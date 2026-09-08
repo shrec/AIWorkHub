@@ -487,44 +487,103 @@ def todos(repo_root: Path, files: list[str], *, limit: int) -> list[dict[str, An
     return _todos(repo_root, files, limit=limit)
 
 
+# The per-symbol metrics a focus reply carries ON the match row itself.  One
+# row per symbol: ``ranked_symbols`` (full duplicate rows), ``hot_symbols`` (a
+# projection of the same rows) and ``risks`` (another projection) used to
+# restate every match up to three times in parallel lists that a reader then
+# had to reconcile to find one line range; measured at 35% of focus bytes and
+# used downstream twice in 27 sessions.
+FOLDED_SYMBOL_METRIC_KEYS: tuple[str, ...] = (
+    "priority_score", "incoming_calls", "outgoing_calls", "branch_count",
+    "loop_count", "risk_reasons", "line_span", "metrics_evidence",
+)
+
+
+def _metric_row_identity(row: dict[str, Any]) -> tuple[str, str, int, int]:
+    """The exact row a metrics row was computed from."""
+
+    def line(raw: Any) -> int:
+        try:
+            return int(raw or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    return (
+        str(row.get("qualname") or ""),
+        str(row.get("file_path") or ""),
+        line(row.get("line_start")),
+        line(row.get("line_end")),
+    )
+
+
+def fold_symbol_metrics(
+    matches: list[dict[str, Any]], ranked: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return ``matches`` with each ranked row's metrics folded into its row.
+
+    Rows without computed metrics (non-symbol kinds, or beyond the metrics
+    limit) are returned unchanged, so the absence of ``priority_score`` on a
+    row is itself truthful: it was not scored.
+
+    The ranking order the old ``ranked_symbols`` list carried is not lost:
+    ``_symbol_metrics`` orders by ``(-priority_score, qualname)`` and both keys
+    ride on the folded row, so a reader recovers the exact former order by
+    sorting the scored matches.
+    """
+
+    # ``_symbol_metrics`` de-duplicates by qualname alone, so a qualname that
+    # occurs in two files is scored once.  Key the fold on the exact row
+    # identity instead: the unscored twin then carries no metrics (truthful)
+    # rather than inheriting the other file's line span and call counts.
+    by_identity = {
+        _metric_row_identity(row): row for row in ranked if row.get("qualname")
+    }
+    folded: list[dict[str, Any]] = []
+    for match in matches:
+        metrics = (
+            by_identity.get(_metric_row_identity(match))
+            if match.get("qualname") else None
+        )
+        if metrics is None:
+            folded.append(match)
+            continue
+        folded.append({
+            **match,
+            **{key: metrics[key] for key in FOLDED_SYMBOL_METRIC_KEYS if key in metrics},
+        })
+    return folded
+
+
 def focus_insights(
     conn: sqlite3.Connection,
     repo_root: Path,
     matches: list[dict[str, Any]],
     *,
     budget: int,
+    include_git: bool = False,
 ) -> dict[str, Any]:
+    """Focus evidence: metrics folded into ``matches``, tests, todos, next steps.
+
+    ``git_signals`` (per-file churn/ownership over 90 days) is unrequested
+    context on a focus call and is emitted only on ``include_git``; the
+    ``churn``/``ownership``/``hotspots`` modes remain the on-demand surface.
+    """
+
     files = candidate_files(matches, limit=min(12, budget))
     ranked = _symbol_metrics(conn, repo_root, matches, limit=min(12, budget))
-    git = _git_metrics(conn, files, limit=min(12, budget))
     tests = _test_candidates(conn, files, matches, limit=min(8, budget))
-    risks = [
-        {"qualname": row["qualname"], "file_path": row["file_path"],
-         "priority_score": row["priority_score"], "reasons": row["risk_reasons"]}
-        for row in ranked if row["risk_reasons"]
-    ]
-    return {
-        "ranked_symbols": ranked,
-        # ``ranked_symbols`` already owns the full symbol rows.  Keep the hot
-        # projection as stable references plus the one differentiating score
-        # instead of repeating signatures, ranges and evidence byte-for-byte.
-        "hot_symbols": [
-            {
-                "qualname": row["qualname"],
-                "file_path": row["file_path"],
-                "priority_score": row["priority_score"],
-            }
-            for row in ranked if int(row["priority_score"]) >= 8
-        ][:8],
-        "risks": risks[:8],
+    insights: dict[str, Any] = {
+        "matches": fold_symbol_metrics(matches, ranked),
         "related_tests": tests,
-        "git_signals": git,
         "todos": _todos(repo_root, files, limit=min(8, budget)),
         "recommended_next_steps": (
             [f"slice:{ranked[0]['qualname']}", f"context:{ranked[0]['file_path']}"]
             if ranked else []
         ),
     }
+    if include_git:
+        insights["git_signals"] = _git_metrics(conn, files, limit=min(12, budget))
+    return insights
 
 
 def slice_insights(

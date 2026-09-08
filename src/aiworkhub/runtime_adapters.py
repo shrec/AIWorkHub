@@ -263,14 +263,20 @@ CODEX_INNER_SANDBOX_MODES: tuple[str, ...] = ("workspace-write", "danger-full-ac
 # this one, so the dependency may only ever run in that direction.
 RAW_DISCOVERY_DENIED_COMMANDS: tuple[str, ...] = ("grep", "rg", "find", "tree")
 
-# Native provider search tools, denied alongside the shell commands.  Claude
-# exposes them as ``Grep``/``Glob`` tool names; Copilot takes lower-case
-# ``grep``/``glob`` entries for ``--excluded-tools``.
+# Native provider search tools, denied alongside the shell commands for BUILD
+# workers: Source Graph is the discovery path a worker is held to, and the
+# repository policy names it.  Claude exposes them as ``Grep``/``Glob`` tool
+# names; Copilot takes lower-case ``grep``/``glob`` entries for
+# ``--excluded-tools``.  A read-only reviewer is the measured exception -- see
+# ``CLAUDE_REVIEWER_SEARCH_TOOLS`` -- and receives only the shell denies.
 CLAUDE_RAW_DISCOVERY_TOOL_DENIES: tuple[str, ...] = ("Grep", "Glob")
 COPILOT_RAW_DISCOVERY_EXCLUDED_TOOLS: tuple[str, ...] = ("grep", "glob")
 
-CLAUDE_RAW_DISCOVERY_DENIES: tuple[str, ...] = CLAUDE_RAW_DISCOVERY_TOOL_DENIES + tuple(
+CLAUDE_RAW_DISCOVERY_SHELL_DENIES: tuple[str, ...] = tuple(
     f"Bash({command} *)" for command in RAW_DISCOVERY_DENIED_COMMANDS
+)
+CLAUDE_RAW_DISCOVERY_DENIES: tuple[str, ...] = (
+    CLAUDE_RAW_DISCOVERY_TOOL_DENIES + CLAUDE_RAW_DISCOVERY_SHELL_DENIES
 )
 COPILOT_RAW_DISCOVERY_EXCLUDES = ",".join(COPILOT_RAW_DISCOVERY_EXCLUDED_TOOLS)
 COPILOT_RAW_DISCOVERY_DENIES: tuple[str, ...] = tuple(
@@ -871,6 +877,30 @@ CLAUDE_REVIEW_TOOLS: tuple[str, ...] = (
     f"{_WORKER}quality_review_submit",
 )
 
+# Native search for the read-only reviewer only.  The same reasoning that
+# stripped the write tools above applies to a deny the sandbox makes
+# pointless: the reviewer sandbox is Landlock read-only with an empty
+# allowed_writes, so ``Grep`` and ``Glob`` cannot change anything, and denying
+# them protected nothing.  Measured over 242 claude_cli reviewer runs
+# (2026-09-08 reviewer audit): 1,080 Bash permission denials -- 25% of every
+# reviewer Bash call, in 181/242 runs (804 grep, 96 find, 52 rg) -- each a
+# wasted turn with zero information, followed by python3 -c file readers,
+# Agent subagents (110 in 60 runs), sandbox probes and whole-file Reads as
+# substitutes, ~285K input tokens per run.  Build workers keep the full deny:
+# Source Graph is their discovery path and the repository policy holds them to
+# it.  The raw shell forms stay denied for reviewers too -- the bounded native
+# tools are the substitute, not an unbounded shell scan.
+CLAUDE_REVIEWER_SEARCH_TOOLS: tuple[str, ...] = CLAUDE_RAW_DISCOVERY_TOOL_DENIES
+
+# Host tools a reviewer must not hold.  ``ReportFindings`` is the host's own
+# code-review channel: 73/242 claude reviewer runs (30%) filed findings
+# through it (90 calls, 13 InputValidationErrors), 66 typed the same findings
+# twice, and 9 runs filed ONLY there -- where ingest never looked -- losing
+# the whole 1.5M-token review.  ``ScheduleWakeup`` (15 calls) schedules a
+# turn no supervisor will ever answer.  The one authoritative channel is the
+# final JSON report the supervisor ingests and submits.
+CLAUDE_REVIEWER_HOST_TOOL_DENIES: tuple[str, ...] = ("ReportFindings", "ScheduleWakeup")
+
 
 def claude_allowed_tools(*, read_only: bool) -> tuple[str, ...]:
     """Tools this role can actually use -- never the union of every role.
@@ -883,8 +913,23 @@ def claude_allowed_tools(*, read_only: bool) -> tuple[str, ...]:
     """
 
     if read_only:
-        return (*CLAUDE_READ_TOOLS, *CLAUDE_REVIEW_TOOLS)
+        return (*CLAUDE_READ_TOOLS, *CLAUDE_REVIEWER_SEARCH_TOOLS, *CLAUDE_REVIEW_TOOLS)
     return (*CLAUDE_READ_TOOLS, *CLAUDE_WRITE_TOOLS)
+
+
+def claude_disallowed_tools(*, read_only: bool) -> tuple[str, ...]:
+    """The ``--disallowedTools`` list for this role.
+
+    A build worker is denied raw discovery in every form (native ``Grep``/
+    ``Glob`` and the shell commands).  A read-only reviewer keeps the shell
+    denies, is granted the native search tools instead (see
+    ``CLAUDE_REVIEWER_SEARCH_TOOLS``), and is additionally denied the host
+    tools that would file its report where the supervisor never reads.
+    """
+
+    if read_only:
+        return (*CLAUDE_RAW_DISCOVERY_SHELL_DENIES, *CLAUDE_REVIEWER_HOST_TOOL_DENIES)
+    return CLAUDE_RAW_DISCOVERY_DENIES
 
 
 def build_runtime_command(
@@ -993,7 +1038,7 @@ def build_runtime_command(
             *claude_allowed_tools(read_only=read_only),
             "--no-session-persistence",
             "--disallowedTools",
-            *CLAUDE_RAW_DISCOVERY_DENIES,
+            *claude_disallowed_tools(read_only=read_only),
         ]
         # Partial-message mode emits a JSON event for nearly every provider
         # delta and can turn a small task into a multi-megabyte stdout log.

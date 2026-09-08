@@ -1822,5 +1822,243 @@ def test_inbox_non_superseded_and_invalid_successor_ids_fail_closed():
     assert "QR-bad" in dag["task_ids"]
 
 
+# ---------------------------------------------------------------------------
+# review_packet: ONE bounded packet at review_ready (audit 2026-09-08, prob. 5)
+# ---------------------------------------------------------------------------
+
+
+def _packet_card(*, findings=None, validation=None, checks=None) -> dict:
+    return {
+        "task_id": "T-PACKET",
+        "runner": "claude_worker_b1",
+        "topic": "task_mcp",
+        "status": "review",
+        "risk_tier": "high",
+        "claim_epoch": 4,
+        "terminal_review": {
+            "substatus": "review_ready",
+            "evidence": {
+                "adapter_id": "claude_cli",
+                "model": "claude-opus-5",
+                "request_identity": {
+                    "request_id": "R-PACKET", "task_id": "T-PACKET",
+                    "runner": "claude_worker_b1", "topic": "task_mcp",
+                },
+                "changed_paths": ["src/aiworkhub/service.py", "tests/test_service.py"],
+                "changed_path_hashes": {"src/aiworkhub/service.py": "a" * 64},
+                "required_outputs": [
+                    {"path": "src/aiworkhub/service.py", "pattern": "",
+                     "bytes": 120, "sha256": "b" * 64, "unchanged_allowed": False}
+                ],
+                "validation": validation if validation is not None else [
+                    {
+                        "declared_command": "pytest tests/test_service.py",
+                        "executed_command": "python -m pytest tests/test_service.py",
+                        "returncode": 1,
+                        "stdout_tail": "1 failed",
+                        "stderr_tail": "AssertionError",
+                        "stdout_truncated": True,
+                    }
+                ],
+                "worker_mcp_gate": {
+                    "gated": True,
+                    "satisfied": False,
+                    "reason": "worker_mcp_required_tools_missing:source_graph",
+                    "missing_tools": ["source_graph"],
+                    "verification": {
+                        "receipt_conformance": {
+                            "status": "failed",
+                            "blocking": True,
+                            "blockers": ["workflow_stage_missing"],
+                        }
+                    },
+                },
+                "quality_gate": {
+                    "passed": False,
+                    "blocking_checks": ["ruff"],
+                    "checks": checks if checks is not None else [
+                        {"check_id": "ruff", "kind": "lint", "status": "failed",
+                         "command": "ruff check src", "summary": "1 error"},
+                        {"check_id": "mypy", "kind": "typecheck", "status": "passed",
+                         "command": "mypy src", "summary": "ok"},
+                    ],
+                    "review_risk_profile": {
+                        "effective_tier": "high",
+                        "requested_tier": "low",
+                        "signals": ["code_change", "concurrency"],
+                        "required_reviewer_lenses": ["correctness", "security"],
+                        "error": "",
+                    },
+                    "reachability": {
+                        "evaluated": False,
+                        "reason": "reachability_inputs_unavailable",
+                    },
+                    "quality_verdict": {
+                        "lenses": [
+                            {"lens": "correctness", "status": "failed",
+                             "finding_ids": ["reviewer:correctness:F-1"],
+                             "observation_ids": []},
+                        ],
+                        "refine_required": True,
+                        "reviewer_reports": [
+                            {
+                                "lens": "correctness",
+                                "findings": findings if findings is not None else [
+                                    {"id": "F-1", "severity": "high",
+                                     "disposition": "defect", "category": "general",
+                                     "summary": "off by one",
+                                     "evidence": "src/aiworkhub/service.py:42 loop bound"},
+                                    {"id": "F-9", "severity": "high",
+                                     "disposition": "defect", "category": "general",
+                                     "summary": "off by one (again)",
+                                     "evidence": "src/aiworkhub/service.py:42 loop bound"},
+                                ],
+                            },
+                            {
+                                "lens": "security",
+                                "findings": [
+                                    {"id": "F-1", "severity": "high",
+                                     "disposition": "defect", "category": "general",
+                                     "summary": "same line",
+                                     "evidence": "src/aiworkhub/service.py:42 loop bound"},
+                                ],
+                            },
+                        ],
+                    },
+                },
+            },
+        },
+    }
+
+
+def test_review_packet_carries_every_gate_row_from_one_card():
+    """One object instead of six nested reads.
+
+    Every fact here was already persisted; what the manager lacked was them
+    arriving together. ``receipt_conformance`` in particular is nested under
+    ``worker_mcp_gate.verification`` -- not a top-level evidence key -- which is
+    why a green-looking card kept failing late on it.
+    """
+    packet = completion_inbox.review_packet(
+        "R-PACKET", card=_packet_card(), task_id="T-PACKET"
+    )
+
+    assert packet["ok"] is True
+    assert packet["schema_id"] == completion_inbox.REVIEW_PACKET_SCHEMA_ID
+    assert packet["identity"]["runner"] == "claude_worker_b1"
+    assert packet["status"]["terminal_substatus"] == "review_ready"
+
+    assert packet["risk"]["effective_tier"] == "high"
+    assert packet["risk"]["required_reviewer_lenses"] == ["correctness", "security"]
+    assert packet["risk"]["source"] == "review_ready_observation"
+    assert packet["risk"]["card_declared_risk_tier"] == "high"
+
+    gates = packet["gates"]
+    assert gates["quality_gate_blockers"] == ["ruff"]
+    assert [row["check_id"] for row in gates["quality_gate_checks"]] == ["ruff", "mypy"]
+    assert gates["validation"][0]["declared_command"] == "pytest tests/test_service.py"
+    assert gates["validation"][0]["returncode"] == 1
+    assert gates["validation"][0]["stderr_tail"] == "AssertionError"
+    assert gates["validation"][0]["truncated"] is True
+    assert gates["worker_mcp_gate"]["satisfied"] is False
+    assert gates["worker_mcp_gate"]["receipt_conformance_blocking"] is True
+    assert gates["worker_mcp_gate"]["blockers"] == ["workflow_stage_missing"]
+    assert gates["required_outputs"][0]["path"] == "src/aiworkhub/service.py"
+
+    assert packet["diff"]["changed_path_count"] == 2
+    assert packet["reachability"]["evaluated"] is False
+    assert packet["truncation"]["within_bound"] is True
+    assert packet["encoded_bytes"] <= completion_inbox.REVIEW_PACKET_MAX_BYTES
+    assert packet["mutation"]["queue_mutated"] is False
+
+
+def test_review_packet_dedupes_findings_by_path_line_and_check_id():
+    """Three reviewer findings, one defect: the same (path, line, id) reported
+    by two lenses and repeated once inside one lens is one thing to fix."""
+    packet = completion_inbox.review_packet(
+        "R-PACKET", card=_packet_card(), task_id="T-PACKET"
+    )
+    findings = packet["review"]["findings"]
+
+    assert len(findings) == 2
+    assert findings[0]["path"] == "src/aiworkhub/service.py"
+    assert findings[0]["line"] == "42"
+    assert findings[0]["lenses"] == ["correctness", "security"]
+    assert packet["review"]["duplicate_findings_collapsed"] == 1
+    assert [row["lens"] for row in packet["review"]["lenses"]] == ["correctness"]
+
+
+def test_review_packet_enforces_its_byte_bound_by_measurement():
+    """The bound is enforced by encoding and dropping, not by hoping.
+
+    Measured over all 419 real cards carrying a quality gate, the packet is
+    1.6-13.8 KB and never needs a drop; this drives the machinery that keeps
+    that true for a card that is not typical.
+    """
+    huge = _packet_card(
+        validation=[
+            {
+                "declared_command": f"pytest tests/test_{index}.py",
+                "returncode": 1,
+                "stdout_tail": "x" * 4000,
+                "stderr_tail": "y" * 4000,
+            }
+            for index in range(50)
+        ],
+        checks=[
+            {"check_id": f"check-{index}", "kind": "lint", "status": "passed",
+             "command": "c" * 400, "summary": "s" * 700}
+            for index in range(50)
+        ],
+    )
+    packet = completion_inbox.review_packet(
+        "R-PACKET", card=huge, task_id="T-PACKET", max_bytes=8_000
+    )
+
+    assert packet["encoded_bytes"] <= 8_000
+    assert packet["truncation"]["within_bound"] is True
+    assert packet["truncation"]["dropped_sections"][:1] == ["validation_output_tails"]
+    # The blockers survive every drop: they are what a manager cannot re-derive.
+    assert packet["gates"]["quality_gate_blockers"] == ["ruff"]
+    assert packet["gates"]["worker_mcp_gate"]["blockers"] == ["workflow_stage_missing"]
+    assert packet["risk"]["effective_tier"] == "high"
+
+
+def test_review_packet_reports_an_unreadable_card_instead_of_raising():
+    result = completion_inbox.review_packet(
+        "R-PACKET",
+        task_id="T-MISSING",
+        show_fn=lambda _task_id: SimpleNamespace(returncode=1, stdout="", stderr="gone"),
+    )
+    assert result["ok"] is False and result["error"] == "card_unreadable"
+    assert completion_inbox.review_packet("R-PACKET")["error"] == (
+        "task_id_required_without_card"
+    )
+
+
+def test_review_packet_carries_the_accept_preview_fold_when_given_one():
+    """The preview is passed in, never called: this module holds no launch
+    authority and must not acquire one to describe a candidate."""
+    packet = completion_inbox.review_packet(
+        "R-PACKET",
+        card=_packet_card(),
+        task_id="T-PACKET",
+        accept_preview={
+            "evaluated": True,
+            "blocked": True,
+            "blockers": [
+                {"kind": "required_reviewer_missing",
+                 "error": "required_reviewer_missing:security"}
+            ],
+            "reviewer_request_ids": ["rq-c"],
+            "reviewer_request_id_source": "server_bound_reviewer_children",
+        },
+    )
+    preview = packet["accept_preview"]
+    assert preview["evaluated"] is True and preview["blocked"] is True
+    assert preview["blockers"][0]["error"] == "required_reviewer_missing:security"
+    assert preview["reviewer_request_id_source"] == "server_bound_reviewer_children"
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

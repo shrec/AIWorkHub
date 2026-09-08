@@ -11,7 +11,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.11.5";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.12.0";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 // NF-2026-00643: this globalStorage trace directory was measured holding 1,102
 // files and 2,235,024,325 bytes (2.24 GB), largest single file 44,626,825 bytes
@@ -8811,6 +8811,12 @@ function handleInboundMessage(view, message) {
       if (ROADMAP_ID_RE.test(roadmapId)) pushRoadmapDetail(view, roadmapId);
       break;
     }
+    // The three NeedFix mutation tools now answer with a receipt whose `item`
+    // is the COMPACT list projection by default; the full row (description,
+    // scope, provenance, evidence) is behind `include_item`. That default was
+    // chosen for the model's tool-result budget -- the Webview is not a token
+    // consumer and renders `payload.item` straight into the detail pane, so
+    // it opts back in here and keeps the exact pane it drew before.
     case "needfixCapture":
       runNeedfixAction(view, "capture", {
         title: String(message.title || "").slice(0, 240),
@@ -8819,6 +8825,7 @@ function handleInboundMessage(view, message) {
         severity: String(message.severity || "medium").slice(0, 24),
         scope: String(message.scope || "").slice(0, 4000) || null,
         tags: Array.isArray(message.tags) ? message.tags.slice(0, 24).map((value) => String(value).slice(0, 80)) : [],
+        include_item: true,
       });
       break;
     case "needfixUpdate": {
@@ -8833,6 +8840,7 @@ function handleInboundMessage(view, message) {
         severity: message.severity == null ? null : String(message.severity).slice(0, 24),
         tags: Array.isArray(message.tags) ? message.tags.slice(0, 24).map((value) => String(value).slice(0, 80)) : null,
         readiness_score: Number.isFinite(Number(message.readinessScore)) ? Math.max(0, Math.min(100, Number(message.readinessScore))) : null,
+        include_item: true,
       });
       break;
     }
@@ -8846,6 +8854,7 @@ function handleInboundMessage(view, message) {
         readiness_score: Number.isFinite(Number(message.readinessScore)) ? Math.max(0, Math.min(100, Number(message.readinessScore))) : null,
         duplicate_parent_id: String(message.duplicateParentId || "").slice(0, 32),
         confirm: message.confirm === true,
+        include_item: true,
       });
       break;
     }

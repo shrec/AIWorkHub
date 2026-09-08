@@ -11,6 +11,8 @@ telemetry accounting, and a fake-worker end-to-end dynamic tool call.
 from __future__ import annotations
 
 import base64
+import copy
+import hashlib
 import inspect
 import json
 import os
@@ -438,9 +440,27 @@ def test_source_graph_query_runs_bounded_and_second_call_is_cached(monkeypatch: 
     assert first["hit_count"] > 0
     assert first["cache_hit"] is False
     assert first["index_revision"] == source_graph_mod.BUILD_REVISION
-    assert first["evidence_counts"] == {
-        "entity_rows": 0, "edge_rows": 0, "file_rows": 0,
-    }
+    # Deliberate (source_graph-3): ``evidence_counts`` describes the reply the
+    # server already hashed and signed; it drives nothing the model does next,
+    # so it moved out of the model-facing envelope into the HMAC-authenticated
+    # ledger row (asserted below through
+    # ``verification["source_graph_evidence_rows"]``).  Together with
+    # ``index_finished_at``, ``output_cap_bytes``, ``authority_state``,
+    # ``budget``, ``bundle_type`` and the empty identity fields that is 300
+    # bytes of every reply, 238 net of the two keys added (receipt_id,
+    # workflow_stage_source).
+    assert not {
+        "evidence_counts", "index_finished_at", "output_cap_bytes",
+        "authority_state", "budget", "bundle_type", "cache_receipt",
+    } & set(first)
+    # What the reply DOES keep is everything a consumer reads off it:
+    # ``task_decomposition._validated_source_graph_receipt`` verifies ok/tool/
+    # mode/authority_repo/authority_source/content/content_sha256/
+    # index_revision/hit_count, and every one of those is still here.
+    assert {
+        "ok", "tool", "mode", "authority_repo", "authority_source",
+        "content", "content_sha256", "index_revision", "hit_count",
+    } <= set(first)
 
     second = w.source_graph_query(
         ctx, mode="focus", query="ignored", budget=32, workflow_stage="validation"
@@ -463,6 +483,12 @@ def test_source_graph_query_runs_bounded_and_second_call_is_cached(monkeypatch: 
     )
     assert verification["call_count_by_tool"]["source_graph"] == 2
     assert verification["cache_hits"] == 1
+    # The evidence counts the envelope no longer carries are still measured,
+    # per call, on the signed ledger row (summed over the live row and the
+    # cache-replay row, which replays the stored counts).
+    assert verification["source_graph_evidence_rows"] == {
+        "entity_rows": 0, "edge_rows": 0, "file_rows": 0,
+    }
     assert verification["compact_replay"] == {
         "receipt_count": 1,
         "original_bytes": first["bytes"],
@@ -783,16 +809,20 @@ def test_source_graph_cache_can_return_full_content_for_internal_evaluation(
     assert replay["replay_bytes_avoided"] == 0
 
 
-def test_source_graph_orientation_truncation_preserves_full_evidence_counts(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
-) -> None:
-    _mute_chmod(monkeypatch)
-    repo = _fake_repo(tmp_path)
-    large_payload = {
-        "mode": "focus",
+def _oversized_payload(mode: str) -> dict:
+    """One engine payload well past every mode's output cap."""
+    return {
+        "mode": mode,
         "query": "large orientation payload",
         "matches": [
-            {"path": f"src/module_{index}.py", "body": "x" * 1200}
+            {
+                "file_path": f"src/module_{index}.py",
+                "qualname": f"src/module_{index}.py::symbol_{index}",
+                "kind": "function",
+                "line_start": 1,
+                "line_end": 40,
+                "body": "x" * 1200,
+            }
             for index in range(24)
         ],
         "ranked_symbols": [
@@ -800,21 +830,102 @@ def test_source_graph_orientation_truncation_preserves_full_evidence_counts(
             for index in range(12)
         ],
     }
+
+
+def test_source_graph_orientation_fits_one_plain_json_page(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Deliberate (source_graph-1): an oversized ORIENTATION reply is fitted.
+
+    An analytic mode used to be chopped into base64 continuation pages cut
+    mid-object, so the first match was unreadable until every page had been
+    fetched, decoded and concatenated -- which no reader did.  Now every mode
+    outside ``SOURCE_GRAPH_EXACT_CONTENT_MODES`` is trimmed to the outer cap
+    by the engine's own structure-aware priority trimmer and returned as ONE
+    plain-JSON page: restating sections go first (``ranked_symbols`` here),
+    ``matches`` rows are halved only when nothing else is left, and every loss
+    is declared through ``truncated`` and named in ``fit_dropped``.  The
+    counts still describe the FULL engine result: ``hit_count`` on the reply,
+    ``evidence_counts`` on the signed ledger row.
+    """
+    _mute_chmod(monkeypatch)
+    repo = _fake_repo(tmp_path)
+    large_payload = _oversized_payload("focus")
+    # A fresh copy per call: the fit trims its argument in place, exactly as
+    # the pre-existing engine-side trimmer always did.
     monkeypatch.setattr(
         source_graph_mod,
         "focus",
-        lambda repo_root, query, budget=64: large_payload,
+        lambda repo_root, query, budget=64: copy.deepcopy(large_payload),
     )
     ctx = _ctx(repo, home=tmp_path / "home")
 
     page = w.source_graph_query(ctx, mode="focus", query="large", budget=32)
     assert page["ok"] is True
+    assert page["internal_truncated"] is True
+    assert page["outer_truncated"] is False
+    assert page["truncated"] is True
+    assert "continuation_cursor" not in page
+    assert "content_encoding" not in page
+    assert w._serialized_response_bytes(page) <= 8 * 1024
+
+    # One page, directly readable, with its first match intact.
+    fitted = json.loads(page["content"])
+    assert fitted["mode"] == "focus"
+    assert fitted["matches"][0]["file_path"] == "src/module_0.py"
+    assert 0 < len(fitted["matches"]) < len(large_payload["matches"])
+    # The restating section goes before any match row, and says so.
+    assert "ranked_symbols" not in fitted
+    assert "ranked_symbols" in fitted["fit_dropped"]
+    assert fitted["truncated"] is True
+    assert page["content_sha256"] == hashlib.sha256(
+        page["content"].encode("utf-8")
+    ).hexdigest()
+
+    # The counts describe the whole engine result, not the trimmed bytes:
+    # hit_count counts the ``matches`` rows only (the parallel
+    # ``ranked_symbols`` list never inflated it), and the evidence counts live
+    # on the HMAC-authenticated ledger row.
+    assert page["hit_count"] == w._json_hit_count(large_payload) == 24
+    verification = w.verify_audit_ledger(
+        ctx.audit_ledger_path, ctx.audit_hmac_key_path,
+        task_id=ctx.task_id, runner=ctx.runner, topic=ctx.topic,
+    )
+    assert verification["source_graph_evidence_rows"] == (
+        w._source_graph_evidence_counts(large_payload)
+    )
+    assert verification["source_graph_evidence_rows"]["entity_rows"] == 24
+
+
+def test_source_graph_exact_content_pages_are_signed_and_reassemble_exactly(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Base64 continuation paging survives for the exact-content modes.
+
+    ``body``/``function``/``class``/``file`` replies ARE the bytes the caller
+    asked for, so they are never trimmed: they page through the signed
+    continuation store.  A tampered cursor is refused, every page fits the
+    cap, each page carries the hash of its own returned bytes, and the pages
+    reassemble to the engine payload byte for byte.
+    """
+    _mute_chmod(monkeypatch)
+    repo = _fake_repo(tmp_path)
+    large_payload = _oversized_payload("body")
+    monkeypatch.setattr(
+        source_graph_mod,
+        "body_query",
+        lambda repo_root, query, budget=64: copy.deepcopy(large_payload),
+    )
+    ctx = _ctx(repo, home=tmp_path / "home")
+
+    page = w.source_graph_query(ctx, mode="body", query="large", budget=32)
+    assert page["ok"] is True
     assert page["internal_truncated"] is False
     assert page["outer_truncated"] is True
     assert page["truncated"] is True
-    assert page["output_cap_bytes"] == 8 * 1024
-    assert page["hit_count"] == w._json_hit_count(large_payload)
-    assert page["evidence_counts"] == w._source_graph_evidence_counts(large_payload)
+    assert page["content_encoding"] == "base64"
+    assert page["page_index"] == 0
+    assert page["page_count"] > 1
 
     cursor_payload = json.loads(
         base64.urlsafe_b64decode(page["continuation_cursor"]).decode("utf-8")
@@ -830,7 +941,7 @@ def test_source_graph_orientation_truncation_preserves_full_evidence_counts(
     ).decode("ascii")
     tampered = w.source_graph_query(
         ctx,
-        mode="focus",
+        mode="body",
         query="large",
         budget=32,
         continuation_cursor=tampered_cursor,
@@ -842,7 +953,7 @@ def test_source_graph_orientation_truncation_preserves_full_evidence_counts(
     while page["continuation_cursor"] is not None:
         page = w.source_graph_query(
             ctx,
-            mode="focus",
+            mode="body",
             query="large",
             budget=32,
             continuation_cursor=page["continuation_cursor"],
@@ -850,10 +961,19 @@ def test_source_graph_orientation_truncation_preserves_full_evidence_counts(
         assert page["ok"] is True
         pages.append(page)
 
-    assert all(page["bytes"] <= page["output_cap_bytes"] for page in pages)
+    output_cap = w._source_graph_output_cap("body")
+    assert all(w._serialized_response_bytes(one) <= output_cap for one in pages)
     assert pages[-1]["continuation_cursor"] is None
-    assert all(page["content_encoding"] == "base64" for page in pages)
-    content = b"".join(base64.b64decode(page["content"]) for page in pages)
+    assert all(one["content_encoding"] == "base64" for one in pages)
+    chunks = [base64.b64decode(one["content"]) for one in pages]
+    # content_sha256 covers the whole response; page_sha256 covers the bytes
+    # this page actually returned, so a swapped or truncated page is provable
+    # in the turn it arrives instead of only after full reassembly.
+    assert [hashlib.sha256(chunk).hexdigest() for chunk in chunks] == [
+        one["page_sha256"] for one in pages
+    ]
+    content = b"".join(chunks)
+    assert hashlib.sha256(content).hexdigest() == page["content_sha256"]
     assert json.loads(content.decode("utf-8")) == large_payload
 
 
@@ -881,8 +1001,23 @@ def test_source_graph_cache_is_invalidated_by_index_generation(
     assert first["cache_hit"] is False
     assert second["cache_hit"] is True
     assert third["cache_hit"] is False
-    assert third["index_finished_at"] == "2026-08-01T00:05:00+00:00"
     assert len(calls) == 2
+    # Deliberate (source_graph-3): the generation timestamp that decides cache
+    # validity is a server fact about the index, not something the model acts
+    # on, so ``index_finished_at`` left the envelope for the HMAC ledger row.
+    # ``index_revision`` stays on the reply because
+    # ``task_decomposition._validated_source_graph_receipt`` reads it there.
+    assert "index_finished_at" not in third
+    assert third["index_revision"] == source_graph_mod.BUILD_REVISION
+    verification = w.verify_audit_ledger(
+        ctx.audit_ledger_path, ctx.audit_hmac_key_path,
+        task_id=ctx.task_id, runner=ctx.runner, topic=ctx.topic,
+    )
+    assert [row["finished_at"] for row in verification["source_graph_index_sequence"]] == [
+        "2026-08-01T00:00:00+00:00",
+        "2026-08-01T00:00:00+00:00",
+        "2026-08-01T00:05:00+00:00",
+    ]
 
 
 def test_source_graph_identity_prefers_newest_single_file_mutation(tmp_path: Path) -> None:
@@ -2017,3 +2152,132 @@ def test_eval_artifact_b833_matches_live_tool_surface() -> None:
     assert payload["schema_id"] == "aiworkhub.task_mcp.aiworkhub_dynamic_worker_mcp_b833_v1.eval.v1"
     assert set(payload["mcp_tool_names"]) == set(w.MCP_TOOL_NAMES)
     assert payload["server_name"] == w.SERVER_NAME
+
+
+# ---------------------------------------------------------------------------
+# Server-inferred workflow stage (worker_prompt-5 / source_graph-7) and the
+# context-store visibility fields (startup-3).  Both shipped without a
+# regression test.
+# ---------------------------------------------------------------------------
+
+def _raw_ctx(tmp_path: Path, **overrides) -> w.WorkerToolContext:
+    fields = {
+        "task_id": "TASK_STAGE", "runner": "runner", "topic": "topic",
+        "request_id": "req-stage", "repo": tmp_path, "authority_repo": tmp_path,
+        "source_graph_targets": (), "session_topic": "topic",
+        "audit_ledger_path": None, "audit_hmac_key_path": None,
+    }
+    fields.update(overrides)
+    return w.WorkerToolContext(**fields)
+
+
+def test_workflow_stage_is_inferred_from_what_the_server_already_saw(
+    tmp_path: Path,
+) -> None:
+    """A stage the server can see is not worth asking the model for."""
+    # ``_TOOL_CALL_STATE`` is keyed by (task_id, request_id) and lives for the
+    # life of the server process, so each case below uses its own request id.
+    plain = _raw_ctx(tmp_path, request_id="stage-plain")
+    assert w._infer_workflow_stage(plain) == "orientation"
+
+    review = _raw_ctx(
+        tmp_path, request_id="stage-review",
+        quality_review_packet_path=tmp_path / "packet.json",
+    )
+    assert w._infer_workflow_stage(review) == "review"
+
+    manager = _raw_ctx(
+        tmp_path, task_id="manager:codex:thread-1", runner="codex_manager",
+        request_id="stage-manager",
+    )
+    assert w._infer_workflow_stage(manager) == "review"
+
+    rework = _raw_ctx(
+        tmp_path, request_id="stage-rework", rework_overlay_packet={"files": []},
+    )
+    assert w._infer_workflow_stage(rework) == "rework"
+
+    # An observed successful apply moves the request into implementation; a
+    # validation receipt right before the query wins over it.
+    working = _raw_ctx(tmp_path, request_id="stage-working")
+    w._record_tool_call(working, "semantic_edit_apply", True)
+    assert w._infer_workflow_stage(working) == "implementation"
+    w._record_tool_call(working, "validation_command", True)
+    assert w._infer_workflow_stage(working) == "validation"
+
+
+def test_declared_workflow_stage_overrides_the_inference_and_both_reach_the_ledger(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    _mute_chmod(monkeypatch)
+    repo = _fake_repo(tmp_path)
+    _stub_source_graph_engine(monkeypatch)
+    ctx = _ctx(repo, home=tmp_path / "home", request_id="req-stage-source")
+
+    inferred = w.source_graph_query(ctx, mode="focus", query="one", budget=8)
+    assert inferred["workflow_stage"] == "orientation"
+    assert inferred["workflow_stage_source"] == "inferred"
+
+    declared = w.source_graph_query(
+        ctx, mode="focus", query="two", budget=8, workflow_stage="validation",
+    )
+    assert declared["workflow_stage"] == "validation"
+    assert declared["workflow_stage_source"] == "declared"
+
+    verification = w.verify_audit_ledger(
+        ctx.audit_ledger_path, ctx.audit_hmac_key_path,
+        task_id=ctx.task_id, runner=ctx.runner, topic=ctx.topic,
+    )
+    # Every row carries a stage now; the ledger says which were declared.
+    assert verification["source_graph_stage_counts"] == {
+        "orientation": 1, "validation": 1,
+    }
+    assert verification["source_graph_stage_source_counts"] == {
+        "inferred": 1, "declared": 1,
+    }
+    assert verification["source_graph_stage_counts"].get("unspecified") is None
+
+
+def test_context_stores_report_their_size_and_any_token_match_semantics(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """startup-3: an empty store and a miss used to look identical.
+
+    ``_fts_match_expr`` joined every query word with FTS5's implicit AND, so a
+    six-word manager question needed all six words in one row.  Tokens are now
+    joined with OR and re-ordered by how many query tokens each row covers, and
+    every context reply says how big the store is so a zero result can be read
+    as "nothing matched" rather than "nothing is there".
+    """
+    _mute_chmod(monkeypatch)
+    repo = _fake_repo(tmp_path)
+    ctx = _ctx(repo, home=tmp_path / "home", request_id="req-store-stats")
+
+    assert w._fts_match_expr("bounded worker context") == (
+        '"bounded" OR "worker" OR "context"'
+    )
+    assert w._fts_match_expr("!!!") is None
+
+    memory = w.ai_memory_search(
+        ctx, query="bounded worker mcp context that is not all one row", limit=4,
+    )
+    assert memory["ok"] is True
+    assert memory["hit_count"] > 0
+    assert memory["store_rows"] > 0
+    payload = json.loads(memory["content"])
+    assert payload["match_semantics"] == "any_token_ranked_by_coverage"
+    assert payload["store_rows"] == memory["store_rows"]
+
+    kb = w.kb_search(ctx, query="bounded Source Graph context for worker tools")
+    assert kb["ok"] is True
+    assert kb["hit_count"] > 0
+    assert kb["store_rows"] > 0
+    assert json.loads(kb["content"])["match_semantics"] == (
+        "any_token_ranked_by_coverage"
+    )
+
+    session = w.session_current_state(ctx, limit=4)
+    assert session["ok"] is True
+    assert session["store_rows"] > 0
+    # A worker's topic is injected by the coordinator, so it never broadens.
+    assert session["match_kind"] in {"", "exact_source"}

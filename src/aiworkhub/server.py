@@ -16,7 +16,7 @@ from functools import wraps
 from pathlib import Path
 from typing import Any, Literal
 
-from . import roadmap_store, skill_registry_store, task_store, tool_recipes_store
+from . import needfix_store, roadmap_store, skill_registry_store, task_store, tool_recipes_store
 from .tool_recovery import unknown_tool_message
 
 _MCP_SDK_AVAILABLE = True
@@ -565,6 +565,423 @@ def _serialize_task_lifecycle_write(function: Any) -> Any:
 
     return wrapped
 
+
+# ---------------------------------------------------------------------------
+# Mutation receipts.
+#
+# Measured over 27 manager sessions: aiworkhub_task_reject_review replied with
+# p50 17.8 KB (13% of every manager tool-result byte), ~80% of it an echo of
+# what the manager had just typed -- the reason twice (in the ``command`` argv
+# and in review_feedback.instruction), the card fields it authored at create,
+# and per-file hash baselines. task_create p50 7.4 KB with 85% of stdout
+# echoing the call's own input; needfix_add 75% echo. Nothing echoed is a
+# decision input: the write already happened, the model holds every string it
+# sent, and the card is one task_show away. Only the server-derived facts are
+# new, so the wrappers below answer with those. ``core.*`` keeps returning its
+# CLI-shaped envelope for every internal caller; the projection is done here,
+# at the MCP boundary, and the decision authority is unchanged.
+# ---------------------------------------------------------------------------
+_ENVELOPE_KEYS = frozenset({"ok", "returncode", "command", "stdout", "stderr"})
+_CARD_INCLUDE_MODES = ("none", "summary", "full")
+_STATUS_DETAIL_MODES = ("summary", "evidence", "full")
+CardInclude = Literal["none", "summary", "full"]
+StatusDetail = Literal["summary", "evidence", "full"]
+
+
+def _envelope_card(result: Any) -> dict[str, Any] | None:
+    """Return the card a CLI-shaped envelope carries as JSON in ``stdout``."""
+
+    if not isinstance(result, dict):
+        return None
+    stdout = result.get("stdout")
+    if not isinstance(stdout, str) or not stdout.lstrip().startswith("{"):
+        return None
+    try:
+        card = json.loads(stdout)
+    except ValueError:
+        return None
+    return card if isinstance(card, dict) else None
+
+
+def _card_identity(card: Mapping[str, Any]) -> dict[str, Any]:
+    canonical = json.dumps(card, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    return {"card_sha256": hashlib.sha256(canonical).hexdigest(), "card_bytes": len(canonical)}
+
+
+def _card_view(card: Mapping[str, Any], include_card: str) -> dict[str, Any] | None:
+    if include_card == "full":
+        return dict(card)
+    if include_card == "summary":
+        return core.summarize_evidence(core.summarize_card_baselines(dict(card)))
+    return None
+
+
+def _without_argv_echo(result: dict[str, Any]) -> dict[str, Any]:
+    """Drop ``command`` from an envelope: for reject_review its argv carries
+    the manager's own reason verbatim (13.8% of the reply, 89% of it reason)."""
+
+    stripped = dict(result)
+    stripped.pop("command", None)
+    return stripped
+
+
+def _include_card_refusal(include_card: str) -> dict[str, Any] | None:
+    """Refuse an out-of-vocabulary ``include_card`` BEFORE the mutation runs.
+
+    ``include_card`` only decides how much of the post-transition card the
+    reply renders; it is never a reason to perform a write and then answer
+    ``ok: False``. Checking it after the call would report a refusal for a
+    transition that actually landed and discard its receipt, so every
+    lifecycle wrapper calls this first and the projection re-checks only as
+    defense in depth. The MCP boundary already constrains the Literal; this
+    covers direct Python callers and tests.
+    """
+
+    if include_card in _CARD_INCLUDE_MODES:
+        return None
+    return {
+        "ok": False,
+        "error": "invalid_include_card",
+        "allowed": list(_CARD_INCLUDE_MODES),
+        "received": str(include_card)[:40],
+    }
+
+
+def _detail_refusal(detail: str) -> dict[str, Any] | None:
+    """Refuse an out-of-vocabulary ``detail`` on the two read wrappers.
+
+    Without this the wrappers fall through their ``== "summary"`` /
+    ``== "full"`` branches and answer with the evidence-mode render while
+    stamping ``detail`` with whatever the caller typed -- a reply that says it
+    is one thing and is another. The MCP boundary constrains the Literal; this
+    covers direct Python callers and tests.
+    """
+
+    if detail in _STATUS_DETAIL_MODES:
+        return None
+    return {
+        "ok": False,
+        "error": "invalid_detail",
+        "allowed": list(_STATUS_DETAIL_MODES),
+        "received": str(detail)[:40],
+    }
+
+
+def _lifecycle_receipt(
+    result: Any,
+    *,
+    schema_id: str,
+    task_id: str,
+    include_card: str,
+    extra: Mapping[str, Any] | None = None,
+) -> Any:
+    """Project a lifecycle envelope (``stdout`` = post-transition card) to a receipt.
+
+    Every server-derived key the core call attached (reviewer_finalization,
+    learning_commit_owed, rework_delta_recovery, workspace_retention,
+    source_graph_refresh, dependency_autolaunch, ...) is carried through; the
+    card is replaced by its sha256/bytes unless ``include_card`` asks for it;
+    ``command`` is never echoed. A reply without a parseable card (an error,
+    or a mocked core) is returned as-is minus the argv echo so nothing is lost.
+    """
+
+    refusal = _include_card_refusal(include_card)
+    if refusal is not None:
+        return refusal
+    if not isinstance(result, dict):
+        return result
+    card = _envelope_card(result)
+    if not result.get("ok") or card is None:
+        return _without_argv_echo(result) if "command" in result else result
+    receipt: dict[str, Any] = {
+        "schema_id": schema_id,
+        "ok": True,
+        "task_id": task_id,
+        "status": card.get("status"),
+        "worker_status": card.get("worker_status"),
+    }
+    receipt.update(_card_identity(card))
+    for key, value in result.items():
+        if key not in _ENVELOPE_KEYS:
+            receipt[key] = value
+    if result.get("stderr"):
+        receipt["stderr"] = result["stderr"]
+    if extra:
+        receipt.update(extra)
+    view = _card_view(card, include_card)
+    if view is not None:
+        receipt["card"] = view
+    receipt["include_card"] = include_card
+    return receipt
+
+
+def _latest_task_event_payload(task_id: str, event_name: str) -> dict[str, Any] | None:
+    """Best-effort read of the newest ``event_name`` audit row for a task.
+
+    The reject_review event is where core records ``prior_episode`` (the
+    card itself loses it in ``begin_claim_episode``); a read failure here
+    only leaves that field ``None`` -- it never fails the mutation reply.
+    """
+
+    try:
+        rows = task_store.get_task_events(core.repo_root(), task_id, limit=5)
+    except (task_store.TaskStoreError, OSError, ValueError, TypeError):
+        return None
+    for row in rows:
+        if str(row.get("event") or "") != event_name:
+            continue
+        try:
+            payload = json.loads(str(row.get("payload") or "{}"))
+        except ValueError:
+            return None
+        return payload if isinstance(payload, dict) else None
+    return None
+
+
+def _reject_review_receipt_fields(
+    card: Mapping[str, Any], *, task_id: str, reason: str, to: str
+) -> dict[str, Any]:
+    feedback = card.get("review_feedback") if isinstance(card.get("review_feedback"), dict) else {}
+    rejection = (
+        card.get("rejection_disposition")
+        if isinstance(card.get("rejection_disposition"), dict) else {}
+    )
+    rework = card.get("rework_predecessor") if isinstance(card.get("rework_predecessor"), dict) else {}
+    reason_bytes = str(reason or "").encode("utf-8")
+    event = _latest_task_event_payload(task_id, "reject_review") or {}
+    return {
+        "to": to,
+        "reason_identity": feedback.get("reason_identity") or event.get("reason_identity") or {
+            "bytes": len(reason_bytes),
+            "sha256": hashlib.sha256(reason_bytes).hexdigest(),
+        },
+        "failure_category": rejection.get("failure_category") or event.get("terminal_disposition"),
+        "request_id": (
+            rejection.get("request_id")
+            or feedback.get("predecessor_request_id")
+            or rework.get("request_id")
+        ),
+        "claim_epoch": rework.get("claim_epoch"),
+        "prior_episode": event.get("prior_episode"),
+        "predecessor_changed_paths_count": len(feedback.get("predecessor_changed_paths") or []),
+        "residual_identities_count": len(feedback.get("residual_identities") or []),
+    }
+
+
+def _task_create_receipt(
+    created: Any,
+    *,
+    echo_card: bool,
+    template_provenance: Mapping[str, Any] | None = None,
+) -> Any:
+    """Project ``core.create_task``'s envelope to a creation receipt.
+
+    ``receipt_state``/``created``/``reconciled`` stay exactly as core set
+    them, so a reconciled existing card is never mistaken for a fresh one.
+    Errors are returned unchanged. ``echo_card=True`` returns today's full
+    envelope (stdout = the persisted card) for callers that parse it.
+
+    ``template_provenance`` is the provenance the template wrapper derived and
+    handed to core. The persisted card is the authority whenever it can be
+    read; this argument only supplies the same fact when the envelope carries
+    no parseable card, so the receipt names it in exactly one place and no
+    caller has to parse ``stdout`` to find it.
+    """
+
+    fallback_provenance = (
+        dict(template_provenance) if isinstance(template_provenance, Mapping) else None
+    )
+    if echo_card or not isinstance(created, dict) or not created.get("ok"):
+        return created
+    card = _envelope_card(created)
+    if card is None:
+        # Nothing to project. Keep the envelope exactly as core built it and
+        # add only the server-derived provenance, which lives nowhere else in
+        # it -- dropping it would lose the one fact this tool alone produces.
+        if fallback_provenance is None:
+            return created
+        return {**created, "template_provenance": fallback_provenance}
+    project_context = card.get("project_context") if isinstance(card.get("project_context"), dict) else {}
+    source_graph = (
+        project_context.get("source_graph")
+        if isinstance(project_context.get("source_graph"), dict) else {}
+    )
+    receipt: dict[str, Any] = {
+        "schema_id": "aiworkhub.task_create_receipt.v1",
+        "ok": True,
+        "task_id": created.get("task_id") or card.get("task_id"),
+        "created": created.get("created"),
+        "reconciled": created.get("reconciled"),
+        "receipt_state": created.get("receipt_state"),
+        "status": card.get("status"),
+        "worker_status": card.get("worker_status"),
+        "runner": card.get("runner"),
+        "topic": card.get("topic"),
+        "scope_warnings": created.get("scope_warnings", []),
+        "validation_roles": card.get("validation_roles"),
+        "work_kind": card.get("work_kind"),
+        "risk_tier": card.get("risk_tier"),
+        "risk_tier_origin": card.get("risk_tier_origin"),
+        "risk_signals": card.get("risk_signals"),
+        "validation_exemption": card.get("validation_exemption"),
+        "template_provenance": card.get("template_provenance") or fallback_provenance,
+        "project_context": {"source_graph": {"query": source_graph.get("query")}},
+    }
+    receipt.update(_card_identity(card))
+    for key, value in created.items():
+        if key not in _ENVELOPE_KEYS and key not in receipt:
+            receipt[key] = value
+    return receipt
+
+
+def _needfix_add_receipt(
+    row: Any, *, before: str, kind_normalized: dict[str, str] | None
+) -> Any:
+    """Project a stored NeedFix row to an add receipt with an explicit
+    dedupe outcome. A dedupe hit returns the pre-existing row, whose
+    ``created_at`` precedes this call; a fresh insert's does not."""
+
+    if not isinstance(row, dict):
+        return row
+    provenance = row.get("provenance") if isinstance(row.get("provenance"), dict) else {}
+    created_at = str(row.get("created_at") or "")
+    deduped = bool(created_at) and created_at < before
+    return {
+        "schema_id": "aiworkhub.needfix_add_receipt.v1",
+        "ok": True,
+        "id": row.get("id"),
+        "dedupe_key": row.get("dedupe_key"),
+        "status": row.get("status"),
+        "kind": row.get("kind"),
+        "severity": row.get("severity"),
+        "readiness_score": row.get("readiness_score"),
+        "created_at": created_at,
+        "updated_at": row.get("updated_at"),
+        "provenance": {
+            "origin": provenance.get("origin"),
+            "verified": provenance.get("verified"),
+        },
+        "deduped": deduped,
+        "existing_id": row.get("id") if deduped else None,
+        "dedupe_evidence": "created_at_precedes_call" if deduped else "created_in_call",
+        "kind_normalized": kind_normalized,
+    }
+
+
+def _needfix_update_receipt(row: Any, *, kind_normalized: dict[str, str] | None) -> Any:
+    if not isinstance(row, dict):
+        return row
+    update = row.get("update_receipt") if isinstance(row.get("update_receipt"), dict) else {}
+    evidence = row.get("evidence") if isinstance(row.get("evidence"), dict) else {}
+    return {
+        "schema_id": "aiworkhub.needfix_update_receipt.v1",
+        "ok": True,
+        "id": row.get("id"),
+        "status": row.get("status"),
+        "fields_changed": list(update.get("fields_changed") or []),
+        "updated_at": row.get("updated_at"),
+        "evidence_keys_after": list(
+            update.get("evidence_keys_after") or sorted(str(key) for key in evidence)
+        ),
+        "event_id": update.get("event_id"),
+        "kind_normalized": kind_normalized,
+    }
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _archive_many(
+    *,
+    tool: str,
+    task_id: str,
+    task_ids: list[str] | None,
+    status: str | None,
+    topic: str | None,
+    older_than_hours: float | None,
+    task_id_prefix: str | None,
+    dry_run: bool,
+    archive_one: Any,
+) -> dict[str, Any]:
+    """Shared body of the two archive tools: explicit ids or a selector, a
+    read-only preview, then per-item fail-soft receipts under the caller's
+    own write gate. Processing cards are still refused by the backend."""
+
+    ids: list[str] = []
+    single = str(task_id or "").strip()
+    if single:
+        ids.append(single)
+    for candidate in list(task_ids or []):
+        text = str(candidate or "").strip()
+        if text and text not in ids:
+            ids.append(text)
+    selector = {
+        "status": str(status).strip() if status else None,
+        "topic": str(topic).strip() if topic else None,
+        "older_than_hours": float(older_than_hours) if older_than_hours is not None else None,
+        "task_id_prefix": str(task_id_prefix).strip() if task_id_prefix else None,
+    }
+    selector_used = any(value not in (None, "") for value in selector.values())
+    if ids and selector_used:
+        return {"ok": False, "error": "archive_ids_and_selector_exclusive", "server_tool": tool}
+    if not ids and not selector_used:
+        return {
+            "ok": False,
+            "error": "archive_target_required",
+            "hint": "pass task_id, task_ids, or a selector (status/topic/older_than_hours/task_id_prefix)",
+            "server_tool": tool,
+        }
+    if len(ids) > task_engine.MAX_ARCHIVE_BATCH:
+        return {
+            "ok": False,
+            "error": "archive_batch_too_large",
+            "limit": task_engine.MAX_ARCHIVE_BATCH,
+            "received": len(ids),
+            "server_tool": tool,
+        }
+    invalid = [candidate for candidate in ids if not core._TASK_ID_RE.fullmatch(candidate)]
+    if invalid:
+        return {"ok": False, "error": "invalid_task_id", "invalid_task_ids": invalid[:20], "server_tool": tool}
+    selection: dict[str, Any] | None = None
+    if selector_used:
+        selection = task_engine.select_archivable_tasks(core.repo_root(), **selector)
+        ids = [str(entry["task_id"]) for entry in selection["selected"]]
+    if dry_run:
+        preview: dict[str, Any] = {
+            "schema_id": "aiworkhub.task_archive_preview.v1",
+            "ok": True,
+            "dry_run": True,
+            "would_archive": ids,
+            "count": len(ids),
+            "server_tool": tool,
+        }
+        if selection is not None:
+            preview["selector"] = {key: value for key, value in selector.items() if value not in (None, "")}
+            preview["selection"] = selection
+        return preview
+    receipts = [task_engine.archive_receipt(candidate, archive_one(candidate)) for candidate in ids]
+    archived = sum(1 for receipt in receipts if receipt["ok"])
+    reply: dict[str, Any] = {
+        "schema_id": "aiworkhub.task_archive_receipt.v1",
+        "ok": archived == len(receipts),
+        "dry_run": False,
+        "count": len(receipts),
+        "archived_count": archived,
+        "failed_count": len(receipts) - archived,
+        "receipts": receipts,
+        "server_tool": tool,
+    }
+    if selection is not None:
+        reply["selector"] = {key: value for key, value in selector.items() if value not in (None, "")}
+        reply["selection"] = {
+            key: selection[key] for key in ("refused", "truncated", "scanned", "limit")
+        }
+    if len(receipts) == 1 and not selector_used:
+        reply.update(receipts[0])
+    return reply
+
+
 RiskSignal = Literal[
     "public_api",
     "combined_change",
@@ -578,10 +995,26 @@ RiskSignal = Literal[
 
 
 @mcp.tool()
-def aiworkhub_manager_bootstrap() -> dict[str, Any]:
-    """CALL FIRST: mandatory repository manager contract and callback workflow."""
+def aiworkhub_manager_bootstrap(
+    include_contract: bool = False,
+    known_contract_sha256: str = "",
+) -> dict[str, Any]:
+    """CALL FIRST: mandatory repository manager contract and callback workflow.
 
-    return core.manager_bootstrap()
+    The identity block -- role, verified route, repository and storage
+    readiness, task health, the last hygiene pass and the Claude-route
+    dispatcher state -- is on every reply, so repository_current and
+    task_health need no call of their own.  The contract prose is delivered
+    once per verified session and then suppressed with its sha; pass
+    include_contract=true to re-read it, or known_contract_sha256 to prove you
+    already hold it.
+    """
+
+    return core.manager_bootstrap(
+        include_contract=bool(include_contract),
+        known_contract_sha256=str(known_contract_sha256 or ""),
+        bootstrap_call=True,
+    )
 
 
 @mcp.tool()
@@ -819,11 +1252,11 @@ def aiworkhub_manager_kb_write(
 def aiworkhub_manager_learning_commit(
     task_id: str,
     request_id: str,
-    repo_area: str,
-    outcome: str,
-    evidence_ids: list[str],
-    idempotency_key: str,
-    provenance: str,
+    repo_area: str = "",
+    outcome: str = "",
+    evidence_ids: list[str] | None = None,
+    idempotency_key: str = "",
+    provenance: str = "",
     root_cause_candidate: str = "",
     invariant_candidate: str = "",
     lesson_candidate: str = "",
@@ -831,15 +1264,65 @@ def aiworkhub_manager_learning_commit(
     promote_ai_memory: bool = False,
     promote_context_graph: bool = False,
     promote_kb: bool = False,
+    extra_evidence_ids: list[str] | None = None,
 ) -> dict[str, Any]:
-    """MANAGER WRITE: persist and project one verified Learning Commit."""
+    """MANAGER WRITE: persist and project one verified Learning Commit.
 
-    return manager_ai_tools.learning_commit(
+    SHORT FORM -- the one to use: ``task_id``, ``request_id`` and the lesson.
+    Everything mechanical is resolved server-side from the card's OWN decision
+    event: ``outcome`` is read from the adjudication (never asserted),
+    ``repo_area`` from the paths that decision was taken over, ``evidence_ids``
+    from the sealed FIXED_AND_VERIFIED acceptance reference, and
+    ``idempotency_key``/``provenance`` are the deterministic strings the
+    ``learning_commit_owed`` payload in your accept/reject reply already carried.
+    ``failure_category`` is always derived server-side from the card's structured
+    terminal evidence and is never caller-suppliable.
+
+    Add your own references with ``extra_evidence_ids``. An evidence id must
+    carry an allowed scheme -- ``file:``, ``http:`` or ``https:``. A ``sha256:``
+    receipt id is refused, and any refusal here returns
+    ``allowed_evidence_id_schemes``.
+
+    ``outcome`` is ``accepted``, ``rejected`` or ``inconclusive``; only the first
+    two may promote, and each promotion needs what its store demands (a lesson
+    for AI Memory, an invariant for KB, an edge plus an acceptance for Context
+    Graph).
+
+    LONG FORM (compatibility): supply repo_area, outcome, evidence_ids,
+    idempotency_key and provenance yourself and nothing is resolved. The lesson
+    text is always the caller's; nothing is written without this call.
+    """
+
+    resolution: dict[str, Any] = {}
+    supplied = list(evidence_ids or [])
+    mechanical = (repo_area, outcome, idempotency_key, provenance)
+    if not all(str(value or "").strip() for value in mechanical) or not supplied:
+        try:
+            resolution = learning_commit_store.resolve_short_form(
+                core.repo_root(), task_id=task_id, request_id=request_id
+            )
+        except learning_commit_store.LearningCommitStoreError as exc:
+            return {
+                "ok": False,
+                "error": str(exc)[:240],
+                "surface": "manager_mcp",
+                "allowed_evidence_id_schemes": list(
+                    learning_commit_store.ALLOWED_EVIDENCE_ID_SCHEMES
+                ),
+            }
+        repo_area = repo_area or str(resolution["repo_area"])
+        outcome = outcome or str(resolution["outcome"])
+        idempotency_key = idempotency_key or str(resolution["idempotency_key"])
+        provenance = provenance or str(resolution["provenance"])
+        supplied = supplied or list(resolution["evidence_ids"])
+
+    merged = list(dict.fromkeys([*supplied, *(extra_evidence_ids or [])]))
+    result = manager_ai_tools.learning_commit(
         task_id=task_id,
         request_id=request_id,
         repo_area=repo_area,
         outcome=outcome,
-        evidence_ids=evidence_ids,
+        evidence_ids=merged,
         idempotency_key=idempotency_key,
         provenance=provenance,
         root_cause_candidate=root_cause_candidate,
@@ -850,6 +1333,17 @@ def aiworkhub_manager_learning_commit(
         promote_context_graph=promote_context_graph,
         promote_kb=promote_kb,
     )
+    if isinstance(result, dict) and result.get("ok") is not True:
+        # A refusal must NAME what was allowed. 16 of 40 measured calls failed on
+        # shape, and the commonest was a scheme the error never enumerated.
+        result = {
+            **result,
+            "allowed_evidence_id_schemes": list(
+                learning_commit_store.ALLOWED_EVIDENCE_ID_SCHEMES
+            ),
+            "resolved_fields": resolution,
+        }
+    return result
 
 
 @mcp.tool()
@@ -957,25 +1451,59 @@ def aiworkhub_manager_context_write_intent_dispose(
 
 @mcp.tool()
 def aiworkhub_manager_skill_propose(
-    identity: str,
-    version: str,
-    scope: str,
-    task_family: str,
-    path_or_symbol: str,
-    risk: str,
-    stage: str,
-    triggers: list[str],
-    confidence: float,
+    identity: str = "",
+    version: str = "",
+    scope: str = "",
+    task_family: str = "",
+    path_or_symbol: str = "",
+    risk: str = "",
+    stage: str = "",
+    triggers: list[str] | None = None,
+    confidence: float = 0.0,
     applicability: list[str] | None = None,
     procedure_steps: list[str] | None = None,
     avoid_rules: list[str] | None = None,
     preferred_tools: list[str] | None = None,
+    candidate_id: str = "",
 ) -> dict[str, Any]:
-    """MANAGER WRITE: register and persist one caller-defined proposed skill.
+    """MANAGER WRITE: register and persist one proposed skill.
 
-    Every field is the caller's; no skill field is inferred or generated. The
-    proposal is evidence-free and a duplicate identity/version is refused without
-    overwriting the stored record.
+    Give ``candidate_id`` from ``aiworkhub_manager_skill_mine`` and the MECHANICAL
+    dimensions are copied server-side from that candidate's measured draft --
+    identity, version, scope, path_or_symbol, risk, stage. You then supply only
+    the judgement: task_family, triggers, applicability, confidence,
+    procedure_steps, avoid_rules. Passing a mechanical field that disagrees with
+    the candidate is refused, never silently overridden. Without a candidate_id
+    every field is required from the caller.
+
+    CLOSED VOCABULARIES -- a value outside these is refused before any write:
+      scope        repository | global
+      risk         low | medium | high | critical
+      stage        orientation | implementation | validation | review | rework
+      task_family  analysis | bugfix | data_ml | docs | implementation |
+                   performance | refactor | replay | security | test
+      triggers     authority_boundary | code_change | combined_change |
+                   concurrency | destructive_change | missing_validation |
+                   public_api | release | schema_migration | security_sensitive |
+                   clean_verdict_without_input_check | silently_bounded_population |
+                   single_bucket_aggregate | swallowed_exception_default |
+                   unknown_or_empty_result
+      applicability
+                   aggregation_reader | observability_surface | quality_gate |
+                   readiness_preflight | authority_boundary_surface |
+                   concurrency_surface | public_api_surface | release_surface |
+                   security_surface | storage_schema_surface
+      version      semver MAJOR.MINOR.PATCH with optional -prerelease/+build
+      identity     ^[a-z][a-z0-9_.-]{0,127}$
+      confidence   a finite float in [0, 1]
+      path_or_symbol
+                   a repository-RELATIVE path or symbol; absolute paths and ``..``
+                   are refused
+
+    The proposal is evidence-free and a duplicate identity/version is refused
+    without overwriting the stored record. It is never ACTIVE on creation:
+    activation needs accepted evidence from two DISTINCT actor identities and
+    stays a separate manager decision.
     """
 
     return manager_skill_tools.propose(
@@ -992,6 +1520,7 @@ def aiworkhub_manager_skill_propose(
         procedure_steps=procedure_steps,
         avoid_rules=avoid_rules,
         preferred_tools=preferred_tools,
+        candidate_id=candidate_id,
     )
 
 
@@ -1004,10 +1533,21 @@ def aiworkhub_manager_skill_add_evidence(
     actor_id: str,
     note: str = "",
 ) -> dict[str, Any]:
-    """MANAGER WRITE: append one caller-supplied evidence entry to a skill version.
+    """MANAGER WRITE: append one MANAGER evidence entry to a skill version.
 
-    Provenance is the caller's ``actor_id``, bound by the registry, so two
-    entries from distinct actors count as two independent accepted contributions.
+    CLOSED VOCABULARIES -- a guess is refused before a turn is spent:
+      outcome   accepted | negative
+      actor_id  ^[a-z][a-z0-9_.-]{0,127}$, and it may NOT contain the reserved
+                role tokens ``worker``, ``reviewer``, ``coordinator``, ``agent``
+                or ``owner``. Those name a DERIVED identity read off a task
+                card's own runner and can never be typed here.
+
+    Two spellings of one manager are ONE actor: identities are compared in their
+    canonical form, so ``manager.claude.7e`` and ``claude_manager_7e`` do not
+    make an activation independent. Genuinely independent evidence comes from a
+    card: it is appended automatically when a decision is recorded on a card the
+    skill was injected into, and can be filed for one card at a time through the
+    task-derived path.
     """
 
     return manager_skill_tools.add_evidence(
@@ -1018,6 +1558,28 @@ def aiworkhub_manager_skill_add_evidence(
         actor_id=actor_id,
         note=note,
     )
+
+
+@mcp.tool()
+def aiworkhub_manager_skill_usage(min_accepted_evidence: int = 2) -> dict[str, Any]:
+    """MANAGER READ: per-skill usage statistics, measured from the stored record.
+
+    For every stored skill version: how many versions of that identity are
+    proposed, its evidence rows split by outcome (accepted/negative), the number
+    of CANONICAL independent actor identities its accepted evidence rests on (not
+    the raw strings -- two spellings of one manager count once), the cards it was
+    injected into according to the persisted selection receipts, whether it is
+    injectable at all, and when it is not, the exact named reason:
+
+      lifecycle_state_is_retired
+      unresolved_negative_evidence
+      activation_evidence_below_two_distinct_actors
+      lifecycle_state_is_proposed_not_active
+
+    Read-only. It never activates, retires or evidences anything.
+    """
+
+    return manager_skill_tools.usage(min_accepted_evidence=min_accepted_evidence)
 
 
 @mcp.tool()
@@ -1105,9 +1667,31 @@ def aiworkhub_manager_recipe_seed_canonical() -> dict[str, Any]:
     worktree provisioning sequence, the finalization Git probes), naming its
     call site in its purpose. Idempotent: an entry already stored is reported as
     ``already_registered`` and its row is left untouched.
+
+    Per-project, not a fixed list. The universal entries -- the git
+    workspace/finalization/diff probes and the packaged ``aiworkhub.recipes.*``
+    operator modules -- install everywhere. The entries that depend on a
+    toolchain or on paths that must exist in THIS project install only when
+    ``toolchain_authority`` measures them present, so a project without Node
+    never receives ``validation.node_test``. ``withheld`` names every skipped
+    entry with its measured reason.
     """
 
     return manager_recipe_tools.seed_canonical()
+
+
+@mcp.tool()
+def aiworkhub_manager_recipe_seed_plan() -> dict[str, Any]:
+    """MANAGER READ: which catalogue entries THIS project would be seeded.
+
+    The same per-project decision ``aiworkhub_manager_recipe_seed_canonical``
+    makes, measured without making it: every eligible entry, every withheld one
+    with the reason it was withheld, and the toolchain evidence behind both.
+    Use it when onboarding a repository to see what it will get before anything
+    is written.
+    """
+
+    return manager_recipe_tools.seed_plan()
 
 
 @mcp.tool()
@@ -1123,6 +1707,32 @@ def aiworkhub_manager_recipe_list(limit: int = 100, offset: int = 0) -> dict[str
 
 
 @mcp.tool()
+def aiworkhub_manager_recipe_usage(
+    limit: int = 100, since: str | None = None
+) -> dict[str, Any]:
+    """MANAGER READ: which registered recipes are actually used, and by whom.
+
+    ``aiworkhub_manager_recipe_list`` answers how many recipes EXIST. This
+    answers whether anything uses them: every registered recipe appears with
+    its run count, how many DISTINCT verified actors ran it, its first and last
+    run, its exit-code distribution and the bytes those runs returned -- and a
+    recipe with no runs appears with ``used`` false rather than being omitted,
+    because "registered and never run" is the actionable state.
+
+    The actor on every receipt is derived by the server from the verified
+    route, never from a caller-supplied string, so ``distinct_actors`` cannot
+    be inflated by typing a new name. Runs recorded before actors existed are
+    reported as ``unattributed_runs`` rather than credited to anyone.
+
+    ``since`` is an ISO-8601 UTC timestamp bounding the evidence window;
+    ``registered_count`` still covers every stored manifest, and ``window_only``
+    marks the asymmetry.
+    """
+
+    return manager_recipe_tools.usage(limit=limit, since=since)
+
+
+@mcp.tool()
 def aiworkhub_manager_recipe_show(
     recipe_id: str, version: str | None = None
 ) -> dict[str, Any]:
@@ -1134,6 +1744,38 @@ def aiworkhub_manager_recipe_show(
     """
 
     return manager_recipe_tools.show(recipe_id=recipe_id, version=version)
+
+
+@mcp.tool()
+def aiworkhub_manager_recipe_run(
+    recipe_id: str,
+    version: str | None = None,
+    params: dict[str, Any] | None = None,
+    grant_capabilities: list[str] | None = None,
+) -> dict[str, Any]:
+    """MANAGER EXECUTE: run one PERSISTED recipe and return a bounded digest.
+
+    What runs is the immutable stored manifest resolved from the registry, not
+    a mapping typed at call time: ``argv[0]`` is a manifest literal, the vector
+    is built from typed slots, and it is spawned as an execve list with no
+    shell. Read-only by default -- ``tool_recipes.validate_invocation`` refuses
+    a recipe whose declared capabilities ``grant_capabilities`` does not name,
+    and a ``write``/``network`` recipe additionally requires the repository
+    write gate to be open.
+
+    A non-zero exit is a RESULT, not an error: the digest carries the return
+    code, the duration, stdout/stderr tails capped at 4096 characters with
+    explicit truncation flags, and the path plus SHA-256 of the full output
+    file, so the whole stream stays retrievable without being carried here.
+    Every run persists a ``tool_recipes`` invocation receipt.
+    """
+
+    return manager_recipe_tools.run(
+        recipe_id=recipe_id,
+        version=version,
+        params=params or {},
+        grant_capabilities=grant_capabilities or [],
+    )
 
 
 @mcp.tool()
@@ -1230,9 +1872,19 @@ def aiworkhub_task_create(
     skill_applicability: list[str] | None = None,
     skill_path_scope: str | None = None,
     custom_template_escape: str | None = None,
+    apply_contract_patch: str | None = None,
+    echo_card: bool = False,
 ) -> dict[str, Any]:
     """MANAGER WRITE: create one new canonical repo-local task card.
 
+    Replies with a creation receipt (``aiworkhub.task_create_receipt.v1``):
+    task_id, created/reconciled/receipt_state, scope_warnings, the
+    server-derived validation_roles, risk_tier/origin/signals,
+    validation_exemption, template_provenance, the project_context
+    Source Graph query, and card_sha256/card_bytes -- never the card the
+    caller just typed. ``echo_card=True`` returns the full CLI envelope with
+    the persisted card in ``stdout`` instead. A refusal names every
+    violation at once (``violations``) with field, length and limit.
     The live manager session supplies callback provider/origin identity;
     callers cannot route a task into another chat, disable the mandatory
     review callback, or overwrite an existing id.
@@ -1286,7 +1938,7 @@ def aiworkhub_task_create(
     fail closed unless ``custom_template_escape`` is the audited token.
     """
 
-    return core.create_task(
+    created = core.create_task(
         task_id=task_id,
         title=title,
         runner=runner,
@@ -1315,7 +1967,9 @@ def aiworkhub_task_create(
         skill_applicability=skill_applicability,
         skill_path_scope=skill_path_scope,
         custom_template_escape=custom_template_escape,
+        apply_contract_patch=apply_contract_patch,
     )
+    return _task_create_receipt(created, echo_card=echo_card)
 
 
 @mcp.tool()
@@ -1346,9 +2000,13 @@ def aiworkhub_task_create_from_template(
     skill_triggers: list[str] | None = None,
     skill_applicability: list[str] | None = None,
     skill_path_scope: str | None = None,
+    echo_card: bool = False,
 ) -> dict[str, Any]:
     """MANAGER WRITE: create one task from an authenticated template.
 
+    Replies with the same creation receipt as ``aiworkhub_task_create``
+    (``template_provenance`` once, from the persisted card); ``echo_card=True``
+    returns the full CLI envelope with the card in ``stdout``.
     Callers supply routing fields, task text/acceptance, a template ID, and
     explicit production/test paths. Generated ``allowed_writes``,
     ``required_outputs``, ``read_first``, ``read_only``, ``task_type``,
@@ -1464,10 +2122,12 @@ def aiworkhub_task_create_from_template(
         skill_path_scope=skill_path_scope,
         template_provenance=provenance,
     )
-    return {
-        **created,
-        "template_provenance": provenance,
-    }
+    if echo_card:
+        return {
+            **created,
+            "template_provenance": provenance,
+        }
+    return _task_create_receipt(created, echo_card=False, template_provenance=provenance)
 
 
 def _task_template_discovery_payload(
@@ -1659,15 +2319,41 @@ def aiworkhub_task_list(status: str = "pending", topic: str | None = None, limit
 
 
 @mcp.tool()
-def aiworkhub_task_show(task_id: str, full: bool = False) -> dict[str, Any]:
+def aiworkhub_task_show(
+    task_id: str, full: bool = False, detail: StatusDetail = "summary"
+) -> dict[str, Any]:
     """Show a single task card by task_id.
 
     Summary-first by default: retained baseline hash maps (tree, workspace and
-    parent baselines) are folded to entry count plus sha256 so a lookup stays a
-    few KB; pass ``full=True`` for the exact stored card.
+    parent baselines) are folded to entry count plus sha256, and the evidence
+    blobs (terminal_review.evidence.{validation, quality_gate, quality_review,
+    quality_review_receipt, worker_mcp_gate, workspace} and
+    accept_evidence.{validation, quality_gate}) are folded to
+    {summarized, bytes, sha256, verdict/status, failed_count, first_failure}.
+    ``detail="evidence"`` keeps the evidence blobs exact (baselines still
+    folded); ``detail="full"`` or ``full=True`` returns the exact stored card.
+    Summary/evidence renders are compact JSON; ``full`` keeps the indented one.
     """
 
-    return core.show_task(task_id, full=full)
+    refusal = _detail_refusal(detail)
+    if refusal is not None:
+        return refusal
+    if full or detail == "full":
+        return core.show_task(task_id, full=True)
+    result = core.show_task(task_id, full=False)
+    card = _envelope_card(result)
+    if card is None:
+        return result
+    if detail == "summary":
+        card = core.summarize_evidence(card)
+    rendered = dict(result)
+    rendered["stdout"] = json.dumps(card, ensure_ascii=False, default=str, separators=(",", ":"))
+    rendered["detail"] = detail
+    rendered["detail_request"] = {
+        "evidence": {"tool": "aiworkhub_task_show", "task_id": task_id, "detail": "evidence"},
+        "full": {"tool": "aiworkhub_task_show", "task_id": task_id, "detail": "full"},
+    }
+    return rendered
 
 
 @mcp.tool()
@@ -1737,10 +2423,25 @@ def aiworkhub_task_mark_review(task_id: str) -> dict[str, Any]:
 
 @mcp.tool()
 @_serialize_task_lifecycle_write
-def aiworkhub_task_mark_done(task_id: str) -> dict[str, Any]:
-    """Write-gated: finalize a reviewed task as done."""
+def aiworkhub_task_mark_done(task_id: str, include_card: CardInclude = "none") -> dict[str, Any]:
+    """Write-gated: finalize a reviewed task as done.
 
-    return core.mark_done(task_id=task_id)
+    Replies with a receipt (``aiworkhub.mark_done_receipt.v1``): task_id,
+    status, card_sha256/card_bytes plus the server-derived
+    source_graph_refresh, dependency_autolaunch and workspace_retention
+    facts. ``include_card`` = none (default) | summary (baselines and
+    evidence folded) | full (the exact post-transition card).
+    """
+
+    refusal = _include_card_refusal(include_card)
+    if refusal is not None:
+        return refusal
+    return _lifecycle_receipt(
+        core.mark_done(task_id=task_id),
+        schema_id="aiworkhub.mark_done_receipt.v1",
+        task_id=task_id,
+        include_card=include_card,
+    )
 
 
 @mcp.tool()
@@ -1763,6 +2464,7 @@ def aiworkhub_task_reject_review(
     to: str = "pending",
     residual_identities: list[dict[str, str]] | None = None,
     predecessor_request_id: str | None = None,
+    include_card: CardInclude = "none",
 ) -> dict[str, Any]:
     """Write-gated Codex action: reject a reviewed task with exact feedback and
     an explicit disposition. ``to`` = pending (rework, default) | blocked |
@@ -1772,8 +2474,18 @@ def aiworkhub_task_reject_review(
     ``predecessor_request_id`` selects an exact retained review request as
     the rework workspace authority.  Omitted (None) defaults to the current
     review request.  An empty string fails closed.
+
+    Replies with a receipt (``aiworkhub.reject_review_receipt.v1``): task_id,
+    to, status, request_id, claim_epoch, prior_episode, failure_category,
+    reason_identity (sha256 + bytes, never the text), predecessor changed-path
+    and residual counts, rework_delta_recovery, reviewer_finalization,
+    learning_commit_owed, card_sha256/card_bytes. The reason and the argv are
+    never echoed; ``include_card`` = none (default) | summary | full.
     """
 
+    refusal = _include_card_refusal(include_card)
+    if refusal is not None:
+        return refusal
     kwargs: dict[str, Any] = {"task_id": task_id, "reason": reason, "to": to}
     # Preserve the established public call shape for callers that do not use
     # the optional typed residual contract.  This also keeps older embedded
@@ -1782,7 +2494,20 @@ def aiworkhub_task_reject_review(
         kwargs["residual_identities"] = residual_identities
     if predecessor_request_id is not None:
         kwargs["predecessor_request_id"] = predecessor_request_id
-    return core.reject_review(**kwargs)
+    result = core.reject_review(**kwargs)
+    card = _envelope_card(result)
+    extra = (
+        _reject_review_receipt_fields(card, task_id=task_id, reason=reason, to=to)
+        if card is not None and isinstance(result, dict) and result.get("ok")
+        else None
+    )
+    return _lifecycle_receipt(
+        result,
+        schema_id="aiworkhub.reject_review_receipt.v1",
+        task_id=task_id,
+        include_card=include_card,
+        extra=extra,
+    )
 
 
 @mcp.tool()
@@ -1856,15 +2581,38 @@ def aiworkhub_task_reroute_launch_identity(
 @mcp.tool()
 @_serialize_task_lifecycle_write
 def aiworkhub_task_archive(
-    task_id: str,
+    task_id: str = "",
     reason: str = "",
+    task_ids: list[str] | None = None,
+    status: str | None = None,
+    topic: str | None = None,
+    older_than_hours: float | None = None,
+    task_id_prefix: str | None = None,
+    dry_run: bool = False,
 ) -> dict[str, Any]:
-    """COORDINATOR WRITE: archive a stale non-processing task atomically
-    (archived_at + card_json + an ``archived`` task_events row). Runs the full
-    coordinator-capability write gate -- use this instead of patching SQLite.
-    For an active/orphaned card use supersede."""
+    """COORDINATOR WRITE: archive stale non-processing tasks atomically
+    (archived_at + card_json + an ``archived`` task_events row each). Runs the
+    full coordinator-capability write gate per item -- use this instead of
+    patching SQLite. For an active/orphaned card use supersede.
 
-    return core.archive_task(task_id=task_id, reason=reason)
+    Targets: one ``task_id``, ``task_ids`` (<= 200), or a selector
+    (``status``/``topic``/``older_than_hours``/``task_id_prefix``, conjunctive).
+    ``dry_run=True`` previews the exact ids (and the processing cards that
+    would be refused) without writing. Replies with per-id receipts
+    ``{task_id, ok, status_after, error?}``; one refusal never hides the rest.
+    """
+
+    return _archive_many(
+        tool="aiworkhub_task_archive",
+        task_id=task_id,
+        task_ids=task_ids,
+        status=status,
+        topic=topic,
+        older_than_hours=older_than_hours,
+        task_id_prefix=task_id_prefix,
+        dry_run=dry_run,
+        archive_one=lambda candidate: core.archive_task(task_id=candidate, reason=reason),
+    )
 
 
 @mcp.tool()
@@ -1899,19 +2647,46 @@ def aiworkhub_task_supersede(
 @mcp.tool()
 @_serialize_task_lifecycle_write
 def aiworkhub_manager_task_archive(
-    task_id: str,
+    task_id: str = "",
     reason: str = "",
+    task_ids: list[str] | None = None,
+    status: str | None = None,
+    topic: str | None = None,
+    older_than_hours: float | None = None,
+    task_id_prefix: str | None = None,
+    dry_run: bool = False,
 ) -> dict[str, Any]:
-    """MANAGER WRITE: archive a non-processing card without deleting audit history."""
+    """MANAGER WRITE: archive non-processing cards without deleting audit history.
+
+    Targets: one ``task_id``, ``task_ids`` (<= 200), or a selector
+    (``status``/``topic``/``older_than_hours``/``task_id_prefix``, conjunctive).
+    ``dry_run=True`` previews the exact ids (and the processing cards that
+    would be refused) without writing. Same write gate and verified manager
+    actor per item, one audit event per task, per-id receipts
+    ``{task_id, ok, status_after, error?}``.
+    """
 
     if not core.writes_allowed():
-        return {"ok": False, "error": "write_gate_closed", "task_id": task_id}
-    return task_engine.archive_task(
-        core.repo_root(),
-        task_id,
-        actor=core._verified_manager_actor(),
-        reason=reason,
-        supersede=False,
+        closed: dict[str, Any] = {"ok": False, "error": "write_gate_closed", "task_id": task_id}
+        if task_ids:
+            closed["task_ids"] = list(task_ids)
+        return closed
+    return _archive_many(
+        tool="aiworkhub_manager_task_archive",
+        task_id=task_id,
+        task_ids=task_ids,
+        status=status,
+        topic=topic,
+        older_than_hours=older_than_hours,
+        task_id_prefix=task_id_prefix,
+        dry_run=dry_run,
+        archive_one=lambda candidate: task_engine.archive_task(
+            core.repo_root(),
+            candidate,
+            actor=core._verified_manager_actor(),
+            reason=reason,
+            supersede=False,
+        ),
     )
 
 
@@ -2584,9 +3359,9 @@ _VALIDATION_REPLAY_AUTO_RECOVERY_REASONS = frozenset(
 @_serialize_task_lifecycle_write
 def aiworkhub_agent_launch_task(
     task_id: str,
-    runner: str,
-    topic: str,
-    adapter_id: str,
+    runner: str | None = None,
+    topic: str | None = None,
+    adapter_id: str | None = None,
     model: str | None = None,
     owner_prompt: str = "",
     timeout_seconds: int = 7200,
@@ -2597,10 +3372,17 @@ def aiworkhub_agent_launch_task(
     AIWORKHUB_ALLOW_WRITES=1. The task card, runner, topic, pending state,
     allowed-write scope, collision guard, adapter, and process limit are all
     validated before a shell-free child process can start.
-    Use the exact ``launch_contract`` returned by workforce ranking; the
-    manager identity ``codex`` is never a worker runner.
     ``timeout_seconds`` is retained only as non-enforcing compatibility
     metadata; this API never installs a provider wall-clock deadline.
+
+    ``runner``, ``topic`` and ``adapter_id`` are optional because the server
+    already owns them: the card carries runner and topic (the launcher refused
+    any value that differed, so typing them asserted rather than decided), and
+    the adapter is a pure function of the runner narrowed to the first
+    pinnable, policy-allowed entry in canonical tuple order. Omit them and the
+    reply's ``launch_identity_derivation`` records exactly what was derived;
+    pass them and the explicit value wins and is validated as before. The
+    manager identity ``codex`` is never a worker runner.
     """
 
     core.scrub_coordinator_capability_from_environment()
@@ -2680,10 +3462,44 @@ def aiworkhub_quality_reviewer_launch(
 
 
 @mcp.tool()
-def aiworkhub_agent_task_status(request_id: str) -> dict[str, Any]:
-    """READ-ONLY: inspect one launched process and its authoritative task card."""
+def aiworkhub_agent_task_status(
+    request_id: str, detail: StatusDetail = "summary"
+) -> dict[str, Any]:
+    """READ-ONLY: inspect one launched process and its authoritative task card.
 
-    return process_launcher.default_manager().status(request_id)
+    ``detail="summary"`` (default) folds the card's baseline hash maps and
+    evidence blobs and the latest event's validation/quality_gate/
+    worker_mcp_gate/token_budget/project_context to
+    {summarized, bytes, sha256, verdict/status, failed_count, first_failure};
+    ``"evidence"`` keeps the evidence exact (baselines still folded);
+    ``"full"`` returns the raw status payload.
+    """
+
+    refusal = _detail_refusal(detail)
+    if refusal is not None:
+        return refusal
+    result = process_launcher.default_manager().status(request_id)
+    if detail == "full" or not isinstance(result, dict) or not result.get("ok"):
+        return result
+    folded = dict(result)
+    card = folded.get("task_card")
+    if isinstance(card, dict):
+        card = core.summarize_card_baselines(card)
+        if detail == "summary":
+            card = core.summarize_evidence(card)
+        folded["task_card"] = card
+    latest = folded.get("latest_event")
+    if isinstance(latest, dict):
+        latest = core.summarize_card_baselines(latest)
+        if detail == "summary":
+            latest = core.summarize_evidence(latest, paths=core.EVENT_EVIDENCE_PATHS)
+        folded["latest_event"] = latest
+    folded["detail"] = detail
+    folded["detail_request"] = {
+        "evidence": {"tool": "aiworkhub_agent_task_status", "request_id": request_id, "detail": "evidence"},
+        "full": {"tool": "aiworkhub_agent_task_status", "request_id": request_id, "detail": "full"},
+    }
+    return folded
 
 
 @mcp.tool()
@@ -2730,16 +3546,52 @@ def aiworkhub_agent_retry_finalization(
 
 
 @mcp.tool()
+def aiworkhub_agent_accept_preview(
+    request_id: str,
+    task_id: str,
+    requested_risk_tier: str | None = None,
+    reviewer_request_ids: list[str] | None = None,
+    confirm_high_risk: bool = False,
+    confirm_destructive_change: bool = False,
+) -> dict[str, Any]:
+    """READ-ONLY: what would block accept_review right now, before any work.
+
+    Measured 2026-09-08: 49 of 159 accept attempts (31%) failed on a blocker
+    that was knowable in advance -- a required lens still running, a target not
+    yet review_ready, an approval not given -- but only after the combined tree
+    had been materialized and two validation runs paid for. This folds exactly
+    those cheap blockers and writes nothing.
+
+    A clear preview is NOT an acceptance and NOT a promise of one. The
+    expensive half -- combined tree, declared validations, mechanical gate,
+    reviewer receipt verification by request id -- runs only in accept_review
+    and can still refuse. ``blocked`` False means only that nothing cheap is
+    refusing yet. Leave ``requested_risk_tier`` unset to read the tier the
+    finalizer measured; an explicit value can only raise it.
+    """
+
+    return process_launcher.default_manager().accept_preview(
+        request_id,
+        task_id,
+        requested_risk_tier=requested_risk_tier,
+        reviewer_request_ids=reviewer_request_ids,
+        confirm_high_risk=confirm_high_risk,
+        confirm_destructive_change=confirm_destructive_change,
+    )
+
+
+@mcp.tool()
 @_serialize_task_lifecycle_write
 def aiworkhub_agent_accept_review(
     request_id: str,
     task_id: str,
     confirm_destructive_change: bool = False,
-    requested_risk_tier: str = quality_evidence.RISK_LOW,
+    requested_risk_tier: str | None = None,
     risk_signals: list[RiskSignal] | None = None,
     reviewer_reports: list[dict[str, Any]] | None = None,
     reviewer_request_ids: list[str] | None = None,
     confirm_high_risk: bool = False,
+    include_card: CardInclude = "none",
 ) -> dict[str, Any]:
     """COORDINATOR/WRITE-GATED: accept one ``review_ready`` request, phase 2.
 
@@ -2753,9 +3605,21 @@ def aiworkhub_agent_accept_review(
     Medium-and-higher risk profiles also validate a fresh canonical+candidate
     combined tree and require strict reviewer findings; high/critical review
     requires an explicit ``confirm_high_risk`` decision.
+
+    A successful reply is the receipt (``aiworkhub.accept_review_receipt.v1``):
+    promoted_paths, reviewer_finalization, acceptance_evidence_record,
+    accepted_outcome_receipt, needfix_closure, learning_commit_owed, plus the
+    finalized card's status and card_sha256/card_bytes. ``include_card`` =
+    none (default) | summary | full adds the card view. Errors are unchanged.
     """
 
-    return process_launcher.default_manager().accept_review(
+    # Refuse a bad render mode BEFORE the accept runs: checking it afterwards
+    # would answer ``ok: False`` for a promotion that already landed and throw
+    # the receipt away.
+    refusal = _include_card_refusal(include_card)
+    if refusal is not None:
+        return refusal
+    result = process_launcher.default_manager().accept_review(
         request_id,
         task_id,
         confirm_destructive_change=confirm_destructive_change,
@@ -2765,6 +3629,24 @@ def aiworkhub_agent_accept_review(
         reviewer_request_ids=reviewer_request_ids,
         confirm_high_risk=confirm_high_risk,
     )
+    if not isinstance(result, dict) or not result.get("ok"):
+        return result
+    receipt: dict[str, Any] = {"schema_id": "aiworkhub.accept_review_receipt.v1", **result}
+    # The accept reply never carried the card; its identity is one bounded
+    # read, best-effort so a read failure cannot fail an accept that landed.
+    try:
+        card = task_store.get_task(core.repo_root(), task_id)
+    except (task_store.TaskStoreError, OSError, ValueError, TypeError):
+        card = None
+    if isinstance(card, dict):
+        receipt["status"] = card.get("status")
+        receipt["worker_status"] = card.get("worker_status")
+        receipt.update(_card_identity(card))
+        view = _card_view(card, include_card)
+        if view is not None:
+            receipt["card"] = view
+    receipt["include_card"] = include_card
+    return receipt
 
 
 @mcp.tool()
@@ -3383,15 +4265,33 @@ def needfix_add(
     evidence_refs: list[str] | None = None,
     readiness_score: int = 0,
 ) -> dict:
-    """Manager-authority add of a NeedFix (dedupe-aware)."""
-    return core.needfix_add(
+    """Manager-authority add of a NeedFix (dedupe-aware).
+
+    ``kind`` must be one of: bug, feature, improvement, idea, technical_debt,
+    optimization, benchmark_gap, documentation_drift, security_risk,
+    investigation, roadmap_candidate, refactor, security, docs, other.
+    Common synonyms are normalised server-side and reported as
+    ``kind_normalized``: gap->improvement, defect->bug,
+    performance->optimization, design->refactor, dead_code->technical_debt,
+    test_coverage->improvement.
+    ``severity`` must be one of: critical, high, medium, low, info.
+
+    Replies with a receipt (``aiworkhub.needfix_add_receipt.v1``): id,
+    dedupe_key, status, kind, severity, created_at, provenance.origin,
+    ``deduped`` with ``existing_id`` when the dedupe key matched a live row
+    (the existing row is returned, nothing new is written), kind_normalized.
+    The row itself is one ``needfix_show`` away.
+    """
+    canonical_kind, kind_normalized = needfix_store.normalize_kind(kind)
+    before = _utc_now_iso()
+    row = core.needfix_add(
         title=title,
         description=description,
         scope=scope,
         provenance=provenance,
         evidence=evidence,
         status=status,
-        kind=kind,
+        kind=canonical_kind,
         severity=severity,
         tags=tags,
         scope_files=scope_files,
@@ -3399,6 +4299,7 @@ def needfix_add(
         evidence_refs=evidence_refs,
         readiness_score=readiness_score,
     )
+    return _needfix_add_receipt(row, before=before, kind_normalized=kind_normalized)
 
 
 @mcp.tool()
@@ -3415,14 +4316,47 @@ def needfix_update(
     evidence: dict | None = None,
     evidence_refs: list[str] | None = None,
     readiness_score: int | None = None,
+    evidence_patch: dict | None = None,
+    evidence_refs_add: list[str] | None = None,
+    evidence_refs_remove: list[str] | None = None,
+    tags_add: list[str] | None = None,
+    tags_remove: list[str] | None = None,
+    scope_files_add: list[str] | None = None,
+    scope_symbols_add: list[str] | None = None,
+    expected_updated_at: str | None = None,
 ) -> dict:
-    """Manager update of mutable NeedFix fields."""
-    return core.needfix_update(
+    """Manager update of mutable NeedFix fields.
+
+    ``None`` keeps a field. ``evidence`` is an explicit FULL REPLACE of the
+    evidence object; ``evidence_patch`` is a JSON merge patch (keys merged,
+    nested objects merged, ``null`` deletes a key) applied server-side to the
+    stored object, so one measurement can be added without re-sending the
+    rest. The two are mutually exclusive. ``evidence_refs_add/remove``,
+    ``tags_add/remove``, ``scope_files_add`` and ``scope_symbols_add`` edit
+    the lists in place (add appends missing values, remove filters).
+    ``expected_updated_at`` is optimistic concurrency: the update is refused
+    (``needfix_update_stale``) when the stored ``updated_at`` differs.
+    ``kind`` vocabulary and synonym normalisation are as in ``needfix_add``.
+
+    Replies with a delta receipt (``aiworkhub.needfix_update_receipt.v1``):
+    id, status, fields_changed, updated_at, evidence_keys_after, event_id,
+    kind_normalized. The ``updated`` audit event records the same
+    fields_changed plus the evidence sha256 before and after.
+    """
+    canonical_kind: str | None = None
+    kind_normalized: dict[str, str] | None = None
+    if kind is not None:
+        canonical_kind, kind_normalized = needfix_store.normalize_kind(kind)
+    # The patch/list-edit/concurrency parameters live on the store's
+    # ``update_needfix``; ``core.needfix_update`` is the legacy field-only
+    # forwarder, so this tool binds the store directly to the verified repo.
+    row = needfix_store.update_needfix(
+        core.repo_root(),
         needfix_id,
         title=title,
         description=description,
         scope=scope,
-        kind=kind,
+        kind=canonical_kind,
         severity=severity,
         tags=tags,
         scope_files=scope_files,
@@ -3430,7 +4364,16 @@ def needfix_update(
         evidence=evidence,
         evidence_refs=evidence_refs,
         readiness_score=readiness_score,
+        evidence_patch=evidence_patch,
+        evidence_refs_add=evidence_refs_add,
+        evidence_refs_remove=evidence_refs_remove,
+        tags_add=tags_add,
+        tags_remove=tags_remove,
+        scope_files_add=scope_files_add,
+        scope_symbols_add=scope_symbols_add,
+        expected_updated_at=expected_updated_at,
     )
+    return _needfix_update_receipt(row, kind_normalized=kind_normalized)
 
 
 @mcp.tool()

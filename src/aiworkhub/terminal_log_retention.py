@@ -229,12 +229,65 @@ def _ledger_token_counts(usage: Mapping[str, Any], adapter_id: str) -> tuple[int
     return input_tokens, output_tokens
 
 
+def _attempt_recorded_at(
+    root: Path,
+    process_root: Path,
+    request_id: str,
+    row: Mapping[str, Any],
+) -> str:
+    """ISO-8601 UTC instant at which the backfilled attempt actually finished.
+
+    The usage row itself is inserted at backfill time, so without this field
+    the ledger would bucket and order the attempt by the backfill instant.
+    Sources, in order of authority: the supervisor's own ``finished_at_epoch``
+    in ``<request>.supervisor.json``; the launcher's terminal ``finished_at``
+    on the process-ledger row for the same request; the ``claim_start`` event
+    ``created_at`` for this exact request (the attempt's start). Empty when
+    none is readable -- the ledger then falls back to its write time rather
+    than inventing an instant.
+    """
+
+    status_path = process_root / f"{request_id}.supervisor.json"
+    if _owned_regular_file(status_path, process_root) is not None:
+        try:
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            status = None
+        epoch = status.get("finished_at_epoch") if isinstance(status, dict) else None
+        if isinstance(epoch, (int, float)) and not isinstance(epoch, bool) and epoch > 0:
+            try:
+                return datetime.fromtimestamp(float(epoch), tz=timezone.utc).isoformat()
+            except (OverflowError, OSError, ValueError):
+                pass
+    finished_at = str(row.get("finished_at") or "").strip()
+    if finished_at:
+        return finished_at
+    task_id = str(row.get("task_id") or "")
+    try:
+        events = task_store.get_task_events(root, task_id, limit=500)
+    except task_store.TaskStoreError:
+        return ""
+    for event in events:
+        if str(event.get("event") or "") != "claim_start":
+            continue
+        try:
+            payload = json.loads(str(event.get("payload") or "{}"))
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict) and str(payload.get("request_id") or "") == request_id:
+            return str(event.get("created_at") or "")
+    return ""
+
+
 def backfill_usage_capture(repo_root: Path | str, *, confirm: bool) -> dict[str, Any]:
     """Idempotently recover usage receipts from retained provider output.
 
     No token or cost is estimated. A structured provider report is normalized;
     otherwise an explicit ``provider_usage_report_not_observed`` receipt is
     retained so cleanup can proceed without pretending the run was free.
+    The payload carries ``attempt_recorded_at`` (the run's own finish time)
+    beside the row's ``created_at`` write time so the ledger can bucket and
+    order the attempt truthfully.
     """
 
     if confirm is not True:
@@ -269,6 +322,9 @@ def backfill_usage_capture(repo_root: Path | str, *, confirm: bool) -> dict[str,
         payload = {
             "runner": runner,
             "topic": str(row.get("topic") or ""),
+            "attempt_recorded_at": _attempt_recorded_at(
+                root, process_root, request_id, row
+            ),
             "model": observed_model or str(row.get("model") or adapter_id),
             "requested_model": str(row.get("model") or adapter_id),
             "observed_model": observed_model,

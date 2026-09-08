@@ -87,7 +87,20 @@ _TASK_CREATE_SKILL_VOCABULARY = [
     "skill_path_scope",
 ]
 
-_TASK_CREATE_TAIL = ["custom_template_escape"]
+# ``echo_card`` is the deliberate, reviewed addition of mcp-output-2 /
+# card_launch-1: the tool now answers with a creation receipt and only echoes
+# the persisted card in ``stdout`` when this is True.
+#
+# ``apply_contract_patch`` is the deliberate, reviewed addition of
+# card_launch-7. 243 cards ended on an unchanged-required-output terminal and
+# only 32 of 4,681 ever set ``allow_unchanged_required_outputs``, because the
+# manager had to retype the exact paths and they must match required_outputs
+# and allowed_writes byte for byte -- got wrong twice in the measured sample.
+# The finalizer already holds that list, so it records a digest-named patch and
+# the manager approves it by reference here. The patch can only ever name paths
+# already present in BOTH lists, so approving one can never widen a card, and
+# the resolved list still faces validate_required_output_exceptions unchanged.
+_TASK_CREATE_TAIL = ["custom_template_escape", "apply_contract_patch", "echo_card"]
 
 
 def test_task_create_schema_remains_unchanged():

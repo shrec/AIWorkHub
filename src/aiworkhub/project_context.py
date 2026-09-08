@@ -42,6 +42,35 @@ TOOL_CAPS: dict[str, dict[str, int]] = {
 }
 SKILL_PACKET_SCHEMA_ID = "aiworkhub.task_mcp.skill_runtime_packet.v1"
 SKILL_SELECT_LIMIT = 4
+# The injected focus orientation is bounded by the same envelope a worker's own
+# focus/slice call receives, so injecting it never costs more prompt bytes than
+# the first live orientation call it replaces (worker_prompt-1).
+SOURCE_GRAPH_ORIENTATION_SCHEMA_ID = "aiworkhub.task_mcp.source_graph_orientation.v1"
+SOURCE_GRAPH_ORIENTATION_BYTES = int(_worker_tools.SOURCE_GRAPH_ORIENTATION_OUTPUT_BYTES)
+# Entity rows shared across every indexed target before byte fitting, and the
+# per-target floor/ceiling (the ceiling is ``file_query``'s own entity limit).
+ORIENTATION_ENTITY_ALLOWANCE = 48
+ORIENTATION_ENTITIES_PER_TARGET_MIN = 4
+ORIENTATION_ENTITIES_PER_TARGET_MAX = 16
+ORIENTATION_FOCUS_MATCHES = 12
+ORIENTATION_INSIGHT_ROWS = 6
+ORIENTATION_DIRECTORY_SYMBOLS = 12
+ORIENTATION_SIGNATURE_CHARS = 120
+# An empty orientation with one of these reasons is a truthful "nothing to
+# orient on" (the card names no path Source Graph could hold), not a failure.
+ORIENTATION_EMPTY_EXEMPT_REASONS = frozenset({"no_targets", "targets_not_on_disk"})
+# Keys whose list/mapping value holds result rows. A row inside one of these
+# is a hit; a list under any other key never is.
+_RESULT_CONTAINER_KEYS = frozenset({
+    "items", "results", "matches", "rows", "symbols", "files", "sections",
+    "entities", "contexts", "ranked_symbols", "direct_matches",
+})
+# Retrieval provenance the engine restores even on a scoped miss. These mark
+# the payload as a retrieval envelope but never count as hits.
+_ECHO_KEYS = frozenset({
+    "query_tokens", "query_tokens_source", "candidate_files", "tags",
+    "targets", "requested_target", "unindexed_targets",
+})
 SOURCE_GRAPH_MODES = (
     "focus", "slice", "context", "file", "function", "class", "body", "bodygrep",
     "impact", "trace", "deps", "bundle",
@@ -255,8 +284,24 @@ def _tool_cap(name: str, cap: str, default: int) -> int:
 
 
 def _json_hit_count(value: Any) -> int:
+    """Count result rows in a canonical tool payload.
+
+    A hit is one row inside a *result container*: a list (or an id-keyed
+    mapping) stored under one of ``_RESULT_CONTAINER_KEYS`` at any depth,
+    reached through nested dicts and list elements but never through an
+    echo key. Echo keys (``query_tokens``, ``candidate_files``, ...) are
+    retrieval provenance the engine restores even on a scoped miss: they
+    mark the payload as a retrieval envelope but never count. Counting them
+    reported ``hit_count == len(query_tokens)`` for every zero-hit focus
+    bundle and defeated ``source_graph_required_empty_result``
+    (worker_prompt-1). A payload with neither a container nor an echo key
+    is opaque: a non-empty one counts as a single hit so unknown tool
+    shapes stay lenient, an empty one as zero. A bounded preview reports
+    the count of the payload it previews.
+    """
+
     if isinstance(value, list):
-        return len(value) + sum(_json_hit_count(item) for item in value)
+        return _row_count(value)
     if isinstance(value, dict):
         if value.get("schema_id") == "aiworkhub.task_mcp.bounded_json_preview.v1":
             original_hit_count = value.get("original_hit_count")
@@ -266,19 +311,54 @@ def _json_hit_count(value: Any) -> int:
                 and original_hit_count >= 0
             ):
                 return original_hit_count
-        total = 0
-        saw_result_container = False
-        for key, item in value.items():
-            if key in {"items", "results", "matches", "rows", "symbols", "files", "sections"}:
-                saw_result_container = True
-                total += _json_hit_count(item)
-            elif isinstance(item, (dict, list)):
-                total += _json_hit_count(item)
-        if total:
+        total, saw_envelope = _container_rows(value)
+        if saw_envelope:
             return total
-        if saw_result_container:
-            return 0
         return 1 if value else 0
+    return 0
+
+
+def _container_rows(value: dict[str, Any]) -> tuple[int, bool]:
+    """Rows under result containers reachable from ``value``.
+
+    The second element says whether a result container or an echo key was
+    seen at all, which is what separates "looked and found nothing" from an
+    opaque payload of unknown shape.
+    """
+
+    total = 0
+    saw_envelope = False
+    for key, item in value.items():
+        if key in _ECHO_KEYS:
+            saw_envelope = True
+            continue
+        if key in _RESULT_CONTAINER_KEYS:
+            saw_envelope = True
+            total += _row_count(item)
+        elif isinstance(item, dict):
+            nested, nested_saw = _container_rows(item)
+            total += nested
+            saw_envelope = saw_envelope or nested_saw
+        elif isinstance(item, list):
+            # A list under any other key is not a result container; only the
+            # containers its dict rows may themselves hold count.
+            for element in item:
+                if isinstance(element, dict):
+                    nested, nested_saw = _container_rows(element)
+                    total += nested
+                    saw_envelope = saw_envelope or nested_saw
+    return total, saw_envelope
+
+
+def _row_count(container: Any) -> int:
+    if isinstance(container, list):
+        return len(container) + sum(
+            _container_rows(row)[0] for row in container if isinstance(row, dict)
+        )
+    if isinstance(container, dict):
+        nested, saw_envelope = _container_rows(container)
+        # An id-keyed mapping with no nested container is itself the row set.
+        return nested if saw_envelope else len(container)
     return 0
 
 
@@ -454,7 +534,18 @@ def _canonical_json_output(
 
 
 def _suppress_irrelevant_sections(sections: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Drop duplicate/empty optional payloads without hiding tool outcomes."""
+    """Drop duplicate/empty payloads without hiding tool outcomes.
+
+    A zero-hit executed section carries no bootstrap value: the launcher has
+    already measured that the canonical query returned nothing for this
+    request, so its model-visible content is emptied while ``executed``,
+    ``hit_count`` and ``degraded_reason`` stay in metadata -- that is the
+    evidence the launcher gate credits as the tool having run. Session
+    Manager joins AI Memory / KB / skills here (worker_prompt-2): its
+    zero-hit envelope was injected into every request and bought nothing.
+    Source Graph is never suppressed -- its zero-hit orientation names why
+    it is empty, which the worker must see.
+    """
 
     out: list[dict[str, Any]] = []
     seen_relevant: set[str] = set()
@@ -467,7 +558,7 @@ def _suppress_irrelevant_sections(sections: list[dict[str, Any]]) -> list[dict[s
         if (
             optimized.get("executed")
             and not relevant
-            and name in {"ai_memory", "kb", "skills"}
+            and name in {"session_current_state", "ai_memory", "kb", "skills"}
         ):
             optimized["content"] = ""
             optimized["content_suppressed"] = True
@@ -617,6 +708,335 @@ def _validate_contract(card: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
+def _target_path(repo: Path, target: str) -> Path | None:
+    """Resolve a contract target inside ``repo``, or ``None`` when it escapes."""
+
+    try:
+        root = repo.resolve()
+        candidate = (root / target).resolve()
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if candidate != root and root not in candidate.parents:
+        return None
+    return candidate
+
+
+def _compact_entity(row: dict[str, Any]) -> dict[str, Any]:
+    compact: dict[str, Any] = {
+        "kind": str(row.get("kind") or ""),
+        "name": str(row.get("name") or ""),
+        "line_start": row.get("line_start"),
+        "line_end": row.get("line_end"),
+    }
+    signature = str(row.get("signature") or "")
+    if signature:
+        compact["signature"] = signature[:ORIENTATION_SIGNATURE_CHARS]
+    return compact
+
+
+def _compact_symbol(row: dict[str, Any]) -> dict[str, Any]:
+    qualname = str(row.get("qualname") or row.get("name") or "")
+    compact: dict[str, Any] = {
+        "qualname": qualname,
+        "kind": str(row.get("kind") or ""),
+        "line_start": row.get("line_start"),
+        "line_end": row.get("line_end"),
+    }
+    file_path = str(row.get("file_path") or "")
+    if file_path and not qualname.startswith(file_path):
+        compact["file_path"] = file_path
+    return compact
+
+
+def _orientation_file_row(
+    sg: Any, repo: Path, target: str, budget: int,
+) -> dict[str, Any] | None:
+    """One indexed target as the worker's ``file`` mode would show it, minus
+    the raw source preview (``file``/``body`` modes and bounded reads exist
+    for that). ``None`` when the index does not hold ``target``."""
+
+    payload = sg.file_query(repo, target, budget)
+    contexts = payload.get("contexts") if isinstance(payload, dict) else None
+    context = contexts[0] if isinstance(contexts, list) and contexts else None
+    if not isinstance(context, dict) or not context.get("found"):
+        return None
+    file_row = context.get("file") if isinstance(context.get("file"), dict) else {}
+    entities = [
+        row for row in (context.get("entities") or [])
+        # The module row repeats the path the target already names, and the
+        # import rows (first by line, so they would fill the whole allowance)
+        # are dependency evidence the ``deps`` mode owns, not definitions.
+        if isinstance(row, dict) and str(row.get("kind") or "") not in {"module", "import"}
+    ]
+    return {
+        "target": target,
+        "language": str(file_row.get("language") or ""),
+        "status": str(file_row.get("status") or ""),
+        "entities": [_compact_entity(row) for row in entities],
+    }
+
+
+def _orientation_directory_row(
+    sg: Any, repo: Path, target: str, query: str, budget: int,
+) -> dict[str, Any] | None:
+    """A directory target as its top-ranked in-scope symbols (``symbols``
+    analytic scoped to the directory), or ``None`` when nothing is indexed
+    beneath it."""
+
+    try:
+        payload = sg.analytics_query(
+            repo, "symbols", query, min(budget, ORIENTATION_DIRECTORY_SYMBOLS),
+            target=target,
+        )
+    except sg.SourceGraphError:
+        # ``file_query`` already opened the same database for this target, so
+        # what remains here is a target the analytic scope grammar refuses.
+        return None
+    symbols = [
+        row for row in (payload.get("symbols") or []) if isinstance(row, dict)
+    ] if isinstance(payload, dict) else []
+    if not symbols:
+        return None
+    coverage = payload.get("coverage") if isinstance(payload.get("coverage"), dict) else {}
+    eligible = coverage.get("eligible")
+    return {
+        "target": target,
+        "kind": "directory",
+        "symbols": [_compact_symbol(row) for row in symbols[:ORIENTATION_DIRECTORY_SYMBOLS]],
+        "symbol_count": int(eligible) if isinstance(eligible, int) and not isinstance(eligible, bool) else len(symbols),
+    }
+
+
+def _orientation_empty_reason(targets: list[str], unindexed_on_disk: int) -> str:
+    if not targets:
+        return "no_targets"
+    if unindexed_on_disk == 0:
+        return "targets_not_on_disk"
+    return "targets_unindexed"
+
+
+def _orientation_rows_key(row: dict[str, Any]) -> str:
+    """A file row carries ``entities``; a directory row carries ``symbols``."""
+
+    return "entities" if "entities" in row else "symbols"
+
+
+def _orientation_size(payload: dict[str, Any]) -> int:
+    return len(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    )
+
+
+def _fit_orientation(payload: dict[str, Any], cap: int) -> dict[str, Any]:
+    """Deterministically trim the orientation to ``cap`` bytes.
+
+    Least-specific evidence goes first: focus insights, then focus matches,
+    then entity signatures, then the longest entity list (halved, never
+    below the per-target floor), then whole matches, then the last target
+    row. Identical input always yields the identical trimmed payload.
+    """
+
+    insight_keys = ("related_tests", "ranked_symbols", "recommended_next_steps")
+    files: list[dict[str, Any]] = payload["files"]
+    orientation: dict[str, Any] = payload["orientation"]
+    trimmed = False
+    while _orientation_size(payload) > cap:
+        if any(key in payload for key in insight_keys):
+            for key in insight_keys:
+                payload.pop(key, None)
+        elif len(payload["matches"]) > ORIENTATION_ENTITIES_PER_TARGET_MIN:
+            payload["matches"] = payload["matches"][: len(payload["matches"]) // 2]
+        elif any("signature" in entity for row in files for entity in row.get("entities", ())):
+            for row in files:
+                for entity in row.get("entities", ()):
+                    entity.pop("signature", None)
+        elif any(
+            len(row.get(_orientation_rows_key(row)) or ()) > ORIENTATION_ENTITIES_PER_TARGET_MIN
+            for row in files
+        ):
+            longest = max(files, key=lambda row: len(row.get(_orientation_rows_key(row)) or ()))
+            key = _orientation_rows_key(longest)
+            rows = longest[key]
+            keep = max(ORIENTATION_ENTITIES_PER_TARGET_MIN, len(rows) // 2)
+            longest[f"{key}_omitted"] = int(longest.get(f"{key}_omitted") or 0) + (len(rows) - keep)
+            longest[key] = rows[:keep]
+        elif payload["matches"]:
+            payload["matches"] = []
+        elif len(files) > 1:
+            files.pop()
+            orientation["omitted_targets"] = int(orientation.get("omitted_targets") or 0) + 1
+        elif files and files[0].get(_orientation_rows_key(files[0])):
+            key = _orientation_rows_key(files[0])
+            files[0][f"{key}_omitted"] = int(files[0].get(f"{key}_omitted") or 0) + len(files[0][key])
+            files[0][key] = []
+        else:
+            break
+        trimmed = True
+    if trimmed:
+        payload["truncated"] = True
+    return payload
+
+
+def _focus_orientation(sg: Any, repo: Path, contract: dict[str, Any]) -> dict[str, Any]:
+    """Build the injected orientation deterministically from the card's targets.
+
+    The orientation inputs are card facts the coordinator already holds:
+    ``read_first`` / ``immutable_inputs`` / ``allowed_writes`` become the
+    contract targets (declared or derived, bounded by ``MAX_TARGETS``). Each
+    target is previewed through the same ``file`` mode a worker would call
+    (``symbols`` scoped to the directory for a directory target), and the
+    manager's free-text focus query rides along as a second slice only when
+    it hits. Running ``focus`` alone on that free text -- 72% path tokens --
+    produced an empty section in 680/680 bundles while every worker re-ran
+    orientation from zero (worker_prompt-1). The whole payload is fitted to
+    ``SOURCE_GRAPH_ORIENTATION_BYTES`` so the prompt cannot grow past what
+    the first live focus call it replaces would have cost.
+    """
+
+    source = contract["source_graph"]
+    query = str(source["query"])
+    budget = int(source["budget"])
+    targets = [str(target) for target in source["targets"]][:MAX_TARGETS]
+    # ``file_query`` derives its entity ceiling from ``budget // 2``; keep the
+    # preview budget high enough to reach the per-target ceiling.
+    preview_budget = min(MAX_BUDGET, max(budget, 2 * ORIENTATION_ENTITIES_PER_TARGET_MAX))
+    files: list[dict[str, Any]] = []
+    unindexed: list[str] = []
+    unindexed_on_disk = 0
+    for target in targets:
+        row = _orientation_file_row(sg, repo, target, preview_budget)
+        resolved = _target_path(repo, target) if row is None else None
+        if row is None and resolved is not None and resolved.is_dir():
+            row = _orientation_directory_row(sg, repo, target, query, budget)
+        if row is None:
+            unindexed.append(target)
+            if resolved is not None and resolved.is_file():
+                unindexed_on_disk += 1
+            continue
+        files.append(row)
+
+    focus_payload = sg.focus(repo, query, budget)
+    if not isinstance(focus_payload, dict):
+        focus_payload = {}
+    focus_matches = [
+        row for row in (focus_payload.get("matches") or []) if isinstance(row, dict)
+    ]
+
+    per_target = max(
+        ORIENTATION_ENTITIES_PER_TARGET_MIN,
+        min(
+            ORIENTATION_ENTITIES_PER_TARGET_MAX,
+            ORIENTATION_ENTITY_ALLOWANCE // max(1, len(files)),
+        ),
+    )
+    for row in files:
+        entities = row.get("entities")
+        if isinstance(entities, list) and len(entities) > per_target:
+            row["entities_omitted"] = len(entities) - per_target
+            row["entities"] = entities[:per_target]
+
+    orientation: dict[str, Any] = {
+        "schema_id": SOURCE_GRAPH_ORIENTATION_SCHEMA_ID,
+        "targets_origin": str(source["targets_origin"]),
+        "targets": len(targets),
+        "indexed": len(files),
+        "unindexed": len(unindexed),
+        "unindexed_on_disk": unindexed_on_disk,
+        "focus_hit_count": len(focus_matches),
+    }
+    if not files and not focus_matches:
+        orientation["empty_reason"] = _orientation_empty_reason(targets, unindexed_on_disk)
+    payload: dict[str, Any] = {
+        "mode": "focus",
+        "query": query,
+        "budget": budget,
+        "orientation": orientation,
+        "files": files,
+        "unindexed_targets": unindexed,
+        "matches": [_compact_symbol(row) for row in focus_matches[:ORIENTATION_FOCUS_MATCHES]],
+        "query_tokens": [str(token) for token in (focus_payload.get("query_tokens") or [])],
+        "candidate_files": [
+            str(path) for path in (focus_payload.get("candidate_files") or [])
+        ][:ORIENTATION_INSIGHT_ROWS],
+        "truncated": bool(focus_payload.get("truncated")),
+    }
+    if focus_matches:
+        # The metrics used to arrive as a separate ``ranked_symbols`` list.
+        # That list was a second copy of the matches -- measured at 25-45% of
+        # a focus payload -- and was folded into the match rows themselves, so
+        # reading it here would now silently yield nothing and every worker's
+        # injected orientation would quietly lose its priority/risk hints.
+        # Rank from the rows that carry the score, in the engine's own
+        # ``(-priority_score, qualname)`` order, so the ordering survives the
+        # fold rather than depending on the caller's arrival order.
+        scored = sorted(
+            (
+                row
+                for row in focus_matches
+                if isinstance(row.get("priority_score"), int)
+                and not isinstance(row.get("priority_score"), bool)
+            ),
+            key=lambda row: (
+                -int(row["priority_score"]),
+                str(row.get("qualname") or ""),
+            ),
+        )
+        ranked = [
+            {
+                "qualname": str(row.get("qualname") or ""),
+                "priority_score": row.get("priority_score"),
+                "risk_reasons": [str(reason) for reason in (row.get("risk_reasons") or [])][:3],
+            }
+            for row in scored
+        ][:ORIENTATION_INSIGHT_ROWS]
+        if ranked:
+            payload["ranked_symbols"] = ranked
+        tests = [
+            str(row.get("file_path"))
+            for row in (focus_payload.get("related_tests") or [])
+            if isinstance(row, dict) and row.get("file_path")
+        ][:ORIENTATION_INSIGHT_ROWS]
+        if tests:
+            payload["related_tests"] = tests
+        steps = [str(step) for step in (focus_payload.get("recommended_next_steps") or [])][:4]
+        if steps:
+            payload["recommended_next_steps"] = steps
+    return _fit_orientation(payload, SOURCE_GRAPH_ORIENTATION_BYTES)
+
+
+def _source_graph_empty_reason(source_text: str) -> str:
+    """The orientation's own ``empty_reason``, or ``""`` for any other payload."""
+
+    try:
+        payload = json.loads(source_text)
+    except (TypeError, ValueError):
+        return ""
+    orientation = payload.get("orientation") if isinstance(payload, dict) else None
+    if not isinstance(orientation, dict):
+        return ""
+    return str(orientation.get("empty_reason") or "")
+
+
+def _orientation_metadata(source_text: str) -> dict[str, Any] | None:
+    """Counts-only view of the orientation block for process metadata.
+
+    Never paths or query text: metadata is redacted evidence (B434/B437).
+    """
+
+    try:
+        payload = json.loads(source_text)
+    except (TypeError, ValueError):
+        return None
+    orientation = payload.get("orientation") if isinstance(payload, dict) else None
+    if not isinstance(orientation, dict):
+        return None
+    return {
+        key: value
+        for key, value in orientation.items()
+        if isinstance(value, (int, str)) and not isinstance(value, bool)
+    }
+
+
 def _source_graph_direct(repo: Path, contract: dict[str, Any]) -> tuple[str, bool]:
     """Query the canonical AIWorkHub Source Graph in-process.
 
@@ -625,6 +1045,10 @@ def _source_graph_direct(repo: Path, contract: dict[str, Any]) -> tuple[str, boo
     The repository (and therefore the durable database under
     ``<repo>/.aiworkhub/source_graph``) is resolved from ``repo`` via
     repository identity, never a fixed path or ambient ``cwd``.
+
+    ``focus`` -- the orientation mode every launcher-made card declares --
+    is built by :func:`_focus_orientation` from the contract targets; every
+    other mode runs the one declared query exactly as written.
     """
 
     from . import source_graph as _source_graph_mod
@@ -667,7 +1091,7 @@ def _source_graph_direct(repo: Path, contract: dict[str, Any]) -> tuple[str, boo
         elif mode == "deps":
             payload = _source_graph_mod.deps_query(repo, query, source["budget"])
         elif mode == "focus":
-            payload = _source_graph_mod.focus(repo, query, source["budget"])
+            payload = _focus_orientation(_source_graph_mod, repo, contract)
         elif mode in _source_graph_mod.SOURCE_GRAPH_MODES:
             payload = _source_graph_mod.analytics_query(
                 repo, mode, query, source["budget"]
@@ -858,6 +1282,21 @@ def _skills_section(repo: Path, card: dict[str, Any]) -> dict[str, Any] | None:
         candidates = skill_registry_store.load_registry(repo).records()
         receipt = skill_registry.select(candidates, context, limit=SKILL_SELECT_LIMIT)
         packet = skill_registry.build_runtime_packet(candidates, receipt)
+        # Persist WHICH skills this card received. Without it the retirement
+        # report measured cards_with_persisted_packet 0 across 4,681 cards and
+        # every skill read injected_cards 0, so a skill could never be shown to
+        # have reached a worker. Reported, never raising: a store failure
+        # returns {"ok": False, "reason": ...} and the context bundle is
+        # unaffected. request_id is empty on purpose -- the launcher mints it
+        # on the line AFTER this collection, so the receipt is card-keyed and
+        # the decision resolves it from the card's latest receipt.
+        skill_registry_store.record_selection_reported(
+            repo,
+            task_id=str(card.get("task_id") or ""),
+            request_id="",
+            packet=packet,
+            context=context,
+        )
     except (
         skill_registry.SkillRegistryError,
         skill_registry_store.SkillStoreError,
@@ -954,8 +1393,22 @@ def collect_project_context(repo: Path, card: dict[str, Any]) -> ProjectContextR
         and contract["task_type"] == "code"
         and source_section["hit_count"] <= 0
     ):
-        raise ProjectContextError("source_graph_required_empty_result")
+        # Fail closed: a required code orientation that found nothing blocks
+        # the launch before any claim (the launcher turns this into
+        # ``blocked_reason``). The one truthful exception is an orientation
+        # that says the card names nothing Source Graph could hold -- no
+        # targets, or only paths that do not exist yet -- which is a zero-hit
+        # section the worker sees, not a silent one. A card naming on-disk
+        # files the index does not know stays blocked: the worker's mandatory
+        # live Source Graph use would be blind on the card's own files.
+        empty_reason = _source_graph_empty_reason(source_text)
+        if empty_reason not in ORIENTATION_EMPTY_EXEMPT_REASONS:
+            raise ProjectContextError(
+                "source_graph_required_empty_result"
+                + (f":{empty_reason}" if empty_reason else "")
+            )
     sections.append(source_section)
+    source_orientation = _orientation_metadata(source_text)
 
     try:
         session_result = _worker_tools.session_current_state(ctx, limit=contract["session"]["limit"])
@@ -1131,6 +1584,9 @@ def collect_project_context(repo: Path, card: dict[str, Any]) -> ProjectContextR
         },
         "bundle_sha256": _sha256_text(bundle),
         "bundle_bytes": len(bundle.encode("utf-8")),
+        # Counts only (targets/indexed/unindexed/focus hits/empty_reason):
+        # how the injected orientation was built, without its paths or query.
+        "source_graph_orientation": source_orientation,
         "repo_identity": {
             "repo_id": repo_id,
             "repo_root": str(authority_repo),

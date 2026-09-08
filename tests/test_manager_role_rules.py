@@ -188,13 +188,21 @@ def test_mechanical_gates_run_first_and_obstacles_are_needfix() -> None:
 
 def test_claude_preamble_states_the_role_before_the_protocol() -> None:
     """Criterion 1: CLAUDE_MANAGER_PREAMBLE leads with the role, ahead of the
-    tool-startup protocol and ahead of the shared canonical body."""
+    tool-startup protocol and ahead of the shared canonical body.
+
+    Re-pinned by audit startup-5 (2026-09-08): the preamble used to restate
+    three role sentences that the shared body already carries, so CLAUDE.md
+    rendered each of them twice with wording drift ('different vendor' in the
+    preamble, 'second vendor' in the body). The preamble still comes first and
+    still names the role, but it binds the single 'Manager role:' statement to
+    direct Claude chats instead of repeating it; every load-bearing sentence
+    now appears exactly once in the rendered CLAUDE.md."""
     text = instr.render_projection("CLAUDE.md")
     role_at = text.index("Claude Code manager role")
     startup_at = text.index("Claude Code manager startup")
     canonical_at = text.index("# AIWorkHub MCP tool-use policy")
     assert role_at < startup_at < canonical_at
-    # The five role statements the preamble itself must make.
+    assert '"Manager role:" rules' in instr.CLAUDE_MANAGER_PREAMBLE
     for required in (
         "The manager does not write code",
         "distributes work to workers by difficulty and cost",
@@ -202,9 +210,11 @@ def test_claude_preamble_states_the_role_before_the_protocol() -> None:
         "independence is this role separation",
         "a single-provider install is fully supported and not degraded",
         "Every card that reaches review is closed the same turn",
-        "acceptance is decided by measurement, never by asking the owner to approve a production accept",
+        "does not ask the owner to approve a production accept",
     ):
-        assert required in instr.CLAUDE_MANAGER_PREAMBLE, required
+        assert text.count(required) == 1, required
+        assert required not in instr.CLAUDE_MANAGER_PREAMBLE, required
+    assert "different vendor" not in text
 
 
 def test_preamble_role_is_claude_local_but_shared_role_reaches_all_providers() -> None:
@@ -217,6 +227,41 @@ def test_preamble_role_is_claude_local_but_shared_role_reaches_all_providers() -
     # But the model-agnostic role IS in AGENTS.md / copilot.
     assert "The manager does not write code" in rendered["AGENTS.md"]
     assert "The manager does not write code" in rendered[".github/copilot-instructions.md"]
+
+
+def test_manager_corrections_use_the_manager_semantic_editor() -> None:
+    """Audit edit-1: the seat is allowed small precise corrections, and the
+    same rule that binds workers binds those. scripts/manager_semantic_edit.py
+    replaces one hash-verified line range ("Replace one hash-verified line
+    range; never rewrite a file."), so the preamble names the instrument, its
+    flags and the behaviour, not just an intention."""
+    text = instr.render_projection("CLAUDE.md")
+    rule = next(
+        line
+        for line in instr.CLAUDE_MANAGER_PREAMBLE.splitlines()
+        if "manager_semantic_edit.py" in line
+    )
+    assert "scripts/manager_semantic_edit.py --path --start --end" in rule
+    assert "replacement on stdin" in rule
+    assert "replaces one hash-verified line range and never rewrites a file" in rule
+    assert "The manager does not correct by whole-string rewrite." in rule
+    assert text.count("manager_semantic_edit.py") == 1
+    # The manager rule is CLAUDE-local; the worker mandate is the shared one.
+    for provider in ("AGENTS.md", ".github/copilot-instructions.md"):
+        assert "manager_semantic_edit.py" not in instr.render_projection(provider)
+        assert "Semantic edit (mandatory):" in instr.render_projection(provider)
+
+
+def test_manager_semantic_editor_named_in_the_preamble_exists_and_says_so() -> None:
+    """The sentence is checked against the script it names."""
+    script = (
+        Path(__file__).resolve().parents[1] / "scripts" / "manager_semantic_edit.py"
+    )
+    source = script.read_text(encoding="utf-8")
+    assert "Replace one hash-verified line range; never rewrite a file." in source
+    for flag in ("--path", "--start", "--end"):
+        assert f'"{flag}"' in source
+    assert "sys.stdin.read()" in source
 
 
 def test_role_addition_keeps_every_projection_within_the_declared_caps() -> None:

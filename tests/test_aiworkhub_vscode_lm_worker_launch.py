@@ -104,9 +104,14 @@ def test_prepared_packet_delivers_source_evidence_in_every_lens_prompt(manager):
     scoped = packet["candidate"]["scoped_audits"]
     assert set(scoped) == {"correctness", "security", "code_quality"}
     for lens in ("correctness", "security", "code_quality"):
-        prompt = quality_reviewer.build_review_prompt(packet, lens=lens)
+        # One shared preparation, one packet per lens: the reviewer is handed
+        # ``build_lens_packet``'s slice, which still carries the source
+        # evidence and carries exactly this lens's scope.
+        lens_packet = quality_reviewer.build_lens_packet(packet, lens=lens)
+        assert set(lens_packet["candidate"]["scoped_audits"]) == {lens}
+        prompt = quality_reviewer.build_review_prompt(lens_packet, lens=lens)
         assert "candidate marker" in prompt
-        assert "active graph-scoped audit entry" in prompt
+        assert f"candidate.scoped_audits.{lens} is the graph-scoped audit" in prompt
         scope = scoped[lens]["packet"]
         assert scope["review_lens"]["lens_kind"] == lens
         assert scope["changed_paths"] == [

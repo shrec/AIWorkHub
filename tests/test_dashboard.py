@@ -2617,7 +2617,11 @@ def test_coding_foundation_default_provider_is_wired_no_sample(tmp_path: Path) -
     skills = provider.get_skills_projection_input()
     assert len(list(skills)) == 0
     recipes = provider.get_tool_recipes_projection_input()
-    assert len(recipes) == 0
+    # The input carries the registry and, once a run exists, its receipts; an
+    # unprovisioned repository has neither, so the registry is empty and the
+    # ``receipts`` key is absent rather than an empty list claiming a zero.
+    assert len(recipes["registry"]) == 0
+    assert "receipts" not in recipes
     snapshot = dashboard.build_snapshot(provider)
     for key in ("development_rules", "skills", "tool_recipes"):
         projection = snapshot[key]

@@ -424,10 +424,29 @@ def launch_isolated(
                     / "task_mcp_worker_runtime"
                     / "quality_review_packet.json"
                 )
-                write_json_0600(
-                    review_packet_path,
-                    dict(quality_review_binding["packet"]),
+                # The packet written into the reviewer's runtime is the exact
+                # bytes packet_read, submit and the receipt verifier bind to.
+                # It must carry this lens's scope and no other: the launcher
+                # derives it with ``quality_reviewer.build_lens_packet`` and a
+                # packet still carrying every lens here is a contract error,
+                # not a bigger file to ship.  A packet without scoped audits
+                # (synthetic fixtures, no Source Graph scope) has nothing to
+                # check.
+                review_packet = dict(quality_review_binding["packet"])
+                review_candidate = review_packet.get("candidate")
+                review_scopes = (
+                    review_candidate.get("scoped_audits")
+                    if isinstance(review_candidate, Mapping)
+                    else None
                 )
+                if isinstance(review_scopes, Mapping) and set(review_scopes) != {
+                    str(quality_review_binding["lens"])
+                }:
+                    raise LaunchRejected(
+                        "quality_review_packet_lens_scope_mismatch:"
+                        + ",".join(sorted(str(key) for key in review_scopes))[:200]
+                    )
+                write_json_0600(review_packet_path, review_packet)
                 launch_phase = "quality_review_source_graph_prewarm"
                 try:
                     worker_ai_tools_mcp.verify_quality_review_prewarm_authority(

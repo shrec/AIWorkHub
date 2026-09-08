@@ -2391,3 +2391,58 @@ def test_reconciler_declares_no_platform_facts_of_its_own():
     )
     offenders = [token for token in forbidden if token in source]
     assert offenders == [], f"platform facts leaked into task_reconciler: {offenders}"
+
+
+def test_gc_scan_prunes_stale_pending_callbacks_without_a_manager_call(tmp_path, monkeypatch):
+    """The stale-callback prune must not depend on an optional manager call.
+
+    Measured 2026-09-08: 84 pending Claude outbox rows (age p50 124 h) whose
+    tasks were long superseded or archived fenced task hygiene with
+    ``callback_live`` on every run. The prune existed, but only inside the
+    route rebind of ``dispatcher_ensure_started`` -- a tool a manager may never
+    call -- so a repository nobody bootstrapped kept the fence forever. The GC
+    pass is the durable owner: it runs every 20th scan with no model involved.
+    """
+    from aiworkhub import core, task_reconciler
+
+    calls: list[Path] = []
+    monkeypatch.setattr(
+        core,
+        "_prune_stale_callbacks",
+        lambda root: (calls.append(Path(root)), {"state": "completed", "superseded": 3})[1],
+    )
+    manager = SimpleNamespace(
+        repo=tmp_path,
+        reconcile=lambda include_gc=True: {"reconciled": 0, "gc_cleaned": 0},
+    )
+
+    with_gc = task_reconciler.run_scan(manager, include_gc=True)
+    assert with_gc["callback_prune"] == {"state": "completed", "superseded": 3}
+    assert calls == [tmp_path.resolve()]
+
+    # A non-GC pass must not pay for it, and must say so rather than reporting
+    # a prune that never ran.
+    without_gc = task_reconciler.run_scan(manager, include_gc=False)
+    assert without_gc["callback_prune"]["state"] == "skipped"
+    assert without_gc["callback_prune"]["reason"] == "gc_not_included"
+    assert calls == [tmp_path.resolve()]
+
+
+def test_gc_scan_survives_a_failing_callback_prune(tmp_path, monkeypatch):
+    """Hygiene is best effort: a broken callback store never fails a scan."""
+    from aiworkhub import core, task_reconciler
+
+    def _boom(root: Path) -> dict[str, object]:
+        raise RuntimeError("callback store unavailable")
+
+    monkeypatch.setattr(core, "_prune_stale_callbacks", _boom)
+    manager = SimpleNamespace(
+        repo=tmp_path,
+        reconcile=lambda include_gc=True: {"reconciled": 1},
+    )
+
+    result = task_reconciler.run_scan(manager, include_gc=True)
+    assert result["ok"] is True
+    assert result["reconciled"] == 1
+    assert result["callback_prune"]["state"] == "skipped"
+    assert result["callback_prune"]["reason"] == "RuntimeError"

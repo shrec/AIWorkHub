@@ -39,7 +39,17 @@ def measure() -> dict[str, Any]:
         source_graph.build_index(repo, incremental=False)
 
         focused = source_graph.focus(repo, "target_entry", 32)
-        target = str(focused["ranked_symbols"][0]["qualname"])
+        # focus folds its per-symbol metrics onto the match rows; the former
+        # ``ranked_symbols`` order is ``(-priority_score, qualname)`` and both
+        # keys ride on the row, so the top-ranked symbol is recovered by
+        # sorting the scored matches rather than reading a duplicate list.
+        scored = [row for row in focused["matches"] if "priority_score" in row]
+        target = str(
+            min(
+                scored,
+                key=lambda row: (-int(row["priority_score"]), str(row["qualname"])),
+            )["qualname"]
+        )
         sliced = source_graph.slice_(
             repo, "change target behavior", 32, target=target,
         )

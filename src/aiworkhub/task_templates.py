@@ -57,11 +57,22 @@ from . import skill_registry
 __all__ = [
     "AUDITED_CUSTOM_ESCAPE",
     "CANONICAL_MINIMALITY_CONTRACT",
+    "CANONICAL_VALIDATION_PYTHON",
     "COMMAND_NODE",
     "COMMAND_PYTHON",
+    "CONTRACT_PATCH_RELATIVE_DIR",
+    "CONTRACT_PATCH_SCHEMA_ID",
     "DIFF_CHECK_COMMAND",
+    "MAX_OBJECTIVE_LENGTH",
     "MAX_PATH_LENGTH",
     "MAX_PATHS_PER_FIELD",
+    "MAX_TITLE_LENGTH",
+    "build_contract_patch",
+    "canonical_validation_command",
+    "contract_patch_digest",
+    "load_contract_patch",
+    "record_contract_patch",
+    "validation_command_head_warnings",
     "PROVENANCE_SCHEMA_ID",
     "REGISTRY_VERSION",
     "SCHEMA_ID",
@@ -92,10 +103,41 @@ REGISTRY_VERSION_TOKEN = f"v{REGISTRY_VERSION}"
 
 MAX_PATHS_PER_FIELD = 128
 MAX_PATH_LENGTH = 500
+# One shared card-text budget for BOTH creation paths. Measured over 66
+# refused creates: 18 of them carried an objective that the raw
+# ``core.create_task`` path accepted (its own inline limit was 4000) and the
+# template path refused (this constant was 2000), so the same text passed one
+# tool and failed the other with no statement that two limits existed.
+# ``core.create_task`` now reads these two names instead of respelling its own
+# numbers, so there is exactly one boundary to discover. The permissive value
+# is the shared one: unifying downward would have refused card text that is
+# accepted and stored today.
 MAX_TITLE_LENGTH = 300
-MAX_OBJECTIVE_LENGTH = 2000
+MAX_OBJECTIVE_LENGTH = 4000
 
-COMMAND_PYTHON = "python"
+# The canonical interpreter head for every generated validation command.
+#
+# Measured across 5,793 declared validation commands: 12 first-token spellings
+# for three tools (``python3`` 1,340, ``python`` 1,172, ``.venv/bin/python``
+# 779, an absolute venv interpreter 42, bare ``pytest`` 23). All of the BARE
+# python spellings are already one thing at execution time --
+# ``worker_workspace._normalize_trusted_validation_executable_argv_with_authority``
+# matches ``^python(3(\.N)?)?(\.exe)?$`` and replaces the head with
+# ``sys.executable`` -- so folding them onto one spelling changes the bytes and
+# nothing else.  ``python3`` is the fold target rather than ``python`` for two
+# measured reasons: it is the majority spelling in the corpus, and
+# ``worker_workspace._is_candidate_pytest_wrapper_command`` recognizes the
+# candidate pytest wrapper only for the exact head ``python3``.
+#
+# Deliberately NOT a symbolic ``${AIWORKHUB_CANONICAL_PYTHON}`` token: the
+# finalizer's ``run_validations`` performs no environment expansion. Such a
+# token survives ``shlex.split`` intact, matches none of the head branches in
+# the resolver above, and would be handed to ``execvpe`` verbatim -- turning
+# every acceptance run into ENOENT.  The declared command IS the acceptance
+# evidence, so the only spelling that can be byte-identical in the stored card,
+# the worker prompt and ``run_validations`` is one the resolver already knows.
+CANONICAL_VALIDATION_PYTHON = "python3"
+COMMAND_PYTHON = CANONICAL_VALIDATION_PYTHON
 COMMAND_NODE = "node"
 DIFF_CHECK_COMMAND = "git diff --check"
 AUDITED_CUSTOM_ESCAPE = "audited_custom_unclassified"
@@ -456,6 +498,275 @@ def split_command_argv(command: str) -> list[str]:
     return command.split(" ")
 
 
+# ---------------------------------------------------------------------------
+# Canonical validation-command head (measured 2026-09-08).
+#
+# ``_BARE_PYTHON_INTERPRETER_RE`` below is the exact pattern
+# ``worker_workspace`` uses to decide that a head is a bare python interpreter
+# and must be replaced by ``sys.executable``. It is restated here rather than
+# imported because ``task_templates`` is a pure, self-contained module with no
+# lifecycle imports; ``tests/test_task_templates.py`` asserts the two patterns
+# stay identical so the restatement cannot drift.
+_BARE_PYTHON_INTERPRETER_RE = re.compile(r"^python(3(\.[0-9]+)?)?(\.[eE][xX][eE])?$")
+# The exact literal ``worker_workspace._is_candidate_pytest_wrapper_command``
+# recognizes, and only for the head ``python3``.
+_CANDIDATE_PYTEST_WRAPPER = "tools/candidate_pytest.py"
+# A repo-relative venv head. It resolves at finalization (the coordinator holds
+# the real ``.venv``) but can never resolve for the WORKER: a worker worktree is
+# a sparse checkout of tracked, card-declared files and ``.venv`` is not tracked.
+_VENV_HEAD_PREFIXES = (".venv/bin/", ".venv/Scripts/")
+
+
+def canonical_validation_command(command: Any) -> str:
+    """Fold a validation command's head onto the canonical spelling.
+
+    Only provably outcome-identical folds are performed, so the normalized
+    command is acceptance evidence for exactly the same execution:
+
+    * a bare python interpreter (``python``/``python3.12``/``python.exe``)
+      becomes ``python3`` -- every one of those heads is already replaced by
+      ``sys.executable`` by the finalizer's head resolver;
+    * a bare ``pytest`` head becomes ``python3 -m pytest`` -- exactly the
+      rewrite ``worker_workspace._normalize_pytest_validation_argv`` applies
+      before execution.
+
+    Everything else is returned unchanged, by design: an ABSOLUTE head is left
+    exactly as declared, and so is a repo-relative head (``.venv/bin/python``,
+    ``.venv/bin/ruff``) or a trusted bare validator (``ruff``/``mypy``/``node``
+    /``git``), because those resolve through a different, root-bearing branch
+    of the resolver and folding them would change which executable runs.
+
+    Non-strings and unparseable commands are returned as-is; this function
+    never refuses. Refusal remains ``worker_workspace.validation_argv``'s job.
+    """
+    if not isinstance(command, str):
+        return command
+    stripped = command.strip()
+    if not stripped:
+        return command
+    argv = stripped.split(" ")
+    # Preserve a leading supported env assignment / ``cd DIR &&`` prefix
+    # untouched, and normalize only the executable head that follows it.
+    prefix: list[str] = []
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if "=" in token and token.split("=", 1)[0].isidentifier():
+            prefix.append(token)
+            index += 1
+            continue
+        if token == "cd" and index + 2 < len(argv) and argv[index + 2] == "&&":
+            prefix.extend(argv[index : index + 3])
+            index += 3
+            continue
+        break
+    rest = argv[index:]
+    if not rest:
+        return command
+    head, tail = rest[0], rest[1:]
+    if head == CANONICAL_VALIDATION_PYTHON:
+        return command
+    if _BARE_PYTHON_INTERPRETER_RE.match(head):
+        if tail[:1] == [_CANDIDATE_PYTEST_WRAPPER]:
+            # The wrapper is recognized ONLY for the exact head ``python3``;
+            # folding onto the canonical head is what makes it recognizable.
+            pass
+        rest = [CANONICAL_VALIDATION_PYTHON, *tail]
+    elif head == "pytest":
+        rest = [CANONICAL_VALIDATION_PYTHON, "-m", "pytest", *tail]
+    else:
+        return command
+    return " ".join([*prefix, *rest])
+
+
+def validation_command_head_warnings(command: Any) -> list[str]:
+    """Advisory findings about a declared command head. Never a refusal.
+
+    A ``.venv``-relative head is the measured landmine: it resolves for the
+    coordinator at finalization and can never resolve inside the worker's
+    sparse worktree, so the worker fails closed and submits an unvalidated
+    candidate. Naming it at creation is the earliest point it can be seen.
+    """
+    if not isinstance(command, str) or not command.strip():
+        return []
+    argv = command.strip().split(" ")
+    head = ""
+    for token in argv:
+        if "=" in token and token.split("=", 1)[0].isidentifier():
+            continue
+        if token in ("cd", "&&"):
+            continue
+        head = token
+        break
+    warnings: list[str] = []
+    if head.startswith(_VENV_HEAD_PREFIXES):
+        warnings.append(f"venv_relative_head_absent_from_worker_worktree:{head}")
+    elif head.startswith("/") and "/.venv/" in head:
+        warnings.append(f"absolute_venv_head_not_portable:{head}")
+    return warnings
+
+
+# ---------------------------------------------------------------------------
+# Contract patch: an approve-by-reference channel for the unchanged-output set.
+#
+# 243 tasks ended on ``required_output_unchanged`` /
+# ``residual_contract_file_unchanged`` / ``required_output_mismatch`` /
+# ``required_output_zero_bytes``, yet only 32 of 4,681 cards ever declared
+# ``allow_unchanged_required_outputs`` -- because declaring it means retyping
+# paths that must match ``required_outputs`` AND ``allowed_writes``
+# byte-for-byte (the manager got that wrong twice in the measured sample).
+# The finalizer already HOLDS the exact unchanged-path list. These helpers let
+# it publish that list once, addressed by a digest, so the manager approves the
+# exception by reference instead of retyping it.
+#
+# This is a proposal channel, never an application: nothing here widens a card
+# on its own. ``core.create_task`` resolves a digest the manager passes and
+# then runs the same ``validate_required_output_exceptions`` checks it runs on
+# a typed list.
+CONTRACT_PATCH_SCHEMA_ID = "aiworkhub.task_contract_patch.v1"
+CONTRACT_PATCH_RELATIVE_DIR = ".aiworkhub/tasking/contract_patches"
+_CONTRACT_PATCH_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _contract_patch_payload(
+    *,
+    task_id: str,
+    allow_unchanged_required_outputs: Sequence[str],
+    required_outputs: Sequence[str],
+    allowed_writes: Sequence[str],
+) -> dict[str, Any]:
+    return {
+        "schema_id": CONTRACT_PATCH_SCHEMA_ID,
+        "task_id": str(task_id),
+        "allow_unchanged_required_outputs": [
+            str(path) for path in allow_unchanged_required_outputs
+        ],
+        "required_outputs": [str(path) for path in required_outputs],
+        "allowed_writes": [str(path) for path in allowed_writes],
+    }
+
+
+def contract_patch_digest(payload: Mapping[str, Any]) -> str:
+    """Digest of one canonical contract-patch payload."""
+    canonical = {
+        key: payload.get(key)
+        for key in (
+            "schema_id",
+            "task_id",
+            "allow_unchanged_required_outputs",
+            "required_outputs",
+            "allowed_writes",
+        )
+    }
+    encoded = json.dumps(
+        canonical, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def build_contract_patch(
+    *,
+    task_id: Any,
+    unchanged_paths: Sequence[Any],
+    required_outputs: Sequence[Any],
+    allowed_writes: Sequence[Any],
+) -> dict[str, Any]:
+    """Build the machine-readable patch for one measured unchanged-output set.
+
+    ``unchanged_paths`` is the exact list the finalizer computed. Only paths
+    that are already BOTH a declared required output and inside the declared
+    write scope are proposed -- the two byte-for-byte agreements the manager
+    kept getting wrong -- so an accepted patch cannot widen the card.
+    """
+    outputs = [str(path) for path in required_outputs]
+    writes = [str(path) for path in allowed_writes]
+    output_set, write_set = set(outputs), set(writes)
+    proposed: list[str] = []
+    rejected: list[dict[str, str]] = []
+    for raw in unchanged_paths:
+        path = str(raw)
+        if path in proposed:
+            continue
+        if path not in output_set:
+            rejected.append({"path": path, "reason": "not_in_required_outputs"})
+            continue
+        if path not in write_set:
+            rejected.append({"path": path, "reason": "not_in_allowed_writes"})
+            continue
+        proposed.append(path)
+    payload = _contract_patch_payload(
+        task_id=str(task_id),
+        allow_unchanged_required_outputs=sorted(proposed),
+        required_outputs=outputs,
+        allowed_writes=writes,
+    )
+    payload["digest"] = contract_patch_digest(payload)
+    payload["rejected"] = rejected
+    payload["apply_hint"] = (
+        "aiworkhub_task_create(..., apply_contract_patch="
+        f"\"{payload['digest']}\") -- the manager still decides; nothing is "
+        "applied automatically."
+    )
+    return payload
+
+
+def _contract_patch_path(repo_root: Any, digest: str) -> Any:
+    from pathlib import Path
+
+    return Path(repo_root) / CONTRACT_PATCH_RELATIVE_DIR / f"{digest}.json"
+
+
+def record_contract_patch(repo_root: Any, patch: Mapping[str, Any]) -> str:
+    """Persist one patch under its own digest and return that digest.
+
+    Idempotent by construction: the file name IS the digest of its content, so
+    re-recording an identical patch rewrites identical bytes.
+    """
+    digest = str(patch.get("digest") or "")
+    if not _CONTRACT_PATCH_DIGEST_RE.match(digest):
+        raise TaskTemplateError("invalid_contract_patch_digest")
+    expected = contract_patch_digest(patch)
+    if digest != expected:
+        raise TaskTemplateError("contract_patch_digest_mismatch")
+    target = _contract_patch_path(repo_root, digest)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(f"{target.name}.tmp")
+    temporary.write_text(
+        json.dumps(dict(patch), sort_keys=True, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    temporary.replace(target)
+    return digest
+
+
+def load_contract_patch(repo_root: Any, digest: Any) -> dict[str, Any]:
+    """Load and re-authenticate one recorded patch by digest.
+
+    Fails closed with a stable reason: an unknown digest, unreadable file, or
+    content whose recomputed digest does not match its own name is refused
+    rather than partially trusted.
+    """
+    token = str(digest or "").strip().lower()
+    if not _CONTRACT_PATCH_DIGEST_RE.match(token):
+        raise TaskTemplateError("invalid_contract_patch_digest")
+    target = _contract_patch_path(repo_root, token)
+    try:
+        raw = target.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise TaskTemplateError(f"contract_patch_not_found:{token}") from exc
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise TaskTemplateError(f"contract_patch_unreadable:{token}") from exc
+    if not isinstance(payload, dict):
+        raise TaskTemplateError(f"contract_patch_unreadable:{token}")
+    if payload.get("schema_id") != CONTRACT_PATCH_SCHEMA_ID:
+        raise TaskTemplateError(f"contract_patch_schema_mismatch:{token}")
+    if contract_patch_digest(payload) != token:
+        raise TaskTemplateError(f"contract_patch_digest_mismatch:{token}")
+    return payload
+
+
 _CANONICAL_WORK_KINDS = frozenset({
     "generic",
     "bugfix",
@@ -794,6 +1105,43 @@ def expanded_contract_digest(
     ).hexdigest()
 
 
+def _expansion_field_matches(field: str, declared: Any, expected: Any) -> bool:
+    """Whether a persisted card field still matches a fresh template expansion.
+
+    Every field but ``validation`` is compared exactly, as it always was.
+
+    ``validation`` is compared on the CANONICAL command instead, and the reason
+    is measured: 435 persisted cards in this repository carry template
+    provenance and a bare ``python`` head, the spelling
+    ``_validation_commands_for`` emitted before ``COMMAND_PYTHON`` became
+    ``python3``. A byte-exact comparison against a fresh expansion would
+    de-authenticate every one of them -- and a de-authenticated template card
+    fails ``_validate_required_outputs_contract`` at launch with
+    ``required_outputs_invalid``. Their stored ``expanded_contract_digest`` is
+    unaffected either way: it is computed from the card's OWN fields, never from
+    a re-expansion, so nothing here weakens the digest.
+
+    This is not a relaxation of authority. ``canonical_validation_command``
+    folds only heads that the finalizer's own resolver already maps to one
+    executable, so two commands that compare equal here select the same
+    interpreter and the same file arguments. It cannot make a card authenticate
+    against a template that validates different files, different flags, or a
+    different tool.
+    """
+    if field != "validation":
+        return declared == expected
+    if not isinstance(declared, (list, tuple)) or not isinstance(
+        expected, (list, tuple)
+    ):
+        return declared == expected
+    if len(declared) != len(expected):
+        return False
+    return all(
+        canonical_validation_command(left) == canonical_validation_command(right)
+        for left, right in zip(declared, expected)
+    )
+
+
 def _authenticated_legacy_v1_provenance(
     card: Mapping[str, Any],
 ) -> dict[str, Any] | None:
@@ -831,7 +1179,7 @@ def _authenticated_legacy_v1_provenance(
         "validation_roles",
         "work_kind",
     ):
-        if card.get(field) != expected[field]:
+        if not _expansion_field_matches(field, card.get(field), expected[field]):
             return None
     legacy_payload = {
         "allowed_writes": writes,
@@ -889,7 +1237,7 @@ def _authenticated_current_provenance(
         "minimality_contract",
     )
     for field in fields:
-        if card.get(field) != expected.get(field):
+        if not _expansion_field_matches(field, card.get(field), expected.get(field)):
             return None
     if validated["expanded_contract_digest"] != expanded_contract_digest(card):
         return None

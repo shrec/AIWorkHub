@@ -179,7 +179,11 @@ def _restore_aiworkhub_sys_modules() -> None:
 _ensure_aiworkhub_sibling_stubs()
 
 try:
-    from aiworkhub import process_launcher, task_store  # noqa: E402
+    from aiworkhub import (  # noqa: E402
+        process_launcher,
+        process_launcher_accept_review,
+        task_store,
+    )
 except BaseException:
     # Collection failures never reach fixture teardown.
     _restore_aiworkhub_sys_modules()
@@ -725,8 +729,19 @@ def test_accept_review_requires_explicit_manager_confirmation_for_destructive_di
     )
 
     assert risk_blocked["ok"] is False
-    assert "quality_gate_failed" in risk_blocked["error"]
-    assert "required_reviewer_missing" in risk_blocked["error"]
+    # The destructive signal floors the tier at high, which requires reviewers
+    # this candidate has none of.  That is now named BEFORE the combined tree is
+    # materialized rather than after: the same refusal, reached without paying
+    # for a workspace and two validation runs, and with the exact missing lens
+    # in the answer instead of a folded ``quality_gate_failed`` prefix.
+    assert risk_blocked["error"] == "required_reviewer_missing:correctness"
+    assert risk_blocked["combined_tree_materialized"] is False
+    assert risk_blocked["effective_risk_tier"] == "high"
+    assert [row["error"] for row in risk_blocked["accept_blockers"]] == [
+        "required_reviewer_missing:correctness",
+        "required_reviewer_missing:security",
+        "explicit_human_approval_missing",
+    ]
     assert promote_calls == []
     assert accept_review_calls == []
 
@@ -943,6 +958,189 @@ def test_target_acceptance_consumes_already_accepted_reviewer_receipt(
         "finished": True,
         "cleanup_error": "",
     }]
+
+
+def test_accept_review_resolves_its_own_reviewer_ids_from_the_bound_children(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The manager stops retyping what the server already knows.
+
+    Measured 2026-09-08 over 159 accept attempts: ``reviewer_request_ids`` was
+    typed by hand in 135 of them, copied out of earlier launch results. The
+    binding that answers the question -- ``terminal_review.evidence.
+    quality_review.target_{task,request}_id`` -- is on every reviewer card
+    (2,219 of 2,219 on the live store) and is the same one
+    ``disposition_reviewer_children`` already reads to dispose them.
+
+    Defaulting changes WHO types the ids and nothing else: the resolved id goes
+    through the identical verification loop, so this accept still stands or
+    falls on the reviewer's own sealed receipt.
+    """
+    (
+        manager, card, request_id, task_id, runner, topic, repo,
+        workspace_dir, promote_calls, accept_review_calls,
+    ) = _fixture(monkeypatch, tmp_path)
+    assert task_store.initialize_repository(repo)["ok"]
+    reviewer_request_id = "review-request-server-resolved"
+    reviewer_task_id = "REVIEW_TASK_SERVER_RESOLVED"
+    reviewer_provider = "deepseek_v4pro"
+
+    signed_receipt = {
+        "schema_id": process_launcher.quality_reviewer.RECEIPT_SCHEMA_ID,
+        "packet_sha256": "a" * 64,
+        "target": {"request_id": request_id, "task_id": task_id, "claim_epoch": 1},
+        "reviewer": {
+            "request_id": reviewer_request_id,
+            "task_id": reviewer_task_id,
+            "provider": reviewer_provider,
+        },
+        "report": {
+            "lens": "correctness",
+            "provider": reviewer_provider,
+            "read_only": True,
+            "can_mutate_repo": False,
+            "findings": [],
+        },
+        "authority": {
+            "process_identity_verified": True,
+            "audit_verified": True,
+            "terminal_state": "review_ready",
+        },
+    }
+    receipt = copy.deepcopy(signed_receipt)
+    receipt["submission_id"] = hashlib.sha256(
+        json.dumps(
+            signed_receipt, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+        ).encode("utf-8")
+    ).hexdigest()
+    receipt["physical_submission_count"] = 1
+    receipt["logical_submission_count"] = 1
+
+    reviewer_workspace = _FakeWorkspace(
+        repo=repo,
+        request_id=reviewer_request_id,
+        path=repo / "reviewer" / "workspace",
+        home=repo / "reviewer" / "home",
+        allowed_writes=(),
+    ).as_metadata()
+    reviewer_card = {
+        "task_id": reviewer_task_id,
+        "topic": "quality_review",
+        "status": "finished",
+        "worker_status": "done",
+        "accepted_request_id": reviewer_request_id,
+        "allowed_writes": [],
+        "required_outputs": [],
+        "terminal_review": {
+            "substatus": "review_ready",
+            "evidence": {
+                "quality_review_receipt": copy.deepcopy(receipt),
+                "workspace": reviewer_workspace,
+                "request_identity": {
+                    "request_id": reviewer_request_id,
+                    "task_id": reviewer_task_id,
+                    "runner": "reviewer",
+                    "topic": "quality_review",
+                },
+                "changed_paths": [],
+                "changed_path_hashes": {},
+                # The production binding: it names the target, which is exactly
+                # what makes the server able to answer without the manager.
+                "quality_review": {
+                    "lens": "correctness",
+                    "packet_sha256": "a" * 64,
+                    "target_task_id": task_id,
+                    "target_request_id": request_id,
+                    "target_claim_epoch": 1,
+                    "adapter_id": reviewer_provider,
+                },
+            },
+        },
+        "accept_evidence": {
+            "quality_review_receipt": copy.deepcopy(receipt),
+            "promoted_paths": [],
+            "changed_paths": [],
+            "changed_path_hashes": {},
+        },
+    }
+    readiness = task_store.storage_readiness(repo)
+    conn = sqlite3.connect(readiness.canonical_db)
+    try:
+        conn.execute(
+            "INSERT INTO tasks (task_id, runner, topic, mode, status, worker_status, "
+            "priority, objective, card_json, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                reviewer_task_id, "reviewer", "quality_review", "auto", "review",
+                "done", 5, "review", json.dumps(reviewer_card),
+                "2026-09-08T00:00:00+00:00", "2026-09-08T00:00:00+00:00",
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    def show(task_id_arg: str) -> dict:
+        selected = reviewer_card if task_id_arg == reviewer_task_id else card
+        return {"returncode": 0, "stdout": json.dumps(selected), "stderr": ""}
+
+    manager._show_task = show
+    manager._append_event({
+        "request_id": reviewer_request_id,
+        "task_id": reviewer_task_id,
+        "runner": "reviewer",
+        "topic": "quality_review",
+        "adapter_id": reviewer_provider,
+        "state": "accepted",
+        "accepted": True,
+        "finished_at": "2026-09-08T02:00:00+00:00",
+        "quality_review_receipt": receipt,
+    })
+
+    # The server already resolves the reviewer BEFORE any acceptance runs.
+    assert process_launcher_accept_review.bound_reviewer_request_ids(
+        manager, task_id, request_id
+    ) == [reviewer_request_id]
+
+    monkeypatch.setattr(
+        process_launcher,
+        "create_combined_validation_workspace",
+        lambda workspace, _card, changed: (
+            workspace,
+            {"schema_id": "aiworkhub.combined_tree.v1", "candidate_paths": list(changed)},
+        ),
+    )
+    monkeypatch.setattr(
+        process_launcher.quality_evidence,
+        "run_completion_quality_gate",
+        lambda *_args, **_kwargs: {"passed": True, "blocking_checks": [], "checks": []},
+    )
+    monkeypatch.setattr(
+        process_launcher.task_engine,
+        "disposition_reviewer_children",
+        lambda *_args, **_kwargs: {"ok": True, "stdout": json.dumps({"finalized": []})},
+    )
+
+    # No reviewer_request_ids argument at all.
+    result = manager.accept_review(request_id, task_id, requested_risk_tier="medium")
+
+    assert result["ok"] is True
+    assert promote_calls == [["out/result.txt"]]
+    provenance = result["accept_parameter_provenance"]
+    assert provenance["reviewer_request_ids"] == [reviewer_request_id]
+    assert provenance["reviewer_request_id_source"] == "server_bound_reviewer_children"
+    # Approval stays an explicit manager input; the audit says so in the record.
+    assert provenance["explicit_human_approval"] is False
+    assert provenance["explicit_human_approval_implied_by_caller"] is False
+    assert provenance["requested_risk_tier_source"] == "manager_override"
+    assert "verified" in result["accept_manager_identity"]
+
+    # The same provenance goes DURABLE, not only into the reply: this evidence
+    # dict IS the ``accept_review`` event payload
+    # (task_engine.accept_review inserts ``{"request_id": ..., **evidence}``).
+    recorded = accept_review_calls[-1]["evidence"]["quality_gate"]
+    assert recorded["accept_parameter_provenance"] == provenance
+    assert recorded["accept_manager_identity"] == result["accept_manager_identity"]
 
 
 def test_accept_review_git_timeout_is_structured_and_releases_promotion_lock(

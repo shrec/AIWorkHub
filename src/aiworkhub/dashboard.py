@@ -2261,7 +2261,7 @@ class DashboardProvider:
             raise RuntimeError("tool_recipes_unavailable")
         store = _load_tool_recipes_store()
         if store is None:
-            return api.RecipeRegistry(())
+            return {"registry": api.RecipeRegistry(())}
         # Load the durable store, but never let an absent, empty or unreadable
         # recipe database fail a dashboard refresh: degrade to an empty registry
         # so a repository with no registered recipes renders a clean, empty
@@ -2269,9 +2269,92 @@ class DashboardProvider:
         # measured fact about the store, not this method handing the projection
         # an empty list and the projection reporting that the list is empty.
         try:
-            return store.load_registry(self.repo_root)
+            registry = store.load_registry(self.repo_root)
         except Exception:  # noqa: BLE001 - a bad store must never break the dashboard
-            return api.RecipeRegistry(())
+            return {"registry": api.RecipeRegistry(())}
+        # The registry alone could never flip the invocation/cache/context
+        # sections: the projection reads them from a ``receipts`` key that this
+        # method never produced, so "no evidence" was structural rather than
+        # measured.  The receipts are carried here alongside the registry --
+        # bounded by the store's own read, with the EXACT total counted
+        # separately so a bounded list can never be mistaken for the total.
+        payload: dict[str, Any] = {"registry": registry}
+        try:
+            receipts = store.list_receipts(
+                self.repo_root, limit=_PROJECTION_LIST_LIMIT
+            )
+            receipt_total = store.receipt_count(self.repo_root)
+        except Exception:  # noqa: BLE001 - a bad receipt row must not break a refresh
+            return payload
+        # Absent means "no evidence exists", which is what ``no_sample`` says.
+        # An empty list would instead claim a measured zero on a store that may
+        # simply predate the receipt table, so the key is omitted entirely.
+        if receipts:
+            payload["receipts"] = receipts
+            payload["receipt_count"] = receipt_total
+            # Cache eligibility is a property of the RECIPE, but the projection
+            # can only look it up in a registry bounded for DISPLAY. A receipt
+            # naming the 12th registered recipe would then be unanswerable for
+            # a reason that has nothing to do with the evidence, so the exact
+            # manifests these receipts name are carried alongside them.
+            payload["receipt_recipes"] = self._recipes_for_receipts(
+                registry, receipts
+            )
+        # Usage is carried whether or not receipts exist, and that asymmetry is
+        # the point. ``receipts`` answers "did anything run"; usage answers
+        # "which of the registered recipes did, and how many DISTINCT verified
+        # actors used each". A populated registry with no receipts is not an
+        # absent measurement -- it is the measured fact that every registered
+        # recipe is unused, which the panel must be able to say out loud.
+        try:
+            usage = store.usage_by_recipe(
+                self.repo_root, limit=store.MAX_USAGE_LIMIT
+            )
+            totals = dict(store.actor_totals(self.repo_root))
+            # The used/unused split is computed HERE, where both collections are
+            # unbounded, and not in the projection, which only ever sees a
+            # registry capped for display. A usage row can also name a manifest
+            # that is no longer stored -- a receipt outlives the version it
+            # records -- so membership is tested rather than inferred from the
+            # two lengths: five used recipes plus one whose manifest is gone is
+            # five used, not six, and the projection cannot know that.
+            registered = {(recipe.id, recipe.version) for recipe in registry}
+            used = {
+                (row["recipe_id"], row["version"])
+                for row in usage
+                if isinstance(row, Mapping)
+            }
+            totals["registered_count"] = len(registered)
+            totals["used_count"] = len(used & registered)
+            totals["unregistered_used_count"] = len(used - registered)
+            payload["usage"] = usage
+            payload["usage_totals"] = totals
+        except Exception:  # noqa: BLE001 - a bad usage read must not break a refresh
+            payload.pop("usage", None)
+            payload.pop("usage_totals", None)
+        return payload
+
+    @staticmethod
+    def _recipes_for_receipts(registry: Any, receipts: list[Any]) -> list[Any]:
+        """Return the distinct manifests ``receipts`` name, skipping any unknown."""
+        resolved: list[Any] = []
+        seen: set[tuple[str, str]] = set()
+        for receipt in receipts:
+            if not isinstance(receipt, Mapping):
+                continue
+            recipe_id = receipt.get("recipe_id")
+            version = receipt.get("recipe_version")
+            if not isinstance(recipe_id, str) or not recipe_id:
+                continue
+            key = (recipe_id, version if isinstance(version, str) else "")
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                resolved.append(registry.get(recipe_id, key[1] or None))
+            except Exception:  # noqa: BLE001 - a receipt may outlive its manifest
+                continue
+        return resolved
 
 
 def _normalize_task_rows(
@@ -3272,6 +3355,85 @@ def _measured_cache_decisions(
     return decisions
 
 
+def _cache_decision_registry(api: Any, mapping: Any, fallback: Any) -> Any:
+    """Return the registry cache decisions resolve against.
+
+    ``fallback`` is the panel's registry, bounded to ``_PROJECTION_LIST_LIMIT``
+    items for display. Cache eligibility is a property of the recipe, so a
+    provider that carries the exact manifests its receipts name lets that
+    display bound stop deciding whether the question is answerable at all. A
+    provider that carries none is unchanged.
+    """
+    if not isinstance(mapping, Mapping):
+        return fallback
+    named = mapping.get("receipt_recipes")
+    if not isinstance(named, list) or not named:
+        return fallback
+    try:
+        return api.RecipeRegistry(named)
+    except Exception:  # noqa: BLE001 - an unusable hint must not lose the fallback
+        return fallback
+
+
+def _project_recipe_usage(mapping: Any, *, ownership: str) -> dict[str, Any]:
+    """Report whether the registered recipes are USED, not merely present.
+
+    "Tool Recipes / 22 recipes / Measured" reported registry POPULATION. The
+    word ``Measured`` was true of rows and silent about use: on this repository
+    it stood over 22 registered recipes of which 7 had ever run, every one of
+    those runs made by a verification agent exercising the plumbing, and not
+    one of them attributable to anybody.
+
+    So this section reports the split the count cannot: how many registered
+    recipes have ever run, how many never have, and how many DISTINCT verified
+    actors are behind the runs. ``unused_count`` is a first-class measurement
+    here, not an omission -- a recipe nobody uses is the actionable state, and
+    hiding it behind a green word is the defect the ``no_sample`` fix just
+    removed from the sections above.
+
+    ``unknown`` when the provider carried no usage (an older provider, or a
+    store whose aggregation failed): a section that cannot measure says so
+    rather than reporting a zero it did not read.
+    """
+    if not isinstance(mapping, Mapping):
+        return _unknown_section()
+    rows = mapping.get("usage")
+    if not isinstance(rows, list):
+        return _unknown_section()
+    totals = mapping.get("usage_totals")
+    if not isinstance(totals, Mapping):
+        return _unknown_section()
+    # The used/unused split is the provider's measurement, not this function's.
+    # ``registry_count`` here is a count of manifests bounded for DISPLAY, and
+    # a usage row can name a manifest no longer stored, so deriving the split
+    # from the two lengths would over-count. The provider holds both
+    # collections unbounded and tests membership; a provider that did not
+    # supply the split leaves this section unknown rather than guessing it.
+    declared_registered = _projection_count(totals.get("registered_count"))
+    used = _projection_count(totals.get("used_count"))
+    if declared_registered is None or used is None or used > declared_registered:
+        return _unknown_section()
+    section: dict[str, Any] = {
+        "state": "measured",
+        "registered_count": declared_registered,
+        "used_count": used,
+        "unused_count": declared_registered - used,
+        "run_count": _projection_count(totals.get("runs")) or 0,
+        "distinct_actor_count": _projection_count(totals.get("distinct_actors")) or 0,
+        "attributed_run_count": _projection_count(totals.get("attributed_runs")) or 0,
+        "unattributed_run_count": (
+            _projection_count(totals.get("unattributed_runs")) or 0
+        ),
+    }
+    unregistered = _projection_count(totals.get("unregistered_used_count"))
+    if unregistered:
+        section["unregistered_used_count"] = unregistered
+    if ownership == "full":
+        section["items"] = rows[:_PROJECTION_LIST_LIMIT]
+        section["truncated"] = len(rows) > _PROJECTION_LIST_LIMIT
+    return section
+
+
 def _project_tool_recipes(
     payload: Any,
     *,
@@ -3325,6 +3487,22 @@ def _project_tool_recipes(
                 projected["context"] = {"state": "invalid"}
             else:
                 items, receipts_truncated, receipts_total = bounded
+                # The store counts its own receipts exactly and says so; a list
+                # already bounded at ``_PROJECTION_LIST_LIMIT`` cannot, and
+                # reporting its length as the total would restate the bound as
+                # a measurement. The declared total is used only when it agrees
+                # with the bounded read -- a number smaller than what was just
+                # read describes nothing (NF-2026-00668, for receipts).
+                declared_receipts = (
+                    _projection_count(mapping.get("receipt_count"))
+                    if mapping is not None
+                    else None
+                )
+                if declared_receipts is not None and declared_receipts >= len(items):
+                    receipts_total = declared_receipts
+                    receipts_truncated = declared_receipts > len(items)
+                else:
+                    declared_receipts = None
                 projected["invocation"] = {
                     "state": "measured",
                     **_bounded_count_fields(items, receipts_total),
@@ -3340,9 +3518,14 @@ def _project_tool_recipes(
                     }
                     projected["context"] = {"state": "measured", "receipt_count": 0}
                 else:
+                    # Resolve cache eligibility against the manifests the
+                    # receipts actually name when the provider supplied them:
+                    # ``registry`` is bounded for display, so a receipt for the
+                    # 12th recipe would otherwise be unanswerable for a reason
+                    # that has nothing to do with the evidence.
                     decisions = _measured_cache_decisions(
                         api,
-                        registry,
+                        _cache_decision_registry(api, mapping, registry),
                         receipts_raw,
                         item_count=len(items),
                         total_count=receipts_total,
@@ -3360,17 +3543,27 @@ def _project_tool_recipes(
                         }
                         for item, flag in zip(items, decisions):
                             item["cache_eligible"] = flag
-                    projected["context"] = _unknown_section()
+                    # ``context`` is the evidence denominator: how many runs
+                    # the panel is speaking for. With the store's exact count
+                    # in hand that is measured, not unknown; without it the
+                    # bounded list cannot answer and says so.
+                    projected["context"] = (
+                        {"state": "measured", "receipt_count": declared_receipts}
+                        if declared_receipts is not None
+                        else _unknown_section()
+                    )
                 if ownership == "full":
                     projected["invocation"]["items"] = items
                     projected["invocation"]["truncated"] = receipts_truncated
                     projected["receipts"] = items
                     projected["receipts_truncated"] = receipts_truncated
+    projected["usage"] = _project_recipe_usage(mapping, ownership=ownership)
     if registry_count == 0 and not has_receipts:
         empty = _projection_shell("tool_recipes", "no_sample", ownership)
         empty["invocation"] = {"state": "no_sample"}
         empty["cache"] = {"state": "no_sample"}
         empty["context"] = {"state": "no_sample"}
+        empty["usage"] = projected["usage"]
         if ownership == "summary":
             return _cheap_projection(empty)
         return empty

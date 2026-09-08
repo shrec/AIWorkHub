@@ -267,6 +267,25 @@ MAX_TOOL_OUTPUT_BYTES = 16 * 1024
 SOURCE_GRAPH_ORIENTATION_OUTPUT_BYTES = 8 * 1024
 SOURCE_GRAPH_ANALYSIS_OUTPUT_BYTES = 12 * 1024
 MAX_RAW_TOOL_OUTPUT_BYTES = 512 * 1024
+# Modes whose reply IS the exact bytes the caller asked for (a symbol body, a
+# file preview).  Those bytes are never trimmed to the outer cap: they page
+# through the signed continuation store below.  Every other mode is analytic
+# and is fitted to the outer cap in ONE plain-JSON page by the structure-aware
+# priority trimmer (``source_graph._fit_payload_bytes``), so a reader never
+# has to base64-decode and concatenate pages to see the first match
+# (source_graph-1).
+SOURCE_GRAPH_EXACT_CONTENT_MODES: frozenset[str] = frozenset({
+    "body", "function", "class", "file",
+})
+# Modes with a server-side, single-turn zero-hit cascade (source_graph-4/5).
+SOURCE_GRAPH_FALLBACK_MODES: frozenset[str] = frozenset({"focus", "slice", "bodygrep"})
+SOURCE_GRAPH_FALLBACK_REASON_PREFIX = "fallback:"
+# Tools whose audit row is a validation command receipt: a Source Graph call
+# right after one is inferred as ``validation`` when no stage was declared.
+VALIDATION_RECEIPT_TOOLS: frozenset[str] = frozenset({
+    "validation_command", "validation_receipt",
+})
+_FIT_MAX_PASSES = 8
 # Signed outer-pagination continuation (NF-2026-00510).  When the exact
 # canonical JSON bytes of a Source Graph response exceed a mode's outer output
 # cap, the worker pages those bytes across a signed cursor instead of
@@ -298,8 +317,10 @@ def _source_graph_output_cap(mode: SourceGraphMode) -> int:
     managers and workers, so they receive the smallest envelope.  Execution
     flow, impact and validation-ownership modes retain a larger analysis
     budget, while content-rich and repository-wide modes keep the existing
-    global ceiling.  The structure-aware JSON renderer preserves semantic
-    priority keys whenever truncation is required.
+    global ceiling.  For every mode outside
+    ``SOURCE_GRAPH_EXACT_CONTENT_MODES`` the wrapper fits the payload to this
+    cap in one plain-JSON page (``_fit_response_payload``); exact-content
+    modes page their bytes through the signed continuation store instead.
     """
 
     if mode in {"focus", "slice"}:
@@ -442,18 +463,80 @@ _FTS_TOKEN_RE = re.compile(r"\w+", re.UNICODE)
 _SQLITE_LIKE_ESCAPE_RE = re.compile(r"([%_\\\\])")
 
 
+def _fts_query_tokens(raw: str) -> list[str]:
+    """Distinct casefolded word tokens of a free-text query, in query order."""
+    tokens: list[str] = []
+    seen: set[str] = set()
+    for token in _FTS_TOKEN_RE.findall(raw):
+        folded = token.casefold()
+        if folded not in seen:
+            seen.add(folded)
+            tokens.append(folded)
+    return tokens
+
+
 def _fts_match_expr(raw: str) -> str | None:
     """Convert free text into a literal, injection-safe FTS5 MATCH expression.
 
     Each Unicode word token is emitted as its own double-quoted phrase so
     punctuation (``-``, ``:``, ``(``, ``)``, ``"``, ``*``) already present in
-    a topic/query string can never be parsed as FTS5 query grammar. Returns
-    ``None`` when the input has no searchable token.
+    a topic/query string can never be parsed as FTS5 query grammar.  Tokens
+    are joined with ``OR``: a space-joined list is FTS5's implicit AND of
+    every word, which required all six words of a typical manager query to
+    sit in one row of a 93-row store and returned zero on 34 of 38 real
+    manager calls (startup-3).  Precision comes back through ranking:
+    ``_rank_fts_rows`` orders the OR candidates by how many query tokens each
+    row covers (an all-token match first), then by bm25.  Returns ``None``
+    when the input has no searchable token.
     """
     tokens = _FTS_TOKEN_RE.findall(raw)
     if not tokens:
         return None
-    return " ".join('"' + t.replace('"', '""') + '"' for t in tokens)
+    return " OR ".join('"' + t.replace('"', '""') + '"' for t in tokens)
+
+
+def _rank_fts_rows(
+    rows: Sequence[sqlite3.Row], tokens: Sequence[str], *, fields: Sequence[str],
+) -> list[sqlite3.Row]:
+    """Order bm25-ranked OR candidates by query-token coverage, then bm25.
+
+    ``rows`` arrive in bm25 order and the sort is stable, so rows covering the
+    same number of tokens keep that order; a row holding every token (the old
+    AND result) ranks first without a second MATCH.
+    """
+
+    def coverage(row: sqlite3.Row) -> int:
+        keys = row.keys()
+        text = " ".join(
+            str(row[field] or "") for field in fields if field in keys
+        ).casefold()
+        return sum(1 for token in tokens if token in text)
+
+    return sorted(rows, key=lambda row: -coverage(row))
+
+
+def _context_store_stats(
+    con: sqlite3.Connection, *, table: str, component: str,
+) -> dict[str, Any]:
+    """``store_rows``/``last_write_at`` so an empty store is visible at a glance.
+
+    ``table`` and ``component`` are module constants, never caller input.
+    """
+    stats: dict[str, Any] = {"store_rows": 0, "last_write_at": None}
+    try:
+        if _table_exists(con, table):
+            stats["store_rows"] = int(
+                con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            )
+        if _table_exists(con, "context_mutations"):
+            row = con.execute(
+                "SELECT MAX(created_at) FROM context_mutations WHERE component=?",
+                (component,),
+            ).fetchone()
+            stats["last_write_at"] = str(row[0]) if row and row[0] else None
+    except sqlite3.Error:
+        pass
+    return stats
 
 
 def _sqlite_like_literal(raw: str) -> str:
@@ -482,9 +565,60 @@ def _bounded_text(text: str, max_bytes: int) -> tuple[str, bool]:
     return encoded[:max_bytes].decode("utf-8", errors="ignore"), True
 
 
+# Structural containers counted for payloads that carry no ``matches`` list.
+# Projections of the primary rows (``related_tests``, ``todos``, the old
+# ``hot_symbols``/``risks``) are deliberately absent: they are not hits.
+_JSON_HIT_CONTAINER_KEYS: frozenset[str] = frozenset({
+    "items", "results", "matches", "rows", "symbols", "files",
+    "sections", "relevant_files", "candidate_files", "neighbors",
+    "contexts", "entities", "edges", "call_edges",
+    "cross_file_edges", "suspects",
+})
+
+
+def _is_fallback_payload(value: Any) -> bool:
+    reason = value.get("retrieval_reason") if isinstance(value, dict) else None
+    return isinstance(reason, str) and reason.startswith(
+        SOURCE_GRAPH_FALLBACK_REASON_PREFIX
+    )
+
+
 def _json_hit_count(value: Any) -> int:
+    """Count first-class hits: the ``matches`` rows when a payload has them.
+
+    A payload with a ``matches`` list counts exactly those rows -- never the
+    projections (``related_tests``, ``todos``, the old ``hot_symbols``) that
+    let a reply whose matches were trimmed still report ``hit_count > 0``
+    (source_graph-2).  A server-side fallback result (``retrieval_reason``
+    ``fallback:<step>``) counts ZERO here so it can never satisfy the live
+    Source Graph gate as a first-class hit; ``_json_fallback_hit_count``
+    reports it separately.  Payloads without ``matches`` (analytics rows,
+    contexts, stub fixtures) keep the structural container count.
+    """
+    if isinstance(value, dict):
+        if _is_fallback_payload(value):
+            return 0
+        matches = value.get("matches")
+        if isinstance(matches, list):
+            return len(matches)
+    return _json_container_hit_count(value)
+
+
+def _json_fallback_hit_count(value: Any) -> int:
+    """Rows a labelled fallback step returned; 0 for a first-class result."""
+    if not _is_fallback_payload(value):
+        return 0
+    matches = value.get("matches")
+    if isinstance(matches, list):
+        return len(matches)
+    return _json_container_hit_count(
+        {key: item for key, item in value.items() if key != "retrieval_reason"}
+    )
+
+
+def _json_container_hit_count(value: Any) -> int:
     if isinstance(value, list):
-        return len(value) + sum(_json_hit_count(item) for item in value)
+        return len(value) + sum(_json_container_hit_count(item) for item in value)
     if isinstance(value, dict):
         total = 0
         saw_container = False
@@ -496,17 +630,11 @@ def _json_hit_count(value: Any) -> int:
             if key == "query_tokens":
                 saw_container = True
                 continue
-            if key in {
-                "items", "results", "matches", "rows", "symbols", "files",
-                "sections", "relevant_files", "candidate_files", "neighbors",
-                "contexts", "entities", "edges", "call_edges",
-                "cross_file_edges", "hot_symbols", "related_tests", "risks",
-                "suspects", "todos",
-            }:
+            if key in _JSON_HIT_CONTAINER_KEYS:
                 saw_container = True
-                total += _json_hit_count(item)
+                total += _json_container_hit_count(item)
             elif isinstance(item, (dict, list)):
-                total += _json_hit_count(item)
+                total += _json_container_hit_count(item)
         if total:
             return total
         return 0 if saw_container else (1 if value else 0)
@@ -1649,6 +1777,94 @@ def _hmac_entry(entry: dict[str, Any], key: bytes) -> str:
     return hmac.new(key, canonical.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
+# Process-local order of what this server already served per (task, request):
+# the facts the workflow-stage inference reads (worker_prompt-5).  Kept even
+# when no ledger is bound (manager contexts) and bounded so a long-lived
+# server cannot grow it.
+_TOOL_CALL_STATE: dict[tuple[str, str], dict[str, Any]] = {}
+_TOOL_CALL_STATE_LOCK = threading.Lock()
+_MAX_TOOL_CALL_STATE_ENTRIES = 256
+
+
+def _record_tool_call(ctx: WorkerToolContext, tool: str, ok: bool) -> None:
+    key = (str(ctx.task_id), str(ctx.request_id))
+    with _TOOL_CALL_STATE_LOCK:
+        state = _TOOL_CALL_STATE.pop(key, None) or {
+            "calls": 0, "prepares": 0, "applies": 0, "last_tool": "",
+        }
+        state["calls"] += 1
+        if ok and tool == "semantic_edit_prepare":
+            state["prepares"] += 1
+        if ok and tool == "semantic_edit_apply":
+            state["applies"] += 1
+        state["last_tool"] = tool
+        _TOOL_CALL_STATE[key] = state
+        while len(_TOOL_CALL_STATE) > _MAX_TOOL_CALL_STATE_ENTRIES:
+            _TOOL_CALL_STATE.pop(next(iter(_TOOL_CALL_STATE)))
+
+
+def _tool_call_state(ctx: WorkerToolContext) -> dict[str, Any]:
+    with _TOOL_CALL_STATE_LOCK:
+        state = _TOOL_CALL_STATE.get((str(ctx.task_id), str(ctx.request_id)))
+        if state is None:
+            return {"calls": 0, "prepares": 0, "applies": 0, "last_tool": ""}
+        return dict(state)
+
+
+def _is_manager_context(ctx: WorkerToolContext) -> bool:
+    return (
+        str(ctx.task_id).startswith("manager:")
+        or str(ctx.runner).endswith("_manager")
+    )
+
+
+def _manager_thread_identity(ctx: WorkerToolContext) -> tuple[str, str] | None:
+    """``(provider, session_id)`` of a manager-bound context, else ``None``."""
+    if not _is_manager_context(ctx):
+        return None
+    runner = str(ctx.runner)
+    provider = runner[: -len("_manager")] if runner.endswith("_manager") else runner
+    session_id = str(ctx.request_id or "").strip()
+    if not session_id and str(ctx.task_id).startswith("manager:"):
+        session_id = str(ctx.task_id)[len("manager:"):]
+    if not provider or not session_id:
+        return None
+    return provider, session_id
+
+
+def _infer_workflow_stage(ctx: WorkerToolContext) -> str:
+    """Derive the stage the server can already see (worker_prompt-5).
+
+    Rework attempt (overlay packet bound) -> ``rework``; reviewer role or a
+    manager context -> ``review``; previous call a validation receipt ->
+    ``validation``; after the first semantic-edit apply -> ``implementation``;
+    otherwise ``orientation``.  A declared stage always overrides this.
+    """
+    if ctx.rework_overlay_packet is not None:
+        return "rework"
+    if ctx.quality_review_packet_path is not None or _is_manager_context(ctx):
+        return "review"
+    state = _tool_call_state(ctx)
+    if str(state.get("last_tool") or "") in VALIDATION_RECEIPT_TOOLS:
+        return "validation"
+    if int(state.get("applies") or 0) > 0:
+        return "implementation"
+    return "orientation"
+
+
+def _infer_ledger_row_stage(
+    *, authority_source: str, runner: str, apply_seen: bool, review_seen: bool,
+) -> str:
+    """The same inference over an authenticated ledger row's own facts."""
+    if authority_source == "rework_overlay":
+        return "rework"
+    if review_seen or runner.endswith("_manager"):
+        return "review"
+    if apply_seen:
+        return "implementation"
+    return "orientation"
+
+
 def _append_audit(
     ctx: WorkerToolContext,
     *,
@@ -1665,6 +1881,7 @@ def _append_audit(
     provider_call_id: str = "",
     provenance: str = "",
 ) -> bool:
+    _record_tool_call(ctx, tool, ok)
     if ctx.audit_ledger_path is None or ctx.audit_hmac_key_path is None:
         return False
     try:
@@ -1798,6 +2015,9 @@ def verify_audit_ledger(
         "source_graph_mode_stage_counts": {},
         "source_graph_mode_attributed_calls": 0,
         "source_graph_stage_attributed_calls": 0,
+        # worker_prompt-5: every row carries a stage; this says how many were
+        # declared by the caller and how many the server inferred.
+        "source_graph_stage_source_counts": {},
         "source_graph_latency": {
             "count": 0, "total_ms": 0.0, "min_ms": None, "max_ms": None,
             "p50_ms": None, "p95_ms": None,
@@ -1838,6 +2058,9 @@ def verify_audit_ledger(
     invalid_identity_codes: list[str] = []
     source_graph_latencies: list[float] = []
     source_graph_call_times: list[float] = []
+    # Ledger order facts for rows that carry no declared stage.
+    semantic_apply_seen = False
+    review_seen = False
     for raw_line in lines:
         raw_line = raw_line.strip()
         if not raw_line:
@@ -1941,12 +2164,33 @@ def verify_audit_ledger(
                 and len(result["source_graph_query_sequence"]) < 64
             ):
                 result["source_graph_query_sequence"].append(query_sha256)
-            stage = (
-                str(payload.get("workflow_stage") or "unspecified")
-                if isinstance(payload, dict) else "unspecified"
+            declared_stage = (
+                str(payload.get("workflow_stage") or "")
+                if isinstance(payload, dict) else ""
             )
-            if stage not in WORKFLOW_STAGES:
-                stage = "unspecified"
+            declared_source = (
+                str(payload.get("workflow_stage_source") or "")
+                if isinstance(payload, dict) else ""
+            )
+            if declared_stage in WORKFLOW_STAGES and declared_stage != "unspecified":
+                stage = declared_stage
+                stage_source = (
+                    declared_source
+                    if declared_source in {"declared", "inferred"}
+                    else "declared"
+                )
+            else:
+                # A row without a label is inferred from the ledger's own
+                # order, never counted as "unspecified" (worker_prompt-5).
+                stage = _infer_ledger_row_stage(
+                    authority_source=str(entry.get("authority_source") or ""),
+                    runner=str(entry.get("runner") or ""),
+                    apply_seen=semantic_apply_seen,
+                    review_seen=review_seen,
+                )
+                stage_source = "inferred"
+            stage_sources = result["source_graph_stage_source_counts"]
+            stage_sources[stage_source] = int(stage_sources.get(stage_source) or 0) + 1
             stage_counts = result["source_graph_stage_counts"]
             stage_counts[stage] = int(stage_counts.get(stage) or 0) + 1
             if stage != "unspecified":
@@ -2019,6 +2263,10 @@ def verify_audit_ledger(
                 source_graph_call_times.append(timestamp.timestamp())
             except (ValueError, OverflowError):
                 pass
+        if tool == "semantic_edit_apply" and entry.get("ok") and not entry.get("violation"):
+            semantic_apply_seen = True
+        if tool == "quality_review_packet_read" and entry.get("ok"):
+            review_seen = True
         returned_bytes = max(0, int(entry.get("bytes_returned") or 0))
         result["bounded_bytes_returned"] += returned_bytes
         bounded_bytes_by_tool[tool] = bounded_bytes_by_tool.get(tool, 0) + returned_bytes
@@ -2549,9 +2797,45 @@ def _prior_session_state(key: tuple[Any, ...]) -> dict[str, Any] | None:
         return _SESSION_DELTA_CACHE.get(key)
 
 
-def _violation(ctx: WorkerToolContext, tool: str, reason: str) -> dict[str, Any]:
+def _violation(
+    ctx: WorkerToolContext, tool: str, reason: str, **detail: Any,
+) -> dict[str, Any]:
+    """Audit a refused call and return it with what the valid next call is.
+
+    ``detail`` rides on the reply only (never the ledger): the allowed target
+    list for ``target_not_allowed``, the valid next call for cursor errors.
+    """
     _append_audit(ctx, tool=tool, ok=False, cache_hit=False, hit_count=0, bytes_returned=0, violation=reason)
-    return {"ok": False, "tool": tool, "reason": reason}
+    result: dict[str, Any] = {"ok": False, "tool": tool, "reason": reason}
+    result.update(detail)
+    return result
+
+
+_CONTINUATION_CURSOR_NEXT_CALL: dict[str, str] = {
+    "invalid_continuation_cursor": (
+        "The cursor is not one this server minted (or was altered). Re-issue "
+        "the original query without continuation_cursor; page 0 mints a fresh "
+        "cursor when the reply pages."
+    ),
+    "continuation_unavailable": (
+        "The paged reply expired or was evicted. Re-issue the original query "
+        "without continuation_cursor to get page 0 and a fresh cursor."
+    ),
+    "continuation_authority_mismatch": (
+        "Pass the identical mode, query, target, budget, bundle_type and "
+        "workflow_stage that minted the cursor; any change starts a new query "
+        "(omit continuation_cursor)."
+    ),
+    "continuation_page_out_of_range": (
+        "Every page was already served; the last page returned "
+        "continuation_cursor=null. Re-issue the query to start over."
+    ),
+    "cursor_not_supported_for_mode": (
+        "cursor is only accepted by analytic modes (tags, hotspots, coverage, "
+        "churn, testmap, ...). For a paged reply of this mode pass the "
+        "continuation_cursor from the previous page instead."
+    ),
+}
 
 
 def _bounded_query(value: Any, *, max_bytes: int = MAX_QUERY_BYTES) -> str | None:
@@ -2579,13 +2863,24 @@ def _filter_by_scope(value: Any, scope: str) -> Any:
     through untouched.
     """
 
-    normalized_scope = scope.replace("\\", "/").rstrip("/")
+    return _filter_by_scopes(value, (scope,))
+
+
+def _filter_by_scopes(value: Any, scopes: Sequence[str]) -> Any:
+    """``_filter_by_scope`` over ANY of several path scopes (declared targets)."""
+
+    normalized_scopes = [
+        str(scope).replace("\\", "/").rstrip("/") for scope in scopes if str(scope)
+    ]
 
     def in_scope(candidate: str) -> bool:
         normalized_candidate = candidate.replace("\\", "/")
         candidate_cmp = normalized_candidate.casefold() if os.name == "nt" else normalized_candidate
-        scope_cmp = normalized_scope.casefold() if os.name == "nt" else normalized_scope
-        return candidate_cmp == scope_cmp or candidate_cmp.startswith(f"{scope_cmp}/")
+        for normalized_scope in normalized_scopes:
+            scope_cmp = normalized_scope.casefold() if os.name == "nt" else normalized_scope
+            if candidate_cmp == scope_cmp or candidate_cmp.startswith(f"{scope_cmp}/"):
+                return True
+        return False
 
     if isinstance(value, list):
         kept: list[Any] = []
@@ -2594,7 +2889,7 @@ def _filter_by_scope(value: Any, scope: str) -> Any:
                 if in_scope(item):
                     kept.append(item)
                 continue
-            filtered_item = _filter_by_scope(item, scope)
+            filtered_item = _filter_by_scopes(item, scopes)
             if filtered_item is not None:
                 kept.append(filtered_item)
         return kept
@@ -2604,7 +2899,7 @@ def _filter_by_scope(value: Any, scope: str) -> Any:
             if isinstance(file_value, str):
                 return value if in_scope(file_value) else None
         return {
-            key: _filter_by_scope(item, scope) if isinstance(item, (list, dict)) else item
+            key: _filter_by_scopes(item, scopes) if isinstance(item, (list, dict)) else item
             for key, item in value.items()
         }
     return value
@@ -3253,11 +3548,8 @@ def _merge_rework_overlay_payload(
         merged["contexts"] = overlay_contexts + (
             canonical_contexts if isinstance(canonical_contexts, list) else []
         )
-    if mode == "focus" and overlay_matches:
-        ranked = merged.get("ranked_symbols")
-        merged["ranked_symbols"] = overlay_matches + (
-            ranked if isinstance(ranked, list) else []
-        )
+    # Overlay rows already lead ``matches``; focus carries its per-symbol
+    # metrics on the match rows now (no ``ranked_symbols`` projection).
     packet = ctx.rework_overlay_packet or {}
     merged["overlay"] = {
         "authority_source": "rework_overlay",
@@ -3332,6 +3624,9 @@ class _ContinuationEntry:
     meta: dict[str, Any]
     chunk_size: int
     page_count: int
+    # Identity/index/evidence block for the ledger row of every continuation
+    # page; it is no longer part of the model-facing ``meta`` (source_graph-3).
+    ledger_meta: dict[str, Any] = field(default_factory=dict)
 
 
 _CONTINUATION_STORE: dict[str, _ContinuationEntry] = {}
@@ -3446,6 +3741,7 @@ def _continuation_put(
     store_id: str | None = None,
     chunk_size: int | None = None,
     page_count: int | None = None,
+    ledger_meta: dict[str, Any] | None = None,
 ) -> str | None:
     """Store one pageable response and return its bounded store identifier."""
     global _CONTINUATION_RETAINED_BYTES
@@ -3474,6 +3770,7 @@ def _continuation_put(
             meta=meta,
             chunk_size=chunk_size,
             page_count=page_count,
+            ledger_meta=dict(ledger_meta or {}),
         )
         _CONTINUATION_RETAINED_BYTES += len(canonical_bytes)
     return store_id
@@ -3511,7 +3808,14 @@ def _continuation_clear() -> None:
 
 
 def _payload_internal_truncation(payload: Any) -> bool:
-    """Report only engine/payload loss, never wrapper response size."""
+    """Report only payload loss, never wrapper response size.
+
+    Payload loss is the engine truncating, the engine signalling a
+    continuation cursor, or the wrapper's structure-aware fit dropping
+    evidence -- the fit declares itself through the payload's own
+    ``truncated`` flag and names what it dropped in ``fit_dropped``.
+    Response size alone is outer pagination, reported separately.
+    """
     if not isinstance(payload, dict):
         return False
     if bool(payload.get("truncated")) or bool(payload.get("scan_truncated")):
@@ -3569,6 +3873,11 @@ def _continuation_page_result(
         "content": base64.b64encode(chunk).decode("ascii"),
         "content_encoding": "base64",
         "content_sha256": content_sha256,
+        # ``content_sha256`` covers the WHOLE canonical response; on a paged
+        # reply the bytes actually returned are this chunk, so it keeps its own
+        # hash.  Without it a page can be truncated or swapped and nothing in
+        # the reply proves it until every page has been reassembled.  It is
+        # also written to the HMAC ledger row for that page.
         "page_sha256": hashlib.sha256(chunk).hexdigest(),
         "page_index": page_index,
         "page_count": page_count,
@@ -3709,11 +4018,18 @@ def _serve_continuation(
 
     entry = _continuation_fetch(store_id)
     if entry is None:
-        return _violation(ctx, tool, "continuation_unavailable")
+        return _violation(
+            ctx, tool, "continuation_unavailable",
+            valid_next_call=_CONTINUATION_CURSOR_NEXT_CALL["continuation_unavailable"],
+        )
     if not hmac.compare_digest(entry.content_sha256, content_sha256):
-        return _violation(ctx, tool, "invalid_continuation_cursor")
+        return _violation(
+            ctx, tool, "invalid_continuation_cursor",
+            valid_next_call=_CONTINUATION_CURSOR_NEXT_CALL["invalid_continuation_cursor"],
+        )
 
     meta = entry.meta
+    ledger_meta = entry.ledger_meta or {}
     expected_bind = _continuation_bind(
         ctx,
         mode=mode,
@@ -3732,10 +4048,16 @@ def _serve_continuation(
         target_task_id=target_task_id,
     )
     if expected_bind != entry.bind:
-        return _violation(ctx, tool, "continuation_authority_mismatch")
+        return _violation(
+            ctx, tool, "continuation_authority_mismatch",
+            valid_next_call=_CONTINUATION_CURSOR_NEXT_CALL["continuation_authority_mismatch"],
+        )
 
     if page_index >= entry.page_count:
-        return _violation(ctx, tool, "continuation_page_out_of_range")
+        return _violation(
+            ctx, tool, "continuation_page_out_of_range",
+            valid_next_call=_CONTINUATION_CURSOR_NEXT_CALL["continuation_page_out_of_range"],
+        )
     result, bytes_returned = _continuation_page_result(
         store_id=store_id,
         page_index=page_index,
@@ -3745,34 +4067,411 @@ def _serve_continuation(
         page_count=entry.page_count,
         content_sha256=entry.content_sha256,
     )
+    receipt_id = secrets.token_hex(6)
+    result["receipt_id"] = receipt_id
+    page_sha256 = str(result["page_sha256"])
     if result["continuation_cursor"] is None:
         _continuation_remove(store_id)
     _append_audit(
         ctx, tool=tool, ok=True, cache_hit=False,
         hit_count=int(meta.get("hit_count") or 0),
         bytes_returned=bytes_returned,
-        authority_source=str(meta.get("authority_source") or ""),
-        authority_state=str(meta.get("authority_state") or ""),
+        authority_source=str(
+            ledger_meta.get("authority_source") or meta.get("authority_source") or ""
+        ),
+        authority_state=str(ledger_meta.get("authority_state") or ""),
         authority_repo=query_repo,
         provenance="continuation",
         payload={
             "mode": meta.get("mode"),
             "query_sha256": query_sha256,
             "workflow_stage": meta.get("workflow_stage"),
+            "workflow_stage_source": meta.get("workflow_stage_source"),
             "latency_ms": round((time.perf_counter() - started) * 1000.0, 3),
             "index_revision": index_identity["build_revision"],
             "index_finished_at": index_identity["finished_at"],
-            "evidence_counts": meta.get("evidence_counts"),
-            "output_cap_bytes": meta.get("output_cap_bytes"),
-            "target_request_id": meta.get("target_request_id"),
-            "target_task_id": meta.get("target_task_id"),
-            "packet_sha256": meta.get("packet_sha256"),
+            "evidence_counts": ledger_meta.get("evidence_counts"),
+            "output_cap_bytes": ledger_meta.get("output_cap_bytes"),
+            "target_request_id": ledger_meta.get("target_request_id"),
+            "target_task_id": ledger_meta.get("target_task_id"),
+            "packet_sha256": ledger_meta.get("packet_sha256"),
             "internal_truncated": bool(meta.get("internal_truncated")),
             "outer_truncated": result["outer_truncated"],
             "page_index": page_index,
+            "page_sha256": page_sha256,
+            "receipt_id": receipt_id,
         },
     )
     return result
+
+
+def _fit_response_payload(
+    sg_module: Any,
+    payload: dict[str, Any],
+    meta: Mapping[str, Any],
+    output_cap_bytes: int,
+) -> tuple[dict[str, Any], list[str]]:
+    """Fit one analytic payload to the outer cap as ONE plain-JSON page.
+
+    The engine's own trimmer runs at ``budget*512`` (32 KiB at budget 64),
+    four times the 8 KiB orientation cap, so focus/slice replies used to be
+    chunked into base64 pages cut mid-object that no reader ever decoded
+    (source_graph-1).  Here the same structure-aware priority trimmer is
+    re-run at ``output_cap_bytes`` minus the MEASURED envelope overhead (the
+    serialized reply with an empty content string).  ``content`` is a JSON
+    string inside JSON, so its escaping adds bytes a payload-level cap cannot
+    see: the whole reply is re-measured and the cap lowered by the exact
+    overage until the reply fits.  Returns the fitted payload (mutated in
+    place) and the sections it dropped; hashes and the ledger row are
+    computed over the fitted bytes actually returned.
+    """
+
+    fit = getattr(sg_module, "_fit_payload_bytes", None)
+    if fit is None or not isinstance(payload, dict):
+        return payload, []
+    probe: dict[str, Any] = {
+        **meta,
+        "truncated": True,
+        "outer_truncated": False,
+        "internal_truncated": True,
+        "bytes": 10 ** 9,
+        "content": "",
+        "content_sha256": "0" * 64,
+    }
+    before = payload.get("fit_dropped")
+    before_names = list(before) if isinstance(before, list) else []
+    cap = output_cap_bytes - _serialized_response_bytes(probe) - 64
+    fitted_once = False
+    for _ in range(_FIT_MAX_PASSES):
+        text = json.dumps(
+            payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        )
+        probe["content"] = text
+        probe["bytes"] = len(text.encode("utf-8"))
+        size = _serialized_response_bytes(probe)
+        if size <= output_cap_bytes:
+            break
+        if fitted_once:
+            cap -= (size - output_cap_bytes) + 32
+        if cap < 256:
+            break
+        payload = fit(payload, cap)
+        fitted_once = True
+    dropped = payload.get("fit_dropped")
+    dropped_now = (
+        [name for name in dropped if name not in before_names]
+        if isinstance(dropped, list) else []
+    )
+    return payload, dropped_now
+
+
+def _source_graph_zero_hit_fallback(
+    ctx: WorkerToolContext,
+    sg_module: Any,
+    query_repo: Path,
+    *,
+    mode: str,
+    query: str,
+    scope: str | None,
+    budget: int,
+    unscoped_payload: Any,
+) -> tuple[dict[str, Any], str] | None:
+    """Run the deterministic zero-hit cascade server-side, in the same turn.
+
+    ranked query (already missed) -> declared targets -> OR terms ->
+    bodygrep token-AND within one line, then within one file (whitespace
+    phrases), each on the requested scope then the declared targets.  The
+    first non-empty step wins and is labelled
+    ``retrieval_reason='fallback:<step>'`` (and ``scope`` /
+    ``requested_target`` when it broadened past the requested target), so
+    ``_json_hit_count`` reports it as zero first-class hits and the live gate
+    and zero-hit KPI still record the primary miss (source_graph-4/5).  An
+    engine without a step's surface (a stubbed engine) skips that step.
+    """
+
+    targets = tuple(str(item) for item in ctx.source_graph_targets if str(item))
+    tokenizer = getattr(sg_module, "_query_tokens", None)
+    tokens = list(tokenizer(query)) if callable(tokenizer) else query.split()
+    # ``slice`` treats its target as a symbol selector, never a path prefix.
+    path_scope = scope if mode != "slice" else None
+    engine_error = getattr(sg_module, "SourceGraphError", Exception)
+
+    def labelled(candidate: dict[str, Any], step: str, scope_label: str) -> tuple[dict[str, Any], str]:
+        result = dict(candidate)
+        result["mode"] = mode
+        result["query"] = query
+        result["retrieval_reason"] = f"{SOURCE_GRAPH_FALLBACK_REASON_PREFIX}{step}"
+        if scope is not None:
+            result["requested_target"] = scope
+            result["scope"] = scope_label or "target"
+        return result, step
+
+    def within_scope(candidate: Any) -> tuple[dict[str, Any] | None, str]:
+        """Apply the request scope, broadening to declared targets if needed."""
+        if not isinstance(candidate, dict) or not candidate:
+            return None, ""
+        if path_scope is None:
+            return candidate, ""
+        narrowed = _filter_by_scope(candidate, path_scope)
+        if isinstance(narrowed, dict) and _json_hit_count(narrowed) > 0:
+            return narrowed, "target"
+        if targets:
+            broadened = _filter_by_scopes(candidate, targets)
+            if isinstance(broadened, dict) and _json_hit_count(broadened) > 0:
+                return broadened, "declared_target_fallback"
+        return None, ""
+
+    # 1. declared targets: the ranked result exists, just not under the
+    #    requested scope (mirrors body mode's declared_target_fallback).
+    if path_scope is not None and targets and _json_hit_count(unscoped_payload) > 0:
+        broadened = _filter_by_scopes(unscoped_payload, targets)
+        if isinstance(broadened, dict) and _json_hit_count(broadened) > 0:
+            return labelled(broadened, "declared_targets", "declared_target_fallback")
+
+    # 2. OR terms: any token instead of every token.
+    if mode in {"focus", "slice"} and len(tokens) > 1:
+        engine = getattr(sg_module, "focus" if mode == "focus" else "slice_", None)
+        candidate: Any = None
+        if callable(engine):
+            try:
+                if mode == "focus":
+                    candidate = engine(query_repo, query, budget, retrieval="or_terms")
+                else:
+                    candidate = engine(
+                        query_repo, query, budget, target=scope, retrieval="or_terms",
+                    )
+            except TypeError:
+                candidate = None  # engine without the broadened pass
+            except engine_error:
+                candidate = None
+        chosen, scope_label = within_scope(candidate)
+        if chosen is not None and _json_hit_count(chosen) > 0:
+            return labelled(chosen, "or_terms", scope_label)
+
+    # 3. bodygrep token-AND for whitespace phrases: one line, then one file,
+    #    on the requested scope first, then each declared target.
+    grep = getattr(sg_module, "bodygrep_query", None)
+    if callable(grep) and (len(tokens) > 1 or mode == "bodygrep"):
+        scan_targets: list[str | None] = [path_scope] if path_scope is not None else [None]
+        if path_scope is not None:
+            scan_targets.extend(
+                [target for target in targets if target != path_scope][:8]
+            )
+        kinds = ("token_and_line", "token_and_file") if len(tokens) > 1 else ()
+        unsupported = False
+        for kind in kinds:
+            for scan_target in scan_targets:
+                try:
+                    candidate = grep(
+                        query_repo, query, budget, target=scan_target, match_kind=kind,
+                    )
+                except TypeError:
+                    unsupported = True  # engine without token kinds
+                    break
+                except engine_error:
+                    continue
+                if isinstance(candidate, dict) and _json_hit_count(candidate) > 0:
+                    scope_label = (
+                        "target" if scan_target == path_scope
+                        else "declared_target_fallback"
+                    )
+                    return labelled(candidate, f"bodygrep_{kind}", scope_label)
+            if unsupported:
+                break
+        # 4. a scoped literal bodygrep miss: the literal on the other declared targets.
+        if mode == "bodygrep" and path_scope is not None:
+            for scan_target in [target for target in targets if target != path_scope][:8]:
+                try:
+                    candidate = grep(query_repo, query, budget, target=scan_target)
+                except (TypeError, engine_error):
+                    continue
+                if isinstance(candidate, dict) and _json_hit_count(candidate) > 0:
+                    return labelled(candidate, "declared_targets", "declared_target_fallback")
+    return None
+
+
+def _refreshed_entity_row(
+    extraction: Any, entity: Any, source: str, indexed_hash: Any,
+) -> dict[str, Any]:
+    return {
+        "kind": entity.kind,
+        "name": entity.name,
+        "qualname": entity.qualname,
+        "file_path": entity.file_path,
+        "line_start": entity.line_start,
+        "line_end": entity.line_end,
+        "signature": entity.signature,
+        "evidence_label": entity.evidence_label,
+        "confidence": entity.confidence,
+        "source_hash": extraction.source_hash,
+        "build_revision": entity.build_revision,
+        "freshness": {
+            "state": "fresh",
+            "indexed_source_hash": indexed_hash,
+            "disk_source_hash": extraction.source_hash,
+            "refresh": "inline",
+        },
+        "source": source,
+        "refresh": "inline",
+    }
+
+
+def _inline_refresh_stale_rows(
+    sg_module: Any, query_repo: Path, payload: dict[str, Any],
+) -> list[str]:
+    """Re-extract stale files inline and answer from the refreshed rows.
+
+    A worker has no refresh tool and the canonical index is read-only under
+    its sandbox, so a body-style reply whose per-file freshness was ``stale``
+    used to hand back stale line numbers and no source while the policy told
+    the worker to "refresh once" (source_graph-8).  The file is re-extracted
+    from the authority tree in memory -- the same extractor the rework
+    overlay uses -- the row's range, signature and source come from the fresh
+    extraction, and the receipt records ``refresh='inline'``.  Nothing is
+    written to the index; a file that cannot be re-extracted stays stale.
+    Returns the refreshed file paths.
+    """
+
+    if not isinstance(payload, dict):
+        return []
+    try:
+        from . import source_graph_ast as _sgast
+    except ImportError:
+        return []
+    root = Path(query_repo).resolve()
+    build_revision = str(getattr(sg_module, "BUILD_REVISION", "") or "")
+    cache: dict[str, tuple[Any, list[str]] | None] = {}
+
+    def extraction_for(file_path: str) -> tuple[Any, list[str]] | None:
+        if file_path in cache:
+            return cache[file_path]
+        found: tuple[Any, list[str]] | None = None
+        try:
+            raw = Path(file_path)
+            if file_path and not raw.is_absolute() and ".." not in raw.parts:
+                current = root
+                symlinked = False
+                for part in raw.parts:
+                    current = current / part
+                    if current.is_symlink():
+                        symlinked = True
+                        break
+                target = (root / raw).resolve()
+                if not symlinked and target.is_relative_to(root) and target.is_file():
+                    extraction = _sgast.extract_file(
+                        root, target, build_revision=build_revision,
+                    )
+                    if extraction.status in _REWORK_OVERLAY_EXTRACT_OK:
+                        found = (
+                            extraction,
+                            target.read_text(encoding="utf-8").splitlines(),
+                        )
+        except (OSError, UnicodeDecodeError, ValueError, RuntimeError):
+            found = None
+        cache[file_path] = found
+        return found
+
+    refreshed: list[str] = []
+    rows = payload.get("matches")
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict):
+            continue
+        freshness = row.get("freshness")
+        if not isinstance(freshness, dict) or freshness.get("state") != "stale":
+            continue
+        file_path = str(row.get("file_path") or "")
+        found = extraction_for(file_path)
+        if found is None:
+            continue
+        extraction, lines = found
+        qualname = str(row.get("qualname") or "")
+        name = str(row.get("name") or "")
+        kind = str(row.get("kind") or "")
+        entity = next(
+            (item for item in extraction.entities if item.qualname == qualname), None,
+        )
+        if entity is None:
+            entity = next(
+                (
+                    item for item in extraction.entities
+                    if item.name == name and item.kind == kind
+                ),
+                None,
+            )
+        if entity is None:
+            continue
+        start = max(0, int(entity.line_start) - 1)
+        end = max(start, int(entity.line_end))
+        update: dict[str, Any] = {
+            "line_start": entity.line_start,
+            "line_end": entity.line_end,
+            "signature": entity.signature,
+            "source_hash": extraction.source_hash,
+            "freshness": {
+                "state": "fresh",
+                "indexed_source_hash": freshness.get("indexed_source_hash"),
+                "disk_source_hash": extraction.source_hash,
+                "refresh": "inline",
+            },
+            "refresh": "inline",
+        }
+        if "source" in row:
+            update["source"] = "\n".join(lines[start:end])
+        row.update(update)
+        refreshed.append(file_path)
+
+    for key in ("contexts", "sections"):
+        sections = payload.get(key)
+        for section in sections if isinstance(sections, list) else []:
+            if not isinstance(section, dict):
+                continue
+            freshness = section.get("freshness")
+            if not isinstance(freshness, dict) or freshness.get("state") != "stale":
+                continue
+            file_path = str(section.get("file_path") or "")
+            found = extraction_for(file_path)
+            if found is None:
+                continue
+            extraction, lines = found
+            previous = section.get("entities")
+            limit = len(previous) if isinstance(previous, list) and previous else 8
+            entities: list[dict[str, Any]] = []
+            for index, entity in enumerate(extraction.entities[:limit]):
+                source = ""
+                if index < 4 and entity.kind in {"function", "method", "class", "struct"}:
+                    start = max(0, int(entity.line_start) - 1)
+                    end = max(start, int(entity.line_end))
+                    source = "\n".join(lines[start:end])[:800]
+                entities.append(_refreshed_entity_row(
+                    extraction, entity, source, freshness.get("indexed_source_hash"),
+                ))
+            section["entities"] = entities
+            # Call edges are graph evidence from the stale generation; they
+            # are kept but named as such rather than silently presented fresh.
+            section["edges_freshness"] = "stale"
+            section["freshness"] = {
+                "state": "fresh",
+                "indexed_source_hash": freshness.get("indexed_source_hash"),
+                "disk_source_hash": extraction.source_hash,
+                "refresh": "inline",
+            }
+            section["refresh"] = "inline"
+            refreshed.append(file_path)
+
+    if refreshed:
+        payload["refresh"] = "inline"
+        payload["refreshed_files"] = sorted(set(refreshed))[:16]
+        if isinstance(payload.get("freshness"), str):
+            states: list[str] = []
+            for key in ("matches", "contexts", "sections"):
+                items = payload.get(key)
+                for item in items if isinstance(items, list) else []:
+                    state = item.get("freshness") if isinstance(item, dict) else None
+                    if isinstance(state, dict):
+                        states.append(str(state.get("state") or ""))
+            if states and all(state == "fresh" for state in states):
+                payload["freshness"] = "fresh"
+    return sorted(set(refreshed))
 
 
 def source_graph_query(
@@ -3854,7 +4553,11 @@ def source_graph_query(
     selector_resolved = False
     if cursor is not None:
         if not is_analytic_mode:
-            return _violation(ctx, tool, "cursor_not_supported_for_mode")
+            return _violation(
+                ctx, tool, "cursor_not_supported_for_mode",
+                valid_next_call=_CONTINUATION_CURSOR_NEXT_CALL["cursor_not_supported_for_mode"],
+                analytic_modes=sorted(SOURCE_GRAPH_ANALYTIC_MODES),
+            )
         bounded_cursor = _bounded_query(cursor, max_bytes=64)
         if bounded_cursor is None:
             return _violation(ctx, tool, "invalid_cursor")
@@ -3866,13 +4569,26 @@ def source_graph_query(
         if bounded_target is None:
             return _violation(ctx, tool, "invalid_target")
         if ctx.source_graph_targets and bounded_target not in ctx.source_graph_targets:
-            return _violation(ctx, tool, "target_not_allowed")
+            # Name the allowed set so the caller does not guess another
+            # target (144 blind retries in the measured window).
+            return _violation(
+                ctx, tool, "target_not_allowed",
+                requested_target=bounded_target,
+                allowed_targets=list(ctx.source_graph_targets),
+                valid_next_call=(
+                    "Pass one of allowed_targets as target, or omit target for "
+                    "the unscoped query."
+                ),
+            )
         scope = bounded_target
 
     if continuation_cursor is not None:
         bounded_continuation = _bounded_query(continuation_cursor, max_bytes=1024)
         if bounded_continuation is None:
-            return _violation(ctx, tool, "invalid_continuation_cursor")
+            return _violation(
+                ctx, tool, "invalid_continuation_cursor",
+                valid_next_call=_CONTINUATION_CURSOR_NEXT_CALL["invalid_continuation_cursor"],
+            )
         return _serve_continuation(
             ctx, tool=tool, cursor=bounded_continuation,
             started=started, query_sha256=query_sha256,
@@ -3927,6 +4643,16 @@ def source_graph_query(
     # cache in that state -- fall back to the live query every time.
     generation_is_definite = _source_graph_generation_is_definite(index_identity)
     cached = _source_graph_cache_get(cache_key) if generation_is_definite else None
+    # Stage: declared by the caller, else inferred from what this server has
+    # already served for the request (worker_prompt-5 / source_graph-7).
+    if workflow_stage == "unspecified":
+        effective_stage = _infer_workflow_stage(ctx)
+        stage_source = "inferred"
+    else:
+        effective_stage = workflow_stage
+        stage_source = "declared"
+    receipt_id = secrets.token_hex(6)
+
     if cached is not None:
         cached_result = cached["result"]
         receipt_content = json.dumps(
@@ -3954,28 +4680,37 @@ def source_graph_query(
             payload={
                 "mode": mode,
                 "query_sha256": query_sha256,
-                "workflow_stage": workflow_stage,
+                "workflow_stage": effective_stage,
+                "workflow_stage_source": stage_source,
                 "latency_ms": round((time.perf_counter() - started) * 1000.0, 3),
                 "index_revision": index_identity["build_revision"],
                 "index_finished_at": index_identity["finished_at"],
                 "evidence_counts": cached["evidence_counts"],
-                "output_cap_bytes": cached["result"].get("output_cap_bytes"),
+                "output_cap_bytes": (
+                    cached.get("output_cap_bytes")
+                    or cached["result"].get("output_cap_bytes")
+                ),
                 "compact_replay": use_receipt,
                 "replay_original_bytes": int(cached["bytes"]),
                 "replay_returned_bytes": returned_bytes,
                 "replay_bytes_avoided": replay_bytes_avoided,
                 "provider_tokens_saved": None,
                 "provider_token_savings_measured": False,
+                "receipt_id": receipt_id,
             },
         )
         return {
             **cached_result,
-            "workflow_stage": workflow_stage,
+            "workflow_stage": effective_stage,
+            "workflow_stage_source": stage_source,
             "content": returned_content,
             "bytes": returned_bytes,
             "cache_hit": True,
+            # Only a cache-hit reply says whether ``content`` is the receipt
+            # or a verbatim replay; live replies do not carry the flag.
             "cache_receipt": use_receipt,
             "content_sha256": cached["content_sha256"],
+            "receipt_id": receipt_id,
             "replay_original_bytes": int(cached["bytes"]),
             "replay_bytes_avoided": replay_bytes_avoided,
             "provider_tokens_saved": None,
@@ -4051,6 +4786,9 @@ def source_graph_query(
         exact_payload = _declared_input_file_payload(ctx, scope)
         if exact_payload is not None:
             payload = exact_payload
+    # The engine result before any wrapper scope filter: the zero-hit cascade
+    # and the truthful ``retrieval_reason`` both read it.
+    unscoped_payload = payload
     selector_scoped = scope is not None and (
         mode == "slice"
         or (mode in SOURCE_GRAPH_SYMBOL_SELECTOR_MODES and selector_resolved)
@@ -4140,13 +4878,46 @@ def source_graph_query(
                 }
         if isinstance(payload, dict) and payload:
             payload.setdefault("scope", "target")
-            if mode == "focus" and _json_hit_count(payload) == 0:
-                payload["retrieval_reason"] = (
-                    "no_ranked_match_within_target"
-                    if _json_hit_count(unscoped_payload) > 0
-                    else "no_ranked_semantic_match"
-                )
-                payload["requested_target"] = scope
+
+    # Server-side, single-turn zero-hit cascade (source_graph-4/5): the next
+    # expression is deterministic, so the server runs it instead of handing
+    # back a bare zero and waiting for the model to retype the query.
+    fallback_step = ""
+    if (
+        mode in SOURCE_GRAPH_FALLBACK_MODES
+        and not overlay_applied
+        and isinstance(payload, dict)
+        and _json_hit_count(payload) == 0
+    ):
+        fallback = _source_graph_zero_hit_fallback(
+            ctx, _source_graph_mod, query_repo,
+            mode=mode, query=bounded_query, scope=scope, budget=budget,
+            unscoped_payload=unscoped_payload,
+        )
+        if fallback is not None:
+            payload, fallback_step = fallback
+    if (
+        mode in {"focus", "slice"}
+        and isinstance(payload, dict)
+        and payload
+        and not fallback_step
+        and _json_hit_count(payload) == 0
+    ):
+        payload.setdefault(
+            "retrieval_reason",
+            "no_ranked_match_within_target"
+            if scope is not None and _json_hit_count(unscoped_payload) > 0
+            else "no_ranked_semantic_match",
+        )
+        if scope is not None:
+            payload["requested_target"] = scope
+
+    # Stale per-file freshness is answered from an inline re-extraction of
+    # that file rather than handed back as stale line numbers (source_graph-8).
+    refreshed_files: list[str] = []
+    if isinstance(payload, dict) and payload and not overlay_applied:
+        refreshed_files = _inline_refresh_stale_rows(_source_graph_mod, query_repo, payload)
+
     hit_payload = (
         {key: value for key, value in payload.items() if key != "overlay"}
         if isinstance(payload, dict)
@@ -4159,57 +4930,99 @@ def source_graph_query(
         hit_count = len(matches) if isinstance(matches, list) else 0
     else:
         hit_count = _json_hit_count(hit_payload)
+    fallback_hit_count = _json_fallback_hit_count(hit_payload) if fallback_step else 0
+    # Evidence counts and hit count describe the FULL engine result, before
+    # the wrapper's fit trims the returned bytes.
     evidence_counts = _source_graph_evidence_counts(payload)
-    raw_text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
     output_cap_bytes = _source_graph_output_cap(mode)
+
+    authority_source = "rework_overlay" if overlay_applied else binding.authority_source
+    authority_state = (
+        "request_scoped_worktree" if overlay_applied else binding.authority_state
+    )
+    target_request_id = (
+        str(ctx.rework_overlay_packet.get("predecessor_request_id") or "")
+        if overlay_applied and ctx.rework_overlay_packet is not None
+        else binding.target_request_id
+    )
+    target_task_id = (
+        str(ctx.rework_overlay_packet.get("predecessor_task_id") or "")
+        if overlay_applied and ctx.rework_overlay_packet is not None
+        else binding.target_task_id
+    )
+    packet_sha256 = (
+        overlay_view.snapshot_sha256
+        if overlay_applied and overlay_view is not None
+        else binding.packet_sha256
+    )
+
+    # Model-facing envelope (source_graph-3): only what drives the next call.
+    # Index generation, evidence counts, the cap, authority state and the
+    # candidate/rework identity block live in the authenticated ledger row
+    # named by ``receipt_id``.  ``authority_source``, ``authority_repo`` and
+    # ``index_revision`` stay: receipt verification (task_decomposition) reads
+    # them off the reply, and the source tells a rework worker which tree
+    # answered.  Empty identity fields are omitted rather than sent as "".
+    meta: dict[str, Any] = {
+        "ok": True,
+        "tool": tool,
+        "mode": mode,
+        "workflow_stage": effective_stage,
+        "workflow_stage_source": stage_source,
+        "query": bounded_query,
+        "target": scope,
+        "hit_count": hit_count,
+        "cache_hit": False,
+        "authority_source": authority_source,
+        "authority_repo": str(query_repo),
+        "index_revision": index_identity["build_revision"],
+        "receipt_id": receipt_id,
+    }
+    if fallback_step:
+        meta["retrieval_reason"] = f"{SOURCE_GRAPH_FALLBACK_REASON_PREFIX}{fallback_step}"
+        meta["fallback_hit_count"] = fallback_hit_count
+    elif isinstance(payload, dict) and isinstance(payload.get("retrieval_reason"), str):
+        meta["retrieval_reason"] = payload["retrieval_reason"]
+    if isinstance(payload, dict) and isinstance(payload.get("freshness"), str):
+        meta["freshness"] = payload["freshness"]
+    if refreshed_files:
+        meta["refresh"] = "inline"
+    for key, value in (
+        ("target_request_id", target_request_id),
+        ("target_task_id", target_task_id),
+        ("packet_sha256", packet_sha256),
+    ):
+        if value:
+            meta[key] = value
+
+    # Fit, do not page (source_graph-1): every analytic mode is trimmed to the
+    # outer cap in one plain-JSON page; exact-content modes keep their bytes
+    # and page below.
+    fit_dropped: list[str] = []
+    if mode not in SOURCE_GRAPH_EXACT_CONTENT_MODES and isinstance(payload, dict):
+        payload, fit_dropped = _fit_response_payload(
+            _source_graph_mod, payload, meta, output_cap_bytes,
+        )
+    raw_text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
     try:
         canonical_bytes = _canonical_json_bytes(tool, raw_text)
     except WorkerToolError as exc:
         return _violation(ctx, tool, str(exc)[:160])
-    # Engine/payload loss is the ONLY internal truncation: the engine itself
-    # truncated, or signalled a continuation cursor.  Response size alone is
-    # never classified as internal -- that is outer pagination (below).
+    # Payload loss is the ONLY internal truncation: the engine truncated, it
+    # signalled a continuation cursor, or the wrapper's fit dropped evidence
+    # (declared through the payload's own ``truncated``).  Response size alone
+    # is never classified as internal -- that is outer pagination (below).
     internal_truncated = _payload_internal_truncation(payload)
     full_content_sha256 = hashlib.sha256(canonical_bytes).hexdigest()
-
-    # Static response metadata shared by every page (initial or continuation).
-    meta = {
-        "ok": True,
-        "tool": tool,
-        "mode": mode,
-        "workflow_stage": workflow_stage,
-        "query": bounded_query,
-        "target": scope,
-        "budget": budget,
-        "bundle_type": bundle_type,
-        "hit_count": hit_count,
-        "output_cap_bytes": output_cap_bytes,
-        "cache_hit": False,
-        "cache_receipt": False,
-        "authority_source": "rework_overlay" if overlay_applied else binding.authority_source,
-        "authority_state": (
-            "request_scoped_worktree" if overlay_applied else binding.authority_state
-        ),
-        "authority_repo": str(query_repo),
-        "target_request_id": (
-            str(ctx.rework_overlay_packet.get("predecessor_request_id") or "")
-            if overlay_applied and ctx.rework_overlay_packet is not None
-            else binding.target_request_id
-        ),
-        "target_task_id": (
-            str(ctx.rework_overlay_packet.get("predecessor_task_id") or "")
-            if overlay_applied and ctx.rework_overlay_packet is not None
-            else binding.target_task_id
-        ),
-        "packet_sha256": (
-            overlay_view.snapshot_sha256
-            if overlay_applied and overlay_view is not None
-            else binding.packet_sha256
-        ),
-        "index_revision": index_identity["build_revision"],
-        "index_finished_at": index_identity["finished_at"],
+    meta["internal_truncated"] = internal_truncated
+    ledger_meta: dict[str, Any] = {
+        "authority_source": authority_source,
+        "authority_state": authority_state,
         "evidence_counts": evidence_counts,
-        "internal_truncated": internal_truncated,
+        "output_cap_bytes": output_cap_bytes,
+        "target_request_id": target_request_id,
+        "target_task_id": target_task_id,
+        "packet_sha256": packet_sha256,
     }
 
     cacheable = generation_is_definite
@@ -4223,7 +5036,11 @@ def source_graph_query(
         "content": text,
         "content_sha256": full_content_sha256,
     }
+    page_sha256 = ""
     if _serialized_response_bytes(result) > output_cap_bytes:
+        # Exact-content modes (and the pathological analytic reply the fit
+        # could not bring under the cap) page their exact bytes through the
+        # signed continuation store.
         bind = _continuation_bind(
             ctx,
             mode=mode,
@@ -4234,12 +5051,12 @@ def source_graph_query(
             workflow_stage=workflow_stage,
             content_sha256=full_content_sha256,
             index_identity=index_identity,
-            authority_source=str(meta["authority_source"]),
-            authority_state=str(meta["authority_state"]),
+            authority_source=authority_source,
+            authority_state=authority_state,
             authority_repo=str(query_repo),
-            packet_sha256=str(meta["packet_sha256"]),
-            target_request_id=str(meta["target_request_id"]),
-            target_task_id=str(meta["target_task_id"]),
+            packet_sha256=str(packet_sha256),
+            target_request_id=str(target_request_id),
+            target_task_id=str(target_task_id),
         )
         if len(canonical_bytes) > SOURCE_GRAPH_CONTINUATION_MAX_BYTES:
             return _violation(ctx, tool, "continuation_payload_too_large")
@@ -4263,6 +5080,7 @@ def source_graph_query(
             store_id=store_id,
             chunk_size=chunk_size,
             page_count=page_count,
+            ledger_meta=ledger_meta,
         )
         if stored_id is None:
             return _violation(ctx, tool, "continuation_payload_too_large")
@@ -4275,6 +5093,7 @@ def source_graph_query(
             page_count=page_count,
             content_sha256=full_content_sha256,
         )
+        page_sha256 = str(result["page_sha256"])
         # A paginated page is a partial view of the response; never cache it.
         cacheable = False
 
@@ -4282,35 +5101,53 @@ def source_graph_query(
         _source_graph_cache_store(cache_key, {
             "result": result, "hit_count": hit_count, "bytes": bytes_returned,
             "content_sha256": full_content_sha256,
-            "authority_source": result["authority_source"],
-            "authority_state": result["authority_state"],
+            "authority_source": authority_source,
+            "authority_state": authority_state,
             "evidence_counts": evidence_counts,
+            "output_cap_bytes": output_cap_bytes,
         })
+    audit_payload: dict[str, Any] = {
+        "mode": mode,
+        "query_sha256": query_sha256,
+        "workflow_stage": effective_stage,
+        "workflow_stage_source": stage_source,
+        "declared_workflow_stage": workflow_stage,
+        "latency_ms": round((time.perf_counter() - started) * 1000.0, 3),
+        "index_revision": index_identity["build_revision"],
+        "index_finished_at": index_identity["finished_at"],
+        "evidence_counts": evidence_counts,
+        "output_cap_bytes": output_cap_bytes,
+        "target_request_id": target_request_id,
+        "target_task_id": target_task_id,
+        "packet_sha256": packet_sha256,
+        "internal_truncated": internal_truncated,
+        "outer_truncated": result["outer_truncated"],
+        "page_index": result.get("page_index", 0),
+        "receipt_id": receipt_id,
+    }
+    if fit_dropped:
+        audit_payload["fit_dropped"] = fit_dropped[:16]
+    if fallback_step:
+        audit_payload["fallback_step"] = fallback_step
+        audit_payload["fallback_hit_count"] = fallback_hit_count
+    if refreshed_files:
+        audit_payload["refresh"] = "inline"
+        audit_payload["refreshed_files"] = refreshed_files[:8]
+    if page_sha256:
+        audit_payload["page_sha256"] = page_sha256
+    # ``hit_count`` on the ledger row is the PRIMARY count: a fallback result
+    # keeps it at zero so the zero-hit KPI records the miss and the live gate
+    # is never inflated by a broadened retrieval.
     _append_audit(
         ctx, tool=tool, ok=True, cache_hit=False, hit_count=hit_count, bytes_returned=bytes_returned,
-        authority_source=result["authority_source"],
-        authority_state=result["authority_state"],
+        authority_source=authority_source,
+        authority_state=authority_state,
         authority_repo=query_repo,
         # A fresh, authoritative, non-cache result is a live provider call by
         # default, but a coordinator-side launch-time prefetch carries
         # ctx.provenance == "prefetch" and must never be credited as live.
         provenance=ctx.provenance or "live",
-        payload={
-            "mode": mode,
-            "query_sha256": query_sha256,
-            "workflow_stage": workflow_stage,
-            "latency_ms": round((time.perf_counter() - started) * 1000.0, 3),
-            "index_revision": index_identity["build_revision"],
-            "index_finished_at": index_identity["finished_at"],
-            "evidence_counts": evidence_counts,
-            "output_cap_bytes": output_cap_bytes,
-            "target_request_id": result["target_request_id"],
-            "target_task_id": result["target_task_id"],
-            "packet_sha256": result["packet_sha256"],
-            "internal_truncated": internal_truncated,
-            "outer_truncated": result["outer_truncated"],
-            "page_index": result.get("page_index", 0),
-        },
+        payload=audit_payload,
     )
     return result
 
@@ -4505,18 +5342,53 @@ def session_current_state(ctx: WorkerToolContext, *, limit: int = 12) -> dict[st
             topic_like = _sqlite_like_literal(ctx.session_topic)
             clauses.append("(source_id = ? OR source_id LIKE ? ESCAPE '\\')")
             params.extend((ctx.session_topic, f"%:{topic_like}"))
+        order_by = "timestamp DESC" if "timestamp" in doc_columns else "rowid DESC"
+        if "doc_id" in doc_columns:
+            order_by += ", doc_id DESC"
+        select_sql = f"SELECT {','.join(selected_columns)} FROM documents "
+        match_kind = ""
         if not clauses:
             rows = []
         else:
-            order_by = "timestamp DESC"
-            if "doc_id" in doc_columns:
-                order_by += ", doc_id DESC"
             rows = con.execute(
-                f"SELECT {','.join(selected_columns)} FROM documents "
-                f"WHERE {' OR '.join(clauses)} "
-                f"ORDER BY {order_by} LIMIT ?",
+                select_sql
+                + f"WHERE {' OR '.join(clauses)} "
+                + f"ORDER BY {order_by} LIMIT ?",
                 (*params, limit),
             ).fetchall()
+            if rows:
+                match_kind = "exact_source"
+        # Manager-only broadening (startup-3).  A worker's topic is injected
+        # by the coordinator and its isolation is a security property (a
+        # worker never reads another task's rows), so only a verified manager
+        # context -- whose typed topic is a guess at server-generated ids like
+        # ``manager:<provider>:<thread>:<topic>`` -- falls through to its own
+        # thread's rows, then to rows whose content mentions the topic.  Each
+        # step is labelled ``match_kind`` so a broadened hit is never mistaken
+        # for an exact one.
+        manager_identity = _manager_thread_identity(ctx)
+        if not rows and manager_identity is not None and "source_id" in doc_columns:
+            provider, session_id = manager_identity
+            own_prefix = _sqlite_like_literal(f"manager:{provider}:{session_id}:") + "%"
+            rows = con.execute(
+                select_sql + f"WHERE source_id LIKE ? ESCAPE '\\' ORDER BY {order_by} LIMIT ?",
+                (own_prefix, limit),
+            ).fetchall()
+            if rows:
+                match_kind = "own_thread"
+        if not rows and manager_identity is not None:
+            content_like = "%" + _sqlite_like_literal(ctx.session_topic) + "%"
+            rows = con.execute(
+                select_sql + f"WHERE content LIKE ? ESCAPE '\\' ORDER BY {order_by} LIMIT ?",
+                (content_like, limit),
+            ).fetchall()
+            if rows:
+                match_kind = "content_substring"
+        store_rows = int(con.execute("SELECT COUNT(*) FROM documents").fetchone()[0])
+        last_write_at: str | None = None
+        if "timestamp" in doc_columns:
+            last_write = con.execute("SELECT MAX(timestamp) FROM documents").fetchone()
+            last_write_at = str(last_write[0]) if last_write and last_write[0] else None
     except sqlite3.Error as exc:
         return _violation(ctx, tool, f"tool_query_failed:{tool}:{exc}"[:160])
     except WorkerToolError as exc:
@@ -4546,6 +5418,9 @@ def session_current_state(ctx: WorkerToolContext, *, limit: int = 12) -> dict[st
     payload = {
         "topic": ctx.session_topic, "state": state, "evidence_count": len(evidence),
         "evidence": evidence,
+        "match_kind": match_kind,
+        "store_rows": store_rows,
+        "last_write_at": last_write_at,
         "authority": {
             "source": session_binding.authority_source,
             "state": session_binding.authority_state,
@@ -4643,6 +5518,7 @@ def session_current_state(ctx: WorkerToolContext, *, limit: int = 12) -> dict[st
     return {
         "ok": True, "tool": tool, "topic": ctx.session_topic, "limit": limit,
         "truncated": truncated, "hit_count": hit_count, "bytes": bytes_returned,
+        "match_kind": match_kind, "store_rows": store_rows, "last_write_at": last_write_at,
         "content": returned_text, "cache_hit": delta_applied,
         "delta_receipt": delta_applied,
         "unchanged_reference": unchanged_reference,
@@ -4687,6 +5563,7 @@ def ai_memory_search(ctx: WorkerToolContext, *, query: str, limit: int = 8) -> d
         con = _open_readonly_db(binding.db_path, tool=tool)
     except WorkerToolError as exc:
         return _violation(ctx, tool, str(exc)[:160])
+    stats: dict[str, Any] = {"store_rows": 0, "last_write_at": None}
     try:
         rows: list[sqlite3.Row] = []
         if not _table_exists(con, "memories"):
@@ -4695,6 +5572,8 @@ def ai_memory_search(ctx: WorkerToolContext, *, query: str, limit: int = 8) -> d
             return _violation(ctx, tool, "fts_unavailable:memories_fts_absent")
         match_expr = _fts_match_expr(bounded)
         if match_expr is not None:
+            # OR candidates, over-fetched so coverage ranking has rows to order.
+            fetch_limit = min(64, limit * 4)
             if _table_exists(con, "context_entity_state"):
                 rows = con.execute(
                     "SELECT m.key AS key, m.value AS value, m.tags AS tags, m.scope AS scope "
@@ -4702,21 +5581,29 @@ def ai_memory_search(ctx: WorkerToolContext, *, query: str, limit: int = 8) -> d
                     "LEFT JOIN context_entity_state s ON s.entity_type='memory' AND s.entity_id=m.id "
                     "WHERE memories_fts MATCH ? AND COALESCE(s.status,'active')='active' "
                     "ORDER BY rank LIMIT ?",
-                    (match_expr, limit),
+                    (match_expr, fetch_limit),
                 ).fetchall()
             else:
                 rows = con.execute(
                     "SELECT m.key AS key, m.value AS value, m.tags AS tags, m.scope AS scope "
                     "FROM memories m JOIN memories_fts f ON m.id = f.rowid "
                     "WHERE memories_fts MATCH ? ORDER BY rank LIMIT ?",
-                    (match_expr, limit),
+                    (match_expr, fetch_limit),
                 ).fetchall()
+            rows = _rank_fts_rows(
+                rows, _fts_query_tokens(bounded), fields=("key", "value", "tags"),
+            )[:limit]
+        stats = _context_store_stats(con, table="memories", component="memory")
     except sqlite3.Error as exc:
         return _violation(ctx, tool, f"tool_query_failed:{tool}:{exc}"[:160])
     finally:
         con.close()
 
-    payload = {"results": [dict(row) for row in rows], "count": len(rows)}
+    payload = {
+        "results": [dict(row) for row in rows], "count": len(rows),
+        "match_semantics": "any_token_ranked_by_coverage",
+        **stats,
+    }
     text, truncated = _bounded_text(json.dumps(payload, ensure_ascii=False, sort_keys=True), 8 * 1024)
     hit_count = len(rows)
     bytes_returned = len(text.encode("utf-8"))
@@ -4727,6 +5614,7 @@ def ai_memory_search(ctx: WorkerToolContext, *, query: str, limit: int = 8) -> d
     return {
         "ok": True, "tool": tool, "query": bounded, "limit": limit,
         "truncated": truncated, "hit_count": hit_count, "bytes": bytes_returned,
+        "store_rows": stats["store_rows"], "last_write_at": stats["last_write_at"],
         "content": text, "cache_hit": False,
         "authority_source": binding.authority_source, "authority_state": binding.authority_state,
     }
@@ -4845,12 +5733,16 @@ def _kb_invoke(ctx: WorkerToolContext, *, subcommand: str, argument: str, tool_l
         ctx, tool=tool_label, ok=True, cache_hit=False, hit_count=hit_count, bytes_returned=bytes_returned,
         authority_source=binding.authority_source, authority_state=binding.authority_state,
     )
-    return {
+    result = {
         "ok": True, "tool": tool_label, subcommand: bounded,
         "truncated": truncated, "hit_count": hit_count, "bytes": bytes_returned,
         "content": text, "cache_hit": False,
         "authority_source": binding.authority_source, "authority_state": binding.authority_state,
     }
+    if "store_rows" in payload:
+        result["store_rows"] = payload["store_rows"]
+        result["last_write_at"] = payload.get("last_write_at")
+    return result
 
 
 def _kb_query(con: sqlite3.Connection, *, subcommand: str, argument: str) -> dict[str, Any]:
@@ -4864,14 +5756,23 @@ def _kb_query(con: sqlite3.Connection, *, subcommand: str, argument: str) -> dic
                 if has_state else ""
             )
             state_filter = "AND COALESCE(s.status,'active')='active' " if has_state else ""
+            # OR candidates, over-fetched so coverage ranking has rows to order.
             rows = con.execute(
                 "SELECT e.key AS key, e.title AS title, e.category AS category, "
                 "e.tags AS tags, e.body AS body FROM entries e "
                 "JOIN entries_fts f ON e.id = f.rowid " + state_join +
-                "WHERE entries_fts MATCH ? " + state_filter + "ORDER BY rank LIMIT 8",
+                "WHERE entries_fts MATCH ? " + state_filter + "ORDER BY rank LIMIT 32",
                 (match_expr,),
             ).fetchall()
-        return {"results": [dict(row) for row in rows], "count": len(rows)}
+            rows = _rank_fts_rows(
+                rows, _fts_query_tokens(argument),
+                fields=("key", "title", "body", "category", "tags"),
+            )[:8]
+        return {
+            "results": [dict(row) for row in rows], "count": len(rows),
+            "match_semantics": "any_token_ranked_by_coverage",
+            **_context_store_stats(con, table="entries", component="kb"),
+        }
 
     if subcommand == "get":
         if has_state:
@@ -5564,16 +6465,130 @@ def quality_review_packet_read(ctx: WorkerToolContext) -> dict[str, Any]:
 
 
 class WorkerSemanticEditSession:
-    """Request-local handles for Source-Graph-sized deterministic edits."""
+    """Request-local handles for Source-Graph-sized deterministic edits.
+
+    Keeps a delivered-range registry keyed ``(path, current_sha256)`` ->
+    ``(start_line, end_line, delivered_by)``, fed by ``prepare`` and by the
+    body/file Source Graph replies served through the same server
+    (worker_validation-5).  A prepare whose range (or a containing range) was
+    already delivered for the same file sha returns the hash-only receipt --
+    which is all ``apply`` needs, since apply re-verifies both preimage hashes
+    on the live file -- instead of re-sending bytes the caller already holds
+    (83% of codex prepares were never applied and 93% targeted a file the run
+    had already read).  Because the key carries the file sha, any edit
+    invalidates every earlier delivery of that file.
+    """
+
+    _MAX_DELIVERED_RANGES_PER_FILE = 512
 
     def __init__(self, ctx: WorkerToolContext) -> None:
         self.ctx = ctx
         self._targets: dict[str, semantic_edit.PreparedLineTarget] = {}
         self._receipts: dict[str, dict[str, Any]] = {}
+        self._delivered: dict[tuple[str, str], list[tuple[int, int, str]]] = {}
         self._lock = threading.Lock()
 
+    def _delivered_by(
+        self, path: str, current_sha256: str, start_line: int, end_line: int,
+    ) -> str | None:
+        with self._lock:
+            for start, end, delivered_by in self._delivered.get((path, current_sha256), ()):
+                if start <= start_line and end_line <= end:
+                    return delivered_by
+        return None
+
+    def _note_delivery(
+        self, path: str, current_sha256: str, start_line: int, end_line: int,
+        delivered_by: str,
+    ) -> None:
+        with self._lock:
+            ranges = self._delivered.setdefault((path, current_sha256), [])
+            ranges.append((start_line, end_line, delivered_by))
+            if len(ranges) > self._MAX_DELIVERED_RANGES_PER_FILE:
+                del ranges[: len(ranges) - self._MAX_DELIVERED_RANGES_PER_FILE]
+
+    def note_source_graph_delivery(self, result: Mapping[str, Any]) -> int:
+        """Register the hash-bound ranges a Source Graph reply already delivered.
+
+        Only complete, fresh symbol bodies (``matches[*].source`` with a
+        ``fresh`` per-file freshness) and untruncated whole-file previews
+        count; a paged (base64) reply or a fitted/truncated string is not a
+        delivery.  Returns the number of ranges registered.
+        """
+
+        if not isinstance(result, Mapping) or result.get("ok") is not True:
+            return 0
+        if result.get("content_encoding"):
+            return 0
+        try:
+            payload = json.loads(str(result.get("content") or ""))
+        except (TypeError, ValueError):
+            return 0
+        if not isinstance(payload, dict):
+            return 0
+        delivered_by = "source_graph:" + str(
+            result.get("receipt_id") or str(result.get("content_sha256") or "")[:12]
+        )
+        registered = 0
+        rows = payload.get("matches")
+        for row in rows if isinstance(rows, list) else []:
+            if not isinstance(row, dict):
+                continue
+            source = row.get("source")
+            freshness = row.get("freshness")
+            if (
+                not isinstance(source, str) or not source
+                or not isinstance(freshness, dict)
+                or freshness.get("state") != "fresh"
+            ):
+                continue
+            sha = str(freshness.get("disk_source_hash") or "")
+            try:
+                path = semantic_edit.normalize_relative_path(row.get("file_path"))
+                start_line = int(row.get("line_start") or 0)
+                end_line = int(row.get("line_end") or 0)
+            except (semantic_edit.SemanticEditError, TypeError, ValueError):
+                continue
+            if not sha or start_line < 1 or end_line < start_line:
+                continue
+            # A body is "\n".join(lines[start-1:end]); a shorter string is a
+            # trimmed one and was not fully delivered.
+            if source.count("\n") + 1 != end_line - start_line + 1:
+                continue
+            self._note_delivery(path, sha, start_line, end_line, delivered_by)
+            registered += 1
+        contexts = payload.get("contexts")
+        for context in contexts if isinstance(contexts, list) else []:
+            if not isinstance(context, dict):
+                continue
+            preview = context.get("source_preview")
+            if (
+                not isinstance(preview, str) or not preview
+                or context.get("source_preview_truncated") is not False
+            ):
+                continue
+            file_row = context.get("file") if isinstance(context.get("file"), dict) else {}
+            sha = str(file_row.get("source_hash") or "")
+            try:
+                path = semantic_edit.normalize_relative_path(
+                    context.get("file_path") or file_row.get("file_path")
+                )
+            except semantic_edit.SemanticEditError:
+                continue
+            line_count = len(preview.splitlines())
+            if not sha or line_count < 1:
+                continue
+            self._note_delivery(path, sha, 1, line_count, delivered_by)
+            registered += 1
+        return registered
+
     def prepare(
-        self, *, file_path: str, start_line: int, end_line: int
+        self,
+        *,
+        file_path: str,
+        start_line: int,
+        end_line: int,
+        include_fragment: bool = False,
     ) -> dict[str, Any]:
         tool = "semantic_edit_prepare"
         try:
@@ -5587,16 +6602,33 @@ class WorkerSemanticEditSession:
         except semantic_edit.SemanticEditError as exc:
             return _violation(self.ctx, tool, str(exc))
         target_id = secrets.token_hex(16)
+        delivered_by = (
+            None if include_fragment
+            else self._delivered_by(
+                target.path, target.current_sha256, start_line, end_line,
+            )
+        )
         with self._lock:
             self._targets[target_id] = target
-        receipt = target.receipt(target_id=target_id)
+        receipt = target.receipt(
+            target_id=target_id, include_fragment=delivered_by is None,
+        )
+        if delivered_by is None:
+            self._note_delivery(
+                target.path, target.current_sha256, start_line, end_line, target_id,
+            )
+            bytes_returned = target.fragment_bytes
+        else:
+            receipt["delivered_by"] = delivered_by
+            receipt["fragment_bytes_avoided"] = target.fragment_bytes
+            bytes_returned = 0
         _append_audit(
             self.ctx,
             tool=tool,
             ok=True,
-            cache_hit=False,
+            cache_hit=delivered_by is not None,
             hit_count=1,
-            bytes_returned=target.fragment_bytes,
+            bytes_returned=bytes_returned,
             authority_source="worker_workspace",
             authority_state="hash_bound_fragment",
             payload={key: value for key, value in receipt.items() if key != "fragment"},
@@ -5973,20 +7005,33 @@ def register_tools(mcp: Any, ctx: WorkerToolContext) -> tuple[str, ...]:
         workflow_stage: WorkflowStage = "unspecified",
     ) -> dict[str, Any]:
         """Bounded Source Graph discovery for this task."""
-        return source_graph_query(
+        result = source_graph_query(
             ctx, mode=mode, query=query, budget=budget,
             target=target, cursor=cursor,
             continuation_cursor=continuation_cursor,
             bundle_type=bundle_type, workflow_stage=workflow_stage,
         )
+        # A body/file reply served here is a delivery: a later prepare of the
+        # same hash-bound range comes back hash-only.
+        semantic_edits.note_source_graph_delivery(result)
+        return result
 
     @mcp.tool(name="aiworkhub_worker_semantic_edit_prepare")
     def _semantic_edit_prepare(
         file_path: str, start_line: int, end_line: int,
+        include_fragment: bool = False,
     ) -> dict[str, Any]:
-        """Read only one Source Graph-selected line range and bind its hashes."""
+        """Bind one Source Graph-selected line range's hashes for apply.
+
+        The fragment text is returned once per (file sha, range): a range
+        already delivered by this server (an earlier prepare, or a body/file
+        Source Graph reply) comes back hash-only with ``fragment_omitted``
+        and ``delivered_by``, which is all apply needs. Pass
+        include_fragment=true to force the text.
+        """
         return semantic_edits.prepare(
-            file_path=file_path, start_line=start_line, end_line=end_line
+            file_path=file_path, start_line=start_line, end_line=end_line,
+            include_fragment=include_fragment,
         )
 
     @mcp.tool(name="aiworkhub_worker_semantic_edit_apply")

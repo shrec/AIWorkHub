@@ -179,8 +179,17 @@ class TestBuildReviewPrompt:
         assert "must not be downgraded for minimality" in prompt
 
     @pytest.mark.parametrize("lens", ["correctness", "security", "code_quality"])
-    def test_prompt_renders_active_scoped_audit_for_requested_lens(self, lens):
-        packet = quality_reviewer.build_review_packet(
+    def test_prompt_delivers_the_lens_scope_once_inside_the_sealed_packet(self, lens):
+        """The scope reaches the reviewer exactly once, inside the packet.
+
+        Measured on 38 surviving packets (2026-09-08 audit): the prompt
+        inlined the active scope as ACTIVE_SCOPED_AUDIT AND shipped the full
+        three-lens packet, so a reviewer received its own scope twice and the
+        other two lenses' identical scopes once, and every packet overflowed
+        the inline cap.  ``build_lens_packet`` is what the launcher binds; the
+        prompt carries that packet and nothing else about the scope.
+        """
+        full = quality_reviewer.build_review_packet(
             request_id="req1",
             task_id="task1",
             claim_epoch=1,
@@ -192,12 +201,44 @@ class TestBuildReviewPrompt:
                 "code_quality",
             ),
         )
+        packet = quality_reviewer.build_lens_packet(full, lens=lens)
 
         prompt = quality_reviewer.build_review_prompt(packet, lens=lens)
 
-        assert "ACTIVE_SCOPED_AUDIT:" in prompt
-        assert f'"lens_kind":"{lens}"' in prompt
-        assert f'"{lens} graph boundary"' in prompt
+        assert "ACTIVE_SCOPED_AUDIT:" not in prompt
+        assert f"candidate.scoped_audits.{lens} is the graph-scoped audit" in prompt
+        assert prompt.count(f'"lens_kind":"{lens}"') == 1
+        # "Once" is measured on the scoped-audit OBJECT, not on one of its
+        # strings: the wrapper promotes the payload's ``known_unknowns``
+        # alongside the sealed payload -- a pre-existing shape pinned by
+        # test_scoped_audit_known_unknowns_are_preserved_in_packet -- so that
+        # one list legitimately reads twice inside the single delivered scope.
+        scope_json = json.dumps(
+            packet["candidate"]["scoped_audits"][lens],
+            ensure_ascii=False, separators=(",", ":"), sort_keys=True,
+        )
+        assert prompt.count(scope_json) == 1
+        assert prompt.count(f'"{lens} graph boundary"') == 2
+        for other in {"correctness", "security", "code_quality"} - {lens}:
+            assert f'"lens_kind":"{other}"' not in prompt
+            assert f'"{other} graph boundary"' not in prompt
+        assert packet["packet_sha256"] in prompt
+
+    def test_prompt_names_the_diff_caller_context_and_output_tails_as_settled(self):
+        """The 2026-09-08 audit: 63.5% of reviewer read bytes were the
+        candidate's own changed files and 38% of runs re-ran git diff, because
+        the packet carried a 4 KB excerpt.  The prompt now names what the
+        packet carries so the reviewer does not go and re-derive it."""
+        prompt = quality_reviewer.build_review_prompt(
+            _packet_with_findings(), lens="correctness"
+        )
+        assert "candidate.source_evidence carries the unified diff" in prompt
+        assert "diff_complete" in prompt
+        assert "do not run git diff" in prompt
+        assert "candidate.caller_context" in prompt
+        assert "stdout_tail" in prompt and "stderr_tail" in prompt
+        assert "candidate.delta" in prompt
+        assert "never a prior verdict" in prompt
 
     def test_structured_check_evidence_rejects_source_siblings(self):
         packet = _packet_with_changed_source(
@@ -389,6 +430,13 @@ class TestBuildReviewPrompt:
         manager, binding = _reviewer_launch_setup(tmp_path, monkeypatch)
         monkeypatch.delenv(quality_reviewer.REVIEW_PACKET_FILE_ROOT_ENV, raising=False)
         packet = _packet_with_findings()
+        # The launcher writes the packet ONE lens receives and refuses a packet
+        # still carrying the other lenses' scopes
+        # (``quality_review_packet_lens_scope_mismatch``), so bind this lens's
+        # packet exactly as ``_launch_quality_review`` does.
+        packet["candidate"]["scoped_audits"] = {
+            binding["lens"]: packet["candidate"]["scoped_audits"][binding["lens"]]
+        }
         packet["candidate"]["padding"] = "x" * (100 * 1024)
         packet["packet_sha256"] = _canonical_digest({k: v for k, v in packet.items() if k != "packet_sha256"})
         binding["packet"] = packet
@@ -520,6 +568,141 @@ class TestBuildReviewPrompt:
             quality_reviewer.build_review_prompt(
                 _packet_with_findings(), lens="unknown",
             )
+
+
+class TestBuildLensPacket:
+    def _full_packet(self) -> dict:
+        return quality_reviewer.build_review_packet(
+            request_id="req1",
+            task_id="task1",
+            claim_epoch=1,
+            worker_provider="adapter-a",
+            changed_path_hashes={"src/module.py": "a" * 64},
+            objective="keep every section",
+            scoped_audits=_scoped_audits("correctness", "security", "code_quality"),
+        )
+
+    @pytest.mark.parametrize("lens", ["correctness", "security", "code_quality"])
+    def test_lens_packet_keeps_only_that_lens_and_reseals_the_digest(self, lens):
+        full = self._full_packet()
+
+        packet = quality_reviewer.build_lens_packet(full, lens=lens)
+
+        assert set(packet["candidate"]["scoped_audits"]) == {lens}
+        assert packet["candidate"]["scoped_audits"][lens] == (
+            full["candidate"]["scoped_audits"][lens]
+        )
+        for key in ("schema_id", "target", "contract", "terminal_validation",
+                    "mechanical_checks", "combined_tree_checks"):
+            assert packet[key] == full[key]
+        assert packet["candidate"]["changed_paths"] == full["candidate"]["changed_paths"]
+        body = {k: v for k, v in packet.items() if k != "packet_sha256"}
+        assert packet["packet_sha256"] == _canonical_digest(body)
+        assert packet["packet_sha256"] != full["packet_sha256"]
+        # The shared packet is untouched: the other lenses still read it.
+        assert set(full["candidate"]["scoped_audits"]) == {
+            "correctness", "security", "code_quality",
+        }
+
+    def test_lens_packet_is_smaller_than_the_shared_packet(self):
+        full = self._full_packet()
+
+        def encoded(value):
+            return len(json.dumps(
+                value, ensure_ascii=False, separators=(",", ":"), sort_keys=True,
+            ).encode("utf-8"))
+
+        packet = quality_reviewer.build_lens_packet(full, lens="security")
+
+        assert encoded(packet) < encoded(full)
+
+    def test_lens_digest_is_what_receipt_and_findings_bind_to(self):
+        packet = quality_reviewer.build_lens_packet(self._full_packet(), lens="security")
+
+        findings = quality_reviewer.normalize_packet_findings(
+            packet, lens="security",
+            findings=[{"severity": "medium", "summary": "s", "evidence": "src/module.py:3"}],
+        )
+        assert findings[0]["evidence_reference"]["path"] == "src/module.py"
+        receipt = {
+            "schema_id": quality_reviewer.RECEIPT_SCHEMA_ID,
+            "packet_sha256": packet["packet_sha256"],
+            "target": dict(packet["target"]),
+            "reviewer": {"request_id": "rev-1", "task_id": "rev-task-1", "provider": "adapter-b"},
+            "report": {"lens": "security", "read_only": True, "can_mutate_repo": False, "findings": findings},
+        }
+        verified = quality_reviewer.verify_reviewer_receipt(
+            receipt, packet=packet,
+            expected_reviewer_request_id="rev-1",
+            expected_reviewer_task_id="rev-task-1",
+            observed_provider="adapter-b",
+            observed_terminal_state="review_ready",
+            audit_verified=True,
+        )
+        assert verified["packet_sha256"] == packet["packet_sha256"]
+
+    def test_lens_packet_missing_lens_fails_closed(self):
+        full = quality_reviewer.build_review_packet(
+            request_id="req1", task_id="task1", claim_epoch=1,
+            worker_provider="adapter-a",
+            changed_path_hashes={"src/module.py": "a" * 64},
+            scoped_audits=_scoped_audits("correctness", "security"),
+        )
+        with pytest.raises(ReviewerEvidenceError, match="review_scope_lens_missing"):
+            quality_reviewer.build_lens_packet(full, lens="code_quality")
+        with pytest.raises(ReviewerEvidenceError, match="invalid_reviewer_lens"):
+            quality_reviewer.build_lens_packet(full, lens="vibes")
+
+    def test_lens_packet_refuses_a_tampered_shared_packet(self):
+        full = self._full_packet()
+        full["contract"]["objective"] = "tampered after sealing"
+        with pytest.raises(ReviewerEvidenceError, match="review_packet_digest_invalid"):
+            quality_reviewer.build_lens_packet(full, lens="correctness")
+
+    def test_packet_without_scoped_audits_or_already_single_lens_passes_through(self):
+        bare = {"packet_sha256": "a" * 64, "target": {"claim_epoch": 1}}
+        assert quality_reviewer.build_lens_packet(bare, lens="correctness") == bare
+        single = quality_reviewer.build_lens_packet(self._full_packet(), lens="security")
+        assert quality_reviewer.build_lens_packet(single, lens="security") == single
+
+    def test_the_lens_packet_goes_inline_where_the_shared_packet_overflowed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """File transport is overflow, not the normal case.
+
+        Measured over 38 surviving packets: 130 KB mean, 83.6% of it
+        ``candidate.scoped_audits`` -- three near-identical copies -- so EVERY
+        packet crossed the 96 KiB inline cap and every reviewer spent its first
+        turns fetching and dissecting a file two thirds of which was about
+        other lenses.  One lens's slice fits inline.
+        """
+        scoped = _scoped_audits("correctness", "security", "code_quality")
+        for lens, audit in scoped.items():
+            audit["packet"]["known_unknowns"] = [f"{lens} graph boundary " + "x" * 35_000]
+            audit["known_unknowns"] = audit["packet"]["known_unknowns"]
+            audit["fingerprint"] = _canonical_digest(audit["packet"])
+        full = quality_reviewer.build_review_packet(
+            request_id="req1", task_id="task1", claim_epoch=1,
+            worker_provider="adapter-a",
+            changed_path_hashes={"src/module.py": "a" * 64},
+            scoped_audits=scoped,
+        )
+        packet = quality_reviewer.build_lens_packet(full, lens="security")
+        monkeypatch.setenv(quality_reviewer.REVIEW_PACKET_FILE_ROOT_ENV, str(tmp_path))
+
+        shared_prompt = quality_reviewer.build_review_prompt(
+            full, lens="security", packet_file=str(tmp_path / "shared.json"),
+        )
+        lens_prompt = quality_reviewer.build_review_prompt(
+            packet, lens="security", packet_file=str(tmp_path / "lens.json"),
+        )
+
+        assert "QUALITY_REVIEW_PACKET_FILE:" in shared_prompt
+        assert "QUALITY_REVIEW_PACKET:" not in shared_prompt
+        assert "QUALITY_REVIEW_PACKET:" in lens_prompt
+        assert "QUALITY_REVIEW_PACKET_FILE:" not in lens_prompt
+        assert not (tmp_path / "lens.json").exists()
+        assert quality_review.extract_inline_packet(lens_prompt) == packet
 
 
 class TestNormalizePacketFindings:

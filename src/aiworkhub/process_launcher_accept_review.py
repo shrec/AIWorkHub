@@ -12,20 +12,575 @@ this function no longer calls -- silently, with the tests still green.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Mapping
 
+from . import manager_skill_tools
 from . import quality_evidence
 
 if TYPE_CHECKING:  # names used only in annotations, which are never evaluated
     from .worker_workspace import WorkerWorkspace as _WorkerWorkspaceT
 
-__all__ = ["accept_review"]
+__all__ = [
+    "ACCEPT_BLOCKER_KINDS",
+    "ACCEPT_PREVIEW_SCHEMA_ID",
+    "accept_preview",
+    "accept_review",
+    "bound_reviewer_request_ids",
+    "bound_reviewer_rows",
+    "bound_reviewer_task_ids",
+    "effective_requested_risk_tier",
+    "fold_accept_blockers",
+    "reviewer_evidence",
+    "server_derived_risk_tier",
+]
+
+_REVIEWER_USABLE_STATES = ("review_ready", "accepted")
+
+# A reviewer that has not finished is not missing evidence, it is unfinished
+# evidence, and the two need different words: 17 of 159 measured accept
+# attempts failed with ``quality_reviewer_not_review_ready`` -- after paying for
+# a combined-tree materialization and two validation runs.
+_REVIEWER_RUNNING_STATES = frozenset(
+    {"starting", "running", "processing", "finalizing", "reconcile_pending"}
+)
+
+ACCEPT_PREVIEW_SCHEMA_ID = "aiworkhub.accept_preview.v1"
+
+# Every blocker the fold can name, so a caller can branch on a closed set
+# instead of matching prose. The measured frequencies are over the 159 accept
+# attempts audited on 2026-09-08, of which 49 (31%) failed on one of these.
+ACCEPT_BLOCKER_KINDS = (
+    "terminal_substatus_not_review_ready",   # 8 of 159
+    "context_write_intents_pending",
+    "required_reviewer_missing",             # 19 of 159
+    "quality_reviewer_not_review_ready",     # 17 of 159
+    "refinement_required",
+    "explicit_human_approval_missing",       # 5 of 159
+    "destructive_diff_requires_manager_confirmation",
+)
+
+
+def _blocker(kind: str, detail: str = "", **extra: Any) -> dict[str, Any]:
+    """One named blocker, with the exact error string ``accept_review`` returns."""
+    return {
+        "kind": str(kind),
+        "detail": str(detail)[:300],
+        "error": (f"{kind}:{detail}"[:400] if detail else str(kind)),
+        **extra,
+    }
+
+
+def bound_reviewer_rows(
+    repo: Any, parent_task_id: str, parent_request_id: str
+) -> list[dict[str, Any]]:
+    """One scan over the quality-review children bound to this exact request.
+
+    Returns, per bound reviewer task, the fields every caller here needs: the
+    task id, the lens the packet was sealed for, the reviewer's own terminal
+    substatus, and the verified receipt if it produced one. One read serves the
+    default-reviewer resolution, the cheap blocker fold and the preview, so a
+    manager decision costs the store one query rather than one per reviewer.
+
+    The binding read -- ``terminal_review.evidence.quality_review`` with the
+    root ``quality_review`` block as the older fallback -- is the SAME one
+    ``task_engine.disposition_reviewer_children`` scans to dispose these cards
+    at accept and reject. Measured on the live store, 2,219 of 2,219 reviewer
+    cards carry it under terminal evidence and none under the root key.
+
+    Read-only and total: any store failure returns an empty list, which can
+    only make the caller ask for MORE evidence (a missing required lens blocks
+    acceptance), never less.
+    """
+    from . import task_store
+
+    try:
+        _readiness, db_path = task_store._require_ready(repo)
+        conn = task_store._connect(db_path)
+    except Exception:  # noqa: BLE001 -- enumeration failure never accepts anything
+        return []
+    try:
+        rows = conn.execute(
+            "SELECT task_id, card_json FROM tasks "
+            "WHERE topic='quality_review' AND status NOT IN ('archived')"
+        ).fetchall()
+    except Exception:  # noqa: BLE001
+        return []
+    finally:
+        try:
+            conn.close()
+        except Exception:  # noqa: BLE001
+            pass
+    import json as _json
+
+    bound: list[dict[str, Any]] = []
+    for row in rows:
+        try:
+            card = _json.loads(row["card_json"] or "{}")
+        except Exception:  # noqa: BLE001
+            continue
+        if not isinstance(card, dict):
+            continue
+        terminal = card.get("terminal_review")
+        terminal = terminal if isinstance(terminal, dict) else {}
+        terminal_evidence = terminal.get("evidence")
+        terminal_evidence = terminal_evidence if isinstance(terminal_evidence, dict) else {}
+        terminal_binding = terminal_evidence.get("quality_review")
+        root_binding = card.get("quality_review")
+        if not isinstance(terminal_binding, dict):
+            terminal_binding = {}
+        if not isinstance(root_binding, dict):
+            root_binding = {}
+        if terminal_binding and root_binding and terminal_binding != root_binding:
+            # Two durable statements that disagree are not a binding.
+            continue
+        binding = terminal_binding or root_binding
+        if (
+            str(binding.get("target_task_id") or "") != str(parent_task_id)
+            or str(binding.get("target_request_id") or "") != str(parent_request_id)
+        ):
+            continue
+        task_id = str(row["task_id"] or "")
+        if not task_id:
+            continue
+        receipt = terminal_evidence.get("quality_review_receipt")
+        bound.append(
+            {
+                "task_id": task_id,
+                "lens": str(binding.get("lens") or ""),
+                "packet_sha256": str(binding.get("packet_sha256") or ""),
+                "terminal_substatus": str(terminal.get("substatus") or ""),
+                "receipt": receipt if isinstance(receipt, dict) else None,
+            }
+        )
+    return sorted(bound, key=lambda entry: entry["task_id"])
+
+
+def bound_reviewer_task_ids(
+    repo: Any, parent_task_id: str, parent_request_id: str
+) -> list[str]:
+    """The task ids from :func:`bound_reviewer_rows`, for callers that need only those.
+
+    The server has always known which reviewers belong to a request; only the
+    accept surface asked the manager to name them, in 135 of 159 measured
+    calls, by copying 32-hex ids out of earlier launch results.
+    """
+    return [
+        row["task_id"]
+        for row in bound_reviewer_rows(repo, parent_task_id, parent_request_id)
+    ]
+
+
+def bound_reviewer_request_ids(
+    self, parent_task_id: str, parent_request_id: str
+) -> list[str]:
+    """Return the usable reviewer REQUEST ids bound to this parent request.
+
+    One reviewer task can be relaunched, so a task can own several requests.
+    Only ``review_ready``/``accepted`` requests are usable evidence, and where
+    a task has more than one the most recently finished wins -- the same
+    "latest terminal attempt" rule the accept path applies when the manager
+    names an id by hand.
+    """
+    return [
+        row["request_id"]
+        for row in reviewer_evidence(self, parent_task_id, parent_request_id)
+        if row["usable"]
+    ]
+
+
+def reviewer_evidence(
+    self, parent_task_id: str, parent_request_id: str
+) -> list[dict[str, Any]]:
+    """Resolve, per bound reviewer task, its current attempt and what it proved.
+
+    One reviewer task can be relaunched, so a task can own several requests.
+    The latest USABLE (``review_ready``/``accepted``) attempt wins, because that
+    is the one carrying evidence; a task with no usable attempt still reports
+    its latest attempt so the caller can say "running" instead of "missing" --
+    two conditions the accept surface has always conflated and which need
+    different answers from a manager.
+
+    Total by construction: a ledger read failure leaves every reviewer with an
+    empty request id and ``usable`` False, which blocks acceptance rather than
+    granting it.
+    """
+    rows = bound_reviewer_rows(self.repo, parent_task_id, parent_request_id)
+    if not rows:
+        return []
+    try:
+        latest = self._latest_by_request()
+    except Exception:  # noqa: BLE001 -- a ledger read failure names no reviewer
+        latest = {}
+    attempts: dict[str, list[dict[str, Any]]] = {}
+    for request_id, event in latest.items():
+        if not isinstance(event, dict):
+            continue
+        reviewer_task_id = str(event.get("task_id") or "")
+        if not reviewer_task_id:
+            continue
+        attempts.setdefault(reviewer_task_id, []).append(
+            {
+                "request_id": str(request_id),
+                "state": str(event.get("state") or ""),
+                "finished_at": str(event.get("finished_at") or ""),
+            }
+        )
+    resolved: list[dict[str, Any]] = []
+    for row in rows:
+        candidates = attempts.get(row["task_id"], [])
+        usable = [
+            attempt
+            for attempt in candidates
+            if attempt["state"] in _REVIEWER_USABLE_STATES
+        ]
+        chosen = max(
+            usable or candidates,
+            key=lambda attempt: (attempt["finished_at"], attempt["request_id"]),
+            default=None,
+        )
+        resolved.append(
+            {
+                **row,
+                "request_id": str((chosen or {}).get("request_id") or ""),
+                "state": str((chosen or {}).get("state") or ""),
+                "usable": bool(usable) and chosen is not None,
+                "attempt_count": len(candidates),
+            }
+        )
+    return sorted(resolved, key=lambda entry: (entry["lens"], entry["task_id"]))
+
+
+def server_derived_risk_tier(card: Any) -> str:
+    """The tier the FINALIZER measured for this candidate, or "" when unrecorded.
+
+    ``run_review_ready_quality_gate`` seals ``review_risk_profile`` on
+    ``terminal_review.evidence.quality_gate`` at ``review_ready``, with the same
+    ``derive_risk_signals`` -> ``resolve_risk_profile`` pair the accept path
+    runs. Reading it back means the manager no longer has to predict and retype
+    the tier -- and, where the finalizer saw a signal the accept-time
+    re-derivation cannot (a destructive diff against a canonical tree that has
+    since moved), it is a floor the accept fold keeps rather than loses.
+    """
+    if not isinstance(card, Mapping):
+        return ""
+    terminal = card.get("terminal_review")
+    evidence = terminal.get("evidence") if isinstance(terminal, Mapping) else None
+    gate = evidence.get("quality_gate") if isinstance(evidence, Mapping) else None
+    profile = gate.get("review_risk_profile") if isinstance(gate, Mapping) else None
+    if not isinstance(profile, Mapping) or str(profile.get("error") or ""):
+        return ""
+    tier = str(profile.get("effective_tier") or "")
+    return tier if tier in quality_evidence._RISK_RANK else ""
+
+
+def effective_requested_risk_tier(card: Any, requested_risk_tier: Any) -> str:
+    """Fold the manager's requested tier over the server-derived one, upward only.
+
+    ``requested_risk_tier`` is an OVERRIDE, and an override of a safety floor
+    may only raise it: a manager may always ask for more review than the
+    measurement demands, and may never ask for less by naming a lower tier.
+    ``None`` means "whatever the server derived", which is the whole point --
+    the tier stops being something a manager has to type correctly.
+    """
+    derived = server_derived_risk_tier(card)
+    requested = (
+        str(requested_risk_tier)
+        if isinstance(requested_risk_tier, str) and requested_risk_tier
+        else ""
+    )
+    ranks = quality_evidence._RISK_RANK
+    if requested and requested not in ranks:
+        # Fail closed on a tier nobody defined: ``resolve_risk_profile`` will
+        # refuse it, and refusing is the correct outcome.
+        return requested
+    if not requested:
+        return derived or quality_evidence.RISK_LOW
+    if derived and ranks[derived] > ranks[requested]:
+        return derived
+    return requested
+
+
+def _refinement_blockers(reviewers: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Findings on ALREADY-VERIFIED reports that will refuse this acceptance.
+
+    Only the receipts a reviewer already sealed are read -- nothing is
+    re-verified here and nothing unverified is trusted. ``fold_quality_verdict``
+    remains the authority; this names in advance the subset of its verdict a
+    manager can act on before paying for a combined tree.
+    """
+    blockers: list[dict[str, Any]] = []
+    for reviewer in reviewers:
+        receipt = reviewer.get("receipt")
+        report = receipt.get("report") if isinstance(receipt, Mapping) else None
+        if not isinstance(report, Mapping):
+            continue
+        lens = str(report.get("lens") or reviewer.get("lens") or "")
+        findings = report.get("findings")
+        for finding in findings if isinstance(findings, list) else []:
+            if not isinstance(finding, Mapping):
+                continue
+            if finding.get("disposition") != "defect":
+                continue
+            finding_id = f"reviewer:{lens}:{str(finding.get('id') or '')}"[:300]
+            severity = str(finding.get("severity") or "")
+            if severity in quality_evidence.BLOCKING_SEVERITIES:
+                blockers.append(
+                    _blocker(
+                        "refinement_required", finding_id,
+                        lens=lens, severity=severity, blocking_severity=True,
+                    )
+                )
+            elif lens in {
+                quality_evidence.LENS_CORRECTNESS, quality_evidence.LENS_SECURITY
+            }:
+                blockers.append(
+                    _blocker(
+                        "refinement_required", finding_id,
+                        lens=lens, severity=severity, blocking_severity=False,
+                    )
+                )
+    return blockers
+
+
+def fold_accept_blockers(
+    *,
+    reviewers: list[dict[str, Any]],
+    reviewer_request_ids: list[str] | None,
+    risk_profile: Mapping[str, Any],
+    terminal_substatus: str,
+    pending_context_write_intents: int = 0,
+    confirm_high_risk: bool = False,
+    destructive_blockers: list[str] | None = None,
+    confirm_destructive_change: bool = False,
+) -> dict[str, Any]:
+    """Every acceptance blocker decidable from persisted evidence alone.
+
+    Measured 2026-09-08 over 159 accept attempts: 49 (31%) failed on exactly
+    these conditions -- ``required_reviewer_missing`` 19,
+    ``quality_reviewer_not_review_ready`` 17,
+    ``terminal_substatus_not_review_ready`` 8,
+    ``explicit_human_approval_missing`` 5 -- and every one of them failed AFTER
+    a combined-tree workspace had been materialized and validated twice. None
+    of these needs a single byte of that tree.
+
+    Two rules keep this honest, and they point in opposite directions:
+
+    * it may never ACCEPT anything and never lowers a bar --
+      ``fold_quality_verdict`` still runs in full at acceptance over the same
+      profile, so a tier planned too narrowly upstream still fails closed
+      there; and
+    * it may never INVENT a refusal the real path would not have made. When a
+      manager names a reviewer request this fold cannot see -- an id outside
+      the bound-children scan, whose lens is therefore unknown -- the missing
+      -lens question is left entirely to the authoritative loop, which resolves
+      that id by request id and verifies its receipt. Not-listed-here is not
+      evidence of not-existing.
+    """
+    required = [
+        str(lens) for lens in (risk_profile.get("required_reviewer_lenses") or ())
+    ]
+    selected = (
+        None if reviewer_request_ids is None else [str(v) for v in reviewer_request_ids]
+    )
+    known = {row["request_id"]: row for row in reviewers if row["request_id"]}
+    unresolved: list[str] = []
+    if selected is None:
+        chosen = [row for row in reviewers if row["usable"]]
+        source = "server_bound_reviewer_children"
+    else:
+        chosen = [known[request_id] for request_id in selected if request_id in known]
+        unresolved = [request_id for request_id in selected if request_id not in known]
+        source = "manager_named"
+    blockers: list[dict[str, Any]] = []
+    if str(terminal_substatus) != "review_ready":
+        blockers.append(
+            _blocker("terminal_substatus_not_review_ready", str(terminal_substatus))
+        )
+    if int(pending_context_write_intents or 0) > 0:
+        blockers.append(
+            _blocker(
+                "context_write_intents_pending",
+                str(int(pending_context_write_intents)),
+            )
+        )
+    for reviewer in chosen:
+        if reviewer["usable"]:
+            continue
+        blockers.append(
+            _blocker(
+                "quality_reviewer_not_review_ready",
+                reviewer["request_id"] or reviewer["task_id"],
+                lens=reviewer["lens"], state=reviewer["state"],
+            )
+        )
+    # A reviewer this fold cannot see, or one whose packet binding carries no
+    # lens, makes the lens census incomplete -- and an incomplete census cannot
+    # say a lens is missing. The accept fold still can, and does.
+    lens_census_complete = not unresolved and all(row["lens"] for row in chosen)
+    usable_lenses = {row["lens"] for row in chosen if row["usable"]}
+    running_lenses = {row["lens"] for row in reviewers if not row["usable"]}
+    if lens_census_complete:
+        for lens in required:
+            if lens in usable_lenses:
+                continue
+            blockers.append(
+                _blocker(
+                    "required_reviewer_missing", lens,
+                    lens=lens,
+                    # The difference between "launch one" and "wait for the one
+                    # already running" -- the manager's next action, named.
+                    reviewer_running=lens in running_lenses,
+                )
+            )
+    blockers.extend(_refinement_blockers([row for row in chosen if row["usable"]]))
+    if risk_profile.get("explicit_human_approval_required") and not confirm_high_risk:
+        blockers.append(_blocker("explicit_human_approval_missing"))
+    if not confirm_destructive_change:
+        for check_id in destructive_blockers or ():
+            blockers.append(
+                _blocker(
+                    "destructive_diff_requires_manager_confirmation", str(check_id)
+                )
+            )
+    return {
+        "blockers": blockers,
+        "reviewer_request_ids": (
+            [row["request_id"] for row in chosen if row["usable"]]
+            if selected is None
+            else list(selected)
+        ),
+        "reviewer_request_id_source": source,
+        "required_reviewer_lenses": required,
+        "lens_census_complete": lens_census_complete,
+        "unresolved_reviewer_request_ids": unresolved,
+        "per_lens": sorted(
+            (
+                {
+                    "lens": row["lens"],
+                    "task_id": row["task_id"],
+                    "request_id": row["request_id"],
+                    "state": row["state"],
+                    "usable": row["usable"],
+                    "required": row["lens"] in required,
+                    "selected": any(
+                        chosen_row is row for chosen_row in chosen
+                    ),
+                    "has_verified_report": isinstance(row.get("receipt"), Mapping),
+                }
+                for row in reviewers
+            ),
+            key=lambda entry: (entry["lens"], entry["task_id"]),
+        ),
+    }
+
+
+def accept_preview(self, request_id: str, task_id: str, **overrides: Any) -> dict[str, Any]:
+    """Read-only: exactly what would block ``accept_review`` right now.
+
+    Same fold, same inputs, no writes, no workspace, no combined tree -- so a
+    manager learns the answer before paying for the two validation runs that
+    preceded 49 of 159 measured failures. Optional ``overrides`` mirror the
+    accept parameters (``requested_risk_tier``, ``reviewer_request_ids``,
+    ``confirm_high_risk``, ``confirm_destructive_change``).
+
+    A clear preview is NOT an acceptance and NOT a promise of one: the
+    expensive half -- the combined tree, the declared validations, the
+    mechanical gate, the reviewer receipt verification by request id -- runs
+    only in ``accept_review`` and can still refuse. ``blocked`` False means
+    only that nothing cheap is refusing yet.
+    """
+    from . import process_launcher as _pl
+
+    result: dict[str, Any] = {
+        "ok": True,
+        "schema_id": ACCEPT_PREVIEW_SCHEMA_ID,
+        "request_id": request_id,
+        "task_id": task_id,
+        "authoritative": False,
+        "evaluated": False,
+    }
+    try:
+        card = _pl._parse_card(self._show_task(task_id), task_id)
+    except Exception as exc:  # noqa: BLE001 -- a preview never raises at a manager
+        return {**result, "ok": False, "error": f"task_lookup_failed:{exc}"[:300]}
+    terminal_review = card.get("terminal_review")
+    terminal_review = terminal_review if isinstance(terminal_review, Mapping) else {}
+    evidence = terminal_review.get("evidence")
+    evidence = evidence if isinstance(evidence, Mapping) else {}
+    changed = [str(value) for value in (evidence.get("changed_paths") or ())]
+    requested = effective_requested_risk_tier(
+        card, overrides.get("requested_risk_tier")
+    )
+    try:
+        signals = quality_evidence.derive_risk_signals(card, changed)
+        risk_profile = quality_evidence.resolve_risk_profile(requested, signals=signals)
+    except Exception as exc:  # noqa: BLE001
+        return {
+            **result,
+            "ok": False,
+            "error": f"risk_profile_unavailable:{type(exc).__name__}:{exc}"[:300],
+        }
+    intents = 0
+    try:
+        snapshot = self._context_write_intent_snapshot(request_id)
+        if snapshot.get("ok"):
+            intents = int((snapshot.get("counts") or {}).get("pending") or 0)
+    except Exception:  # noqa: BLE001 -- an unreadable snapshot blocks nothing here
+        intents = 0
+    fold = fold_accept_blockers(
+        reviewers=reviewer_evidence(self, task_id, request_id),
+        reviewer_request_ids=overrides.get("reviewer_request_ids"),
+        risk_profile=risk_profile,
+        terminal_substatus=str(terminal_review.get("substatus") or ""),
+        pending_context_write_intents=intents,
+        confirm_high_risk=bool(overrides.get("confirm_high_risk")),
+    )
+    return {
+        **result,
+        "evaluated": True,
+        "blocked": bool(fold["blockers"]),
+        "canonical_status": _pl._canonical_task_status(card),
+        "terminal_substatus": str(terminal_review.get("substatus") or ""),
+        "changed_path_count": len(changed),
+        "risk_profile": {
+            "requested_tier": risk_profile["requested_tier"],
+            "effective_tier": risk_profile["effective_tier"],
+            "signals": list(risk_profile["signals"]),
+            "required_reviewer_lenses": list(risk_profile["required_reviewer_lenses"]),
+            "combined_tree_required": bool(risk_profile["combined_tree_required"]),
+            "explicit_human_approval_required": bool(
+                risk_profile["explicit_human_approval_required"]
+            ),
+            "server_derived_tier": server_derived_risk_tier(card),
+            "card_declared_risk_tier": str(card.get("risk_tier") or ""),
+        },
+        "pending_context_write_intents": intents,
+        **fold,
+    }
+
 
 # The seams are runtime names only.  ``Any`` and ``_WorkerWorkspaceT`` appear
 # solely in annotations -- which ``from __future__ import annotations`` leaves
 # as strings -- so they are resolved from this module's own imports and are
 # deliberately NOT re-bound below.  A name that is never evaluated cannot carry
 # a monkeypatch, and shadowing it here would only hide it from the type checker.
+#
+# THIS module's own names are the second group.  They were never in
+# ``process_launcher``, so there is no seam to preserve and re-binding them off
+# ``_pl`` would raise ``AttributeError``; a test that patches one patches it
+# here, where it lives.  Two kinds qualify: helpers defined in this module, and
+# a sibling module imported here and nowhere else on the launcher.  They are
+# declared all the same, because the invariant the seam test protects is "no
+# global enters this body unannounced" -- and a name that belongs to neither
+# list is exactly the drift it exists to catch.
+ACCEPT_REVIEW_LOCAL_NAMES: tuple[str, ...] = (
+    "effective_requested_risk_tier",
+    "fold_accept_blockers",
+    "manager_skill_tools",
+    "reviewer_evidence",
+    "server_derived_risk_tier",
+)
+
 ACCEPT_REVIEW_SEAM_NAMES: tuple[str, ...] = (
     "GitCommandTimeout",
     "LaunchRejected",
@@ -68,7 +623,7 @@ def accept_review(
     task_id: str,
     *,
     confirm_destructive_change: bool = False,
-    requested_risk_tier: str = quality_evidence.RISK_LOW,
+    requested_risk_tier: str | None = None,
     risk_signals: list[str] | None = None,
     reviewer_reports: list[dict[str, Any]] | None = None,
     reviewer_request_ids: list[str] | None = None,
@@ -88,10 +643,23 @@ def accept_review(
     the exact same request returns ``already_accepted`` instead of
     re-promoting or re-validating anything.
 
-    ``requested_risk_tier`` and ``risk_signals`` are manager-owned inputs.
+    ``requested_risk_tier`` and ``risk_signals`` are manager-owned inputs, and
+    both are OVERRIDES that may only tighten. ``requested_risk_tier=None`` --
+    the default -- means "the tier the finalizer already measured for this
+    candidate" (:func:`server_derived_risk_tier`); an explicit tier is folded
+    over that with :func:`effective_requested_risk_tier`, which takes the
+    higher of the two, so naming a tier can add review and can never remove it.
     Medium-and-higher profiles materialize a fresh combined-tree workspace
     and fail closed without the required read-only reviewer reports.
     High/critical profiles additionally require ``confirm_high_risk``.
+
+    ``reviewer_request_ids=None`` -- the default -- means "every verified
+    reviewer child bound to this exact (request_id, task_id)", which the server
+    already knows: the manager retyped them in 135 of 159 measured calls. An
+    explicit list overrides that set, and an explicit ``[]`` excludes every
+    reviewer. Whichever way they are chosen, EVERY id is still verified here by
+    request id against its own sealed receipt -- defaulting changes who types
+    the ids, never what is proven about them.
     """
     # Every module-level name this function used while it lived in
     # ``process_launcher`` is re-bound here from that exact module object, so a
@@ -951,10 +1519,61 @@ def accept_review(
                         ]
                     )
                 )
+            # The tier the FINALIZER measured, raised (never lowered) by an
+            # explicit manager request. ``None`` -- the default -- means the
+            # manager stops predicting and retyping a tier the server already
+            # derived from this exact candidate.
+            effective_requested_tier = effective_requested_risk_tier(
+                card, requested_risk_tier
+            )
             risk_profile = quality_evidence.resolve_risk_profile(
-                requested_risk_tier,
+                effective_requested_tier,
                 signals=effective_risk_signals,
             )
+            # ---- the cheap fold, BEFORE anything expensive --------------
+            #
+            # Measured 2026-09-08: 49 of 159 accept attempts (31%) failed on a
+            # parameter or timing condition decidable from persisted evidence
+            # alone -- and every one of them failed AFTER a combined-tree
+            # workspace had been materialized and validated twice. Nothing
+            # below this point is needed to know any of them.
+            #
+            # It refuses; it never accepts. ``fold_quality_verdict`` still runs
+            # in full further down over the same profile, so a tier planned too
+            # narrowly upstream still fails closed there. This only says so
+            # first, for free.
+            #
+            # Two of the fold's conditions -- the target substatus and the
+            # pending write intents -- were already refused far above, so they
+            # cannot fire HERE. They are still in the fold because
+            # ``accept_preview`` runs the identical function and is where a
+            # manager meets them: the point is that the two surfaces answer
+            # from one implementation, not two that drift.
+            reviewers = reviewer_evidence(self, task_id, request_id)
+            accept_fold = fold_accept_blockers(
+                reviewers=reviewers,
+                reviewer_request_ids=reviewer_request_ids,
+                risk_profile=risk_profile,
+                terminal_substatus=str(terminal_review.get("substatus") or ""),
+                confirm_high_risk=confirm_high_risk,
+            )
+            if accept_fold["blockers"]:
+                return {
+                    "ok": False,
+                    "error": str(accept_fold["blockers"][0]["error"]),
+                    "request_id": request_id,
+                    "task_id": task_id,
+                    "accept_blockers": accept_fold["blockers"],
+                    "reviewer_request_ids": accept_fold["reviewer_request_ids"],
+                    "reviewer_request_id_source": accept_fold[
+                        "reviewer_request_id_source"
+                    ],
+                    "required_reviewer_lenses": accept_fold["required_reviewer_lenses"],
+                    "reviewer_lenses": accept_fold["per_lens"],
+                    "effective_risk_tier": str(risk_profile["effective_tier"]),
+                    "requested_risk_tier": effective_requested_tier,
+                    "combined_tree_materialized": False,
+                }
             combined_tree: dict[str, Any] | None = None
             combined_tree_checks: list[dict[str, Any]] = []
             inherited_policy = (
@@ -980,7 +1599,7 @@ def accept_review(
                     union_quality = quality_evidence.run_completion_quality_gate(
                         union_workspace.path,
                         changed_paths=changed,
-                        requested_risk_tier=requested_risk_tier,
+                        requested_risk_tier=effective_requested_tier,
                         risk_signals=effective_risk_signals,
                         combined_tree_scope=True,
                         policy_root=self.repo if inherited_policy else None,
@@ -1026,7 +1645,19 @@ def accept_review(
                         union_workspace.path,
                         union_workspace.home,
                     )
-            reviewer_ids = list(reviewer_request_ids or [])
+            # The manager named these in 24 of 159 measured calls and retyped
+            # what the server already knew in the other 135. ``None`` now means
+            # "the verified reviewer children bound to this exact (request_id,
+            # task_id)"; an explicit list still overrides, and an explicit ``[]``
+            # still excludes every reviewer. Either way each id is verified
+            # below against its own sealed receipt -- this decides who TYPES the
+            # ids, never what is proven about them.
+            reviewer_ids = (
+                list(accept_fold["reviewer_request_ids"])
+                if reviewer_request_ids is None
+                else list(reviewer_request_ids)
+            )
+            reviewer_ids_source = accept_fold["reviewer_request_id_source"]
             if len(reviewer_ids) > quality_evidence.MAX_REVIEW_REPORTS:
                 raise WorkspaceError("quality_reviewer_request_overflow")
             if len(set(reviewer_ids)) != len(reviewer_ids):
@@ -1127,7 +1758,7 @@ def accept_review(
             quality_gate = quality_evidence.run_completion_quality_gate(
                 workspace.path,
                 changed_paths=changed,
-                requested_risk_tier=requested_risk_tier,
+                requested_risk_tier=effective_requested_tier,
                 risk_signals=effective_risk_signals,
                 reviewer_reports=verified_reviewer_reports,
                 combined_tree_checks=combined_tree_checks,
@@ -1139,6 +1770,60 @@ def accept_review(
             )
             quality_gate["combined_tree"] = combined_tree
             quality_gate["quality_policy_authority"] = policy_authority
+            # WHO accepted, WHO chose the reviewer ids, and WHAT the tier was
+            # asked to be -- on the record, in the accept event's own payload.
+            #
+            # ``confirm_high_risk`` stays an EXPLICIT manager input and is NOT
+            # implied by the verified call: a high/critical acceptance remains a
+            # decision someone made in words, and
+            # ``explicit_human_approval_implied_by_caller`` states in the record
+            # itself that it was not inferred. Should that ever change, this
+            # field is where the audit has to say so.
+            #
+            # ``requested_risk_tier_source`` distinguishes a tier the manager
+            # typed from one the finalizer measured, so a later reader can tell
+            # an override from a default.
+            #
+            # The identity is same-uid local runtime state (provider, session
+            # and window), never a credential, and it is best-effort: an
+            # unverifiable route is recorded as unverified rather than
+            # fabricated, and never blocks a promotion that has already passed
+            # every gate above.
+            try:
+                manager_identity = (
+                    core._claude_manager_identity() or core._codex_manager_identity()
+                ) or {}
+            except Exception:  # noqa: BLE001 -- describing the caller never fails an accept
+                manager_identity = {}
+            quality_gate["accept_manager_identity"] = {
+                "verified": bool(manager_identity),
+                "provider": str(manager_identity.get("provider") or "")[:60],
+                "session_id": str(
+                    manager_identity.get("session_id")
+                    or manager_identity.get("thread_id")
+                    or ""
+                )[:120],
+                "window_id": str(manager_identity.get("window_id") or "")[:120],
+            }
+            quality_gate["accept_parameter_provenance"] = {
+                "reviewer_request_ids": list(reviewer_ids),
+                "reviewer_request_id_source": (
+                    reviewer_ids_source
+                    if reviewer_request_ids is None
+                    else "manager_named"
+                ),
+                "requested_risk_tier": effective_requested_tier,
+                "requested_risk_tier_source": (
+                    "manager_override" if requested_risk_tier else "server_derived"
+                ),
+                "manager_requested_risk_tier": str(requested_risk_tier or ""),
+                "server_derived_risk_tier": server_derived_risk_tier(card),
+                "explicit_human_approval": bool(confirm_high_risk),
+                "explicit_human_approval_implied_by_caller": False,
+                "destructive_change_confirmed_by_manager": bool(
+                    confirm_destructive_change
+                ),
+            }
             if not quality_gate.get("passed"):
                 quality_blockers = quality_gate.get("blocking_checks") or []
                 if not isinstance(quality_blockers, list):
@@ -1282,6 +1967,16 @@ def accept_review(
             changed_paths=list(promoted), evidence_reference=str(
                 (acceptance_evidence_record or {}).get("reference") or ""),
         )
+        # One evidence row per skill this card actually received, with the
+        # actor DERIVED from the card's own runner. Measured 2026-09-08: across
+        # 3,383 recorded decisions there were 0 evidence rows, because the only
+        # path was a manager typing skill_add_evidence with a free-text actor --
+        # and the one "active" record had 5 rows from a single canonical actor
+        # under two spellings. Deriving the actor is what makes two independent
+        # actors mean two. Never raises; activation stays a manager decision.
+        manager_skill_tools.record_decision_evidence(
+            self.repo, task_id=task_id, request_id=request_id, outcome="accepted"
+        )
         accepted_reply = {
             "ok": True, "request_id": request_id, "task_id": task_id,
             "promoted_paths": promoted,
@@ -1290,6 +1985,13 @@ def accept_review(
             "accepted_outcome_receipt": accepted_outcome_receipt,
             "needfix_closure": needfix_closure,
             "learning_commit_owed": learning_owed,
+            # The same provenance the accept EVENT carries, in the reply, so a
+            # caller can see which reviewer ids were used and who supplied them
+            # without re-reading the card it just finished.
+            "accept_parameter_provenance": quality_gate.get(
+                "accept_parameter_provenance", {}
+            ),
+            "accept_manager_identity": quality_gate.get("accept_manager_identity", {}),
         }
         try:
             cleanup_workspace(workspace.repo, workspace.path, workspace.home)

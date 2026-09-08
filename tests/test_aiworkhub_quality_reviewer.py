@@ -224,18 +224,23 @@ def test_scoped_audit_known_unknowns_are_preserved_in_packet():
 
 @pytest.mark.parametrize("lens", ["correctness", "security", "code_quality"])
 def test_packet_to_prompt_renders_matching_scoped_audit_for_each_lens(lens):
-    packet = _packet(
+    shared = _packet(
         source_evidence=_evidence(),
         scoped_audits=_scoped_audits("correctness", "security", "code_quality"),
     )
+    packet = quality_reviewer.build_lens_packet(shared, lens=lens)
 
     prompt = quality_reviewer.build_review_prompt(packet, lens=lens)
 
     assert f"Review lens: {lens}." in prompt
     assert f'"{lens} graph boundary"' in prompt
     assert f'"lens_kind":"{lens}"' in prompt
+    # The lens packet carries this lens's scope and no other: the shared
+    # three-lens packet is the coordinator's, never the reviewer's.
     for other_lens in {"correctness", "security", "code_quality"} - {lens}:
-        assert f'"lens_kind":"{other_lens}"' in prompt
+        assert f'"lens_kind":"{other_lens}"' not in prompt
+    assert packet["packet_sha256"] in prompt
+    assert shared["packet_sha256"] not in prompt
 
 
 @pytest.mark.parametrize("lens", ["correctness", "security", "code_quality"])
@@ -285,5 +290,163 @@ def test_scoped_audit_known_unknowns_wrapper_tamper_fails_closed():
                     "known_unknowns": ["outer tamper"],
                     "packet": scoped_payload,
                 }
+            }
+        )
+
+
+def _validation_row(**overrides):
+    row = {
+        "declared_command": "python -m pytest -q",
+        "executed_argv": ["python3", "-m", "pytest", "-q"],
+        "returncode": 1,
+        "duration_seconds": 12.5,
+        "stdout_tail": "noise\n1 failed, 2 passed in 3.01s",
+        "stdout_truncated": True,
+        "stderr_tail": "Traceback tail",
+        "stderr_truncated": False,
+    }
+    row.update(overrides)
+    return row
+
+
+def test_terminal_validation_carries_the_finalizers_output_tails_and_duration():
+    """The prompt promises bounded stdout/stderr under terminal_validation.
+
+    The finalizer already retains a 4 KiB ``stdout_tail``/``stderr_tail`` and a
+    ``duration_seconds`` on every executed validation row (``worker_workspace``
+    record); the packet carried only the truncation flags, so a reviewer that
+    wanted the pytest summary line re-ran the command it was told not to run.
+    """
+    packet = _packet(terminal_validation=[_validation_row()])
+
+    row = packet["terminal_validation"][0]
+    assert row["returncode"] == 1
+    assert row["duration_seconds"] == 12.5
+    assert row["stdout_tail"].endswith("1 failed, 2 passed in 3.01s")
+    assert row["stderr_tail"] == "Traceback tail"
+    assert row["stdout_truncated"] is True
+    assert row["stderr_truncated"] is False
+
+
+def test_validation_output_tails_are_bounded_to_what_the_finalizer_retains():
+    """Never more than the finalizer's own 4 KiB, and the LAST bytes at that."""
+    long_tail = "x" * 9_000 + "\n1 failed, 2 passed in 3.01s"
+    packet = _packet(terminal_validation=[_validation_row(stdout_tail=long_tail)])
+
+    row = packet["terminal_validation"][0]
+    assert len(row["stdout_tail"]) == quality_reviewer.MAX_VALIDATION_OUTPUT_TAIL_CHARS
+    assert row["stdout_tail"] == long_tail[-4_096:]
+    assert row["stdout_tail"].endswith("1 failed, 2 passed in 3.01s")
+
+
+def test_validation_rows_without_tails_or_duration_stay_well_formed():
+    """A row from a fixture or an older finalizer is bounded, never rejected."""
+    packet = _packet(
+        terminal_validation=[
+            {"declared_command": "ruff check", "executed_argv": ["ruff"], "returncode": 0}
+        ]
+    )
+
+    row = packet["terminal_validation"][0]
+    assert row["duration_seconds"] is None
+    assert row["stdout_tail"] == "" and row["stderr_tail"] == ""
+
+
+def _caller_context(**overrides):
+    value = {
+        "rows": [
+            {
+                "identity": "callers:1",
+                "path": "src/other.py",
+                "line": 10,
+                "line_start": 5,
+                "line_end": 15,
+                "source": "canonical",
+                "text": "def caller():\n    return mod.changed()\n",
+            }
+        ],
+        "complete": True,
+        "omitted": 0,
+    }
+    value.update(overrides)
+    return value
+
+
+def test_caller_context_is_bound_as_canonical_source_around_graph_lines():
+    packet = _packet(caller_context=_caller_context())
+
+    context = packet["candidate"]["caller_context"]
+    assert context["complete"] is True and context["omitted"] == 0
+    assert context["rows"][0]["path"] == "src/other.py"
+    assert context["rows"][0]["source"] == "canonical"
+    assert "mod.changed()" in context["rows"][0]["text"]
+
+
+@pytest.mark.parametrize(
+    "broken",
+    [
+        {"rows": [{"identity": "c", "path": "/etc/passwd", "line": 1,
+                   "line_start": 1, "line_end": 1, "source": "canonical", "text": ""}]},
+        {"rows": [{"identity": "c", "path": "../outside.py", "line": 1,
+                   "line_start": 1, "line_end": 1, "source": "canonical", "text": ""}]},
+        {"rows": [{"identity": "c", "path": "src/other.py", "line": 20,
+                   "line_start": 5, "line_end": 15, "source": "canonical", "text": ""}]},
+        {"rows": [{"identity": "c", "path": "src/other.py", "line": 10,
+                   "line_start": 5, "line_end": 15, "source": "reviewer", "text": ""}]},
+        {"complete": True, "omitted": 3},
+    ],
+)
+def test_caller_context_fails_closed_on_anything_it_cannot_vouch_for(broken):
+    """Escaped paths, a line outside its own window, a non-canonical source and
+    a 'complete' record that also counts omissions are each refused."""
+    with pytest.raises(
+        quality_reviewer.ReviewerEvidenceError, match="invalid_caller_context"
+    ):
+        _packet(caller_context=_caller_context(**broken))
+
+
+def test_candidate_delta_records_byte_identity_and_nothing_else():
+    """The delta is a fact about bytes: no prior report, verdict or line map."""
+    packet = _packet(
+        candidate_delta={
+            "predecessor_request_id": "req0",
+            "paths": {
+                "src/mod.py": {"unchanged_since_reviewed": True, "predecessor_sha256": DIGEST}
+            },
+        }
+    )
+
+    delta = packet["candidate"]["delta"]
+    assert delta["schema_id"] == quality_reviewer.CANDIDATE_DELTA_SCHEMA_ID
+    assert delta["basis"] == "changed_path_hashes"
+    assert delta["predecessor_request_id"] == "req0"
+    assert delta["paths"] == {
+        "src/mod.py": {"unchanged_since_reviewed": True, "predecessor_sha256": DIGEST}
+    }
+
+
+def test_candidate_delta_must_cover_exactly_the_changed_paths():
+    with pytest.raises(
+        quality_reviewer.ReviewerEvidenceError, match="invalid_candidate_delta"
+    ):
+        _packet(
+            candidate_delta={
+                "predecessor_request_id": "req0",
+                "paths": {
+                    "src/mod.py": {"unchanged_since_reviewed": True,
+                                   "predecessor_sha256": DIGEST},
+                    "src/not_changed.py": {"unchanged_since_reviewed": False,
+                                           "predecessor_sha256": None},
+                },
+            }
+        )
+    with pytest.raises(
+        quality_reviewer.ReviewerEvidenceError, match="invalid_candidate_delta"
+    ):
+        _packet(
+            candidate_delta={
+                "predecessor_request_id": "req0",
+                "paths": {"src/mod.py": {"unchanged_since_reviewed": True,
+                                         "predecessor_sha256": "not-a-digest"}},
             }
         )

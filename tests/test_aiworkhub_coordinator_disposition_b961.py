@@ -2268,9 +2268,22 @@ def test_manager_bootstrap_hygiene_is_interval_throttled_and_nonfatal(
     monkeypatch.setattr(core, "_codex_manager_identity", lambda: None)
     monkeypatch.setenv("AIWORKHUB_ALLOW_WRITES", "1")
     monkeypatch.setattr(core, "_TASK_HYGIENE_LAST_RUNS", {})
+    monkeypatch.setattr(core, "_TASK_HYGIENE_LAST_RESULTS", {})
+    monkeypatch.setattr(core, "_TASK_HYGIENE_INFLIGHT", set())
     monkeypatch.setattr(core.time, "monotonic", lambda: 1.0)
     monkeypatch.setattr(
         task_retention, "hygiene_config", lambda: {"interval_seconds": 60}
+    )
+    # manager_bootstrap schema v2 moves the sweep OFF the request path on
+    # purpose: the reply no longer waits for a pass, it schedules one and
+    # reports the last COMPLETED pass under ``task_hygiene.last``.  Running the
+    # scheduled callable inline -- exactly what ``core._run_off_request_path``
+    # documents for tests -- is how the completed pass is observed here without
+    # a thread race.  The interval reservation, the per-repository bound and
+    # the "a hygiene fault never fails bootstrap" rule below are unchanged from
+    # v1 and are still asserted.
+    monkeypatch.setattr(
+        core, "_run_off_request_path", lambda target, *, name: target()
     )
     calls: list[Path] = []
 
@@ -2301,11 +2314,27 @@ def test_manager_bootstrap_hygiene_is_interval_throttled_and_nonfatal(
         "reasons": {"callback_live": 1},
         "state": "completed",
     }
-    assert first_a["task_hygiene"] == expected_completed
-    assert first_b["task_hygiene"] == expected_completed
-    assert second_a["task_hygiene"] == {"state": "throttled"}
+    for reply in (first_a, first_b):
+        scheduled = reply["task_hygiene"]
+        assert scheduled["state"] == "scheduled"
+        assert scheduled["off_request_path"] is True
+        last = scheduled["last"]
+        assert {
+            field: last[field] for field in expected_completed
+        } == expected_completed
+        # The pass now also prunes stale pending callbacks and stamps when it
+        # finished, so a later reply can report a pass it did not run.
+        assert last["completed_at"]
+        assert last["callback_prune"]["state"] in {"completed", "skipped"}
+    assert second_a["task_hygiene"]["state"] == "throttled"
+    assert second_a["task_hygiene"]["last"]["state"] == "completed"
+    # The same last-known result is readable without running anything.
+    assert core.task_hygiene_status()["last"]["state"] == "completed"
+    assert core.task_hygiene_status()["inflight"] is False
 
     monkeypatch.setattr(core, "_TASK_HYGIENE_LAST_RUNS", {})
+    monkeypatch.setattr(core, "_TASK_HYGIENE_LAST_RESULTS", {})
+    monkeypatch.setattr(core, "_TASK_HYGIENE_INFLIGHT", set())
     monkeypatch.setattr(
         task_retention,
         "run_automatic_hygiene",
@@ -2313,7 +2342,28 @@ def test_manager_bootstrap_hygiene_is_interval_throttled_and_nonfatal(
     )
     failed = core.manager_bootstrap()
     assert failed["ok"] is True
-    assert failed["task_hygiene"]["state"] == "skipped"
+    # v1 reported a sweep fault as the bootstrap's own hygiene state because
+    # the sweep ran inline. v2 catches it inside the off-request-path pass, so
+    # the scheduling still succeeds and the fault is reported on the result.
+    assert failed["task_hygiene"]["state"] == "scheduled"
+    assert failed["task_hygiene"]["last"]["state"] == "skipped"
+    assert failed["task_hygiene"]["last"]["reasons"] == {"RuntimeError": 1}
+
+    # A fault in the SCHEDULING itself still degrades to a skipped hygiene
+    # block on a bootstrap that stays ok -- the v1 nonfatal pin, at the level
+    # v1 asserted it.
+    monkeypatch.setattr(core, "_TASK_HYGIENE_LAST_RUNS", {})
+    monkeypatch.setattr(
+        task_retention,
+        "hygiene_config",
+        lambda: (_ for _ in ()).throw(RuntimeError("no config")),
+    )
+    unschedulable = core.manager_bootstrap()
+    assert unschedulable["ok"] is True
+    assert unschedulable["task_hygiene"] == {
+        "state": "skipped",
+        "reasons": {"RuntimeError": 1},
+    }
 
 
 def test_pending_ordinary_recovery_absent_authorization_already_recovered(tmp_path):

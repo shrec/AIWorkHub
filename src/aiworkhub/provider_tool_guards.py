@@ -9,7 +9,11 @@ from pathlib import Path
 from typing import Any
 
 from . import agent_tool_instructions as instructions
-from .runtime_adapters import CLAUDE_RAW_DISCOVERY_DENIES
+from .runtime_adapters import (
+    CLAUDE_RAW_DISCOVERY_DENIES,
+    CLAUDE_RAW_DISCOVERY_TOOL_DENIES,
+    claude_disallowed_tools,
+)
 
 
 CLAUDE_SETTINGS_REL = Path(".claude/settings.json")
@@ -17,6 +21,31 @@ CLAUDE_SETTINGS_REL = Path(".claude/settings.json")
 
 class ProviderGuardError(RuntimeError):
     pass
+
+
+def claude_settings_deny(*, read_only: bool) -> tuple[str, ...]:
+    """The ``permissions.deny`` list a Claude tree gets for THIS role.
+
+    ``runtime_adapters.claude_disallowed_tools`` already answers this question
+    for the provider argv: a build worker is denied raw discovery in every form
+    because Source Graph is its discovery path, and a read-only reviewer keeps
+    the raw SHELL denies but is granted the bounded native ``Grep``/``Glob``
+    instead (measured: 1,080 denied Bash calls, 25% of every reviewer Bash call,
+    across 181 of 242 runs).
+
+    That grant was inert. A reviewer runs inside a git worktree created by
+    ``worker_workspace.create_workspace``, so it checks out the repository's own
+    tracked ``.claude/settings.json`` -- and a project ``permissions.deny`` wins
+    over an argv ``--allowedTools`` entry. The reviewer therefore inherited the
+    build worker's deny and went on burning turns on refusals.
+
+    So the settings value is derived from the SAME function as the argv. The two
+    enforcement surfaces cannot disagree about a role, and the build worker's
+    rule is untouched: for ``read_only=False`` this is exactly
+    ``CLAUDE_RAW_DISCOVERY_DENIES``.
+    """
+
+    return tuple(claude_disallowed_tools(read_only=bool(read_only)))
 
 
 def _is_legacy_ai_tool_command(value: Any) -> bool:
@@ -68,7 +97,9 @@ def _atomic_write_text(path: Path, text: str) -> None:
             pass
 
 
-def _merge_claude_settings(path: Path) -> tuple[dict[str, Any], bool]:
+def _merge_claude_settings(
+    path: Path, *, read_only: bool = False
+) -> tuple[dict[str, Any], bool]:
     if path.exists():
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
@@ -93,8 +124,16 @@ def _merge_claude_settings(path: Path) -> tuple[dict[str, Any], bool]:
     deny = permissions.setdefault("deny", [])
     if not isinstance(deny, list) or any(not isinstance(item, str) for item in deny):
         raise ProviderGuardError("claude_permissions_deny_string_list_required")
-    merged = [*deny]
-    for item in CLAUDE_RAW_DISCOVERY_DENIES:
+    required = claude_settings_deny(read_only=read_only)
+    # A reviewer tree is a git worktree of this repository, so it arrives with
+    # the canonical tracked deny already in it. Merging alone would leave the
+    # build worker's ``Grep``/``Glob`` entries in place and the argv grant inert,
+    # so the entries this role must not inherit are dropped explicitly. Only the
+    # native tool denies are role-scoped: the raw SHELL forms stay denied for
+    # every role, and nothing a repository owner wrote is touched.
+    surrendered = frozenset(CLAUDE_RAW_DISCOVERY_TOOL_DENIES) - frozenset(required)
+    merged = [item for item in deny if item not in surrendered]
+    for item in required:
         if item not in merged:
             merged.append(item)
     changed = changed or merged != deny
@@ -102,8 +141,13 @@ def _merge_claude_settings(path: Path) -> tuple[dict[str, Any], bool]:
     return payload, changed
 
 
-def apply_repository_guards(repo_root: Path) -> dict[str, Any]:
-    """Idempotently install all provider instructions plus Claude hard denies."""
+def apply_repository_guards(repo_root: Path, *, read_only: bool = False) -> dict[str, Any]:
+    """Idempotently install all provider instructions plus Claude hard denies.
+
+    ``read_only`` names the ROLE the tree is being provisioned for and defaults
+    to the writing one, so a caller that does not think about roles provisions a
+    build worker's full deny -- the direction that can only be too strict.
+    """
 
     root = repo_root.resolve()
     changed: list[str] = []
@@ -122,7 +166,7 @@ def apply_repository_guards(repo_root: Path) -> dict[str, Any]:
     claude_path = (root / CLAUDE_SETTINGS_REL).resolve()
     if not claude_path.is_relative_to(root):
         raise ProviderGuardError("claude_settings_path_escape")
-    settings, settings_changed = _merge_claude_settings(claude_path)
+    settings, settings_changed = _merge_claude_settings(claude_path, read_only=read_only)
     if settings_changed or not claude_path.exists():
         _atomic_write_text(
             claude_path,
@@ -134,7 +178,46 @@ def apply_repository_guards(repo_root: Path) -> dict[str, Any]:
         "ok": True,
         "changed": changed,
         "managed_providers": [*instructions.PROVIDERS, CLAUDE_SETTINGS_REL.as_posix()],
-        "claude_raw_discovery_denied": list(CLAUDE_RAW_DISCOVERY_DENIES),
+        "read_only": bool(read_only),
+        "claude_raw_discovery_denied": list(claude_settings_deny(read_only=read_only)),
+    }
+
+
+def apply_workspace_guards(workspace_root: Path, *, read_only: bool) -> dict[str, Any]:
+    """Rewrite ONE provisioned worktree's ``.claude/settings.json`` for its role.
+
+    :func:`apply_repository_guards` provisions the canonical repository at init.
+    A worker or reviewer, though, does not run there: it runs in a git worktree
+    that ``worker_workspace.create_workspace`` checked out, which inherits the
+    canonical tracked settings file verbatim. That inheritance is what made the
+    reviewer's native-search grant inert.
+
+    This touches the settings file ONLY -- never a provider instruction file --
+    because those are already correct in the checkout and rewriting them would
+    put unrelated paths into the candidate delta a reviewer must not carry.
+
+    ``baseline_paths`` names the exact repository-relative path this wrote. A
+    caller provisioning a workspace must fold it into the workspace baseline it
+    snapshots, or the rewrite reads back as a candidate edit the reviewer made.
+    """
+
+    root = Path(workspace_root).resolve()
+    claude_path = (root / CLAUDE_SETTINGS_REL).resolve()
+    if not claude_path.is_relative_to(root):
+        raise ProviderGuardError("claude_settings_path_escape")
+    settings, settings_changed = _merge_claude_settings(claude_path, read_only=read_only)
+    wrote = settings_changed or not claude_path.exists()
+    if wrote:
+        _atomic_write_text(
+            claude_path,
+            json.dumps(settings, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        )
+    return {
+        "ok": True,
+        "read_only": bool(read_only),
+        "changed": [CLAUDE_SETTINGS_REL.as_posix()] if wrote else [],
+        "baseline_paths": [CLAUDE_SETTINGS_REL.as_posix()],
+        "deny": list(claude_settings_deny(read_only=read_only)),
     }
 
 
@@ -142,4 +225,6 @@ __all__ = [
     "CLAUDE_SETTINGS_REL",
     "ProviderGuardError",
     "apply_repository_guards",
+    "apply_workspace_guards",
+    "claude_settings_deny",
 ]

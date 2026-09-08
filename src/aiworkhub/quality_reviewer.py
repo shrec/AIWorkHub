@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import builtins
+import copy
 import hashlib
 import importlib.machinery
 import importlib.util
@@ -25,7 +26,14 @@ MAX_PACKET_PATHS = 200
 MAX_PACKET_CHECKS = 200
 MAX_PACKET_COMMANDS = 100
 MAX_TEXT_CHARS = 2_000
+# The finalizer retains the last 4 KiB of stdout and stderr on every executed
+# validation row (worker_workspace: ``stdout_tail``/``stderr_tail``).  The
+# packet carries exactly that bound, never more, so the prompt's promise of
+# "bounded stdout/stderr under terminal_validation" is true by construction.
+MAX_VALIDATION_OUTPUT_TAIL_CHARS = 4_096
 REVIEW_PACKET_FILE_ROOT_ENV = "AIWORKHUB_QUALITY_REVIEW_PACKET_ROOT"
+REVIEWER_LENSES = frozenset({"correctness", "security", "code_quality"})
+CANDIDATE_DELTA_SCHEMA_ID = "aiworkhub.quality_review_candidate_delta.v1"
 
 _IDENTITY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -188,12 +196,20 @@ def build_review_packet(
     combined_tree_checks: Iterable[Mapping[str, Any]] = (),
     source_evidence: Mapping[str, Mapping[str, Any]] | None = None,
     scoped_audits: Mapping[str, Mapping[str, Any] | ScopedAuditPacket] | None = None,
+    caller_context: Mapping[str, Any] | None = None,
+    candidate_delta: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the only evidence packet an independent reviewer may receive.
 
     The packet is intentionally anti-anchored: it contains the objective
     contract and deterministic evidence, never the worker's explanation,
     self-verdict, final response, chain of thought, or reviewer suggestions.
+
+    ``caller_context`` is the canonical source read around every graph-resolved
+    caller line the scoped audit lists, and ``candidate_delta`` marks which
+    changed paths are byte-identical to the previously reviewed candidate.
+    Both are mechanical facts derived by the coordinator; neither carries any
+    reviewer or worker prose.
     """
 
     if not isinstance(claim_epoch, int) or claim_epoch < 1:
@@ -255,6 +271,18 @@ def build_review_packet(
             returncode = row.get("returncode")
             if not isinstance(returncode, int) or isinstance(returncode, bool):
                 raise ReviewerEvidenceError("invalid_terminal_validation")
+            duration_raw = row.get("duration_seconds")
+            duration: float | None = None
+            if (
+                isinstance(duration_raw, (int, float))
+                and not isinstance(duration_raw, bool)
+                and duration_raw >= 0
+            ):
+                duration = float(duration_raw)
+            # The tails are what the run printed LAST -- the pytest summary
+            # line, the traceback tail, the linter's final count -- already
+            # bounded by the finalizer; ``*_truncated`` says whether a head
+            # and tail were cut out of a longer stream.
             result.append(
                 {
                     "declared_command": str(
@@ -265,7 +293,10 @@ def build_review_packet(
                         for item in list(executed)[:MAX_PACKET_COMMANDS]
                     ],
                     "returncode": returncode,
+                    "duration_seconds": duration,
+                    "stdout_tail": _output_tail(row.get("stdout_tail")),
                     "stdout_truncated": bool(row.get("stdout_truncated")),
+                    "stderr_tail": _output_tail(row.get("stderr_tail")),
                     "stderr_truncated": bool(row.get("stderr_truncated")),
                 }
             )
@@ -279,6 +310,12 @@ def build_review_packet(
             scoped_audits,
             task_id=task_id,
             changed_paths={row["path"] for row in path_rows},
+        )
+    if caller_context is not None:
+        candidate["caller_context"] = _caller_context_rows(caller_context)
+    if candidate_delta is not None:
+        candidate["delta"] = _candidate_delta_rows(
+            candidate_delta, changed_paths={row["path"] for row in path_rows}
         )
     body = {
         "schema_id": PACKET_SCHEMA_ID,
@@ -300,6 +337,53 @@ def build_review_packet(
         "combined_tree_checks": checks(combined_tree_checks),
     }
     return {**body, "packet_sha256": _canonical_digest(body)}
+
+
+def _output_tail(value: object) -> str:
+    """Bound one validation output tail to what the finalizer retains."""
+
+    text = value if isinstance(value, str) else ""
+    return text[-MAX_VALIDATION_OUTPUT_TAIL_CHARS:]
+
+
+def build_lens_packet(packet: Mapping[str, Any], *, lens: str) -> dict[str, Any]:
+    """Derive the packet ONE reviewer lens receives from the shared full packet.
+
+    ``build_review_packet`` seals every lens's scoped audit into one packet so
+    the heavy preparation runs once per candidate.  Measured over 38 surviving
+    packets (2026-09-08 reviewer audit): 130 KB mean, of which
+    ``candidate.scoped_audits`` was 83.6% -- three byte-identical 36 KB copies
+    whose rows differ only in ``packet_id`` and ``review_lens``.  Every packet
+    therefore exceeded the 96 KiB inline cap, and every lens run spent its
+    first turns fetching and dissecting a file two thirds of which was about
+    other lenses.
+
+    The lens packet keeps every section and exactly ``scoped_audits[lens]``,
+    and its ``packet_sha256`` is recomputed over that body with the same
+    canonical digest, so the digest covers exactly what this reviewer sees and
+    ``packet_read``, ``submit`` and ``verify_reviewer_receipt`` all bind to it.
+
+    A packet that carries no scoped audits, or already carries only this lens,
+    is returned as a copy: there is nothing to slice and nothing to re-seal.
+    """
+
+    if lens not in REVIEWER_LENSES:
+        raise ReviewerEvidenceError("invalid_reviewer_lens")
+    candidate = packet.get("candidate")
+    scoped = candidate.get("scoped_audits") if isinstance(candidate, Mapping) else None
+    if not isinstance(scoped, Mapping):
+        return dict(packet)
+    if lens not in scoped:
+        raise ReviewerEvidenceError("review_scope_lens_missing")
+    if set(scoped) == {lens}:
+        return dict(packet)
+    packet_body = {k: v for k, v in packet.items() if k != "packet_sha256"}
+    packet_digest = str(packet.get("packet_sha256") or "")
+    if not _SHA256_RE.fullmatch(packet_digest) or _canonical_digest(packet_body) != packet_digest:
+        raise ReviewerEvidenceError("review_packet_digest_invalid")
+    lens_body = copy.deepcopy(packet_body)
+    lens_body["candidate"]["scoped_audits"] = {lens: lens_body["candidate"]["scoped_audits"][lens]}
+    return {**lens_body, "packet_sha256": _canonical_digest(lens_body)}
 
 
 def _has_symlink_component(base: Path, relative: str) -> bool:
@@ -498,16 +582,39 @@ def verify_reviewer_receipt(
 # Naming what is settled moves that work off the model without weakening the
 # review: the reviewer still reads the candidate and still judges it, but it
 # stops re-deriving facts the supervisor established and recorded.
+#
+# Measured again over 1,024 reviewer runs (2026-09-08 audit) after that block
+# landed: hash and test re-runs were down to 80 calls, but 63.5% of every byte
+# reviewers read was the candidate's OWN changed files and 38% of runs ran git
+# diff -- because the packet carried a 4 KB excerpt per path, 2% of the change.
+# The packet now carries the complete unified diff, the canonical source around
+# every graph-resolved caller and the validation output tails, and this block
+# names each of them so the reviewer knows what it already holds.
 _ALREADY_ESTABLISHED_MECHANICALLY = (
     "The packet is deterministic evidence the supervisor already produced. Do "
     "NOT re-derive any of it:\n"
     "- candidate file digests are recorded per changed path; do not run "
     "sha256sum or any hashing command to confirm them.\n"
+    "- candidate.source_evidence carries the unified diff of every changed "
+    "path against the canonical tree: per hunk an @@ header with exact "
+    "candidate and baseline line numbers, then ' ' context, '-' removed and "
+    "'+' added lines. Where diff_complete is true that diff IS the whole "
+    "change; do not run git diff and do not re-read the changed file to "
+    "reconstruct it. Where diff_complete is false the omitted hunks are named "
+    "in segments and omission_reason, and only those need the workspace.\n"
+    "- candidate.caller_context carries the canonical source around every "
+    "graph-resolved caller line listed in impact_evidence; when complete is "
+    "true there is no further caller to search for.\n"
     "- every declared validation was already executed; the packet carries its "
-    "exact argv, returncode and bounded stdout/stderr under terminal_validation "
-    "and mechanical_checks. Do not re-run pytest, lint or any validation "
-    "command, and do not go looking for an interpreter.\n"
+    "exact argv, returncode, duration_seconds and the bounded stdout_tail/"
+    "stderr_tail under terminal_validation and mechanical_checks. Do not "
+    "re-run pytest, lint or any validation command, and do not go looking "
+    "for an interpreter.\n"
     "- combined-tree checks are recorded the same way.\n"
+    "- candidate.delta, when present, marks the changed paths whose bytes are "
+    "identical to the previously reviewed candidate (basis: "
+    "changed_path_hashes). It is a fact about bytes, never a prior verdict: "
+    "a changed hunk is reviewed in full regardless.\n"
     "Read the candidate and judge it. Spend your turns on the code, not on "
     "reproducing receipts you were handed.\n"
 )
@@ -559,7 +666,7 @@ def build_review_prompt(
     """
 
 
-    if lens not in {"correctness", "security", "code_quality"}:
+    if lens not in REVIEWER_LENSES:
         raise ReviewerEvidenceError("invalid_reviewer_lens")
     packet_body = {k: v for k, v in packet.items() if k != "packet_sha256"}
     packet_digest = str(packet.get("packet_sha256") or "")
@@ -574,21 +681,15 @@ def build_review_prompt(
         if not isinstance(active_scope, Mapping):
             raise ReviewerEvidenceError("review_scope_invalid")
     encoded = json.dumps(packet, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    # The packet a lens receives is built by ``build_lens_packet`` and carries
+    # exactly that lens's scoped audit, so the scope is delivered ONCE, inside
+    # the sealed packet.  It used to be inlined a second time here as
+    # ACTIVE_SCOPED_AUDIT (measured: the reviewer received its own scope twice
+    # and the other lenses' identical scopes once, on every launch).
     scope_instruction = (
-        "Use only the active graph-scoped audit entry for this lens as the "
-        "primary behavior boundary; treat its known_unknowns as explicit limits.\n"
-        if active_scope is not None
-        else ""
-    )
-    active_scope_evidence = (
-        "ACTIVE_SCOPED_AUDIT: "
-        + json.dumps(
-            active_scope,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        )
-        + "\n"
+        f"candidate.scoped_audits.{lens} is the graph-scoped audit for this "
+        "lens: use it as the primary behavior boundary and treat its "
+        "known_unknowns as explicit limits.\n"
         if active_scope is not None
         else ""
     )
@@ -642,14 +743,15 @@ def build_review_prompt(
         f"{repair_block}"
         "You are an independent, strictly read-only quality reviewer.\n"
         f"Review lens: {lens}.\n"
-        "Inspect the exact candidate workspace and the deterministic packet below. "
+        "Judge the candidate from the deterministic packet below; the exact "
+        "candidate workspace is there for what the packet marks incomplete and "
+        "for context beyond it, not to re-read what the packet already carries. "
         "You are intentionally not given the worker's rationale, self-verdict, or final answer. "
         "Do not write, edit, format, or delete repository files.\n"
         f"{scope_instruction}"
         f"{_ALREADY_ESTABLISHED_MECHANICALLY}"
         "Report only concrete items supported by file/line or check evidence. "
         f"{QUALITY_REVIEW_FINDING_SCHEMA_DOC}\n"
-        f"{active_scope_evidence}"
         "Finish with exactly one JSON object and no surrounding prose, using "
         f'{{"lens":"{lens}","findings":[...]}}. The supervisor derives all '
         "task, request, claim, target, reviewer, and packet identity and durably "
@@ -2028,9 +2130,149 @@ def _scoped_audit_rows(
     return result
 
 
-MAX_SOURCE_EVIDENCE_CHARS = 8_000
-MAX_SOURCE_EVIDENCE_TOTAL_CHARS = 120_000
+# The source-evidence budget is sized from the measured change, not a fixed
+# excerpt: git diff output on reviewed candidates averaged ~35 KB (p50 26 KB
+# per re-derivation, 2026-09-08 audit), against a 4,000 B per-path excerpt
+# that covered 2.0% of the changed bytes and left 67% of rows truncated.  The
+# coordinator emits complete unified diff hunks under a 24 KiB per-path and
+# 64 KiB total byte budget (``process_launcher._QUALITY_REVIEW_SOURCE_*``);
+# these character caps admit exactly that (chars <= bytes in UTF-8) and
+# refuse anything larger, so a packet can never carry an unbounded diff.
+MAX_SOURCE_EVIDENCE_CHARS = 24 * 1024
+MAX_SOURCE_EVIDENCE_TOTAL_CHARS = 64 * 1024
 MAX_SOURCE_EVIDENCE_SEGMENTS = 200
+MAX_CALLER_CONTEXT_ROWS = 64
+MAX_CALLER_CONTEXT_CHARS = 2_048
+MAX_CALLER_CONTEXT_TOTAL_CHARS = 16 * 1024
+_CALLER_CONTEXT_SOURCES = frozenset({"canonical"})
+
+
+def _caller_context_rows(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate bounded canonical source read around graph-resolved caller lines.
+
+    Each row is the caller line ``impact_evidence`` already names, plus a few
+    lines either side, read from the canonical tree.  Rows are bounded in
+    count and bytes; ``complete`` is false and ``omitted`` counts the rows the
+    coordinator could not carry, so a missing caller snippet is never silent.
+    """
+
+    if not isinstance(value, Mapping):
+        raise ReviewerEvidenceError("invalid_caller_context")
+    rows = value.get("rows")
+    if rows is None:
+        rows = []
+    if not isinstance(rows, list) or len(rows) > MAX_CALLER_CONTEXT_ROWS:
+        raise ReviewerEvidenceError("invalid_caller_context")
+    omitted = value.get("omitted", 0)
+    complete = value.get("complete")
+    if (
+        not isinstance(omitted, int)
+        or isinstance(omitted, bool)
+        or omitted < 0
+        or not isinstance(complete, bool)
+        or (complete and omitted)
+    ):
+        raise ReviewerEvidenceError("invalid_caller_context")
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    total = 0
+    for row in rows:
+        if not isinstance(row, Mapping):
+            raise ReviewerEvidenceError("invalid_caller_context")
+        identity = str(row.get("identity") or "")
+        path = str(row.get("path") or "")
+        if (
+            not identity
+            or identity in seen
+            or not path
+            or path.startswith("/")
+            or ".." in path.split("/")
+        ):
+            raise ReviewerEvidenceError("invalid_caller_context")
+        seen.add(identity)
+        line = row.get("line")
+        line_start = row.get("line_start")
+        line_end = row.get("line_end")
+        # Each bound is checked by name rather than in a loop so the ordering
+        # check reads narrowed integers: ``line_start >= 1`` plus the ordering
+        # is exactly the old "every one of the three is a positive int".
+        if (
+            not isinstance(line, int)
+            or isinstance(line, bool)
+            or not isinstance(line_start, int)
+            or isinstance(line_start, bool)
+            or not isinstance(line_end, int)
+            or isinstance(line_end, bool)
+            or line_start < 1
+            or not (line_start <= line <= line_end)
+        ):
+            raise ReviewerEvidenceError("invalid_caller_context")
+        source = str(row.get("source") or "canonical")
+        if source not in _CALLER_CONTEXT_SOURCES:
+            raise ReviewerEvidenceError("invalid_caller_context")
+        text = row.get("text")
+        if not isinstance(text, str) or len(text) > MAX_CALLER_CONTEXT_CHARS:
+            raise ReviewerEvidenceError("invalid_caller_context")
+        total += len(text)
+        if total > MAX_CALLER_CONTEXT_TOTAL_CHARS:
+            raise ReviewerEvidenceError("review_packet_overflow")
+        result.append(
+            {
+                "identity": identity[:200],
+                "path": path,
+                "line": line,
+                "line_start": line_start,
+                "line_end": line_end,
+                "source": source,
+                "text": text,
+            }
+        )
+    return {"rows": result, "complete": complete, "omitted": omitted}
+
+
+def _candidate_delta_rows(
+    value: Mapping[str, Any], *, changed_paths: set[str]
+) -> dict[str, Any]:
+    """Validate the byte-identity delta against the previously reviewed candidate.
+
+    The basis is the predecessor's ``changed_path_hashes`` on the card: a path
+    is ``unchanged_since_reviewed`` when its candidate sha256 equals the
+    predecessor's.  That is the only fact this record asserts -- it carries no
+    prior report, verdict or line map.
+    """
+
+    if not isinstance(value, Mapping):
+        raise ReviewerEvidenceError("invalid_candidate_delta")
+    predecessor_request_id = _identity(
+        value.get("predecessor_request_id"), "predecessor_request_id"
+    )
+    paths = value.get("paths")
+    if not isinstance(paths, Mapping) or set(paths) != changed_paths:
+        raise ReviewerEvidenceError("invalid_candidate_delta")
+    rows: dict[str, dict[str, Any]] = {}
+    for path in sorted(paths):
+        row = paths[path]
+        if not isinstance(row, Mapping):
+            raise ReviewerEvidenceError("invalid_candidate_delta")
+        unchanged = row.get("unchanged_since_reviewed")
+        if not isinstance(unchanged, bool):
+            raise ReviewerEvidenceError("invalid_candidate_delta")
+        predecessor_digest = row.get("predecessor_sha256")
+        if predecessor_digest is not None and (
+            not isinstance(predecessor_digest, str)
+            or not _SHA256_RE.fullmatch(predecessor_digest)
+        ):
+            raise ReviewerEvidenceError("invalid_candidate_delta")
+        rows[path] = {
+            "unchanged_since_reviewed": unchanged,
+            "predecessor_sha256": predecessor_digest,
+        }
+    return {
+        "schema_id": CANDIDATE_DELTA_SCHEMA_ID,
+        "basis": "changed_path_hashes",
+        "predecessor_request_id": predecessor_request_id,
+        "paths": rows,
+    }
 
 
 def _source_evidence_rows(
@@ -2138,13 +2380,30 @@ def _source_evidence_rows(
                 raise ReviewerEvidenceError("invalid_candidate_source_evidence")
         if not excerpt and not omission_reason and not segments:
             raise ReviewerEvidenceError("invalid_candidate_source_evidence")
+        truncated = bool(row.get("truncated"))
+        # ``diff_complete`` is the reviewer-facing promise that every changed
+        # hunk of this path is in the excerpt in full.  A row may only claim
+        # it when nothing was truncated and nothing was omitted (an empty
+        # diff is complete: there was nothing to carry).
+        diff_complete_raw = row.get("diff_complete")
+        if diff_complete_raw is None:
+            diff_complete = not truncated and omission_reason in ("", "empty_diff")
+        elif isinstance(diff_complete_raw, bool):
+            diff_complete = diff_complete_raw
+        else:
+            raise ReviewerEvidenceError("invalid_candidate_source_evidence")
+        if diff_complete and (
+            truncated or omission_reason not in ("", "empty_diff")
+        ):
+            raise ReviewerEvidenceError("invalid_candidate_source_evidence")
         result = {
             "path": path,
             "candidate_sha256": digest,
             "excerpt": excerpt,
             "excerpt_bytes": excerpt_bytes,
             "source_bytes": source_bytes,
-            "truncated": bool(row.get("truncated")),
+            "truncated": truncated,
+            "diff_complete": diff_complete,
             "segments": segments,
         }
         if omission_reason:
@@ -2163,6 +2422,8 @@ __all__ = [
     "RECEIPT_SCHEMA_ID",
     "MAX_SOURCE_EVIDENCE_CHARS",
     "MAX_SOURCE_EVIDENCE_TOTAL_CHARS",
+    "MAX_VALIDATION_OUTPUT_TAIL_CHARS",
+    "REVIEWER_LENSES",
     "FINDING_SEVERITIES",
     "FINDING_DISPOSITIONS",
     "FINDING_CATEGORIES",
@@ -2175,6 +2436,7 @@ __all__ = [
     "QUALITY_REVIEW_FINDING_SCHEMA_DOC",
     "QUALITY_REVIEW_SUBMIT_TOOL_DESCRIPTION",
     "ReviewerEvidenceError",
+    "build_lens_packet",
     "build_review_packet",
     "build_review_prompt",
     "normalize_packet_findings",

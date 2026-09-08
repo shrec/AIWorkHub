@@ -195,7 +195,7 @@ def _record(
 # The editor bridge dispatches a fixed tool allowlist; anything outside it
 # returns ``worker_bridge_tool_not_allowed``.  That allowlist is the ground
 # truth for what an editor-hosted worker can and cannot do.
-_EDITOR_BRIDGE_DISPATCH = "src/aiworkhub/process_launcher.py:11572-11651"
+_EDITOR_BRIDGE_DISPATCH = "src/aiworkhub/process_launcher.py:12093-12172"
 
 _EDITOR_VSCODE_LM_CONTRACT = RouteContract(
     route_family=runtime_adapters.ROUTE_FAMILY_EDITOR_VSCODE_LM,
@@ -232,7 +232,7 @@ _EDITOR_VSCODE_LM_CONTRACT = RouteContract(
             ),
             # NOT MEASURED.  Note carefully what is and is not known here.
             # The bridge DOES dispatch ``aiworkhub_worker_quality_review_submit``
-            # (process_launcher.py:11641-11650), so the common claim that "the
+            # (process_launcher.py:11983-11992), so the common claim that "the
             # vscode_lm transport does not carry submit" is false at the
             # dispatcher.  But that tool is not the canonical path: the reviewer
             # prompt bans every submission tool and the supervisor ingests the

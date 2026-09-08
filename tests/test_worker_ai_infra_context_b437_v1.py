@@ -270,8 +270,13 @@ def test_common_prompt_delivery_and_receipt_are_distinct(
         for runner in ("codex_b437", "claude_b437", "deepseek_b437")
     ]
     assert prompts[0].split("PROJECT_CONTEXT_BUNDLE:", 1)[1] == prompts[1].split("PROJECT_CONTEXT_BUNDLE:", 1)[1]
-    assert "PROJECT_CONTEXT_RECEIPT" in prompts[2]
-    assert context_result.metadata["bundle_sha256"] in prompts[2]
+    # worker_prompt-3: the prompt carries the bundle but no longer asks the
+    # model to copy the coordinator's own sha back; acknowledgement is derived
+    # server-side (coordinator_prompt_binding). The receipt parser below stays
+    # as optional telemetry for workers that still emit the line.
+    assert "PROJECT_CONTEXT_BUNDLE:" in prompts[2]
+    assert "PROJECT_CONTEXT_RECEIPT" not in prompts[2]
+    assert "no acknowledgement line is required" in prompts[2]
     output = tmp_path / "stdout.log"
     output.write_text(
         "PROJECT_CONTEXT_RECEIPT: "

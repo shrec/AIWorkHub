@@ -165,6 +165,18 @@ TRANSIENT_DENIAL_REASONS = frozenset(
         "required_output_not_allowed",
         "required_output_path_invalid",
         "required_outputs_invalid",
+        # -- launch-identity DERIVATION (process_launcher.derive_launch_identity).
+        # ``launch_identity_underivable`` fires when the card row carries no
+        # runner/topic, and ``launch_adapter_underivable`` when no adapter in the
+        # runner family's tuple passes repo policy for this card. Both read the
+        # card, and both belong here for the same reason as the contract-shape
+        # family above: the card row is repairable, and a repaired row releases
+        # the hold anyway. The adapter one additionally quotes the repo-policy
+        # verdict that refused each candidate, so a genuine ``repo_policy_*``
+        # detail inside it is still claimed deterministic by the family rule --
+        # which is exactly how the same policy denial is classified on its own.
+        "launch_adapter_underivable",
+        "launch_identity_underivable",
         # -- lifecycle and claim races.  Every one of these depends on who else
         # is holding the row right now, which is exactly what a retry resolves.
         "card_scoped_action_not_allowed",
@@ -207,6 +219,14 @@ TRANSIENT_DENIAL_REASONS = frozenset(
         "vscode_lm_unavailable",
         "quality_review_source_graph_authority_unverified",
         "quality_review_source_graph_prewarm_failed",
+        # -- the reviewer packet the LAUNCHER derives, not a card field.
+        # process_launcher_launch_isolated.py:436-448 refuses a packet whose
+        # candidate.scoped_audits carry any lens but the one being launched.
+        # That operand is quality_reviewer.build_lens_packet's output over the
+        # candidate's evidence, supplied through the caller's binding; a
+        # correctly scoped rebuild clears it with no card-row change, so the
+        # fail-closed rule above disclaims it rather than claiming it.
+        "quality_review_packet_lens_scope_mismatch",
         # -- host, filesystem and external roots.
         "external_readonly_root_not_directory",
         "external_readonly_root_unavailable",

@@ -1781,6 +1781,193 @@ def summarize_card_baselines(value: Any, *, depth: int = 0) -> Any:
     return value
 
 
+# The baseline fold above covers the three hash maps only. Evidence blobs --
+# raw validation stdout, quality-gate reports, worker-MCP-gate receipts -- are
+# never folded and dominate a summary-mode card: over the 400 most recent
+# terminal cards, terminal_review.evidence + accept_evidence are 58% (p50) /
+# 65% (p90) of the summary render, evidence.validation alone 72% of that, and
+# the manager extracts verdict, failing command and counts by eye or spills
+# the reply to disk and dissects it with jq. Verdict, failed_count, the first
+# failure and a content hash are derivable here; the full blob stays in the
+# store and one ``detail="evidence"`` call away.
+CARD_EVIDENCE_PATHS: tuple[tuple[str, ...], ...] = (
+    ("terminal_review", "evidence", "validation"),
+    ("terminal_review", "evidence", "quality_gate"),
+    ("terminal_review", "evidence", "quality_review"),
+    ("terminal_review", "evidence", "quality_review_receipt"),
+    ("terminal_review", "evidence", "worker_mcp_gate"),
+    ("terminal_review", "evidence", "workspace"),
+    ("accept_evidence", "validation"),
+    ("accept_evidence", "quality_gate"),
+)
+EVENT_EVIDENCE_PATHS: tuple[tuple[str, ...], ...] = (
+    ("validation",),
+    ("quality_gate",),
+    ("worker_mcp_gate",),
+    ("token_budget",),
+    ("project_context",),
+)
+_EVIDENCE_ERROR_CHARS = 300
+_EVIDENCE_LIST_PREVIEW = 8
+
+
+def _evidence_identity(value: Any) -> tuple[int, str]:
+    canonical = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+    encoded = canonical.encode("utf-8")
+    return len(encoded), hashlib.sha256(encoded).hexdigest()
+
+
+def _evidence_text(*candidates: Any) -> str:
+    for candidate in candidates:
+        if isinstance(candidate, list):
+            candidate = " ".join(str(part) for part in candidate)
+        text = str(candidate or "").strip()
+        if text:
+            return text[:_EVIDENCE_ERROR_CHARS]
+    return ""
+
+
+def _fold_validation(entries: list[Any], folded: dict[str, Any]) -> None:
+    rows = [entry for entry in entries if isinstance(entry, dict)]
+    failed = [
+        entry for entry in rows
+        if entry.get("timed_out") or entry.get("returncode") not in (0, None)
+    ]
+    folded["verdict"] = "failed" if failed else ("passed" if rows else "empty")
+    folded["command_count"] = len(rows)
+    folded["failed_count"] = len(failed)
+    if failed:
+        first = failed[0]
+        folded["first_failure"] = {
+            "command": _evidence_text(first.get("command"), first.get("declared_command")),
+            "rc": first.get("returncode"),
+            "error": _evidence_text(
+                first.get("error"), first.get("stderr_tail"), first.get("stderr_head"),
+                first.get("stdout_tail"),
+            ),
+        }
+
+
+def _fold_quality_gate(value: dict[str, Any], folded: dict[str, Any]) -> None:
+    passed = value.get("passed")
+    if passed is True:
+        folded["verdict"] = "passed"
+    elif passed is False:
+        folded["verdict"] = "failed"
+    else:
+        folded["verdict"] = str(value.get("quality_verdict") or value.get("reason") or "not_applicable")
+    checks = [check for check in (value.get("checks") or []) if isinstance(check, dict)]
+    failed = [
+        check for check in checks
+        if check.get("passed") is False
+        or str(check.get("status") or "").lower() in {"failed", "error", "blocked", "timeout"}
+    ]
+    folded["check_count"] = len(checks)
+    folded["failed_count"] = len(failed)
+    folded["blocking_count"] = len(value.get("blocking_checks") or [])
+    if value.get("reason"):
+        folded["reason"] = _evidence_text(value.get("reason"))
+    if failed:
+        first = failed[0]
+        folded["first_failure"] = {
+            "command": _evidence_text(
+                first.get("executed_command"), first.get("command"), first.get("check_id")
+            ),
+            "rc": first.get("returncode"),
+            "error": _evidence_text(first.get("error"), first.get("summary")),
+        }
+
+
+def _fold_worker_mcp_gate(value: dict[str, Any], folded: dict[str, Any]) -> None:
+    missing = list(value.get("missing_tools") or [])
+    stale = list(value.get("stale_tools") or [])
+    folded["status"] = "satisfied" if value.get("satisfied") else "unsatisfied"
+    folded["gated"] = bool(value.get("gated"))
+    folded["failed_count"] = len(missing) + len(stale)
+    if missing:
+        folded["missing_tools"] = [str(tool) for tool in missing[:_EVIDENCE_LIST_PREVIEW]]
+    if stale:
+        folded["stale_tools"] = [str(tool) for tool in stale[:_EVIDENCE_LIST_PREVIEW]]
+    if value.get("reason"):
+        folded["reason"] = _evidence_text(value.get("reason"))
+
+
+def _fold_evidence(key: str, value: Any) -> Any:
+    """Fold one evidence blob to identity plus the facts a review reads."""
+
+    if not isinstance(value, (dict, list)):
+        return value
+    size, digest = _evidence_identity(value)
+    folded: dict[str, Any] = {"summarized": True, "bytes": size, "sha256": digest}
+    if key == "validation" and isinstance(value, list):
+        _fold_validation(value, folded)
+    elif key == "quality_gate" and isinstance(value, dict):
+        _fold_quality_gate(value, folded)
+    elif key == "worker_mcp_gate" and isinstance(value, dict):
+        _fold_worker_mcp_gate(value, folded)
+    elif key == "token_budget" and isinstance(value, dict):
+        folded["status"] = "enforcing" if value.get("enforcing") else (
+            "observed" if value.get("telemetry_observed") else "unobserved"
+        )
+        for field in ("accepted_total_tokens", "cap_tokens", "report_count"):
+            folded[field] = value.get(field)
+    elif key == "project_context" and isinstance(value, dict):
+        folded["status"] = "delivered" if value.get("bundle_bytes") else "absent"
+        folded["bundle_bytes"] = value.get("bundle_bytes")
+        folded["bundle_sha256"] = value.get("bundle_sha256")
+    elif key == "workspace" and isinstance(value, dict):
+        folded["request_id"] = value.get("request_id")
+        folded["path"] = value.get("path")
+        folded["base_oid"] = value.get("base_oid")
+        folded["allowed_writes_count"] = len(value.get("allowed_writes") or [])
+        folded["inherited_rework_paths_count"] = len(value.get("inherited_rework_paths") or [])
+    elif key == "quality_review" and isinstance(value, dict):
+        for field in ("lens", "adapter_id", "packet_sha256", "target_request_id"):
+            folded[field] = value.get(field)
+    elif key == "quality_review_receipt" and isinstance(value, dict):
+        report = value.get("report") if isinstance(value.get("report"), dict) else {}
+        authority = value.get("authority") if isinstance(value.get("authority"), dict) else {}
+        folded["status"] = authority.get("terminal_state")
+        folded["lens"] = report.get("lens")
+        folded["provider"] = report.get("provider")
+        folded["findings_count"] = len(report.get("findings") or [])
+        folded["submission_id"] = value.get("submission_id")
+        folded["packet_sha256"] = value.get("packet_sha256")
+    if isinstance(value, dict):
+        folded["keys"] = sorted(str(item) for item in value)[:16]
+    return folded
+
+
+def summarize_evidence(
+    value: Any, *, paths: tuple[tuple[str, ...], ...] = CARD_EVIDENCE_PATHS
+) -> Any:
+    """Return a copy of ``value`` with the named evidence blobs folded.
+
+    ``paths`` defaults to the card paths (``terminal_review.evidence.*`` and
+    ``accept_evidence.*``); pass ``EVENT_EVIDENCE_PATHS`` for a process
+    event row. Only dicts along a path are copied, so the stored object is
+    never mutated and unrelated fields are exact.
+    """
+
+    if not isinstance(value, dict):
+        return value
+    result = dict(value)
+    for path in paths:
+        *parents, leaf = path
+        node = result
+        for key in parents:
+            child = node.get(key)
+            if not isinstance(child, dict):
+                node = None
+                break
+            child = dict(child)
+            node[key] = child
+            node = child
+        if node is not None and isinstance(node.get(leaf), (dict, list)):
+            node[leaf] = _fold_evidence(leaf, node[leaf])
+    return result
+
+
 def show_task(task_id: str, *, full: bool = True) -> dict[str, Any]:
     command = ["show", task_id]
     try:
@@ -2458,53 +2645,243 @@ MCP_MANAGER_CONTRACT_BANNER = (
 )
 
 
-def manager_bootstrap() -> dict[str, Any]:
-    """Compact, model-readable manager contract for a newly attached chat."""
-    hygiene: dict[str, Any] = {"state": "disabled"}
-    if os.environ.get("AIWORKHUB_ALLOW_WRITES") == "1":
-        try:
-            config = task_retention.hygiene_config()
-            canonical_root = repo_root().resolve()
-            repository_key = str(canonical_root)
-            monotonic_now = time.monotonic()
-            with _TASK_HYGIENE_LOCK:
-                last_run = _TASK_HYGIENE_LAST_RUNS.get(repository_key)
-                due = (
-                    last_run is None
-                    or monotonic_now - last_run >= config["interval_seconds"]
-                )
-                if due:
-                    # Reserve this repository's interval before running. The
-                    # bounded map prevents route changes from suppressing other
-                    # repositories or growing process state without limit.
-                    if (
-                        repository_key not in _TASK_HYGIENE_LAST_RUNS
-                        and len(_TASK_HYGIENE_LAST_RUNS) >= _TASK_HYGIENE_REPOSITORY_LIMIT
-                    ):
-                        del _TASK_HYGIENE_LAST_RUNS[next(iter(_TASK_HYGIENE_LAST_RUNS))]
-                    _TASK_HYGIENE_LAST_RUNS[repository_key] = monotonic_now
+# ---------------------------------------------------------------------------
+# Manager bootstrap: an identity block on every call, the contract prose once.
+#
+# Measured 2026-09-08 over 53 bootstraps in 27 manager sessions: the p50 reply
+# was 5,718 B, of which 5,538 B (97%) was byte-identical prose already resident
+# in CLAUDE.md and in the FastMCP instructions banner; 31 of the 53 calls were
+# repeat bootstraps that kept that prose resident for p50 183 further turns,
+# and the only dynamic part -- role, provider, repo, route -- was 288 B.  The
+# follow-up aiworkhub_repo_current / aiworkhub_task_health calls repeated the
+# dynamic part (29 turns), and task hygiene ran on the request path (p50
+# 2.77 s per bootstrap).
+#
+# The contract is now one module constant with one sha, delivered to a
+# verified session once (or whenever it asks with include_contract=true); the
+# identity block carries repository_current, task_health and the dispatcher
+# state so the start sequence is one call; hygiene runs off the request path
+# and its last result is readable here.
+# ---------------------------------------------------------------------------
+MANAGER_BOOTSTRAP_SCHEMA_ID = "aiworkhub.manager_bootstrap.v2"
+MANAGER_CONTRACT_VERSION = "aiworkhub.manager_operating_contract.v2"
+_CONTRACT_DELIVERY_LOCK = threading.Lock()
+_CONTRACT_DELIVERIES: dict[str, str] = {}
+_CONTRACT_DELIVERY_LIMIT = 256
+_TASK_HYGIENE_LAST_RESULTS: dict[str, dict[str, Any]] = {}
+_TASK_HYGIENE_INFLIGHT: set[str] = set()
+
+
+def _run_off_request_path(target: Any, *, name: str) -> None:
+    """Run ``target`` (a zero-argument callable) on a daemon thread, after the
+    current reply is free to return.  Tests replace this to run inline."""
+    threading.Thread(target=target, name=name, daemon=True).start()
+
+
+def _prune_stale_callbacks(canonical_root: Path) -> dict[str, Any]:
+    """Supersede pending callback rows whose task left its terminal state.
+
+    Measured 2026-09-08: 84 pending Claude outbox rows (age p50 124 h) whose
+    tasks were long superseded/archived fenced task hygiene (``callback_live``
+    x22 on every run) and were pruned only inside the route rebind of an
+    optional manager call.  The rule is the store's own
+    ``_task_still_in_matching_terminal_state``; a wake for a task still in
+    review stays pending.  Also run by the reconciler GC pass.
+    """
+    try:
+        conn = callback_store.open_db(callback_store.resolve_db_path(canonical_root))
+    except Exception as exc:  # noqa: BLE001 -- hygiene is best effort, never a gate
+        return {"state": "skipped", "reason": f"{type(exc).__name__}"[:80]}
+    try:
+        return {"state": "completed", **callback_store.prune_stale_pending_callbacks(conn)}
+    except Exception as exc:  # noqa: BLE001 -- see above
+        return {"state": "skipped", "reason": f"{type(exc).__name__}"[:80]}
+    finally:
+        conn.close()
+
+
+def _task_hygiene_pass(canonical_root: Path) -> dict[str, Any]:
+    """One hygiene pass for one repository: stale-callback prune, then the
+    bounded archive sweep.  Runs off the request path; its result is kept for
+    the next bootstrap to report."""
+    key = str(canonical_root)
+    result: dict[str, Any]
+    try:
+        prune = _prune_stale_callbacks(canonical_root)
+        hygiene = task_retention.run_automatic_hygiene(canonical_root)
+        result = {
+            field: hygiene.get(field, 0)
+            for field in ("scanned", "eligible", "archived", "skipped")
+        }
+        result["reasons"] = dict(list((hygiene.get("reasons") or {}).items())[:12])
+        result["state"] = "completed" if hygiene.get("ok") else "skipped"
+        result["callback_prune"] = prune
+    except Exception as exc:  # noqa: BLE001 -- a hygiene fault is reported, never raised
+        result = {"state": "skipped", "reasons": {type(exc).__name__: 1}}
+    result["completed_at"] = datetime.now(timezone.utc).isoformat()
+    with _TASK_HYGIENE_LOCK:
+        if (
+            key not in _TASK_HYGIENE_LAST_RESULTS
+            and len(_TASK_HYGIENE_LAST_RESULTS) >= _TASK_HYGIENE_REPOSITORY_LIMIT
+        ):
+            del _TASK_HYGIENE_LAST_RESULTS[next(iter(_TASK_HYGIENE_LAST_RESULTS))]
+        _TASK_HYGIENE_LAST_RESULTS[key] = result
+        _TASK_HYGIENE_INFLIGHT.discard(key)
+    return result
+
+
+def _schedule_task_hygiene() -> dict[str, Any]:
+    """Throttled, per-repository, off-request-path hygiene scheduling.
+
+    Returns the ``task_hygiene`` block: ``state`` is scheduled / running /
+    throttled / disabled / skipped, and ``last`` is the most recent completed
+    pass for this repository (empty until one has finished).
+    """
+    if os.environ.get("AIWORKHUB_ALLOW_WRITES") != "1":
+        return {"state": "disabled"}
+    try:
+        config = task_retention.hygiene_config()
+        canonical_root = repo_root().resolve()
+        key = str(canonical_root)
+        monotonic_now = time.monotonic()
+        with _TASK_HYGIENE_LOCK:
+            last_run = _TASK_HYGIENE_LAST_RUNS.get(key)
+            inflight = key in _TASK_HYGIENE_INFLIGHT
+            due = not inflight and (
+                last_run is None or monotonic_now - last_run >= config["interval_seconds"]
+            )
             if due:
-                result = task_retention.run_automatic_hygiene(canonical_root)
-                hygiene = {
-                    key: result.get(key, 0)
-                    for key in ("scanned", "eligible", "archived", "skipped")
-                }
-                hygiene["reasons"] = dict(list((result.get("reasons") or {}).items())[:12])
-                hygiene["state"] = "completed" if result.get("ok") else "skipped"
-            else:
-                hygiene = {"state": "throttled"}
-        except Exception as exc:  # bootstrap must remain available during hygiene faults
-            hygiene = {"state": "skipped", "reasons": {type(exc).__name__: 1}}
-    identity = _claude_manager_identity() or _codex_manager_identity()
-    provider = str((identity or {}).get("provider") or _current_chat_provider())
+                # Reserve this repository's interval before running. The
+                # bounded map prevents route changes from suppressing other
+                # repositories or growing process state without limit.
+                if (
+                    key not in _TASK_HYGIENE_LAST_RUNS
+                    and len(_TASK_HYGIENE_LAST_RUNS) >= _TASK_HYGIENE_REPOSITORY_LIMIT
+                ):
+                    del _TASK_HYGIENE_LAST_RUNS[next(iter(_TASK_HYGIENE_LAST_RUNS))]
+                _TASK_HYGIENE_LAST_RUNS[key] = monotonic_now
+                _TASK_HYGIENE_INFLIGHT.add(key)
+        if due:
+            state = "scheduled"
+            try:
+                _run_off_request_path(
+                    lambda: _task_hygiene_pass(canonical_root),
+                    name=f"aiworkhub-task-hygiene:{canonical_root.name}",
+                )
+            except Exception:
+                with _TASK_HYGIENE_LOCK:
+                    _TASK_HYGIENE_INFLIGHT.discard(key)
+                raise
+        else:
+            state = "running" if inflight else "throttled"
+        with _TASK_HYGIENE_LOCK:
+            last = dict(_TASK_HYGIENE_LAST_RESULTS.get(key) or {})
+        return {"state": state, "off_request_path": True, "last": last}
+    except Exception as exc:  # noqa: BLE001 -- bootstrap must remain available during hygiene faults
+        return {"state": "skipped", "reasons": {type(exc).__name__: 1}}
+
+
+def task_hygiene_status() -> dict[str, Any]:
+    """Read-only: the last off-request-path hygiene result for this repository
+    (what ``task_health`` can report without running anything)."""
+    key = str(repo_root().resolve())
+    with _TASK_HYGIENE_LOCK:
+        return {
+            "inflight": key in _TASK_HYGIENE_INFLIGHT,
+            "last": dict(_TASK_HYGIENE_LAST_RESULTS.get(key) or {}),
+        }
+
+
+def _repository_binding_source() -> str:
+    if os.environ.get("AIWORKHUB_REPO_ROOT", "").strip():
+        return "explicit_repo_child"
+    if _PROCESS_REPO_ROOT_OVERRIDE is not None:
+        return "manager_switch"
+    if os.environ.get("AIWORKHUB_REPO", "").strip():
+        return "legacy_explicit"
+    if _implicit_codex_repository_root() is not None:
+        return "live_codex_route"
+    return "process_cwd"
+
+
+def _bootstrap_task_health(root: Path, readiness: Any) -> dict[str, Any]:
+    """The ``aiworkhub_task_health`` facts, folded into the identity block."""
+    ready = bool(getattr(readiness, "ready", False))
+    health: dict[str, Any] = {
+        "ok": ready,
+        "writes_allowed": writes_allowed(),
+        "storage_ready": ready,
+        "storage_reason": str(getattr(readiness, "reason", "") or ""),
+    }
+    try:
+        from . import task_reconciler  # local import: cycle-safe
+
+        reconciler = task_reconciler.reconciler_health(root)
+        health["reconciler"] = {
+            key: reconciler.get(key)
+            for key in (
+                "ok", "running", "active_owner", "durable_status_present",
+                "durable_scan_stale", "durable_scan_age_seconds", "last_error",
+                "startup_error",
+            )
+            if key in reconciler
+        }
+    except Exception as exc:  # noqa: BLE001 -- health must never fail closed
+        health["reconciler"] = {
+            "ok": False,
+            "last_error": f"reconciler_health_unavailable:{type(exc).__name__}",
+        }
+    try:
+        from . import learning_commit_store  # local import: cycle-safe
+
+        coverage = learning_commit_store.coverage(root)
+        health["learning_coverage"] = {
+            key: value
+            for key, value in coverage.items()
+            if value is None or isinstance(value, (str, int, float, bool))
+        }
+    except Exception as exc:  # noqa: BLE001 -- health must never fail closed
+        health["learning_coverage"] = {
+            "ok": False,
+            "last_error": f"learning_coverage_unavailable:{type(exc).__name__}",
+        }
+    return health
+
+
+def _bootstrap_dispatcher(identity: Mapping[str, str] | None, provider: str) -> dict[str, Any]:
+    """Ensure the callback inbox on the Claude route from bootstrap itself, so
+    the CLI-route manager no longer types aiworkhub_dispatcher_ensure_started
+    (15 solo turns / 7.0M input tokens in the measured sample).  The codex
+    route is extension-owned and untouched."""
+    if not identity or provider != "claude":
+        return {
+            "ensured": False,
+            "status": "not_applicable",
+            "reason": "claude_route_only:extension_owns_codex_dispatch",
+        }
+    try:
+        result = dispatcher_ensure_started()
+    except Exception as exc:  # noqa: BLE001 -- bootstrap must remain available
+        return {"ensured": False, "status": "error", "reason": f"{type(exc).__name__}:{exc}"[:200]}
+    compact = {
+        key: result.get(key)
+        for key in (
+            "ok", "status", "provider", "reason", "dispatcher_started",
+            "rebound_callback_count", "seeded_review_callback_count",
+        )
+        if key in result
+    }
+    return {"ensured": True, **compact}
+
+
+def _manager_contract() -> dict[str, Any]:
+    """The static manager contract; built once into ``MANAGER_CONTRACT``.
+
+    The banner is deliberately not repeated here: it is the FastMCP
+    ``instructions`` text (``MCP_MANAGER_CONTRACT_BANNER``) the host already
+    holds for the whole session.
+    """
     return {
-        "ok": True,
-        "schema_id": "aiworkhub.manager_bootstrap.v1",
-        "role": "manager" if identity else "worker_or_unverified_client",
-        "provider": provider,
-        "repo": str(repo_root()),
-        "manager_route": identity or {},
-        "task_hygiene": hygiene,
         "responsibility_matrix": {
             "schema_id": "aiworkhub.manager_responsibility_matrix.v1",
             "aiworkhub_system": {
@@ -2648,22 +3025,180 @@ def manager_bootstrap() -> dict[str, Any]:
     }
 
 
+# Built once at import: the contract is static, so its identity is a constant.
+# Only the sha is taken from this object -- a delivery is a fresh
+# ``_manager_contract()`` so no caller can mutate the module constant, and the
+# sha is therefore stable for the life of the process.
+MANAGER_CONTRACT: dict[str, Any] = _manager_contract()
+MANAGER_CONTRACT_SHA256: str = hashlib.sha256(
+    json.dumps(
+        MANAGER_CONTRACT, sort_keys=True, separators=(",", ":"), default=str
+    ).encode("utf-8")
+).hexdigest()
+
+
+def _remember_contract_delivery(session_id: str) -> None:
+    """Record that ``session_id`` holds the current contract sha.
+
+    Bounded exactly like the hygiene maps: a long-lived server must not grow
+    one entry per session forever, so the oldest entry is evicted at
+    ``_CONTRACT_DELIVERY_LIMIT``.  Evicting a session only re-delivers prose it
+    already has; it can never suppress prose a session lacks.
+    """
+    with _CONTRACT_DELIVERY_LOCK:
+        if (
+            session_id not in _CONTRACT_DELIVERIES
+            and len(_CONTRACT_DELIVERIES) >= _CONTRACT_DELIVERY_LIMIT
+        ):
+            del _CONTRACT_DELIVERIES[next(iter(_CONTRACT_DELIVERIES))]
+        _CONTRACT_DELIVERIES[session_id] = MANAGER_CONTRACT_SHA256
+
+
+def _contract_delivery_decision(
+    session_id: str, known_contract_sha256: str, include_contract: bool
+) -> tuple[bool, str]:
+    """Decide whether this reply carries the contract prose, and say why.
+
+    Deliver when the caller asks for it, when the sha it says it holds is not
+    the current one, or when this session has not been sent the current sha
+    yet.  A session that proves it already holds the current sha is recorded
+    and suppressed from then on.  Without a session id there is nothing to
+    remember, so prose is never suppressed -- an unverified client keeps the
+    schema v1 reply shape exactly.
+
+    KNOWN CONSEQUENCE, stated where it is decided: ``manager_bootstrap`` is
+    also the route gate for every manager AI/recipe/skill tool, for the
+    dashboard snapshot and for the launcher's write-intent surfaces, and those
+    callers share this session id while discarding the prose.  Whichever of
+    them calls first consumes the one delivery, so a model whose first action
+    is not its own bootstrap can see a suppressed reply.  Recovery is one call
+    (``include_contract=True``, named in ``contract_recall`` on every
+    suppressed reply) -- but the MCP wrapper must expose that argument for the
+    model to reach it.
+    """
+    known = str(known_contract_sha256 or "").strip().lower()
+    if known and known != MANAGER_CONTRACT_SHA256:
+        return True, "contract_sha_changed"
+    if include_contract:
+        return True, "requested"
+    if not session_id:
+        return True, "unverified_session"
+    with _CONTRACT_DELIVERY_LOCK:
+        held = _CONTRACT_DELIVERIES.get(session_id) == MANAGER_CONTRACT_SHA256
+    if held:
+        return False, "already_delivered_this_session"
+    if known == MANAGER_CONTRACT_SHA256:
+        _remember_contract_delivery(session_id)
+        return False, "caller_holds_current_contract"
+    return True, "first_delivery_this_session"
+
+
+def manager_bootstrap(
+    *,
+    include_contract: bool = False,
+    known_contract_sha256: str = "",
+    bootstrap_call: bool = False,
+) -> dict[str, Any]:
+    """The manager start sequence in one call.
+
+    Every reply carries the identity block: the route facts every caller gates
+    on (``role``, ``provider``, ``repo``, ``manager_route``), the
+    ``repository_current`` facts (``repo_id``, ``storage_ready``,
+    ``storage_reason``, ``binding_source``, ``manager_verified``) through the
+    shared :func:`_repository_binding_source`, the ``task_health`` facts, the
+    last off-request-path hygiene result, the Claude-route dispatcher state,
+    and the contract's version and sha.  ``repository_current`` and
+    ``task_health`` therefore no longer need a call of their own.
+
+    The contract prose (``responsibility_matrix``, ``operating_contract``,
+    ``workflow``, ``callback``, ``rules``) is folded in only when it is due --
+    see :func:`_contract_delivery_decision`.  ``contract_delivered`` says which
+    reply this is and ``contract_sha256`` is what a caller passes back as
+    ``known_contract_sha256`` to keep it suppressed.  The prose itself is
+    byte-identical to schema v1; what v2 changes is which replies carry it.
+
+    ``bootstrap_call`` is True only when the MCP bootstrap tool is the caller.
+    This function is ALSO the route gate for every manager AI/recipe/skill
+    tool, for the dashboard snapshot and for the launcher's write-intent
+    surfaces, and those callers share one session id and discard the prose.
+    If a gate call consumed the session's single delivery, the model whose own
+    bootstrap came later would get a suppressed reply it never asked for; and
+    the Claude-route dispatcher's real database work (rebind pending callbacks,
+    seed review callbacks) would run on every gate check instead of once per
+    bootstrap.  So a gate call keeps the schema v1 behaviour exactly: full
+    prose, no delivery ledger entry, no dispatcher side effect.
+    """
+
+    # Scheduled first so the sweep overlaps the reads below instead of the
+    # request path; the reply reports the last *completed* pass, never this one.
+    hygiene = _schedule_task_hygiene()
+    identity = _claude_manager_identity() or _codex_manager_identity()
+    provider = str((identity or {}).get("provider") or _current_chat_provider())
+    root = repo_root()
+    try:
+        readiness: Any = task_store.storage_readiness(root)
+        storage_reason = str(getattr(readiness, "reason", "") or "")
+    except Exception as exc:  # noqa: BLE001 -- bootstrap must remain available
+        readiness = None
+        storage_reason = f"storage_readiness_unavailable:{type(exc).__name__}"
+    try:
+        from ._version import __version__ as server_version
+    except Exception:  # noqa: BLE001 -- the version is reported, never required
+        server_version = ""
+    session_id = str(
+        (identity or {}).get("session_id") or (identity or {}).get("thread_id") or ""
+    ).strip()
+    if bootstrap_call:
+        deliver, delivery_reason = _contract_delivery_decision(
+            session_id, known_contract_sha256, include_contract
+        )
+        dispatcher = _bootstrap_dispatcher(identity, provider)
+    else:
+        deliver, delivery_reason = True, "route_gate_call"
+        dispatcher = {
+            "ensured": False,
+            "status": "not_evaluated",
+            "reason": "route_gate_call:the_bootstrap_tool_ensures_the_dispatcher",
+        }
+    reply: dict[str, Any] = {
+        "ok": True,
+        "schema_id": MANAGER_BOOTSTRAP_SCHEMA_ID,
+        "role": "manager" if identity else "worker_or_unverified_client",
+        "provider": provider,
+        "repo": str(root),
+        "repo_id": str(getattr(readiness, "repo_id", "") or ""),
+        "storage_ready": bool(getattr(readiness, "ready", False)),
+        "storage_reason": storage_reason,
+        "binding_source": _repository_binding_source(),
+        "manager_verified": bool(identity),
+        "manager_route": identity or {},
+        "server_version": str(server_version),
+        "task_hygiene": hygiene,
+        "task_health": _bootstrap_task_health(root, readiness),
+        "dispatcher": dispatcher,
+        "contract_version": MANAGER_CONTRACT_VERSION,
+        "contract_sha256": MANAGER_CONTRACT_SHA256,
+        "contract_delivered": deliver,
+        "contract_delivery_reason": delivery_reason,
+    }
+    if deliver:
+        reply.update(_manager_contract())
+        if bootstrap_call and session_id:
+            _remember_contract_delivery(session_id)
+    else:
+        reply["contract_recall"] = (
+            "aiworkhub_manager_bootstrap(include_contract=true) re-delivers the "
+            "contract prose; it is unchanged while contract_sha256 is unchanged."
+        )
+    return reply
+
+
 def repository_current() -> dict[str, Any]:
     """Return the exact process/repository authority currently in effect."""
 
     root = repo_root()
     readiness = task_store.storage_readiness(root)
     identity = _claude_manager_identity() or _codex_manager_identity()
-    if os.environ.get("AIWORKHUB_REPO_ROOT", "").strip():
-        binding_source = "explicit_repo_child"
-    elif _PROCESS_REPO_ROOT_OVERRIDE is not None:
-        binding_source = "manager_switch"
-    elif os.environ.get("AIWORKHUB_REPO", "").strip():
-        binding_source = "legacy_explicit"
-    elif _implicit_codex_repository_root() is not None:
-        binding_source = "live_codex_route"
-    else:
-        binding_source = "process_cwd"
     return {
         "ok": bool(readiness.ready),
         "schema_id": "aiworkhub.repository_current.v1",
@@ -2671,7 +3206,7 @@ def repository_current() -> dict[str, Any]:
         "repo_root": str(root),
         "storage_ready": bool(readiness.ready),
         "storage_reason": str(readiness.reason or ""),
-        "binding_source": binding_source,
+        "binding_source": _repository_binding_source(),
         "manager_verified": bool(identity),
         "manager_route": identity or {},
     }
@@ -2974,6 +3509,132 @@ def card_scope_warnings(card: dict[str, Any]) -> list[str]:
     return sorted(warnings)
 
 
+# A ``.py`` token inside a validation command. Deliberately the same shape as
+# ``_OBJECTIVE_PATH_TOKEN_RE`` narrowed to Python, because a validation command
+# is already a validated single-space-split argv: every token is either a flag,
+# a pytest node id, or a repo-relative path.
+_VALIDATION_PY_TOKEN_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./-]*\.py")
+_PRODUCTION_ROOT = "src/"
+
+
+def _looks_like_test_path(path: str) -> bool:
+    posix = path.replace("\\", "/")
+    if not posix.endswith(".py"):
+        return False
+    return posix.startswith("tests/") or posix.rsplit("/", 1)[-1].startswith("test_")
+
+
+def card_test_scope_warnings(
+    card: dict[str, Any], *, repo: Path | None = None
+) -> dict[str, Any]:
+    """Tests the card's own contract needs that ``allowed_writes`` cannot reach.
+
+    ``card_scope_warnings`` cross-references only path tokens in the objective
+    against ``scope_files``; it never looks at the card's tests. Measured over
+    1,624 writable worker cards in this repository's task queue: 225 (13.9%)
+    name a test file in a validation command that ``allowed_writes`` does not
+    cover, and 571 (35.2%) declare a ``src/aiworkhub`` production path whose
+    same-stem ``tests/test_<stem>.py`` exists on disk and is absent from
+    ``allowed_writes``. Either shape makes correct work unwinnable: the worker
+    must change the test that asserts the contract it was asked to change, and
+    cannot write it.
+
+    Two deterministic, filesystem-only sources, so this costs nothing at create
+    and cannot vary between two calls on one card:
+
+    * ``validation_command`` -- a test path named by a command the card itself
+      declares. The strongest evidence there is: the card will be REJECTED on
+      that command's result.
+    * ``same_stem`` -- ``tests/test_<stem>.py`` exists on disk for a declared
+      production path.
+
+    A path the card explicitly declares read-only (``read_first``,
+    ``immutable_inputs``, ``forbidden``) is a deliberate manager decision and is
+    reported under ``suppressed_read_only`` instead of warned about; 132 of the
+    357 naive validation-command matches in the corpus are exactly that.
+
+    Richer evidence exists and is deliberately not consulted here: Source Graph
+    ``testmap``/``impact`` and ``quality_review_scope`` know the callers and the
+    indexed test-to-symbol edges, but both need an index that may be stale or
+    absent, and a creation-time advisory may not depend on a surface that can
+    fail. The manager can still run ``testmap`` before deciding.
+
+    Advisory only. This NEVER widens ``allowed_writes``: it returns the paths
+    and lets the manager decide.
+    """
+    repo_path = repo if repo is not None else repo_root()
+    writes = [
+        path
+        for path in (_task_contract_path(v) for v in card.get("allowed_writes") or [])
+        if path
+    ]
+    read_only_evidence: set[str] = set()
+    for field in ("read_first", "immutable_inputs", "forbidden"):
+        for value in card.get(field) or []:
+            declared = _task_contract_path(value)
+            if declared:
+                read_only_evidence.add(declared)
+
+    def covered(path: str) -> bool:
+        return any(_task_contract_paths_overlap(path, allowed) for allowed in writes)
+
+    findings: dict[str, dict[str, Any]] = {}
+    suppressed: list[str] = []
+
+    def record(path: str, source: str, detail: str) -> None:
+        if covered(path):
+            return
+        if path in read_only_evidence:
+            if path not in suppressed:
+                suppressed.append(path)
+            return
+        existing = findings.get(path)
+        if existing is None:
+            findings[path] = {"path": path, "source": source, "detail": detail}
+        elif source == "validation_command" and existing["source"] != source:
+            # The declared command is the stronger evidence; keep it.
+            findings[path] = {"path": path, "source": source, "detail": detail}
+
+    for command in card.get("validation") or []:
+        text = str(command or "").replace("\\", "/")
+        for token in _VALIDATION_PY_TOKEN_RE.findall(text):
+            if not _looks_like_test_path(token):
+                continue
+            declared = _task_contract_path(token)
+            if declared:
+                record(
+                    declared,
+                    "validation_command",
+                    f"named by declared validation command: {text[:160]}",
+                )
+
+    for raw in (*(card.get("allowed_writes") or []), *(card.get("scope_files") or [])):
+        declared = _task_contract_path(raw)
+        if not declared or not declared.endswith(".py"):
+            continue
+        if not declared.startswith(_PRODUCTION_ROOT) or _looks_like_test_path(declared):
+            continue
+        stem = declared.rsplit("/", 1)[-1][: -len(".py")]
+        candidate = f"tests/test_{stem}.py"
+        try:
+            if not (repo_path / candidate).is_file():
+                continue
+        except OSError:
+            continue
+        record(
+            candidate,
+            "same_stem",
+            f"exists on disk and asserts the contract of {declared}",
+        )
+
+    ordered = [findings[path] for path in sorted(findings)]
+    return {
+        "test_scope_warnings": ordered,
+        "suggested_allowed_writes": sorted(findings),
+        "suppressed_read_only": sorted(suppressed),
+    }
+
+
 _CONTEXT_QUERY_STOPWORDS = frozenset({
     "aiworkhub", "task", "worker", "review", "audit", "repair", "implement",
     "validate", "validation", "code", "source", "graph", "model", "manager",
@@ -3081,6 +3742,60 @@ def resolve_create_time_runner(runner: str) -> tuple[str, dict[str, Any] | None]
     return runner, None
 
 
+def create_time_runner_route_warnings(runner: str) -> list[str]:
+    """Advisory findings about a folded runner's launchability. Never refuses.
+
+    ``resolve_create_time_runner`` folds a variant spelling onto a registered
+    route and, by design, refuses nothing: 804 of 2,660 measured ``claim_start``
+    events named a legitimate per-card reviewer identity that maps to no model
+    at all, so a refusal there would have refused correct work. The consequence
+    is that a runner with no route is accepted at create and dies a launch turn
+    later -- measured launch_blocked reasons: workforce_route_absent 4,
+    vscode_lm_model_required 3, model_rejected 6, adapter_denied_by_repo_policy
+    8, glm_credential_missing 8, against 408 distinct runner strings in the task
+    DB of which 10 fold-groups are spellings of one route.
+
+    This names that gap at creation without inheriting the refusal risk. Two
+    configuration-only facts, never a built catalog (whose rows appear and
+    disappear with an editor window):
+
+    * the folded runner resolves to no canonical workforce row and no catalog
+      launch identity;
+    * the folded runner's family constrains adapters to a tuple that the
+      canonical workforce table can pin no model for.
+    """
+    from . import process_launcher as _launcher_routes
+    from . import workforce_catalog as _catalog
+
+    identity = str(runner or "").strip()
+    if not identity or identity == CODEX_RUNNER:
+        return []
+    table_runners = {
+        route_runner for route_runner, _adapter in _launcher_routes._CANONICAL_WORKFORCE
+    }
+    catalog_runners: set[str] = set()
+    try:
+        catalog_runners = set(_catalog.catalog_launch_identities(repo_root()))
+    except Exception:  # noqa: BLE001 - an unreadable catalog never invents a warning
+        return []
+    if identity in table_runners or identity in catalog_runners:
+        return []
+    warnings = [
+        f"workforce_route_absent:runner={identity}:"
+        "no canonical workforce row and no catalog launch identity"
+    ]
+    adapters = _launcher_routes.adapter_identity_tuple(identity)
+    if adapters and not any(
+        (identity, adapter) in _launcher_routes._CANONICAL_WORKFORCE
+        for adapter in adapters
+    ):
+        warnings.append(
+            f"workforce_model_unpinnable:runner={identity}:"
+            f"adapters={'|'.join(adapters)}"
+        )
+    return warnings
+
+
 def create_task(
     task_id: str,
     title: str,
@@ -3113,6 +3828,7 @@ def create_task(
     template_provenance: Mapping[str, Any] | None = None,
     custom_template_escape: str | None = None,
     validation_exemption: str | None = None,
+    apply_contract_patch: str | None = None,
 ) -> dict[str, Any]:
     """Create one new canonical task card for the verified manager chat.
 
@@ -3126,6 +3842,16 @@ def create_task(
     reach the ``finished`` lifecycle state before this card is DAG-ready (see
     ``task_plan.py``). Omitting it (the default, ``None``) is identical to the
     pre-DAG behavior: an empty dependency list that never blocks readiness.
+
+    ``apply_contract_patch`` (optional) is the sha256 digest of a contract
+    patch a finalizer already published (``task_templates.build_contract_patch``
+    / ``record_contract_patch``). It supplies
+    ``allow_unchanged_required_outputs`` BY REFERENCE instead of asking the
+    manager to retype paths that must match ``required_outputs`` and
+    ``allowed_writes`` byte-for-byte. It is never applied automatically: the
+    manager names the digest, and the resolved list then passes exactly the
+    same ``validate_required_output_exceptions`` checks a typed list passes.
+    Naming both a digest and an explicit list is refused rather than merged.
     """
     identity = _claude_manager_identity() or _codex_manager_identity()
     if identity is None:
@@ -3161,28 +3887,77 @@ def create_task(
     if route_error is not None:
         return route_error
     coordinator_worker_runner = runner == CODEX_RUNNER
-    if not title or len(title) > 300 or not objective or len(objective) > 4000:
-        return _lifecycle_error("invalid_title_or_objective", 2)
+    # Validate-all-then-refuse over the closed vocabularies and limits the
+    # server owns. Measured over 27 manager sessions: 66 of 221 creates were
+    # refused, 39 of them on title/objective length, and the refusal was one
+    # word for four causes ("invalid_title_or_objective") that named neither
+    # the field nor the limit, so the manager found the boundary by re-sending
+    # the whole ~5 KB card up to four times. Each check below is deterministic
+    # on data already in hand; every violation is collected and returned in one
+    # reply. ``stderr`` keeps the first violation's code (callers match on it)
+    # and a length refusal names field, cause, length and limit exactly as
+    # ``task_templates._bounded_text`` does.
+    # ONE shared limit for both creation paths. These used to be two inline
+    # numbers here (300/4000) beside ``task_templates.MAX_OBJECTIVE_LENGTH``'s
+    # 2000, so 18 of the 66 measured refusals were an objective the raw create
+    # accepted and the template create refused -- the same text, two answers,
+    # neither of them stating that a second limit existed. The constants now
+    # live in exactly one module and both paths read them.
+    from . import task_templates
+
+    title_limit = task_templates.MAX_TITLE_LENGTH
+    objective_limit = task_templates.MAX_OBJECTIVE_LENGTH
     allowed_priorities = ("low", "normal", "high", "critical")
-    if priority not in allowed_priorities:
-        result = _lifecycle_error("invalid_priority", 2)
-        result["allowed_priorities"] = list(allowed_priorities)
-        result["received_priority"] = priority[:80]
-        return result
     allowed_risk_tiers = ("low", "medium", "high", "critical")
-    if risk_tier is not None and risk_tier not in allowed_risk_tiers:
-        result = _lifecycle_error("invalid_risk_tier", 2)
-        result["allowed_risk_tiers"] = list(allowed_risk_tiers)
-        result["received_risk_tier"] = risk_tier[:80]
-        return result
     allowed_task_types = ("code", "data_classification", "research")
+    violations: list[dict[str, Any]] = []
+    violation_extra: dict[str, Any] = {}
+
+    def text_violation(field: str, value: str, limit: int) -> None:
+        if not value:
+            reason = f"invalid_{field}:empty"
+        elif len(value) > limit:
+            reason = f"invalid_{field}:too_long:{len(value)}_chars_exceeds_limit_{limit}"
+        else:
+            return
+        violations.append({
+            "code": f"invalid_title_or_objective:{reason}",
+            "field": field,
+            "length": len(value),
+            "limit": limit,
+        })
+
+    text_violation("title", title, title_limit)
+    text_violation("objective", objective, objective_limit)
+    if priority not in allowed_priorities:
+        violations.append({
+            "code": "invalid_priority",
+            "field": "priority",
+            "received": priority[:80],
+            "allowed": list(allowed_priorities),
+        })
+        violation_extra["allowed_priorities"] = list(allowed_priorities)
+        violation_extra["received_priority"] = priority[:80]
+    if risk_tier is not None and risk_tier not in allowed_risk_tiers:
+        violations.append({
+            "code": "invalid_risk_tier",
+            "field": "risk_tier",
+            "received": risk_tier[:80],
+            "allowed": list(allowed_risk_tiers),
+        })
+        violation_extra["allowed_risk_tiers"] = list(allowed_risk_tiers)
+        violation_extra["received_risk_tier"] = risk_tier[:80]
     if task_type not in allowed_task_types:
-        result = _lifecycle_error("invalid_task_type", 2)
-        result["allowed_task_types"] = list(allowed_task_types)
-        result["received_task_type"] = task_type[:80]
-        return result
+        violations.append({
+            "code": "invalid_task_type",
+            "field": "task_type",
+            "received": task_type[:80],
+            "allowed": list(allowed_task_types),
+        })
+        violation_extra["allowed_task_types"] = list(allowed_task_types)
+        violation_extra["received_task_type"] = task_type[:80]
     if not isinstance(read_only, bool):
-        return _lifecycle_error("read_only_invalid", 2)
+        violations.append({"code": "read_only_invalid", "field": "read_only"})
     if (
         max_live_tokens is not None
         and (
@@ -3191,7 +3966,18 @@ def create_task(
             or not 1 <= max_live_tokens <= 100_000_000
         )
     ):
-        return _lifecycle_error("max_live_tokens_out_of_range", 2)
+        violations.append({
+            "code": "max_live_tokens_out_of_range",
+            "field": "max_live_tokens",
+            "limit": 100_000_000,
+        })
+    if violations:
+        result = _lifecycle_error(str(violations[0]["code"]), 2)
+        result.update(violation_extra)
+        result["violations"] = violations
+        result["violation_count"] = len(violations)
+        result["limits"] = {"title": title_limit, "objective": objective_limit}
+        return result
 
     def bounded_strings(value: list[str] | None, name: str, *, required: bool = False) -> list[str]:
         if not isinstance(value, list) or (required and not value) or len(value) > 128:
@@ -3224,6 +4010,51 @@ def create_task(
         )
     except task_templates.TaskTemplateError as exc:
         return _lifecycle_error(str(exc), 2)
+
+    # Approve the unchanged-output exception BY REFERENCE. 243 tasks ended on
+    # required_output_unchanged / residual_contract_file_unchanged /
+    # required_output_mismatch / required_output_zero_bytes, and only 32 of
+    # 4,681 cards ever declared the exception -- because declaring it meant
+    # retyping paths that must match required_outputs AND allowed_writes
+    # byte-for-byte. A digest names the exact list the finalizer already
+    # measured. Nothing is auto-applied: the manager passes the digest, and the
+    # resolved list then faces the identical validation a typed list faces.
+    applied_contract_patch: dict[str, Any] | None = None
+    patch_digest = str(apply_contract_patch or "").strip()
+    if patch_digest:
+        if allow_unchanged_required_outputs:
+            result = _lifecycle_error(
+                "contract_patch_conflicts_with_explicit_list", 2
+            )
+            result["apply_contract_patch"] = patch_digest[:80]
+            result["contract_hint"] = (
+                "pass apply_contract_patch OR allow_unchanged_required_outputs, "
+                "never both; the digest already names the exact measured list"
+            )
+            return result
+        try:
+            patch = task_templates.load_contract_patch(repo_root(), patch_digest)
+        except task_templates.TaskTemplateError as exc:
+            result = _lifecycle_error(f"invalid_contract_patch:{exc}", 2)
+            result["apply_contract_patch"] = patch_digest[:80]
+            return result
+        patch_task_id = str(patch.get("task_id") or "")
+        if patch_task_id and patch_task_id != task_id:
+            result = _lifecycle_error(
+                f"contract_patch_task_mismatch:{patch_task_id}", 2
+            )
+            result["apply_contract_patch"] = patch_digest[:80]
+            return result
+        allow_unchanged_required_outputs = list(
+            patch.get("allow_unchanged_required_outputs") or []
+        )
+        applied_contract_patch = {
+            "digest": patch_digest,
+            "task_id": patch_task_id,
+            "allow_unchanged_required_outputs": list(
+                allow_unchanged_required_outputs
+            ),
+        }
 
     try:
         acceptance2 = bounded_strings(acceptance, "acceptance", required=True)
@@ -3483,11 +4314,37 @@ def create_task(
                 "supported_validation_examples": [
                     "pytest -q tests/test_target.py",
                     "ruff check src/target.py tests/test_target.py",
-                    "python -m pytest -q tests/test_target.py",
-                    "python scripts/validate_target.py",
+                    "python3 -m pytest -q tests/test_target.py",
+                    "python3 scripts/validate_target.py",
                 ],
             })
             return result
+
+    # Advisory canonical spelling for the declared command head.
+    #
+    # Measured: 5,793 declared validation commands use 12 first-token spellings
+    # for three tools. The commands are NOT rewritten here, and that is
+    # deliberate -- the declared command IS the acceptance evidence, and a card
+    # expanded from a template carries a ``template_provenance`` whose
+    # ``expanded_contract_digest`` hashes this exact validation list, so a
+    # post-expansion rewrite would invalidate the card's own provenance at
+    # launch. The canonical spelling is emitted at the point the command is
+    # GENERATED (``task_templates`` now builds every command head from
+    # ``CANONICAL_VALIDATION_PYTHON``), and reported here for a hand-written
+    # command so the manager can see the divergence before it becomes 12
+    # spellings of one route.
+    validation_normalization: list[dict[str, str]] = []
+    validation_head_warnings: list[str] = []
+    for validation_command in validation2:
+        canonical = task_templates.canonical_validation_command(validation_command)
+        if canonical != validation_command:
+            validation_normalization.append({
+                "declared": validation_command[:240],
+                "canonical": canonical[:240],
+            })
+        validation_head_warnings.extend(
+            task_templates.validation_command_head_warnings(validation_command)
+        )
     for item in writes2:
         path = Path(item)
         if path.is_absolute() or ".." in path.parts:
@@ -3523,6 +4380,58 @@ def create_task(
         result = _lifecycle_error("contradictory_task_path_contract", 2)
         result["conflicts"] = conflicts
         return result
+
+    # Name an unwinnable contract HERE, not one launch turn later.
+    #
+    # ``ProcessManager._preflight_card`` refuses these with
+    # ``task_contract_unwinnable``; measured launch refusals it produced:
+    # task_contract_unwinnable 16, workspace_required_input_missing 10,
+    # required_outputs_invalid 7. Each was decidable from the card and the
+    # repository at creation, and each first cost a claim, a launch turn and a
+    # recovery decision.
+    #
+    # ``toolchain_authority.card_contract_missing_inputs`` is the CARD-PURE half
+    # of the launcher's evaluation, split out so it can run here: the full
+    # ``ToolchainAuthority.evaluate`` measured 15.0s per card on this repository
+    # (13.5s of it resolving the sparse import closure), which no creation path
+    # may spend; the split check is three filesystem stats (measured 0.003s).
+    # Host capability (a missing ruff, an absent module, a sandbox lane) is
+    # deliberately not consulted at all: it is repairable, the launcher repairs
+    # it before judging, and the machine composing a card is not necessarily the
+    # machine that will run it.
+    #
+    # ADVISORY, NOT A REFUSAL -- and that is a measured decision, not caution.
+    # ``dependency_autolaunch`` classifies ``workspace_required_input_missing``
+    # as TRANSIENT for a stated reason: "A sibling card's accept can promote the
+    # file into the canonical tree, clearing it." A wave routinely declares a
+    # card against a file an earlier card in the same wave produces, so refusing
+    # at CREATE -- before any sibling has run -- would refuse cards that become
+    # winnable, which is a strictly worse failure than the launch refusal it
+    # replaces. Applied to this repository's 1,651 cards carrying validation, the
+    # rule fires on 21 (1.3%); every one of them is named here at creation, and
+    # the launcher keeps the authority to refuse.
+    contract_warnings: list[str] = []
+    contract_card_probe = {
+        "task_type": task_type,
+        "validation": validation2,
+        "allowed_writes": writes2,
+        "required_outputs": outputs2,
+        "read_only": read_only,
+        "read_first": read_first2,
+        "immutable_inputs": immutable_inputs2,
+    }
+    try:
+        # Lazy, like ``worker_workspace`` above: creation must not widen core's
+        # startup dependency surface.
+        from . import toolchain_authority as _toolchain_authority
+
+        _missing_inputs = _toolchain_authority.card_contract_missing_inputs(
+            repo_root(), contract_card_probe
+        )
+    except Exception:  # noqa: BLE001 - an unreadable repository never invents a warning
+        _missing_inputs = ()
+    contract_warnings = [f"{reason}:{token}" for token, reason in _missing_inputs]
+
     try:
         depends_on2 = task_plan.normalize_depends_on(depends_on)
     except task_plan.TaskPlanError as exc:
@@ -4009,6 +4918,30 @@ def create_task(
         # declared allowed_writes does not cover. Never blocks creation.
         "scope_warnings": card_scope_warnings(card),
     })
+    # Advisory-only test-scope evidence. ``suggested_allowed_writes`` is a
+    # SUGGESTION: the card was stored with the declared scope and nothing here
+    # widened it. The manager decides whether to recreate with a wider scope.
+    result.update(card_test_scope_warnings(card))
+    if validation_normalization:
+        result["validation_normalization"] = validation_normalization
+    if validation_head_warnings:
+        result["validation_head_warnings"] = sorted(set(validation_head_warnings))
+    if contract_warnings:
+        # Same vocabulary the launcher uses, so the manager reads one wording at
+        # creation and at launch. Advisory: see the note at the check.
+        result["contract_warnings"] = contract_warnings
+        result["contract_hint"] = (
+            "a declared validation command reads a repository path that neither "
+            "exists nor is a declared output of this card; add it to "
+            "allowed_writes/required_outputs if the worker must create it, "
+            "declare depends_on if a sibling card produces it, or correct the "
+            "path -- the launcher refuses this contract"
+        )
+    if applied_contract_patch is not None:
+        result["applied_contract_patch"] = applied_contract_patch
+    runner_route_warnings = create_time_runner_route_warnings(runner)
+    if runner_route_warnings:
+        result["runner_route_warnings"] = runner_route_warnings
     return result
 
 
@@ -5473,6 +6406,17 @@ def reject_review(
             for entry in (residual_identities or [])
             if isinstance(entry, dict)
         ],
+    )
+    # The rejection half of the same evidence loop as accept: one row per skill
+    # this card received, actor derived from the card's own runner. Imported
+    # locally because manager_skill_tools imports core. Never raises.
+    from . import manager_skill_tools as _skill_tools
+
+    _skill_tools.record_decision_evidence(
+        repo_root(),
+        task_id=task_id,
+        request_id=str(pred_request_id or ""),
+        outcome="rejected",
     )
     return result
 
@@ -7647,17 +8591,288 @@ def dispatcher_ensure_started() -> dict[str, Any]:
     }
 
 
-def claude_callback_wait(timeout_seconds: int = 240) -> dict[str, Any]:
+# The long-poll hold.  Measured 2026-09-08 over 206 manager waits: the model
+# asked for 900 s in 112 of them, the server silently clamped to 300 s, and 83
+# waits (40%) came back empty, after which the manager polled by hand (240
+# Bash sleeps, 83 tail -F monitors).  The cap is now a configured value that is
+# negotiated against the host's own tool timeout and ALWAYS reported back, so
+# the model can stop asking for what it cannot get.
+CALLBACK_WAIT_MAX_SECONDS_ENV = "AIWORKHUB_CALLBACK_WAIT_MAX_SECONDS"
+CALLBACK_WAIT_MAX_SECONDS_DEFAULT = 300
+_CALLBACK_WAIT_MAX_SECONDS_RANGE = (1, 3600)
+# Claude Code exports its per-call MCP tool timeout to the server process in
+# milliseconds; a hold longer than that is a response the host will never
+# read (the lease reclaim would still recover it -- safe, but a wasted turn).
+CALLBACK_WAIT_HOST_TIMEOUT_MS_ENV = "MCP_TOOL_TIMEOUT"
+CALLBACK_WAIT_HOST_SAFETY_SECONDS = 15
+CALLBACK_WAIT_WATCH_POLL_SECONDS = 2.0
+CALLBACK_WAIT_WATCH_LIMIT = 64
+CALLBACK_WAIT_SNAPSHOT_LIMIT = 64
+
+
+def callback_wait_limits() -> dict[str, Any]:
+    """The effective ceiling on one ``claude_callback_wait`` hold, with its
+    provenance: the configured value (env, default 300 s) negotiated down to
+    stay under the host's MCP tool timeout when the host declares one."""
+    configured = CALLBACK_WAIT_MAX_SECONDS_DEFAULT
+    source = "default"
+    raw = os.environ.get(CALLBACK_WAIT_MAX_SECONDS_ENV, "").strip()
+    if raw:
+        try:
+            low, high = _CALLBACK_WAIT_MAX_SECONDS_RANGE
+            configured = max(low, min(int(raw), high))
+            source = f"env:{CALLBACK_WAIT_MAX_SECONDS_ENV}"
+        except ValueError:
+            source = f"default:invalid_{CALLBACK_WAIT_MAX_SECONDS_ENV}"
+    host_seconds: float | None = None
+    raw_host = os.environ.get(CALLBACK_WAIT_HOST_TIMEOUT_MS_ENV, "").strip()
+    if raw_host:
+        try:
+            host_ms = int(raw_host)
+        except ValueError:
+            host_ms = 0
+        if host_ms > 0:
+            host_seconds = host_ms / 1000.0
+    max_timeout = configured
+    if host_seconds is not None:
+        negotiated = max(1, int(host_seconds) - CALLBACK_WAIT_HOST_SAFETY_SECONDS)
+        if negotiated < max_timeout:
+            max_timeout = negotiated
+            source = f"host:{CALLBACK_WAIT_HOST_TIMEOUT_MS_ENV}"
+    return {
+        "max_timeout_seconds": max_timeout,
+        "configured_max_timeout_seconds": configured,
+        "host_tool_timeout_seconds": host_seconds,
+        "timeout_clamp_source": source,
+    }
+
+
+def _epoch_to_iso(value: Any) -> str | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        return datetime.fromtimestamp(float(value), tz=timezone.utc).isoformat()
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _seconds_since_iso(value: Any, now_epoch: float) -> float | None:
+    try:
+        parsed = datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return round(max(0.0, now_epoch - parsed.timestamp()), 1)
+
+
+def _claude_session_process_rows(
+    session_id: str, watch_request_ids: Sequence[str],
+) -> list[dict[str, Any]]:
+    """Latest ledger row per request that this session launched (its task's
+    ``origin_thread_id`` is the session) and is still active, plus every
+    watched request regardless of state.  A pure read of the process ledger
+    and the tasks table; never a reconcile."""
+    from . import process_event_ledger  # local import: cycle-safe
+    from . import process_launcher  # local import: cycle-safe
+
+    root = repo_root()
+    log_path = Path(
+        os.environ.get(
+            process_launcher.PROCESS_LOG_ENV,
+            str(root / process_launcher.PROCESS_LOG_DEFAULT_REL),
+        )
+    )
+    if not log_path.is_file():
+        return []
+    latest = process_event_ledger.latest_events(
+        log_path,
+        key_field="request_id",
+        skip_event_kinds=(process_launcher.RUNTIME_NOTICE_EVENT_KIND,),
+        replace=True,
+    )
+    active_states = (
+        process_launcher.ACTIVE_PROCESS_STATES
+        | process_launcher.FINALIZATION_PENDING_STATES
+        | {process_launcher.REVIEWER_CLAIM_BOUND_STATE}
+    )
+    watched = set(watch_request_ids)
+    candidates = [
+        dict(row) for request_id, row in latest.items()
+        if isinstance(row, dict)
+        and (str(row.get("state") or "") in active_states or str(request_id) in watched)
+    ]
+    if not candidates:
+        return []
+    task_ids = sorted({str(row.get("task_id") or "") for row in candidates if row.get("task_id")})
+    origins: dict[str, str] = {}
+    if task_ids:
+        conn = _canonical_connect(readonly=True)
+        try:
+            for start in range(0, len(task_ids), 200):
+                chunk = task_ids[start:start + 200]
+                marks = ",".join("?" for _ in chunk)
+                for row in conn.execute(
+                    f"SELECT task_id, origin_thread_id FROM tasks WHERE task_id IN ({marks})",
+                    tuple(chunk),
+                ).fetchall():
+                    origins[str(row["task_id"])] = str(row["origin_thread_id"] or "")
+        finally:
+            conn.close()
+    return [
+        row for row in candidates
+        if str(row.get("request_id") or "") in watched
+        or origins.get(str(row.get("task_id") or "")) == session_id
+    ]
+
+
+def _claude_session_liveness_snapshot(
+    identity: Mapping[str, str], watch_request_ids: Sequence[str],
+) -> dict[str, Any]:
+    """Compact, read-only evidence returned with an empty wait: what this
+    session's launched requests are doing right now, and when the reconciler
+    last closed a scan.  It states observations only -- ``state`` and
+    ``liveness_state`` are the ledger's and the supervisor artifact's own
+    words -- and never infers a terminal outcome (``status()`` already
+    refuses to guess on ``pid_identity_unknown``; so does this)."""
+    from . import process_launcher  # local import: cycle-safe
+    from . import task_reconciler  # local import: cycle-safe
+
+    now_epoch = time.time()
+    snapshot: dict[str, Any] = {
+        "schema_id": "aiworkhub.callback_wait_liveness.v1",
+        "inference": "none",
+        "requests": [],
+        "reconciler": {"status_present": False, "last_scan_age_s": None, "stale": True},
+    }
+    try:
+        rows = _claude_session_process_rows(str(identity.get("session_id") or ""), watch_request_ids)
+    except Exception as exc:  # noqa: BLE001 -- evidence must never break the wait
+        snapshot["requests_error"] = f"{type(exc).__name__}:{exc}"[:200]
+        rows = []
+    rows.sort(key=lambda row: str(row.get("timestamp") or ""))
+    truncated = max(0, len(rows) - CALLBACK_WAIT_SNAPSHOT_LIMIT)
+    for row in rows[:CALLBACK_WAIT_SNAPSHOT_LIMIT]:
+        try:
+            liveness = process_launcher.ProcessManager._liveness_snapshot(row)
+        except Exception:  # noqa: BLE001 -- a bad artifact is reported as absent
+            liveness = {}
+        runtime = liveness.get("runtime_seconds")
+        elapsed = (
+            round(float(runtime), 1)
+            if isinstance(runtime, (int, float)) and not isinstance(runtime, bool)
+            else _seconds_since_iso(row.get("timestamp"), now_epoch)
+        )
+        last_artifact = _epoch_to_iso(liveness.get("last_meaningful_progress_epoch"))
+        if last_artifact is None:
+            activity_age = liveness.get("activity_age_seconds")
+            if isinstance(activity_age, (int, float)) and not isinstance(activity_age, bool):
+                last_artifact = _epoch_to_iso(now_epoch - float(activity_age))
+        snapshot["requests"].append({
+            "request_id": str(row.get("request_id") or ""),
+            "task_id": str(row.get("task_id") or ""),
+            "state": str(row.get("state") or ""),
+            "preparation_phase": row.get("preparation_phase"),
+            "elapsed_s": elapsed,
+            "last_event_ts": row.get("timestamp"),
+            "last_artifact_ts": last_artifact,
+            "liveness_state": liveness.get("liveness_state"),
+            "reconciliation_deferred": row.get("reconciliation_deferred"),
+        })
+    if truncated:
+        snapshot["requests_truncated"] = truncated
+    try:
+        record = task_reconciler.read_status(repo_root())
+        stale, age = task_reconciler._staleness(record)
+        snapshot["reconciler"] = {
+            "status_present": bool(record),
+            "last_scan_age_s": round(age, 1) if age is not None else None,
+            "stale": bool(stale),
+            "scan_in_progress": bool(record.get("scan_in_progress")),
+            "last_error": str(record.get("last_error") or ""),
+        }
+    except Exception as exc:  # noqa: BLE001 -- evidence must never break the wait
+        snapshot["reconciler"] = {
+            "status_present": False, "last_scan_age_s": None, "stale": True,
+            "error": f"{type(exc).__name__}"[:80],
+        }
+    return snapshot
+
+
+def _watch_signature(rows: Sequence[Mapping[str, Any]], watch: Sequence[str]) -> dict[str, tuple]:
+    by_request = {str(row.get("request_id") or ""): row for row in rows}
+    signature: dict[str, tuple] = {}
+    for request_id in watch:
+        row = by_request.get(request_id)
+        if row is None:
+            signature[request_id] = ("absent", None, None, None)
+            continue
+        signature[request_id] = (
+            str(row.get("state") or ""),
+            row.get("preparation_phase"),
+            row.get("exit_code"),
+            str(row.get("timestamp") or ""),
+        )
+    return signature
+
+
+def claude_callback_wait(
+    timeout_seconds: int = 240,
+    ack_batch_id: str = "",
+    ack_lease_id: str = "",
+    watch_request_ids: Sequence[str] | None = None,
+) -> dict[str, Any]:
     """Wait for one callback batch belonging to this exact Claude manager.
 
     Returning the batch wakes the already-open Claude turn through its own
-    MCP request.  Delivery remains inflight until ``claude_callback_ack``;
-    if the tool response is lost, the normal lease reclaim path retries it.
+    MCP request.  Delivery remains inflight until it is acknowledged; if the
+    tool response is lost, the normal lease reclaim path retries it.
+
+    Acknowledgement rides on the next wait: ``ack_batch_id``/``ack_lease_id``
+    are the ids the previous ``callback_ready`` reply carried, and they are
+    acknowledged inside the same identity-checked transaction that claims the
+    next batch (``callback_store.acknowledge_then_claim``).  The explicit
+    ``claude_callback_ack`` remains available.  Nothing is acknowledged at
+    delivery time.
+
+    The hold is capped by :func:`callback_wait_limits`; the reply always says
+    what the effective cap was.  An empty wait returns a read-only liveness
+    snapshot of this session's launched requests instead of nothing, and a
+    ``watch_request_ids`` list also wakes the wait when a watched request's
+    ledger row changes (a non-terminal milestone), reported as
+    ``watch_changed``.
     """
     identity = _claude_manager_identity()
     if identity is None:
         return {"ok": False, "reason": "verified_claude_manager_required"}
-    timeout = max(1, min(int(timeout_seconds), 300))
+    limits = callback_wait_limits()
+    try:
+        requested = int(timeout_seconds)
+    except (TypeError, ValueError):
+        requested = 240
+    timeout = max(1, min(requested, int(limits["max_timeout_seconds"])))
+    timing = {
+        "requested_timeout_seconds": requested,
+        "effective_timeout_seconds": timeout,
+        "max_timeout_seconds": int(limits["max_timeout_seconds"]),
+        "timeout_clamped": requested > timeout,
+        "timeout_clamp_source": limits["timeout_clamp_source"],
+    }
+    watch = [
+        str(item).strip() for item in (watch_request_ids or []) if str(item or "").strip()
+    ][:CALLBACK_WAIT_WATCH_LIMIT]
+    ack_pending = bool(str(ack_batch_id or "").strip() or str(ack_lease_id or "").strip())
+    ack_result: dict[str, Any] | None = None
+    session_id = identity["session_id"]
+
+    def _watch_rows() -> list[dict[str, Any]]:
+        try:
+            return _claude_session_process_rows(session_id, watch)
+        except Exception:  # noqa: BLE001 -- a watch is evidence, never a failure
+            return []
+
+    watch_baseline = _watch_signature(_watch_rows(), watch) if watch else {}
+    next_watch_poll = time.monotonic() + CALLBACK_WAIT_WATCH_POLL_SECONDS
     deadline = time.monotonic() + timeout
     while True:
         conn = _canonical_connect()
@@ -7665,23 +8880,34 @@ def claude_callback_wait(timeout_seconds: int = 240) -> dict[str, Any]:
             callback_store.seed_missing_review_callbacks(
                 conn,
                 provider="claude",
-                origin_thread_id=identity["session_id"],
+                origin_thread_id=session_id,
             )
             # Claim at route level, not just provider level: pass this verified
             # manager's own session identity through so a second manager on the
             # same repository can never lease (and then park) a batch belonging
             # to another route. The store's ``origin_thread_id`` scope is exactly
             # this guarantee; passing only ``provider`` left it unused.
-            batch = callback_store.claim_pending_callback_batch(
-                conn,
-                lease_seconds=max(120, timeout + 30),
-                provider="claude",
-                origin_thread_id=identity["session_id"],
-            )
+            if ack_pending:
+                ack_result, batch = callback_store.acknowledge_then_claim(
+                    conn,
+                    ack_batch_id=str(ack_batch_id or ""),
+                    ack_lease_id=ack_lease_id,
+                    provider="claude",
+                    origin_thread_id=session_id,
+                    lease_seconds=max(120, timeout + 30),
+                )
+                ack_pending = False
+            else:
+                batch = callback_store.claim_pending_callback_batch(
+                    conn,
+                    lease_seconds=max(120, timeout + 30),
+                    provider="claude",
+                    origin_thread_id=session_id,
+                )
         finally:
             conn.close()
         if batch is not None:
-            if batch.get("origin_thread_id") != identity["session_id"]:
+            if batch.get("origin_thread_id") != session_id:
                 conn = _canonical_connect()
                 try:
                     callback_store.defer_batch_busy(
@@ -7711,6 +8937,36 @@ def claude_callback_wait(timeout_seconds: int = 240) -> dict[str, Any]:
                     "lease_id": batch["lease_id"],
                     "origin_thread_id": batch["origin_thread_id"],
                     "members": members,
+                    "ack": ack_result,
+                    "ack_hint": (
+                        "pass batch_id/lease_id as ack_batch_id/ack_lease_id on the next "
+                        "aiworkhub_claude_callback_wait, or call aiworkhub_claude_callback_ack"
+                    ),
+                    **timing,
+                }
+        now = time.monotonic()
+        if watch and now >= next_watch_poll:
+            next_watch_poll = now + CALLBACK_WAIT_WATCH_POLL_SECONDS
+            current = _watch_signature(_watch_rows(), watch)
+            changes = [
+                {
+                    "request_id": request_id,
+                    "from": {"state": before[0], "preparation_phase": before[1], "exit_code": before[2]},
+                    "to": {"state": after[0], "preparation_phase": after[1], "exit_code": after[2]},
+                }
+                for request_id, before in watch_baseline.items()
+                for after in (current.get(request_id),)
+                if after is not None and after != before
+            ]
+            if changes:
+                return {
+                    "ok": True,
+                    "status": "watch_changed",
+                    "provider": "claude",
+                    "changes": changes,
+                    "ack": ack_result,
+                    "liveness": _claude_session_liveness_snapshot(identity, watch),
+                    **timing,
                 }
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -7719,12 +8975,19 @@ def claude_callback_wait(timeout_seconds: int = 240) -> dict[str, Any]:
                 "status": "timeout_no_callback",
                 "provider": "claude",
                 "waited_seconds": timeout,
+                "ack": ack_result,
+                "liveness": _claude_session_liveness_snapshot(identity, watch),
+                **timing,
             }
         time.sleep(min(0.5, remaining))
 
 
 def claude_callback_ack(batch_id: str, lease_id: str) -> dict[str, Any]:
-    """Durably acknowledge a callback returned by ``claude_callback_wait``."""
+    """Durably acknowledge a callback returned by ``claude_callback_wait``.
+
+    The explicit fallback; the same acknowledgement rides on the next wait
+    (``ack_batch_id``/``ack_lease_id``) and on a same-session action naming a
+    member (``claude_callback_ack_by_reference``)."""
     identity = _claude_manager_identity()
     if identity is None:
         return {"ok": False, "reason": "verified_claude_manager_required"}
@@ -7745,6 +9008,47 @@ def claude_callback_ack(batch_id: str, lease_id: str) -> dict[str, Any]:
         "provider": "claude",
         "batch_id": batch_id,
     }
+
+
+def claude_callback_ack_by_reference(*, task_id: str = "", request_id: str = "") -> dict[str, Any]:
+    """Acknowledge this session's inflight batch because the same verified
+    Claude session just acted on one of its members.
+
+    One line for the accept_review / reject_review / quality_reviewer_launch /
+    agent_collect_result / task_show wrappers::
+
+        core.claude_callback_ack_by_reference(task_id=task_id, request_id=request_id)
+
+    It never raises and never blocks the caller's action: an unverified
+    session, an unavailable store or a reference that names no inflight
+    member simply reports ``acknowledged=False`` and the batch stays inflight
+    for the lease reclaim path, exactly as an un-acked wait does today.
+    """
+    identity = _claude_manager_identity()
+    if identity is None:
+        return {"acknowledged": False, "batch_id": "", "reason": "verified_claude_manager_required"}
+    try:
+        conn = _canonical_connect()
+    except Exception as exc:  # noqa: BLE001 -- ack-by-reference is a courtesy, never a gate
+        return {
+            "acknowledged": False, "batch_id": "",
+            "reason": f"store_unavailable:{type(exc).__name__}",
+        }
+    try:
+        return callback_store.acknowledge_batch_by_reference(
+            conn,
+            provider="claude",
+            origin_thread_id=identity["session_id"],
+            task_id=task_id,
+            request_id=request_id,
+        )
+    except Exception as exc:  # noqa: BLE001 -- see above
+        return {
+            "acknowledged": False, "batch_id": "",
+            "reason": f"ack_by_reference_failed:{type(exc).__name__}",
+        }
+    finally:
+        conn.close()
 
 
 def dispatcher_health() -> dict[str, Any]:

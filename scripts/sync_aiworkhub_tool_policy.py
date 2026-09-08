@@ -356,9 +356,63 @@ def extract_block(data: bytes, path: Path) -> PolicyBlock:
     return PolicyBlock(start=start, end=end + len(END_MARKER_BYTES), inner=data[inner_start:end])
 
 
+def rendered_canonical() -> bytes:
+    return agent_tool_instructions.render_canonical().encode("utf-8")
+
+
+def canonical_source_error(canonical: bytes) -> str | None:
+    if canonical == rendered_canonical():
+        return None
+    return f"{POLICY_SOURCE}: canonical policy source differs from agent_tool_instructions.render_canonical()"
+
+
+def outside_scan(
+    data: bytes, block: PolicyBlock, generated: bytes, path: Path
+) -> agent_tool_instructions.OutsideScan:
+    """Scan the host text around the block for copies of the rendered policy.
+
+    The block replacer only rewrites between the markers, so a copy of the
+    policy that once lived above the START marker survived every sync and
+    every --check (CLAUDE.md carried 1,775 B of it). The scan is shared with
+    the MCP apply plan in ``agent_tool_instructions``.
+
+    ``generated`` is this host's own block, but the scan matches against every
+    projection's rules: AGENTS.md then kept 1,018 B of the CLAUDE.md manager
+    startup rules above its marker, renamed "Kilo", and a scan that knew only
+    AGENTS.md's preamble-free block called them owner prose. A verbatim copy is
+    reported and stripped by --sync; a copy whose wording differs is reported
+    and left exactly as it is.
+    """
+
+    try:
+        before = data[: block.start].decode("utf-8")
+        after = data[block.end :].decode("utf-8")
+        rendered = generated.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise PolicySyncError(f"{path}: host text around the policy block is not UTF-8: {exc}") from exc
+    return agent_tool_instructions.scan_outside_block(before, after, rendered)
+
+
+def duplicate_error(path: Path, scan: agent_tool_instructions.OutsideScan) -> str | None:
+    if scan.drifted:
+        first = scan.drifted[0]
+        shown = first if len(first) <= 60 else first[:57] + "..."
+        return (
+            f"{path}: {len(scan.drifted)} drifted policy line(s) outside the managed block; "
+            f"remove or restore them by hand, the sync will not guess (first: {shown!r})"
+        )
+    if scan.verbatim:
+        return f"{path}: {len(scan.verbatim)} policy line(s) duplicated outside the managed block"
+    return None
+
+
 def synced_text(data: bytes, canonical: bytes, path: Path) -> bytes:
     block = extract_block(data, path)
-    return data[: block.start] + generated_block(canonical, path) + data[block.end :]
+    generated = generated_block(canonical, path)
+    scan = outside_scan(data, block, generated, path)
+    if scan.fail_closed:
+        raise PolicySyncError(duplicate_error(path, scan) or f"{path}: drifted policy text outside the managed block")
+    return scan.before.encode("utf-8") + generated + scan.after.encode("utf-8")
 
 
 def check(root: Path = REPO_ROOT, host_files: Sequence[Path] = HOST_FILES) -> list[str]:
@@ -368,6 +422,9 @@ def check(root: Path = REPO_ROOT, host_files: Sequence[Path] = HOST_FILES) -> li
         return [str(exc)]
 
     errors = []
+    source_error = canonical_source_error(canonical)
+    if source_error is not None:
+        errors.append(source_error)
     for relative_path in host_files:
         path = root / relative_path
         try:
@@ -376,13 +433,37 @@ def check(root: Path = REPO_ROOT, host_files: Sequence[Path] = HOST_FILES) -> li
         except PolicySyncError as exc:
             errors.append(str(exc))
             continue
-        if data[block.start : block.end] != generated_block(canonical, relative_path):
+        generated = generated_block(canonical, relative_path)
+        if data[block.start : block.end] != generated:
             errors.append(f"{relative_path}: policy block differs from {POLICY_SOURCE}")
+        try:
+            scan = outside_scan(data, block, generated, relative_path)
+        except PolicySyncError as exc:
+            errors.append(str(exc))
+            continue
+        outside_error = duplicate_error(relative_path, scan)
+        if outside_error is not None:
+            errors.append(outside_error)
     return errors
 
 
 def planned_updates(root: Path, canonical: bytes, host_files: Sequence[Path]) -> list[HostUpdate]:
     updates = []
+    if canonical_source_error(canonical) is not None:
+        # The module POLICY is the source of truth; the docs copy is one more
+        # projection and is regenerated through the same staged write path.
+        snapshot = read_regular_file_snapshot(root / POLICY_SOURCE, POLICY_SOURCE, root)
+        updates.append(
+            HostUpdate(
+                root=root,
+                relative_path=POLICY_SOURCE,
+                path=root / POLICY_SOURCE,
+                original=snapshot.data,
+                updated=rendered_canonical(),
+                mode=snapshot.identity.mode & 0o7777,
+                original_identity=snapshot.identity,
+            )
+        )
     for relative_path in host_files:
         path = root / relative_path
         snapshot = read_regular_file_snapshot(path, relative_path, root)

@@ -5157,16 +5157,36 @@ def create_quality_review_workspace(
     }
     review_workspace = create_workspace(repo, request_id, seed_card, adapter_id)
     try:
+        # A read-only reviewer inherits the repository's tracked
+        # .claude/settings.json, whose permissions.deny lists Grep and Glob for
+        # build workers -- and a project deny beats an argv allow, so granting
+        # the reviewer those tools was inert. Measured 2026-09-08: 1,080 denied
+        # Bash calls, 25% of every reviewer Bash call, in 181 of 242 runs, then
+        # substituted with subagents, probes and whole-file reads. The guard
+        # rewrites that one file inside THIS worktree only; the canonical
+        # repository is untouched, and the build-worker rule is unchanged.
+        # Local, like every other sibling import in this module: it keeps the
+        # import graph acyclic and matches the file's established style.
+        from . import provider_tool_guards
+
+        review_guard = provider_tool_guards.apply_workspace_guards(
+            review_workspace.path, read_only=True
+        )
         for relative in read_only_inputs:
             _overlay_quality_review_read_only_input(
                 repo, review_workspace.path, relative
             )
         for relative in canonical_delta:
             _overlay_regular_path(repo, review_workspace.path, relative)
+        # The rewritten settings file must ride in the baseline. changed_paths
+        # is git diff plus untracked minus paths whose workspace_baseline hash
+        # is unchanged, so a guard file absent from the baseline reads back as
+        # a candidate edit by a reviewer that holds allowed_writes=().
         baseline_paths = sorted(
             set(review_workspace.workspace_baseline)
             | set(canonical_delta)
             | set(read_only_inputs)
+            | set(review_guard["baseline_paths"])
         )
         canonical_baseline = {
             relative: _hash_path(review_workspace.path / relative)

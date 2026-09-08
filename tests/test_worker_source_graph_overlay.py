@@ -100,7 +100,14 @@ def test_overlay_query_shadows_changed_and_tombstones_deleted(
     )
     assert body["ok"] is True
     assert body["authority_source"] == "rework_overlay"
-    assert body["authority_state"] == "request_scoped_worktree"
+    # Deliberate (source_graph-3): ``authority_state`` moved out of the
+    # model-facing envelope into the HMAC-authenticated ledger row, where
+    # ``verify_audit_ledger`` publishes it as ``authority_index_identity``
+    # (``source_graph:<source>:<state>:<repo>`` -- asserted end to end in
+    # tests/test_quality_reviewer_candidate_source_graph_b1461.py).  It is
+    # redundant on the reply: ``authority_source`` alone tells a rework worker
+    # which tree answered, and it stays for exactly that reason.
+    assert "authority_state" not in body
     assert "worktree_symbol" in body["content"]
     assert "canonical_symbol" not in body["content"]
     parsed = json.loads(body["content"])

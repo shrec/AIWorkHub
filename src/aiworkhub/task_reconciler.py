@@ -463,13 +463,30 @@ def run_scan(
     keeps live or ambiguous reservations untouched. Repeated scans see the
     terminal event and perform no second retirement transition. Never touches
     AITools/taskdb.py directly and never invokes a model/chat endpoint.
+
+    The GC pass also prunes stale pending callback rows. Measured 2026-09-08:
+    84 pending Claude outbox rows (age p50 124 h) whose tasks were long
+    superseded or archived fenced task hygiene with ``callback_live`` on every
+    run, and were pruned only inside the route rebind of an OPTIONAL manager
+    call -- so a repository nobody bootstrapped kept the fence forever. The
+    rule stays the store's own ``_task_still_in_matching_terminal_state``:
+    a wake for a task still in review is left pending. Shares
+    ``core._prune_stale_callbacks`` with the hygiene pass rather than opening
+    a second copy of the same three lines.
     """
     mgr = manager or process_launcher.ProcessManager(repo=repo)
     result = mgr.reconcile(include_gc=include_gc)
+    callback_prune: dict[str, Any] = {"state": "skipped", "reason": "gc_not_included"}
+    if include_gc:
+        try:
+            callback_prune = core._prune_stale_callbacks(Path(mgr.repo).resolve())
+        except Exception as exc:  # noqa: BLE001 -- a scan must never fail on hygiene
+            callback_prune = {"state": "skipped", "reason": f"{type(exc).__name__}"[:80]}
     return {
         "ok": True,
         "scanned_at": _utcnow(),
         "gc_included": bool(include_gc),
+        "callback_prune": callback_prune,
         **result,
     }
 

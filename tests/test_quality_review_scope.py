@@ -126,6 +126,95 @@ def test_graph_scope_records_truthful_unknowns_without_canonical_graph(
     ] == "expect-candidate-integrity"
 
 
+def test_executed_validation_evidence_names_the_last_line_it_printed(
+    tmp_path: Path,
+) -> None:
+    """The one line a reviewer judging test adequacy actually needs.
+
+    The finalizer retains a bounded ``stdout_tail``/``stderr_tail`` on every
+    executed validation row; the last non-blank line of it is the pytest
+    summary, the traceback tail or the linter count.  Reviewers used to re-run
+    the command to obtain it (measured: 20 pytest re-runs and 85 sandbox probes
+    per 1,024 reviewer runs).  ``stderr_tail`` is the fallback when the run
+    printed nothing on stdout.
+    """
+    authority = tmp_path / "authority"
+    candidate = tmp_path / "candidate"
+    authority.mkdir()
+    candidate.mkdir()
+    path = candidate / "notes.md"
+    path.write_text("changed\n", encoding="utf-8")
+
+    scopes = quality_review_scope.build_scoped_audits(
+        authority_repo=authority,
+        candidate_repo=candidate,
+        task_id="TASK_TAIL",
+        packet_seed="request-tail",
+        created_at="2026-09-08T00:00:00Z",
+        changed_path_hashes={"notes.md": _digest(path)},
+        source_evidence={"notes.md": {"segments": []}},
+        terminal_validation=[
+            {
+                "declared_command": "python3 -m pytest -q",
+                "returncode": 0,
+                "stdout_tail": "collected 3 items\n3 passed in 3.01s\n\n",
+            },
+            {
+                "declared_command": "ruff check .",
+                "returncode": 0,
+                "stdout_tail": "   \n",
+                "stderr_tail": "warning: 1 rule deprecated\n",
+            },
+        ],
+        lenses=["correctness"],
+    )
+
+    descriptions = [
+        row["description"]
+        for row in scopes["correctness"]["packet"]["test_evidence"]
+    ]
+    assert any(
+        "last output line: 3 passed in 3.01s" in text for text in descriptions
+    ), descriptions
+    # Blank stdout falls through to the retained stderr tail rather than
+    # reporting an empty last line.
+    assert any(
+        "last output line: warning: 1 rule deprecated" in text
+        for text in descriptions
+    ), descriptions
+
+
+def test_executed_validation_evidence_stays_intact_without_any_output(
+    tmp_path: Path,
+) -> None:
+    """A row with no retained tail keeps exactly the description it always had."""
+    authority = tmp_path / "authority"
+    candidate = tmp_path / "candidate"
+    authority.mkdir()
+    candidate.mkdir()
+    path = candidate / "notes.md"
+    path.write_text("changed\n", encoding="utf-8")
+
+    scopes = quality_review_scope.build_scoped_audits(
+        authority_repo=authority,
+        candidate_repo=candidate,
+        task_id="TASK_QUIET",
+        packet_seed="request-quiet",
+        created_at="2026-09-08T00:00:00Z",
+        changed_path_hashes={"notes.md": _digest(path)},
+        source_evidence={"notes.md": {"segments": []}},
+        terminal_validation=[{"declared_command": "ruff check .", "returncode": 0}],
+        lenses=["correctness"],
+    )
+
+    descriptions = [
+        row["description"]
+        for row in scopes["correctness"]["packet"]["test_evidence"]
+    ]
+    assert "Executed validation returned 0: ruff check ." in descriptions
+    assert not any("last output line" in text for text in descriptions)
+
+
 def test_graph_scope_uses_canonical_symbols_for_removed_file(
     tmp_path: Path,
     monkeypatch,

@@ -667,7 +667,10 @@ def test_zero_match_is_an_executed_suppressed_section(
     )
     assert section["executed"] is True
     assert section["hit_count"] == 0
-    assert result.metadata["optimization"]["zero_hit_suppression_count"] == 1
+    # Two suppressed sections: this zero-match skills packet and the stub's
+    # zero-hit Session Manager state, which is suppressed the same way since
+    # worker_prompt-2 (its metadata still says executed / hit_count 0).
+    assert result.metadata["optimization"]["zero_hit_suppression_count"] == 2
 
 
 def test_card_without_vocabulary_produces_no_skills_section(

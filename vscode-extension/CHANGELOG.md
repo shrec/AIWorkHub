@@ -1,5 +1,40 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.12.0 — 2026-09-08
+
+### Added
+
+- A tool-recipe run surface with usage evidence: the Tool Recipes panel now
+  separates recipes that have run from the ones nobody has used, and reports
+  who ran each. Seven operator recipes ship as package modules, so they work in
+  every repository AIWorkHub manages instead of only in its own checkout.
+- An accept preview that answers what would block an acceptance before any
+  candidate tree is built.
+- Skill usage evidence: a decision now records which skills the card received
+  and the actor that produced the outcome, so a skill's activation evidence is
+  measured rather than typed.
+
+### Changed
+
+- Manager bootstrap sends its contract once per session and the live identity
+  every time, and folds in the repository and task-health facts that used to
+  need two more calls.
+- Task, NeedFix and review tools answer with receipts instead of echoing back
+  the text the caller just sent.
+- Reviewers receive the diff and the validation output the review packet always
+  promised, for the one lens they were launched for.
+
+### Fixed
+
+- A rework worker now receives the measured failure from the attempt that
+  preceded it instead of rediscovering it.
+- The automatic reviewer launch driver works again; reviewers no longer have to
+  be launched by hand.
+- Task usage records carry their topic, so cost and routing views stop
+  reporting a third of all work as unknown.
+- The operator recipe scripts are shipped with the package; they were never
+  committed and could not run outside a developer's own working copy.
+
 ## 0.11.5 — 2026-09-08
 
 ### Fixed

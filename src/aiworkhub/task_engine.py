@@ -989,6 +989,112 @@ def archive_task(
     }
 
 
+# Batch archive surface. Measured: 210 single-id archive calls in 27 manager
+# sessions (62% of all assistant turns were pure tool relays), each re-sending
+# the whole manager context to the provider for a 195-byte envelope. The loop
+# runs here under the same per-item write gate the single form uses; each
+# item keeps its own audit event and its own receipt, so one refusal never
+# hides behind an all-or-nothing reply.
+MAX_ARCHIVE_BATCH = 200
+ARCHIVE_SELECTOR_FIELDS = ("status", "topic", "older_than_hours", "task_id_prefix")
+_ARCHIVE_SELECTION_SCAN_LIMIT = 5000
+
+
+def archive_receipt(task_id: str, result: Any) -> dict[str, Any]:
+    """Project one archive envelope (``archive_task``/``core.archive_task``)
+    to a per-id receipt ``{task_id, ok, status_after, error?}``."""
+
+    if not isinstance(result, dict):
+        return {"task_id": task_id, "ok": False, "status_after": None, "error": "archive_result_invalid"}
+    ok = bool(result.get("ok"))
+    status_after = None
+    stdout = result.get("stdout")
+    if isinstance(stdout, str) and stdout:
+        try:
+            payload = json.loads(stdout)
+        except ValueError:
+            payload = None
+        if isinstance(payload, dict):
+            status_after = payload.get("status")
+    receipt: dict[str, Any] = {"task_id": task_id, "ok": ok, "status_after": status_after}
+    if not ok:
+        receipt["error"] = str(
+            result.get("stderr") or result.get("error") or "archive_failed"
+        )[:300]
+    return receipt
+
+
+def _parse_iso_timestamp(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def select_archivable_tasks(
+    repo: Path,
+    *,
+    status: str | None = None,
+    topic: str | None = None,
+    older_than_hours: float | None = None,
+    task_id_prefix: str | None = None,
+    limit: int = MAX_ARCHIVE_BATCH,
+) -> dict[str, Any]:
+    """Read-only selection of cards a batch archive would act on.
+
+    Filters are conjunctive. Already archived/superseded rows are skipped;
+    ``processing`` rows are listed under ``refused`` (the archive backend
+    refuses them, ``allow_processing=False``) so a preview names them instead
+    of silently dropping them. Never writes.
+    """
+
+    rows = task_store.list_tasks(repo, status=status or None, limit=_ARCHIVE_SELECTION_SCAN_LIMIT)
+    now = datetime.now(timezone.utc)
+    bounded_limit = max(1, min(int(limit), MAX_ARCHIVE_BATCH))
+    selected: list[dict[str, Any]] = []
+    refused: list[dict[str, Any]] = []
+    for row in rows:
+        task_id = str(row.get("task_id") or "")
+        canonical = str(row.get("status") or "")
+        row_topic = str(row.get("topic") or "")
+        if topic and row_topic != topic:
+            continue
+        if task_id_prefix and not task_id.startswith(task_id_prefix):
+            continue
+        if older_than_hours is not None:
+            updated = _parse_iso_timestamp(row.get("updated_at"))
+            if updated is None or (now - updated).total_seconds() < float(older_than_hours) * 3600.0:
+                continue
+        entry = {
+            "task_id": task_id,
+            "status": canonical,
+            "topic": row_topic,
+            "updated_at": row.get("updated_at"),
+        }
+        if canonical in ("archived", "superseded"):
+            continue
+        if canonical == "processing":
+            refused.append({**entry, "reason": "processing_refused"})
+            continue
+        selected.append(entry)
+    return {
+        "selected": selected[:bounded_limit],
+        "selected_count": min(len(selected), bounded_limit),
+        "truncated": len(selected) > bounded_limit,
+        "refused": refused,
+        "scanned": len(rows),
+        "limit": bounded_limit,
+    }
+
+
 _REVIEWER_CHILD_TERMINAL_STATUSES = ("finished", "done", "archived", "superseded")
 
 

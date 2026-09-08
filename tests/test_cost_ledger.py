@@ -344,6 +344,145 @@ def test_repo_bound_usage_preserves_retries_and_cache_economics(monkeypatch, tmp
     }
 
 
+def test_topic_less_usage_event_is_joined_with_visible_provenance(monkeypatch, tmp_path) -> None:
+    """retries-4: 1,423 live usage_record rows carry no topic key. The ledger
+    recovers it from request-time identity (the process-ledger row for the
+    same task/request) and otherwise from tasks.topic, labels the source, and
+    leaves every token count untouched."""
+    ledger = tmp_path / ".aiworkhub/runtime/process_logs/process_events.jsonl"
+    ledger.parent.mkdir(parents=True)
+    ledger.write_text(
+        '{"task_id":"T1","request_id":"R1","repository_id":"repo-1","topic":"representation"}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        cost_ledger.task_store,
+        "list_usage_events",
+        lambda _root, limit=10_000: [
+            {
+                "task_id": "T1", "runner": "codex", "request_id": "R1",
+                "repository_id": "repo-1", "role": "worker",
+                "input_tokens": 100, "output_tokens": 20, "total_tokens": 120,
+                "usage_observed": True, "created_at": "2026-09-03T01:02:03+00:00",
+            },
+            {
+                "task_id": "T2", "runner": "codex", "request_id": "R2",
+                "repository_id": "repo-1", "role": "worker",
+                "input_tokens": 50, "output_tokens": 5, "total_tokens": 55,
+                "usage_observed": True, "created_at": "2026-09-03T01:02:04+00:00",
+            },
+            {
+                "task_id": "T3", "runner": "codex", "request_id": "R3",
+                "repository_id": "repo-1", "role": "worker", "topic": "code",
+                "input_tokens": 1, "output_tokens": 1, "total_tokens": 2,
+                "usage_observed": True, "created_at": "2026-09-03T01:02:05+00:00",
+            },
+            {
+                "task_id": "T-GONE", "runner": "codex", "request_id": "R4",
+                "repository_id": "repo-1", "role": "worker",
+                "input_tokens": 3, "output_tokens": 0, "total_tokens": 3,
+                "usage_observed": True, "created_at": "2026-09-03T01:02:06+00:00",
+            },
+        ],
+    )
+    list_tasks_calls: list[dict] = []
+
+    def fake_list_tasks(_root, **kwargs):
+        list_tasks_calls.append(kwargs)
+        return [{"task_id": "T2", "topic": "quality_review"}, {"task_id": "T1", "topic": "other"}]
+
+    monkeypatch.setattr(cost_ledger.task_store, "list_tasks", fake_list_tasks)
+
+    rows = {row["task_id"]: row for row in cost_ledger._canonical_usage_rows(tmp_path)}
+
+    assert (rows["T1"]["topic"], rows["T1"]["topic_source"]) == ("representation", "process_event_join")
+    assert (rows["T2"]["topic"], rows["T2"]["topic_source"]) == ("quality_review", "task_join")
+    assert (rows["T3"]["topic"], rows["T3"]["topic_source"]) == ("code", "usage_event")
+    assert (rows["T-GONE"]["topic"], rows["T-GONE"]["topic_source"]) == ("", "unresolved")
+    # Explicit role wins; the joined topic never rewrites tokens.
+    assert rows["T2"]["role"] == "worker"
+    assert rows["T1"]["total_tokens"] == 120 and rows["T2"]["total_tokens"] == 55
+    assert len(list_tasks_calls) == 1  # one bounded query, built lazily
+
+    result = cost_ledger.build_cost_ledger(repo_root=tmp_path)
+    assert result["aggregates"]["by_topic"]["representation"]["total_tokens"] == 120
+    assert result["aggregates"]["by_topic"]["quality_review"]["total_tokens"] == 55
+    assert result["topic_quality"] == {
+        "records_by_source": {
+            "process_event_join": 1, "task_join": 1, "unresolved": 1, "usage_event": 1,
+        },
+        "joined_topic_changes_attribution_not_tokens": True,
+    }
+
+
+def test_healthy_ledger_never_queries_tasks_for_topic(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(
+        cost_ledger.task_store,
+        "list_usage_events",
+        lambda _root, limit=10_000: [{
+            "task_id": "T1", "runner": "codex", "topic": "code", "total_tokens": 1,
+            "created_at": "2026-09-03T01:02:03+00:00",
+        }],
+    )
+    monkeypatch.setattr(
+        cost_ledger.task_store,
+        "list_tasks",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("no task join needed")),
+    )
+    [row] = cost_ledger._canonical_usage_rows(tmp_path)
+    assert row["topic_source"] == "usage_event"
+
+
+def test_backfilled_attempt_time_drives_day_bucket_and_retry_order(monkeypatch, tmp_path) -> None:
+    """retries-5: a backfilled row is written at the backfill instant; its
+    payload's attempt_recorded_at is the run's own finish time. The day bucket,
+    retry ordering and decision matching follow the attempt time while
+    created_at remains the audit write time."""
+    monkeypatch.setattr(
+        cost_ledger.task_store,
+        "list_usage_events",
+        lambda _root, limit=10_000: [
+            {
+                "task_id": "T1", "runner": "codex", "topic": "code", "role": "worker",
+                "source": "task_mcp_launcher", "note": "task_mcp_request:req-live",
+                "total_tokens": 700, "input_tokens": 600, "output_tokens": 100,
+                "usage_observed": True, "cost_observed": False,
+                "created_at": "2026-08-03T02:00:00+00:00",
+            },
+            {
+                "task_id": "T1", "runner": "codex", "topic": "code", "role": "worker",
+                "source": "terminal_log_backfill", "note": "task_mcp_request:req-first",
+                "attempt_recorded_at": "2026-08-03T01:00:00+00:00",
+                "total_tokens": 300, "input_tokens": 250, "output_tokens": 50,
+                "usage_observed": True, "cost_observed": False,
+                "created_at": "2026-09-06T09:07:00+00:00",  # backfill instant
+            },
+        ],
+    )
+    monkeypatch.setattr(
+        cost_ledger.task_store,
+        "latest_manager_decisions",
+        lambda _root: {
+            "T1": {"decision": "accepted", "created_at": "2026-08-03T03:00:00+00:00"}
+        },
+    )
+
+    result = cost_ledger.build_cost_ledger(repo_root=tmp_path, include_tasks=True)
+
+    backfilled = next(row for row in result["tasks"] if row["attempt_id"] == "req-first")
+    assert backfilled["created_at"] == "2026-09-06T09:07:00+00:00"
+    assert backfilled["attempt_recorded_at"] == "2026-08-03T01:00:00+00:00"
+    assert backfilled["day"] == "2026-08-03"
+    assert "2026-09-06" not in result["aggregates"]["by_day"]
+    assert result["aggregates"]["by_day"]["2026-08-03"]["total_tokens"] == 1000
+    # The backfilled row is the FIRST attempt; only the live row is a retry.
+    economics = result["retry_economics"]
+    assert economics["retry_records"] == 1
+    assert economics["retry_tokens"] == 700
+    # The decision at 03:00 matches the latest attempt that ran before it.
+    assert result["model_outcomes"]["unmatched_decisions"] == 0
+
+
 def test_cache_ratio_is_unknown_when_provider_did_not_report_cache_metrics() -> None:
     aggregate = cost_ledger._aggregate(
         [{

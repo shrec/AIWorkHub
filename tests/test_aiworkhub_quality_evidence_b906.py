@@ -466,3 +466,149 @@ def test_declared_check_descriptors_never_executes(tmp_path, monkeypatch):
     descriptors = qe.declared_check_descriptors(repo)
     assert len(descriptors) == 1
     assert descriptors[0].status == qe.STATUS_SKIPPED
+
+
+# --- the review_ready risk observation (audit 2026-09-08, problem 3) --------
+#
+# Measured before this existed:
+# ``terminal_review.quality_gate.risk_profile.effective_tier`` was ``low`` in
+# 1,370 of 1,370 review_ready gates that carried a profile, because the
+# finalizer ran the gate with NO risk signals at all -- so every manager had to
+# predict the tier, and therefore the reviewer lens set, by hand. The
+# reachability observation had been evaluated in 0 of 299 accepts.
+
+
+def _code_card() -> dict:
+    return {"task_id": "T-1", "task_type": "code", "validation": ["pytest -q"]}
+
+
+def test_review_ready_risk_observation_names_the_tier_and_its_lenses():
+    observation = qe.review_ready_risk_observation(
+        _code_card(),
+        ["src/aiworkhub/process_launcher.py", "src/aiworkhub/task_store.py"],
+    )
+
+    assert observation["schema_id"] == qe.REVIEW_READY_RISK_SCHEMA_ID
+    assert observation["error"] == ""
+    # Exactly what resolve_risk_profile derives from the same signals.
+    profile = qe.resolve_risk_profile(
+        qe.RISK_LOW, signals=qe.derive_risk_signals(_code_card(), [
+            "src/aiworkhub/process_launcher.py", "src/aiworkhub/task_store.py",
+        ])
+    )
+    assert observation["effective_tier"] == profile["effective_tier"]
+    assert observation["required_reviewer_lenses"] == (
+        profile["required_reviewer_lenses"]
+    )
+    assert observation["effective_tier"] != qe.RISK_LOW
+    assert observation["changed_path_count"] == 2
+
+
+def test_review_ready_risk_observation_reports_its_own_failure_never_raises():
+    """Describing a candidate must never fail a finalization."""
+    observation = qe.review_ready_risk_observation(
+        _code_card(), ["src/x.py"], requested_risk_tier="not-a-tier"
+    )
+    assert observation["error"].startswith("MalformedConfigError:")
+    assert observation["effective_tier"] == ""
+    assert observation["required_reviewer_lenses"] == []
+
+
+def test_review_ready_gate_records_the_tier_without_enforcing_the_review_half(
+    tmp_path,
+):
+    """The record grows; the bar does not move.
+
+    The reviewer/approval/combined-tree requirements are decidable only at
+    acceptance, where the receipts and the verified manager exist. Enforcing
+    them at review_ready would refuse every medium-and-higher candidate for
+    evidence that cannot exist yet -- so this call refuses exactly what the
+    old low-tier call refused, and names the true tier while doing it.
+    """
+    repo = _repo(tmp_path)
+    (repo / "src").mkdir()
+    (repo / "src" / "process_launcher.py").write_text("x = 1\n", encoding="utf-8")
+
+    gate = qe.run_review_ready_quality_gate(
+        repo, card=_code_card(), changed_paths=["src/process_launcher.py"]
+    )
+
+    assert gate["passed"] is True
+    assert gate["review_meta_gates_enforced"] is False
+    profile = gate["review_risk_profile"]
+    assert profile["effective_tier"] != qe.RISK_LOW
+    assert profile["required_reviewer_lenses"]
+    # The REPORTED profile is the complete one -- the tier and lens set a
+    # manager needs -- while the fold that decided ``passed`` was the
+    # mechanical half only.
+    assert gate["risk_profile"]["effective_tier"] == profile["effective_tier"]
+    assert gate["risk_profile"]["required_reviewer_lenses"] == (
+        profile["required_reviewer_lenses"]
+    )
+    assert "required_reviewer_missing:correctness" not in (
+        gate.get("blocking_checks") or []
+    )
+    assert "combined_tree_evidence_missing" not in (gate.get("blocking_checks") or [])
+
+
+def test_review_ready_gate_records_reachability_as_not_evaluated(tmp_path):
+    """Unavailable inputs are recorded as unevaluated, never as all-reachable.
+
+    Measured: the reachability observation had been evaluated in 0 of 299
+    accepts, and read as silence rather than as "not measured".
+    """
+    repo = _repo(tmp_path)
+    (repo / "src").mkdir()
+    (repo / "src" / "service.py").write_text("x = 1\n", encoding="utf-8")
+
+    gate = qe.run_review_ready_quality_gate(
+        repo, card=_code_card(), changed_paths=["src/service.py"]
+    )
+
+    assert gate["reachability"]["evaluated"] is False
+    assert gate["reachability"]["reason"] == "reachability_inputs_unavailable"
+    assert gate["reachability"]["all_reachable"] is None
+    assert gate["reachability"]["blocking"] is False
+
+
+def test_review_ready_gate_reports_reachability_when_inputs_exist(tmp_path):
+    repo = _repo(tmp_path)
+    (repo / "src").mkdir()
+    (repo / "src" / "service.py").write_text("x = 1\n", encoding="utf-8")
+
+    gate = qe.run_review_ready_quality_gate(
+        repo,
+        card=_code_card(),
+        changed_paths=["src/service.py"],
+        reachability_inputs={
+            "changed_symbols": [{"symbol": "orphan", "path": "src/service.py"}],
+            "call_edges": [],
+            "reference_edges": [],
+            "entry_points": ["main"],
+        },
+    )
+
+    assert gate["reachability"]["evaluated"] is True
+    # An unreachable addition is NAMED, never a gate failure.
+    assert gate["reachability"]["blocking"] is False
+    assert gate["passed"] is True
+
+
+def test_completion_gate_still_enforces_the_review_half_by_default(tmp_path):
+    """``accept_review`` keeps running the FULL profile: the review-ready fold
+    is an explicit opt-out, not a new default."""
+    repo = _repo(tmp_path)
+    (repo / "src").mkdir()
+    (repo / "src" / "service.py").write_text("x = 1\n", encoding="utf-8")
+
+    gate = qe.run_completion_quality_gate(
+        repo,
+        changed_paths=["src/service.py"],
+        requested_risk_tier=qe.RISK_MEDIUM,
+    )
+
+    assert gate["review_meta_gates_enforced"] is True
+    assert gate["passed"] is False
+    blockers = gate["blocking_checks"]
+    assert "required_reviewer_missing:correctness" in blockers
+    assert "combined_tree_evidence_missing" in blockers

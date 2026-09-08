@@ -62,12 +62,50 @@ REASON_NON_LITERAL_EXECUTABLE = "non_literal_executable"
 REASON_EMPTY_ARGV = "empty_argv"
 REASON_DUPLICATE = "duplicate_definition"
 REASON_BAD_MANIFEST = "bad_manifest"
+REASON_UNVERIFIED_ACTOR = "unverified_actor"
 
 # Capability tags with security meaning.  Discovery and cache eligibility key
 # on these exact strings.
 CAPABILITY_WRITE = "write"
 CAPABILITY_SECRET = "secret"
 CAPABILITY_NETWORK = "network"
+
+# Exit taxonomy.  ``not_executed`` is the placeholder this module binds on its
+# own: nothing here runs anything, so an unbound receipt says exactly that.
+# The other three are the only outcomes an execution surface can observe, and
+# they are named HERE rather than in the runner so a receipt reader branches on
+# one vocabulary owned by the module that defines the receipt.
+EXIT_STATUS_NOT_EXECUTED = "not_executed"
+EXIT_STATUS_COMPLETED = "completed"
+EXIT_STATUS_TIMEOUT = "timeout"
+EXIT_STATUS_SPAWN_FAILED = "spawn_failed"
+EXIT_STATUSES = frozenset(
+    {
+        EXIT_STATUS_NOT_EXECUTED,
+        EXIT_STATUS_COMPLETED,
+        EXIT_STATUS_TIMEOUT,
+        EXIT_STATUS_SPAWN_FAILED,
+    }
+)
+
+# Actor taxonomy.  A receipt records WHO ran the invocation, and the vocabulary
+# lives here for the same reason the exit taxonomy does: a receipt reader
+# branches on one vocabulary owned by the module that defines the receipt.
+#
+# ``unattributed`` is the placeholder, and it is not a courtesy default -- it is
+# the only honest answer when no verified route produced the run, and it carries
+# NO identity fields at all, so "nobody could be named" and "somebody was named"
+# are different shapes rather than one shape with empty strings in it.  This
+# repository has already been bitten by free-text actor identity (skill
+# activation counts DISTINCT actor strings, and a typed string is not an
+# identity), so an actor is constructed from a verified route by the server or
+# it is not constructed at all.
+ACTOR_KIND_UNATTRIBUTED = "unattributed"
+ACTOR_KIND_MANAGER = "manager"
+ACTOR_KIND_WORKER = "worker"
+ACTOR_KINDS = frozenset(
+    {ACTOR_KIND_UNATTRIBUTED, ACTOR_KIND_MANAGER, ACTOR_KIND_WORKER}
+)
 
 # Cache disqualification reasons.
 CACHE_REASON_POLICY = "cache_policy_never"
@@ -90,13 +128,34 @@ MAX_DISCOVERY_LIMIT = 256
 CHANGED_PATH_SHAPE = "list[str] of repository-relative changed paths"
 
 
-class RecipeError(Exception):
-    """A fail-closed recipe failure carrying a stable ``reason`` string."""
+class RecipeErrorBase(Exception):
+    """The one definition of a fail-closed failure's ``(reason, message)`` pair.
+
+    Two layers raise these failures: this description/validation layer, and the
+    execution surface in ``recipe_runner``. Both carry the same two attributes,
+    and the construction that binds them is written HERE once rather than
+    copied into each -- this module owns the stable ``REASON_*`` vocabulary the
+    ``reason`` is drawn from, and ``recipe_runner`` already imports it, so the
+    dependency runs one way only.
+
+    The two concrete errors are SIBLINGS under this base, never parent and
+    child. Callers branch on *which layer* refused:
+    ``manager_recipe_tools.run`` catches :class:`RecipeError` first and
+    ``recipe_runner.RecipeRunError`` second, returning a different reply shape
+    for each. Making the run error a subclass of :class:`RecipeError` would
+    make every run failure match the validation branch that precedes it, and
+    the discrimination would be lost silently -- no test would fail on the
+    class hierarchy, only on the reply body.
+    """
 
     def __init__(self, reason: str, message: str) -> None:
         super().__init__(message)
         self.reason = reason
         self.message = message
+
+
+class RecipeError(RecipeErrorBase):
+    """A fail-closed recipe failure carrying a stable ``reason`` string."""
 
 
 # ---------------------------------------------------------------------------
@@ -990,19 +1049,177 @@ def cache_eligibility(recipe: Recipe) -> CacheDecision:
 
 @dataclass(frozen=True)
 class TimingPlaceholder:
-    """Timing placeholders; populated only by a (not-present) execution engine."""
+    """Timing: unbound placeholders by default, a measurement when supplied.
+
+    This module still fabricates nothing -- every field defaults to ``None``
+    and nothing here can fill one in. An execution surface that genuinely
+    measured a run binds the values it measured through
+    :func:`build_receipt`, and the constructor refuses a shape that could not
+    have been measured (a non-string timestamp, a negative or non-finite
+    duration), so an unbound receipt and a measured one are distinguishable
+    and neither can carry a plausible-looking invention.
+    """
 
     started_at: str | None = None
     finished_at: str | None = None
     duration_seconds: float | None = None
 
+    def __post_init__(self) -> None:
+        for label in ("started_at", "finished_at"):
+            value = getattr(self, label)
+            if value is not None and (not isinstance(value, str) or value == ""):
+                raise RecipeError(
+                    REASON_INVALID_TYPE, f"{label} must be a non-empty str or None"
+                )
+        duration = self.duration_seconds
+        if duration is None:
+            return
+        if isinstance(duration, bool) or not isinstance(duration, (int, float)):
+            raise RecipeError(REASON_INVALID_TYPE, "duration_seconds must be a number")
+        if not math.isfinite(float(duration)) or float(duration) < 0:
+            raise RecipeError(
+                REASON_OUT_OF_RANGE, "duration_seconds must be finite and non-negative"
+            )
+        object.__setattr__(self, "duration_seconds", float(duration))
+
 
 @dataclass(frozen=True)
 class ExitPlaceholder:
-    """Exit taxonomy placeholders; no exit is fabricated in this foundation."""
+    """Exit taxonomy: an unbound placeholder by default, a measurement when bound.
 
-    status: str = "not_executed"
+    ``status`` defaults to :data:`EXIT_STATUS_NOT_EXECUTED`, which is what a
+    receipt built by this module alone honestly says. A caller that ran the
+    invocation binds one of the other :data:`EXIT_STATUSES`; an unknown string
+    is refused, so the taxonomy cannot drift into a second vocabulary.
+    """
+
+    status: str = EXIT_STATUS_NOT_EXECUTED
     exit_code: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.status not in EXIT_STATUSES:
+            raise RecipeError(
+                REASON_INVALID_ENUM, f"unknown exit status {self.status!r}"
+            )
+        code = self.exit_code
+        if code is not None and (isinstance(code, bool) or not isinstance(code, int)):
+            raise RecipeError(REASON_INVALID_TYPE, "exit_code must be an int or None")
+
+
+@dataclass(frozen=True)
+class ActorIdentity:
+    """WHO ran an invocation: an unbound placeholder, or a verified route.
+
+    The registry could always say how many recipes existed and, once receipts
+    landed, how many runs existed. It could never say whether anything USED
+    them, because a receipt bound no actor of any kind -- no session, no
+    provider, no role, no runner, no task. "22 recipes, measured" therefore
+    reported that rows existed, which is not the question anyone asks.
+
+    Three shapes, and the constructor refuses every other one:
+
+    * ``unattributed`` -- the default, carrying NO identity fields at all. A
+      run whose actor could not be verified is recorded as nobody, never as a
+      plausible somebody.
+    * ``manager`` -- requires ``provider`` AND ``session_id``, which is exactly
+      the verified manager route ``manager_recipe_tools`` already resolves from
+      ``core.manager_bootstrap``.
+    * ``worker`` -- requires ``runner`` AND at least one of ``request_id`` /
+      ``task_id``, which is the card-bound identity a launched worker carries.
+
+    :attr:`key` is DERIVED, never supplied. It is the string a distinct-actor
+    count groups on, and deriving it here is the whole point: this repository
+    already learned that counting distinct free-text actor strings lets one
+    typed string become an identity (skill activation needs two DISTINCT actor
+    identities, and a caller who can type both defeats it). A caller that
+    passes a ``key`` at all must pass the one this class would have computed,
+    so a round-trip through JSON is lossless and an invented key is refused.
+
+    Nothing here consults a route. It validates a shape; the SERVER supplies
+    the fields from a route it verified, and there is no MCP parameter through
+    which a model can name itself.
+    """
+
+    kind: str = ACTOR_KIND_UNATTRIBUTED
+    provider: str | None = None
+    session_id: str | None = None
+    request_id: str | None = None
+    task_id: str | None = None
+    runner: str | None = None
+    key: str = ""
+
+    def __post_init__(self) -> None:
+        if self.kind not in ACTOR_KINDS:
+            raise RecipeError(REASON_INVALID_ENUM, f"unknown actor kind {self.kind!r}")
+        for label in ("provider", "session_id", "request_id", "task_id", "runner"):
+            value = getattr(self, label)
+            if value is None:
+                continue
+            if not isinstance(value, str):
+                raise RecipeError(
+                    REASON_INVALID_TYPE, f"actor {label} must be a str or None"
+                )
+            # An identity that cannot be written down safely is not an identity
+            # this receipt will carry: it is refused, not sanitized into
+            # something that no longer names the route it came from.
+            #
+            # Stricter than shell-safety, and for a reason shell-safety does
+            # not cover: ``key`` joins these fields with ``:``, so a field
+            # containing ``:`` (or a space) would let two different routes
+            # derive one key -- ``provider="a:b", session="c"`` and
+            # ``provider="a", session="b:c"`` are different actors and would
+            # count as one. A separator inside a field is an identity
+            # collision, so it is refused here rather than escaped later.
+            if not _is_safe_literal(value) or ":" in value:
+                raise RecipeError(
+                    REASON_UNSAFE_VALUE,
+                    f"actor {label} {value!r} must be a single token without ':'",
+                )
+        named = tuple(
+            label
+            for label in ("provider", "session_id", "request_id", "task_id", "runner")
+            if getattr(self, label) is not None
+        )
+        if self.kind == ACTOR_KIND_UNATTRIBUTED and named:
+            raise RecipeError(
+                REASON_UNVERIFIED_ACTOR,
+                f"an unattributed actor must carry no identity, got {list(named)}",
+            )
+        if self.kind == ACTOR_KIND_MANAGER and not (self.provider and self.session_id):
+            raise RecipeError(
+                REASON_UNVERIFIED_ACTOR,
+                "a manager actor requires the verified route's provider and session_id",
+            )
+        if self.kind == ACTOR_KIND_WORKER and not (
+            self.runner and (self.request_id or self.task_id)
+        ):
+            raise RecipeError(
+                REASON_UNVERIFIED_ACTOR,
+                "a worker actor requires runner and request_id or task_id",
+            )
+        derived = self._derive_key()
+        if self.key and self.key != derived:
+            raise RecipeError(
+                REASON_UNVERIFIED_ACTOR,
+                "actor key is derived from the verified route and cannot be supplied",
+            )
+        object.__setattr__(self, "key", derived)
+
+    def _derive_key(self) -> str:
+        if self.kind == ACTOR_KIND_MANAGER:
+            return f"{ACTOR_KIND_MANAGER}:{self.provider}:{self.session_id}"
+        if self.kind == ACTOR_KIND_WORKER:
+            return (
+                f"{ACTOR_KIND_WORKER}:{self.runner}:"
+                f"{self.request_id or self.task_id}"
+            )
+        return ""
+
+
+# The one unbound actor. A receipt built without a verified route binds THIS,
+# so "no actor" is a single shared object rather than a shape each caller
+# reinvents.
+UNATTRIBUTED_ACTOR = ActorIdentity()
 
 
 @dataclass(frozen=True)
@@ -1010,10 +1227,11 @@ class InvocationReceipt:
     """A deterministic receipt binding a validated invocation.
 
     It binds recipe version/digest, normalized parameters, the argv vector,
-    repository/HEAD identity inputs, timing/exit *placeholders* and the shape
-    (plus caller-supplied content) of changed-path evidence.  Nothing here is
-    fabricated: timing/exit default to placeholders and changed paths are only
-    whatever the caller supplied (empty by default).
+    repository/HEAD identity inputs, timing/exit *placeholders*, the ACTOR the
+    run is attributable to, the bytes the run returned to that actor, and the
+    shape (plus caller-supplied content) of changed-path evidence.  Nothing
+    here is fabricated: timing/exit/actor default to placeholders and changed
+    paths are only whatever the caller supplied (empty by default).
     """
 
     recipe_id: str
@@ -1027,6 +1245,8 @@ class InvocationReceipt:
     capabilities: tuple[str, ...]
     timing: TimingPlaceholder
     exit: ExitPlaceholder
+    actor: ActorIdentity
+    returned_digest_bytes: int | None
     changed_path_shape: str
     changed_paths: tuple[str, ...]
     digest: str
@@ -1066,37 +1286,154 @@ def _validate_changed_paths(changed_paths: Iterable[str]) -> tuple[str, ...]:
     return tuple(sorted(validated))
 
 
+def _receipt_payload_fields(
+    recipe: Recipe,
+    params: tuple[tuple[str, str], ...],
+    argv: tuple[str, ...],
+    repository: str | None,
+    head: str | None,
+    platform: str | None,
+    capabilities: tuple[str, ...],
+    timing: TimingPlaceholder,
+    exit_state: ExitPlaceholder,
+    actor: ActorIdentity,
+    returned_digest_bytes: int | None,
+    paths: tuple[str, ...],
+) -> dict[str, Any]:
+    """Return the exact mapping a receipt digest is computed over."""
+    return {
+        "recipe_id": recipe.id,
+        "recipe_version": recipe.version,
+        "recipe_digest": recipe.digest,
+        "normalized_parameters": [list(pair) for pair in params],
+        "argv": list(argv),
+        "repository": repository,
+        "head": head,
+        "platform": platform,
+        "capabilities": list(capabilities),
+        "timing": _canonicalize(timing),
+        "exit": _canonicalize(exit_state),
+        "actor": _canonicalize(actor),
+        "returned_digest_bytes": returned_digest_bytes,
+        "changed_path_shape": CHANGED_PATH_SHAPE,
+        "changed_paths": list(paths),
+    }
+
+
+def receipt_digest(payload: Mapping[str, Any]) -> str:
+    """Return the deterministic digest of a receipt payload.
+
+    The payload is the mapping :func:`receipt_payload` emits -- the receipt
+    WITHOUT its own ``digest`` field, which is what :func:`build_receipt`
+    hashes. Exposing it means a persisted receipt can be verified from its
+    stored bytes alone, exactly as :func:`recipe_digest` allows for a manifest.
+    """
+    if not isinstance(payload, Mapping):
+        raise RecipeError(REASON_BAD_MANIFEST, "receipt payload must be a mapping")
+    return _sha256(canonical_json(payload))
+
+
+def receipt_payload(receipt: "InvocationReceipt") -> dict[str, Any]:
+    """Return the canonical, JSON-safe payload of ``receipt``.
+
+    This is the exact mapping the receipt's own ``digest`` covers, so a payload
+    and the digest of the receipt it came from can never describe different
+    bytes: ``receipt_digest(receipt_payload(r)) == r.digest``.
+    """
+    if not isinstance(receipt, InvocationReceipt):
+        raise RecipeError(REASON_BAD_MANIFEST, "receipt_payload requires an InvocationReceipt")
+    return {
+        "recipe_id": receipt.recipe_id,
+        "recipe_version": receipt.recipe_version,
+        "recipe_digest": receipt.recipe_digest,
+        "normalized_parameters": [list(pair) for pair in receipt.normalized_parameters],
+        "argv": list(receipt.argv),
+        "repository": receipt.repository,
+        "head": receipt.head,
+        "platform": receipt.platform,
+        "capabilities": list(receipt.capabilities),
+        "timing": _canonicalize(receipt.timing),
+        "exit": _canonicalize(receipt.exit),
+        "actor": _canonicalize(receipt.actor),
+        "returned_digest_bytes": receipt.returned_digest_bytes,
+        "changed_path_shape": receipt.changed_path_shape,
+        "changed_paths": list(receipt.changed_paths),
+    }
+
+
 def build_receipt(
     validated: ValidatedInvocation,
     *,
     repository: str | None = None,
     head: str | None = None,
     changed_paths: Iterable[str] = (),
+    timing: TimingPlaceholder | None = None,
+    exit_state: ExitPlaceholder | None = None,
+    actor: ActorIdentity | None = None,
+    returned_digest_bytes: int | None = None,
 ) -> InvocationReceipt:
-    """Bind a receipt from a validated invocation plus caller identity inputs."""
+    """Bind a receipt from a validated invocation plus caller identity inputs.
+
+    ``timing``/``exit_state``/``actor`` default to the unbound placeholders,
+    which is what a receipt built by this module alone honestly reports. A
+    caller that genuinely RAN the invocation passes what it measured; this
+    function still measures nothing itself and cannot tell whether it was
+    handed a measurement, so every placeholder constructor refuses a shape no
+    measurement could have produced.
+
+    ``actor`` must be an :class:`ActorIdentity` or ``None``. A mapping or a
+    string is REFUSED rather than coerced, which is where "the actor is
+    server-derived and never accepted from the caller" stops being a promise:
+    the only way to reach this parameter is to construct the dataclass, and the
+    dataclass demands the field set of a verified route.
+    """
     recipe = validated.recipe
     params = tuple(
         (name, canonical_json(value)) for name, value in validated.normalized_parameters
     )
-    timing = TimingPlaceholder()
-    exit_placeholder = ExitPlaceholder()
+    if timing is None:
+        timing = TimingPlaceholder()
+    elif not isinstance(timing, TimingPlaceholder):
+        raise RecipeError(REASON_INVALID_TYPE, "timing must be a TimingPlaceholder")
+    if exit_state is None:
+        exit_placeholder = ExitPlaceholder()
+    elif isinstance(exit_state, ExitPlaceholder):
+        exit_placeholder = exit_state
+    else:
+        raise RecipeError(REASON_INVALID_TYPE, "exit_state must be an ExitPlaceholder")
+    if actor is None:
+        bound_actor = UNATTRIBUTED_ACTOR
+    elif isinstance(actor, ActorIdentity):
+        bound_actor = actor
+    else:
+        raise RecipeError(REASON_INVALID_TYPE, "actor must be an ActorIdentity")
+    if returned_digest_bytes is not None:
+        if isinstance(returned_digest_bytes, bool) or not isinstance(
+            returned_digest_bytes, int
+        ):
+            raise RecipeError(
+                REASON_INVALID_TYPE, "returned_digest_bytes must be an int or None"
+            )
+        if returned_digest_bytes < 0:
+            raise RecipeError(
+                REASON_OUT_OF_RANGE, "returned_digest_bytes must be non-negative"
+            )
     paths = _validate_changed_paths(changed_paths)
-    payload = {
-        "recipe_id": recipe.id,
-        "recipe_version": recipe.version,
-        "recipe_digest": recipe.digest,
-        "normalized_parameters": [list(pair) for pair in params],
-        "argv": list(validated.argv),
-        "repository": repository,
-        "head": head,
-        "platform": validated.platform,
-        "capabilities": list(validated.capabilities),
-        "timing": _canonicalize(timing),
-        "exit": _canonicalize(exit_placeholder),
-        "changed_path_shape": CHANGED_PATH_SHAPE,
-        "changed_paths": list(paths),
-    }
-    digest = _sha256(canonical_json(payload))
+    payload = _receipt_payload_fields(
+        recipe,
+        params,
+        validated.argv,
+        repository,
+        head,
+        validated.platform,
+        validated.capabilities,
+        timing,
+        exit_placeholder,
+        bound_actor,
+        returned_digest_bytes,
+        paths,
+    )
+    digest = receipt_digest(payload)
     return InvocationReceipt(
         recipe_id=recipe.id,
         recipe_version=recipe.version,
@@ -1109,6 +1446,8 @@ def build_receipt(
         capabilities=validated.capabilities,
         timing=timing,
         exit=exit_placeholder,
+        actor=bound_actor,
+        returned_digest_bytes=returned_digest_bytes,
         changed_path_shape=CHANGED_PATH_SHAPE,
         changed_paths=paths,
         digest=digest,

@@ -27,7 +27,9 @@ evidence entries can never collapse into one lost update.
 
 from __future__ import annotations
 
+import re
 import sqlite3
+from collections import Counter
 from pathlib import Path
 from typing import Any, Callable
 
@@ -88,6 +90,55 @@ def _manager_context() -> tuple[Path | None, str, dict[str, Any]]:
 _TASK_EVIDENCE_ROLES = ("worker", "reviewer")
 _REVIEW_TOPICS = frozenset({"quality_review", "review", "security_review"})
 
+# Role tokens that may appear ONLY in a DERIVED provenance identity. A
+# card-derived actor is read off the canonical task store's own ``runner``; a
+# caller-typed one is a string. Before this, nothing stopped a manager typing
+# ``worker.claude.sonnet.5`` into :func:`add_evidence` and manufacturing the
+# second "independent" actor an activation needs -- the exact self-certification
+# the two-actor floor exists to prevent, and the shape the one stored ACTIVE
+# record already took (``manager.claude.7e6e8a47`` and ``claude_manager_7e6e8a47``
+# were one manager under two spellings).
+#
+# Canonicalization fixed the accidental half of that. This fixes the deliberate
+# half: the derived namespace is reserved, so the free-text surface can name only
+# a manager, and manager entries all canonicalize to one actor.
+_DERIVED_ONLY_ROLE_TOKENS = frozenset(sr.ACTOR_ROLE_TOKENS) - {"manager"}
+_ACTOR_TOKEN_RE = re.compile(r"[._-]+")
+
+# The card decision vocabulary this maps into ``EvidenceOutcome``. A skill that
+# was injected into a card the manager ACCEPTED contributed to an accepted
+# outcome; one injected into a card that was REJECTED is negative evidence about
+# that skill on that card. Nothing else is a decision.
+DECISION_EVIDENCE_OUTCOMES: dict[str, str] = {
+    "accepted": sr.EvidenceOutcome.ACCEPTED.value,
+    "rejected": sr.EvidenceOutcome.NEGATIVE.value,
+}
+
+
+def _caller_actor(actor_id: Any) -> str:
+    """Validate a CALLER-TYPED provenance identity, refusing an impersonation.
+
+    The registry's own charset check runs first (through the public
+    :func:`skill_registry.canonical_actor_id`), then the reserved-role check.
+    A refusal names the token, because the fix is always the same one: file the
+    entry through the derived path that can actually prove that actor acted.
+    """
+    text = str(actor_id or "")
+    sr.canonical_actor_id(text)  # raises SkillRegistryError on an invalid shape
+    claimed = sorted(
+        {token for token in _ACTOR_TOKEN_RE.split(text.lower()) if token}
+        & _DERIVED_ONLY_ROLE_TOKENS
+    )
+    if claimed:
+        raise sr.SkillRegistryError(
+            "skill_registry.invalid_evidence",
+            f"actor_id may not claim the reserved role token {claimed[0]!r}: a "
+            f"{claimed[0]} identity is DERIVED from a task card's own runner, "
+            "never typed; file it through add_task_evidence or the decision "
+            "evidence recorded at accept/reject",
+        )
+    return text
+
 
 def _actor_subject(raw: str) -> str:
     """Reduce a runner identity to the actor-id charset, dropping role tokens.
@@ -108,8 +159,16 @@ def _actor_subject(raw: str) -> str:
     return ".".join(tokens)
 
 
-def _task_actor(root: Path, task_id: str) -> tuple[str, str, str]:
+def _task_actor(
+    root: Path, task_id: str, *, require_finished: bool = True
+) -> tuple[str, str, str]:
     """Derive ``(role, actor_id, source_anchor)`` from one finished task card.
+
+    ``require_finished=False`` is for the decision path only. A rejection sends
+    the card straight back into a new claim episode, which clears
+    ``completed_at``; the runner that produced the judged candidate is still on
+    the card and is still the actor whose work was adjudicated, so demanding a
+    finish there would silently drop every rejection's evidence.
 
     Fails closed through :class:`skill_registry.SkillRegistryError` -- the same
     channel :func:`_invoke_write` already surfaces with a stable ``code`` -- when
@@ -134,7 +193,7 @@ def _task_actor(root: Path, task_id: str) -> tuple[str, str, str]:
             "skill_registry.invalid_evidence",
             f"task card {bounded!r} is not in the canonical task store",
         )
-    if not str(card.get("completed_at") or "").strip():
+    if require_finished and not str(card.get("completed_at") or "").strip():
         raise sr.SkillRegistryError(
             "skill_registry.invalid_evidence",
             f"task {bounded!r} never finished; an unfinished card produces no evidence",
@@ -197,39 +256,80 @@ def _invoke_write(
     }
 
 
+# The dimensions ``skill_miner._proposal_draft`` derives from measured card
+# evidence. When a candidate_id is given these are copied server-side and a
+# conflicting caller value is REFUSED rather than silently preferred -- a
+# mistyped identity would otherwise propose a different skill than the one the
+# evidence supports, under a name that looks mined.
+_CANDIDATE_DERIVED_FIELDS = ("identity", "version", "scope", "path_or_symbol", "risk", "stage")
+
+
 def propose(
     *,
-    identity: str,
-    version: str,
-    scope: str,
-    task_family: str,
-    path_or_symbol: str,
-    risk: str,
-    stage: str,
-    triggers: list[str],
-    confidence: float,
+    identity: str = "",
+    version: str = "",
+    scope: str = "",
+    task_family: str = "",
+    path_or_symbol: str = "",
+    risk: str = "",
+    stage: str = "",
+    triggers: list[str] | None = None,
+    confidence: float = 0.0,
     applicability: list[str] | None = None,
     procedure_steps: list[str] | None = None,
     avoid_rules: list[str] | None = None,
     preferred_tools: list[str] | None = None,
+    candidate_id: str = "",
 ) -> dict[str, Any]:
-    """MANAGER WRITE: register and persist one caller-defined proposed skill.
+    """MANAGER WRITE: register and persist one proposed skill.
 
-    Every field is taken verbatim from the caller; lifecycle state, evidence and
-    counters are never accepted here, so the proposal is always evidence-free.
-    A duplicate ``(identity, version)`` is refused by the loaded registry before
-    any write, so no stored record is overwritten.
+    Two ways in, and both leave every JUDGEMENT field with the caller:
+
+    * Full form -- every field is taken verbatim from the caller.
+    * ``candidate_id`` from ``aiworkhub_manager_skill_mine`` -- the mechanical
+      dimensions (identity, version, scope, path_or_symbol, risk, stage) are
+      copied server-side from that candidate's own measured draft, and the
+      caller supplies only what no measurement can: ``task_family``,
+      ``triggers``, ``applicability``, ``confidence``, ``procedure_steps`` and
+      ``avoid_rules``. Passing a conflicting mechanical value is refused, not
+      silently overridden.
+
+    Lifecycle state, evidence and counters are never accepted here, so the
+    proposal is always evidence-free. A duplicate ``(identity, version)`` is
+    refused by the loaded registry before any write, so no stored record is
+    overwritten.
     """
     def operation(root: Path, token: str) -> sr.SkillRecord:
-        record = sr.SkillRecord.from_mapping({
+        fields = {
             "identity": identity,
             "version": version,
             "scope": scope,
-            "task_family": task_family,
             "path_or_symbol": path_or_symbol,
             "risk": risk,
             "stage": stage,
-            "triggers": list(triggers),
+        }
+        wanted = str(candidate_id or "").strip()
+        if wanted:
+            try:
+                draft = skill_miner.candidate_draft(root, wanted)["proposal_draft"]
+            except skill_miner.SkillMinerError as exc:
+                raise sr.SkillRegistryError(
+                    "skill_registry.invalid_value", str(exc)[:400]
+                ) from exc
+            for field in _CANDIDATE_DERIVED_FIELDS:
+                supplied = str(fields.get(field) or "").strip()
+                derived = str(draft.get(field) or "")
+                if supplied and supplied != derived:
+                    raise sr.SkillRegistryError(
+                        "skill_registry.invalid_value",
+                        f"{field} is derived from candidate {wanted!r} "
+                        f"({derived!r}); it may not be supplied as {supplied!r}",
+                    )
+                fields[field] = derived
+        record = sr.SkillRecord.from_mapping({
+            **fields,
+            "task_family": task_family,
+            "triggers": list(triggers or ()),
             "confidence": confidence,
             "applicability": list(applicability or ()),
             "procedure_steps": list(procedure_steps or ()),
@@ -260,9 +360,18 @@ def add_evidence(
     entries from distinct actors count as two independent contributions while two
     from one actor count as one. The advanced runtime state is persisted in place
     on the same immutable ``(identity, version)`` row.
+
+    The caller may NOT type an identity in the derived namespace. ``worker``,
+    ``reviewer``, ``coordinator``, ``agent`` and ``owner`` are reserved for an
+    actor read off a task card's own runner, so this surface can name only a
+    manager -- and manager entries canonicalize to one actor however they are
+    spelled. Without that reservation, two typed strings were two "independent"
+    actors and the two-actor activation floor certified itself.
     """
     def operation(root: Path, token: str) -> sr.SkillRecord:
-        authority = sr.Authority(sr.AuthorityRole.MANAGER, actor_id=actor_id, token=token)
+        authority = sr.Authority(
+            sr.AuthorityRole.MANAGER, actor_id=_caller_actor(actor_id), token=token
+        )
         registry = store.load_registry(root)
         expected = store.stored_state_digest(root, identity, version)
         updated = registry.add_evidence(
@@ -324,6 +433,264 @@ def add_task_evidence(
         return updated
 
     return _invoke_write(operation)
+
+
+def record_decision_evidence(
+    repo_root: str | Path,
+    *,
+    task_id: str,
+    request_id: str,
+    outcome: str,
+    note: str = "",
+) -> dict[str, Any]:
+    """Append one evidence row per INJECTED skill when a decision is recorded.
+
+    This is the automatic half of the loop, and the one that was missing. Across
+    3,383 recorded accept/reject decisions the registry held ZERO evidence rows,
+    because the only producer was a manager hand-typing
+    ``skill_add_evidence`` with a free-text actor (8 such calls in 27 sessions,
+    3 of them refused on a malformed actor or an invalid outcome). A floor of two
+    independent actors is unreachable from a surface nothing drives.
+
+    Called at the decision site with the card and the request that was judged, it:
+
+    * reads the SELECTION RECEIPT the launcher persisted for that card+request,
+      so the skills credited are exactly the ones the worker received -- never a
+      replay of selection against today's registry;
+    * derives the actor from the card's own ``runner`` (see :func:`_task_actor`),
+      so provenance is READ, not typed. There is deliberately no ``actor_id``
+      parameter: the security property is that this surface cannot be told who
+      acted;
+    * records the card's OWN adjudicated decision as the evidence outcome, and
+      refuses when the caller's outcome contradicts what the card says.
+
+    Deliberately NOT manager-gated and deliberately fail-soft: it is invoked from
+    the accept/reject path, which must not fail because a skill store is missing
+    or a record was retired. Every refusal is reported, never raised, and nothing
+    here can activate a skill -- activation stays a manager decision behind the
+    unchanged two-actor gate.
+
+    Idempotent: an entry with the same ``(source, actor_id, outcome)`` already on
+    the record is not appended twice, so a retried finalization cannot inflate
+    ``accepted_count``.
+    """
+    root = Path(repo_root)
+    decision = str(outcome or "").strip().lower()
+    if decision not in DECISION_EVIDENCE_OUTCOMES:
+        return {
+            "ok": False,
+            "reason": "decision_outcome_not_adjudicated",
+            "allowed_outcomes": sorted(DECISION_EVIDENCE_OUTCOMES),
+            "recorded": [],
+        }
+    evidence_outcome = DECISION_EVIDENCE_OUTCOMES[decision]
+    try:
+        receipt = store.get_selection(root, str(task_id), str(request_id or ""))
+    except (store.SkillStoreError, OSError, sqlite3.Error) as exc:
+        return {
+            "ok": False,
+            "reason": f"selection_receipt_unreadable:{type(exc).__name__}",
+            "recorded": [],
+        }
+    if receipt is None:
+        return {
+            "ok": True,
+            "reason": "no_selection_receipt_for_this_card",
+            "task_id": str(task_id),
+            "request_id": str(request_id or ""),
+            "recorded": [],
+        }
+    if not receipt["skills"]:
+        return {
+            "ok": True,
+            "reason": "selection_receipt_is_empty",
+            "task_id": str(task_id),
+            "request_id": str(request_id or ""),
+            "packet_sha256": receipt["packet_sha256"],
+            "recorded": [],
+        }
+    try:
+        _role, actor_id, _anchor = _task_actor(
+            root, str(task_id), require_finished=False
+        )
+    except sr.SkillRegistryError as exc:
+        return {"ok": False, "reason": str(exc)[:240], "recorded": []}
+    try:
+        contradiction = _decision_contradiction(root, str(task_id), str(request_id or ""), decision)
+    except (OSError, sqlite3.Error, ValueError):  # noqa: BLE001 - unreadable card is not a veto
+        contradiction = ""
+    if contradiction:
+        return {"ok": False, "reason": contradiction, "recorded": []}
+
+    anchor = str(request_id or task_id)[:128]
+    recorded: list[dict[str, Any]] = []
+    refused: list[dict[str, Any]] = []
+    for row in receipt["skills"]:
+        identity = str(row.get("identity") or "")
+        version = str(row.get("version") or "")
+        try:
+            registry = store.load_registry(root)
+            record = registry.get(identity, version)
+            if record is None:
+                refused.append({"identity": identity, "version": version,
+                                "reason": "skill_version_not_stored"})
+                continue
+            if any(
+                item.source == anchor
+                and item.actor_id == actor_id
+                and item.outcome.value == evidence_outcome
+                for item in record.evidence
+            ):
+                recorded.append({"identity": identity, "version": version,
+                                 "outcome": evidence_outcome, "actor_id": actor_id,
+                                 "idempotent": True})
+                continue
+            expected = store.stored_state_digest(root, identity, version)
+            authority = sr.Authority(sr.AuthorityRole.WORKER, actor_id=actor_id, token="")
+            updated = registry.add_evidence(
+                identity,
+                version,
+                {
+                    "source": anchor,
+                    "outcome": evidence_outcome,
+                    "note": (note or f"card {task_id} was {decision} by the manager")[:2000],
+                },
+                authority,
+            )
+            store.advance_record(root, updated, expected_state_digest=expected)
+        except (sr.SkillRegistryError, store.SkillStoreError, OSError, sqlite3.Error) as exc:
+            refused.append({"identity": identity, "version": version,
+                            "reason": str(exc)[:200]})
+            continue
+        recorded.append({"identity": identity, "version": version,
+                         "outcome": evidence_outcome, "actor_id": actor_id,
+                         "idempotent": False})
+    return {
+        "ok": True,
+        "schema_id": "aiworkhub.skill_decision_evidence.v1",
+        "task_id": str(task_id),
+        "request_id": str(request_id or ""),
+        "packet_sha256": receipt["packet_sha256"],
+        "decision": decision,
+        "evidence_outcome": evidence_outcome,
+        "actor_id": actor_id,
+        "actor_source": "task_card_runner",
+        "recorded": recorded,
+        "refused": refused,
+    }
+
+
+def _decision_contradiction(
+    root: Path, task_id: str, request_id: str, decision: str
+) -> str:
+    """Return a refusal reason when the card contradicts the claimed decision.
+
+    The card is the authority on what was adjudicated. When it names an outcome
+    for this exact request and that outcome is not the one being recorded, the
+    evidence would attribute the wrong sign to every injected skill, so it is
+    refused. When the card names nothing resolvable -- a rejection has already
+    cleared the terminal evidence by the time the reply is built -- the decision
+    site's own outcome stands, because the decision site IS the authority there.
+    """
+    from . import learning_commit_store  # local import: keeps the import graph acyclic
+
+    card = task_store.get_task(root, task_id)
+    if not isinstance(card, dict):
+        return "task_card_not_in_canonical_store"
+    adjudicated = learning_commit_store.adjudicated_decision(card, request_id)
+    if adjudicated and adjudicated != decision:
+        return f"card_adjudicated_{adjudicated}_not_{decision}"
+    return ""
+
+
+def usage(*, min_accepted_evidence: int = 2) -> dict[str, Any]:
+    """MANAGER READ: the per-skill usage statistics, measured, never inferred.
+
+    The dashboard could say only "4 skills / 4 proposed / 0 active / 0 retired",
+    which answers none of the questions an owner actually asks: is anything
+    being used, is anything reachable, and if not, why not. Each of those is now
+    answered from stored evidence:
+
+    * ``proposals`` -- how many versions of this identity are stored.
+    * ``evidence_by_outcome`` -- accepted/negative entry counts as recorded.
+    * ``distinct_actors`` and ``actor_ids`` -- the CANONICAL independent
+      identities the two-actor gate actually counts, not the raw strings, so two
+      spellings of one manager read as the one actor they are.
+    * ``injectable`` plus the exact ``injectable_reason`` when it is false.
+    * ``injected_cards`` -- from the persisted selection receipts only.
+
+    Read-only, and it never activates or retires anything.
+    """
+    root, _token, manager = _manager_context()
+    if root is None:
+        return manager
+    try:
+        stored = store.list_records(root)
+        injection = store.injection_counts(root)
+    except (store.SkillStoreError, OSError, sqlite3.Error) as exc:
+        return {
+            "ok": False,
+            "error": f"skill_store_failed:{type(exc).__name__}",
+            "manager": manager,
+            "surface": "manager_mcp",
+        }
+    versions_per_identity = Counter(record.identity for record in stored)
+    skills: list[dict[str, Any]] = []
+    for record in stored:
+        injectable, reason = skill_miner.injectability(record)
+        outcomes = Counter(item.outcome.value for item in record.evidence)
+        actors = sr.independent_accepted_actor_ids(record)
+        counts = injection.get(f"{record.identity}@{record.version}", {})
+        skills.append(
+            {
+                "identity": record.identity,
+                "version": record.version,
+                "stored_lifecycle_state": record.lifecycle_state.value,
+                "proposals": int(versions_per_identity[record.identity]),
+                "evidence_rows": len(record.evidence),
+                "evidence_by_outcome": {
+                    outcome.value: int(outcomes.get(outcome.value, 0))
+                    for outcome in sr.EvidenceOutcome
+                },
+                "distinct_actors": len(actors),
+                "actor_ids": list(actors),
+                "raw_actor_ids": sorted({item.actor_id for item in record.evidence}),
+                "unresolved_negative_evidence": len(
+                    sr.unresolved_negative_evidence(record)
+                ),
+                "injectable": bool(injectable),
+                "injectable_reason": reason,
+                "injected_cards": int(counts.get("injected_cards", 0)),
+                "injected_requests": int(counts.get("injected_requests", 0)),
+                "evidence_anchors": sorted(
+                    {item.source for item in record.evidence if item.source}
+                ),
+            }
+        )
+    skills.sort(key=lambda item: (item["identity"], item["version"]))
+    lifecycles = Counter(item["stored_lifecycle_state"] for item in skills)
+    return {
+        "ok": True,
+        "schema_id": "aiworkhub.skill_usage_report.v1",
+        "min_accepted_evidence": int(min_accepted_evidence),
+        "totals": {
+            "skills": len(skills),
+            "proposed": int(lifecycles.get("proposed", 0)),
+            "active": int(lifecycles.get("active", 0)),
+            "retired": int(lifecycles.get("retired", 0)),
+            "injectable": sum(1 for item in skills if item["injectable"]),
+            "evidence_rows": sum(item["evidence_rows"] for item in skills),
+            "selection_receipts": len(store.list_selections(root)),
+        },
+        "skills": skills,
+        "authority": {
+            "produces": "measurements_only",
+            "writes": "none",
+            "activation": "manager_gated_two_distinct_actor_identities",
+        },
+        "manager": manager,
+        "surface": "manager_mcp",
+    }
 
 
 def audit(*, min_accepted_evidence: int = 2) -> dict[str, Any]:

@@ -18,6 +18,7 @@ import os
 import re
 import sqlite3
 import time
+from datetime import datetime, timezone
 from threading import Lock
 from typing import Any, Mapping
 
@@ -1133,13 +1134,60 @@ def task_restore_view(task_id: str, reason: str = "", confirm: bool = False) -> 
 
 
 def _needfix_response(response: Mapping[str, Any], tool: str, *, write: bool = False) -> dict[str, Any]:
-    """Attach dashboard authority metadata to one bounded NeedFix response."""
+    """Attach dashboard authority metadata to one bounded NeedFix response.
+
+    The authority of a NeedFix/Roadmap view is a function of the tool, not of
+    the call, so it is one string (``storage_write`` | ``readonly``) rather
+    than the seven constant booleans that rode on every reply (5% of every
+    transition reply, 54 KB over 348 calls, identical each time).
+    """
     result = dict(response)
     result["server_tool"] = tool
-    result["authority_flags"] = (
-        _storage_write_authority_flags() if write else _readonly_authority_flags()
-    )
+    result["authority"] = "storage_write" if write else "readonly"
     return result
+
+
+def _needfix_item_view(row: Mapping[str, Any], *, include_item: bool) -> dict[str, Any]:
+    """The compact list projection by default (id/status/kind/severity/
+    readiness/tags/scope lists); ``include_item=True`` adds description,
+    scope, provenance and evidence -- the 67% of a transition reply the
+    manager wrote itself moments earlier."""
+    return _bounded_needfix_row(row, include_detail=include_item)
+
+
+def _needfix_transition_receipt(
+    row: Mapping[str, Any],
+    *,
+    action: str,
+    steps: list[Any],
+    include_item: bool,
+) -> dict[str, Any]:
+    """Delta receipt for one (or one promoted pair of) lifecycle step(s)."""
+    transitions = [step for step in steps if isinstance(step, Mapping)]
+    first = transitions[0] if transitions else {}
+    last = transitions[-1] if transitions else {}
+    return {
+        "ok": True,
+        "schema_id": "aiworkhub.needfix_transition_receipt.v1",
+        "id": str(row.get("id") or "")[:32],
+        "action": action,
+        "status_before": first.get("status_before"),
+        "status_after": str(row.get("status") or "")[:40],
+        "updated_at": str(row.get("updated_at") or "")[:64],
+        "readiness_score": max(0, min(100, int(row.get("readiness_score") or 0))),
+        "converted_task_id": str(row.get("converted_task_id") or "")[:200] or None,
+        "event_id": last.get("event_id"),
+        "events": [
+            {
+                "event": str(step.get("event") or "")[:40],
+                "event_id": step.get("event_id"),
+                "status_before": step.get("status_before"),
+                "status_after": step.get("status_after"),
+            }
+            for step in transitions
+        ],
+        "item": _needfix_item_view(row, include_item=include_item),
+    }
 
 
 def _bounded_needfix_row(row: Mapping[str, Any], *, include_detail: bool = False) -> dict[str, Any]:
@@ -1336,19 +1384,50 @@ def needfix_capture_view(
     severity: str = "medium",
     scope: str | None = None,
     tags: list[str] | None = None,
+    include_item: bool = False,
 ) -> dict[str, Any]:
-    """USER WRITE: explicitly capture one dashboard-authored proposal."""
+    """USER WRITE: explicitly capture one dashboard-authored proposal.
+
+    ``kind`` vocabulary: bug, feature, improvement, idea, technical_debt,
+    optimization, benchmark_gap, documentation_drift, security_risk,
+    investigation, roadmap_candidate, refactor, security, docs, other
+    (synonyms gap/defect/performance/design/dead_code/test_coverage are
+    normalised and reported as ``kind_normalized``). ``severity``: critical,
+    high, medium, low, info. Replies with a capture receipt: id, dedupe_key,
+    status, created_at, provenance.origin, ``deduped``/``existing_id`` when
+    the dedupe key matched a live row, plus the compact item
+    (``include_item=True`` adds description/scope/provenance/evidence).
+    """
+    canonical_kind, kind_normalized = needfix_store.normalize_kind(str(kind or "other")[:60])
+    before = datetime.now(timezone.utc).isoformat()
     try:
         row = core.needfix_capture(
             title=str(title or "")[:240],
             description=str(description or "")[:8000],
-            kind=str(kind or "other")[:60],
+            kind=canonical_kind,
             severity=str(severity or "medium")[:24],
             scope=str(scope or "")[:4000] or None,
             tags=[str(value)[:80] for value in list(tags or [])[:24]],
             provenance={"source": "dashboard_user"},
         )
-        response = {"ok": True, "item": _bounded_needfix_row(row, include_detail=True)}
+        provenance = row.get("provenance") if isinstance(row.get("provenance"), Mapping) else {}
+        created_at = str(row.get("created_at") or "")[:64]
+        deduped = bool(created_at) and created_at < before
+        response = {
+            "ok": True,
+            "schema_id": "aiworkhub.needfix_capture_receipt.v1",
+            "id": str(row.get("id") or "")[:32],
+            "dedupe_key": str(row.get("dedupe_key") or "")[:128],
+            "status": str(row.get("status") or "")[:40],
+            "kind": str(row.get("kind") or "")[:60],
+            "severity": str(row.get("severity") or "")[:24],
+            "created_at": created_at,
+            "provenance": {"origin": str(provenance.get("origin") or "")[:60] or None},
+            "deduped": deduped,
+            "existing_id": str(row.get("id") or "")[:32] if deduped else None,
+            "kind_normalized": kind_normalized,
+            "item": _needfix_item_view(row, include_item=include_item),
+        }
     except (needfix_store.NeedFixError, OSError, sqlite3.Error, TypeError, ValueError) as exc:
         response = {"ok": False, "error": str(exc)[:240]}
     return _needfix_response(response, "aiworkhub_dashboard_needfix_capture", write=True)
@@ -1363,21 +1442,47 @@ def needfix_update_view(
     severity: str | None = None,
     tags: list[str] | None = None,
     readiness_score: int | None = None,
+    include_item: bool = False,
 ) -> dict[str, Any]:
-    """USER WRITE: update bounded mutable NeedFix fields."""
+    """USER WRITE: update bounded mutable NeedFix fields.
+
+    Replies with a delta receipt: id, status, fields_changed, updated_at,
+    evidence_keys_after, event_id, kind_normalized, plus the compact item
+    (``include_item=True`` adds description/scope/provenance/evidence).
+    """
     candidate = str(needfix_id or "")
+    canonical_kind: str | None = None
+    kind_normalized: dict[str, str] | None = None
+    if kind is not None:
+        canonical_kind, kind_normalized = needfix_store.normalize_kind(str(kind)[:60])
     try:
         row = core.needfix_update(
             candidate,
             title=str(title)[:240] if title is not None else None,
             description=str(description)[:8000] if description is not None else None,
             scope=str(scope)[:4000] if scope is not None else None,
-            kind=str(kind)[:60] if kind is not None else None,
+            kind=canonical_kind,
             severity=str(severity)[:24] if severity is not None else None,
             tags=[str(value)[:80] for value in list(tags)[:24]] if tags is not None else None,
             readiness_score=max(0, min(100, int(readiness_score))) if readiness_score is not None else None,
         )
-        response = {"ok": True, "item": _bounded_needfix_row(row, include_detail=True)}
+        update = row.get("update_receipt") if isinstance(row.get("update_receipt"), Mapping) else {}
+        evidence = row.get("evidence") if isinstance(row.get("evidence"), Mapping) else {}
+        response = {
+            "ok": True,
+            "schema_id": "aiworkhub.needfix_update_receipt.v1",
+            "id": str(row.get("id") or "")[:32],
+            "status": str(row.get("status") or "")[:40],
+            "fields_changed": [str(value)[:40] for value in list(update.get("fields_changed") or [])[:24]],
+            "updated_at": str(row.get("updated_at") or "")[:64],
+            "evidence_keys_after": [
+                str(value)[:80]
+                for value in list(update.get("evidence_keys_after") or sorted(evidence))[:64]
+            ],
+            "event_id": update.get("event_id"),
+            "kind_normalized": kind_normalized,
+            "item": _needfix_item_view(row, include_item=include_item),
+        }
     except (needfix_store.NeedFixError, OSError, sqlite3.Error, TypeError, ValueError) as exc:
         response = {"ok": False, "error": str(exc)[:240]}
     return _needfix_response(response, "aiworkhub_dashboard_needfix_update", write=True)
@@ -1390,16 +1495,52 @@ def needfix_transition_view(
     readiness_score: int | None = None,
     duplicate_parent_id: str = "",
     confirm: bool = False,
+    include_item: bool = False,
+    promote_to: str = "",
 ) -> dict[str, Any]:
-    """USER WRITE: one explicit, confirmed NeedFix lifecycle transition."""
+    """USER WRITE: one explicit, confirmed NeedFix lifecycle transition.
+
+    Replies with a delta receipt (``aiworkhub.needfix_transition_receipt.v1``):
+    id, action, status_before, status_after, updated_at, readiness_score,
+    converted_task_id, event_id, the recorded ``events``, and the compact
+    item (``include_item=True`` adds description/scope/provenance/evidence).
+    ``promote_to="accepted"`` with ``action="triage"`` records the triage and
+    the accept as two audit events in one call, with one reason; the
+    confirm gate and the state machine are unchanged (92 of 113 triages in
+    27 sessions were followed by an accept within six calls).
+    """
     candidate = str(needfix_id or "")
     selected = str(action or "").strip().lower()
+    promote = str(promote_to or "").strip().lower()
+    steps: list[Any] = []
     if confirm is not True:
         response = {"ok": False, "error": "needfix_transition_confirmation_required"}
+    elif promote and promote != "accepted":
+        response = {"ok": False, "error": "invalid_promote_to", "allowed": ["accepted"]}
+    elif promote and selected != "triage":
+        response = {"ok": False, "error": "promote_to_requires_triage_action"}
     else:
         try:
             if selected == "triage":
                 row = core.needfix_triage(candidate, readiness_score=readiness_score, triage_note=str(reason)[:1000] or None)
+                if promote:
+                    steps.append(row.get("transition"))
+                    try:
+                        row = core.needfix_accept(candidate, readiness_score=readiness_score)
+                    except (needfix_store.NeedFixError, sqlite3.Error) as exc:
+                        # The triage landed; report it and the exact refusal
+                        # instead of pretending neither step happened.
+                        partial = _needfix_transition_receipt(
+                            row, action=selected, steps=steps, include_item=include_item
+                        )
+                        partial.update({
+                            "ok": False,
+                            "error": f"promote_failed:{str(exc)[:200]}",
+                            "promote_to": promote,
+                        })
+                        return _needfix_response(
+                            partial, "aiworkhub_dashboard_needfix_transition", write=True
+                        )
             elif selected == "accept":
                 row = core.needfix_accept(candidate, readiness_score=readiness_score)
             elif selected == "reject":
@@ -1422,7 +1563,12 @@ def needfix_transition_view(
                     "aiworkhub_dashboard_needfix_transition",
                     write=True,
                 )
-            response = {"ok": True, "item": _bounded_needfix_row(row, include_detail=True)}
+            steps.append(row.get("transition"))
+            response = _needfix_transition_receipt(
+                row, action=selected, steps=steps, include_item=include_item
+            )
+            if promote:
+                response["promote_to"] = promote
         except (needfix_store.NeedFixError, OSError, sqlite3.Error, TypeError, ValueError) as exc:
             response = {"ok": False, "error": str(exc)[:240]}
     return _needfix_response(response, "aiworkhub_dashboard_needfix_transition", write=True)

@@ -64,7 +64,14 @@ def test_default_task_create_is_template_first(
         work_kind="generic",
     )
     assert result["ok"] is True
-    created = json.loads(result["stdout"])
+    # Deliberate contract change (mcp-output-2 / card_launch-1): the tool
+    # answers with a creation receipt that carries the server-derived
+    # provenance once, not the card the caller typed; the persisted card is
+    # only echoed on echo_card=True (asserted below).
+    created = result
+    assert created["schema_id"] == "aiworkhub.task_create_receipt.v1"
+    assert "stdout" not in created
+    assert created["receipt_state"] == "created"
     assert created["template_provenance"]["template_name"] == (
         "implementation_with_tests"
     )
@@ -74,6 +81,25 @@ def test_default_task_create_is_template_first(
     stored = task_store.get_task(repo, "TASK_NF390_DEFAULT")
     assert stored is not None
     assert stored["template_provenance"] == created["template_provenance"]
+    assert created["risk_tier"] == stored["risk_tier"]
+    assert created["validation_roles"] == stored["validation_roles"]
+    assert len(created["card_sha256"]) == 64 and created["card_bytes"] > 0
+    echoed = server.aiworkhub_task_create(
+        task_id="TASK_NF390_DEFAULT_ECHO",
+        title="Template first create",
+        runner="codex_worker_nf390",
+        topic="task_mcp",
+        objective=expanded["objective"],
+        acceptance=["classify generic python cards"],
+        allowed_writes=expanded["allowed_writes"],
+        required_outputs=expanded["required_outputs"],
+        validation=expanded["validation"],
+        validation_roles=expanded["validation_roles"],
+        read_first=expanded["read_first"],
+        work_kind="generic",
+        echo_card=True,
+    )
+    assert json.loads(echoed["stdout"])["task_id"] == "TASK_NF390_DEFAULT_ECHO"
 
 def test_unclassified_raw_task_create_fails_without_escape(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -107,8 +133,8 @@ def test_unclassified_raw_task_create_fails_without_escape(
         custom_template_escape=task_templates.AUDITED_CUSTOM_ESCAPE,
     )
     assert escaped["ok"] is True
-    created = json.loads(escaped["stdout"])
-    assert created["template_provenance"]["classification_reason"] == (
+    # Receipt shape (mcp-output-2): provenance rides on the receipt itself.
+    assert escaped["template_provenance"]["classification_reason"] == (
         "audited_custom_escape"
     )
 

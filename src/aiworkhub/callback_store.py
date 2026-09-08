@@ -763,6 +763,79 @@ def _supersede_stale_batch_members(conn: sqlite3.Connection, batch_id: str) -> i
     return remaining
 
 
+def _acknowledge_inside_transaction(
+    conn: sqlite3.Connection,
+    *,
+    batch_id: str,
+    lease_id: object,
+    provider: str,
+    origin_thread_id: str,
+    now_iso: str,
+    idempotent_on_delivered: bool = False,
+) -> dict[str, Any]:
+    """The one acknowledgement predicate, applied inside a caller-owned write
+    transaction (no commit/rollback here).
+
+    The checks are exactly those of :func:`acknowledge_callback_batch`: the
+    batch must still be this caller's inflight claim (state, lease, provider
+    and originating thread all match).  A mismatch mutates nothing and names
+    its reason so a piggybacked ack can be reported truthfully alongside the
+    claim it rode on.
+
+    ``idempotent_on_delivered`` is for the claim loop's re-apply only: a
+    batch this exact lease already delivered (durable through a
+    mid-transaction commit) reports acknowledged instead of refused.  The
+    explicit ack keeps refusing a second ack of the same batch.
+    """
+    batch_id = str(batch_id or "").strip()
+    if not batch_id:
+        return {"acknowledged": False, "batch_id": batch_id, "reason": "batch_id_required"}
+    if not isinstance(lease_id, str) or not lease_id.strip():
+        return {"acknowledged": False, "batch_id": batch_id, "reason": "lease_id_required"}
+    lease_id = lease_id.strip()
+    row = conn.execute(
+        "SELECT state, lease_id, provider, origin_thread_id "
+        "FROM callback_batches WHERE batch_id=?",
+        (batch_id,),
+    ).fetchone()
+    if row is None:
+        return {"acknowledged": False, "batch_id": batch_id, "reason": "batch_not_found"}
+    if (
+        idempotent_on_delivered
+        and row["state"] == "delivered"
+        and row["lease_id"] == lease_id
+        and str(row["provider"] or "").lower() == str(provider or "").lower()
+        and row["origin_thread_id"] == origin_thread_id
+    ):
+        return {"acknowledged": True, "batch_id": batch_id, "reason": "already_delivered"}
+    if row["state"] != "inflight":
+        return {
+            "acknowledged": False, "batch_id": batch_id,
+            "reason": f"batch_not_inflight:{row['state']}",
+        }
+    if row["lease_id"] != lease_id:
+        return {"acknowledged": False, "batch_id": batch_id, "reason": "lease_mismatch"}
+    if str(row["provider"] or "").lower() != str(provider or "").lower():
+        return {"acknowledged": False, "batch_id": batch_id, "reason": "provider_mismatch"}
+    if row["origin_thread_id"] != origin_thread_id:
+        return {"acknowledged": False, "batch_id": batch_id, "reason": "origin_thread_mismatch"}
+    updated = conn.execute(
+        """
+        UPDATE callback_batches
+        SET state='delivered', updated_at=?
+        WHERE batch_id=? AND lease_id=? AND state='inflight'
+        """,
+        (now_iso, batch_id, lease_id),
+    )
+    if updated.rowcount != 1:
+        return {"acknowledged": False, "batch_id": batch_id, "reason": "batch_changed_under_ack"}
+    conn.execute(
+        "UPDATE callback_outbox SET state='delivered', updated_at=? WHERE batch_id=? AND state='inflight'",
+        (now_iso, batch_id),
+    )
+    return {"acknowledged": True, "batch_id": batch_id, "reason": ""}
+
+
 def claim_pending_callback_batch(
     conn: sqlite3.Connection,
     lease_seconds: int = 120,
@@ -784,6 +857,66 @@ def claim_pending_callback_batch(
     bound session/thread identity never claims (and is never handed) a
     different route's callback, even when both share the same provider.
     Default '' preserves the existing provider-wide claim behavior."""
+    _batch, _ack = _claim_pending_callback_batch(
+        conn,
+        lease_seconds=lease_seconds,
+        max_members=max_members,
+        provider=provider,
+        origin_thread_id=origin_thread_id,
+        acknowledge=None,
+    )
+    return _batch
+
+
+def acknowledge_then_claim(
+    conn: sqlite3.Connection,
+    *,
+    ack_batch_id: str,
+    ack_lease_id: object,
+    provider: str,
+    origin_thread_id: str,
+    lease_seconds: int = 120,
+    max_members: int = DEFAULT_CALLBACK_BATCH_MAX_MEMBERS,
+) -> tuple[dict[str, Any], dict | None]:
+    """Acknowledge the previous batch and claim the next one in ONE write
+    transaction (the piggybacked ack of the MCP long-poll path).
+
+    The acknowledgement runs first, under the same checks as
+    :func:`acknowledge_callback_batch`, inside the same ``BEGIN IMMEDIATE``
+    that then reclaims expired leases and claims the next batch for this
+    exact route -- so the previous batch is delivered and the next one leased
+    atomically, and a rejected ack never blocks the claim.  Acknowledgement
+    still only happens because the same verified session came back with the
+    lease it was handed; nothing is acknowledged at delivery time.
+
+    Returns ``(ack_result, batch_or_None)``."""
+    provider = str(provider or "").strip().lower()
+    origin_thread_id = str(origin_thread_id or "").strip()
+    if not provider or not origin_thread_id:
+        raise ValueError("provider and origin_thread_id are required")
+    batch, ack = _claim_pending_callback_batch(
+        conn,
+        lease_seconds=lease_seconds,
+        max_members=max_members,
+        provider=provider,
+        origin_thread_id=origin_thread_id,
+        acknowledge=(str(ack_batch_id or ""), ack_lease_id),
+    )
+    assert ack is not None  # an acknowledge tuple always yields a result
+    return ack, batch
+
+
+def _claim_pending_callback_batch(
+    conn: sqlite3.Connection,
+    *,
+    lease_seconds: int,
+    max_members: int,
+    provider: str,
+    origin_thread_id: str,
+    acknowledge: tuple[str, object] | None,
+) -> tuple[dict | None, dict[str, Any] | None]:
+    """Shared claim loop; ``acknowledge`` rides inside the first committed
+    write transaction (re-applied only if that transaction rolled back)."""
     _ensure_callback_outbox_table(conn)
     _ensure_callback_batches_table(conn)
     provider = str(provider or "").strip().lower()
@@ -791,10 +924,31 @@ def claim_pending_callback_batch(
     provider_where = " AND provider=?" if provider else ""
     thread_where = " AND origin_thread_id=?" if origin_thread_id else ""
     scope_params = tuple(p for p in (provider, origin_thread_id) if p)
+    ack_pending = acknowledge is not None
+    ack_attempts = 0
+    ack_result: dict[str, Any] | None = None
     while True:
         conn.execute("BEGIN IMMEDIATE")
         try:
             now_iso = utc_now()
+            if ack_pending and acknowledge is not None:
+                # Ack BEFORE reclaiming expired leases: this is the same order
+                # an explicit ``claude_callback_ack`` followed by a wait runs
+                # in, so a lease that is still inflight is honoured exactly as
+                # the standalone ack would honour it.  A re-apply after a
+                # rollback may find the batch already delivered (the stale-
+                # member supersede commits mid-transaction); that is the same
+                # lease's own durable ack, not a refusal.
+                ack_result = _acknowledge_inside_transaction(
+                    conn,
+                    batch_id=acknowledge[0],
+                    lease_id=acknowledge[1],
+                    provider=provider,
+                    origin_thread_id=origin_thread_id,
+                    now_iso=now_iso,
+                    idempotent_on_delivered=ack_attempts > 0,
+                )
+                ack_attempts += 1
             _reclaim_expired_batches(conn, now_iso)
 
             inflight_threads = {
@@ -839,7 +993,7 @@ def claim_pending_callback_batch(
                         break
                 if oldest_unassigned is None:
                     conn.commit()
-                    return None
+                    return None, ack_result
                 thread_id = oldest_unassigned["origin_thread_id"]
                 candidates = conn.execute(
                     "SELECT outbox_id FROM callback_outbox "
@@ -871,6 +1025,7 @@ def claim_pending_callback_batch(
                     (utc_now(), batch_id),
                 )
                 conn.commit()
+                ack_pending = False
                 continue
 
             lease_id = uuid.uuid4().hex
@@ -888,6 +1043,8 @@ def claim_pending_callback_batch(
                 (lease_id, lease_expires_iso, utc_now(), batch_id),
             )
             if updated.rowcount != 1:
+                # Rolled back: the ack rode on this transaction and is not
+                # durable, so it is re-applied on the next iteration.
                 conn.rollback()
                 continue
             conn.execute(
@@ -914,7 +1071,7 @@ def claim_pending_callback_batch(
             "lease_expires_at": lease_expires_iso,
             "attempts": int(batch_row["attempts"]),
             "members": [dict(m) for m in member_rows],
-        }
+        }, ack_result
 
 
 def has_deliverable_callback(
@@ -1008,23 +1165,96 @@ def acknowledge_callback_batch(
     The lease, provider and originating thread must all match.  This keeps
     the MCP long-poll path two-phase: a dropped tool response is reclaimed
     after lease expiry instead of being falsely recorded as delivered.
+
+    The predicate is :func:`_acknowledge_inside_transaction`, shared with the
+    piggybacked ack of :func:`acknowledge_then_claim`, so the two ack paths
+    can never drift.
     """
     _ensure_callback_batches_table(conn)
-    row = conn.execute(
-        "SELECT state, lease_id, provider, origin_thread_id "
-        "FROM callback_batches WHERE batch_id=?",
-        (batch_id,),
-    ).fetchone()
-    if row is None:
-        return False
-    if (
-        row["state"] != "inflight"
-        or row["lease_id"] != lease_id
-        or str(row["provider"] or "").lower() != str(provider or "").lower()
-        or row["origin_thread_id"] != origin_thread_id
-    ):
-        return False
-    return mark_batch_delivered(conn, batch_id, lease_id)
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        result = _acknowledge_inside_transaction(
+            conn,
+            batch_id=batch_id,
+            lease_id=lease_id,
+            provider=provider,
+            origin_thread_id=origin_thread_id,
+            now_iso=utc_now(),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return bool(result["acknowledged"])
+
+
+def acknowledge_batch_by_reference(
+    conn: sqlite3.Connection,
+    *,
+    provider: str,
+    origin_thread_id: str,
+    task_id: str = "",
+    request_id: str = "",
+) -> dict[str, Any]:
+    """Acknowledge this route's inflight batch because the same verified
+    session acted on one of its members.
+
+    A manager that calls accept_review / reject_review /
+    quality_reviewer_launch / agent_collect_result / task_show with a
+    member's ``task_id`` or ``request_id`` has provably received the wake
+    that named it, which is exactly the fact the explicit ack proves.  The
+    batch is marked delivered with its OWN stored lease -- scoped to the
+    exact ``provider`` + ``origin_thread_id`` and to a member that is still
+    inflight in that batch.  Any other batch stays inflight and is reclaimed
+    on lease expiry, as before.  Never raises on a missing reference: it
+    reports ``acknowledged=False`` with a reason.
+    """
+    provider = str(provider or "").strip().lower()
+    origin_thread_id = str(origin_thread_id or "").strip()
+    task_id = str(task_id or "").strip()
+    request_id = str(request_id or "").strip()
+    if not provider or not origin_thread_id:
+        return {"acknowledged": False, "batch_id": "", "reason": "route_identity_required"}
+    if not task_id and not request_id:
+        return {"acknowledged": False, "batch_id": "", "reason": "reference_required"}
+    _ensure_callback_outbox_table(conn)
+    _ensure_callback_batches_table(conn)
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        batches = conn.execute(
+            "SELECT batch_id, lease_id FROM callback_batches "
+            "WHERE state='inflight' AND provider=? AND origin_thread_id=? "
+            "ORDER BY updated_at ASC, batch_id ASC",
+            (provider, origin_thread_id),
+        ).fetchall()
+        for batch in batches:
+            member = conn.execute(
+                "SELECT task_id, request_id FROM callback_outbox "
+                "WHERE batch_id=? AND state='inflight' AND ("
+                "  (?<>'' AND task_id=?) OR (?<>'' AND request_id=?)"
+                ") LIMIT 1",
+                (batch["batch_id"], task_id, task_id, request_id, request_id),
+            ).fetchone()
+            if member is None:
+                continue
+            matched_by = (
+                "task_id" if task_id and member["task_id"] == task_id else "request_id"
+            )
+            result = _acknowledge_inside_transaction(
+                conn,
+                batch_id=str(batch["batch_id"]),
+                lease_id=str(batch["lease_id"] or ""),
+                provider=provider,
+                origin_thread_id=origin_thread_id,
+                now_iso=utc_now(),
+            )
+            conn.commit()
+            return {**result, "matched_by": matched_by, "task_id": str(member["task_id"] or "")}
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return {"acknowledged": False, "batch_id": "", "reason": "no_inflight_member_reference"}
 
 
 def rebind_pending_callbacks(
@@ -1099,6 +1329,97 @@ def rebind_pending_callbacks(
     except Exception:
         conn.rollback()
         raise
+
+
+STALE_PENDING_PRUNE_REASON = "stale_pending_pruned"
+
+
+def prune_stale_pending_callbacks(
+    conn: sqlite3.Connection,
+    *,
+    provider: str = "",
+) -> dict[str, int]:
+    """Supersede pending outbox rows whose task no longer matches the
+    terminal state/episode that produced them -- keyed on task state, not
+    on a route.
+
+    This is the prune loop :func:`rebind_pending_callbacks` runs before a
+    route rebind, lifted out so it can run on its own cadence: a pending
+    wake for a task that was since accepted, rejected, superseded or archived
+    fences task hygiene (``callback_live``) for as long as nobody happens to
+    call the rebind path.  Measured 2026-09-08: 84 pending Claude rows, age
+    p50 124 h, every one bound to a task that had already left its terminal
+    state.  Exactly the same rule decides here as in the rebind and in the
+    claim-time recheck: :func:`_task_still_in_matching_terminal_state`.  A
+    pending wake for a task still in review stays pending.
+
+    ``callback_superseded`` is recorded per pruned row, as the rebind does.
+    A pending batch left with no live member is superseded as well so it
+    can never be claimed empty.
+    """
+    _ensure_callback_outbox_table(conn)
+    _ensure_callback_batches_table(conn)
+    provider = str(provider or "").strip().lower()
+    provider_where = " AND provider=?" if provider else ""
+    params: tuple[str, ...] = (provider,) if provider else ()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        candidates = conn.execute(
+            "SELECT outbox_id, batch_id, task_id, transition, episode_id "
+            "FROM callback_outbox WHERE state='pending'" + provider_where +
+            " ORDER BY created_at ASC, outbox_id ASC",
+            params,
+        ).fetchall()
+        pruned = 0
+        touched_batches: set[str] = set()
+        now = utc_now()
+        for row in candidates:
+            if _task_still_in_matching_terminal_state(
+                conn, row["task_id"], row["transition"], row["episode_id"],
+            ):
+                continue
+            conn.execute(
+                "UPDATE callback_outbox SET state='superseded', "
+                "last_error='task_no_longer_in_matching_terminal_state_or_episode', "
+                "updated_at=? WHERE outbox_id=? AND state='pending'",
+                (now, row["outbox_id"]),
+            )
+            # ``append_event`` commits (as it does inside the rebind loop);
+            # each pruned row is therefore durable on its own.
+            append_event(
+                conn,
+                row["task_id"],
+                "callback_superseded",
+                "",
+                {"transition": row["transition"], "reason": STALE_PENDING_PRUNE_REASON},
+            )
+            pruned += 1
+            if row["batch_id"]:
+                touched_batches.add(str(row["batch_id"]))
+        batches_superseded = 0
+        for batch_id in sorted(touched_batches):
+            live = conn.execute(
+                "SELECT 1 FROM callback_outbox WHERE batch_id=? "
+                "AND state IN ('pending','inflight') LIMIT 1",
+                (batch_id,),
+            ).fetchone()
+            if live is not None:
+                continue
+            emptied = conn.execute(
+                "UPDATE callback_batches SET state='superseded', lease_id='', "
+                "lease_expires_at='', updated_at=? WHERE batch_id=? AND state='pending'",
+                (now, batch_id),
+            )
+            batches_superseded += int(emptied.rowcount == 1)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return {
+        "scanned": len(candidates),
+        "pruned": pruned,
+        "batches_superseded": batches_superseded,
+    }
 
 
 def seed_missing_review_callbacks(

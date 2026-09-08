@@ -70,6 +70,7 @@ from . import storage_retention, terminal_failure_classification
 from .process_launcher_acceptance import accepted_outcome_receipt as _accepted_outcome_receipt
 from .process_launcher_acceptance import changed_path_hashes as _changed_path_hashes
 from .process_launcher_acceptance import finished_acceptance_result as _finished_acceptance_result
+from .process_launcher_accept_review import accept_preview as _accept_preview_impl
 from .process_launcher_accept_review import accept_review as _accept_review_impl
 from .process_launcher_launch_isolated import launch_isolated as _launch_isolated_impl
 from .launch_replay_guard import (
@@ -2670,30 +2671,100 @@ _GATEABLE_CONTEXT_SECTIONS = frozenset(
 )
 
 
-def _injected_context_satisfaction(
-    metadata: dict[str, Any],
-    request_id: str = "",
-) -> tuple[bool, set[str]]:
-    """Which required tools a VERIFIED injected project-context section already
-    satisfies, and whether the worker acknowledged the injected bundle.
-
-    Injection and a live worker call are ALTERNATIVE valid satisfaction sources
-    for the same required tool -- the launcher already ran Session Manager / AI
-    Memory / KB / Source Graph and injected their results with a hash receipt,
-    so a worker need not re-run them by hand. A section is credited only when:
-
-    * the whole bundle receipt is acknowledged -- the worker echoed a
-      ``PROJECT_CONTEXT_RECEIPT`` whose ``bundle_sha256`` equals the stored one.
-      That sha binds repository/scope identity (the bundle embeds
-      ``repo_identity.scope_root``), so a tampered, repo-mismatched, or
-      unacknowledged receipt yields ``(False, set())`` and the gate stays
-      fail-closed; AND
-    * the section itself was ``executed`` with an empty ``degraded_reason``.
+def _executed_context_sections(context: dict[str, Any]) -> set[str]:
+    """Gateable sections the launcher executed for this request without
+    degradation.
 
     ``hit_count`` is deliberately NOT required to be > 0: an executed section
     that returned zero rows (e.g. AI Memory with no matches) is a valid, real
     result, never a "missing call" (B948/B951 regression). A degraded / stale /
     failed section is not credited, so a live recovery call is still required.
+    """
+    satisfied: set[str] = set()
+    for section in context.get("sections") or []:
+        if not isinstance(section, dict):
+            continue
+        name = str(section.get("name") or "")
+        if name not in _GATEABLE_CONTEXT_SECTIONS:
+            continue
+        if not section.get("executed"):
+            continue
+        if str(section.get("degraded_reason") or "").strip():
+            continue
+        satisfied.add(name)
+    return satisfied
+
+
+def _coordinator_measured_zero_hit_sections(context: dict[str, Any]) -> set[str]:
+    """Gateable sections the launcher executed, without degradation, whose
+    canonical query measured exactly zero rows for this request.
+
+    That zero is the coordinator's own measurement, taken before the worker
+    started; no model text and no live re-call can change it.
+    """
+    measured: set[str] = set()
+    for section in context.get("sections") or []:
+        if not isinstance(section, dict):
+            continue
+        name = str(section.get("name") or "")
+        if name not in _GATEABLE_CONTEXT_SECTIONS or not section.get("executed"):
+            continue
+        if str(section.get("degraded_reason") or "").strip():
+            continue
+        hit_count = section.get("hit_count")
+        if type(hit_count) is int and hit_count == 0:
+            measured.add(name)
+    return measured
+
+
+def _coordinator_bound_context_sections(metadata: dict[str, Any]) -> set[str] | None:
+    """Sections the coordinator itself proves it injected into this request.
+
+    The launcher recorded, at launch, the collected bundle's ``bundle_sha256``
+    (``project_context``) and a delivery receipt naming the sha of the bundle
+    it actually wrote into the prompt (``project_context_delivery``). When the
+    delivery says ``injected`` and both shas agree, the bundle reached the
+    worker by construction; the caller additionally requires the request's
+    HMAC audit ledger to verify, which binds this request id. ``None`` means
+    the launch record does not prove injection, so nothing is credited here.
+    """
+    context = metadata.get("project_context") or {}
+    delivery = metadata.get("project_context_delivery") or {}
+    if not isinstance(context, dict) or not isinstance(delivery, dict):
+        return None
+    bundle_sha256 = str(context.get("bundle_sha256") or "").strip().lower()
+    delivered_sha256 = str(delivery.get("bundle_sha256") or "").strip().lower()
+    if (
+        delivery.get("injected") is not True
+        or len(bundle_sha256) != 64
+        or any(ch not in "0123456789abcdef" for ch in bundle_sha256)
+        or delivered_sha256 != bundle_sha256
+    ):
+        return None
+    return _executed_context_sections(context)
+
+
+def _injected_context_satisfaction(
+    metadata: dict[str, Any],
+    request_id: str = "",
+) -> tuple[bool, set[str]]:
+    """Which required tools a VERIFIED injected project-context section already
+    satisfies according to the worker-typed ``PROJECT_CONTEXT_RECEIPT`` line.
+
+    Injection and a live worker call are ALTERNATIVE valid satisfaction sources
+    for the same required tool -- the launcher already ran Session Manager / AI
+    Memory / KB / Source Graph and injected their results with a hash receipt,
+    so a worker need not re-run them by hand.
+
+    This is the optional telemetry path: the primary acknowledgement is derived
+    server-side by :func:`_coordinator_bound_context_sections` plus a verified
+    audit ledger (``coordinator_prompt_binding``), because the receipt line
+    only ever copied a sha the coordinator itself wrote into the prompt.  A
+    receipt is credited here only when its ``bundle_sha256`` equals the stored
+    one -- that sha binds repository/scope identity (the bundle embeds
+    ``repo_identity.scope_root``) -- so a tampered, repo-mismatched, or
+    unacknowledged receipt yields ``(False, set())`` from this path.  Sections
+    are credited by :func:`_executed_context_sections`.
     """
     context = metadata.get("project_context") or {}
     if not isinstance(context, dict):
@@ -2711,19 +2782,7 @@ def _injected_context_satisfaction(
     )
     if not receipt.get("acknowledged"):
         return False, set()
-    satisfied: set[str] = set()
-    for section in context.get("sections") or []:
-        if not isinstance(section, dict):
-            continue
-        name = str(section.get("name") or "")
-        if name not in _GATEABLE_CONTEXT_SECTIONS:
-            continue
-        if not section.get("executed"):
-            continue
-        if str(section.get("degraded_reason") or "").strip():
-            continue
-        satisfied.add(name)
-    return True, satisfied
+    return True, _executed_context_sections(context)
 
 
 def _expected_context_bundle_sha(metadata_path: Path | None) -> str:
@@ -2957,27 +3016,47 @@ def _external_readonly_dirs(
     return [str(path) for path in result]
 
 
-def _validate_adapter_identity(runner: str, adapter_id: str) -> None:
+def adapter_identity_tuple(runner: str) -> tuple[str, ...]:
+    """The adapters a runner family may use, in canonical preference order.
+
+    This is the pure function ``_validate_adapter_identity`` has always been:
+    the runner PREFIX decides the tuple, nothing else is consulted, and the
+    order is the documented preference order (editor-owned bridge first where
+    one exists). An empty tuple means the family constrains nothing, and every
+    adapter stays acceptable for it -- exactly the ``return`` fall-through the
+    validator has always taken.
+
+    Extracted so the launch path can DERIVE an adapter from the card instead of
+    requiring the caller to retype one the server already owns, without any
+    caller gaining a second, divergent copy of the table.
+    """
     if runner == core.CODEX_RUNNER:
-        raise LaunchRejected("coordinator_runner_cannot_launch_worker")
+        return ()
     if runner.startswith("claude_"):
-        allowed: tuple[str, ...] = ("vscode_lm", "claude_cli")
-    elif runner.startswith("codex_"):
-        allowed = ("vscode_lm", "codex_cli")
-    elif runner.startswith("deepseek_"):
+        return ("vscode_lm", "claude_cli")
+    if runner.startswith("codex_"):
+        return ("vscode_lm", "codex_cli")
+    if runner.startswith("deepseek_"):
         # Prefer the editor-owned VS Code Language Model API authorization.
         # BYOK and manual modes remain explicit compatibility fallbacks.
-        allowed = ("vscode_lm", "deepseek_vscode_lm", "deepseek_copilot_cli", "deepseek_manual")
-    elif runner.startswith("glm_"):
+        return ("vscode_lm", "deepseek_vscode_lm", "deepseek_copilot_cli", "deepseek_manual")
+    if runner.startswith("glm_"):
         # Prefer the credential-free VS Code Language Model API bridge.  Keep
         # the explicit BYOK adapter as a backwards-compatible fallback.
-        allowed = ("vscode_lm", "glm_vscode_lm", "glm_copilot_cli")
-    elif runner.startswith("copilot_"):
+        return ("vscode_lm", "glm_vscode_lm", "glm_copilot_cli")
+    if runner.startswith("copilot_"):
         # Copilot-owned models are a distinct workforce from first-party
         # Claude Code/Codex subscriptions. They may use only the editor's
         # public VS Code Language Model API bridge.
-        allowed = ("vscode_lm",)
-    else:
+        return ("vscode_lm",)
+    return ()
+
+
+def _validate_adapter_identity(runner: str, adapter_id: str) -> None:
+    if runner == core.CODEX_RUNNER:
+        raise LaunchRejected("coordinator_runner_cannot_launch_worker")
+    allowed = adapter_identity_tuple(runner)
+    if not allowed:
         return
     if adapter_id not in allowed:
         raise LaunchRejected(
@@ -3136,6 +3215,119 @@ def validate_workforce_identity(
             f"runner={runner}:model={canonical_model}:risk_tier={normalized_risk_tier}"
         )
     return canonical_model
+
+
+def derive_launch_identity(
+    repo: Path,
+    card: Mapping[str, Any],
+    *,
+    runner: str | None = None,
+    topic: str | None = None,
+    adapter_id: str | None = None,
+    model: str | None = None,
+) -> dict[str, Any]:
+    """Derive the launch tuple the server already owns, from the card.
+
+    ``aiworkhub_agent_launch_task`` required ``runner``, ``topic`` and
+    ``adapter_id`` from the caller, yet none of them was a caller DECISION:
+    ``_preflight_card`` refuses unless ``runner`` and ``topic`` EQUAL the
+    card's, so they were asserted rather than chosen; ``adapter_id`` was a pure
+    function of the runner prefix; and the model is pinned by
+    ``_CANONICAL_WORKFORCE``. ``workforce_catalog.rank_task`` has been building
+    exactly this ``launch_contract`` all along and this module never read it
+    (0 hits), while ``dependency_autolaunch.reconcile`` already launches
+    dependents from the card row with no adapter argument at all.
+
+    Determinism is the whole contract: adapter selection walks
+    ``adapter_identity_tuple`` in its canonical order and takes the FIRST one
+    ``repo_policy.validate_launch`` accepts for this exact card, so two launches
+    of one card can never pick different routes. An explicitly supplied value
+    always wins over derivation and is returned unchanged; nothing here relaxes
+    a check, and every derived value still faces ``validate_workforce_identity``
+    /``_validate_adapter_identity`` and the unchanged claim gate afterwards.
+    """
+    derived_from: dict[str, str] = {}
+    resolved_runner = str(runner or "").strip()
+    if not resolved_runner:
+        resolved_runner = str(card.get("runner") or "").strip()
+        derived_from["runner"] = "card"
+    resolved_topic = str(topic or "").strip()
+    if not resolved_topic:
+        resolved_topic = str(card.get("topic") or "").strip()
+        derived_from["topic"] = "card"
+    if not resolved_runner or not resolved_topic:
+        raise LaunchRejected("launch_identity_underivable:card_missing_runner_or_topic")
+
+    resolved_adapter = str(adapter_id or "").strip()
+    adapter_candidates = adapter_identity_tuple(resolved_runner)
+    adapter_rejections: list[str] = []
+    if not resolved_adapter:
+        if not adapter_candidates:
+            raise LaunchRejected(
+                f"launch_adapter_underivable:runner={resolved_runner}:"
+                "no adapter tuple for this runner family"
+            )
+        # A derived adapter must survive the SAME validation an asserted one
+        # faces. ``claude_opus-5`` is the measured case: its tuple leads with
+        # ``vscode_lm``, which has no canonical workforce row, so deriving the
+        # merely-policy-allowed first entry would pin a model the very next
+        # check (``validate_workforce_identity``) refuses with
+        # ``workforce_route_absent``. When the runner owns ANY canonical row,
+        # only an adapter that has one is derivable; a runner the table does not
+        # know keeps the plain policy walk. Both passes run the tuple in its
+        # canonical order, so the choice stays deterministic either way.
+        pinnable = tuple(
+            candidate
+            for candidate in adapter_candidates
+            if (resolved_runner, candidate) in _CANONICAL_WORKFORCE
+        )
+        for candidate in pinnable or adapter_candidates:
+            verdict = repo_policy.validate_launch(repo, card, candidate)
+            if verdict.get("ok"):
+                resolved_adapter = candidate
+                break
+            adapter_rejections.append(
+                f"{candidate}:{str(verdict.get('reason') or 'repo_policy_rejected')[:80]}"
+            )
+        if not resolved_adapter:
+            raise LaunchRejected(
+                "launch_adapter_underivable:runner="
+                f"{resolved_runner}:{';'.join(adapter_rejections)[:280]}"
+            )
+        derived_from["adapter_id"] = (
+            "first_pinnable_launchable_in_tuple_order"
+            if pinnable
+            else "first_launchable_in_tuple_order"
+        )
+
+    resolved_model = str(model or "").strip() or None
+    if resolved_model is None:
+        route = _CANONICAL_WORKFORCE.get((resolved_runner, resolved_adapter))
+        if route is not None:
+            resolved_model = str(route["model"])
+            derived_from["model"] = "canonical_workforce"
+        else:
+            try:
+                from . import workforce_catalog
+
+                identities = workforce_catalog.catalog_launch_identities(repo)
+            except Exception:  # noqa: BLE001 - an unreadable catalog pins no model
+                identities = {}
+            worker = identities.get(resolved_runner)
+            if worker is not None and str(worker.get("model") or "").strip():
+                resolved_model = str(worker["model"]).strip()
+                derived_from["model"] = "catalog_launch_identities"
+
+    return {
+        "runner": resolved_runner,
+        "topic": resolved_topic,
+        "adapter_id": resolved_adapter,
+        "model": resolved_model,
+        "derived_from": derived_from,
+        "adapter_candidates": list(adapter_candidates),
+        "adapter_rejections": adapter_rejections,
+        "identity_rule": "use_same_runner_for_task_create_and_agent_launch_task",
+    }
 
 
 def _worker_mcp_bundle_payload(
@@ -3639,12 +3831,22 @@ def _materialize_crash_retry_packet(
     card: Mapping[str, Any],
     rework_overlay_packet: Mapping[str, Any] | None,
 ) -> tuple[Path | None, dict[str, Any] | None]:
-    """Bind bounded failed-stream evidence to one verified rework overlay.
+    """Bind bounded predecessor failure evidence to one verified rework overlay.
 
     The predecessor workspace bytes remain authoritative through the overlay;
     this packet only salvages diagnostics that would otherwise be reread from
-    old process logs. Missing, successful, cross-task, cross-repository, or
-    oversized predecessor metadata fails closed by omitting the packet.
+    old process logs or re-derived by re-running the declared validation.  A
+    crashed predecessor contributes its bounded stream tails.  A predecessor
+    that exited cleanly contributes the sealed attempt-artifacts validation
+    failure delta instead -- every validation_failed predecessor exits 0, so
+    an exit-code gate would drop exactly the runs that hold a measured
+    failure -- plus the finalizer's terminal reason when the failure left no
+    failed-check receipt (required_output_unchanged, mcp_call_missing, ...).
+    Its stream tails are omitted: for an exit-0 run they are the worker's own
+    final stream, not diagnostics.  Missing, cross-task, cross-repository, or
+    oversized predecessor metadata fails closed by omitting the packet; a
+    clean exit that was not measured as a validation failure also omits it,
+    because a review-rejected candidate is carried by review_feedback.
     """
 
     predecessor = card.get("rework_predecessor")
@@ -3698,22 +3900,11 @@ def _materialize_crash_retry_packet(
 
     state = str(status.get("state") or "")
     returncode = status.get("exit_code")
-    if state == "exited" and returncode == 0:
-        return None, None
-    stdout_path = process_dir / f"{request_id}.stdout.log"
-    stderr_path = process_dir / f"{request_id}.stderr.log"
-    # The packet is JSON, so JSON encoding already neutralises every
-    # metacharacter. The HTML-oriented live-output sanitiser escaped and
-    # redacted bytes the successor needs verbatim, so carry the predecessor's
-    # diagnostics unescaped and unredacted; the tail hashes below then cover
-    # exactly the bytes delivered rather than a pre-sanitised original.
-    stdout_tail = _safe_tail(stdout_path, MAX_CRASH_RETRY_STREAM_BYTES)
-    stderr_tail = _safe_tail(stderr_path, MAX_CRASH_RETRY_STREAM_BYTES)
-    error = str(status.get("error") or "")[:500]
-    if not (stdout_tail or stderr_tail or error or state):
-        return None, None
+    clean_exit = state == "exited" and returncode == 0
     validation_delta: dict[str, Any] | None = None
     validation_manifest_sha256 = ""
+    terminal_substatus = ""
+    terminal_reason = ""
     bundle_dir = process_dir / "attempt-artifacts" / request_id
     if bundle_dir.exists():
         try:
@@ -3726,6 +3917,19 @@ def _materialize_crash_retry_packet(
                 (entry for entry in manifest.artifacts if entry.role == "validation"),
                 None,
             )
+            review_entry = next(
+                (entry for entry in manifest.artifacts if entry.role == "review"),
+                None,
+            )
+            if review_entry is not None:
+                review_payload = json.loads(
+                    (bundle_dir / review_entry.path).read_text(encoding="utf-8")
+                )
+                if isinstance(review_payload, dict):
+                    terminal_substatus = str(review_payload.get("target_state") or "")
+                    terminal_reason = str(review_payload.get("error") or "")[
+                        :MAX_CRASH_RETRY_TERMINAL_REASON_CHARS
+                    ]
             if validation_entry is not None:
                 validation_payload = json.loads(
                     (bundle_dir / validation_entry.path).read_text(encoding="utf-8")
@@ -3752,6 +3956,36 @@ def _materialize_crash_retry_packet(
             raise WorkspaceError(
                 f"crash_retry_validation_artifact_invalid:{exc}"
             ) from exc
+    failed_check_count = (
+        int(validation_delta.get("failure_count") or 0)
+        if isinstance(validation_delta, dict)
+        else 0
+    )
+    measured_validation_failure = (
+        failed_check_count > 0 or terminal_substatus == "validation_failed"
+    )
+    if clean_exit and not measured_validation_failure:
+        return None, None
+    stdout_path = process_dir / f"{request_id}.stdout.log"
+    stderr_path = process_dir / f"{request_id}.stderr.log"
+    # The packet is JSON, so JSON encoding already neutralises every
+    # metacharacter. The HTML-oriented live-output sanitiser escaped and
+    # redacted bytes the successor needs verbatim, so carry the predecessor's
+    # diagnostics unescaped and unredacted; the tail hashes below then cover
+    # exactly the bytes delivered rather than a pre-sanitised original.
+    # A clean exit has no crash diagnostics in its streams -- they are the
+    # worker's own final output -- so omit them and keep the packet headroom
+    # for the validation delta.
+    stream_tails_omitted_reason = "predecessor_exited_clean" if clean_exit else ""
+    stdout_tail = (
+        "" if clean_exit else _safe_tail(stdout_path, MAX_CRASH_RETRY_STREAM_BYTES)
+    )
+    stderr_tail = (
+        "" if clean_exit else _safe_tail(stderr_path, MAX_CRASH_RETRY_STREAM_BYTES)
+    )
+    error = str(status.get("error") or "")[:500]
+    if not (stdout_tail or stderr_tail or error or state):
+        return None, None
 
     packet: dict[str, Any] = {
         "schema_id": "aiworkhub.crash_retry_packet.v1",
@@ -3762,6 +3996,13 @@ def _materialize_crash_retry_packet(
         "predecessor_state": state,
         "predecessor_exit_code": returncode,
         "predecessor_error": error,
+        "predecessor_terminal_substatus": terminal_substatus,
+        # The finalizer's own reason is the only carrier for a failure that
+        # left no failed-check receipt; with receipts present it restates them.
+        "predecessor_terminal_reason": (
+            terminal_reason if failed_check_count == 0 else ""
+        ),
+        "stream_tails_omitted_reason": stream_tails_omitted_reason,
         "stdout_tail": stdout_tail,
         "stderr_tail": stderr_tail,
         "stdout_tail_sha256": hashlib.sha256(stdout_tail.encode("utf-8")).hexdigest(),
@@ -3904,7 +4145,16 @@ def _worker_mcp_live_call_gate(metadata: dict[str, Any], request_id: str) -> dic
             )
         except repo_policy.RepoPolicyError as exc:
             policy_error = f"repo_policy_invalid:{exc}"
+    # Sections the coordinator executed for this request and measured at zero
+    # rows: a fact taken before the worker started, independent of any model
+    # text or live re-call.  Degraded sections are never in this set.
+    coordinator_zero_hit = (
+        _coordinator_measured_zero_hit_sections(context_metadata)
+        if isinstance(context_metadata, dict)
+        else set()
+    )
     gate_required_tools: list[str] = []
+    exempted_tools: dict[str, str] = {}
     if task_type == "code" and tools_policy.get("source_graph_required_for_code"):
         gate_required_tools.append("source_graph")
     if (
@@ -3919,6 +4169,15 @@ def _worker_mcp_live_call_gate(metadata: dict[str, Any], request_id: str) -> dic
                 name in {"session_current_state", "ai_memory", "kb"}
                 and name not in gate_required_tools
             ):
+                if name == "session_current_state" and name in coordinator_zero_hit:
+                    # The canonical session query IS the topic-scoped store:
+                    # zero rows at launch means the store holds no document
+                    # for this card's topic, so no live call can return
+                    # anything and requiring one is ceremony.  Record why the
+                    # tool is not required; a degraded section never reaches
+                    # this branch and stays required.
+                    exempted_tools[name] = "session_store_empty_for_topic_at_launch"
+                    continue
                 gate_required_tools.append(name)
     # An explicit required project-context contract is stronger than the
     # repository's generic code-task defaults.  Research/read-only cards use
@@ -3937,11 +4196,13 @@ def _worker_mcp_live_call_gate(metadata: dict[str, Any], request_id: str) -> dic
         "task_type": task_type,
         "project_context_required": context_required,
         "required_tools": gate_required_tools if gated else [],
+        "exempted_tools": exempted_tools,
         "missing_tools": [],
         "satisfied": True,
         "reason": "",
         "satisfaction_by_tool": {},
         "injected_context_acknowledged": False,
+        "injected_context_acknowledgement_source": "",
         "observation_only": not gated,
         "telemetry_observed": False,
         "telemetry_reason": "",
@@ -3964,7 +4225,9 @@ def _worker_mcp_live_call_gate(metadata: dict[str, Any], request_id: str) -> dic
     injected_acknowledged, injected_tools = _injected_context_satisfaction(
         metadata, request_id
     )
+    acknowledgement_source = "worker_receipt" if injected_acknowledged else ""
     gate_result["injected_context_acknowledged"] = injected_acknowledged
+    gate_result["injected_context_acknowledgement_source"] = acknowledgement_source
     source_graph_injected_acknowledged = False
     context = metadata.get("project_context") or {}
     if injected_acknowledged and isinstance(context, dict):
@@ -4004,6 +4267,23 @@ def _worker_mcp_live_call_gate(metadata: dict[str, Any], request_id: str) -> dic
     }
     gate_result["telemetry_observed"] = bool(verification.get("ok"))
     gate_result["telemetry_reason"] = str(verification.get("reason") or "")
+    # Server-derived acknowledgement: the coordinator wrote the bundle into
+    # this request's prompt (delivery receipt sha == collected bundle sha) and
+    # the HMAC audit ledger verifies for this exact request id.  Both inputs
+    # are coordinator facts; the worker-typed receipt line above only ever
+    # copied a sha the coordinator itself rendered, so its absence or a typo
+    # in it is telemetry, never grounds to discard verified work.
+    if not injected_acknowledged and verification.get("ok") is True:
+        bound_sections = _coordinator_bound_context_sections(metadata)
+        if bound_sections is not None:
+            injected_acknowledged = True
+            injected_tools = bound_sections
+            source_graph_injected_acknowledged = True
+            acknowledgement_source = "coordinator_prompt_binding"
+            gate_result["injected_context_acknowledged"] = True
+            gate_result["injected_context_acknowledgement_source"] = (
+                acknowledgement_source
+            )
     # Authenticated-ledger numeric decoding fails closed with a named refusal:
     # a malformed count is never an exception escaping this gate boundary.
     policy_violations = _decode_ledger_int(verification.get("policy_violations"))
@@ -4101,7 +4381,16 @@ def _worker_mcp_live_call_gate(metadata: dict[str, Any], request_id: str) -> dic
         if int(successful.get(tool) or 0) > 0:
             satisfaction_by_tool[tool] = "live_worker_call"
         elif injected_acknowledged and tool in injected_tools:
-            satisfaction_by_tool[tool] = "injected_receipt"
+            satisfaction_by_tool[tool] = (
+                "coordinator_prompt_binding"
+                if acknowledgement_source == "coordinator_prompt_binding"
+                else "injected_receipt"
+            )
+        elif tool in coordinator_zero_hit:
+            # The coordinator ran the canonical query for this request and
+            # measured zero rows; that measurement is the answer, independent
+            # of a model-typed receipt or a live re-call of the same query.
+            satisfaction_by_tool[tool] = "coordinator_zero_hit_measurement"
         elif rework_attempt:
             # A rework is a validation-only replay of an already-green
             # predecessor delta; it structurally does not re-issue the context
@@ -4277,6 +4566,9 @@ def _enforce_quality_review_launch_binding(
 MAX_OWNER_PROMPT_BYTES = 16 * 1024
 MAX_CRASH_RETRY_PACKET_BYTES = 12 * 1024
 MAX_CRASH_RETRY_STREAM_BYTES = 2 * 1024
+# The sealed attempt review payload already caps the finalizer reason at 500
+# characters; the packet never carries more than the bundle holds.
+MAX_CRASH_RETRY_TERMINAL_REASON_CHARS = 500
 MAX_TASK_CONTRACT_BYTES = 96 * 1024
 MAX_REWORK_TASK_CONTRACT_BYTES = 48 * 1024
 MAX_WORKER_PROMPT_BYTES = 160 * 1024
@@ -4324,27 +4616,18 @@ def build_worker_prompt(
     )
     if contract_bytes > contract_cap:
         raise ValueError("task_contract_too_large")
-    bundle_sha256 = hashlib.sha256(project_context_bundle.encode("utf-8")).hexdigest()
-    section_count = 0
-    if project_context_bundle.strip():
-        try:
-            payload = json.loads(project_context_bundle.split("PROJECT_CONTEXT_BUNDLE:\n", 1)[1])
-            section_count = _worker_context_section_count(payload)
-        except (IndexError, TypeError, json.JSONDecodeError):
-            section_count = 0
+    # No acknowledgement line is requested: the coordinator already knows the
+    # bundle sha and the request id it rendered, and binds them to the worker
+    # MCP audit ledger at finalization (coordinator_prompt_binding).  Asking
+    # the model to copy 265 bytes of the prompt back into stdout added no
+    # evidence and its absence used to refuse verified work (receipt_not_found).
+    # ``request_id`` stays in the signature for its call sites; the binding
+    # is recorded in the request metadata, not in prompt text.
     context_block = (
-        "\n\nTrusted project context (bounded, read-only, coordinator-provided):\n"
+        "\n\nTrusted project context (bounded, read-only, coordinator-provided; "
+        "bound to your request id by the coordinator, no acknowledgement line "
+        "is required):\n"
         + project_context_bundle.strip()
-        + "\n\nIf you use this context, emit one bounded acknowledgement line before your final message:\n"
-        + "PROJECT_CONTEXT_RECEIPT: "
-        + json.dumps({
-            "schema_id": project_context.RECEIPT_SCHEMA_ID,
-            "acknowledged": True,
-            "bundle_sha256": bundle_sha256,
-            "prompt_sha256": "",
-            "section_count": section_count,
-            "request_id": request_id,
-        }, sort_keys=True, separators=(",", ":"))
         if project_context_bundle.strip()
         else ""
     )
@@ -5805,9 +6088,9 @@ class ProcessManager:
         self,
         *,
         task_id: str,
-        runner: str,
-        topic: str,
-        adapter_id: str,
+        runner: str | None = None,
+        topic: str | None = None,
+        adapter_id: str | None = None,
         model: str | None = None,
         owner_prompt: str = "",
         timeout_seconds: int = 7200,
@@ -5815,6 +6098,39 @@ class ProcessManager:
         reserved_request_id: str | None = None,
         prewarm_progress: Callable[..., None] | None = None,
     ) -> dict[str, Any]:
+        """Launch one worker; ``runner``/``topic``/``adapter_id`` are optional.
+
+        Omitting them derives the tuple from the card via
+        ``derive_launch_identity``: the card already owns runner and topic (and
+        ``_preflight_card`` refuses anything else), and the adapter is the first
+        one in the family's canonical tuple that ``repo_policy`` accepts for this
+        card. Passing them keeps the exact prior behavior -- an explicit value is
+        never overridden. Identity remains explicitly validated either way.
+        """
+        identity_derivation: dict[str, Any] | None = None
+        if not (runner and topic and adapter_id):
+            try:
+                card = _parse_card(self._show_task(task_id), task_id)
+                identity_derivation = derive_launch_identity(
+                    self.repo,
+                    card,
+                    runner=runner,
+                    topic=topic,
+                    adapter_id=adapter_id,
+                    model=model,
+                )
+            except LaunchRejected as exc:
+                return self._blocked(
+                    task_id,
+                    str(runner or ""),
+                    str(topic or ""),
+                    str(adapter_id or ""),
+                    str(exc),
+                )
+            runner = identity_derivation["runner"]
+            topic = identity_derivation["topic"]
+            adapter_id = identity_derivation["adapter_id"]
+            model = identity_derivation["model"]
         isolated_kwargs: dict[str, Any] = {
             "task_id": task_id,
             "runner": runner,
@@ -5831,16 +6147,22 @@ class ProcessManager:
         if prewarm_progress is not None:
             isolated_kwargs["prewarm_progress"] = prewarm_progress
         if self.isolation_enabled or reserved_request_id is not None:
-            return self._launch_isolated(**isolated_kwargs)
-        return self._launch_direct_for_tests(
-            task_id=task_id,
-            runner=runner,
-            topic=topic,
-            adapter_id=adapter_id,
-            model=model,
-            owner_prompt=owner_prompt,
-            timeout_seconds=timeout_seconds,
-        )
+            result = self._launch_isolated(**isolated_kwargs)
+        else:
+            result = self._launch_direct_for_tests(
+                task_id=task_id,
+                runner=runner,
+                topic=topic,
+                adapter_id=adapter_id,
+                model=model,
+                owner_prompt=owner_prompt,
+                timeout_seconds=timeout_seconds,
+            )
+        # The receipt records HOW the identity was decided, so a launch that
+        # derived its route is auditable against one that asserted it.
+        if identity_derivation is not None and isinstance(result, dict):
+            result["launch_identity_derivation"] = identity_derivation
+        return result
 
     launch_task = launch
 
@@ -6142,14 +6464,44 @@ class ProcessManager:
     # time-limited or killed by elapsed time.  Liveness of a real provider still
     # follows exact process evidence only.
     _QUALITY_REVIEW_LAUNCH_OWNER_SECONDS = 300.0
-    _QUALITY_REVIEW_SOURCE_MAX_BYTES = 4_000
-    _QUALITY_REVIEW_SOURCE_TOTAL_MAX_BYTES = 60_000
+    # The source-evidence budget is sized from the measured change rather than
+    # a fixed excerpt.  2026-09-08 reviewer audit over 38 surviving packets:
+    # the old 4,000 B per-path / 60,000 B total excerpt with 3 context lines
+    # carried 2.0% of the changed bytes (excerpt 12,271 B vs 619,485 B of
+    # changed source per candidate) and flagged 67% of rows truncated, so
+    # reviewers re-read their own changed files (63.5% of every byte they
+    # read) and ran git diff in 38% of runs (p50 26 KB each).  git diff output
+    # on those candidates averaged ~35 KB; a 24 KiB per-path and 64 KiB total
+    # budget carries the whole change for the typical candidate and names the
+    # omission exactly (``diff_complete`` false) for the rest.
+    _QUALITY_REVIEW_SOURCE_MAX_BYTES = 24 * 1024
+    _QUALITY_REVIEW_SOURCE_TOTAL_MAX_BYTES = 64 * 1024
     _QUALITY_REVIEW_SOURCE_CONTEXT_LINES = 3
+    # Canonical source around every graph-resolved caller line the scoped
+    # audit lists (``impact_evidence`` rows of kind ``callers``).  Impact rows
+    # sit at the 64-row cap in 38/38 packets; the caller search reviewers ran
+    # by hand (110 Agent subagents in 60 claude runs) was looking for exactly
+    # these lines, which the coordinator already had.
+    _QUALITY_REVIEW_CALLER_CONTEXT_LINES = 5
+    _QUALITY_REVIEW_CALLER_CONTEXT_MAX_ROWS = 64
+    _QUALITY_REVIEW_CALLER_CONTEXT_ROW_MAX_BYTES = 2_048
+    _QUALITY_REVIEW_CALLER_CONTEXT_TOTAL_MAX_BYTES = 16 * 1024
 
     def _quality_review_source_evidence(
         self, workspace: Any, changed_hashes: Mapping[str, str | None]
     ) -> dict[str, dict[str, Any]]:
-        """Build bounded source evidence centered on candidate changed ranges."""
+        """Build the complete unified diff of each changed path, candidate vs canonical.
+
+        One hunk per non-equal SequenceMatcher opcode: an ``@@`` header naming
+        the exact candidate and baseline line ranges, then ``' '`` context
+        lines (bounded by the neighbouring equal blocks, so context is never
+        another hunk's changed line), ``'-'`` baseline lines removed and
+        ``'+'`` candidate lines added.  Hunks are emitted whole while the
+        per-path and total byte budgets allow; a hunk that does not fit is cut
+        at a line boundary and counted, and every cut or omitted hunk keeps
+        its exact ``segments`` row so ``diff_complete`` is false only when
+        something is missing and never silently.
+        """
 
         def decode_utf8(raw: bytes) -> str | None:
             try:
@@ -6157,27 +6509,10 @@ class ProcessManager:
             except UnicodeDecodeError:
                 return None
 
-        def line_span(start: int, end: int, line_count: int) -> tuple[int, int]:
-            anchor_start = start + 1
-            anchor_end = max(start + 1, end)
-            context = self._QUALITY_REVIEW_SOURCE_CONTEXT_LINES
-            return (
-                max(1, anchor_start - context),
-                min(line_count, anchor_end + context),
-            )
+        def with_newline(line: str) -> str:
+            return line if line.endswith("\n") else line + "\n"
 
-        def segment_excerpt(
-            lines: list[str], start_line: int, end_line: int, limit: int
-        ) -> tuple[str, int, bool]:
-            if limit <= 0 or start_line > end_line:
-                return "", 0, bool(start_line <= end_line)
-            excerpt = "".join(lines[start_line - 1 : end_line])
-            encoded = excerpt.encode("utf-8")
-            if len(encoded) <= limit:
-                return excerpt, len(encoded), False
-            body = encoded[:limit]
-            return body.decode("utf-8", errors="replace"), len(body), True
-
+        context_lines = self._QUALITY_REVIEW_SOURCE_CONTEXT_LINES
         evidence: dict[str, dict[str, Any]] = {}
         remaining = self._QUALITY_REVIEW_SOURCE_TOTAL_MAX_BYTES
         for path in sorted(changed_hashes):
@@ -6189,6 +6524,7 @@ class ProcessManager:
                 "excerpt_bytes": 0,
                 "source_bytes": 0,
                 "truncated": False,
+                "diff_complete": False,
                 "segments": [],
             }
             evidence[path] = row
@@ -6224,73 +6560,208 @@ class ProcessManager:
             baseline_lines = baseline_text.splitlines(keepends=True)
             if not candidate_lines and candidate_text:
                 candidate_lines = [candidate_text]
-            matcher = difflib.SequenceMatcher(None, baseline_lines, candidate_lines)
+            opcodes = difflib.SequenceMatcher(
+                None, baseline_lines, candidate_lines
+            ).get_opcodes()
             chunks: list[str] = []
             omitted_hunks = 0
             path_remaining = self._QUALITY_REVIEW_SOURCE_MAX_BYTES
             header_path = json.dumps(path, ensure_ascii=True)
-            for tag, old_start, old_end, new_start, new_end in matcher.get_opcodes():
+            for index, (tag, old_start, old_end, new_start, new_end) in enumerate(opcodes):
                 if tag == "equal":
                     continue
-                start_line, end_line = line_span(
-                    new_start, new_end, len(candidate_lines)
-                )
-                limit = max(0, min(path_remaining, remaining))
+                # Context is bounded by the adjacent EQUAL blocks: a short
+                # equal run between two hunks must not let one hunk's context
+                # swallow the other hunk's changed lines as if unchanged.
+                before = 0
+                if index > 0 and opcodes[index - 1][0] == "equal":
+                    before = min(context_lines, opcodes[index - 1][4] - opcodes[index - 1][3])
+                after = 0
+                if index + 1 < len(opcodes) and opcodes[index + 1][0] == "equal":
+                    after = min(context_lines, opcodes[index + 1][4] - opcodes[index + 1][3])
+                start_line = new_start - before + 1
+                end_line = max(start_line, new_end + after)
                 header = (
                     f"@@ path:{header_path} candidate:{start_line}-{end_line} "
                     f"change:{new_start + 1}-{max(new_start + 1, new_end)} "
                     f"baseline:{old_start + 1}-{max(old_start + 1, old_end)} {tag} @@\n"
                 )
+                body_lines = (
+                    [" " + with_newline(line) for line in candidate_lines[new_start - before:new_start]]
+                    + ["-" + with_newline(line) for line in baseline_lines[old_start:old_end]]
+                    + ["+" + with_newline(line) for line in candidate_lines[new_start:new_end]]
+                    + [" " + with_newline(line) for line in candidate_lines[new_end:new_end + after]]
+                )
+                segment = {
+                    "kind": tag,
+                    "candidate_start_line": start_line,
+                    "candidate_end_line": end_line,
+                    "changed_start_line": new_start + 1,
+                    "changed_end_line": max(new_start + 1, new_end),
+                    "baseline_start_line": old_start + 1,
+                    "baseline_end_line": max(old_start + 1, old_end),
+                    "excerpt_bytes": 0,
+                    "truncated": True,
+                }
+                limit = max(0, min(path_remaining, remaining))
                 header_bytes = len(header.encode("utf-8"))
                 if limit <= header_bytes:
                     omitted_hunks += 1
-                    row["truncated"] = True
-                    row["segments"].append(
-                        {
-                            "kind": tag,
-                            "candidate_start_line": start_line,
-                            "candidate_end_line": end_line,
-                            "changed_start_line": new_start + 1,
-                            "changed_end_line": max(new_start + 1, new_end),
-                            "baseline_start_line": old_start + 1,
-                            "baseline_end_line": max(old_start + 1, old_end),
-                            "excerpt_bytes": 0,
-                            "truncated": True,
-                        }
-                    )
+                    row["segments"].append(segment)
                     continue
-                excerpt, excerpt_bytes, truncated = segment_excerpt(
-                    candidate_lines, start_line, end_line, limit - header_bytes
-                )
-                segment_bytes = header_bytes + excerpt_bytes
+                budget = limit - header_bytes
+                emitted: list[str] = []
+                used = 0
+                truncated = False
+                for line in body_lines:
+                    encoded = len(line.encode("utf-8"))
+                    if used + encoded > budget:
+                        truncated = True
+                        break
+                    emitted.append(line)
+                    used += encoded
+                segment_bytes = header_bytes + used
                 remaining -= segment_bytes
                 path_remaining -= segment_bytes
                 row["excerpt_bytes"] += segment_bytes
-                row["segments"].append(
-                    {
-                        "kind": tag,
-                        "candidate_start_line": start_line,
-                        "candidate_end_line": end_line,
-                        "changed_start_line": new_start + 1,
-                        "changed_end_line": max(new_start + 1, new_end),
-                        "baseline_start_line": old_start + 1,
-                        "baseline_end_line": max(old_start + 1, old_end),
-                        "excerpt_bytes": segment_bytes,
-                        "truncated": truncated,
-                    }
-                )
-                chunks.append(header + excerpt)
+                segment["excerpt_bytes"] = segment_bytes
+                segment["truncated"] = truncated
+                row["segments"].append(segment)
+                chunks.append(header + "".join(emitted))
                 if truncated:
                     omitted_hunks += 1
-                    row["truncated"] = True
-                if remaining <= 0 or path_remaining <= 0:
-                    row["truncated"] = True
+            row["diff_complete"] = omitted_hunks == 0
+            row["truncated"] = omitted_hunks > 0
             if omitted_hunks:
                 row["omission_reason"] = f"changed_hunks_omitted:{omitted_hunks}"
             if not chunks and "omission_reason" not in row:
                 row["omission_reason"] = "empty_diff"
             row["excerpt"] = "".join(chunks)
         return evidence
+
+    def _quality_review_caller_context(
+        self,
+        changed_hashes: Mapping[str, str | None],
+        scoped_audits: Mapping[str, Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        """Read the canonical source around every graph-resolved caller line.
+
+        The rows come from the scoped audit's ``impact_evidence`` of kind
+        ``callers`` -- canonical Source Graph edges into the changed symbols.
+        They are lens-independent, so one lens's rows are read.  A caller that
+        lives in a changed path is skipped: the diff already carries that file
+        in full and the graph line would refer to the canonical bytes anyway.
+        Everything read here is canonical-tree bytes at the graph's line;
+        nothing is model prose.
+        """
+
+        def with_newline(line: str) -> str:
+            return line if line.endswith("\n") else line + "\n"
+
+        callers: dict[str, tuple[str, int]] = {}
+        for lens in sorted(scoped_audits):
+            wrapper = scoped_audits[lens]
+            scope = wrapper.get("packet") if isinstance(wrapper, Mapping) else None
+            if not isinstance(scope, Mapping):
+                continue
+            for entry in scope.get("impact_evidence") or []:
+                if not isinstance(entry, Mapping) or entry.get("evidence_kind") != "callers":
+                    continue
+                identity = str(entry.get("identity") or "")
+                path = str(entry.get("path") or "")
+                line = entry.get("line_start")
+                if (
+                    not identity
+                    or not path
+                    or path.startswith("/")
+                    or ".." in path.split("/")
+                    or type(line) is not int
+                    or line < 1
+                    or path in changed_hashes
+                ):
+                    continue
+                callers.setdefault(identity, (path, line))
+            break
+        context = self._QUALITY_REVIEW_CALLER_CONTEXT_LINES
+        rows: list[dict[str, Any]] = []
+        omitted = 0
+        remaining = self._QUALITY_REVIEW_CALLER_CONTEXT_TOTAL_MAX_BYTES
+        cache: dict[str, list[str]] = {}
+        ordered = sorted(callers, key=lambda key: (callers[key][0], callers[key][1], key))
+        for identity in ordered:
+            path, line = callers[identity]
+            if len(rows) >= self._QUALITY_REVIEW_CALLER_CONTEXT_MAX_ROWS:
+                omitted += 1
+                continue
+            lines = cache.get(path)
+            if lines is None:
+                source = Path(self.repo) / path
+                try:
+                    if source.is_symlink() or not source.is_file():
+                        lines = []
+                    else:
+                        lines = source.read_bytes().decode("utf-8").splitlines(keepends=True)
+                except (OSError, UnicodeDecodeError):
+                    lines = []
+                cache[path] = lines
+            if line > len(lines):
+                omitted += 1
+                continue
+            start = max(1, line - context)
+            end = min(len(lines), line + context)
+            text = "".join(with_newline(item) for item in lines[start - 1:end])
+            size = len(text.encode("utf-8"))
+            if size > self._QUALITY_REVIEW_CALLER_CONTEXT_ROW_MAX_BYTES or size > remaining:
+                omitted += 1
+                continue
+            remaining -= size
+            rows.append(
+                {
+                    "identity": identity,
+                    "path": path,
+                    "line": line,
+                    "line_start": start,
+                    "line_end": end,
+                    "source": "canonical",
+                    "text": text,
+                }
+            )
+        return {"rows": rows, "complete": omitted == 0, "omitted": omitted}
+
+    @staticmethod
+    def _quality_review_candidate_delta(
+        card: Mapping[str, Any], current_hashes: Mapping[str, str | None]
+    ) -> dict[str, Any] | None:
+        """Mark which changed paths are byte-identical to the reviewed predecessor.
+
+        Basis: the ``rework_predecessor.changed_path_hashes`` retained on the
+        card against the current candidate's hashes.  Measured 2026-09-08:
+        80% of lens launches target rework candidates and 34.6% of their
+        changed paths are byte-identical to the predecessor.  Predecessor
+        worktrees are retired, so this records only hash identity -- never a
+        hunk diff against the predecessor and never a prior report.  ``None``
+        when the card names no well-formed predecessor.
+        """
+
+        predecessor = card.get("rework_predecessor")
+        if not isinstance(predecessor, Mapping):
+            return None
+        request_id = str(predecessor.get("request_id") or "").strip()
+        hashes = predecessor.get("changed_path_hashes")
+        if not request_id or not isinstance(hashes, Mapping):
+            return None
+        paths: dict[str, dict[str, Any]] = {}
+        for path in sorted(current_hashes):
+            prior = hashes.get(path) if path in hashes else None
+            if prior is not None and (
+                not isinstance(prior, str) or not re.fullmatch(r"[0-9a-f]{64}", prior)
+            ):
+                return None
+            paths[path] = {
+                "unchanged_since_reviewed": path in hashes and prior == current_hashes[path],
+                "predecessor_sha256": prior,
+            }
+        return {"predecessor_request_id": request_id, "paths": paths}
 
     def _prepared_quality_review(
         self,
@@ -6504,6 +6975,12 @@ class ProcessManager:
                 lenses=quality_evidence.JUDGMENT_LENSES,
             )
             mark("scope_audits_complete")
+            caller_context = self._quality_review_caller_context(
+                current_hashes, scoped_audits
+            )
+            candidate_delta = self._quality_review_candidate_delta(
+                card, current_hashes
+            )
             target_claim_epoch = card.get("claim_epoch")
             if type(target_claim_epoch) is not int or target_claim_epoch < 1:
                 raise WorkspaceError("quality_review_target_claim_epoch_invalid")
@@ -6527,6 +7004,8 @@ class ProcessManager:
                 mechanical_checks=initial_gate.get("checks") or [],
                 source_evidence=source_evidence,
                 scoped_audits=scoped_audits,
+                caller_context=caller_context,
+                candidate_delta=candidate_delta,
             )
             # Immutable inputs are authenticated reviewer contract context and
             # read-only workspace materialization authority. Keep candidate
@@ -7369,12 +7848,25 @@ class ProcessManager:
                 reviewer_model=str(adapter_id or ""),
             )
             _progress("independence_rung_recorded", str(independence["rung"]))
+            # The shared preparation seals every lens's scoped audit into one
+            # packet (single-flight per target).  This lens is handed the
+            # packet that carries exactly ITS scope and a digest recomputed
+            # over that body, so packet_read, submit and the receipt verifier
+            # all bind to what this reviewer actually sees -- and the packet
+            # fits the inline transport instead of a three-lens file.
+            try:
+                lens_packet = quality_reviewer.build_lens_packet(
+                    prepared["packet"], lens=lens
+                )
+            except quality_reviewer.ReviewerEvidenceError as exc:
+                _fail(f"quality_review_preparation_failed:lens_packet:{exc}"[:500])
+                return
             _progress("packet_prepared")
             binding = {
                 "target_request_id": target_request_id,
                 "target_task_id": target_task_id,
                 "target_claim_epoch": (
-                    prepared["packet"].get("target", {}).get("claim_epoch")
+                    lens_packet.get("target", {}).get("claim_epoch")
                 ),
                 "adapter_id": adapter_id,
                 "source_workspace": prepared["workspace"].as_metadata(),
@@ -7382,7 +7874,7 @@ class ProcessManager:
                 "read_only_input_paths": list(
                     prepared.get("read_only_input_paths") or []
                 ),
-                "packet": prepared["packet"],
+                "packet": lens_packet,
                 "lens": lens,
                 "independence": independence,
             }
@@ -8506,6 +8998,10 @@ class ProcessManager:
         usage["role"] = usage_role
         event_payload: dict[str, Any] = {
             "runner": runner,
+            # Request-time topic: the backfill writer persists it and the
+            # ledger attributes by it; omitting it left 31% of input tokens
+            # unattributed although every claim carries the topic.
+            "topic": str(topic or ""),
             "model": ledger_model,
             "requested_model": model,
             "observed_model": str(usage.get("observed_model") or ""),
@@ -9514,7 +10010,13 @@ class ProcessManager:
             automation_result = review_orchestrator.retry_pending_registrations(
                 self, db_path=review_db, events=self._latest_by_request())
             driver = review_orchestrator.ReviewOrchestrator(self, db_path=review_db)
-            review_result = driver.drain(max_actions=1).as_dict()
+            # One action per reconcile pass could not work off an outbox holding
+            # 627 chains and 12 actions each: measured, 30 launches completed
+            # automatically while 570 were typed by hand. The bound itself is
+            # unchanged -- ``drain`` has always clamped to
+            # DEFAULT_DRAIN_MAX_ACTIONS -- this call simply stops asking for one
+            # twelfth of it.
+            review_result = driver.drain().as_dict()
         return {
             "ok": True,
             "reservations_retired": reservations_retired,
@@ -10700,8 +11202,26 @@ class ProcessManager:
                                 "blocking_checks": [],
                             }
                         else:
-                            quality_gate = quality_evidence.run_completion_quality_gate(
-                                workspace.path, changed_paths=changed
+                            # The canonical card, not ``metadata``: only the card
+                            # carries ``task_type``/``project_context``, and
+                            # ``derive_risk_signals`` reads both. An unreadable
+                            # card degrades to the launch metadata rather than
+                            # failing a finalization over risk DESCRIPTION.
+                            try:
+                                risk_card: dict[str, Any] = _parse_card(
+                                    self._show_task(str(metadata["task_id"])),
+                                    str(metadata["task_id"]),
+                                )
+                            except Exception:  # noqa: BLE001 -- description never fails a candidate
+                                risk_card = dict(metadata)
+                            quality_gate = quality_evidence.run_review_ready_quality_gate(
+                                workspace.path,
+                                card=risk_card,
+                                changed_paths=changed,
+                                canonical_repo=self.repo,
+                                reachability_inputs=self._candidate_reachability_inputs(
+                                    workspace, changed
+                                ),
                             )
                             if full_validation_snapshot is not None:
                                 quality_gate["full_validation_snapshot"] = full_validation_snapshot
@@ -10824,7 +11344,8 @@ class ProcessManager:
                             try:
                                 registration = review_orchestrator.candidate_registration(
                                     metadata=metadata, artifact_receipt=attempt_artifact_receipt,
-                                    changed_path_hashes=changed_path_hashes)
+                                    changed_path_hashes=changed_path_hashes,
+                                    quality_gate=quality_gate)
                                 review_db = review_orchestrator.canonical_review_db(self)
                                 if review_db is None:
                                     raise RuntimeError("review_lifecycle_store_not_ready")
@@ -12434,7 +12955,7 @@ class ProcessManager:
         task_id: str,
         *,
         confirm_destructive_change: bool = False,
-        requested_risk_tier: str = quality_evidence.RISK_LOW,
+        requested_risk_tier: str | None = None,
         risk_signals: list[str] | None = None,
         reviewer_reports: list[dict[str, Any]] | None = None,
         reviewer_request_ids: list[str] | None = None,
@@ -12458,6 +12979,29 @@ class ProcessManager:
             reviewer_request_ids=reviewer_request_ids,
             confirm_high_risk=confirm_high_risk,
         )
+
+    def accept_preview(
+        self,
+        request_id: str,
+        task_id: str,
+        **overrides: Any,
+    ) -> dict[str, Any]:
+        """READ-ONLY preview of the cheap blocker fold ``accept_review`` runs.
+
+        Measured 2026-09-08: 49 of 159 accept attempts (31%) failed on a
+        parameter or timing blocker -- a lens still running, a target not yet
+        review_ready, an approval not given -- AFTER the combined tree had been
+        materialized and two validation runs had been paid for. Those blockers
+        are all knowable before any of that work, so they are now foldable on
+        their own.
+
+        The implementation lives in
+        :func:`process_launcher_accept_review.accept_preview`; this method is
+        the delegation and holds no logic of its own. It writes nothing and it
+        is not an acceptance: a clear preview only means nothing cheap is
+        refusing yet, and the expensive half can still refuse.
+        """
+        return _accept_preview_impl(self, request_id, task_id, **overrides)
 
     def reject_review(
         self,

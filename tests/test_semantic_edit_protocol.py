@@ -277,3 +277,144 @@ def test_verified_audit_exposes_only_semantic_edit_byte_receipt(
     serialized = json.dumps(verified, sort_keys=True)
     assert "edit-audit-1" not in serialized
     assert "src/module.py" not in serialized
+
+
+# ---------------------------------------------------------------------------
+# Delivered-range registry (worker_validation-5).  The fragment is bytes the
+# caller already holds; ``apply`` needs only the hashes.  CONTRACT: apply must
+# still verify BOTH preimage hashes on the live file when the receipt it was
+# given carried no fragment.
+# ---------------------------------------------------------------------------
+
+def _delivery_session(tmp_path: Path) -> tuple[worker_tools.WorkerSemanticEditSession, Path]:
+    repo = tmp_path / "worktree"
+    target = repo / "src" / "module.py"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"before\ndef target():\n    return 1\nafter\n")
+    key_path = tmp_path / "audit.key"
+    key_path.write_bytes(b"k" * 32)
+    ctx = worker_tools.WorkerToolContext(
+        task_id="TASK",
+        runner="runner",
+        topic="topic",
+        request_id="request",
+        repo=repo,
+        authority_repo=tmp_path,
+        source_graph_targets=("src/module.py",),
+        session_topic="topic",
+        audit_ledger_path=tmp_path / "audit.jsonl",
+        audit_hmac_key_path=key_path,
+        allowed_writes=("src/*.py",),
+    )
+    return worker_tools.WorkerSemanticEditSession(ctx), target
+
+
+def test_an_already_delivered_range_comes_back_hash_only(tmp_path: Path) -> None:
+    session, _target = _delivery_session(tmp_path)
+
+    first = session.prepare(file_path="src/module.py", start_line=2, end_line=3)
+    assert first["fragment"] == "def target():\n    return 1\n"
+    assert "fragment_omitted" not in first
+
+    second = session.prepare(file_path="src/module.py", start_line=2, end_line=3)
+    assert "fragment" not in second
+    assert second["fragment_omitted"] is True
+    assert second["delivered_by"] == first["target_id"]
+    assert second["fragment_bytes_avoided"] == first["fragment_bytes"]
+    # Everything apply verifies is present either way.
+    assert second["current_sha256"] == first["current_sha256"]
+    assert second["fragment_sha256"] == first["fragment_sha256"]
+    assert (second["start_line"], second["end_line"]) == (2, 3)
+
+    # A containing range counts as delivered; a wider one does not.
+    inner = session.prepare(file_path="src/module.py", start_line=2, end_line=2)
+    assert inner["fragment_omitted"] is True
+    wider = session.prepare(file_path="src/module.py", start_line=1, end_line=4)
+    assert "fragment" in wider
+
+    # The override always wins.
+    forced = session.prepare(
+        file_path="src/module.py", start_line=2, end_line=3, include_fragment=True,
+    )
+    assert forced["fragment"] == first["fragment"]
+
+
+def test_apply_from_a_hash_only_receipt_still_verifies_both_preimages(
+    tmp_path: Path,
+) -> None:
+    session, target = _delivery_session(tmp_path)
+    session.prepare(file_path="src/module.py", start_line=2, end_line=3)
+    hash_only = session.prepare(file_path="src/module.py", start_line=2, end_line=3)
+    assert "fragment" not in hash_only
+
+    applied = session.apply(
+        target_id=hash_only["target_id"],
+        new="def target():\n    return 2",
+        idempotency_key="delivered-1",
+    )
+    assert applied["ok"] is True
+    assert applied["preimage_verified"] is True
+    assert applied["preimage_verified_range_count"] == 1
+    assert applied["preimage_unverified_range_count"] == 0
+    assert applied["before_sha256"] == hash_only["current_sha256"]
+    assert target.read_text(encoding="utf-8") == (
+        "before\ndef target():\n    return 2\nafter\n"
+    )
+
+
+def test_an_edit_invalidates_every_earlier_delivery_of_that_file(
+    tmp_path: Path,
+) -> None:
+    """The registry key carries the file sha, so a write re-arms the fragment."""
+    session, _target = _delivery_session(tmp_path)
+    first = session.prepare(file_path="src/module.py", start_line=2, end_line=3)
+    session.apply(
+        target_id=first["target_id"],
+        new="def target():\n    return 2",
+        idempotency_key="invalidate-1",
+    )
+
+    after = session.prepare(file_path="src/module.py", start_line=2, end_line=3)
+    assert after["fragment"] == "def target():\n    return 2\n"
+    assert "fragment_omitted" not in after
+    assert after["current_sha256"] != first["current_sha256"]
+
+
+def test_a_source_graph_body_reply_counts_as_a_delivery(tmp_path: Path) -> None:
+    """A body the server already served is not re-sent by ``prepare``."""
+    session, target = _delivery_session(tmp_path)
+    body = "def target():\n    return 1"
+    payload = {
+        "mode": "body",
+        "matches": [{
+            "file_path": "src/module.py",
+            "line_start": 2,
+            "line_end": 3,
+            "source": body,
+            "freshness": {
+                "state": "fresh",
+                "disk_source_hash": hashlib.sha256(target.read_bytes()).hexdigest(),
+            },
+        }],
+    }
+    registered = session.note_source_graph_delivery({
+        "ok": True,
+        "receipt_id": "abc123",
+        "content": json.dumps(payload, sort_keys=True),
+    })
+    assert registered == 1
+
+    prepared = session.prepare(file_path="src/module.py", start_line=2, end_line=3)
+    assert "fragment" not in prepared
+    assert prepared["fragment_omitted"] is True
+    assert prepared["delivered_by"] == "source_graph:abc123"
+
+    # A paged (base64) reply is not a delivery: those bytes were never
+    # readable in one page.
+    other, _other_target = _delivery_session(tmp_path / "second")
+    assert other.note_source_graph_delivery({
+        "ok": True,
+        "receipt_id": "abc123",
+        "content_encoding": "base64",
+        "content": json.dumps(payload, sort_keys=True),
+    }) == 0

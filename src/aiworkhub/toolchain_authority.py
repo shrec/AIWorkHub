@@ -20,7 +20,7 @@ import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Protocol
 
 from . import terminal_authority
@@ -152,6 +152,106 @@ def worker_workspace_unresolvable_paths(
         if (repo / candidate).exists():
             findings.append((posix, WORKER_WORKTREE_ABSENT))
     return tuple(findings)
+
+
+CARD_CONTRACT_INPUT_MISSING = "workspace_required_input_missing"
+
+
+def card_contract_missing_inputs(
+    repo: Path, card: Mapping[str, Any]
+) -> tuple[tuple[str, str], ...]:
+    """Card-pure inputs a validation command needs and nothing can supply.
+
+    ``(token, reason)`` pairs, empty when every repository-relative input a
+    declared validation command reads either exists in the canonical repository
+    or is a declared output this card authorizes the worker to create.
+
+    This is the CHEAP half of what ``ToolchainAuthority.evaluate`` proves, split
+    out so it can run at card CREATION. The measurement that forced the split:
+    ``evaluate`` costs 15.0s on this repository for one card, essentially all of
+    it inside ``worker_workspace._declared_workspace_seed_closure`` (13.5s), which
+    resolves the whole sparse import closure. Paying 15s on every
+    ``aiworkhub_task_create`` to learn a fact that four filesystem stats decide is
+    not a trade a creation path may make. The closure keeps its authority at
+    launch; this only ever ADDS the same refusal earlier, and only for the two
+    conditions it can prove:
+
+    * ``workspace_required_input_missing`` -- the path is not in the repository
+      and is not a declared output, so no worker can produce it;
+    * ``repository_path_untracked_so_absent_from_worker_worktree`` -- the path
+      exists for the coordinator but git does not track it, so the worker's
+      worktree cannot materialize it.
+
+    Deliberately silent about host capability (a missing ruff, an absent module,
+    a sandbox lane): those are repairable, the launcher repairs them, and the
+    machine composing a card is not necessarily the machine that runs it.
+    """
+    commands = tuple(
+        value
+        for value in (card.get("validation") or [])
+        if isinstance(value, str) and value.strip()
+    )
+    if not commands:
+        return ()
+    # A declared output is a capability the worker HAS: the card authorizes it
+    # to create the file, so its absence today is the point of the card, not a
+    # defect. Mirrors ``_exact_required_card_inputs``'s ``exempt`` set exactly.
+    exempt: set[str] = set()
+    for field in ("allowed_writes", "required_outputs"):
+        for value in card.get(field) or []:
+            try:
+                exempt.add(Path(os.path.normpath(str(value))).as_posix())
+            except (OSError, ValueError):
+                continue
+    generated = frozenset(
+        output for command in commands for output in declared_compiler_outputs(command)
+    )
+    tracked = repository_tracked_paths(repo)
+    findings: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for command in commands:
+        try:
+            tokens = shlex.split(command)
+        except ValueError:
+            continue
+        for raw in tokens:
+            # A pytest node id authenticates only its file component; the
+            # ``::class::test`` tail is selection metadata, not a path.
+            token = raw.split("::", 1)[0]
+            if not token or token.startswith("-") or token.startswith("/"):
+                continue
+            if "/" not in token or ":" in token or "=" in token:
+                continue
+            suffix = PurePosixPath(token).suffix.lower()
+            if suffix not in _VALIDATION_INPUT_SUFFIXES:
+                continue
+            candidate = os.path.normpath(token)
+            if candidate.startswith("..") or candidate in seen:
+                continue
+            seen.add(candidate)
+            posix = Path(candidate).as_posix()
+            if posix in exempt or posix in generated:
+                continue
+            if not (repo / candidate).exists():
+                findings.append((posix, CARD_CONTRACT_INPUT_MISSING))
+                continue
+            if tracked and posix not in tracked:
+                prefix = posix + "/"
+                if not any(entry.startswith(prefix) for entry in tracked):
+                    findings.append((posix, WORKER_WORKTREE_ABSENT))
+    return tuple(findings)
+
+
+# The suffixes a validation-command token may name as an INPUT file. Restated
+# from ``worker_workspace._VALIDATION_FILE_SUFFIXES``; a token with any other
+# suffix (or none) is a selector, an option value or a directory and is never
+# treated as a missing input.
+_VALIDATION_INPUT_SUFFIXES = frozenset(
+    {
+        ".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".ini", ".js", ".json",
+        ".mjs", ".py", ".sh", ".toml", ".ts", ".yaml", ".yml",
+    }
+)
 
 
 def declared_compiler_outputs(command: str) -> frozenset[str]:

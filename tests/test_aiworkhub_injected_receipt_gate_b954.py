@@ -88,8 +88,10 @@ def _metadata(
     stdout: Path,
     runtime: bool = True,
     task_type: str = "code",
+    delivered_sha: str | None = None,
+    context_required: bool = False,
 ) -> dict:
-    return {
+    metadata = {
         "task_id": "TASK_B954", "runner": "codex", "topic": "representation",
         "stdout_path": str(stdout),
         "worker_mcp": (
@@ -102,6 +104,28 @@ def _metadata(
             "sections": sections,
         },
     }
+    if context_required:
+        metadata["project_context"]["required"] = True
+    if delivered_sha is not None:
+        # The launcher's own record of what it wrote into the prompt.
+        metadata["project_context_delivery"] = {
+            "injected": True,
+            "bundle_sha256": delivered_sha,
+            "prompt_sha256": _sha("prompt"),
+        }
+    return metadata
+
+
+def _no_receipt_stdout(tmp_path: Path) -> Path:
+    stdout = tmp_path / "no-receipt.stdout.log"
+    stdout.write_text(
+        json.dumps({
+            "type": "item.completed",
+            "item": {"type": "agent_message", "text": "edited src/x.py; tests green"},
+        }) + "\n",
+        encoding="utf-8",
+    )
+    return stdout
 
 
 def _patch_verify(monkeypatch, *, live_source_graph: int = 0, successful: dict | None = None, policy_violations: int = 0) -> None:
@@ -160,7 +184,10 @@ def test_verbatim_worker_prompt_echo_cannot_acknowledge_injected_orientation(
         request_id,
     )
 
-    assert f'\"request_id\":\"{request_id}\"' in prompt
+    # The prompt no longer carries a receipt line for the model to copy; an
+    # echoed prompt therefore contains nothing that could read as one.
+    assert "PROJECT_CONTEXT_RECEIPT" not in prompt
+    assert gate["injected_context_acknowledged"] is False
     assert gate["satisfied"] is False
     assert gate["missing_tools"] == ["source_graph"]
 
@@ -203,8 +230,9 @@ def test_authenticated_assistant_receipt_binds_exact_request_and_satisfies_orien
         request_id,
     )
 
-    assert f'\"request_id\":\"{request_id}\"' in prompt
+    assert "PROJECT_CONTEXT_RECEIPT" not in prompt
     assert gate["satisfied"] is True
+    assert gate["injected_context_acknowledgement_source"] == "worker_receipt"
     assert gate["verification"]["live_source_graph_calls"] == 0
     assert gate["satisfaction_by_tool"]["source_graph"] == (
         "supervisor_injected_orientation"
@@ -988,3 +1016,260 @@ def test_concurrent_get_and_store_never_duplicate_or_cross_authorities():
         for i in range(per_worker):
             key = _key(request_id=f"req-{n}", query=f"q{i}")
             assert wm._CACHE[key]["content_sha256"] == f"{n}:{i}"
+
+
+# --- worker_prompt-2/3: coordinator-derived acknowledgement and measurement --
+
+def test_coordinator_prompt_binding_acknowledges_injected_context_without_model_echo(
+    tmp_path, monkeypatch
+):
+    """The launcher recorded the bundle it injected (delivery sha == bundle
+    sha) and the HMAC ledger verifies for this request: the injected sections
+    are acknowledged by construction. No PROJECT_CONTEXT_RECEIPT line exists in
+    the worker output and none is needed -- receipt_not_found no longer refuses
+    a run whose ledger verifies."""
+    _patch_verify(monkeypatch)
+    bundle = _sha()
+    sections = _sections(
+        ("source_graph", True, 3, ""),
+        ("session_current_state", True, 4, ""),
+        ("ai_memory", True, 2, ""),
+        ("kb", True, 0, ""),
+    )
+    gate = pl._worker_mcp_live_call_gate(
+        _metadata(
+            tmp_path,
+            bundle_sha=bundle,
+            sections=sections,
+            stdout=_no_receipt_stdout(tmp_path),
+            delivered_sha=bundle,
+        ),
+        "req",
+    )
+
+    assert gate["injected_context_acknowledged"] is True
+    assert gate["injected_context_acknowledgement_source"] == "coordinator_prompt_binding"
+    assert gate["satisfied"] is True
+    assert gate["missing_tools"] == []
+    assert gate["satisfaction_by_tool"] == {
+        "source_graph": "supervisor_injected_orientation",
+        "session_current_state": "coordinator_prompt_binding",
+        "ai_memory": "coordinator_prompt_binding",
+        "kb": "coordinator_prompt_binding",
+    }
+    assert gate["exempted_tools"] == {}
+
+
+def test_coordinator_binding_requires_verified_ledger_and_matching_delivery(
+    tmp_path, monkeypatch
+):
+    """Both binding inputs are coordinator facts and both are required: an
+    unverified ledger or a delivery record that does not match the collected
+    bundle credits nothing, so the gate stays fail-closed."""
+    bundle = _sha()
+    sections = _sections(("source_graph", True, 3, ""), ("ai_memory", True, 2, ""))
+
+    monkeypatch.setattr(
+        pl.worker_ai_tools_mcp,
+        "verify_audit_ledger",
+        lambda *_a, **_k: {
+            "ok": False,
+            "reason": "audit_unavailable",
+            "live_source_graph_calls": 0,
+            "successful_call_count_by_tool": {},
+            "policy_violations": 0,
+        },
+    )
+    unverified = pl._worker_mcp_live_call_gate(
+        _metadata(
+            tmp_path, bundle_sha=bundle, sections=sections,
+            stdout=_no_receipt_stdout(tmp_path), delivered_sha=bundle,
+        ),
+        "req",
+    )
+    assert unverified["injected_context_acknowledged"] is False
+    assert unverified["injected_context_acknowledgement_source"] == ""
+    assert unverified["satisfied"] is False
+    assert unverified["reason"] == "audit_unavailable"
+
+    _patch_verify(monkeypatch)
+    mismatched = pl._worker_mcp_live_call_gate(
+        _metadata(
+            tmp_path, bundle_sha=bundle, sections=sections,
+            stdout=_no_receipt_stdout(tmp_path), delivered_sha=_sha("other-bundle"),
+        ),
+        "req",
+    )
+    assert mismatched["injected_context_acknowledged"] is False
+    assert mismatched["satisfied"] is False
+    assert set(mismatched["missing_tools"]) == {"source_graph", "ai_memory"}
+
+    no_delivery = pl._worker_mcp_live_call_gate(
+        _metadata(
+            tmp_path, bundle_sha=bundle, sections=sections,
+            stdout=_no_receipt_stdout(tmp_path),
+        ),
+        "req",
+    )
+    assert no_delivery["injected_context_acknowledged"] is False
+    assert no_delivery["satisfied"] is False
+
+
+def test_mismatched_model_receipt_is_telemetry_when_coordinator_binding_holds(
+    tmp_path, monkeypatch
+):
+    """A worker that typed a wrong sha into its receipt line copied the prompt
+    badly; the coordinator knows what it injected. The typed line is telemetry
+    and the server-derived binding decides."""
+    _patch_verify(monkeypatch)
+    bundle = _sha("real-bundle")
+    stdout = _write_receipt(tmp_path, _sha("forged-bundle"), section_count=2)
+    sections = _sections(("source_graph", True, 3, ""), ("session_current_state", True, 8, ""))
+    gate = pl._worker_mcp_live_call_gate(
+        _metadata(
+            tmp_path, bundle_sha=bundle, sections=sections, stdout=stdout,
+            delivered_sha=bundle,
+        ),
+        "req",
+    )
+    assert gate["injected_context_acknowledged"] is True
+    assert gate["injected_context_acknowledgement_source"] == "coordinator_prompt_binding"
+    assert gate["satisfied"] is True
+
+
+def test_degraded_section_is_never_credited_by_coordinator_binding(tmp_path, monkeypatch):
+    _patch_verify(monkeypatch)
+    bundle = _sha()
+    sections = _sections(
+        ("source_graph", True, 3, ""),
+        ("ai_memory", True, 0, "memory_store_unavailable"),
+    )
+    gate = pl._worker_mcp_live_call_gate(
+        _metadata(
+            tmp_path, bundle_sha=bundle, sections=sections,
+            stdout=_no_receipt_stdout(tmp_path), delivered_sha=bundle,
+        ),
+        "req",
+    )
+    assert gate["injected_context_acknowledged"] is True
+    assert gate["satisfied"] is False
+    assert gate["missing_tools"] == ["ai_memory"]
+
+
+def test_executed_zero_hit_section_satisfies_required_tool_by_construction(
+    tmp_path, monkeypatch
+):
+    """worker_prompt-2: a section the launcher itself executed for this request
+    with hit_count 0 and no degradation is a measured zero. It satisfies its
+    required tool without any model-typed receipt, without a delivery record
+    and without a live re-call of the same zero-hit query."""
+    _patch_verify(monkeypatch, live_source_graph=1, successful={"source_graph": 1})
+    bundle = _sha()
+    sections = _sections(
+        ("source_graph", True, 3, ""),
+        ("ai_memory", True, 0, ""),
+        ("kb", True, 0, ""),
+    )
+    gate = pl._worker_mcp_live_call_gate(
+        _metadata(
+            tmp_path, bundle_sha=bundle, sections=sections,
+            stdout=_no_receipt_stdout(tmp_path),
+        ),
+        "req",
+    )
+    assert gate["injected_context_acknowledged"] is False
+    assert gate["satisfied"] is True
+    assert gate["missing_tools"] == []
+    assert gate["satisfaction_by_tool"] == {
+        "source_graph": "live_worker_call",
+        "ai_memory": "coordinator_zero_hit_measurement",
+        "kb": "coordinator_zero_hit_measurement",
+    }
+
+
+def test_empty_session_store_for_topic_is_exempt_from_the_required_tools(
+    tmp_path, monkeypatch
+):
+    """The canonical session query is the topic-scoped store itself; zero
+    rows at launch means no document exists for this card's topic, so the tool
+    is not required and the reason is recorded. A degraded session section is
+    not an empty store and stays required."""
+    _patch_verify(monkeypatch, live_source_graph=1, successful={"source_graph": 1})
+    bundle = _sha()
+    gate = pl._worker_mcp_live_call_gate(
+        _metadata(
+            tmp_path, bundle_sha=bundle,
+            sections=_sections(
+                ("source_graph", True, 3, ""),
+                ("session_current_state", True, 0, ""),
+            ),
+            stdout=_no_receipt_stdout(tmp_path),
+        ),
+        "req",
+    )
+    assert gate["required_tools"] == ["source_graph"]
+    assert gate["exempted_tools"] == {
+        "session_current_state": "session_store_empty_for_topic_at_launch"
+    }
+    assert gate["satisfied"] is True
+
+    degraded = pl._worker_mcp_live_call_gate(
+        _metadata(
+            tmp_path, bundle_sha=bundle,
+            sections=_sections(
+                ("source_graph", True, 3, ""),
+                ("session_current_state", True, 0, "session_store_unavailable"),
+            ),
+            stdout=_no_receipt_stdout(tmp_path),
+        ),
+        "req",
+    )
+    assert degraded["required_tools"] == ["source_graph", "session_current_state"]
+    assert degraded["exempted_tools"] == {}
+    assert degraded["satisfied"] is False
+    assert degraded["missing_tools"] == ["session_current_state"]
+
+
+def test_explicit_required_contract_keeps_empty_session_required_and_credits_measurement(
+    tmp_path, monkeypatch
+):
+    """An explicit required project-context contract is stronger than the
+    repository default: the session tool stays listed, and the coordinator's
+    zero-row measurement is what satisfies it."""
+    _patch_verify(monkeypatch, live_source_graph=1, successful={"source_graph": 1})
+    bundle = _sha()
+    gate = pl._worker_mcp_live_call_gate(
+        _metadata(
+            tmp_path, bundle_sha=bundle,
+            sections=_sections(
+                ("source_graph", True, 3, ""),
+                ("session_current_state", True, 0, ""),
+            ),
+            stdout=_no_receipt_stdout(tmp_path),
+            context_required=True,
+        ),
+        "req",
+    )
+    assert gate["required_tools"] == ["source_graph", "session_current_state"]
+    assert gate["satisfied"] is True
+    assert gate["satisfaction_by_tool"]["session_current_state"] == (
+        "coordinator_zero_hit_measurement"
+    )
+
+
+def test_worker_prompt_no_longer_requests_an_acknowledgement_line():
+    bundle = "PROJECT_CONTEXT_BUNDLE:\n" + json.dumps({
+        "evidence": {"source_graph": {"matches": [], "truncated": False}},
+        "repo_identity": {"repo_id": "repo-b954", "scope_root": "."},
+    })
+    prompt = pl.build_worker_prompt(
+        task_id="TASK_B954",
+        runner="codex",
+        topic="representation",
+        request_id="req",
+        project_context_bundle=bundle,
+    )
+    assert "PROJECT_CONTEXT_BUNDLE:" in prompt
+    assert "PROJECT_CONTEXT_RECEIPT" not in prompt
+    assert "emit one bounded acknowledgement line" not in prompt
+    assert "no acknowledgement line is required" in prompt

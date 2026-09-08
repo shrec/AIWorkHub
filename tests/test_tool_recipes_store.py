@@ -304,11 +304,20 @@ def _projection(repo_root, ownership: str = "full") -> dict:
 
 
 def test_dashboard_reads_the_store(tmp_path):
-    """The projection input is the store's registry, not a fresh empty one."""
+    """The projection input is the store's registry, not a fresh empty one.
+
+    The input is now a mapping rather than the bare registry, because the
+    projection reads the invocation/cache/context sections from a ``receipts``
+    key that no provider ever produced. With no run recorded the key is absent
+    -- ``no_sample`` stays a measured fact -- and the registry is unchanged.
+    """
     store.put_recipe(tmp_path, _recipe())
     provider = dashboard.DashboardProvider(repo_root=tmp_path)
 
-    registry = provider.get_tool_recipes_projection_input()
+    payload = provider.get_tool_recipes_projection_input()
+    assert isinstance(payload, dict)
+    assert "receipts" not in payload
+    registry = payload["registry"]
     assert isinstance(registry, tr.RecipeRegistry)
     assert registry.ids() == ("echo-tool",)
 
@@ -359,6 +368,24 @@ def test_a_corrupt_store_never_breaks_a_refresh(tmp_path):
     assert _projection(tmp_path)["state"] == "no_sample"
 
 
+# ``usage`` is the one key a store-backed projection can answer and a
+# hand-built registry cannot: usage is read from the RECEIPTS table, and a bare
+# ``RecipeRegistry`` has no store behind it to read. Both projections still
+# carry the key -- the shape is identical, which is what the extension renders
+# -- and the store's says ``measured`` where the registry's says ``unknown``.
+# Comparing the two on that key would assert that measuring is the same as not
+# measuring, so it is compared separately and explicitly below.
+_STORE_MEASURABLE_KEYS = ("usage",)
+
+
+def _without_store_measurements(projection):
+    return {
+        key: value
+        for key, value in projection.items()
+        if key not in _STORE_MEASURABLE_KEYS
+    }
+
+
 def test_the_projection_keys_are_unchanged_by_the_new_source(tmp_path):
     """Same payload shape as an in-memory registry passed straight through.
 
@@ -373,7 +400,9 @@ def test_the_projection_keys_are_unchanged_by_the_new_source(tmp_path):
     )
     empty_store = _projection(tmp_path)
     assert set(empty_store) == set(empty_direct)
-    assert empty_store == empty_direct
+    assert _without_store_measurements(empty_store) == _without_store_measurements(
+        empty_direct
+    )
 
     store.put_recipe(tmp_path, recipe)
     full_direct = dashboard._project_tool_recipes(
@@ -381,7 +410,33 @@ def test_the_projection_keys_are_unchanged_by_the_new_source(tmp_path):
     )
     full_store = _projection(tmp_path)
     assert set(full_store) == set(full_direct)
-    assert full_store == full_direct
+    assert _without_store_measurements(full_store) == _without_store_measurements(
+        full_direct
+    )
+
+
+def test_only_a_store_backed_projection_can_measure_usage(tmp_path):
+    """The one key the two sources legitimately differ on, asserted directly.
+
+    A hand-built registry has no receipts table behind it, so it cannot know
+    whether anything ran and says ``unknown`` rather than claiming a measured
+    zero. The store CAN read that table, and one registered recipe with no
+    receipts is a measured fact: one registered, none used.
+    """
+    recipe = _recipe()
+    store.put_recipe(tmp_path, recipe)
+
+    direct = dashboard._project_tool_recipes(
+        tr.RecipeRegistry((recipe,)), ownership="full", input_state="present"
+    )
+    backed = _projection(tmp_path)
+
+    assert direct["usage"] == {"state": "unknown", "denominator": "unknown"}
+    assert backed["usage"]["state"] == "measured"
+    assert backed["usage"]["registered_count"] == 1
+    assert backed["usage"]["used_count"] == 0
+    assert backed["usage"]["unused_count"] == 1
+    assert backed["usage"]["run_count"] == 0
 
 
 def test_the_summary_projection_shape_is_unchanged(tmp_path):
@@ -391,7 +446,10 @@ def test_the_summary_projection_shape_is_unchanged(tmp_path):
     summary_direct = dashboard._project_tool_recipes(
         tr.RecipeRegistry((_recipe(),)), ownership="summary", input_state="present"
     )
-    assert summary_store == summary_direct
+    assert set(summary_store) == set(summary_direct)
+    assert _without_store_measurements(summary_store) == _without_store_measurements(
+        summary_direct
+    )
 
 
 # ---------------------------------------------------------------------------

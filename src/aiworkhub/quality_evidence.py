@@ -2626,6 +2626,7 @@ def run_completion_quality_gate(
     human_approval: bool = False,
     reachability_inputs: Mapping[str, Any] | None = None,
     combined_tree_scope: bool = False,
+    review_meta_gates: bool = True,
     policy_root: Path | str | None = None,
 ) -> dict[str, Any]:
     """Execute the mandatory review-quality floor for one task delta.
@@ -2657,6 +2658,24 @@ def run_completion_quality_gate(
         }
     try:
         risk_profile = resolve_risk_profile(requested_risk_tier, signals=risk_signals)
+        # ``review_meta_gates`` separates the two halves of a risk profile.
+        #
+        # The MECHANICAL half (which declared checks apply at this tier) is
+        # decidable wherever a candidate's bytes are: it needs only the delta.
+        # The REVIEW half -- required reviewer lenses, the combined tree, and
+        # explicit human approval -- is decidable only at acceptance, because
+        # only then do the reviewer receipts and the verified manager exist.
+        #
+        # Running the whole profile at ``review_ready`` would therefore refuse
+        # every medium-and-higher candidate for evidence that cannot exist yet.
+        # Passing ``review_meta_gates=False`` folds the mechanical half at the
+        # real effective tier while leaving the review half to ``accept_review``,
+        # which still recomputes the FULL profile from scratch. The reported
+        # ``risk_profile`` stays the complete one, so the recorded evidence
+        # names the true tier and the true required lens set -- the facts a
+        # manager needs before deciding -- and ``review_meta_gates_enforced``
+        # says, in the record itself, that this fold did not decide them.
+        fold_profile = risk_profile
         if combined_tree_scope:
             # The combined-tree validation must carry the parent fold's exact
             # risk tier and signals so a declared check with ``minimum_risk``
@@ -2668,6 +2687,15 @@ def run_completion_quality_gate(
             # Stripping them keeps the low-tier behavior the sub-gate always had
             # while adding the correct declared-check applicability tier.
             risk_profile = {
+                **risk_profile,
+                "combined_tree_required": False,
+                "cross_provider_required": False,
+                "explicit_human_approval_required": False,
+                "required_reviewer_lenses": [],
+            }
+            fold_profile = risk_profile
+        elif not review_meta_gates:
+            fold_profile = {
                 **risk_profile,
                 "combined_tree_required": False,
                 "cross_provider_required": False,
@@ -2687,13 +2715,14 @@ def run_completion_quality_gate(
         declared = []
         config_error = str(exc)
         risk_profile = {}
+        fold_profile = {}
     all_checks = [*checks, *declared]
     try:
         if not risk_profile:
             raise MalformedConfigError(config_error or "risk_profile_unavailable")
         verdict = fold_quality_verdict(
             all_checks,
-            risk_profile=risk_profile,
+            risk_profile=fold_profile or risk_profile,
             reviewer_reports=reviewer_reports,
             combined_tree_checks=combined_tree_checks,
             worker_provider=worker_provider,
@@ -2726,6 +2755,7 @@ def run_completion_quality_gate(
         "config_error": config_error,
         "optional_gates": optional,
         "risk_profile": risk_profile,
+        "review_meta_gates_enforced": bool(review_meta_gates and not combined_tree_scope),
         "quality_verdict": verdict,
         "repository_quality_policy": config_status,
         "reachability": _reachability_record(reachability_inputs),
@@ -2741,6 +2771,136 @@ def run_completion_quality_gate(
             else "builtin_and_task_contract_only"
         ),
     }
+
+
+REVIEW_READY_RISK_SCHEMA_ID = "aiworkhub.review_ready_risk_observation.v1"
+
+
+def review_ready_risk_observation(
+    card: Mapping[str, Any] | None,
+    changed_paths: Iterable[str],
+    *,
+    destructive_checks: Iterable[EvidenceCheck | Mapping[str, Any]] = (),
+    requested_risk_tier: str = RISK_LOW,
+) -> dict[str, Any]:
+    """Name the risk tier and reviewer lenses this candidate will be held to.
+
+    The same ``derive_risk_signals`` -> ``resolve_risk_profile`` pair the accept
+    path runs, moved to where its inputs first exist. Measured before this
+    existed: ``terminal_review.quality_gate.risk_profile.effective_tier`` was
+    ``low`` in 1,370 of 1,370 ``review_ready`` gates that carried a profile, so
+    every manager had to predict the tier -- and therefore the lens set -- by
+    hand, and 19 accept attempts failed with ``required_reviewer_missing``
+    because the prediction was wrong.
+
+    This is an OBSERVATION, never a verdict. It cannot refuse a candidate and
+    it cannot lower a bar: ``accept_review`` re-derives the whole profile from
+    the promoted delta, with the destructive checks and manager signals it
+    alone can supply, and a tier under-named here simply fails closed there.
+    Total by construction -- a malformed card or an unknown signal is reported
+    in ``error`` rather than raised, because a finalizer must never fail on the
+    act of describing its own candidate.
+    """
+
+    paths = [str(value) for value in (changed_paths or ())]
+    observation: dict[str, Any] = {
+        "schema_id": REVIEW_READY_RISK_SCHEMA_ID,
+        "requested_tier": str(requested_risk_tier),
+        "effective_tier": "",
+        "signals": [],
+        "required_reviewer_lenses": [],
+        "combined_tree_required": None,
+        "cross_provider_required": None,
+        "explicit_human_approval_required": None,
+        "changed_path_count": len(paths),
+        "error": "",
+    }
+    try:
+        signals = derive_risk_signals(
+            card if isinstance(card, Mapping) else {},
+            paths,
+            destructive_checks=destructive_checks,
+        )
+        profile = resolve_risk_profile(str(requested_risk_tier), signals=signals)
+    except Exception as exc:  # noqa: BLE001 -- describing a candidate never fails it
+        observation["error"] = f"{type(exc).__name__}:{exc}"[:300]
+        return observation
+    observation.update({
+        "effective_tier": str(profile["effective_tier"]),
+        "signals": list(profile["signals"]),
+        "required_reviewer_lenses": list(profile["required_reviewer_lenses"]),
+        "combined_tree_required": bool(profile["combined_tree_required"]),
+        "cross_provider_required": bool(profile["cross_provider_required"]),
+        "explicit_human_approval_required": bool(
+            profile["explicit_human_approval_required"]
+        ),
+    })
+    return observation
+
+
+def run_review_ready_quality_gate(
+    candidate_root: Path | str,
+    *,
+    card: Mapping[str, Any] | None = None,
+    changed_paths: Iterable[str] | None = None,
+    canonical_repo: Path | str | None = None,
+    reachability_inputs: Mapping[str, Any] | None = None,
+    requested_risk_tier: str = RISK_LOW,
+) -> dict[str, Any]:
+    """Run the ``review_ready`` completion gate with the candidate's real tier.
+
+    Three facts the finalizer already had the inputs for, and did not record:
+
+    * the effective risk tier and the reviewer lenses it requires -- so the
+      manager stops predicting them and stops launching lenses the tier never
+      asked for (measured: 194 of 893 launches on accepted targets, 21.7%);
+    * the destructive-diff signal that can floor that tier at ``high``;
+    * the reachability observation, which had been evaluated in 0 of 299
+      accepts because it was only ever computed from a combined tree that no
+      longer had a candidate Source Graph index.
+
+    The blocking half is deliberately unchanged: ``review_meta_gates=False``
+    keeps the reviewer/approval/combined-tree requirements with
+    ``accept_review``, where the evidence for them exists, so this call refuses
+    exactly the candidates the low-tier call refused and no others. What grows
+    is the record, not the bar.
+    """
+
+    affected = [str(value) for value in (changed_paths or ())]
+    destructive_rows: list[dict[str, Any]] = []
+    destructive_checks: list[EvidenceCheck] = []
+    if canonical_repo is not None and affected:
+        try:
+            destructive_checks = list(
+                run_destructive_diff_checks(
+                    Path(canonical_repo), Path(candidate_root), changed_paths=affected
+                )
+            )
+        except Exception:  # noqa: BLE001 -- a signal source, never a gate failure
+            destructive_checks = []
+        destructive_rows = [check.to_dict() for check in destructive_checks]
+    observation = review_ready_risk_observation(
+        card,
+        affected,
+        destructive_checks=destructive_checks,
+        requested_risk_tier=requested_risk_tier,
+    )
+    gate = run_completion_quality_gate(
+        candidate_root,
+        changed_paths=affected,
+        requested_risk_tier=requested_risk_tier,
+        risk_signals=observation["signals"],
+        reachability_inputs=reachability_inputs,
+        review_meta_gates=False,
+    )
+    gate["review_risk_profile"] = observation
+    gate["review_ready_destructive_diff_checks"] = destructive_rows
+    gate["review_ready_destructive_diff_blockers"] = [
+        check.check_id
+        for check in destructive_checks
+        if check.status == STATUS_FAILED
+    ]
+    return gate
 
 
 def _public_python_symbols(source: str) -> set[str]:

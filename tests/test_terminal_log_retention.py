@@ -304,6 +304,87 @@ def test_usage_capture_backfill_is_idempotent_and_unblocks_retention(tmp_path: P
     assert usage[0]["total_tokens"] == 10
 
 
+def test_usage_capture_backfill_records_the_attempt_time_not_the_backfill_instant(
+    tmp_path: Path,
+) -> None:
+    """retries-5: the backfill row's created_at is the backfill instant, so the
+    payload carries attempt_recorded_at from the run's own evidence -- the
+    supervisor's finished epoch, else the ledger row's finished_at, else the
+    claim_start event for that exact request -- and is empty when none exist."""
+    repo = _repo(tmp_path)
+    process_root = repo / terminal_log_retention.PROCESS_FILES_RELATIVE_PATH
+    process_root.mkdir(parents=True, exist_ok=True)
+    ledger = repo / terminal_log_retention.PROCESS_LOG_RELATIVE_PATH
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    cases = {
+        "a" * 32: {"supervisor": {"state": "exited", "exit_code": 0, "finished_at_epoch": 1754182800.5}, "finished_at": "2026-08-03T02:00:00+00:00"},
+        "b" * 32: {"supervisor": {"state": "exited", "exit_code": 0}, "finished_at": "2026-08-03T02:00:00+00:00"},
+        "c" * 32: {"supervisor": "not-json", "finished_at": ""},
+        "d" * 32: {"supervisor": "not-json", "finished_at": ""},
+    }
+    with ledger.open("a", encoding="utf-8") as handle:
+        for request_id, spec in cases.items():
+            for suffix in terminal_log_retention._OWNED_SUFFIXES:
+                path = process_root / f"{request_id}{suffix}"
+                if suffix == ".stdout.log":
+                    path.write_text(
+                        '{"type":"result","usage":{"input_tokens":7,"output_tokens":3}}\n',
+                        encoding="utf-8",
+                    )
+                elif suffix == ".supervisor.json":
+                    supervisor = spec["supervisor"]
+                    path.write_text(
+                        json.dumps(supervisor) if isinstance(supervisor, dict) else supervisor,
+                        encoding="utf-8",
+                    )
+                else:
+                    path.write_text("run\n", encoding="utf-8")
+            row = {
+                "request_id": request_id,
+                "task_id": "TASK_DONE",
+                "runner": "runner",
+                "topic": "topic",
+                "adapter_id": "codex_cli",
+                "model": "codex",
+                "state": "exited",
+            }
+            if spec["finished_at"]:
+                row["finished_at"] = spec["finished_at"]
+            handle.write(json.dumps(row) + "\n")
+    readiness = task_store.storage_readiness(repo)
+    conn = sqlite3.connect(readiness.canonical_db)
+    try:
+        conn.execute(
+            "INSERT INTO task_events(task_id,event,runner,payload_json,created_at) "
+            "VALUES(?,?,?,?,?)",
+            (
+                "TASK_DONE", "claim_start", "runner",
+                json.dumps({"runner": "runner", "topic": "topic", "request_id": "c" * 32}),
+                "2026-08-03T01:00:00+00:00",
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    result = terminal_log_retention.backfill_usage_capture(repo, confirm=True)
+
+    assert result["recorded"] == 4
+    recorded = {
+        event["note"].removeprefix("task_mcp_request:"): event
+        for event in task_store.list_usage_events(repo)
+    }
+    assert recorded["a" * 32]["attempt_recorded_at"] == datetime.fromtimestamp(
+        1754182800.5, tz=timezone.utc
+    ).isoformat()
+    assert recorded["b" * 32]["attempt_recorded_at"] == "2026-08-03T02:00:00+00:00"
+    assert recorded["c" * 32]["attempt_recorded_at"] == "2026-08-03T01:00:00+00:00"
+    assert recorded["d" * 32]["attempt_recorded_at"] == ""
+    for event in recorded.values():
+        assert event["total_tokens"] == 10
+        assert event["created_at"] != event["attempt_recorded_at"]
+
+
 def test_terminal_log_quarantine_restore_and_explicit_purge_gate(tmp_path: Path) -> None:
     repo = _repo(tmp_path)
     for index in range(11):

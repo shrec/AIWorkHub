@@ -7,6 +7,8 @@ import sqlite3
 import stat
 from pathlib import Path
 
+import pytest
+
 from _taskdb_compat import upsert_card
 from aiworkhub import (
     context_graph,
@@ -748,3 +750,275 @@ def test_rejection_may_promote_to_ai_memory_and_kb_but_never_context_graph(
     assert "promotion_eligible_context_graph requires outcome ACCEPTED" in str(
         graph.get("error")
     )
+
+
+# ---------------------------------------------------------------------------
+# The SHORT FORM: seven required fields, six of them already computed.
+#
+# Coverage was 53 commits against 3,383 decisions (1.6%), and 16 of 40 measured
+# calls failed on shape -- an invalid outcome, a refused sha256: evidence id, an
+# identity mismatch. Every one of those six fields is derivable from the card's
+# own decision event; only the lesson is a judgement.
+# ---------------------------------------------------------------------------
+
+
+def _accepted_card_with_promotion(
+    root: Path, *, task_id: str, request_id: str, promoted: list[str]
+) -> None:
+    record = evidence_levels.EvidenceRecord(
+        evidence_level=evidence_levels.EvidenceLevel.FIXED_AND_VERIFIED,
+        severity="NONE",
+        confidence="HIGH",
+        reference=f"file:.aiworkhub/runtime/process_logs/attempt-artifacts/{request_id}/manifest.json",
+        verified_by="codex",
+        message="manager verified exact accepted outcome",
+    ).to_dict()
+    card = {
+        "task_id": task_id,
+        "runner": "worker",
+        "topic": "learning",
+        "mode": "edit",
+        "status": "finished",
+        "worker_status": "done",
+        "accepted_request_id": request_id,
+        "accept_evidence": {
+            "acceptance_evidence_record": record,
+            "promoted_paths": promoted,
+        },
+    }
+    con = sqlite3.connect(str(task_store.canonical_db_path(root)))
+    con.row_factory = sqlite3.Row
+    try:
+        upsert_card(con, card)
+    finally:
+        con.close()
+
+
+def _rework_rejected_card(root: Path, *, task_id: str, request_id: str) -> None:
+    card = {
+        "task_id": task_id,
+        "runner": "worker",
+        "topic": "learning",
+        "mode": "edit",
+        "status": "pending",
+        "worker_status": "pending",
+        "review_feedback": {
+            "schema_id": "aiworkhub.rework_feedback_delta.v1",
+            "instruction": "the reader must consult the fact on the object",
+            "predecessor_request_id": request_id,
+            "predecessor_changed_paths": [
+                "src/aiworkhub/skill_miner.py",
+                "tests/test_skill_miner.py",
+            ],
+        },
+    }
+    con = sqlite3.connect(str(task_store.canonical_db_path(root)))
+    con.row_factory = sqlite3.Row
+    try:
+        upsert_card(con, card)
+    finally:
+        con.close()
+
+
+def test_the_short_form_resolves_every_mechanical_field_from_an_accept(
+    tmp_path, monkeypatch
+):
+    root = _setup_repo(tmp_path, monkeypatch)
+    _accepted_card_with_promotion(
+        root,
+        task_id="TASK-SHORT-1",
+        request_id="request-short-0001",
+        promoted=["src/aiworkhub/skill_miner.py", "tests/test_skill_miner.py"],
+    )
+
+    resolved = learning_commit_store.resolve_short_form(
+        root, task_id="TASK-SHORT-1", request_id="request-short-0001"
+    )
+
+    assert resolved["outcome"] == "accepted"
+    # Tests are excluded first, so the area is where the change actually is.
+    assert resolved["repo_area"] == "src/aiworkhub"
+    assert resolved["repo_area_source"] == "accept_evidence.promoted_paths"
+    assert resolved["idempotency_key"] == (
+        "TASK-SHORT-1:request-short-0001:accepted"
+    )
+    assert resolved["provenance"] == "manager_accepted_review"
+    # The evidence id is the sealed acceptance reference, in the form the store
+    # accepts -- never a sha256: receipt id.
+    assert resolved["evidence_ids"] == [
+        "file:.aiworkhub/runtime/process_logs/attempt-artifacts/"
+        "request-short-0001/manifest.json"
+    ]
+    assert resolved["allowed_evidence_id_schemes"] == ["file:", "http:", "https:"]
+
+
+def test_the_short_form_reads_a_rejection_as_a_rejection(tmp_path, monkeypatch):
+    """The outcome is READ from the card, never asserted by the caller."""
+    root = _setup_repo(tmp_path, monkeypatch)
+    _rework_rejected_card(
+        root, task_id="TASK-SHORT-2", request_id="request-short-0002"
+    )
+
+    resolved = learning_commit_store.resolve_short_form(
+        root, task_id="TASK-SHORT-2", request_id="request-short-0002"
+    )
+
+    assert resolved["outcome"] == "rejected"
+    assert resolved["repo_area"] == "src/aiworkhub"
+    assert resolved["repo_area_source"] == (
+        "review_feedback.predecessor_changed_paths"
+    )
+    assert resolved["evidence_ids"] == []  # a rejection seals no acceptance
+
+
+def test_the_short_form_refuses_a_request_the_card_never_adjudicated(
+    tmp_path, monkeypatch
+):
+    root = _setup_repo(tmp_path, monkeypatch)
+    _accepted_card_with_promotion(
+        root, task_id="TASK-SHORT-3", request_id="request-short-0003",
+        promoted=["src/aiworkhub/core.py"],
+    )
+
+    with pytest.raises(
+        learning_commit_store.LearningCommitStoreError,
+        match="learning_commit_request_identity_mismatch",
+    ):
+        learning_commit_store.resolve_short_form(
+            root, task_id="TASK-SHORT-3", request_id="some-other-request"
+        )
+
+
+def test_adjudicated_decision_answers_unknown_rather_than_guessing():
+    assert learning_commit_store.adjudicated_decision({}, "r") == ""
+    assert learning_commit_store.adjudicated_decision({"accepted_request_id": "r"}, "") == ""
+    # Accepted needs BOTH the finished lifecycle and the exact request id.
+    assert learning_commit_store.adjudicated_decision(
+        {"accepted_request_id": "r", "status": "finished"}, "r"
+    ) == "accepted"
+    assert learning_commit_store.adjudicated_decision(
+        {"accepted_request_id": "other", "status": "finished"}, "r"
+    ) == ""
+
+
+def test_the_short_form_tool_writes_a_commit_from_task_request_and_lesson(
+    tmp_path, monkeypatch
+):
+    """Three arguments where the tool used to demand seven."""
+    from aiworkhub import server
+
+    root = _setup_repo(tmp_path, monkeypatch)
+    monkeypatch.setattr(core, "repo_root", lambda: root)
+    _accepted_card_with_promotion(
+        root, task_id="TASK-SHORT-4", request_id="request-short-0004",
+        promoted=["src/aiworkhub/skill_registry_store.py"],
+    )
+
+    result = server.aiworkhub_manager_learning_commit(
+        task_id="TASK-SHORT-4",
+        request_id="request-short-0004",
+        lesson_candidate="a decision that records no lesson teaches nobody",
+        promote_ai_memory=True,
+    )
+
+    assert result["ok"] is True, result
+    assert result["outcome"] == "accepted"
+    assert result["task_id"] == "TASK-SHORT-4"
+
+
+def test_extra_evidence_ids_are_merged_with_the_resolved_one(tmp_path, monkeypatch):
+    from aiworkhub import server
+
+    root = _setup_repo(tmp_path, monkeypatch)
+    monkeypatch.setattr(core, "repo_root", lambda: root)
+    _accepted_card_with_promotion(
+        root, task_id="TASK-SHORT-5", request_id="request-short-0005",
+        promoted=["src/aiworkhub/skill_registry_store.py"],
+    )
+
+    result = server.aiworkhub_manager_learning_commit(
+        task_id="TASK-SHORT-5",
+        request_id="request-short-0005",
+        lesson_candidate="name the reason a record is not injectable",
+        extra_evidence_ids=["file:tests/test_learning_commit_store.py"],
+    )
+
+    assert result["ok"] is True, result
+    row = _fetch_commit(root, "TASK-SHORT-5")
+    assert "file:tests/test_learning_commit_store.py" in row["evidence_ids"]
+    assert len(row["evidence_ids"]) == 2
+
+
+def _fetch_commit(root: Path, task_id: str) -> dict:
+    con = sqlite3.connect(str(task_store.canonical_db_path(root)))
+    con.row_factory = sqlite3.Row
+    try:
+        row = con.execute(
+            "SELECT payload_json FROM learning_commits WHERE task_id=?", (task_id,)
+        ).fetchone()
+    finally:
+        con.close()
+    return json.loads(row["payload_json"])
+
+
+def test_a_refusal_names_the_evidence_id_schemes_it_would_have_accepted(
+    tmp_path, monkeypatch
+):
+    """The commonest measured failure was a scheme the error never enumerated."""
+    from aiworkhub import server
+
+    root = _setup_repo(tmp_path, monkeypatch)
+    monkeypatch.setattr(core, "repo_root", lambda: root)
+    _accepted_card_with_promotion(
+        root, task_id="TASK-SHORT-6", request_id="request-short-0006",
+        promoted=["src/aiworkhub/skill_registry_store.py"],
+    )
+
+    result = server.aiworkhub_manager_learning_commit(
+        task_id="TASK-SHORT-6",
+        request_id="request-short-0006",
+        lesson_candidate="a refusal that names nothing costs a whole turn",
+        extra_evidence_ids=["sha256:5cf2a1b0"],
+    )
+
+    assert result["ok"] is False
+    assert result["allowed_evidence_id_schemes"] == ["file:", "http:", "https:"]
+
+
+def test_an_unknown_request_is_refused_with_the_schemes_named(tmp_path, monkeypatch):
+    from aiworkhub import server
+
+    root = _setup_repo(tmp_path, monkeypatch)
+    monkeypatch.setattr(core, "repo_root", lambda: root)
+
+    result = server.aiworkhub_manager_learning_commit(
+        task_id="TASK-NOT-A-CARD",
+        request_id="request-short-9999",
+        lesson_candidate="the card must exist",
+    )
+
+    assert result["ok"] is False
+    assert "learning_commit_task_not_found" in result["error"]
+    assert result["allowed_evidence_id_schemes"] == ["file:", "http:", "https:"]
+
+
+def test_the_fourteen_argument_form_is_unchanged(tmp_path, monkeypatch):
+    """The compatibility path resolves nothing and behaves exactly as before."""
+    from aiworkhub import server
+
+    root, task_id, request_id = _setup(tmp_path, monkeypatch)
+    monkeypatch.setattr(core, "repo_root", lambda: root)
+
+    result = server.aiworkhub_manager_learning_commit(
+        task_id=task_id,
+        request_id=request_id,
+        repo_area="src/aiworkhub",
+        outcome="accepted",
+        evidence_ids=["file:tests/test_learning_commit_store.py"],
+        idempotency_key="learning-manager-longform-0001",
+        provenance="long form compatibility",
+        lesson_candidate="the old shape must keep working",
+    )
+
+    assert result["ok"] is True, result
+    assert result["outcome"] == "accepted"

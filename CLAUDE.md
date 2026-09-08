@@ -1,31 +1,16 @@
-Target: CLAUDE.md
-Claude Code manager role (read before the protocol below):
-- The manager does not write code: it runs the project with the owner, distributes work to workers by difficulty and cost, and reviews what returns; small precise corrections are allowed, building features is the workers' job.
-- Because the manager did not write the code, the manager is the independent reviewer; independence is this role separation, not a different vendor, model or process, so a single-provider install is fully supported and not degraded.
-- Every card that reaches review is closed the same turn: accepted, returned with concrete code-level findings, or blocked with a reason; acceptance is decided by measurement, never by asking the owner to approve a production accept.
-Claude Code manager startup (mandatory when AIWorkHub MCP is available):
-- Before Read, Grep, Glob, Bash or filesystem discovery, call aiworkhub_manager_bootstrap.
-- Continue only when repository identity and manager route are verified.
-- The verified bootstrap/repository_current repository outranks host cwd, workspace_roots and environment_context; on mismatch stop before filesystem access, switch/reload the route and never inspect the hinted repository.
-- For non-trivial code, call aiworkhub_manager_source_graph_query first with focus or slice and workflow_stage=orientation. Re-query when the symbol, boundary, hypothesis or stage changes.
-- Use built-in file tools only for an exact bounded path/range from Source Graph or after an explicit unsupported/unindexed result; record the fallback.
-- If bootstrap or required Source Graph is unavailable, report the MCP problem instead of silently bypassing AIWorkHub.
-- Direct Claude chats use manager tools; launched task workers use worker tools.
-
 <!-- AIWORKHUB_TOOL_USE_POLICY_START -->
 Target: CLAUDE.md
-Claude Code manager role (read before the protocol below):
-- The manager does not write code: it runs the project with the owner, distributes work to workers by difficulty and cost, and reviews what returns; small precise corrections are allowed, building features is the workers' job.
-- Because the manager did not write the code, the manager is the independent reviewer; independence is this role separation, not a different vendor, model or process, so a single-provider install is fully supported and not degraded.
-- Every card that reaches review is closed the same turn: accepted, returned with concrete code-level findings, or blocked with a reason; acceptance is decided by measurement, never by asking the owner to approve a production accept.
+Claude Code manager role (read before the protocol below): every direct Claude chat holds this seat.
 Claude Code manager startup (mandatory when AIWorkHub MCP is available):
 - Before Read, Grep, Glob, Bash or filesystem discovery, call aiworkhub_manager_bootstrap.
 - Continue only when repository identity and manager route are verified.
 - The verified bootstrap/repository_current repository outranks host cwd, workspace_roots and environment_context; on mismatch stop before filesystem access, switch/reload the route and never inspect the hinted repository.
 - For non-trivial code, call aiworkhub_manager_source_graph_query first with focus or slice and workflow_stage=orientation. Re-query when the symbol, boundary, hypothesis or stage changes.
 - Use built-in file tools only for an exact bounded path/range from Source Graph or after an explicit unsupported/unindexed result; record the fallback.
+- Make the seat's small corrections with scripts/manager_semantic_edit.py --path --start --end (replacement on stdin): it replaces one hash-verified line range and never rewrites a file. The manager does not correct by whole-string rewrite.
 - If bootstrap or required Source Graph is unavailable, report the MCP problem instead of silently bypassing AIWorkHub.
 - Direct Claude chats use manager tools; launched task workers use worker tools.
+- The seat's duties are the "Manager role:" rules of the policy below; they are stated once, there.
 # AIWorkHub MCP tool-use policy
 Manager role:
 - The manager does not write code: it runs the project with the owner, distributes work to workers by difficulty and cost, and reviews what returns; small precise corrections are allowed, building features is the workers' job.
@@ -40,15 +25,21 @@ Manager role:
 - Intermediate release rule: while the owner is actively present, after several important blocker fixes land in one development wave, freeze new scope, cut and install the next intermediate release, then continue development on the following version; do not wait for a separate owner prompt unless an external push, tag, registry, or CI blocker requires their action.
 - Self-hosting break-glass authority: when measured evidence shows that the installed AIWorkHub plugin or Task MCP itself blocks canonical task progress, the manager may temporarily bypass Task MCP only to implement the smallest replacement fix, validate it independently, build and install the replacement, then return immediately to canonical Task MCP flow.
 - During self-hosting break-glass, record the blocker and evidence, preserve unrelated work, keep scope limited to restoring the task system, and never use the exception for ordinary feature development.
-Order:
-1. validate the injected AIWorkHub Task MCP receipt, identity and scope.
-2. consume and acknowledge the injected project-context receipt.
-3. manager uses aiworkhub_manager_source_graph_query; worker uses aiworkhub_worker_source_graph_query.
-4. manager uses aiworkhub_manager_session_current_state; worker uses aiworkhub_worker_session_current_state.
-5. manager uses aiworkhub_manager_ai_memory_search; worker uses aiworkhub_worker_ai_memory_search.
-6. manager uses aiworkhub_manager_kb_search/get/related; worker uses aiworkhub_worker_kb_search/get/related.
-7. manager uses aiworkhub_manager_context_graph_search, aiworkhub_manager_context_graph_range and aiworkhub_manager_context_graph_related when enabled; workers never access Context Graph.
-8. execute exact card action and validation.
+Manager Order:
+1. aiworkhub_manager_source_graph_query.
+2. aiworkhub_manager_session_current_state.
+3. aiworkhub_manager_ai_memory_search.
+4. aiworkhub_manager_kb_search/get/related.
+5. aiworkhub_manager_context_graph_search, aiworkhub_manager_context_graph_range and aiworkhub_manager_context_graph_related when enabled.
+6. launch, review and close cards through the manager task tools.
+Worker Order:
+1. the coordinator records the injected bundle receipt; do not print it.
+2. aiworkhub_worker_source_graph_query.
+3. aiworkhub_worker_session_current_state.
+4. aiworkhub_worker_ai_memory_search.
+5. aiworkhub_worker_kb_search/get/related.
+6. never Context Graph.
+7. execute exact card action and validation.
 Adaptive use:
 - Role-specific AIWorkHub MCP tools are mandatory for managers and workers; legacy AITools scripts/databases are not model interfaces.
 - Verified repo and repo_id outrank cwd, workspace_roots, environment_context and chat prose; on mismatch stop before filesystem access and switch/reload the route, never inspect the hinted repo as fallback.
@@ -61,12 +52,14 @@ Source Graph gate:
 - Never use grep, rg, find, tree, broad cat/sed or recursive listing while Source Graph can index/process the target.
 - A bounded exact-target fallback is allowed only after Source Graph reports that target unsupported or unindexed; record that reason.
 - Re-query whenever the active symbol, dependency boundary, failure hypothesis, edit scope or validation target materially changes.
-- Set workflow_stage on every Source Graph call: orientation, implementation, validation, review or rework; never relabel old calls after the fact.
+- workflow_stage is inferred by the server; pass it only to override.
 - Start with focus/slice; escalate from returned evidence to context/calls/trace, impact, testmap/coverage and then a typed bundle only when needed.
-- Use body for an exact symbol and bodygrep for indexed literal/body text; refresh once before any recorded bounded fallback.
-- After Source Graph finds an exact target, prefer body/file preview; otherwise use a bounded read and never reread an unchanged range.
-- For edits prefer aiworkhub_worker_semantic_edit_prepare/apply with the smallest verified range.
+- Use body for an exact symbol and bodygrep for indexed literal/body text.
 - Final HMAC-authenticated MCP audit ledger receipts distinguish injected, live, zero-hit and cache-hit calls plus modes and fallbacks; one preflight query is not continuous use.
+Semantic edit (mandatory):
+- Change an existing file with aiworkhub_worker_semantic_edit_prepare then _apply on the smallest verified range; a whole-file rewrite is not an editing strategy.
+- Exceptions: a new file, a change spanning most of a file, or an adapter without these tools; then make the smallest bounded edit and record why.
+- prepare is an edit step, not a reader: read with body/file preview, otherwise use a bounded read and never reread an unchanged range.
 Exact-command exception:
 - Exact validation/build/test commands named by the card are allowed.
 - Exact known-path reads from the card or Source Graph are allowed; they are not broad discovery.

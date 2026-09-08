@@ -161,9 +161,62 @@ def _report_from_text(text: str) -> dict[str, Any] | None:
     return _report_from_value(value)
 
 
+# Host-provided structured review tools whose typed input IS the report.
+# ``ReportFindings`` is Claude Code's own code-review channel: it shows up in
+# a reviewer's toolset because the host offers it, not because this system
+# asked for it.  Measured over 242 claude_cli reviewer runs (2026-09-08
+# audit): 73 runs (30%) filed findings through it, 66 of them also typed the
+# final JSON, and 9 filed ONLY there and were recorded as missing_final --
+# nine complete 1.5M-token reviews thrown away over a transport the
+# supervisor never read.  Reviewer launches now deny the tool
+# (``runtime_adapters.CLAUDE_REVIEWER_HOST_TOOL_DENIES``); this reader is the
+# second half of the fix, for a transport that still lets the call through.
+HOST_STRUCTURED_REVIEW_TOOLS: frozenset[str] = frozenset({"ReportFindings"})
+
+
+def provider_tool_use_findings(event: Mapping[str, Any]) -> list[Any] | None:
+    """Return the findings of the last host structured-review call in one event.
+
+    Claude stream-json shape: ``{"type": "assistant", "message": {"content":
+    [{"type": "tool_use", "name": "ReportFindings", "input": {"findings":
+    [...]}}]}}``.  The block is provider-authored exactly like the final text,
+    so it earns no more trust: the findings are mapped to the expected lens and
+    go through the same normalisation and packet-permitted path/line
+    validation as a text report.  ``None`` when the event carries no such
+    call with a findings list.
+    """
+    if event.get("type") != "assistant":
+        return None
+    message = event.get("message")
+    content = message.get("content") if isinstance(message, Mapping) else None
+    if not isinstance(content, list):
+        return None
+    found: list[Any] | None = None
+    for block in content:
+        if not isinstance(block, Mapping) or block.get("type") != "tool_use":
+            continue
+        if str(block.get("name") or "") not in HOST_STRUCTURED_REVIEW_TOOLS:
+            continue
+        payload = block.get("input")
+        if not isinstance(payload, Mapping):
+            continue
+        findings = payload.get("findings")
+        if isinstance(findings, list):
+            found = list(findings)
+    return found
+
+
 def extract_structured_final(events: Iterable[str], *, expected_lens: str) -> IngestResult:
-    """Extract exactly one report from bounded JSONL provider events."""
+    """Extract exactly one report from bounded JSONL provider events.
+
+    The final text is the authoritative channel.  The LAST host structured-
+    review ``tool_use`` (see ``provider_tool_use_findings``) is a fallback
+    that only counts when no text report exists at all, so a reviewer that
+    typed its findings on both channels is never refused as having emitted
+    two reports.
+    """
     reports: list[dict[str, Any]] = []
+    tool_use_findings: list[Any] | None = None
     final_count = 0
     last_final_text = ""
     for count, raw in enumerate(events, 1):
@@ -175,6 +228,9 @@ def extract_structured_final(events: Iterable[str], *, expected_lens: str) -> In
             continue
         if not isinstance(event, dict):
             continue
+        host_findings = provider_tool_use_findings(event)
+        if host_findings is not None:
+            tool_use_findings = host_findings
         text = provider_final_text(event)
         if not text:
             continue
@@ -186,6 +242,12 @@ def extract_structured_final(events: Iterable[str], *, expected_lens: str) -> In
     if len(reports) > 1:
         raise ReviewProtocolError("multiple_structured_finals")
     if not reports:
+        if tool_use_findings is not None:
+            return IngestResult(
+                "structured_tool_use",
+                {"lens": expected_lens, "findings": tool_use_findings},
+                final_excerpt=_bounded_final_excerpt(last_final_text),
+            )
         return IngestResult(
             "unstructured_final" if final_count else "missing_final",
             None,
@@ -197,13 +259,46 @@ def extract_structured_final(events: Iterable[str], *, expected_lens: str) -> In
     return IngestResult("structured_final", report)
 
 
+def _equal_after_normalization(
+    explicit: Mapping[str, Any],
+    report: Mapping[str, Any],
+    normalize: Callable[[dict[str, Any]], dict[str, Any]] | None,
+) -> bool:
+    """True when the explicit receipt and the final report are one judgment.
+
+    The explicit receipt in the ledger is the receipt producer's shape
+    (``quality_evidence.normalize_reviewer_reports``); the final text is the
+    supervisor's shape (``normalize_packet_findings``).  The two differ in
+    which optional keys they carry even when the findings are identical, and
+    that difference used to be refused as ``explicit_submission_conflict`` --
+    an unrepairable category that threw the whole review away.  Running the
+    explicit copy through the same normalisation lets equal judgments compare
+    equal; a genuinely different report still conflicts.
+    """
+    if normalize is None:
+        return False
+    try:
+        renormalized = normalize(dict(explicit))
+    except ReviewProtocolError:
+        return False
+    return renormalized == report
+
+
 def ingest_structured_final(
     events: Iterable[str], *, expected_lens: str,
     explicit_report: Mapping[str, Any] | None = None,
     submit: Callable[[dict[str, Any]], Any] | None = None,
     normalize: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+    normalize_explicit: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
 ) -> IngestResult:
-    """Apply legacy compatibility, logical dedup, and supervisor submission."""
+    """Apply legacy compatibility, logical dedup, and supervisor submission.
+
+    ``normalize_explicit`` normalises the explicit receipt for the equality
+    comparison only; it defaults to ``normalize``.  A caller whose
+    ``normalize`` records per-finding repairs on the audit passes a variant
+    here that does not, so the comparison never writes the explicit copy's
+    repairs onto the provider final's record.
+    """
     result = extract_structured_final(events, expected_lens=expected_lens)
     report = result.report
     if report is not None and normalize is not None:
@@ -212,7 +307,9 @@ def ingest_structured_final(
         authoritative = dict(explicit_report)
         if report is None:
             return IngestResult("explicit_only", authoritative, deduplicated=True)
-        if authoritative != report:
+        if authoritative != report and not _equal_after_normalization(
+            authoritative, report, normalize_explicit or normalize
+        ):
             raise ReviewProtocolError("explicit_submission_conflict")
         return IngestResult("deduplicated", report, deduplicated=True)
     if report is None:
@@ -688,7 +785,9 @@ def supervisor_ingest(
 
     normalization: list[dict[str, Any]] = []
 
-    def normalize(report: dict[str, Any]) -> dict[str, Any]:
+    def _normalize(
+        report: dict[str, Any], *, record_into: list[dict[str, Any]]
+    ) -> dict[str, Any]:
         supplied = list(report.get("findings") or [])
         normalized_report, record, positions = normalize_review_findings(report)
         try:
@@ -700,7 +799,7 @@ def supervisor_ingest(
         except quality_reviewer.ReviewerEvidenceError as exc:
             raise ReviewProtocolError(f"structured_report_invalid:{exc}") from exc
         finally:
-            normalization.extend(record)
+            record_into.extend(record)
         if supplied and not findings:
             # Every finding was refused, so this review cannot be represented as
             # a clean one; fail closed and name why each finding was dropped.
@@ -709,6 +808,14 @@ def supervisor_ingest(
                 f"{_dropped_reasons(record)}"
             )
         return {"lens": expected_lens, "findings": findings}
+
+    def normalize(report: dict[str, Any]) -> dict[str, Any]:
+        return _normalize(report, record_into=normalization)
+
+    def normalize_explicit(report: dict[str, Any]) -> dict[str, Any]:
+        # The explicit receipt is compared, never repaired: its record goes
+        # nowhere so the audit names only what the provider FINAL needed.
+        return _normalize(report, record_into=[])
 
     def submit(report: dict[str, Any]) -> None:
         ctx = worker_ai_tools_mcp.WorkerToolContext(
@@ -730,6 +837,7 @@ def supervisor_ingest(
         ingest_structured_final(
             events, expected_lens=expected_lens, explicit_report=explicit,
             submit=submit, normalize=normalize,
+            normalize_explicit=normalize_explicit,
         )
     except (UnicodeDecodeError, OSError) as exc:
         raise ReviewProtocolError("provider_events_unreadable") from exc

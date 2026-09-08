@@ -59,6 +59,55 @@ def test_the_two_sets_are_disjoint():
     assert not (set(ra.CLAUDE_WRITE_TOOLS) & set(ra.CLAUDE_REVIEW_TOOLS))
 
 
+def test_a_read_only_reviewer_may_search_natively():
+    """The same reasoning, applied to a deny the sandbox makes pointless.
+
+    The reviewer sandbox is Landlock read-only with an empty
+    ``allowed_writes``, so ``Grep``/``Glob`` cannot change anything and denying
+    them protected nothing.  Measured over 242 claude reviewer runs: 1,080 Bash
+    permission denials (25% of every reviewer Bash call, in 181 runs), each a
+    turn spent discovering a refusal and then substituting an unbounded
+    workaround.  The raw SHELL forms stay denied -- the bounded native tools
+    are the substitute, not an unbounded shell scan.
+    """
+    tools = set(ra.claude_allowed_tools(read_only=True))
+    denied = set(ra.claude_disallowed_tools(read_only=True))
+
+    assert {"Grep", "Glob"} <= tools
+    assert not ({"Grep", "Glob"} & denied)
+    assert set(ra.CLAUDE_RAW_DISCOVERY_SHELL_DENIES) <= denied
+    assert "Bash(grep *)" in denied
+
+
+def test_a_build_worker_keeps_the_full_raw_discovery_deny():
+    """Source Graph is the build worker's discovery path and policy holds it there."""
+    tools = set(ra.claude_allowed_tools(read_only=False))
+    denied = set(ra.claude_disallowed_tools(read_only=False))
+
+    assert not ({"Grep", "Glob"} & tools)
+    assert denied == set(ra.CLAUDE_RAW_DISCOVERY_DENIES)
+    assert {"Grep", "Glob"} <= denied
+
+
+def test_a_reviewer_cannot_file_its_report_where_the_supervisor_never_reads():
+    """``ReportFindings`` is the host's own code-review channel, not this one.
+
+    73 of 242 claude reviewer runs filed through it; 9 filed ONLY there and
+    lost the whole review.  ``ScheduleWakeup`` schedules a turn no supervisor
+    will ever answer.  The one authoritative channel is the final JSON report
+    the supervisor ingests and submits.
+    """
+    denied = set(ra.claude_disallowed_tools(read_only=True))
+
+    assert set(ra.CLAUDE_REVIEWER_HOST_TOOL_DENIES) <= denied
+    assert {"ReportFindings", "ScheduleWakeup"} <= denied
+    assert not (set(ra.CLAUDE_REVIEWER_HOST_TOOL_DENIES)
+                & set(ra.claude_allowed_tools(read_only=True)))
+    # A build worker never held these; denying them there would be noise.
+    assert not (set(ra.CLAUDE_REVIEWER_HOST_TOOL_DENIES)
+                & set(ra.claude_disallowed_tools(read_only=False)))
+
+
 def _plan(tmp_path, *, read_only: bool):
     """A real argv, built against a real executable path.
 

@@ -14,16 +14,25 @@ from aiworkhub import agent_tool_instructions as instr  # noqa: E402
 
 
 def test_canonical_order_is_exact_and_compact() -> None:
+    # Re-pinned for audit startup-5: one sequence per seat, receipt steps only
+    # on the worker side (see tests/test_agent_tool_instructions.py).
     text = instr.render_canonical()
     expected = [
-        "1. validate the injected AIWorkHub Task MCP receipt, identity and scope.",
-        "2. consume and acknowledge the injected project-context receipt.",
-        "3. manager uses aiworkhub_manager_source_graph_query; worker uses aiworkhub_worker_source_graph_query.",
-        "4. manager uses aiworkhub_manager_session_current_state; worker uses aiworkhub_worker_session_current_state.",
-        "5. manager uses aiworkhub_manager_ai_memory_search; worker uses aiworkhub_worker_ai_memory_search.",
-        "6. manager uses aiworkhub_manager_kb_search/get/related; worker uses aiworkhub_worker_kb_search/get/related.",
-        "7. manager uses aiworkhub_manager_context_graph_search, aiworkhub_manager_context_graph_range and aiworkhub_manager_context_graph_related when enabled; workers never access Context Graph.",
-        "8. execute exact card action and validation.",
+        "Manager Order:",
+        "1. aiworkhub_manager_source_graph_query.",
+        "2. aiworkhub_manager_session_current_state.",
+        "3. aiworkhub_manager_ai_memory_search.",
+        "4. aiworkhub_manager_kb_search/get/related.",
+        "5. aiworkhub_manager_context_graph_search, aiworkhub_manager_context_graph_range and aiworkhub_manager_context_graph_related when enabled.",
+        "6. launch, review and close cards through the manager task tools.",
+        "Worker Order:",
+        "1. the coordinator records the injected bundle receipt; do not print it.",
+        "2. aiworkhub_worker_source_graph_query.",
+        "3. aiworkhub_worker_session_current_state.",
+        "4. aiworkhub_worker_ai_memory_search.",
+        "5. aiworkhub_worker_kb_search/get/related.",
+        "6. never Context Graph.",
+        "7. execute exact card action and validation.",
     ]
     positions = [text.index(item) for item in expected]
     assert positions == sorted(positions)
@@ -57,6 +66,25 @@ def test_source_graph_policy_requires_continuous_adaptive_use() -> None:
     assert "Start with focus/slice" in text
     assert "bodygrep for indexed literal/body text" in text
     assert "one preflight query is not continuous use" in text
+
+
+def test_semantic_edit_section_is_mandatory_and_bounded() -> None:
+    """Audit edit-1 (2026-09-08): the generated canonical now carries the
+    semantic-edit mandate, its named exceptions, and the rule that prepare is
+    an edit step rather than a reader. It replaced the two Source Graph lines
+    that said less, so the byte caps did not move."""
+    text = instr.render_canonical()
+    assert "Semantic edit (mandatory):" in text
+    assert "aiworkhub_worker_semantic_edit_prepare then _apply" in text
+    assert "smallest verified range" in text
+    assert "a whole-file rewrite is not an editing strategy" in text
+    assert "Exceptions: a new file" in text
+    assert "make the smallest bounded edit and record why" in text
+    assert "prepare is an edit step, not a reader" in text
+    assert "For edits prefer" not in text
+    assert text.index("Source Graph gate:") < text.index("Semantic edit (mandatory):")
+    assert text.index("Semantic edit (mandatory):") < text.index("Exact-command exception:")
+    assert len(text.encode("utf-8")) <= instr.CANONICAL_MAX_BYTES
 
 
 def test_exact_validation_exception_is_not_discovery_escape_hatch() -> None:

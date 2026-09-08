@@ -286,6 +286,182 @@ def test_open_new_staged_file_does_not_relax_concurrent_file_creation_permission
     assert observed_mode == 0o600
 
 
+def _claude_stale_copy() -> bytes:
+    """The bytes CLAUDE.md carried above its START marker: a copy of the block."""
+    block = policy_sync.generated_block(b"", policy_sync.HOST_FILES[1])
+    inner = block[len(policy_sync.START_MARKER_BYTES) + 1 : block.index(policy_sync.END_MARKER_BYTES)]
+    return inner + b"\n"
+
+
+def test_check_reports_verbatim_policy_copy_outside_block_and_sync_strips_it(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Audit startup-5: CLAUDE.md carried 1,775 B of its own block above the
+    START marker; the replacer rewrites only between markers and --check compared
+    only the block, so the copy passed CI in every release."""
+    copy_policy_tree(tmp_path)
+    monkeypatch.setenv(policy_sync.WRITE_GATE_ENV, "1")
+
+    host = policy_sync.HOST_FILES[1]
+    host_path = tmp_path / host
+    original = host_path.read_bytes()
+    stale = _claude_stale_copy()
+    host_path.write_bytes(stale + original)
+    line_count = len([line for line in stale.splitlines() if line])
+
+    assert policy_sync.check(tmp_path) == [
+        f"{host}: {line_count} policy line(s) duplicated outside the managed block"
+    ]
+    assert host_path.read_bytes() == stale + original
+
+    changed = policy_sync.sync(tmp_path)
+
+    assert changed == [host]
+    assert host_path.read_bytes() == original
+    assert policy_sync.check(tmp_path) == []
+
+
+def test_check_and_sync_fail_closed_on_drifted_policy_copy_outside_block(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """When the outside copy differs from the rendered text the sync reports it
+    and refuses to guess which wording the owner meant."""
+    copy_policy_tree(tmp_path)
+    monkeypatch.setenv(policy_sync.WRITE_GATE_ENV, "1")
+
+    host = policy_sync.HOST_FILES[1]
+    host_path = tmp_path / host
+    original = host_path.read_bytes()
+    stale = _claude_stale_copy().replace(b"not a second vendor", b"not a different vendor")
+    assert stale != _claude_stale_copy()
+    host_path.write_bytes(stale + original)
+
+    errors = policy_sync.check(tmp_path)
+
+    assert len(errors) == 1
+    assert errors[0].startswith(f"{host}: 1 drifted policy line(s) outside the managed block; remove or restore them by hand")
+    assert "Because the manager did not write the code" in errors[0]
+
+    try:
+        policy_sync.sync(tmp_path)
+    except policy_sync.PolicySyncError as exc:
+        assert str(exc) == errors[0]
+    else:
+        raise AssertionError("sync must fail closed on a drifted outside copy")
+
+    assert host_path.read_bytes() == stale + original
+    assert staged_policy_artifacts(tmp_path) == []
+
+
+def _claude_preamble_copy() -> bytes:
+    """The bytes AGENTS.md carried above its START marker: the CLAUDE.md
+    manager-startup rules, which AGENTS.md's own projection never renders."""
+    return policy_sync.agent_tool_instructions.CLAUDE_MANAGER_PREAMBLE.encode("utf-8")
+
+
+def test_check_reports_another_providers_rules_copied_outside_the_block(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Audit edit-1: AGENTS.md carried 1,018 B of the CLAUDE.md manager
+    startup rules above its marker. The first out-of-block scan compared each
+    document against its own rendered block only, and AGENTS.md's projection
+    has no Claude preamble, so those lines matched nothing and --check stayed
+    green. The scan now knows every projection's rules."""
+    copy_policy_tree(tmp_path)
+    monkeypatch.setenv(policy_sync.WRITE_GATE_ENV, "1")
+
+    host = policy_sync.HOST_FILES[0]
+    assert host == Path("AGENTS.md")
+    host_path = tmp_path / host
+    original = host_path.read_bytes()
+    copy = _claude_preamble_copy()
+    host_path.write_bytes(copy + original)
+    line_count = len([line for line in copy.splitlines() if line])
+
+    assert policy_sync.check(tmp_path) == [
+        f"{host}: {line_count} policy line(s) duplicated outside the managed block"
+    ]
+    assert host_path.read_bytes() == copy + original
+
+    changed = policy_sync.sync(tmp_path)
+
+    assert changed == [host]
+    assert host_path.read_bytes() == original
+    assert policy_sync.check(tmp_path) == []
+
+
+def test_check_fails_closed_on_a_renamed_copy_of_another_providers_rules(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The real copy said "Kilo" where the rendered rule says "Claude", inside
+    the first nine characters, so a shared-prefix test read it as owner prose.
+    A copy that differs from the rendered text is reported and left alone: the
+    sync does not guess which wording the owner meant."""
+    copy_policy_tree(tmp_path)
+    monkeypatch.setenv(policy_sync.WRITE_GATE_ENV, "1")
+
+    host = policy_sync.HOST_FILES[0]
+    host_path = tmp_path / host
+    original = host_path.read_bytes()
+    renamed = _claude_preamble_copy().replace(
+        b"Claude Code manager startup (mandatory",
+        b"Kilo manager startup (copied from CLAUDE.md; mandatory",
+    ).replace(b"- Direct Claude chats", b"- Direct Kilo chats")
+    assert renamed != _claude_preamble_copy()
+    host_path.write_bytes(renamed + original)
+
+    errors = policy_sync.check(tmp_path)
+
+    assert len(errors) == 1
+    assert errors[0].startswith(
+        f"{host}: 2 drifted policy line(s) outside the managed block; "
+        "remove or restore them by hand"
+    )
+    assert "Kilo manager startup" in errors[0]
+
+    try:
+        policy_sync.sync(tmp_path)
+    except policy_sync.PolicySyncError as exc:
+        assert str(exc) == errors[0]
+    else:
+        raise AssertionError("sync must fail closed on a renamed outside copy")
+
+    assert host_path.read_bytes() == renamed + original
+    assert staged_policy_artifacts(tmp_path) == []
+
+
+def test_repository_hosts_carry_no_policy_copy_outside_their_blocks() -> None:
+    """The live tree, under the wider scan: no host may park policy rules
+    outside its managed block, whichever projection they came from."""
+    for relative_path in policy_sync.HOST_FILES:
+        data = (REPO_ROOT / relative_path).read_bytes()
+        block = policy_sync.extract_block(data, relative_path)
+        generated = policy_sync.generated_block(b"", relative_path)
+        scan = policy_sync.outside_scan(data, block, generated, relative_path)
+        assert scan.verbatim == (), relative_path
+        assert scan.drifted == (), relative_path
+
+
+def test_check_reports_docs_canonical_drift_and_sync_regenerates_it(tmp_path: Path, monkeypatch) -> None:
+    copy_policy_tree(tmp_path)
+    monkeypatch.setenv(policy_sync.WRITE_GATE_ENV, "1")
+
+    source_path = tmp_path / policy_sync.POLICY_SOURCE
+    rendered = policy_sync.rendered_canonical()
+    assert source_path.read_bytes() == rendered
+    source_path.write_bytes(rendered.replace(b"Stop at Codex review.", b"Stop at drift review."))
+
+    assert policy_sync.check(tmp_path) == [
+        f"{policy_sync.POLICY_SOURCE}: canonical policy source differs from agent_tool_instructions.render_canonical()"
+    ]
+
+    changed = policy_sync.sync(tmp_path)
+
+    assert changed == [policy_sync.POLICY_SOURCE]
+    assert source_path.read_bytes() == rendered
+    assert policy_sync.check(tmp_path) == []
+
+
 def test_check_detects_crlf_policy_block_byte_drift_without_writing(tmp_path: Path) -> None:
     copy_policy_tree(tmp_path)
 

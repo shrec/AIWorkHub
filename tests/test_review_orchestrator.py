@@ -162,8 +162,6 @@ def test_launch_rejects_identity_mismatch_and_empty_partition(tmp_path: Path) ->
     ("field", "reason"),
     [
         ("task_id", "target_task_identity_invalid"),
-        ("request_id", "target_request_identity_invalid"),
-        ("claim_epoch", "target_claim_identity_invalid"),
         ("packet_sha256", "target_packet_identity_invalid"),
         ("candidate_sha256", "target_candidate_identity_invalid"),
     ],
@@ -187,6 +185,43 @@ def test_launch_identity_mismatches_are_terminal_before_not_ready(
     assert result.failed == 1
     assert manager.launches == []
     assert reason in review_lifecycle.rows_for_test(tmp_path / "identity.sqlite")[0]["failure_reason"]
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement", "reason"),
+    [
+        ("request_id", "newer-request", "target_request_superseded:newer-request"),
+        ("claim_epoch", "9", "target_claim_epoch_superseded:9"),
+    ],
+)
+def test_superseded_target_is_retired_as_obsolete_not_failed(
+    tmp_path: Path, field: str, replacement: str, reason: str
+) -> None:
+    """A newer request/claim on the same task ends the chain, it does not park it.
+
+    Measured over 627 real chains: 337 were bound to a request the card had
+    already replaced, and every one of them FAILED its launch action, which
+    parked its whole chain permanently. Nothing is left to review on those
+    bytes -- that is a completed chain, not a broken one.
+    """
+    manager = _Manager(tmp_path)
+    manager.target_status = _target_status(**{field: replacement})
+    driver = review_orchestrator.ReviewOrchestrator(
+        manager, db_path=tmp_path / "superseded.sqlite", route_selector=_route
+    )
+    driver.ensure_chain(
+        target_task_id="TARGET", target_request_id="target-request", claim_epoch=1,
+        packet_sha256="a" * 64, candidate_sha256="b" * 64, now=NOW,
+    )
+
+    result = driver.drain(max_actions=1, now=NOW)
+
+    assert result.failed == 0
+    assert result.completed == 1
+    assert manager.launches == []
+    row = review_lifecycle.rows_for_test(tmp_path / "superseded.sqlite")[0]
+    assert row["state"] == "completed"
+    assert json.loads(row["receipt_json"])["obsolete_reason"] == reason
 
 
 def test_launch_binds_workspace_when_canonical_card_becomes_available(tmp_path: Path) -> None:
@@ -253,13 +288,32 @@ def test_accept_waits_for_supervisor_terminal_receipt_without_busy_loop(
     assert rows[1]["lease_token"] == ""
 
 
+def _review_packet_sha256(lens: str) -> str:
+    """The REVIEW-PACKET digest, which is never the attempt-manifest digest.
+
+    The chain identity's ``packet_sha256`` ("a" * 64 throughout this module) is
+    the digest of the attempt-artifact MANIFEST; a reviewer receipt carries the
+    digest of the review PACKET, recomputed by
+    ``quality_reviewer.verify_reviewer_receipt`` over the packet body -- and the
+    packet is per lens, so the three lenses do not even share one. Putting the
+    same constant on both sides hid a comparison that could never hold in
+    production: measured over the live store, 0 of 627 chain packet digests
+    appear among the 958 distinct receipt digests. Two different realistic
+    digests are what catches that.
+    """
+    return hashlib.sha256(f"review-packet:target-request:{lens}".encode()).hexdigest()
+
+
 def _review_status(
-    lens: str = "correctness", *, findings: list[dict] | None = None
+    lens: str = "correctness", *, findings: list[dict] | None = None,
+    binding_packet_sha256: str | None = None,
+    candidate_sha256: str = "b" * 64,
 ) -> dict:
     reviewer_request = "review-request-" + lens
+    packet_sha256 = _review_packet_sha256(lens)
     receipt = {
         "schema_id": "aiworkhub.quality_review_receipt.v1",
-        "packet_sha256": "a" * 64,
+        "packet_sha256": packet_sha256,
         "target": {"request_id": "target-request", "task_id": "TARGET", "claim_epoch": 1},
         "reviewer": {
             "request_id": reviewer_request,
@@ -268,7 +322,7 @@ def _review_status(
                     "schema_id": "aiworkhub.review_lifecycle.v1",
                     "target_task_id": "TARGET", "target_request_id": "target-request",
                     "claim_epoch": "1", "packet_sha256": "a" * 64,
-                    "candidate_sha256": "b" * 64,
+                    "candidate_sha256": candidate_sha256,
                 },
                 lens,
             ),
@@ -286,10 +340,30 @@ def _review_status(
         "physical_submission_count": 1,
         "logical_submission_count": 1,
     }
+    # The reviewer card's own record of the packet THIS repository sealed for
+    # THIS reviewer -- the receipt digest's real counterpart. Measured on the
+    # live store: it equals the receipt digest in 2,219 of 2,219 stored reviewer
+    # cards, with the lens matching in all 2,219.
+    binding = {
+        "lens": lens,
+        "packet_sha256": (
+            packet_sha256 if binding_packet_sha256 is None else binding_packet_sha256
+        ),
+        "target_request_id": "target-request",
+        "target_task_id": "TARGET",
+        "target_claim_epoch": 1,
+    }
     return {
         "ok": True, "state": "review_ready", "adapter_id": "codex_cli",
         "latest_event": {"quality_review_receipt": receipt},
-        "task_card": {"terminal_review": {"evidence": {"quality_review_receipt": receipt}}},
+        "task_card": {
+            "terminal_review": {
+                "evidence": {
+                    "quality_review": binding,
+                    "quality_review_receipt": receipt,
+                }
+            }
+        },
     }
 
 
@@ -333,9 +407,140 @@ def test_terminal_receipt_card_event_mismatch_fails_closed(tmp_path: Path) -> No
         )
 
 
+def _receipt_chain(tmp_path: Path) -> tuple[object, object]:
+    manager = _Manager(tmp_path)
+    driver = review_orchestrator.ReviewOrchestrator(
+        manager, db_path=tmp_path / "review.sqlite", route_selector=_route
+    )
+    chain = driver.ensure_chain(
+        target_task_id="TARGET", target_request_id="target-request", claim_epoch=1,
+        packet_sha256="a" * 64, candidate_sha256="b" * 64, now=NOW,
+    )
+    return driver, chain
+
+
+def _verify_receipt(driver, chain, status: dict) -> dict:
+    return driver._review_receipt(
+        chain.actions[1], status, "review-request-correctness",
+        review_orchestrator.ReviewOrchestrator._reviewer_task_id(
+            chain.chain_identity, "correctness"
+        ),
+    )
+
+
+def test_reviewer_receipt_binds_to_the_review_packet_not_the_attempt_manifest(
+    tmp_path: Path,
+) -> None:
+    """The two digests are of two different objects and must not be conflated.
+
+    ``chain_identity["packet_sha256"]`` is the attempt-artifact MANIFEST digest;
+    the receipt carries the review PACKET digest. Comparing them refused every
+    real receipt -- measured over the live store, 0 of 627 chain digests appear
+    among the 958 distinct receipt digests, and of the 103 receipts whose target
+    request owns a chain, 0 matched and 103 differed. The check now compares the
+    receipt against the reviewer card's own record of the packet this repository
+    sealed for it, which is the digest it is actually a receipt for.
+    """
+    driver, chain = _receipt_chain(tmp_path)
+    status = _review_status()
+    packet_sha256 = _review_packet_sha256("correctness")
+
+    assert packet_sha256 != chain.chain_identity["packet_sha256"]
+    assert _verify_receipt(driver, chain, status)["packet_sha256"] == packet_sha256
+
+    # The exact shape the old comparison demanded: a receipt claiming the
+    # attempt-manifest digest, which no reviewer can ever produce.
+    manifest_digest = _review_status()
+    for holder in (
+        manifest_digest["latest_event"]["quality_review_receipt"],
+        manifest_digest["task_card"]["terminal_review"]["evidence"][
+            "quality_review_receipt"
+        ],
+    ):
+        holder["packet_sha256"] = chain.chain_identity["packet_sha256"]
+    with pytest.raises(RuntimeError, match="reviewer_receipt_binding_invalid"):
+        _verify_receipt(driver, chain, manifest_digest)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "reason"),
+    [
+        ({}, "reviewer_packet_binding_missing"),
+        ({"packet_sha256": "c" * 64}, "reviewer_receipt_binding_invalid"),
+        ({"packet_sha256": "not-a-digest"}, "reviewer_packet_binding_invalid"),
+        ({"lens": "security"}, "reviewer_packet_binding_invalid"),
+        ({"target_request_id": "other-request"}, "reviewer_packet_binding_invalid"),
+        ({"target_claim_epoch": 9}, "reviewer_packet_binding_invalid"),
+    ],
+)
+def test_reviewer_packet_binding_must_name_this_chain_and_this_lens(
+    tmp_path: Path, mutation: dict, reason: str
+) -> None:
+    """A receipt is evidence only for the packet it was written against."""
+    driver, chain = _receipt_chain(tmp_path)
+    status = _review_status()
+    evidence = status["task_card"]["terminal_review"]["evidence"]
+    if mutation:
+        evidence["quality_review"].update(mutation)
+    else:
+        evidence.pop("quality_review")
+    with pytest.raises(RuntimeError, match=reason):
+        _verify_receipt(driver, chain, status)
+
+
+def test_automatic_chain_stops_at_acceptance_and_never_accepts_the_target(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Fixing the launch check must not hand acceptance to the orchestrator.
+
+    Every chain used to die at its first launch action, which is the only
+    reason ``target_accept`` (which calls ``manager.accept_review`` on the
+    TARGET) had never run. That was an accident, not a control. The nine
+    reviewer actions now complete automatically and the chain parks at
+    acceptance with an explicit reason.
+    """
+    monkeypatch.setattr(
+        review_orchestrator.task_engine,
+        "archive_task",
+        lambda _repo, task_id, **_kwargs: {"ok": True, "task_id": task_id},
+    )
+    manager = _Manager(tmp_path)
+    driver = review_orchestrator.ReviewOrchestrator(
+        manager, db_path=tmp_path / "gated.sqlite", route_selector=_route
+    )
+    driver.ensure_chain(
+        target_task_id="TARGET", target_request_id="target-request", claim_epoch=1,
+        packet_sha256="a" * 64, candidate_sha256="b" * 64, now=NOW,
+    )
+    for lens in review_orchestrator.LENSES:
+        manager.status_results["review-request-" + lens] = _review_status(lens)
+
+    assert review_orchestrator.AUTOMATIC_TARGET_ACCEPT_ENABLED is False
+    for _ in range(9):
+        assert driver.drain(max_actions=1, now=NOW).completed == 1
+    gated = driver.drain(max_actions=1, now=NOW)
+
+    assert gated.failed == 1
+    assert manager.accepts == [
+        ("review-request-" + lens, task_id)
+        for lens, task_id in zip(
+            review_orchestrator.LENSES,
+            [row["reviewer_task_id"] for row in manager.launches],
+        )
+    ]
+    assert ("target-request", "TARGET") not in manager.accepts
+    rows = review_lifecycle.rows_for_test(tmp_path / "gated.sqlite")
+    assert rows[9]["action_type"] == "target_accept"
+    assert rows[9]["state"] == "failed"
+    assert "target_accept_requires_verified_manager" in rows[9]["failure_reason"]
+
+
 def test_happy_path_is_exactly_ordered_and_closes_linked_needfix(
     monkeypatch, tmp_path: Path
 ) -> None:
+    monkeypatch.setattr(
+        review_orchestrator, "AUTOMATIC_TARGET_ACCEPT_ENABLED", True
+    )
     manager = _Manager(tmp_path)
     archived: list[str] = []
     resolved: list[tuple[str, str]] = []
@@ -1380,3 +1585,330 @@ def test_returning_a_target_to_pending_does_not_retire_the_rest_of_its_chain(
 
     # And the chain is genuinely parked: a second pass reserves nothing.
     assert driver.drain(max_actions=12, now=NOW).attempted == 0
+
+
+# ---------------------------------------------------------------------------
+# The identity read (audit 2026-09-08, problem 1).
+#
+# Every fixture above uses TOP-LEVEL card keys, which nothing in production
+# writes: measured over the live store's 627 chains, 0 target cards carry a
+# top-level ``request_id`` and 522 of the 581 failed launch actions died with
+# ``target_request_identity_invalid``. These fixtures use the shape
+# ``_finalize_isolated_request`` actually seals.
+# ---------------------------------------------------------------------------
+
+
+def _sealed_changed_path_hashes() -> dict[str, str]:
+    return {"src/aiworkhub/service.py": "c" * 64}
+
+
+_SEALED_CANDIDATE_SHA256 = review_orchestrator.candidate_digest(
+    {"src/aiworkhub/service.py": "c" * 64}
+)
+
+
+def _stub_archive(monkeypatch) -> None:
+    """Archiving a finished reviewer is a store write, not what is under test."""
+    monkeypatch.setattr(
+        review_orchestrator.task_engine,
+        "archive_task",
+        lambda _repo, task_id, **_kwargs: {"ok": True, "task_id": task_id},
+    )
+
+
+def _sealed_target_status(
+    *, state: str = "review_ready", evidence_overrides: dict | None = None,
+    claim_epoch: str = "1",
+) -> dict:
+    """A card in the shape ``_finalize_isolated_request`` writes: no top-level
+    ``request_id``/``packet_sha256``/``candidate_sha256``/``workspace_identity``
+    anywhere, everything under ``terminal_review.evidence``."""
+    workspace = {
+        "request_id": "target-request",
+        "path": "/candidate/worktree",
+        "base_oid": "base-oid",
+    }
+    evidence = {
+        "request_identity": {
+            "request_id": "target-request",
+            "task_id": "TARGET",
+            "claim_epoch": claim_epoch,
+        },
+        "attempt_artifact_manifest": {"manifest_sha256": "a" * 64},
+        "changed_path_hashes": _sealed_changed_path_hashes(),
+        "workspace": workspace,
+        "source_graph_partition_readiness": {"target": True},
+    }
+    evidence.update(evidence_overrides or {})
+    return {
+        "ok": True,
+        "state": state,
+        "task_card": {
+            "task_id": "TARGET",
+            "claim_epoch": claim_epoch,
+            "terminal_review": {"substatus": "review_ready", "evidence": evidence},
+            "evidence": {"source_graph_partition_readiness": {"target": True}},
+        },
+    }
+
+
+def _sealed_chain(driver) -> None:
+    driver.ensure_chain(
+        target_task_id="TARGET", target_request_id="target-request", claim_epoch=1,
+        packet_sha256="a" * 64,
+        candidate_sha256=review_orchestrator.candidate_digest(
+            _sealed_changed_path_hashes()
+        ),
+        now=NOW,
+    )
+
+
+def test_identity_resolves_from_terminal_evidence_where_the_finalizer_writes_it(
+    tmp_path: Path,
+) -> None:
+    """The read that made 504 of 563 outbox launch actions terminal-fail.
+
+    Verified read-only against the live store: the old top-level read resolved
+    0 of 627 chains; this read resolves 93 exactly, retires 332 as superseded
+    and leaves 202 unresolvable (199 of whose targets have already left review
+    and retire one check earlier).
+    """
+    manager = _Manager(tmp_path)
+    manager.target_status = _sealed_target_status()
+    driver = review_orchestrator.ReviewOrchestrator(
+        manager, db_path=tmp_path / "sealed.sqlite", route_selector=_route
+    )
+    _sealed_chain(driver)
+
+    # The old read, on the same card, resolves nothing.
+    card = manager.target_status["task_card"]
+    assert review_orchestrator._legacy_card_identity(card) == {}
+
+    resolved = review_orchestrator.resolve_target_identity(manager.target_status)
+    assert resolved["identity_source"] == "terminal_review_evidence"
+    assert resolved["identity"]["target_request_id"] == "target-request"
+    assert resolved["identity"]["packet_sha256"] == "a" * 64
+    assert resolved["workspace_identity"]
+
+    result = driver.drain(max_actions=1, now=NOW)
+
+    assert result.completed == 1 and result.failed == 0
+    assert len(manager.launches) == 1
+    receipt = json.loads(
+        review_lifecycle.rows_for_test(tmp_path / "sealed.sqlite")[0]["receipt_json"]
+    )
+    assert receipt["target_readiness_receipt"]["identity_source"] == (
+        "terminal_review_evidence"
+    )
+
+
+def test_registration_payload_answers_when_the_card_evidence_is_gone(
+    tmp_path: Path,
+) -> None:
+    """The finalizer records the same five fields on the terminal event as
+    ``review_automation.registration``; it is the only remaining statement of
+    what a chain was bound to once the card's terminal evidence is replaced."""
+    status = {
+        "ok": True,
+        "state": "review_ready",
+        "task_card": {"task_id": "TARGET"},
+        "latest_event": {
+            "review_automation": {
+                "registration": {
+                    "target_task_id": "TARGET",
+                    "target_request_id": "target-request",
+                    "claim_epoch": "1",
+                    "packet_sha256": "a" * 64,
+                    "candidate_sha256": "b" * 64,
+                }
+            }
+        },
+    }
+    resolved = review_orchestrator.resolve_target_identity(status)
+
+    assert resolved["identity_source"] == "review_automation_registration"
+    assert resolved["identity"]["candidate_sha256"] == "b" * 64
+    assert resolved["conflict"] == ""
+
+
+def test_two_durable_identities_that_disagree_fail_closed(tmp_path: Path) -> None:
+    """A packet digest that differs between the card and the registration is
+    two statements about which bytes are under review. Picking one silently is
+    exactly what must not happen."""
+    status = _sealed_target_status()
+    status["latest_event"] = {
+        "review_automation": {
+            "registration": {
+                "target_task_id": "TARGET",
+                "target_request_id": "target-request",
+                "claim_epoch": "1",
+                "packet_sha256": "f" * 64,
+                "candidate_sha256": review_orchestrator.candidate_digest(
+                    _sealed_changed_path_hashes()
+                ),
+            }
+        }
+    }
+    resolved = review_orchestrator.resolve_target_identity(status)
+    assert resolved["conflict"] == "packet_sha256"
+
+    manager = _Manager(tmp_path)
+    manager.target_status = status
+    driver = review_orchestrator.ReviewOrchestrator(
+        manager, db_path=tmp_path / "conflict.sqlite", route_selector=_route
+    )
+    _sealed_chain(driver)
+
+    result = driver.drain(max_actions=1, now=NOW)
+
+    assert result.failed == 1 and manager.launches == []
+    assert "target_identity_conflict:packet_sha256" in (
+        review_lifecycle.rows_for_test(tmp_path / "conflict.sqlite")[0]["failure_reason"]
+    )
+
+
+# ---------------------------------------------------------------------------
+# The lens plan (audit 2026-09-08, problem 2).
+#
+# ``_RISK_PROFILES`` requires low () / medium (correctness) / high (correctness,
+# security) / critical (all three), but the plan launched all three for every
+# chain: 194 of 893 launches on accepted targets (21.7%) were of a lens the
+# tier never required, at ~889K input tokens each.
+# ---------------------------------------------------------------------------
+
+
+def test_only_the_tier_required_lenses_are_launched(
+    monkeypatch, tmp_path: Path
+) -> None:
+    _stub_archive(monkeypatch)
+    manager = _Manager(tmp_path)
+    manager.target_status = _sealed_target_status()
+    driver = review_orchestrator.ReviewOrchestrator(
+        manager, db_path=tmp_path / "tier.sqlite", route_selector=_route
+    )
+    chain = driver.ensure_chain(
+        target_task_id="TARGET", target_request_id="target-request", claim_epoch=1,
+        packet_sha256="a" * 64,
+        candidate_sha256=review_orchestrator.candidate_digest(
+            _sealed_changed_path_hashes()
+        ),
+        now=NOW, required_reviewer_lenses=["correctness"], effective_tier="medium",
+    )
+    manager.status_results["review-request-correctness"] = _review_status(
+        "correctness", candidate_sha256=_SEALED_CANDIDATE_SHA256
+    )
+
+    assert review_orchestrator.required_lenses(
+        tmp_path / "tier.sqlite", chain.chain_id
+    ) == ("correctness",)
+
+    # Nine reviewer actions: three do work, six retire without a reviewer.
+    for _ in range(9):
+        assert driver.drain(max_actions=1, now=NOW).completed == 1
+
+    assert [row["lens"] for row in manager.launches] == ["correctness"]
+    rows = review_lifecycle.rows_for_test(tmp_path / "tier.sqlite")
+    obsolete = [
+        json.loads(row["receipt_json"])["obsolete_reason"]
+        for row in rows[:9]
+        if row["state"] == "completed"
+        and json.loads(row["receipt_json"]).get("obsolete_reason")
+    ]
+    assert obsolete == ["lens_not_required_by_tier:medium"] * 6
+
+
+def test_an_unplanned_chain_still_gets_every_lens(tmp_path: Path) -> None:
+    """Fail OPEN on the plan: a chain with no recorded tier reviews everything,
+    which is what happened before the plan existed."""
+    assert review_orchestrator.required_lenses(
+        tmp_path / "absent.sqlite", 999
+    ) == review_orchestrator.LENSES
+    record = review_orchestrator.lens_plan_record(tmp_path / "absent.sqlite", 999)
+    assert record["planned"] is False
+    assert record["lenses"] == list(review_orchestrator.LENSES)
+
+
+def test_manager_override_adds_a_lens_and_can_never_remove_one(tmp_path: Path) -> None:
+    """The tier is a floor. A manager may ask for more review than it demands;
+    asking for less would silently lower a bar ``accept_review`` still enforces.
+    """
+    db_path = tmp_path / "override.sqlite"
+    review_orchestrator.bind_lens_plan(
+        db_path, chain_id=7, lenses=["correctness"], effective_tier="medium"
+    )
+    assert review_orchestrator.add_required_lens(
+        db_path, chain_id=7, lens="security"
+    ) == ("correctness", "security")
+    # Re-binding cannot shrink a bound plan.
+    assert review_orchestrator.bind_lens_plan(
+        db_path, chain_id=7, lenses=[], effective_tier="low"
+    ) == ("correctness", "security")
+    assert review_orchestrator.lens_plan_record(db_path, 7)["source"] == (
+        "manager_override"
+    )
+    with pytest.raises(ValueError, match="unknown_review_lens"):
+        review_orchestrator.add_required_lens(db_path, chain_id=7, lens="vibes")
+
+
+def test_registration_carries_the_tier_from_the_finalizers_own_gate_record() -> None:
+    registration = review_orchestrator.candidate_registration(
+        metadata={"task_id": "TARGET", "request_id": "target-request", "claim_epoch": 1},
+        artifact_receipt={"manifest_sha256": "a" * 64},
+        changed_path_hashes=_sealed_changed_path_hashes(),
+        quality_gate={
+            "review_risk_profile": {
+                "effective_tier": "high",
+                "required_reviewer_lenses": ["correctness", "security"],
+                "error": "",
+            }
+        },
+    )
+    assert registration["effective_tier"] == "high"
+    assert registration["required_reviewer_lenses"] == ["correctness", "security"]
+
+    # A gate whose observation failed plans nothing, so every lens runs.
+    degraded = review_orchestrator.candidate_registration(
+        metadata={"task_id": "TARGET", "request_id": "target-request", "claim_epoch": 1},
+        artifact_receipt={"manifest_sha256": "a" * 64},
+        changed_path_hashes=_sealed_changed_path_hashes(),
+        quality_gate={"review_risk_profile": {"error": "ValueError:boom"}},
+    )
+    assert "required_reviewer_lenses" not in degraded
+
+
+def test_drain_defaults_to_the_whole_pass_and_keeps_its_hard_bound(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """One action per reconcile pass could not work off 627 chains: measured, 30
+    launches completed automatically while 570 were typed by hand. The BOUND is
+    unchanged -- drain still clamps to DEFAULT_DRAIN_MAX_ACTIONS -- only the
+    default request changed."""
+    import inspect
+
+    _stub_archive(monkeypatch)
+    assert review_orchestrator.DEFAULT_DRAIN_MAX_ACTIONS == 12
+    assert inspect.signature(
+        review_orchestrator.ReviewOrchestrator.drain
+    ).parameters["max_actions"].default == 12
+
+    manager = _Manager(tmp_path)
+    manager.target_status = _sealed_target_status()
+    driver = review_orchestrator.ReviewOrchestrator(
+        manager, db_path=tmp_path / "drain.sqlite", route_selector=_route
+    )
+    _sealed_chain(driver)
+    for lens in review_orchestrator.LENSES:
+        manager.status_results["review-request-" + lens] = _review_status(
+            lens, candidate_sha256=_SEALED_CANDIDATE_SHA256
+        )
+
+    result = driver.drain(now=NOW)
+
+    # Nine reviewer actions in ONE pass; the chain then parks at target_accept.
+    assert result.attempted <= review_orchestrator.DEFAULT_DRAIN_MAX_ACTIONS
+    assert result.completed == 9
+    assert len(manager.launches) == 3
+    # A caller asking for more than the bound still gets the bound.
+    assert driver.drain(max_actions=10_000, now=NOW).attempted <= (
+        review_orchestrator.DEFAULT_DRAIN_MAX_ACTIONS
+    )

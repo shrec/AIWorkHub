@@ -643,9 +643,14 @@ def test_manager_bootstrap_describes_current_repo_manager_callback_ownership(tmp
         },
     )
     monkeypatch.setattr(core, "_claude_manager_identity", lambda: None)
+    # Schema v2 delivers the contract prose to a verified session once, so this
+    # test states the empty-delivery-map precondition it has always relied on
+    # rather than inheriting whatever ran before it in the same process.
+    monkeypatch.setattr(core, "_CONTRACT_DELIVERIES", {})
 
     contract = core.manager_bootstrap()
 
+    assert contract["contract_delivered"] is True
     assert "current verified Codex manager" in contract["callback"]["codex"]
     assert "audit provenance" in contract["callback"]["codex"]
     assert "optional explicit claim" in contract["operating_contract"]["task_state_machine"]["claim"]

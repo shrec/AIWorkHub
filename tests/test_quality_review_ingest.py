@@ -96,6 +96,144 @@ def test_retry_with_normalized_explicit_report_is_logical_dedup():
     assert result.deduplicated is True
 
 
+def _strip_to_severity(report):
+    return {
+        "lens": report["lens"],
+        "findings": [{"severity": finding["severity"]} for finding in report["findings"]],
+    }
+
+
+def test_an_explicit_receipt_is_renormalized_before_it_is_called_a_conflict():
+    """The ledger receipt and the provider final are two shapes of one judgment.
+
+    The explicit copy is the receipt producer's shape and the final is the
+    supervisor's; they differ in which optional keys they carry even when the
+    findings are identical.  Comparing them raw refused the pair as
+    ``explicit_submission_conflict`` -- an unrepairable category that threw the
+    whole review away.  A genuinely different judgment must still conflict.
+    """
+    final = {"lens": "correctness", "findings": [{"severity": "low"}]}
+    explicit = {"lens": "correctness", "findings": [{"severity": "low", "actionable": False}]}
+    events = [json.dumps({"type": "result", "result": json.dumps(final)})]
+
+    result = ingest.ingest_structured_final(
+        list(events), expected_lens="correctness",
+        explicit_report=explicit, normalize=_strip_to_severity,
+    )
+
+    assert result.status == "deduplicated"
+    assert result.report == _strip_to_severity(final)
+    with pytest.raises(ingest.ReviewProtocolError, match="explicit_submission_conflict"):
+        ingest.ingest_structured_final(
+            list(events), expected_lens="correctness",
+            explicit_report={"lens": "correctness", "findings": [{"severity": "high"}]},
+            normalize=_strip_to_severity,
+        )
+
+
+def test_the_explicit_copy_is_compared_through_its_own_normalizer():
+    """``normalize_explicit`` keeps the audit naming only the FINAL's repairs.
+
+    The supervisor's ``normalize`` records every per-finding coercion on the
+    audit receipt; running the explicit receipt through it would write the
+    explicit copy's repairs onto the provider final's record.
+    """
+    final = {"lens": "correctness", "findings": [{"severity": "low"}]}
+    explicit = {"lens": "correctness", "findings": [{"severity": "low", "actionable": False}]}
+    order: list[str] = []
+
+    def normalize(report):
+        order.append("final")
+        return _strip_to_severity(report)
+
+    def normalize_explicit(report):
+        order.append("explicit")
+        return _strip_to_severity(report)
+
+    result = ingest.ingest_structured_final(
+        [json.dumps({"type": "result", "result": json.dumps(final)})],
+        expected_lens="correctness", explicit_report=explicit,
+        normalize=normalize, normalize_explicit=normalize_explicit,
+    )
+
+    assert result.status == "deduplicated"
+    assert order == ["final", "explicit"]
+
+
+def _host_tool_use_event(findings, *, name: str = "ReportFindings") -> str:
+    """One claude stream-json assistant turn that filed findings through a host tool."""
+    return json.dumps({
+        "type": "assistant",
+        "message": {
+            "content": [
+                {"type": "text", "text": "Filing the findings."},
+                {"type": "tool_use", "name": name, "input": {"findings": findings}},
+            ]
+        },
+    })
+
+
+def test_the_host_report_findings_call_is_read_when_nothing_was_typed():
+    """9 of 242 claude reviewer runs filed ONLY through the host's own
+    ``ReportFindings`` tool and were recorded as ``missing_final`` -- complete
+    reviews thrown away over a transport the supervisor never read."""
+    findings = [{"severity": "medium", "summary": "s", "evidence": "src/m.py:3"}]
+
+    result = ingest.extract_structured_final(
+        [_host_tool_use_event(findings)], expected_lens="security",
+    )
+
+    assert result.status == "structured_tool_use"
+    assert result.report == {"lens": "security", "findings": findings}
+
+
+def test_the_host_call_report_goes_through_the_normal_normalize_and_submit_path():
+    findings = [{"severity": "medium", "extra": "dropped"}]
+    submitted: list[dict] = []
+
+    result = ingest.ingest_structured_final(
+        [_host_tool_use_event(findings)], expected_lens="security",
+        submit=submitted.append, normalize=_strip_to_severity,
+    )
+
+    assert result.submitted is True
+    assert submitted == [{"lens": "security", "findings": [{"severity": "medium"}]}]
+
+
+def test_a_typed_final_wins_over_the_host_call_and_is_not_a_second_report():
+    """66 of the 73 runs that used the host tool ALSO typed the final JSON.
+    The typed final is authoritative and the pair is never two reports."""
+    typed = {"lens": "correctness", "findings": []}
+    events = [
+        _host_tool_use_event([{"severity": "low", "summary": "filed"}]),
+        json.dumps({"type": "result", "result": json.dumps(typed)}),
+    ]
+
+    result = ingest.extract_structured_final(events, expected_lens="correctness")
+
+    assert result.status == "structured_final"
+    assert result.report == typed
+
+
+def test_only_the_last_allowlisted_host_call_carrying_findings_counts():
+    last = [{"severity": "high", "summary": "last"}]
+    events = [
+        _host_tool_use_event([{"severity": "low", "summary": "first"}]),
+        json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "ReportFindings", "input": {"note": "no findings"}},
+        ]}}),
+        _host_tool_use_event(last),
+    ]
+
+    result = ingest.extract_structured_final(events, expected_lens="code_quality")
+
+    assert result.report == {"lens": "code_quality", "findings": last}
+    # An ordinary tool call is not a report channel, whatever its input holds.
+    assert ingest.extract_structured_final(
+        [_host_tool_use_event(last, name="Read")], expected_lens="code_quality",
+    ).status == "missing_final"
+
+
 def test_review_finding_aliases_are_copied_and_evidence_is_preserved():
     original = {
         "lens": "correctness",

@@ -760,3 +760,438 @@ def build_completion_inbox(
             "writes_allowed_env": core.writes_allowed(),
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# ONE bounded review packet (audit 2026-09-08, problem 5).
+#
+# The evidence a manager needs to decide a ``review_ready`` candidate is
+# already persisted -- validation rows with their declared commands and output
+# tails, the quality gate's checks and blockers, the worker MCP gate and its
+# receipt-conformance verdict, required outputs, destructive-diff checks, the
+# effective tier and its per-lens status, the reviewer findings, the
+# reachability observation -- and it is spread across six nested objects on one
+# card. Reading it by hand was the manager's own discovery cost: measured over
+# the 2026-09-08 worker audit, discovery was 39% of every byte a worker read
+# and reviewer lenses spent 85% of theirs re-acquiring what the server already
+# held.
+#
+# This assembles that into ONE object, bounded, from persisted data only. It
+# reads nothing live, launches nothing, and decides nothing: every verdict here
+# was already recorded by the gate that produced it. What it adds is that they
+# arrive together and under a size bound.
+# ---------------------------------------------------------------------------
+
+REVIEW_PACKET_SCHEMA_ID = "aiworkhub.review_packet.v1"
+
+# The size bound, and it is enforced by MEASUREMENT, not by hope: the packet is
+# encoded, and while it exceeds this the sections below are dropped in the
+# declared order and named in ``truncation``. 90 KB is the target the audit
+# set; the encoder never returns more.
+REVIEW_PACKET_MAX_BYTES = 90_000
+
+# Per-field caps applied before the whole-packet bound, so a single pathological
+# field cannot consume the budget and force every other section out.
+_PACKET_TAIL_CHARS = 2_000
+_PACKET_TEXT_CHARS = 600
+_PACKET_MAX_ROWS = 60
+
+# Dropped in this order while the encoded packet exceeds the bound. Least
+# decisive first: an output tail can be re-read from the artifact bundle, a
+# blocker cannot be re-derived from anything the manager has open.
+_PACKET_DROP_ORDER = (
+    "validation_output_tails",
+    "gate_checks_passed",
+    "reviewer_observations",
+    "changed_paths",
+    "validation",
+    "gate_checks",
+    "reviewer_findings",
+)
+
+
+def _packet_text(value: Any, limit: int = _PACKET_TEXT_CHARS) -> str:
+    return str(value or "")[:limit]
+
+
+def _packet_rows(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [row for row in value[:_PACKET_MAX_ROWS] if isinstance(row, dict)]
+
+
+def _packet_validation_rows(evidence: dict[str, Any]) -> list[dict[str, Any]]:
+    """Validation rows as declared/executed pairs with bounded tails."""
+    rows = []
+    for row in _packet_rows(evidence.get("validation")):
+        returncode = row.get("returncode")
+        rows.append(
+            {
+                "declared_command": _packet_text(
+                    row.get("declared_command") or row.get("command")
+                ),
+                "executed_command": _packet_text(
+                    row.get("executed_command")
+                    or " ".join(str(v) for v in (row.get("executed_argv") or []))
+                ),
+                "returncode": returncode if isinstance(returncode, int) else None,
+                "behavioral_role": _packet_text(row.get("behavioral_role"), 80),
+                "duration_seconds": row.get("duration_seconds"),
+                "stdout_tail": _packet_text(row.get("stdout_tail"), _PACKET_TAIL_CHARS),
+                "stderr_tail": _packet_text(row.get("stderr_tail"), _PACKET_TAIL_CHARS),
+                "truncated": bool(
+                    row.get("stdout_truncated") or row.get("stderr_truncated")
+                ),
+            }
+        )
+    return rows
+
+
+def _packet_gate_checks(gate: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        {
+            "check_id": _packet_text(row.get("check_id"), 200),
+            "kind": _packet_text(row.get("kind"), 60),
+            "status": _packet_text(row.get("status"), 40),
+            "command": _packet_text(row.get("command"), 300),
+            "summary": _packet_text(row.get("summary")),
+            "error": _packet_text(row.get("error")),
+        }
+        for row in _packet_rows(gate.get("checks"))
+    ]
+
+
+def _packet_worker_mcp_gate(evidence: dict[str, Any]) -> dict[str, Any]:
+    """The MCP gate verdict plus the receipt-conformance blockers under it.
+
+    ``receipt_conformance`` is not a top-level evidence key -- it is nested at
+    ``worker_mcp_gate.verification.receipt_conformance``, which is why a
+    manager reading the card by hand keeps missing it. It is a green card's
+    most common late refusal.
+    """
+    gate = evidence.get("worker_mcp_gate")
+    if not isinstance(gate, dict):
+        return {"present": False, "gated": None, "satisfied": None, "blockers": []}
+    verification = gate.get("verification")
+    conformance = (
+        verification.get("receipt_conformance") if isinstance(verification, dict) else None
+    )
+    conformance = conformance if isinstance(conformance, dict) else {}
+    return {
+        "present": True,
+        "gated": bool(gate.get("gated")),
+        "satisfied": gate.get("satisfied"),
+        "reason": _packet_text(gate.get("reason")),
+        "missing_tools": [
+            _packet_text(v, 120) for v in (gate.get("missing_tools") or [])[:20]
+        ],
+        "stale_tools": [
+            _packet_text(v, 120) for v in (gate.get("stale_tools") or [])[:20]
+        ],
+        "receipt_conformance_status": _packet_text(conformance.get("status"), 60),
+        "receipt_conformance_blocking": bool(conformance.get("blocking")),
+        "blockers": [
+            _packet_text(v, 200) for v in (conformance.get("blockers") or [])[:20]
+        ],
+    }
+
+
+def _packet_finding_key(lens: str, finding: dict[str, Any]) -> tuple[str, str, str]:
+    """Dedupe key: (path, line, check_id), as the audit specified.
+
+    Reviewer findings carry their location inside ``evidence`` prose rather
+    than in structured fields, so the first ``path:line`` in that text is the
+    location and the finding id is the check identity. Findings that name no
+    location fall back to their own id, which cannot collide across lenses
+    because the lens is part of the key.
+    """
+    text = str(finding.get("evidence") or "")
+    match = re.search(r"([\w./\\-]+\.[A-Za-z0-9_]+):(\d+)", text)
+    path = match.group(1) if match else ""
+    line = match.group(2) if match else ""
+    return (path, line, f"{lens}:{str(finding.get('id') or '')}" if not path else str(finding.get("id") or ""))
+
+
+def _packet_reviewer_sections(
+    reviewer_reports: Any,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int]:
+    """Deduped actionable findings, deduped observations, and the duplicate count."""
+    findings: dict[tuple[str, str, str], dict[str, Any]] = {}
+    observations: dict[tuple[str, str, str], dict[str, Any]] = {}
+    duplicates = 0
+    for report in reviewer_reports if isinstance(reviewer_reports, list) else []:
+        if not isinstance(report, dict):
+            continue
+        lens = _packet_text(report.get("lens"), 40)
+        for finding in report.get("findings") or []:
+            if not isinstance(finding, dict):
+                continue
+            key = _packet_finding_key(lens, finding)
+            bucket = (
+                findings
+                if finding.get("disposition") == "defect"
+                else observations
+            )
+            if key in bucket:
+                duplicates += 1
+                if lens not in bucket[key]["lenses"]:
+                    bucket[key]["lenses"].append(lens)
+                continue
+            bucket[key] = {
+                "id": _packet_text(finding.get("id"), 200),
+                "lenses": [lens],
+                "severity": _packet_text(finding.get("severity"), 30),
+                "disposition": _packet_text(finding.get("disposition"), 40),
+                "category": _packet_text(finding.get("category"), 60),
+                "path": key[0],
+                "line": key[1],
+                "summary": _packet_text(finding.get("summary")),
+                "evidence": _packet_text(finding.get("evidence")),
+            }
+    return (
+        list(findings.values())[:_PACKET_MAX_ROWS],
+        list(observations.values())[:_PACKET_MAX_ROWS],
+        duplicates,
+    )
+
+
+def _packet_encoded_bytes(packet: dict[str, Any]) -> int:
+    return len(
+        json.dumps(packet, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    )
+
+
+def _packet_drop(packet: dict[str, Any], section: str) -> bool:
+    """Apply one declared drop. Returns whether anything was actually removed."""
+    if section == "validation_output_tails":
+        rows = packet.get("gates", {}).get("validation") or []
+        dropped = False
+        for row in rows:
+            if row.get("stdout_tail") or row.get("stderr_tail"):
+                dropped = True
+            row["stdout_tail"] = ""
+            row["stderr_tail"] = ""
+            row["tails_dropped"] = True
+        return dropped
+    if section == "gate_checks_passed":
+        gates = packet.get("gates", {})
+        rows = gates.get("quality_gate_checks") or []
+        kept = [row for row in rows if row.get("status") != "passed"]
+        gates["quality_gate_checks"] = kept
+        return len(kept) != len(rows)
+    if section == "reviewer_observations":
+        review = packet.get("review", {})
+        had = bool(review.get("observations"))
+        review["observations"] = []
+        return had
+    if section == "changed_paths":
+        diff = packet.get("diff", {})
+        had = bool(diff.get("changed_paths"))
+        diff["changed_paths"] = []
+        return had
+    if section == "validation":
+        gates = packet.get("gates", {})
+        had = bool(gates.get("validation"))
+        gates["validation"] = []
+        return had
+    if section == "gate_checks":
+        gates = packet.get("gates", {})
+        had = bool(gates.get("quality_gate_checks"))
+        gates["quality_gate_checks"] = []
+        return had
+    if section == "reviewer_findings":
+        review = packet.get("review", {})
+        had = bool(review.get("findings"))
+        review["findings"] = []
+        return had
+    return False
+
+
+def review_packet(
+    request_id: str,
+    *,
+    card: dict[str, Any] | None = None,
+    task_id: str = "",
+    show_fn: Any = None,
+    accept_preview: dict[str, Any] | None = None,
+    reviewer_reports: Any = None,
+    max_bytes: int = REVIEW_PACKET_MAX_BYTES,
+) -> dict[str, Any]:
+    """One bounded review packet for a ``review_ready`` request, from the card.
+
+    Read-only and total. ``card`` may be supplied directly; otherwise it is
+    fetched with ``show_fn`` (default :func:`core.show_task`), the same
+    read-only path every other facet in this module uses. ``accept_preview`` is
+    the fold from
+    :func:`process_launcher_accept_review.accept_preview` -- passed in rather
+    than called, because that fold needs a live ProcessManager and this module
+    holds no launch authority.
+
+    Nothing here is a verdict. Every status in the packet was decided by the
+    gate that recorded it; assembling them cannot change one, and a manager
+    still accepts through ``accept_review``, which re-runs the whole fold.
+    """
+    packet: dict[str, Any] = {
+        "schema_id": REVIEW_PACKET_SCHEMA_ID,
+        "request_id": str(request_id),
+        "task_id": str(task_id),
+        "ok": True,
+        "readonly": READONLY,
+    }
+    if card is None:
+        if not task_id:
+            return {**packet, "ok": False, "error": "task_id_required_without_card"}
+        fetched, read_error = _show_one_card(show_fn or core.show_task, task_id)
+        if fetched is None:
+            return {**packet, "ok": False, "error": "card_unreadable",
+                    "read_error": read_error}
+        card = fetched
+    terminal = card.get("terminal_review")
+    terminal = terminal if isinstance(terminal, dict) else {}
+    evidence = terminal.get("evidence")
+    evidence = evidence if isinstance(evidence, dict) else {}
+    gate = evidence.get("quality_gate")
+    gate = gate if isinstance(gate, dict) else {}
+    verdict = gate.get("quality_verdict")
+    verdict = verdict if isinstance(verdict, dict) else {}
+    # The finalizer's own observation first, the accept-time profile second:
+    # they are the same computation at two moments, and where both exist the
+    # review-ready one is what this candidate was actually planned against.
+    profile = gate.get("review_risk_profile")
+    if not isinstance(profile, dict) or profile.get("error"):
+        profile = gate.get("risk_profile")
+    profile = profile if isinstance(profile, dict) else {}
+    identity = evidence.get("request_identity")
+    identity = identity if isinstance(identity, dict) else {}
+    changed_paths = [
+        _packet_text(value, 300) for value in (evidence.get("changed_paths") or [])
+    ][:200]
+    hashes = evidence.get("changed_path_hashes")
+    hashes = hashes if isinstance(hashes, dict) else {}
+    if reviewer_reports is None:
+        reviewer_reports = verdict.get("reviewer_reports")
+    findings, observations, duplicate_count = _packet_reviewer_sections(reviewer_reports)
+    preview = accept_preview if isinstance(accept_preview, dict) else {}
+    packet.update(
+        {
+            "task_id": str(task_id or identity.get("task_id") or card.get("task_id") or ""),
+            "identity": {
+                "request_id": _packet_text(identity.get("request_id") or request_id, 100),
+                "task_id": _packet_text(identity.get("task_id") or card.get("task_id"), 300),
+                "runner": _packet_text(identity.get("runner") or card.get("runner"), 120),
+                "topic": _packet_text(identity.get("topic") or card.get("topic"), 120),
+                "claim_epoch": _packet_text(card.get("claim_epoch"), 40),
+                "adapter_id": _packet_text(evidence.get("adapter_id"), 120),
+                "model": _packet_text(evidence.get("model"), 120),
+            },
+            "status": {
+                "canonical_status": _packet_text(card.get("status"), 40),
+                "terminal_substatus": _packet_text(terminal.get("substatus"), 60),
+                "error": _packet_text(evidence.get("error")),
+            },
+            "risk": {
+                "effective_tier": _packet_text(profile.get("effective_tier"), 20),
+                "requested_tier": _packet_text(profile.get("requested_tier"), 20),
+                "signals": [_packet_text(v, 60) for v in (profile.get("signals") or [])][:30],
+                "required_reviewer_lenses": [
+                    _packet_text(v, 40)
+                    for v in (profile.get("required_reviewer_lenses") or [])
+                ][:10],
+                "card_declared_risk_tier": _packet_text(card.get("risk_tier"), 20),
+                "source": (
+                    "review_ready_observation"
+                    if isinstance(gate.get("review_risk_profile"), dict)
+                    else "accept_time_profile" if gate.get("risk_profile") else "absent"
+                ),
+            },
+            "gates": {
+                "quality_gate_passed": gate.get("passed"),
+                "quality_gate_blockers": [
+                    _packet_text(v, 200) for v in (gate.get("blocking_checks") or [])
+                ][:40],
+                "quality_gate_config_error": _packet_text(gate.get("config_error")),
+                "quality_gate_checks": _packet_gate_checks(gate),
+                "validation": _packet_validation_rows(evidence),
+                "worker_mcp_gate": _packet_worker_mcp_gate(evidence),
+                "required_outputs": [
+                    {
+                        "path": _packet_text(row.get("path"), 300),
+                        "pattern": _packet_text(row.get("pattern"), 300),
+                        "bytes": row.get("bytes"),
+                        "unchanged_allowed": bool(row.get("unchanged_allowed")),
+                    }
+                    for row in _packet_rows(evidence.get("required_outputs"))
+                ],
+                "destructive_diff_checks": [
+                    {
+                        "check_id": _packet_text(row.get("check_id"), 200),
+                        "status": _packet_text(row.get("status"), 40),
+                        "summary": _packet_text(row.get("summary")),
+                    }
+                    for row in _packet_rows(
+                        gate.get("review_ready_destructive_diff_checks")
+                        or evidence.get("destructive_diff_checks")
+                    )
+                ],
+                "behavioral_gate": gate.get("behavioral_gate"),
+            },
+            "review": {
+                "lenses": [
+                    {
+                        "lens": _packet_text(row.get("lens"), 40),
+                        "status": _packet_text(row.get("status"), 60),
+                        "finding_count": len(row.get("finding_ids") or []),
+                        "observation_count": len(row.get("observation_ids") or []),
+                        "independence_rung": _packet_text(row.get("independence_rung"), 60),
+                    }
+                    for row in _packet_rows(verdict.get("lenses"))
+                ],
+                "findings": findings,
+                "observations": observations,
+                "duplicate_findings_collapsed": duplicate_count,
+                "refine_required": verdict.get("refine_required"),
+            },
+            "diff": {
+                "changed_path_count": len(evidence.get("changed_paths") or []),
+                "hashed_path_count": len(hashes),
+                "required_output_count": len(evidence.get("required_outputs") or []),
+                "changed_paths": changed_paths,
+            },
+            "reachability": gate.get("reachability")
+            if isinstance(gate.get("reachability"), dict)
+            else {"evaluated": False, "reason": "not_recorded_on_this_card"},
+            "accept_preview": {
+                "evaluated": bool(preview.get("evaluated")),
+                "blocked": preview.get("blocked"),
+                "blockers": [
+                    {
+                        "kind": _packet_text(row.get("kind"), 80),
+                        "error": _packet_text(row.get("error"), 400),
+                    }
+                    for row in _packet_rows(preview.get("blockers"))
+                ],
+                "reviewer_request_ids": [
+                    _packet_text(v, 100)
+                    for v in (preview.get("reviewer_request_ids") or [])
+                ][:20],
+                "reviewer_request_id_source": _packet_text(
+                    preview.get("reviewer_request_id_source"), 60
+                ),
+            },
+            "truncation": {"dropped_sections": [], "max_bytes": int(max_bytes)},
+            "mutation": {
+                "queue_mutated": False,
+                "write_gate_bypassed": False,
+                "write_command_invoked": False,
+                "agent_or_process_launched": False,
+            },
+        }
+    )
+    for section in _PACKET_DROP_ORDER:
+        if _packet_encoded_bytes(packet) <= int(max_bytes):
+            break
+        if _packet_drop(packet, section):
+            packet["truncation"]["dropped_sections"].append(section)
+    packet["encoded_bytes"] = _packet_encoded_bytes(packet)
+    packet["truncation"]["within_bound"] = packet["encoded_bytes"] <= int(max_bytes)
+    return packet

@@ -3464,7 +3464,21 @@ def _looks_like_identifier_query(term: str) -> bool:
 _IDENTIFIER_AND_TOKEN_LIMIT = 5
 
 
-def find(conn: sqlite3.Connection, term: str, *, limit: int = 24) -> list[dict[str, Any]]:
+def find(
+    conn: sqlite3.Connection,
+    term: str,
+    *,
+    limit: int = 24,
+    retrieval: str = "ranked",
+) -> list[dict[str, Any]]:
+    """Ranked symbol lookup: phrase -> AND -> (OR) -> LIKE.
+
+    ``retrieval="or_terms"`` is the server-side zero-hit fallback step: it
+    skips the phrase and AND passes that already missed and runs the any-token
+    OR expression directly (then the LIKE pass), so a wrapper can broaden a
+    miss in the same turn instead of asking the model to retype the query.
+    """
+
     term = (term or "").strip()
     if not term:
         return []
@@ -3478,11 +3492,14 @@ def find(conn: sqlite3.Connection, term: str, *, limit: int = 24) -> list[dict[s
         return _sgp.composed_find(conn, term, limit=limit)
     rows = []
     tokens = _query_tokens(term)
-    expressions = [_fts_phrase(term)]
-    if len(tokens) > 1:
-        expressions.append(_fts_terms(term, operator="AND"))
-        if not _looks_like_identifier_query(term) or len(tokens) > _IDENTIFIER_AND_TOKEN_LIMIT:
-            expressions.append(_fts_terms(term, operator="OR"))
+    if retrieval == "or_terms":
+        expressions = [_fts_terms(term, operator="OR") if len(tokens) > 1 else _fts_phrase(term)]
+    else:
+        expressions = [_fts_phrase(term)]
+        if len(tokens) > 1:
+            expressions.append(_fts_terms(term, operator="AND"))
+            if not _looks_like_identifier_query(term) or len(tokens) > _IDENTIFIER_AND_TOKEN_LIMIT:
+                expressions.append(_fts_terms(term, operator="OR"))
     for expression in expressions:
         try:
             rows = conn.execute(
@@ -3651,6 +3668,9 @@ def _bodygrep_bytes_proves_no_match(needle: str, raw: bytes) -> bool:
     return re.search(re.escape(needle.encode("ascii")), raw, re.IGNORECASE) is None
 
 
+BODYGREP_MATCH_KINDS: tuple[str, ...] = ("literal", "token_and_line", "token_and_file")
+
+
 def bodygrep_query(
     repo_root: Path,
     term: str,
@@ -3658,6 +3678,7 @@ def bodygrep_query(
     *,
     target: str | None = None,
     cursor: str | None = None,
+    match_kind: str = "literal",
 ) -> dict[str, Any]:
     """Search literal/body text only inside canonical indexed source files.
 
@@ -3665,9 +3686,17 @@ def bodygrep_query(
     mode closes that deliberate storage gap without shelling out to grep or
     silently scanning ignored/unindexed paths.  It reports scan limits so a
     zero hit remains truthful rather than looking like full-repository proof.
+
+    ``match_kind`` is the server-side fallback for whitespace phrases that do
+    not occur verbatim (source_graph-5): ``token_and_line`` matches a line
+    holding every query token, ``token_and_file`` a file holding every token
+    (rows are the lines holding at least one).  Both are labelled on every row
+    and on the payload so they can never be mistaken for literal evidence.
     """
 
     term = (term or "").strip()
+    if match_kind not in BODYGREP_MATCH_KINDS:
+        raise SourceGraphError(f"bodygrep_match_kind_invalid:{match_kind}")
     if not term:
         return {
             "mode": "bodygrep", "query": term, "budget": 0, "matches": [],
@@ -3676,6 +3705,12 @@ def bodygrep_query(
             "truncated": False,
         }
     budget = max(1, min(int(budget), MAX_BUDGET_ROWS))
+    tokens = _query_tokens(term) if match_kind != "literal" else []
+    if match_kind != "literal" and not tokens:
+        raise SourceGraphError("bodygrep_token_query_empty")
+    # A token-mode cursor is bound to the kind as well as the term, so a page
+    # minted by one kind can never resume a scan of another.
+    cursor_term = term if match_kind == "literal" else f"{match_kind}:{term}"
     byte_cap = max(512, budget * 512)
     scan_file_cap = max(64, min(4000, budget * 32))
     scan_byte_cap = max(1_048_576, min(32 * 1_048_576, budget * 262_144))
@@ -3697,7 +3732,7 @@ def bodygrep_query(
     # ending forever at the first byte-cap or file-cap overrun. The cursor is
     # bound to this exact (term, target, budget) tuple.
     resume = _decode_bodygrep_cursor(
-        cursor, term=term, target=normalized_target, budget=budget,
+        cursor, term=cursor_term, target=normalized_target, budget=budget,
     )
     resume_file = resume[0] if resume else None
     resume_line = resume[1] if resume else 0
@@ -3745,6 +3780,10 @@ def bodygrep_query(
     paths = paths[:scan_file_cap]
     repo_root = repo_root.resolve()
     needle = term.casefold()
+    if match_kind != "literal":
+        # Pre-decode filter for the token kinds: a file that lacks the longest
+        # token cannot hold every token, so the byte-level rejection stays sound.
+        needle = max(tokens, key=len)
     matches: list[dict[str, Any]] = []
     files_scanned = 0
     bytes_scanned = 0
@@ -3821,12 +3860,9 @@ def bodygrep_query(
         # Skip lines already returned on a prior page for the resume file.
         start_after = resume_line if file_path == resume_file else 0
         hit_budget = False
-        for line_number, line in enumerate(_iter_splitlines(text), start=1):
-            if line_number <= start_after:
-                continue
-            if needle not in line.casefold():
-                continue
-            matches.append({
+
+        def match_row(line_number: int, line: str) -> dict[str, Any]:
+            row = {
                 "file_path": file_path,
                 "kind": "body_match",
                 "name": term,
@@ -3836,7 +3872,34 @@ def bodygrep_query(
                 "signature": line.strip()[:320],
                 "evidence_label": "EXTRACTED",
                 "confidence": 1.0,
-            })
+            }
+            if match_kind != "literal":
+                row["match_kind"] = match_kind
+            return row
+
+        # token_and_file holds candidate rows (lines with at least one token)
+        # until the whole file has proven it holds every token.
+        held_rows: list[dict[str, Any]] = []
+        seen_tokens: set[str] = set()
+        for line_number, line in enumerate(_iter_splitlines(text), start=1):
+            if line_number <= start_after:
+                continue
+            folded = line.casefold()
+            if match_kind == "literal":
+                if needle not in folded:
+                    continue
+            elif match_kind == "token_and_line":
+                if not all(token in folded for token in tokens):
+                    continue
+            else:
+                present = [token for token in tokens if token in folded]
+                if not present:
+                    continue
+                seen_tokens.update(present)
+                if len(held_rows) < budget:
+                    held_rows.append(match_row(line_number, line))
+                continue
+            matches.append(match_row(line_number, line))
             if len(matches) >= budget:
                 scan_truncated = True
                 hit_budget = True
@@ -3844,9 +3907,23 @@ def bodygrep_query(
                 # remaining matches here are not skipped and not duplicated.
                 next_cursor = _encode_bodygrep_cursor(
                     file_path, line_number,
-                    term=term, target=normalized_target, budget=budget,
+                    term=cursor_term, target=normalized_target, budget=budget,
                 )
                 break
+        if match_kind == "token_and_file" and seen_tokens >= set(tokens):
+            for row in held_rows:
+                matches.append(row)
+                if len(matches) >= budget:
+                    scan_truncated = True
+                    hit_budget = True
+                    # A file-level proof cannot resume mid-file (the token set
+                    # would restart), so the page resumes at the next file and
+                    # the remaining rows of this one are declared truncated.
+                    next_cursor = _encode_bodygrep_cursor(
+                        file_path, _BODYGREP_SKIP_ALL_LINES,
+                        term=cursor_term, target=normalized_target, budget=budget,
+                    )
+                    break
         # End the decoded string's lifetime before the next candidate is read:
         # a matching file's full text must not stay live alongside the next
         # candidate's raw bytes (and, once decoded, its text).
@@ -3859,7 +3936,7 @@ def bodygrep_query(
         # reaches the files the cap cut off.
         next_cursor = _encode_bodygrep_cursor(
             last_scanned_file, _BODYGREP_SKIP_ALL_LINES,
-            term=term, target=normalized_target, budget=budget,
+            term=cursor_term, target=normalized_target, budget=budget,
         )
     rows, output_truncated = _bounded_rows(matches, budget, byte_cap)
     payload = {
@@ -3880,6 +3957,9 @@ def bodygrep_query(
         "next_cursor": next_cursor,
         "truncated": bool(output_truncated or scan_truncated or next_cursor is not None),
     }
+    if match_kind != "literal":
+        payload["match_kind"] = match_kind
+        payload["query_tokens"] = list(tokens)
     return _fit_payload_bytes(payload, byte_cap)
 
 
@@ -4349,72 +4429,202 @@ def _bounded_rows(rows: list[dict[str, Any]], row_cap: int, byte_cap: int) -> tu
     return rows, truncated
 
 
-def _fit_payload_bytes(payload: dict[str, Any], byte_cap: int) -> dict[str, Any]:
-    """Deterministically trim nested optional evidence to the public byte cap."""
+# Keys a fitted payload never loses: the query receipt, scope provenance,
+# truncation/scan truth and paging state.  A trimmed reply must still say what
+# was asked, where, and that it was trimmed.
+_FIT_PROTECTED_KEYS: frozenset[str] = frozenset({
+    "mode", "query", "budget", "target", "query_tokens", "query_tokens_source",
+    "candidate_files", "truncated", "coverage", "cursor", "next_cursor",
+    "freshness", "scope", "requested_target", "retrieval_reason",
+    "retrieval_expression", "match_kind", "fit_dropped", "bundle_type",
+    "files_scanned", "bytes_scanned", "scan_truncated", "scan_file_cap",
+    "scan_byte_cap", "oversized_files_skipped", "refresh", "refreshed_files",
+})
+# Explicit fit priority (source_graph-1).  Sections that restate or decorate
+# the primary rows are dropped WHOLE, least valuable first, before a single
+# primary row is touched; ``git_signals`` goes first, ``related_tests`` is the
+# last secondary list halved, and ``matches`` (rows with their line ranges)
+# are halved only when nothing else is left.
+_FIT_DROP_ORDER: tuple[str, ...] = (
+    "git_signals", "todos", "risks", "hot_symbols", "ranked_symbols",
+    "recommended_next_steps", "task_evidence", "insights", "entry_symbols",
+    "oversized_files",
+)
+_FIT_SECONDARY_LISTS: tuple[str, ...] = (
+    "neighbors", "cross_file_edges", "call_edges", "edges", "entities",
+    "dependency_edges", "impacted_files", "outgoing_calls", "incoming_calls",
+    "related_tests",
+)
+_FIT_PRIMARY_LISTS: tuple[str, ...] = (
+    "matches", "sections", "contexts", "rows", "symbols", "results", "items",
+)
+# Per-row metric decorations (folded from the old ranked_symbols) that are
+# stripped from primary rows before any primary row is dropped: a row without
+# its priority score is still a usable line range; a dropped row is not.
+_FIT_ROW_DECORATIONS: tuple[str, ...] = (
+    "metrics_evidence", "line_span", "loop_count", "branch_count",
+    "risk_reasons", "outgoing_calls", "incoming_calls", "priority_score",
+)
 
-    protected_keys = {
-        "mode",
-        "query",
-        "budget",
-        "target",
-        "query_tokens",
-        "query_tokens_source",
-        "candidate_files",
-        "truncated",
-        "coverage",
-        "cursor",
-        "next_cursor",
-        "freshness",
-    }
+
+def _fit_payload_bytes(payload: dict[str, Any], byte_cap: int) -> dict[str, Any]:
+    """Deterministically trim a payload to ``byte_cap`` in explicit priority.
+
+    Order: (1) whole restating sections in ``_FIT_DROP_ORDER``; (2) the
+    largest long string (a body/preview) halved; (3) secondary top-level lists
+    in ``_FIT_SECONDARY_LISTS`` order, halved (dropped when a single row is
+    left); (4) per-row metric decorations stripped from primary rows, once;
+    (5) the largest nested list inside primary rows, then the largest primary
+    list, halved; (6) any remaining unprotected field, largest first.  Every
+    loss sets ``truncated`` and names dropped sections in ``fit_dropped`` so a
+    reader knows what is missing rather than guessing.
+    """
 
     def encoded_size() -> int:
         return len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
 
+    def note_dropped(name: str) -> None:
+        dropped = payload.get("fit_dropped")
+        if not isinstance(dropped, list):
+            dropped = []
+            payload["fit_dropped"] = dropped
+        if name not in dropped:
+            dropped.append(name)
+        payload["truncated"] = True
+
+    # A key that restates the primary rows of a focus reply is the ANSWER of
+    # some other mode: hotspots/complexity/bottlenecks return their ranking in
+    # ``ranked_symbols``, coverage/testmap in ``related_tests``, todo in
+    # ``todos``, churn/ownership/summarize in ``files``, calls in
+    # ``outgoing_calls``/``incoming_calls``.  Dropping one of those whole would
+    # return an empty reply that still claims hits, so the mode's own entry in
+    # ``_ANALYTICS_RESULT_KEYS`` (the same registry paging and scope
+    # enforcement read) promotes it to a primary list here.  ``a.b`` result
+    # paths protect their top-level container.
+    mode = str(payload.get("mode") or "")
+    primary_keys = tuple(dict.fromkeys(
+        _FIT_PRIMARY_LISTS
+        + tuple(
+            key.split(".", 1)[0]
+            for key in _ANALYTICS_RESULT_KEYS.get(mode, ())
+        )
+    ))
+    drop_order = tuple(key for key in _FIT_DROP_ORDER if key not in primary_keys)
+    secondary_lists = tuple(
+        key for key in _FIT_SECONDARY_LISTS if key not in primary_keys
+    )
+
+    stripped_row_metrics = False
     while encoded_size() > byte_cap:
-        lists: list[tuple[int, list[Any]]] = []
+        # 1. restating sections, whole, least valuable first
+        section = next((key for key in drop_order if key in payload), None)
+        if section is not None:
+            del payload[section]
+            note_dropped(section)
+            continue
+
+        # 2. long strings anywhere (bodies, previews, signatures)
         strings: list[tuple[int, dict[str, Any], str]] = []
         removable: list[tuple[int, dict[str, Any], str]] = []
+        nested_lists: list[tuple[int, list[Any]]] = []
 
-        def visit(value: Any) -> None:
+        def visit(value: Any, *, top: bool) -> None:
             if isinstance(value, dict):
                 for key, item in value.items():
-                    if key in protected_keys:
+                    if key in _FIT_PROTECTED_KEYS:
                         continue
                     removable.append(
                         (len(json.dumps(item, ensure_ascii=False)), value, key)
                     )
                     if isinstance(item, str) and len(item) > 256:
                         strings.append((len(item), value, key))
+                    elif isinstance(item, list):
+                        if item and not (top and key in primary_keys):
+                            nested_lists.append(
+                                (len(json.dumps(item, ensure_ascii=False)), item)
+                            )
+                        for child in item:
+                            visit(child, top=False)
                     else:
-                        visit(item)
+                        visit(item, top=False)
             elif isinstance(value, list):
-                if value:
-                    lists.append((len(json.dumps(value, ensure_ascii=False)), value))
-                for item in value:
-                    visit(item)
+                for child in value:
+                    visit(child, top=False)
 
-        visit(payload)
+        visit(payload, top=True)
         if strings:
             _, owner, key = max(strings, key=lambda item: item[0])
             text = str(owner[key])
             owner[key] = text[: max(256, len(text) // 2)]
             payload["truncated"] = True
             continue
-        if lists:
-            _, target = max(lists, key=lambda item: item[0])
+
+        # 3. secondary top-level lists, least valuable first
+        secondary = next(
+            (
+                key for key in secondary_lists
+                if isinstance(payload.get(key), list) and payload[key]
+            ),
+            None,
+        )
+        if secondary is not None:
+            rows = payload[secondary]
+            if len(rows) <= 1:
+                del payload[secondary]
+                note_dropped(secondary)
+            else:
+                del rows[len(rows) // 2:]
+                payload["truncated"] = True
+            continue
+
+        # 4. metric decorations on primary rows, once
+        if not stripped_row_metrics:
+            stripped_row_metrics = True
+            stripped = False
+            for key in primary_keys:
+                rows = payload.get(key)
+                if not isinstance(rows, list):
+                    continue
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
+                    for decoration in _FIT_ROW_DECORATIONS:
+                        if decoration in row:
+                            del row[decoration]
+                            stripped = True
+            if stripped:
+                note_dropped("row_metrics")
+                continue
+
+        # 5. nested lists inside primary rows, then the primary lists
+        if nested_lists:
+            _, target = max(nested_lists, key=lambda item: item[0])
             del target[len(target) // 2:]
             payload["truncated"] = True
             continue
+        primary = [
+            (len(json.dumps(payload[key], ensure_ascii=False)), payload[key])
+            for key in primary_keys
+            if isinstance(payload.get(key), list) and payload[key]
+        ]
+        if primary:
+            _, target = max(primary, key=lambda item: item[0])
+            del target[len(target) // 2:]
+            payload["truncated"] = True
+            continue
+
+        # 6. Nothing left is a compressible string or a shrinkable list --
+        # every remaining non-protected value is small fixed scaffolding.
+        # The byte cap is still a hard requirement, so drop whole fields,
+        # largest encoded size first, until the cap is met or only
+        # protected keys remain.
         if removable:
-            # Nothing left is a compressible string or a shrinkable list --
-            # every remaining non-protected value is small fixed scaffolding
-            # (short strings, already-empty lists, small nested dicts). The
-            # byte cap is still a hard requirement, so drop whole fields,
-            # largest encoded size first, until the cap is met or only
-            # protected keys remain.
             _, owner, key = max(removable, key=lambda item: item[0])
             del owner[key]
-            payload["truncated"] = True
+            if owner is payload:
+                note_dropped(key)
+            else:
+                payload["truncated"] = True
             continue
         break
     return payload
@@ -4531,6 +4741,8 @@ def _query_payload(
     budget: int,
     *,
     target: str | None = None,
+    retrieval: str = "ranked",
+    include: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     budget = max(1, min(int(budget), MAX_BUDGET_ROWS))
     byte_cap = max(512, budget * 512)
@@ -4538,7 +4750,7 @@ def _query_payload(
     conn = connect(db_path, read_only=True)
     try:
         lookup = str(target or query).strip()
-        matches = find(conn, lookup, limit=budget)
+        matches = find(conn, lookup, limit=budget, retrieval=retrieval)
         matches, truncated = _bounded_rows(matches, budget, byte_cap)
         files = _candidate_files(matches, limit=min(budget, 16))
         payload: dict[str, Any] = {
@@ -4549,9 +4761,14 @@ def _query_payload(
         if target:
             payload["target"] = target
             payload["query_tokens_source"] = "target"
+        if retrieval != "ranked":
+            payload["retrieval_expression"] = retrieval
         if mode == "focus" and matches:
+            # ``focus_insights`` returns the SAME matches with per-symbol
+            # metrics folded onto each row; the update replaces the list.
             payload.update(sginsights.focus_insights(
                 conn, repo_root, matches, budget=budget,
+                include_git="git" in include,
             ))
         elif mode == "slice" and matches:
             payload.update(sginsights.slice_insights(
@@ -4566,8 +4783,19 @@ def _query_payload(
         conn.close()
 
 
-def focus(repo_root: Path, query: str, budget: int = 64) -> dict[str, Any]:
-    return _query_payload(repo_root, "focus", query, budget)
+def focus(
+    repo_root: Path,
+    query: str,
+    budget: int = 64,
+    *,
+    retrieval: str = "ranked",
+    include: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    """Ranked focus.  ``include=("git",)`` opts into per-file git signals."""
+
+    return _query_payload(
+        repo_root, "focus", query, budget, retrieval=retrieval, include=include,
+    )
 
 
 def slice_(
@@ -4576,8 +4804,11 @@ def slice_(
     budget: int = 64,
     *,
     target: str | None = None,
+    retrieval: str = "ranked",
 ) -> dict[str, Any]:
-    return _query_payload(repo_root, "slice", query, budget, target=target)
+    return _query_payload(
+        repo_root, "slice", query, budget, target=target, retrieval=retrieval,
+    )
 
 
 def context_query(repo_root: Path, query: str, budget: int = 64) -> dict[str, Any]:
@@ -5329,6 +5560,18 @@ def bundle(repo_root: Path, bundle_type: str, query: str, max_lines: int = 64) -
         insights = sginsights.focus_insights(
             conn, repo_root, matches, budget=min(budget, 32),
         ) if matches else {}
+        if insights:
+            # A bundle already carries every matched file as a ``sections``
+            # context, so its insight block restates only the SCORED symbols
+            # -- exactly what ``ranked_symbols`` used to hold, in the same
+            # ``(-priority_score, qualname)`` order, now with the hot/risk
+            # projections folded onto the row.  Folding the whole match list
+            # here instead would ADD ~25% to the block (measured 12,852 ->
+            # 15,902 bytes on a 32-row query) rather than remove a duplicate.
+            insights["matches"] = sorted(
+                (row for row in insights["matches"] if "priority_score" in row),
+                key=lambda row: (-int(row["priority_score"]), str(row.get("qualname") or "")),
+            )
         task_evidence: dict[str, Any] = {}
         if matches and bundle_type in {"bugfix", "feature", "refactor"}:
             task_evidence = sginsights.slice_insights(

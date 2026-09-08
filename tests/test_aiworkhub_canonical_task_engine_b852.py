@@ -1085,8 +1085,17 @@ def test_manager_bootstrap_advertises_create_and_callback_contract(writable_repo
         },
     )
     monkeypatch.setattr(core, "_claude_manager_identity", lambda: None)
+    # Schema v2 delivers the contract prose to a verified session ONCE. The
+    # delivery map is process state, so this test states the precondition it
+    # has always relied on instead of inheriting whatever ran before it; and
+    # the hygiene sweep is scheduled off the request path, so it is pinned to a
+    # no-op rather than left running past teardown.
+    monkeypatch.setattr(core, "_CONTRACT_DELIVERIES", {})
+    monkeypatch.setattr(core, "_run_off_request_path", lambda target, *, name: None)
     result = core.manager_bootstrap()
     assert result["role"] == "manager"
+    assert result["schema_id"] == core.MANAGER_BOOTSTRAP_SCHEMA_ID
+    assert result["contract_delivered"] is True
     matrix = result["responsibility_matrix"]
     assert matrix["schema_id"] == "aiworkhub.manager_responsibility_matrix.v1"
     system = matrix["aiworkhub_system"]
@@ -1120,6 +1129,126 @@ def test_manager_bootstrap_advertises_create_and_callback_contract(writable_repo
     assert result["workflow"][0].startswith("aiworkhub_manager_source_graph_query")
     assert "aiworkhub_task_create" in result["workflow"]
     assert "aiworkhub_claude_callback_wait" in result["callback"]["claude"]
+
+
+def test_manager_bootstrap_splits_identity_from_contract_prose(writable_repo, monkeypatch):
+    """The v2 split is deliberate: identity every call, contract prose once.
+
+    Schema v1 repeated ~5.5 KB of static prose on every bootstrap and forced
+    two follow-up calls (repository_current, task_health) for the ~300 B that
+    actually changes. v2 keeps the prose byte-identical and keeps every v1 key
+    a caller reads; what it changes is WHICH replies carry the prose. This test
+    is the freeze on that split -- both halves of it.
+
+    The split belongs to the MCP bootstrap TOOL alone (``bootstrap_call=True``).
+    This same function is the route gate for every manager AI/recipe/skill
+    tool, the dashboard snapshot and the launcher's write-intent surfaces;
+    those share one session id and discard the prose, so if a gate call could
+    consume the delivery the model's own bootstrap would be suppressed by work
+    it never issued. The last block below freezes that: a gate call keeps the
+    v1 shape and leaves the ledger untouched.
+    """
+    monkeypatch.setattr(
+        core,
+        "_codex_manager_identity",
+        lambda: {
+            "provider": "codex",
+            "session_id": "b8a3d1c4-0000-4000-8000-00000000c0de",
+            "thread_id": "b8a3d1c4-0000-4000-8000-00000000c0de",
+        },
+    )
+    monkeypatch.setattr(core, "_claude_manager_identity", lambda: None)
+    monkeypatch.setattr(core, "_CONTRACT_DELIVERIES", {})
+    monkeypatch.setattr(core, "_run_off_request_path", lambda target, *, name: None)
+
+    contract_keys = ("responsibility_matrix", "operating_contract", "workflow", "callback", "rules")
+    # The identity block is on EVERY reply, contract or not. These are the keys
+    # existing callers gate on (manager_ai_tools, manager_recipe_tools,
+    # manager_skill_tools, learning_commit, the dashboard and the MCP wrapper
+    # all read role / manager_route / repo off a no-argument call).
+    identity_keys = (
+        "ok", "schema_id", "role", "provider", "repo", "repo_id", "storage_ready",
+        "binding_source", "manager_route", "server_version", "task_hygiene",
+        "dispatcher", "contract_sha256", "contract_version", "contract_delivered",
+    )
+
+    first = core.manager_bootstrap(bootstrap_call=True)
+    assert first["contract_delivered"] is True
+    assert all(key in first for key in identity_keys)
+    assert all(key in first for key in contract_keys)
+    # repository_current and task_health are folded in: no follow-up call.
+    current = core.repository_current()
+    assert first["repo_id"] == current["repo_id"]
+    assert first["binding_source"] == current["binding_source"]
+    assert first["manager_route"] == current["manager_route"]
+    assert first["task_health"]["writes_allowed"] is True
+
+    second = core.manager_bootstrap(bootstrap_call=True)
+    assert second["contract_delivered"] is False
+    assert second["contract_delivery_reason"] == "already_delivered_this_session"
+    assert all(key in second for key in identity_keys)
+    assert not any(key in second for key in contract_keys)
+    assert second["role"] == first["role"] == "manager"
+    assert second["repo"] == first["repo"]
+    assert second["contract_sha256"] == first["contract_sha256"]
+
+    # The prose is recoverable on demand, and byte-identical to the first one.
+    asked = core.manager_bootstrap(bootstrap_call=True, include_contract=True)
+    assert asked["contract_delivered"] is True
+    assert asked["contract_delivery_reason"] == "requested"
+    assert {key: asked[key] for key in contract_keys} == {key: first[key] for key in contract_keys}
+
+    # A caller that says it holds the current sha is suppressed; one that holds
+    # a different sha is re-delivered, so a contract change can never be missed.
+    monkeypatch.setattr(core, "_CONTRACT_DELIVERIES", {})
+    holding = core.manager_bootstrap(
+        bootstrap_call=True, known_contract_sha256=core.MANAGER_CONTRACT_SHA256
+    )
+    assert holding["contract_delivered"] is False
+    assert holding["contract_delivery_reason"] == "caller_holds_current_contract"
+    stale = core.manager_bootstrap(bootstrap_call=True, known_contract_sha256="0" * 64)
+    assert stale["contract_delivered"] is True
+    assert stale["contract_delivery_reason"] == "contract_sha_changed"
+
+    # A route-gate call (every internal caller) never consumes the session's
+    # delivery and never runs the dispatcher's database work: it keeps the v1
+    # reply exactly, so the model's own bootstrap still gets its one delivery.
+    deliveries: dict[str, str] = {}
+    monkeypatch.setattr(core, "_CONTRACT_DELIVERIES", deliveries)
+    for _ in range(3):
+        gate = core.manager_bootstrap()
+        assert gate["contract_delivered"] is True
+        assert gate["contract_delivery_reason"] == "route_gate_call"
+        assert gate["dispatcher"]["status"] == "not_evaluated"
+        assert all(key in gate for key in contract_keys)
+        assert gate["role"] == "manager"
+    assert deliveries == {}
+    after_gates = core.manager_bootstrap(bootstrap_call=True)
+    assert after_gates["contract_delivered"] is True
+    assert after_gates["contract_delivery_reason"] == "first_delivery_this_session"
+
+    # An unverified client has no session to remember, so it is never
+    # suppressed: its reply keeps the v1 shape exactly.
+    monkeypatch.setattr(core, "_codex_manager_identity", lambda: None)
+    monkeypatch.setattr(core, "_CONTRACT_DELIVERIES", {})
+    for _ in range(2):
+        unverified = core.manager_bootstrap(bootstrap_call=True)
+        assert unverified["role"] == "worker_or_unverified_client"
+        assert unverified["contract_delivered"] is True
+        assert unverified["contract_delivery_reason"] == "unverified_session"
+        assert all(key in unverified for key in contract_keys)
+
+
+def test_manager_bootstrap_contract_delivery_map_is_bounded(monkeypatch):
+    """One entry per session must never grow without limit on a long server."""
+    deliveries: dict[str, str] = {}
+    monkeypatch.setattr(core, "_CONTRACT_DELIVERIES", deliveries)
+    monkeypatch.setattr(core, "_CONTRACT_DELIVERY_LIMIT", 4)
+    for index in range(12):
+        core._remember_contract_delivery(f"session-{index}")
+    assert len(deliveries) == 4
+    assert list(deliveries) == [f"session-{index}" for index in range(8, 12)]
+    assert set(deliveries.values()) == {core.MANAGER_CONTRACT_SHA256}
 
 
 def test_manager_create_task_is_uncapped_by_default(writable_repo, monkeypatch):

@@ -608,7 +608,10 @@ def test_packet_is_deterministic_and_anti_anchored() -> None:
             "declared_command": "python -m pytest -q",
             "executed_argv": ["python3", "-m", "pytest", "-q"],
             "returncode": 0,
+            "duration_seconds": None,
+            "stdout_tail": "",
             "stdout_truncated": False,
+            "stderr_tail": "",
             "stderr_truncated": False,
         }
     ]

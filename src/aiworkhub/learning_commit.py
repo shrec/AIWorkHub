@@ -194,6 +194,13 @@ ALLOWED_COMMIT_FIELDS: FrozenSet[str] = frozenset({
 
 _MAX_REF_LEN = 1024
 _ALLOWED_SCHEMES: FrozenSet[str] = frozenset({ "file", "http", "https" })
+# The exact schemes :func:`_validate_evidence_id` accepts, published so a
+# refusal can NAME them. Measured over 40 learning_commit calls, 16 failed on
+# shape and the commonest was a ``sha256:`` receipt id -- a guess that costs a
+# whole turn to discover because the error never said what was allowed.
+ALLOWED_EVIDENCE_ID_SCHEMES: Tuple[str, ...] = tuple(
+    f"{scheme}:" for scheme in sorted(_ALLOWED_SCHEMES)
+)
 _SCHEME_PATTERN = re.compile(r'^[a-zA-Z][a-zA-Z0-9+.-]*$')
 _RELATION_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]{0,63}$")
 _MAX_EVIDENCE_IDS = 32

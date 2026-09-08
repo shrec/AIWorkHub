@@ -247,7 +247,9 @@ def test_dashboard_roadmap_views_are_bounded_and_read_only(
 
     assert listing["ok"] is True
     assert listing["entries"][0]["id"] == item["id"]
-    assert listing["authority_flags"]["readonly"] is True
+    # Deliberate contract change (mcp-output-9): one authority string replaces
+    # the constant seven-flag block on every NeedFix/Roadmap dashboard reply.
+    assert listing["authority"] == "readonly"
     assert detail["ok"] is True
     assert detail["item"]["outcome"] == item["outcome"]
 

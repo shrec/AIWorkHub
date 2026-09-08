@@ -276,13 +276,82 @@ def _fill_process_usage(
     return merged
 
 
+def _task_topic_index(repo_root: Path | str) -> dict[str, str]:
+    """``{task_id: tasks.topic}`` from one bounded query, for topic-less rows.
+
+    Built lazily and only when a usage event lacks its topic, so a healthy
+    ledger never pays for it. ``list_tasks`` is capped at 5000 rows ordered
+    by ``updated_at`` DESC; a task beyond that window stays unresolved rather
+    than being guessed.
+    """
+
+    try:
+        tasks = task_store.list_tasks(repo_root, status="all", limit=5000)
+    except task_store.TaskStoreError:
+        return {}
+    return {
+        str(task.get("task_id") or ""): str(task.get("topic") or "")
+        for task in tasks
+        if task.get("task_id")
+    }
+
+
+def _records_by_topic_source(rows: list[dict[str, Any]]) -> dict[str, int]:
+    """Record counts keyed by where each row's topic came from.
+
+    ``usage_event`` is the writer's own field; ``process_event_join`` and
+    ``task_join`` are read-side recoveries for rows the live writer left
+    topic-less; ``unresolved`` rows still report as an empty topic. Rows from
+    the legacy usage report or launch audit carry no label and are counted
+    as ``unlabeled``.
+    """
+
+    counts: dict[str, int] = defaultdict(int)
+    for row in rows:
+        source = str(row.get("topic_source") or "") or "unlabeled"
+        counts[source] += int(row.get("records") or 0)
+    return dict(sorted(counts.items()))
+
+
+def _attempt_time(row: dict[str, Any]) -> str:
+    """When the attempt happened: its recorded instant, else the ledger write.
+
+    A backfilled row is written long after the run it accounts for; its
+    ``created_at`` is the backfill instant. ``attempt_recorded_at`` is the
+    run's own finish time carried in the payload, so ordering and day
+    buckets prefer it whenever it is present.
+    """
+
+    return str(row.get("attempt_recorded_at") or row.get("created_at") or "")
+
+
 def _canonical_usage_rows(repo_root: Path | str) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     process_events = _process_event_index(repo_root)
+    topic_index: dict[str, str] | None = None
     for raw_entry in task_store.list_usage_events(repo_root, limit=10_000):
         entry = _fill_process_usage(raw_entry, repo_root, process_events)
         created_at = str(entry.get("created_at") or "")
+        attempt_recorded_at = str(entry.get("attempt_recorded_at") or "")
+        attempt_at = attempt_recorded_at or created_at
+        task_id = str(entry.get("task_id") or "")
         topic = str(entry.get("topic") or "")
+        topic_source = "usage_event" if topic else ""
+        if not topic:
+            # A live writer regression dropped the topic from usage_record
+            # payloads; recover it from request-time identity first (the
+            # process ledger row for the same task/request), then from the
+            # task itself. Provenance stays visible: tokens are unchanged,
+            # only the attribution key is joined.
+            event = _matching_process_event(entry, repo_root, process_events)
+            joined = str(event.get("topic") or "") if event is not None else ""
+            if joined:
+                topic, topic_source = joined, "process_event_join"
+        if not topic:
+            if topic_index is None:
+                topic_index = _task_topic_index(repo_root)
+            joined = topic_index.get(task_id, "")
+            topic, topic_source = joined, ("task_join" if joined else "unresolved")
         explicit_role = str(entry.get("role") or "").strip().lower()
         role = (
             explicit_role
@@ -302,9 +371,10 @@ def _canonical_usage_rows(repo_root: Path | str) -> list[dict[str, Any]]:
         note = str(entry.get("note") or "")
         rows.append({
             "source": "canonical_usage_event",
-            "task_id": str(entry.get("task_id") or ""),
+            "task_id": task_id,
             "runner": str(entry.get("runner") or ""),
             "topic": topic,
+            "topic_source": topic_source,
             "model": str(entry.get("model") or ""),
             "role": role,
             "role_observed": explicit_role in {"worker", "reviewer"},
@@ -334,8 +404,11 @@ def _canonical_usage_rows(repo_root: Path | str) -> list[dict[str, Any]]:
             "source_detail": str(entry.get("source") or ""),
             "note": note,
             "attempt_id": _request_identity(entry),
+            # created_at stays the ledger write time for audit; the day
+            # bucket and attempt ordering follow the attempt's own instant.
             "created_at": created_at,
-            "day": created_at[:10] if len(created_at) >= 10 else "",
+            "attempt_recorded_at": attempt_recorded_at,
+            "day": attempt_at[:10] if len(attempt_at) >= 10 else "",
         })
     return rows
 
@@ -437,13 +510,13 @@ def _model_outcome_matrix(
             row
             for row in candidates
             if not decision_at
-            or not str(row.get("created_at") or "")
-            or str(row.get("created_at") or "") <= decision_at
+            or not _attempt_time(row)
+            or _attempt_time(row) <= decision_at
         ]
         if not eligible:
             unmatched_decisions += 1
             continue
-        usage = max(eligible, key=lambda row: str(row.get("created_at") or ""))
+        usage = max(eligible, key=_attempt_time)
         model = str(
             usage.get("observed_model")
             or usage.get("model")
@@ -711,7 +784,9 @@ def _retry_economics(
     retry_rows: list[dict[str, Any]] = []
     retried_tasks: set[str] = set()
     for task_id, rows in by_task.items():
-        ordered = sorted(rows, key=lambda row: str(row.get("created_at") or ""))
+        # Order by when the attempt ran, not when its row was written: a
+        # backfilled first attempt otherwise sorts after the live retries.
+        ordered = sorted(rows, key=_attempt_time)
         if len(ordered) > 1:
             retried_tasks.add(task_id)
             retry_rows.extend(ordered[1:])
@@ -876,6 +951,10 @@ def build_cost_ledger(
                 if not row.get("role_observed")
             ),
             "legacy_inference": "quality_review_topic_is_reviewer_otherwise_worker",
+        },
+        "topic_quality": {
+            "records_by_source": _records_by_topic_source(union_rows),
+            "joined_topic_changes_attribution_not_tokens": True,
         },
         "aggregates": {
             "by_topic": _aggregate(union_rows, "topic"),

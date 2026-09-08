@@ -679,11 +679,35 @@ def test_cpp_cross_file_calls_and_all_six_compact_query_modes(tmp_path):
     bundled = sg.bundle(repo, "bugfix", "run_engine", 32)
 
     assert focus["matches"] and focus["candidate_files"][0] == "native/engine.cpp"
-    assert focus["ranked_symbols"]
-    assert focus["ranked_symbols"][0]["metrics_evidence"] == "deterministic_lexical_and_graph"
+    # Deliberate (source_graph-2): the per-symbol metrics ride ON the match
+    # row.  ``ranked_symbols`` repeated every match row in full and
+    # ``hot_symbols``/``risks`` projected the same rows twice more, so one
+    # symbol was restated up to three times in parallel lists a reader had to
+    # reconcile to find one line range.  Measured over five real queries
+    # against this repository's own index those three lists were 25-45% of the
+    # focus payload (31,772 of 89,852 bytes, 35%, removed with git_signals).
+    # Nothing is lost: ``_symbol_metrics`` ranks by ``(-priority_score,
+    # qualname)`` and both keys are on the row, so the former order and the
+    # former ``hot_symbols`` filter are recovered from ``matches`` alone.
+    assert not {"ranked_symbols", "hot_symbols", "risks", "git_signals"} & set(focus)
+    scored = [row for row in focus["matches"] if "priority_score" in row]
+    assert scored
+    assert scored[0]["metrics_evidence"] == "deterministic_lexical_and_graph"
+    assert {
+        "priority_score", "incoming_calls", "outgoing_calls", "branch_count",
+        "loop_count", "risk_reasons", "line_span",
+    } <= set(scored[0])
+    # The row keeps its own identity keys, so the old hot projection is a
+    # filter over the same rows instead of a second list.
     assert all(
-        set(row) == {"qualname", "file_path", "priority_score"}
-        for row in focus["hot_symbols"]
+        {"qualname", "file_path", "priority_score"} <= set(row)
+        for row in scored if int(row["priority_score"]) >= 8
+    )
+    # A match the metrics pass did not score carries no metrics at all rather
+    # than a zeroed score: absence is truthful.
+    assert all(
+        not ({"priority_score", "risk_reasons"} & set(row))
+        for row in focus["matches"] if "priority_score" not in row
     )
     assert sliced["outgoing_calls"]
     assert any(row["file_path"] == "tests/test_engine.cpp" for row in sliced["related_tests"])
@@ -709,7 +733,18 @@ def test_cpp_cross_file_calls_and_all_six_compact_query_modes(tmp_path):
     )
     assert "outgoing_calls" not in dependencies
     assert bundled["sections"] and bundled["outgoing_calls"]
-    assert bundled["insights"]["ranked_symbols"]
+    # Deliberate (source_graph-2): the bundle's insight block is the ranked
+    # SCORED symbols, in the same (-priority_score, qualname) order the old
+    # ``ranked_symbols`` used, with the hot/risk projections folded onto each
+    # row.  Measured on this repository's own index at budget 32 the block is
+    # 36-39% smaller (12,852 -> 7,956 bytes).
+    assert not {"ranked_symbols", "hot_symbols", "risks"} & set(bundled["insights"])
+    ranked_rows = bundled["insights"]["matches"]
+    assert ranked_rows and all("priority_score" in row for row in ranked_rows)
+    assert ranked_rows == sorted(
+        ranked_rows,
+        key=lambda row: (-int(row["priority_score"]), str(row["qualname"])),
+    )
 
 
 def test_every_focus_emitted_next_step_resolves_without_replacing_task_query(tmp_path):
@@ -844,7 +879,14 @@ def test_slice_is_symbol_scoped_and_excludes_unrelated_same_file_calls(tmp_path)
     sg.build_index(repo, incremental=False)
 
     focused = sg.focus(repo, "wanted_entry", 16)
-    target = focused["ranked_symbols"][0]["qualname"]
+    # Deliberate (source_graph-2): the top-ranked symbol comes from the folded
+    # match rows.  ``ranked_symbols`` was a full duplicate of ``matches``; its
+    # order, ``(-priority_score, qualname)``, is reproduced here from the two
+    # keys the row still carries.
+    target = min(
+        (row for row in focused["matches"] if "priority_score" in row),
+        key=lambda row: (-int(row["priority_score"]), str(row["qualname"])),
+    )["qualname"]
     sliced = sg.slice_(repo, "change wanted behavior", 16, target=target)
 
     assert sliced["matches"][0]["qualname"] == target
@@ -4527,7 +4569,8 @@ def test_source_graph_continuation_reassembles_exact_canonical_bytes(tmp_path, m
     _write(repo / "pkg" / "big.py", _big_body_function("big_target"))
     sg.build_index(repo, incremental=True)
     ctx = _continuation_ctx(repo)
-    monkeypatch.setattr(w, "_source_graph_output_cap", lambda mode: 2048)
+    output_cap = 2048
+    monkeypatch.setattr(w, "_source_graph_output_cap", lambda mode: output_cap)
 
     first = w.source_graph_query(ctx, mode="body", query="big_target", budget=8)
     assert first["ok"] is True
@@ -4538,7 +4581,12 @@ def test_source_graph_continuation_reassembles_exact_canonical_bytes(tmp_path, m
     assert first["page_index"] == 0
     assert first["page_count"] > 1
     assert first["continuation_cursor"]
-    assert _compact_response_bytes(first) <= first["output_cap_bytes"]
+    # Deliberate (source_graph-3): ``output_cap_bytes`` is a server constant of
+    # the mode, not evidence about this reply, so it moved from the
+    # model-facing envelope to the HMAC-signed ledger row.  The cap the
+    # response must respect is the one this test installed.
+    assert "output_cap_bytes" not in first
+    assert _compact_response_bytes(first) <= output_cap
 
     chunks = [base64.b64decode(first["content"])]
     indexes = [first["page_index"]]
@@ -4551,7 +4599,7 @@ def test_source_graph_continuation_reassembles_exact_canonical_bytes(tmp_path, m
         )
         assert page["ok"] is True
         assert page["content_encoding"] == "base64"
-        assert _compact_response_bytes(page) <= page["output_cap_bytes"]
+        assert _compact_response_bytes(page) <= output_cap
         chunks.append(base64.b64decode(page["content"]))
         indexes.append(page["page_index"])
         shas.append(page["page_sha256"])
@@ -6761,3 +6809,258 @@ def test_full_build_replaces_bootstrap_generation_authority_before_single_file_m
     finally:
         conn.close()
     assert after_mutation == authoritative_last_build
+
+
+# ---------------------------------------------------------------------------
+# Server-side zero-hit cascade, refusal guidance and inline freshness repair
+# (source_graph-4/5/8).  These were shipped without a regression test; the
+# CONTRACT they must keep is that a broadened retrieval can never be counted
+# as a first-class hit for the live Source Graph gate.
+# ---------------------------------------------------------------------------
+
+def _cascade_repo(tmp_path: Path, name: str) -> Path:
+    repo = _new_repo(tmp_path, name)
+    _write(
+        repo / "pkg" / "service.py",
+        "def alpha_handler(value):\n"
+        "    return value + 1\n\n"
+        "def beta_worker(value):\n"
+        "    # the quick brown fox jumps\n"
+        "    return alpha_handler(value)\n",
+    )
+    _write(repo / "other" / "far.py", "def gamma_thing():\n    return 3\n")
+    sg.build_index(repo, incremental=False)
+    return repo
+
+
+def _cascade_ctx(repo: Path, tmp_path: Path, targets: tuple[str, ...] = ()) -> w.WorkerToolContext:
+    return w.WorkerToolContext(
+        task_id="t-cascade", runner="r", topic="topic", request_id="req-cascade",
+        repo=repo, authority_repo=repo, source_graph_targets=targets,
+        allowed_writes=("pkg/service.py",), session_topic="topic",
+        audit_ledger_path=tmp_path / "cascade-ledger.jsonl",
+        audit_hmac_key_path=None,
+    )
+
+
+def test_bodygrep_token_match_kinds_are_labelled_and_bounded(tmp_path):
+    """A whitespace phrase that occurs out of order still has evidence."""
+    repo = _cascade_repo(tmp_path, "bodygrep_kinds")
+
+    literal = sg.bodygrep_query(repo, "quick brown fox", 8)
+    assert len(literal["matches"]) == 1
+    assert "match_kind" not in literal
+    assert "match_kind" not in literal["matches"][0]
+
+    # Reordered words: no literal occurrence, but one line holds every token.
+    assert sg.bodygrep_query(repo, "fox quick brown", 8)["matches"] == []
+    by_line = sg.bodygrep_query(repo, "fox quick brown", 8, match_kind="token_and_line")
+    assert by_line["match_kind"] == "token_and_line"
+    assert sorted(by_line["query_tokens"]) == ["brown", "fox", "quick"]
+    assert by_line["matches"]
+    assert all(row["match_kind"] == "token_and_line" for row in by_line["matches"])
+
+    # A file-level proof needs every token in the SAME file.
+    assert sg.bodygrep_query(
+        repo, "alpha_handler gamma_thing", 8, match_kind="token_and_file",
+    )["matches"] == []
+    same_file = sg.bodygrep_query(
+        repo, "alpha_handler beta_worker", 8, match_kind="token_and_file",
+    )
+    assert same_file["matches"]
+    assert {row["file_path"] for row in same_file["matches"]} == {"pkg/service.py"}
+
+    with pytest.raises(sg.SourceGraphError):
+        sg.bodygrep_query(repo, "alpha", 8, match_kind="not_a_kind")
+
+
+def test_find_or_terms_is_the_broadened_retrieval_step(tmp_path):
+    """``retrieval='or_terms'`` finds what the AND-of-every-word pass misses."""
+    repo = _cascade_repo(tmp_path, "or_terms")
+    conn = sg.connect(sg.resolve_db_path(repo), read_only=True)
+    try:
+        # Four tokens, all identifier-shaped: ``find`` keeps the strict
+        # phrase-then-AND passes and never reaches its own OR pass.
+        assert sg.find(conn, "alpha_handler nonexistent_token", limit=8) == []
+        broadened = sg.find(
+            conn, "alpha_handler nonexistent_token", limit=8, retrieval="or_terms",
+        )
+    finally:
+        conn.close()
+    assert [row["qualname"] for row in broadened] == ["pkg/service.py.alpha_handler"]
+
+
+def test_zero_hit_cascade_returns_evidence_without_counting_as_a_first_class_hit(tmp_path):
+    """CONTRACT: a fallback result never satisfies the live Source Graph gate.
+
+    The next expression after a ranked miss is deterministic, so the server
+    runs it in the same turn instead of handing back a bare zero.  The result
+    is labelled ``retrieval_reason='fallback:<step>'``; ``_json_hit_count``
+    reports it as ZERO so the gate and the zero-hit KPI still record the
+    primary miss, and the rows it did find are counted separately in
+    ``fallback_hit_count``.
+    """
+    repo = _cascade_repo(tmp_path, "zero_hit_cascade")
+    ctx = _cascade_ctx(repo, tmp_path)
+
+    # A prose phrase no symbol name matches: the ranked pass returns nothing.
+    result = w.source_graph_query(ctx, mode="focus", query="quick brown fox", budget=8)
+    assert result["ok"] is True
+    assert result["retrieval_reason"].startswith("fallback:")
+    assert result["hit_count"] == 0
+    assert result["fallback_hit_count"] > 0
+
+    payload = json.loads(result["content"])
+    assert payload["matches"]
+    assert payload["retrieval_reason"] == result["retrieval_reason"]
+    # The gate reads the same counter the ledger row records.
+    assert w._json_hit_count(payload) == 0
+    assert w._json_fallback_hit_count(payload) == result["fallback_hit_count"]
+
+    # A first-class hit is unaffected: no label, and it counts.
+    direct = w.source_graph_query(ctx, mode="focus", query="alpha_handler", budget=8)
+    assert direct["hit_count"] > 0
+    assert "retrieval_reason" not in direct
+    assert "fallback_hit_count" not in direct
+
+
+def test_zero_hit_cascade_broadens_to_the_declared_targets(tmp_path):
+    """A ranked hit outside the requested target is labelled, not hidden."""
+    repo = _cascade_repo(tmp_path, "cascade_declared_targets")
+    ctx = _cascade_ctx(repo, tmp_path, targets=("pkg/service.py", "other/far.py"))
+
+    result = w.source_graph_query(
+        ctx, mode="focus", query="gamma_thing", budget=8, target="pkg/service.py",
+    )
+    assert result["ok"] is True
+    assert result["retrieval_reason"] == "fallback:declared_targets"
+    assert result["hit_count"] == 0
+    assert result["fallback_hit_count"] > 0
+    payload = json.loads(result["content"])
+    assert payload["requested_target"] == "pkg/service.py"
+    assert payload["scope"] == "declared_target_fallback"
+    assert {row["file_path"] for row in payload["matches"]} == {"other/far.py"}
+
+
+def test_target_not_allowed_names_the_allowed_targets(tmp_path):
+    """A refusal that does not name the valid set only buys a blind retry."""
+    repo = _cascade_repo(tmp_path, "target_refusal")
+    ctx = _cascade_ctx(repo, tmp_path, targets=("pkg/service.py",))
+
+    refused = w.source_graph_query(
+        ctx, mode="focus", query="alpha_handler", budget=8, target="other/far.py",
+    )
+    assert refused["ok"] is False
+    assert refused["reason"] == "target_not_allowed"
+    assert refused["requested_target"] == "other/far.py"
+    assert refused["allowed_targets"] == ["pkg/service.py"]
+    assert "allowed_targets" in refused["valid_next_call"]
+
+
+def test_stale_rows_are_answered_from_an_inline_re_extraction(tmp_path):
+    """source_graph-8: a worker cannot refresh the index, so the reply does.
+
+    The canonical index is read-only under the worker sandbox, so a body
+    reply whose per-file freshness was ``stale`` used to hand back the
+    previous generation's line numbers.  The file is now re-extracted in
+    memory from the authority tree and the row answers from that, declared as
+    ``refresh='inline'``.  Nothing is written to the index.
+    """
+    repo = _new_repo(tmp_path, "inline_refresh")
+    _write(repo / "pkg" / "svc.py", "def stale_target(value):\n    return value + 1\n")
+    sg.build_index(repo, incremental=False)
+    generation = sg.resolve_db_path(repo).stat().st_mtime_ns
+    # Mutate on disk WITHOUT reindexing: the indexed row is now stale.
+    _write(
+        repo / "pkg" / "svc.py",
+        "# a new leading comment\n"
+        "# and another\n"
+        "def stale_target(value):\n"
+        "    return value + 99\n",
+    )
+    engine_row = sg.body_query(repo, "stale_target", 8)["matches"][0]
+    assert engine_row["freshness"]["state"] == "stale"
+    assert (engine_row["line_start"], engine_row["line_end"]) == (1, 2)
+
+    ctx = _cascade_ctx(repo, tmp_path)
+    result = w.source_graph_query(ctx, mode="body", query="stale_target", budget=8)
+    assert result["ok"] is True
+    assert result["refresh"] == "inline"
+    assert result["freshness"] == "fresh"
+
+    payload = json.loads(result["content"])
+    row = payload["matches"][0]
+    assert row["refresh"] == "inline"
+    assert row["freshness"]["state"] == "fresh"
+    assert (row["line_start"], row["line_end"]) == (3, 4)
+    assert row["source"] == "def stale_target(value):\n    return value + 99"
+    assert payload["refreshed_files"] == ["pkg/svc.py"]
+    # The read-only canonical index was not rebuilt to serve the reply.
+    assert sg.resolve_db_path(repo).stat().st_mtime_ns == generation
+
+
+@pytest.mark.parametrize(
+    "mode",
+    ["hotspots", "complexity", "bottlenecks", "todo", "coverage", "testmap",
+     "churn", "ownership", "calls"],
+)
+def test_the_fit_never_drops_a_mode_s_own_result_rows(mode):
+    """The priority trimmer is named for focus; other modes reuse those names.
+
+    ``_FIT_DROP_ORDER`` drops restating sections whole, and three of its
+    entries (``ranked_symbols``, ``todos``, and via the secondary list
+    ``related_tests``) are the ONLY rows some analytic mode returns:
+    hotspots/complexity/bottlenecks rank into ``ranked_symbols``, todo into
+    ``todos``, coverage/testmap into ``related_tests``, churn/ownership into
+    ``files``, calls into ``outgoing_calls``/``incoming_calls``.  Dropping one
+    of those would return an empty reply that still reports hits, so the
+    engine's own ``_ANALYTICS_RESULT_KEYS`` registry -- the same one paging
+    and scope enforcement read -- promotes them to primary lists in the fit.
+    """
+    keys = sg._ANALYTICS_RESULT_KEYS[mode]
+    assert keys, mode
+    payload = {"mode": mode, "query": "q", "budget": 32, "truncated": False}
+    for key in keys:
+        payload[key] = [
+            {
+                "qualname": f"pkg/mod_{index}.py::symbol_{index}",
+                "file_path": f"pkg/mod_{index}.py",
+                "priority_score": 100 - index,
+                "risk_reasons": ["branch_heavy"],
+                "line_span": 40,
+                "metrics_evidence": "deterministic_lexical_and_graph",
+                "detail": "y" * 300,
+            }
+            for index in range(40)
+        ]
+
+    fitted = sg._fit_payload_bytes(payload, 2048)
+    assert len(json.dumps(fitted, ensure_ascii=False).encode("utf-8")) <= 2048
+    for key in keys:
+        assert fitted.get(key), f"{mode}: {key} was dropped whole"
+        assert key not in (fitted.get("fit_dropped") or [])
+    assert fitted["truncated"] is True
+
+
+def test_the_fit_drops_focus_restating_sections_before_any_match_row():
+    payload = {
+        "mode": "focus",
+        "query": "q",
+        "budget": 32,
+        "matches": [
+            {"qualname": f"s{index}", "file_path": f"f{index}.py", "body": "x" * 200}
+            for index in range(20)
+        ],
+        "ranked_symbols": [
+            {"qualname": f"s{index}", "score": index, "pad": "z" * 200}
+            for index in range(20)
+        ],
+        "git_signals": {"churn": ["c" * 400]},
+        "todos": [{"file_path": "f0.py", "text": "t" * 200}],
+    }
+
+    fitted = sg._fit_payload_bytes(payload, 4096)
+    assert fitted["fit_dropped"] == ["git_signals", "todos", "ranked_symbols"]
+    assert fitted["matches"]
+    assert fitted["matches"][0]["qualname"] == "s0"
+    assert len(json.dumps(fitted, ensure_ascii=False).encode("utf-8")) <= 4096

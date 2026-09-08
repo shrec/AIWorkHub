@@ -158,6 +158,35 @@ def test_claude_raw_discovery_is_provider_denied(monkeypatch, tmp_path):
     assert tuple(plan.argv[start:]) == runtime_adapters.CLAUDE_RAW_DISCOVERY_DENIES
 
 
+def test_claude_reviewer_argv_grants_native_search_and_denies_host_report_tools(
+    monkeypatch, tmp_path,
+):
+    """The reviewer role's own deny list actually reaches the process.
+
+    The read-only reviewer keeps the shell denies, receives ``Grep``/``Glob``
+    instead (its sandbox is Landlock read-only with an empty
+    ``allowed_writes``), and is additionally denied the host tools that would
+    file its report where the supervisor never reads.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    executable = _executable(tmp_path, "claude")
+    monkeypatch.setattr(runtime_adapters.shutil, "which", lambda _: str(executable))
+
+    plan = runtime_adapters.build_runtime_command(
+        "claude_cli", "Prompt", repo, read_only=True
+    )
+
+    allowed = plan.argv[plan.argv.index("--allowedTools") + 1:]
+    allowed = allowed[: allowed.index("--no-session-persistence")]
+    denied = plan.argv[plan.argv.index("--disallowedTools") + 1:]
+    assert {"Grep", "Glob"} <= set(allowed)
+    assert tuple(denied) == runtime_adapters.claude_disallowed_tools(read_only=True)
+    assert "Grep" not in denied and "Glob" not in denied
+    assert "Bash(grep *)" in denied
+    assert {"ReportFindings", "ScheduleWakeup"} <= set(denied)
+
+
 def test_claude_worker_uses_bounded_noninteractive_permissions(monkeypatch, tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()

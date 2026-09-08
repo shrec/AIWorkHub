@@ -668,6 +668,79 @@ def mine(
     }
 
 
+def injectability(record: Any) -> tuple[bool, str]:
+    """Whether one stored record can be injected today, and the EXACT reason not.
+
+    ``skill_registry.select`` serves ACTIVE records exclusively, and the store
+    demotes an ACTIVE record whose own evidence no longer meets the rule in
+    force. Both facts decide injectability, and reporting only one of them is
+    how three PROPOSED records read as ``injectable: true`` while no worker
+    could ever receive them.
+
+    ``activation_evidence_below_two_distinct_actors`` is preserved verbatim: it
+    is the measured reason the repository's one ACTIVE record is not injectable,
+    and a reader who learned it must keep finding it.
+    """
+    lifecycle = record.lifecycle_state
+    if lifecycle is skill_registry.LifecycleState.RETIRED:
+        return False, "lifecycle_state_is_retired"
+    if skill_registry.unresolved_negative_evidence(record):
+        return False, "unresolved_negative_evidence"
+    actors = skill_registry.independent_accepted_evidence_count(record)
+    if actors < 2:
+        return False, "activation_evidence_below_two_distinct_actors"
+    if lifecycle is not skill_registry.LifecycleState.ACTIVE:
+        return False, "lifecycle_state_is_proposed_not_active"
+    return True, ""
+
+
+def candidate_draft(
+    repo: str | Path,
+    candidate_id: str,
+    *,
+    threshold: float = DEFAULT_THRESHOLD,
+    min_cards: int = MIN_DISTINCT_CARDS,
+    min_files: int = MIN_DISTINCT_FILES,
+) -> dict[str, Any]:
+    """Return ONE mined candidate's proposal draft by its ``candidate_id``.
+
+    :func:`mine` already computes every mechanical dimension of a proposal from
+    measured card evidence -- identity, version, scope, path_or_symbol, risk and
+    stage -- and then hands the whole draft back for a manager to retype. That
+    round trip is pure transcription risk: a mistyped identity silently proposes
+    a different skill than the one the evidence supports.
+
+    This is the server-side lookup that makes the hand-off exact. It is still
+    read-only and still produces no lifecycle transition: what a manager owes is
+    the judgement half (``task_family``, ``triggers``, ``applicability``,
+    ``confidence``, and the procedure text), which is exactly what
+    ``draft_incomplete`` names and what no measurement can supply.
+    """
+    wanted = str(candidate_id or "").strip()
+    if not wanted:
+        raise SkillMinerError("candidate_id_required")
+    report = mine(
+        repo,
+        threshold=threshold,
+        min_cards=min_cards,
+        min_files=min_files,
+        include_sensitivity=False,
+    )
+    for candidate in report.get("candidates", []):
+        if str(candidate.get("candidate_id") or "") == wanted:
+            return {
+                "candidate_id": wanted,
+                "proposal_draft": candidate_proposal_payload(candidate),
+                "draft_incomplete": list(candidate.get("draft_incomplete") or []),
+                "provenance": candidate.get("provenance") or {},
+                "recurrence": candidate.get("recurrence") or {},
+            }
+    known = [str(c.get("candidate_id") or "") for c in report.get("candidates", [])]
+    raise SkillMinerError(
+        f"unknown_candidate_id:{wanted[:80]}; mined candidates: {known[:10]}"
+    )
+
+
 def measure_retirement(
     repo: str | Path, *, min_anchors: int = MIN_RETIREMENT_ANCHORS
 ) -> dict[str, Any]:
@@ -701,6 +774,10 @@ def measure_retirement(
 
     outcomes = learning_commit_store.read_card_outcomes(repo_path)
     injection = learning_commit_store.injection_ledger_state(repo_path)
+    try:
+        per_skill_injection = skill_registry_store.injection_counts(repo_path)
+    except (skill_registry_store.SkillStoreError, OSError, sqlite3.Error):
+        per_skill_injection = {}
 
     skills: list[dict[str, Any]] = []
     for record in stored:
@@ -712,7 +789,7 @@ def measure_retirement(
             for v in resolved.values()
             if v.get("failure_category")
         )
-        injectable = skill_registry_store.activation_supported(record, 2)
+        injectable, injectable_reason = injectability(record)
         rejected = decided.get("rejected", 0)
         total = sum(decided.values())
         if len(resolved) < min_anchors:
@@ -733,14 +810,16 @@ def measure_retirement(
                 "version": record.version,
                 "stored_lifecycle_state": record.lifecycle_state.value,
                 "injectable": bool(injectable),
-                "injectable_reason": (
-                    "" if injectable else "activation_evidence_below_two_distinct_actors"
-                ),
+                "injectable_reason": injectable_reason,
                 "evidence_anchors": anchors,
                 "resolvable_anchor_cards": len(resolved),
                 "anchor_outcomes": dict(decided),
                 "anchor_failure_classes": dict(classes),
-                "injected_cards": injection["injected_cards"],
+                "injected_cards": int(
+                    per_skill_injection.get(
+                        f"{record.identity}@{record.version}", {}
+                    ).get("injected_cards", 0)
+                ),
                 "verdict": verdict,
                 "reason": reason,
             }

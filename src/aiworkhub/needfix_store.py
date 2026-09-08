@@ -124,6 +124,62 @@ KINDS: tuple[str, ...] = (
     "other",
 )
 
+# Synonyms a manager types for a kind that is not in ``KINDS``. Measured over
+# 27 manager sessions: 11 of 14 needfix_add refusals were ``invalid kind`` on
+# exactly these words, and the vocabulary was only ever revealed in the error
+# text. The MCP wrappers map them before the store validates and report the
+# mapping as ``kind_normalized`` so the call succeeds and the substitution is
+# visible, never silent. The store itself stays strict: ``KINDS`` is the only
+# vocabulary it accepts.
+KIND_SYNONYMS: dict[str, str] = {
+    "gap": "improvement",
+    "defect": "bug",
+    "performance": "optimization",
+    "design": "refactor",
+    "dead_code": "technical_debt",
+    "test_coverage": "improvement",
+}
+
+
+def normalize_kind(kind: Any) -> tuple[str, dict[str, str] | None]:
+    """Return ``(canonical_kind, mapping)`` for a caller-supplied kind.
+
+    ``mapping`` is ``{"from": <typed>, "to": <canonical>}`` when a synonym
+    was substituted and ``None`` when the value was passed through unchanged
+    (a valid kind, or an unknown one that the store will refuse by name).
+    """
+
+    text = str(kind or "").strip()
+    lowered = text.lower()
+    if lowered in KINDS:
+        return lowered, None
+    canonical = KIND_SYNONYMS.get(lowered)
+    if canonical is None:
+        return text, None
+    return canonical, {"from": text, "to": canonical}
+
+
+def merge_patch(target: Any, patch: Mapping[str, Any]) -> dict[str, Any]:
+    """Apply a JSON merge patch (RFC 7396) to ``target`` and return the result.
+
+    Keys in ``patch`` are merged into ``target``; a ``None`` value deletes the
+    key; nested objects merge recursively; any other value replaces. The
+    inputs are never mutated.
+    """
+
+    result: dict[str, Any] = dict(target) if isinstance(target, Mapping) else {}
+    for key, value in patch.items():
+        if value is None:
+            result.pop(key, None)
+        elif isinstance(value, Mapping) and isinstance(result.get(key), Mapping):
+            result[key] = merge_patch(result[key], value)
+        elif isinstance(value, Mapping):
+            result[key] = merge_patch({}, value)
+        else:
+            result[key] = value
+    return result
+
+
 NF_ID_RE = re.compile(r'^NF-\d{4}-\d{5}$')
 MAX_ID_SEQUENCE = 99999
 
@@ -1047,9 +1103,19 @@ def _apply_transition(
             params.append(val)
     params.append(needfix_id)
     conn.execute(f"UPDATE needfix SET {', '.join(sets)} WHERE id = ?", params)
-    _record_event(conn, needfix_id, event, dict(detail or {}, prior_status=current))
+    event_id = _record_event(conn, needfix_id, event, dict(detail or {}, prior_status=current))
     updated = conn.execute("SELECT * FROM needfix WHERE id = ?", (needfix_id,)).fetchone()
-    return _row_to_dict(updated)
+    result = _row_to_dict(updated)
+    # The durable identity of this exact step, so a caller can answer with a
+    # delta receipt (before/after status, event id) instead of re-reading the
+    # row or echoing it. Not a column; never persisted back.
+    result["transition"] = {
+        "event": event,
+        "event_id": event_id,
+        "status_before": current,
+        "status_after": target_status,
+    }
+    return result
 
 
 def triage_needfix(
@@ -1315,7 +1381,19 @@ def resolve_verified_needfix(
         if row is None:
             raise NeedFixNotFoundError(needfix_id)
         if row["status"] == "resolved":
-            return _row_to_dict(row)
+            # Idempotent replay. This path writes nothing, so it carries no
+            # event id; saying so explicitly is the point -- a receipt that
+            # reported ``status_before: null`` would be indistinguishable from
+            # a transition whose identity the caller failed to record.
+            already = _row_to_dict(row)
+            already["transition"] = {
+                "event": "manager_verified_resolved",
+                "event_id": None,
+                "status_before": "resolved",
+                "status_after": "resolved",
+                "noop": True,
+            }
+            return already
         if row["status"] != "accepted":
             raise NeedFixConflictError(
                 "manager-verified resolution requires current_status='accepted'; "
@@ -1350,7 +1428,7 @@ def resolve_verified_needfix(
             raise NeedFixConflictError(
                 "manager-verified resolution lost an atomic status race"
             )
-        _record_event(
+        event_id = _record_event(
             conn,
             needfix_id,
             "manager_verified_resolved",
@@ -1362,7 +1440,19 @@ def resolve_verified_needfix(
             },
         )
         updated = conn.execute("SELECT * FROM needfix WHERE id = ?", (needfix_id,)).fetchone()
-        return _row_to_dict(updated)
+        result = _row_to_dict(updated)
+        # This transition is written by hand rather than through
+        # ``_apply_transition`` (it enforces its own evidence preconditions),
+        # so it has to attach the same durable step identity -- without it the
+        # dashboard delta receipt reports this one action of eight with a null
+        # status_before and an empty event list.
+        result["transition"] = {
+            "event": "manager_verified_resolved",
+            "event_id": event_id,
+            "status_before": "accepted",
+            "status_after": "resolved",
+        }
+        return result
     finally:
         conn.close()
 
@@ -1382,8 +1472,36 @@ def update_needfix(
     evidence: Mapping[str, Any] | None = None,
     evidence_refs: Sequence[str] | None = None,
     readiness_score: int | None = None,
+    evidence_patch: Mapping[str, Any] | None = None,
+    evidence_refs_add: Sequence[str] | None = None,
+    evidence_refs_remove: Sequence[str] | None = None,
+    tags_add: Sequence[str] | None = None,
+    tags_remove: Sequence[str] | None = None,
+    scope_files_add: Sequence[str] | None = None,
+    scope_symbols_add: Sequence[str] | None = None,
+    expected_updated_at: str | None = None,
 ) -> dict[str, Any]:
-    """Update mutable fields. Blocked for transient/terminal statuses."""
+    """Update mutable fields. Blocked for transient/terminal statuses.
+
+    ``None`` keeps a field; a whole value replaces it. That convention stopped
+    at the object boundary: adding one measurement key to ``evidence`` meant
+    re-sending the whole dict, and forgetting the copy destroyed every prior
+    measurement (it happened; the auto-memory note records it). The ``*_patch``
+    / ``*_add`` / ``*_remove`` parameters merge server-side against the row
+    read inside this same connection; ``evidence`` stays an explicit full
+    replace and is refused together with ``evidence_patch`` so a caller can
+    never mean both. ``expected_updated_at`` is optimistic concurrency: when
+    supplied it must equal the stored ``updated_at`` or the update is refused.
+
+    The returned row carries an ``update_receipt`` (``fields_changed``,
+    ``event_id``, ``evidence_keys_after``) so the MCP wrapper can answer with
+    a delta instead of echoing the row; the ``updated`` audit event records
+    the same ``fields_changed`` plus the evidence sha256 before and after.
+    """
+    if evidence is not None and evidence_patch is not None:
+        raise NeedFixValidationError(
+            "evidence (full replace) and evidence_patch (merge) are mutually exclusive"
+        )
     conn = _connect(repo_root)
     try:
         row = conn.execute("SELECT * FROM needfix WHERE id = ?", (needfix_id,)).fetchone()
@@ -1393,24 +1511,88 @@ def update_needfix(
             raise NeedFixConflictError(
                 f"cannot update needfix {needfix_id} in transient status {row['status']!r}"
             )
+        if expected_updated_at is not None and str(expected_updated_at) != str(row["updated_at"]):
+            raise NeedFixConflictError(
+                f"needfix_update_stale: expected_updated_at={expected_updated_at!r} "
+                f"current_updated_at={row['updated_at']!r}"
+            )
         if kind is not None and kind not in KINDS:
-            raise NeedFixValidationError(f"invalid kind: {kind!r}")
+            raise NeedFixValidationError(f"invalid kind: {kind!r}; valid: {KINDS}")
         if severity is not None and severity not in SEVERITIES:
-            raise NeedFixValidationError(f"invalid severity: {severity!r}")
+            raise NeedFixValidationError(f"invalid severity: {severity!r}; valid: {SEVERITIES}")
         if readiness_score is not None and (readiness_score < 0 or readiness_score > 100):
             raise NeedFixValidationError("readiness_score must be 0-100")
 
-        new_title = title if title is not None else row["title"]
-        new_description = description if description is not None else row["description"]
-        new_kind = kind if kind is not None else row["kind"]
-        new_severity = severity if severity is not None else row["severity"]
-        new_tags = json.dumps(list(tags)) if tags is not None else row["tags_json"]
-        new_scope = scope if scope is not None else row["scope"]
-        new_scope_files = json.dumps(list(scope_files)) if scope_files is not None else row["scope_files_json"]
-        new_scope_symbols = json.dumps(list(scope_symbols)) if scope_symbols is not None else row["scope_symbols_json"]
-        new_evidence = json.dumps(dict(evidence)) if evidence is not None else row["evidence_json"]
-        new_evidence_refs = json.dumps(list(evidence_refs)) if evidence_refs is not None else row["evidence_refs_json"]
-        new_readiness = readiness_score if readiness_score is not None else row["readiness_score"]
+        def _list_edit(
+            current_json: str,
+            replace: Sequence[str] | None,
+            add: Sequence[str] | None,
+            remove: Sequence[str] | None,
+        ) -> list[str]:
+            items = list(replace) if replace is not None else list(json.loads(current_json or "[]"))
+            for value in list(add or []):
+                if value not in items:
+                    items.append(value)
+            if remove:
+                drop = set(remove)
+                items = [value for value in items if value not in drop]
+            return items
+
+        old_evidence = json.loads(row["evidence_json"] or "{}")
+        if evidence is not None:
+            new_evidence_obj: dict[str, Any] = dict(evidence)
+        elif evidence_patch is not None:
+            new_evidence_obj = merge_patch(old_evidence, evidence_patch)
+        else:
+            new_evidence_obj = old_evidence
+        if len(json.dumps(new_evidence_obj).encode("utf-8")) > MAX_EVIDENCE_BYTES:
+            raise NeedFixValidationError("evidence payload exceeds bounded size")
+
+        new_values: dict[str, Any] = {
+            "title": title if title is not None else row["title"],
+            "description": description if description is not None else row["description"],
+            "kind": kind if kind is not None else row["kind"],
+            "severity": severity if severity is not None else row["severity"],
+            "tags_json": json.dumps(_list_edit(row["tags_json"], tags, tags_add, tags_remove)),
+            "scope": scope if scope is not None else row["scope"],
+            "scope_files_json": json.dumps(
+                _list_edit(row["scope_files_json"], scope_files, scope_files_add, None)
+            ),
+            "scope_symbols_json": json.dumps(
+                _list_edit(row["scope_symbols_json"], scope_symbols, scope_symbols_add, None)
+            ),
+            "evidence_json": json.dumps(new_evidence_obj),
+            "evidence_refs_json": json.dumps(
+                _list_edit(
+                    row["evidence_refs_json"], evidence_refs, evidence_refs_add, evidence_refs_remove
+                )
+            ),
+            "readiness_score": readiness_score if readiness_score is not None else row["readiness_score"],
+        }
+        # Compare the stored representation, not the caller's arguments: a
+        # value re-sent unchanged is not a change, and a patch that only
+        # re-states existing keys is not one either.
+        public_name = {
+            "tags_json": "tags",
+            "scope_files_json": "scope_files",
+            "scope_symbols_json": "scope_symbols",
+            "evidence_json": "evidence",
+            "evidence_refs_json": "evidence_refs",
+        }
+        def _stored_changed(column: str, value: Any) -> bool:
+            if not column.endswith("_json"):
+                return value != row[column]
+            empty = "{}" if column == "evidence_json" else "[]"
+            return json.loads(value) != json.loads(row[column] or empty)
+
+        fields_changed = [
+            public_name.get(column, column)
+            for column, value in new_values.items()
+            if _stored_changed(column, value)
+        ]
+
+        def _sha(text: str) -> str:
+            return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
         conn.execute(
             """UPDATE needfix SET title = ?, description = ?, kind = ?, severity = ?,
@@ -1418,15 +1600,39 @@ def update_needfix(
             evidence_json = ?, evidence_refs_json = ?, readiness_score = ?,
             updated_at = ? WHERE id = ?""",
             (
-                new_title, new_description, new_kind, new_severity,
-                new_tags, new_scope, new_scope_files, new_scope_symbols,
-                new_evidence, new_evidence_refs, new_readiness,
-                _utcnow_iso(), needfix_id,
+                new_values["title"], new_values["description"], new_values["kind"],
+                new_values["severity"], new_values["tags_json"], new_values["scope"],
+                new_values["scope_files_json"], new_values["scope_symbols_json"],
+                new_values["evidence_json"], new_values["evidence_refs_json"],
+                new_values["readiness_score"], _utcnow_iso(), needfix_id,
             ),
         )
-        _record_event(conn, needfix_id, "updated", {"fields_updated": True})
+        event_id = _record_event(
+            conn,
+            needfix_id,
+            "updated",
+            {
+                "fields_updated": bool(fields_changed),
+                "fields_changed": fields_changed,
+                "evidence_sha256_before": _sha(json.dumps(old_evidence, sort_keys=True)),
+                "evidence_sha256_after": _sha(json.dumps(new_evidence_obj, sort_keys=True)),
+                "evidence_mode": (
+                    "replace" if evidence is not None
+                    else "merge_patch" if evidence_patch is not None
+                    else "unchanged"
+                ),
+                "expected_updated_at": expected_updated_at,
+            },
+        )
         updated = conn.execute("SELECT * FROM needfix WHERE id = ?", (needfix_id,)).fetchone()
-        return _row_to_dict(updated)
+        result = _row_to_dict(updated)
+        result["update_receipt"] = {
+            "fields_changed": fields_changed,
+            "event_id": event_id,
+            "evidence_keys_after": sorted(str(key) for key in new_evidence_obj),
+            "updated_at": result["updated_at"],
+        }
+        return result
     finally:
         conn.close()
 

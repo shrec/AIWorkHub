@@ -118,8 +118,8 @@ def test_bugfix_outputs_exactly_cover_atomic_write_set():
     assert card["read_only"] is False
     assert card["read_first"] == expected
     assert card["validation"] == [
-        "python -m pytest -q tests/test_a.py",
-        "python -m ruff check src/a.py src/b.py tests/test_a.py",
+        "python3 -m pytest -q tests/test_a.py",
+        "python3 -m ruff check src/a.py src/b.py tests/test_a.py",
         "git diff --check",
     ]
 
@@ -135,8 +135,8 @@ def test_implementation_with_tests_matches_bugfix_contract():
     assert card["allowed_writes"] == expected
     assert card["allowed_writes"] == expected
     assert card["validation"] == [
-        "python -m pytest -q tests/test_mod.py",
-        "python -m ruff check src/mod.py tests/test_mod.py",
+        "python3 -m pytest -q tests/test_mod.py",
+        "python3 -m ruff check src/mod.py tests/test_mod.py",
         "git diff --check",
     ]
 
@@ -158,8 +158,8 @@ def test_test_only_requires_tests_and_rejects_production_paths():
     assert card["write_set"] == ["tests/test_a.py"]
     assert card["read_first"] == ["tests/test_a.py"]
     assert card["validation"] == [
-        "python -m pytest -q tests/test_a.py",
-        "python -m ruff check tests/test_a.py",
+        "python3 -m pytest -q tests/test_a.py",
+        "python3 -m ruff check tests/test_a.py",
         "git diff --check",
     ]
 
@@ -265,8 +265,8 @@ def test_validation_replay_runs_commands_without_writes():
     assert card["allowed_writes"] == []
     assert card["required_outputs"] == []
     assert card["validation"] == [
-        "python -m pytest -q tests/test_a.py",
-        "python -m ruff check src/a.py tests/test_a.py",
+        "python3 -m pytest -q tests/test_a.py",
+        "python3 -m ruff check src/a.py tests/test_a.py",
         "git diff --check",
     ]
     with pytest.raises(TaskTemplateError, match="missing_test_paths"):
@@ -443,7 +443,7 @@ def test_validation_commands_preserve_exact_argv_semantics():
         assert " ".join(argv) == command
         assert all(" " not in token for token in argv)
     assert split_command_argv(card["validation"][0]) == [
-        "python",
+        "python3",
         "-m",
         "pytest",
         "-q",
@@ -631,12 +631,12 @@ def test_cross_boundary_bugfix_keeps_python_and_node_commands_separated():
         test_paths=["tests/test_a.py", "tests/a.test.js"],
     )
     assert card["validation"] == [
-        "python -m pytest -q tests/test_a.py",
-        "python -m ruff check src/a.py tests/test_a.py",
+        "python3 -m pytest -q tests/test_a.py",
+        "python3 -m ruff check src/a.py tests/test_a.py",
         "node --test tests/a.test.js",
         "git diff --check",
     ]
-    python_commands = [command for command in card["validation"] if command.startswith("python ")]
+    python_commands = [command for command in card["validation"] if command.startswith("python3 ")]
     node_commands = [command for command in card["validation"] if command.startswith("node ")]
     assert all(".js" not in command for command in python_commands)
     assert all(".py" not in command for command in node_commands)
@@ -1281,8 +1281,8 @@ def test_custom_validation_and_roles_reject_unbounded_lists():
 def test_real_suffixless_directory_targets_route_to_python_toolchain():
     card = expand_template("test_only", test_paths=["tests", "tests/unit"])
     assert card["validation"] == [
-        "python -m pytest -q tests tests/unit",
-        "python -m ruff check tests tests/unit",
+        "python3 -m pytest -q tests tests/unit",
+        "python3 -m ruff check tests tests/unit",
         "git diff --check",
     ]
 
@@ -1332,8 +1332,8 @@ def test_suffixless_ordinary_files_never_route_to_pytest_or_ruff():
         test_paths=["tests/test_app.py"],
     )
     assert card["validation"] == [
-        "python -m pytest -q tests/test_app.py",
-        "python -m ruff check src/app.py tests/test_app.py",
+        "python3 -m pytest -q tests/test_app.py",
+        "python3 -m ruff check src/app.py tests/test_app.py",
         "git diff --check",
     ]
     assert card["allowed_writes"] == [
@@ -1344,7 +1344,7 @@ def test_suffixless_ordinary_files_never_route_to_pytest_or_ruff():
         "tests/test_app.py",
     ]
     for command in card["validation"]:
-        if command.startswith("python "):
+        if command.startswith("python3 "):
             assert "Makefile" not in command
             assert "LICENSE" not in command
             assert "Dockerfile" not in command
@@ -1363,8 +1363,8 @@ def test_non_python_assets_never_route_to_pytest_or_ruff():
         test_paths=["tests/test_app.py", "tests/data.json"],
     )
     assert card["validation"] == [
-        "python -m pytest -q tests/test_app.py",
-        "python -m ruff check src/app.py tests/test_app.py",
+        "python3 -m pytest -q tests/test_app.py",
+        "python3 -m ruff check src/app.py tests/test_app.py",
         "git diff --check",
     ]
     non_python_assets = (
@@ -1375,7 +1375,7 @@ def test_non_python_assets_never_route_to_pytest_or_ruff():
         "data.json",
     )
     for command in card["validation"]:
-        if command.startswith("python "):
+        if command.startswith("python3 "):
             for asset in non_python_assets:
                 assert asset not in command
 
@@ -1387,12 +1387,12 @@ def test_mixed_python_and_javascript_targets_stay_language_separated():
         test_paths=["tests/test_app.py", "tests/app.test.js"],
     )
     assert card["validation"] == [
-        "python -m pytest -q tests/test_app.py",
-        "python -m ruff check src/app.py tests/test_app.py",
+        "python3 -m pytest -q tests/test_app.py",
+        "python3 -m ruff check src/app.py tests/test_app.py",
         "node --test tests/app.test.js",
         "git diff --check",
     ]
-    python_commands = [c for c in card["validation"] if c.startswith("python ")]
+    python_commands = [c for c in card["validation"] if c.startswith("python3 ")]
     node_commands = [c for c in card["validation"] if c.startswith("node ")]
     assert all(".js" not in command for command in python_commands)
     assert all(".py" not in command for command in node_commands)
@@ -1404,8 +1404,8 @@ def test_suffixless_files_under_tests_never_route_to_pytest_or_ruff():
         test_paths=["tests/unit", "tests/Makefile", "tests/fixtures/sample"],
     )
     assert card["validation"] == [
-        "python -m pytest -q tests/unit",
-        "python -m ruff check tests/unit",
+        "python3 -m pytest -q tests/unit",
+        "python3 -m ruff check tests/unit",
         "git diff --check",
     ]
     assert card["allowed_writes"] == [
@@ -1414,7 +1414,7 @@ def test_suffixless_files_under_tests_never_route_to_pytest_or_ruff():
         "tests/fixtures/sample",
     ]
     for command in card["validation"]:
-        if command.startswith("python "):
+        if command.startswith("python3 "):
             assert "Makefile" not in command
             assert "fixtures" not in command
             assert "sample" not in command
@@ -1431,8 +1431,8 @@ def test_lowercase_suffixless_file_under_tests_never_routes():
         test_paths=["tests/unit", "tests/data", "tests/fixture", "tests/notes"],
     )
     assert card["validation"] == [
-        "python -m pytest -q tests/unit",
-        "python -m ruff check tests/unit",
+        "python3 -m pytest -q tests/unit",
+        "python3 -m ruff check tests/unit",
         "git diff --check",
     ]
     assert card["allowed_writes"] == [
@@ -1442,7 +1442,7 @@ def test_lowercase_suffixless_file_under_tests_never_routes():
         "tests/notes",
     ]
     for command in card["validation"]:
-        if command.startswith("python "):
+        if command.startswith("python3 "):
             for leaf in ("data", "fixture", "notes"):
                 assert leaf not in command
 
@@ -1457,13 +1457,13 @@ def test_underscore_prefixed_leaf_under_tests_never_routes():
         test_paths=["tests", "tests/unit", "tests/_helpers"],
     )
     assert card["validation"] == [
-        "python -m pytest -q tests tests/unit",
-        "python -m ruff check tests tests/unit",
+        "python3 -m pytest -q tests tests/unit",
+        "python3 -m ruff check tests tests/unit",
         "git diff --check",
     ]
     assert card["allowed_writes"] == ["tests", "tests/unit", "tests/_helpers"]
     for command in card["validation"]:
-        if command.startswith("python "):
+        if command.startswith("python3 "):
             assert "_helpers" not in command
 
 

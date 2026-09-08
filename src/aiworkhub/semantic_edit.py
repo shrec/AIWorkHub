@@ -45,7 +45,16 @@ class PreparedLineTarget:
     file_bytes: int
     fragment_bytes: int
 
-    def receipt(self, *, target_id: str = "") -> dict[str, Any]:
+    def receipt(
+        self, *, target_id: str = "", include_fragment: bool = True,
+    ) -> dict[str, Any]:
+        """The hash-bound receipt; ``include_fragment=False`` omits the text.
+
+        Everything ``apply`` verifies (``current_sha256``, ``fragment_sha256``,
+        the range) is present either way; a hash-only receipt says so with
+        ``fragment_omitted`` so the caller never mistakes it for an empty
+        fragment.
+        """
         payload: dict[str, Any] = {
             "schema_id": "aiworkhub.semantic_edit_target.v1",
             "path": self.path,
@@ -53,7 +62,6 @@ class PreparedLineTarget:
             "end_line": self.end_line,
             "current_sha256": self.current_sha256,
             "fragment_sha256": self.fragment_sha256,
-            "fragment": self.fragment,
             "file_bytes": self.file_bytes,
             "fragment_bytes": self.fragment_bytes,
             "whole_file_bytes_not_returned_by_tool": max(
@@ -61,6 +69,10 @@ class PreparedLineTarget:
             ),
             "token_savings_claimed": False,
         }
+        if include_fragment:
+            payload["fragment"] = self.fragment
+        else:
+            payload["fragment_omitted"] = True
         if target_id:
             payload["target_id"] = target_id
         return payload

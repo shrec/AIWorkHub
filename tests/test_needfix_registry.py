@@ -1678,7 +1678,29 @@ class TestManagerVerifiedResolution:
         second = needfix_store.resolve_verified_needfix(
             init_store, row["id"], resolution_note="Verified again."
         )
-        assert second == first
+        # The DURABLE row is untouched by the replay -- same resolved_at, same
+        # updated_at, same everything the table holds.
+        assert {k: v for k, v in second.items() if k != "transition"} == {
+            k: v for k, v in first.items() if k != "transition"
+        }
+        # ``transition`` is deliberately excluded from that equality (the
+        # mutation-receipt change): it is not a column, it is THIS call's step
+        # identity, and it is the one key that must differ. The write carries
+        # the durable event id it recorded; the replay carries none and says
+        # ``noop``. Handing back the first call's identity a second time would
+        # make a no-op indistinguishable from a second recorded transition --
+        # which is exactly what the delta receipt built on it has to tell
+        # apart. The audit log below is what proves the replay wrote nothing.
+        assert first["transition"]["event_id"] is not None
+        assert first["transition"]["status_before"] == "accepted"
+        assert second["transition"]["event_id"] is None
+        assert second["transition"]["noop"] is True
+        resolved_events = [
+            event
+            for event in needfix_store.list_events(init_store, row["id"])
+            if event["event"] == "manager_verified_resolved"
+        ]
+        assert len(resolved_events) == 1
 
     def test_ordinary_resolve_still_rejects_accepted_item(self, init_store: Path):
         row = self._accepted(init_store)

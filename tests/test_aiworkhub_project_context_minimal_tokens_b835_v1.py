@@ -502,3 +502,56 @@ def test_real_measurement_evidence_written(tmp_path: Path) -> None:
     assert report["token_economy"]["meets_byte_cap_gate"] is True
     assert report["token_economy"]["meets_50pct_reduction_gate"] is True
     assert evidence_path.stat().st_size > 0
+
+
+def test_real_shaped_zero_hit_focus_envelope_is_rejected(tmp_path: Path) -> None:
+    """Production focus misses echo ``query_tokens``; that is not evidence.
+
+    Before worker_prompt-1 the section counted the echoed tokens
+    (``hit_count == len(query_tokens)``), so the required-context check never
+    fired and 680/680 bundles injected an empty orientation.
+    """
+
+    repo = _repo(tmp_path, source_payload=SOURCE_GRAPH_PAYLOAD, session_payload=SESSION_PAYLOAD)
+    query = _card()["project_context"]["source_graph"]["query"]
+    zero_hit = {
+        "mode": "focus",
+        "query": query,
+        "budget": 128,
+        "matches": [],
+        "query_tokens": query.split(),
+        "candidate_files": [],
+        "truncated": False,
+    }
+    assert len(zero_hit["query_tokens"]) == 14
+    assert project_context._json_hit_count(zero_hit) == 0
+    with _install_source_graph_stub(zero_hit), _install_worker_tools_stub():
+        with pytest.raises(
+            project_context.ProjectContextError, match="source_graph_required_empty_result"
+        ):
+            project_context.collect_project_context(repo, _card())
+
+
+def test_zero_hit_session_section_omitted_from_prompt_but_kept_in_metadata(tmp_path: Path) -> None:
+    repo = _repo(tmp_path, source_payload=SOURCE_GRAPH_PAYLOAD, session_payload=SESSION_PAYLOAD)
+    with _install_source_graph_stub(SOURCE_GRAPH_PAYLOAD), _install_worker_tools_stub(session_hit=False):
+        result = project_context.collect_project_context(repo, _card())
+    assert result is not None
+    payload = json.loads(_bundle_body(result.prompt_bundle))
+    assert set(payload["evidence"]) == {"source_graph"}
+
+    meta_by_name = {section["name"]: section for section in result.metadata["sections"]}
+    session = meta_by_name["session_current_state"]
+    # The launcher's own measurement stays on record: the canonical query ran
+    # for this request and returned nothing, and nothing degraded.
+    assert session["executed"] is True
+    assert session["hit_count"] == 0
+    assert session["degraded_reason"] == ""
+    assert session["bytes"] == 0
+    assert result.metadata["optimization"]["zero_hit_suppression_count"] == 3
+    assert result.metadata["section_count"] == 4
+
+    # The zero-hit envelope no longer costs prompt bytes.
+    with_session = _collect(tmp_path / "with_session")
+    assert result.metadata["bundle_bytes"] < with_session.metadata["bundle_bytes"]
+    assert result.metadata["bundle_bytes"] <= BYTE_CAP_GATE

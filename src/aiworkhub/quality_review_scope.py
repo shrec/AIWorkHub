@@ -123,6 +123,30 @@ def _command_text(value: object) -> str:
     return str(value or "")[:1024]
 
 
+MAX_VALIDATION_LAST_LINE_CHARS = 240
+
+
+def _last_output_line(row: Mapping[str, Any]) -> str:
+    """Return the last non-blank line an executed validation printed.
+
+    The finalizer retains a bounded ``stdout_tail``/``stderr_tail`` on every
+    validation row; the last line of it is the pytest summary, the traceback
+    tail or the linter count -- the one line a reviewer judging test adequacy
+    needs and used to re-run the command to obtain (measured: 20 pytest
+    re-runs and 85 sandbox probes per 1,024 reviewer runs, 2026-09-08 audit).
+    """
+
+    for key in ("stdout_tail", "stderr_tail"):
+        text = row.get(key)
+        if not isinstance(text, str):
+            continue
+        for line in reversed(text.splitlines()):
+            stripped = line.strip()
+            if stripped:
+                return stripped[:MAX_VALIDATION_LAST_LINE_CHARS]
+    return ""
+
+
 def _row_value(row: Any, field: str, default: Any = None) -> Any:
     if isinstance(row, Mapping):
         return row.get(field, default)
@@ -383,6 +407,10 @@ def build_scoped_audits(
                 continue
             changed = changed_paths[index % len(changed_paths)]
             identity = _stable_id("validation", index, command, returncode)
+            last_line = _last_output_line(row)
+            description = f"Executed validation returned {returncode}: {command}"
+            if last_line:
+                description += f"; last output line: {last_line}"
             tests[identity] = EvidenceReference(
                 identity=identity,
                 evidence_kind="test_target",
@@ -394,7 +422,7 @@ def build_scoped_audits(
                 path=changed.path,
                 line_start=changed.line_start,
                 line_end=changed.line_end,
-                description=f"Executed validation returned {returncode}: {command}"[:1024],
+                description=description[:1024],
                 supports_blocker=returncode != 0,
             )
 

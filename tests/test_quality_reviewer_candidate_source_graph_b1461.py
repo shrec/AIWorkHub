@@ -238,7 +238,11 @@ def test_quality_reviewer_source_graph_uses_packet_bound_candidate_overlay(
     assert result["hit_count"] > 0
     assert "candidate_only_symbol" in result["content"]
     assert result["authority_source"] == "candidate_overlay"
-    assert result["authority_state"] == "quality_review_readonly"
+    # Deliberate (source_graph-3): ``authority_state`` left the model-facing
+    # envelope for the HMAC-authenticated ledger row; the pair is asserted
+    # below through ``authority_index_identity``, which is stronger evidence
+    # than an unsigned field on the reply.
+    assert "authority_state" not in result
     assert result["authority_repo"] == str(candidate.resolve())
     assert result["target_request_id"] == "target-request-1"
     assert result["target_task_id"] == "TARGET_TASK_1"
@@ -573,7 +577,18 @@ def test_review_packet_source_evidence_centers_nf3_late_changed_symbol(
 
     filler_count = row["excerpt"].count("# unchanged filler")
     assert 0 < filler_count <= manager._QUALITY_REVIEW_SOURCE_CONTEXT_LINES
-    assert "_v3_planned_outputs" in row["excerpt"][:200]
+    # The excerpt is the complete unified diff hunk now, not a candidate-only
+    # window: an ``@@`` header, up to three ``' '`` context lines, the ``'-'``
+    # baseline lines and then the ``'+'`` candidate lines.  Centring is still
+    # what this pins -- the late changed symbol arrives inside the first (and
+    # only) hunk rather than after a walk from the file head -- and the removed
+    # baseline definition is now carried too, which the old window never was.
+    assert "+def _v3_planned_outputs():\n" in row["excerpt"]
+    assert "-def unchanged_tail():\n" in row["excerpt"]
+    assert row["excerpt"].index("_v3_planned_outputs") < 400
+    assert row["excerpt"].count("@@ path:") == 1
+    assert row["diff_complete"] is True
+    assert row["truncated"] is False
     assert (
         "tests/test_quality_reviewer_candidate_source_graph_b1461.py" in row["excerpt"]
     )
@@ -672,6 +687,158 @@ def test_review_packet_rejects_omitted_hunks_without_exact_range_metadata() -> N
                 }
             },
         )
+
+
+def test_review_packet_carries_whole_diff_hunks_with_removed_and_added_lines(
+    tmp_path: Path,
+) -> None:
+    """The excerpt is a real unified diff, not a candidate-only window.
+
+    Measured 2026-09-08 over 38 packets: a 4,000 B per-path excerpt carried
+    2.0% of the changed bytes and flagged 67% of rows truncated, so reviewers
+    re-read their own changed files (63.5% of every byte read) and ran git diff
+    in 38% of runs.  Each non-equal opcode is now emitted whole: an ``@@``
+    header, ``' '`` context bounded by the ADJACENT equal blocks, ``'-'``
+    baseline lines and ``'+'`` candidate lines.  The clamp is what keeps a
+    short equal run between two hunks from letting one hunk present the
+    other's changed line as unchanged context.
+    """
+    canonical = tmp_path / "canonical"
+    candidate = tmp_path / "candidate"
+    canonical.mkdir()
+    candidate.mkdir()
+    baseline = ["a = 1\n", "b = 2\n", "OLD_ONE = 'x'\n", "gap1 = 0\n", "gap2 = 0\n",
+                "OLD_TWO = 'y'\n", "z = 9\n"]
+    changed = ["a = 1\n", "b = 2\n", "NEW_ONE = 'x'\n", "gap1 = 0\n", "gap2 = 0\n",
+               "NEW_TWO = 'y'\n", "z = 9\n"]
+    (canonical / "m.py").write_text("".join(baseline), encoding="utf-8")
+    candidate_file = candidate / "m.py"
+    candidate_file.write_text("".join(changed), encoding="utf-8")
+    digest = hashlib.sha256(candidate_file.read_bytes()).hexdigest()
+    manager = SimpleNamespace(
+        repo=canonical,
+        _QUALITY_REVIEW_SOURCE_TOTAL_MAX_BYTES=64 * 1024,
+        _QUALITY_REVIEW_SOURCE_MAX_BYTES=24 * 1024,
+        _QUALITY_REVIEW_SOURCE_CONTEXT_LINES=3,
+    )
+
+    evidence = process_launcher.ProcessManager._quality_review_source_evidence(
+        manager, SimpleNamespace(path=candidate), {"m.py": digest}
+    )
+    packet = quality_reviewer.build_review_packet(
+        request_id="target-request-1",
+        task_id="TARGET_TASK_1",
+        claim_epoch=1,
+        worker_provider="codex_cli",
+        changed_path_hashes={"m.py": digest},
+        source_evidence=evidence,
+    )
+    row = packet["candidate"]["source_evidence"][0]
+    hunks = row["excerpt"].split("@@ path:")
+
+    assert row["diff_complete"] is True
+    assert row["truncated"] is False
+    assert "omission_reason" not in row
+    assert len(row["segments"]) == 2
+    for removed, added in (("OLD_ONE", "NEW_ONE"), ("OLD_TWO", "NEW_TWO")):
+        assert f"-{removed} = " in row["excerpt"]
+        assert f"+{added} = " in row["excerpt"]
+    # Two hunks plus the leading empty split element.
+    assert len(hunks) == 3
+    # A hunk's context never presents the OTHER hunk's changed line as
+    # unchanged: the two-line equal run between them clamps both windows.
+    assert " OLD_TWO" not in hunks[1] and " NEW_TWO" not in hunks[1]
+    assert " OLD_ONE" not in hunks[2] and " NEW_ONE" not in hunks[2]
+    assert row["excerpt"].count(" gap1 = 0\n") == 2
+
+
+def _caller_context_manager(canonical: Path) -> SimpleNamespace:
+    cls = process_launcher.ProcessManager
+    return SimpleNamespace(
+        repo=canonical,
+        _QUALITY_REVIEW_CALLER_CONTEXT_LINES=cls._QUALITY_REVIEW_CALLER_CONTEXT_LINES,
+        _QUALITY_REVIEW_CALLER_CONTEXT_MAX_ROWS=cls._QUALITY_REVIEW_CALLER_CONTEXT_MAX_ROWS,
+        _QUALITY_REVIEW_CALLER_CONTEXT_ROW_MAX_BYTES=(
+            cls._QUALITY_REVIEW_CALLER_CONTEXT_ROW_MAX_BYTES
+        ),
+        _QUALITY_REVIEW_CALLER_CONTEXT_TOTAL_MAX_BYTES=(
+            cls._QUALITY_REVIEW_CALLER_CONTEXT_TOTAL_MAX_BYTES
+        ),
+    )
+
+
+def test_caller_context_reads_canonical_source_around_graph_resolved_callers(
+    tmp_path: Path,
+) -> None:
+    """The caller lines the scoped audit already names, read from canonical.
+
+    Impact rows sit at the 64-row cap in every surviving packet, and the caller
+    search reviewers ran by hand (110 Agent subagents in 60 claude runs) was
+    looking for exactly these lines.  A caller inside a CHANGED path is skipped
+    -- the diff already carries that file -- and only ``callers`` rows count.
+    """
+    canonical = tmp_path / "canonical"
+    (canonical / "src").mkdir(parents=True)
+    (canonical / "src" / "caller.py").write_text(
+        "".join(f"line {index}\n" for index in range(1, 31)), encoding="utf-8"
+    )
+    scoped = {
+        "correctness": {"packet": {"impact_evidence": [
+            {"identity": "callers:1", "evidence_kind": "callers",
+             "path": "src/caller.py", "line_start": 12},
+            {"identity": "callers:2", "evidence_kind": "callers",
+             "path": "src/changed.py", "line_start": 3},
+            {"identity": "tests:1", "evidence_kind": "test_target",
+             "path": "src/caller.py", "line_start": 2},
+        ]}},
+    }
+
+    context = process_launcher.ProcessManager._quality_review_caller_context(
+        _caller_context_manager(canonical), {"src/changed.py": "a" * 64}, scoped
+    )
+
+    assert context == {
+        "rows": [{
+            "identity": "callers:1",
+            "path": "src/caller.py",
+            "line": 12,
+            "line_start": 7,
+            "line_end": 17,
+            "source": "canonical",
+            "text": "".join(f"line {index}\n" for index in range(7, 18)),
+        }],
+        "complete": True,
+        "omitted": 0,
+    }
+
+
+def test_caller_context_counts_every_caller_it_could_not_carry(tmp_path: Path) -> None:
+    """A missing caller snippet is named, never silent."""
+    canonical = tmp_path / "canonical"
+    (canonical / "src").mkdir(parents=True)
+    (canonical / "src" / "caller.py").write_text("only line\n", encoding="utf-8")
+    scoped = {
+        "correctness": {"packet": {"impact_evidence": [
+            {"identity": "callers:1", "evidence_kind": "callers",
+             "path": "src/caller.py", "line_start": 1},
+            {"identity": "callers:past_eof", "evidence_kind": "callers",
+             "path": "src/caller.py", "line_start": 999},
+            {"identity": "callers:absent", "evidence_kind": "callers",
+             "path": "src/missing.py", "line_start": 1},
+            {"identity": "callers:escape", "evidence_kind": "callers",
+             "path": "../outside.py", "line_start": 1},
+        ]}},
+    }
+
+    context = process_launcher.ProcessManager._quality_review_caller_context(
+        _caller_context_manager(canonical), {"src/changed.py": "a" * 64}, scoped
+    )
+
+    assert [row["identity"] for row in context["rows"]] == ["callers:1"]
+    # Past EOF and the unreadable file are counted; the escaped path is refused
+    # before it is ever a candidate row.
+    assert context["complete"] is False
+    assert context["omitted"] == 2
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Windows forbids control characters in paths")

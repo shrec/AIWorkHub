@@ -561,3 +561,172 @@ def test_stored_state_digest_is_none_for_an_absent_store_or_row(tmp_path):
     assert store.stored_state_digest(tmp_path, "nope", "1.0.0") is None
     _self_certified_active(tmp_path)
     assert store.stored_state_digest(tmp_path, "nope", "1.0.0") is None
+
+
+# ---------------------------------------------------------------------------
+# Selection receipts: WHICH skills a card actually received.
+#
+# The packet was built at prompt time and dropped, so the retirement report said
+# cards_with_persisted_packet=0 and injected_cards=0 for 4,681 cards, and the
+# accept/reject evidence loop had no list of skills to attribute an outcome to.
+# ---------------------------------------------------------------------------
+
+
+def _packet(*rows, version="1"):
+    return {
+        "version": version,
+        "skills": [
+            {
+                "identity": identity,
+                "version": ver,
+                "digest": f"digest-{identity}",
+                "reasons": ["task_family"],
+                "procedure_steps": ["do the thing"],
+            }
+            for identity, ver in rows
+        ],
+    }
+
+
+def test_a_selection_receipt_records_the_identities_and_the_packet_sha(tmp_path):
+    result = store.record_selection(
+        tmp_path, task_id="T1", request_id="R1", packet=_packet(("a", "1.0.0"))
+    )
+
+    assert result["schema_id"] == store.SELECTION_RECEIPT_SCHEMA_ID
+    assert result["packet_sha256"] == store.selection_packet_sha256(
+        _packet(("a", "1.0.0"))
+    )
+    assert result["skills"] == [{"identity": "a", "version": "1.0.0", "digest": "digest-a"}]
+
+    stored = store.get_selection(tmp_path, "T1", "R1")
+    assert stored["skills"] == result["skills"]
+    assert stored["packet_sha256"] == result["packet_sha256"]
+
+
+def test_the_receipt_carries_addresses_and_never_procedure_text(tmp_path):
+    """It must not become a second, drifting copy of a skill's instructions."""
+    store.record_selection(
+        tmp_path, task_id="T1", request_id="R1", packet=_packet(("a", "1.0.0"))
+    )
+    blob = json.dumps(store.get_selection(tmp_path, "T1", "R1"))
+    assert "do the thing" not in blob
+
+
+def test_recording_the_same_packet_twice_is_idempotent(tmp_path):
+    first = store.record_selection(
+        tmp_path, task_id="T1", request_id="R1", packet=_packet(("a", "1.0.0"))
+    )
+    second = store.record_selection(
+        tmp_path, task_id="T1", request_id="R1", packet=_packet(("a", "1.0.0"))
+    )
+    assert first["idempotent"] is False
+    assert second["idempotent"] is True
+    assert len(store.list_selections(tmp_path)) == 1
+
+
+def test_a_relaunch_that_rebuilds_the_packet_replaces_the_stale_list(tmp_path):
+    """Crediting a decision to skills the worker never saw would be a fabrication."""
+    store.record_selection(
+        tmp_path, task_id="T1", request_id="R1", packet=_packet(("a", "1.0.0"))
+    )
+    replaced = store.record_selection(
+        tmp_path, task_id="T1", request_id="R1", packet=_packet(("b", "2.0.0"))
+    )
+
+    assert replaced["replaced"] is True
+    assert store.get_selection(tmp_path, "T1", "R1")["skills"] == [
+        {"identity": "b", "version": "2.0.0", "digest": "digest-b"}
+    ]
+
+
+def test_an_empty_packet_is_recorded_as_a_measurement(tmp_path):
+    """"Looked and matched nothing" must not read as "selection never ran"."""
+    result = store.record_selection(
+        tmp_path, task_id="T1", request_id="R1", packet=_packet()
+    )
+    assert result["skills"] == []
+    assert store.get_selection(tmp_path, "T1", "R1") is not None
+    assert store.injection_counts(tmp_path) == {}
+
+
+def test_a_receipt_accepts_the_packet_object_the_selection_site_holds(tmp_path):
+    """The one call a launcher adds must not depend on which object is in scope."""
+    record = base_record(identity="a", version="1.0.0")
+    registry = sr.SkillRegistry()
+    registry.adopt(record)
+    receipt = sr.SkillSelectionReceipt(
+        selected=(sr.SkillSelection("a", "1.0.0", sr.skill_digest(record), ()),)
+    )
+
+    result = store.record_selection(
+        tmp_path, task_id="T1", request_id="R1", packet=receipt
+    )
+    assert [row["identity"] for row in result["skills"]] == ["a"]
+
+
+def test_injection_counts_are_recorded_never_replayed(tmp_path):
+    store.record_selection(
+        tmp_path, task_id="T1", request_id="R1", packet=_packet(("a", "1.0.0"))
+    )
+    store.record_selection(
+        tmp_path, task_id="T2", request_id="R2",
+        packet=_packet(("a", "1.0.0"), ("b", "2.0.0")),
+    )
+
+    counts = store.injection_counts(tmp_path)
+
+    assert counts["a@1.0.0"]["injected_cards"] == 2
+    assert counts["a@1.0.0"]["injected_requests"] == 2
+    assert counts["b@2.0.0"]["injected_cards"] == 1
+    assert sorted(counts["a@1.0.0"]["card_ids"]) == ["T1", "T2"]
+
+
+def test_a_card_with_no_receipt_reads_as_none_not_as_an_empty_selection(tmp_path):
+    assert store.get_selection(tmp_path, "NEVER_LAUNCHED", "R") is None
+    assert store.list_selections(tmp_path) == []
+    assert store.injection_counts(tmp_path) == {}
+
+
+def test_the_receipt_table_is_additive_over_an_existing_store(tmp_path):
+    """An older database gains the table without touching a stored record."""
+    record = base_record()
+    store.put_record(tmp_path, record)
+    store.record_selection(
+        tmp_path, task_id="T1", request_id="R1", packet=_packet(("a", "1.0.0"))
+    )
+
+    assert store.get_record(tmp_path, record.identity, record.version) is not None
+    assert store.list_records(tmp_path)[0].identity == record.identity
+
+
+def test_an_oversized_packet_is_refused_rather_than_stored(tmp_path):
+    rows = tuple((f"s{index}", "1.0.0") for index in range(store.MAX_RECEIPT_SKILLS + 1))
+    with pytest.raises(store.SkillStoreError, match="selection_packet_too_large"):
+        store.record_selection(
+            tmp_path, task_id="T1", request_id="R1", packet=_packet(*rows)
+        )
+    assert store.list_selections(tmp_path) == []
+
+
+def test_a_receipt_needs_a_task_id(tmp_path):
+    with pytest.raises(store.SkillStoreError, match="task_id_required"):
+        store.record_selection(
+            tmp_path, task_id="", request_id="R1", packet=_packet(("a", "1.0.0"))
+        )
+
+
+def test_the_launcher_entry_point_reports_a_refusal_instead_of_raising(tmp_path):
+    """The prompt-build path must not die because a receipt could not be written."""
+    refused = store.record_selection_reported(
+        tmp_path, task_id="", request_id="R1", packet=_packet(("a", "1.0.0"))
+    )
+    assert refused["ok"] is False
+    assert refused["reason"] == "skill_selection_receipt_not_recorded:SkillStoreError"
+    assert "task_id_required" in refused["detail"]
+
+    ok = store.record_selection_reported(
+        tmp_path, task_id="T1", request_id="R1", packet=_packet(("a", "1.0.0"))
+    )
+    assert ok["ok"] is True
+    assert store.get_selection(tmp_path, "T1", "R1")["skills"][0]["identity"] == "a"

@@ -28,9 +28,11 @@ from . import (
     task_store,
 )
 from .learning_commit import (
+    ALLOWED_EVIDENCE_ID_SCHEMES,
     FailureCategory,
     LearningCommit,
     Outcome,
+    commit_owed,
     learning_commit_from_dict,
     validate_repo_match,
 )
@@ -525,8 +527,15 @@ def commit_learning(
     try:
         commit = learning_commit_from_dict(normalized)
         validate_repo_match(commit, readiness.repo_id)
-    except (TypeError, ValueError) as exc:
-        raise LearningCommitStoreError(f"invalid_learning_commit:{exc}") from exc
+    except (TypeError, ValueError, evidence_levels.EvidenceValidationError) as exc:
+        # ``EvidenceValidationError`` is NOT a ValueError, so a bad evidence id
+        # -- the commonest measured shape failure, a ``sha256:`` receipt id --
+        # escaped this handler and reached the MCP surface as an uncaught
+        # exception instead of a named refusal the caller could act on.
+        raise LearningCommitStoreError(
+            f"invalid_learning_commit:{exc}; allowed evidence id schemes: "
+            + ", ".join(ALLOWED_EVIDENCE_ID_SCHEMES)
+        ) from exc
     if commit.promotion_eligible_ai_memory and not commit.lesson_candidate:
         raise LearningCommitStoreError("learning_commit_memory_promotion_requires_lesson")
     if commit.promotion_eligible_context_graph and not commit.edge_candidates:
@@ -642,13 +651,152 @@ def commit_learning(
     }
 
 
+def adjudicated_decision(card: dict[str, Any], request_id: str) -> str:
+    """Return ``"accepted"``, ``"rejected"`` or ``""`` for ONE request on a card.
+
+    The card is the authority on its own outcome, and this is the single place
+    that reads it. ``""`` means the card names no decision bound to this exact
+    request -- not that none was taken -- so a caller must treat it as unknown
+    rather than as an absence of judgement.
+    """
+    if not isinstance(card, dict):
+        return ""
+    request = str(request_id or "").strip()
+    if not request:
+        return ""
+    if (
+        task_store.canonical_status(card) == "finished"
+        and str(card.get("accepted_request_id") or "") == request
+    ):
+        return "accepted"
+    if _request_matches_candidate(card, request):
+        return "rejected"
+    return ""
+
+
+def _decision_changed_paths(
+    card: dict[str, Any], decision: str
+) -> tuple[list[str], str]:
+    """The paths the decision was taken over, and WHERE they were read from.
+
+    Accepted: exactly what was promoted into the canonical tree. Rejected: the
+    predecessor's changed paths, which ``core.reject_review`` pinned in the same
+    transition that produced the feedback. Both are written by the decision path
+    itself, never by a model.
+
+    When the decision recorded no paths at all -- a card accepted with an empty
+    promotion, or one rejected before the pin existed -- the card's own declared
+    write scope is used instead. That is still read off the card, and the source
+    is returned so a reader can tell the two apart rather than being handed a
+    repo area whose provenance is invisible.
+    """
+    if decision == "accepted":
+        evidence = card.get("accept_evidence")
+        promoted = evidence.get("promoted_paths") if isinstance(evidence, dict) else None
+        paths = [str(item) for item in promoted or [] if isinstance(item, str)][:256]
+        if paths:
+            return paths, "accept_evidence.promoted_paths"
+    else:
+        feedback = card.get("review_feedback")
+        if isinstance(feedback, dict):
+            raw = feedback.get("predecessor_changed_paths")
+            if isinstance(raw, (list, tuple)) and raw:
+                return (
+                    [str(item) for item in raw if isinstance(item, str)][:256],
+                    "review_feedback.predecessor_changed_paths",
+                )
+        predecessor = card.get("rework_predecessor")
+        if isinstance(predecessor, dict):
+            hashes = predecessor.get("changed_path_hashes")
+            if isinstance(hashes, dict) and hashes:
+                return (
+                    sorted(str(key) for key in hashes)[:256],
+                    "rework_predecessor.changed_path_hashes",
+                )
+    declared = card.get("allowed_writes") or card.get("read_first") or []
+    if isinstance(declared, (list, tuple)) and declared:
+        return (
+            [str(item) for item in declared if isinstance(item, str)][:256],
+            "card.allowed_writes",
+        )
+    return [], ""
+
+
+def resolve_short_form(
+    repo: str | Path, *, task_id: str, request_id: str
+) -> dict[str, Any]:
+    """Fill every MECHANICAL learning-commit field from the card's own decision.
+
+    ``aiworkhub_manager_learning_commit`` demands seven fields of which six are
+    already computed by :func:`learning_commit.commit_owed` and echoed in the
+    accept/reject reply the manager just read. Retyping them cost 16 shape
+    failures in 40 measured calls (an invalid outcome, a refused ``sha256:``
+    evidence id, an identity mismatch) and coverage sat at 53 commits against
+    3,383 decisions -- 1.6%.
+
+    Nothing here is a judgement. The outcome is READ from the card's own
+    decision event, the repo area is derived from the paths that decision was
+    taken over, the acceptance evidence id is the canonical
+    FIXED_AND_VERIFIED reference the accept path already sealed, and the
+    idempotency key and provenance are the same deterministic strings
+    ``commit_owed`` returns. The lesson text stays caller-authored; this writes
+    nothing.
+    """
+    repo_path = Path(repo)
+    task = str(task_id or "").strip()
+    request = str(request_id or "").strip()
+    if not task or not request:
+        raise LearningCommitStoreError("learning_commit_task_and_request_required")
+    readiness = task_store.storage_readiness(repo_path)
+    if not readiness.ready:
+        raise LearningCommitStoreError(
+            f"canonical_task_store_unavailable:{readiness.reason}"
+        )
+    card = task_store.get_task(repo_path, task)
+    if card is None:
+        raise LearningCommitStoreError("learning_commit_task_not_found")
+    decision = adjudicated_decision(card, request)
+    if not decision:
+        raise LearningCommitStoreError("learning_commit_request_identity_mismatch")
+    evidence_reference = ""
+    if decision == "accepted":
+        # Raises with the exact reason when the acceptance seal is missing or
+        # not FIXED_AND_VERIFIED, which is the same refusal commit_learning
+        # would produce -- surfaced before the manager writes a lesson.
+        evidence_reference = _canonical_acceptance_reference(card, request)
+    changed_paths, paths_source = _decision_changed_paths(card, decision)
+    owed = commit_owed(
+        task_id=task,
+        request_id=request,
+        outcome=decision,
+        changed_paths=changed_paths,
+        evidence_reference=evidence_reference,
+    )
+    if not str(owed["repo_area"] or "").strip():
+        raise LearningCommitStoreError(
+            "learning_commit_repo_area_not_derivable:"
+            f"the {decision} card records no changed paths and declares no write "
+            "scope; supply repo_area explicitly"
+        )
+    return {
+        **owed,
+        "resolved_from": "task_card_decision_event",
+        "repo_area_source": paths_source,
+        "repository_id": readiness.repo_id,
+        "allowed_evidence_id_schemes": list(ALLOWED_EVIDENCE_ID_SCHEMES),
+    }
+
+
 __all__ = [
+    "ALLOWED_EVIDENCE_ID_SCHEMES",
     "LearningCommitStoreError",
     "SCHEMA_ID",
+    "adjudicated_decision",
     "commit_learning",
     "injection_ledger_state",
     "read_card_outcomes",
     "read_correction_record",
+    "resolve_short_form",
 ]
 
 # ---------------------------------------------------------------------------
@@ -841,28 +989,45 @@ def injection_ledger_state(repo: str | Path) -> dict[str, Any]:
     good skills and keep bad ones with equal confidence.
     """
     from . import skill_registry as _skill_registry
+    from . import skill_registry_store as _skill_store
 
     repo_path = Path(repo)
+    # The selection receipt store is now the authority for "which skills did
+    # this card receive". It is a RECORD of what was injected, written at the
+    # selection site, never a replay of selection over history -- so a card with
+    # no receipt still contributes nothing rather than a guess.
+    try:
+        receipts = _skill_store.list_selections(repo_path)
+    except (_skill_store.SkillStoreError, OSError, sqlite3.Error):
+        receipts = []
+    receipt_cards = {str(item["task_id"]) for item in receipts}
+    receipt_cards_with_skills = {
+        str(item["task_id"]) for item in receipts if item["skills"]
+    }
     try:
         conn = _readonly(repo_path)
     except Exception:  # noqa: BLE001
         return {
-            "state": "unavailable",
-            "reason": "task_store_unreadable",
+            "state": "available" if receipt_cards_with_skills else "unavailable",
+            "reason": (
+                "" if receipt_cards_with_skills else "task_store_unreadable"
+            ),
             "cards_scanned": 0,
-            "cards_with_persisted_packet": 0,
+            "cards_with_persisted_packet": len(receipt_cards),
             "cards_with_selection_context": 0,
-            "injected_cards": 0,
+            "injected_cards": len(receipt_cards_with_skills),
+            "selection_receipts": len(receipts),
         }
     scanned = with_packet = with_context = 0
     try:
         conn.row_factory = sqlite3.Row
-        for row in conn.execute("SELECT card_json FROM tasks"):
+        for row in conn.execute("SELECT task_id, card_json FROM tasks"):
             card = _card_of(row)
             scanned += 1
             context = card.get("project_context")
-            if isinstance(context, dict) and any(
-                "skill" in str(key).lower() for key in context
+            if str(row["task_id"]) in receipt_cards or (
+                isinstance(context, dict)
+                and any("skill" in str(key).lower() for key in context)
             ):
                 with_packet += 1
             try:
@@ -874,17 +1039,19 @@ def injection_ledger_state(repo: str | Path) -> dict[str, Any]:
         pass
     finally:
         conn.close()
-    measurable = with_packet > 0
+    injected = len(receipt_cards_with_skills)
+    measurable = injected > 0
     return {
         "state": "available" if measurable else "unavailable",
         "reason": (
             ""
             if measurable
-            else "no_card_persists_a_skill_packet_and_no_card_declares_selection_vocabulary"
+            else "no_card_persists_a_skill_packet_and_no_selection_receipt_is_recorded"
         ),
         "cards_scanned": scanned,
-        "cards_with_persisted_packet": with_packet,
+        "cards_with_persisted_packet": max(with_packet, len(receipt_cards)),
         "cards_with_selection_context": with_context,
-        "injected_cards": with_packet,
+        "injected_cards": injected,
+        "selection_receipts": len(receipts),
     }
 

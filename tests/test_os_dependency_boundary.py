@@ -89,7 +89,45 @@ def test_current_tree_passes_and_baseline_is_sorted():
     # workspace_hygiene.py already do) and both it and tool_recipes_store.py
     # open sqlite, as every other *_store.py in the baseline does. The tree
     # still carries 18 FEWER OS dependencies than the reference commit.
-    assert sum(entry.count for entry in boundary.baseline) == 143
+    # 143 -> 135 on 2026-09-08, and the arithmetic is the point:
+    #   +1 recipe_runner.py:os_name_eq -- a new module's single `_is_windows()`
+    #      predicate, the precedent every other module already sets.
+    #   +4 review_orchestrator.py:sqlite_connect 2 -> 6 -- four more
+    #      `with closing(sqlite3.connect(...))` blocks in the queue work; all
+    #      six close, so sqlite_context_managers_close still holds.
+    #   -3 db_writer.py import_fcntl/import_msvcrt/sqlite_connect were never
+    #      real. The module is byte-identical to the commit that recorded them,
+    #      it opens no connection, and its line 110 says outright "There is
+    #      deliberately no fcntl/msvcrt branching in this module": the three
+    #      entries were read off prose. A decrease never fails the ratchet, so
+    #      nothing ever challenged them -- the claim above about db_writer.py
+    #      taking an advisory lock is the error, kept here as the record.
+    #   -1 process_launcher.py:os_name_ne, -2 runtime_adapters.py:os_name_eq,
+    #      -2 worker_workspace.py:os_name_eq (10 -> 8) and -5
+    #      worker_workspace.py:os_name_ne (9 -> 4) -- real removals from this
+    #      wave's refactors.
+    # 143 + 5 - 3 - 10 = 135, now 26 FEWER than the reference commit.
+    # 135 -> 136 on 2026-09-08, and the +1 is a SCOPE change, not a new
+    # dependency: the seven operator recipe scripts moved from ``scripts/``,
+    # which this scanner does not read, into ``src/aiworkhub/recipes/``, which
+    # it does. They had to move -- their recipes' argv named
+    # ``scripts/recipes/<name>.py``, a path that exists only in this checkout,
+    # so every one of them was unrunnable in the repositories AIWorkHub
+    # manages. Two dependencies came with them and only one survived review:
+    #   +1 recipes/_common.py:sqlite_connect -- the task queue is opened
+    #      ``mode=ro&immutable=1``, and ``sqlite_readonly.connect_readonly``
+    #      cannot express ``immutable=1``. Dropping it would make an audit read
+    #      take a lock and replay the WAL of a database a live launch is
+    #      writing, which is exactly what these read-only modules must not do.
+    #      The move was still an improvement: the URI is now built with
+    #      ``Path.as_uri()`` instead of an f-string, closing the ``#``-in-path
+    #      hole that opened a DIFFERENT file read-write, and ``PRAGMA
+    #      query_only=ON`` was added -- both guarantees the facade documents.
+    #   +0 recipes/repo_test_subset.py:sys_platform -- deleted rather than
+    #      recorded. As a bare script it could not import the sanctioned
+    #      facade; as a package module it can, and now calls
+    #      ``platform_io.is_windows()``.
+    assert sum(entry.count for entry in boundary.baseline) == 136
 
 
 def test_new_identity_and_same_identity_growth_fail(tmp_path):

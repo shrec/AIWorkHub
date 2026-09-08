@@ -976,6 +976,208 @@ def test_crash_retry_packet_reuses_bounded_failure_evidence_without_stale_tree(
     assert "stale-later-data" not in path.read_text(encoding="utf-8")
 
 
+def _clean_exit_predecessor(
+    tmp_path: Path,
+    *,
+    checks: list[dict],
+    review: dict,
+    with_bundle: bool = True,
+) -> tuple[Path, "process_launcher.WorkerWorkspace", str, dict]:
+    """A validation_failed-style predecessor: exit 0, empty supervisor error."""
+    repo = tmp_path / "repo"
+    process_dir = repo / ".aiworkhub" / "runtime" / "process_logs" / "processes"
+    worktree = tmp_path / "successor" / "worktree"
+    home = tmp_path / "successor" / "home"
+    repo.mkdir(parents=True)
+    process_dir.mkdir(parents=True)
+    worktree.mkdir(parents=True)
+    home.mkdir(parents=True)
+    workspace = process_launcher.WorkerWorkspace(
+        request_id="5" * 32,
+        repo=repo,
+        path=worktree,
+        home=home,
+        allowed_writes=("src/service.py",),
+        parent_baseline={"src/service.py": None},
+        workspace_baseline={"src/service.py": "a" * 64},
+        inherited_rework_paths=("src/service.py",),
+    )
+    predecessor = "6" * 32
+    process_launcher.write_json_0600(
+        process_dir / f"{predecessor}.request.json",
+        {
+            "request_id": predecessor,
+            "task_id": "TASK_SAME",
+            "workspace": {"repo": str(repo)},
+        },
+    )
+    process_launcher.write_json_0600(
+        process_dir / f"{predecessor}.supervisor.json",
+        {"state": "exited", "exit_code": 0, "error": ""},
+    )
+    (process_dir / f"{predecessor}.stdout.log").write_text(
+        "worker-final-stream-not-a-diagnostic\n", encoding="utf-8"
+    )
+    (process_dir / f"{predecessor}.stderr.log").write_text(
+        "worker-final-stderr\n", encoding="utf-8"
+    )
+    if with_bundle:
+        process_launcher.attempt_artifacts.persist_json_bundle(
+            process_dir / "attempt-artifacts" / predecessor,
+            attempt_id=predecessor,
+            payloads={
+                "metadata": {"request_id": predecessor},
+                "diff": {"changed_paths": ["src/service.py"]},
+                "validation": {"checks": checks},
+                "usage": {"usage_observed": False},
+                "review": review,
+            },
+        )
+    overlay = {
+        "predecessor_request_id": predecessor,
+        "predecessor_task_id": "TASK_SAME",
+        "canonical_digest": "b" * 64,
+    }
+    return process_dir, workspace, predecessor, overlay
+
+
+def test_crash_retry_packet_carries_validation_delta_for_clean_exit_validation_failed(
+    tmp_path: Path,
+) -> None:
+    """retries-1 / worker_validation-3: every validation_failed predecessor
+    exits 0, so an exit-code gate dropped the sealed failure delta for the
+    whole class. A clean exit with a failed check now yields the packet with
+    the delta receipts and without the worker's own final stream tails."""
+    process_dir, workspace, predecessor, overlay = _clean_exit_predecessor(
+        tmp_path,
+        checks=[
+            {
+                "returncode": 0,
+                "argv": ["ruff", "check", "src"],
+                "stdout_tail": "All checks passed!",
+            },
+            {
+                "returncode": 1,
+                "argv": ["pytest", "tests/test_service.py"],
+                "stderr_tail": "FAILED tests/test_service.py::test_x - AssertionError",
+            },
+        ],
+        review={
+            "target_state": "validation_failed",
+            "error": "validation_failed:pytest tests/test_service.py:rc=1:stdout=:stderr=x",
+        },
+    )
+
+    path, packet = process_launcher._materialize_crash_retry_packet(
+        process_dir,
+        workspace,
+        task_id="TASK_SAME",
+        card={"rework_predecessor": {"request_id": predecessor}},
+        rework_overlay_packet=overlay,
+    )
+
+    assert path is not None and path.is_file()
+    assert packet is not None
+    assert packet["predecessor_state"] == "exited"
+    assert packet["predecessor_exit_code"] == 0
+    assert packet["predecessor_error"] == ""
+    assert packet["predecessor_terminal_substatus"] == "validation_failed"
+    delta = packet["validation_failure_delta"]
+    assert delta["failure_count"] == 1
+    receipt = delta["receipts"][0]
+    assert receipt["failure_class"] == "test_failure"
+    assert receipt["argv"] == ["pytest", "tests/test_service.py"]
+    assert receipt["returncode"] == 1
+    assert "AssertionError" in receipt["diagnostic_tail"]
+    assert delta["automatic_repair_authorized"] is False
+    assert len(packet["validation_manifest_sha256"]) == 64
+    # Receipts carry the failure; the finalizer reason would only restate it.
+    assert packet["predecessor_terminal_reason"] == ""
+    # An exit-0 stream is the worker's own final output, not a diagnostic.
+    assert packet["stream_tails_omitted_reason"] == "predecessor_exited_clean"
+    assert packet["stdout_tail"] == "" and packet["stderr_tail"] == ""
+    assert "worker-final-stream" not in path.read_text(encoding="utf-8")
+    assert packet["rework_overlay_sha256"] == "b" * 64
+    assert packet["stale_worktree_bytes_authoritative"] is False
+    assert packet["canonical_reread_savings_claimed"] is False
+    encoded = json.dumps(packet, ensure_ascii=False, separators=(",", ":"))
+    assert len(encoded.encode("utf-8")) <= process_launcher.MAX_CRASH_RETRY_PACKET_BYTES
+    prompt = process_launcher.build_worker_prompt(
+        task_id="TASK_SAME",
+        runner="claude_worker_b1",
+        topic="task_mcp",
+        card={"task_id": "TASK_SAME", "rework_predecessor": {}},
+        crash_retry_packet=packet,
+    )
+    assert prompt.count("CRASH_RETRY_PACKET_JSON:") == 1
+    assert "do not infer current files from this text" in prompt
+
+
+def test_crash_retry_packet_carries_finalizer_reason_for_receipt_free_failure(
+    tmp_path: Path,
+) -> None:
+    """23% of validation_failed predecessors are receipt/contract failures
+    with zero failed checks; the delta is empty there, so the packet must
+    carry the finalizer's terminal reason instead of nothing."""
+    reason = (
+        "validation_required_aiworkhub_mcp_call_missing:"
+        "worker_mcp_required_tools_missing:source_graph"
+    )
+    process_dir, workspace, predecessor, overlay = _clean_exit_predecessor(
+        tmp_path,
+        checks=[{"returncode": 0, "argv": ["pytest", "-q"], "stdout_tail": "ok"}],
+        review={"target_state": "validation_failed", "error": reason},
+    )
+
+    _path, packet = process_launcher._materialize_crash_retry_packet(
+        process_dir,
+        workspace,
+        task_id="TASK_SAME",
+        card={"rework_predecessor": {"request_id": predecessor}},
+        rework_overlay_packet=overlay,
+    )
+
+    assert packet is not None
+    assert packet["validation_failure_delta"]["failure_count"] == 0
+    assert packet["predecessor_terminal_substatus"] == "validation_failed"
+    assert packet["predecessor_terminal_reason"] == reason
+    assert packet["stream_tails_omitted_reason"] == "predecessor_exited_clean"
+
+
+def test_crash_retry_packet_omitted_for_clean_exit_without_measured_failure(
+    tmp_path: Path,
+) -> None:
+    """A clean exit that reached review_ready has no failure delta to hand
+    over: the manager's review_feedback carries that rework. A clean exit
+    without any sealed bundle likewise yields no packet."""
+    process_dir, workspace, predecessor, overlay = _clean_exit_predecessor(
+        tmp_path / "reviewed",
+        checks=[{"returncode": 0, "argv": ["pytest", "-q"], "stdout_tail": "ok"}],
+        review={"target_state": "review_ready", "error": ""},
+    )
+    assert process_launcher._materialize_crash_retry_packet(
+        process_dir,
+        workspace,
+        task_id="TASK_SAME",
+        card={"rework_predecessor": {"request_id": predecessor}},
+        rework_overlay_packet=overlay,
+    ) == (None, None)
+
+    process_dir, workspace, predecessor, overlay = _clean_exit_predecessor(
+        tmp_path / "bare",
+        checks=[],
+        review={},
+        with_bundle=False,
+    )
+    assert process_launcher._materialize_crash_retry_packet(
+        process_dir,
+        workspace,
+        task_id="TASK_SAME",
+        card={"rework_predecessor": {"request_id": predecessor}},
+        rework_overlay_packet=overlay,
+    ) == (None, None)
+
+
 def test_crash_retry_packet_rejects_cross_task_predecessor(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     process_dir = tmp_path / "processes"
@@ -4020,6 +4222,53 @@ def test_provider_free_replay_usage_is_labeled_without_fabricated_observation(
     assert usage["provider_launched"] is False
     assert usage["usage_observed"] is False
     assert usage["telemetry_reason"] == "provider_not_invoked_deterministic_replay"
+
+
+@pytest.mark.parametrize("explicit_topic", ["task_mcp", None])
+def test_live_usage_record_payload_carries_request_topic(
+    monkeypatch, tmp_path, explicit_topic
+):
+    """retries-4: the launcher computed the topic and then dropped it from the
+    usage_record payload, so 31% of input tokens were unattributable although
+    every task and claim carries the topic. The payload now names it, from the
+    launch topic or, failing that, from the card."""
+    output = tmp_path / "provider-output.jsonl"
+    output.write_text(
+        '{"type":"result","usage":{"input_tokens":7,"output_tokens":3}}\n',
+        encoding="utf-8",
+    )
+    card = _card()
+    manager = _manager(
+        tmp_path,
+        show_task=_show(lambda: card),
+        argv=[sys.executable, "-c", "pass"],
+    )
+    captured: dict = {}
+
+    def fake_append(repo, task_id, runner, **kwargs):
+        captured.update(kwargs)
+        return True, "recorded"
+
+    monkeypatch.setattr(
+        process_launcher.task_store, "append_live_usage_event", fake_append
+    )
+    _usage, recorded, error = manager._record_usage(
+        "request-topic",
+        card["task_id"],
+        card["runner"],
+        "claude_cli",
+        "claude-sonnet-5",
+        output,
+        topic=explicit_topic,
+        claim_authority={
+            "request_id": "request-topic",
+            "claimed_by": card["runner"],
+            "claim_epoch": 1,
+        },
+    )
+
+    assert (recorded, error) == (True, "")
+    assert captured["payload"]["topic"] == card["topic"]
 
 
 def test_append_live_usage_event_requires_exact_current_claim(tmp_path):
