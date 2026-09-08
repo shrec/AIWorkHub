@@ -814,6 +814,18 @@ def quarantine(repo_root: Path | str, *, preview_digest: str, confirm: bool) -> 
         # directory when even the initial durable manifest cannot be created.
         batch.rmdir()
         raise
+    # NF-2026-00642: the initial "planned" write above is the only durable
+    # commit the move loop depends on. ``restore`` never trusts a "planned"
+    # item's state alone -- it re-derives truth from which files are
+    # physically present under the batch (see ``restore``) -- so a crash
+    # mid-loop is exactly as recoverable whether or not every item's
+    # transition is flushed as it happens. Publishing the full (bounded up to
+    # MAX_MANIFEST_BYTES) manifest once per item made a quarantine of N
+    # requests cost N whole-manifest rewrites+fsyncs. The loop below only
+    # mutates the in-memory ``manifest`` dict; the terminal state is published
+    # once after it (and, when a legacy store is folded in below, that is
+    # still part of the same single terminal write), so a batch publishes its
+    # full manifest a constant number of times regardless of element count.
     process_root = root / PROCESS_FILES_RELATIVE_PATH
     moved_files = 0
     moved_bytes = 0
@@ -845,7 +857,6 @@ def quarantine(repo_root: Path | str, *, preview_digest: str, confirm: bool) -> 
                 break
         if not complete:
             item["state"] = "skipped_identity_changed"
-            _atomic_json(manifest_path, manifest)
             continue
         for expected in item["files"]:
             source = process_root / expected["name"]
@@ -853,7 +864,6 @@ def quarantine(repo_root: Path | str, *, preview_digest: str, confirm: bool) -> 
             moved_files += 1
             moved_bytes += int(expected["size_bytes"])
         item["state"] = "quarantined"
-        _atomic_json(manifest_path, manifest)
     legacy = manifest.get("legacy_store")
     if isinstance(legacy, dict) and legacy.get("state") == "planned":
         source = root / "logs"
@@ -880,7 +890,6 @@ def quarantine(repo_root: Path | str, *, preview_digest: str, confirm: bool) -> 
             legacy["state"] = "quarantined"
             moved_files += int(legacy["file_count"])
             moved_bytes += int(legacy["size_bytes"])
-        _atomic_json(manifest_path, manifest)
     manifest["status"] = "quarantined" if moved_files else "empty"
     manifest["quarantined_files"] = moved_files
     manifest["quarantined_bytes"] = moved_bytes

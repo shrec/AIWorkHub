@@ -295,6 +295,43 @@ def test_quarantine_reaps_an_empty_batch_it_opens(
     assert terminal_log_retention.list_batches(repo)["count"] == 0
 
 
+def test_quarantine_reaps_an_empty_batch_when_every_candidate_races_away(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # NF-2026-00642: the same TOCTOU as the single-candidate race above, but
+    # with several candidates racing away at once so every item -- not just
+    # one -- ends up "skipped_identity_changed". The batch must still be
+    # empty in both record and on disk and must not be left behind.
+    repo = _repo(tmp_path)
+    for index in range(5):
+        _run(repo, f"{index + 1:032x}", "TASK_DONE")
+    preview = terminal_log_retention.preview(repo)
+    assert preview["candidate_count"] == 5
+    process_root = repo / terminal_log_retention.PROCESS_FILES_RELATIVE_PATH
+
+    real_payload = terminal_log_retention._candidate_payload
+
+    def _racing_payload(root: Path) -> dict[str, object]:
+        payload = real_payload(root)
+        for item in payload.get("candidates", []):
+            for entry in item.get("files", []):
+                (process_root / entry["name"]).unlink()
+        return payload
+
+    monkeypatch.setattr(terminal_log_retention, "_candidate_payload", _racing_payload)
+
+    result = terminal_log_retention.quarantine(
+        repo, preview_digest=preview["preview_digest"], confirm=True
+    )
+
+    assert result["quarantined"] == 0
+    assert result["no_op"] is True
+    assert result["batch_id"] == ""
+    assert terminal_log_retention.list_batches(repo)["count"] == 0
+    quarantine_root = repo / terminal_log_retention.QUARANTINE_RELATIVE_PATH
+    assert list(quarantine_root.iterdir()) == []
+
+
 def test_empty_batch_of_skipped_items_is_reapable_but_enforce_leaves_it(tmp_path: Path) -> None:
     # The exact shape observed on the canonical store: status "empty", three
     # skipped items, no file on disk, and a still-live seven-day deadline.

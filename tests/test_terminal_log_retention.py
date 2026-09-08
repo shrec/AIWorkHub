@@ -329,6 +329,43 @@ def test_terminal_log_quarantine_restore_and_explicit_purge_gate(tmp_path: Path)
     assert (process_root / f"{request_id}.stdout.log").is_file()
 
 
+def test_quarantine_publishes_manifest_a_constant_number_of_times(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """NF-2026-00642: the manifest is rewritten+fsynced a bounded, constant
+    number of times per batch -- never once per candidate."""
+
+    def _write_count_for(n: int) -> int:
+        case_root = tmp_path / f"case-{n}"
+        case_root.mkdir()
+        repo = _repo(case_root)
+        for index in range(n):
+            _run(repo, f"{index + 1:032x}", "TASK_DONE")
+        preview = terminal_log_retention.preview(repo)
+        assert preview["candidate_count"] == n
+
+        calls: list[Path] = []
+        real_atomic_json = terminal_log_retention._atomic_json
+
+        def counted(path: Path, value: object) -> None:
+            calls.append(path)
+            real_atomic_json(path, value)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(terminal_log_retention, "_atomic_json", counted)
+            result = terminal_log_retention.quarantine(
+                repo, preview_digest=preview["preview_digest"], confirm=True
+            )
+        assert result["quarantined"] == n * 4
+        return len(calls)
+
+    small = _write_count_for(3)
+    large = _write_count_for(40)
+
+    assert small == 2
+    assert large == 2
+
+
 def test_terminal_log_quarantine_accepts_zero_byte_stream(tmp_path: Path) -> None:
     repo = _repo(tmp_path)
     for index in range(11):
