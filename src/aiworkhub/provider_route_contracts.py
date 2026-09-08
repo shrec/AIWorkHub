@@ -195,7 +195,19 @@ def _record(
 # The editor bridge dispatches a fixed tool allowlist; anything outside it
 # returns ``worker_bridge_tool_not_allowed``.  That allowlist is the ground
 # truth for what an editor-hosted worker can and cannot do.
-_EDITOR_BRIDGE_DISPATCH = "src/aiworkhub/process_launcher.py:12093-12172"
+#
+# The citation names the FUNCTION, not a line range.  It used to say
+# ``process_launcher.py:12093-12172`` and it moved three times in one day --
+# every unrelated insertion above the dispatch chain re-broke
+# ``test_declared_code_path_claims_match_the_bridge_allowlist``, which is the
+# same silent-rot failure mode the test exists to prevent, just inverted: a
+# loud failure that says nothing about the fact being claimed.  The test
+# already resolves this function by AST name; a symbolic citation is the fact
+# it was actually asserting, so the span is now derived on both sides and
+# there is nothing left to drift.
+_EDITOR_BRIDGE_DISPATCH = (
+    "src/aiworkhub/process_launcher.py::invoke_vscode_lm_worker_tool"
+)
 
 _EDITOR_VSCODE_LM_CONTRACT = RouteContract(
     route_family=runtime_adapters.ROUTE_FAMILY_EDITOR_VSCODE_LM,

@@ -389,29 +389,56 @@ def test_observability_carries_capabilities_beside_reachability(
         assert submit["reason"] == contracts.REASON_NO_OBSERVED_ROUND_TRIP
 
 
-def _bridge_dispatch_evidence() -> tuple[Path, int, int]:
-    """Split ``_EDITOR_BRIDGE_DISPATCH`` into the file and lines it cites."""
+def _bridge_dispatch_citation() -> tuple[Path, str]:
+    """Split ``_EDITOR_BRIDGE_DISPATCH`` into the file and the function it names.
 
-    path_text, _, span = contracts._EDITOR_BRIDGE_DISPATCH.partition(":")
-    first, _, last = span.partition("-")
+    The citation names a function, not a line range, and this helper refuses a
+    line range outright. The range form moved three times in a single day --
+    any insertion anywhere above the dispatch chain re-broke the test below
+    while the fact it asserts had not changed at all. A test that fails on
+    unrelated edits teaches people to edit the citation until it goes green,
+    which is precisely how the hand-written copy this file was written to
+    catch rotted in the first place.
+    """
+
+    path_text, separator, symbol = contracts._EDITOR_BRIDGE_DISPATCH.partition("::")
+    assert separator and symbol, (
+        "the dispatch citation must name a function as 'path::qualname'; a "
+        f"line range rots on every unrelated edit: {contracts._EDITOR_BRIDGE_DISPATCH!r}"
+    )
     root = Path(__file__).resolve().parents[1]
-    return root / path_text, int(first), int(last)
+    return root / path_text, symbol
 
 
-def _dispatched_worker_tools(source_path: Path) -> tuple[set[str], dict[str, int]]:
+def _dispatched_worker_tools(
+    source_path: Path, symbol: str
+) -> tuple[set[str], dict[str, int], tuple[int, int]]:
     """Every tool name the bridge dispatches, read from the source itself.
 
     Derived, never restated. The registry claims a fact ABOUT this dispatch
     chain, so the claim has to be checked against the chain rather than against
     a second hand-written copy of it -- a hand-written copy is what rotted.
+
+    Also returns the span the citation resolves to, so a failure can say where
+    the chain actually is instead of leaving the reader to find it.
     """
 
     tree = ast.parse(source_path.read_text(encoding="utf-8"))
-    for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef) and node.name == "invoke_vscode_lm_worker_tool":
-            break
-    else:  # pragma: no cover - the method is the subject of the test
-        raise AssertionError("invoke_vscode_lm_worker_tool not found in the cited file")
+    defined = [
+        found
+        for found in ast.walk(tree)
+        if isinstance(found, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and found.name == symbol
+    ]
+    assert defined, f"{symbol} not found in the cited file {source_path}"
+    # A second definition would make the lookup silently pick one of them, and
+    # the citation could then describe a function nobody calls.
+    assert len(defined) == 1, (
+        f"{symbol} is defined {len(defined)} times in {source_path} at lines "
+        f"{[found.lineno for found in defined]}; the citation is ambiguous"
+    )
+    node = defined[0]
+    span = (node.lineno, node.end_lineno or node.lineno)
 
     names: set[str] = set()
     lines: dict[str, int] = {}
@@ -425,7 +452,7 @@ def _dispatched_worker_tools(source_path: Path) -> tuple[set[str], dict[str, int
             continue
         names.add(right.value)
         lines.setdefault(right.value, inner.lineno)
-    return names, lines
+    return names, lines, span
 
 
 def test_declared_code_path_claims_match_the_bridge_allowlist():
@@ -439,9 +466,11 @@ def test_declared_code_path_claims_match_the_bridge_allowlist():
     deriving the allowlist from the source instead of trusting the comment.
     """
 
-    source_path, first_line, last_line = _bridge_dispatch_evidence()
+    source_path, symbol = _bridge_dispatch_citation()
     assert source_path.is_file(), f"cited evidence file is missing: {source_path}"
-    dispatched, at_line = _dispatched_worker_tools(source_path)
+    dispatched, at_line, (first_line, last_line) = _dispatched_worker_tools(
+        source_path, symbol
+    )
 
     packet_read = "aiworkhub_worker_quality_review_packet_read"
     record = contracts.capability_record(
@@ -462,14 +491,19 @@ def test_declared_code_path_claims_match_the_bridge_allowlist():
         f"{'dispatches' if packet_read in dispatched else 'refuses'} it"
     )
 
-    # The citation must point at the code it claims to describe; a range that
-    # no longer brackets the dispatch is a stale citation even when the state
-    # happens to be right.
+    # The citation must point at the code it claims to describe. That used to
+    # be a line-range check against a hand-copied span, and the copy is what
+    # went stale -- so the span is now derived from the named function and the
+    # bracketing holds by construction. What is left to check is that the name
+    # resolves to a function that really is the dispatch chain: a citation
+    # pointed at some other function still parses, and would quietly describe
+    # code the bridge never runs.
+    assert last_line > first_line, (
+        f"{symbol} resolves to a single line at {first_line}; that is not a "
+        "dispatch chain"
+    )
     if packet_read in dispatched:
-        assert first_line <= at_line[packet_read] <= last_line, (
-            f"{packet_read} is dispatched at line {at_line[packet_read]}, outside "
-            f"the cited range {first_line}-{last_line}"
-        )
+        assert first_line <= at_line[packet_read] <= last_line
 
     # The submit comment on the same contract asserts a dispatcher fact too:
     # that the bridge DOES carry submit, which is why its state is unknown for
