@@ -22,7 +22,6 @@ from __future__ import annotations
 import json
 import shutil
 import sqlite3
-import subprocess
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,23 +29,9 @@ from pathlib import Path
 import pytest
 
 from aiworkhub import storage_retention, task_store, worktree_storage
-
-# terminal_runs_days defaults to 30; 31 real days pushes a worktree past the
-# default policy threshold without ever touching its on-disk mtime.
-_AGED_NOW_OFFSET_DAYS = 31
-
-
-def _aged_now() -> float:
-    return time.time() + _AGED_NOW_OFFSET_DAYS * 86400
-
-
-def _git(cwd: Path, *args: str) -> None:
-    subprocess.run(
-        ["git", "-c", "user.email=t@t", "-c", "user.name=t", "-C", str(cwd), *args],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+from support.retention import aged_now as _aged_now
+from support.retention import git as _git
+from support.retention import repository
 
 
 def _insert_task_card(
@@ -96,19 +81,7 @@ def _insert_task_card(
 
 @pytest.fixture()
 def repo_with_worktrees(tmp_path: Path) -> dict[str, Path]:
-    remote = tmp_path / "remote.git"
-    repo = tmp_path / "repo"
-    base = tmp_path / "worktrees"
-    base.mkdir()
-    subprocess.run(["git", "init", "--bare", str(remote)], check=True, capture_output=True)
-    _git(tmp_path, "clone", str(remote), str(repo))
-    (repo / "file.txt").write_text("base\n", encoding="utf-8")
-    _git(repo, "add", "file.txt")
-    _git(repo, "commit", "-m", "base")
-    _git(repo, "push", "origin", "HEAD:refs/heads/main")
-    _git(repo, "fetch", "origin")
-    assert task_store.initialize_repository(repo)["ok"]
-    return {"repo": repo, "base": base}
+    return repository(tmp_path)
 
 
 def _add_worktree(

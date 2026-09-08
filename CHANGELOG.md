@@ -6,6 +6,14 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.5] - 2026-09-08
+
+### Fixed
+
+- Read-only research and quality-review tasks now bind the required outcome
+  receipt when accepted, so successful verification can finish the task.
+  Missing or mismatched receipts remain rejected.
+
 ## [0.11.4] - 2026-09-08
 
 ### Fixed

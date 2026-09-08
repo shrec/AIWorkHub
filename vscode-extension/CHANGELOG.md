@@ -1,5 +1,13 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.5 — 2026-09-08
+
+### Fixed
+
+- Read-only research and quality-review tasks can finish after successful
+  verification. Both acceptance paths now retain the required outcome receipt
+  and continue to reject missing or mismatched evidence.
+
 ## 0.11.4 — 2026-09-08
 
 ### Fixed

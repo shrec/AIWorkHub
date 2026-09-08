@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import json
 import sqlite3
-import subprocess
 import threading
 import time
 from datetime import datetime, timezone
@@ -32,57 +31,16 @@ from pathlib import Path
 import pytest
 
 from aiworkhub import storage_retention, task_store, worktree_storage
-
-_AGED_NOW_OFFSET_DAYS = 31
-
-
-def _aged_now() -> float:
-    return time.time() + _AGED_NOW_OFFSET_DAYS * 86400
-
-
-def _git(cwd: Path, *args: str) -> None:
-    subprocess.run(
-        ["git", "-c", "user.email=t@t", "-c", "user.name=t", "-C", str(cwd), *args],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+from support.retention import add_clean_worktree as _add_clean_worktree
+from support.retention import add_unpushed_worktree as _add_unpushed_worktree
+from support.retention import aged_now as _aged_now
+from support.retention import git as _git
+from support.retention import repository
 
 
 @pytest.fixture()
 def repo_with_worktrees(tmp_path: Path) -> dict[str, Path]:
-    remote = tmp_path / "remote.git"
-    repo = tmp_path / "repo"
-    base = tmp_path / "worktrees"
-    base.mkdir()
-    subprocess.run(["git", "init", "--bare", str(remote)], check=True, capture_output=True)
-    _git(tmp_path, "clone", str(remote), str(repo))
-    (repo / "file.txt").write_text("base\n", encoding="utf-8")
-    _git(repo, "add", "file.txt")
-    _git(repo, "commit", "-m", "base")
-    _git(repo, "push", "origin", "HEAD:refs/heads/main")
-    _git(repo, "fetch", "origin")
-    assert task_store.initialize_repository(repo)["ok"]
-    return {"repo": repo, "base": base}
-
-
-def _add_clean_worktree(repo: Path, base: Path, entry_id: str) -> Path:
-    entry = base / entry_id
-    worktree = entry / "worktree"
-    entry.mkdir()
-    _git(repo, "worktree", "add", "--detach", str(worktree), "HEAD")
-    return entry
-
-
-def _add_unpushed_worktree(repo: Path, base: Path, entry_id: str) -> Path:
-    entry = base / entry_id
-    worktree = entry / "worktree"
-    entry.mkdir()
-    _git(repo, "worktree", "add", "--detach", str(worktree), "HEAD")
-    (worktree / "note.txt").write_text("rework\n", encoding="utf-8")
-    _git(worktree, "add", "note.txt")
-    _git(worktree, "commit", "-m", "unpushed rework attempt")
-    return entry
+    return repository(tmp_path)
 
 
 def _insert_card(repo: Path, task_id: str, *, status: str, rework_predecessor_request_id: str) -> None:

@@ -602,6 +602,25 @@ def accept_review(
                     "Manager reverified and accepted the sealed quality-review outcome."
                 ),
             )
+            try:
+                accepted_outcome_receipt = _accepted_outcome_receipt(
+                    self.repo,
+                    task_id=task_id,
+                    request_id=request_id,
+                    claim_epoch=int(card.get("claim_epoch") or 0),
+                    base_oid=str(workspace_meta.get("base_oid") or ""),
+                    promoted_paths=[],
+                    changed_path_hashes=stored_hashes,
+                    attempt_artifact_manifest=attempt_artifact_receipt,
+                )
+            except (OSError, TypeError, ValueError, WorkspaceError) as exc:
+                return {
+                    "ok": False,
+                    "error": f"accepted_outcome_receipt_failed:{exc}",
+                    "request_id": request_id,
+                    "task_id": task_id,
+                    "promoted_paths": [],
+                }
             accept_result = task_engine.accept_review(
                 self.repo,
                 task_id,
@@ -618,6 +637,7 @@ def accept_review(
                     "acceptance_evidence_record": acceptance_evidence_record,
                     "attempt_artifact_manifest": attempt_artifact_receipt,
                 },
+                accepted_outcome_receipt=accepted_outcome_receipt,
             )
             if not accept_result.get("ok"):
                 return {
@@ -652,6 +672,7 @@ def accept_review(
                 "cleanup_error": cleanup_error,
                 "quality_review_receipt": verified_receipt,
                 "acceptance_evidence_record": acceptance_evidence_record,
+                "accepted_outcome_receipt": accepted_outcome_receipt,
                 "reviewer_finalization": [],
                 "acceptance_lock_scope": "request",
                 "needfix_closure": needfix_closure,
@@ -665,6 +686,7 @@ def accept_review(
                 "cleanup_error": cleanup_error,
                 "quality_review_receipt": verified_receipt,
                 "acceptance_evidence_record": acceptance_evidence_record,
+                "accepted_outcome_receipt": accepted_outcome_receipt,
                 "reviewer_finalization": [],
                 "acceptance_lock_scope": "request",
                 "needfix_closure": needfix_closure,
@@ -752,6 +774,26 @@ def accept_review(
                     "task_id": task_id,
                 }
 
+            try:
+                accepted_outcome_receipt = _accepted_outcome_receipt(
+                    self.repo,
+                    task_id=task_id,
+                    request_id=request_id,
+                    claim_epoch=int(card.get("claim_epoch") or 0),
+                    base_oid=str(workspace_meta.get("base_oid") or ""),
+                    promoted_paths=[],
+                    changed_path_hashes=stored_hashes,
+                    attempt_artifact_manifest=attempt_artifact_receipt,
+                )
+            except (OSError, TypeError, ValueError, WorkspaceError) as exc:
+                return {
+                    "ok": False,
+                    "error": f"accepted_outcome_receipt_failed:{exc}",
+                    "request_id": request_id,
+                    "task_id": task_id,
+                    "promoted_paths": [],
+                }
+
             quality_gate = {
                 "schema_id": "aiworkhub.completion_quality_gate.v1",
                 "applicable": False,
@@ -786,6 +828,7 @@ def accept_review(
                     "acceptance_evidence_record": acceptance_evidence_record,
                     "attempt_artifact_manifest": attempt_artifact_receipt,
                 },
+                accepted_outcome_receipt=accepted_outcome_receipt,
             )
             if not accept_result.get("ok"):
                 return {
@@ -820,6 +863,7 @@ def accept_review(
                 "cleanup_error": cleanup_error,
                 "research_result": current_result,
                 "acceptance_evidence_record": acceptance_evidence_record,
+                "accepted_outcome_receipt": accepted_outcome_receipt,
                 "reviewer_finalization": [],
                 "needfix_closure": needfix_closure,
                 "finished_at": _utcnow(),
@@ -832,6 +876,7 @@ def accept_review(
                 "cleanup_error": cleanup_error,
                 "research_result": current_result,
                 "acceptance_evidence_record": acceptance_evidence_record,
+                "accepted_outcome_receipt": accepted_outcome_receipt,
                 "reviewer_finalization": [],
                 "acceptance_lock_scope": "request",
                 "needfix_closure": needfix_closure,

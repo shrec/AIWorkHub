@@ -12,11 +12,7 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.11.4 — 2026-09-08
+## What's new in 0.11.5 — 2026-09-08
 
-- Python and Node validation commands can update timestamps on their permitted
-  scratch files while the sandbox continues to enforce file ownership and paths.
-- Windows process supervision and file handling use shared structure definitions
-  to keep their platform behavior consistent.
-- Rejected successful work retains its verified candidate so corrections can
-  continue from the same attempt.
+- Read-only research and review tasks now finish after successful verification
+  instead of failing at acceptance. Required evidence checks remain enforced.

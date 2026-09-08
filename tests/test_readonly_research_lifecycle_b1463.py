@@ -426,10 +426,14 @@ def test_accept_revalidates_exact_readonly_research_stdout(
     root = tmp_path / "worktrees"
     monkeypatch.setenv("AIWORKHUB_WORKTREE_ROOT", str(root))
     repo = tmp_path / "repo"
-    repo.mkdir()
+    _init_git(repo)
     workspace_path = root / REQUEST_ID / "worktree"
     home = root / REQUEST_ID / "home"
-    _init_git(workspace_path)
+    subprocess.run(
+        ["git", "worktree", "add", "--detach", "-q", str(workspace_path), "HEAD"],
+        cwd=repo,
+        check=True,
+    )
     home.mkdir(parents=True)
     workspace = worker_workspace.WorkerWorkspace(
         request_id=REQUEST_ID,
@@ -437,6 +441,9 @@ def test_accept_revalidates_exact_readonly_research_stdout(
         path=workspace_path,
         home=home,
         allowed_writes=(),
+        base_oid=subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=workspace_path, text=True
+        ).strip(),
         parent_baseline={},
         workspace_baseline={},
     )
@@ -527,10 +534,14 @@ def test_accepts_authenticated_readonly_quality_review_without_changed_hashes(
     root = tmp_path / "worktrees"
     monkeypatch.setenv("AIWORKHUB_WORKTREE_ROOT", str(root))
     repo = tmp_path / "repo"
-    repo.mkdir()
+    _init_git(repo)
     workspace_path = root / REQUEST_ID / "worktree"
     home = root / REQUEST_ID / "home"
-    _init_git(workspace_path)
+    subprocess.run(
+        ["git", "worktree", "add", "--detach", "-q", str(workspace_path), "HEAD"],
+        cwd=repo,
+        check=True,
+    )
     home.mkdir(parents=True)
     workspace = worker_workspace.WorkerWorkspace(
         request_id=REQUEST_ID,
@@ -538,6 +549,9 @@ def test_accepts_authenticated_readonly_quality_review_without_changed_hashes(
         path=workspace_path,
         home=home,
         allowed_writes=(),
+        base_oid=subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=workspace_path, text=True
+        ).strip(),
         parent_baseline={},
         workspace_baseline={},
     )
