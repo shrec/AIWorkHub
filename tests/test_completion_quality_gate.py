@@ -700,6 +700,33 @@ def test_python_module_path_fallback_is_allowlisted(tmp_path, monkeypatch) -> No
     ]
 
 
+def test_pytest_quality_check_prefers_toolchain_entrypoint_even_when_runtime_imports_pytest(
+    tmp_path, monkeypatch
+) -> None:
+    entrypoint = tmp_path / ".venv" / "bin" / "pytest"
+    entrypoint.parent.mkdir(parents=True)
+    entrypoint.write_text("#!/bin/sh\n", encoding="utf-8")
+    entrypoint.chmod(0o755)
+    observed: dict[str, object] = {}
+
+    monkeypatch.setattr(quality_evidence, "os", SimpleNamespace(name="posix"))
+    monkeypatch.setattr(quality_evidence.importlib.util, "find_spec", lambda _name: object())
+    monkeypatch.setattr(quality_evidence, "_which", lambda _name: str(entrypoint))
+    def fake_run(argv, **_kwargs):
+        observed["argv"] = argv
+        return SimpleNamespace(returncode=0, stdout="passed", stderr="")
+
+    monkeypatch.setattr(quality_evidence.subprocess, "run", fake_run)
+
+    status, _stdout, _stderr, _duration = quality_evidence._run_command_array(
+        ("{python}", "-m", "pytest", "-q"), cwd=tmp_path, timeout_seconds=10,
+        toolchain_root=tmp_path,
+    )
+
+    assert status == "passed"
+    assert observed["argv"] == [str(entrypoint), "-q"]
+
+
 def test_completion_quality_gate_accepts_codeql_like_static_analysis_kind(tmp_path) -> None:
     config = tmp_path / ".aiworkhub" / "quality.json"
     config.parent.mkdir()

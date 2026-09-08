@@ -2130,13 +2130,26 @@ def _run_command_array(
     cwd: Path,
     timeout_seconds: int,
     execution_receipt: dict[str, Any] | None = None,
+    toolchain_root: Path | None = None,
 ) -> tuple[str, str, str, float]:
     """Run one exact argv array, shell=False. Returns (status, stdout, stderr, duration)."""
 
     declared_argv = list(command)
     argv = [sys.executable if part == "{python}" else part for part in declared_argv]
     resolution = "declared"
-    if (
+    module = declared_argv[2] if len(declared_argv) >= 3 else ""
+    pytest_entrypoint = None
+    if module == "pytest" and toolchain_root is not None:
+        relative = Path(".venv/Scripts/pytest.exe" if os.name == "nt" else ".venv/bin/pytest")
+        candidate = toolchain_root / relative
+        if candidate.is_file() and (
+            os.name == "nt" or candidate.stat().st_mode & stat.S_IXUSR
+        ):
+            pytest_entrypoint = str(candidate)
+    if pytest_entrypoint is not None:
+        argv = [pytest_entrypoint, *declared_argv[3:]]
+        resolution = "python_module_policy_toolchain_entrypoint"
+    elif (
         len(declared_argv) >= 3
         and declared_argv[0] == "{python}"
         and declared_argv[1] == "-m"
@@ -2288,6 +2301,7 @@ def run_declared_checks(
             cwd=root,
             timeout_seconds=timeout_seconds,
             execution_receipt=execution_receipt,
+            toolchain_root=Path(policy_root) if policy_root is not None else root,
         )
         summary = f"stdout:\n{stdout}\nstderr:\n{stderr}"
         results.append(
