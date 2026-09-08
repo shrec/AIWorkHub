@@ -1706,9 +1706,8 @@ def review_queue() -> dict[str, Any]:
     try:
         rows = [
             row
-            for row in task_store.list_task_cards(repo_root(), limit=5000)
-            if row.get("status") == "review"
-            and _review_substatus(row) != "finalize_failed"
+            for row in task_store.list_review_queue_cards(repo_root(), limit=5000)
+            if _review_substatus(row) != "finalize_failed"
         ][:500]
     except task_store.TaskStoreError as exc:
         return _canonical_result(ok=False, returncode=1, stderr=str(exc), command=command)

@@ -223,6 +223,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   archived_at TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_task_store_tasks_status ON tasks(status);
+CREATE INDEX IF NOT EXISTS idx_task_store_tasks_worker_status ON tasks(worker_status);
 
 CREATE TABLE IF NOT EXISTS task_events (
   event_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -326,26 +327,78 @@ def ensure_event_indexes(conn: sqlite3.Connection) -> bool:
 # identical plan, identical 3.6ms, 5x the build cost, and it does NOT remove the
 # temp B-tree because ``status IN (...)`` scans two disjoint ranges that cannot
 # yield a single global ordering.
+#
+# ``idx_task_store_tasks_status_lower`` is a second, expression index on
+# ``lower(status)``, added alongside the raw-column index above. It exists
+# only so ``list_review_queue_cards`` can match ``status`` case-insensitively
+# -- exactly like ``canonical_status`` does -- without abandoning an index for
+# a table scan. The raw-column index is untouched and still serves
+# ``callback_store``'s exact-literal predicate.
 TASK_STATUS_INDEX_SCHEMA = """
 CREATE INDEX IF NOT EXISTS idx_task_store_tasks_status ON tasks(status);
+CREATE INDEX IF NOT EXISTS idx_task_store_tasks_status_lower ON tasks(lower(status));
 """
 
 
+def _ensure_column_index(
+    conn: sqlite3.Connection, *, required_column: str, schema_sql: str
+) -> bool:
+    """One authoritative installer for a ``tasks``-column index pair.
+
+    ``ensure_task_status_index`` and ``ensure_task_worker_status_index`` are
+    call-sites of this single implementation rather than independent copies:
+    two functions with the same body and only a column name and schema
+    constant swapped is exactly the parallel-implementation shape
+    ``declared_invariants.parallel_implementations_have_one_owner`` exists to
+    catch, so the guard/before/after/apply logic lives here once.
+    """
+
+    columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(tasks)").fetchall()}
+    if required_column not in columns:
+        return False
+    before = {str(row[1]) for row in conn.execute("PRAGMA index_list(tasks)").fetchall()}
+    conn.executescript(schema_sql)
+    after = {str(row[1]) for row in conn.execute("PRAGMA index_list(tasks)").fetchall()}
+    return before != after
+
+
 def ensure_task_status_index(conn: sqlite3.Connection) -> bool:
-    """Install the tasks.status index; True when this call created it.
+    """Install the tasks.status indexes; True when this call created any.
 
     Runs through the same schema/migration path as ``ensure_event_indexes`` so
     existing canonical stores gain it on their next readiness upgrade. Never
     executed against a live database directly.
     """
 
-    columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(tasks)").fetchall()}
-    if "status" not in columns:
-        return False
-    before = {str(row[1]) for row in conn.execute("PRAGMA index_list(tasks)").fetchall()}
-    conn.executescript(TASK_STATUS_INDEX_SCHEMA)
-    after = {str(row[1]) for row in conn.execute("PRAGMA index_list(tasks)").fetchall()}
-    return before != after
+    return _ensure_column_index(conn, required_column="status", schema_sql=TASK_STATUS_INDEX_SCHEMA)
+
+
+# ``list_review_queue_cards`` filters on ``lower(status)``/``lower(worker_status)``
+# so its candidate predicate matches exactly like ``canonical_status`` does
+# (case-insensitively), instead of silently dropping a mixed-case persisted
+# alias before the Python cross-check ever sees it. Each side of its ``OR`` is
+# still sargable because it is backed by an expression index
+# (``idx_task_store_tasks_status_lower`` / ``idx_task_store_tasks_worker_status_lower``)
+# below. Without this index the ``worker_status`` side forces SQLite to
+# abandon the status index entirely and fall back to ``SCAN tasks`` for the
+# whole predicate -- measured with ``EXPLAIN QUERY PLAN`` in
+# ``test_list_review_queue_cards_uses_multi_index_or_query_plan``. With this
+# index present, SQLite plans a ``MULTI-INDEX OR`` -- one indexed search per
+# column, unioned by rowid -- instead of a table scan.
+WORKER_STATUS_INDEX_SCHEMA = """
+CREATE INDEX IF NOT EXISTS idx_task_store_tasks_worker_status ON tasks(worker_status);
+CREATE INDEX IF NOT EXISTS idx_task_store_tasks_worker_status_lower ON tasks(lower(worker_status));
+"""
+
+
+def ensure_task_worker_status_index(conn: sqlite3.Connection) -> bool:
+    """Install the tasks.worker_status indexes; True when this call created any.
+
+    Same migration path as ``ensure_task_status_index``, so existing canonical
+    stores gain it on their next readiness upgrade.
+    """
+
+    return _ensure_column_index(conn, required_column="worker_status", schema_sql=WORKER_STATUS_INDEX_SCHEMA)
 
 
 class TaskStoreError(RuntimeError):
@@ -526,6 +579,7 @@ def _atomic_init_schema(path: Path) -> None:
             conn.executescript(review_lifecycle.SCHEMA)
             ensure_event_indexes(conn)
             ensure_task_status_index(conn)
+            ensure_task_worker_status_index(conn)
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             conn.commit()
         finally:
@@ -850,6 +904,7 @@ def _upgrade_compatible_schema(path: Path) -> bool:
         changed = review_lifecycle.ensure_schema(conn) or changed
         changed = ensure_event_indexes(conn) or changed
         changed = ensure_task_status_index(conn) or changed
+        changed = ensure_task_worker_status_index(conn) or changed
         conn.commit()
     finally:
         conn.close()
@@ -973,27 +1028,29 @@ def exact_status_counts(root: str | Path) -> dict[str, int]:
     return counts
 
 
+_CANONICAL_STATUS_CASE_SQL = """
+    CASE
+      WHEN COALESCE(archived_at, '') <> '' THEN 'archived'
+      WHEN lower(COALESCE(status, '')) IN ('finished', 'completed', 'stale_already_done')
+        OR lower(COALESCE(worker_status, '')) = 'done' THEN 'finished'
+      WHEN lower(COALESCE(status, '')) LIKE 'blocked%'
+        OR lower(COALESCE(worker_status, '')) LIKE 'blocked%'
+        OR lower(COALESCE(worker_status, '')) LIKE 'deferred%' THEN 'blocked'
+      WHEN lower(COALESCE(status, '')) IN ('review', 'ready_for_review', 'codex_review', 'awaiting_review')
+        OR lower(COALESCE(worker_status, '')) IN ('review', 'ready_for_review', 'codex_review', 'awaiting_review') THEN 'review'
+      WHEN lower(COALESCE(status, '')) IN ('processing', 'in_progress')
+        OR lower(COALESCE(worker_status, '')) IN ('claimed', 'in_progress') THEN 'processing'
+      WHEN lower(COALESCE(status, '')) = 'superseded'
+        OR lower(COALESCE(worker_status, '')) = 'superseded' THEN 'superseded'
+      ELSE 'pending'
+    END
+"""
+
+
 def list_tasks(root: str | Path, *, status: str | None = None, limit: int = 500) -> list[dict[str, Any]]:
     """List canonical tasks, optionally filtered to one canonical status."""
     _readiness, db_path = _require_ready(root)
     bounded_limit = max(1, min(int(limit), 5000))
-    canonical_status_sql = """
-        CASE
-          WHEN COALESCE(archived_at, '') <> '' THEN 'archived'
-          WHEN lower(COALESCE(status, '')) IN ('finished', 'completed', 'stale_already_done')
-            OR lower(COALESCE(worker_status, '')) = 'done' THEN 'finished'
-          WHEN lower(COALESCE(status, '')) LIKE 'blocked%'
-            OR lower(COALESCE(worker_status, '')) LIKE 'blocked%'
-            OR lower(COALESCE(worker_status, '')) LIKE 'deferred%' THEN 'blocked'
-          WHEN lower(COALESCE(status, '')) IN ('review', 'ready_for_review', 'codex_review', 'awaiting_review')
-            OR lower(COALESCE(worker_status, '')) IN ('review', 'ready_for_review', 'codex_review', 'awaiting_review') THEN 'review'
-          WHEN lower(COALESCE(status, '')) IN ('processing', 'in_progress')
-            OR lower(COALESCE(worker_status, '')) IN ('claimed', 'in_progress') THEN 'processing'
-          WHEN lower(COALESCE(status, '')) = 'superseded'
-            OR lower(COALESCE(worker_status, '')) = 'superseded' THEN 'superseded'
-          ELSE 'pending'
-        END
-    """
     query = (
         "SELECT task_id, runner, "
         "COALESCE(NULLIF(topic, ''), json_extract(card_json, '$.topic'), '') AS topic, "
@@ -1003,7 +1060,7 @@ def list_tasks(root: str | Path, *, status: str | None = None, limit: int = 500)
     )
     params: list[Any] = []
     if status and status != "all":
-        query += f" WHERE ({canonical_status_sql}) = ?"
+        query += f" WHERE ({_CANONICAL_STATUS_CASE_SQL}) = ?"
         params.append(status)
     query += " ORDER BY updated_at DESC LIMIT ?"
     params.append(bounded_limit)
@@ -1060,6 +1117,120 @@ def list_task_cards(root: str | Path, *, limit: int = 500) -> list[dict[str, Any
     finally:
         conn.close()
     return [_decode_task_card(row) for row in rows]
+
+
+_REVIEW_STATUS_VALUES: tuple[str, ...] = ("review", "ready_for_review", "codex_review", "awaiting_review")
+
+_REVIEW_QUEUE_SQL = (
+    "SELECT task_id, runner, "
+    "CASE WHEN NULLIF(topic, '') IS NOT NULL THEN topic "
+    "WHEN json_valid(card_json) THEN json_extract(card_json, '$.topic') "
+    "ELSE NULL END AS topic, "
+    "status, worker_status, archived_at, updated_at, "
+    "CASE WHEN json_valid(card_json) THEN json_extract(card_json, '$.terminal_substatus') "
+    "ELSE NULL END AS terminal_substatus, "
+    "CASE WHEN json_valid(card_json) THEN "
+    "CASE json_type(card_json, '$.terminal_review') "
+    "WHEN 'true' THEN 'true' WHEN 'false' THEN 'false' "
+    "ELSE json_quote(json_extract(card_json, '$.terminal_review')) END "
+    "ELSE NULL END AS terminal_review_json "
+    "FROM tasks WHERE (lower(status) IN ({placeholders}) OR lower(worker_status) IN ({placeholders})) "
+    "AND trim(COALESCE(archived_at, ''), char(9)||char(10)||char(11)||char(12)||char(13)||char(32)) = '' "
+    "AND lower(status) NOT IN ('finished', 'completed', 'stale_already_done') "
+    "AND lower(worker_status) != 'done' "
+    "AND lower(status) NOT LIKE 'blocked%' "
+    "AND lower(worker_status) NOT LIKE 'blocked%' "
+    "AND lower(worker_status) NOT LIKE 'deferred%' "
+    "ORDER BY updated_at DESC LIMIT ?"
+)
+
+
+def list_review_queue_cards(root: str | Path, *, limit: int = 500) -> list[dict[str, Any]]:
+    """Return bounded canonical review-status cards, filtered and projected in SQLite.
+
+    The candidate predicate matches ``lower(status)``/``lower(worker_status)``
+    against the review alias literals -- exactly the case-insensitive
+    comparison ``canonical_status`` makes -- so a mixed-case persisted alias
+    (e.g. ``status='Review'``) is not silently dropped before the Python
+    cross-check below ever sees it. Both sides of the ``OR`` stay sargable
+    because they are backed by expression indexes
+    (``idx_task_store_tasks_status_lower`` / ``idx_task_store_tasks_worker_status_lower``),
+    so SQLite still plans a ``MULTI-INDEX OR`` instead of a table scan
+    (verified with ``EXPLAIN QUERY PLAN`` against ``_REVIEW_QUEUE_SQL`` itself
+    by ``test_list_review_queue_cards_production_query_uses_indexed_plan``).
+    Only rows whose column already carries a review-alias literal are read,
+    so ``card_json`` for unrelated terminal/non-review rows is never touched.
+
+    ``archived_at`` is compared with
+    ``trim(COALESCE(archived_at, ''), <ascii whitespace>) = ''`` rather than a
+    bare ``= ''`` so it stays whitespace-equivalent to ``canonical_status``'s
+    ``str(row.get("archived_at") or "").strip()``: a genuine SQL ``NULL``
+    (a legacy row predating this store's ``NOT NULL DEFAULT ''`` column
+    constraint) and a whitespace-only value (e.g. ``' '``) both read as
+    active, exactly like the Python side treats ``None``/whitespace-only
+    strings as not archived, instead of the bare ``COALESCE`` form silently
+    treating a whitespace-only value as archived.
+
+    That candidate predicate alone is a superset of ``canonical_status``'s
+    ``review`` branch -- e.g. a row with ``status='review'`` but
+    ``worker_status='done'`` matches it even though its canonical status is
+    ``finished`` -- so the query additionally excludes, in SQL and equally
+    case-insensitively, every higher-precedence branch ``canonical_status``
+    checks before ``review`` (archived, the finished set, the
+    blocked/deferred prefixes). With those exclusions applied the remaining
+    rows are exactly the ``review`` rows, so ``ORDER BY updated_at DESC`` and
+    ``LIMIT`` run in SQL too, without a higher-precedence false positive ever
+    crowding a genuine review row out of the bounded response.
+    ``canonical_status`` is still recomputed in Python below as a fail-closed
+    cross-check of the same row data, never as the mechanism that enforces
+    the bound.
+
+    ``topic`` falls back to ``card_json.topic`` when the column is empty,
+    matching the legacy ``core.review_queue``/``_decode_task_card`` display
+    fallback -- otherwise a task whose display label only ever lived in
+    ``card_json`` would regress to an empty/wrong label. The fallback is
+    guarded by ``json_valid`` for the same fail-closed reason as
+    ``terminal_substatus``/``terminal_review`` below.
+
+    Only ``topic``, ``terminal_substatus`` and ``terminal_review`` -- the
+    ``card_json`` fields ``core.review_queue`` reads -- are projected out via
+    ``json_extract``, guarded by ``json_valid`` so one malformed selected
+    row's ``card_json`` degrades to null extras instead of raising and
+    failing the whole query. ``terminal_review`` additionally goes through
+    ``json_type``/``json_quote`` so a JSON scalar (number, boolean or string)
+    is re-encoded into valid JSON text before it ever reaches
+    ``json.loads`` -- plain ``json_extract`` returns JSON scalars as native
+    SQLite INTEGER/REAL/TEXT, and passing an int/float straight to
+    ``json.loads`` raises ``TypeError`` instead of degrading gracefully.
+    """
+    _readiness, db_path = _require_ready(root)
+    bounded_limit = max(1, min(int(limit), 5000))
+    placeholders = ",".join("?" for _ in _REVIEW_STATUS_VALUES)
+    query = _REVIEW_QUEUE_SQL.format(placeholders=placeholders)
+    conn = _connect(db_path, readonly=True)
+    try:
+        rows = conn.execute(
+            query,
+            (*_REVIEW_STATUS_VALUES, *_REVIEW_STATUS_VALUES, bounded_limit),
+        ).fetchall()
+    finally:
+        conn.close()
+    cards: list[dict[str, Any]] = []
+    for row in rows:
+        card = dict(row)
+        raw_terminal_review = card.pop("terminal_review_json", None)
+        terminal_review: Any = None
+        if raw_terminal_review is not None:
+            try:
+                terminal_review = json.loads(raw_terminal_review)
+            except (TypeError, json.JSONDecodeError):
+                terminal_review = None
+        card["terminal_review"] = terminal_review
+        card["status"] = canonical_status(card)
+        if card["status"] != "review":
+            continue
+        cards.append(card)
+    return cards
 
 
 # Terminal event names that carry a provider route outcome in their evidence.
