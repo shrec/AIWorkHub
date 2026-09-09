@@ -750,6 +750,9 @@ def supervise(spec: dict[str, Any]) -> int:
                 meaningful_sequence = int(meaningful_progress.get("sequence") or 0)
                 if meaningful_sequence > last_meaningful_progress_sequence:
                     last_meaningful_progress_epoch = time.time()
+                    last_output_change_epoch = max(
+                        last_output_change_epoch, last_meaningful_progress_epoch
+                    )
                     last_meaningful_phase = str(meaningful_progress["phase"])
                     last_meaningful_progress_sequence = meaningful_sequence
                     last_meaningful_progress_event = meaningful_progress
