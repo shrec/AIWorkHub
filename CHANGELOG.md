@@ -6,6 +6,15 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.17] - 2026-09-09
+
+### Fixed
+
+- Editor-hosted finalization now stops after the same missing required-create
+  rejection repeats, returning the typed `vscode_lm_finalization_nonprogress`
+  failure instead of spending additional provider turns. A changed rejected
+  path still receives its own exact `v3_create` correction and may complete.
+
 ## [0.11.16] - 2026-09-09
 
 ### Fixed

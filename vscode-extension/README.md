@@ -12,6 +12,12 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.11.17 — 2026-09-09
+
+- Repeated missing-file finalization now terminates with a typed non-progress
+  result after one exact `v3_create` correction, while a changed missing path
+  can still continue to completion.
+
 ## What's new in 0.11.16 — 2026-09-09
 
 - Validation recognizes the exact active Python interpreter in hosted

@@ -1,5 +1,14 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.17 — 2026-09-09
+
+### Fixed
+
+- Repeated identical missing required-create responses now stop with the typed
+  `vscode_lm_finalization_nonprogress` result after one exact `v3_create`
+  correction. If the rejected path changes, the new identity still gets one
+  repair turn and can complete normally.
+
 ## 0.11.16 — 2026-09-09
 
 ### Fixed

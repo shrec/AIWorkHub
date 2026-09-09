@@ -112,8 +112,9 @@ async function textProtocolUnchangedOutputTerminates() {
       invokeToolOk,
     ),
     (err) => {
-      assert.match(String(err.message || err), /vscode_lm_final_envelope_missing_create/);
+      assert.match(String(err.message || err), /vscode_lm_finalization_nonprogress/);
       assert.strictEqual(err.missingCreatePath, "out/unchanged.js");
+      assert.strictEqual(err.missingCreateAction, "v3_create");
       assert.ok(err.protocolTrace.some((entry) => /missing_required_create/.test(entry.outcome || "")));
       return true;
     },
@@ -135,8 +136,9 @@ async function backslashPathNormalizationTerminates() {
       invokeToolOk,
     ),
     (err) => {
-      assert.match(String(err.message || err), /vscode_lm_final_envelope_missing_create/);
+      assert.match(String(err.message || err), /vscode_lm_finalization_nonprogress/);
       assert.strictEqual(err.missingCreatePath, "tests/new.py");
+      assert.strictEqual(err.missingCreateAction, "v3_create");
       return true;
     },
   );
@@ -158,8 +160,8 @@ async function backslashPathNormalizationTerminates() {
 
 async function nativeProtocolMultipleMissingCreatesSubsetRepaired() {
   // Two required creates are missing on the first attempt; the bounded
-  // corrective stage repairs only one of them. The remaining missing path
-  // (not the already-repaired one) must name the terminal outcome.
+  // corrective stage repairs only one of them. The changed missing identity
+  // gets one correction of its own, then the repeated identity terminates.
   const contract = {
     "multi/a.js": { action: "create", current_sha256: "", line_count: 0, parent_existed: false },
     "multi/b.js": { action: "create", current_sha256: "", line_count: 0, parent_existed: false },
@@ -171,7 +173,7 @@ async function nativeProtocolMultipleMissingCreatesSubsetRepaired() {
   });
   await assert.rejects(
     internals.runVscodeLmAgent(
-      nativeModel([bothMissing, subsetRepaired]),
+      nativeModel([bothMissing, subsetRepaired, subsetRepaired]),
       {
         requestId: "2".repeat(32), request_kind: "worker", prompt: "bounded",
         allowedWrites: ["multi/*.js"], path_contracts: contract,
@@ -180,8 +182,9 @@ async function nativeProtocolMultipleMissingCreatesSubsetRepaired() {
       invokeToolOk,
     ),
     (err) => {
-      assert.match(String(err.message || err), /vscode_lm_final_envelope_missing_create/);
+      assert.match(String(err.message || err), /vscode_lm_finalization_nonprogress/);
       assert.strictEqual(err.missingCreatePath, "multi/b.js");
+      assert.strictEqual(err.missingCreateAction, "v3_create");
       return true;
     },
   );
