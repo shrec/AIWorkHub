@@ -1,5 +1,13 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.18 — 2026-09-09
+
+### Fixed
+
+- Reviewer launch and background packet preparation now agree on canonical
+  review-ready state. State-less wait telemetry no longer blocks a valid
+  quality review before provider start, and stale targets remain rejected.
+
 ## 0.11.17 — 2026-09-09
 
 ### Fixed

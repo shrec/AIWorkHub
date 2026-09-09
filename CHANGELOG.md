@@ -6,6 +6,16 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.18] - 2026-09-09
+
+### Fixed
+
+- Quality-review launch now reconciles the canonical
+  `review/review/review_ready` card state across both admission and background
+  packet preparation. Later state-less orchestration events no longer reject a
+  valid target before provider start, while a target that has left review still
+  fails closed.
+
 ## [0.11.17] - 2026-09-09
 
 ### Fixed
