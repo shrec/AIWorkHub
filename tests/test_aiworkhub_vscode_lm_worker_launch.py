@@ -52,11 +52,15 @@ def manager(tmp_path, monkeypatch):
     workspace = _Workspace(workspace_dir, canonical_repo, "req1")
     card = {
         "claim_epoch": 1,
+        "status": "review",
+        "worker_status": "review",
+        "terminal_substatus": "review_ready",
         "objective": "objective",
         "acceptance": [],
         "required_outputs": [],
         "validation": [],
         "terminal_review": {
+            "substatus": "review_ready",
             "evidence": {
                 "workspace": {},
                 "changed_path_hashes": {"src/mod.py": digest},
