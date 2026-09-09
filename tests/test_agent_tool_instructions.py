@@ -366,8 +366,9 @@ def test_semantic_edit_is_mandatory_in_every_projection() -> None:
     canonical = instr.render_canonical()
     assert "Semantic edit (mandatory):" in canonical
     assert (
-        "Change an existing file with aiworkhub_worker_semantic_edit_prepare"
-        " then _apply on the smallest verified range" in canonical
+        "Every seat changes an existing file with"
+        " aiworkhub_worker_semantic_edit_prepare then _apply, or the manager"
+        " pair, on the smallest verified range" in canonical
     )
     assert "a whole-file rewrite is not an editing strategy" in canonical
     for provider in instr.PROVIDERS:
@@ -384,7 +385,7 @@ def test_semantic_edit_exceptions_are_named_so_the_rule_is_followable() -> None:
     assert "a new file" in exceptions
     assert "a change spanning most of a file" in exceptions
     assert "an adapter without these tools" in exceptions
-    assert "make the smallest bounded edit and record why" in exceptions
+    assert "record which one applies, never a silent raw edit" in exceptions
 
 
 def test_prepare_is_an_edit_step_not_a_reader() -> None:
@@ -409,9 +410,28 @@ def test_the_semantic_edit_rule_is_stated_once() -> None:
     assert "After Source Graph finds an exact target" not in canonical
     assert canonical.count("aiworkhub_worker_semantic_edit_prepare") == 1
     assert canonical.count("a bounded read and never reread an unchanged range") == 1
-    assert instr.CANONICAL_MAX_BYTES == 7200
+    assert instr.CANONICAL_MAX_BYTES == 7300
     assert instr.PROJECTION_MAX_BYTES == 9200
     assert len(canonical.encode("utf-8")) <= instr.CANONICAL_MAX_BYTES
+
+
+def test_the_canonical_has_room_for_the_vocabulary_it_is_derived_from() -> None:
+    """A derived document must leave room for its source to grow.
+
+    The prohibition is rendered FROM ``RAW_DISCOVERY_DENIED_COMMANDS``, so the
+    canonical gets longer whenever that tuple does. At 4 bytes of headroom --
+    where the "every seat" sentences left it -- adding one realistic command
+    would have raised ValueError inside ``render_canonical`` in production, at
+    projection time, with no review to catch it. This measures the headroom
+    against a real command rather than trusting the comment at the cap.
+    """
+
+    rendered, _worker = _rendered_with_extra_denied_command("ripgrep")
+    for provider, text in rendered.items():
+        assert "ripgrep" in text, provider
+        assert len(text.encode("utf-8")) <= instr.PROJECTION_MAX_BYTES, provider
+    # The canonical is what the cap actually binds, and it is the tightest.
+    assert len(instr.render_canonical().encode("utf-8")) <= instr.CANONICAL_MAX_BYTES
 
 
 def test_worker_prompt_mandates_the_semantic_editor_with_named_exceptions() -> None:
@@ -458,9 +478,21 @@ def test_worker_policy_names_the_one_shot_tool_schema_load() -> None:
             "aiworkhub_worker_source_graph_query",
             "aiworkhub_worker_semantic_edit_prepare",
             "aiworkhub_worker_semantic_edit_apply",
+            # The declaration channel rides with them: the worker who is about
+            # to take a raw fallback is the one who will not search for a tool
+            # that records it.
+            "aiworkhub_worker_semantic_edit_exception_declare",
+            # The bounded validation runner and the exit rehearsal are preloaded
+            # too: a worker that has to discover them mid-run falls back to raw
+            # Bash validation, which is the 42.7%-of-bytes defect they replace.
+            "aiworkhub_worker_validation_run",
+            "aiworkhub_worker_exit_preflight",
         )
     )
     assert instr.WORKER_CLAUDE_TOOL_SCHEMA_QUERY == expected
+    assert set(instr.WORKER_CLAUDE_PRELOADED_TOOLS) <= set(
+        instr.WORKER_MCP_TOOL_NAMES
+    )
     assert f'"{expected}"' in policy
     assert policy.count("ToolSearch") == 1
     assert "never search schemas by keyword" in policy
@@ -476,13 +508,18 @@ def test_worker_policy_states_resolved_toolchain_and_bounded_output() -> None:
     assert "$AIWORKHUB_CANONICAL_PYTHON" in policy
     assert "$AIWORKHUB_CANONICAL_RUFF" in policy
     assert "$AIWORKHUB_CANONICAL_MYPY" in policy
-    assert "already resolved" in policy
-    assert "substitute them verbatim" in policy
+    assert "resolved absolute paths" in policy
     assert "never probe them first" in policy
-    assert "pass -q" in policy
-    assert "tail -n 40 or head" in policy
     assert "--tb=short" in policy
-    assert "re-run it only after you changed something it tests" in policy
+    # Output shaping is the tool's job now, not the model's: the runner returns
+    # a bounded record, so the policy must stop teaching a tail/head workaround
+    # (777 such calls were measured) and must forbid it instead.
+    assert "aiworkhub_worker_validation_run" in policy
+    assert "Never retype a validation command" in policy
+    assert "never pipe" in policy and "tail or head" in policy
+    assert "pass -q" not in policy
+    assert "aiworkhub_worker_exit_preflight" in policy
+    assert "never marks anything satisfied" in policy
     assert "at most 12 lines" in policy
     assert "name tests plus changed paths" not in policy
     assert "do not list files or paste test output" in policy
@@ -498,3 +535,160 @@ def test_worker_policy_states_resolved_toolchain_and_bounded_output() -> None:
     ):
         assert kept in policy, kept
     assert "Call aiworkhub_worker_session_current_state for continuity" not in policy
+
+
+# ---------------------------------------------------------------------------
+# Derived prohibition, derived substitution, and per-seat enforcement honesty.
+#
+# The prohibition and the enforced deny tuple used to be two hand-written lists
+# that agreed by luck, and the policy forbade without ever naming a replacement.
+# These tests fail against a restated string: they mutate the tuple and require
+# the rendered text to move with it.
+# ---------------------------------------------------------------------------
+
+import importlib  # noqa: E402
+import re  # noqa: E402
+
+from aiworkhub import runtime_adapters  # noqa: E402
+
+
+def _rendered_with_extra_denied_command(command: str) -> tuple[dict[str, str], str]:
+    """Render every projection and the worker prompt with ``command`` denied.
+
+    The module is reloaded so the derivation is exercised at its real source.
+    Both the tuple and the module are restored before returning, and the
+    restoration is asserted by the caller.
+    """
+
+    original = runtime_adapters.RAW_DISCOVERY_DENIED_COMMANDS
+    try:
+        runtime_adapters.RAW_DISCOVERY_DENIED_COMMANDS = (*original, command)
+        reloaded = importlib.reload(instr)
+        rendered = {
+            provider: reloaded.render_projection(provider)
+            for provider in reloaded.PROVIDERS
+        }
+        worker = reloaded.render_worker_runtime_policy()
+        return rendered, worker
+    finally:
+        runtime_adapters.RAW_DISCOVERY_DENIED_COMMANDS = original
+        importlib.reload(instr)
+
+
+def test_the_raw_discovery_prohibition_is_derived_from_the_enforced_tuple() -> None:
+    """A command added to the enforced tuple must reach every projection."""
+    sentinel = "zzsentinelsearch"
+    baseline = {p: instr.render_projection(p) for p in instr.PROVIDERS}
+    for text in baseline.values():
+        assert sentinel not in text
+
+    rendered, _worker = _rendered_with_extra_denied_command(sentinel)
+    for provider, text in rendered.items():
+        assert sentinel in text, provider
+
+    # Restored: the module is back to the real tuple for every later test.
+    assert {p: instr.render_projection(p) for p in instr.PROVIDERS} == baseline
+
+
+def test_the_worker_prompt_prohibition_is_derived_too() -> None:
+    """The second hand-written copy lived in the worker prompt; derive it too."""
+    sentinel = "zzsentinelsearch"
+    before = instr.render_worker_runtime_policy()
+    assert sentinel not in before
+
+    _rendered, worker = _rendered_with_extra_denied_command(sentinel)
+    assert sentinel in worker
+    assert instr.render_worker_runtime_policy() == before
+
+
+def test_the_canonical_prohibition_keeps_its_exact_wording() -> None:
+    """The derivation changed the SOURCE, not the text: no document resync."""
+    text = instr.render_canonical()
+    assert (
+        "- Never use grep, rg, find, tree, broad cat/sed or recursive listing"
+        " while Source Graph can index/process the target." in text
+    )
+    assert len(text.encode("utf-8")) <= instr.CANONICAL_MAX_BYTES
+
+
+def test_the_substitution_table_names_a_replacement_for_every_forbidden_surface() -> None:
+    """Forbidding without substituting is what sends a model to cat and sed."""
+    block = instr.WORKER_SUBSTITUTION_BLOCK
+    assert block in instr.render_worker_runtime_policy()
+    for command in runtime_adapters.RAW_DISCOVERY_DENIED_COMMANDS:
+        assert command in block, command
+    for native in runtime_adapters.CLAUDE_RAW_DISCOVERY_TOOL_DENIES:
+        assert native in block, native
+    for surface, tool in instr.WORKER_SUBSTITUTIONS:
+        assert surface.strip() and tool.strip()
+        assert f"{surface} -> {tool}." in block
+    # The third column: what to do when the named tool is genuinely unavailable.
+    assert "genuinely unavailable" in block
+    assert "A fallback nobody named is an unrecorded one." in block
+
+
+def test_every_tool_named_in_the_table_is_one_the_worker_server_registers() -> None:
+    """A renamed tool must not leave a dangling instruction behind."""
+    named = set(re.findall(r"aiworkhub_worker_[a-z_]+", instr.WORKER_SUBSTITUTION_BLOCK))
+    assert named
+    assert named <= set(instr.WORKER_MCP_TOOL_NAMES), sorted(
+        named - set(instr.WORKER_MCP_TOOL_NAMES)
+    )
+
+
+def test_the_worker_table_is_seat_correct() -> None:
+    """A worker prompt must never carry a manager-prefixed tool name."""
+    assert "aiworkhub_manager_" not in instr.WORKER_SUBSTITUTION_BLOCK
+    assert "aiworkhub_manager_" not in instr.render_worker_runtime_policy()
+
+
+def test_an_unenforcing_transport_is_told_the_text_is_the_only_control() -> None:
+    """Only a transport that enforces NOTHING gets the notice.
+
+    Two mechanisms enforce, and the argv predicate knows about one of them. The
+    first version of this test read it alone and required the notice on all six
+    adapters without an argv deny -- which put it on the three vscode_lm routes,
+    whose dispatch surface serves 20 tools, every one aiworkhub_*, with no raw
+    search and no raw editor among them. Telling that seat "nothing here refuses
+    you" was the plainest kind of false: it is the seat where refusal is total.
+    """
+
+    base = instr.render_worker_runtime_policy()
+    unenforcing = []
+    for adapter_id in runtime_adapters.SUPPORTED_ADAPTERS:
+        rendered = instr.render_worker_runtime_policy(adapter_id)
+        surface = runtime_adapters.tool_surface_enforcement_fact(adapter_id)
+        if surface["mechanism"] != runtime_adapters.TOOL_SURFACE_MECHANISM_NONE:
+            # Argv already refuses, or the surface never offered it. Either way
+            # the worker meets the refusal without being told about it.
+            assert rendered == base, adapter_id
+            continue
+        unenforcing.append(adapter_id)
+        assert "RAW_DISCOVERY_ENFORCEMENT:" in rendered, adapter_id
+        assert adapter_id in rendered
+        assert "this instruction is the whole of the rule" in rendered
+        assert "HMAC-authenticated MCP audit ledger" in rendered
+    # codex_cli, grok_kilo_cli and deepseek_manual: no argv deny, and a tool
+    # surface AIWorkHub does not own.
+    assert unenforcing == ["codex_cli", "grok_kilo_cli", "deepseek_manual"], unenforcing
+
+
+def test_an_unknown_transport_is_treated_as_unenforcing() -> None:
+    """An unlisted adapter can never inherit an enforcement claim."""
+    fact = instr.raw_discovery_enforcement("some_new_cli")
+    assert fact["adapter_known"] is False
+    assert fact["enforced"] is False
+    assert "RAW_DISCOVERY_ENFORCEMENT:" in instr.render_worker_runtime_policy(
+        "some_new_cli"
+    )
+    # No adapter at all keeps the historical, unannotated prefix.
+    assert instr.render_worker_runtime_policy(None) == instr.WORKER_RUNTIME_POLICY
+
+
+def test_the_contract_clauses_still_hold_in_both_carriers() -> None:
+    """The rewrite must not drop a clause the consistency check requires."""
+    canonical = instr.render_canonical()
+    worker = instr.render_worker_runtime_policy()
+    for clause, alternatives in instr.CONTRACT_CLAUSES.items():
+        assert any(value in canonical for value in alternatives), clause
+        assert any(value in worker for value in alternatives), clause

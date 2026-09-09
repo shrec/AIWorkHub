@@ -79,7 +79,7 @@ def test_semantic_edit_section_is_mandatory_and_bounded() -> None:
     assert "smallest verified range" in text
     assert "a whole-file rewrite is not an editing strategy" in text
     assert "Exceptions: a new file" in text
-    assert "make the smallest bounded edit and record why" in text
+    assert "record which one applies, never a silent raw edit" in text
     assert "prepare is an edit step, not a reader" in text
     assert "For edits prefer" not in text
     assert text.index("Source Graph gate:") < text.index("Semantic edit (mandatory):")

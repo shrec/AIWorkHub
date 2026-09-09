@@ -11,6 +11,20 @@ import re
 from dataclasses import dataclass
 from typing import Any, Literal
 
+# The enforced raw-discovery vocabulary and the per-adapter enforcement
+# capability live in ``runtime_adapters``; the rendered prohibition is derived
+# from them rather than restated, so a command added to the tuple reaches every
+# projection and every worker prompt in the same change.
+#
+# Direction check before wiring it: ``runtime_adapters`` imports only
+# ``platform_io`` (stdlib-only), and nothing in that chain imports this module,
+# so this edge is acyclic.  The constraint that module documents -- "repo_policy
+# already imports this one, so the dependency may only ever run in that
+# direction" -- is about ``repo_policy``; it does not forbid this direction, and
+# ``provider_tool_guards`` already imports THIS module while importing
+# ``runtime_adapters`` nowhere, so no cycle is created either way.
+from . import runtime_adapters
+
 
 # Byte caps for the on-attach contract. NF-2026-00281-V2 added the manager-role
 # section to the shared POLICY (rendered into all three providers) and a role
@@ -51,7 +65,48 @@ from typing import Any, Literal
 # rule) against unchanged caps of 7200 / 9200. Canonical headroom is now 37
 # bytes: the next policy addition has to dedupe something, which is the
 # intended pressure.
-CANONICAL_MAX_BYTES = 7200
+#
+# Audit tools-1 (2026-09-08) added the derived prohibition and the substitution
+# table and paid NOTHING for them in this document. Measured, before -> after:
+#   canonical 7163 -> 7163, AGENTS.md 7261 -> 7261,
+#   CLAUDE.md 8706 -> 8706, copilot 7283 -> 7283.
+# Zero, because the canonical sentence's WORDING did not change -- only its
+# source did, from a hand-written list to ``RAW_DISCOVERY_DENIED_COMMANDS``. The
+# three managed documents and docs/AIWORKHUB_TOOL_USE_POLICY.md therefore need
+# no resync for it.
+#
+# The substitution table itself is +1041 bytes and lives in WORKER_RUNTIME_POLICY
+# (5924 -> 6965 measured on this tree), which has no cap of its own and sits
+# inside a 160 KiB prompt budget. That placement was measured, not chosen to
+# dodge the cap: the three managed FILES never reach a worker at all (a worker
+# worktree is a sparse checkout seeded only from the card's declared paths),
+# while ``build_worker_prompt`` prepends this prefix for EVERY adapter on the
+# single launch path. The manager-seat rows were costed and NOT taken: the
+# leanest four-row table measures +365 canonical bytes net of the two lines it
+# could honestly absorb (the prohibition itself, and "Use body for an exact
+# symbol and bodygrep..."), which against 37 bytes of headroom would need the
+# cap at 7550 and would leave CLAUDE.md at 9071 of 9200. That is a cap raise
+# bought for a seat that is not the one skipping the tools, so it is reported as
+# an owner decision rather than taken here.
+#
+# Manager correction (2026-09-08), and this one DOES raise the cap, for a reason
+# none of the entries above had. Two "every seat" sentences landed in the
+# semantic-edit section (+33 measured, canonical 7163 -> 7196), which left 4
+# bytes. Four bytes was survivable while the document was hand-written. It is
+# not survivable now that "Audit tools-1" made the prohibition DERIVED: the
+# canonical grows whenever ``RAW_DISCOVERY_DENIED_COMMANDS`` grows, and a
+# realistic seventh command costs about 9 bytes there. So adding one word to the
+# enforcement vocabulary would have raised ValueError inside render_canonical --
+# in production, at import of the projection, not in a review.
+#
+# That is a coupling this file did not have before, and a cap has to leave room
+# for the thing it is now coupled to. 7300 is the smallest raise that admits
+# more than one such command; ``test_the_canonical_has_room_for_the_vocabulary_
+# it_is_derived_from`` measures it against the real tuple rather than trusting
+# this comment. Nothing was absorbed to pay for it because nothing here is
+# redundant -- the prose cost 33 bytes and the other 71 are headroom bought
+# deliberately, which is the honest description of it.
+CANONICAL_MAX_BYTES = 7300
 PROJECTION_MAX_BYTES = 9200
 START = "<!-- AIWORKHUB_TOOL_USE_POLICY_START -->"
 END = "<!-- AIWORKHUB_TOOL_USE_POLICY_END -->"
@@ -62,6 +117,25 @@ END = "<!-- AIWORKHUB_TOOL_USE_POLICY_END -->"
 PROVIDERS: tuple[Provider, ...] = ("AGENTS.md", "CLAUDE.md", ".github/copilot-instructions.md")
 
 Provider = Literal["AGENTS.md", "CLAUDE.md", ".github/copilot-instructions.md"]
+
+
+# ---------------------------------------------------------------------------
+# Derived raw-discovery vocabulary.
+#
+# There were three hand-written copies of the same list: the enforced tuple in
+# ``runtime_adapters``, the canonical POLICY sentence ("Never use grep, rg,
+# find, tree, ...") and the worker prompt sentence ("Raw Grep, Glob, grep, rg,
+# find and tree discovery are provider-blocked."). They agreed by luck. Both
+# rendered copies are now built from the tuples, so adding a command to
+# ``RAW_DISCOVERY_DENIED_COMMANDS`` changes what every seat is told.
+#
+# The canonical sentence keeps its exact previous wording and byte count -- the
+# derivation is a change of SOURCE, not of text -- so the three managed
+# documents and docs/AIWORKHUB_TOOL_USE_POLICY.md need no resync for it.
+RAW_DISCOVERY_COMMANDS = ", ".join(runtime_adapters.RAW_DISCOVERY_DENIED_COMMANDS)
+RAW_DISCOVERY_NATIVE_TOOLS = ", ".join(
+    runtime_adapters.CLAUDE_RAW_DISCOVERY_TOOL_DENIES
+)
 
 
 CLAUDE_MANAGER_PREAMBLE = """Claude Code manager role (read before the protocol below): every direct Claude chat holds this seat.
@@ -145,7 +219,7 @@ POLICY = ToolPolicy(
     ),
     source_graph=(
         "When source_graph_required is true, stop if its bundle is unavailable, empty, stale or unacknowledged.",
-        "Never use grep, rg, find, tree, broad cat/sed or recursive listing while Source Graph can index/process the target.",
+        f"Never use {RAW_DISCOVERY_COMMANDS}, broad cat/sed or recursive listing while Source Graph can index/process the target.",
         "A bounded exact-target fallback is allowed only after Source Graph reports that target unsupported or unindexed; record that reason.",
         "Re-query whenever the active symbol, dependency boundary, failure hypothesis, edit scope or validation target materially changes.",
         "workflow_stage is inferred by the server; pass it only to override.",
@@ -168,8 +242,8 @@ POLICY = ToolPolicy(
     # aiworkhub_worker_semantic_edit_prepare/apply with the smallest verified
     # range."), so CANONICAL_MAX_BYTES did not move.
     semantic_edit=(
-        "Change an existing file with aiworkhub_worker_semantic_edit_prepare then _apply on the smallest verified range; a whole-file rewrite is not an editing strategy.",
-        "Exceptions: a new file, a change spanning most of a file, or an adapter without these tools; then make the smallest bounded edit and record why.",
+        "Every seat changes an existing file with aiworkhub_worker_semantic_edit_prepare then _apply, or the manager pair, on the smallest verified range; a whole-file rewrite is not an editing strategy.",
+        "Exceptions: a new file, a change spanning most of a file, or an adapter without these tools; record which one applies, never a silent raw edit.",
         "prepare is an edit step, not a reader: read with body/file preview, otherwise use a bounded read and never reread an unchanged range.",
     ),
     validation=(
@@ -216,6 +290,7 @@ WORKER_MCP_TOOL_NAMES: tuple[str, ...] = (
     "aiworkhub_worker_source_graph_query",
     "aiworkhub_worker_semantic_edit_prepare",
     "aiworkhub_worker_semantic_edit_apply",
+    "aiworkhub_worker_semantic_edit_exception_declare",
     "aiworkhub_worker_session_current_state",
     "aiworkhub_worker_ai_memory_search",
     "aiworkhub_worker_ai_memory_get",
@@ -228,6 +303,9 @@ WORKER_MCP_TOOL_NAMES: tuple[str, ...] = (
     "aiworkhub_worker_kb_write_intent",
     "aiworkhub_worker_quality_review_packet_read",
     "aiworkhub_worker_quality_review_submit",
+    "aiworkhub_worker_validation_run",
+    "aiworkhub_worker_validation_output_page",
+    "aiworkhub_worker_exit_preflight",
 )
 
 MANAGER_CONTEXT_GRAPH_TOOL_NAMES: tuple[str, ...] = (
@@ -244,8 +322,115 @@ MANAGER_CONTEXT_GRAPH_TOOL_NAMES: tuple[str, ...] = (
 # re-discovering this static list. The exact one-shot select string is
 # rendered into WORKER_RUNTIME_POLICY so a run needs at most one call.
 WORKER_MCP_SERVER_NAME = "aiworkhub_worker_ai_tools"
+# The exact schemas a build worker needs in hand before its first action:
+# discovery, the two semantic-edit steps, the bounded validation runner and the
+# exit rehearsal. Preloading the last two is what keeps a worker from
+# rediscovering them mid-run and falling back to raw Bash validation.
+WORKER_CLAUDE_PRELOADED_TOOLS: tuple[str, ...] = (
+    *WORKER_MCP_TOOL_NAMES[:3],
+    # The declaration channel is preloaded for the same reason the validation
+    # runner is: a worker about to take a raw fallback is exactly the worker who
+    # will not think to search the deferred schemas for a tool that records one.
+    # A fallback channel undiscoverable at the moment of fallback is not one.
+    "aiworkhub_worker_semantic_edit_exception_declare",
+    "aiworkhub_worker_validation_run",
+    "aiworkhub_worker_exit_preflight",
+)
 WORKER_CLAUDE_TOOL_SCHEMA_QUERY = "select:" + ",".join(
-    f"mcp__{WORKER_MCP_SERVER_NAME}__{name}" for name in WORKER_MCP_TOOL_NAMES[:3]
+    f"mcp__{WORKER_MCP_SERVER_NAME}__{name}" for name in WORKER_CLAUDE_PRELOADED_TOOLS
+)
+
+
+# ---------------------------------------------------------------------------
+# The substitution table.
+#
+# The policy forbade and never substituted.  A model told "never grep" with no
+# named replacement reaches for cat, sed, a wider read, or guesses -- and for
+# six of the nine supported adapters (every vscode_lm route, codex_cli,
+# grok_kilo_cli and deepseek_manual) there is NO argv-level deny behind the
+# words, so the text is the whole of the enforcement.
+#
+# Both halves of each row are derived: the forbidden surface from the
+# ``runtime_adapters`` deny tuples, the replacement from ``WORKER_MCP_TOOL_NAMES``
+# via ``_WORKER_TOOL``, which raises at import if a tool is renamed.  A renamed
+# tool therefore cannot leave a dangling instruction pointing at a name the
+# server no longer registers.
+#
+# The table is rendered into WORKER_RUNTIME_POLICY, not into the canonical
+# POLICY, and that is a measured choice rather than a budget dodge:
+#   * the three managed instruction FILES are never present in a worker's
+#     worktree -- ``worker_workspace._prepare_sparse_worktree`` seeds only the
+#     card's declared paths -- so AGENTS.md/CLAUDE.md/copilot-instructions.md
+#     reach a manager chat in the canonical root and reach no worker at all;
+#   * every launched worker on every adapter DOES receive this string:
+#     ``build_worker_prompt`` prepends ``render_worker_runtime_policy()`` on the
+#     single launch path, before the adapter branch that splits the in-process
+#     vscode_lm bridge from the subprocess CLIs;
+#   * the canonical POLICY has 37 bytes of headroom and the leanest useful
+#     four-row table measures +365 bytes net of everything it can honestly
+#     absorb, so putting it there would buy the manager rows with a cap raise.
+# The manager-seat rows are therefore reported as a costed option, not taken.
+_WORKER_TOOL: dict[str, str] = {
+    name[len("aiworkhub_worker_"):]: name for name in WORKER_MCP_TOOL_NAMES
+}
+
+WORKER_SUBSTITUTIONS: tuple[tuple[str, str], ...] = (
+    (
+        f"raw search ({RAW_DISCOVERY_NATIVE_TOOLS}, {RAW_DISCOVERY_COMMANDS},"
+        " broad cat/sed, recursive listing)",
+        f"{_WORKER_TOOL['source_graph_query']} -- focus/slice to locate, then"
+        " body for an exact symbol or bodygrep for indexed literal text",
+    ),
+    (
+        "a whole-file rewrite, or a raw apply_patch/Edit/Write over a range"
+        " these tools can take",
+        f"{_WORKER_TOOL['semantic_edit_prepare']} then"
+        f" {_WORKER_TOOL['semantic_edit_apply']}",
+    ),
+    (
+        "retyping or re-deriving a validation command, or typing pytest/ruff/"
+        "mypy into Bash",
+        _WORKER_TOOL["validation_run"],
+    ),
+    (
+        "an unbounded file read, or rereading an unchanged range",
+        "one Source Graph body/file preview, then one bounded range you reuse",
+    ),
+    (
+        "calling your own work finished",
+        _WORKER_TOOL["exit_preflight"],
+    ),
+)
+
+WORKER_SUBSTITUTION_BLOCK = "\n".join(
+    [
+        "USE_THE_AIWORKHUB_TOOL_INSTEAD (forbidden surface -> the tool that does that job):",
+        *[f"- {surface} -> {tool}." for surface, tool in WORKER_SUBSTITUTIONS],
+        "- When the named tool is genuinely unavailable, say which one and why in"
+        " the final message, then make the smallest bounded fallback. A fallback"
+        " nobody named is an unrecorded one.",
+    ]
+)
+
+
+# ---------------------------------------------------------------------------
+# Enforcement honesty, per adapter.
+#
+# Measured against ``runtime_adapters.adapter_enforces_raw_discovery_denies``
+# on 2026-09-08: 3 of 9 supported adapters carry an argv-level tool deny
+# (claude_cli, deepseek_copilot_cli, glm_copilot_cli).  The other six --
+# codex_cli, grok_kilo_cli, deepseek_manual and all three vscode_lm routes --
+# have none, and for them this text is the entire control.  Saying
+# "provider-blocked" to a seat where nothing blocks it teaches the model that
+# the rule is somebody else's problem; saying it to a seat where the argv
+# already refuses spends bytes repeating a refusal it will meet anyway.  So the
+# sentence is rendered from the capability, and only where it is load-bearing.
+_ENFORCEMENT_NOTICE = (
+    "RAW_DISCOVERY_ENFORCEMENT: this transport ({adapter_id}) passes no"
+    " tool-deny to your provider ({reason}), so nothing mechanically stops the"
+    " commands above -- this instruction is the whole of the rule. The"
+    " HMAC-authenticated MCP audit ledger the coordinator verifies after you"
+    " exit is what records whether you kept it."
 )
 
 
@@ -256,25 +441,31 @@ do not commit, and do not modify .git. Work only on the task contract. The
 coordinator will independently enforce allowed_writes, rerun validation, promote
 accepted files, and request review after your process exits successfully.
 
-Read every read_first path before editing. Create the required evidence and run
-each listed validation command one time when its executable is already
-available; re-run it only after you changed something it tests.
+Read every read_first path before editing. Create the required evidence, then
+run validation ONLY through aiworkhub_worker_validation_run: it resolves the
+card's own declared command for you, executes it in this sandbox and returns the
+returncode, failure class, pytest short-summary lines and a bounded tail with
+the full log addressable by sha256. Never retype a validation command and never
+type pytest, ruff or mypy into Bash. On some transports Bash refuses those
+outright; on the rest nothing stops you, and typing one anyway produces an
+unreceipted run the supervisor cannot read -- so the result does not count
+either way. Re-running the tool on unchanged bytes returns the cached receipt;
+pass force=true to re-execute.
 Never install, download, unpack, vendor, or bootstrap validation dependencies
-inside the worker sandbox. If a declared validator is unavailable, name the
-exact missing executable/module in the final message and continue no further
-than an already-available targeted check; the coordinator-side supervisor will
-still run the canonical validation after exit. Never use git add -A or git add
-. and never touch paths outside allowed_writes.
+inside the worker sandbox. When a declared validator is unavailable the tool
+reports failure_class tool_unavailable: name it in the final message and
+continue no further; the coordinator-side supervisor will still run the
+canonical validation after exit.
+Never use git add -A or git add . and never touch paths outside allowed_writes.
 
 SANDBOX_VALIDATION_FACTS: your worktree is a sparse checkout, so a declared
-.venv/bin/python does not exist inside it. $AIWORKHUB_CANONICAL_PYTHON,
-$AIWORKHUB_CANONICAL_RUFF and $AIWORKHUB_CANONICAL_MYPY are already resolved
-absolute paths: substitute them verbatim for the declared interpreter or tool
-and never probe them first (no echo, command -v, which, ls or --version turn).
-Tool caches are already routed into your writable temp (RUFF_CACHE_DIR,
-MYPY_CACHE_DIR; PYTEST_ADDOPTS already adds --tb=short). Keep every validation
-output bounded: pass -q, pipe long output through tail -n 40 or head, and never
-paste a raw log into your reasoning. chmod/chown/utime are denied everywhere by
+.venv/bin/python does not exist inside it; the validation tool already resolves
+it, and $AIWORKHUB_CANONICAL_PYTHON, $AIWORKHUB_CANONICAL_RUFF and
+$AIWORKHUB_CANONICAL_MYPY are resolved absolute paths for anything else;
+never probe them first (no echo, command -v, which, ls or --version turn).
+Tool caches and pytest --tb=short are already configured, so never pipe
+validation through tail or head and never paste a raw log into your reasoning.
+chmod/chown/utime are denied everywhere by
 sandbox policy, so a test or fixture that needs them cannot run here: report
 exactly which tests were blocked with the prefix
 validation_unsupported_in_sandbox: and never stub a denied call to claim a
@@ -285,12 +476,15 @@ you need with exactly one ToolSearch call before any other tool call, query
 "{WORKER_CLAUDE_TOOL_SCHEMA_QUERY}"
 (select: is exact; never search schemas by keyword). Other hosts skip this.
 
+{WORKER_SUBSTITUTION_BLOCK}
+
 MANDATORY_AIWORKHUB_TOOLS:
 - For code discovery call aiworkhub_worker_source_graph_query first and call it
   again whenever you need a new symbol, dependency, call path, control-flow,
   configuration, or file target. Initial injected context is startup material,
-  not a substitute for live Source Graph use. Raw Grep, Glob, grep, rg, find
-  and tree discovery are provider-blocked.
+  not a substitute for live Source Graph use. Raw {RAW_DISCOVERY_NATIVE_TOOLS},
+  {RAW_DISCOVERY_COMMANDS} and recursive-listing discovery are denied for this
+  run; the line above names what to call instead.
 - Source Graph `target` is an optional exact path filter, never a copy of the
   semantic `query`. Omit `target` unless the task contract or worker MCP
   receipt explicitly declares that exact path as an allowed source target.
@@ -322,16 +516,74 @@ MANDATORY_AIWORKHUB_TOOLS:
 - If Source Graph reports an exact target unsupported/unindexed, stop and
   report that target. Only a new coordinator-authorized fallback card may use
   raw discovery for it.
+- Before your final message call aiworkhub_worker_exit_preflight once. It
+  re-runs the coordinator's own required-output, residual-contract and live
+  MCP-call checks read-only and names each failure it would otherwise produce
+  after you exit. It never marks anything satisfied, so repair what it lists
+  rather than reporting it.
 
 Your final message must be at most 12 lines: what changed and why, plus any
 blocked or missing validator. The coordinator computes changed paths and reruns
 validation itself, so do not list files or paste test output."""
 
 
-def render_worker_runtime_policy() -> str:
-    """Return the canonical stable worker prefix from the policy module."""
+def raw_discovery_enforcement(adapter_id: str | None) -> dict[str, Any]:
+    """What this transport can actually refuse, and what only the text holds.
 
-    return WORKER_RUNTIME_POLICY
+    ``enforced`` is read from ``runtime_adapters``, never asserted here, so a
+    newly added adapter defaults to "does not enforce" and can never inherit an
+    enforcement claim nobody verified.  ``adapter_id`` of ``None`` means the
+    caller did not say which transport this is, and an unknown transport is
+    treated exactly like an unenforcing one -- the honest direction.
+    """
+
+    known = bool(adapter_id) and adapter_id in runtime_adapters.SUPPORTED_ADAPTERS
+    # Two mechanisms enforce, not one. An argv tool deny is what a subprocess
+    # CLI accepts; a closed dispatch surface is what the in-process bridge has,
+    # and it is the stronger of the two -- a tool that is never dispatched
+    # cannot be called at all. Reading only the argv predicate told the three
+    # vscode_lm routes that nothing enforced their rule while their surface
+    # served 20 tools, every one aiworkhub_*, with no Grep, Read, Bash, Edit or
+    # Write among them. The argv predicate keeps its exact meaning for routing
+    # and launch records; this reads the companion that knows about both.
+    surface = runtime_adapters.tool_surface_enforcement_fact(str(adapter_id or ""))
+    enforced = known and surface["mechanism"] != (
+        runtime_adapters.TOOL_SURFACE_MECHANISM_NONE
+    )
+    detail = surface
+    return {
+        "adapter_id": str(adapter_id or ""),
+        "adapter_known": known,
+        "enforced": bool(enforced),
+        "reason": str(detail.get("reason") or runtime_adapters.RAW_DISCOVERY_ENFORCEMENT_UNVERIFIED),
+        "denied_commands": list(runtime_adapters.RAW_DISCOVERY_DENIED_COMMANDS),
+    }
+
+
+def render_worker_runtime_policy(adapter_id: str | None = None) -> str:
+    """Return the canonical stable worker prefix from the policy module.
+
+    With ``adapter_id`` the prefix also tells that seat the truth about its own
+    enforcement.  Six of the nine supported adapters pass no tool-deny to the
+    provider, and for those the rendered text IS the enforcement; saying so is
+    the difference between a rule a model treats as somebody else's problem and
+    one it knows it is personally holding.  Where the argv already refuses, no
+    bytes are spent repeating a refusal the run will meet anyway.
+
+    The parameter is optional so every existing caller keeps working unchanged;
+    a caller that knows the adapter should pass it.
+    """
+
+    if adapter_id is None:
+        return WORKER_RUNTIME_POLICY
+    enforcement = raw_discovery_enforcement(adapter_id)
+    if enforcement["enforced"]:
+        return WORKER_RUNTIME_POLICY
+    notice = _ENFORCEMENT_NOTICE.format(
+        adapter_id=enforcement["adapter_id"] or "unknown",
+        reason=enforcement["reason"],
+    )
+    return f"{WORKER_RUNTIME_POLICY}\n\n{notice}"
 
 
 CONTRACT_CLAUSES: dict[str, tuple[str, ...]] = {
@@ -662,16 +914,21 @@ __all__ = [
     "POLICY",
     "PROJECTION_MAX_BYTES",
     "PROVIDERS",
+    "RAW_DISCOVERY_COMMANDS",
+    "RAW_DISCOVERY_NATIVE_TOOLS",
     "START",
     "WORKER_CLAUDE_TOOL_SCHEMA_QUERY",
     "WORKER_MCP_SERVER_NAME",
     "WORKER_MCP_TOOL_NAMES",
     "WORKER_RUNTIME_POLICY",
+    "WORKER_SUBSTITUTIONS",
+    "WORKER_SUBSTITUTION_BLOCK",
     "ToolPolicy",
     "build_apply_plan",
     "diff_projection",
     "inspect_document",
     "managed_policy_rule_lines",
+    "raw_discovery_enforcement",
     "render_all",
     "render_canonical",
     "render_projection",

@@ -6,6 +6,78 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.9] - 2026-09-09
+
+### Added
+
+- The instruction the models actually receive now names the AIWorkHub tool for
+  every surface it forbids. The policy forbade raw search and a whole-file
+  rewrite in prose and never said what to use instead, so a model with no named
+  substitute reached for the next available thing. The worker runtime policy
+  carries a derived substitution table -- raw search to Source Graph, a whole
+  file rewrite to semantic edit prepare/apply, a retyped validation command to
+  the bounded validation runner, an unbounded read to one Source Graph preview,
+  and calling your own work finished to the exit rehearsal. Both sides are
+  derived from the tuples that define them, so a renamed tool cannot leave a
+  dangling instruction behind.
+- A worker can declare a semantic-edit exception and have it recorded.
+  `aiworkhub_worker_semantic_edit_exception_declare` writes the exception, the
+  path and the reason into the HMAC-authenticated audit ledger, and the
+  coverage record moves that path out of `undeclared_raw_only`. The policy
+  always had three legitimate exceptions -- a new file, a change spanning most
+  of a file, an adapter without the tools -- and until now taking one was
+  indistinguishable from ignoring the rule.
+- Semantic edit coverage is measured per attempt and attached to the terminal
+  event: which changed paths were reached by an apply, which were raw only,
+  which exceptions were declared or derived, and five named reasons a run could
+  not be measured rather than a false zero. It is measurement, not a gate; a
+  test asserts no acceptance module reads it.
+- The manager seat has the same semantic-edit pair over MCP, with its own
+  audit ledger, so a manager correction is recorded the way a worker's is.
+- A relaunch that cannot produce a different outcome is refused, and the
+  refusal names the two legal moves: reroute the launch identity, or authorize
+  the repeat with a reason.
+- A reviewer receives the findings from earlier rounds on the same task, with
+  line numbers carried only where the cited file is byte-identical and withheld
+  where it is not; a stale line number is worse than none.
+
+### Fixed
+
+- Six of the nine supported adapters were told their tools were
+  "provider-blocked" when nothing blocked them. Three of those six were told it
+  while their tool surface refuses more completely than any flag: AIWorkHub is
+  the tool server for the in-process bridge, and the twenty tools it offers are
+  every one `aiworkhub_*`, with no raw search and no raw editor among them. The
+  notice now renders only for the three transports that genuinely have no
+  launch-time lever, and enforcement is read from both mechanisms rather than
+  from the argv flag alone.
+- The validation line claimed pytest, ruff and mypy were provider-blocked. On
+  six adapters nothing blocked them, and on the three that do, prefix matching
+  means `Bash(pytest *)` never matches `<python> -m pytest`, the spelling this
+  repository actually uses. It now states the reason that is true everywhere: a
+  hand-typed run is unreceipted, so it does not count.
+- A build worker is denied the raw editor at launch. `Edit` sat on the granted
+  tool list beside semantic edit prepare/apply and was denied nowhere, which is
+  why 1,500 of 2,648 verified attempts that changed a file made zero semantic
+  applies. Measured before the change: of 547 `Edit` calls, 523 hit a file the
+  run never prepared at all -- the semantic path was not weighed and rejected,
+  it was never entered. `Write` is kept, because 82% of its use authors a new
+  file and no tool substitutes for that. The deny is launch-only and never
+  reaches the repository's tracked `.claude/settings.json`.
+- Eleven MCP contract and smoke gates had never run: pytest collects `test_*.py`
+  and they are named `mcp_*.py`. Eight now run under a driver that also fails if
+  a new gate file is neither driven nor declared unrun with a reason. The
+  contract drift they had accumulated was not an SDK change but this project's
+  own `geoai_task_*` to `aiworkhub_task_*` rename, which FastMCP writes into
+  every schema title; substituting the old prefix reproduces the old fingerprint
+  byte-exactly.
+- An accept or a reject now writes the decision, the changed paths with their
+  hashes and the review-feedback digest into the session store, so a rework
+  worker's injected context carries its predecessor's decision instead of
+  nothing.
+- A citation that named a line range in a twelve-thousand-line file moved three
+  times in one day on unrelated edits. It names the function now, and the test
+  refuses a line-range citation outright.
 ## [0.11.8] - 2026-09-08
 
 ### Fixed

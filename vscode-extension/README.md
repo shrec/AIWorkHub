@@ -12,6 +12,18 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.11.9 — 2026-09-09
+
+- Workers are told which AIWorkHub tool to use instead of each thing they are
+  told not to do, and each transport is told what actually enforces its rules
+  rather than a claim it could disprove in one turn.
+- The raw file editor is no longer handed to workers; the semantic editor does
+  the same job with a hash check. Creating a new file is unaffected.
+- A worker can declare a genuine exception and have it recorded, and how much
+  of a run went through the semantic editor is now measured.
+- A relaunch that cannot come out differently is refused, with the legal moves
+  named.
+
 ## What's new in 0.11.8 — 2026-09-08
 
 - Validation runs work on systems whose Python is a position-independent

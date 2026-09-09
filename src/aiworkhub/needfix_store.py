@@ -968,6 +968,290 @@ def add_needfix(
         readiness_score=readiness_score,
     )
 
+
+# ---------------------------------------------------------------------------
+# Read-only NeedFix drafting from the evidence that already justifies one.
+#
+# Measured 2026-09-08: of 204 manual filings, 76 had an accept/reject/status/
+# collect result within the previous 15 calls, 43 carried a 32-hex request id,
+# and 355 of 540 typed identifiers (66%) appeared verbatim in the previous 15
+# tool results; 453 of 557 stored rows carry a hand-typed evidence dict at p50
+# 549 B. Meanwhile 589 accepted-shape reviewer findings and 1,623 failed-gate
+# payloads became a NeedFix only if a manager retyped them, and reviewer cards
+# are archived (1,796 so far), taking every unconverted finding with them.
+#
+# Everything below is MECHANICAL -- title, kind, severity, scope, evidence,
+# refs and provenance are all copied or mapped from what the gate already
+# recorded. The DESCRIPTION is deliberately left empty: it is the manager's
+# judgement about what to do, and inventing one here would launder a guess as
+# evidence. A draft is not a row; nothing is written until the manager calls
+# ``add_needfix`` (verified) or ``capture_proposal`` (captured/unverified).
+# ---------------------------------------------------------------------------
+
+NEEDFIX_DRAFT_SCHEMA_ID = "aiworkhub.needfix_draft.v1"
+
+# Reviewer finding category -> NeedFix kind. The left column is exactly
+# ``quality_reviewer.FINDING_CATEGORIES``; anything outside it falls back to
+# ``bug`` rather than being dropped, so an added reviewer category can never
+# silently lose its findings.
+DRAFT_CATEGORY_KINDS: dict[str, str] = {
+    "general": "bug",
+    "duplicate_existing_symbol": "technical_debt",
+    "handrolled_standard_or_platform_capability": "technical_debt",
+    "unnecessary_abstraction": "refactor",
+    "excess_scope": "refactor",
+}
+
+# Quality-gate check kind -> NeedFix kind, same fallback rule.
+DRAFT_CHECK_KINDS: dict[str, str] = {
+    "lint": "technical_debt",
+    "format": "technical_debt",
+    "style": "technical_debt",
+    "typecheck": "bug",
+    "test": "bug",
+    "behavioral": "bug",
+    "security": "security_risk",
+    "coverage": "improvement",
+    "docs": "documentation_drift",
+}
+
+_DRAFT_LOCATION_RE = re.compile(r"([\w./\\-]+\.[A-Za-z0-9_]+):(\d+)")
+_DRAFT_MAX_CANDIDATES = 40
+_DRAFT_TEXT = 300
+
+
+def _draft_text(value: Any, limit: int = _DRAFT_TEXT) -> str:
+    return str(value or "").strip()[:limit]
+
+
+def _draft_severity(value: Any, default: str = "medium") -> str:
+    severity = str(value or "").strip().lower()
+    return severity if severity in SEVERITIES else default
+
+
+def _draft_location(finding: Mapping[str, Any]) -> tuple[str, str]:
+    """First ``path:line`` in a finding's own evidence prose, or ``("", "")``.
+
+    Reviewer findings carry their location inside ``evidence`` rather than in
+    structured fields -- the same convention ``completion_inbox`` dedupes on --
+    so this reads it from there instead of inventing one.
+    """
+    for key in ("path", "file"):
+        path = _draft_text(finding.get(key))
+        if path:
+            line = finding.get("line")
+            return path, str(line) if isinstance(line, int) else _draft_text(line, 12)
+    match = _DRAFT_LOCATION_RE.search(str(finding.get("evidence") or ""))
+    return (match.group(1), match.group(2)) if match else ("", "")
+
+
+def _draft_evidence_refs(evidence: Mapping[str, Any], request_id: str) -> list[str]:
+    """The attempt-artifact manifest reference plus the request id.
+
+    ``process_launcher._attempt_evidence_reference`` writes the manifest
+    reference as a repo-relative ``file:`` path and falls back to the
+    request-scoped bundle path; this reads the recorded one and reuses the same
+    fallback, so a draft never points at a manifest that was never written.
+    """
+    manifest = evidence.get("attempt_artifact_manifest")
+    reference = ""
+    if isinstance(manifest, Mapping):
+        reference = _draft_text(manifest.get("reference"), 500)
+        if not reference:
+            path = _draft_text(manifest.get("manifest_path"), 500)
+            if path:
+                reference = "file:" + path
+    if not reference:
+        reference = f"file:attempt-artifacts/{request_id}/manifest.json"
+    return [reference, str(request_id)]
+
+
+def _draft_failing_validation(evidence: Mapping[str, Any]) -> dict[str, Any]:
+    """The first failing validation row, as declared command + returncode."""
+    rows = evidence.get("validation")
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, Mapping):
+            continue
+        returncode = row.get("returncode")
+        if isinstance(returncode, int) and returncode != 0:
+            return {
+                "declared_command": _draft_text(
+                    row.get("declared_command") or row.get("command"), 500
+                ),
+                "returncode": returncode,
+            }
+    return {"declared_command": "", "returncode": None}
+
+
+def draft_from_review_evidence(
+    card: Mapping[str, Any],
+    *,
+    request_id: str,
+    finding_id: str = "",
+    check_id: str = "",
+) -> dict[str, Any]:
+    """Draft every NeedFix this card's own review evidence already justifies.
+
+    READ-ONLY and total: it opens no database, writes nothing, and never
+    raises. ``finding_id`` / ``check_id`` narrow the draft to exactly one
+    reviewer finding or one failing quality-gate check; with neither, every
+    blocking/failed check and every ``defect``-disposition finding is drafted.
+
+    Each candidate is filing-ready except for ``description``, which stays
+    empty because it is the manager's judgement, not a fact on the card. File
+    one with :func:`add_needfix` (verified) or :func:`capture_proposal`
+    (captured/unverified) after writing that description.
+    """
+
+    result: dict[str, Any] = {
+        "schema_id": NEEDFIX_DRAFT_SCHEMA_ID,
+        "ok": True,
+        "readonly": True,
+        "request_id": str(request_id),
+        "task_id": "",
+        "candidates": [],
+        "description_owner": "manager",
+        "description_note": (
+            "description is intentionally empty: it is the manager's judgement "
+            "about what to do, and this drafter never invents one"
+        ),
+        "file_with": ["needfix_add", "capture_proposal"],
+    }
+    if not isinstance(card, Mapping):
+        return {**result, "ok": False, "error": "card_unreadable"}
+    terminal = card.get("terminal_review")
+    terminal = terminal if isinstance(terminal, Mapping) else {}
+    evidence = terminal.get("evidence")
+    evidence = evidence if isinstance(evidence, Mapping) else {}
+    gate = evidence.get("quality_gate")
+    gate = gate if isinstance(gate, Mapping) else {}
+    identity = evidence.get("request_identity")
+    identity = identity if isinstance(identity, Mapping) else {}
+    task_id = _draft_text(
+        identity.get("task_id") or card.get("task_id"), 300
+    )
+    result["task_id"] = task_id
+
+    changed_paths = [
+        _draft_text(value, 300)
+        for value in (evidence.get("changed_paths") or [])
+        if _draft_text(value, 300)
+    ][:200]
+    refs = _draft_evidence_refs(evidence, str(request_id))
+    failing_validation = _draft_failing_validation(evidence)
+    base_evidence: dict[str, Any] = {
+        "request_id": str(request_id),
+        "task_id": task_id,
+        "error": _draft_text(evidence.get("error"), 500),
+        "returncode": failing_validation["returncode"],
+        "declared_command": failing_validation["declared_command"],
+    }
+    provenance = {
+        "origin": "server_draft",
+        "request_id": str(request_id),
+        "verified": False,
+    }
+
+    blocking = {
+        _draft_text(value, 200)
+        for value in (gate.get("blocking_checks") or [])
+        if isinstance(value, str)
+    }
+    candidates: list[dict[str, Any]] = []
+
+    wanted_check = _draft_text(check_id, 200)
+    wanted_finding = _draft_text(finding_id, 200)
+    for row in gate.get("checks") or []:
+        if not isinstance(row, Mapping):
+            continue
+        row_id = _draft_text(row.get("check_id"), 200)
+        status = _draft_text(row.get("status"), 40).lower()
+        if wanted_check:
+            if row_id != wanted_check:
+                continue
+        elif wanted_finding or status not in {"failed", "error", "blocked"}:
+            continue
+        candidates.append({
+            "source": "quality_gate_check",
+            "check_id": row_id,
+            "title": f"quality gate check failed: {row_id}"[:300],
+            "kind": DRAFT_CHECK_KINDS.get(
+                _draft_text(row.get("kind"), 60).lower(), "bug"
+            ),
+            "severity": "high" if row_id in blocking else "medium",
+            "scope_files": list(changed_paths),
+            "scope_symbols": [],
+            "description": "",
+            "evidence": {
+                **base_evidence,
+                "check_id": row_id,
+                "check_kind": _draft_text(row.get("kind"), 60),
+                "check_status": status,
+                "check_command": _draft_text(row.get("command"), 500),
+                "check_summary": _draft_text(row.get("summary"), 500),
+                "check_error": _draft_text(row.get("error"), 500),
+                "blocking": row_id in blocking,
+            },
+            "evidence_refs": list(refs),
+            "provenance": dict(provenance),
+        })
+
+    verdict = gate.get("quality_verdict")
+    verdict = verdict if isinstance(verdict, Mapping) else {}
+    reports = verdict.get("reviewer_reports")
+    for report in reports if isinstance(reports, list) else []:
+        if not isinstance(report, Mapping):
+            continue
+        lens = _draft_text(report.get("lens"), 40)
+        for finding in report.get("findings") or []:
+            if not isinstance(finding, Mapping):
+                continue
+            row_id = _draft_text(finding.get("id"), 200)
+            if wanted_finding:
+                if row_id != wanted_finding:
+                    continue
+            elif wanted_check or _draft_text(finding.get("disposition"), 40) != "defect":
+                continue
+            path, line = _draft_location(finding)
+            category = _draft_text(finding.get("category"), 60) or "general"
+            candidates.append({
+                "source": "reviewer_finding",
+                "finding_id": row_id,
+                "lens": lens,
+                "title": _draft_text(finding.get("summary"))
+                or f"reviewer finding {lens}:{row_id}"[:300],
+                "kind": DRAFT_CATEGORY_KINDS.get(category, "bug"),
+                "severity": _draft_severity(finding.get("severity")),
+                "scope_files": [path] if path else list(changed_paths),
+                "scope_symbols": [],
+                "description": "",
+                "evidence": {
+                    **base_evidence,
+                    "lens": lens,
+                    "finding_id": row_id,
+                    "category": category,
+                    "disposition": _draft_text(finding.get("disposition"), 40),
+                    "path": path,
+                    "line": line,
+                    "check_id": row_id,
+                    "summary": _draft_text(finding.get("summary"), 500),
+                    "finding_evidence": _draft_text(finding.get("evidence"), 2000),
+                },
+                "evidence_refs": list(refs),
+                "provenance": dict(provenance),
+            })
+
+    result["candidates"] = candidates[:_DRAFT_MAX_CANDIDATES]
+    result["candidate_count"] = len(result["candidates"])
+    result["truncated"] = len(candidates) > _DRAFT_MAX_CANDIDATES
+    if (wanted_check or wanted_finding) and not result["candidates"]:
+        result["ok"] = False
+        result["error"] = (
+            "check_id_not_on_card" if wanted_check else "finding_id_not_on_card"
+        )
+    return result
+
+
 def get_needfix(repo_root: str | Path, needfix_id: str) -> dict[str, Any]:
     conn = _connect(repo_root)
     try:

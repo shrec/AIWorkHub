@@ -1909,6 +1909,297 @@ def _semantic_edit_evidence_from_output(
     return from_authenticated_ledger()
 
 
+SEMANTIC_EDIT_COVERAGE_SCHEMA_ID = "aiworkhub.semantic_edit_coverage.v1"
+
+# The three exceptions the repository's semantic-edit rule actually allows.
+# Kept as data so a declaration carrying anything else is reported as an
+# unknown code rather than silently accepted.
+SEMANTIC_EDIT_POLICY_EXCEPTIONS = (
+    "new_file",
+    "spans_most_of_file",
+    "adapter_without_tools",
+)
+_COVERAGE_LIST_CAP = 200
+
+
+def semantic_edit_path_identifier(relative: str) -> str:
+    """The join key shared with the authenticated worker ledger.
+
+    ``sha256`` of the repo-relative POSIX path text -- the identical rule
+    ``worker_ai_tools_mcp.verify_audit_ledger`` applies to an apply receipt's
+    private ``path``.  Both sides hash the same normalized string, so the
+    finalizer can join an apply to a changed path without the ledger ever
+    carrying path text.
+    """
+    text = str(relative or "").strip().replace("\\", "/")
+    if not text:
+        return ""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _semantic_edit_coverage(
+    changed_paths: Iterable[str],
+    *,
+    workspace: Any = None,
+    worker_mcp_gate: dict[str, Any] | None = None,
+    granted_tool_names: Iterable[str] = (),
+    runtime_evidence: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Per-attempt semantic-edit coverage over the candidate's changed paths.
+
+    THIS IS A MEASUREMENT, NOT A GATE.  Nothing in acceptance, promotion, the
+    quality ratchet or the review decision reads this record; it exists so the
+    question "is semantic edit actually mandatory, and does everyone use it?"
+    has a durable numeric answer instead of an assertion.  This repository's
+    own rule is never to bound what it cannot yet measure, so the measurement
+    comes first and any threshold is a separate, later decision made against
+    the distribution this record produces.
+
+    Byte labels stay byte labels.  ``coverage_ratio`` is a ratio of BYTES of
+    changed files, never of provider tokens and never of money;
+    ``token_savings_claimed`` stays False for the same reason it is False on
+    the apply receipt itself.
+
+    Absence of evidence is never reported as zero coverage.  An unverifiable
+    ledger, an attempt that changed nothing, or receipts written before the
+    path identifier existed all resolve to ``measured: False`` with a named
+    ``unmeasured_reason`` -- never to ``coverage_ratio: 0.0``.
+    """
+
+    record: dict[str, Any] = {
+        "schema_id": SEMANTIC_EDIT_COVERAGE_SCHEMA_ID,
+        "measured": False,
+        "unmeasured_reason": "",
+        "changed_paths_count": 0,
+        "eligible_paths_count": 0,
+        "paths_with_apply": 0,
+        "paths_raw_only": [],
+        "paths_raw_only_count": 0,
+        "paths_new_file": 0,
+        "paths_deleted": 0,
+        "paths_baseline_unknown": 0,
+        "bytes_basis": "changed_file_size_at_finalization",
+        "bytes_changed": 0,
+        "bytes_via_apply": 0,
+        "coverage_ratio": None,
+        "declared_exceptions": [],
+        "declared_exception_count": 0,
+        "derived_exceptions": [],
+        "derived_exception_count": 0,
+        "undeclared_raw_only": [],
+        "undeclared_raw_only_count": 0,
+        "apply_receipts_total": 0,
+        "apply_receipts_joined": 0,
+        "apply_receipts_unjoinable": 0,
+        "adapter_semantic_edit_granted": None,
+        "token_savings_claimed": False,
+        "measurement_only": True,
+    }
+
+    changed = sorted({
+        str(item).strip().replace("\\", "/")
+        for item in (changed_paths or [])
+        if str(item).strip()
+    })
+    record["changed_paths_count"] = len(changed)
+
+    verification = (
+        worker_mcp_gate.get("verification")
+        if isinstance(worker_mcp_gate, dict) else None
+    )
+    if not isinstance(verification, dict) or verification.get("ok") is not True:
+        # The ledger is the only authenticated statement about tool use.  An
+        # adapter that reported nothing, or a ledger that could not be
+        # verified, is UNMEASURED -- it is not a worker that used nothing.
+        record["unmeasured_reason"] = "ledger_unverified"
+        return record
+    if not changed:
+        record["unmeasured_reason"] = "no_changed_paths"
+        return record
+
+    receipts = verification.get("semantic_edit_apply_receipts")
+    receipts = [row for row in receipts[:128] if isinstance(row, dict)] if isinstance(
+        receipts, list
+    ) else []
+    record["apply_receipts_total"] = len(receipts)
+    applied_digests = {
+        str(row.get("path_sha256") or "") for row in receipts
+    } - {""}
+    if receipts and not applied_digests:
+        # Every retained receipt predates the path identifier: the applies are
+        # real but cannot be joined to a path, so coverage is unknown rather
+        # than zero.
+        record["unmeasured_reason"] = "receipts_without_path_identifier"
+        return record
+    if not receipts and isinstance(runtime_evidence, dict) and runtime_evidence.get(
+        "observed"
+    ) is True:
+        # The authenticated ledger holds no apply, yet the local runtime bridge
+        # observed semantic edits for this attempt -- the vscode_lm route
+        # reports through ``semantic_edit_metrics`` on its own result stream,
+        # not through the worker MCP ledger.  Counting that as 0% would be
+        # exactly the "absence of evidence read as zero" defect this record
+        # exists to avoid, and folding an unauthenticated stream into the
+        # numerator would weaken the ledger.  So: unmeasured, and named.
+        record["unmeasured_reason"] = "applies_observed_outside_the_authenticated_ledger"
+        return record
+
+    granted = [str(name) for name in (granted_tool_names or [])]
+    semantic_edit_granted: bool | None = None
+    if granted:
+        semantic_edit_granted = any(
+            name.endswith("semantic_edit_apply") for name in granted
+        )
+    record["adapter_semantic_edit_granted"] = semantic_edit_granted
+
+    baselines: dict[str, str | None] = {}
+    tree_baseline: dict[str, str | None] | None = None
+    workspace_root: Path | None = None
+    if workspace is not None:
+        baselines = dict(getattr(workspace, "workspace_baseline", None) or {})
+        raw_tree = getattr(workspace, "tree_baseline", None)
+        tree_baseline = dict(raw_tree) if isinstance(raw_tree, dict) else None
+        root = getattr(workspace, "path", None)
+        workspace_root = Path(str(root)) if root else None
+
+    def baseline_state(relative: str) -> str:
+        """``present`` / ``absent`` / ``unknown`` at workspace creation."""
+        if relative in baselines:
+            return "present" if baselines[relative] is not None else "absent"
+        if tree_baseline is not None:
+            # The tree manifest covers EVERY file in the worktree, so absence
+            # from it is decisive: the path did not exist before this attempt.
+            return "present" if tree_baseline.get(relative) is not None else "absent"
+        return "unknown"
+
+    def path_bytes(relative: str) -> tuple[int, bool]:
+        if workspace_root is None:
+            return 0, False
+        candidate = workspace_root / relative
+        try:
+            if candidate.is_symlink() or not candidate.is_file():
+                return 0, False
+            return max(0, candidate.stat().st_size), True
+        except OSError:
+            return 0, False
+
+    declarations_by_digest: dict[str, dict[str, Any]] = {}
+    raw_declarations = verification.get("semantic_edit_exception_declarations")
+    if isinstance(raw_declarations, list):
+        for row in raw_declarations[:128]:
+            if not isinstance(row, dict):
+                continue
+            digest = str(row.get("path_sha256") or "")
+            if digest:
+                declarations_by_digest[digest] = row
+
+    raw_only: list[str] = []
+    new_files: list[str] = []
+    derived: list[dict[str, Any]] = []
+    declared: list[dict[str, Any]] = []
+    joined_digests: set[str] = set()
+    bytes_changed = 0
+    bytes_via_apply = 0
+    eligible = 0
+
+    for relative in changed:
+        digest = semantic_edit_path_identifier(relative)
+        has_apply = digest in applied_digests
+        if has_apply:
+            joined_digests.add(digest)
+        size, exists = path_bytes(relative)
+        state = baseline_state(relative)
+        if state == "unknown":
+            record["paths_baseline_unknown"] += 1
+        if not exists:
+            # A removed path was never "written raw": there is no replacement
+            # text to have gone through the editor, so it is outside the
+            # denominator rather than an uncovered edit.
+            record["paths_deleted"] += 1
+            continue
+        if state == "absent":
+            new_files.append(relative)
+            derived.append({
+                "path": relative,
+                "exception": "new_file",
+                "basis": "no_baseline_hash_at_workspace_creation",
+                "source": "runtime_derivation",
+            })
+            continue
+        eligible += 1
+        bytes_changed += size
+        if has_apply:
+            record["paths_with_apply"] += 1
+            bytes_via_apply += size
+            continue
+        raw_only.append(relative)
+        declaration = declarations_by_digest.get(digest)
+        covered_by_derivation = False
+        if semantic_edit_granted is False:
+            derived.append({
+                "path": relative,
+                "exception": "adapter_without_tools",
+                "basis": "semantic_edit_apply_absent_from_granted_tool_names",
+                "source": "runtime_derivation",
+            })
+            covered_by_derivation = True
+        if declaration is not None:
+            code = str(declaration.get("exception") or "")
+            if code not in SEMANTIC_EDIT_POLICY_EXCEPTIONS:
+                corroboration = "unknown_exception_code"
+                corroborated = False
+            elif code == "new_file":
+                corroborated = False
+                corroboration = "baseline_hash_present_for_path"
+            elif code == "adapter_without_tools":
+                corroborated = semantic_edit_granted is False
+                corroboration = (
+                    "granted_tool_names"
+                    if semantic_edit_granted is not None
+                    else "granted_tool_names_unknown"
+                )
+            else:
+                # "spans most of a file" is the genuinely judgemental case: the
+                # runtime never saw the raw write, so it holds no preimage to
+                # measure the span against.  The worker's word is recorded and
+                # explicitly marked uncorroborated rather than dressed up as a
+                # derivation.
+                corroborated = False
+                corroboration = "no_byte_evidence_for_a_raw_write"
+            declared.append({
+                "path": relative,
+                "exception": code,
+                "reason": str(declaration.get("reason") or "")[:200],
+                "source": "worker_declaration",
+                "corroborated": bool(corroborated),
+                "corroboration": corroboration,
+            })
+        elif not covered_by_derivation:
+            record["undeclared_raw_only"].append(relative)
+
+    record["eligible_paths_count"] = eligible
+    record["paths_raw_only"] = raw_only[:_COVERAGE_LIST_CAP]
+    record["paths_raw_only_count"] = len(raw_only)
+    record["paths_new_file"] = len(new_files)
+    record["bytes_changed"] = bytes_changed
+    record["bytes_via_apply"] = bytes_via_apply
+    record["coverage_ratio"] = (
+        round(bytes_via_apply / bytes_changed, 4) if bytes_changed > 0 else None
+    )
+    record["declared_exception_count"] = len(declared)
+    record["declared_exceptions"] = declared[:_COVERAGE_LIST_CAP]
+    record["derived_exception_count"] = len(derived)
+    record["derived_exceptions"] = derived[:_COVERAGE_LIST_CAP]
+    record["undeclared_raw_only_count"] = len(record["undeclared_raw_only"])
+    record["undeclared_raw_only"] = record["undeclared_raw_only"][:_COVERAGE_LIST_CAP]
+    record["apply_receipts_joined"] = len(joined_digests)
+    record["apply_receipts_unjoinable"] = max(
+        0, len(applied_digests) - len(joined_digests)
+    )
+    record["measured"] = True
+    return record
+
+
 def _ledger_input_tokens(usage: dict[str, Any], adapter_id: str) -> int:
     """Return taskctl's total input count without double-counting cache hits."""
     base = int(usage.get("input_tokens") or 0)
@@ -4584,6 +4875,7 @@ def build_worker_prompt(
     owner_prompt: str = "",
     project_context_bundle: str = "",
     crash_retry_packet: dict[str, Any] | None = None,
+    adapter_id: str | None = None,
     _budget_report: dict[str, Any] | None = None,
 ) -> str:
     extra = owner_prompt.strip()
@@ -4654,7 +4946,12 @@ def build_worker_prompt(
     # unrelated tasks; the task contract, context receipt, and owner text stay
     # after the stable boundary. This is a structural optimization only --
     # cache savings remain unclaimed until provider telemetry observes them.
-    stable_prefix = agent_tool_instructions.render_worker_runtime_policy()
+    # The adapter is passed because six of the nine supported transports carry
+    # no launch-time tool deny, and the runtime policy tells only those six that
+    # the rule behind it is the audit ledger rather than a provider refusal.
+    # This keeps the prefix stable: it varies per adapter, and a provider prefix
+    # cache is per provider already, so no cache is split by task.
+    stable_prefix = agent_tool_instructions.render_worker_runtime_policy(adapter_id)
     prompt = (
         stable_prefix
         + "\n\nTASK_CONTRACT_JSON:\n"
@@ -5904,8 +6201,12 @@ class ProcessManager:
         card[_toolchain_authority.RECEIPT_CARD_KEY] = (
             _toolchain_authority.authority_receipt(authority_snapshot, card)
         )
+        # ``repo`` lets the guard read the durable terminal history in
+        # ``task_events``.  It has to: ``reject_review`` erases the card's own
+        # ``terminal_review`` on the transition back to ``pending``, so the
+        # repeated-outcome axis has nothing to compare on the card alone.
         relaunch_refusal = identical_relaunch_refusal(
-            card, runner=runner, adapter_id=adapter_id
+            card, runner=runner, adapter_id=adapter_id, repo=self.repo
         )
         if relaunch_refusal:
             raise LaunchRejected(relaunch_refusal)
@@ -6763,6 +7064,315 @@ class ProcessManager:
             }
         return {"predecessor_request_id": request_id, "paths": paths}
 
+    # Bounds on what the prior-review section may cost.  Reviewer children are
+    # read for ONE task id, the target's own terminal history for ONE task id,
+    # and both are capped, so a target with 30 rework rounds cannot turn packet
+    # preparation into a table scan or the packet into a transcript.
+    _PRIOR_REVIEW_MAX_REVIEWER_CARDS = 64
+    _PRIOR_REVIEW_MAX_TERMINAL_EVENTS = 64
+
+    def _prior_reviewer_receipts(
+        self, target_task_id: str, exclude_request_id: str
+    ) -> tuple[list[dict[str, Any]], dict[str, dict[str, str | None]]]:
+        """Read EARLIER reviewer receipts for this task, and the bytes they judged.
+
+        Two bounded reads against the canonical task store, both keyed by one
+        task id:
+
+        * the reviewer child cards (``topic='quality_review'``) whose sealed
+          ``quality_review`` binding names this target task at some request
+          other than the one being packaged now; and
+        * this target's own ``terminal_review`` events, which are the only
+          durable record of what ``changed_path_hashes`` each earlier request
+          actually produced -- the card retains the latest attempt only.
+
+        Sequential by design, and the reason is the shape of the work, not an
+        oversight: this is two indexed single-key SQLite reads inside a
+        connection that is already open, and the whole call is inside the
+        single-flight that prepares one packet.  There is nothing to fan out
+        across cores, and a pool here would only compete with the interactive
+        MCP server for the same file lock.
+
+        Never raises: a store that cannot be read yields no prior findings,
+        which costs a round of re-derivation and breaks nothing.
+        """
+
+        reports: list[dict[str, Any]] = []
+        hashes_by_request: dict[str, dict[str, str | None]] = {}
+        conn: sqlite3.Connection | None = None
+        try:
+            db_path = task_store.canonical_db_path(self.repo)
+            # The canonical store's own read-only opener, not a second way of
+            # connecting to it: it applies this repository's busy timeout,
+            # ``query_only`` and row factory, so a prior-findings read can never
+            # write and never diverge from how everything else reads.
+            conn = task_store._connect(Path(db_path), readonly=True)
+            rows = conn.execute(
+                "SELECT task_id, card_json FROM tasks "
+                "WHERE topic='quality_review' AND instr(card_json, ?) > 0 "
+                "ORDER BY created_at DESC, task_id DESC LIMIT ?",
+                (target_task_id, self._PRIOR_REVIEW_MAX_REVIEWER_CARDS),
+            ).fetchall()
+            events = conn.execute(
+                "SELECT payload_json FROM task_events "
+                "WHERE task_id=? AND event='terminal_review' "
+                "ORDER BY event_id DESC LIMIT ?",
+                (target_task_id, self._PRIOR_REVIEW_MAX_TERMINAL_EVENTS),
+            ).fetchall()
+        except (sqlite3.Error, task_store.TaskStoreError, OSError, ValueError):
+            return [], {}
+        finally:
+            if conn is not None:
+                conn.close()
+
+        for event in events:
+            try:
+                payload = json.loads(event["payload_json"] or "{}")
+            except (TypeError, ValueError):
+                continue
+            evidence = payload.get("evidence")
+            if not isinstance(evidence, Mapping):
+                evidence = payload if isinstance(payload, Mapping) else {}
+            request_id = str(evidence.get("request_id") or payload.get("request_id") or "")
+            changed = evidence.get("changed_path_hashes")
+            if not request_id or not isinstance(changed, Mapping):
+                continue
+            hashes_by_request.setdefault(
+                request_id,
+                {
+                    str(key): (None if value is None else str(value))
+                    for key, value in changed.items()
+                },
+            )
+
+        for row in rows:
+            try:
+                card = json.loads(row["card_json"] or "{}")
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(card, Mapping):
+                continue
+            terminal = card.get("terminal_review")
+            evidence = terminal.get("evidence") if isinstance(terminal, Mapping) else None
+            if not isinstance(evidence, Mapping):
+                continue
+            binding = evidence.get("quality_review")
+            receipt = evidence.get("quality_review_receipt")
+            if not isinstance(binding, Mapping) or not isinstance(receipt, Mapping):
+                continue
+            # Identity, checked here rather than trusted: this receipt must name
+            # THIS target task, some OTHER request of it, and a real lens.
+            if str(binding.get("target_task_id") or "") != target_task_id:
+                continue
+            prior_request_id = str(binding.get("target_request_id") or "")
+            if not prior_request_id or prior_request_id == exclude_request_id:
+                continue
+            lens = str(binding.get("lens") or "")
+            if lens not in quality_reviewer.REVIEWER_LENSES:
+                continue
+            report = receipt.get("report")
+            target = receipt.get("target")
+            if not isinstance(report, Mapping) or not isinstance(target, Mapping):
+                continue
+            if str(target.get("task_id") or "") != target_task_id:
+                continue
+            findings = report.get("findings")
+            if not isinstance(findings, list):
+                continue
+            reports.append(
+                {
+                    "lens": lens,
+                    "reviewer_task_id": str(row["task_id"] or ""),
+                    "reviewer_request_id": str(
+                        (receipt.get("reviewer") or {}).get("request_id") or ""
+                    ),
+                    "reviewer_provider": str(report.get("provider") or ""),
+                    "packet_sha256": str(binding.get("packet_sha256") or ""),
+                    "target_request_id": prior_request_id,
+                    "findings": [f for f in findings if isinstance(f, Mapping)],
+                }
+            )
+        return reports, hashes_by_request
+
+    def _quality_review_prior_findings(
+        self,
+        *,
+        target_task_id: str,
+        target_request_id: str,
+        current_hashes: Mapping[str, str | None],
+        source_evidence: Mapping[str, Mapping[str, Any]],
+        predecessor_request_id: str,
+    ) -> dict[str, Any] | None:
+        """Carry earlier lens findings forward, with a MECHANICAL line status.
+
+        Measured 2026-09-08: 916 of 1,141 reviewer launches target a successor
+        candidate, 34.6% of their changed paths are byte-identical to the
+        predecessor, and 45 of 73 accepted targets produced zero findings across
+        every lens run they ever paid for.  Every one of those rounds re-derived
+        judgments the previous round already made and this repository already
+        paid for, because the packet said nothing about them.
+
+        The status attached to each finding is decided by comparing the sha256
+        of the cited path in THIS candidate against the sha256 of the same path
+        in the candidate that finding was written against -- the exact bytes,
+        recovered from that request's own ``terminal_review`` event.  Identical
+        bytes mean the cited lines still say exactly what the earlier reviewer
+        read, so the line numbers carry over unchanged and the finding is the
+        strongest available pointer to where to look first.  Different bytes
+        mean the line numbers are not transferable and the status says so.
+
+        Nothing here concludes that a finding was FIXED.  ``lines_changed``
+        says the bytes moved, not that the defect went away; ``lines_unchanged``
+        says they did not move, not that the finding was right.  Both are
+        sha256 comparisons, and the judgment stays with the reviewer.
+
+        Returns ``None`` when no earlier receipt for this task can be read --
+        the packet then simply carries no prior-review section, exactly as
+        before.
+        """
+
+        reports, hashes_by_request = self._prior_reviewer_receipts(
+            target_task_id, target_request_id
+        )
+        if not reports:
+            return None
+
+        changed_paths = set(current_hashes)
+
+        def hunk_overlap(path: str, start: int | None, end: int | None) -> bool | None:
+            """Does the cited range fall inside a hunk THIS candidate changed?"""
+            if start is None:
+                return None
+            row = source_evidence.get(path)
+            segments = row.get("segments") if isinstance(row, Mapping) else None
+            if not isinstance(segments, list):
+                return None
+            last = end if end is not None and end >= start else start
+            for segment in segments:
+                if not isinstance(segment, Mapping):
+                    continue
+                low = segment.get("changed_start_line")
+                high = segment.get("changed_end_line")
+                if not isinstance(low, int) or not isinstance(high, int):
+                    continue
+                if start <= high and last >= low:
+                    return True
+            return False
+
+        lenses: dict[str, dict[str, list[dict[str, Any]]]] = {}
+        omitted = 0
+        for report in reports:
+            lens = report["lens"]
+            section = lenses.setdefault(lens, {"reports": [], "findings": []})
+            if len(section["reports"]) >= quality_reviewer.MAX_PRIOR_REPORTS_PER_LENS:
+                omitted += 1
+                continue
+            prior_hashes = hashes_by_request.get(report["target_request_id"])
+            reviewer_request_id = report["reviewer_request_id"]
+            if not reviewer_request_id:
+                omitted += 1
+                continue
+            rows: list[dict[str, Any]] = []
+            for finding in report["findings"]:
+                raw_path = finding.get("path")
+                path = str(raw_path) if isinstance(raw_path, str) and raw_path else None
+                if path is not None and path not in changed_paths:
+                    # The packet binds every path-bearing row to this
+                    # candidate's changed set. A citation outside it is carried
+                    # without the path rather than dropped, so the judgment
+                    # still reaches the reviewer and nothing is silently lost.
+                    path = None
+                unchanged = (
+                    path is not None
+                    and isinstance(prior_hashes, Mapping)
+                    and path in prior_hashes
+                    and prior_hashes[path] is not None
+                    and prior_hashes[path] == current_hashes.get(path)
+                )
+
+                # Line numbers are carried ONLY when the bytes are identical.
+                # On changed bytes they are not merely stale, they are
+                # misleading -- a number that points at a line the earlier
+                # reviewer never read -- so they are withheld outright.
+                cited: list[int | None] = []
+                for field in ("line_start", "line_end"):
+                    value = finding.get(field)
+                    cited.append(
+                        value
+                        if unchanged
+                        and isinstance(value, int)
+                        and not isinstance(value, bool)
+                        and value >= 1
+                        else None
+                    )
+                line_start, line_end = cited
+                rows.append(
+                    {
+                        "reviewer_request_id": reviewer_request_id,
+                        "finding_id": str(finding.get("id") or ""),
+                        "severity": str(finding.get("severity") or "low"),
+                        "disposition": str(finding.get("disposition") or "observation"),
+                        "actionable": finding.get("actionable") is True,
+                        "summary": str(finding.get("summary") or ""),
+                        "path": path,
+                        "line_start": line_start,
+                        "line_end": line_end,
+                        "status": "lines_unchanged" if unchanged else "lines_changed",
+                        "line_mapping": "identity" if unchanged else "unavailable",
+                        "path_in_candidate": path is not None,
+                        "overlaps_current_hunk": (
+                            hunk_overlap(path, line_start, line_end)
+                            if unchanged and path is not None
+                            else None
+                        ),
+                    }
+                )
+            section["reports"].append(
+                {
+                    "reviewer_request_id": reviewer_request_id,
+                    "reviewer_task_id": report["reviewer_task_id"],
+                    "reviewer_provider": report["reviewer_provider"],
+                    "target_request_id": report["target_request_id"],
+                    "packet_sha256": (
+                        report["packet_sha256"]
+                        if re.fullmatch(r"[0-9a-f]{64}", report["packet_sha256"])
+                        else None
+                    ),
+                    "finding_count": len(rows),
+                }
+            )
+            section["findings"].extend(rows)
+
+        for lens, section in lenses.items():
+            # A finding on bytes that did not move is the strongest pointer the
+            # packet can carry, so it is kept first when the cap bites; an
+            # actionable defect outranks an observation after that.
+            section["findings"].sort(
+                key=lambda row: (
+                    row["status"] != "lines_unchanged",
+                    not row["actionable"],
+                    {"critical": 0, "high": 1, "medium": 2, "low": 3}.get(
+                        row["severity"], 4
+                    ),
+                    row["finding_id"],
+                )
+            )
+            cap = quality_reviewer.MAX_PRIOR_FINDINGS_PER_LENS
+            if len(section["findings"]) > cap:
+                omitted += len(section["findings"]) - cap
+                section["findings"] = section["findings"][:cap]
+            # ``finding_count`` stays the report's TRUE count and is never
+            # rewritten to what survived the cap: ``clean`` is derived from it,
+            # and a truncated report that reported "clean" would be a lie that
+            # tells a reviewer to look away.
+        if not any(section["reports"] for section in lenses.values()):
+            return None
+        return {
+            "predecessor_request_id": predecessor_request_id,
+            "lenses": lenses,
+            "omitted": omitted,
+        }
+
     def _prepared_quality_review(
         self,
         target_request_id: str,
@@ -6981,6 +7591,15 @@ class ProcessManager:
             candidate_delta = self._quality_review_candidate_delta(
                 card, current_hashes
             )
+            prior_findings = self._quality_review_prior_findings(
+                target_task_id=target_task_id,
+                target_request_id=target_request_id,
+                current_hashes=current_hashes,
+                source_evidence=source_evidence,
+                predecessor_request_id=str(
+                    (candidate_delta or {}).get("predecessor_request_id") or ""
+                ),
+            )
             target_claim_epoch = card.get("claim_epoch")
             if type(target_claim_epoch) is not int or target_claim_epoch < 1:
                 raise WorkspaceError("quality_review_target_claim_epoch_invalid")
@@ -7006,6 +7625,7 @@ class ProcessManager:
                 scoped_audits=scoped_audits,
                 caller_context=caller_context,
                 candidate_delta=candidate_delta,
+                prior_findings=prior_findings,
             )
             # Immutable inputs are authenticated reviewer contract context and
             # read-only workspace materialization authority. Keep candidate
@@ -11592,6 +12212,31 @@ class ProcessManager:
             semantic_edit_evidence = _semantic_edit_evidence_from_output(
                 stdout_path, worker_mcp_gate=worker_mcp_gate,
             )
+            # Coverage is computed BEFORE the workspace can be purged below:
+            # the eligible changed files are still on disk here, so the byte
+            # denominator comes from the files the finalizer already stats and
+            # hashes rather than from a second diff.  Measurement only -- no
+            # branch above or below consults it.
+            try:
+                semantic_edit_coverage = _semantic_edit_coverage(
+                    changed,
+                    workspace=workspace,
+                    worker_mcp_gate=worker_mcp_gate,
+                    granted_tool_names=(
+                        (metadata.get("worker_mcp") or {}).get("tool_names") or ()
+                    ),
+                    runtime_evidence=semantic_edit_evidence,
+                )
+            except Exception as exc:  # never let a measurement change an outcome
+                semantic_edit_coverage = {
+                    "schema_id": SEMANTIC_EDIT_COVERAGE_SCHEMA_ID,
+                    "measured": False,
+                    "unmeasured_reason": (
+                        f"coverage_measurement_failed:{type(exc).__name__}"
+                    )[:200],
+                    "token_savings_claimed": False,
+                    "measurement_only": True,
+                }
             finalization_duration_ms = round(
                 (time.monotonic() - finalization_started) * 1000.0, 3
             )
@@ -11693,6 +12338,7 @@ class ProcessManager:
                 "provider_tool_denials": provider_tool_denials,
                 "read_efficiency": provider_read_efficiency,
                 "semantic_edit": semantic_edit_evidence,
+                "semantic_edit_coverage": semantic_edit_coverage,
                 "worker_mcp_gate": worker_mcp_gate,
                 "quality_gate": quality_gate,
                 "research_result": research_result,

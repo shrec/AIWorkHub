@@ -85,8 +85,70 @@ def test_a_build_worker_keeps_the_full_raw_discovery_deny():
     denied = set(ra.claude_disallowed_tools(read_only=False))
 
     assert not ({"Grep", "Glob"} & tools)
-    assert denied == set(ra.CLAUDE_RAW_DISCOVERY_DENIES)
+    assert set(ra.CLAUDE_RAW_DISCOVERY_DENIES) <= denied
     assert {"Grep", "Glob"} <= denied
+
+
+def test_a_build_worker_routes_validation_through_the_bounded_runner():
+    """Raw pytest/ruff/mypy is denied the same way raw discovery is.
+
+    Token audit 2026-09-08 over 659 parseable worker runs: validation was 42.7%
+    of every tool-result byte on 16.1% of calls, 170 single Codex calls carried
+    more than 100 KB each, and 550 identical commands were re-run inside one
+    run.  ``aiworkhub_worker_validation_run`` is the substitute, so a build
+    worker holds it and is denied the raw spellings; a read-only reviewer has
+    no card validation to route and keeps its list unchanged.
+    """
+    tools = set(ra.claude_allowed_tools(read_only=False))
+    denied = set(ra.claude_disallowed_tools(read_only=False))
+    reviewer_denied = set(ra.claude_disallowed_tools(read_only=True))
+
+    assert f"{ra._WORKER}validation_run" in tools
+    assert set(ra.CLAUDE_WORKER_VALIDATION_SHELL_DENIES) <= denied
+    assert {"Bash(pytest *)", "Bash(ruff *)", "Bash(mypy *)"} <= denied
+    assert not (set(ra.CLAUDE_WORKER_VALIDATION_SHELL_DENIES) & tools)
+    assert not (set(ra.CLAUDE_WORKER_VALIDATION_SHELL_DENIES) & reviewer_denied)
+    assert f"{ra._WORKER}validation_run" not in set(
+        ra.claude_allowed_tools(read_only=True)
+    )
+
+
+def test_a_build_worker_routes_an_existing_file_change_through_the_semantic_editor():
+    """The rule stops being prose and starts being the tool list.
+
+    Measured over 215 retained claude_cli worker runs: 547 ``Edit`` calls, and
+    523 of them (95.6%) on a file ``semantic_edit_prepare`` was never called
+    for anywhere in that run.  ``Edit`` was the FIRST choice, not a fallback
+    after a failed prepare -- of 20 failed prepares, 20 retried the tool and 0
+    fell back to a raw write.  So the deny lands on the default path.
+
+    ``Write`` stays: 49 of its 60 distinct targets (82%) were authoring a new
+    file, which is one of the mandate's own exceptions.
+    """
+    tools = set(ra.claude_allowed_tools(read_only=False))
+    denied = set(ra.claude_disallowed_tools(read_only=False))
+
+    assert "Edit" not in tools
+    assert set(ra.CLAUDE_WORKER_RAW_EDITOR_DENIES) <= denied
+    # Granting and denying the same tool is the defect this module already
+    # names: a tool the launch will refuse is worse than an absent one.
+    assert not (set(ra.CLAUDE_WORKER_RAW_EDITOR_DENIES) & tools)
+    # The replacement, and the declared-exception channel behind it, are held.
+    assert f"{ra._WORKER}semantic_edit_prepare" in tools
+    assert f"{ra._WORKER}semantic_edit_apply" in tools
+    assert f"{ra._WORKER}semantic_edit_exception_declare" in tools
+    # Write is deliberately NOT denied -- denying it would delete the new-file
+    # exception rather than the shortcut.
+    assert "Write" in tools
+    assert "Write" not in denied
+
+
+def test_a_read_only_reviewer_is_not_handed_the_editor_deny():
+    """A reviewer holds no writable tree, so the editor deny is noise there."""
+    reviewer_denied = set(ra.claude_disallowed_tools(read_only=True))
+
+    assert not (set(ra.CLAUDE_WORKER_RAW_EDITOR_DENIES) & reviewer_denied)
+    assert not ({"Write", "Edit"} & set(ra.claude_allowed_tools(read_only=True)))
 
 
 def test_a_reviewer_cannot_file_its_report_where_the_supervisor_never_reads():
@@ -145,6 +207,10 @@ def test_the_argv_a_build_worker_actually_receives(tmp_path):
     assert "Write" in allowed
     assert any("semantic_edit_apply" in tool for tool in allowed)
     assert not any("quality_review_submit" in tool for tool in allowed)
+    # The editor deny reaches the real command line, not just the constant.
+    assert "Edit" not in allowed
+    denied = plan.argv[plan.argv.index("--disallowedTools") + 1:]
+    assert set(ra.CLAUDE_WORKER_RAW_EDITOR_DENIES) <= set(denied)
 
 
 def test_the_default_is_the_writing_role(tmp_path):

@@ -50,6 +50,7 @@ def test_worker_mcp_starts_without_optional_mcp_package(tmp_path: Path) -> None:
         "aiworkhub_worker_source_graph_query",
         "aiworkhub_worker_semantic_edit_prepare",
         "aiworkhub_worker_semantic_edit_apply",
+        "aiworkhub_worker_semantic_edit_exception_declare",
             "aiworkhub_worker_session_current_state",
             "aiworkhub_worker_ai_memory_search",
             "aiworkhub_worker_ai_memory_get",
@@ -62,6 +63,9 @@ def test_worker_mcp_starts_without_optional_mcp_package(tmp_path: Path) -> None:
         "aiworkhub_worker_kb_write_intent",
         "aiworkhub_worker_quality_review_packet_read",
         "aiworkhub_worker_quality_review_submit",
+        "aiworkhub_worker_validation_run",
+        "aiworkhub_worker_validation_output_page",
+        "aiworkhub_worker_exit_preflight",
     }
     source_schema = tools["aiworkhub_worker_source_graph_query"]["inputSchema"]
     assert source_schema["properties"]["budget"]["type"] == "integer"

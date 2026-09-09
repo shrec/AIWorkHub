@@ -347,6 +347,27 @@ function formatCount(value) {
   return new Intl.NumberFormat(undefined, { notation: "compact", maximumFractionDigits: 1 }).format(numberValue(value));
 }
 
+// "access observed" was too short a label for a two-disjunct fact, and the
+// row printed it next to a round-trip verdict that could say "unknown" in the
+// same breath. Name which evidence made it true, and never let it read as a
+// recent round trip: the access probe is not windowed.
+function accessObservationLabel(worker) {
+  const observation = worker.availability_observation;
+  if (!observation) {
+    return worker.availability_observed ? "access observed" : "access unverified";
+  }
+  if (!observation.observed) {
+    return "access unverified";
+  }
+  if (observation.basis === "adapter_access_probe") {
+    return "access probe ok";
+  }
+  if (observation.basis === "historical_quality_cards") {
+    return `access from ${formatCount(observation.historical_quality_cards)} prior cards`;
+  }
+  return "access observed";
+}
+
 function formatMoney(value) {
   return new Intl.NumberFormat(undefined, {
     style: "currency",
@@ -2045,7 +2066,7 @@ function renderWorkforce(snapshot) {
     row.appendChild(createElement(
       "div",
       "workforce-metrics",
-      `${worker.readiness_status || (worker.available ? "ready" : "unavailable")} · ${worker.availability_observed ? "access observed" : "access unverified"} · ${formatCount(outcomes.sample_count)} samples · ${outcomes.accepted_rate === null || outcomes.accepted_rate === undefined ? "accept n/a" : `${(numberValue(outcomes.accepted_rate) * 100).toFixed(1)}% accepted`} · ${formatCount(outcomes.retry_count)} retries`,
+      `${worker.readiness_status || (worker.available ? "ready" : "unavailable")} · ${accessObservationLabel(worker)} · ${formatCount(outcomes.sample_count)} samples · ${outcomes.accepted_rate === null || outcomes.accepted_rate === undefined ? "accept n/a" : `${(numberValue(outcomes.accepted_rate) * 100).toFixed(1)}% accepted`} · ${formatCount(outcomes.retry_count)} retries`,
     ));
     list.appendChild(row);
   }

@@ -9,6 +9,7 @@ if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 from aiworkhub import process_launcher  # noqa: E402
+from aiworkhub import runtime_adapters  # noqa: E402
 
 
 def _metadata() -> dict:
@@ -181,12 +182,48 @@ def test_worker_prompt_explains_runtime_enforcement() -> None:
         task_id="T1", runner="claude_worker", topic="coding", card={}
     )
     assert "MANDATORY_AIWORKHUB_TOOLS" in prompt
-    assert "provider-blocked" in prompt
     assert "HMAC-authenticated MCP audit ledger" in prompt
     assert "new coordinator-authorized fallback card" in prompt
     assert "trusted injected bundle are already canonical queries" in prompt
     assert "Never repeat an unchanged zero-hit query as ceremony" in prompt
     assert "Call aiworkhub_worker_session_current_state for continuity" not in prompt
+
+
+def test_the_prompt_never_claims_a_block_the_transport_does_not_make() -> None:
+    """A rule the model can disprove in one turn stops being a rule.
+
+    The validation line used to end "those are provider-blocked". Two measured
+    facts made that false. Six of the nine supported adapters carry no argv tool
+    deny at all, so nothing blocks anything there; and on the three that do,
+    Claude's Bash rules are prefix matches, so ``Bash(pytest *)`` never matches
+    ``<python> -m pytest`` -- the spelling every invocation in this repository
+    actually uses. The honest reason to use the tool is that a hand-typed run is
+    unreceipted and does not count, which is true on every transport.
+    """
+
+    prompt = process_launcher.build_worker_prompt(
+        task_id="T1", runner="claude_worker", topic="coding", card={}
+    )
+    assert "provider-blocked" not in prompt
+    assert "unreceipted run the supervisor cannot read" in prompt
+
+    # And the per-adapter notice tells only the seats that have no argv deny.
+    for adapter_id in runtime_adapters.SUPPORTED_ADAPTERS:
+        text = process_launcher.build_worker_prompt(
+            task_id="T1",
+            runner="claude_worker",
+            topic="coding",
+            card={},
+            adapter_id=adapter_id,
+        )
+        # The notice is keyed on what actually enforces, which is TWO
+        # mechanisms: an argv tool deny, and the bridge's closed dispatch
+        # surface. Reading only the argv predicate here told the three
+        # vscode_lm routes that nothing held their rule, when their surface
+        # serves no raw editor at all.
+        surface = runtime_adapters.tool_surface_enforcement_fact(adapter_id)
+        enforced = surface["mechanism"] != runtime_adapters.TOOL_SURFACE_MECHANISM_NONE
+        assert ("RAW_DISCOVERY_ENFORCEMENT:" in text) is not enforced, adapter_id
 
 
 def test_context_gate_honors_repo_policy_toggle(monkeypatch, tmp_path) -> None:

@@ -115,22 +115,36 @@ WRITE_GATED_TOOLS: tuple[str, ...] = (
 
 # The SAME byte-canonical sha256(inputSchema) values frozen at B108. A drift in
 # ANY tool's input schema flips concurrent_contract_v1 to false over the pipe.
+# RE-FROZEN 2026-09-08. This harness had never been RUN since it was written:
+# pytest collects ``test_*.py`` only and nothing in CI named this file, so it
+# sat red without saying so. 12 of these 15 mismatched, for the same measured
+# reason as B108: the tool FUNCTIONS were renamed ``geoai_*`` -> ``aiworkhub_*``
+# and FastMCP puts ``f"{func.__name__}Arguments"`` inside every inputSchema as
+# its title. Substituting the old prefix back reproduces the old fingerprint
+# exactly for 10 of the 12, which proves their parameters never changed; the
+# other two (``task_show``, ``task_mark_done``) additionally gained optional
+# parameters. It is NOT an SDK rendering change -- the three
+# ``aiworkhub_cli_adapter_*`` tools never drifted, because their functions were
+# never named ``geoai_*``.
+#
+# This file already compares only these 15 names against a session's listing
+# (never the whole inventory), so a newly added tool does not disturb it.
 FROZEN_SCHEMA_FINGERPRINTS: dict[str, str] = {
     "aiworkhub_cli_adapter_audit_summary_readonly": "6ab96b247924a28d5d793064a61e50c59f46a771c53459ec1197e3acca973fee",
     "aiworkhub_cli_adapter_plan_readonly": "7a79866fe17cd414929fc7e59898311436ce102d826637f7bac3df870cc49c9e",
     "aiworkhub_cli_adapter_report_readonly": "f80f2283b05d851f6fe1a405930efb9f65e39e7f2d501dc70ed5635ab5ca538c",
-    "aiworkhub_task_audit_log_read": "74c684c110e619ef2e3c8c01e59beb938438df93b3c4a0de9c661bc9fd93203d",
-    "aiworkhub_task_auto_pickup": "fff78a02b8d8a49a54a9d7c5ea8fabdda817fd3bffdcd12bc560cdc5f7051866",
-    "aiworkhub_task_collision_guard": "acfe0038d2537d852cd25d46d0021a0e38a8227a8ab0f8cce9deaef2b8feaf36",
-    "aiworkhub_task_export_jsonl": "bef633b8f2ef490b50629465aaad568676cd573cdd12e642875b19d9a3c02579",
-    "aiworkhub_task_health": "091219a847dddf8926f5a41e7deb3ad33704df05434e23409bceab171e305aeb",
-    "aiworkhub_task_list": "eb3d9dcce2e6679c3f9f77cd0a9b689d6e553a0119d944cf8e9f7dde3170fef9",
-    "aiworkhub_task_mark_done": "571fa3749c5713a752de7557b3ad5f5520fc6d0a2c0bc56d0de89632e0b76cd2",
-    "aiworkhub_task_mark_review": "f108d09c8f51dab3dfe79808e34fa7df610141b0992c0b4ac7abe660cc016344",
-    "aiworkhub_task_pending_for_runner": "37de6b3d912cfa4d5deab2f1ae2c1e03eeac9e552de7678604d4309c33227a13",
-    "aiworkhub_task_review_queue": "3db01bcd01ceec23a2caf5d7df6b28c5a452c03ac9a482eeeb5a48c5dd2142fc",
-    "aiworkhub_task_show": "197d2041187737888044d493380cb4d2a233d2195557a52b6a275cb914977dd0",
-    "aiworkhub_task_usage_report": "9aeda83460cd1edb99761473dd1aebbd6ddedfa3f96f02b5e2aeae702425168a",
+    "aiworkhub_task_audit_log_read": "5111315e1823d882715a6b1fa754f1c64894ec10eea469b0b2fe7bc5e98ec015",
+    "aiworkhub_task_auto_pickup": "02878ab53c86e45277a3c4337c438218de36a3d2d9f82f2385d9afaed2aa243e",
+    "aiworkhub_task_collision_guard": "9a6a72f9e63acc7e08a9fd4c95e66382530f96b98bb40467801b6679c2adf6fd",
+    "aiworkhub_task_export_jsonl": "60699d5c0d81ccf28ea7cd0a2f415089d0f87d144b40b83117517649fa847a4a",
+    "aiworkhub_task_health": "0d6de3645a2bbbb16f9ae4bc7592403918fd5a8768a3888b1018f1570a9aaffc",
+    "aiworkhub_task_list": "bf57352dc786f7f0a14c31625711a0a6ab4576d2d85fb730209a4a957efbd914",
+    "aiworkhub_task_mark_done": "85f0dad5ce5e23a4c258d1314230223d1ff8adfcee3f17765283986f1dce4e9a",
+    "aiworkhub_task_mark_review": "1722a2665425d2ebd8573c3425ee2d04b8c71ae3db24ace3c97e5a82d7e92bd4",
+    "aiworkhub_task_pending_for_runner": "864d85c9f3a5a7020e270ddd71f9aeea2ab65ca35932aaf869afaa837950b16d",
+    "aiworkhub_task_review_queue": "b5728f6f46c22488977fe80e794f420203cf6725367eb9271cfdad1c6538b878",
+    "aiworkhub_task_show": "987a6779aea9974dc849205292e41e5fab2443e04e97f3c2528059a6b60c4ad3",
+    "aiworkhub_task_usage_report": "84fe64116d44bde99ea6a1d850e94a3164e32c12b7a4479ecb4dc10bcc0fe7e3",
 }
 
 # server.py must contain none of these (defense in depth: the server never

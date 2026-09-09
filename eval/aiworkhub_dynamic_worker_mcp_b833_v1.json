@@ -9,6 +9,7 @@
     "aiworkhub_worker_source_graph_query",
     "aiworkhub_worker_semantic_edit_prepare",
     "aiworkhub_worker_semantic_edit_apply",
+    "aiworkhub_worker_semantic_edit_exception_declare",
     "aiworkhub_worker_session_current_state",
     "aiworkhub_worker_ai_memory_search",
     "aiworkhub_worker_ai_memory_get",
@@ -20,9 +21,13 @@
     "aiworkhub_worker_ai_memory_write_intent",
     "aiworkhub_worker_kb_write_intent",
     "aiworkhub_worker_quality_review_packet_read",
-    "aiworkhub_worker_quality_review_submit"
+    "aiworkhub_worker_quality_review_submit",
+    "aiworkhub_worker_validation_run",
+    "aiworkhub_worker_validation_output_page",
+    "aiworkhub_worker_exit_preflight"
   ],
   "bound_env_vars": [
+    "AIWORKHUB_WORKER_MCP_CONTRACT_PACKET_PATH",
     "AIWORKHUB_WORKER_MCP_TASK_ID",
     "AIWORKHUB_WORKER_MCP_RUNNER",
     "AIWORKHUB_WORKER_MCP_TOPIC",

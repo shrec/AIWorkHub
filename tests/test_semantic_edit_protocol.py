@@ -267,6 +267,7 @@ def test_verified_audit_exposes_only_semantic_edit_byte_receipt(
     assert verified["successful_call_count_by_tool"]["semantic_edit_prepare"] == 1
     assert verified["successful_call_count_by_tool"]["semantic_edit_apply"] == 1
     assert verified["semantic_edit_apply_receipts"] == [{
+        "path_sha256": hashlib.sha256(b"src/module.py").hexdigest(),
         "file_bytes": len(original.encode("utf-8")),
         "range_count": 1,
         "old_region_bytes": len("def target():\n    return 1\n".encode("utf-8")),
@@ -276,7 +277,15 @@ def test_verified_audit_exposes_only_semantic_edit_byte_receipt(
     }]
     serialized = json.dumps(verified, sort_keys=True)
     assert "edit-audit-1" not in serialized
+    # The privacy boundary is unchanged: the ledger still carries no path TEXT,
+    # no replacement text and no preimage/idempotency identity.  The added
+    # field is a non-invertible digest of the repo-relative path, usable only
+    # by a reader that already holds the path.
     assert "src/module.py" not in serialized
+    assert "def target()" not in serialized
+    assert verified["semantic_edit_apply_receipts"][0]["path_sha256"] == (
+        process_launcher.semantic_edit_path_identifier("src/module.py")
+    )
 
 
 # ---------------------------------------------------------------------------

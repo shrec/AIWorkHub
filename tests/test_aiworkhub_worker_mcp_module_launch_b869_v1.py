@@ -121,7 +121,16 @@ def test_worker_mcp_server_launches_as_a_package_module_and_serves_tools_over_re
 
     result = asyncio.run(_run_handshake(params))
     assert result["tool_names"] == set(w.MCP_TOOL_NAMES)
-    assert len(w.MCP_TOOL_NAMES) == 15
+    # 15 discovery/edit/review tools, the three bounded validation and
+    # exit-contract tools added by the 2026-09-08 token audit, and the
+    # declared-exception channel that makes a semantic-edit fallback a
+    # recorded act rather than an invisible one.
+    assert len(w.MCP_TOOL_NAMES) == 19
+    assert {
+        "aiworkhub_worker_validation_run",
+        "aiworkhub_worker_validation_output_page",
+        "aiworkhub_worker_exit_preflight",
+    } <= result["tool_names"]
     assert result["call_is_error"] is not True
 
 

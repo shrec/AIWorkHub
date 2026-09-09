@@ -466,6 +466,7 @@ def _compact_ai_infra(event: Mapping[str, Any]) -> dict[str, Any]:
     provider_denials = event.get("provider_tool_denials")
     read_efficiency = event.get("read_efficiency")
     semantic_edit = event.get("semantic_edit")
+    semantic_edit_coverage = event.get("semantic_edit_coverage")
     usage = event.get("usage")
     if (
         not isinstance(context, Mapping)
@@ -476,6 +477,7 @@ def _compact_ai_infra(event: Mapping[str, Any]) -> dict[str, Any]:
         and not isinstance(provider_denials, Mapping)
         and not isinstance(read_efficiency, Mapping)
         and not isinstance(semantic_edit, Mapping)
+        and not isinstance(semantic_edit_coverage, Mapping)
         and not isinstance(usage, Mapping)
     ):
         return {}
@@ -794,6 +796,44 @@ def _compact_ai_infra(event: Mapping[str, Any]) -> dict[str, Any]:
             # provider-token or monetary savings without a paired baseline.
             "token_savings_claimed": False,
         } if isinstance(semantic_edit, Mapping) else {},
+        # Per-attempt semantic-edit coverage: the denominator (paths the
+        # attempt changed) against the numerator (paths an authenticated apply
+        # receipt can be joined to).  Path TEXT is deliberately not projected;
+        # only the counts and the byte ratio are.  ``measured`` false with a
+        # named ``unmeasured_reason`` is an absence of evidence and must never
+        # be rendered as 0% coverage.  Measurement only: no gate reads it.
+        "semantic_edit_coverage": {
+            "schema_id": str(semantic_edit_coverage.get("schema_id") or "")[:96],
+            "measured": bool(semantic_edit_coverage.get("measured")),
+            "unmeasured_reason": str(
+                semantic_edit_coverage.get("unmeasured_reason") or ""
+            )[:120],
+            **{
+                key: _bounded_int(semantic_edit_coverage.get(key))
+                for key in (
+                    "changed_paths_count", "eligible_paths_count",
+                    "paths_with_apply", "paths_raw_only_count",
+                    "paths_new_file", "paths_deleted",
+                    "declared_exception_count", "derived_exception_count",
+                    "undeclared_raw_only_count", "apply_receipts_total",
+                    "apply_receipts_joined", "apply_receipts_unjoinable",
+                    "bytes_changed", "bytes_via_apply",
+                )
+            },
+            "coverage_ratio": _bounded_nonnegative_float(
+                semantic_edit_coverage.get("coverage_ratio")
+            ),
+            "adapter_semantic_edit_granted": (
+                semantic_edit_coverage.get("adapter_semantic_edit_granted")
+                if isinstance(
+                    semantic_edit_coverage.get("adapter_semantic_edit_granted"), bool
+                )
+                else None
+            ),
+            # A ratio of bytes of changed files. Not tokens, not money.
+            "token_savings_claimed": False,
+            "measurement_only": True,
+        } if isinstance(semantic_edit_coverage, Mapping) else {},
         "usage": {
             "input_tokens": _bounded_int(usage.get("input_tokens")),
             "output_tokens": _bounded_int(usage.get("output_tokens")),

@@ -1331,6 +1331,7 @@ def fold_quality_verdict(
     worker_model: str = "",
     human_approval: bool = False,
     config_error: str = "",
+    replay_binding: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Purely fold mechanical and reviewer evidence into one final verdict.
 
@@ -1378,6 +1379,49 @@ def fold_quality_verdict(
             blockers.append(check_id)
 
     raw_reports = list(reviewer_reports)
+    # HASH-KEYED REPLAY, ADMITTED ONLY ON BOTH HASHES.
+    #
+    # A report may be a REPLAY: an earlier reviewer's authenticated report on a
+    # byte-identical candidate under an identical contract, carried forward
+    # instead of paying for the same judgment twice. It counts for its lens --
+    # and so answers ``required_reviewer_missing`` -- only when BOTH the
+    # candidate digest and the contract identity of the report match this
+    # target's, and both are present.
+    #
+    # This can only ever make acceptance stricter. A replay whose binding does
+    # not match is not silently ignored: it is dropped from the evidence AND
+    # named as a blocker, so a mismatched replay refuses acceptance rather than
+    # quietly leaving a lens uncovered. Nothing here can turn a missing lens
+    # into a present one on anything weaker than an exact double match.
+    replay_rejected: list[str] = []
+    if raw_reports:
+        expected_candidate = str((replay_binding or {}).get("candidate_sha256") or "")
+        expected_contract = str(
+            (replay_binding or {}).get("contract_identity_sha256") or ""
+        )
+        admitted: list[Mapping[str, Any]] = []
+        for report in raw_reports:
+            replay = report.get("replay") if isinstance(report, Mapping) else None
+            if not isinstance(replay, Mapping):
+                admitted.append(report)
+                continue
+            observed_candidate = str(replay.get("candidate_sha256") or "")
+            observed_contract = str(replay.get("contract_identity_sha256") or "")
+            if (
+                expected_candidate
+                and expected_contract
+                and observed_candidate == expected_candidate
+                and observed_contract == expected_contract
+            ):
+                admitted.append(report)
+                continue
+            lens_name = report.get("lens") if isinstance(report, Mapping) else None
+            replay_rejected.append(
+                "replayed_reviewer_binding_mismatch:"
+                + (str(lens_name) if lens_name in JUDGMENT_LENSES else "unknown_lens")
+            )
+        raw_reports = admitted
+    blockers.extend(sorted(set(replay_rejected)))
     normalized_reports, schema_errors = normalize_reviewer_reports(raw_reports)
     blockers.extend(schema_errors)
 
@@ -2628,6 +2672,7 @@ def run_completion_quality_gate(
     combined_tree_scope: bool = False,
     review_meta_gates: bool = True,
     policy_root: Path | str | None = None,
+    replay_binding: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Execute the mandatory review-quality floor for one task delta.
 
@@ -2728,6 +2773,7 @@ def run_completion_quality_gate(
             worker_provider=worker_provider,
             human_approval=human_approval,
             config_error=config_error,
+            replay_binding=replay_binding,
         )
     except MalformedConfigError as exc:
         risk_profile = {}

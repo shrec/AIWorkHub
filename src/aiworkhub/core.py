@@ -6448,6 +6448,39 @@ def reject_review(
         request_id=str(pred_request_id or ""),
         outcome="rejected",
     )
+    # Both of the following read the card as it stood WHEN THIS REJECTION WAS
+    # ADJUDICATED. ``begin_claim_episode`` above cleared ``terminal_review``
+    # from the live card, and the failing checks and reviewer findings live
+    # only there; ``review_preimage`` is the exact SQL preimage this function
+    # already proved equal to that card, so this is a decode, not a re-read.
+    from . import learning_commit_store as _learning_store  # local: cycle-safe
+    from . import needfix_store as _needfix_store  # local: cycle-safe
+
+    try:
+        judged_card = task_store._decode_task_card(review_preimage)
+    except (TypeError, ValueError, KeyError):
+        judged_card = {}
+    # A reviewer card is archived once the parent finishes (1,796 so far),
+    # taking every unconverted finding with it. Draft them here, while they are
+    # still in hand -- mechanically, from the card's own evidence. The manager
+    # files one with needfix_add; the DESCRIPTION stays the manager's.
+    result["needfix_candidates"] = _needfix_store.draft_from_review_evidence(
+        judged_card, request_id=str(pred_request_id or "")
+    )
+    # Measured 2026-09-08: 3,383 decisions produced 130 session documents and
+    # the injected bundle's session section read evidence_count 0 in 743 of 743
+    # requests, so the successor's mandated session query was empty by
+    # construction. One event document per decision is what makes the
+    # predecessor's rejection visible to the rework worker.
+    result["session_decision_event"] = _learning_store.record_decision_event(
+        repo_root(),
+        task_id=task_id,
+        request_id=str(pred_request_id or ""),
+        decision="rejected",
+        changed_path_hashes=pred_changed_hashes,
+        review_feedback=card.get("review_feedback"),
+        failure_category=terminal_disposition,
+    )
     return result
 
 
@@ -6995,6 +7028,7 @@ def reroute_launch_identity(
     concurrent claim or mutation.
     """
     from . import process_launcher  # local import: cycle-safe (see _reconcile_retained_workspaces)
+    from . import launch_replay_guard  # local import: cycle-safe (it imports core)
 
     from_runner = str(from_runner or "").strip()
     to_runner = str(to_runner or "").strip()
@@ -7030,6 +7064,7 @@ def reroute_launch_identity(
         if isinstance(terminal_retry, dict)
         else ""
     )
+    identical_outcome_receipt: dict[str, Any] = {}
     if (
         not isinstance(terminal_retry, dict)
         or terminal_retry.get("schema_id") != "aiworkhub.terminal_retry.v1"
@@ -7037,7 +7072,23 @@ def reroute_launch_identity(
         or len(retry_request_id) > 120
         or retry_substatus not in _RETRYABLE_OPERATIONAL_TERMINAL_SUBSTATUSES
     ):
-        return _lifecycle_error("reroute_requires_terminal_retry_provenance")
+        # A semantic terminal (``validation_failed``) is not an operational
+        # retry and never will be: an unattended retry must not re-run a
+        # finding about the work.  But a card the launch guard has REFUSED on
+        # its own runner has no legal move left here unless the manager can
+        # change that runner in place.  Superseding into a new task id was the
+        # only alternative, and that is what turned 462 rework families into
+        # 1,967 task ids and lost their per-task retry accounting.
+        #
+        # The receipt is derived from the durable terminal history, not read
+        # from the card, so it cannot be forged; and it stops being true the
+        # moment this call changes the runner, which is the point.
+        live_refusal = launch_replay_guard.identical_outcome_refusal_receipt(
+            card, repo=repo_root()
+        )
+        if not live_refusal:
+            return _lifecycle_error("reroute_requires_terminal_retry_provenance")
+        identical_outcome_receipt = live_refusal
 
     retained_candidate_receipt: dict[str, Any] = {}
     if _has_retained_candidate_delta(card):
@@ -7094,6 +7145,14 @@ def reroute_launch_identity(
         "rerouted_at": now,
         **retained_candidate_receipt,
     }
+    if identical_outcome_receipt:
+        # What authorized this reroute, recorded where the next reader of the
+        # card can see it: the task id, the retained candidate and the retry
+        # accounting all stay, and the reason they were allowed to stay is on
+        # the card rather than in a manager's head.
+        semantic_card["identity_reroute"]["identical_outcome_refusal"] = (
+            identical_outcome_receipt
+        )
     encoded_card = json.dumps(semantic_card, ensure_ascii=False, sort_keys=True)
     try:
         conn = _canonical_connect()
@@ -7147,6 +7206,7 @@ def reroute_launch_identity(
                         "to_adapter_id": to_adapter_id,
                         "to_model": canonical_model,
                         "reason": bounded_reason,
+                        "identical_outcome_refusal": identical_outcome_receipt,
                     },
                     ensure_ascii=False,
                     sort_keys=True,
@@ -7164,7 +7224,150 @@ def reroute_launch_identity(
     result["from_runner"] = card_runner
     result["to_runner"] = to_runner
     result["to_model"] = canonical_model
+    if identical_outcome_receipt:
+        result["identical_outcome_refusal"] = dict(identical_outcome_receipt)
     return _reconcile_retained_workspaces(result)
+
+
+def authorize_identical_outcome_relaunch(
+    task_id: str,
+    request_id: str,
+    error_hash: str,
+    reason: str = "",
+    topic: str | None = None,
+) -> dict[str, Any]:
+    """Record the manager's explicit permission to relaunch a refused card.
+
+    The launch guard refuses a relaunch whose recorded outcomes have already
+    repeated on the same launch identity (see
+    ``launch_replay_guard.identical_outcome_refusal``).  Two moves stay legal
+    for such a card and the refusal names both: ``reroute_launch_identity``
+    moves it to another provider in place, and this call says "run it again on
+    the same one anyway, on my evidence".
+
+    It is deliberately narrow.  The override names the exact predecessor
+    request and the exact error identity it excuses, so it expires the moment
+    the card produces a different outcome, and it authorizes nothing else: it
+    accepts no work, changes no contract, and touches nothing acceptance
+    measures.  It is refused unless that refusal is currently live, so it
+    cannot be pre-armed against a future repeat.
+    """
+
+    from . import launch_replay_guard  # local import: cycle-safe (it imports core)
+
+    request_id = str(request_id or "").strip()
+    error_hash = str(error_hash or "").strip().lower()
+    bounded_reason = str(reason or "").strip()[:500]
+    if not request_id or len(request_id) > 120:
+        return _lifecycle_error("identical_outcome_override_request_id_invalid")
+    if not re.fullmatch(r"[a-f0-9]{4,64}", error_hash):
+        return _lifecycle_error("identical_outcome_override_error_hash_invalid")
+    if not bounded_reason:
+        return _lifecycle_error("identical_outcome_override_requires_reason")
+
+    card, error = _live_card(task_id)
+    if error:
+        return error
+    assert card is not None
+    expected_updated_at = str(card.get("updated_at") or "")
+    live_topic = str(card.get("topic") or "")
+    if not live_topic:
+        return _lifecycle_error("task has no exact topic identity")
+    if topic is not None and topic != live_topic:
+        return _lifecycle_error(f"topic mismatch expected={live_topic} got={topic}")
+    if (
+        _lifecycle_state(card) != "pending"
+        or str(card.get("worker_status") or "") != "unclaimed"
+        or card.get("claimed_by")
+    ):
+        return _lifecycle_error("identical_outcome_override_not_pending_unclaimed")
+
+    receipt = launch_replay_guard.identical_outcome_refusal_receipt(
+        card, repo=repo_root()
+    )
+    if not receipt:
+        return _lifecycle_error("identical_outcome_override_no_live_refusal")
+    if str(receipt.get("request_id") or "") != request_id:
+        return _lifecycle_error(
+            "identical_outcome_override_request_mismatch:"
+            f"expected={receipt.get('request_id')}:got={request_id}"
+        )
+    if str(receipt.get("error_hash") or "") != error_hash:
+        return _lifecycle_error(
+            "identical_outcome_override_error_hash_mismatch:"
+            f"expected={receipt.get('error_hash')}:got={error_hash}"
+        )
+
+    command = ["authorize-identical-outcome-relaunch", task_id, "--request-id", request_id]
+    actor = _verified_manager_actor()
+    gate = _canonical_write_gate(
+        "retry-terminal",
+        runner=CODEX_RUNNER,
+        topic=live_topic,
+        coordinator_capability=True,
+        task_id=task_id,
+    )
+    if gate is not None:
+        return gate
+
+    now = datetime.now(timezone.utc).isoformat()
+    override = {
+        "schema_id": launch_replay_guard.IDENTICAL_OUTCOME_OVERRIDE_SCHEMA_ID,
+        "request_id": request_id,
+        "error_hash": error_hash,
+        "repeats": receipt.get("repeats"),
+        "terminal_substatus": receipt.get("terminal_substatus"),
+        "runner": receipt.get("runner"),
+        "adapter_id": receipt.get("adapter_id"),
+        "reason": bounded_reason,
+        "actor": actor,
+        "authorized_at": now,
+    }
+    semantic_card = task_store.persistable_card_payload(card)
+    semantic_card["identical_outcome_override"] = override
+    encoded_card = json.dumps(semantic_card, ensure_ascii=False, sort_keys=True)
+    try:
+        conn = _canonical_connect()
+    except task_store.TaskStoreError as exc:
+        return _canonical_result(ok=False, returncode=1, stderr=str(exc), command=command)
+    try:
+        cur = conn.execute(
+            "UPDATE tasks SET card_json=?, updated_at=? WHERE task_id=? "
+            "AND status='pending' AND worker_status='unclaimed' AND updated_at=?",
+            (encoded_card, now, task_id, expected_updated_at),
+        )
+        if cur.rowcount != 1:
+            conn.rollback()
+            return _canonical_result(
+                ok=False,
+                returncode=1,
+                stderr=f"identical_outcome_override_conflict:task_id={task_id}",
+                command=command,
+            )
+        conn.execute(
+            "INSERT INTO task_events "
+            "(task_id, event, runner, payload_json, created_at) VALUES (?,?,?,?,?)",
+            (
+                task_id,
+                "identical_outcome_override",
+                actor,
+                json.dumps(
+                    {"topic": live_topic, "override": override, "refusal": receipt},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                now,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    card2 = task_store.get_task(repo_root(), task_id)
+    stdout = json.dumps(card2, ensure_ascii=False, default=str) if card2 else ""
+    result = _canonical_result(ok=True, returncode=0, stdout=stdout, command=command)
+    result["identical_outcome_override"] = dict(override)
+    return result
 
 
 def archive_task(task_id: str, reason: str = "", topic: str | None = None) -> dict[str, Any]:

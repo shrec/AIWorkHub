@@ -113,37 +113,78 @@ READONLY_CALL_ARGS: dict[str, dict[str, Any]] = {
     },
 }
 
+# Two of the eleven read-only tools return a result whose value->TYPE skeleton
+# is a function of the REPOSITORY'S STATE, not of the tool's contract, so it
+# cannot be frozen and is deliberately not:
+#
+#   * ``aiworkhub_task_health`` folds the live reconciler status and the
+#     learning-coverage window. ``durable_last_scan.scan_finished_epoch`` is
+#     ``null`` before a scan completes and a number after; whole sub-objects
+#     are absent until the reconciler has run once.
+#   * ``aiworkhub_task_usage_report`` folds per-record usage/cost counts that
+#     exist only once usage has been recorded.
+#
+# MEASURED 2026-09-08: this harness run against this repository and against a
+# freshly ``initialize_repository``-d one differs in EXACTLY these two
+# fingerprints and in no other. Freezing them would pin this machine's runtime
+# state and go red on any clean checkout -- a gate that fails for a reason that
+# is not a contract change teaches nothing. Their OUTPUT SCHEMA is still frozen
+# below, which is the part that is contract.
+STATE_DEPENDENT_RESULT_TOOLS: frozenset[str] = frozenset({
+    "aiworkhub_task_health",
+    "aiworkhub_task_usage_report",
+})
+
 # Byte-canonical sha256 of the value->type skeleton of each read-only tool's
 # structuredContent result, frozen at B109. Drift in ANY tool's output key set
 # or value type flips frozen_output_contract_v1 to false -> this is the freeze.
+#
+# RE-FROZEN 2026-09-08, after this gate was run for the first time since it was
+# written (pytest collects ``test_*.py`` only, and nothing in CI named this
+# file, so it sat red without saying so). Two skeletons drifted for real:
+# ``aiworkhub_cli_adapter_plan_readonly`` and
+# ``aiworkhub_cli_adapter_report_readonly`` both gained a ``collision_preflight``
+# object -- an additive read-only preflight fold. Both are stable across a
+# fresh repository, so both stay frozen.
 FROZEN_RESULT_SKELETON_FINGERPRINTS: dict[str, str] = {
     "aiworkhub_cli_adapter_audit_summary_readonly": "38556ccf570e39d958d93d3859b90928dfa39367e991a63ace1441567d7d40a5",
-    "aiworkhub_cli_adapter_plan_readonly": "f15bce6176e5ee3a51b18bcdbf4fc7b7f633ecddda984446b98fd6e35342e2c5",
-    "aiworkhub_cli_adapter_report_readonly": "c1c81f65e4d04bdd81ef1b84fd810d41f23eabbda763a65936b83dfaa3141e05",
+    "aiworkhub_cli_adapter_plan_readonly": "b725081798c2838c529b9e190eca464e0da858c7160c5fd69300d0bdb787846e",
+    "aiworkhub_cli_adapter_report_readonly": "ec006b454486996878c26f1108dbdabcd6f206eafff4b5626292711007ead658",
     "aiworkhub_task_audit_log_read": "a3ed606211c4752400a8719f8f711d160e9f51a8a8d4b0c1f112cf1e52670b4e",
     "aiworkhub_task_collision_guard": "2c83150c951e941ac4354831d3a09f4c1398816f94f259fbd8c173958033719f",
-    "aiworkhub_task_health": "e61b8cb033c374b08000c2585607d8cccdb1a91da4055af0e033441cf1201c14",
     "aiworkhub_task_list": "2c83150c951e941ac4354831d3a09f4c1398816f94f259fbd8c173958033719f",
     "aiworkhub_task_pending_for_runner": "87a32b68a9a85471f84885c1b59da774b3b5ad5f16d2864d922d8570de65766d",
     "aiworkhub_task_review_queue": "2c83150c951e941ac4354831d3a09f4c1398816f94f259fbd8c173958033719f",
     "aiworkhub_task_show": "2c83150c951e941ac4354831d3a09f4c1398816f94f259fbd8c173958033719f",
-    "aiworkhub_task_usage_report": "2c83150c951e941ac4354831d3a09f4c1398816f94f259fbd8c173958033719f",
 }
+assert not (
+    set(FROZEN_RESULT_SKELETON_FINGERPRINTS) & STATE_DEPENDENT_RESULT_TOOLS
+), "a state-dependent result must not be frozen as a contract"
 
 # The generic FastMCP output schema fingerprint per tool (supplementary static
-# check; catches a return-annotation change e.g. dict -> non-dict).
+# check; catches a return-annotation change e.g. dict -> non-dict). This IS
+# contract, and it covers all eleven tools including the two whose result
+# skeleton is state-dependent.
+#
+# RE-FROZEN 2026-09-08. Eight of eleven drifted, and for exactly one reason:
+# FastMCP names the generated output model ``f"{func.__name__}DictOutput"``, so
+# the ``geoai_task_*`` -> ``aiworkhub_task_*`` FUNCTION RENAME is inside the
+# schema as its title. The three ``aiworkhub_cli_adapter_*`` tools did not
+# drift, because their functions were never named ``geoai_*``. Nothing about
+# any return type changed -- every one of these is still
+# ``{"additionalProperties": true, "title": ..., "type": "object"}``.
 FROZEN_OUTPUT_SCHEMA_FINGERPRINTS: dict[str, str] = {
     "aiworkhub_cli_adapter_audit_summary_readonly": "5fc4ac244ce411f881fb112af8fce5c896d55e4bf19a253c4b2f363a095a67b1",
     "aiworkhub_cli_adapter_plan_readonly": "0e26f78662f85cf082a1b9a02a8ab8f20465fddde3cc0c64afa98b53483993eb",
     "aiworkhub_cli_adapter_report_readonly": "9db21818742f39cddd1089f8373dab352f3489fd555866ae7866772659cd70ca",
-    "aiworkhub_task_audit_log_read": "fdd2305a613bfd24f01c484b593ef0d36accb5df3f49a30c696b4b2d37f1bf54",
-    "aiworkhub_task_collision_guard": "fcb8ae84a30dc9801d116a3d294f67a613436a9ff8de4969b0097bef429d66f4",
-    "aiworkhub_task_health": "9c2b1d290ffa8d3e2cb8555afaf7117cf45e613d588cbb5e787b191f9251f1dc",
-    "aiworkhub_task_list": "6bc17623c20a41768e84146af7271946f2d89119181c35882f3a63c2330f3361",
-    "aiworkhub_task_pending_for_runner": "9574847f6b6c2d8eaef5271fe4486ba39c46210bdfaef31a87b0ec303c12f474",
-    "aiworkhub_task_review_queue": "90a02a5eab8f75261a4d9c191a7e1f939d44052dbf46a5a8ffd0bfba2e12ec86",
-    "aiworkhub_task_show": "49abd9371460804368fc330a3c9eb5ad061dcc81d62794b08c4b163ef4ac31b5",
-    "aiworkhub_task_usage_report": "e9583569f8f66b1ebf56609cee43b4c3ffbb9b5ee70322a7a8d40032150f3563",
+    "aiworkhub_task_audit_log_read": "c72b8e209722cf3fa169df408d36be3204a4a532239efeafafa8ca352db07690",
+    "aiworkhub_task_collision_guard": "b3f8735a3f9313805eb6458973cec467e4f03f77fbf8734b68becd8b23dbd218",
+    "aiworkhub_task_health": "0c9c1855d347f350bf3fe1a5b9ea0e12d49e1a0441df405b394d4d3d2032a7ac",
+    "aiworkhub_task_list": "e4711bee05cc4da07987fc7241e4bea86677ed2b72a0929b532745081c19d4a1",
+    "aiworkhub_task_pending_for_runner": "f661c107bf6262aed050c64d9ab8591901e24e92abe0c80596602cc79257b69d",
+    "aiworkhub_task_review_queue": "462a24ef1505e80c64cbd9e52336830d1ab1141e8dec37fcbda12fead4ed9548",
+    "aiworkhub_task_show": "0b99e620ef1d148d989ed2680bb48ae10d619baf448b5da6990158ad1bbeb90a",
+    "aiworkhub_task_usage_report": "15d014050eb5cf7bdc66b9eeed7da0ce9b3c75511f888439e870a3091f481b1c",
 }
 
 # Read-only tool modules that MUST hold no process-launch code (defense in
@@ -334,6 +375,9 @@ def run_freeze() -> dict[str, Any]:
             if cur_fp.get(n) != FROZEN_RESULT_SKELETON_FINGERPRINTS[n]
         )
         checks["result_skeleton_fingerprints_match_frozen"] = not skel_mismatch
+        # Determinism is compared over EVERY captured skeleton, including the
+        # state-dependent two: two sessions in one process see one repo state,
+        # so a difference there is real non-determinism, not repo drift.
         checks["result_skeleton_deterministic_across_sessions"] = cur_fp == fp_b
         detail["result_skeleton_fingerprint_mismatches"] = skel_mismatch
 

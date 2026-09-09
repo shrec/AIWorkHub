@@ -27,12 +27,24 @@ Hard invariants:
     writing text that looks like one, because it cannot forge the HMAC
     without the secret, and any tampered line is dropped by the verifier
     rather than trusted.
-  * No tool ever shells out to a script or spawns a subprocess: Source Graph,
-    Session Manager, AI Memory and KB are all queried in-process (direct
-    ``sqlite3`` reads against the canonical registry-resolved database, or a
-    direct call into ``aiworkhub.source_graph``), bounded and output-capped,
-    mirroring the bounded-context pattern already used by
+  * No DISCOVERY tool ever shells out to a script or spawns a subprocess:
+    Source Graph, Session Manager, AI Memory and KB are all queried in-process
+    (direct ``sqlite3`` reads against the canonical registry-resolved database,
+    or a direct call into ``aiworkhub.source_graph``), bounded and
+    output-capped, mirroring the bounded-context pattern already used by
     ``project_context.py`` for the coordinator's own precomputed bundle.
+    ``aiworkhub_worker_validation_run`` is the single, deliberate exception and
+    it spawns exactly one thing: the card's OWN declared validation command,
+    resolved by the coordinator's own resolver
+    (``worker_workspace.resolve_worker_validation_argv``) and never a
+    caller-supplied argv.  It runs shell-free, inside the sandbox this server is
+    already confined by, so it executes nothing the worker's own Bash tool could
+    not already execute at that moment -- no boundary moves.  Its purpose is
+    purely to keep the megabytes that command prints OUT of the model's context
+    (measured 2026-09-08: validation was 42.7% of all worker tool-result bytes,
+    82.0 MB on the Codex lane alone, one pytest call returning 988,306 bytes),
+    and it is advisory: the coordinator's post-exit ``run_validations`` remains
+    the only acceptance evidence.
 
 Binding note (B834 authority repair): this module receives TWO separate,
 immutable repository bindings, never one conflated path:
@@ -83,6 +95,7 @@ import os
 import re
 import secrets
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import threading
@@ -90,7 +103,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 _REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 from typing import Any, Literal, Mapping, NamedTuple, Sequence
@@ -125,6 +138,10 @@ ENV_SESSION_TOPIC = "AIWORKHUB_WORKER_MCP_SESSION_TOPIC"
 ENV_AUDIT_LEDGER_PATH = "AIWORKHUB_WORKER_MCP_AUDIT_LEDGER_PATH"
 ENV_AUDIT_HMAC_KEY_PATH = "AIWORKHUB_WORKER_MCP_AUDIT_HMAC_KEY_PATH"
 ENV_QUALITY_REVIEW_PACKET_PATH = "AIWORKHUB_WORKER_MCP_QUALITY_REVIEW_PACKET_PATH"
+# Sealed exit-contract packet (see worker_workspace.seal_worker_contract_packet):
+# the card's validation commands, required outputs and the launch baselines the
+# finalizer will re-measure.  Advisory input only; never acceptance evidence.
+ENV_CONTRACT_PACKET_PATH = "AIWORKHUB_WORKER_MCP_CONTRACT_PACKET_PATH"
 ENV_REWORK_OVERLAY_PATH = "AIWORKHUB_REWORK_OVERLAY_PATH"
 ENV_PROVIDER_CALL_ID = "AIWORKHUB_WORKER_MCP_PROVIDER_CALL_ID"
 ENV_PROVENANCE = "AIWORKHUB_WORKER_MCP_PROVENANCE"
@@ -351,6 +368,7 @@ class WorkerToolContext:
     allowed_writes: tuple[str, ...] = ()
     rework_overlay_packet: dict[str, Any] | None = None
     rework_overlay_packet_path: Path | None = None
+    contract_packet_path: Path | None = None
     provider_call_id: str = ""
     provenance: str = ""
     _supervisor_owned: bool = False
@@ -398,6 +416,7 @@ def load_context_from_env(env: Any = None) -> WorkerToolContext:
     ledger_raw = source.get(ENV_AUDIT_LEDGER_PATH) or ""
     key_raw = source.get(ENV_AUDIT_HMAC_KEY_PATH) or ""
     review_packet_raw = source.get(ENV_QUALITY_REVIEW_PACKET_PATH) or ""
+    contract_packet_raw = source.get(ENV_CONTRACT_PACKET_PATH) or ""
     rework_overlay_raw = source.get(ENV_REWORK_OVERLAY_PATH) or ""
     rework_packet: dict[str, Any] | None = None
     if rework_overlay_raw:
@@ -449,6 +468,9 @@ def load_context_from_env(env: Any = None) -> WorkerToolContext:
         ),
         rework_overlay_packet=rework_packet,
         rework_overlay_packet_path=(overlay_path if rework_overlay_raw else None),
+        contract_packet_path=(
+            Path(str(contract_packet_raw)) if contract_packet_raw else None
+        ),
         provider_call_id=provider_call_id,
         provenance=provenance,
     )
@@ -2034,6 +2056,11 @@ def verify_audit_ledger(
         "authority_index_identity": [],
         "verified_payloads": [],
         "semantic_edit_apply_receipts": [],
+        # Worker-declared policy exceptions for paths edited without the
+        # semantic editor ("a new file", "spans most of a file", "an adapter
+        # without these tools").  Carried as hashed path identifiers only, on
+        # the same rule as the apply receipts below.
+        "semantic_edit_exception_declarations": [],
         "provider_call_ids": [],
         "provenance_counts": {},
         "provider_call_id_by_tool": {},
@@ -2295,6 +2322,15 @@ def verify_audit_ledger(
             tool == "semantic_edit_apply"
             and authority_source == "worker_workspace"
             and authority_state == "deterministic_apply"
+        ) or (
+            # A declaration is a successful worker call like any other.  Without
+            # this pairing it would land in ``call_count_by_tool`` and never in
+            # ``successful_call_count_by_tool``, which makes
+            # ``_failed_attempts`` read every recorded exception as a FAILURE --
+            # the record would be evidence against the worker that filed it.
+            tool == "semantic_edit_exception_declare"
+            and authority_source == "worker_workspace"
+            and authority_state == "declared_exception"
         )
         review_packet_authority = (
             tool == "quality_review_packet_read"
@@ -2331,10 +2367,29 @@ def verify_audit_ledger(
             and isinstance(payload, dict)
             and len(result["semantic_edit_apply_receipts"]) < 128
         ):
-            # Only deterministic byte counts leave the authenticated ledger.
-            # Replacement text, paths, hashes and idempotency keys remain
-            # private to the worker runtime.
+            # Only deterministic byte counts and ONE opaque path IDENTIFIER
+            # leave the authenticated ledger.  Replacement text, path TEXT,
+            # preimage/postimage hashes and idempotency keys remain private to
+            # the worker runtime, exactly as before.
+            #
+            # Why the identifier does not breach that boundary: it is
+            # sha256(repo-relative path text), a fixed-width digest that
+            # carries no directory names, no file names, no extensions, no
+            # content and no filesystem layout, and it is not invertible.  It
+            # is only useful to a reader who ALREADY holds the path and hashes
+            # it the same way -- which is precisely the finalizer, and only for
+            # paths that attempt already declared as changed.  Without it an
+            # apply can never be joined to the candidate's changed paths, so
+            # "this worker used the tool at least once" was the strongest claim
+            # the ledger could support; with it the denominator exists and
+            # semantic-edit coverage becomes a measurement instead of an
+            # assertion.
+            path_text = str(payload.get("path") or "").strip().replace("\\", "/")
             result["semantic_edit_apply_receipts"].append({
+                "path_sha256": (
+                    hashlib.sha256(path_text.encode("utf-8")).hexdigest()
+                    if path_text else ""
+                ),
                 "file_bytes": max(0, int(payload.get("file_bytes") or 0)),
                 "range_count": max(0, int(payload.get("range_count") or 0)),
                 "old_region_bytes": max(
@@ -2347,6 +2402,31 @@ def verify_audit_ledger(
                     0, int(payload.get("model_reemitted_old_bytes") or 0)
                 ),
                 "token_savings_claimed": False,
+            })
+        if (
+            tool == "semantic_edit_exception_declare"
+            and entry.get("ok")
+            and not entry.get("violation")
+            and isinstance(payload, dict)
+            and len(result["semantic_edit_exception_declarations"]) < 128
+        ):
+            # The policy allows three exceptions to mandatory semantic editing.
+            # Two of them the runtime can derive by itself (a new file has no
+            # baseline hash; an adapter that was never granted the tool cannot
+            # have used it).  The third -- "a change spanning most of a file" --
+            # is a judgement about an edit the runtime never saw, so it needs
+            # the worker's word, recorded here under the same authenticated
+            # HMAC as every other entry and under the same path-identifier rule
+            # as the apply receipts above.  A declaration is EVIDENCE, never an
+            # authority: nothing consults it to admit or refuse a candidate.
+            declared_path = str(payload.get("path") or "").strip().replace("\\", "/")
+            result["semantic_edit_exception_declarations"].append({
+                "path_sha256": (
+                    hashlib.sha256(declared_path.encode("utf-8")).hexdigest()
+                    if declared_path else ""
+                ),
+                "exception": str(payload.get("exception") or "")[:64],
+                "reason": str(payload.get("reason") or "")[:200],
             })
         authoritative_source_graph = (
             authority_source == "canonical"
@@ -6735,6 +6815,923 @@ class WorkerSemanticEditSession:
         return receipt
 
 
+SEMANTIC_EDIT_EXCEPTION_SCHEMA_ID = "aiworkhub.semantic_edit_exception_declaration.v1"
+
+
+def semantic_edit_exception_declare(
+    ctx: WorkerToolContext,
+    *,
+    path: str,
+    exception: str,
+    reason: str = "",
+) -> dict[str, Any]:
+    """Record "I changed this path WITHOUT the semantic editor, for this reason".
+
+    A RECORD, never a gate.  It refuses nothing, it changes nothing in the
+    tree, and no acceptance path consults it.  Its only consumer is
+    ``process_launcher._semantic_edit_coverage``, where a changed path holding
+    no apply receipt and no declaration is reported as ``undeclared_raw_only``;
+    this tool is how a worker moves such a path from undeclared to DECLARED.
+
+    It exists because the mandate has three legitimate exceptions -- a new
+    file, a change spanning most of a file, and an adapter without these tools
+    -- so a blanket deny of the raw editor would be wrong, and because a failed
+    ``prepare``/``apply`` must not silently become an unrecorded raw edit.  The
+    fallback is permitted; the fallback going UNRECORDED is what is not.
+
+    Deliberately NOT validated against the exception vocabulary: an unknown
+    code is reported by the coverage record as ``unknown_exception_code``,
+    which is visible, whereas refusing it here would destroy the evidence that
+    a worker took a fallback at all.  For the same reason a path outside
+    ``allowed_writes`` is recorded rather than refused, with
+    ``path_in_allowed_writes`` stating the fact next to it.
+
+    The ledger payload is exactly ``path``/``exception``/``reason`` because
+    ``verify_audit_ledger`` hashes ``path`` into the same ``path_sha256`` join
+    key it derives for an apply receipt.  A second shape would not join.
+    """
+
+    tool = "semantic_edit_exception_declare"
+    try:
+        relative = semantic_edit.normalize_relative_path(path)
+    except semantic_edit.SemanticEditError as exc:
+        # A declaration that cannot name a path is not evidence -- the coverage
+        # record would have nothing to join it to -- so the unjoinable row is
+        # never written into the authenticated ledger.  Reported, not refused.
+        return {
+            "ok": True,
+            "tool": tool,
+            "schema_id": SEMANTIC_EDIT_EXCEPTION_SCHEMA_ID,
+            "is_gate": False,
+            "recorded": False,
+            "unrecorded_reason": str(exc)[:120],
+            "token_savings_claimed": False,
+        }
+    declared = str(exception or "")[:64]
+    reason_text = str(reason or "")[:200]
+    recorded = _append_audit(
+        ctx,
+        tool=tool,
+        ok=True,
+        cache_hit=False,
+        hit_count=1,
+        bytes_returned=0,
+        authority_source="worker_workspace",
+        authority_state="declared_exception",
+        payload={"path": relative, "exception": declared, "reason": reason_text},
+    )
+    return {
+        "ok": True,
+        "tool": tool,
+        "schema_id": SEMANTIC_EDIT_EXCEPTION_SCHEMA_ID,
+        "is_gate": False,
+        # False also when this ctx has no ledger bound (audit intentionally
+        # disabled); the caller is told, rather than being shown a success the
+        # coverage record will never see.
+        "recorded": bool(recorded),
+        "path": relative,
+        "exception": declared,
+        "reason": reason_text,
+        "path_in_allowed_writes": semantic_edit.path_is_allowed(
+            relative, ctx.allowed_writes
+        ),
+        "token_savings_claimed": False,
+    }
+
+# ---------------------------------------------------------------------------
+# Bounded validation execution + exit preflight (token audit 2026-09-08)
+#
+# Measured over 659 parseable worker runs (22,204 tool calls, 194.7 MB of
+# tool-result bytes): VALIDATION was 42.7% of every byte on 16.1% of calls.
+# Codex alone spent 82.0 MB on validation, of which 170 single calls carried
+# more than 100 KB each (74.9 MB) and one pytest call returned 988,306 bytes;
+# per-run p90 was 666 KB.  34% of validation commands exited non-zero, and 550
+# IDENTICAL commands were re-run inside one run (14.7 MB) across 210 of 478
+# runs.  Workers already tried to self-trim -- 777 calls piped to tail/head.
+# Separately the worker RE-DERIVED the command: env probes in 146 of 181 claude
+# runs, 109 distinct first-token spellings, and only 39-49% of commands were
+# the card's declared command verbatim.
+#
+# So the server resolves the command itself, runs it, and returns the finalizer
+# -shaped record instead of the log.  Full output always lands on disk and is
+# addressable by sha256, so nothing is lost -- it simply stops being re-sent on
+# every subsequent turn.
+# ---------------------------------------------------------------------------
+
+MAX_VALIDATION_DIAGNOSTIC_TAIL_CHARS = 2048
+MAX_VALIDATION_SUMMARY_LINES = 40
+MAX_VALIDATION_PATH_REFS = 40
+MAX_VALIDATION_OUTPUT_PAGE_BYTES = 8 * 1024
+# Bounded, process-local memo of (command, candidate bytes) -> receipt.  The
+# candidate-bytes half is what makes it safe: an edit to ANY allowed_writes path
+# changes the key, so a stale pass can never be served after a change.
+MAX_VALIDATION_MEMO_ENTRIES = 32
+_VALIDATION_MEMO: dict[tuple[str, str, str], dict[str, Any]] = {}
+_VALIDATION_MEMO_LOCK = threading.Lock()
+# The auto-attached exit preflight is one-shot per (task, request): a worker
+# that finishes a green validation gets the contract diagnostics in that same
+# tool result -- exactly one more turn's worth of information -- and never a
+# second time, so it cannot loop on it.
+_EXIT_PREFLIGHT_AUTO_ATTACHED: set[tuple[str, str]] = set()
+_EXIT_PREFLIGHT_LOCK = threading.Lock()
+
+_VALIDATION_SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
+_PYTEST_SUMMARY_RE = re.compile(r"^(?:FAILED|ERROR)\s+\S.*$")
+_PATH_REF_RE = re.compile(r"(?<![\w/.])([\w./\-]+\.(?:py|js|ts|tsx|jsx|json|md)):(\d+)")
+
+# Failure classes this tool reports.  They are advisory labels for the worker,
+# never a terminal substatus -- ``task_fsm`` owns that vocabulary and never
+# reads these.
+VALIDATION_FAILURE_CLASSES: tuple[str, ...] = (
+    "passed",
+    "test_failed",
+    "collection_error",
+    "validator_finding",
+    "tool_unavailable",
+    "timed_out",
+    "nonzero_exit",
+)
+
+
+def _validation_memo_reset() -> None:
+    """Clear the process-local memo and one-shot preflight arming (tests)."""
+
+    with _VALIDATION_MEMO_LOCK:
+        _VALIDATION_MEMO.clear()
+    with _EXIT_PREFLIGHT_LOCK:
+        _EXIT_PREFLIGHT_AUTO_ATTACHED.clear()
+
+
+def _contract_packet(ctx: WorkerToolContext) -> dict[str, Any]:
+    """Read the coordinator-sealed contract packet, or fail closed with why."""
+
+    path = ctx.contract_packet_path
+    if path is None:
+        raise WorkerToolError("worker_contract_packet_not_bound")
+    try:
+        if path.is_symlink() or not path.is_file():
+            raise WorkerToolError(f"worker_contract_packet_not_file:{path}")
+        if path.stat().st_size > 4 * 1024 * 1024:
+            raise WorkerToolError("worker_contract_packet_too_large")
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise WorkerToolError("worker_contract_packet_unreadable") from exc
+    if not isinstance(payload, dict):
+        raise WorkerToolError("worker_contract_packet_invalid")
+    return payload
+
+
+def _packet_workspace(ctx: WorkerToolContext, packet: Mapping[str, Any]) -> Any:
+    """Rebuild the launcher's ``WorkerWorkspace`` view inside the sandbox.
+
+    The baselines are the coordinator's own sealed maps -- not recomputed here
+    -- so ``validate_required_outputs`` measures precisely what the finalizer
+    will measure after exit.  ``worker_workspace`` is imported lazily because it
+    imports THIS module during host-side provisioning.
+    """
+
+    from . import worker_workspace
+
+    home = (
+        ctx.contract_packet_path.parent
+        if ctx.contract_packet_path is not None
+        else ctx.repo
+    )
+    return worker_workspace.WorkerWorkspace(
+        request_id=str(packet.get("request_id") or ctx.request_id),
+        repo=ctx.authority_repo,
+        path=ctx.repo,
+        home=home,
+        allowed_writes=tuple(
+            str(v) for v in (packet.get("allowed_writes") or ctx.allowed_writes)
+        ),
+        parent_baseline={
+            str(k): (None if v is None else str(v))
+            for k, v in dict(packet.get("parent_baseline") or {}).items()
+        },
+        workspace_baseline={
+            str(k): (None if v is None else str(v))
+            for k, v in dict(packet.get("workspace_baseline") or {}).items()
+        },
+        inherited_rework_paths=tuple(
+            str(v) for v in (packet.get("inherited_rework_paths") or ())
+        ),
+    )
+
+
+def _candidate_bytes_digest(
+    workspace_path: Path, allowed_writes: Sequence[str]
+) -> str:
+    """Digest the CURRENT bytes of every allowed_writes path in the worktree.
+
+    This is the half of the memo key that makes memoisation correct rather than
+    merely fast: any edit to a path this card may write changes the digest, so
+    a cached pass can never outlive the bytes it was measured on.  A pattern
+    that matches nothing contributes its own name and an empty marker, so a
+    file appearing or disappearing also moves the key.
+    """
+
+    digest = hashlib.sha256()
+    for pattern in sorted({str(p) for p in allowed_writes}):
+        digest.update(pattern.encode("utf-8"))
+        digest.update(b"\x00")
+        try:
+            if any(ch in pattern for ch in "*?["):
+                matches = sorted(workspace_path.glob(pattern))
+            else:
+                candidate = workspace_path / Path(*PurePosixPath(pattern).parts)
+                matches = [candidate] if candidate.exists() else []
+        except (OSError, ValueError):
+            digest.update(b"unreadable\x00")
+            continue
+        for match in matches:
+            try:
+                relative = match.relative_to(workspace_path).as_posix()
+            except ValueError:
+                continue
+            digest.update(relative.encode("utf-8"))
+            digest.update(b"\x00")
+            try:
+                if match.is_symlink() or not match.is_file():
+                    digest.update(b"non_file\x00")
+                    continue
+                digest.update(hashlib.sha256(match.read_bytes()).digest())
+            except OSError:
+                digest.update(b"unreadable")
+            digest.update(b"\x00")
+    return digest.hexdigest()
+
+
+def _classify_validation_failure(
+    returncode: int, summary_lines: Sequence[str], text: str, timed_out: bool
+) -> str:
+    if timed_out:
+        return "timed_out"
+    if returncode == 0:
+        return "passed"
+    lowered = text.lower()
+    if returncode == 127 or "no module named" in lowered or "command not found" in lowered:
+        return "tool_unavailable"
+    if "error collecting" in lowered or "errors during collection" in lowered:
+        return "collection_error"
+    if summary_lines:
+        return "test_failed"
+    return "nonzero_exit"
+
+
+def _validation_digest(
+    *,
+    text: str,
+    returncode: int,
+    timed_out: bool,
+    total_bytes: int,
+) -> dict[str, Any]:
+    """Reduce a validation log to the record the finalizer itself would keep."""
+
+    summary_lines = [
+        line.strip()
+        for line in text.splitlines()
+        if _PYTEST_SUMMARY_RE.match(line.strip())
+    ][:MAX_VALIDATION_SUMMARY_LINES]
+    path_refs: list[str] = []
+    for match in _PATH_REF_RE.finditer(text):
+        ref = f"{match.group(1)}:{match.group(2)}"
+        if ref not in path_refs:
+            path_refs.append(ref)
+        if len(path_refs) >= MAX_VALIDATION_PATH_REFS:
+            break
+    truncated = len(text) > MAX_VALIDATION_DIAGNOSTIC_TAIL_CHARS
+    return {
+        "diagnostic_tail": text[-MAX_VALIDATION_DIAGNOSTIC_TAIL_CHARS:],
+        "stdout_truncated": truncated,
+        "output_bytes": total_bytes,
+        "short_summary_lines": summary_lines,
+        "path_refs": path_refs,
+        "failure_class": _classify_validation_failure(
+            returncode, summary_lines, text, timed_out
+        ),
+    }
+
+
+def _validation_run_dir(ctx: WorkerToolContext) -> Path:
+    """The request-private directory this server may write full logs into."""
+
+    if ctx.audit_ledger_path is not None:
+        base = ctx.audit_ledger_path.parent
+    elif ctx.contract_packet_path is not None:
+        base = ctx.contract_packet_path.parent
+    else:
+        base = Path(tempfile.gettempdir())
+    run_dir = base / "validation_runs"
+    run_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    return run_dir
+
+
+def _validation_child_env(
+    workspace: Any, resolution: Mapping[str, Any], run_dir: Path
+) -> dict[str, str]:
+    """The worker's own environment plus the same validation affordances the
+    coordinator's ``run_validations`` sets (cache redirection and the bounded
+    ``PYTEST_ADDOPTS`` literal), reusing ``worker_workspace``'s constant rather
+    than restating it."""
+
+    from . import worker_workspace
+
+    env = dict(os.environ)
+    # A ``<name> -m <module>`` spelling still needs PATH to find the
+    # interpreter, and an adapter that REPLACES (rather than merges) this
+    # server's environment can leave it unset. Fall back to the platform
+    # default rather than failing a resolvable command for a missing variable.
+    if not env.get("PATH"):
+        env["PATH"] = os.defpath
+    scratch = str(run_dir)
+    env.setdefault("TMPDIR", scratch)
+    env.setdefault("TMP", scratch)
+    env.setdefault("TEMP", scratch)
+    env["RUFF_CACHE_DIR"] = env.get("RUFF_CACHE_DIR") or scratch
+    env["MYPY_CACHE_DIR"] = env.get("MYPY_CACHE_DIR") or scratch
+    if resolution.get("is_pytest"):
+        env["PYTEST_ADDOPTS"] = env.get(
+            "PYTEST_ADDOPTS", worker_workspace._WORKER_PYTEST_ADDOPTS
+        )
+    components = tuple(resolution.get("pythonpath_components") or ())
+    if components:
+        env["PYTHONPATH"] = worker_workspace.resolve_validation_pythonpath(
+            workspace, "landlock", components
+        )
+    return env
+
+
+def validation_run(
+    ctx: WorkerToolContext,
+    *,
+    index: Any = "all",
+    force: bool = False,
+    timeout_seconds: int = 1800,
+) -> dict[str, Any]:
+    """Run the card's own declared validation command(s) and return a digest.
+
+    ``index`` is an integer position in ``card.validation`` or the literal
+    ``"all"``.  The worker never retypes a command, so the 51-61% of ad-hoc
+    spellings measured in the audit cannot occur here.
+    """
+
+    packet = _contract_packet(ctx)
+    commands = [str(v) for v in (packet.get("validation") or [])]
+    if not commands:
+        return {
+            "ok": True,
+            "tool": "validation_run",
+            "reason": "card_declares_no_validation",
+            "commands": [],
+            "results": [],
+        }
+    if isinstance(index, bool):
+        raise WorkerToolError("validation_index_invalid")
+    if isinstance(index, str) and index.strip().lower() == "all":
+        selected = list(range(len(commands)))
+    else:
+        try:
+            position = int(index)
+        except (TypeError, ValueError) as exc:
+            raise WorkerToolError("validation_index_invalid") from exc
+        if not 0 <= position < len(commands):
+            raise WorkerToolError(
+                f"validation_index_out_of_range:0..{len(commands) - 1}"
+            )
+        selected = [position]
+
+    workspace = _packet_workspace(ctx, packet)
+    candidate_digest = _candidate_bytes_digest(
+        Path(workspace.path), workspace.allowed_writes
+    )
+    run_dir = _validation_run_dir(ctx)
+    results: list[dict[str, Any]] = []
+    for position in selected:
+        results.append(
+            _run_one_validation(
+                ctx,
+                workspace=workspace,
+                command=commands[position],
+                index=position,
+                candidate_digest=candidate_digest,
+                run_dir=run_dir,
+                force=bool(force),
+                timeout_seconds=timeout_seconds,
+            )
+        )
+    result: dict[str, Any] = {
+        "ok": True,
+        "tool": "validation_run",
+        "schema_id": "aiworkhub.worker_validation_run.v1",
+        "declared_command_count": len(commands),
+        "candidate_bytes_sha256": candidate_digest,
+        "advisory_only": True,
+        "acceptance_evidence": "coordinator_post_exit_run_validations",
+        "results": results,
+    }
+    green = all(row.get("returncode") == 0 for row in results)
+    result["all_passed"] = green
+    if green and set(selected) == set(range(len(commands))):
+        attached = _auto_attach_exit_preflight(ctx)
+        if attached is not None:
+            result["exit_preflight"] = attached
+    return result
+
+
+def _run_one_validation(
+    ctx: WorkerToolContext,
+    *,
+    workspace: Any,
+    command: str,
+    index: int,
+    candidate_digest: str,
+    run_dir: Path,
+    force: bool,
+    timeout_seconds: int,
+) -> dict[str, Any]:
+    from . import worker_workspace
+
+    command_sha256 = hashlib.sha256(command.encode("utf-8")).hexdigest()
+    memo_key = (str(ctx.request_id), command_sha256, candidate_digest)
+    if not force:
+        with _VALIDATION_MEMO_LOCK:
+            cached = _VALIDATION_MEMO.get(memo_key)
+        if cached is not None:
+            _append_audit(
+                ctx,
+                tool="validation_command",
+                ok=cached.get("returncode") == 0,
+                cache_hit=True,
+                hit_count=1,
+                bytes_returned=0,
+                authority_source="worker_advisory",
+                authority_state="validation_memo_hit",
+            )
+            return {**cached, "unchanged_since_last_run": True, "index": index}
+
+    try:
+        resolution = worker_workspace.resolve_worker_validation_argv(
+            workspace, command
+        )
+    except worker_workspace.WorkspaceError as exc:
+        _append_audit(
+            ctx,
+            tool="validation_command",
+            ok=False,
+            cache_hit=False,
+            hit_count=0,
+            bytes_returned=0,
+            violation=str(exc)[:160],
+            authority_source="worker_advisory",
+            authority_state="validation_unresolved",
+        )
+        return {
+            "index": index,
+            "command": command,
+            "command_sha256": command_sha256,
+            "resolved": False,
+            "reason": str(exc)[:300],
+            "returncode": None,
+            "failure_class": "tool_unavailable",
+            "unchanged_since_last_run": False,
+        }
+
+    cwd = Path(workspace.path)
+    cd_relative = resolution.get("cd_relative")
+    if cd_relative:
+        cwd = cwd / Path(*PurePosixPath(str(cd_relative)).parts)
+    env = _validation_child_env(workspace, resolution, run_dir)
+    output_path = run_dir / f"validation_{index}_{command_sha256[:16]}.log"
+    started = time.monotonic()
+    timed_out = False
+    try:
+        with open(output_path, "wb") as handle:
+            completed = subprocess.run(  # noqa: S603 -- card-declared argv only
+                list(resolution["argv"]),
+                cwd=str(cwd),
+                env=env,
+                stdout=handle,
+                stderr=subprocess.STDOUT,
+                shell=False,
+                timeout=max(1, int(timeout_seconds)),
+                check=False,
+            )
+        returncode = int(completed.returncode)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        returncode = 124
+    except OSError as exc:
+        _append_audit(
+            ctx,
+            tool="validation_command",
+            ok=False,
+            cache_hit=False,
+            hit_count=0,
+            bytes_returned=0,
+            violation=str(exc)[:160],
+            authority_source="worker_advisory",
+            authority_state="validation_spawn_failed",
+        )
+        return {
+            "index": index,
+            "command": command,
+            "command_sha256": command_sha256,
+            "resolved": True,
+            "argv": [str(token) for token in resolution["argv"]],
+            "returncode": None,
+            "failure_class": "tool_unavailable",
+            "reason": str(exc)[:300],
+            "unchanged_since_last_run": False,
+        }
+    duration = round(time.monotonic() - started, 3)
+
+    try:
+        raw = output_path.read_bytes()
+    except OSError:
+        raw = b""
+    text = raw.decode("utf-8", errors="replace")
+    digest = _validation_digest(
+        text=text,
+        returncode=returncode,
+        timed_out=timed_out,
+        total_bytes=len(raw),
+    )
+    receipt = {
+        "index": index,
+        "command": command,
+        "command_sha256": command_sha256,
+        "resolved": True,
+        "argv": [str(token) for token in resolution["argv"]],
+        "declared_head": resolution.get("declared_head", ""),
+        "returncode": returncode,
+        "duration_seconds": duration,
+        "timed_out": timed_out,
+        "full_output_path": str(output_path),
+        "full_output_sha256": hashlib.sha256(raw).hexdigest(),
+        "unchanged_since_last_run": False,
+        **digest,
+    }
+    with _VALIDATION_MEMO_LOCK:
+        _VALIDATION_MEMO[memo_key] = dict(receipt)
+        while len(_VALIDATION_MEMO) > MAX_VALIDATION_MEMO_ENTRIES:
+            _VALIDATION_MEMO.pop(next(iter(_VALIDATION_MEMO)))
+    # Recorded with a purely advisory authority so it can never be counted as a
+    # satisfying canonical call: ``verify_audit_ledger`` only counts an entry
+    # whose authority_source is "canonical" (or one of the two named
+    # semantic-edit/review-packet authorities), so acceptance never reads this.
+    _append_audit(
+        ctx,
+        tool="validation_command",
+        ok=returncode == 0,
+        cache_hit=False,
+        hit_count=1,
+        bytes_returned=len(raw),
+        authority_source="worker_advisory",
+        authority_state="validation_executed",
+    )
+    return receipt
+
+
+def validation_output_page(
+    ctx: WorkerToolContext,
+    *,
+    full_output_sha256: str,
+    offset: int = 0,
+    limit: int = MAX_VALIDATION_OUTPUT_PAGE_BYTES,
+) -> dict[str, Any]:
+    """Serve a bounded page of an already-produced validation log by digest."""
+
+    if not _VALIDATION_SHA256_HEX_RE.fullmatch(str(full_output_sha256 or "")):
+        raise WorkerToolError("validation_output_sha256_invalid")
+    with _VALIDATION_MEMO_LOCK:
+        rows = [
+            row
+            for row in _VALIDATION_MEMO.values()
+            if row.get("full_output_sha256") == full_output_sha256
+        ]
+    if not rows:
+        raise WorkerToolError("validation_output_unknown_sha256")
+    path = Path(str(rows[0]["full_output_path"]))
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise WorkerToolError("validation_output_unreadable") from exc
+    if hashlib.sha256(raw).hexdigest() != full_output_sha256:
+        raise WorkerToolError("validation_output_digest_mismatch")
+    start = max(0, int(offset))
+    size = max(1, min(int(limit), MAX_VALIDATION_OUTPUT_PAGE_BYTES))
+    chunk = raw[start:start + size]
+    return {
+        "ok": True,
+        "tool": "validation_output_page",
+        "full_output_sha256": full_output_sha256,
+        "offset": start,
+        "returned_bytes": len(chunk),
+        "total_bytes": len(raw),
+        "eof": start + len(chunk) >= len(raw),
+        "text": chunk.decode("utf-8", errors="replace"),
+    }
+
+
+# --- exit preflight --------------------------------------------------------
+
+# The exact contract classes measured in the 2026-09-08 audit.  Every one of
+# them is recomputable before exit; naming them here keeps the diagnostic the
+# worker reads and the failure the finalizer emits in the same vocabulary.
+EXIT_PREFLIGHT_FAILURE_CLASSES: tuple[str, ...] = (
+    "required_output_unchanged",
+    "required_output_mismatch",
+    "required_output_zero_bytes",
+    "required_output_not_allowed",
+    "residual_contract_file_unchanged",
+    "validation_required_aiworkhub_mcp_call_missing",
+)
+_GATEABLE_MCP_TOOLS: tuple[str, ...] = (
+    "source_graph", "session_current_state", "ai_memory", "kb",
+)
+
+
+def _required_output_findings(
+    workspace: Any, packet: Mapping[str, Any]
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Run the finalizer's own ``validate_required_outputs`` read-only."""
+
+    from . import worker_workspace
+
+    findings: list[dict[str, Any]] = []
+    required = [str(v) for v in (packet.get("required_outputs") or [])]
+    if not required:
+        return findings, {"checked": False, "reason": "card_declares_no_required_outputs"}
+    try:
+        records = worker_workspace.validate_required_outputs(
+            workspace,
+            required,
+            allow_empty=tuple(packet.get("allow_empty_required_outputs") or []),
+            allow_unchanged=tuple(packet.get("allow_unchanged_required_outputs") or []),
+        )
+    except worker_workspace.WorkspaceError as exc:
+        message = str(exc)
+        diagnostics: dict[str, Any] = {}
+        if message.startswith("required_output_mismatch:"):
+            try:
+                diagnostics = json.loads(message.split(":", 1)[1])
+            except (ValueError, IndexError):
+                diagnostics = {}
+        for path in diagnostics.get("missing_required_artifacts") or []:
+            findings.append({
+                "failure_class": "required_output_mismatch",
+                "path": str(path),
+                "action": (
+                    f"{path} is a mandatory output and does not exist in the "
+                    "worktree; create it before you stop"
+                ),
+            })
+        for path in diagnostics.get("unchanged_mandatory_outputs") or []:
+            findings.append({
+                "failure_class": "required_output_unchanged",
+                "path": str(path),
+                "action": (
+                    f"{path} is a mandatory output and is byte-identical to "
+                    "baseline; allow_unchanged was not granted"
+                ),
+            })
+        for violation in diagnostics.get("scope_violations") or []:
+            reason = str((violation or {}).get("reason") or "")
+            path = str((violation or {}).get("path") or "")
+            failure_class = (
+                "required_output_zero_bytes"
+                if "zero_bytes" in reason
+                else "required_output_not_allowed"
+                if "not_allowed" in reason
+                else "required_output_mismatch"
+            )
+            findings.append({
+                "failure_class": failure_class,
+                "path": path,
+                "action": (
+                    f"{path} fails the required-output scope check ({reason}); "
+                    "the finalizer refuses it in this state"
+                ),
+            })
+        if not findings:
+            findings.append({
+                "failure_class": "required_output_mismatch",
+                "path": "",
+                "action": message[:300],
+            })
+        return findings, {"checked": True, "raised": message[:200]}
+    return findings, {
+        "checked": True,
+        "raised": "",
+        "records": [
+            {"path": row.get("path"), "bytes": row.get("bytes")} for row in records
+        ],
+    }
+
+
+def _residual_findings(
+    workspace: Any, packet: Mapping[str, Any]
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    from . import worker_workspace
+
+    manifest = [
+        row for row in (packet.get("residual_contract_manifest") or [])
+        if isinstance(row, dict)
+    ]
+    if not manifest:
+        return [], {"checked": False, "reason": "no_residual_contract"}
+    findings: list[dict[str, Any]] = []
+    try:
+        rows = worker_workspace.validate_residual_contract(workspace, manifest)
+    except worker_workspace.WorkspaceError as exc:
+        return (
+            [{
+                "failure_class": "residual_contract_file_unchanged",
+                "path": "",
+                "action": str(exc)[:300],
+            }],
+            {"checked": True, "raised": str(exc)[:200]},
+        )
+    for row in rows:
+        if row.get("scope") == "whole_file" and row.get("changed") is False:
+            path = str(row.get("path") or "")
+            findings.append({
+                "failure_class": "residual_contract_file_unchanged",
+                "path": path,
+                "action": (
+                    f"{path} is a residual contract file inherited from the "
+                    "predecessor and is still byte-identical to it; this "
+                    "rework must change it"
+                ),
+            })
+    return findings, {"checked": True, "raised": ""}
+
+
+def _mcp_gate_findings(ctx: WorkerToolContext) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Report which gateable MCP tools have NO authenticated live call yet.
+
+    This never says a gate is satisfied.  Whether a tool is actually REQUIRED is
+    the coordinator's decision (``process_launcher._worker_mcp_live_call_gate``
+    reads the request's ``project_context`` contract, which the worker does not
+    hold), so this reports the one fact the ledger can prove -- that no
+    authenticated successful call exists -- and names the terminal class that
+    fact produces when the coordinator did require it.  172 attempts died on
+    exactly this, 165 of them with every declared validation row already green.
+    """
+
+    if ctx.audit_ledger_path is None or ctx.audit_hmac_key_path is None:
+        return (
+            [],
+            {"checked": False, "reason": "worker_mcp_runtime_not_provisioned"},
+        )
+    verification = verify_audit_ledger(
+        ctx.audit_ledger_path,
+        ctx.audit_hmac_key_path,
+        task_id=ctx.task_id,
+        runner=ctx.runner,
+        topic=ctx.topic,
+        request_id=ctx.request_id,
+    )
+    successful = verification.get("successful_call_count_by_tool") or {}
+    live_source_graph = int(verification.get("live_source_graph_calls") or 0)
+    findings: list[dict[str, Any]] = []
+    for tool in _GATEABLE_MCP_TOOLS:
+        if tool == "source_graph":
+            if live_source_graph > 0:
+                continue
+        elif int(successful.get(tool) or 0) > 0:
+            continue
+        findings.append({
+            "failure_class": "validation_required_aiworkhub_mcp_call_missing",
+            "path": "",
+            "tool": tool,
+            "action": (
+                f"no authenticated live aiworkhub_worker_{tool} call is recorded "
+                "for this request; if the coordinator's project_context required "
+                "it, the finalizer refuses this attempt with "
+                "validation_required_aiworkhub_mcp_call_missing even when every "
+                "validation row is green"
+            ),
+        })
+    return findings, {
+        "checked": True,
+        "ledger_ok": bool(verification.get("ok")),
+        "ledger_reason": str(verification.get("reason") or "")[:200],
+        "live_source_graph_calls": live_source_graph,
+        "successful_call_count_by_tool": {
+            str(k): int(v or 0) for k, v in dict(successful).items()
+        },
+    }
+
+
+def exit_preflight(ctx: WorkerToolContext) -> dict[str, Any]:
+    """Read-only rehearsal of the exit contract the finalizer will enforce.
+
+    It NEVER marks anything satisfied and it changes nothing: the coordinator
+    re-runs the identical ``validate_required_outputs`` /
+    ``validate_residual_contract`` functions against its own retained metadata
+    after this process exits, which is what keeps the whole surface fail-closed.
+    A worker that rewrote its own contract packet would fool only itself.
+    """
+
+    try:
+        packet = _contract_packet(ctx)
+    except WorkerToolError as exc:
+        _append_audit(
+            ctx,
+            tool="validation_receipt",
+            ok=False,
+            cache_hit=False,
+            hit_count=0,
+            bytes_returned=0,
+            violation=str(exc)[:160],
+            authority_source="worker_advisory",
+            authority_state="exit_preflight_unavailable",
+        )
+        return {
+            "ok": False,
+            "tool": "exit_preflight",
+            "schema_id": "aiworkhub.worker_exit_preflight.v1",
+            "reason": str(exc),
+            "satisfies_nothing": True,
+            "findings": [],
+        }
+    workspace = _packet_workspace(ctx, packet)
+    findings: list[dict[str, Any]] = []
+    required_findings, required_detail = _required_output_findings(workspace, packet)
+    findings.extend(required_findings)
+    residual_findings, residual_detail = _residual_findings(workspace, packet)
+    findings.extend(residual_findings)
+    gate_findings, gate_detail = _mcp_gate_findings(ctx)
+    findings.extend(gate_findings)
+    result = {
+        "ok": True,
+        "tool": "exit_preflight",
+        "schema_id": "aiworkhub.worker_exit_preflight.v1",
+        "read_only": True,
+        # There is deliberately no "satisfied"/"pass" key: nothing this tool
+        # observes may be treated as having cleared a gate.
+        "satisfies_nothing": True,
+        "acceptance_evidence": "coordinator_post_exit_finalizer",
+        "failure_classes": list(EXIT_PREFLIGHT_FAILURE_CLASSES),
+        "finding_count": len(findings),
+        "findings": findings,
+        "required_outputs": required_detail,
+        "residual_contract": residual_detail,
+        "worker_mcp_gate": gate_detail,
+    }
+    _append_audit(
+        ctx,
+        tool="validation_receipt",
+        ok=True,
+        cache_hit=False,
+        hit_count=len(findings),
+        bytes_returned=0,
+        authority_source="worker_advisory",
+        authority_state="exit_preflight",
+    )
+    return result
+
+
+def _auto_attach_exit_preflight(ctx: WorkerToolContext) -> dict[str, Any] | None:
+    """Attach the preflight to a green validation result exactly once.
+
+    A tool result IS a turn, so a worker that has just finished its declared
+    validation green and is about to stop receives the contract diagnostics in
+    that same result and gets exactly one more turn to repair them.  The
+    one-shot arming per (task, request) is what bounds it: a second green run
+    attaches nothing, so no retry loop is possible.
+
+    WHY HERE, AND NOT AT THE WORKER'S FINAL MESSAGE.  Hooking the final message
+    is the more direct expression of the intent, and it is not reachable from
+    this process.  Every native worker runs one-shot (``claude -p ...``,
+    ``codex exec ...``); there is no in-run turn loop for this server to append
+    to, and the only component that can SEE a terminal message is the
+    coordinator's supervisor while it reads the adapter's stream-json output.
+    Acting on it there would mean spawning the provider again with a nudge
+    prompt -- a relaunch, with its own claim, reservation and cost, for a
+    diagnostic the worker can be handed for free one turn earlier.  So the
+    green-validation boundary is where the extra turn actually exists today: it
+    is the last thing a finishing worker does, and the diagnostics arrive
+    inside a result it was already going to read.  If a supervisor-side
+    final-message hook is ever built, it belongs in the stream-json reader and
+    should consume this same ``exit_preflight`` rather than restating it.
+    """
+
+    key = (str(ctx.task_id), str(ctx.request_id))
+    with _EXIT_PREFLIGHT_LOCK:
+        if key in _EXIT_PREFLIGHT_AUTO_ATTACHED:
+            return None
+        _EXIT_PREFLIGHT_AUTO_ATTACHED.add(key)
+        while len(_EXIT_PREFLIGHT_AUTO_ATTACHED) > _MAX_TOOL_CALL_STATE_ENTRIES:
+            _EXIT_PREFLIGHT_AUTO_ATTACHED.pop()
+    preflight = exit_preflight(ctx)
+    preflight["auto_attached"] = True
+    preflight["auto_attach_retries_remaining"] = 0
+    return preflight
+
+
 # ---------------------------------------------------------------------------
 # Per-request MCP runtime generation (host-side; called BEFORE the sandboxed
 # adapter process starts, so it may write freely under the isolated home)
@@ -6807,6 +7804,7 @@ def generate_worker_mcp_runtime(
     python_executable: str | None = None,
     quality_review_packet_path: Path | None = None,
     rework_overlay_path: Path | None = None,
+    contract_packet_path: Path | PurePosixPath | None = None,
     provider_call_id: str | None = None,
     provenance: str | None = None,
 ) -> WorkerMcpRuntime:
@@ -6883,6 +7881,8 @@ def generate_worker_mcp_runtime(
         env[ENV_QUALITY_REVIEW_PACKET_PATH] = str(quality_review_packet_path)
     if rework_overlay_path is not None:
         env[ENV_REWORK_OVERLAY_PATH] = str(rework_overlay_path)
+    if contract_packet_path is not None:
+        env[ENV_CONTRACT_PACKET_PATH] = str(contract_packet_path)
     # NF389/r6: absent (None) identity stays unbound; a present value -- even an
     # explicit empty string -- fails closed instead of silently dropping the
     # binding.
@@ -6971,6 +7971,7 @@ MCP_TOOL_NAMES: tuple[str, ...] = (
     "aiworkhub_worker_source_graph_query",
     "aiworkhub_worker_semantic_edit_prepare",
     "aiworkhub_worker_semantic_edit_apply",
+    "aiworkhub_worker_semantic_edit_exception_declare",
     "aiworkhub_worker_session_current_state",
     "aiworkhub_worker_ai_memory_search",
     "aiworkhub_worker_ai_memory_get",
@@ -6983,6 +7984,9 @@ MCP_TOOL_NAMES: tuple[str, ...] = (
     "aiworkhub_worker_kb_write_intent",
     "aiworkhub_worker_quality_review_packet_read",
     "aiworkhub_worker_quality_review_submit",
+    "aiworkhub_worker_validation_run",
+    "aiworkhub_worker_validation_output_page",
+    "aiworkhub_worker_exit_preflight",
 )
 
 
@@ -7041,6 +8045,26 @@ def register_tools(mcp: Any, ctx: WorkerToolContext) -> tuple[str, ...]:
         """Apply replacement-only code to an immutable prepared target."""
         return semantic_edits.apply(
             target_id=target_id, new=new, idempotency_key=idempotency_key
+        )
+
+    @mcp.tool(name="aiworkhub_worker_semantic_edit_exception_declare")
+    def _semantic_edit_exception_declare(
+        file_path: str, exception: str, reason: str = "",
+    ) -> dict[str, Any]:
+        """Record a path changed WITHOUT the semantic editor, and why.
+
+        Use when the mandate's named exceptions apply -- "new_file",
+        "spans_most_of_file", "adapter_without_tools" -- or when a prepare or
+        apply failed and you fell back to a raw write. It is a record, not a
+        gate: it refuses nothing and blocks nothing. An undeclared raw edit is
+        reported as exactly that, so declaring is strictly better than not.
+        """
+        # ``file_path`` on the wire, matching semantic_edit_prepare and the
+        # invariant that no registered tool exposes a bare ``path`` binding
+        # parameter; ``path`` stays the LEDGER key, where the coverage record
+        # already derives its join digest from it.
+        return semantic_edit_exception_declare(
+            ctx, path=file_path, exception=exception, reason=reason
         )
 
     @mcp.tool(name="aiworkhub_worker_session_current_state")
@@ -7142,6 +8166,56 @@ def register_tools(mcp: Any, ctx: WorkerToolContext) -> tuple[str, ...]:
         )
 
     _quality_review_submit.__doc__ = quality_reviewer.QUALITY_REVIEW_SUBMIT_TOOL_DESCRIPTION
+
+    @mcp.tool(
+        name="aiworkhub_worker_validation_run",
+        description=(
+            "Run this card's OWN declared validation command(s) and return only "
+            "the finalizer-shaped record: returncode, duration, failure_class, a "
+            "<=2048-char diagnostic tail, the pytest short-summary lines and "
+            "path:line refs, plus the full log's path and sha256 for optional "
+            "paging. Never retype a validation command and never run pytest, "
+            "ruff or mypy through Bash: this is the surface for them. Advisory "
+            "only -- the coordinator re-runs canonical validation after exit."
+        ),
+    )
+    def _validation_run(index: int | str = "all", force: bool = False) -> dict[str, Any]:
+        """Run card.validation[index] (or all) with bounded output."""
+        return validation_run(ctx, index=index, force=force)
+
+    @mcp.tool(
+        name="aiworkhub_worker_validation_output_page",
+        description=(
+            "Read one bounded page of a validation log already produced by "
+            "aiworkhub_worker_validation_run, addressed by its full_output_sha256."
+        ),
+    )
+    def _validation_output_page(
+        full_output_sha256: str, offset: int = 0,
+        limit: int = MAX_VALIDATION_OUTPUT_PAGE_BYTES,
+    ) -> dict[str, Any]:
+        """Page an already-measured validation log by digest."""
+        return validation_output_page(
+            ctx,
+            full_output_sha256=full_output_sha256,
+            offset=offset,
+            limit=limit,
+        )
+
+    @mcp.tool(
+        name="aiworkhub_worker_exit_preflight",
+        description=(
+            "Read-only rehearsal of the exit contract the coordinator enforces "
+            "after you exit: mandatory outputs that are missing, unchanged, "
+            "zero-byte or out of scope, residual-contract files still identical "
+            "to the predecessor, and gateable AIWorkHub MCP tools with no "
+            "authenticated live call. It never marks anything satisfied. Call "
+            "it before your final message."
+        ),
+    )
+    def _exit_preflight() -> dict[str, Any]:
+        """Rehearse the coordinator's exit contract; satisfies nothing."""
+        return exit_preflight(ctx)
 
     return MCP_TOOL_NAMES
 

@@ -11,7 +11,21 @@ if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 from aiworkhub import agent_tool_instructions, provider_tool_guards, task_store  # noqa: E402
-from aiworkhub.runtime_adapters import CLAUDE_RAW_DISCOVERY_DENIES  # noqa: E402
+from aiworkhub.runtime_adapters import (  # noqa: E402
+    CLAUDE_RAW_DISCOVERY_DENIES,
+    claude_disallowed_tools,
+)
+
+
+def _build_worker_deny() -> tuple[str, ...]:
+    """The build worker's TREE deny, stated as the role rather than a literal.
+
+    Derived from the settings producer, not the argv producer: the two are
+    deliberately not identical any more (see
+    ``test_the_launch_only_validation_deny_never_reaches_a_tracked_tree``).
+    """
+
+    return provider_tool_guards.claude_settings_deny(read_only=False)
 
 
 def test_repository_guards_preserve_owner_content_and_are_idempotent(tmp_path: Path) -> None:
@@ -47,7 +61,8 @@ def test_repository_guards_preserve_owner_content_and_are_idempotent(tmp_path: P
     settings = json.loads(settings_path.read_text(encoding="utf-8"))
     assert settings["model"] == "sonnet"
     assert settings["permissions"]["allow"] == ["Read"]
-    assert tuple(settings["permissions"]["deny"]) == CLAUDE_RAW_DISCOVERY_DENIES
+    assert tuple(settings["permissions"]["deny"]) == _build_worker_deny()
+    assert set(CLAUDE_RAW_DISCOVERY_DENIES) <= set(settings["permissions"]["deny"])
     assert "hooks" not in settings
 
 
@@ -69,7 +84,7 @@ def test_init_repo_installs_provider_guards(tmp_path: Path) -> None:
     assert (tmp_path / "CLAUDE.md").is_file()
     assert (tmp_path / ".github" / "copilot-instructions.md").is_file()
     settings = json.loads((tmp_path / ".claude" / "settings.json").read_text(encoding="utf-8"))
-    assert tuple(settings["permissions"]["deny"]) == CLAUDE_RAW_DISCOVERY_DENIES
+    assert tuple(settings["permissions"]["deny"]) == _build_worker_deny()
 
 
 # ---------------------------------------------------------------------------
@@ -105,11 +120,40 @@ def test_a_build_worker_tree_keeps_the_whole_raw_discovery_deny(tmp_path: Path) 
     root.mkdir()
     provider_tool_guards.apply_repository_guards(root)
 
-    assert tuple(_deny(root)) == CLAUDE_RAW_DISCOVERY_DENIES
+    assert tuple(_deny(root)) == _build_worker_deny()
+    assert set(CLAUDE_RAW_DISCOVERY_DENIES) <= set(_deny(root))
     assert {"Grep", "Glob"} <= set(_deny(root))
     assert provider_tool_guards.claude_settings_deny(read_only=False) == (
-        CLAUDE_RAW_DISCOVERY_DENIES
+        _build_worker_deny()
     )
+
+
+def test_the_launch_only_editor_deny_never_reaches_a_tracked_tree(
+    tmp_path: Path,
+) -> None:
+    """``Edit`` is denied at the LAUNCH, and must not be denied in the repo.
+
+    This settings file is TRACKED, and a worker worktree checks out exactly
+    these bytes -- but so does every human session and every interactive
+    Claude Code session opened on the repository, none of whom are the build
+    workers the rule aims at.  The argv carries the deny because that is where
+    the role exists; the tree must not, for the same reason the raw validation
+    spellings were subtracted before it.
+    """
+    from aiworkhub.runtime_adapters import CLAUDE_WORKER_RAW_EDITOR_DENIES
+
+    root = tmp_path / "repo"
+    root.mkdir()
+    provider_tool_guards.apply_repository_guards(root)
+
+    tree_deny = set(_deny(root))
+    launch_deny = set(claude_disallowed_tools(read_only=False))
+
+    assert set(CLAUDE_WORKER_RAW_EDITOR_DENIES) <= launch_deny
+    assert not (set(CLAUDE_WORKER_RAW_EDITOR_DENIES) & tree_deny)
+    assert "Edit" not in tree_deny
+    # Nothing else moved: the tracked deny is still exactly raw discovery.
+    assert tree_deny == set(CLAUDE_RAW_DISCOVERY_DENIES)
 
 
 def test_a_reviewer_worktree_does_not_inherit_the_native_search_deny(
@@ -136,14 +180,77 @@ def test_a_reviewer_worktree_does_not_inherit_the_native_search_deny(
     assert {"Grep", "Glob"} <= set(_deny(root))
 
 
-def test_the_settings_deny_and_the_argv_deny_cannot_disagree() -> None:
-    """One producer for both enforcement surfaces, so a role cannot drift."""
+def test_the_settings_deny_and_the_argv_deny_cannot_disagree_about_a_role() -> None:
+    """One producer for both enforcement surfaces, so a role cannot drift.
+
+    Exactly TWO launch-only sets are subtracted on the settings side, and they
+    are the only permitted difference: the raw validation spellings and the raw
+    file editor.  Both are subtracted for the same reason -- this settings file
+    is tracked, so a rule written there binds every human and interactive
+    session on the repository, not the build workers it aims at.  Each is
+    pinned by its own test below; this one pins that there is nothing ELSE.
+    """
     from aiworkhub import runtime_adapters as ra
 
+    launch_only = set(ra.CLAUDE_WORKER_VALIDATION_SHELL_DENIES) | set(
+        ra.CLAUDE_WORKER_RAW_EDITOR_DENIES
+    )
     for read_only in (True, False):
-        assert provider_tool_guards.claude_settings_deny(read_only=read_only) == tuple(
-            ra.claude_disallowed_tools(read_only=read_only)
-        )
+        settings = set(provider_tool_guards.claude_settings_deny(read_only=read_only))
+        argv = set(ra.claude_disallowed_tools(read_only=read_only))
+        assert settings <= argv
+        assert argv - settings <= launch_only
+
+
+def test_the_launch_only_validation_deny_never_reaches_a_tracked_tree(
+    tmp_path: Path,
+) -> None:
+    """``Bash(pytest *)`` belongs to the launch argv, never to a settings file.
+
+    Two measured facts put it there and keep it there.  Claude Bash rules are
+    prefix matches, so ``Bash(pytest *)`` cannot match ``<python> -m pytest``,
+    which is how every invocation in this repository is actually spelled -- the
+    settings entry would buy nothing against the real form.  And
+    ``.claude/settings.json`` is TRACKED: a worktree, a human session, another
+    Claude Code session and the manager seat all inherit it, and none of them
+    are the build worker the rule aims at.  So the argv carries it and the tree
+    never does.
+    """
+    from aiworkhub import runtime_adapters as ra
+
+    validation_denies = set(ra.CLAUDE_WORKER_VALIDATION_SHELL_DENIES)
+    assert validation_denies == {"Bash(pytest *)", "Bash(ruff *)", "Bash(mypy *)"}
+
+    # The launch argv carries them for a build worker.
+    assert validation_denies <= set(ra.claude_disallowed_tools(read_only=False))
+
+    # No settings surface does, for either role.
+    assert not (validation_denies & set(
+        provider_tool_guards.claude_settings_deny(read_only=False)
+    ))
+    assert not (validation_denies & set(
+        provider_tool_guards.claude_settings_deny(read_only=True)
+    ))
+
+    root = tmp_path / "repo"
+    root.mkdir()
+    provider_tool_guards.apply_repository_guards(root)
+    assert not (validation_denies & set(_deny(root)))
+
+    worktree = _worktree_checkout_of_the_repository_settings(root, tmp_path)
+    provider_tool_guards.apply_workspace_guards(worktree, read_only=False)
+    assert not (validation_denies & set(_deny(worktree)))
+
+    # A tree that inherited them from an earlier provisioning is repaired, not
+    # left carrying a rule that belongs to the argv.
+    settings_path = worktree / provider_tool_guards.CLAUDE_SETTINGS_REL
+    stale = json.loads(settings_path.read_text(encoding="utf-8"))
+    stale["permissions"]["deny"] = [*stale["permissions"]["deny"], "Bash(pytest *)"]
+    settings_path.write_text(json.dumps(stale), encoding="utf-8")
+
+    provider_tool_guards.apply_workspace_guards(worktree, read_only=False)
+
+    assert "Bash(pytest *)" not in set(_deny(worktree))
 
 
 def test_a_build_worker_worktree_still_gets_the_full_deny(tmp_path: Path) -> None:

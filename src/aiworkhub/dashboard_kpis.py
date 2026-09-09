@@ -137,6 +137,148 @@ def _semantic_edit_telemetry(runs: list[Mapping[str, Any]]) -> dict[str, Any]:
     return totals
 
 
+def _semantic_edit_coverage_kpi(runs: list[Mapping[str, Any]]) -> dict[str, Any]:
+    """Fleet answer to "is semantic edit mandatory, and does everyone use it?".
+
+    Per adapter: attempts, mean coverage, raw-only paths, undeclared raw-only
+    paths.  Every number is a count of PATHS or a ratio of BYTES of changed
+    files -- never a token or cost claim.
+
+    An attempt whose ledger could not be verified, that changed nothing, or
+    whose receipts predate the path identifier counts as UNMEASURED under a
+    named reason.  It is never folded into the mean as 0% coverage, because an
+    adapter that reports nothing and an adapter that used nothing are different
+    facts and this panel exists to keep them apart.
+
+    Nothing here gates anything: no acceptance, promotion or ratchet path reads
+    this projection.
+    """
+
+    totals: dict[str, Any] = {
+        "schema_id": "aiworkhub.semantic_edit_coverage.kpi.v1",
+        "bounded_runs": len(runs),
+        "measured_runs": 0,
+        "unmeasured_runs": 0,
+        "unmeasured_reasons": {},
+        "semantic_only_attempts": 0,
+        "raw_only_attempts": 0,
+        "mixed_attempts": 0,
+        "changed_paths": 0,
+        "paths_with_apply": 0,
+        "paths_raw_only": 0,
+        "paths_new_file": 0,
+        "undeclared_raw_only": 0,
+        "declared_exceptions": 0,
+        "derived_exceptions": 0,
+        "bytes_changed": 0,
+        "bytes_via_apply": 0,
+        "byte_coverage_rate": None,
+        "mean_attempt_coverage": None,
+        "adapters": [],
+        "measurement_label": (
+            "authenticated_apply_receipts_joined_to_changed_paths_"
+            "byte_ratio_not_token_or_cost_savings"
+        ),
+        "token_savings_available": False,
+        "cost_savings_available": False,
+        "measurement_only": True,
+    }
+    per_adapter: dict[str, dict[str, Any]] = defaultdict(
+        lambda: {
+            "attempts": 0,
+            "measured_attempts": 0,
+            "unmeasured_attempts": 0,
+            "semantic_only_attempts": 0,
+            "raw_only_attempts": 0,
+            "mixed_attempts": 0,
+            "changed_paths": 0,
+            "paths_with_apply": 0,
+            "paths_raw_only": 0,
+            "undeclared_raw_only": 0,
+            "bytes_changed": 0,
+            "bytes_via_apply": 0,
+            "_ratios": [],
+        }
+    )
+    ratios: list[float] = []
+    for row in runs:
+        infra = row.get("ai_infra_context")
+        record = (
+            infra.get("semantic_edit_coverage") if isinstance(infra, Mapping) else None
+        )
+        if not isinstance(record, Mapping) or not record:
+            continue
+        adapter = str(row.get("adapter_id") or "unknown")[:120]
+        bucket = per_adapter[adapter]
+        bucket["attempts"] += 1
+        if not record.get("measured"):
+            totals["unmeasured_runs"] += 1
+            bucket["unmeasured_attempts"] += 1
+            reason = str(record.get("unmeasured_reason") or "unnamed")[:120]
+            totals["unmeasured_reasons"][reason] = (
+                _count(totals["unmeasured_reasons"].get(reason)) + 1
+            )
+            continue
+        totals["measured_runs"] += 1
+        bucket["measured_attempts"] += 1
+        for key in (
+            "changed_paths_count", "paths_with_apply", "paths_raw_only_count",
+            "paths_new_file", "undeclared_raw_only_count",
+            "declared_exception_count", "derived_exception_count",
+            "bytes_changed", "bytes_via_apply",
+        ):
+            value = _count(record.get(key))
+            totals_key = {
+                "changed_paths_count": "changed_paths",
+                "paths_raw_only_count": "paths_raw_only",
+                "undeclared_raw_only_count": "undeclared_raw_only",
+                "declared_exception_count": "declared_exceptions",
+                "derived_exception_count": "derived_exceptions",
+            }.get(key, key)
+            totals[totals_key] += value
+            if totals_key in bucket:
+                bucket[totals_key] += value
+        with_apply = _count(record.get("paths_with_apply"))
+        raw_only = _count(record.get("paths_raw_only_count"))
+        if with_apply and not raw_only:
+            totals["semantic_only_attempts"] += 1
+            bucket["semantic_only_attempts"] += 1
+        elif raw_only and not with_apply:
+            totals["raw_only_attempts"] += 1
+            bucket["raw_only_attempts"] += 1
+        elif raw_only and with_apply:
+            totals["mixed_attempts"] += 1
+            bucket["mixed_attempts"] += 1
+        ratio = record.get("coverage_ratio")
+        if isinstance(ratio, (int, float)) and not isinstance(ratio, bool):
+            ratios.append(float(ratio))
+            bucket["_ratios"].append(float(ratio))
+
+    if totals["bytes_changed"] > 0:
+        totals["byte_coverage_rate"] = round(
+            100.0 * totals["bytes_via_apply"] / totals["bytes_changed"], 1
+        )
+    if ratios:
+        totals["mean_attempt_coverage"] = round(
+            100.0 * sum(ratios) / len(ratios), 1
+        )
+    adapter_rows = []
+    for name, values in per_adapter.items():
+        adapter_ratios = values.pop("_ratios")
+        row_out = {"name": name, **values}
+        row_out["mean_attempt_coverage"] = (
+            round(100.0 * sum(adapter_ratios) / len(adapter_ratios), 1)
+            if adapter_ratios else None
+        )
+        row_out["byte_coverage_rate"] = _rate(
+            values["bytes_via_apply"], values["bytes_changed"]
+        )
+        adapter_rows.append(row_out)
+    adapter_rows.sort(key=lambda item: (-item["attempts"], item["name"].lower()))
+    totals["adapters"] = adapter_rows
+    return totals
+
+
 def build_kpi_snapshot(
     *,
     process_report: Mapping[str, Any],
@@ -628,6 +770,7 @@ def build_kpi_snapshot(
     provider_summary = provider_economics["summary"]
     economics["provider_measurement"] = provider_economics
     semantic_edit = _semantic_edit_telemetry(runs)
+    semantic_edit_coverage = _semantic_edit_coverage_kpi(runs)
 
     return {
         "schema_id": "aiworkhub.kpi.dashboard.v4",
@@ -741,6 +884,7 @@ def build_kpi_snapshot(
         "tool_use_cohorts": cohort_rows,
         "economics": economics,
         "semantic_edit": semantic_edit,
+        "semantic_edit_coverage": semantic_edit_coverage,
         "context": context_rows,
         "data_quality": {
             "acceptance_rate_available": manager_decisions > 0,

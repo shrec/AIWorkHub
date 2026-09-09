@@ -2650,6 +2650,12 @@ def build_residual_contract_manifest(
                 "scope": "whole_file",
                 "predecessor_file_hash": _bounded_residual_file_hash(path),
             })
+    # The manifest can only be snapshotted AFTER predecessor materialization,
+    # which is later than ``create_workspace``'s seal -- so it is merged into
+    # the already-sealed worker contract packet here rather than guessed there.
+    _update_worker_contract_packet(
+        workspace.home, residual_contract_manifest=list(manifest)
+    )
     return manifest
 
 
@@ -2695,6 +2701,100 @@ def validate_residual_contract(
             "pass": True,
         })
     return results
+
+
+# ---------------------------------------------------------------------------
+# Worker contract packet (token audit 2026-09-08).
+#
+# 506 attempts ended ``validation_failed`` on contract checks the worker could
+# not see -- 161 required_output_unchanged, 78 residual_contract_file_unchanged,
+# 72 required_output_mismatch, 20 required_output_zero_bytes, 3
+# required_output_not_allowed and 172 required_aiworkhub_mcp_call_missing -- and
+# in 334 of them ``evidence.validation`` was empty, so nothing had even run.
+# Every one of those checks is computable BEFORE the worker exits: the finalizer
+# runs ``validate_required_outputs``/``validate_residual_contract`` against the
+# very same worktree with the very same launch baselines.
+#
+# This packet is the coordinator's sealed copy of exactly those inputs, written
+# once into the request-private isolated HOME so the worker MCP server (which
+# runs inside the worker's sandbox and holds no card) can re-run the identical
+# functions read-only.  It is deliberately NOT evidence: the packet lives on a
+# path the worker's own sandbox may write, so a worker could rewrite it.  That
+# grants no capability -- ``aiworkhub_worker_exit_preflight`` never marks
+# anything satisfied, the coordinator re-runs the identical checks against its
+# own retained metadata after exit, and the validation commands the packet
+# carries are argv the worker's Bash could already run in the same sandbox.
+WORKER_CONTRACT_PACKET_FILENAME = "task_mcp_worker_contract.json"
+WORKER_CONTRACT_PACKET_SCHEMA = "aiworkhub.worker_contract_packet.v1"
+MAX_WORKER_CONTRACT_PACKET_BYTES = 4 * 1024 * 1024
+
+
+def worker_contract_packet_path(home: Path | str) -> Path:
+    """Return the request-private contract packet path beneath ``home``."""
+
+    return Path(home) / WORKER_CONTRACT_PACKET_FILENAME
+
+
+def _card_string_list(card: Mapping[str, Any], key: str) -> list[str]:
+    raw = card.get(key)
+    if not isinstance(raw, (list, tuple)):
+        return []
+    return [str(value) for value in raw if str(value).strip()]
+
+
+def seal_worker_contract_packet(
+    workspace: "WorkerWorkspace", card: Mapping[str, Any]
+) -> Path | None:
+    """Seal this request's exit-contract inputs into the isolated HOME.
+
+    Best effort by construction: a packet that cannot be written leaves the
+    worker without the advisory preflight surface, which is exactly the
+    behaviour that existed before it.  It never fails a launch.
+    """
+
+    try:
+        path = worker_contract_packet_path(workspace.home)
+        payload = {
+            "schema_id": WORKER_CONTRACT_PACKET_SCHEMA,
+            "request_id": workspace.request_id,
+            "allowed_writes": list(workspace.allowed_writes),
+            "required_outputs": _card_string_list(card, "required_outputs"),
+            "allow_empty_required_outputs": _card_string_list(
+                card, "allow_empty_required_outputs"
+            ),
+            "allow_unchanged_required_outputs": _card_string_list(
+                card, "allow_unchanged_required_outputs"
+            ),
+            "validation": _card_string_list(card, "validation"),
+            "validation_roles": _card_string_list(card, "validation_roles"),
+            "read_only": card.get("read_only") is True,
+            "parent_baseline": dict(workspace.parent_baseline),
+            "workspace_baseline": dict(workspace.workspace_baseline),
+            "inherited_rework_paths": list(workspace.inherited_rework_paths),
+            "residual_contract_manifest": [],
+        }
+        write_json_0600(path, payload)
+    except (OSError, TypeError, ValueError):
+        return None
+    return path
+
+
+def _update_worker_contract_packet(home: Path, **fields: Any) -> None:
+    """Merge ``fields`` into an already-sealed packet, or do nothing."""
+
+    try:
+        path = worker_contract_packet_path(home)
+        if path.is_symlink() or not path.is_file():
+            return
+        if path.stat().st_size > MAX_WORKER_CONTRACT_PACKET_BYTES:
+            return
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            return
+        payload.update(fields)
+        write_json_0600(path, payload)
+    except (OSError, ValueError, TypeError):
+        return
 
 
 def _credential_home(home: Path, adapter_id: str, project_root: Path | None = None) -> None:
@@ -3006,6 +3106,22 @@ def provision_worker_mcp_runtime(
             else host_packet
         )
 
+    # Exit-contract packet: sealed by ``create_workspace`` beneath the isolated
+    # HOME, so it is spelled for the worker exactly the way the review packet
+    # above is -- real host path for landlock, bubblewrap HOME alias otherwise.
+    worker_contract_packet: Path | PurePosixPath | None = None
+    host_contract_packet = worker_contract_packet_path(workspace.home)
+    if host_contract_packet.is_file() and not host_contract_packet.is_symlink():
+        relative_contract = host_contract_packet.resolve().relative_to(
+            workspace.home.resolve()
+        )
+        worker_contract_packet = (
+            PurePosixPath(bubblewrap_home_env_value())
+            / PurePosixPath(*relative_contract.parts)
+            if backend == "bubblewrap"
+            else host_contract_packet
+        )
+
     worker_rework_overlay_path: Path | None = None
     if rework_overlay_path is not None:
         host_overlay = rework_overlay_path.resolve()
@@ -3035,6 +3151,7 @@ def provision_worker_mcp_runtime(
             package_import_root=package_import_root,
             quality_review_packet_path=worker_review_packet_path,
             rework_overlay_path=worker_rework_overlay_path,
+            contract_packet_path=worker_contract_packet,
         )
     except worker_ai_tools_mcp.WorkerToolError as exc:
         # Provisioning/config-injection failure must reject the launch, not
@@ -4529,7 +4646,7 @@ def create_workspace(
     except WorkspaceError:
         cleanup_workspace(repo, path, home)
         raise
-    return WorkerWorkspace(
+    workspace = WorkerWorkspace(
         request_id=request_id,
         repo=repo,
         path=path,
@@ -4545,6 +4662,10 @@ def create_workspace(
         inherited_rework_paths=tuple(sorted(set(rework_seeded))),
         base_oid=base_oid,
     )
+    # Seal the exit-contract inputs the worker MCP server needs for
+    # ``aiworkhub_worker_exit_preflight``.  Advisory only; never fails a launch.
+    seal_worker_contract_packet(workspace, card)
+    return workspace
 
 
 def _registered_worktree_admin_dir(repo: Path, path: Path) -> Path | None:
@@ -6628,6 +6749,50 @@ def _normalize_validation_interpreter_argv(
             endpoint=endpoint,
         )
     raise WorkspaceError("validation_environment:interpreter_missing")
+
+
+def resolve_worker_validation_argv(
+    workspace: WorkerWorkspace, command: str
+) -> dict[str, Any]:
+    """Resolve one declared validation command for IN-SANDBOX worker execution.
+
+    This is the coordinator's own resolution, composed from the exact same
+    private helpers ``run_validations`` calls in the same order -- the command
+    tokenizer/env-and-cd splitter (``_parse_validation_command_detailed``), the
+    declared-interpreter resolver (``_normalize_validation_interpreter_argv``),
+    the candidate import-root prepend (``_candidate_pythonpath_components``) and
+    the console-script pytest rewrite (``_normalize_pytest_validation_argv``).
+    Nothing is reimplemented here, so the two paths cannot drift and the
+    ``copied_helpers_have_one_definition`` invariant stays satisfied.
+
+    What it deliberately does NOT do is wrap the argv in ``sandbox_argv``.  The
+    caller (``worker_ai_tools_mcp``'s advisory validation tool) already runs
+    INSIDE the worker's sandbox, where a second Landlock/bubblewrap layer is
+    neither possible nor needed: the resolved argv is exactly what that
+    worker's own Bash tool could already execute at that moment, so no boundary
+    moves.  The coordinator's post-exit ``run_validations`` -- which does wrap,
+    and which is the only acceptance evidence -- is untouched by this function.
+    """
+
+    tokens, components, _tmpdir_override, cd_relative = (
+        _parse_validation_command_detailed(command)
+    )
+    declared_head = tokens[0] if tokens else ""
+    tokens, interpreter_authority = _normalize_validation_interpreter_argv(
+        workspace, tokens
+    )
+    if _is_pytest_validation_command(tokens):
+        tokens = _normalize_pytest_validation_argv(tokens)
+    if _is_python_validation_command(tokens):
+        components = _candidate_pythonpath_components(workspace, components)
+    return {
+        "argv": list(tokens),
+        "declared_head": declared_head,
+        "pythonpath_components": tuple(components),
+        "cd_relative": cd_relative,
+        "interpreter_authority": interpreter_authority,
+        "is_pytest": _is_pytest_validation_command(tokens),
+    }
 
 
 # Worker-adapter validation affordances (mechanical-failure audit follow-up,
@@ -10627,7 +10792,10 @@ __all__ = [
     "provision_validation_exec_scratch",
     "resolve_trusted_pytest_runtime_root",
     "resolve_validation_pythonpath",
+    "resolve_worker_validation_argv",
     "run_validations",
+    "seal_worker_contract_packet",
+    "worker_contract_packet_path",
     "sandbox_argv",
     "select_sandbox_backend",
     "sanitized_env",

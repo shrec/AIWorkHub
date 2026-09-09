@@ -467,6 +467,148 @@ def raw_discovery_enforcement_fact(adapter_id: str) -> dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# CLOSED TOOL SURFACE -- a SECOND, independent enforcement mechanism.
+#
+# ``adapter_enforces_raw_discovery_denies`` above is, and stays, a statement
+# about launch ARGV: does the built command line carry a tool-deny flag.  It is
+# read by routing and by launch records that need exactly that meaning, so it
+# is not widened here.
+#
+# But argv is not the only way a rule can be enforced, and for one family it is
+# not the relevant one.  The ``*_vscode_lm`` adapters build no provider argv at
+# all: AIWorkHub is itself the tool server.  Verified 2026-09-08 against the
+# shipped extension (``vscode-extension/extension.js``):
+#
+#   * ``options.tools`` for every request is ``vscodeLmToolsForRequest(...)``
+#     (:5140), drawn only from the frozen ``VSCODE_LM_PRIVATE_TOOLS`` array
+#     (:3195) -- 20 entries, every one an ``aiworkhub_*`` tool, plus the two
+#     bridge-internal edit tools ``aiworkhub_manager_semantic_edit_stage`` and
+#     ``..._finalize``.  The VS Code Language Model API offers a model only the
+#     tools passed in ``options.tools``; the editor's own tool registry is
+#     never read here, so nothing else is reachable.
+#   * A returned tool call is re-checked against that offered set
+#     (``permittedToolNames``, :5304) and against ``VSCODE_LM_PRIVATE_TOOLS``
+#     (:3650), so an invented name is refused rather than executed.
+#   * The Python side agrees: ``process_launcher.invoke_vscode_lm_worker_tool``
+#     dispatches a fixed chain of ``tool_name == "<literal>"`` comparisons and
+#     falls through to ``worker_bridge_tool_not_allowed``.
+#
+# There is therefore NO ``Grep``, ``Glob``, ``Edit`` or ``Write`` on that
+# surface -- not denied, ABSENT -- which is a stronger guarantee than any deny
+# flag, because a tool that is never offered cannot be called, mis-spelled
+# around, or re-enabled by provider configuration.  Reporting this family as
+# "unenforced" because it carries no argv flag inverts the truth.
+#
+# The one honest boundary: this describes the model AIWorkHub drives through
+# ``sendRequest``.  It says nothing about what a human's own chat session may
+# do in the same editor -- that is not this worker, and no adapter fact covers
+# it.
+# ---------------------------------------------------------------------------
+CLOSED_TOOL_SURFACE_ADAPTERS: frozenset[str] = frozenset(
+    {VSCODE_LM_ADAPTER, GLM_VSCODE_LM_ADAPTER, DEEPSEEK_VSCODE_LM_ADAPTER}
+)
+TOOL_SURFACE_MECHANISM_DISPATCH = "closed_dispatch_surface"
+TOOL_SURFACE_MECHANISM_ARGV = "argv_tool_deny"
+TOOL_SURFACE_MECHANISM_NONE = "none_at_launch"
+
+# What each adapter's LAUNCH actually does about the raw file editor.  Stated
+# per adapter rather than derived from "carries some deny flag", because the
+# two are not the same question and conflating them overclaims.
+#
+#   absent_from_surface        the raw editor is not among the offered tools.
+#   modify_denied_create_open  ``Edit`` is denied; ``Write`` is deliberately
+#                              kept, so creating a new file and rewriting most
+#                              of one -- the mandate's own exceptions -- remain
+#                              possible, and Write-over-existing stays open and
+#                              is recorded rather than blocked.
+#   not_denied                 nothing at launch touches the editor.
+RAW_EDITOR_ABSENT_FROM_SURFACE = "absent_from_surface"
+RAW_EDITOR_MODIFY_DENIED_CREATE_OPEN = "modify_denied_create_open"
+RAW_EDITOR_NOT_DENIED = "not_denied"
+_RAW_EDITOR_DENY_STATES: Mapping[str, str] = MappingProxyType(
+    {
+        "claude_cli": RAW_EDITOR_MODIFY_DENIED_CREATE_OPEN,
+        # Verified 2026-09-08 from ``copilot help permissions`` on the installed
+        # CLI: the ``write`` permission kind "matches tools that create and
+        # modify files".  One kind covers both, so denying modify-an-existing
+        # would also deny new-file creation.  Left undenied deliberately.
+        DEEPSEEK_COPILOT_ADAPTER: RAW_EDITOR_NOT_DENIED,
+        GLM_COPILOT_ADAPTER: RAW_EDITOR_NOT_DENIED,
+        "codex_cli": RAW_EDITOR_NOT_DENIED,
+        GROK_KILO_ADAPTER: RAW_EDITOR_NOT_DENIED,
+        VSCODE_LM_ADAPTER: RAW_EDITOR_ABSENT_FROM_SURFACE,
+        GLM_VSCODE_LM_ADAPTER: RAW_EDITOR_ABSENT_FROM_SURFACE,
+        DEEPSEEK_VSCODE_LM_ADAPTER: RAW_EDITOR_ABSENT_FROM_SURFACE,
+        # No launch of ours at all: a human drives this one. Named rather than
+        # left to the default, so the ninth adapter is a stated fact.
+        "deepseek_manual": RAW_EDITOR_NOT_DENIED,
+    }
+)
+
+
+def adapter_serves_a_closed_tool_surface(adapter_id: str) -> bool:
+    """Return True when AIWorkHub itself decides every tool this adapter offers.
+
+    A pure capability statement, like its argv sibling, and unlisted defaults
+    to False so a new transport can never inherit a guarantee nobody verified.
+    """
+
+    return adapter_id in CLOSED_TOOL_SURFACE_ADAPTERS
+
+
+def tool_surface_enforcement_fact(adapter_id: str) -> dict[str, Any]:
+    """How -- if at all -- this adapter's raw tool denies are enforced at launch.
+
+    Three outcomes, not two.  ``closed_dispatch_surface`` means the raw tools
+    are absent from the offered set; ``argv_tool_deny`` means the built command
+    line carries a verified deny flag; ``none_at_launch`` means neither, and
+    the only boundary left is what AIWorkHub records and finalizes afterwards.
+    Inert evidence: it starts no process and reads no configuration.
+
+    Search and EDITING are reported separately and must not be collapsed.  The
+    Copilot pair carries a verified argv deny, but that deny names ``grep``
+    and ``glob`` only: verified 2026-09-08 against the installed CLI, Copilot's
+    permission kind ``write`` "matches tools that create and modify files", one
+    kind for both, so there is no way to deny modifying an existing file
+    without also denying new-file creation -- and creating a new file is one of
+    the mandate's own exceptions.  Reporting those two adapters as
+    editor-enforced because they carry SOME deny would be exactly the overclaim
+    this module exists to prevent.
+    """
+
+    closed = adapter_serves_a_closed_tool_surface(adapter_id)
+    argv_deny = adapter_enforces_raw_discovery_denies(adapter_id)
+    if closed:
+        mechanism = TOOL_SURFACE_MECHANISM_DISPATCH
+        reason = (
+            "AIWorkHub is the tool server: the offered set is a fixed "
+            "aiworkhub_* allowlist, so raw search and the raw editor are "
+            "absent rather than denied"
+        )
+    elif argv_deny:
+        mechanism = TOOL_SURFACE_MECHANISM_ARGV
+        reason = _RAW_DISCOVERY_ENFORCEMENT_REASONS.get(
+            adapter_id, RAW_DISCOVERY_ENFORCEMENT_UNVERIFIED
+        )
+    else:
+        mechanism = TOOL_SURFACE_MECHANISM_NONE
+        reason = _RAW_DISCOVERY_ENFORCEMENT_REASONS.get(
+            adapter_id, RAW_DISCOVERY_ENFORCEMENT_UNVERIFIED
+        )
+    return {
+        "adapter_id": adapter_id,
+        "mechanism": mechanism,
+        "reason": reason,
+        "raw_discovery_reachable": not (closed or argv_deny),
+        "raw_editor_deny": _RAW_EDITOR_DENY_STATES.get(
+            adapter_id, RAW_EDITOR_NOT_DENIED
+        ),
+        "argv_deny_enforced": argv_deny,
+        "closed_tool_surface": closed,
+    }
+
+
 PathValue = str | os.PathLike[str]
 ExecutableOverrides = Mapping[str, PathValue]
 
@@ -852,6 +994,8 @@ CLAUDE_READ_TOOLS: tuple[str, ...] = (
     f"{_WORKER}kb_search",
     f"{_WORKER}kb_get",
     f"{_WORKER}kb_related",
+    f"{_WORKER}validation_output_page",
+    f"{_WORKER}exit_preflight",
 )
 
 # Tools that change something. A read-only reviewer must not be handed one:
@@ -860,11 +1004,22 @@ CLAUDE_READ_TOOLS: tuple[str, ...] = (
 # semantic_edit_apply could only ever produce a denial. Measured on reviewer
 # request 5415654189de: seven write tools offered, zero used, and the
 # candidate-review turn budget spent partly on being refused.
+#
+# ``Edit`` is deliberately ABSENT here and denied at launch (see
+# ``CLAUDE_WORKER_RAW_EDITOR_DENIES``).  Modifying an existing file is exactly
+# what ``semantic_edit_prepare``/``_apply`` replaces, so granting the raw
+# spelling beside them left the only repository rule whose alternative was
+# still on the tool list -- and it is the only one that did not take (pooled
+# path coverage 9.1% over 2,648 gate-verified attempts).  ``Write`` STAYS:
+# two of the three policy exceptions -- a new file, and a change spanning most
+# of a file -- have no semantic-edit form at all, so denying it would delete
+# the exception rather than the shortcut.
 CLAUDE_WRITE_TOOLS: tuple[str, ...] = (
     "Write",
-    "Edit",
+    f"{_WORKER}validation_run",
     f"{_WORKER}semantic_edit_prepare",
     f"{_WORKER}semantic_edit_apply",
+    f"{_WORKER}semantic_edit_exception_declare",
     f"{_WORKER}session_write_intent",
     f"{_WORKER}ai_memory_write_intent",
     f"{_WORKER}kb_write_intent",
@@ -901,6 +1056,88 @@ CLAUDE_REVIEWER_SEARCH_TOOLS: tuple[str, ...] = CLAUDE_RAW_DISCOVERY_TOOL_DENIES
 # final JSON report the supervisor ingests and submits.
 CLAUDE_REVIEWER_HOST_TOOL_DENIES: tuple[str, ...] = ("ReportFindings", "ScheduleWakeup")
 
+# Validation commands a BUILD worker must route through
+# ``aiworkhub_worker_validation_run`` rather than raw Bash.  Measured over 659
+# parseable worker runs on 2026-09-08: validation was 42.7% of every
+# tool-result byte on 16.1% of calls; 170 single Codex calls carried more than
+# 100 KB each (74.9 MB) and one pytest call returned 988,306 bytes; 550
+# IDENTICAL commands were re-run inside one run (14.7 MB) across 210 of 478
+# runs; and only 39-49% of the commands typed were the card's declared command.
+# The MCP tool resolves the declared command itself, memoises on the current
+# candidate bytes and returns a bounded record, so the raw spellings are denied
+# the same way raw discovery is.
+#
+# Scope, stated exactly: these are Claude Bash PREFIX rules, so they deny the
+# bare console-script spellings (``pytest ...``, ``ruff ...``, ``mypy ...``)
+# that the audit found among 109 distinct first tokens.  They cannot deny a
+# ``<python> -m pytest`` spelling -- no prefix rule can -- which is why the
+# worker runtime policy states the rule in words as well.  A read-only reviewer
+# is unaffected: it holds no card validation to route.
+WORKER_VALIDATION_DENIED_COMMANDS: tuple[str, ...] = ("pytest", "ruff", "mypy")
+CLAUDE_WORKER_VALIDATION_SHELL_DENIES: tuple[str, ...] = tuple(
+    f"Bash({command} *)" for command in WORKER_VALIDATION_DENIED_COMMANDS
+)
+
+# The raw file EDITOR a build worker must not hold.  Measured 2026-09-08 over
+# 2,648 gate-verified attempts that changed at least one file: 1,500 made ZERO
+# semantic-edit applies and pooled path coverage was 9.1% (codex_cli 13.1%,
+# claude_cli 12.6%, deepseek_copilot_cli 0.6%) -- while every one of those
+# adapters was granted ``semantic_edit_prepare`` and ``_apply``, so missing
+# tools explain none of it.  That whole window PREDATES the mandate (the policy
+# section landed 2026-09-08 19:14Z; the last measured attempt ran 14:52Z, under
+# a prompt that said "prefer"), so 9.1% is a baseline, not disobedience.  What
+# separates this rule from the two that DID take is the shape of the fix:
+# search compliance was won by DELETING Grep/Glob and validation compliance by
+# denying the raw pytest/ruff/mypy spellings, whereas editing was asked for in
+# prose with ``Edit`` left on the tool list beside the semantic pair.
+#
+# Scope, stated exactly, because a deny that overclaims is worse than none.
+# The per-tool numbers below are from 215 retained claude_cli worker runs
+# (2026-09-02 .. 2026-09-08); they are a floor for that slice, not a census.
+#
+# * ``Edit`` -- 547 calls, and 523 of them (95.6%) hit a file for which
+#   ``semantic_edit_prepare`` was NEVER called anywhere in that run.  Edit is
+#   not a fallback after a failed prepare, it is the FIRST choice, so this is
+#   the leak.  It also only ever modifies a file that already exists, which is
+#   exactly what prepare/apply performs with a hash precondition -- a total
+#   substitute.  Denying it removes the shortcut precisely where the
+#   replacement is complete.
+# * ``Write`` is deliberately NOT denied -- 79 calls over 60 distinct targets,
+#   of which 49 (82%) were authoring a NEW file and only 11 overwrote existing
+#   content.  Of those 11, eight were rework attempts re-authoring a file the
+#   card itself creates; just two were true whole-file rewrites of a canonical
+#   pre-existing file.  Write is the new-file channel, and new files are one of
+#   the mandate's own exceptions, so denying it would delete the exception
+#   rather than the shortcut.
+# * Write-over-an-existing-file therefore stays OPEN, measured at 2 of 60
+#   targets.  It is not closed, it is RECORDED:
+#   ``process_launcher._semantic_edit_coverage`` reports a changed path with no
+#   apply receipt and no declaration as ``undeclared_raw_only``, and
+#   ``aiworkhub_worker_semantic_edit_exception_declare`` is how a worker moves
+#   such a path from undeclared to declared.  Nothing here gates on either.
+# * ``Bash`` is NOT a third hole today: across 2,445 Bash calls in that slice
+#   there were zero ``sed -i``, zero redirections into the worktree and zero
+#   ``mv``/``cp`` into it.  So the earlier hypothesis that denying ``Write``
+#   would simply relocate whole-file writes into the shell is NOT supported by
+#   the data, and is not the reason for keeping it -- the reason is the new-file
+#   exception above.  What the data does show is that ``Write`` sits one step
+#   from becoming the substitute once ``Edit`` is gone, which is why the
+#   residual is re-measured after this change rather than declared closed.
+#   Constraining ``Write`` to absent-or-empty targets cannot be expressed in a
+#   tool-name deny list and needs its own mechanism; it is deliberately not
+#   attempted here.
+#
+# The extra spellings cost nothing: an unknown tool NAME in a deny list is
+# inert, unlike an unknown CLI FLAG, which is accepted and silently ignored.
+# ``MultiEdit`` was never observed in the retained slice (0 calls); it and
+# ``NotebookEdit`` are listed because they are the same operation under other
+# names, not because they were seen.
+CLAUDE_WORKER_RAW_EDITOR_DENIES: tuple[str, ...] = (
+    "Edit",
+    "MultiEdit",
+    "NotebookEdit",
+)
+
 
 def claude_allowed_tools(*, read_only: bool) -> tuple[str, ...]:
     """Tools this role can actually use -- never the union of every role.
@@ -921,15 +1158,25 @@ def claude_disallowed_tools(*, read_only: bool) -> tuple[str, ...]:
     """The ``--disallowedTools`` list for this role.
 
     A build worker is denied raw discovery in every form (native ``Grep``/
-    ``Glob`` and the shell commands).  A read-only reviewer keeps the shell
+    ``Glob`` and the shell commands), the raw validation spellings it must
+    route through ``aiworkhub_worker_validation_run``, and the raw file EDITOR
+    it must route through ``semantic_edit_prepare``/``_apply`` (see
+    ``CLAUDE_WORKER_RAW_EDITOR_DENIES``, which records exactly what that deny
+    does and does not close).  A read-only reviewer keeps the discovery shell
     denies, is granted the native search tools instead (see
     ``CLAUDE_REVIEWER_SEARCH_TOOLS``), and is additionally denied the host
-    tools that would file its report where the supervisor never reads.
+    tools that would file its report where the supervisor never reads; it
+    holds no card validation to route and no tree it may write, so neither the
+    validation nor the editor denies apply to it.
     """
 
     if read_only:
         return (*CLAUDE_RAW_DISCOVERY_SHELL_DENIES, *CLAUDE_REVIEWER_HOST_TOOL_DENIES)
-    return CLAUDE_RAW_DISCOVERY_DENIES
+    return (
+        *CLAUDE_RAW_DISCOVERY_DENIES,
+        *CLAUDE_WORKER_VALIDATION_SHELL_DENIES,
+        *CLAUDE_WORKER_RAW_EDITOR_DENIES,
+    )
 
 
 def build_runtime_command(

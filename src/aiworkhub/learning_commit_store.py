@@ -651,6 +651,189 @@ def commit_learning(
     }
 
 
+# ---------------------------------------------------------------------------
+# One session document per adjudicated decision.
+#
+# Measured 2026-09-08: 3,383 accept/reject decisions produced 130 session
+# documents, of which only 47 carry decision provenance -- and those 47 are the
+# projections of the 53 explicit learning commits above. Workers made 108 live
+# session/memory/kb calls with 0 hits, and the injected bundle's session
+# section read ``evidence_count: 0`` in 743 of 743 requests. Every mandated
+# session query was therefore empty BY CONSTRUCTION: the decision that produced
+# the rework never reached the store the successor is told to read.
+#
+# This writes ONE ``event`` document per decision through the SAME
+# ``context_writes.session_write`` path the learning-commit projection above
+# uses -- no new authority, no model call, no lesson text. ``learning_commit``
+# still owns the lesson; this owns only the fact that a decision happened, what
+# it was taken over, and why it failed. The point is that the rework worker's
+# injected session section then contains its predecessor's decision instead of
+# nothing.
+# ---------------------------------------------------------------------------
+
+DECISION_EVENT_SCHEMA_ID = "aiworkhub.review_decision_event.v1"
+DECISION_EVENT_TOPIC = "review_decision"
+DECISION_EVENT_PROVENANCE: dict[str, str] = {
+    "accepted": "manager_accepted_review",
+    "rejected": "manager_rejected_review",
+}
+_MAX_DECISION_PATHS = 200
+
+
+def _decision_actor(task_id: str) -> dict[str, str] | None:
+    """The verified manager route as a context-writes actor, or ``None``.
+
+    Same-uid local runtime state only (provider, session), never a credential.
+    An unverifiable route yields ``None`` and the event is recorded as skipped:
+    a session document is evidence, and evidence with a fabricated identity is
+    worse than an absent one.
+    """
+    try:
+        identity = core._claude_manager_identity() or core._codex_manager_identity()
+    except Exception:  # noqa: BLE001 -- describing the caller never fails a decision
+        return None
+    if not isinstance(identity, dict):
+        return None
+    session_id = str(
+        identity.get("session_id") or identity.get("thread_id") or ""
+    ).strip()
+    provider = str(identity.get("provider") or "").strip()
+    if not session_id or not provider:
+        return None
+    return {
+        "role": "manager",
+        "actor_id": session_id[:256],
+        "task_id": str(task_id or "")[:256],
+        "provider": provider[:64],
+        "session_id": session_id[:256],
+    }
+
+
+def _decision_idempotency_key(task_id: str, request_id: str, decision: str) -> str:
+    """``task:request:decision``, coerced into the context-writes key grammar.
+
+    The same decision replayed writes the same key, so a retried accept or a
+    re-run finalizer appends one document, not two.
+    """
+    raw = f"{task_id}:{request_id}:{decision}"
+    key = re.sub(r"[^A-Za-z0-9_.:-]", "-", raw)[:192]
+    if _IDEMPOTENCY_RE.fullmatch(key):
+        return key
+    return "decision." + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:40]
+
+
+def _review_feedback_sha256(review_feedback: Any) -> str:
+    if review_feedback in (None, "", {}):
+        return ""
+    if isinstance(review_feedback, str):
+        payload = review_feedback.encode("utf-8")
+    else:
+        try:
+            payload = json.dumps(
+                review_feedback, ensure_ascii=False, sort_keys=True, default=str
+            ).encode("utf-8")
+        except (TypeError, ValueError):
+            return ""
+    return hashlib.sha256(payload).hexdigest()
+
+
+def record_decision_event(
+    repo: str | Path,
+    *,
+    task_id: str,
+    request_id: str,
+    decision: str,
+    changed_path_hashes: Any = None,
+    changed_paths: Any = None,
+    review_feedback: Any = None,
+    failure_category: str = "",
+) -> dict[str, Any]:
+    """Append ONE session ``event`` document for one adjudicated decision.
+
+    Best-effort and total: it never raises and never changes the decision it
+    describes. The return value is a small state record for the accept/reject
+    reply -- ``applied``, ``idempotent``, ``skipped`` (with a reason) or
+    ``failed`` (with the error) -- so a caller can see that the projection
+    happened instead of assuming it.
+    """
+
+    state: dict[str, Any] = {
+        "schema_id": DECISION_EVENT_SCHEMA_ID,
+        "state": "skipped",
+        "decision": str(decision),
+        "task_id": str(task_id),
+        "request_id": str(request_id),
+    }
+    provenance = DECISION_EVENT_PROVENANCE.get(str(decision))
+    if provenance is None:
+        return {**state, "reason": f"unknown_decision:{decision}"[:120]}
+    if not core.writes_allowed():
+        return {**state, "reason": "write_gate_closed"}
+    actor = _decision_actor(str(task_id))
+    if actor is None:
+        return {**state, "reason": "manager_session_identity_unverified"}
+
+    hashes = changed_path_hashes if isinstance(changed_path_hashes, dict) else {}
+    paths = [
+        str(value) for value in (changed_paths or [])
+    ] or sorted(str(key) for key in hashes)
+    rows = [
+        {"path": path[:300], "sha256": str(hashes.get(path) or "")[:64]}
+        for path in paths[:_MAX_DECISION_PATHS]
+    ]
+    payload: dict[str, Any] = {
+        "schema_id": DECISION_EVENT_SCHEMA_ID,
+        "decision": str(decision),
+        "task_id": str(task_id),
+        "request_id": str(request_id),
+        "changed_path_count": len(paths),
+        "changed_paths": rows,
+        "review_feedback_sha256": _review_feedback_sha256(review_feedback),
+        "failure_category": str(failure_category or "")[:120],
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+    }
+    content = _json(payload)
+    if len(content.encode("utf-8")) > context_writes.MAX_CONTENT_BYTES:
+        # The identities are what the successor needs; the path list is the
+        # only unbounded part, so it is the only part that can be dropped.
+        payload["changed_paths"] = []
+        payload["changed_paths_dropped"] = True
+        content = _json(payload)
+    key = _decision_idempotency_key(str(task_id), str(request_id), str(decision))
+    try:
+        receipt = context_writes.session_write(
+            Path(repo),
+            actor=actor,
+            action="event",
+            topic=DECISION_EVENT_TOPIC,
+            content=content,
+            idempotency_key=key,
+            provenance=provenance,
+        )
+    except Exception as exc:  # noqa: BLE001
+        # Deliberately total. This describes a decision that has already been
+        # taken and committed; a storage-registry, repository-state, sqlite or
+        # filesystem failure here must be REPORTED on the reply, never allowed
+        # to turn a landed accept into an exception at the manager.
+        return {**state, "state": "failed", "error": f"{type(exc).__name__}:{exc}"[:300]}
+    if receipt.get("ok") is not True:
+        return {
+            **state,
+            "state": "failed",
+            "error": str(receipt.get("error") or "session_write_failed")[:300],
+        }
+    return {
+        **state,
+        "state": "applied",
+        "idempotent": bool(receipt.get("idempotent")),
+        "provenance": provenance,
+        "idempotency_key": key,
+        "document_id": receipt.get("document_id"),
+        "topic": DECISION_EVENT_TOPIC,
+        "changed_path_count": payload["changed_path_count"],
+    }
+
+
 def adjudicated_decision(card: dict[str, Any], request_id: str) -> str:
     """Return ``"accepted"``, ``"rejected"`` or ``""`` for ONE request on a card.
 

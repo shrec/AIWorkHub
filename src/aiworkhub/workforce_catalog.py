@@ -1396,7 +1396,32 @@ def build_catalog(
             ),
             evidence_sources=prior_observation_sources,
         )
+        # `availability_observed` is a two-disjunct boolean whose NAME reads as
+        # "availability was observed", and a Windows operator reading 0.11.8
+        # reasonably took it that way: the same row said
+        # route_observation.state=unknown with
+        # "no_terminal_execution_inside_observation_window" and, two fields
+        # later, availability_observed=true.  Both are correct and they answer
+        # different questions, but only one of them said which question it was
+        # answering.  Publish the basis in the same shape the neighbouring
+        # verdict already uses, so the two can never be read as one claim.
         availability_observed = access_observed or bool(sample_count > 0)
+        availability_observation = {
+            "question": repo_policy.ROUTE_QUESTION_ACCESS_PROBE_OBSERVED,
+            "observed": availability_observed,
+            "basis": (
+                "adapter_access_probe"
+                if access_observed
+                else "historical_quality_cards"
+                if sample_count > 0
+                else "none"
+            ),
+            "access_probe_observed": access_observed,
+            "historical_quality_cards": int(sample_count),
+            # Stated because the two questions differ on exactly this point:
+            # the round-trip verdict is windowed, this one is not.
+            "windowed": False,
+        }
         # Availability is startability AND no tripped failure circuit -- one
         # question each, both already answered elsewhere and quoted here.  It
         # deliberately does NOT require an observed round trip: a route nobody
@@ -1458,6 +1483,7 @@ def build_catalog(
             "availability_reason": availability_reason,
             "route_observation": route_observation,
             "availability_observed": availability_observed,
+            "availability_observation": availability_observation,
             # One rule for every route.  The round-trip fact is NOT repeated
             # here: it is `route_observation`'s, published on every row with
             # its evidence class and its per-source count, and a second

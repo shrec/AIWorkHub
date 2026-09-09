@@ -62,7 +62,7 @@ def test_claude_argv_is_current_noninteractive_shape(monkeypatch, tmp_path):
         *runtime_adapters.claude_allowed_tools(read_only=False),
         "--no-session-persistence",
         "--disallowedTools",
-        *runtime_adapters.CLAUDE_RAW_DISCOVERY_DENIES,
+        *runtime_adapters.claude_disallowed_tools(read_only=False),
         "--model",
         "claude-sonnet-current",
     ]
@@ -116,7 +116,7 @@ def test_claude_omits_model_when_not_requested(monkeypatch, tmp_path):
         *runtime_adapters.claude_allowed_tools(read_only=False),
         "--no-session-persistence",
         "--disallowedTools",
-        *runtime_adapters.CLAUDE_RAW_DISCOVERY_DENIES,
+        *runtime_adapters.claude_disallowed_tools(read_only=False),
     ]
 
 
@@ -155,7 +155,13 @@ def test_claude_raw_discovery_is_provider_denied(monkeypatch, tmp_path):
     plan = runtime_adapters.build_runtime_command("claude_cli", "Prompt", repo)
 
     start = plan.argv.index("--disallowedTools") + 1
-    assert tuple(plan.argv[start:]) == runtime_adapters.CLAUDE_RAW_DISCOVERY_DENIES
+    denied = tuple(plan.argv[start:])
+    assert denied == runtime_adapters.claude_disallowed_tools(read_only=False)
+    # Raw discovery stays denied in full, and the raw validation spellings the
+    # bounded MCP runner replaces are denied alongside it (token audit
+    # 2026-09-08: validation was 42.7% of every worker tool-result byte).
+    assert set(runtime_adapters.CLAUDE_RAW_DISCOVERY_DENIES) <= set(denied)
+    assert set(runtime_adapters.CLAUDE_WORKER_VALIDATION_SHELL_DENIES) <= set(denied)
 
 
 def test_claude_reviewer_argv_grants_native_search_and_denies_host_report_tools(
@@ -817,3 +823,104 @@ def test_every_local_adapter_has_an_explicit_verified_enforcement_reason():
     assert unknown["enforced"] is False
     assert unknown["reason"] == runtime_adapters.RAW_DISCOVERY_ENFORCEMENT_UNVERIFIED
     assert runtime_adapters.adapter_enforces_raw_discovery_denies("some_future_cli") is False
+
+
+# ---------------------------------------------------------------------------
+# Closed tool surface: a SECOND enforcement mechanism, reported separately.
+#
+# ``adapter_enforces_raw_discovery_denies`` answers "does the argv carry a deny
+# flag", and for the vscode_lm family the answer is False by construction --
+# they build no provider argv.  Reading that as "unenforced" inverts the truth:
+# AIWorkHub is itself the tool server there, and the raw tools are absent from
+# the offered set rather than denied.  So the two facts stay separate.
+# ---------------------------------------------------------------------------
+
+def test_the_vscode_lm_family_is_reported_as_dispatch_enforced_not_unenforced():
+    """Verified against the shipped extension, not assumed.
+
+    ``vscodeLmToolsForRequest`` builds ``options.tools`` only from the frozen
+    ``VSCODE_LM_PRIVATE_TOOLS`` array -- 20 ``aiworkhub_*`` entries plus the two
+    bridge-internal edit tools -- and a returned call is re-checked against that
+    offered set.  There is no Grep, Glob, Edit or Write anywhere on it.
+    """
+    for adapter_id in (
+        runtime_adapters.VSCODE_LM_ADAPTER,
+        runtime_adapters.GLM_VSCODE_LM_ADAPTER,
+        runtime_adapters.DEEPSEEK_VSCODE_LM_ADAPTER,
+    ):
+        fact = runtime_adapters.tool_surface_enforcement_fact(adapter_id)
+        assert fact["mechanism"] == runtime_adapters.TOOL_SURFACE_MECHANISM_DISPATCH
+        assert fact["closed_tool_surface"] is True
+        assert fact["raw_discovery_reachable"] is False
+        assert fact["raw_editor_deny"] == runtime_adapters.RAW_EDITOR_ABSENT_FROM_SURFACE
+        # The argv predicate keeps its exact, narrower meaning.
+        assert runtime_adapters.adapter_enforces_raw_discovery_denies(adapter_id) is False
+
+
+def test_the_argv_predicate_is_not_widened_by_the_new_one():
+    """Routing and launch records read the argv fact and must keep its meaning."""
+    for adapter_id in runtime_adapters.RAW_DISCOVERY_ENFORCING_ADAPTERS:
+        assert runtime_adapters.adapter_serves_a_closed_tool_surface(adapter_id) is False
+        fact = runtime_adapters.tool_surface_enforcement_fact(adapter_id)
+        assert fact["mechanism"] == runtime_adapters.TOOL_SURFACE_MECHANISM_ARGV
+
+
+def test_a_search_deny_is_never_reported_as_an_editor_deny():
+    """The Copilot pair denies grep/glob and does NOT deny the editor.
+
+    Verified 2026-09-08 from ``copilot help permissions`` on the installed CLI:
+    the ``write`` permission kind "matches tools that create and modify files"
+    -- one kind for both -- so modifying an existing file cannot be denied
+    without also denying new-file creation, which is one of the mandate's own
+    exceptions.  Collapsing the two questions would overclaim.
+    """
+    for adapter_id in (
+        runtime_adapters.DEEPSEEK_COPILOT_ADAPTER,
+        runtime_adapters.GLM_COPILOT_ADAPTER,
+    ):
+        fact = runtime_adapters.tool_surface_enforcement_fact(adapter_id)
+        assert fact["raw_discovery_reachable"] is False
+        assert fact["raw_editor_deny"] == runtime_adapters.RAW_EDITOR_NOT_DENIED
+
+    claude = runtime_adapters.tool_surface_enforcement_fact("claude_cli")
+    assert claude["raw_editor_deny"] == (
+        runtime_adapters.RAW_EDITOR_MODIFY_DENIED_CREATE_OPEN
+    )
+
+
+def test_an_unknown_adapter_inherits_no_enforcement_claim():
+    fact = runtime_adapters.tool_surface_enforcement_fact("some_future_cli")
+
+    assert fact["mechanism"] == runtime_adapters.TOOL_SURFACE_MECHANISM_NONE
+    assert fact["closed_tool_surface"] is False
+    assert fact["raw_discovery_reachable"] is True
+    assert fact["raw_editor_deny"] == runtime_adapters.RAW_EDITOR_NOT_DENIED
+    assert runtime_adapters.adapter_serves_a_closed_tool_surface("some_future_cli") is False
+
+
+def test_every_supported_adapter_has_an_explicit_editor_deny_state():
+    """No transport may fall through to the default without being named.
+
+    All nine, not just the locally launched ones: an adapter whose editor state
+    is silence is one nobody decided about.
+    """
+    for adapter_id in runtime_adapters.SUPPORTED_ADAPTERS:
+        assert adapter_id in runtime_adapters._RAW_EDITOR_DENY_STATES, adapter_id
+
+
+def test_the_build_worker_argv_denies_the_raw_editor(tmp_path):
+    """The deny reaches the real command line for the one adapter that can."""
+    executable = _executable(tmp_path, "claude")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    plan = runtime_adapters.build_runtime_command(
+        "claude_cli", "Prompt", repo,
+        executable_overrides={"claude_cli": str(executable)},
+    )
+
+    denied = set(plan.argv[plan.argv.index("--disallowedTools") + 1:])
+    assert set(runtime_adapters.CLAUDE_WORKER_RAW_EDITOR_DENIES) <= denied
+    assert "Edit" in denied
+    # Write is not denied: it is the new-file channel and a declared exception.
+    assert "Write" not in denied

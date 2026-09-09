@@ -57,8 +57,8 @@ Source Graph gate:
 - Use body for an exact symbol and bodygrep for indexed literal/body text.
 - Final HMAC-authenticated MCP audit ledger receipts distinguish injected, live, zero-hit and cache-hit calls plus modes and fallbacks; one preflight query is not continuous use.
 Semantic edit (mandatory):
-- Change an existing file with aiworkhub_worker_semantic_edit_prepare then _apply on the smallest verified range; a whole-file rewrite is not an editing strategy.
-- Exceptions: a new file, a change spanning most of a file, or an adapter without these tools; then make the smallest bounded edit and record why.
+- Every seat changes an existing file with aiworkhub_worker_semantic_edit_prepare then _apply, or the manager pair, on the smallest verified range; a whole-file rewrite is not an editing strategy.
+- Exceptions: a new file, a change spanning most of a file, or an adapter without these tools; record which one applies, never a silent raw edit.
 - prepare is an edit step, not a reader: read with body/file preview, otherwise use a bounded read and never reread an unchanged range.
 Exact-command exception:
 - Exact validation/build/test commands named by the card are allowed.

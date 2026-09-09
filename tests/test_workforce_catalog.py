@@ -2486,3 +2486,74 @@ def test_route_observation_verdict_reports_where_its_count_came_from() -> None:
         prior_observation_count=0,
         observation_window_seconds=86_400.0,
     )["prior_observation_sources"] == {}
+
+
+def test_access_observation_names_which_evidence_made_it_true(tmp_path: Path) -> None:
+    """A two-disjunct boolean must say which disjunct answered it.
+
+    Measured 2026-09-08 on a Windows operator's 0.11.8 report: the same row
+    said ``route_observation.state = unknown`` with
+    ``no_terminal_execution_inside_observation_window`` and, two fields later,
+    ``availability_observed = true``. Both were correct -- they answer
+    different questions -- but only the round-trip verdict said which question
+    it was answering, so the pair read as one self-contradicting claim. The
+    access observation now publishes its question, its basis and whether it is
+    windowed, in the shape the neighbouring verdict already uses.
+
+    The evidence is constructed, never sampled from the host: whether a route
+    on this machine has run recently is exactly the kind of fact that made two
+    other tests pass here and fail on CI earlier today.
+    """
+    root = _root(tmp_path)
+    preflight = {"providers": [
+        {"adapter_id": "codex_cli", "launchable": True, "status": "ready"}
+    ]}
+
+    def _observation(snapshot: dict, worker_id: str = "gpt-5.5") -> dict:
+        row = next(r for r in snapshot["workers"] if r["worker_id"] == worker_id)
+        observation = row["availability_observation"]
+        # The invariant that holds for EVERY row of EVERY snapshot, whichever
+        # disjunct answered: the record can never disagree with the boolean,
+        # it always names this question and it is never the windowed one.
+        for other in snapshot["workers"]:
+            record = other["availability_observation"]
+            assert record["observed"] is other["availability_observed"]
+            assert record["question"] == repo_policy.ROUTE_QUESTION_ACCESS_PROBE_OBSERVED
+            assert record["question"] != repo_policy.ROUTE_QUESTION_ROUND_TRIP_OBSERVED
+            assert record["windowed"] is False
+        return observation
+
+    # Nothing observed at all: the basis says so rather than leaving a reader
+    # to infer it from a bare false.
+    quiet = _observation(
+        workforce_catalog.build_catalog(
+            root, cards=[], process_rows=[], preflight={"providers": []}
+        )
+    )
+    assert quiet["observed"] is False
+    assert quiet["basis"] == "none"
+    assert quiet["access_probe_observed"] is False
+    assert quiet["historical_quality_cards"] == 0
+
+    # The historical disjunct: this route has run at some point, which is a
+    # different fact from "it ran inside the observation window" -- and that
+    # is precisely the pair the report read as a contradiction.
+    seen_snapshot = workforce_catalog.build_catalog(
+        root,
+        cards=[{"task_id": "T1", "status": "finished",
+                "terminal_substatus": "review_ready"}],
+        process_rows=[{
+            "request_id": "r1", "task_id": "T1", "adapter_id": "codex_cli",
+            "model": "gpt-5.5", "total_tokens": 500,
+        }],
+        preflight=preflight,
+    )
+    seen = _observation(seen_snapshot)
+    assert seen["observed"] is True
+    assert seen["basis"] == "historical_quality_cards"
+    assert seen["historical_quality_cards"] == 1
+    # The two questions, side by side on one row, each labelled: this is the
+    # shape that makes the pair legible instead of contradictory.
+    row = next(r for r in seen_snapshot["workers"] if r["worker_id"] == "gpt-5.5")
+    assert row["route_question"] == repo_policy.ROUTE_QUESTION_ROUND_TRIP_OBSERVED
+    assert row["availability_observation"]["question"] != row["route_question"]

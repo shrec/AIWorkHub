@@ -75,6 +75,12 @@ ROUTE_QUESTION_ROUND_TRIP_OBSERVED = "route_round_trip_observed_in_window"
 # route nobody has run yet passes it -- unlike the round-trip question, which
 # a never-run route can never pass and which therefore must never gate.
 ROUTE_QUESTION_FAILURE_CIRCUIT_CLOSED = "route_failure_circuit_closed"
+# The fourth question, named because it was previously published only as the
+# bare boolean `availability_observed`, which reads as an answer to the
+# round-trip question above and is not one: it is true when an adapter access
+# probe succeeded OR when the route has quality cards on record at any time,
+# and it is not windowed.
+ROUTE_QUESTION_ACCESS_PROBE_OBSERVED = "route_access_probe_observed"
 
 # Exact reasons for a round-trip verdict.  "Never observed" and "observed,
 # but not inside the window" are different facts calling for different

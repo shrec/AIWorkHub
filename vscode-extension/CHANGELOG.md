@@ -1,5 +1,34 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.9 — 2026-09-09
+
+### Added
+
+- Workers are now told which AIWorkHub tool replaces each thing they are told
+  not to do, instead of only being told not to do it.
+- A worker that genuinely has to make a raw edit can declare why, and the
+  declaration is recorded. Taking one of the three legitimate exceptions no
+  longer looks the same as ignoring the rule.
+- How much of each run's editing went through the semantic editor is measured
+  and attached to the result. It is a measurement, not a gate.
+- A relaunch that cannot come out differently is refused, and the refusal says
+  what to do instead.
+- A reviewer sees the earlier rounds' findings for the same task, with line
+  numbers only where the file has not changed since.
+
+### Fixed
+
+- Six of the nine model transports were told their tools were blocked when
+  nothing blocked them, and three of those were told it while their tool
+  surface refuses more completely than any flag could. Each transport is now
+  told what is actually true for it.
+- Workers no longer receive the raw file editor. The semantic editor does the
+  same job with a hash check, and the raw one was being reached for first in
+  95% of edits. Creating a new file is unaffected.
+- Eleven contract and smoke gates that had never run now run.
+- An accept or a reject is written into the session store, so a rework worker
+  starts with its predecessor's decision instead of nothing.
+
 ## 0.11.8 — 2026-09-08
 
 ### Fixed

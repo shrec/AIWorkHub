@@ -3346,6 +3346,65 @@ def aiworkhub_completion_inbox(
     return result
 
 
+@mcp.tool()
+def aiworkhub_review_packet(
+    request_id: str,
+    task_id: str = "",
+    max_bytes: int = 90_000,
+) -> dict[str, Any]:
+    """READ-ONLY: ONE bounded review packet for a ``review_ready`` candidate.
+
+    Every fact a manager needs to decide a candidate is already persisted --
+    validation rows with their declared commands and output tails, the quality
+    gate's checks and blockers, the worker MCP gate and its receipt-conformance
+    verdict, required outputs, destructive-diff checks, the effective tier and
+    its per-lens status, the deduped reviewer findings, the reachability
+    observation -- spread across six nested objects on one card. This returns
+    them together, under a measured byte bound.
+
+    Measured over all 419 real cards carrying a quality gate: min 1,662 B, p50
+    6,387 B, p90 8,813 B, max 13,799 B, 0 needing truncation. It replaces per
+    candidate 10 task-scoped calls at p50 (p90 21) and, session-wide, 1,688
+    hand-written Bash re-derivations (pytest 611, attempt-artifact reads 242,
+    task_queue.sqlite scripts 250, log tails 113, git diff 155) totalling
+    1.45 MB.
+
+    Nothing here is a verdict: every status was decided by the gate that
+    recorded it, and accepting still runs the whole fold in ``accept_review``.
+    The one live computation is ``accept_preview`` -- itself read-only -- which
+    ``completion_inbox`` cannot call because it holds no launch authority, so
+    it is computed here and passed in.
+    """
+
+    manager = process_launcher.default_manager()
+    resolved_task_id = str(task_id or "")
+    task_id_source = "caller" if resolved_task_id else ""
+    if not resolved_task_id:
+        # The packet is request-scoped; resolving the task id from the same
+        # read-only status path ``aiworkhub_agent_task_status`` uses keeps the
+        # caller from having to hold both ids to ask one question.
+        status = manager.status(request_id)
+        if isinstance(status, dict):
+            card = status.get("task_card")
+            resolved_task_id = str(
+                status.get("task_id")
+                or (card.get("task_id") if isinstance(card, dict) else "")
+                or ""
+            )
+        if resolved_task_id:
+            task_id_source = "request_status"
+    preview = manager.accept_preview(request_id, resolved_task_id)
+    packet = completion_inbox.review_packet(
+        request_id,
+        task_id=resolved_task_id,
+        accept_preview=preview if isinstance(preview, dict) else None,
+        max_bytes=max_bytes,
+    )
+    if isinstance(packet, dict):
+        packet["task_id_source"] = task_id_source or "unresolved"
+    return packet
+
+
 _VALIDATION_REPLAY_AUTO_RECOVERY_REASONS = frozenset(
     {
         "validation_only_replay_claim_binding_invalid",
@@ -4247,6 +4306,62 @@ def needfix_list(
 def needfix_show(needfix_id: str) -> dict:
     """Show one NeedFix by id."""
     return core.needfix_show(needfix_id)
+
+
+@mcp.tool()
+def aiworkhub_manager_needfix_draft(
+    request_id: str,
+    finding_id: str = "",
+    check_id: str = "",
+) -> dict[str, Any]:
+    """READ-ONLY: draft the NeedFixes one request's own review evidence justifies.
+
+    A NeedFix could not be drafted from the evidence that justifies it, so it
+    was retyped. Measured 2026-09-08: of 204 manual filings, 76 had an accept/
+    reject/status/collect result within the previous 15 calls, 43 carried a
+    32-hex request id, and 355 of 540 typed identifiers (66%) appeared verbatim
+    in the previous 15 tool results; 453 of 557 stored rows carry a hand-typed
+    evidence dict at p50 549 B. Meanwhile 589 accepted-shape reviewer findings
+    and 1,623 failed-gate payloads became a NeedFix only if someone retyped
+    them, and reviewer cards are archived (1,796 so far), taking every
+    unconverted finding with them.
+
+    Everything returned is mechanical: title from the failing check id or the
+    finding summary, kind and severity from the finding category through a
+    fixed map, ``scope_files`` from the card's changed paths, ``evidence`` from
+    ``terminal_review.evidence`` (error, returncode, declared command) plus the
+    finding's own path/line/check_id, ``evidence_refs`` from the attempt
+    -artifact manifest reference and this request id, and provenance
+    ``{origin: server_draft, request_id, verified: false}``.
+
+    The DESCRIPTION is deliberately empty -- it is your judgement about what to
+    do, not a fact on the card, and this never invents one. Writes nothing:
+    file a candidate with ``needfix_add`` once you have written that
+    description. ``finding_id`` / ``check_id`` narrow the draft to exactly one
+    finding or one failing check.
+    """
+
+    status = process_launcher.default_manager().status(request_id)
+    if not isinstance(status, dict) or not status.get("ok"):
+        return {
+            "schema_id": needfix_store.NEEDFIX_DRAFT_SCHEMA_ID,
+            "ok": False,
+            "error": "request_not_found",
+            "request_id": request_id,
+            "state": str((status or {}).get("state") or "unknown"),
+        }
+    card = status.get("task_card")
+    if not isinstance(card, dict):
+        return {
+            "schema_id": needfix_store.NEEDFIX_DRAFT_SCHEMA_ID,
+            "ok": False,
+            "error": "task_card_unreadable",
+            "request_id": request_id,
+            "task_id": str(status.get("task_id") or ""),
+        }
+    return needfix_store.draft_from_review_evidence(
+        card, request_id=request_id, finding_id=finding_id, check_id=check_id
+    )
 
 
 @mcp.tool()

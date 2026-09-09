@@ -12,6 +12,8 @@ from . import agent_tool_instructions as instructions
 from .runtime_adapters import (
     CLAUDE_RAW_DISCOVERY_DENIES,
     CLAUDE_RAW_DISCOVERY_TOOL_DENIES,
+    CLAUDE_WORKER_RAW_EDITOR_DENIES,
+    CLAUDE_WORKER_VALIDATION_SHELL_DENIES,
     claude_disallowed_tools,
 )
 
@@ -43,9 +45,38 @@ def claude_settings_deny(*, read_only: bool) -> tuple[str, ...]:
     enforcement surfaces cannot disagree about a role, and the build worker's
     rule is untouched: for ``read_only=False`` this is exactly
     ``CLAUDE_RAW_DISCOVERY_DENIES``.
+
+    ONE deliberate subtraction: the raw validation spellings
+    (``CLAUDE_WORKER_VALIDATION_SHELL_DENIES``) are a LAUNCH rule, not a tree
+    rule, so they never reach a ``.claude/settings.json``.  Two measured facts
+    decide it.  First, Claude Bash rules are prefix matches, so
+    ``Bash(pytest *)`` cannot match ``<python> -m pytest`` -- the form every
+    invocation in this repository actually uses -- so the settings entry buys
+    nothing against the real spelling.  Second, this file is TRACKED: writing it
+    there constrains every human session, every Claude Code session and the
+    manager seat, none of whom are the build workers the rule aims at.  A rule
+    that is ineffective where it aims and effective where it does not aim is
+    removed, not kept.  The argv deny stays (it belongs to the launch, which is
+    where the role actually exists) and the worker runtime policy states the
+    rule in words, which is the part that reaches the worker.
+
+    The SECOND subtraction is the raw file editor
+    (``CLAUDE_WORKER_RAW_EDITOR_DENIES``), for the same reason and with more
+    force.  A build worker must route a change to an existing file through
+    ``semantic_edit_prepare``/``_apply``, and the launch argv denies ``Edit``
+    to make that real rather than merely written.  But this file is TRACKED,
+    and a worker worktree checks out exactly these bytes -- so putting
+    ``Edit`` here would ALSO deny the raw editor to every human session and
+    every interactive Claude Code session opened on this repository, none of
+    whom are the build workers the rule aims at.  The role exists at the
+    launch, so the deny stays at the launch.
     """
 
-    return tuple(claude_disallowed_tools(read_only=bool(read_only)))
+    denied = claude_disallowed_tools(read_only=bool(read_only))
+    launch_only = frozenset(
+        CLAUDE_WORKER_VALIDATION_SHELL_DENIES + CLAUDE_WORKER_RAW_EDITOR_DENIES
+    )
+    return tuple(item for item in denied if item not in launch_only)
 
 
 def _is_legacy_ai_tool_command(value: Any) -> bool:
@@ -131,7 +162,13 @@ def _merge_claude_settings(
     # so the entries this role must not inherit are dropped explicitly. Only the
     # native tool denies are role-scoped: the raw SHELL forms stay denied for
     # every role, and nothing a repository owner wrote is touched.
-    surrendered = frozenset(CLAUDE_RAW_DISCOVERY_TOOL_DENIES) - frozenset(required)
+    # The launch-only validation denies are surrendered for EVERY role, so a
+    # tree that inherited them from an earlier provisioning is repaired rather
+    # than left carrying a rule that belongs to the argv (see
+    # ``claude_settings_deny``).
+    surrendered = (
+        frozenset(CLAUDE_RAW_DISCOVERY_TOOL_DENIES) - frozenset(required)
+    ) | frozenset(CLAUDE_WORKER_VALIDATION_SHELL_DENIES)
     merged = [item for item in deny if item not in surrendered]
     for item in required:
         if item not in merged:

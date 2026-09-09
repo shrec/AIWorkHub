@@ -673,6 +673,7 @@ def launch_isolated(
                         context_result.prompt_bundle if context_result is not None else ""
                     ),
                     crash_retry_packet=crash_retry_packet,
+                    adapter_id=adapter_id,
                     _budget_report=prompt_budget,
                 )
             include_partial_messages = (

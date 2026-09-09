@@ -79,6 +79,20 @@ class Manager(Protocol):
 RouteSelector = Callable[[Path, str, str], Mapping[str, Any]]
 
 
+def _side_table_connection(db_path: str | Path) -> sqlite3.Connection:
+    """The one way this module opens its own side tables.
+
+    ``review_lifecycle`` owns the authenticated chain and outbox rows and opens
+    them itself. Everything the ORCHESTRATOR retains beside them -- the expected
+    workspace binding, the tier's lens plan, the replay plan -- lives in the
+    same file and was being opened at eight separate call sites that had drifted
+    apart in nothing but spelling. One opener means one place to change the
+    timeout, the row factory or the journal mode, and one place a reader has to
+    look to know how this module talks to that database.
+    """
+    return sqlite3.connect(db_path)
+
+
 def canonical_review_db(manager: Manager) -> Path | None:
     """Return the sole task-store DB, or no authority for an unready fake repo."""
     readiness = task_store.storage_readiness(manager.repo)
@@ -380,6 +394,44 @@ TARGET_IDENTITY_FIELDS = (
     "packet_sha256", "candidate_sha256",
 )
 
+# The contract half of a replay key. Identical candidate BYTES reviewed against
+# a different CONTRACT is a different review: the same diff can pass an
+# objective and fail the one that replaced it, and the acceptance criteria, the
+# required outputs, the declared validation and the forbidden set are exactly
+# what a lens is asked to judge the bytes against. These are the same fields
+# ``quality_reviewer.build_review_packet`` seals into ``packet.contract``.
+CONTRACT_IDENTITY_FIELDS = (
+    "objective", "acceptance", "required_outputs", "validation", "forbidden",
+)
+CONTRACT_IDENTITY_SCHEMA = "aiworkhub.review_contract_identity.v1"
+
+
+def contract_identity_digest(card: Any) -> str:
+    """Digest the contract a lens is asked to judge a candidate against.
+
+    Returns ``""`` for an unreadable card. Empty is UNKNOWN, and unknown never
+    matches anything, so a card that cannot be read simply launches a fresh
+    reviewer -- the same outcome as before any of this existed.
+    """
+    if not isinstance(card, Mapping):
+        return ""
+    preimage = {"schema_id": CONTRACT_IDENTITY_SCHEMA}
+    for field in CONTRACT_IDENTITY_FIELDS:
+        value = card.get(field)
+        if isinstance(value, str):
+            preimage[field] = value
+        elif isinstance(value, (list, tuple)):
+            preimage[field] = [str(item) for item in value]
+        elif value is None:
+            preimage[field] = None
+        else:
+            # An unexpected shape is not silently normalized into a match.
+            return ""
+    encoded = json.dumps(
+        preimage, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
 
 def target_identity_from_card(card: Any) -> dict[str, str]:
     """Read the candidate identity from where the finalizer actually writes it.
@@ -557,6 +609,18 @@ def register_candidate(
 # planned too narrowly is caught by ``required_reviewer_missing`` in the accept
 # fold, which refuses to accept. Under-planning costs a relaunch; it can never
 # buy an acceptance.
+# --- hash-keyed replay ---------------------------------------------------
+#
+# Side table, deliberately outside the immutable lifecycle rows: the plan is a
+# DECISION about what to do, not a receipt of what was done. The receipt of the
+# replay lands where every other receipt lands -- in the completed launch
+# action, carrying ``replayed_from_chain`` and both packet digests.
+REPLAY_PLAN_TABLE = (
+    "CREATE TABLE IF NOT EXISTS review_orchestrator_replay_plan ("
+    "chain_id INTEGER NOT NULL, lens TEXT NOT NULL, plan_json TEXT NOT NULL, "
+    "PRIMARY KEY (chain_id, lens))"
+)
+
 LENS_PLAN_TABLE = (
     "CREATE TABLE IF NOT EXISTS review_orchestrator_lens_plan ("
     "chain_id INTEGER PRIMARY KEY, lenses TEXT NOT NULL, "
@@ -580,7 +644,7 @@ def bind_lens_plan(
 ) -> tuple[str, ...]:
     """Bind the required lens set for one chain, once. Returns what is bound."""
     planned = _normalize_lenses(lenses)
-    with closing(sqlite3.connect(db_path)) as conn, conn:
+    with closing(_side_table_connection(db_path)) as conn, conn:
         conn.execute(LENS_PLAN_TABLE)
         conn.execute(
             "INSERT OR IGNORE INTO review_orchestrator_lens_plan "
@@ -597,7 +661,7 @@ def bind_lens_plan(
 def required_lenses(db_path: str | Path, chain_id: int) -> tuple[str, ...]:
     """Return the lens set this chain must launch, or every lens when unplanned."""
     try:
-        with closing(sqlite3.connect(db_path)) as conn:
+        with closing(_side_table_connection(db_path)) as conn:
             conn.execute(LENS_PLAN_TABLE)
             row = conn.execute(
                 "SELECT lenses FROM review_orchestrator_lens_plan WHERE chain_id=?",
@@ -613,7 +677,7 @@ def required_lenses(db_path: str | Path, chain_id: int) -> tuple[str, ...]:
 def lens_plan_record(db_path: str | Path, chain_id: int) -> dict[str, Any]:
     """Read-only view of one chain's lens plan for a manager or a review packet."""
     try:
-        with closing(sqlite3.connect(db_path)) as conn:
+        with closing(_side_table_connection(db_path)) as conn:
             conn.execute(LENS_PLAN_TABLE)
             row = conn.execute(
                 "SELECT lenses, effective_tier, source FROM "
@@ -644,7 +708,7 @@ def add_required_lens(db_path: str | Path, *, chain_id: int, lens: str) -> tuple
     """
     if lens not in LENSES:
         raise ValueError("unknown_review_lens:" + str(lens))
-    with closing(sqlite3.connect(db_path)) as conn, conn:
+    with closing(_side_table_connection(db_path)) as conn, conn:
         conn.execute(LENS_PLAN_TABLE)
         row = conn.execute(
             "SELECT lenses FROM review_orchestrator_lens_plan WHERE chain_id=?",
@@ -773,6 +837,7 @@ class ReviewOrchestrator:
         required_reviewer_lenses: Any = None,
         effective_tier: str = "",
     ) -> review_lifecycle.ReviewChain:
+        contract_identity = self._contract_identity(target_request_id)
         chain = review_lifecycle.create_or_replay_chain(
             self.db_path,
             target_task_id=target_task_id,
@@ -781,10 +846,97 @@ class ReviewOrchestrator:
             packet_sha256=packet_sha256,
             candidate_sha256=candidate_sha256,
             now=now,
+            contract_identity_sha256=contract_identity,
         )
         self._bind_expected_workspace(chain)
         self._bind_lens_plan(chain, required_reviewer_lenses, effective_tier)
+        self._bind_replay_plan(
+            chain,
+            target_task_id=target_task_id,
+            candidate_sha256=candidate_sha256,
+            contract_identity_sha256=contract_identity,
+        )
         return chain
+
+    def _contract_identity(self, target_request_id: str) -> str:
+        """Digest the target's contract, or return ``""`` when it cannot be read."""
+        try:
+            status = self.manager.status(str(target_request_id))
+        except Exception:  # noqa: BLE001 -- unknown contract, never a replay
+            return ""
+        card = status.get("task_card") if isinstance(status, Mapping) else None
+        return contract_identity_digest(card)
+
+    def _bind_replay_plan(
+        self,
+        chain: review_lifecycle.ReviewChain,
+        *,
+        target_task_id: str,
+        candidate_sha256: str,
+        contract_identity_sha256: str,
+    ) -> None:
+        """Record which lenses this chain may serve from an already-ingested report.
+
+        Decided HERE, at registration, because this is the moment the chain's
+        bytes and contract are known and nothing has been spent yet. It is
+        APPLIED in ``_execute``, where the launch action completes through the
+        ordinary authenticated outbox path -- a replay must not need a second
+        way of completing an action, and it does not get one.
+
+        Bound once and never rewritten: ``INSERT OR IGNORE``, so a re-registered
+        chain keeps the decision its first registration measured.
+        """
+        try:
+            sources = review_lifecycle.replay_sources(
+                self.db_path,
+                target_task_id=target_task_id,
+                candidate_sha256=candidate_sha256,
+                contract_identity_sha256=contract_identity_sha256,
+                exclude_chain_id=chain.chain_id,
+            )
+        except (sqlite3.Error, review_lifecycle.ReviewLifecycleError):
+            # A lookup that cannot run means no replay, which means a fresh
+            # reviewer: strictly the behaviour that existed before.
+            return
+        if not sources:
+            return
+        try:
+            with closing(_side_table_connection(self.db_path)) as conn, conn:
+                conn.execute(REPLAY_PLAN_TABLE)
+                for lens, plan in sorted(sources.items()):
+                    conn.execute(
+                        "INSERT OR IGNORE INTO review_orchestrator_replay_plan "
+                        "(chain_id, lens, plan_json) VALUES (?, ?, ?)",
+                        (
+                            chain.chain_id,
+                            lens,
+                            json.dumps(plan, sort_keys=True, separators=(",", ":")),
+                        ),
+                    )
+        except sqlite3.Error:
+            return
+
+    def _replay_plan(self, chain_id: int, lens: str) -> dict[str, Any]:
+        """Return this chain's bound replay decision for one lens, or ``{}``."""
+        if not lens:
+            return {}
+        try:
+            with closing(_side_table_connection(self.db_path)) as conn:
+                conn.execute(REPLAY_PLAN_TABLE)
+                row = conn.execute(
+                    "SELECT plan_json FROM review_orchestrator_replay_plan "
+                    "WHERE chain_id=? AND lens=?",
+                    (int(chain_id), str(lens)),
+                ).fetchone()
+        except sqlite3.Error:
+            return {}
+        if row is None:
+            return {}
+        try:
+            plan = json.loads(str(row[0] or "{}"))
+        except (TypeError, ValueError):
+            return {}
+        return plan if isinstance(plan, dict) else {}
 
     def _bind_lens_plan(
         self,
@@ -844,7 +996,7 @@ class ReviewOrchestrator:
 
     def _repair_expected_workspace(self, chain_id: int, workspace_identity: str) -> None:
         """Bind a later verified workspace only while the retained binding is empty."""
-        with closing(sqlite3.connect(self.db_path)) as conn, conn:
+        with closing(_side_table_connection(self.db_path)) as conn, conn:
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS review_orchestrator_workspace_bindings "
                 "(chain_id INTEGER PRIMARY KEY, workspace_identity TEXT NOT NULL)"
@@ -862,7 +1014,7 @@ class ReviewOrchestrator:
                 )
 
     def _expected_workspace_identity(self, chain_id: int) -> str:
-        with closing(sqlite3.connect(self.db_path)) as conn:
+        with closing(_side_table_connection(self.db_path)) as conn:
             row = conn.execute(
                 "SELECT workspace_identity FROM review_orchestrator_workspace_bindings "
                 "WHERE chain_id=?",
@@ -1050,6 +1202,46 @@ class ReviewOrchestrator:
                 # unhandled outcome must never fall through into a launch.
                 raise RuntimeError("launch_readiness_outcome_unknown:"
                                    + str(readiness["outcome"]))
+            replay = self._replay_plan(action.chain_id, action.lens)
+            if replay:
+                # HASH-KEYED REPLAY. The bytes and the contract are identical to
+                # a candidate this lens already reported on, and that report was
+                # already INGESTED (its accept action completed, which only
+                # happens after the sealed receipt authenticated). Nothing about
+                # the judgment is re-derived and nothing about it is re-signed:
+                # the completed action names the source chain and the original
+                # reviewer, and the report itself is still the original
+                # reviewer's HMAC-authenticated receipt on the original
+                # reviewer's own card, resolved at accept time.
+                return self._receipt(
+                    action,
+                    reviewer_task_id=str(replay.get("reviewer_task_id") or ""),
+                    reviewer_request_id=str(replay.get("reviewer_request_id") or ""),
+                    reviewer_route=replay.get("reviewer_route") or {},
+                    replayed_from_chain=int(replay.get("source_chain_id") or 0),
+                    replay={
+                        "source_chain_id": int(replay.get("source_chain_id") or 0),
+                        "source_target_request_id": str(
+                            replay.get("source_target_request_id") or ""
+                        ),
+                        "source_claim_epoch": str(replay.get("source_claim_epoch") or ""),
+                        # BOTH packet digests: the manifest digest of the
+                        # candidate this chain is bound to, and the manifest
+                        # digest of the chain the report came from. They are
+                        # equal only when the two chains really are the same
+                        # bytes, and both are on the record either way.
+                        "packet_sha256": str(identity["packet_sha256"]),
+                        "source_packet_sha256": str(
+                            replay.get("source_packet_sha256") or ""
+                        ),
+                        "candidate_sha256": str(replay.get("candidate_sha256") or ""),
+                        "contract_identity_sha256": str(
+                            replay.get("contract_identity_sha256") or ""
+                        ),
+                    },
+                    target_readiness_receipt=readiness,
+                    result={"ok": True, "state": "replayed", "task_id": target_task},
+                )
             route = dict(self.route_selector(self.manager.repo, reviewer_task, action.lens))
             runner = str(route.get("runner") or "")
             adapter_id = str(route.get("adapter_id") or "")
@@ -1076,12 +1268,55 @@ class ReviewOrchestrator:
             )
         if action.action_type == "accept":
             launch = self._lens_receipt(prior, action.lens, "launch")
+            replay = launch.get("replay") if isinstance(launch, Mapping) else None
+            replay = replay if isinstance(replay, Mapping) else {}
             reviewer_request = str(launch["reviewer_request_id"])
             status = self.manager.status(reviewer_request)
             if str(status.get("state") or "") in {
                 "starting", "running", "processing", "finalizing", "reconcile_pending"
             }:
                 return None
+            if replay:
+                # The replayed report is resolved from the ORIGINAL reviewer's
+                # own card, against the SOURCE chain's target identity, through
+                # the identical verifier a fresh report goes through. Its
+                # provider, its packet digest, its submission counters and its
+                # authenticated receipt are the original reviewer's -- nothing
+                # here mints a new one, and the independence rung stays
+                # resolvable from that reviewer's own provider identity.
+                source_identity = {
+                    "target_task_id": str(identity["target_task_id"]),
+                    "target_request_id": str(
+                        replay.get("source_target_request_id") or ""
+                    ),
+                    "claim_epoch": str(replay.get("source_claim_epoch") or ""),
+                }
+                receipt = self._review_receipt(
+                    action,
+                    status,
+                    reviewer_request,
+                    str(launch.get("reviewer_task_id") or ""),
+                    source_identity,
+                )
+                findings = receipt["report"]["findings"]
+                if any(
+                    finding.get("actionable") is True
+                    or finding.get("disposition") == "defect"
+                    for finding in findings
+                ):
+                    raise RuntimeError("reviewer_actionable_findings")
+                # No second acceptance of one report: the source chain already
+                # accepted this reviewer task, and accepting it again would put
+                # two acceptances behind one piece of work.
+                return self._receipt(
+                    action,
+                    reviewer_task_id=str(launch.get("reviewer_task_id") or ""),
+                    reviewer_request_id=reviewer_request,
+                    replayed_from_chain=int(replay.get("source_chain_id") or 0),
+                    replay=dict(replay),
+                    reviewer_provider=str(status.get("adapter_id") or ""),
+                    result={"ok": True, "state": "replayed", "task_id": reviewer_task},
+                )
             receipt = self._review_receipt(
                 action, status, reviewer_request, reviewer_task
             )
@@ -1099,6 +1334,19 @@ class ReviewOrchestrator:
         if action.action_type == "archive":
             accepted = self._lens_receipt(prior, action.lens, "accept")
             launch = self._lens_receipt(prior, action.lens, "launch")
+            if isinstance(launch, Mapping) and launch.get("replay"):
+                # The reviewer task belongs to the source chain, which archived
+                # it. Archiving it again from here would be a second terminal
+                # disposition of one card.
+                return self._receipt(
+                    action,
+                    reviewer_task_id=str(launch.get("reviewer_task_id") or ""),
+                    reviewer_request_id=str(accepted.get("reviewer_request_id") or ""),
+                    replayed_from_chain=int(
+                        (launch.get("replay") or {}).get("source_chain_id") or 0
+                    ),
+                    result={"ok": True, "state": "replayed", "task_id": target_task},
+                )
             result = task_engine.archive_task(
                 self.manager.repo, reviewer_task,
                 actor=str((launch.get("reviewer_route") or {}).get("runner") or "system"),
@@ -1480,6 +1728,7 @@ class ReviewOrchestrator:
         status: Mapping[str, Any],
         reviewer_request: str,
         reviewer_task: str,
+        identity: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         if status.get("ok") is not True or status.get("state") != "review_ready":
             raise RuntimeError("reviewer_terminal_receipt_missing")
@@ -1498,7 +1747,12 @@ class ReviewOrchestrator:
             receipt.get("target"), receipt.get("reviewer"),
             receipt.get("report"), receipt.get("authority"),
         )
-        identity = action.descriptor["chain_identity"]
+        # A replayed report was written against the SOURCE chain's target
+        # request, not this one, so the caller supplies that identity. Every
+        # other binding below -- the reviewer's own request/task, its provider,
+        # the lens, the read-only authority, the sealed packet digest and the
+        # submission counters -- is checked exactly as it is for a fresh run.
+        identity = identity if identity is not None else action.descriptor["chain_identity"]
         if not all(isinstance(value, dict) for value in (target, reviewer, report, authority)):
             raise RuntimeError("reviewer_receipt_shape_invalid")
         # TWO DIGESTS OF TWO DIFFERENT OBJECTS.

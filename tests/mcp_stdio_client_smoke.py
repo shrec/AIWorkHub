@@ -15,12 +15,16 @@ Checks (all must pass for ``frozen_contract_v1`` true):
 
   C1  all read-only tools VISIBLE via ``tools/list`` over the stdio pipe;
   C2  all write-gated tools also visible (B108 compatibility subsets);
-  C3  the complete 33-tool inventory and every inputSchema are exactly equal
-      to the B109 frozen names/fingerprints AND deterministic across two
-      independent stdio subprocess sessions;
+  C3  every one of the 33 frozen tools is still VISIBLE and still carries its
+      exact frozen inputSchema, and every rendered schema is deterministic
+      across two independent stdio subprocess sessions. (NARROWED 2026-09-08
+      from exact 33-tool CLOSURE -- the server now exposes 188; see the note
+      above FROZEN_SCHEMA_FINGERPRINTS.);
   C4  no queue/audit writes with ``AIWORKHUB_ALLOW_WRITES`` UNSET: the
       MCP-owned audit state dir (passed to the child via env) is byte-identical
-      (and empty) before/after every read-only ``tools/call`` and the parent
+      before/after every read-only ``tools/call``, holds no RECORD (a zero-byte
+      advisory ``*.lock`` the server's own startup takes is tolerated and
+      nothing else is -- see ``_run_readonly_round_via_stdio``), and the parent
       queue stays verify-intact;
   C5  same no-write proof with ``AIWORKHUB_ALLOW_WRITES=1`` in the child;
   C6  STDIO transport actually used: two subprocess sessions initialized and
@@ -92,44 +96,78 @@ WRITE_GATED_TOOLS: tuple[str, ...] = (
     "aiworkhub_task_export_jsonl",
 )
 
-# Byte-canonical sha256(inputSchema) values for the complete B109-visible tool
-# inventory. The original 15 B108 fingerprints are unchanged; the other 18
-# entries freeze the rest of the staged 33-tool server surface. Any added,
-# removed, renamed, or schema-drifted tool flips frozen_contract_v1 to false.
+# Byte-canonical sha256(inputSchema) for the 33 tools frozen at B109. A removed,
+# renamed, or schema-drifted frozen tool flips frozen_contract_v1 to false.
+# RE-FROZEN 2026-09-08, and NARROWED, with the measurement for both.
+#
+# This harness had never been RUN since it was written: pytest collects
+# ``test_*.py`` only and nothing in CI named this file, so it sat red without
+# saying so. Two separate things were wrong with it, and only one of them is a
+# drifted pin.
+#
+# 1. THE PIN. 30 of these 33 fingerprints mismatched. The dominant cause is
+#    that the tool FUNCTIONS were renamed ``geoai_*`` -> ``aiworkhub_*``:
+#    FastMCP names each tool's pydantic argument model
+#    ``f"{func.__name__}Arguments"``, so that title -- and only that title --
+#    lives inside every inputSchema. Substituting the old prefix back into the
+#    current schema reproduces the old fingerprint exactly for the pure-rename
+#    cases, which is the proof that their parameters never changed. It is NOT
+#    an SDK rendering change: the three ``aiworkhub_cli_adapter_*`` tools never
+#    drifted at all, because their functions carry their own names
+#    (``plan_command_readonly`` / ``audit_summary_readonly`` /
+#    ``readonly_tool_report``) and are registered under an explicit tool name.
+#    The rest are genuine additive parameters accumulated over ~100 waves
+#    (``task_show.detail``/``full``, ``task_mark_done.include_card``,
+#    ``agent_launch_task``'s and ``completion_inbox``'s new options, ...).
+#    All 33 are re-frozen here against the current server.
+#
+# 2. THE CLOSURE. The original checks asserted the server has EXACTLY these 33
+#    tools and EXACTLY these fingerprints for its whole visible surface.
+#    MEASURED 2026-09-08: the server exposes 188. Every one of the 33 is still
+#    present -- none was removed or renamed away -- but the surface grew by
+#    deliberate product decisions, wave after wave. A closure pin over a
+#    growing surface asserts only "no tool has been added since the pin was
+#    written", which is not a contract, cannot be maintained, and would turn
+#    red on the next tool anyone adds while teaching nothing about it.
+#    So the closure is narrowed to what is still TRUE and still worth
+#    defending: every frozen tool must still be VISIBLE and must still carry
+#    its EXACT frozen input schema, over a real stdio pipe. A tool that
+#    disappears, is renamed, or changes shape still fails this gate; a newly
+#    added tool does not.
 FROZEN_SCHEMA_FINGERPRINTS: dict[str, str] = {
-    "aiworkhub_agent_cancel_task": "d6dc39018324299f9ca0163985b3b7ea846ea681a5b4c8300bfcfca5992132ed",
-    "aiworkhub_agent_collect_result": "0f18003c33bbfa39a51bd58df9b7199958f654d48be46b22f135eeaac95ebd7e",
-    "aiworkhub_agent_launch_task": "e2df07bb8d3b62ba205ce55a4c6952977bfadcf1b9110a50018383c40264ca8c",
-    "aiworkhub_agent_list_processes": "ef824212a6e23c40e901bcfb3681aa45db69dd8c7a2ff2a0afd1e6c3dff974e1",
-    "aiworkhub_agent_task_status": "ff9aba2f7412aa53948c8f3ba1a83d9bc2e3a4e1886f54bd1306c64b510f31a7",
+    "aiworkhub_agent_cancel_task": "f1d9792f94307639105434caa381c54857d7c292dab122b4cd4e9333dd0552f3",
+    "aiworkhub_agent_collect_result": "c291cac06bc81689a1b0df1357facb97c5806fefd0a447ef3245e38976077a3f",
+    "aiworkhub_agent_launch_task": "02f5d9a9625474dca12ffb80a5afbc8415aa971561799e2041a1557fe0c1d59b",
+    "aiworkhub_agent_list_processes": "706c69e343e2b322d11e57bd76279459c4e7296f3906d620fa9c2d643931db28",
+    "aiworkhub_agent_task_status": "2c2f20ce1b0fd6064f7aa7fc34822f6ba82911605ed9eb3924752cc442321455",
     "aiworkhub_cli_adapter_audit_summary_readonly": "6ab96b247924a28d5d793064a61e50c59f46a771c53459ec1197e3acca973fee",
     "aiworkhub_cli_adapter_plan_readonly": "7a79866fe17cd414929fc7e59898311436ce102d826637f7bac3df870cc49c9e",
     "aiworkhub_cli_adapter_report_readonly": "f80f2283b05d851f6fe1a405930efb9f65e39e7f2d501dc70ed5635ab5ca538c",
-    "aiworkhub_completion_inbox": "fc015d926f2c5df16a05f81f8da9104398479be855f88a4b503e476e3ddfc5eb",
-    "aiworkhub_launch_queue_audit_summary_readonly": "d69e90ba19ecaf47938bb1d5afaadbbffaf8e7cdc3bd2a850c5963b2a76ad4ea",
-    "aiworkhub_launch_queue_describe_readonly": "f95498863ef4cd023de90327c99b01a2502ead5e42eb637f57399eff2aa13473",
-    "aiworkhub_launch_queue_evaluate_readonly": "edc2a889e2948cda4414a45ca2ea3574bee01c851905d3a49c449ad96f1411ff",
-    "aiworkhub_supervisor_loop_status": "53af2da13ad6d2029abdb0832822908eb19c5d343cf8bab25dc6f6d62a9abc41",
-    "aiworkhub_task_audit_log_read": "74c684c110e619ef2e3c8c01e59beb938438df93b3c4a0de9c661bc9fd93203d",
-    "aiworkhub_task_auto_pickup": "fff78a02b8d8a49a54a9d7c5ea8fabdda817fd3bffdcd12bc560cdc5f7051866",
-    "aiworkhub_task_auto_pickup_dryrun": "a4961d4d6e6c8f5b3cc6d81d625f27dd63858b9c7720266cd21fa6115dbf67b4",
-    "aiworkhub_task_codex_handoff": "7b19a7cf66e19bcbb075dd793e34c54c7450c8b55d30a450e35e23cdfe3d43bd",
-    "aiworkhub_task_codex_handoff_markdown": "880b9c601eab1b1024df04987c95957288ae4e6c8b7e82e15f2dab39a6354492",
-    "aiworkhub_task_collision_guard": "acfe0038d2537d852cd25d46d0021a0e38a8227a8ab0f8cce9deaef2b8feaf36",
-    "aiworkhub_task_cost_ledger": "e3ca25a6bb80d2f6bb991b99feb194b3c459afaa77bfc7de5ec94055aea62643",
-    "aiworkhub_task_export_jsonl": "bef633b8f2ef490b50629465aaad568676cd573cdd12e642875b19d9a3c02579",
-    "aiworkhub_task_health": "091219a847dddf8926f5a41e7deb3ad33704df05434e23409bceab171e305aeb",
-    "aiworkhub_task_list": "eb3d9dcce2e6679c3f9f77cd0a9b689d6e553a0119d944cf8e9f7dde3170fef9",
-    "aiworkhub_task_mark_done": "571fa3749c5713a752de7557b3ad5f5520fc6d0a2c0bc56d0de89632e0b76cd2",
-    "aiworkhub_task_mark_review": "f108d09c8f51dab3dfe79808e34fa7df610141b0992c0b4ac7abe660cc016344",
-    "aiworkhub_task_pending_for_runner": "37de6b3d912cfa4d5deab2f1ae2c1e03eeac9e552de7678604d4309c33227a13",
-    "aiworkhub_task_queue_request": "b53127ff1f63327b53557cee43288f710d3965a9907bf71df1fc5ba5937ee7c5",
-    "aiworkhub_task_reject_review": "b63f46acd240e9c485a43898d12dc10a7d9adf63ef60b7884cff1ef7c160e6ac",
-    "aiworkhub_task_review_queue": "3db01bcd01ceec23a2caf5d7df6b28c5a452c03ac9a482eeeb5a48c5dd2142fc",
-    "aiworkhub_task_review_summarize": "6023df30ec17d4326fcc0e2ddd569b1f98976375c31c4f088f26b56bda0863b9",
-    "aiworkhub_task_show": "197d2041187737888044d493380cb4d2a233d2195557a52b6a275cb914977dd0",
-    "aiworkhub_task_stale_recovery_recommend": "4f423ac0d8e568417fc7a398abae49c57eda8eafa75b356540b0f9787bd38e70",
-    "aiworkhub_task_usage_report": "9aeda83460cd1edb99761473dd1aebbd6ddedfa3f96f02b5e2aeae702425168a",
+    "aiworkhub_completion_inbox": "6f38948559f5ecef8e53a08e2658eb73dedf6452a349e49c7a9110e18e131d75",
+    "aiworkhub_launch_queue_audit_summary_readonly": "074f02e6dc862d3b8207f0abbfc33fa7345afc5e29856d09487cf806735dbe05",
+    "aiworkhub_launch_queue_describe_readonly": "196646048b91854998c28342d65215b29254c8ead6fd79bdc9d43839d774bdd3",
+    "aiworkhub_launch_queue_evaluate_readonly": "8f4cde4ac5015c22c941c48d9f6fb17541d0b47cabb51ab44de615771689b861",
+    "aiworkhub_supervisor_loop_status": "ca2607d4656ee1a5cd7cba313fee45589ea2ea355a870ca5b7a03a18a70fe68e",
+    "aiworkhub_task_audit_log_read": "5111315e1823d882715a6b1fa754f1c64894ec10eea469b0b2fe7bc5e98ec015",
+    "aiworkhub_task_auto_pickup": "02878ab53c86e45277a3c4337c438218de36a3d2d9f82f2385d9afaed2aa243e",
+    "aiworkhub_task_auto_pickup_dryrun": "f5c5e3922552fb6813c94f921c9163c8aded29f7db478fd88ab8c60a9e30a29a",
+    "aiworkhub_task_codex_handoff": "5f15fa92c6eb29072587971c5d4226860d9196893a53688bcb027a4e2b07a6aa",
+    "aiworkhub_task_codex_handoff_markdown": "00f589247e30bcdd709f807b64b3e80452eab0c074fc14326d734e14e0491ece",
+    "aiworkhub_task_collision_guard": "9a6a72f9e63acc7e08a9fd4c95e66382530f96b98bb40467801b6679c2adf6fd",
+    "aiworkhub_task_cost_ledger": "58b4efbf795ea2d110e6dd630a048afce78bd2dba650aac46e5d2ce5a6660540",
+    "aiworkhub_task_export_jsonl": "60699d5c0d81ccf28ea7cd0a2f415089d0f87d144b40b83117517649fa847a4a",
+    "aiworkhub_task_health": "0d6de3645a2bbbb16f9ae4bc7592403918fd5a8768a3888b1018f1570a9aaffc",
+    "aiworkhub_task_list": "bf57352dc786f7f0a14c31625711a0a6ab4576d2d85fb730209a4a957efbd914",
+    "aiworkhub_task_mark_done": "85f0dad5ce5e23a4c258d1314230223d1ff8adfcee3f17765283986f1dce4e9a",
+    "aiworkhub_task_mark_review": "1722a2665425d2ebd8573c3425ee2d04b8c71ae3db24ace3c97e5a82d7e92bd4",
+    "aiworkhub_task_pending_for_runner": "864d85c9f3a5a7020e270ddd71f9aeea2ab65ca35932aaf869afaa837950b16d",
+    "aiworkhub_task_queue_request": "2c43bb4347d3806b3f373390c95cfc7c4f398b4404860ff4a1722269edeb7fa5",
+    "aiworkhub_task_reject_review": "7ab03785fb0e3e081bc677b4d9e9d8d57b7706d630a6deb48a77700e3d921b07",
+    "aiworkhub_task_review_queue": "b5728f6f46c22488977fe80e794f420203cf6725367eb9271cfdad1c6538b878",
+    "aiworkhub_task_review_summarize": "e535208ce91e843357bb2efb237b656c50ad1a0b4e1be4111c9ae2356c647e01",
+    "aiworkhub_task_show": "987a6779aea9974dc849205292e41e5fab2443e04e97f3c2528059a6b60c4ad3",
+    "aiworkhub_task_stale_recovery_recommend": "29e87fad5d966f1e6159991a6ddeba3f77be49d7d8ee11951dd8c858556881fc",
+    "aiworkhub_task_usage_report": "84fe64116d44bde99ea6a1d850e94a3164e32c12b7a4479ecb4dc10bcc0fe7e3",
 }
 
 # Read-only tools_call payloads (client path) -- required args supplied.
@@ -241,12 +279,29 @@ async def _run_readonly_round_via_stdio(state_dir: Path, allow_writes: bool) -> 
                     return {"ok": False, "reason": f"tool_error:{name}"}
     after = _snapshot_dir(state_dir)
     verify_after = core.run_taskctl(["verify"]).returncode
+    # "Empty" was always meant as "holds no RECORD". MEASURED 2026-09-08 with
+    # this harness pointed at a freshly initialized repository -- which is what
+    # a CI runner is -- the server child creates ONE zero-byte advisory lock,
+    # ``process_events.jsonl.lock``, next to the process log this harness
+    # deliberately redirects into the state dir. It is created by the server's
+    # own startup (the reconciler taking the process-log lock), not by any
+    # ``tools/call``; against a developer machine where another AIWorkHub server
+    # already holds that lock it never appeared, which is why this check looked
+    # green here and would have been red in CI.
+    #
+    # A zero-byte ``*.lock`` is therefore tolerated and NOTHING else is: a lock
+    # with any content, a file that is not a lock, or ANY change across the
+    # round still fails. ``state_byte_identical`` is untouched and remains the
+    # primary tooth.
+    records = [row for row in after if not (row[0].endswith(".lock") and row[1] == 0)]
     return {
         "ok": True,
         "state_before": before,
         "state_after": after,
         "state_byte_identical": before == after,
         "state_empty": after == [],
+        "state_holds_no_records": records == [],
+        "tolerated_empty_locks": [row[0] for row in after if row not in records],
         "queue_verify_before_rc": verify_before,
         "queue_verify_after_rc": verify_after,
         "queue_verify_intact": verify_before == 0 and verify_after == 0,
@@ -296,26 +351,36 @@ def run_smoke() -> dict[str, Any]:
         wg_visible = [n for n in WRITE_GATED_TOOLS if n in visible]
         checks["readonly_tools_visible"] = set(ro_visible) == set(READONLY_TOOLS)
         checks["write_gated_tools_visible"] = set(wg_visible) == set(WRITE_GATED_TOOLS)
+        # NARROWED 2026-09-08 (see the note above FROZEN_SCHEMA_FINGERPRINTS):
+        # every frozen tool must still be VISIBLE in both sessions. It no
+        # longer asserts the server has ONLY these tools -- it has 188, and a
+        # closure pin over a deliberately growing surface asserts nothing about
+        # any contract. Removal, rename and shape drift are still caught.
         checks["tool_inventory_matches_frozen"] = (
-            visible == frozen_tools and visible_b == frozen_tools
+            frozen_tools <= visible and frozen_tools <= visible_b
         )
         detail["readonly_tools_visible"] = sorted(ro_visible)
         detail["write_gated_tools_visible"] = sorted(wg_visible)
         detail["tools_visible"] = sorted(visible)
         detail["frozen_tool_names"] = sorted(frozen_tools)
         detail["missing_tools"] = sorted(frozen_tools - visible)
-        detail["unexpected_tools"] = sorted(visible - frozen_tools)
+        detail["tools_added_since_freeze"] = sorted(visible - frozen_tools)
+        detail["unexpected_tools"] = []
         detail["total_tools_visible"] = len(visible)
 
         cur_fp = {n: _canon_fp(s) for n, s in schemas_a.items()}
         fp_b = {n: _canon_fp(s) for n, s in schemas_b.items()}
         mismatches = sorted(
-            n for n in set(cur_fp) | frozen_tools
-            if cur_fp.get(n) != FROZEN_SCHEMA_FINGERPRINTS.get(n)
+            n for n in frozen_tools
+            if cur_fp.get(n) != FROZEN_SCHEMA_FINGERPRINTS[n]
         )
-        checks["schema_fingerprints_match_frozen"] = (
-            cur_fp == FROZEN_SCHEMA_FINGERPRINTS
-        )
+        # Frozen tools only, for the same reason: a tool added after the freeze
+        # has no frozen fingerprint to match, and demanding one would make this
+        # gate fail on additions instead of on drift.
+        checks["schema_fingerprints_match_frozen"] = not mismatches
+        # Determinism is still compared over the WHOLE listing: two independent
+        # subprocess sessions must render every schema identically, and that is
+        # a property of the server, not of the pin.
         checks["schema_deterministic_across_sessions"] = cur_fp == fp_b
         detail["schema_fingerprint_mismatches"] = mismatches
         detail["current_schema_fingerprints"] = cur_fp
@@ -325,7 +390,8 @@ def run_smoke() -> dict[str, Any]:
         r_unset = asyncio.run(_run_readonly_round_via_stdio(state_dir, allow_writes=False))
         checks["no_write_allow_unset"] = bool(
             r_unset.get("ok") and r_unset.get("state_byte_identical")
-            and r_unset.get("state_empty") and r_unset.get("queue_verify_intact")
+            and r_unset.get("state_holds_no_records")
+            and r_unset.get("queue_verify_intact")
         )
         detail["round_allow_unset"] = r_unset
 
@@ -333,7 +399,8 @@ def run_smoke() -> dict[str, Any]:
         r_set = asyncio.run(_run_readonly_round_via_stdio(state_dir, allow_writes=True))
         checks["no_write_allow_set"] = bool(
             r_set.get("ok") and r_set.get("state_byte_identical")
-            and r_set.get("state_empty") and r_set.get("queue_verify_intact")
+            and r_set.get("state_holds_no_records")
+            and r_set.get("queue_verify_intact")
         )
         detail["round_allow_set"] = r_set
 
@@ -346,11 +413,15 @@ def run_smoke() -> dict[str, Any]:
             params.env.get(process_launcher.ALLOW_LAUNCH_ENV) == "0"
             and runtime_launch_enabled is False
         )
+        # Same narrowing as C4/C5, for the same measured reason: "no launcher
+        # STATE was created" is what this asserts, and a zero-byte advisory
+        # lock is not launcher state. A launcher that actually ran would leave
+        # a non-empty process_events.jsonl, which still fails here.
         checks["no_launch_side_effects"] = (
             checks["only_mcp_server_launched"]
             and checks["launch_gate_forced_closed"]
-            and r_unset.get("state_empty") is True
-            and r_set.get("state_empty") is True
+            and r_unset.get("state_holds_no_records") is True
+            and r_set.get("state_holds_no_records") is True
         )
         detail["server_launch_pattern_hits"] = launch_hits
         detail["launch_enabled"] = runtime_launch_enabled

@@ -1977,6 +1977,54 @@ def accept_review(
         manager_skill_tools.record_decision_evidence(
             self.repo, task_id=task_id, request_id=request_id, outcome="accepted"
         )
+        # Imported here, not at module scope: the seam guard treats a function
+        # -body import as a binding, and neither module is a ``process_launcher``
+        # seam a test could patch.
+        from . import learning_commit_store as _learning_store
+        from . import needfix_store as _needfix_store
+
+        # Findings that SURVIVED ingest but were not acted on. The accept
+        # landed, so nothing here blocked it -- and the reviewer card that
+        # carries them is finalized in this same call and archived later (1,796
+        # so far), which is where 589 accepted-shape findings went. Drafted
+        # from the reports this accept actually verified; the manager files one
+        # with needfix_add, or lets it land through capture_proposal as
+        # captured/unverified. The DESCRIPTION stays the manager's.
+        surviving_findings = _needfix_store.draft_from_review_evidence(
+            {
+                "task_id": task_id,
+                "terminal_review": {
+                    "evidence": {
+                        "request_identity": {
+                            "request_id": request_id, "task_id": task_id,
+                        },
+                        "changed_paths": list(promoted),
+                        "attempt_artifact_manifest": attempt_artifact_receipt,
+                        "quality_gate": {
+                            "quality_verdict": {
+                                "reviewer_reports": verified_reviewer_reports,
+                            },
+                        },
+                    },
+                },
+            },
+            request_id=request_id,
+        )
+        # Measured 2026-09-08: 3,383 accept/reject decisions produced 130
+        # session documents, and the injected bundle's session section read
+        # evidence_count 0 in 743 of 743 requests -- every mandated session
+        # query was empty by construction. One event document per decision,
+        # through the same context_writes path the learning-commit projection
+        # uses. No model call; learning_commit still owns the lesson text.
+        session_decision_event = _learning_store.record_decision_event(
+            self.repo,
+            task_id=task_id,
+            request_id=request_id,
+            decision="accepted",
+            changed_path_hashes=stored_hashes,
+            changed_paths=list(promoted),
+            failure_category="",
+        )
         accepted_reply = {
             "ok": True, "request_id": request_id, "task_id": task_id,
             "promoted_paths": promoted,
@@ -1985,6 +2033,8 @@ def accept_review(
             "accepted_outcome_receipt": accepted_outcome_receipt,
             "needfix_closure": needfix_closure,
             "learning_commit_owed": learning_owed,
+            "needfix_candidates": surviving_findings,
+            "session_decision_event": session_decision_event,
             # The same provenance the accept EVENT carries, in the reply, so a
             # caller can see which reviewer ids were used and who supplied them
             # without re-reading the card it just finished.

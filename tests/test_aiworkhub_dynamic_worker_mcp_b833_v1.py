@@ -1785,10 +1785,24 @@ def test_worker_ai_tools_module_imports_no_task_mutation_or_shell_surface() -> N
     assert "from . import core" not in source
     assert "import process_launcher" not in source
     assert "from . import process_launcher" not in source
-    # B878: KB / AI Memory / Session Manager are now queried in-process via
-    # sqlite3 -- this module never shells out to AITools/*.py at all.
-    assert "import subprocess" not in source
+    # B878: KB / AI Memory / Session Manager are queried in-process via
+    # sqlite3 -- no discovery tool here shells out at all.  Never a shell, in
+    # any form.
     assert "shell=True" not in source
+    assert "os.system" not in source
+    assert "subprocess.Popen" not in source
+    assert "subprocess.call" not in source
+    assert "check_output" not in source
+    # The single permitted spawn: the card's OWN declared validation command,
+    # resolved by the coordinator's resolver and executed shell-free inside the
+    # sandbox this server is already confined by (token audit 2026-09-08 --
+    # validation was 42.7% of every worker tool-result byte).  Exactly one
+    # ``subprocess.run`` call site, and it must be shell-free.
+    assert source.count("subprocess.run(") == 1
+    run_index = source.index("subprocess.run(")
+    spawn_call = source[run_index : run_index + 400]
+    assert "shell=False" in spawn_call
+    assert 'resolution["argv"]' in spawn_call
 
 
 def test_fake_worker_end_to_end_dynamic_tool_call(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -2139,6 +2153,22 @@ def test_live_call_gate_telemetry_never_leaks_ledger_paths(monkeypatch: pytest.M
 # ---------------------------------------------------------------------------
 
 def test_worker_mcp_tool_names_match_agent_tool_instructions_reference() -> None:
+    """KNOWN RED, and deliberately not weakened.
+
+    ``aiworkhub_worker_semantic_edit_exception_declare`` was added to
+    ``worker_ai_tools_mcp.MCP_TOOL_NAMES``.  The mirror list lives in
+    ``agent_tool_instructions.WORKER_MCP_TOOL_NAMES`` (a file held by another
+    agent during this change), and this assertion is exactly the guard that
+    catches the two drifting apart -- so it stays as written and fails until
+    the one-line hunk lands:
+
+        src/aiworkhub/agent_tool_instructions.py, WORKER_MCP_TOOL_NAMES,
+        after the line "aiworkhub_worker_semantic_edit_apply", (:251) add
+            "aiworkhub_worker_semantic_edit_exception_declare",
+
+    That tuple is documented there as deliberately NOT part of ``POLICY``, so
+    adding to it does not move ``render_canonical`` bytes or CANONICAL_MAX_BYTES.
+    """
     assert instr.WORKER_MCP_TOOL_NAMES == w.MCP_TOOL_NAMES
 
 

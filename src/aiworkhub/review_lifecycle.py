@@ -199,6 +199,21 @@ def ensure_schema(conn: sqlite3.Connection) -> bool:
             "ADD COLUMN retired_due_to_action_id TEXT NOT NULL DEFAULT ''"
         )
         changed = True
+    chain_columns = {
+        str(row[1])
+        for row in conn.execute("PRAGMA table_info(review_chains)").fetchall()
+    }
+    if "contract_identity_sha256" not in chain_columns:
+        # Deliberately NOT part of ``chain_identity``: that object is hashed
+        # into every stored chain and action descriptor, and adding a field to
+        # it would invalidate all 627 existing rows on the next verification.
+        # It is a separate authenticated column, and an empty one means
+        # "unknown", which can never match and therefore can never replay.
+        conn.execute(
+            "ALTER TABLE review_chains "
+            "ADD COLUMN contract_identity_sha256 TEXT NOT NULL DEFAULT ''"
+        )
+        changed = True
     reservation_columns = {
         str(row[1])
         for row in conn.execute("PRAGMA table_info(review_reservation_state)").fetchall()
@@ -229,9 +244,13 @@ def create_or_replay_chain(
     packet_sha256: str,
     candidate_sha256: str,
     now: datetime | None = None,
+    contract_identity_sha256: str = "",
 ) -> ReviewChain:
     packet = _canonical_sha256(packet_sha256, "packet_sha256")
     candidate = _canonical_sha256(candidate_sha256, "candidate_sha256")
+    contract_identity = str(contract_identity_sha256 or "")
+    if contract_identity and not HEX64.fullmatch(contract_identity):
+        raise ReviewLifecycleError("contract_identity_sha256_invalid")
     identity = _chain_identity(
         target_task_id=target_task_id,
         target_request_id=target_request_id,
@@ -255,14 +274,23 @@ def create_or_replay_chain(
             if chain.chain_identity != identity:
                 raise ReviewLifecycleError("chain_identity_conflict")
             _verify_chain_actions(conn, chain.chain_id, identity, chain.chain_identity_sha256)
+            if contract_identity and not str(row["contract_identity_sha256"] or ""):
+                # Bind a contract identity only into an empty column, and never
+                # over one already recorded: the retained value is what a replay
+                # decision was measured against.
+                conn.execute(
+                    "UPDATE review_chains SET contract_identity_sha256=? "
+                    "WHERE chain_id=? AND contract_identity_sha256=''",
+                    (contract_identity, chain.chain_id),
+                )
             conn.commit()
             return _hydrate_chain_by_id(conn, chain.chain_id)
         identity_json, identity_sha = _canonical_json_sha(identity)
         cursor = conn.execute(
             "INSERT INTO review_chains("
             "target_task_id,target_request_id,claim_epoch,packet_sha256,candidate_sha256,"
-            "chain_identity_json,chain_identity_sha256,created_at"
-            ") VALUES(?,?,?,?,?,?,?,?)",
+            "chain_identity_json,chain_identity_sha256,created_at,contract_identity_sha256"
+            ") VALUES(?,?,?,?,?,?,?,?,?)",
             (
                 identity["target_task_id"],
                 identity["target_request_id"],
@@ -272,6 +300,7 @@ def create_or_replay_chain(
                 identity_json,
                 identity_sha,
                 created_at,
+                contract_identity,
             ),
         )
         if cursor.rowcount != 1:
@@ -1105,6 +1134,108 @@ def completed_receipts_for_chain(
             (int(chain_id),),
         ).fetchall()
         return tuple(json.loads(str(row["receipt_json"])) for row in rows)
+    finally:
+        conn.close()
+
+
+def replay_sources(
+    db_path: str | Path,
+    *,
+    target_task_id: str,
+    candidate_sha256: str,
+    contract_identity_sha256: str,
+    exclude_chain_id: int,
+) -> dict[str, dict[str, Any]]:
+    """Per lens, an EARLIER chain that already ingested a report for these bytes.
+
+    Measured 2026-09-08 over the live store: 627 chains for 600 distinct
+    ``(target_task_id, candidate_sha256)`` pairs -- 27 chains that re-reviewed
+    bytes another chain had already been built for, because a chain is keyed by
+    ``(target_task_id, target_request_id, claim_epoch)`` and a new request id
+    mints a new chain even when every changed file is byte-identical.
+
+    A lens is offered as replayable only when ALL of these hold on the source
+    chain, and every one of them is a stored fact rather than an inference:
+
+    * the same target task;
+    * the identical ``candidate_sha256`` -- the canonical digest of the whole
+      ``changed_path_hashes`` map, so one differing byte in one file is a
+      different candidate and no replay is offered;
+    * an identical, NON-EMPTY ``contract_identity_sha256``.  Empty means the
+      contract was never recorded, and unknown never matches: a chain written
+      before this column existed can neither replay nor be replayed from; and
+    * the source chain's ``launch`` action for that lens completed with a real
+      ``reviewer_request_id`` AND its ``accept`` action completed.  The accept
+      action is the proof of INGESTION: it only completes after
+      ``_review_receipt`` has authenticated the reviewer's sealed, packet-bound
+      report.  A launched-but-never-ingested reviewer offers nothing.
+
+    Everything else -- a missing column, an unreadable receipt, an ambiguous
+    duplicate -- yields no entry for that lens, and no entry means a fresh
+    reviewer is launched.  This is a fail-closed lookup: it can only ever
+    remove a duplicate run, never authorise one that was not already paid for.
+    """
+
+    if not HEX64.fullmatch(str(candidate_sha256 or "")) or not HEX64.fullmatch(
+        str(contract_identity_sha256 or "")
+    ):
+        return {}
+    conn = _connect(db_path)
+    try:
+        ensure_schema(conn)
+        conn.commit()
+        chains = conn.execute(
+            "SELECT chain_id, target_request_id, claim_epoch, packet_sha256 "
+            "FROM review_chains WHERE target_task_id=? AND candidate_sha256=? "
+            "AND contract_identity_sha256=? AND chain_id<>? ORDER BY chain_id",
+            (
+                str(target_task_id),
+                str(candidate_sha256),
+                str(contract_identity_sha256),
+                int(exclude_chain_id),
+            ),
+        ).fetchall()
+        found: dict[str, dict[str, Any]] = {}
+        for chain_row in chains:
+            chain_id = int(chain_row["chain_id"])
+            actions = conn.execute(
+                "SELECT action_type, lens, receipt_json FROM review_action_outbox "
+                "WHERE chain_id=? AND state='completed' AND lens<>'' "
+                "ORDER BY action_index",
+                (chain_id,),
+            ).fetchall()
+            launches: dict[str, dict[str, Any]] = {}
+            ingested: set[str] = set()
+            for action in actions:
+                try:
+                    receipt = json.loads(str(action["receipt_json"] or "{}"))
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(receipt, dict):
+                    continue
+                lens = str(action["lens"])
+                if str(action["action_type"]) == "launch":
+                    reviewer_request_id = str(receipt.get("reviewer_request_id") or "")
+                    if reviewer_request_id and not receipt.get("obsolete_reason"):
+                        launches[lens] = receipt
+                elif str(action["action_type"]) == "accept":
+                    if not receipt.get("obsolete_reason"):
+                        ingested.add(lens)
+            for lens, receipt in launches.items():
+                if lens in found or lens not in ingested:
+                    continue
+                found[lens] = {
+                    "source_chain_id": chain_id,
+                    "source_target_request_id": str(chain_row["target_request_id"]),
+                    "source_claim_epoch": str(chain_row["claim_epoch"]),
+                    "source_packet_sha256": str(chain_row["packet_sha256"]),
+                    "reviewer_request_id": str(receipt.get("reviewer_request_id") or ""),
+                    "reviewer_task_id": str(receipt.get("reviewer_task_id") or ""),
+                    "reviewer_route": receipt.get("reviewer_route") or {},
+                    "candidate_sha256": str(candidate_sha256),
+                    "contract_identity_sha256": str(contract_identity_sha256),
+                }
+        return found
     finally:
         conn.close()
 
