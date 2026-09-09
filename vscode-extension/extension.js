@@ -11,7 +11,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.11.11";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.11.12";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 // NF-2026-00643: this globalStorage trace directory was measured holding 1,102
 // files and 2,235,024,325 bytes (2.24 GB), largest single file 44,626,825 bytes
@@ -3969,17 +3969,33 @@ function createVscodeLmStagedEditCollector(request) {
   const requiredSet = new Set(requiredOutputs);
   let incompleteFinalizeCount = 0;
 
+  const nextMissingRequired = () => {
+    if (!trackRequired) return null;
+    for (const filePath of requiredOutputs) {
+      if (edits.has(filePath) || creates.has(filePath)) continue;
+      const contract = contractByPath.get(filePath);
+      const action = contract && contract.action === "create" ? "create" : "replace_range";
+      return { path: filePath, action };
+    }
+    return null;
+  };
+
   const requiredProgress = () => {
     if (!trackRequired) return {};
     const staged = new Set([...edits.keys(), ...creates.keys()]);
     const completed_outputs = requiredOutputs.filter((filePath) => staged.has(filePath));
     const missing_outputs = requiredOutputs.filter((filePath) => !staged.has(filePath));
     const required_output_count = requiredOutputs.length;
+    const nextMissing = nextMissingRequired();
     return {
       required_output_count,
       completed_outputs,
       missing_outputs,
       completion_rate: required_output_count === 0 ? 1 : completed_outputs.length / required_output_count,
+      ...(nextMissing ? {
+        next_missing_path: nextMissing.path,
+        next_missing_action: nextMissing.action,
+      } : {}),
     };
   };
 
@@ -4133,7 +4149,55 @@ function createVscodeLmStagedEditCollector(request) {
     };
   };
 
-  return { stage, finalize, hasChanges: () => edits.size > 0 || creates.size > 0 };
+  return { stage, finalize, hasChanges: () => edits.size > 0 || creates.size > 0, nextMissingRequired };
+}
+
+function vscodeLmNextMissingRequiredOutput(stagedEdits) {
+  return stagedEdits && typeof stagedEdits.nextMissingRequired === "function"
+    ? stagedEdits.nextMissingRequired()
+    : null;
+}
+
+function vscodeLmStagedOutputsReady(stagedEdits) {
+  return Boolean(stagedEdits && stagedEdits.hasChanges()) && !vscodeLmNextMissingRequiredOutput(stagedEdits);
+}
+
+function vscodeLmShouldKeepStagedEdit(writableTask, stagedEdits) {
+  return Boolean(writableTask) && !vscodeLmStagedOutputsReady(stagedEdits);
+}
+
+function vscodeLmMissingRequiredStageInstruction(nextMissing, native = false) {
+  const stageNow = native
+    ? `Call ${VSCODE_LM_STAGE_EDIT_TOOL} now`
+    : `Output ONLY one ${VSCODE_LM_TOOL_REQUEST_SCHEMA} request for ${VSCODE_LM_STAGE_EDIT_TOOL}`;
+  if (!nextMissing || !nextMissing.path || !nextMissing.action) {
+    return `The bounded discovery phase is complete. Do not regenerate a full file or final edit envelope. ` +
+      (native
+        ? `${stageNow} with only the smallest required replacement/create.`
+        : `${stageNow}.`);
+  }
+  return `Required output ${nextMissing.path} is still missing. Do not emit a final edit envelope. ` +
+    `${stageNow} with operation ${nextMissing.action} for ${nextMissing.path}.`;
+}
+
+function vscodeLmForcedStageMissingKey(nextMissing) {
+  return nextMissing && nextMissing.action && nextMissing.path
+    ? `${nextMissing.action}:${nextMissing.path}`
+    : "";
+}
+
+function vscodeLmNoteForcedStageFailure(counter, nextMissing, protocolTrace, lastProtocolPreview) {
+  const key = vscodeLmForcedStageMissingKey(nextMissing);
+  if (key !== counter.key) {
+    counter.key = key;
+    counter.count = 0;
+  }
+  if (counter.count >= 1) {
+    throw vscodeLmProtocolFailure(
+      "vscode_lm_semantic_edit_stage_required", protocolTrace, lastProtocolPreview,
+    );
+  }
+  counter.count += 1;
 }
 
 const VSCODE_LM_WORKER_SOURCE_GRAPH_TOOL = "aiworkhub_worker_source_graph_query";
@@ -4696,7 +4760,8 @@ async function runVscodeLmTextProtocol(
   let reviewSubmitViolations = 0;
   let forceStagedEdit = false;
   let stagedEditInstructionSent = false;
-  let stagedEditViolations = 0;
+  let stagedEditMissingPathSent = "";
+  const stagedEditFailure = { key: "", count: 0 };
   let missingCreateViolations = 0;
   const protocolTrace = [];
   let lastProtocolPreview = "";
@@ -4711,19 +4776,30 @@ async function runVscodeLmTextProtocol(
     }
     if (request.request_kind !== "quality_review" &&
         sourceGraphAcknowledged && postSourceTurns >= VSCODE_LM_MAX_POST_SOURCE_TURNS) {
-      if (writableTask && !stagedEdits.hasChanges()) forceStagedEdit = true;
+      if (vscodeLmShouldKeepStagedEdit(writableTask, stagedEdits)) forceStagedEdit = true;
       else forceFinal = true;
     }
-    if (forceStagedEdit && stagedEdits.hasChanges()) {
+    if (vscodeLmStagedOutputsReady(stagedEdits) && (
+        forceStagedEdit
+        || (Array.isArray(request.required_outputs) && request.required_outputs.length > 0)
+    )) {
       forceStagedEdit = false;
       forceFinal = true;
     }
-    if (forceStagedEdit && !stagedEditInstructionSent) {
-      stagedEditInstructionSent = true;
-      messages.push(vscode.LanguageModelChatMessage.User(
-        `The bounded discovery phase is complete. Do not regenerate a full file or final edit envelope. ` +
-        `Output ONLY one ${VSCODE_LM_TOOL_REQUEST_SCHEMA} request for ${VSCODE_LM_STAGE_EDIT_TOOL}.`,
-      ));
+    if (forceStagedEdit) {
+      const nextMissing = vscodeLmNextMissingRequiredOutput(stagedEdits);
+      const missingKey = vscodeLmForcedStageMissingKey(nextMissing);
+      if (missingKey !== stagedEditFailure.key) {
+        stagedEditFailure.key = missingKey;
+        stagedEditFailure.count = 0;
+      }
+      if (!stagedEditInstructionSent || missingKey !== stagedEditMissingPathSent) {
+        stagedEditInstructionSent = true;
+        stagedEditMissingPathSent = missingKey;
+        messages.push(vscode.LanguageModelChatMessage.User(
+          vscodeLmMissingRequiredStageInstruction(nextMissing, false),
+        ));
+      }
     }
     if (forceFinal) {
       if (stagedEdits.hasChanges()) {
@@ -4778,7 +4854,9 @@ async function runVscodeLmTextProtocol(
         );
       }
       messages.push(vscode.LanguageModelChatMessage.User(
-        forceFinal
+        forceStagedEdit
+          ? vscodeLmMissingRequiredStageInstruction(vscodeLmNextMissingRequiredOutput(stagedEdits), false)
+          : forceFinal
           ? `The previous provider turn contained no text. Output ONLY one final ${VSCODE_LM_EDIT_RESPONSE_SCHEMA} JSON object.`
           : `The previous provider turn contained no text. Retry without prose and output only the next strict ` +
             `${VSCODE_LM_TOOL_REQUEST_SCHEMA} tool request or final ${VSCODE_LM_EDIT_RESPONSE_SCHEMA} JSON object.`,
@@ -4790,6 +4868,14 @@ async function runVscodeLmTextProtocol(
         outcome: "empty",
         response: err && err.responseDiagnostics || {},
       });
+      if (forceStagedEdit) {
+        vscodeLmNoteForcedStageFailure(
+          stagedEditFailure,
+          vscodeLmNextMissingRequiredOutput(stagedEdits),
+          protocolTrace,
+          lastProtocolPreview,
+        );
+      }
       continue;
     }
     if (sourceGraphAcknowledged) postSourceTurns += 1;
@@ -4807,6 +4893,18 @@ async function runVscodeLmTextProtocol(
         );
       }
       messages.push(vscode.LanguageModelChatMessage.Assistant([languageModelTextPart(text)]));
+      if (forceStagedEdit) {
+        vscodeLmNoteForcedStageFailure(
+          stagedEditFailure,
+          vscodeLmNextMissingRequiredOutput(stagedEdits),
+          protocolTrace,
+          lastProtocolPreview,
+        );
+        messages.push(vscode.LanguageModelChatMessage.User(
+          vscodeLmMissingRequiredStageInstruction(vscodeLmNextMissingRequiredOutput(stagedEdits), false),
+        ));
+        continue;
+      }
       messages.push(vscode.LanguageModelChatMessage.User(
         forceFinal
           ? `The previous response was not valid final JSON. Output ONLY one ${VSCODE_LM_EDIT_RESPONSE_SCHEMA} JSON object.`
@@ -4826,10 +4924,15 @@ async function runVscodeLmTextProtocol(
       }
       if (forceStagedEdit) {
         protocolTrace.push({ turn, phase: "semantic_edit_stage", outcome: "full_envelope_rejected" });
+        vscodeLmNoteForcedStageFailure(
+          stagedEditFailure,
+          vscodeLmNextMissingRequiredOutput(stagedEdits),
+          protocolTrace,
+          lastProtocolPreview,
+        );
         messages.push(vscode.LanguageModelChatMessage.Assistant([languageModelTextPart(text)]));
         messages.push(vscode.LanguageModelChatMessage.User(
-          `Full-file/final envelopes are disabled after bounded discovery. Output ONLY one ` +
-          `${VSCODE_LM_TOOL_REQUEST_SCHEMA} request for ${VSCODE_LM_STAGE_EDIT_TOOL}.`,
+          vscodeLmMissingRequiredStageInstruction(vscodeLmNextMissingRequiredOutput(stagedEdits), false),
         ));
         continue;
       }
@@ -4897,18 +5000,15 @@ async function runVscodeLmTextProtocol(
       // request fails with one bounded structured error.
       if (forceStagedEdit) {
         protocolTrace.push({ turn, phase: "semantic_edit_stage", outcome: "non_stage_tool_rejected" });
-        if (stagedEditViolations >= 1) {
-          throw vscodeLmProtocolFailure(
-            "vscode_lm_semantic_edit_stage_required", protocolTrace, lastProtocolPreview,
-          );
-        }
-        stagedEditViolations += 1;
+        vscodeLmNoteForcedStageFailure(
+          stagedEditFailure,
+          vscodeLmNextMissingRequiredOutput(stagedEdits),
+          protocolTrace,
+          lastProtocolPreview,
+        );
         messages.push(vscode.LanguageModelChatMessage.Assistant([languageModelTextPart(text)]));
         messages.push(vscode.LanguageModelChatMessage.User(
-          `Only ${VSCODE_LM_STAGE_EDIT_TOOL} is accepted in the bounded semantic-edit stage. ` +
-          `Use one of these exact tool envelope shapes and nothing else:\n` +
-          `{"schema_id":"${VSCODE_LM_TOOL_REQUEST_SCHEMA}","name":"${VSCODE_LM_STAGE_EDIT_TOOL}","input":{"operation":"create","file_path":"<allowed-path>","content":"<full file content>"}} and ` +
-          `{"schema_id":"${VSCODE_LM_TOOL_REQUEST_SCHEMA}","name":"${VSCODE_LM_STAGE_EDIT_TOOL}","input":{"operation":"replace_range","file_path":"<allowed-path>","start_line":1,"end_line":1,"new":"<replacement code>"}}.`,
+          vscodeLmMissingRequiredStageInstruction(vscodeLmNextMissingRequiredOutput(stagedEdits), false),
         ));
         continue;
       }
@@ -5028,13 +5128,25 @@ async function runVscodeLmTextProtocol(
     if (result && result.ok === true && result.__finalEnvelope) {
       return JSON.stringify(result.__finalEnvelope);
     }
+    if (forceStagedEdit && result && result.ok === false) {
+      protocolTrace.push({ turn, phase: "semantic_edit_stage", outcome: "stage_rejected" });
+      vscodeLmNoteForcedStageFailure(
+        stagedEditFailure,
+        vscodeLmNextMissingRequiredOutput(stagedEdits),
+        protocolTrace,
+        lastProtocolPreview,
+      );
+    }
     protocolTrace.push({ turn, phase: "work", outcome: `tool:${envelope.name}` });
     messages.push(vscode.LanguageModelChatMessage.Assistant([languageModelTextPart(text)]));
+    const nextMissing = vscodeLmNextMissingRequiredOutput(stagedEdits);
     messages.push(vscode.LanguageModelChatMessage.User(JSON.stringify({
       schema_id: VSCODE_LM_TOOL_RESULT_SCHEMA,
       name: envelope.name,
       result,
-      instruction: "Output only the next strict tool-request JSON or final edit-response JSON object.",
+      instruction: nextMissing
+        ? vscodeLmMissingRequiredStageInstruction(nextMissing, false)
+        : "Output only the next strict tool-request JSON or final edit-response JSON object.",
     })));
   }
   throw vscodeLmProtocolFailure("vscode_lm_agent_turn_limit", protocolTrace, lastProtocolPreview);
@@ -5085,7 +5197,8 @@ async function runVscodeLmAgent(
   let reviewSubmitViolations = 0;
   let forceStagedEdit = false;
   let stagedEditInstructionSent = false;
-  let stagedEditViolations = 0;
+  let stagedEditMissingPathSent = "";
+  const stagedEditFailure = { key: "", count: 0 };
   let missingCreateViolations = 0;
   const protocolTrace = [];
   let lastProtocolPreview = "";
@@ -5101,22 +5214,33 @@ async function runVscodeLmAgent(
     if (sourceGraphAcknowledged &&
         (toolTurns >= VSCODE_LM_MAX_TOOL_TURNS || postSourceTurns >= VSCODE_LM_MAX_POST_SOURCE_TURNS) &&
         !forceFinal) {
-      if (writableTask && !stagedEdits.hasChanges()) {
+      if (vscodeLmShouldKeepStagedEdit(writableTask, stagedEdits)) {
         forceStagedEdit = true;
       } else {
         forceFinal = true;
       }
-      if (forceStagedEdit && !stagedEditInstructionSent) {
-        stagedEditInstructionSent = true;
-        messages.push(vscode.LanguageModelChatMessage.User(
-          `The bounded discovery phase is complete. Do not regenerate a full file or final edit envelope. ` +
-          `Call ${VSCODE_LM_STAGE_EDIT_TOOL} now with only the smallest required replacement/create.`,
-        ));
-      }
     }
-    if (forceStagedEdit && stagedEdits.hasChanges()) {
+    if (vscodeLmStagedOutputsReady(stagedEdits) && (
+        forceStagedEdit
+        || (Array.isArray(request.required_outputs) && request.required_outputs.length > 0)
+    )) {
       forceStagedEdit = false;
       forceFinal = true;
+    }
+    if (forceStagedEdit) {
+      const nextMissing = vscodeLmNextMissingRequiredOutput(stagedEdits);
+      const missingKey = vscodeLmForcedStageMissingKey(nextMissing);
+      if (missingKey !== stagedEditFailure.key) {
+        stagedEditFailure.key = missingKey;
+        stagedEditFailure.count = 0;
+      }
+      if (!stagedEditInstructionSent || missingKey !== stagedEditMissingPathSent) {
+        stagedEditInstructionSent = true;
+        stagedEditMissingPathSent = missingKey;
+        messages.push(vscode.LanguageModelChatMessage.User(
+          vscodeLmMissingRequiredStageInstruction(nextMissing, true),
+        ));
+      }
     }
     if (forceFinal) {
       if (stagedEdits.hasChanges()) {
@@ -5139,7 +5263,7 @@ async function runVscodeLmAgent(
     if (!forceFinal) {
       options.tools = availableTools;
       options.toolMode = qualityReview || forceStagedEdit ||
-        (writableTask && !stagedEdits.hasChanges())
+        vscodeLmShouldKeepStagedEdit(writableTask, stagedEdits)
         ? vscode.LanguageModelChatToolMode.Required
         : sourceGraphAcknowledged
           ? vscode.LanguageModelChatToolMode.Auto
@@ -5184,18 +5308,15 @@ async function runVscodeLmAgent(
     if (startedWithSourceGraph) postSourceTurns += 1;
     if (forceStagedEdit && calls.some((call) => call.name !== VSCODE_LM_STAGE_EDIT_TOOL)) {
       protocolTrace.push({ turn, phase: "semantic_edit_stage", outcome: "non_stage_tool_rejected" });
-      if (stagedEditViolations >= 1) {
-        throw vscodeLmProtocolFailure(
-          "vscode_lm_semantic_edit_stage_required", protocolTrace, lastProtocolPreview,
-        );
-      }
-      stagedEditViolations += 1;
+      vscodeLmNoteForcedStageFailure(
+        stagedEditFailure,
+        vscodeLmNextMissingRequiredOutput(stagedEdits),
+        protocolTrace,
+        lastProtocolPreview,
+      );
       messages.push(vscode.LanguageModelChatMessage.Assistant(filterOutToolCallParts(assistantParts)));
       messages.push(vscode.LanguageModelChatMessage.User(
-        `Only ${VSCODE_LM_STAGE_EDIT_TOOL} is accepted in the bounded semantic-edit stage. ` +
-        `Call ${VSCODE_LM_STAGE_EDIT_TOOL} now with only the smallest required envelope shape. ` +
-        `Use create for new files: {"schema_id":"${VSCODE_LM_TOOL_REQUEST_SCHEMA}","name":"${VSCODE_LM_STAGE_EDIT_TOOL}","input":{"operation":"create","file_path":"<allowed-path>","content":"<full file content>"}} ` +
-        `or replace_range for edits: {"schema_id":"${VSCODE_LM_TOOL_REQUEST_SCHEMA}","name":"${VSCODE_LM_STAGE_EDIT_TOOL}","input":{"operation":"replace_range","file_path":"<allowed-path>","start_line":1,"end_line":1,"new":"<replacement code>"}}.`,
+        vscodeLmMissingRequiredStageInstruction(vscodeLmNextMissingRequiredOutput(stagedEdits), true),
       ));
       continue;
     }
@@ -5215,13 +5336,34 @@ async function runVscodeLmAgent(
       }
       if (!text) {
         protocolTrace.push({ turn, phase: forceFinal ? "final" : "work", outcome: "empty" });
+        if (forceStagedEdit) {
+          vscodeLmNoteForcedStageFailure(
+            stagedEditFailure,
+            vscodeLmNextMissingRequiredOutput(stagedEdits),
+            protocolTrace,
+            lastProtocolPreview,
+          );
+        }
         messages.push(vscode.LanguageModelChatMessage.User(
           forceStagedEdit
-            ? `The previous provider turn contained neither a tool call nor text. ` +
-              `Call ${VSCODE_LM_STAGE_EDIT_TOOL} now with only the smallest required replacement/create.`
+            ? vscodeLmMissingRequiredStageInstruction(vscodeLmNextMissingRequiredOutput(stagedEdits), true)
             : `The previous provider turn contained neither a tool call nor text. ` +
               `Output ONLY one final ${VSCODE_LM_EDIT_RESPONSE_SCHEMA} JSON object matching ` +
               `allowed_writes=${JSON.stringify(request.allowedWrites)}.`,
+        ));
+        continue;
+      }
+      if (forceStagedEdit) {
+        protocolTrace.push({ turn, phase: "semantic_edit_stage", outcome: "full_envelope_rejected" });
+        vscodeLmNoteForcedStageFailure(
+          stagedEditFailure,
+          vscodeLmNextMissingRequiredOutput(stagedEdits),
+          protocolTrace,
+          lastProtocolPreview,
+        );
+        messages.push(vscode.LanguageModelChatMessage.Assistant([languageModelTextPart(text)]));
+        messages.push(vscode.LanguageModelChatMessage.User(
+          vscodeLmMissingRequiredStageInstruction(vscodeLmNextMissingRequiredOutput(stagedEdits), true),
         ));
         continue;
       }
@@ -5406,6 +5548,15 @@ async function runVscodeLmAgent(
       if (completedReview) return completedReview;
       if (result && result.ok === true && result.__finalEnvelope) {
         return JSON.stringify(result.__finalEnvelope);
+      }
+      if (forceStagedEdit && result && result.ok === false) {
+        protocolTrace.push({ turn, phase: "semantic_edit_stage", outcome: "stage_rejected" });
+        vscodeLmNoteForcedStageFailure(
+          stagedEditFailure,
+          vscodeLmNextMissingRequiredOutput(stagedEdits),
+          protocolTrace,
+          lastProtocolPreview,
+        );
       }
       results.push(languageModelToolResultPart(call.callId, result));
     }

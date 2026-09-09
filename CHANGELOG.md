@@ -6,6 +6,21 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.12] - 2026-09-09
+
+### Fixed
+
+- Workforce telemetry now separates route startability, access probes,
+  historical evidence, current round-trip observation and provider outcome;
+  installation alone can no longer read as a successful live execution.
+- A real terminal provider failure now proves that a route was observed without
+  falsely reporting the route as available or successful.
+- VS Code LM workers keep semantic staging open until every immutable required
+  output is staged, name the exact next path/action, and terminate repeated
+  refusal with a bounded stage-specific error instead of a broad turn limit.
+- Complete staged edit/create envelopes finalize offline without an extra
+  provider turn on both text and native tool-calling routes.
+
 ## [0.11.11] - 2026-09-09
 
 ### Fixed

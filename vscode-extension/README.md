@@ -12,6 +12,15 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.11.12 — 2026-09-09
+
+- Route telemetry now tells launch readiness, historical evidence, current
+  round-trip observation and provider outcome apart.
+- Multi-output VS Code LM work stays in semantic staging until every required
+  edit/create is complete, then finalizes without another model turn.
+- Corrections name the exact missing path/action and repeated refusal fails with
+  a bounded semantic-stage error.
+
 ## What's new in 0.11.11 — 2026-09-09
 
 - Native Codex workers now receive the full role-scoped AIWorkHub tool contract

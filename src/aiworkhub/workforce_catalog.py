@@ -1396,19 +1396,23 @@ def build_catalog(
             ),
             evidence_sources=prior_observation_sources,
         )
-        # `availability_observed` is a two-disjunct boolean whose NAME reads as
-        # "availability was observed", and a Windows operator reading 0.11.8
-        # reasonably took it that way: the same row said
-        # route_observation.state=unknown with
-        # "no_terminal_execution_inside_observation_window" and, two fields
-        # later, availability_observed=true.  Both are correct and they answer
-        # different questions, but only one of them said which question it was
-        # answering.  Publish the basis in the same shape the neighbouring
-        # verdict already uses, so the two can never be read as one claim.
-        availability_observed = access_observed or bool(sample_count > 0)
+        current_round_trip = bool(exact_route_success_observed)
+        if current_round_trip:
+            round_trip_observed: bool | str = True
+        elif (
+            route_observation["state"]
+            == provider_route_contracts.CAPABILITY_UNSUPPORTED
+        ):
+            round_trip_observed = True
+        else:
+            round_trip_observed = "unknown"
+        availability_observed = current_round_trip
         availability_observation = {
             "question": repo_policy.ROUTE_QUESTION_ACCESS_PROBE_OBSERVED,
-            "observed": availability_observed,
+            "access_probe_observed": access_observed,
+            "historical_quality_cards": int(sample_count),
+            "windowed": False,
+            "proves_round_trip": False,
             "basis": (
                 "adapter_access_probe"
                 if access_observed
@@ -1416,12 +1420,29 @@ def build_catalog(
                 if sample_count > 0
                 else "none"
             ),
-            "access_probe_observed": access_observed,
-            "historical_quality_cards": int(sample_count),
-            # Stated because the two questions differ on exactly this point:
-            # the round-trip verdict is windowed, this one is not.
-            "windowed": False,
         }
+        historical_route_observation = {
+            "recorded": prior_observation_count > 0,
+            "count": int(prior_observation_count),
+            "sources": dict(prior_observation_sources),
+            "in_current_window": current_round_trip
+            or route_observation["state"]
+            == provider_route_contracts.CAPABILITY_UNSUPPORTED,
+            "reason": (
+                str(route_observation["reason"])
+                if prior_observation_count > 0 and round_trip_observed == "unknown"
+                else ""
+            ),
+        }
+        reviewer_submit = provider_route_contracts.capability_record(
+            route_family,
+            provider_route_contracts.CAPABILITY_REVIEWER_SUBMIT,
+        ).as_dict()
+        readiness_status = (
+            "route_circuit_open"
+            if not route_available
+            else str(adapter_ready.get("status") or "unobserved")
+        )
         # Availability is startability AND no tripped failure circuit -- one
         # question each, both already answered elsewhere and quoted here.  It
         # deliberately does NOT require an observed round trip: a route nobody
@@ -1484,16 +1505,15 @@ def build_catalog(
             "route_observation": route_observation,
             "availability_observed": availability_observed,
             "availability_observation": availability_observation,
-            # One rule for every route.  The round-trip fact is NOT repeated
-            # here: it is `route_observation`'s, published on every row with
-            # its evidence class and its per-source count, and a second
-            # spelling of it in this field -- for two providers only -- is
-            # what made the same route read differently in two places.
-            "readiness_status": (
-                "route_circuit_open"
-                if not route_available
-                else str(adapter_ready.get("status") or "unobserved")
-            ),
+            "round_trip_observed": round_trip_observed,
+            "historical_route_observation": historical_route_observation,
+            "reviewer_submit": reviewer_submit,
+            "readiness_status": readiness_status,
+            "readiness": {
+                "status": readiness_status,
+                "question": repo_policy.ROUTE_QUESTION_STARTABLE,
+                "proves_round_trip": False,
+            },
             "route_health": route_health,
             "quota_observed": False,
             "quota_state": "unavailable_from_provider_api",
@@ -1594,6 +1614,8 @@ def build_catalog(
             "route_question": repo_policy.ROUTE_QUESTION_ROUND_TRIP_OBSERVED,
             "startability_question_answered_by": "repo_policy.build_preflight",
             "unmeasured_never_reported_as_measured_empty": True,
+            "availability_observed_is_current_round_trip_only": True,
+            "startability_never_sets_round_trip_observed": True,
         },
     }
 

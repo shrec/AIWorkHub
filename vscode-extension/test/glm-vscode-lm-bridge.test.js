@@ -1878,6 +1878,7 @@ async function nativeProtocolChecks() {
   // NF164: one bounded corrective turn for a non-stage call, then the exact stage
   // tool is accepted; the rejected call must never reach MCP.
   let correctiveTurns = 0;
+  let correctiveNonStageSent = false;
   const correctiveExecutedCalls = [];
   const correctiveModel = {
     capabilities: { toolCalling: true },
@@ -1889,18 +1890,20 @@ async function nativeProtocolChecks() {
       const lastMessage = _messages[_messages.length - 1];
       const lastUserText = lastMessage && lastMessage.role === "user" &&
         typeof lastMessage.content === "string" ? lastMessage.content : "";
-      if (lastUserText.includes("bounded semantic-edit stage")) {
-        return {
-          stream: (async function* stream() {
-            yield {
-              callId: "stage-after-correction",
-              name: "aiworkhub_manager_semantic_edit_stage",
-              input: { operation: "create", file_path: "out/result.json", content: "{}\n" },
-            };
-          }()),
-        };
-      }
-      if (lastUserText.includes("The bounded discovery phase is complete")) {
+      if (lastUserText.includes("The bounded discovery phase is complete")
+          || lastUserText.includes("is still missing")) {
+        if (correctiveNonStageSent) {
+          return {
+            stream: (async function* stream() {
+              yield {
+                callId: "stage-after-correction",
+                name: "aiworkhub_manager_semantic_edit_stage",
+                input: { operation: "create", file_path: "out/result.json", content: "{}\n" },
+              };
+            }()),
+          };
+        }
+        correctiveNonStageSent = true;
         return {
           stream: (async function* stream() {
             yield {
@@ -2140,6 +2143,7 @@ async function nf168ProviderHistoryValidation() {
   // in provider-compatible format (VS Code LanguageModelChatMessage content arrays).
   let retryMessages = null;
   let forceStagedViolationTurns = 0;
+  let nf168NonStageSent = false;
   const historyValidatorModel = {
     capabilities: { toolCalling: true },
     sendRequest: async (_messages, options) => {
@@ -2150,24 +2154,24 @@ async function nf168ProviderHistoryValidation() {
       const lastMessage = _messages[_messages.length - 1];
       const lastUserText = lastMessage && lastMessage.role === "user" &&
         typeof lastMessage.content === "string" ? lastMessage.content : "";
-      if (lastUserText.includes("bounded semantic-edit stage")) {
-        // This is the corrective retry turn — capture the full raw history for inspection.
-        // Shallow-clone each message but retain the original content arrays.
-        retryMessages = _messages.map((msg) => ({
-          role: msg.role,
-          content: msg.content,
-        }));
-        return {
-          stream: (async function* stream() {
-            yield {
-              callId: "stage-after-nf168",
-              name: "aiworkhub_manager_semantic_edit_stage",
-              input: { operation: "create", file_path: "out/result.json", content: "{}\n" },
-            };
-          }()),
-        };
-      }
-      if (lastUserText.includes("The bounded discovery phase is complete")) {
+      if (lastUserText.includes("The bounded discovery phase is complete")
+          || lastUserText.includes("is still missing")) {
+        if (nf168NonStageSent) {
+          retryMessages = _messages.map((msg) => ({
+            role: msg.role,
+            content: msg.content,
+          }));
+          return {
+            stream: (async function* stream() {
+              yield {
+                callId: "stage-after-nf168",
+                name: "aiworkhub_manager_semantic_edit_stage",
+                input: { operation: "create", file_path: "out/result.json", content: "{}\n" },
+              };
+            }()),
+          };
+        }
+        nf168NonStageSent = true;
         return {
           stream: (async function* stream() {
             yield {
@@ -3456,22 +3460,27 @@ async function nf179ForcedStageRecoveryChecks() {
     return last && last.role === "user" && typeof last.content === "string" ? last.content : "";
   };
 
+  let textNonStageSent = false;
   const textInvocations = [];
   const textModel = {
     capabilities: { toolCalling: false },
     sendRequest: async (messages) => {
       const instruction = lastUserText(messages);
       let value;
-      if (instruction.includes("Only aiworkhub_manager_semantic_edit_stage")) {
-        value = toolRequest("aiworkhub_manager_semantic_edit_stage", {
-          operation: "create", file_path: "out/result.json", content: "{}\n",
-        });
-      } else if (instruction.includes("The bounded discovery phase is complete")) {
-        value = toolRequest("aiworkhub_worker_session_current_state", {
-          mode: "focus",
-          query: "forced-stage-corrective",
-          workflow_stage: "implementation",
-        });
+      if (instruction.includes("The bounded discovery phase is complete")
+          || instruction.includes("is still missing")) {
+        if (textNonStageSent) {
+          value = toolRequest("aiworkhub_manager_semantic_edit_stage", {
+            operation: "create", file_path: "out/result.json", content: "{}\n",
+          });
+        } else {
+          textNonStageSent = true;
+          value = toolRequest("aiworkhub_worker_session_current_state", {
+            mode: "focus",
+            query: "forced-stage-corrective",
+            workflow_stage: "implementation",
+          });
+        }
       } else {
         value = toolRequest("aiworkhub_worker_source_graph_query", {
           mode: "focus",
@@ -3517,6 +3526,7 @@ async function nf179ForcedStageRecoveryChecks() {
     /vscode_lm_semantic_edit_stage_required/,
   );
 
+  let nativeWrongNonStageSent = false;
   const nativeWrongStageModel = {
     capabilities: { toolCalling: true },
     sendRequest: async (messages, options) => {
@@ -3524,14 +3534,15 @@ async function nf179ForcedStageRecoveryChecks() {
       if (!Object.prototype.hasOwnProperty.call(options, "tools")) {
         return { stream: (async function* stream() { yield { value: finalResponse }; }()) };
       }
-      if (instruction.includes("bounded discovery phase")) {
+      if (instruction.includes("bounded discovery phase") || instruction.includes("is still missing")) {
+        if (nativeWrongNonStageSent) {
+          return { stream: (async function* stream() {
+            yield { callId: "nf179-native-stage", name: "aiworkhub_manager_semantic_edit_stage", input: { operation: "create", file_path: "out/result.json", content: "{}\n" } };
+          }()) };
+        }
+        nativeWrongNonStageSent = true;
         return { stream: (async function* stream() {
           yield { callId: "nf179-native-wrong", name: "aiworkhub_worker_session_current_state", input: {} };
-        }()) };
-      }
-      if (instruction.includes("Only aiworkhub_manager_semantic_edit_stage")) {
-        return { stream: (async function* stream() {
-          yield { callId: "nf179-native-stage", name: "aiworkhub_manager_semantic_edit_stage", input: { operation: "create", file_path: "out/result.json", content: "{}\n" } };
         }()) };
       }
       return { stream: (async function* stream() {
@@ -3555,26 +3566,29 @@ async function nf179ForcedStageRecoveryChecks() {
 
   const nativeInvocations = [];
   const forcedToolSets = [];
+  let nativeNonStageSent = false;
   const nativeModel = {
     capabilities: { toolCalling: true },
     sendRequest: async (messages, options) => {
       const instruction = lastUserText(messages);
-      if (instruction.includes("bounded discovery phase") && Array.isArray(options.tools)) {
+      if ((instruction.includes("bounded discovery phase") || instruction.includes("is still missing"))
+          && Array.isArray(options.tools)) {
+        if (nativeNonStageSent) {
+          return { stream: (async function* stream() {
+            yield {
+              callId: "nf179-stage",
+              name: "aiworkhub_manager_semantic_edit_stage",
+              input: { operation: "create", file_path: "out/result.json", content: "{}\n" },
+            };
+          }()) };
+        }
+        nativeNonStageSent = true;
         forcedToolSets.push(options.tools.map((tool) => tool.name));
         return { stream: (async function* stream() {
           yield {
             callId: "nf179-corrective",
             name: "aiworkhub_worker_source_graph_query",
             input: { mode: "focus", query: "forced-stage-corrective", workflow_stage: "implementation" },
-          };
-        }()) };
-      }
-      if (instruction.includes("Only aiworkhub_manager_semantic_edit_stage")) {
-        return { stream: (async function* stream() {
-          yield {
-            callId: "nf179-stage",
-            name: "aiworkhub_manager_semantic_edit_stage",
-            input: { operation: "create", file_path: "out/result.json", content: "{}\n" },
           };
         }()) };
       }
@@ -3603,6 +3617,719 @@ async function nf179ForcedStageRecoveryChecks() {
     names.length === 1 && names[0] === "aiworkhub_manager_semantic_edit_stage"));
   assert.ok(!nativeInvocations.some((call) => call.name === "aiworkhub_manager_semantic_edit_stage"));
   assert.ok(!nativeInvocations.some((call) => call.input && call.input.query === "forced-stage-corrective"));
+}
+
+async function nf723StagedFinalizationCompletenessChecks() {
+  const editPath = "src/existing.js";
+  const createPath = "src/created.js";
+  const request = {
+    requestId: "a".repeat(32),
+    request_kind: "worker",
+    prompt: "edit plus create",
+    allowedWrites: ["src/*.js"],
+    required_outputs: [editPath, createPath],
+    path_contracts: {
+      [editPath]: {
+        action: "edit",
+        current_sha256: "a".repeat(64),
+        line_count: 2,
+        parent_existed: true,
+      },
+      [createPath]: {
+        action: "create",
+        current_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        line_count: 0,
+        parent_existed: false,
+      },
+    },
+    initial_source_graph_result: { ok: true, content: "prefetched graph" },
+  };
+  const stageName = "aiworkhub_manager_semantic_edit_stage";
+  const toolRequest = (name, input) => JSON.stringify({
+    schema_id: internals.constants.VSCODE_LM_TOOL_REQUEST_SCHEMA,
+    name,
+    input,
+  });
+  const lastUserText = (messages) => {
+    const last = messages[messages.length - 1];
+    return last && last.role === "user" && typeof last.content === "string" ? last.content : "";
+  };
+  const collector = internals.createVscodeLmStagedEditCollector(request);
+  const partial = await collector.stage({
+    operation: "replace_range",
+    file_path: editPath,
+    start_line: 1,
+    end_line: 1,
+    new: "const edited = true;\n",
+  });
+  assert.strictEqual(partial.ok, true);
+  assert.strictEqual(partial.next_missing_path, createPath);
+  assert.strictEqual(partial.next_missing_action, "create");
+  assert.ok(!Object.prototype.hasOwnProperty.call(partial, "content"));
+  const created = await collector.stage({
+    operation: "create",
+    file_path: createPath,
+    content: "module.exports = {};\n",
+  });
+  assert.strictEqual(created.ok, true);
+  assert.strictEqual(created.next_missing_path, undefined);
+  const finalized = collector.finalize("Applied validated staged semantic edits.");
+  assert.strictEqual(finalized.ok, true);
+  assert.strictEqual(finalized.__finalEnvelope.edits[0].path, editPath);
+  assert.strictEqual(finalized.__finalEnvelope.creates[0].path, createPath);
+
+  const invokeOk = async () => ({ ok: true, content: "graph" });
+  const runText = (model) => internals.runVscodeLmTextProtocol(model, request, undefined, invokeOk);
+  const runNative = (model) => internals.runVscodeLmAgent(model, request, undefined, invokeOk);
+
+  const textTurns = [];
+  let textEditStaged = false;
+  const textSuccess = {
+    capabilities: { toolCalling: false },
+    sendRequest: async (messages) => {
+      const instruction = lastUserText(messages);
+      textTurns.push(instruction);
+      let value;
+      if (instruction.includes("is still missing") && instruction.includes("operation create")) {
+        value = toolRequest(stageName, {
+          operation: "create", file_path: createPath, content: "module.exports = {};\n",
+        });
+      } else if (
+        instruction.includes("is still missing")
+        || instruction.includes("bounded discovery phase")
+        || instruction.includes(`Only ${stageName}`)
+      ) {
+        textEditStaged = true;
+        value = toolRequest(stageName, {
+          operation: "replace_range",
+          file_path: editPath,
+          start_line: 1,
+          end_line: 1,
+          new: "const edited = true;\n",
+        });
+      } else {
+        value = toolRequest("aiworkhub_worker_source_graph_query", {
+          mode: "focus", query: "work", workflow_stage: "implementation",
+        });
+      }
+      return { stream: (async function* stream() { yield { value }; }()) };
+    },
+  };
+  const textResult = JSON.parse(await runText(textSuccess));
+  assert.strictEqual(textResult.edits[0].path, editPath);
+  assert.strictEqual(textResult.creates[0].path, createPath);
+  assert.ok(textEditStaged);
+  const textAfterEdit = textTurns.find((instruction) =>
+    instruction.includes("is still missing") && instruction.includes("operation create"));
+  assert.ok(textAfterEdit, "text protocol must name the missing create after the edit is staged");
+  assert.match(textAfterEdit, /operation create/);
+  assert.ok(!/Output ONLY one final /.test(textAfterEdit));
+  assert.ok(!textTurns.some((instruction) => instruction.includes("The bounded tool/reasoning phase is complete")));
+
+  let textRefuseTurns = 0;
+  let textRefuseEditStaged = false;
+  const textRefuse = {
+    capabilities: { toolCalling: false },
+    sendRequest: async (messages) => {
+      const instruction = lastUserText(messages);
+      let value;
+      if (!textRefuseEditStaged && (
+        instruction.includes("is still missing")
+        || instruction.includes("bounded discovery phase")
+        || instruction.includes(`Only ${stageName}`)
+      )) {
+        textRefuseEditStaged = true;
+        textRefuseTurns += 1;
+        value = toolRequest(stageName, {
+          operation: "replace_range",
+          file_path: editPath,
+          start_line: 1,
+          end_line: 1,
+          new: "const edited = true;\n",
+        });
+      } else {
+        textRefuseTurns += 1;
+        value = toolRequest("aiworkhub_worker_source_graph_query", {
+          mode: "focus", query: `refuse-${textRefuseTurns}`, workflow_stage: "implementation",
+        });
+      }
+      return { stream: (async function* stream() { yield { value }; }()) };
+    },
+  };
+  await assert.rejects(
+    runText(textRefuse),
+    (err) => {
+      const msg = String(err && err.message || err);
+      assert.match(msg, /vscode_lm_semantic_edit_stage_required/);
+      assert.doesNotMatch(msg, /vscode_lm_finalization_limit/);
+      assert.doesNotMatch(msg, /vscode_lm_agent_turn_limit/);
+      return true;
+    },
+  );
+
+  const nativeTurns = [];
+  let nativeEditStaged = false;
+  const nativeSuccess = {
+    capabilities: { toolCalling: true },
+    sendRequest: async (messages, options) => {
+      const instruction = lastUserText(messages);
+      const toolNames = Array.isArray(options.tools) ? options.tools.map((tool) => tool.name) : [];
+      nativeTurns.push({
+        hasTools: Object.prototype.hasOwnProperty.call(options, "tools"),
+        toolNames,
+        toolMode: options.toolMode,
+        instruction,
+      });
+      if (toolNames.length === 1 && toolNames[0] === stageName) {
+        if (!nativeEditStaged) {
+          nativeEditStaged = true;
+          return { stream: (async function* stream() {
+            yield {
+              callId: "nf723-edit",
+              name: stageName,
+              input: {
+                operation: "replace_range",
+                file_path: editPath,
+                start_line: 1,
+                end_line: 1,
+                new: "const edited = true;\n",
+              },
+            };
+          }()) };
+        }
+        return { stream: (async function* stream() {
+          yield {
+            callId: "nf723-create",
+            name: stageName,
+            input: { operation: "create", file_path: createPath, content: "module.exports = {};\n" },
+          };
+        }()) };
+      }
+      return { stream: (async function* stream() {
+        yield {
+          callId: `nf723-sg-${nativeTurns.length}`,
+          name: "aiworkhub_worker_source_graph_query",
+          input: { mode: "focus", query: "work", workflow_stage: "implementation" },
+        };
+      }()) };
+    },
+  };
+  const nativeResult = JSON.parse(await runNative(nativeSuccess));
+  assert.strictEqual(nativeResult.edits[0].path, editPath);
+  assert.strictEqual(nativeResult.creates[0].path, createPath);
+  const nativeAfterEdit = nativeTurns.find((turn) =>
+    turn.hasTools
+    && turn.toolNames.length === 1
+    && turn.toolNames[0] === stageName
+    && nativeEditStaged
+    && turn.instruction.includes(createPath));
+  assert.ok(nativeAfterEdit, "native protocol must keep the stage tool after the required edit");
+  assert.strictEqual(nativeAfterEdit.toolMode, fakeVscode.LanguageModelChatToolMode.Required);
+  assert.match(nativeAfterEdit.instruction, /operation create/);
+  assert.ok(nativeTurns.every((turn) => turn.hasTools));
+  assert.strictEqual(nativeTurns[nativeTurns.length - 1].toolNames[0], stageName);
+
+  let nativeRefuseTurns = 0;
+  let nativeRefuseEditStaged = false;
+  const nativeRefuse = {
+    capabilities: { toolCalling: true },
+    sendRequest: async (_messages, options) => {
+      nativeRefuseTurns += 1;
+      const toolNames = Array.isArray(options.tools) ? options.tools.map((tool) => tool.name) : [];
+      if (toolNames.length === 1 && toolNames[0] === stageName && !nativeRefuseEditStaged) {
+        nativeRefuseEditStaged = true;
+        return { stream: (async function* stream() {
+          yield {
+            callId: "nf723-refuse-edit",
+            name: stageName,
+            input: {
+              operation: "replace_range",
+              file_path: editPath,
+              start_line: 1,
+              end_line: 1,
+              new: "const edited = true;\n",
+            },
+          };
+        }()) };
+      }
+      return { stream: (async function* stream() {
+        yield {
+          callId: `nf723-refuse-sg-${nativeRefuseTurns}`,
+          name: "aiworkhub_worker_source_graph_query",
+          input: { mode: "focus", query: `refuse-${nativeRefuseTurns}`, workflow_stage: "implementation" },
+        };
+      }()) };
+    },
+  };
+  await assert.rejects(
+    runNative(nativeRefuse),
+    (err) => {
+      const msg = String(err && err.message || err);
+      assert.match(msg, /vscode_lm_semantic_edit_stage_required/);
+      assert.doesNotMatch(msg, /vscode_lm_finalization_limit/);
+      assert.doesNotMatch(msg, /vscode_lm_agent_turn_limit/);
+      return true;
+    },
+  );
+
+  let textEarlyCount = 0;
+  let textEarlyEdit = false;
+  const textEarly = {
+    capabilities: { toolCalling: false },
+    sendRequest: async (messages) => {
+      textEarlyCount += 1;
+      const instruction = lastUserText(messages);
+      let value;
+      if (instruction.includes("is still missing") && instruction.includes("operation create")) {
+        value = toolRequest(stageName, {
+          operation: "create", file_path: createPath, content: "module.exports = {};\n",
+        });
+      } else if (
+        instruction.includes("is still missing")
+        || instruction.includes("bounded discovery phase")
+        || instruction.includes(`Only ${stageName}`)
+      ) {
+        textEarlyEdit = true;
+        value = toolRequest(stageName, {
+          operation: "replace_range",
+          file_path: editPath,
+          start_line: 1,
+          end_line: 1,
+          new: "const edited = true;\n",
+        });
+      } else {
+        value = toolRequest("aiworkhub_worker_source_graph_query", {
+          mode: "focus", query: "early", workflow_stage: "implementation",
+        });
+      }
+      return { stream: (async function* stream() { yield { value }; }()) };
+    },
+  };
+  const textEarlyResult = JSON.parse(await runText(textEarly));
+  assert.strictEqual(textEarlyResult.edits[0].path, editPath);
+  assert.strictEqual(textEarlyResult.creates[0].path, createPath);
+  assert.ok(textEarlyEdit);
+  assert.strictEqual(textEarlyCount, 3);
+
+  let nativeEarlyCount = 0;
+  const nativeEarly = {
+    capabilities: { toolCalling: true },
+    sendRequest: async () => {
+      nativeEarlyCount += 1;
+      if (nativeEarlyCount === 1) {
+        return { stream: (async function* stream() {
+          yield {
+            callId: "nf723-early-edit",
+            name: stageName,
+            input: {
+              operation: "replace_range",
+              file_path: editPath,
+              start_line: 1,
+              end_line: 1,
+              new: "const edited = true;\n",
+            },
+          };
+        }()) };
+      }
+      return { stream: (async function* stream() {
+        yield {
+          callId: "nf723-early-create",
+          name: stageName,
+          input: { operation: "create", file_path: createPath, content: "module.exports = {};\n" },
+        };
+      }()) };
+    },
+  };
+  const nativeEarlyResult = JSON.parse(await runNative(nativeEarly));
+  assert.strictEqual(nativeEarlyResult.edits[0].path, editPath);
+  assert.strictEqual(nativeEarlyResult.creates[0].path, createPath);
+  assert.strictEqual(nativeEarlyCount, 2);
+
+  const forcedStageUser = (instruction) =>
+    instruction.includes("is still missing") && !instruction.includes("schema_id");
+  let textForceStage = false;
+  let textProgressEdit = false;
+  let textProgressCreate = false;
+  let textProgressRefusedEdit = false;
+  let textProgressRefusedCreate = false;
+  let textProgressEditCorrection = "";
+  let textProgressCreateCorrection = "";
+  const textProgress = {
+    capabilities: { toolCalling: false },
+    sendRequest: async (messages) => {
+      const instruction = lastUserText(messages);
+      if (forcedStageUser(instruction)) textForceStage = true;
+      let value;
+      if (!textForceStage) {
+        value = toolRequest("aiworkhub_worker_source_graph_query", {
+          mode: "focus", query: "progress", workflow_stage: "implementation",
+        });
+      } else if (textProgressEdit || instruction.includes("operation create")) {
+        if (!textProgressRefusedCreate) {
+          textProgressRefusedCreate = true;
+          value = toolRequest("aiworkhub_worker_source_graph_query", {
+            mode: "focus", query: "refuse-create", workflow_stage: "implementation",
+          });
+        } else {
+          textProgressCreate = true;
+          textProgressCreateCorrection = instruction;
+          value = toolRequest(stageName, {
+            operation: "create", file_path: createPath, content: "module.exports = {};\n",
+          });
+        }
+      } else if (!textProgressRefusedEdit) {
+        textProgressRefusedEdit = true;
+        value = toolRequest("aiworkhub_worker_source_graph_query", {
+          mode: "focus", query: "refuse-edit", workflow_stage: "implementation",
+        });
+      } else {
+        textProgressEdit = true;
+        textProgressEditCorrection = instruction;
+        value = toolRequest(stageName, {
+          operation: "replace_range",
+          file_path: editPath,
+          start_line: 1,
+          end_line: 1,
+          new: "const edited = true;\n",
+        });
+      }
+      return { stream: (async function* stream() { yield { value }; }()) };
+    },
+  };
+  const textProgressResult = JSON.parse(await runText(textProgress));
+  assert.strictEqual(textProgressResult.edits[0].path, editPath);
+  assert.strictEqual(textProgressResult.creates[0].path, createPath);
+  assert.ok(textProgressRefusedEdit && textProgressEdit);
+  assert.ok(textProgressRefusedCreate && textProgressCreate);
+  assert.ok(textProgressEditCorrection.includes(editPath));
+  assert.ok(textProgressEditCorrection.includes("operation replace_range"));
+  assert.ok(textProgressCreateCorrection.includes(createPath));
+  assert.ok(textProgressCreateCorrection.includes("operation create"));
+
+  let nativeProgressTurns = 0;
+  let nativeProgressEdit = false;
+  let nativeProgressCreate = false;
+  let nativeProgressRefusedEdit = false;
+  let nativeProgressRefusedCreate = false;
+  let nativeProgressEditCorrection = "";
+  let nativeProgressCreateCorrection = "";
+  const nativeProgress = {
+    capabilities: { toolCalling: true },
+    sendRequest: async (messages, options) => {
+      nativeProgressTurns += 1;
+      const instruction = lastUserText(messages);
+      const toolNames = Array.isArray(options.tools) ? options.tools.map((tool) => tool.name) : [];
+      const stageOnly = toolNames.length === 1 && toolNames[0] === stageName;
+      if (stageOnly && !nativeProgressEdit) {
+        if (!nativeProgressRefusedEdit) {
+          nativeProgressRefusedEdit = true;
+          return { stream: (async function* stream() {
+            yield {
+              callId: `nf723-progress-refuse-edit-${nativeProgressTurns}`,
+              name: "aiworkhub_worker_source_graph_query",
+              input: { mode: "focus", query: "refuse-edit", workflow_stage: "implementation" },
+            };
+          }()) };
+        }
+        nativeProgressEdit = true;
+        nativeProgressEditCorrection = instruction;
+        return { stream: (async function* stream() {
+          yield {
+            callId: "nf723-progress-edit",
+            name: stageName,
+            input: {
+              operation: "replace_range",
+              file_path: editPath,
+              start_line: 1,
+              end_line: 1,
+              new: "const edited = true;\n",
+            },
+          };
+        }()) };
+      }
+      if (stageOnly) {
+        if (!nativeProgressRefusedCreate) {
+          nativeProgressRefusedCreate = true;
+          return { stream: (async function* stream() {
+            yield {
+              callId: `nf723-progress-refuse-create-${nativeProgressTurns}`,
+              name: "aiworkhub_worker_source_graph_query",
+              input: { mode: "focus", query: "refuse-create", workflow_stage: "implementation" },
+            };
+          }()) };
+        }
+        nativeProgressCreate = true;
+        nativeProgressCreateCorrection = instruction;
+        return { stream: (async function* stream() {
+          yield {
+            callId: "nf723-progress-create",
+            name: stageName,
+            input: { operation: "create", file_path: createPath, content: "module.exports = {};\n" },
+          };
+        }()) };
+      }
+      return { stream: (async function* stream() {
+        yield {
+          callId: `nf723-progress-sg-${nativeProgressTurns}`,
+          name: "aiworkhub_worker_source_graph_query",
+          input: { mode: "focus", query: "progress", workflow_stage: "implementation" },
+        };
+      }()) };
+    },
+  };
+  const nativeProgressResult = JSON.parse(await runNative(nativeProgress));
+  assert.strictEqual(nativeProgressResult.edits[0].path, editPath);
+  assert.strictEqual(nativeProgressResult.creates[0].path, createPath);
+  assert.ok(nativeProgressRefusedEdit && nativeProgressEdit);
+  assert.ok(nativeProgressRefusedCreate && nativeProgressCreate);
+  assert.ok(nativeProgressEditCorrection.includes(editPath));
+  assert.ok(nativeProgressEditCorrection.includes("operation replace_range"));
+  assert.ok(nativeProgressCreateCorrection.includes(createPath));
+  assert.ok(nativeProgressCreateCorrection.includes("operation create"));
+
+  const assertStageRequired = (err) => {
+    const msg = String(err && err.message || err);
+    assert.match(msg, /vscode_lm_semantic_edit_stage_required/);
+    assert.doesNotMatch(msg, /vscode_lm_finalization_limit/);
+    assert.doesNotMatch(msg, /vscode_lm_agent_turn_limit/);
+    return true;
+  };
+  const emptyStream = () => ({ stream: (async function* stream() {})() });
+  const stageEdit = () => toolRequest(stageName, {
+    operation: "replace_range",
+    file_path: editPath,
+    start_line: 1,
+    end_line: 1,
+    new: "const edited = true;\n",
+  });
+  const rejectedCreate = () => toolRequest(stageName, { operation: "create", file_path: createPath });
+  const shouldStageEdit = (instruction, alreadyStaged) => !alreadyStaged && (
+    instruction.includes("is still missing")
+    || instruction.includes("bounded discovery phase")
+    || instruction.includes(`Only ${stageName}`)
+  );
+
+  let textEmptyEditStaged = false;
+  let textEmptyFailedOnce = false;
+  const textEmptyMalformed = {
+    capabilities: { toolCalling: false },
+    sendRequest: async (messages) => {
+      const instruction = lastUserText(messages);
+      if (shouldStageEdit(instruction, textEmptyEditStaged)) {
+        textEmptyEditStaged = true;
+        return { stream: (async function* stream() { yield { value: stageEdit() }; }()) };
+      }
+      if (textEmptyEditStaged && !textEmptyFailedOnce) {
+        textEmptyFailedOnce = true;
+        return emptyStream();
+      }
+      if (textEmptyEditStaged) {
+        return { stream: (async function* stream() { yield { value: "{" }; }()) };
+      }
+      return { stream: (async function* stream() {
+        yield { value: toolRequest("aiworkhub_worker_source_graph_query", {
+          mode: "focus", query: "empty", workflow_stage: "implementation",
+        }) };
+      }()) };
+    },
+  };
+  await assert.rejects(runText(textEmptyMalformed), assertStageRequired);
+
+  let textRejectEditStaged = false;
+  const textRejectedStage = {
+    capabilities: { toolCalling: false },
+    sendRequest: async (messages) => {
+      const instruction = lastUserText(messages);
+      let value;
+      if (shouldStageEdit(instruction, textRejectEditStaged)) {
+        textRejectEditStaged = true;
+        value = stageEdit();
+      } else if (textRejectEditStaged) {
+        value = rejectedCreate();
+      } else {
+        value = toolRequest("aiworkhub_worker_source_graph_query", {
+          mode: "focus", query: "reject", workflow_stage: "implementation",
+        });
+      }
+      return { stream: (async function* stream() { yield { value }; }()) };
+    },
+  };
+  await assert.rejects(runText(textRejectedStage), assertStageRequired);
+
+  let nativeEmptyEditStaged = false;
+  const nativeEmpty = {
+    capabilities: { toolCalling: true },
+    sendRequest: async (_messages, options) => {
+      const toolNames = Array.isArray(options.tools) ? options.tools.map((tool) => tool.name) : [];
+      if (toolNames.length === 1 && toolNames[0] === stageName && !nativeEmptyEditStaged) {
+        nativeEmptyEditStaged = true;
+        return { stream: (async function* stream() {
+          yield {
+            callId: "nf723-empty-edit",
+            name: stageName,
+            input: {
+              operation: "replace_range",
+              file_path: editPath,
+              start_line: 1,
+              end_line: 1,
+              new: "const edited = true;\n",
+            },
+          };
+        }()) };
+      }
+      return emptyStream();
+    },
+  };
+  await assert.rejects(runNative(nativeEmpty), assertStageRequired);
+
+  let nativeRejectEditStaged = false;
+  let nativeRejectTurns = 0;
+  const nativeRejectedStage = {
+    capabilities: { toolCalling: true },
+    sendRequest: async (_messages, options) => {
+      nativeRejectTurns += 1;
+      const toolNames = Array.isArray(options.tools) ? options.tools.map((tool) => tool.name) : [];
+      if (toolNames.length === 1 && toolNames[0] === stageName && !nativeRejectEditStaged) {
+        nativeRejectEditStaged = true;
+        return { stream: (async function* stream() {
+          yield {
+            callId: "nf723-reject-edit",
+            name: stageName,
+            input: {
+              operation: "replace_range",
+              file_path: editPath,
+              start_line: 1,
+              end_line: 1,
+              new: "const edited = true;\n",
+            },
+          };
+        }()) };
+      }
+      if (toolNames.length === 1 && toolNames[0] === stageName) {
+        return { stream: (async function* stream() {
+          yield {
+            callId: `nf723-reject-create-${nativeRejectTurns}`,
+            name: stageName,
+            input: { operation: "create", file_path: createPath },
+          };
+        }()) };
+      }
+      return { stream: (async function* stream() {
+        yield {
+          callId: `nf723-reject-sg-${nativeRejectTurns}`,
+          name: "aiworkhub_worker_source_graph_query",
+          input: { mode: "focus", query: "reject", workflow_stage: "implementation" },
+        };
+      }()) };
+    },
+  };
+  await assert.rejects(runNative(nativeRejectedStage), assertStageRequired);
+
+  let textNonStageEditStaged = false;
+  let textNonStageWrongSent = false;
+  let textNonStageCorrection = "";
+  const textNonStageAfterEdit = {
+    capabilities: { toolCalling: false },
+    sendRequest: async (messages) => {
+      const instruction = lastUserText(messages);
+      if (textNonStageWrongSent && !textNonStageCorrection) textNonStageCorrection = instruction;
+      let value;
+      if (
+        textNonStageWrongSent
+        && instruction.includes("is still missing")
+        && instruction.includes("operation create")
+      ) {
+        value = toolRequest(stageName, {
+          operation: "create", file_path: createPath, content: "module.exports = {};\n",
+        });
+      } else if (shouldStageEdit(instruction, textNonStageEditStaged)) {
+        textNonStageEditStaged = true;
+        value = stageEdit();
+      } else if (textNonStageEditStaged && !textNonStageWrongSent) {
+        textNonStageWrongSent = true;
+        value = toolRequest("aiworkhub_worker_source_graph_query", {
+          mode: "focus", query: "non-stage", workflow_stage: "implementation",
+        });
+      } else {
+        value = toolRequest("aiworkhub_worker_source_graph_query", {
+          mode: "focus", query: "work", workflow_stage: "implementation",
+        });
+      }
+      return { stream: (async function* stream() { yield { value }; }()) };
+    },
+  };
+  const textNonStageResult = JSON.parse(await runText(textNonStageAfterEdit));
+  assert.strictEqual(textNonStageResult.edits[0].path, editPath);
+  assert.strictEqual(textNonStageResult.creates[0].path, createPath);
+  assert.ok(
+    textNonStageCorrection.includes(createPath),
+    "text non-stage correction must name the remaining required path",
+  );
+  assert.match(textNonStageCorrection, /operation create/);
+
+  let nativeNonStageEditStaged = false;
+  let nativeNonStageWrongSent = false;
+  let nativeNonStageCorrection = "";
+  let nativeNonStageTurns = 0;
+  const nativeNonStageAfterEdit = {
+    capabilities: { toolCalling: true },
+    sendRequest: async (messages, options) => {
+      nativeNonStageTurns += 1;
+      const instruction = lastUserText(messages);
+      const toolNames = Array.isArray(options.tools) ? options.tools.map((tool) => tool.name) : [];
+      if (nativeNonStageWrongSent && !nativeNonStageCorrection) nativeNonStageCorrection = instruction;
+      if (toolNames.length === 1 && toolNames[0] === stageName && !nativeNonStageEditStaged) {
+        nativeNonStageEditStaged = true;
+        return { stream: (async function* stream() {
+          yield {
+            callId: "nf723-nonstage-edit",
+            name: stageName,
+            input: {
+              operation: "replace_range",
+              file_path: editPath,
+              start_line: 1,
+              end_line: 1,
+              new: "const edited = true;\n",
+            },
+          };
+        }()) };
+      }
+      if (toolNames.length === 1 && toolNames[0] === stageName && nativeNonStageWrongSent) {
+        return { stream: (async function* stream() {
+          yield {
+            callId: "nf723-nonstage-create",
+            name: stageName,
+            input: { operation: "create", file_path: createPath, content: "module.exports = {};\n" },
+          };
+        }()) };
+      }
+      if (toolNames.length === 1 && toolNames[0] === stageName) {
+        nativeNonStageWrongSent = true;
+        return { stream: (async function* stream() {
+          yield {
+            callId: `nf723-nonstage-wrong-${nativeNonStageTurns}`,
+            name: "aiworkhub_worker_source_graph_query",
+            input: { mode: "focus", query: "non-stage", workflow_stage: "implementation" },
+          };
+        }()) };
+      }
+      return { stream: (async function* stream() {
+        yield {
+          callId: `nf723-nonstage-sg-${nativeNonStageTurns}`,
+          name: "aiworkhub_worker_source_graph_query",
+          input: { mode: "focus", query: "work", workflow_stage: "implementation" },
+        };
+      }()) };
+    },
+  };
+  const nativeNonStageResult = JSON.parse(await runNative(nativeNonStageAfterEdit));
+  assert.strictEqual(nativeNonStageResult.edits[0].path, editPath);
+  assert.strictEqual(nativeNonStageResult.creates[0].path, createPath);
+  assert.ok(
+    nativeNonStageCorrection.includes(createPath),
+    "native non-stage correction must name the remaining required path",
+  );
+  assert.match(nativeNonStageCorrection, /operation create/);
 }
 
 async function main() {
@@ -3670,6 +4397,7 @@ async function main() {
   await nf169ContextlessWorkerNative();
   await nf202600229QualityReviewSubmitBoundaryChecks();
   await nf179ForcedStageRecoveryChecks();
+  await nf723StagedFinalizationCompletenessChecks();
 }
 async function cancellationToolBoundaryChecks() {
   const toolEnvelope = JSON.stringify({

@@ -1,5 +1,17 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.12 — 2026-09-09
+
+### Fixed
+
+- Workforce rows distinguish launch readiness from historical and current
+  route execution evidence, including terminal provider failures.
+- Text and native VS Code LM workers continue bounded semantic staging until
+  every required edit/create is present and identify the exact missing path and
+  action after each correction.
+- Fully staged output finalizes locally without another model turn; repeated
+  refusal ends with a stable semantic-stage error rather than a broad limit.
+
 ## 0.11.11 — 2026-09-09
 
 ### Fixed
