@@ -707,12 +707,18 @@ def test_validation_receipts_can_never_satisfy_the_completion_gate(
 # ---------------------------------------------------------------------------
 
 def test_the_worker_resolver_composes_the_coordinators_own_helpers() -> None:
-    """No duplicate resolution exists to drift from ``run_validations``."""
+    """No duplicate resolution exists to drift from run_validations."""
     source = Path(worker_workspace.__file__).read_text(encoding="utf-8")
 
     assert source.count("def _parse_validation_command_detailed(") == 1
     assert source.count("def _normalize_validation_interpreter_argv(") == 1
     assert source.count("def _normalize_pytest_validation_argv(") == 1
+    assert (
+        source.count(
+            "def _normalize_trusted_validation_executable_argv_with_authority("
+        )
+        == 1
+    )
     assert source.count("def _candidate_pythonpath_components(") == 1
     assert source.count("def resolve_worker_validation_argv(") == 1
 
@@ -726,10 +732,52 @@ def test_the_worker_resolver_composes_the_coordinators_own_helpers() -> None:
         "_normalize_validation_interpreter_argv(",
         "_normalize_pytest_validation_argv(",
         "_candidate_pythonpath_components(",
+        "_normalize_trusted_validation_executable_argv_with_authority(",
     ):
         assert helper in code, helper
     # It must never wrap a second sandbox: the caller is already inside one.
     assert "sandbox_argv" not in code
+
+
+def test_bare_python_validation_uses_the_verified_running_interpreter(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A worker child must never depend on PATH to resolve bare python."""
+    _mute_chmod(monkeypatch)
+    monkeypatch.setenv("PATH", "")
+    worktree = _worktree(tmp_path)
+    (worktree / "emit.py").write_text("print('ok')\n", encoding="utf-8")
+    packet = _packet(tmp_path, validation=["python emit.py"])
+    ctx = _ctx(tmp_path, packet, worktree)
+
+    row = w.validation_run(ctx, index=0)["results"][0]
+
+    assert row["returncode"] == 0
+    assert row["argv"][0] == sys.executable
+    assert row["declared_head"] == "python"
+
+
+def test_bare_python_module_validation_reaches_pytest_without_path_lookup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Pin the exact command shape that stopped the single-writer worker."""
+    _mute_chmod(monkeypatch)
+    monkeypatch.setenv("PATH", "")
+    worktree = _worktree(tmp_path)
+    (worktree / "tests" / "test_ok.py").write_text(
+        "def test_ok():\n    assert True\n", encoding="utf-8"
+    )
+    packet = _packet(
+        tmp_path, validation=["python -m pytest -q tests/test_ok.py"]
+    )
+    ctx = _ctx(tmp_path, packet, worktree)
+
+    row = w.validation_run(ctx, index=0)["results"][0]
+
+    assert row["returncode"] == 0
+    assert Path(row["argv"][0]).is_absolute()
+    assert row["argv"][1:4] == ["-P", "-m", "pytest"]
+    assert row["declared_head"] == "python"
 
 
 def test_create_workspace_seals_the_contract_packet(tmp_path: Path) -> None:

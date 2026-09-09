@@ -6757,20 +6757,22 @@ def resolve_worker_validation_argv(
     """Resolve one declared validation command for IN-SANDBOX worker execution.
 
     This is the coordinator's own resolution, composed from the exact same
-    private helpers ``run_validations`` calls in the same order -- the command
-    tokenizer/env-and-cd splitter (``_parse_validation_command_detailed``), the
-    declared-interpreter resolver (``_normalize_validation_interpreter_argv``),
-    the candidate import-root prepend (``_candidate_pythonpath_components``) and
-    the console-script pytest rewrite (``_normalize_pytest_validation_argv``).
+    private helpers run_validations calls in the same order -- the command
+    tokenizer/env-and-cd splitter (_parse_validation_command_detailed), the
+    declared-interpreter resolver (_normalize_validation_interpreter_argv),
+    the candidate import-root prepend (_candidate_pythonpath_components),
+    the console-script pytest rewrite (_normalize_pytest_validation_argv)
+    and the trusted executable resolver
+    (_normalize_trusted_validation_executable_argv_with_authority).
     Nothing is reimplemented here, so the two paths cannot drift and the
-    ``copied_helpers_have_one_definition`` invariant stays satisfied.
+    copied_helpers_have_one_definition invariant stays satisfied.
 
-    What it deliberately does NOT do is wrap the argv in ``sandbox_argv``.  The
-    caller (``worker_ai_tools_mcp``'s advisory validation tool) already runs
+    What it deliberately does NOT do is wrap the argv in sandbox_argv.  The
+    caller (worker_ai_tools_mcp's advisory validation tool) already runs
     INSIDE the worker's sandbox, where a second Landlock/bubblewrap layer is
     neither possible nor needed: the resolved argv is exactly what that
     worker's own Bash tool could already execute at that moment, so no boundary
-    moves.  The coordinator's post-exit ``run_validations`` -- which does wrap,
+    moves.  The coordinator's post-exit run_validations -- which does wrap,
     and which is the only acceptance evidence -- is untouched by this function.
     """
 
@@ -6785,6 +6787,16 @@ def resolve_worker_validation_argv(
         tokens = _normalize_pytest_validation_argv(tokens)
     if _is_python_validation_command(tokens):
         components = _candidate_pythonpath_components(workspace, components)
+    tokens, _validation_executable_roots, module_interpreter_authority = (
+        _normalize_trusted_validation_executable_argv_with_authority(
+            tokens, workspace.repo
+        )
+    )
+    if module_interpreter_authority is not None:
+        interpreter_authority = {
+            **module_interpreter_authority,
+            "declared": declared_head,
+        }
     return {
         "argv": list(tokens),
         "declared_head": declared_head,
