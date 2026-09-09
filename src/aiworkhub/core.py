@@ -10,6 +10,7 @@ import sqlite3
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections import defaultdict
@@ -6954,36 +6955,90 @@ def _verified_retained_predecessor_receipt(
             ):
                 return None, "reroute_retained_candidate_hash_invalid"
             normalized_hashes[relative] = expected
-        observed_paths = worker_workspace.changed_paths(
-            workspace, git_phase="reroute_retained_candidate"
-        )
     except (OSError, RuntimeError, ValueError, worker_workspace.WorkspaceError):
         return None, "reroute_retained_candidate_workspace_unverifiable"
-    if set(observed_paths) != set(normalized_hashes):
-        return None, "reroute_retained_candidate_changed_paths_mismatch"
 
-    total_content_bytes = 0
-    for relative, expected in normalized_hashes.items():
-        target = workspace.path / relative
+    def verify_candidate(
+        candidate_root: Path, observed_paths: Sequence[str],
+    ) -> str | None:
+        if set(observed_paths) != set(normalized_hashes):
+            return "reroute_retained_candidate_changed_paths_mismatch"
+        total_content_bytes = 0
+        for relative, expected in normalized_hashes.items():
+            target = candidate_root / relative
+            try:
+                worker_workspace._require_beneath(candidate_root, target)
+                if target.is_symlink():
+                    return "reroute_retained_candidate_hash_mismatch"
+                if expected is None:
+                    if target.exists():
+                        return "reroute_retained_candidate_hash_mismatch"
+                    continue
+                if not target.is_file():
+                    return "reroute_retained_candidate_hash_mismatch"
+                total_content_bytes += target.stat().st_size
+                if (
+                    total_content_bytes
+                    > worker_workspace.MAX_REWORK_OVERLAY_CONTENT_BYTES
+                ):
+                    return "reroute_retained_candidate_too_large"
+                observed = hashlib.sha256(target.read_bytes()).hexdigest()
+            except (
+                OSError,
+                RuntimeError,
+                ValueError,
+                worker_workspace.WorkspaceError,
+            ):
+                return "reroute_retained_candidate_hash_mismatch"
+            if not hmac.compare_digest(observed, expected):
+                return "reroute_retained_candidate_hash_mismatch"
+        return None
+
+    if workspace.path.is_symlink():
+        return None, "reroute_retained_candidate_workspace_invalid"
+    if workspace.path.is_dir():
         try:
-            worker_workspace._require_beneath(workspace.path, target)
-            if target.is_symlink():
-                return None, "reroute_retained_candidate_hash_mismatch"
-            if expected is None:
-                if target.exists():
-                    return None, "reroute_retained_candidate_hash_mismatch"
-                continue
-            if not target.is_file():
-                return None, "reroute_retained_candidate_hash_mismatch"
-            size = target.stat().st_size
-            total_content_bytes += size
-            if total_content_bytes > worker_workspace.MAX_REWORK_OVERLAY_CONTENT_BYTES:
-                return None, "reroute_retained_candidate_too_large"
-            observed = hashlib.sha256(target.read_bytes()).hexdigest()
-        except (OSError, RuntimeError, ValueError, worker_workspace.WorkspaceError):
-            return None, "reroute_retained_candidate_hash_mismatch"
-        if not hmac.compare_digest(observed, expected):
-            return None, "reroute_retained_candidate_hash_mismatch"
+            observed_paths = worker_workspace.changed_paths(
+                workspace, git_phase="reroute_retained_candidate"
+            )
+        except (
+            OSError,
+            RuntimeError,
+            ValueError,
+            worker_workspace.WorkspaceError,
+        ):
+            return None, "reroute_retained_candidate_workspace_unverifiable"
+        verification_error = verify_candidate(workspace.path, observed_paths)
+    elif workspace.path.exists():
+        return None, "reroute_retained_candidate_workspace_invalid"
+    else:
+        try:
+            with tempfile.TemporaryDirectory(
+                prefix="aiworkhub-reroute-delta-"
+            ) as temporary:
+                candidate_root = Path(temporary)
+                observed_paths = worker_workspace.materialize_rework_delta_artifact(
+                    artifact=predecessor["delta_artifact"],
+                    authority_repo=authority_repo,
+                    request_id=request_id,
+                    task_id=task_id,
+                    claim_epoch=claim_epoch,
+                    worktree=candidate_root,
+                    expected_path_hashes=normalized_hashes,
+                    allowed_writes=workspace.allowed_writes,
+                )
+                verification_error = verify_candidate(
+                    candidate_root, observed_paths
+                )
+        except (
+            OSError,
+            RuntimeError,
+            ValueError,
+            worker_workspace.WorkspaceError,
+        ):
+            return None, "reroute_retained_candidate_delta_unverified"
+    if verification_error:
+        return None, verification_error
 
     predecessor_digest = hashlib.sha256(
         json.dumps(

@@ -648,6 +648,52 @@ def test_reroute_launch_identity_preserves_retained_candidate_delta(
     assert receipt["retained_predecessor_sha256"] == expected_digest
 
 
+def test_reroute_launch_identity_uses_sealed_delta_after_worktree_retention(
+    coordinator_repo: Path,
+) -> None:
+    task_id = "REROUTE_RETAINED_SEALED_DELTA"
+    content = b"retained candidate\n"
+    predecessor = _retained_predecessor(
+        coordinator_repo, task_id=task_id, content=content
+    )
+    artifact = worker_workspace.seal_rework_delta_artifact(
+        authority_repo=coordinator_repo,
+        task_id=task_id,
+        request_id=predecessor["request_id"],
+        claim_epoch=predecessor["claim_epoch"],
+        file_entries=[("out/result.json", content)],
+        artifact_dir=(
+            worker_workspace.configured_runtime_root(coordinator_repo)
+            / "rework_deltas"
+        ),
+    )
+    predecessor["delta_artifact"] = artifact
+    predecessor["rework_delta"].update(
+        artifact_path=artifact["path"], artifact_sha256=artifact["digest"]
+    )
+    worktree = Path(predecessor["workspace"]["path"])
+    (worktree / "out/result.json").unlink()
+    (worktree / "out").rmdir()
+    worktree.rmdir()
+    _insert_pending_reroutable(
+        coordinator_repo, task_id=task_id, rework_predecessor=predecessor
+    )
+
+    result = core.reroute_launch_identity(
+        task_id,
+        from_runner="claude_sonnet-4.6",
+        to_runner="claude_sonnet-5",
+        to_adapter_id="claude_cli",
+        to_model="sonnet",
+    )
+
+    assert result["ok"] is True, result
+    row = _row(coordinator_repo, task_id)
+    assert row["runner"] == "claude_sonnet-5"
+    card = json.loads(row["card_json"])
+    assert card["rework_predecessor"] == predecessor
+
+
 def test_reroute_launch_identity_rejects_tampered_retained_bytes(
     coordinator_repo: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
