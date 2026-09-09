@@ -3193,6 +3193,10 @@ def _declared_input_file_payload(ctx: WorkerToolContext, relative_path: str) -> 
 
 
 _REWORK_OVERLAY_EXTRACT_OK = frozenset({"ok", "file_evidence_only"})
+_REWORK_OVERLAY_REPAIR_EVIDENCE_STATUS = "parse_error_fail_closed"
+_REWORK_OVERLAY_EVIDENCE_ONLY = _REWORK_OVERLAY_EXTRACT_OK | frozenset({
+    _REWORK_OVERLAY_REPAIR_EVIDENCE_STATUS,
+})
 
 
 def _sealed_rework_overlay_bytes(entry: Mapping[str, Any], relative: str) -> bytes | None:
@@ -3303,6 +3307,7 @@ class _ReworkOverlayView:
     digest_refs: Mapping[str, str] = field(default_factory=dict)
     authorized_sources: Mapping[str, str] = field(default_factory=dict)
     authorized_digests: Mapping[str, str] = field(default_factory=dict)
+    repair_evidence: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
 
 
 def _prepare_rework_overlay_view(
@@ -3346,6 +3351,7 @@ def _prepare_rework_overlay_view(
     digest_refs: dict[str, str] = {}
     authorized_sources: dict[str, str] = {}
     authorized_digests: dict[str, str] = {}
+    repair_evidence: dict[str, Mapping[str, str]] = {}
     snapshot_rows: list[dict[str, str | bool]] = []
     for relative in sorted(entries):
         entry = entries[relative]
@@ -3408,10 +3414,19 @@ def _prepare_rework_overlay_view(
         extraction = _source_graph_ast.extract_file(
             repo_root, resolved, build_revision=build_revision,
         )
-        if extraction.status not in _REWORK_OVERLAY_EXTRACT_OK:
+        if extraction.status not in _REWORK_OVERLAY_EVIDENCE_ONLY:
             raise WorkerToolError(
                 f"rework_overlay_extract_failed:{relative}:{extraction.status}"
             )
+        if extraction.status == _REWORK_OVERLAY_REPAIR_EVIDENCE_STATUS:
+            repair_evidence[relative] = {
+                "path": relative,
+                "pinned_sha256": expected_hash,
+                "observed_sha256": observed_hash,
+                "parse_status": extraction.status,
+                "provenance": "request_scoped_rework_overlay",
+            }
+            continue
         changed[relative] = extraction
 
     snapshot_sha256 = hashlib.sha256(json.dumps(
@@ -3423,6 +3438,7 @@ def _prepare_rework_overlay_view(
     return _ReworkOverlayView(
         changed, frozenset(deleted), snapshot_sha256,
         sealed_sources, digest_refs, authorized_sources, authorized_digests,
+        repair_evidence,
     )
 
 
@@ -3487,12 +3503,12 @@ def _merge_rework_overlay_payload(
 
     if view is None or (
         not view.changed and not view.deleted and not view.digest_refs
-        and not view.authorized_digests
+        and not view.authorized_digests and not view.repair_evidence
     ):
         return payload, False
     shadowed = frozenset((
         *view.changed.keys(), *view.deleted, *view.digest_refs,
-        *view.authorized_digests,
+        *view.authorized_digests, *view.repair_evidence.keys(),
     ))
     merged = _drop_shadowed_source_graph_rows(payload, shadowed)
     if not isinstance(merged, dict):
@@ -3610,6 +3626,32 @@ def _merge_rework_overlay_payload(
             "provenance": "digest_bound_reference",
         })
 
+    for relative, evidence in sorted(view.repair_evidence.items()):
+        if mode == "file":
+            requested = target or query
+            if requested != relative:
+                continue
+        elif mode not in {"focus", "symbols"}:
+            continue
+        elif query_tokens and not all(
+            token in relative.casefold() for token in query_tokens
+        ):
+            continue
+        overlay_matches.append({
+            "file_path": relative,
+            "kind": "file",
+            "name": Path(relative).name,
+            "qualname": relative,
+            "source_hash": evidence["observed_sha256"],
+            "pinned_sha256": evidence["pinned_sha256"],
+            "observed_sha256": evidence["observed_sha256"],
+            "status": "file_evidence_only",
+            "parse_status": evidence["parse_status"],
+            "line_start": 1,
+            "line_end": 1,
+            "provenance": evidence["provenance"],
+        })
+
     overlay_matches.sort(key=lambda row: (
         str(row.get("file_path") or ""),
         int(row.get("line_start") or 0),
@@ -3642,6 +3684,11 @@ def _merge_rework_overlay_payload(
         "digest_bound_paths": sorted(view.digest_refs),
         "authorized_overlay_paths": sorted(view.authorized_digests),
         "authorized_overlay_digests": dict(view.authorized_digests),
+        "repair_evidence_paths": sorted(view.repair_evidence),
+        "repair_evidence": {
+            path: dict(evidence)
+            for path, evidence in sorted(view.repair_evidence.items())
+        },
     }
     if mode in {"body", "function", "class"}:
         merged["freshness"] = "worktree_overlay" if overlay_matches else "no_match"

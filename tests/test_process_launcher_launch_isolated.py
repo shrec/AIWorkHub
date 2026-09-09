@@ -24,8 +24,12 @@ that changing the patched value changes the answer.
 from __future__ import annotations
 
 import ast
+import base64
 import builtins
+import contextlib
+import hashlib
 import inspect
+import json
 import symtable
 from pathlib import Path
 
@@ -273,3 +277,304 @@ def test_patching_a_seam_value_flows_through_into_the_moved_bodys_receipt(
 
     assert result["ok"] is False
     assert marker in result["blocked_reason"]
+
+
+def test_vscode_launch_prefetch_accepts_parse_broken_rework_overlay(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from aiworkhub import source_graph
+    from aiworkhub.repository_state import bootstrap_repository
+    from aiworkhub.worker_workspace import WorkerWorkspace
+
+    authority = tmp_path / "authority"
+    workspace_root = tmp_path / "R-prefetch"
+    workspace = workspace_root / "worktree"
+    home = workspace_root / "home"
+    process_dir = tmp_path / "processes"
+    authority.mkdir()
+    workspace.mkdir(parents=True)
+    home.mkdir()
+    process_dir.mkdir()
+    bootstrap_repository(authority, repo_name="authority")
+    bootstrap_repository(workspace, repo_name="workspace")
+    (authority / "src").mkdir()
+    (workspace / "src").mkdir()
+    (authority / "src/changed.py").write_text(
+        "def canonical_symbol():\n    return 'old'\n",
+        encoding="utf-8",
+    )
+    source_graph.build_index(authority, incremental=False)
+    broken = b"def retained_overlay(:\n    return 'repair me'\n"
+    (workspace / "src/changed.py").write_bytes(broken)
+    digest = hashlib.sha256(broken).hexdigest()
+    packet = {
+        "successor_request_id": "R-prefetch",
+        "successor_task_id": "T-1",
+        "predecessor_request_id": "R-old",
+        "predecessor_task_id": "T-1",
+        "authority_repo": str(authority.resolve()),
+        "files": [
+            {
+                "path": "src/changed.py",
+                "sha256": digest,
+                "content_base64": base64.b64encode(broken).decode("ascii"),
+            }
+        ],
+    }
+    packet["canonical_digest"] = hashlib.sha256(
+        json.dumps(packet, sort_keys=True, ensure_ascii=True).encode("utf-8")
+    ).hexdigest()
+    overlay_path = home / "task_mcp_worker_runtime" / "rework_overlay.json"
+    overlay_path.parent.mkdir()
+    overlay_path.write_text(json.dumps(packet), encoding="utf-8")
+    worker_workspace = WorkerWorkspace(
+        request_id="R-prefetch",
+        repo=authority,
+        path=workspace,
+        home=home,
+        allowed_writes=("src/changed.py",),
+        parent_baseline={},
+        workspace_baseline={},
+    )
+
+    class _LaunchManager(_StubManager):
+        def __init__(self) -> None:
+            super().__init__(authority)
+            self.process_dir = process_dir
+            self._live: dict[str, object] = {}
+            self._lock = contextlib.nullcontext()
+
+        def _preflight_card(
+            self, *_args: object, **_kwargs: object,
+        ) -> dict[str, object]:
+            return {
+                "request_id": "R-prefetch",
+                "allowed_writes": ["src/changed.py"],
+                "project_context": {
+                    "source_graph": {
+                        "mode": "file",
+                        "query": "src/changed.py",
+                        "target": "src/changed.py",
+                        "budget": 16,
+                        "workflow_stage": "orientation",
+                    }
+                },
+            }
+
+        def _with_dependency_inputs(self, card: dict[str, object]) -> dict[str, object]:
+            return dict(card)
+
+        def _resolve_provider_env(
+            self,
+            _adapter_id: str,
+            model: str | None,
+        ) -> tuple[dict[str, str], str | None]:
+            return {}, model
+
+        def _launch_reservation(
+            self, _event: dict[str, object],
+        ) -> contextlib.AbstractContextManager[None]:
+            return contextlib.nullcontext()
+
+        def _terminal_authority_grant_path(self, request_id: str) -> Path:
+            return process_dir / f"{request_id}.authority.json"
+
+        def _terminal_authority_key(self) -> bytes:
+            return b"test-key"
+
+        def _popen(self, *_args: object, **_kwargs: object) -> object:
+            return type("FakeProcess", (), {"pid": 4321})()
+
+        def _monitor(self, _live: object) -> None:
+            return None
+
+    class _Runtime:
+        server_name = "test-worker-mcp"
+        tool_names = ("aiworkhub_worker_source_graph_query",)
+        audit_ledger_path = None
+        audit_hmac_key_path = None
+        claude_mcp_config_path = home / "claude.json"
+        copilot_mcp_config_path = home / "copilot.json"
+        codex_config_toml_path = home / "config.toml"
+        kilo_config_path = home / "kilo.json"
+        package_import_root = tmp_path
+
+    class _TaskEngine:
+        @staticmethod
+        def claim_start_exact(
+            *_args: object,
+            **_kwargs: object,
+        ) -> dict[str, object]:
+            return {"ok": True, "card": {"claim_epoch": 1}}
+
+    class _FakeThread:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            self.args = args
+            self.kwargs = kwargs
+
+        def start(self) -> None:
+            return None
+
+    created: dict[str, object] = {}
+
+    class _BridgeRequest:
+        def __init__(self, request_id: str) -> None:
+            self.request_id = request_id
+
+    class _Bridge:
+        @staticmethod
+        def create_request(**kwargs: object) -> _BridgeRequest:
+            created["kwargs"] = kwargs
+            return _BridgeRequest(str(kwargs["request_id"]))
+
+        @staticmethod
+        def bridge_request_metadata(request: _BridgeRequest) -> dict[str, str]:
+            return {"schema_id": "test.bridge", "request_id": request.request_id}
+
+        @staticmethod
+        def cancel_request(_request: _BridgeRequest) -> None:
+            return None
+
+    monkeypatch.setattr(process_launcher, "launch_gates_open", lambda: True)
+    monkeypatch.setattr(process_launcher, "task_engine", _TaskEngine)
+    monkeypatch.setattr(
+        process_launcher, "_validate_adapter_identity", lambda *_a: None,
+    )
+    monkeypatch.setattr(
+        process_launcher,
+        "validate_workforce_identity",
+        lambda _runner, _adapter_id, model, **_kwargs: model or "test-model",
+    )
+    monkeypatch.setattr(
+        process_launcher, "_memory_launch_admission", lambda: {"admit": True},
+    )
+    monkeypatch.setattr(
+        process_launcher, "_external_readonly_dirs", lambda *_a: [],
+    )
+    monkeypatch.setattr(
+        process_launcher, "_task_authority_repo", lambda *_a: authority,
+    )
+    monkeypatch.setattr(
+        process_launcher, "_launch_project_context", lambda *_a: None,
+    )
+    monkeypatch.setattr(
+        process_launcher, "create_workspace", lambda *_a: worker_workspace,
+    )
+    monkeypatch.setattr(
+        process_launcher, "build_residual_contract_manifest", lambda *_a: [],
+    )
+    monkeypatch.setattr(
+        process_launcher,
+        "_materialize_worker_rework_overlay",
+        lambda *_a, **_kwargs: (overlay_path, packet),
+    )
+    monkeypatch.setattr(
+        process_launcher,
+        "_materialize_crash_retry_packet",
+        lambda *_a, **_kwargs: (None, None),
+    )
+    monkeypatch.setattr(
+        process_launcher,
+        "_provision_worker_mcp_runtime_for_authority",
+        lambda *_a, **_kwargs: _Runtime(),
+    )
+    monkeypatch.setattr(
+        process_launcher,
+        "_worker_mcp_source_graph_targets",
+        lambda _context: ("src/changed.py",),
+    )
+    monkeypatch.setattr(
+        process_launcher, "_worker_mcp_session_topic", lambda *_a: "nf736",
+    )
+    monkeypatch.setattr(
+        process_launcher, "build_worker_prompt", lambda **_kwargs: "prompt",
+    )
+    monkeypatch.setattr(process_launcher, "vscode_lm_bridge", _Bridge)
+    monkeypatch.setattr(
+        process_launcher, "_vscode_lm_worker_env", lambda env, _root: env or {},
+    )
+    monkeypatch.setattr(
+        process_launcher, "worker_launch_env", lambda *_a, **_kwargs: {},
+    )
+    monkeypatch.setattr(
+        process_launcher, "sandbox_argv", lambda _w, _a, argv, **_k: argv,
+    )
+    monkeypatch.setattr(
+        process_launcher, "_worker_launch_cwd", lambda path: str(path),
+    )
+    monkeypatch.setattr(
+        process_launcher,
+        "_worker_supervisor_script",
+        lambda: tmp_path / "supervisor.py",
+    )
+    monkeypatch.setattr(
+        process_launcher, "_touch_0600", lambda path: path.write_text(""),
+    )
+    monkeypatch.setattr(process_launcher, "chmod_path", lambda *_a: None)
+    monkeypatch.setattr(
+        process_launcher,
+        "write_json_0600",
+        lambda path, data: path.write_text(json.dumps(data)),
+    )
+    monkeypatch.setattr(
+        process_launcher,
+        "_write_terminal_authority_grant",
+        lambda *_a, **_k: None,
+    )
+    monkeypatch.setattr(process_launcher, "_pid_start_ticks", lambda _pid: 123)
+    monkeypatch.setattr(
+        process_launcher, "process_group_launch_kwargs", lambda _name: {},
+    )
+    monkeypatch.setattr(process_launcher.threading, "Thread", _FakeThread)
+    monkeypatch.setattr(
+        process_launcher,
+        "_committed_claim_card",
+        lambda claim, **_kwargs: {
+            "request_id": "R-prefetch",
+            "claim_epoch": int(dict(claim["card"])["claim_epoch"]),
+            "allowed_writes": ["src/changed.py"],
+        },
+    )
+
+    manager = _LaunchManager()
+    result = _launch(
+        manager,
+        runner="vscode_lm",
+        adapter_id=process_launcher.runtime_adapters.VSCODE_LM_ADAPTER,
+        topic="nf736",
+        timeout_seconds=30,
+    )
+
+    assert result["ok"] is True
+    assert result["state"] == "running"
+    assert "kwargs" in created
+    bridge_kwargs = dict(created["kwargs"])
+    assert bridge_kwargs["source_graph_request"]["query"] == "src/changed.py"
+    source_graph_result = dict(bridge_kwargs["source_graph_result"])
+    assert source_graph_result["ok"] is True
+    assert source_graph_result["authority_source"] == "rework_overlay"
+    payload = json.loads(str(source_graph_result["content"]))
+    assert payload["matches"] == [
+        {
+            "file_path": "src/changed.py",
+            "kind": "file",
+            "name": "changed.py",
+            "qualname": "src/changed.py",
+            "source_hash": digest,
+            "pinned_sha256": digest,
+            "observed_sha256": digest,
+            "status": "file_evidence_only",
+            "parse_status": "parse_error_fail_closed",
+            "line_start": 1,
+            "line_end": 1,
+            "provenance": "request_scoped_rework_overlay",
+        }
+    ]
+    assert payload["overlay"]["repair_evidence_paths"] == ["src/changed.py"]
+    assert "canonical_symbol" not in str(source_graph_result["content"])
+    blocked_reasons = [str(event.get("blocked_reason") or "") for event in manager.events]
+    assert not any(
+        reason.startswith("vscode_lm_initial_source_graph_prefetch_failed")
+        for reason in blocked_reasons
+    )

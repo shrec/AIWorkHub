@@ -61,10 +61,10 @@ function createRequest(paths = ["tests/new.py"]) {
   };
 }
 
-function finalEnvelope(creates = []) {
+function finalEnvelope(creates = [], summary = "candidate") {
   return JSON.stringify({
     schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
-    summary: "candidate",
+    summary,
     edits: [],
     creates,
   });
@@ -84,6 +84,20 @@ function textResponse(value) {
   return { stream: (async function* stream() { yield { value }; }()) };
 }
 
+function rotatingMissingCreateModel(paths, toolCalling) {
+  let providerTurns = 0;
+  return {
+    get providerTurns() { return providerTurns; },
+    capabilities: { toolCalling },
+    sendRequest: async () => {
+      const presentPath = providerTurns === 0 ? null : paths[(providerTurns - 1) % paths.length];
+      const creates = presentPath ? [{ path: presentPath, content: `VALUE = ${providerTurns}\n` }] : [];
+      providerTurns += 1;
+      return textResponse(finalEnvelope(creates, `candidate ${providerTurns}`));
+    },
+  };
+}
+
 test("text protocol stops on the second identical missing-create rejection", async () => {
   const prompts = [];
   let providerTurns = 0;
@@ -92,7 +106,9 @@ test("text protocol stops on the second identical missing-create rejection", asy
     sendRequest: async (messages) => {
       providerTurns += 1;
       prompts.push(lastUserText(messages));
-      return textResponse(finalEnvelope());
+      return textResponse(
+        `provider prose turn ${providerTurns}\n${finalEnvelope([], `candidate ${providerTurns}`)}`,
+      );
     },
   };
 
@@ -121,7 +137,9 @@ test("tool-call protocol stops on the second identical missing-create rejection"
     sendRequest: async (messages) => {
       providerTurns += 1;
       prompts.push(lastUserText(messages));
-      return textResponse(finalEnvelope());
+      return textResponse(
+        `provider prose turn ${providerTurns}\n${finalEnvelope([], `candidate ${providerTurns}`)}`,
+      );
     },
   };
 
@@ -130,6 +148,7 @@ test("tool-call protocol stops on the second identical missing-create rejection"
     (error) => {
       assert.match(String(error && error.message || error), /vscode_lm_finalization_nonprogress/);
       assert.doesNotMatch(String(error && error.message || error), /vscode_lm_finalization_limit/);
+      assert.strictEqual(error.nonprogressReason, "repeated_missing_required_create");
       assert.strictEqual(error.missingCreatePath, "tests/new.py");
       assert.strictEqual(error.missingCreateAction, "v3_create");
       return true;
@@ -139,6 +158,38 @@ test("tool-call protocol stops on the second identical missing-create rejection"
   assert.strictEqual(providerTurns, 2);
   assert.match(prompts[1], /tests\/new\.py/);
   assert.match(prompts[1], /action v3_create/);
+});
+
+test("text protocol rotating missing-create paths still hit the finalization cap", async () => {
+  const paths = ["tests/rotating-a.py", "tests/rotating-b.py"];
+  const model = rotatingMissingCreateModel(paths, false);
+
+  await assert.rejects(
+    internals.runVscodeLmTextProtocol(model, createRequest(paths), undefined, async () => ({ ok: true })),
+    (error) => {
+      assert.match(String(error && error.message || error), /vscode_lm_finalization_limit/);
+      assert.notStrictEqual(error.nonprogressReason, "repeated_missing_required_create");
+      return true;
+    },
+  );
+
+  assert.ok(model.providerTurns > 2);
+});
+
+test("tool-call protocol rotating missing-create paths still hit the finalization cap", async () => {
+  const paths = ["tests/rotating-a.py", "tests/rotating-b.py"];
+  const model = rotatingMissingCreateModel(paths, true);
+
+  await assert.rejects(
+    internals.runVscodeLmAgent(model, createRequest(paths), undefined, async () => ({ ok: true })),
+    (error) => {
+      assert.match(String(error && error.message || error), /vscode_lm_finalization_limit/);
+      assert.notStrictEqual(error.nonprogressReason, "repeated_missing_required_create");
+      return true;
+    },
+  );
+
+  assert.ok(model.providerTurns > 2);
 });
 
 test("a changed missing-create identity receives a new bounded correction", async () => {

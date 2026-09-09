@@ -177,6 +177,70 @@ def test_empty_or_unchanged_overlay_preserves_canonical_provenance(tmp_path: Pat
     assert empty_result["content"] == unchanged_result["content"]
 
 
+def test_parse_broken_overlay_shadows_canonical_symbols_with_repair_evidence(
+    tmp_path: Path,
+) -> None:
+    authority = tmp_path / "authority"
+    workspace = tmp_path / "workspace"
+    authority.mkdir()
+    workspace.mkdir()
+    bootstrap_repository(authority, repo_name="authority")
+    bootstrap_repository(workspace, repo_name="workspace")
+    _write(authority / "src/changed.py", "def canonical_symbol():\n    return 'old'\n")
+    source_graph.build_index(authority, incremental=False)
+
+    broken = b"def retained_overlay(:\n    return 'repair me'\n"
+    _write(workspace / "src/changed.py", broken.decode("utf-8"))
+    digest = hashlib.sha256(broken).hexdigest()
+    ctx = _ctx(authority, workspace, _packet(authority, [{
+        "path": "src/changed.py",
+        "sha256": digest,
+        "content_base64": base64.b64encode(broken).decode("ascii"),
+    }]))
+
+    canonical = source_graph_query(
+        ctx, mode="function", query="canonical_symbol", target="src/changed.py",
+        workflow_stage="rework", compact_replay=False,
+    )
+    assert canonical["ok"] is True
+    assert canonical["hit_count"] == 0
+    canonical_payload = json.loads(canonical["content"])
+    assert canonical_payload["matches"] == []
+
+    repaired = source_graph_query(
+        ctx, mode="file", query="src/changed.py", target="src/changed.py",
+        workflow_stage="rework", compact_replay=False,
+    )
+    assert repaired["ok"] is True
+    assert repaired["authority_source"] == "rework_overlay"
+    payload = json.loads(repaired["content"])
+    assert payload["matches"] == [{
+        "file_path": "src/changed.py",
+        "kind": "file",
+        "name": "changed.py",
+        "qualname": "src/changed.py",
+        "source_hash": digest,
+        "pinned_sha256": digest,
+        "observed_sha256": digest,
+        "status": "file_evidence_only",
+        "parse_status": "parse_error_fail_closed",
+        "line_start": 1,
+        "line_end": 1,
+        "provenance": "request_scoped_rework_overlay",
+    }]
+    assert payload["overlay"]["changed_paths"] == []
+    assert payload["overlay"]["repair_evidence_paths"] == ["src/changed.py"]
+    assert payload["overlay"]["repair_evidence"] == {
+        "src/changed.py": {
+            "path": "src/changed.py",
+            "pinned_sha256": digest,
+            "observed_sha256": digest,
+            "parse_status": "parse_error_fail_closed",
+            "provenance": "request_scoped_rework_overlay",
+        }
+    }
+
+
 def test_overlay_identity_mismatch_fails_closed(tmp_path: Path) -> None:
     authority = tmp_path / "authority"
     workspace = tmp_path / "workspace"

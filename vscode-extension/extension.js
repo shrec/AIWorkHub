@@ -4037,6 +4037,19 @@ function createVscodeLmStagedEditCollector(request) {
     return null;
   };
 
+  const missingRequiredCreateRejection = () => {
+    const nextMissing = nextMissingRequired();
+    if (!nextMissing || nextMissing.action !== "create") return null;
+    const reason = "missing_required_create";
+    const action = "v3_create";
+    return Object.freeze({
+      reason,
+      path: nextMissing.path,
+      action,
+      identity: `${reason}:${nextMissing.path}:${action}`,
+    });
+  };
+
   const requiredProgress = () => {
     if (!trackRequired) return {};
     const staged = new Set([...edits.keys(), ...creates.keys()]);
@@ -4171,19 +4184,23 @@ function createVscodeLmStagedEditCollector(request) {
   const finalize = (summary) => {
     const progress = requiredProgress();
     if (trackRequired && incompleteFinalizeCount >= 2) {
+      const missingRequiredCreate = missingRequiredCreateRejection();
       return {
         ok: false,
         reason: "semantic_edit_required_outputs_correction_exhausted",
+        ...(missingRequiredCreate ? { missingRequiredCreate } : {}),
         ...progress,
       };
     }
     if (trackRequired && progress.missing_outputs.length > 0) {
       incompleteFinalizeCount += 1;
+      const missingRequiredCreate = missingRequiredCreateRejection();
       return {
         ok: false,
         reason: incompleteFinalizeCount >= 2
           ? "semantic_edit_required_outputs_correction_exhausted"
           : "semantic_edit_required_outputs_incomplete",
+        ...(missingRequiredCreate ? { missingRequiredCreate } : {}),
         ...progress,
       };
     }
@@ -4843,6 +4860,10 @@ async function runVscodeLmTextProtocol(
       forceStagedEdit = false;
       forceFinal = true;
     }
+    if ((forceFinal || finalizationTurns > 0) &&
+        finalizationTurns >= VSCODE_LM_MAX_FINALIZATION_TURNS) {
+      throw vscodeLmProtocolFailure("vscode_lm_finalization_limit", protocolTrace, lastProtocolPreview);
+    }
     if (forceStagedEdit) {
       const nextMissing = vscodeLmNextMissingRequiredOutput(stagedEdits);
       const missingKey = vscodeLmForcedStageMissingKey(nextMissing);
@@ -4859,13 +4880,37 @@ async function runVscodeLmTextProtocol(
       }
     }
     if (forceFinal) {
+      if (finalizationTurns >= VSCODE_LM_MAX_FINALIZATION_TURNS) {
+        throw vscodeLmProtocolFailure("vscode_lm_finalization_limit", protocolTrace, lastProtocolPreview);
+      }
       if (stagedEdits.hasChanges()) {
         const offline = stagedEdits.finalize("Applied validated staged semantic edits.");
         if (offline.ok) return JSON.stringify(offline.__finalEnvelope);
-        protocolTrace.push({ turn, phase: "offline_finalization", outcome: offline.reason });
-      }
-      if (finalizationTurns >= VSCODE_LM_MAX_FINALIZATION_TURNS) {
-        throw vscodeLmProtocolFailure("vscode_lm_finalization_limit", protocolTrace, lastProtocolPreview);
+        const missingCreate = offline.missingRequiredCreate || null;
+        protocolTrace.push({
+          turn,
+          phase: "offline_finalization",
+          outcome: offline.reason,
+          ...(missingCreate ? { rejectionIdentity: missingCreate.identity } : {}),
+        });
+        if (missingCreate) {
+          if (lastMissingCreateRejectionIdentity === missingCreate.identity) {
+            const missingCreateError = vscodeLmProtocolFailure(
+              "vscode_lm_finalization_nonprogress", protocolTrace, lastProtocolPreview,
+            );
+            missingCreateError.nonprogressReason = "repeated_missing_required_create";
+            missingCreateError.missingCreatePath = missingCreate.path;
+            missingCreateError.missingCreateAction = "v3_create";
+            missingCreateError.rejectionIdentity = missingCreate.identity;
+            throw missingCreateError;
+          }
+          lastMissingCreateRejectionIdentity = missingCreate.identity;
+          finalizationTurns += 1;
+          messages.push(vscode.LanguageModelChatMessage.User(
+            vscodeLmMissingRequiredCreateInstruction(missingCreate, request.allowedWrites),
+          ));
+          continue;
+        }
       }
       finalizationTurns += 1;
       messages.push(vscode.LanguageModelChatMessage.User(
@@ -5015,6 +5060,10 @@ async function runVscodeLmTextProtocol(
             missingCreateError.rejectionIdentity = missingCreate.identity;
             throw missingCreateError;
           }
+          if (finalizationTurns >= VSCODE_LM_MAX_FINALIZATION_TURNS) {
+            throw vscodeLmProtocolFailure("vscode_lm_finalization_limit", protocolTrace, lastProtocolPreview);
+          }
+          finalizationTurns += 1;
           lastMissingCreateRejectionIdentity = missingCreate.identity;
           messages.push(vscode.LanguageModelChatMessage.Assistant([languageModelTextPart(text)]));
           messages.push(vscode.LanguageModelChatMessage.User(
@@ -5319,6 +5368,10 @@ async function runVscodeLmAgent(
       forceStagedEdit = false;
       forceFinal = true;
     }
+    if ((forceFinal || finalizationTurns > 0) &&
+        finalizationTurns >= VSCODE_LM_MAX_FINALIZATION_TURNS) {
+      throw vscodeLmProtocolFailure("vscode_lm_finalization_limit", protocolTrace, lastProtocolPreview);
+    }
     if (forceStagedEdit) {
       const nextMissing = vscodeLmNextMissingRequiredOutput(stagedEdits);
       const missingKey = vscodeLmForcedStageMissingKey(nextMissing);
@@ -5338,7 +5391,31 @@ async function runVscodeLmAgent(
       if (stagedEdits.hasChanges()) {
         const offline = stagedEdits.finalize("Applied validated staged semantic edits.");
         if (offline.ok) return JSON.stringify(offline.__finalEnvelope);
-        protocolTrace.push({ turn, phase: "offline_finalization", outcome: offline.reason });
+        const missingCreate = offline.missingRequiredCreate || null;
+        protocolTrace.push({
+          turn,
+          phase: "offline_finalization",
+          outcome: offline.reason,
+          ...(missingCreate ? { rejectionIdentity: missingCreate.identity } : {}),
+        });
+        if (missingCreate) {
+          if (lastMissingCreateRejectionIdentity === missingCreate.identity) {
+            const missingCreateError = vscodeLmProtocolFailure(
+              "vscode_lm_finalization_nonprogress", protocolTrace, lastProtocolPreview,
+            );
+            missingCreateError.nonprogressReason = "repeated_missing_required_create";
+            missingCreateError.missingCreatePath = missingCreate.path;
+            missingCreateError.missingCreateAction = "v3_create";
+            missingCreateError.rejectionIdentity = missingCreate.identity;
+            throw missingCreateError;
+          }
+          lastMissingCreateRejectionIdentity = missingCreate.identity;
+          finalizationTurns += 1;
+          messages.push(vscode.LanguageModelChatMessage.User(
+            vscodeLmMissingRequiredCreateInstruction(missingCreate, request.allowedWrites),
+          ));
+          continue;
+        }
       }
       if (finalizationTurns >= VSCODE_LM_MAX_FINALIZATION_TURNS) {
         throw vscodeLmProtocolFailure("vscode_lm_finalization_limit", protocolTrace, lastProtocolPreview);
@@ -5503,6 +5580,10 @@ async function runVscodeLmAgent(
             missingCreateError.rejectionIdentity = missingCreate.identity;
             throw missingCreateError;
           }
+          if (finalizationTurns >= VSCODE_LM_MAX_FINALIZATION_TURNS) {
+            throw vscodeLmProtocolFailure("vscode_lm_finalization_limit", protocolTrace, lastProtocolPreview);
+          }
+          finalizationTurns += 1;
           lastMissingCreateRejectionIdentity = missingCreate.identity;
           messages.push(vscode.LanguageModelChatMessage.Assistant([languageModelTextPart(text)]));
           messages.push(vscode.LanguageModelChatMessage.User(
