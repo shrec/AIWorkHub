@@ -7106,17 +7106,69 @@ def reroute_launch_identity(
             f"reroute_from_identity_mismatch:expected={card_runner}:got={from_runner}"
         )
 
-    if (to_runner, to_adapter_id) not in process_launcher._CANONICAL_WORKFORCE:
-        return _lifecycle_error(
-            "reroute_target_rejected:workforce_route_absent:"
-            f"runner={to_runner}:adapter={to_adapter_id}"
-        )
-    try:
-        canonical_model = process_launcher.validate_workforce_identity(
-            to_runner, to_adapter_id, to_model, risk_tier=card.get("risk_tier")
-        )
-    except process_launcher.LaunchRejected as exc:
-        return _lifecycle_error(f"reroute_target_rejected:{exc}")
+    static_route = process_launcher._CANONICAL_WORKFORCE.get(
+        (to_runner, to_adapter_id)
+    )
+    if static_route is None:
+        from . import workforce_catalog
+
+        try:
+            catalog = workforce_catalog.build_catalog(repo_root())
+        except Exception as exc:  # noqa: BLE001 - unreadable authority fails closed
+            return _lifecycle_error(
+                "reroute_target_rejected:workforce_catalog_unreadable:"
+                f"{type(exc).__name__}"
+            )
+        route_matches = [
+            route
+            for route in catalog.get("workers") or []
+            if str(route.get("execution_runner") or "") == to_runner
+            and str(route.get("effective_adapter_id") or "") == to_adapter_id
+        ]
+        if len(route_matches) != 1:
+            reason = "workforce_route_absent" if not route_matches else "workforce_route_ambiguous"
+            return _lifecycle_error(
+                f"reroute_target_rejected:{reason}:"
+                f"runner={to_runner}:adapter={to_adapter_id}"
+            )
+        catalog_route = route_matches[0]
+        expected_model = str(catalog_route.get("model") or "").strip()
+        if not expected_model or to_model != expected_model:
+            return _lifecycle_error(
+                "reroute_target_rejected:workforce_model_mismatch:"
+                f"runner={to_runner}:adapter={to_adapter_id}:"
+                f"expected={expected_model}:got={to_model}"
+            )
+        if not catalog_route.get("enabled"):
+            return _lifecycle_error(
+                "reroute_target_rejected:workforce_route_disabled:"
+                f"runner={to_runner}:model={to_model}"
+            )
+        if not catalog_route.get("launch_eligible") or not catalog_route.get("available"):
+            return _lifecycle_error(
+                "reroute_target_rejected:workforce_route_unavailable:"
+                f"runner={to_runner}:model={to_model}"
+            )
+        risk_order = {"low": 0, "medium": 1, "high": 2, "critical": 3}
+        task_risk = str(card.get("risk_tier") or "").strip().lower()
+        max_risk = str(catalog_route.get("max_risk") or "").strip().lower()
+        if (
+            task_risk not in risk_order
+            or max_risk not in risk_order
+            or risk_order[task_risk] > risk_order[max_risk]
+        ):
+            return _lifecycle_error(
+                "reroute_target_rejected:workforce_route_risk_incapable:"
+                f"runner={to_runner}:model={to_model}:risk_tier={task_risk}"
+            )
+        canonical_model = to_model
+    else:
+        try:
+            canonical_model = process_launcher.validate_workforce_identity(
+                to_runner, to_adapter_id, to_model, risk_tier=card.get("risk_tier")
+            )
+        except process_launcher.LaunchRejected as exc:
+            return _lifecycle_error(f"reroute_target_rejected:{exc}")
 
     if to_runner == card_runner:
         return _lifecycle_error("reroute_target_identical_to_source")

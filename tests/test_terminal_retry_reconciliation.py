@@ -17,6 +17,7 @@ from aiworkhub import (
     task_store,
     terminal_failure_classification,
     toolchain_authority,
+    workforce_catalog,
     worker_workspace,
 )
 
@@ -735,6 +736,44 @@ def test_reroute_launch_identity_allows_stub_rework_predecessor_without_delta(
     )
 
     assert result["ok"] is True, result
+
+
+def test_reroute_launch_identity_accepts_available_catalog_route(
+    coordinator_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = "REROUTE_CATALOG_DEEPSEEK"
+    _insert_pending_reroutable(
+        coordinator_repo, task_id=task_id, risk_tier="high"
+    )
+    monkeypatch.setattr(
+        workforce_catalog,
+        "build_catalog",
+        lambda _repo: {
+            "workers": [
+                {
+                    "execution_runner": "deepseek_v4-pro",
+                    "effective_adapter_id": "deepseek_vscode_lm",
+                    "model": "deepseek-v4-pro",
+                    "enabled": True,
+                    "launch_eligible": True,
+                    "available": True,
+                    "max_risk": "high",
+                }
+            ]
+        },
+    )
+
+    result = core.reroute_launch_identity(
+        task_id,
+        from_runner="claude_sonnet-4.6",
+        to_runner="deepseek_v4-pro",
+        to_adapter_id="deepseek_vscode_lm",
+        to_model="deepseek-v4-pro",
+    )
+
+    assert result["ok"] is True, result
+    assert _row(coordinator_repo, task_id)["runner"] == "deepseek_v4-pro"
 
 
 @pytest.mark.parametrize(
