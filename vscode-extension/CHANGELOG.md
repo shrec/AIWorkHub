@@ -1,5 +1,13 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.14 — 2026-09-09
+
+### Fixed
+
+- Retained rework cards no longer fail before worker launch when review
+  evidence names an already-landed system prerequisite outside the card's
+  write scope; the prerequisite remains explicit in the sealed contract.
+
 ## 0.11.13 — 2026-09-09
 
 ### Fixed

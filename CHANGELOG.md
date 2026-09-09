@@ -6,6 +6,14 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.14] - 2026-09-09
+
+### Fixed
+
+- Retained rework now distinguishes worker-editable residual artifacts from
+  out-of-scope system prerequisites. Prerequisites remain in the sealed audit
+  packet, while an actual out-of-scope predecessor change still fails closed.
+
 ## [0.11.13] - 2026-09-09
 
 ### Fixed

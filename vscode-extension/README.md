@@ -12,6 +12,12 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.11.14 — 2026-09-09
+
+- Retained rework keeps out-of-scope system prerequisites as explicit audit
+  context without treating them as worker-editable artifacts, while genuine
+  scope violations continue to fail closed.
+
 ## What's new in 0.11.13 — 2026-09-09
 
 - Editor-hosted reviewers can submit durable verdicts, with route capability

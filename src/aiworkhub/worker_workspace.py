@@ -2624,13 +2624,25 @@ def build_residual_contract_manifest(
     if not isinstance(identities, list) or len(identities) > 256:
         raise WorkspaceError("invalid_residual_identities")
     grouped: dict[str, list[str]] = {}
+    external: list[dict[str, str]] = []
+    predecessor_paths = predecessor.get("changed_path_hashes")
+    if not isinstance(predecessor_paths, dict):
+        predecessor_paths = {}
     for row in identities:
         if not isinstance(row, dict):
             raise WorkspaceError("invalid_residual_identities")
         relative = _relative_repo_path(str(row.get("path") or ""))
         pointer = str(row.get("pointer") or "").strip()
         if not _matches(relative, workspace.allowed_writes):
-            raise WorkspaceError(f"residual_artifact_outside_scope:{relative}")
+            # Review feedback may name an already-landed system prerequisite
+            # outside this card's write scope.  It is audit context, not an
+            # artifact the successor may edit or whose predecessor bytes need
+            # preserving.  A predecessor that actually changed such a path is
+            # still a scope violation and must fail closed.
+            if relative in predecessor_paths:
+                raise WorkspaceError(f"residual_artifact_outside_scope:{relative}")
+            external.append({"path": relative, "pointer": pointer})
+            continue
         grouped.setdefault(relative, []).append(pointer)
     manifest: list[dict[str, Any]] = []
     for relative, pointers in sorted(grouped.items()):
@@ -2654,7 +2666,9 @@ def build_residual_contract_manifest(
     # which is later than ``create_workspace``'s seal -- so it is merged into
     # the already-sealed worker contract packet here rather than guessed there.
     _update_worker_contract_packet(
-        workspace.home, residual_contract_manifest=list(manifest)
+        workspace.home,
+        residual_contract_manifest=list(manifest),
+        external_residual_identities=external,
     )
     return manifest
 
