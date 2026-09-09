@@ -1,5 +1,24 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.19 — 2026-09-09
+
+### Fixed
+
+- Worker, review and rework stages now preserve the authenticated request
+  identity so later stages stay on the same request.
+- Authenticated parse-broken rework prefetch (NF736) loads the retained
+  candidate instead of asking the worker to rediscover it.
+- Bounded missing-create finalization (NF737) stops after one exact
+  correction when the same required create is still missing.
+- VSIX packaging validation stays scratch-contained (NF745) and does not
+  write outside the bounded workspace.
+- The Marketplace landing page is restored as a complete page with the
+  repository screenshot and architecture assets.
+- Root generated `data/` JSONL hygiene (NF573) classifies root `data/` as
+  artifacts and skips root `data/*.jsonl` in untargeted bodygrep before
+  content/result-budget consumption, while targeted queries and nested
+  package data remain available.
+
 ## 0.11.18 — 2026-09-09
 
 ### Fixed

@@ -3,9 +3,11 @@ const fs = require("fs");
 const path = require("path");
 
 const root = path.resolve(__dirname, "..");
-const dist = path.join(root, "dist");
-const staging = path.join(dist, "vsix-staging");
-const extensionDir = path.join(staging, "extension");
+const DEFAULT_DIST = path.join(root, "dist");
+const VALIDATION_SCRATCH_ENV = "AIWORKHUB_VALIDATION_EXEC_SCRATCH_ROOT";
+let dist = DEFAULT_DIST;
+let staging = path.join(dist, "vsix-staging");
+let extensionDir = path.join(staging, "extension");
 
 // Canonical, single source of truth for the bundled Python MCP runtime: the
 // same src/aiworkhub package this repo tests/ships everywhere else. Copied
@@ -16,11 +18,11 @@ const extensionDir = path.join(staging, "extension");
 // McpStdioClient._start(), which points both PYTHONPATH and the child's cwd
 // at this directory.
 const PY_RUNTIME_SRC = path.join(root, "..", "src", "aiworkhub");
-const PY_RUNTIME_DEST = path.join(extensionDir, "runtime", "aiworkhub");
+let PY_RUNTIME_DEST = path.join(extensionDir, "runtime", "aiworkhub");
 const MUX_LAUNCHER_SRC = path.join(root, "..", "scripts", "aiworkhub-app-server-mux");
-const MUX_LAUNCHER_DEST = path.join(extensionDir, "bin", "aiworkhub-app-server-mux");
+let MUX_LAUNCHER_DEST = path.join(extensionDir, "bin", "aiworkhub-app-server-mux");
 const MUX_LAUNCHER_CMD_SRC = path.join(root, "..", "scripts", "aiworkhub-app-server-mux.cmd");
-const MUX_LAUNCHER_CMD_DEST = path.join(extensionDir, "bin", "aiworkhub-app-server-mux.cmd");
+let MUX_LAUNCHER_CMD_DEST = path.join(extensionDir, "bin", "aiworkhub-app-server-mux.cmd");
 const NATIVE_LAUNCHER_SRC = path.join(root, "native-launcher", "main.go");
 const PACKAGE_SOURCE_OVERRIDES = Object.freeze({
   "media/aiworkhub-block-diagram.png": path.join(
@@ -47,6 +49,71 @@ const PACKAGE_JSON_READ_CHUNK_BYTES = 64 * 1024;
 const RELEASE_VERSION = /^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$/;
 const PYTHON_VERSION_LITERAL = /^__version__\s*=\s*["']([^"']+)["']\s*$/gm;
 const EXTENSION_VERSION_LITERAL = /^const EXPECTED_MCP_PACKAGE_VERSION\s*=\s*["']([^"']+)["'];\s*$/gm;
+
+function resolveOutputPath(layout, ...parts) {
+  if (!layout || typeof layout.outputRoot !== "string" || layout.outputRoot === "") {
+    throw new Error("Packaging output root is not resolved");
+  }
+  const resolvedRoot = path.resolve(layout.outputRoot);
+  const candidate = path.resolve(resolvedRoot, ...parts);
+  const prefix = resolvedRoot.endsWith(path.sep) ? resolvedRoot : `${resolvedRoot}${path.sep}`;
+  if (candidate === resolvedRoot || candidate.startsWith(prefix)) {
+    return candidate;
+  }
+  throw new Error(`Packaging path escaped authenticated output root: ${candidate}`);
+}
+
+function layoutForOutputRoot(outputRoot, usesScratch) {
+  const layout = { usesScratch, outputRoot: path.resolve(outputRoot) };
+  layout.staging = resolveOutputPath(layout, "vsix-staging");
+  layout.extensionDir = resolveOutputPath(layout, "vsix-staging", "extension");
+  return layout;
+}
+
+function resolvePackagingLayout(env = process.env) {
+  const raw = env == null ? undefined : env[VALIDATION_SCRATCH_ENV];
+  if (raw == null) {
+    return layoutForOutputRoot(DEFAULT_DIST, false);
+  }
+  const trimmed = String(raw).trim();
+  if (trimmed === "") {
+    return layoutForOutputRoot(DEFAULT_DIST, false);
+  }
+  if (trimmed.includes("\0") || !path.isAbsolute(trimmed)) {
+    throw new Error(
+      `AIWORKHUB_VALIDATION_EXEC_SCRATCH_ROOT must be an existing/creatable absolute directory: ${JSON.stringify(raw)}`,
+    );
+  }
+  const outputRoot = path.resolve(trimmed);
+  try {
+    fs.mkdirSync(outputRoot, { recursive: true });
+    const stat = fs.lstatSync(outputRoot);
+    if (stat.isSymbolicLink() || !stat.isDirectory()) {
+      throw new Error("not a directory");
+    }
+  } catch (error) {
+    throw new Error(
+      `AIWORKHUB_VALIDATION_EXEC_SCRATCH_ROOT must be an existing/creatable absolute directory: ${outputRoot}`,
+    );
+  }
+  return layoutForOutputRoot(outputRoot, true);
+}
+
+function applyPackagingLayout(layout) {
+  dist = layout.outputRoot;
+  staging = layout.staging;
+  extensionDir = layout.extensionDir;
+  PY_RUNTIME_DEST = resolveOutputPath(layout, "vsix-staging", "extension", "runtime", "aiworkhub");
+  MUX_LAUNCHER_DEST = resolveOutputPath(layout, "vsix-staging", "extension", "bin", "aiworkhub-app-server-mux");
+  MUX_LAUNCHER_CMD_DEST = resolveOutputPath(
+    layout,
+    "vsix-staging",
+    "extension",
+    "bin",
+    "aiworkhub-app-server-mux.cmd",
+  );
+  return layout;
+}
 
 function readVersionLiteral(filePath, sourceName, pattern) {
   const source = fs.readFileSync(filePath, "utf8");
@@ -397,7 +464,8 @@ function writePortableZip(sourceDirectory, destination) {
 }
 
 function copyFile(rel, packageSourceText) {
-  const target = path.join(extensionDir, rel);
+  const parts = String(rel).split(/[/\\]/).filter(Boolean);
+  const target = resolveOutputPath({ outputRoot: dist }, "vsix-staging", "extension", ...parts);
   fs.mkdirSync(path.dirname(target), { recursive: true });
   if (rel === "package.json") {
     fs.writeFileSync(target, packageSourceText, "utf8");
@@ -428,11 +496,12 @@ function copyPythonRuntime(srcDir, destDir) {
 }
 
 function buildVsix(packageSnapshot) {
-const pkg = packageSnapshot.json;
-const out = path.join(dist, `${pkg.name}-${pkg.version}.vsix`);
-fs.rmSync(staging, { recursive: true, force: true });
-fs.rmSync(out, { force: true });
-fs.mkdirSync(extensionDir, { recursive: true });
+  const pkg = packageSnapshot.json;
+  const layout = applyPackagingLayout(resolvePackagingLayout(process.env));
+  const out = resolveOutputPath(layout, `${pkg.name}-${pkg.version}.vsix`);
+  fs.rmSync(staging, { recursive: true, force: true });
+  fs.rmSync(out, { force: true });
+  fs.mkdirSync(extensionDir, { recursive: true });
 
 for (const rel of [
   "package.json",
@@ -465,7 +534,7 @@ fs.mkdirSync(path.dirname(MUX_LAUNCHER_DEST), { recursive: true });
 fs.copyFileSync(MUX_LAUNCHER_SRC, MUX_LAUNCHER_DEST);
 fs.copyFileSync(MUX_LAUNCHER_CMD_SRC, MUX_LAUNCHER_CMD_DEST);
 for (const [goarch, folder] of [["amd64", "windows-x86_64"], ["arm64", "windows-aarch64"]]) {
-  const nativeDest = path.join(extensionDir, "bin", folder, "aiworkhub-app-server-mux.exe");
+  const nativeDest = resolveOutputPath(layout, "vsix-staging", "extension", "bin", folder, "aiworkhub-app-server-mux.exe");
   fs.mkdirSync(path.dirname(nativeDest), { recursive: true });
   childProcess.execFileSync("go", ["build", "-trimpath", "-ldflags=-s -w", "-o", nativeDest, NATIVE_LAUNCHER_SRC], {
     cwd: root,
@@ -565,7 +634,11 @@ if (require.main === module) {
 module.exports = {
   MAX_PACKAGE_JSON_BYTES,
   PACKAGE_JSON_READ_CHUNK_BYTES,
+  DEFAULT_DIST,
+  VALIDATION_SCRATCH_ENV,
   assertReleaseVersionConsistency,
   packageWithVersionGate,
   readStableBoundedTextFile,
+  resolveOutputPath,
+  resolvePackagingLayout,
 };

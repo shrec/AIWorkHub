@@ -14,7 +14,10 @@ if (tests.length === 0) {
   console.error("AIWorkHub extension test discovery found no *.test.js files");
   process.exit(1);
 }
-
+if (!tests.includes("package-vsix-scratch.test.js")) {
+  console.error("AIWorkHub extension test discovery missing package-vsix-scratch.test.js");
+  process.exit(1);
+}
 for (const test of tests) {
   const absolute = path.join(testRoot, test);
   const result = spawnSync(process.execPath, [absolute], {

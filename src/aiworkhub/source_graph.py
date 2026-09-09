@@ -757,6 +757,11 @@ def _glob_ignored(relative_path: str, patterns: tuple[str, ...], *, is_dir: bool
     return False
 
 
+def _is_repository_root_generated_data_jsonl(relative_path: str) -> bool:
+    rel = relative_path.replace("\\", "/").strip("/")
+    return rel.startswith("data/") and rel.casefold().endswith(".jsonl")
+
+
 def iter_source_files(repo_root: Path) -> list[Path]:
     repo_root = repo_root.resolve()
     policy = load_ignore_policy(repo_root)
@@ -1168,7 +1173,7 @@ def _index_quality_scorecard(
         "file_path LIKE 'eval/%' OR file_path LIKE 'artifacts/%' OR "
         "file_path LIKE 'coverage/%' OR file_path LIKE 'tmp/%' OR "
         "file_path LIKE '.tmp/%' OR file_path LIKE 'dist/%' OR "
-        "file_path LIKE 'build/%'"
+        "file_path LIKE 'build/%' OR file_path LIKE 'data/%'"
     ).fetchone()[0])
 
     # Each metric is pre-aggregated against ``files`` on its own, single
@@ -1364,7 +1369,7 @@ def _index_quality_scorecard(
             "entities": artifact_entities,
             "total_entities": entity_count,
             "entity_share": round(artifact_ratio, 6) if artifact_ratio is not None else None,
-            "path_families": ["eval", "artifacts", "coverage", "tmp", "dist", "build"],
+            "path_families": ["eval", "artifacts", "coverage", "tmp", "dist", "build", "data"],
         },
         "by_language": by_language,
         "generation_delta": {
@@ -3823,6 +3828,11 @@ def bodygrep_query(
             # this file rather than ending on it, so a cursor still advances.
             oversized_skipped.append(file_path)
             scan_truncated = True
+            continue
+        if (
+            not normalized_target
+            and _is_repository_root_generated_data_jsonl(file_path)
+        ):
             continue
         # A file that would merely overflow the REMAINING budget is ordinary
         # paging: mint a cursor and let the caller continue from it. At least

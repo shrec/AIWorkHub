@@ -4,6 +4,8 @@
 
 # AIWorkHub for VS Code
 
+**Plan. Delegate. Verify. Remember.**
+
 AIWorkHub is a repository-native control plane for multi-model software
 development. It gives every repository an isolated task system, Source Graph,
 durable project context, worker runtime and evidence-first review loop.
@@ -12,96 +14,227 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.11.18 — 2026-09-09
+## What's new in 0.11.19
 
-- Quality reviewers now start from canonical review-ready cards even after
-  state-less wait telemetry is appended, without reopening stale targets.
+- Keep request-identity preservation across worker, review and rework stages
+  so they stay on the same authenticated request.
+- Use authenticated parse-broken rework prefetch to load the retained
+  candidate instead of asking the worker to rediscover it.
+- Apply bounded missing-create finalization so repeated identical missing
+  creates stop after one exact correction.
 
-## What's new in 0.11.17 — 2026-09-09
+Detailed older history stays in the
+[changelog](https://github.com/shrec/AIWorkHub/blob/main/vscode-extension/CHANGELOG.md).
 
-- Repeated missing-file finalization now terminates with a typed non-progress
-  result after one exact `v3_create` correction, while a changed missing path
-  can still continue to completion.
+## Architecture at a glance
 
-## What's new in 0.11.16 — 2026-09-09
+<div align="center">
+  <img src="https://raw.githubusercontent.com/shrec/AIWorkHub/main/docs/assets/aiworkhub-block-diagram.png" alt="AIWorkHub system architecture block diagram" width="100%">
+  <br>
+  <em>The complete AIWorkHub control plane, execution, evidence and improvement loop.</em>
+</div>
 
-- Validation recognizes the exact active Python interpreter in hosted
-  toolcache environments without weakening the refusal of unrelated
-  world-writable executables.
+<div align="center">
+  <img src="https://raw.githubusercontent.com/shrec/AIWorkHub/main/docs/assets/aiworkhub-source-graph-architecture.png" alt="AIWorkHub Source Graph architecture" width="100%">
+  <br>
+  <em>Incremental Source Graph refresh, index, query, semantic-edit and review-overlay paths.</em>
+</div>
 
-## What's new in 0.11.15 — 2026-09-09
+<div align="center">
+  <img src="https://raw.githubusercontent.com/shrec/AIWorkHub/main/docs/assets/demo/aiworkhub-task-review-loop.gif" alt="AIWorkHub task, worker, evidence and review loop" width="100%">
+  <br>
+  <em>Create a bounded task, launch a model worker, inspect its evidence and accept or rework it.</em>
+</div>
 
-- Long code-worker runs that produce no required-output delta now terminate at
-  a bounded, timeout-derived deadline instead of continuing after a warning.
+## Highlights
 
-## What's new in 0.11.14 — 2026-09-09
+- Plan and inspect dependency-aware AI tasks from one operational dashboard.
+- Delegate to supported local model adapters and track real terminal outcomes.
+- Replace repeated raw-source discovery with a repository Source Graph covering
+  exactly 34 language/file families.
+- Send focused code fragments through staged semantic edits and let the local
+  bridge assemble the hash-bound final envelope without model-side full-file
+  regeneration.
+- Use exactly 37 currently exposed bounded Source Graph query modes for
+  symbols, calls, tests, impact, complexity, ownership, hotspots, gaps and
+  task-shaped context bundles.
+- Preserve continuity through Session Manager, AI Memory and KB.
+- Review diffs, tests, logs, artifacts, approval history and deterministic
+  Quality Evidence before acceptance.
+- Run a changed-file Known Bug Scanner across C/C++/CUDA, Python,
+  JavaScript/TypeScript, Go, Java/Kotlin and PHP without treating heuristic
+  warnings as proven failures.
+- Measure whether workers used Source Graph throughout the task through
+  authenticated tool-use receipts and continuous-use telemetry.
+- Keep repositories isolated in separate `.aiworkhub/` authorities.
+- Run on Linux, macOS, native Windows, WSL and Remote-SSH.
 
-- Retained rework keeps out-of-scope system prerequisites as explicit audit
-  context without treating them as worker-editable artifacts, while genuine
-  scope violations continue to fail closed.
+## Operational dashboard
 
-## What's new in 0.11.13 — 2026-09-09
+The retained dashboard combines the task DAG, live worker output, Review
+Inbox, callback health, model readiness, tool-use statistics, storage
+retention, Source Graph coverage and bounded viewers for logs, sessions,
+AI Memory and KB. Settings remain repository-local under `.aiworkhub/`, so a
+multi-window installation does not share task or context authority between
+repositories.
 
-- Editor-hosted reviewers can submit durable verdicts, with route capability
-  telemetry derived from the bridge that actually dispatches the tool.
-- Sandbox validation detects unavailable multiprocessing semaphore support
-  before valid candidates enter a repeated `PermissionError` loop.
-- Kilo/Grok cache and provider-cost telemetry is normalized from real
-  `step-finish` events without summing repeated token snapshots.
-- Claude's deferred-schema instruction remains Claude-only, saving those prompt
-  bytes on Codex, Grok and other worker routes.
+<div align="center">
+  <img src="https://raw.githubusercontent.com/shrec/AIWorkHub/main/docs/assets/screenshots/aiworkhub-self-hosted-dashboard.png" alt="AIWorkHub repository dashboard" width="100%">
+  <br>
+  <em>Tasks, callback health, source coverage, context stores, preflight and evidence in one retained editor tab.</em>
+</div>
 
-## What's new in 0.11.12 — 2026-09-09
+## Get started
 
-- Route telemetry now tells launch readiness, historical evidence, current
-  round-trip observation and provider outcome apart.
-- Multi-output VS Code LM work stays in semantic staging until every required
-  edit/create is complete, then finalizes without another model turn.
-- Corrections name the exact missing path/action and repeated refusal fails with
-  a bounded semantic-stage error.
+1. Install from the Marketplace (or install a release VSIX) and open a Git
+   repository in VS Code.
+2. Run **AIWorkHub: Open Dashboard**.
+3. Select the repository when using a multi-root workspace.
+4. Choose **Initialize AIWorkHub** on first use.
+5. Open a new Codex, Claude or MCP-capable chat after registration so the new
+   runtime tools are discovered by that chat process.
 
-## What's new in 0.11.11 — 2026-09-09
+Initialization is explicit and idempotent. It creates repository-local state
+only under `.aiworkhub/` and starts the first Source Graph index in the
+background.
 
-- Native Codex workers now receive the full role-scoped AIWorkHub tool contract
-  explicitly, including Source Graph, semantic editing and validation.
-- A malformed Codex code-worker tool set fails before launch, and Claude-only
-  deferred-schema instructions are no longer shown to other transports.
+For Claude Code, initialization also maintains the repository-local
+`.mcp.json` server registration and the bounded AIWorkHub block in `CLAUDE.md`.
+Open a **new** Claude chat after initialization or an AIWorkHub upgrade. That
+direct chat is instructed to bootstrap as the manager, call manager Source
+Graph before broad `Read`/`Grep`/`Glob` discovery, and re-query the graph when
+its implementation or validation boundary changes. AIWorkHub-launched task
+processes use the separate worker tool surface.
 
-## What's new in 0.11.10 — 2026-09-09
+## Run your first task
 
-- Retained rework candidates can be rerouted without losing their sealed delta.
-- Worker validation and finalization now use the same trusted Python interpreter,
-  so an empty or restricted PATH no longer strands a valid task.
+AIWorkHub is designed for a manager chat that delegates bounded work instead
+of letting several models edit one checkout without coordination.
 
-## What's new in 0.11.9 — 2026-09-09
+Start a new chat after initialization or upgrade and paste:
 
-- Workers are told which AIWorkHub tool to use instead of each thing they are
-  told not to do, and each transport is told what actually enforces its rules
-  rather than a claim it could disprove in one turn.
-- The raw file editor is no longer handed to workers; the semantic editor does
-  the same job with a hash check. Creating a new file is unaffected.
-- A worker can declare a genuine exception and have it recorded, and how much
-  of a run went through the semantic editor is now measured.
-- A relaunch that cannot come out differently is refused, with the legal moves
-  named.
+```text
+Use AIWorkHub as manager for the currently bound repository. Call
+aiworkhub_manager_bootstrap first; verify repository identity, manager route,
+callback, Source Graph and preflight. Do not edit or launch yet. Report what is
+ready and what is degraded.
+```
 
-## What's new in 0.11.8 — 2026-09-08
+Then describe the desired outcome normally. Ask the manager to create bounded
+cards and launch only independent, dependency-ready, non-colliding cards in
+parallel. The MCP server also presents this lifecycle as a mandatory contract:
+creating a task leaves it `pending`; exact claim plus launch establishes
+`processing`; workers stop at `review_ready`; callbacks wake the current
+verified manager; and only that manager accepts or rejects verified evidence.
 
-- Validation runs work on systems whose Python is a position-independent
-  build, which is most of them. The sandbox filter could not be installed
-  there and the run died without a message.
+1. Check the dashboard header. Repository, MCP, Source Graph and callback
+   state should be ready; **Preflight** explains any unavailable optional
+   model adapters.
+2. Tell the manager what outcome you want. The manager creates a task card
+   with an exact objective, acceptance criteria, allowed writes, validation
+   commands and dependencies.
+3. The manager selects a ready adapter/model and launches the exact card.
+   Workers receive repository-scoped Source Graph, Session, Memory and KB
+   context and work in an isolated task workspace.
+4. Follow **Live Output** or continue other work. Terminal outcomes are durable
+   and the originating manager receives a callback when review is required.
+5. Open the task in **Review**. Inspect the bounded diff, tests, logs,
+   artifacts, tool-use receipts and independent reviewer evidence.
+6. **Accept** promotes the verified change and finalizes the task. **Reject**
+   records exact feedback and creates a bounded residual rather than silently
+   discarding the previous evidence.
 
-## What's new in 0.11.7 — 2026-09-08
+Dependency cards remain pending until their prerequisites finish. Collision
+checks prevent two active workers from owning overlapping write paths.
 
-- Manager startup no longer leaves a background thread running, which made
-  validation runs that fork unstable on smaller machines.
+See the [complete first-run and manager manual](https://github.com/shrec/AIWorkHub/blob/main/docs/GETTING_STARTED.md)
+for copy/paste planning/review prompts, Remote-SSH behavior and recovery after
+an interrupted write acknowledgement.
 
-## What's new in 0.11.6 — 2026-09-08
+## Models and authentication
 
-- Tool Recipes now show real usage: which recipes have actually run, who ran
-  them, and which are registered but never used. The operator recipes ship with
-  the extension, so they work in any repository AIWorkHub manages.
-- Reviewers get the diff and the validation output for the lens they were
-  launched for, and the automatic reviewer launcher works again.
-- A rework worker starts from the failure the previous attempt measured.
-- Manager startup sends its contract once per session instead of on every call.
+AIWorkHub does not proxy credentials or require an AIWorkHub account. It uses
+models already authenticated in the corresponding editor or CLI. The table
+lists observed runner families; Preflight reports which routes are actually
+ready in this window. An optional adapter being unavailable does not block
+otherwise ready models.
+
+| Runner | Typical adapter | Requirement |
+| --- | --- | --- |
+| Codex | Codex CLI or VS Code Language Model | Existing Codex login or one-time VS Code consent |
+| Claude | Claude Code CLI or VS Code Language Model | Existing Claude subscription login or one-time VS Code consent |
+| Copilot-hosted models | VS Code Language Model | GitHub sign-in and one-time model consent |
+| DeepSeek | VS Code Language Model or Copilot CLI fallback | Provider visible in VS Code; fallback uses its own stored credential |
+| GLM 5.3 | VS Code Language Model or Copilot CLI fallback | Provider visible in VS Code; fallback uses its own stored credential |
+| Grok | Observed Kilo/Grok worker route | Existing provider login; Preflight reports whether that route is ready |
+
+## Source Graph and context
+
+Source Graph is an incrementally refreshed structural repository index, not a
+remote Sourcegraph service. It covers exactly 34 language/file families and
+exposes exactly 37 currently exposed bounded Source Graph query modes.
+Managers and workers start with low-token `focus` and `slice` queries, then
+use calls, trace, impact, test mapping or typed bundles only when the task
+needs them. Operations telemetry shows which modes were requested and
+executed, returned evidence, workflow stage, latency, generation and
+inter-call gaps.
+
+Session Manager stores current state and handoffs; AI Memory stores durable
+lessons; KB stores curated project facts; the optional Manager Context Graph
+preserves bounded manager transcript evidence. All are repository-local and
+have bounded viewers in the dashboard.
+
+## Commands
+
+- **AIWorkHub: Open Dashboard** — open or reveal the retained editor tab.
+- **AIWorkHub: Select Repository** — bind the dashboard in a multi-root window.
+- **AIWorkHub: Refresh Dashboard** — refresh the current repository snapshot.
+- **AIWorkHub: Restart MCP Connection** — replace only AIWorkHub's selected
+  repository MCP child.
+
+## Remote development
+
+AIWorkHub is a workspace extension. In Remote-SSH, install it on the remote
+extension host; its packaged Python runtime, MCP child and repository state run
+beside the remote checkout. No port forwarding is required.
+
+## If the dashboard is not ready
+
+- **Connecting:** use **AIWorkHub: Restart MCP Connection** once and inspect
+  the dashboard's last-log row. The extension restarts only its own child.
+- **A model is unavailable:** open Preflight, confirm the provider is installed
+  and grant the one-time VS Code model consent when prompted.
+- **Source Graph is empty:** initialize the repository, enable the required
+  language family in Settings and run a refresh.
+- **A chat cannot see tools:** open a new chat after installation or upgrade so
+  that client performs MCP discovery against the current runtime.
+- **Windows upgraded from an old build:** activation automatically migrates
+  legacy source/version `PYTHONPATH` registrations to a host-stable packaged
+  runtime; no manual `config.toml` edit is required.
+
+## Trust and privacy
+
+- Local stdio transport; no AIWorkHub network listener.
+- Read-only and launch-disabled by default.
+- Repository-specific state, route identity and audit trail.
+- No AIWorkHub telemetry upload of prompts, source, credentials or memories.
+- Explicit manager authority for context writes and task acceptance.
+
+Read the full [Getting Started guide](https://github.com/shrec/AIWorkHub/blob/main/docs/GETTING_STARTED.md),
+[Architecture](https://github.com/shrec/AIWorkHub/blob/main/docs/ARCHITECTURE.md),
+[Source Graph guide](https://github.com/shrec/AIWorkHub/blob/main/docs/SOURCE_GRAPH.md),
+[Manager Context Graph guide](https://github.com/shrec/AIWorkHub/blob/main/docs/CONTEXT_GRAPH.md),
+[Security Policy](https://github.com/shrec/AIWorkHub/blob/main/SECURITY.md) and
+[Product Roadmap](https://github.com/shrec/AIWorkHub/blob/main/docs/PRODUCT_ROADMAP.md).
+
+## Development build
+
+```bash
+npm --prefix vscode-extension install
+npm --prefix vscode-extension test
+npm --prefix vscode-extension run package
+code --install-extension vscode-extension/dist/aiworkhub-*.vsix
+```
+
+AIWorkHub is open source under the
+[MIT License](https://github.com/shrec/AIWorkHub/blob/main/LICENSE).

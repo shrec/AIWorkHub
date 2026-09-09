@@ -301,9 +301,59 @@ assert.ok(fs.existsSync(path.join(root, "media", "aiworkhub-hero.svg")));
 // the editable master; aiworkhub-hero.png is what ships in the README.
 assert.ok(fs.existsSync(path.join(root, "media", "aiworkhub-hero.png")));
 assert.ok(fs.statSync(path.join(root, "media", "aiworkhub-hero.png")).size > 1000);
-assert.ok(read("README.md").includes("media/aiworkhub-hero.png"));
-assert.ok(!/<img[^>]+\.svg/i.test(read("README.md")), "README must not embed an SVG image");
-assert.ok(read("README.md").includes(`What's new in ${pkg.version}`));
+const readme = read("README.md");
+assert.ok(readme.includes("media/aiworkhub-hero.png"));
+assert.ok(!/<img[^>]+\.svg/i.test(readme), "README must not embed an SVG image");
+assert.ok(readme.includes("What's new in 0.11.19"));
+assert.ok(readme.includes("request-identity preservation"));
+assert.ok(readme.includes("authenticated parse-broken rework prefetch"));
+assert.ok(readme.includes("bounded missing-create finalization"));
+for (const heading of [
+  "Architecture at a glance",
+  "Highlights",
+  "Operational dashboard",
+  "Get started",
+  "Run your first task",
+  "Models and authentication",
+  "Source Graph and context",
+  "Commands",
+  "Remote development",
+  "If the dashboard is not ready",
+  "Trust and privacy",
+]) {
+  assert.ok(readme.includes(heading), `README missing section: ${heading}`);
+}
+assert.ok(readme.includes("exactly 34 language/file families"));
+assert.ok(readme.includes("exactly 37 currently exposed bounded Source Graph query modes"));
+assert.ok(readme.includes("GLM 5.3"));
+for (const runner of ["Codex", "Claude", "Copilot-hosted models", "DeepSeek", "GLM 5.3", "Grok"]) {
+  assert.ok(readme.includes(runner), `README missing runner: ${runner}`);
+}
+assert.ok(readme.includes("docs/GETTING_STARTED.md"));
+assert.ok(readme.includes("docs/ARCHITECTURE.md"));
+assert.ok(readme.includes("docs/SOURCE_GRAPH.md"));
+assert.ok(readme.includes("SECURITY.md"));
+absent(readme, ["0.10.62", "31-mode", "48-mode", "31 bounded", "GLM 5.2"], "stale marketplace capability claim");
+const repoRoot = path.resolve(root, "..");
+const rasterAssets = [
+  ["vscode-extension/media/aiworkhub-hero.png", "https://raw.githubusercontent.com/shrec/AIWorkHub/main/vscode-extension/media/aiworkhub-hero.png"],
+  ["docs/assets/aiworkhub-block-diagram.png", "https://raw.githubusercontent.com/shrec/AIWorkHub/main/docs/assets/aiworkhub-block-diagram.png"],
+  ["docs/assets/aiworkhub-source-graph-architecture.png", "https://raw.githubusercontent.com/shrec/AIWorkHub/main/docs/assets/aiworkhub-source-graph-architecture.png"],
+  ["docs/assets/demo/aiworkhub-task-review-loop.gif", "https://raw.githubusercontent.com/shrec/AIWorkHub/main/docs/assets/demo/aiworkhub-task-review-loop.gif"],
+  ["docs/assets/screenshots/aiworkhub-self-hosted-dashboard.png", "https://raw.githubusercontent.com/shrec/AIWorkHub/main/docs/assets/screenshots/aiworkhub-self-hosted-dashboard.png"],
+];
+for (const [rel, url] of rasterAssets) {
+  assert.ok(readme.includes(url), `README missing raster URL: ${url}`);
+  const assetPath = path.join(repoRoot, rel);
+  assert.ok(fs.existsSync(assetPath), `missing local raster asset: ${rel}`);
+  assert.ok(fs.statSync(assetPath).size > 1000, `tiny raster asset: ${rel}`);
+}
+const imgSrcs = [...readme.matchAll(/<img\b[^>]*\bsrc="([^"]+)"/gi)].map((match) => match[1]);
+assert.strictEqual(imgSrcs.length, 5);
+for (const src of imgSrcs) {
+  assert.ok(src.startsWith("https://"), `Marketplace image must use HTTPS: ${src}`);
+  assert.ok(!src.toLowerCase().includes(".svg"), `embedded SVG: ${src}`);
+}
 assert.ok(read("CHANGELOG.md").includes(`## ${pkg.version} —`));
 assert.ok(activityIcon.includes('aria-label="AIWorkHub"'));
 assert.ok(activityIcon.includes('stroke="currentColor"'));
