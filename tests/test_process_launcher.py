@@ -10100,10 +10100,12 @@ def test_quality_review_packet_binding_carries_explicit_target_inputs(
     card.update(
         {
             "claim_epoch": 1,
+            "terminal_substatus": "review_ready",
             "allowed_writes": ["src/changed.py"],
             "read_first": ["README.md", "src/changed.py"],
             "immutable_inputs": ["docs/SOURCE_GRAPH.md"],
             "terminal_review": {
+                "substatus": "review_ready",
                 "evidence": {
                     "workspace": workspace.as_metadata(),
                     "changed_path_hashes": changed_hashes,
@@ -10122,6 +10124,15 @@ def test_quality_review_packet_binding_carries_explicit_target_inputs(
             "topic": "code",
             "adapter_id": "worker_adapter",
             "state": "review_ready",
+        }
+    )
+    manager._append_event(
+        {
+            "request_id": request_id,
+            "task_id": "TARGET_TASK",
+            "runner": "review_orchestrator",
+            "topic": "quality_review_wait",
+            "phase": "reviewer_slot_wait",
         }
     )
     monkeypatch.setenv("AIWORKHUB_WORKTREE_ROOT", str(tmp_path / "worktrees"))
@@ -10158,6 +10169,8 @@ def test_quality_review_packet_binding_carries_explicit_target_inputs(
 
     assert result["ok"] is True, result
     prepared = result["prepared"]
+    assert prepared["worker_adapter_id"] == "worker_adapter"
+    assert packet_kwargs["worker_provider"] == "worker_adapter"
     assert prepared["read_only_input_paths"] == [
         "README.md",
         "docs/SOURCE_GRAPH.md",
@@ -10175,6 +10188,48 @@ def test_quality_review_packet_binding_carries_explicit_target_inputs(
     assert prepared["packet"]["packet_sha256"] == (
         process_launcher.quality_reviewer._canonical_digest(packet_body)
     )
+
+
+def test_quality_review_packet_rejects_stale_ready_event_after_card_leaves_review(
+    tmp_path: Path,
+) -> None:
+    request_id = "f" * 32
+    card = _card(task_id="TARGET_TASK", state="blocked")
+    manager = _manager(
+        tmp_path,
+        show_task=_show(lambda: card),
+        argv=[sys.executable, "-c", "pass"],
+    )
+    manager._append_event(
+        {
+            "request_id": request_id,
+            "task_id": "TARGET_TASK",
+            "runner": "worker",
+            "topic": "code",
+            "adapter_id": "worker_adapter",
+            "state": "review_ready",
+        }
+    )
+    manager._append_event(
+        {
+            "request_id": request_id,
+            "task_id": "TARGET_TASK",
+            "runner": "review_orchestrator",
+            "topic": "quality_review_wait",
+            "phase": "reviewer_slot_wait",
+        }
+    )
+
+    result = manager._build_quality_review_packet(request_id, "TARGET_TASK")
+
+    assert result == {
+        "ok": False,
+        "error": "quality_review_target_not_review_ready",
+        "state": None,
+        "card_status": "blocked",
+        "card_worker_status": "unclaimed",
+        "card_terminal_substatus": None,
+    }
 
 
 def test_verified_quality_review_receipt_ingests_jsonl_once_across_retry(

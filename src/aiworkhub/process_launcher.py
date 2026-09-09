@@ -7596,12 +7596,15 @@ class ProcessManager:
         latest = events[-1]
         if str(latest.get("task_id") or "") != target_task_id:
             return {"ok": False, "error": "quality_review_target_identity_mismatch"}
-        if str(latest.get("state") or "") != "review_ready":
-            return {
-                "ok": False,
-                "error": "quality_review_target_not_review_ready",
-                "state": latest.get("state"),
-            }
+        review_ready_event = next(
+            (
+                event
+                for event in reversed(events)
+                if str(event.get("task_id") or "") == target_task_id
+                and str(event.get("state") or "") == "review_ready"
+            ),
+            None,
+        )
         mark("target_events_loaded")
         try:
             try:
@@ -7617,6 +7620,20 @@ class ProcessManager:
                     ) from exc
                 raise
             card = _parse_card(target_envelope, target_task_id)
+            card_review_ready = (
+                str(card.get("status") or "") == "review"
+                and str(card.get("worker_status") or "") == "review"
+                and str(card.get("terminal_substatus") or "") == "review_ready"
+            )
+            if review_ready_event is None or not card_review_ready:
+                return {
+                    "ok": False,
+                    "error": "quality_review_target_not_review_ready",
+                    "state": latest.get("state"),
+                    "card_status": card.get("status"),
+                    "card_worker_status": card.get("worker_status"),
+                    "card_terminal_substatus": card.get("terminal_substatus"),
+                }
             terminal = card.get("terminal_review") or {}
             evidence = terminal.get("evidence") or {}
             workspace = WorkerWorkspace.from_metadata(dict(evidence["workspace"]))
@@ -7644,9 +7661,9 @@ class ProcessManager:
                 task_id=target_task_id,
                 packet_seed=target_request_id,
                 created_at=str(
-                    latest.get("at")
-                    or latest.get("updated_at")
-                    or latest.get("finished_at")
+                    review_ready_event.get("at")
+                    or review_ready_event.get("updated_at")
+                    or review_ready_event.get("finished_at")
                     or target_request_id
                 ),
                 changed_path_hashes=current_hashes,
@@ -7687,7 +7704,11 @@ class ProcessManager:
                 request_id=target_request_id,
                 task_id=target_task_id,
                 claim_epoch=target_claim_epoch,
-                worker_provider=str(latest.get("adapter_id") or latest.get("runner") or ""),
+                worker_provider=str(
+                    review_ready_event.get("adapter_id")
+                    or review_ready_event.get("runner")
+                    or ""
+                ),
                 changed_path_hashes=current_hashes,
                 objective=str(card.get("objective") or ""),
                 acceptance=card.get("acceptance") or [],
@@ -7732,7 +7753,7 @@ class ProcessManager:
 
         mark("packet_built")
         prepared = {
-            "worker_adapter_id": str(latest.get("adapter_id") or ""),
+            "worker_adapter_id": str(review_ready_event.get("adapter_id") or ""),
             "workspace": workspace,
             "changed_hashes": dict(current_hashes),
             "read_only_input_paths": read_only_input_paths,
