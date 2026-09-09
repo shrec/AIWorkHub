@@ -121,6 +121,30 @@ def test_launch_waits_until_target_is_ready_then_launches_once(tmp_path: Path) -
     assert len(manager.launches) == 1
 
 
+def test_launch_accepts_canonical_review_ready_card_when_process_state_is_absent(
+    tmp_path: Path,
+) -> None:
+    manager = _Manager(tmp_path)
+    manager.target_status = _target_status(
+        status="review",
+        worker_status="review",
+        terminal_substatus="review_ready",
+    )
+    manager.target_status["state"] = None
+    driver = review_orchestrator.ReviewOrchestrator(
+        manager, db_path=tmp_path / "review.sqlite", route_selector=_route
+    )
+    driver.ensure_chain(
+        target_task_id="TARGET", target_request_id="target-request", claim_epoch=1,
+        packet_sha256="a" * 64, candidate_sha256="b" * 64, now=NOW,
+    )
+
+    launched = driver.drain(max_actions=1, now=NOW)
+
+    assert launched.completed == 1
+    assert len(manager.launches) == 1
+
+
 def test_launch_rejects_identity_mismatch_and_empty_partition(tmp_path: Path) -> None:
     manager = _Manager(tmp_path)
     manager.target_status = _target_status(candidate_sha256="c" * 64)

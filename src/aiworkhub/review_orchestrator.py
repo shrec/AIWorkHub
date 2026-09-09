@@ -1473,7 +1473,13 @@ class ReviewOrchestrator:
             return self._readiness_receipt(action, "terminal", "target_packet_identity_invalid")
         if observed["candidate_sha256"] != str(identity["candidate_sha256"]):
             return self._readiness_receipt(action, "terminal", "target_candidate_identity_invalid")
-        if str(status.get("state") or "") != "review_ready":
+        process_review_ready = str(status.get("state") or "") == "review_ready"
+        card_review_ready = (
+            str(card.get("status") or "") == "review"
+            and str(card.get("worker_status") or "") == "review"
+            and str(card.get("terminal_substatus") or "") == "review_ready"
+        )
+        if not process_review_ready and not card_review_ready:
             return self._readiness_receipt(action, "deferred", "target_not_review_ready")
         # Every immutable identity above has matched and the card is genuinely
         # at review_ready, so its deterministic verdict is about THIS claim of
