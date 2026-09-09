@@ -774,7 +774,7 @@ def test_bare_python_module_validation_reaches_pytest_without_path_lookup(
 
     row = w.validation_run(ctx, index=0)["results"][0]
 
-    assert row["returncode"] == 0, row
+    assert row["returncode"] == 0, row.get("reason")
     assert Path(row["argv"][0]).is_absolute()
     assert row["argv"][1:4] == ["-P", "-m", "pytest"]
     assert row["declared_head"] == "python"
