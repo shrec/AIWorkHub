@@ -1,5 +1,14 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.10 — 2026-09-09
+
+### Fixed
+
+- A pending retry with a retained rework delta can be rerouted to an available
+  workforce route without discarding the candidate.
+- Bare Python validation commands resolve to the trusted canonical interpreter
+  before the worker sandbox runs them, matching coordinator finalization.
+
 ## 0.11.9 — 2026-09-09
 
 ### Added

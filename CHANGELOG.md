@@ -6,6 +6,16 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.10] - 2026-09-09
+
+### Fixed
+
+- Pending retries can be rerouted through a workforce-catalog route even when the
+  task carries a retained rework delta; the sealed candidate remains preserved.
+- Worker-side validation now resolves bare `python` and `python -m` commands to
+  the same trusted canonical interpreter as finalization, including isolated
+  `-P -m` module execution.
+
 ## [0.11.9] - 2026-09-09
 
 ### Added

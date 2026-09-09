@@ -12,6 +12,12 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.11.10 — 2026-09-09
+
+- Retained rework candidates can be rerouted without losing their sealed delta.
+- Worker validation and finalization now use the same trusted Python interpreter,
+  so an empty or restricted PATH no longer strands a valid task.
+
 ## What's new in 0.11.9 — 2026-09-09
 
 - Workers are told which AIWorkHub tool to use instead of each thing they are
