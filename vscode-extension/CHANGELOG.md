@@ -1,5 +1,14 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.16 — 2026-09-09
+
+### Fixed
+
+- Python module validations no longer fail solely because the exact running
+  interpreter comes from a hosted toolcache with permissive file mode; the
+  trust exception remains identity-bound and other world-writable targets are
+  still rejected.
+
 ## 0.11.15 — 2026-09-09
 
 ### Fixed

@@ -12,6 +12,12 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.11.16 — 2026-09-09
+
+- Validation recognizes the exact active Python interpreter in hosted
+  toolcache environments without weakening the refusal of unrelated
+  world-writable executables.
+
 ## What's new in 0.11.15 — 2026-09-09
 
 - Long code-worker runs that produce no required-output delta now terminate at

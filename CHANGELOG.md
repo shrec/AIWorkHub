@@ -6,6 +6,15 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.16] - 2026-09-09
+
+### Fixed
+
+- Module-form validation now accepts the exact interpreter already running
+  AIWorkHub when a hosted toolcache exposes that same endpoint as
+  world-writable. Arbitrary world-writable executables remain refused, and
+  failed validation rows now retain the resolver reason for CI diagnosis.
+
 ## [0.11.15] - 2026-09-09
 
 ### Fixed

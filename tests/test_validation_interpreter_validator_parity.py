@@ -527,6 +527,33 @@ def test_module_symlink_to_world_writable_target_is_refused(
         )
 
 
+@posix_layout
+def test_exact_running_interpreter_identity_accepts_hosted_toolcache_mode(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A hosted toolcache may expose the already-running interpreter as 0777.
+
+    Only the exact ``sys.executable`` execution path and resolved endpoint inherit
+    that process authority; the arbitrary world-writable target above stays red.
+    """
+    root = tmp_path / ".venv"
+    (root / "bin").mkdir(parents=True)
+    endpoint = _runtime_executable(tmp_path / "toolcache", "python3.12")
+    os.chmod(endpoint, 0o777)
+    candidate = root / "bin" / "python"
+    os.symlink(endpoint, candidate)
+    _pin_root(monkeypatch, root)
+    _force_module_present(monkeypatch)
+    monkeypatch.setattr(worker_workspace.sys, "executable", str(candidate))
+
+    tokens, roots, _authority = worker_workspace._resolve_module_validator_argv(
+        ["python", "-m", "mypy", "src"], tmp_path
+    )
+
+    assert tokens[:4] == [str(candidate), "-P", "-m", "mypy"]
+    assert roots == (root.resolve(),)
+
+
 def test_windows_python_exe_is_recognised_as_module_form() -> None:
     """REWORK LOW: the Windows ``python.exe`` spelling is recognised as the ``-m``
     module form (the ``.exe`` suffix is accepted case-insensitively) exactly as the

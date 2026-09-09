@@ -7059,7 +7059,10 @@ def _resolve_trusted_validation_root_interpreter(
     a root-owned executable anywhere else is refused) or one that is world-writable
     is an escalation on any real venv layout -- so those two checks run on the
     resolved file, exactly as ``_trusted_validation_executable_from_resolved`` runs
-    them, and the owner refusal thereby matches the bare form's. Security
+    them, and the owner refusal thereby matches the bare form's. The sole mode
+    exception is the exact execution path and endpoint of ``sys.executable``:
+    that interpreter is already the authenticated authority running this process,
+    including hosted toolcache layouts whose base binary is mode 0777. Security
     is decided by what the symlink POINTS AT (the resolved target, checked here);
     BEHAVIOUR is decided by what is EXECUTED, so the UNRESOLVED ``candidate`` is
     what is returned: a venv is activated only by executing its own ``bin/python``,
@@ -7140,7 +7143,18 @@ def _resolve_trusted_validation_root_interpreter(
             raise WorkspaceError(
                 f"validation_executable_untrusted_owner:{resolved}"
             )
-        if posix_path_modes_supported(os.name) and stat.S_IMODE(target_info.st_mode) & 0o002:
+        try:
+            authenticated_running_interpreter = (
+                candidate.absolute() == Path(sys.executable).absolute()
+                and resolved == Path(sys.executable).resolve(strict=True)
+            )
+        except OSError:
+            authenticated_running_interpreter = False
+        if (
+            posix_path_modes_supported(os.name)
+            and stat.S_IMODE(target_info.st_mode) & 0o002
+            and not authenticated_running_interpreter
+        ):
             raise WorkspaceError(
                 f"validation_executable_world_writable:{resolved}"
             )
