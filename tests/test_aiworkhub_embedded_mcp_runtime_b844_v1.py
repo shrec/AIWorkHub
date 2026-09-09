@@ -336,12 +336,15 @@ def test_stdlib_fallback_task_create_then_show_uses_binary_utf8_for_georgian(
     title = "ქართული სათაური"
     objective = "ქართული ამოცანის შექმნა და იმავე ტრანსპორტზე წაკითხვა"
     card: dict[str, object] = {}
+    card_created = threading.Event()
 
     def fake_create_task(**kwargs):
         card.update(kwargs)
+        card_created.set()
         return {"ok": True, "created": True, "task_id": kwargs["task_id"], **kwargs}
 
     def fake_show_task(requested_task_id, *, full=False):
+        assert card_created.wait(timeout=5), "create request did not complete"
         assert requested_task_id == task_id
         assert full is False
         return {"ok": True, "task_id": requested_task_id, "card": dict(card)}
@@ -406,9 +409,10 @@ def test_stdlib_fallback_task_create_then_show_uses_binary_utf8_for_georgian(
         json.loads(line.decode("utf-8"))
         for line in stdout_bytes.getvalue().splitlines()
     ]
-    assert [response["id"] for response in responses] == [1, 2]
-    assert responses[0]["result"]["structuredContent"]["title"] == title
-    shown = responses[1]["result"]["structuredContent"]
+    responses_by_id = {response["id"]: response for response in responses}
+    assert sorted(responses_by_id) == [1, 2]
+    assert responses_by_id[1]["result"]["structuredContent"]["title"] == title
+    shown = responses_by_id[2]["result"]["structuredContent"]
     assert shown["card"]["objective"] == objective
 
 
