@@ -320,7 +320,7 @@ MANAGER_CONTEXT_GRAPH_TOOL_NAMES: tuple[str, ...] = (
 # load them through ToolSearch; audit worker_prompt-4 measured 347 ToolSearch
 # calls in 192 claude runs, half of them keyword searches and 26% misses, all
 # re-discovering this static list. The exact one-shot select string is
-# rendered into WORKER_RUNTIME_POLICY so a run needs at most one call.
+# rendered only for claude_cli so Codex is never told to call ToolSearch.
 WORKER_MCP_SERVER_NAME = "aiworkhub_worker_ai_tools"
 # The exact schemas a build worker needs in hand before its first action:
 # discovery, the two semantic-edit steps, the bounded validation runner and the
@@ -338,6 +338,12 @@ WORKER_CLAUDE_PRELOADED_TOOLS: tuple[str, ...] = (
 )
 WORKER_CLAUDE_TOOL_SCHEMA_QUERY = "select:" + ",".join(
     f"mcp__{WORKER_MCP_SERVER_NAME}__{name}" for name in WORKER_CLAUDE_PRELOADED_TOOLS
+)
+_CLAUDE_TOOL_SCHEMA_BLOCK = (
+    "CLAUDE_TOOL_SCHEMAS: a Claude CLI host defers MCP tool schemas. Load the "
+    "required schemas with exactly one ToolSearch call before any other tool "
+    f'call, query "{WORKER_CLAUDE_TOOL_SCHEMA_QUERY}"\n'
+    "(select: is exact; never search schemas by keyword)."
 )
 
 
@@ -471,11 +477,6 @@ exactly which tests were blocked with the prefix
 validation_unsupported_in_sandbox: and never stub a denied call to claim a
 pass; the coordinator's canonical validation decides those tests after exit.
 
-CLAUDE_TOOL_SCHEMAS: a Claude CLI host defers MCP tool schemas. Load the three
-you need with exactly one ToolSearch call before any other tool call, query
-"{WORKER_CLAUDE_TOOL_SCHEMA_QUERY}"
-(select: is exact; never search schemas by keyword). Other hosts skip this.
-
 {WORKER_SUBSTITUTION_BLOCK}
 
 MANDATORY_AIWORKHUB_TOOLS:
@@ -574,16 +575,19 @@ def render_worker_runtime_policy(adapter_id: str | None = None) -> str:
     a caller that knows the adapter should pass it.
     """
 
+    policy = WORKER_RUNTIME_POLICY
+    if adapter_id == "claude_cli":
+        policy = f"{policy}\n\n{_CLAUDE_TOOL_SCHEMA_BLOCK}"
     if adapter_id is None:
-        return WORKER_RUNTIME_POLICY
+        return policy
     enforcement = raw_discovery_enforcement(adapter_id)
     if enforcement["enforced"]:
-        return WORKER_RUNTIME_POLICY
+        return policy
     notice = _ENFORCEMENT_NOTICE.format(
         adapter_id=enforcement["adapter_id"] or "unknown",
         reason=enforcement["reason"],
     )
-    return f"{WORKER_RUNTIME_POLICY}\n\n{notice}"
+    return f"{policy}\n\n{notice}"
 
 
 CONTRACT_CLAUSES: dict[str, tuple[str, ...]] = {

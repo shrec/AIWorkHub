@@ -7748,6 +7748,7 @@ class WorkerMcpRuntime:
     audit_ledger_path: Path
     audit_hmac_key_path: Path
     tool_names: tuple[str, ...]
+    codex_tool_names: tuple[str, ...]
     package_import_root: Path
 
 
@@ -7768,9 +7769,46 @@ def resolve_host_package_import_root() -> Path:
     """
     return Path(__file__).resolve().parent.parent
 
-
 def _toml_str(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _toml_array(values: tuple[str, ...] | list[str]) -> str:
+    return "[" + ", ".join(_toml_str(v) for v in values) + "]"
+
+
+_CODEX_CODE_WORKER_REQUIRED_TOOLS: tuple[str, ...] = (
+    "aiworkhub_worker_source_graph_query",
+    "aiworkhub_worker_semantic_edit_prepare",
+    "aiworkhub_worker_semantic_edit_apply",
+)
+_CODEX_QUALITY_REVIEW_TOOLS: tuple[str, ...] = (
+    "aiworkhub_worker_quality_review_packet_read",
+    "aiworkhub_worker_quality_review_submit",
+)
+
+
+def require_codex_code_worker_tool_contract(
+    tool_names: tuple[str, ...] | list[str],
+) -> tuple[str, ...]:
+    names = tuple(tool_names)
+    missing = [n for n in _CODEX_CODE_WORKER_REQUIRED_TOOLS if n not in names]
+    if missing:
+        raise WorkerToolError(
+            "codex_code_worker_tool_contract_incomplete:" + ",".join(missing)
+        )
+    return names
+
+
+def resolve_codex_enabled_tools(
+    catalog: tuple[str, ...],
+    *,
+    quality_review_bound: bool,
+) -> tuple[str, ...]:
+    skip = set() if quality_review_bound else set(_CODEX_QUALITY_REVIEW_TOOLS)
+    return require_codex_code_worker_tool_contract(
+        tuple(name for name in catalog if name not in skip)
+    )
 
 
 def _write_json_0600(path: Path, payload: dict[str, Any]) -> None:
@@ -7924,6 +7962,12 @@ def generate_worker_mcp_runtime(
     }
     _write_json_0600(kilo_path, kilo_config)
 
+    codex_tool_names = require_codex_code_worker_tool_contract(
+        resolve_codex_enabled_tools(
+            MCP_TOOL_NAMES,
+            quality_review_bound=quality_review_packet_path is not None,
+        )
+    )
     codex_home = (home / ".codex").resolve()
     codex_home.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(codex_home, 0o700)
@@ -7932,6 +7976,7 @@ def generate_worker_mcp_runtime(
         f"[mcp_servers.{SERVER_NAME}]",
         f"command = {_toml_str(py)}",
         f"args = [{', '.join(_toml_str(a) for a in launch_args)}]",
+        f"enabled_tools = {_toml_array(codex_tool_names)}",
         "",
         f"[mcp_servers.{SERVER_NAME}.env]",
     ]
@@ -7958,6 +8003,7 @@ def generate_worker_mcp_runtime(
         audit_ledger_path=ledger_path,
         audit_hmac_key_path=key_path,
         tool_names=MCP_TOOL_NAMES,
+        codex_tool_names=codex_tool_names,
         package_import_root=package_import_root,
     )
 
@@ -8272,6 +8318,8 @@ __all__ = [
     "kb_search",
     "load_context_from_env",
     "register_tools",
+    "require_codex_code_worker_tool_contract",
+    "resolve_codex_enabled_tools",
     "session_write_intent",
     "ai_memory_write_intent",
     "kb_write_intent",

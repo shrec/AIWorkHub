@@ -3137,7 +3137,7 @@ def provision_worker_mcp_runtime(
         )
 
     try:
-        return worker_ai_tools_mcp.generate_worker_mcp_runtime(
+        runtime = worker_ai_tools_mcp.generate_worker_mcp_runtime(
             home=workspace.home,
             request_id=request_id,
             task_id=task_id,
@@ -3153,6 +3153,10 @@ def provision_worker_mcp_runtime(
             rework_overlay_path=worker_rework_overlay_path,
             contract_packet_path=worker_contract_packet,
         )
+        worker_ai_tools_mcp.require_codex_code_worker_tool_contract(
+            runtime.codex_tool_names
+        )
+        return runtime
     except worker_ai_tools_mcp.WorkerToolError as exc:
         # Provisioning/config-injection failure must reject the launch, not
         # silently degrade to a worker without a working tool surface --
