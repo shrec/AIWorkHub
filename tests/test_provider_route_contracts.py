@@ -34,26 +34,25 @@ _EDITOR_ADAPTERS = (
 # ---------------------------------------------------------------------------
 
 
-def test_editor_family_reviewer_submit_is_unknown_never_supported() -> None:
-    """The defect itself: bridge presence must not imply a completed submit.
+def test_editor_family_reviewer_submit_is_measured_supported_from_the_bridge() -> None:
+    """Submit is a route/tool-contract fact, never an installation fact.
 
-    Every signal preflight had for this family -- bridge module present, host
-    count, access consent -- is a fact about the bridge.  No round trip has
-    been observed, so the honest state is unknown.
+    The editor family dispatches ``aiworkhub_worker_quality_review_submit``
+    through the same worker bridge as packet_read. That is what ``supported``
+    records here; a model being installed or startable does not enter it.
     """
 
     record = contracts.capability_record(
         _EDITOR_FAMILY, contracts.CAPABILITY_REVIEWER_SUBMIT
     )
-    assert record.state == contracts.CAPABILITY_UNKNOWN
-    assert record.evidence_class == contracts.EVIDENCE_UNVERIFIED
-    assert record.reason == contracts.REASON_NO_OBSERVED_ROUND_TRIP
-    # The fail-closed reader must refuse it.
+    assert record.state == contracts.CAPABILITY_SUPPORTED
+    assert record.evidence_class == contracts.EVIDENCE_DECLARED_FROM_CODE_PATH
+    assert "process_launcher.py" in record.evidence
     assert (
         contracts.route_can_complete(
             _EDITOR_FAMILY, contracts.CAPABILITY_REVIEWER_SUBMIT
         )
-        is False
+        is True
     )
 
 
@@ -101,8 +100,11 @@ def test_unsupported_and_unknown_are_distinguishable_not_collapsed() -> None:
         evidence="src/aiworkhub/process_launcher.py:1-2",
         reason=contracts.REASON_BRIDGE_TOOL_NOT_ALLOWED,
     )
-    never_measured = contracts.capability_record(
-        _EDITOR_FAMILY, contracts.CAPABILITY_REVIEWER_SUBMIT
+    never_measured = contracts._record(
+        contracts.CAPABILITY_REVIEWER_SUBMIT,
+        contracts.CAPABILITY_UNKNOWN,
+        contracts.EVIDENCE_UNVERIFIED,
+        reason=contracts.REASON_NO_OBSERVED_ROUND_TRIP,
     )
     assert never_measured.state == contracts.CAPABILITY_UNKNOWN
     assert measured_negative.state != never_measured.state
@@ -313,23 +315,30 @@ def test_preflight_publishes_the_registry(
     assert _EDITOR_FAMILY in registry["route_families"]
 
 
-def test_no_editor_route_is_offered_for_a_reviewer_submit(
+def test_editor_route_is_offered_for_reviewer_submit_from_the_contract(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The contradiction the owner reported, asserted directly.
+    """Launchability still does not invent the capability; the contract does.
 
-    An editor-hosted route may well be launchable on this host -- that is a
-    true statement about starting it.  It must still never appear among the
-    routes offered for a capability the registry has not verified.
+    An editor-hosted route may be unlaunchable on this host. When it is
+    launchable, reviewer_submit is offered because the route/tool contract
+    dispatches the authenticated submit tool, not because a model is installed.
     """
 
     report = _preflight(monkeypatch, tmp_path)
     offered = report["provider_summary"]["capability_launchable_routes"][
         contracts.CAPABILITY_REVIEWER_SUBMIT
     ]
+    launchable = {
+        str(item["adapter_id"])
+        for item in report["providers"]
+        if item.get("launchable") and item.get("coverage_required", True)
+    }
     for adapter_id in _EDITOR_ADAPTERS:
-        assert adapter_id not in offered
-
+        if adapter_id in launchable:
+            assert adapter_id in offered
+        else:
+            assert adapter_id not in offered
 
 def test_capability_offers_are_a_subset_of_launchable_routes(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -385,8 +394,9 @@ def test_observability_carries_capabilities_beside_reachability(
         if entry["route_family"] != _EDITOR_FAMILY:
             continue
         submit = entry["capabilities"][contracts.CAPABILITY_REVIEWER_SUBMIT]
-        assert submit["state"] == contracts.CAPABILITY_UNKNOWN
-        assert submit["reason"] == contracts.REASON_NO_OBSERVED_ROUND_TRIP
+        assert submit["state"] == contracts.CAPABILITY_SUPPORTED
+        assert submit["evidence_class"] == contracts.EVIDENCE_DECLARED_FROM_CODE_PATH
+        assert "process_launcher.py" in submit["evidence"]
 
 
 def _bridge_dispatch_citation() -> tuple[Path, str]:
@@ -505,7 +515,17 @@ def test_declared_code_path_claims_match_the_bridge_allowlist():
     if packet_read in dispatched:
         assert first_line <= at_line[packet_read] <= last_line
 
-    # The submit comment on the same contract asserts a dispatcher fact too:
-    # that the bridge DOES carry submit, which is why its state is unknown for
-    # a different reason rather than unsupported for this one.
-    assert "aiworkhub_worker_quality_review_submit" in dispatched
+    submit = "aiworkhub_worker_quality_review_submit"
+    submit_record = contracts.capability_record(
+        runtime_adapters.ROUTE_FAMILY_EDITOR_VSCODE_LM,
+        contracts.CAPABILITY_REVIEWER_SUBMIT,
+    )
+    assert submit_record.evidence_class == contracts.EVIDENCE_DECLARED_FROM_CODE_PATH
+    submit_expected = (
+        contracts.CAPABILITY_SUPPORTED
+        if submit in dispatched
+        else contracts.CAPABILITY_UNSUPPORTED
+    )
+    assert submit_record.state == submit_expected
+    assert submit in dispatched
+    assert first_line <= at_line[submit] <= last_line

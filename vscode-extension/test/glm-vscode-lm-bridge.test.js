@@ -3432,6 +3432,211 @@ async function nf202600229QualityReviewSubmitBoundaryChecks() {
     "aiworkhub_worker_source_graph_query",
     "aiworkhub_worker_quality_review_submit",
   ]);
+
+  await assert.rejects(
+    internals.invokeVscodeLmPrivateTool(
+      { name: "aiworkhub_worker_quality_review_submit", input: submitInput() },
+      "c".repeat(32),
+    ),
+    (err) => {
+      const msg = String(err && err.message || err);
+      assert.ok(!/mcp_unavailable/.test(msg), msg);
+      assert.match(msg, /vscode_lm_quality_review_submit_runtime_unavailable/);
+      return true;
+    },
+  );
+
+  let forwardedSubmit = null;
+  internals.bindVscodeLmProviderBridgeForTest({
+    mcpClient: {
+      repositoryRoot: "/tmp/nf723-submit",
+      callTool: async (name, args) => {
+        forwardedSubmit = { name, args };
+        return { ok: true, durable: true, submission_id: "f".repeat(64) };
+      },
+    },
+    activeRepoIdentity: { root: "/tmp/nf723-submit" },
+  });
+  const authenticated = await internals.invokeVscodeLmPrivateTool(
+    { name: "aiworkhub_worker_quality_review_submit", input: submitInput() },
+    "c".repeat(32),
+    "pci_submit1",
+  );
+  assert.deepStrictEqual(authenticated, { ok: true, durable: true, submission_id: "f".repeat(64) });
+  assert.strictEqual(forwardedSubmit.name, "aiworkhub_vscode_lm_worker_tool");
+  assert.strictEqual(forwardedSubmit.args.tool_name, "aiworkhub_worker_quality_review_submit");
+  assert.strictEqual(forwardedSubmit.args.request_id, "c".repeat(32));
+  assert.strictEqual(forwardedSubmit.args.tool_input.provider_call_id, "pci_submit1");
+  internals.resetVscodeLmWorkerSourceGraphReadinessForTest();
+
+  const textFailCalls = [];
+  let textFailTurn = 0;
+  let textFailUser = "";
+  const textFailModel = {
+    capabilities: { toolCalling: false },
+    sendRequest: async (messages) => {
+      textFailTurn += 1;
+      const last = messages[messages.length - 1];
+      textFailUser = typeof last.content === "string" ? last.content : "";
+      return { stream: (async function* stream() { yield { value: submitRequestText() }; }()) };
+    },
+  };
+  await assert.rejects(
+    internals.runVscodeLmTextProtocol(
+      textFailModel,
+      reviewRequest("1".repeat(32)),
+      undefined,
+      async (call) => {
+        textFailCalls.push(call.name);
+        throw new Error("mcp_unavailable");
+      },
+    ),
+    (err) => {
+      const msg = String(err && err.message || err);
+      assert.match(msg, /vscode_lm_quality_review_submit_required/);
+      assert.ok(!/vscode_lm_agent_turn_limit/.test(msg), msg);
+      return true;
+    },
+  );
+  assert.strictEqual(textFailTurn, 2);
+  assert.deepStrictEqual(textFailCalls, [
+    "aiworkhub_worker_quality_review_submit",
+    "aiworkhub_worker_quality_review_submit",
+  ]);
+  assert.ok(textFailUser.includes("vscode_lm_quality_review_submit_runtime_unavailable"));
+  assert.ok(!textFailUser.includes("mcp_unavailable"));
+
+  const nativeFailCallIds = [];
+  let nativeFailTurn = 0;
+  const nativeFailModel = {
+    capabilities: { toolCalling: true },
+    sendRequest: async (messages) => {
+      nativeFailTurn += 1;
+      if (nativeFailTurn === 2) {
+        const last = messages[messages.length - 1];
+        const parts = Array.isArray(last.content) ? last.content : [];
+        for (const part of parts) {
+          if (part && typeof part.callId === "string") nativeFailCallIds.push(part.callId);
+        }
+      }
+      return {
+        stream: (async function* stream() {
+          yield {
+            callId: `submit-${nativeFailTurn}`,
+            name: "aiworkhub_worker_quality_review_submit",
+            input: submitInput(),
+          };
+        }()),
+      };
+    },
+  };
+  await assert.rejects(
+    internals.runVscodeLmAgent(
+      nativeFailModel,
+      reviewRequest("2".repeat(32)),
+      undefined,
+      async () => { throw new Error("mcp_unavailable"); },
+    ),
+    (err) => {
+      const msg = String(err && err.message || err);
+      assert.match(msg, /vscode_lm_quality_review_submit_required/);
+      assert.ok(!/vscode_lm_agent_turn_limit/.test(msg), msg);
+      return true;
+    },
+  );
+  assert.strictEqual(nativeFailTurn, 2);
+  assert.deepStrictEqual(nativeFailCallIds, ["submit-1"]);
+
+  let glmAttempt = 0;
+  let glmTurn = 0;
+  const glmModel = {
+    capabilities: { toolCalling: false },
+    sendRequest: async () => {
+      glmTurn += 1;
+      return { stream: (async function* stream() { yield { value: submitRequestText() }; }()) };
+    },
+  };
+  await assert.rejects(
+    internals.runVscodeLmTextProtocol(
+      glmModel,
+      reviewRequest("3".repeat(32)),
+      undefined,
+      async () => {
+        glmAttempt += 1;
+        return glmAttempt === 1
+          ? { ok: false, reason: "quality_review_finding_invalid", corrections_remaining: 1, terminal: false }
+          : { ok: false, reason: "quality_review_correction_retry_exhausted", corrections_remaining: 0, terminal: true };
+      },
+    ),
+    /vscode_lm_quality_review_submit_required/,
+  );
+  assert.strictEqual(glmTurn, 2);
+  assert.strictEqual(glmAttempt, 2);
+
+  const kimiCalls = [];
+  const kimiModel = {
+    capabilities: { toolCalling: true },
+    sendRequest: async () => ({
+      stream: (async function* stream() {
+        yield { callId: "submit-a", name: "aiworkhub_worker_quality_review_submit", input: submitInput() };
+        yield { callId: "submit-b", name: "aiworkhub_worker_quality_review_submit", input: submitInput() };
+      }()),
+    }),
+  };
+  const kimiResult = await internals.runVscodeLmAgent(
+    kimiModel,
+    reviewRequest("4".repeat(32)),
+    undefined,
+    async (call) => {
+      kimiCalls.push(call.name);
+      if (kimiCalls.length === 1) throw new Error("mcp_unavailable");
+      return { ok: true, durable: true, submission_id: "e".repeat(64) };
+    },
+  );
+  assert.deepStrictEqual(JSON.parse(kimiResult), sealedReview("e".repeat(64)));
+  assert.deepStrictEqual(kimiCalls, [
+    "aiworkhub_worker_quality_review_submit",
+    "aiworkhub_worker_quality_review_submit",
+  ]);
+
+  let nativeGlmAttempt = 0;
+  let nativeGlmTurn = 0;
+  const nativeGlmModel = {
+    capabilities: { toolCalling: true },
+    sendRequest: async () => {
+      nativeGlmTurn += 1;
+      return {
+        stream: (async function* stream() {
+          yield {
+            callId: `glm-submit-${nativeGlmTurn}`,
+            name: "aiworkhub_worker_quality_review_submit",
+            input: submitInput(),
+          };
+        }()),
+      };
+    },
+  };
+  await assert.rejects(
+    internals.runVscodeLmAgent(
+      nativeGlmModel,
+      reviewRequest("5".repeat(32)),
+      undefined,
+      async () => {
+        nativeGlmAttempt += 1;
+        return nativeGlmAttempt === 1
+          ? { ok: false, reason: "quality_review_finding_invalid", corrections_remaining: 1, terminal: false }
+          : { ok: false, reason: "quality_review_correction_retry_exhausted", corrections_remaining: 0, terminal: true };
+      },
+    ),
+    (err) => {
+      const msg = String(err && err.message || err);
+      assert.match(msg, /vscode_lm_quality_review_submit_required/);
+      assert.ok(!/vscode_lm_agent_turn_limit/.test(msg), msg);
+      return true;
+    },
+  );
+  assert.strictEqual(nativeGlmTurn, 2);
+  assert.strictEqual(nativeGlmAttempt, 2);
 }
 
 async function nf179ForcedStageRecoveryChecks() {

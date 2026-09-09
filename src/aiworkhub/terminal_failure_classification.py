@@ -225,6 +225,10 @@ _CONTROL_PLANE_REASONS: tuple[str, ...] = (
     #   file could not be read or parsed, so there is no identity to finalize.
     "review_workspace_quarantine_failed",
     "metadata_invalid",
+    # Typed sandbox SemLock denial (NF-2026-00720). Named here so a
+    # ``permission denied`` tail cannot win ``auth_forbidden`` for posix_shm
+    # or named_semaphore backends.
+    "validation_unsupported_in_sandbox",
     # ------------------------------------------------------------------ #
     # WRAPPERS ONLY BELOW THIS LINE -- see the ordering note above.
     #

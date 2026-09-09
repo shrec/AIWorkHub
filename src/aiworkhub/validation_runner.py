@@ -21,9 +21,10 @@ this), so classification stays reusable and unit-testable without a sandbox.
 
 from __future__ import annotations
 
+import ast
 import re
 import shlex
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -46,6 +47,26 @@ RESTRICTION_REFUSED_CHMOD = "refused_chmod"
 RESTRICTION_ABSENT_INTERPRETER = "absent_interpreter"
 RESTRICTION_MISSING_PACKAGE = "missing_package"
 RESTRICTION_METADATA_BROKER_DENIAL = "metadata_broker_denial"
+VALIDATION_UNSUPPORTED_IN_SANDBOX = "validation_unsupported_in_sandbox"
+SEMLOCK_PRIMITIVE = "multiprocessing.SemLock"
+SEMLOCK_PROBE_SCHEMA = "aiworkhub.semlock_capability_probe.v1"
+SEMLOCK_TRUSTED_EXIT_SUPPORTED_POSIX = 70
+SEMLOCK_TRUSTED_EXIT_SUPPORTED_NAMED = 71
+SEMLOCK_TRUSTED_EXIT_DENIED_POSIX = 80
+SEMLOCK_TRUSTED_EXIT_DENIED_NAMED = 81
+SEMLOCK_TRUSTED_PROBE_SOURCE = (
+    "import multiprocessing as m,sys\n"
+    "try:\n"
+    " l=m.get_context().Lock()\n"
+    " n=str(getattr(getattr(l,'_semlock',None),'name','') or '')\n"
+    " t=n.replace('\\\\','/').lower()\n"
+    " raise SystemExit(71 if ('shm' not in t and not t.startswith('/')) else 70)\n"
+    "except PermissionError as e:\n"
+    " f=str(getattr(e,'filename','') or '')\n"
+    " t=f.replace('\\\\','/').lower()\n"
+    " n=bool(f) or str(getattr(sys,'platform','')).startswith('win')\n"
+    " raise SystemExit(81 if not ('shm' in t or '/mp-' in t or not n) else 80)\n"
+)
 # create-time-only restrictions (a card that declares such a command can never
 # succeed inside a worker sandbox and is rejected before a worker spends tokens)
 RESTRICTION_FULL_REPOSITORY_SUITE = "full_repository_suite"
@@ -228,6 +249,241 @@ def plan_validation_capability_replay(
     return ValidationReplayDecision(True, "authenticated_structural_denial", profile)
 
 
+def construct_multiprocessing_semlock() -> str:
+    import multiprocessing
+
+    lock = multiprocessing.get_context().Lock()
+    name = str(getattr(getattr(lock, "_semlock", None), "name", "") or "")
+    normalized = name.replace("\\", "/").lower()
+    if "shm" in normalized or normalized.startswith("/"):
+        return "posix_shm"
+    return "named_semaphore"
+
+
+def _semlock_backend_from_exc(exc: BaseException) -> str:
+    filename = str(getattr(exc, "filename", "") or "")
+    text = filename.replace("\\", "/").lower()
+    if "shm" in text or "/mp-" in text:
+        return "posix_shm"
+    if filename:
+        return "named_semaphore"
+    import sys
+
+    if str(getattr(sys, "platform", "")).startswith("win"):
+        return "named_semaphore"
+    return "posix_shm"
+
+
+def probe_multiprocessing_semlock(
+    *, construct: Callable[[], str] | None = None
+) -> dict[str, Any]:
+    builder = construct or construct_multiprocessing_semlock
+    try:
+        backend = builder()
+    except PermissionError as exc:
+        return {
+            "schema": SEMLOCK_PROBE_SCHEMA,
+            "supported": False,
+            "primitive": SEMLOCK_PRIMITIVE,
+            "backend": _semlock_backend_from_exc(exc),
+        }
+    return {
+        "schema": SEMLOCK_PROBE_SCHEMA,
+        "supported": True,
+        "primitive": SEMLOCK_PRIMITIVE,
+        "backend": backend,
+    }
+
+
+def trusted_semlock_probe_argv(python_executable: str) -> list[str]:
+    return [str(python_executable), "-c", str(SEMLOCK_TRUSTED_PROBE_SOURCE)]
+
+
+def decode_trusted_semlock_exit(returncode: int) -> dict[str, Any] | None:
+    decoded = {
+        SEMLOCK_TRUSTED_EXIT_SUPPORTED_POSIX: (True, "posix_shm"),
+        SEMLOCK_TRUSTED_EXIT_SUPPORTED_NAMED: (True, "named_semaphore"),
+        SEMLOCK_TRUSTED_EXIT_DENIED_POSIX: (False, "posix_shm"),
+        SEMLOCK_TRUSTED_EXIT_DENIED_NAMED: (False, "named_semaphore"),
+    }.get(returncode)
+    if decoded is None:
+        return None
+    supported, backend = decoded
+    return {
+        "schema": SEMLOCK_PROBE_SCHEMA,
+        "supported": supported,
+        "primitive": SEMLOCK_PRIMITIVE,
+        "backend": backend,
+    }
+
+
+def attributed_semlock_capability_row(
+    command: str, probe: Mapping[str, Any]
+) -> dict[str, Any]:
+    return {
+        "command": command,
+        "returncode": 1,
+        "capability_probe_attributed": True,
+        "capability_probe": dict(probe),
+    }
+
+
+def _source_needs_semlock(text: str) -> bool:
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError):
+        return False
+    ctors = {
+        "SemLock",
+        "Lock",
+        "RLock",
+        "Semaphore",
+        "BoundedSemaphore",
+        "Condition",
+        "Event",
+        "Queue",
+        "JoinableQueue",
+        "SimpleQueue",
+    }
+    mp_names: set[str] = set()
+    ctx_names: set[str] = set()
+    ctor_names: set[str] = set()
+    get_context_names: set[str] = set()
+
+    def _mp_module(name: str | None) -> bool:
+        return bool(name) and name.split(".", 1)[0] == "multiprocessing"
+
+    def _bind(target: ast.AST, names: set[str]) -> None:
+        if isinstance(target, ast.Name):
+            names.add(target.id)
+
+    def _root_name(node: ast.AST) -> str | None:
+        while isinstance(node, ast.Attribute):
+            node = node.value
+        return node.id if isinstance(node, ast.Name) else None
+
+    def _is_get_context(node: ast.AST) -> bool:
+        if not isinstance(node, ast.Call):
+            return False
+        func = node.func
+        if isinstance(func, ast.Name):
+            return func.id in get_context_names
+        return (
+            isinstance(func, ast.Attribute)
+            and func.attr == "get_context"
+            and _root_name(func.value) in mp_names
+        )
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if _mp_module(alias.name):
+                    mp_names.add(alias.asname or alias.name.split(".", 1)[0])
+        elif isinstance(node, ast.ImportFrom) and _mp_module(node.module):
+            for alias in node.names:
+                bound = alias.asname or alias.name
+                if alias.name in ctors:
+                    ctor_names.add(bound)
+                elif alias.name == "get_context":
+                    get_context_names.add(bound)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and _is_get_context(node.value):
+            for target in node.targets:
+                _bind(target, ctx_names)
+        elif (
+            isinstance(node, ast.AnnAssign)
+            and node.value is not None
+            and _is_get_context(node.value)
+        ):
+            _bind(node.target, ctx_names)
+        elif isinstance(node, ast.NamedExpr) and _is_get_context(node.value):
+            _bind(node.target, ctx_names)
+    owners = mp_names | ctx_names
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Name) and func.id in ctor_names:
+            return True
+        if isinstance(func, ast.Attribute) and func.attr in ctors:
+            owner = func.value
+            if _is_get_context(owner) or _root_name(owner) in owners:
+                return True
+    return False
+
+
+def command_needs_multiprocessing_semlock(
+    command: str, *, source_text: Callable[[str], str | None] | None = None
+) -> bool:
+    for segment in _command_segments(str(command)):
+        if segment and _PYTHON_INTERPRETER_RE.match(segment[0].rsplit("/", 1)[-1]):
+            for index, token in enumerate(segment):
+                if token == "-c" and index + 1 < len(segment):
+                    if _source_needs_semlock(segment[index + 1]):
+                        return True
+                    break
+        pytest_args = _pytest_args(segment)
+        if pytest_args is None or source_text is None:
+            continue
+        for kind, name, _value in _iter_pytest_args(pytest_args):
+            if kind != "positional":
+                continue
+            relative = name.split("::", 1)[0]
+            if not relative.endswith(".py"):
+                continue
+            text = source_text(relative)
+            if isinstance(text, str) and _source_needs_semlock(text):
+                return True
+    return False
+
+
+def sandbox_can_grant_semlock(backend: str, probe_backend: str) -> bool:
+    if backend == "landlock" and probe_backend == "posix_shm":
+        return False
+    return True
+
+
+@dataclass(frozen=True)
+class SemlockPreflight:
+    action: str
+    evidence: str = ""
+    primitive: str = SEMLOCK_PRIMITIVE
+    backend: str = ""
+
+
+def preflight_semlock_capability(
+    commands: Iterable[str],
+    *,
+    backend: str,
+    probe: Mapping[str, Any] | None = None,
+    source_text: Callable[[str], str | None] | None = None,
+    construct: Callable[[], str] | None = None,
+    sandbox_measured: bool = False,
+) -> SemlockPreflight:
+    needed = any(
+        command_needs_multiprocessing_semlock(command, source_text=source_text)
+        for command in commands
+        if isinstance(command, str)
+    )
+    if not needed:
+        return SemlockPreflight("skip")
+    measured = dict(probe) if probe is not None else probe_multiprocessing_semlock(
+        construct=construct
+    )
+    primitive = str(measured.get("primitive") or SEMLOCK_PRIMITIVE)
+    probe_backend = str(measured.get("backend") or "named_semaphore")
+    if measured.get("supported") is True and (
+        sandbox_measured or sandbox_can_grant_semlock(backend, probe_backend)
+    ):
+        return SemlockPreflight("grant", primitive=primitive, backend=probe_backend)
+    return SemlockPreflight(
+        "unsupported",
+        f"{VALIDATION_UNSUPPORTED_IN_SANDBOX}:{primitive}:{probe_backend}",
+        primitive,
+        probe_backend,
+    )
+
+
 def _row_diagnostic(row: Mapping[str, Any]) -> str:
     return (
         str(row.get("stderr_tail") or "")
@@ -334,6 +590,19 @@ def row_restriction(row: Mapping[str, Any]) -> str | None:
         for item in denials
     ):
         return RESTRICTION_METADATA_BROKER_DENIAL
+
+    probe = row.get("capability_probe")
+    if (
+        row.get("capability_probe_attributed") is True
+        and isinstance(probe, Mapping)
+        and probe.get("schema") == SEMLOCK_PROBE_SCHEMA
+        and probe.get("supported") is False
+        and isinstance(probe.get("primitive"), str)
+        and probe.get("primitive")
+        and isinstance(probe.get("backend"), str)
+        and probe.get("backend")
+    ):
+        return VALIDATION_UNSUPPORTED_IN_SANDBOX
 
     diagnostic = _row_diagnostic(row)
     launch_error = row.get("launch_error")
@@ -814,14 +1083,27 @@ __all__ = [
     "RESTRICTION_MISSING_PACKAGE",
     "RESTRICTION_REFUSED_CHMOD",
     "RESTRICTION_SUBPROCESS_PYTEST",
+    "SEMLOCK_PRIMITIVE",
+    "SEMLOCK_PROBE_SCHEMA",
+    "SEMLOCK_TRUSTED_PROBE_SOURCE",
+    "SemlockPreflight",
     "TerminalState",
     "VALIDATION_ENVIRONMENT_BLOCKED",
     "VALIDATION_FAILED",
     "VALIDATION_PASSED",
+    "VALIDATION_UNSUPPORTED_IN_SANDBOX",
     "assert_card_validation_sandbox_runnable",
+    "attributed_semlock_capability_row",
     "classify_validation_results",
+    "command_needs_multiprocessing_semlock",
+    "construct_multiprocessing_semlock",
     "dash_m_validator_modules",
+    "decode_trusted_semlock_exit",
     "exec_scratch_denied_restriction",
+    "preflight_semlock_capability",
+    "probe_multiprocessing_semlock",
     "row_restriction",
+    "sandbox_can_grant_semlock",
     "sandbox_unrunnable_reason",
+    "trusted_semlock_probe_argv",
 ]

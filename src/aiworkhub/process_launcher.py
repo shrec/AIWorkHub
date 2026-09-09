@@ -684,6 +684,76 @@ def _run_validations_with_toolchain_receipt(
     if isinstance(receipt, Mapping):
         kwargs.setdefault("toolchain_authority_receipt", receipt)
         kwargs.setdefault("toolchain_authority_card", authority)
+    commands = tuple(commands)
+    from . import validation_runner as _validation_runner
+
+    def _source_text(relative: str) -> str | None:
+        path = target.path / relative
+        try:
+            return path.read_text(encoding="utf-8")
+        except OSError:
+            return None
+
+    needed = any(
+        _validation_runner.command_needs_multiprocessing_semlock(
+            command, source_text=_source_text
+        )
+        for command in commands
+        if isinstance(command, str)
+    )
+    probe: dict[str, Any] | None = None
+    sandbox_measured = False
+    if needed:
+        inner = _validation_runner.trusted_semlock_probe_argv(sys.executable)
+        backend = kwargs.get("backend")
+        selected = backend if isinstance(backend, str) and backend else None
+        try:
+            argv = sandbox_argv(
+                target, str(kwargs.get("adapter_id") or ""), inner, backend=selected
+            )
+            sandbox_measured = True
+        except WorkspaceError:
+            argv = inner
+        try:
+            completed = subprocess.run(
+                argv, capture_output=True, text=True, timeout=30, check=False
+            )
+        except OSError:
+            completed = None
+        if completed is not None:
+            probe = _validation_runner.decode_trusted_semlock_exit(completed.returncode)
+        if probe is None:
+            command = next((item for item in commands if isinstance(item, str)), "")
+            raise ValidationRunError(
+                "semlock_capability_probe_harness_failed",
+                [
+                    {
+                        "command": command,
+                        "returncode": (
+                            None if completed is None else completed.returncode
+                        ),
+                    }
+                ],
+            )
+    if probe is not None:
+        decision = _validation_runner.preflight_semlock_capability(
+            commands,
+            backend=str(kwargs.get("backend") or ""),
+            probe=probe,
+            source_text=_source_text,
+            sandbox_measured=sandbox_measured,
+        )
+        if decision.action == "unsupported":
+            command = next((item for item in commands if isinstance(item, str)), "")
+            raise ValidationEnvironmentBlocked(
+                decision.evidence,
+                [
+                    _validation_runner.attributed_semlock_capability_row(
+                        command, probe
+                    )
+                ],
+                restriction=_validation_runner.VALIDATION_UNSUPPORTED_IN_SANDBOX,
+            )
     return run_validations(target, commands, **kwargs)
 
 
@@ -709,9 +779,12 @@ _is_operational_validation_failure = (
 _VALIDATION_ENVIRONMENT_RESTRICTION_PREFIXES = (
     _launcher_validation.VALIDATION_ENVIRONMENT_RESTRICTION_PREFIXES
 )
-_terminal_state_for_workspace_error = (
-    _launcher_validation.terminal_state_for_workspace_error
-)
+
+
+def _terminal_state_for_workspace_error(exc: WorkspaceError) -> str:
+    if str(exc).startswith("validation_unsupported_in_sandbox"):
+        return "finalize_failed"
+    return _launcher_validation.terminal_state_for_workspace_error(exc)
 
 # Failure workspaces remain available through coordinator review.  Once a
 # coordinator has disposed that exact attempt (finished/archived, returned it

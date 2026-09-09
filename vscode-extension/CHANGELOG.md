@@ -1,5 +1,17 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.13 — 2026-09-09
+
+### Fixed
+
+- Editor-hosted reviewers submit durable verdicts through the bridge, and the
+  workforce capability row reports that dispatch surface truth.
+- Sandbox validation distinguishes unavailable Python semaphore support from
+  candidate failure before running multiprocessing-dependent checks.
+- Kilo/Grok usage captures nested cache counters and additive per-call cost
+  without inflating snapshot token totals.
+- Claude-only deferred-schema guidance stays out of every other worker prompt.
+
 ## 0.11.12 — 2026-09-09
 
 ### Fixed

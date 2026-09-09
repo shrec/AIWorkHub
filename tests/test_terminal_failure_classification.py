@@ -1260,3 +1260,72 @@ def test_provider_refusal_vocabulary_matches_runtime_adapters() -> None:
         if outcome["outcome"] != runtime_adapters.OUTCOME_PROVIDER_REFUSED:
             continue
         assert recognised_reason(outcome["reason"]) is not None, outcome["reason"]
+
+
+def test_semlock_unsupported_outranks_permission_denied() -> None:
+    for backend in ("posix_shm", "named_semaphore"):
+        result = classify_terminal_failure(
+            state="finalize_failed",
+            exit_code=0,
+            error=(
+                "validation_unsupported_in_sandbox:multiprocessing.SemLock:"
+                f"{backend}:Permission denied: /dev/shm/mp-x"
+            ),
+        )
+        assert result["failure_kind"] == "finalize_failed"
+        assert result["diagnostic"].startswith(
+            "finalize_failed:validation_unsupported_in_sandbox"
+        )
+        assert _ALLOWLISTED_DIAGNOSTIC.match(result["diagnostic"])
+        assert "auth_forbidden" not in result["diagnostic"]
+        assert "candidate" not in result["diagnostic"]
+
+
+def test_ordinary_permission_denied_stays_auth_forbidden() -> None:
+    result = classify_terminal_failure(
+        state="validation_failed",
+        exit_code=1,
+        error="worker failed",
+        stderr_tail="Permission denied: /etc/shadow",
+    )
+    assert result["failure_kind"] == "validation_failed"
+    assert result["diagnostic"].startswith("validation_failed:auth_forbidden")
+    assert _ALLOWLISTED_DIAGNOSTIC.match(result["diagnostic"])
+
+
+def test_semlock_unsupported_maps_to_finalize_failed_terminal() -> None:
+    from aiworkhub.process_launcher import _terminal_state_for_workspace_error
+    from aiworkhub.worker_workspace import (
+        ValidationEnvironmentBlocked,
+        ValidationRunError,
+        WorkspaceError,
+    )
+
+    blocked = ValidationEnvironmentBlocked(
+        "validation_unsupported_in_sandbox:multiprocessing.SemLock:posix_shm",
+        [],
+        restriction="validation_unsupported_in_sandbox",
+    )
+    assert _terminal_state_for_workspace_error(blocked) == "finalize_failed"
+    named = WorkspaceError(
+        "validation_unsupported_in_sandbox:multiprocessing.SemLock:"
+        "named_semaphore"
+    )
+    assert _terminal_state_for_workspace_error(named) == "finalize_failed"
+    assert (
+        _terminal_state_for_workspace_error(
+            ValidationRunError("semlock_capability_probe_harness_failed", [])
+        )
+        == "validation_failed"
+    )
+    for error in (str(blocked), str(named)):
+        classified = classify_terminal_failure(
+            state="finalize_failed",
+            exit_code=0,
+            error=error,
+        )
+        assert classified["failure_kind"] == "finalize_failed"
+        assert classified["diagnostic"].startswith(
+            "finalize_failed:validation_unsupported_in_sandbox"
+        )
+        assert "auth_forbidden" not in classified["diagnostic"]

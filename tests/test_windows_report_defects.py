@@ -301,16 +301,21 @@ def test_awh_obs_014_every_configured_adapter_is_accounted_for() -> None:
         "vscode_lm": (),
         "deepseek_vscode_lm": (),
         "glm_vscode_lm": (),
-        "grok_kilo_cli": (),
+        "grok_kilo_cli": ("tokens", "cost"),
         "deepseek_manual": (),  # manual-only, never launched
     }
     # Every supported adapter has an accounted-for telemetry entry -- no adapter
     # is left with an unexplained zero.
     for adapter in runtime_adapters.SUPPORTED_ADAPTERS:
         assert adapter in obtainable
-    # Only the Anthropic route yields a provider-reported dollar cost.
+    # Claude and Kilo/Grok stream-json report provider dollar cost.
     assert obtainable["claude_cli"] == ("tokens", "cost")
-    assert all("cost" not in caps for name, caps in obtainable.items() if name != "claude_cli")
+    assert obtainable["grok_kilo_cli"] == ("tokens", "cost")
+    assert all(
+        "cost" not in caps
+        for name, caps in obtainable.items()
+        if name not in {"claude_cli", "grok_kilo_cli"}
+    )
 
 
 # --- AWH-OBS-015 ------------------------------------------------------------

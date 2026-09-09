@@ -11,7 +11,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.11.12";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.11.13";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 // NF-2026-00643: this globalStorage trace directory was measured holding 1,102
 // files and 2,235,024,325 bytes (2.24 GB), largest single file 44,626,825 bytes
@@ -3534,6 +3534,35 @@ function completedQualityReviewResponse(request, toolName, result) {
   });
 }
 
+function isQualityReviewSubmitTool(toolName) {
+  return String(toolName || "") === "aiworkhub_worker_quality_review_submit";
+}
+
+function qualityReviewSubmitErrorMessage(err) {
+  const message = sanitizeErrorMessage(err);
+  if (!message || message === "mcp_unavailable" || message === "vscode_lm_mcp_unavailable") {
+    return "vscode_lm_quality_review_submit_runtime_unavailable";
+  }
+  return message;
+}
+
+function normalizeQualityReviewSubmitResult(toolName, result) {
+  if (!isQualityReviewSubmitTool(toolName) || !result || result.ok === true) return result;
+  const errText = String(result.error || result.reason || result.message || "");
+  if (!errText || errText === "mcp_unavailable" || errText === "vscode_lm_mcp_unavailable") {
+    return { ...result, ok: false, error: "vscode_lm_quality_review_submit_runtime_unavailable" };
+  }
+  return result;
+}
+
+function qualityReviewSubmitIncomplete(request, toolName, result) {
+  return Boolean(
+    request && request.request_kind === "quality_review" &&
+    isQualityReviewSubmitTool(toolName) &&
+    completedQualityReviewResponse(request, toolName, result) === null,
+  );
+}
+
 function languageModelTextPart(value) {
   return typeof vscode.LanguageModelTextPart === "function" ? new vscode.LanguageModelTextPart(String(value)) : { value: String(value) };
 }
@@ -3649,7 +3678,20 @@ async function invokeVscodeLmPrivateTool(call, requestId = "", providerCallId = 
   const toolName = String(call && call.name || "");
   const permitted = VSCODE_LM_PRIVATE_TOOLS.find((tool) => tool.name === toolName);
   if (!permitted) throw new Error(`vscode_lm_tool_not_allowed:${String(call.name || "")}`);
-  if (!mcpClient || !activeRepoIdentity) throw new Error("vscode_lm_mcp_unavailable");
+  if (isQualityReviewSubmitTool(toolName)) {
+    try {
+      await awaitVscodeLmWorkerSourceGraphReadinessOnce();
+    } catch (_err) {
+      throw new Error("vscode_lm_quality_review_submit_runtime_unavailable");
+    }
+  }
+  if (!mcpClient || !activeRepoIdentity) {
+    throw new Error(
+      isQualityReviewSubmitTool(toolName)
+        ? "vscode_lm_quality_review_submit_runtime_unavailable"
+        : "vscode_lm_mcp_unavailable",
+    );
+  }
   if (mcpClient.repositoryRoot !== activeRepoIdentity.root) throw new Error("vscode_lm_mcp_repo_mismatch");
   if (!VSCODE_LM_REQUEST_ID_RE.test(String(requestId || ""))) {
     throw new Error("vscode_lm_worker_request_id_invalid");
@@ -5093,13 +5135,18 @@ async function runVscodeLmTextProtocol(
       assertRequestActive();
     } catch (err) {
       if (String(err && err.message || err) === "vscode_lm_request_cancelled") throw err;
-      result = { ok: false, error: sanitizeErrorMessage(err) };
+      result = {
+        ok: false,
+        error: isQualityReviewSubmitTool(envelope.name)
+          ? qualityReviewSubmitErrorMessage(err)
+          : sanitizeErrorMessage(err),
+      };
       if (typeof onToolTurn === "function") {
         try {
           onToolTurn(envelope.name, {
             tool_state: "failed",
             elapsed_ms: Math.max(0, Date.now() - toolStartedAt),
-            error_code: sanitizeErrorMessage(err).slice(0, 256),
+            error_code: sanitizeErrorMessage(result.error).slice(0, 256),
             timeout_phase: String((err && err.mcpDiagnostics && err.mcpDiagnostics.phase) || "").slice(0, 80),
             timeout_ms: Number((err && err.mcpDiagnostics && err.mcpDiagnostics.timeout_ms) || 0),
           });
@@ -5112,6 +5159,7 @@ async function runVscodeLmTextProtocol(
     if (envelope.name === expectedSgTool && result && result.ok === true) {
       sourceGraphAcknowledged = true;
     }
+    result = normalizeQualityReviewSubmitResult(envelope.name, result);
     if (typeof onToolTurn === "function" && !toolFailureReported) {
       try {
         onToolTurn(envelope.name, {
@@ -5125,6 +5173,21 @@ async function runVscodeLmTextProtocol(
     }
     const completedReview = completedQualityReviewResponse(request, envelope.name, result);
     if (completedReview) return completedReview;
+    if (qualityReviewSubmitIncomplete(request, envelope.name, result)) {
+      protocolTrace.push({
+        turn,
+        phase: "review_submit",
+        outcome: sanitizeErrorMessage(result && (result.error || result.reason) || "submit_not_durable"),
+      });
+      if (reviewSubmitViolations >= 1) {
+        throw vscodeLmProtocolFailure(
+          "vscode_lm_quality_review_submit_required",
+          protocolTrace,
+          lastProtocolPreview,
+        );
+      }
+      reviewSubmitViolations += 1;
+    }
     if (result && result.ok === true && result.__finalEnvelope) {
       return JSON.stringify(result.__finalEnvelope);
     }
@@ -5149,7 +5212,13 @@ async function runVscodeLmTextProtocol(
         : "Output only the next strict tool-request JSON or final edit-response JSON object.",
     })));
   }
-  throw vscodeLmProtocolFailure("vscode_lm_agent_turn_limit", protocolTrace, lastProtocolPreview);
+  throw vscodeLmProtocolFailure(
+    request.request_kind === "quality_review"
+      ? "vscode_lm_quality_review_submit_required"
+      : "vscode_lm_agent_turn_limit",
+    protocolTrace,
+    lastProtocolPreview,
+  );
 }
 
 async function runVscodeLmAgent(
@@ -5498,6 +5567,7 @@ async function runVscodeLmAgent(
     }
     messages.push(vscode.LanguageModelChatMessage.Assistant(assistantParts));
     const results = [];
+    let submitIncompleteThisTurn = false;
     for (const call of calls) {
       let result;
       let toolFailureReported = false;
@@ -5513,13 +5583,18 @@ async function runVscodeLmAgent(
         assertRequestActive();
       } catch (err) {
         if (String(err && err.message || err) === "vscode_lm_request_cancelled") throw err;
-        result = { ok: false, error: sanitizeErrorMessage(err) };
+        result = {
+          ok: false,
+          error: isQualityReviewSubmitTool(call.name)
+            ? qualityReviewSubmitErrorMessage(err)
+            : sanitizeErrorMessage(err),
+        };
         if (typeof onToolTurn === "function") {
           try {
             onToolTurn(call.name, {
               tool_state: "failed",
               elapsed_ms: Math.max(0, Date.now() - toolStartedAt),
-              error_code: sanitizeErrorMessage(err).slice(0, 256),
+              error_code: sanitizeErrorMessage(result.error).slice(0, 256),
               timeout_phase: String((err && err.mcpDiagnostics && err.mcpDiagnostics.phase) || "").slice(0, 80),
               timeout_ms: Number((err && err.mcpDiagnostics && err.mcpDiagnostics.timeout_ms) || 0),
             });
@@ -5533,6 +5608,7 @@ async function runVscodeLmAgent(
       if (call.name === expectedSgTool && result && result.ok === true) {
         sourceGraphAcknowledged = true;
       }
+      result = normalizeQualityReviewSubmitResult(call.name, result);
       if (typeof onToolTurn === "function" && !toolFailureReported) {
         try {
           onToolTurn(call.name, {
@@ -5546,6 +5622,14 @@ async function runVscodeLmAgent(
       }
       const completedReview = completedQualityReviewResponse(request, call.name, result);
       if (completedReview) return completedReview;
+      if (qualityReviewSubmitIncomplete(request, call.name, result)) {
+        submitIncompleteThisTurn = true;
+        protocolTrace.push({
+          turn,
+          phase: "review_submit",
+          outcome: sanitizeErrorMessage(result && (result.error || result.reason) || "submit_not_durable"),
+        });
+      }
       if (result && result.ok === true && result.__finalEnvelope) {
         return JSON.stringify(result.__finalEnvelope);
       }
@@ -5563,8 +5647,24 @@ async function runVscodeLmAgent(
     toolTurns += 1;
     protocolTrace.push({ turn, phase: "work", outcome: `tools:${calls.length}` });
     messages.push(vscode.LanguageModelChatMessage.User(results));
+    if (submitIncompleteThisTurn) {
+      if (reviewSubmitViolations >= 1) {
+        throw vscodeLmProtocolFailure(
+          "vscode_lm_quality_review_submit_required",
+          protocolTrace,
+          lastProtocolPreview,
+        );
+      }
+      reviewSubmitViolations += 1;
+    }
   }
-  throw vscodeLmProtocolFailure("vscode_lm_agent_turn_limit", protocolTrace, lastProtocolPreview);
+  throw vscodeLmProtocolFailure(
+    qualityReview
+      ? "vscode_lm_quality_review_submit_required"
+      : "vscode_lm_agent_turn_limit",
+    protocolTrace,
+    lastProtocolPreview,
+  );
 }
 
 class VscodeLmBridgeHost {

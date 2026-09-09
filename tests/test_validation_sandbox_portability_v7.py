@@ -26,8 +26,8 @@ from pathlib import Path, PurePosixPath
 
 import pytest
 
-from aiworkhub import worker_workspace
-from aiworkhub.worker_workspace import WorkspaceError
+from aiworkhub import validation_runner, worker_workspace
+from aiworkhub.worker_workspace import ValidationEnvironmentBlocked, WorkspaceError
 
 
 pytestmark = pytest.mark.skipif(
@@ -1242,3 +1242,415 @@ class TestCoherentDependencyGenerationPortability:
             worker_workspace.cleanup_workspace(
                 repo, workspace.path, workspace.home
             )
+
+
+class TestSemLockCapability:
+    def test_probe_does_not_infer_support_from_platform_name(self) -> None:
+        import inspect
+
+        src = "".join(
+            inspect.getsource(fn)
+            for fn in (
+                validation_runner.construct_multiprocessing_semlock,
+                validation_runner.probe_multiprocessing_semlock,
+                validation_runner.sandbox_can_grant_semlock,
+                validation_runner.preflight_semlock_capability,
+            )
+        )
+        assert "sys.platform" not in src
+        assert "os.name" not in src
+        assert "get_context" in inspect.getsource(
+            validation_runner.construct_multiprocessing_semlock
+        )
+
+    def test_production_construct_uses_runtime_context(self) -> None:
+        try:
+            backend = validation_runner.construct_multiprocessing_semlock()
+        except TypeError as exc:
+            raise AssertionError(
+                "construct_multiprocessing_semlock must pass runtime ctx"
+            ) from exc
+        except PermissionError:
+            probe = validation_runner.probe_multiprocessing_semlock()
+            assert probe["supported"] is False
+            assert probe["primitive"] == validation_runner.SEMLOCK_PRIMITIVE
+            return
+        assert backend in {"posix_shm", "named_semaphore"}
+        probe = validation_runner.probe_multiprocessing_semlock()
+        assert probe["supported"] is True
+        assert probe["backend"] == backend
+        assert probe["schema"] == validation_runner.SEMLOCK_PROBE_SCHEMA
+        assert probe["primitive"] == validation_runner.SEMLOCK_PRIMITIVE
+
+    def test_landlock_dev_shm_permission_error_is_unsupported(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from aiworkhub import process_launcher
+        from aiworkhub.terminal_failure_classification import classify_terminal_failure
+
+        if worker_workspace.landlock_abi_version() < 1:
+            pytest.skip("host kernel lacks landlock")
+        workspace = _workspace(tmp_path)
+        source = validation_runner.SEMLOCK_TRUSTED_PROBE_SOURCE
+        assert "aiworkhub" not in source
+        inner = validation_runner.trusted_semlock_probe_argv(sys.executable)
+        assert inner == [sys.executable, "-c", source]
+        argv = process_launcher.sandbox_argv(
+            workspace, "", inner, backend="landlock"
+        )
+        assert argv[-len(inner) :] == inner
+        child = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        probe = validation_runner.decode_trusted_semlock_exit(child.returncode)
+        assert probe is not None, (child.returncode, child.stderr[-400:])
+        assert probe["supported"] is False
+        assert probe["primitive"] == validation_runner.SEMLOCK_PRIMITIVE
+        assert probe["backend"] == "posix_shm"
+        decision = validation_runner.preflight_semlock_capability(
+            ["python -m pytest tests/test_x.py"],
+            backend="landlock",
+            probe=probe,
+            source_text=lambda rel: "import multiprocessing as mp\nmp.get_context().Lock()\n",
+        )
+        assert decision.action == "unsupported"
+        assert decision.evidence == (
+            f"{validation_runner.VALIDATION_UNSUPPORTED_IN_SANDBOX}:"
+            f"{validation_runner.SEMLOCK_PRIMITIVE}:posix_shm"
+        )
+        tests_dir = workspace.path / "tests"
+        tests_dir.mkdir()
+        (tests_dir / "test_x.py").write_text(
+            "import multiprocessing as mp\n"
+            "ctx = mp.get_context('spawn')\n"
+            "q = ctx.Queue()\n",
+            encoding="utf-8",
+        )
+
+        def fake_run_validations(
+            target: object, commands: list[str], **kw: object
+        ) -> list[dict[str, object]]:
+            raise AssertionError("unsupported capability must not run the command")
+
+        monkeypatch.setattr(process_launcher, "run_validations", fake_run_validations)
+        with pytest.raises(ValidationEnvironmentBlocked) as caught:
+            process_launcher._run_validations_with_toolchain_receipt(
+                workspace,
+                ["python -m pytest tests/test_x.py"],
+                {},
+                backend="landlock",
+            )
+        assert caught.value.restriction == validation_runner.VALIDATION_UNSUPPORTED_IN_SANDBOX
+        row = caught.value.results[0]
+        assert row["capability_probe"]["backend"] == "posix_shm"
+        assert row["capability_probe"]["supported"] is False
+        assert (
+            process_launcher._terminal_state_for_workspace_error(caught.value)
+            == "finalize_failed"
+        )
+        classified = classify_terminal_failure(
+            state="finalize_failed",
+            exit_code=0,
+            error=str(caught.value),
+        )
+        assert classified["failure_kind"] == "finalize_failed"
+        assert classified["diagnostic"].startswith(
+            "finalize_failed:validation_unsupported_in_sandbox"
+        )
+        assert "auth_forbidden" not in classified["diagnostic"]
+
+    def test_grant_retains_candidate_pass_fail(self) -> None:
+        probe = {
+            "schema": validation_runner.SEMLOCK_PROBE_SCHEMA,
+            "supported": True,
+            "primitive": validation_runner.SEMLOCK_PRIMITIVE,
+            "backend": "named_semaphore",
+        }
+        decision = validation_runner.preflight_semlock_capability(
+            ["python -m pytest tests/test_x.py"],
+            backend="landlock",
+            probe=probe,
+            source_text=lambda rel: "import multiprocessing as mp\nmp.get_context().Lock()\n",
+        )
+        assert decision.action == "grant"
+        passed = validation_runner.classify_validation_results(
+            [{"command": "python -m pytest tests/test_x.py", "returncode": 0}]
+        )
+        assert passed.state == validation_runner.VALIDATION_PASSED
+        failed = validation_runner.classify_validation_results(
+            [{"command": "python -m pytest tests/test_x.py", "returncode": 1}]
+        )
+        assert failed.state == validation_runner.VALIDATION_FAILED
+        assert failed.blocks_acceptance is True
+
+    def test_unsupported_blocks_acceptance_without_retry(self) -> None:
+        probe = {
+            "schema": validation_runner.SEMLOCK_PROBE_SCHEMA,
+            "supported": False,
+            "primitive": validation_runner.SEMLOCK_PRIMITIVE,
+            "backend": "posix_shm",
+        }
+        row = {
+            "command": "python -m pytest tests/test_x.py",
+            "returncode": 1,
+            "capability_probe_attributed": True,
+            "capability_probe": probe,
+        }
+        terminal = validation_runner.classify_validation_results([row])
+        assert terminal.state == validation_runner.VALIDATION_ENVIRONMENT_BLOCKED
+        assert terminal.restriction == validation_runner.VALIDATION_UNSUPPORTED_IN_SANDBOX
+        assert terminal.blocks_acceptance is True
+        assert terminal.requires_supersede is False
+        replay = validation_runner.plan_validation_capability_replay(
+            [row["command"]], [row], backend="landlock"
+        )
+        assert replay.replay is False
+        exhausted = validation_runner.plan_validation_capability_replay(
+            [row["command"]], [row], backend="landlock", already_replayed=True
+        )
+        assert exhausted.reason == "validation_capability_replay_exhausted"
+
+    def test_ordinary_permissionerror_is_not_unsupported(self) -> None:
+        spawn = {
+            "command": "python -m pytest tests/test_x.py",
+            "returncode": None,
+            "launch_error": "PermissionError",
+        }
+        assert (
+            validation_runner.row_restriction(spawn)
+            == validation_runner.RESTRICTION_FORBIDDEN_SPAWN
+        )
+        candidate = {
+            "command": "python -m pytest tests/test_x.py",
+            "returncode": 1,
+            "stderr_tail": "PermissionError: [Errno 13] Permission denied: '/secret'",
+        }
+        assert validation_runner.row_restriction(candidate) is None
+        terminal = validation_runner.classify_validation_results([candidate])
+        assert terminal.state == validation_runner.VALIDATION_FAILED
+
+    def test_linux_and_windows_backends_share_unsupported_prefix(self) -> None:
+        filename_less = "named_semaphore" if os.name == "nt" else "posix_shm"
+        cases = (
+            ("/dev/shm/mp-x", "posix_shm"),
+            (None, filename_less),
+            ("Global\\BaseNamedObjects\\sem", "named_semaphore"),
+        )
+        for filename, expected_backend in cases:
+            def _deny(name: str | None = filename) -> str:
+                raise PermissionError(13, "Permission denied", name)
+
+            probe = validation_runner.probe_multiprocessing_semlock(construct=_deny)
+            assert probe["supported"] is False
+            assert probe["primitive"] == validation_runner.SEMLOCK_PRIMITIVE
+            assert probe["backend"] == expected_backend
+            decision = validation_runner.preflight_semlock_capability(
+                ['python -c "import multiprocessing as mp; mp.get_context().Lock()"'],
+                backend="landlock",
+                probe=probe,
+            )
+            assert decision.action == "unsupported"
+            assert decision.evidence.endswith(f":{expected_backend}")
+            assert decision.evidence.startswith(
+                f"{validation_runner.VALIDATION_UNSUPPORTED_IN_SANDBOX}:"
+                f"{validation_runner.SEMLOCK_PRIMITIVE}:"
+            )
+
+    def test_import_or_executor_is_not_semlock_need(self) -> None:
+        denied = {
+            "schema": validation_runner.SEMLOCK_PROBE_SCHEMA,
+            "supported": False,
+            "primitive": validation_runner.SEMLOCK_PRIMITIVE,
+            "backend": "posix_shm",
+        }
+        sources = (
+            "import multiprocessing as mp\n",
+            "from concurrent.futures import ProcessPoolExecutor\nProcessPoolExecutor()\n",
+            "import multiprocessing\nmultiprocessing.Process(target=abs)\n",
+        )
+        for text in sources:
+            assert (
+                validation_runner.command_needs_multiprocessing_semlock(
+                    "python -m pytest tests/test_x.py",
+                    source_text=lambda rel, src=text: src,
+                )
+                is False
+            )
+            assert (
+                validation_runner.preflight_semlock_capability(
+                    ["python -m pytest tests/test_x.py"],
+                    backend="landlock",
+                    probe=denied,
+                    source_text=lambda rel, src=text: src,
+                ).action
+                == "skip"
+            )
+        assert (
+            validation_runner.command_needs_multiprocessing_semlock(
+                "python -m pytest -n 2 tests/test_x.py",
+                source_text=lambda rel: "import multiprocessing as mp\n",
+            )
+            is False
+        )
+        assert (
+            validation_runner.command_needs_multiprocessing_semlock(
+                "python -c multiprocessing"
+            )
+            is False
+        )
+
+    def test_queue_and_lock_are_semlock_need(self) -> None:
+        queue_src = (
+            "import multiprocessing as mp\n"
+            "ctx = mp.get_context('spawn')\n"
+            "q = ctx.Queue()\n"
+        )
+        assert (
+            validation_runner.command_needs_multiprocessing_semlock(
+                "python -m pytest tests/test_x.py",
+                source_text=lambda rel: queue_src,
+            )
+            is True
+        )
+        assert (
+            validation_runner.command_needs_multiprocessing_semlock(
+                'python -c "import multiprocessing as mp; mp.get_context().Lock()"'
+            )
+            is True
+        )
+
+    def test_trusted_exit_codes_are_structural(self) -> None:
+        mapping = (
+            (70, True, "posix_shm"),
+            (71, True, "named_semaphore"),
+            (80, False, "posix_shm"),
+            (81, False, "named_semaphore"),
+        )
+        for code, supported, backend in mapping:
+            probe = validation_runner.decode_trusted_semlock_exit(code)
+            assert probe is not None
+            assert probe["schema"] == validation_runner.SEMLOCK_PROBE_SCHEMA
+            assert probe["supported"] is supported
+            assert probe["backend"] == backend
+            assert probe["primitive"] == validation_runner.SEMLOCK_PRIMITIVE
+        assert validation_runner.decode_trusted_semlock_exit(1) is None
+        argv = validation_runner.trusted_semlock_probe_argv(sys.executable)
+        assert argv[0] == sys.executable
+        assert argv[1] == "-c"
+        assert argv[2] == validation_runner.SEMLOCK_TRUSTED_PROBE_SOURCE
+
+    def test_sandbox_measured_posix_shm_success_is_grant(self) -> None:
+        probe = {
+            "schema": validation_runner.SEMLOCK_PROBE_SCHEMA,
+            "supported": True,
+            "primitive": validation_runner.SEMLOCK_PRIMITIVE,
+            "backend": "posix_shm",
+        }
+        denied = validation_runner.preflight_semlock_capability(
+            ["python -m pytest tests/test_x.py"],
+            backend="landlock",
+            probe=probe,
+            source_text=lambda rel: "import multiprocessing as mp\nmp.get_context().Lock()\n",
+        )
+        assert denied.action == "unsupported"
+        granted = validation_runner.preflight_semlock_capability(
+            ["python -m pytest tests/test_x.py"],
+            backend="landlock",
+            probe=probe,
+            source_text=lambda rel: "import multiprocessing as mp\nmp.get_context().Lock()\n",
+            sandbox_measured=True,
+        )
+        assert granted.action == "grant"
+
+    def test_receipt_probe_uses_sandbox_argv_not_parent(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from aiworkhub import process_launcher
+
+        workspace = _workspace(tmp_path)
+        tests_dir = workspace.path / "tests"
+        tests_dir.mkdir()
+        (tests_dir / "test_x.py").write_text(
+            "import multiprocessing as mp\n"
+            "ctx = mp.get_context('spawn')\n"
+            "q = ctx.Queue()\n",
+            encoding="utf-8",
+        )
+        wrapped: list[list[str]] = []
+
+        def fake_sandbox_argv(ws: object, adapter_id: str, adapter_argv: list[str], **kw: object) -> list[str]:
+            wrapped.append(list(adapter_argv))
+            return [sys.executable, "-c", "raise SystemExit(80)"]
+
+        def boom() -> str:
+            raise AssertionError("parent must not construct SemLock")
+
+        ran: list[list[str]] = []
+
+        def fake_run_validations(
+            target: object, commands: list[str], **kw: object
+        ) -> list[dict[str, object]]:
+            ran.append(list(commands))
+            return [{"command": "python -m pytest tests/test_x.py", "returncode": 0}]
+
+        monkeypatch.setattr(process_launcher, "sandbox_argv", fake_sandbox_argv)
+        monkeypatch.setattr(process_launcher, "run_validations", fake_run_validations)
+        monkeypatch.setattr(validation_runner, "construct_multiprocessing_semlock", boom)
+        with pytest.raises(ValidationEnvironmentBlocked) as caught:
+            process_launcher._run_validations_with_toolchain_receipt(
+                workspace,
+                ["python -m pytest tests/test_x.py"],
+                {},
+                backend="landlock",
+            )
+        assert ran == []
+        assert wrapped
+        assert wrapped[0][2] == validation_runner.SEMLOCK_TRUSTED_PROBE_SOURCE
+        assert caught.value.restriction == validation_runner.VALIDATION_UNSUPPORTED_IN_SANDBOX
+        assert (
+            process_launcher._terminal_state_for_workspace_error(caught.value)
+            == "finalize_failed"
+        )
+        row = caught.value.results[0]
+        assert row["capability_probe_attributed"] is True
+        assert row["capability_probe"]["schema"] == validation_runner.SEMLOCK_PROBE_SCHEMA
+        assert row["capability_probe"]["supported"] is False
+
+    def test_receipt_probe_grant_runs_declared_command(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from aiworkhub import process_launcher
+
+        workspace = _workspace(tmp_path)
+        tests_dir = workspace.path / "tests"
+        tests_dir.mkdir()
+        (tests_dir / "test_x.py").write_text(
+            "import multiprocessing as mp\nmp.get_context().Lock()\n",
+            encoding="utf-8",
+        )
+
+        def fake_sandbox_argv(ws: object, adapter_id: str, adapter_argv: list[str], **kw: object) -> list[str]:
+            return [sys.executable, "-c", "raise SystemExit(71)"]
+
+        ran: list[list[str]] = []
+
+        def fake_run_validations(
+            target: object, commands: list[str], **kw: object
+        ) -> list[dict[str, object]]:
+            ran.append(list(commands))
+            return [{"command": "python -m pytest tests/test_x.py", "returncode": 0}]
+
+        monkeypatch.setattr(process_launcher, "sandbox_argv", fake_sandbox_argv)
+        monkeypatch.setattr(process_launcher, "run_validations", fake_run_validations)
+        rows = process_launcher._run_validations_with_toolchain_receipt(
+            workspace,
+            ["python -m pytest tests/test_x.py"],
+            {},
+            backend="landlock",
+        )
+        assert ran == [["python -m pytest tests/test_x.py"]]
+        assert rows[0]["returncode"] == 0

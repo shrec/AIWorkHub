@@ -6,6 +6,22 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.13] - 2026-09-09
+
+### Fixed
+
+- Editor-hosted quality reviewers can submit durable verdicts through the
+  bridge, and route capability truth now follows the dispatch surface instead
+  of leaving `reviewer_submit` unknown.
+- Validation preflights Python multiprocessing semaphore support inside the
+  actual sandbox and reports a stable unsupported capability when the host
+  denies it, instead of repeatedly failing valid candidates with `PermissionError`.
+- Kilo/Grok `step-finish` usage now records nested token/cache counters and
+  provider-reported cost. Token counters retain snapshot/max semantics while
+  each distinct direct `part.cost` event is accumulated exactly once.
+- Worker-policy tests preserve Claude's one-shot deferred-schema instruction
+  without adding those prompt bytes to Codex, Grok or other transports.
+
 ## [0.11.12] - 2026-09-09
 
 ### Fixed

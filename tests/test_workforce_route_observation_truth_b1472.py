@@ -234,7 +234,7 @@ def test_reviewer_submit_comes_from_route_contract_not_installation(
     )
     for worker_id, expected_state in (
         ("gpt-5.5", provider_route_contracts.CAPABILITY_SUPPORTED),
-        ("glm-5.2", provider_route_contracts.CAPABILITY_UNKNOWN),
+        ("glm-5.2", provider_route_contracts.CAPABILITY_SUPPORTED),
     ):
         present_row = _row(installed, worker_id)
         present = present_row["reviewer_submit"]

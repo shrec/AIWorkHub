@@ -471,7 +471,7 @@ def test_stage_and_refresh_rules_are_server_side_now() -> None:
 def test_worker_policy_names_the_one_shot_tool_schema_load() -> None:
     from aiworkhub import runtime_adapters, worker_ai_tools_mcp
 
-    policy = instr.render_worker_runtime_policy()
+    policy = instr.render_worker_runtime_policy("claude_cli")
     expected = "select:" + ",".join(
         f"mcp__aiworkhub_worker_ai_tools__{name}"
         for name in (
@@ -661,7 +661,12 @@ def test_an_unenforcing_transport_is_told_the_text_is_the_only_control() -> None
         if surface["mechanism"] != runtime_adapters.TOOL_SURFACE_MECHANISM_NONE:
             # Argv already refuses, or the surface never offered it. Either way
             # the worker meets the refusal without being told about it.
-            assert rendered == base, adapter_id
+            if adapter_id == "claude_cli":
+                # Only Claude has deferred schemas; keep its one-shot ToolSearch
+                # instruction off every other adapter's paid prompt prefix.
+                assert rendered == f"{base}\n\n{instr._CLAUDE_TOOL_SCHEMA_BLOCK}"
+            else:
+                assert rendered == base, adapter_id
             continue
         unenforcing.append(adapter_id)
         assert "RAW_DISCOVERY_ENFORCEMENT:" in rendered, adapter_id

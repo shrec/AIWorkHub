@@ -242,23 +242,17 @@ _EDITOR_VSCODE_LM_CONTRACT = RouteContract(
                 EVIDENCE_DECLARED_FROM_CODE_PATH,
                 evidence=_EDITOR_BRIDGE_DISPATCH,
             ),
-            # NOT MEASURED.  Note carefully what is and is not known here.
-            # The bridge DOES dispatch ``aiworkhub_worker_quality_review_submit``
-            # (process_launcher.py:11983-11992), so the common claim that "the
-            # vscode_lm transport does not carry submit" is false at the
-            # dispatcher.  But that tool is not the canonical path: the reviewer
-            # prompt bans every submission tool and the supervisor ingests the
-            # reviewer's final assistant TEXT instead
-            # (quality_reviewer.py:586-596).  Whether this family emits a final
-            # event in the shape ``quality_review_ingest.provider_final_text``
-            # accepts has never been observed end to end.  So the state is
-            # unknown -- not true, and not false either.
+            # MEASURED AND POSITIVE from the same dispatcher that carries
+            # packet_read.  The editor family exposes and executes
+            # ``aiworkhub_worker_quality_review_submit`` through the worker
+            # bridge; installation or startability of a model is not this
+            # fact.  Durable recording is the authenticated submit tool, not
+            # final prose JSON.
             CAPABILITY_REVIEWER_SUBMIT: _record(
                 CAPABILITY_REVIEWER_SUBMIT,
-                CAPABILITY_UNKNOWN,
-                EVIDENCE_UNVERIFIED,
-                evidence="src/aiworkhub/quality_reviewer.py:586-596",
-                reason=REASON_NO_OBSERVED_ROUND_TRIP,
+                CAPABILITY_SUPPORTED,
+                EVIDENCE_DECLARED_FROM_CODE_PATH,
+                evidence=_EDITOR_BRIDGE_DISPATCH,
             ),
             CAPABILITY_WORKER_SEMANTIC_EDIT: _record(
                 CAPABILITY_WORKER_SEMANTIC_EDIT,

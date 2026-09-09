@@ -113,19 +113,34 @@ def read_provider_usage(
 
     samples: list[dict[str, Any]] = []
     sample_count = 0
+    seen_nodes: set[int] = set()
+    seen_usage: set[int] = set()
+    seen_additive_cost: set[tuple[int, int]] = set()
+    additive_cost_usd = 0.0
+    additive_cost_seen = False
+    snapshot_cost_usd: float | None = None
 
     def consume_usage(
         usage: dict[str, Any],
         *,
         event_type: str,
         cost_sources: tuple[dict[str, Any], ...],
+        event_index: int,
     ) -> None:
-        nonlocal sample_count
+        nonlocal sample_count, snapshot_cost_usd, additive_cost_usd, additive_cost_seen
+        usage_id = id(usage)
+        if usage_id in seen_usage:
+            return
+        seen_usage.add(usage_id)
         details = usage.get("input_tokens_details") or usage.get(
             "prompt_tokens_details"
         )
         if not isinstance(details, dict):
             details = {}
+        nested_cache = usage.get("cache")
+        if not isinstance(nested_cache, dict):
+            nested_cache = {}
+        cache_nested_observed = any(key in nested_cache for key in ("read", "write"))
         recognized_keys = {
             "input_tokens",
             "prompt_tokens",
@@ -134,13 +149,18 @@ def read_provider_usage(
             "completion_tokens",
             "output",
             "reasoning_output_tokens",
+            "reasoning",
             "cache_read_input_tokens",
             "cached_input_tokens",
             "prompt_cache_hit_tokens",
             "cache_creation_input_tokens",
             "cache_write_input_tokens",
         }
-        if not any(key in usage for key in recognized_keys) and "cached_tokens" not in details:
+        if (
+            not any(key in usage for key in recognized_keys)
+            and "cached_tokens" not in details
+            and not cache_nested_observed
+        ):
             return
 
         input_tokens = _as_int(
@@ -153,14 +173,19 @@ def read_provider_usage(
             or usage.get("completion_tokens")
             or usage.get("output")
         )
-        reasoning_output_tokens = _as_int(usage.get("reasoning_output_tokens"))
+        reasoning_output_tokens = _as_int(
+            usage.get("reasoning_output_tokens") or usage.get("reasoning")
+        )
         cached_input_tokens = _as_int(
             usage.get("cache_read_input_tokens")
             or usage.get("cached_input_tokens")
             or usage.get("prompt_cache_hit_tokens")
             or details.get("cached_tokens")
+            or nested_cache.get("read")
         )
-        cache_write_input_tokens = _as_int(usage.get("cache_write_input_tokens"))
+        cache_write_input_tokens = _as_int(
+            usage.get("cache_write_input_tokens") or nested_cache.get("write")
+        )
         cache_creation_input_tokens = _as_int(
             usage.get("cache_creation_input_tokens")
             or cache_write_input_tokens
@@ -174,7 +199,7 @@ def read_provider_usage(
                 "cache_creation_input_tokens",
                 "cache_write_input_tokens",
             )
-        ) or "cached_tokens" in details
+        ) or "cached_tokens" in details or cache_nested_observed
 
         result["usage_observed"] = True
         result["cache_metrics_observed"] = bool(
@@ -204,15 +229,32 @@ def read_provider_usage(
             result[key] = max(int(result[key]), value)
 
         for source in (*cost_sources, usage):
-            for key in ("total_cost_usd", "cost_usd"):
-                if key in source and source.get(key) is not None:
-                    result["cost_observed"] = True
-                    result["cost_usd"] = max(
-                        float(result["cost_usd"] or 0.0),
-                        _as_float(source.get(key)),
+            metrics = source.get("metrics") if isinstance(source.get("metrics"), dict) else {}
+            snapshot_hit = False
+            for key, container in (
+                ("total_cost_usd", source),
+                ("cost_usd", source),
+                ("cost", metrics),
+            ):
+                if key in container and container.get(key) is not None:
+                    observed = _as_float(container.get(key))
+                    snapshot_cost_usd = (
+                        observed
+                        if snapshot_cost_usd is None
+                        else max(snapshot_cost_usd, observed)
                     )
+                    snapshot_hit = True
                     break
-
+            if snapshot_hit:
+                continue
+            if source is usage or "cost" not in source or source.get("cost") is None:
+                continue
+            cost_identity = (event_index, id(source))
+            if cost_identity in seen_additive_cost:
+                continue
+            seen_additive_cost.add(cost_identity)
+            additive_cost_usd += _as_float(source.get("cost"))
+            additive_cost_seen = True
         sample_count += 1
         if include_samples and len(samples) < MAX_USAGE_SAMPLES:
             samples.append({
@@ -228,10 +270,21 @@ def read_provider_usage(
                 "semantics": "provider_reported_snapshot",
             })
 
-    def walk(value: Any, *, root: dict[str, Any], event_type: str, depth: int = 0) -> None:
+    def walk(
+        value: Any,
+        *,
+        root: dict[str, Any],
+        event_type: str,
+        event_index: int,
+        depth: int = 0,
+    ) -> None:
         if depth > MAX_WALK_DEPTH:
             return
         if isinstance(value, dict):
+            node_id = id(value)
+            if node_id in seen_nodes:
+                return
+            seen_nodes.add(node_id)
             local_type = str(value.get("type") or event_type or "")
             for key in ("model", "model_id"):
                 observed_model = _model_identity(value.get(key))
@@ -240,7 +293,12 @@ def read_provider_usage(
                     result["observed_model"] = observed_model
             usage = value.get("usage")
             if isinstance(usage, dict):
-                consume_usage(usage, event_type=local_type, cost_sources=(root, value))
+                consume_usage(
+                    usage,
+                    event_type=local_type,
+                    cost_sources=(root, value),
+                    event_index=event_index,
+                )
             for alternate in ("token_usage", "tokens"):
                 nested_usage = value.get(alternate)
                 if isinstance(nested_usage, dict):
@@ -248,25 +306,49 @@ def read_provider_usage(
                         nested_usage,
                         event_type=local_type,
                         cost_sources=(root, value),
+                        event_index=event_index,
                     )
             for key, nested in list(value.items())[:MAX_WALK_ITEMS]:
                 if key not in {"usage", "token_usage", "tokens"}:
-                    walk(nested, root=root, event_type=local_type, depth=depth + 1)
+                    walk(
+                        nested,
+                        root=root,
+                        event_type=local_type,
+                        event_index=event_index,
+                        depth=depth + 1,
+                    )
         elif isinstance(value, list):
             for nested in value[:MAX_WALK_ITEMS]:
-                walk(nested, root=root, event_type=event_type, depth=depth + 1)
+                walk(
+                    nested,
+                    root=root,
+                    event_type=event_type,
+                    event_index=event_index,
+                    depth=depth + 1,
+                )
 
-    for candidate in roots[:MAX_JSON_EVENTS]:
+    for event_index, candidate in enumerate(roots[:MAX_JSON_EVENTS]):
         if isinstance(candidate, dict):
             walk(
                 candidate,
                 root=candidate,
                 event_type=str(candidate.get("type") or ""),
+                event_index=event_index,
             )
         elif isinstance(candidate, list):
             synthetic_root: dict[str, Any] = {}
-            walk(candidate, root=synthetic_root, event_type="")
+            walk(
+                candidate,
+                root=synthetic_root,
+                event_type="",
+                event_index=event_index,
+            )
 
+    if additive_cost_seen or snapshot_cost_usd is not None:
+        result["cost_observed"] = True
+        result["cost_usd"] = additive_cost_usd if additive_cost_seen else 0.0
+        if snapshot_cost_usd is not None:
+            result["cost_usd"] = float(result["cost_usd"]) + snapshot_cost_usd
     result["usage_sample_count"] = sample_count
     result["usage_samples"] = samples
     result["usage_samples_truncated"] = sample_count > len(samples)

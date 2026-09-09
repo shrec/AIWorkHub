@@ -12,6 +12,17 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.11.13 — 2026-09-09
+
+- Editor-hosted reviewers can submit durable verdicts, with route capability
+  telemetry derived from the bridge that actually dispatches the tool.
+- Sandbox validation detects unavailable multiprocessing semaphore support
+  before valid candidates enter a repeated `PermissionError` loop.
+- Kilo/Grok cache and provider-cost telemetry is normalized from real
+  `step-finish` events without summing repeated token snapshots.
+- Claude's deferred-schema instruction remains Claude-only, saving those prompt
+  bytes on Codex, Grok and other worker routes.
+
 ## What's new in 0.11.12 — 2026-09-09
 
 - Route telemetry now tells launch readiness, historical evidence, current
