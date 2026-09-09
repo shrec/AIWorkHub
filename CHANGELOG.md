@@ -6,6 +6,17 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.11] - 2026-09-09
+
+### Fixed
+
+- Generated Codex worker configuration now declares the exact enabled MCP tool
+  set instead of allowing the host to expose only `exit_preflight`.
+- Code-worker launch fails closed unless Source Graph and both semantic-edit
+  operations are enabled; reviewer-bound Codex runs retain their review tools.
+- Claude's deferred-schema `ToolSearch` instruction is now rendered only for
+  the Claude CLI and is never sent to Codex or other transports.
+
 ## [0.11.10] - 2026-09-09
 
 ### Fixed
@@ -301,4 +312,3 @@ discovery 39% -- and every relay turn re-reads a context that grows from 36K to
 - The dashboard's coding-foundation cards say loading before they say nothing.
   They asserted "No sample / No evidence" at first paint while the default
   snapshot had simply not sent the field yet.
-

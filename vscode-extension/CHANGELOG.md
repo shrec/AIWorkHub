@@ -1,5 +1,14 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.11 — 2026-09-09
+
+### Fixed
+
+- Native Codex workers receive an explicit role-scoped MCP `enabled_tools`
+  contract, including Source Graph, semantic editing and validation.
+- Codex launch now fails closed on a missing code-worker tool contract, while
+  Claude-only deferred-schema guidance stays limited to the Claude CLI.
+
 ## 0.11.10 — 2026-09-09
 
 ### Fixed
@@ -134,4 +143,3 @@
 - A model the account cannot use is switched off after it fails, instead of
   taking another hundred launches.
 - The dashboard cards say loading before they say nothing.
-

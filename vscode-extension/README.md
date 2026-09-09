@@ -12,6 +12,13 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.11.11 — 2026-09-09
+
+- Native Codex workers now receive the full role-scoped AIWorkHub tool contract
+  explicitly, including Source Graph, semantic editing and validation.
+- A malformed Codex code-worker tool set fails before launch, and Claude-only
+  deferred-schema instructions are no longer shown to other transports.
+
 ## What's new in 0.11.10 — 2026-09-09
 
 - Retained rework candidates can be rerouted without losing their sealed delta.
