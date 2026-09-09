@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import ast
 import builtins
+import contextlib
 import inspect
 from pathlib import Path
 
@@ -253,6 +254,52 @@ def test_patching_process_launcher_still_reaches_the_moved_body(monkeypatch, sea
             _StubManager(), "R-1", "T-1"
         )
     assert str(excinfo.value) == seam
+
+
+def test_accept_review_uses_terminal_identity_before_later_orchestrator_event():
+    """Bookkeeping appended after review_ready cannot hide execution identity."""
+
+    class _Manager:
+        repo = Path("/nonexistent")
+
+        def _request_events(self, request_id: str) -> list[dict[str, object]]:
+            return [
+                {
+                    "request_id": request_id,
+                    "task_id": "T-1",
+                    "runner": "codex_gpt-5.5",
+                    "topic": "code",
+                    "adapter_id": "codex_cli",
+                    "state": "review_ready",
+                },
+                {
+                    "request_id": request_id,
+                    "task_id": "T-1",
+                    "event_type": "review_orchestrator_wait",
+                },
+            ]
+
+        def _show_task(self, task_id: str) -> dict[str, object]:
+            raise process_launcher.LaunchRejected("stop-after-identity")
+
+        def _promotion_lock(self):
+            return contextlib.nullcontext()
+
+    result = process_launcher_accept_review.accept_review(_Manager(), "R-1", "T-1")
+
+    assert result["error"] == "task_lookup_failed:stop-after-identity"
+
+
+def test_latest_request_identity_event_never_borrows_another_tasks_identity():
+    events = [
+        {"task_id": "T-OTHER", "runner": "worker", "topic": "code"},
+        {"task_id": "T-1", "event_type": "review_orchestrator_wait"},
+    ]
+
+    assert (
+        process_launcher_accept_review._latest_request_identity_event(events, "T-1")
+        is None
+    )
 
 
 # ---------------------------------------------------------------------------

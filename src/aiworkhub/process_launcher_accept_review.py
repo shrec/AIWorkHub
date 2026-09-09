@@ -250,6 +250,27 @@ def reviewer_evidence(
     return sorted(resolved, key=lambda entry: (entry["lens"], entry["task_id"]))
 
 
+def _latest_request_identity_event(
+    events: list[dict[str, Any]], task_id: str
+) -> dict[str, Any] | None:
+    """Return the newest exact-task event carrying launch identity.
+
+    Request-scoped orchestration may append bookkeeping events after the
+    terminal worker event. Those rows intentionally omit runner/topic and
+    must not erase the authenticated execution identity used by acceptance.
+    """
+    return next(
+        (
+            event
+            for event in reversed(events)
+            if str(event.get("task_id") or "") == task_id
+            and str(event.get("runner") or "")
+            and str(event.get("topic") or "")
+        ),
+        None,
+    )
+
+
 def server_derived_risk_tier(card: Any) -> str:
     """The tier the FINALIZER measured for this candidate, or "" when unrecorded.
 
@@ -576,6 +597,7 @@ def accept_preview(self, request_id: str, task_id: str, **overrides: Any) -> dic
 ACCEPT_REVIEW_LOCAL_NAMES: tuple[str, ...] = (
     "effective_requested_risk_tier",
     "fold_accept_blockers",
+    "_latest_request_identity_event",
     "manager_skill_tools",
     "reviewer_evidence",
     "server_derived_risk_tier",
@@ -738,23 +760,24 @@ def accept_review(
         events = self._request_events(request_id)
         if not events:
             return {"ok": False, "error": "request_not_found", "request_id": request_id}
-        latest = events[-1]
-        if str(latest.get("task_id") or "") != task_id:
+        latest_observed = events[-1]
+        if str(latest_observed.get("task_id") or "") != task_id:
             return {
                 "ok": False,
                 "error": "request_task_identity_mismatch",
                 "request_id": request_id,
                 "task_id": task_id,
             }
-        runner = str(latest.get("runner") or "")
-        topic = str(latest.get("topic") or "")
-        if not runner or not topic:
+        latest = _latest_request_identity_event(events, task_id)
+        if latest is None:
             return {
                 "ok": False,
                 "error": "request_identity_incomplete",
                 "request_id": request_id,
                 "task_id": task_id,
             }
+        runner = str(latest.get("runner") or "")
+        topic = str(latest.get("topic") or "")
 
         try:
             card = _parse_card(self._show_task(task_id), task_id)
