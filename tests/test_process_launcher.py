@@ -10507,7 +10507,7 @@ def test_parity_schema_mypy_baseline_non_comparable_fails_closed(overrides, erro
 
 # --- NF-2026-00548 (audit M3): in-run zero-delta tripwire and the
 # identical-relaunch guard. Both are named, deterministic platform mechanics:
-# the tripwire only ever appends a notice, and the guard only ever refuses a
+# the tripwire enforces a bounded empty-run deadline, and the guard refuses a
 # launch whose every input is provably identical to a recorded failure. ------
 
 
@@ -10627,7 +10627,9 @@ def test_zero_delta_tripwire_emits_exactly_one_notice_per_empty_run(
     assert first["changed_allowed_writes"] == []
     assert first["elapsed_share"] == 0.7
     assert first["notice_after_seconds"] == 300.0
-    assert first["enforced"] is False
+    assert first["enforced"] is True
+    assert first["terminal_reason"] == "zero_required_output_delta_timeout"
+    assert first["deadline_seconds"] == 300.0
     # A notice carries no lifecycle state at all, so nothing can read it as one.
     assert "state" not in first
 
@@ -10638,6 +10640,47 @@ def test_zero_delta_tripwire_emits_exactly_one_notice_per_empty_run(
     # Lifecycle semantics are untouched: the request's state row is still the
     # one the supervisor published, not the notice.
     assert manager._latest_by_request()[live.request_id]["state"] == "running"
+
+
+def test_zero_delta_tripwire_cancels_through_the_canonical_lifecycle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = _manager(
+        tmp_path,
+        show_task=_show(_card),
+        argv=[sys.executable, "-c", "pass"],
+    )
+    process = _NF548Process(timeouts=1)
+    live = _nf548_live(
+        tmp_path,
+        manager,
+        _nf548_workspace(tmp_path),
+        process=process,
+        timeout_seconds=1_200,
+    )
+    monotonic = iter((100.0, 701.0))
+    monkeypatch.setattr(
+        process_launcher.time,
+        "monotonic",
+        lambda: next(monotonic, 701.0),
+    )
+    cancellations: list[tuple[str, str]] = []
+
+    def cancel(request_id: str, reason: str) -> dict:
+        cancellations.append((request_id, reason))
+        return {"ok": True, "request_id": request_id, "state": "cancel_requested"}
+
+    monkeypatch.setattr(manager, "cancel", cancel)
+
+    manager._await_exit_watching_zero_delta(live)
+
+    assert cancellations == [
+        (live.request_id, process_launcher.ZERO_DELTA_TERMINAL_REASON)
+    ]
+    notice = _nf548_notices(manager)[0]
+    assert notice["elapsed_seconds"] == 601.0
+    assert notice["deadline_seconds"] == 600.0
+    assert notice["terminal_reason"] == process_launcher.ZERO_DELTA_TERMINAL_REASON
 
 
 def test_zero_delta_tripwire_stays_silent_when_an_allowed_write_changed(

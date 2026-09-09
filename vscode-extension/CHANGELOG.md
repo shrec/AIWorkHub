@@ -1,5 +1,13 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.15 — 2026-09-09
+
+### Fixed
+
+- Code workers with no required-output delta are now cancelled at the bounded,
+  timeout-derived deadline with an exact terminal reason, preventing a warning
+  from being followed by the remainder of a long runaway provider session.
+
 ## 0.11.14 — 2026-09-09
 
 ### Fixed

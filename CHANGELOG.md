@@ -6,6 +6,16 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.15] - 2026-09-09
+
+### Fixed
+
+- Code-worker launches that reach their timeout-derived zero-required-output
+  deadline now cancel through the canonical lifecycle with a distinct reason,
+  instead of emitting a warning and burning the rest of a long provider run.
+  Read-only cards, explicit unchanged-output contracts and real write deltas
+  remain exempt.
+
 ## [0.11.14] - 2026-09-09
 
 ### Fixed

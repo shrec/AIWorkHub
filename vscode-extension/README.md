@@ -12,6 +12,11 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.11.15 — 2026-09-09
+
+- Long code-worker runs that produce no required-output delta now terminate at
+  a bounded, timeout-derived deadline instead of continuing after a warning.
+
 ## What's new in 0.11.14 — 2026-09-09
 
 - Retained rework keeps out-of-scope system prerequisites as explicit audit

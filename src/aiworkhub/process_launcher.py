@@ -93,6 +93,7 @@ from .launch_zero_delta import (
     ZERO_DELTA_MIN_SECONDS,
     ZERO_DELTA_NOTICE,
     ZERO_DELTA_POLL_SECONDS,
+    ZERO_DELTA_TERMINAL_REASON,
     ZeroDeltaTripwire,
     changed_allowed_write_paths,
     evaluate_zero_delta_tripwire,
@@ -5087,9 +5088,9 @@ class _LiveProcess:
     pid_start_ticks: int | None = None
     bridge_request: vscode_lm_bridge.BridgeRequest | None = None
     claim_epoch: int | None = None
-    # NF-2026-00548: once the zero-delta tripwire has settled (notice emitted,
-    # a real delta observed, or the card exempt) no later observation of this
-    # run can change the answer, so the monitor stops re-hashing the workspace.
+    # Once the zero-delta tripwire has settled (enforcement requested, a real
+    # delta observed, or the card exempt) no later observation of this run can
+    # change the answer, so the monitor stops re-hashing the workspace.
     zero_delta_tripwire_settled: bool = False
 
 
@@ -9377,9 +9378,10 @@ class ProcessManager:
         """Wait for the worker exactly as before, observing the delta meanwhile.
 
         The wait is sliced so the already-running monitor thread can look at
-        the isolated workspace it is supervising.  Nothing here influences
-        exit, timeout, cancellation or finalization: the loop ends only when
-        the process ends, and the one thing it can do is append a notice.
+        the isolated workspace it is supervising. A code task that reaches
+        its bounded deadline without changing any allowed write is cancelled
+        through the normal lifecycle path; real deltas and explicit read-only
+        or unchanged-output exemptions settle the observer without action.
 
         A test double whose ``wait`` takes no ``timeout`` falls back to the
         original blocking call, so the monitor keeps working against any
@@ -9396,9 +9398,11 @@ class ProcessManager:
             except TypeError:
                 live.process.wait()
                 return
-            self._maybe_emit_zero_delta_notice(
+            notice = self._maybe_emit_zero_delta_notice(
                 live, elapsed_seconds=time.monotonic() - started
             )
+            if notice is not None and notice.get("enforced") is True:
+                self.cancel(live.request_id, reason=ZERO_DELTA_TERMINAL_REASON)
 
     def _maybe_emit_zero_delta_notice(
         self, live: _LiveProcess, *, elapsed_seconds: float
@@ -9408,7 +9412,9 @@ class ProcessManager:
         Returns the appended event, or ``None`` when nothing was emitted.  The
         notice carries no lifecycle ``state`` and is tagged as a runtime
         notice, so the reconcilers and reporters that read the ledger for a
-        request's state never see it (see ``_latest_by_request``).
+        request's state never see it (see ``_latest_by_request``). The monitor
+        separately routes an enforcing notice through ``cancel`` so terminal
+        state and reason remain canonical lifecycle evidence.
         """
 
         if live.zero_delta_tripwire_settled or live.metadata_path is None:
