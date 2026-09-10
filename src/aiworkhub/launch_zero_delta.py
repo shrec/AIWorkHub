@@ -11,7 +11,6 @@ from .worker_workspace import WorkerWorkspace
 
 
 ZERO_DELTA_NOTICE = "zero_required_output_delta_warning"
-ZERO_DELTA_TERMINAL_REASON = "zero_required_output_delta_timeout"
 RUNTIME_NOTICE_EVENT_KIND = "runtime_notice"
 ZERO_DELTA_ELAPSED_SHARE_ENV = "AIWORKHUB_ZERO_DELTA_ELAPSED_SHARE"
 ZERO_DELTA_DEFAULT_ELAPSED_SHARE = 0.5
@@ -122,8 +121,10 @@ def evaluate_zero_delta_tripwire(
             "required_outputs": [str(value) for value in required_outputs],
             "allowed_writes": allowed_writes,
             "changed_allowed_writes": [],
-            "enforced": True,
-            "terminal_reason": ZERO_DELTA_TERMINAL_REASON,
-            "deadline_seconds": round(notice_after, 3),
+            # Zero required-output delta is an observation, not proof that a
+            # live worker is stuck.  Provider reasoning, reads, and tool calls
+            # can legitimately precede the first edit, so only the normal
+            # liveness/timeout owners may terminate the process.
+            "enforced": False,
         },
     )
