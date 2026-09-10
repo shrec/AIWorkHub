@@ -168,9 +168,17 @@ def _publish_build_identity_if_unowned(
             if (
                 not required.issubset(current)
                 or current.get("repo_root") != _registry_key(repo_root)
-                or not _cross_instance_identity_supported()
-                or _retained_tree_alive(current)
             ):
+                return False
+            if not _cross_instance_identity_supported():
+                # Windows cannot authenticate a retained PID as the same
+                # process across instances.  It can, however, prove that no
+                # process currently owns that PID without signalling it.  A
+                # live/reused or unprovable PID remains fenced; only a
+                # definitively absent PID may be replaced under this lock.
+                if not platform_io.is_windows() or _retained_tree_alive(current):
+                    return False
+            elif _retained_tree_alive(current):
                 return False
             try:
                 pid = int(current["pid"])
@@ -259,6 +267,20 @@ def _owned_group_members(retained: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _retained_tree_alive(retained: dict[str, Any]) -> bool:
+    if platform_io.is_windows():
+        # Windows retained identities deliberately have no Linux start-tick
+        # authentication.  The safe cross-instance operation is therefore
+        # limited to a non-signalling absence proof.  Every malformed or
+        # indeterminate probe fails closed to alive so PID reuse can never
+        # authorize clearing or signalling an unrelated process.
+        try:
+            pid = int(retained["pid"])
+            owner_token = str(retained["owner_token"])
+            if pid <= 0 or not owner_token:
+                return True
+            return bool(platform_io.windows_pid_is_alive(pid))
+        except (KeyError, TypeError, ValueError, OSError):
+            return True
     if _identity_matches(retained):
         return True
     try:
@@ -269,6 +291,29 @@ def _retained_tree_alive(retained: dict[str, Any]) -> bool:
     return any(
         member["pgid"] == pgid and member["session_id"] == session_id
         for member in _owned_group_members(retained)
+    )
+
+
+def _recover_dead_windows_build_identity(
+    repo_root: Path | str, retained: dict[str, Any]
+) -> bool:
+    """Clear one exact Windows identity only after a non-signalling death proof.
+
+    The final clear reacquires the durable identity lock, matches the owner
+    token and repeats liveness, so a concurrent replacement or PID becoming
+    live between the preliminary probe and deletion remains fenced.
+    """
+
+    required = {"pid", "pgid", "session_id", "start_ticks", "owner_token", "repo_root"}
+    if (
+        not platform_io.is_windows()
+        or not required.issubset(retained)
+        or retained.get("repo_root") != _registry_key(repo_root)
+        or _retained_tree_alive(retained)
+    ):
+        return False
+    return _clear_build_identity_if_dead(
+        repo_root, str(retained["owner_token"])
     )
 
 
@@ -319,6 +364,8 @@ def _stop_retained_build(repo_root: Path | str, *, timeout: float = 5.0) -> bool
         # identity and environment ownership. Windows provides neither through
         # these primitives, so absence of evidence must never become death
         # proof or permit clearing the durable cross-instance fence.
+        if platform_io.is_windows():
+            return _recover_dead_windows_build_identity(repo_root, retained)
         return False
     if _identity_matches(retained) and not _leader_owner_matches(retained):
         # Public kernel identity fields are forgeable. Never persist a stop
@@ -1483,6 +1530,14 @@ class SourceGraphDaemon:
                     self._last_error = "build_start_fenced"
                 return True
             retained = _read_build_identity(self.repo_root)
+            if (
+                retained is not None
+                and _recover_dead_windows_build_identity(self.repo_root, retained)
+            ):
+                # Re-read after the lock-protected clear.  A concurrent owner
+                # may have claimed the slot immediately; that owner remains
+                # authoritative and publication will fail closed below.
+                retained = _read_build_identity(self.repo_root)
             if retained is not None and retained.get("state") == "stopping":
                 with self._state_lock:
                     self._status = STATUS_STOPPED
@@ -1694,6 +1749,11 @@ class SourceGraphDaemon:
             self._stop_event.clear()
             self._refresh_event.clear()
             self._started_at = _utcnow()
+            # Publication precedes Thread.start(): health must never expose
+            # the contradictory transient ``running=true/status=stopped``
+            # while the scheduler has accepted a new indexing lifecycle.
+            self._status = STATUS_INDEXING
+            self._last_error = ""
             thread = threading.Thread(
                 target=self._loop,
                 name=f"aiworkhub-source-graph-daemon:{self.repo_root.name}",
@@ -1706,27 +1766,28 @@ class SourceGraphDaemon:
         self._stop_event.set()
         self._refresh_event.set()
         retained = _read_build_identity(self.repo_root)
-        if retained is not None:
+        with self._process_lock:
+            local_process = self._build_process
+            local_owner_token = self._build_owner_token
+        owns_retained = bool(
+            retained is not None
+            and local_process is not None
+            and retained.get("owner_token") == local_owner_token
+            and retained.get("pid") == getattr(local_process, "pid", None)
+        )
+        if retained is not None and owns_retained:
             stopping = {**retained, "state": "stopping"}
             try:
-                transitioned = _compare_and_write_build_identity(
+                _compare_and_write_build_identity(
                     self.repo_root, retained, stopping
                 )
             except OSError:
-                # A failed durable transition cannot authorize cross-instance
-                # signalling, but an exact Popen owned by this instance still
-                # can and must be stopped. With no such handle, fail closed.
-                with self._process_lock:
-                    if self._build_process is None:
-                        return
-                self._terminate_build_process()
-            else:
-                if not transitioned:
-                    # A replacement owner won the slot. Never clobber it;
-                    # only an exact local Popen handle remains ours to stop.
-                    with self._process_lock:
-                        if self._build_process is None:
-                            return
+                # A failed durable transition cannot authorize any retained
+                # cross-instance action.  The exact local Popen handle still
+                # authorizes termination of this instance's own child below.
+                pass
+        # A foreign retained identity is never rewritten here.  Termination
+        # is limited to the exact Popen handle owned by this daemon instance.
         self._terminate_build_process()
         thread = self._thread
         if thread is not None:
@@ -1893,8 +1954,21 @@ class SourceGraphDaemon:
                 or self._last_refresh_job
                 or {}
             )
+            refreshable = bool(
+                running
+                and reported_status
+                not in {STATUS_STOPPED, STATUS_DEGRADED, STATUS_STALE, STATUS_RECOVERY}
+                and self._last_error != "build_start_fenced"
+                and refresh_job.get("state") != "failed"
+            )
+            writer_state = (
+                "standby"
+                if status == STATUS_STANDBY
+                else ("stopped" if status == STATUS_STOPPED else "active")
+            )
             return {
-                "ok": reported_status not in {STATUS_DEGRADED, STATUS_STALE, STATUS_RECOVERY},
+                "ok": reported_status
+                not in {STATUS_STOPPED, STATUS_DEGRADED, STATUS_STALE, STATUS_RECOVERY},
                 "status": reported_status,
                 "running": running,
                 "repo_root": str(self.repo_root),
@@ -1919,7 +1993,8 @@ class SourceGraphDaemon:
                 "stale_reason": "last_success_exceeded_threshold" if stale else "",
                 "last_report": self._last_report,
                 "last_error": self._last_error,
-                "writer_state": "standby" if status == STATUS_STANDBY else "active",
+                "writer_state": writer_state,
+                "refreshable": refreshable,
                 "language_capabilities": dict(source_graph.LANGUAGE_CAPABILITIES),
                 "indexed_extensions": list(source_graph.INDEXED_EXTENSIONS),
                 "recovery": recovery_info,
@@ -2015,6 +2090,8 @@ def daemon_health(repo_root: Path | str) -> dict[str, Any]:
             "stale_reason": "",
             "last_report": None,
             "last_error": "",
+            "writer_state": "stopped",
+            "refreshable": False,
             "language_capabilities": dict(source_graph.LANGUAGE_CAPABILITIES),
             "indexed_extensions": list(source_graph.INDEXED_EXTENSIONS),
             "index_quality": None,
@@ -2032,6 +2109,8 @@ def daemon_health(repo_root: Path | str) -> dict[str, Any]:
                     "status": STATUS_INDEXING,
                     "running": True,
                     "last_error": "unregistered_live_builder",
+                    "writer_state": "active",
+                    "refreshable": False,
                     "retained_build": {
                         "pid": retained.get("pid"),
                         "state": retained.get("state", "running"),

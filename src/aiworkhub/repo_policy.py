@@ -660,12 +660,32 @@ def build_preflight(repo_root: Path | str, adapter_id: str | None = None) -> dic
         and source_stale_after is not None
         and float(source_age) > float(source_stale_after)
     )
+    source_refresh_job = source_health.get("refresh_job")
+    source_refresh_failed = bool(
+        isinstance(source_refresh_job, dict)
+        and source_refresh_job.get("state") == "failed"
+    )
+    source_graph_refreshable = bool(
+        source_health.get("running")
+        and source_health.get("ok")
+        and source_health.get("status")
+        not in {
+            source_graph_daemon.STATUS_STOPPED,
+            source_graph_daemon.STATUS_DEGRADED,
+            source_graph_daemon.STATUS_STALE,
+            source_graph_daemon.STATUS_RECOVERY,
+        }
+        and source_health.get("refreshable", True) is not False
+        and source_health.get("last_error") != "build_start_fenced"
+        and not source_refresh_failed
+    )
     source_graph_ready_for_code = (
         bool(source_health.get("readable_generation"))
         and bool(source_health.get("last_success_at"))
         and bool(source_health.get("build_revision"))
         and int(source_health.get("files_seen") or 0) > 0
         and source_generation_fresh
+        and source_graph_refreshable
     )
     if policy["tools"]["source_graph_required_for_code"] and not source_graph_ready_for_code:
         errors.append("source_graph_not_ready")
@@ -889,10 +909,12 @@ def build_preflight(repo_root: Path | str, adapter_id: str | None = None) -> dic
                 for key in (
                     "ok", "status", "running", "registered", "last_success_at",
                     "stale_reason", "build_revision", "files_seen",
-                    "readable_generation",
+                    "readable_generation", "last_error", "writer_state",
+                    "refreshable", "refresh_job",
                 )
             },
             "ready_for_code": source_graph_ready_for_code,
+            "refreshable_for_code": source_graph_refreshable,
         },
         "sandbox": {
             # Primary fields describe the selected route (or the set of

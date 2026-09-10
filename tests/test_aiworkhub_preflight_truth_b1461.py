@@ -418,6 +418,49 @@ def test_source_graph_requires_success_identity_not_only_ready_label(monkeypatch
     assert report["source_graph"]["ready_for_code"] is False
 
 
+def test_source_graph_stopped_fence_blocks_old_readable_generation(
+    monkeypatch, tmp_path,
+):
+    root = _root(tmp_path)
+    graph = _ready_graph()
+    graph.update(
+        {
+            "status": source_graph_daemon.STATUS_STOPPED,
+            "running": True,
+            "last_error": "build_start_fenced",
+            "writer_state": "active",
+            "refresh_job": {"state": "failed", "error": "build_start_fenced"},
+        }
+    )
+    _common(monkeypatch, graph=graph)
+    monkeypatch.setattr(
+        repo_policy.worker_workspace, "select_sandbox_backend", lambda: "bubblewrap"
+    )
+
+    report = repo_policy.build_preflight(root)
+
+    assert "source_graph_not_ready" in report["errors"]
+    assert report["source_graph"]["ready_for_code"] is False
+    assert report["source_graph"]["refreshable_for_code"] is False
+    assert report["source_graph"]["last_error"] == "build_start_fenced"
+
+
+def test_source_graph_latest_failed_refresh_blocks_ready_label(monkeypatch, tmp_path):
+    root = _root(tmp_path)
+    graph = _ready_graph()
+    graph["refresh_job"] = {"state": "failed", "error": "refresh failed"}
+    _common(monkeypatch, graph=graph)
+    monkeypatch.setattr(
+        repo_policy.worker_workspace, "select_sandbox_backend", lambda: "bubblewrap"
+    )
+
+    report = repo_policy.build_preflight(root)
+
+    assert "source_graph_not_ready" in report["errors"]
+    assert report["source_graph"]["ready_for_code"] is False
+    assert report["source_graph"]["refreshable_for_code"] is False
+
+
 def test_source_graph_fresh_standby_generation_is_ready_for_code(monkeypatch, tmp_path):
     root = _root(tmp_path)
     graph = _ready_graph()

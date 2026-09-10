@@ -1989,15 +1989,84 @@ def test_cross_instance_windows_stop_keeps_unauthenticated_identity(
     monkeypatch.setattr(
         source_graph_daemon, "_cross_instance_identity_supported", lambda: False
     )
+    monkeypatch.setattr(source_graph_daemon.platform_io, "is_windows", lambda: True)
+    monkeypatch.setattr(
+        source_graph_daemon.platform_io, "windows_pid_is_alive", lambda _pid: True
+    )
+    compared: list = []
+    monkeypatch.setattr(
+        source_graph_daemon,
+        "_compare_and_write_build_identity",
+        lambda *args: compared.append(args) or True,
+    )
     signalled: list = []
     monkeypatch.setattr(
         source_graph_daemon.os, "killpg", lambda *args: signalled.append(args)
     )
 
+    daemon = source_graph_daemon.SourceGraphDaemon(root)
+    daemon.stop()
+    assert source_graph_daemon._read_build_identity(root) == retained
+    assert compared == []
+
     assert source_graph_daemon.get_daemon(root) is None
     assert not source_graph_daemon.stop_daemon(root)
     assert source_graph_daemon._read_build_identity(root) == retained
     assert signalled == []
+
+
+def test_dead_windows_stopping_identity_is_cleared_before_refresh(
+    tmp_path, monkeypatch,
+):
+    root = _init_repo(tmp_path, "windows_dead_stopping")
+    (root / "refreshed.py").write_text(
+        "def refreshed_after_reload():\n    return True\n", encoding="utf-8"
+    )
+    retained = {
+        "repo_root": str(root.resolve()), "owner_token": "dead-windows-owner",
+        "pid": 992, "pgid": 0, "session_id": 0, "start_ticks": 0,
+        "state": "stopping",
+    }
+    source_graph_daemon._write_build_identity(root, retained)
+    monkeypatch.setattr(source_graph_daemon.platform_io, "is_windows", lambda: True)
+    monkeypatch.setattr(
+        source_graph_daemon.platform_io, "windows_pid_is_alive", lambda _pid: False
+    )
+    monkeypatch.setattr(
+        source_graph_daemon, "_cross_instance_identity_supported", lambda: False
+    )
+    daemon = source_graph_daemon.SourceGraphDaemon(root)
+
+    assert daemon._run_one_build() is True
+    assert source_graph_daemon._read_build_identity(root) is None
+    health = daemon.health()
+    assert health["status"] == source_graph_daemon.STATUS_READY
+    assert health["last_error"] == ""
+    assert health["files_seen"] > 0
+
+
+def test_live_windows_stopping_identity_remains_fenced(tmp_path, monkeypatch):
+    root = _init_repo(tmp_path, "windows_live_stopping")
+    retained = {
+        "repo_root": str(root.resolve()), "owner_token": "live-windows-owner",
+        "pid": 993, "pgid": 0, "session_id": 0, "start_ticks": 0,
+        "state": "stopping",
+    }
+    source_graph_daemon._write_build_identity(root, retained)
+    monkeypatch.setattr(source_graph_daemon.platform_io, "is_windows", lambda: True)
+    monkeypatch.setattr(
+        source_graph_daemon.platform_io, "windows_pid_is_alive", lambda _pid: True
+    )
+    daemon = source_graph_daemon.SourceGraphDaemon(root)
+
+    assert daemon._run_one_build() is True
+    health = daemon.health()
+    assert health["status"] == source_graph_daemon.STATUS_STOPPED
+    assert health["last_error"] == "build_start_fenced"
+    assert health["writer_state"] == "stopped"
+    assert health["refreshable"] is False
+    assert health["ok"] is False
+    assert source_graph_daemon._read_build_identity(root) == retained
 
 
 def test_retained_stop_revalidates_owned_group_immediately_before_signal(
@@ -2074,10 +2143,15 @@ def test_stop_uses_exact_owner_handle_when_stopping_fence_write_fails(
 ):
     root = _init_repo(tmp_path, "stopping_fence_failure")
     daemon = source_graph_daemon.SourceGraphDaemon(root)
-    owned = object()
+    owned = SimpleNamespace(pid=81)
     daemon._build_process = owned
+    retained = {
+        "pid": owned.pid,
+        "owner_token": daemon._build_owner_token,
+        "state": "running",
+    }
     monkeypatch.setattr(
-        source_graph_daemon, "_read_build_identity", lambda _root: {"state": "running"}
+        source_graph_daemon, "_read_build_identity", lambda _root: retained
     )
     monkeypatch.setattr(
         source_graph_daemon,
@@ -2091,7 +2165,7 @@ def test_stop_uses_exact_owner_handle_when_stopping_fence_write_fails(
 
     daemon.stop()
 
-    assert terminated == [owned, owned]
+    assert terminated == [owned]
 
 
 def test_dead_stale_identity_is_atomically_replaced_before_child_continues(
@@ -2154,31 +2228,24 @@ def test_build_identity_publications_are_owner_only_under_permissive_umask(tmp_p
         os.umask(previous_umask)
 
 
-def test_daemon_stop_cas_does_not_clobber_concurrent_replacement(tmp_path, monkeypatch):
-    root = _init_repo(tmp_path, "daemon_stop_cas_replacement")
+def test_daemon_stop_does_not_cas_foreign_retained_identity(tmp_path, monkeypatch):
+    root = _init_repo(tmp_path, "daemon_stop_foreign_identity")
     daemon = source_graph_daemon.SourceGraphDaemon(root)
     prior = {
         "repo_root": str(root.resolve()), "owner_token": "prior", "pid": 71,
         "pgid": 71, "session_id": 71, "start_ticks": 7, "state": "running",
     }
-    newer = {
-        **prior, "owner_token": "newer", "pid": 72, "pgid": 72,
-        "session_id": 72, "start_ticks": 8,
-    }
     source_graph_daemon._write_build_identity(root, prior)
-
-    def replace_before_cas(repo_root, expected, value):
-        assert expected == prior
-        assert value["state"] == "stopping"
-        source_graph_daemon._write_build_identity(repo_root, newer)
-        return False
-
+    compared = []
     monkeypatch.setattr(
-        source_graph_daemon, "_compare_and_write_build_identity", replace_before_cas
+        source_graph_daemon,
+        "_compare_and_write_build_identity",
+        lambda *args: compared.append(args) or True,
     )
     daemon.stop()
 
-    assert source_graph_daemon._read_build_identity(root) == newer
+    assert compared == []
+    assert source_graph_daemon._read_build_identity(root) == prior
 
 
 def test_unregistered_health_exposes_retained_live_builder(tmp_path, monkeypatch):
