@@ -6,6 +6,23 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.22] - 2026-09-10
+
+### Fixed
+
+- Dashboard full-snapshot hydration now includes Skills, Tool Recipes, and
+  Semantic Edit.
+- Canonical `task_queue.sqlite` mutation paths now take a single
+  cross-process writer lease while concurrent readonly access remains
+  available.
+- SemLock preflight denial now emits exact per-command validation receipt
+  cardinality.
+
+### Limitations
+
+- Source Graph durable single-owner (NF761) remains open.
+- The secure native SemLock-capable validation lane (NF690) remains open.
+
 ## [0.11.21] - 2026-09-10
 
 ### Fixed
