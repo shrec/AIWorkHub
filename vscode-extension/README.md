@@ -14,14 +14,12 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.11.19
+## What's new in 0.11.20
 
-- Keep request-identity preservation across worker, review and rework stages
-  so they stay on the same authenticated request.
-- Use authenticated parse-broken rework prefetch to load the retained
-  candidate instead of asking the worker to rediscover it.
-- Apply bounded missing-create finalization so repeated identical missing
-  creates stop after one exact correction.
+- Keep exact deadmethods entrypoint truth so Source Graph reports the
+  measured entrypoint.
+- Normalize nested quality-review findings to the canonical finding schema.
+- Deliver a single reviewer packet for each quality-review request.
 
 Detailed older history stays in the
 [changelog](https://github.com/shrec/AIWorkHub/blob/main/vscode-extension/CHANGELOG.md).

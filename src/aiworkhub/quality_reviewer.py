@@ -703,10 +703,10 @@ def build_review_prompt(
     """Render a bounded independent-review prompt from packet facts only.
 
     When *packet_file* is provided the serialised packet is written to that
-    path and the prompt references it via a worker-scoped file read instead of
-    embedding the full JSON inline.  This avoids E2BIG on native CLI adapters
-    where large quality-review payloads would otherwise be passed through argv.
-    *max_inline_bytes* guards the inline fallback when *packet_file* is None.
+    path and the prompt references it via FILE + SHA regardless of size, even
+    just below 96 KiB.  This avoids E2BIG on native CLI adapters where
+    quality-review payloads would otherwise be passed through argv.
+    Blind adapters omit *packet_file* and still receive the packet inline.
     *packet_root* is coordinator-owned write authority, independent of the
     destination path. It overrides the worker-environment fallback without
     *prior_rejection* is the durable refusal a previous attempt at this exact
@@ -746,11 +746,13 @@ def build_review_prompt(
         if active_scope is not None
         else ""
     )
-    use_file_transport = (
-        packet_file is not None and len(encoded.encode("utf-8")) > max_inline_bytes
+    use_file_transport = packet_file is not None and (
+        packet_root is not None or os.environ.get(REVIEW_PACKET_FILE_ROOT_ENV)
     )
     if use_file_transport and packet_file is not None:
         _write_review_packet_file(Path(packet_file), encoded, packet_root=packet_root)
+    elif packet_file is not None and len(encoded.encode("utf-8")) > max_inline_bytes:
+        raise ReviewerEvidenceError("quality_review_packet_too_large")
     packet_evidence = (
         f"QUALITY_REVIEW_PACKET_FILE: {packet_file}\n"
         f"PACKET_SHA256: {packet_digest}\n"

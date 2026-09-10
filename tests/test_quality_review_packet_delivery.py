@@ -185,6 +185,96 @@ def test_file_transport_prompt_names_no_argument_packet_tool(tmp_path: Path) -> 
     assert "Do not supply a path or identity" in prompt
 
 
+def test_sighted_bound_packet_stays_file_ref_just_below_inline_cap(
+    tmp_path: Path,
+) -> None:
+    cap = 96 * 1024
+    body = {k: v for k, v in _packet().items() if k != "packet_sha256"}
+    candidate = dict(body["candidate"])
+    body = {**body, "candidate": candidate}
+
+    def sealed() -> dict[str, object]:
+        digest = hashlib.sha256(
+            json.dumps(
+                body, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+            ).encode("utf-8")
+        ).hexdigest()
+        return {**body, "packet_sha256": digest}
+
+    def encoded_len(payload: dict[str, object]) -> int:
+        return len(
+            json.dumps(
+                payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+            ).encode("utf-8")
+        )
+
+    candidate["padding"] = "x" * (90 * 1024)
+    packet = sealed()
+    extra = cap - 1 - encoded_len(packet)
+    assert extra > 0
+    candidate["padding"] = str(candidate["padding"]) + ("x" * extra)
+    packet = sealed()
+    assert encoded_len(packet) == cap - 1
+
+    runtime_root = tmp_path / "runtime"
+    runtime_root.mkdir()
+    packet_path = runtime_root / "quality_review_packet.json"
+    candidate = tmp_path / CANDIDATE_PATH
+    candidate.parent.mkdir(parents=True, exist_ok=True)
+    candidate.write_bytes(b"candidate-bytes")
+
+    blind = qr.assemble_reviewer_prompt(
+        packet,
+        lens="correctness",
+        adapter_id="vscode_lm",
+        packet_path=str(packet_path),
+        packet_root=runtime_root,
+    )
+    assert qr.extract_inline_packet(blind) == packet
+    assert "QUALITY_REVIEW_PACKET_FILE:" not in blind
+    assert not packet_path.exists()
+
+    sighted = qr.assemble_reviewer_prompt(
+        packet,
+        lens="correctness",
+        adapter_id="claude_cli",
+        packet_path=str(packet_path),
+        packet_root=runtime_root,
+    )
+    assert "QUALITY_REVIEW_PACKET_FILE:" in sighted
+    assert f"PACKET_SHA256: {packet['packet_sha256']}" in sighted
+    assert "QUALITY_REVIEW_PACKET:" not in sighted
+    assert qr.extract_inline_packet(sighted) is None
+    assert len(sighted.encode("utf-8")) < len(blind.encode("utf-8"))
+    assert json.loads(packet_path.read_text(encoding="utf-8")) == packet
+
+    ctx = _review_ctx(tmp_path, packet_path)
+    result = worker_mcp.quality_review_packet_read(ctx)
+    assert result == {
+        "ok": True,
+        "tool": "quality_review_packet_read",
+        "packet_sha256": packet["packet_sha256"],
+        "packet": packet,
+    }
+    assert ctx.audit_ledger_path is not None
+    assert ctx.audit_hmac_key_path is not None
+    verification = worker_mcp.verify_audit_ledger(
+        ctx.audit_ledger_path,
+        ctx.audit_hmac_key_path,
+        task_id=ctx.task_id,
+        runner=ctx.runner,
+        topic=ctx.topic,
+        request_id=ctx.request_id,
+    )
+    assert verification["ok"] is True
+    assert verification["entries_tampered"] == 0
+    assert verification["call_count_by_tool"]["quality_review_packet_read"] == 1
+    assert (
+        verification["successful_call_count_by_tool"]["quality_review_packet_read"]
+        == 1
+    )
+
+
 def test_legacy_blind_toolset_remains_unchanged() -> None:
     assert "aiworkhub_worker_quality_review_packet_read" not in BLIND_TOOLSET
     assert "aiworkhub_worker_quality_review_packet_read" in PACKET_READ_TOOLSET

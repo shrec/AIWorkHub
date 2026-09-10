@@ -6,6 +6,15 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.20] - 2026-09-10
+
+### Fixed
+
+- Source Graph `deadmethods` now reports exact entrypoint truth (NF568).
+- Nested quality-review findings now normalize to the canonical finding
+  schema (NF747).
+- Quality review now delivers a single reviewer packet (NF748).
+
 ## [0.11.19] - 2026-09-09
 
 ### Fixed

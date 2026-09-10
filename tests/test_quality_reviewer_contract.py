@@ -112,16 +112,27 @@ def test_finding_input_normalizer_json_object_string_normalizes_once(
     assert [item["summary"] for item in findings] == ["gate", "gate"]
 
 
-def test_finding_input_normalizer_rejects_malformed_scalar_nested_double_encoded(
+def test_finding_json_string_failures_have_distinct_deterministic_reasons(
     tmp_path: Path,
 ) -> None:
-    bad_values = [
-        "{not-json",
-        "42",
-        json.dumps(json.dumps({"severity": "high"})),
-        json.dumps([{"severity": "high"}]),
-    ]
-    for index, bad in enumerate(bad_values):
+    cases = (
+        ("{not-json", "finding_json_object_string_syntax_invalid"),
+        ("42", "finding_json_object_string_not_object"),
+        (
+            json.dumps(json.dumps({"severity": "high"})),
+            "finding_json_object_string_not_object",
+        ),
+        (
+            json.dumps([{"severity": "high"}]),
+            "finding_json_object_string_not_object",
+        ),
+        (
+            json.dumps({"severity": "high", "summary": "x", "path": ["nested"]}),
+            "finding_json_object_nested_field:path",
+        ),
+    )
+    seen: set[str] = set()
+    for index, (bad, reason) in enumerate(cases):
         case = tmp_path / str(index)
         case.mkdir()
         packet = _packet()
@@ -135,7 +146,12 @@ def test_finding_input_normalizer_rejects_malformed_scalar_nested_double_encoded
             findings=[bad],
         )
         assert result["ok"] is False
-        assert result["reason"] == "finding_json_object_string_invalid"
+        assert result["reason"] == reason
+        seen.add(reason)
+        if reason == "finding_json_object_nested_field:path":
+            assert result["field"] == "path"
+            assert "schema" not in result
+            assert "example" not in result
         report = worker_tools.verify_audit_ledger(
             ctx.audit_ledger_path,
             ctx.audit_hmac_key_path,
@@ -145,6 +161,99 @@ def test_finding_input_normalizer_rejects_malformed_scalar_nested_double_encoded
             request_id=ctx.request_id,
         )
         assert report["verified_payloads"] == []
+    assert seen == {
+        "finding_json_object_string_syntax_invalid",
+        "finding_json_object_string_not_object",
+        "finding_json_object_nested_field:path",
+    }
+
+
+def test_nested_evidence_object_guides_flat_correction_without_second_receipt(
+    tmp_path: Path,
+) -> None:
+    nested = dict(_in_scope_finding("nested-evidence"))
+    nested["evidence"] = {
+        "path": "src/aiworkhub/core.py",
+        "line_start": 7,
+        "line_end": 7,
+    }
+    packet = _packet()
+    packet_path = tmp_path / "review_packet.json"
+    packet_path.write_text(json.dumps(packet), encoding="utf-8")
+    ctx = _worker_context(tmp_path, packet_path)
+    rejected = worker_tools.quality_review_submit(
+        ctx,
+        packet_sha256=str(packet["packet_sha256"]),
+        lens="correctness",
+        findings=[json.dumps(nested)],
+    )
+    assert rejected["ok"] is False
+    assert rejected["reason"] == "finding_json_object_nested_field:evidence"
+    assert rejected["field"] == "evidence"
+    assert rejected["schema"] == qr.QUALITY_REVIEW_FINDING_SCHEMA_DOC
+    assert rejected["example"] == {
+        "severity": "high",
+        "summary": "one sentence",
+        "evidence": "src/path.py:1",
+    }
+    assert rejected["attempt"] == 1
+    assert rejected["corrections_remaining"] == 1
+    assert rejected["terminal"] is False
+    accepted = worker_tools.quality_review_submit(
+        ctx,
+        packet_sha256=str(packet["packet_sha256"]),
+        lens="correctness",
+        findings=[_in_scope_finding("nested-evidence")],
+    )
+    assert accepted["ok"] is True, accepted
+    assert accepted["durable"] is True
+    payloads = _verified_payloads(ctx)
+    assert len(payloads) == 1
+    assert payloads[0]["report"]["findings"][0]["id"] == "nested-evidence"
+
+
+def test_nested_evidence_two_failures_refuse_a_third_attempt(tmp_path: Path) -> None:
+    nested = json.dumps(
+        {
+            "severity": "high",
+            "summary": "gate",
+            "evidence": {
+                "path": "src/aiworkhub/core.py",
+                "line_start": 7,
+                "line_end": 7,
+            },
+        }
+    )
+    packet = _packet()
+    packet_path = tmp_path / "review_packet.json"
+    packet_path.write_text(json.dumps(packet), encoding="utf-8")
+    ctx = _worker_context(tmp_path, packet_path)
+    first = worker_tools.quality_review_submit(
+        ctx,
+        packet_sha256=str(packet["packet_sha256"]),
+        lens="correctness",
+        findings=[nested],
+    )
+    assert first["attempt"] == 1
+    assert first["terminal"] is False
+    second = worker_tools.quality_review_submit(
+        ctx,
+        packet_sha256=str(packet["packet_sha256"]),
+        lens="correctness",
+        findings=[nested],
+    )
+    assert second["reason"] == "finding_json_object_nested_field:evidence"
+    assert second["terminal"] is True
+    third = worker_tools.quality_review_submit(
+        ctx,
+        packet_sha256=str(packet["packet_sha256"]),
+        lens="correctness",
+        findings=[_in_scope_finding("too-late")],
+    )
+    assert third["ok"] is False
+    assert third["reason"] == "quality_review_correction_retry_exhausted"
+    assert third["terminal"] is True
+    assert _verified_payloads(ctx) == []
 
 
 def test_forged_or_wrong_identity_rejections_never_satisfy_nonempty_finding_gate(

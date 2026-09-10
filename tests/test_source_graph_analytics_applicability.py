@@ -23,8 +23,8 @@ report can be read directly against the acceptance contract:
   the SQL ``LIMIT``. After: scope and the builtin exclusion are pushed into
   the SQL.
 * Before: ``deadmethods`` called a symbol dead on resolved edges alone.
-  After: it states plainly that incoming-edge evidence excludes MCP/CLI
-  dispatch.
+  After: it excludes pytest/CLI/MCP entrypoints with explicit evidence and
+  states that unresolved edges are not execution proof.
 """
 
 from __future__ import annotations
@@ -470,6 +470,10 @@ def test_deadmethods_states_incoming_edge_evidence_is_incomplete(tmp_path: Path)
         # The caveat is stated plainly and names the unobserved dispatch paths.
         evidence = analysis["incoming_edge_evidence"]
         assert "dispatch" in evidence and "mcp" in evidence
+        assert "execution_proof" in evidence or "not_execution_proof" in evidence
+        limitation = analysis["applicability"]["limitation"]
+        assert "unresolved" in limitation
+        assert "proof" in limitation
         flagged = {
             finding["qualname"].split(".")[-1]: finding["reasons"]
             for finding in analysis["findings"]

@@ -6066,20 +6066,32 @@ def kb_write_intent(
 MAX_FINDING_JSON_STRING_CHARS = 32_768
 
 
-def _decode_finding_json_object(raw: str) -> tuple[dict[str, Any] | None, str | None]:
+def _decode_finding_json_object(
+    raw: str,
+) -> tuple[dict[str, Any] | None, str | None, dict[str, Any]]:
     """Decode one bounded, one-level JSON-object finding input string."""
+    empty: dict[str, Any] = {}
     if len(raw) > MAX_FINDING_JSON_STRING_CHARS:
-        return None, "finding_json_object_string_too_large"
+        return None, "finding_json_object_string_too_large", empty
     try:
         decoded = json.loads(raw)
     except (json.JSONDecodeError, ValueError):
-        return None, "finding_json_object_string_invalid"
+        return None, "finding_json_object_string_syntax_invalid", empty
     if not isinstance(decoded, dict):
-        return None, "finding_json_object_string_invalid"
-    for value in decoded.values():
+        return None, "finding_json_object_string_not_object", empty
+    for key, value in decoded.items():
         if value is not None and not isinstance(value, (bool, int, float, str)):
-            return None, "finding_json_object_string_invalid"
-    return decoded, None
+            field = str(key)
+            correction: dict[str, Any] = {"field": field}
+            if field == "evidence":
+                correction["schema"] = quality_reviewer.QUALITY_REVIEW_FINDING_SCHEMA_DOC
+                correction["example"] = {
+                    "severity": "high",
+                    "summary": "one sentence",
+                    "evidence": "src/path.py:1",
+                }
+            return None, f"finding_json_object_nested_field:{field}", correction
+    return decoded, None, empty
 
 
 def _record_rejected_finding_intent(
@@ -6295,20 +6307,21 @@ def quality_review_submit(
     decoded_findings: list[Any] = []
     for raw_finding in findings:
         if isinstance(raw_finding, str):
-            decoded, decode_reason = _decode_finding_json_object(raw_finding)
+            decoded, decode_reason, decode_correction = _decode_finding_json_object(
+                raw_finding
+            )
             if decoded is None:
-                return _charge_failed_submit_attempt(
+                recorded = _record_rejected_finding_intent(
                     ctx,
                     tool,
-                    _record_rejected_finding_intent(
-                        ctx,
-                        tool,
-                        decode_reason,
-                        packet_sha256=packet_sha256,
-                        lens=lens,
-                        raw_findings=list(findings),
-                    ),
+                    decode_reason,
+                    packet_sha256=packet_sha256,
+                    lens=lens,
+                    raw_findings=list(findings),
                 )
+                if decode_correction:
+                    recorded.update(decode_correction)
+                return _charge_failed_submit_attempt(ctx, tool, recorded)
             decoded_findings.append(decoded)
         else:
             decoded_findings.append(raw_finding)

@@ -5467,15 +5467,11 @@ def analytics_query(
         byte_trimmed = bool(payload.get("truncated")) and not pre_fit_truncated
         returned = _analytics_result_row_count(mode, payload)
         analysis = payload.get("analysis") if isinstance(payload, dict) else None
-        # ``scanned`` must equal what the analytic really examined, never the
-        # whole eligible corpus. Every mode is handed only ``page`` (at most
-        # ``budget`` rows sliced from ``corpus`` above), so no single call can
-        # examine more of the corpus than that page. A per-symbol filter mode
-        # reports its own ``analysis.symbols_scanned`` (the exact page rows it
-        # read); every other mode -- the page-sliced tags/hotspots/complexity/
-        # bottlenecks views and the aggregate snapshots alike -- ranks or
-        # aggregates over that same ``page``, so ``page_len`` is the truthful
-        # examined count for all of them.
+        # ``scanned`` equals what the analytic examined. Filter modes receive the
+        # whole scoped corpus and report that via ``analysis.symbols_scanned``
+        # (equal to ``eligible`` when every in-scope row was read). Modes that
+        # still slice their own input to one page and omit a scan count use
+        # ``page_len``. Returned rows stay budget-bounded.
         scans_per_symbol = (
             isinstance(analysis, dict) and isinstance(analysis.get("symbols_scanned"), int)
         )

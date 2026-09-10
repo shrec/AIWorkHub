@@ -315,6 +315,46 @@ class TestBuildReviewPrompt:
 
         assert json.loads(packet_file.read_text(encoding="utf-8")) == packet
 
+    def test_no_root_direct_call_inlines_and_does_not_write_caller_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        monkeypatch.delenv(quality_reviewer.REVIEW_PACKET_FILE_ROOT_ENV, raising=False)
+        packet = _packet_with_findings()
+        caller_path = tmp_path / "caller-selected.json"
+        prompt = quality_review.assemble_reviewer_prompt(
+            packet, lens="correctness", adapter_id="claude_cli",
+            packet_path=str(caller_path),
+        )
+        assert quality_review.extract_inline_packet(prompt) == packet
+        assert "QUALITY_REVIEW_PACKET_FILE:" not in prompt
+        assert str(caller_path) not in prompt
+        assert not caller_path.exists()
+
+        oversized = dict(packet)
+        oversized["candidate"] = dict(packet["candidate"])
+        oversized["candidate"]["padding"] = "x" * (100 * 1024)
+        oversized["packet_sha256"] = _canonical_digest(
+            {k: v for k, v in oversized.items() if k != "packet_sha256"}
+        )
+        with pytest.raises(ReviewerEvidenceError, match="quality_review_packet_too_large"):
+            quality_review.assemble_reviewer_prompt(
+                oversized, lens="correctness", adapter_id="claude_cli",
+                packet_path=str(caller_path),
+            )
+        assert not caller_path.exists()
+
+        runtime_root = tmp_path / "runtime"
+        runtime_root.mkdir()
+        bound_path = runtime_root / "quality_review_packet.json"
+        bound = quality_review.assemble_reviewer_prompt(
+            packet, lens="correctness", adapter_id="claude_cli",
+            packet_path=str(bound_path), packet_root=runtime_root,
+        )
+        assert bound.count("QUALITY_REVIEW_PACKET_FILE:") == 1
+        assert f"PACKET_SHA256: {packet['packet_sha256']}" in bound
+        assert "QUALITY_REVIEW_PACKET:" not in bound
+        assert json.loads(bound_path.read_text(encoding="utf-8")) == packet
+
     @pytest.mark.parametrize("adapter_id", ["codex_cli", "deepseek_copilot_cli"])
     def test_native_oversized_packet_uses_explicit_coordinator_root_without_env(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, adapter_id: str,
@@ -665,16 +705,15 @@ class TestBuildLensPacket:
         single = quality_reviewer.build_lens_packet(self._full_packet(), lens="security")
         assert quality_reviewer.build_lens_packet(single, lens="security") == single
 
-    def test_the_lens_packet_goes_inline_where_the_shared_packet_overflowed(
+    def test_bound_packet_file_uses_file_transport_even_when_lens_fits_inline(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ):
-        """File transport is overflow, not the normal case.
+        """Sighted bound-path transport is FILE+SHA regardless of size.
 
         Measured over 38 surviving packets: 130 KB mean, 83.6% of it
-        ``candidate.scoped_audits`` -- three near-identical copies -- so EVERY
-        packet crossed the 96 KiB inline cap and every reviewer spent its first
-        turns fetching and dissecting a file two thirds of which was about
-        other lenses.  One lens's slice fits inline.
+        ``candidate.scoped_audits``. Lens slicing still shrinks the on-disk
+        packet; a bound packet_file no longer switches the prompt to inline
+        just because the slice is under 96 KiB.
         """
         scoped = _scoped_audits("correctness", "security", "code_quality")
         for lens, audit in scoped.items():
@@ -699,10 +738,12 @@ class TestBuildLensPacket:
 
         assert "QUALITY_REVIEW_PACKET_FILE:" in shared_prompt
         assert "QUALITY_REVIEW_PACKET:" not in shared_prompt
-        assert "QUALITY_REVIEW_PACKET:" in lens_prompt
-        assert "QUALITY_REVIEW_PACKET_FILE:" not in lens_prompt
-        assert not (tmp_path / "lens.json").exists()
-        assert quality_review.extract_inline_packet(lens_prompt) == packet
+        assert "QUALITY_REVIEW_PACKET_FILE:" in lens_prompt
+        assert "QUALITY_REVIEW_PACKET:" not in lens_prompt
+        assert json.loads((tmp_path / "lens.json").read_text(encoding="utf-8")) == packet
+        assert quality_review.extract_inline_packet(lens_prompt) is None
+        unbound = quality_reviewer.build_review_prompt(packet, lens="security")
+        assert quality_review.extract_inline_packet(unbound) == packet
 
 
 class TestNormalizePacketFindings:

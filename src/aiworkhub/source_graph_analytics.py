@@ -11,10 +11,13 @@ or call edges: when no imported runtime evidence exists it is reported as
 
 from __future__ import annotations
 
+import ast
 import builtins as _builtins
+import configparser
 import hashlib
 import re
 import sqlite3
+import tomllib
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
@@ -58,6 +61,22 @@ _BUILD_RE = re.compile(r"(^|/)(build|ci|scripts?|tools?)(/|$)", re.IGNORECASE)
 _DATA_RE = re.compile(r"\b(data|schema|model|record|entity|store|database|db)\b", re.IGNORECASE)
 _API_RE = re.compile(r"\b(api|server|client|handler|route|controller|endpoint)\b", re.IGNORECASE)
 _TEST_RE = re.compile(r"(^|/)(tests?|specs?)(/|$)|(^|/)(test_|spec_)", re.IGNORECASE)
+_PYTEST_COLLECT_FILE_RE = re.compile(
+    r"(?:^|/)(?:conftest\.py$|test_[^/]*\.py$|[^/]*_test\.py$)",
+    re.IGNORECASE,
+)
+_PYTEST_FIXTURE_DECORATOR_RE = re.compile(
+    r"^[ \t]*@[ \t]*(?:pytest[ \t]*\.[ \t]*)?fixture\b",
+    re.MULTILINE,
+)
+_MCP_TOOL_DECORATOR_RE = re.compile(
+    r"^[ \t]*@[ \t]*(?:[\w]+[ \t]*\.[ \t]*)+tool[ \t]*\(",
+    re.MULTILINE,
+)
+_CLI_COMMAND_DECORATOR_RE = re.compile(
+    r"^[ \t]*@[ \t]*(?:[\w]+[ \t]*\.[ \t]*)+(?:command|group)[ \t]*\(",
+    re.MULTILINE,
+)
 _RAW_PTR_RE = re.compile(
     r"\b(?:char|short|int|long|float|double|void|[A-Z]\w*(?:::\w+)*)\s*\*\s*\w+"
 )
@@ -548,6 +567,317 @@ def _symbol_source(repo_root: Path, row: dict[str, Any], *, max_chars: int = 240
         return ""
 
 
+_ENTRYPOINT_SOURCE_READ_LIMIT = 262144
+
+
+def _file_text(repo_root: Path, file_path: str) -> str:
+    try:
+        root = repo_root.resolve()
+        path = (root / file_path).resolve()
+        if not path.is_relative_to(root) or not path.is_file():
+            return ""
+        with path.open("rb") as handle:
+            raw = handle.read(_ENTRYPOINT_SOURCE_READ_LIMIT)
+        return raw.decode("utf-8", errors="replace")
+    except (OSError, TypeError, ValueError):
+        return ""
+
+
+def _split_packaging_entrypoint(value: str) -> tuple[str, str] | None:
+    text = value.strip().strip("'\"")
+    extra = text.find("[")
+    if extra >= 0:
+        text = text[:extra].strip()
+    if ":" not in text:
+        return None
+    module, func = text.split(":", 1)
+    module = module.strip()
+    func = func.strip()
+    if not module or not all(part.isidentifier() for part in func.split(".")):
+        return None
+    return module, func
+
+
+def _pyproject_script_entrypoints(text: str) -> set[tuple[str, str]]:
+    found: set[tuple[str, str]] = set()
+    if not text:
+        return found
+    try:
+        data = tomllib.loads(text)
+    except tomllib.TOMLDecodeError:
+        return found
+    project = data.get("project")
+    if not isinstance(project, dict):
+        return found
+    for key in ("scripts", "gui-scripts"):
+        table = project.get(key)
+        if not isinstance(table, dict):
+            continue
+        for value in table.values():
+            if not isinstance(value, str):
+                continue
+            parsed = _split_packaging_entrypoint(value)
+            if parsed is not None:
+                found.add(parsed)
+    return found
+
+
+def _setup_cfg_script_entrypoints(text: str) -> set[tuple[str, str]]:
+    found: set[tuple[str, str]] = set()
+    if not text:
+        return found
+    parser = configparser.ConfigParser(interpolation=None)
+    try:
+        parser.read_string(text)
+    except (configparser.Error, TypeError, ValueError):
+        return found
+    if not parser.has_section("options.entry_points"):
+        return found
+    for option in ("console_scripts", "gui_scripts"):
+        if not parser.has_option("options.entry_points", option):
+            continue
+        raw = parser.get("options.entry_points", option)
+        for line in raw.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or "=" not in stripped:
+                continue
+            _name, value = stripped.split("=", 1)
+            parsed = _split_packaging_entrypoint(value)
+            if parsed is not None:
+                found.add(parsed)
+    return found
+
+
+def _packaging_console_scripts(repo_root: Path) -> frozenset[tuple[str, str]]:
+    found: set[tuple[str, str]] = set()
+    found.update(_pyproject_script_entrypoints(_file_text(repo_root, "pyproject.toml")))
+    found.update(_setup_cfg_script_entrypoints(_file_text(repo_root, "setup.cfg")))
+    return frozenset(found)
+
+
+def _file_matches_module(file_path: str, module: str) -> bool:
+    relative = file_path.replace("\\", "/").lstrip("./")
+    dotted = module.replace(".", "/")
+    return (
+        relative == f"{dotted}.py"
+        or relative.endswith(f"/{dotted}.py")
+        or relative == f"{dotted}/__init__.py"
+        or relative.endswith(f"/{dotted}/__init__.py")
+    )
+
+
+def _packaging_object_identity(row: dict[str, Any], file_text: str) -> str | None:
+    name = str(row.get("name") or "")
+    if not name.isidentifier():
+        return None
+    file_path = str(row.get("file_path") or "").replace("\\", "/")
+    qualname = str(row.get("qualname") or "")
+    from_qual: str | None = None
+    if qualname:
+        relative = file_path.lstrip("./")
+        prefixes: list[str] = []
+        if relative:
+            prefixes.append(relative)
+            if relative.endswith(".py"):
+                module = relative[:-3].replace("/", ".")
+                prefixes.append(module)
+                if module.endswith(".__init__"):
+                    prefixes.append(module[: -len(".__init__")])
+        remainder: str | None = None
+        if qualname == name:
+            remainder = name
+        else:
+            for prefix in prefixes:
+                if qualname.startswith(prefix + "."):
+                    remainder = qualname[len(prefix) + 1 :]
+                    break
+            else:
+                if qualname.endswith("." + name) or qualname == name:
+                    remainder = qualname
+        if remainder:
+            parts = remainder.split(".")
+            if parts[-1] == name and all(part.isidentifier() for part in parts):
+                from_qual = remainder
+    from_line: str | None = None
+    line_start = int(row.get("line_start") or 0)
+    if line_start >= 1 and file_text:
+        lines = file_text.splitlines()
+        if line_start <= len(lines):
+            def_match = re.match(
+                r"^([ \t]*)(?:async[ \t]+)?(?:def|class)[ \t]+(\w+)\b",
+                lines[line_start - 1],
+            )
+            if def_match is not None and def_match.group(2) == name:
+                indent = len(def_match.group(1))
+                classes: list[str] = []
+                for raw in reversed(lines[: line_start - 1]):
+                    stripped = raw.strip()
+                    if not stripped or stripped.startswith("#"):
+                        continue
+                    raw_indent = len(raw) - len(raw.lstrip(" \t"))
+                    if raw_indent >= indent:
+                        continue
+                    class_match = re.match(r"^[ \t]*class[ \t]+(\w+)\b", raw)
+                    if class_match is not None:
+                        classes.append(class_match.group(1))
+                    indent = raw_indent
+                    if indent == 0:
+                        break
+                classes.reverse()
+                from_line = ".".join((*classes, name))
+    if from_qual is None:
+        return from_line
+    if from_line is None or from_qual == from_line:
+        return from_qual
+    return None
+
+
+def _leading_decorators(file_text: str, line_start: int) -> str:
+    lines = file_text.splitlines()
+    idx = max(0, min(len(lines), int(line_start or 1) - 1))
+    start = idx
+    depth = 0
+    walked = 0
+    while start > 0 and walked < 48:
+        walked += 1
+        stripped = lines[start - 1].strip()
+        if not stripped or stripped.startswith("#"):
+            start -= 1
+            continue
+        depth += stripped.count(")") - stripped.count("(")
+        if stripped.startswith("@"):
+            start -= 1
+            if depth < 0:
+                depth = 0
+            continue
+        if depth > 0:
+            start -= 1
+            continue
+        if start >= 2 and lines[start - 2].rstrip().endswith("\\"):
+            start -= 1
+            continue
+        break
+    return "\n".join(lines[start:idx])
+
+
+def _constant_str(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    return None
+
+
+def _is_name_main_guard(test: ast.AST) -> bool:
+    if not isinstance(test, ast.Compare) or len(test.ops) != 1 or len(test.comparators) != 1:
+        return False
+    if not isinstance(test.ops[0], ast.Eq):
+        return False
+    left, right = test.left, test.comparators[0]
+    name_left = isinstance(left, ast.Name) and left.id == "__name__"
+    name_right = isinstance(right, ast.Name) and right.id == "__name__"
+    return (name_left and _constant_str(right) == "__main__") or (
+        name_right and _constant_str(left) == "__main__"
+    )
+
+
+def _ast_object_identity(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Name) and node.id.isidentifier():
+        return node.id
+    if isinstance(node, ast.Attribute) and node.attr.isidentifier():
+        parent = _ast_object_identity(node.value)
+        if parent is None:
+            return None
+        return f"{parent}.{node.attr}"
+    return None
+
+
+def _executable_guard_invokes_local(node: ast.AST, identity: str) -> bool:
+    func = node.func if isinstance(node, ast.Call) else None
+    if func is not None and _ast_object_identity(func) == identity:
+        return True
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+        return False
+    return any(
+        _executable_guard_invokes_local(child, identity) for child in ast.iter_child_nodes(node)
+    )
+
+
+def _if_main_invokes(file_text: str, identity: str) -> bool:
+    if not identity:
+        return False
+    try:
+        tree = ast.parse(file_text)
+    except SyntaxError:
+        return False
+    for stmt in tree.body:
+        if not isinstance(stmt, ast.If) or not _is_name_main_guard(stmt.test):
+            continue
+        if any(_executable_guard_invokes_local(child, identity) for child in stmt.body):
+            return True
+    return False
+
+
+def _is_mcp_tool_apply(node: ast.Call, identity: str) -> bool:
+    inner = node.func
+    if not isinstance(inner, ast.Call):
+        return False
+    func = inner.func
+    if not isinstance(func, ast.Attribute) or func.attr != "tool":
+        return False
+    return any(_ast_object_identity(arg) == identity for arg in node.args)
+
+
+def _executable_mcp_registers(node: ast.AST, identity: str) -> bool:
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+        return False
+    if isinstance(node, ast.Call) and _is_mcp_tool_apply(node, identity):
+        return True
+    return any(_executable_mcp_registers(child, identity) for child in ast.iter_child_nodes(node))
+
+
+def _mcp_tool_registration_call(file_text: str, identity: str) -> bool:
+    if not identity:
+        return False
+    try:
+        tree = ast.parse(file_text)
+    except SyntaxError:
+        return False
+    return any(_executable_mcp_registers(stmt, identity) for stmt in tree.body)
+
+
+def _deadmethods_entrypoint_exclusion(
+    row: dict[str, Any],
+    *,
+    file_text: str,
+    packaging_entrypoints: frozenset[tuple[str, str]],
+) -> str | None:
+    file_path = str(row.get("file_path") or "")
+    name = str(row.get("name") or "")
+    kind = str(row.get("kind") or "")
+    collect_file = bool(_PYTEST_COLLECT_FILE_RE.search(file_path.replace("\\", "/")))
+    if collect_file and name.startswith("test_"):
+        return "pytest_collection_naming_and_location"
+    if collect_file and kind == "class" and name.startswith("Test"):
+        return "pytest_collection_naming_and_location"
+    decorators = _leading_decorators(file_text, int(row.get("line_start") or 1))
+    if collect_file and _PYTEST_FIXTURE_DECORATOR_RE.search(decorators):
+        return "pytest_fixture_decorator"
+    if _MCP_TOOL_DECORATOR_RE.search(decorators):
+        return "mcp_tool_decorator"
+    identity = _packaging_object_identity(row, file_text)
+    if identity is not None and _mcp_tool_registration_call(file_text, identity):
+        return "mcp_tool_registration_call"
+    if _CLI_COMMAND_DECORATOR_RE.search(decorators):
+        return "cli_framework_decorator"
+    if identity is not None and _if_main_invokes(file_text, identity):
+        return "dunder_main_invocation"
+    if identity is not None and any(
+        object_ref == identity and _file_matches_module(file_path, module)
+        for module, object_ref in packaging_entrypoints
+    ):
+        return "packaging_console_script"
+    return None
+
+
 def _risk_views(
     conn: sqlite3.Connection,
     repo_root: Path,
@@ -563,6 +893,10 @@ def _risk_views(
     candidate_symbols = 0
     applicable_candidates = 0
     skipped_by_language: Counter[str] = Counter()
+    packaging_entrypoints = (
+        _packaging_console_scripts(repo_root) if mode == "deadmethods" else frozenset()
+    )
+    deadmethods_file_text: dict[str, str] = {}
     for row in rows:
         if str(row.get("kind") or "") not in {"function", "method", "class", "struct"}:
             continue
@@ -620,15 +954,23 @@ def _risk_views(
                 "SELECT COUNT(*) FROM edges WHERE kind='calls' AND dst_qualname=?", (qualname,)
             ).fetchone()[0])
             name = str(row.get("name") or "")
-            if incoming == 0 and name not in {"main", "__init__", "activate", "deactivate"}:
-                reasons.append("no_resolved_incoming_calls_dynamic_dispatch_unobserved")
+            if incoming == 0 and name != "__init__":
+                file_path = str(row.get("file_path") or "")
+                if file_path not in deadmethods_file_text:
+                    deadmethods_file_text[file_path] = _file_text(repo_root, file_path)
+                if _deadmethods_entrypoint_exclusion(
+                    row,
+                    file_text=deadmethods_file_text[file_path],
+                    packaging_entrypoints=packaging_entrypoints,
+                ) is None:
+                    reasons.append("no_resolved_incoming_calls_dynamic_dispatch_unobserved")
         elif mode == "duplicates":
             normalized = re.sub(
                 r"\s+", " ", _mask_comments_only(source, language)
             ).strip()
             if len(normalized) >= 80:
                 duplicate_groups[hashlib.sha256(normalized.encode()).hexdigest()].append(row)
-        if reasons:
+        if reasons and len(findings) < budget:
             findings.append({
                 "file_path": row.get("file_path"),
                 "qualname": row.get("qualname"),
@@ -636,8 +978,6 @@ def _risk_views(
                 "reasons": reasons,
                 "evidence_class": "bounded_lexical_candidate_not_proven_defect",
             })
-        if len(findings) >= budget:
-            break
     if mode == "duplicates":
         findings = [
             {
@@ -678,12 +1018,20 @@ def _risk_views(
         result["applicable_languages"] = sorted(applicable_languages)
         result["symbols_skipped_by_language"] = dict(sorted(skipped_by_language.items()))
     if mode == "deadmethods":
-        # Incoming edges are resolved static calls only: a symbol reached solely
-        # through MCP or CLI dispatch has no resolved edge and must not be
-        # called dead without this caveat stated plainly.
         result["incoming_edge_evidence"] = (
-            "resolved_static_call_edges_only_excludes_mcp_and_cli_dispatch"
+            "resolved_static_call_edges_only_not_execution_proof;"
+            "unresolved_dynamic_mcp_cli_and_dispatch_unobserved"
         )
+        result["applicability"] = {
+            "excludes": [
+                "pytest_collected_by_naming_and_location",
+                "cli_entrypoints_with_explicit_evidence",
+                "mcp_handlers_with_explicit_registration_evidence",
+            ],
+            "limitation": (
+                "no_incoming_edge_is_unresolved_static_reachability_not_runtime_proof"
+            ),
+        }
     return result
 
 
