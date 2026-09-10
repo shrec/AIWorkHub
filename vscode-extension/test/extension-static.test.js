@@ -306,12 +306,10 @@ assert.ok(readme.includes("media/aiworkhub-hero.png"));
 assert.ok(!/<img[^>]+\.svg/i.test(readme), "README must not embed an SVG image");
 assert.ok(readme.includes(`What's new in ${pkg.version}`));
 assert.ok(readme.includes("Automatic quality-review launch"));
-assert.ok(readme.includes("Tool Recipes"));
-assert.ok(readme.includes("accessible popup"));
-assert.ok(readme.includes("universal development-skill design"));
-assert.ok(readme.includes("NF769"));
-assert.ok(readme.includes("NF761"));
-assert.ok(readme.includes("NF690"));
+assert.ok(readme.includes("authenticated aggregate"));
+assert.ok(readme.includes("exactly one manager callback"));
+assert.ok(readme.includes("never accepts or rejects"));
+assert.ok(readme.includes("Legacy review receipts"));
 for (const heading of [
   "Architecture at a glance",
   "Highlights",

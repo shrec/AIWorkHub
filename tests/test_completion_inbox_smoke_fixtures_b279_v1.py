@@ -128,7 +128,23 @@ def test_finalization_failures_are_operational_not_ordinary_review_queue():
             "task_id": "TASK_REVIEW_READY",
             "runner": "worker_ready",
             "topic": "task_mcp",
+            "claim_epoch": 1,
             "terminal_substatus": "review_ready",
+            "terminal_review": {
+                "substatus": "review_ready",
+                "evidence": {
+                    "request_identity": {"request_id": "REQ-READY"}
+                },
+            },
+            "manager_ready_receipt": {
+                "manager_ready": {
+                    "schema_id": "aiworkhub.manager_ready_receipt.v1",
+                    "target_task_id": "TASK_REVIEW_READY",
+                    "target_request_id": "REQ-READY",
+                    "claim_epoch": "1",
+                    "reviews": [],
+                }
+            },
             "updated_at": "2026-08-09T00:00:00+00:00",
         },
         "TASK_FINALIZE_FAILED": {
@@ -176,7 +192,8 @@ def test_finalization_failures_are_operational_not_ordinary_review_queue():
     assert [row["task_id"] for row in result["review_queue"]] == [
         "TASK_REVIEW_READY"
     ]
-    assert result["review_queue"][0]["quality_reviewer_eligible"] is True
+    assert result["review_queue"][0]["quality_reviewer_eligible"] is False
+    assert result["review_queue"][0]["manager_reviewable"] is True
     assert [row["task_id"] for row in result["operational_failures"]] == [
         "TASK_VALIDATION_SCRATCH_FAILED",
         "TASK_FINALIZE_FAILED"
@@ -1828,7 +1845,7 @@ def test_inbox_non_superseded_and_invalid_successor_ids_fail_closed():
 
 
 def _packet_card(*, findings=None, validation=None, checks=None) -> dict:
-    return {
+    card = {
         "task_id": "T-PACKET",
         "runner": "claude_worker_b1",
         "topic": "task_mcp",
@@ -1929,6 +1946,17 @@ def _packet_card(*, findings=None, validation=None, checks=None) -> dict:
             },
         },
     }
+    card["manager_ready_receipt"] = {
+        "manager_ready": {
+            "schema_id": "aiworkhub.manager_ready_receipt.v1",
+            "target_task_id": "T-PACKET",
+            "target_request_id": "R-PACKET",
+            "claim_epoch": "4",
+            "lenses": ["correctness", "security"],
+            "reviews": [],
+        }
+    }
+    return card
 
 
 def test_review_packet_carries_every_gate_row_from_one_card():

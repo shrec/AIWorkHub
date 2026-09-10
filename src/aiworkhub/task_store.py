@@ -2734,6 +2734,144 @@ def mark_terminal_review_with_callback(
         )
 
 
+def manager_ready_marker(card: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Return a strictly bound manager-ready marker from one task card."""
+
+    receipt = card.get("manager_ready_receipt")
+    aggregate = receipt.get("manager_ready") if isinstance(receipt, Mapping) else None
+    terminal = card.get("terminal_review")
+    evidence = terminal.get("evidence") if isinstance(terminal, Mapping) else None
+    request_identity = (
+        evidence.get("request_identity") if isinstance(evidence, Mapping) else None
+    )
+    if not isinstance(aggregate, Mapping) or not isinstance(request_identity, Mapping):
+        return None
+    try:
+        claim_epoch = str(int(card.get("claim_epoch") or 0))
+    except (TypeError, ValueError):
+        return None
+    if (
+        aggregate.get("schema_id") != review_lifecycle.MANAGER_READY_SCHEMA_ID
+        or aggregate.get("target_task_id") != card.get("task_id")
+        or aggregate.get("target_request_id")
+        != request_identity.get("request_id")
+        or str(aggregate.get("claim_epoch")) != claim_epoch
+        or not isinstance(aggregate.get("reviews"), list)
+    ):
+        return None
+    return dict(receipt)
+
+
+def publish_manager_ready(
+    root: str | Path,
+    *,
+    task_id: str,
+    request_id: str,
+    claim_epoch: str | int,
+) -> tuple[bool, str, bool]:
+    """Persist the authenticated review aggregate and enqueue its sole callback.
+
+    The review action is completed before this function is called.  Re-reading
+    it through ``review_lifecycle`` authenticates the whole chain, so neither a
+    caller payload nor an uncommitted orchestrator effect can mint manager-ready
+    state.  Card marker, event, and callback row commit in one transaction.
+    """
+
+    _readiness, db_path = _require_ready(root)
+    receipt = review_lifecycle.manager_ready_receipt_for_target(
+        db_path,
+        target_task_id=task_id,
+        target_request_id=request_id,
+        claim_epoch=claim_epoch,
+    )
+    if receipt is None:
+        raise TaskStoreError("manager_ready_receipt_missing")
+    aggregate = receipt["manager_ready"]
+    receipt_sha256 = hashlib.sha256(
+        json.dumps(
+            receipt, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        ).encode("utf-8")
+    ).hexdigest()
+    with _write_connection(db_path) as conn:
+        _begin_immediate(conn)
+        row = conn.execute(
+            "SELECT status, worker_status, card_json, origin_thread_id "
+            "FROM tasks WHERE task_id=?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            conn.rollback()
+            return False, "task_not_found", False
+        try:
+            card = json.loads(str(row["card_json"] or "{}"))
+        except json.JSONDecodeError:
+            card = {}
+        if not isinstance(card, dict):
+            card = {}
+        existing = card.get("manager_ready_receipt")
+        if existing == receipt:
+            conn.rollback()
+            return True, canonical_status(dict(row)), False
+        terminal = card.get("terminal_review")
+        evidence = terminal.get("evidence") if isinstance(terminal, Mapping) else None
+        request_identity = (
+            evidence.get("request_identity") if isinstance(evidence, Mapping) else None
+        )
+        if (
+            canonical_status(dict(row)) != "review"
+            or str(card.get("terminal_substatus") or "") != "review_ready"
+            or not isinstance(request_identity, Mapping)
+            or str(request_identity.get("request_id") or "") != request_id
+            or str(card.get("claim_epoch") or "") != str(claim_epoch)
+        ):
+            conn.rollback()
+            return False, "manager_ready_target_identity_mismatch", False
+        if existing not in (None, {}) and existing != receipt:
+            conn.rollback()
+            return False, "manager_ready_receipt_conflict", False
+        now = datetime.now(timezone.utc).isoformat()
+        card["manager_ready_receipt"] = receipt
+        card["manager_ready_receipt_sha256"] = receipt_sha256
+        card["manager_ready_at"] = now
+        conn.execute(
+            "UPDATE tasks SET updated_at=?, card_json=? WHERE task_id=?",
+            (now, json.dumps(card, ensure_ascii=False, sort_keys=True), task_id),
+        )
+        conn.execute(
+            "INSERT INTO task_events(task_id, event, runner, payload_json, created_at) "
+            "VALUES (?, 'manager_ready', 'system', ?, ?)",
+            (
+                task_id,
+                json.dumps(
+                    {
+                        "request_id": request_id,
+                        "claim_epoch": str(claim_epoch),
+                        "chain_id": aggregate["chain_id"],
+                        "receipt_sha256": receipt_sha256,
+                        "lenses": aggregate["lenses"],
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                now,
+            ),
+        )
+        callback_enqueued = _enqueue_terminal_callback_row(
+            conn,
+            task_id=task_id,
+            provider=str(card.get("coordinator_provider") or ""),
+            origin_thread_id=str(
+                row["origin_thread_id"] or card.get("origin_thread_id") or ""
+            ),
+            transition="review_ready",
+            episode_id=str(claim_epoch),
+            request_id=request_id,
+            now=now,
+        )
+        conn.commit()
+        return True, "review", callback_enqueued
+
+
 def mark_review_workspace_missing(
     root: str | Path,
     task_id: str,

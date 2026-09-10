@@ -3136,7 +3136,15 @@ def test_successful_isolated_reconcile_enters_review_without_promoting(
 
     review_calls = []
 
-    def fake_review_terminal_exact(metadata_arg, substatus, *, request_id, error="", evidence=None):
+    def fake_review_terminal_exact(
+        metadata_arg,
+        substatus,
+        *,
+        request_id,
+        error="",
+        evidence=None,
+        notify_manager=True,
+    ):
         review_calls.append(
             {
                 "repo": repo,
@@ -3144,6 +3152,7 @@ def test_successful_isolated_reconcile_enters_review_without_promoting(
                 "runner": metadata_arg["runner"],
                 "substatus": substatus,
                 "evidence": evidence or {},
+                "notify_manager": notify_manager,
             }
         )
         return {"ok": True, "returncode": 0, "stdout": "{}", "stderr": ""}
@@ -3217,6 +3226,7 @@ def test_successful_isolated_reconcile_enters_review_without_promoting(
     assert call["substatus"] == "review_ready"
     assert call["task_id"] == "TASK_B1"
     assert call["runner"] == "claude_worker_b1"
+    assert call["notify_manager"] is False
     evidence = call["evidence"]
     assert "out/result.json" in evidence["changed_paths"]
     assert evidence["changed_path_hashes"]["out/result.json"] == hashlib.sha256(
@@ -3656,13 +3666,22 @@ def test_finalize_isolated_request_validation_only_replay_authorization(
 
     review_calls = []
 
-    def fake_review_terminal_exact(metadata_arg, substatus, *, request_id, error="", evidence=None):
+    def fake_review_terminal_exact(
+        metadata_arg,
+        substatus,
+        *,
+        request_id,
+        error="",
+        evidence=None,
+        notify_manager=True,
+    ):
         review_calls.append(
             {
                 "request_id": request_id,
                 "task_id": metadata_arg["task_id"],
                 "substatus": substatus,
                 "evidence": evidence or {},
+                "notify_manager": notify_manager,
             }
         )
         return {"ok": True, "returncode": 0, "stdout": "{}", "stderr": ""}

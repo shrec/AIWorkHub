@@ -1784,3 +1784,32 @@ def test_create_task_rejects_unbounded_validation_and_roles(
     )
     assert invalid_roles["ok"] is False
     assert invalid_roles["stderr"] == "invalid_validation_roles"
+
+
+def test_system_review_ready_suppresses_manager_callback_until_quality_chain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    observed: dict[str, object] = {}
+    monkeypatch.setattr(task_store, "get_task", lambda _repo, _task_id: {})
+
+    def terminalize(_repo, _task_id, **kwargs):
+        observed.update(kwargs)
+        return True, "review", False
+
+    monkeypatch.setattr(task_store, "mark_terminal_review_with_callback", terminalize)
+
+    result = task_engine.mark_terminal_review(
+        repo,
+        "TARGET",
+        "glm53_worker",
+        "review_ready",
+        evidence={"request_id": "target-request"},
+        notify_manager=False,
+    )
+
+    assert result["ok"] is True
+    assert result["callback_enqueued"] is False
+    assert observed["callback_transition"] == ""
+    assert observed["callback_request_id"] == "target-request"

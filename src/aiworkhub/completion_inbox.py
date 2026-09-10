@@ -66,7 +66,7 @@ import re
 from datetime import datetime, timezone
 from typing import Any
 
-from aiworkhub import core, task_plan
+from aiworkhub import core, task_plan, task_store
 
 READONLY: bool = True
 LAUNCH_IMPLEMENTED: bool = False
@@ -396,6 +396,19 @@ def _compact_review_entry(card: dict[str, Any], mismatch: str) -> dict[str, Any]
     operational_error = str(
         terminal_evidence.get("error") or card.get("validation_error") or ""
     )
+    manager_ready = task_store.manager_ready_marker(card)
+    # Imported/legacy review rows predate terminal substatus and have no
+    # automatic chain to finish them; keep those visible so the migration does
+    # not strand existing work.  Every newly finalized candidate has an exact
+    # substatus and therefore requires the authenticated marker.
+    manager_reviewable = (
+        manager_ready is not None or terminal_substatus != "review_ready"
+    )
+    aggregate = (
+        manager_ready.get("manager_ready")
+        if isinstance(manager_ready, dict)
+        else {}
+    )
     return {
         "task_id": card.get("task_id"),
         "runner": card.get("runner"),
@@ -409,7 +422,14 @@ def _compact_review_entry(card: dict[str, Any], mismatch: str) -> dict[str, Any]
         "validation_status": card.get("validation_status", "unreported"),
         "terminal_substatus": terminal_substatus,
         "operational_error": operational_error[:300] or None,
-        "quality_reviewer_eligible": terminal_substatus == "review_ready",
+        "quality_reviewer_eligible": (
+            terminal_substatus == "review_ready" and manager_ready is None
+        ),
+        "manager_reviewable": manager_reviewable,
+        "manager_ready_lenses": list(aggregate.get("lenses") or []),
+        "manager_ready_receipt_sha256": card.get(
+            "manager_ready_receipt_sha256"
+        ),
         "runner_task_batch_mismatch": mismatch or None,
     }
 
@@ -662,10 +682,17 @@ def build_completion_inbox(
         for entry in review_entries
         if _is_operational_finalization_failure(entry)
     ]
+    quality_review_pending = [
+        entry
+        for entry in review_entries
+        if not _is_operational_finalization_failure(entry)
+        and not entry.get("manager_reviewable")
+    ]
     review_queue = [
         entry
         for entry in review_entries
         if not _is_operational_finalization_failure(entry)
+        and entry.get("manager_reviewable")
     ]
     review_queue.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
     operational_failures.sort(
@@ -730,6 +757,7 @@ def build_completion_inbox(
             "stale_processing_hours": stale_processing_hours,
         },
         "review_queue": review_queue,
+        "quality_review_pending": quality_review_pending,
         "operational_failures": operational_failures,
         "stale_processing": stale_processing,
         "runner_mismatch_warnings": runner_mismatch_warnings,
@@ -742,6 +770,7 @@ def build_completion_inbox(
             "review_scanned": len(cards_by_status["review"]),
             "blocked_scanned": len(cards_by_status.get("blocked", [])),
             "review_queue": len(review_queue),
+            "quality_review_pending": len(quality_review_pending),
             "operational_failures": len(operational_failures),
             "stale_processing": len(stale_processing),
             "runner_mismatch_warnings": len(runner_mismatch_warnings),
@@ -1046,6 +1075,24 @@ def review_packet(
             return {**packet, "ok": False, "error": "card_unreadable",
                     "read_error": read_error}
         card = fetched
+    manager_ready = task_store.manager_ready_marker(card)
+    card_terminal = card.get("terminal_review")
+    card_substatus = str(
+        card.get("terminal_substatus")
+        or (
+            card_terminal.get("substatus")
+            if isinstance(card_terminal, dict)
+            else ""
+        )
+        or ""
+    )
+    if manager_ready is None and card_substatus == "review_ready":
+        return {**packet, "ok": False, "error": "manager_review_not_ready"}
+    packet["manager_ready"] = (
+        manager_ready["manager_ready"]
+        if manager_ready is not None
+        else {"schema_id": "aiworkhub.manager_ready_legacy.v1"}
+    )
     terminal = card.get("terminal_review")
     terminal = terminal if isinstance(terminal, dict) else {}
     evidence = terminal.get("evidence")

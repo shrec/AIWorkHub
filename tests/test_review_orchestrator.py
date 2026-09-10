@@ -12,7 +12,7 @@ _SRC = Path(__file__).resolve().parents[1] / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from aiworkhub import review_lifecycle, review_orchestrator  # noqa: E402
+from aiworkhub import review_lifecycle, review_orchestrator, task_store  # noqa: E402
 import pytest  # noqa: E402
 
 
@@ -523,11 +523,9 @@ def test_automatic_chain_stops_at_acceptance_and_never_accepts_the_target(
 ) -> None:
     """Fixing the launch check must not hand acceptance to the orchestrator.
 
-    Every chain used to die at its first launch action, which is the only
-    reason ``target_accept`` (which calls ``manager.accept_review`` on the
-    TARGET) had never run. That was an accident, not a control. The nine
-    reviewer actions now complete automatically and the chain parks at
-    acceptance with an explicit reason.
+    The nine reviewer actions complete automatically, then one authenticated
+    manager-ready receipt is sealed.  Archival waits while the target remains
+    in review and no target acceptance call is made by the orchestrator.
     """
     monkeypatch.setattr(
         review_orchestrator.task_engine,
@@ -548,9 +546,13 @@ def test_automatic_chain_stops_at_acceptance_and_never_accepts_the_target(
     assert review_orchestrator.AUTOMATIC_TARGET_ACCEPT_ENABLED is False
     for _ in range(9):
         assert driver.drain(max_actions=1, now=NOW).completed == 1
-    gated = driver.drain(max_actions=1, now=NOW)
+    manager_ready = driver.drain(max_actions=1, now=NOW)
+    cleanup = driver.drain(max_actions=2, now=NOW)
 
-    assert gated.failed == 1
+    assert manager_ready.completed == 1
+    assert manager_ready.failed == 0
+    assert cleanup.completed == 2
+    assert cleanup.pending == 0
     assert manager.accepts == [
         ("review-request-" + lens, task_id)
         for lens, task_id in zip(
@@ -561,44 +563,130 @@ def test_automatic_chain_stops_at_acceptance_and_never_accepts_the_target(
     assert ("target-request", "TARGET") not in manager.accepts
     rows = review_lifecycle.rows_for_test(tmp_path / "gated.sqlite")
     assert rows[9]["action_type"] == "target_accept"
-    assert rows[9]["state"] == "failed"
-    assert "target_accept_requires_verified_manager" in rows[9]["failure_reason"]
+    assert rows[9]["state"] == "completed"
+    aggregate = json.loads(rows[9]["receipt_json"])["manager_ready"]
+    assert aggregate["schema_id"] == review_lifecycle.MANAGER_READY_SCHEMA_ID
+    assert aggregate["lenses"] == list(review_orchestrator.LENSES)
+    assert len(aggregate["reviews"]) == 3
 
 
-def test_happy_path_is_exactly_ordered_and_closes_linked_needfix(
+def test_canonical_chain_publishes_one_manager_callback_after_all_reviews(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The manager wake is a projection of the completed quality chain only."""
+
+    monkeypatch.setattr(
+        review_orchestrator.task_engine,
+        "archive_task",
+        lambda _repo, task_id, **_kwargs: {"ok": True, "task_id": task_id},
+    )
+    task_store.initialize_repository(tmp_path)
+    _readiness, db_path = task_store._require_ready(tmp_path)
+    now = NOW.isoformat()
+    card = {
+        "task_id": "TARGET",
+        "runner": "glm53_worker",
+        "topic": "task_mcp",
+        "status": "review",
+        "claim_epoch": 1,
+        "coordinator_provider": "codex",
+        "origin_thread_id": "thread-manager-ready",
+        "terminal_substatus": "review_ready",
+        "terminal_review": {
+            "substatus": "review_ready",
+            "evidence": {
+                "request_identity": {
+                    "request_id": "target-request",
+                    "task_id": "TARGET",
+                    "runner": "glm53_worker",
+                }
+            },
+        },
+    }
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO tasks(task_id, runner, topic, status, worker_status, priority, "
+            "objective, card_json, created_at, updated_at, claimed_by, origin_thread_id) "
+            "VALUES (?, ?, 'task_mcp', 'review', 'review', '', '', ?, ?, ?, ?, ?)",
+            (
+                "TARGET",
+                "glm53_worker",
+                json.dumps(card, sort_keys=True),
+                now,
+                now,
+                "glm53_worker",
+                "thread-manager-ready",
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    manager = _Manager(tmp_path)
+    driver = review_orchestrator.ReviewOrchestrator(
+        manager, db_path=db_path, route_selector=_route
+    )
+    driver.ensure_chain(
+        target_task_id="TARGET",
+        target_request_id="target-request",
+        claim_epoch=1,
+        packet_sha256="a" * 64,
+        candidate_sha256="b" * 64,
+        now=NOW,
+    )
+    for lens in review_orchestrator.LENSES:
+        manager.status_results["review-request-" + lens] = _review_status(lens)
+
+    conn = sqlite3.connect(db_path)
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM callback_outbox").fetchone()[0] == 0
+    finally:
+        conn.close()
+    for _ in range(10):
+        assert driver.drain(max_actions=1, now=NOW).completed == 1
+
+    stored = task_store.get_task(tmp_path, "TARGET")
+    marker = task_store.manager_ready_marker(stored or {})
+    assert marker is not None
+    assert marker["manager_ready"]["lenses"] == list(review_orchestrator.LENSES)
+    conn = sqlite3.connect(db_path)
+    try:
+        callback = conn.execute(
+            "SELECT transition, request_id, episode_id FROM callback_outbox"
+        ).fetchall()
+        manager_events = conn.execute(
+            "SELECT COUNT(*) FROM task_events "
+            "WHERE task_id='TARGET' AND event='manager_ready'"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert callback == [("review_ready", "target-request", "1")]
+    assert manager_events == 1
+
+    cleanup = driver.drain(max_actions=12, now=NOW)
+    assert cleanup.completed == 2
+    assert cleanup.pending == 0
+    conn = sqlite3.connect(db_path)
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM callback_outbox").fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events "
+            "WHERE task_id='TARGET' AND event='manager_ready'"
+        ).fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def test_happy_path_is_exactly_ordered_and_hands_cleanup_to_manager(
     monkeypatch, tmp_path: Path
 ) -> None:
-    monkeypatch.setattr(
-        review_orchestrator, "AUTOMATIC_TARGET_ACCEPT_ENABLED", True
-    )
     manager = _Manager(tmp_path)
     archived: list[str] = []
-    resolved: list[tuple[str, str]] = []
     monkeypatch.setattr(
         review_orchestrator.task_engine,
         "archive_task",
         lambda _repo, task_id, **_kwargs: archived.append(task_id) or {"ok": True},
-    )
-    monkeypatch.setattr(
-        review_orchestrator.needfix_store,
-        "list_needfix",
-        lambda _repo, *, status, **_kwargs: (
-            [{"id": "NF-1", "status": status, "converted_task_id": "TARGET"}]
-            if status == "task_created"
-            else []
-        ),
-    )
-    monkeypatch.setattr(
-        review_orchestrator.needfix_store,
-        "resolve_needfix",
-        lambda _repo, needfix_id, *, resolution_note: (
-            resolved.append((needfix_id, resolution_note))
-            or {
-                "id": needfix_id,
-                "status": "resolved",
-                "converted_task_id": "TARGET",
-            }
-        ),
     )
     driver = review_orchestrator.ReviewOrchestrator(
         manager, db_path=tmp_path / "review.sqlite", route_selector=_route
@@ -610,37 +698,33 @@ def test_happy_path_is_exactly_ordered_and_closes_linked_needfix(
     for lens in review_orchestrator.LENSES:
         manager.status_results["review-request-" + lens] = _review_status(lens)
 
-    for _ in range(12):
+    for _ in range(10):
         result = driver.drain(max_actions=1, now=NOW)
         rows_now = review_lifecycle.rows_for_test(tmp_path / "review.sqlite")
         failed = [row["failure_reason"] for row in rows_now if row["state"] == "failed"]
         assert result.completed == 1, failed
+        assert result.failed == 0
+    for _ in range(2):
+        result = driver.drain(max_actions=1, now=NOW)
+        assert result.completed == 1
         assert result.failed == 0
     exhausted = driver.drain(max_actions=1, now=NOW)
 
     assert exhausted.attempted == 0
     assert [row["lens"] for row in manager.launches] == list(review_orchestrator.LENSES)
     assert [row["runner"] for row in manager.launches] == [ROUTE["runner"]] * 3
-    assert manager.accepts[-1] == ("target-request", "TARGET")
-    assert archived[-1] == "TARGET"
-    assert resolved == [
-        ("NF-1", "automatic review lifecycle accepted and archived task TARGET")
-    ]
+    assert ("target-request", "TARGET") not in manager.accepts
+    assert "TARGET" not in archived
     rows = review_lifecycle.rows_for_test(tmp_path / "review.sqlite")
     assert [row["state"] for row in rows] == ["completed"] * 12
     assert rows[11]["action_type"] == "needfix_close"
     assert rows[11]["state"] == "completed"
 
 
-def test_needfix_close_without_linked_findings_completes_exactly_once(
+def test_needfix_close_is_a_manager_owned_handoff(
     monkeypatch, tmp_path: Path
 ) -> None:
     manager = _Manager(tmp_path)
-    monkeypatch.setattr(
-        review_orchestrator.needfix_store,
-        "list_needfix",
-        lambda _repo, **_kwargs: [],
-    )
     driver = review_orchestrator.ReviewOrchestrator(
         manager, db_path=tmp_path / "review.sqlite", route_selector=_route
     )
@@ -661,13 +745,15 @@ def test_needfix_close_without_linked_findings_completes_exactly_once(
         packet_sha256="a" * 64, candidate_sha256="b" * 64, now=NOW,
     )
     action = chain.actions[11]
-
     receipt = driver._execute(action)
 
     assert receipt is not None
-    assert receipt["needfix_ids"] == []
-    assert receipt["needfix_newly_resolved"] == []
-    assert receipt["needfix_closed_count"] == 0
+    assert receipt["result"] == {
+        "ok": True,
+        "state": "manager_owned",
+        "task_id": "TARGET",
+        "request_id": "target-request",
+    }
 
 
 _CATALOG = {"schema_id": "aiworkhub.workforce_catalog.v1", "workers": [{"worker_id": "gpt-5.5"}]}
@@ -1015,7 +1101,7 @@ def test_needfix_close_is_not_retired_by_a_decided_target() -> None:
     """
     assert "needfix_close" not in review_orchestrator.REVIEW_DRIVING_ACTIONS
     assert review_orchestrator.REVIEW_DRIVING_ACTIONS == {
-        "launch", "accept", "archive", "target_accept", "target_archive",
+        "launch", "accept", "archive", "manager_ready", "target_accept",
     }
 
 
@@ -1934,9 +2020,11 @@ def test_drain_defaults_to_the_whole_pass_and_keeps_its_hard_bound(
 
     result = driver.drain(now=NOW)
 
-    # Nine reviewer actions in ONE pass; the chain then parks at target_accept.
+    # Nine reviewer actions, manager-ready, and two manager-owned compatibility
+    # handoffs complete in one bounded pass.
     assert result.attempted <= review_orchestrator.DEFAULT_DRAIN_MAX_ACTIONS
-    assert result.completed == 9
+    assert result.completed == 12
+    assert result.pending == 0
     assert len(manager.launches) == 3
     # A caller asking for more than the bound still gets the bound.
     assert driver.drain(max_actions=10_000, now=NOW).attempted <= (

@@ -6,6 +6,26 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.25] - 2026-09-10
+
+### Fixed
+
+- Candidate and quality-review finalization no longer wake the manager before
+  the system-owned correctness, security, and code-quality chain completes.
+- The completed chain seals an authenticated manager-ready aggregate bound to
+  the exact candidate, claim, packet, reviewer requests, reports, receipts,
+  and submissions, then atomically emits exactly one manager callback.
+- Manager-owned acceptance, rejection, archival, and linked-NeedFix closure
+  remain outside review automation without head-of-line blocking later chains.
+- Persisted template provenance is bound before required-output validation, so
+  launch-time expansion cannot be mistaken for an unclassified task contract.
+- Historical `target_accept` receipts remain readable but cannot repopulate the
+  new manager queue or block review-orchestrator startup.
+
+### Validation
+
+- The complete Python suite passes: 10,200 passed and 44 skipped.
+
 ## [0.11.24] - 2026-09-10
 
 ### Fixed

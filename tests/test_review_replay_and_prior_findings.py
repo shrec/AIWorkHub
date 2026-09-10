@@ -477,7 +477,7 @@ def test_a_replayed_actionable_finding_still_fails_the_chain(
     assert len(manager.accepts) == accepted_before
 
 
-def test_replay_never_enables_the_gated_automatic_target_accept(
+def test_replay_seals_manager_ready_without_automatic_target_accept(
     tmp_path: Path, monkeypatch
 ) -> None:
     assert review_orchestrator.AUTOMATIC_TARGET_ACCEPT_ENABLED is False
@@ -494,8 +494,11 @@ def test_replay_never_enables_the_gated_automatic_target_accept(
         if row["chain_id"] == second.chain_id
         and row["action_type"] == "target_accept"
     ]
-    assert rows and rows[0]["state"] == "failed"
-    assert "target_accept_requires_verified_manager" in rows[0]["failure_reason"]
+    assert rows and rows[0]["state"] == "completed"
+    receipt = json.loads(rows[0]["receipt_json"])
+    assert receipt["manager_ready"]["schema_id"] == (
+        review_lifecycle.MANAGER_READY_SCHEMA_ID
+    )
     # The target is never accepted by any path this feature opened.
     assert [pair for pair in manager.accepts[accepted_before:] if pair[1] == "TARGET"] == []
 

@@ -415,11 +415,19 @@ def mark_terminal_review(
     substatus: str,
     *,
     evidence: dict[str, Any] | None = None,
+    notify_manager: bool = True,
 ) -> dict[str, Any]:
     command = ["terminal-review", task_id, "--runner", runner, "--substatus", substatus]
     card = task_store.get_task(repo, task_id) or {}
     provider = str(card.get("coordinator_provider") or "").strip().lower()
-    transition = callback_store.resolve_callback_transition(substatus)
+    callback_deferred = isinstance(
+        (evidence or {}).get("manager_callback_deferred"), dict
+    )
+    transition = (
+        callback_store.resolve_callback_transition(substatus)
+        if notify_manager and not callback_deferred
+        else ""
+    )
     try:
         ok, state, callback_enqueued = task_store.mark_terminal_review_with_callback(
             repo,

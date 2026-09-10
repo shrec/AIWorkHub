@@ -54,6 +54,7 @@ def _review_card(
     request_id: str = "R-DRAFT",
     *,
     with_manifest: bool = True,
+    manager_ready: bool = False,
 ) -> dict:
     """A review_ready card carrying exactly the evidence a decision is taken on.
 
@@ -114,6 +115,17 @@ def _review_card(
     }
     if not with_manifest:
         card["terminal_review"]["evidence"].pop("attempt_artifact_manifest")
+    if manager_ready:
+        card["claim_epoch"] = 1
+        card["manager_ready_receipt"] = {
+            "manager_ready": {
+                "schema_id": "aiworkhub.manager_ready_receipt.v1",
+                "target_task_id": task_id,
+                "target_request_id": request_id,
+                "claim_epoch": "1",
+                "reviews": [],
+            }
+        }
     return card
 
 
@@ -233,7 +245,7 @@ def _fake_show(task_id: str):
     return core.TaskCtlResult(
         command=["show", task_id],
         returncode=0,
-        stdout=json.dumps(_review_card(task_id=task_id)),
+        stdout=json.dumps(_review_card(task_id=task_id, manager_ready=True)),
         stderr="",
     )
 
@@ -243,7 +255,11 @@ def test_review_packet_tool_resolves_a_missing_task_id_from_the_request(monkeypa
 
     class _Manager:
         def status(self, request_id):
-            return {"ok": True, "task_id": "T-DRAFT", "task_card": _review_card()}
+            return {
+                "ok": True,
+                "task_id": "T-DRAFT",
+                "task_card": _review_card(manager_ready=True),
+            }
 
         def accept_preview(self, request_id, task_id):
             assert task_id == "T-DRAFT"

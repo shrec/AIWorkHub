@@ -1275,6 +1275,28 @@ def test_orchestrator_mechanical_failure_reason_still_short_circuits_review() ->
     assert review_orchestrator.mechanical_failure_reason({}, "7") == ""
 
 
+def test_legacy_completed_target_accept_receipt_is_not_a_manager_wake(
+    tmp_path: Path,
+) -> None:
+    """Pre-manager-ready history must not block or repopulate the new queue."""
+
+    db = tmp_path / "legacy.sqlite"
+    _chain(db)
+    for action_index in range(10):
+        action = _reserve(db)
+        assert action.action_index == action_index
+        assert review_lifecycle.complete_action(
+            db,
+            action_id=action.action_id,
+            owner="worker-a",
+            lease_token="lease-a",
+            receipt={"legacy_action_index": action_index},
+            now=NOW,
+        )
+
+    assert review_lifecycle.completed_manager_ready_receipts(db) == ()
+
+
 def test_orchestrator_routing_catalog_cache_reset_still_clears_memoised_entries() -> None:
     """``reset_routing_catalog_cache`` this rework must preserve still empties
     the per-pass memoisation dict ``select_reviewer_route`` relies on.

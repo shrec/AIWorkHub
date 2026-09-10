@@ -10135,6 +10135,7 @@ class ProcessManager:
         request_id: str,
         error: str = "",
         evidence: dict[str, Any] | None = None,
+        notify_manager: bool = True,
     ) -> dict[str, Any]:
         task_id = str(metadata["task_id"])
         runner = str(metadata["runner"])
@@ -10172,6 +10173,10 @@ class ProcessManager:
             "error": error[:500],
             **(evidence or {}),
         }
+        if not notify_manager:
+            payload["manager_callback_deferred"] = {
+                "reason": "system_quality_review_pending"
+            }
         return task_engine.mark_terminal_review(
             self.repo,
             task_id,
@@ -11810,6 +11815,7 @@ class ProcessManager:
                                 metadata,
                                 "review_ready",
                                 request_id=request_id,
+                                notify_manager=False,
                                 evidence={
                                     "quality_review_receipt": verified_receipt,
                                     "quality_review": metadata["quality_review"],
@@ -12024,6 +12030,7 @@ class ProcessManager:
                             metadata,
                             "review_ready",
                             request_id=request_id,
+                            notify_manager=False,
                             evidence={
                                 "changed_paths": successful_candidate_paths,
                                 "changed_path_hashes": changed_path_hashes,

@@ -14,21 +14,18 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.11.24
+## What's new in 0.11.25
 
-- Windows refresh can recover a stale Source Graph build identity only after a
-  safe, non-signalling PID absence proof; live or unprovable identities remain
-  fenced.
-- Reload and shutdown no longer rewrite foreign retained ownership, preventing
-  a stale `stopping` record from permanently blocking later builds.
-- Health and preflight now report stopped, degraded, stale, fenced, or
-  latest-refresh-failed writers as non-ready even when an older generation is
-  still readable.
-- Linux simulations and focused regression tests pass; owner-machine Windows
-  live qualification remains pending.
-- Also included from 0.11.23: the Automatic quality-review launch deadlock fix,
-  compact Tool Recipes evidence in an accessible popup, and the source-audited
-  universal development-skill design. NF769, NF761, and NF690 remain open.
+- Automatic quality-review launch now moves worker completion through a
+  system-owned correctness, security, and code-quality chain without
+  prematurely waking the manager.
+- After every required lens passes, one authenticated aggregate binds the
+  candidate and reviewer evidence and emits exactly one manager callback.
+- Review automation never accepts or rejects the implementation target; the
+  verified manager receives only the completed decision packet.
+- Legacy review receipts remain compatible without blocking later chains, and
+  launch-time required-output validation uses persisted template provenance.
+- The complete Python suite passes with 10,200 tests and no failures.
 
 Detailed older history stays in the
 [changelog](https://github.com/shrec/AIWorkHub/blob/main/vscode-extension/CHANGELOG.md).

@@ -33,21 +33,10 @@ RECEIPT_SCHEMA = "aiworkhub.review_orchestrator_receipt.v1"
 # were typed by hand.
 DEFAULT_DRAIN_MAX_ACTIONS = 12
 
-# ACCEPTANCE IS NOT AUTOMATED, AND THIS IS THE SWITCH THAT SAYS SO.
-#
-# ``review_lifecycle.PLAN`` contains a ``target_accept`` action whose effect is
-# ``manager.accept_review(target_request, target_task, ...)``. It was
-# unreachable only by accident: every chain failed at its first launch action,
-# so nothing ever walked far enough to reach index 9. Repairing the launch
-# identity read removes that accident, and an accident is not a control.
-#
-# Launching a reviewer is not acceptance. Acceptance is a verified manager's
-# decision, recorded against that manager's identity, and no orchestrator pass
-# may make it. With this False, ``target_accept`` fails with an explicit
-# reason; the chain parks there and its two remaining actions are retired by
-# the ordinary dead-chain reconciliation. Turning it on would be a deliberate,
-# separately-argued change to who accepts -- never a side effect of fixing a
-# launch check.
+# Legacy compatibility constant: target acceptance remains permanently outside
+# this orchestrator.  The immutable ``target_accept`` descriptor is interpreted
+# as a manager-ready notification boundary, never as authority to accept the
+# target.
 AUTOMATIC_TARGET_ACCEPT_ENABLED = False
 
 # The actions whose whole purpose is to drive ONE candidate through review.
@@ -57,7 +46,7 @@ AUTOMATIC_TARGET_ACCEPT_ENABLED = False
 # unreservable here. ``needfix_close`` is deliberately absent: it is
 # bookkeeping that stays meaningful after the review ended.
 REVIEW_DRIVING_ACTIONS = frozenset({
-    "launch", "accept", "archive", "target_accept", "target_archive",
+    "launch", "accept", "archive", "manager_ready", "target_accept",
 })
 # Statuses a target can still be driven through review from. Anything else is
 # a decided outcome, and fail-closed means an UNREADABLE card counts as still
@@ -332,6 +321,15 @@ def candidate_digest(changed_path_hashes: Mapping[str, Any]) -> str:
         ensure_ascii=True,
     )
     return hashlib.sha256(candidate_json.encode("utf-8")).hexdigest()
+
+
+def canonical_digest(value: Any) -> str:
+    """Digest one JSON-compatible review artifact deterministically."""
+
+    encoded = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def workspace_identity(workspace_metadata: Any) -> str:
@@ -1034,6 +1032,54 @@ class ReviewOrchestrator:
             ).fetchone()
         return str(row[0]) if row is not None else ""
 
+    def _publish_completed_manager_ready(self) -> int:
+        """Project durable chain receipts into the task card and callback once."""
+
+        canonical_db = canonical_review_db(self.manager)
+        if (
+            canonical_db is None
+            or canonical_db.resolve(strict=False) != self.db_path.resolve(strict=False)
+        ):
+            # Unit-level/embedded lifecycle stores have no canonical task row
+            # to project into.  The authenticated outbox remains testable in
+            # isolation without fabricating a callback destination.
+            return 0
+        with closing(_side_table_connection(self.db_path)) as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS review_manager_ready_projection "
+                "(chain_id INTEGER PRIMARY KEY, projected_at TEXT NOT NULL)"
+            )
+            projected = {
+                int(row[0])
+                for row in conn.execute(
+                    "SELECT chain_id FROM review_manager_ready_projection"
+                ).fetchall()
+            }
+        published = 0
+        for receipt in review_lifecycle.completed_manager_ready_receipts(self.db_path):
+            aggregate = receipt["manager_ready"]
+            chain_id = int(aggregate["chain_id"])
+            if chain_id in projected:
+                continue
+            ok, state, _callback_enqueued = task_store.publish_manager_ready(
+                self.manager.repo,
+                task_id=str(aggregate["target_task_id"]),
+                request_id=str(aggregate["target_request_id"]),
+                claim_epoch=str(aggregate["claim_epoch"]),
+            )
+            if not ok:
+                raise RuntimeError("manager_ready_publish_failed:" + state)
+            with closing(_side_table_connection(self.db_path)) as conn, conn:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(
+                    "INSERT OR IGNORE INTO review_manager_ready_projection"
+                    "(chain_id, projected_at) VALUES (?, ?)",
+                    (chain_id, datetime.now(timezone.utc).isoformat()),
+                )
+            published += 1
+        return published
+
     def drain(
         self, *, max_actions: int = DEFAULT_DRAIN_MAX_ACTIONS, now: datetime | None = None
     ) -> DrainResult:
@@ -1045,6 +1091,9 @@ class ReviewOrchestrator:
         reset_routing_catalog_cache()
         instant = now or datetime.now(timezone.utc)
         review_lifecycle.reconcile_dead_chains(self.db_path, now=instant)
+        # Recovery-first: a crash after completing the authenticated action but
+        # before projecting it into the task card cannot lose the manager wake.
+        self._publish_completed_manager_ready()
         attempted = completed = failed = pending = 0
         # One deferred-wait event per pass, not one per deferred action. A pass
         # that now looks at up to 12 actions passes over many chains still
@@ -1125,6 +1174,8 @@ class ReviewOrchestrator:
                 receipt=receipt,
                 now=instant,
             )
+            if isinstance(receipt.get("manager_ready"), Mapping):
+                self._publish_completed_manager_ready()
             completed += 1
         return DrainResult(
             attempted, completed, failed, pending,
@@ -1317,6 +1368,8 @@ class ReviewOrchestrator:
                     for finding in findings
                 ):
                     raise RuntimeError("reviewer_actionable_findings")
+                report_sha256 = canonical_digest(receipt["report"])
+                quality_receipt_sha256 = canonical_digest(receipt)
                 # No second acceptance of one report: the source chain already
                 # accepted this reviewer task, and accepting it again would put
                 # two acceptances behind one piece of work.
@@ -1327,6 +1380,9 @@ class ReviewOrchestrator:
                     replayed_from_chain=int(replay.get("source_chain_id") or 0),
                     replay=dict(replay),
                     reviewer_provider=str(status.get("adapter_id") or ""),
+                    review_report_sha256=report_sha256,
+                    quality_review_receipt_sha256=quality_receipt_sha256,
+                    submission_id=str(receipt.get("submission_id") or ""),
                     result={"ok": True, "state": "replayed", "task_id": reviewer_task},
                 )
             receipt = self._review_receipt(
@@ -1339,10 +1395,20 @@ class ReviewOrchestrator:
                 for finding in findings
             ):
                 raise RuntimeError("reviewer_actionable_findings")
+            report_sha256 = canonical_digest(receipt["report"])
+            quality_receipt_sha256 = canonical_digest(receipt)
             result = self.manager.accept_review(reviewer_request, reviewer_task)
             self._require_ok(result, "reviewer_accept_failed")
-            return self._receipt(action, reviewer_task_id=reviewer_task,
-                                 reviewer_request_id=reviewer_request, result=result)
+            return self._receipt(
+                action,
+                reviewer_task_id=reviewer_task,
+                reviewer_request_id=reviewer_request,
+                reviewer_provider=str(status.get("adapter_id") or ""),
+                review_report_sha256=report_sha256,
+                quality_review_receipt_sha256=quality_receipt_sha256,
+                submission_id=str(receipt.get("submission_id") or ""),
+                result=result,
+            )
         if action.action_type == "archive":
             accepted = self._lens_receipt(prior, action.lens, "accept")
             launch = self._lens_receipt(prior, action.lens, "launch")
@@ -1384,55 +1450,94 @@ class ReviewOrchestrator:
                     ids.append(reviewer_request_id)
             return ids
 
-        if action.action_type == "target_accept":
-            if not AUTOMATIC_TARGET_ACCEPT_ENABLED:
-                # See AUTOMATIC_TARGET_ACCEPT_ENABLED. Failing here is the
-                # point: the chain parks with an explicit reason instead of
-                # accepting a candidate no verified manager decided on.
-                raise RuntimeError("target_accept_requires_verified_manager")
-            reviewer_ids = _reviewer_ids()
-            result = self.manager.accept_review(
-                target_request, target_task, reviewer_request_ids=reviewer_ids
-            )
-            self._require_ok(result, "target_accept_failed")
-            return self._receipt(action, reviewer_request_ids=reviewer_ids, result=result)
-        if action.action_type == "target_archive":
-            reviewer_ids = _reviewer_ids()
-            result = task_engine.archive_task(
-                self.manager.repo, target_task, actor="system",
-                reason=f"automatic review chain complete:{target_request}",
-            )
-            if result.get("ok") is not True and not self._is_archived(target_task):
-                self._require_ok(result, "target_archive_failed")
-            return self._receipt(action, reviewer_request_ids=reviewer_ids, result=result)
-        if action.action_type == "needfix_close":
-            linked = self._linked_needfix_rows(target_task)
-            newly_resolved: list[str] = []
-            for row in linked:
-                if row["status"] != "task_created":
-                    continue
-                needfix_id = str(row["id"])
-                resolved = needfix_store.resolve_needfix(
-                    self.manager.repo,
-                    needfix_id,
-                    resolution_note=(
-                        "automatic review lifecycle accepted and archived task "
-                        + target_task
-                    ),
+        if action.action_type in {"manager_ready", "target_accept"}:
+            lenses = required_lenses(self.db_path, action.chain_id)
+            reviews: list[dict[str, str]] = []
+            for lens in lenses:
+                accepted = self._lens_receipt(prior, lens, "accept")
+                report_sha256 = str(accepted.get("review_report_sha256") or "")
+                receipt_sha256 = str(
+                    accepted.get("quality_review_receipt_sha256") or ""
                 )
+                reviewer_request_id = str(
+                    accepted.get("reviewer_request_id") or ""
+                )
+                reviewer_task_id = str(accepted.get("reviewer_task_id") or "")
+                submission_id = str(accepted.get("submission_id") or "")
                 if (
-                    resolved.get("id") != needfix_id
-                    or resolved.get("status") != "resolved"
-                    or resolved.get("converted_task_id") != target_task
+                    not reviewer_request_id
+                    or not reviewer_task_id
+                    or not re.fullmatch(r"[0-9a-f]{64}", report_sha256)
+                    or not re.fullmatch(r"[0-9a-f]{64}", receipt_sha256)
+                    or not re.fullmatch(r"[0-9a-f]{64}", submission_id)
                 ):
-                    raise RuntimeError("needfix_close_receipt_invalid")
-                newly_resolved.append(needfix_id)
+                    raise RuntimeError("manager_ready_review_binding_missing")
+                reviews.append(
+                    {
+                        "lens": lens,
+                        "reviewer_task_id": reviewer_task_id,
+                        "reviewer_request_id": reviewer_request_id,
+                        "reviewer_provider": str(
+                            accepted.get("reviewer_provider") or ""
+                        ),
+                        "report_sha256": report_sha256,
+                        "quality_review_receipt_sha256": receipt_sha256,
+                        "submission_id": submission_id,
+                    }
+                )
+            aggregate = {
+                "schema_id": review_lifecycle.MANAGER_READY_SCHEMA_ID,
+                "chain_id": action.chain_id,
+                "chain_identity_sha256": str(
+                    action.descriptor["chain_identity_sha256"]
+                ),
+                "target_task_id": target_task,
+                "target_request_id": target_request,
+                "claim_epoch": str(identity["claim_epoch"]),
+                "packet_sha256": str(identity["packet_sha256"]),
+                "candidate_sha256": str(identity["candidate_sha256"]),
+                "lenses": list(lenses),
+                "reviews": reviews,
+            }
             return self._receipt(
                 action,
-                needfix_ids=sorted(str(row["id"]) for row in linked),
-                needfix_newly_resolved=sorted(newly_resolved),
-                needfix_closed_count=len(linked),
-                result={"ok": True, "state": "resolved"},
+                manager_ready=aggregate,
+                reviewer_request_ids=[
+                    review["reviewer_request_id"] for review in reviews
+                ],
+                result={
+                    "ok": True,
+                    "state": "manager_ready",
+                    "task_id": target_task,
+                    "request_id": target_request,
+                },
+            )
+        if action.action_type == "target_archive":
+            # Archival belongs to the manager's eventual accept/reject flow.
+            # Complete this compatibility action immediately so one candidate
+            # waiting for a manager cannot head-of-line block every later chain.
+            reviewer_ids = _reviewer_ids()
+            return self._receipt(
+                action,
+                reviewer_request_ids=reviewer_ids,
+                result={
+                    "ok": True,
+                    "state": "manager_owned",
+                    "task_id": target_task,
+                    "request_id": target_request,
+                },
+            )
+        if action.action_type == "needfix_close":
+            # ProcessManager.accept_review owns linked-NeedFix closure and its
+            # recovery ledger. The review chain records that handoff only.
+            return self._receipt(
+                action,
+                result={
+                    "ok": True,
+                    "state": "manager_owned",
+                    "task_id": target_task,
+                    "request_id": target_request,
+                },
             )
         raise RuntimeError("unknown_review_action")
 

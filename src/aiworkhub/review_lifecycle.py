@@ -61,10 +61,16 @@ PLAN: tuple[tuple[int, str, str, str], ...] = (
     (6, "code_quality", "launch", "code_quality"),
     (7, "code_quality", "accept", "code_quality"),
     (8, "code_quality", "archive", "code_quality"),
+    # The action type is retained for descriptor compatibility with persisted
+    # chains.  Its effect is now an authenticated manager-ready boundary; it
+    # never accepts the implementation target on the manager's behalf.
     (9, "target", "target_accept", ""),
     (10, "target", "target_archive", ""),
     (11, "needfix", "needfix_close", ""),
 )
+
+MANAGER_READY_SCHEMA_ID = "aiworkhub.manager_ready_receipt.v1"
+MANAGER_READY_ACTION_TYPES = frozenset({"target_accept"})
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS review_chains (
@@ -1153,6 +1159,88 @@ def completed_receipts_for_chain(
         return tuple(json.loads(str(row["receipt_json"])) for row in rows)
     finally:
         conn.close()
+
+
+def completed_manager_ready_receipts(
+    db_path: str | Path,
+) -> tuple[dict[str, Any], ...]:
+    """Return authenticated manager-ready receipts awaiting a human decision.
+
+    ``target_accept`` is retained as a legacy action identity because action
+    descriptors are immutable.  A legacy row is manager-ready only when its
+    completed receipt carries the new aggregate schema; old automatic-accept
+    receipts never satisfy this predicate.
+    """
+
+    conn = _read_connection(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT DISTINCT chain_id FROM review_action_outbox "
+            "WHERE action_index=9 AND state='completed' "
+            "AND action_type='target_accept' "
+            "ORDER BY chain_id"
+        ).fetchall()
+        receipts: list[dict[str, Any]] = []
+        for row in rows:
+            chain = _hydrate_chain_by_id(conn, int(row["chain_id"]))
+            action_rows = conn.execute(
+                "SELECT receipt_json FROM review_action_outbox "
+                "WHERE chain_id=? AND action_index=9 AND state='completed' "
+                "AND action_type='target_accept'",
+                (chain.chain_id,),
+            ).fetchall()
+            if len(action_rows) != 1:
+                raise ReviewLifecycleError("manager_ready_action_ambiguous")
+            receipt = json.loads(str(action_rows[0]["receipt_json"]))
+            aggregate = receipt.get("manager_ready")
+            if aggregate is None:
+                # A completed descriptor from releases before the manager-ready
+                # boundary is authenticated history, not a pending manager wake.
+                continue
+            identity = chain.chain_identity
+            if (
+                not isinstance(aggregate, dict)
+                or aggregate.get("schema_id") != MANAGER_READY_SCHEMA_ID
+                or aggregate.get("chain_id") != chain.chain_id
+                or aggregate.get("chain_identity_sha256")
+                != chain.chain_identity_sha256
+                or aggregate.get("target_task_id") != identity["target_task_id"]
+                or aggregate.get("target_request_id")
+                != identity["target_request_id"]
+                or str(aggregate.get("claim_epoch")) != identity["claim_epoch"]
+                or aggregate.get("packet_sha256") != identity["packet_sha256"]
+                or aggregate.get("candidate_sha256")
+                != identity["candidate_sha256"]
+                or not isinstance(aggregate.get("reviews"), list)
+            ):
+                raise ReviewLifecycleError("manager_ready_receipt_invalid")
+            receipts.append(receipt)
+        return tuple(receipts)
+    finally:
+        conn.close()
+
+
+def manager_ready_receipt_for_target(
+    db_path: str | Path,
+    *,
+    target_task_id: str,
+    target_request_id: str,
+    claim_epoch: str | int,
+) -> dict[str, Any] | None:
+    """Return the one authenticated receipt for an exact target episode."""
+
+    matches = []
+    for receipt in completed_manager_ready_receipts(db_path):
+        aggregate = receipt["manager_ready"]
+        if (
+            aggregate["target_task_id"] == str(target_task_id)
+            and aggregate["target_request_id"] == str(target_request_id)
+            and str(aggregate["claim_epoch"]) == str(claim_epoch)
+        ):
+            matches.append(receipt)
+    if len(matches) > 1:
+        raise ReviewLifecycleError("manager_ready_receipt_ambiguous")
+    return matches[0] if matches else None
 
 
 def replay_sources(

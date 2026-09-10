@@ -1,5 +1,24 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.25 — 2026-09-10
+
+### Fixed
+
+- Worker and reviewer finalization now defer manager notification until the
+  system-owned correctness, security, and code-quality chain is complete.
+- One authenticated manager-ready aggregate binds the exact candidate and all
+  reviewer evidence, then publishes one atomic callback for manager action.
+- Review automation no longer accepts the target, closes its NeedFix, or blocks
+  later chains while the verified manager decides.
+- Launch-time output validation now uses the persisted expanded-template
+  provenance instead of misclassifying valid task contracts.
+- Legacy review receipts remain compatible and are excluded from the new
+  manager-ready queue.
+
+### Validation
+
+- The complete Python suite passes: 10,200 passed and 44 skipped.
+
 ## 0.11.24 — 2026-09-10
 
 ### Fixed

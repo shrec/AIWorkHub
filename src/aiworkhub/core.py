@@ -1719,6 +1719,10 @@ def review_queue() -> dict[str, Any]:
             row
             for row in task_store.list_review_queue_cards(repo_root(), limit=5000)
             if _review_substatus(row) != "finalize_failed"
+            and (
+                task_store.manager_ready_marker(row) is not None
+                or _review_substatus(row) != "review_ready"
+            )
         ][:500]
     except task_store.TaskStoreError as exc:
         return _canonical_result(ok=False, returncode=1, stderr=str(exc), command=command)
