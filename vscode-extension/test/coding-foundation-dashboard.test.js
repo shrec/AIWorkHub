@@ -5,6 +5,7 @@ const crypto = require("crypto");
 const fs = require("fs");
 const Module = require("module");
 const path = require("path");
+const vm = require("vm");
 
 const extensionPath = path.resolve(__dirname, "..", "extension.js");
 const extensionRoot = path.dirname(extensionPath);
@@ -377,6 +378,58 @@ assert.match(mixedAdapters.detail, /codex_cli 2 measured\/0 unmeasured/);
 assert.match(mixedAdapters.detail, /1 semantic\/0 raw\/1 mixed/);
 assert.match(mixedAdapters.detail, /claude_cli 0 measured\/1 unmeasured/);
 assert.doesNotMatch(mixedAdapters.detail, /token/);
+
+// Execute the exact script embedded in the Webview. Direct unit calls above do
+// not detect helper functions accidentally omitted from the generated source.
+{
+  const generatedElements = mockElements();
+  const nodes = {};
+  for (const [kind, slot] of Object.entries(generatedElements)) {
+    const id = `header-${kind.replace(/_/g, "-")}`;
+    nodes[id] = slot.card;
+    nodes[`${id}-value`] = slot.value;
+    nodes[`${id}-detail`] = slot.detail;
+  }
+  let onMessage = null;
+  vm.runInNewContext(internals.codingFoundationDashboardSource(), {
+    document: { getElementById: (id) => nodes[id] || null },
+    window: {
+      addEventListener(type, listener) {
+        if (type === "message") onMessage = listener;
+      },
+    },
+  });
+  assert.strictEqual(typeof onMessage, "function");
+
+  onMessage({
+    data: {
+      type: "snapshotSummary",
+      payload: {
+        snapshot_mode: "summary",
+        full_snapshot_available: true,
+        omitted_fields: internals.CODING_FOUNDATION_CARD_KEYS,
+      },
+    },
+  });
+  assert.strictEqual(generatedElements.skills.value.textContent, "Loading");
+
+  onMessage({
+    data: {
+      type: "snapshot",
+      payload: {
+        snapshot_mode: "full",
+        development_rules: { state: "measured", declared_rule_count: 20 },
+        skills: { state: "measured", count: 4, lifecycle: { proposed: 4, active: 0, retired: 0 } },
+        tool_recipes: { state: "measured", count: 29, usage: { state: "measured", used_count: 8, unused_count: 21, run_count: 82 } },
+        semantic_edit_coverage: { state: "measured", measured_runs: 15, unmeasured_runs: 46, byte_coverage_rate: 87.7 },
+      },
+    },
+  });
+  assert.strictEqual(generatedElements.development_rules.value.textContent, "20 rules");
+  assert.strictEqual(generatedElements.skills.value.textContent, "4 skills");
+  assert.strictEqual(generatedElements.tool_recipes.value.textContent, "29 recipes");
+  assert.strictEqual(generatedElements.semantic_edit_coverage.value.textContent, "15 measured");
+}
 
 console.log("coding foundation dashboard: ok");
 
