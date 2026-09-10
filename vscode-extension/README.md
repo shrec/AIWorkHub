@@ -14,18 +14,21 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.11.23
+## What's new in 0.11.24
 
-- Automatic quality-review launch no longer deadlocks while waiting for its
-  own future Source Graph partition; prewarm remains verified before any
-  provider process starts.
-- Skills, Tool Recipes, and Semantic Edit stay compact on the dashboard and
-  reveal their complete evidence in an accessible popup.
-- A source-audited universal development-skill design is included for the
-  next provider-neutral A/B evaluation wave.
-- Manager-ready notification timing (NF769), Source Graph durable
-  single-owner (NF761), and secure native SemLock validation (NF690) remain
-  open.
+- Windows refresh can recover a stale Source Graph build identity only after a
+  safe, non-signalling PID absence proof; live or unprovable identities remain
+  fenced.
+- Reload and shutdown no longer rewrite foreign retained ownership, preventing
+  a stale `stopping` record from permanently blocking later builds.
+- Health and preflight now report stopped, degraded, stale, fenced, or
+  latest-refresh-failed writers as non-ready even when an older generation is
+  still readable.
+- Linux simulations and focused regression tests pass; owner-machine Windows
+  live qualification remains pending.
+- Also included from 0.11.23: the Automatic quality-review launch deadlock fix,
+  compact Tool Recipes evidence in an accessible popup, and the source-audited
+  universal development-skill design. NF769, NF761, and NF690 remain open.
 
 Detailed older history stays in the
 [changelog](https://github.com/shrec/AIWorkHub/blob/main/vscode-extension/CHANGELOG.md).

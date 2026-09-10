@@ -1,5 +1,22 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.24 — 2026-09-10
+
+### Fixed
+
+- Windows Source Graph refresh safely recovers a stale retained identity only
+  after a non-signalling PID absence proof; live, recycled, and unprovable PIDs
+  remain fenced and are never signalled.
+- Shutdown mutates retained ownership only for the exact locally owned process,
+  preventing reload from persisting a foreign `stopping` fence.
+- Stopped/fenced refresh is now reported as non-refreshable and cannot pass code
+  preflight merely because an older generation remains readable.
+
+### Validation
+
+- The Windows lifecycle simulations and focused Source Graph/preflight suite
+  pass on Linux; owner-machine Windows live qualification remains pending.
+
 ## 0.11.23 — 2026-09-10
 
 ### Fixed

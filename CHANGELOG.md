@@ -6,6 +6,25 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.24] - 2026-09-10
+
+### Fixed
+
+- Windows Source Graph refresh now clears a retained build identity only when
+  the non-signalling PID probe definitively proves that process absent; a live,
+  recycled, malformed, or unprovable identity remains fenced.
+- Daemon shutdown rewrites a retained identity only for its exact locally owned
+  process handle, so reload cannot turn a foreign owner into a permanent
+  `build_start_fenced` state.
+- Source Graph health reports stopped writers as stopped, and code preflight no
+  longer treats an old readable generation as ready when refresh is stopped,
+  degraded, stale, fenced, or its latest refresh job failed.
+
+### Validation
+
+- Windows lifecycle simulations and the focused Source Graph/preflight suite
+  pass on Linux. Owner-machine Windows live refresh qualification remains open.
+
 ## [0.11.23] - 2026-09-10
 
 ### Fixed
