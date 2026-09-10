@@ -3236,7 +3236,7 @@ def _validate_required_outputs_contract(card: dict[str, Any]) -> None:
         # writable cards cannot smuggle an accidental empty list to launch.
         try:
             provenance = task_templates.validate_template_provenance(
-                card.get("template_provenance")
+                card.get("template_provenance"), expanded_card=card
             )
             expected_digest = task_templates.expanded_contract_digest(card)
         except task_templates.TaskTemplateError as exc:

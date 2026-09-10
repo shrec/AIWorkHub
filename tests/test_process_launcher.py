@@ -797,6 +797,10 @@ def test_launch_contract_accepts_authenticated_empty_mandatory_change_set():
     }
     assert card["required_outputs"] == []
 
+    # Canonical task storage JSON-round-trips provenance, so launch validation
+    # must bind the persisted plain dict to the exact expanded card again.
+    card = json.loads(json.dumps(card))
+
     process_launcher._validate_required_outputs_contract(card)
 
     card["template_provenance"] = {
