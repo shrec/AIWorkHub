@@ -1620,6 +1620,61 @@ class TestSemLockCapability:
         assert row["capability_probe"]["schema"] == validation_runner.SEMLOCK_PROBE_SCHEMA
         assert row["capability_probe"]["supported"] is False
 
+    def test_receipt_probe_denial_preserves_batch_role_cardinality(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from aiworkhub import process_launcher
+
+        workspace = _workspace(tmp_path)
+        tests_dir = workspace.path / "tests"
+        tests_dir.mkdir()
+        (tests_dir / "test_x.py").write_text(
+            "import multiprocessing as mp\n"
+            "ctx = mp.get_context('spawn')\n"
+            "q = ctx.Queue()\n",
+            encoding="utf-8",
+        )
+        commands = [
+            "python -m pytest tests/test_x.py",
+            "python -m pytest tests/test_y.py",
+            "python -m ruff check src",
+            "git diff --check",
+        ]
+        roles = ["regression", "reproduction", "generic", "generic"]
+
+        def fake_sandbox_argv(
+            ws: object, adapter_id: str, adapter_argv: list[str], **kw: object
+        ) -> list[str]:
+            return [sys.executable, "-c", "raise SystemExit(80)"]
+
+        def forbidden_run(*args: object, **kwargs: object) -> list[dict[str, object]]:
+            raise AssertionError("declared commands must not run after denied preflight")
+
+        monkeypatch.setattr(process_launcher, "sandbox_argv", fake_sandbox_argv)
+        monkeypatch.setattr(process_launcher, "run_validations", forbidden_run)
+        monkeypatch.setattr(
+            process_launcher, "_sandbox_backend_for_adapter", lambda adapter_id: "landlock"
+        )
+        authority = {
+            "adapter_id": "grok_kilo_cli",
+            "sandbox_backend": "landlock",
+            "validation": commands,
+            "validation_roles": roles,
+            "work_kind": "bugfix",
+        }
+        with pytest.raises(ValidationEnvironmentBlocked) as caught:
+            process_launcher._run_declared_validations(
+                workspace, authority, authority
+            )
+
+        assert [row["command"] for row in caught.value.results] == commands
+        assert [row["behavioral_role"] for row in caught.value.results] == roles
+        assert all(
+            row["preflight_scope"] == "validation_batch"
+            and row["capability_probe_attributed"] is True
+            for row in caught.value.results
+        )
+
     def test_receipt_probe_grant_runs_declared_command(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

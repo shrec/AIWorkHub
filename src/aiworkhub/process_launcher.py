@@ -744,14 +744,24 @@ def _run_validations_with_toolchain_receipt(
             sandbox_measured=sandbox_measured,
         )
         if decision.action == "unsupported":
-            command = next((item for item in commands if isinstance(item, str)), "")
+            # The SemLock probe is a batch preflight: no declared command has
+            # run when it denies the lane.  Preserve one structural receipt per
+            # declared command so the behavioral-role binder sees the exact
+            # contract cardinality instead of relabelling an environment
+            # denial as ``validation_receipt_count_mismatch``.
+            blocked_rows = [
+                {
+                    **_validation_runner.attributed_semlock_capability_row(
+                        command, probe
+                    ),
+                    "preflight_scope": "validation_batch",
+                }
+                for command in commands
+                if isinstance(command, str)
+            ]
             raise ValidationEnvironmentBlocked(
                 decision.evidence,
-                [
-                    _validation_runner.attributed_semlock_capability_row(
-                        command, probe
-                    )
-                ],
+                blocked_rows,
                 restriction=_validation_runner.VALIDATION_UNSUPPORTED_IN_SANDBOX,
             )
     return run_validations(target, commands, **kwargs)
