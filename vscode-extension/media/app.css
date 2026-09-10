@@ -396,7 +396,10 @@ summary:focus-visible,
 .header-storage,
 .header-tool-use,
 #header-needfix,
-#header-roadmap {
+#header-roadmap,
+#header-skills,
+#header-tool-recipes,
+#header-semantic-edit-coverage {
   cursor: pointer;
   font: inherit;
 }
@@ -404,9 +407,27 @@ summary:focus-visible,
 .header-storage:hover,
 .header-tool-use:hover,
 #header-needfix:hover,
-#header-roadmap:hover {
+#header-roadmap:hover,
+#header-skills:hover,
+#header-tool-recipes:hover,
+#header-semantic-edit-coverage:hover {
   border-color: var(--accent);
   background: var(--review-soft);
+}
+
+#header-skills,
+#header-tool-recipes,
+#header-semantic-edit-coverage {
+  max-height: 58px;
+  overflow: hidden;
+}
+
+#header-skills .header-insight-detail,
+#header-tool-recipes .header-insight-detail,
+#header-semantic-edit-coverage .header-insight-detail {
+  max-width: 100%;
+  overflow: hidden;
+  white-space: nowrap;
 }
 
 .telemetry-section-title {
@@ -2392,6 +2413,18 @@ tbody tr.is-selected td:first-child {
   padding: 0 10px 10px;
 }
 
+.coding-foundation-dialog-body {
+  contain: paint;
+  height: calc(100% - 52px);
+  overflow: auto;
+  overflow-wrap: anywhere;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+  padding: 12px;
+  white-space: pre-wrap;
+  font-size: var(--fs-sm);
+  line-height: 1.45;
+}
 /* The one dialog that still scrolls itself: below 820px its workspace goes to
    auto height on purpose, so the dialog takes over the scrolling. It reserves
    the gutter so gaining that scrollbar does not resize the toolbar above it. */

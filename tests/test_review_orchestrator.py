@@ -145,7 +145,9 @@ def test_launch_accepts_canonical_review_ready_card_when_process_state_is_absent
     assert len(manager.launches) == 1
 
 
-def test_launch_rejects_identity_mismatch_and_empty_partition(tmp_path: Path) -> None:
+def test_launch_rejects_identity_mismatch_but_prewarm_is_launch_owned(
+    tmp_path: Path,
+) -> None:
     manager = _Manager(tmp_path)
     manager.target_status = _target_status(candidate_sha256="c" * 64)
     driver = review_orchestrator.ReviewOrchestrator(
@@ -175,11 +177,15 @@ def test_launch_rejects_identity_mismatch_and_empty_partition(tmp_path: Path) ->
         packet_sha256="a" * 64, candidate_sha256="b" * 64, now=NOW,
     )
 
-    empty = driver.drain(max_actions=2, now=NOW)
+    launch_owned = driver.drain(max_actions=2, now=NOW)
 
-    assert empty.pending == 1
-    assert manager.launches == []
-    assert manager.events[-1]["review_automation"]["reason"] == "source_graph_partition_empty"
+    assert launch_owned.completed == 1
+    assert len(manager.launches) == 1
+    readiness = json.loads(
+        review_lifecycle.rows_for_test(tmp_path / "empty.sqlite")[0]["receipt_json"]
+    )["target_readiness_receipt"]
+    assert readiness["outcome"] == "ready"
+    assert readiness["partition_readiness"] == {}
 
 
 @pytest.mark.parametrize(

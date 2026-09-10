@@ -52,15 +52,19 @@ try {
 }
 
 const internals = extension.__testInternals;
-
 function mockSlot(value, detail) {
   return {
     card: {
       title: "",
       attrs: {},
+      dataset: {},
       setAttribute(name, next) {
         this.attrs[name] = next;
       },
+      getAttribute(name) {
+        return this.attrs[name];
+      },
+      addEventListener() {},
     },
     value: { textContent: value },
     detail: { textContent: detail },
@@ -103,10 +107,13 @@ assert.match(insights[0], /id="header-development-rules"/);
 assert.match(insights[0], />Development Rules</);
 assert.match(insights[0], /id="header-skills"/);
 assert.match(insights[0], />Skills</);
+assert.match(insights[0], /<button class="header-insight-card" id="header-skills"/);
 assert.match(insights[0], /id="header-tool-recipes"/);
 assert.match(insights[0], />Tool Recipes</);
+assert.match(insights[0], /<button class="header-insight-card" id="header-tool-recipes"/);
 assert.match(insights[0], /id="header-semantic-edit-coverage"/);
 assert.match(insights[0], />Semantic Edit</);
+assert.match(insights[0], /<button class="header-insight-card" id="header-semantic-edit-coverage"/);
 // NF-2026-00675: the static markup must not assert "No sample" before any
 // projection has arrived. The default snapshot omits all three fields, so a
 // first paint that claims no sample is a measured verdict about a thing
@@ -129,6 +136,9 @@ assert.doesNotMatch(insights[0], /overflow\s*:\s*(auto|scroll)/i);
 assert.doesNotMatch(insights[0], /position\s*:\s*sticky/i);
 assert.match(html, /bindCodingFoundationDashboard/);
 assert.match(html, /snapshotSummary/);
+assert.match(html, /id="coding-foundation-dialog"/);
+assert.match(html, /id="coding-foundation-dialog-title"/);
+assert.match(html, /data-close-dialog="coding-foundation-dialog"/);
 
 const elements = mockElements();
 internals.renderCodingFoundationCards({
@@ -214,28 +224,36 @@ assert.match(elements.development_rules.detail.textContent, /1 viol/);
 assert.strictEqual(elements.development_rules.card.attrs["data-state"], "measured");
 assert.strictEqual(elements.skills.value.textContent, "6 skills");
 assert.match(elements.skills.detail.textContent, /1 proposed · 4 active · 1 retired/);
-assert.match(elements.skills.detail.textContent, /0 injectable/);
-assert.match(elements.skills.detail.textContent, /2 selection\/injection receipts/);
-assert.match(elements.skills.detail.textContent, /5 accepted/);
-assert.match(elements.skills.detail.textContent, /2 actors/);
-assert.match(elements.skills.detail.textContent, /activation_evidence_below_two_distinct_actors/);
-assert.match(elements.skills.detail.textContent, /unresolved_negative_evidence/);
+assert.doesNotMatch(elements.skills.detail.textContent, /0 injectable/);
+assert.doesNotMatch(elements.skills.detail.textContent, /selection\/injection/);
+assert.doesNotMatch(elements.skills.detail.textContent, /activation_evidence_below_two_distinct_actors/);
+assert.match(elements.skills.card.dataset.foundationBreakdown, /0 injectable/);
+assert.match(elements.skills.card.dataset.foundationBreakdown, /2 selection\/injection receipts/);
+assert.match(elements.skills.card.dataset.foundationBreakdown, /5 accepted/);
+assert.match(elements.skills.card.dataset.foundationBreakdown, /2 actors/);
+assert.match(elements.skills.card.dataset.foundationBreakdown, /activation_evidence_below_two_distinct_actors/);
+assert.match(elements.skills.card.dataset.foundationBreakdown, /unresolved_negative_evidence/);
 assert.strictEqual(elements.tool_recipes.value.textContent, "5 recipes");
 assert.match(elements.tool_recipes.detail.textContent, /2 used/);
 assert.match(elements.tool_recipes.detail.textContent, /3 unused/);
-assert.match(elements.tool_recipes.detail.textContent, /8 runs/);
-assert.match(elements.tool_recipes.detail.textContent, /5 unattributed/);
+assert.doesNotMatch(elements.tool_recipes.detail.textContent, /5 unattributed/);
 assert.doesNotMatch(elements.tool_recipes.detail.textContent, /8 uses/);
+assert.match(elements.tool_recipes.card.dataset.foundationBreakdown, /2 used/);
+assert.match(elements.tool_recipes.card.dataset.foundationBreakdown, /8 runs/);
+assert.match(elements.tool_recipes.card.dataset.foundationBreakdown, /5 unattributed/);
 assert.strictEqual(elements.semantic_edit_coverage.value.textContent, "3 measured");
 assert.match(elements.semantic_edit_coverage.detail.textContent, /1 unmeasured/);
-assert.match(elements.semantic_edit_coverage.detail.textContent, /4 paths/);
-assert.match(elements.semantic_edit_coverage.detail.textContent, /5 ranges/);
-assert.match(elements.semantic_edit_coverage.detail.textContent, /2 raw-only/);
-assert.match(elements.semantic_edit_coverage.detail.textContent, /codex_cli 3 measured\/0 unmeasured/);
-assert.match(elements.semantic_edit_coverage.detail.textContent, /1 semantic\/1 raw\/1 mixed/);
-assert.match(elements.semantic_edit_coverage.detail.textContent, /claude_cli 0 measured\/1 unmeasured/);
-assert.doesNotMatch(elements.semantic_edit_coverage.detail.textContent, /token/);
-assert.doesNotMatch(elements.semantic_edit_coverage.detail.textContent, /cost/);
+assert.doesNotMatch(elements.semantic_edit_coverage.detail.textContent, /codex_cli/);
+assert.doesNotMatch(elements.semantic_edit_coverage.detail.textContent, /4 paths/);
+assert.match(elements.semantic_edit_coverage.card.dataset.foundationBreakdown, /1 unmeasured/);
+assert.match(elements.semantic_edit_coverage.card.dataset.foundationBreakdown, /4 paths/);
+assert.match(elements.semantic_edit_coverage.card.dataset.foundationBreakdown, /5 ranges/);
+assert.match(elements.semantic_edit_coverage.card.dataset.foundationBreakdown, /2 raw-only/);
+assert.match(elements.semantic_edit_coverage.card.dataset.foundationBreakdown, /codex_cli 3 measured\/0 unmeasured/);
+assert.match(elements.semantic_edit_coverage.card.dataset.foundationBreakdown, /1 semantic\/1 raw\/1 mixed/);
+assert.match(elements.semantic_edit_coverage.card.dataset.foundationBreakdown, /claude_cli 0 measured\/1 unmeasured/);
+assert.doesNotMatch(elements.semantic_edit_coverage.card.dataset.foundationBreakdown, /token/);
+assert.doesNotMatch(elements.semantic_edit_coverage.card.dataset.foundationBreakdown, /cost/);
 
 const preservedSkillsValue = elements.skills.value.textContent;
 const preservedSkillsDetail = elements.skills.detail.textContent;
@@ -321,7 +339,8 @@ const zeroUsage = internals.codingFoundationCardModel("tool_recipes", {
 });
 assert.match(zeroUsage.detail, /0 used/);
 assert.match(zeroUsage.detail, /4 unused/);
-assert.match(zeroUsage.detail, /0 runs/);
+assert.doesNotMatch(zeroUsage.detail, /0 runs/);
+assert.match(zeroUsage.breakdown, /0 runs/);
 
 const unattributed = internals.codingFoundationCardModel("tool_recipes", {
   schema_id: internals.CODING_FOUNDATION_SCHEMAS.tool_recipes,
@@ -338,8 +357,10 @@ const unattributed = internals.codingFoundationCardModel("tool_recipes", {
     distinct_actor_count: 0,
   },
 });
-assert.match(unattributed.detail, /2 unattributed/);
-assert.match(unattributed.detail, /0 attributed/);
+assert.match(unattributed.detail, /1 used/);
+assert.doesNotMatch(unattributed.detail, /2 unattributed/);
+assert.match(unattributed.breakdown, /2 unattributed/);
+assert.match(unattributed.breakdown, /0 attributed/);
 
 const unknownEdit = internals.codingFoundationCardModel("semantic_edit_coverage", {
   schema_id: internals.CODING_FOUNDATION_SCHEMAS.semantic_edit_coverage,
@@ -374,10 +395,12 @@ const mixedAdapters = internals.codingFoundationCardModel("semantic_edit_coverag
   token_savings_available: false,
 });
 assert.strictEqual(mixedAdapters.value, "2 measured");
-assert.match(mixedAdapters.detail, /codex_cli 2 measured\/0 unmeasured/);
-assert.match(mixedAdapters.detail, /1 semantic\/0 raw\/1 mixed/);
-assert.match(mixedAdapters.detail, /claude_cli 0 measured\/1 unmeasured/);
-assert.doesNotMatch(mixedAdapters.detail, /token/);
+assert.match(mixedAdapters.detail, /1 unmeasured/);
+assert.doesNotMatch(mixedAdapters.detail, /codex_cli/);
+assert.match(mixedAdapters.breakdown, /codex_cli 2 measured\/0 unmeasured/);
+assert.match(mixedAdapters.breakdown, /1 semantic\/0 raw\/1 mixed/);
+assert.match(mixedAdapters.breakdown, /claude_cli 0 measured\/1 unmeasured/);
+assert.doesNotMatch(mixedAdapters.breakdown, /token/);
 
 // Execute the exact script embedded in the Webview. Direct unit calls above do
 // not detect helper functions accidentally omitted from the generated source.

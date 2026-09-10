@@ -304,10 +304,12 @@ assert.ok(fs.statSync(path.join(root, "media", "aiworkhub-hero.png")).size > 100
 const readme = read("README.md");
 assert.ok(readme.includes("media/aiworkhub-hero.png"));
 assert.ok(!/<img[^>]+\.svg/i.test(readme), "README must not embed an SVG image");
-assert.ok(readme.includes("What's new in 0.11.22"));
-assert.ok(readme.includes("full-snapshot hydration"));
+assert.ok(readme.includes(`What's new in ${pkg.version}`));
+assert.ok(readme.includes("Automatic quality-review launch"));
 assert.ok(readme.includes("Tool Recipes"));
-assert.ok(readme.includes("writer lease"));
+assert.ok(readme.includes("accessible popup"));
+assert.ok(readme.includes("universal development-skill design"));
+assert.ok(readme.includes("NF769"));
 assert.ok(readme.includes("NF761"));
 assert.ok(readme.includes("NF690"));
 for (const heading of [

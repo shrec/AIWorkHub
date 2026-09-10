@@ -6,6 +6,28 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.23] - 2026-09-10
+
+### Fixed
+
+- Automatic quality-review orchestration no longer waits on a Source Graph
+  partition receipt that can only be created by the reviewer launch itself;
+  launch-owned prewarm still fails closed before provider execution.
+- Dashboard foundation telemetry stays compact and opens its full Skills,
+  Tool Recipes, and Semantic Edit evidence in an accessible popup.
+
+### Added
+
+- A source-audited design for universal, provider-neutral development skills
+  and their future A/B evaluation is documented.
+
+### Limitations
+
+- Manager-ready notification still needs to be delayed until the automatic
+  reviewer chain has completed (NF769).
+- Source Graph durable single-owner (NF761) and the secure native
+  SemLock-capable validation lane (NF690) remain open.
+
 ## [0.11.22] - 2026-09-10
 
 ### Fixed

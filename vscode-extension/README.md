@@ -14,16 +14,18 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.11.22
+## What's new in 0.11.23
 
-- Dashboard full-snapshot hydration now covers Skills, Tool Recipes, and
-  Semantic Edit.
-- Canonical `task_queue.sqlite` mutation paths take a single cross-process
-  writer lease while concurrent readonly access remains available.
-- SemLock preflight denial now reports exact per-command validation
-  receipt cardinality.
-- Source Graph durable single-owner (NF761) and the secure native
-  SemLock-capable validation lane (NF690) remain open.
+- Automatic quality-review launch no longer deadlocks while waiting for its
+  own future Source Graph partition; prewarm remains verified before any
+  provider process starts.
+- Skills, Tool Recipes, and Semantic Edit stay compact on the dashboard and
+  reveal their complete evidence in an accessible popup.
+- A source-audited universal development-skill design is included for the
+  next provider-neutral A/B evaluation wave.
+- Manager-ready notification timing (NF769), Source Graph durable
+  single-owner (NF761), and secure native SemLock validation (NF690) remain
+  open.
 
 Detailed older history stays in the
 [changelog](https://github.com/shrec/AIWorkHub/blob/main/vscode-extension/CHANGELOG.md).

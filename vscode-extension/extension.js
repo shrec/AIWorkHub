@@ -11,7 +11,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.11.22";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.11.23";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 // NF-2026-00643: this globalStorage trace directory was measured holding 1,102
 // files and 2,235,024,325 bytes (2.24 GB), largest single file 44,626,825 bytes
@@ -9383,6 +9383,7 @@ function codingFoundationBoundedCount(value) {
 
 function codingFoundationBoundText(value, limit) {
   const text = String(value == null ? "" : value);
+  if (limit === false) return text;
   const max = limit || 80;
   if (text.length <= max) return text;
   return text.slice(0, Math.max(0, max - 1)) + "…";
@@ -9419,7 +9420,6 @@ function codingFoundationSectionCount(section, keys, suffix) {
   const counted = codingFoundationMeasuredCount(section, keys);
   return counted == null ? "" : counted + " " + suffix;
 }
-
 function codingFoundationCardModel(kind, projection) {
   if (!projection || typeof projection !== "object" || Array.isArray(projection)) return null;
   if (projection.schema_id != null && projection.schema_id !== CODING_FOUNDATION_SCHEMAS[kind]) return null;
@@ -9427,19 +9427,19 @@ function codingFoundationCardModel(kind, projection) {
   if (typeof state !== "string" || !state) return null;
   const label = CODING_FOUNDATION_LABELS[kind] || kind;
   if (state === "no_sample") {
-    return { state: state, value: "No sample", detail: "No evidence", title: label + ": no sample" };
+    return { state: state, value: "No sample", detail: "No evidence", breakdown: "No evidence", title: label + ": no sample" };
   }
   if (state === "unknown") {
-    return { state: state, value: "UNKNOWN", detail: "No evidence", title: label + ": unknown" };
+    return { state: state, value: "UNKNOWN", detail: "No evidence", breakdown: "No evidence", title: label + ": unknown" };
   }
   if (state === "unavailable") {
     const reason = typeof projection.reason === "string" && projection.reason
       ? codingFoundationBoundText(projection.reason, 48)
       : "No evidence";
-    return { state: state, value: "Unavailable", detail: reason, title: label + " unavailable" };
+    return { state: state, value: "Unavailable", detail: reason, breakdown: reason, title: label + " unavailable" };
   }
   if (state === "invalid") {
-    return { state: state, value: "Unavailable", detail: "Invalid evidence", title: label + " invalid" };
+    return { state: state, value: "Unavailable", detail: "Invalid evidence", breakdown: "Invalid evidence", title: label + " invalid" };
   }
   if (state !== "measured") return null;
   if (kind === "development_rules") {
@@ -9449,14 +9449,16 @@ function codingFoundationCardModel(kind, projection) {
       ? codingFoundationBoundedCount(projection.violation_count)
       : null;
     const version = typeof projection.version === "string" ? codingFoundationBoundText(projection.version, 16) : "";
+    const detail = codingFoundationJoinParts([
+      resolved == null ? "" : resolved + " resolved",
+      violations == null ? "" : violations + " viol",
+      version,
+    ]) || "Measured";
     return {
       state: state,
       value: declared == null ? "Measured" : declared + " rules",
-      detail: codingFoundationJoinParts([
-        resolved == null ? "" : resolved + " resolved",
-        violations == null ? "" : violations + " viol",
-        version,
-      ]) || "Measured",
+      detail: detail,
+      breakdown: detail,
       title: label + " measured",
     };
   }
@@ -9469,31 +9471,32 @@ function codingFoundationCardModel(kind, projection) {
     const active = lifecycle ? codingFoundationBoundedCount(lifecycle.active) : null;
     const retired = lifecycle ? codingFoundationBoundedCount(lifecycle.retired) : null;
     const reasons = Array.isArray(projection.active_non_injectable_reasons)
-      ? projection.active_non_injectable_reasons.slice(0, 8)
-        .map((item) => codingFoundationBoundText(item, 48))
-        .filter(Boolean)
+      ? projection.active_non_injectable_reasons.slice()
       : [];
     if (reasons.length === 0 && typeof projection.active_non_injectable_reason === "string") {
-      const legacyReason = codingFoundationBoundText(projection.active_non_injectable_reason, 48);
+      const legacyReason = projection.active_non_injectable_reason;
       if (legacyReason) reasons.push(legacyReason);
     }
     const reasonSummary = reasons.join(", ")
       + (projection.active_non_injectable_reasons_truncated ? " …" : "");
+    const lifecycleLine = proposed == null || active == null || retired == null
+      ? ""
+      : proposed + " proposed · " + active + " active · " + retired + " retired";
+    const breakdown = codingFoundationJoinParts([
+      lifecycleLine,
+      codingFoundationCountLabel(projection.injectable_count, "injectable"),
+      codingFoundationSectionCount(
+        projection.selection_injection, ["count", "returned_count"], "selection/injection receipts"
+      ),
+      codingFoundationCountLabel(projection.accepted_evidence_count, "accepted"),
+      codingFoundationCountLabel(projection.distinct_actor_count, "actors"),
+      reasonSummary,
+    ], false) || "Measured";
     return {
       state: state,
       value: count == null ? "Measured" : count + " skills",
-      detail: codingFoundationJoinParts([
-        proposed == null || active == null || retired == null
-          ? ""
-          : proposed + " proposed · " + active + " active · " + retired + " retired",
-        codingFoundationCountLabel(projection.injectable_count, "injectable"),
-        codingFoundationSectionCount(
-          projection.selection_injection, ["count", "returned_count"], "selection/injection receipts"
-        ),
-        codingFoundationCountLabel(projection.accepted_evidence_count, "accepted"),
-        codingFoundationCountLabel(projection.distinct_actor_count, "actors"),
-        reasonSummary,
-      ], 240) || "Measured",
+      detail: codingFoundationBoundText(lifecycleLine || "Measured", 72),
+      breakdown: breakdown,
       title: label + " measured",
     };
   }
@@ -9518,20 +9521,22 @@ function codingFoundationCardModel(kind, projection) {
           + (mixed == null ? "?" : mixed) + " mixed";
       }).filter(Boolean).join(" · ")
       : "";
+    const breakdown = codingFoundationJoinParts([
+      unmeasured,
+      codingFoundationCountLabel(projection.changed_paths, "paths"),
+      codingFoundationCountLabel(projection.range_count, "ranges"),
+      codingFoundationCountLabel(projection.bytes_changed, "bytes"),
+      codingFoundationCountLabel(projection.paths_raw_only, "raw-only"),
+      codingFoundationCountLabel(projection.declared_exceptions, "declared"),
+      codingFoundationCountLabel(projection.derived_exceptions, "derived"),
+      adapterSummary,
+      projection.byte_coverage_rate == null ? "" : projection.byte_coverage_rate + "% bytes",
+    ], false) || "Measured";
     return {
       state: state,
       value: measured == null ? "Measured" : measured + " measured",
-      detail: codingFoundationJoinParts([
-        unmeasured,
-        codingFoundationCountLabel(projection.changed_paths, "paths"),
-        codingFoundationCountLabel(projection.range_count, "ranges"),
-        codingFoundationCountLabel(projection.bytes_changed, "bytes"),
-        codingFoundationCountLabel(projection.paths_raw_only, "raw-only"),
-        codingFoundationCountLabel(projection.declared_exceptions, "declared"),
-        codingFoundationCountLabel(projection.derived_exceptions, "derived"),
-        adapterSummary,
-        projection.byte_coverage_rate == null ? "" : projection.byte_coverage_rate + "% bytes",
-      ], 360) || "Measured",
+      detail: codingFoundationBoundText(unmeasured || "Measured", 72),
+      breakdown: breakdown,
       title: label + " measured",
     };
   }
@@ -9539,24 +9544,35 @@ function codingFoundationCardModel(kind, projection) {
   const usage = projection.usage && typeof projection.usage === "object" ? projection.usage : null;
   const usageState = usage && typeof usage.state === "string" ? usage.state : "";
   const discovery = codingFoundationBoundedCount(projection.discovery_count);
+  const usageBreakdown = usageState === "unknown"
+    ? "UNKNOWN usage"
+    : usageState === "measured"
+      ? codingFoundationJoinParts([
+        codingFoundationCountLabel(usage.used_count, "used"),
+        codingFoundationCountLabel(usage.unused_count, "unused"),
+        codingFoundationCountLabel(usage.run_count, "runs"),
+        codingFoundationCountLabel(usage.attributed_run_count, "attributed"),
+        codingFoundationCountLabel(usage.unattributed_run_count, "unattributed"),
+        codingFoundationCountLabel(usage.distinct_actor_count, "actors"),
+      ], false)
+      : "";
+  const compactUsage = usageState === "unknown"
+    ? "UNKNOWN usage"
+    : usageState === "measured"
+      ? codingFoundationJoinParts([
+        codingFoundationCountLabel(usage.used_count, "used"),
+        codingFoundationCountLabel(usage.unused_count, "unused"),
+      ], 72)
+      : "";
+  const breakdown = codingFoundationJoinParts([
+    usageBreakdown,
+    discovery == null ? "" : discovery + " discovered",
+  ], false) || "Measured";
   return {
     state: state,
     value: count == null ? "Measured" : count + " recipes",
-    detail: codingFoundationJoinParts([
-      usageState === "unknown"
-        ? "UNKNOWN usage"
-        : usageState === "measured"
-          ? codingFoundationJoinParts([
-            codingFoundationCountLabel(usage.used_count, "used"),
-            codingFoundationCountLabel(usage.unused_count, "unused"),
-            codingFoundationCountLabel(usage.run_count, "runs"),
-            codingFoundationCountLabel(usage.attributed_run_count, "attributed"),
-            codingFoundationCountLabel(usage.unattributed_run_count, "unattributed"),
-            codingFoundationCountLabel(usage.distinct_actor_count, "actors"),
-          ])
-          : "",
-      discovery == null ? "" : discovery + " discovered",
-    ]) || "Measured",
+    detail: compactUsage || (discovery == null ? "Measured" : discovery + " discovered"),
+    breakdown: breakdown,
     title: label + " measured",
   };
 }
@@ -9599,6 +9615,7 @@ function renderCodingFoundationCards(snapshot, elements) {
         if (slot.card) {
           slot.card.title = label + ": awaiting the full snapshot";
           if (typeof slot.card.setAttribute === "function") slot.card.setAttribute("data-state", "pending");
+          if (slot.card.dataset) slot.card.dataset.foundationBreakdown = "";
         }
       }
       continue;
@@ -9608,6 +9625,7 @@ function renderCodingFoundationCards(snapshot, elements) {
     if (slot.card) {
       slot.card.title = model.title;
       if (typeof slot.card.setAttribute === "function") slot.card.setAttribute("data-state", model.state);
+      if (slot.card.dataset) slot.card.dataset.foundationBreakdown = model.breakdown || model.detail;
     }
   }
 }
@@ -9625,8 +9643,51 @@ function bindCodingFoundationDashboard(doc) {
       detail: root.getElementById(id + "-detail"),
     };
   }
+  const dialog = root.getElementById("coding-foundation-dialog");
+  const dialogTitle = root.getElementById("coding-foundation-dialog-title");
+  const dialogSummary = root.getElementById("coding-foundation-dialog-summary");
+  const dialogBody = root.getElementById("coding-foundation-dialog-body");
+  let selectedKind = "";
+  const fillFoundationDialog = function fillFoundationDialog(kind) {
+    selectedKind = kind;
+    const label = CODING_FOUNDATION_LABELS[kind] || kind;
+    const slot = elements[kind];
+    if (dialogTitle) dialogTitle.textContent = label;
+    const state = slot && slot.card && typeof slot.card.getAttribute === "function"
+      ? String(slot.card.getAttribute("data-state") || "")
+      : "";
+    if (state === "pending" || state === "") {
+      if (dialogSummary) dialogSummary.textContent = "Loading";
+      if (dialogBody) dialogBody.textContent = "Awaiting the full snapshot";
+      return;
+    }
+    if (dialogSummary) dialogSummary.textContent = slot && slot.value ? String(slot.value.textContent || "") : "";
+    const breakdown = slot && slot.card && slot.card.dataset
+      ? String(slot.card.dataset.foundationBreakdown || "")
+      : "";
+    if (dialogBody) dialogBody.textContent = breakdown || (slot && slot.detail ? String(slot.detail.textContent || "") : "");
+  };
+  const openFoundationDialog = function openFoundationDialog(kind) {
+    fillFoundationDialog(kind);
+    if (dialog && typeof dialog.showModal === "function" && !dialog.open) dialog.showModal();
+  };
+  for (let i = 0; i < CODING_FOUNDATION_CARD_KEYS.length; i += 1) {
+    const kind = CODING_FOUNDATION_CARD_KEYS[i];
+    if (kind === "development_rules") continue;
+    const card = elements[kind] && elements[kind].card;
+    if (!card || typeof card.addEventListener !== "function") continue;
+    card.addEventListener("click", function onFoundationCardClick() {
+      openFoundationDialog(kind);
+    });
+  }
+  if (dialog && typeof dialog.addEventListener === "function") {
+    dialog.addEventListener("click", function onFoundationDialogBackdrop(event) {
+      if (event && event.target === dialog && typeof dialog.close === "function") dialog.close();
+    });
+  }
   const apply = function applyCodingFoundationSnapshot(snapshot) {
     renderCodingFoundationCards(snapshot, elements);
+    if (dialog && dialog.open && selectedKind) fillFoundationDialog(selectedKind);
   };
   if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
     window.addEventListener("message", function onCodingFoundationSnapshot(event) {
@@ -9634,8 +9695,9 @@ function bindCodingFoundationDashboard(doc) {
       if (message.type !== "snapshot" && message.type !== "snapshotSummary") return;
       apply(message.payload || {});
     });
+    window.openCodingFoundationDialog = openFoundationDialog;
   }
-  return { elements: elements, apply: apply };
+  return { elements: elements, apply: apply, open: openFoundationDialog };
 }
 
 function codingFoundationHeaderMarkup() {
@@ -9651,21 +9713,21 @@ function codingFoundationHeaderMarkup() {
     '<strong id="header-development-rules-value">Loading</strong>',
     '<span class="header-insight-detail" id="header-development-rules-detail">Awaiting the full snapshot</span>',
     "</div>",
-    '<div class="header-insight-card" id="header-skills" data-state="pending" title="Skills snapshot projection">',
+    '<button class="header-insight-card" id="header-skills" type="button" data-state="pending" data-foundation-kind="skills" aria-haspopup="dialog" aria-controls="coding-foundation-dialog" title="Skills snapshot projection">',
     '<span class="header-storage-label">Skills</span>',
     '<strong id="header-skills-value">Loading</strong>',
     '<span class="header-insight-detail" id="header-skills-detail">Awaiting the full snapshot</span>',
-    "</div>",
-    '<div class="header-insight-card" id="header-tool-recipes" data-state="pending" title="Tool Recipes snapshot projection">',
+    "</button>",
+    '<button class="header-insight-card" id="header-tool-recipes" type="button" data-state="pending" data-foundation-kind="tool_recipes" aria-haspopup="dialog" aria-controls="coding-foundation-dialog" title="Tool Recipes snapshot projection">',
     '<span class="header-storage-label">Tool Recipes</span>',
     '<strong id="header-tool-recipes-value">Loading</strong>',
     '<span class="header-insight-detail" id="header-tool-recipes-detail">Awaiting the full snapshot</span>',
-    "</div>",
-    '<div class="header-insight-card" id="header-semantic-edit-coverage" data-state="pending" title="Semantic Edit coverage projection">',
+    "</button>",
+    '<button class="header-insight-card" id="header-semantic-edit-coverage" type="button" data-state="pending" data-foundation-kind="semantic_edit_coverage" aria-haspopup="dialog" aria-controls="coding-foundation-dialog" title="Semantic Edit coverage projection">',
     '<span class="header-storage-label">Semantic Edit</span>',
     '<strong id="header-semantic-edit-coverage-value">Loading</strong>',
     '<span class="header-insight-detail" id="header-semantic-edit-coverage-detail">Awaiting the full snapshot</span>',
-    "</div>",
+    "</button>",
   ].join("");
 }
 
@@ -10295,6 +10357,14 @@ function getHtmlForWebview(webview, extensionUri) {
       </div>
       <div class="settings-footnote">Stored only in this repository's <code>.aiworkhub/config/features.json</code>, <code>.aiworkhub/config/source_graph.json</code> and <code>.aiworkhub/config/models.json</code>. Task orchestration and callback routing remain protected core services.</div>
     </div>
+  </dialog>
+
+  <dialog class="diagnostic-dialog coding-foundation-dialog" id="coding-foundation-dialog" aria-labelledby="coding-foundation-dialog-title">
+    <div class="dialog-heading">
+      <div><h2 id="coding-foundation-dialog-title">Skills</h2><span id="coding-foundation-dialog-summary"></span></div>
+      <button type="button" class="dialog-close" data-close-dialog="coding-foundation-dialog">Close</button>
+    </div>
+    <div class="coding-foundation-dialog-body" id="coding-foundation-dialog-body"></div>
   </dialog>
 
   <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>

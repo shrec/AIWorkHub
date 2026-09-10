@@ -1520,18 +1520,15 @@ class ReviewOrchestrator:
             return self._readiness_receipt(
                 action, "terminal", "target_workspace_identity_invalid"
             )
-        evidence = card.get("evidence")
-        partitions = (
-            evidence.get("source_graph_partition_readiness")
-            if isinstance(evidence, Mapping)
-            else None
-        )
-        if not isinstance(partitions, Mapping) or not partitions:
-            return self._readiness_receipt(action, "deferred", "source_graph_partition_empty")
-        if any(value is not True for value in partitions.values()):
-            return self._readiness_receipt(action, "deferred", "source_graph_partition_not_ready")
+        # Reviewer Source Graph preparation is launch-owned.  ``launch_task``
+        # materializes the sealed lens packet and then prewarms its candidate
+        # partition before any provider process starts, failing the reserved
+        # reviewer mechanically if that preparation cannot be verified.  A
+        # target card cannot truthfully carry that future launch receipt here;
+        # requiring it created a circular gate that deferred every automatic
+        # review forever.
         return self._readiness_receipt(
-            action, "ready", "ready", workspace, partitions,
+            action, "ready", "ready", workspace,
             identity_source=identity_source,
         )
 
