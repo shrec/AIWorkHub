@@ -8,22 +8,22 @@ import re
 import sqlite3
 import time
 import uuid
-from contextlib import closing
+from contextlib import ExitStack, closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol
 
 from . import (
+    db_writer,
     needfix_store,
     review_lifecycle,
+    sqlite_readonly,
     task_engine,
     task_store,
     workforce_catalog,
     workforce_router,
 )
-
-
 LENSES = ("correctness", "security", "code_quality")
 RECEIPT_SCHEMA = "aiworkhub.review_orchestrator_receipt.v1"
 
@@ -79,7 +79,18 @@ class Manager(Protocol):
 RouteSelector = Callable[[Path, str, str], Mapping[str, Any]]
 
 
-def _side_table_connection(db_path: str | Path) -> sqlite3.Connection:
+class _LeasedConnection(sqlite3.Connection):
+    def close(self) -> None:
+        try:
+            super().close()
+        finally:
+            stack = getattr(self, "_lease_stack", None)
+            self._lease_stack = None
+            if stack is not None:
+                stack.close()
+
+
+def _side_table_connection(db_path: str | Path, *, readonly: bool = False) -> sqlite3.Connection:
     """The one way this module opens its own side tables.
 
     ``review_lifecycle`` owns the authenticated chain and outbox rows and opens
@@ -90,7 +101,18 @@ def _side_table_connection(db_path: str | Path) -> sqlite3.Connection:
     timeout, the row factory or the journal mode, and one place a reader has to
     look to know how this module talks to that database.
     """
-    return sqlite3.connect(db_path)
+    path = Path(db_path)
+    if readonly:
+        return sqlite_readonly.connect_readonly(path)
+    stack = ExitStack()
+    stack.enter_context(db_writer.write_lease(path))
+    try:
+        conn = sqlite3.connect(path, factory=_LeasedConnection)
+        conn._lease_stack = stack  # type: ignore[attr-defined]
+        return conn
+    except Exception:
+        stack.close()
+        raise
 
 
 def canonical_review_db(manager: Manager) -> Path | None:
@@ -645,6 +667,7 @@ def bind_lens_plan(
     """Bind the required lens set for one chain, once. Returns what is bound."""
     planned = _normalize_lenses(lenses)
     with closing(_side_table_connection(db_path)) as conn, conn:
+        conn.execute("BEGIN IMMEDIATE")
         conn.execute(LENS_PLAN_TABLE)
         conn.execute(
             "INSERT OR IGNORE INTO review_orchestrator_lens_plan "
@@ -661,8 +684,7 @@ def bind_lens_plan(
 def required_lenses(db_path: str | Path, chain_id: int) -> tuple[str, ...]:
     """Return the lens set this chain must launch, or every lens when unplanned."""
     try:
-        with closing(_side_table_connection(db_path)) as conn:
-            conn.execute(LENS_PLAN_TABLE)
+        with closing(_side_table_connection(db_path, readonly=True)) as conn:
             row = conn.execute(
                 "SELECT lenses FROM review_orchestrator_lens_plan WHERE chain_id=?",
                 (int(chain_id),),
@@ -677,8 +699,7 @@ def required_lenses(db_path: str | Path, chain_id: int) -> tuple[str, ...]:
 def lens_plan_record(db_path: str | Path, chain_id: int) -> dict[str, Any]:
     """Read-only view of one chain's lens plan for a manager or a review packet."""
     try:
-        with closing(_side_table_connection(db_path)) as conn:
-            conn.execute(LENS_PLAN_TABLE)
+        with closing(_side_table_connection(db_path, readonly=True)) as conn:
             row = conn.execute(
                 "SELECT lenses, effective_tier, source FROM "
                 "review_orchestrator_lens_plan WHERE chain_id=?",
@@ -709,6 +730,7 @@ def add_required_lens(db_path: str | Path, *, chain_id: int, lens: str) -> tuple
     if lens not in LENSES:
         raise ValueError("unknown_review_lens:" + str(lens))
     with closing(_side_table_connection(db_path)) as conn, conn:
+        conn.execute("BEGIN IMMEDIATE")
         conn.execute(LENS_PLAN_TABLE)
         row = conn.execute(
             "SELECT lenses FROM review_orchestrator_lens_plan WHERE chain_id=?",
@@ -902,6 +924,7 @@ class ReviewOrchestrator:
             return
         try:
             with closing(_side_table_connection(self.db_path)) as conn, conn:
+                conn.execute("BEGIN IMMEDIATE")
                 conn.execute(REPLAY_PLAN_TABLE)
                 for lens, plan in sorted(sources.items()):
                     conn.execute(
@@ -921,8 +944,7 @@ class ReviewOrchestrator:
         if not lens:
             return {}
         try:
-            with closing(_side_table_connection(self.db_path)) as conn:
-                conn.execute(REPLAY_PLAN_TABLE)
+            with closing(_side_table_connection(self.db_path, readonly=True)) as conn:
                 row = conn.execute(
                     "SELECT plan_json FROM review_orchestrator_replay_plan "
                     "WHERE chain_id=? AND lens=?",
@@ -997,6 +1019,7 @@ class ReviewOrchestrator:
     def _repair_expected_workspace(self, chain_id: int, workspace_identity: str) -> None:
         """Bind a later verified workspace only while the retained binding is empty."""
         with closing(_side_table_connection(self.db_path)) as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS review_orchestrator_workspace_bindings "
                 "(chain_id INTEGER PRIMARY KEY, workspace_identity TEXT NOT NULL)"
@@ -1014,7 +1037,7 @@ class ReviewOrchestrator:
                 )
 
     def _expected_workspace_identity(self, chain_id: int) -> str:
-        with closing(_side_table_connection(self.db_path)) as conn:
+        with closing(_side_table_connection(self.db_path, readonly=True)) as conn:
             row = conn.execute(
                 "SELECT workspace_identity FROM review_orchestrator_workspace_bindings "
                 "WHERE chain_id=?",

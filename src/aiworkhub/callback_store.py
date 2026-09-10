@@ -23,10 +23,12 @@ import re
 import sqlite3
 import time
 import uuid
+from contextlib import ExitStack
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from . import db_writer
 from . import task_fsm
 from . import task_store
 
@@ -138,36 +140,51 @@ def resolve_db_path(repo: str | Path) -> Path:
     return Path(readiness.canonical_db)
 
 
+class _LeasedConnection(sqlite3.Connection):
+    def close(self) -> None:
+        try:
+            super().close()
+        finally:
+            stack = getattr(self, "_lease_stack", None)
+            self._lease_stack = None
+            if stack is not None:
+                stack.close()
+
+
 def open_db(path: Path) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
+    stack = ExitStack()
+    stack.enter_context(db_writer.write_lease(path))
     conn: sqlite3.Connection | None = None
     try:
-        conn = sqlite3.connect(str(path), timeout=5.0)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA busy_timeout=5000")
-        for attempt in range(_WAL_RETRY_COUNT):
-            try:
-                conn.execute("PRAGMA journal_mode=WAL")
-                break
-            except sqlite3.OperationalError as exc:
-                if "locked" not in str(exc).lower():
-                    _close_db_quietly(conn)
-                    raise CallbackStoreError(_WAL_CATEGORY, _WAL_OPERATION_FAILED_REASON) from None
-                if attempt == _WAL_RETRY_COUNT - 1:
-                    _close_db_quietly(conn)
-                    raise CallbackStoreError(_WAL_CATEGORY, _WAL_LOCK_EXHAUSTED_REASON) from None
-                time.sleep(0.05 * (attempt + 1))
-        conn.execute("PRAGMA synchronous=NORMAL")
+        try:
+            conn = sqlite3.connect(str(path), timeout=5.0, factory=_LeasedConnection)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA busy_timeout=5000")
+            for attempt in range(_WAL_RETRY_COUNT):
+                try:
+                    conn.execute("PRAGMA journal_mode=WAL")
+                    break
+                except sqlite3.OperationalError as exc:
+                    if "locked" not in str(exc).lower():
+                        raise CallbackStoreError(_WAL_CATEGORY, _WAL_OPERATION_FAILED_REASON) from None
+                    if attempt == _WAL_RETRY_COUNT - 1:
+                        raise CallbackStoreError(_WAL_CATEGORY, _WAL_LOCK_EXHAUSTED_REASON) from None
+                    time.sleep(0.05 * (attempt + 1))
+            conn.execute("PRAGMA synchronous=NORMAL")
+        except sqlite3.OperationalError:
+            raise CallbackStoreError(_WAL_CATEGORY, _WAL_OPERATION_FAILED_REASON) from None
+        conn._lease_stack = stack  # type: ignore[attr-defined]
         return conn
-    except sqlite3.OperationalError:
+    except Exception:
         _close_db_quietly(conn)
-        raise CallbackStoreError(_WAL_CATEGORY, _WAL_OPERATION_FAILED_REASON) from None
+        stack.close()
+        raise
 
 
 def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
     rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
     return any(row["name"] == column for row in rows)
-
 
 def _ensure_callback_outbox_table(conn: sqlite3.Connection) -> None:
     """Idempotent, fail-closed migration: create/upgrade callback_outbox.

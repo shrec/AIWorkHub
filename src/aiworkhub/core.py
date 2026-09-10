@@ -14,6 +14,7 @@ import tempfile
 import threading
 import time
 from collections import defaultdict
+from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -29,6 +30,7 @@ from . import (
 from . import repository_state
 from . import shared_router
 from . import sqlite_readonly
+from . import db_writer
 from . import task_store
 from . import task_retention
 from . import callback_store
@@ -130,6 +132,17 @@ def _canonical_db_path() -> Path:
     return Path(readiness.canonical_db)
 
 
+class _LeasedConnection(sqlite3.Connection):
+    def close(self) -> None:
+        try:
+            super().close()
+        finally:
+            stack = getattr(self, "_lease_stack", None)
+            self._lease_stack = None
+            if stack is not None:
+                stack.close()
+
+
 def _canonical_connect(*, readonly: bool = False) -> sqlite3.Connection:
     path = _canonical_db_path()
     if readonly:
@@ -139,10 +152,18 @@ def _canonical_connect(*, readonly: bool = False) -> sqlite3.Connection:
         # open through the fail-closed helper, which percent-encodes the path
         # and also issues ``PRAGMA query_only=ON``.
         conn = sqlite_readonly.connect_readonly(path)
-    else:
-        conn = sqlite3.connect(str(path))
-    conn.row_factory = sqlite3.Row
-    return conn
+        conn.row_factory = sqlite3.Row
+        return conn
+    stack = ExitStack()
+    stack.enter_context(db_writer.write_lease(path))
+    try:
+        conn = sqlite3.connect(str(path), factory=_LeasedConnection)
+        conn.row_factory = sqlite3.Row
+        conn._lease_stack = stack  # type: ignore[attr-defined]
+        return conn
+    except Exception:
+        stack.close()
+        raise
 
 
 def _canonical_result(

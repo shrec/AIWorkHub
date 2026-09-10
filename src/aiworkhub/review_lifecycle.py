@@ -11,10 +11,14 @@ import hashlib
 import json
 import re
 import sqlite3
+from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping
+
+from . import db_writer
+from .sqlite_readonly import connect_readonly
 
 
 SCHEMA_ID = "aiworkhub.review_lifecycle.v1"
@@ -710,11 +714,36 @@ def lifecycle_counts(db_path: str | Path) -> dict[str, int]:
         conn.close()
 
 
+
+class _LeasedConnection(sqlite3.Connection):
+    def close(self) -> None:
+        try:
+            super().close()
+        finally:
+            stack = getattr(self, "_lease_stack", None)
+            self._lease_stack = None
+            if stack is not None:
+                stack.close()
+
+
 def _connect(db_path: str | Path) -> sqlite3.Connection:
     path = Path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(path), timeout=5.0)
-    conn.execute("PRAGMA busy_timeout=5000")
+    stack = ExitStack()
+    stack.enter_context(db_writer.write_lease(path))
+    try:
+        conn = sqlite3.connect(str(path), timeout=5.0, factory=_LeasedConnection)
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.row_factory = sqlite3.Row
+        conn._lease_stack = stack  # type: ignore[attr-defined]
+        return conn
+    except Exception:
+        stack.close()
+        raise
+
+
+def _read_connection(db_path: str | Path) -> sqlite3.Connection:
+    conn = connect_readonly(db_path)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -1109,7 +1138,7 @@ def _action_from_row(row: sqlite3.Row | None) -> ReviewAction:
 
 
 def actions_for_chain(db_path: str | Path, chain_id: int) -> tuple[ReviewAction, ...]:
-    conn = _connect(db_path)
+    conn = _read_connection(db_path)
     try:
         row = conn.execute(
             "SELECT * FROM review_chains WHERE chain_id=?", (int(chain_id),)
@@ -1125,7 +1154,7 @@ def completed_receipts_for_chain(
     db_path: str | Path, chain_id: int
 ) -> tuple[dict[str, Any], ...]:
     """Return completed receipts only after authenticating the whole chain."""
-    conn = _connect(db_path)
+    conn = _read_connection(db_path)
     try:
         _hydrate_chain_by_id(conn, int(chain_id))
         rows = conn.execute(

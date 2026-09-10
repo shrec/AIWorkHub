@@ -5,12 +5,15 @@ import fnmatch
 import json
 import re
 import sqlite3
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping
+from typing import Any, Callable, Iterable, Iterator, Mapping
 
 from . import callback_store
+from . import db_writer
+from .sqlite_readonly import connect_readonly
 
 
 SCHEMA_ID = "aiworkhub.dependency_autolaunch_outcome.v1"
@@ -327,6 +330,23 @@ def _state(row: _TaskRow) -> str:
 
 def _repo_db(repo_root: Path) -> Path:
     return Path(repo_root) / ".aiworkhub" / "tasking" / "task_queue.sqlite"
+
+
+@contextmanager
+def _write_connection(db: Path) -> Iterator[sqlite3.Connection]:
+    with db_writer.write_lease(db):
+        conn = sqlite3.connect(str(db), timeout=30)
+        conn.row_factory = sqlite3.Row
+        try:
+            yield conn
+        finally:
+            conn.close()
+
+
+def _read_connection(db: Path) -> sqlite3.Connection:
+    conn = connect_readonly(db)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
 def _read_rows(conn: sqlite3.Connection) -> dict[str, _TaskRow]:
@@ -679,91 +699,105 @@ def reconcile(
         outcome["error"] = "task_db_missing"
         return outcome
 
-    conn = sqlite3.connect(str(db), timeout=30)
-    conn.row_factory = sqlite3.Row
-    try:
+    with _write_connection(db) as conn:
+        conn.execute("BEGIN IMMEDIATE")
         callback_store.init_db(conn)
         _ensure_holds_table(conn)
         conn.commit()
         rows = _read_rows(conn)
-        launched_count = 0
-        for child in sorted(rows.values(), key=lambda r: r.task_id):
-            deps = _depends_on(child.card)
-            if not deps:
-                continue
-            child_state = _state(child)
-            if child_state != "pending" or child.worker_status.strip().lower() not in ACTIVE_WORKER_STATUSES:
-                outcome["skipped"].append({"task_id": child.task_id, "reason": f"not_pending_unclaimed:{child_state}"})
-                continue
-            dep_rows = [rows.get(dep) for dep in deps]
-            missing = [dep for dep, dep_row in zip(deps, dep_rows) if dep_row is None]
-            if missing:
-                outcome["delayed"].append({"task_id": child.task_id, "reason": "missing_dependencies", "dependencies": missing})
-                continue
-            failed = sorted(dep.task_id for dep in dep_rows if dep is not None and _state(dep) == "failed")
-            if failed:
+
+    launched_count = 0
+    for child in sorted(rows.values(), key=lambda r: r.task_id):
+        deps = _depends_on(child.card)
+        if not deps:
+            continue
+        child_state = _state(child)
+        if child_state != "pending" or child.worker_status.strip().lower() not in ACTIVE_WORKER_STATUSES:
+            outcome["skipped"].append({"task_id": child.task_id, "reason": f"not_pending_unclaimed:{child_state}"})
+            continue
+        dep_rows = [rows.get(dep) for dep in deps]
+        missing = [dep for dep, dep_row in zip(deps, dep_rows) if dep_row is None]
+        if missing:
+            outcome["delayed"].append({"task_id": child.task_id, "reason": "missing_dependencies", "dependencies": missing})
+            continue
+        failed = sorted(dep.task_id for dep in dep_rows if dep is not None and _state(dep) == "failed")
+        if failed:
+            with _write_connection(db) as conn:
+                conn.execute("BEGIN IMMEDIATE")
                 if _mark_dependency_blocked(conn, child, failed, trigger_task_id):
                     conn.commit()
-                    outcome["blocked"].append({"task_id": child.task_id, "blocked_by": failed})
+                    blocked = True
                 else:
                     conn.rollback()
-                    outcome["delayed"].append({"task_id": child.task_id, "reason": "dependency_block_race"})
-                continue
-            waiting = [dep.task_id for dep in dep_rows if dep is not None and _state(dep) != "success"]
-            if waiting:
-                outcome["delayed"].append({"task_id": child.task_id, "reason": "waiting_dependencies", "dependencies": waiting})
-                continue
+                    blocked = False
+            if blocked:
+                outcome["blocked"].append({"task_id": child.task_id, "blocked_by": failed})
+            else:
+                outcome["delayed"].append({"task_id": child.task_id, "reason": "dependency_block_race"})
+            continue
+        waiting = [dep.task_id for dep in dep_rows if dep is not None and _state(dep) != "success"]
+        if waiting:
+            outcome["delayed"].append({"task_id": child.task_id, "reason": "waiting_dependencies", "dependencies": waiting})
+            continue
+        conn = _read_connection(db)
+        try:
             hold = _hold_for(conn, child.task_id)
-            if hold is not None:
-                if child.updated_at and child.updated_at > hold["card_updated_at"]:
-                    # The card changed since the recorded denial: the hold no
-                    # longer describes this configuration, so it is released.
+        finally:
+            conn.close()
+        if hold is not None:
+            if child.updated_at and child.updated_at > hold["card_updated_at"]:
+                # The card changed since the recorded denial: the hold no
+                # longer describes this configuration, so it is released.
+                with _write_connection(db) as conn:
+                    conn.execute("BEGIN IMMEDIATE")
                     _clear_hold(conn, child.task_id)
                     conn.commit()
-                elif hold["kind"] == "deterministic":
-                    outcome["skipped"].append(
-                        {
-                            "task_id": child.task_id,
-                            "reason": "deterministic_denial_hold:"
-                            + hold["reason"][:120],
-                        }
-                    )
-                    continue
-                elif hold["next_attempt_at"] > _now():
-                    outcome["delayed"].append(
-                        {
-                            "task_id": child.task_id,
-                            "reason": "transient_backoff_hold",
-                            "next_attempt_at": hold["next_attempt_at"],
-                        }
-                    )
-                    continue
-            if capacity is not None and launched_count >= capacity:
-                outcome["delayed"].append({"task_id": child.task_id, "reason": "capacity"})
+            elif hold["kind"] == "deterministic":
+                outcome["skipped"].append(
+                    {
+                        "task_id": child.task_id,
+                        "reason": "deterministic_denial_hold:"
+                        + hold["reason"][:120],
+                    }
+                )
                 continue
-            result = dict(launch(child.task_id, child.runner, child.topic, _request_id(trigger_task_id, child.task_id)))
-            if result.get("ok"):
-                launched_count += 1
-                _clear_hold(conn, child.task_id)
-                conn.commit()
-                outcome["launched"].append({"task_id": child.task_id, "runner": child.runner, "topic": child.topic})
-            else:
-                denial = str(result.get("stderr") or result.get("error") or "")
-                hold_state = _record_denial(conn, child, denial)
-                conn.commit()
+            elif hold["next_attempt_at"] > _now():
                 outcome["delayed"].append(
                     {
                         "task_id": child.task_id,
-                        "reason": "launch_not_claimed",
-                        "stderr": denial[:240],
-                        "denial_kind": hold_state["kind"],
-                        "attempts": hold_state["attempts"],
-                        "next_attempt_at": hold_state["next_attempt_at"],
+                        "reason": "transient_backoff_hold",
+                        "next_attempt_at": hold["next_attempt_at"],
                     }
                 )
-        return outcome
-    finally:
-        conn.close()
+                continue
+        if capacity is not None and launched_count >= capacity:
+            outcome["delayed"].append({"task_id": child.task_id, "reason": "capacity"})
+            continue
+        result = dict(launch(child.task_id, child.runner, child.topic, _request_id(trigger_task_id, child.task_id)))
+        if result.get("ok"):
+            launched_count += 1
+            with _write_connection(db) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                _clear_hold(conn, child.task_id)
+                conn.commit()
+            outcome["launched"].append({"task_id": child.task_id, "runner": child.runner, "topic": child.topic})
+        else:
+            denial = str(result.get("stderr") or result.get("error") or "")
+            with _write_connection(db) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                hold_state = _record_denial(conn, child, denial)
+                conn.commit()
+            outcome["delayed"].append(
+                {
+                    "task_id": child.task_id,
+                    "reason": "launch_not_claimed",
+                    "stderr": denial[:240],
+                    "denial_kind": hold_state["kind"],
+                    "attempts": hold_state["attempts"],
+                    "next_attempt_at": hold_state["next_attempt_at"],
+                }
+            )
+    return outcome
 
 
 def reconcile_after_accept(repo_root: Path | str, accepted_task_id: str, launch: LaunchFn) -> dict[str, Any]:
