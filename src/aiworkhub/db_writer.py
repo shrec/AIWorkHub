@@ -47,6 +47,7 @@ returns immediately instead of self-deadlocking.
 from __future__ import annotations
 
 import os
+import sqlite3
 import threading
 import time
 from contextlib import contextmanager
@@ -405,3 +406,14 @@ def lease_for_connection(
         return
     with write_lease(db_path, timeout_s=timeout_s) as receipt:
         yield {**receipt, "skipped": False}
+
+
+class _LeasedConnection(sqlite3.Connection):
+    def close(self) -> None:
+        try:
+            super().close()
+        finally:
+            stack = getattr(self, "_lease_stack", None)
+            self._lease_stack = None
+            if stack is not None:
+                stack.close()

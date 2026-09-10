@@ -8,6 +8,7 @@ test forks real OS processes and fails if the lease is not observed by both.
 
 from __future__ import annotations
 
+import ast
 import json
 import multiprocessing as mp
 import os
@@ -16,6 +17,7 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import ExitStack
 from pathlib import Path
 
 import pytest
@@ -311,3 +313,67 @@ def test_lease_removes_the_database_is_locked_class(tmp_path: Path, leased: bool
         # stops failing, the scenario no longer reproduces contention and the
         # leased assertion above would be proving nothing.
         assert locked > 0, "baseline scenario no longer reproduces contention"
+
+
+def test_leased_connection_wrapper_is_defined_once_and_used_by_consumers() -> None:
+    root = Path(__file__).resolve().parents[1] / "src" / "aiworkhub"
+    definitions: list[str] = []
+    factories: list[str] = []
+    for path in sorted(root.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        rel = path.relative_to(root).as_posix()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef) and node.name == "_LeasedConnection":
+                definitions.append(rel)
+            if not isinstance(node, ast.Call):
+                continue
+            for kw in node.keywords:
+                if kw.arg != "factory":
+                    continue
+                value = kw.value
+                if (
+                    isinstance(value, ast.Attribute)
+                    and value.attr == "_LeasedConnection"
+                    and isinstance(value.value, ast.Name)
+                    and value.value.id == "db_writer"
+                ):
+                    factories.append(rel)
+    assert definitions == ["db_writer.py"]
+    assert factories == [
+        "callback_store.py",
+        "core.py",
+        "review_lifecycle.py",
+        "review_orchestrator.py",
+    ]
+
+
+def test_leased_connection_retains_lease_until_idempotent_close(tmp_path: Path) -> None:
+    db = tmp_path / "q.sqlite"
+    stack = ExitStack()
+    stack.enter_context(db_writer.write_lease(db, timeout_s=5))
+    conn = sqlite3.connect(str(db), factory=db_writer._LeasedConnection)
+    conn._lease_stack = stack  # type: ignore[attr-defined]
+    assert type(conn) is db_writer._LeasedConnection
+    conn.execute("CREATE TABLE t(x INTEGER)")
+    conn.commit()
+    conn.execute("INSERT INTO t VALUES (1)")
+    held: list[bool] = []
+
+    def probe() -> None:
+        try:
+            with db_writer.write_lease(db, timeout_s=0.3):
+                held.append(True)
+        except db_writer.WriteLeaseTimeout:
+            held.append(False)
+
+    thread = threading.Thread(target=probe)
+    thread.start()
+    thread.join()
+    assert held == [False]
+    conn.close()
+    conn.close()
+    with sqlite3.connect(str(db)) as other:
+        assert other.execute("SELECT COUNT(*) FROM t").fetchone()[0] == 0
+    with db_writer.write_lease(db, timeout_s=5):
+        held.append(True)
+    assert held == [False, True]

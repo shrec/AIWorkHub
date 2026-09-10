@@ -132,17 +132,6 @@ def _canonical_db_path() -> Path:
     return Path(readiness.canonical_db)
 
 
-class _LeasedConnection(sqlite3.Connection):
-    def close(self) -> None:
-        try:
-            super().close()
-        finally:
-            stack = getattr(self, "_lease_stack", None)
-            self._lease_stack = None
-            if stack is not None:
-                stack.close()
-
-
 def _canonical_connect(*, readonly: bool = False) -> sqlite3.Connection:
     path = _canonical_db_path()
     if readonly:
@@ -157,7 +146,7 @@ def _canonical_connect(*, readonly: bool = False) -> sqlite3.Connection:
     stack = ExitStack()
     stack.enter_context(db_writer.write_lease(path))
     try:
-        conn = sqlite3.connect(str(path), factory=_LeasedConnection)
+        conn = sqlite3.connect(str(path), factory=db_writer._LeasedConnection)
         conn.row_factory = sqlite3.Row
         conn._lease_stack = stack  # type: ignore[attr-defined]
         return conn

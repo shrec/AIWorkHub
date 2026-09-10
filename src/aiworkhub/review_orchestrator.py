@@ -79,17 +79,6 @@ class Manager(Protocol):
 RouteSelector = Callable[[Path, str, str], Mapping[str, Any]]
 
 
-class _LeasedConnection(sqlite3.Connection):
-    def close(self) -> None:
-        try:
-            super().close()
-        finally:
-            stack = getattr(self, "_lease_stack", None)
-            self._lease_stack = None
-            if stack is not None:
-                stack.close()
-
-
 def _side_table_connection(db_path: str | Path, *, readonly: bool = False) -> sqlite3.Connection:
     """The one way this module opens its own side tables.
 
@@ -107,7 +96,7 @@ def _side_table_connection(db_path: str | Path, *, readonly: bool = False) -> sq
     stack = ExitStack()
     stack.enter_context(db_writer.write_lease(path))
     try:
-        conn = sqlite3.connect(path, factory=_LeasedConnection)
+        conn = sqlite3.connect(path, factory=db_writer._LeasedConnection)
         conn._lease_stack = stack  # type: ignore[attr-defined]
         return conn
     except Exception:

@@ -140,17 +140,6 @@ def resolve_db_path(repo: str | Path) -> Path:
     return Path(readiness.canonical_db)
 
 
-class _LeasedConnection(sqlite3.Connection):
-    def close(self) -> None:
-        try:
-            super().close()
-        finally:
-            stack = getattr(self, "_lease_stack", None)
-            self._lease_stack = None
-            if stack is not None:
-                stack.close()
-
-
 def open_db(path: Path) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     stack = ExitStack()
@@ -158,7 +147,7 @@ def open_db(path: Path) -> sqlite3.Connection:
     conn: sqlite3.Connection | None = None
     try:
         try:
-            conn = sqlite3.connect(str(path), timeout=5.0, factory=_LeasedConnection)
+            conn = sqlite3.connect(str(path), timeout=5.0, factory=db_writer._LeasedConnection)
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA busy_timeout=5000")
             for attempt in range(_WAL_RETRY_COUNT):

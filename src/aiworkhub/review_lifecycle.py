@@ -714,25 +714,13 @@ def lifecycle_counts(db_path: str | Path) -> dict[str, int]:
         conn.close()
 
 
-
-class _LeasedConnection(sqlite3.Connection):
-    def close(self) -> None:
-        try:
-            super().close()
-        finally:
-            stack = getattr(self, "_lease_stack", None)
-            self._lease_stack = None
-            if stack is not None:
-                stack.close()
-
-
 def _connect(db_path: str | Path) -> sqlite3.Connection:
     path = Path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     stack = ExitStack()
     stack.enter_context(db_writer.write_lease(path))
     try:
-        conn = sqlite3.connect(str(path), timeout=5.0, factory=_LeasedConnection)
+        conn = sqlite3.connect(str(path), timeout=5.0, factory=db_writer._LeasedConnection)
         conn.execute("PRAGMA busy_timeout=5000")
         conn.row_factory = sqlite3.Row
         conn._lease_stack = stack  # type: ignore[attr-defined]
