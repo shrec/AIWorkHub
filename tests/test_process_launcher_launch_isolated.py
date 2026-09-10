@@ -578,3 +578,214 @@ def test_vscode_launch_prefetch_accepts_parse_broken_rework_overlay(
         reason.startswith("vscode_lm_initial_source_graph_prefetch_failed")
         for reason in blocked_reasons
     )
+
+
+def test_vscode_launch_prefetch_rejects_overlay_identity_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from aiworkhub.worker_workspace import WorkerWorkspace
+
+    authority = tmp_path / "authority"
+    workspace_root = tmp_path / "R-prefetch"
+    workspace = workspace_root / "worktree"
+    home = workspace_root / "home"
+    process_dir = tmp_path / "processes"
+    authority.mkdir()
+    workspace.mkdir(parents=True)
+    home.mkdir()
+    process_dir.mkdir()
+    packet = {
+        "successor_request_id": "R-other",
+        "successor_task_id": "T-1",
+        "predecessor_request_id": "R-old",
+        "predecessor_task_id": "T-1",
+        "authority_repo": str(authority.resolve()),
+        "files": [],
+    }
+    packet["canonical_digest"] = hashlib.sha256(
+        json.dumps(packet, sort_keys=True, ensure_ascii=True).encode("utf-8")
+    ).hexdigest()
+    overlay_path = home / "task_mcp_worker_runtime" / "rework_overlay.json"
+    overlay_path.parent.mkdir()
+    overlay_path.write_text(json.dumps(packet), encoding="utf-8")
+    worker_workspace = WorkerWorkspace(
+        request_id="R-prefetch",
+        repo=authority,
+        path=workspace,
+        home=home,
+        allowed_writes=("src/changed.py",),
+        parent_baseline={},
+        workspace_baseline={},
+    )
+
+    class _LaunchManager(_StubManager):
+        def __init__(self) -> None:
+            super().__init__(authority)
+            self.process_dir = process_dir
+            self._live: dict[str, object] = {}
+            self._lock = contextlib.nullcontext()
+
+        def _preflight_card(
+            self, *_args: object, **_kwargs: object,
+        ) -> dict[str, object]:
+            return {
+                "request_id": "R-prefetch",
+                "allowed_writes": ["src/changed.py"],
+                "project_context": {
+                    "source_graph": {
+                        "mode": "file",
+                        "query": "src/changed.py",
+                        "target": "src/changed.py",
+                        "budget": 16,
+                        "workflow_stage": "orientation",
+                    }
+                },
+            }
+
+        def _with_dependency_inputs(self, card: dict[str, object]) -> dict[str, object]:
+            return dict(card)
+
+        def _resolve_provider_env(
+            self,
+            _adapter_id: str,
+            model: str | None,
+        ) -> tuple[dict[str, str], str | None]:
+            return {}, model
+
+        def _launch_reservation(
+            self, _event: dict[str, object],
+        ) -> contextlib.AbstractContextManager[None]:
+            return contextlib.nullcontext()
+
+        def _terminal_authority_grant_path(self, request_id: str) -> Path:
+            return process_dir / f"{request_id}.authority.json"
+
+        def _terminal_authority_key(self) -> bytes:
+            return b"test-key"
+
+        def _popen(self, *_args: object, **_kwargs: object) -> object:
+            return type("FakeProcess", (), {"pid": 4321})()
+
+        def _monitor(self, _live: object) -> None:
+            return None
+
+    class _Runtime:
+        server_name = "test-worker-mcp"
+        tool_names = ("aiworkhub_worker_source_graph_query",)
+        audit_ledger_path = None
+        audit_hmac_key_path = None
+        claude_mcp_config_path = home / "claude.json"
+        copilot_mcp_config_path = home / "copilot.json"
+        codex_config_toml_path = home / "config.toml"
+        kilo_config_path = home / "kilo.json"
+        package_import_root = tmp_path
+
+    class _TaskEngine:
+        @staticmethod
+        def claim_start_exact(
+            *_args: object,
+            **_kwargs: object,
+        ) -> dict[str, object]:
+            return {"ok": True, "card": {"claim_epoch": 1}}
+
+        @staticmethod
+        def mark_launch_failed(
+            *_args: object,
+            **_kwargs: object,
+        ) -> dict[str, object]:
+            return {"ok": True}
+
+    created: dict[str, object] = {}
+
+    class _Bridge:
+        @staticmethod
+        def create_request(**kwargs: object) -> object:
+            created["kwargs"] = kwargs
+            return type("Req", (), {"request_id": str(kwargs["request_id"])})()
+
+        @staticmethod
+        def cancel_request(_request: object) -> None:
+            return None
+
+    monkeypatch.setattr(process_launcher, "launch_gates_open", lambda: True)
+    monkeypatch.setattr(process_launcher, "task_engine", _TaskEngine)
+    monkeypatch.setattr(
+        process_launcher, "_validate_adapter_identity", lambda *_a: None,
+    )
+    monkeypatch.setattr(
+        process_launcher,
+        "validate_workforce_identity",
+        lambda _runner, _adapter_id, model, **_kwargs: model or "test-model",
+    )
+    monkeypatch.setattr(
+        process_launcher, "_memory_launch_admission", lambda: {"admit": True},
+    )
+    monkeypatch.setattr(
+        process_launcher, "_external_readonly_dirs", lambda *_a: [],
+    )
+    monkeypatch.setattr(
+        process_launcher, "_task_authority_repo", lambda *_a: authority,
+    )
+    monkeypatch.setattr(
+        process_launcher, "_launch_project_context", lambda *_a: None,
+    )
+    monkeypatch.setattr(
+        process_launcher, "create_workspace", lambda *_a: worker_workspace,
+    )
+    monkeypatch.setattr(
+        process_launcher, "build_residual_contract_manifest", lambda *_a: [],
+    )
+    monkeypatch.setattr(
+        process_launcher,
+        "_materialize_worker_rework_overlay",
+        lambda *_a, **_kwargs: (overlay_path, packet),
+    )
+    monkeypatch.setattr(
+        process_launcher,
+        "_materialize_crash_retry_packet",
+        lambda *_a, **_kwargs: (None, None),
+    )
+    monkeypatch.setattr(
+        process_launcher,
+        "_provision_worker_mcp_runtime_for_authority",
+        lambda *_a, **_kwargs: _Runtime(),
+    )
+    monkeypatch.setattr(
+        process_launcher,
+        "_worker_mcp_source_graph_targets",
+        lambda _context: ("src/changed.py",),
+    )
+    monkeypatch.setattr(
+        process_launcher, "_worker_mcp_session_topic", lambda *_a: "nf736",
+    )
+    monkeypatch.setattr(process_launcher, "vscode_lm_bridge", _Bridge)
+    monkeypatch.setattr(process_launcher, "_touch_0600", lambda path: path.write_text(""))
+    monkeypatch.setattr(process_launcher, "chmod_path", lambda *_a: None)
+    monkeypatch.setattr(
+        process_launcher,
+        "write_json_0600",
+        lambda path, data: path.write_text(json.dumps(data)),
+    )
+    monkeypatch.setattr(
+        process_launcher, "_committed_claim_card",
+        lambda claim, **_kwargs: {
+            "request_id": "R-prefetch",
+            "claim_epoch": int(dict(claim["card"])["claim_epoch"]),
+            "allowed_writes": ["src/changed.py"],
+        },
+    )
+
+    result = _launch(
+        _LaunchManager(),
+        runner="vscode_lm",
+        adapter_id=process_launcher.runtime_adapters.VSCODE_LM_ADAPTER,
+        topic="nf736",
+        timeout_seconds=30,
+    )
+
+    assert result["ok"] is False
+    assert "kwargs" not in created
+    reason = str(result.get("blocked_reason") or "")
+    assert reason.startswith("vscode_lm_initial_source_graph_prefetch_failed:")
+    assert "successor_request_id_mismatch" in reason

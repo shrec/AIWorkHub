@@ -11,7 +11,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.11.20";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.11.21";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 // NF-2026-00643: this globalStorage trace directory was measured holding 1,102
 // files and 2,235,024,325 bytes (2.24 GB), largest single file 44,626,825 bytes
@@ -9360,16 +9360,18 @@ function applyWebviewOptions(webview, extensionUri) {
   };
 }
 
-const CODING_FOUNDATION_CARD_KEYS = ["development_rules", "skills", "tool_recipes"];
+const CODING_FOUNDATION_CARD_KEYS = ["development_rules", "skills", "tool_recipes", "semantic_edit_coverage"];
 const CODING_FOUNDATION_SCHEMAS = {
   development_rules: "aiworkhub.dashboard.development_rules.v1",
   skills: "aiworkhub.dashboard.skills.v1",
   tool_recipes: "aiworkhub.dashboard.tool_recipes.v1",
+  semantic_edit_coverage: "aiworkhub.dashboard.semantic_edit_coverage.v1",
 };
 const CODING_FOUNDATION_LABELS = {
   development_rules: "Development Rules",
   skills: "Skills",
   tool_recipes: "Tool Recipes",
+  semantic_edit_coverage: "Semantic Edit",
 };
 
 function codingFoundationBoundedCount(value) {
@@ -9386,12 +9388,12 @@ function codingFoundationBoundText(value, limit) {
   return text.slice(0, Math.max(0, max - 1)) + "…";
 }
 
-function codingFoundationJoinParts(parts) {
+function codingFoundationJoinParts(parts, limit) {
   const kept = [];
   for (let i = 0; i < parts.length; i += 1) {
     if (typeof parts[i] === "string" && parts[i]) kept.push(parts[i]);
   }
-  return codingFoundationBoundText(kept.join(" · "));
+  return codingFoundationBoundText(kept.join(" · "), limit);
 }
 
 function codingFoundationMeasuredCount(projection, keys) {
@@ -9403,6 +9405,21 @@ function codingFoundationMeasuredCount(projection, keys) {
   return null;
 }
 
+function codingFoundationCountLabel(value, suffix) {
+  if (value === "unknown") return "UNKNOWN " + suffix;
+  const counted = codingFoundationBoundedCount(value);
+  if (counted == null) return "";
+  return counted + " " + suffix;
+}
+
+function codingFoundationSectionCount(section, keys, suffix) {
+  if (!section || typeof section !== "object") return "";
+  if (section.state === "unknown") return "UNKNOWN " + suffix;
+  if (section.state !== "measured") return "";
+  const counted = codingFoundationMeasuredCount(section, keys);
+  return counted == null ? "" : counted + " " + suffix;
+}
+
 function codingFoundationCardModel(kind, projection) {
   if (!projection || typeof projection !== "object" || Array.isArray(projection)) return null;
   if (projection.schema_id != null && projection.schema_id !== CODING_FOUNDATION_SCHEMAS[kind]) return null;
@@ -9411,6 +9428,9 @@ function codingFoundationCardModel(kind, projection) {
   const label = CODING_FOUNDATION_LABELS[kind] || kind;
   if (state === "no_sample") {
     return { state: state, value: "No sample", detail: "No evidence", title: label + ": no sample" };
+  }
+  if (state === "unknown") {
+    return { state: state, value: "UNKNOWN", detail: "No evidence", title: label + ": unknown" };
   }
   if (state === "unavailable") {
     const reason = typeof projection.reason === "string" && projection.reason
@@ -9448,15 +9468,17 @@ function codingFoundationCardModel(kind, projection) {
     const proposed = lifecycle ? codingFoundationBoundedCount(lifecycle.proposed) : null;
     const active = lifecycle ? codingFoundationBoundedCount(lifecycle.active) : null;
     const retired = lifecycle ? codingFoundationBoundedCount(lifecycle.retired) : null;
-    const selection = projection.selection && projection.selection.state === "measured"
-      ? codingFoundationMeasuredCount(projection.selection, ["count", "returned_count"])
-      : null;
-    const invocation = projection.invocation && projection.invocation.state === "measured"
-      ? codingFoundationMeasuredCount(projection.invocation, ["count", "returned_count"])
-      : null;
-    const outcome = projection.outcome && projection.outcome.state === "measured"
-      ? codingFoundationMeasuredCount(projection.outcome, ["count", "returned_count"])
-      : null;
+    const reasons = Array.isArray(projection.active_non_injectable_reasons)
+      ? projection.active_non_injectable_reasons.slice(0, 8)
+        .map((item) => codingFoundationBoundText(item, 48))
+        .filter(Boolean)
+      : [];
+    if (reasons.length === 0 && typeof projection.active_non_injectable_reason === "string") {
+      const legacyReason = codingFoundationBoundText(projection.active_non_injectable_reason, 48);
+      if (legacyReason) reasons.push(legacyReason);
+    }
+    const reasonSummary = reasons.join(", ")
+      + (projection.active_non_injectable_reasons_truncated ? " …" : "");
     return {
       state: state,
       value: count == null ? "Measured" : count + " skills",
@@ -9464,26 +9486,75 @@ function codingFoundationCardModel(kind, projection) {
         proposed == null || active == null || retired == null
           ? ""
           : proposed + " proposed · " + active + " active · " + retired + " retired",
-        selection == null ? "" : selection + " sel",
-        invocation == null ? "" : invocation + " inv",
-        outcome == null ? "" : outcome + " out",
-      ]) || "Measured",
+        codingFoundationCountLabel(projection.injectable_count, "injectable"),
+        codingFoundationSectionCount(
+          projection.selection_injection, ["count", "returned_count"], "selection/injection receipts"
+        ),
+        codingFoundationCountLabel(projection.accepted_evidence_count, "accepted"),
+        codingFoundationCountLabel(projection.distinct_actor_count, "actors"),
+        reasonSummary,
+      ], 240) || "Measured",
+      title: label + " measured",
+    };
+  }
+  if (kind === "semantic_edit_coverage") {
+    const measured = codingFoundationBoundedCount(projection.measured_runs);
+    const unmeasured = codingFoundationCountLabel(projection.unmeasured_runs, "unmeasured");
+    const adapterSummary = Array.isArray(projection.adapters)
+      ? projection.adapters.slice(0, 8).map((adapter) => {
+        if (!adapter || typeof adapter !== "object") return "";
+        const name = codingFoundationBoundText(adapter.name, 32);
+        const adapterMeasured = codingFoundationBoundedCount(adapter.measured_attempts);
+        const adapterUnmeasured = codingFoundationBoundedCount(adapter.unmeasured_attempts);
+        const semantic = codingFoundationBoundedCount(adapter.semantic_only_attempts);
+        const raw = codingFoundationBoundedCount(adapter.raw_only_attempts);
+        const mixed = codingFoundationBoundedCount(adapter.mixed_attempts);
+        if (!name) return "";
+        return name + " "
+          + (adapterMeasured == null ? "?" : adapterMeasured) + " measured/"
+          + (adapterUnmeasured == null ? "?" : adapterUnmeasured) + " unmeasured; "
+          + (semantic == null ? "?" : semantic) + " semantic/"
+          + (raw == null ? "?" : raw) + " raw/"
+          + (mixed == null ? "?" : mixed) + " mixed";
+      }).filter(Boolean).join(" · ")
+      : "";
+    return {
+      state: state,
+      value: measured == null ? "Measured" : measured + " measured",
+      detail: codingFoundationJoinParts([
+        unmeasured,
+        codingFoundationCountLabel(projection.changed_paths, "paths"),
+        codingFoundationCountLabel(projection.range_count, "ranges"),
+        codingFoundationCountLabel(projection.bytes_changed, "bytes"),
+        codingFoundationCountLabel(projection.paths_raw_only, "raw-only"),
+        codingFoundationCountLabel(projection.declared_exceptions, "declared"),
+        codingFoundationCountLabel(projection.derived_exceptions, "derived"),
+        adapterSummary,
+        projection.byte_coverage_rate == null ? "" : projection.byte_coverage_rate + "% bytes",
+      ], 360) || "Measured",
       title: label + " measured",
     };
   }
   const count = codingFoundationMeasuredCount(projection, ["count", "registry_count", "returned_count"]);
+  const usage = projection.usage && typeof projection.usage === "object" ? projection.usage : null;
+  const usageState = usage && typeof usage.state === "string" ? usage.state : "";
   const discovery = codingFoundationBoundedCount(projection.discovery_count);
-  const uses = projection.invocation && projection.invocation.state === "measured"
-    ? codingFoundationMeasuredCount(projection.invocation, ["count", "returned_count"])
-    : null;
-  const cache = projection.cache && projection.cache.state === "measured" ? projection.cache : null;
-  const eligible = cache ? codingFoundationBoundedCount(cache.eligible_count) : null;
   return {
     state: state,
     value: count == null ? "Measured" : count + " recipes",
     detail: codingFoundationJoinParts([
-      uses == null ? "" : uses + " uses",
-      eligible == null ? "" : eligible + " cache-ok",
+      usageState === "unknown"
+        ? "UNKNOWN usage"
+        : usageState === "measured"
+          ? codingFoundationJoinParts([
+            codingFoundationCountLabel(usage.used_count, "used"),
+            codingFoundationCountLabel(usage.unused_count, "unused"),
+            codingFoundationCountLabel(usage.run_count, "runs"),
+            codingFoundationCountLabel(usage.attributed_run_count, "attributed"),
+            codingFoundationCountLabel(usage.unattributed_run_count, "unattributed"),
+            codingFoundationCountLabel(usage.distinct_actor_count, "actors"),
+          ])
+          : "",
       discovery == null ? "" : discovery + " discovered",
     ]) || "Measured",
     title: label + " measured",
@@ -9589,6 +9660,11 @@ function codingFoundationHeaderMarkup() {
     '<span class="header-storage-label">Tool Recipes</span>',
     '<strong id="header-tool-recipes-value">Loading</strong>',
     '<span class="header-insight-detail" id="header-tool-recipes-detail">Awaiting the full snapshot</span>',
+    "</div>",
+    '<div class="header-insight-card" id="header-semantic-edit-coverage" data-state="pending" title="Semantic Edit coverage projection">',
+    '<span class="header-storage-label">Semantic Edit</span>',
+    '<strong id="header-semantic-edit-coverage-value">Loading</strong>',
+    '<span class="header-insight-detail" id="header-semantic-edit-coverage-detail">Awaiting the full snapshot</span>',
     "</div>",
   ].join("");
 }

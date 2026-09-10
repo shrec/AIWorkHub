@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -661,10 +662,261 @@ def test_kpi_reports_per_adapter_shape_and_keeps_unmeasured_out_of_the_mean() ->
     assert kpi["mean_attempt_coverage"] == 50.0
     assert kpi["byte_coverage_rate"] == 50.0
     assert kpi["token_savings_available"] is False
-
     by_name = {row["name"]: row for row in kpi["adapters"]}
     assert by_name["codex_cli"]["attempts"] == 3
     assert by_name["codex_cli"]["measured_attempts"] == 3
     assert by_name["codex_cli"]["paths_raw_only"] == 2
     assert by_name["claude_cli"]["measured_attempts"] == 0
+    assert by_name["claude_cli"]["unmeasured_reasons"] == {"ledger_unverified": 1}
     assert by_name["claude_cli"]["mean_attempt_coverage"] is None
+
+    missing_runs = [
+        _run("codex_cli", {}),
+        {
+            "adapter_id": "glm_cli",
+            "state": "review_ready",
+            "ai_infra_context": {},
+        },
+    ]
+    missing_kpi = dashboard_kpis._semantic_edit_coverage_kpi(missing_runs)
+    assert missing_kpi["bounded_runs"] == 2
+    assert missing_kpi["measured_runs"] == 0
+    assert missing_kpi["unmeasured_runs"] == 2
+    assert missing_kpi["unmeasured_reasons"] == {
+        "semantic_edit_coverage_missing": 2,
+    }
+    missing_by_name = {row["name"]: row for row in missing_kpi["adapters"]}
+    assert missing_by_name["codex_cli"]["unmeasured_attempts"] == 1
+    assert missing_by_name["glm_cli"]["unmeasured_reasons"] == {
+        "semantic_edit_coverage_missing": 1,
+    }
+    projection = dashboard._semantic_edit_coverage_projection(
+        missing_kpi, ownership="summary",
+    )
+    assert projection["state"] == "unmeasured"
+    assert projection["measured_runs"] == 0
+    assert projection["unmeasured_runs"] == 2
+
+
+def test_kpi_range_count_mixed_adapters_never_claims_token_savings() -> None:
+    runs = [
+        {
+            "adapter_id": "codex_cli",
+            "ai_infra_context": {
+                "semantic_edit_coverage": {
+                    "measured": True,
+                    "coverage_ratio": 1.0,
+                    "changed_paths_count": 1,
+                    "paths_with_apply": 1,
+                    "paths_raw_only_count": 0,
+                    "bytes_changed": 50,
+                    "bytes_via_apply": 50,
+                    "range_count": 2,
+                },
+            },
+        },
+        {
+            "adapter_id": "claude_cli",
+            "ai_infra_context": {
+                "semantic_edit_coverage": {
+                    "measured": True,
+                    "coverage_ratio": 0.5,
+                    "changed_paths_count": 2,
+                    "paths_with_apply": 1,
+                    "paths_raw_only_count": 1,
+                    "bytes_changed": 100,
+                    "bytes_via_apply": 50,
+                },
+                "semantic_edit": {"range_count": 3},
+            },
+        },
+        {
+            "adapter_id": "cursor",
+            "ai_infra_context": {
+                "semantic_edit_coverage": {
+                    "measured": False,
+                    "unmeasured_reason": "ledger_unverified",
+                },
+                "semantic_edit": {"range_count": 9},
+            },
+        },
+    ]
+    kpi = dashboard_kpis._semantic_edit_coverage_kpi(runs)
+    assert kpi["range_count"] == 5
+    assert kpi["token_savings_available"] is False
+    assert kpi["cost_savings_available"] is False
+    by_name = {row["name"]: row for row in kpi["adapters"]}
+    assert by_name["codex_cli"]["range_count"] == 2
+    assert by_name["claude_cli"]["range_count"] == 3
+    assert by_name["cursor"]["range_count"] == 0
+
+
+def test_compact_semantic_edit_unknown_is_not_zero() -> None:
+    unknown = dashboard._semantic_edit_coverage_projection(None, ownership="summary")
+    assert unknown["state"] == "unknown"
+    assert unknown["schema_id"] == "aiworkhub.dashboard.semantic_edit_coverage.v1"
+    assert "measured_runs" not in unknown
+    assert unknown["token_savings_available"] is False
+    empty = dashboard._semantic_edit_coverage_projection(
+        {"schema_id": "aiworkhub.semantic_edit_coverage.kpi.v1", "bounded_runs": 0},
+        ownership="summary",
+    )
+    assert empty["state"] == "no_sample"
+    measured = dashboard._semantic_edit_coverage_projection(
+        {
+            "schema_id": "aiworkhub.semantic_edit_coverage.kpi.v1",
+            "bounded_runs": 2,
+            "measured_runs": 1,
+            "unmeasured_runs": 1,
+            "token_savings_available": True,
+        },
+        ownership="full",
+    )
+    assert measured["state"] == "measured"
+    assert measured["measured_runs"] == 1
+    assert measured["token_savings_available"] is False
+
+
+def test_recipe_usage_missing_counts_are_unknown_not_zero() -> None:
+    unknown = dashboard._project_recipe_usage({"usage": []}, ownership="summary")
+    assert unknown["state"] == "unknown"
+    assert unknown.get("run_count") != 0
+    measured = dashboard._project_recipe_usage(
+        {
+            "usage": [{"recipe_id": "a", "version": "1"}],
+            "usage_totals": {
+                "registered_count": 3,
+                "used_count": 1,
+                "runs": 4,
+                "distinct_actors": 1,
+                "attributed_runs": 0,
+                "unattributed_runs": 4,
+            },
+        },
+        ownership="summary",
+    )
+    assert measured["state"] == "measured"
+    assert measured["unused_count"] == 2
+    assert measured["run_count"] == 4
+    assert measured["attributed_run_count"] == 0
+    assert measured["unattributed_run_count"] == 4
+    missing_runs = dashboard._project_recipe_usage(
+        {
+            "usage": [],
+            "usage_totals": {"registered_count": 2, "used_count": 0},
+        },
+        ownership="summary",
+    )
+    assert missing_runs["run_count"] == "unknown"
+    assert missing_runs["distinct_actor_count"] == "unknown"
+    assert missing_runs["unused_count"] == 2
+
+
+def test_provider_skills_payload_projects_shared_selection_injection_receipts(
+    tmp_path: Path, monkeypatch
+) -> None:
+    receipts = [{"identity": "commit-msg-check", "task_id": "T1"}]
+    api = dashboard._load_skill_registry_api()
+    assert api is not None
+    store = SimpleNamespace(
+        load_registry=lambda repo_root: api.SkillRegistry(),
+        list_selections=lambda repo_root, limit=100: list(receipts),
+    )
+    monkeypatch.setattr(dashboard, "_load_skill_registry_store", lambda: store)
+    provider = dashboard.DashboardProvider(repo_root=tmp_path)
+    payload = provider.get_skills_projection_input()
+    assert isinstance(payload, dict)
+    assert payload["selection_injection_receipts"] == receipts
+    assert "selections" not in payload
+    assert "invocations" not in payload
+    projected = dashboard._project_skills(
+        payload, ownership="full", input_state="present"
+    )
+    assert projected["selection_injection"]["state"] == "measured"
+    assert projected["selection_injection"]["count"] == 1
+    assert projected["outcome"]["state"] == "no_sample"
+
+
+def test_provider_skills_payload_measured_empty_receipt_store(
+    tmp_path: Path, monkeypatch
+) -> None:
+    api = dashboard._load_skill_registry_api()
+    assert api is not None
+    store = SimpleNamespace(
+        load_registry=lambda repo_root: api.SkillRegistry(),
+        list_selections=lambda repo_root, limit=100: [],
+    )
+    monkeypatch.setattr(dashboard, "_load_skill_registry_store", lambda: store)
+    payload = dashboard.DashboardProvider(repo_root=tmp_path).get_skills_projection_input()
+    projected = dashboard._project_skills(
+        payload, ownership="full", input_state="present"
+    )
+    assert projected["selection_injection"] == {
+        "state": "measured",
+        "count": 0,
+        "returned_count": 0,
+        "denominator": 0,
+        "items": [],
+        "truncated": False,
+    }
+
+
+def test_provider_skills_payload_durable_zero_row_receipt_table_is_measured(
+    tmp_path: Path, monkeypatch
+) -> None:
+    api = dashboard._load_skill_registry_api()
+    assert api is not None
+    db_path = tmp_path / "skills.sqlite"
+    conn = sqlite3.connect(db_path)
+    conn.execute("CREATE TABLE skill_selection_receipts (task_id TEXT)")
+    conn.commit()
+    conn.close()
+    store = SimpleNamespace(
+        load_registry=lambda repo_root: api.SkillRegistry(),
+        list_selections=lambda repo_root, limit=100: [],
+        _db_path=lambda repo_root: db_path,
+        connect_readonly=sqlite3.connect,
+    )
+    monkeypatch.setattr(dashboard, "_load_skill_registry_store", lambda: store)
+    payload = dashboard.DashboardProvider(repo_root=tmp_path).get_skills_projection_input()
+    assert type(payload).__name__ == "SkillRegistry"
+    assert list(payload) == []
+    projected = dashboard._project_skills(
+        payload, ownership="full", input_state="present"
+    )
+    assert projected["selection_injection"]["state"] == "measured"
+    assert projected["selection_injection"]["count"] == 0
+
+
+def test_provider_skills_payload_missing_store_is_unknown(
+    tmp_path: Path,
+) -> None:
+    provider = dashboard.DashboardProvider(repo_root=tmp_path)
+    payload = provider.get_skills_projection_input()
+    projected = dashboard._project_skills(
+        payload, ownership="full", input_state="present"
+    )
+    assert projected["state"] == "no_sample"
+    assert projected.get("count", "unknown") == "unknown"
+    assert projected["selection_injection"]["state"] == "unknown"
+    assert projected["selection_injection"]["denominator"] == "unknown"
+
+
+def test_skill_adoption_preserves_multiple_exact_active_reasons(monkeypatch) -> None:
+    records = [
+        SimpleNamespace(lifecycle_state=SimpleNamespace(value="active"), reason="z_reason"),
+        SimpleNamespace(lifecycle_state=SimpleNamespace(value="active"), reason="a_reason"),
+    ]
+    api = SimpleNamespace(
+        independent_accepted_evidence_count=lambda record: 0,
+        independent_accepted_actor_ids=lambda record: (),
+    )
+    monkeypatch.setattr(
+        dashboard,
+        "_skill_injectability",
+        lambda api, record: (False, record.reason),
+    )
+    projected = dashboard._project_skill_adoption(api, records, truncated=False)
+    assert projected["active_non_injectable_reasons"] == ["a_reason", "z_reason"]
+    assert projected["active_non_injectable_reasons_truncated"] is False
+    assert projected["active_non_injectable_reason"] == ""

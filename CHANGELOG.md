@@ -6,6 +6,19 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.21] - 2026-09-10
+
+### Fixed
+
+- Authenticated parse-broken repair launch now accepts request-scoped
+  overlay evidence at prefetch, hides stale canonical symbols, and fails
+  closed on identity, hash, or scope mismatch.
+- Dashboard Tool Recipes, Skills, and Semantic Edit telemetry classify
+  unavailable evidence separately from a measured zero (NF722).
+- Compatibility repair (NF757).
+- Release CI provenance requires a completed successful push run for the
+  exact tag commit.
+
 ## [0.11.20] - 2026-09-10
 
 ### Fixed

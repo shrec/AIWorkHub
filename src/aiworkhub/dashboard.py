@@ -62,7 +62,12 @@ ACTIVE_STATUSES = ("pending", "processing", "review")
 # The full canonical-status taxonomy (AITools.taskdb.canonical_status), used
 # for exact whole-queue totals -- independent of any bounded row limit.
 ALL_CANONICAL_STATUSES = ("pending", "processing", "review", "blocked", "superseded", "finished", "archived")
-_CODING_FOUNDATION_KEYS = ("development_rules", "skills", "tool_recipes")
+_CODING_FOUNDATION_KEYS = (
+    "development_rules",
+    "skills",
+    "tool_recipes",
+    "semantic_edit_coverage",
+)
 
 # Reviewer children are launched by the quality-review machinery to review a
 # work card; they are machine lifecycle, not delivered work. ``cost_ledger``
@@ -148,6 +153,7 @@ _PROJECTION_SCHEMA_IDS = {
     "development_rules": "aiworkhub.dashboard.development_rules.v1",
     "skills": "aiworkhub.dashboard.skills.v1",
     "tool_recipes": "aiworkhub.dashboard.tool_recipes.v1",
+    "semantic_edit_coverage": "aiworkhub.dashboard.semantic_edit_coverage.v1",
 }
 _RICH_PROJECTION_KEYS = frozenset(
     {
@@ -2291,9 +2297,54 @@ class DashboardProvider:
         # skills database fail a dashboard refresh: degrade to an empty registry
         # so a repository with no skills renders a clean, empty panel.
         try:
-            return store.load_registry(self.repo_root)
+            registry = store.load_registry(self.repo_root)
         except Exception:  # noqa: BLE001 - a bad store must never break the dashboard
             return api.SkillRegistry()
+        payload: dict[str, Any] = {"registry": registry}
+        # Preserve an absent database or selection-receipt table as unavailable
+        # evidence. The store's bounded reader intentionally returns [] for both
+        # absence and a measured empty table, so inspect only the durable store's
+        # own path/schema before asking it for the bounded receipt page.
+        db_path_fn = getattr(store, "_db_path", None)
+        connect_readonly = getattr(store, "connect_readonly", None)
+        durable_receipt_table = False
+        if callable(db_path_fn) and callable(connect_readonly):
+            try:
+                db_path = db_path_fn(self.repo_root)
+                if not db_path.exists():
+                    return registry
+                conn = connect_readonly(db_path)
+                try:
+                    receipt_table = conn.execute(
+                        "SELECT 1 FROM sqlite_master "
+                        "WHERE type = 'table' AND name = 'skill_selection_receipts'"
+                    ).fetchone()
+                finally:
+                    conn.close()
+                if receipt_table is None:
+                    return registry
+                durable_receipt_table = True
+            except Exception:  # noqa: BLE001 - unavailable evidence stays unavailable
+                return registry
+        # Each durable row records the packet a card/request received. It is one
+        # shared selection/injection measurement, not two independent outcomes.
+        try:
+            receipts = store.list_selections(
+                self.repo_root, limit=_PROJECTION_LIST_LIMIT
+            )
+        except Exception:  # noqa: BLE001 - a bad receipt row must not break a refresh
+            return registry
+        if durable_receipt_table and not receipts:
+            object.__setattr__(registry, "_dashboard_durable_selection_injection", [])
+            object.__setattr__(
+                registry, "_dashboard_durable_selection_injection_denominator", 0
+            )
+            return registry
+        payload["selection_injection_receipts"] = receipts
+        payload["selection_injection_denominator"] = (
+            len(receipts) if len(receipts) < _PROJECTION_LIST_LIMIT else "unknown"
+        )
+        return payload
 
     def get_tool_recipes_projection_input(self) -> Any | None:
         api = _load_tool_recipes_api()
@@ -2938,6 +2989,13 @@ def _merge_coding_foundation_projection(
         and previous.get("ownership") == "full"
         and current.get("ownership") == "summary"
     ):
+        if (
+            _nested_section_state(previous) == "measured"
+            and _nested_section_state(current) in _PLACEHOLDER_PROJECTION_STATES
+        ):
+            retained = dict(previous)
+            retained["ownership"] = "full"
+            return retained
         replace_empty_receipts = _exact_empty_receipt_replacement(current)
         merged = dict(previous)
         if replace_empty_receipts:
@@ -3022,6 +3080,20 @@ def _retain_coding_foundation_evidence(
     return snapshot
 
 
+def _coding_foundation_snapshot_fields(
+    foundation: Any, *, ownership: str
+) -> dict[str, Any]:
+    mapping = foundation if isinstance(foundation, Mapping) else {}
+    fields: dict[str, Any] = {}
+    for key in _CODING_FOUNDATION_KEYS:
+        current = mapping.get(key)
+        if isinstance(current, Mapping):
+            fields[key] = dict(current)
+            continue
+        fields[key] = _projection_shell(key, "unknown", ownership)
+    return fields
+
+
 def _storage_not_ready_projection(kind: str, ownership: str = "full") -> dict[str, Any]:
     projected = _projection_shell(kind, "unavailable", ownership)
     projected["reason"] = "storage_not_ready"
@@ -3070,6 +3142,14 @@ def _load_skill_registry_api() -> Any | None:
 def _load_skill_registry_store() -> Any | None:
     try:
         from aiworkhub import skill_registry_store as module
+    except ImportError:
+        return None
+    return module
+
+
+def _load_skill_miner() -> Any | None:
+    try:
+        from aiworkhub import skill_miner as module
     except ImportError:
         return None
     return module
@@ -3238,6 +3318,59 @@ def _evidence_section(
     return section
 
 
+def _skill_injectability(api: Any, record: Any) -> tuple[bool, str]:
+    miner = _load_skill_miner()
+    if miner is not None:
+        return miner.injectability(record)
+    lifecycle = getattr(getattr(record, "lifecycle_state", None), "value", "")
+    if lifecycle == "retired":
+        return False, "lifecycle_state_is_retired"
+    if api.unresolved_negative_evidence(record):
+        return False, "unresolved_negative_evidence"
+    actors = api.independent_accepted_evidence_count(record)
+    if actors < 2:
+        return False, "activation_evidence_below_two_distinct_actors"
+    if lifecycle != "active":
+        return False, "lifecycle_state_is_proposed_not_active"
+    return True, ""
+
+
+def _project_skill_adoption(api: Any, records: list[Any], *, truncated: bool) -> dict[str, Any]:
+    if truncated:
+        return {
+            "injectable_count": "unknown",
+            "accepted_evidence_count": "unknown",
+            "distinct_actor_count": "unknown",
+            "active_non_injectable_reason": "unknown",
+            "active_non_injectable_reasons": [],
+            "active_non_injectable_reasons_truncated": True,
+        }
+    injectable = 0
+    accepted = 0
+    actors: set[str] = set()
+    active_reasons: list[str] = []
+    for record in records:
+        ok, reason = _skill_injectability(api, record)
+        if ok:
+            injectable += 1
+        else:
+            lifecycle = getattr(getattr(record, "lifecycle_state", None), "value", None)
+            if lifecycle == "active" and reason:
+                active_reasons.append(reason)
+        accepted += api.independent_accepted_evidence_count(record)
+        actors.update(api.independent_accepted_actor_ids(record))
+    unique = sorted(set(active_reasons))
+    bounded_reasons = unique[:_PROJECTION_LIST_LIMIT]
+    return {
+        "injectable_count": injectable,
+        "accepted_evidence_count": accepted,
+        "distinct_actor_count": len(actors),
+        "active_non_injectable_reason": bounded_reasons[0] if len(unique) == 1 else "",
+        "active_non_injectable_reasons": bounded_reasons,
+        "active_non_injectable_reasons_truncated": len(unique) > len(bounded_reasons),
+    }
+
+
 def _project_skills(
     payload: Any,
     *,
@@ -3257,10 +3390,19 @@ def _project_skills(
         return _projection_shell("skills", "invalid", ownership)
     records, truncated, total_count = parsed
     mapping = payload if isinstance(payload, Mapping) else None
+    selection_injection: dict[str, Any] | None = None
     selection: dict[str, Any] | None = None
     invocation: dict[str, Any] | None = None
     outcome: dict[str, Any] | None = None
+    durable_receipts = getattr(payload, "_dashboard_durable_selection_injection", None)
     if mapping is not None:
+        if "selection_injection_receipts" in mapping:
+            selection_injection = _evidence_section(
+                mapping,
+                "selection_injection_receipts",
+                "selection_injection_denominator",
+                ownership=ownership,
+            )
         selection = _evidence_section(
             mapping, "selections", "selection_denominator", ownership=ownership
         )
@@ -3270,20 +3412,37 @@ def _project_skills(
         outcome = _evidence_section(
             mapping, "outcomes", "outcome_denominator", ownership=ownership
         )
-    nested_measured = bool(
-        selection is not None
-        and any(
-            section.get("state") == "measured"
-            for section in (selection, invocation, outcome)
-            if section is not None
+    elif isinstance(durable_receipts, list):
+        selection_injection = _evidence_section(
+            {
+                "selection_injection_receipts": durable_receipts,
+                "selection_injection_denominator": getattr(
+                    payload,
+                    "_dashboard_durable_selection_injection_denominator",
+                    len(durable_receipts),
+                ),
+            },
+            "selection_injection_receipts",
+            "selection_injection_denominator",
+            ownership=ownership,
         )
+    nested_measured = any(
+        section is not None and section.get("state") == "measured"
+        for section in (selection_injection, selection, invocation, outcome)
     )
+    evidence = {
+        "selection": selection if selection is not None else {"state": "no_sample"},
+        "invocation": invocation if invocation is not None else {"state": "no_sample"},
+        "outcome": outcome if outcome is not None else {"state": "no_sample"},
+        "selection_injection": (
+            selection_injection
+            if selection_injection is not None
+            else {"state": "unknown", "denominator": "unknown"}
+        ),
+    }
     if not records and not nested_measured:
         projected = _projection_shell("skills", "no_sample", ownership)
-        if selection is not None and invocation is not None and outcome is not None:
-            projected["selection"] = selection
-            projected["invocation"] = invocation
-            projected["outcome"] = outcome
+        projected.update(evidence)
         if ownership == "summary":
             return _cheap_projection(projected)
         return projected
@@ -3297,14 +3456,12 @@ def _project_skills(
             if state in lifecycle:
                 lifecycle[state] += 1
         projected["lifecycle"] = lifecycle
-    if selection is not None and invocation is not None and outcome is not None:
-        projected["selection"] = selection
-        projected["invocation"] = invocation
-        projected["outcome"] = outcome
-    else:
-        projected["selection"] = {"state": "no_sample"}
-        projected["invocation"] = {"state": "no_sample"}
-        projected["outcome"] = {"state": "no_sample"}
+    projected.update(
+        _project_skill_adoption(
+            api, records, truncated=truncated or total_count == "unknown"
+        )
+    )
+    projected.update(evidence)
     if ownership == "summary":
         return _cheap_projection(projected)
     return projected
@@ -3458,11 +3615,11 @@ def _project_recipe_usage(mapping: Any, *, ownership: str) -> dict[str, Any]:
         "registered_count": declared_registered,
         "used_count": used,
         "unused_count": declared_registered - used,
-        "run_count": _projection_count(totals.get("runs")) or 0,
-        "distinct_actor_count": _projection_count(totals.get("distinct_actors")) or 0,
-        "attributed_run_count": _projection_count(totals.get("attributed_runs")) or 0,
-        "unattributed_run_count": (
-            _projection_count(totals.get("unattributed_runs")) or 0
+        "run_count": _projection_denominator(totals.get("runs")),
+        "distinct_actor_count": _projection_denominator(totals.get("distinct_actors")),
+        "attributed_run_count": _projection_denominator(totals.get("attributed_runs")),
+        "unattributed_run_count": _projection_denominator(
+            totals.get("unattributed_runs")
         ),
     }
     unregistered = _projection_count(totals.get("unregistered_used_count"))
@@ -3612,10 +3769,44 @@ def _project_tool_recipes(
     return projected
 
 
+def _semantic_edit_coverage_projection(
+    kpi: Any, *, ownership: str
+) -> dict[str, Any]:
+    if not isinstance(kpi, Mapping) or not kpi:
+        projected = _projection_shell("semantic_edit_coverage", "unknown", ownership)
+        projected["token_savings_available"] = False
+        projected["cost_savings_available"] = False
+        if ownership == "summary":
+            return _cheap_projection(projected)
+        return projected
+    bounded = _projection_count(kpi.get("bounded_runs"))
+    measured = _projection_count(kpi.get("measured_runs"))
+    if bounded == 0:
+        state = "no_sample"
+    elif measured == 0:
+        state = "unmeasured"
+    else:
+        state = "measured"
+    projected = _projection_shell("semantic_edit_coverage", state, ownership)
+    skip = {"schema_id", "state", "ownership", "availability"}
+    for key, value in kpi.items():
+        if key in skip or key in _RICH_PROJECTION_KEYS:
+            continue
+        if key == "adapters" and ownership != "full":
+            continue
+        projected[key] = value
+    projected["token_savings_available"] = False
+    projected["cost_savings_available"] = False
+    if ownership == "summary":
+        return _cheap_projection(projected)
+    return projected
+
+
 def _coding_foundation_projections(
     provider: Any,
     *,
     ownership: str,
+    semantic_edit_kpi: Any = None,
 ) -> dict[str, dict[str, Any]]:
     rules_state, rules_payload = _provider_projection_input(
         provider, "get_development_rules_projection_input"
@@ -3635,6 +3826,9 @@ def _coding_foundation_projections(
         ),
         "tool_recipes": _project_tool_recipes(
             recipes_payload, ownership=ownership, input_state=recipes_state
+        ),
+        "semantic_edit_coverage": _semantic_edit_coverage_projection(
+            semantic_edit_kpi, ownership=ownership
         ),
     }
 
@@ -4086,9 +4280,7 @@ def _build_summary_snapshot(
         "task_plan": {},
         "needfix": {},
         "roadmap": {},
-        "development_rules": foundation["development_rules"],
-        "skills": foundation["skills"],
-        "tool_recipes": foundation["tool_recipes"],
+        **_coding_foundation_snapshot_fields(foundation, ownership="summary"),
     }
 
 
@@ -4184,6 +4376,7 @@ def build_snapshot(
             "development_rules": storage_not_ready["development_rules"],
             "skills": storage_not_ready["skills"],
             "tool_recipes": storage_not_ready["tool_recipes"],
+            "semantic_edit_coverage": storage_not_ready["semantic_edit_coverage"],
             },
             previous,
         )
@@ -4612,7 +4805,11 @@ def build_snapshot(
     )
     needfix_snapshot = reads["needfix"]
     roadmap_snapshot = reads["roadmap"]
-    foundation = _coding_foundation_projections(data_provider, ownership="full")
+    foundation = _coding_foundation_projections(
+        data_provider,
+        ownership="full",
+        semantic_edit_kpi=kpi_analytics.get("semantic_edit_coverage"),
+    )
 
     return _retain_coding_foundation_evidence(
         {
@@ -4663,9 +4860,7 @@ def build_snapshot(
         "task_plan": dict(task_plan_snapshot),
         "needfix": needfix_snapshot,
         "roadmap": roadmap_snapshot,
-        "development_rules": foundation["development_rules"],
-        "skills": foundation["skills"],
-        "tool_recipes": foundation["tool_recipes"],
+        **_coding_foundation_snapshot_fields(foundation, ownership="full"),
         "warnings": {
             "stale": stale_tasks,
             "collisions": collision_warnings,

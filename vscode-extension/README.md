@@ -14,12 +14,14 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.11.20
+## What's new in 0.11.21
 
-- Keep exact deadmethods entrypoint truth so Source Graph reports the
-  measured entrypoint.
-- Normalize nested quality-review findings to the canonical finding schema.
-- Deliver a single reviewer packet for each quality-review request.
+- Launch parse-broken repair with authenticated overlay evidence instead
+  of stale canonical symbols.
+- Report Tool Recipes, Skills, and Semantic Edit dashboard telemetry
+  without treating unavailable evidence as zero.
+- Include the NF757 compatibility repair.
+- Require exact-commit successful-push CI provenance before release.
 
 Detailed older history stays in the
 [changelog](https://github.com/shrec/AIWorkHub/blob/main/vscode-extension/CHANGELOG.md).

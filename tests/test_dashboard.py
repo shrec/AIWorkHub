@@ -2390,6 +2390,31 @@ def test_coding_foundation_summary_unavailable_or_no_sample_keeps_prior_governin
             assert cursor
 
 
+def test_coding_foundation_summary_keeps_measured_semantic_edit_coverage() -> None:
+    measured = dashboard._semantic_edit_coverage_projection(
+        {
+            "schema_id": "aiworkhub.semantic_edit_coverage.kpi.v1",
+            "bounded_runs": 2,
+            "measured_runs": 1,
+            "unmeasured_runs": 1,
+        },
+        ownership="full",
+    )
+    assert measured["state"] == "measured"
+    assert dashboard._mapping_has_rich_evidence(measured) is False
+    full = dashboard.build_snapshot(_FoundationProvider())
+    full["semantic_edit_coverage"] = measured
+    summary = dashboard.build_snapshot(
+        _FoundationProvider(), summary_only=True, previous=full
+    )
+    coverage = summary["semantic_edit_coverage"]
+    assert coverage["state"] == "measured"
+    assert coverage["ownership"] == "full"
+    assert coverage["measured_runs"] == 1
+    assert coverage["bounded_runs"] == 2
+    assert coverage["unmeasured_runs"] == 1
+
+
 def test_coding_foundation_projection_items_bound_inspection_and_invalid_rows() -> None:
     class _InspectedList(list):
         def __init__(self, rows: list) -> None:

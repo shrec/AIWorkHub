@@ -4129,7 +4129,7 @@ def _serve_continuation(
     )
     if overlay_view is not None and (
         overlay_view.changed or overlay_view.deleted or overlay_view.digest_refs
-        or overlay_view.authorized_digests
+        or overlay_view.authorized_digests or overlay_view.repair_evidence
     ):
         authority_source = "rework_overlay"
         authority_state = "request_scoped_worktree"

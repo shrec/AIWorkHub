@@ -14,112 +14,75 @@ on:
         required: true
 
 permissions:
+  actions: read
   contents: read
 
 jobs:
-  platform-qualification:
-    name: Release qualification (${{ matrix.name }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { name: linux, os: ubuntu-latest, mode: local }
-          - { name: remote-ssh-contract, os: ubuntu-latest, mode: remote_ssh_contract }
-          - { name: windows, os: windows-latest, mode: local }
-          - { name: macos, os: macos-latest, mode: local }
-
+  provenance:
+    name: Verify exact-commit CI provenance
+    runs-on: ubuntu-latest
+    outputs:
+      release_sha: ${{ steps.target.outputs.release_sha }}
+      release_tag: ${{ steps.target.outputs.release_tag }}
     steps:
-      - uses: actions/checkout@v7
+      - name: Check out requested tag
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/checkout@v7
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
-          fetch-depth: 1
+          ref: refs/tags/${{ inputs.tag }}
+          fetch-depth: 0
 
-      - name: Set up Python
-        uses: actions/setup-python@v6
+      - name: Check out pushed tag
+        if: github.event_name == 'push'
+        uses: actions/checkout@v7
         with:
-          python-version: "3.12"
+          ref: ${{ github.ref }}
+          fetch-depth: 0
 
-      - name: Verify canonical release metadata
+      - name: Resolve immutable release target
+        id: target
         env:
           RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
-        run: python scripts/release_metadata.py check --tag "$RELEASE_TAG"
-
-      - name: Verify release assurance manifest
-        run: python scripts/check_release_assurance.py
-
-      - name: Verify replayable release evidence pack
-        run: python scripts/check_release_evidence_pack.py
-
-      - name: Install and qualify cross-platform Python runtime
-        env:
-          AIWORKHUB_QUALIFICATION_MODE: ${{ matrix.mode }}
         run: |
-          python -m pip install --upgrade pip setuptools wheel
-          python -m pip install .
-          # pytest-xdist is not optional: pyproject addopts pin
-          # "-n auto --dist loadfile", so a pytest without it exits 4 on
-          # "unrecognized arguments: -n --dist" before collecting a single
-          # test. Measured 2026-09-08: every Release qualification job on
-          # every platform failed in 18-23s this way, and had been failing the
-          # same way on the previous tag, so no release has actually qualified.
-          # The pins match ci.yml deliberately -- two jobs running different
-          # pytest majors is a difference nobody would see until it broke.
-          python -m pip install "pytest>=8,<10" "pytest-xdist>=3.5,<4"
-          python -m pytest tests/test_platform_io.py tests/test_cross_platform_runtime.py tests/test_release_qualification_e2e.py -q --tb=short --junitxml=qualification-${{ matrix.name }}.xml
+          set -euo pipefail
+          tag_ref="refs/tags/$RELEASE_TAG"
+          git show-ref --verify --quiet "$tag_ref" || {
+            echo "::error::release input must name an existing tag"
+            exit 1
+          }
+          tag_commit="$(git rev-parse "$tag_ref^{commit}")"
+          checkout_commit="$(git rev-parse HEAD^{commit})"
+          test "$tag_commit" = "$checkout_commit" || {
+            echo "::error::tag commit does not match checked-out commit"
+            exit 1
+          }
+          echo "release_sha=$tag_commit" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v6
-        with:
-          node-version: "20"
-
-      - name: Set up Go for native Windows callback launchers
-        uses: actions/setup-go@v7
-        with:
-          go-version: "1.24.x"
-          cache: false
-
-      - name: Install extension dependencies
-        run: npm install
-        working-directory: vscode-extension
-
-      - name: Run extension tests
-        run: npm test
-        working-directory: vscode-extension
-
-      - name: Package fresh VSIX
-        run: npm run package
-        working-directory: vscode-extension
-
-      - name: Upload qualification evidence
-        uses: actions/upload-artifact@v6
-        with:
-          name: release-qualification-${{ matrix.name }}
-          path: |
-            qualification-${{ matrix.name }}.xml
-            vscode-extension/dist/aiworkhub-*.vsix
-          if-no-files-found: error
+      - name: Require successful push CI for exact commit
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_SHA: ${{ steps.target.outputs.release_sha }}
+        run: python scripts/check_release_ci_provenance.py --sha "$RELEASE_SHA"
 
   build:
-    name: Build VSIX and Python package
-    needs: [platform-qualification]
+    name: Build and smoke fresh release artifacts
+    needs: [provenance]
     runs-on: ubuntu-latest
     timeout-minutes: 20
-
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          ref: ${{ needs.provenance.outputs.release_sha }}
           fetch-depth: 1
 
-      - name: Set up Python
-        uses: actions/setup-python@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
       - name: Verify release versions
         env:
-          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          RELEASE_TAG: ${{ needs.provenance.outputs.release_tag }}
         run: python scripts/release_metadata.py check --tag "$RELEASE_TAG"
 
       - name: Verify release assurance manifest
@@ -128,19 +91,8 @@ jobs:
       - name: Verify replayable release evidence pack
         run: python scripts/check_release_evidence_pack.py
 
-      - name: Install Python test and build dependencies
-        run: |
-          python -m pip install --upgrade pip setuptools wheel build twine
-          python -m pip install -e ".[dev]"
-
-      - name: Run static quality gates
-        run: |
-          ruff check src/aiworkhub scripts tests
-          mypy
-          python scripts/check_public_docs.py
-
-      - name: Run Python tests
-        run: python -m pytest tests/ -v --tb=short -x
+      - name: Install Python build dependencies
+        run: python -m pip install --upgrade pip setuptools wheel build twine
 
       - name: Build Python distributions
         run: python -m build --outdir dist
@@ -156,6 +108,16 @@ jobs:
           test -s "${sdists[0]}"
           python -m twine check dist/*
 
+      - name: Smoke fresh installed Python artifacts
+        run: |
+          python -m venv /tmp/aiworkhub-release-smoke
+          shopt -s nullglob
+          wheels=(dist/aiworkhub-*.whl)
+          (( ${#wheels[@]} == 1 ))
+          /tmp/aiworkhub-release-smoke/bin/python -m pip install "${wheels[0]}"
+          /tmp/aiworkhub-release-smoke/bin/python -c "import aiworkhub"
+          /tmp/aiworkhub-release-smoke/bin/aiworkhub --help
+
       - name: Upload Python distributions
         uses: actions/upload-artifact@v6
         with:
@@ -165,23 +127,17 @@ jobs:
             dist/aiworkhub-*.tar.gz
           if-no-files-found: error
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v6
+      - uses: actions/setup-node@v6
         with:
           node-version: "20"
 
-      - name: Set up Go for native Windows callback launchers
-        uses: actions/setup-go@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: "1.24.x"
           cache: false
 
-      - name: Install dependencies
+      - name: Install extension dependencies
         run: npm install
-        working-directory: vscode-extension
-
-      - name: Run extension tests
-        run: npm test
         working-directory: vscode-extension
 
       - name: Package VSIX
@@ -195,12 +151,23 @@ jobs:
           cmp /tmp/aiworkhub-first.vsix dist/aiworkhub-*.vsix
         working-directory: vscode-extension
 
-      - name: Verify VSIX
+      - name: Verify fresh VSIX manifest and package
         run: |
           shopt -s nullglob
           vsix=(vscode-extension/dist/aiworkhub-*.vsix)
           (( ${#vsix[@]} == 1 ))
           test -s "${vsix[0]}"
+          python - "${vsix[0]}" <<'PY'
+          import json
+          import sys
+          import zipfile
+          with zipfile.ZipFile(sys.argv[1]) as archive:
+              names = archive.namelist()
+              assert "extension/package.json" in names
+              manifest = json.loads(archive.read("extension/package.json"))
+              assert manifest["name"] == "aiworkhub"
+              assert any(name.startswith("extension/dist/") for name in names)
+          PY
 
       - name: Upload VSIX artifact
         uses: actions/upload-artifact@v6
@@ -211,70 +178,47 @@ jobs:
 
   github-release:
     name: GitHub Release
-    needs: [build]
+    needs: [provenance, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
-
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          ref: ${{ needs.provenance.outputs.release_sha }}
           fetch-depth: 1
-
-      - name: Download Python distributions
-        uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@v8
         with:
           name: aiworkhub-python-dist
           path: release-assets/python/
-
-      - name: Download VSIX
-        uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@v8
         with:
           name: aiworkhub-vsix
           path: release-assets/vscode/
-
       - name: Verify release assets
         run: |
           shopt -s nullglob
           wheels=(release-assets/python/aiworkhub-*.whl)
           sdists=(release-assets/python/aiworkhub-*.tar.gz)
           vsix=(release-assets/vscode/aiworkhub-*.vsix)
-          (( ${#wheels[@]} == 1 ))
-          (( ${#sdists[@]} == 1 ))
-          (( ${#vsix[@]} == 1 ))
-          test -s "${wheels[0]}"
-          test -s "${sdists[0]}"
-          test -s "${vsix[0]}"
-
+          (( ${#wheels[@]} == 1 && ${#sdists[@]} == 1 && ${#vsix[@]} == 1 ))
+          test -s "${wheels[0]}" && test -s "${sdists[0]}" && test -s "${vsix[0]}"
       - name: Generate release checksums
         run: >-
           python scripts/release_metadata.py checksums
           --output release-assets/SHA256SUMS
           release-assets/python/* release-assets/vscode/*
-
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
-          name: AIWorkHub ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          tag_name: ${{ needs.provenance.outputs.release_tag }}
+          name: AIWorkHub ${{ needs.provenance.outputs.release_tag }}
           body: |
             ## AIWorkHub Release
-
             See the repository commit history for details.
-
-            ### Installation
-
-            ```bash
-            # VS Code / Cursor / Windsurf
-            code --install-extension aiworkhub-*.vsix
-
-            # Remote-SSH: install on the remote host workspace
-            ```
-
             Verify downloaded artifacts against the attached `SHA256SUMS`.
           draft: false
-          prerelease: ${{ contains(github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name, '-') }}
+          prerelease: ${{ contains(needs.provenance.outputs.release_tag, '-') }}
           fail_on_unmatched_files: true
           files: |
             release-assets/python/aiworkhub-*.whl
@@ -289,21 +233,13 @@ jobs:
     runs-on: ubuntu-latest
     env:
       OVSX_TOKEN: ${{ secrets.OVSX_TOKEN }}
-
     steps:
       - name: Require Open VSX token
-        run: |
-          test -n "$OVSX_TOKEN" || {
-            echo "::error::OVSX_PUBLISH_ENABLED is true but OVSX_TOKEN is missing"
-            exit 1
-          }
-
-      - name: Download VSIX
-        uses: actions/download-artifact@v8
+        run: test -n "$OVSX_TOKEN"
+      - uses: actions/download-artifact@v8
         with:
           name: aiworkhub-vsix
           path: registry-assets/
-
       - name: Publish to Open VSX
         run: |
           shopt -s nullglob
@@ -319,21 +255,13 @@ jobs:
     runs-on: ubuntu-latest
     env:
       MARKETPLACE_TOKEN: ${{ secrets.MARKETPLACE_TOKEN }}
-
     steps:
       - name: Require Marketplace token
-        run: |
-          test -n "$MARKETPLACE_TOKEN" || {
-            echo "::error::MARKETPLACE_PUBLISH_ENABLED is true but MARKETPLACE_TOKEN is missing"
-            exit 1
-          }
-
-      - name: Download VSIX
-        uses: actions/download-artifact@v8
+        run: test -n "$MARKETPLACE_TOKEN"
+      - uses: actions/download-artifact@v8
         with:
           name: aiworkhub-vsix
           path: registry-assets/
-
       - name: Publish to Marketplace
         run: |
           shopt -s nullglob
@@ -352,13 +280,9 @@ jobs:
       url: https://pypi.org/project/aiworkhub/
     permissions:
       id-token: write
-
     steps:
-      - name: Download Python distributions
-        uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@v8
         with:
           name: aiworkhub-python-dist
           path: dist/
-
-      - name: Publish with PyPI Trusted Publishing
-        uses: pypa/gh-action-pypi-publish@release/v1
+      - uses: pypa/gh-action-pypi-publish@release/v1

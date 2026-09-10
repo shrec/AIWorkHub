@@ -134,14 +134,23 @@ def test_ci_and_release_enforce_metadata_reproducibility_and_checksums() -> None
     assert "python scripts/check_public_docs.py" in ci
     assert "Verify reproducible VSIX bytes" in ci
     assert "scripts/release_metadata.py check --tag" in release
-    assert 'python -m pip install -e ".[dev]"' in release
-    assert "ruff check src/aiworkhub scripts tests" in release
-    assert "mypy" in release
-    assert "python scripts/check_public_docs.py" in release
     assert "pypa/gh-action-pypi-publish@release/v1" in release
     assert "python -m twine check dist/*" in release
     assert "Verify reproducible VSIX bytes" in release
     assert "release-assets/SHA256SUMS" in release
+    assert "python -m venv" in release
+    assert 'pip install "${wheels[0]}"' in release
+    assert "import aiworkhub" in release
+    assert "aiworkhub --help" in release
+    assert "Verify fresh VSIX manifest and package" in release
+    assert 'python -m pip install -e ".[dev]"' not in release
+    assert "ruff check src/aiworkhub scripts tests" not in release
+    assert "python scripts/check_public_docs.py" not in release
+    assert "Run Python tests" not in release
+    assert "Run static quality gates" not in release
+    assert "Run extension tests" not in release
+    assert "platform-qualification" not in release
+    assert "--no-index" not in release
 
 
 def test_check_covers_the_documents_the_extension_test_gates_on(tmp_path):

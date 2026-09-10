@@ -12,9 +12,12 @@ from aiworkhub.repository_state import bootstrap_repository
 from aiworkhub.worker_ai_tools_mcp import WorkerToolContext, source_graph_query
 
 
-def _write(path: Path, text: str) -> None:
+def _write(path: Path, text: str | bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8")
+    if isinstance(text, bytes):
+        path.write_bytes(text)
+        return
+    path.write_text(str(text), encoding="utf-8")
 
 
 def _packet(authority: Path, files: list[dict[str, object]]) -> dict[str, object]:

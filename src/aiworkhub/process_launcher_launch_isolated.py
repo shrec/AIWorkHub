@@ -594,6 +594,20 @@ def launch_isolated(
                 }
                 source_graph_input.setdefault("mode", "focus")
                 source_graph_input.setdefault("workflow_stage", "orientation")
+                if rework_overlay_packet is not None:
+                    try:
+                        worker_ai_tools_mcp._verify_rework_overlay_packet(
+                            rework_overlay_packet,
+                            task_id,
+                            request_id,
+                            runner,
+                            authority_repo,
+                        )
+                    except worker_ai_tools_mcp.WorkerToolError as exc:
+                        raise LaunchRejected(
+                            "vscode_lm_initial_source_graph_prefetch_failed:"
+                            + str(exc)[:300]
+                        ) from exc
                 prefetch_ctx = worker_ai_tools_mcp.WorkerToolContext(
                     task_id=task_id,
                     runner=runner,
@@ -613,10 +627,16 @@ def launch_isolated(
                     rework_overlay_packet_path=rework_overlay_path,
                     provenance="prefetch",
                 )
-                vscode_source_graph_result = worker_ai_tools_mcp.source_graph_query(
-                    prefetch_ctx,
-                    **source_graph_input,
-                )
+                try:
+                    vscode_source_graph_result = worker_ai_tools_mcp.source_graph_query(
+                        prefetch_ctx,
+                        **source_graph_input,
+                    )
+                except worker_ai_tools_mcp.WorkerToolError as exc:
+                    raise LaunchRejected(
+                        "vscode_lm_initial_source_graph_prefetch_failed:"
+                        + str(exc)[:300]
+                    ) from exc
                 if vscode_source_graph_result.get("ok") is not True:
                     reason = str(
                         vscode_source_graph_result.get("reason")

@@ -164,6 +164,7 @@ def _semantic_edit_coverage_kpi(runs: list[Mapping[str, Any]]) -> dict[str, Any]
         "raw_only_attempts": 0,
         "mixed_attempts": 0,
         "changed_paths": 0,
+        "range_count": 0,
         "paths_with_apply": 0,
         "paths_raw_only": 0,
         "paths_new_file": 0,
@@ -188,10 +189,12 @@ def _semantic_edit_coverage_kpi(runs: list[Mapping[str, Any]]) -> dict[str, Any]
             "attempts": 0,
             "measured_attempts": 0,
             "unmeasured_attempts": 0,
+            "unmeasured_reasons": {},
             "semantic_only_attempts": 0,
             "raw_only_attempts": 0,
             "mixed_attempts": 0,
             "changed_paths": 0,
+            "range_count": 0,
             "paths_with_apply": 0,
             "paths_raw_only": 0,
             "undeclared_raw_only": 0,
@@ -202,19 +205,31 @@ def _semantic_edit_coverage_kpi(runs: list[Mapping[str, Any]]) -> dict[str, Any]
     )
     ratios: list[float] = []
     for row in runs:
+        adapter = str(row.get("adapter_id") or "unknown")[:120]
+        bucket = per_adapter[adapter]
+        bucket["attempts"] += 1
         infra = row.get("ai_infra_context")
         record = (
             infra.get("semantic_edit_coverage") if isinstance(infra, Mapping) else None
         )
         if not isinstance(record, Mapping) or not record:
+            reason = "semantic_edit_coverage_missing"
+            totals["unmeasured_runs"] += 1
+            bucket["unmeasured_attempts"] += 1
+            totals["unmeasured_reasons"][reason] = (
+                _count(totals["unmeasured_reasons"].get(reason)) + 1
+            )
+            bucket["unmeasured_reasons"][reason] = (
+                _count(bucket["unmeasured_reasons"].get(reason)) + 1
+            )
             continue
-        adapter = str(row.get("adapter_id") or "unknown")[:120]
-        bucket = per_adapter[adapter]
-        bucket["attempts"] += 1
         if not record.get("measured"):
             totals["unmeasured_runs"] += 1
             bucket["unmeasured_attempts"] += 1
             reason = str(record.get("unmeasured_reason") or "unnamed")[:120]
+            bucket["unmeasured_reasons"][reason] = (
+                _count(bucket["unmeasured_reasons"].get(reason)) + 1
+            )
             totals["unmeasured_reasons"][reason] = (
                 _count(totals["unmeasured_reasons"].get(reason)) + 1
             )
@@ -238,6 +253,15 @@ def _semantic_edit_coverage_kpi(runs: list[Mapping[str, Any]]) -> dict[str, Any]
             totals[totals_key] += value
             if totals_key in bucket:
                 bucket[totals_key] += value
+        ranges = _count(record.get("range_count"))
+        if not ranges:
+            telemetry = (
+                infra.get("semantic_edit") if isinstance(infra, Mapping) else None
+            )
+            if isinstance(telemetry, Mapping):
+                ranges = _count(telemetry.get("range_count"))
+        totals["range_count"] += ranges
+        bucket["range_count"] += ranges
         with_apply = _count(record.get("paths_with_apply"))
         raw_only = _count(record.get("paths_raw_only_count"))
         if with_apply and not raw_only:
