@@ -186,3 +186,23 @@ def test_an_unreadable_release_document_is_a_mismatch_not_a_pass(tmp_path):
         "vscode-extension/CHANGELOG.md",
     }
     assert all("unreadable" in reason for reason in gaps.values())
+
+
+def test_release_vsix_smoke_checks_packaged_assets_not_false_dist_prefix() -> None:
+    release = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+    packaged = (
+        "extension/extension.js",
+        "extension/media/app.js",
+        "extension/runtime/aiworkhub/__init__.py",
+    )
+    assert "Verify fresh VSIX manifest and package" in release
+    assert "(( ${#vsix[@]} == 1 ))" in release
+    assert 'test -s "${vsix[0]}"' in release
+    assert 'assert manifest["name"] == "aiworkhub"' in release
+    for asset in packaged:
+        assert f'assert "{asset}" in names' in release
+    assert 'assert any(name.startswith("extension/dist/") for name in names)' not in release
+
+    names = ["extension/package.json", *packaged]
+    assert any(name.startswith("extension/dist/") for name in names) is False
+    assert all(asset in names for asset in packaged)

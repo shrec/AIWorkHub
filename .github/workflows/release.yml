@@ -166,7 +166,9 @@ jobs:
               assert "extension/package.json" in names
               manifest = json.loads(archive.read("extension/package.json"))
               assert manifest["name"] == "aiworkhub"
-              assert any(name.startswith("extension/dist/") for name in names)
+              assert "extension/extension.js" in names
+              assert "extension/media/app.js" in names
+              assert "extension/runtime/aiworkhub/__init__.py" in names
           PY
 
       - name: Upload VSIX artifact
