@@ -27,7 +27,7 @@ import io
 import json
 import os
 import queue
-import select
+import selectors
 import subprocess
 import sys
 import threading
@@ -448,9 +448,14 @@ class _StdioSession:
                     "bundled MCP fallback runtime did not respond in time"
                 ) from exc
         else:
-            ready, _, _ = select.select([self.proc.stdout], [], [], timeout)
-            if not ready:
-                raise TimeoutError("bundled MCP fallback runtime did not respond in time")
+            # DefaultSelector uses poll/epoll/kqueue where available, so an
+            # xdist worker with a pipe fd above FD_SETSIZE remains valid.
+            with selectors.DefaultSelector() as selector:
+                selector.register(self.proc.stdout, selectors.EVENT_READ)
+                if not selector.select(timeout):
+                    raise TimeoutError(
+                        "bundled MCP fallback runtime did not respond in time"
+                    )
             line = self.proc.stdout.readline()
         if line == "":
             stderr = self.proc.stderr.read() if self.proc.stderr else ""
