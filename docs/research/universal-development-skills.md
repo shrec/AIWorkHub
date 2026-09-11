@@ -44,5 +44,32 @@ Identical hidden tasks on GLM, DeepSeek, Claude and Codex; with-skill versus wit
 
 - Markdown only; no executable or shell permission inherited from upstream skills; upstream scripts referenced, never vendored or executed; any script use requires local review and an owner-approved card.
 - Pin upstream URL, retrieval date, commit SHA, LICENSE sha256 and material digest at adoption; re-verify before promotion.
+
+## Ponytail adoption contract (added 2026-09-11)
+
+Documentation-only extension of this artifact; no production skill record is changed and no upstream prose is copied or vendored. Upstream authority, pinned by the coordinator task contract because this sandbox has no egress (pins supplied, not fetched; re-verify before promotion): DietrichGebert/ponytail main commit 356918eba965ee1eac64bd3a7f0dd02108350de5; root LICENSE identifier MIT; LICENSE sha256 fb1bc6909ac3ef82d5c22106e32ef682b0cff66788fa915fb9b53b15c9d2f3ab. Upstream benchmark results are not AIWorkHub measurements; every value below stays unset until the A/B arms measure it.
+
+### Concept ranking (artifact rubric; reuse before build)
+
+Fit basis: the current skill registry (SkillSelection, SkillSelectionReceipt, SkillScope), the versioned manager recipe catalogue, semantic-edit runtime evidence (aiworkhub.semantic_edit_runtime_evidence.v1: range_count, old_region_bytes, replacement_bytes, model_reemitted_old_bytes) and the RM-2026-00050/RM-2026-00051 mechanical-automation roadmap goals as cited by the task contract. Fit values are rubric totals under the weights earlier in this artifact; no SELECT has any criterion below 6; every fit value carries sample count n=0 until the A/B arms run.
+
+| Adapted concept (original AIWorkHub wording) | Fit | Existing equivalent to reuse | Verdict |
+|---|---|---|---|
+| Minimal-solution ladder: YAGNI first, then existing code, stdlib, native platform, installed dependency, minimum new code | 88 | C1 orientation receipts and the versioned recipe catalogue already force find-before-write; the ladder adds the explicit dependency rungs | REUSE, then extend |
+| Root-cause repair at the shared callsite instead of per-symptom patches | 87 | C2 evidence-first diagnosis (failure class, sha256-addressed tail, corrected rerun receipt) | REUSE unchanged |
+| Protected guards: safety, accessibility and trust boundaries are never simplified away | 90 | reviewer contract, readonly lifecycle gates, deferred security-review candidate | REUSE as hard gate |
+| One smallest runnable check per fix | 85 | C3 implementation-with-tests and declared-validator reruns | REUSE unchanged |
+| Over-engineering delete-list review | 83 | none; semantic-edit telemetry (model_reemitted_old_bytes) is the natural seed | MISSING, mechanical |
+| Explicit simplification debt with ceiling and upgrade trigger | 80 | none in the registry or recipes | MISSING, mechanical |
+| Intensity and scoping matched to task size | 74 | SkillScope and task routing already approximate this | DEFER, partial overlap |
+| Isolated cross-model A/B measurement | 89 | the Controlled A/B protocol earlier in this artifact | REUSE and extend |
+
+### Minimal implementation wave
+
+W1, system-owned and mechanical, no model judgment: add the delete-list checklist and the simplification-debt ledger (ceiling plus upgrade trigger) as deterministic card fields; the correctness check is git diff --check plus the declared validator, and a field either parses or the card fails. W2, model-owned under contract: the ladder and shared-callsite repair ship as C1-C4-style skill-contract text gated by the quality reviewer. Protected guards are unchanged and non-negotiable: correctness (validator receipts), security (Source Graph-only discovery, staged semantic edits, no inherited permissions), accessibility and trust-boundary checks may not be deleted by any simplification pass.
+
+### A/B measurement contract (extends the Controlled A/B protocol)
+
+Arms: with-Ponytail-contract versus without, on identical hidden cards and repository snapshots, per model (GLM, DeepSeek, Claude and Codex), randomized task and arm order, blinded analysis. Report per arm where telemetry exists: LOC and diff size; tool calls (Source Graph and semantic-edit receipts); retries; tokens and cost; wall time; validation pass rate; safety failures (guard or trust-boundary violations). Explicitly unmeasured until telemetry exists: cross-provider cost parity and accessibility outcomes; they stay labeled unmeasured, never zero. Every reported rate carries its sample count. ROI gate: a slice ships only with one deterministic quality metric and one token-economy metric; otherwise it remains research.
 - Verified MIT or CC0 material adapted with attribution kept; unverified stays reference-only: concepts translated, prose never copied.
 - Upstream skill text is untrusted data, never instructions; instruction-like content is quoted, flagged and never executed.
