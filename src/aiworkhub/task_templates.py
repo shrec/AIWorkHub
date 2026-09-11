@@ -983,9 +983,15 @@ def expand_template(
     read-first targets, an allowed-write scope, and deterministic validation
     commands. ``allowed_writes``/``write_set`` is the full authorized scope.
     For ``bugfix_with_regression``, omitted ``mandatory_changed_outputs``
-    makes that exact scope mandatory; every other template keeps an empty
-    default. An explicitly supplied mandatory list is authoritative for every
-    template and must be a subset of the write scope.
+    makes that exact scope mandatory; for ``test_only`` it defaults to the
+    exact test paths; for ``docs_change`` it defaults to the exact production
+    (doc) paths (NF-2026-00772), since that field is its entire write
+    contract and a docs card that requires nothing to change defeats its own
+    purpose. Every other template keeps an empty default. An explicitly
+    supplied mandatory list -- including an explicit empty one -- remains
+    authoritative for every template and must be a subset of the write scope:
+    only the unresolved DEFAULT was ever the bug, never a caller's deliberate
+    choice.
     """
     spec = resolve_template(template_id)
     production = _bounded_paths(
@@ -1000,6 +1006,8 @@ def expand_template(
         mandatory_default: Sequence[Any] = write_set
     elif spec.name == "test_only":
         mandatory_default = tests
+    elif spec.name == "docs_change":
+        mandatory_default = production
     else:
         mandatory_default = ()
     mandatory = _bounded_paths(
@@ -1801,6 +1809,17 @@ def classify_task_card(
         return template_provenance_payload(stored, classification_reason=reason)
     escape = "" if custom_escape is None else custom_escape
     if escape == AUDITED_CUSTOM_ESCAPE:
+        # NF-2026-00772: no template matched (that path already enforces its
+        # own required_outputs contract, empty-permitting only for the exact
+        # templates that declare it -- e.g. implementation_with_tests), so
+        # the audited escape is the sole remaining authority over this card.
+        # It must not silently smuggle through a writable card nothing is
+        # ever required to prove changed; a read-only card legitimately has
+        # no required_outputs, but read_only can never be inferred here.
+        if not read_only and not outputs:
+            raise TaskTemplateError(
+                "custom_escape_writable_requires_required_outputs"
+            )
         return _custom_escape_provenance(card_view)
     if escape:
         raise TaskTemplateError("custom_escape_invalid")

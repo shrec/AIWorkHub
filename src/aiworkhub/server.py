@@ -1900,11 +1900,18 @@ def aiworkhub_task_create(
     only when the selected provider exposes structured usage while running;
     terminal-only usage remains posthoc evidence, never a false live-
     enforcement claim.
-    Every writable task requires a non-empty ``required_outputs`` contract;
-    it contains only repo-relative file paths or glob patterns covered by
-    ``allowed_writes``. Human-readable outcome
-    descriptions belong in ``acceptance``; mixing prose into
-    ``required_outputs`` is rejected before a provider run is launched.
+    A writable task's ``required_outputs`` may be empty ONLY when template
+    classification matches a contract that declares that default itself
+    (e.g. ``implementation_with_tests``/``cross_boundary_bugfix``, whose
+    combined production+test scope keeps a deliberate empty default per
+    NF-2026-00456) or an explicit, in-scope mandatory list resolves that way.
+    Every other writable outcome -- including the audited custom-escape path,
+    which has no template contract of its own to fall back on -- requires a
+    non-empty ``required_outputs`` (NF-2026-00772); it contains only
+    repo-relative file paths or glob patterns covered by ``allowed_writes``.
+    Human-readable outcome descriptions belong in ``acceptance``; mixing
+    prose into ``required_outputs`` is rejected before a provider run is
+    launched.
     ``allow_unchanged_required_outputs`` explicitly names required files that
     are evidence inputs/outputs permitted to remain byte-identical to both
     launch baselines; they are verified and hashed but never promoted.

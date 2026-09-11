@@ -225,12 +225,35 @@ def test_docs_change_requires_docs_paths_and_rejects_test_paths():
             test_paths=["tests/test_x.py"],
         )
     card = expand_template("docs_change", production_paths=["docs/guide.md"])
-    assert card["required_outputs"] == []
-    assert card["allowed_writes"] == ["docs/guide.md"]
+    assert card["required_outputs"] == ["docs/guide.md"]
     assert card["allowed_writes"] == ["docs/guide.md"]
     assert card["task_type"] == "code"
     assert card["work_kind"] == "generic"
     assert card["validation"] == ["git diff --check"]
+
+
+def test_nf772_docs_change_default_required_outputs_cover_declared_write_targets():
+    """Regression for the 0.11.25 docs_change failure: a writable docs_change
+    card used to default to an empty ``required_outputs``, so a worker could
+    "complete" the card without ever touching the one declared doc path."""
+    card = expand_template(
+        "docs_change", production_paths=["docs/a.md", "docs/b.md"]
+    )
+    assert card["required_outputs"] == ["docs/a.md", "docs/b.md"]
+    assert card["required_outputs"] == card["allowed_writes"]
+
+
+def test_nf772_docs_change_explicit_empty_override_stays_authoritative():
+    """Symmetric with bugfix_with_regression: only the unresolved DEFAULT was
+    the bug. A caller's deliberate, explicit choice -- even an empty one --
+    remains authoritative for every template, docs_change included."""
+    card = expand_template(
+        "docs_change",
+        production_paths=["docs/guide.md"],
+        mandatory_changed_outputs=[],
+    )
+    assert card["required_outputs"] == []
+    assert card["allowed_writes"] == ["docs/guide.md"]
 
 
 def test_read_only_analysis_emits_no_writes_outputs_or_validations():

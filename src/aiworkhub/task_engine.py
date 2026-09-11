@@ -301,14 +301,43 @@ def record_launch_blocker(
     *,
     adapter_id: str,
     reason: str,
+    request_id: str = "",
 ) -> dict[str, Any]:
     """Record a pre-claim launch blocker without fabricating a claim.
 
     The card remains pending/unclaimed and can be retried explicitly after the
     environment is repaired, but Plan-DAG/auto-pickup can now see the exact
     operational blocker instead of looping or reporting an empty blocker map.
+
+    A launch-preflight rejection observed against a card THIS exact runner
+    already owns (status=processing/worker_status=claimed/claimed_by=runner --
+    e.g. a retried launch attempt whose earlier claim succeeded before this
+    rejection) can never go through the CAS below: the card-scoped
+    "launch-blocked" write gate itself only authorizes a pending/unclaimed
+    card, so it denies this case before the CAS ever runs. NF-2026-00772: the
+    caller (process_launcher's isolated-launch failure path) branches on
+    whether ITS OWN attempt performed the claim, so a retry against an
+    already-owned claim used to hit that gate denial with no fallback,
+    leaving the card stuck ``processing``/``claimed`` forever with no
+    recorded reason -- a phantom processing owner. Detecting that exact case
+    up front and retiring the claim atomically through the same terminal
+    ``mark_launch_failed`` transition a post-claim failure already uses
+    closes that gap: the rejection always resolves to exactly one typed,
+    persisted blocker.
     """
     command = ["launch-blocked", task_id, "--runner", runner]
+    precheck = task_store.get_task(repo, task_id) or {}
+    if (
+        precheck.get("runner") == runner
+        and str(precheck.get("topic") or "") == topic
+        and str(precheck.get("status") or "").lower() == "processing"
+        and str(precheck.get("worker_status") or "").lower() == "claimed"
+        and str(precheck.get("claimed_by") or "") == runner
+    ):
+        effective_request_id = request_id or str(precheck.get("launch_request_id") or "")
+        return mark_launch_failed(
+            repo, task_id, runner, reason=reason, request_id=effective_request_id,
+        )
     # A launch blocker is a narrower card-scoped write than claim-start. It is
     # authorized only for this exact pending/unclaimed card, including legacy
     # cards incorrectly owned by the coordinator runner; it never grants that
@@ -332,7 +361,7 @@ def record_launch_blocker(
         return {"ok": False, "returncode": 1, "command": command, "stdout": "", "stderr": str(exc)}
     try:
         row = conn.execute(
-            "SELECT runner, topic, status, worker_status, card_json FROM tasks WHERE task_id=?",
+            "SELECT runner, topic, status, worker_status, claimed_by, card_json FROM tasks WHERE task_id=?",
             (task_id,),
         ).fetchone()
         if row is None:
@@ -341,7 +370,21 @@ def record_launch_blocker(
         if row["runner"] != runner or _effective_topic(row) != topic:
             conn.rollback()
             return {"ok": False, "returncode": 1, "command": command, "stdout": "", "stderr": "identity_mismatch"}
-        if str(row["status"] or "").lower() != "pending" or str(row["worker_status"] or "").lower() != "unclaimed":
+        status = str(row["status"] or "").lower()
+        worker_status = str(row["worker_status"] or "").lower()
+        if status == "processing" and worker_status == "claimed" and str(row["claimed_by"] or "") == runner:
+            try:
+                stuck_card = json.loads(str(row["card_json"] or "{}"))
+            except (TypeError, json.JSONDecodeError):
+                stuck_card = {}
+            if not isinstance(stuck_card, dict):
+                stuck_card = {}
+            effective_request_id = request_id or str(stuck_card.get("launch_request_id") or "")
+            conn.rollback()
+            return mark_launch_failed(
+                repo, task_id, runner, reason=reason, request_id=effective_request_id,
+            )
+        if status != "pending" or worker_status != "unclaimed":
             conn.rollback()
             return {"ok": False, "returncode": 1, "command": command, "stdout": "", "stderr": "task_not_pending_unclaimed"}
         raw_card = str(row["card_json"] or "{}")

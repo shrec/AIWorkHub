@@ -381,6 +381,39 @@ def test_preclaim_launch_blocker_is_persisted_and_cleared_by_exact_claim(tmp_pat
     assert "operational_blocker" not in retried_card
 
 
+def test_nf772_launch_preflight_rejection_never_leaves_a_phantom_processing_owner(
+    tmp_path, monkeypatch,
+):
+    """A retried launch whose EARLIER attempt already claimed the card must
+    not get stuck: ``record_launch_blocker`` self-heals an owned
+    processing/claimed card into one typed terminal blocker instead of
+    failing ``task_not_pending_unclaimed`` and leaving it phantom-owned."""
+    repo = _repo(tmp_path, monkeypatch)
+    _insert(
+        repo,
+        "TASK_PHANTOM_OWNER",
+        status="processing",
+        worker_status="claimed",
+        claimed_by=RUNNER,
+        launch_request_id="request-stuck",
+    )
+
+    result = task_engine.record_launch_blocker(
+        repo,
+        "TASK_PHANTOM_OWNER",
+        RUNNER,
+        TOPIC,
+        adapter_id="vscode_lm",
+        reason="launch preflight rejected the owned claim",
+    )
+    assert result["ok"] is True, result
+
+    card = task_store.get_task(repo, "TASK_PHANTOM_OWNER") or {}
+    assert card["status"] == "blocked"
+    assert card["worker_status"] == "launch_failed"
+    assert card["status"] != "processing"
+
+
 def test_preclaim_blocker_uses_coordinator_authority_for_legacy_codex_card(
     tmp_path, monkeypatch,
 ):

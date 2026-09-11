@@ -139,6 +139,30 @@ def test_unclassified_raw_task_create_fails_without_escape(
     )
 
 
+def test_nf772_custom_escape_writable_card_requires_required_outputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The audited custom escape has no template contract of its own to fall
+    back on, so it must never accept a writable card asserting a mandatory
+    write while requiring nothing to prove it happened."""
+    _ready_repo(tmp_path, monkeypatch)
+    result = server.aiworkhub_task_create(
+        task_id="TASK_NF772_ESCAPE_EMPTY",
+        title="Raw audited escape, no required outputs",
+        runner="codex_worker_nf772",
+        topic="task_mcp",
+        objective="Write an odd file",
+        acceptance=["must fail closed"],
+        allowed_writes=["src/odd.txt"],
+        required_outputs=[],
+        validation=["python -m pytest -q tests/test_missing.py"],
+        work_kind="generic",
+        custom_template_escape=task_templates.AUDITED_CUSTOM_ESCAPE,
+    )
+    assert result["ok"] is False
+    assert result["stderr"] == "custom_escape_writable_requires_required_outputs"
+
+
 def test_custom_escape_create_accepts_joined_include_root(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
