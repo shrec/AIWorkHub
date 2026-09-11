@@ -115,6 +115,29 @@ LAUNCH_ISOLATED_SEAM_NAMES: tuple[str, ...] = (
 )
 
 
+def _appcontainer_supervisor_identity(
+    *, repo_id: str, worker_kind: str, platform: str
+) -> dict[str, str]:
+    """Shape the AppContainer identity fields carried into the supervisor spec.
+
+    Only the ``win32`` path adds ``backend`` and normalizes ``worker_kind``;
+    every other platform passes both values through unchanged so editor-hosted
+    and non-Windows behaviour is untouched.
+    """
+    if platform != "win32":
+        return {"repo_id": repo_id, "worker_kind": worker_kind}
+    if not repo_id:
+        raise ValueError("repo_id must be a non-empty string for windows_appcontainer")
+    normalized_kind = "_".join(worker_kind.lower().replace("-", "").split())
+    if not normalized_kind:
+        raise ValueError("worker_kind must be a non-empty string for windows_appcontainer")
+    return {
+        "backend": "windows_appcontainer",
+        "repo_id": repo_id,
+        "worker_kind": normalized_kind,
+    }
+
+
 def launch_isolated(
     self,
     *,
@@ -1019,6 +1042,24 @@ def launch_isolated(
                 request_id=request_id,
             )
             launch_phase = "supervisor_spec"
+            appcontainer_identity_fields: dict[str, str] = {}
+            if sandbox_backend == "windows_appcontainer":
+                try:
+                    canonical_repo_id = project_context.repository_state.inspect_repository(
+                        authority_repo
+                    ).manifest.repo_id
+                except project_context.repository_state.RepositoryStateError:
+                    canonical_repo_id = ""
+                identity = _appcontainer_supervisor_identity(
+                    repo_id=canonical_repo_id,
+                    worker_kind=adapter_id,
+                    platform=sys.platform,
+                )
+                appcontainer_identity_fields = {
+                    "execution_backend": identity.get("backend", "windows_appcontainer"),
+                    "repo_id": identity["repo_id"],
+                    "worker_kind": identity["worker_kind"],
+                }
             write_json_0600(spec_path, {
                 "argv": worker_argv,
                 "cwd": launch_cwd,
@@ -1030,6 +1071,7 @@ def launch_isolated(
                 "max_output_bytes": MAX_WORKER_STREAM_LOG_BYTES,
                 "adapter_id": adapter_id,
                 "token_budget": metadata.get("token_budget"),
+                **appcontainer_identity_fields,
             })
 
             supervisor = _worker_supervisor_script()
