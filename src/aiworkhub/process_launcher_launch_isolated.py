@@ -54,6 +54,7 @@ LAUNCH_ISOLATED_SEAM_NAMES: tuple[str, ...] = (
     "_LiveProcess",
     "_ReviewerReservationTerminalized",
     "_VSCODE_LM_IN_PROCESS_ADAPTERS",
+    "_appcontainer_supervisor_identity",
     "_bounded_launch_diagnostic",
     "_committed_claim_card",
     "_enforce_quality_review_launch_binding",
@@ -112,6 +113,16 @@ LAUNCH_ISOLATED_SEAM_NAMES: tuple[str, ...] = (
     "worker_ai_tools_mcp",
     "worker_launch_env",
     "write_json_0600",
+)
+
+# Names declared above that are genuinely new to this module rather than
+# re-bound from ``process_launcher``: ``_appcontainer_supervisor_identity`` is
+# defined below and is a free variable of ``launch_isolated`` like every other
+# seam, but it has no counterpart on ``process_launcher`` to read at call time
+# and it is expected to already be an attribute of this module -- both things
+# that would be drift for every other seam in ``LAUNCH_ISOLATED_SEAM_NAMES``.
+LAUNCH_ISOLATED_LOCAL_SEAM_NAMES: tuple[str, ...] = (
+    "_appcontainer_supervisor_identity",
 )
 
 

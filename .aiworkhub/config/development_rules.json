@@ -724,6 +724,11 @@
         "count": 1
       },
       {
+        "path": "src/aiworkhub/process_launcher_launch_isolated.py",
+        "pattern": "sys_platform",
+        "count": 1
+      },
+      {
         "path": "src/aiworkhub/provider_tool_guards.py",
         "pattern": "def_atomic",
         "count": 1
@@ -972,8 +977,8 @@
     "measurement": {
       "reference_commit": "4ef0001cf9ef66fc9ebd70d5b724d46c485b1840",
       "reference_total": 161,
-      "current_total": 136,
-      "accepted_predecessor_delta": -25
+      "current_total": 137,
+      "accepted_predecessor_delta": -24
     }
   },
   "single_definition_boundary": {

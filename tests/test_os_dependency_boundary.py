@@ -127,7 +127,11 @@ def test_current_tree_passes_and_baseline_is_sorted():
     #      recorded. As a bare script it could not import the sanctioned
     #      facade; as a package module it can, and now calls
     #      ``platform_io.is_windows()``.
-    assert sum(entry.count for entry in boundary.baseline) == 136
+    # 136 -> 137 on 2026-09-11: process_launcher_launch_isolated.py's
+    # ``launch_isolated`` gained one ``sys.platform`` read when the AppContainer
+    # supervisor identity was propagated into it -- a real new dependency, not
+    # a scope change.
+    assert sum(entry.count for entry in boundary.baseline) == 137
 
 
 def test_new_identity_and_same_identity_growth_fail(tmp_path):

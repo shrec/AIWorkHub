@@ -162,11 +162,17 @@ def test_declared_seam_names_are_exactly_the_functions_free_variables():
 
 
 def test_every_declared_seam_is_still_an_attribute_of_process_launcher():
-    """Each name must resolve on the module the tests actually patch."""
+    """Each name must resolve on the module the tests actually patch.
+
+    Local seams are free variables too, but they are defined on this module
+    rather than re-bound from ``process_launcher`` -- they have no
+    counterpart there to check.
+    """
+    local = set(process_launcher_launch_isolated.LAUNCH_ISOLATED_LOCAL_SEAM_NAMES)
     missing = [
         name
         for name in process_launcher_launch_isolated.LAUNCH_ISOLATED_SEAM_NAMES
-        if not hasattr(process_launcher, name)
+        if name not in local and not hasattr(process_launcher, name)
     ]
     assert missing == []
 
@@ -176,7 +182,8 @@ def test_seams_are_read_from_process_launcher_at_call_time_not_import_time():
 
     An import-time capture is exactly the silent failure this move risks, and
     it is visible in the source: every binding is an attribute load off the
-    ``process_launcher`` module imported inside the function body.
+    ``process_launcher`` module imported inside the function body. Local
+    seams are exempt: they are not re-bound from ``process_launcher`` at all.
     """
     fn = _moved_function_node()
 
@@ -187,29 +194,47 @@ def test_seams_are_read_from_process_launcher_at_call_time_not_import_time():
     )
 
     # _preamble_bindings only matches `X = _pl.X`, so covering every declared
-    # seam is itself the proof that each one is a live attribute read.
+    # non-local seam is itself the proof that each one is a live attribute read.
     bindings = _preamble_bindings(fn)
+    local = set(process_launcher_launch_isolated.LAUNCH_ISOLATED_LOCAL_SEAM_NAMES)
     missing = [
         name
         for name in process_launcher_launch_isolated.LAUNCH_ISOLATED_SEAM_NAMES
-        if name not in bindings
+        if name not in local and name not in bindings
     ]
     assert missing == []
 
 
 def test_the_extracted_module_binds_no_seam_at_import_time():
-    """The module object itself must not hold a copy of any seam.
+    """The module object itself must not hold a copy of any non-local seam.
 
     If a seam name existed at module scope here, a later edit could resolve it
     from there instead of from the preamble and the patch would stop landing
-    without anything failing.
+    without anything failing. Local seams are declared on this module by
+    design, so they are exempt from this check.
     """
+    local = set(process_launcher_launch_isolated.LAUNCH_ISOLATED_LOCAL_SEAM_NAMES)
     leaked = [
         name
         for name in process_launcher_launch_isolated.LAUNCH_ISOLATED_SEAM_NAMES
-        if hasattr(process_launcher_launch_isolated, name)
+        if name not in local and hasattr(process_launcher_launch_isolated, name)
     ]
     assert leaked == []
+
+
+def test_every_local_seam_resolves_on_the_extracted_module():
+    """Local seams must actually exist where the moved body expects them.
+
+    Unlike the other seams, these are read from module globals rather than
+    the ``process_launcher`` preamble, so this is the only test that checks
+    they resolve at all.
+    """
+    missing = [
+        name
+        for name in process_launcher_launch_isolated.LAUNCH_ISOLATED_LOCAL_SEAM_NAMES
+        if not hasattr(process_launcher_launch_isolated, name)
+    ]
+    assert missing == []
 
 
 def test_delegating_method_keeps_the_original_signature():
