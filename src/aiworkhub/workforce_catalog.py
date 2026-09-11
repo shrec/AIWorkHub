@@ -254,6 +254,23 @@ def _worker(value: Any) -> dict[str, Any]:
     supports = _tokens(value.get("supports"), "supports")
     if not supports or set(supports) - set(workforce_router.TASK_KINDS):
         raise WorkforceCatalogError("worker_supports_invalid")
+
+    def _role_bool(key: str, default: bool) -> bool:
+        if key not in value:
+            return default
+        raw = value[key]
+        if isinstance(raw, bool):
+            return raw
+        raise WorkforceCatalogError("worker_roles_invalid")
+
+    manager = _role_bool("manager", True)
+    implementation_worker = _role_bool("implementation_worker", True)
+    reviewer = _role_bool("reviewer", False)
+
+    runner_id = execution_runner(worker_id, adapter_id)
+    if adapter_id == "codex_cli" or runner_id == "codex" or runner_id.startswith("codex_gpt"):
+        manager, implementation_worker, reviewer = True, False, False
+
     return {
         "worker_id": worker_id,
         "adapter_id": adapter_id,
@@ -266,6 +283,9 @@ def _worker(value: Any) -> dict[str, Any]:
         "max_risk": risk,
         "quality_ceiling": ceiling,
         "manager_score_adjustment": adjustment,
+        "manager": manager,
+        "implementation_worker": implementation_worker,
+        "reviewer": reviewer,
     }
 
 

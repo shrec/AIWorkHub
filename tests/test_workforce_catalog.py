@@ -647,6 +647,102 @@ def test_execution_runner_is_stable_and_never_uses_manager_identity() -> None:
     assert workforce_catalog.execution_runner("grok-4.6", "grok_kilo_cli") == "grok_4.6"
 
 
+def _roles_worker_row(worker_id: str, adapter_id: str, model: str, **extra) -> dict:
+    worker = {
+        "worker_id": worker_id,
+        "adapter_id": adapter_id,
+        "model": model,
+        "provider": "zhipu",
+        "enabled": True,
+        "supports": ["mechanical", "code", "research", "review"],
+        "tools": [],
+        "max_context_tokens": 128_000,
+        "max_risk": "medium",
+        "quality_ceiling": 0.9,
+        "manager_score_adjustment": 0.0,
+    }
+    worker.update(extra)
+    return worker
+
+
+def _validated_role_rows(*workers: dict) -> list:
+    catalog = {
+        "schema_id": workforce_catalog.SCHEMA_ID,
+        "revision": 1,
+        "workers": list(workers),
+    }
+    return workforce_catalog.validate_catalog(catalog)["workers"]
+
+
+def test_legacy_rows_get_safe_role_defaults() -> None:
+    row = _validated_role_rows(
+        _roles_worker_row("glm-5.2", "glm_vscode_lm", "glm-5.2")
+    )[0]
+    assert row["manager"] is True
+    assert row["implementation_worker"] is True
+    assert row["reviewer"] is False
+
+
+def test_explicit_role_booleans_are_preserved_for_ordinary_routes() -> None:
+    row = _validated_role_rows(
+        _roles_worker_row(
+            "glm-5.2",
+            "glm_vscode_lm",
+            "glm-5.2",
+            manager=False,
+            implementation_worker=False,
+            reviewer=True,
+        )
+    )[0]
+    assert row["manager"] is False
+    assert row["implementation_worker"] is False
+    assert row["reviewer"] is True
+
+
+def test_non_boolean_role_values_fail_closed_with_stable_error() -> None:
+    for field, bad in (
+        ("manager", "yes"),
+        ("implementation_worker", 1),
+        ("reviewer", None),
+    ):
+        try:
+            _validated_role_rows(
+                _roles_worker_row(
+                    "glm-5.2", "glm_vscode_lm", "glm-5.2", **{field: bad}
+                )
+            )
+        except workforce_catalog.WorkforceCatalogError as exc:
+            assert str(exc) == "worker_roles_invalid"
+        else:  # pragma: no cover - explicit assertion without pytest dependency
+            raise AssertionError(f"non-boolean {field} role value was accepted")
+
+
+def test_codex_identities_are_always_manager_only() -> None:
+    rows = _validated_role_rows(
+        _roles_worker_row(
+            "gpt-5.5",
+            "codex_cli",
+            "gpt-5.5",
+            manager=False,
+            implementation_worker=True,
+            reviewer=True,
+        ),
+        _roles_worker_row(
+            "codex",
+            "codex_cli",
+            "gpt-5.5",
+            manager=False,
+            implementation_worker=True,
+            reviewer=True,
+        ),
+    )
+    assert [row["worker_id"] for row in rows] == ["gpt-5.5", "codex"]
+    for row in rows:
+        assert row["manager"] is True
+        assert row["implementation_worker"] is False
+        assert row["reviewer"] is False
+
+
 def test_default_catalog_declares_exact_grok_kilo_route() -> None:
     worker = next(
         row
