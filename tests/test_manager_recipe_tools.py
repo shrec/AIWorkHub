@@ -1608,6 +1608,8 @@ def test_the_packaged_operator_modules_run_as_module_arguments(manager):
     checkout via ``__file__``) and refuse with its declared exit 2 because the
     store is absent -- which is a measured answer, not a failure to run.
     """
+    import os
+    import pathlib
     import subprocess
     import sys
 
@@ -1621,9 +1623,30 @@ def test_the_packaged_operator_modules_run_as_module_arguments(manager):
     )
     assert argv[:3] == ["python", "-m", "aiworkhub.recipes.task_events"]
 
+    # Import the recipe through the trusted source checkout's own package
+    # root instead of whatever ambient cwd, PYTHONPATH or installation
+    # happened to make this interpreter importable. The projection is a
+    # fresh minimal mapping, so no inherited HOME or other caller state
+    # reaches the measured child; SYSTEMROOT is the one variable a win32
+    # interpreter cannot start without.
+    child_env = {
+        "PYTHONPATH": str(pathlib.Path(__file__).resolve().parents[1] / "src"),
+    }
+    if sys.platform == "win32":
+        child_env["SYSTEMROOT"] = os.environ.get("SYSTEMROOT", "")
+
+    # The empty manager repository needs its own `.aiworkhub` boundary
+    # directory: the recipe walks ancestors for the nearest `.aiworkhub` to
+    # find its repository, and without one the child climbs out of the
+    # scratch manager into this checkout's real repository and live task
+    # DB. The boundary stays empty -- no tasking/task_queue.sqlite -- so
+    # the measured answer stays the declared exit 2.
+    (manager / ".aiworkhub").mkdir(exist_ok=True)
+
     completed = subprocess.run(
         [sys.executable, *argv[1:]],
         cwd=str(manager),
+        env=child_env,
         capture_output=True,
         text=True,
         check=False,
