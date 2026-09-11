@@ -227,6 +227,7 @@ def _insert_pending_reroutable(
     terminal_retry: dict | None = "default",  # type: ignore[assignment]
     rework_predecessor: dict | None = None,
     risk_tier: str | None = None,
+    card_overrides: dict | None = None,
 ) -> None:
     readiness = task_store.storage_readiness(repo)
     now = "2026-08-03T00:00:00+00:00"
@@ -260,6 +261,8 @@ def _insert_pending_reroutable(
         card["rework_predecessor"] = rework_predecessor
     if risk_tier is not None:
         card["risk_tier"] = risk_tier
+    if card_overrides is not None:
+        card.update(card_overrides)
     conn = sqlite3.connect(readiness.canonical_db)
     try:
         conn.execute(
@@ -342,6 +345,37 @@ def _retained_predecessor(
         "delta_artifact": {
             "path": str(artifact_path),
             "digest": artifact_digest,
+        },
+    }
+
+
+def _manager_rejection_fields(predecessor: dict) -> dict:
+    pinned_at = "2026-08-03T00:01:00+00:00"
+    request_id = predecessor["request_id"]
+    instruction = "repair the rejected candidate through another provider"
+    predecessor["pinned_at"] = pinned_at
+    return {
+        "claim_epoch": predecessor["claim_epoch"],
+        "rejection_disposition": {
+            "schema_id": "aiworkhub.rejection_disposition.v1",
+            "failure_category": "candidate_code",
+            "request_id": request_id,
+            "to": "pending",
+            "pinned_at": pinned_at,
+        },
+        "review_feedback": {
+            "schema_id": "aiworkhub.rework_feedback_delta.v1",
+            "instruction": instruction,
+            "reason_identity": {
+                "bytes": len(instruction.encode("utf-8")),
+                "sha256": hashlib.sha256(instruction.encode("utf-8")).hexdigest(),
+                "truncated": False,
+            },
+            "predecessor_request_id": request_id,
+            "predecessor_changed_paths": sorted(
+                predecessor["changed_path_hashes"]
+            ),
+            "residual_identities": [],
         },
     }
 
@@ -600,6 +634,123 @@ def test_reroute_launch_identity_rejects_malformed_or_nonoperational_retry(
     row = _row(coordinator_repo, task_id)
     assert row["runner"] == "claude_sonnet-4.6"
     assert json.loads(row["card_json"])["terminal_retry"] == terminal_retry
+
+
+def test_reroute_launch_identity_uses_current_manager_rejection_over_stale_retry(
+    coordinator_repo: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = "REROUTE_REJECTED_GLM_TO_DEEPSEEK"
+    predecessor = _retained_predecessor(coordinator_repo, task_id=task_id)
+    manager_fields = _manager_rejection_fields(predecessor)
+    monkeypatch.setattr(
+        worker_workspace,
+        "changed_paths",
+        lambda _workspace, **_kwargs: ["out/result.json"],
+    )
+    monkeypatch.setattr(
+        workforce_catalog,
+        "build_catalog",
+        lambda _repo: {
+            "workers": [{
+                "execution_runner": "deepseek_v4-pro",
+                "effective_adapter_id": "deepseek_vscode_lm",
+                "model": "deepseek-v4-pro",
+                "enabled": True,
+                "launch_eligible": True,
+                "available": True,
+                "max_risk": "critical",
+            }]
+        },
+    )
+    _insert_pending_reroutable(
+        coordinator_repo,
+        task_id=task_id,
+        runner="glm_5.3",
+        rework_predecessor=predecessor,
+        risk_tier="high",
+        card_overrides=manager_fields,
+    )
+
+    result = core.reroute_launch_identity(
+        task_id,
+        from_runner="glm_5.3",
+        to_runner="deepseek_v4-pro",
+        to_adapter_id="deepseek_vscode_lm",
+        to_model="deepseek-v4-pro",
+    )
+
+    assert result["ok"] is True, result
+    row = _row(coordinator_repo, task_id)
+    assert row["runner"] == "deepseek_v4-pro"
+    card = json.loads(row["card_json"])
+    assert card["terminal_retry"]["request_id"] == "r" * 32
+    assert card["review_feedback"] == manager_fields["review_feedback"]
+    assert card["rework_predecessor"] == predecessor
+    authorization = card["identity_reroute"][
+        "manager_rejection_authorization"
+    ]
+    assert authorization["task_id"] == task_id
+    assert authorization["request_id"] == predecessor["request_id"]
+    assert authorization["claim_epoch"] == predecessor["claim_epoch"]
+    assert result["manager_rejection_authorization"] == authorization
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_error"),
+    [
+        ("missing", "reroute_manager_rejection_provenance_missing"),
+        ("stale", "reroute_manager_rejection_identity_mismatch"),
+        ("cross_task", "reroute_manager_rejection_identity_mismatch"),
+        ("unsealed", "reroute_retained_candidate_delta_unverified"),
+        ("tampered", "reroute_retained_candidate_hash_mismatch"),
+    ],
+)
+def test_reroute_launch_identity_rejects_invalid_manager_rework_provenance(
+    coordinator_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+    expected_error: str,
+) -> None:
+    task_id = f"REROUTE_REJECTED_BAD_{mutation.upper()}"
+    predecessor = _retained_predecessor(coordinator_repo, task_id=task_id)
+    manager_fields = _manager_rejection_fields(predecessor)
+    if mutation == "missing":
+        manager_fields.pop("rejection_disposition")
+    elif mutation == "stale":
+        manager_fields["rejection_disposition"]["request_id"] = "c" * 32
+    elif mutation == "cross_task":
+        predecessor["task_id"] = "OTHER_TASK"
+        predecessor["rework_delta"]["task_id"] = "OTHER_TASK"
+    elif mutation == "unsealed":
+        predecessor["rework_delta"]["sealed"] = False
+    elif mutation == "tampered":
+        Path(predecessor["workspace"]["path"], "out/result.json").write_text(
+            "tampered\n", encoding="utf-8"
+        )
+    monkeypatch.setattr(
+        worker_workspace,
+        "changed_paths",
+        lambda _workspace, **_kwargs: ["out/result.json"],
+    )
+    _insert_pending_reroutable(
+        coordinator_repo,
+        task_id=task_id,
+        runner="glm_5.3",
+        rework_predecessor=predecessor,
+        card_overrides=manager_fields,
+    )
+
+    result = core.reroute_launch_identity(
+        task_id,
+        from_runner="glm_5.3",
+        to_runner="claude_sonnet-5",
+        to_adapter_id="claude_cli",
+        to_model="claude-sonnet-5",
+    )
+
+    assert result["ok"] is False
+    assert expected_error in result["stderr"]
+    assert _row(coordinator_repo, task_id)["runner"] == "glm_5.3"
 
 
 def test_reroute_launch_identity_preserves_retained_candidate_delta(

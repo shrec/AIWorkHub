@@ -6890,6 +6890,93 @@ def _has_retained_candidate_delta(card: Mapping[str, Any]) -> bool:
     return isinstance(changed, dict) and bool(changed)
 
 
+def _verified_manager_rejection_receipt(
+    card: Mapping[str, Any], *, task_id: str
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Bind an explicit manager rejection to the exact retained candidate.
+
+    ``terminal_retry`` can outlive the operational episode that created it.
+    Once a later candidate has been rejected, that stale receipt must not
+    authorize a provider change by itself: all rejection and retained-delta
+    identities have to agree before the manager can reroute the rework.
+    """
+    rejection = card.get("rejection_disposition")
+    feedback = card.get("review_feedback")
+    predecessor = card.get("rework_predecessor")
+    if not all(isinstance(value, dict) for value in (rejection, feedback, predecessor)):
+        return None, "reroute_manager_rejection_provenance_missing"
+    assert isinstance(rejection, dict)
+    assert isinstance(feedback, dict)
+    assert isinstance(predecessor, dict)
+
+    request_id = str(rejection.get("request_id") or "").strip()
+    claim_epoch = predecessor.get("claim_epoch")
+    pinned_at = str(rejection.get("pinned_at") or "").strip()
+    if (
+        rejection.get("schema_id") != "aiworkhub.rejection_disposition.v1"
+        or rejection.get("to") != "pending"
+        or rejection.get("failure_category") != "candidate_code"
+        or re.fullmatch(r"[0-9a-f]{32}", request_id) is None
+        or not pinned_at
+        or str(predecessor.get("pinned_at") or "").strip() != pinned_at
+        or str(predecessor.get("task_id") or "").strip() != task_id
+        or str(predecessor.get("request_id") or "").strip() != request_id
+        or type(claim_epoch) is not int
+        or claim_epoch < 1
+        or card.get("claim_epoch") != claim_epoch
+    ):
+        return None, "reroute_manager_rejection_identity_mismatch"
+
+    changed_hashes = predecessor.get("changed_path_hashes")
+    feedback_paths = feedback.get("predecessor_changed_paths")
+    instruction = feedback.get("instruction")
+    reason_identity = feedback.get("reason_identity")
+    if (
+        feedback.get("schema_id") != "aiworkhub.rework_feedback_delta.v1"
+        or str(feedback.get("predecessor_request_id") or "").strip() != request_id
+        or not isinstance(changed_hashes, dict)
+        or not changed_hashes
+        or feedback_paths != sorted(str(path) for path in changed_hashes)
+        or not isinstance(instruction, str)
+        or len(instruction.encode("utf-8")) > _MAX_REWORK_FEEDBACK_BYTES
+        or not isinstance(reason_identity, dict)
+        or type(reason_identity.get("bytes")) is not int
+        or reason_identity.get("bytes", -1) < 0
+        or re.fullmatch(
+            r"[0-9a-f]{64}", str(reason_identity.get("sha256") or "")
+        )
+        is None
+        or type(reason_identity.get("truncated")) is not bool
+    ):
+        return None, "reroute_manager_rejection_feedback_invalid"
+
+    retained, retained_error = _verified_retained_predecessor_receipt(
+        card, task_id=task_id
+    )
+    if retained_error is not None or retained is None:
+        return None, retained_error or "reroute_retained_candidate_unverified"
+
+    def digest(value: Any) -> str:
+        return hashlib.sha256(
+            json.dumps(
+                value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+        ).hexdigest()
+
+    return {
+        "schema_id": "aiworkhub.manager_rejection_reroute_authorization.v1",
+        "task_id": task_id,
+        "request_id": request_id,
+        "claim_epoch": claim_epoch,
+        "authority_repo": str(repo_root().resolve(strict=False)),
+        "rejection_sha256": digest(rejection),
+        "feedback_sha256": digest(feedback),
+        "allowed_writes_sha256": digest(card.get("allowed_writes") or []),
+        "changed_path_hashes_sha256": digest(changed_hashes),
+        "retained_predecessor_sha256": retained["retained_predecessor_sha256"],
+    }, None
+
+
 def _verified_retained_predecessor_receipt(
     card: Mapping[str, Any], *, task_id: str
 ) -> tuple[dict[str, Any] | None, str | None]:
@@ -7085,8 +7172,9 @@ def reroute_launch_identity(
     """Atomically reroute one pending/unclaimed card's invalid pinned runner
     to an enabled, available, risk-capable canonical workforce tuple.
 
-    Permitted only for a card that already carries an exact operational
-    ``terminal_retry`` receipt (see ``retry_terminal_task``). Preserves task
+    Permitted only for a card that carries either an exact operational
+    ``terminal_retry`` receipt (see ``retry_terminal_task``) or an authenticated
+    manager rejection bound to a verified sealed candidate. Preserves task
     ID, topic, scope, template provenance, history and any hash-pinned retained
     candidate -- mutates only ``runner`` plus a bounded audited old/new
     identity receipt. Retained bytes are still reverified against their exact
@@ -7133,14 +7221,35 @@ def reroute_launch_identity(
         if isinstance(terminal_retry, dict)
         else ""
     )
+    valid_terminal_retry = (
+        isinstance(terminal_retry, dict)
+        and terminal_retry.get("schema_id") == "aiworkhub.terminal_retry.v1"
+        and bool(retry_request_id)
+        and len(retry_request_id) <= 120
+        and retry_substatus in _RETRYABLE_OPERATIONAL_TERMINAL_SUBSTATUSES
+    )
+    feedback = card.get("review_feedback")
+    predecessor = card.get("rework_predecessor")
+    has_manager_rework_evidence = "rejection_disposition" in card or (
+        isinstance(feedback, dict)
+        and feedback.get("schema_id") == "aiworkhub.rework_feedback_delta.v1"
+        and bool(str(feedback.get("predecessor_request_id") or "").strip())
+        and isinstance(predecessor, dict)
+        and _has_retained_candidate_delta(card)
+    )
+    manager_rejection_receipt: dict[str, Any] = {}
     identical_outcome_receipt: dict[str, Any] = {}
-    if (
-        not isinstance(terminal_retry, dict)
-        or terminal_retry.get("schema_id") != "aiworkhub.terminal_retry.v1"
-        or not retry_request_id
-        or len(retry_request_id) > 120
-        or retry_substatus not in _RETRYABLE_OPERATIONAL_TERMINAL_SUBSTATUSES
-    ):
+    if has_manager_rework_evidence:
+        manager_rejection, manager_rejection_error = (
+            _verified_manager_rejection_receipt(card, task_id=task_id)
+        )
+        if manager_rejection_error is not None or manager_rejection is None:
+            return _lifecycle_error(
+                manager_rejection_error
+                or "reroute_manager_rejection_provenance_invalid"
+            )
+        manager_rejection_receipt = manager_rejection
+    elif not valid_terminal_retry:
         # A semantic terminal (``validation_failed``) is not an operational
         # retry and never will be: an unattended retry must not re-run a
         # finding about the work.  But a card the launch guard has REFUSED on
@@ -7274,6 +7383,10 @@ def reroute_launch_identity(
         semantic_card["identity_reroute"]["identical_outcome_refusal"] = (
             identical_outcome_receipt
         )
+    if manager_rejection_receipt:
+        semantic_card["identity_reroute"]["manager_rejection_authorization"] = (
+            manager_rejection_receipt
+        )
     encoded_card = json.dumps(semantic_card, ensure_ascii=False, sort_keys=True)
     try:
         conn = _canonical_connect()
@@ -7328,6 +7441,7 @@ def reroute_launch_identity(
                         "to_model": canonical_model,
                         "reason": bounded_reason,
                         "identical_outcome_refusal": identical_outcome_receipt,
+                        "manager_rejection_authorization": manager_rejection_receipt,
                     },
                     ensure_ascii=False,
                     sort_keys=True,
@@ -7347,6 +7461,10 @@ def reroute_launch_identity(
     result["to_model"] = canonical_model
     if identical_outcome_receipt:
         result["identical_outcome_refusal"] = dict(identical_outcome_receipt)
+    if manager_rejection_receipt:
+        result["manager_rejection_authorization"] = dict(
+            manager_rejection_receipt
+        )
     return _reconcile_retained_workspaces(result)
 
 
