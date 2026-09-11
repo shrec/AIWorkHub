@@ -6912,6 +6912,38 @@ def _verified_manager_rejection_receipt(
     request_id = str(rejection.get("request_id") or "").strip()
     claim_epoch = predecessor.get("claim_epoch")
     pinned_at = str(rejection.get("pinned_at") or "").strip()
+    current_claim_epoch = card.get("claim_epoch")
+    recovery = card.get("recovery_predecessor")
+    recovery_epoch = card.get("recovery_epoch")
+    terminal_failure = card.get("terminal_failure")
+    terminal_evidence = (
+        terminal_failure.get("evidence")
+        if isinstance(terminal_failure, dict)
+        else None
+    )
+    recovery_rebind = (
+        type(claim_epoch) is int
+        and isinstance(recovery, dict)
+        and type(recovery_epoch) is int
+        and type(current_claim_epoch) is int
+        and recovery_epoch == current_claim_epoch
+        and recovery_epoch > claim_epoch
+        and str(card.get("recovered_by") or "").strip()
+        == _verified_manager_actor()
+        and bool(str(card.get("recovered_from_blocked_at") or "").strip())
+        and str(recovery.get("request_id") or "").strip() == request_id
+        and recovery.get("terminal_claim_epoch") == claim_epoch
+        and recovery.get("changed_path_hashes")
+        == predecessor.get("changed_path_hashes")
+        and isinstance(terminal_failure, dict)
+        and type(terminal_failure.get("claim_epoch")) is int
+        and terminal_failure.get("claim_epoch") == recovery_epoch - 1
+        and terminal_failure.get("substatus")
+        in _RETRYABLE_OPERATIONAL_TERMINAL_SUBSTATUSES
+        and isinstance(terminal_evidence, dict)
+        and str(terminal_evidence.get("request_id") or "").strip()
+        == str(card.get("launch_request_id") or "").strip()
+    )
     if (
         rejection.get("schema_id") != "aiworkhub.rejection_disposition.v1"
         or rejection.get("to") != "pending"
@@ -6923,7 +6955,7 @@ def _verified_manager_rejection_receipt(
         or str(predecessor.get("request_id") or "").strip() != request_id
         or type(claim_epoch) is not int
         or claim_epoch < 1
-        or card.get("claim_epoch") != claim_epoch
+        or (current_claim_epoch != claim_epoch and not recovery_rebind)
     ):
         return None, "reroute_manager_rejection_identity_mismatch"
 
@@ -6963,7 +6995,7 @@ def _verified_manager_rejection_receipt(
             ).encode("utf-8")
         ).hexdigest()
 
-    return {
+    receipt = {
         "schema_id": "aiworkhub.manager_rejection_reroute_authorization.v1",
         "task_id": task_id,
         "request_id": request_id,
@@ -6974,7 +7006,15 @@ def _verified_manager_rejection_receipt(
         "allowed_writes_sha256": digest(card.get("allowed_writes") or []),
         "changed_path_hashes_sha256": digest(changed_hashes),
         "retained_predecessor_sha256": retained["retained_predecessor_sha256"],
-    }, None
+    }
+    if recovery_rebind:
+        receipt["recovery_rebind"] = {
+            "schema_id": "aiworkhub.manager_rejection_recovery_rebind.v1",
+            "recovery_epoch": recovery_epoch,
+            "recovery_predecessor_sha256": digest(recovery),
+            "terminal_failure_sha256": digest(terminal_failure),
+        }
+    return receipt, None
 
 
 def _verified_retained_predecessor_receipt(

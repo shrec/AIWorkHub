@@ -695,6 +695,131 @@ def test_reroute_launch_identity_uses_current_manager_rejection_over_stale_retry
     assert result["manager_rejection_authorization"] == authorization
 
 
+def test_reroute_launch_identity_allows_exact_recovered_rework_epoch(
+    coordinator_repo: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = "REROUTE_RECOVERED_REJECTED_REWORK"
+    predecessor = _retained_predecessor(coordinator_repo, task_id=task_id)
+    manager_fields = _manager_rejection_fields(predecessor)
+    recovery_epoch = predecessor["claim_epoch"] + 3
+    latest_request_id = "f" * 32
+    manager_fields.update({
+        "claim_epoch": recovery_epoch,
+        "launch_request_id": latest_request_id,
+        "recovered_by": "codex",
+        "recovered_from_blocked_at": "2026-08-03T00:02:00+00:00",
+        "recovery_epoch": recovery_epoch,
+        "recovery_predecessor": {
+            "request_id": predecessor["request_id"],
+            "terminal_claim_epoch": predecessor["claim_epoch"],
+            "changed_path_hashes": dict(predecessor["changed_path_hashes"]),
+        },
+        "terminal_failure": {
+            "claim_epoch": recovery_epoch - 1,
+            "substatus": "worker_failed",
+            "evidence": {"request_id": latest_request_id},
+        },
+    })
+    monkeypatch.setattr(
+        worker_workspace,
+        "changed_paths",
+        lambda _workspace, **_kwargs: ["out/result.json"],
+    )
+    _insert_pending_reroutable(
+        coordinator_repo,
+        task_id=task_id,
+        runner="glm_5.3",
+        rework_predecessor=predecessor,
+        risk_tier="high",
+        card_overrides=manager_fields,
+    )
+
+    result = core.reroute_launch_identity(
+        task_id,
+        from_runner="glm_5.3",
+        to_runner="claude_sonnet-5",
+        to_adapter_id="claude_cli",
+        to_model="sonnet",
+    )
+
+    assert result["ok"] is True, result
+    rebind = result["manager_rejection_authorization"]["recovery_rebind"]
+    assert rebind["recovery_epoch"] == recovery_epoch
+    assert len(rebind["recovery_predecessor_sha256"]) == 64
+    assert len(rebind["terminal_failure_sha256"]) == 64
+
+
+@pytest.mark.parametrize(
+    ("mutation", "value"),
+    [
+        ("recovery_request", "e" * 32),
+        ("terminal_epoch", 99),
+        ("terminal_substatus", "validation_failed"),
+        ("terminal_request", "d" * 32),
+    ],
+)
+def test_reroute_launch_identity_rejects_invalid_recovery_rebind(
+    coordinator_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+    value: object,
+) -> None:
+    task_id = f"REROUTE_BAD_RECOVERY_{mutation.upper()}"
+    predecessor = _retained_predecessor(coordinator_repo, task_id=task_id)
+    manager_fields = _manager_rejection_fields(predecessor)
+    recovery_epoch = predecessor["claim_epoch"] + 1
+    latest_request_id = "f" * 32
+    manager_fields.update({
+        "claim_epoch": recovery_epoch,
+        "launch_request_id": latest_request_id,
+        "recovered_by": "codex",
+        "recovered_from_blocked_at": "2026-08-03T00:02:00+00:00",
+        "recovery_epoch": recovery_epoch,
+        "recovery_predecessor": {
+            "request_id": predecessor["request_id"],
+            "terminal_claim_epoch": predecessor["claim_epoch"],
+            "changed_path_hashes": dict(predecessor["changed_path_hashes"]),
+        },
+        "terminal_failure": {
+            "claim_epoch": recovery_epoch - 1,
+            "substatus": "worker_failed",
+            "evidence": {"request_id": latest_request_id},
+        },
+    })
+    if mutation == "recovery_request":
+        manager_fields["recovery_predecessor"]["request_id"] = value
+    elif mutation == "terminal_epoch":
+        manager_fields["terminal_failure"]["claim_epoch"] = value
+    elif mutation == "terminal_substatus":
+        manager_fields["terminal_failure"]["substatus"] = value
+    else:
+        manager_fields["terminal_failure"]["evidence"]["request_id"] = value
+    monkeypatch.setattr(
+        worker_workspace,
+        "changed_paths",
+        lambda _workspace, **_kwargs: ["out/result.json"],
+    )
+    _insert_pending_reroutable(
+        coordinator_repo,
+        task_id=task_id,
+        runner="glm_5.3",
+        rework_predecessor=predecessor,
+        risk_tier="high",
+        card_overrides=manager_fields,
+    )
+
+    result = core.reroute_launch_identity(
+        task_id,
+        from_runner="glm_5.3",
+        to_runner="deepseek_v4-pro",
+        to_adapter_id="deepseek_vscode_lm",
+        to_model="deepseek-v4-pro",
+    )
+
+    assert result["ok"] is False
+    assert "reroute_manager_rejection_identity_mismatch" in result["stderr"]
+
+
 @pytest.mark.parametrize(
     ("mutation", "expected_error"),
     [
