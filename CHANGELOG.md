@@ -6,6 +6,44 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.26] - 2026-09-11
+
+### Fixed
+
+- `record_launch_blocker` tolerates an unready/absent storage manifest instead
+  of letting `StorageNotReadyError` mask the real launch-rejection reason,
+  restoring 6 tests broken by the prior release's storage fail-closed change.
+- Workforce catalog rows carry explicit `manager`, `implementation_worker`,
+  and `reviewer` booleans with tested safe defaults for legacy rows; `codex`
+  and `codex_gpt*` routes are always forced manager-only regardless of
+  declared values.
+- The AppContainer-supervisor-identity launch seam and its `sys.platform`
+  dependency are now declared in both the launch-isolation seam registry and
+  the OS-dependency boundary baseline, closing a gap left by the prior
+  release.
+
+### Added
+
+- Research: a provenance-pinned Ponytail adoption contract extending the
+  universal-development-skills artifact (upstream `DietrichGebert/ponytail`,
+  MIT), ranking the minimal-solution ladder and related concepts against the
+  existing skill registry, recipes, and semantic-edit evidence.
+
+### Known issues
+
+- Four pre-existing regressions remain open and are not fixed in this
+  release: automatic quality-review launch failing to complete the
+  correctness/security chain for two related cards, a toolchain-cache
+  finalization receipt check, MCP stdio server write-gate visibility with no
+  `ALLOW_WRITES` set, and `server.main()`'s Source Graph bootstrap ordering.
+  Tracked as NF-2026-00796 (clusters C/D/G) and NF-2026-00798 (recovery
+  lineage fail-closed gap).
+
+### Validation
+
+- Full suite: 10,188 passed, 7 failed (the four pre-existing issues above),
+  45 skipped.
+
 ## [0.11.25] - 2026-09-10
 
 ### Fixed

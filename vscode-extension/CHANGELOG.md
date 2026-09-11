@@ -1,5 +1,34 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.26 — 2026-09-11
+
+### Fixed
+
+- `record_launch_blocker` tolerates an unready/absent storage manifest
+  instead of a fail-closed storage error masking the real launch-rejection
+  reason.
+- Workforce catalog rows now carry explicit manager/implementation-worker/
+  reviewer role booleans with safe legacy defaults; Codex routes are always
+  manager-only.
+- The AppContainer-supervisor-identity launch seam and its platform
+  dependency are declared in both governance gates that track this.
+
+### Added
+
+- Research: a provenance-pinned Ponytail adoption contract added to the
+  universal-development-skills artifact.
+
+### Known issues
+
+- Four pre-existing regressions remain open (tracked as NF-2026-00796 and
+  NF-2026-00798): automatic quality-review launch, a toolchain-cache
+  finalization check, MCP write-gate visibility, and Source Graph bootstrap
+  ordering in `server.main()`.
+
+### Validation
+
+- Full suite: 10,188 passed, 7 failed (the known issues above), 45 skipped.
+
 ## 0.11.25 — 2026-09-10
 
 ### Fixed
