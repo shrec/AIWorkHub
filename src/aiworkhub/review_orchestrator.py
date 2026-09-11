@@ -1860,9 +1860,17 @@ class ReviewOrchestrator:
         evidence = terminal.get("evidence") if isinstance(terminal, Mapping) else None
         event_receipt = event.get("quality_review_receipt")
         card_receipt = evidence.get("quality_review_receipt") if isinstance(evidence, Mapping) else None
-        if not isinstance(event_receipt, Mapping) or event_receipt != card_receipt:
+        if not isinstance(card_receipt, Mapping):
+            raise RuntimeError("reviewer_terminal_receipt_missing")
+        # The task card is the durable terminal authority.  Process events may
+        # omit the receipt (the live VS Code LM finalizer does), but when an
+        # event copy is present it must still agree byte-for-byte with the
+        # card's sealed evidence.
+        if event_receipt is not None and (
+            not isinstance(event_receipt, Mapping) or event_receipt != card_receipt
+        ):
             raise RuntimeError("reviewer_terminal_receipt_mismatch")
-        receipt = json.loads(json.dumps(event_receipt, ensure_ascii=False))
+        receipt = json.loads(json.dumps(card_receipt, ensure_ascii=False))
         target, reviewer, report, authority = (
             receipt.get("target"), receipt.get("reviewer"),
             receipt.get("report"), receipt.get("authority"),

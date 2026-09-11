@@ -437,6 +437,19 @@ def test_terminal_receipt_card_event_mismatch_fails_closed(tmp_path: Path) -> No
         )
 
 
+def test_terminal_receipt_uses_durable_card_when_process_event_omits_copy(
+    tmp_path: Path,
+) -> None:
+    driver, chain = _receipt_chain(tmp_path)
+    status = _review_status()
+    expected = status["task_card"]["terminal_review"]["evidence"][
+        "quality_review_receipt"
+    ]
+    status["latest_event"].pop("quality_review_receipt")
+
+    assert _verify_receipt(driver, chain, status) == expected
+
+
 def _receipt_chain(tmp_path: Path) -> tuple[object, object]:
     manager = _Manager(tmp_path)
     driver = review_orchestrator.ReviewOrchestrator(
