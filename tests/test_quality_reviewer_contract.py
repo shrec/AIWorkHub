@@ -684,6 +684,21 @@ def test_target_acceptance_reuses_canonically_accepted_reviewer_receipt() -> Non
     assert reconstructed.as_metadata() == workspace_metadata
 
 
+def test_target_acceptance_reuses_archived_accepted_reviewer_receipt() -> None:
+    latest, card = _accepted_reviewer_state()
+    card["archived_at"] = "2026-08-10T00:01:00Z"
+
+    verified = process_launcher._verified_accepted_quality_review_receipt(
+        latest,
+        card,
+        "review-request-1",
+        "target-request-1",
+        "TARGET_TASK_1",
+    )
+
+    assert verified == latest["quality_review_receipt"]
+
+
 def test_accepted_reviewer_receipt_must_match_all_durable_copies() -> None:
     latest, card = _accepted_reviewer_state()
     card["accept_evidence"]["quality_review_receipt"]["report"]["findings"] = [

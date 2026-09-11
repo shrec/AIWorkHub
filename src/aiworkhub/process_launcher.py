@@ -4846,7 +4846,7 @@ def _verified_accepted_quality_review_receipt(
     reviewer_task_id = str(latest.get("task_id") or "")
     if not reviewer_task_id or str(card.get("task_id") or "") != reviewer_task_id:
         raise WorkspaceError("quality_reviewer_accepted_task_identity_mismatch")
-    if _canonical_task_status(card) != "finished":
+    if _canonical_task_status(card) not in {"finished", "archived"}:
         raise WorkspaceError("quality_reviewer_accepted_task_not_finished")
     if str(card.get("accepted_request_id") or "") != reviewer_request_id:
         raise WorkspaceError("quality_reviewer_accepted_request_mismatch")
