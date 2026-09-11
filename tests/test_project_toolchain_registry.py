@@ -393,3 +393,125 @@ def test_committed_registry_is_portable() -> None:
     assert payload["schema_id"] == toolchain_authority.REGISTRY_SCHEMA_ID
     assert not any(part in encoded for part in (str(Path.home()), os.getcwd()))
     assert "/home/" not in encoded
+
+
+def test_cache_identity_ignores_set_order_but_tracks_contract_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_registry(tmp_path, _registry())
+
+    from aiworkhub import worker_workspace
+
+    monkeypatch.setattr(
+        worker_workspace,
+        "_normalize_trusted_validation_executable_argv_with_roots",
+        lambda argv, _repo: ([sys.executable, *argv[1:]], ()),
+    )
+    authority = toolchain_authority.ToolchainAuthority(
+        tmp_path, capability_probe=lambda _repo, _card: ()
+    )
+
+    first = authority.evaluate(
+        {
+            "validation": ["python -m pytest -q"],
+            "read_first": ["a.py", "b.py"],
+            "immutable_inputs": ["c.py", "d.py"],
+            "allowed_writes": ["out/one.txt", "out/two.txt"],
+            "required_outputs": ["out/one.txt", "out/two.txt"],
+        }
+    )
+    reordered = authority.evaluate(
+        {
+            "validation": ["python -m pytest -q"],
+            "read_first": ["b.py", "a.py"],
+            "immutable_inputs": ["d.py", "c.py"],
+            "allowed_writes": ["out/two.txt", "out/one.txt"],
+            "required_outputs": ["out/two.txt", "out/one.txt"],
+        }
+    )
+    changed_read_first = authority.evaluate(
+        {
+            "validation": ["python -m pytest -q"],
+            "read_first": ["a.py"],
+            "immutable_inputs": ["c.py", "d.py"],
+            "allowed_writes": ["out/one.txt", "out/two.txt"],
+            "required_outputs": ["out/one.txt", "out/two.txt"],
+        }
+    )
+    changed_allowed_writes = authority.evaluate(
+        {
+            "validation": ["python -m pytest -q"],
+            "read_first": ["a.py", "b.py"],
+            "immutable_inputs": ["c.py", "d.py"],
+            "allowed_writes": ["out/one.txt"],
+            "required_outputs": ["out/one.txt", "out/two.txt"],
+        }
+    )
+
+    assert reordered.cache_identity == first.cache_identity
+    assert changed_read_first.cache_identity != first.cache_identity
+    assert changed_allowed_writes.cache_identity != first.cache_identity
+
+
+def test_stale_failed_snapshot_not_reused_for_corrected_card_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_registry(tmp_path, _registry())
+    (tmp_path / "present.txt").write_text("ok", encoding="utf-8")
+
+    from aiworkhub import worker_workspace
+
+    monkeypatch.setattr(
+        worker_workspace,
+        "_normalize_trusted_validation_executable_argv_with_roots",
+        lambda argv, _repo: ([sys.executable, *argv[1:]], ()),
+    )
+
+    def probe(repo: Path, card: dict[str, object]) -> tuple[str, ...]:
+        missing = []
+        for relative in card.get("read_first") or ():
+            if not (repo / str(relative)).is_file():
+                missing.append(f"repository_input:{relative}")
+        return tuple(missing)
+
+    authority = toolchain_authority.ToolchainAuthority(tmp_path, capability_probe=probe)
+
+    first = authority.evaluate(
+        {"validation": ["python -m pytest -q"], "read_first": ["missing.txt"]}
+    )
+    assert not first.available
+
+    second = authority.evaluate(
+        {
+            "validation": ["python -m pytest -q"],
+            "read_first": ["present.txt"],
+            "allowed_writes": ["out.txt"],
+        }
+    )
+
+    assert second.available
+    assert second.cache_identity != first.cache_identity
+
+
+def test_persisted_snapshot_requires_matching_card_contract_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_registry(tmp_path, _registry())
+    from aiworkhub import worker_workspace
+
+    monkeypatch.setattr(
+        worker_workspace,
+        "_normalize_trusted_validation_executable_argv_with_roots",
+        lambda argv, _repo: ([sys.executable, *argv[1:]], ()),
+    )
+    first_authority = toolchain_authority.ToolchainAuthority(
+        tmp_path, capability_probe=lambda _repo, _card: ()
+    )
+    first = first_authority.evaluate({"validation": [], "read_first": ["a.py"]})
+    assert first_authority.repair(first)
+
+    second = toolchain_authority.ToolchainAuthority(
+        tmp_path, capability_probe=lambda _repo, _card: ()
+    ).evaluate({"validation": [], "read_first": ["b.py"]})
+
+    assert second.cache_identity != first.cache_identity

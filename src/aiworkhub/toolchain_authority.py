@@ -712,12 +712,24 @@ class ToolchainAuthority:
 
     @staticmethod
     def _dynamic_requirements_digest(card: Mapping[str, Any]) -> str:
-        commands = tuple(
-            command.strip()
-            for command in card.get("validation") or ()
-            if isinstance(command, str) and command.strip()
-        )
-        encoded = json.dumps(commands, sort_keys=True, separators=(",", ":")).encode()
+        def _ordered(field: str) -> tuple[str, ...]:
+            return tuple(
+                value.strip()
+                for value in (card.get(field) or ())
+                if isinstance(value, str) and value.strip()
+            )
+
+        def _unordered(field: str) -> tuple[str, ...]:
+            return tuple(sorted(set(_ordered(field))))
+
+        contract = {
+            "validation": _ordered("validation"),
+            "read_first": _unordered("read_first"),
+            "immutable_inputs": _unordered("immutable_inputs"),
+            "allowed_writes": _unordered("allowed_writes"),
+            "required_outputs": _unordered("required_outputs"),
+        }
+        encoded = json.dumps(contract, sort_keys=True, separators=(",", ":")).encode()
         return hashlib.sha256(encoded).hexdigest()
 
     def _cache_identity(
