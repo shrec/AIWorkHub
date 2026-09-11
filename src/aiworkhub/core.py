@@ -6890,6 +6890,169 @@ def _has_retained_candidate_delta(card: Mapping[str, Any]) -> bool:
     return isinstance(changed, dict) and bool(changed)
 
 
+def _latest_operational_recovery_projection(
+    card: Mapping[str, Any], *, task_id: str
+) -> dict[str, Any] | None:
+    """Authenticate the latest operational terminal/recovery lineage.
+
+    The live NF780 card does NOT retain ``terminal_failure`` after a second
+    recover-blocked-rework: the projection is dropped while ``recovery_epoch``
+    and ``recovery_predecessor`` remain.  The exact operational episode that
+    advanced the claim epoch therefore has to be re-derived from canonical
+    task events, bound to this exact task, the latest launch request and the
+    recovery epoch.  Missing, stale, cross-task, cross-request, non-sequential
+    or tampered evidence yields ``None`` and the caller fails closed.
+    """
+    recovery = card.get("recovery_predecessor")
+    recovery_epoch = card.get("recovery_epoch")
+    current_claim_epoch = card.get("claim_epoch")
+    latest_request_id = str(card.get("launch_request_id") or "").strip()
+    if (
+        not isinstance(recovery, dict)
+        or type(recovery_epoch) is not int
+        or type(current_claim_epoch) is not int
+        or recovery_epoch != current_claim_epoch
+        or re.fullmatch(r"[0-9a-f]{32}", latest_request_id) is None
+        or str(recovery.get("task_id") or task_id) != task_id
+    ):
+        return None
+
+    inline = card.get("terminal_failure")
+    if isinstance(inline, dict):
+        evidence = inline.get("evidence")
+        if (
+            str(inline.get("task_id") or task_id) == task_id
+            and inline.get("substatus")
+            in _RETRYABLE_OPERATIONAL_TERMINAL_SUBSTATUSES
+            and isinstance(evidence, dict)
+            and str(evidence.get("request_id") or "").strip() == latest_request_id
+            and type(inline.get("claim_epoch")) is int
+        ):
+            return dict(inline)
+        return None
+
+    persisted = card.get("recovery_terminal_projection")
+    if isinstance(persisted, dict):
+        evidence = persisted.get("evidence")
+        if (
+            persisted.get("schema_id")
+            == "aiworkhub.recovery_terminal_projection.v1"
+            and str(persisted.get("task_id") or "").strip() == task_id
+            and persisted.get("substatus")
+            in _RETRYABLE_OPERATIONAL_TERMINAL_SUBSTATUSES
+            and isinstance(evidence, dict)
+            and str(evidence.get("request_id") or "").strip() == latest_request_id
+            and type(persisted.get("claim_epoch")) is int
+            and persisted.get("claim_epoch") == recovery_epoch - 1
+        ):
+            return dict(persisted)
+        return None
+
+    # No projection is retained on the live card after a second
+    # recover-blocked-rework, so authenticate the EXACT canonical event pair:
+    # the latest operational terminal event for the latest launch request,
+    # immediately followed by the blocked_rework_recovery event that names it
+    # and the same recovery predecessor identity the card carries.  No field is
+    # inferred: an absent, cross-task, cross-request, non-sequential or
+    # tampered pair yields ``None`` and the caller fails closed.
+    try:
+        events = task_store.get_task_events(repo_root(), task_id, limit=200)
+    except Exception:  # pragma: no cover - canonical store unavailable
+        return None
+    if not events:
+        return None
+    # get_task_events is a newest-first audit feed.  The matcher below is a
+    # forward state machine (terminal episode, then its recovery), so make
+    # that ordering explicit instead of relying on test fixture order.
+    events = list(reversed(events))
+
+    recovery_request_id = str(recovery.get("request_id") or "").strip()
+    recovery_terminal_epoch = recovery.get("terminal_claim_epoch")
+    if (
+        re.fullmatch(r"[0-9a-f]{32}", recovery_request_id) is None
+        or type(recovery_terminal_epoch) is not int
+    ):
+        return None
+
+    pending_terminal: dict[str, Any] | None = None
+    authenticated: dict[str, Any] | None = None
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        raw_payload = event.get("payload")
+        try:
+            payload = (
+                json.loads(raw_payload)
+                if isinstance(raw_payload, str)
+                else raw_payload
+            )
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if str(event.get("task_id") or task_id) != task_id:
+            continue
+        if str(payload.get("task_id") or task_id) != task_id:
+            continue
+        name = str(event.get("event") or "").strip()
+        if name in _RETRYABLE_OPERATIONAL_TERMINAL_SUBSTATUSES:
+            event_request_id = str(payload.get("request_id") or "").strip()
+            if re.fullmatch(r"[0-9a-f]{32}", event_request_id) is None:
+                pending_terminal = None
+                continue
+            pending_terminal = {
+                "substatus": name,
+                "request_id": event_request_id,
+                "payload": payload,
+            }
+            continue
+        if name != "blocked_rework_recovery":
+            continue
+        prior_episode = payload.get("prior_episode")
+        predecessor = payload.get("predecessor")
+        event_epoch = payload.get("claim_epoch")
+        authenticated = None
+        if (
+            pending_terminal is None
+            or not isinstance(prior_episode, dict)
+            or not isinstance(predecessor, dict)
+            or type(event_epoch) is not int
+            or event_epoch != recovery_epoch
+            or str(prior_episode.get("terminal_substatus") or "").strip()
+            != pending_terminal["substatus"]
+            or pending_terminal["request_id"] != latest_request_id
+            or str(predecessor.get("request_id") or "").strip()
+            != recovery_request_id
+            or predecessor.get("terminal_claim_epoch") != recovery_terminal_epoch
+        ):
+            pending_terminal = None
+            continue
+        terminal_payload = pending_terminal["payload"]
+        assert isinstance(terminal_payload, dict)
+        authenticated = {
+            "schema_id": "aiworkhub.recovery_terminal_projection.v1",
+            "task_id": task_id,
+            "request_id": latest_request_id,
+            "claim_epoch": recovery_epoch - 1,
+            "substatus": pending_terminal["substatus"],
+            "evidence": {
+                "request_id": latest_request_id,
+                "reason": str(terminal_payload.get("reason") or ""),
+                "recorded_at": str(terminal_payload.get("recorded_at") or ""),
+                "runner": str(terminal_payload.get("runner") or ""),
+                "transition": str(terminal_payload.get("transition") or ""),
+                "worker_status": str(terminal_payload.get("worker_status") or ""),
+            },
+            "source": "canonical_task_event_pair",
+        }
+        pending_terminal = None
+    if pending_terminal is not None:
+        # A terminal episode after the latest recovery: the recovery lineage is
+        # no longer the latest one on this card.
+        return None
+    return authenticated
+
+
 def _verified_manager_rejection_receipt(
     card: Mapping[str, Any], *, task_id: str
 ) -> tuple[dict[str, Any] | None, str | None]:
@@ -6915,35 +7078,86 @@ def _verified_manager_rejection_receipt(
     current_claim_epoch = card.get("claim_epoch")
     recovery = card.get("recovery_predecessor")
     recovery_epoch = card.get("recovery_epoch")
-    terminal_failure = card.get("terminal_failure")
+    terminal_failure = _latest_operational_recovery_projection(card, task_id=task_id)
     terminal_evidence = (
         terminal_failure.get("evidence")
         if isinstance(terminal_failure, dict)
         else None
     )
-    recovery_rebind = (
+    latest_request_id = str(card.get("launch_request_id") or "").strip()
+    recovery_request_id = (
+        str(recovery.get("request_id") or "").strip()
+        if isinstance(recovery, dict)
+        else ""
+    )
+    recovery_terminal_epoch = (
+        recovery.get("terminal_claim_epoch")
+        if isinstance(recovery, dict)
+        else None
+    )
+    terminal_epoch = (
+        terminal_failure.get("claim_epoch")
+        if isinstance(terminal_failure, dict)
+        else None
+    )
+    # The recovery lineage that may explain a claim epoch later than the sealed
+    # rejection.  Every identity below is exact: the recovery must be the LATEST
+    # one on the card, it must sit immediately after the recovered terminal
+    # episode, that episode must be operational and bound to the latest launch
+    # request, and the retained candidate delta must be preserved byte-identical.
+    recovery_lineage_valid = (
         type(claim_epoch) is int
         and isinstance(recovery, dict)
         and type(recovery_epoch) is int
         and type(current_claim_epoch) is int
+        and type(terminal_epoch) is int
+        and type(recovery_terminal_epoch) is int
         and recovery_epoch == current_claim_epoch
         and recovery_epoch > claim_epoch
+        and terminal_epoch == recovery_epoch - 1
+        and terminal_epoch >= claim_epoch
         and str(card.get("recovered_by") or "").strip()
         == _verified_manager_actor()
         and bool(str(card.get("recovered_from_blocked_at") or "").strip())
-        and str(recovery.get("request_id") or "").strip() == request_id
-        and recovery.get("terminal_claim_epoch") == claim_epoch
-        and recovery.get("changed_path_hashes")
-        == predecessor.get("changed_path_hashes")
         and isinstance(terminal_failure, dict)
-        and type(terminal_failure.get("claim_epoch")) is int
-        and terminal_failure.get("claim_epoch") == recovery_epoch - 1
+        and str(terminal_failure.get("task_id") or task_id) == task_id
+        and str(recovery.get("task_id") or task_id) == task_id
         and terminal_failure.get("substatus")
         in _RETRYABLE_OPERATIONAL_TERMINAL_SUBSTATUSES
         and isinstance(terminal_evidence, dict)
+        and re.fullmatch(r"[0-9a-f]{32}", latest_request_id) is not None
         and str(terminal_evidence.get("request_id") or "").strip()
-        == str(card.get("launch_request_id") or "").strip()
+        == latest_request_id
     )
+    # Direct rebind: the recovered episode IS the sealed rejected predecessor.
+    direct_rebind = (
+        recovery_lineage_valid
+        and recovery_request_id == request_id
+        and recovery_terminal_epoch == claim_epoch
+        and recovery.get("changed_path_hashes")
+        == predecessor.get("changed_path_hashes")
+    )
+    # Sequential rebind (NF780): a later operational failure of the latest launch
+    # was itself recovered, advancing the claim epoch while the sealed
+    # manager-rejected predecessor and its retained delta remain valid.  On the
+    # live card the recovery predecessor still points at the sealed rejected
+    # request at its own terminal epoch, so bind to that identity exactly.
+    sequential_rebind = (
+        recovery_lineage_valid
+        and recovery_request_id == request_id
+        and latest_request_id != request_id
+        and type(recovery_terminal_epoch) is int
+        and recovery_terminal_epoch == claim_epoch
+        and terminal_epoch > recovery_terminal_epoch
+        and str(terminal_failure.get("request_id") or latest_request_id)
+        == latest_request_id
+        and (
+            recovery.get("changed_path_hashes") is None
+            or recovery.get("changed_path_hashes")
+            == predecessor.get("changed_path_hashes")
+        )
+    )
+    recovery_rebind = direct_rebind or sequential_rebind
     if (
         rejection.get("schema_id") != "aiworkhub.rejection_disposition.v1"
         or rejection.get("to") != "pending"

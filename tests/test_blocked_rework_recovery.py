@@ -1512,3 +1512,398 @@ def test_validation_only_replay_rejects_terminal_failure_claim_epoch_mismatch(
     card = _get_card(repo, task_id)
     assert card["status"] == "blocked"
     assert "validation_only_replay_authorization" not in card
+
+
+_NF780_TASK_ID = "NF780_RETAINED_REWORK_REROUTE_RECOVERY"
+_NF780_PREDECESSOR_REQUEST = "a" * 32
+_NF780_LATEST_REQUEST = "f" * 32
+_NF780_HASHES = {"out/result.json": "c" * 64}
+
+
+def _nf780_card(**overrides: object) -> dict:
+    """Card shape copied from the live NF780 sequential recovery lineage.
+
+    The sealed rejection and its retained predecessor sit at claim epoch 3, a
+    LATER operational ``launch_failed`` of the latest launch request was
+    recovered by the manager at epoch 5, and no ``terminal_failure`` projection
+    is retained on the card.
+    """
+    instruction = "repair the rejected candidate through another provider"
+    pinned_at = "2026-08-03T00:01:00+00:00"
+    card = {
+        "allowed_writes": ["out/result.json"],
+        "claim_epoch": 5,
+        "launch_request_id": _NF780_LATEST_REQUEST,
+        "recovered_by": "codex",
+        "recovered_from_blocked_at": "2026-08-03T00:02:00+00:00",
+        "recovery_epoch": 5,
+        "recovery_predecessor": {
+            "task_id": _NF780_TASK_ID,
+            "request_id": _NF780_PREDECESSOR_REQUEST,
+            "terminal_claim_epoch": 3,
+        },
+        "rejection_disposition": {
+            "schema_id": "aiworkhub.rejection_disposition.v1",
+            "failure_category": "candidate_code",
+            "request_id": _NF780_PREDECESSOR_REQUEST,
+            "to": "pending",
+            "pinned_at": pinned_at,
+        },
+        "review_feedback": {
+            "schema_id": "aiworkhub.rework_feedback_delta.v1",
+            "instruction": instruction,
+            "reason_identity": {
+                "bytes": len(instruction.encode("utf-8")),
+                "sha256": hashlib.sha256(instruction.encode("utf-8")).hexdigest(),
+                "truncated": False,
+            },
+            "predecessor_request_id": _NF780_PREDECESSOR_REQUEST,
+            "predecessor_changed_paths": sorted(_NF780_HASHES),
+            "residual_identities": [],
+        },
+        "rework_predecessor": {
+            "schema_id": "aiworkhub.rework_predecessor.v1",
+            "task_id": _NF780_TASK_ID,
+            "request_id": _NF780_PREDECESSOR_REQUEST,
+            "claim_epoch": 3,
+            "pinned_at": pinned_at,
+            "changed_path_hashes": dict(_NF780_HASHES),
+        },
+    }
+    card.update(overrides)
+    return card
+
+
+def _nf780_launch_failed_event(
+    *, task_id: str = _NF780_TASK_ID, request_id: str = _NF780_LATEST_REQUEST
+) -> dict:
+    """Exact live operational event: no substatus/claim_epoch/evidence fields."""
+    return {
+        "event": "launch_failed",
+        "task_id": task_id,
+        "payload": {
+            "reason": "runner launch returned nonzero",
+            "recorded_at": "2026-08-03T00:01:45+00:00",
+            "request_id": request_id,
+            "runner": "copilot_claude-opus-5",
+            "transition": "in_progress->blocked",
+            "worker_status": "blocked",
+        },
+    }
+
+
+def _nf780_recovery_event(
+    *,
+    task_id: str = _NF780_TASK_ID,
+    claim_epoch: int = 5,
+    terminal_substatus: str = "launch_failed",
+    predecessor_request_id: str = _NF780_PREDECESSOR_REQUEST,
+    predecessor_epoch: int = 3,
+) -> dict:
+    """Exact live manager recovery event following the terminal episode."""
+    return {
+        "event": "blocked_rework_recovery",
+        "task_id": task_id,
+        "payload": {
+            "claim_epoch": claim_epoch,
+            "recorded_at": "2026-08-03T00:02:00+00:00",
+            "prior_episode": {
+                "terminal_substatus": terminal_substatus,
+                "request_id": _NF780_LATEST_REQUEST,
+            },
+            "predecessor": {
+                "request_id": predecessor_request_id,
+                "terminal_claim_epoch": predecessor_epoch,
+            },
+        },
+    }
+
+
+def _nf780_events() -> list:
+    # Match task_store.get_task_events: newest event first.
+    return [_nf780_recovery_event(), _nf780_launch_failed_event()]
+
+
+def _nf780_authorize(
+    monkeypatch: pytest.MonkeyPatch, card: dict, events: list | None = None
+) -> tuple:
+    from aiworkhub import core
+
+    monkeypatch.setattr(core, "_verified_manager_actor", lambda: "codex")
+    monkeypatch.setattr(
+        core,
+        "_verified_retained_predecessor_receipt",
+        lambda _card, *, task_id: (
+            {
+                "retained_candidate_preserved": True,
+                "retained_predecessor_request_id": _NF780_PREDECESSOR_REQUEST,
+                "retained_predecessor_sha256": "d" * 64,
+                "retained_base_oid": "b" * 40,
+                "retained_claim_epoch": 3,
+                "retained_changed_path_count": len(_NF780_HASHES),
+            },
+            None,
+        ),
+    )
+    resolved = _nf780_events() if events is None else events
+    monkeypatch.setattr(
+        core.task_store,
+        "get_task_events",
+        lambda _root, _task_id, limit=200: list(resolved),
+    )
+    return core._verified_manager_rejection_receipt(card, task_id=_NF780_TASK_ID)
+
+
+def test_nf780_sequential_recovery_authorizes_retained_rework_reroute(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    receipt, error = _nf780_authorize(monkeypatch, _nf780_card())
+
+    assert error is None
+    assert receipt is not None
+    assert receipt["request_id"] == _NF780_PREDECESSOR_REQUEST
+    assert receipt["claim_epoch"] == 3
+    # Retained candidate delta identity is preserved across the reroute.
+    assert receipt["retained_predecessor_sha256"] == "d" * 64
+    rebind = receipt["recovery_rebind"]
+    assert rebind["recovery_epoch"] == 5
+    assert len(rebind["recovery_predecessor_sha256"]) == 64
+    assert len(rebind["terminal_failure_sha256"]) == 64
+
+
+def test_nf780_json_encoded_event_payloads_are_authenticated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events = []
+    for event in _nf780_events():
+        encoded = dict(event)
+        encoded["payload"] = json.dumps(event["payload"])
+        events.append(encoded)
+
+    receipt, error = _nf780_authorize(monkeypatch, _nf780_card(), events)
+
+    assert error is None
+    assert receipt is not None
+
+
+@pytest.mark.parametrize(
+    "events",
+    [
+        pytest.param([], id="no_events"),
+        pytest.param([_nf780_launch_failed_event()], id="recovery_missing"),
+        pytest.param([_nf780_recovery_event()], id="terminal_missing"),
+        pytest.param(
+            [_nf780_launch_failed_event(), _nf780_recovery_event()],
+            id="non_sequential_order",
+        ),
+        pytest.param(
+            [_nf780_launch_failed_event()] + _nf780_events(),
+            id="terminal_after_latest_recovery",
+        ),
+        pytest.param(
+            [
+                _nf780_recovery_event(task_id="other-task"),
+                _nf780_launch_failed_event(task_id="other-task"),
+            ],
+            id="cross_task",
+        ),
+        pytest.param(
+            [
+                _nf780_recovery_event(),
+                _nf780_launch_failed_event(request_id="a" * 32),
+            ],
+            id="cross_request",
+        ),
+        pytest.param(
+            [
+                _nf780_recovery_event(predecessor_request_id="c" * 32),
+                _nf780_launch_failed_event(),
+            ],
+            id="tampered_predecessor_request",
+        ),
+        pytest.param(
+            [
+                _nf780_recovery_event(predecessor_epoch=4),
+                _nf780_launch_failed_event(),
+            ],
+            id="tampered_predecessor_epoch",
+        ),
+        pytest.param(
+            [_nf780_recovery_event(claim_epoch=6), _nf780_launch_failed_event()],
+            id="stale_recovery_epoch",
+        ),
+        pytest.param(
+            [
+                _nf780_recovery_event(terminal_substatus="worker_failed"),
+                _nf780_launch_failed_event(),
+            ],
+            id="terminal_substatus_mismatch",
+        ),
+    ],
+)
+def test_nf780_recovery_authorization_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, events: list
+) -> None:
+    receipt, error = _nf780_authorize(monkeypatch, _nf780_card(), events)
+
+    assert receipt is None
+    assert error == "reroute_manager_rejection_identity_mismatch"
+
+
+def test_nf780_direct_recovery_rebind_authorizes_reroute(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    card = _nf780_card(
+        claim_epoch=4,
+        recovery_epoch=4,
+        recovery_predecessor={
+            "task_id": _NF780_TASK_ID,
+            "request_id": _NF780_PREDECESSOR_REQUEST,
+            "terminal_claim_epoch": 3,
+            "changed_path_hashes": dict(_NF780_HASHES),
+        },
+        terminal_failure={
+            "task_id": _NF780_TASK_ID,
+            "request_id": _NF780_LATEST_REQUEST,
+            "claim_epoch": 3,
+            "substatus": "worker_failed",
+            "evidence": {"request_id": _NF780_LATEST_REQUEST},
+        },
+    )
+
+    receipt, error = _nf780_authorize(monkeypatch, card)
+
+    assert error is None
+    assert receipt is not None
+    assert receipt["recovery_rebind"]["recovery_epoch"] == 4
+
+
+def test_nf780_exact_epoch_rejection_without_recovery_authorizes_reroute(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    card = _nf780_card(claim_epoch=3)
+    for key in (
+        "recovery_epoch",
+        "recovery_predecessor",
+        "terminal_failure",
+        "recovered_by",
+        "recovered_from_blocked_at",
+    ):
+        card.pop(key, None)
+
+    receipt, error = _nf780_authorize(monkeypatch, card)
+
+    assert error is None
+    assert receipt is not None
+    assert "recovery_rebind" not in receipt
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        pytest.param({"recovery_epoch": 4}, id="stale_recovery_epoch"),
+        pytest.param(
+            {
+                "recovery_predecessor": {
+                    "task_id": "OTHER_TASK",
+                    "request_id": _NF780_LATEST_REQUEST,
+                    "terminal_claim_epoch": 4,
+                    "changed_path_hashes": dict(_NF780_HASHES),
+                }
+            },
+            id="cross_task_recovery",
+        ),
+        pytest.param(
+            {
+                "recovery_predecessor": {
+                    "task_id": _NF780_TASK_ID,
+                    "request_id": "e" * 32,
+                    "terminal_claim_epoch": 4,
+                    "changed_path_hashes": dict(_NF780_HASHES),
+                }
+            },
+            id="cross_request_recovery",
+        ),
+        pytest.param(
+            {
+                "terminal_failure": {
+                    "task_id": _NF780_TASK_ID,
+                    "request_id": _NF780_LATEST_REQUEST,
+                    "claim_epoch": 2,
+                    "substatus": "worker_failed",
+                    "evidence": {"request_id": _NF780_LATEST_REQUEST},
+                }
+            },
+            id="non_sequential_terminal_epoch",
+        ),
+        pytest.param(
+            {
+                "recovery_predecessor": {
+                    "task_id": _NF780_TASK_ID,
+                    "request_id": _NF780_LATEST_REQUEST,
+                    "terminal_claim_epoch": 4,
+                    "changed_path_hashes": {"out/result.json": "9" * 64},
+                }
+            },
+            id="changed_path_hash_tamper",
+        ),
+        pytest.param({"recovered_by": "mallory"}, id="non_manager_recovered_by"),
+        pytest.param({"recovered_from_blocked_at": ""}, id="missing_recovery_timestamp"),
+        pytest.param(
+            {
+                "terminal_failure": {
+                    "task_id": _NF780_TASK_ID,
+                    "request_id": _NF780_LATEST_REQUEST,
+                    "claim_epoch": 4,
+                    "substatus": "worker_failed",
+                }
+            },
+            id="missing_terminal_evidence",
+        ),
+        pytest.param(
+            {
+                "terminal_failure": {
+                    "task_id": _NF780_TASK_ID,
+                    "request_id": _NF780_LATEST_REQUEST,
+                    "claim_epoch": 4,
+                    "substatus": "worker_failed",
+                    "evidence": {"request_id": "e" * 32},
+                }
+            },
+            id="terminal_evidence_request_mismatch",
+        ),
+        pytest.param(
+            {
+                "terminal_failure": {
+                    "task_id": _NF780_TASK_ID,
+                    "request_id": _NF780_LATEST_REQUEST,
+                    "claim_epoch": 4,
+                    "substatus": "validation_failed",
+                    "evidence": {"request_id": _NF780_LATEST_REQUEST},
+                }
+            },
+            id="non_operational_terminal_substatus",
+        ),
+        pytest.param({"launch_request_id": "not-a-request-id"}, id="invalid_launch_request"),
+    ],
+)
+def test_nf780_invalid_recovery_lineage_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, overrides: dict,
+) -> None:
+    receipt, error = _nf780_authorize(monkeypatch, _nf780_card(**overrides))
+
+    assert receipt is None
+    assert error == "reroute_manager_rejection_identity_mismatch"
+
+
+def test_nf780_advanced_claim_epoch_without_recovery_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    card = _nf780_card()
+    card.pop("recovery_predecessor")
+    card.pop("recovery_epoch")
+
+    receipt, error = _nf780_authorize(monkeypatch, card)
+
+    assert receipt is None
+    assert error == "reroute_manager_rejection_identity_mismatch"
