@@ -1158,6 +1158,31 @@ def test_reject_review_predecessor_wrong_repo_fails_closed(tmp_path: Path) -> No
     assert error == "predecessor_request_id_repo_mismatch"
 
 
+def test_record_launch_blocker_tolerates_unready_storage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression for the precheck exception masking a real LaunchRejected."""
+    repo = _repo_with_task(tmp_path, status="pending")
+
+    def _raise_not_ready(*_args: Any, **_kwargs: Any) -> None:
+        raise task_store.StorageNotReadyError("storage not ready")
+
+    monkeypatch.setattr(task_store, "get_task", _raise_not_ready)
+
+    result = task_engine.record_launch_blocker(
+        repo,
+        "TASK_B891",
+        "codex_worker_b891",
+        "task_mcp",
+        adapter_id="adapter-x",
+        reason="boom",
+    )
+
+    assert isinstance(result, dict)
+    assert result["command"] == ["launch-blocked", "TASK_B891", "--runner", "codex_worker_b891"]
+    assert isinstance(result["ok"], bool)
+
+
 def test_reject_review_predecessor_claim_epoch_mismatch_fails_closed(tmp_path: Path) -> None:
     card = _validation_failed_card(tmp_path, claim_epoch=2)
     card["claim_epoch"] = 4

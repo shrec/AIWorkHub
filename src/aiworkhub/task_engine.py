@@ -326,7 +326,10 @@ def record_launch_blocker(
     persisted blocker.
     """
     command = ["launch-blocked", task_id, "--runner", runner]
-    precheck = task_store.get_task(repo, task_id) or {}
+    try:
+        precheck = task_store.get_task(repo, task_id) or {}
+    except task_store.StorageNotReadyError:
+        precheck = {}
     if (
         precheck.get("runner") == runner
         and str(precheck.get("topic") or "") == topic
