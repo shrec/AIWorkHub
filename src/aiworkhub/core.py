@@ -6920,16 +6920,25 @@ def _latest_operational_recovery_projection(
     inline = card.get("terminal_failure")
     if isinstance(inline, dict):
         evidence = inline.get("evidence")
+        inline_request_id = (
+            str(evidence.get("request_id") or "").strip()
+            if isinstance(evidence, dict)
+            else ""
+        )
         if (
             str(inline.get("task_id") or task_id) == task_id
             and inline.get("substatus")
             in _RETRYABLE_OPERATIONAL_TERMINAL_SUBSTATUSES
             and isinstance(evidence, dict)
-            and str(evidence.get("request_id") or "").strip() == latest_request_id
+            and re.fullmatch(r"[0-9a-f]{32}", inline_request_id) is not None
             and type(inline.get("claim_epoch")) is int
         ):
-            return dict(inline)
-        return None
+            if inline_request_id == latest_request_id:
+                return dict(inline)
+            # A recovered card may retain an older valid terminal projection.
+            # Authenticate the latest episode from the canonical event pair.
+        else:
+            return None
 
     persisted = card.get("recovery_terminal_projection")
     if isinstance(persisted, dict):

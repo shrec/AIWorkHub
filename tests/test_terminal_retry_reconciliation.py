@@ -749,6 +749,71 @@ def test_reroute_launch_identity_allows_exact_recovered_rework_epoch(
     assert len(rebind["terminal_failure_sha256"]) == 64
 
 
+def test_latest_recovery_projection_ignores_stale_valid_inline_terminal(
+    coordinator_repo: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = "REROUTE_AFTER_SECOND_MECHANICAL_FAILURE"
+    latest_request_id = "f" * 32
+    recovery_epoch = 3
+    card = {
+        "task_id": task_id,
+        "claim_epoch": recovery_epoch,
+        "launch_request_id": latest_request_id,
+        "recovery_epoch": recovery_epoch,
+        "recovery_predecessor": {
+            "task_id": task_id,
+            "request_id": "a" * 32,
+            "terminal_claim_epoch": 1,
+        },
+        "terminal_failure": {
+            "claim_epoch": 1,
+            "substatus": "worker_failed",
+            "evidence": {"request_id": "e" * 32},
+        },
+    }
+    terminal_event = {
+        "task_id": task_id,
+        "event": "launch_failed",
+        "payload": {
+            "task_id": task_id,
+            "request_id": latest_request_id,
+            "reason": "subscription refresh required",
+            "recorded_at": "2026-08-03T00:02:00+00:00",
+            "runner": "claude_opus-5",
+            "transition": "processing_to_blocked",
+            "worker_status": "launch_failed",
+        },
+    }
+    recovery_event = {
+        "task_id": task_id,
+        "event": "blocked_rework_recovery",
+        "payload": {
+            "task_id": task_id,
+            "claim_epoch": recovery_epoch,
+            "prior_episode": {"terminal_substatus": "launch_failed"},
+            "predecessor": {
+                "request_id": "a" * 32,
+                "terminal_claim_epoch": 1,
+            },
+        },
+    }
+    monkeypatch.setattr(
+        task_store,
+        "get_task_events",
+        lambda _repo, _task_id, *, limit: [recovery_event, terminal_event],
+    )
+
+    projection = core._latest_operational_recovery_projection(
+        card, task_id=task_id
+    )
+
+    assert projection is not None
+    assert projection["source"] == "canonical_task_event_pair"
+    assert projection["request_id"] == latest_request_id
+    assert projection["claim_epoch"] == recovery_epoch - 1
+    assert projection["substatus"] == "launch_failed"
+
+
 @pytest.mark.parametrize(
     ("mutation", "value"),
     [
