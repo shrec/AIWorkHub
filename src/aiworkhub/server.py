@@ -4190,6 +4190,12 @@ def _start_task_reconciler_safely(root: Path) -> None:
     miss the client's request deadline.  Failure stays diagnosable through the
     reconciler's own health surface and the next reload retries registration.
     """
+    # Every MCP client gets its own server process, but only a write-enabled
+    # manager process can drive the reconciler's task/reviewer transitions.
+    # A read-only dashboard child must not take the repository-wide owner lock
+    # and then fail every system-owned review action at the write gate.
+    if not core.writes_allowed():
+        return
     try:
         task_reconciler.ensure_started(root)
     except Exception as exc:  # noqa: BLE001 -- MCP must stay available

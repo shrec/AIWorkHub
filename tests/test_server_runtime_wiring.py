@@ -125,6 +125,32 @@ def test_runtime_tools_delegate_to_single_manager(monkeypatch):
     ]
 
 
+def test_read_only_mcp_does_not_take_task_reconciler_ownership(
+    tmp_path, monkeypatch
+):
+    starts = []
+    monkeypatch.setattr(core, "writes_allowed", lambda: False)
+    monkeypatch.setattr(
+        server.task_reconciler, "ensure_started", lambda root: starts.append(root)
+    )
+
+    server._start_task_reconciler_safely(tmp_path)
+
+    assert starts == []
+
+
+def test_write_enabled_mcp_starts_task_reconciler(tmp_path, monkeypatch):
+    starts = []
+    monkeypatch.setattr(core, "writes_allowed", lambda: True)
+    monkeypatch.setattr(
+        server.task_reconciler, "ensure_started", lambda root: starts.append(root)
+    )
+
+    server._start_task_reconciler_safely(tmp_path)
+
+    assert starts == [tmp_path]
+
+
 def test_launch_rebinds_stale_validation_replay_once(monkeypatch):
     fake = _FakeManager()
     launch_results = iter(
