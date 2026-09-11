@@ -244,6 +244,15 @@ _VALIDATION_WORKER_PACKAGE_SUPPORT = (
     "src/aiworkhub/runtime_temp.py",
     "src/aiworkhub/validation_runner.py",
 )
+_VALIDATION_QUALITY_SUPPORT = {
+    "tests/test_declared_invariants.py": (
+        ".aiworkhub/config/development_rules.json",
+    ),
+}
+_VALIDATION_QUALITY_BASELINE_SECTIONS = (
+    "single_definition_boundary",
+    "os_dependency_boundary",
+)
 _NPM_SUPPORT_EXCLUDED_DIRS = frozenset(
     {
         "node_modules",
@@ -3729,6 +3738,68 @@ def _legacy_worktree_root() -> Path:
     return (Path(tempfile.gettempdir()) / "aiworkhub-worktrees").resolve()
 
 
+def _validation_quality_support(
+    source_root: Path,
+    test_files: Iterable[str],
+) -> tuple[str, ...]:
+    """Return exact repository-owned artifacts consumed by selected checks."""
+    seeded: set[str] = set()
+    for test_file in test_files:
+        for manifest_relative in _VALIDATION_QUALITY_SUPPORT.get(test_file, ()):
+            manifest_path = source_root / manifest_relative
+            _require_beneath(source_root, manifest_path)
+            if manifest_path.is_symlink() or not manifest_path.is_file():
+                raise WorkspaceError(
+                    f"validation_worker_support_missing:{manifest_relative}"
+                )
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, ValueError) as exc:
+                raise WorkspaceError(
+                    f"validation_worker_support_invalid:{manifest_relative}"
+                ) from exc
+            if not isinstance(manifest, dict):
+                raise WorkspaceError(
+                    f"validation_worker_support_invalid:{manifest_relative}"
+                )
+            seeded.add(manifest_relative)
+            for section_name in _VALIDATION_QUALITY_BASELINE_SECTIONS:
+                section = manifest.get(section_name)
+                if section is None:
+                    continue
+                baseline = section.get("baseline") if isinstance(section, dict) else None
+                if not isinstance(baseline, list):
+                    raise WorkspaceError(
+                        f"validation_worker_support_invalid:{manifest_relative}"
+                    )
+                for entry in baseline:
+                    raw_path = entry.get("path") if isinstance(entry, dict) else None
+                    try:
+                        relative = _relative_repo_path(raw_path)
+                    except (TypeError, WorkspaceError) as exc:
+                        raise WorkspaceError(
+                            f"validation_worker_support_invalid:{manifest_relative}"
+                        ) from exc
+                    if (
+                        not relative.startswith("src/aiworkhub/")
+                        or not relative.endswith(".py")
+                        or any(character in relative for character in "*?[")
+                    ):
+                        raise WorkspaceError(
+                            f"validation_worker_support_invalid:{manifest_relative}"
+                        )
+                    candidate = source_root / relative
+                    _require_beneath(source_root, candidate)
+                    if candidate.is_symlink() or not candidate.is_file():
+                        raise WorkspaceError(
+                            f"validation_worker_support_missing:{relative}"
+                        )
+                    seeded.add(relative)
+                    if len(seeded) > MAX_SEED_FILES:
+                        raise WorkspaceError(f"seed_file_limit_exceeded:{len(seeded)}")
+    return tuple(sorted(seeded))
+
+
 def _declared_workspace_seed_closure(
     source_root: Path,
     card: Mapping[str, Any],
@@ -3770,6 +3841,24 @@ def _declared_workspace_seed_closure(
         )
     if validation_rows:
         test_files = _extract_pytest_test_files(source_root, validation_rows)
+        quality_support = _validation_quality_support(source_root, test_files)
+        support_seeded = tuple(
+            sorted(set(support_seeded) | (set(quality_support) - set(live_seeded)))
+        )
+        if any(
+            relative.startswith("src/aiworkhub/")
+            for relative in (*live_seeded, *quality_support)
+        ):
+            support_seeded = tuple(
+                sorted(
+                    set(support_seeded)
+                    | {
+                        relative
+                        for relative in _VALIDATION_WORKER_PACKAGE_SUPPORT
+                        if relative not in live_seeded
+                    }
+                )
+            )
         seeds_for_python_closure = (*live_seeded, *support_seeded, *test_files)
         python_seeded = _resolve_local_python_imports(
             source_root, seeds_for_python_closure

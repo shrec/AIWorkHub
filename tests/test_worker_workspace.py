@@ -534,6 +534,133 @@ def _commit_validation_worker_package(repo: Path) -> None:
     assert _git(repo, "commit", "-qm", "validation worker package").returncode == 0
 
 
+def _commit_declared_invariant_quality_fixture(repo: Path) -> None:
+    subject = repo / "src" / "aiworkhub" / "quality_subject.py"
+    subject.parent.mkdir(parents=True, exist_ok=True)
+    subject.write_text("VALUE = 'quality-baseline'\n", encoding="utf-8")
+    manifest = repo / ".aiworkhub" / "config" / "development_rules.json"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text(
+        json.dumps(
+            {
+                "single_definition_boundary": {
+                    "baseline": [{"path": "src/aiworkhub/quality_subject.py"}]
+                },
+                "os_dependency_boundary": {"baseline": []},
+            }
+        ),
+        encoding="utf-8",
+    )
+    invariant_test = repo / "tests" / "test_declared_invariants.py"
+    invariant_test.parent.mkdir(exist_ok=True)
+    invariant_test.write_text(
+        "import json\n"
+        "from pathlib import Path\n\n"
+        "def test_declared_quality_inputs_are_present():\n"
+        "    root = Path(__file__).parents[1]\n"
+        "    manifest = json.loads((root / '.aiworkhub/config/development_rules.json').read_text())\n"
+        "    for section in ('single_definition_boundary', 'os_dependency_boundary'):\n"
+        "        for entry in manifest[section]['baseline']:\n"
+        "            assert (root / entry['path']).is_file()\n",
+        encoding="utf-8",
+    )
+    assert (
+        _git(
+            repo,
+            "add",
+            ".aiworkhub/config/development_rules.json",
+            "src/aiworkhub/quality_subject.py",
+            "tests/test_declared_invariants.py",
+        ).returncode
+        == 0
+    )
+    assert _git(repo, "commit", "-qm", "declared quality fixture").returncode == 0
+
+
+@pytest.mark.parametrize("allowed_writes", [[], ["out/result.txt"]])
+def test_selected_declared_invariants_seed_exact_quality_support(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    repo: Path,
+    allowed_writes: list[str],
+) -> None:
+    _commit_validation_worker_package(repo)
+    _commit_declared_invariant_quality_fixture(repo)
+    monkeypatch.setattr(
+        worker_workspace, "_trusted_validation_runtime_roots", lambda repo=None: ()
+    )
+    monkeypatch.setenv(
+        worker_workspace.WORKTREE_ROOT_ENV,
+        str(tmp_path / "declared-quality-worktrees"),
+    )
+    request_id = "declared-quality-" + ("write" if allowed_writes else "readonly")
+    workspace = worker_workspace.create_workspace(
+        repo,
+        request_id,
+        {
+            "allowed_writes": allowed_writes,
+            "validation": [
+                "python3 -m pytest -q tests/test_declared_invariants.py"
+            ],
+        },
+        "glm_vscode_lm",
+    )
+    try:
+        assert (
+            workspace.path / ".aiworkhub/config/development_rules.json"
+        ).is_file()
+        assert (workspace.path / "src/aiworkhub/quality_subject.py").is_file()
+        result, = worker_workspace.run_validations(
+            workspace,
+            ["python3 -m pytest -q tests/test_declared_invariants.py"],
+            backend=worker_workspace.VSCODE_LM_IN_PROCESS_BACKEND,
+            adapter_id="glm_vscode_lm",
+        )
+        assert result["returncode"] == 0, result
+        assert "1 passed" in result["stdout_head"]
+    finally:
+        worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
+
+
+def test_missing_declared_quality_config_fails_before_worktree_launch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    repo: Path,
+) -> None:
+    invariant_test = repo / "tests" / "test_declared_invariants.py"
+    invariant_test.parent.mkdir()
+    invariant_test.write_text("def test_placeholder():\n    assert True\n", encoding="utf-8")
+    assert _git(repo, "add", "tests/test_declared_invariants.py").returncode == 0
+    assert _git(repo, "commit", "-qm", "declared invariant test").returncode == 0
+    monkeypatch.setenv(
+        worker_workspace.WORKTREE_ROOT_ENV,
+        str(tmp_path / "missing-quality-worktrees"),
+    )
+
+    def git_launch_forbidden(*_args, **_kwargs):
+        raise AssertionError("missing quality support must fail before Git launch")
+
+    monkeypatch.setattr(worker_workspace, "_run", git_launch_forbidden)
+    with pytest.raises(
+        worker_workspace.WorkspaceError,
+        match=(
+            "validation_worker_support_missing:"
+            r"\.aiworkhub/config/development_rules\.json"
+        ),
+    ):
+        worker_workspace.create_workspace(
+            repo,
+            "missing-declared-quality",
+            {
+                "allowed_writes": [],
+                "validation": [
+                    "python3 -m pytest -q tests/test_declared_invariants.py"
+                ],
+            },
+            "glm_vscode_lm",
+        )
+
+
 def test_worker_workspace_binds_platform_helpers_after_runtime_temp_closure(
     tmp_path: Path,
 ) -> None:
@@ -7339,6 +7466,10 @@ def _run_shaping_fixture(tmp_path: Path, addopts: str, *argv: str) -> str:
         env={
             "PATH": os.environ.get("PATH", ""),
             "HOME": str(workdir),
+            # HOME is deliberately isolated, but this interpreter's pytest may
+            # live in its user site. Project only that already-loaded package
+            # root so the shaping fixture tests pytest rather than host setup.
+            "PYTHONPATH": str(Path(pytest.__file__).resolve().parents[1]),
             "PYTEST_ADDOPTS": addopts,
         },
         capture_output=True,
