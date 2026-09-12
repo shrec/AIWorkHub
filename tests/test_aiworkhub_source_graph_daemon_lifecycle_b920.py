@@ -319,35 +319,65 @@ def test_core_source_graph_ensure_started_then_stop(tmp_path, monkeypatch, clean
 
 
 def test_server_main_bootstraps_source_graph_before_stdio(monkeypatch):
-    calls: list[str] = []
+    calls: list[object] = []
+    reconciler_threads: list[threading.Thread] = []
+    original_thread_init = threading.Thread.__init__
 
+    def tracked_thread_init(self, *args, target=None, **kwargs):
+        original_thread_init(self, *args, target=target, **kwargs)
+        if target is server._start_task_reconciler_safely:
+            reconciler_threads.append(self)
+
+    monkeypatch.setattr(threading.Thread, "__init__", tracked_thread_init)
     monkeypatch.setattr(core, "source_graph_ensure_started", lambda: calls.append("source_graph"))
     monkeypatch.setattr(server.core, "repo_root", lambda: Path("/repo"))
-    monkeypatch.setattr(server.task_reconciler, "ensure_started", lambda _repo: calls.append("reconciler"))
+    monkeypatch.setattr(server.core, "writes_allowed", lambda: True)
+    monkeypatch.setattr(server.task_reconciler, "ensure_started", lambda repo: calls.append(("reconciler", repo)))
     monkeypatch.setattr(server.task_reconciler, "stop_reconciler", lambda _repo: calls.append("reconciler_stop"))
     monkeypatch.setattr(server.mcp, "run", lambda: calls.append("mcp"))
 
     server.main()
 
-    assert calls == ["source_graph", "reconciler", "mcp", "reconciler_stop"]
+    assert len(reconciler_threads) == 1, "main() must start exactly one reconciler daemon thread"
+    reconciler_threads[0].join(timeout=5)
+    assert not reconciler_threads[0].is_alive(), "reconciler thread never finished"
+
+    assert calls[0] == "source_graph"
+    assert ("reconciler", Path("/repo")) in calls
+    assert calls.index("mcp") < calls.index("reconciler_stop")
 
 
 def test_server_main_keeps_mcp_available_when_source_graph_bootstrap_fails(monkeypatch):
-    calls: list[str] = []
+    calls: list[object] = []
+    reconciler_threads: list[threading.Thread] = []
+    original_thread_init = threading.Thread.__init__
+
+    def tracked_thread_init(self, *args, target=None, **kwargs):
+        original_thread_init(self, *args, target=target, **kwargs)
+        if target is server._start_task_reconciler_safely:
+            reconciler_threads.append(self)
 
     def fail_start():
         calls.append("source_graph")
         raise RuntimeError("indexer_failed")
 
+    monkeypatch.setattr(threading.Thread, "__init__", tracked_thread_init)
     monkeypatch.setattr(core, "source_graph_ensure_started", fail_start)
     monkeypatch.setattr(server.core, "repo_root", lambda: Path("/repo"))
-    monkeypatch.setattr(server.task_reconciler, "ensure_started", lambda _repo: calls.append("reconciler"))
+    monkeypatch.setattr(server.core, "writes_allowed", lambda: True)
+    monkeypatch.setattr(server.task_reconciler, "ensure_started", lambda repo: calls.append(("reconciler", repo)))
     monkeypatch.setattr(server.task_reconciler, "stop_reconciler", lambda _repo: calls.append("reconciler_stop"))
     monkeypatch.setattr(server.mcp, "run", lambda: calls.append("mcp"))
 
     server.main()
 
-    assert calls == ["source_graph", "reconciler", "mcp", "reconciler_stop"]
+    assert len(reconciler_threads) == 1, "main() must start exactly one reconciler daemon thread"
+    reconciler_threads[0].join(timeout=5)
+    assert not reconciler_threads[0].is_alive(), "reconciler thread never finished"
+
+    assert calls[0] == "source_graph"
+    assert ("reconciler", Path("/repo")) in calls
+    assert calls.index("mcp") < calls.index("reconciler_stop")
 
 
 # ---------------------------------------------------------------------------
