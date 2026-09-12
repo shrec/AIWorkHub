@@ -1088,7 +1088,6 @@ def verify_authority_receipt(
     cache_identity, metadata, path_fingerprint = authority._cache_identity(registry, card)
     expected_scalars = {
         "repository": str(authority.repo),
-        "cache_identity": cache_identity,
         "path": path_fingerprint,
         "registry_fingerprint": registry.fingerprint,
         "repository_fingerprint": metadata,
@@ -1099,6 +1098,7 @@ def verify_authority_receipt(
             or ""
         ),
         "card_identity": _receipt_card_identity(card),
+        "cache_identity": cache_identity,
     }
     for key, expected in expected_scalars.items():
         if str(receipt.get(key) or "") != expected:
