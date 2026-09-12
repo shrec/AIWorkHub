@@ -14,20 +14,14 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.11.27
+## What's new in 0.11.28
 
-- Automatic quality review can fail over to another eligible reviewer route
-  after a mechanical route failure and can recover authenticated chains that
-  an older runtime stopped only because no reviewer route was available.
-- OpenCode JSON/SSE usage capture distinguishes top-level completion from
-  child-session activity and deduplicates token, cache, and cost evidence.
-- A fail-closed OpenCode CLI runtime foundation adds exact provider/model
-  identities, Linux executable resolution, JSON invocation, and a
-  request-local default-deny worker tool policy.
-- OpenCode workforce discovery, route wiring, dashboard selection, and a live
-  canary remain pending; this release does not expose OpenCode as a selectable
-  production worker.
-- Cross-process SQLite single-writer ownership remains open.
+- Archived automatic-review cards remain part of the exact target's
+  server-bound reviewer census, so authenticated completed receipts are reused
+  instead of being reported missing or causing duplicate model work.
+- OpenCode's runtime foundation and event/usage capture remain available from
+  0.11.27; workforce discovery, task-route wiring, dashboard selection, and a
+  live canary are still staged work.
 
 Automatic quality-review launch moves worker completion through a
 system-owned correctness, security, and code-quality chain without

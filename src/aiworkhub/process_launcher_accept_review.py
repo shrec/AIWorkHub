@@ -101,7 +101,7 @@ def bound_reviewer_rows(
     try:
         rows = conn.execute(
             "SELECT task_id, card_json FROM tasks "
-            "WHERE topic='quality_review' AND status NOT IN ('archived')"
+            "WHERE topic='quality_review'"
         ).fetchall()
     except Exception:  # noqa: BLE001
         return []

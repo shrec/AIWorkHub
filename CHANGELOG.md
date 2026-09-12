@@ -6,6 +6,21 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.28] - 2026-09-12
+
+### Fixed
+
+- Manager acceptance now retains authenticated automatic-review receipts after
+  their reviewer cards are archived, so a completed correctness/security chain
+  remains visible to the server-bound reviewer census and does not trigger
+  duplicate reviewer work.
+
+### Validation
+
+- Regression coverage exercises archived reviewer enumeration through the
+  production accept-preview path, alongside the existing authenticated receipt
+  verification suite.
+
 ## [0.11.27] - 2026-09-12
 
 ### Fixed

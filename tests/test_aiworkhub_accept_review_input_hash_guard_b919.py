@@ -864,7 +864,7 @@ def test_target_acceptance_consumes_already_accepted_reviewer_receipt(
     reviewer_card = {
         "task_id": reviewer_task_id,
         "topic": "quality_review",
-        "status": "finished",
+        "status": "archived",
         "worker_status": "done",
         "accepted_request_id": reviewer_request_id,
         "allowed_writes": [],
@@ -1071,7 +1071,7 @@ def test_accept_review_resolves_its_own_reviewer_ids_from_the_bound_children(
             "priority, objective, card_json, created_at, updated_at) "
             "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             (
-                reviewer_task_id, "reviewer", "quality_review", "auto", "review",
+                reviewer_task_id, "reviewer", "quality_review", "auto", "archived",
                 "done", 5, "review", json.dumps(reviewer_card),
                 "2026-09-08T00:00:00+00:00", "2026-09-08T00:00:00+00:00",
             ),

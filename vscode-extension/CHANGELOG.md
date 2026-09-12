@@ -1,5 +1,13 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.28 — 2026-09-12
+
+### Fixed
+
+- Completed automatic-review receipts remain discoverable after reviewer-card
+  archival, preventing already-finished correctness and security work from
+  being reported as missing at manager acceptance.
+
 ## 0.11.27 — 2026-09-12
 
 ### Fixed
