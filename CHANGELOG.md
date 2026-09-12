@@ -6,6 +6,40 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.27] - 2026-09-12
+
+### Fixed
+
+- Automatic quality review can retry an alternate eligible reviewer route
+  after a mechanical route failure, while preserving the manager as the sole
+  authority for accepting or returning the implementation target.
+- Review reconciliation recovers authenticated chains that an older runtime
+  terminalized only because no reviewer route was available, without treating
+  transient route availability as a verdict on candidate code.
+- OpenCode JSON/SSE terminal and usage events now distinguish top-level
+  completion from child-session activity and deduplicate cumulative token,
+  cache, and cost evidence.
+
+### Added
+
+- A fail-closed OpenCode CLI runtime foundation: exact `provider/model`
+  identities, Linux executable resolution, native JSON command construction,
+  and a request-local permission contract that denies built-in tools by
+  default and allows only the bounded AIWorkHub worker MCP surface.
+
+### Limitations
+
+- OpenCode is staged but is not yet workforce-eligible or selectable in the
+  dashboard. Model discovery, task-route wiring, UI settings, and a live
+  end-to-end canary remain required before production use.
+- Cross-process SQLite single-writer ownership remains open; this release does
+  not claim that all `database is locked` paths are eliminated.
+
+### Validation
+
+- Release qualification covers the full Python and VS Code extension suites,
+  Ruff, metadata consistency, VSIX packaging, and packaged-runtime smoke tests.
+
 ## [0.11.26] - 2026-09-11
 
 ### Fixed

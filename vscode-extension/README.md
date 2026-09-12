@@ -14,20 +14,20 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.11.26
+## What's new in 0.11.27
 
-- `record_launch_blocker` tolerates an unready/absent storage manifest
-  instead of a fail-closed storage error masking the real launch-rejection
-  reason.
-- Workforce catalog rows carry explicit manager/implementation-worker/
-  reviewer role booleans with safe legacy defaults; Codex routes are always
-  manager-only.
-- The AppContainer-supervisor-identity launch seam and its platform
-  dependency are declared in both governance gates that track this.
-- Research: a provenance-pinned Ponytail adoption contract added to the
-  universal-development-skills artifact.
-- Four pre-existing regressions remain open and are tracked, not fixed, in
-  this release (NF-2026-00796, NF-2026-00798).
+- Automatic quality review can fail over to another eligible reviewer route
+  after a mechanical route failure and can recover authenticated chains that
+  an older runtime stopped only because no reviewer route was available.
+- OpenCode JSON/SSE usage capture distinguishes top-level completion from
+  child-session activity and deduplicates token, cache, and cost evidence.
+- A fail-closed OpenCode CLI runtime foundation adds exact provider/model
+  identities, Linux executable resolution, JSON invocation, and a
+  request-local default-deny worker tool policy.
+- OpenCode workforce discovery, route wiring, dashboard selection, and a live
+  canary remain pending; this release does not expose OpenCode as a selectable
+  production worker.
+- Cross-process SQLite single-writer ownership remains open.
 
 Automatic quality-review launch moves worker completion through a
 system-owned correctness, security, and code-quality chain without

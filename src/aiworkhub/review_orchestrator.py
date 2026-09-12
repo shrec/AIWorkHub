@@ -176,7 +176,31 @@ def routing_catalog(repo: Path) -> Mapping[str, Any] | None:
     return catalog
 
 
-def select_reviewer_route(repo: Path, reviewer_task_id: str, lens: str) -> Mapping[str, Any]:
+def _review_route_identity(route: Mapping[str, Any]) -> tuple[str, str, str]:
+    return (
+        str(route.get("runner") or ""),
+        str(route.get("adapter_id") or ""),
+        str(route.get("model") or ""),
+    )
+
+
+def _manager_reserved_codex_route(route: Mapping[str, Any]) -> bool:
+    """Keep Codex CLI reserved for the manager, without excluding Copilot GPT."""
+    runner, adapter_id, _model = _review_route_identity(route)
+    return (
+        adapter_id == "codex_cli"
+        or runner == "codex"
+        or runner.startswith("codex_gpt-")
+    )
+
+
+def select_reviewer_route(
+    repo: Path,
+    reviewer_task_id: str,
+    lens: str,
+    *,
+    excluded_routes: frozenset[tuple[str, str, str]] = frozenset(),
+) -> Mapping[str, Any]:
     """Select one currently available review worker through canonical policy."""
     readiness = task_store.storage_readiness(repo)
     if not readiness.ready:
@@ -185,23 +209,117 @@ def select_reviewer_route(repo: Path, reviewer_task_id: str, lens: str) -> Mappi
         task_id=reviewer_task_id,
         repo_id=readiness.repo_id,
         kinds=("review",),
-        risk="critical",
+        # Reviewers only produce read-only evidence; the manager remains the
+        # acceptance authority.  ``critical`` unnecessarily excluded every
+        # high-capability fallback when the sole critical route was exhausted.
+        risk="high",
         tool_needs=("source-graph", "session-manager", "ai-memory", "kb"),
     )
     # A None catalog makes rank_task rebuild the bare one itself, which is
     # precisely the conservative-prior ranking this did unconditionally before.
     ranked = workforce_catalog.rank_task(repo, task, catalog=routing_catalog(repo))
+    candidates: list[Mapping[str, Any]] = []
     contract = ranked.get("launch_contract")
-    if not isinstance(contract, Mapping):
-        raise RuntimeError("review_route_unavailable:" + lens)
-    route = {
-        "runner": str(contract.get("runner") or ""),
-        "adapter_id": str(contract.get("adapter_id") or ""),
-        "model": str(contract.get("model") or ""),
-    }
-    if not all(route.values()) or route["runner"] == "codex":
-        raise RuntimeError("review_route_identity_invalid")
-    return route
+    if isinstance(contract, Mapping):
+        candidates.append(contract)
+    for candidate in ranked.get("candidates") or []:
+        if not isinstance(candidate, Mapping) or candidate.get("excluded") is True:
+            continue
+        candidates.append({
+            "runner": candidate.get("execution_runner"),
+            "adapter_id": candidate.get("adapter_id"),
+            "model": candidate.get("model"),
+        })
+    seen: set[tuple[str, str, str]] = set()
+    for candidate in candidates:
+        route = {
+            "runner": str(candidate.get("runner") or ""),
+            "adapter_id": str(candidate.get("adapter_id") or ""),
+            "model": str(candidate.get("model") or ""),
+        }
+        identity = _review_route_identity(route)
+        if not all(identity) or identity in seen:
+            continue
+        seen.add(identity)
+        if identity in excluded_routes or _manager_reserved_codex_route(route):
+            continue
+        return route
+    raise RuntimeError("review_route_unavailable:" + lens)
+
+
+_REVIEWER_RUNNING_STATES = frozenset({
+    "starting", "running", "processing", "finalizing", "reconcile_pending",
+})
+_REVIEWER_MECHANICAL_TERMINAL_STATES = frozenset({
+    "launch_failed", "worker_failed", "validation_failed", "finalize_failed",
+    "output_budget_exceeded", "blocked", "timed_out", "cancelled", "canceled",
+})
+
+_REVIEWER_FAILURE_CLASS_MARKERS = (
+    ("provider_credit", ("monthly_credit_limit", "credit_limit", "insufficient_credit")),
+    ("provider_quota", ("quota", "rate_limit")),
+    ("provider_refusal", ("refusal", "refused", "rejected_by_provider")),
+    ("provider_timeout", ("timed_out", "timeout")),
+    ("provider_auth", ("authentication", "authorization", "credential")),
+    ("model_unavailable", ("model_unavailable", "model_not_found")),
+    ("output_budget", ("output_budget",)),
+    ("cancelled", ("cancelled", "canceled")),
+)
+
+
+def _reviewer_failure_class(status: Mapping[str, Any], card: Mapping[str, Any]) -> str:
+    """Classify bounded failure signals without retaining their raw text."""
+    latest = status.get("latest_event")
+    latest = latest if isinstance(latest, Mapping) else {}
+    terminal = card.get("terminal_failure")
+    terminal = terminal if isinstance(terminal, Mapping) else {}
+    evidence = terminal.get("evidence")
+    evidence = evidence if isinstance(evidence, Mapping) else {}
+    values = (
+        status.get("state"), status.get("terminal_substatus"), status.get("reason"),
+        status.get("error_code"), status.get("code"),
+        latest.get("failure_kind"), latest.get("diagnostic"), latest.get("error"),
+        latest.get("code"), card.get("terminal_substatus"), card.get("worker_status"),
+        card.get("blocker_reason"), terminal.get("substatus"),
+        terminal.get("failure_class"), evidence.get("error"), evidence.get("code"),
+    )
+    signal = " ".join(
+        str(value).strip().lower()
+        for value in values
+        if isinstance(value, str) and value.strip()
+    )
+    for failure_class, markers in _REVIEWER_FAILURE_CLASS_MARKERS:
+        if any(marker in signal for marker in markers):
+            return failure_class
+    return "mechanical_terminal"
+
+
+def mechanical_reviewer_failure_reason(status: Any) -> str:
+    """Return a bounded system-owned terminal reviewer failure, or ``""``.
+
+    Reviewer cards are read-only and can produce a judgment only through
+    ``review_ready``.  A launch/worker/timeout terminal is therefore a route
+    attempt failure, never a negative review of the candidate.  Only fixed
+    process/card fields are retained here; provider/model prose is never persisted.
+    """
+    if not isinstance(status, Mapping):
+        return ""
+    state = str(status.get("state") or "").strip().lower()
+    card = status.get("task_card")
+    card = card if isinstance(card, Mapping) else {}
+    if state == "blocked":
+        state = str(
+            card.get("terminal_substatus") or card.get("worker_status") or state
+        ).strip().lower()
+    failure_class = _reviewer_failure_class(status, card)
+    if state not in _REVIEWER_MECHANICAL_TERMINAL_STATES:
+        if status.get("ok") is False and failure_class != "mechanical_terminal":
+            state = "launch_failed"
+        else:
+            return ""
+    if state == "canceled":
+        state = "cancelled"
+    return f"{state}:{failure_class}"
 
 
 # --- mechanical short-circuit -------------------------------------------
@@ -634,6 +752,16 @@ LENS_PLAN_TABLE = (
     "CREATE TABLE IF NOT EXISTS review_orchestrator_lens_plan ("
     "chain_id INTEGER PRIMARY KEY, lenses TEXT NOT NULL, "
     "effective_tier TEXT NOT NULL DEFAULT '', source TEXT NOT NULL DEFAULT '')"
+)
+
+ROUTE_ATTEMPT_TABLE = (
+    "CREATE TABLE IF NOT EXISTS review_orchestrator_route_attempts ("
+    "chain_id INTEGER NOT NULL, lens TEXT NOT NULL, attempt_index INTEGER NOT NULL, "
+    "reviewer_task_id TEXT NOT NULL, reviewer_request_id TEXT NOT NULL DEFAULT '', "
+    "runner TEXT NOT NULL, adapter_id TEXT NOT NULL, model TEXT NOT NULL, "
+    "state TEXT NOT NULL, failure_reason TEXT NOT NULL DEFAULT '', "
+    "PRIMARY KEY (chain_id, lens, attempt_index), "
+    "UNIQUE (chain_id, lens, reviewer_task_id))"
 )
 
 
@@ -1090,6 +1218,9 @@ class ReviewOrchestrator:
         # ledger, so evidence can go stale within a pass but never across one.
         reset_routing_catalog_cache()
         instant = now or datetime.now(timezone.utc)
+        review_lifecycle.recover_route_unavailable_chains(
+            self.db_path, now=instant
+        )
         review_lifecycle.reconcile_dead_chains(self.db_path, now=instant)
         # Recovery-first: a crash after completing the authenticated action but
         # before projecting it into the task card cannot lose the manager wake.
@@ -1181,6 +1312,248 @@ class ReviewOrchestrator:
             attempted, completed, failed, pending,
             review_lifecycle.lifecycle_counts(self.db_path),
         )
+
+    def _route_attempts(self, chain_id: int, lens: str) -> list[dict[str, Any]]:
+        """Return the durable route history for one chain lens in launch order."""
+        with closing(_side_table_connection(self.db_path)) as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(ROUTE_ATTEMPT_TABLE)
+            rows = conn.execute(
+                "SELECT attempt_index,reviewer_task_id,reviewer_request_id,"
+                "runner,adapter_id,model,state,failure_reason "
+                "FROM review_orchestrator_route_attempts "
+                "WHERE chain_id=? AND lens=? ORDER BY attempt_index",
+                (int(chain_id), str(lens)),
+            ).fetchall()
+        keys = (
+            "attempt_index", "reviewer_task_id", "reviewer_request_id",
+            "runner", "adapter_id", "model", "state", "failure_reason",
+        )
+        return [dict(zip(keys, row, strict=True)) for row in rows]
+
+    def _select_attempt_route(
+        self,
+        reviewer_task_id: str,
+        lens: str,
+        excluded: frozenset[tuple[str, str, str]],
+    ) -> dict[str, str]:
+        if self.route_selector is select_reviewer_route:
+            selected = select_reviewer_route(
+                self.manager.repo, reviewer_task_id, lens,
+                excluded_routes=excluded,
+            )
+        else:
+            selected = self.route_selector(self.manager.repo, reviewer_task_id, lens)
+        route = {
+            "runner": str(selected.get("runner") or ""),
+            "adapter_id": str(selected.get("adapter_id") or ""),
+            "model": str(selected.get("model") or ""),
+        }
+        identity = _review_route_identity(route)
+        if not all(identity) or _manager_reserved_codex_route(route):
+            raise RuntimeError("review_route_identity_invalid")
+        if identity in excluded:
+            raise RuntimeError("review_route_unavailable:" + lens)
+        return route
+
+    def _plan_route_attempt(
+        self, action: review_lifecycle.ReviewAction
+    ) -> dict[str, Any]:
+        """Bind a distinct reviewer task and route before any external launch."""
+        attempts = self._route_attempts(action.chain_id, action.lens)
+        if attempts and attempts[-1]["state"] != "retired":
+            return attempts[-1]
+        attempt_index = len(attempts) + 1
+        identity = action.descriptor["chain_identity"]
+        reviewer_task_id = self._reviewer_task_id(
+            identity, action.lens, attempt_index=attempt_index
+        )
+        excluded = frozenset(
+            (str(row["runner"]), str(row["adapter_id"]), str(row["model"]))
+            for row in attempts
+            if row["state"] == "retired"
+        )
+        route = self._select_attempt_route(reviewer_task_id, action.lens, excluded)
+        with closing(_side_table_connection(self.db_path)) as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(ROUTE_ATTEMPT_TABLE)
+            conn.execute(
+                "INSERT OR IGNORE INTO review_orchestrator_route_attempts "
+                "(chain_id,lens,attempt_index,reviewer_task_id,runner,adapter_id,"
+                "model,state) VALUES (?,?,?,?,?,?,?,'planned')",
+                (
+                    int(action.chain_id), action.lens, attempt_index,
+                    reviewer_task_id, route["runner"], route["adapter_id"],
+                    route["model"],
+                ),
+            )
+        planned = self._route_attempts(action.chain_id, action.lens)
+        if not planned or int(planned[-1]["attempt_index"]) != attempt_index:
+            raise RuntimeError("review_route_attempt_plan_conflict")
+        return planned[-1]
+
+    def _bind_route_attempt_request(
+        self, action: review_lifecycle.ReviewAction, attempt: Mapping[str, Any], request_id: str
+    ) -> bool:
+        """Persist the acknowledged request; false leaves the action retryable."""
+        try:
+            with closing(_side_table_connection(self.db_path)) as conn, conn:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(ROUTE_ATTEMPT_TABLE)
+                conn.execute(
+                    "UPDATE review_orchestrator_route_attempts "
+                    "SET reviewer_request_id=?,state='launched' "
+                    "WHERE chain_id=? AND lens=? AND attempt_index=? "
+                    "AND state IN ('planned','launched') "
+                    "AND reviewer_request_id IN ('',?)",
+                    (
+                        request_id, int(action.chain_id), action.lens,
+                        int(attempt["attempt_index"]), request_id,
+                    ),
+                )
+                row = conn.execute(
+                    "SELECT reviewer_request_id,state FROM review_orchestrator_route_attempts "
+                    "WHERE chain_id=? AND lens=? AND attempt_index=?",
+                    (int(action.chain_id), action.lens, int(attempt["attempt_index"])),
+                ).fetchone()
+            return row is not None and row[0] == request_id and row[1] == "launched"
+        except Exception:  # noqa: BLE001 -- an acknowledged launch stays retryable
+            return False
+
+    def _launch_route_attempt(
+        self, action: review_lifecycle.ReviewAction, attempt: Mapping[str, Any]
+    ) -> dict[str, Any] | None:
+        """Launch or reconcile one pre-bound attempt without duplicating its provider."""
+        identity = action.descriptor["chain_identity"]
+        try:
+            result = self.manager.launch_quality_reviewer(
+                target_request_id=str(identity["target_request_id"]),
+                target_task_id=str(identity["target_task_id"]),
+                reviewer_task_id=str(attempt["reviewer_task_id"]),
+                runner=str(attempt["runner"]),
+                adapter_id=str(attempt["adapter_id"]),
+                model=str(attempt["model"]),
+                lens=action.lens,
+            )
+        except Exception:  # noqa: BLE001 -- reconcile the pre-bound task on retry
+            return None
+        route_failure = mechanical_reviewer_failure_reason(result)
+        if route_failure:
+            # A synchronous terminal receipt still belongs to the exact route
+            # just invoked.  Validate any identity fields it supplies before
+            # retiring that durable attempt; an omitted field is legitimate
+            # when the provider rejected before allocating a request.
+            expected = {
+                "task_id": str(attempt["reviewer_task_id"]),
+                "runner": str(attempt["runner"]),
+                "adapter_id": str(attempt["adapter_id"]),
+                "model": str(attempt["model"]),
+            }
+            if any(
+                str(result.get(key) or "") not in {"", value}
+                for key, value in expected.items()
+            ):
+                raise RuntimeError("reviewer_launch_terminal_identity_invalid")
+            if not self._retire_route_attempt(action, attempt, route_failure):
+                return None
+            return {"_route_terminal_failure": route_failure}
+        self._require_ok(result, "reviewer_launch_failed")
+        request_id = str(result.get("request_id") or "")
+        if (
+            not request_id
+            or str(result.get("task_id") or attempt["reviewer_task_id"])
+            != str(attempt["reviewer_task_id"])
+        ):
+            raise RuntimeError("reviewer_launch_identity_invalid")
+        if not self._bind_route_attempt_request(action, attempt, request_id):
+            # The external launch is acknowledged but its request binding is
+            # not durable yet. Keep this action pending: the pre-bound task and
+            # route make the retry reconcile the same ProcessManager attempt.
+            return None
+        return result
+
+    def _launch_with_successor(
+        self, action: review_lifecycle.ReviewAction, attempt: Mapping[str, Any]
+    ) -> tuple[dict[str, Any], dict[str, Any]] | None:
+        """Launch an attempt, advancing once when launch itself is terminal."""
+        current = dict(attempt)
+        for launch_index in range(2):
+            result = self._launch_route_attempt(action, current)
+            if result is None:
+                return None
+            if "_route_terminal_failure" not in result:
+                return current, result
+            if launch_index:
+                # The second exact route is already retired.  A later drain
+                # continues from that durable state instead of spinning here.
+                return None
+            try:
+                current = self._plan_route_attempt(action)
+            except RuntimeError as exc:
+                if str(exc).startswith("review_route_"):
+                    raise _DeferredLaunch(
+                        str(exc),
+                        {"outcome": "deferred", "reason": str(exc)},
+                    ) from exc
+                raise
+        return None
+
+    def _retire_route_attempt(
+        self,
+        action: review_lifecycle.ReviewAction,
+        attempt: Mapping[str, Any],
+        reason: str,
+    ) -> bool:
+        try:
+            with closing(_side_table_connection(self.db_path)) as conn, conn:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(ROUTE_ATTEMPT_TABLE)
+                conn.execute(
+                    "UPDATE review_orchestrator_route_attempts "
+                    "SET state='retired',failure_reason=? "
+                    "WHERE chain_id=? AND lens=? AND attempt_index=? "
+                    "AND state IN ('planned','launched')",
+                    (
+                        str(reason)[:500], int(action.chain_id), action.lens,
+                        int(attempt["attempt_index"]),
+                    ),
+                )
+                row = conn.execute(
+                    "SELECT state,failure_reason FROM review_orchestrator_route_attempts "
+                    "WHERE chain_id=? AND lens=? AND attempt_index=?",
+                    (int(action.chain_id), action.lens, int(attempt["attempt_index"])),
+                ).fetchone()
+            return row is not None and row[0] == "retired" and bool(row[1])
+        except Exception:  # noqa: BLE001 -- route retirement stays retryable
+            return False
+
+    def _attempt_for_accept(
+        self, action: review_lifecycle.ReviewAction, launch: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        attempts = self._route_attempts(action.chain_id, action.lens)
+        if attempts:
+            return attempts[-1]
+        route = launch.get("reviewer_route")
+        route = route if isinstance(route, Mapping) else {}
+        reviewer_task_id = str(launch.get("reviewer_task_id") or "")
+        reviewer_request_id = str(launch.get("reviewer_request_id") or "")
+        if not reviewer_task_id or not reviewer_request_id or not all(
+            _review_route_identity(route)
+        ):
+            raise RuntimeError("reviewer_launch_binding_missing")
+        with closing(_side_table_connection(self.db_path)) as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(ROUTE_ATTEMPT_TABLE)
+            conn.execute(
+                "INSERT OR IGNORE INTO review_orchestrator_route_attempts "
+                "(chain_id,lens,attempt_index,reviewer_task_id,reviewer_request_id,"
+                "runner,adapter_id,model,state) VALUES (?,?,?,?,?,?,?,?,'launched')",
+                (
+                    int(action.chain_id), action.lens, 1, reviewer_task_id,
+                    reviewer_request_id, *_review_route_identity(route),
+                ),
+            )
+        return self._route_attempts(action.chain_id, action.lens)[-1]
 
     def _execute(self, action: review_lifecycle.ReviewAction) -> dict[str, Any] | None:
         identity = action.descriptor["chain_identity"]
@@ -1305,39 +1678,83 @@ class ReviewOrchestrator:
                     target_readiness_receipt=readiness,
                     result={"ok": True, "state": "replayed", "task_id": target_task},
                 )
-            route = dict(self.route_selector(self.manager.repo, reviewer_task, action.lens))
-            runner = str(route.get("runner") or "")
-            adapter_id = str(route.get("adapter_id") or "")
-            model = str(route.get("model") or "")
-            if not runner or not adapter_id or not model or runner == "codex":
-                raise RuntimeError("review_route_identity_invalid")
-            result = self.manager.launch_quality_reviewer(
-                target_request_id=target_request,
-                target_task_id=target_task,
-                reviewer_task_id=reviewer_task,
-                runner=runner,
-                adapter_id=adapter_id,
-                model=model,
-                lens=action.lens,
-            )
-            self._require_ok(result, "reviewer_launch_failed")
-            request_id = str(result.get("request_id") or "")
-            if not request_id or str(result.get("task_id") or reviewer_task) != reviewer_task:
-                raise RuntimeError("reviewer_launch_identity_invalid")
+            try:
+                attempt = self._plan_route_attempt(action)
+            except RuntimeError as exc:
+                if str(exc).startswith("review_route_"):
+                    raise _DeferredLaunch(
+                        str(exc),
+                        {"outcome": "deferred", "reason": str(exc)},
+                    ) from exc
+                raise
+            launched = self._launch_with_successor(action, attempt)
+            if launched is None:
+                return None
+            attempt, result = launched
+            request_id = str(result["request_id"])
+            reviewer_task = str(attempt["reviewer_task_id"])
+            route = {
+                "runner": str(attempt["runner"]),
+                "adapter_id": str(attempt["adapter_id"]),
+                "model": str(attempt["model"]),
+            }
             return self._receipt(
                 action, reviewer_task_id=reviewer_task,
                 reviewer_request_id=request_id, reviewer_route=route,
+                route_attempt_index=int(attempt["attempt_index"]),
                 target_readiness_receipt=readiness, result=result,
             )
         if action.action_type == "accept":
             launch = self._lens_receipt(prior, action.lens, "launch")
             replay = launch.get("replay") if isinstance(launch, Mapping) else None
             replay = replay if isinstance(replay, Mapping) else {}
-            reviewer_request = str(launch["reviewer_request_id"])
+            attempt = self._attempt_for_accept(action, launch)
+            if not str(attempt.get("reviewer_request_id") or ""):
+                launched = self._launch_with_successor(action, attempt)
+                if launched is None:
+                    return None
+                attempt, _result = launched
+            reviewer_request = str(attempt["reviewer_request_id"])
+            reviewer_task = str(attempt["reviewer_task_id"])
             status = self.manager.status(reviewer_request)
-            if str(status.get("state") or "") in {
-                "starting", "running", "processing", "finalizing", "reconcile_pending"
-            }:
+            if str(status.get("state") or "") in _REVIEWER_RUNNING_STATES:
+                return None
+            route_failure = mechanical_reviewer_failure_reason(status)
+            if route_failure:
+                exact_status_route = (
+                    str(status.get("runner") or ""),
+                    str(status.get("adapter_id") or ""),
+                    str(status.get("model") or ""),
+                )
+                if (
+                    str(status.get("request_id") or "") != reviewer_request
+                    or str(status.get("task_id") or "") != reviewer_task
+                    or exact_status_route != (
+                        str(attempt["runner"]), str(attempt["adapter_id"]),
+                        str(attempt["model"]),
+                    )
+                ):
+                    raise RuntimeError("reviewer_terminal_route_binding_invalid")
+                if not self._retire_route_attempt(action, attempt, route_failure):
+                    return None
+                try:
+                    successor = self._plan_route_attempt(action)
+                except RuntimeError as exc:
+                    if str(exc).startswith("review_route_"):
+                        raise _DeferredLaunch(
+                            str(exc),
+                            {
+                                "outcome": "deferred",
+                                "reason": str(exc),
+                                "retired_route": {
+                                    "runner": str(attempt["runner"]),
+                                    "adapter_id": str(attempt["adapter_id"]),
+                                    "model": str(attempt["model"]),
+                                },
+                            },
+                        ) from exc
+                    raise
+                self._launch_with_successor(action, successor)
                 return None
             if replay:
                 # The replayed report is resolved from the ORIGINAL reviewer's
@@ -1362,12 +1779,11 @@ class ReviewOrchestrator:
                     source_identity,
                 )
                 findings = receipt["report"]["findings"]
-                if any(
+                actionable_findings = any(
                     finding.get("actionable") is True
                     or finding.get("disposition") == "defect"
                     for finding in findings
-                ):
-                    raise RuntimeError("reviewer_actionable_findings")
+                )
                 report_sha256 = canonical_digest(receipt["report"])
                 quality_receipt_sha256 = canonical_digest(receipt)
                 # No second acceptance of one report: the source chain already
@@ -1383,18 +1799,18 @@ class ReviewOrchestrator:
                     review_report_sha256=report_sha256,
                     quality_review_receipt_sha256=quality_receipt_sha256,
                     submission_id=str(receipt.get("submission_id") or ""),
+                    actionable_findings=actionable_findings,
                     result={"ok": True, "state": "replayed", "task_id": reviewer_task},
                 )
             receipt = self._review_receipt(
                 action, status, reviewer_request, reviewer_task
             )
             findings = receipt["report"]["findings"]
-            if any(
+            actionable_findings = any(
                 finding.get("actionable") is True
                 or finding.get("disposition") == "defect"
                 for finding in findings
-            ):
-                raise RuntimeError("reviewer_actionable_findings")
+            )
             report_sha256 = canonical_digest(receipt["report"])
             quality_receipt_sha256 = canonical_digest(receipt)
             result = self.manager.accept_review(reviewer_request, reviewer_task)
@@ -1403,10 +1819,17 @@ class ReviewOrchestrator:
                 action,
                 reviewer_task_id=reviewer_task,
                 reviewer_request_id=reviewer_request,
+                reviewer_route={
+                    "runner": str(attempt["runner"]),
+                    "adapter_id": str(attempt["adapter_id"]),
+                    "model": str(attempt["model"]),
+                },
+                route_attempt_index=int(attempt["attempt_index"]),
                 reviewer_provider=str(status.get("adapter_id") or ""),
                 review_report_sha256=report_sha256,
                 quality_review_receipt_sha256=quality_receipt_sha256,
                 submission_id=str(receipt.get("submission_id") or ""),
+                actionable_findings=actionable_findings,
                 result=result,
             )
         if action.action_type == "archive":
@@ -1425,15 +1848,25 @@ class ReviewOrchestrator:
                     ),
                     result={"ok": True, "state": "replayed", "task_id": target_task},
                 )
+            accepted_reviewer_task = str(
+                accepted.get("reviewer_task_id") or reviewer_task
+            )
             result = task_engine.archive_task(
-                self.manager.repo, reviewer_task,
-                actor=str((launch.get("reviewer_route") or {}).get("runner") or "system"),
+                self.manager.repo, accepted_reviewer_task,
+                actor=str(
+                    (accepted.get("reviewer_route") or {}).get("runner")
+                    or (launch.get("reviewer_route") or {}).get("runner")
+                    or "system"
+                ),
                 reason=f"automatic review accepted:{target_request}",
             )
-            if result.get("ok") is not True and not self._is_archived(reviewer_task):
+            if (
+                result.get("ok") is not True
+                and not self._is_archived(accepted_reviewer_task)
+            ):
                 self._require_ok(result, "reviewer_archive_failed")
             return self._receipt(
-                action, reviewer_task_id=reviewer_task,
+                action, reviewer_task_id=accepted_reviewer_task,
                 reviewer_request_id=str(accepted["reviewer_request_id"]), result=result,
             )
         # Computed per branch, not up front: only the two target actions carry
@@ -1988,7 +2421,15 @@ class ReviewOrchestrator:
         return bool(str(card.get("archived_at") or "").strip())
 
     @staticmethod
-    def _reviewer_task_id(identity: Mapping[str, Any], lens: str) -> str:
-        preimage = json.dumps({"identity": dict(identity), "lens": lens},
+    def _reviewer_task_id(
+        identity: Mapping[str, Any], lens: str, *, attempt_index: int = 1
+    ) -> str:
+        attempt = max(1, int(attempt_index))
+        payload: dict[str, Any] = {"identity": dict(identity), "lens": lens}
+        # Preserve every existing first-attempt identity. Successors add their
+        # ordinal to the preimage and therefore become distinct canonical cards.
+        if attempt > 1:
+            payload["route_attempt"] = attempt
+        preimage = json.dumps(payload,
                               sort_keys=True, separators=(",", ":"), ensure_ascii=True)
         return "QUALITY_REVIEW_" + hashlib.sha256(preimage.encode()).hexdigest()[:24].upper()

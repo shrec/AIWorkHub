@@ -302,6 +302,7 @@ def test_awh_obs_014_every_configured_adapter_is_accounted_for() -> None:
         "deepseek_vscode_lm": (),
         "glm_vscode_lm": (),
         "grok_kilo_cli": ("tokens", "cost"),
+        "opencode_cli": ("tokens", "cost"),
         "deepseek_manual": (),  # manual-only, never launched
     }
     # Every supported adapter has an accounted-for telemetry entry -- no adapter
@@ -311,10 +312,11 @@ def test_awh_obs_014_every_configured_adapter_is_accounted_for() -> None:
     # Claude and Kilo/Grok stream-json report provider dollar cost.
     assert obtainable["claude_cli"] == ("tokens", "cost")
     assert obtainable["grok_kilo_cli"] == ("tokens", "cost")
+    assert obtainable["opencode_cli"] == ("tokens", "cost")
     assert all(
         "cost" not in caps
         for name, caps in obtainable.items()
-        if name not in {"claude_cli", "grok_kilo_cli"}
+        if name not in {"claude_cli", "grok_kilo_cli", "opencode_cli"}
     )
 
 

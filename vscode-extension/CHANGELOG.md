@@ -1,5 +1,28 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.27 — 2026-09-12
+
+### Fixed
+
+- Automatic quality review can fail over to another eligible reviewer route
+  after a mechanical route failure and can recover authenticated chains that
+  an older runtime stopped only because no route was available.
+- OpenCode JSON/SSE event capture now separates top-level terminal evidence
+  from child sessions and deduplicates token, cache, and cost totals.
+
+### Added
+
+- A fail-closed OpenCode CLI runtime foundation with exact provider/model
+  identities, Linux executable resolution, JSON command construction, and a
+  request-local default-deny worker tool policy.
+
+### Limitations
+
+- OpenCode workforce discovery, task-route wiring, dashboard model selection,
+  and a live canary remain pending; the adapter is not production-selectable
+  in this release.
+- Cross-process SQLite single-writer ownership remains open.
+
 ## 0.11.26 — 2026-09-11
 
 ### Fixed

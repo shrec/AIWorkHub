@@ -17,7 +17,11 @@ import pytest  # noqa: E402
 
 
 NOW = datetime(2026, 8, 29, tzinfo=timezone.utc)
-ROUTE = {"runner": "codex56_reviewer", "adapter_id": "codex_cli", "model": "gpt-5.6-sol"}
+ROUTE = {
+    "runner": "copilot_gpt-5.6-sol",
+    "adapter_id": "vscode_lm",
+    "model": "gpt-5.6-sol",
+}
 
 
 def _route(_repo: Path, _task_id: str, _lens: str) -> dict[str, str]:
@@ -57,6 +61,42 @@ class _Manager:
 
     def _append_event(self, event):
         self.events.append(event)
+
+
+class _FailoverManager(_Manager):
+    """ProcessManager-shaped launch reconciliation for route failover tests."""
+
+    def __init__(self, repo: Path) -> None:
+        super().__init__(repo)
+        self.requests_by_task: dict[str, str] = {}
+        self.provider_launches: list[dict] = []
+        self.terminal_launch_results: dict[str, dict] = {}
+
+    def launch_quality_reviewer(self, **kwargs):
+        self.launches.append(kwargs)
+        task_id = kwargs["reviewer_task_id"]
+        terminal = self.terminal_launch_results.pop(task_id, None)
+        if terminal is not None:
+            return {
+                "task_id": task_id,
+                **{key: kwargs[key] for key in ROUTE},
+                **terminal,
+            }
+        request_id = self.requests_by_task.get(task_id)
+        if request_id is None:
+            request_id = f"review-request-{len(self.requests_by_task) + 1}"
+            self.requests_by_task[task_id] = request_id
+            self.provider_launches.append(dict(kwargs))
+        return {
+            "ok": True,
+            "request_id": request_id,
+            "task_id": task_id,
+            "state": "starting",
+            "already_reserved": len([
+                call for call in self.launches
+                if call["reviewer_task_id"] == task_id
+            ]) > 1,
+        }
 
 
 def _target_status(*, state: str = "review_ready", **card_overrides: object) -> dict:
@@ -119,6 +159,277 @@ def test_launch_waits_until_target_is_ready_then_launches_once(tmp_path: Path) -
 
     assert launched.completed == 1
     assert len(manager.launches) == 1
+
+
+def test_initial_route_unavailable_defers_without_terminalizing_chain(
+    tmp_path: Path,
+) -> None:
+    manager = _Manager(tmp_path)
+    available = False
+
+    def route(_repo: Path, _task_id: str, lens: str) -> dict[str, str]:
+        if not available:
+            raise RuntimeError("review_route_unavailable:" + lens)
+        return dict(ROUTE)
+
+    driver = review_orchestrator.ReviewOrchestrator(
+        manager, db_path=tmp_path / "review.sqlite", route_selector=route
+    )
+    driver.ensure_chain(
+        target_task_id="TARGET", target_request_id="target-request", claim_epoch=1,
+        packet_sha256="a" * 64, candidate_sha256="b" * 64, now=NOW,
+    )
+
+    deferred = driver.drain(max_actions=1, now=NOW)
+    assert deferred.pending == 1
+    assert deferred.failed == 0
+    assert review_lifecycle.lifecycle_counts(
+        tmp_path / "review.sqlite"
+    )["pending"] == 12
+
+    available = True
+    launched = driver.drain(max_actions=1, now=NOW)
+    assert launched.completed == 1
+    assert len(manager.launches) == 1
+
+
+FIRST_ROUTE = {
+    "runner": "copilot_claude-opus-5",
+    "adapter_id": "vscode_lm",
+    "model": "claude-opus-5",
+}
+SUCCESSOR_ROUTE = {
+    "runner": "deepseek_native-v4-pro",
+    "adapter_id": "deepseek_copilot_cli",
+    "model": "deepseek-v4-pro",
+}
+
+
+def _terminal_status(request_id: str, task_id: str) -> dict:
+    return {
+        "ok": True,
+        "request_id": request_id,
+        "task_id": task_id,
+        "state": "worker_failed",
+        **FIRST_ROUTE,
+        "latest_event": {
+            "failure_kind": "worker_failed",
+            "diagnostic": "worker_failed:provider_timeout:exit_code=1",
+        },
+        "task_card": {
+            "terminal_substatus": "worker_failed",
+            "worker_status": "worker_failed",
+        },
+    }
+
+
+def _two_route_selector(first_task_id: str):
+    def select(_repo: Path, task_id: str, _lens: str) -> dict[str, str]:
+        return dict(FIRST_ROUTE if task_id == first_task_id else SUCCESSOR_ROUTE)
+
+    return select
+
+
+def test_terminal_reviewer_before_restart_launches_distinct_successor_and_converges(
+    tmp_path: Path,
+) -> None:
+    manager = _FailoverManager(tmp_path)
+    db_path = tmp_path / "terminal-restart.sqlite"
+    seed = review_orchestrator.ReviewOrchestrator(
+        manager, db_path=db_path, route_selector=lambda *_args: dict(FIRST_ROUTE)
+    )
+    chain = seed.ensure_chain(
+        target_task_id="TARGET", target_request_id="target-request", claim_epoch=1,
+        packet_sha256="a" * 64, candidate_sha256="b" * 64, now=NOW,
+    )
+    first_task = seed._reviewer_task_id(chain.chain_identity, "correctness")
+    seed.route_selector = _two_route_selector(first_task)
+    assert seed.drain(max_actions=1, now=NOW).completed == 1
+    first_request = manager.requests_by_task[first_task]
+    manager.status_results[first_request] = _terminal_status(first_request, first_task)
+
+    restarted = review_orchestrator.ReviewOrchestrator(
+        manager, db_path=db_path, route_selector=_two_route_selector(first_task)
+    )
+    failed_over = restarted.drain(max_actions=1, now=NOW)
+
+    assert failed_over.pending == 1
+    assert len(manager.provider_launches) == 2
+    successor = restarted._route_attempts(chain.chain_id, "correctness")[-1]
+    assert successor["reviewer_task_id"] != first_task
+    assert successor["state"] == "launched"
+    assert {key: successor[key] for key in SUCCESSOR_ROUTE} == SUCCESSOR_ROUTE
+    first = restarted._route_attempts(chain.chain_id, "correctness")[0]
+    assert first["state"] == "retired"
+    assert "provider_timeout" in first["failure_reason"]
+
+    successor_request = str(successor["reviewer_request_id"])
+    manager.status_results[successor_request] = _review_status(
+        reviewer_request=successor_request,
+        reviewer_task=str(successor["reviewer_task_id"]),
+        provider=SUCCESSOR_ROUTE["adapter_id"],
+        route=SUCCESSOR_ROUTE,
+    )
+    converged = review_orchestrator.ReviewOrchestrator(
+        manager, db_path=db_path, route_selector=_two_route_selector(first_task)
+    ).drain(max_actions=1, now=NOW)
+
+    assert converged.completed == 1
+    assert len(manager.provider_launches) == 2
+    assert manager.accepts == [
+        (successor_request, str(successor["reviewer_task_id"]))
+    ]
+
+
+def test_launch_ack_before_attempt_request_persistence_reconciles_without_duplicate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _FailoverManager(tmp_path)
+    db_path = tmp_path / "ack-crash.sqlite"
+    driver = review_orchestrator.ReviewOrchestrator(
+        manager, db_path=db_path, route_selector=lambda *_args: dict(FIRST_ROUTE)
+    )
+    chain = driver.ensure_chain(
+        target_task_id="TARGET", target_request_id="target-request", claim_epoch=1,
+        packet_sha256="a" * 64, candidate_sha256="b" * 64, now=NOW,
+    )
+    first_task = driver._reviewer_task_id(chain.chain_identity, "correctness")
+    driver.route_selector = _two_route_selector(first_task)
+    assert driver.drain(max_actions=1, now=NOW).completed == 1
+    first_request = manager.requests_by_task[first_task]
+    manager.status_results[first_request] = _terminal_status(first_request, first_task)
+    original_bind = driver._bind_route_attempt_request
+    failed_once = False
+
+    def fail_successor_once(action, attempt, request_id):
+        nonlocal failed_once
+        if int(attempt["attempt_index"]) == 2 and not failed_once:
+            failed_once = True
+            return False
+        return original_bind(action, attempt, request_id)
+
+    monkeypatch.setattr(driver, "_bind_route_attempt_request", fail_successor_once)
+    assert driver.drain(max_actions=1, now=NOW).pending == 1
+    assert len(manager.provider_launches) == 2
+    successor = driver._route_attempts(chain.chain_id, "correctness")[-1]
+    assert successor["state"] == "planned"
+    assert successor["reviewer_request_id"] == ""
+
+    restarted = review_orchestrator.ReviewOrchestrator(
+        manager, db_path=db_path, route_selector=_two_route_selector(first_task)
+    )
+    assert restarted.drain(max_actions=1, now=NOW).pending == 1
+    assert len(manager.provider_launches) == 2, "same task must bind the prior provider"
+    recovered = restarted._route_attempts(chain.chain_id, "correctness")[-1]
+    assert recovered["state"] == "launched"
+    assert recovered["reviewer_request_id"] == manager.requests_by_task[
+        str(recovered["reviewer_task_id"])
+    ]
+
+
+@pytest.mark.parametrize(
+    ("state", "error_code", "failure_reason"),
+    [
+        ("launch_failed", "runtime_error", "launch_failed:mechanical_terminal"),
+        ("credit", "monthly_credit_limit", "launch_failed:provider_credit"),
+        ("quota", "quota_exhausted", "launch_failed:provider_quota"),
+        ("refusal", "request_refused", "launch_failed:provider_refusal"),
+        ("timeout", "provider_timeout", "launch_failed:provider_timeout"),
+        ("cancelled", "owner_cancelled", "cancelled:cancelled"),
+    ],
+)
+def test_typed_terminal_launch_receipt_advances_distinct_route_and_converges(
+    tmp_path: Path, state: str, error_code: str, failure_reason: str,
+) -> None:
+    manager = _FailoverManager(tmp_path)
+    db_path = tmp_path / f"typed-{state}.sqlite"
+    seed = review_orchestrator.ReviewOrchestrator(
+        manager, db_path=db_path, route_selector=lambda *_args: dict(FIRST_ROUTE)
+    )
+    chain = seed.ensure_chain(
+        target_task_id="TARGET", target_request_id="target-request", claim_epoch=1,
+        packet_sha256="a" * 64, candidate_sha256="b" * 64, now=NOW,
+    )
+    first_task = seed._reviewer_task_id(chain.chain_identity, "correctness")
+    seed.route_selector = _two_route_selector(first_task)
+    manager.terminal_launch_results[first_task] = {
+        "ok": False,
+        "state": state,
+        "error_code": error_code,
+        "latest_event": {
+            "diagnostic": "provider secret=sk-must-not-persist arbitrary prose",
+        },
+    }
+
+    launched = seed.drain(max_actions=1, now=NOW)
+
+    assert launched.completed == 1
+    assert len(manager.launches) == 2
+    assert len(manager.provider_launches) == 1
+    first, successor = seed._route_attempts(chain.chain_id, "correctness")
+    assert first["state"] == "retired"
+    assert first["failure_reason"] == failure_reason
+    assert "sk-must-not-persist" not in first["failure_reason"]
+    assert successor["state"] == "launched"
+    assert successor["reviewer_task_id"] != first_task
+    assert {key: successor[key] for key in SUCCESSOR_ROUTE} == SUCCESSOR_ROUTE
+
+    successor_request = str(successor["reviewer_request_id"])
+    manager.status_results[successor_request] = _review_status(
+        reviewer_request=successor_request,
+        reviewer_task=str(successor["reviewer_task_id"]),
+        provider=SUCCESSOR_ROUTE["adapter_id"],
+        route=SUCCESSOR_ROUTE,
+    )
+    converged = review_orchestrator.ReviewOrchestrator(
+        manager, db_path=db_path, route_selector=_two_route_selector(first_task)
+    ).drain(max_actions=1, now=NOW)
+
+    assert converged.completed == 1
+    assert len(manager.provider_launches) == 1
+    assert manager.accepts == [
+        (successor_request, str(successor["reviewer_task_id"]))
+    ]
+
+
+@pytest.mark.parametrize(
+    ("state", "detail", "failure_class"),
+    [
+        ("worker_failed", "monthly_credit_limit_reached", "provider_credit"),
+        ("launch_failed", "provider_refused:quota_exhausted", "provider_quota"),
+        ("launch_failed", "provider_refused:request_refused", "provider_refusal"),
+        ("timed_out", "vscode_lm_response_timeout", "provider_timeout"),
+    ],
+)
+def test_provider_terminal_classes_are_mechanical_route_failures(
+    state: str, detail: str, failure_class: str,
+) -> None:
+    reason = review_orchestrator.mechanical_reviewer_failure_reason({
+        "state": state,
+        "latest_event": {"diagnostic": detail},
+        "task_card": {},
+    })
+
+    assert reason == f"{state}:{failure_class}"
+    assert review_orchestrator.mechanical_reviewer_failure_reason({
+        "state": "review_ready", "latest_event": {"diagnostic": detail},
+    }) == ""
+
+
+def test_mechanical_route_failure_never_retains_provider_prose_or_secrets() -> None:
+    secret = "sk-provider-secret-material"
+    reason = review_orchestrator.mechanical_reviewer_failure_reason({
+        "ok": False,
+        "state": "launch_failed",
+        "latest_event": {
+            "diagnostic": f"monthly_credit_limit token={secret} arbitrary prose",
+        },
+        "task_card": {},
+    })
+
+    assert reason == "launch_failed:provider_credit"
+    assert secret not in reason
+    assert "arbitrary prose" not in reason
 
 
 def test_launch_accepts_canonical_review_ready_card_when_process_state_is_absent(
@@ -338,8 +649,23 @@ def _review_status(
     lens: str = "correctness", *, findings: list[dict] | None = None,
     binding_packet_sha256: str | None = None,
     candidate_sha256: str = "b" * 64,
+    reviewer_request: str | None = None,
+    reviewer_task: str | None = None,
+    provider: str | None = None,
+    route: dict[str, str] | None = None,
 ) -> dict:
-    reviewer_request = "review-request-" + lens
+    route = dict(route or ROUTE)
+    provider = provider or route["adapter_id"]
+    reviewer_request = reviewer_request or "review-request-" + lens
+    reviewer_task = reviewer_task or review_orchestrator.ReviewOrchestrator._reviewer_task_id(
+        {
+            "schema_id": "aiworkhub.review_lifecycle.v1",
+            "target_task_id": "TARGET", "target_request_id": "target-request",
+            "claim_epoch": "1", "packet_sha256": "a" * 64,
+            "candidate_sha256": candidate_sha256,
+        },
+        lens,
+    )
     packet_sha256 = _review_packet_sha256(lens)
     receipt = {
         "schema_id": "aiworkhub.quality_review_receipt.v1",
@@ -347,19 +673,11 @@ def _review_status(
         "target": {"request_id": "target-request", "task_id": "TARGET", "claim_epoch": 1},
         "reviewer": {
             "request_id": reviewer_request,
-            "task_id": review_orchestrator.ReviewOrchestrator._reviewer_task_id(
-                {
-                    "schema_id": "aiworkhub.review_lifecycle.v1",
-                    "target_task_id": "TARGET", "target_request_id": "target-request",
-                    "claim_epoch": "1", "packet_sha256": "a" * 64,
-                    "candidate_sha256": candidate_sha256,
-                },
-                lens,
-            ),
-            "provider": "codex_cli",
+            "task_id": reviewer_task,
+            "provider": provider,
         },
         "report": {
-            "lens": lens, "provider": "codex_cli", "read_only": True,
+            "lens": lens, "provider": provider, "read_only": True,
             "can_mutate_repo": False, "findings": list(findings or []),
         },
         "authority": {
@@ -384,7 +702,10 @@ def _review_status(
         "target_claim_epoch": 1,
     }
     return {
-        "ok": True, "state": "review_ready", "adapter_id": "codex_cli",
+        "ok": True, "state": "review_ready",
+        "request_id": reviewer_request, "task_id": reviewer_task,
+        "runner": route["runner"], "adapter_id": route["adapter_id"],
+        "model": route["model"],
         "latest_event": {"quality_review_receipt": receipt},
         "task_card": {
             "terminal_review": {
@@ -397,7 +718,9 @@ def _review_status(
     }
 
 
-def test_actionable_finding_fails_chain_before_accept(tmp_path: Path) -> None:
+def test_actionable_finding_completes_reviewer_accept_for_manager_decision(
+    tmp_path: Path,
+) -> None:
     manager = _Manager(tmp_path)
     driver = review_orchestrator.ReviewOrchestrator(
         manager, db_path=tmp_path / "review.sqlite", route_selector=_route
@@ -413,8 +736,27 @@ def test_actionable_finding_fails_chain_before_accept(tmp_path: Path) -> None:
 
     result = driver.drain(max_actions=1, now=NOW)
 
-    assert result.failed == 1
-    assert manager.accepts == []
+    assert result.completed == 1
+    assert result.failed == 0
+    assert manager.accepts == [
+        (
+            "review-request-correctness",
+            review_orchestrator.ReviewOrchestrator._reviewer_task_id(
+                {
+                    "schema_id": "aiworkhub.review_lifecycle.v1",
+                    "target_task_id": "TARGET",
+                    "target_request_id": "target-request",
+                    "claim_epoch": "1",
+                    "packet_sha256": "a" * 64,
+                    "candidate_sha256": "b" * 64,
+                },
+                "correctness",
+            ),
+        )
+    ]
+    rows = review_lifecycle.rows_for_test(tmp_path / "review.sqlite")
+    assert rows[1]["state"] == "completed"
+    assert json.loads(rows[1]["receipt_json"])["actionable_findings"] is True
 
 
 def test_terminal_receipt_card_event_mismatch_fails_closed(tmp_path: Path) -> None:
@@ -810,11 +1152,178 @@ def test_default_route_uses_canonical_workforce_contract(monkeypatch, tmp_path: 
     assert route == ROUTE
     task, catalog = captured[0]
     assert task.kinds == frozenset({"review"})
-    assert task.risk == "critical"
+    assert task.risk == "high"
     assert "session-manager" in task.tool_needs
     # The point of this wiring: ranking sees the evidenced catalog, and no
     # longer falls through to build_catalog's empty process/usage defaults.
     assert catalog == _CATALOG
+
+
+def test_default_route_real_rank_falls_back_from_unavailable_critical_route(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    """The production ranker must admit a high-capability read-only reviewer."""
+    tools = ["source-graph", "session-manager", "ai-memory", "kb"]
+
+    def worker(
+        worker_id: str, adapter_id: str, model: str, provider: str,
+        max_risk: str, *, available: bool,
+    ) -> dict:
+        return {
+            "worker_id": worker_id,
+            "adapter_id": adapter_id,
+            "model": model,
+            "provider": provider,
+            "supports": ["code", "research", "review"],
+            "tools": tools,
+            "max_context_tokens": 1_000_000,
+            "max_risk": max_risk,
+            "quality_ceiling": 0.97,
+            "manager_score_adjustment": 0.0,
+            "available": available,
+            "outcomes": {"sample_count": 0},
+        }
+
+    catalog = {
+        "schema_id": "aiworkhub.workforce_catalog.v1",
+        "workers": [
+            worker(
+                "claude-opus-5", "vscode_lm", "claude-opus-5", "anthropic",
+                "critical", available=False,
+            ),
+            worker(
+                "grok-4.6", "grok_kilo_cli", "xai/grok-4.6", "xai",
+                "high", available=True,
+            ),
+            worker(
+                "glm-5.2", "glm_vscode_lm", "glm-5.2", "zhipu",
+                "high", available=True,
+            ),
+            worker(
+                "deepseek-v4-pro", "deepseek_vscode_lm", "deepseek-v4-pro",
+                "deepseek", "high", available=True,
+            ),
+        ],
+    }
+    review_orchestrator.reset_routing_catalog_cache()
+    _ready_storage(monkeypatch)
+    monkeypatch.setattr(
+        review_orchestrator, "routing_catalog", lambda _repo: catalog,
+    )
+
+    route = review_orchestrator.select_reviewer_route(
+        tmp_path, "QUALITY_REVIEW_HIGH_FAILOVER", "correctness",
+        excluded_routes=frozenset({
+            ("copilot_claude-opus-5", "vscode_lm", "claude-opus-5"),
+        }),
+    )
+
+    assert route["adapter_id"] in {
+        "grok_kilo_cli", "glm_vscode_lm", "deepseek_vscode_lm",
+    }
+    assert route["model"] in {"xai/grok-4.6", "glm-5.2", "deepseek-v4-pro"}
+
+    critical_task = review_orchestrator.workforce_router.TaskRequirements.build(
+        task_id="QUALITY_REVIEW_CRITICAL",
+        repo_id="repo-test",
+        kinds=("review",),
+        risk="critical",
+        tool_needs=tools,
+    )
+    critical_rank = review_orchestrator.workforce_catalog.rank_task(
+        tmp_path, critical_task, catalog=catalog,
+    )
+    assert critical_rank["launch_contract"] is None
+    assert all(
+        "risk_exceeds_worker_limit" in candidate["exclusion_reasons"]
+        for candidate in critical_rank["candidates"]
+        if candidate["model"] != "claude-opus-5"
+    )
+
+
+def test_default_route_skips_manager_codex_cli_but_keeps_copilot_gpt(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    review_orchestrator.reset_routing_catalog_cache()
+    _ready_storage(monkeypatch)
+    monkeypatch.setattr(
+        review_orchestrator.workforce_catalog,
+        "rank_task",
+        lambda *_args, **_kwargs: {
+            "launch_contract": {
+                "runner": "codex_gpt-5.6-sol",
+                "adapter_id": "codex_cli",
+                "model": "gpt-5.6-sol",
+            },
+            "candidates": [
+                {
+                    "execution_runner": "codex_gpt-5.6-sol",
+                    "adapter_id": "codex_cli",
+                    "model": "gpt-5.6-sol",
+                    "excluded": False,
+                },
+                {
+                    "execution_runner": "copilot_gpt-5.6-sol",
+                    "adapter_id": "vscode_lm",
+                    "model": "gpt-5.6-sol",
+                    "excluded": False,
+                },
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        review_orchestrator.workforce_catalog,
+        "build_routing_catalog",
+        lambda _repo: dict(_CATALOG),
+    )
+
+    assert review_orchestrator.select_reviewer_route(
+        tmp_path, "QUALITY_REVIEW_EXACT", "correctness"
+    ) == {
+        "runner": "copilot_gpt-5.6-sol",
+        "adapter_id": "vscode_lm",
+        "model": "gpt-5.6-sol",
+    }
+
+
+def test_default_route_skips_the_exact_retired_route_identity(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    review_orchestrator.reset_routing_catalog_cache()
+    _ready_storage(monkeypatch)
+    monkeypatch.setattr(
+        review_orchestrator.workforce_catalog,
+        "rank_task",
+        lambda *_args, **_kwargs: {
+            "launch_contract": dict(FIRST_ROUTE),
+            "candidates": [
+                {
+                    **FIRST_ROUTE,
+                    "execution_runner": FIRST_ROUTE["runner"],
+                    "excluded": False,
+                },
+                {
+                    **SUCCESSOR_ROUTE,
+                    "execution_runner": SUCCESSOR_ROUTE["runner"],
+                    "excluded": False,
+                },
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        review_orchestrator.workforce_catalog,
+        "build_routing_catalog",
+        lambda _repo: dict(_CATALOG),
+    )
+
+    route = review_orchestrator.select_reviewer_route(
+        tmp_path, "QUALITY_REVIEW_SUCCESSOR", "correctness",
+        excluded_routes=frozenset({
+            review_orchestrator._review_route_identity(FIRST_ROUTE)
+        }),
+    )
+
+    assert route == SUCCESSOR_ROUTE
 
 
 def test_reviewer_route_still_selects_when_the_catalog_build_raises(

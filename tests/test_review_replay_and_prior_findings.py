@@ -42,7 +42,11 @@ from aiworkhub import (  # noqa: E402
 )
 
 NOW = datetime(2026, 9, 8, tzinfo=timezone.utc)
-ROUTE = {"runner": "codex56_reviewer", "adapter_id": "codex_cli", "model": "gpt-5.6-sol"}
+ROUTE = {
+    "runner": "copilot_gpt-5.6-sol",
+    "adapter_id": "vscode_lm",
+    "model": "gpt-5.6-sol",
+}
 CANDIDATE = "b" * 64
 MANIFEST_1 = "a" * 64
 MANIFEST_2 = "c" * 64
@@ -430,7 +434,7 @@ def test_a_replayed_report_that_fails_the_real_verifier_is_never_completed(
     assert len(manager.accepts) == accepted_before
 
 
-def test_a_replayed_actionable_finding_still_fails_the_chain(
+def test_a_replayed_actionable_finding_completes_for_manager_decision(
     tmp_path: Path, monkeypatch
 ) -> None:
     """A replay carries the judgment forward -- including a blocking one."""
@@ -471,9 +475,11 @@ def test_a_replayed_actionable_finding_still_fails_the_chain(
         findings=[{"disposition": "defect", "actionable": True}],
     )
 
-    assert driver.drain(max_actions=1, now=NOW).failed == 1
-    # The blocking judgment was carried forward, not re-derived, and it still
-    # stopped the chain -- and no second acceptance was minted on the way.
+    result = driver.drain(max_actions=1, now=NOW)
+    assert result.completed == 1
+    assert result.failed == 0
+    # The blocking judgment is carried forward for the manager's target
+    # decision without minting a second reviewer acceptance on the way.
     assert len(manager.accepts) == accepted_before
 
 

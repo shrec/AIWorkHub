@@ -673,9 +673,15 @@ def test_an_unenforcing_transport_is_told_the_text_is_the_only_control() -> None
         assert adapter_id in rendered
         assert "this instruction is the whole of the rule" in rendered
         assert "HMAC-authenticated MCP audit ledger" in rendered
-    # codex_cli, grok_kilo_cli and deepseek_manual: no argv deny, and a tool
-    # surface AIWorkHub does not own.
-    assert unenforcing == ["codex_cli", "grok_kilo_cli", "deepseek_manual"], unenforcing
+    # codex_cli, grok_kilo_cli, staged opencode_cli and deepseek_manual: no argv
+    # deny, and a tool surface AIWorkHub does not own. OpenCode moves out of
+    # this list only when task-route wiring applies its request-local policy.
+    assert unenforcing == [
+        "codex_cli",
+        "grok_kilo_cli",
+        "opencode_cli",
+        "deepseek_manual",
+    ], unenforcing
 
 
 def test_an_unknown_transport_is_treated_as_unenforcing() -> None:

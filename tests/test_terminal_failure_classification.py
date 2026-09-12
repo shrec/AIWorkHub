@@ -9,6 +9,7 @@ import pytest
 from aiworkhub.terminal_failure_classification import (
     MAX_DIAGNOSTIC_CHARS,
     MAX_TAIL_READ_BYTES,
+    FAILURE_CLASS_UNKNOWN,
     _CONTROL_PLANE_REASONS,
     _PROVIDER_REFUSAL_REASONS,
     _REASON_CONSTANTS,
@@ -17,7 +18,9 @@ from aiworkhub.terminal_failure_classification import (
     classify_terminal_failure,
     classify_terminal_failure_from_paths,
     constant,
+    failure_disposition,
     normalize_exit_code,
+    provider_terminal_signal,
     recognised_reason,
     safe_error_text,
     supervisor_failure_reason,
@@ -1329,3 +1332,230 @@ def test_semlock_unsupported_maps_to_finalize_failed_terminal() -> None:
             "finalize_failed:validation_unsupported_in_sandbox"
         )
         assert "auth_forbidden" not in classified["diagnostic"]
+
+
+def _opencode_jsonl(events: list[object]) -> str:
+    return "".join(json.dumps(event) + "\n" for event in events)
+
+
+def _opencode_step_finish(session_id: str = "ses_canary") -> dict[str, object]:
+    return {
+        "type": "step_finish",
+        "sessionID": session_id,
+        "reason": "stop",
+        "cost": 0,
+        "tokens": {
+            "total": 4368,
+            "input": 3072,
+            "output": 800,
+            "reasoning": 224,
+            "cache": {"read": 1024, "write": 64},
+        },
+    }
+
+
+def test_opencode_session_idle_with_step_finish_is_authoritative() -> None:
+    stdout = _opencode_jsonl(
+        [
+            {"type": "text", "sessionID": "ses_canary", "part": {"type": "text", "text": "ok"}},
+            _opencode_step_finish(),
+            {"type": "session.idle", "properties": {"sessionID": "ses_canary"}},
+        ]
+    )
+    signal = provider_terminal_signal(stdout)
+    assert signal["envelope"] == "session_idle"
+    placed = failure_disposition(stdout_tail=stdout)
+    assert placed["envelope"] == "session_idle"
+    assert placed["failure_class"] == FAILURE_CLASS_UNKNOWN
+    assert "sk-" not in json.dumps(placed)
+
+
+def test_opencode_missing_step_finish_and_stdout_exit_stay_unknown() -> None:
+    idle_only = _opencode_jsonl(
+        [{"type": "session.idle", "properties": {"sessionID": "ses_canary"}}]
+    )
+    idle_signal = provider_terminal_signal(idle_only)
+    assert idle_signal["envelope"] == ""
+    idle_placed = failure_disposition(stdout_tail=idle_only)
+    assert idle_placed["evidence"] == "no_provider_terminal_envelope"
+    assert idle_placed["envelope"] == ""
+    assert idle_placed["failure_class"] == FAILURE_CLASS_UNKNOWN
+
+    step_only = _opencode_jsonl([_opencode_step_finish()])
+    step_placed = failure_disposition(stdout_tail=step_only)
+    assert step_placed["evidence"] == "no_provider_terminal_envelope"
+
+    exit_only = failure_disposition(stdout_tail="exited with code 0\n")
+    assert exit_only["evidence"] == "no_provider_terminal_envelope"
+    assert exit_only["envelope"] == ""
+
+
+def test_opencode_duplicated_terminal_and_session_fallback() -> None:
+    duplicated = _opencode_jsonl(
+        [
+            _opencode_step_finish(),
+            {"type": "session.idle", "properties": {"sessionID": "ses_canary"}},
+            {"type": "session.idle", "properties": {"sessionID": "ses_canary"}},
+        ]
+    )
+    signal = provider_terminal_signal(duplicated)
+    assert signal["envelope"] == "session_idle"
+    assert failure_disposition(stdout_tail=duplicated)["envelope"] == "session_idle"
+
+    fallback = _opencode_jsonl(
+        [
+            _opencode_step_finish(),
+            {
+                "info": {
+                    "id": "ses_canary",
+                    "time": {"completed": 1757400000500},
+                }
+            },
+        ]
+    )
+    fallback_signal = provider_terminal_signal(fallback)
+    assert fallback_signal["envelope"] == "session_terminal"
+
+
+def test_opencode_hyphen_part_and_export_session_terminal() -> None:
+    nested = {
+        "type": "step_finish",
+        "sessionID": "ses_canary",
+        "part": {
+            "id": "prt_finish",
+            "type": "step-finish",
+            "sessionID": "ses_canary",
+            "messageID": "msg_canary",
+            "reason": "stop",
+            "cost": 0,
+            "tokens": {"total": 10, "input": 8, "output": 2, "reasoning": 0},
+        },
+    }
+    nested_idle = _opencode_jsonl(
+        [nested, {"type": "session.idle", "properties": {"sessionID": "ses_canary"}}]
+    )
+    assert provider_terminal_signal(nested_idle)["envelope"] == "session_idle"
+
+    stored_part = {
+        "id": "prt_finish",
+        "type": "step-finish",
+        "sessionID": "ses_canary",
+        "messageID": "msg_canary",
+        "reason": "stop",
+        "cost": 0,
+        "tokens": {"total": 10, "input": 8, "output": 2, "reasoning": 0},
+    }
+    export_only = _opencode_jsonl(
+        [
+            {
+                "info": {
+                    "id": "ses_canary",
+                    "time": {"completed": 1757400000500},
+                },
+                "messages": [
+                    {
+                        "id": "msg_canary",
+                        "sessionID": "ses_canary",
+                        "parts": [stored_part],
+                    }
+                ],
+            }
+        ]
+    )
+    export_placed = failure_disposition(stdout_tail=export_only)
+    assert provider_terminal_signal(export_only)["envelope"] == "session_terminal"
+    assert export_placed["envelope"] == "session_terminal"
+
+    completed_only = _opencode_jsonl(
+        [{"info": {"id": "ses_canary", "time": {"completed": 1757400000500}}}]
+    )
+    completed_placed = failure_disposition(stdout_tail=completed_only)
+    assert completed_placed["evidence"] == "no_provider_terminal_envelope"
+    assert completed_placed["envelope"] == ""
+
+    child_export = _opencode_jsonl(
+        [
+            {
+                "info": {
+                    "id": "ses_child",
+                    "parentID": "ses_canary",
+                    "time": {"completed": 1757400000500},
+                },
+                "messages": [
+                    {
+                        "sessionID": "ses_child",
+                        "parts": [
+                            {
+                                "type": "step-finish",
+                                "sessionID": "ses_child",
+                                "parentID": "ses_canary",
+                            }
+                        ],
+                    }
+                ],
+            }
+        ]
+    )
+    child_export_placed = failure_disposition(stdout_tail=child_export)
+    assert child_export_placed["evidence"] == "no_provider_terminal_envelope"
+
+    mismatched = _opencode_jsonl(
+        [
+            {
+                "info": {
+                    "id": "ses_other",
+                    "time": {"completed": 1757400000500},
+                },
+                "messages": [
+                    {
+                        "sessionID": "ses_canary",
+                        "parts": [{"type": "step-finish", "sessionID": "ses_canary"}],
+                    }
+                ],
+            }
+        ]
+    )
+    mismatched_placed = failure_disposition(stdout_tail=mismatched)
+    assert mismatched_placed["evidence"] == "no_provider_terminal_envelope"
+
+
+def test_opencode_child_malformed_and_secrets_fail_closed() -> None:
+    child = _opencode_jsonl(
+        [
+            {
+                "type": "step_finish",
+                "sessionID": "ses_child",
+                "parentID": "ses_canary",
+                "reason": "stop",
+                "cost": 0,
+                "tokens": {"total": 10, "input": 8, "output": 2, "reasoning": 0},
+            },
+            {
+                "type": "session.idle",
+                "properties": {"sessionID": "ses_child", "parentID": "ses_canary"},
+            },
+        ]
+    )
+    child_placed = failure_disposition(stdout_tail=child)
+    assert child_placed["evidence"] == "no_provider_terminal_envelope"
+    assert child_placed["envelope"] == ""
+
+    malformed = '{"type":"session.idle","properties":{"sessionID":"ses_canary"\n'
+    malformed_placed = failure_disposition(stdout_tail=malformed)
+    assert malformed_placed["evidence"] == "no_provider_terminal_envelope"
+
+    secret = _opencode_jsonl(
+        [
+            {
+                "type": "reasoning",
+                "text": "api_key=sk-SANITIZED_NOT_A_REAL_SECRET",
+                "sessionID": "ses_canary",
+            },
+            _opencode_step_finish(),
+            {"type": "session.idle", "properties": {"sessionID": "ses_canary"}},
+        ]
+    )
+    secret_placed = failure_disposition(stdout_tail=secret)
+    dumped = json.dumps(secret_placed)
+    assert "sk-SANITIZED_NOT_A_REAL_SECRET" not in dumped
+    assert secret_placed["envelope"] == "session_idle"

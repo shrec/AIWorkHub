@@ -744,6 +744,54 @@ def test_reconcile_dead_chains_is_idempotent_across_repeated_passes(tmp_path: Pa
     assert counts["pending"] == 0
 
 
+def test_route_unavailable_failure_requeues_exact_chain_and_descendants(
+    tmp_path: Path,
+) -> None:
+    db = tmp_path / "task.sqlite"
+    _chain(db)
+    action = _reserve(db)
+    reason = "RuntimeError:review_route_unavailable:correctness"
+    review_lifecycle.fail_action(
+        db, action_id=action.action_id, owner="worker-a", lease_token="lease-a",
+        reason=reason, now=NOW,
+    )
+    assert review_lifecycle.reconcile_dead_chains(db, now=NOW)["retired"] == 11
+
+    recovered = review_lifecycle.recover_route_unavailable_chains(db, now=NOW)
+
+    assert recovered == {
+        "examined": 1,
+        "recovered": 1,
+        "descendants_requeued": 11,
+    }
+    rows = review_lifecycle.rows_for_test(db)
+    assert {row["state"] for row in rows} == {"pending"}
+    assert all(row["failure_reason"] == "" for row in rows)
+    assert all(row["retired_due_to_action_id"] == "" for row in rows)
+    assert review_lifecycle.recover_route_unavailable_chains(
+        db, now=NOW
+    )["recovered"] == 0
+
+
+def test_route_unavailable_recovery_does_not_requeue_other_failures(
+    tmp_path: Path,
+) -> None:
+    db = tmp_path / "task.sqlite"
+    _chain(db)
+    action = _reserve(db)
+    review_lifecycle.fail_action(
+        db, action_id=action.action_id, owner="worker-a", lease_token="lease-a",
+        reason="RuntimeError:review_route_identity_invalid", now=NOW,
+    )
+    review_lifecycle.reconcile_dead_chains(db, now=NOW)
+
+    recovered = review_lifecycle.recover_route_unavailable_chains(db, now=NOW)
+
+    assert recovered["recovered"] == 0
+    assert review_lifecycle.lifecycle_counts(db)["failed"] == 1
+    assert review_lifecycle.lifecycle_counts(db)["retired"] == 11
+
+
 def test_reconcile_dead_chains_is_bounded_per_pass_and_progresses_deterministically(
     tmp_path: Path,
 ) -> None:

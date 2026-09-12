@@ -35,6 +35,105 @@ def _as_float(value: Any) -> float:
         return 0.0
 
 
+def _first_present(container: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        if key in container and container.get(key) is not None:
+            return container[key]
+    return None
+
+
+def _parse_json_fragment(raw: str) -> Any | None:
+    candidate = raw.strip()
+    if candidate.startswith("data:"):
+        candidate = candidate[5:].strip()
+    if not candidate or candidate[0] not in "{[":
+        return None
+    try:
+        return json.loads(candidate)
+    except json.JSONDecodeError:
+        return None
+
+
+def _event_type_name(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def _is_content_event_type(event_type: str) -> bool:
+    return event_type.replace("-", "_") in {"text", "reasoning", "reasoning_content"}
+
+
+def _is_token_delta_event_type(event_type: str) -> bool:
+    if event_type == "message_delta":
+        return False
+    return "delta" in event_type.replace("-", "_")
+
+
+def _opencode_parent_id(sources: tuple[dict[str, Any], ...]) -> str:
+    for source in sources:
+        containers: list[Any] = [
+            source,
+            source.get("properties"),
+            source.get("info"),
+            source.get("part"),
+        ]
+        props = source.get("properties")
+        if isinstance(props, dict):
+            containers.append(props.get("part"))
+        for container in containers:
+            if not isinstance(container, dict):
+                continue
+            parent = container.get("parentID")
+            if parent is None:
+                parent = container.get("parent_id")
+            if isinstance(parent, str) and parent.strip():
+                return parent.strip()[:128]
+    return ""
+
+
+def _opencode_record_identity(
+    usage: dict[str, Any],
+    cost_sources: tuple[dict[str, Any], ...],
+) -> tuple[Any, ...] | None:
+    if "total" not in usage:
+        return None
+    session = ""
+    part_id = ""
+    message_id = ""
+    cost_value = None
+    for source in cost_sources:
+        if not session:
+            raw_session = source.get("sessionID")
+            if raw_session is None:
+                raw_session = source.get("session_id")
+            if isinstance(raw_session, str) and raw_session.strip():
+                session = raw_session.strip()[:128]
+        if not part_id:
+            raw_id = source.get("id")
+            if isinstance(raw_id, str) and raw_id.strip():
+                part_id = raw_id.strip()[:128]
+        if not message_id:
+            raw_message = source.get("messageID")
+            if raw_message is None:
+                raw_message = source.get("message_id")
+            if isinstance(raw_message, str) and raw_message.strip():
+                message_id = raw_message.strip()[:128]
+        if cost_value is None and "cost" in source and source.get("cost") is not None:
+            cost_value = source.get("cost")
+    if session or part_id or message_id:
+        return ("id", session, part_id, message_id)
+    cache = usage.get("cache") if isinstance(usage.get("cache"), dict) else {}
+    return (
+        "fallback",
+        usage.get("total"),
+        usage.get("input"),
+        usage.get("output"),
+        usage.get("reasoning"),
+        cache.get("read"),
+        cache.get("write"),
+        cost_value,
+    )
+
+
 def _model_identity(value: Any) -> str:
     if isinstance(value, str):
         candidate = value.strip()
@@ -57,6 +156,8 @@ def _empty_summary() -> dict[str, Any]:
         "cached_input_tokens": 0,
         "cache_creation_input_tokens": 0,
         "cache_write_input_tokens": 0,
+        "total_tokens": 0,
+        "total_tokens_observed": False,
         "usage_observed": False,
         "cache_metrics_observed": False,
         "cost_usd": None,
@@ -106,15 +207,15 @@ def read_provider_usage(
         roots.append(json.loads(raw))
     except json.JSONDecodeError:
         for line in raw.splitlines()[:MAX_JSON_EVENTS]:
-            try:
-                roots.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
+            parsed = _parse_json_fragment(line)
+            if parsed is not None:
+                roots.append(parsed)
 
     samples: list[dict[str, Any]] = []
     sample_count = 0
     seen_nodes: set[int] = set()
     seen_usage: set[int] = set()
+    seen_opencode_records: set[tuple[Any, ...]] = set()
     seen_additive_cost: set[tuple[int, int]] = set()
     additive_cost_usd = 0.0
     additive_cost_seen = False
@@ -155,6 +256,7 @@ def read_provider_usage(
             "prompt_cache_hit_tokens",
             "cache_creation_input_tokens",
             "cache_write_input_tokens",
+            "total",
         }
         if (
             not any(key in usage for key in recognized_keys)
@@ -162,34 +264,51 @@ def read_provider_usage(
             and not cache_nested_observed
         ):
             return
+        if _opencode_parent_id(cost_sources):
+            return
+        opencode_tokens = "total" in usage
+        identity = (
+            _opencode_record_identity(usage, cost_sources) if opencode_tokens else None
+        )
+        if identity is not None:
+            if identity in seen_opencode_records:
+                return
+            seen_opencode_records.add(identity)
 
         input_tokens = _as_int(
-            usage.get("input_tokens")
-            or usage.get("prompt_tokens")
-            or usage.get("input")
+            _first_present(usage, "input_tokens", "prompt_tokens", "input")
         )
         output_tokens = _as_int(
-            usage.get("output_tokens")
-            or usage.get("completion_tokens")
-            or usage.get("output")
+            _first_present(usage, "output_tokens", "completion_tokens", "output")
         )
         reasoning_output_tokens = _as_int(
-            usage.get("reasoning_output_tokens") or usage.get("reasoning")
+            _first_present(usage, "reasoning_output_tokens", "reasoning")
         )
         cached_input_tokens = _as_int(
-            usage.get("cache_read_input_tokens")
-            or usage.get("cached_input_tokens")
-            or usage.get("prompt_cache_hit_tokens")
-            or details.get("cached_tokens")
-            or nested_cache.get("read")
+            _first_present(
+                usage,
+                "cache_read_input_tokens",
+                "cached_input_tokens",
+                "prompt_cache_hit_tokens",
+            )
         )
+        if cached_input_tokens == 0 and "cached_tokens" in details:
+            cached_input_tokens = _as_int(details.get("cached_tokens"))
+        if cached_input_tokens == 0 and "read" in nested_cache:
+            cached_input_tokens = _as_int(nested_cache.get("read"))
         cache_write_input_tokens = _as_int(
-            usage.get("cache_write_input_tokens") or nested_cache.get("write")
+            _first_present(usage, "cache_write_input_tokens")
         )
-        cache_creation_input_tokens = _as_int(
-            usage.get("cache_creation_input_tokens")
-            or cache_write_input_tokens
-        )
+        if cache_write_input_tokens == 0 and "write" in nested_cache:
+            cache_write_input_tokens = _as_int(nested_cache.get("write"))
+        if "cache_creation_input_tokens" in usage and usage.get(
+            "cache_creation_input_tokens"
+        ) is not None:
+            cache_creation_input_tokens = _as_int(
+                usage.get("cache_creation_input_tokens")
+            )
+        else:
+            cache_creation_input_tokens = cache_write_input_tokens
         cache_observed = any(
             key in usage
             for key in (
@@ -205,6 +324,12 @@ def read_provider_usage(
         result["cache_metrics_observed"] = bool(
             result["cache_metrics_observed"] or cache_observed
         )
+        combine = int.__add__ if opencode_tokens else max
+        if "total" in usage and usage.get("total") is not None:
+            result["total_tokens_observed"] = True
+            result["total_tokens"] = combine(
+                int(result["total_tokens"]), _as_int(usage.get("total"))
+            )
         if event_type == "message_delta":
             result["completed_turn_count"] += 1
             result["completed_turn_input_tokens"] += input_tokens
@@ -226,16 +351,17 @@ def read_provider_usage(
             ("cache_creation_input_tokens", cache_creation_input_tokens),
             ("cache_write_input_tokens", cache_write_input_tokens),
         ):
-            result[key] = max(int(result[key]), value)
+            result[key] = combine(int(result[key]), value)
 
         for source in (*cost_sources, usage):
             metrics = source.get("metrics") if isinstance(source.get("metrics"), dict) else {}
             snapshot_hit = False
-            for key, container in (
+            snapshot_fields: tuple[tuple[str, dict[str, Any]], ...] = (
                 ("total_cost_usd", source),
                 ("cost_usd", source),
                 ("cost", metrics),
-            ):
+            )
+            for key, container in snapshot_fields:
                 if key in container and container.get(key) is not None:
                     observed = _as_float(container.get(key))
                     snapshot_cost_usd = (
@@ -285,7 +411,13 @@ def read_provider_usage(
             if node_id in seen_nodes:
                 return
             seen_nodes.add(node_id)
-            local_type = str(value.get("type") or event_type or "")
+            if _opencode_parent_id((value,)):
+                return
+            local_type = _event_type_name(value.get("type") or event_type)
+            if _is_content_event_type(local_type) or _is_token_delta_event_type(
+                local_type
+            ):
+                return
             for key in ("model", "model_id"):
                 observed_model = _model_identity(value.get(key))
                 if observed_model and not result["model_observed"]:
@@ -360,6 +492,8 @@ def cumulative_total_tokens(summary: dict[str, Any], adapter_id: str) -> int | N
 
     if not summary.get("usage_observed"):
         return None
+    if summary.get("total_tokens_observed"):
+        return int(summary.get("total_tokens") or 0)
     total = int(summary.get("input_tokens") or 0) + int(
         summary.get("output_tokens") or 0
     )

@@ -29,6 +29,7 @@ SUPPORTED_ADAPTERS: tuple[str, ...] = (
     "glm_copilot_cli",
     "glm_vscode_lm",
     "grok_kilo_cli",
+    "opencode_cli",
     "deepseek_manual",
 )
 LOCAL_ADAPTERS: tuple[str, ...] = (
@@ -59,9 +60,9 @@ ADAPTER_EXECUTABLES: Mapping[str, str] = MappingProxyType(
         # Official Kilo CLI, authenticated against xAI in a request-scoped
         # home by the launcher.  This pure planner never reads credentials.
         "grok_kilo_cli": "kilo",
+        "opencode_cli": "opencode",
     }
 )
-
 # DeepSeek model selection. ``pro`` is the production coding default; ``flash``
 # is the cheaper/faster variant. A DeepSeek-labeled task may use only these
 # models -- never a GitHub-hosted Claude/GPT model.
@@ -87,6 +88,12 @@ GROK_KILO_ADAPTER = "grok_kilo_cli"
 GROK_KILO_SUPPORTED_MODELS: tuple[str, ...] = ("xai/grok-4.6",)
 GROK_KILO_DEFAULT_MODEL = GROK_KILO_SUPPORTED_MODELS[0]
 _KILO_EXTENSION_DIR_GLOB = "kilocode.kilo-code-*"
+OPENCODE_CLI_ADAPTER = "opencode_cli"
+OPENCODE_SNAP_BIN = "/snap/bin/opencode"
+OPENCODE_WORKER_MCP_SERVER = "aiworkhub_worker_ai_tools"
+OPENCODE_PERMISSION_ALLOW = "allow"
+OPENCODE_PERMISSION_DENY = "deny"
+OPENCODE_WINDOWS_RESOLUTION_FAIL_CLOSED = "opencode_cli_windows_resolution_fail_closed"
 VSCODE_LM_ADAPTER = "vscode_lm"
 WINDOWS_NATIVE_CLI_REQUIRES_APPCONTAINER = "windows_native_cli_requires_appcontainer_sandbox"
 # The single spelling of the Windows confinement backend.  This exact string is
@@ -114,6 +121,7 @@ ROUTE_FAMILY_COPILOT_BYOK_CLI = "copilot_byok_cli"
 ROUTE_FAMILY_CLAUDE_CLI = "claude_cli"
 ROUTE_FAMILY_CODEX_CLI = "codex_cli"
 ROUTE_FAMILY_KILO_XAI_CLI = "kilo_xai_cli"
+ROUTE_FAMILY_OPENCODE_CLI = "opencode_cli"
 ROUTE_FAMILY_UNKNOWN = "unknown"
 
 _ROUTE_FAMILY_BY_ADAPTER: Mapping[str, str] = MappingProxyType(
@@ -126,9 +134,9 @@ _ROUTE_FAMILY_BY_ADAPTER: Mapping[str, str] = MappingProxyType(
         "claude_cli": ROUTE_FAMILY_CLAUDE_CLI,
         "codex_cli": ROUTE_FAMILY_CODEX_CLI,
         GROK_KILO_ADAPTER: ROUTE_FAMILY_KILO_XAI_CLI,
+        OPENCODE_CLI_ADAPTER: ROUTE_FAMILY_OPENCODE_CLI,
     }
 )
-
 
 def route_family(adapter_id: str) -> str:
     """Return the protocol family this adapter speaks, or ``unknown``.
@@ -331,6 +339,10 @@ _RAW_DISCOVERY_ENFORCEMENT_REASONS: Mapping[str, str] = MappingProxyType(
             "overrides silently"
         ),
         GROK_KILO_ADAPTER: "kilo run exposes no tool-deny flag",
+        OPENCODE_CLI_ADAPTER: (
+            "opencode run exposes no argv tool-deny flag; "
+            "permission deny is request-local config"
+        ),
         VSCODE_LM_ADAPTER: "in-process bridge builds no provider argv",
         GLM_VSCODE_LM_ADAPTER: "in-process bridge builds no provider argv",
         DEEPSEEK_VSCODE_LM_ADAPTER: "in-process bridge builds no provider argv",
@@ -379,9 +391,9 @@ _ADAPTER_PROVIDERS: Mapping[str, str] = MappingProxyType(
         "glm_copilot_cli": "glm",
         "glm_vscode_lm": "glm",
         "grok_kilo_cli": "xai",
+        OPENCODE_CLI_ADAPTER: "opencode",
     }
 )
-
 
 def provider_for_adapter(adapter_id: str) -> str:
     """Return the provider family an adapter belongs to.
@@ -537,6 +549,7 @@ _RAW_EDITOR_DENY_STATES: Mapping[str, str] = MappingProxyType(
         GLM_COPILOT_ADAPTER: RAW_EDITOR_NOT_DENIED,
         "codex_cli": RAW_EDITOR_NOT_DENIED,
         GROK_KILO_ADAPTER: RAW_EDITOR_NOT_DENIED,
+        OPENCODE_CLI_ADAPTER: RAW_EDITOR_NOT_DENIED,
         VSCODE_LM_ADAPTER: RAW_EDITOR_ABSENT_FROM_SURFACE,
         GLM_VSCODE_LM_ADAPTER: RAW_EDITOR_ABSENT_FROM_SURFACE,
         DEEPSEEK_VSCODE_LM_ADAPTER: RAW_EDITOR_ABSENT_FROM_SURFACE,
@@ -692,7 +705,7 @@ def _validate_override_mapping(
         return None
     if not isinstance(executable_overrides, Mapping):
         return "executable overrides must be a mapping keyed by adapter id"
-    if any(key not in LOCAL_ADAPTERS for key in executable_overrides):
+    if any(key not in ADAPTER_EXECUTABLES for key in executable_overrides):
         return "executable overrides contain an unsupported adapter key"
     return None
 
@@ -800,6 +813,11 @@ def resolve_executable(
             adapter_id, None, False, "unsupported adapter"
         )
 
+    if adapter_id == OPENCODE_CLI_ADAPTER and _is_windows_host():
+        return ExecutableResolution(
+            adapter_id, None, False, OPENCODE_WINDOWS_RESOLUTION_FAIL_CLOSED
+        )
+
     override_error = _validate_override_mapping(executable_overrides)
     if override_error:
         return ExecutableResolution(adapter_id, None, False, override_error)
@@ -820,12 +838,29 @@ def resolve_executable(
     if not discovered:
         if adapter_id == GROK_KILO_ADAPTER:
             return _resolve_kilo_extension_executable(adapter_id)
+        if adapter_id == OPENCODE_CLI_ADAPTER and _is_linux_host():
+            try:
+                wrapper = Path(OPENCODE_SNAP_BIN)
+                resolved = wrapper.resolve(strict=True)
+            except (OSError, RuntimeError, ValueError):
+                return ExecutableResolution(
+                    adapter_id, None, False, f"executable not found: {binary}"
+                )
+            if not resolved.is_file() or not os.access(resolved, os.X_OK):
+                return ExecutableResolution(
+                    adapter_id,
+                    None,
+                    False,
+                    f"discovered executable is not executable: {binary}",
+                )
+            return ExecutableResolution(adapter_id, str(wrapper), True, "")
         return ExecutableResolution(
             adapter_id, None, False, f"executable not found: {binary}"
         )
 
     try:
-        resolved = Path(discovered).resolve(strict=True)
+        discovered_path = Path(discovered)
+        resolved = discovered_path.resolve(strict=True)
     except (OSError, RuntimeError, ValueError):
         return ExecutableResolution(
             adapter_id, None, False, f"discovered executable is not a file: {binary}"
@@ -836,7 +871,10 @@ def resolve_executable(
             adapter_id, None, False, f"discovered executable is not executable: {binary}"
         )
 
-    return ExecutableResolution(adapter_id, str(resolved), True, "")
+    executable = (
+        str(discovered_path) if adapter_id == OPENCODE_CLI_ADAPTER else str(resolved)
+    )
+    return ExecutableResolution(adapter_id, executable, True, "")
 
 
 def resolve_deepseek_model(model: str | None) -> tuple[str | None, str | None]:
@@ -875,6 +913,20 @@ def resolve_grok_kilo_model(model: str | None) -> tuple[str | None, str | None]:
             "unsupported_grok_kilo_model:"
             f"{candidate}:allowed={'|'.join(GROK_KILO_SUPPORTED_MODELS)}"
         )
+    return candidate, None
+
+
+def resolve_opencode_model(model: str | None) -> tuple[str | None, str | None]:
+    """Preserve an exact OpenCode ``provider/model`` identity; no inventory."""
+
+    if not isinstance(model, str) or not model.strip() or "\x00" in model:
+        return None, "unsupported_opencode_model:malformed"
+    candidate = model.strip()
+    if any(ch.isspace() for ch in candidate):
+        return None, "unsupported_opencode_model:malformed"
+    provider, sep, remainder = candidate.partition("/")
+    if not sep or not provider or not remainder or remainder.startswith("/"):
+        return None, "unsupported_opencode_model:missing_provider_or_model"
     return candidate, None
 
 
@@ -941,6 +993,10 @@ def _is_windows_host() -> bool:
     # function only because it is the seam the adapter tests inject a host
     # platform through; the decision itself is made in exactly one module.
     return platform_io.is_windows()
+
+
+def _is_linux_host() -> bool:
+    return platform_io.is_linux()
 
 
 def _resolve_additional_readonly_dirs(
@@ -1179,6 +1235,95 @@ def claude_disallowed_tools(*, read_only: bool) -> tuple[str, ...]:
     )
 
 
+OPENCODE_WORKER_MCP_TOOLS: tuple[str, ...] = (
+    "aiworkhub_worker_source_graph_query",
+    "aiworkhub_worker_session_current_state",
+    "aiworkhub_worker_ai_memory_search",
+    "aiworkhub_worker_ai_memory_get",
+    "aiworkhub_worker_ai_memory_related",
+    "aiworkhub_worker_kb_search",
+    "aiworkhub_worker_kb_get",
+    "aiworkhub_worker_kb_related",
+    "aiworkhub_worker_validation_output_page",
+    "aiworkhub_worker_exit_preflight",
+    "aiworkhub_worker_validation_run",
+    "aiworkhub_worker_semantic_edit_prepare",
+    "aiworkhub_worker_semantic_edit_apply",
+    "aiworkhub_worker_semantic_edit_exception_declare",
+    "aiworkhub_worker_session_write_intent",
+    "aiworkhub_worker_ai_memory_write_intent",
+    "aiworkhub_worker_kb_write_intent",
+)
+OPENCODE_DENIED_BUILTIN_TOOLS: tuple[str, ...] = (
+    "read",
+    "edit",
+    "bash",
+    "task",
+    "skill",
+    "lsp",
+    "websearch",
+    "glob",
+    "grep",
+    "webfetch",
+    "question",
+    "external_directory",
+    "doom_loop",
+)
+
+
+def opencode_mcp_tool_name(mcp_tool: str) -> str:
+    return f"{OPENCODE_WORKER_MCP_SERVER}_{mcp_tool}"
+
+
+def opencode_worker_permission_contract() -> dict[str, str]:
+    permission: dict[str, str] = {"*": OPENCODE_PERMISSION_DENY}
+    for tool in OPENCODE_DENIED_BUILTIN_TOOLS:
+        permission[tool] = OPENCODE_PERMISSION_DENY
+    for mcp_tool in OPENCODE_WORKER_MCP_TOOLS:
+        permission[opencode_mcp_tool_name(mcp_tool)] = OPENCODE_PERMISSION_ALLOW
+    return permission
+
+
+def _opencode_permission_pattern_matches(pattern: str, name: str) -> bool:
+    escaped = re.escape(pattern).replace(r"\*", ".*").replace(r"\?", ".")
+    return re.fullmatch(escaped, name) is not None
+
+
+def opencode_permission_action(tool_name: str) -> str:
+    action = OPENCODE_PERMISSION_DENY
+    for pattern, value in opencode_worker_permission_contract().items():
+        if _opencode_permission_pattern_matches(pattern, tool_name):
+            action = value
+    return action
+
+
+def opencode_tool_is_allowed(tool_name: str) -> bool:
+    return opencode_permission_action(tool_name) == OPENCODE_PERMISSION_ALLOW
+
+
+def build_opencode_worker_mcp_config(mcp_command: Sequence[str]) -> dict[str, Any]:
+    if isinstance(mcp_command, (str, bytes)) or not isinstance(mcp_command, Sequence):
+        raise ValueError("opencode_mcp_command_must_be_argv")
+    command: list[str] = []
+    for token in mcp_command:
+        if not isinstance(token, str) or not token or "\x00" in token:
+            raise ValueError("opencode_mcp_command_token_invalid")
+        command.append(token)
+    if not command:
+        raise ValueError("opencode_mcp_command_empty")
+    return {
+        "$schema": "https://opencode.ai/config.json",
+        "permission": opencode_worker_permission_contract(),
+        "mcp": {
+            OPENCODE_WORKER_MCP_SERVER: {
+                "type": "local",
+                "command": command,
+                "enabled": True,
+            }
+        },
+    }
+
+
 def build_runtime_command(
     adapter_id: str,
     prompt: str,
@@ -1339,6 +1484,20 @@ def build_runtime_command(
             "--dir",
             cwd,
             "--auto",
+            prompt,
+        ]
+    elif adapter_id == OPENCODE_CLI_ADAPTER:
+        resolved_model, model_error = resolve_opencode_model(model)
+        if model_error:
+            return _invalid_plan(adapter_id, model_error, cwd=cwd)
+        assert resolved_model is not None
+        argv = [
+            executable,
+            "run",
+            "--format",
+            "json",
+            "--model",
+            resolved_model,
             prompt,
         ]
     else:  # Copilot CLI in BYOK mode for OpenAI-compatible local-worker adapters

@@ -382,6 +382,22 @@ _KILO_XAI_CLI_CONTRACT = RouteContract(
     capabilities=MappingProxyType({}),
 )
 
+_OPENCODE_CLI_CONTRACT = RouteContract(
+    route_family=runtime_adapters.ROUTE_FAMILY_OPENCODE_CLI,
+    transport="native_cli_stdio_json",
+    protocol="opencode_cli",
+    protocol_version=UNKNOWN_VALUE,
+    model_families=(),
+    documentation_urls=(
+        "https://opencode.ai/docs/cli/",
+        "https://opencode.ai/docs/permissions/",
+    ),
+    documentation_retrieved_at=UNKNOWN_VALUE,
+    documentation_digest=UNKNOWN_VALUE,
+    last_verification=VERIFICATION_NEVER_RUN,
+    capabilities=MappingProxyType({}),
+)
+
 ROUTE_CONTRACTS: Mapping[str, RouteContract] = MappingProxyType(
     {
         contract.route_family: contract
@@ -391,6 +407,7 @@ ROUTE_CONTRACTS: Mapping[str, RouteContract] = MappingProxyType(
             _CODEX_CLI_CONTRACT,
             _COPILOT_BYOK_CLI_CONTRACT,
             _KILO_XAI_CLI_CONTRACT,
+            _OPENCODE_CLI_CONTRACT,
         )
     }
 )

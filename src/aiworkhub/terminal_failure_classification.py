@@ -1198,6 +1198,7 @@ PROVIDER_CODE_DISPOSITION: dict[str, str] = {
 # status or code is allowed to place a card.
 _PROVIDER_TERMINAL_ENVELOPES: tuple[str, ...] = (
     "result_api_error", "api_retry", "provider_error", "turn_failed",
+    "session_idle", "session_terminal",
 )
 
 # The two stream events a CLI writes ABOUT A FAILED REQUEST rather than about
@@ -1359,6 +1360,151 @@ def embedded_provider_objects(text: object) -> list[dict[str, Any]]:
     would show up as a route seal that matches nothing on a real log.
     """
     return _embedded_objects(text, 0)
+
+
+def _opencode_session_id(event: dict[str, Any]) -> str:
+    containers: list[dict[str, Any]] = [event]
+    props = event.get("properties")
+    if isinstance(props, dict):
+        containers.append(props)
+        nested_part = props.get("part")
+        if isinstance(nested_part, dict):
+            containers.append(nested_part)
+    part = event.get("part")
+    if isinstance(part, dict):
+        containers.append(part)
+    info = event.get("info")
+    if isinstance(info, dict):
+        containers.append(info)
+    for container in containers:
+        for key in ("sessionID", "session_id"):
+            value = container.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()[:128]
+    if isinstance(info, dict):
+        value = info.get("id")
+        if isinstance(value, str) and value.strip():
+            return value.strip()[:128]
+    return ""
+
+
+def _opencode_parent_id(event: dict[str, Any]) -> str:
+    containers: list[Any] = [
+        event,
+        event.get("properties"),
+        event.get("info"),
+        event.get("part"),
+    ]
+    props = event.get("properties")
+    if isinstance(props, dict):
+        containers.append(props.get("part"))
+    for container in containers:
+        if not isinstance(container, dict):
+            continue
+        value = container.get("parentID")
+        if value is None:
+            value = container.get("parent_id")
+        if isinstance(value, str) and value.strip():
+            return value.strip()[:128]
+    return ""
+
+
+def _opencode_is_step_finish(event: dict[str, Any]) -> bool:
+    kind = str(event.get("type") or "").strip().lower().replace("-", "_")
+    if kind == "step_finish":
+        return True
+    part = event.get("part")
+    if isinstance(part, dict) and str(part.get("type") or "").strip().lower().replace("-", "_") == "step_finish":
+        return True
+    props = event.get("properties")
+    if isinstance(props, dict):
+        part = props.get("part")
+        if isinstance(part, dict) and str(part.get("type") or "").strip().lower().replace("-", "_") == "step_finish":
+            return True
+    return False
+
+
+def _opencode_idle_session(event: dict[str, Any]) -> str:
+    kind = str(event.get("type") or "").strip().lower()
+    if kind in {"session.idle", "session_idle"}:
+        return _opencode_session_id(event)
+    if kind in {"session.status", "session_status"}:
+        props = event.get("properties") if isinstance(event.get("properties"), dict) else event
+        status = props.get("status") if isinstance(props, dict) else None
+        status_type = ""
+        if isinstance(status, dict):
+            status_type = str(status.get("type") or "").strip().lower()
+        elif isinstance(status, str):
+            status_type = status.strip().lower()
+        if status_type == "idle":
+            return _opencode_session_id(event)
+    return ""
+
+
+def _opencode_completed_session(event: dict[str, Any]) -> str:
+    info = event.get("info") if isinstance(event.get("info"), dict) else event
+    if not isinstance(info, dict):
+        return ""
+    time = info.get("time")
+    if not isinstance(time, dict):
+        return ""
+    completed = time.get("completed")
+    if completed in (None, "", False):
+        return ""
+    if isinstance(completed, (int, float)) and completed <= 0:
+        return ""
+    session = _opencode_session_id(event)
+    if session:
+        return session
+    value = info.get("id")
+    if isinstance(value, str) and value.strip():
+        return value.strip()[:128]
+    return ""
+
+
+def _record_opencode_terminal(event: dict[str, Any], found: dict[str, Any]) -> None:
+    steps = found.setdefault("_oc_steps", set())
+    idle = found.setdefault("_oc_idle", set())
+    completed = found.setdefault("_oc_completed", set())
+    children = found.setdefault("_oc_children", set())
+    session = _opencode_session_id(event)
+    parent = _opencode_parent_id(event)
+    if _opencode_is_step_finish(event) and session:
+        steps.add(session)
+        if parent:
+            children.add(session)
+    idle_session = _opencode_idle_session(event)
+    if idle_session:
+        idle.add(idle_session)
+        if parent:
+            children.add(idle_session)
+    completed_session = _opencode_completed_session(event)
+    if completed_session:
+        completed.add(completed_session)
+        if parent:
+            children.add(completed_session)
+    messages = event.get("messages")
+    if not isinstance(messages, list):
+        return
+    for message in messages[:64]:
+        if not isinstance(message, dict):
+            continue
+        parts = message.get("parts")
+        if not isinstance(parts, list):
+            continue
+        for part in parts[:64]:
+            if not isinstance(part, dict):
+                continue
+            if str(part.get("type") or "").strip().lower().replace("-", "_") != "step_finish":
+                continue
+            part_session = _opencode_session_id(part) or _opencode_session_id(message) or session
+            part_parent = _opencode_parent_id(part) or _opencode_parent_id(message) or parent
+            if part_session:
+                steps.add(part_session)
+                if part_parent:
+                    children.add(part_session)
+
+
 def _harvest_provider_event(event: object, found: dict[str, Any], depth: int = 0) -> None:
     """Fold one typed provider event into the accumulating signal.
 
@@ -1396,6 +1542,8 @@ def _harvest_provider_event(event: object, found: dict[str, Any], depth: int = 0
         # byte can reach a durable field through this path.
         found["code"] = next(key for key in PROVIDER_CODE_DISPOSITION if key == code)
 
+    _record_opencode_terminal(event, found)
+
     if not found["envelope"]:
         if (
             kind == "result"
@@ -1405,7 +1553,7 @@ def _harvest_provider_event(event: object, found: dict[str, Any], depth: int = 0
             found["envelope"] = _PROVIDER_TERMINAL_ENVELOPES[0]
         elif kind == "system" and subtype == "api_retry":
             found["envelope"] = _PROVIDER_TERMINAL_ENVELOPES[1]
-        elif kind == "error":
+        elif kind in {"error", "session.error", "session_error"}:
             found["envelope"] = _PROVIDER_TERMINAL_ENVELOPES[2]
         elif kind == "turn.failed":
             found["envelope"] = _PROVIDER_TERMINAL_ENVELOPES[3]
@@ -1439,11 +1587,21 @@ def provider_terminal_signal(text: str | None) -> dict[str, Any]:
     ``transient`` costs the card's bounded retry budget and nothing else, and a
     forged ``credential`` pauses a lane and destroys no work.
     """
-    found: dict[str, Any] = {"status": None, "code": "", "envelope": ""}
+    found: dict[str, Any] = {
+        "status": None,
+        "code": "",
+        "envelope": "",
+        "_oc_steps": set(),
+        "_oc_idle": set(),
+        "_oc_completed": set(),
+        "_oc_children": set(),
+    }
     for index, raw_line in enumerate(str(text or "").splitlines()):
         if index >= _MAX_SIGNAL_LINES:
             break
         line = raw_line.strip()
+        if line.startswith("data:"):
+            line = line[5:].strip()
         if not line.startswith("{"):
             continue
         try:
@@ -1451,7 +1609,18 @@ def provider_terminal_signal(text: str | None) -> dict[str, Any]:
         except (TypeError, ValueError):
             continue
         _harvest_provider_event(event, found)
-    return found
+    if not found["envelope"]:
+        children = found["_oc_children"]
+        steps = found["_oc_steps"] - children
+        if found["_oc_idle"] & steps:
+            found["envelope"] = _PROVIDER_TERMINAL_ENVELOPES[4]
+        elif found["_oc_completed"] & steps:
+            found["envelope"] = _PROVIDER_TERMINAL_ENVELOPES[5]
+    return {
+        "status": found["status"],
+        "code": found["code"],
+        "envelope": found["envelope"],
+    }
 
 
 def disposition_for_reason(reason: str | None) -> str:

@@ -529,3 +529,50 @@ def test_declared_code_path_claims_match_the_bridge_allowlist():
     assert submit_record.state == submit_expected
     assert submit in dispatched
     assert first_line <= at_line[submit] <= last_line
+
+
+def test_opencode_cli_registers_its_own_family_without_changing_existing_identities() -> None:
+    existing = (
+        runtime_adapters.VSCODE_LM_ADAPTER,
+        "claude_cli",
+        "codex_cli",
+        runtime_adapters.DEEPSEEK_COPILOT_ADAPTER,
+        runtime_adapters.GROK_KILO_ADAPTER,
+    )
+    before = {adapter_id: runtime_adapters.route_family(adapter_id) for adapter_id in existing}
+    assert runtime_adapters.OPENCODE_CLI_ADAPTER in runtime_adapters.SUPPORTED_ADAPTERS
+    assert runtime_adapters.OPENCODE_CLI_ADAPTER not in runtime_adapters.LOCAL_ADAPTERS
+    assert runtime_adapters.route_family(runtime_adapters.OPENCODE_CLI_ADAPTER) == (
+        runtime_adapters.ROUTE_FAMILY_OPENCODE_CLI
+    )
+    assert before == {
+        adapter_id: runtime_adapters.route_family(adapter_id) for adapter_id in existing
+    }
+    assert runtime_adapters.ROUTE_FAMILY_OPENCODE_CLI in contracts.ROUTE_CONTRACTS
+
+
+def test_opencode_capabilities_are_unverified_until_measured() -> None:
+    family = runtime_adapters.ROUTE_FAMILY_OPENCODE_CLI
+    contract = contracts.ROUTE_CONTRACTS[family]
+    assert contract.last_verification == contracts.VERIFICATION_NEVER_RUN
+    assert contract.documentation_retrieved_at == contracts.UNKNOWN_VALUE
+    assert contract.documentation_digest == contracts.UNKNOWN_VALUE
+    assert contract.protocol_version == contracts.UNKNOWN_VALUE
+    assert contract.model_families == ()
+    for capability in contracts.CAPABILITY_VOCABULARY:
+        record = contracts.capability_record(family, capability)
+        assert record.state == contracts.CAPABILITY_UNKNOWN
+        assert record.evidence_class == contracts.EVIDENCE_UNVERIFIED
+        assert contracts.route_can_complete(family, capability) is False
+        assert contracts.adapter_can_complete(
+            runtime_adapters.OPENCODE_CLI_ADAPTER, capability
+        ) is False
+    description = contracts.describe_adapter_capabilities(
+        runtime_adapters.OPENCODE_CLI_ADAPTER
+    )
+    assert description["route_family"] == family
+    assert "install" not in str(description).lower()
+    assert "round_trip" not in str(description).lower() or all(
+        item["evidence_class"] == contracts.EVIDENCE_UNVERIFIED
+        for item in description["capabilities"].values()
+    )
