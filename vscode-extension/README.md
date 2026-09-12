@@ -29,6 +29,15 @@ port, expose a LAN service or require an AIWorkHub cloud account.
 - Four pre-existing regressions remain open and are tracked, not fixed, in
   this release (NF-2026-00796, NF-2026-00798).
 
+Automatic quality-review launch moves worker completion through a
+system-owned correctness, security, and code-quality chain without
+prematurely waking the manager. After every required lens passes, one
+authenticated aggregate binds the candidate and reviewer evidence and emits
+exactly one manager callback. Review automation never accepts or rejects the
+implementation target; the verified manager receives only the completed
+decision packet. Legacy review receipts remain compatible without blocking
+later chains.
+
 Detailed older history stays in the
 [changelog](https://github.com/shrec/AIWorkHub/blob/main/vscode-extension/CHANGELOG.md).
 
