@@ -6925,6 +6925,15 @@ def _latest_operational_recovery_projection(
             if isinstance(evidence, dict)
             else ""
         )
+        # A ``terminal_failure`` that declares its own top-level ``request_id``
+        # must agree with its embedded ``evidence.request_id``: a mismatch is
+        # tampered/self-inconsistent evidence and fails closed immediately,
+        # rather than falling through to authenticate a DIFFERENT, otherwise
+        # legitimate lineage from the canonical event pair below. Most real
+        # terminal_failure projections never carry this top-level field at
+        # all (only ``evidence.request_id``), so its absence is not itself a
+        # tamper signal.
+        inline_own_request_id = str(inline.get("request_id") or "").strip()
         if (
             str(inline.get("task_id") or task_id) == task_id
             and inline.get("substatus")
@@ -6932,6 +6941,10 @@ def _latest_operational_recovery_projection(
             and isinstance(evidence, dict)
             and re.fullmatch(r"[0-9a-f]{32}", inline_request_id) is not None
             and type(inline.get("claim_epoch")) is int
+            and (
+                not inline_own_request_id
+                or inline_own_request_id == inline_request_id
+            )
         ):
             if inline_request_id == latest_request_id:
                 return dict(inline)
