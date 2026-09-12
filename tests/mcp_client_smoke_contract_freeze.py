@@ -224,10 +224,18 @@ def run_smoke() -> dict[str, Any]:
         schemas_b = asyncio.run(_list_tools_via_client())
 
         visible = set(schemas_a)
+        # This harness runs in a single already-imported server process (see
+        # ``_gate_env``, AIWORKHUB_ALLOW_WRITES="0"), so the write-gated
+        # decorator decided registration once, at import, with writes off --
+        # a correctly write-gated tool is ABSENT here by design for the whole
+        # run. ``required_tools`` carves WRITE_GATED_TOOLS out of the "must
+        # match frozen fingerprint" requirement while writes are off; the
+        # read-only closure is unaffected.
+        required_tools = set(FROZEN_SCHEMA_FINGERPRINTS) - set(WRITE_GATED_TOOLS)
         ro_visible = [n for n in READONLY_TOOLS if n in visible]
         wg_visible = [n for n in WRITE_GATED_TOOLS if n in visible]
         checks["readonly_tools_visible"] = set(ro_visible) == set(READONLY_TOOLS)
-        checks["write_gated_tools_visible"] = set(wg_visible) == set(WRITE_GATED_TOOLS)
+        checks["write_gated_tools_visible"] = not wg_visible
         detail["readonly_tools_visible"] = sorted(ro_visible)
         detail["write_gated_tools_visible"] = sorted(wg_visible)
         detail["total_tools_visible"] = len(visible)
@@ -235,7 +243,7 @@ def run_smoke() -> dict[str, Any]:
         cur_fp = {n: _canon_fp(s) for n, s in schemas_a.items()}
         fp_b = {n: _canon_fp(s) for n, s in schemas_b.items()}
         mismatches = sorted(
-            n for n in FROZEN_SCHEMA_FINGERPRINTS
+            n for n in required_tools
             if cur_fp.get(n) != FROZEN_SCHEMA_FINGERPRINTS[n]
         )
         deterministic = cur_fp == fp_b

@@ -113,6 +113,15 @@ WRITE_GATED_TOOLS: tuple[str, ...] = (
     "aiworkhub_task_export_jsonl",
 )
 
+# Raw ``state_byte_identical`` (see the round dicts below) is diagnostic-only
+# and must NEVER be folded into any pass/fail check in this harness: each
+# server subprocess's own startup reconciler MEASURABLY takes a zero-byte
+# advisory ``process_events.jsonl.lock``, so raw byte-identity is always
+# false here, and any check requiring it would be permanently red regardless
+# of real writes. ``state_byte_identical_excl_tolerated_lock`` is the correct
+# replacement -- strictly stronger than ``state_holds_no_records`` alone --
+# and is the only byte-identity signal any check here may use.
+
 # The SAME byte-canonical sha256(inputSchema) values frozen at B108. A drift in
 # ANY tool's input schema flips concurrent_contract_v1 to false over the pipe.
 # RE-FROZEN 2026-09-08. This harness had never been RUN since it was written:
@@ -179,6 +188,19 @@ def _snapshot_dir(d: Path) -> list[tuple[str, int, str]]:
          hashlib.sha256(p.read_bytes()).hexdigest())
         for p in d.rglob("*") if p.is_file()
     )
+
+
+_TOLERATED_ADVISORY_LOCK = "process_events.jsonl.lock"
+
+
+def _exclude_tolerated_lock(
+    rows: list[tuple[str, int, str]],
+) -> list[tuple[str, int, str]]:
+    """Drop exactly the zero-byte reconciler startup lock, nothing else."""
+    return [
+        row for row in rows
+        if not (row[0] == _TOLERATED_ADVISORY_LOCK and row[1] == 0)
+    ]
 
 
 def _readonly_args(runner: str, tag: str) -> dict[str, dict[str, Any]]:
@@ -326,10 +348,22 @@ async def _concurrent_round(
         and RUNNER_B in cmd_b and RUNNER_A not in cmd_b
     )
 
-    state_ok = (
-        after_a == before_a and after_b == before_b
-        and after_a == [] and after_b == []
+    # MEASURED (see the analogous note in mcp_stdio_client_smoke.py): each
+    # server subprocess's own startup reconciler takes ONE zero-byte advisory
+    # lock, ``process_events.jsonl.lock``, next to its isolated audit dir --
+    # not a queue/audit write. The byte-identity comparison excludes EXACTLY
+    # that one zero-byte file from both the before and after snapshots of
+    # each session's state dir and requires the remaining trees to match byte
+    # for byte; any other new file, size change, or content mutation in
+    # either session's state dir still fails this gate.
+    state_byte_identical_excl_tolerated_lock = (
+        _exclude_tolerated_lock(before_a) == _exclude_tolerated_lock(after_a)
+        and _exclude_tolerated_lock(before_b) == _exclude_tolerated_lock(after_b)
     )
+    state_holds_no_records = (
+        _exclude_tolerated_lock(after_a) == [] and _exclude_tolerated_lock(after_b) == []
+    )
+    state_ok = state_byte_identical_excl_tolerated_lock
     return {
         "ok": bool(overlap_confirmed and no_tool_errors and bleed_ok and state_ok
                    and verify_before == 0 and verify_after == 0),
@@ -344,13 +378,36 @@ async def _concurrent_round(
         "state_a_before": before_a, "state_a_after": after_a,
         "state_b_before": before_b, "state_b_after": after_b,
         "state_byte_identical": after_a == before_a and after_b == before_b,
+        "state_byte_identical_excl_tolerated_lock": state_byte_identical_excl_tolerated_lock,
         "state_empty": after_a == [] and after_b == [],
+        "state_holds_no_records": state_holds_no_records,
         "queue_verify_before_rc": verify_before,
         "queue_verify_after_rc": verify_after,
         "queue_verify_intact": verify_before == 0 and verify_after == 0,
         "schemas_a": res_a["schemas"],
         "schemas_b": res_b["schemas"],
     }
+
+
+async def _attempt_write_gated_calls_via_stdio(audit_log: Path) -> dict[str, bool]:
+    """Confirm each write-gated tool is REJECTED on ``tools/call`` while the
+    child has ``AIWORKHUB_ALLOW_WRITES`` unset -- not merely absent from
+    ``tools/list``. A tool the server never registered has no dispatch
+    target, so the client either gets an error result or the call raises;
+    either outcome counts as rejected.
+    """
+    params = _server_params(audit_log, allow_writes=False)
+    rejected: dict[str, bool] = {}
+    async with stdio_client(params) as (read, write):
+        async with ClientSession(read, write, read_timeout_seconds=REQUEST_TIMEOUT) as s:
+            await s.initialize()
+            for name in WRITE_GATED_TOOLS:
+                try:
+                    r = await s.call_tool(name, {}, read_timeout_seconds=REQUEST_TIMEOUT)
+                    rejected[name] = bool(r.isError)
+                except Exception:
+                    rejected[name] = True
+    return rejected
 
 
 def run_smoke() -> dict[str, Any]:
@@ -403,26 +460,48 @@ def run_smoke() -> dict[str, Any]:
         checks["readonly_tools_visible"] = (
             set(READONLY_TOOLS) <= vis_a and set(READONLY_TOOLS) <= vis_b
         )
-        checks["write_gated_tools_visible"] = (
-            set(WRITE_GATED_TOOLS) <= vis_a and set(WRITE_GATED_TOOLS) <= vis_b
-        )
+        # Both sessions in this round are spawned with ALLOW_WRITES unset (see
+        # the ``_concurrent_round(sa1, sb1, allow_writes=False)`` call above),
+        # so a correctly write-gated tool is ABSENT here by design -- that is
+        # the fix, not a regression.
+        wg_visible_a = [n for n in WRITE_GATED_TOOLS if n in vis_a]
+        wg_visible_b = [n for n in WRITE_GATED_TOOLS if n in vis_b]
+        checks["write_gated_tools_visible"] = not wg_visible_a and not wg_visible_b
         detail["readonly_tools_visible"] = sorted(n for n in READONLY_TOOLS if n in vis_a)
-        detail["write_gated_tools_visible"] = sorted(n for n in WRITE_GATED_TOOLS if n in vis_a)
+        detail["write_gated_tools_visible"] = sorted(wg_visible_a)
         detail["total_tools_visible"] = len(vis_a)
         detail["total_tools_visible_session_b"] = len(vis_b)
 
         # --- C3/C4 frozen fingerprints in BOTH sessions + cross agreement --
+        # ``required_tools`` carves WRITE_GATED_TOOLS out of the "must match
+        # frozen fingerprint" requirement while writes are off in this round;
+        # the read-only closure is unaffected.
+        required_tools = set(FROZEN_SCHEMA_FINGERPRINTS) - set(WRITE_GATED_TOOLS)
         fp_a = {n: _canon_fp(s) for n, s in schemas_a.items()}
         fp_b = {n: _canon_fp(s) for n, s in schemas_b.items()}
-        mism_a = sorted(n for n in FROZEN_SCHEMA_FINGERPRINTS
+        mism_a = sorted(n for n in required_tools
                         if fp_a.get(n) != FROZEN_SCHEMA_FINGERPRINTS[n])
-        mism_b = sorted(n for n in FROZEN_SCHEMA_FINGERPRINTS
+        mism_b = sorted(n for n in required_tools
                         if fp_b.get(n) != FROZEN_SCHEMA_FINGERPRINTS[n])
         checks["schema_fingerprints_match_frozen"] = not mism_a and not mism_b
         checks["schema_deterministic_across_concurrent_sessions"] = fp_a == fp_b
         detail["schema_fingerprint_mismatches_session_a"] = mism_a
         detail["schema_fingerprint_mismatches_session_b"] = mism_b
         detail["frozen_schema_fingerprints"] = FROZEN_SCHEMA_FINGERPRINTS
+
+        # --- write-gated tools REJECTED on tools/call while disallowed ------
+        # A dedicated probe dir, isolated from the round state dirs above, so
+        # this subprocess's own audit/process-log files never perturb any
+        # snapshot-based byte-identity proof.
+        probe_dir = Path(tempfile.mkdtemp(prefix="aiworkhub_b110_write_probe_"))
+        try:
+            write_gated_rejections = asyncio.run(
+                _attempt_write_gated_calls_via_stdio(probe_dir / "audit.jsonl")
+            )
+        finally:
+            shutil.rmtree(probe_dir, ignore_errors=True)
+        checks["write_gated_tools_call_rejected"] = all(write_gated_rejections.values())
+        detail["write_gated_tools_call_rejected"] = write_gated_rejections
 
         # --- C5 overlap, C6 no-bleed, C7/C8 no-write per round -------------
         checks["concurrent_sessions_overlap"] = bool(
@@ -433,12 +512,12 @@ def run_smoke() -> dict[str, Any]:
             and r_unset["distinct_audit_dirs"] and r_set["distinct_audit_dirs"]
         )
         checks["no_write_allow_unset"] = bool(
-            r_unset["ok"] and r_unset["state_byte_identical"]
-            and r_unset["state_empty"] and r_unset["queue_verify_intact"]
+            r_unset["ok"] and r_unset["state_byte_identical_excl_tolerated_lock"]
+            and r_unset["state_holds_no_records"] and r_unset["queue_verify_intact"]
         )
         checks["no_write_allow_set"] = bool(
-            r_set["ok"] and r_set["state_byte_identical"]
-            and r_set["state_empty"] and r_set["queue_verify_intact"]
+            r_set["ok"] and r_set["state_byte_identical_excl_tolerated_lock"]
+            and r_set["state_holds_no_records"] and r_set["queue_verify_intact"]
         )
         # Compact, path-free round snapshots for the eval artifact.
         detail["round_allow_unset"] = {
@@ -446,7 +525,9 @@ def run_smoke() -> dict[str, Any]:
                 "overlap_confirmed", "no_tool_errors", "distinct_audit_dirs",
                 "session_a_sees_own_runner", "session_a_sees_other_runner",
                 "session_b_sees_own_runner", "session_b_sees_other_runner",
-                "no_cross_session_bleed", "state_byte_identical", "state_empty",
+                "no_cross_session_bleed", "state_byte_identical",
+                "state_byte_identical_excl_tolerated_lock", "state_empty",
+                "state_holds_no_records",
                 "queue_verify_before_rc", "queue_verify_after_rc",
                 "queue_verify_intact", "ok",
             )

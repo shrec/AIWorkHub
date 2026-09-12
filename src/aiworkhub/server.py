@@ -566,6 +566,24 @@ def _serialize_task_lifecycle_write(function: Any) -> Any:
     return wrapped
 
 
+def _write_gated_tool(*args: Any, **kwargs: Any) -> Any:
+    """Register an MCP tool only while ``core.writes_allowed()`` is true.
+
+    Mirrors ``@mcp.tool(...)`` but, when writes are not allowed, skips SDK/
+    stdio registration entirely instead of registering and refusing at call
+    time -- so the tool is absent from ``tools/list`` for read-only sessions.
+    The function itself is always returned unwrapped and directly callable
+    by internal Python callers and tests either way.
+    """
+
+    def decorate(function: Any) -> Any:
+        if core.writes_allowed():
+            return mcp.tool(*args, **kwargs)(function)
+        return function
+
+    return decorate
+
+
 # ---------------------------------------------------------------------------
 # Mutation receipts.
 #
@@ -2370,7 +2388,7 @@ def aiworkhub_task_pending_for_runner(runner: str, topic: str | None = None) -> 
     return core.pending_for_runner(runner=runner, topic=topic)
 
 
-@mcp.tool()
+@_write_gated_tool()
 @_serialize_task_lifecycle_write
 def aiworkhub_task_auto_pickup(runner: str, topic: str | None = None) -> dict[str, Any]:
     """Write-gated: claim and start the next task for a runner.
@@ -2420,7 +2438,7 @@ def aiworkhub_task_auto_pickup_dryrun(runner: str, topic: str | None = None) -> 
     return core.auto_pickup_dryrun(runner=runner, topic=topic)
 
 
-@mcp.tool()
+@_write_gated_tool()
 @_serialize_task_lifecycle_write
 def aiworkhub_task_mark_review(task_id: str) -> dict[str, Any]:
     """Write-gated: mark a worker task as ready for Codex review."""
@@ -2428,7 +2446,7 @@ def aiworkhub_task_mark_review(task_id: str) -> dict[str, Any]:
     return core.mark_review(task_id=task_id)
 
 
-@mcp.tool()
+@_write_gated_tool()
 @_serialize_task_lifecycle_write
 def aiworkhub_task_mark_done(task_id: str, include_card: CardInclude = "none") -> dict[str, Any]:
     """Write-gated: finalize a reviewed task as done.
@@ -2734,7 +2752,7 @@ def aiworkhub_task_usage_report(
     return core.usage_report(runner=runner, topic=topic, status=status)
 
 
-@mcp.tool()
+@_write_gated_tool()
 def aiworkhub_task_export_jsonl() -> dict[str, Any]:
     """Write-gated: export SQLite task queue back to JSONL manifest."""
 

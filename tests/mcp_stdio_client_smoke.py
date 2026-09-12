@@ -96,6 +96,15 @@ WRITE_GATED_TOOLS: tuple[str, ...] = (
     "aiworkhub_task_export_jsonl",
 )
 
+# Raw ``state_byte_identical`` (see the round dicts below) is diagnostic-only
+# and must NEVER be folded into any pass/fail check in this harness: the
+# server's own startup reconciler MEASURABLY takes a zero-byte advisory
+# ``process_events.jsonl.lock``, so raw byte-identity is always false here,
+# and any check requiring it would be permanently red regardless of real
+# writes. ``state_byte_identical_excl_tolerated_lock`` is the correct
+# replacement -- strictly stronger than ``state_holds_no_records`` alone --
+# and is the only byte-identity signal any check here may use.
+
 # Byte-canonical sha256(inputSchema) for the 33 tools frozen at B109. A removed,
 # renamed, or schema-drifted frozen tool flips frozen_contract_v1 to false.
 # RE-FROZEN 2026-09-08, and NARROWED, with the measurement for both.
@@ -224,6 +233,19 @@ def _snapshot_dir(d: Path) -> list[tuple[str, int, str]]:
     )
 
 
+_TOLERATED_ADVISORY_LOCK = "process_events.jsonl.lock"
+
+
+def _exclude_tolerated_lock(
+    rows: list[tuple[str, int, str]],
+) -> list[tuple[str, int, str]]:
+    """Drop exactly the zero-byte reconciler startup lock, nothing else."""
+    return [
+        row for row in rows
+        if not (row[0] == _TOLERATED_ADVISORY_LOCK and row[1] == 0)
+    ]
+
+
 def _server_params(audit_log: Path, allow_writes: bool | None) -> StdioServerParameters:
     """Build stdio params that launch ONLY the MCP server subprocess.
 
@@ -279,33 +301,58 @@ async def _run_readonly_round_via_stdio(state_dir: Path, allow_writes: bool) -> 
                     return {"ok": False, "reason": f"tool_error:{name}"}
     after = _snapshot_dir(state_dir)
     verify_after = core.run_taskctl(["verify"]).returncode
-    # "Empty" was always meant as "holds no RECORD". MEASURED 2026-09-08 with
-    # this harness pointed at a freshly initialized repository -- which is what
-    # a CI runner is -- the server child creates ONE zero-byte advisory lock,
-    # ``process_events.jsonl.lock``, next to the process log this harness
-    # deliberately redirects into the state dir. It is created by the server's
-    # own startup (the reconciler taking the process-log lock), not by any
-    # ``tools/call``; against a developer machine where another AIWorkHub server
-    # already holds that lock it never appeared, which is why this check looked
-    # green here and would have been red in CI.
+    # MEASURED 2026-09-08 with this harness pointed at a freshly initialized
+    # repository -- which is what a CI runner is -- the server child creates
+    # ONE zero-byte advisory lock, ``process_events.jsonl.lock``, next to the
+    # process log this harness deliberately redirects into the state dir. It
+    # is created by the server's own startup (the reconciler taking the
+    # process-log lock), not by any ``tools/call``; against a developer
+    # machine where another AIWorkHub server already holds that lock it never
+    # appeared, which is why this check looked green here and would have been
+    # red in CI.
     #
-    # A zero-byte ``*.lock`` is therefore tolerated and NOTHING else is: a lock
-    # with any content, a file that is not a lock, or ANY change across the
-    # round still fails. ``state_byte_identical`` is untouched and remains the
-    # primary tooth.
-    records = [row for row in after if not (row[0].endswith(".lock") and row[1] == 0)]
+    # The byte-identity comparison tolerates EXACTLY that one known file: the
+    # state_dir tree is compared before vs. after with the zero-byte
+    # ``process_events.jsonl.lock`` entry excluded from both sides, and
+    # nothing else. Any other byte-level change -- a lock with content, a
+    # file that is not that lock, a mutation to a pre-existing file -- still
+    # fails ``state_byte_identical_excl_tolerated_lock``. Raw
+    # ``state_byte_identical`` is left untouched below for diagnostics.
+    before_excl_lock = _exclude_tolerated_lock(before)
+    after_excl_lock = _exclude_tolerated_lock(after)
     return {
         "ok": True,
         "state_before": before,
         "state_after": after,
         "state_byte_identical": before == after,
+        "state_byte_identical_excl_tolerated_lock": before_excl_lock == after_excl_lock,
         "state_empty": after == [],
-        "state_holds_no_records": records == [],
-        "tolerated_empty_locks": [row[0] for row in after if row not in records],
+        "state_holds_no_records": after_excl_lock == [],
         "queue_verify_before_rc": verify_before,
         "queue_verify_after_rc": verify_after,
         "queue_verify_intact": verify_before == 0 and verify_after == 0,
     }
+
+
+async def _attempt_write_gated_calls_via_stdio(audit_log: Path) -> dict[str, bool]:
+    """Confirm each write-gated tool is REJECTED on ``tools/call`` while the
+    child has ``AIWORKHUB_ALLOW_WRITES`` unset -- not merely absent from
+    ``tools/list``. A tool the server never registered has no dispatch
+    target, so the client either gets an error result or the call raises;
+    either outcome counts as rejected.
+    """
+    params = _server_params(audit_log, allow_writes=False)
+    rejected: dict[str, bool] = {}
+    async with stdio_client(params) as (read, write):
+        async with ClientSession(read, write, read_timeout_seconds=REQUEST_TIMEOUT) as s:
+            await s.initialize()
+            for name in WRITE_GATED_TOOLS:
+                try:
+                    r = await s.call_tool(name, {}, read_timeout_seconds=REQUEST_TIMEOUT)
+                    rejected[name] = bool(r.isError)
+                except Exception:
+                    rejected[name] = True
+    return rejected
 
 
 def run_smoke() -> dict[str, Any]:
@@ -347,23 +394,30 @@ def run_smoke() -> dict[str, Any]:
         visible = set(schemas_a)
         visible_b = set(schemas_b)
         frozen_tools = set(FROZEN_SCHEMA_FINGERPRINTS)
+        # Both stdio sessions above are listed with ALLOW_WRITES unset in the
+        # child (see ``_list_tools_via_stdio``), so a correctly write-gated
+        # tool is ABSENT here by design. ``required_tools`` carves
+        # WRITE_GATED_TOOLS out of the "must be visible"/"must match frozen
+        # fingerprint" requirements while writes are off; the read-only
+        # closure is unaffected.
+        required_tools = frozen_tools - set(WRITE_GATED_TOOLS)
         ro_visible = [n for n in READONLY_TOOLS if n in visible]
         wg_visible = [n for n in WRITE_GATED_TOOLS if n in visible]
         checks["readonly_tools_visible"] = set(ro_visible) == set(READONLY_TOOLS)
-        checks["write_gated_tools_visible"] = set(wg_visible) == set(WRITE_GATED_TOOLS)
+        checks["write_gated_tools_visible"] = not wg_visible
         # NARROWED 2026-09-08 (see the note above FROZEN_SCHEMA_FINGERPRINTS):
         # every frozen tool must still be VISIBLE in both sessions. It no
         # longer asserts the server has ONLY these tools -- it has 188, and a
         # closure pin over a deliberately growing surface asserts nothing about
         # any contract. Removal, rename and shape drift are still caught.
         checks["tool_inventory_matches_frozen"] = (
-            frozen_tools <= visible and frozen_tools <= visible_b
+            required_tools <= visible and required_tools <= visible_b
         )
         detail["readonly_tools_visible"] = sorted(ro_visible)
         detail["write_gated_tools_visible"] = sorted(wg_visible)
         detail["tools_visible"] = sorted(visible)
         detail["frozen_tool_names"] = sorted(frozen_tools)
-        detail["missing_tools"] = sorted(frozen_tools - visible)
+        detail["missing_tools"] = sorted(required_tools - visible)
         detail["tools_added_since_freeze"] = sorted(visible - frozen_tools)
         detail["unexpected_tools"] = []
         detail["total_tools_visible"] = len(visible)
@@ -371,7 +425,7 @@ def run_smoke() -> dict[str, Any]:
         cur_fp = {n: _canon_fp(s) for n, s in schemas_a.items()}
         fp_b = {n: _canon_fp(s) for n, s in schemas_b.items()}
         mismatches = sorted(
-            n for n in frozen_tools
+            n for n in required_tools
             if cur_fp.get(n) != FROZEN_SCHEMA_FINGERPRINTS[n]
         )
         # Frozen tools only, for the same reason: a tool added after the freeze
@@ -386,21 +440,44 @@ def run_smoke() -> dict[str, Any]:
         detail["current_schema_fingerprints"] = cur_fp
         detail["frozen_schema_fingerprints"] = FROZEN_SCHEMA_FINGERPRINTS
 
+        # --- write-gated tools REJECTED on tools/call while disallowed ------
+        # A dedicated probe dir (never touched by the C4/C5 snapshot rounds
+        # below) so this subprocess's own audit/process-log files never
+        # perturb the state_dir byte-identity proof.
+        probe_dir = Path(tempfile.mkdtemp(prefix="aiworkhub_b109_write_probe_"))
+        try:
+            write_gated_rejections = asyncio.run(
+                _attempt_write_gated_calls_via_stdio(probe_dir / "audit.jsonl")
+            )
+        finally:
+            shutil.rmtree(probe_dir, ignore_errors=True)
+        checks["write_gated_tools_call_rejected"] = all(write_gated_rejections.values())
+        detail["write_gated_tools_call_rejected"] = write_gated_rejections
+
         # --- C4 no-write with ALLOW_WRITES unset in the child --------------
         r_unset = asyncio.run(_run_readonly_round_via_stdio(state_dir, allow_writes=False))
+        # ``state_byte_identical_excl_tolerated_lock`` (not raw
+        # ``state_byte_identical``) is the authoritative "no write happened"
+        # signal here -- see the note above ``_run_readonly_round_via_stdio``:
+        # the server's own startup reconciler MEASURABLY takes a zero-byte
+        # advisory ``process_events.jsonl.lock`` next to this isolated audit
+        # dir, which is not a queue/audit write. The comparison excludes
+        # EXACTLY that one zero-byte file from both the before and after
+        # snapshots and then requires the remaining trees to match byte for
+        # byte -- any other new file, size change, or content mutation still
+        # fails this gate, which is exactly the gap measured in CI (see
+        # ``_run_readonly_round_via_stdio``'s docstring).
         checks["no_write_allow_unset"] = bool(
-            r_unset.get("ok") and r_unset.get("state_byte_identical")
-            and r_unset.get("state_holds_no_records")
-            and r_unset.get("queue_verify_intact")
+            r_unset.get("ok") and r_unset.get("state_byte_identical_excl_tolerated_lock")
+            and r_unset.get("state_holds_no_records") and r_unset.get("queue_verify_intact")
         )
         detail["round_allow_unset"] = r_unset
 
         # --- C5 no-write with ALLOW_WRITES=1 in the child ------------------
         r_set = asyncio.run(_run_readonly_round_via_stdio(state_dir, allow_writes=True))
         checks["no_write_allow_set"] = bool(
-            r_set.get("ok") and r_set.get("state_byte_identical")
-            and r_set.get("state_holds_no_records")
-            and r_set.get("queue_verify_intact")
+            r_set.get("ok") and r_set.get("state_byte_identical_excl_tolerated_lock")
+            and r_set.get("state_holds_no_records") and r_set.get("queue_verify_intact")
         )
         detail["round_allow_set"] = r_set
 
@@ -420,7 +497,9 @@ def run_smoke() -> dict[str, Any]:
         checks["no_launch_side_effects"] = (
             checks["only_mcp_server_launched"]
             and checks["launch_gate_forced_closed"]
+            and r_unset.get("state_byte_identical_excl_tolerated_lock") is True
             and r_unset.get("state_holds_no_records") is True
+            and r_set.get("state_byte_identical_excl_tolerated_lock") is True
             and r_set.get("state_holds_no_records") is True
         )
         detail["server_launch_pattern_hits"] = launch_hits
