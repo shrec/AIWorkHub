@@ -598,9 +598,12 @@ def supervise(spec: dict[str, Any]) -> int:
     supervisor_pid_start_ticks = _pid_start_ticks(supervisor_pid)
     started_epoch = time.time()
     execution_backend = spec.get("execution_backend")
-    appcontainer_selected = execution_backend == "windows_appcontainer"
-    deadline_epoch = started_epoch + timeout if appcontainer_selected else None
-    deadline_monotonic = time.monotonic() + timeout if appcontainer_selected else None
+    # NF-2026-00517: timeout_seconds is a monotonic hard wall deadline for
+    # every spawned backend (POSIX/Landlock subprocess, editor bridge, native
+    # CLI route, OpenCode, Windows AppContainer). Heartbeats, provider output,
+    # trusted progress and usage telemetry never extend it.
+    deadline_epoch = started_epoch + timeout
+    deadline_monotonic = time.monotonic() + timeout
     cancel_requested = False
     child: subprocess.Popen[bytes] | _AppContainerProcess | None = None
     windows_job: _WindowsKillOnCloseJob | None = None
@@ -620,7 +623,7 @@ def supervise(spec: dict[str, Any]) -> int:
         "started_at_epoch": started_epoch,
         "deadline_epoch": deadline_epoch,
         "timeout_seconds": timeout,
-        "timeout_enforced": appcontainer_selected,
+        "timeout_enforced": True,
     })
 
     try:
@@ -660,9 +663,9 @@ def supervise(spec: dict[str, Any]) -> int:
                 "error": f"{type(exc).__name__}:{exc}"[:500],
                 "started_at_epoch": started_epoch,
                 "finished_at_epoch": time.time(),
-                "deadline_epoch": None,
+                "deadline_epoch": deadline_epoch,
                 "timeout_seconds": timeout,
-                "timeout_enforced": False,
+                "timeout_enforced": True,
             })
             return 126
 
@@ -695,9 +698,9 @@ def supervise(spec: dict[str, Any]) -> int:
             "child_pid": child.pid,
             "child_pid_start_ticks": child_start_ticks,
             "started_at_epoch": started_epoch,
-            "deadline_epoch": None,
+            "deadline_epoch": deadline_epoch,
             "timeout_seconds": timeout,
-            "timeout_enforced": False,
+            "timeout_enforced": True,
             "heartbeat_seq": heartbeat_seq,
             "heartbeat_at_epoch": time.time(),
             "stdout_bytes": last_stdout_bytes,
@@ -783,9 +786,9 @@ def supervise(spec: dict[str, Any]) -> int:
                     "child_pid": child.pid,
                     "child_pid_start_ticks": child_start_ticks,
                     "started_at_epoch": started_epoch,
-                    "deadline_epoch": None,
+                    "deadline_epoch": deadline_epoch,
                     "timeout_seconds": timeout,
-                    "timeout_enforced": False,
+                    "timeout_enforced": True,
                     "heartbeat_seq": heartbeat_seq,
                     "heartbeat_at_epoch": time.time(),
                     "stdout_bytes": last_stdout_bytes,
@@ -888,7 +891,7 @@ def supervise(spec: dict[str, Any]) -> int:
             "finished_at_epoch": time.time(),
             "deadline_epoch": deadline_epoch,
             "timeout_seconds": timeout,
-            "timeout_enforced": appcontainer_selected,
+            "timeout_enforced": True,
             "heartbeat_seq": heartbeat_seq,
             "heartbeat_at_epoch": time.time(),
             "stdout_bytes": final_stdout_bytes,
@@ -963,9 +966,9 @@ def supervise(spec: dict[str, Any]) -> int:
                 "error": (f"{type(exc).__name__}:{exc}" + cleanup_error)[:500],
                 "started_at_epoch": started_epoch,
                 "finished_at_epoch": time.time(),
-                "deadline_epoch": None,
+                "deadline_epoch": deadline_epoch,
                 "timeout_seconds": timeout,
-                "timeout_enforced": False,
+                "timeout_enforced": True,
             })
         except Exception:
             # Status artifact itself is unwritable (e.g. a nested read-only

@@ -219,7 +219,20 @@ def _storage_write_authority_flags() -> dict[str, bool]:
 MAX_MODEL_POLICY_CATALOG_ROWS = 64
 
 
-def _model_policy_view(root: Any) -> dict[str, Any]:
+def _settings_preflight_snapshot(_root: Any) -> Mapping[str, Any] | None:
+    """Reuse the catalog's already-built environment-preflight snapshot.
+
+    Settings must not spawn a second ``opencode models`` probe. When no
+    repo-bound snapshot has been established, this returns None.
+    """
+
+    return workforce_catalog.cached_preflight_snapshot(_root)
+
+
+def _model_policy_view(
+    root: Any,
+    preflight: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     """Return bounded policy plus configured and live editor model inventory."""
     policy = model_settings.load(root)
     catalog = workforce_catalog.load_catalog(root)
@@ -319,6 +332,48 @@ def _model_policy_view(root: Any) -> dict[str, Any]:
                     "discovered_from_editor": True,
                 }
             )
+    opencode_identities = workforce_catalog.opencode_identities_from_preflight(
+        preflight
+    )
+    opencode_discovered_count = 0
+    for identity in opencode_identities[:MAX_MODEL_POLICY_CATALOG_ROWS]:
+        vendor_provider, _sep, _remainder = identity.partition("/")
+        vendor_provider = vendor_provider.lower() or "opencode"
+        provider, adapter = workforce_catalog.policy_route_identity(
+            vendor_provider, "opencode_cli"
+        )
+        key = (provider, adapter, identity[:128])
+        opencode_discovered_count += 1
+        discovered_count += 1
+        matched = False
+        for worker in workers:
+            if worker["adapter"] == "opencode_cli" and worker["model"] == identity[:128]:
+                worker["discovered_from_opencode"] = True
+                matched = True
+                break
+        if matched or key in existing:
+            continue
+        inventory_only_count += 1
+        existing.add(key)
+        workers.append(
+            {
+                "worker_id": "",
+                "provider": provider[:128],
+                "adapter": adapter[:128],
+                "model": identity[:128],
+                "vendor_provider": vendor_provider[:128],
+                "declared_adapter": "opencode_cli",
+                "catalog_enabled": True,
+                "effective_enabled": model_settings.evaluate_state(
+                    policy,
+                    provider=provider,
+                    adapter=adapter,
+                    model=identity,
+                ),
+                "inventory_only": True,
+                "discovered_from_opencode": True,
+            }
+        )
     workers.sort(
         key=lambda row: (
             row["provider"], row["adapter"], row["model"], row["worker_id"]
@@ -333,6 +388,7 @@ def _model_policy_view(root: Any) -> dict[str, Any]:
             "worker_count": total_rows,
             "configured_worker_count": len(source_rows),
             "discovered_model_count": discovered_count,
+            "opencode_discovered_model_count": opencode_discovered_count,
             "inventory_only_model_count": inventory_only_count,
             "editor_catalog_live": bool(editor.get("launchable")),
             "editor_catalog_reason": str(editor.get("blocker_reason") or "")[:200],
@@ -351,7 +407,9 @@ def settings_view() -> dict[str, Any]:
         result["source_graph_policy"] = source_graph.source_graph_policy_view(root)
         policy = repo_policy.load_policy(root)
         result["retention_policy"] = dict(policy.get("retention") or {})
-        result["model_policy"] = _model_policy_view(root)
+        result["model_policy"] = _model_policy_view(
+            root, preflight=_settings_preflight_snapshot(root)
+        )
     except (
         context_graph.ContextGraphError,
         feature_settings.FeatureSettingsError,

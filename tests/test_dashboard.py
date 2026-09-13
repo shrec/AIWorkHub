@@ -3945,3 +3945,153 @@ def test_provider_history_series_never_writes_to_the_canonical_store(tmp_path: P
     dashboard.DashboardProvider(repo_root=repo).get_history_series()
 
     assert Path(db_path).read_bytes() == before
+
+
+def _opencode_settings_preflight() -> dict:
+    return {
+        "providers": [
+            {
+                "adapter_id": "opencode_cli",
+                "launchable": True,
+                "status": "ready",
+                "provider_observed_models": [
+                    "opencode/glm-4.5-free",
+                    "openai/gpt-4o",
+                    "opencode/glm-4.5-free",
+                ],
+                "observed_models": ["opencode/glm-4.5-free"],
+            }
+        ]
+    }
+
+
+def test_model_policy_exposes_opencode_identities_from_catalog_preflight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from aiworkhub import dashboard_mcp_app, repo_policy, vscode_lm_bridge, workforce_catalog
+
+    root = _init_canonical_repo(tmp_path)
+    monkeypatch.setattr(core, "repo_root", lambda: root)
+    monkeypatch.setattr(
+        vscode_lm_bridge,
+        "bridge_readiness",
+        lambda *_args, **_kwargs: {
+            "launchable": False,
+            "blocker_reason": "",
+            "observed_models": [],
+        },
+    )
+    listing_calls: list[str] = []
+    monkeypatch.setattr(
+        repo_policy,
+        "_list_opencode_models",
+        lambda *_args, **_kwargs: listing_calls.append("cli") or ["should-not-run"],
+    )
+    preflight = _opencode_settings_preflight()
+    monkeypatch.setattr(
+        dashboard_mcp_app,
+        "_settings_preflight_snapshot",
+        lambda _root: preflight,
+    )
+
+    viewed = dashboard_mcp_app.settings_view()["model_policy"]
+    catalog = workforce_catalog.build_catalog(
+        root, cards=[], process_rows=[], preflight=preflight,
+    )
+    policy_models = [
+        row["model"]
+        for row in viewed["catalog"]["workers"]
+        if row.get("discovered_from_opencode") or row.get("adapter") == "opencode_cli"
+    ]
+    catalog_models = [
+        row["model"]
+        for row in catalog["workers"]
+        if row.get("discovered_from_opencode")
+    ]
+    assert viewed["catalog"]["opencode_discovered_model_count"] >= 2
+    assert policy_models
+    assert set(policy_models) == set(catalog_models)
+    assert "opencode/glm-4.5-free" in policy_models
+    assert "openai/gpt-4o" in policy_models
+    assert listing_calls == []
+    paid = next(row for row in viewed["catalog"]["workers"] if row["model"] == "openai/gpt-4o")
+    free = next(
+        row for row in viewed["catalog"]["workers"] if row["model"] == "opencode/glm-4.5-free"
+    )
+    assert paid["inventory_only"] is True
+    assert paid["effective_enabled"] is False
+    assert free["effective_enabled"] is True
+    assert "free" not in paid
+    assert paid.get("access_observed") is None
+    assert paid.get("round_trip_observed") is None
+
+
+def test_model_policy_keeps_disabled_opencode_routes_visible(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from aiworkhub import dashboard_mcp_app, model_settings, vscode_lm_bridge
+
+    root = _init_canonical_repo(tmp_path)
+    monkeypatch.setattr(core, "repo_root", lambda: root)
+    monkeypatch.setattr(
+        vscode_lm_bridge,
+        "bridge_readiness",
+        lambda *_args, **_kwargs: {
+            "launchable": False,
+            "blocker_reason": "",
+            "observed_models": [],
+        },
+    )
+    model_settings.update(root, provider="opencode", enabled=False, expected_revision=0)
+    viewed = dashboard_mcp_app._model_policy_view(
+        root, preflight=_opencode_settings_preflight(),
+    )
+    rows = [
+        row for row in viewed["catalog"]["workers"]
+        if row.get("discovered_from_opencode")
+    ]
+    assert rows
+    assert all(row["effective_enabled"] is False for row in rows)
+    assert {row["model"] for row in rows} >= {"opencode/glm-4.5-free", "openai/gpt-4o"}
+
+
+def test_settings_view_uses_shared_catalog_preflight_without_hook_patch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from aiworkhub import dashboard_mcp_app, repo_policy, vscode_lm_bridge, workforce_catalog
+
+    root = _init_canonical_repo(tmp_path)
+    monkeypatch.setattr(core, "repo_root", lambda: root)
+    monkeypatch.setattr(
+        vscode_lm_bridge,
+        "bridge_readiness",
+        lambda *_args, **_kwargs: {
+            "launchable": False,
+            "blocker_reason": "",
+            "observed_models": [],
+        },
+    )
+    listing_calls: list[str] = []
+    monkeypatch.setattr(
+        repo_policy,
+        "_list_opencode_models",
+        lambda *_args, **_kwargs: listing_calls.append("cli") or ["should-not-run"],
+    )
+    preflight = _opencode_settings_preflight()
+    before = dashboard_mcp_app.settings_view()["model_policy"]
+    assert before["catalog"]["opencode_discovered_model_count"] == 0
+    workforce_catalog.build_catalog(
+        root, cards=[], process_rows=[], preflight=preflight,
+    )
+    viewed = dashboard_mcp_app.settings_view()["model_policy"]
+    catalog_models = workforce_catalog.opencode_identities_from_preflight(preflight)
+    policy_models = [
+        row["model"]
+        for row in viewed["catalog"]["workers"]
+        if row.get("discovered_from_opencode") or row.get("adapter") == "opencode_cli"
+    ]
+    assert viewed["catalog"]["opencode_discovered_model_count"] == len(catalog_models)
+    assert set(policy_models) == set(catalog_models)
+    assert "opencode/glm-4.5-free" in policy_models
+    assert "openai/gpt-4o" in policy_models
+    assert listing_calls == []

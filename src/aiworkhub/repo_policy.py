@@ -12,6 +12,7 @@ import json
 import os
 import re
 import stat
+import subprocess
 import time
 from copy import deepcopy
 from pathlib import Path
@@ -95,9 +96,13 @@ ROUTE_OBSERVATION_CIRCUIT_OPEN = "route_failure_circuit_open"
 
 _FINALIZATION_PREFLIGHT_WARMUP_SECONDS = 1.0
 
+_POLICY_ALLOWED_ADAPTERS: tuple[str, ...] = (
+    *runtime_adapters.LOCAL_ADAPTERS,
+    runtime_adapters.OPENCODE_CLI_ADAPTER,
+)
 DEFAULT_POLICY: dict[str, Any] = {
     "schema_id": SCHEMA_ID,
-    "providers": {"allowed_adapters": list(runtime_adapters.LOCAL_ADAPTERS)},
+    "providers": {"allowed_adapters": list(_POLICY_ALLOWED_ADAPTERS)},
     "tools": {
         "source_graph_required_for_code": True,
         "session_memory_kb_required_for_nontrivial": True,
@@ -115,6 +120,7 @@ DEFAULT_POLICY: dict[str, Any] = {
 _PRE_GROK_LOCAL_ADAPTERS = frozenset(
     set(runtime_adapters.LOCAL_ADAPTERS) - {runtime_adapters.GROK_KILO_ADAPTER}
 )
+_PRE_OPENCODE_POLICY_ADAPTERS = frozenset(runtime_adapters.LOCAL_ADAPTERS)
 
 
 class RepoPolicyError(RuntimeError):
@@ -156,7 +162,7 @@ def validate_policy(value: Any) -> dict[str, Any]:
         raise RepoPolicyError("policy_sections_invalid")
 
     allowed = _string_list(providers.get("allowed_adapters"), "allowed_adapters")
-    unsupported = sorted(set(allowed) - set(runtime_adapters.LOCAL_ADAPTERS))
+    unsupported = sorted(set(allowed) - set(_POLICY_ALLOWED_ADAPTERS))
     if unsupported or not allowed:
         raise RepoPolicyError("allowed_adapters_unsupported_or_empty")
     raw_denies = _string_list(tools.get("raw_discovery_forbidden"), "raw_discovery_forbidden")
@@ -236,8 +242,17 @@ def load_policy(repo_root: Path | str) -> dict[str, Any]:
         # every pre-Grok route receive the new route.  A repository that
         # deliberately omitted any legacy route remains untouched/fail-closed.
         policy["providers"]["allowed_adapters"] = [
-            name for name in runtime_adapters.LOCAL_ADAPTERS
+            name for name in _POLICY_ALLOWED_ADAPTERS
             if name in allowed or name == runtime_adapters.GROK_KILO_ADAPTER
+        ]
+        allowed = list(policy["providers"]["allowed_adapters"])
+    if (
+        runtime_adapters.OPENCODE_CLI_ADAPTER not in allowed
+        and _PRE_OPENCODE_POLICY_ADAPTERS.issubset(allowed)
+    ):
+        policy["providers"]["allowed_adapters"] = [
+            name for name in _POLICY_ALLOWED_ADAPTERS
+            if name in allowed or name == runtime_adapters.OPENCODE_CLI_ADAPTER
         ]
     return {**policy, "configured": True}
 
@@ -332,6 +347,30 @@ _VSCODE_LM_IN_PROCESS_ADAPTERS = frozenset(
 
 def _is_windows_host() -> bool:
     return os.name == "nt"
+
+
+def _list_opencode_models(executable: str | None) -> list[str]:
+    """Bound ``opencode models`` discovery; listing is not round-trip evidence."""
+
+    if not isinstance(executable, str) or not executable.strip():
+        return []
+    from . import workforce_catalog
+
+    try:
+        completed = subprocess.run(
+            [executable, "models"],
+            check=False,
+            capture_output=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return []
+    payload = completed.stdout or b""
+    if not payload:
+        payload = completed.stderr or b""
+    if len(payload) > 64 * 1024:
+        return []
+    return workforce_catalog.parse_opencode_models_output(payload)
 
 
 def _provider_status(
@@ -514,6 +553,33 @@ def _provider_status(
                 result["launchable"] = False
                 result["status"] = "repository_model_policy_disabled"
                 result["reason"] = "all_observed_models_disabled_by_repository_model_settings"
+    if (
+        adapter_id == runtime_adapters.OPENCODE_CLI_ADAPTER
+        and result["installed"]
+        and "observed_models" not in result
+    ):
+        listed = _list_opencode_models(resolution.executable)
+        provider_observed_models = listed[:128]
+        eligible_observed_models = [
+            value
+            for value in provider_observed_models
+            if model_settings.evaluate_state(
+                model_policy,
+                provider=policy_provider,
+                adapter=policy_adapter,
+                model=value,
+            )
+        ]
+        result["provider_observed_models"] = provider_observed_models
+        result["observed_models"] = eligible_observed_models
+        excluded_count = len(provider_observed_models) - len(eligible_observed_models)
+        if excluded_count:
+            result["observed_models_excluded_by_repository_model_policy"] = excluded_count
+        if provider_observed_models and not eligible_observed_models:
+            result["provider_launchable"] = result["launchable"]
+            result["launchable"] = False
+            result["status"] = "repository_model_policy_disabled"
+            result["reason"] = "all_observed_models_disabled_by_repository_model_settings"
     if adapter_id in _VSCODE_LM_IN_PROCESS_ADAPTERS:
         result["sandbox_backend"] = "vscode_lm_in_process"
     else:
@@ -704,7 +770,7 @@ def build_preflight(repo_root: Path | str, adapter_id: str | None = None) -> dic
             sandbox_error,
             model_policy=repository_model_policy,
         )
-        for name in runtime_adapters.LOCAL_ADAPTERS
+        for name in _POLICY_ALLOWED_ADAPTERS
     ]
     selected = next((item for item in providers if item["adapter_id"] == adapter_id), None)
     if adapter_id and selected is None:
@@ -1198,6 +1264,7 @@ _ROUTE_FAMILY_COPILOT = runtime_adapters.ROUTE_FAMILY_COPILOT_BYOK_CLI
 _ROUTE_FAMILY_CLAUDE = runtime_adapters.ROUTE_FAMILY_CLAUDE_CLI
 _ROUTE_FAMILY_CODEX = runtime_adapters.ROUTE_FAMILY_CODEX_CLI
 _ROUTE_FAMILY_KILO = runtime_adapters.ROUTE_FAMILY_KILO_XAI_CLI
+_ROUTE_FAMILY_OPENCODE = runtime_adapters.ROUTE_FAMILY_OPENCODE_CLI
 _ROUTE_FAMILY_UNKNOWN = runtime_adapters.ROUTE_FAMILY_UNKNOWN
 
 _QUOTA_UNOBSERVABLE_REASON_BY_FAMILY: Mapping[str, str] = {
@@ -1213,6 +1280,9 @@ _QUOTA_UNOBSERVABLE_REASON_BY_FAMILY: Mapping[str, str] = {
     _ROUTE_FAMILY_CODEX: "codex_cli_exposes_no_quota_endpoint_to_this_host",
     _ROUTE_FAMILY_KILO: (
         "kilo_xai_subscription_exposes_local_auth_not_provider_side_quota"
+    ),
+    _ROUTE_FAMILY_OPENCODE: (
+        "opencode_cli_listing_is_not_quota_or_round_trip_evidence"
     ),
     _ROUTE_FAMILY_UNKNOWN: "adapter_family_unknown_quota_observability_undetermined",
 }
@@ -1394,7 +1464,7 @@ def describe_provider_observability(
 
 
 def provider_observability_report(repo_root: Path | str) -> dict[str, Any]:
-    """Per-adapter observability across every configured local adapter.
+    """Per-adapter observability across every configured policy adapter.
 
     Each adapter names what is observable here and why its quota is not, so a
     caller reading this report can distinguish an available provider from an
@@ -1405,7 +1475,7 @@ def provider_observability_report(repo_root: Path | str) -> dict[str, Any]:
     root = Path(repo_root).resolve()
     adapters = [
         describe_provider_observability(root, name)
-        for name in runtime_adapters.LOCAL_ADAPTERS
+        for name in _POLICY_ALLOWED_ADAPTERS
     ]
     return {
         "schema_id": PROVIDER_OBSERVABILITY_SCHEMA_ID,

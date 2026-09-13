@@ -451,7 +451,7 @@ class TestRunValidationsPytestRepair(_TolerateNestedSeccompChmodDenial):
             )
             self.assertEqual(
                 results[0]["env_override"]["retained_for"],
-                "trusted_pytest_runtime",
+                "trusted_pytest_runtime_and_candidate_imports",
             )
         finally:
             worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
@@ -493,9 +493,59 @@ class TestRunValidationsPytestRepair(_TolerateNestedSeccompChmodDenial):
             self.assertIsNotNone(active_root)
             self.assertEqual(
                 components,
-                [str(active_root), str(fake_root.resolve())],
+                [str(active_root), str(fake_root.resolve()), "."],
             )
-            self.assertEqual(record["env_override"]["dropped_candidate_components"], ["."])
+            self.assertEqual(record["env_override"]["dropped_candidate_components"], [])
+            self.assertEqual(
+                record["env_override"]["retained_for"],
+                "trusted_pytest_runtime_and_candidate_imports",
+            )
+        finally:
+            worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
+
+    def test_pytest_safe_path_keeps_repository_root_importable(self) -> None:
+        fake_root = self.tmp_path / "trusted_site_packages_repo_import"
+        fake_root.mkdir()
+        os.chmod(fake_root, 0o755)
+        _write_fake_pytest_package(fake_root)
+        repo, workspace = _manual_workspace(self.tmp_path, "b755-repo-import")
+        scripts = workspace.path / "scripts"
+        scripts.mkdir()
+        (scripts / "__init__.py").write_text("VALUE = 'candidate-root'\n", encoding="utf-8")
+        tests = workspace.path / "tests"
+        tests.mkdir()
+        (tests / "test_repo_import.py").write_text(
+            "import scripts\n\n"
+            "def test_repository_root_import():\n"
+            "    assert scripts.VALUE == 'candidate-root'\n",
+            encoding="utf-8",
+        )
+        try:
+            with mock.patch.object(
+                worker_workspace.site,
+                "getusersitepackages",
+                return_value=str(fake_root),
+            ), mock.patch.object(
+                worker_workspace,
+                "_resolve_trusted_validation_executable",
+                side_effect=worker_workspace.WorkspaceError(
+                    "validation_executable_unavailable:pytest"
+                ),
+            ), mock.patch.object(
+                worker_workspace,
+                "_select_module_validator_interpreter",
+                return_value=(
+                    None,
+                    "validation_executable_module_absent_in_all_trusted_roots:pytest",
+                ),
+            ):
+                results = worker_workspace.run_validations(
+                    workspace, ["python3 -m pytest -q tests/test_repo_import.py"]
+                )
+            record = results[0]
+            self.assertEqual(record["returncode"], 0)
+            self.assertIn("1 passed", record["stdout_tail"])
+            self.assertIn(".", record["env_override"]["components"])
         finally:
             worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
 

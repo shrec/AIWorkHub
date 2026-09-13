@@ -33,6 +33,7 @@ SUPPORTED_ADAPTERS: tuple[str, ...] = (
     "glm_cli",
     "grok_kilo_cli",
     "claude_cli",
+    "opencode_cli",
     "manual",
 )
 RISK_ORDER: Mapping[str, int] = {

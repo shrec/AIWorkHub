@@ -11,7 +11,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.11.28";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.11.29";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 // NF-2026-00643: this globalStorage trace directory was measured holding 1,102
 // files and 2,235,024,325 bytes (2.24 GB), largest single file 44,626,825 bytes
@@ -8417,8 +8417,21 @@ async function runNeedfixAction(view, action, args) {
 
 async function pushSettings(view) {
   try {
-    const client = getMcpClient();
+    const options = arguments.length > 1 && arguments[1] ? arguments[1] : {};
+    const client = options.client || getMcpClient();
     view.bindClient(client);
+    // NF-2026-00811 cold-start ordering: an immediate requestSettings must
+    // never overtake the initial full snapshot. The repo-bound preflight
+    // snapshot that fills the dashboard also owns the bounded OpenCode
+    // identities served here, so reuse the existing snapshotInFlight
+    // transport primitive: let any in-flight snapshot settle first, then
+    // call the dashboard settings tool exactly once. When nothing is in
+    // flight the established snapshot already covers this call, so
+    // unrelated dashboard actions are never serialized behind this wait
+    // and no second `opencode models` probe is introduced.
+    if (view.snapshotInFlight) {
+      await view.snapshotInFlight.catch(() => {});
+    }
     const payload = await client.callTool(DASHBOARD_TOOLS.settings, {});
     if (view.stillBoundTo(client)) {
       view.postMessage({ type: OUTBOUND_TYPES.settings, payload: sanitizeWebviewPayload(payload) });
@@ -10970,6 +10983,7 @@ module.exports = {
     pushSnapshot,
     pushSnapshotOnce,
     pushSnapshotNoRetry,
+    pushSettings,
     pushRuntimeInfo,
     readRepositoryManifestInfo,
     runBackgroundTask,

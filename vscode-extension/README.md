@@ -14,14 +14,18 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.11.28
+## What's new in 0.11.29
 
-- Archived automatic-review cards remain part of the exact target's
-  server-bound reviewer census, so authenticated completed receipts are reused
-  instead of being reported missing or causing duplicate model work.
-- OpenCode's runtime foundation and event/usage capture remain available from
-  0.11.27; workforce discovery, task-route wiring, dashboard selection, and a
-  live canary are still staged work.
+- The Models tab now presents a bounded provider-to-model tree and includes
+  OpenCode identities discovered from the cached preflight snapshot.
+- Discovery is reported separately from repository enablement, launchability,
+  access and observed round-trip execution; a listed model is never presented
+  as proven runnable without evidence.
+- Automatic VS Code LM reviewers use one authenticated, request-bound
+  submission contract instead of conflicting tool-call and printed-JSON
+  instructions.
+- Missing review chains are recovered by reconciliation, and all worker
+  backends enforce one monotonic hard timeout.
 
 Automatic quality-review launch moves worker completion through a
 system-owned correctness, security, and code-quality chain without

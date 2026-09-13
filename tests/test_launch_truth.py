@@ -113,7 +113,7 @@ def test_observability_report_covers_every_configured_adapter(tmp_path: Path) ->
     root = _initialized_root(tmp_path)
     report = repo_policy.provider_observability_report(root)
     ids = {item["adapter_id"] for item in report["adapters"]}
-    assert ids == set(runtime_adapters.LOCAL_ADAPTERS)
+    assert ids == set(repo_policy.DEFAULT_POLICY["providers"]["allowed_adapters"])
 
 
 def test_quota_unobservability_is_named_per_adapter_not_a_blanket_unknown(

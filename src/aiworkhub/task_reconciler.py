@@ -42,6 +42,7 @@ from typing import Any
 
 from . import core
 from . import process_launcher
+from . import review_orchestrator
 from .platform_io import (
     DIRECTORY_DESCRIPTOR_BACKEND_NONE,
     chmod_fd,
@@ -492,6 +493,7 @@ def run_scan(
             task_hygiene = core._schedule_task_hygiene(run_when_due=True)
         except Exception as exc:  # noqa: BLE001 -- see above
             task_hygiene = {"state": "skipped", "reason": f"{type(exc).__name__}"[:80]}
+    review_recovery = _scan_review_ready_recovery(mgr)
     return {
         "ok": True,
         "scanned_at": _utcnow(),
@@ -499,7 +501,45 @@ def run_scan(
         "callback_prune": callback_prune,
         "task_hygiene": task_hygiene,
         **result,
+        "review_recovery": review_recovery,
     }
+
+
+def _scan_review_ready_recovery(manager: Any) -> dict[str, Any]:
+    """Ensure missing review chains, then let the orchestrator launch."""
+    empty: dict[str, Any] = {
+        "state": "skipped",
+        "reason": "no_work",
+        "review_recovery_scanned": 0,
+        "review_recovery_ensured": 0,
+        "review_recovery_skipped": 0,
+        "review_recovery_failed": 0,
+        "review_recovery_reasons": {},
+        "review_recovery_failures": [],
+    }
+    try:
+        review_db = review_orchestrator.canonical_review_db(manager)
+        if review_db is None:
+            empty["reason"] = "review_db_unavailable"
+            return empty
+        recovery = review_orchestrator.recover_review_ready_targets(
+            manager, db_path=review_db,
+        )
+        if int(recovery.get("review_recovery_ensured") or 0) > 0:
+            drain = review_orchestrator.ReviewOrchestrator(
+                manager, db_path=review_db,
+            ).drain()
+            recovery["review_recovery_drain"] = drain.as_dict()
+        else:
+            recovery.setdefault(
+                "review_recovery_drain",
+                {"state": "skipped", "reason": "no_work"},
+            )
+        recovery.setdefault("state", "ok")
+        return recovery
+    except Exception as exc:  # noqa: BLE001 -- never block worker reconcile
+        empty["reason"] = f"{type(exc).__name__}"[:80]
+        return empty
 
 
 class ReconcilerService:

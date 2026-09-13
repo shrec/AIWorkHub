@@ -234,6 +234,7 @@ def _fallback_validate_required_outputs(
     required_outputs: list[str] | tuple[str, ...],
     allow_empty: tuple[str, ...] | None = None,
     allow_unchanged: tuple[str, ...] | None = None,
+    **_: Any,
 ) -> list[dict[str, Any]]:
     """Validate the explicit mandatory-change set, never the full write scope.
 
@@ -291,7 +292,12 @@ def _fallback_validate_required_outputs(
             digest = hashlib.sha256(path.read_bytes()).hexdigest()
             baseline = workspace.workspace_baseline.get(relative)
             current = f"file:{path.stat().st_mode & 0o777:o}:{digest}"
-            is_unchanged = baseline in {digest, current}
+            inherited_change = (
+                relative in workspace.inherited_rework_paths
+                and baseline in {digest, current}
+                and current != workspace.parent_baseline.get(relative)
+            )
+            is_unchanged = baseline in {digest, current} and not inherited_change
             if is_unchanged:
                 if relative not in unchanged_allowed:
                     unchanged_mandatory_outputs.append(relative)
@@ -11353,7 +11359,10 @@ class ProcessManager:
             reason = terminal_failure_classification.recognised_reason(error)
             if liveness_lost and not error:
                 error = f"liveness_lost:heartbeat_lease_and_recovery_grace_exceeded:rc={supervisor_returncode}"
-            if supervisor_state == "timed_out" and metadata.get("timeout_enforced") is True:
+            if supervisor_state == "timed_out" and (
+                supervisor_status.get("timeout_enforced") is True
+                or metadata.get("timeout_enforced") is True
+            ):
                 terminal_state = "timed_out"
                 error = error or (
                     "worker_timed_out:timeout_seconds="
@@ -11848,6 +11857,7 @@ class ProcessManager:
                             workspace,
                             list(metadata.get("residual_contract_manifest") or []),
                         )
+                        predecessor = metadata.get("rework_predecessor")
                         required_output_records = validate_required_outputs(
                             workspace,
                             metadata.get("required_outputs") or [],
@@ -11863,12 +11873,14 @@ class ProcessManager:
                             replay_task_id=str(metadata.get("task_id") or ""),
                             replay_actor=core.CODEX_RUNNER,
                             replay_predecessor_request_id=str(
-                                (metadata.get("rework_predecessor") or {}).get(
-                                    "request_id"
-                                )
+                                (predecessor or {}).get("request_id")
                                 or ""
                             ),
                             replay_claim_epoch=metadata.get("claim_epoch"),
+                            rework_predecessor=(
+                                predecessor if isinstance(predecessor, dict) else None
+                            ),
+                            strict_rework_inheritance=True,
                         )
                         validated_required_paths = {
                             rec["path"]

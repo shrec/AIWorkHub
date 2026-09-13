@@ -6,6 +6,42 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.29] - 2026-09-13
+
+### Added
+
+- Repository Settings now projects discovered OpenCode identities into a
+  bounded, collapsible provider-to-model tree. Exact model children remain
+  distinct from installation, policy enablement, launchability, access, and
+  observed round-trip evidence.
+
+### Fixed
+
+- Settings reuses the workforce catalog's cached environment-preflight
+  snapshot instead of spawning a second `opencode models` probe during the
+  same refresh.
+- Automatic VS Code LM quality reviewers now receive one unambiguous terminal
+  contract: submit the authenticated report exactly once through the
+  request-bound review tool, eliminating the prior printed-JSON/tool-call
+  contradiction.
+- The reconciler now reconstructs missing automatic-review chains for sealed
+  `review_ready` candidates, while permanently stale manager-ready projections
+  are quarantined instead of starving newer review work.
+- Worker timeout is a monotonic hard wall on every execution backend; output,
+  heartbeat, progress and usage events cannot extend it.
+- Validation retains trusted pytest runtime roots and explicit sandboxed
+  project imports, accepts only verified no-op metadata requests on hardlinks,
+  and recognizes candidate bytes that are already canonical.
+- Required-output validation counts an inherited rework file only when its
+  request identity and digest match an authenticated sealed predecessor.
+
+### Validation
+
+- OpenCode model projection and tree rendering are covered by focused Python
+  dashboard/catalog tests and Node Webview tests. The complete release passed
+  10,357 Python tests and the full 50-file extension suite, plus Ruff, release
+  metadata and diff checks.
+
 ## [0.11.28] - 2026-09-12
 
 ### Fixed

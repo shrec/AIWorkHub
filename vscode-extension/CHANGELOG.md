@@ -1,5 +1,27 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.29 — 2026-09-13
+
+### Added
+
+- Repository Settings displays discovered OpenCode identities as exact model
+  children under a collapsible OpenCode family instead of flattening every
+  provider and model into one level.
+
+### Fixed
+
+- The Models snapshot reuses cached environment-preflight discovery, avoiding
+  a duplicate `opencode models` process on each Settings refresh.
+- VS Code LM quality reviewers now have one request-bound terminal submission
+  contract, removing the conflicting printed-JSON instruction that caused
+  provider-independent review failures.
+- Reconciliation restores missing automatic-review chains for sealed
+  `review_ready` candidates and no longer lets stale manager-ready projections
+  starve current work.
+- Every worker backend now enforces the same monotonic hard timeout, and the
+  validation sandbox preserves explicit pytest project imports without
+  weakening trusted-runtime ordering.
+
 ## 0.11.28 — 2026-09-12
 
 ### Fixed

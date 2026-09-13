@@ -917,6 +917,230 @@ def retry_pending_registrations(
     }
 
 
+_RECOVERY_SCAN_LIMIT = 500
+_RECOVERY_FAILURE_LIMIT = 16
+_RECOVERY_REASON_LIMIT = 24
+
+
+def _recovery_reason(reasons: dict[str, int], reason: str) -> None:
+    key = str(reason or "unspecified")[:80]
+    if len(reasons) >= _RECOVERY_REASON_LIMIT and key not in reasons:
+        key = "reason_cap"
+    reasons[key] = int(reasons.get(key) or 0) + 1
+
+
+def _review_substatus(card: Mapping[str, Any]) -> str:
+    terminal = card.get("terminal_review")
+    return str(
+        card.get("terminal_substatus")
+        or (terminal.get("substatus") if isinstance(terminal, Mapping) else "")
+        or ""
+    ).strip()
+
+
+def _sealed_hashes(card: Any) -> Mapping[str, Any] | None:
+    if not isinstance(card, Mapping):
+        return None
+    terminal = card.get("terminal_review")
+    evidence = terminal.get("evidence") if isinstance(terminal, Mapping) else None
+    hashes = evidence.get("changed_path_hashes") if isinstance(evidence, Mapping) else None
+    if not isinstance(hashes, Mapping) or not hashes:
+        return None
+    return hashes
+
+
+def _quality_gate(card: Any) -> Mapping[str, Any] | None:
+    if not isinstance(card, Mapping):
+        return None
+    terminal = card.get("terminal_review")
+    evidence = terminal.get("evidence") if isinstance(terminal, Mapping) else None
+    gate = evidence.get("quality_gate") if isinstance(evidence, Mapping) else None
+    return gate if isinstance(gate, Mapping) else None
+
+
+def _card_request_id(card: Mapping[str, Any]) -> str:
+    terminal = card.get("terminal_review")
+    evidence = terminal.get("evidence") if isinstance(terminal, Mapping) else None
+    identity = evidence.get("request_identity") if isinstance(evidence, Mapping) else None
+    if isinstance(identity, Mapping):
+        return str(identity.get("request_id") or "")
+    return ""
+
+
+def _status_review_ready(status: Any) -> bool:
+    if not isinstance(status, Mapping):
+        return False
+    state = str(status.get("state") or "")
+    if state == "review_ready":
+        return True
+    if state:
+        return False
+    card = status.get("task_card")
+    return isinstance(card, Mapping) and _review_substatus(card) == "review_ready"
+
+
+def _present_reviewer_lenses(
+    repo: Path, identity: Mapping[str, str], lenses: tuple[str, ...],
+) -> frozenset[str]:
+    present: set[str] = set()
+    for lens in lenses:
+        task_id = ReviewOrchestrator._reviewer_task_id(identity, lens)
+        try:
+            row = task_store.get_task(repo, task_id)
+        except (task_store.TaskStoreError, OSError, TypeError, ValueError):
+            continue
+        if row is not None:
+            present.add(lens)
+    return frozenset(present)
+
+
+def recover_review_ready_targets(
+    manager: Manager,
+    *,
+    db_path: str | Path,
+) -> dict[str, Any]:
+    """Ensure missing required-lens chains for authenticated review_ready targets.
+
+    Discovers current review-queue episodes only. Identity comes from sealed
+    terminal evidence or the durable registration payload -- never chat prose.
+    Does not launch reviewers and never accepts the target.
+    """
+    scanned = ensured = skipped = failed = 0
+    reasons: dict[str, int] = {}
+    failures: list[dict[str, str]] = []
+    repo = Path(getattr(manager, "repo", "") or "")
+    try:
+        cards = task_store.list_review_queue_cards(repo, limit=_RECOVERY_SCAN_LIMIT)
+    except Exception as exc:  # noqa: BLE001 -- fail closed, never raise through scan
+        return {
+            "review_recovery_scanned": 0,
+            "review_recovery_ensured": 0,
+            "review_recovery_skipped": 0,
+            "review_recovery_failed": 0,
+            "review_recovery_reasons": {"store_unreadable": 1},
+            "review_recovery_failures": [{
+                "request_id": "", "error": f"{type(exc).__name__}"[:80],
+            }],
+            "state": "skipped",
+            "reason": "store_unreadable",
+        }
+    for card in cards:
+        if not isinstance(card, Mapping):
+            continue
+        if str(card.get("topic") or "") == "quality_review":
+            continue
+        if _review_substatus(card) != "review_ready":
+            continue
+        scanned += 1
+        if task_store.manager_ready_marker(card) is not None:
+            skipped += 1
+            _recovery_reason(reasons, "manager_ready")
+            continue
+        request_id = _card_request_id(card)
+        if not request_id:
+            skipped += 1
+            _recovery_reason(reasons, "missing_registration")
+            continue
+        try:
+            status = manager.status(request_id)
+        except Exception as exc:  # noqa: BLE001
+            failed += 1
+            _recovery_reason(reasons, "status_unreadable")
+            if len(failures) < _RECOVERY_FAILURE_LIMIT:
+                failures.append({
+                    "request_id": request_id,
+                    "error": f"{type(exc).__name__}"[:80],
+                })
+            continue
+        if not _status_review_ready(status):
+            skipped += 1
+            _recovery_reason(reasons, "non_review")
+            continue
+        status_card = status.get("task_card") if isinstance(status, Mapping) else None
+        if _sealed_hashes(status_card) is None:
+            skipped += 1
+            _recovery_reason(reasons, "empty_delta")
+            continue
+        resolved = resolve_target_identity(status)
+        if str(resolved.get("conflict") or ""):
+            skipped += 1
+            _recovery_reason(reasons, "changed_candidate")
+            continue
+        identity = resolved.get("identity")
+        source = str(resolved.get("identity_source") or "")
+        if not isinstance(identity, Mapping) or not identity:
+            skipped += 1
+            _recovery_reason(reasons, "missing_registration")
+            continue
+        if source not in {
+            "terminal_review_evidence", "review_automation_registration",
+        }:
+            skipped += 1
+            _recovery_reason(reasons, "stale")
+            continue
+        if (
+            str(identity.get("target_task_id") or "") != str(card.get("task_id") or "")
+            or str(identity.get("target_request_id") or "") != request_id
+        ):
+            skipped += 1
+            _recovery_reason(reasons, "mismatched_identity")
+            continue
+        hashes = _sealed_hashes(status_card)
+        if hashes is None:
+            skipped += 1
+            _recovery_reason(reasons, "empty_delta")
+            continue
+        registration = candidate_registration(
+            metadata={
+                "task_id": identity["target_task_id"],
+                "request_id": identity["target_request_id"],
+                "claim_epoch": identity["claim_epoch"],
+            },
+            artifact_receipt={"manifest_sha256": identity["packet_sha256"]},
+            changed_path_hashes=hashes,
+            quality_gate=_quality_gate(status_card),
+        )
+        if str(registration.get("candidate_sha256") or "") != str(
+            identity.get("candidate_sha256") or ""
+        ):
+            skipped += 1
+            _recovery_reason(reasons, "changed_candidate")
+            continue
+        planned = _normalize_lenses(registration.get("required_reviewer_lenses"))
+        if not planned:
+            planned = LENSES
+        missing = tuple(
+            lens for lens in planned
+            if lens not in _present_reviewer_lenses(repo, identity, planned)
+        )
+        if not missing:
+            skipped += 1
+            _recovery_reason(reasons, "already_present")
+            continue
+        try:
+            register_candidate(manager, db_path=db_path, registration=registration)
+        except Exception as exc:  # noqa: BLE001
+            failed += 1
+            _recovery_reason(reasons, "ensure_failed")
+            if len(failures) < _RECOVERY_FAILURE_LIMIT:
+                failures.append({
+                    "request_id": request_id,
+                    "error": f"{type(exc).__name__}:{exc}"[:80],
+                })
+            continue
+        ensured += 1
+        _recovery_reason(reasons, "ensured")
+    return {
+        "review_recovery_scanned": scanned,
+        "review_recovery_ensured": ensured,
+        "review_recovery_skipped": skipped,
+        "review_recovery_failed": failed,
+        "review_recovery_reasons": reasons,
+        "review_recovery_failures": failures,
+        "state": "ok",
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class DrainResult:
     attempted: int
@@ -1184,6 +1408,15 @@ class ReviewOrchestrator:
                     "SELECT chain_id FROM review_manager_ready_projection"
                 ).fetchall()
             }
+        def mark_projected(chain_id: int) -> None:
+            with closing(_side_table_connection(self.db_path)) as conn, conn:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(
+                    "INSERT OR IGNORE INTO review_manager_ready_projection"
+                    "(chain_id, projected_at) VALUES (?, ?)",
+                    (chain_id, datetime.now(timezone.utc).isoformat()),
+                )
+
         published = 0
         for receipt in review_lifecycle.completed_manager_ready_receipts(self.db_path):
             aggregate = receipt["manager_ready"]
@@ -1197,14 +1430,15 @@ class ReviewOrchestrator:
                 claim_epoch=str(aggregate["claim_epoch"]),
             )
             if not ok:
+                if state == "manager_ready_target_identity_mismatch":
+                    # A completed receipt for a superseded request/claim is
+                    # permanently stale.  Quarantine it once so it cannot
+                    # starve newer review chains; every other publish failure
+                    # remains fail-closed and retryable.
+                    mark_projected(chain_id)
+                    continue
                 raise RuntimeError("manager_ready_publish_failed:" + state)
-            with closing(_side_table_connection(self.db_path)) as conn, conn:
-                conn.execute("BEGIN IMMEDIATE")
-                conn.execute(
-                    "INSERT OR IGNORE INTO review_manager_ready_projection"
-                    "(chain_id, projected_at) VALUES (?, ?)",
-                    (chain_id, datetime.now(timezone.utc).isoformat()),
-                )
+            mark_projected(chain_id)
             published += 1
         return published
 

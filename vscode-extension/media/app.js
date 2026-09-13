@@ -53,6 +53,7 @@ const state = {
   roadmapDetail: null,
   featureSettings: null,
   settingsPendingIdentity: null,
+  settingsCollapsedFamilies: {},
   settingsTab: "features",
   planScope: persisted.planScope === "all" ? "all" : "active",
   planSearch: "",
@@ -4517,6 +4518,82 @@ function setSettingsPending(identity, pending) {
   elements.settingsList.setAttribute("aria-busy", String(Boolean(pending)));
 }
 
+// A route's model-policy family is normally its provider, but every OpenCode
+// discovered route keeps the upstream provider prefix in its exact model
+// identity (openai/gpt-4o, anthropic/claude-x) while its policy owner is
+// always "opencode" (see model_settings.policy_route_identity). Grouping by
+// effective adapter, not upstream provider, keeps every OpenCode route under
+// one OpenCode parent regardless of which vendor it was discovered from.
+const OPENCODE_ADAPTER_ID = "opencode_cli";
+const OPENCODE_FAMILY = "opencode";
+
+function modelFamilyOf(row) {
+  if (String(row.adapter || "") === OPENCODE_ADAPTER_ID) return OPENCODE_FAMILY;
+  return String(row.provider || "");
+}
+
+function modelFamilyLabel(family) {
+  return family === OPENCODE_FAMILY ? "OpenCode" : family;
+}
+
+function isOpencodeOpenAIRoute(route, family) {
+  return family === OPENCODE_FAMILY && String(route.model || "").toLowerCase().startsWith("openai/");
+}
+
+function settingsFamilyExpanded(family) {
+  return (state.settingsCollapsedFamilies || {})[family] !== true;
+}
+
+function routeDiscoveredLabel(route) {
+  if (route.discovered_from_opencode) return "opencode discovery";
+  if (route.discovered_from_editor) return "editor discovery";
+  if (route.inventory_only) return "discovered";
+  return "configured";
+}
+
+function routeAccessLabel(route) {
+  if (route.availability_observed === true || route.access_observed === true) return "access observed";
+  if (route.availability_observed === false || route.access_observed === false) return "access unverified";
+  return "access unknown";
+}
+
+function routeLaunchableLabel(route) {
+  const launchable = typeof route.launch_eligible === "boolean"
+    ? route.launch_eligible
+    : Boolean(route.effective_enabled) && Boolean(route.catalog_enabled);
+  return launchable ? "launchable" : "not launchable";
+}
+
+function routeRoundTripLabel(route) {
+  if (route.round_trip_observed === true) return "round-trip confirmed";
+  if (route.round_trip_observed === false) return "round-trip failed";
+  return "round-trip unknown";
+}
+
+// Cost is only ever reported when it is positively known: an absent or
+// non-numeric cost field renders as "cost unknown", never "free" -- a listed
+// but unpriced route must not read as a free one.
+function routeCostLabel(route) {
+  if (route.free === true) return "free";
+  if (typeof route.estimated_cost_usd === "number") {
+    return route.estimated_cost_usd === 0 ? "free" : `${formatMoney(route.estimated_cost_usd)}/task`;
+  }
+  if (typeof route.cost_usd_per_1k_tokens === "number") {
+    return route.cost_usd_per_1k_tokens === 0 ? "free" : `${formatMoney(route.cost_usd_per_1k_tokens)}/1k tok`;
+  }
+  return "cost unknown";
+}
+
+function routeTruthSummary(route) {
+  return [
+    routeDiscoveredLabel(route),
+    routeAccessLabel(route),
+    routeLaunchableLabel(route),
+    routeRoundTripLabel(route),
+    routeCostLabel(route),
+  ].join(" · ");
+}
+
 function renderSettings(payload, options = {}) {
   const preservePending = Boolean(options.preservePending && state.settingsPendingIdentity);
   const activeControl = elements.settingsList.contains(document.activeElement)
@@ -4633,34 +4710,70 @@ function renderSettings(payload, options = {}) {
       "",
       `${discoveredCount} live VS Code/Copilot model${discoveredCount === 1 ? "" : "s"} discovered`,
     ));
-    const providers = [...new Set(workers.map((row) => String(row.provider || "")).filter(Boolean))].sort();
-    for (const provider of providers) {
-      const providerRows = workers.filter((row) => row.provider === provider);
-      const configured = Object.prototype.hasOwnProperty.call(modelPolicy.providers || {}, provider);
-      const enabled = configured ? Boolean(modelPolicy.providers[provider]) : true;
-      const row = document.createElement("label");
+    // Two-level tree: each provider/effective-adapter family is a collapsible
+    // parent, exact model routes are its indented children. OpenCode routes
+    // group under one "opencode" family regardless of upstream provider
+    // prefix (see modelFamilyOf), so an openai/* identity discovered through
+    // OpenCode never appears as a peer of the real OpenAI provider.
+    const families = [...new Set(workers.map((row) => modelFamilyOf(row)).filter(Boolean))].sort();
+    for (const family of families) {
+      const familyRows = workers.filter((row) => modelFamilyOf(row) === family);
+      const configured = Object.prototype.hasOwnProperty.call(modelPolicy.providers || {}, family);
+      const enabled = configured ? Boolean(modelPolicy.providers[family]) : true;
+      const enabledRouteCount = familyRows.filter((row) => Boolean(row.effective_enabled)).length;
+      const familyLabel = modelFamilyLabel(family);
+      const familyId = `model-family-${family.replace(/[^a-z0-9]+/gi, "-").toLowerCase() || "family"}`;
+      const expanded = settingsFamilyExpanded(family);
+
+      const familyWrap = createElement("div", "settings-model-family");
+      const row = document.createElement("div");
       row.className = "settings-row settings-model-provider";
+
+      const toggle = document.createElement("button");
+      toggle.type = "button";
+      toggle.className = "settings-model-family-toggle";
+      toggle.dataset.modelFamilyToggle = family;
+      toggle.setAttribute("aria-expanded", String(expanded));
+      toggle.setAttribute("aria-controls", familyId);
+      toggle.setAttribute("aria-label", `${familyLabel} routes, ${expanded ? "expanded" : "collapsed"}`);
+      toggle.textContent = expanded ? "▾" : "▸";
+
       const copy = createElement("span", "settings-copy");
       copy.append(
-        createElement("strong", "", provider),
-        createElement("small", "", `${providerRows.length} configured route${providerRows.length === 1 ? "" : "s"} · ${configured ? "repository override" : "enabled by default"}`),
+        createElement("strong", "", familyLabel),
+        createElement(
+          "small",
+          "",
+          `${familyRows.length} route${familyRows.length === 1 ? "" : "s"} · ${enabledRouteCount} enabled · ${configured ? "repository override" : "enabled by default"}`,
+        ),
       );
+
+      const switchLabel = document.createElement("label");
+      switchLabel.className = "switch-control-wrap";
       const control = createElement("span", "switch-control");
       const input = document.createElement("input");
       input.type = "checkbox";
       input.checked = enabled;
-      input.dataset.modelProvider = provider;
+      input.dataset.modelProvider = family;
       input.dataset.modelRevision = String(Number(modelPolicy.revision || 0));
       if (settingsControlIdentity(input) === state.settingsPendingIdentity) {
         input.disabled = true;
         input.dataset.settingsPending = "true";
       }
-      input.setAttribute("aria-label", `${provider} provider enabled`);
+      input.setAttribute("aria-label", `${familyLabel} provider enabled`);
       control.append(input, createElement("span", "switch-track"));
-      row.append(copy, control);
-      sections.models.appendChild(row);
+      switchLabel.appendChild(control);
 
-      for (const route of providerRows) {
+      row.append(toggle, copy, switchLabel);
+      familyWrap.appendChild(row);
+
+      const childrenWrap = document.createElement("div");
+      childrenWrap.className = "settings-model-family-children";
+      childrenWrap.id = familyId;
+      childrenWrap.setAttribute("role", "group");
+      childrenWrap.hidden = !expanded;
+
+      for (const route of familyRows) {
         const routeRow = document.createElement("label");
         routeRow.className = "settings-row settings-model-route";
         const routeCopy = createElement("span", "settings-copy");
@@ -4670,16 +4783,26 @@ function renderSettings(payload, options = {}) {
             "small",
             "",
             route.inventory_only
-              ? `${String(route.adapter || "unknown adapter")} · discovered in VS Code · no task capability assigned`
+              ? route.discovered_from_opencode
+                ? `${String(route.adapter || "unknown adapter")} · discovered by OpenCode · no task capability assigned`
+                : `${String(route.adapter || "unknown adapter")} · discovered in VS Code · no task capability assigned`
               : `${String(route.adapter || "unknown adapter")} · ${String(route.worker_id || "unidentified worker")}`,
           ),
+          createElement("small", "settings-model-truth", routeTruthSummary(route)),
         );
+        if (isOpencodeOpenAIRoute(route, family)) {
+          routeCopy.appendChild(createElement(
+            "small",
+            "settings-model-warning",
+            "May share OpenAI/Codex subscription budget · stays disabled until explicitly enabled",
+          ));
+        }
         const routeControl = createElement("span", "switch-control");
         const routeInput = document.createElement("input");
         routeInput.type = "checkbox";
         routeInput.checked = Boolean(route.effective_enabled);
         routeInput.disabled = !enabled || !Boolean(route.catalog_enabled);
-        routeInput.dataset.modelProvider = String(route.provider || "");
+        routeInput.dataset.modelProvider = family;
         routeInput.dataset.modelAdapter = String(route.adapter || "");
         routeInput.dataset.modelName = String(route.model || "");
         routeInput.dataset.modelRevision = String(Number(modelPolicy.revision || 0));
@@ -4690,8 +4813,11 @@ function renderSettings(payload, options = {}) {
         routeInput.setAttribute("aria-label", `${String(route.model || "model")} enabled`);
         routeControl.append(routeInput, createElement("span", "switch-track"));
         routeRow.append(routeCopy, routeControl);
-        sections.models.appendChild(routeRow);
+        childrenWrap.appendChild(routeRow);
       }
+
+      familyWrap.appendChild(childrenWrap);
+      sections.models.appendChild(familyWrap);
     }
     if (!workers.length) {
       sections.models.appendChild(createElement("div", "panel-state", "No configured model routes"));
@@ -6461,6 +6587,21 @@ elements.settingsList.addEventListener("change", (event) => {
 });
 
 elements.settingsList.addEventListener("click", (event) => {
+  const familyToggle = event.target.closest("[data-model-family-toggle]");
+  if (familyToggle) {
+    const family = familyToggle.dataset.modelFamilyToggle || "";
+    const next = familyToggle.getAttribute("aria-expanded") !== "true";
+    if (!state.settingsCollapsedFamilies) state.settingsCollapsedFamilies = {};
+    if (next) delete state.settingsCollapsedFamilies[family];
+    else state.settingsCollapsedFamilies[family] = true;
+    familyToggle.setAttribute("aria-expanded", String(next));
+    familyToggle.setAttribute("aria-label", `${family === OPENCODE_FAMILY ? "OpenCode" : family} routes, ${next ? "expanded" : "collapsed"}`);
+    familyToggle.textContent = next ? "▾" : "▸";
+    const familyWrap = familyToggle.closest(".settings-model-family");
+    const childrenWrap = familyWrap ? familyWrap.querySelector(".settings-model-family-children") : null;
+    if (childrenWrap) childrenWrap.hidden = !next;
+    return;
+  }
   const tab = event.target.closest("[data-settings-tab]");
   if (!tab) return;
   state.settingsTab = tab.dataset.settingsTab || "features";

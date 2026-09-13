@@ -114,6 +114,25 @@ class _FakeLibrary:
         return 0
 
 
+class _RealSyscallLibrary:
+    """Linux x86_64 truth for the two brokered names NF-2026-00448 exercises.
+
+    The mapping stays separate from ``_FakeLibrary`` so a real-table lookup
+    can never accidentally inherit the fake numbers used by tests.
+    """
+
+    _NUMBERS = {"chmod": 90, "fchmod": 91}
+
+    def number(self, name: str) -> int:
+        return self._NUMBERS[name]
+
+    def seccomp_syscall_resolve_name(self, raw: bytes) -> int:
+        return self._NUMBERS.get(raw.decode("ascii"), -1)
+
+    def seccomp_notify_id_valid(self, fd: int, notif_id: int) -> int:
+        return 0
+
+
 def _make_request(nr: int, pid: int) -> worker_workspace._SeccompNotif:
     request = worker_workspace._SeccompNotif()
     request.id = 1
@@ -460,6 +479,144 @@ class TestBrokeredSyscallDecoding:
             os.close(target_fd)
             os.close(fd)
         assert stat.S_IMODE(os.stat(target).st_mode) == 0o640
+
+    @staticmethod
+    def _hardlinked_git_config_lock(scratch: Path) -> Path:
+        # NF-2026-00448: nested Git sparse checkout keeps .git/config.lock
+        # as a hardlink alias; reproduce that exact layout for probes.
+        git_dir = scratch / ".git"
+        git_dir.mkdir(mode=0o700)
+        target = git_dir / "config.lock"
+        target.write_text("x", encoding="utf-8")
+        os.chmod(target, 0o664)
+        os.link(target, scratch / "config.lock.alias")
+        return target
+
+    def _apply_brokered_metadata(
+        self,
+        library,
+        syscall_name: str,
+        target: Path,
+        scratch: Path,
+        mode: int,
+    ) -> None:
+        fd, root = _scratch_fd_root(scratch)
+        request = _make_request(library.number(syscall_name), os.getpid())
+        target_fd = None
+        try:
+            if syscall_name == "chmod":
+                buf = _path_buffer(target)
+                request.data.args[0] = ctypes.addressof(buf)
+            else:
+                target_fd = os.open(target, os.O_RDWR)
+                request.data.args[0] = target_fd
+            request.data.args[1] = mode
+            worker_workspace._metadata_broker_apply(
+                library, -1, request, os.getpid(), fd, root
+            )
+        finally:
+            if target_fd is not None:
+                os.close(target_fd)
+            os.close(fd)
+
+    def test_real_syscall_numbers_map_to_same_brokered_names(self) -> None:
+        real_names = worker_workspace._metadata_broker_syscall_names(
+            _RealSyscallLibrary()
+        )
+        fake_names = worker_workspace._metadata_broker_syscall_names(
+            _FakeLibrary()
+        )
+        # NF-2026-00448 measured the nested Git config.lock no-op as chmod
+        # (syscall 90) and fchmod (syscall 91) on x86_64; the brokered names
+        # must resolve identically for the real and the fake numbers alike.
+        assert real_names.get(90) == fake_names.get(71) == "chmod"
+        assert real_names.get(91) == fake_names.get(72) == "fchmod"
+
+    @pytest.mark.parametrize(
+        "library_factory", [_FakeLibrary, _RealSyscallLibrary], ids=["fake", "real"]
+    )
+    @pytest.mark.parametrize("syscall_name", ["chmod", "fchmod"])
+    def test_noop_metadata_on_hardlinked_git_lock_allowed(
+        self, scratch: Path, library_factory, syscall_name: str
+    ) -> None:
+        # The exact nested Git no-op case: the requested mode equals the
+        # current mode of the hardlinked lock, so the broker must allow it
+        # for the fake numbers and the real x86_64 chmod (90)/fchmod (91).
+        library = library_factory()
+        target = self._hardlinked_git_config_lock(scratch)
+        self._apply_brokered_metadata(
+            library, syscall_name, target, scratch, 0o664
+        )
+        assert stat.S_IMODE(os.stat(target).st_mode) == 0o664
+        assert os.stat(target).st_nlink == 2
+
+    @pytest.mark.parametrize("syscall_name", ["chmod", "fchmod"])
+    def test_mutating_mode_on_hardlink_denied(
+        self, scratch: Path, syscall_name: str
+    ) -> None:
+        # Any mode change on a hardlink alias is a metadata mutation and
+        # must keep failing closed with the audited denial reason.
+        target = scratch / "config.lock"
+        target.write_text("x", encoding="utf-8")
+        os.chmod(target, 0o664)
+        os.link(target, scratch / "config.lock.alias")
+        with pytest.raises(
+            WorkspaceError, match="metadata_broker_hardlink_forbidden"
+        ):
+            self._apply_brokered_metadata(
+                _FakeLibrary(), syscall_name, target, scratch, 0o600
+            )
+        assert stat.S_IMODE(os.stat(target).st_mode) == 0o664
+
+    def test_fchmod_unlinked_descriptor_noop_denied(
+        self, scratch: Path
+    ) -> None:
+        library = _FakeLibrary()
+        target = scratch / "config.lock"
+        target.write_text("x", encoding="utf-8")
+        os.chmod(target, 0o664)
+        fd, root = _scratch_fd_root(scratch)
+        target_fd = os.open(target, os.O_RDWR)
+        os.unlink(target)
+        request = _make_request(library.number("fchmod"), os.getpid())
+        request.data.args[0] = target_fd
+        request.data.args[1] = 0o664
+        try:
+            with pytest.raises(
+                WorkspaceError, match="metadata_broker_deleted_fd"
+            ):
+                worker_workspace._metadata_broker_apply(
+                    library, -1, request, os.getpid(), fd, root
+                )
+        finally:
+            os.close(target_fd)
+            os.close(fd)
+        assert not target.exists()
+
+    def test_fchmod_link_count_race_mutating_denied(
+        self, scratch: Path
+    ) -> None:
+        library = _FakeLibrary()
+        target = scratch / "config.lock"
+        target.write_text("x", encoding="utf-8")
+        os.chmod(target, 0o664)
+        fd, root = _scratch_fd_root(scratch)
+        target_fd = os.open(target, os.O_RDWR)
+        os.link(target, scratch / "config.lock.alias")
+        request = _make_request(library.number("fchmod"), os.getpid())
+        request.data.args[0] = target_fd
+        request.data.args[1] = 0o600
+        try:
+            with pytest.raises(
+                WorkspaceError, match="metadata_broker_hardlink_forbidden"
+            ):
+                worker_workspace._metadata_broker_apply(
+                    library, -1, request, os.getpid(), fd, root
+                )
+        finally:
+            os.close(target_fd)
+            os.close(fd)
+        assert stat.S_IMODE(os.stat(target).st_mode) == 0o664
 
     def test_fchmod_outside_scratch_denied(
         self, scratch: Path, tmp_path: Path

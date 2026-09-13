@@ -140,9 +140,10 @@ class TestBuildReviewPrompt:
             packet, lens="correctness",
             submit_tool_name="aiworkhub_worker_quality_review_submit",
         )
-        assert "aiworkhub_worker_quality_review_submit" not in prompt
-        assert "exactly one JSON object" in prompt
+        assert "calling aiworkhub_worker_quality_review_submit exactly once" in prompt
+        assert f'"packet_sha256":"{packet["packet_sha256"]}"' in prompt
         assert '"lens":"correctness","findings":[...]' in prompt
+        assert "Do not print or simulate a receipt" in prompt
 
     def test_prompt_names_the_receipts_the_supervisor_already_produced(self):
         """Reviewers were re-deriving evidence the packet already carried.

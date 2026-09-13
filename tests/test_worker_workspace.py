@@ -4683,10 +4683,10 @@ class TestFocusedRegressionExercisesCandidate:
             assert cleanup_called[0] is True
 
     @staticmethod
-    def test_ordinary_pytest_keeps_trusted_pythonpath_and_drops_candidate(
+    def test_ordinary_pytest_keeps_trusted_pythonpath_before_candidate(
         monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """Ordinary pytest keeps only trusted host PYTHONPATH components."""
+        """Pytest keeps trusted runtime first, then sandboxed candidate imports."""
         workspace = worker_workspace.WorkerWorkspace(
             request_id="nf128-ordinary-py-order",
             repo=tmp_path,
@@ -4798,13 +4798,14 @@ class TestFocusedRegressionExercisesCandidate:
             assert captured_components is not None, (
                 "resolve_validation_pythonpath was not called"
             )
-            # The canonical validator runtime remains available, while the
-            # candidate-writable component cannot shadow pytest or its imports.
-            assert captured_components == (str(pytest_root),)
-            assert results[0]["env_override"]["dropped_candidate_components"] == [
-                "src"
-            ], (
-                f"candidate component was not dropped: {captured_components}"
+            # The canonical validator runtime wins import precedence, while
+            # candidate project/root imports remain available behind it inside
+            # the already-confined pytest execution sandbox.
+            assert captured_components == (str(pytest_root), "src", ".")
+            assert results[0]["env_override"]["dropped_candidate_components"] == []
+            assert (
+                results[0]["env_override"]["retained_for"]
+                == "trusted_pytest_runtime_and_candidate_imports"
             )
         finally:
             monkeypatch.setattr(worker_workspace.subprocess, "run", orig_run)
@@ -5925,6 +5926,51 @@ def _plant_nested_landlock_layout(tmp_path: Path) -> tuple[Path, Path, Path, Pat
     return planted, locator, nested, scratch
 
 
+def _hide_ambient_outer_authority(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Hide the enclosing coordinator authority outside this test's tmp_path.
+
+    Full-suite runs execute beneath the coordinator's own planted authority,
+    so cwd-ancestor lookups would otherwise verify it and break the negative
+    expectations. Paths resolving outside tmp_path return None; paths inside
+    tmp_path delegate to the captured real verifiers, preserving every
+    planted owner/mode/symlink/HMAC fail-closed check.
+    """
+    boundary = tmp_path.resolve()
+    real_locator = worker_workspace.verify_nested_landlock_authority_locator
+    real_outer = worker_workspace.verify_outer_validation_authority_file
+
+    def _inside_tmp_path(path: Path) -> bool:
+        try:
+            resolved = path.resolve()
+        except OSError:
+            return False
+        return resolved == boundary or boundary in resolved.parents
+
+    def _scoped_locator(path: Path):
+        if not _inside_tmp_path(path):
+            return None
+        return real_locator(path)
+
+    def _scoped_outer(path: Path):
+        if not _inside_tmp_path(path):
+            return None
+        return real_outer(path)
+
+    monkeypatch.setattr(
+        worker_workspace,
+        "verify_nested_landlock_authority_locator",
+        _scoped_locator,
+    )
+    monkeypatch.setattr(
+        worker_workspace,
+        "verify_outer_validation_authority_file",
+        _scoped_outer,
+    )
+
+
 def test_nested_landlock_locator_resolves_from_separate_cwd(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -5946,6 +5992,7 @@ def test_nested_landlock_locator_rejects_ambient_non_nested_scratch_cwd(
 ) -> None:
     _planted, _locator, _nested, scratch = _plant_nested_landlock_layout(tmp_path)
     _deny_landlock_sibling_writes(monkeypatch)
+    _hide_ambient_outer_authority(monkeypatch, tmp_path)
     ambient = scratch / "pytest-tmp" / "ambient"
     ambient.mkdir(parents=True)
     monkeypatch.chdir(ambient)
@@ -5959,6 +6006,7 @@ def test_nested_landlock_locator_rejects_owner_mode_symlink_hmac_escape_copy(
 ) -> None:
     _planted, locator, nested, scratch = _plant_nested_landlock_layout(tmp_path)
     _deny_landlock_sibling_writes(monkeypatch)
+    _hide_ambient_outer_authority(monkeypatch, tmp_path)
     workspace = tmp_path / "workspace"
     monkeypatch.chdir(nested)
     real_owned = worker_workspace._coordinator_owned_regular_file
@@ -6684,9 +6732,9 @@ def test_verify_fd_accepts_exact_mode_noop_on_hardlinked_regular_file(
         mutate = worker_workspace._metadata_broker_verify_fd(
             fd, str(target), current_mode
         )
-        assert mutate is True
-        # Authentication admits only the exact mode; the broker must still
-        # execute the real fchmod branch on this descriptor.
+        assert mutate is False
+        # An authenticated exact-mode hardlink no-op must skip the real
+        # fchmod syscall; the authenticated descriptor mode stays unchanged.
         assert stat.S_IMODE(os.fstat(fd).st_mode) == current_mode
     finally:
         os.close(fd)
@@ -6758,7 +6806,7 @@ def test_verify_target_any_hardlink_same_mode_noop_accepted_different_mode_denie
         )
         try:
             assert fd >= 0
-            assert mutate is True
+            assert mutate is False
         finally:
             os.close(fd)
         with pytest.raises(
@@ -6799,7 +6847,6 @@ def test_fchmod_hardlink_noop_unlink_race_uses_authenticated_descriptor(
     target.chmod(0o644)
     _hardlink_or_skip(target, sibling)
     child_fd = os.open(target, os.O_RDONLY)
-    original_identity = os.fstat(child_fd).st_dev, os.fstat(child_fd).st_ino
     specs = [worker_workspace._open_broker_scratch_root(scratch)]
     request = worker_workspace._SeccompNotif()
     request.id = 448
@@ -6839,8 +6886,8 @@ def test_fchmod_hardlink_noop_unlink_race_uses_authenticated_descriptor(
             object(), -1, request, os.getpid(), specs
         )
         assert checks == 2
-        assert fchmod_identities == [original_identity]
-        assert target.read_text(encoding="utf-8") == "replacement\n"
+        assert fchmod_identities == []
+        assert target.read_text() == "replacement\n"
         assert stat.S_IMODE(target.stat().st_mode) == 0o600
         assert stat.S_IMODE(os.fstat(child_fd).st_mode) == 0o644
     finally:
@@ -6915,6 +6962,97 @@ def test_metadata_broker_allows_real_git_init_chmod(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     assert (target / ".git" / "config").is_file()
 
+
+def test_run_validations_nested_git_sparse_checkout_noop_metadata_integration(
+    tmp_path: Path,
+) -> None:
+    """NF-2026-00448: the nested Git sparse-checkout/config.lock path must
+    validate under the exec-scratch metadata broker. Re-running
+    ``sparse-checkout set`` re-locks ``config.lock`` as a no-op, so the exact
+    chmod/fchmod no-op on a hardlinked inode stays permitted; the successful
+    run executes no mutating metadata syscall on that inode, and any real
+    mutation attempt on a hardlinked inode still fails closed with
+    ``metadata_broker_hardlink_forbidden``."""
+    repo = tmp_path / "fake_repo"
+    repo.mkdir()
+    base = tmp_path / "worktrees" / "nf448-nested-git"
+    path = base / "worktree"
+    home = base / "home"
+    path.mkdir(parents=True)
+    home.mkdir(parents=True, mode=0o700)
+    (home / "tmp").mkdir(mode=0o700)
+    workspace = worker_workspace.WorkerWorkspace(
+        request_id="nf448-nested-git",
+        repo=repo,
+        path=path,
+        home=home,
+        allowed_writes=(),
+        parent_baseline={},
+        workspace_baseline={},
+    )
+    (path / "nf448_nested_git.py").write_text(
+        "import os\n"
+        "import stat\n"
+        "import subprocess\n"
+        "import sys\n"
+        "from pathlib import Path\n"
+        "\n"
+        "root = Path(os.environ['TMPDIR']) / 'pytest-tmp' / 'nf448-nested-git'\n"
+        "root.mkdir(parents=True, exist_ok=True)\n"
+        "(root / 'src').mkdir(exist_ok=True)\n"
+        "(root / 'src' / 'tracked.txt').write_text('ok\\n', encoding='utf-8')\n"
+        "os.chdir(root)\n"
+        "sequence = [\n"
+        "    ['git', 'init', '-b', 'main'],\n"
+        "    ['git', 'config', 'user.email', 'nf448@example.invalid'],\n"
+        "    ['git', 'config', 'user.name', 'NF448'],\n"
+        "    ['git', 'add', 'src/tracked.txt'],\n"
+        "    ['git', 'commit', '-m', 'init'],\n"
+        "    ['git', 'sparse-checkout', 'init', '--cone'],\n"
+        "    ['git', 'sparse-checkout', 'set', 'src'],\n"
+        "    ['git', 'sparse-checkout', 'set', 'src'],\n"
+        "]\n"
+        "for command in sequence:\n"
+        "    done = subprocess.run(\n"
+        "        command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True\n"
+        "    )\n"
+        "    if done.returncode != 0:\n"
+        "        sys.stderr.write(done.stderr)\n"
+        "        sys.exit(30)\n"
+        "if not (root / 'src' / 'tracked.txt').is_file():\n"
+        "    sys.exit(31)\n"
+        "lock = root / '.git' / 'config.lock'\n"
+        "lock.write_text('locked\\n', encoding='utf-8')\n"
+        "os.chmod(lock, 0o600)\n"
+        "os.link(lock, root / 'config.lock.link')\n"
+        "mode = stat.S_IMODE(os.stat(lock).st_mode)\n"
+        "os.chmod(lock, mode)\n"
+        "descriptor = os.open(lock, os.O_RDONLY)\n"
+        "try:\n"
+        "    os.fchmod(descriptor, mode)\n"
+        "finally:\n"
+        "    os.close(descriptor)\n"
+        "print('noop-allowed')\n"
+        "if stat.S_IMODE(os.stat(lock).st_mode) != mode:\n"
+        "    sys.exit(33)\n"
+        "print('nested-git-noop-ok')\n"
+        "print('scratch=' + os.environ['TMPDIR'])\n",
+        encoding="utf-8",
+    )
+    try:
+        (result,) = worker_workspace.run_validations(
+            workspace,
+            ["python3 nf448_nested_git.py"],
+            backend="landlock",
+        )
+        assert isinstance(result["returncode"], int)
+        assert 0 <= result["returncode"] < 128, result
+        assert result["returncode"] == 0, result["stderr_tail"]
+        assert "metadata_broker_hardlink_forbidden" not in result["stderr_tail"]
+        assert "noop-allowed" in result["stdout_tail"]
+        assert "nested-git-noop-ok" in result["stdout_tail"]
+    finally:
+        worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
 
 def test_metadata_broker_denial_uses_private_structural_channel(
     monkeypatch: pytest.MonkeyPatch,

@@ -1033,6 +1033,57 @@ def test_canonical_chain_publishes_one_manager_callback_after_all_reviews(
         conn.close()
 
 
+def test_stale_manager_ready_receipt_cannot_starve_current_projection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A superseded completed chain is quarantined without widening failures."""
+
+    task_store.initialize_repository(tmp_path)
+    _readiness, db_path = task_store._require_ready(tmp_path)
+    driver = review_orchestrator.ReviewOrchestrator(
+        _Manager(tmp_path), db_path=db_path, route_selector=_route,
+    )
+    receipts = [
+        {
+            "manager_ready": {
+                "chain_id": 41,
+                "target_task_id": "TARGET",
+                "target_request_id": "stale-request",
+                "claim_epoch": "1",
+            },
+        },
+        {
+            "manager_ready": {
+                "chain_id": 42,
+                "target_task_id": "TARGET",
+                "target_request_id": "current-request",
+                "claim_epoch": "2",
+            },
+        },
+    ]
+    monkeypatch.setattr(
+        review_orchestrator.review_lifecycle,
+        "completed_manager_ready_receipts",
+        lambda _db_path: receipts,
+    )
+    calls: list[str] = []
+
+    def publish(_repo, *, task_id, request_id, claim_epoch):
+        assert task_id == "TARGET"
+        assert claim_epoch in {"1", "2"}
+        calls.append(request_id)
+        if request_id == "stale-request":
+            return False, "manager_ready_target_identity_mismatch", False
+        return True, "manager_ready", True
+
+    monkeypatch.setattr(review_orchestrator.task_store, "publish_manager_ready", publish)
+
+    assert driver._publish_completed_manager_ready() == 1
+    assert calls == ["stale-request", "current-request"]
+    assert driver._publish_completed_manager_ready() == 0
+    assert calls == ["stale-request", "current-request"]
+
+
 def test_happy_path_is_exactly_ordered_and_hands_cleanup_to_manager(
     monkeypatch, tmp_path: Path
 ) -> None:

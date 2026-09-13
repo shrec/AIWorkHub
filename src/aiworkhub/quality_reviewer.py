@@ -782,18 +782,12 @@ def build_review_prompt(
             instruction=str(repair["instruction"]),
         )
     )
-    # Reconciliation of a real contradiction: runtime_adapters grants the
-    # reviewer ``aiworkhub_worker_quality_review_submit`` in its allowedTools,
-    # yet this prompt bans invoking any submission tool.  The prompt ban is
-    # authoritative -- the reviewer emits exactly one JSON report as its final
-    # text and the SUPERVISOR (quality_review_ingest.supervisor_ingest) derives
-    # all task/request/claim/target/reviewer/packet identity and submits it.
-    # The allowedTools grant is retained only as a tolerated fallback: if a
-    # reviewer self-submits despite the ban, that payload lands in the audit
-    # ledger and supervisor_ingest's explicit-receipt path reconciles it (dedup
-    # or conflict), never letting reviewer-asserted identity through.  The tool
-    # name is deliberately kept out of the returned prompt so the reviewer is
-    # not nudged toward it.
+    # One terminal contract across native and text-protocol adapters: the
+    # reviewer submits exactly once through the request-bound MCP tool.  The
+    # tool derives task/request/claim/target/reviewer identity from runtime
+    # authority; the model supplies only the sealed packet digest, lens and
+    # findings.  Keeping this instruction aligned with the VS Code bridge
+    # prevents an adapter from simultaneously requiring and forbidding submit.
     return (
         f"{repair_block}"
         "You are an independent, strictly read-only quality reviewer.\n"
@@ -807,10 +801,10 @@ def build_review_prompt(
         f"{_ALREADY_ESTABLISHED_MECHANICALLY}"
         "Report only concrete items supported by file/line or check evidence. "
         f"{QUALITY_REVIEW_FINDING_SCHEMA_DOC}\n"
-        "Finish with exactly one JSON object and no surrounding prose, using "
-        f'{{"lens":"{lens}","findings":[...]}}. The supervisor derives all '
-        "task, request, claim, target, reviewer, and packet identity and durably "
-        "submits the report. Do not invoke lifecycle or submission tools.\n"
+        f"Finish by calling {submit_tool_name} exactly once with "
+        f'{{"packet_sha256":"{packet_digest}","lens":"{lens}","findings":[...]}}. '
+        "Do not print or simulate a receipt and do not invoke lifecycle tools. "
+        "The request-bound tool derives task, request, claim, target and reviewer identity.\n"
         f"{packet_evidence}"
     )
 

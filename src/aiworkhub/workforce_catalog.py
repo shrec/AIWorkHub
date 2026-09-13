@@ -17,6 +17,7 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from statistics import median
+from threading import Lock
 from typing import Any, Iterable, Mapping
 
 from . import (
@@ -129,6 +130,7 @@ def execution_runner(worker_id: str, adapter_id: str) -> str:
         "glm_copilot_cli": "glm",
         "grok_kilo_cli": "grok",
         "vscode_lm": "copilot",
+        "opencode_cli": "opencode",
     }.get(str(adapter_id).strip(), "worker")
     slug = re.sub(r"[^A-Za-z0-9_.:-]+", "_", str(worker_id).strip()).strip("_.:-")
     remainder = slug
@@ -144,6 +146,62 @@ def execution_runner(worker_id: str, adapter_id: str) -> str:
         f"{worker_id}\0{adapter_id}".encode("utf-8")
     ).hexdigest()[:12]
     return f"{candidate[:115].rstrip('_.:-')}_{digest}"
+
+
+_ANSI_ESCAPE_RE = re.compile(
+    r"(?:\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_])"
+)
+_OPENCODE_MODELS_MAX_BYTES = 64 * 1024
+_OPENCODE_MODELS_MAX_ROWS = 64
+
+
+def parse_opencode_models_output(raw: str | bytes | None) -> list[str]:
+    """Parse bounded ``opencode models`` text into exact provider/model ids."""
+
+    if raw is None:
+        return []
+    if isinstance(raw, bytes):
+        if len(raw) > _OPENCODE_MODELS_MAX_BYTES:
+            return []
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return []
+    elif isinstance(raw, str):
+        if len(raw.encode("utf-8")) > _OPENCODE_MODELS_MAX_BYTES:
+            return []
+        text = raw
+    else:
+        return []
+    cleaned = _ANSI_ESCAPE_RE.sub("", text).replace("\x00", "")
+    candidates: list[str] = []
+    stripped = cleaned.strip()
+    if stripped.startswith("["):
+        try:
+            payload = json.loads(stripped)
+        except json.JSONDecodeError:
+            payload = None
+        if isinstance(payload, list) and all(isinstance(item, str) for item in payload):
+            candidates = list(payload)
+    if not candidates:
+        for line in cleaned.splitlines():
+            token = line.strip().split()[0] if line.strip() else ""
+            if token:
+                candidates.append(token)
+    discovered: list[str] = []
+    seen: set[str] = set()
+    for value in candidates:
+        identity, error = runtime_adapters.resolve_opencode_model(str(value).strip())
+        if error or not identity or not _MODEL_TOKEN_RE.fullmatch(identity):
+            continue
+        if identity in seen:
+            continue
+        seen.add(identity)
+        discovered.append(identity)
+        if len(discovered) >= _OPENCODE_MODELS_MAX_ROWS:
+            break
+    return discovered
+
 
 # Keep the declared worker/provider/model identity stable while allowing an
 # equivalent launch transport when the preferred VS Code LM surface is not
@@ -202,7 +260,7 @@ def policy_route_identity(provider: str, adapter_id: str) -> tuple[str, str]:
 def model_identity_valid(value: str) -> bool:
     """Return whether a discovered model id is safe for policy persistence."""
 
-    return bool(_TOKEN_RE.fullmatch(str(value)))
+    return bool(_MODEL_TOKEN_RE.fullmatch(str(value)))
 
 
 def catalog_path(repo_root: Path | str) -> Path:
@@ -883,6 +941,11 @@ def _resolve_effective_adapter(
             return model in {
                 str(value) for value in observed if isinstance(value, str)
             }
+        if adapter_id == "opencode_cli":
+            if not isinstance(observed, list):
+                return True
+            visible = {str(value) for value in observed if isinstance(value, str)}
+            return model in visible
         if adapter_id not in {
             "vscode_lm",
             "deepseek_vscode_lm",
@@ -999,6 +1062,142 @@ def _expand_discovered_workers(
                 preserved["discovered_from_editor"] = False
                 expanded.append(preserved)
                 emitted_identities.add(identity)
+    return _attach_opencode_discovered_workers(expanded, ready_by_adapter)
+
+
+def _opencode_worker_id(identity: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9_.:-]+", "_", str(identity).strip()).strip("_.:-")
+    return slug[:128] or "opencode"
+
+
+def _opencode_discovered_identities(
+    ready_by_adapter: Mapping[str, Mapping[str, Any]],
+) -> list[str]:
+    readiness = ready_by_adapter.get("opencode_cli", {})
+    raw = readiness.get("provider_observed_models")
+    if not isinstance(raw, list):
+        raw = readiness.get("observed_models")
+    if not isinstance(raw, list):
+        return []
+    return parse_opencode_models_output(
+        "\n".join(str(item) for item in raw if isinstance(item, str))
+    )
+
+
+def opencode_identities_from_preflight(
+    preflight: Mapping[str, Any] | None,
+) -> list[str]:
+    """Return exact OpenCode identities from one catalog preflight snapshot.
+
+    This never probes the CLI. The snapshot must already carry
+    ``provider_observed_models`` or ``observed_models`` on the opencode_cli
+    adapter row -- the same fields ``build_catalog`` consumes.
+    """
+
+    ready_by_adapter: dict[str, Mapping[str, Any]] = {}
+    if isinstance(preflight, Mapping):
+        for item in preflight.get("providers") or []:
+            if not isinstance(item, Mapping):
+                continue
+            adapter_id = str(item.get("adapter_id") or "")
+            if adapter_id:
+                ready_by_adapter[adapter_id] = item
+    return _opencode_discovered_identities(ready_by_adapter)
+
+
+_PREFLIGHT_HANDOFF_LOCK = Lock()
+_PREFLIGHT_HANDOFF: dict[str, dict[str, Any]] = {}
+_PREFLIGHT_HANDOFF_MAX_REPOS = 8
+_PREFLIGHT_HANDOFF_MAX_PROVIDERS = 64
+
+
+def remember_preflight_snapshot(
+    repo_root: Path | str,
+    preflight: Mapping[str, Any] | None,
+) -> None:
+    """Store a bounded, repo-keyed copy of the catalog's consumed preflight."""
+
+    if not isinstance(preflight, Mapping):
+        return
+    try:
+        key = str(Path(repo_root).resolve())
+    except (OSError, TypeError, ValueError):
+        return
+    providers: list[dict[str, Any]] = []
+    for item in preflight.get("providers") or []:
+        if not isinstance(item, Mapping):
+            continue
+        providers.append(dict(item))
+        if len(providers) >= _PREFLIGHT_HANDOFF_MAX_PROVIDERS:
+            break
+    snapshot = {"providers": providers}
+    with _PREFLIGHT_HANDOFF_LOCK:
+        _PREFLIGHT_HANDOFF.pop(key, None)
+        _PREFLIGHT_HANDOFF[key] = snapshot
+        while len(_PREFLIGHT_HANDOFF) > _PREFLIGHT_HANDOFF_MAX_REPOS:
+            _PREFLIGHT_HANDOFF.pop(next(iter(_PREFLIGHT_HANDOFF)))
+
+
+def cached_preflight_snapshot(repo_root: Path | str) -> dict[str, Any] | None:
+    """Return the catalog preflight already built for this repo, or None."""
+
+    try:
+        key = str(Path(repo_root).resolve())
+    except (OSError, TypeError, ValueError):
+        return None
+    with _PREFLIGHT_HANDOFF_LOCK:
+        snapshot = _PREFLIGHT_HANDOFF.get(key)
+        if snapshot is None:
+            return None
+        providers = [dict(item) for item in snapshot.get("providers") or []]
+        return {"providers": providers}
+
+
+def _attach_opencode_discovered_workers(
+    expanded: list[dict[str, Any]],
+    ready_by_adapter: Mapping[str, Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    present = {
+        (str(worker.get("adapter_id") or ""), str(worker.get("model") or ""))
+        for worker in expanded
+    }
+    for identity in _opencode_discovered_identities(ready_by_adapter):
+        key = ("opencode_cli", identity)
+        if key in present:
+            for worker in expanded:
+                if (
+                    str(worker.get("adapter_id") or ""),
+                    str(worker.get("model") or ""),
+                ) == key:
+                    worker["discovered_from_opencode"] = True
+            continue
+        provider, _sep, _remainder = identity.partition("/")
+        projected = {
+            "worker_id": _opencode_worker_id(identity),
+            "adapter_id": "opencode_cli",
+            "model": identity,
+            "provider": provider.lower(),
+            "enabled": True,
+            "supports": ["mechanical"],
+            "tools": [
+                "filesystem",
+                "source-graph",
+                "session-manager",
+                "ai-memory",
+                "kb",
+                "semantic-edit",
+            ],
+            "max_context_tokens": 256_000,
+            "max_risk": "low",
+            "quality_ceiling": 0.95,
+            "manager_score_adjustment": 0.0,
+            "manager": False,
+            "implementation_worker": True,
+            "reviewer": False,
+            "discovered_from_opencode": True,
+        }
+        expanded.append(projected)
+        present.add(key)
     return expanded
 
 
@@ -1153,6 +1352,7 @@ def build_catalog(
             process["identity_recovered_fields"] = recovered_fields
             identity_recovered += 1
     readiness = preflight or repo_policy.build_preflight(root)
+    remember_preflight_snapshot(root, readiness)
     ready_by_adapter = {
         str(item.get("adapter_id") or ""): item
         for item in readiness.get("providers") or []

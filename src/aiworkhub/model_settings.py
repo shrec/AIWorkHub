@@ -37,6 +37,7 @@ _ADAPTER_PROVIDERS = {
     "deepseek_copilot_cli": "deepseek",
     "glm_copilot_cli": "zhipu",
     "grok_kilo_cli": "xai",
+    "opencode_cli": "opencode",
 }
 _STORED_FIELDS = frozenset(
     {"schema_id", "revision", "updated_at", "providers", "adapters", "models"}
@@ -47,12 +48,24 @@ class ModelSettingsError(RuntimeError):
     """Malformed, stale or unsafe repository model settings."""
 
 
+def opencode_identity_default_enabled(model: str) -> bool:
+    """Return whether an OpenCode identity is launch-eligible by default."""
+
+    identity = str(model or "").strip()
+    provider, sep, remainder = identity.partition("/")
+    if not sep or not provider or not remainder or "/" in remainder:
+        return False
+    return provider == "opencode" and remainder.endswith("-free") and remainder != "-free"
+
+
 def policy_route_identity(provider: str, adapter: str) -> tuple[str, str]:
     """Return the repository-policy owner for one effective launch route."""
 
     normalized_adapter = _validate_identity(adapter, "adapter")
     if normalized_adapter in _EDITOR_POLICY_ADAPTERS:
         return "copilot", "vscode_lm"
+    if normalized_adapter == "opencode_cli":
+        return "opencode", "opencode_cli"
     return _validate_identity(provider, "provider").lower(), normalized_adapter
 
 
@@ -269,8 +282,9 @@ def evaluate_state(
         override = state["models"].get(provider, {}).get(adapter, {})
         if model in override:
             return bool(override[model])
+        if adapter == "opencode_cli" and provider == "opencode":
+            return opencode_identity_default_enabled(model)
     return True
-
 
 @contextmanager
 def _update_lock(path: Path):

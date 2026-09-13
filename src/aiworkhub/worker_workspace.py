@@ -982,6 +982,24 @@ def _hash_path(path: Path) -> str | None:
     return f"file:{mode:o}:{digest.hexdigest()}"
 
 
+def _same_regular_file_content(left: Path, right: Path) -> bool:
+    """Compare the payload that the combined-tree overlay can materialize.
+
+    ``_overlay_regular_path`` deliberately uses ``copyfile`` because metadata
+    operations are denied inside the Landlock validation boundary.  Therefore
+    an already-canonical candidate must be compared by bytes, not by the
+    sandbox-local permission bits included in ``_hash_path``.
+    """
+
+    left_hash = _hash_path(left)
+    right_hash = _hash_path(right)
+    if left_hash is None or right_hash is None:
+        return False
+    if not left_hash.startswith("file:") or not right_hash.startswith("file:"):
+        return left_hash == right_hash
+    return left_hash.rsplit(":", 1)[-1] == right_hash.rsplit(":", 1)[-1]
+
+
 def finalization_git_timeout_seconds() -> float:
     """Return the bounded finalization Git budget configured for this host."""
     raw = os.environ.get(FINALIZATION_GIT_TIMEOUT_ENV, "").strip()
@@ -2426,6 +2444,62 @@ def has_verified_rework_delta(
         return hashlib.sha256(resolved.read_bytes()).hexdigest() == digest
     except OSError:
         return False
+
+
+def verified_rework_delta_file_hashes(
+    predecessor: Any,
+    *,
+    authority_repo: Path,
+) -> dict[str, str] | None:
+    """Return sealed predecessor path digests, or None when none is claimed.
+
+    A predecessor that does not claim a sealed delta returns ``None`` so the
+    existing inherited-rework carve-out still applies. A claimed but
+    unverified, identity-mismatched, or unreadable artifact returns an empty
+    mapping so inheritance fails closed.
+    """
+    if not isinstance(predecessor, dict):
+        return None
+    if predecessor.get("rework_delta") is None and predecessor.get("delta_artifact") is None:
+        return None
+    if not has_verified_rework_delta(predecessor, authority_repo=authority_repo):
+        return {}
+    artifact_path = Path(str((predecessor.get("delta_artifact") or {}).get("path") or ""))
+    try:
+        packet = json.loads(artifact_path.read_bytes().decode("utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError):
+        return {}
+    if not isinstance(packet, dict):
+        return {}
+    canonical_digest = str(packet.pop("canonical_digest", "") or "")
+    if (
+        packet.get("schema_id") != REWORK_DELTA_ARTIFACT_SCHEMA_ID
+        or not re.fullmatch(r"[0-9a-f]{64}", canonical_digest)
+        or _rework_delta_canonical_digest(packet) != canonical_digest
+        or str(packet.get("authority_repo")) != str(authority_repo.resolve(strict=False))
+        or str(packet.get("request_id")) != str(predecessor.get("request_id") or "").strip()
+        or str(packet.get("task_id")) != str(predecessor.get("task_id") or "").strip()
+        or packet.get("claim_epoch") != predecessor.get("claim_epoch")
+    ):
+        return {}
+    files = packet.get("files")
+    if not isinstance(files, list) or not files:
+        return {}
+    hashes: dict[str, str] = {}
+    for entry in files:
+        if not isinstance(entry, dict):
+            return {}
+        try:
+            relative = _rework_delta_normalize_path(entry.get("path"))
+        except WorkspaceError:
+            return {}
+        if entry.get("deleted") is True:
+            continue
+        file_sha = str(entry.get("sha256") or "")
+        if not re.fullmatch(r"[0-9a-f]{64}", file_sha):
+            return {}
+        hashes[relative] = file_sha
+    return hashes
 
 
 def materialize_rework_delta_artifact(
@@ -5247,7 +5321,16 @@ def create_combined_validation_workspace(
             _overlay_regular_path(source_workspace.path, combined.path, relative)
         observed = changed_paths(combined)
         unexpected = sorted(set(observed) - set(candidate))
-        missing = sorted(set(candidate) - set(observed))
+        not_observed = sorted(set(candidate) - set(observed))
+        already_in_canonical = [
+            relative
+            for relative in not_observed
+            if _same_regular_file_content(
+                source_workspace.path / relative,
+                repo / relative,
+            )
+        ]
+        missing = sorted(set(not_observed) - set(already_in_canonical))
         if unexpected:
             raise WorkspaceError(
                 "combined_tree_unexpected_delta:" + ",".join(unexpected[:20])
@@ -5261,6 +5344,7 @@ def create_combined_validation_workspace(
             "candidate_paths": candidate,
             "canonical_delta_paths": canonical_delta,
             "observed_candidate_paths": observed,
+            "candidate_paths_already_in_canonical": already_in_canonical,
         }
     except Exception:
         cleanup_workspace(repo, combined.path, combined.home)
@@ -5667,6 +5751,8 @@ def validate_required_outputs(
     replay_actor: str = "",
     replay_predecessor_request_id: str = "",
     replay_claim_epoch: int | None = None,
+    rework_predecessor: dict[str, Any] | None = None,
+    strict_rework_inheritance: bool = False,
 ) -> list[dict[str, Any]]:
     """Validate every declared required output exists, is non-empty, and changed.
 
@@ -5688,8 +5774,26 @@ def validate_required_outputs(
     unchanged inherited predecessor path whose raw SHA-256 and exact task,
     actor, predecessor request, and claim epoch match a one-episode Phase A
     authorization. Every mismatch preserves the ordinary fail-closed result.
+
+    ``rework_predecessor`` never widens that allowlist either. A verified sealed
+    delta may count an inherited mandatory output whose digest matches the
+    artifact; a claimed but mismatched request, task, claim epoch, path, or
+    digest fails closed. ``strict_rework_inheritance`` disables the legacy
+    direct-call fallback onto workspace-derived inherited rework paths when no
+    sealed predecessor authority is claimed, so strict coordinator finalization
+    fails closed instead.
     """
     required_patterns = [_relative_repo_path(raw) for raw in required_outputs]
+    sealed_inherited_hashes = verified_rework_delta_file_hashes(
+        rework_predecessor,
+        authority_repo=workspace.repo,
+    )
+    if sealed_inherited_hashes is None and strict_rework_inheritance:
+        # Strict coordinator finalization: absent or unauthenticated
+        # predecessor authority never falls back to workspace-derived
+        # inherited rework paths, so an inherited mandatory output that the
+        # current attempt did not change fails closed.
+        sealed_inherited_hashes = {}
     unchanged_allowed: set[str] = set()
     for raw in allow_unchanged or ():
         path = _relative_repo_path(raw)
@@ -5748,15 +5852,24 @@ def validate_required_outputs(
                 legacy_error_codes.append(f"required_output_zero_bytes:{relative}")
                 continue
             current_hash = _hash_path(target)
-            inherited_change = (
-                relative in workspace.inherited_rework_paths
-                and current_hash == workspace.workspace_baseline.get(relative)
-                and current_hash != workspace.parent_baseline.get(relative)
+            raw_sha256 = hashlib.sha256(target.read_bytes()).hexdigest()
+            matches_retry_baseline = current_hash == workspace.workspace_baseline.get(
+                relative
             )
-            is_unchanged = (
-                current_hash == workspace.workspace_baseline.get(relative)
-                and not inherited_change
-            )
+            differs_from_parent = current_hash != workspace.parent_baseline.get(relative)
+            if sealed_inherited_hashes is not None:
+                inherited_change = (
+                    matches_retry_baseline
+                    and differs_from_parent
+                    and sealed_inherited_hashes.get(relative) == raw_sha256
+                )
+            else:
+                inherited_change = (
+                    relative in workspace.inherited_rework_paths
+                    and matches_retry_baseline
+                    and differs_from_parent
+                )
+            is_unchanged = matches_retry_baseline and not inherited_change
             replay_evidence: dict[str, Any] | None = None
             if is_unchanged:
                 if relative not in unchanged_allowed:
@@ -7592,6 +7705,21 @@ def _validator_run_pythonpath_components(components: tuple[str, ...]) -> tuple[s
     )
 
 
+def _pytest_run_pythonpath_components(components: tuple[str, ...]) -> tuple[str, ...]:
+    """Keep pytest's trusted roots ahead of its sandboxed candidate imports.
+
+    Unlike ruff and mypy, pytest deliberately imports and executes candidate
+    tests.  ``-P`` must therefore be paired with an explicit candidate root;
+    otherwise repository-root packages such as ``scripts`` disappear from
+    ``sys.path``.  Approved absolute runtime roots stay first so candidate
+    modules cannot replace pytest itself, while relative components remain
+    confined by ``resolve_validation_pythonpath`` and the validation sandbox.
+    """
+    trusted = tuple(component for component in components if os.path.isabs(component))
+    candidate = tuple(component for component in components if not os.path.isabs(component))
+    return (*trusted, *candidate)
+
+
 def _normalize_trusted_validation_executable_argv_with_roots(
     argv: list[str], repo: Path | None = None
 ) -> tuple[list[str], tuple[Path, ...]]:
@@ -8237,23 +8365,27 @@ def _metadata_broker_verify_flags(flags: int) -> int:
 
 
 def _metadata_broker_verify_fd(
-    fd: int, candidate: str, requested_mode: int | None = None
+    fd: int,
+    candidate: str,
+    requested_mode: int | None = None,
 ) -> bool:
     """Fail closed unless fd is a scratch-owned target beneath the request scratch.
 
     Owned directories are permitted so validators can manage scratch-directory
     metadata (e.g. os.chmod(parent, 0o700) after path.parent.mkdir).
-    Regular files still require st_nlink == 1 (no hardlinks) UNLESS
-    requested_mode is given and already equals the file's current
-    permission bits exactly -- that one metadata no-op is accepted so a
-    validator that redundantly re-chmods a hardlinked file to its own mode
-    (e.g. a nested Git/pytest config.lock) is not spuriously denied, while
-    any actual requested mode change against a hardlink stays denied. Special
-    files (devices, sockets, FIFOs) remain denied.
+    Regular files still require st_nlink == 1 (no hardlinks) UNLESS the
+    brokered chmod is an exact mode no-op against that inode: requested_mode
+    is given and already equals the file's current permission bits exactly
+    (NF-2026-00448: a nested Git sparse-checkout re-apply re-chmods an
+    already hardlinked config.lock to its own mode). That one verified no-op
+    returns False so the caller skips the real fchmod and the shared inode is
+    never touched; any missing or different requested mode against a hardlink
+    stays metadata_broker_hardlink_forbidden. Special files (devices,
+    sockets, FIFOs) remain denied.
 
     Returns True only after the descriptor is authenticated for the real
-    fchmod syscall branch. For a hardlink, the exact current permission
-    bits are the sole accepted request, so the syscall cannot change its mode.
+    fchmod syscall branch; False means the verified request is already
+    satisfied and the caller must not execute the syscall.
     """
     info = os.fstat(fd)
     if stat.S_ISDIR(info.st_mode):
@@ -8266,8 +8398,10 @@ def _metadata_broker_verify_fd(
         if not stat_owned_by_current_user(info):
             raise WorkspaceError(f"metadata_broker_foreign_owner:{candidate}")
         if requested_mode is None or stat.S_IMODE(info.st_mode) != requested_mode:
+            # Only an exact permission-bit no-op may pass: every missing or
+            # different mode request on a hardlink stays denied fail-closed.
             raise WorkspaceError(f"metadata_broker_hardlink_forbidden:{candidate}")
-        return True
+        return False
     if not stat_owned_by_current_user(info):
         raise WorkspaceError(f"metadata_broker_foreign_owner:{candidate}")
     return True
@@ -8288,9 +8422,13 @@ def _metadata_broker_verify_target(
     fails closed on traversal, absolute/outside paths, symlinked roots and
     symlink targets -- never a userspace string-prefix comparison. The returned
     descriptor passes ``_metadata_broker_verify_fd`` (owned directories are
-    permitted; regular files require ``st_nlink == 1`` unless ``requested_mode``
-    is an exact permission-bit no-op); the caller executes ``fchmod`` on that
-    exact authenticated fd and closes it.
+    permitted; regular files require ``st_nlink == 1``, and a hardlinked
+    regular file is authorized only when its permission bits already equal
+    ``requested_mode`` exactly -- that exact-mode authorization returns
+    ``False`` so the caller skips the real ``fchmod``, while a missing or
+    different mode is denied); the caller executes ``fchmod`` on that exact
+    authenticated fd only when the returned authorization is ``True``, and
+    always closes it.
 
     For directories the first ``openat2`` with ``O_RDONLY|O_NOCTTY`` yields an
     O_PATH descriptor that cannot be ``fchmod``'d.  A second ``openat2`` with
@@ -8362,9 +8500,13 @@ def _metadata_broker_verify_target_any(
     rejected -- authority is never widened to the repository or an arbitrary
     path.
 
-    Returns the authenticated fd and syscall-branch authorization. An accepted
-    hardlink request is necessarily an exact permission-bit no-op, but still
-    executes through the real ``fchmod`` branch on that descriptor.
+    Returns the authenticated fd and the ``fchmod`` authorization decided by
+    ``_metadata_broker_verify_fd``. The hardlink exception (NF-2026-00448)
+    is exact-mode only: a hardlinked regular file is authorized solely when
+    its permission bits already equal the requested ``fchmod`` mode, and that
+    authorization is ``False`` so the caller skips the real ``fchmod``; a
+    missing or different mode is denied fail-closed like any other
+    beneath-but-invalid target.
     """
     outside: WorkspaceError | None = None
     for scratch_fd, scratch_root in scratch_specs:
@@ -10411,6 +10553,11 @@ def run_validations(
                 effective_components = _candidate_pythonpath_components(
                     workspace, effective_components
                 )
+            if _is_pytest_validation_command(tokens) and "." not in effective_components:
+                # ``-P`` removes the implicit cwd entry. Pytest intentionally
+                # imports candidate tests, including repository-root helper
+                # packages, so spell that already-sandboxed authority explicitly.
+                effective_components = (*effective_components, ".")
             tokens, validation_executable_roots, module_interpreter_authority = (
                 _normalize_trusted_validation_executable_argv_with_authority(
                     tokens, workspace.repo
@@ -10565,8 +10712,11 @@ def run_validations(
                     # code, so drop every candidate-writable component and keep only
                     # the trusted host-absolute ones (the explicit safe channel),
                     # mirroring ``_host_probe_pythonpath``.
-                    safe_components = _validator_run_pythonpath_components(
-                        effective_components
+                    pytest_command = _is_pytest_validation_command(tokens)
+                    safe_components = (
+                        _pytest_run_pythonpath_components(effective_components)
+                        if pytest_command
+                        else _validator_run_pythonpath_components(effective_components)
                     )
                     shadow_prefix = _trusted_validator_pythonpath_prefix(
                         validation_executable_roots[0], selected_backend
@@ -10591,6 +10741,10 @@ def run_validations(
                             if component not in safe_components
                         ],
                     }
+                    if pytest_command:
+                        env_override_evidence["retained_for"] = (
+                            "trusted_pytest_runtime_and_candidate_imports"
+                        )
                 elif (
                     _module_validator_fallback_authority(module_interpreter_authority)
                     and _is_pytest_validation_command(tokens)
@@ -10599,10 +10753,10 @@ def run_validations(
                     # runtime root prepended to ``effective_components`` above.
                     # Falling back to the coordinator interpreter must retain
                     # that one trusted absolute component or the sanitized HOME
-                    # makes ``python -m pytest`` unimportable. Candidate-relative
-                    # components remain excluded, so this does not reopen the
-                    # module/startup shadowing path closed by NF586.
-                    safe_components = _validator_run_pythonpath_components(
+                    # makes ``python -m pytest`` unimportable. Pytest deliberately
+                    # imports candidate tests, so retain the sandboxed project
+                    # components behind the approved absolute runtime roots.
+                    safe_components = _pytest_run_pythonpath_components(
                         effective_components
                     )
                     if safe_components:
@@ -10619,7 +10773,7 @@ def run_validations(
                             for component in effective_components
                             if component not in safe_components
                         ],
-                        "retained_for": "trusted_pytest_runtime",
+                        "retained_for": "trusted_pytest_runtime_and_candidate_imports",
                     }
                 elif _module_validator_fallback_authority(module_interpreter_authority):
                     # NF-2026-00586 finding one (rework HIGH): a ``<python> -m

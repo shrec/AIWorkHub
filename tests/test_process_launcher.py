@@ -7079,6 +7079,142 @@ def test_process_manager_worker_failed_retains_scoped_delta_without_outputs(
     assert captured["rework_delta"]["sealed"] is True
 
 
+def test_process_manager_enforced_timeout_retains_delta_not_candidate_failure(
+    monkeypatch, tmp_path
+):
+    from aiworkhub import worker_workspace
+
+    manager, request_id, metadata_path, status_path = _finalize_retry_manager(
+        tmp_path, retained_delta=True
+    )
+    worker_workspace.write_json_0600(
+        status_path,
+        {
+            "state": "timed_out",
+            "exit_code": 124,
+            "timeout_enforced": True,
+            "timeout_seconds": 2,
+            "deadline_epoch": 1_700_000_002.0,
+            "started_at_epoch": 1_700_000_000.0,
+        },
+    )
+    manager._append_event({
+        "request_id": request_id,
+        "task_id": "TASK_B1",
+        "runner": "claude_worker_b1",
+        "topic": "task_mcp",
+        "adapter_id": "claude_cli",
+        "state": "finalizing",
+        "metadata_path": str(metadata_path),
+        "supervisor_status_path": str(status_path),
+        "pid": 999_999_999,
+        "pid_start_ticks": 1,
+    })
+    captured: dict = {}
+    monkeypatch.setattr(process_launcher, "enforce_scope", lambda *_a, **_k: ["changed.py"])
+    monkeypatch.setattr(manager, "_exact_claim_state", lambda _metadata: "processing")
+    monkeypatch.setattr(
+        process_launcher,
+        "_terminal_rework_delta_evidence",
+        lambda *_a, **_k: {"schema_id": "aiworkhub.rework_delta_descriptor.v1", "sealed": True},
+    )
+    monkeypatch.setattr(manager, "_persist_attempt_artifacts", lambda *_a, **_k: None)
+
+    def terminal_failure(_metadata, state, *, evidence, **_kwargs):
+        captured["state"] = state
+        captured.update(evidence)
+        return {"ok": True, "stderr": ""}
+
+    monkeypatch.setattr(manager, "_terminal_failure_exact", terminal_failure)
+    event = manager._finalize_isolated_request(request_id, 124)
+
+    digest = hashlib.sha256(b"retained worker edit").hexdigest()
+    assert event["state"] == "timed_out"
+    assert captured["state"] == "timed_out"
+    assert captured["changed_paths"] == ["changed.py"]
+    assert captured["changed_path_hashes"] == {"changed.py": digest}
+    assert captured["rework_delta"]["sealed"] is True
+
+
+def test_process_manager_windows_metadata_timeout_stays_distinct_from_cancel(
+    monkeypatch, tmp_path
+):
+    from aiworkhub import worker_workspace
+
+    manager, request_id, metadata_path, status_path = _finalize_retry_manager(tmp_path)
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["timeout_enforced"] = True
+    metadata["timeout_seconds"] = 2
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+    worker_workspace.write_json_0600(
+        status_path,
+        {
+            "state": "timed_out",
+            "exit_code": 124,
+            "timeout_enforced": True,
+            "timeout_seconds": 2,
+        },
+    )
+    manager._append_event({
+        "request_id": request_id,
+        "task_id": "TASK_B1",
+        "runner": "claude_worker_b1",
+        "topic": "task_mcp",
+        "adapter_id": "claude_cli",
+        "state": "finalizing",
+        "metadata_path": str(metadata_path),
+        "supervisor_status_path": str(status_path),
+        "pid": 999_999_999,
+        "pid_start_ticks": 1,
+    })
+    captured: dict = {}
+    monkeypatch.setattr(manager, "_persist_attempt_artifacts", lambda *_a, **_k: None)
+
+    def terminal_failure(_metadata, state, *, evidence, **_kwargs):
+        captured["state"] = state
+        return {"ok": True, "stderr": ""}
+
+    monkeypatch.setattr(manager, "_terminal_failure_exact", terminal_failure)
+    timed_out = manager._finalize_isolated_request(request_id, 124)
+    assert timed_out["state"] == "timed_out"
+    assert captured["state"] == "timed_out"
+
+
+def test_process_manager_cancel_stays_distinct_from_enforced_timeout(
+    monkeypatch, tmp_path
+):
+    from aiworkhub import worker_workspace
+
+    manager, request_id, metadata_path, status_path = _finalize_retry_manager(tmp_path)
+    worker_workspace.write_json_0600(
+        status_path,
+        {"state": "cancelled", "exit_code": 125, "timeout_enforced": True},
+    )
+    manager._append_event({
+        "request_id": request_id,
+        "task_id": "TASK_B1",
+        "runner": "claude_worker_b1",
+        "topic": "task_mcp",
+        "adapter_id": "claude_cli",
+        "state": "finalizing",
+        "metadata_path": str(metadata_path),
+        "supervisor_status_path": str(status_path),
+        "pid": 999_999_999,
+        "pid_start_ticks": 1,
+    })
+    captured: dict = {}
+    monkeypatch.setattr(manager, "_persist_attempt_artifacts", lambda *_a, **_k: None)
+
+    def terminal_failure(_metadata, state, *, evidence, **_kwargs):
+        captured["state"] = state
+        return {"ok": True, "stderr": ""}
+
+    monkeypatch.setattr(manager, "_terminal_failure_exact", terminal_failure)
+    event = manager._finalize_isolated_request(request_id, 125)
+    assert event["state"] == "cancelled"
+    assert captured["state"] == "cancelled"
+
+
 def test_release_pending_retry_records_provider_token_spend(monkeypatch, tmp_path):
     """fix #8: a release_pending predecessor is a finalization-pending state
     that never recorded provider spend. On the retry the spend must be recorded,

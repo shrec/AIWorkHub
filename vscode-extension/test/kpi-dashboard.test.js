@@ -558,3 +558,298 @@ test("Daily worker outcomes legend wraps responsively instead of relying on fixe
   assert.match(cssSource, /\.kpi-day-segment\s*\{[^}]*min-height:\s*0/,
     "segments must not carry a pixel min-height floor -- that is what let many-state stacks sum past 100%");
 });
+
+function hostArray(value) {
+  return Array.from(value || []);
+}
+
+function makeSettingsElement(tag) {
+  const element = {
+    tag,
+    className: "",
+    textContent: "",
+    hidden: false,
+    id: "",
+    type: "",
+    checked: false,
+    disabled: false,
+    dataset: {},
+    attrs: {},
+    children: [],
+    parentNode: null,
+    listeners: {},
+    classList: {
+      _owner: null,
+      toggle(name, force) {
+        const parts = String(this._owner.className || "").split(/\s+/).filter(Boolean);
+        const has = parts.includes(name);
+        const next = force === undefined ? !has : Boolean(force);
+        const updated = next ? (has ? parts : parts.concat(name)) : parts.filter((item) => item !== name);
+        this._owner.className = updated.join(" ");
+      },
+    },
+    style: {},
+    setAttribute(name, value) {
+      this.attrs[name] = String(value);
+      if (name.startsWith("data-")) {
+        const key = name.slice(5).replace(/-([a-z])/g, (_, letter) => letter.toUpperCase());
+        this.dataset[key] = String(value);
+      }
+      if (name === "id") this.id = String(value);
+    },
+    getAttribute(name) {
+      return this.attrs[name];
+    },
+    appendChild(child) {
+      if (child && typeof child === "object") child.parentNode = this;
+      this.children.push(child);
+      return child;
+    },
+    append(...nodes) {
+      for (const child of nodes) {
+        if (child && typeof child === "object") child.parentNode = this;
+      }
+      this.children.push(...nodes);
+    },
+    replaceChildren(...nodes) {
+      this.children.splice(0, this.children.length, ...nodes);
+    },
+    contains() {
+      return false;
+    },
+    querySelector(selector) {
+      const visit = (node) => {
+        if (!node || typeof node !== "object") return null;
+        if (selector.startsWith(".") && String(node.className || "").split(/\s+/).includes(selector.slice(1))) {
+          return node;
+        }
+        for (const child of hostArray(node.children)) {
+          const found = visit(child);
+          if (found) return found;
+        }
+        return null;
+      };
+      return visit(this);
+    },
+    querySelectorAll(selector) {
+      const found = [];
+      const visit = (node) => {
+        if (!node || typeof node !== "object") return;
+        if (selector.startsWith("[data-settings-tab]") && node.dataset && node.dataset.settingsTab) found.push(node);
+        if (selector.startsWith("[data-settings-panel]") && node.dataset && node.dataset.settingsPanel) found.push(node);
+        if (selector.startsWith(".") && String(node.className || "").split(/\s+/).includes(selector.slice(1))) {
+          found.push(node);
+        }
+        for (const child of hostArray(node.children)) visit(child);
+      };
+      visit(this);
+      return found;
+    },
+    closest(selector) {
+      let node = this;
+      while (node) {
+        if (selector.startsWith(".") && String(node.className || "").split(/\s+/).includes(selector.slice(1))) {
+          return node;
+        }
+        if (selector === "[data-model-family-toggle]" && node.dataset && node.dataset.modelFamilyToggle) {
+          return node;
+        }
+        node = node.parentNode;
+      }
+      return null;
+    },
+    addEventListener(type, handler) {
+      if (!this.listeners[type]) this.listeners[type] = [];
+      this.listeners[type].push(handler);
+    },
+    dispatchEvent(event) {
+      for (const handler of this.listeners[event.type] || []) handler(event);
+      return true;
+    },
+  };
+  element.classList._owner = element;
+  return element;
+}
+
+function collectByClass(node, className, acc = []) {
+  if (!node || typeof node !== "object") return acc;
+  if (String(node.className || "").split(/\s+/).includes(className)) acc.push(node);
+  for (const child of hostArray(node.children)) collectByClass(child, className, acc);
+  return acc;
+}
+
+test("Models CSS distinguishes indented OpenCode child rows without the dashboard-card overflow regression", () => {
+  assert.match(cssSource, /\.settings-model-family\s*\{/);
+  assert.match(cssSource, /\.settings-model-family-toggle\s*\{/);
+  assert.match(cssSource, /\.settings-model-family-children\s*\{/);
+  assert.match(cssSource, /\.settings-model-route\s*\{[^}]*padding-left:\s*30px/);
+  assert.match(cssSource, /\.settings-model-truth\s*,\s*\n\s*\.settings-model-warning\s*\{/);
+  assert.doesNotMatch(cssSource, /\.settings-model-route\s*\{[^}]*width:\s*calc/);
+  assert.doesNotMatch(cssSource, /\.settings-model-family[^{]*\{[^}]*dashboard-card/);
+});
+
+test("Models renders one OpenCode family with collapsible exact-model children and honest unknown truth", () => {
+  const start = appSource.indexOf("const OPENCODE_ADAPTER_ID = \"opencode_cli\";");
+  const end = appSource.indexOf("function renderSettings(payload, options = {})");
+  assert.notEqual(start, -1);
+  assert.notEqual(end, -1);
+  const helpers = appSource.slice(start, end);
+  const renderStart = appSource.indexOf("function renderSettings(payload, options = {})");
+  const renderEnd = appSource.indexOf("\n// ═══ HISTORY_PAGE_BEGIN", renderStart);
+  assert.notEqual(renderStart, -1);
+  assert.notEqual(renderEnd, -1);
+  const renderFn = appSource.slice(renderStart, renderEnd);
+  const clickStart = appSource.indexOf('elements.settingsList.addEventListener("click", (event) => {');
+  const clickEnd = appSource.indexOf("\nelements.kbSearch.addEventListener", clickStart);
+  assert.notEqual(clickStart, -1);
+  assert.notEqual(clickEnd, -1);
+  const clickListener = appSource.slice(clickStart, clickEnd);
+  const settingsList = makeSettingsElement("div");
+  settingsList.scrollTop = 0;
+  settingsList.scrollHeight = 0;
+  const settingsDialog = makeSettingsElement("dialog");
+  settingsDialog.scrollTop = 0;
+  const settingsSummary = makeSettingsElement("span");
+  const result = { families: null, routes: null, truths: null, toggle: null, children: null };
+  const harness = `
+    "use strict";
+    const FEATURE_LABELS = {};
+    const state = { settingsTab: "models", settingsCollapsedFamilies: {}, settingsPendingIdentity: null, featureSettings: null };
+    const elements = {
+      settingsList,
+      settingsDialog,
+      settingsSummary,
+    };
+    function settingsTabDefinitions() {
+      return [
+        ["features", "Features"],
+        ["models", "Models"],
+        ["source-graph", "Source Graph"],
+        ["retention", "Retention"],
+        ["telemetry", "Telemetry"],
+      ];
+    }
+    function createElement(tag, className, text) {
+      const element = document.createElement(tag);
+      if (className) element.className = className;
+      if (text !== undefined && text !== null) element.textContent = String(text);
+      return element;
+    }
+    function settingsControlIdentity() { return null; }
+    function restoreSettingsFocus() {}
+    function setSettingsPending() {}
+    function renderSettingsPlaceholder() {}
+    function settingsStateMessage() { return document.createElement("div"); }
+    function numberValue(value) { const parsed = Number(value); return Number.isFinite(parsed) ? parsed : 0; }
+    function formatCount(value) { return String(value); }
+    function formatBytes() { return "0 B"; }
+    function formatMoney(value) { return String(value); }
+    ${helpers}
+    ${renderFn}
+    ${clickListener}
+    renderSettings({
+      ok: true,
+      revision: 1,
+      features: {},
+      model_policy: {
+        ok: true,
+        revision: 1,
+        providers: {},
+        catalog: {
+          discovered_model_count: 2,
+          workers: [
+            {
+              provider: "opencode",
+              adapter: "opencode_cli",
+              model: "opencode/glm-4.5-free",
+              worker_id: "",
+              catalog_enabled: true,
+              effective_enabled: true,
+              inventory_only: true,
+              discovered_from_opencode: true,
+            },
+            {
+              provider: "opencode",
+              adapter: "opencode_cli",
+              model: "openai/gpt-4o",
+              worker_id: "",
+              catalog_enabled: true,
+              effective_enabled: false,
+              inventory_only: true,
+              discovered_from_opencode: true,
+            },
+            {
+              provider: "copilot",
+              adapter: "vscode_lm",
+              model: "gpt-5.6-sol",
+              worker_id: "copilot",
+              catalog_enabled: true,
+              effective_enabled: true,
+              inventory_only: false,
+            },
+          ],
+        },
+      },
+    });
+    const families = [];
+    const collect = (node) => {
+      if (!node || typeof node !== "object") return;
+      if (String(node.className || "").split(/\\s+/).includes("settings-model-family")) families.push(node);
+      for (const child of Array.from(node.children || [])) collect(child);
+    };
+    collect(settingsList);
+    result.families = families;
+  `;
+  const context = vm.createContext({
+    document: {
+      createElement: (tag) => makeSettingsElement(tag),
+      createDocumentFragment: () => makeSettingsElement("fragment"),
+      activeElement: null,
+      scrollingElement: null,
+    },
+    settingsList,
+    settingsDialog,
+    settingsSummary,
+    result,
+  });
+  vm.runInContext(harness, context);
+  const families = hostArray(result.families);
+  assert.equal(families.length, 2);
+  const labels = families.map((family) => {
+    const provider = collectByClass(family, "settings-model-provider")[0];
+    const strong = collectByClass(provider || family, "settings-copy")[0];
+    const title = hostArray((strong || {}).children).find((child) => child.tag === "strong");
+    return title ? title.textContent : "";
+  });
+  assert.deepEqual(labels, ["copilot", "OpenCode"]);
+  const openCode = families[1];
+  const routes = collectByClass(openCode, "settings-model-route");
+  assert.equal(routes.length, 2);
+  const models = routes.map((row) => {
+    const copy = collectByClass(row, "settings-copy")[0];
+    const title = hostArray((copy || {}).children).find((child) => child.tag === "strong");
+    return title ? title.textContent : "";
+  });
+  assert.deepEqual(models, ["opencode/glm-4.5-free", "openai/gpt-4o"]);
+  const truths = routes.map((row) => {
+    const truth = collectByClass(row, "settings-model-truth")[0];
+    return truth ? truth.textContent : "";
+  });
+  assert.match(truths[0], /opencode discovery/);
+  assert.match(truths[0], /access unknown/);
+  assert.match(truths[0], /round-trip unknown/);
+  assert.match(truths[0], /cost unknown/);
+  assert.doesNotMatch(truths[1], /\bfree\b/);
+  assert.match(truths[1], /not launchable/);
+  const warning = collectByClass(openCode, "settings-model-warning")[0];
+  assert.ok(warning);
+  const toggle = collectByClass(openCode, "settings-model-family-toggle")[0];
+  const children = collectByClass(openCode, "settings-model-family-children")[0];
+  assert.equal(toggle.attrs["aria-expanded"], "true");
+  assert.equal(children.hidden, false);
+  settingsList.dispatchEvent({ type: "click", target: toggle });
+  assert.equal(children.hidden, true);
+  assert.equal(toggle.attrs["aria-expanded"], "false");
+  assert.equal(toggle.attrs["aria-label"], "OpenCode routes, collapsed");
+  assert.equal(toggle.textContent, "▸");
+});

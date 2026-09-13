@@ -2852,6 +2852,60 @@ tbody tr.is-selected td:first-child {
   background: var(--accent-soft);
 }
 
+.settings-model-family {
+  margin: 0 0 8px;
+}
+
+.settings-model-family-toggle {
+  flex: 0 0 auto;
+  width: 28px;
+  min-width: 28px;
+  min-height: 28px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  color: var(--ink-soft);
+  background: var(--surface);
+  font-size: var(--fs-sm);
+  line-height: 1;
+  cursor: pointer;
+}
+
+.settings-model-family-toggle:hover,
+.settings-model-family-toggle:focus-visible {
+  color: var(--ink);
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.settings-model-family-toggle:focus-visible {
+  outline: 2px solid var(--vscode-focusBorder);
+  outline-offset: 1px;
+}
+
+.settings-model-family-children {
+  display: grid;
+  gap: 0;
+  margin: 0;
+  padding: 0 0 0 12px;
+}
+
+.settings-model-family-children[hidden] {
+  display: none;
+}
+
+.settings-model-truth,
+.settings-model-warning {
+  display: block;
+  color: var(--muted);
+  font-size: var(--fs-2xs);
+  line-height: 1.4;
+}
+
+.settings-model-warning {
+  color: var(--pending);
+}
+
 /* A model route is indented with padding, not with a margin plus width maths.
    It used to read `width: calc(100% - 18px); margin-left: 18px`, but
    `.settings-row { width: 100% }` is declared later at the same specificity
@@ -2867,6 +2921,7 @@ tbody tr.is-selected td:first-child {
   border-left: 2px solid var(--line);
   border-top-left-radius: 0;
   border-bottom-left-radius: 0;
+  background: var(--surface);
 }
 
 .settings-metric-grid {

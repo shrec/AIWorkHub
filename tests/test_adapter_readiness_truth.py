@@ -127,9 +127,10 @@ def test_observability_report_lists_which_routes_can_never_be_verified_and_why(
     report = repo_policy.provider_observability_report(tmp_path)
     adapters = report["adapters"]
 
-    # Every launchable/local adapter is accounted for.
+    # Every configured policy adapter is accounted for, including discovery-only
+    # routes that are not yet admitted to LOCAL_ADAPTERS execution.
     assert {item["adapter_id"] for item in adapters} == set(
-        runtime_adapters.LOCAL_ADAPTERS
+        repo_policy.DEFAULT_POLICY["providers"]["allowed_adapters"]
     )
     # Not one route can have its quota verified here today...
     assert report["quota_observable_any"] is False
@@ -195,9 +196,10 @@ def test_provider_observability_is_wired_into_the_preflight_surface(
 
     assert "provider_observability" in report
     observability = report["provider_observability"]
-    # Every local route is named in the surface, and none can be verified here...
+    # Every configured policy route is named in the surface, including
+    # discovery-only routes, and none can be verified here...
     assert {item["adapter_id"] for item in observability["adapters"]} == set(
-        runtime_adapters.LOCAL_ADAPTERS
+        repo_policy.DEFAULT_POLICY["providers"]["allowed_adapters"]
     )
     assert observability["quota_observable_any"] is False
     # ...each with its own named reason -- the surface is not a blanket unknown.

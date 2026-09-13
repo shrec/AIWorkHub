@@ -2645,3 +2645,80 @@ def test_access_observation_names_which_evidence_made_it_true(tmp_path: Path) ->
     assert row["round_trip_observed"] == "unknown"
     assert row["historical_route_observation"]["recorded"] is True
     assert row["historical_route_observation"]["in_current_window"] is False
+
+
+def test_discovered_opencode_rows_are_low_risk_inventory_not_managers(
+    tmp_path: Path,
+) -> None:
+    root = _root(tmp_path)
+    preflight = {
+        "providers": [
+            {
+                "adapter_id": "opencode_cli",
+                "launchable": True,
+                "status": "ready",
+                "provider_observed_models": [
+                    "opencode/glm-4.5-free",
+                    "openai/gpt-4o",
+                ],
+                "observed_models": ["opencode/glm-4.5-free"],
+            }
+        ]
+    }
+    snapshot = workforce_catalog.build_catalog(
+        root, cards=[], process_rows=[], preflight=preflight,
+    )
+    rows = [
+        item for item in snapshot["workers"] if item.get("discovered_from_opencode")
+    ]
+    assert len(rows) >= 2
+    models = {item["model"] for item in rows}
+    assert models == {"opencode/glm-4.5-free", "openai/gpt-4o"}
+    for item in rows:
+        assert item["adapter_id"] == "opencode_cli"
+        assert item["manager"] is False
+        assert item["reviewer"] is False
+        assert item["max_risk"] == "low"
+        assert item["supports"] == ["mechanical"]
+        assert "review" not in item["supports"]
+        assert item["round_trip_observed"] == "unknown"
+        assert item.get("free") is not True
+    paid = next(item for item in rows if item["model"] == "openai/gpt-4o")
+    free = next(item for item in rows if item["model"] == "opencode/glm-4.5-free")
+    assert paid["launch_eligible"] is False
+    assert paid["policy_enabled"] is False
+    assert free["policy_enabled"] is True
+    identities = workforce_catalog.opencode_identities_from_preflight(preflight)
+    assert identities == ["opencode/glm-4.5-free", "openai/gpt-4o"]
+
+
+def test_catalog_preflight_handoff_is_repo_keyed_and_probe_free(
+    tmp_path: Path,
+) -> None:
+    root = _root(tmp_path)
+    other = tmp_path / "other-repo"
+    other.mkdir()
+    preflight = {
+        "providers": [
+            {
+                "adapter_id": "opencode_cli",
+                "launchable": True,
+                "status": "ready",
+                "provider_observed_models": [
+                    "opencode/glm-4.5-free",
+                    "openai/gpt-4o",
+                ],
+            }
+        ]
+    }
+    assert workforce_catalog.cached_preflight_snapshot(root) is None
+    workforce_catalog.build_catalog(
+        root, cards=[], process_rows=[], preflight=preflight,
+    )
+    cached = workforce_catalog.cached_preflight_snapshot(root)
+    assert cached is not None
+    assert workforce_catalog.opencode_identities_from_preflight(cached) == [
+        "opencode/glm-4.5-free",
+        "openai/gpt-4o",
+    ]
+    assert workforce_catalog.cached_preflight_snapshot(other) is None

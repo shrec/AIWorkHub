@@ -69,7 +69,53 @@ def test_combined_tree_contains_current_canonical_delta_and_candidate(
                 "candidate_paths": ["feature.txt", "shared.txt"],
                 "canonical_delta_paths": ["base.txt"],
                 "observed_candidate_paths": ["feature.txt", "shared.txt"],
+                "candidate_paths_already_in_canonical": [],
             }
+        finally:
+            cleanup_workspace(combined.repo, combined.path, combined.home)
+    finally:
+        cleanup_workspace(candidate.repo, candidate.path, candidate.home)
+
+
+def test_combined_tree_accepts_candidate_bytes_already_in_canonical(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init")
+    _git(repo, "config", "user.email", "test@example.com")
+    _git(repo, "config", "user.name", "AIWorkHub Test")
+    (repo / "shared.txt").write_text("old\n", encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "base")
+
+    monkeypatch.setenv("AIWORKHUB_WORKTREE_ROOT", str(tmp_path / "worktrees"))
+    card = {
+        "allowed_writes": ["shared.txt"],
+        "read_first": [],
+        "immutable_inputs": [],
+        "required_outputs": [],
+    }
+    candidate = create_workspace(repo, "candidate_duplicate_request", card, "validation")
+    try:
+        (candidate.path / "shared.txt").write_text("same fix\n", encoding="utf-8")
+        (repo / "shared.txt").write_text("same fix\n", encoding="utf-8")
+        os.chmod(candidate.path / "shared.txt", 0o600)
+        os.chmod(repo / "shared.txt", 0o664)
+
+        combined, evidence = create_combined_validation_workspace(
+            candidate,
+            card,
+            ["shared.txt"],
+        )
+        try:
+            assert (combined.path / "shared.txt").read_text(encoding="utf-8") == (
+                "same fix\n"
+            )
+            assert evidence["observed_candidate_paths"] == []
+            assert evidence["candidate_paths_already_in_canonical"] == ["shared.txt"]
+            assert evidence["canonical_delta_paths"] == ["shared.txt"]
         finally:
             cleanup_workspace(combined.repo, combined.path, combined.home)
     finally:

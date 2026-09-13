@@ -737,3 +737,268 @@ test("Settings CSS declares stable desktop and narrow modal geometry with list-o
   assert.ok(css.includes("overflow-y: auto"));
   assert.ok(css.includes("overscroll-behavior: contain"));
 });
+
+const WORKERS_WITH_OPENCODE = [
+  { provider: "openai", adapter: "vscode_lm", model: "gpt-a", worker_id: "w1", effective_enabled: true, catalog_enabled: true },
+  { provider: "opencode", adapter: "opencode_cli", model: "opencode/nano-free", worker_id: "oc-free", effective_enabled: true, catalog_enabled: true, free: true, discovered_from_opencode: true },
+  { provider: "openai", adapter: "opencode_cli", model: "openai/gpt-4o", worker_id: "oc-openai", effective_enabled: false, catalog_enabled: true, discovered_from_opencode: true },
+  { provider: "anthropic", adapter: "opencode_cli", model: "anthropic/claude-unknown", worker_id: "oc-anthropic", effective_enabled: false, catalog_enabled: true, discovered_from_opencode: true },
+];
+
+test("Models tree nests provider families as parents with model routes as children, and never renders them as flat peers", () => {
+  const { run } = buildDomHarness();
+  renderPayload(run, WORKERS_WITH_GLM, { openai: true, glm: true });
+  focusModelsTab(run);
+
+  const familyNames = run(
+    'Array.from(elements.settingsList.querySelectorAll("[data-model-family-toggle]")).map((b) => b.dataset.modelFamilyToggle).sort()',
+  );
+  assert.deepStrictEqual([...familyNames], ["glm", "openai"]);
+
+  const glmChildModels = run(`(() => {
+    const toggle = Array.from(elements.settingsList.querySelectorAll("[data-model-family-toggle]"))
+      .find((b) => b.dataset.modelFamilyToggle === "glm");
+    const wrap = toggle.closest(".settings-model-family");
+    const children = wrap.querySelector(".settings-model-family-children");
+    return Array.from(children.querySelectorAll("input")).map((i) => i.dataset.modelName).sort();
+  })()`);
+  assert.deepStrictEqual([...glmChildModels], ["glm-4", "glm-4-air"]);
+
+  const flatPeers = run(`(() => {
+    const panel = Array.from(elements.settingsList.querySelectorAll("[data-settings-panel]"))
+      .find((p) => p.dataset.settingsPanel === "models");
+    return panel.children.filter((c) => c.className !== "settings-group-heading" && c.className !== "settings-model-family").length;
+  })()`);
+  assert.strictEqual(
+    flatPeers,
+    0,
+    "the models panel must contain only the heading and one .settings-model-family wrapper per family; provider and route rows must never sit as flat peers",
+  );
+});
+
+test("all dynamically discovered OpenCode routes group under one OpenCode parent regardless of upstream provider prefix, preserving exact model identity", () => {
+  const { run } = buildDomHarness();
+  const providers = { openai: true, opencode: true, anthropic: true };
+  renderPayload(run, WORKERS_WITH_OPENCODE, providers);
+  focusModelsTab(run);
+
+  const familyNames = run(
+    'Array.from(elements.settingsList.querySelectorAll("[data-model-family-toggle]")).map((b) => b.dataset.modelFamilyToggle).sort()',
+  );
+  assert.deepStrictEqual([...familyNames], ["openai", "opencode"]);
+
+  const opencodeChildModels = run(`(() => {
+    const toggle = Array.from(elements.settingsList.querySelectorAll("[data-model-family-toggle]"))
+      .find((b) => b.dataset.modelFamilyToggle === "opencode");
+    const wrap = toggle.closest(".settings-model-family");
+    const children = wrap.querySelector(".settings-model-family-children");
+    return Array.from(children.querySelectorAll("input")).map((i) => i.dataset.modelName).sort();
+  })()`);
+  assert.deepStrictEqual([...opencodeChildModels], [
+    "anthropic/claude-unknown",
+    "openai/gpt-4o",
+    "opencode/nano-free",
+  ]);
+
+  const openaiChildModels = run(`(() => {
+    const toggle = Array.from(elements.settingsList.querySelectorAll("[data-model-family-toggle]"))
+      .find((b) => b.dataset.modelFamilyToggle === "openai");
+    const wrap = toggle.closest(".settings-model-family");
+    const children = wrap.querySelector(".settings-model-family-children");
+    return Array.from(children.querySelectorAll("input")).map((i) => i.dataset.modelName);
+  })()`);
+  assert.deepStrictEqual([...openaiChildModels], ["gpt-a"], "the real openai vscode_lm route must stay under the openai family, not opencode");
+});
+
+test("Models tree parent toggle is keyboard-operable, exposes aria-expanded/aria-controls, hides children without removing them, and the collapse state survives a full re-render", () => {
+  const { run } = buildDomHarness();
+  renderPayload(run, WORKERS_WITH_GLM, { openai: true, glm: true });
+  focusModelsTab(run);
+
+  const before = run(`(() => {
+    const toggle = Array.from(elements.settingsList.querySelectorAll("[data-model-family-toggle]"))
+      .find((b) => b.dataset.modelFamilyToggle === "glm");
+    return { expanded: toggle.getAttribute("aria-expanded"), controls: toggle.getAttribute("aria-controls"), tag: toggle.tagName };
+  })()`);
+  assert.strictEqual(before.expanded, "true");
+  assert.strictEqual(before.tag, "BUTTON", "the disclosure control must be a native, keyboard-operable button");
+  assert.ok(before.controls, "aria-controls must reference the children container");
+
+  const clickToggle = () => run(`(() => {
+    const toggle = Array.from(elements.settingsList.querySelectorAll("[data-model-family-toggle]"))
+      .find((b) => b.dataset.modelFamilyToggle === "glm");
+    elements.settingsList._trigger("click", toggle);
+  })();`);
+  const state = () => run(`(() => {
+    const toggle = Array.from(elements.settingsList.querySelectorAll("[data-model-family-toggle]"))
+      .find((b) => b.dataset.modelFamilyToggle === "glm");
+    const wrap = toggle.closest(".settings-model-family");
+    const children = wrap.querySelector(".settings-model-family-children");
+    return { expanded: toggle.getAttribute("aria-expanded"), hidden: children.hidden, routeCount: children.querySelectorAll("input").length };
+  })()`);
+
+  clickToggle();
+  let after = state();
+  assert.strictEqual(after.expanded, "false");
+  assert.strictEqual(after.hidden, true);
+  assert.strictEqual(after.routeCount, 2, "collapsed children remain in the DOM, only visually hidden");
+
+  clickToggle();
+  after = state();
+  assert.strictEqual(after.expanded, "true");
+  assert.strictEqual(after.hidden, false);
+
+  clickToggle();
+  renderPayload(run, WORKERS_WITH_GLM, { openai: true, glm: true });
+  after = state();
+  assert.strictEqual(after.expanded, "false", "collapse state must persist across a full settings re-render, not just local DOM state");
+  assert.strictEqual(after.hidden, true);
+});
+
+test("Models tree preserves focus on a nested OpenCode child route across a full re-render", () => {
+  const { run } = buildDomHarness();
+  const providers = { openai: true, opencode: true, anthropic: true };
+  renderPayload(run, WORKERS_WITH_OPENCODE, providers);
+  focusModelsTab(run);
+  focusRoute(run, "opencode", "opencode/nano-free");
+
+  renderPayload(run, WORKERS_WITH_OPENCODE, providers);
+
+  assert.strictEqual(run("document.activeElement && document.activeElement.dataset.modelProvider"), "opencode");
+  assert.strictEqual(run("document.activeElement && document.activeElement.dataset.modelName"), "opencode/nano-free");
+});
+
+test("OpenCode free route is grouped under the OpenCode parent, is checked, and its truth line reports free cost", () => {
+  const { run } = buildDomHarness();
+  const providers = { openai: true, opencode: true, anthropic: true };
+  renderPayload(run, WORKERS_WITH_OPENCODE, providers);
+  focusModelsTab(run);
+
+  const detail = run(`(() => {
+    const input = Array.from(elements.settingsList.querySelectorAll("input"))
+      .find((i) => i.dataset.modelName === "opencode/nano-free");
+    const label = input.closest("label");
+    return { provider: input.dataset.modelProvider, text: label.textContent, checked: input.checked };
+  })()`);
+  assert.strictEqual(detail.provider, "opencode");
+  assert.match(detail.text, /free/);
+  assert.strictEqual(detail.checked, true);
+});
+
+test("OpenCode openai/* child starts disabled, warns about shared OpenAI/Codex budget, and toggling posts the opencode policy provider, not the upstream openai identity", () => {
+  const { run } = buildDomHarness();
+  const providers = { openai: true, opencode: true, anthropic: true };
+  renderPayload(run, WORKERS_WITH_OPENCODE, providers);
+  focusModelsTab(run);
+
+  const before = run(`(() => {
+    const input = Array.from(elements.settingsList.querySelectorAll("input"))
+      .find((i) => i.dataset.modelName === "openai/gpt-4o");
+    const label = input.closest("label");
+    return { checked: input.checked, provider: input.dataset.modelProvider, adapter: input.dataset.modelAdapter, text: label.textContent };
+  })()`);
+  assert.strictEqual(before.checked, false, "OpenCode openai/* routes must start disabled until the owner explicitly enables them");
+  assert.strictEqual(before.provider, "opencode");
+  assert.strictEqual(before.adapter, "opencode_cli");
+  assert.match(before.text, /OpenAI\/Codex/);
+
+  run(`(() => {
+    const input = Array.from(elements.settingsList.querySelectorAll("input"))
+      .find((i) => i.dataset.modelName === "openai/gpt-4o");
+    input.checked = true;
+    elements.settingsList._trigger("change", input);
+  })();`);
+
+  assert.deepStrictEqual(JSON.parse(run("JSON.stringify(__posted.slice(-1)[0])")), {
+    type: "updateModelSetting",
+    provider: "opencode",
+    adapter: "opencode_cli",
+    model: "openai/gpt-4o",
+    enabled: true,
+    expectedRevision: 5,
+  });
+});
+
+test("a route with no reported cost shows cost unknown and is never labeled free", () => {
+  const { run } = buildDomHarness();
+  const providers = { openai: true, opencode: true, anthropic: true };
+  renderPayload(run, WORKERS_WITH_OPENCODE, providers);
+  focusModelsTab(run);
+
+  const text = run(`(() => {
+    const input = Array.from(elements.settingsList.querySelectorAll("input"))
+      .find((i) => i.dataset.modelName === "anthropic/claude-unknown");
+    return input.closest("label").textContent;
+  })()`);
+  assert.match(text, /cost unknown/);
+  assert.doesNotMatch(text, /\bfree\b/);
+});
+
+test("empty OpenCode discovery renders no fabricated OpenCode parent, and a model-policy error renders a safe concise state with no stale family rows", () => {
+  const { run } = buildDomHarness();
+  renderPayload(run, WORKERS_WITH_GLM, { openai: true, glm: true });
+  focusModelsTab(run);
+  const openCodeToggles = run(
+    'Array.from(elements.settingsList.querySelectorAll("[data-model-family-toggle]")).filter((b) => b.dataset.modelFamilyToggle === "opencode").length',
+  );
+  assert.strictEqual(openCodeToggles, 0, "no OpenCode routes were discovered, so no OpenCode parent may be fabricated");
+
+  run(`renderSettings({
+    ok: true,
+    revision: 9,
+    features: { source_graph: true, session_manager: true, ai_memory: true, knowledge_base: true, context_graph: false },
+    model_policy: { ok: false, error: "opencode discovery unavailable" },
+    source_graph_policy: { ok: true, revision: 1, enabled_count: 0, language_count: 0, languages: [] },
+    retention_policy: {},
+  });`);
+  assert.match(run("elements.settingsList.textContent"), /opencode discovery unavailable/);
+  assert.strictEqual(
+    run('Array.from(elements.settingsList.querySelectorAll("[data-model-family-toggle]")).length'),
+    0,
+    "an errored model policy must render no family rows at all",
+  );
+});
+
+test("a newly discovered OpenCode model identity renders correctly with no hardcoded model names in app.js", () => {
+  assert.ok(
+    !app.includes("never-seen-before-model-xyz"),
+    "future discovered models must render from data alone, never require a source change",
+  );
+  const { run } = buildDomHarness();
+  const NOVEL = [
+    {
+      provider: "mistral",
+      adapter: "opencode_cli",
+      model: "mistral/never-seen-before-model-xyz",
+      worker_id: "novel",
+      effective_enabled: false,
+      catalog_enabled: true,
+      discovered_from_opencode: true,
+    },
+  ];
+  renderPayload(run, NOVEL, { opencode: true });
+  focusModelsTab(run);
+  const found = run(
+    'Boolean(Array.from(elements.settingsList.querySelectorAll("input")).find((i) => i.dataset.modelName === "mistral/never-seen-before-model-xyz"))',
+  );
+  assert.strictEqual(found, true);
+  const families = run(
+    'Array.from(elements.settingsList.querySelectorAll("[data-model-family-toggle]")).map((b) => b.dataset.modelFamilyToggle)',
+  );
+  assert.deepStrictEqual([...families], ["opencode"]);
+});
+
+test("model family children rely on the existing bounded, scrollable settings list rather than introducing new unbounded growth", () => {
+  const { run } = buildDomHarness();
+  renderPayload(run, WORKERS_WITH_GLM, { openai: true, glm: true });
+  focusModelsTab(run);
+  const inlineHeightStyles = run(`(() => {
+    const wraps = Array.from(elements.settingsList.querySelectorAll(".settings-model-family-children"));
+    return wraps.some((w) => w.style && (w.style.height || w.style.maxHeight || w.style.minHeight));
+  })()`);
+  assert.strictEqual(
+    inlineHeightStyles,
+    false,
+    "family children must not set their own height; the existing bounded/scrollable settings-list geometry stays authoritative",
+  );
+});
