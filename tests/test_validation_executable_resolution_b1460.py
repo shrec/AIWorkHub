@@ -319,6 +319,27 @@ def test_toolchain_receipt_detects_executable_swap(tmp_path: Path) -> None:
         worker_workspace._verify_authority_receipt_executable(receipt, str(second))
 
 
+def test_toolchain_receipt_accepts_large_executable_bounded_fingerprint(
+    tmp_path: Path,
+) -> None:
+    executable = tmp_path / "bin" / "large-tool"
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"#!/bin/sh\nexit 0\n" + b"x" * (2 * 1024 * 1024))
+    executable.chmod(0o700)
+    fact = toolchain_authority._executable_fact(
+        "large-tool", str(executable), version_fact="large-tool 1.0"
+    )
+    assert fact is not None
+    receipt = {
+        "schema_id": "aiworkhub.toolchain_authority.receipt.v1",
+        "executables": [fact.as_dict()],
+    }
+
+    assert worker_workspace._verify_authority_receipt_executable(
+        receipt, str(executable)
+    ) == fact.as_dict()
+
+
 def _authority_receipt_for(
     repo: Path, monkeypatch: pytest.MonkeyPatch, executable: Path
 ) -> tuple[dict[str, object], dict[str, object]]:

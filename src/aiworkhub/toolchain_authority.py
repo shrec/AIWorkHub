@@ -462,6 +462,12 @@ def _hash_file(path: Path, *, limit: int = _FINGERPRINT_LIMIT) -> str:
     return digest.hexdigest()
 
 
+def bounded_file_fingerprint(path: Path) -> str:
+    """Return the canonical bounded fingerprint used by authority receipts."""
+
+    return _hash_file(path)
+
+
 def _metadata_fingerprint(repo: Path) -> str:
     rows: list[tuple[str, str, int]] = []
     for relative in _REPOSITORY_METADATA:

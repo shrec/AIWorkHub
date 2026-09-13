@@ -14,7 +14,11 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.11.35
+## What's new in 0.11.36
+
+- Toolchain receipt creation and validation now use one bounded executable
+  fingerprint contract, eliminating false identity drift for binaries larger
+  than 1 MiB during provider-free replay.
 
 - Durable toolchain snapshots are executable-identity checked before reuse;
   stale cache facts are re-derived instead of blocking retained-candidate

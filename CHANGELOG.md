@@ -6,6 +6,20 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.36] - 2026-09-13
+
+### Fixed
+
+- Validation now checks executable authority receipts with the same bounded
+  fingerprint primitive that creates them. Real binaries larger than 1 MiB no
+  longer fail provider-free replay before the first declared validation command.
+
+### Validation
+
+- A production-shaped executable larger than 1 MiB proves receipt creation and
+  validation share one identity contract. The authority, validation and replay
+  suite passes with 565 tests and 2 skips.
+
 ## [0.11.35] - 2026-09-13
 
 ### Fixed

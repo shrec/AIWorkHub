@@ -1,5 +1,13 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.36 — 2026-09-13
+
+### Fixed
+
+- Toolchain receipt production and validation now share the same bounded file
+  fingerprint, so large real-world executables no longer trigger false identity
+  drift during provider-free replay.
+
 ## 0.11.35 — 2026-09-13
 
 ### Fixed

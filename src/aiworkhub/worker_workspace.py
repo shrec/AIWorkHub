@@ -4553,11 +4553,9 @@ def _verify_authority_receipt(
 
 
 def _authority_receipt_file_fingerprint(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(65536), b""):
-            digest.update(block)
-    return digest.hexdigest()
+    from . import toolchain_authority
+
+    return toolchain_authority.bounded_file_fingerprint(path)
 
 
 def _authority_receipt_fact(
