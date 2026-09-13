@@ -625,6 +625,18 @@ def test_mechanical_review_park_projects_infrastructure_category(
     assert projected["request_id"] == request_id
     assert projected["failure_category"] == "dependency_or_route"
 
+    result = manager_ai_tools.learning_commit(
+        task_id=task_id,
+        request_id=request_id,
+        repo_area="src/aiworkhub",
+        outcome="rejected",
+        evidence_ids=["file:tests/test_learning_commit_store.py"],
+        idempotency_key="learning-manager-mechanical-park-0001",
+        provenance="mechanical review park classification regression",
+    )
+    assert result["ok"] is True, result
+    assert result["failure_category"] == "dependency_or_route"
+
 
 def test_reject_review_event_carries_the_disposition_it_classified(
     tmp_path, monkeypatch,

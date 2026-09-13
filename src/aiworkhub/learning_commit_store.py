@@ -157,11 +157,12 @@ def _request_matches_candidate(card: dict[str, Any], request_id: str) -> bool:
     # rework_predecessor, and this predicate looked at neither, so the commit
     # failed learning_commit_request_identity_mismatch.
     #
-    # Both are written by reject_review itself, not supplied by a model:
+    # All three are written by reject_review itself, not supplied by a model:
     # rework_predecessor pins the predecessor's changed-path hashes and
-    # review_feedback carries the reason's sha256. Accepting them binds the
-    # lesson to the exact request that was judged, which is what this predicate
-    # exists to guarantee.
+    # review_feedback carries the reason's sha256. A blocked park may have
+    # neither, so rejection_disposition is the durable exact-request authority
+    # for that path. Accepting only its schema- and category-validated pin binds
+    # the lesson to the exact request that was judged.
     for section in ("rework_predecessor", "review_feedback"):
         block = card.get(section)
         if not isinstance(block, dict):
@@ -169,6 +170,8 @@ def _request_matches_candidate(card: dict[str, Any], request_id: str) -> bool:
         for key in ("request_id", "predecessor_request_id"):
             if str(block.get(key) or "") == request_id:
                 return True
+    if _pinned_rejection_disposition(card, request_id) is not None:
+        return True
     return False
 
 
@@ -1237,4 +1240,3 @@ def injection_ledger_state(repo: str | Path) -> dict[str, Any]:
         "injected_cards": injected,
         "selection_receipts": len(receipts),
     }
-
