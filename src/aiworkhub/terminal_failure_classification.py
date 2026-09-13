@@ -458,6 +458,18 @@ def classify_terminal_failure(
     )
     http_status = _http_status(error_text)
 
+    stderr_text = str(stderr_tail or "").lower()
+    if "snap-confine" in stderr_text and "cap_dac_override" in stderr_text:
+        return {
+            "failure_kind": "snap_confine_sandbox_failure",
+            "diagnostic": _assemble_diagnostic(
+                "snap_confine_sandbox_failure",
+                code="snap_confine_sandbox_failure",
+                exit_code=exit_code,
+                http_status=http_status,
+            ),
+        }
+
     if state_norm in _TIMEOUT_STALL_STATES:
         return {
             "failure_kind": "timeout_stall",

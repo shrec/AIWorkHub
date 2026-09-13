@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import stat
 import sys
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -90,6 +91,12 @@ GROK_KILO_DEFAULT_MODEL = GROK_KILO_SUPPORTED_MODELS[0]
 _KILO_EXTENSION_DIR_GLOB = "kilocode.kilo-code-*"
 OPENCODE_CLI_ADAPTER = "opencode_cli"
 OPENCODE_SNAP_BIN = "/snap/bin/opencode"
+OPENCODE_SNAP_LAUNCHER = "/usr/bin/snap"
+OPENCODE_SNAP_NAME = "opencode"
+OPENCODE_SNAP_ROOT = "/snap/opencode"
+OPENCODE_SNAP_TRUSTED_UID = 0
+OPENCODE_SNAP_METADATA_MAX_BYTES = 65536
+OPENCODE_SNAP_FAIL_CLOSED = "opencode_snap_launcher_fail_closed"
 OPENCODE_WORKER_MCP_SERVER = "aiworkhub_worker_ai_tools"
 OPENCODE_PERMISSION_ALLOW = "allow"
 OPENCODE_PERMISSION_DENY = "deny"
@@ -797,6 +804,155 @@ def _resolve_kilo_extension_executable(adapter_id: str) -> ExecutableResolution:
     return ExecutableResolution(adapter_id, str(resolved), True, "")
 
 
+def _is_snap_launcher(resolved: Path) -> bool:
+    """Match only the platform launcher path; its trust is checked separately."""
+    try:
+        launcher = Path(OPENCODE_SNAP_LAUNCHER).resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return resolved == launcher
+
+
+def _snap_fail(adapter_id: str, detail: str) -> ExecutableResolution:
+    return ExecutableResolution(
+        adapter_id, None, False, f"{OPENCODE_SNAP_FAIL_CLOSED}:{detail}"
+    )
+
+
+def _snap_trusted_owner(st: os.stat_result) -> bool:
+    return st.st_uid == OPENCODE_SNAP_TRUSTED_UID
+
+
+def _snap_not_writable(st: os.stat_result) -> bool:
+    return not st.st_mode & 0o022
+
+
+def _snap_regular_file(path: Path) -> os.stat_result | None:
+    """Return an lstat only for a regular file, never for a symlink."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return None
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+        return None
+    return st
+
+
+def _snap_trusted_dir(path: Path) -> bool:
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    return (
+        stat.S_ISDIR(st.st_mode)
+        and _snap_trusted_owner(st)
+        and _snap_not_writable(st)
+    )
+
+
+def _snap_metadata_is_classic(metadata: bytes) -> bool:
+    """Read the two required top-level snap.yaml facts without YAML execution."""
+    try:
+        text = metadata.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    values: dict[str, str] = {}
+    for line in text.splitlines():
+        if line.startswith((" ", "\t")):
+            continue
+        key, separator, value = line.partition(":")
+        key = key.strip()
+        if not separator or key not in {"name", "confinement"}:
+            continue
+        if key in values:
+            return False
+        values[key] = value.strip().strip("'\"")
+    return (
+        values.get("name") == OPENCODE_SNAP_NAME
+        and values.get("confinement") == "classic"
+    )
+
+
+def _authenticate_classic_snap_opencode(adapter_id: str) -> ExecutableResolution:
+    """Authenticate and return a classic Snap's real OpenCode executable.
+
+    The generic snap launcher needs capabilities that the worker's Landlock
+    boundary intentionally withholds. A classic Snap already runs without
+    snap confinement, so the safe equivalent is its exact installed binary,
+    after verifying the root-owned launcher, layout, metadata, and target.
+    """
+    launcher = Path(OPENCODE_SNAP_LAUNCHER)
+    launcher_st = _snap_regular_file(launcher)
+    if (
+        launcher_st is None
+        or not _snap_trusted_owner(launcher_st)
+        or not _snap_not_writable(launcher_st)
+        or not launcher_st.st_mode & 0o111
+    ):
+        return _snap_fail(adapter_id, "snap_launcher_untrusted")
+
+    root = Path(OPENCODE_SNAP_ROOT)
+    if root.is_symlink() or not _snap_trusted_dir(root):
+        return _snap_fail(adapter_id, "snap_root_untrusted")
+    try:
+        base = root.resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        return _snap_fail(adapter_id, "snap_root_missing")
+    if base != root:
+        return _snap_fail(adapter_id, "snap_root_untrusted")
+
+    current_link = root / "current"
+    try:
+        current_link_st = os.lstat(current_link)
+        current_real = current_link.resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        return _snap_fail(adapter_id, "current_missing")
+    if not stat.S_ISLNK(current_link_st.st_mode) or not _snap_trusted_owner(
+        current_link_st
+    ):
+        return _snap_fail(adapter_id, "current_untrusted")
+    if current_real.parent != base or not _snap_trusted_dir(current_real):
+        return _snap_fail(adapter_id, "current_escapes_snap_root")
+
+    meta_dir = current_real / "meta"
+    if not _snap_trusted_dir(meta_dir):
+        return _snap_fail(adapter_id, "metadata_directory_untrusted")
+    meta_path = meta_dir / "snap.yaml"
+    meta_st = _snap_regular_file(meta_path)
+    if meta_st is None:
+        return _snap_fail(adapter_id, "metadata_missing")
+    if not _snap_trusted_owner(meta_st):
+        return _snap_fail(adapter_id, "metadata_not_root_owned")
+    if not _snap_not_writable(meta_st):
+        return _snap_fail(adapter_id, "metadata_writable")
+    if meta_st.st_size > OPENCODE_SNAP_METADATA_MAX_BYTES:
+        return _snap_fail(adapter_id, "metadata_malformed")
+    try:
+        metadata = meta_path.read_bytes()
+    except OSError:
+        return _snap_fail(adapter_id, "metadata_malformed")
+    if (
+        len(metadata) > OPENCODE_SNAP_METADATA_MAX_BYTES
+        or not _snap_metadata_is_classic(metadata)
+    ):
+        return _snap_fail(adapter_id, "snap_not_classic")
+
+    bin_dir = current_real / "bin"
+    if not _snap_trusted_dir(bin_dir):
+        return _snap_fail(adapter_id, "executable_directory_untrusted")
+    executable = bin_dir / OPENCODE_SNAP_NAME
+    executable_st = _snap_regular_file(executable)
+    if executable_st is None:
+        return _snap_fail(adapter_id, "executable_missing")
+    if not _snap_trusted_owner(executable_st):
+        return _snap_fail(adapter_id, "executable_not_root_owned")
+    if not _snap_not_writable(executable_st):
+        return _snap_fail(adapter_id, "executable_writable")
+    if not executable_st.st_mode & 0o111:
+        return _snap_fail(adapter_id, "executable_not_executable")
+    return ExecutableResolution(adapter_id, str(executable), True, "")
+
+
 def resolve_executable(
     adapter_id: str,
     executable_overrides: ExecutableOverrides | None = None,
@@ -853,6 +1009,8 @@ def resolve_executable(
                     False,
                     f"discovered executable is not executable: {binary}",
                 )
+            if _is_snap_launcher(resolved):
+                return _authenticate_classic_snap_opencode(adapter_id)
             return ExecutableResolution(adapter_id, str(wrapper), True, "")
         return ExecutableResolution(
             adapter_id, None, False, f"executable not found: {binary}"
@@ -870,6 +1028,9 @@ def resolve_executable(
         return ExecutableResolution(
             adapter_id, None, False, f"discovered executable is not executable: {binary}"
         )
+
+    if adapter_id == OPENCODE_CLI_ADAPTER and _is_snap_launcher(resolved):
+        return _authenticate_classic_snap_opencode(adapter_id)
 
     executable = (
         str(discovered_path) if adapter_id == OPENCODE_CLI_ADAPTER else str(resolved)

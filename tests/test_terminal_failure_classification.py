@@ -184,6 +184,25 @@ def test_worker_failed_falls_back_to_stdout_tail_when_stderr_empty() -> None:
     assert result["diagnostic"] == "worker_failed:provider_refused:exit_code=1"
 
 
+def test_snap_confine_capability_failure_is_typed_and_secret_safe() -> None:
+    result = classify_terminal_failure(
+        state="worker_failed",
+        exit_code=1,
+        error="worker_failed:supervisor_state=exited:exit_code=1",
+        stderr_tail=(
+            "snap-confine is packaged without necessary permissions: "
+            "cap_dac_override not found; api_key=DO_NOT_PERSIST"
+        ),
+    )
+
+    assert result["failure_kind"] == "snap_confine_sandbox_failure"
+    assert result["diagnostic"] == (
+        "snap_confine_sandbox_failure:snap_confine_sandbox_failure:exit_code=1"
+    )
+    assert _ALLOWLISTED_DIAGNOSTIC.match(result["diagnostic"])
+    assert "DO_NOT_PERSIST" not in result["diagnostic"]
+
+
 def test_worker_failed_diagnostic_falls_back_to_unclassified_when_no_signal_anywhere() -> None:
     result = classify_terminal_failure(
         state="worker_failed",

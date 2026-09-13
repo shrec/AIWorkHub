@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -22,6 +23,67 @@ def _portable_host(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def _executable(_tmp_path: Path, _name: str) -> Path:
     return Path(sys.executable).resolve()
+
+
+def _write_mode(path: Path, content: bytes, mode: int) -> None:
+    previous_umask = os.umask(0)
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    finally:
+        os.umask(previous_umask)
+    with os.fdopen(descriptor, "wb") as handle:
+        handle.write(content)
+
+
+def _mkdir_mode(path: Path, mode: int = 0o755) -> None:
+    previous_umask = os.umask(0)
+    try:
+        path.mkdir(mode=mode)
+    finally:
+        os.umask(previous_umask)
+
+
+def _fake_classic_snap(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    confinement: str = "classic",
+    metadata_mode: int = 0o644,
+    bin_mode: int = 0o755,
+    missing_executable: bool = False,
+    current_escape: bool = False,
+) -> tuple[Path, Path]:
+    launcher = tmp_path / "usr" / "bin" / "snap"
+    launcher.parent.mkdir(parents=True)
+    _write_mode(launcher, b"snap launcher fixture\n", 0o755)
+
+    snap_parent = tmp_path / "snap"
+    snap_parent.mkdir()
+    root = snap_parent / "opencode"
+    _mkdir_mode(root)
+    revision = (tmp_path / "escaped" / "217") if current_escape else (root / "217")
+    if current_escape:
+        revision.parent.mkdir()
+    _mkdir_mode(revision)
+    meta_dir = revision / "meta"
+    bin_dir = revision / "bin"
+    _mkdir_mode(meta_dir)
+    _mkdir_mode(bin_dir, bin_mode)
+    metadata = f"name: opencode\nconfinement: {confinement}\n".encode()
+    _write_mode(meta_dir / "snap.yaml", metadata, metadata_mode)
+    executable = bin_dir / "opencode"
+    if not missing_executable:
+        _write_mode(executable, b"opencode fixture\n", 0o755)
+    (root / "current").symlink_to(revision, target_is_directory=True)
+
+    wrapper = tmp_path / "snap-bin" / "opencode"
+    wrapper.parent.mkdir()
+    wrapper.symlink_to(launcher)
+    monkeypatch.setattr(runtime_adapters, "OPENCODE_SNAP_LAUNCHER", str(launcher))
+    monkeypatch.setattr(runtime_adapters, "OPENCODE_SNAP_ROOT", str(root))
+    monkeypatch.setattr(runtime_adapters, "OPENCODE_SNAP_TRUSTED_UID", os.getuid())
+    monkeypatch.setattr(runtime_adapters.shutil, "which", lambda _binary: str(wrapper))
+    return wrapper, executable
 
 
 def test_existing_adapter_identities_are_unchanged() -> None:
@@ -179,6 +241,46 @@ def test_opencode_path_discovery_preserves_snap_wrapper_when_symlink_target_is_s
     assert resolution.ok is True
     assert resolution.executable == str(wrapper)
     assert resolution.executable != str(wrapper.resolve(strict=True))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="classic Snap is a Linux runtime")
+def test_opencode_classic_snap_resolves_authenticated_real_executable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    wrapper, executable = _fake_classic_snap(monkeypatch, tmp_path)
+
+    resolution = runtime_adapters.resolve_executable(runtime_adapters.OPENCODE_CLI_ADAPTER)
+
+    assert resolution.ok is True
+    assert resolution.executable == str(executable)
+    assert resolution.executable != str(wrapper)
+    assert resolution.executable != str(wrapper.resolve(strict=True))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="classic Snap is a Linux runtime")
+@pytest.mark.parametrize(
+    ("fixture_options", "reason"),
+    [
+        ({"confinement": "strict"}, "snap_not_classic"),
+        ({"metadata_mode": 0o664}, "metadata_writable"),
+        ({"bin_mode": 0o775}, "executable_directory_untrusted"),
+        ({"missing_executable": True}, "executable_missing"),
+        ({"current_escape": True}, "current_escapes_snap_root"),
+    ],
+)
+def test_opencode_snap_resolution_fails_closed_for_untrusted_installation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    fixture_options: dict[str, object],
+    reason: str,
+) -> None:
+    _fake_classic_snap(monkeypatch, tmp_path, **fixture_options)
+
+    resolution = runtime_adapters.resolve_executable(runtime_adapters.OPENCODE_CLI_ADAPTER)
+
+    assert resolution.ok is False
+    assert resolution.executable is None
+    assert resolution.reason == f"{runtime_adapters.OPENCODE_SNAP_FAIL_CLOSED}:{reason}"
 
 
 def test_opencode_permission_default_deny_blocks_builtins_and_unknown() -> None:
