@@ -8472,8 +8472,9 @@ async function updateFeatureSetting(view, feature, enabled, expectedRevision) {
 
 async function updateModelSetting(view, provider, adapter, model, enabled, expectedRevision) {
   const identity = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
+  const modelIdentity = /^[^\x00-\x1f\x7f]{1,128}$/;
   if (!identity.test(provider) || (adapter !== "" && !identity.test(adapter)) ||
-      (model !== "" && (!adapter || !identity.test(model))) ||
+      (model !== "" && (!adapter || !modelIdentity.test(model))) ||
       typeof enabled !== "boolean" || !Number.isSafeInteger(expectedRevision) ||
       expectedRevision < 0) {
     view.postMessage({ type: OUTBOUND_TYPES.error, message: "invalid_model_setting_update" });

@@ -65,6 +65,57 @@ test("context viewer markers exist in extension.js and app.js", () => {
   assert.ok(css.includes(".settings-model-provider"));
 });
 
+test("model setting updates preserve slash-qualified OpenCode model identities", async () => {
+  const source = extension.match(
+    /async function updateModelSetting[\s\S]*?\n}\n\nasync function updateSourceGraphLanguage/,
+  )[0].replace(/\n\nasync function updateSourceGraphLanguage$/, "");
+  const calls = [];
+  const messages = [];
+  const client = {
+    async callTool(tool, args) {
+      calls.push({ tool, args });
+      return { ok: true };
+    },
+  };
+  const updateModelSetting = vm.runInNewContext(
+    `(${source.replace("async function updateModelSetting", "async function")})`,
+    {
+      MODEL_SETTINGS_UPDATE_TOOL: "aiworkhub_dashboard_model_settings_update",
+      OUTBOUND_TYPES: { error: "error", notification: "notification" },
+      getMcpClient: () => client,
+      pushSettings: async () => {},
+      sanitizeErrorMessage: (err) => String(err),
+    },
+  );
+  const view = {
+    bindClient() {},
+    stillBoundTo: () => true,
+    postMessage: (message) => messages.push(message),
+  };
+
+  await updateModelSetting(view, "opencode", "opencode_cli", "openai/gpt-5.6-sol", true, 5);
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(calls)), [{
+    tool: "aiworkhub_dashboard_model_settings_update",
+    args: {
+      provider: "opencode",
+      adapter: "opencode_cli",
+      model: "openai/gpt-5.6-sol",
+      enabled: true,
+      expected_revision: 5,
+    },
+  }]);
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(messages)), [
+    { type: "notification", message: "openai/gpt-5.6-sol enabled" },
+  ]);
+
+  await updateModelSetting(view, "opencode", "opencode_cli", "openai/gpt\n5.6-sol", true, 5);
+  assert.strictEqual(calls.length, 1, "control characters must still be rejected locally");
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(messages.at(-1))), {
+    type: "error",
+    message: "invalid_model_setting_update",
+  });
+});
+
 test("app.js implements identity-based focus/scroll restore for the Models modal", () => {
   assert.ok(app.includes("function settingsControlIdentity"));
   assert.ok(app.includes("function settingsControlProvider"));
