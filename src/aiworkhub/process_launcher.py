@@ -6893,6 +6893,7 @@ class ProcessManager:
                     ),
                     "sandbox_backend": "deterministic_validation",
                     "validation": list(card.get("validation") or []),
+                    "read_first": list(card.get("read_first") or []),
                     "allowed_writes": list(card.get("allowed_writes") or []),
                     "validation_roles": list(card.get("validation_roles") or []),
                     "work_kind": str(card.get("work_kind") or "generic"),

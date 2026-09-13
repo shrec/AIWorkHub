@@ -6,6 +6,19 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.34] - 2026-09-13
+
+### Fixed
+
+- Provider-free validation replay now carries the full `read_first` contract
+  into its isolated request, preserving the HMAC-bound toolchain cache
+  identity before declared validations run.
+
+### Validation
+
+- Regression coverage uses a non-empty `read_first` contract and verifies the
+  replay request against the original toolchain authority receipt.
+
 ## [0.11.33] - 2026-09-13
 
 ### Fixed

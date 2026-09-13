@@ -1,5 +1,13 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.34 — 2026-09-13
+
+### Fixed
+
+- Validation-only replay preserves non-empty `read_first` requirements in the
+  signed toolchain identity, avoiding false cache-identity failures before
+  validation command 1.
+
 ## 0.11.33 — 2026-09-13
 
 ### Fixed

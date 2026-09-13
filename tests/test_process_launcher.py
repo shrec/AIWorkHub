@@ -3871,6 +3871,7 @@ def test_validation_only_replay_preserves_complete_toolchain_receipt_identity(
     card.update({
         "claim_epoch": 2,
         "validation": [f"{sys.executable} -m compileall -q ."],
+        "read_first": ["read-first.txt"],
         "required_outputs": ["out/result.json"],
         "rework_predecessor": {
             "request_id": predecessor_id,
@@ -3882,6 +3883,7 @@ def test_validation_only_replay_preserves_complete_toolchain_receipt_identity(
         show_task=_show(lambda: card),
         argv=[sys.executable, "-c", "pass"],
     )
+    (manager.repo / "read-first.txt").write_text("read me\n", encoding="utf-8")
     preflight = manager._preflight_card(
         card["task_id"],
         card["runner"],
@@ -3973,6 +3975,7 @@ def test_validation_only_replay_preserves_complete_toolchain_receipt_identity(
         )
     )
     assert metadata["allowed_writes"] == preflight["allowed_writes"]
+    assert metadata["read_first"] == preflight["read_first"]
     assert toolchain_authority.verify_authority_receipt(
         metadata[toolchain_authority.RECEIPT_CARD_KEY], manager.repo, metadata
     )
