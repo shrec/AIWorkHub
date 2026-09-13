@@ -5821,6 +5821,7 @@ def reject_review(
     to: str = "pending",
     residual_identities: list[dict[str, str]] | None = None,
     predecessor_request_id: str | None = None,
+    failure_category: str | None = None,
 ) -> dict[str, Any]:
     card, error = _live_card(task_id)
     if error:
@@ -5845,6 +5846,27 @@ def reject_review(
     )
     if blocked is not None:
         return blocked
+    explicit_failure_category: str | None = None
+    if failure_category is not None:
+        # A verified manager may park a candidate because the review machinery
+        # itself failed. Keep that signal out of candidate-code learning, but
+        # expose no general-purpose taxonomy override: only blocked tasks and
+        # only the closed infrastructure vocabulary are accepted here.
+        if disposition != "blocked":
+            return _lifecycle_error("failure_category_requires_blocked_disposition")
+        try:
+            requested_category = FailureCategory(str(failure_category).strip())
+        except ValueError:
+            return _lifecycle_error("invalid_rejection_failure_category")
+        allowed_categories = {
+            FailureCategory.VALIDATION_ENVIRONMENT,
+            FailureCategory.PROVIDER_RUNTIME,
+            FailureCategory.DEPENDENCY_OR_ROUTE,
+            FailureCategory.CANCELLATION_OR_TIMEOUT,
+        }
+        if requested_category not in allowed_categories:
+            return _lifecycle_error("rejection_failure_category_not_infrastructure")
+        explicit_failure_category = requested_category.value
     # Keep the exact SQL preimage while artifact I/O happens outside a writer
     # transaction. A later review episode must never receive this snapshot.
     snapshot_conn = _canonical_connect(readonly=True)
@@ -6162,11 +6184,20 @@ def reject_review(
     # begin_claim_episode() below erases terminal_review/terminal_substatus from
     # the card, so classifying later -- which is when a learning commit runs --
     # can only ever answer "inconclusive". Classify now, pin the answer below.
-    terminal_disposition = classify_terminal_disposition(card).value
+    terminal_disposition = (
+        explicit_failure_category or classify_terminal_disposition(card).value
+    )
+    failure_category_source = (
+        "manager_explicit_infrastructure"
+        if explicit_failure_category is not None
+        else "terminal_evidence"
+    )
     command = [
         "reject-review", task_id, "--runner", actor, "--topic", str(live_topic),
         "--reason", bounded_reason, "--to", disposition,
     ]
+    if explicit_failure_category is not None:
+        command.extend(["--failure-category", explicit_failure_category])
     # archived / superseded retire the card atomically (archived_at + card_json
     # + task_events) via the shared archive backend. Only a card actually in
     # review may be rejected.
@@ -6332,6 +6363,7 @@ def reject_review(
     card["rejection_disposition"] = {
         "schema_id": "aiworkhub.rejection_disposition.v1",
         "failure_category": terminal_disposition,
+        "failure_category_source": failure_category_source,
         "request_id": pred_request_id,
         "to": disposition,
         "pinned_at": now,
@@ -6417,6 +6449,7 @@ def reject_review(
                         "reason": bounded_reason,
                         "reason_identity": reason_identity,
                         "terminal_disposition": terminal_disposition,
+                        "failure_category_source": failure_category_source,
                         "to": disposition,
                         "prior_episode": prior_episode,
                         "rework_delta_reuse_error": rework_delta_reuse_error,

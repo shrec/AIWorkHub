@@ -587,6 +587,30 @@ def test_server_reject_review_passes_predecessor_request_id(monkeypatch):
         if kwargs.get("task_id") == "T_DEF":
             assert "predecessor_request_id" not in kwargs
 
+
+def test_server_reject_review_passes_explicit_infrastructure_category(monkeypatch):
+    calls = []
+
+    def reject(**kwargs):
+        calls.append(kwargs)
+        return {"ok": True, **kwargs}
+
+    monkeypatch.setattr(core, "reject_review", reject)
+
+    server.aiworkhub_task_reject_review(
+        "T_MECHANICAL",
+        "review route failed",
+        to="blocked",
+        failure_category="provider_runtime",
+    )
+
+    assert calls == [{
+        "task_id": "T_MECHANICAL",
+        "reason": "review route failed",
+        "to": "blocked",
+        "failure_category": "provider_runtime",
+    }]
+
 def test_real_core_lifecycle_calls_scope_identity_and_capability(monkeypatch, tmp_path):
     """B857: rebased to the canonical in-process engine (task_store) --
     these lifecycle calls resolve directly against the repo-local

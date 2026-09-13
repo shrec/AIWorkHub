@@ -592,6 +592,40 @@ def test_rework_rejection_pins_failure_category_before_its_input_is_erased(
     assert result["failure_category"] == "candidate_code"
 
 
+def test_mechanical_review_park_projects_infrastructure_category(
+    tmp_path, monkeypatch,
+):
+    root = _setup_repo(tmp_path, monkeypatch)
+    _coordinator_env(root, tmp_path, monkeypatch)
+    task_id = "TASK-MECHANICAL-PARK-1"
+    request_id = "request-mechanical-park-0001"
+    _rejectable_card(
+        root, task_id=task_id, request_id=request_id, substatus="review_ready",
+    )
+    projected = {}
+
+    def record_decision_event(*args, **kwargs):
+        projected.update(kwargs)
+        return {"state": "applied"}
+
+    monkeypatch.setattr(
+        learning_commit_store, "record_decision_event", record_decision_event,
+    )
+
+    rejected = core.reject_review(
+        task_id,
+        "required automatic reviewer route was unavailable",
+        to="blocked",
+        failure_category="dependency_or_route",
+    )
+    assert rejected["ok"] is True, rejected
+    card = task_store.get_task(root, task_id)
+    assert card is not None
+    assert card["rejection_disposition"]["failure_category"] == "dependency_or_route"
+    assert projected["request_id"] == request_id
+    assert projected["failure_category"] == "dependency_or_route"
+
+
 def test_reject_review_event_carries_the_disposition_it_classified(
     tmp_path, monkeypatch,
 ):

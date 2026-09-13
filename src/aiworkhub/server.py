@@ -604,6 +604,12 @@ _CARD_INCLUDE_MODES = ("none", "summary", "full")
 _STATUS_DETAIL_MODES = ("summary", "evidence", "full")
 CardInclude = Literal["none", "summary", "full"]
 StatusDetail = Literal["summary", "evidence", "full"]
+InfrastructureFailureCategory = Literal[
+    "validation_environment",
+    "provider_runtime",
+    "dependency_or_route",
+    "cancellation_or_timeout",
+]
 
 
 def _envelope_card(result: Any) -> dict[str, Any] | None:
@@ -774,6 +780,10 @@ def _reject_review_receipt_fields(
             "sha256": hashlib.sha256(reason_bytes).hexdigest(),
         },
         "failure_category": rejection.get("failure_category") or event.get("terminal_disposition"),
+        "failure_category_source": (
+            rejection.get("failure_category_source")
+            or event.get("failure_category_source")
+        ),
         "request_id": (
             rejection.get("request_id")
             or feedback.get("predecessor_request_id")
@@ -2489,6 +2499,7 @@ def aiworkhub_task_reject_review(
     to: str = "pending",
     residual_identities: list[dict[str, str]] | None = None,
     predecessor_request_id: str | None = None,
+    failure_category: InfrastructureFailureCategory | None = None,
     include_card: CardInclude = "none",
 ) -> dict[str, Any]:
     """Write-gated Codex action: reject a reviewed task with exact feedback and
@@ -2499,6 +2510,10 @@ def aiworkhub_task_reject_review(
     ``predecessor_request_id`` selects an exact retained review request as
     the rework workspace authority.  Omitted (None) defaults to the current
     review request.  An empty string fails closed.
+
+    ``failure_category`` is a verified-manager escape hatch for a mechanical
+    review failure. It is accepted only with ``to=blocked`` and only from the
+    closed infrastructure taxonomy, so it cannot relabel candidate code.
 
     Replies with a receipt (``aiworkhub.reject_review_receipt.v1``): task_id,
     to, status, request_id, claim_epoch, prior_episode, failure_category,
@@ -2519,6 +2534,8 @@ def aiworkhub_task_reject_review(
         kwargs["residual_identities"] = residual_identities
     if predecessor_request_id is not None:
         kwargs["predecessor_request_id"] = predecessor_request_id
+    if failure_category is not None:
+        kwargs["failure_category"] = failure_category
     result = core.reject_review(**kwargs)
     card = _envelope_card(result)
     extra = (

@@ -529,6 +529,68 @@ def test_reject_to_blocked_parks_as_blocked(coord):
     assert "terminal_review" not in card
 
 
+def test_reject_to_blocked_can_pin_verified_infrastructure_failure(coord):
+    _insert(
+        coord,
+        "T_BLOCK_MECHANICAL",
+        card={
+            "claim_epoch": 4,
+            "terminal_review": {"substatus": "review_ready"},
+            "deterministic_verification": {"pass": True, "claim_epoch": 4},
+        },
+    )
+
+    res = core.reject_review(
+        "T_BLOCK_MECHANICAL",
+        "automatic security reviewer was never materialized",
+        to="blocked",
+        failure_category="dependency_or_route",
+    )
+
+    assert res["ok"] is True, res
+    card = json.loads(_row(coord, "T_BLOCK_MECHANICAL")["card_json"])
+    assert card["rejection_disposition"]["failure_category"] == "dependency_or_route"
+    assert (
+        card["rejection_disposition"]["failure_category_source"]
+        == "manager_explicit_infrastructure"
+    )
+
+
+@pytest.mark.parametrize(
+    ("to", "failure_category", "expected_error"),
+    [
+        ("pending", "provider_runtime", "failure_category_requires_blocked_disposition"),
+        ("blocked", "candidate_code", "rejection_failure_category_not_infrastructure"),
+        ("blocked", "made_up", "invalid_rejection_failure_category"),
+    ],
+)
+def test_rejection_failure_category_override_fails_closed(
+    coord, to, failure_category, expected_error
+):
+    task_id = f"T_BAD_CATEGORY_{to}_{failure_category}"
+    _insert(
+        coord,
+        task_id,
+        card={
+            "claim_epoch": 2,
+            "terminal_review": {"substatus": "review_ready"},
+            "deterministic_verification": {"pass": True, "claim_epoch": 2},
+        },
+    )
+
+    res = core.reject_review(
+        task_id,
+        "mechanical park",
+        to=to,
+        failure_category=failure_category,
+    )
+
+    assert res["ok"] is False
+    assert expected_error in res["stderr"]
+    row = _row(coord, task_id)
+    assert row["status"] == "review" and row["worker_status"] == "review"
+
+
 def test_reject_to_archived_retires_atomically(coord):
     _insert(coord, "T_ARCH")
     res = core.reject_review("T_ARCH", "obsolete", to="archived")
