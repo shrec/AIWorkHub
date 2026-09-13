@@ -868,6 +868,7 @@ def test_fake_clock_explicit_cancel_is_exactly_once(
 def test_fake_clock_exact_child_exit_is_exactly_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    real_sleep = worker_supervisor.time.sleep
     clock = _FakeClock()
     _install_fake_clock(monkeypatch, clock)
     timeout_seconds = 2
@@ -888,9 +889,12 @@ def test_fake_clock_exact_child_exit_is_exactly_once(
         return original_terminate(child)
 
     def fake_sleep(seconds: float) -> None:
-        clock.sleep(seconds)
         if not marker.exists():
             marker.write_text("exit", encoding="utf-8")
+        # This test owns the successful-exit branch, not deadline expiry. Yield
+        # to the real child without advancing the fake deadline; the dedicated
+        # hard-deadline test advances the clock and asserts termination.
+        real_sleep(min(float(seconds), 0.01))
 
     monkeypatch.setattr(worker_supervisor.time, "sleep", fake_sleep)
     monkeypatch.setattr(worker_supervisor, "_terminate_child", wrapped_terminate)
