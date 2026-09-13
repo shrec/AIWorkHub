@@ -982,9 +982,28 @@ def _status_review_ready(status: Any) -> bool:
 def _present_reviewer_lenses(
     repo: Path, identity: Mapping[str, str], lenses: tuple[str, ...],
 ) -> frozenset[str]:
+    # Live launch/plan paths key reviewer children by the canonical chain
+    # identity, whose hashed preimage includes schema_id. Normalize the
+    # recovered five-field mapping through the same review_lifecycle
+    # primitive so an already-live or terminal reviewer row is observed as
+    # present instead of being re-ensured by every periodic scan.
+    try:
+        canonical = review_lifecycle._chain_identity(
+            target_task_id=str(identity.get("target_task_id") or ""),
+            target_request_id=str(identity.get("target_request_id") or ""),
+            claim_epoch=str(identity.get("claim_epoch") or ""),
+            packet_sha256=str(identity.get("packet_sha256") or ""),
+            candidate_sha256=str(identity.get("candidate_sha256") or ""),
+        )
+    except review_lifecycle.ReviewLifecycleError:
+        # An identity that cannot be keyed to canonical reviewer children
+        # must not crash the scan: report nothing present and let the
+        # caller's sealed registration path fail closed with its bounded
+        # ensure_failed reason.
+        return frozenset()
     present: set[str] = set()
     for lens in lenses:
-        task_id = ReviewOrchestrator._reviewer_task_id(identity, lens)
+        task_id = ReviewOrchestrator._reviewer_task_id(canonical, lens)
         try:
             row = task_store.get_task(repo, task_id)
         except (task_store.TaskStoreError, OSError, TypeError, ValueError):

@@ -516,6 +516,7 @@ def _scan_review_ready_recovery(manager: Any) -> dict[str, Any]:
         "review_recovery_failed": 0,
         "review_recovery_reasons": {},
         "review_recovery_failures": [],
+        "review_recovery_drain": {"state": "skipped", "reason": "no_work"},
     }
     try:
         review_db = review_orchestrator.canonical_review_db(manager)
@@ -525,7 +526,16 @@ def _scan_review_ready_recovery(manager: Any) -> dict[str, Any]:
         recovery = review_orchestrator.recover_review_ready_targets(
             manager, db_path=review_db,
         )
-        if int(recovery.get("review_recovery_ensured") or 0) > 0:
+        # Launch delegation belongs to the system-owned orchestrator alone;
+        # the scan only hands it work. Drain strictly on chains this scan
+        # newly ensured: chains that already existed were handed to the
+        # orchestrator by the scan that ensured them, and live reviewers,
+        # terminal reports and manager-ready chains keep progressing through
+        # the system's own liveness drain. A repeated scan over
+        # already-present chains is therefore a no-op and can never create
+        # duplicate chains, children, requests or provider launches.
+        pending_work = int(recovery.get("review_recovery_ensured") or 0) > 0
+        if pending_work:
             drain = review_orchestrator.ReviewOrchestrator(
                 manager, db_path=review_db,
             ).drain()

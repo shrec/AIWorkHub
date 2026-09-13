@@ -2633,3 +2633,144 @@ def test_drain_defaults_to_the_whole_pass_and_keeps_its_hard_bound(
     assert driver.drain(max_actions=10_000, now=NOW).attempted <= (
         review_orchestrator.DEFAULT_DRAIN_MAX_ACTIONS
     )
+
+
+def _high_tier_gate() -> dict:
+    return {
+        "review_risk_profile": {
+            "effective_tier": "high",
+            "required_reviewer_lenses": ["correctness", "security"],
+        }
+    }
+
+
+def _nf517_queue_card(**overrides: object) -> dict:
+    status = _sealed_target_status(
+        evidence_overrides={"quality_gate": _high_tier_gate()}
+    )
+    card = dict(status["task_card"])
+    row = {
+        "task_id": "TARGET",
+        "topic": "task_mcp",
+        "runner": "grok_4.6",
+        "status": "review",
+        "terminal_substatus": "review_ready",
+        "terminal_review": card["terminal_review"],
+        "claim_epoch": "1",
+    }
+    row.update(overrides)
+    return row
+
+
+def _patch_queue(monkeypatch, cards) -> None:
+    monkeypatch.setattr(
+        review_orchestrator.task_store,
+        "list_review_queue_cards",
+        lambda _repo, limit=500: list(cards),
+    )
+    monkeypatch.setattr(
+        review_orchestrator.task_store,
+        "get_task",
+        lambda _repo, _task_id: None,
+    )
+
+
+def test_nf517_zero_child_review_ready_scan_launches_required_lenses_once(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    """Live NF-517 shape: review_ready, zero children, two required lenses."""
+    _stub_archive(monkeypatch)
+    _patch_queue(monkeypatch, [_nf517_queue_card()])
+    manager = _Manager(tmp_path)
+    manager.target_status = _sealed_target_status(
+        evidence_overrides={"quality_gate": _high_tier_gate()}
+    )
+    db = tmp_path / "nf517.sqlite"
+    driver = review_orchestrator.ReviewOrchestrator(
+        manager, db_path=db, route_selector=_route,
+    )
+
+    first = review_orchestrator.recover_review_ready_targets(manager, db_path=db)
+    assert first["review_recovery_scanned"] == 1
+    assert first["review_recovery_ensured"] == 1
+    assert first["review_recovery_failed"] == 0
+    for lens in ("correctness", "security"):
+        manager.status_results["review-request-" + lens] = _review_status(
+            lens, candidate_sha256=_SEALED_CANDIDATE_SHA256
+        )
+    for _ in range(12):
+        assert driver.drain(max_actions=1, now=NOW).failed == 0
+        if [row["lens"] for row in manager.launches] == ["correctness", "security"]:
+            break
+    assert [row["lens"] for row in manager.launches] == ["correctness", "security"]
+    assert ("target-request", "TARGET") not in manager.accepts
+    assert review_orchestrator.AUTOMATIC_TARGET_ACCEPT_ENABLED is False
+    assert review_orchestrator._manager_reserved_codex_route(
+        {"runner": "codex", "adapter_id": "codex_cli", "model": "gpt-5"}
+    )
+    for row in manager.launches:
+        assert not review_orchestrator._manager_reserved_codex_route({
+            "runner": row.get("runner") or "",
+            "adapter_id": row.get("adapter_id") or "",
+            "model": row.get("model") or "",
+        })
+
+    second = review_orchestrator.recover_review_ready_targets(manager, db_path=db)
+    driver.drain(now=NOW)
+    assert second["review_recovery_failed"] == 0
+    assert [row["lens"] for row in manager.launches] == ["correctness", "security"]
+    assert ("target-request", "TARGET") not in manager.accepts
+
+
+def test_recover_review_ready_fails_closed_on_untrusted_targets(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    manager = _Manager(tmp_path)
+    db = tmp_path / "closed.sqlite"
+
+    _patch_queue(monkeypatch, [_nf517_queue_card(terminal_substatus="blocked")])
+    skipped = review_orchestrator.recover_review_ready_targets(manager, db_path=db)
+    assert skipped["review_recovery_scanned"] == 0
+
+    missing = dict(_nf517_queue_card())
+    missing["terminal_review"] = {"substatus": "review_ready", "evidence": {}}
+    _patch_queue(monkeypatch, [missing])
+    result = review_orchestrator.recover_review_ready_targets(manager, db_path=db)
+    assert result["review_recovery_reasons"].get("missing_registration") == 1
+
+    _patch_queue(monkeypatch, [_nf517_queue_card()])
+    manager.target_status = _sealed_target_status(
+        evidence_overrides={"changed_path_hashes": {}, "quality_gate": _high_tier_gate()}
+    )
+    result = review_orchestrator.recover_review_ready_targets(manager, db_path=db)
+    assert result["review_recovery_reasons"].get("empty_delta") == 1
+
+    manager.target_status = _sealed_target_status(
+        evidence_overrides={"quality_gate": _high_tier_gate()}
+    )
+    manager.target_status["latest_event"] = {
+        "review_automation": {
+            "state": "seeded",
+            "registration": {
+                "target_task_id": "TARGET",
+                "target_request_id": "target-request",
+                "claim_epoch": "1",
+                "packet_sha256": "a" * 64,
+                "candidate_sha256": "d" * 64,
+            },
+        }
+    }
+    result = review_orchestrator.recover_review_ready_targets(manager, db_path=db)
+    assert result["review_recovery_reasons"].get("changed_candidate") == 1
+
+    manager.target_status = _sealed_target_status(state="processing")
+    result = review_orchestrator.recover_review_ready_targets(manager, db_path=db)
+    assert result["review_recovery_reasons"].get("non_review") == 1
+
+    manager.target_status = _sealed_target_status(
+        evidence_overrides={"quality_gate": _high_tier_gate()}
+    )
+    _patch_queue(monkeypatch, [_nf517_queue_card(task_id="OTHER")])
+    result = review_orchestrator.recover_review_ready_targets(manager, db_path=db)
+    assert result["review_recovery_reasons"].get("mismatched_identity") == 1
+    assert result["review_recovery_ensured"] == 0
