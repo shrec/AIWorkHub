@@ -4223,7 +4223,50 @@ function createVscodeLmStagedEditCollector(request) {
     };
   };
 
-  return { stage, finalize, hasChanges: () => edits.size > 0 || creates.size > 0, nextMissingRequired };
+  // NF-2026-00831: a valid V3 direct envelope may contain only the output
+  // completed on this provider turn. Reuse the same stage validator so those
+  // edits remain authoritative while the protocol asks only for the next
+  // missing required path. No raw/direct payload bypasses the stage contract.
+  const ingestFinalEnvelope = async (envelope) => {
+    if (!envelope || envelope.schema_id !== VSCODE_LM_EDIT_RESPONSE_SCHEMA ||
+        !Array.isArray(envelope.edits) || !Array.isArray(envelope.creates)) {
+      return reject("final_envelope_invalid");
+    }
+    for (const edit of envelope.edits) {
+      for (const range of edit.ranges) {
+        const receipt = await stage({
+          operation: "replace_range",
+          file_path: edit.path,
+          start_line: range.start_line,
+          end_line: range.end_line,
+          new: range.new,
+          preserve_trailing_newline: range.preserve_trailing_newline,
+        });
+        if (!receipt.ok) return receipt;
+      }
+    }
+    for (const create of envelope.creates) {
+      const receipt = await stage({
+        operation: "create",
+        file_path: create.path,
+        content: create.content,
+      });
+      if (!receipt.ok) return receipt;
+    }
+    return {
+      ok: true,
+      schema_id: "aiworkhub.vscode_lm.staged_edit_ingest_receipt.v1",
+      ...requiredProgress(),
+    };
+  };
+
+  return {
+    stage,
+    finalize,
+    ingestFinalEnvelope,
+    hasChanges: () => edits.size > 0 || creates.size > 0,
+    nextMissingRequired,
+  };
 }
 
 function vscodeLmNextMissingRequiredOutput(stagedEdits) {
@@ -4250,8 +4293,9 @@ function vscodeLmMissingRequiredStageInstruction(nextMissing, native = false) {
         ? `${stageNow} with only the smallest required replacement/create.`
         : `${stageNow}.`);
   }
+  const action = nextMissing.action === "create" ? "v3_create" : nextMissing.action;
   return `Required output ${nextMissing.path} is still missing. Do not emit a final edit envelope. ` +
-    `${stageNow} with operation ${nextMissing.action} for ${nextMissing.path}.`;
+    `${stageNow} with operation ${nextMissing.action} (action ${action}) for ${nextMissing.path}.`;
 }
 
 function vscodeLmForcedStageMissingKey(nextMissing) {
@@ -5039,10 +5083,70 @@ async function runVscodeLmTextProtocol(
         continue;
       }
       const finalError = validateVscodeLmFinalEnvelope(envelope, request.allowedWrites, request.path_contracts);
+      const missingCreate = vscodeLmMissingRequiredCreateRejection(
+        finalError, vscodeLmContractMap(request.path_contracts),
+      );
+      const stageRequiredDirectV3 = envelope.schema_id === VSCODE_LM_EDIT_RESPONSE_SCHEMA &&
+        Array.isArray(request.required_outputs) && request.required_outputs.length > 0 &&
+        (!finalError || Boolean(missingCreate));
+      if (stageRequiredDirectV3) {
+        const ingested = await stagedEdits.ingestFinalEnvelope(envelope);
+        if (!ingested.ok) {
+          protocolTrace.push({ turn, phase: "semantic_edit_stage", outcome: ingested.reason });
+          throw vscodeLmProtocolFailure(
+            "vscode_lm_semantic_edit_stage_required", protocolTrace, lastProtocolPreview,
+          );
+        }
+        const nextMissing = vscodeLmNextMissingRequiredOutput(stagedEdits);
+        if (!nextMissing) {
+          const stagedFinal = stagedEdits.finalize(envelope.summary);
+          protocolTrace.push({
+            turn,
+            phase: "semantic_edit_stage",
+            outcome: stagedFinal.ok ? "required_outputs_complete" : stagedFinal.reason,
+          });
+          if (stagedFinal.ok) return JSON.stringify(stagedFinal.__finalEnvelope);
+          throw vscodeLmProtocolFailure(
+            "vscode_lm_semantic_edit_stage_required", protocolTrace, lastProtocolPreview,
+          );
+        }
+        const missingIdentity = `required_output:${nextMissing.path}:${nextMissing.action}`;
+        protocolTrace.push({
+          turn,
+          phase: "semantic_edit_stage",
+          outcome: "semantic_edit_required_outputs_incomplete",
+          rejectionIdentity: missingIdentity,
+        });
+        if (lastMissingCreateRejectionIdentity === missingIdentity) {
+          const nonprogress = vscodeLmProtocolFailure(
+            "vscode_lm_finalization_nonprogress", protocolTrace, lastProtocolPreview,
+          );
+          nonprogress.rejectionIdentity = missingIdentity;
+          if (nextMissing.action === "create") {
+            nonprogress.nonprogressReason = "repeated_missing_required_create";
+            nonprogress.missingCreatePath = nextMissing.path;
+            nonprogress.missingCreateAction = "v3_create";
+          } else {
+            nonprogress.nonprogressReason = "repeated_missing_required_output";
+            nonprogress.missingOutputPath = nextMissing.path;
+            nonprogress.missingOutputAction = nextMissing.action;
+          }
+          throw nonprogress;
+        }
+        if (finalizationTurns >= VSCODE_LM_MAX_FINALIZATION_TURNS) {
+          throw vscodeLmProtocolFailure(
+            "vscode_lm_finalization_limit", protocolTrace, lastProtocolPreview,
+          );
+        }
+        finalizationTurns += 1;
+        lastMissingCreateRejectionIdentity = missingIdentity;
+        messages.push(vscode.LanguageModelChatMessage.Assistant([languageModelTextPart(text)]));
+        messages.push(vscode.LanguageModelChatMessage.User(
+          vscodeLmMissingRequiredStageInstruction(nextMissing, false),
+        ));
+        continue;
+      }
       if (finalError) {
-        const missingCreate = vscodeLmMissingRequiredCreateRejection(
-          finalError, vscodeLmContractMap(request.path_contracts),
-        );
         if (missingCreate) {
           protocolTrace.push({
             turn,
@@ -5559,10 +5663,70 @@ async function runVscodeLmAgent(
         continue;
       }
       const finalError = validateVscodeLmFinalEnvelope(envelope, request.allowedWrites, request.path_contracts);
+      const missingCreate = vscodeLmMissingRequiredCreateRejection(
+        finalError, vscodeLmContractMap(request.path_contracts),
+      );
+      const stageRequiredDirectV3 = envelope.schema_id === VSCODE_LM_EDIT_RESPONSE_SCHEMA &&
+        Array.isArray(request.required_outputs) && request.required_outputs.length > 0 &&
+        (!finalError || Boolean(missingCreate));
+      if (stageRequiredDirectV3) {
+        const ingested = await stagedEdits.ingestFinalEnvelope(envelope);
+        if (!ingested.ok) {
+          protocolTrace.push({ turn, phase: "semantic_edit_stage", outcome: ingested.reason });
+          throw vscodeLmProtocolFailure(
+            "vscode_lm_semantic_edit_stage_required", protocolTrace, lastProtocolPreview,
+          );
+        }
+        const nextMissing = vscodeLmNextMissingRequiredOutput(stagedEdits);
+        if (!nextMissing) {
+          const stagedFinal = stagedEdits.finalize(envelope.summary);
+          protocolTrace.push({
+            turn,
+            phase: "semantic_edit_stage",
+            outcome: stagedFinal.ok ? "required_outputs_complete" : stagedFinal.reason,
+          });
+          if (stagedFinal.ok) return JSON.stringify(stagedFinal.__finalEnvelope);
+          throw vscodeLmProtocolFailure(
+            "vscode_lm_semantic_edit_stage_required", protocolTrace, lastProtocolPreview,
+          );
+        }
+        const missingIdentity = `required_output:${nextMissing.path}:${nextMissing.action}`;
+        protocolTrace.push({
+          turn,
+          phase: "semantic_edit_stage",
+          outcome: "semantic_edit_required_outputs_incomplete",
+          rejectionIdentity: missingIdentity,
+        });
+        if (lastMissingCreateRejectionIdentity === missingIdentity) {
+          const nonprogress = vscodeLmProtocolFailure(
+            "vscode_lm_finalization_nonprogress", protocolTrace, lastProtocolPreview,
+          );
+          nonprogress.rejectionIdentity = missingIdentity;
+          if (nextMissing.action === "create") {
+            nonprogress.nonprogressReason = "repeated_missing_required_create";
+            nonprogress.missingCreatePath = nextMissing.path;
+            nonprogress.missingCreateAction = "v3_create";
+          } else {
+            nonprogress.nonprogressReason = "repeated_missing_required_output";
+            nonprogress.missingOutputPath = nextMissing.path;
+            nonprogress.missingOutputAction = nextMissing.action;
+          }
+          throw nonprogress;
+        }
+        if (finalizationTurns >= VSCODE_LM_MAX_FINALIZATION_TURNS) {
+          throw vscodeLmProtocolFailure(
+            "vscode_lm_finalization_limit", protocolTrace, lastProtocolPreview,
+          );
+        }
+        finalizationTurns += 1;
+        lastMissingCreateRejectionIdentity = missingIdentity;
+        messages.push(vscode.LanguageModelChatMessage.Assistant([languageModelTextPart(text)]));
+        messages.push(vscode.LanguageModelChatMessage.User(
+          vscodeLmMissingRequiredStageInstruction(nextMissing, true),
+        ));
+        continue;
+      }
       if (finalError) {
-        const missingCreate = vscodeLmMissingRequiredCreateRejection(
-          finalError, vscodeLmContractMap(request.path_contracts),
-        );
         if (missingCreate) {
           protocolTrace.push({
             turn,

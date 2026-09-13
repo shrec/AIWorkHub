@@ -160,36 +160,34 @@ test("tool-call protocol stops on the second identical missing-create rejection"
   assert.match(prompts[1], /action v3_create/);
 });
 
-test("text protocol rotating missing-create paths still hit the finalization cap", async () => {
+test("text protocol accumulates distinct partial creates without false nonprogress", async () => {
   const paths = ["tests/rotating-a.py", "tests/rotating-b.py"];
   const model = rotatingMissingCreateModel(paths, false);
 
-  await assert.rejects(
-    internals.runVscodeLmTextProtocol(model, createRequest(paths), undefined, async () => ({ ok: true })),
-    (error) => {
-      assert.match(String(error && error.message || error), /vscode_lm_finalization_limit/);
-      assert.notStrictEqual(error.nonprogressReason, "repeated_missing_required_create");
-      return true;
-    },
-  );
+  const result = JSON.parse(await internals.runVscodeLmTextProtocol(
+    model, createRequest(paths), undefined, async () => ({ ok: true }),
+  ));
 
-  assert.ok(model.providerTurns > 2);
+  assert.strictEqual(model.providerTurns, 3);
+  assert.deepStrictEqual(
+    result.creates.map((entry) => entry.path),
+    paths,
+  );
 });
 
-test("tool-call protocol rotating missing-create paths still hit the finalization cap", async () => {
+test("tool-call protocol accumulates distinct partial creates without false nonprogress", async () => {
   const paths = ["tests/rotating-a.py", "tests/rotating-b.py"];
   const model = rotatingMissingCreateModel(paths, true);
 
-  await assert.rejects(
-    internals.runVscodeLmAgent(model, createRequest(paths), undefined, async () => ({ ok: true })),
-    (error) => {
-      assert.match(String(error && error.message || error), /vscode_lm_finalization_limit/);
-      assert.notStrictEqual(error.nonprogressReason, "repeated_missing_required_create");
-      return true;
-    },
-  );
+  const result = JSON.parse(await internals.runVscodeLmAgent(
+    model, createRequest(paths), undefined, async () => ({ ok: true }),
+  ));
 
-  assert.ok(model.providerTurns > 2);
+  assert.strictEqual(model.providerTurns, 3);
+  assert.deepStrictEqual(
+    result.creates.map((entry) => entry.path),
+    paths,
+  );
 });
 
 test("a changed missing-create identity receives a new bounded correction", async () => {

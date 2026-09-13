@@ -4537,7 +4537,131 @@ async function nf723StagedFinalizationCompletenessChecks() {
   assert.match(nativeNonStageCorrection, /operation create/);
 }
 
+const NF831_EDIT_PATH = "pkg/existing-module.js";
+const NF831_CREATE_PATH = "pkg/new-module.js";
+const NF831_EDIT_SHA = "1f".repeat(32);
+
+function nf831Request() {
+  return {
+    requestId: "nf831-request",
+    request_kind: "worker",
+    prompt: "complete the two required outputs",
+    allowedWrites: [NF831_EDIT_PATH, NF831_CREATE_PATH],
+    path_contracts: {
+      [NF831_EDIT_PATH]: {
+        action: "edit", current_sha256: NF831_EDIT_SHA, line_count: 20, parent_existed: true,
+      },
+      [NF831_CREATE_PATH]: { action: "create", parent_existed: false },
+    },
+    required_outputs: [NF831_EDIT_PATH, NF831_CREATE_PATH],
+    initial_source_graph_request: { mode: "focus", query: "nf831" },
+    initial_source_graph_result: { ok: true, hit_count: 1 },
+  };
+}
+
+function nf831Envelope(edits, creates) {
+  return JSON.stringify({
+    schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+    summary: "nf831 bounded direct final",
+    edits,
+    creates,
+  });
+}
+
+function nf831Edit() {
+  return {
+    path: NF831_EDIT_PATH,
+    current_sha256: NF831_EDIT_SHA,
+    ranges: [{
+      start_line: 2,
+      end_line: 2,
+      new: "// preserved nf831 edit",
+      preserve_trailing_newline: true,
+    }],
+  };
+}
+
+function nf831Model(toolCalling, responses) {
+  const state = { turns: 0, requests: [] };
+  return {
+    state,
+    model: {
+      capabilities: { toolCalling },
+      sendRequest: async (messages) => {
+        state.requests.push(messages);
+        const value = responses[Math.min(state.turns, responses.length - 1)];
+        state.turns += 1;
+        return { stream: (async function* stream() { yield { value }; })() };
+      },
+    },
+  };
+}
+
+function nf831LastUserText(messages) {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (!message || message.role !== "user") continue;
+    if (typeof message.content === "string") return message.content;
+    if (Array.isArray(message.content)) return message.content.map(String).join("\n");
+    return String(message.content);
+  }
+  return "";
+}
+
+async function nf831DirectFinalSubsetChecks() {
+  const editOnly = nf831Envelope([nf831Edit()], []);
+  const createOnly = nf831Envelope([], [{
+    path: NF831_CREATE_PATH,
+    content: "export const nf831 = true;\n",
+  }]);
+  const complete = nf831Envelope([nf831Edit()], [{
+    path: NF831_CREATE_PATH,
+    content: "export const nf831 = true;\n",
+  }]);
+  const invoke = async () => ({ ok: true });
+
+  for (const [name, run, native] of [
+    ["text", internals.runVscodeLmTextProtocol, false],
+    ["native", internals.runVscodeLmAgent, true],
+  ]) {
+    const partialThenCreate = nf831Model(native, [editOnly, createOnly]);
+    const combined = JSON.parse(await run(
+      partialThenCreate.model, nf831Request(), undefined, invoke,
+    ));
+    assert.strictEqual(partialThenCreate.state.turns, 2, `${name}: use one bounded correction turn`);
+    assert.deepStrictEqual(combined.edits[0].ranges, nf831Edit().ranges, `${name}: preserve prior edit`);
+    assert.strictEqual(combined.creates[0].path, NF831_CREATE_PATH, `${name}: add missing create`);
+    const correction = nf831LastUserText(partialThenCreate.state.requests[1]);
+    assert.ok(correction.includes(NF831_CREATE_PATH), `${name}: name exact missing path`);
+    assert.match(correction, /create/, `${name}: name exact missing action`);
+    assert.ok(!correction.includes(NF831_EDIT_PATH), `${name}: never request completed edit again`);
+
+    const onePass = nf831Model(native, [complete]);
+    const onePassResult = JSON.parse(await run(
+      onePass.model, nf831Request(), undefined, invoke,
+    ));
+    assert.strictEqual(onePass.state.turns, 1, `${name}: complete envelope stays one-pass`);
+    assert.strictEqual(onePassResult.edits[0].path, NF831_EDIT_PATH);
+    assert.strictEqual(onePassResult.creates[0].path, NF831_CREATE_PATH);
+
+    const repeated = nf831Model(native, [editOnly]);
+    await assert.rejects(
+      () => run(repeated.model, nf831Request(), undefined, invoke),
+      (error) => {
+        assert.match(String(error && error.message || error), /vscode_lm_finalization_nonprogress/);
+        assert.strictEqual(error.nonprogressReason, "repeated_missing_required_create");
+        assert.strictEqual(error.missingCreatePath, NF831_CREATE_PATH);
+        assert.strictEqual(error.missingCreateAction, "v3_create");
+        return true;
+      },
+      `${name}: repeated partial must terminate with the existing typed reason`,
+    );
+    assert.strictEqual(repeated.state.turns, 2, `${name}: nonprogress termination stays bounded`);
+  }
+}
+
 async function main() {
+  await nf831DirectFinalSubsetChecks();
   const schema = internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA;
   const allowed = ["src/*.py", "tests/*.py"];
   const contracts = {
