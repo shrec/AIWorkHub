@@ -4188,7 +4188,11 @@ def create_task(
     declared_risk_tier = risk_tier
     try:
         risk_signals = quality_evidence.derive_risk_signals(
-            {"task_type": task_type, "validation": validation2},
+            {
+                "task_type": task_type,
+                "validation": validation2,
+                "read_only": read_only,
+            },
             writes2,
         )
         risk_tier = quality_evidence.resolve_risk_profile(

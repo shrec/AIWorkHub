@@ -490,11 +490,13 @@ def derive_risk_signals(
         project_context = card.get("project_context")
         if isinstance(project_context, Mapping):
             task_type = str(project_context.get("task_type") or "").strip().lower()
-    if task_type == "code" or any(
+    read_only = card.get("read_only") is True
+    code_change = (task_type == "code" and not read_only) or any(
         Path(path).suffix.lower() in _SOURCE_CODE_SUFFIXES for path in paths
-    ):
+    )
+    if code_change:
         signals.add("code_change")
-    if task_type == "code" and not (card.get("validation") or []):
+    if code_change and task_type == "code" and not (card.get("validation") or []):
         signals.add("missing_validation")
     if len(paths) > 1:
         signals.add("combined_change")

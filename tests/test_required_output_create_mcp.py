@@ -633,6 +633,9 @@ def test_create_from_template_real_core_accepts_every_template_id(
             objective="Create from the authenticated template.",
         )
         assert card["task_type"] in _CANONICAL_TASK_TYPES
+        if card["read_only"]:
+            assert result["risk_signals"] == []
+            assert result["risk_tier"] == "low"
         created.append(template_id)
     assert created == list(TEMPLATE_IDS)
 

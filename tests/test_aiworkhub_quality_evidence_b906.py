@@ -482,6 +482,16 @@ def _code_card() -> dict:
     return {"task_id": "T-1", "task_type": "code", "validation": ["pytest -q"]}
 
 
+def test_read_only_code_card_without_candidate_paths_has_no_code_risk():
+    card = {"task_type": "code", "read_only": True, "validation": []}
+
+    assert qe.derive_risk_signals(card, []) == []
+    assert qe.derive_risk_signals(card, ["src/changed.py"]) == [
+        "code_change",
+        "missing_validation",
+    ]
+
+
 def test_review_ready_risk_observation_names_the_tier_and_its_lenses():
     observation = qe.review_ready_risk_observation(
         _code_card(),
