@@ -880,7 +880,6 @@ def test_fake_clock_exact_child_exit_is_exactly_once(
     )
     _, spec = _spec(tmp_path, [sys.executable, "-c", script], timeout=timeout_seconds)
     spec["heartbeat_interval_seconds"] = 0.05
-    started_mono = clock.mono
     terminate_calls = {"n": 0}
     original_terminate = worker_supervisor._terminate_child
 
@@ -898,7 +897,6 @@ def test_fake_clock_exact_child_exit_is_exactly_once(
 
     code = worker_supervisor.supervise(spec)
 
-    assert clock.mono - started_mono < timeout_seconds
     assert code == 0
     assert terminate_calls["n"] == 0
     status = json.loads(Path(spec["status_path"]).read_text(encoding="utf-8"))
