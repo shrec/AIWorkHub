@@ -11934,11 +11934,24 @@ class ProcessManager:
                                             or "research_result_missing"
                                         )
                                     )
+                            try:
+                                risk_card = _parse_card(
+                                    self._show_task(str(metadata["task_id"])),
+                                    str(metadata["task_id"]),
+                                )
+                            except Exception:  # noqa: BLE001 -- description never fails a candidate
+                                risk_card = dict(metadata)
                             quality_gate = {
                                 "schema_id": "aiworkhub.completion_quality_gate.v1",
                                 "applicable": False,
                                 "passed": None,
                                 "reason": "research_no_repository_change",
+                                "review_risk_profile": (
+                                    quality_evidence.review_ready_risk_observation(
+                                        risk_card,
+                                        [],
+                                    )
+                                ),
                                 "changed_paths": [],
                                 "checks": [],
                                 "blocking_checks": [],

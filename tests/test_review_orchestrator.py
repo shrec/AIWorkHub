@@ -925,8 +925,20 @@ def test_automatic_chain_stops_at_acceptance_and_never_accepts_the_target(
     assert len(aggregate["reviews"]) == 3
 
 
+@pytest.mark.parametrize(
+    ("required_reviewer_lenses", "effective_tier", "expected_lenses"),
+    [
+        (None, "", list(review_orchestrator.LENSES)),
+        ([], "low", []),
+    ],
+    ids=("unplanned-fail-closed", "low-zero-reviewers"),
+)
 def test_canonical_chain_publishes_one_manager_callback_after_all_reviews(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    required_reviewer_lenses: list[str] | None,
+    effective_tier: str,
+    expected_lenses: list[str],
 ) -> None:
     """The manager wake is a projection of the completed quality chain only."""
 
@@ -989,8 +1001,10 @@ def test_canonical_chain_publishes_one_manager_callback_after_all_reviews(
         packet_sha256="a" * 64,
         candidate_sha256="b" * 64,
         now=NOW,
+        required_reviewer_lenses=required_reviewer_lenses,
+        effective_tier=effective_tier,
     )
-    for lens in review_orchestrator.LENSES:
+    for lens in expected_lenses:
         manager.status_results["review-request-" + lens] = _review_status(lens)
 
     conn = sqlite3.connect(db_path)
@@ -1004,7 +1018,8 @@ def test_canonical_chain_publishes_one_manager_callback_after_all_reviews(
     stored = task_store.get_task(tmp_path, "TARGET")
     marker = task_store.manager_ready_marker(stored or {})
     assert marker is not None
-    assert marker["manager_ready"]["lenses"] == list(review_orchestrator.LENSES)
+    assert marker["manager_ready"]["lenses"] == expected_lenses
+    assert [launch["lens"] for launch in manager.launches] == expected_lenses
     conn = sqlite3.connect(db_path)
     try:
         callback = conn.execute(
@@ -2554,6 +2569,21 @@ def test_registration_carries_the_tier_from_the_finalizers_own_gate_record() -> 
     )
     assert registration["effective_tier"] == "high"
     assert registration["required_reviewer_lenses"] == ["correctness", "security"]
+
+    low = review_orchestrator.candidate_registration(
+        metadata={"task_id": "TARGET", "request_id": "target-request", "claim_epoch": 1},
+        artifact_receipt={"manifest_sha256": "a" * 64},
+        changed_path_hashes={},
+        quality_gate={
+            "review_risk_profile": {
+                "effective_tier": "low",
+                "required_reviewer_lenses": [],
+                "error": "",
+            }
+        },
+    )
+    assert low["effective_tier"] == "low"
+    assert low["required_reviewer_lenses"] == []
 
     # A gate whose observation failed plans nothing, so every lens runs.
     degraded = review_orchestrator.candidate_registration(

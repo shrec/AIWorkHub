@@ -406,6 +406,11 @@ def test_successful_readonly_research_reaches_review_ready(
     assert event is not None and event["state"] == "review_ready"
     assert event["changed_paths"] == []
     assert event["quality_gate"]["applicable"] is False
+    assert event["quality_gate"]["reason"] == "research_no_repository_change"
+    risk_profile = event["quality_gate"]["review_risk_profile"]
+    assert risk_profile["effective_tier"] == "low"
+    assert risk_profile["signals"] == []
+    assert risk_profile["required_reviewer_lenses"] == []
     assert captured[0]["substatus"] == "review_ready"
     evidence = captured[0]["evidence"]
     assert evidence["changed_path_hashes"] == {}
