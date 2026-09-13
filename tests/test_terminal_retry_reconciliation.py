@@ -158,6 +158,9 @@ def test_retry_terminal_requeues_only_exact_operational_episode(
     assert card["review_feedback"]["schema_id"].endswith(".v1")
     assert card["rework_predecessor"]["schema_id"].endswith(".v1")
     assert card["terminal_retry"]["request_id"] == request_id
+    assert card["terminal_retry"]["task_id"] == task_id
+    assert card["terminal_retry"]["runner"] == "worker_runner"
+    assert card["terminal_retry"]["claim_epoch"] == 7
     assert card["terminal_retry"]["terminal_substatus"] == substatus
     for cleared in (
         "launch_request_id",
@@ -693,6 +696,145 @@ def test_reroute_launch_identity_uses_current_manager_rejection_over_stale_retry
     assert authorization["request_id"] == predecessor["request_id"]
     assert authorization["claim_epoch"] == predecessor["claim_epoch"]
     assert result["manager_rejection_authorization"] == authorization
+
+
+def test_reroute_launch_identity_allows_exact_terminal_retry_rework_epoch(
+    coordinator_repo: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = "REROUTE_REJECTED_AFTER_OPERATIONAL_RETRY"
+    predecessor = _retained_predecessor(coordinator_repo, task_id=task_id)
+    manager_fields = _manager_rejection_fields(predecessor)
+    retry_epoch = predecessor["claim_epoch"] + 1
+    manager_fields.update({
+        "claim_epoch": retry_epoch,
+        "terminal_retry": {
+            "schema_id": "aiworkhub.terminal_retry.v1",
+            "task_id": task_id,
+            "request_id": "f" * 32,
+            "runner": "glm_5.3",
+            "claim_epoch": retry_epoch,
+            "terminal_substatus": "cancelled",
+            "reason": "bounded editor-hosted nonprogress",
+            "retried_at": "2026-08-03T00:02:00+00:00",
+        },
+    })
+    monkeypatch.setattr(
+        worker_workspace,
+        "changed_paths",
+        lambda _workspace, **_kwargs: ["out/result.json"],
+    )
+    monkeypatch.setattr(
+        workforce_catalog,
+        "build_catalog",
+        lambda _repo: {
+            "workers": [{
+                "execution_runner": "deepseek_v4-pro",
+                "effective_adapter_id": "deepseek_vscode_lm",
+                "model": "deepseek-v4-pro",
+                "enabled": True,
+                "launch_eligible": True,
+                "available": True,
+                "max_risk": "critical",
+            }]
+        },
+    )
+    _insert_pending_reroutable(
+        coordinator_repo,
+        task_id=task_id,
+        runner="glm_5.3",
+        terminal_retry=manager_fields["terminal_retry"],
+        rework_predecessor=predecessor,
+        risk_tier="high",
+        card_overrides=manager_fields,
+    )
+
+    result = core.reroute_launch_identity(
+        task_id,
+        from_runner="glm_5.3",
+        to_runner="deepseek_v4-pro",
+        to_adapter_id="deepseek_vscode_lm",
+        to_model="deepseek-v4-pro",
+    )
+
+    assert result["ok"] is True, result
+    rebind = result["manager_rejection_authorization"]["terminal_retry_rebind"]
+    assert rebind["claim_epoch"] == retry_epoch
+    assert len(rebind["terminal_retry_sha256"]) == 64
+
+
+@pytest.mark.parametrize(
+    ("tampered_field", "tampered_value"),
+    [
+        ("task_id", "OTHER_TASK"),
+        ("runner", "other_runner"),
+        ("claim_epoch", 1),
+    ],
+)
+def test_reroute_launch_identity_rejects_tampered_terminal_retry_rework_epoch(
+    coordinator_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tampered_field: str,
+    tampered_value: object,
+) -> None:
+    task_id = f"REROUTE_REJECTED_TAMPERED_{tampered_field.upper()}"
+    predecessor = _retained_predecessor(coordinator_repo, task_id=task_id)
+    manager_fields = _manager_rejection_fields(predecessor)
+    retry_epoch = predecessor["claim_epoch"] + 1
+    terminal_retry = {
+        "schema_id": "aiworkhub.terminal_retry.v1",
+        "task_id": task_id,
+        "request_id": "f" * 32,
+        "runner": "glm_5.3",
+        "claim_epoch": retry_epoch,
+        "terminal_substatus": "cancelled",
+        "reason": "bounded editor-hosted nonprogress",
+        "retried_at": "2026-08-03T00:02:00+00:00",
+    }
+    terminal_retry[tampered_field] = tampered_value
+    manager_fields.update({
+        "claim_epoch": retry_epoch,
+        "terminal_retry": terminal_retry,
+    })
+    monkeypatch.setattr(
+        worker_workspace,
+        "changed_paths",
+        lambda _workspace, **_kwargs: ["out/result.json"],
+    )
+    monkeypatch.setattr(
+        workforce_catalog,
+        "build_catalog",
+        lambda _repo: {
+            "workers": [{
+                "execution_runner": "deepseek_v4-pro",
+                "effective_adapter_id": "deepseek_vscode_lm",
+                "model": "deepseek-v4-pro",
+                "enabled": True,
+                "launch_eligible": True,
+                "available": True,
+                "max_risk": "critical",
+            }]
+        },
+    )
+    _insert_pending_reroutable(
+        coordinator_repo,
+        task_id=task_id,
+        runner="glm_5.3",
+        terminal_retry=terminal_retry,
+        rework_predecessor=predecessor,
+        risk_tier="high",
+        card_overrides=manager_fields,
+    )
+
+    result = core.reroute_launch_identity(
+        task_id,
+        from_runner="glm_5.3",
+        to_runner="deepseek_v4-pro",
+        to_adapter_id="deepseek_vscode_lm",
+        to_model="deepseek-v4-pro",
+    )
+
+    assert result["ok"] is False
+    assert "reroute_manager_rejection_identity_mismatch" in result["stderr"]
 
 
 def test_reroute_launch_identity_allows_exact_recovered_rework_epoch(

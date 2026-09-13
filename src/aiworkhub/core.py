@@ -6796,7 +6796,10 @@ def retry_terminal_task(
         claimed_by=None,
         terminal_retry={
             "schema_id": "aiworkhub.terminal_retry.v1",
+            "task_id": task_id,
             "request_id": request_id,
+            "runner": str(card.get("runner") or ""),
+            "claim_epoch": card.get("claim_epoch"),
             "terminal_substatus": terminal_substatus,
             "reason": bounded_reason,
             "retried_at": now,
@@ -7180,6 +7183,25 @@ def _verified_manager_rejection_receipt(
         )
     )
     recovery_rebind = direct_rebind or sequential_rebind
+    terminal_retry = card.get("terminal_retry")
+    terminal_retry_rebind = (
+        type(claim_epoch) is int
+        and type(current_claim_epoch) is int
+        and current_claim_epoch > claim_epoch
+        and isinstance(terminal_retry, dict)
+        and terminal_retry.get("schema_id") == "aiworkhub.terminal_retry.v1"
+        and str(terminal_retry.get("task_id") or "").strip() == task_id
+        and str(terminal_retry.get("runner") or "").strip()
+        == str(card.get("runner") or "").strip()
+        and re.fullmatch(
+            r"[0-9a-f]{32}", str(terminal_retry.get("request_id") or "").strip()
+        )
+        is not None
+        and terminal_retry.get("terminal_substatus")
+        in _RETRYABLE_OPERATIONAL_TERMINAL_SUBSTATUSES
+        and type(terminal_retry.get("claim_epoch")) is int
+        and terminal_retry.get("claim_epoch") == current_claim_epoch
+    )
     if (
         rejection.get("schema_id") != "aiworkhub.rejection_disposition.v1"
         or rejection.get("to") != "pending"
@@ -7191,7 +7213,11 @@ def _verified_manager_rejection_receipt(
         or str(predecessor.get("request_id") or "").strip() != request_id
         or type(claim_epoch) is not int
         or claim_epoch < 1
-        or (current_claim_epoch != claim_epoch and not recovery_rebind)
+        or (
+            current_claim_epoch != claim_epoch
+            and not recovery_rebind
+            and not terminal_retry_rebind
+        )
     ):
         return None, "reroute_manager_rejection_identity_mismatch"
 
@@ -7249,6 +7275,12 @@ def _verified_manager_rejection_receipt(
             "recovery_epoch": recovery_epoch,
             "recovery_predecessor_sha256": digest(recovery),
             "terminal_failure_sha256": digest(terminal_failure),
+        }
+    if terminal_retry_rebind:
+        receipt["terminal_retry_rebind"] = {
+            "schema_id": "aiworkhub.manager_rejection_terminal_retry_rebind.v1",
+            "claim_epoch": current_claim_epoch,
+            "terminal_retry_sha256": digest(terminal_retry),
         }
     return receipt, None
 
