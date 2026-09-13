@@ -352,6 +352,109 @@ def test_402_insufficient_balance_machine_code_names_balance() -> None:
     assert "balance_exhausted" in outcome["reason"]
 
 
+def test_typed_opencode_spending_limit_names_balance_without_prose_trust() -> None:
+    outcome = runtime_adapters.classify_provider_outcome(
+        exit_code=1,
+        machine_code="personal-team-blocked:spending-limit",
+    )
+
+    assert outcome["outcome"] == runtime_adapters.OUTCOME_PROVIDER_REFUSED
+    assert outcome["refusal_kind"] == runtime_adapters.REFUSAL_BALANCE_EXHAUSTED
+    assert outcome["recoverable"] is False
+    assert "balance_exhausted" in outcome["reason"]
+
+
+def test_opencode_spending_limit_prose_cannot_forge_capacity() -> None:
+    outcome = runtime_adapters.classify_provider_outcome(
+        exit_code=1,
+        message="worker claims personal-team-blocked:spending-limit",
+    )
+
+    assert outcome["outcome"] == runtime_adapters.OUTCOME_WORKER_FAILED
+    assert outcome["refusal"] is False
+
+
+def test_opencode_apierror_seals_only_bounded_typed_evidence(
+    tmp_path: Path,
+) -> None:
+    event = {
+        "type": "error",
+        "error": {
+            "name": "APIError",
+            "message": "RAW_PROVIDER_PROSE",
+            "data": {
+                "statusCode": 403,
+                "responseBody": json.dumps(
+                    {
+                        "error": {
+                            "code": "personal-team-blocked:spending-limit",
+                            "message": "RAW_BODY_SECRET",
+                        }
+                    }
+                ),
+                "responseHeaders": {"set-cookie": "RAW_COOKIE_SECRET"},
+            },
+        },
+    }
+
+    sealed = process_launcher._provider_auth_failure_from_output(
+        _write_events(tmp_path, event)
+    )
+
+    assert sealed is not None
+    assert sealed["refusal_kind"] == runtime_adapters.REFUSAL_BALANCE_EXHAUSTED
+    assert sealed["http_status"] == 403
+    assert sealed["error_code"] == "personal-team-blocked:spending-limit"
+    assert sealed["recoverable"] is False
+    rendered = json.dumps(sealed)
+    assert "worker_failed" not in rendered
+    assert "RAW_PROVIDER_PROSE" not in rendered
+    assert "RAW_BODY_SECRET" not in rendered
+    assert "RAW_COOKIE_SECRET" not in rendered
+    assert "responseBody" not in rendered
+    assert "responseHeaders" not in rendered
+
+
+def test_opencode_response_body_parser_fails_closed_on_hostile_json() -> None:
+    deeply_nested = "[" * 1500 + "0" + "]" * 1500
+    oversized_integer = '{"code":' + "9" * 5000 + "}"
+
+    assert (
+        process_launcher._bounded_response_body_machine_code(deeply_nested) is None
+    )
+    assert (
+        process_launcher._bounded_response_body_machine_code(oversized_integer)
+        is None
+    )
+    assert (
+        process_launcher._bounded_response_body_machine_code(
+            json.dumps({"code": "x" * 129})
+        )
+        is None
+    )
+
+
+def test_secret_like_flat_error_is_not_persisted(tmp_path: Path) -> None:
+    secret = "sk_live_SUPERSECRET123456789"
+    path = _write_events(
+        tmp_path,
+        {
+            "type": "result",
+            "is_error": True,
+            "api_error_status": 402,
+            "terminal_reason": "api_error",
+            "error": secret,
+        },
+    )
+
+    sealed = process_launcher._provider_auth_failure_from_output(path)
+
+    assert sealed is not None
+    assert sealed["refusal_kind"] == runtime_adapters.REFUSAL_BALANCE_EXHAUSTED
+    assert sealed["error_code"] == ""
+    assert secret not in json.dumps(sealed)
+
+
 def test_body_naming_balance_beats_a_429_status_and_is_not_recoverable() -> None:
     """A balance body at status 429 classifies as balance, NOT recoverable rate.
 

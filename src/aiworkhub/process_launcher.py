@@ -2601,6 +2601,88 @@ def _strip_project_context_receipt_prefix(text: str) -> str:
     return "\n".join(kept).strip()
 
 
+def _is_bounded_machine_code(value: str) -> bool:
+    """Return whether ``value`` is a short ASCII machine identifier, not prose."""
+
+    if not value or len(value) > 128 or not value[0].isalnum():
+        return False
+    return all(
+        char.isascii() and (char.isalnum() or char in "._:/-")
+        for char in value
+    )
+
+
+def _bounded_response_body_machine_code(body_text: object) -> str | None:
+    """Extract only a bounded code/type from a small JSON response body."""
+
+    if not isinstance(body_text, str) or not body_text or len(body_text) > 8192:
+        return None
+    try:
+        body = json.loads(body_text)
+    except (json.JSONDecodeError, RecursionError, ValueError):
+        return None
+    if not isinstance(body, dict):
+        return None
+    candidates: list[object] = []
+    nested_error = body.get("error")
+    if isinstance(nested_error, dict):
+        candidates.extend((nested_error.get("code"), nested_error.get("type")))
+    candidates.extend((body.get("code"), body.get("type")))
+    for candidate in candidates:
+        if not isinstance(candidate, str):
+            continue
+        code = candidate.strip().lower()
+        if _is_bounded_machine_code(code):
+            return code
+    return None
+
+
+def _opencode_provider_refusal_from_event(
+    event: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Seal a provider-owned OpenCode APIError without retaining its raw body."""
+
+    if event.get("type") != "error":
+        return None
+    error = event.get("error")
+    if not isinstance(error, dict) or error.get("name") != "APIError":
+        return None
+    data = error.get("data")
+    if not isinstance(data, dict):
+        return None
+    raw_status = data.get("statusCode")
+    if (
+        not isinstance(raw_status, int)
+        or isinstance(raw_status, bool)
+        or not 400 <= raw_status <= 599
+    ):
+        return None
+    machine_code = _bounded_response_body_machine_code(data.get("responseBody"))
+    if machine_code is None:
+        return None
+    typed_spending_limit = machine_code == "personal-team-blocked:spending-limit"
+    if not (
+        typed_spending_limit
+        or runtime_adapters.provider_body_names_cause(machine_code)
+    ):
+        return None
+    outcome = runtime_adapters.classify_provider_outcome(
+        exit_code=1,
+        message=f"http_status={raw_status}",
+        machine_code=machine_code,
+    )
+    if outcome.get("outcome") != runtime_adapters.OUTCOME_PROVIDER_REFUSED:
+        return None
+    return {
+        "schema_id": "aiworkhub.provider_launch_failure.v1",
+        "reason": str(outcome.get("reason") or "provider_refused"),
+        "refusal_kind": str(outcome.get("refusal_kind") or ""),
+        "recoverable": bool(outcome.get("recoverable")),
+        "http_status": raw_status,
+        "error_code": machine_code,
+    }
+
+
 def _provider_auth_failure_from_output(path: Path) -> dict[str, Any] | None:
     """Return a bounded, body-classified provider-refusal record, no secret text.
 
@@ -2650,9 +2732,21 @@ def _provider_auth_failure_from_output(path: Path) -> dict[str, Any] | None:
             continue
         if not isinstance(event, dict):
             continue
+        opencode_refusal = _opencode_provider_refusal_from_event(event)
+        if opencode_refusal is not None:
+            return opencode_refusal
         raw_status = event.get("error_status", event.get("api_error_status"))
         status = raw_status if isinstance(raw_status, int) and not isinstance(raw_status, bool) else 0
-        error_code = str(event.get("error") or "").strip().lower()
+        raw_error = event.get("error")
+        error_code = ""
+        if isinstance(raw_error, str):
+            candidate_code = raw_error.strip().lower()
+            if _is_bounded_machine_code(candidate_code) and (
+                candidate_code
+                in {"authentication_failed", "unauthorized", "invalid_api_key"}
+                or runtime_adapters.provider_body_names_cause(candidate_code)
+            ):
+                error_code = candidate_code
         subtype = str(event.get("subtype") or "").strip().lower()
         structured_auth_error = error_code in {
             "authentication_failed",

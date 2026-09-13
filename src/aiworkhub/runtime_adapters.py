@@ -2047,7 +2047,11 @@ def _refusal_kind(lowered: str, status_code: int | None) -> str | None:
 
 
 def classify_provider_outcome(
-    *, exit_code: int, message: str = "", stderr: str = ""
+    *,
+    exit_code: int,
+    message: str = "",
+    stderr: str = "",
+    machine_code: str = "",
 ) -> dict[str, Any]:
     """Classify a worker exit as provider refusal, worker crash, or clean exit.
 
@@ -2087,6 +2091,16 @@ def classify_provider_outcome(
 
     status_code = _provider_status_code(lowered)
     kind = _refusal_kind(lowered, status_code)
+    # NF-2026-00822: this OpenCode/Kilo capacity signal is authoritative only
+    # when it arrived through the typed APIError envelope.  Deliberately keep it
+    # out of the free-form refusal vocabulary above so model/worker prose cannot
+    # forge a route-capacity seal.
+    if (
+        isinstance(machine_code, str)
+        and machine_code.strip().lower()
+        == "personal-team-blocked:spending-limit"
+    ):
+        kind = REFUSAL_BALANCE_EXHAUSTED
     if kind is None:
         return {
             "schema_id": PROVIDER_OUTCOME_SCHEMA_ID,

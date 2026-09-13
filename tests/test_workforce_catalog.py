@@ -1535,6 +1535,45 @@ def test_authenticated_http_402_quota_opens_exact_route_after_one_failure(
     assert "worker_unavailable" in pro_candidate["exclusion_reasons"]
 
 
+def test_nf822_spending_limit_opens_only_the_exact_route(tmp_path: Path) -> None:
+    root = _root(tmp_path)
+    now = 2_000_000_000.0
+    row = _sealed_route_row(
+        request_id="opencode-spending-limit",
+        model="deepseek-v4-pro",
+        code="personal-team-blocked:spending-limit",
+        http_status=403,
+        epoch=now - 15,
+    )
+    row["provider_error"]["refusal_kind"] = "balance_exhausted"
+
+    snapshot = workforce_catalog.build_catalog(
+        root,
+        cards=[],
+        process_rows=[row],
+        preflight=_deepseek_preflight(),
+        now_epoch=now,
+    )
+    pro = next(
+        worker
+        for worker in snapshot["workers"]
+        if worker["worker_id"] == "deepseek-v4-pro"
+    )
+    flash = next(
+        worker
+        for worker in snapshot["workers"]
+        if worker["worker_id"] == "deepseek-v4-flash"
+    )
+
+    assert pro["available"] is False
+    assert pro["route_health"]["state"] == "open"
+    assert pro["route_health"]["scope"] == "exact_adapter_and_model"
+    assert pro["route_health"]["consecutive_failures"] == 1
+    assert flash["available"] is True
+    assert flash["launch_eligible"] is True
+    assert flash["route_health"]["state"] == "closed"
+
+
 def test_invalid_grant_and_unknown_refresh_token_open_auth_route_after_one(
     tmp_path: Path,
 ) -> None:
