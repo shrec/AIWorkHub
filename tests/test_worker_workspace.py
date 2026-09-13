@@ -2421,6 +2421,77 @@ def test_validate_required_outputs_replay_authorization_permits_hash_pinned_unch
             worker_workspace.cleanup_workspace(repo, successor.path, successor.home)
         worker_workspace.cleanup_workspace(repo, predecessor.path, predecessor.home)
 
+
+def test_validate_required_outputs_replay_authorization_permits_retained_delta_against_new_parent(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    repo: Path,
+) -> None:
+    monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "worktrees"))
+    predecessor = worker_workspace.create_workspace(
+        repo,
+        "replay-delta-predecessor",
+        {"allowed_writes": ["out/result.txt"]},
+        "validation",
+    )
+    successor = None
+    try:
+        candidate = predecessor.path / "out" / "result.txt"
+        candidate.write_bytes(b"retained-result-v2\n")
+        candidate_hash = hashlib.sha256(candidate.read_bytes()).hexdigest()
+        successor = worker_workspace.create_workspace(
+            repo,
+            "replay-delta-successor",
+            {
+                "allowed_writes": ["out/result.txt"],
+                "rework_predecessor": {
+                    "schema_id": "aiworkhub.rework_predecessor.v1",
+                    "request_id": "replay-delta-predecessor",
+                    "workspace": predecessor.as_metadata(),
+                    "changed_path_hashes": {"out/result.txt": candidate_hash},
+                },
+            },
+            "validation",
+        )
+        assert successor.parent_baseline["out/result.txt"] != successor.workspace_baseline[
+            "out/result.txt"
+        ]
+
+        authorization = {
+            "task_id": "T-REPLAY-DELTA",
+            "actor": "codex",
+            "predecessor_request_id": "replay-delta-predecessor",
+            "changed_path_hashes": {"out/result.txt": candidate_hash},
+            "authorized_at": "2026-09-13T00:00:00+00:00",
+            "next_claim_epoch": 4,
+            "one_episode_binding": True,
+        }
+        records = worker_workspace.validate_required_outputs(
+            successor,
+            ["out/result.txt"],
+            replay_authorization=authorization,
+            replay_task_id="T-REPLAY-DELTA",
+            replay_actor="codex",
+            replay_predecessor_request_id="replay-delta-predecessor",
+            replay_claim_epoch=4,
+            strict_rework_inheritance=True,
+        )
+        assert records[0]["unchanged_allowed"] is True
+        assert records[0]["replay_evidence"]["sha256"] == candidate_hash
+
+        with pytest.raises(
+            worker_workspace.WorkspaceError, match="required_output_mismatch:"
+        ):
+            worker_workspace.validate_required_outputs(
+                successor,
+                ["out/result.txt"],
+                strict_rework_inheritance=True,
+            )
+    finally:
+        if successor is not None:
+            worker_workspace.cleanup_workspace(repo, successor.path, successor.home)
+        worker_workspace.cleanup_workspace(repo, predecessor.path, predecessor.home)
+
 def test_residual_contract_allows_only_declared_json_pointer_changes(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

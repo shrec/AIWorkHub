@@ -5904,7 +5904,13 @@ def validate_required_outputs(
                         legacy_error_codes.append(f"required_output_unchanged:{relative}")
                         continue
                 parent_hash = workspace.parent_baseline.get(relative)
-                if current_hash != parent_hash:
+                # An authenticated validation-only replay is deliberately
+                # proving a retained predecessor delta against a newer
+                # canonical parent.  Its exact bytes are already bound by
+                # task, actor, predecessor request, claim epoch, path and raw
+                # SHA-256 in ``replay_evidence``.  Parent equality remains a
+                # requirement only for the ordinary allow-unchanged contract.
+                if replay_evidence is None and current_hash != parent_hash:
                     scope_violations.append(
                         {
                             "path": relative,

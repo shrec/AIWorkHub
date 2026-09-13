@@ -6,6 +6,21 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.32] - 2026-09-13
+
+### Fixed
+
+- Authenticated validation-only replay now accepts an exact retained candidate
+  whose bytes differ from the current canonical parent, while continuing to
+  bind the replay to task, actor, predecessor request, claim epoch, path and
+  SHA-256.
+
+### Validation
+
+- Regression coverage exercises a retained predecessor delta against a newer
+  parent and proves that the same unchanged delta still fails closed without
+  the one-episode replay authorization.
+
 ## [0.11.31] - 2026-09-13
 
 ### Fixed

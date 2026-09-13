@@ -1,5 +1,13 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.32 — 2026-09-13
+
+### Fixed
+
+- Validation-only replay accepts the exact authenticated retained delta when
+  the canonical parent has advanced, without widening ordinary unchanged-file
+  allowances.
+
 ## 0.11.31 — 2026-09-13
 
 ### Fixed
