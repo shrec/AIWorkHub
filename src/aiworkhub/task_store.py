@@ -2762,6 +2762,60 @@ def manager_ready_marker(card: Mapping[str, Any]) -> dict[str, Any] | None:
     return dict(receipt)
 
 
+def _prior_receipt_episode(receipt: object) -> tuple[str, str] | None:
+    """Return the ``(request_id, claim_epoch)`` a stored receipt is bound to."""
+
+    aggregate = receipt.get("manager_ready") if isinstance(receipt, Mapping) else None
+    if not isinstance(aggregate, Mapping):
+        return None
+    request_id = str(aggregate.get("target_request_id") or "")
+    claim_epoch = str(aggregate.get("claim_epoch") or "")
+    if not request_id or not claim_epoch:
+        return None
+    return request_id, claim_epoch
+
+
+def _receipt_canonical_json(receipt: object) -> str | None:
+    """Return the canonical serialization used for receipt equality checks."""
+
+    try:
+        return json.dumps(
+            receipt, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def _stored_receipt_is_authenticated(
+    db_path: str | Path,
+    task_id: str,
+    receipt: object,
+    prior_episode: tuple[str, str],
+) -> bool:
+    """True only when a stored receipt re-authenticates through review_lifecycle.
+
+    A card-stored marker is not trusted on its own: comparing the card's stored
+    SHA against the same card-stored payload is circular.  Re-reading the exact
+    old episode through ``review_lifecycle`` re-verifies every chain row and
+    action digest, so the stored bytes must equal that independently
+    authenticated manager-ready receipt before a stale marker may be replaced.
+    """
+
+    prior_request_id, prior_claim_epoch = prior_episode
+    try:
+        authenticated = review_lifecycle.manager_ready_receipt_for_target(
+            db_path,
+            target_task_id=task_id,
+            target_request_id=prior_request_id,
+            claim_epoch=prior_claim_epoch,
+        )
+    except review_lifecycle.ReviewLifecycleError:
+        return False
+    if authenticated is None:
+        return False
+    return _receipt_canonical_json(receipt) == _receipt_canonical_json(authenticated)
+
+
 def publish_manager_ready(
     root: str | Path,
     *,
@@ -2775,6 +2829,10 @@ def publish_manager_ready(
     it through ``review_lifecycle`` authenticates the whole chain, so neither a
     caller payload nor an uncommitted orchestrator effect can mint manager-ready
     state.  Card marker, event, and callback row commit in one transaction.
+    A stored receipt bound to an older request/claim episode is stale rework
+    history: once the checks below bind the card to the current episode, that
+    stale receipt is replaced inside this same transaction, while a distinct
+    receipt bound to the current episode remains a fail-closed conflict.
     """
 
     _readiness, db_path = _require_ready(root)
@@ -2827,8 +2885,16 @@ def publish_manager_ready(
             conn.rollback()
             return False, "manager_ready_target_identity_mismatch", False
         if existing not in (None, {}) and existing != receipt:
-            conn.rollback()
-            return False, "manager_ready_receipt_conflict", False
+            prior_episode = _prior_receipt_episode(existing)
+            if (
+                prior_episode is None
+                or prior_episode == (request_id, str(claim_epoch))
+                or not _stored_receipt_is_authenticated(
+                    db_path, task_id, existing, prior_episode
+                )
+            ):
+                conn.rollback()
+                return False, "manager_ready_receipt_conflict", False
         now = datetime.now(timezone.utc).isoformat()
         card["manager_ready_receipt"] = receipt
         card["manager_ready_receipt_sha256"] = receipt_sha256

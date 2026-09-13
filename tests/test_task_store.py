@@ -5,7 +5,9 @@ import json
 import os
 import sqlite3
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -1665,3 +1667,284 @@ def test_write_lease_converts_a_busy_timeout_failure_into_waiting(
         assert check.execute("SELECT COUNT(*) FROM probe").fetchone()[0] == 2
     finally:
         check.close()
+
+
+def _manager_ready_receipt_sha256(receipt: dict[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            receipt, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _complete_authenticated_chain(
+    db_path: Path,
+    *,
+    target_task_id: str,
+    target_request_id: str,
+    claim_epoch: str,
+    packet_sha256: str,
+    candidate_sha256: str,
+    reviews: list[dict[str, Any]] | None = None,
+    lenses: list[str] | None = None,
+) -> dict[str, Any]:
+    """Complete every action of one review chain so action 9 is manager-ready."""
+    now = datetime(2026, 7, 22, 12, 0, 0, tzinfo=timezone.utc)
+    owner = "nf825-test-owner"
+    lease_token = "nf825-test-lease"
+    chain = review_lifecycle.create_or_replay_chain(
+        db_path,
+        target_task_id=target_task_id,
+        target_request_id=target_request_id,
+        claim_epoch=claim_epoch,
+        packet_sha256=packet_sha256,
+        candidate_sha256=candidate_sha256,
+        now=now,
+    )
+    reviews = list(reviews) if reviews is not None else [{"lens": "correctness", "ok": True}]
+    lenses = list(lenses) if lenses is not None else ["correctness"]
+    for _ in range(len(review_lifecycle.PLAN)):
+        action = review_lifecycle.reserve_next_action(
+            db_path, owner=owner, lease_token=lease_token, now=now
+        )
+        assert action is not None, "review chain did not expose all actions"
+        if action.action_index == 9:
+            receipt: dict[str, Any] = {
+                "manager_ready": {
+                    "schema_id": review_lifecycle.MANAGER_READY_SCHEMA_ID,
+                    "chain_id": chain.chain_id,
+                    "chain_identity_sha256": chain.chain_identity_sha256,
+                    "target_task_id": target_task_id,
+                    "target_request_id": target_request_id,
+                    "claim_epoch": str(claim_epoch),
+                    "packet_sha256": packet_sha256,
+                    "candidate_sha256": candidate_sha256,
+                    "reviews": reviews,
+                    "lenses": lenses,
+                },
+            }
+        else:
+            receipt = {"action_index": action.action_index, "ok": True}
+        assert review_lifecycle.complete_action(
+            db_path,
+            action_id=action.action_id,
+            owner=owner,
+            lease_token=lease_token,
+            receipt=receipt,
+            now=now,
+        )
+    authenticated = review_lifecycle.manager_ready_receipt_for_target(
+        db_path,
+        target_task_id=target_task_id,
+        target_request_id=target_request_id,
+        claim_epoch=claim_epoch,
+    )
+    assert authenticated is not None, "expected an authenticated manager-ready receipt"
+    return authenticated
+
+
+def _seed_review_ready_episode(
+    repo: Path,
+    task_id: str,
+    *,
+    request_id: str,
+    claim_epoch: str,
+    manager_ready_receipt: dict[str, Any] | None = None,
+) -> None:
+    """Insert a review-ready card bound to one exact request/claim episode."""
+    _insert_task(repo, task_id, status="review")
+    _readiness, db_path = task_store._require_ready(repo)
+    conn = sqlite3.connect(db_path)
+    try:
+        card = json.loads(
+            conn.execute(
+                "SELECT card_json FROM tasks WHERE task_id=?", (task_id,)
+            ).fetchone()[0]
+        )
+        card["claim_epoch"] = claim_epoch
+        card["terminal_substatus"] = "review_ready"
+        card["terminal_review"] = {
+            "substatus": "review_ready",
+            "evidence": {
+                "request_identity": {
+                    "request_id": request_id,
+                    "task_id": task_id,
+                    "runner": "codex_worker_b891",
+                },
+            },
+        }
+        if manager_ready_receipt is not None:
+            card["manager_ready_receipt"] = manager_ready_receipt
+            card["manager_ready_receipt_sha256"] = _manager_ready_receipt_sha256(
+                manager_ready_receipt
+            )
+        conn.execute(
+            "UPDATE tasks SET worker_status='review', claimed_by='codex_worker_b891', "
+            "card_json=? WHERE task_id=?",
+            (json.dumps(card), task_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_publish_manager_ready_replaces_authenticated_stale_episode_receipt(
+    tmp_path: Path,
+) -> None:
+    """An older authenticated episode receipt must not block the current one."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    task_store.initialize_repository(repo)
+    _readiness, db_path = task_store._require_ready(repo)
+    stale = _complete_authenticated_chain(
+        db_path,
+        target_task_id="TASK",
+        target_request_id="req-old",
+        claim_epoch="1",
+        packet_sha256="a" * 64,
+        candidate_sha256="b" * 64,
+    )
+    current = _complete_authenticated_chain(
+        db_path,
+        target_task_id="TASK",
+        target_request_id="req-current",
+        claim_epoch="2",
+        packet_sha256="c" * 64,
+        candidate_sha256="d" * 64,
+    )
+    _seed_review_ready_episode(
+        repo,
+        "TASK",
+        request_id="req-current",
+        claim_epoch="2",
+        manager_ready_receipt=stale,
+    )
+
+    ok, status, _enqueued = task_store.publish_manager_ready(
+        repo, task_id="TASK", request_id="req-current", claim_epoch="2"
+    )
+
+    assert (ok, status) == (True, "review")
+    stored = task_store.get_task(repo, "TASK")
+    marker = task_store.manager_ready_marker(stored or {})
+    assert marker == current
+
+
+def test_publish_manager_ready_rejects_distinct_same_episode_receipt(
+    tmp_path: Path,
+) -> None:
+    """A distinct receipt bound to the current episode is a fail-closed conflict."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    task_store.initialize_repository(repo)
+    _readiness, db_path = task_store._require_ready(repo)
+    current = _complete_authenticated_chain(
+        db_path,
+        target_task_id="TASK",
+        target_request_id="req-a",
+        claim_epoch="1",
+        packet_sha256="a" * 64,
+        candidate_sha256="b" * 64,
+    )
+    forged = json.loads(json.dumps(current))
+    forged["manager_ready"]["reviews"] = [{"lens": "security", "ok": False}]
+    _seed_review_ready_episode(
+        repo,
+        "TASK",
+        request_id="req-a",
+        claim_epoch="1",
+        manager_ready_receipt=forged,
+    )
+
+    ok, status, enqueued = task_store.publish_manager_ready(
+        repo, task_id="TASK", request_id="req-a", claim_epoch="1"
+    )
+
+    assert (ok, status, enqueued) == (False, "manager_ready_receipt_conflict", False)
+    stored = task_store.get_task(repo, "TASK")
+    assert (stored or {}).get("manager_ready_receipt") == forged
+
+
+def test_publish_manager_ready_rejects_malformed_stored_receipt(
+    tmp_path: Path,
+) -> None:
+    """A stored marker with no resolvable episode is a fail-closed conflict."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    task_store.initialize_repository(repo)
+    _readiness, db_path = task_store._require_ready(repo)
+    _complete_authenticated_chain(
+        db_path,
+        target_task_id="TASK",
+        target_request_id="req-a",
+        claim_epoch="1",
+        packet_sha256="a" * 64,
+        candidate_sha256="b" * 64,
+    )
+    malformed = {
+        "manager_ready": {
+            "schema_id": review_lifecycle.MANAGER_READY_SCHEMA_ID,
+            "target_task_id": "TASK",
+            "target_request_id": "req-a",
+        },
+    }
+    _seed_review_ready_episode(
+        repo,
+        "TASK",
+        request_id="req-a",
+        claim_epoch="1",
+        manager_ready_receipt=malformed,
+    )
+
+    ok, status, enqueued = task_store.publish_manager_ready(
+        repo, task_id="TASK", request_id="req-a", claim_epoch="1"
+    )
+
+    assert (ok, status, enqueued) == (False, "manager_ready_receipt_conflict", False)
+
+
+def test_publish_manager_ready_rejects_unauthenticated_stale_receipt(
+    tmp_path: Path,
+) -> None:
+    """A plausible old-episode marker that never authenticated is a conflict."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    task_store.initialize_repository(repo)
+    _readiness, db_path = task_store._require_ready(repo)
+    _complete_authenticated_chain(
+        db_path,
+        target_task_id="TASK",
+        target_request_id="req-current",
+        claim_epoch="2",
+        packet_sha256="c" * 64,
+        candidate_sha256="d" * 64,
+    )
+    forged_stale = {
+        "manager_ready": {
+            "schema_id": review_lifecycle.MANAGER_READY_SCHEMA_ID,
+            "chain_id": 999999,
+            "chain_identity_sha256": "0" * 64,
+            "target_task_id": "TASK",
+            "target_request_id": "req-old",
+            "claim_epoch": "1",
+            "packet_sha256": "a" * 64,
+            "candidate_sha256": "b" * 64,
+            "reviews": [{"lens": "correctness", "ok": True}],
+            "lenses": ["correctness"],
+        },
+    }
+    _seed_review_ready_episode(
+        repo,
+        "TASK",
+        request_id="req-current",
+        claim_epoch="2",
+        manager_ready_receipt=forged_stale,
+    )
+
+    ok, status, enqueued = task_store.publish_manager_ready(
+        repo, task_id="TASK", request_id="req-current", claim_epoch="2"
+    )
+
+    assert (ok, status, enqueued) == (False, "manager_ready_receipt_conflict", False)
+    stored = task_store.get_task(repo, "TASK")
+    assert (stored or {}).get("manager_ready_receipt") == forged_stale
