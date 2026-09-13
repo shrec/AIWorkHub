@@ -62,18 +62,19 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
-## What's new in 0.9.40
+## What's new in 0.11.29
 
-- Required semantic-edit creates reject literal placeholder output, including
-  retained rework that leaves an invalid required file unchanged.
-- Repository Ruff and mypy checks can use their trusted PATH entrypoint when
-  the active MCP interpreter does not provide the declared module; receipts
-  still record the command and executable that actually ran.
-- Task supersession now verifies the replacement task before archiving the
-  original card, so the Plan DAG never observes a broken replacement edge.
-- Quality-verdict aggregation keeps a strict typed evidence shape, with new
-  focused regressions alongside the full Python and VS Code extension suites.
-
+- The Models tab now presents a bounded provider-to-model tree and includes
+  OpenCode identities discovered from the cached preflight snapshot.
+- Discovery is reported separately from repository enablement, launchability,
+  access and observed round-trip execution; a listed model is never presented
+  as proven runnable without evidence.
+- Automatic quality-review launch runs a system-owned correctness, security
+  and code-quality chain after worker completion and emits one authenticated
+  manager callback; review automation never accepts or rejects the target.
+- 0.11.29 is the current source release in this repository; Marketplace and
+  GitHub Release publication of that exact version are separate channels this
+  README does not assert without measured evidence.
 ## Supported models
 
 AIWorkHub routes by runner family and adapter. Editor routes use models already

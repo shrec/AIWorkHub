@@ -80,7 +80,9 @@ Detailed older history stays in the
 - Measure whether workers used Source Graph throughout the task through
   authenticated tool-use receipts and continuous-use telemetry.
 - Keep repositories isolated in separate `.aiworkhub/` authorities.
-- Run on Linux, macOS, native Windows, WSL and Remote-SSH.
+- Run on Linux (the canonical development and validation host), on WSL,
+  Remote-SSH and macOS as qualified client paths, and on native Windows only
+  at its measured coverage.
 
 ## Operational dashboard
 

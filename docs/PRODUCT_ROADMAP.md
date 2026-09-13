@@ -17,67 +17,43 @@ The product remains local-first. Repository state belongs to that repository;
 model prompts, source text, credentials, and memories are not uploaded by
 AIWorkHub telemetry.
 
-## Current delivery checkpoint (local 0.9.40 candidate, 2026-08-10)
+## Current delivery checkpoint (0.11.29 source truth, 2026-09-13)
 
 This checkpoint is the current operational snapshot; the older baseline below
 remains useful history. It does not promote an unchecked roadmap item to
 shipped status.
 
-- Release `v0.9.39` is the latest published baseline. Local candidate `0.9.40`
-  adds the required-file semantic-edit placeholder guard and truthful
-  `{python} -m ruff|mypy` tool-entrypoint resolution. It passes 3,450 Python
-  tests (35 skipped), the complete extension suite, Ruff, strict mypy, release
-  metadata validation and VSIX packaging. The candidate is installed locally
-  but is not a public release claim.
-- The canonical queue has four actionable cards and no orphaned processing:
-  NF41 is retained at review for provider-free validation replay after the
-  `0.9.40` runtime reload; clean-root GLM successors for NF22, NF45 and NF19
-  are pending and ready.
-- The Plan DAG contains 150 cards: 146 terminal and the four actionable cards
-  described above. There is no dependency cycle or write-scope collision.
-  The common evidence-level contract, durable attempt-artifact manifest and
-  graph-scoped reviewer packet are now implemented and locally validated. The
-  meaningful-output/task-type behavioral contract is also implemented:
-  specialized cards fail before launch without exact validation roles and the
-  same observed receipts are rechecked at finalization and manager acceptance.
-  The manager-gated Learning Commit integration, bounded NeedFix Markdown
-  intake, atomic terminal-review/callback transition, release-assurance gate,
-  fail-closed Windows path-mux staging fallback, and explicit superseded-task
-  replacement-edge projection are now locally complete. Plan-DAG readiness now
-  follows the audited replacement chain, waits for the replacement to finish,
-  and blocks malformed, missing, ordinary-archive, or cyclic chains. A
-  repository-native Roadmap registry is now implemented locally as the
-  explicit manager-approved layer between NeedFix intake and the executable
-  Task DAG. It preserves outcome/dependency/acceptance/task provenance in its
-  own audited store, exposes bounded MCP operations, and has a dedicated
-  read-only VS Code dashboard popup. Completion is gated on canonical finished
-  tasks or explicit task-free evidence.
-  Local proof is not promoted to a release claim.
-- NeedFix contains 115 durable records after the current closure rebase: 85
-  resolved, 3 duplicate, 7 captured, 9 accepted, 1 linked to a created task,
-  4 deferred and 6 archived. Captured ideas are not
-  accepted roadmap commitments, and accepted findings are not resolved fixes.
-- Windows packaged-runtime qualification remains the immediate platform gate.
-  The `v0.9.37` dashboard now reports failed repair attempts truthfully, and
-  the shared event-ledger lock fallback is implemented, but live confirmation
-  is still required for finalization recovery and validation-only replay. One
-  VS Code window timed out during MCP child recovery while another window on
-  the same machine launched successfully, narrowing the remaining MCP defect
-  to window-local child/session/extension-host ownership or recovery routing.
-- A fresh Source Graph generation was present, but one roadmap-oriented free-
-  form focus query returned zero file/entity evidence and required exact-target
-  fallback. The checked retrieval corpus is now ten non-empty cases with
-  recall@k `1.0`, MRR `0.95`, success@k `1.0`, mean returned payload
-  `3035.2` bytes, and an environment-observed mean/p95 latency of
-  `19.328/28.936 ms`. Accepted-outcome coverage is still `0`, so this proves
-  the checked structural retrieval contract, not broad-query quality, causal
-  task benefit, provider-token savings, or a vector-search advantage.
-
-The next closure order is: reload and live-verify the local `0.9.40` runtime,
-provider-free replay/accept NF41, verify the two new fidelity/tool-resolution
-guards, then resume NF22, NF45 and NF19 from clean task roots. Windows-only and
-matched-benchmark residuals stay open until their stated evidence exists.
-
+- `0.11.29` is the current source release in this repository. Marketplace and
+  GitHub Release publication of that exact version are separate channels this
+  roadmap does not assert without measured evidence; source truth lives in
+  the repository changelogs and extension package metadata.
+- The manager-worker lifecycle is evidence-first end to end: the manager plans
+  and claims bounded tasks, isolated workers execute them with Source Graph
+  discovery and mandatory staged semantic edits, an automatic quality review
+  runs a system-owned correctness, security and code-quality chain whose
+  authenticated aggregate emits exactly one manager callback, and only the
+  verified manager accepts or rejects the result. Review automation never
+  decides the implementation target, and the same observed validation
+  receipts are rechecked at finalization and manager acceptance.
+- Source Graph is the mandatory worker discovery surface, and semantic edit
+  staging is the mandatory write path: workers replace focused hash-bound
+  line ranges instead of regenerating whole files, and the local bridge
+  verifies the full-file preimage before mutating the isolated worktree.
+- The Models tab reports a bounded provider-to-model tree built from the
+  cached preflight snapshot. OpenCode identities discovered there are listed
+  facts only: discovered, repository-enabled, adapter-supported, launchable,
+  round-trip-observed and successful stay separate labeled states, and a
+  listed Nemotron or GPT identity never implies Task MCP execution
+  eligibility without an observed canonical round trip.
+- Platform claims stay measured: Linux is the canonical development and
+  validation host; WSL, Remote-SSH and macOS are qualified client paths; and
+  native Windows support is reported only at its measured coverage, without
+  extending it into unsupported AppContainer guarantees.
+- Token economy claims stay bounded: Source Graph discovery, bounded reads
+  and replacement-only semantic edits are the measured mechanism, verified as
+  a 60.26x code-output shape ratio (31,998 existing-file bytes versus 531
+  replacement bytes), while the total provider-token multiplier remains
+  unmeasured and overall savings are not promised.
 ## Assessment intake and assurance roadmap (2026-08-06)
 
 Eight owner-supplied product and architecture reviews are preserved under

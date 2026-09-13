@@ -9,10 +9,13 @@ and headless (CLI-only MCP client).
 ### VS Code (recommended)
 
 Install
-[AIWorkHub from the VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=IvaneChkheidze.aiworkhub),
+[AIWorkHub from the VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=IvaneChkheidze.aiworkhub)
 or download a versioned VSIX from the
-[GitHub Releases page](https://github.com/shrec/AIWorkHub/releases). To build a
-development VSIX locally:
+[GitHub Releases page](https://github.com/shrec/AIWorkHub/releases) when those
+channels list a current build. The current source release in this repository
+is 0.11.29; Marketplace and GitHub Release publication of that exact version
+are separate channels this guide does not assert without measured evidence.
+To build a development VSIX locally:
 
 ```bash
 npm --prefix vscode-extension install
