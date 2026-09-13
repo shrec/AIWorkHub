@@ -912,8 +912,15 @@ def test_fake_clock_exact_child_exit_is_exactly_once(
 def test_fake_clock_live_usage_crossing_legacy_cap_never_terminates(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    real_sleep = worker_supervisor.time.sleep
     clock = _FakeClock()
     _install_fake_clock(monkeypatch, clock)
+
+    def scheduled_sleep(seconds: float) -> None:
+        clock.sleep(seconds)
+        real_sleep(seconds)
+
+    monkeypatch.setattr(worker_supervisor.time, "sleep", scheduled_sleep)
     timeout_seconds = 2
     script = (
         "import json; "
