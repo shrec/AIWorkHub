@@ -6,6 +6,20 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.31] - 2026-09-13
+
+### Fixed
+
+- Provider-free validation-only replay now preserves the complete signed task
+  card identity in finalization metadata, so retained candidates can rerun
+  their declared gates without weakening cross-request receipt protection.
+
+### Validation
+
+- Regression coverage verifies the replay metadata against the canonical
+  HMAC-bound toolchain receipt; the affected launcher, blocked-rework and
+  executable-resolution suites pass before packaging.
+
 ## [0.11.30] - 2026-09-13
 
 ### Fixed

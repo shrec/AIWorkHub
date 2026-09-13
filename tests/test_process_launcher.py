@@ -3857,6 +3857,127 @@ def test_validation_only_replay_authorization_fails_closed_before_launch():
         )
 
 
+def test_validation_only_replay_preserves_complete_toolchain_receipt_identity(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv(
+        "AIWORKHUB_TOOLCHAIN_AUTHORITY_HMAC_KEY",
+        "hex:" + ("ce" * 32),
+    )
+    request_id = "validation-replay-receipt-1"
+    predecessor_id = "validation-replay-predecessor-1"
+    digest = "a" * 64
+    card = _card("TASK_REPLAY_RECEIPT")
+    card.update({
+        "claim_epoch": 2,
+        "validation": [f"{sys.executable} -m compileall -q ."],
+        "required_outputs": ["out/result.json"],
+        "rework_predecessor": {
+            "request_id": predecessor_id,
+            "changed_path_hashes": {"out/result.json": digest},
+        },
+    })
+    manager = _manager(
+        tmp_path,
+        show_task=_show(lambda: card),
+        argv=[sys.executable, "-c", "pass"],
+    )
+    preflight = manager._preflight_card(
+        card["task_id"],
+        card["runner"],
+        card["topic"],
+        "claude_cli",
+        reserved_request_id=request_id,
+    )
+    authorization = {
+        "task_id": card["task_id"],
+        "actor": process_launcher.core.CODEX_RUNNER,
+        "predecessor_request_id": predecessor_id,
+        "changed_path_hashes": {"out/result.json": digest},
+        "next_claim_epoch": 2,
+        "one_episode_binding": True,
+    }
+    preflight["validation_only_replay_authorization"] = dict(authorization)
+
+    workspace_path = tmp_path / "replay-worktree"
+    workspace_path.mkdir()
+    workspace_home = tmp_path / "replay-home"
+    workspace_home.mkdir()
+    workspace = SimpleNamespace(
+        request_id=request_id,
+        repo=manager.repo,
+        path=workspace_path,
+        home=workspace_home,
+        allowed_writes=("out/result.json",),
+        as_metadata=lambda: {
+            "request_id": request_id,
+            "repo": str(manager.repo),
+            "path": str(workspace_path),
+            "home": str(workspace_home),
+            "allowed_writes": ["out/result.json"],
+        },
+    )
+    monkeypatch.setattr(process_launcher, "create_workspace", lambda *_a, **_k: workspace)
+    monkeypatch.setattr(
+        process_launcher, "build_residual_contract_manifest", lambda *_a, **_k: {}
+    )
+    monkeypatch.setattr(process_launcher, "_path_manifest", lambda *_a, **_k: {})
+    monkeypatch.setattr(
+        manager, "_validation_replay_predecessor_mcp_receipt", lambda *_a, **_k: None
+    )
+    monkeypatch.setattr(
+        process_launcher, "_write_terminal_authority_grant", lambda *_a, **_k: None
+    )
+    monkeypatch.setattr(manager, "_finalize_isolated_request", lambda *_a, **_k: None)
+
+    committed = dict(preflight)
+    committed.pop("request_id", None)
+    committed.update({
+        "status": "processing",
+        "worker_status": "claimed",
+        "claimed_by": card["runner"],
+        "launch_request_id": request_id,
+        "validation_only_replay_authorization": {
+            **authorization,
+            "request_id": request_id,
+            "repo": str(manager.repo.resolve()),
+        },
+    })
+    monkeypatch.setattr(
+        process_launcher.task_engine,
+        "claim_start_exact",
+        lambda *_a, **_k: {
+            "ok": True,
+            "returncode": 0,
+            "stdout": json.dumps(committed),
+            "stderr": "",
+        },
+    )
+
+    launched = manager._launch_validation_only_replay(
+        task_id=card["task_id"],
+        runner=card["runner"],
+        topic=card["topic"],
+        adapter_id="claude_cli",
+        model=None,
+        timeout_seconds=30,
+        card=preflight,
+        authorization=authorization,
+        request_id=request_id,
+    )
+
+    assert launched["ok"] is True
+    metadata = json.loads(
+        (manager.process_dir / f"{request_id}.request.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert metadata["allowed_writes"] == preflight["allowed_writes"]
+    assert toolchain_authority.verify_authority_receipt(
+        metadata[toolchain_authority.RECEIPT_CARD_KEY], manager.repo, metadata
+    )
+
+
 def test_validation_only_replay_code_task_requires_satisfied_exact_predecessor_mcp_gate(
     monkeypatch, tmp_path
 ):

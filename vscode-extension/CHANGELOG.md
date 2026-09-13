@@ -1,5 +1,13 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.31 — 2026-09-13
+
+### Fixed
+
+- Retained-candidate validation replay carries the full signed task identity,
+  eliminating false `toolchain_authority_receipt_card_identity_mismatch`
+  failures while keeping receipts request-bound.
+
 ## 0.11.30 — 2026-09-13
 
 ### Fixed

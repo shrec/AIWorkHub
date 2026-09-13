@@ -14,8 +14,10 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.11.30
+## What's new in 0.11.31
 
+- Validation-only replay now carries the complete HMAC-bound task identity,
+  allowing retained candidates to rerun gates without false receipt mismatch.
 - Sealed `review_ready` candidates whose automatic reviewer child was never
   created are recovered by reconciliation without manager-launched reviewers.
 - Mechanical review parks, retained-delta reroutes and pending launch failures
