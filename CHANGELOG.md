@@ -6,6 +6,25 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.33] - 2026-09-13
+
+### Fixed
+
+- Repeated provider-free validation replay now preserves authenticated worker
+  MCP evidence across a mechanically failed replay instead of stopping with
+  `validation_only_replay_predecessor_worker_mcp_gate_missing`.
+
+### Security
+
+- Inherited replay evidence is accepted only when the coordinator-owned
+  request packet matches the exact task, request, repository, claim epoch,
+  predecessor and retained path hashes; mismatches continue to fail closed.
+
+### Validation
+
+- Regression coverage proves both successful two-hop inheritance and rejection
+  of altered provider-launch, request-identity and claim-epoch fields.
+
 ## [0.11.32] - 2026-09-13
 
 ### Fixed

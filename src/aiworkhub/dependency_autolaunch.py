@@ -249,6 +249,7 @@ TRANSIENT_DENIAL_REASONS = frozenset(
         # launch_replay_guard family claimed above: a terminal event or a gate
         # receipt can appear later with no card-row change.
         "validation_only_replay_committed_grant_mismatch",
+        "validation_only_replay_predecessor_inherited_worker_mcp_gate_mismatch",
         "validation_only_replay_predecessor_terminal_event_missing",
         "validation_only_replay_predecessor_worker_mcp_gate_missing",
         "validation_only_replay_predecessor_worker_mcp_gate_unsatisfied",

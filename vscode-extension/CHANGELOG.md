@@ -1,5 +1,13 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.33 — 2026-09-13
+
+### Fixed
+
+- Repeated validation-only replay retains the exact authenticated worker MCP
+  gate through mechanical validation failures, with fail-closed identity and
+  retained-path binding.
+
 ## 0.11.32 — 2026-09-13
 
 ### Fixed

@@ -6503,7 +6503,7 @@ class ProcessManager:
         predecessor_request_id = str(
             authorization.get("predecessor_request_id") or ""
         )
-        predecessor_event = None
+        predecessor_gate = None
         terminal_seen = False
         for event in reversed(self._events()):
             if (
@@ -6515,17 +6515,109 @@ class ProcessManager:
             terminal_seen = True
             # Compact retention rows must not shadow the evidence-bearing row.
             if isinstance(event.get("worker_mcp_gate"), dict):
-                predecessor_event = event
+                predecessor_gate = event["worker_mcp_gate"]
                 break
         if not terminal_seen:
             raise LaunchRejected(
                 "validation_only_replay_predecessor_terminal_event_missing"
             )
-        if predecessor_event is None:
+        if predecessor_gate is None:
+            # A provider-free replay can fail before its finalizer projects the
+            # inherited gate onto the terminal event.  Its coordinator-owned
+            # request packet still carries that gate, bound to the exact replay
+            # request, claim epoch, repository and retained path hashes.  Follow
+            # that single authenticated hop so a mechanical validation failure
+            # cannot sever an otherwise valid replay chain.
+            metadata_path = self.process_dir / f"{predecessor_request_id}.request.json"
+            try:
+                predecessor_metadata = json.loads(
+                    metadata_path.read_text(encoding="utf-8")
+                )
+            except (OSError, json.JSONDecodeError):
+                predecessor_metadata = None
+            metadata_worker_mcp = (
+                predecessor_metadata.get("worker_mcp")
+                if isinstance(predecessor_metadata, dict)
+                else None
+            )
+            inherited = (
+                metadata_worker_mcp.get("inherited_predecessor_gate")
+                if isinstance(metadata_worker_mcp, dict)
+                else None
+            )
+            metadata_authorization = (
+                predecessor_metadata.get("validation_only_replay_authorization")
+                if isinstance(predecessor_metadata, dict)
+                else None
+            )
+            metadata_predecessor = (
+                predecessor_metadata.get("rework_predecessor")
+                if isinstance(predecessor_metadata, dict)
+                else None
+            )
+            metadata_workspace = (
+                predecessor_metadata.get("workspace")
+                if isinstance(predecessor_metadata, dict)
+                else None
+            )
+            expected_repo = str(self.repo.resolve())
+            changed_path_hashes = dict(
+                authorization.get("changed_path_hashes") or {}
+            )
+            inherited_bindings_match = (
+                isinstance(predecessor_metadata, dict)
+                and predecessor_metadata.get("schema_id")
+                == "aiworkhub.task_mcp.isolated_request.v1"
+                and predecessor_metadata.get("request_id")
+                == predecessor_request_id
+                and predecessor_metadata.get("task_id") == task_id
+                and predecessor_metadata.get("execution_mode")
+                == "validation_only_replay"
+                and predecessor_metadata.get("provider_launched") is False
+                and isinstance(metadata_authorization, dict)
+                and metadata_authorization.get("task_id") == task_id
+                and metadata_authorization.get("actor") == core.CODEX_RUNNER
+                and metadata_authorization.get("one_episode_binding") is True
+                and metadata_authorization.get("request_id")
+                == predecessor_request_id
+                and metadata_authorization.get("repo") == expected_repo
+                and metadata_authorization.get("next_claim_epoch")
+                == predecessor_metadata.get("claim_epoch")
+                and metadata_authorization.get("changed_path_hashes")
+                == changed_path_hashes
+                and isinstance(metadata_predecessor, dict)
+                and metadata_predecessor.get("request_id")
+                == metadata_authorization.get("predecessor_request_id")
+                and metadata_predecessor.get("changed_path_hashes")
+                == changed_path_hashes
+                and isinstance(metadata_workspace, dict)
+                and metadata_workspace.get("request_id")
+                == predecessor_request_id
+                and metadata_workspace.get("repo") == expected_repo
+                and isinstance(inherited, dict)
+                and inherited.get("schema_id")
+                == "aiworkhub.task_mcp.validation_replay_predecessor_gate.v1"
+                and inherited.get("task_id") == task_id
+                and inherited.get("request_id") == predecessor_request_id
+                and inherited.get("predecessor_request_id")
+                == metadata_authorization.get("predecessor_request_id")
+                and inherited.get("repo") == expected_repo
+                and inherited.get("next_claim_epoch")
+                == predecessor_metadata.get("claim_epoch")
+                and inherited.get("changed_path_hashes") == changed_path_hashes
+            )
+            if not inherited_bindings_match:
+                raise LaunchRejected(
+                    "validation_only_replay_predecessor_inherited_worker_mcp_gate_mismatch"
+                )
+            inherited_gate = inherited.get("worker_mcp_gate")
+            if isinstance(inherited_gate, dict):
+                predecessor_gate = inherited_gate
+        if predecessor_gate is None:
             raise LaunchRejected(
                 "validation_only_replay_predecessor_worker_mcp_gate_missing"
             )
-        gate = predecessor_event["worker_mcp_gate"]
+        gate = predecessor_gate
         verification = gate.get("verification")
         if (
             gate.get("gated") is not True

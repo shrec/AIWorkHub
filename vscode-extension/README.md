@@ -14,8 +14,10 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.11.32
+## What's new in 0.11.33
 
+- Repeated validation-only replay can inherit the authenticated worker MCP gate
+  through a mechanically failed replay without launching the provider again.
 - Validation-only replay now accepts an exact authenticated retained delta
   even when the canonical parent advanced after the original attempt.
 - Validation-only replay now carries the complete HMAC-bound task identity,

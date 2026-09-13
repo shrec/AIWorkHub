@@ -4117,6 +4117,202 @@ def test_validation_only_replay_inherits_authenticated_predecessor_mcp_truth(tmp
     ] is False
 
 
+def test_validation_only_replay_inherits_gate_across_failed_replay_predecessor(
+    tmp_path,
+):
+    task_id = "TASK_REPLAY_CHAIN"
+    predecessor_request_id = "replay-failed-8"
+    original_request_id = "worker-green-7"
+    current_request_id = "replay-current-9"
+    changed_path_hashes = {"out/result.py": "e" * 64}
+    card = {
+        "task_id": task_id,
+        "project_context": {"task_type": "code", "required": True},
+    }
+    authorization = {
+        "task_id": task_id,
+        "actor": process_launcher.core.CODEX_RUNNER,
+        "predecessor_request_id": predecessor_request_id,
+        "changed_path_hashes": changed_path_hashes,
+        "next_claim_epoch": 9,
+        "one_episode_binding": True,
+        "request_id": current_request_id,
+        "repo": str(tmp_path.resolve()),
+    }
+    manager = _manager(
+        tmp_path,
+        show_task=_show(lambda: _card(task_id=task_id)),
+        argv=[sys.executable, "-c", "pass"],
+    )
+    predecessor_gate = {
+        "gated": True,
+        "task_type": "code",
+        "project_context_required": True,
+        "required_tools": ["source_graph", "session_current_state"],
+        "missing_tools": [],
+        "satisfied": True,
+        "reason": "",
+        "observation_only": False,
+        "verification": {"ok": True, "verified_entries": 2},
+    }
+    predecessor_metadata = {
+        "schema_id": "aiworkhub.task_mcp.isolated_request.v1",
+        "request_id": predecessor_request_id,
+        "task_id": task_id,
+        "claim_epoch": 8,
+        "execution_mode": "validation_only_replay",
+        "provider_launched": False,
+        "rework_predecessor": {
+            "request_id": original_request_id,
+            "changed_path_hashes": changed_path_hashes,
+        },
+        "validation_only_replay_authorization": {
+            "task_id": task_id,
+            "actor": process_launcher.core.CODEX_RUNNER,
+            "predecessor_request_id": original_request_id,
+            "changed_path_hashes": changed_path_hashes,
+            "next_claim_epoch": 8,
+            "one_episode_binding": True,
+            "request_id": predecessor_request_id,
+            "repo": str(manager.repo.resolve()),
+        },
+        "workspace": {
+            "request_id": predecessor_request_id,
+            "repo": str(manager.repo.resolve()),
+        },
+        "worker_mcp": {
+            "inherited_predecessor_gate": {
+                "schema_id": "aiworkhub.task_mcp.validation_replay_predecessor_gate.v1",
+                "task_id": task_id,
+                "predecessor_request_id": original_request_id,
+                "changed_path_hashes": changed_path_hashes,
+                "next_claim_epoch": 8,
+                "request_id": predecessor_request_id,
+                "repo": str(manager.repo.resolve()),
+                "task_type": "code",
+                "required_tools": ["source_graph", "session_current_state"],
+                "worker_mcp_gate": predecessor_gate,
+            }
+        },
+    }
+    manager.process_dir.mkdir(parents=True, exist_ok=True)
+    (manager.process_dir / f"{predecessor_request_id}.request.json").write_text(
+        json.dumps(predecessor_metadata), encoding="utf-8"
+    )
+    manager._append_event({
+        "request_id": predecessor_request_id,
+        "task_id": task_id,
+        "state": "validation_failed",
+    })
+
+    receipt = manager._validation_replay_predecessor_mcp_receipt(
+        card, authorization, task_id
+    )
+
+    assert receipt["predecessor_request_id"] == predecessor_request_id
+    assert receipt["request_id"] == current_request_id
+    assert receipt["next_claim_epoch"] == 9
+    assert receipt["changed_path_hashes"] == changed_path_hashes
+    assert receipt["worker_mcp_gate"]["satisfied"] is True
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("provider_launched", True),
+        ("request_id", "different-replay"),
+        ("claim_epoch", 99),
+    ],
+)
+def test_validation_only_replay_rejects_tampered_inherited_gate_packet(
+    tmp_path, field, value
+):
+    task_id = "TASK_REPLAY_CHAIN_TAMPER"
+    predecessor_request_id = "replay-failed-8"
+    changed_path_hashes = {"out/result.py": "f" * 64}
+    manager = _manager(
+        tmp_path,
+        show_task=_show(lambda: _card(task_id=task_id)),
+        argv=[sys.executable, "-c", "pass"],
+    )
+    predecessor_metadata = {
+        "schema_id": "aiworkhub.task_mcp.isolated_request.v1",
+        "request_id": predecessor_request_id,
+        "task_id": task_id,
+        "claim_epoch": 8,
+        "execution_mode": "validation_only_replay",
+        "provider_launched": False,
+        "rework_predecessor": {
+            "request_id": "worker-green-7",
+            "changed_path_hashes": changed_path_hashes,
+        },
+        "validation_only_replay_authorization": {
+            "task_id": task_id,
+            "actor": process_launcher.core.CODEX_RUNNER,
+            "predecessor_request_id": "worker-green-7",
+            "changed_path_hashes": changed_path_hashes,
+            "next_claim_epoch": 8,
+            "one_episode_binding": True,
+            "request_id": predecessor_request_id,
+            "repo": str(manager.repo.resolve()),
+        },
+        "workspace": {
+            "request_id": predecessor_request_id,
+            "repo": str(manager.repo.resolve()),
+        },
+        "worker_mcp": {
+            "inherited_predecessor_gate": {
+                "schema_id": "aiworkhub.task_mcp.validation_replay_predecessor_gate.v1",
+                "task_id": task_id,
+                "predecessor_request_id": "worker-green-7",
+                "changed_path_hashes": changed_path_hashes,
+                "next_claim_epoch": 8,
+                "request_id": predecessor_request_id,
+                "repo": str(manager.repo.resolve()),
+                "worker_mcp_gate": {
+                    "gated": True,
+                    "satisfied": True,
+                    "required_tools": ["source_graph"],
+                    "verification": {"ok": True},
+                },
+            }
+        },
+    }
+    predecessor_metadata[field] = value
+    manager.process_dir.mkdir(parents=True, exist_ok=True)
+    (manager.process_dir / f"{predecessor_request_id}.request.json").write_text(
+        json.dumps(predecessor_metadata), encoding="utf-8"
+    )
+    manager._append_event({
+        "request_id": predecessor_request_id,
+        "task_id": task_id,
+        "state": "validation_failed",
+    })
+    authorization = {
+        "task_id": task_id,
+        "actor": process_launcher.core.CODEX_RUNNER,
+        "predecessor_request_id": predecessor_request_id,
+        "changed_path_hashes": changed_path_hashes,
+        "next_claim_epoch": 9,
+        "one_episode_binding": True,
+        "request_id": "replay-current-9",
+        "repo": str(manager.repo.resolve()),
+    }
+
+    with pytest.raises(
+        process_launcher.LaunchRejected,
+        match="validation_only_replay_predecessor_inherited_worker_mcp_gate_mismatch",
+    ):
+        manager._validation_replay_predecessor_mcp_receipt(
+            {
+                "task_id": task_id,
+                "project_context": {"task_type": "code", "required": True},
+            },
+            authorization,
+            task_id,
+        )
+
+
 def test_isolated_validation_only_replay_never_resolves_or_starts_provider(
     monkeypatch, tmp_path
 ):
