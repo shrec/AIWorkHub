@@ -13,6 +13,7 @@ import pytest
 
 from aiworkhub import (
     core,
+    process_event_ledger,
     process_launcher,
     task_store,
     terminal_failure_classification,
@@ -760,6 +761,162 @@ def test_reroute_launch_identity_allows_exact_terminal_retry_rework_epoch(
     rebind = result["manager_rejection_authorization"]["terminal_retry_rebind"]
     assert rebind["claim_epoch"] == retry_epoch
     assert len(rebind["terminal_retry_sha256"]) == 64
+
+
+def test_reroute_launch_identity_allows_exact_pending_launch_failure_rework_epoch(
+    coordinator_repo: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = "REROUTE_REJECTED_AFTER_PENDING_LAUNCH_FAILURE"
+    predecessor = _retained_predecessor(coordinator_repo, task_id=task_id)
+    manager_fields = _manager_rejection_fields(predecessor)
+    request_id = "f" * 32
+    current_epoch = predecessor["claim_epoch"] + 2
+    failure_reason = "provider_refused_rate_limited_recoverable"
+    manager_fields.update({
+        "claim_epoch": current_epoch,
+        "launch_request_id": request_id,
+        "transient_retry": {
+            "schema_id": "aiworkhub.transient_retry.v1",
+            "request_id": request_id,
+            "attempts": 1,
+            "budget": 3,
+            "reason": failure_reason,
+            "recorded_at": "2026-08-03T00:03:00+00:00",
+        },
+        "identity_reroute": {
+            "schema_id": "aiworkhub.identity_reroute.v1",
+            "from_runner": "glm_5.3",
+            "to_runner": "claude_sonnet-5",
+            "to_adapter_id": "claude_cli",
+            "to_model": "claude-sonnet-5",
+        },
+    })
+    monkeypatch.setattr(
+        worker_workspace,
+        "changed_paths",
+        lambda _workspace, **_kwargs: ["out/result.json"],
+    )
+    monkeypatch.setattr(
+        process_event_ledger,
+        "latest_events",
+        lambda _path: {
+            request_id: {
+                "request_id": request_id,
+                "task_id": task_id,
+                "runner": "claude_sonnet-5",
+                "adapter_id": "claude_cli",
+                "model": "claude-sonnet-5",
+                "state": "launch_failed",
+                "failure_kind": "launch_failed",
+                "error": failure_reason,
+                "exit_code": 1,
+                "changed_paths": [],
+            }
+        },
+    )
+    monkeypatch.setattr(
+        workforce_catalog,
+        "build_catalog",
+        lambda _repo: {
+            "workers": [{
+                "execution_runner": "deepseek_v4-pro",
+                "effective_adapter_id": "deepseek_vscode_lm",
+                "model": "deepseek-v4-pro",
+                "enabled": True,
+                "launch_eligible": True,
+                "available": True,
+                "max_risk": "critical",
+            }]
+        },
+    )
+    _insert_pending_reroutable(
+        coordinator_repo,
+        task_id=task_id,
+        runner="claude_sonnet-5",
+        rework_predecessor=predecessor,
+        risk_tier="high",
+        card_overrides=manager_fields,
+    )
+
+    result = core.reroute_launch_identity(
+        task_id,
+        from_runner="claude_sonnet-5",
+        to_runner="deepseek_v4-pro",
+        to_adapter_id="deepseek_vscode_lm",
+        to_model="deepseek-v4-pro",
+    )
+
+    assert result["ok"] is True, result
+    rebind = result["manager_rejection_authorization"][
+        "pending_launch_failure_rebind"
+    ]
+    assert rebind["request_id"] == request_id
+    assert rebind["claim_epoch"] == current_epoch
+    assert len(rebind["transient_retry_sha256"]) == 64
+    assert len(rebind["process_event_sha256"]) == 64
+
+
+def test_reroute_launch_identity_rejects_pending_launch_failure_with_delta(
+    coordinator_repo: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = "REROUTE_REJECTED_PENDING_LAUNCH_FAILURE_WITH_DELTA"
+    predecessor = _retained_predecessor(coordinator_repo, task_id=task_id)
+    manager_fields = _manager_rejection_fields(predecessor)
+    request_id = "f" * 32
+    failure_reason = "provider_refused_rate_limited_recoverable"
+    manager_fields.update({
+        "claim_epoch": predecessor["claim_epoch"] + 2,
+        "launch_request_id": request_id,
+        "transient_retry": {
+            "schema_id": "aiworkhub.transient_retry.v1",
+            "request_id": request_id,
+            "attempts": 1,
+            "budget": 3,
+            "reason": failure_reason,
+            "recorded_at": "2026-08-03T00:03:00+00:00",
+        },
+    })
+    monkeypatch.setattr(
+        worker_workspace,
+        "changed_paths",
+        lambda _workspace, **_kwargs: ["out/result.json"],
+    )
+    monkeypatch.setattr(
+        process_event_ledger,
+        "latest_events",
+        lambda _path: {
+            request_id: {
+                "request_id": request_id,
+                "task_id": task_id,
+                "runner": "claude_sonnet-5",
+                "adapter_id": "claude_cli",
+                "model": "claude-sonnet-5",
+                "state": "launch_failed",
+                "failure_kind": "launch_failed",
+                "error": failure_reason,
+                "exit_code": 1,
+                "changed_paths": ["out/result.json"],
+            }
+        },
+    )
+    _insert_pending_reroutable(
+        coordinator_repo,
+        task_id=task_id,
+        runner="claude_sonnet-5",
+        rework_predecessor=predecessor,
+        card_overrides=manager_fields,
+    )
+
+    result = core.reroute_launch_identity(
+        task_id,
+        from_runner="claude_sonnet-5",
+        to_runner="claude_opus-5",
+        to_adapter_id="claude_cli",
+        to_model="opus",
+    )
+
+    assert result["ok"] is False
+    assert "reroute_manager_rejection_identity_mismatch" in result["stderr"]
 
 
 @pytest.mark.parametrize(

@@ -7115,6 +7115,107 @@ def _latest_operational_recovery_projection(
     return authenticated
 
 
+def _verified_pending_launch_failure_reroute_receipt(
+    card: Mapping[str, Any], *, task_id: str
+) -> dict[str, Any] | None:
+    """Authenticate a zero-delta launch failure that intentionally stayed pending.
+
+    Recoverable provider refusals use the transient retry scheduler and therefore
+    do not pass through the blocked terminal-retry transition.  A manager must
+    still be able to move the retained candidate off that exact failed route.
+    The card projection alone is insufficient authority, so bind it to the
+    canonical process-event ledger and fail closed on any identity or delta.
+    """
+    from . import process_event_ledger, process_launcher
+
+    current_claim_epoch = card.get("claim_epoch")
+    request_id = str(card.get("launch_request_id") or "").strip()
+    runner = str(card.get("runner") or "").strip()
+    transient_retry = card.get("transient_retry")
+    if (
+        type(current_claim_epoch) is not int
+        or re.fullmatch(r"[0-9a-f]{32}", request_id) is None
+        or not runner
+        or not isinstance(transient_retry, dict)
+        or transient_retry.get("schema_id") != "aiworkhub.transient_retry.v1"
+        or str(transient_retry.get("request_id") or "").strip() != request_id
+        or type(transient_retry.get("attempts")) is not int
+        or type(transient_retry.get("budget")) is not int
+        or not (1 <= transient_retry["attempts"] <= transient_retry["budget"])
+        or not str(transient_retry.get("recorded_at") or "").strip()
+    ):
+        return None
+    reason = str(transient_retry.get("reason") or "").strip()
+    if not reason or len(reason.encode("utf-8")) > 500:
+        return None
+
+    process_log = Path(
+        os.environ.get(
+            process_launcher.PROCESS_LOG_ENV,
+            str(repo_root() / process_launcher.PROCESS_LOG_DEFAULT_REL),
+        )
+    )
+    try:
+        event = process_event_ledger.latest_events(process_log).get(request_id)
+    except Exception:  # noqa: BLE001 - unreadable process authority fails closed
+        return None
+    if not isinstance(event, dict):
+        return None
+    changed_paths = event.get("changed_paths")
+    if (
+        str(event.get("request_id") or "").strip() != request_id
+        or str(event.get("task_id") or "").strip() != task_id
+        or str(event.get("runner") or "").strip() != runner
+        or str(event.get("state") or "").strip() != "launch_failed"
+        or str(event.get("failure_kind") or "").strip() != "launch_failed"
+        or str(event.get("error") or "").strip() != reason
+        or changed_paths != []
+    ):
+        return None
+
+    prior_reroute = card.get("identity_reroute")
+    if isinstance(prior_reroute, dict) and (
+        str(prior_reroute.get("to_runner") or "").strip() != runner
+        or str(prior_reroute.get("to_adapter_id") or "").strip()
+        != str(event.get("adapter_id") or "").strip()
+        or str(prior_reroute.get("to_model") or "").strip()
+        != str(event.get("model") or "").strip()
+    ):
+        return None
+
+    def digest(value: Any) -> str:
+        return hashlib.sha256(
+            json.dumps(
+                value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+        ).hexdigest()
+
+    event_identity = {
+        key: event.get(key)
+        for key in (
+            "request_id",
+            "task_id",
+            "runner",
+            "adapter_id",
+            "model",
+            "state",
+            "failure_kind",
+            "error",
+            "exit_code",
+            "changed_paths",
+        )
+    }
+    return {
+        "schema_id": "aiworkhub.pending_launch_failure_reroute.v1",
+        "task_id": task_id,
+        "request_id": request_id,
+        "runner": runner,
+        "claim_epoch": current_claim_epoch,
+        "transient_retry_sha256": digest(transient_retry),
+        "process_event_sha256": digest(event_identity),
+    }
+
+
 def _verified_manager_rejection_receipt(
     card: Mapping[str, Any], *, task_id: str
 ) -> tuple[dict[str, Any] | None, str | None]:
@@ -7239,6 +7340,17 @@ def _verified_manager_rejection_receipt(
         and type(terminal_retry.get("claim_epoch")) is int
         and terminal_retry.get("claim_epoch") == current_claim_epoch
     )
+    pending_launch_failure_rebind: dict[str, Any] | None = None
+    if (
+        type(claim_epoch) is int
+        and type(current_claim_epoch) is int
+        and current_claim_epoch > claim_epoch
+        and not recovery_rebind
+        and not terminal_retry_rebind
+    ):
+        pending_launch_failure_rebind = (
+            _verified_pending_launch_failure_reroute_receipt(card, task_id=task_id)
+        )
     if (
         rejection.get("schema_id") != "aiworkhub.rejection_disposition.v1"
         or rejection.get("to") != "pending"
@@ -7254,6 +7366,7 @@ def _verified_manager_rejection_receipt(
             current_claim_epoch != claim_epoch
             and not recovery_rebind
             and not terminal_retry_rebind
+            and pending_launch_failure_rebind is None
         )
     ):
         return None, "reroute_manager_rejection_identity_mismatch"
@@ -7319,6 +7432,8 @@ def _verified_manager_rejection_receipt(
             "claim_epoch": current_claim_epoch,
             "terminal_retry_sha256": digest(terminal_retry),
         }
+    if pending_launch_failure_rebind is not None:
+        receipt["pending_launch_failure_rebind"] = pending_launch_failure_rebind
     return receipt, None
 
 
