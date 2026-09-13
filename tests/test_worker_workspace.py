@@ -279,6 +279,41 @@ def test_claude_credential_projection_rejects_destination_symlink(
         worker_workspace.refresh_claude_credential_projection(home)
 
 
+def test_opencode_credential_home_projects_only_auth_file(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source_home = tmp_path / "source-home"
+    source = source_home / ".local" / "share" / "opencode" / "auth.json"
+    source.parent.mkdir(parents=True, mode=0o700)
+    source.write_text('{"openai":{"token":"test"}}\n', encoding="utf-8")
+    source.chmod(0o600)
+    (source.parent / "opencode.db").write_text("do-not-copy", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(source_home))
+    isolated = tmp_path / "isolated-home"
+
+    worker_workspace._credential_home(isolated, "opencode_cli")
+
+    destination = isolated / ".local" / "share" / "opencode" / "auth.json"
+    assert destination.read_bytes() == source.read_bytes()
+    assert not (destination.parent / "opencode.db").exists()
+
+
+def test_opencode_credential_home_missing_auth_has_stable_classification(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source_home = tmp_path / "source-home"
+    source_home.mkdir()
+    monkeypatch.setenv("HOME", str(source_home))
+
+    with pytest.raises(
+        worker_workspace.WorkspaceError,
+        match="^opencode_auth_unavailable:opencode_auth_source_unavailable$",
+    ):
+        worker_workspace._credential_home(tmp_path / "isolated-home", "opencode_cli")
+
+
 @pytest.fixture
 def repo(tmp_path: Path) -> Path:
     root = tmp_path / "parent"

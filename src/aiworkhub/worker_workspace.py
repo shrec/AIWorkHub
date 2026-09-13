@@ -2934,6 +2934,21 @@ def _credential_home(home: Path, adapter_id: str, project_root: Path | None = No
             destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             shutil.copyfile(source, destination)
             chmod_path(destination, 0o600)
+    elif adapter_id == "opencode_cli":
+        # This module must also work as the direct Landlock wrapper, where
+        # relative imports are unavailable.  The regular sibling check keeps
+        # that lazy package import pinned to this verified support directory.
+        sibling_root = _runtime_temp_support_root()
+        _require_regular_runtime_temp_support(
+            sibling_root, "opencode_auth", "opencode_auth.py"
+        )
+        qualified = f"{__package__}.opencode_auth" if __package__ else "aiworkhub.opencode_auth"
+        opencode_auth = __import__(qualified, fromlist=["project_opencode_auth"])
+        source = source_home / ".local" / "share" / "opencode" / "auth.json"
+        try:
+            opencode_auth.project_opencode_auth(source, home)
+        except opencode_auth.OpenCodeAuthError as exc:
+            raise WorkspaceError(f"opencode_auth_unavailable:{exc.reason}") from None
 
 
 def _copy_regular_file_atomic(source: Path, destination: Path) -> None:
