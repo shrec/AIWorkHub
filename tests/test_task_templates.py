@@ -257,13 +257,15 @@ def test_nf772_docs_change_explicit_empty_override_stays_authoritative():
 
 
 def test_read_only_analysis_emits_no_writes_outputs_or_validations():
-    card = expand_template("read_only_analysis", production_paths=["src/a.py"])
+    card = expand_template(
+        "read_only_analysis", production_paths=["src/aiworkhub/core.py"]
+    )
     assert card["read_only"] is True
     assert card["allowed_writes"] == []
     assert card["required_outputs"] == []
     assert card["write_set"] == []
     assert card["validation"] == []
-    assert card["read_first"] == ["src/a.py"]
+    assert card["read_first"] == ["src/aiworkhub/core.py"]
     bare = expand_template("read_only_analysis")
     assert bare["read_first"] == []
     assert bare["validation"] == []

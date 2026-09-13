@@ -962,7 +962,7 @@ def _validation_commands_for(
         validation.append(" ".join([COMMAND_NODE, "--test", *node_tests]))
     if spec.generates_diff_check:
         validation.append(DIFF_CHECK_COMMAND)
-    gate = _package_gate_command(production)
+    gate = None if spec.read_only else _package_gate_command(production)
     if gate is not None and gate not in validation:
         validation.append(gate)
     return validation
