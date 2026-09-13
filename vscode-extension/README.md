@@ -14,7 +14,11 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.11.34
+## What's new in 0.11.35
+
+- Durable toolchain snapshots are executable-identity checked before reuse;
+  stale cache facts are re-derived instead of blocking retained-candidate
+  validation before its first declared command.
 
 - Provider-free validation replay now preserves non-empty `read_first`
   requirements in its authenticated toolchain identity.

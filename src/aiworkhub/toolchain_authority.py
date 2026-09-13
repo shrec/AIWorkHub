@@ -968,7 +968,7 @@ class ToolchainAuthority:
                     if self._executable_identities_match(self._cached):
                         return self._cached
                 loaded = self._load_snapshot(cache_identity)
-                if loaded is not None:
+                if loaded is not None and self._executable_identities_match(loaded):
                     self._cache_key, self._cached = cache_identity, loaded
                     return loaded
             facts, modules, missing = self._derive(card, registry)

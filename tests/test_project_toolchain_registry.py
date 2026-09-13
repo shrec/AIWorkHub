@@ -100,6 +100,42 @@ def test_unchanged_registry_evaluation_reuses_local_snapshot_without_resolution(
     assert second.executables == first.executables
 
 
+def test_disk_cached_snapshot_with_executable_drift_is_rederived(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_registry(tmp_path, _registry())
+    executable = _versioned_executable(tmp_path / "bin" / "python", "1.0.0")
+    calls = 0
+
+    def normalize(argv: list[str], _repo: Path) -> tuple[list[str], tuple[Path, ...]]:
+        nonlocal calls
+        calls += 1
+        return [str(executable), *argv[1:]], ()
+
+    from aiworkhub import worker_workspace
+
+    monkeypatch.setattr(
+        worker_workspace,
+        "_normalize_trusted_validation_executable_argv_with_roots",
+        normalize,
+    )
+    first_authority = toolchain_authority.ToolchainAuthority(
+        tmp_path, capability_probe=lambda _repo, _card: ()
+    )
+    first = first_authority.evaluate({"validation": []})
+    assert first_authority.repair(first)
+    calls = 0
+    _versioned_executable(executable, "2.0.0")
+
+    second = toolchain_authority.ToolchainAuthority(
+        tmp_path, capability_probe=lambda _repo, _card: ()
+    ).evaluate({"validation": []})
+
+    assert calls == 1
+    assert second.digest != first.digest
+    assert second.executables[0].fingerprint != first.executables[0].fingerprint
+
+
 def test_registry_cache_identity_includes_card_validation_requirements(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

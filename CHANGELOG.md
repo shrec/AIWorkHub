@@ -6,6 +6,21 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.35] - 2026-09-13
+
+### Fixed
+
+- Toolchain authority now verifies executable identities before reusing a
+  snapshot loaded from the durable cache. A stale or cross-namespace snapshot
+  is re-derived instead of being signed into a validation request that must
+  immediately fail with `validation_toolchain_authority_executable_identity_drift`.
+
+### Validation
+
+- Regression coverage replaces a persisted executable and proves that a new
+  authority instance rejects the stale disk snapshot and measures the current
+  toolchain. The full Python suite passes before packaging.
+
 ## [0.11.34] - 2026-09-13
 
 ### Fixed

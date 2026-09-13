@@ -1,5 +1,13 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.35 — 2026-09-13
+
+### Fixed
+
+- Durable toolchain snapshots are executable-identity checked before reuse;
+  stale cache facts are re-derived rather than poisoning provider-free
+  validation replay before its first declared command.
+
 ## 0.11.34 — 2026-09-13
 
 ### Fixed
