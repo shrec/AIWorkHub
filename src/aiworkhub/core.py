@@ -3429,9 +3429,25 @@ def _task_contract_path(raw: Any) -> str:
     return value.lstrip("./")
 
 
-def _task_contract_paths_overlap(left: str, right: str) -> bool:
+def _paths_overlap(left: str, right: str, *, glob_aware: bool) -> bool:
+    if left == right:
+        return True
+
+    has_glob = any(ch in left + right for ch in "*?[]")
+    if not glob_aware:
+        # Collision checks cannot prove two distinct globs overlap without
+        # expanding the repository. Keep this branch cheap and deterministic.
+        if has_glob:
+            return False
+        left_dir = left.endswith("/")
+        right_dir = right.endswith("/")
+        return (left_dir and right.startswith(left)) or (
+            right_dir and left.startswith(right)
+        )
+
     if fnmatch.fnmatchcase(left, right) or fnmatch.fnmatchcase(right, left):
         return True
+
     def static_prefix(value: str) -> str:
         indices = [value.find(ch) for ch in "*?[" if ch in value]
         stop = min(indices) if indices else len(value)
@@ -3467,7 +3483,7 @@ def task_card_path_conflicts(card: dict[str, Any]) -> list[dict[str, str]]:
             if not declared:
                 continue
             for denied in forbidden:
-                if _task_contract_paths_overlap(declared, denied):
+                if _paths_overlap(declared, denied, glob_aware=True):
                     conflicts.append({
                         "field": field,
                         "path": declared,
@@ -3548,7 +3564,7 @@ def card_scope_warnings(card: dict[str, Any]) -> list[str]:
         seen.add(declared)
         if declared in read_only_evidence:
             continue
-        if any(_task_contract_paths_overlap(declared, allowed) for allowed in writes):
+        if any(_paths_overlap(declared, allowed, glob_aware=True) for allowed in writes):
             continue
         warnings.append(declared)
     return sorted(warnings)
@@ -3621,7 +3637,7 @@ def card_test_scope_warnings(
                 read_only_evidence.add(declared)
 
     def covered(path: str) -> bool:
-        return any(_task_contract_paths_overlap(path, allowed) for allowed in writes)
+        return any(_paths_overlap(path, allowed, glob_aware=True) for allowed in writes)
 
     findings: dict[str, dict[str, Any]] = {}
     suppressed: list[str] = []
@@ -7115,6 +7131,14 @@ def _latest_operational_recovery_projection(
     return authenticated
 
 
+def _canonical_receipt_digest(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
+
+
 def _verified_pending_launch_failure_reroute_receipt(
     card: Mapping[str, Any], *, task_id: str
 ) -> dict[str, Any] | None:
@@ -7183,13 +7207,6 @@ def _verified_pending_launch_failure_reroute_receipt(
     ):
         return None
 
-    def digest(value: Any) -> str:
-        return hashlib.sha256(
-            json.dumps(
-                value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-            ).encode("utf-8")
-        ).hexdigest()
-
     event_identity = {
         key: event.get(key)
         for key in (
@@ -7211,8 +7228,8 @@ def _verified_pending_launch_failure_reroute_receipt(
         "request_id": request_id,
         "runner": runner,
         "claim_epoch": current_claim_epoch,
-        "transient_retry_sha256": digest(transient_retry),
-        "process_event_sha256": digest(event_identity),
+        "transient_retry_sha256": _canonical_receipt_digest(transient_retry),
+        "process_event_sha256": _canonical_receipt_digest(event_identity),
     }
 
 
@@ -7400,37 +7417,32 @@ def _verified_manager_rejection_receipt(
     if retained_error is not None or retained is None:
         return None, retained_error or "reroute_retained_candidate_unverified"
 
-    def digest(value: Any) -> str:
-        return hashlib.sha256(
-            json.dumps(
-                value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-            ).encode("utf-8")
-        ).hexdigest()
-
     receipt = {
         "schema_id": "aiworkhub.manager_rejection_reroute_authorization.v1",
         "task_id": task_id,
         "request_id": request_id,
         "claim_epoch": claim_epoch,
         "authority_repo": str(repo_root().resolve(strict=False)),
-        "rejection_sha256": digest(rejection),
-        "feedback_sha256": digest(feedback),
-        "allowed_writes_sha256": digest(card.get("allowed_writes") or []),
-        "changed_path_hashes_sha256": digest(changed_hashes),
+        "rejection_sha256": _canonical_receipt_digest(rejection),
+        "feedback_sha256": _canonical_receipt_digest(feedback),
+        "allowed_writes_sha256": _canonical_receipt_digest(
+            card.get("allowed_writes") or []
+        ),
+        "changed_path_hashes_sha256": _canonical_receipt_digest(changed_hashes),
         "retained_predecessor_sha256": retained["retained_predecessor_sha256"],
     }
     if recovery_rebind:
         receipt["recovery_rebind"] = {
             "schema_id": "aiworkhub.manager_rejection_recovery_rebind.v1",
             "recovery_epoch": recovery_epoch,
-            "recovery_predecessor_sha256": digest(recovery),
-            "terminal_failure_sha256": digest(terminal_failure),
+            "recovery_predecessor_sha256": _canonical_receipt_digest(recovery),
+            "terminal_failure_sha256": _canonical_receipt_digest(terminal_failure),
         }
     if terminal_retry_rebind:
         receipt["terminal_retry_rebind"] = {
             "schema_id": "aiworkhub.manager_rejection_terminal_retry_rebind.v1",
             "claim_epoch": current_claim_epoch,
-            "terminal_retry_sha256": digest(terminal_retry),
+            "terminal_retry_sha256": _canonical_receipt_digest(terminal_retry),
         }
     if pending_launch_failure_rebind is not None:
         receipt["pending_launch_failure_rebind"] = pending_launch_failure_rebind
@@ -8351,23 +8363,6 @@ def _normalize_allowed_write_path(path: str) -> str:
     return str(path or "").replace("\\", "/").lstrip("./")
 
 
-def _allowed_write_paths_overlap(left: str, right: str) -> bool:
-    if left == right:
-        return True
-    if any(ch in left + right for ch in "*?[]"):
-        # Glob semantics are intentionally fail-safe but non-expansive here:
-        # exact glob-vs-glob overlap is undecidable without a filesystem walk,
-        # and collision guard must remain repo-local, cheap, and deterministic.
-        return False
-    left_dir = left.endswith("/")
-    right_dir = right.endswith("/")
-    if left_dir and right.startswith(left):
-        return True
-    if right_dir and left.startswith(right):
-        return True
-    return False
-
-
 def _scan_aiworkhub_collisions(cards: list[dict[str, Any]]) -> dict[str, Any]:
     entries: list[tuple[str, str]] = []
     for card in cards:
@@ -8382,7 +8377,7 @@ def _scan_aiworkhub_collisions(cards: list[dict[str, Any]]) -> dict[str, Any]:
         for path_b, task_b in entries[idx + 1 :]:
             if task_a == task_b:
                 continue
-            if _allowed_write_paths_overlap(path_a, path_b):
+            if _paths_overlap(path_a, path_b, glob_aware=False):
                 key = path_a if path_a == path_b else f"{path_a} <-> {path_b}"
                 collisions[key].update((task_a, task_b))
 
@@ -8507,7 +8502,7 @@ def launch_collision_guard(
                 left if left == right else f"{left} <-> {right}"
                 for left in candidate_paths
                 for right in other_paths
-                if _allowed_write_paths_overlap(left, right)
+                if _paths_overlap(left, right, glob_aware=False)
             }
         )
         if not overlaps:
@@ -10663,19 +10658,20 @@ def needfix_convert(
     )
 
 
+def _canonical_task(task_id: str) -> dict[str, Any] | None:
+    return task_store.get_task(repo_root(), task_id)
+
+
 def needfix_link_existing_task(needfix_id: str, existing_task_id: str) -> dict[str, Any]:
     """Explicit manager-only link of a NeedFix to an already-existing,
     same-repository canonical task that is manager-accepted and finished."""
     ns = _needfix_store_module()
 
-    def _get_task_fn(task_id: str) -> dict[str, Any] | None:
-        return task_store.get_task(repo_root(), task_id)
-
     return ns.link_existing_task(
         repo_root(),
         needfix_id,
         existing_task_id,
-        _get_task_fn,
+        _canonical_task,
         task_store.canonical_status,
     )
 
@@ -10710,13 +10706,10 @@ def needfix_reopen_superseded_task_link(
     """
     ns = _needfix_store_module()
 
-    def _get_task_fn(task_id: str) -> dict[str, Any] | None:
-        return task_store.get_task(repo_root(), task_id)
-
     return ns.reopen_superseded_task_link(
         repo_root(),
         needfix_id,
-        get_task_fn=_get_task_fn,
+        get_task_fn=_canonical_task,
         canonical_status_fn=task_store.canonical_status,
         reason=reason,
     )

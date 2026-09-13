@@ -1,5 +1,22 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.30 — 2026-09-13
+
+### Fixed
+
+- Reconciliation materializes missing automatic-review children for sealed
+  review-ready candidates, closing the zero-child review stall without manual
+  reviewer launches.
+- Mechanical review parks, retained-delta reroutes, pending launch failures and
+  blocked-review learning identities preserve their authoritative state across
+  retries.
+- Read-only analysis and research complete without mutation-only validation or
+  reviewer requirements.
+- OpenCode isolated workers receive authentication, support classic Snap under
+  Landlock, and record capacity refusals as explicit provider evidence.
+- VS Code LM finalization preserves valid partial finals while failing closed
+  on contradictory or unauthenticated terminal evidence.
+
 ## 0.11.29 — 2026-09-13
 
 ### Added

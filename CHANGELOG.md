@@ -6,6 +6,31 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.30] - 2026-09-13
+
+### Fixed
+
+- Reconciliation now materializes missing automatic-review children for sealed
+  review-ready candidates and recovers zero-child review chains without manual
+  reviewer launches.
+- Mechanical review parks, blocked-review learning identities, retained-delta
+  reroutes, and pending launch failures now preserve their authoritative
+  lifecycle and failure classification across retries.
+- Read-only analysis and research complete without code-validation or reviewer
+  requirements that cannot add assurance to a mutation-free result.
+- OpenCode workers receive isolated authentication, support classic Snap under
+  Landlock, and seal capacity refusals as provider evidence instead of leaving
+  ambiguous failed attempts.
+- VS Code LM finalization preserves valid partial finals while continuing to
+  reject contradictory or unauthenticated terminal evidence.
+
+### Validation
+
+- The release activates the already-reviewed zero-child recovery and related
+  mechanical-failure regressions now present in the canonical tree. Python,
+  extension, release-metadata, package and fresh-install smoke gates are run
+  before tagging.
+
 ## [0.11.29] - 2026-09-13
 
 ### Added

@@ -14,18 +14,18 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.11.29
+## What's new in 0.11.30
 
-- The Models tab now presents a bounded provider-to-model tree and includes
-  OpenCode identities discovered from the cached preflight snapshot.
-- Discovery is reported separately from repository enablement, launchability,
-  access and observed round-trip execution; a listed model is never presented
-  as proven runnable without evidence.
-- Automatic VS Code LM reviewers use one authenticated, request-bound
-  submission contract instead of conflicting tool-call and printed-JSON
-  instructions.
-- Missing review chains are recovered by reconciliation, and all worker
-  backends enforce one monotonic hard timeout.
+- Sealed `review_ready` candidates whose automatic reviewer child was never
+  created are recovered by reconciliation without manager-launched reviewers.
+- Mechanical review parks, retained-delta reroutes and pending launch failures
+  preserve their authoritative lifecycle across retries.
+- Read-only analysis and research no longer consume mutation-only validation or
+  reviewer work.
+- OpenCode workers receive isolated authentication, classic Snap launch support
+  under Landlock, and explicit capacity-refusal evidence.
+- VS Code LM finalization keeps valid partial finals while contradictory or
+  unauthenticated terminal evidence remains rejected.
 
 Automatic quality-review launch moves worker completion through a
 system-owned correctness, security, and code-quality chain without
