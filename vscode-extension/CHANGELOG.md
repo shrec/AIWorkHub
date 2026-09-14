@@ -1,5 +1,13 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.39 — 2026-09-14
+
+### Fixed
+
+- Automatic review recovery now advances the pending reservation cursor through
+  the action actually selected. A deferred first chain no longer loops back to
+  itself and prevents later ready review chains from running in the same pass.
+
 ## 0.11.38 — 2026-09-14
 
 ### Fixed

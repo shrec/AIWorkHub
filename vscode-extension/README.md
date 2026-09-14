@@ -14,7 +14,11 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.11.38
+## What's new in 0.11.39
+
+- Review recovery now preserves fair cursor progress when its first action is
+  deferred, allowing later ready reviewer chains to run in the same bounded
+  reconciler pass.
 
 - Reconciler review recovery now advances a bounded batch of durable actions
   per scan and continues past deferred chains. A busy review queue can no

@@ -6,6 +6,22 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.39] - 2026-09-14
+
+### Fixed
+
+- Review lifecycle reservation now advances its persistent pending cursor only
+  through the action actually selected. Returning a deferred head to pending no
+  longer wraps the cursor immediately and starves later ready review chains.
+- An exhausted pending round performs at most one bounded rollover scan, so
+  blocked descendants do not regress the existing one-call progress guarantee.
+
+### Validation
+
+- The review lifecycle, orchestrator, replay, task-store, single-writer and
+  reconciler suites pass with 274 tests. A regression test proves a deferred
+  first chain cannot prevent a later ready chain from being reserved.
+
 ## [0.11.38] - 2026-09-14
 
 ### Fixed
