@@ -1,5 +1,13 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.37 — 2026-09-14
+
+### Fixed
+
+- Reconciler review recovery advances one durable lifecycle action per scan so
+  stalled-review repair no longer blocks unrelated Task MCP operations for
+  several minutes.
+
 ## 0.11.36 — 2026-09-13
 
 ### Fixed

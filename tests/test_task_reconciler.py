@@ -57,15 +57,15 @@ def test_run_scan_recovery_error_does_not_block_worker_reconcile(monkeypatch, tm
 
 def test_run_scan_drains_only_after_ensured_recovery(monkeypatch, tmp_path):
     mgr = _Mgr(tmp_path)
-    drained: list[Path] = []
+    drained: list[tuple[Path, int | None]] = []
 
     class _Driver:
         def __init__(self, manager, *, db_path):
             self.manager = manager
             self.db_path = db_path
 
-        def drain(self, **_kwargs):
-            drained.append(self.db_path)
+        def drain(self, *, max_actions=None, **_kwargs):
+            drained.append((self.db_path, max_actions))
             return SimpleNamespace(
                 as_dict=lambda: {
                     "attempted": 2,
@@ -100,7 +100,7 @@ def test_run_scan_drains_only_after_ensured_recovery(monkeypatch, tmp_path):
         _Driver,
     )
     result = task_reconciler.run_scan(mgr, include_gc=False)
-    assert drained == [tmp_path / "review.sqlite"]
+    assert drained == [(tmp_path / "review.sqlite", 1)]
     assert result["review_recovery"]["review_recovery_ensured"] == 1
     assert result["finalized"] == 3
 

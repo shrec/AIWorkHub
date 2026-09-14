@@ -536,9 +536,14 @@ def _scan_review_ready_recovery(manager: Any) -> dict[str, Any]:
         # duplicate chains, children, requests or provider launches.
         pending_work = int(recovery.get("review_recovery_ensured") or 0) > 0
         if pending_work:
+            # A reconciler pass must stay shorter than its cadence.  Draining
+            # the default action batch can synchronously rank/launch many
+            # reviewer effects and has held this loop for several minutes,
+            # starving unrelated Task MCP operations.  Advance exactly one
+            # durable effect per pass; later passes resume from the ledger.
             drain = review_orchestrator.ReviewOrchestrator(
                 manager, db_path=review_db,
-            ).drain()
+            ).drain(max_actions=1)
             recovery["review_recovery_drain"] = drain.as_dict()
         else:
             recovery.setdefault(
