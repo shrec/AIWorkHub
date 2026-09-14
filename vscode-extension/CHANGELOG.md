@@ -1,5 +1,24 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.41 — 2026-09-14
+
+### Fixed
+
+- Windows native-CLI workers now launch inside the repo-scoped AppContainer
+  profile and its kill-on-close Job Object: the launcher declares that backend
+  with the canonical repository identity and refuses to spawn without it, and
+  the supervisor accepts no other spelling. The confinement report states the
+  boundary actually in force rather than a fixed answer, so a host that does
+  not qualify is still reported as bounded by process-tree lifetime only.
+  Proved by fake-Windows behaviour tests over the real launch path; no
+  live-Windows execution evidence is claimed yet.
+- A Windows extension host resuming from idle no longer loses repository
+  discovery to one transient handle, sharing or lock fault. The manifest read
+  now retries exactly once, only for an authenticated transient cause, on a
+  brand-new descriptor that repeats every symlink, regular-file and identity
+  check. A missing, malformed, foreign or otherwise invalid manifest still
+  fails closed on the first attempt, with no sleep and no second retry.
+
 ## 0.11.40 — 2026-09-14
 
 ### Fixed

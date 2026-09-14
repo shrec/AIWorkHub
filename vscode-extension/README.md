@@ -14,7 +14,21 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.11.40
+## What's new in 0.11.41
+
+- Windows native-CLI workers now run inside the repo-scoped AppContainer
+  profile and its kill-on-close Job Object when the platform, the host's
+  AppContainer APIs and the launch path all confirm it, and the confinement
+  report names the boundary actually in force instead of a fixed answer. The
+  wiring is proved by fake-Windows behaviour tests over the real launch path;
+  a live Windows canary has not run, so no live-Windows evidence is claimed.
+
+- A Windows extension host resuming from idle no longer loses repository
+  discovery to one transient handle, sharing or lock fault. The manifest read
+  retries exactly once, only for an authenticated transient cause, on a
+  brand-new descriptor that repeats every symlink, regular-file and identity
+  check. A missing, malformed, foreign or otherwise invalid manifest still
+  fails closed immediately.
 
 - Rejected validation-only candidates now lose their one-episode replay grant,
   ensuring the next rework claim invokes a worker instead of repeating stale

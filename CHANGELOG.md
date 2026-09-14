@@ -6,6 +6,46 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.41] - 2026-09-14
+
+### Fixed
+
+- Windows native-CLI workers now actually launch inside the repo-scoped
+  AppContainer profile and its kill-on-close Job Object. The launcher writes the
+  execution backend together with the canonical `repo_id` and the normalized
+  `worker_kind`, and refuses the launch before spawn when that identity cannot
+  be established; the supervisor dispatches on that exact backend token and
+  refuses any other spelling instead of falling through to a plain subprocess.
+- The Windows confinement report now derives the boundary in force from the
+  three facts it measures -- platform, host AppContainer APIs and launch-path
+  wiring -- rather than returning a constant, so a host that does not qualify is
+  still described as bounded by worker process-tree lifetime only.
+- A Windows extension host resuming from idle no longer loses repository
+  discovery to a single transient fault. The manifest read now takes at most one
+  immediate retry, authorized only for a transient cause (Win32
+  `ERROR_INVALID_HANDLE`, `ERROR_SHARING_VIOLATION`, `ERROR_LOCK_VIOLATION`, or
+  POSIX `EINTR`), and that retry is a whole new attempt on a brand-new
+  descriptor which repeats the symlink, regular-file and dev/ino identity
+  checks. A missing manifest, invalid UTF-8/JSON, a non-object payload, a
+  foreign repository and every identity or security rejection stay fail-closed
+  on the first attempt; there is no sleep, no backoff and no second retry.
+- Shared-router repository discovery now reads identity through that one
+  validated `repository_state` manifest reader instead of a second local JSON
+  parser, inheriting the same checks and the same single bounded recovery while
+  still degrading to an empty id rather than raising.
+
+### Validation
+
+- The Windows AppContainer wiring is proved by deterministic fake-Windows
+  behaviour tests that drive the real launcher and supervisor call path on
+  Linux. Those seams cannot prove a Win32 syscall: NF-2026-00452 stays open
+  until a real Windows read-only canary runs after this release, and this
+  release claims no live-Windows execution evidence.
+- The bounded manifest recovery is covered by repository-state and shared-router
+  regressions asserting that exactly one retry is authorized, that the retry
+  re-runs every identity check on a fresh descriptor, and that non-transient
+  causes are never retried into acceptance.
+
 ## [0.11.40] - 2026-09-14
 
 ### Fixed
