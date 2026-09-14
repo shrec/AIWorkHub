@@ -193,6 +193,22 @@ def test_reviewer_bound_to_a_different_request_survives(coord):
     assert "R_REWORK" in _review_queue(coord)
 
 
+def test_reviewer_bound_to_a_different_parent_is_not_a_cleanup_target(coord):
+    """Rejecting one parent must not cancel another parent's live reviewer."""
+    _insert_parent(coord, "T_MAIN", "REQ_A")
+    _insert_reviewer(coord, "R_BOUND", "T_MAIN", "REQ_A")
+    _insert_reviewer(coord, "R_FOREIGN", "T_OTHER", "REQ_OTHER")
+
+    res = core.reject_review("T_MAIN", "rework", to="pending")
+    assert res["ok"] is True, res
+
+    named = {row["task_id"] for row in res["reviewer_finalization"]}
+    assert named == {"R_BOUND"}
+    assert _status(coord, "R_BOUND") == ("superseded", "superseded")
+    assert _status(coord, "R_FOREIGN") == ("review", "review")
+    assert "R_FOREIGN" in _review_queue(coord)
+
+
 def test_reject_receipt_shape_matches_accept_receipt(coord):
     """Each reject row carries exactly the keys accept_review returns."""
     _insert_parent(coord, "T_MAIN", "REQ_A")

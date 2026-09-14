@@ -6170,18 +6170,19 @@ def reject_review(
             payload = {}
         finalized = {str(tid) for tid in (payload.get("finalized") or [])}
         superseded = {str(tid) for tid in (payload.get("superseded") or [])}
-        skipped = {str(tid) for tid in (payload.get("skipped") or [])}
         errored: dict[str, str] = {}
         for entry in payload.get("errors") or []:
             reviewer_id, _, message = str(entry).partition(":")
             errored[reviewer_id] = message
         rows: list[dict[str, Any]] = []
-        for reviewer_task_id in sorted(finalized | superseded | skipped | set(errored)):
+        # ``skipped`` includes reviewer cards owned by another parent.  They
+        # were deliberately not disposed and therefore must never enter the
+        # cleanup receipt consumed by ``cancel_disposed_reviewer_processes``.
+        for reviewer_task_id in sorted(finalized | superseded | set(errored)):
             rows.append({
                 "task_id": reviewer_task_id,
                 "finished": reviewer_task_id in finalized
-                or reviewer_task_id in superseded
-                or reviewer_task_id in skipped,
+                or reviewer_task_id in superseded,
                 "cleanup_error": errored.get(reviewer_task_id, ""),
             })
         return rows
