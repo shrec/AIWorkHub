@@ -506,6 +506,29 @@ def test_run_once_no_pending_is_a_zero_launch_noop():
         assert result == {"ok": True, "action": "no_pending"}
 
 
+def test_repeated_idle_connections_initialize_schema_once(monkeypatch, tmp_path):
+    db_path = tmp_path / "task_queue.sqlite"
+    bridge = CallbackBridge(
+        repo=tmp_path,
+        db_path=db_path,
+        state_path=tmp_path / "state.json",
+        executable=["/nonexistent/should-never-be-launched"],
+    )
+    init_calls = 0
+    original = bridge._callback_store.init_db
+
+    def counted_init(conn):
+        nonlocal init_calls
+        init_calls += 1
+        original(conn)
+
+    monkeypatch.setattr(bridge._callback_store, "init_db", counted_init)
+    for _ in range(3):
+        conn = bridge._conn()
+        conn.close()
+    assert init_calls == 1
+
+
 def test_already_finalized_backlog_yields_zero_turns_via_supersede():
     """A backlog whose task has since moved out of the matching terminal
     state (already finalized/reclaimed) must be superseded, not delivered

@@ -1707,10 +1707,20 @@ class CallbackBridge:
         self._sideband_client: SidebandCallbackClient | None = None
         self._stop_event = threading.Event()
         self._startup_recovered_batch_count = 0
+        self._schema_ready = False
+        self._schema_guard = threading.Lock()
 
     def _conn(self):
         conn = self._callback_store.open_db(self._db_path)
-        self._callback_store.init_db(conn)
+        if not self._schema_ready:
+            try:
+                with self._schema_guard:
+                    if not self._schema_ready:
+                        self._callback_store.init_db(conn)
+                        self._schema_ready = True
+            except Exception:
+                conn.close()
+                raise
         return conn
 
     def recover_incompatible_transport_leases(self) -> int:
