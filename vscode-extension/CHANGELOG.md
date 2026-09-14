@@ -1,5 +1,13 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.40 — 2026-09-14
+
+### Fixed
+
+- Rejected validation-only candidates can no longer loop through provider-free
+  replay; the next rework claim must run the selected worker.
+- Parent rejection no longer finalizes or cancels unrelated reviewer tasks.
+
 ## 0.11.39 — 2026-09-14
 
 ### Fixed

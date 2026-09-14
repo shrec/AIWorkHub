@@ -6,6 +6,22 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.40] - 2026-09-14
+
+### Fixed
+
+- Rejecting a validation-only replay now invalidates that episode's replay
+  grant, so the next rework claim invokes a provider instead of rerunning the
+  rejected candidate bytes indefinitely.
+- Rejecting one parent now cancels only its bound reviewer children; foreign
+  review tasks are skipped without being reported as finalized or terminated.
+
+### Validation
+
+- Rework/rejection lifecycle coverage passes with 121 tests, including a
+  regression proving a rejected replay grant cannot survive into the successor
+  claim. The reviewer-cleanup regression suite passes with 99 focused tests.
+
 ## [0.11.39] - 2026-09-14
 
 ### Fixed
