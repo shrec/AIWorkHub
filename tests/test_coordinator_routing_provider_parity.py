@@ -19,7 +19,9 @@ These tests pin three invariants:
 """
 from __future__ import annotations
 
+import errno
 import json
+import os
 import sys
 import types
 import uuid
@@ -29,7 +31,7 @@ _SRC = Path(__file__).resolve().parents[1] / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from aiworkhub import core, task_store  # noqa: E402
+from aiworkhub import app_server_mux, core, repository_state, task_store  # noqa: E402
 
 _CLAUDE_IDENTITY = {
     "provider": "claude",
@@ -262,3 +264,103 @@ def test_dispatcher_health_headless_when_no_verified_identity_and_no_window(tmp_
 
     assert health["selected_provider"] == "codex"
     assert health["dispatch_expected"] is False
+
+
+# ---------------------------------------------------------------------------
+# 4. NF833: the exact live-mux thread projection survives one transient
+#    Windows manifest fault, and still fails closed on a real I/O error.
+# ---------------------------------------------------------------------------
+
+_LIVE_THREAD_ID = "019f5097-6dbe-7172-870a-945afc5f3bfa"
+_ERROR_LOCK_VIOLATION = 33
+
+
+def _windows_manifest_fault(monkeypatch, manifest_path):
+    """Count every manifest open and fail the next one with the armed error.
+
+    Arming is single-shot, so a read that comes back has to have recovered on
+    its own next fresh descriptor; the attempt count leaves no room for a
+    hidden loop, sleep or reload.
+    """
+
+    original_open = os.open
+    fault = {"armed": None, "attempts": 0}
+
+    def flaky_open(path, flags, mode=0o777, **kwargs):
+        if Path(path) == manifest_path:
+            fault["attempts"] += 1
+            error = fault["armed"]
+            if error is not None:
+                fault["armed"] = None
+                raise error
+        return original_open(path, flags, mode, **kwargs)
+
+    monkeypatch.setattr(os, "open", flaky_open)
+    return fault
+
+
+def _install_live_mux(monkeypatch, tmp_path, repo_id, *, pid=12345):
+    """Present exactly one live, fresh, ready sideband instance for this route."""
+
+    instance = types.SimpleNamespace(
+        repo_id=repo_id,
+        parent_pid=pid,
+        is_owner_fresh=True,
+        ready=True,
+        active_thread_id=_LIVE_THREAD_ID,
+    )
+    monkeypatch.setattr(app_server_mux, "default_sideband_dir", lambda: tmp_path / "sideband")
+    monkeypatch.setattr(
+        app_server_mux, "list_live_sideband_instances", lambda sideband_dir: [instance]
+    )
+
+
+def test_live_mux_thread_projection_recovers_after_transient_manifest_fault(tmp_path, monkeypatch):
+    root = _init_repo(tmp_path)
+    repo_id = _write_codex_route(root)
+    monkeypatch.setattr(core, "_claude_manager_identity", lambda: None)
+    _install_live_mux(monkeypatch, tmp_path, repo_id)
+    fault = _windows_manifest_fault(monkeypatch, root / repository_state.PROJECT_MANIFEST_REL)
+
+    baseline = core.read_selected_coordinator_target(root)
+    clean_opens = fault["attempts"]
+
+    lock_violation = PermissionError(13, "lock violation")
+    lock_violation.winerror = _ERROR_LOCK_VIOLATION
+    fault["armed"] = lock_violation
+    recovered = core.read_selected_coordinator_target(root)
+    faulted_opens = fault["attempts"] - clean_opens
+
+    for target in (baseline["targets"]["codex"], recovered["targets"]["codex"]):
+        assert target["capability_state"] == "available"
+        assert target["route"]["thread_id"] == _LIVE_THREAD_ID
+        assert target["route"]["session_id"] == _LIVE_THREAD_ID
+        assert target["wake"] == {"mode": "app_server_sideband", "supported": True}
+    # The projection is back on this very read -- no VS Code reload -- and it
+    # cost exactly one extra attempt: one retry, never a loop.
+    assert fault["armed"] is None
+    assert clean_opens >= 1
+    assert faulted_opens == clean_opens + 1
+
+
+def test_live_mux_thread_projection_stays_route_pending_on_non_transient_fault(
+    tmp_path, monkeypatch
+):
+    root = _init_repo(tmp_path)
+    repo_id = _write_codex_route(root)
+    monkeypatch.setattr(core, "_claude_manager_identity", lambda: None)
+    _install_live_mux(monkeypatch, tmp_path, repo_id)
+    fault = _windows_manifest_fault(monkeypatch, root / repository_state.PROJECT_MANIFEST_REL)
+    fault["armed"] = OSError(errno.EIO, "Input/output error")
+
+    target = core.read_selected_coordinator_target(root)
+
+    codex_target = target["targets"]["codex"]
+    assert codex_target["capability_state"] == "route_pending"
+    assert codex_target["route"]["thread_id"] == ""
+    assert codex_target["wake"] == {
+        "mode": "direct_api_or_callback_inbox",
+        "supported": False,
+        "reason": "codex_thread_id_not_observed",
+    }
+    assert fault["attempts"] == 1

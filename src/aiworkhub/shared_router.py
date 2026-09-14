@@ -327,17 +327,22 @@ def rollback_manager_route(
 
 
 def _read_manifest_repo_id(root: Path) -> str:
+    """Return the repo_id the repository itself claims, or "" if it cannot.
+
+    Identity comes from canonical ``repository_state`` inspection -- the one
+    validated manifest reader -- rather than a second parser here, so shared
+    discovery inherits its symlink/regular-file/dev-ino checks and its single
+    bounded fresh-descriptor recovery for a transient Windows fault.  Discovery
+    stays bounded and non-raising: a missing, unreadable, malformed or
+    otherwise invalid manifest degrades to the empty id that marks the registry
+    record as a reject.
+    """
+
     try:
-        payload = json.loads(
-            (root / repository_state.PROJECT_MANIFEST_REL).read_text(
-                encoding="utf-8"
-            )
-        )
-    except (OSError, json.JSONDecodeError):
+        state = repository_state.inspect_repository(root)
+    except (repository_state.RepositoryStateError, OSError, ValueError):
         return ""
-    if not isinstance(payload, dict):
-        return ""
-    return str(payload.get("repo_id") or "")
+    return str(state.manifest.repo_id or "")
 
 
 def _bounded_record(path: Path, *, now: float) -> dict[str, Any]:

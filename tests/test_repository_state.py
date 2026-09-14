@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import json
 import os
 from pathlib import Path
@@ -272,3 +273,200 @@ def test_bootstrap_creates_repository_local_store_registry(tmp_path: Path) -> No
     assert registry.payload["repo_id"] == "repo_store_registry"
     assert task_db == state.hub_dir / "tasking" / "task_queue.sqlite"
     assert str(task_db).startswith(str(state.root))
+
+
+# ---------------------------------------------------------------------------
+# NF833: one bounded fresh-descriptor recovery for transient manifest I/O.
+# ---------------------------------------------------------------------------
+
+_ERROR_INVALID_HANDLE = 6
+_ERROR_SHARING_VIOLATION = 32
+_ERROR_LOCK_VIOLATION = 33
+_ERROR_ACCESS_DENIED = 5
+
+
+def _win32_error(winerror: int, message: str) -> OSError:
+    """Build an OSError shaped the way CPython raises one on Win32."""
+    error = PermissionError(errno.EACCES, message)
+    error.winerror = winerror
+    return error
+
+
+def _fail_manifest_opens(
+    monkeypatch: pytest.MonkeyPatch,
+    manifest_path: Path,
+    errors: list[OSError],
+) -> list[int]:
+    """Raise ``errors`` in order on the first opens of ``manifest_path``.
+
+    Once the queue is exhausted every further open -- including the fresh
+    descriptor of a retry -- behaves normally, so recovery is proven by the
+    very next read rather than by any sleep, backoff or timing.  The returned
+    list records one entry per attempted manifest open.
+    """
+
+    original_open = os.open
+    attempts: list[int] = []
+    pending = list(errors)
+
+    def flaky_open(
+        path: os.PathLike[str] | str,
+        flags: int,
+        mode: int = 0o777,
+        **kwargs: object,
+    ) -> int:
+        if Path(path) == manifest_path:
+            attempts.append(flags)
+            if pending:
+                raise pending.pop(0)
+        return original_open(path, flags, mode, **kwargs)
+
+    monkeypatch.setattr(os, "open", flaky_open)
+    return attempts
+
+
+@pytest.mark.parametrize(
+    "build_error",
+    [
+        lambda: _win32_error(_ERROR_INVALID_HANDLE, "The handle is invalid"),
+        lambda: _win32_error(_ERROR_SHARING_VIOLATION, "used by another process"),
+        lambda: _win32_error(_ERROR_LOCK_VIOLATION, "lock violation"),
+        lambda: OSError(errno.EINTR, "Interrupted system call"),
+    ],
+    ids=["win32_invalid_handle", "win32_sharing_violation", "win32_lock_violation", "posix_eintr"],
+)
+def test_transient_manifest_fault_recovers_on_one_fresh_descriptor_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    build_error,
+) -> None:
+    repo = tmp_path / "C_drive" / "work" / "repo"
+    _git_init(repo)
+    state = rs.bootstrap_repository(repo, repo_id="repo_" + "e" * 32)
+    manifest_path = repo / rs.PROJECT_MANIFEST_REL
+    attempts = _fail_manifest_opens(monkeypatch, manifest_path, [build_error()])
+
+    recovered = rs.inspect_repository(repo)
+
+    assert recovered.manifest.repo_id == state.manifest.repo_id
+    # Exactly one retry, and it opened its own descriptor with the same
+    # no-follow authority as the first attempt.
+    assert len(attempts) == 2
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    assert all((flags & nofollow) == nofollow for flags in attempts)
+
+
+@pytest.mark.parametrize(
+    "build_error",
+    [
+        lambda: OSError(errno.EIO, "Input/output error"),
+        lambda: OSError(errno.ENODEV, "No such device"),
+        lambda: PermissionError(errno.EPERM, "Operation not permitted"),
+        lambda: PermissionError(errno.EACCES, "Permission denied"),
+        lambda: _win32_error(_ERROR_ACCESS_DENIED, "Access is denied"),
+        lambda: FileNotFoundError(errno.ENOENT, "The system cannot find the file"),
+    ],
+    ids=["eio", "enodev", "eperm", "eacces", "win32_access_denied", "enoent_after_prevalidation"],
+)
+def test_non_transient_manifest_faults_are_never_retried(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    build_error,
+) -> None:
+    repo = tmp_path / "C_drive" / "work" / "repo"
+    _git_init(repo)
+    rs.bootstrap_repository(repo, repo_id="repo_" + "f" * 32)
+    manifest_path = repo / rs.PROJECT_MANIFEST_REL
+    attempts = _fail_manifest_opens(monkeypatch, manifest_path, [build_error()])
+
+    with pytest.raises(rs.ManifestInvalidError, match="manifest_unreadable"):
+        rs.inspect_repository(repo)
+
+    assert len(attempts) == 1
+
+
+def test_identity_change_on_the_second_attempt_stays_unreadable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = tmp_path / "C_drive" / "work" / "repo"
+    _git_init(repo)
+    owner_id = "repo_" + "1" * 32
+    external_id = "repo_" + "2" * 32
+    rs.bootstrap_repository(repo, repo_id=owner_id)
+    manifest_path = repo / rs.PROJECT_MANIFEST_REL
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload["repo_id"] = external_id
+    external = tmp_path / "D_drive" / "external-project.json"
+    external.parent.mkdir(parents=True)
+    external.write_text(json.dumps(payload), encoding="utf-8")
+
+    original_open = os.open
+    attempts: list[int] = []
+
+    def flaky_open(
+        path: os.PathLike[str] | str,
+        flags: int,
+        mode: int = 0o777,
+        **kwargs: object,
+    ) -> int:
+        if Path(path) == manifest_path:
+            attempts.append(flags)
+            if len(attempts) == 1:
+                raise _win32_error(_ERROR_SHARING_VIOLATION, "used by another process")
+            if len(attempts) == 2:
+                # The retry has already taken its own lstat; swap a foreign
+                # repository's manifest in underneath it so the descriptor it
+                # is about to receive no longer carries that dev/ino.
+                manifest_path.unlink()
+                external.replace(manifest_path)
+        return original_open(path, flags, mode, **kwargs)
+
+    monkeypatch.setattr(os, "open", flaky_open)
+    with pytest.raises(rs.ManifestInvalidError, match="manifest_unreadable"):
+        rs.inspect_repository(repo)
+
+    assert len(attempts) == 2
+    assert json.loads(manifest_path.read_text(encoding="utf-8"))["repo_id"] == external_id
+    assert owner_id != external_id
+
+
+def test_transient_fault_never_retries_invalid_payload_into_acceptance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = tmp_path / "repo"
+    _git_init(repo)
+    rs.bootstrap_repository(repo, repo_id="repo_" + "3" * 32)
+    manifest_path = repo / rs.PROJECT_MANIFEST_REL
+    manifest_path.write_bytes(b"{not-json")
+    attempts = _fail_manifest_opens(
+        monkeypatch,
+        manifest_path,
+        [_win32_error(_ERROR_SHARING_VIOLATION, "used by another process")],
+    )
+
+    with pytest.raises(rs.ManifestInvalidError, match="manifest_invalid_json"):
+        rs.inspect_repository(repo)
+
+    assert len(attempts) == 2
+
+
+def test_transient_fault_never_retries_foreign_identity_into_acceptance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = tmp_path / "repo"
+    _git_init(repo)
+    rs.bootstrap_repository(repo, repo_id="repo_" + "4" * 32)
+    manifest_path = repo / rs.PROJECT_MANIFEST_REL
+    attempts = _fail_manifest_opens(
+        monkeypatch,
+        manifest_path,
+        [_win32_error(_ERROR_LOCK_VIOLATION, "lock violation")],
+    )
+
+    with pytest.raises(rs.ManifestInvalidError, match="repo_id_mismatch"):
+        rs.inspect_repository(repo, expected_repo_id="repo_" + "5" * 32)
+
+    assert len(attempts) == 2

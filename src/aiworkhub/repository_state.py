@@ -8,6 +8,7 @@ Callers must explicitly ask to resolve, inspect, or bootstrap a repository.
 from __future__ import annotations
 
 import contextlib
+import errno
 import json
 import os
 import re
@@ -243,7 +244,44 @@ def resolve_repository_root(
     return root
 
 
-def _read_manifest(path: Path) -> RepositoryManifest:
+_RETRYABLE_WIN32_MANIFEST_ERRORS = frozenset(
+    {
+        6,   # ERROR_INVALID_HANDLE
+        32,  # ERROR_SHARING_VIOLATION
+        33,  # ERROR_LOCK_VIOLATION
+    }
+)
+
+
+def _is_transient_manifest_io_error(exc: BaseException | None) -> bool:
+    """Authorize exactly one fresh-descriptor retry of a manifest read.
+
+    A Windows extension host that resumes from idle can hand back
+    ERROR_INVALID_HANDLE / ERROR_SHARING_VIOLATION / ERROR_LOCK_VIOLATION for
+    one read of a file it will serve normally a moment later, and a POSIX read
+    can be interrupted (EINTR).  Nothing else is transient: EIO, ENODEV, a bare
+    EPERM/EACCES with no Win32 code, a missing manifest, decode/JSON failures
+    and every identity or security rejection stay fail-closed on the first
+    attempt.
+    """
+
+    if not isinstance(exc, OSError) or isinstance(exc, FileNotFoundError):
+        return False
+    if exc.errno == errno.EINTR:
+        return True
+    winerror = getattr(exc, "winerror", None)
+    return type(winerror) is int and winerror in _RETRYABLE_WIN32_MANIFEST_ERRORS
+
+
+def _read_manifest_once(path: Path) -> RepositoryManifest:
+    """Perform one complete, self-contained secure manifest read attempt.
+
+    The attempt owns every check it relies on: its own symlink-component scan,
+    its own ``lstat``, its own descriptor, and its own ``fstat`` dev/ino
+    comparison against that ``lstat``.  Nothing -- descriptor, stat identity or
+    decoded payload -- is carried in from or out to another attempt.
+    """
+
     if _has_symlink_component(path):
         raise PathEscapeError(f"manifest_symlink_component:{path}")
     try:
@@ -297,6 +335,26 @@ def _read_manifest(path: Path) -> RepositoryManifest:
     if not isinstance(payload, dict):
         raise ManifestInvalidError("manifest_must_be_object")
     return RepositoryManifest.from_json(payload)
+
+
+def _read_manifest(path: Path) -> RepositoryManifest:
+    """Read the manifest, allowing at most one immediate retry.
+
+    The retry is taken only for an authenticated transient I/O failure and is a
+    whole new attempt on a brand new descriptor, so the symlink, regular-file
+    and dev/ino identity checks all run again against what is on disk now.
+    There is no sleep, no backoff and no second retry: a second attempt that
+    still fails, or whose identity moved, remains ``manifest_unreadable``, and
+    invalid UTF-8/JSON, a non-object payload, a foreign repository or any
+    identity mismatch is never retried into acceptance.
+    """
+
+    try:
+        return _read_manifest_once(path)
+    except ManifestInvalidError as exc:
+        if not _is_transient_manifest_io_error(exc.__cause__):
+            raise
+    return _read_manifest_once(path)
 
 
 def inspect_repository(
