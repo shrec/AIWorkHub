@@ -434,16 +434,27 @@ def _refusing_validator(*refused_summaries):
     return normalize_packet_findings
 
 
-def _run_supervisor_ingest(tmp_path, monkeypatch, *, findings, validator):
-    """Drive the real supervisor ingest over one provider final."""
+def _run_supervisor_ingest(
+    tmp_path, monkeypatch, *, findings, validator, progress_events: int = 0
+):
+    """Drive the real supervisor ingest over one provider final.
+
+    ``progress_events`` prepends that many known replayable progress events --
+    the NF-2026-00163 amplification compacted out of the retained stream.  At
+    the default 0 the stdout log is byte-identical to the single-final log
+    every other caller here has always written.
+    """
     from aiworkhub import quality_reviewer, worker_ai_tools_mcp
 
     stdout = tmp_path / "req-1.stdout.log"
     stdout.write_text(
-        json.dumps({
-            "type": "result",
-            "result": json.dumps({"lens": "correctness", "findings": findings}),
-        }),
+        "\n".join([
+            *_progress_chatter(progress_events),
+            json.dumps({
+                "type": "result",
+                "result": json.dumps({"lens": "correctness", "findings": findings}),
+            }),
+        ]),
         encoding="utf-8",
     )
     monkeypatch.setattr(
@@ -873,3 +884,278 @@ def test_every_protocol_category_is_repairable_or_disclaimed() -> None:
     assert ingest.unclassified_protocol_categories(
         {"a_refusal_nobody_reasoned_about"}
     ) == ("a_refusal_nobody_reasoned_about",)
+
+
+# --- NF-2026-00163: bounded replayable progress-event compaction ----------
+#
+# A reviewer stream carries one record per UI tick, so a long review routinely
+# emits tens of thousands of ``assistant.message_delta`` and
+# ``session.background_tasks_changed`` events.  That amplification pushed the
+# RETAINED stream past ``MAX_EVENTS`` and refused complete reviews as
+# ``provider_events_oversized``.  Those two types -- and only those two -- are
+# now compacted out before the count.  Most of what follows pins down what may
+# NOT change: the ceilings themselves, retained ordering, every other event
+# type, and each fail-closed refusal.
+
+LENS = "correctness"
+
+
+def _final_event() -> str:
+    return json.dumps({"type": "result", "result": _report()})
+
+
+def _message_delta(index: int) -> str:
+    return json.dumps({
+        "type": "assistant.message_delta",
+        "data": {"delta": f"chunk {index}"},
+    })
+
+
+def _background_tasks_changed(index: int) -> str:
+    return json.dumps({
+        "type": "session.background_tasks_changed",
+        "data": {"tasks": [{"id": f"bg-{index}", "state": "running"}]},
+    })
+
+
+def _progress_chatter(count: int) -> list[str]:
+    """``count`` known replayable progress events, both types interleaved."""
+    return [
+        _message_delta(index) if index % 2 else _background_tasks_changed(index)
+        for index in range(count)
+    ]
+
+
+def test_an_amplified_progress_stream_reconstructs_the_unamplified_report():
+    """The headline blocker: chatter alone must not lose a clean report."""
+    unamplified = [_final_event()]
+    amplified = [*_progress_chatter(ingest.MAX_EVENTS + 1000), _final_event()]
+
+    clean = ingest.extract_structured_final(unamplified, expected_lens=LENS)
+    noisy = ingest.extract_structured_final(amplified, expected_lens=LENS)
+
+    assert len(amplified) > ingest.MAX_EVENTS
+    assert noisy.status == clean.status == "structured_final"
+    assert noisy.report == clean.report == json.loads(_report())
+
+
+def test_the_retained_bounds_themselves_are_unchanged():
+    """Compaction shrinks the stream; it must never raise either ceiling."""
+    assert ingest.MAX_EVENTS == 4096
+    assert ingest.MAX_EVENT_BYTES == 1_048_576
+
+
+@pytest.mark.parametrize("event_type", sorted(ingest.REPLAYABLE_PROGRESS_EVENT_TYPES))
+def test_every_compactable_type_is_report_free_on_both_channels(event_type):
+    """Why dropping these is safe, asserted rather than assumed.
+
+    ``provider_final_text`` and ``provider_tool_use_findings`` are the ONLY
+    inputs ``extract_structured_final`` reconstructs a report from, so a type
+    both of them refuse cannot change the report by being dropped -- even when
+    its payload happens to contain the report text verbatim, as here.
+    """
+    event = {"type": event_type, "data": {"delta": _report(), "tasks": []}}
+
+    assert ingest.provider_final_text(event) == ""
+    assert ingest.provider_tool_use_findings(event) is None
+    assert ingest.replayable_progress_event(event) is True
+
+
+def test_a_named_progress_type_carrying_a_report_channel_is_retained(monkeypatch):
+    """Positive control: the channel check is load-bearing, not decoration.
+
+    No shipped provider shape puts a final or a host findings call inside a
+    delta, so without forcing one of the two readers to speak, the retained
+    branch of the guard would never be exercised and could rot unnoticed.
+    """
+    event = json.loads(_message_delta(1))
+    assert ingest.replayable_progress_event(event) is True
+
+    monkeypatch.setattr(ingest, "provider_final_text", lambda event: _report())
+    assert ingest.replayable_progress_event(event) is False
+
+    monkeypatch.setattr(ingest, "provider_final_text", lambda event: "")
+    monkeypatch.setattr(ingest, "provider_tool_use_findings", lambda event: [])
+    assert ingest.replayable_progress_event(event) is False
+
+
+@pytest.mark.parametrize(
+    "amplifier",
+    [
+        # A near-miss on each known name, so the allowlist is exact.
+        lambda index: json.dumps({"type": "assistant.message_delta_v2",
+                                  "data": {"delta": index}}),
+        lambda index: json.dumps({"type": "session.background_tasks",
+                                  "data": {"tasks": []}}),
+        # Already ignored by both readers -- but ignored is not compactable.
+        lambda index: json.dumps({"type": "progress", "data": {"n": index}}),
+        lambda index: f"not json at all {index}",
+        lambda index: json.dumps(index),
+    ],
+)
+def test_an_event_this_module_does_not_know_is_never_compacted(amplifier):
+    events = [amplifier(index) for index in range(ingest.MAX_EVENTS + 1)]
+
+    with pytest.raises(ingest.ReviewProtocolError, match="provider_events_oversized"):
+        ingest.extract_structured_final(events, expected_lens=LENS)
+
+
+def test_tool_calls_are_retained_and_still_counted():
+    events = [
+        _host_tool_use_event([{"severity": "low", "summary": "s"}])
+        for _ in range(ingest.MAX_EVENTS)
+    ]
+    events.append(_final_event())
+
+    with pytest.raises(ingest.ReviewProtocolError, match="provider_events_oversized"):
+        ingest.extract_structured_final(events, expected_lens=LENS)
+
+
+def test_an_individually_oversized_progress_event_still_fails_closed():
+    """A known type does not buy an exemption from ``MAX_EVENT_BYTES``."""
+    fat = json.dumps({
+        "type": "assistant.message_delta",
+        "data": {"delta": "x" * (ingest.MAX_EVENT_BYTES + 1)},
+    })
+    assert len(fat.encode("utf-8")) > ingest.MAX_EVENT_BYTES
+
+    with pytest.raises(ingest.ReviewProtocolError, match="provider_events_oversized"):
+        ingest.extract_structured_final([fat, _final_event()], expected_lens=LENS)
+
+
+def test_compacted_progress_chatter_is_itself_bounded(monkeypatch):
+    """Compaction must not trade a bounded refusal for unbounded work."""
+    monkeypatch.setattr(ingest, "MAX_COMPACTED_EVENTS", 3)
+
+    with pytest.raises(ingest.ReviewProtocolError, match="provider_events_oversized"):
+        ingest.extract_structured_final(
+            [*_progress_chatter(4), _final_event()], expected_lens=LENS
+        )
+
+
+def test_retained_event_order_survives_compaction():
+    last = [{"severity": "high", "summary": "last"}]
+    events = [
+        *_progress_chatter(3000),
+        _host_tool_use_event([{"severity": "low", "summary": "first"}]),
+        *_progress_chatter(3000),
+        _host_tool_use_event(last),
+        *_progress_chatter(3000),
+    ]
+
+    result = ingest.extract_structured_final(events, expected_lens=LENS)
+
+    # "the last host call wins" is an ORDER fact: compaction must not reshuffle
+    # what it keeps, only remove what it drops.
+    assert result.status == "structured_tool_use"
+    assert result.report == {"lens": LENS, "findings": last}
+
+
+def test_two_finals_still_conflict_across_a_compacted_stream():
+    events = [
+        *_progress_chatter(2500),
+        _final_event(),
+        *_progress_chatter(2500),
+        _final_event(),
+    ]
+
+    with pytest.raises(ingest.ReviewProtocolError, match="multiple_structured_finals"):
+        ingest.extract_structured_final(events, expected_lens=LENS)
+
+
+def test_a_lens_mismatch_still_fails_closed_across_a_compacted_stream():
+    events = [*_progress_chatter(ingest.MAX_EVENTS + 4), _final_event()]
+
+    with pytest.raises(ingest.ReviewProtocolError, match="lens_mismatch"):
+        ingest.extract_structured_final(events, expected_lens="security")
+
+
+def test_the_host_tool_use_fallback_survives_a_compacted_stream():
+    findings = [{"severity": "medium", "summary": "s", "evidence": "src/m.py:3"}]
+    events = [
+        *_progress_chatter(ingest.MAX_EVENTS + 4),
+        _host_tool_use_event(findings),
+    ]
+
+    result = ingest.extract_structured_final(events, expected_lens="security")
+
+    assert result.status == "structured_tool_use"
+    assert result.report == {"lens": "security", "findings": findings}
+
+
+def test_a_progress_only_stream_is_still_a_missing_final():
+    result = ingest.extract_structured_final(
+        _progress_chatter(ingest.MAX_EVENTS + 4), expected_lens=LENS
+    )
+
+    assert result.status == "missing_final"
+    assert result.report is None
+
+
+def test_compaction_telemetry_measures_persisted_records_and_bytes_only():
+    chatter = _progress_chatter(ingest.MAX_EVENTS + 8)
+    final = _final_event()
+
+    result = ingest.extract_structured_final([*chatter, final], expected_lens=LENS)
+    record = result.event_compaction
+
+    assert record["schema_id"] == "aiworkhub.provider_event_compaction.v1"
+    assert record["saving_scope"] == "persisted_bytes_and_records_only"
+    assert record["retained_events"] == 1
+    assert record["retained_bytes"] == len(final.encode("utf-8"))
+    assert record["persisted_events_dropped"] == len(chatter)
+    assert record["persisted_bytes_dropped"] == sum(
+        len(raw.encode("utf-8")) for raw in chatter
+    )
+    assert set(record["dropped_event_types"]) == ingest.REPLAYABLE_PROGRESS_EVENT_TYPES
+    assert sum(record["dropped_event_types"].values()) == len(chatter)
+    # Bounded, and measured against the ceilings it did not move.
+    assert record["retained_events"] <= record["max_retained_events"]
+    assert record["max_retained_events"] == ingest.MAX_EVENTS
+    assert record["max_event_bytes"] == ingest.MAX_EVENT_BYTES
+    assert record["max_events_dropped"] == ingest.MAX_COMPACTED_EVENTS
+    # Persisted-byte/record savings ONLY: the provider had already generated
+    # and billed every dropped event, so no token claim may appear here.
+    assert "token" not in json.dumps(record).lower()
+
+
+def test_an_unamplified_stream_reports_nothing_compacted():
+    result = ingest.extract_structured_final([_final_event()], expected_lens=LENS)
+
+    assert result.event_compaction["persisted_events_dropped"] == 0
+    assert result.event_compaction["persisted_bytes_dropped"] == 0
+    assert result.event_compaction["dropped_event_types"] == {}
+
+
+def test_the_audit_names_persisted_savings_only_when_chatter_was_compacted(
+    tmp_path, monkeypatch
+):
+    verification, submitted = _run_supervisor_ingest(
+        tmp_path,
+        monkeypatch,
+        findings=[{"severity": "low", "summary": "s", "evidence": "e"}],
+        validator=_accept_all_findings,
+        progress_events=ingest.MAX_EVENTS + 8,
+    )
+
+    record = verification["provider_event_compaction"]
+    assert submitted[0]["findings"] == [
+        {"severity": "low", "summary": "s", "evidence": "e"}
+    ]
+    assert record["persisted_events_dropped"] == ingest.MAX_EVENTS + 8
+    assert record["retained_events"] == 1
+    assert record["saving_scope"] == "persisted_bytes_and_records_only"
+    assert "token" not in json.dumps(record).lower()
+
+
+def test_a_clean_stream_leaves_no_compaction_record_on_the_receipt(
+    tmp_path, monkeypatch
+):
+    verification, _submitted = _run_supervisor_ingest(
+        tmp_path,
+        monkeypatch,
+        findings=[{"severity": "low", "summary": "s", "evidence": "e"}],
+        validator=_accept_all_findings,
+    )
+
+    assert "provider_event_compaction" not in verification

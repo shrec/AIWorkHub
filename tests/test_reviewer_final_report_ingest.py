@@ -116,3 +116,129 @@ def test_prose_with_a_lone_quote_still_finds_the_report() -> None:
     result, submitted = _ingest(final)
     assert submitted == [_report()]
     assert result.submitted is True
+
+
+# --- NF-2026-00163: the same one report, out of an amplified stream --------
+#
+# The sibling blocker to the prose final above, and the same loss: a complete
+# review was thrown away over the transport rather than its content.  Here the
+# reviewer typed a perfectly good JSON final, but its turn had also emitted
+# more than ``MAX_EVENTS`` live-progress records, so the retained stream was
+# refused as ``provider_events_oversized`` before the final was ever read.
+# Those known replayable events are compacted out of the retained stream;
+# submission must still happen exactly once, from the same report.
+
+_PROGRESS_TYPES = ("assistant.message_delta", "session.background_tasks_changed")
+
+
+def _progress_event(index: int) -> str:
+    return json.dumps({
+        "type": _PROGRESS_TYPES[index % len(_PROGRESS_TYPES)],
+        "data": {"delta": f"chunk {index}", "tasks": [{"id": f"bg-{index}"}]},
+    })
+
+
+def _amplified(final: str, *, progress: int) -> list[str]:
+    """One real final buried in ``progress`` known replayable events."""
+    half = progress // 2
+    return [
+        *(_progress_event(index) for index in range(half)),
+        _result_event(final),
+        *(_progress_event(index) for index in range(half, progress)),
+    ]
+
+
+def test_an_amplified_stream_still_submits_exactly_one_report() -> None:
+    from aiworkhub.quality_review_ingest import MAX_EVENTS
+
+    events = _amplified(json.dumps(_report()), progress=MAX_EVENTS + 500)
+    submitted: list[dict] = []
+
+    result = ingest_structured_final(
+        events, expected_lens=LENS, submit=submitted.append
+    )
+
+    assert len(events) > MAX_EVENTS
+    # Byte-for-byte the outcome of the unamplified stream.
+    assert submitted == [_report()]
+    assert result.submitted is True
+    assert result.report == _report()
+
+
+def test_the_amplified_and_unamplified_streams_agree_on_the_report() -> None:
+    from aiworkhub.quality_review_ingest import MAX_EVENTS
+
+    final = json.dumps(_report())
+    plain, _ = _ingest(final)
+    amplified = ingest_structured_final(
+        _amplified(final, progress=MAX_EVENTS + 500),
+        expected_lens=LENS,
+        submit=lambda report: None,
+    )
+
+    assert amplified.report == plain.report
+    assert amplified.status == plain.status == "submitted"
+
+
+def test_the_submitted_result_measures_only_persisted_savings() -> None:
+    from aiworkhub.quality_review_ingest import MAX_EVENTS
+
+    events = _amplified(json.dumps(_report()), progress=MAX_EVENTS + 500)
+
+    result = ingest_structured_final(
+        events, expected_lens=LENS, submit=lambda report: None
+    )
+    record = result.event_compaction
+
+    assert record["retained_events"] == 1
+    assert record["persisted_events_dropped"] == MAX_EVENTS + 500
+    assert record["saving_scope"] == "persisted_bytes_and_records_only"
+    # The provider generated and billed every dropped event before this reader
+    # saw it, so nothing here may be dressed up as a token saving.
+    assert "token" not in json.dumps(record).lower()
+
+
+def test_an_amplified_stream_without_a_report_still_fails_closed() -> None:
+    """Compaction removes chatter, never the reason a review was refused."""
+    from aiworkhub.quality_review_ingest import MAX_EVENTS
+
+    final = "I reviewed everything and found no defects worth reporting."
+    events = _amplified(final, progress=MAX_EVENTS + 500)
+    submitted: list[dict] = []
+
+    with pytest.raises(ReviewProtocolError) as excinfo:
+        ingest_structured_final(events, expected_lens=LENS, submit=submitted.append)
+
+    assert submitted == []
+    assert excinfo.value.category.startswith("no_report_in_final:")
+    # Still the reviewer's own words, not a bare count and not the chatter.
+    assert "no defects worth reporting" in str(excinfo.value)
+    assert "chunk" not in str(excinfo.value)
+
+
+def test_a_second_final_hidden_in_the_chatter_is_still_detected() -> None:
+    from aiworkhub.quality_review_ingest import MAX_EVENTS
+
+    final = json.dumps(_report())
+    events = [
+        *_amplified(final, progress=MAX_EVENTS + 500),
+        _result_event(final),
+    ]
+    submitted: list[dict] = []
+
+    with pytest.raises(ReviewProtocolError, match="multiple_structured_finals"):
+        ingest_structured_final(events, expected_lens=LENS, submit=submitted.append)
+
+    assert submitted == []
+
+
+def test_extract_reports_the_unamplified_status_across_the_chatter() -> None:
+    from aiworkhub.quality_review_ingest import MAX_EVENTS
+
+    events = _amplified("purely prose, no json at all", progress=MAX_EVENTS + 500)
+
+    result = extract_structured_final(events, expected_lens=LENS)
+
+    assert result.report is None
+    assert result.status == "unstructured_final"
+    assert "purely prose, no json at all" in result.final_excerpt

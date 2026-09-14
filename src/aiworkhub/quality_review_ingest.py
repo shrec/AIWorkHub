@@ -11,6 +11,23 @@ from typing import Any
 
 MAX_EVENT_BYTES = 1_048_576
 MAX_EVENTS = 4096
+# Provider events whose entire content is live progress: one streamed
+# assistant text delta, and one background-task roster change.  Both are
+# emitted per UI tick, so a single long reviewer turn can push tens of
+# thousands of them into the retained stream and refuse a review that did
+# produce one clean report as ``provider_events_oversized``.  They are
+# compacted out of the RETAINED stream only (see ``replayable_progress_event``
+# for why that is safe); the live stream a human watches is untouched.
+REPLAYABLE_PROGRESS_EVENT_TYPES: frozenset[str] = frozenset({
+    "assistant.message_delta",
+    "session.background_tasks_changed",
+})
+# Compaction must not trade a bounded refusal for unbounded work, so the
+# events dropped BEFORE the ``MAX_EVENTS`` count are themselves bounded.  This
+# is a separate ceiling on progress chatter; ``MAX_EVENTS`` and
+# ``MAX_EVENT_BYTES``, which bound what is retained and persisted, are
+# deliberately unchanged.
+MAX_COMPACTED_EVENTS = 1_048_576
 REPORT_KEYS = frozenset({"lens", "findings"})
 
 
@@ -29,6 +46,9 @@ class IngestResult:
     submitted: bool = False
     deduplicated: bool = False
     final_excerpt: str = ""
+    # Persisted-byte/record accounting for the retained stream, built by
+    # ``event_compaction_record``.  Never a provider-token claim.
+    event_compaction: dict[str, Any] | None = None
 
 
 def provider_final_text(event: Mapping[str, Any]) -> str:
@@ -206,6 +226,53 @@ def provider_tool_use_findings(event: Mapping[str, Any]) -> list[Any] | None:
     return found
 
 
+def replayable_progress_event(event: Mapping[str, Any]) -> bool:
+    """True only for an explicitly known, provably report-free progress event.
+
+    Two conditions must BOTH hold.  The type must be named in
+    ``REPLAYABLE_PROGRESS_EVENT_TYPES``, so an unknown or newly invented type
+    is never compacted and an amplifier cannot mint one.  And the event must
+    yield nothing through either of this module's two report channels,
+    ``provider_final_text`` and ``provider_tool_use_findings`` -- which is the
+    whole basis on which dropping it is safe: those two readers are the only
+    inputs ``extract_structured_final`` reconstructs a report from, so an
+    event both of them refuse cannot change the report, the final count, the
+    bounded excerpt, or the relative order of anything retained.  A named type
+    that somehow does carry a final or a host findings call is RETAINED.
+    """
+    if event.get("type") not in REPLAYABLE_PROGRESS_EVENT_TYPES:
+        return False
+    return not provider_final_text(event) and provider_tool_use_findings(event) is None
+
+
+def event_compaction_record(
+    *, retained_events: int, retained_bytes: int, compacted_events: int,
+    compacted_bytes: int, compacted_types: Mapping[str, int],
+) -> dict[str, Any]:
+    """Measure what the retained stream kept and what compaction dropped.
+
+    The saving measured here is a PERSISTENCE saving and nothing else: every
+    dropped event had already been generated, streamed and billed by the
+    provider before this reader saw it, so no field here is a provider-token
+    saving and none may be read as one.  ``retained_events``/``retained_bytes``
+    are what quality-review ingestion and the attempt bundle actually carry,
+    and both are bounded -- at most ``MAX_EVENTS`` records of at most
+    ``MAX_EVENT_BYTES`` each.
+    """
+    return {
+        "schema_id": "aiworkhub.provider_event_compaction.v1",
+        "saving_scope": "persisted_bytes_and_records_only",
+        "retained_events": retained_events,
+        "retained_bytes": retained_bytes,
+        "max_retained_events": MAX_EVENTS,
+        "max_event_bytes": MAX_EVENT_BYTES,
+        "persisted_events_dropped": compacted_events,
+        "persisted_bytes_dropped": compacted_bytes,
+        "max_events_dropped": MAX_COMPACTED_EVENTS,
+        "dropped_event_types": dict(sorted(compacted_types.items())),
+    }
+
+
 def extract_structured_final(events: Iterable[str], *, expected_lens: str) -> IngestResult:
     """Extract exactly one report from bounded JSONL provider events.
 
@@ -214,18 +281,52 @@ def extract_structured_final(events: Iterable[str], *, expected_lens: str) -> In
     that only counts when no text report exists at all, so a reviewer that
     typed its findings on both channels is never refused as having emitted
     two reports.
+
+    ``MAX_EVENTS`` bounds the RETAINED stream, not the provider's.  Events
+    ``replayable_progress_event`` recognises are compacted out before they are
+    counted, so a reviewer whose UI ticked forty thousand times is no longer
+    refused as ``provider_events_oversized`` over a review that produced one
+    clean report -- while a stream amplified with anything else (an unknown
+    type, a tool call or result, a second final, undecodable bytes) still is.
+    Retained events keep their original order, and the per-event
+    ``MAX_EVENT_BYTES`` ceiling is applied to EVERY line including a
+    compactable one, so an individually oversized event still fails closed
+    instead of being dropped.  The chatter itself is bounded by
+    ``MAX_COMPACTED_EVENTS`` so compaction cannot trade a bounded refusal for
+    unbounded work.
     """
     reports: list[dict[str, Any]] = []
     tool_use_findings: list[Any] | None = None
     final_count = 0
     last_final_text = ""
-    for count, raw in enumerate(events, 1):
-        if count > MAX_EVENTS or len(raw.encode("utf-8")) > MAX_EVENT_BYTES:
+    retained_events = 0
+    retained_bytes = 0
+    compacted_events = 0
+    compacted_bytes = 0
+    compacted_types: dict[str, int] = {}
+    for raw in events:
+        raw_bytes = len(raw.encode("utf-8"))
+        if raw_bytes > MAX_EVENT_BYTES:
             raise ReviewProtocolError("provider_events_oversized")
         try:
-            event = json.loads(raw)
+            event: Any = json.loads(raw)
         except json.JSONDecodeError:
+            event = None
+        if isinstance(event, dict) and replayable_progress_event(event):
+            compacted_events += 1
+            compacted_bytes += raw_bytes
+            event_type = str(event.get("type"))
+            compacted_types[event_type] = compacted_types.get(event_type, 0) + 1
+            if compacted_events > MAX_COMPACTED_EVENTS:
+                raise ReviewProtocolError("provider_events_oversized")
             continue
+        retained_events += 1
+        retained_bytes += raw_bytes
+        if retained_events > MAX_EVENTS:
+            raise ReviewProtocolError("provider_events_oversized")
+        # An undecodable line or a non-object is RETAINED and counted: only an
+        # explicitly known progress type earns compaction, so garbage and
+        # unknown shapes still fail the stream closed exactly as before.
         if not isinstance(event, dict):
             continue
         host_findings = provider_tool_use_findings(event)
@@ -239,6 +340,11 @@ def extract_structured_final(events: Iterable[str], *, expected_lens: str) -> In
         report = _report_from_text(text)
         if report is not None:
             reports.append(report)
+    compaction = event_compaction_record(
+        retained_events=retained_events, retained_bytes=retained_bytes,
+        compacted_events=compacted_events, compacted_bytes=compacted_bytes,
+        compacted_types=compacted_types,
+    )
     if len(reports) > 1:
         raise ReviewProtocolError("multiple_structured_finals")
     if not reports:
@@ -247,16 +353,18 @@ def extract_structured_final(events: Iterable[str], *, expected_lens: str) -> In
                 "structured_tool_use",
                 {"lens": expected_lens, "findings": tool_use_findings},
                 final_excerpt=_bounded_final_excerpt(last_final_text),
+                event_compaction=compaction,
             )
         return IngestResult(
             "unstructured_final" if final_count else "missing_final",
             None,
             final_excerpt=_bounded_final_excerpt(last_final_text),
+            event_compaction=compaction,
         )
     report = reports[0]
     if report["lens"] != expected_lens:
         raise ReviewProtocolError("lens_mismatch")
-    return IngestResult("structured_final", report)
+    return IngestResult("structured_final", report, event_compaction=compaction)
 
 
 def _equal_after_normalization(
@@ -300,18 +408,26 @@ def ingest_structured_final(
     repairs onto the provider final's record.
     """
     result = extract_structured_final(events, expected_lens=expected_lens)
+    # Carried onto every outcome so the finalizer can measure the retained
+    # stream whichever channel the report arrived on.
+    compaction = result.event_compaction
     report = result.report
     if report is not None and normalize is not None:
         report = normalize(report)
     if explicit_report is not None:
         authoritative = dict(explicit_report)
         if report is None:
-            return IngestResult("explicit_only", authoritative, deduplicated=True)
+            return IngestResult(
+                "explicit_only", authoritative, deduplicated=True,
+                event_compaction=compaction,
+            )
         if authoritative != report and not _equal_after_normalization(
             authoritative, report, normalize_explicit or normalize
         ):
             raise ReviewProtocolError("explicit_submission_conflict")
-        return IngestResult("deduplicated", report, deduplicated=True)
+        return IngestResult(
+            "deduplicated", report, deduplicated=True, event_compaction=compaction,
+        )
     if report is None:
         # Fail closed with the reviewer's actual final output, never a bare
         # submission count.  The SUPERVISOR -- never the reviewer -- derives
@@ -320,9 +436,11 @@ def ingest_structured_final(
         # or a genuinely absent final), not just "submission_count:0".
         raise ReviewProtocolError(_no_report_reason(result))
     if submit is None:
-        return IngestResult(result.status, report)
+        return IngestResult(result.status, report, event_compaction=compaction)
     submit(report)
-    return IngestResult("submitted", report, submitted=True)
+    return IngestResult(
+        "submitted", report, submitted=True, event_compaction=compaction,
+    )
 
 
 def _no_report_reason(result: IngestResult) -> str:
@@ -834,7 +952,7 @@ def supervisor_ingest(
             raise ReviewProtocolError(str(result.get("reason") or "internal_submission_failed"))
 
     try:
-        ingest_structured_final(
+        ingested = ingest_structured_final(
             events, expected_lens=expected_lens, explicit_report=explicit,
             submit=submit, normalize=normalize,
             normalize_explicit=normalize_explicit,
@@ -851,4 +969,11 @@ def supervisor_ingest(
         # keys coerced or dropped per finding, additively and only when a
         # provider report actually needed repairing.
         audit["review_finding_normalization"] = normalization
+    compaction = ingested.event_compaction
+    if compaction and compaction["persisted_events_dropped"]:
+        # Additive, and only when known progress chatter was actually compacted
+        # out: it names how many records/bytes the persisted bundle carries and
+        # how many were dropped before it.  A PERSISTENCE measurement only --
+        # the provider had already emitted and billed every dropped event.
+        audit["provider_event_compaction"] = compaction
     return audit, verified_payloads
