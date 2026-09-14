@@ -457,58 +457,76 @@ def _reservable_candidate(
     row sorts first -- within a bounded number of calls set by the backlog
     size at the round's start, independent of how many new rows keep arriving.
     """
-    if reserved_only:
-        rows = conn.execute(
-            "SELECT * FROM review_action_outbox WHERE state='reserved' "
-            "AND lease_expires_at<=? ORDER BY lease_expires_at, action_id LIMIT ?",
-            (_format_utc(now), RESERVE_SCAN_LIMIT),
-        ).fetchall()
-    else:
+    cursor = watermark = 0
+    if not reserved_only:
         cursor, watermark = _reservation_cursor(conn)
         if watermark == 0:
             watermark = _pending_high_watermark(conn)
             cursor = 0
-        rows = (
-            conn.execute(
-                "SELECT * FROM review_action_outbox WHERE state='pending' "
-                "AND action_id > ? AND action_id <= ? ORDER BY action_id LIMIT ?",
-                (cursor, watermark, RESERVE_SCAN_LIMIT),
+
+    # Pending gets one bounded rollover scan when the current round is
+    # exhausted.  This preserves the pre-existing one-call progress guarantee
+    # when a round's tail contains only blocked descendants, without allowing
+    # sustained arrivals to make a scan unbounded.
+    scan_count = 1 if reserved_only else 2
+    for scan_index in range(scan_count):
+        if reserved_only:
+            rows = conn.execute(
+                "SELECT * FROM review_action_outbox WHERE state='reserved' "
+                "AND lease_expires_at<=? ORDER BY lease_expires_at, action_id LIMIT ?",
+                (_format_utc(now), RESERVE_SCAN_LIMIT),
             ).fetchall()
-            if watermark
-            else []
-        )
-        if not rows:
-            cursor = 0
-            watermark = _pending_high_watermark(conn)
+        else:
             rows = (
                 conn.execute(
                     "SELECT * FROM review_action_outbox WHERE state='pending' "
-                    "AND action_id > 0 AND action_id <= ? ORDER BY action_id LIMIT ?",
-                    (watermark, RESERVE_SCAN_LIMIT),
+                    "AND action_id > ? AND action_id <= ? ORDER BY action_id LIMIT ?",
+                    (cursor, watermark, RESERVE_SCAN_LIMIT),
                 ).fetchall()
                 if watermark
                 else []
             )
-        next_cursor = max((int(r["action_id"]) for r in rows), default=cursor)
-        _set_reservation_cursor(conn, next_cursor, watermark)
-    for row in rows:
-        chain_row = conn.execute(
-            "SELECT * FROM review_chains WHERE chain_id=?", (row["chain_id"],)
-        ).fetchone()
-        if chain_row is None:
-            raise ReviewLifecycleError("descriptor_tamper")
-        identity = _verify_chain_row(chain_row)
-        _verify_action_row(conn, row, identity, chain_row["chain_identity_sha256"])
-        state = str(row["state"])
-        if state == "reserved":
-            lease_expires_at = _parse_utc(str(row["lease_expires_at"]), "lease_expires_at")
-            if lease_expires_at > now:
+        for row in rows:
+            chain_row = conn.execute(
+                "SELECT * FROM review_chains WHERE chain_id=?", (row["chain_id"],)
+            ).fetchone()
+            if chain_row is None:
+                raise ReviewLifecycleError("descriptor_tamper")
+            identity = _verify_chain_row(chain_row)
+            _verify_action_row(conn, row, identity, chain_row["chain_identity_sha256"])
+            state = str(row["state"])
+            if state == "reserved":
+                lease_expires_at = _parse_utc(
+                    str(row["lease_expires_at"]), "lease_expires_at"
+                )
+                if lease_expires_at > now:
+                    continue
+            elif state != "pending":
                 continue
-        elif state != "pending":
-            continue
-        if not _prior_actions_completed(conn, row, identity, chain_row["chain_identity_sha256"]):
-            continue
-        return row
+            if not _prior_actions_completed(
+                conn, row, identity, chain_row["chain_identity_sha256"]
+            ):
+                continue
+            if not reserved_only:
+                # Advance only through the row actually selected.  A deferred
+                # action returns to ``pending`` immediately; advancing to the
+                # end of the fetched window before selecting it made the next
+                # reserve wrap and pick that same action again, starving every
+                # later ready chain in the current drain pass.
+                _set_reservation_cursor(conn, int(row["action_id"]), watermark)
+            return row
+        if not reserved_only:
+            # No row in this bounded window can run.  Mark the whole inspected
+            # window consumed so the next scan continues forward.
+            next_cursor = max((int(r["action_id"]) for r in rows), default=cursor)
+            _set_reservation_cursor(conn, next_cursor, watermark)
+            round_exhausted = not rows or next_cursor >= watermark
+            if round_exhausted and scan_index == 0:
+                cursor = 0
+                watermark = _pending_high_watermark(conn)
+                _set_reservation_cursor(conn, cursor, watermark)
+                continue
+        break
     return None
 
 

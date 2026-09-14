@@ -916,6 +916,51 @@ def test_sustained_new_pending_arrivals_cannot_starve_a_redeferred_low_action_id
     assert found is not None, "sustained new arrivals starved the re-deferred low action_id"
 
 
+def test_deferred_head_does_not_starve_a_later_ready_chain_in_same_round(
+    tmp_path: Path,
+) -> None:
+    """Deferring the selected head must not make it the next selection again.
+
+    Production review recovery drains several actions per pass.  Advancing the
+    persistent cursor to the end of the fetched window before returning its
+    first eligible row caused a defer to wrap the cursor and immediately
+    reserve the same head again; the orchestrator then stopped on its duplicate
+    guard and every later chain starved.
+    """
+    db = tmp_path / "task.sqlite"
+    first_chain = _chain(db)
+    later_chain = review_lifecycle.create_or_replay_chain(
+        db,
+        target_task_id="LATER_TARGET",
+        target_request_id="req-later",
+        claim_epoch="1",
+        packet_sha256="c" * 64,
+        candidate_sha256="d" * 64,
+        now=NOW,
+    )
+
+    first = review_lifecycle.reserve_next_action(
+        db, owner="worker-first", lease_token="lease-first", now=NOW,
+        lease_seconds=60,
+    )
+    assert first is not None
+    assert first.chain_id == first_chain.chain_id
+    assert review_lifecycle.defer_action(
+        db, action_id=first.action_id, owner="worker-first",
+        lease_token="lease-first", now=NOW,
+    )
+
+    second = review_lifecycle.reserve_next_action(
+        db, owner="worker-second", lease_token="lease-second", now=NOW,
+        lease_seconds=60,
+    )
+
+    assert second is not None
+    assert second.action_id != first.action_id
+    assert second.chain_id == later_chain.chain_id
+    assert second.action_index == 0
+
+
 def test_retired_evidence_fails_closed_for_malformed_cross_chain_later_and_nonfailed_causes(
     tmp_path: Path,
 ) -> None:
