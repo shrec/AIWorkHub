@@ -110,6 +110,28 @@ def test_reject_to_pending_requeues_for_rework(coord):
     assert feedback["reason_identity"]["truncated"] is False
 
 
+def test_reject_to_pending_invalidates_validation_only_replay_authorization(coord):
+    _insert(
+        coord,
+        "T_PEND_REPLAY",
+        card={
+            "validation_only_replay_authorization": {
+                "schema_id": "aiworkhub.validation_only_replay_authorization.v1",
+                "task_id": "T_PEND_REPLAY",
+                "request_id": "rejected-request",
+                "next_claim_epoch": 2,
+                "one_episode_binding": True,
+            }
+        },
+    )
+
+    res = core.reject_review("T_PEND_REPLAY", "repair the candidate", to="pending")
+
+    assert res["ok"] is True, res
+    card = json.loads(_row(coord, "T_PEND_REPLAY")["card_json"])
+    assert "validation_only_replay_authorization" not in card
+
+
 def test_reject_to_pending_never_repersists_decoded_card_json_envelope(coord):
     recursive = json.dumps({"card_json": json.dumps({"card_json": "x" * 200_000})})
     _insert(

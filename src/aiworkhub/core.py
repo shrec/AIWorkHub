@@ -6385,6 +6385,10 @@ def reject_review(
         "to": disposition,
         "pinned_at": now,
     }
+    # A validation-only replay grant is bound to the episode the manager just
+    # adjudicated.  If that candidate is rejected, the successor must invoke a
+    # provider to apply the feedback instead of replaying the rejected bytes.
+    card.pop("validation_only_replay_authorization", None)
     prior_episode = task_store.begin_claim_episode(card)
     if disposition == "blocked":
         # NF-2026-00307 / audit A6: this was the path through the blocked-reason
