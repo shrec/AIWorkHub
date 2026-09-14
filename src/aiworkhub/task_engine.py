@@ -1282,9 +1282,9 @@ def disposition_reviewer_children(
       not counted in future dashboard KPIs yet remain in history.
 
     Idempotent: a repeat call with the same verified set updates nothing already
-    finalized or superseded.  Fail-closed on identity: a child bound to another
-    task, or to an episode of this task whose order cannot be established, is
-    left untouched and reported by name in ``refused`` *and* as a
+    finalized or superseded.  Fail-closed on identity: another task's child is
+    silently skipped because it says nothing about this parent; an unordered
+    episode of this task is left untouched and reported in ``refused`` and as a
     ``reviewer_child_disposition_refused`` event.  A child bound to this task at
     a strictly earlier claim epoch is superseded as ``stale_claim_episode``.
     """
@@ -1372,6 +1372,11 @@ def disposition_reviewer_children(
                 parent_request_id=parent_request_id,
                 parent_claim_epoch=parent_claim_epoch,
             )
+            if reason == "foreign_target_task":
+                # Another parent's child says nothing about this disposition.
+                # Do not amplify every parent decision into a durable O(N) event storm.
+                skipped.append(child_task_id)
+                continue
             if reason is not None:
                 if child_status in _REVIEWER_CHILD_TERMINAL_STATUSES:
                     # Already terminal: its own disposition event explains it,

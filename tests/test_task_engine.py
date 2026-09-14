@@ -870,7 +870,7 @@ def test_disposition_reviewer_children_supersedes_stale_claim_episode_child(
     assert events[0]["parent_claim_epoch"] == 5
 
 
-def test_disposition_reviewer_children_refuses_foreign_target_task(
+def test_disposition_reviewer_children_skips_foreign_target_task_without_event(
     tmp_path: Path,
 ) -> None:
     """A child bound to a different task is never ours, at any epoch."""
@@ -891,7 +891,8 @@ def test_disposition_reviewer_children_refuses_foreign_target_task(
     )
     assert result["ok"] is True
     payload = json.loads(result["stdout"])
-    assert payload["refused"] == ["REVIEWER_S1:foreign_target_task"]
+    assert payload["refused"] == []
+    assert "REVIEWER_S1" in payload["skipped"]
     assert payload["superseded"] == []
     assert payload["stale_superseded"] == []
 
@@ -902,10 +903,7 @@ def test_disposition_reviewer_children_refuses_foreign_target_task(
     assert "reviewer_disposition" not in sibling
 
     refusals = _child_events(repo, "REVIEWER_S1", "reviewer_child_disposition_refused")
-    assert len(refusals) == 1
-    assert refusals[0]["reason"] == "foreign_target_task"
-    assert refusals[0]["child_target_task_id"] == "SOME_OTHER_PARENT"
-    assert refusals[0]["child_status"] == "review"
+    assert refusals == []
 
 
 def test_disposition_reviewer_children_refuses_newer_claim_episode_child(
