@@ -111,13 +111,15 @@ def worker_workspace_unresolvable_paths(
     *,
     tracked: frozenset[str],
     generated_paths: frozenset[str] = frozenset(),
+    externally_supplied_paths: frozenset[str] = frozenset(),
 ) -> tuple[tuple[str, str], ...]:
     """Repository-relative tokens a worker's worktree cannot supply.
 
     Pure apart from stat-ing the coordinator's own repository: no network, no
     mutation, no subprocess. Returns ``(token, reason)`` pairs, empty when
     every repository-relative token in ``command`` is tracked and therefore
-    materialized in the worker's worktree.
+    materialized in the worker's worktree, or was already resolved to an
+    authenticated external toolchain executable by ``ToolchainAuthority``.
     """
     if not tracked:
         return ()
@@ -138,7 +140,7 @@ def worker_workspace_unresolvable_paths(
             continue
         seen.add(candidate)
         posix = Path(candidate).as_posix()
-        if posix in generated_paths:
+        if posix in generated_paths or posix in externally_supplied_paths:
             continue
         if posix in tracked:
             continue
@@ -886,6 +888,7 @@ class ToolchainAuthority:
         facts: dict[str, ExecutableFact] = {}
         modules: set[str] = set()
         missing: set[MissingRequirement] = set()
+        externally_supplied_by_command: dict[str, frozenset[str]] = {}
         for name, commands, minimum_version, source in self._commands(card, registry):
             fact: ExecutableFact | None = None
             normalized: list[str] = []
@@ -906,6 +909,16 @@ class ToolchainAuthority:
                     version_mismatch = True
                     fact = None
                     continue
+                declared_head = argv[0] if argv else ""
+                if (
+                    declared_head
+                    and not Path(declared_head).is_absolute()
+                    and ("/" in declared_head or "\\" in declared_head)
+                    and normalized
+                    and Path(normalized[0]).is_absolute()
+                ):
+                    supplied = Path(os.path.normpath(declared_head)).as_posix()
+                    externally_supplied_by_command[command] = frozenset({supplied})
                 break
             if fact is None:
                 if source == "registry":
@@ -955,6 +968,9 @@ class ToolchainAuthority:
                     command,
                     tracked=tracked,
                     generated_paths=generated_paths,
+                    externally_supplied_paths=externally_supplied_by_command.get(
+                        command, frozenset()
+                    ),
                 ):
                     missing.add(
                         MissingRequirement(

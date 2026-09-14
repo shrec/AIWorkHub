@@ -196,6 +196,40 @@ def test_missing_facts_are_exact_and_structured(tmp_path: Path) -> None:
     }
 
 
+def test_authenticated_external_validation_head_is_not_required_from_worktree(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from aiworkhub import worker_workspace
+
+    declared = tmp_path / ".venv" / "bin" / "python"
+    declared.parent.mkdir(parents=True)
+    declared.write_text("untracked declaration", encoding="utf-8")
+    test_file = tmp_path / "tests" / "test_x.py"
+    test_file.parent.mkdir()
+    test_file.write_text("def test_x(): pass\n", encoding="utf-8")
+    monkeypatch.setattr(
+        toolchain_authority,
+        "repository_tracked_paths",
+        lambda _repo: frozenset({"tests/test_x.py"}),
+    )
+    monkeypatch.setattr(
+        worker_workspace,
+        "_normalize_trusted_validation_executable_argv_with_roots",
+        lambda argv, _repo: ([sys.executable, *argv[1:]], ()),
+    )
+    monkeypatch.setattr(
+        toolchain_authority, "_read_executable_version", lambda _path: "Python test"
+    )
+
+    snapshot = _authority(tmp_path).evaluate(
+        {"validation": [".venv/bin/python -m pytest -q tests/test_x.py"]}
+    )
+
+    assert snapshot.available
+    assert snapshot.executables[0].requested == ".venv/bin/python"
+    assert not [item for item in snapshot.missing if item.kind == "worker_workspace"]
+
+
 def test_repair_is_atomic_idempotent_and_scoped_to_aiworkhub(tmp_path: Path) -> None:
     authority = _authority(tmp_path)
     snapshot = authority.evaluate(_card())
