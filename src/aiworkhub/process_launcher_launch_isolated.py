@@ -1059,15 +1059,36 @@ def launch_isolated(
                     canonical_repo_id = project_context.repository_state.inspect_repository(
                         authority_repo
                     ).manifest.repo_id
-                except project_context.repository_state.RepositoryStateError:
-                    canonical_repo_id = ""
-                identity = _appcontainer_supervisor_identity(
-                    repo_id=canonical_repo_id,
-                    worker_kind=adapter_id,
-                    platform=sys.platform,
-                )
+                except project_context.repository_state.RepositoryStateError as exc:
+                    # No canonical repository identity means no repo-scoped
+                    # AppContainer profile can be derived.  Refuse here, before
+                    # the supervisor is spawned, rather than handing the
+                    # supervisor a spec it would have to guess an identity for.
+                    raise LaunchRejected(
+                        f"windows_appcontainer_repo_identity_unavailable:{exc}"
+                    ) from exc
+                try:
+                    identity = _appcontainer_supervisor_identity(
+                        repo_id=canonical_repo_id,
+                        worker_kind=adapter_id,
+                        platform=sys.platform,
+                    )
+                except ValueError as exc:
+                    raise LaunchRejected(
+                        f"windows_appcontainer_identity_invalid:{exc}"
+                    ) from exc
+                # Only the win32 branch shapes a ``backend`` key.  Reaching
+                # here without one means the AppContainer sandbox backend was
+                # selected on a platform that cannot apply it; defaulting the
+                # token in would announce a confinement the supervisor would
+                # then refuse, so this fails closed instead.
+                if "backend" not in identity:
+                    raise LaunchRejected(
+                        "windows_appcontainer_backend_platform_mismatch:"
+                        f"{sys.platform}"
+                    )
                 appcontainer_identity_fields = {
-                    "execution_backend": identity.get("backend", "windows_appcontainer"),
+                    "execution_backend": identity["backend"],
                     "repo_id": identity["repo_id"],
                     "worker_kind": identity["worker_kind"],
                 }

@@ -255,6 +255,19 @@ def _native_handle(fd: int) -> int:
 def _launch_appcontainer_process(
     argv: list[str], cwd: str, spec: dict[str, Any]
 ) -> _AppContainerProcess:
+    # Identity is checked before a single handle is opened.  A blank or absent
+    # repo_id/worker_kind cannot name the repo-scoped AppContainer profile this
+    # worker must be confined by, and the only safe answer is a stable
+    # mechanical refusal: never a guessed moniker, and never a fall-through to
+    # the plain-subprocess branch the caller has already ruled out.
+    repo_id = str(spec.get("repo_id") or "").strip()
+    worker_kind = str(
+        spec.get("worker_kind") or spec.get("adapter_id") or ""
+    ).strip()
+    if not repo_id:
+        raise ValueError("appcontainer_spec_missing_repo_id")
+    if not worker_kind:
+        raise ValueError("appcontainer_spec_missing_worker_kind")
     launch: windows_appcontainer.AppContainerLaunch | None = None
     stdin_fd = os.open(os.devnull, os.O_RDONLY)
     stdout_read, stdout_write = os.pipe()
@@ -265,8 +278,8 @@ def _launch_appcontainer_process(
         os.set_inheritable(stderr_write, True)
         request = windows_appcontainer.AppContainerRequest(
             argv=argv,
-            repo_id=str(spec["repo_id"]),
-            worker_kind=str(spec.get("worker_kind") or spec.get("adapter_id") or "worker"),
+            repo_id=repo_id,
+            worker_kind=worker_kind,
             working_directory=cwd,
             environment=os.environ.copy(),
             stdin_handle=_native_handle(stdin_fd),
@@ -631,6 +644,15 @@ def supervise(spec: dict[str, Any]) -> int:
         try:
             if execution_backend == "windows_appcontainer":
                 child = _launch_appcontainer_process(argv, cwd, spec)
+            elif execution_backend not in (None, ""):
+                # A spec that names a backend gets that backend or nothing.
+                # Silently falling through to the plain-subprocess branch on a
+                # near-miss spelling is exactly how a worker ends up reading as
+                # confined while being held by a Job Object and nothing else.
+                spawn_phase = "execution_backend_unsupported"
+                raise ValueError(
+                    f"unsupported_execution_backend:{execution_backend}"
+                )
             else:
                 popen_kwargs: dict[str, Any] = {
                     "cwd": cwd,

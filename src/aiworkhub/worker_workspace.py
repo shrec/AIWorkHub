@@ -6640,24 +6640,32 @@ def _is_windows_host() -> bool:
 
 
 # ── Windows native-CLI confinement ─────────────────────────────────────────
-# Windows CAN confine a native CLI worker.  A repo-scoped AppContainer profile
-# plus a kill-on-close Job Object is implemented end to end in
-# ``windows_appcontainer.py``, and ``worker_supervisor`` already knows how to
-# launch through it (``execution_backend == "windows_appcontainer"``).
+# Windows CAN confine a native CLI worker, and since NF-2026-00452 the
+# production launch path actually selects it.  Three pieces have to agree, and
+# each is proved by a deterministic fake-Windows behaviour test that drives the
+# real call path rather than by matching source text:
 #
-# What is missing is the last wire.  ``process_launcher`` writes the supervisor
-# spec without ``execution_backend`` -- and without the ``repo_id`` /
-# ``worker_kind`` that ``worker_supervisor._launch_appcontainer_process``
-# reads -- so the supervisor always falls through to its plain
-# ``subprocess.Popen`` branch.  Announcing "windows_appcontainer" from this
-# function before that spec carries the backend would not weaken a sandbox; it
-# would report one that is never applied, and run a model's code against the
-# owner's machine with no filesystem boundary at all.
+#   * ``windows_appcontainer.py`` builds the repo-scoped AppContainer profile
+#     and the kill-on-close Job Object that owns the worker process tree;
+#   * ``process_launcher_launch_isolated`` writes ``execution_backend`` plus
+#     the exact canonical ``repo_id`` and the normalized ``worker_kind`` into
+#     the supervisor spec, and refuses the launch before spawn when that
+#     identity cannot be established;
+#   * ``worker_supervisor`` dispatches on that exact backend token and refuses
+#     any other spelling outright instead of falling through to its plain
+#     ``subprocess.Popen`` branch.
 #
-# So this stays False until the launcher declares the backend, and it is
-# deliberately NOT an environment override: an unconfined worker must never be
-# one variable away.
-WINDOWS_APPCONTAINER_EXECUTION_WIRED = False
+# This flag states a fact about THIS repository's launch path, never about the
+# host.  ``windows_confinement_report`` measures the host's AppContainer APIs
+# separately and ``available`` requires platform, host capability and this wire
+# together.  It is deliberately NOT an environment override in either
+# direction: an unconfined worker must never be one variable away, and neither
+# must a confinement claim.
+#
+# NF-2026-00452 stays open until a real Windows read-only canary runs after
+# release.  Fake-Windows seams prove the wiring; they cannot prove a Win32
+# syscall.
+WINDOWS_APPCONTAINER_EXECUTION_WIRED = True
 WINDOWS_APPCONTAINER_BACKEND = "windows_appcontainer"
 
 
@@ -6701,6 +6709,39 @@ def windows_confinement_report(
         reason = "execution_path_not_wired"
     else:
         reason = ""
+    available = bool(platform_is_windows and host_available and wired)
+    # What a native CLI worker is actually held by on Windows RIGHT NOW: a
+    # function of the three facts just measured, never a constant.  When they
+    # agree, the supervisor launches through a repo-scoped AppContainer profile
+    # SID that bounds filesystem, registry and network access, inside the
+    # kill-on-close Job Object that owns the process tree.  Otherwise the
+    # supervisor takes its plain-subprocess branch, where that Job Object bounds
+    # the tree's lifetime and nothing else.  Stated only for Windows: on Linux
+    # the active boundary is landlock/bubblewrap and this report does not
+    # describe it.
+    if not platform_is_windows:
+        active_confinement = "not_applicable"
+        active_contains: tuple[str, ...] = ()
+        active_does_not_contain: tuple[str, ...] = ()
+    elif available:
+        active_confinement = "appcontainer_profile_and_job_object"
+        active_contains = (
+            "worker_process_tree_lifetime",
+            "filesystem",
+            "registry",
+            "network",
+            "other_processes_of_the_same_user",
+        )
+        active_does_not_contain = ()
+    else:
+        active_confinement = "job_object_lifetime_only"
+        active_contains = ("worker_process_tree_lifetime",)
+        active_does_not_contain = (
+            "filesystem",
+            "registry",
+            "network",
+            "other_processes_of_the_same_user",
+        )
     return {
         "backend": WINDOWS_APPCONTAINER_BACKEND,
         "platform_is_windows": platform_is_windows,
@@ -6709,38 +6750,25 @@ def windows_confinement_report(
         "host_appcontainer_detail": host_detail[:200],
         # Does the production launch path actually select it?  A code fact.
         "execution_path_wired": wired,
-        "available": bool(platform_is_windows and host_available and wired),
+        "available": available,
         "reason": reason,
-        # What a native CLI worker would actually be held by on Windows RIGHT
-        # NOW.  The supervisor's non-AppContainer branch assigns a
-        # kill-on-close Job Object, which bounds the process tree's lifetime
-        # and nothing else.  Stated only for Windows: on Linux the active
-        # boundary is landlock/bubblewrap and this report does not describe it.
-        "active_confinement": (
-            "job_object_lifetime_only" if platform_is_windows else "not_applicable"
-        ),
-        "active_contains": (
-            ("worker_process_tree_lifetime",) if platform_is_windows else ()
-        ),
-        "active_does_not_contain": (
-            (
-                "filesystem",
-                "registry",
-                "network",
-                "other_processes_of_the_same_user",
-            )
-            if platform_is_windows
-            else ()
-        ),
+        "active_confinement": active_confinement,
+        "active_contains": active_contains,
+        "active_does_not_contain": active_does_not_contain,
     }
 
 
 def select_sandbox_backend() -> str:
     if _is_windows_host():
-        # Refuse, and say which of the three causes it is.  The identifier
-        # stays the leading token so existing callers and receipts keep
-        # matching on it.
+        # Measure first, then decide.  A Windows host whose AppContainer APIs
+        # resolve AND whose launch path is wired to them gets the single
+        # backend token the planner, the policy gate and the supervisor all
+        # dispatch on.  Every other Windows host still refuses and says which
+        # of the three causes it is; the identifier stays the leading token so
+        # existing callers and receipts keep matching on it.
         report = windows_confinement_report()
+        if report["available"]:
+            return WINDOWS_APPCONTAINER_BACKEND
         raise WorkspaceError(
             f"windows_appcontainer_sandbox_unavailable:{report['reason']}"
         )

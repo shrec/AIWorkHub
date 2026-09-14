@@ -18,6 +18,7 @@ from aiworkhub import (  # noqa: E402
     runtime_adapters,
     task_reconciler,
     vscode_lm_bridge,
+    windows_appcontainer,
     workforce_catalog,
     workforce_router,
     worker_workspace,
@@ -502,7 +503,7 @@ def _probe(available: bool, detail: str):
     return lambda: SimpleNamespace(available=available, detail=detail)
 
 
-def test_confinement_report_separates_host_fact_from_unwired_execution_path(
+def test_confinement_report_separates_host_fact_from_execution_path(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(worker_workspace, "_is_windows_host", lambda: True)
@@ -517,34 +518,50 @@ def test_confinement_report_separates_host_fact_from_unwired_execution_path(
         "required Win32 export unavailable"
     )
     assert unavailable["available"] is False
+    # The wire being closed must never paper over a host that cannot build an
+    # AppContainer: this row is still a refusal, and it still blames the host.
+    assert unavailable["execution_path_wired"] is True
 
-    # A host that CAN build an AppContainer is still refused, and the reason
-    # now names AIWorkHub rather than blaming the host.
+    # A host that CAN build an AppContainer now gets one, because the launch
+    # path selects it.  All three facts have to agree for `available`.
     capable = worker_workspace.windows_confinement_report(
         probe=_probe(True, "AppContainer APIs resolved.")
     )
     assert capable["host_appcontainer_available"] is True
-    assert capable["execution_path_wired"] is False
-    assert capable["reason"] == "execution_path_not_wired"
-    assert capable["available"] is False
+    assert capable["execution_path_wired"] is True
+    assert capable["reason"] == ""
+    assert capable["available"] is True
+    assert capable["backend"] == worker_workspace.WINDOWS_APPCONTAINER_BACKEND
 
 
-def test_confinement_report_never_claims_a_boundary_it_does_not_apply(
+def test_confinement_report_describes_the_boundary_that_is_actually_applied(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(worker_workspace, "_is_windows_host", lambda: True)
 
-    report = worker_workspace.windows_confinement_report(
+    applied = worker_workspace.windows_confinement_report(
         probe=_probe(True, "AppContainer APIs resolved.")
     )
 
-    # Windows today holds a native CLI worker with a kill-on-close Job Object
-    # and nothing else.  The report must say so in as many words rather than
-    # letting an unconfined tier read as sandboxed.
-    assert report["active_confinement"] == "job_object_lifetime_only"
-    assert "filesystem" in report["active_does_not_contain"]
-    assert "network" in report["active_does_not_contain"]
-    assert "filesystem" not in report["active_contains"]
+    # When the launch path selects AppContainer, the worker is held by a
+    # repo-scoped profile SID as well as the kill-on-close Job Object, and the
+    # report must not keep understating that as a lifetime bound.
+    assert applied["active_confinement"] == "appcontainer_profile_and_job_object"
+    assert "filesystem" in applied["active_contains"]
+    assert "network" in applied["active_contains"]
+    assert applied["active_does_not_contain"] == ()
+
+    # A host that cannot build one falls back to the supervisor's plain
+    # subprocess branch, where the Job Object bounds lifetime and nothing else.
+    # The report must say so in as many words rather than letting an
+    # unconfined tier read as sandboxed.
+    unconfined = worker_workspace.windows_confinement_report(
+        probe=_probe(False, "required Win32 export unavailable")
+    )
+    assert unconfined["active_confinement"] == "job_object_lifetime_only"
+    assert "filesystem" in unconfined["active_does_not_contain"]
+    assert "network" in unconfined["active_does_not_contain"]
+    assert "filesystem" not in unconfined["active_contains"]
 
 
 def test_confinement_report_does_not_describe_windows_on_another_platform(
@@ -581,21 +598,201 @@ def test_windows_sandbox_refusal_carries_the_measured_cause(
     }
 
 
-def test_appcontainer_execution_stays_off_until_the_launcher_declares_it() -> None:
-    """The last wire, asserted as the single switch it is.
+def test_appcontainer_execution_is_wired_and_selected_on_a_capable_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The last wire, asserted by running the selection it controls.
 
-    ``worker_supervisor`` dispatches AppContainer on ``execution_backend``,
-    but ``process_launcher`` never writes that key into the supervisor spec,
-    so the AppContainer branch is unreachable from production.  Flipping the
-    flag without that spec key would report a confinement the runtime does not
-    apply, so the flag and the spec key must land together.
+    The predecessor of this test compared the flag against the presence of an
+    ``"execution_backend"`` substring in a source file.  That proved nothing
+    about which branch production takes, and it would have stayed green if the
+    key had been written into a spec nobody read.  This drives the real
+    ``select_sandbox_backend`` on a fake-Windows host whose AppContainer APIs
+    resolve, and requires the exact backend token the launcher writes into the
+    supervisor spec and the supervisor dispatches on.
     """
-    launcher_source = (
-        Path(worker_workspace.__file__).with_name("process_launcher.py")
-    ).read_text(encoding="utf-8")
-    launcher_declares_backend = '"execution_backend"' in launcher_source
-
-    assert (
-        worker_workspace.WINDOWS_APPCONTAINER_EXECUTION_WIRED
-        is launcher_declares_backend
+    monkeypatch.setattr(worker_workspace, "_is_windows_host", lambda: True)
+    monkeypatch.setattr(
+        windows_appcontainer,
+        "probe",
+        lambda: SimpleNamespace(
+            available=True, detail="AppContainer APIs resolved."
+        ),
     )
+
+    assert worker_workspace.WINDOWS_APPCONTAINER_EXECUTION_WIRED is True
+    backend = worker_workspace.select_sandbox_backend()
+
+    assert backend == worker_workspace.WINDOWS_APPCONTAINER_BACKEND
+    assert backend == runtime_adapters.WINDOWS_APPCONTAINER_SANDBOX_BACKEND
+    # The launcher resolves the adapter's boundary through this same call, so
+    # an admitted native CLI route and the supervisor branch that ends up
+    # running it cannot disagree about which boundary is in force.
+    assert process_launcher._sandbox_backend_for_adapter("claude_cli") == backend
+    # Editor-hosted routes never consult the host sandbox at all.
+    assert (
+        process_launcher._sandbox_backend_for_adapter("glm_vscode_lm")
+        == worker_workspace.VSCODE_LM_IN_PROCESS_BACKEND
+    )
+
+
+def test_wiring_flag_never_admits_a_host_that_cannot_build_an_appcontainer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Wired is a fact about this repository's code, never about the host."""
+    monkeypatch.setattr(worker_workspace, "_is_windows_host", lambda: True)
+    monkeypatch.setattr(
+        windows_appcontainer,
+        "probe",
+        lambda: SimpleNamespace(
+            available=False, detail="required Win32 export unavailable"
+        ),
+    )
+
+    with pytest.raises(worker_workspace.WorkspaceError) as excinfo:
+        worker_workspace.select_sandbox_backend()
+
+    assert str(excinfo.value) == (
+        "windows_appcontainer_sandbox_unavailable:win32_appcontainer_unavailable"
+    )
+
+
+def _capable_windows_appcontainer_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A Windows host whose AppContainer APIs resolve, on both seams.
+
+    ``repo_policy`` asks its own ``_is_windows_host`` for the platform row;
+    ``worker_workspace`` asks its own before probing.  Both have to say Windows
+    or the preflight row and the sandbox selection describe different hosts.
+    """
+    monkeypatch.setattr(repo_policy, "_is_windows_host", lambda: True)
+    monkeypatch.setattr(worker_workspace, "_is_windows_host", lambda: True)
+    monkeypatch.setattr(
+        windows_appcontainer,
+        "probe",
+        lambda: SimpleNamespace(
+            available=True, detail="AppContainer APIs resolved."
+        ),
+    )
+
+
+def _authenticated_native_cli_helpers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Credential/auth answers for the native CLI routes, held constant.
+
+    These helpers read the *owner's* real machine state, which is not the
+    subject of any test here.  Pinning them keeps the assertions about the
+    Windows execution wire rather than about whoever happens to be logged in.
+    """
+    ready = {"launchable": True, "access_observed": True, "reason": ""}
+    monkeypatch.setattr(
+        repo_policy.claude_auth, "auth_status", lambda *_a, **_k: dict(ready)
+    )
+    monkeypatch.setattr(
+        repo_policy.codex_auth, "capability_status", lambda *_a, **_k: dict(ready)
+    )
+    monkeypatch.setattr(
+        repo_policy.kilo_auth, "auth_status", lambda *_a, **_k: dict(ready)
+    )
+
+
+def test_capable_windows_host_admits_the_native_cli_routes_the_flag_excluded(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """NF-2026-00452: the false wiring flag was the sole exclusion cause.
+
+    Codex, Grok and OpenCode were excluded from Windows preflight coverage
+    because ``select_sandbox_backend`` refused every Windows host, not because
+    anything about those routes was unsupported.  With the execution path wired
+    and the host capable, they must be ordinary launchable rows carrying the
+    AppContainer backend -- and the same capability truth must drive both the
+    row and the sandbox selection.
+    """
+    root = _initialized_root(tmp_path)
+    _ready_preflight_deps(monkeypatch)
+    _capable_windows_appcontainer_host(monkeypatch)
+    _authenticated_native_cli_helpers(monkeypatch)
+    monkeypatch.setattr(
+        repo_policy.worker_workspace,
+        "finalization_preflight_probe_nonblocking",
+        lambda _root, _adapter: {
+            "ok": True,
+            "status": "ready",
+            "reason": "",
+            "phase": "preflight_finalization",
+        },
+    )
+    monkeypatch.setattr(
+        repo_policy.vscode_lm_bridge,
+        "bridge_readiness",
+        lambda *args, **kwargs: {
+            "launchable": True,
+            "blocker_reason": "",
+            "window_id": "window_test",
+            "live_host_count": 1,
+            "stale_host_count": 0,
+            "observed_models": ["glm-5.2", "deepseek-chat"],
+        },
+    )
+
+    report = repo_policy.build_preflight(root)
+    by_adapter = {item["adapter_id"]: item for item in report["providers"]}
+
+    for adapter_id in ("claude_cli", "codex_cli", "grok_kilo_cli", "opencode_cli"):
+        row = by_adapter[adapter_id]
+        assert row["platform_excluded"] is False, adapter_id
+        assert row["coverage_required"] is True, adapter_id
+        assert row["launchable"] is True, adapter_id
+        assert row["sandbox_backend"] == (
+            worker_workspace.WINDOWS_APPCONTAINER_BACKEND
+        ), adapter_id
+        assert row["reason"] != (
+            runtime_adapters.WINDOWS_NATIVE_CLI_REQUIRES_APPCONTAINER
+        ), adapter_id
+    # Editor-hosted routes are untouched by the Windows execution wire.
+    assert by_adapter["glm_vscode_lm"]["sandbox_backend"] == "vscode_lm_in_process"
+    assert report["provider_summary"]["excluded_route_count"] == 0
+
+
+def test_claude_executable_absence_stays_independent_of_the_windows_wire(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A missing binary is a binary fact, not a sandbox fact.
+
+    Claude going unlaunchable here must read as ``claude`` not being installed,
+    never as the Windows boundary being unavailable, and it must leave every
+    other native CLI route launchable.
+    """
+    root = _initialized_root(tmp_path)
+    _ready_preflight_deps(monkeypatch)
+    _capable_windows_appcontainer_host(monkeypatch)
+    _authenticated_native_cli_helpers(monkeypatch)
+    monkeypatch.setattr(
+        repo_policy.claude_auth,
+        "auth_status",
+        lambda *_a, **_k: {
+            "launchable": False,
+            "reason": "claude_cli_not_installed",
+        },
+    )
+    monkeypatch.setattr(
+        repo_policy.runtime_adapters,
+        "resolve_executable",
+        lambda adapter_id: runtime_adapters.ExecutableResolution(
+            adapter_id,
+            None if adapter_id == "claude_cli" else "/bin/model",
+            adapter_id != "claude_cli",
+            "claude_cli_not_installed" if adapter_id == "claude_cli" else "",
+        ),
+    )
+
+    report = repo_policy.build_preflight(root)
+    by_adapter = {item["adapter_id"]: item for item in report["providers"]}
+
+    assert by_adapter["claude_cli"]["installed"] is False
+    assert by_adapter["claude_cli"]["launchable"] is False
+    assert by_adapter["claude_cli"]["reason"] == "claude_cli_not_installed"
+    assert by_adapter["claude_cli"]["platform_excluded"] is False
+    assert by_adapter["claude_cli"]["sandbox_backend"] == (
+        worker_workspace.WINDOWS_APPCONTAINER_BACKEND
+    )
+    assert by_adapter["codex_cli"]["launchable"] is True
+    assert by_adapter["grok_kilo_cli"]["launchable"] is True
