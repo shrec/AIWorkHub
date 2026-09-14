@@ -2562,6 +2562,16 @@ def aiworkhub_task_reject_review(
     if failure_category is not None:
         kwargs["failure_category"] = failure_category
     result = core.reject_review(**kwargs)
+    if (
+        isinstance(result, dict)
+        and result.get("ok") is True
+        and result.get("reviewer_finalization")
+    ):
+        result["reviewer_process_cancellation"] = (
+            process_launcher.default_manager().cancel_disposed_reviewer_processes(
+                result["reviewer_finalization"],
+            )
+        )
     card = _envelope_card(result)
     extra = (
         _reject_review_receipt_fields(card, task_id=task_id, reason=reason, to=to)

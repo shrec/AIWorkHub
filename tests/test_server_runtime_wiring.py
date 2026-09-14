@@ -611,6 +611,34 @@ def test_server_reject_review_passes_explicit_infrastructure_category(monkeypatc
         "failure_category": "provider_runtime",
     }]
 
+
+def test_server_reject_review_cancels_only_core_disposed_reviewer_processes(monkeypatch):
+    reviewer_rows = [
+        {"task_id": "R_EXACT", "finished": True, "cleanup_error": ""},
+    ]
+
+    def reject(**kwargs):
+        return {"ok": True, "reviewer_finalization": reviewer_rows, **kwargs}
+
+    class Manager:
+        def cancel_disposed_reviewer_processes(self, rows):
+            assert rows is reviewer_rows
+            return {
+                "schema_id": "aiworkhub.reviewer_process_cancellation.v1",
+                "ok": True,
+                "state": "completed",
+                "reviewer_task_ids": ["R_EXACT"],
+                "cancelled": [],
+            }
+
+    monkeypatch.setattr(core, "reject_review", reject)
+    monkeypatch.setattr(process_launcher, "default_manager", lambda: Manager())
+
+    result = server.aiworkhub_task_reject_review("T_PARENT", "rework")
+
+    assert result["reviewer_process_cancellation"]["ok"] is True
+    assert result["reviewer_process_cancellation"]["reviewer_task_ids"] == ["R_EXACT"]
+
 def test_real_core_lifecycle_calls_scope_identity_and_capability(monkeypatch, tmp_path):
     """B857: rebased to the canonical in-process engine (task_store) --
     these lifecycle calls resolve directly against the repo-local

@@ -26,7 +26,7 @@ SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from aiworkhub import core, task_store  # noqa: E402
+from aiworkhub import core, process_launcher, task_store  # noqa: E402
 
 NOW = "2026-08-18T00:00:00+00:00"
 
@@ -230,3 +230,68 @@ def test_still_running_reviewer_is_superseded_on_reject(coord):
     assert "R_RUNNING" not in _review_queue(coord)
     named = {row["task_id"]: row for row in res["reviewer_finalization"]}
     assert named["R_RUNNING"]["finished"] is True
+
+
+def test_disposed_reviewer_process_cancellation_is_exact_and_stable(monkeypatch):
+    manager = object.__new__(process_launcher.ProcessManager)
+    latest = {
+        "REQ_RUNNING": {
+            "task_id": "R_BOUND",
+            "state": "running",
+        },
+        "REQ_TERMINAL": {
+            "task_id": "R_BOUND",
+            "state": "review_ready",
+        },
+        "REQ_FOREIGN": {
+            "task_id": "R_OTHER",
+            "state": "running",
+        },
+    }
+    monkeypatch.setattr(
+        manager,
+        "_latest_by_request_stable",
+        lambda: (latest, ("stable",)),
+    )
+    calls = []
+
+    def cancel(request_id, reason):
+        calls.append((request_id, reason))
+        return {"ok": True, "state": "cancelled"}
+
+    monkeypatch.setattr(manager, "cancel", cancel)
+
+    result = manager.cancel_disposed_reviewer_processes([
+        {"task_id": "R_BOUND", "finished": True, "cleanup_error": ""},
+    ])
+
+    assert result["ok"] is True
+    assert result["reviewer_task_ids"] == ["R_BOUND"]
+    assert calls == [("REQ_RUNNING", "parent_candidate_rejected")]
+    assert result["cancelled"] == [{
+        "task_id": "R_BOUND",
+        "request_id": "REQ_RUNNING",
+        "ok": True,
+        "state": "cancelled",
+        "blocked_reason": "",
+    }]
+
+
+def test_disposed_reviewer_process_cancellation_fails_closed_without_stable_ledger(
+    monkeypatch,
+):
+    manager = object.__new__(process_launcher.ProcessManager)
+    monkeypatch.setattr(manager, "_latest_by_request_stable", lambda: ({}, None))
+    monkeypatch.setattr(
+        manager,
+        "cancel",
+        lambda *_args, **_kwargs: pytest.fail("unproven snapshot must not cancel"),
+    )
+
+    result = manager.cancel_disposed_reviewer_processes([
+        {"task_id": "R_BOUND", "finished": True, "cleanup_error": ""},
+    ])
+
+    assert result["ok"] is False
+    assert result["state"] == "reconcile_pending"
+    assert result["blocked_reason"] == "process_ledger_snapshot_unproven"

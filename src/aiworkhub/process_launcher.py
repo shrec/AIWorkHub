@@ -13973,6 +13973,80 @@ class ProcessManager:
         """
         return _accept_preview_impl(self, request_id, task_id, **overrides)
 
+    def cancel_disposed_reviewer_processes(
+        self,
+        reviewer_finalization: Any,
+        *,
+        reason: str = "parent_candidate_rejected",
+    ) -> dict[str, Any]:
+        """Cancel live requests for the exact reviewer tasks core disposed.
+
+        ``core.reject_review`` is the authority that binds reviewer children to
+        the rejected ``(task_id, request_id)`` pair.  Reusing only the task ids
+        in its durable ``reviewer_finalization`` receipt avoids guessing from
+        names, lenses, or timing.  A stable process-ledger snapshot is required
+        before cancellation so an append racing this read cannot hide a newly
+        launched reviewer request.
+        """
+        rows = reviewer_finalization if isinstance(reviewer_finalization, list) else []
+        reviewer_task_ids = sorted({
+            str(row.get("task_id") or "").strip()
+            for row in rows
+            if isinstance(row, dict) and str(row.get("task_id") or "").strip()
+        })
+        if not reviewer_task_ids:
+            return {
+                "schema_id": "aiworkhub.reviewer_process_cancellation.v1",
+                "ok": True,
+                "state": "no_bound_reviewers",
+                "reviewer_task_ids": [],
+                "cancelled": [],
+            }
+
+        latest, generation = self._latest_by_request_stable()
+        if generation is None:
+            return {
+                "schema_id": "aiworkhub.reviewer_process_cancellation.v1",
+                "ok": False,
+                "state": "reconcile_pending",
+                "blocked_reason": "process_ledger_snapshot_unproven",
+                "reviewer_task_ids": reviewer_task_ids,
+                "cancelled": [],
+            }
+
+        exact_ids = set(reviewer_task_ids)
+        requests = sorted(
+            (
+                str(request_id),
+                event,
+            )
+            for request_id, event in latest.items()
+            if isinstance(event, dict)
+            and str(event.get("task_id") or "") in exact_ids
+            and str(event.get("state") or "") not in TERMINAL_PROCESS_STATES
+        )
+        cancelled: list[dict[str, Any]] = []
+        for request_id, event in requests:
+            outcome = self.cancel(request_id, reason=reason)
+            cancelled.append({
+                "task_id": str(event.get("task_id") or ""),
+                "request_id": request_id,
+                "ok": bool(outcome.get("ok")) if isinstance(outcome, dict) else False,
+                "state": str(outcome.get("state") or "") if isinstance(outcome, dict) else "",
+                "blocked_reason": (
+                    str(outcome.get("blocked_reason") or "")
+                    if isinstance(outcome, dict)
+                    else "cancel_result_invalid"
+                ),
+            })
+        return {
+            "schema_id": "aiworkhub.reviewer_process_cancellation.v1",
+            "ok": all(row["ok"] for row in cancelled),
+            "state": "completed",
+            "reviewer_task_ids": reviewer_task_ids,
+            "cancelled": cancelled,
+        }
+
     def reject_review(
         self,
         task_id: str,
@@ -14028,6 +14102,12 @@ class ProcessManager:
         result = core.reject_review(target, bounded_reason, to=to)
         if not isinstance(result, dict):
             return {**refusal, "error": "reject_review_result_invalid"}
+        if result.get("ok") is True and result.get("reviewer_finalization"):
+            result["reviewer_process_cancellation"] = (
+                self.cancel_disposed_reviewer_processes(
+                    result["reviewer_finalization"],
+                )
+            )
         result.setdefault("task_id", target)
         result.setdefault("to", to)
         if result.get("ok") is not True:
