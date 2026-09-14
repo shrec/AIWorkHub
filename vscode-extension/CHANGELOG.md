@@ -1,5 +1,16 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.38 — 2026-09-14
+
+### Fixed
+
+- Automatic review recovery now advances up to six reservable lifecycle
+  actions per reconciler pass and continues across deferred chains, eliminating
+  the one-action starvation loop while retaining bounded interactive headroom.
+- Task MCP writer serialization, validation replay authority, reviewer process
+  cleanup and callback initialization fixes reduce recurring mechanical
+  failures and SQLite lock contention.
+
 ## 0.11.37 — 2026-09-14
 
 ### Fixed

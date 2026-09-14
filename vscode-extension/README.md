@@ -14,10 +14,14 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.11.37
+## What's new in 0.11.38
 
-- Reconciler review recovery now advances one durable action per scan, keeping
-  stalled-review recovery from monopolizing the Task MCP critical path.
+- Reconciler review recovery now advances a bounded batch of durable actions
+  per scan and continues past deferred chains. A busy review queue can no
+  longer strand newly seeded reviewers behind one action per multi-minute pass.
+
+- Task MCP writes now share a serialized writer boundary and reusable lock
+  descriptor, reducing SQLite contention and lock churn.
 
 - Toolchain receipt creation and validation now use one bounded executable
   fingerprint contract, eliminating false identity drift for binaries larger

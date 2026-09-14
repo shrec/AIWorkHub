@@ -6,6 +6,27 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.38] - 2026-09-14
+
+### Fixed
+
+- Automatic quality-review recovery now drains a bounded batch of reservable
+  lifecycle actions on every reconciler pass. A deferred first action can no
+  longer hold the remaining review queue behind one multi-minute scan.
+- Task MCP writes share one serialized writer boundary and reusable lock
+  descriptor, reducing SQLite writer contention and lock churn.
+- Validation-only replay preserves workspace/toolchain authority, while
+  disposed reviewer processes and callback schema initialization are handled
+  deterministically instead of creating repeated mechanical failures.
+- Foreign reviewer children no longer generate disposition-event floods, and
+  replayable review progress is compacted before it reaches model context.
+
+### Validation
+
+- The reconciler, liveness and review-orchestrator suite passes with 191 tests.
+  A production-shaped 35-action backlog proves a newly seeded target is reached
+  in six bounded passes without duplicate execution.
+
 ## [0.11.36] - 2026-09-13
 
 ### Fixed
