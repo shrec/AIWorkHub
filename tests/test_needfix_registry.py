@@ -1316,6 +1316,89 @@ class TestLinkExistingTask:
         assert event["detail"]["actor"] == "inventory-repair"
         assert event["detail"]["archive_operation"] == "archived"
 
+    def test_reopen_legacy_alias_event_row_remains_readable(self, init_store: Path):
+        r = self._accepted_needfix(init_store)
+        finished_get, status_fn = self._tasks(**{"task-1": {"status": "finished"}})
+        needfix_store.link_existing_task(
+            init_store, r["id"], "task-1", finished_get, status_fn
+        )
+        archived_get, archived_status = self._tasks(
+            **{
+                "task-1": {
+                    "id": "task-1",
+                    "status": "archived",
+                    "archive_operation": "archived",
+                }
+            }
+        )
+
+        reopened = needfix_store.reopen_superseded_task_link(
+            init_store,
+            r["id"],
+            get_task_fn=archived_get,
+            canonical_status_fn=archived_status,
+            actor="inventory-repair",
+            reason="Durable legacy-vocabulary reopen row must stay readable.",
+        )
+
+        assert reopened["reopen_generation"] == 1
+        shown = needfix_store.get_needfix(init_store, r["id"])
+        assert shown["status"] == "accepted"
+        assert shown["converted_task_id"] is None
+        assert shown["reopen_generation"] == 1
+        events = needfix_store.list_events(init_store, r["id"], limit=50)
+        names = [e["event"] for e in events]
+        assert names.count("archived_task_link_reopened") == 1
+        assert names.count("superseded_task_link_reopened") == 0
+
+    def test_reopen_show_then_link_existing_accepted_task_round_trip(
+        self, init_store: Path
+    ):
+        r = self._accepted_needfix(init_store)
+        finished_get, status_fn = self._tasks(**{"task-1": {"status": "finished"}})
+        needfix_store.link_existing_task(
+            init_store, r["id"], "task-1", finished_get, status_fn
+        )
+        superseded_get, superseded_status = self._tasks(
+            **{
+                "task-1": {
+                    "id": "task-1",
+                    "status": "archived",
+                    "archive_operation": "superseded",
+                }
+            }
+        )
+
+        reopened = needfix_store.reopen_superseded_task_link(
+            init_store,
+            r["id"],
+            get_task_fn=superseded_get,
+            canonical_status_fn=superseded_status,
+            reason="Replacement task will be planned from the rebased residual.",
+        )
+        assert reopened["status"] == "accepted"
+
+        shown = needfix_store.get_needfix(init_store, r["id"])
+        assert shown["status"] == "accepted"
+        assert shown["converted_task_id"] is None
+        assert shown["reopen_generation"] == 1
+        event = needfix_store.list_events(init_store, r["id"], limit=1)[0]
+        assert event["event"] == "superseded_task_link_reopened"
+        assert event["detail"]["reopen_generation"] == 1
+
+        replacement_get, replacement_status = self._tasks(
+            **{"task-2": {"status": "finished"}}
+        )
+        relinked = needfix_store.link_existing_task(
+            init_store, r["id"], "task-2", replacement_get, replacement_status
+        )
+        assert relinked["converted_task_id"] == "task-2"
+
+        round_tripped = needfix_store.get_needfix(init_store, r["id"])
+        assert round_tripped["status"] == "task_created"
+        assert round_tripped["converted_task_id"] == "task-2"
+        assert round_tripped["reopen_generation"] == 1
+
     def test_reopen_archived_accepted_task_fails_closed(self, init_store: Path):
         r = self._accepted_needfix(init_store)
         finished_get, status_fn = self._tasks(**{"task-1": {"status": "finished"}})

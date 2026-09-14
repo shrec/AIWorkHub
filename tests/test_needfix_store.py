@@ -260,3 +260,103 @@ def test_active_state_definition_is_derived_from_the_buckets():
     ):
         for member in bucket:
             assert member in ACTIVE_STATE_DEFINITION, member
+
+
+# --- authoritative reopen generation: durable event vocabulary --------------
+
+
+def _reopen_create_task_fn(card: dict[str, Any]) -> dict[str, Any]:
+    return {"ok": True, "task_id": card["task_id"]}
+
+
+def _archived_get_task(task_id: str) -> dict[str, Any]:
+    return {"id": task_id, "status": "archived", "archive_operation": "archived"}
+
+
+def _superseded_get_task(task_id: str) -> dict[str, Any]:
+    return {"id": task_id, "status": "archived", "archive_operation": "superseded"}
+
+
+def _linkable_get_task(task_id: str) -> dict[str, Any]:
+    return {"id": task_id, "status": "accepted"}
+
+
+def _reopen_canonical_status(task: Mapping[str, Any]) -> str:
+    return task["status"]
+
+
+def test_legacy_archived_alias_event_counts_toward_authoritative_generation(init: Path):
+    # ``archived_task_link_reopened`` is the legacy alias durable rows may
+    # carry; the authoritative reader must count it exactly like the
+    # canonical ``superseded_task_link_reopened`` event.
+    rec = needfix_store.add_needfix(init, title="t", description="d", status="accepted")
+    needfix_store.convert_needfix(init, rec["id"], _reopen_create_task_fn)
+
+    reopened = needfix_store.reopen_superseded_task_link(
+        init,
+        rec["id"],
+        get_task_fn=_archived_get_task,
+        canonical_status_fn=_reopen_canonical_status,
+        reason="legacy archived link reconciliation",
+    )
+    assert reopened["reopen_generation"] == 1
+
+    events = needfix_store.list_events(init, rec["id"], limit=10)
+    assert events[0]["event"] == "archived_task_link_reopened"
+    assert needfix_store.get_needfix(init, rec["id"])["reopen_generation"] == 1
+
+
+def test_reopen_show_link_existing_round_trip_needs_no_second_reopen(init: Path):
+    rec = needfix_store.add_needfix(init, title="t", description="d", status="accepted")
+    first = needfix_store.convert_needfix(init, rec["id"], _reopen_create_task_fn)
+
+    needfix_store.reopen_superseded_task_link(
+        init,
+        rec["id"],
+        get_task_fn=_superseded_get_task,
+        canonical_status_fn=_reopen_canonical_status,
+        reason="stale superseded link reconciliation",
+    )
+
+    shown = needfix_store.get_needfix(init, rec["id"])
+    assert shown["status"] == "accepted"
+    assert shown["converted_task_id"] is None
+    assert shown["reopen_generation"] == 1
+
+    linked = needfix_store.link_existing_task(
+        init, rec["id"], "T-existing-accepted", _linkable_get_task, _reopen_canonical_status
+    )
+    assert linked["converted_task_id"] == "T-existing-accepted"
+    assert linked["already_converted"] is False
+
+    final = needfix_store.get_needfix(init, rec["id"])
+    assert final["converted_task_id"] == "T-existing-accepted"
+    assert final["converted_task_id"] != first["converted_task_id"]
+    assert final["reopen_generation"] == 1
+
+
+def test_unrelated_and_forged_events_do_not_count_toward_generation(init: Path):
+    rec = needfix_store.add_needfix(init, title="t", description="d", status="accepted")
+    conn = needfix_store._connect(init)
+    try:
+        needfix_store._record_event(
+            conn, rec["id"], "existing_task_link_claimed", {"note": "unrelated authenticated event"}
+        )
+        needfix_store._record_event(
+            conn, rec["id"], "forged_reopen_event", {"note": "not a recognised reopen alias"}
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    assert needfix_store.get_needfix(init, rec["id"])["reopen_generation"] == 0
+
+    needfix_store.convert_needfix(init, rec["id"], _reopen_create_task_fn)
+    reopened = needfix_store.reopen_superseded_task_link(
+        init,
+        rec["id"],
+        get_task_fn=_superseded_get_task,
+        canonical_status_fn=_reopen_canonical_status,
+        reason="genuine reopen after unrelated and forged events",
+    )
+    assert reopened["reopen_generation"] == 1
+    assert needfix_store.get_needfix(init, rec["id"])["reopen_generation"] == 1

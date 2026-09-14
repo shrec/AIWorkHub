@@ -376,12 +376,22 @@ def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
     return any(row["name"] == column for row in rows)
 
 
+REOPEN_EVENT_LEGACY_ALIAS = "archived_task_link_reopened"
+# One compatible durable reopen vocabulary shared by the reopen writer and
+# the authoritative read validator: the canonical superseded reopen event
+# plus its authenticated legacy ordinary-archive alias. Each name counts as
+# exactly one durable reopen for generation authority, so authenticated
+# legacy ``archived_task_link_reopened`` rows stay readable without any
+# direct database edit.
+REOPEN_EVENT_ALIASES: tuple[str, ...] = (REOPEN_EVENT, REOPEN_EVENT_LEGACY_ALIAS)
+
+
 def _durable_reopen_count(conn: sqlite3.Connection, needfix_id: str) -> int:
     """Exact durable lineage authority: recorded reopen event count."""
     row = conn.execute(
         "SELECT COUNT(*) AS n FROM needfix_events "
-        "WHERE needfix_id = ? AND event = ?",
-        (needfix_id, REOPEN_EVENT),
+        "WHERE needfix_id = ? AND event IN (?, ?)",
+        (needfix_id, *REOPEN_EVENT_ALIASES),
     ).fetchone()
     return int(row["n"])
 
@@ -390,18 +400,20 @@ def _backfill_legacy_reopen_generation(conn: sqlite3.Connection) -> None:
     """Derive ``reopen_generation`` for legacy rows from durable reopen events.
 
     Only rows still carrying the migration default of 0 and with at least one
-    durable ``superseded_task_link_reopened`` event are rewritten; nonzero
-    values are never silently repaired here (they fail closed elsewhere).
+    durable reopen event in the compatible vocabulary (canonical
+    ``superseded_task_link_reopened`` or the legacy
+    ``archived_task_link_reopened`` alias) are rewritten; nonzero values are
+    never silently repaired here (they fail closed elsewhere).
     """
     conn.execute(
         "UPDATE needfix SET reopen_generation = ("
         "    SELECT COUNT(*) FROM needfix_events e "
-        "    WHERE e.needfix_id = needfix.id AND e.event = ?"
+        "    WHERE e.needfix_id = needfix.id AND e.event IN (?, ?)"
         ") WHERE reopen_generation = 0 AND ("
         "    SELECT COUNT(*) FROM needfix_events e "
-        "    WHERE e.needfix_id = needfix.id AND e.event = ?"
+        "    WHERE e.needfix_id = needfix.id AND e.event IN (?, ?)"
         ") > 0",
-        (REOPEN_EVENT, REOPEN_EVENT),
+        (*REOPEN_EVENT_ALIASES, *REOPEN_EVENT_ALIASES),
     )
 
 
