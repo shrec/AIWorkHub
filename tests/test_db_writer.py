@@ -339,11 +339,16 @@ def test_leased_connection_wrapper_is_defined_once_and_used_by_consumers() -> No
                 ):
                     factories.append(rel)
     assert definitions == ["db_writer.py"]
+    # ``task_store.py`` joined this list with NF-2026-00846: its ``_connect`` is
+    # the one write-capable opener every direct caller reaches (task_engine's
+    # settlement paths, learning_commit_store, process_launcher_accept_review),
+    # so leasing it there is what removed the last unserialized writers.
     assert factories == [
         "callback_store.py",
         "core.py",
         "review_lifecycle.py",
         "review_orchestrator.py",
+        "task_store.py",
     ]
 
 

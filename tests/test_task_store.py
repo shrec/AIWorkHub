@@ -1133,7 +1133,13 @@ def test_write_connection_takes_the_lease_before_it_opens_the_connection(
     itself a write that can fail on a lock, so connecting outside the lease
     would leave the first statement of the write path unserialized. Taking the
     lease outside also keeps it from ever being acquired inside an open
-    transaction, which is the ordering that could deadlock."""
+    transaction, which is the ordering that could deadlock.
+
+    NF-2026-00846 adds a second acquisition INSIDE ``_connect`` -- re-entrant,
+    so it never waits here -- because callers that reach ``_connect`` directly
+    rather than through ``_write_connection`` were the unserialized writers.
+    The invariant the exact sequence below pins is that no connection is ever
+    opened before a lease is held, and that the lease outlives the body."""
     order: list[str] = []
     real_lease = task_store.db_writer.write_lease
     real_connect = task_store._connect
@@ -1158,7 +1164,16 @@ def test_write_connection_takes_the_lease_before_it_opens_the_connection(
         order.append("body")
         assert conn is not None
 
-    assert order == ["lease_acquired", "connect", "body", "lease_released"]
+    assert order == [
+        "lease_acquired",
+        "connect",
+        "lease_acquired",
+        "body",
+        "lease_released",
+        "lease_released",
+    ]
+    assert order.index("connect") > order.index("lease_acquired")
+    assert order.index("body") < order.index("lease_released")
 
 
 def test_write_connection_holds_the_lease_for_the_whole_block(tmp_path: Path) -> None:

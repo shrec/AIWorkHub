@@ -29,6 +29,7 @@ import hashlib
 import json
 import re
 import sqlite3
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -56,10 +57,12 @@ def _effective_topic(row: Any) -> str:
     return str(card_json.get("topic") or "") if isinstance(card_json, dict) else topic
 
 
-def claim_start_exact(
+def _claim_start_exact_once(
     repo: Path, task_id: str, runner: str, topic: str, request_id: str = ""
 ) -> dict[str, Any]:
-    """Same wire contract and authority as ``core.claim_start_exact`` --
+    """One attempt at the claim CAS. ``claim_start_exact`` is the front door.
+
+    Same wire contract and authority as ``core.claim_start_exact`` --
     same write gate, same fail-closed identity/collision behavior -- but
     bound to an explicit ``repo`` (see module docstring) instead of an
     ambiently re-resolved one, and normalized against the same topic
@@ -98,22 +101,23 @@ def claim_start_exact(
     # "database is locked" under contention (callback_store.open_db already
     # retries that exact statement). Connecting outside the lease would leave
     # the first statement of the claim path unserialized.
+    # A lease failure is no longer settled here: ``claim_start_exact`` owns the
+    # bounded retry and the one typed receipt, so a timeout must reach it rather
+    # than become a distinct terminal answer on the first contended attempt.
     lease_stack = contextlib.ExitStack()
-    try:
-        lease_stack.enter_context(db_writer.write_lease(db_path))
-    except db_writer.WriteLeaseError as exc:
-        return {
-            "ok": False,
-            "returncode": 1,
-            "command": command,
-            "stdout": "",
-            "stderr": f"task_queue_write_lease_unavailable:{exc}",
-        }
+    lease_stack.enter_context(db_writer.write_lease(db_path))
     try:
         conn = task_store._connect(db_path)
     except task_store.TaskStoreError as exc:
         lease_stack.close()
         return {"ok": False, "returncode": 1, "command": command, "stdout": "", "stderr": str(exc)}
+    except BaseException:
+        # ``_connect`` now takes the lease itself, so it can fail for reasons
+        # other than TaskStoreError. Releasing here keeps a failed attempt from
+        # stranding the lease this function already holds -- which would make
+        # the retry above wait on its own predecessor.
+        lease_stack.close()
+        raise
     try:
         row = conn.execute(
             "SELECT runner, topic, status, worker_status, claimed_by, card_json "
@@ -291,6 +295,86 @@ def claim_start_exact(
     card = task_store.get_task(repo, task_id)
     stdout = json.dumps(card, ensure_ascii=False, default=str) if card else ""
     return {"ok": True, "returncode": 0, "command": command, "stdout": stdout, "stderr": ""}
+
+
+# NF-2026-00846: a pre-provider SQLite lock must never escape a launch as a raw
+# ``sqlite3.OperationalError: database is locked``. With every write-capable
+# ``task_queue.sqlite`` connection now leased (``task_store._connect``), genuine
+# contention here is a bounded *wait*, not a failure -- but the lease itself is
+# bounded, and a wedged holder still surfaces as ``WriteLeaseTimeout``. Both are
+# converted, at this one boundary, into a typed durable receipt.
+#
+# The retry is mechanical and bounded, never open-ended, and it is safe only
+# because it replays the SAME ``request_id``: ``_claim_start_exact_once`` already
+# reconciles a re-presented request onto the claim it committed
+# (``claim_reconciled``) instead of taking a second epoch. So a retry can neither
+# duplicate a claim epoch nor duplicate a provider launch -- the caller has not
+# spawned anything yet when this runs.
+CLAIM_CONTENTION_ATTEMPTS = 3
+_CLAIM_CONTENTION_BACKOFF_S = 0.05
+CLAIM_CONTENTION_SCHEMA = "aiworkhub.task_queue.write_contention.v1"
+
+
+def _is_write_contention(exc: BaseException) -> bool:
+    """True only for a contended writer, never for a real SQLite fault.
+
+    A corrupt database, a missing table or a constraint violation must keep
+    failing exactly as it does today; retrying those would hide them.
+    """
+    if isinstance(exc, db_writer.WriteLeaseError):
+        return True
+    if isinstance(exc, sqlite3.OperationalError):
+        text = str(exc).lower()
+        return "database is locked" in text or "database is busy" in text
+    return False
+
+
+def claim_start_exact(
+    repo: Path, task_id: str, runner: str, topic: str, request_id: str = ""
+) -> dict[str, Any]:
+    """``_claim_start_exact_once`` with a bounded, identity-preserving retry.
+
+    Same wire contract, same authority, same fail-closed identity behavior.
+    The only addition is that writer contention reached before the provider is
+    launched resolves to either the exact committed claim or a typed receipt --
+    never to a raw lock error crossing the launch boundary.
+    """
+    command = ["claim-start", task_id, "--runner", runner, "--topic", topic]
+    if request_id:
+        command.extend(["--request-id", request_id])
+    error_class = ""
+    for attempt in range(CLAIM_CONTENTION_ATTEMPTS):
+        try:
+            return _claim_start_exact_once(repo, task_id, runner, topic, request_id)
+        except BaseException as exc:  # noqa: BLE001 -- re-raised unless contended
+            if not _is_write_contention(exc):
+                raise
+            error_class = type(exc).__name__
+            if attempt == CLAIM_CONTENTION_ATTEMPTS - 1:
+                break
+            time.sleep(_CLAIM_CONTENTION_BACKOFF_S * (attempt + 1))
+    return {
+        "ok": False,
+        "returncode": 1,
+        "command": command,
+        "stdout": "",
+        "stderr": (
+            f"task_queue_write_contention:task_id={task_id}"
+            f":request_id={request_id}:attempts={CLAIM_CONTENTION_ATTEMPTS}"
+            f":{error_class}"
+        ),
+        "task_queue_contention": {
+            "schema_id": CLAIM_CONTENTION_SCHEMA,
+            "task_id": task_id,
+            "runner": runner,
+            "topic": topic,
+            "request_id": request_id,
+            "attempts": CLAIM_CONTENTION_ATTEMPTS,
+            "error_class": error_class,
+            "provider_launched": False,
+            "retryable": True,
+        },
+    }
 
 
 def record_launch_blocker(

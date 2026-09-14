@@ -32,7 +32,7 @@ import tempfile
 import threading
 import time
 from collections import OrderedDict
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -466,7 +466,7 @@ def _connect(
     busy_timeout_ms: int = 5000,
     explicit_txn: bool = False,
 ) -> sqlite3.Connection:
-    """Open the canonical store.
+    """Open the canonical store; every write-capable open takes the lease.
 
     ``explicit_txn`` opts one connection out of sqlite3's legacy implicit
     transaction handling (``isolation_level=None``) so the caller states its own
@@ -478,22 +478,63 @@ def _connect(
     into no-ops. ``commit()``/``rollback()`` still work normally on an
     ``explicit_txn`` connection once a transaction is open, because sqlite3
     issues them whenever ``sqlite3_get_autocommit()`` is false.
+
+    NF-2026-00846: the ``db_writer`` lease is taken HERE -- before
+    ``sqlite3.connect`` and before the first ``PRAGMA`` -- and not only in
+    ``_write_connection``. Leasing one level up left every caller that opens a
+    write-capable connection directly racing unserialized: the six
+    ``task_engine`` claim/settlement paths a launch reaches
+    (``record_launch_blocker``, ``mark_launch_failed``, ``mark_terminal_failure``,
+    ``mark_review_workspace_missing``, ``accept_review``,
+    ``disposition_reviewer_children``), plus ``learning_commit_store`` and
+    ``process_launcher_accept_review``. Those are precisely the writers whose
+    ``PRAGMA journal_mode=WAL`` -- itself a write on a not-yet-WAL database --
+    and whose claim CAS surfaced raw ``database is locked`` before a provider
+    was ever launched. This adds no second lock: it routes those opens through
+    the one existing cross-process authority.
+
+    ``db_writer._LeasedConnection`` ties release to ``conn.close()``, so the
+    ``conn = _connect(...); try: ... finally: conn.close()`` shape every call
+    site already uses holds the lease for exactly the life of the writer. The
+    lease is re-entrant per (process, thread, path), so ``_write_connection``
+    and ``task_engine.claim_start_exact`` -- which both already hold it -- are
+    unaffected. Read-only opens stay ungated: WAL readers must stay concurrent.
     """
     bounded_busy = max(0, int(busy_timeout_ms))
-    if not readonly:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(
-            str(path), timeout=5.0, isolation_level=None if explicit_txn else ""
-        )
-        conn.execute(f"PRAGMA busy_timeout={bounded_busy}")
-        _set_journal_mode_wal(conn)
-        conn.execute("PRAGMA synchronous=NORMAL")
-    else:
+    if readonly:
         conn = connect_readonly(path, timeout=5.0)
         conn.execute(f"PRAGMA busy_timeout={bounded_busy}")
         conn.execute("PRAGMA query_only=ON")
-    conn.row_factory = sqlite3.Row
-    return conn
+        conn.row_factory = sqlite3.Row
+        return conn
+    path.parent.mkdir(parents=True, exist_ok=True)
+    stack = ExitStack()
+    stack.enter_context(db_writer.write_lease(path))
+    leased: sqlite3.Connection | None = None
+    try:
+        leased = sqlite3.connect(
+            str(path),
+            timeout=5.0,
+            isolation_level=None if explicit_txn else "",
+            factory=db_writer._LeasedConnection,
+        )
+        leased.execute(f"PRAGMA busy_timeout={bounded_busy}")
+        _set_journal_mode_wal(leased)
+        leased.execute("PRAGMA synchronous=NORMAL")
+        leased.row_factory = sqlite3.Row
+        leased._lease_stack = stack  # type: ignore[attr-defined]
+        return leased
+    except BaseException:
+        # Release in the reverse order of acquisition. ``close()`` is a no-op
+        # for the lease until ``_lease_stack`` is set, and ``ExitStack.close``
+        # is idempotent, so this is correct whichever statement failed.
+        if leased is not None:
+            try:
+                leased.close()
+            except Exception:  # noqa: BLE001 -- cleanup must not mask the cause
+                pass
+        stack.close()
+        raise
 
 
 def _begin_immediate(conn: sqlite3.Connection) -> None:
@@ -535,6 +576,11 @@ def _write_connection(
     would leave the first statement of the write path unserialized. Taking it
     outside also keeps it from ever being acquired inside an open transaction,
     which is the ordering that could deadlock.
+
+    Since NF-2026-00846 ``_connect`` takes the same lease itself, so the
+    acquisition below is re-entrant. It is kept because this is the only place
+    a caller can bound the wait with ``timeout_s``: the outer acquisition is
+    the one that actually waits, and the nested one returns immediately.
     """
     with db_writer.write_lease(db_path, timeout_s=timeout_s):
         conn = _connect(db_path, explicit_txn=True)

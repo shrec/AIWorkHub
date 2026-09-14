@@ -95,7 +95,7 @@ def bound_reviewer_rows(
 
     try:
         _readiness, db_path = task_store._require_ready(repo)
-        conn = task_store._connect(db_path)
+        conn = task_store._connect(db_path, readonly=True)
     except Exception:  # noqa: BLE001 -- enumeration failure never accepts anything
         return []
     try:

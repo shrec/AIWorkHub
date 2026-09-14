@@ -408,6 +408,30 @@ def test_bound_reviewer_rows_reads_the_binding_the_finalizer_writes(tmp_path: Pa
     ) == ["QR-CORRECTNESS", "QR-SECURITY"]
 
 
+def test_bound_reviewer_rows_uses_an_ungated_readonly_connection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Reviewer enumeration must not join the single-writer queue."""
+    repo = _store_with_reviewers(
+        tmp_path,
+        [_reviewer_card("QR-CORRECTNESS", "correctness")],
+    )
+    observed: list[bool] = []
+    real_connect = task_store._connect
+
+    def traced_connect(path, **kwargs):  # type: ignore[no-untyped-def]
+        observed.append(bool(kwargs.get("readonly")))
+        return real_connect(path, **kwargs)
+
+    monkeypatch.setattr(task_store, "_connect", traced_connect)
+
+    rows = process_launcher_accept_review.bound_reviewer_rows(repo, "T-1", "R-1")
+
+    assert [row["task_id"] for row in rows] == ["QR-CORRECTNESS"]
+    assert observed
+    assert all(observed)
+
+
 def test_reviewer_evidence_separates_running_from_missing(tmp_path: Path):
     """"Not finished" and "not launched" need different answers from a manager;
     the accept surface returned the same one for both."""
