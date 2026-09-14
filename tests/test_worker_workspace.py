@@ -521,6 +521,10 @@ def _commit_validation_worker_package(repo: Path) -> None:
         "_version.py",
         "_platform_process.py",
         "platform_io.py",
+        # NF-2026-00841: worker_workspace loads this sibling at runtime through
+        # ``__import__``, so the seed closure must carry it and this fixture
+        # repository must therefore track it too.
+        "opencode_auth.py",
         "runtime_temp.py",
         "windows_file_structures.py",
         "toolchain_authority.py",
@@ -7936,3 +7940,283 @@ def test_unmeasured_privacy_record_is_deduplicated_and_bounded(
         worker_workspace._verify_owner_private_directory(target, "probe")
     assert len(worker_workspace.UNMEASURED_DIRECTORY_PRIVACY) <= cap
     worker_workspace.UNMEASURED_DIRECTORY_PRIVACY.clear()
+
+
+# --- NF-2026-00841: deterministic runtime sibling dependency closure --------
+
+
+def test_runtime_loaded_siblings_are_declared_once_not_inline() -> None:
+    """No dynamic sibling load may name its own module/file inline.
+
+    ``_resolve_local_python_imports`` walks ``ast.Import``/``ast.ImportFrom``
+    only, so a sibling reached by file location or ``__import__`` is invisible
+    to the sparse seed closure. NF-2026-00841 measured exactly that outcome:
+    ``opencode_auth`` was a tracked file the closure never seeded, and the
+    opencode_cli credential projection then failed inside the isolated
+    worktree. Routing every dynamic load through
+    ``RUNTIME_LOADED_PACKAGE_SIBLINGS`` is what keeps the loaders and the seed
+    list from drifting, so a new inline literal has to fail here.
+    """
+    import ast
+
+    tree = ast.parse(
+        Path(worker_workspace.__file__).read_text(encoding="utf-8"),
+        filename="worker_workspace.py",
+    )
+    inline: set[tuple[str, ...]] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        called = func.id if isinstance(func, ast.Name) else getattr(func, "attr", "")
+        if called != "_require_regular_runtime_temp_support":
+            continue
+        literals = tuple(
+            argument.value
+            for argument in node.args
+            if isinstance(argument, ast.Constant) and isinstance(argument.value, str)
+        )
+        if literals:
+            inline.add(literals)
+    assert inline == set(), sorted(inline)
+
+    declared = set(worker_workspace.RUNTIME_LOADED_PACKAGE_SIBLINGS)
+    assert ("opencode_auth", "opencode_auth.py") in declared
+    assert set(worker_workspace._RUNTIME_TEMP_SUPPORT_SIBLINGS) < declared
+    package_root = Path(worker_workspace.__file__).resolve().parent
+    for module_name, filename in declared:
+        sibling = package_root / filename
+        assert sibling.is_file(), module_name
+        assert not sibling.is_symlink(), module_name
+
+
+def test_validation_worker_package_support_carries_every_runtime_sibling() -> None:
+    support = set(worker_workspace._VALIDATION_WORKER_PACKAGE_SUPPORT)
+    for _module_name, filename in worker_workspace.RUNTIME_LOADED_PACKAGE_SIBLINGS:
+        assert f"src/aiworkhub/{filename}" in support
+    assert "src/aiworkhub/opencode_auth.py" in support
+
+
+def test_declared_seed_closure_materializes_the_opencode_auth_sibling(
+    repo: Path,
+) -> None:
+    _commit_validation_worker_package(repo)
+    card = {
+        "allowed_writes": ["src/aiworkhub/worker_workspace.py"],
+        "read_first": ["src/aiworkhub/worker_workspace.py"],
+        "validation": ["python3 -m pytest -q tests/test_new_candidate_module.py"],
+    }
+    _live, support_seeded, seeded = worker_workspace._declared_workspace_seed_closure(
+        repo, card, ("src/aiworkhub/worker_workspace.py",)
+    )
+    assert "src/aiworkhub/opencode_auth.py" in support_seeded
+    assert "src/aiworkhub/opencode_auth.py" in seeded
+
+
+def test_sparse_worktree_runtime_load_of_opencode_auth_cannot_fail(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    repo: Path,
+) -> None:
+    """The measured NF-2026-00841 failure, proved absent end to end.
+
+    A real sparse worktree is provisioned, then a child interpreter resolves
+    the sibling exactly the way ``_credential_home`` does and imports it. Both
+    the verified sibling path and the imported module must come from the
+    worktree, never from the canonical checkout the worker cannot see.
+    """
+    _commit_validation_worker_package(repo)
+    monkeypatch.setenv(
+        worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "nf841-worktrees")
+    )
+    workspace = worker_workspace.create_workspace(
+        repo,
+        "nf841-opencode-sibling",
+        {
+            "allowed_writes": ["src/aiworkhub/worker_workspace.py"],
+            "read_first": ["src/aiworkhub/worker_workspace.py"],
+            "validation": ["python3 -m pytest -q tests/test_new_candidate_module.py"],
+        },
+        "glm_vscode_lm",
+    )
+    try:
+        sibling = workspace.path / "src" / "aiworkhub" / "opencode_auth.py"
+        assert sibling.is_file()
+        assert not sibling.is_symlink()
+        probe = (
+            "import json\n"
+            "from aiworkhub import worker_workspace as w\n"
+            "name, filename = w._OPENCODE_AUTH_SIBLING\n"
+            "verified = w._require_regular_runtime_temp_support(\n"
+            "    w._runtime_temp_support_root(), name, filename\n"
+            ")\n"
+            "module = __import__(\n"
+            "    'aiworkhub.' + name, fromlist=['project_opencode_auth']\n"
+            ")\n"
+            "print(json.dumps({\n"
+            "    'verified': str(verified),\n"
+            "    'loaded': module.__file__,\n"
+            "    'callable': callable(module.project_opencode_auth),\n"
+            "}))\n"
+        )
+        environment = dict(os.environ)
+        environment["PYTHONPATH"] = str(workspace.path / "src")
+        result = subprocess.run(
+            [sys.executable, "-c", probe],
+            cwd=workspace.path,
+            env=environment,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        assert payload["callable"] is True
+        assert Path(payload["verified"]).resolve() == sibling.resolve()
+        assert Path(payload["loaded"]).resolve() == sibling.resolve()
+    finally:
+        worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
+
+
+# --- NF-2026-00841: cleanup repairs the parent, never a shared inode -------
+
+
+def _record_chmod(monkeypatch: pytest.MonkeyPatch, *, denied: bool = False) -> list:
+    """Capture every ``os.chmod`` the cleanup repair attempts.
+
+    The worker validation sandbox denies the whole chmod family outright, so
+    the repair policy is asserted through the recorded calls rather than
+    through resulting mode bits. ``denied=True`` replays that exact host: the
+    repair must absorb the refusal instead of turning it into a cleanup error.
+    """
+    calls: list[tuple[str, int]] = []
+
+    def fake_chmod(path, mode: int) -> None:
+        calls.append((str(path), mode))
+        if denied:
+            raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(worker_workspace.os, "chmod", fake_chmod)
+    return calls
+
+
+def _shared_read_only_file(directory: Path, alias: Path) -> Path:
+    """A 0o444 regular file with ``st_nlink == 2``, built without any chmod.
+
+    This is the layout ``plant_outer_validation_authority`` creates on purpose:
+    the nested Landlock authority locator is hardlinked to its workspace anchor
+    so ``verify_nested_landlock_authority_locator`` can require ``st_nlink ==
+    2``. The mode comes from the ``os.open`` creation argument because a
+    create-then-chmod sequence could not run in a nested sandbox.
+    """
+    target = directory / "nested_landlock_locator.json"
+    handle = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o444)
+    try:
+        os.write(handle, b"{}")
+    finally:
+        os.close(handle)
+    os.link(target, alias)
+    assert os.stat(target).st_nlink == 2
+    return target
+
+
+def test_removal_repair_never_chmods_a_shared_inode(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The measured syscall-90 hardlink denial, removed at its source.
+
+    Removal authority is the parent directory's write+search bits; the entry's
+    own mode never authorizes its unlink. Chmod'ing the shared locator inode
+    was therefore both unnecessary and exactly the authenticated
+    ``metadata_broker_hardlink_forbidden`` denial NF-2026-00841 measured.
+    """
+    parent = tmp_path / "scratch"
+    parent.mkdir(mode=0o700)
+    target = _shared_read_only_file(parent, tmp_path / "anchor.json")
+    before = os.stat(target)
+
+    calls = _record_chmod(monkeypatch)
+    worker_workspace._repair_removal_permissions(str(target))
+
+    assert [path for path, _mode in calls] == [str(parent)]
+    assert calls[0][1] == stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR
+    after = os.stat(target)
+    assert (after.st_dev, after.st_ino) == (before.st_dev, before.st_ino)
+    assert stat.S_IMODE(after.st_mode) == stat.S_IMODE(before.st_mode)
+    assert after.st_nlink == 2
+
+
+def test_removal_repair_restores_an_unshared_regular_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    parent = tmp_path / "scratch"
+    parent.mkdir(mode=0o700)
+    target = parent / "unshared"
+    handle = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o444)
+    os.close(handle)
+
+    calls = _record_chmod(monkeypatch)
+    worker_workspace._repair_removal_permissions(str(target))
+
+    # Provably unshared bytes stay repairable: the parent first, then the file.
+    assert [path for path, _mode in calls] == [str(parent), str(target)]
+    assert calls[1][1] == stat.S_IRUSR | stat.S_IWUSR
+
+
+def test_removal_repair_restores_a_directory_on_its_own_terms(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A directory is never a hardlink alias of a file and the broker authorizes
+    # owned directories on their own terms, so a directory still repairs its
+    # own bits.  The fixture stays traversable because the chmod family is
+    # denied in a nested sandbox and an 0o000 directory could not be cleaned up.
+    target = tmp_path / "stubborn"
+    target.mkdir(mode=0o700)
+
+    calls = _record_chmod(monkeypatch)
+    worker_workspace._repair_removal_permissions(str(target))
+
+    assert calls == [(str(target), stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)]
+
+
+def test_removal_repair_absorbs_a_denied_chmod_family(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    parent = tmp_path / "scratch"
+    parent.mkdir(mode=0o700)
+    target = parent / "entry"
+    target.write_text("x", encoding="utf-8")
+
+    calls = _record_chmod(monkeypatch, denied=True)
+    worker_workspace._repair_removal_permissions(str(target))
+
+    # Every attempt is made and every refusal absorbed: the retried removal,
+    # not a failed repair, decides the cleanup outcome.
+    assert [path for path, _mode in calls] == [str(parent), str(target)]
+
+
+def test_workspace_rmtree_disposes_a_tree_holding_a_shared_inode(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """End to end: the tree goes away and the shared inode is never mutated."""
+    root = tmp_path / "workspace"
+    nested = root / ".aiworkhub" / "validation"
+    nested.mkdir(parents=True, mode=0o700)
+    alias = tmp_path / "anchor.json"
+    target = _shared_read_only_file(nested, alias)
+    shared_identity = os.stat(target)
+    shared_mode = stat.S_IMODE(shared_identity.st_mode)
+
+    calls = _record_chmod(monkeypatch)
+    worker_workspace._rmtree_workspace_owned(root)
+
+    assert not root.exists()
+    assert str(target) not in [path for path, _mode in calls]
+    surviving = os.stat(alias)
+    assert (surviving.st_dev, surviving.st_ino) == (
+        shared_identity.st_dev,
+        shared_identity.st_ino,
+    )
+    assert stat.S_IMODE(surviving.st_mode) == shared_mode
+    assert surviving.st_nlink == 1

@@ -115,13 +115,15 @@ class _FakeLibrary:
 
 
 class _RealSyscallLibrary:
-    """Linux x86_64 truth for the two brokered names NF-2026-00448 exercises.
+    """Linux x86_64 truth for the brokered names NF-2026-00448/NF-2026-00841 use.
 
     The mapping stays separate from ``_FakeLibrary`` so a real-table lookup
     can never accidentally inherit the fake numbers used by tests.
+    ``utimensat`` (280) joins ``chmod`` (90) because NF-2026-00841 measured the
+    two together as one authenticated denial sequence.
     """
 
-    _NUMBERS = {"chmod": 90, "fchmod": 91}
+    _NUMBERS = {"chmod": 90, "fchmod": 91, "utimensat": 280}
 
     def number(self, name: str) -> int:
         return self._NUMBERS[name]
@@ -1866,3 +1868,270 @@ class TestSemLockCapability:
         )
         assert ran == [["python -m pytest tests/test_x.py"]]
         assert rows[0]["returncode"] == 0
+
+
+class TestNF841AuthenticatedDenialIsNotStructurallyTerminal:
+    """NF-2026-00841: a legitimate denial must not replace the real exit status.
+
+    Two provider-free failures measured the broker terminating an otherwise
+    passing pytest with ``rc=126`` after an authenticated ``utimensat``
+    (syscall 280) ``metadata_broker_outside_scratch`` denial followed by an
+    authenticated ``chmod`` (syscall 90) ``metadata_broker_hardlink_forbidden``
+    denial.  Neither denial means the sandbox is broken: the validation
+    substrate itself plants a shared inode inside the request-owned exec
+    scratch (``plant_outer_validation_authority`` hardlinks the nested Landlock
+    authority locator to its workspace anchor so
+    ``verify_nested_landlock_authority_locator`` can require ``st_nlink == 2``),
+    and refusing to mutate it is the intended outcome.  The refusal, the
+    audited record and every kernel beneath-root/symlink/owner/inode check stay
+    exactly as they were; only the process-group kill goes away.
+    """
+
+    @staticmethod
+    def _record(
+        exc: BaseException, syscall_nr: int, monkeypatch: pytest.MonkeyPatch
+    ) -> tuple[bool, dict]:
+        """Drive the real denial recorder and return ``(terminal, record)``."""
+        import json
+
+        read_fd, write_fd = os.pipe()
+        monkeypatch.setattr(
+            worker_workspace, "_metadata_broker_evidence_fd", write_fd
+        )
+        monkeypatch.setattr(worker_workspace, "_metadata_broker_denial_count", 0)
+        request = _make_request(syscall_nr, os.getpid())
+        try:
+            terminal = worker_workspace._record_metadata_broker_denial(exc, request)
+            os.close(write_fd)
+            payload = os.read(read_fd, 4096).decode("utf-8")
+        finally:
+            os.close(read_fd)
+        return terminal, json.loads(payload.splitlines()[0])
+
+    def test_terminal_reasons_are_exactly_the_unknowable_post_states(self) -> None:
+        # A denial is terminal only when this trusted parent cannot say what
+        # the filesystem looks like afterwards.  A refused mutation is not in
+        # that class: the shared inode is provably untouched.
+        assert worker_workspace._METADATA_BROKER_TERMINAL_DENIAL_REASONS == frozenset(
+            {"metadata_broker_deleted_fd", "oserror_EPERM"}
+        )
+
+    def test_hardlink_forbidden_chmod_is_audited_without_termination(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        terminal, record = self._record(
+            WorkspaceError("metadata_broker_hardlink_forbidden:/scratch/config.lock"),
+            90,
+            monkeypatch,
+        )
+        assert terminal is False
+        assert record["schema"] == "aiworkhub.metadata_broker_denial.v1"
+        assert record["authenticated"] is True
+        assert record["terminal"] is False
+        assert record["reason"] == "metadata_broker_hardlink_forbidden"
+        assert record["syscall_nr"] == 90
+
+    def test_outside_scratch_utimensat_is_audited_without_termination(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        terminal, record = self._record(
+            WorkspaceError("metadata_broker_outside_scratch:/elsewhere/stamp"),
+            280,
+            monkeypatch,
+        )
+        assert terminal is False
+        assert record["authenticated"] is True
+        assert record["terminal"] is False
+        assert record["reason"] == "metadata_broker_outside_scratch"
+        assert record["syscall_nr"] == 280
+
+    @pytest.mark.parametrize(
+        "exc,reason",
+        [
+            (
+                WorkspaceError("metadata_broker_deleted_fd"),
+                "metadata_broker_deleted_fd",
+            ),
+            (PermissionError(1, "Operation not permitted"), "oserror_EPERM"),
+        ],
+    )
+    def test_unknowable_post_state_denials_stay_terminal(
+        self, exc: BaseException, reason: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        terminal, record = self._record(exc, 90, monkeypatch)
+        assert terminal is True
+        assert record["terminal"] is True
+        assert record["reason"] == reason
+
+    @staticmethod
+    def _shared_inode_lock(scratch: Path) -> Path:
+        """A hardlinked ``.git/config.lock``, built without a single chmod.
+
+        ``TestBrokeredSyscallDecoding._hardlinked_git_config_lock`` reaches the
+        same layout through ``os.chmod``, which the worker sandbox's own
+        seccomp policy denies. Both denials this case replays are raised by
+        target verification before any real metadata syscall, so building the
+        fixture with the mode-at-creation ``os.open`` argument keeps the
+        regression runnable in a nested sandbox as well as on a host.
+        """
+        git_dir = scratch / ".git"
+        git_dir.mkdir(mode=0o700)
+        target = git_dir / "config.lock"
+        handle = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o664)
+        try:
+            os.write(handle, b"x")
+        finally:
+            os.close(handle)
+        os.link(target, scratch / "config.lock.alias")
+        return target
+
+    @pytest.mark.usefixtures("require_openat2")
+    def test_authenticated_280_then_90_sequence_leaves_shared_inode_untouched(
+        self, scratch: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Replay the exact measured sequence against the real broker with the
+        # real x86_64 syscall numbers: both requests are authenticated, both
+        # are refused fail-closed, the shared inode keeps its identity and its
+        # mode, and neither refusal is structurally terminal.
+        library = _RealSyscallLibrary()
+        outside = tmp_path / "outside.stamp"
+        outside.write_text("x", encoding="utf-8")
+        target = self._shared_inode_lock(scratch)
+        before = os.stat(target)
+        denials: list[tuple[int, WorkspaceError]] = []
+        fd, root = _scratch_fd_root(scratch)
+        try:
+            stamp_buffer = _path_buffer(outside)
+            utimensat = _make_request(library.number("utimensat"), os.getpid())
+            utimensat.data.args[0] = 0
+            utimensat.data.args[1] = ctypes.addressof(stamp_buffer)
+            utimensat.data.args[2] = 0
+            utimensat.data.args[3] = 0
+            with pytest.raises(
+                WorkspaceError, match="metadata_broker_outside_scratch"
+            ) as outside_denial:
+                worker_workspace._metadata_broker_apply(
+                    library, -1, utimensat, os.getpid(), fd, root
+                )
+            denials.append((int(utimensat.data.nr), outside_denial.value))
+
+            lock_buffer = _path_buffer(target)
+            chmod = _make_request(library.number("chmod"), os.getpid())
+            chmod.data.args[0] = ctypes.addressof(lock_buffer)
+            chmod.data.args[1] = 0o600
+            with pytest.raises(
+                WorkspaceError, match="metadata_broker_hardlink_forbidden"
+            ) as hardlink_denial:
+                worker_workspace._metadata_broker_apply(
+                    library, -1, chmod, os.getpid(), fd, root
+                )
+            denials.append((int(chmod.data.nr), hardlink_denial.value))
+        finally:
+            os.close(fd)
+
+        after = os.stat(target)
+        assert (after.st_dev, after.st_ino) == (before.st_dev, before.st_ino)
+        assert after.st_nlink == 2
+        assert stat.S_IMODE(after.st_mode) == 0o664
+        assert [number for number, _exc in denials] == [280, 90]
+        for number, exc in denials:
+            terminal, record = self._record(exc, number, monkeypatch)
+            assert terminal is False, record
+            assert record["authenticated"] is True
+            assert record["syscall_nr"] == number
+
+    @staticmethod
+    def _denial_probe_command() -> str:
+        """Build the nested probe as one card-shaped validation command.
+
+        ``_tokenize_validation_command`` rejects shell metacharacters anywhere
+        in a validation command, including inside shell quoting, so the payload
+        must not contain one at all.  ``O_WRONLY``, ``O_CREAT`` and ``O_EXCL``
+        are disjoint bits, so summing them yields exactly the flag word the
+        bitwise or would have produced, and every explanatory comment stays out
+        here in real source rather than riding along inside the program text.
+        """
+        script_body = "\n".join(
+            (
+                "import os",
+                "import sys",
+                "scratch = os.environ['TMPDIR']",
+                "probe = os.path.join(scratch, 'nf841probe')",
+                "os.makedirs(probe, exist_ok=True)",
+                "target = os.path.join(probe, 'config.lock')",
+                "flags = os.O_WRONLY + os.O_CREAT + os.O_EXCL",
+                "handle = os.open(target, flags, 0o664)",
+                "os.close(handle)",
+                # Plant the shared inode the broker must refuse to mutate.
+                "try:",
+                "    os.link(target, os.path.join(probe, 'config.lock.alias'))",
+                "except OSError:",
+                "    sys.exit(3)",
+                # syscall 280 against a path outside every authorized root.
+                "stamp = os.path.join(os.path.dirname(scratch), 'nf841.stamp')",
+                "try:",
+                "    os.utime(stamp, None)",
+                "except OSError:",
+                "    pass",
+                # syscall 90 against the shared inode: refused, never terminal.
+                "try:",
+                "    os.chmod(target, 0o600)",
+                "except OSError:",
+                "    pass",
+                "sys.exit(0)",
+            )
+        )
+        return f"python3 -c {shlex.quote('exec(' + repr(script_body) + ')')}"
+
+    def test_denial_probe_payload_is_card_validation_parseable(self) -> None:
+        # The predecessor payload spelled the open flags with a bitwise or, and
+        # _tokenize_validation_command refuses that character even inside shell
+        # quoting -- so the nested case died as validation_shell_syntax_forbidden
+        # before the broker ever decided anything.  Prove the payload parses on
+        # every host, not only where a nested Landlock sandbox can start.
+        command = self._denial_probe_command()
+        assert not set(command).intersection("\n\r|;`<>\x00")
+        argv = worker_workspace._tokenize_validation_command(command)
+        assert argv[:2] == ["python3", "-c"]
+        assert len(argv) == 3
+        assert "os.utime(stamp, None)" in argv[2]
+        assert "os.chmod(target, 0o600)" in argv[2]
+        assert "os.link(target," in argv[2]
+
+    def test_nested_validation_reports_child_status_after_both_denials(
+        self, tmp_path: Path
+    ) -> None:
+        if _SELF_HOSTED_VALIDATION_EXEC:
+            pytest.skip(
+                "self-hosted validation bootstrap: the already loaded canonical "
+                "broker still decides the nested run before the candidate "
+                "broker can prove its behavior in a real run_validations"
+            )
+        if sys.platform != "linux":
+            pytest.skip("seccomp user notification is Linux-only")
+        try:
+            backend = worker_workspace.select_sandbox_backend()
+        except WorkspaceError:
+            pytest.skip("no secure sandbox backend available on this host")
+        if backend != "landlock":
+            pytest.skip("landlock validation backend not selected on this host")
+        if not worker_workspace._seccomp_notify_supported():
+            pytest.skip("host kernel/libseccomp lacks seccomp user notification")
+        workspace = _workspace(tmp_path)
+        try:
+            results = worker_workspace.run_validations(
+                workspace,
+                [self._denial_probe_command()],
+                timeout_seconds=180,
+            )
+        except ValidationEnvironmentBlocked as blocked:
+            # No exec-capable, metadata-honouring scratch root exists here, so
+            # the nested run never starts. That is a host capability gap, the
+            # same one provision_validation_exec_scratch reports fail-closed --
+            # not a verdict on the broker's termination policy.
+            pytest.skip(f"validation_unsupported_in_sandbox:{blocked}")
+        assert results
+        if results[0]["returncode"] == 3:
+            pytest.skip("this host's Landlock policy refuses hardlink creation")
+        assert results[0]["returncode"] == 0, results[0]
+        assert not results[0].get("timed_out")

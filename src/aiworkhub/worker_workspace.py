@@ -96,6 +96,31 @@ def _runtime_temp_support_root() -> Path:
     return Path(__file__).resolve().parent
 
 
+# NF-2026-00841: the sibling modules this file resolves at RUNTIME instead of
+# through a static import statement.  ``_load_runtime_temp`` resolves the
+# runtime_temp closure by file location because bare-script (direct Landlock
+# wrapper) execution has no package context, and ``_credential_home`` reaches
+# ``opencode_auth`` through ``__import__`` for the same reason.  Neither form is
+# an ``ast.Import``/``ast.ImportFrom`` node, so the static seed closure
+# ``_resolve_local_python_imports`` walks cannot see them: a sparse validation
+# worktree seeded runtime_temp's group (it is also named by the support tuple
+# below) but silently omitted the tracked ``opencode_auth.py``, and the
+# opencode_cli credential projection then failed at runtime inside the isolated
+# worktree.  Declaring every runtime-loaded sibling exactly once here makes the
+# loaders and ``_VALIDATION_WORKER_PACKAGE_SUPPORT`` structurally unable to
+# drift apart; ``tests/test_worker_workspace.py`` proves the two stay aligned.
+_RUNTIME_TEMP_SUPPORT_SIBLINGS: tuple[tuple[str, str], ...] = (
+    ("_platform_process", "_platform_process.py"),
+    ("platform_io", "platform_io.py"),
+    ("runtime_temp", "runtime_temp.py"),
+)
+_OPENCODE_AUTH_SIBLING: tuple[str, str] = ("opencode_auth", "opencode_auth.py")
+RUNTIME_LOADED_PACKAGE_SIBLINGS: tuple[tuple[str, str], ...] = (
+    *_RUNTIME_TEMP_SUPPORT_SIBLINGS,
+    _OPENCODE_AUTH_SIBLING,
+)
+
+
 def _require_regular_runtime_temp_support(
     sibling_root: Path, module_name: str, filename: str
 ) -> Path:
@@ -121,11 +146,7 @@ def _load_runtime_temp():
     """
     sibling_root = _runtime_temp_support_root()
     if __package__:
-        for module_name, filename in (
-            ("_platform_process", "_platform_process.py"),
-            ("platform_io", "platform_io.py"),
-            ("runtime_temp", "runtime_temp.py"),
-        ):
+        for module_name, filename in _RUNTIME_TEMP_SUPPORT_SIBLINGS:
             _require_regular_runtime_temp_support(sibling_root, module_name, filename)
         from . import runtime_temp
         return runtime_temp
@@ -239,9 +260,15 @@ _VALIDATION_WORKER_PACKAGE_SUPPORT = (
     "pyproject.toml",
     "src/aiworkhub/__init__.py",
     "src/aiworkhub/_version.py",
-    "src/aiworkhub/_platform_process.py",
-    "src/aiworkhub/platform_io.py",
-    "src/aiworkhub/runtime_temp.py",
+    # Every sibling this module resolves at runtime rather than through a
+    # static import statement.  ``_resolve_local_python_imports`` cannot see a
+    # file-location load or an ``__import__`` call, so they are materialized
+    # from the single ``RUNTIME_LOADED_PACKAGE_SIBLINGS`` declaration instead
+    # of a hand-maintained second list that drifts (NF-2026-00841).
+    *(
+        f"src/aiworkhub/{filename}"
+        for _module_name, filename in RUNTIME_LOADED_PACKAGE_SIBLINGS
+    ),
     "src/aiworkhub/validation_runner.py",
 )
 _VALIDATION_QUALITY_SUPPORT = {
@@ -2937,12 +2964,17 @@ def _credential_home(home: Path, adapter_id: str, project_root: Path | None = No
     elif adapter_id == "opencode_cli":
         # This module must also work as the direct Landlock wrapper, where
         # relative imports are unavailable.  The regular sibling check keeps
-        # that lazy package import pinned to this verified support directory.
+        # that lazy package import pinned to this verified support directory,
+        # and the module/filename pair comes from the same
+        # ``RUNTIME_LOADED_PACKAGE_SIBLINGS`` declaration that seeds the file
+        # into a sparse validation worktree, so the runtime load can never
+        # reference a sibling the seed closure omitted (NF-2026-00841).
         sibling_root = _runtime_temp_support_root()
-        _require_regular_runtime_temp_support(
-            sibling_root, "opencode_auth", "opencode_auth.py"
+        module_name, filename = _OPENCODE_AUTH_SIBLING
+        _require_regular_runtime_temp_support(sibling_root, module_name, filename)
+        qualified = (
+            f"{__package__}.{module_name}" if __package__ else f"aiworkhub.{module_name}"
         )
-        qualified = f"{__package__}.opencode_auth" if __package__ else "aiworkhub.opencode_auth"
         opencode_auth = __import__(qualified, fromlist=["project_opencode_auth"])
         source = source_home / ".local" / "share" / "opencode" / "auth.json"
         try:
@@ -4921,6 +4953,55 @@ def _registered_worktree_admin_dir(repo: Path, path: Path) -> Path | None:
     return unique[0] if unique else None
 
 
+def _repair_removal_permissions(target: str) -> None:
+    """Restore only the permission bits a removal actually needs (NF-2026-00841).
+
+    POSIX removal authority lives in the *parent* directory's write+search
+    bits; an entry's own mode never authorizes its own unlink.  The previous
+    blanket ``os.chmod`` of the failing entry therefore mutated metadata the
+    removal did not need -- and the validation substrate deliberately plants a
+    shared inode inside a request-owned tree, because
+    ``plant_outer_validation_authority`` hardlinks the ``0o444`` nested
+    Landlock authority locator to its workspace anchor precisely so
+    ``verify_nested_landlock_authority_locator`` can require ``st_nlink == 2``.
+    Inside a nested validation that blanket chmod is exactly the authenticated
+    ``metadata_broker_hardlink_forbidden`` (syscall 90) denial NF-2026-00841
+    measured: correctly refused by the broker, and never needed here at all.
+
+    A directory still has its own bits repaired -- it is never a hardlink alias
+    of a file, and the broker authorizes owned directories on their own terms.
+    A regular file's mode is touched only when it is provably unshared
+    (``st_nlink == 1``); a shared inode keeps both its bytes and its mode while
+    its parent regains the bits the unlink actually requires.  Every repair is
+    best effort, so on a host where the chmod family is denied outright the
+    retried removal still decides the outcome instead of a failed repair
+    masking it.
+    """
+
+    def repair(path: "str | Path", mode: int) -> None:
+        try:
+            os.chmod(path, mode)
+        except OSError:
+            pass
+
+    try:
+        info = os.lstat(target)
+    except OSError:
+        info = None
+    if info is not None and stat.S_ISDIR(info.st_mode):
+        repair(target, stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+        return
+    parent = Path(target).parent
+    try:
+        parent_info = os.lstat(parent)
+    except OSError:
+        parent_info = None
+    if parent_info is not None and stat.S_ISDIR(parent_info.st_mode):
+        repair(parent, stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+    if info is not None and stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
+        repair(target, stat.S_IRUSR | stat.S_IWUSR)
+
+
 def _rmtree_workspace_owned(root: Path) -> None:
     """Remove one already-authorized workspace/admin tree, repairing mode only."""
     if not root.exists():
@@ -4929,8 +5010,8 @@ def _rmtree_workspace_owned(root: Path) -> None:
         raise WorkspaceError("workspace_cleanup_root_invalid")
 
     def repair_and_retry(function: Any, target: str, _exc: BaseException) -> None:
+        _repair_removal_permissions(target)
         try:
-            os.chmod(target, stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
             function(target)
         except OSError as exc:
             raise WorkspaceError(
@@ -9001,9 +9082,33 @@ def _metadata_broker_denial_reason(exc: BaseException) -> str:
     return type(exc).__name__
 
 
+# Denials that leave this trusted parent unable to state what the filesystem
+# now looks like, so the command it was brokering for cannot be believed and is
+# structurally terminated (NF430).
+#
+# NF-2026-00841 removed ``metadata_broker_hardlink_forbidden`` from this set.
+# A shared inode beneath a request-owned root is not evidence of a broken
+# sandbox -- the validation substrate plants one deliberately:
+# ``plant_outer_validation_authority`` hardlinks the nested Landlock authority
+# locator inside the exec scratch to its workspace anchor precisely so
+# ``verify_nested_landlock_authority_locator`` can require ``st_nlink == 2``.
+# A nested validation walking that scratch therefore reaches shared bytes by
+# construction, and refusing to mutate them is the correct, intended outcome
+# (NF-2026-00448 keeps the exact-mode no-op as the single exception, and the
+# shared inode is never touched either way).  Refusing is right; replacing an
+# otherwise passing pytest exit status with ``rc=126`` is not.  The denial
+# stays fail-closed -- ``EPERM`` reaches the caller, whose own metadata
+# mutators already tolerate it because every mode they need is applied
+# atomically by the ``mkdir``/``os.open`` mode argument -- and stays audited:
+# ``_record_metadata_broker_denial`` still writes the authenticated
+# ``aiworkhub.metadata_broker_denial.v1`` record, so the coordinator keeps the
+# full, structured evidence while the validated command reports its own real
+# status.  ``metadata_broker_deleted_fd`` (the caller raced the target away
+# between authentication and mutation) and ``oserror_EPERM`` (this parent could
+# not perform the emulation at all) remain terminal for exactly the original
+# reason: neither leaves a knowable post-state.
 _METADATA_BROKER_TERMINAL_DENIAL_REASONS = frozenset(
     {
-        "metadata_broker_hardlink_forbidden",
         "metadata_broker_deleted_fd",
         "oserror_EPERM",
     }
