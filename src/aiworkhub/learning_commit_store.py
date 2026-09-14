@@ -15,7 +15,7 @@ import re
 import sqlite3
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable, cast
 
 from . import (
@@ -908,8 +908,45 @@ def _decision_changed_paths(
     return [], ""
 
 
+def normalize_supplied_repo_area(value: str) -> str:
+    """Normalize and validate an explicitly supplied ``repo_area``.
+
+    A supplied area is honored verbatim except for trimming and path
+    normalization, and must be a safe relative path. Empty, whitespace,
+    absolute, traversal, scheme-like, backslash, NUL or oversized values
+    fail closed rather than being silently re-derived.
+    """
+    if not isinstance(value, str):
+        raise LearningCommitStoreError("learning_commit_repo_area_invalid:unsafe")
+    text = value.strip()
+    if not text:
+        raise LearningCommitStoreError("learning_commit_repo_area_invalid:empty")
+    try:
+        encoded = text.encode("utf-8")
+    except UnicodeEncodeError:
+        raise LearningCommitStoreError("learning_commit_repo_area_invalid:binary")
+    if len(encoded) > 256:
+        raise LearningCommitStoreError("learning_commit_repo_area_invalid:oversized")
+    if "\x00" in text:
+        raise LearningCommitStoreError("learning_commit_repo_area_invalid:binary")
+    if ":" in text:
+        raise LearningCommitStoreError("learning_commit_repo_area_invalid:scheme")
+    if "\\" in text:
+        raise LearningCommitStoreError("learning_commit_repo_area_invalid:unsafe")
+    if text.startswith("/"):
+        raise LearningCommitStoreError("learning_commit_repo_area_invalid:absolute")
+    normalized = str(PurePosixPath(text))
+    if normalized in {"", "."}:
+        raise LearningCommitStoreError("learning_commit_repo_area_invalid:unsafe")
+    if normalized == ".." or normalized.startswith("../"):
+        raise LearningCommitStoreError("learning_commit_repo_area_invalid:traversal")
+    if any(segment == ".." for segment in normalized.split("/")):
+        raise LearningCommitStoreError("learning_commit_repo_area_invalid:traversal")
+    return normalized
+
+
 def resolve_short_form(
-    repo: str | Path, *, task_id: str, request_id: str
+    repo: str | Path, *, task_id: str, request_id: str, repo_area: str | None = None
 ) -> dict[str, Any]:
     """Fill every MECHANICAL learning-commit field from the card's own decision.
 
@@ -958,6 +995,11 @@ def resolve_short_form(
         changed_paths=changed_paths,
         evidence_reference=evidence_reference,
     )
+    if repo_area is not None:
+        # A supplied area is honored after normalization, never silently
+        # re-derived from the decision's evidence tiers.
+        owed["repo_area"] = normalize_supplied_repo_area(repo_area)
+        paths_source = "supplied_repo_area"
     if not str(owed["repo_area"] or "").strip():
         raise LearningCommitStoreError(
             "learning_commit_repo_area_not_derivable:"

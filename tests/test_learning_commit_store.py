@@ -1068,3 +1068,173 @@ def test_the_fourteen_argument_form_is_unchanged(tmp_path, monkeypatch):
 
     assert result["ok"] is True, result
     assert result["outcome"] == "accepted"
+
+
+def test_supplied_repo_area_is_normalized_and_honored_when_derivation_is_empty(
+    tmp_path, monkeypatch
+):
+    """An explicit area wins even when the decision recorded no derivable paths."""
+    root, task_id, request_id = _setup(tmp_path, monkeypatch)
+
+    resolved = learning_commit_store.resolve_short_form(
+        root,
+        task_id=task_id,
+        request_id=request_id,
+        repo_area="  src/aiworkhub/custom  ",
+    )
+
+    assert resolved["repo_area"] == "src/aiworkhub/custom"
+    assert resolved["repo_area_source"] == "supplied_repo_area"
+    assert resolved["outcome"] == "accepted"
+
+
+def test_supplied_repo_area_wins_over_derived_evidence(tmp_path, monkeypatch):
+    root = _setup_repo(tmp_path, monkeypatch)
+    _accepted_card_with_promotion(
+        root,
+        task_id="TASK-SUPPLIED-1",
+        request_id="request-supplied-0001",
+        promoted=["src/aiworkhub/skill_miner.py"],
+    )
+
+    resolved = learning_commit_store.resolve_short_form(
+        root,
+        task_id="TASK-SUPPLIED-1",
+        request_id="request-supplied-0001",
+        repo_area="src/custom",
+    )
+
+    assert resolved["repo_area"] == "src/custom"
+    assert resolved["repo_area_source"] == "supplied_repo_area"
+
+
+def test_omitted_repo_area_still_derives_deterministically(tmp_path, monkeypatch):
+    """Omission alone may derive; the tier order is unchanged."""
+    root = _setup_repo(tmp_path, monkeypatch)
+    _rework_rejected_card(
+        root, task_id="TASK-SUPPLIED-2", request_id="request-supplied-0002"
+    )
+
+    resolved = learning_commit_store.resolve_short_form(
+        root, task_id="TASK-SUPPLIED-2", request_id="request-supplied-0002"
+    )
+
+    assert resolved["repo_area"] == "src/aiworkhub"
+    assert resolved["repo_area_source"] == "review_feedback.predecessor_changed_paths"
+
+
+@pytest.mark.parametrize("blank", ["", "   ", "\t\n"])
+def test_supplied_blank_repo_area_fails_closed_in_store(
+    tmp_path, monkeypatch, blank
+):
+    """An explicit empty/whitespace area is not omission and must fail closed."""
+    root, task_id, request_id = _setup(tmp_path, monkeypatch)
+
+    with pytest.raises(
+        learning_commit_store.LearningCommitStoreError,
+        match="learning_commit_repo_area_invalid:empty",
+    ):
+        learning_commit_store.resolve_short_form(
+            root, task_id=task_id, request_id=request_id, repo_area=blank
+        )
+
+
+@pytest.mark.parametrize(
+    "value, reason",
+    [
+        ("/etc/passwd", "absolute"),
+        ("../outside", "traversal"),
+        ("file:src/aiworkhub", "scheme"),
+        ("src\\aiworkhub", "unsafe"),
+        ("src\x00aiworkhub", "binary"),
+        ("a" * 300, "oversized"),
+    ],
+)
+def test_supplied_unsafe_repo_area_fails_closed_in_store(
+    tmp_path, monkeypatch, value, reason
+):
+    root, task_id, request_id = _setup(tmp_path, monkeypatch)
+
+    with pytest.raises(
+        learning_commit_store.LearningCommitStoreError,
+        match=f"learning_commit_repo_area_invalid:{reason}",
+    ):
+        learning_commit_store.resolve_short_form(
+            root, task_id=task_id, request_id=request_id, repo_area=value
+        )
+
+
+def test_supplied_lone_surrogate_repo_area_fails_closed_in_store(
+    tmp_path, monkeypatch
+):
+    """A JSON-reachable lone surrogate is not UTF-8 and must fail closed."""
+    root, task_id, request_id = _setup(tmp_path, monkeypatch)
+
+    with pytest.raises(
+        learning_commit_store.LearningCommitStoreError,
+        match="learning_commit_repo_area_invalid:binary",
+    ):
+        learning_commit_store.resolve_short_form(
+            root, task_id=task_id, request_id=request_id, repo_area=chr(0xD800)
+        )
+
+
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_supplied_blank_repo_area_fails_closed_at_manager_entry(
+    tmp_path, monkeypatch, blank
+):
+    """The manager entry refuses an explicit empty area before any card lookup."""
+    from aiworkhub import server
+
+    root = _setup_repo(tmp_path, monkeypatch)
+    monkeypatch.setattr(core, "repo_root", lambda: root)
+
+    result = server.aiworkhub_manager_learning_commit(
+        task_id="TASK-ANY", request_id="request-any", repo_area=blank
+    )
+
+    assert result["ok"] is False
+    assert result["error"] == "learning_commit_repo_area_invalid:empty"
+    assert result["surface"] == "manager_mcp"
+
+
+def test_supplied_lone_surrogate_repo_area_fails_closed_at_manager_entry(
+    tmp_path, monkeypatch
+):
+    """The manager entry maps a lone surrogate to the structured refusal."""
+    from aiworkhub import server
+
+    root = _setup_repo(tmp_path, monkeypatch)
+    monkeypatch.setattr(core, "repo_root", lambda: root)
+
+    result = server.aiworkhub_manager_learning_commit(
+        task_id="TASK-ANY", request_id="request-any", repo_area=chr(0xD800)
+    )
+
+    assert result["ok"] is False
+    assert result["error"] == "learning_commit_repo_area_invalid:binary"
+    assert result["surface"] == "manager_mcp"
+
+
+def test_supplied_repo_area_is_honored_at_manager_entry(tmp_path, monkeypatch):
+    """A supplied area flows through the manager entry and lands in the commit."""
+    from aiworkhub import server
+
+    root = _setup_repo(tmp_path, monkeypatch)
+    monkeypatch.setattr(core, "repo_root", lambda: root)
+    _accepted_card_with_promotion(
+        root,
+        task_id="TASK-SUPPLIED-3",
+        request_id="request-supplied-0003",
+        promoted=["src/aiworkhub/skill_miner.py"],
+    )
+
+    result = server.aiworkhub_manager_learning_commit(
+        task_id="TASK-SUPPLIED-3",
+        request_id="request-supplied-0003",
+        repo_area="  src/custom/area  ",
+        lesson_candidate="the supplied area is the area",
+    )
+
+    assert result["ok"] is True, result
+    assert _fetch_commit(root, "TASK-SUPPLIED-3")["repo_area"] == "src/custom/area"

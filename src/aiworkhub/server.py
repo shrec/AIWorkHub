@@ -1280,7 +1280,7 @@ def aiworkhub_manager_kb_write(
 def aiworkhub_manager_learning_commit(
     task_id: str,
     request_id: str,
-    repo_area: str = "",
+    repo_area: str | None = None,
     outcome: str = "",
     evidence_ids: list[str] | None = None,
     idempotency_key: str = "",
@@ -1304,7 +1304,10 @@ def aiworkhub_manager_learning_commit(
     ``idempotency_key``/``provenance`` are the deterministic strings the
     ``learning_commit_owed`` payload in your accept/reject reply already carried.
     ``failure_category`` is always derived server-side from the card's structured
-    terminal evidence and is never caller-suppliable.
+    terminal evidence and is never caller-suppliable. ``repo_area`` omitted is
+    derived from the decision's paths; any explicitly supplied value is
+    normalized and honored, while an empty or whitespace value is refused with
+    ``learning_commit_repo_area_invalid:empty``.
 
     Add your own references with ``extra_evidence_ids``. An evidence id must
     carry an allowed scheme -- ``file:``, ``http:`` or ``https:``. A ``sha256:``
@@ -1323,11 +1326,33 @@ def aiworkhub_manager_learning_commit(
 
     resolution: dict[str, Any] = {}
     supplied = list(evidence_ids or [])
-    mechanical = (repo_area, outcome, idempotency_key, provenance)
-    if not all(str(value or "").strip() for value in mechanical) or not supplied:
+    repo_area_omitted = repo_area is None
+    if repo_area_omitted:
+        repo_area = ""
+    else:
+        try:
+            repo_area = learning_commit_store.normalize_supplied_repo_area(repo_area)
+        except learning_commit_store.LearningCommitStoreError as exc:
+            return {
+                "ok": False,
+                "error": str(exc)[:240],
+                "surface": "manager_mcp",
+                "allowed_evidence_id_schemes": list(
+                    learning_commit_store.ALLOWED_EVIDENCE_ID_SCHEMES
+                ),
+            }
+    mechanical = (outcome, idempotency_key, provenance)
+    if (
+        repo_area_omitted
+        or not all(str(value or "").strip() for value in mechanical)
+        or not supplied
+    ):
         try:
             resolution = learning_commit_store.resolve_short_form(
-                core.repo_root(), task_id=task_id, request_id=request_id
+                core.repo_root(),
+                task_id=task_id,
+                request_id=request_id,
+                repo_area=repo_area if not repo_area_omitted else None,
             )
         except learning_commit_store.LearningCommitStoreError as exc:
             return {
