@@ -42,6 +42,7 @@ from typing import Any
 
 from . import core
 from . import process_launcher
+from . import review_lifecycle
 from . import review_orchestrator
 from .platform_io import (
     DIRECTORY_DESCRIPTOR_BACKEND_NONE,
@@ -505,6 +506,57 @@ def run_scan(
     }
 
 
+# 0.11.37 measured what a fixed one-action policy costs: a 143.496 s
+# recovery pass advanced exactly one durable effect and returned with 35
+# actions still pending, so NF865 -- a current target seeded behind that
+# backlog -- faced 35 further passes before its own first lens could run.
+# The capability was never missing; ``ReviewOrchestrator.drain`` has always
+# taken ``max_actions`` and this scan asked for one.
+#
+# A batch is the repair because a pass is dominated by what drain pays once
+# per pass rather than per action: one routing-catalog build (the
+# orchestrator's own note measures +1.49 s per launch if it were rebuilt per
+# action), one route/dead-chain reconcile, one manager-ready publish and one
+# counts verification. Each additional action in the same pass adds only its
+# own reservation and effect, so throughput rises while the fixed cost does
+# not.
+#
+# The ceiling is headroom, not a throughput target: it stays at half the
+# orchestrator's own per-pass bound (``DEFAULT_DRAIN_MAX_ACTIONS`` = 12) so a
+# recovery pass can never claim the whole outbox window, and so the loop
+# still returns to worker finalization -- the correctness path this daemon
+# exists for -- and to unrelated Task MCP callers inside the scan cadence.
+# The floor guarantees the property the incident lacked: whenever there is
+# work at all a pass advances strictly more than one action, so a backlog
+# costs passes proportional to backlog/REVIEW_DRAIN_MAX_ACTIONS instead of
+# one pass per action. Neither bound grows with the backlog, and drain
+# remains the only thing that decides WHICH action runs.
+REVIEW_DRAIN_MIN_ACTIONS = 2
+REVIEW_DRAIN_MAX_ACTIONS = 6
+
+
+def _review_drain_budget(ready: int) -> int:
+    """Size one pass's action batch from the observed ready workload."""
+    if ready <= 0:
+        return 0
+    return max(REVIEW_DRAIN_MIN_ACTIONS, min(REVIEW_DRAIN_MAX_ACTIONS, ready))
+
+
+def _review_backlog(review_db: Path) -> dict[str, int]:
+    """Observed outbox depth, from the lifecycle's own truthful counts.
+
+    ``pending_reservable`` and never ``pending``: an action parked behind a
+    failed action in its own chain can never be reserved, so counting it
+    would size a batch against work this pass cannot possibly do.
+    """
+    counts = review_lifecycle.lifecycle_counts(review_db)
+    return {
+        "pending": int(counts.get("pending") or 0),
+        "pending_parked": int(counts.get("pending_parked") or 0),
+        "pending_reservable": int(counts.get("pending_reservable") or 0),
+    }
+
+
 def _scan_review_ready_recovery(manager: Any) -> dict[str, Any]:
     """Ensure missing review chains, then let the orchestrator launch."""
     empty: dict[str, Any] = {
@@ -516,7 +568,9 @@ def _scan_review_ready_recovery(manager: Any) -> dict[str, Any]:
         "review_recovery_failed": 0,
         "review_recovery_reasons": {},
         "review_recovery_failures": [],
-        "review_recovery_drain": {"state": "skipped", "reason": "no_work"},
+        "review_recovery_drain": {
+            "state": "skipped", "reason": "no_work", "budget": 0,
+        },
     }
     try:
         review_db = review_orchestrator.canonical_review_db(manager)
@@ -527,28 +581,46 @@ def _scan_review_ready_recovery(manager: Any) -> dict[str, Any]:
             manager, db_path=review_db,
         )
         # Launch delegation belongs to the system-owned orchestrator alone;
-        # the scan only hands it work. Drain strictly on chains this scan
-        # newly ensured: chains that already existed were handed to the
-        # orchestrator by the scan that ensured them, and live reviewers,
-        # terminal reports and manager-ready chains keep progressing through
-        # the system's own liveness drain. A repeated scan over
-        # already-present chains is therefore a no-op and can never create
-        # duplicate chains, children, requests or provider launches.
-        pending_work = int(recovery.get("review_recovery_ensured") or 0) > 0
-        if pending_work:
-            # A reconciler pass must stay shorter than its cadence.  Draining
-            # the default action batch can synchronously rank/launch many
-            # reviewer effects and has held this loop for several minutes,
-            # starving unrelated Task MCP operations.  Advance exactly one
-            # durable effect per pass; later passes resume from the ledger.
+        # the scan only hands it work and a budget. Draining on every pass
+        # with ready work -- not only on a pass that ensured something -- is
+        # safe because an action is a durable, leased, exactly-once outbox
+        # row: a repeated pass re-reserves nothing an earlier pass completed
+        # and can never create duplicate chains, children, requests or
+        # provider launches. Gating on ``ensured`` alone was the other half
+        # of the starvation, because a backlog nobody added to was never
+        # worked off at all.
+        backlog = _review_backlog(review_db)
+        ensured = int(recovery.get("review_recovery_ensured") or 0)
+        # Chains ensured just above have already written their pending
+        # actions, so the reservable count already includes them; ``max``
+        # keeps an ensure visible without counting it twice.
+        ready = max(int(backlog["pending_reservable"]), ensured)
+        budget = _review_drain_budget(ready)
+        if budget:
             drain = review_orchestrator.ReviewOrchestrator(
                 manager, db_path=review_db,
-            ).drain(max_actions=1)
-            recovery["review_recovery_drain"] = drain.as_dict()
+            ).drain(max_actions=budget)
+            # attempted/completed/failed/pending come from drain itself and
+            # ``review_actions`` is the post-pass ledger, so one receipt
+            # answers both what this budget bought and what is left.
+            receipt = dict(drain.as_dict())
+            receipt.update({
+                "state": "ok",
+                "budget": budget,
+                "ready": ready,
+                "backlog": backlog,
+            })
+            recovery["review_recovery_drain"] = receipt
         else:
             recovery.setdefault(
                 "review_recovery_drain",
-                {"state": "skipped", "reason": "no_work"},
+                {
+                    "state": "skipped",
+                    "reason": "no_work",
+                    "budget": 0,
+                    "ready": ready,
+                    "backlog": backlog,
+                },
             )
         recovery.setdefault("state", "ok")
         return recovery
