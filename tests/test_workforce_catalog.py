@@ -99,6 +99,13 @@ def test_catalog_rejects_invalid_revision_without_leaking_value_error() -> None:
 
 def test_manager_upsert_is_bounded_audited_and_preserves_other_workers(tmp_path: Path) -> None:
     root = _root(tmp_path)
+    path, _ = workforce_catalog.ensure_catalog(root)
+    seeded = workforce_catalog.load_catalog(root)
+    seeded_glm = next(
+        item for item in seeded["workers"] if item["worker_id"] == "glm-5.2"
+    )
+    seeded_glm["reviewer"] = True
+    path.write_text(json.dumps(seeded), encoding="utf-8")
     result = workforce_catalog.upsert_worker(
         root,
         {
@@ -121,9 +128,22 @@ def test_manager_upsert_is_bounded_audited_and_preserves_other_workers(tmp_path:
     assert len(catalog["workers"]) == len(workforce_catalog.DEFAULT_WORKERS)
     glm = next(item for item in catalog["workers"] if item["worker_id"] == "glm-5.2")
     assert glm["manager_score_adjustment"] == 4.0
+    assert glm["reviewer"] is True
     audit = (root / workforce_catalog.AUDIT_RELATIVE_PATH).read_text(encoding="utf-8")
     assert "private-thread-1234567890" not in audit
     assert "glm-5.2" in audit
+
+
+def test_default_claude_reviewer_declares_required_manager_context_tools() -> None:
+    sonnet = next(
+        item
+        for item in workforce_catalog.DEFAULT_WORKERS
+        if item["worker_id"] == "claude-sonnet-5"
+    )
+    assert {"source-graph", "session-manager", "ai-memory", "kb"} <= set(
+        sonnet["tools"]
+    )
+    assert sonnet["reviewer"] is True
 
 
 def test_catalog_scores_only_attributed_canonical_outcomes(tmp_path: Path) -> None:
@@ -1830,7 +1850,13 @@ def test_upsert_normalizes_variant_runner_spelling_onto_registered_id(
     tmp_path: Path,
 ) -> None:
     root = _root(tmp_path)
-    workforce_catalog.ensure_catalog(root)
+    path, _ = workforce_catalog.ensure_catalog(root)
+    seeded = workforce_catalog.load_catalog(root)
+    seeded_opus = next(
+        item for item in seeded["workers"] if item["worker_id"] == "claude-opus-5"
+    )
+    seeded_opus["reviewer"] = True
+    path.write_text(json.dumps(seeded), encoding="utf-8")
     count = len(workforce_catalog.load_catalog(root)["workers"])
 
     result = workforce_catalog.upsert_worker(
@@ -1849,6 +1875,7 @@ def test_upsert_normalizes_variant_runner_spelling_onto_registered_id(
         item for item in catalog["workers"] if item["worker_id"] == "claude-opus-5"
     )
     assert opus["manager_score_adjustment"] == 3.0
+    assert opus["reviewer"] is True
 
 
 def test_upsert_rejects_unresolvable_runner_variant_identity_conflict(

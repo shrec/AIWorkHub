@@ -227,9 +227,9 @@ _EDITOR_MODEL_ALIASES: dict[str, tuple[str, ...]] = {
 
 
 DEFAULT_WORKERS: tuple[dict[str, Any], ...] = (
-    {"worker_id": "claude-haiku", "adapter_id": "claude_cli", "model": "haiku", "provider": "anthropic", "supports": ["mechanical", "code", "review"], "tools": ["filesystem", "source-graph"], "max_context_tokens": 200_000, "max_risk": "medium", "quality_ceiling": 0.85},
-    {"worker_id": "claude-sonnet-5", "adapter_id": "claude_cli", "model": "sonnet", "provider": "anthropic", "supports": ["mechanical", "code", "research", "linguistic", "review"], "tools": ["filesystem", "source-graph"], "max_context_tokens": 1_000_000, "max_risk": "high", "quality_ceiling": 0.97},
-    {"worker_id": "claude-opus-5", "adapter_id": "claude_cli", "model": "opus", "provider": "anthropic", "supports": ["code", "research", "linguistic", "review"], "tools": ["filesystem", "source-graph"], "max_context_tokens": 1_000_000, "max_risk": "critical", "quality_ceiling": 1.0},
+    {"worker_id": "claude-haiku", "adapter_id": "claude_cli", "model": "haiku", "provider": "anthropic", "supports": ["mechanical", "code", "review"], "tools": ["filesystem", "source-graph", "session-manager", "ai-memory", "kb", "semantic-edit"], "max_context_tokens": 200_000, "max_risk": "medium", "quality_ceiling": 0.85},
+    {"worker_id": "claude-sonnet-5", "adapter_id": "claude_cli", "model": "sonnet", "provider": "anthropic", "supports": ["mechanical", "code", "research", "linguistic", "review"], "tools": ["filesystem", "source-graph", "session-manager", "ai-memory", "kb", "semantic-edit"], "max_context_tokens": 1_000_000, "max_risk": "high", "quality_ceiling": 0.97, "reviewer": True},
+    {"worker_id": "claude-opus-5", "adapter_id": "claude_cli", "model": "opus", "provider": "anthropic", "supports": ["code", "research", "linguistic", "review"], "tools": ["filesystem", "source-graph", "session-manager", "ai-memory", "kb", "semantic-edit"], "max_context_tokens": 1_000_000, "max_risk": "critical", "quality_ceiling": 1.0},
     {"worker_id": "gpt-5.5", "adapter_id": "codex_cli", "model": "gpt-5.5", "provider": "openai", "supports": ["code", "research", "linguistic", "review"], "tools": ["filesystem", "source-graph"], "max_context_tokens": 921_000, "max_risk": "critical", "quality_ceiling": 1.0},
     {"worker_id": "gpt-5.3-codex", "adapter_id": "codex_cli", "model": "gpt-5.3-codex", "provider": "openai", "supports": ["mechanical", "code", "review"], "tools": ["filesystem", "source-graph"], "max_context_tokens": 272_000, "max_risk": "high", "quality_ceiling": 0.96},
     {"worker_id": "gpt-5.3-codex-spark", "adapter_id": "codex_cli", "model": "gpt-5.3-codex-spark", "provider": "openai", "supports": ["mechanical", "code"], "tools": ["filesystem", "source-graph"], "max_context_tokens": 272_000, "max_risk": "medium", "quality_ceiling": 0.88},
@@ -474,8 +474,28 @@ def upsert_worker(repo_root: Path | str, worker: Mapping[str, Any], *, actor: Ma
     root = Path(repo_root).resolve()
     ensure_catalog(root)
     catalog = load_catalog(root)
-    normalized = _worker(worker)
     workers = [dict(item) for item in catalog["workers"]]
+    incoming = dict(worker)
+    provided_roles = {
+        role
+        for role in ("manager", "implementation_worker", "reviewer")
+        if role in incoming
+    }
+    existing = next(
+        (
+            item
+            for item in workers
+            if item["worker_id"] == str(incoming.get("worker_id") or "").strip()
+        ),
+        None,
+    )
+    # The public manager upsert predates explicit role flags. Preserve the
+    # canonical roles when that bounded surface updates capabilities, rather
+    # than silently resetting a reviewer route to the legacy defaults.
+    if existing is not None:
+        for role in ("manager", "implementation_worker", "reviewer"):
+            incoming.setdefault(role, existing[role])
+    normalized = _worker(incoming)
     # NF-2026-00549 slice A: fold a variant runner-id spelling onto the one
     # already-registered canonical identity (runner_topic_policy is the single
     # grammar authority). An accepted upsert must never persist a second
@@ -505,6 +525,9 @@ def upsert_worker(repo_root: Path | str, worker: Mapping[str, Any], *, actor: Ma
         ):
             raise WorkforceCatalogError("runner_id_variant_identity_conflict")
         normalized["worker_id"] = registered_worker_id
+        for role in ("manager", "implementation_worker", "reviewer"):
+            if role not in provided_roles:
+                normalized[role] = registered_worker[role]
     index = next((idx for idx, item in enumerate(workers) if item["worker_id"] == normalized["worker_id"]), None)
     action = "updated" if index is not None else "created"
     if index is None:
