@@ -182,6 +182,32 @@ def test_lock_file_is_a_sidecar_and_never_the_database(tmp_path: Path) -> None:
     assert not db.exists(), "the lease must not create or touch the database file"
 
 
+def test_repeated_leases_reuse_one_lock_file_descriptor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = tmp_path / "task_queue.sqlite"
+    key = str(db.resolve())
+    opened: list[int] = []
+    original = db_writer.platform_io.open_lock_file
+
+    def counted_open(lock_file: Path) -> int:
+        fd = original(lock_file)
+        opened.append(fd)
+        return fd
+
+    monkeypatch.setattr(db_writer.platform_io, "open_lock_file", counted_open)
+    try:
+        for _ in range(3):
+            with db_writer.write_lease(db, timeout_s=5):
+                pass
+        assert len(opened) == 1
+        assert db_writer._PATH_FDS[key] == opened[0]
+    finally:
+        fd = db_writer._PATH_FDS.pop(key, None)
+        if fd is not None:
+            os.close(fd)
+
+
 def test_connection_db_path_resolves_the_main_database(tmp_path: Path) -> None:
     db = tmp_path / "q.sqlite"
     conn = _connect(db)

@@ -209,8 +209,9 @@ def _path_fd(key: str, lock_file: Path) -> int:
         # The lock-file open lives in platform_io: the flag set is platform
         # knowledge (O_CLOEXEC is POSIX-only, O_BINARY is Windows-only) and it
         # must agree with what lock_fd needs, which is a WRITABLE descriptor.
-        fd = platform_io.open_lock_file(lock_file)
-        _PATH_FDS[key] = fd
+        if fd is None:
+            fd = platform_io.open_lock_file(lock_file)
+            _PATH_FDS[key] = fd
         return fd
 
 
