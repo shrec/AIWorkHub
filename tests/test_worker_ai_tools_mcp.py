@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import inspect
 import json
@@ -15,6 +16,7 @@ from typing import get_args, get_type_hints
 
 import pytest
 
+from aiworkhub import output_spill_store
 from aiworkhub import quality_reviewer
 from aiworkhub import platform_io
 from aiworkhub import repository_state
@@ -648,3 +650,227 @@ def test_registered_quality_review_schema_exposes_canonical_finding_shape(
         )
         return
     pytest.fail("aiworkhub_worker_quality_review_submit not registered")
+
+
+def test_oversized_focus_result_spills_full_payload_and_stays_retrievable(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """RM-2026-00044: the live Source Graph over-cap path is _fit_response_payload.
+
+    Whenever it actually drops sections to fit the outer cap, the pre-drop
+    payload must be spilled in full and stay retrievable/digest-verified
+    from the locator carried on the response -- not just from a unit test
+    of the standalone helper.
+    """
+    repo = tmp_path / "repo"
+    runtime = tmp_path / "runtime"
+    repo.mkdir()
+    (repo / "module.py").write_text("def f():\n    return 1\n", encoding="utf-8")
+    repository_state.bootstrap_repository(repo)
+    source_graph.build_index(repo)
+
+    big_symbols = [
+        {
+            "name": f"symbol_{index}",
+            "qualname": f"module.symbol_{index}",
+            "body_preview": "x" * 2000,
+        }
+        for index in range(20)
+    ]
+
+    def fake_focus(query_repo, query, budget):
+        # Deep-copy so the engine's in-place trim (halving/dropping fields
+        # on these row dicts) never mutates ``big_symbols`` itself -- the
+        # test's own comparison snapshot must stay pristine.
+        return {
+            "mode": "focus",
+            "query": query,
+            "budget": budget,
+            "matches": copy.deepcopy(big_symbols),
+            "ranked_symbols": copy.deepcopy(big_symbols),
+        }
+
+    monkeypatch.setattr(source_graph, "focus", fake_focus)
+    ctx = _ctx(
+        runtime,
+        repo=repo,
+        authority_repo=repo,
+        packet_path=None,
+        task_id="SPILL_WIRING_TASK",
+    )
+    worker_tools._CACHE.clear()
+
+    result = worker_tools.source_graph_query(
+        ctx, mode="focus", query="anything", budget=64
+    )
+
+    assert result["ok"] is True
+    locator = result.get("spill_locator")
+    assert isinstance(locator, str) and locator.startswith("aiworkhub-spill-sha256:")
+    assert str(repo) not in locator
+
+    original = output_spill_store.retrieve_text(locator, repo=repo)
+    original_payload = json.loads(original)
+    assert original_payload["ranked_symbols"] == big_symbols
+
+    telemetry = result["telemetry"]
+    assert telemetry["provider_token_savings"] == "UNKNOWN"
+    assert telemetry["spilled_bytes"] == len(original.encode("utf-8"))
+    assert telemetry["pruned_bytes"] > 0
+
+
+def test_below_cap_focus_result_is_never_spilled_and_stays_byte_identical(
+    tmp_path: Path, monkeypatch
+) -> None:
+    repo = tmp_path / "repo"
+    runtime = tmp_path / "runtime"
+    repo.mkdir()
+    (repo / "module.py").write_text("def f():\n    return 1\n", encoding="utf-8")
+    repository_state.bootstrap_repository(repo)
+    source_graph.build_index(repo)
+
+    def fake_focus(query_repo, query, budget):
+        return {
+            "mode": "focus",
+            "query": query,
+            "budget": budget,
+            "matches": [{"name": "tiny_symbol"}],
+            "ranked_symbols": [{"name": "tiny_symbol"}],
+        }
+
+    monkeypatch.setattr(source_graph, "focus", fake_focus)
+    ctx = _ctx(
+        runtime,
+        repo=repo,
+        authority_repo=repo,
+        packet_path=None,
+        task_id="NO_SPILL_TASK",
+    )
+    worker_tools._CACHE.clear()
+
+    result = worker_tools.source_graph_query(
+        ctx, mode="focus", query="anything", budget=64
+    )
+
+    assert result["ok"] is True
+    assert "spill_locator" not in result
+    assert "telemetry" not in result
+    spill_dir = repo / ".aiworkhub" / "spill"
+    assert not spill_dir.exists() or not list(spill_dir.glob("*"))
+
+
+def test_fit_response_payload_refits_complete_envelope_after_spill_metadata_added(
+    tmp_path: Path,
+) -> None:
+    """RM-2026-00044 review fix for ``_fit_response_payload``.
+
+    The first fit pass measured the envelope BEFORE ``spill_locator`` /
+    ``spill_retrieval_hint`` / ``telemetry`` existed (they are only added to
+    ``meta`` once the pass decides it is done), so those extra bytes could
+    push the COMPLETE response the caller actually sends back over
+    ``output_cap_bytes``. This drives a stub engine's fit right up against a
+    realistic (8 KiB, matching the live focus/slice cap) budget so the first
+    pass leaves less headroom than the spill metadata alone costs, and
+    asserts the fix's second pass brings the true final envelope back under
+    the cap rather than merely the pre-spill payload.
+    """
+
+    def _dumps(value: dict) -> str:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+    class _StubEngine:
+        @staticmethod
+        def _fit_payload_bytes(payload, cap):
+            items = list(payload.get("items", []))
+            dropped = list(payload.get("fit_dropped") or [])
+            while items:
+                candidate = {**payload, "items": items, "fit_dropped": dropped}
+                if len(_dumps(candidate).encode("utf-8")) <= cap:
+                    return candidate
+                dropped = [*dropped, f"item_{len(items) - 1}"]
+                items = items[:-1]
+            return {**payload, "items": [], "fit_dropped": dropped}
+
+    output_cap_bytes = 8 * 1024
+    payload = {
+        "mode": "focus",
+        "query": "q",
+        "items": ["z" * 40 for _ in range(500)],
+    }
+    meta = {"ok": True, "tool": "source_graph_query", "mode": "focus"}
+
+    fitted, dropped_now = worker_tools._fit_response_payload(
+        _StubEngine, payload, meta, output_cap_bytes, repo=tmp_path
+    )
+
+    assert dropped_now
+    assert "spill_locator" in meta
+    assert "telemetry" in meta
+
+    content = _dumps(fitted)
+    result = {
+        **meta,
+        "truncated": True,
+        "outer_truncated": False,
+        "bytes": len(content.encode("utf-8")),
+        "content": content,
+        "content_sha256": "0" * 64,
+    }
+    assert worker_tools._serialized_response_bytes(result) <= output_cap_bytes
+
+
+def test_fit_response_payload_remeasures_telemetry_when_final_pass_is_exhausted(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """RM-2026-00044 review fix: when the pass budget runs out right after
+    the loop's own final ``fit()`` call, that call changes ``payload`` with
+    no further iteration left to re-measure it, so meta/telemetry could
+    describe a stale, larger pre-fit payload instead of the one actually
+    returned. Pinning the pass budget to 1 forces the very first (and only)
+    iteration through exactly that path deterministically.
+    """
+
+    def _dumps(value: dict) -> str:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+    class _StubEngine:
+        @staticmethod
+        def _fit_payload_bytes(payload, cap):
+            items = list(payload.get("items", []))
+            dropped = list(payload.get("fit_dropped") or [])
+            while items:
+                candidate = {**payload, "items": items, "fit_dropped": dropped}
+                if len(_dumps(candidate).encode("utf-8")) <= cap:
+                    return candidate
+                dropped = [*dropped, f"item_{len(items) - 1}"]
+                items = items[:-1]
+            return {**payload, "items": [], "fit_dropped": dropped}
+
+    monkeypatch.setattr(worker_tools, "_FIT_MAX_PASSES", 1)
+
+    output_cap_bytes = 8 * 1024
+    payload = {
+        "mode": "focus",
+        "query": "q",
+        "items": ["z" * 40 for _ in range(500)],
+    }
+    meta = {"ok": True, "tool": "source_graph_query", "mode": "focus"}
+
+    fitted, dropped_now = worker_tools._fit_response_payload(
+        _StubEngine, payload, meta, output_cap_bytes, repo=tmp_path
+    )
+
+    assert dropped_now
+    assert "telemetry" in meta
+
+    content = _dumps(fitted)
+    result = {
+        **meta,
+        "truncated": True,
+        "outer_truncated": False,
+        "bytes": len(content.encode("utf-8")),
+        "content": content,
+        "content_sha256": "0" * 64,
+    }
+    assert worker_tools._serialized_response_bytes(result) <= output_cap_bytes
+    assert meta["telemetry"]["presented_bytes"] == len(content.encode("utf-8"))

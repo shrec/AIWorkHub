@@ -114,6 +114,7 @@ except ImportError:  # minimal copied worker package / direct-script mode
     from platform_io import chmod_fd
 
 from .repository_state import RepositoryStateError
+from . import output_spill_store
 from . import quality_reviewer
 from . import semantic_edit
 from . import semantic_edit_applier
@@ -303,6 +304,11 @@ VALIDATION_RECEIPT_TOOLS: frozenset[str] = frozenset({
     "validation_command", "validation_receipt",
 })
 _FIT_MAX_PASSES = 8
+# Telemetry embeds its own presented_bytes/pruned_bytes counters inside the
+# envelope it measures, so inserting or updating them can shift the envelope's
+# own serialized size (rare digit-width changes). Re-measure and update until
+# the stored presented_bytes matches the actual returned bytes (fixpoint).
+_TELEMETRY_FIXPOINT_PASSES = 4
 # Signed outer-pagination continuation (NF-2026-00510).  When the exact
 # canonical JSON bytes of a Source Graph response exceed a mode's outer output
 # cap, the worker pages those bytes across a signed cursor instead of
@@ -663,8 +669,18 @@ def _json_container_hit_count(value: Any) -> int:
     return 0
 
 
-def _canonical_json_output(name: str, text: str, *, max_bytes: int) -> tuple[str, bool]:
-    """Strip Source Graph's one bounded banner line, canonicalize the JSON."""
+def _canonical_json_output(
+    name: str, text: str, *, max_bytes: int, repo: Path | str
+) -> tuple[str, bool]:
+    """Strip Source Graph's one bounded banner line, canonicalize the JSON.
+
+    Over-cap text is spilled in full via ``output_spill_store`` BEFORE this
+    builds its bounded preview (RM-2026-00044): the exact original stays
+    retrievable and digest-verified from the wrapper's ``spill_locator``
+    rather than being discarded the moment it is trimmed. A spill failure
+    raises ``OutputSpillError`` here -- it never falls through to returning
+    a preview-only reply for a result that failed to persist.
+    """
 
     start = text.find("{")
     if start < 0:
@@ -682,6 +698,9 @@ def _canonical_json_output(name: str, text: str, *, max_bytes: int) -> tuple[str
     encoded = canonical.encode("utf-8")
     if len(encoded) <= max_bytes:
         return canonical, False
+
+    receipt = output_spill_store.spill_text(canonical, repo=repo)
+
     priority_keys = (
         "ranked_symbols",
         "related_tests",
@@ -728,6 +747,10 @@ def _canonical_json_output(name: str, text: str, *, max_bytes: int) -> tuple[str
         "original_sha256": hashlib.sha256(encoded).hexdigest(),
         "original_hit_count": _json_hit_count(payload),
         "preview_semantics": "structure_aware_priority_preserving",
+        "spill_locator": receipt.locator,
+        "spill_retrieval_hint": (
+            "output_spill_store.retrieve_text(spill_locator, repo=<repository root>)"
+        ),
         "preview": {},
     }
     preview: dict[str, Any] = wrapper["preview"]
@@ -756,7 +779,11 @@ def _canonical_json_output(name: str, text: str, *, max_bytes: int) -> tuple[str
                 preview.pop(key, None)
     wrapper["omitted_key_count"] = omitted
     wrapper["priority_keys_present"] = [key for key in priority_keys if key in preview]
-    bounded = json.dumps(wrapper, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+    def _serialize() -> str:
+        return json.dumps(wrapper, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+    bounded = _serialize()
     while len(bounded.encode("utf-8")) > max_bytes:
         removable = next(
             (key for key in reversed(list(preview)) if key not in priority_keys),
@@ -766,7 +793,46 @@ def _canonical_json_output(name: str, text: str, *, max_bytes: int) -> tuple[str
             break
         preview.pop(removable, None)
         wrapper["omitted_key_count"] += 1
-        bounded = json.dumps(wrapper, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        bounded = _serialize()
+
+    def _stabilize_telemetry() -> str:
+        # ``telemetry`` is embedded in the wrapper it measures, so writing a
+        # new presented_bytes value can itself shift the envelope's byte
+        # count (rare digit-width changes). Re-measure/update to a fixpoint
+        # so telemetry.presented_bytes always equals len(returned bytes).
+        text = _serialize()
+        for _ in range(_TELEMETRY_FIXPOINT_PASSES):
+            telemetry = wrapper.get("telemetry")
+            if telemetry is None:
+                break
+            actual_bytes = len(text.encode("utf-8"))
+            if telemetry["presented_bytes"] == actual_bytes:
+                break
+            telemetry["presented_bytes"] = actual_bytes
+            telemetry["pruned_bytes"] = len(encoded) - actual_bytes
+            text = _serialize()
+        return text
+
+    wrapper["telemetry"] = output_spill_store.build_telemetry(
+        original_bytes=len(encoded),
+        presented_bytes=len(bounded.encode("utf-8")),
+        spilled_bytes=receipt.original_bytes,
+        pruned_bytes=len(encoded) - len(bounded.encode("utf-8")),
+    )
+    bounded = _stabilize_telemetry()
+    while len(bounded.encode("utf-8")) > max_bytes:
+        removable = next(
+            (key for key in reversed(list(preview)) if key not in priority_keys),
+            None,
+        )
+        if removable is None:
+            wrapper.pop("telemetry", None)
+            bounded = _serialize()
+            break
+        preview.pop(removable, None)
+        wrapper["omitted_key_count"] += 1
+        bounded = _stabilize_telemetry()
+
     return bounded, True
 
 
@@ -4235,8 +4301,10 @@ def _serve_continuation(
 def _fit_response_payload(
     sg_module: Any,
     payload: dict[str, Any],
-    meta: Mapping[str, Any],
+    meta: dict[str, Any],
     output_cap_bytes: int,
+    *,
+    repo: Path | str,
 ) -> tuple[dict[str, Any], list[str]]:
     """Fit one analytic payload to the outer cap as ONE plain-JSON page.
 
@@ -4251,6 +4319,19 @@ def _fit_response_payload(
     overage until the reply fits.  Returns the fitted payload (mutated in
     place) and the sections it dropped; hashes and the ledger row are
     computed over the fitted bytes actually returned.
+
+    Every section this drops is permanent loss unless spilled: whenever the
+    trimmer actually runs, the pre-trim payload is persisted in full via
+    ``output_spill_store`` (RM-2026-00044) BEFORE its sections are lost, and
+    ``meta`` (mutated in place, flows into the caller's response envelope)
+    carries the spill locator and byte telemetry so the exact original stays
+    retrievable and digest-verified rather than being discarded the moment
+    it is trimmed.  Those spill fields are themselves envelope bytes the
+    first fit pass never measured (it fit against a ``meta`` that did not
+    carry them yet): once the receipt and telemetry are known, a second
+    bounded pass re-measures the COMPLETE response with them included and
+    trims further if that pushed it back over the cap, so the reply this
+    returns is fit against the exact envelope the caller actually sends.
     """
 
     fit = getattr(sg_module, "_fit_payload_bytes", None)
@@ -4269,10 +4350,13 @@ def _fit_response_payload(
     before_names = list(before) if isinstance(before, list) else []
     cap = output_cap_bytes - _serialized_response_bytes(probe) - 64
     fitted_once = False
+    original_text = ""
     for _ in range(_FIT_MAX_PASSES):
         text = json.dumps(
             payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
         )
+        if not fitted_once:
+            original_text = text
         probe["content"] = text
         probe["bytes"] = len(text.encode("utf-8"))
         size = _serialized_response_bytes(probe)
@@ -4284,6 +4368,50 @@ def _fit_response_payload(
             break
         payload = fit(payload, cap)
         fitted_once = True
+    if fitted_once:
+        original_bytes = len(original_text.encode("utf-8"))
+        receipt = output_spill_store.spill_text(original_text, repo=repo)
+        for _ in range(_FIT_MAX_PASSES):
+            presented_text = json.dumps(
+                payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            )
+            presented_bytes = len(presented_text.encode("utf-8"))
+            meta["spill_locator"] = receipt.locator
+            meta["spill_retrieval_hint"] = receipt.retrieval_hint
+            meta["telemetry"] = output_spill_store.build_telemetry(
+                original_bytes=original_bytes,
+                presented_bytes=presented_bytes,
+                spilled_bytes=receipt.original_bytes,
+                pruned_bytes=max(0, original_bytes - presented_bytes),
+            )
+            probe["content"] = presented_text
+            probe["bytes"] = presented_bytes
+            probe["spill_locator"] = meta["spill_locator"]
+            probe["spill_retrieval_hint"] = meta["spill_retrieval_hint"]
+            probe["telemetry"] = meta["telemetry"]
+            size = _serialized_response_bytes(probe)
+            if size <= output_cap_bytes:
+                break
+            cap -= (size - output_cap_bytes) + 32
+            if cap < 256:
+                break
+            payload = fit(payload, cap)
+        else:
+            # The pass budget ran out right after a ``fit()`` call: that
+            # final call changed ``payload`` but the loop had no further
+            # iteration left to re-measure it, so meta/telemetry above still
+            # describe the pre-fit payload. Re-measure once more against the
+            # payload this function actually returns.
+            presented_text = json.dumps(
+                payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            )
+            presented_bytes = len(presented_text.encode("utf-8"))
+            meta["telemetry"] = output_spill_store.build_telemetry(
+                original_bytes=original_bytes,
+                presented_bytes=presented_bytes,
+                spilled_bytes=receipt.original_bytes,
+                pruned_bytes=max(0, original_bytes - presented_bytes),
+            )
     dropped = payload.get("fit_dropped")
     dropped_now = (
         [name for name in dropped if name not in before_names]
@@ -5128,7 +5256,7 @@ def source_graph_query(
     fit_dropped: list[str] = []
     if mode not in SOURCE_GRAPH_EXACT_CONTENT_MODES and isinstance(payload, dict):
         payload, fit_dropped = _fit_response_payload(
-            _source_graph_mod, payload, meta, output_cap_bytes,
+            _source_graph_mod, payload, meta, output_cap_bytes, repo=query_repo,
         )
     raw_text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
     try:
