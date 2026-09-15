@@ -351,8 +351,52 @@ function measuredCount(value) {
   return isMeasured(value) ? formatCount(value) : NO_MEASUREMENT_LABEL;
 }
 
+function formatCompactNumber(value, locale) {
+  return formatCount(value, locale);
+}
+
+// One argument on purpose: this exact declaration is the seam other extension
+// tests extract verbatim from the shipped file. The algorithm therefore stays
+// self-contained. formatCompactNumber() supplies the optional second argument
+// only for a deterministic test harness without widening this public seam.
 function formatCount(value) {
-  return new Intl.NumberFormat(undefined, { notation: "compact", maximumFractionDigits: 1 }).format(numberValue(value));
+  const locale = arguments.length > 1
+    ? arguments[1]
+    : (typeof navigator !== "undefined" && navigator.language ? navigator.language : undefined);
+  const tiers = [
+    { limit: 1e12, suffix: "T" },
+    { limit: 1e9, suffix: "B" },
+    { limit: 1e6, suffix: "M" },
+    { limit: 1e3, suffix: "k" },
+  ];
+  const amount = numberValue(value);
+  const magnitude = Math.abs(amount);
+  const render = (number, digits) => new Intl.NumberFormat(locale, {
+    minimumFractionDigits: 0,
+    maximumFractionDigits: digits,
+    useGrouping: false,
+  }).format(number);
+  if (magnitude < tiers[tiers.length - 1].limit) {
+    return render(amount, 0);
+  }
+  let index = tiers.length - 1;
+  while (index > 0 && magnitude >= tiers[index - 1].limit) {
+    index -= 1;
+  }
+  for (;;) {
+    const tier = tiers[index];
+    const mantissa = amount / tier.limit;
+    const mantissaMagnitude = Math.abs(mantissa);
+    const digits = mantissaMagnitude < 10 ? 3 : (mantissaMagnitude < 100 ? 2 : 1);
+    const factor = 10 ** digits;
+    const absoluteRounded = Math.round(Math.abs(mantissa) * factor) / factor;
+    const rounded = mantissa < 0 ? -absoluteRounded : absoluteRounded;
+    if (Math.abs(rounded) >= 1000 && index > 0) {
+      index -= 1;
+      continue;
+    }
+    return `${render(rounded, digits)}${tier.suffix}`;
+  }
 }
 
 // "access observed" was too short a label for a two-disjunct fact, and the
