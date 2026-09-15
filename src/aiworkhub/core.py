@@ -2956,6 +2956,7 @@ def _manager_contract() -> dict[str, Any]:
                 "supported_capabilities": [
                     "Create, claim, launch, inspect, and finalize canonical cards.",
                     "Plan dependency waves only from repository evidence.",
+                    "Make small hash-bound range edits with aiworkhub_manager_semantic_edit_prepare then aiworkhub_manager_semantic_edit_apply.",
                 ],
                 "fail_closed_limitations": [
                     "Does not act on mismatched repository or unverified route evidence.",
@@ -3217,6 +3218,17 @@ def manager_bootstrap(
         "binding_source": _repository_binding_source(),
         "manager_verified": bool(identity),
         "manager_route": identity or {},
+        "capabilities": {
+            "semantic_edit": {
+                "available": bool(identity),
+                "mandatory_for_existing_files": True,
+                "prepare_tool": "aiworkhub_manager_semantic_edit_prepare",
+                "apply_tool": "aiworkhub_manager_semantic_edit_apply",
+                "write_gate_required_for_apply": True,
+                "write_gate_open": writes_allowed(),
+                "unavailable_reason": "" if identity else "manager_route_unverified",
+            },
+        },
         "server_version": str(server_version),
         "task_hygiene": hygiene,
         "task_health": _bootstrap_task_health(root, readiness),

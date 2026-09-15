@@ -1046,6 +1046,38 @@ def aiworkhub_manager_bootstrap(
 
 
 @mcp.tool()
+def aiworkhub_manager_semantic_edit_prepare(
+    file_path: str,
+    start_line: int,
+    end_line: int,
+    include_fragment: bool = False,
+) -> dict[str, Any]:
+    """MANAGER EDIT: bind one verified file range before changing it."""
+
+    return manager_ai_tools.semantic_edit_prepare(
+        file_path=file_path,
+        start_line=start_line,
+        end_line=end_line,
+        include_fragment=include_fragment,
+    )
+
+
+@mcp.tool()
+def aiworkhub_manager_semantic_edit_apply(
+    target_id: str,
+    new: str,
+    idempotency_key: str,
+) -> dict[str, Any]:
+    """MANAGER EDIT: replace exactly one prepared, hash-bound range."""
+
+    return manager_ai_tools.semantic_edit_apply(
+        target_id=target_id,
+        new=new,
+        idempotency_key=idempotency_key,
+    )
+
+
+@mcp.tool()
 def aiworkhub_manager_source_graph_query(
     mode: worker_ai_tools_mcp.SourceGraphMode,
     query: str,

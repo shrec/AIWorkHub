@@ -236,6 +236,60 @@ def test_stdlib_fallback_source_graph_schema_is_self_describing(fallback_server_
     ]
 
 
+def test_stdlib_fallback_exposes_manager_semantic_edit_pair(
+    fallback_server_module, monkeypatch,
+):
+    server_module = fallback_server_module
+    tools = server_module.mcp._tools
+    assert "aiworkhub_manager_semantic_edit_prepare" in tools
+    assert "aiworkhub_manager_semantic_edit_apply" in tools
+
+    monkeypatch.setattr(
+        server_module.manager_ai_tools,
+        "semantic_edit_prepare",
+        lambda **kwargs: {"ok": True, "arguments": kwargs},
+    )
+    prepared = server_module._stdio_dispatch(
+        "AIWorkHub MCP",
+        tools,
+        "tools/call",
+        {
+            "name": "aiworkhub_manager_semantic_edit_prepare",
+            "arguments": {
+                "file_path": "src/aiworkhub/core.py",
+                "start_line": 1,
+                "end_line": 2,
+                "include_fragment": False,
+            },
+        },
+    )["structuredContent"]
+    assert prepared["arguments"]["file_path"] == "src/aiworkhub/core.py"
+
+    monkeypatch.setattr(
+        server_module.manager_ai_tools,
+        "semantic_edit_apply",
+        lambda **kwargs: {"ok": True, "arguments": kwargs},
+    )
+    applied = server_module._stdio_dispatch(
+        "AIWorkHub MCP",
+        tools,
+        "tools/call",
+        {
+            "name": "aiworkhub_manager_semantic_edit_apply",
+            "arguments": {
+                "target_id": "target-1",
+                "new": "replacement",
+                "idempotency_key": "manager-edit-1",
+            },
+        },
+    )["structuredContent"]
+    assert applied["arguments"] == {
+        "target_id": "target-1",
+        "new": "replacement",
+        "idempotency_key": "manager-edit-1",
+    }
+
+
 def test_stdlib_fallback_rejects_unknown_tool_and_unknown_method(fallback_server_module):
     server_module = fallback_server_module
     tools = server_module.mcp._tools

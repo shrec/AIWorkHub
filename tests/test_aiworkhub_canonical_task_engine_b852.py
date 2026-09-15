@@ -1096,6 +1096,16 @@ def test_manager_bootstrap_advertises_create_and_callback_contract(writable_repo
     assert result["role"] == "manager"
     assert result["schema_id"] == core.MANAGER_BOOTSTRAP_SCHEMA_ID
     assert result["contract_delivered"] is True
+    semantic_edit = result["capabilities"]["semantic_edit"]
+    assert semantic_edit == {
+        "available": True,
+        "mandatory_for_existing_files": True,
+        "prepare_tool": "aiworkhub_manager_semantic_edit_prepare",
+        "apply_tool": "aiworkhub_manager_semantic_edit_apply",
+        "write_gate_required_for_apply": True,
+        "write_gate_open": True,
+        "unavailable_reason": "",
+    }
     matrix = result["responsibility_matrix"]
     assert matrix["schema_id"] == "aiworkhub.manager_responsibility_matrix.v1"
     system = matrix["aiworkhub_system"]
@@ -1105,6 +1115,8 @@ def test_manager_bootstrap_advertises_create_and_callback_contract(writable_repo
     assert "completion inbox" in system["recovery_surfaces"][2]
     manager = matrix["manager"]
     assert "Source Graph-first" in manager["owned_duties"][1]
+    assert "aiworkhub_manager_semantic_edit_prepare" in manager["supported_capabilities"][2]
+    assert "aiworkhub_manager_semantic_edit_apply" in manager["supported_capabilities"][2]
     assert "callbacks" in manager["fail_closed_limitations"][1]
     assert "aiworkhub_task_mark_done" in manager["recovery_surfaces"][2]
     worker = matrix["worker_model"]
