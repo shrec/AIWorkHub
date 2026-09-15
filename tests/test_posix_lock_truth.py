@@ -322,7 +322,16 @@ def _write_route_record(reg_dir: Path, repo_id: str, *, extension_host_pid) -> P
     root = reg_dir.parent / repo_id
     manifest = root / shared_router.repository_state.PROJECT_MANIFEST_REL
     manifest.parent.mkdir(parents=True, exist_ok=True)
-    manifest.write_text(json.dumps({"repo_id": repo_id}), encoding="utf-8")
+    manifest.write_text(
+        json.dumps(
+            shared_router.repository_state.RepositoryManifest(
+                repo_id=repo_id,
+                repo_name=root.name,
+                created_at="2026-09-15T00:00:00+00:00",
+            ).to_json()
+        ),
+        encoding="utf-8",
+    )
     record = reg_dir / f"{repo_id}.json"
     record.write_text(
         json.dumps({

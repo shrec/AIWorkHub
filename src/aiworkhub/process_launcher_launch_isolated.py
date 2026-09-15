@@ -1055,6 +1055,7 @@ def launch_isolated(
             launch_phase = "supervisor_spec"
             appcontainer_identity_fields: dict[str, str] = {}
             if sandbox_backend == "windows_appcontainer":
+                platform_name = sys.platform
                 try:
                     canonical_repo_id = project_context.repository_state.inspect_repository(
                         authority_repo
@@ -1071,7 +1072,7 @@ def launch_isolated(
                     identity = _appcontainer_supervisor_identity(
                         repo_id=canonical_repo_id,
                         worker_kind=adapter_id,
-                        platform=sys.platform,
+                        platform=platform_name,
                     )
                 except ValueError as exc:
                     raise LaunchRejected(
@@ -1085,7 +1086,7 @@ def launch_isolated(
                 if "backend" not in identity:
                     raise LaunchRejected(
                         "windows_appcontainer_backend_platform_mismatch:"
-                        f"{sys.platform}"
+                        f"{platform_name}"
                     )
                 appcontainer_identity_fields = {
                     "execution_backend": identity["backend"],

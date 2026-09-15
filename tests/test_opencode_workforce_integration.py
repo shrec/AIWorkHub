@@ -367,7 +367,9 @@ def test_simulated_windows_discovers_identities_without_launching(
     assert parsed == [_FREE, _PAID]
 
 
-def test_listing_probe_does_not_mark_access_observed(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_listing_probe_does_not_mark_access_observed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     monkeypatch.setattr(
         repo_policy,
         "_list_opencode_models",
@@ -393,7 +395,9 @@ def test_listing_probe_does_not_mark_access_observed(monkeypatch: pytest.MonkeyP
         },
         "bubblewrap",
         "",
-        model_policy=model_settings.load(Path(".")),
+        # This verifies default OpenCode filtering, so it must not inherit the
+        # checkout owner's repository-local provider switches.
+        model_policy=model_settings.load(_repo(tmp_path)),
     )
     assert status["installed"] is True
     assert status["access_observed"] is False

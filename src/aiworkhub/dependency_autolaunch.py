@@ -243,6 +243,13 @@ TRANSIENT_DENIAL_REASONS = frozenset(
         "ledger_snapshot_unproven",
         "supervisor_pid_identity_unavailable",
         "windows_launch_cwd_unavailable",
+        # AppContainer identity is derived from repository state, the selected
+        # adapter and the host platform. Each input can change without a task
+        # row mutation, so these fail-closed launch denials must remain
+        # retryable rather than being held as deterministic card defects.
+        "windows_appcontainer_backend_platform_mismatch",
+        "windows_appcontainer_identity_invalid",
+        "windows_appcontainer_repo_identity_unavailable",
         "worker_supervisor_script_missing",
         # -- replay grants that read task EVENTS or worker MCP gate receipts
         # rather than card fields.  Deliberately split from the card-pure
