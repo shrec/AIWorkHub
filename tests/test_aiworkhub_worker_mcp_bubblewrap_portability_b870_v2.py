@@ -59,6 +59,7 @@ BWRAP = Path("/usr/bin/bwrap")
 _PACKAGE_FILES = (
     "__init__.py",
     "_version.py",
+    "output_spill_store.py",
     "repository_state.py",
     "semantic_edit.py",
     # The applier layer semantic_edit deliberately excludes: one definition
