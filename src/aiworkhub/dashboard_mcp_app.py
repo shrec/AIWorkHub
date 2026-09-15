@@ -35,6 +35,7 @@ from aiworkhub import (
     repo_policy,
     repository_bootstrap,
     shared_router,
+    skill_registry_store,
     source_graph,
     sqlite_readonly,
     storage_observability,
@@ -2461,6 +2462,51 @@ def kb_view(limit: int = 100) -> dict[str, Any]:
     }
 
 
+def skills_view() -> dict[str, Any]:
+    """READ-ONLY: measured skill selection and injection coverage.
+
+    Counts only, never rows: skill totals by lifecycle, how many ACTIVE records
+    a card context could actually reach, how many recorded receipts selected and
+    how many injected, and the consecutive run of newest receipts that injected
+    nothing. The streak is the point. A skill system whose every selection comes
+    back empty is indistinguishable from a quiet one until something counts the
+    run, and this repository measured 24 empty selections in a row while every
+    surface reported a well-formed, bounded, entirely healthy-looking packet.
+
+    An absent or unreadable store reports ``measured: False`` with a reason. It
+    does NOT report zeros -- "no skills were injected" and "nobody looked" are
+    different facts and a panel that renders them identically is the defect.
+
+    A failure ABOVE the projection answers in that identical shape. Dropping
+    ``schema_id``/``unavailable_reason``/``skills``/``selection`` here would
+    make a renderer branch on WHICH layer failed before it could tell whether
+    the surface was measured, and a missing block reads as an absent one.
+    """
+    try:
+        root = core.repo_root()
+        coverage = skill_registry_store.skill_coverage(root)
+    except (
+        skill_registry_store.SkillStoreError,
+        sqlite3.Error,
+        OSError,
+        ValueError,
+    ) as exc:
+        reason = f"skill_coverage_unavailable:{type(exc).__name__}"
+        return {
+            "ok": False,
+            "server_tool": "aiworkhub_dashboard_skills",
+            "error": reason,
+            **skill_registry_store.unmeasured_coverage(reason),
+            "authority_flags": _readonly_authority_flags(),
+        }
+    return {
+        "ok": True,
+        "server_tool": "aiworkhub_dashboard_skills",
+        **coverage,
+        "authority_flags": _readonly_authority_flags(),
+    }
+
+
 def storage_retention_preview_view() -> dict[str, Any]:
     """READ-ONLY: fresh repository-scoped cleanup preview and batch list."""
     try:
@@ -3549,6 +3595,8 @@ SESSION_TOOL_NAME = "aiworkhub_dashboard_sessions"
 SESSION_TOOLS: dict[str, Any] = {SESSION_TOOL_NAME: session_view}
 KB_TOOL_NAME = "aiworkhub_dashboard_kb"
 KB_TOOLS: dict[str, Any] = {KB_TOOL_NAME: kb_view}
+SKILLS_TOOL_NAME = "aiworkhub_dashboard_skills"
+SKILLS_TOOLS: dict[str, Any] = {SKILLS_TOOL_NAME: skills_view}
 NEEDFIX_READ_TOOLS: dict[str, Any] = {
     "aiworkhub_dashboard_needfix_list": needfix_list_view,
     "aiworkhub_dashboard_needfix_detail": needfix_detail_view,
@@ -3637,6 +3685,8 @@ def register(mcp: Any) -> tuple[str, ...]:
         mcp.tool(name=name)(fn)
     for name, fn in KB_TOOLS.items():
         mcp.tool(name=name)(fn)
+    for name, fn in SKILLS_TOOLS.items():
+        mcp.tool(name=name)(fn)
     for name, fn in NEEDFIX_READ_TOOLS.items():
         mcp.tool(name=name)(fn)
     for name, fn in NEEDFIX_WRITE_TOOLS.items():
@@ -3670,6 +3720,7 @@ def register(mcp: Any) -> tuple[str, ...]:
         MEMORY_TOOL_NAME,
         SESSION_TOOL_NAME,
         KB_TOOL_NAME,
+        SKILLS_TOOL_NAME,
         SETTINGS_TOOL_NAME,
         STORAGE_RETENTION_PREVIEW_TOOL_NAME,
         TERMINAL_LOG_RETENTION_PREVIEW_TOOL_NAME,

@@ -1630,6 +1630,141 @@ def select(
     )
 
 
+# ---------------------------------------------------------------------------
+# Why a selection came back empty
+# ---------------------------------------------------------------------------
+#
+# :func:`select` answers WHAT matched. It deliberately cannot answer why nothing
+# did, and that silence is what let an all-empty chain read as healthy: 24 of 24
+# measured card contexts selected zero skills and every surface reported the
+# same bounded, well-formed, entirely uninformative empty packet.
+#
+# The four reasons below are mutually exclusive and are decided in order of how
+# early the chain broke, so the first true one is the one worth acting on. They
+# are tokens, not prose, because a dashboard counts them.
+
+SELECTION_EMPTY_NO_CANDIDATES = "no_candidates"
+SELECTION_EMPTY_NO_ACTIVE_RECORDS = "no_active_records"
+SELECTION_EMPTY_ACTIVE_VOCABULARY_UNSELECTABLE = "active_vocabulary_unselectable"
+SELECTION_EMPTY_NO_VOCABULARY_MATCH = "no_vocabulary_match"
+
+SELECTION_EMPTY_REASONS: frozenset[str] = frozenset(
+    {
+        SELECTION_EMPTY_NO_CANDIDATES,
+        SELECTION_EMPTY_NO_ACTIVE_RECORDS,
+        SELECTION_EMPTY_ACTIVE_VOCABULARY_UNSELECTABLE,
+        SELECTION_EMPTY_NO_VOCABULARY_MATCH,
+    }
+)
+
+# The dimensions whose DECLARED value can put a record permanently out of reach.
+# ``path_or_symbol`` and ``risk`` are excluded on purpose and the exclusion is
+# not an oversight: any relative path is the scope of SOME card, and ``risk`` is
+# an ordered floor that every tier at or above it satisfies, so neither can be
+# declared in a way no card context could ever carry.
+_REACHABLE_VOCABULARY_FIELDS: tuple[str, ...] = (
+    "task_family",
+    "stage",
+    "triggers",
+    "applicability",
+)
+
+
+def unreachable_selection_dimensions(record: SkillRecord) -> tuple[str, ...]:
+    """Return the declared dimensions no card context can ever match.
+
+    A record predating the closed vocabulary carries free-text prose where a
+    token belongs -- ``"a surface reports unknown"`` as a trigger, ``"reporting
+    and observability surfaces"`` as applicability. :func:`_tuple_match` and
+    :func:`_scalar_match` compare exactly, so such a value matches nothing a
+    card can legally declare: the record is ACTIVE, passes every integrity
+    check, and is unreachable. That is the failure this names.
+
+    The empty tuple means reachable. It does NOT mean "will match" -- only that
+    the record's own declaration does not rule matching out in advance.
+
+    Matching is unchanged by this function: it decides nothing, it explains. A
+    dimension is unreachable only when the record neither declares the explicit
+    wildcard nor leaves the dimension unconstrained nor carries a single token
+    the shared vocabulary knows.
+    """
+    record = validate_record(record)
+    unreachable: list[str] = []
+    for field in _REACHABLE_VOCABULARY_FIELDS:
+        declared = getattr(record, field)
+        vocabulary = vocabulary_for(field)
+        if isinstance(declared, tuple):
+            # _tuple_match: no patterns is unconstrained and matches every card;
+            # otherwise ONE known token is enough to make the record reachable.
+            reachable = (
+                not declared
+                or SELECT_WILDCARD in declared
+                or any(token in vocabulary for token in declared)
+            )
+        else:
+            reachable = declared == SELECT_WILDCARD or declared in vocabulary
+        if not reachable:
+            unreachable.append(field)
+    return tuple(unreachable)
+
+
+def is_injectable(record: SkillRecord) -> bool:
+    """Whether a record is ACTIVE *and* reachable by some card context.
+
+    This is the honest injectable denominator. Counting ACTIVE records alone
+    reports a skill system that is ready to inject when every one of its records
+    declares prose the matcher cannot reach, which is exactly how an all-empty
+    selection streak stayed invisible.
+    """
+    record = validate_record(record)
+    if record.lifecycle_state is not LifecycleState.ACTIVE:
+        return False
+    return not unreachable_selection_dimensions(record)
+
+
+def selection_empty_reason(
+    candidates: Iterable[SkillRecord], receipt: SkillSelectionReceipt
+) -> str:
+    """Return WHY ``receipt`` selected nothing, or ``""`` when it selected.
+
+    Read-only and pure, like :func:`select` itself. The reason is derived from
+    the SAME candidate set the receipt was produced from, so it describes the
+    decision that actually ran rather than a replay against a later registry.
+
+    A one-shot iterator is refused rather than read. ``receipt`` can only have
+    come from :func:`select`, which already drained such an iterator, so the
+    candidate set arriving here would be EMPTY and this function would answer
+    ``no_candidates`` -- the earliest and most alarming link in the chain --
+    for a registry that was in fact full. That is the one wrong answer nobody
+    could tell apart from a true one, so the misuse fails loudly instead.
+    Callers materialize once (``tuple(...)``) and pass the same sequence to
+    :func:`select`, :func:`build_runtime_packet` and this function.
+    """
+    if not isinstance(receipt, SkillSelectionReceipt):
+        _fail("skill_registry.invalid_type", "receipt must be a SkillSelectionReceipt")
+    if isinstance(candidates, Iterator):
+        _fail(
+            "skill_registry.invalid_type",
+            "candidates must be a re-iterable sequence, not a one-shot iterator",
+        )
+    if receipt.selected:
+        return ""
+    records = list(candidates)
+    if not records:
+        return SELECTION_EMPTY_NO_CANDIDATES
+    active = [
+        record
+        for record in records
+        if validate_record(record).lifecycle_state is LifecycleState.ACTIVE
+    ]
+    if not active:
+        return SELECTION_EMPTY_NO_ACTIVE_RECORDS
+    if not any(is_injectable(record) for record in active):
+        return SELECTION_EMPTY_ACTIVE_VOCABULARY_UNSELECTABLE
+    return SELECTION_EMPTY_NO_VOCABULARY_MATCH
+
+
+
 def _validate_positive_limit(value: Any, field: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         _fail("skill_registry.invalid_type", f"{field} must be a positive int")
@@ -2232,6 +2367,11 @@ __all__ = [
     "SkillRuntimePacketRow",
     "SkillScope",
     "SkillSelection",
+    "SELECTION_EMPTY_ACTIVE_VOCABULARY_UNSELECTABLE",
+    "SELECTION_EMPTY_NO_ACTIVE_RECORDS",
+    "SELECTION_EMPTY_NO_CANDIDATES",
+    "SELECTION_EMPTY_NO_VOCABULARY_MATCH",
+    "SELECTION_EMPTY_REASONS",
     "SkillSelectionReceipt",
     "TransitionDecision",
     "build_runtime_packet",
@@ -2243,11 +2383,14 @@ __all__ = [
     "canonical_payload",
     "independent_accepted_actor_ids",
     "independent_accepted_evidence_count",
+    "is_injectable",
     "normalize",
     "rank",
     "select",
+    "selection_empty_reason",
     "skill_digest",
     "transition_allowed",
+    "unreachable_selection_dimensions",
     "unresolved_negative_evidence",
     "validate_record",
 ]

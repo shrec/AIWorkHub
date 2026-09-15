@@ -66,6 +66,37 @@ DEFAULT_LOAD_LIMIT = MAX_LOAD_LIMIT
 # write an unbounded row.
 MAX_RECEIPT_SKILLS = 32
 MAX_RECEIPT_ID_CHARS = 200
+MAX_EMPTY_REASON_CHARS = 64
+# A count is bounded for the same reason a receipt row list is: the column is
+# a measurement, and a measurement larger than the receipt could hold is a bug
+# upstream, not a number to persist.
+MAX_RECEIPT_COUNT = 10_000
+
+# Stamped on an empty receipt whose caller measured no reason. Distinct from the
+# blank default, which means the row predates the measurement columns entirely:
+# "recorded empty, reason unreported" and "never measured" are different facts
+# and a coverage projection must not add them together.
+SELECTION_EMPTY_REASON_NOT_REPORTED = "reason_not_reported"
+
+# The bucket a persisted reason outside the closed set is counted under. Rows
+# predate validation or come from a build whose vocabulary has since changed,
+# and :func:`skill_coverage` GROUPS BY this column: without a bucket, one stale
+# free-text value opens an unbounded key space in a projection whose whole
+# promise is bounded counts. It is never written, only read.
+SELECTION_EMPTY_REASON_UNRECOGNIZED = "reason_unrecognized"
+
+# The closed set a receipt row's ``empty_reason`` may hold: the selection
+# vocabulary this build knows, plus this module's own "recorded empty, reason
+# unreported" token. Validated at WRITE time so the grouping key space stays
+# closed at the source rather than being repaired on every read.
+PERSISTABLE_EMPTY_REASONS: frozenset[str] = frozenset(
+    skill_registry.SELECTION_EMPTY_REASONS | {SELECTION_EMPTY_REASON_NOT_REPORTED}
+)
+
+# How many of the newest receipts a coverage projection reads. Bounded by the
+# same rule as every other read here: a projection reports counts and a streak,
+# never an unbounded row set.
+MAX_COVERAGE_RECEIPTS = 500
 
 
 class SkillStoreError(Exception):
@@ -99,11 +130,23 @@ CREATE TABLE IF NOT EXISTS skill_selection_receipts (
     selected_json TEXT NOT NULL,
     context_json TEXT NOT NULL,
     created_at TEXT NOT NULL,
+    selected_count INTEGER NOT NULL DEFAULT 0,
+    injected_count INTEGER NOT NULL DEFAULT 0,
+    empty_reason TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (task_id, request_id)
 );
 CREATE INDEX IF NOT EXISTS idx_skill_selection_receipts_task
     ON skill_selection_receipts(task_id);
 """
+
+# Receipt columns added after the table shipped. Listed once, with the exact
+# DDL each needs, so the additive upgrade in ``ensure_schema`` stays a loop over
+# data rather than a growing block of near-identical ALTER statements.
+_RECEIPT_ADDED_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("selected_count", "INTEGER NOT NULL DEFAULT 0"),
+    ("injected_count", "INTEGER NOT NULL DEFAULT 0"),
+    ("empty_reason", "TEXT NOT NULL DEFAULT ''"),
+)
 
 
 def _utcnow() -> str:
@@ -125,12 +168,18 @@ def _connect(repo_root: str | Path) -> sqlite3.Connection:
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
-    """Create the skill_records table and digest index if they do not exist.
+    """Create the canonical tables, index and added columns if they are absent.
 
     Additive only: existing rows are never rewritten, so an older database is
     upgraded in place without data loss. A pre-existing table that predates the
     ``state_digest`` column gains it as an empty-default column; such legacy rows
     then fail closed on read until rewritten, never serving unverified state.
+
+    The receipt measurement columns (``selected_count``, ``injected_count``,
+    ``empty_reason``) are added the same way. Their defaults are deliberately
+    the zero/empty ones: a row written before the columns existed was never
+    MEASURED for them, and :func:`skill_coverage` reports such rows as
+    unmeasured rather than folding them into a real count of zero.
     """
     conn.executescript(_SCHEMA_SQL)
     columns = {row[1] for row in conn.execute("PRAGMA table_info(skill_records)")}
@@ -138,6 +187,14 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE skill_records ADD COLUMN state_digest TEXT NOT NULL DEFAULT ''"
         )
+    receipt_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(skill_selection_receipts)")
+    }
+    for column, ddl in _RECEIPT_ADDED_COLUMNS:
+        if column not in receipt_columns:
+            conn.execute(
+                f"ALTER TABLE skill_selection_receipts ADD COLUMN {column} {ddl}"
+            )
 
 
 def initialize_repository(repo_root: str | Path) -> dict[str, Any]:
@@ -434,7 +491,7 @@ def get_record(
 
 
 def _bounded_page(
-    repo_root: str | Path, sql: str, *, limit: int, offset: int
+    repo_root: str | Path, sql: str, *, limit: int, offset: int, strict: bool = False
 ) -> list[sqlite3.Row]:
     """The ONE owner of a bounded, fail-closed page read of the skills database.
 
@@ -443,6 +500,14 @@ def _bounded_page(
     or missing table with an empty page rather than an error, so a repository
     that has no skills never fails a dashboard. Writing that twice would be a
     second implementation of one policy, and the two would drift on the cap.
+
+    ``strict=True`` withdraws only that last clause, and only for a caller whose
+    job is to MEASURE. An empty page is a safe answer for a reader that wants
+    rows and a false one for :func:`skill_coverage`: a corrupt file or a store
+    missing ``skill_records`` would be published as measured zeros with
+    ``truncated`` false -- byte-identical to a healthy registry nobody has
+    filled yet. A strict caller is expected to catch :class:`sqlite3.Error` and
+    report the reading as unmeasured instead of inventing a number.
 
     ``sql`` must end in ``LIMIT ? OFFSET ?``; those are the only bound values.
     """
@@ -458,21 +523,32 @@ def _bounded_page(
             ).fetchall()
         )
     except sqlite3.Error:
+        if strict:
+            raise
         return []
     finally:
         conn.close()
 
 
 def list_records(
-    repo_root: str | Path, *, limit: int = DEFAULT_LOAD_LIMIT, offset: int = 0
+    repo_root: str | Path,
+    *,
+    limit: int = DEFAULT_LOAD_LIMIT,
+    offset: int = 0,
+    strict: bool = False,
 ) -> list[SkillRecord]:
-    """Return persisted records, bounded and fail-closed. Never creates the DB."""
+    """Return persisted records, bounded and fail-closed. Never creates the DB.
+
+    ``strict`` is forwarded to :func:`_bounded_page`: a measuring caller wants an
+    unreadable store to raise rather than look empty.
+    """
     rows = _bounded_page(
         repo_root,
         "SELECT * FROM skill_records ORDER BY identity ASC, version ASC "
         "LIMIT ? OFFSET ?",
         limit=limit,
         offset=offset,
+        strict=strict,
     )
     return [_row_to_record(row) for row in rows]
 
@@ -540,12 +616,23 @@ def audit_active_records(
     activation is surfaced for a manager to act on rather than repaired behind
     their back. Each entry names the canonical actor identities the activation
     actually rests on, which is the fact a raw ``accepted_count`` hides.
+
+    ``unreachable_dimensions`` is the second thing an activation can be wrong
+    about, and the one nothing was asking. A record can rest on two genuinely
+    independent accepted actors and still declare free-text prose where a
+    vocabulary token belongs, which makes it ACTIVE, verified, and impossible
+    for any card context to match. It is listed, never retired here: retirement
+    is a manager transition through :meth:`SkillRegistry.retire` and
+    :func:`advance_record`, and replacement is a new version through the same
+    propose/evidence/activate path. This report names the targets; the canonical
+    mechanisms move them.
     """
     report: list[dict[str, Any]] = []
     for record in list_records(repo_root, limit=limit):
         if record.lifecycle_state is not skill_registry.LifecycleState.ACTIVE:
             continue
         actors = skill_registry.independent_accepted_actor_ids(record)
+        unreachable = skill_registry.unreachable_selection_dimensions(record)
         report.append(
             {
                 "identity": record.identity,
@@ -562,6 +649,8 @@ def audit_active_records(
                 ),
                 "min_accepted_evidence": int(min_accepted_evidence),
                 "verified": activation_supported(record, min_accepted_evidence),
+                "unreachable_dimensions": list(unreachable),
+                "injectable": skill_registry.is_injectable(record),
             }
         )
     return report
@@ -572,6 +661,7 @@ def load_registry(
     *,
     min_accepted_evidence: int = 2,
     limit: int = DEFAULT_LOAD_LIMIT,
+    strict: bool = False,
     demote_unverified_active: bool = True,
 ) -> SkillRegistry:
     """Load persisted records into a :class:`SkillRegistry`.
@@ -595,9 +685,13 @@ def load_registry(
     ``demote_unverified_active=False`` loads the persisted lifecycle verbatim.
     It exists for audit and migration callers that must observe the stored state
     exactly as written, and must not be used to serve runtime selection.
+
+    ``strict=True`` withdraws the "unreadable yields empty" clause of the first
+    paragraph, so a caller measuring coverage sees the sqlite failure instead of
+    an empty registry it would report as a real zero.
     """
     registry = SkillRegistry(min_accepted_evidence=min_accepted_evidence)
-    for record in list_records(repo_root, limit=limit):
+    for record in list_records(repo_root, limit=limit, strict=strict):
         if demote_unverified_active and not activation_supported(
             record, min_accepted_evidence
         ):
@@ -637,6 +731,16 @@ def _bounded_id(value: Any, field: str) -> str:
     if len(text) > MAX_RECEIPT_ID_CHARS or "\x00" in text:
         raise SkillStoreError(f"{field}_invalid")
     return text
+
+
+def _bounded_count(value: Any) -> int:
+    """Return a non-negative, bounded receipt count, or refuse."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise SkillStoreError("selection_count_invalid")
+    if value < 0 or value > MAX_RECEIPT_COUNT:
+        raise SkillStoreError("selection_count_invalid")
+    return value
+
 
 
 def _packet_rows(packet: Any) -> list[dict[str, str]]:
@@ -700,25 +804,59 @@ def record_selection(
     request_id: str = "",
     packet: Any,
     context: Any = None,
+    selected_count: int | None = None,
+    empty_reason: str = "",
 ) -> dict[str, Any]:
     """Persist which skills one card+request received, and the packet's sha.
 
-    Idempotent by ``(task_id, request_id)``: re-recording the identical packet
-    is a no-op that reports ``idempotent``. A DIFFERENT packet for the same key
-    replaces the row and reports ``replaced`` -- a relaunch of the same request
-    genuinely rebuilds the packet, and silently keeping the stale list would
-    attribute the decision's evidence to skills the worker never saw.
+    Idempotent by ``(task_id, request_id)``: re-recording the identical
+    measurement is a no-op that reports ``idempotent``. A DIFFERENT packet --
+    or the same packet with a different measurement -- replaces the row and
+    reports ``replaced``. A relaunch of the same request genuinely rebuilds the
+    packet, and silently keeping the stale list would attribute the decision's
+    evidence to skills the worker never saw.
 
     An empty packet is recorded too. "This card declared selection vocabulary
     and matched nothing" is a measurement; leaving no row would make it
     indistinguishable from "selection never ran", which is the exact confusion
     the injection ledger already reports as unavailable.
+
+    ``selected_count`` and ``empty_reason`` are what turn that row from a
+    tombstone into evidence. SELECTED and INJECTED are two different numbers --
+    :func:`skill_registry.select` decides the first, ``build_runtime_packet``
+    bounds the second -- and recording only the packet made a selection that was
+    truncated to fit look exactly like a selection that found nothing.
+    ``selected_count`` defaults to the injected count, which is correct for the
+    common unbounded case and never invents a number the caller did not measure.
+
+    ``empty_reason`` carries one :data:`skill_registry.SELECTION_EMPTY_REASONS`
+    token when the packet is empty. An empty packet recorded WITHOUT one is
+    stamped :data:`SELECTION_EMPTY_REASON_NOT_REPORTED` rather than left blank,
+    so a blank reason keeps its one meaning: this row predates the measurement.
+    A token outside :data:`PERSISTABLE_EMPTY_REASONS` is REFUSED rather than
+    truncated and stored: :func:`skill_coverage` groups its empty tally by this
+    column, so admitting free text would let one caller turn a bounded reason
+    histogram into an open-ended one. :func:`record_selection_reported` reports
+    that refusal like any other, so a launcher still never raises on it.
     """
     task = _bounded_id(task_id, "task_id")
     request = str(request_id or "").strip()[:MAX_RECEIPT_ID_CHARS]
     rows = _packet_rows(packet)
     packet_sha = selection_packet_sha256(packet)
     selected_json = json.dumps(rows, sort_keys=True, separators=(",", ":"))
+    injected = len(rows)
+    selected = injected if selected_count is None else _bounded_count(selected_count)
+    reason = str(empty_reason or "").strip()[:MAX_EMPTY_REASON_CHARS]
+    if reason and reason not in PERSISTABLE_EMPTY_REASONS:
+        raise SkillStoreError(
+            "empty_reason must be one of "
+            f"{sorted(PERSISTABLE_EMPTY_REASONS)}; got {reason!r}"
+        )
+    if not injected and not reason:
+        reason = SELECTION_EMPTY_REASON_NOT_REPORTED
+    if injected:
+        # A packet that carried skills is not empty, whatever the caller said.
+        reason = ""
     if context is not None and hasattr(context, "as_mapping"):
         context = context.as_mapping()
     context_json = json.dumps(
@@ -732,17 +870,26 @@ def record_selection(
         ensure_schema(conn)
         conn.execute("BEGIN IMMEDIATE")
         existing = conn.execute(
-            "SELECT packet_sha256 FROM skill_selection_receipts "
-            "WHERE task_id=? AND request_id=?",
+            "SELECT packet_sha256,selected_count,injected_count,empty_reason "
+            "FROM skill_selection_receipts WHERE task_id=? AND request_id=?",
             (task, request),
         ).fetchone()
-        idempotent = existing is not None and existing["packet_sha256"] == packet_sha
+        idempotent = existing is not None and (
+            existing["packet_sha256"],
+            int(existing["selected_count"]),
+            int(existing["injected_count"]),
+            str(existing["empty_reason"] or ""),
+        ) == (packet_sha, selected, injected, reason)
         if not idempotent:
             conn.execute(
                 "INSERT OR REPLACE INTO skill_selection_receipts "
-                "(task_id,request_id,packet_sha256,selected_json,context_json,created_at) "
-                "VALUES (?,?,?,?,?,?)",
-                (task, request, packet_sha, selected_json, context_json, _utcnow()),
+                "(task_id,request_id,packet_sha256,selected_json,context_json,created_at,"
+                "selected_count,injected_count,empty_reason) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
+                (
+                    task, request, packet_sha, selected_json, context_json, _utcnow(),
+                    selected, injected, reason,
+                ),
             )
         conn.commit()
         return {
@@ -751,6 +898,9 @@ def record_selection(
             "request_id": request,
             "packet_sha256": packet_sha,
             "skills": rows,
+            "selected_count": selected,
+            "injected_count": injected,
+            "empty_reason": reason,
             "idempotent": bool(idempotent),
             "replaced": bool(existing is not None and not idempotent),
         }
@@ -769,6 +919,8 @@ def record_selection_reported(
     request_id: str = "",
     packet: Any,
     context: Any = None,
+    selected_count: int | None = None,
+    empty_reason: str = "",
 ) -> dict[str, Any]:
     """:func:`record_selection` that REPORTS its refusal instead of raising.
 
@@ -782,6 +934,7 @@ def record_selection_reported(
         return {"ok": True, **record_selection(
             repo_root, task_id=task_id, request_id=request_id,
             packet=packet, context=context,
+            selected_count=selected_count, empty_reason=empty_reason,
         )}
     except (SkillStoreError, sqlite3.Error, OSError, TypeError, ValueError) as exc:
         return {
@@ -800,6 +953,17 @@ def _receipt_row(row: sqlite3.Row) -> dict[str, Any]:
         context = json.loads(str(row["context_json"] or "{}"))
     except (TypeError, ValueError):
         context = {}
+    # The measurement columns are read defensively, not because a write path
+    # could omit them, but because a READ path can: connect_readonly cannot run
+    # the additive ALTER, so a database not yet opened read-write still serves
+    # its pre-measurement shape. It reads as unmeasured, never as a zero.
+    columns = set(row.keys())
+    measured = "injected_count" in columns and "empty_reason" in columns
+    injected = int(row["injected_count"]) if measured else 0
+    selected = (
+        int(row["selected_count"]) if "selected_count" in columns else injected
+    )
+    reason = str(row["empty_reason"] or "") if measured else ""
     return {
         "schema_id": SELECTION_RECEIPT_SCHEMA_ID,
         "task_id": str(row["task_id"]),
@@ -808,6 +972,12 @@ def _receipt_row(row: sqlite3.Row) -> dict[str, Any]:
         "skills": skills if isinstance(skills, list) else [],
         "context": context if isinstance(context, dict) else {},
         "created_at": str(row["created_at"]),
+        "selected_count": selected,
+        "injected_count": injected,
+        "empty_reason": reason,
+        # Blank reason on an empty receipt is the ONE signal that separates a
+        # row written before these columns existed from a measured empty one.
+        "measured": bool(measured and (injected or reason)),
     }
 
 
@@ -848,14 +1018,22 @@ def get_selection(
 
 
 def list_selections(
-    repo_root: str | Path, *, limit: int = DEFAULT_LOAD_LIMIT, offset: int = 0
+    repo_root: str | Path,
+    *,
+    limit: int = DEFAULT_LOAD_LIMIT,
+    offset: int = 0,
+    strict: bool = False,
 ) -> list[dict[str, Any]]:
-    """Return persisted selection receipts, bounded. Never creates the DB."""
+    """Return persisted selection receipts, bounded. Never creates the DB.
+
+    ``strict`` is forwarded to :func:`_bounded_page` for measuring callers.
+    """
     rows = _bounded_page(
         repo_root,
         "SELECT * FROM skill_selection_receipts "
         "ORDER BY created_at DESC, task_id ASC LIMIT ? OFFSET ?",
         limit=limit,
+        strict=strict,
         offset=offset,
     )
     return [_receipt_row(row) for row in rows]
@@ -888,4 +1066,201 @@ def injection_counts(
             "card_ids": sorted(entry["cards"])[:40],
         }
         for key, entry in counts.items()
+    }
+
+
+# ---------------------------------------------------------------------------
+# Measured coverage -- is the skill system actually reaching workers?
+#
+# Every number below is counted from rows this repository wrote. When the store
+# is absent nothing is counted and ``measured`` is False: an unavailable skill
+# surface reported as a row of zeros is the exact confusion that let 24 of 24
+# empty selections read as a healthy, quiet system.
+# ---------------------------------------------------------------------------
+
+COVERAGE_SCHEMA_ID = "aiworkhub.skill_registry_store.coverage.v1"
+
+
+def unmeasured_coverage(reason: str) -> dict[str, Any]:
+    """The one shape an unavailable coverage reading takes. Never zeros.
+
+    Public because the reading can also fail ABOVE this module -- a dashboard
+    view that cannot even reach :func:`skill_coverage` must answer in the same
+    shape, or a caller has to branch on which layer failed to learn whether the
+    skill surface was measured.
+    """
+    return {
+        "schema_id": COVERAGE_SCHEMA_ID,
+        "measured": False,
+        "unavailable_reason": reason,
+        "skills": {},
+        "selection": {},
+    }
+
+
+def _coverage_empty_reason(value: Any) -> str:
+    """Return the closed-vocabulary bucket one persisted reason counts under."""
+    reason = str(value or "") or SELECTION_EMPTY_REASON_NOT_REPORTED
+    if reason not in PERSISTABLE_EMPTY_REASONS:
+        return SELECTION_EMPTY_REASON_UNRECOGNIZED
+    return reason
+
+
+def _more_rows_beyond(
+    repo_root: str | Path, sql: str, *, offset: int, strict: bool = False
+) -> bool:
+    """Whether one bounded page left rows behind it. One row is read, never more."""
+    return bool(
+        _bounded_page(repo_root, sql, limit=1, offset=offset, strict=strict)
+    )
+
+
+def skill_coverage(
+    repo_root: str | Path,
+    *,
+    limit: int = MAX_COVERAGE_RECEIPTS,
+    record_limit: int = MAX_LOAD_LIMIT,
+    min_accepted_evidence: int = 2,
+) -> dict[str, Any]:
+    """Return bounded, measured skill selection/injection coverage.
+
+    Four numbers and a streak, no rows:
+
+    * ``skills.total`` / ``skills.by_lifecycle`` -- what the registry holds.
+    * ``skills.injectable`` -- ACTIVE records that some card context could
+      actually reach (:func:`skill_registry.is_injectable`). A record declaring
+      free-text prose where a vocabulary token belongs is ACTIVE and unreachable,
+      so counting ACTIVE alone reports readiness the matcher cannot deliver.
+    * ``selection.selection_count`` / ``selection.injection_count`` -- receipts
+      that SELECTED something and receipts that INJECTED something. They are two
+      numbers because a bounded packet can carry fewer skills than select chose.
+    * ``selection.consecutive_empty_streak`` -- how many of the newest receipts
+      in a row injected nothing, with ``empty_reasons`` naming why. This is the
+      number that refuses to stay quiet: a long streak is a broken chain, not a
+      calm one.
+
+    Every population read here is bounded, and each block DISCLOSES its own
+    bound: ``skills.record_limit`` / ``skills.truncated`` and
+    ``selection.receipt_limit`` / ``selection.truncated``. A headline total
+    silently computed from an identity-ordered clamp is the same defect this
+    projection exists to name -- a number that looks like the whole registry
+    and is really the first page of it. ``truncated`` is measured, by reading
+    ONE row past the page, not inferred from the page being full.
+
+    ``empty_reasons`` is keyed by :data:`PERSISTABLE_EMPTY_REASONS` plus
+    :data:`SELECTION_EMPTY_REASON_UNRECOGNIZED`. Writes are validated, so the
+    bucket catches only rows an older build persisted.
+
+    Three store states are three different answers, never one. An ABSENT store
+    is ``skill_store_absent``. A store that exists but cannot be read -- corrupt
+    bytes, or a file missing the tables this projection groups over -- is
+    ``skill_store_unreadable:<ExceptionName>``. Only a store that opened and
+    answered is ``measured``, and only then may it report zeros. The middle case
+    is the one worth naming: it fails exactly where a healthy empty registry
+    succeeds, so a projection that reads it leniently publishes a broken store
+    as a calm one.
+
+    Read-only. Never creates the database and never rewrites a row. The registry
+    is loaded with the demotion rule in force, so ``injectable`` counts what
+    selection would really serve rather than what the rows claim.
+    """
+    path = _db_path(repo_root)
+    if not path.exists():
+        return unmeasured_coverage("skill_store_absent")
+    record_page = max(1, min(int(record_limit), MAX_LOAD_LIMIT))
+    receipt_page = max(1, min(int(limit), MAX_COVERAGE_RECEIPTS))
+    # Every read below is strict. The page reader's default is to answer an
+    # unreadable store with an empty page, which is right for a caller that
+    # wants rows and fatal for this one: a corrupt file or a store missing
+    # skill_records would arrive here as zero records, zero receipts and
+    # truncated=False, and be published as a measured, healthy, empty registry.
+    try:
+        records = load_registry(
+            repo_root,
+            min_accepted_evidence=min_accepted_evidence,
+            limit=record_page,
+            strict=True,
+        ).records()
+        receipts = list_selections(repo_root, limit=receipt_page, strict=True)
+        records_truncated = _more_rows_beyond(
+            repo_root,
+            "SELECT identity FROM skill_records "
+            "ORDER BY identity ASC, version ASC LIMIT ? OFFSET ?",
+            offset=record_page,
+            strict=True,
+        )
+        receipts_truncated = _more_rows_beyond(
+            repo_root,
+            "SELECT task_id FROM skill_selection_receipts "
+            "ORDER BY created_at DESC, task_id ASC LIMIT ? OFFSET ?",
+            offset=receipt_page,
+            strict=True,
+        )
+    except (SkillStoreError, sqlite3.Error, OSError, ValueError) as exc:
+        return unmeasured_coverage(f"skill_store_unreadable:{type(exc).__name__}")
+
+    by_lifecycle: dict[str, int] = {}
+    injectable = 0
+    active_unreachable = 0
+    for record in records:
+        state = record.lifecycle_state.value
+        by_lifecycle[state] = by_lifecycle.get(state, 0) + 1
+        if record.lifecycle_state is not skill_registry.LifecycleState.ACTIVE:
+            continue
+        if skill_registry.is_injectable(record):
+            injectable += 1
+        else:
+            active_unreachable += 1
+
+    measured_receipts = [row for row in receipts if row["measured"]]
+    empty_reasons: dict[str, int] = {}
+    selection_count = 0
+    injection_count = 0
+    for row in measured_receipts:
+        if row["selected_count"]:
+            selection_count += 1
+        if row["injected_count"]:
+            injection_count += 1
+        else:
+            reason = _coverage_empty_reason(row["empty_reason"])
+            empty_reasons[reason] = empty_reasons.get(reason, 0) + 1
+    # list_selections orders newest first, so the streak is the leading run.
+    streak = 0
+    for row in measured_receipts:
+        if row["injected_count"]:
+            break
+        streak += 1
+
+    return {
+        "schema_id": COVERAGE_SCHEMA_ID,
+        "measured": True,
+        "unavailable_reason": "",
+        "skills": {
+            "total": len(records),
+            "by_lifecycle": dict(sorted(by_lifecycle.items())),
+            "active": by_lifecycle.get(
+                skill_registry.LifecycleState.ACTIVE.value, 0
+            ),
+            "injectable": injectable,
+            "active_unreachable_vocabulary": active_unreachable,
+            # The population these totals were counted over, and whether the
+            # registry held more than it. Without both, "total" reads as the
+            # registry when it is only the first identity-ordered page of it.
+            "record_limit": record_page,
+            "truncated": records_truncated,
+        },
+        "selection": {
+            "receipts": len(measured_receipts),
+            "unmeasured_receipts": len(receipts) - len(measured_receipts),
+            "selection_count": selection_count,
+            "injection_count": injection_count,
+            "empty_receipts": len(measured_receipts) - injection_count,
+            "consecutive_empty_streak": streak,
+            "all_empty": bool(measured_receipts) and injection_count == 0,
+            "empty_reasons": dict(sorted(empty_reasons.items())),
+            # The EFFECTIVE bound this call used, not the module ceiling: a
+            # caller that asked for 10 receipts was never told it got 10.
+            "receipt_limit": receipt_page,
+            "truncated": receipts_truncated,
+        },
     }

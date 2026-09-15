@@ -367,6 +367,7 @@ def test_register_binds_readonly_live_output_and_initialize_tools():
         dashboard_mcp_app.MEMORY_TOOL_NAME,
         dashboard_mcp_app.SESSION_TOOL_NAME,
         dashboard_mcp_app.KB_TOOL_NAME,
+        dashboard_mcp_app.SKILLS_TOOL_NAME,
         dashboard_mcp_app.SETTINGS_TOOL_NAME,
         dashboard_mcp_app.STORAGE_RETENTION_PREVIEW_TOOL_NAME,
         dashboard_mcp_app.TERMINAL_LOG_RETENTION_PREVIEW_TOOL_NAME,
@@ -2493,3 +2494,109 @@ def test_opencode_snapshot_at_the_producer_slice_reports_a_floor(
     assert row["source_truncated"] is True
     assert row["discovered_from_opencode"] is True
     assert row.get("declared_only") is not True
+
+
+# ---------------------------------------------------------------------------
+# Skill selection / injection coverage panel
+# ---------------------------------------------------------------------------
+
+
+def test_skills_view_reports_measured_coverage_without_raw_rows(
+    tmp_path, monkeypatch
+) -> None:
+    """Counts, a streak and reason tallies -- never a list of skills or cards."""
+    from aiworkhub import skill_registry_store
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setattr(dashboard_mcp_app.core, "repo_root", lambda: repo)
+    skill_registry_store.record_selection(
+        repo,
+        task_id="TASK_EMPTY",
+        packet={"version": 1, "skills": []},
+        empty_reason="no_vocabulary_match",
+    )
+
+    result = dashboard_mcp_app.skills_view()
+    assert result["ok"] is True
+    assert result["server_tool"] == "aiworkhub_dashboard_skills"
+    assert result["measured"] is True
+    assert result["skills"]["total"] == 0
+    assert result["skills"]["injectable"] == 0
+    assert result["selection"]["selection_count"] == 0
+    assert result["selection"]["injection_count"] == 0
+    assert result["selection"]["consecutive_empty_streak"] == 1
+    assert result["selection"]["all_empty"] is True
+    assert result["selection"]["empty_reasons"] == {"no_vocabulary_match": 1}
+    # Bounded by construction: no key in the payload carries a row list.
+    assert not any(
+        isinstance(value, list)
+        for block in ("skills", "selection")
+        for value in result[block].values()
+    )
+
+
+def test_skills_view_reports_an_absent_store_as_unmeasured_not_zero(
+    tmp_path, monkeypatch
+) -> None:
+    """A skill panel that renders "nobody looked" as 0 is the original defect."""
+    repo = tmp_path / "bare"
+    repo.mkdir()
+    monkeypatch.setattr(dashboard_mcp_app.core, "repo_root", lambda: repo)
+
+    result = dashboard_mcp_app.skills_view()
+    assert result["measured"] is False
+    assert result["unavailable_reason"] == "skill_store_absent"
+    assert result["skills"] == {}
+    assert result["selection"] == {}
+    assert result["schema_id"] == (
+        dashboard_mcp_app.skill_registry_store.COVERAGE_SCHEMA_ID
+    )
+
+
+def test_skills_view_keeps_one_unmeasured_shape_however_the_reading_failed(
+    tmp_path, monkeypatch
+) -> None:
+    """A failure ABOVE the projection answers in the projection's own shape.
+
+    Dropping ``schema_id``/``unavailable_reason``/``skills``/``selection`` on
+    this path makes a renderer branch on WHICH layer failed before it can tell
+    whether the surface was measured, and a missing block reads as an absent
+    one -- the exact confusion "measured: False" was added to end.
+    """
+    repo = tmp_path / "unreadable"
+    repo.mkdir()
+    monkeypatch.setattr(dashboard_mcp_app.core, "repo_root", lambda: repo)
+
+    def boom(*args, **kwargs):
+        raise OSError("skills.sqlite is not readable")
+
+    monkeypatch.setattr(
+        dashboard_mcp_app.skill_registry_store, "skill_coverage", boom
+    )
+
+    result = dashboard_mcp_app.skills_view()
+    assert result["ok"] is False
+    assert result["error"] == "skill_coverage_unavailable:OSError"
+    assert result["measured"] is False
+    # Same shape as the absent-store reading, key for key.
+    assert result["schema_id"] == (
+        dashboard_mcp_app.skill_registry_store.COVERAGE_SCHEMA_ID
+    )
+    assert result["unavailable_reason"] == result["error"]
+    assert result["skills"] == {}
+    assert result["selection"] == {}
+
+
+def test_the_skills_tool_is_registered_on_the_readonly_surface() -> None:
+    recorded: list[str] = []
+
+    class _Recorder:
+        def tool(self, *, name):
+            recorded.append(name)
+            return lambda fn: fn
+
+    names = dashboard_mcp_app.register(_Recorder())
+    assert dashboard_mcp_app.SKILLS_TOOL_NAME == "aiworkhub_dashboard_skills"
+    assert dashboard_mcp_app.SKILLS_TOOL_NAME in recorded
+    assert dashboard_mcp_app.SKILLS_TOOL_NAME in names

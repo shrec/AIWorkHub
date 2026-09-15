@@ -1246,6 +1246,39 @@ def _skill_selection_context(card: dict[str, Any]) -> dict[str, Any] | None:
     return skill_registry.card_selection_context(resolved)
 
 
+def _skill_selection_metadata(section: dict[str, Any]) -> dict[str, Any]:
+    """Bundle-level selection truth for a card that DID declare vocabulary.
+
+    One shape with one meaning per field, so a reader never has to know which
+    layer failed. ``measured`` is the discriminator: when the selection ran, the
+    counts are real and ``failure_reason`` is empty; when it did not, the counts
+    are ``None`` and ``failure_reason`` carries the section's own degraded
+    identity (``skill_vocabulary_rejected:<code>`` or
+    ``skill_selection_failed:<ExceptionName>``).
+
+    The counts are ``None`` rather than 0 on purpose. A failed selection that
+    reported zeros would read exactly like a selection that ran and injected
+    nothing -- the same conflation of "unavailable" with "measured zero" this
+    block exists to prevent. The failure path is detected by the ABSENCE of
+    ``empty_reason``, which only the completed path attaches.
+    """
+    if "empty_reason" not in section:
+        return {
+            "measured": False,
+            "selected_count": None,
+            "injected_count": None,
+            "empty_reason": "",
+            "failure_reason": section["degraded_reason"],
+        }
+    return {
+        "measured": True,
+        "selected_count": section["selected_count"],
+        "injected_count": section["injected_count"],
+        "empty_reason": section["empty_reason"],
+        "failure_reason": "",
+    }
+
+
 def _skills_section(repo: Path, card: dict[str, Any]) -> dict[str, Any] | None:
     """Return the bounded skill runtime packet section, or ``None``.
 
@@ -1279,9 +1312,19 @@ def _skills_section(repo: Path, card: dict[str, Any]) -> dict[str, Any] | None:
         # record that self-certified under a weaker reading of independence is
         # loaded as proposed and select() -- which serves ACTIVE only -- will
         # not inject it.
-        candidates = skill_registry_store.load_registry(repo).records()
+        #
+        # Materialized ONCE, into a tuple, at this boundary. Three readers below
+        # consume the candidate set, so a registry that handed back a one-shot
+        # stream would leave the last two looking at an exhausted iterator and
+        # reporting "no_candidates" for a store that was full.
+        candidates = tuple(skill_registry_store.load_registry(repo).records())
         receipt = skill_registry.select(candidates, context, limit=SKILL_SELECT_LIMIT)
         packet = skill_registry.build_runtime_packet(candidates, receipt)
+        # WHY nothing was selected, derived from the same candidate set the
+        # receipt came from. A bounded, well-formed, empty packet is what 24 of
+        # 24 measured card contexts produced, and with no reason attached it
+        # read as a healthy system rather than a broken chain.
+        empty_reason = skill_registry.selection_empty_reason(candidates, receipt)
         # Persist WHICH skills this card received. Without it the retirement
         # report measured cards_with_persisted_packet 0 across 4,681 cards and
         # every skill read injected_cards 0, so a skill could never be shown to
@@ -1290,12 +1333,17 @@ def _skills_section(repo: Path, card: dict[str, Any]) -> dict[str, Any] | None:
         # unaffected. request_id is empty on purpose -- the launcher mints it
         # on the line AFTER this collection, so the receipt is card-keyed and
         # the decision resolves it from the card's latest receipt.
+        # selected_count is the SELECTION, len(packet.skills) the INJECTION:
+        # build_runtime_packet bounds the packet, so the two can differ and
+        # recording only one of them hides a truncation as a miss.
         skill_registry_store.record_selection_reported(
             repo,
             task_id=str(card.get("task_id") or ""),
             request_id="",
             packet=packet,
             context=context,
+            selected_count=len(receipt.selected),
+            empty_reason=empty_reason,
         )
     except (
         skill_registry.SkillRegistryError,
@@ -1324,6 +1372,9 @@ def _skills_section(repo: Path, card: dict[str, Any]) -> dict[str, Any] | None:
         name="skills",
         task_family=str(context["task_family"]),
         stage=str(context["stage"]),
+        selected_count=len(receipt.selected),
+        injected_count=len(packet.skills),
+        empty_reason=empty_reason,
         content=content,
         truncated=False,
         # The packet row count is the hit count. It is taken from the packet
@@ -1674,6 +1725,19 @@ def collect_project_context(repo: Path, card: dict[str, Any]) -> ProjectContextR
             "token_savings_available": False,
         },
         "section_count": len(sections),
+        # Selection truth, kept out of the per-section rows on purpose: only the
+        # skills section has these numbers, and giving every other section a
+        # defaulted zero would turn "this surface has no selection" into "this
+        # surface selected nothing". Absent key means the card declared no
+        # vocabulary, so no selection was ever attempted. A selection that WAS
+        # attempted always reports here, including when it failed -- omitting
+        # the block for a rejected vocabulary or an unreadable store would make
+        # a broken selection indistinguishable from a card that never had one.
+        **(
+            {"skill_selection": _skill_selection_metadata(skills_section)}
+            if skills_section is not None
+            else {}
+        ),
         "sections": [
             {
                 "name": section["name"],
