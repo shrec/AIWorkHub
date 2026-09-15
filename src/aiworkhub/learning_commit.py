@@ -16,6 +16,7 @@ from enum import Enum
 from pathlib import PurePosixPath
 from typing import Any, Dict, FrozenSet, List, Optional, Sequence, Tuple
 
+from . import terminal_failure_classification
 from .evidence_levels import (
     InvalidReferenceSchemeError,
     EmptyReferencePathError,
@@ -54,15 +55,26 @@ class FailureCategory(Enum):
 # groups are consulted only when the finalization outcome is *not* accepted:
 # a manager-rejected task whose worker reported review_ready means the worker
 # believed it succeeded but a human found a genuine candidate defect.
-_CODE_QUALITY_TERMINAL_SUBSTATUSES: FrozenSet[str] = frozenset({
-    "review_ready", "validation_failed",
-})
-_ENVIRONMENT_TERMINAL_SUBSTATUSES: FrozenSet[str] = frozenset({"finalize_failed"})
-_PROVIDER_RUNTIME_TERMINAL_SUBSTATUSES: FrozenSet[str] = frozenset({
-    "launch_failed", "worker_failed", "process_lost", "liveness_lost",
-})
-_CANCELLATION_TERMINAL_SUBSTATUSES: FrozenSet[str] = frozenset({"timed_out", "cancelled"})
-_POLICY_TERMINAL_SUBSTATUSES: FrozenSet[str] = frozenset({"output_budget_exceeded"})
+#
+# NF-2026-00847: these names are now PROJECTIONS of
+# ``terminal_failure_classification``'s canonical vocabulary rather than an
+# independent copy of it.  Two tables that both answered "what kind of failure
+# was this" could disagree about the same card, and did; one table cannot.
+_CODE_QUALITY_TERMINAL_SUBSTATUSES: FrozenSet[str] = (
+    terminal_failure_classification.CANDIDATE_TERMINAL_SUBSTATUSES
+)
+_ENVIRONMENT_TERMINAL_SUBSTATUSES: FrozenSet[str] = (
+    terminal_failure_classification.VALIDATION_ENVIRONMENT_TERMINAL_SUBSTATUSES
+)
+_PROVIDER_RUNTIME_TERMINAL_SUBSTATUSES: FrozenSet[str] = (
+    terminal_failure_classification.PROVIDER_RUNTIME_TERMINAL_SUBSTATUSES
+)
+_CANCELLATION_TERMINAL_SUBSTATUSES: FrozenSet[str] = (
+    terminal_failure_classification.CANCELLATION_TERMINAL_SUBSTATUSES
+)
+_POLICY_TERMINAL_SUBSTATUSES: FrozenSet[str] = (
+    terminal_failure_classification.POLICY_TERMINAL_SUBSTATUSES
+)
 
 # Single canonical source of "this terminal substatus is an infrastructure
 # failure, not a candidate-code failure" -- reused by workforce_catalog so
@@ -83,36 +95,14 @@ CODE_QUALITY_FAILURE_CATEGORIES: FrozenSet[FailureCategory] = frozenset({
     FailureCategory.CANDIDATE_CODE,
 })
 
-_SEALED_PROVIDER_QUOTA_CODES: FrozenSet[str] = frozenset({
-    "insufficient_balance", "insufficient_quota",
-    "balance_exhausted", "quota_exhausted",
-})
-_SEALED_PROVIDER_AUTH_CODES: FrozenSet[str] = frozenset({
-    "invalid_grant", "unknown_refresh_token",
-    "invalid_api_key", "unauthorized",
-    "authentication_failed", "authorization_failed",
-})
-_SEALED_PROVIDER_DEPENDENCY_CODES: FrozenSet[str] = frozenset({
-    "dependency_unavailable", "route_unavailable",
-    "upstream_unavailable", "mcp_unavailable",
-})
-
 
 def _sealed_provider_diagnostic(value: Any) -> Optional[Dict[str, Any]]:
     """Return ``value`` only if the provider transport sealed it itself.
 
-    ``owner`` must be exactly ``"provider"`` and ``sealed`` exactly ``True``.
-    Any other shape -- including a structured-looking dict an assistant wrote
-    about itself -- is untrusted and ignored, so substring/dict spoofing
-    cannot forge a classification.
+    Delegates to the canonical seal check so "did the provider actually say
+    this" has exactly one definition in this repository.
     """
-    if not isinstance(value, dict):
-        return None
-    if str(value.get("owner") or "").strip().casefold() != "provider":
-        return None
-    if value.get("sealed") is not True:
-        return None
-    return value
+    return terminal_failure_classification.sealed_provider_diagnostic(value)
 
 
 def classify_failure_category(
@@ -120,38 +110,27 @@ def classify_failure_category(
     terminal_substatus: Optional[str] = None,
     sealed_diagnostics: Optional[Dict[str, Any]] = None,
 ) -> FailureCategory:
-    """Classify one finalized task's failure into the canonical taxonomy.
+    """Project one canonical typed disposition onto the learning taxonomy.
 
     Only the worker's own structured ``terminal_substatus`` and a
     provider-sealed structured diagnostic are consulted.  Free-form prose (a
     manager's reject reason, a root-cause candidate, an assistant's
     self-reported error text) is never scanned.
+
+    This function no longer INFERS anything: it asks
+    ``terminal_failure_classification`` for the canonical disposition and
+    projects its ``cause`` onto :class:`FailureCategory`.  The external schema
+    -- the enum, its seven values, and every category this has ever returned
+    for a given (substatus, sealed diagnostic) pair -- is unchanged; what is
+    gone is the second, independently-maintained inference table behind it.
     """
-    substatus = str(terminal_substatus or "").strip().lower()
-    sealed = _sealed_provider_diagnostic(sealed_diagnostics)
-    if sealed is not None:
-        code = str(sealed.get("code") or "").strip().casefold()
-        status = sealed.get("http_status")
-        status_code = status if isinstance(status, int) and not isinstance(status, bool) else 0
-        if (
-            status_code in (401, 402, 403)
-            or code in _SEALED_PROVIDER_QUOTA_CODES
-            or code in _SEALED_PROVIDER_AUTH_CODES
-        ):
-            return FailureCategory.PROVIDER_RUNTIME
-        if code in _SEALED_PROVIDER_DEPENDENCY_CODES:
-            return FailureCategory.DEPENDENCY_OR_ROUTE
-    if substatus in _CODE_QUALITY_TERMINAL_SUBSTATUSES:
-        return FailureCategory.CANDIDATE_CODE
-    if substatus in _ENVIRONMENT_TERMINAL_SUBSTATUSES:
-        return FailureCategory.VALIDATION_ENVIRONMENT
-    if substatus in _PROVIDER_RUNTIME_TERMINAL_SUBSTATUSES:
-        return FailureCategory.PROVIDER_RUNTIME
-    if substatus in _POLICY_TERMINAL_SUBSTATUSES:
-        return FailureCategory.POLICY_OR_SCOPE
-    if substatus in _CANCELLATION_TERMINAL_SUBSTATUSES:
-        return FailureCategory.CANCELLATION_OR_TIMEOUT
-    return FailureCategory.INCONCLUSIVE
+    disposition = terminal_failure_classification.failure_disposition_from_substatus(
+        terminal_substatus=terminal_substatus,
+        sealed_diagnostics=sealed_diagnostics,
+    )
+    return FailureCategory(
+        terminal_failure_classification.failure_category_projection(disposition)
+    )
 
 
 @dataclass(frozen=True)

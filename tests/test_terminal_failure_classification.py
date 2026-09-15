@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from aiworkhub import terminal_failure_classification as tfc
 from aiworkhub.terminal_failure_classification import (
     MAX_DIAGNOSTIC_CHARS,
     MAX_TAIL_READ_BYTES,
@@ -1578,3 +1579,469 @@ def test_opencode_child_malformed_and_secrets_fail_closed() -> None:
     dumped = json.dumps(secret_placed)
     assert "sk-SANITIZED_NOT_A_REAL_SECRET" not in dumped
     assert secret_placed["envelope"] == "session_idle"
+
+
+# --------------------------------------------------------------------------- #
+# NF-2026-00847: ONE typed disposition, and the actions it is allowed to pick.
+#
+# Before this, three taxonomies answered "what do we do now" from three tables
+# and could disagree about the same terminal event. These tests pin the single
+# matrix, the evidence each action is allowed to rest on, and -- the whole point
+# -- every place where the answer must be "start nothing".
+# --------------------------------------------------------------------------- #
+
+DISPOSITION_FIELDS = (
+    "failure_class", "cause_owner", "cause", "action", "retry_scope",
+    "provider_launched", "candidate_bytes_preserved", "evidence_authority",
+)
+
+
+def _sealed(code: str = "", **extra: object) -> dict[str, object]:
+    return {"owner": "provider", "sealed": True, "code": code, **extra}
+
+
+def test_every_disposition_carries_the_whole_stable_field_set():
+    for substatus in ("", "worker_failed", "validation_failed", "cancelled"):
+        verdict = tfc.failure_disposition_from_substatus(terminal_substatus=substatus)
+        assert set(DISPOSITION_FIELDS) <= set(verdict)
+        assert verdict["schema_id"] == tfc.DISPOSITION_SCHEMA_ID
+        assert verdict["failure_class"] in tfc.FAILURE_CLASSES
+        assert verdict["cause"] in tfc.DISPOSITION_CAUSES
+        assert verdict["cause_owner"] in tfc.CAUSE_OWNERS
+        assert verdict["action"] in tfc.DISPOSITION_ACTIONS
+        assert verdict["retry_scope"] in tfc.RETRY_SCOPES
+        assert verdict["evidence_authority"] in tfc.EVIDENCE_AUTHORITIES
+        assert isinstance(verdict["provider_launched"], bool)
+        assert isinstance(verdict["candidate_bytes_preserved"], bool)
+
+
+def test_the_action_matrix_is_total_and_has_exactly_one_entry_per_cause():
+    """A cause added without an action cannot arrive silently."""
+    assert set(tfc._ACTION_MATRIX) == set(tfc._CAUSE_FAILURE_CLASS)
+    assert set(tfc._ACTION_MATRIX) == set(tfc._CAUSE_FAILURE_CATEGORY)
+    assert set(tfc.DISPOSITION_ACTIONS) == {
+        action for _owner, action, _scope, _launch in tfc._ACTION_MATRIX.values()
+    }
+    # Every cause every lookup table can name must be in the matrix.
+    named = (
+        set(tfc._SUBSTATUS_CAUSE.values())
+        | set(tfc._SEALED_CODE_OWNER.values())
+        | set(tfc._SEALED_STATUS_CAUSE.values())
+        | set(tfc._REFUSAL_KIND_CAUSE.values())
+        | set(tfc._PROVIDER_CODE_CAUSE.values())
+        | set(tfc._PROVIDER_STATUS_CAUSE.values())
+        | set(tfc._REASON_CAUSE.values())
+        | set(tfc.MANAGER_REJECTION_INTENT_CAUSES.values())
+    )
+    assert named <= set(tfc._ACTION_MATRIX)
+
+
+def test_only_two_actions_may_ever_start_a_provider():
+    launching = {
+        action
+        for _owner, action, _scope, launched in tfc._ACTION_MATRIX.values()
+        if launched
+    }
+    assert launching == tfc.PROVIDER_LAUNCHING_ACTIONS
+    assert launching == {tfc.ACTION_CANDIDATE_REWORK, tfc.ACTION_ROUTE_RETRY}
+
+
+@pytest.mark.parametrize(
+    "action",
+    sorted(
+        tfc.DISPOSITION_ACTIONS
+        - {tfc.ACTION_CANDIDATE_REWORK, tfc.ACTION_ROUTE_RETRY}
+    ),
+)
+def test_no_hold_or_replay_action_ever_reports_a_provider_launch(action):
+    """The no-provider-start invariant, one deterministic case per action."""
+    launched = {
+        launch
+        for _owner, matrix_action, _scope, launch in tfc._ACTION_MATRIX.values()
+        if matrix_action == action
+    }
+    assert launched == {False}
+
+
+@pytest.mark.parametrize(
+    ("substatus", "sealed", "refusal", "reason", "cause", "action", "authority"),
+    [
+        # Candidate-owned: the only family that earns a fresh provider, and it
+        # never retires or penalises the route that ran it.
+        (
+            "validation_failed", None, "", "",
+            "candidate_code", "candidate_rework", "aiworkhub_minted_reason",
+        ),
+        (
+            "review_ready", None, "", "required_output_missing:out/x.json",
+            "candidate_required_output", "candidate_rework",
+            "aiworkhub_minted_reason",
+        ),
+        (
+            "worker_failed", None, "", "scope_rejected:src/other.py",
+            "candidate_scope", "candidate_rework", "aiworkhub_minted_reason",
+        ),
+        # Callback / finalization / terminal-writer conflicts reconcile; they
+        # never launch, because the work already happened.
+        (
+            "finalize_failed", None, "", "",
+            "callback_conflict", "callback_reconcile", "aiworkhub_minted_reason",
+        ),
+        (
+            "worker_failed", None, "", "terminal_failure_transition_conflict",
+            "callback_conflict", "callback_reconcile", "aiworkhub_minted_reason",
+        ),
+        (
+            "worker_failed", None, "", "claim_ownership_lost:claimed_by=someone",
+            "callback_conflict", "callback_reconcile", "aiworkhub_minted_reason",
+        ),
+        # Dependency / sandbox / toolchain hold until a remediation identity
+        # changes.
+        (
+            "worker_failed", "dependency_unavailable", "", "",
+            "dependency_unavailable", "dependency_hold", "sealed_receipt",
+        ),
+        (
+            "validation_failed", None, "", "validation_unsupported_in_sandbox:x",
+            "sandbox_unsupported", "dependency_hold", "aiworkhub_minted_reason",
+        ),
+        # Capacity is NOT credential, and never relaunches the same route.
+        (
+            "worker_failed", None, "quota_exhausted", "",
+            "provider_capacity", "capacity_hold", "provider_refusal",
+        ),
+        (
+            "worker_failed", None, "session_limit", "",
+            "provider_capacity", "capacity_hold", "provider_refusal",
+        ),
+        (
+            "worker_failed", None, "rate_limited", "",
+            "provider_capacity", "capacity_hold", "provider_refusal",
+        ),
+        # Credential/balance holds until the credential identity changes.
+        (
+            "worker_failed", None, "credential_rejected", "",
+            "provider_credential", "credential_hold", "provider_refusal",
+        ),
+        (
+            "worker_failed", None, "balance_exhausted", "",
+            "provider_credential", "credential_hold", "provider_refusal",
+        ),
+        (
+            "worker_failed", None, "",
+            "claude_subscription_session_refresh_required",
+            "provider_credential", "credential_hold", "aiworkhub_minted_reason",
+        ),
+        # Proven transient route failure: the one bounded distinct-route retry.
+        (
+            "worker_failed", None, "provider_unavailable", "",
+            "provider_transient", "route_retry", "provider_refusal",
+        ),
+        # Cancellation is final. A timeout, and a generic worker_failed, are
+        # honestly unplaced -- neither may default to a mechanical retry.
+        (
+            "cancelled", None, "", "",
+            "cancelled", "cancellation_final", "aiworkhub_minted_reason",
+        ),
+        (
+            "timed_out", None, "", "",
+            "timeout", "manager_judgment_unknown", "aiworkhub_minted_reason",
+        ),
+        (
+            "worker_failed", None, "", "",
+            "provider_runtime_unclassified", "manager_judgment_unknown",
+            "aiworkhub_minted_reason",
+        ),
+        (
+            "worker_failed", None, "cause_not_distinguished", "",
+            "provider_runtime_unclassified", "manager_judgment_unknown",
+            "aiworkhub_minted_reason",
+        ),
+        (
+            "something_no_vocabulary_names", None, "", "",
+            "cause_not_established", "manager_judgment_unknown", "none",
+        ),
+    ],
+)
+def test_the_typed_action_matrix_end_to_end(
+    substatus, sealed, refusal, reason, cause, action, authority,
+):
+    verdict = tfc.failure_disposition_from_substatus(
+        terminal_substatus=substatus,
+        sealed_diagnostics=_sealed(sealed) if sealed else None,
+        refusal_kind=refusal,
+        reason=reason,
+    )
+    assert verdict["cause"] == cause
+    assert verdict["action"] == action
+    assert verdict["evidence_authority"] == authority
+    assert verdict["provider_launched"] is (
+        action in tfc.PROVIDER_LAUNCHING_ACTIONS
+    )
+
+
+def test_free_text_can_never_select_an_automatic_action():
+    """The admission rule, stated as a property rather than as a case."""
+    for authority in sorted(tfc.EVIDENCE_AUTHORITIES - tfc.AUTOMATIC_EVIDENCE_AUTHORITIES):
+        for cause in sorted(tfc.DISPOSITION_CAUSES):
+            verdict = tfc._typed_disposition(
+                cause=cause, evidence_authority=authority,
+            )
+            assert verdict["action"] == tfc.ACTION_MANAGER_JUDGMENT_UNKNOWN
+            assert verdict["provider_launched"] is False
+
+
+# --- the review finding this rework exists for ----------------------------- #
+#
+# ``failure_disposition_from_substatus`` computes ``substatus`` and then had two
+# sealed early returns -- the ``http_status`` branch and the ``_SEALED_CODE_OWNER``
+# branch -- that called ``_typed_disposition`` WITHOUT it. Since
+# ``candidate_bytes_preserved`` is decided by ``terminal_workspace_cleanup_allowed``,
+# which reads the terminal state, a ``launch_failed`` capacity or dependency
+# diagnostic reported preserved bytes for a workspace the sweep was allowed to
+# delete. Both branches now thread it, and these are the regressions.
+
+
+@pytest.mark.parametrize(
+    ("code", "cause"),
+    [
+        ("dependency_unavailable", "dependency_unavailable"),
+        ("route_unavailable", "dependency_unavailable"),
+        ("quota_exhausted", "provider_capacity"),
+        ("insufficient_quota", "provider_capacity"),
+    ],
+)
+def test_sealed_code_branch_threads_terminal_state_into_byte_preservation(code, cause):
+    swept = tfc.failure_disposition_from_substatus(
+        terminal_substatus="launch_failed", sealed_diagnostics=_sealed(code),
+    )
+    assert swept["cause"] == cause
+    # ``launch_failed`` + a non-credential class: the sweep IS allowed, so the
+    # bytes are gone and the disposition must say so.
+    assert tfc.terminal_workspace_cleanup_allowed(
+        terminal_state="launch_failed", failure_class=swept["failure_class"],
+    ) is True
+    assert swept["candidate_bytes_preserved"] is False
+    # Every other terminal state keeps the bytes, unchanged.
+    kept = tfc.failure_disposition_from_substatus(
+        terminal_substatus="worker_failed", sealed_diagnostics=_sealed(code),
+    )
+    assert kept["candidate_bytes_preserved"] is True
+
+
+@pytest.mark.parametrize("status", [401, 402, 403])
+def test_sealed_status_branch_threads_terminal_state_into_byte_preservation(status):
+    swept = tfc.failure_disposition_from_substatus(
+        terminal_substatus="launch_failed",
+        sealed_diagnostics=_sealed(http_status=status),
+    )
+    credential = swept["failure_class"] == tfc.FAILURE_CLASS_CREDENTIAL
+    # 402 is the $46.07 case: a credential outcome never sweeps, whatever state
+    # it landed on. 401/403 name no cause, so the sweep is allowed and the
+    # bytes really are gone.
+    assert swept["candidate_bytes_preserved"] is credential
+    assert swept["candidate_bytes_preserved"] is not tfc.terminal_workspace_cleanup_allowed(
+        terminal_state="launch_failed", failure_class=swept["failure_class"],
+    )
+
+
+def test_validation_only_replay_requires_the_bytes_it_would_replay():
+    kept = tfc.failure_disposition_from_substatus(
+        terminal_substatus="validation_failed",
+        manager_intent={
+            "owner": "manager", "authenticated": True,
+            "intent": "validation_environment",
+        },
+    )
+    assert kept["action"] == tfc.ACTION_VALIDATION_ONLY_REPLAY
+    assert kept["retry_scope"] == tfc.RETRY_SCOPE_VALIDATION_ONLY
+    assert kept["provider_launched"] is False
+    assert kept["candidate_bytes_preserved"] is True
+
+    swept = tfc.failure_disposition_from_substatus(
+        terminal_substatus="launch_failed",
+        manager_intent={
+            "owner": "manager", "authenticated": True,
+            "intent": "validation_environment",
+        },
+    )
+    assert swept["candidate_bytes_preserved"] is False
+    assert swept["action"] == tfc.ACTION_MANAGER_JUDGMENT_UNKNOWN
+    assert swept["provider_launched"] is False
+
+
+def test_only_an_authenticated_manager_intent_is_a_manager_intent():
+    for forged in (
+        None, "validation_environment", {"intent": "validation_environment"},
+        {"owner": "model", "authenticated": True, "intent": "validation_environment"},
+        {"owner": "manager", "authenticated": "yes", "intent": "validation_environment"},
+        {"owner": "manager", "authenticated": True, "intent": "candidate_code"},
+    ):
+        assert tfc.authenticated_manager_intent(forged) is None
+        verdict = tfc.failure_disposition_from_substatus(
+            terminal_substatus="worker_failed", manager_intent=forged,
+        )
+        assert verdict["evidence_authority"] != tfc.EVIDENCE_AUTHORITY_MANAGER_INTENT
+
+
+def test_same_route_retry_needs_a_sealed_reset_window_and_a_circuit_allowance():
+    capacity = tfc.failure_disposition_from_substatus(
+        terminal_substatus="worker_failed", refusal_kind="quota_exhausted",
+    )
+    assert capacity["action"] == tfc.ACTION_CAPACITY_HOLD
+    # Neither half alone.
+    assert tfc.same_route_retry_allowed(disposition=capacity) is False
+    assert tfc.same_route_retry_allowed(
+        disposition=capacity, circuit_allows=True,
+    ) is False
+    assert tfc.same_route_retry_allowed(
+        disposition=capacity, reset_evidence=_sealed(retry_after_seconds=60),
+    ) is False
+    # An UNSEALED reset window is not evidence at all.
+    assert tfc.same_route_retry_allowed(
+        disposition=capacity, circuit_allows=True,
+        reset_evidence={"owner": "model", "retry_after_seconds": 60},
+    ) is False
+    # Both halves, sealed.
+    assert tfc.same_route_retry_allowed(
+        disposition=capacity, circuit_allows=True,
+        reset_evidence=_sealed(retry_after_seconds=60),
+    ) is True
+    # And a credential hold can never satisfy it, however sealed the window.
+    credential = tfc.failure_disposition_from_substatus(
+        terminal_substatus="worker_failed", refusal_kind="credential_rejected",
+    )
+    assert tfc.same_route_retry_allowed(
+        disposition=credential, circuit_allows=True,
+        reset_evidence=_sealed(retry_after_seconds=60),
+    ) is False
+
+
+def test_distinct_route_retry_is_bounded_to_one_and_only_for_route_retry():
+    transient = tfc.failure_disposition_from_substatus(
+        terminal_substatus="worker_failed", refusal_kind="provider_unavailable",
+    )
+    assert tfc.distinct_route_retry_allowed(
+        disposition=transient, attempts_made=1,
+    ) is True
+    assert tfc.distinct_route_retry_allowed(
+        disposition=transient, attempts_made=tfc.MAX_DISTINCT_ROUTE_RETRIES + 1,
+    ) is False
+    assert tfc.distinct_route_retry_allowed(
+        disposition=transient, attempts_made=True,
+    ) is False
+    for substatus, refusal in (
+        ("worker_failed", "quota_exhausted"),
+        ("worker_failed", "credential_rejected"),
+        ("validation_failed", ""),
+        ("cancelled", ""),
+        ("worker_failed", ""),
+    ):
+        held = tfc.failure_disposition_from_substatus(
+            terminal_substatus=substatus, refusal_kind=refusal,
+        )
+        assert tfc.distinct_route_retry_allowed(
+            disposition=held, attempts_made=1,
+        ) is False
+
+
+def test_a_hold_is_released_only_by_an_exact_identity_change():
+    for refusal in ("credential_rejected", "quota_exhausted"):
+        held = tfc.failure_disposition_from_substatus(
+            terminal_substatus="worker_failed", refusal_kind=refusal,
+        )
+        assert tfc.hold_released(
+            disposition=held, held_identity="id-1", current_identity="id-1",
+        ) is False
+        assert tfc.hold_released(
+            disposition=held, held_identity="id-1", current_identity="",
+        ) is False
+        assert tfc.hold_released(
+            disposition=held, held_identity="id-1", current_identity="id-2",
+        ) is True
+    rework = tfc.failure_disposition_from_substatus(
+        terminal_substatus="validation_failed",
+    )
+    assert tfc.hold_released(
+        disposition=rework, held_identity="id-1", current_identity="id-2",
+    ) is False
+
+
+def test_cancellation_is_final_unless_a_new_authenticated_resume_exists():
+    cancelled = tfc.failure_disposition_from_substatus(terminal_substatus="cancelled")
+    assert cancelled["action"] == tfc.ACTION_CANCELLATION_FINAL
+    assert cancelled["provider_launched"] is False
+    assert tfc.cancellation_resume_allowed(
+        disposition=cancelled, resume_intent=None,
+    ) is False
+    assert tfc.cancellation_resume_allowed(
+        disposition=cancelled,
+        resume_intent={"owner": "manager", "authenticated": False, "intent": "resume"},
+    ) is False
+    assert tfc.cancellation_resume_allowed(
+        disposition=cancelled,
+        resume_intent={"owner": "manager", "authenticated": True, "intent": "resume"},
+    ) is True
+    # A resume intent cannot revive anything that was not cancelled.
+    worker_failed = tfc.failure_disposition_from_substatus(
+        terminal_substatus="worker_failed",
+    )
+    assert tfc.cancellation_resume_allowed(
+        disposition=worker_failed,
+        resume_intent={"owner": "manager", "authenticated": True, "intent": "resume"},
+    ) is False
+
+
+def test_telemetry_records_the_whole_decision_and_the_launches_it_avoided():
+    held = tfc.failure_disposition_from_substatus(
+        terminal_substatus="launch_failed", refusal_kind="credential_rejected",
+    )
+    record = tfc.disposition_telemetry(
+        held, hold_count=3, attempt_count=2, avoided_provider_launches=5,
+    )
+    assert record["cause"] == "provider_credential"
+    assert record["cause_owner"] == tfc.CAUSE_OWNER_PROVIDER_ACCOUNT
+    assert record["action"] == tfc.ACTION_CREDENTIAL_HOLD
+    assert record["retry_scope"] == tfc.RETRY_SCOPE_HOLD_UNTIL_CREDENTIAL_CHANGE
+    assert record["evidence_authority"] == tfc.EVIDENCE_AUTHORITY_PROVIDER_REFUSAL
+    assert record["provider_launched"] is False
+    assert record["candidate_bytes_preserved"] is True
+    assert record["hold_count"] == 3
+    assert record["attempt_count"] == 2
+    assert record["avoided_provider_launches"] == 5
+    # Counts are bounded and a bool is never a count.
+    junk = tfc.disposition_telemetry(
+        {}, hold_count=True, attempt_count=-4, avoided_provider_launches="9",
+    )
+    assert junk["hold_count"] == junk["attempt_count"] == 0
+    assert junk["avoided_provider_launches"] == 0
+    assert junk["action"] == tfc.ACTION_MANAGER_JUDGMENT_UNKNOWN
+    assert junk["cause"] == tfc.CAUSE_NOT_ESTABLISHED
+
+
+def test_no_sealed_or_intent_byte_reaches_the_typed_disposition():
+    secret = "sk-live-AKIAIOSFODNN7EXAMPLE"
+    verdict = tfc.failure_disposition_from_substatus(
+        terminal_substatus="worker_failed",
+        sealed_diagnostics=_sealed("quota_exhausted", message=secret, note=secret),
+        refusal_kind=secret,
+        reason=secret,
+        manager_intent={"owner": "manager", "authenticated": True, "intent": secret},
+    )
+    assert secret not in json.dumps(verdict)
+    assert verdict["cause"] == "provider_capacity"
+    assert verdict["provider_code"] in {"", *tfc._SEALED_CODE_OWNER}
+
+
+def test_the_legacy_failure_disposition_shape_is_unchanged_and_typed_on_top():
+    legacy_keys = {
+        "failure_class", "evidence", "provider_status", "provider_code", "envelope",
+    }
+    verdict = failure_disposition(refusal_kind="rate_limited")
+    assert legacy_keys <= set(verdict)
+    assert verdict["failure_class"] == "transient"
+    assert verdict["evidence"] == "refusal_kind=rate_limited"
+    # ... and the typed half agrees with it about the same event.
+    assert verdict["cause"] == "provider_capacity"
+    assert verdict["action"] == tfc.ACTION_CAPACITY_HOLD
+    assert verdict["provider_launched"] is False

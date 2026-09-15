@@ -21,6 +21,7 @@ from . import (
     sqlite_readonly,
     task_engine,
     task_store,
+    terminal_failure_classification,
     workforce_catalog,
     workforce_router,
 )
@@ -320,6 +321,166 @@ def mechanical_reviewer_failure_reason(status: Any) -> str:
     if state == "canceled":
         state = "cancelled"
     return f"{state}:{failure_class}"
+
+
+# --- typed mechanical recovery dispatch (NF-2026-00847) ------------------
+#
+# ``mechanical_reviewer_failure_reason`` above answers "what shall we RECORD",
+# and it keeps its bounded marker vocabulary because durable receipts and
+# operator views are pinned to it. It deliberately does NOT answer "what shall
+# we DO": its markers are read off a joined signal string, which is exactly the
+# prose-shaped evidence a recovery decision may never rest on.
+#
+# THE DISPATCH BELOW IS THAT SECOND ANSWER, and it has one source: the canonical
+# typed disposition in ``terminal_failure_classification``. Only a sealed
+# provider receipt, a refusal kind the provider boundary established, or a
+# reason AIWorkHub itself minted can name a cause here; everything else
+# resolves to ``manager_judgment_unknown`` and starts nothing.
+#
+# WHY THAT MATTERS HERE SPECIFICALLY. ``_launch_with_successor`` used to give
+# EVERY terminal route failure a second provider on a distinct route. A quota
+# wall, an expired credential, an unavailable dependency and a finalizer race
+# all bought a second reviewer launch that could not possibly succeed -- the
+# blind relaunch this card exists to remove.
+
+REVIEWER_RECOVERY_SCHEMA = "aiworkhub.review_orchestrator_recovery_dispatch.v1"
+
+
+def _structured_field(sources: tuple[Any, ...], key: str) -> str:
+    """First non-empty ``key`` across ordered structured mappings, else ``""``."""
+    for source in sources:
+        if not isinstance(source, Mapping):
+            continue
+        value = source.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def reviewer_terminal_disposition(status: Any) -> dict[str, Any]:
+    """Canonical typed disposition for one terminal reviewer/worker status.
+
+    Reads ONLY structured, system-owned fields: the process state, the card's
+    own terminal substatus, a provider-sealed diagnostic, the refusal kind the
+    provider boundary sealed, and the closed-vocabulary reason/diagnostic
+    ``terminal_event_authority`` minted. Reviewer, worker and manager prose is
+    never an input, so no model can talk its own card into a relaunch.
+    """
+    if not isinstance(status, Mapping):
+        return terminal_failure_classification.failure_disposition_from_substatus()
+    card = status.get("task_card")
+    card = card if isinstance(card, Mapping) else {}
+    latest = status.get("latest_event")
+    latest = latest if isinstance(latest, Mapping) else {}
+    terminal = card.get("terminal_failure")
+    terminal = terminal if isinstance(terminal, Mapping) else {}
+    evidence = terminal.get("evidence")
+    evidence = evidence if isinstance(evidence, Mapping) else {}
+
+    state = str(status.get("state") or "").strip().lower()
+    if state in {"", "blocked"}:
+        state = str(
+            card.get("terminal_substatus") or card.get("worker_status") or state
+        ).strip().lower()
+
+    sealed = None
+    for candidate in (
+        evidence.get("provider_error"), terminal.get("provider_error"),
+        latest.get("provider_error"), status.get("provider_error"),
+    ):
+        if terminal_failure_classification.sealed_provider_diagnostic(candidate):
+            sealed = candidate
+            break
+
+    sources = (evidence, terminal, latest, status)
+    return terminal_failure_classification.failure_disposition_from_substatus(
+        terminal_substatus=state,
+        sealed_diagnostics=sealed,
+        # ``error_code`` is the launcher's own closed-vocabulary field on a
+        # terminal receipt. It is read through the refusal-kind ALLOWLIST, so a
+        # value that vocabulary does not contain places nothing -- the field
+        # can select a known refusal, never synthesise one.
+        refusal_kind=(
+            _structured_field(sources, "refusal_kind")
+            or _structured_field(sources, "error_code")
+        ),
+        # ``error``/``diagnostic`` on a terminal event are already the
+        # classifier's own closed-vocabulary strings, never provider text --
+        # see ``terminal_failure_classification.terminal_event_authority``.
+        reason=(
+            _structured_field(sources, "reason")
+            or _structured_field(sources, "error")
+            or _structured_field(sources, "diagnostic")
+        ),
+    )
+
+
+# The actions after which ANOTHER reviewer attempt on this lens cannot help:
+# the candidate, the credential, the dependency, the bookkeeping or a manager
+# has to move first. ``route_retry`` and ``capacity_hold`` are deliberately
+# absent, because both really are answerable by a DISTINCT eligible route --
+# immediately for a provider-asserted transient, on a later reconcile pass for
+# capacity, and never on the same route before its reset.
+ROUTE_HOLD_ACTIONS: frozenset[str] = (
+    terminal_failure_classification.DISPOSITION_ACTIONS
+    - {
+        terminal_failure_classification.ACTION_ROUTE_RETRY,
+        terminal_failure_classification.ACTION_CAPACITY_HOLD,
+    }
+)
+
+# The retired attempt's own ``failure_reason`` carries the hold, so the decision
+# survives a process restart with no new table and no new column: the durable
+# row that already records WHY this route was retired now also records what the
+# typed disposition said to do about it.
+_ROUTE_HOLD_MARKER = ":hold="
+
+
+def route_attempt_hold(failure_reason: Any) -> str:
+    """The held ACTION recorded on a retired route attempt, or ``""``.
+
+    Only an action from :data:`ROUTE_HOLD_ACTIONS` is returned, so a reason
+    string carrying anything else -- including one written before this existed
+    -- reads as "not held" and keeps the previous behaviour exactly.
+    """
+    _head, separator, held = str(failure_reason or "").partition(_ROUTE_HOLD_MARKER)
+    if not separator:
+        return ""
+    return held if held in ROUTE_HOLD_ACTIONS else ""
+
+
+def reviewer_recovery_dispatch(
+    status: Any, *, attempts_made: int = 0, hold_count: int = 0,
+) -> dict[str, Any]:
+    """The ONE mechanical next step for a terminal reviewer attempt.
+
+    ``relaunch_distinct_route`` is true only for a route failure the PROVIDER
+    asserted, and only within the single bounded retry
+    ``terminal_failure_classification.MAX_DISTINCT_ROUTE_RETRIES`` allows.
+
+    ``route_hold`` is the stronger statement: no further reviewer attempt on
+    this lens can help at all. Capacity is the one action that is neither --
+    it spends nothing now and may take a distinct eligible route on a later
+    pass. The telemetry counts the provider launch each decision avoided.
+    """
+    disposition = reviewer_terminal_disposition(status)
+    action = terminal_failure_classification.disposition_action(disposition)
+    relaunch = terminal_failure_classification.distinct_route_retry_allowed(
+        disposition=disposition, attempts_made=attempts_made,
+    )
+    return {
+        "schema_id": REVIEWER_RECOVERY_SCHEMA,
+        "action": action,
+        "relaunch_distinct_route": relaunch,
+        "route_hold": action in ROUTE_HOLD_ACTIONS,
+        "disposition": dict(disposition),
+        "telemetry": terminal_failure_classification.disposition_telemetry(
+            disposition,
+            hold_count=hold_count,
+            attempt_count=attempts_made,
+            avoided_provider_launches=0 if relaunch else 1,
+        ),
+    }
 
 
 # --- mechanical short-circuit -------------------------------------------
@@ -1616,6 +1777,12 @@ class ReviewOrchestrator:
         attempts = self._route_attempts(action.chain_id, action.lens)
         if attempts and attempts[-1]["state"] != "retired":
             return attempts[-1]
+        held = route_attempt_hold(attempts[-1]["failure_reason"]) if attempts else ""
+        if held:
+            # The typed disposition of the last attempt says no reviewer route
+            # can settle this. Planning one anyway is the blind relaunch -- it
+            # just spends the next pass's provider instead of this one's.
+            raise RuntimeError("review_route_hold:" + held)
         attempt_index = len(attempts) + 1
         identity = action.descriptor["chain_identity"]
         reviewer_task_id = self._reviewer_task_id(
@@ -1707,9 +1874,22 @@ class ReviewOrchestrator:
                 for key, value in expected.items()
             ):
                 raise RuntimeError("reviewer_launch_terminal_identity_invalid")
-            if not self._retire_route_attempt(action, attempt, route_failure):
+            # The typed dispatch is computed off this exact synchronous receipt,
+            # so the successor decision below -- and every later pass, which
+            # reads the hold back out of the durable retirement reason -- share
+            # one disposition instead of each re-deriving their own.
+            dispatch = reviewer_recovery_dispatch(
+                result, attempts_made=int(attempt["attempt_index"]),
+            )
+            retirement = route_failure
+            if dispatch["route_hold"]:
+                retirement = f"{route_failure}{_ROUTE_HOLD_MARKER}{dispatch['action']}"
+            if not self._retire_route_attempt(action, attempt, retirement):
                 return None
-            return {"_route_terminal_failure": route_failure}
+            return {
+                "_route_terminal_failure": retirement,
+                "_route_dispatch": dispatch,
+            }
         self._require_ok(result, "reviewer_launch_failed")
         request_id = str(result.get("request_id") or "")
         if (
@@ -1728,7 +1908,16 @@ class ReviewOrchestrator:
     def _launch_with_successor(
         self, action: review_lifecycle.ReviewAction, attempt: Mapping[str, Any]
     ) -> tuple[dict[str, Any], dict[str, Any]] | None:
-        """Launch an attempt, advancing once when launch itself is terminal."""
+        """Launch an attempt, advancing once when the TYPED action allows it.
+
+        The successor launch is no longer automatic. It happens only when the
+        canonical disposition says this was a provider-asserted route failure
+        and the single bounded distinct-route retry is still unspent. A quota
+        wall, an expired credential, a missing dependency, a finalizer race, a
+        candidate defect and an unestablished cause each leave the retired
+        attempt where it is for a manager or a hold to settle -- none of them
+        can be fixed by spending a second reviewer on a different model.
+        """
         current = dict(attempt)
         for launch_index in range(2):
             result = self._launch_route_attempt(action, current)
@@ -1739,6 +1928,11 @@ class ReviewOrchestrator:
             if launch_index:
                 # The second exact route is already retired.  A later drain
                 # continues from that durable state instead of spinning here.
+                return None
+            dispatch = result.get("_route_dispatch")
+            if not isinstance(dispatch, Mapping) or (
+                dispatch.get("relaunch_distinct_route") is not True
+            ):
                 return None
             try:
                 current = self._plan_route_attempt(action)
@@ -1988,7 +2182,28 @@ class ReviewOrchestrator:
                     )
                 ):
                     raise RuntimeError("reviewer_terminal_route_binding_invalid")
-                if not self._retire_route_attempt(action, attempt, route_failure):
+                # Same typed gate as the launch path. A reviewer that RAN and
+                # died is the more expensive half of the measured waste: before
+                # this, EVERY terminal reviewer state bought a second reviewer
+                # on a distinct route, including the ones no route can fix.
+                dispatch = reviewer_recovery_dispatch(
+                    status, attempts_made=int(attempt["attempt_index"]),
+                )
+                retirement = route_failure
+                if dispatch["route_hold"]:
+                    retirement = (
+                        f"{route_failure}{_ROUTE_HOLD_MARKER}{dispatch['action']}"
+                    )
+                if not self._retire_route_attempt(action, attempt, retirement):
+                    return None
+                if dispatch["relaunch_distinct_route"] is not True:
+                    # The SAME bound _launch_with_successor applies, and this
+                    # path needs it stated explicitly: ``route_retry`` is not a
+                    # route hold, so once its single distinct-route retry is
+                    # spent nothing else stops this branch. The retired attempt
+                    # is re-read by every later drain pass, and each one would
+                    # plan and launch another reviewer. Hold on the durable
+                    # retirement instead; a manager or a reset moves it.
                     return None
                 try:
                     successor = self._plan_route_attempt(action)

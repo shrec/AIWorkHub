@@ -5880,6 +5880,11 @@ def reject_review(
         # itself failed. Keep that signal out of candidate-code learning, but
         # expose no general-purpose taxonomy override: only blocked tasks and
         # only the closed infrastructure vocabulary are accepted here.
+        #
+        # NF-2026-00847: that vocabulary is a PROJECTION of the canonical typed
+        # disposition's manager-intent causes, not a second hand-maintained
+        # list. An authenticated manager intent is one of the four evidence
+        # authorities allowed to select an action, and this is where it enters.
         if disposition != "blocked":
             return _lifecycle_error("failure_category_requires_blocked_disposition")
         try:
@@ -5887,10 +5892,8 @@ def reject_review(
         except ValueError:
             return _lifecycle_error("invalid_rejection_failure_category")
         allowed_categories = {
-            FailureCategory.VALIDATION_ENVIRONMENT,
-            FailureCategory.PROVIDER_RUNTIME,
-            FailureCategory.DEPENDENCY_OR_ROUTE,
-            FailureCategory.CANCELLATION_OR_TIMEOUT,
+            FailureCategory(value)
+            for value in terminal_failure_classification.MANAGER_REJECTION_INTENT_CAUSES
         }
         if requested_category not in allowed_categories:
             return _lifecycle_error("rejection_failure_category_not_infrastructure")

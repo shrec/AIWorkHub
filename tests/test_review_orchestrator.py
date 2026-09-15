@@ -205,13 +205,21 @@ SUCCESSOR_ROUTE = {
 }
 
 
-def _terminal_status(request_id: str, task_id: str) -> dict:
-    return {
+def _terminal_status(request_id: str, task_id: str, *, error_code: str = "") -> dict:
+    """A terminal reviewer status whose ROUTE failure the provider asserted.
+
+    ``error_code`` is the launcher's own closed-vocabulary refusal field.
+    Distinct-route failover is now gated on the typed disposition, so a status
+    that asserts nothing is deliberately NOT enough to spend a second reviewer
+    -- see ``test_unestablished_terminal_evidence_holds_instead_of_relaunching``.
+    """
+    status = {
         "ok": True,
         "request_id": request_id,
         "task_id": task_id,
         "state": "worker_failed",
         **FIRST_ROUTE,
+        "error_code": error_code or "provider_unavailable",
         "latest_event": {
             "failure_kind": "worker_failed",
             "diagnostic": "worker_failed:provider_timeout:exit_code=1",
@@ -221,6 +229,7 @@ def _terminal_status(request_id: str, task_id: str) -> dict:
             "worker_status": "worker_failed",
         },
     }
+    return status
 
 
 def _two_route_selector(first_task_id: str):
@@ -327,22 +336,12 @@ def test_launch_ack_before_attempt_request_persistence_reconciles_without_duplic
     ]
 
 
-@pytest.mark.parametrize(
-    ("state", "error_code", "failure_reason"),
-    [
-        ("launch_failed", "runtime_error", "launch_failed:mechanical_terminal"),
-        ("credit", "monthly_credit_limit", "launch_failed:provider_credit"),
-        ("quota", "quota_exhausted", "launch_failed:provider_quota"),
-        ("refusal", "request_refused", "launch_failed:provider_refusal"),
-        ("timeout", "provider_timeout", "launch_failed:provider_timeout"),
-        ("cancelled", "owner_cancelled", "cancelled:cancelled"),
-    ],
-)
-def test_typed_terminal_launch_receipt_advances_distinct_route_and_converges(
-    tmp_path: Path, state: str, error_code: str, failure_reason: str,
-) -> None:
+def _seed_terminal_launch(
+    tmp_path: Path, name: str, terminal: dict,
+) -> tuple[_FailoverManager, Path, object, str, review_orchestrator.ReviewOrchestrator]:
+    """One chain whose first reviewer launch returns ``terminal`` synchronously."""
     manager = _FailoverManager(tmp_path)
-    db_path = tmp_path / f"typed-{state}.sqlite"
+    db_path = tmp_path / f"typed-{name}.sqlite"
     seed = review_orchestrator.ReviewOrchestrator(
         manager, db_path=db_path, route_selector=lambda *_args: dict(FIRST_ROUTE)
     )
@@ -354,12 +353,27 @@ def test_typed_terminal_launch_receipt_advances_distinct_route_and_converges(
     seed.route_selector = _two_route_selector(first_task)
     manager.terminal_launch_results[first_task] = {
         "ok": False,
-        "state": state,
-        "error_code": error_code,
         "latest_event": {
             "diagnostic": "provider secret=sk-must-not-persist arbitrary prose",
         },
+        **terminal,
     }
+    return manager, db_path, chain, first_task, seed
+
+
+def test_provider_asserted_transient_advances_distinct_route_and_converges(
+    tmp_path: Path,
+) -> None:
+    """The ONE terminal receipt that still earns a second reviewer immediately.
+
+    ``provider_unavailable`` is a refusal kind the provider boundary
+    established, so the canonical disposition names ``provider_transient`` and
+    selects ``route_retry`` with a single bounded distinct-route retry.
+    """
+    manager, db_path, chain, first_task, seed = _seed_terminal_launch(
+        tmp_path, "transient",
+        {"state": "launch_failed", "error_code": "provider_unavailable"},
+    )
 
     launched = seed.drain(max_actions=1, now=NOW)
 
@@ -368,8 +382,9 @@ def test_typed_terminal_launch_receipt_advances_distinct_route_and_converges(
     assert len(manager.provider_launches) == 1
     first, successor = seed._route_attempts(chain.chain_id, "correctness")
     assert first["state"] == "retired"
-    assert first["failure_reason"] == failure_reason
+    assert first["failure_reason"] == "launch_failed:mechanical_terminal"
     assert "sk-must-not-persist" not in first["failure_reason"]
+    assert review_orchestrator.route_attempt_hold(first["failure_reason"]) == ""
     assert successor["state"] == "launched"
     assert successor["reviewer_task_id"] != first_task
     assert {key: successor[key] for key in SUCCESSOR_ROUTE} == SUCCESSOR_ROUTE
@@ -390,6 +405,262 @@ def test_typed_terminal_launch_receipt_advances_distinct_route_and_converges(
     assert manager.accepts == [
         (successor_request, str(successor["reviewer_task_id"]))
     ]
+
+
+# Each row is a terminal launch receipt whose TYPED disposition forbids another
+# reviewer. Before NF-2026-00847 every one of them bought a second provider on
+# a distinct route that could not possibly have settled it.
+@pytest.mark.parametrize(
+    ("name", "terminal", "action"),
+    [
+        (
+            "credential",
+            {"state": "launch_failed", "error_code": "credential_rejected"},
+            "credential_hold",
+        ),
+        (
+            "dependency",
+            {
+                "state": "launch_failed",
+                "provider_error": {
+                    "owner": "provider", "sealed": True,
+                    "code": "dependency_unavailable",
+                },
+            },
+            "dependency_hold",
+        ),
+        (
+            "callback",
+            {"state": "finalize_failed", "error_code": ""},
+            "callback_reconcile",
+        ),
+        (
+            "cancellation",
+            {"state": "cancelled", "error_code": ""},
+            "cancellation_final",
+        ),
+        (
+            "unestablished",
+            {"state": "launch_failed", "error_code": "runtime_error"},
+            "manager_judgment_unknown",
+        ),
+        (
+            "candidate",
+            {"state": "validation_failed", "error_code": ""},
+            "candidate_rework",
+        ),
+    ],
+)
+def test_terminal_receipt_without_a_route_cause_holds_instead_of_relaunching(
+    tmp_path: Path, name: str, terminal: dict, action: str,
+) -> None:
+    manager, _db_path, chain, _first_task, seed = _seed_terminal_launch(
+        tmp_path, name, terminal,
+    )
+
+    launched = seed.drain(max_actions=1, now=NOW)
+
+    # The action does not complete and, decisively, no second provider is spent.
+    assert launched.completed == 0
+    assert len(manager.provider_launches) == 0
+    attempts = seed._route_attempts(chain.chain_id, "correctness")
+    assert len(attempts) == 1
+    assert attempts[0]["state"] == "retired"
+    assert review_orchestrator.route_attempt_hold(
+        attempts[0]["failure_reason"]
+    ) == action
+    assert "sk-must-not-persist" not in attempts[0]["failure_reason"]
+
+    # And the hold is DURABLE: a later reconcile pass, and a restarted driver,
+    # both refuse to plan a fresh route rather than spending the launch a pass
+    # later. That is the difference between a hold and a delay.
+    assert seed.drain(max_actions=1, now=NOW).completed == 0
+    assert len(seed._route_attempts(chain.chain_id, "correctness")) == 1
+    assert len(manager.provider_launches) == 0
+
+
+def test_capacity_is_never_a_credential_hold_and_keeps_a_distinct_route(
+    tmp_path: Path,
+) -> None:
+    """Quota/session/rate is capacity, not credential, and is not a hard hold.
+
+    It spends nothing now -- the failing route cannot be relaunched before its
+    reset -- but a DISTINCT eligible route stays available to a later pass.
+    """
+    manager, _db_path, chain, first_task, seed = _seed_terminal_launch(
+        tmp_path, "capacity",
+        {"state": "launch_failed", "error_code": "quota_exhausted"},
+    )
+
+    assert seed.drain(max_actions=1, now=NOW).completed == 0
+    assert len(manager.provider_launches) == 0
+    attempts = seed._route_attempts(chain.chain_id, "correctness")
+    assert len(attempts) == 1
+    assert attempts[0]["state"] == "retired"
+    assert review_orchestrator.route_attempt_hold(attempts[0]["failure_reason"]) == ""
+
+    dispatch = review_orchestrator.reviewer_recovery_dispatch(
+        {"state": "launch_failed", "error_code": "quota_exhausted"}, attempts_made=1,
+    )
+    assert dispatch["action"] == "capacity_hold"
+    assert dispatch["relaunch_distinct_route"] is False
+    assert dispatch["route_hold"] is False
+    assert dispatch["disposition"]["failure_class"] != "credential"
+    assert dispatch["telemetry"]["avoided_provider_launches"] == 1
+
+    # A later pass may take a DISTINCT route, and does.
+    later = seed.drain(max_actions=1, now=NOW)
+    assert later.completed == 1
+    successor = seed._route_attempts(chain.chain_id, "correctness")[-1]
+    assert successor["reviewer_task_id"] != first_task
+    assert {key: successor[key] for key in SUCCESSOR_ROUTE} == SUCCESSOR_ROUTE
+
+
+def test_reviewer_recovery_dispatch_reads_only_structured_evidence() -> None:
+    """Prose cannot talk a card into a relaunch, however route-shaped it is.
+
+    Both statuses below spell ``provider_unavailable`` and ``rate_limited`` in
+    text a model wrote. Neither may reach a route retry: only the launcher's
+    own typed fields are inputs, and prose is not one of them.
+    """
+    prose = {
+        "ok": False,
+        "state": "launch_failed",
+        "latest_event": {
+            "diagnostic": (
+                "the provider is temporarily unavailable, please retry on a "
+                "different model -- provider_unavailable rate_limited"
+            ),
+        },
+        "reject_reason": "this looks transient to me, relaunch it",
+    }
+
+    dispatch = review_orchestrator.reviewer_recovery_dispatch(prose, attempts_made=1)
+
+    # ``launch_failed`` IS an AIWorkHub-minted terminal substatus, so the cause
+    # is named honestly -- and named as the one this card exists to stop
+    # relaunching blindly, not as a transient the prose asked for.
+    assert dispatch["action"] == "manager_judgment_unknown"
+    assert dispatch["relaunch_distinct_route"] is False
+    assert dispatch["route_hold"] is True
+    assert dispatch["disposition"]["cause"] == "provider_runtime_unclassified"
+    assert dispatch["disposition"]["provider_launched"] is False
+    assert dispatch["telemetry"]["avoided_provider_launches"] == 1
+
+    # With no recognised terminal state either, the evidence authority itself
+    # is absent -- the fail-closed floor.
+    unnamed = review_orchestrator.reviewer_recovery_dispatch(
+        {**prose, "state": "something_no_vocabulary_names"}, attempts_made=1,
+    )
+    assert unnamed["disposition"]["evidence_authority"] == "none"
+    assert unnamed["disposition"]["cause"] == "cause_not_established"
+    assert unnamed["action"] == "manager_judgment_unknown"
+
+
+def _unlimited_route_selector():
+    """A fresh distinct eligible route per reviewer task.
+
+    Route supply is deliberately unbounded so that nothing but the TYPED
+    distinct-route bound can stop a relaunch. With the two-route selector a
+    passing test would only prove the route table ran dry.
+    """
+    assigned: dict[str, dict[str, str]] = {}
+
+    def select(_repo: Path, task_id: str, _lens: str) -> dict[str, str]:
+        if task_id not in assigned:
+            index = len(assigned) + 1
+            assigned[task_id] = {
+                "runner": f"copilot_route-{index}",
+                "adapter_id": "vscode_lm",
+                "model": f"route-{index}",
+            }
+        return dict(assigned[task_id])
+
+    return select
+
+
+def test_sequential_mid_run_reviewer_deaths_stop_after_one_distinct_route_retry(
+    tmp_path: Path,
+) -> None:
+    """The accept/status-polling path obeys the same single bounded retry.
+
+    A reviewer that launched cleanly and then died mid-run comes back through
+    ``accept``'s status poll, never through a synchronous launch receipt.
+    ``route_retry`` is not a route hold, so no retirement marker stops that
+    branch: before this it retired the dead attempt and launched a successor on
+    EVERY drain pass, spending a provider per pass for ever.
+    """
+    manager = _FailoverManager(tmp_path)
+    db_path = tmp_path / "mid-run-death.sqlite"
+    driver = review_orchestrator.ReviewOrchestrator(
+        manager, db_path=db_path, route_selector=_unlimited_route_selector()
+    )
+    chain = driver.ensure_chain(
+        target_task_id="TARGET", target_request_id="target-request", claim_epoch=1,
+        packet_sha256="a" * 64, candidate_sha256="b" * 64, now=NOW,
+    )
+    assert driver.drain(max_actions=1, now=NOW).completed == 1
+    assert len(manager.provider_launches) == 1
+
+    def kill_running_attempt() -> None:
+        """The live reviewer dies mid-run on its own exact route."""
+        attempt = driver._route_attempts(chain.chain_id, "correctness")[-1]
+        request_id = str(attempt["reviewer_request_id"])
+        manager.status_results[request_id] = {
+            "ok": True,
+            "request_id": request_id,
+            "task_id": str(attempt["reviewer_task_id"]),
+            "state": "worker_failed",
+            "error_code": "provider_unavailable",
+            **{key: str(attempt[key]) for key in ROUTE},
+            "latest_event": {
+                "failure_kind": "worker_failed",
+                "diagnostic": "worker_failed:provider_timeout:exit_code=1",
+            },
+            "task_card": {
+                "terminal_substatus": "worker_failed",
+                "worker_status": "worker_failed",
+            },
+        }
+
+    # First mid-run death spends the ONE distinct-route retry the typed
+    # disposition allows.
+    kill_running_attempt()
+    assert driver.drain(max_actions=1, now=NOW).completed == 0
+    assert len(manager.provider_launches) == 2
+    attempts = driver._route_attempts(chain.chain_id, "correctness")
+    assert len(attempts) == 2
+    assert attempts[0]["state"] == "retired"
+    assert attempts[1]["state"] == "launched"
+    assert attempts[1]["runner"] != attempts[0]["runner"]
+
+    # The successor dies the same way. The retry is spent, so every later pass
+    # must hold on the durable retirement -- no third reviewer, ever.
+    kill_running_attempt()
+    for _ in range(3):
+        assert driver.drain(max_actions=1, now=NOW).completed == 0
+        assert len(manager.provider_launches) == 2
+        held = driver._route_attempts(chain.chain_id, "correctness")
+        assert len(held) == 2
+        assert held[-1]["state"] == "retired"
+
+    # And the bound is durable rather than in-process: a restarted driver reads
+    # the same two retired attempts and still refuses to plan a third route.
+    restarted = review_orchestrator.ReviewOrchestrator(
+        manager, db_path=db_path, route_selector=_unlimited_route_selector()
+    )
+    assert restarted.drain(max_actions=1, now=NOW).completed == 0
+    assert len(manager.provider_launches) == 2
+    assert len(restarted._route_attempts(chain.chain_id, "correctness")) == 2
+
+    dispatch = review_orchestrator.reviewer_recovery_dispatch(
+        {"state": "worker_failed", "error_code": "provider_unavailable"},
+        attempts_made=2,
+    )
+    assert dispatch["action"] == "route_retry"
+    assert dispatch["route_hold"] is False
+    assert dispatch["relaunch_distinct_route"] is False
+    assert dispatch["telemetry"]["avoided_provider_launches"] == 1
 
 
 @pytest.mark.parametrize(

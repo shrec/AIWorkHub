@@ -15,6 +15,8 @@ from aiworkhub.learning_commit import (
     validate_repo_match,
     learning_commit_from_dict,
 )
+from aiworkhub import learning_commit
+from aiworkhub import terminal_failure_classification as tfc
 from aiworkhub.evidence_levels import (
     InvalidReferenceSchemeError,
     EmptyReferencePathError,
@@ -550,6 +552,144 @@ class TestCanonicalFailureTaxonomy:
             sealed_diagnostics="insufficient_balance http_status=402",  # type: ignore[arg-type]
         )
         assert result is FailureCategory.CANDIDATE_CODE
+
+
+class TestFailureCategoryIsAProjectionNotATaxonomy:
+    """NF-2026-00847: the learning schema stays; its own inference table goes.
+
+    Learning Commit used to hold a second, independently-maintained set of
+    substatus groups and sealed provider-code sets. Two tables answering "what
+    kind of failure was this" could disagree about one card, which is exactly
+    what happened. These tests pin that the enum, its seven values and every
+    category this function returns are unchanged, and that the ANSWER now comes
+    from the canonical typed disposition.
+    """
+
+    def test_every_category_is_projected_from_a_canonical_cause(self):
+        projected = set(tfc._CAUSE_FAILURE_CATEGORY.values())
+        assert projected == {category.value for category in FailureCategory}
+
+    def test_the_substatus_vocabulary_is_the_canonical_one(self):
+        assert learning_commit._CODE_QUALITY_TERMINAL_SUBSTATUSES is (
+            tfc.CANDIDATE_TERMINAL_SUBSTATUSES
+        )
+        assert learning_commit._PROVIDER_RUNTIME_TERMINAL_SUBSTATUSES is (
+            tfc.PROVIDER_RUNTIME_TERMINAL_SUBSTATUSES
+        )
+        assert learning_commit._CANCELLATION_TERMINAL_SUBSTATUSES is (
+            tfc.CANCELLATION_TERMINAL_SUBSTATUSES
+        )
+        assert learning_commit._POLICY_TERMINAL_SUBSTATUSES is (
+            tfc.POLICY_TERMINAL_SUBSTATUSES
+        )
+        assert INFRASTRUCTURE_FAILURE_CATEGORIES.isdisjoint(
+            CODE_QUALITY_FAILURE_CATEGORIES
+        )
+
+    def test_the_seal_check_is_the_canonical_one(self):
+        assert learning_commit._sealed_provider_diagnostic is not None
+        sealed = {"owner": "provider", "sealed": True, "code": "quota_exhausted"}
+        assert learning_commit._sealed_provider_diagnostic(sealed) is sealed
+        for forged in (
+            None, "quota_exhausted", {"code": "quota_exhausted"},
+            {"owner": "model", "sealed": True, "code": "quota_exhausted"},
+            {"owner": "provider", "sealed": "yes", "code": "quota_exhausted"},
+        ):
+            assert learning_commit._sealed_provider_diagnostic(forged) is None
+
+    @pytest.mark.parametrize(
+        ("substatus", "sealed", "expected"),
+        [
+            ("validation_failed", None, FailureCategory.CANDIDATE_CODE),
+            ("review_ready", None, FailureCategory.CANDIDATE_CODE),
+            ("finalize_failed", None, FailureCategory.VALIDATION_ENVIRONMENT),
+            ("launch_failed", None, FailureCategory.PROVIDER_RUNTIME),
+            ("worker_failed", None, FailureCategory.PROVIDER_RUNTIME),
+            ("process_lost", None, FailureCategory.PROVIDER_RUNTIME),
+            ("liveness_lost", None, FailureCategory.PROVIDER_RUNTIME),
+            ("output_budget_exceeded", None, FailureCategory.POLICY_OR_SCOPE),
+            ("timed_out", None, FailureCategory.CANCELLATION_OR_TIMEOUT),
+            ("cancelled", None, FailureCategory.CANCELLATION_OR_TIMEOUT),
+            ("", None, FailureCategory.INCONCLUSIVE),
+            ("never_seen_before", None, FailureCategory.INCONCLUSIVE),
+            # Quota and balance were ONE sealed set before, and both still
+            # project to provider_runtime -- but the canonical classifier now
+            # tells them apart underneath, because only one of them is a
+            # credential the owner has to renew.
+            (
+                "worker_failed", {"code": "quota_exhausted"},
+                FailureCategory.PROVIDER_RUNTIME,
+            ),
+            (
+                "worker_failed", {"code": "insufficient_balance"},
+                FailureCategory.PROVIDER_RUNTIME,
+            ),
+            (
+                "review_ready", {"code": "route_unavailable"},
+                FailureCategory.DEPENDENCY_OR_ROUTE,
+            ),
+            (
+                "review_ready", {"http_status": 402},
+                FailureCategory.PROVIDER_RUNTIME,
+            ),
+        ],
+    )
+    def test_projection_agrees_with_the_canonical_disposition(
+        self, substatus, sealed, expected,
+    ):
+        diagnostics = (
+            {"owner": "provider", "sealed": True, **sealed} if sealed else None
+        )
+        assert classify_failure_category(
+            terminal_substatus=substatus, sealed_diagnostics=diagnostics,
+        ) is expected
+        disposition = tfc.failure_disposition_from_substatus(
+            terminal_substatus=substatus, sealed_diagnostics=diagnostics,
+        )
+        assert tfc.failure_category_projection(disposition) == expected.value
+
+    def test_quota_and_balance_are_the_same_category_and_different_actions(self):
+        capacity = tfc.failure_disposition_from_substatus(
+            terminal_substatus="worker_failed",
+            sealed_diagnostics={
+                "owner": "provider", "sealed": True, "code": "quota_exhausted",
+            },
+        )
+        credential = tfc.failure_disposition_from_substatus(
+            terminal_substatus="worker_failed",
+            sealed_diagnostics={
+                "owner": "provider", "sealed": True, "code": "insufficient_balance",
+            },
+        )
+        assert tfc.failure_category_projection(capacity) == (
+            tfc.failure_category_projection(credential)
+        )
+        assert capacity["action"] == tfc.ACTION_CAPACITY_HOLD
+        assert credential["action"] == tfc.ACTION_CREDENTIAL_HOLD
+        assert capacity["failure_class"] != credential["failure_class"]
+        assert capacity["provider_launched"] is False
+        assert credential["provider_launched"] is False
+
+    def test_an_unplaced_disposition_never_invents_a_category(self):
+        for junk in (None, {}, {"cause": "not_a_cause"}, "candidate_code"):
+            assert tfc.failure_category_projection(junk) == (
+                FailureCategory.INCONCLUSIVE.value
+            )
+
+    def test_manager_rejection_override_set_is_the_canonical_projection(self):
+        allowed = {
+            FailureCategory(value)
+            for value in tfc.MANAGER_REJECTION_INTENT_CAUSES
+        }
+        assert allowed == {
+            FailureCategory.VALIDATION_ENVIRONMENT,
+            FailureCategory.PROVIDER_RUNTIME,
+            FailureCategory.DEPENDENCY_OR_ROUTE,
+            FailureCategory.CANCELLATION_OR_TIMEOUT,
+        }
+        # An infrastructure override is never a candidate-code verdict.
+        assert allowed <= INFRASTRUCTURE_FAILURE_CATEGORIES
+        assert allowed.isdisjoint(CODE_QUALITY_FAILURE_CATEGORIES)
 
 
 class TestFailureCategoryOnLearningCommit:

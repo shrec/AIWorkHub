@@ -330,6 +330,52 @@ def test_a_credential_failure_never_sweeps_the_workspace():
         ) is False
 
 
+@pytest.mark.parametrize(
+    ("code", "swept"),
+    [
+        # Capacity and dependency are NOT credential, so a ``launch_failed``
+        # sweep is allowed and the bytes really are gone. The disposition has
+        # to say so: reporting preserved bytes for a deleted workspace sends
+        # the next step to replay something that is no longer there.
+        ("dependency_unavailable", True),
+        ("route_unavailable", True),
+        ("quota_exhausted", True),
+        ("insufficient_quota", True),
+        # Only added credit clears this one, so the finished work must survive.
+        ("insufficient_balance", False),
+        ("balance_exhausted", False),
+    ],
+)
+def test_launch_failed_sealed_diagnostic_reports_byte_preservation_truthfully(
+    code: str, swept: bool,
+) -> None:
+    """Regression: both sealed early returns must carry the terminal state.
+
+    ``failure_disposition_from_substatus`` computes the substatus and then
+    returns early on a sealed ``http_status`` or a sealed machine code. Those
+    two branches once called the disposition builder without it, so every
+    ``launch_failed`` capacity/dependency diagnostic claimed
+    ``candidate_bytes_preserved`` while ``terminal_workspace_cleanup_allowed``
+    was already permitting the sweep.
+    """
+    disposition = tfc.failure_disposition_from_substatus(
+        terminal_substatus="launch_failed",
+        sealed_diagnostics={"owner": "provider", "sealed": True, "code": code},
+    )
+    assert disposition["candidate_bytes_preserved"] is not swept
+    assert tfc.terminal_workspace_cleanup_allowed(
+        terminal_state="launch_failed",
+        failure_class=disposition["failure_class"],
+    ) is swept
+    # The same sealed code on a state that never sweeps keeps the bytes.
+    kept = tfc.failure_disposition_from_substatus(
+        terminal_substatus="worker_failed",
+        sealed_diagnostics={"owner": "provider", "sealed": True, "code": code},
+    )
+    assert kept["candidate_bytes_preserved"] is True
+    assert kept["provider_launched"] is False
+
+
 # --- the transient transition ---------------------------------------------- #
 
 RUNNER = "codex_cli"

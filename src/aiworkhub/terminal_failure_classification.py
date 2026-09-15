@@ -1645,14 +1645,14 @@ def disposition_for_reason(reason: str | None) -> str:
     return REASON_DISPOSITION.get(token, FAILURE_CLASS_UNKNOWN)
 
 
-def failure_disposition(
+def _legacy_failure_disposition(
     *,
     refusal_kind: str | None = None,
     reason: str | None = None,
     stdout_tail: str | None = None,
     stderr_tail: str | None = None,
 ) -> dict[str, Any]:
-    """Name the class of one terminal failure, and the evidence that named it.
+    """The R4 three-way class and the evidence string that named it.
 
     PRECEDENCE, and why. A refusal kind already established at the provider
     boundary is read first: ``process_launcher`` held the provider's response
@@ -1663,6 +1663,9 @@ def failure_disposition(
     the first two left unplaced.
 
     ``evidence`` is assembled from module constants and a bounded int only.
+    Kept as its own function so the legacy fields every existing reader pins
+    are produced by exactly the code that always produced them, and the typed
+    disposition is layered on top rather than reimplementing them.
     """
     kind = str(refusal_kind or "").strip().lower()
     if kind in REFUSAL_KIND_DISPOSITION:
@@ -1729,6 +1732,59 @@ def failure_disposition(
     }
 
 
+def failure_disposition(
+    *,
+    refusal_kind: str | None = None,
+    reason: str | None = None,
+    stdout_tail: str | None = None,
+    stderr_tail: str | None = None,
+    terminal_state: str | None = None,
+) -> dict[str, Any]:
+    """Name the class of one terminal failure, the typed action it selects, and
+    the evidence that named both.
+
+    The legacy ``failure_class``/``evidence``/``provider_*``/``envelope`` fields
+    are byte-identical to what this function has always returned; the typed
+    fields (``cause``/``cause_owner``/``action``/``retry_scope``/
+    ``provider_launched``/``candidate_bytes_preserved``/
+    ``evidence_authority``) are the canonical disposition projected off the
+    SAME resolved evidence, so a reader of either half can never disagree with
+    a reader of the other.
+    """
+    legacy = _legacy_failure_disposition(
+        refusal_kind=refusal_kind,
+        reason=reason,
+        stdout_tail=stdout_tail,
+        stderr_tail=stderr_tail,
+    )
+    cause, authority = _tail_cause(
+        evidence=str(legacy["evidence"]),
+        provider_code=str(legacy["provider_code"]),
+        provider_status=legacy["provider_status"],
+    )
+    if cause == CAUSE_NOT_ESTABLISHED:
+        # The tail named nothing. A reason or a terminal state this repository
+        # minted may still name the cause -- that is structured evidence, not
+        # prose, and leaving it unread is how ``not_processing`` used to become
+        # a blind relaunch.
+        fallback = failure_disposition_from_substatus(
+            terminal_substatus=terminal_state, reason=reason,
+        )
+        cause = str(fallback["cause"])
+        authority = str(fallback["evidence_authority"])
+    typed = _typed_disposition(
+        cause=cause,
+        evidence_authority=authority,
+        evidence=str(legacy["evidence"]),
+        terminal_state=terminal_state,
+        failure_class=str(legacy["failure_class"]),
+        provider_status=legacy["provider_status"],
+        provider_code=str(legacy["provider_code"]),
+        envelope=str(legacy["envelope"]),
+    )
+    return {**typed, **legacy}
+
+
 def failure_disposition_from_paths(
     *,
     state: str | None,
@@ -1741,11 +1797,24 @@ def failure_disposition_from_paths(
     """``failure_disposition`` over the same bounded log tails the classifier reads.
 
     A cancelled or verdict-free outcome is never dispositioned: there is no
-    failure to retry, pause a lane for, or blame on the card.
+    failure to retry, pause a lane for, or blame on the card. It still carries
+    the typed shape, so a dispatcher never has to special-case a missing key --
+    a cancelled outcome is ``cancellation_final`` and a verdict-free one is
+    ``manager_judgment_unknown``, and neither starts a provider.
     """
     state_norm = str(state or "").strip().lower()
     if cancelled or state_norm in _NO_VERDICT_STATES:
+        typed = _typed_disposition(
+            cause=(
+                CAUSE_CANCELLED if cancelled or state_norm in _CANCELLED_STATES
+                else CAUSE_NOT_ESTABLISHED
+            ),
+            evidence_authority=EVIDENCE_AUTHORITY_AIWORKHUB_REASON,
+            evidence="no_failure_verdict",
+            terminal_state=state_norm,
+        )
         return {
+            **typed,
             "failure_class": FAILURE_CLASS_UNKNOWN,
             "evidence": "no_failure_verdict",
             "provider_status": None,
@@ -1757,6 +1826,7 @@ def failure_disposition_from_paths(
         reason=error,
         stdout_tail=_read_log_tail(stdout_path),
         stderr_tail=_read_log_tail(stderr_path),
+        terminal_state=state,
     )
 
 
@@ -1783,3 +1853,779 @@ def terminal_workspace_cleanup_allowed(
     if str(terminal_state or "").strip().lower() != "launch_failed":
         return False
     return str(failure_class or "") != FAILURE_CLASS_CREDENTIAL
+
+
+# --------------------------------------------------------------------------- #
+# THE CANONICAL TYPED DISPOSITION (NF-2026-00847).
+#
+# THE PROBLEM THIS CLOSES. Three independent taxonomies answered "what do we do
+# now" about the same terminal event and could not agree: R4's three-way
+# ``failure_class`` above, ``learning_commit.FailureCategory``'s seven-way
+# learning taxonomy, and ``review_orchestrator``'s marker-scan reviewer class.
+# Each inferred its own answer from its own table, so a card could be a
+# ``transient`` here, a ``candidate_code`` there, and a ``provider_quota``
+# relaunch in the third -- and the third one spent a provider.
+#
+# WHAT REPLACES THEM. One typed disposition carrying eight stable fields:
+#
+#   failure_class            the R4 three-way, kept so no external schema breaks
+#   cause_owner              WHO the evidence says owns the failure
+#   cause                    the closed cause constant the evidence named
+#   action                   the ONE mechanical next step
+#   retry_scope              what that step is allowed to re-run
+#   provider_launched        whether the action starts a provider process
+#   candidate_bytes_preserved whether the attempt's bytes are still on disk
+#   evidence_authority       WHICH trusted channel named the cause
+#
+# THE ADMISSION RULE. An automatic action may only be selected by a typed
+# provider refusal/envelope, a reason AIWorkHub itself minted, a sealed
+# validation/toolchain/callback receipt, or an authenticated manager intent.
+# Anything else -- worker prose, reviewer prose, manager prose, a bare exit
+# code, an unmatched terminal state -- resolves to ``manager_judgment_unknown``
+# and launches nothing. ``_typed_disposition`` enforces that centrally rather
+# than trusting each call site to remember it.
+# --------------------------------------------------------------------------- #
+
+DISPOSITION_SCHEMA_ID = "aiworkhub.terminal_failure_disposition.v1"
+
+CAUSE_OWNER_CANDIDATE = "candidate"
+CAUSE_OWNER_PROVIDER_ROUTE = "provider_route"
+CAUSE_OWNER_PROVIDER_ACCOUNT = "provider_account"
+CAUSE_OWNER_VALIDATION_ENVIRONMENT = "validation_environment"
+CAUSE_OWNER_DEPENDENCY = "dependency"
+CAUSE_OWNER_CONTROL_PLANE = "control_plane"
+CAUSE_OWNER_MANAGER = "manager"
+CAUSE_OWNER_UNKNOWN = "unknown"
+
+CAUSE_OWNERS: frozenset[str] = frozenset({
+    CAUSE_OWNER_CANDIDATE, CAUSE_OWNER_PROVIDER_ROUTE,
+    CAUSE_OWNER_PROVIDER_ACCOUNT, CAUSE_OWNER_VALIDATION_ENVIRONMENT,
+    CAUSE_OWNER_DEPENDENCY, CAUSE_OWNER_CONTROL_PLANE, CAUSE_OWNER_MANAGER,
+    CAUSE_OWNER_UNKNOWN,
+})
+
+ACTION_CANDIDATE_REWORK = "candidate_rework"
+ACTION_VALIDATION_ONLY_REPLAY = "validation_only_replay"
+ACTION_DEPENDENCY_HOLD = "dependency_hold"
+ACTION_CALLBACK_RECONCILE = "callback_reconcile"
+ACTION_ROUTE_RETRY = "route_retry"
+ACTION_CAPACITY_HOLD = "capacity_hold"
+ACTION_CREDENTIAL_HOLD = "credential_hold"
+ACTION_CANCELLATION_FINAL = "cancellation_final"
+ACTION_MANAGER_JUDGMENT_UNKNOWN = "manager_judgment_unknown"
+
+DISPOSITION_ACTIONS: frozenset[str] = frozenset({
+    ACTION_CANDIDATE_REWORK, ACTION_VALIDATION_ONLY_REPLAY,
+    ACTION_DEPENDENCY_HOLD, ACTION_CALLBACK_RECONCILE, ACTION_ROUTE_RETRY,
+    ACTION_CAPACITY_HOLD, ACTION_CREDENTIAL_HOLD, ACTION_CANCELLATION_FINAL,
+    ACTION_MANAGER_JUDGMENT_UNKNOWN,
+})
+
+# The ONLY two actions that may start a provider process. Every other action is
+# a hold, a replay of bytes already on disk, or a control-plane reconciliation,
+# and starting a provider for one of those is the exact waste R4 measured.
+PROVIDER_LAUNCHING_ACTIONS: frozenset[str] = frozenset({
+    ACTION_CANDIDATE_REWORK, ACTION_ROUTE_RETRY,
+})
+
+RETRY_SCOPE_NONE = "none"
+RETRY_SCOPE_CANDIDATE_REWORK = "candidate_rework"
+RETRY_SCOPE_VALIDATION_ONLY = "validation_only"
+RETRY_SCOPE_DISTINCT_ROUTE = "distinct_route"
+RETRY_SCOPE_CALLBACK_ONLY = "callback_only"
+RETRY_SCOPE_HOLD_UNTIL_REMEDIATION = "hold_until_remediation_identity_change"
+RETRY_SCOPE_HOLD_UNTIL_CREDENTIAL_CHANGE = "hold_until_credential_identity_change"
+
+RETRY_SCOPES: frozenset[str] = frozenset({
+    RETRY_SCOPE_NONE, RETRY_SCOPE_CANDIDATE_REWORK,
+    RETRY_SCOPE_VALIDATION_ONLY, RETRY_SCOPE_DISTINCT_ROUTE,
+    RETRY_SCOPE_CALLBACK_ONLY, RETRY_SCOPE_HOLD_UNTIL_REMEDIATION,
+    RETRY_SCOPE_HOLD_UNTIL_CREDENTIAL_CHANGE,
+})
+
+EVIDENCE_AUTHORITY_PROVIDER_ENVELOPE = "provider_envelope"
+EVIDENCE_AUTHORITY_PROVIDER_REFUSAL = "provider_refusal"
+EVIDENCE_AUTHORITY_AIWORKHUB_REASON = "aiworkhub_minted_reason"
+EVIDENCE_AUTHORITY_SEALED_RECEIPT = "sealed_receipt"
+EVIDENCE_AUTHORITY_MANAGER_INTENT = "authenticated_manager_intent"
+EVIDENCE_AUTHORITY_NONE = "none"
+
+EVIDENCE_AUTHORITIES: frozenset[str] = frozenset({
+    EVIDENCE_AUTHORITY_PROVIDER_ENVELOPE, EVIDENCE_AUTHORITY_PROVIDER_REFUSAL,
+    EVIDENCE_AUTHORITY_AIWORKHUB_REASON, EVIDENCE_AUTHORITY_SEALED_RECEIPT,
+    EVIDENCE_AUTHORITY_MANAGER_INTENT, EVIDENCE_AUTHORITY_NONE,
+})
+
+# Free text is NOT here, and that absence is the whole admission rule.
+AUTOMATIC_EVIDENCE_AUTHORITIES: frozenset[str] = (
+    EVIDENCE_AUTHORITIES - {EVIDENCE_AUTHORITY_NONE}
+)
+
+CAUSE_CANDIDATE_CODE = "candidate_code"
+CAUSE_CANDIDATE_REQUIRED_OUTPUT = "candidate_required_output"
+CAUSE_CANDIDATE_SCOPE = "candidate_scope"
+CAUSE_POLICY_BUDGET = "policy_budget"
+CAUSE_VALIDATION_ENVIRONMENT = "validation_environment"
+CAUSE_TOOLCHAIN_UNAVAILABLE = "toolchain_unavailable"
+CAUSE_SANDBOX_UNSUPPORTED = "sandbox_unsupported"
+CAUSE_DEPENDENCY_UNAVAILABLE = "dependency_unavailable"
+CAUSE_CALLBACK_CONFLICT = "callback_conflict"
+CAUSE_PROVIDER_TRANSIENT = "provider_transient"
+CAUSE_PROVIDER_CAPACITY = "provider_capacity"
+CAUSE_PROVIDER_CREDENTIAL = "provider_credential"
+CAUSE_PROVIDER_RUNTIME_UNCLASSIFIED = "provider_runtime_unclassified"
+CAUSE_CANCELLED = "cancelled"
+CAUSE_TIMEOUT = "timeout"
+CAUSE_NOT_ESTABLISHED = "cause_not_established"
+
+# THE ACTION MATRIX -- cause -> (owner, action, retry_scope, provider_launched).
+# One table, read by everything. Adding a cause without an entry raises a
+# KeyError at classification time rather than silently defaulting to a retry,
+# which is the failure mode this card exists to remove.
+_ACTION_MATRIX: dict[str, tuple[str, str, str, bool]] = {
+    # The candidate's own work is wrong. This is the ONLY family that earns a
+    # fresh provider, and it never retires or penalises the route that ran it.
+    CAUSE_CANDIDATE_CODE: (
+        CAUSE_OWNER_CANDIDATE, ACTION_CANDIDATE_REWORK,
+        RETRY_SCOPE_CANDIDATE_REWORK, True,
+    ),
+    CAUSE_CANDIDATE_REQUIRED_OUTPUT: (
+        CAUSE_OWNER_CANDIDATE, ACTION_CANDIDATE_REWORK,
+        RETRY_SCOPE_CANDIDATE_REWORK, True,
+    ),
+    CAUSE_CANDIDATE_SCOPE: (
+        CAUSE_OWNER_CANDIDATE, ACTION_CANDIDATE_REWORK,
+        RETRY_SCOPE_CANDIDATE_REWORK, True,
+    ),
+    CAUSE_POLICY_BUDGET: (
+        CAUSE_OWNER_CANDIDATE, ACTION_CANDIDATE_REWORK,
+        RETRY_SCOPE_CANDIDATE_REWORK, True,
+    ),
+    # The bytes are fine; the thing that judged them was not. Replay the exact
+    # request against the exact retained candidate -- no provider, no new diff.
+    CAUSE_VALIDATION_ENVIRONMENT: (
+        CAUSE_OWNER_VALIDATION_ENVIRONMENT, ACTION_VALIDATION_ONLY_REPLAY,
+        RETRY_SCOPE_VALIDATION_ONLY, False,
+    ),
+    # Nothing on this machine can make the next attempt different, so nothing
+    # is attempted until the remediation identity itself changes.
+    CAUSE_TOOLCHAIN_UNAVAILABLE: (
+        CAUSE_OWNER_DEPENDENCY, ACTION_DEPENDENCY_HOLD,
+        RETRY_SCOPE_HOLD_UNTIL_REMEDIATION, False,
+    ),
+    CAUSE_SANDBOX_UNSUPPORTED: (
+        CAUSE_OWNER_DEPENDENCY, ACTION_DEPENDENCY_HOLD,
+        RETRY_SCOPE_HOLD_UNTIL_REMEDIATION, False,
+    ),
+    CAUSE_DEPENDENCY_UNAVAILABLE: (
+        CAUSE_OWNER_DEPENDENCY, ACTION_DEPENDENCY_HOLD,
+        RETRY_SCOPE_HOLD_UNTIL_REMEDIATION, False,
+    ),
+    # A terminal-writer / finalizer / callback race. The work already happened;
+    # only the bookkeeping lost. Re-running a provider would redo the work.
+    CAUSE_CALLBACK_CONFLICT: (
+        CAUSE_OWNER_CONTROL_PLANE, ACTION_CALLBACK_RECONCILE,
+        RETRY_SCOPE_CALLBACK_ONLY, False,
+    ),
+    # A route-level hiccup the provider itself asserted: one bounded retry, on
+    # a DISTINCT route. Same-route retry needs authenticated reset evidence.
+    CAUSE_PROVIDER_TRANSIENT: (
+        CAUSE_OWNER_PROVIDER_ROUTE, ACTION_ROUTE_RETRY,
+        RETRY_SCOPE_DISTINCT_ROUTE, True,
+    ),
+    # Session/quota/rate. Emphatically NOT credential: the account is fine and
+    # will be usable again on its own. Hold, or take a distinct eligible route.
+    CAUSE_PROVIDER_CAPACITY: (
+        CAUSE_OWNER_PROVIDER_ROUTE, ACTION_CAPACITY_HOLD,
+        RETRY_SCOPE_DISTINCT_ROUTE, False,
+    ),
+    # Only added credit or a new credential clears this, never elapsed time.
+    CAUSE_PROVIDER_CREDENTIAL: (
+        CAUSE_OWNER_PROVIDER_ACCOUNT, ACTION_CREDENTIAL_HOLD,
+        RETRY_SCOPE_HOLD_UNTIL_CREDENTIAL_CHANGE, False,
+    ),
+    # ``worker_failed``/``launch_failed`` with nothing else: the exact string
+    # this whole card exists because it means nothing. It gets a manager, not
+    # a relaunch.
+    CAUSE_PROVIDER_RUNTIME_UNCLASSIFIED: (
+        CAUSE_OWNER_UNKNOWN, ACTION_MANAGER_JUDGMENT_UNKNOWN,
+        RETRY_SCOPE_NONE, False,
+    ),
+    CAUSE_CANCELLED: (
+        CAUSE_OWNER_MANAGER, ACTION_CANCELLATION_FINAL, RETRY_SCOPE_NONE, False,
+    ),
+    # A timeout can be a slow provider OR an infinite loop in the candidate,
+    # and nothing in the evidence separates them. Fail closed.
+    CAUSE_TIMEOUT: (
+        CAUSE_OWNER_UNKNOWN, ACTION_MANAGER_JUDGMENT_UNKNOWN,
+        RETRY_SCOPE_NONE, False,
+    ),
+    CAUSE_NOT_ESTABLISHED: (
+        CAUSE_OWNER_UNKNOWN, ACTION_MANAGER_JUDGMENT_UNKNOWN,
+        RETRY_SCOPE_NONE, False,
+    ),
+}
+
+DISPOSITION_CAUSES: frozenset[str] = frozenset(_ACTION_MATRIX)
+
+# Projection 1: the R4 three-way class, so every existing reader of
+# ``failure_class`` keeps its meaning.
+_CAUSE_FAILURE_CLASS: dict[str, str] = {
+    CAUSE_CANDIDATE_CODE: FAILURE_CLASS_DEFECT,
+    CAUSE_CANDIDATE_REQUIRED_OUTPUT: FAILURE_CLASS_DEFECT,
+    CAUSE_CANDIDATE_SCOPE: FAILURE_CLASS_DEFECT,
+    CAUSE_POLICY_BUDGET: FAILURE_CLASS_DEFECT,
+    CAUSE_VALIDATION_ENVIRONMENT: FAILURE_CLASS_UNKNOWN,
+    CAUSE_TOOLCHAIN_UNAVAILABLE: FAILURE_CLASS_TRANSIENT,
+    CAUSE_SANDBOX_UNSUPPORTED: FAILURE_CLASS_TRANSIENT,
+    CAUSE_DEPENDENCY_UNAVAILABLE: FAILURE_CLASS_TRANSIENT,
+    CAUSE_CALLBACK_CONFLICT: FAILURE_CLASS_TRANSIENT,
+    CAUSE_PROVIDER_TRANSIENT: FAILURE_CLASS_TRANSIENT,
+    CAUSE_PROVIDER_CAPACITY: FAILURE_CLASS_TRANSIENT,
+    CAUSE_PROVIDER_CREDENTIAL: FAILURE_CLASS_CREDENTIAL,
+    CAUSE_PROVIDER_RUNTIME_UNCLASSIFIED: FAILURE_CLASS_UNKNOWN,
+    CAUSE_CANCELLED: FAILURE_CLASS_UNKNOWN,
+    CAUSE_TIMEOUT: FAILURE_CLASS_UNKNOWN,
+    CAUSE_NOT_ESTABLISHED: FAILURE_CLASS_UNKNOWN,
+}
+
+# Projection 2: ``learning_commit.FailureCategory``'s value vocabulary. The
+# learning taxonomy keeps its external schema and stops inferring its own.
+FAILURE_CATEGORY_CANDIDATE_CODE = "candidate_code"
+FAILURE_CATEGORY_VALIDATION_ENVIRONMENT = "validation_environment"
+FAILURE_CATEGORY_PROVIDER_RUNTIME = "provider_runtime"
+FAILURE_CATEGORY_DEPENDENCY_OR_ROUTE = "dependency_or_route"
+FAILURE_CATEGORY_POLICY_OR_SCOPE = "policy_or_scope"
+FAILURE_CATEGORY_CANCELLATION_OR_TIMEOUT = "cancellation_or_timeout"
+FAILURE_CATEGORY_INCONCLUSIVE = "inconclusive"
+
+_CAUSE_FAILURE_CATEGORY: dict[str, str] = {
+    CAUSE_CANDIDATE_CODE: FAILURE_CATEGORY_CANDIDATE_CODE,
+    CAUSE_CANDIDATE_REQUIRED_OUTPUT: FAILURE_CATEGORY_CANDIDATE_CODE,
+    CAUSE_CANDIDATE_SCOPE: FAILURE_CATEGORY_CANDIDATE_CODE,
+    CAUSE_POLICY_BUDGET: FAILURE_CATEGORY_POLICY_OR_SCOPE,
+    CAUSE_VALIDATION_ENVIRONMENT: FAILURE_CATEGORY_VALIDATION_ENVIRONMENT,
+    # A finalizer/terminal-writer conflict is an environment failure to the
+    # learning taxonomy -- it says nothing about the candidate's code, which is
+    # exactly what ``validation_environment`` means there.
+    CAUSE_CALLBACK_CONFLICT: FAILURE_CATEGORY_VALIDATION_ENVIRONMENT,
+    CAUSE_TOOLCHAIN_UNAVAILABLE: FAILURE_CATEGORY_DEPENDENCY_OR_ROUTE,
+    CAUSE_SANDBOX_UNSUPPORTED: FAILURE_CATEGORY_DEPENDENCY_OR_ROUTE,
+    CAUSE_DEPENDENCY_UNAVAILABLE: FAILURE_CATEGORY_DEPENDENCY_OR_ROUTE,
+    CAUSE_PROVIDER_TRANSIENT: FAILURE_CATEGORY_PROVIDER_RUNTIME,
+    CAUSE_PROVIDER_CAPACITY: FAILURE_CATEGORY_PROVIDER_RUNTIME,
+    CAUSE_PROVIDER_CREDENTIAL: FAILURE_CATEGORY_PROVIDER_RUNTIME,
+    CAUSE_PROVIDER_RUNTIME_UNCLASSIFIED: FAILURE_CATEGORY_PROVIDER_RUNTIME,
+    CAUSE_CANCELLED: FAILURE_CATEGORY_CANCELLATION_OR_TIMEOUT,
+    CAUSE_TIMEOUT: FAILURE_CATEGORY_CANCELLATION_OR_TIMEOUT,
+    CAUSE_NOT_ESTABLISHED: FAILURE_CATEGORY_INCONCLUSIVE,
+}
+
+# The worker's own structured terminal substatus vocabulary, moved here from
+# ``learning_commit`` so one module owns it. Published because
+# ``workforce_catalog`` reuses the infrastructure grouping.
+CANDIDATE_TERMINAL_SUBSTATUSES: frozenset[str] = frozenset({
+    "review_ready", "validation_failed",
+})
+VALIDATION_ENVIRONMENT_TERMINAL_SUBSTATUSES: frozenset[str] = frozenset({
+    "finalize_failed",
+})
+PROVIDER_RUNTIME_TERMINAL_SUBSTATUSES: frozenset[str] = frozenset({
+    "launch_failed", "worker_failed", "process_lost", "liveness_lost",
+})
+CANCELLATION_TERMINAL_SUBSTATUSES: frozenset[str] = frozenset({
+    "timed_out", "cancelled",
+})
+POLICY_TERMINAL_SUBSTATUSES: frozenset[str] = frozenset({
+    "output_budget_exceeded",
+})
+
+_SUBSTATUS_CAUSE: dict[str, str] = {
+    **{s: CAUSE_CANDIDATE_CODE for s in CANDIDATE_TERMINAL_SUBSTATUSES},
+    **{
+        s: CAUSE_CALLBACK_CONFLICT
+        for s in VALIDATION_ENVIRONMENT_TERMINAL_SUBSTATUSES
+    },
+    **{
+        s: CAUSE_PROVIDER_RUNTIME_UNCLASSIFIED
+        for s in PROVIDER_RUNTIME_TERMINAL_SUBSTATUSES
+    },
+    **{s: CAUSE_POLICY_BUDGET for s in POLICY_TERMINAL_SUBSTATUSES},
+    "timed_out": CAUSE_TIMEOUT,
+    "cancelled": CAUSE_CANCELLED,
+    "canceled": CAUSE_CANCELLED,
+}
+
+# A sealed provider receipt's machine code. Split where the old learning table
+# conflated: ``quota`` is CAPACITY (time clears it) and ``balance`` is
+# CREDENTIAL (only the owner clears it). Both still project to
+# ``provider_runtime``, so the learning schema is unchanged.
+_SEALED_CAPACITY_CODES: frozenset[str] = frozenset({
+    "insufficient_quota", "quota_exhausted",
+})
+_SEALED_CREDENTIAL_CODES: frozenset[str] = frozenset({
+    "insufficient_balance", "balance_exhausted",
+    "invalid_grant", "unknown_refresh_token", "invalid_api_key", "unauthorized",
+    "authentication_failed", "authorization_failed",
+})
+_SEALED_DEPENDENCY_CODES: frozenset[str] = frozenset({
+    "dependency_unavailable", "route_unavailable",
+    "upstream_unavailable", "mcp_unavailable",
+})
+
+_SEALED_CODE_OWNER: dict[str, str] = {
+    **{code: CAUSE_PROVIDER_CAPACITY for code in _SEALED_CAPACITY_CODES},
+    **{code: CAUSE_PROVIDER_CREDENTIAL for code in _SEALED_CREDENTIAL_CODES},
+    **{code: CAUSE_DEPENDENCY_UNAVAILABLE for code in _SEALED_DEPENDENCY_CODES},
+}
+
+# 402 is an account condition. 401/403 name no cause on their own
+# (NF-2026-00326), so they are recognised as provider-runtime and then handed
+# to a manager rather than being guessed at.
+_SEALED_STATUS_CAUSE: dict[int, str] = {
+    401: CAUSE_PROVIDER_RUNTIME_UNCLASSIFIED,
+    402: CAUSE_PROVIDER_CREDENTIAL,
+    403: CAUSE_PROVIDER_RUNTIME_UNCLASSIFIED,
+}
+
+_REFUSAL_KIND_CAUSE: dict[str, str] = {
+    "session_limit": CAUSE_PROVIDER_CAPACITY,
+    "quota_exhausted": CAUSE_PROVIDER_CAPACITY,
+    "rate_limited": CAUSE_PROVIDER_CAPACITY,
+    "provider_unavailable": CAUSE_PROVIDER_TRANSIENT,
+    "model_not_found": CAUSE_PROVIDER_TRANSIENT,
+    "balance_exhausted": CAUSE_PROVIDER_CREDENTIAL,
+    "credential_rejected": CAUSE_PROVIDER_CREDENTIAL,
+    # ``cause_not_distinguished`` is deliberately absent: it is the
+    # classifier's own admission that nothing was established.
+}
+
+_PROVIDER_CODE_CAUSE: dict[str, str] = {
+    "model_not_found": CAUSE_PROVIDER_TRANSIENT,
+    "model_not_supported": CAUSE_PROVIDER_TRANSIENT,
+    "model_not_available": CAUSE_PROVIDER_TRANSIENT,
+    "unknown_model": CAUSE_PROVIDER_TRANSIENT,
+    "overloaded_error": CAUSE_PROVIDER_CAPACITY,
+    "rate_limit_error": CAUSE_PROVIDER_CAPACITY,
+    "authentication_failed": CAUSE_PROVIDER_CREDENTIAL,
+    "invalid_api_key": CAUSE_PROVIDER_CREDENTIAL,
+    "insufficient_balance": CAUSE_PROVIDER_CREDENTIAL,
+    "invalid_grant": CAUSE_PROVIDER_CREDENTIAL,
+    "invalid_client": CAUSE_PROVIDER_CREDENTIAL,
+    "unauthorized_client": CAUSE_PROVIDER_CREDENTIAL,
+    "invalid_token": CAUSE_PROVIDER_CREDENTIAL,
+    "expired_token": CAUSE_PROVIDER_CREDENTIAL,
+}
+
+_PROVIDER_STATUS_CAUSE: dict[int, str] = {
+    408: CAUSE_PROVIDER_TRANSIENT,
+    425: CAUSE_PROVIDER_TRANSIENT,
+    429: CAUSE_PROVIDER_CAPACITY,
+    500: CAUSE_PROVIDER_TRANSIENT,
+    502: CAUSE_PROVIDER_TRANSIENT,
+    503: CAUSE_PROVIDER_TRANSIENT,
+    504: CAUSE_PROVIDER_TRANSIENT,
+    529: CAUSE_PROVIDER_TRANSIENT,
+    402: CAUSE_PROVIDER_CREDENTIAL,
+}
+
+_REASON_CAUSE: dict[str, str] = {
+    **{
+        reason: CAUSE_CANDIDATE_REQUIRED_OUTPUT
+        for reason in _DEFECT_REASONS
+        if reason.startswith("required_output")
+    },
+    "scope_rejected": CAUSE_CANDIDATE_SCOPE,
+    "validation_failed": CAUSE_CANDIDATE_CODE,
+    "claude_subscription_session_refresh_required": CAUSE_PROVIDER_CREDENTIAL,
+    "validation_unsupported_in_sandbox": CAUSE_SANDBOX_UNSUPPORTED,
+    # Every control-plane reason that says the CARD ROW moved or that this
+    # finalizer could not complete its transition. None of them says anything
+    # about the work or the provider, and every one of them is settled by
+    # reconciling the exact task/request/claim/candidate -- never by a launch.
+    **{
+        reason: CAUSE_CALLBACK_CONFLICT
+        for reason in (
+            "not_processing", "not_claimed", "task_not_found",
+            "claim_owner_mismatch", "runner_mismatch", "launch_request_mismatch",
+            "request_identity_missing", "terminal_failure_transition_conflict",
+            "claim_ownership_lost", "write_gate_closed_during_reconciliation",
+            "finalize_abandoned", "finalizer_retries_exhausted",
+            "review_workspace_quarantine_failed", "metadata_invalid",
+        )
+    },
+    **{
+        f"provider_refused_{kind}{tail}": cause
+        for kind, cause in _REFUSAL_KIND_CAUSE.items()
+        for tail in (
+            "", "_recoverable_after_reported_window",
+            "_recoverable_but_reset_window_unreported",
+        )
+    },
+}
+
+# An authenticated manager may state one of exactly these dispositions when it
+# parks a candidate. ``core.reject_review``'s allowed override set is this
+# mapping's key set -- a projection, not a second table.
+MANAGER_REJECTION_INTENT_CAUSES: dict[str, str] = {
+    FAILURE_CATEGORY_VALIDATION_ENVIRONMENT: CAUSE_VALIDATION_ENVIRONMENT,
+    FAILURE_CATEGORY_PROVIDER_RUNTIME: CAUSE_PROVIDER_RUNTIME_UNCLASSIFIED,
+    FAILURE_CATEGORY_DEPENDENCY_OR_ROUTE: CAUSE_DEPENDENCY_UNAVAILABLE,
+    FAILURE_CATEGORY_CANCELLATION_OR_TIMEOUT: CAUSE_CANCELLED,
+}
+
+MANAGER_INTENT_RESUME = "resume"
+
+# One bounded distinct-route retry. Not two: a second distinct route that fails
+# the same way is evidence about the card, not about the routes.
+MAX_DISTINCT_ROUTE_RETRIES = 1
+
+
+def sealed_provider_diagnostic(value: Any) -> dict[str, Any] | None:
+    """Return ``value`` only if the provider transport sealed it itself.
+
+    ``owner`` must be exactly ``"provider"`` and ``sealed`` exactly ``True``.
+    Any other shape -- including a structured-looking dict an assistant wrote
+    about itself -- is untrusted and ignored, so substring/dict spoofing cannot
+    forge a disposition.
+    """
+    if not isinstance(value, dict):
+        return None
+    if str(value.get("owner") or "").strip().casefold() != "provider":
+        return None
+    if value.get("sealed") is not True:
+        return None
+    return value
+
+
+def authenticated_manager_intent(value: Any) -> str | None:
+    """Return THIS module's own intent constant for an authenticated manager
+    statement, else ``None``.
+
+    The same seal shape as a provider receipt, with ``owner == "manager"``.
+    The returned value is the registry key, never the caller's bytes.
+    """
+    if not isinstance(value, dict):
+        return None
+    if str(value.get("owner") or "").strip().casefold() != "manager":
+        return None
+    if value.get("authenticated") is not True:
+        return None
+    intent = str(value.get("intent") or "").strip().casefold()
+    if intent == MANAGER_INTENT_RESUME:
+        return MANAGER_INTENT_RESUME
+    for key in MANAGER_REJECTION_INTENT_CAUSES:
+        if key == intent:
+            return key
+    return None
+
+
+def _typed_disposition(
+    *,
+    cause: str,
+    evidence_authority: str,
+    evidence: str = "",
+    terminal_state: str | None = None,
+    failure_class: str | None = None,
+    provider_status: int | None = None,
+    provider_code: str = "",
+    envelope: str = "",
+) -> dict[str, Any]:
+    """Build the one canonical disposition record from a NAMED cause.
+
+    Two centrally-enforced degradations, so no call site can forget them:
+
+    * an ``evidence_authority`` outside :data:`AUTOMATIC_EVIDENCE_AUTHORITIES`
+      -- i.e. free text, or nothing at all -- can never select an automatic
+      action, whatever cause the caller thought it had;
+    * ``validation_only_replay`` requires the candidate bytes to still exist.
+      Replaying validation against a swept workspace is not a replay, it is a
+      silent re-run of nothing, so that case goes to a manager instead.
+    """
+    owner, action, retry_scope, provider_launched = _ACTION_MATRIX[cause]
+    resolved_class = (
+        failure_class if failure_class in FAILURE_CLASSES
+        else _CAUSE_FAILURE_CLASS[cause]
+    )
+    preserved = not terminal_workspace_cleanup_allowed(
+        terminal_state=terminal_state, failure_class=resolved_class,
+    )
+    if evidence_authority not in AUTOMATIC_EVIDENCE_AUTHORITIES or (
+        action == ACTION_VALIDATION_ONLY_REPLAY and not preserved
+    ):
+        owner, action, retry_scope, provider_launched = (
+            _ACTION_MATRIX[CAUSE_NOT_ESTABLISHED]
+        )
+    return {
+        "schema_id": DISPOSITION_SCHEMA_ID,
+        "failure_class": resolved_class,
+        "cause_owner": owner,
+        "cause": cause,
+        "action": action,
+        "retry_scope": retry_scope,
+        "provider_launched": provider_launched,
+        "candidate_bytes_preserved": preserved,
+        "evidence_authority": evidence_authority,
+        "evidence": evidence or cause,
+        "provider_status": provider_status,
+        "provider_code": provider_code,
+        "envelope": envelope,
+    }
+
+
+def failure_disposition_from_substatus(
+    *,
+    terminal_substatus: str | None = None,
+    sealed_diagnostics: Any = None,
+    refusal_kind: str | None = None,
+    reason: str | None = None,
+    manager_intent: Any = None,
+) -> dict[str, Any]:
+    """The canonical classifier over one card's STRUCTURED terminal evidence.
+
+    PRECEDENCE. An authenticated manager intent outranks everything -- a human
+    with the account in front of them knows more than any table. A sealed
+    provider receipt is next, then the refusal kind the provider boundary
+    already established, then a reason AIWorkHub minted, and last the worker's
+    own terminal substatus. Free-form prose is never an input at any level.
+
+    ``terminal_state`` is threaded into EVERY branch, including both sealed
+    early returns: ``candidate_bytes_preserved`` is decided by
+    :func:`terminal_workspace_cleanup_allowed`, which reads the terminal state,
+    so a branch that omitted it silently reported preserved bytes for a
+    ``launch_failed`` sweep that had already deleted them.
+    """
+    substatus = str(terminal_substatus or "").strip().lower()
+
+    intent = authenticated_manager_intent(manager_intent)
+    if intent is not None and intent != MANAGER_INTENT_RESUME:
+        return _typed_disposition(
+            cause=MANAGER_REJECTION_INTENT_CAUSES[intent],
+            evidence_authority=EVIDENCE_AUTHORITY_MANAGER_INTENT,
+            evidence=f"manager_intent={intent}",
+            terminal_state=substatus,
+        )
+
+    sealed = sealed_provider_diagnostic(sealed_diagnostics)
+    if sealed is not None:
+        code = str(sealed.get("code") or "").strip().casefold()
+        status = sealed.get("http_status")
+        status_code = (
+            status if isinstance(status, int) and not isinstance(status, bool)
+            else 0
+        )
+        if status_code in _SEALED_STATUS_CAUSE:
+            return _typed_disposition(
+                cause=_SEALED_STATUS_CAUSE[status_code],
+                evidence_authority=EVIDENCE_AUTHORITY_SEALED_RECEIPT,
+                evidence=f"sealed_provider_status={status_code}",
+                terminal_state=substatus,
+                provider_status=status_code,
+            )
+        if code in _SEALED_CODE_OWNER:
+            named = next(key for key in _SEALED_CODE_OWNER if key == code)
+            return _typed_disposition(
+                cause=_SEALED_CODE_OWNER[named],
+                evidence_authority=EVIDENCE_AUTHORITY_SEALED_RECEIPT,
+                evidence=f"sealed_provider_code={named}",
+                terminal_state=substatus,
+                provider_status=status_code or None,
+                provider_code=named,
+            )
+
+    kind = str(refusal_kind or "").strip().lower()
+    if kind in _REFUSAL_KIND_CAUSE:
+        named_kind = next(key for key in _REFUSAL_KIND_CAUSE if key == kind)
+        return _typed_disposition(
+            cause=_REFUSAL_KIND_CAUSE[named_kind],
+            evidence_authority=EVIDENCE_AUTHORITY_PROVIDER_REFUSAL,
+            evidence=f"refusal_kind={named_kind}",
+            terminal_state=substatus,
+        )
+
+    token = str(reason or "").strip().split(":")[0]
+    if token in _REASON_CAUSE:
+        named_reason = next(key for key in _REASON_CAUSE if key == token)
+        return _typed_disposition(
+            cause=_REASON_CAUSE[named_reason],
+            evidence_authority=EVIDENCE_AUTHORITY_AIWORKHUB_REASON,
+            evidence=f"control_plane_reason={named_reason}",
+            terminal_state=substatus,
+        )
+
+    if substatus in _SUBSTATUS_CAUSE:
+        named_state = next(key for key in _SUBSTATUS_CAUSE if key == substatus)
+        return _typed_disposition(
+            cause=_SUBSTATUS_CAUSE[named_state],
+            evidence_authority=EVIDENCE_AUTHORITY_AIWORKHUB_REASON,
+            evidence=f"terminal_substatus={named_state}",
+            terminal_state=substatus,
+        )
+
+    return _typed_disposition(
+        cause=CAUSE_NOT_ESTABLISHED,
+        evidence_authority=EVIDENCE_AUTHORITY_NONE,
+        evidence=_NO_PROVIDER_ENVELOPE,
+        terminal_state=substatus,
+    )
+
+
+def failure_category_projection(disposition: Any) -> str:
+    """Project one canonical disposition onto the Learning Commit vocabulary.
+
+    A mapping without a recognised ``cause`` projects to ``inconclusive``:
+    the learning taxonomy must never invent a category for evidence the
+    canonical classifier refused to place.
+    """
+    cause = ""
+    if isinstance(disposition, dict):
+        cause = str(disposition.get("cause") or "")
+    return _CAUSE_FAILURE_CATEGORY.get(cause, FAILURE_CATEGORY_INCONCLUSIVE)
+
+
+def disposition_action(disposition: Any) -> str:
+    """The typed action of a disposition mapping, or ``manager_judgment_unknown``."""
+    action = ""
+    if isinstance(disposition, dict):
+        action = str(disposition.get("action") or "")
+    return action if action in DISPOSITION_ACTIONS else ACTION_MANAGER_JUDGMENT_UNKNOWN
+
+
+def distinct_route_retry_allowed(*, disposition: Any, attempts_made: int) -> bool:
+    """One bounded distinct-route retry, and only for a proven route failure."""
+    if disposition_action(disposition) != ACTION_ROUTE_RETRY:
+        return False
+    if isinstance(attempts_made, bool) or not isinstance(attempts_made, int):
+        return False
+    return attempts_made <= MAX_DISTINCT_ROUTE_RETRIES
+
+
+def same_route_retry_allowed(
+    *,
+    disposition: Any,
+    reset_evidence: Any = None,
+    circuit_allows: bool = False,
+) -> bool:
+    """May the FAILING route be launched again right now?
+
+    Only with both halves: a provider-sealed receipt that reports a reset or
+    retry-after window, and an explicit circuit allowance from the caller that
+    owns the route's health. Elapsed-time optimism is not evidence, and a
+    capacity/credential hold can never satisfy this on its own.
+    """
+    action = disposition_action(disposition)
+    if action not in {ACTION_ROUTE_RETRY, ACTION_CAPACITY_HOLD}:
+        return False
+    if circuit_allows is not True:
+        return False
+    sealed = sealed_provider_diagnostic(reset_evidence)
+    if sealed is None:
+        return False
+    for field in ("retry_after_seconds", "reset_at", "retry_after"):
+        value = sealed.get(field)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int) or (isinstance(value, str) and value.strip()):
+            return True
+    return False
+
+
+def hold_released(*, disposition: Any, held_identity: Any, current_identity: Any) -> bool:
+    """A hold is released only when its EXACT remediation identity changes.
+
+    Both a dependency hold and a credential hold work this way: nothing about
+    elapsed time can make the next attempt different, so the only honest
+    release condition is that the thing that has to change, changed.
+    """
+    if disposition_action(disposition) not in {
+        ACTION_DEPENDENCY_HOLD, ACTION_CREDENTIAL_HOLD, ACTION_CAPACITY_HOLD,
+    }:
+        return False
+    held = str(held_identity or "")
+    current = str(current_identity or "")
+    return bool(current) and current != held
+
+
+def cancellation_resume_allowed(*, disposition: Any, resume_intent: Any) -> bool:
+    """Cancellation is final unless a NEW authenticated resume intent exists."""
+    if disposition_action(disposition) != ACTION_CANCELLATION_FINAL:
+        return False
+    return authenticated_manager_intent(resume_intent) == MANAGER_INTENT_RESUME
+
+
+def disposition_telemetry(
+    disposition: Any,
+    *,
+    hold_count: int = 0,
+    attempt_count: int = 0,
+    avoided_provider_launches: int = 0,
+) -> dict[str, Any]:
+    """The bounded telemetry record for one mechanical recovery decision.
+
+    Every string is a module constant and every number is a bounded count, so
+    the record is safe on any durable surface. ``avoided_provider_launches``
+    is the measurement this whole card is judged by: how many provider starts
+    the typed action prevented.
+    """
+    action = disposition_action(disposition)
+    cause = ""
+    owner = ""
+    authority = ""
+    scope = ""
+    preserved = False
+    if isinstance(disposition, dict):
+        cause = str(disposition.get("cause") or "")
+        owner = str(disposition.get("cause_owner") or "")
+        authority = str(disposition.get("evidence_authority") or "")
+        scope = str(disposition.get("retry_scope") or "")
+        preserved = disposition.get("candidate_bytes_preserved") is True
+    return {
+        "schema_id": DISPOSITION_SCHEMA_ID,
+        "cause": cause if cause in DISPOSITION_CAUSES else CAUSE_NOT_ESTABLISHED,
+        "cause_owner": owner if owner in CAUSE_OWNERS else CAUSE_OWNER_UNKNOWN,
+        "action": action,
+        "retry_scope": scope if scope in RETRY_SCOPES else RETRY_SCOPE_NONE,
+        "evidence_authority": (
+            authority if authority in EVIDENCE_AUTHORITIES
+            else EVIDENCE_AUTHORITY_NONE
+        ),
+        "provider_launched": action in PROVIDER_LAUNCHING_ACTIONS,
+        "candidate_bytes_preserved": preserved,
+        "hold_count": _bounded_count(hold_count),
+        "attempt_count": _bounded_count(attempt_count),
+        "avoided_provider_launches": _bounded_count(avoided_provider_launches),
+    }
+
+
+def _bounded_count(value: Any) -> int:
+    """A non-negative bounded int, or 0 -- a bool is never a count."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return 0
+    return min(value, _EXIT_CODE_BOUND)
+
+
+def _tail_cause(
+    *, evidence: str, provider_code: str, provider_status: Any,
+) -> tuple[str, str]:
+    """Name the cause and authority behind one ``failure_disposition`` verdict.
+
+    The legacy verdict already decided WHICH channel spoke; this re-reads that
+    decision against the typed tables instead of re-deriving it, so the two can
+    never disagree about the same terminal event. An evidence string no typed
+    table recognises -- ``envelope_names_no_class``, ``no_provider_envelope``,
+    or a refusal/code/status the matrix deliberately leaves unplaced -- names
+    no cause and carries no authority, which is what makes it launch nothing.
+    """
+    field, _separator, value = evidence.partition("=")
+    if field == "refusal_kind" and value in _REFUSAL_KIND_CAUSE:
+        return _REFUSAL_KIND_CAUSE[value], EVIDENCE_AUTHORITY_PROVIDER_REFUSAL
+    if field == "control_plane_reason" and value in _REASON_CAUSE:
+        return _REASON_CAUSE[value], EVIDENCE_AUTHORITY_AIWORKHUB_REASON
+    if field == "provider_code" and provider_code in _PROVIDER_CODE_CAUSE:
+        return _PROVIDER_CODE_CAUSE[provider_code], EVIDENCE_AUTHORITY_PROVIDER_ENVELOPE
+    if field == "provider_status" and provider_status in _PROVIDER_STATUS_CAUSE:
+        return (
+            _PROVIDER_STATUS_CAUSE[provider_status],
+            EVIDENCE_AUTHORITY_PROVIDER_ENVELOPE,
+        )
+    return CAUSE_NOT_ESTABLISHED, EVIDENCE_AUTHORITY_NONE
