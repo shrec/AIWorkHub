@@ -1275,6 +1275,31 @@ def launch_isolated(
             if expected
             else f"unexpected_launch_error:{type(exc).__name__}:{exc}"
         )
+        if (
+            reserved_request_id is None
+            and isinstance(exc, LaunchRejected)
+            and reason.startswith("task_launch_already_attached:")
+        ):
+            # A repeated manager launch is an idempotent observation of the
+            # live claim, not a new failure episode.  Recording a blocker here
+            # would overwrite the original worker's processing ownership and
+            # make its later successful finalization fail closed.
+            attached_request_id = reason.partition(":")[2]
+            return {
+                "ok": False,
+                "launch_implemented": LAUNCH_IMPLEMENTED,
+                "launch_enabled": True,
+                "request_id": attached_request_id,
+                "existing_request_id": attached_request_id,
+                "task_id": task_id,
+                "runner": runner,
+                "topic": topic,
+                "adapter_id": adapter_id,
+                "state": "already_attached",
+                "blocked_reason": reason,
+                "idempotent": True,
+                "shell": False,
+            }
         # Provisioned failures must become recoverable blocked claim episodes.
         claim_release_retained = False
         if not claimed and workspace is not None and request_id:

@@ -304,6 +304,55 @@ def test_patching_a_seam_value_flows_through_into_the_moved_bodys_receipt(
     assert marker in result["blocked_reason"]
 
 
+def test_already_attached_launch_refusal_is_read_only(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A duplicate launch must not replace the live worker's claim with a blocker."""
+
+    attached_request_id = "a" * 32
+
+    class _TaskEngine:
+        @staticmethod
+        def record_launch_blocker(*_a: object, **_k: object) -> dict[str, object]:
+            raise AssertionError("duplicate launch must not mutate the task card")
+
+    manager = _StubManager(tmp_path)
+
+    def _already_attached(*_a: object, **_k: object) -> dict[str, object]:
+        raise process_launcher.LaunchRejected(
+            f"task_launch_already_attached:{attached_request_id}"
+        )
+
+    manager._preflight_card = _already_attached  # type: ignore[attr-defined]
+    monkeypatch.setattr(process_launcher, "launch_gates_open", lambda: True)
+    monkeypatch.setattr(process_launcher, "task_engine", _TaskEngine)
+    monkeypatch.setattr(
+        process_launcher,
+        "_validate_adapter_identity",
+        lambda *_a, **_k: None,
+    )
+
+    result = _launch(manager)
+
+    assert result == {
+        "ok": False,
+        "launch_implemented": True,
+        "launch_enabled": True,
+        "request_id": attached_request_id,
+        "existing_request_id": attached_request_id,
+        "task_id": "T-1",
+        "runner": "codex_cli",
+        "topic": "aiworkhub",
+        "adapter_id": "codex_cli",
+        "state": "already_attached",
+        "blocked_reason": f"task_launch_already_attached:{attached_request_id}",
+        "idempotent": True,
+        "shell": False,
+    }
+    assert manager.events == []
+
+
 def test_vscode_launch_prefetch_accepts_parse_broken_rework_overlay(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
