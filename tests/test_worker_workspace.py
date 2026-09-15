@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -4113,16 +4114,48 @@ def test_probe_metadata_capable_dir_rejects_chmod_hostile_filesystem(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """Root cause A: the metadata probe must reject a scratch root whose
-    filesystem cannot honour the chmod git init performs on .git/config.lock."""
+    filesystem cannot honour the chmod git init performs on .git/config.lock.
+
+    NF-2026-00841: both the descriptor and the path form are denied here, so
+    the rejection still proves a genuinely metadata-hostile root rather than
+    merely that one of the two spellings was refused.
+    """
     good = tmp_path / "ok"
     good.mkdir()
     assert worker_workspace._probe_metadata_capable_dir(good) is True
 
-    def _deny_chmod(_path: object, _mode: int, *args: object, **kwargs: object) -> None:
+    def _deny_chmod(_target: object, _mode: int, *args: object, **kwargs: object) -> None:
         raise PermissionError(1, "Operation not permitted")
 
     monkeypatch.setattr(worker_workspace.os, "chmod", _deny_chmod)
+    monkeypatch.setattr(worker_workspace.os, "fchmod", _deny_chmod)
     assert worker_workspace._probe_metadata_capable_dir(good) is False
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX chmod metadata semantics")
+def test_probe_metadata_capable_dir_requests_mode_through_its_own_descriptor(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """NF-2026-00841: the POSIX probe mutates the descriptor it just created.
+
+    The seccomp metadata broker authenticates a brokered ``fchmod`` by inode
+    through ``/proc/<pid>/fd/<n>``, while the path form is matched lexically
+    against the resolved scratch root in ``_metadata_broker_verify_target``.
+    Pinning the descriptor form keeps a request-owned scratch probe -- the same
+    metadata capability git's own ``.git/config.lock`` chmod needs -- from
+    being refused as ``metadata_broker_outside_scratch`` only because the
+    caller's TMPDIR string and the broker's resolved scratch root spell the
+    same directory differently. The probe stays self-cleaning either way.
+    """
+    good = tmp_path / "ok"
+    good.mkdir()
+
+    def _reject_path_form(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("POSIX metadata probe must not use the path form")
+
+    monkeypatch.setattr(worker_workspace.os, "chmod", _reject_path_form)
+    assert worker_workspace._probe_metadata_capable_dir(good) is True
+    assert list(good.iterdir()) == []
 
 
 def test_windows_exec_probe_executes_private_native_copy(
@@ -5822,15 +5855,29 @@ def test_run_validations_world_writable_venv_python_fails_closed(
 def test_run_validations_nested_git_sparse_checkout_under_scratch_denies_canonical(
     tmp_path: Path,
 ) -> None:
-    if worker_workspace.nested_sandbox_requires_host_boundary():
-        pytest.skip(
-            "live seccomp-listener installation is already covered by the "
-            "authenticated outer validation sandbox"
-        )
     repo = tmp_path / "fake_repo"
     repo.mkdir()
     secret = repo / "canonical-secret.txt"
     secret.write_text("keep\n", encoding="utf-8")
+    # NF-2026-00841 rework: the mode-change half of this probe has to aim at a
+    # target that is outside every request-owned root *in force*, whichever
+    # boundary happens to be mediating -- otherwise the verdict depends on
+    # knowing that boundary's roots, which a nested run cannot authenticate and
+    # which a candidate could therefore try to describe for itself.
+    #
+    # ``secret`` is not that target and cannot be made into one.  Under the
+    # canonical union/Landlock validation, pytest's ``tmp_path`` lives inside
+    # the *mediating* run's own ``.aiworkhub/temp/worker/<request_id>``
+    # authority (NF430), so a brokered chmod there mutates a request-owned
+    # inode rather than escaping any root -- it is the very authority every
+    # ``git init`` fixture in this module relies on, and refusing it would take
+    # all of them down with it.  This module's own canonical source file is
+    # owned by us, present in every environment, and beneath no exec scratch
+    # and no worker temp in any of them, so a refusal there is decided by the
+    # roots themselves and can never be excused by a declaration.  It is only
+    # ever chmod'd, never written to; its mode is asserted unchanged and
+    # restored if it somehow moved.
+    canonical = Path(worker_workspace.__file__).resolve()
     base = tmp_path / "worktrees" / "nf395-nested-git"
     path = base / "worktree"
     home = base / "home"
@@ -5879,6 +5926,7 @@ def test_run_validations_nested_git_sparse_checkout_under_scratch_denies_canonic
         "import os, sys\n"
         "from pathlib import Path\n"
         "denied = Path(sys.argv[1])\n"
+        "outside = Path(sys.argv[2])\n"
         "try:\n"
         "    denied.write_text('mutated\\n', encoding='utf-8')\n"
         "except PermissionError:\n"
@@ -5889,7 +5937,7 @@ def test_run_validations_nested_git_sparse_checkout_under_scratch_denies_canonic
         "else:\n"
         "    sys.exit(25)\n"
         "try:\n"
-        "    os.chmod(denied, 0o600)\n"
+        "    os.chmod(outside, 0o600)\n"
         "except PermissionError:\n"
         "    print('chmod-denied')\n"
         "except Exception as exc:\n"
@@ -5899,24 +5947,37 @@ def test_run_validations_nested_git_sparse_checkout_under_scratch_denies_canonic
         "    sys.exit(26)\n",
         encoding="utf-8",
     )
+    commands = [
+        "python3 exec_git.py init -b main",
+        "python3 prepare_nested_git.py",
+        "python3 exec_git.py config user.email nf395@example.invalid",
+        "python3 exec_git.py config user.name NF395",
+        "python3 exec_git.py add src/tracked.txt",
+        "python3 exec_git.py commit -m init",
+        "python3 exec_git.py sparse-checkout init --cone",
+        "python3 exec_git.py sparse-checkout set src",
+        "python3 exec_git.py worktree add --detach __LINKED__ HEAD",
+        "python3 verify_nested_git.py",
+        f"python3 deny_canonical.py {secret} {canonical}",
+    ]
+    mode_before = secret.stat().st_mode & 0o777
+    canonical_mode_before = canonical.stat().st_mode & 0o777
     try:
-        *git_results, deny_result = worker_workspace.run_validations(
-            workspace,
-            [
-                "python3 exec_git.py init -b main",
-                "python3 prepare_nested_git.py",
-                "python3 exec_git.py config user.email nf395@example.invalid",
-                "python3 exec_git.py config user.name NF395",
-                "python3 exec_git.py add src/tracked.txt",
-                "python3 exec_git.py commit -m init",
-                "python3 exec_git.py sparse-checkout init --cone",
-                "python3 exec_git.py sparse-checkout set src",
-                "python3 exec_git.py worktree add --detach __LINKED__ HEAD",
-                "python3 verify_nested_git.py",
-                f"python3 deny_canonical.py {secret}",
-            ],
-            backend="landlock",
-        )
+        # Both refusals are things the probe *prints*, not things it exits with,
+        # so the whole batch is expected to pass. Surface the offending rows on
+        # failure rather than an opaque ``ValidationRunError``.
+        try:
+            results = worker_workspace.run_validations(
+                workspace,
+                commands,
+                backend="landlock",
+            )
+        except worker_workspace.ValidationRunError as exc:
+            failed = [row for row in exc.results if row["returncode"] != 0]
+            raise AssertionError(
+                f"nested-git batch did not fully pass: {failed or exc}"
+            ) from exc
+        *git_results, deny_result = results
         assert len(git_results) == 10
         for git_result in git_results:
             assert isinstance(git_result["returncode"], int)
@@ -5924,14 +5985,29 @@ def test_run_validations_nested_git_sparse_checkout_under_scratch_denies_canonic
             assert git_result["returncode"] < 128, git_result
             assert git_result["returncode"] == 0, git_result["stderr_tail"]
         assert "nested-git-sparse-ok" in git_results[-1]["stdout_tail"]
-        assert isinstance(deny_result["returncode"], int)
-        assert deny_result["returncode"] >= 0, deny_result
-        assert deny_result["returncode"] < 128, deny_result
-        assert deny_result["returncode"] == 0, deny_result["stderr_tail"]
-        assert "write-denied" in deny_result["stdout_tail"]
-        assert "chmod-denied" in deny_result["stdout_tail"]
+        assert deny_result["command"] == commands[-1], deny_result
+        deny_rc = deny_result["returncode"]
+        assert isinstance(deny_rc, int)
+        deny_stdout = deny_result["stdout_tail"]
+        # The two security invariants under test. rc=25 would mean the canonical
+        # write was accepted and rc=26 that the mode change outside every
+        # request-owned root was authorized; rc=28/29 would mean the probe hit
+        # an unexpected error class instead of a clean fail-closed denial.
+        assert "write-denied" in deny_stdout, deny_result
+        assert "chmod-denied" in deny_stdout, deny_result
+        assert deny_rc == 0, deny_result
         assert secret.read_text(encoding="utf-8") == "keep\n"
+        assert secret.stat().st_mode & 0o777 == mode_before
+        assert canonical.stat().st_mode & 0o777 == canonical_mode_before
     finally:
+        if canonical.stat().st_mode & 0o777 != canonical_mode_before:
+            # Only reachable if the boundary authorized the refused mode change,
+            # which the assertion above already reports; do not leave the
+            # canonical tree altered on the way out.
+            try:
+                canonical.chmod(canonical_mode_before)
+            except OSError:
+                pass
         worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
 
 
@@ -5940,6 +6016,16 @@ def test_outer_validation_authority_ignores_candidate_env_and_writable_files(
     tmp_path: Path,
 ) -> None:
     monkeypatch.chdir(tmp_path)
+    # NF-2026-00841: this negative expectation is only meaningful when no
+    # genuine coordinator authority sits above ``tmp_path``. Under outer
+    # authority there is none, but inside the canonical union/Landlock
+    # validation the suite runs beneath the coordinator's own planted
+    # authority, whose cwd-ancestor lookup this test then verified and
+    # reported as the forged context it is asserting cannot exist. Scope the
+    # lookup to this test's own tree exactly like the sibling locator tests
+    # already do; every planted owner/mode/symlink/HMAC check inside
+    # ``tmp_path`` still runs against the real verifiers.
+    _hide_ambient_outer_authority(monkeypatch, tmp_path)
     monkeypatch.setenv("GITHUB_ACTIONS", "true")
     monkeypatch.setenv("AIWORKHUB_OUTER_VALIDATION_AUTHORITY", "1")
     monkeypatch.setenv(worker_workspace.VALIDATION_EXEC_SCRATCH_ROOT_ENV, str(tmp_path))
@@ -6115,6 +6201,40 @@ def test_nested_landlock_locator_rejects_ambient_non_nested_scratch_cwd(
     assert worker_workspace.nested_sandbox_requires_host_boundary() is False
 
 
+def _forge_nested_locator(locator: Path, anchor: Path, forge) -> None:
+    """Replace a planted locator/anchor pair with a forged, read-only one.
+
+    NF-2026-00841: the planted locator is ``0o444`` precisely so a confined
+    validator cannot rewrite it in place, which is also why a forgery case can
+    no longer simply overwrite it. A forger holding write access to the scratch
+    can still build a *fresh* inode, hardlink it to the anchor so
+    ``st_nlink == 2`` still holds, and bind its document to that inode's own
+    identity -- so each case below differs from an authentic locator in exactly
+    the one field under test, and is refused for that field rather than for an
+    incidental inode or link-count mismatch.
+    """
+    staging = locator.with_name(locator.name + ".forge")
+    anchor_staging = anchor.with_name(anchor.name + ".forge")
+    handle = os.open(
+        staging,
+        os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+        worker_workspace.NESTED_LANDLOCK_AUTHORITY_LOCATOR_MODE,
+    )
+    try:
+        os.link(staging, anchor_staging)
+        document = forge(os.fstat(handle))
+        os.write(
+            handle,
+            json.dumps(document, separators=(",", ":"), sort_keys=True).encode(
+                "utf-8"
+            ),
+        )
+    finally:
+        os.close(handle)
+    os.replace(anchor_staging, anchor)
+    os.replace(staging, locator)
+
+
 def test_nested_landlock_locator_rejects_owner_mode_symlink_hmac_escape_copy(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -6163,23 +6283,19 @@ def test_nested_landlock_locator_rejects_owner_mode_symlink_hmac_escape_copy(
     locator.unlink()
     real.rename(locator)
 
-    payload = json.loads(locator.read_text(encoding="utf-8"))
-    payload["mac"] = "0" * 64
-    try:
-        locator.chmod(0o600)
-    except PermissionError:
-        pass
-    locator.write_text(json.dumps(payload), encoding="utf-8")
-    try:
-        locator.chmod(0o444)
-    except PermissionError:
-        pass
+    anchor = (
+        workspace
+        / worker_workspace.NESTED_LANDLOCK_AUTHORITY_LOCATOR_ANCHOR_RELATIVE
+    )
+    authentic = json.loads(locator.read_text(encoding="utf-8"))
+    _forge_nested_locator(
+        locator, anchor, lambda _identity: {**authentic, "mac": "0" * 64}
+    )
     assert worker_workspace.authenticated_outer_validation_context() is None
 
     worker_workspace.plant_outer_validation_authority(
         workspace, exec_scratch=scratch
     )
-    status = locator.lstat()
     escaped = {
         "schema_id": worker_workspace.NESTED_LANDLOCK_AUTHORITY_LOCATOR_SCHEMA,
         "kind": worker_workspace._NESTED_LANDLOCK_AUTHORITY_LOCATOR_KIND,
@@ -6187,21 +6303,20 @@ def test_nested_landlock_locator_rejects_owner_mode_symlink_hmac_escape_copy(
         "exec_scratch": str(scratch.resolve()),
         "workspace": str(workspace.resolve()),
     }
-    escaped["mac"] = worker_workspace._outer_validation_authority_mac(
-        escaped, identity=status
+    # Bound to the forged inode's own identity and hardlinked to the anchor, so
+    # the escaped ``authority`` path is the single thing wrong with it: this
+    # case must be refused on that path, not on a stale MAC or an ``st_nlink``
+    # the forger could simply have reproduced.
+    _forge_nested_locator(
+        locator,
+        anchor,
+        lambda identity: {
+            **escaped,
+            "mac": worker_workspace._outer_validation_authority_mac(
+                escaped, identity=identity
+            ),
+        },
     )
-    try:
-        locator.chmod(0o600)
-    except PermissionError:
-        pass
-    locator.write_text(
-        json.dumps(escaped, separators=(",", ":"), sort_keys=True),
-        encoding="utf-8",
-    )
-    try:
-        locator.chmod(0o444)
-    except PermissionError:
-        pass
     assert worker_workspace.authenticated_outer_validation_context() is None
 
     worker_workspace.plant_outer_validation_authority(
@@ -6216,6 +6331,113 @@ def test_nested_landlock_locator_rejects_owner_mode_symlink_hmac_escape_copy(
         pass
     assert worker_workspace.authenticated_outer_validation_context() is None
 
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX hardlink and mode semantics")
+def test_plant_outer_validation_authority_needs_no_brokered_metadata_syscall(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """NF-2026-00841: planting must never mutate metadata on a shared inode.
+
+    ``plant_outer_validation_authority`` hardlinks the nested Landlock
+    authority locator to its workspace anchor so
+    ``verify_nested_landlock_authority_locator`` can require ``st_nlink == 2``.
+    Inside the canonical union/Landlock validation every metadata syscall is
+    brokered, and a real mode change on a shared inode is correctly refused as
+    ``metadata_broker_hardlink_forbidden`` -- a refusal the old code swallowed,
+    so the locator's mode was decided by whether the broker happened to allow
+    it. Planting now decides the mode at creation, while the inode is still
+    provably unshared, so denying the whole chmod family outright here must
+    change nothing: no metadata syscall is required at all, and the mode the
+    locator ends up with is read-only, because it lives inside a Landlock-
+    writable exec scratch and must not be rewritable in place by the sandboxed
+    validator whose nesting authority it establishes.
+    """
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    scratch = tmp_path / "scratch"
+    scratch.mkdir(mode=0o700)
+
+    def _denied(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("planting must not issue a metadata syscall")
+
+    monkeypatch.setattr(worker_workspace.os, "chmod", _denied)
+    monkeypatch.setattr(worker_workspace.os, "fchmod", _denied)
+    monkeypatch.setattr(worker_workspace, "chmod_fd", _denied)
+    monkeypatch.setattr(worker_workspace, "chmod_path", _denied)
+
+    authority = worker_workspace.plant_outer_validation_authority(
+        workspace, exec_scratch=scratch
+    )
+    locator = (
+        scratch / worker_workspace.NESTED_LANDLOCK_AUTHORITY_LOCATOR_RELATIVE
+    )
+    anchor = (
+        workspace
+        / worker_workspace.NESTED_LANDLOCK_AUTHORITY_LOCATOR_ANCHOR_RELATIVE
+    )
+    locator_status = locator.lstat()
+    anchor_status = anchor.lstat()
+    assert locator_status.st_nlink == 2
+    assert (locator_status.st_dev, locator_status.st_ino) == (
+        anchor_status.st_dev,
+        anchor_status.st_ino,
+    )
+    # Read-only on the fresh unshared inode, decided by the ``O_CREAT|O_EXCL``
+    # mode argument before the anchor link exists -- never by a chmod that would
+    # race its own ``os.link`` and be refused on a shared inode. Never
+    # group/other writable is what ``_coordinator_owned_regular_file`` checks;
+    # not owner-writable is what keeps a confined validator from rewriting it.
+    assert stat.S_IMODE(locator_status.st_mode) == 0o444
+    assert (
+        stat.S_IMODE(locator_status.st_mode)
+        == worker_workspace.NESTED_LANDLOCK_AUTHORITY_LOCATOR_MODE
+    )
+    assert stat.S_IMODE(anchor_status.st_mode) == 0o444
+    assert stat.S_IMODE(authority.lstat().st_mode) == 0o600
+    assert worker_workspace._coordinator_owned_regular_file(locator) is not None
+    assert (
+        worker_workspace._coordinator_owned_regular_file(authority) is not None
+    )
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits")
+@pytest.mark.skipif(
+    os.geteuid() == 0 if hasattr(os, "geteuid") else False,
+    reason="root bypasses DAC write permission",
+)
+def test_planted_nested_locator_cannot_be_rewritten_in_place(
+    tmp_path: Path,
+) -> None:
+    """NF-2026-00841 rework: the locator is not writable where it lives.
+
+    The exec scratch is the one tree Landlock leaves writable for the validator
+    it confines, and the nested Landlock authority locator sits inside it. An
+    owner-writable locator could therefore be rewritten in place by that very
+    validator, with the HMAC re-derived against an unchanged dev/ino. Both the
+    scratch-side locator and its workspace anchor are the same read-only inode,
+    so neither can be opened for writing at all.
+    """
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    scratch = tmp_path / "scratch"
+    scratch.mkdir(mode=0o700)
+    worker_workspace.plant_outer_validation_authority(
+        workspace, exec_scratch=scratch
+    )
+    locator = scratch / worker_workspace.NESTED_LANDLOCK_AUTHORITY_LOCATOR_RELATIVE
+    anchor = (
+        workspace
+        / worker_workspace.NESTED_LANDLOCK_AUTHORITY_LOCATOR_ANCHOR_RELATIVE
+    )
+    original = locator.read_bytes()
+    assert original, "the locator document must have been written at creation"
+    for target in (locator, anchor):
+        with pytest.raises(PermissionError):
+            os.close(os.open(target, os.O_WRONLY))
+        with pytest.raises(PermissionError):
+            target.write_bytes(b"{}")
+    assert locator.read_bytes() == original
+    assert locator.lstat().st_nlink == 2
 
 def test_nested_landlock_locator_lookup_is_bounded_to_cwd_ancestors(
     monkeypatch: pytest.MonkeyPatch,
@@ -7088,11 +7310,6 @@ def test_run_validations_nested_git_sparse_checkout_noop_metadata_integration(
     run executes no mutating metadata syscall on that inode, and any real
     mutation attempt on a hardlinked inode still fails closed with
     ``metadata_broker_hardlink_forbidden``."""
-    if worker_workspace.nested_sandbox_requires_host_boundary():
-        pytest.skip(
-            "live seccomp-listener installation is already covered by the "
-            "authenticated outer validation sandbox"
-        )
     repo = tmp_path / "fake_repo"
     repo.mkdir()
     base = tmp_path / "worktrees" / "nf448-nested-git"
@@ -7233,7 +7450,9 @@ def test_landlock_exec_closes_broker_evidence_fd_before_direct_exec(
     monkeypatch.setenv(worker_workspace._METADATA_BROKER_EVIDENCE_ENV, str(write_fd))
     monkeypatch.setattr(worker_workspace, "_apply_landlock", lambda *args, **kwargs: None)
     monkeypatch.setattr(worker_workspace, "_seccomp_notify_supported", lambda: False)
-    monkeypatch.setattr(worker_workspace, "_apply_metadata_seccomp", lambda: None)
+    monkeypatch.setattr(
+        worker_workspace, "_apply_metadata_seccomp", lambda **_kwargs: None
+    )
     monkeypatch.setattr(os, "chdir", lambda _path: None)
 
     def execvpe(_file: str, _argv: list[str], env: dict[str, str]) -> None:
@@ -8230,3 +8449,251 @@ def test_workspace_rmtree_disposes_a_tree_holding_a_shared_inode(
     )
     assert stat.S_IMODE(surviving.st_mode) == shared_mode
     assert surviving.st_nlink == 1
+
+
+def _landlock_exec_fallback_probe(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    measured: "frozenset[str]",
+) -> dict[str, object]:
+    """Drive ``_landlock_exec`` down its no-listener-of-our-own fallback."""
+    seen: dict[str, object] = {}
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    monkeypatch.setattr(
+        worker_workspace, "_apply_landlock", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(worker_workspace, "_seccomp_notify_supported", lambda: False)
+
+    def _probe(exec_scratch: Path) -> "frozenset[str]":
+        seen.update(probed=exec_scratch)
+        return measured
+
+    monkeypatch.setattr(
+        worker_workspace,
+        "_outer_metadata_broker_brokered_chmod_syscalls",
+        _probe,
+    )
+    monkeypatch.setattr(
+        worker_workspace,
+        "_apply_metadata_seccomp",
+        lambda **kwargs: seen.update(kwargs),
+    )
+    monkeypatch.setattr(os, "chdir", lambda _path: None)
+
+    def execvpe(_file: str, _argv: list[str], _env: dict[str, str]) -> None:
+        raise RuntimeError("exec intercepted")
+
+    monkeypatch.setattr(os, "execvpe", execvpe)
+    with pytest.raises(RuntimeError, match="exec intercepted"):
+        worker_workspace._landlock_exec([
+            "--landlock-exec", "--workspace", str(tmp_path),
+            "--home", str(tmp_path), "--exec-scratch", str(scratch),
+            "--", "validator",
+        ])
+    # The only thing consulted is this request's own exec scratch: the decision
+    # is a measurement of whatever boundary already mediates it, never a
+    # protocol that boundary has to understand and answer.
+    assert seen["probed"] == scratch.resolve()
+    return seen
+
+
+def test_landlock_exec_fallback_yields_measured_variants_to_a_proven_broker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """NF-2026-00841: the nested child must stop shadowing an outer broker.
+
+    Only one seccomp user-notification listener can exist per filter tree, so
+    a nested validation beneath an already-brokered sandbox reaches this
+    fallback. ``SECCOMP_RET_ERRNO`` outranks ``SECCOMP_RET_USER_NOTIF``, so
+    denying the chmod family here overrode the outer broker's verified
+    mediation and left unmodified Git unable to chmod its own request-owned
+    ``.git/config.lock``. What bounds the yield is the measurement's negative
+    half -- the same boundary refuses chmod outside the request-owned scratch,
+    beside it, and through a symlink inside it -- and what is yielded is only
+    the individual syscall variants that measurement actually issued.
+    """
+    measured = frozenset(worker_workspace._MEASURABLE_BROKERED_CHMOD_SYSCALLS)
+    seen = _landlock_exec_fallback_probe(monkeypatch, tmp_path, measured=measured)
+    assert seen["brokered_chmod_syscalls"] == measured
+
+
+def test_landlock_exec_fallback_keeps_full_deny_without_a_proven_outer_broker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    seen = _landlock_exec_fallback_probe(
+        monkeypatch, tmp_path, measured=frozenset()
+    )
+    assert seen["brokered_chmod_syscalls"] == frozenset()
+
+
+def _install_modelled_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+    scratch: Path,
+    *,
+    outside: "BaseException | None",
+    root_only: bool = False,
+    seen: "list[Path] | None" = None,
+) -> None:
+    """Install a modelled mediating boundary in place of ``os.chmod``.
+
+    The mode an authorized call would have applied is remembered and served
+    back through ``os.fstat`` instead of being written to the inode, because
+    the worker sandbox denies the whole chmod family unconditionally and a
+    model that really chmod'd could not run there at all. Every symlinked
+    target is refused, which is the broker's own ``RESOLVE_NO_SYMLINKS`` rule.
+    ``root_only`` models a path-scoped MAC that guards only ``/``.
+    """
+    applied: dict[tuple[int, int], int] = {}
+    real_fstat = os.fstat
+    real_stat = os.stat
+
+    def chmod(path: object, mode: int, *_args: object, **_kwargs: object) -> None:
+        target = Path(os.fspath(path))
+        if seen is not None:
+            seen.append(target)
+        if target.is_relative_to(scratch):
+            if target.is_symlink():
+                raise OSError("symlinked target refused")
+            identity = real_stat(target)
+            applied[(identity.st_dev, identity.st_ino)] = mode
+            return None
+        if outside is not None and not (root_only and target.parent != Path("/")):
+            raise outside
+        raise FileNotFoundError(errno.ENOENT, "No such file or directory")
+
+    def fchmod(fd: int, mode: int, *_args: object, **_kwargs: object) -> None:
+        """The same modelled boundary, reached through a descriptor.
+
+        ``fchmod`` is measured on targets the probe created, so an outside
+        target exists and an unmediated boundary really applies the change
+        there instead of reporting ``ENOENT``. The broker's own ``st_nlink``
+        rule is modelled too: it is the refusal the measurement falls back to
+        when creation is confined to the scratch.
+        """
+        info = real_fstat(fd)
+        target = Path(os.readlink(f"/proc/self/fd/{fd}"))
+        if seen is not None:
+            seen.append(target)
+        if target.is_relative_to(scratch):
+            if info.st_nlink != 1 and stat.S_IMODE(info.st_mode) != mode:
+                raise PermissionError(1, "shared inode refused")
+            applied[(info.st_dev, info.st_ino)] = mode
+            return None
+        if outside is not None and not (root_only and target.parent != Path("/")):
+            raise outside
+        applied[(info.st_dev, info.st_ino)] = mode
+        return None
+
+    def fstat(fd: int) -> os.stat_result:
+        info = real_fstat(fd)
+        # Consumed on read: each probe reads its own result exactly once, and
+        # the throwaway file is unlinked straight after, so a later probe that
+        # lands on the recycled inode number must not inherit this answer.
+        mode = applied.pop((info.st_dev, info.st_ino), None)
+        if mode is None:
+            return info
+        fields = list(info)
+        fields[0] = stat.S_IFMT(info.st_mode) | mode
+        return os.stat_result(fields)
+
+    monkeypatch.setattr(os, "chmod", chmod)
+    monkeypatch.setattr(os, "fchmod", fchmod)
+    monkeypatch.setattr(os, "fstat", fstat)
+
+
+def test_outer_broker_probe_touches_only_its_own_scratch_files(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Every target the measurement touches is one it just created itself.
+
+    The positive half now asks for a *real* mode change rather than a no-op --
+    a no-op succeeds even where the syscall never ran, which is what let an
+    unmediated boundary look mediating -- so what bounds it instead is that the
+    only inode it may change is a throwaway one it created beneath this
+    request's own exec scratch, under the reserved probe basename, and removed
+    again.
+    """
+    scratch = tmp_path / "region" / "scratch"
+    scratch.mkdir(parents=True)
+    neighbour = tmp_path / "region" / "neighbour.txt"
+    os.close(os.open(neighbour, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+    requested: list[Path] = []
+    _install_modelled_boundary(
+        monkeypatch,
+        scratch,
+        outside=PermissionError(1, "denied outside scratch"),
+        seen=requested,
+    )
+    assert worker_workspace._outer_metadata_broker_brokered_chmod_syscalls(
+        scratch
+    ) == frozenset(worker_workspace._MEASURABLE_BROKERED_CHMOD_SYSCALLS)
+    assert requested, "the measurement must actually issue a chmod"
+    for target in requested:
+        assert target.name.startswith(
+            worker_workspace._METADATA_BROKER_PROBE_BASENAME_PREFIX
+        ), target
+    assert neighbour not in requested
+    assert stat.S_IMODE(neighbour.stat().st_mode) == 0o600
+    assert not list(scratch.iterdir()), "the measurement must clean up after itself"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX metadata broker semantics")
+def test_outer_broker_probe_rejects_an_ambient_root_only_denial(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """NF-2026-00841 rework: an ambient MAC must not disable the chmod deny.
+
+    Treating any ``PermissionError`` on a ``/`` target as broker evidence let a
+    path-scoped AppArmor/SELinux-like policy -- one that forbids the filesystem
+    root while permitting the temporary-file region an exec scratch lives in --
+    switch off the whole chmod-family deny with no canonical broker anywhere.
+    The measurement therefore also probes directly beside the scratch, inside
+    the region such a policy permits, and fails closed when it is allowed
+    through: an ``ENOENT`` for a name that does not exist means the syscall
+    really ran.
+    """
+    scratch = tmp_path / "region" / "scratch"
+    scratch.mkdir(parents=True)
+    seen: list[Path] = []
+    _install_modelled_boundary(
+        monkeypatch,
+        scratch,
+        outside=PermissionError(errno.EPERM, "Operation not permitted"),
+        root_only=True,
+        seen=seen,
+    )
+    assert (
+        worker_workspace._outer_metadata_broker_brokered_chmod_syscalls(scratch)
+        == frozenset()
+    )
+    beside = [target for target in seen if target.parent == scratch.parent]
+    assert beside, "the beside-the-scratch target must actually be probed"
+    assert not list(scratch.iterdir())
+
+
+def test_nested_scope_declaration_protocol_is_gone() -> None:
+    """The retired handshake must not come back as a second protocol.
+
+    Declaring roots to the outer boundary and waiting for a reserved
+    acknowledgement errno could never bootstrap: during a self-hosted canonical
+    validation the boundary mediating a candidate's exec scratch is the
+    *already loaded* canonical broker, which cannot answer a protocol that same
+    candidate introduces. It therefore always reported ``boundary_allowed``,
+    the nested child kept its full deny list, and unmodified Git still could
+    not chmod its own request-owned ``.git/config.lock`` -- the NF-2026-00841
+    false negative itself. The decision is now a measurement of the boundary
+    instead, so nothing may reserve a filename, an errno or a registry.
+    """
+    for retired in (
+        "_METADATA_BROKER_SCOPE_FILENAME",
+        "_METADATA_BROKER_SCOPE_ACK_ERRNO",
+        "_MetadataBrokerScopeRegistry",
+        "_MetadataBrokerScopeRegistered",
+        "_metadata_broker_register_scope",
+        "_metadata_broker_enforce_scope",
+        "_nested_metadata_scope_roots",
+        "_register_nested_metadata_scope",
+    ):
+        assert not hasattr(worker_workspace, retired), retired

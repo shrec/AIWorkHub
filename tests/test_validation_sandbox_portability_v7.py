@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import ctypes
 import hashlib
+import inspect
+import json
 import os
 import shlex
 import shutil
@@ -486,11 +488,29 @@ class TestBrokeredSyscallDecoding:
     def _hardlinked_git_config_lock(scratch: Path) -> Path:
         # NF-2026-00448: nested Git sparse checkout keeps .git/config.lock
         # as a hardlink alias; reproduce that exact layout for probes.
+        #
+        # NF-2026-00841: build that layout with mode-at-creation only, exactly
+        # like ``TestNF841AuthenticatedDenialIsNotStructurallyTerminal.
+        # _shared_inode_lock``. A raw ``os.chmod`` here is itself a
+        # request-owned scratch ``.git/config.lock`` metadata mutation, so
+        # inside the canonical union/Landlock validation the fixture -- not the
+        # broker behaviour under test -- decided whether these probes could run
+        # at all, and the four parametrizations failed for a reason unrelated
+        # to the no-op authorization they exist to prove. The umask guard makes
+        # the created mode exactly 0o664 on any host, which is the current mode
+        # the brokered exact-mode no-op is compared against below.
         git_dir = scratch / ".git"
         git_dir.mkdir(mode=0o700)
         target = git_dir / "config.lock"
-        target.write_text("x", encoding="utf-8")
-        os.chmod(target, 0o664)
+        previous_umask = os.umask(0)
+        try:
+            handle = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o664)
+        finally:
+            os.umask(previous_umask)
+        try:
+            os.write(handle, b"x")
+        finally:
+            os.close(handle)
         os.link(target, scratch / "config.lock.alias")
         return target
 
@@ -1963,6 +1983,125 @@ class TestNF841AuthenticatedDenialIsNotStructurallyTerminal:
         assert record["terminal"] is True
         assert record["reason"] == reason
 
+    def test_refused_emulation_is_its_own_reason_and_never_terminal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A nested trusted parent's own ``fchmod`` can be refused, and that is
+        not an unknowable post-state: the verified inode is provably untouched.
+
+        This is the exact denial that kept the nested-Git cases red -- the
+        emulation reached ``EPERM`` because the parent doing it was itself
+        confined by an outer validation boundary -- and collapsing it into
+        ``oserror_EPERM`` terminated an otherwise passing command.
+        """
+        reasons = worker_workspace._METADATA_BROKER_TERMINAL_DENIAL_REASONS
+        assert "metadata_broker_emulation_refused" not in reasons
+        # The unbounded EPERM classes this carve-out must not absorb stay put.
+        assert reasons == frozenset({"metadata_broker_deleted_fd", "oserror_EPERM"})
+        terminal, record = self._record(
+            worker_workspace._MetadataBrokerEmulationRefused(
+                "metadata_broker_emulation_refused:fchmod"
+            ),
+            90,
+            monkeypatch,
+        )
+        assert terminal is False
+        assert record["authenticated"] is True
+        assert record["terminal"] is False
+        assert record["reason"] == "metadata_broker_emulation_refused"
+
+    def test_only_eperm_is_reclassified_at_the_single_mutation_site(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # EPERM is the one errno that means the mode change was refused whole;
+        # anything else may have left a state this parent cannot describe, so it
+        # keeps its own reason and its own terminal status.
+        calls: list[tuple[int, int]] = []
+
+        def _refuse(fd: int, mode: int) -> None:
+            calls.append((fd, mode))
+            raise PermissionError(1, "Operation not permitted")
+
+        monkeypatch.setattr(worker_workspace.os, "fchmod", _refuse)
+        with pytest.raises(worker_workspace._MetadataBrokerEmulationRefused):
+            worker_workspace._metadata_broker_emulate_fchmod(7, 0o600)
+        assert calls == [(7, 0o600)]
+
+        def _read_only(_fd: int, _mode: int) -> None:
+            raise OSError(30, "Read-only file system")
+
+        monkeypatch.setattr(worker_workspace.os, "fchmod", _read_only)
+        with pytest.raises(OSError) as other:
+            worker_workspace._metadata_broker_emulate_fchmod(7, 0o600)
+        assert not isinstance(
+            other.value, worker_workspace._MetadataBrokerEmulationRefused
+        )
+        assert (
+            worker_workspace._metadata_broker_denial_reason(other.value)
+            == "oserror_EROFS"
+        )
+
+    @pytest.mark.usefixtures("require_openat2")
+    @pytest.mark.parametrize("syscall", ["chmod", "fchmod"])
+    def test_both_descriptor_paths_refuse_without_touching_the_target(
+        self, syscall: str, scratch: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Drive the real broker down both mutation paths with the emulation
+        refused, exactly as an outer boundary refuses it.
+
+        Both branches reach the same single ``fchmod`` mutation site: the
+        pathname form through an ``openat2`` descriptor resolved beneath this
+        request's scratch, the descriptor form through the child's own reopened
+        and inode-matched fd.  The target is created with the mode-at-creation
+        ``os.open`` argument, so the case needs no real chmod of its own and
+        stays runnable inside a nested sandbox.
+        """
+        library = _RealSyscallLibrary()
+        target = scratch / "config.lock"
+        previous_umask = os.umask(0)
+        try:
+            handle = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o664)
+        finally:
+            os.umask(previous_umask)
+        before = os.stat(target)
+        refused: list[int] = []
+
+        def _refuse(fd: int, _mode: int) -> None:
+            refused.append(fd)
+            raise PermissionError(1, "Operation not permitted")
+
+        fd, root = _scratch_fd_root(scratch)
+        buffer = _path_buffer(target)
+        try:
+            request = _make_request(library.number(syscall), os.getpid())
+            if syscall == "fchmod":
+                request.data.args[0] = handle
+            else:
+                request.data.args[0] = ctypes.addressof(buffer)
+            request.data.args[1] = 0o600
+            monkeypatch.setattr(worker_workspace.os, "fchmod", _refuse)
+            with pytest.raises(
+                worker_workspace._MetadataBrokerEmulationRefused
+            ) as denial:
+                worker_workspace._metadata_broker_apply(
+                    library, -1, request, os.getpid(), fd, root
+                )
+        finally:
+            os.close(fd)
+            os.close(handle)
+
+        # The refusal happened at the mutation site, once, after every check.
+        assert len(refused) == 1
+        after = os.stat(target)
+        assert (after.st_dev, after.st_ino) == (before.st_dev, before.st_ino)
+        assert stat.S_IMODE(after.st_mode) == 0o664
+        terminal, record = self._record(
+            denial.value, int(request.data.nr), monkeypatch
+        )
+        assert terminal is False, record
+        assert record["authenticated"] is True
+        assert record["reason"] == "metadata_broker_emulation_refused"
+
     @staticmethod
     def _shared_inode_lock(scratch: Path) -> Path:
         """A hardlinked ``.git/config.lock``, built without a single chmod.
@@ -1973,13 +2112,18 @@ class TestNF841AuthenticatedDenialIsNotStructurallyTerminal:
         target verification before any real metadata syscall, so building the
         fixture with the mode-at-creation ``os.open`` argument keeps the
         regression runnable in a nested sandbox as well as on a host.
+
+        That creation mode is masked by the process umask, so this fixture
+        needs the sibling's umask guard too: at the usual ``0o022`` the lock is
+        born ``0o644`` and the untouched-mode assertion below reports a
+        difference the broker never caused. Pinning the created mode to exactly
+        ``0o664`` on every host keeps ``before`` and ``after`` comparable and
+        keeps the replayed ``0o600`` chmod a genuine mode *change*, which is
+        what must stay denied on a shared inode.
         """
         git_dir = scratch / ".git"
         git_dir.mkdir(mode=0o700)
         target = git_dir / "config.lock"
-        # Creation modes are filtered through the host umask. Pin it while
-        # constructing this fixture so the untouched-mode assertion below is
-        # deterministic on local shells and GitHub runners alike.
         previous_umask = os.umask(0)
         try:
             handle = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o664)
@@ -2142,3 +2286,854 @@ class TestNF841AuthenticatedDenialIsNotStructurallyTerminal:
             pytest.skip("this host's Landlock policy refuses hardlink creation")
         assert results[0]["returncode"] == 0, results[0]
         assert not results[0].get("timed_out")
+
+
+class TestNestedFallbackDoesNotShadowTheOuterBroker:
+    """NF-2026-00841: the deny-only fallback must not blind an outer broker.
+
+    The kernel permits one seccomp user-notification listener per filter tree,
+    so a nested ``run_validations`` inside an already-brokered validation
+    sandbox cannot install its own and takes ``_apply_metadata_seccomp``.
+    Because ``SECCOMP_RET_ERRNO`` outranks ``SECCOMP_RET_USER_NOTIF``, that
+    inner filter used to override the outer broker and return ``EPERM`` for
+    every chmod -- which is why unmodified Git could not set ``core.filemode``
+    on its own request-owned ``.git/config.lock``. The fallback now yields
+    individual chmod-family *variants*, one syscall at a time, and only those
+    an outer broker was measured issuing that exact syscall to mediate: each
+    applied a real mode change to this request's own scratch inode and was
+    refused at the filesystem root, beside the scratch, and through a symlink
+    inside it. Anything unmeasured keeps its historical deny.
+    """
+
+    @staticmethod
+    def _recording_library() -> object:
+        class _Library:
+            def __init__(self) -> None:
+                self.rules: list[str] = []
+                self.loaded = False
+                self.released = False
+                self._names: dict[int, str] = {}
+
+            def seccomp_init(self, _action: int) -> int:
+                return 1
+
+            def seccomp_syscall_resolve_name(self, name: bytes) -> int:
+                number = len(self._names) + 1
+                self._names[number] = name.decode("ascii")
+                return number
+
+            def seccomp_rule_add(
+                self, _ctx: int, _action: int, number: int, _count: int
+            ) -> int:
+                self.rules.append(self._names[number])
+                return 0
+
+            def seccomp_load(self, _ctx: int) -> int:
+                self.loaded = True
+                return 0
+
+            def seccomp_release(self, _ctx: int) -> None:
+                self.released = True
+
+        return _Library()
+
+    def test_default_fallback_still_denies_every_metadata_syscall(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        library = self._recording_library()
+        monkeypatch.setattr(worker_workspace, "_seccomp_library", lambda: library)
+        worker_workspace._apply_metadata_seccomp()
+        assert tuple(library.rules) == worker_workspace._SECCOMP_DENIED_SYSCALLS
+        assert library.loaded is True
+        assert library.released is True
+
+    def test_brokered_fallback_yields_only_the_measured_variants(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        library = self._recording_library()
+        monkeypatch.setattr(worker_workspace, "_seccomp_library", lambda: library)
+        worker_workspace._apply_metadata_seccomp(
+            brokered_chmod_syscalls=frozenset(
+                worker_workspace._MEASURABLE_BROKERED_CHMOD_SYSCALLS
+            )
+        )
+        omitted = set(worker_workspace._SECCOMP_DENIED_SYSCALLS) - set(library.rules)
+        assert omitted == set(worker_workspace._MEASURABLE_BROKERED_CHMOD_SYSCALLS)
+        # NF-2026-00841 rework: ``fchmodat2`` has no libc entry point here, so
+        # it cannot be issued as itself by the probe -- and what is never
+        # measured is never exempted.  The family is not traded away on one
+        # variant's evidence, however many of its siblings are proven mediated.
+        assert "fchmodat2" in library.rules
+        # Ownership, xattr, timestamp and process-inspection confinement is
+        # never traded away either -- including utimensat, which this filter
+        # keeps denying even though the broker can mediate it.
+        for retained in ("utimensat", "chown", "fchownat", "setxattr", "ptrace"):
+            assert retained in library.rules
+        assert library.loaded is True
+
+    def test_a_single_measured_variant_yields_exactly_itself(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        library = self._recording_library()
+        monkeypatch.setattr(worker_workspace, "_seccomp_library", lambda: library)
+        worker_workspace._apply_metadata_seccomp(
+            brokered_chmod_syscalls=frozenset({"chmod"})
+        )
+        omitted = set(worker_workspace._SECCOMP_DENIED_SYSCALLS) - set(library.rules)
+        assert omitted == {"chmod"}
+        assert "fchmodat" in library.rules
+
+    def test_no_syscall_outside_the_chmod_family_can_be_exempted(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The exemption is intersected with the chmod family at load time.
+
+        A caller -- or a future measurement bug -- cannot trade away ownership,
+        timestamp or process-inspection confinement by naming it here.
+        """
+        library = self._recording_library()
+        monkeypatch.setattr(worker_workspace, "_seccomp_library", lambda: library)
+        worker_workspace._apply_metadata_seccomp(
+            brokered_chmod_syscalls=frozenset(
+                {"chmod", "utimensat", "chown", "ptrace", "setxattr"}
+            )
+        )
+        omitted = set(worker_workspace._SECCOMP_DENIED_SYSCALLS) - set(library.rules)
+        assert omitted == {"chmod"}
+
+    def test_chmod_family_subset_is_not_widened(self) -> None:
+        chmod_family = set(worker_workspace._METADATA_BROKER_CHMOD_SYSCALLS)
+        assert chmod_family == {"chmod", "fchmod", "fchmodat", "fchmodat2"}
+        assert chmod_family <= set(worker_workspace._METADATA_BROKER_SYSCALLS)
+        assert chmod_family <= set(worker_workspace._SECCOMP_DENIED_SYSCALLS)
+        measurable = set(worker_workspace._MEASURABLE_BROKERED_CHMOD_SYSCALLS)
+        # ``fchmod`` joined the measurable set once it was probed as itself, on
+        # descriptors to targets the probe creates. ``fchmodat2`` has no libc
+        # entry point here, so it can never be issued, measured or exempted --
+        # the subset stays a strict subset of the family.
+        assert measurable == {"chmod", "fchmod", "fchmodat"}
+        assert measurable < chmod_family
+
+    @staticmethod
+    def _install_boundary(
+        monkeypatch: pytest.MonkeyPatch,
+        scratch: Path,
+        *,
+        outside: "BaseException | None",
+        root_only: bool = False,
+        follows_symlinks: bool = False,
+        seen: "list[Path] | None" = None,
+    ) -> None:
+        """Install a modelled mediating boundary in place of ``os.chmod``.
+
+        A canonical broker resolves beneath this request's own roots: it refuses
+        every target outside the scratch and every symlinked target
+        (``RESOLVE_NO_SYMLINKS``) while applying a real change inside it.
+        ``root_only`` models the path-scoped MAC this rework must reject -- it
+        guards the filesystem root and lets everything else through -- and
+        ``follows_symlinks`` models a boundary with no symlink rule at all. A
+        target the model lets through reports ``ENOENT`` for a name that does
+        not exist, exactly as an unmediated syscall would.
+
+        The mode an authorized call would have applied is remembered and served
+        back through ``os.fstat`` instead of being written to the inode: the
+        worker sandbox denies the whole chmod family unconditionally, so a model
+        that really chmod'd could not run there at all. What the measurement
+        under test observes is identical either way.
+        """
+        applied: dict[tuple[int, int], int] = {}
+        real_fstat = os.fstat
+        real_stat = os.stat
+
+        def chmod(path: object, mode: int, *_args: object, **_kwargs: object) -> None:
+            target = Path(os.fspath(path))
+            if seen is not None:
+                seen.append(target)
+            if target.is_relative_to(scratch):
+                if target.is_symlink() and not follows_symlinks:
+                    raise OSError("symlinked target refused")
+                identity = real_stat(target)
+                applied[(identity.st_dev, identity.st_ino)] = mode
+                return None
+            if outside is not None and not (root_only and target.parent != Path("/")):
+                raise outside
+            raise FileNotFoundError(2, "No such file or directory")
+
+        def fchmod(fd: int, mode: int, *_args: object, **_kwargs: object) -> None:
+            """The same modelled boundary, reached through a descriptor.
+
+            ``fchmod`` is measured on targets the probe created, so unlike the
+            pathname model an outside target *exists*: an unmediated boundary
+            really applies the change there rather than reporting ``ENOENT``,
+            which is exactly what the confinement half must fail closed on. The
+            canonical broker's ``st_nlink`` rule is modelled too, because that
+            is the refusal the measurement falls back to when creation is
+            confined to the scratch.
+            """
+            info = real_fstat(fd)
+            target = Path(os.readlink(f"/proc/self/fd/{fd}"))
+            if seen is not None:
+                seen.append(target)
+            if target.is_relative_to(scratch):
+                if info.st_nlink != 1 and stat.S_IMODE(info.st_mode) != mode:
+                    raise PermissionError(1, "shared inode refused")
+                applied[(info.st_dev, info.st_ino)] = mode
+                return None
+            if outside is not None and not (root_only and target.parent != Path("/")):
+                raise outside
+            applied[(info.st_dev, info.st_ino)] = mode
+            return None
+
+        def fstat(fd: int) -> os.stat_result:
+            info = real_fstat(fd)
+            # Consumed on read: each probe reads its own result exactly once and
+            # unlinks its throwaway file straight after, so a later probe that
+            # lands on the recycled inode number must not inherit this answer.
+            mode = applied.pop((info.st_dev, info.st_ino), None)
+            if mode is None:
+                return info
+            fields = list(info)
+            fields[0] = stat.S_IFMT(info.st_mode) | mode
+            return os.stat_result(fields)
+
+        monkeypatch.setattr(os, "chmod", chmod)
+        monkeypatch.setattr(os, "fchmod", fchmod)
+        monkeypatch.setattr(os, "fstat", fstat)
+
+    def test_probe_accepts_a_boundary_that_mediates_refuses_and_blocks_symlinks(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        scratch = tmp_path / "region" / "scratch"
+        scratch.mkdir(parents=True)
+        seen: list[Path] = []
+        self._install_boundary(
+            monkeypatch, scratch, outside=PermissionError(1, "denied"), seen=seen
+        )
+        assert worker_workspace._outer_metadata_broker_brokered_chmod_syscalls(
+            scratch
+        ) == frozenset(worker_workspace._MEASURABLE_BROKERED_CHMOD_SYSCALLS)
+        assert not list(scratch.iterdir()), "the probe must clean up after itself"
+        # Every target the boundary saw carries the reserved probe basename, so
+        # the refusals it answers can be recognised -- and left unrecorded -- by
+        # the broker instead of forging denial telemetry on each nested command.
+        assert seen
+        for target in seen:
+            assert target.name.startswith(
+                worker_workspace._METADATA_BROKER_PROBE_BASENAME_PREFIX
+            ), target
+
+    def test_probe_rejects_an_unmediated_chmod(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """An out-of-scratch chmod that really executes proves nothing mediates
+        it: ``ENOENT`` for a non-existent target means the syscall ran."""
+        scratch = tmp_path / "region" / "scratch"
+        scratch.mkdir(parents=True)
+        self._install_boundary(monkeypatch, scratch, outside=None)
+        assert (
+            worker_workspace._outer_metadata_broker_brokered_chmod_syscalls(scratch)
+            == frozenset()
+        )
+
+    def test_probe_rejects_a_policy_that_only_guards_the_filesystem_root(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """NF-2026-00841 rework: the ambient-MAC false positive, closed.
+
+        An AppArmor/SELinux-like policy that forbids chmod at ``/`` while
+        permitting the temporary-file region an exec scratch lives in answers
+        the root probe with ``EPERM`` without any canonical broker existing.
+        Accepting that would disable the whole chmod-family deny and let a
+        nested validator chmod every neighbouring request's files, so the
+        measurement also probes directly beside the scratch -- inside the
+        region such a policy permits -- and fails closed when it is allowed.
+        """
+        scratch = tmp_path / "region" / "scratch"
+        scratch.mkdir(parents=True)
+        seen: list[Path] = []
+        self._install_boundary(
+            monkeypatch,
+            scratch,
+            outside=PermissionError(1, "denied"),
+            root_only=True,
+            seen=seen,
+        )
+        assert (
+            worker_workspace._outer_metadata_broker_brokered_chmod_syscalls(scratch)
+            == frozenset()
+        )
+        # The beside-the-scratch target really was probed, not assumed.
+        assert any(target.parent == scratch.parent for target in seen), seen
+
+    def test_probe_rejects_a_boundary_that_follows_a_symlink(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """``RESOLVE_NO_SYMLINKS`` is the broker's own rule, and no path-scoped
+        policy implements it: a boundary that reaches a target through a link
+        is not the mediator this exemption is safe to rely on."""
+        scratch = tmp_path / "region" / "scratch"
+        scratch.mkdir(parents=True)
+        self._install_boundary(
+            monkeypatch,
+            scratch,
+            outside=PermissionError(1, "denied"),
+            follows_symlinks=True,
+        )
+        assert (
+            worker_workspace._outer_metadata_broker_brokered_chmod_syscalls(scratch)
+            == frozenset()
+        )
+
+    def test_probe_rejects_a_plain_deny_only_ancestor(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        scratch = tmp_path / "region" / "scratch"
+        scratch.mkdir(parents=True)
+
+        def chmod(*_args: object, **_kwargs: object) -> None:
+            raise PermissionError(1, "denied")
+
+        monkeypatch.setattr(os, "chmod", chmod)
+        assert (
+            worker_workspace._outer_metadata_broker_brokered_chmod_syscalls(scratch)
+            == frozenset()
+        )
+
+    def test_probe_requires_a_scratch_and_fails_closed_on_inode_drift(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        assert (
+            worker_workspace._outer_metadata_broker_brokered_chmod_syscalls(None)
+            == frozenset()
+        )
+        scratch = tmp_path / "region" / "scratch"
+        scratch.mkdir(parents=True)
+        self._install_boundary(
+            monkeypatch, scratch, outside=PermissionError(1, "denied")
+        )
+        real_fstat = os.fstat
+        seen: list[int] = []
+
+        def drifting_fstat(fd: int) -> os.stat_result:
+            info = real_fstat(fd)
+            seen.append(fd)
+            if len(seen) % 2 == 1:
+                # Each variant reads the probe inode twice. The ``before`` read
+                # is honest and the ``after`` read reports a different inode --
+                # the drift every variant must fail closed on, not just the
+                # first one measured.
+                return info
+            fields = list(info)
+            fields[1] = int(info.st_ino) + 1
+            return os.stat_result(fields)
+
+        monkeypatch.setattr(os, "fstat", drifting_fstat)
+        assert (
+            worker_workspace._outer_metadata_broker_brokered_chmod_syscalls(scratch)
+            == frozenset()
+        )
+
+    def test_the_descriptor_variant_is_measured_as_itself(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """NF-2026-00841 rework: ``fchmod`` is proven, not inferred.
+
+        The predecessor exempted only the pathname variants and left ``fchmod``
+        denied in the nested child's fallback filter, so ``SECCOMP_RET_ERRNO``
+        kept answering it ``EPERM`` and outranked the outer broker that was
+        already mediating its siblings -- which is the exact syscall Git reaches
+        through an open ``.git/config.lock`` descriptor. It is now measured by
+        issuing ``os.fchmod`` itself, never by trusting a sibling's evidence.
+        """
+        scratch = tmp_path / "region" / "scratch"
+        scratch.mkdir(parents=True)
+        issued: list[int] = []
+        self._install_boundary(
+            monkeypatch, scratch, outside=PermissionError(1, "denied")
+        )
+        modelled_fchmod = os.fchmod
+
+        def counting_fchmod(fd: int, mode: int, *args: object, **kwargs: object):
+            issued.append(fd)
+            return modelled_fchmod(fd, mode, *args, **kwargs)
+
+        monkeypatch.setattr(os, "fchmod", counting_fchmod)
+        assert "fchmod" in (
+            worker_workspace._outer_metadata_broker_brokered_chmod_syscalls(scratch)
+        )
+        assert issued, "the descriptor form must actually be issued"
+        assert not list(scratch.iterdir()), "the probe must clean up after itself"
+
+    def test_the_descriptor_variant_is_refused_beside_the_scratch(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A region-permissive policy must not exempt the descriptor form.
+
+        ``root_only`` forbids only the filesystem root and lets the temporary
+        region an exec scratch lives in through. A descriptor on a throwaway
+        directly beside the scratch is therefore applied rather than refused,
+        and ``fchmod`` must keep its historical deny.
+        """
+        scratch = tmp_path / "region" / "scratch"
+        scratch.mkdir(parents=True)
+        self._install_boundary(
+            monkeypatch,
+            scratch,
+            outside=PermissionError(1, "denied"),
+            root_only=True,
+        )
+        # Asserted on the descriptor measurement itself: the aggregate would
+        # also exclude ``fchmod`` here because no pathname sibling survives
+        # ``root_only``, which would pass this test without the confinement
+        # half ever being exercised.
+        assert worker_workspace._brokered_fchmod_is_mediated(scratch) is False
+        assert "fchmod" not in (
+            worker_workspace._outer_metadata_broker_brokered_chmod_syscalls(scratch)
+        )
+
+    def test_the_descriptor_variant_falls_back_to_the_shared_inode_rule(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Confining creation to the scratch must not disable the measurement.
+
+        A nested validator's Landlock ruleset may permit creation only beneath
+        the exec scratch, so the beside-the-scratch descriptor cannot be made at
+        all. The broker's own ``st_nlink`` rule then decides: no bare kernel and
+        no path-scoped policy refuses a mode change merely because the inode is
+        hardlinked, so a refusal there authenticates the mediator itself.
+        """
+        scratch = tmp_path / "region" / "scratch"
+        scratch.mkdir(parents=True)
+        self._install_boundary(
+            monkeypatch, scratch, outside=PermissionError(1, "denied")
+        )
+        real_open = os.open
+
+        def confined_open(path: object, flags: int, *args: object) -> int:
+            target = Path(os.fspath(path))
+            if flags & os.O_CREAT and not target.is_relative_to(scratch):
+                raise PermissionError(1, "creation confined to the scratch")
+            return real_open(path, flags, *args)
+
+        monkeypatch.setattr(os, "open", confined_open)
+        assert worker_workspace._brokered_fchmod_is_mediated(scratch) is True
+        assert "fchmod" in (
+            worker_workspace._outer_metadata_broker_brokered_chmod_syscalls(scratch)
+        )
+        assert not list(scratch.iterdir()), "the probe must clean up after itself"
+
+    def test_the_descriptor_variant_fails_closed_on_an_unrefused_shared_inode(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A boundary with no ``st_nlink`` rule is not the canonical broker.
+
+        With creation confined to the scratch the shared-inode refusal is the
+        only negative evidence left, so a boundary that lets an ``fchmod`` on a
+        hardlinked inode through -- instead of refusing it the way
+        ``_metadata_broker_verify_fd`` does -- must not have ``fchmod`` traded
+        away to it.
+        """
+        scratch = tmp_path / "region" / "scratch"
+        scratch.mkdir(parents=True)
+        self._install_boundary(
+            monkeypatch, scratch, outside=PermissionError(1, "denied")
+        )
+        real_open = os.open
+        real_fchmod = os.fchmod
+
+        def confined_open(path: object, flags: int, *args: object) -> int:
+            target = Path(os.fspath(path))
+            if flags & os.O_CREAT and not target.is_relative_to(scratch):
+                raise PermissionError(1, "creation confined to the scratch")
+            return real_open(path, flags, *args)
+
+        def linkblind_fchmod(fd: int, mode: int, *args: object, **kwargs: object):
+            """Identical to the modelled broker minus its ``st_nlink`` rule."""
+            info = os.fstat(fd)
+            if info.st_nlink != 1:
+                return None
+            return real_fchmod(fd, mode, *args, **kwargs)
+
+        monkeypatch.setattr(os, "open", confined_open)
+        monkeypatch.setattr(os, "fchmod", linkblind_fchmod)
+        assert worker_workspace._brokered_fchmod_is_mediated(scratch) is False
+        assert "fchmod" not in (
+            worker_workspace._outer_metadata_broker_brokered_chmod_syscalls(scratch)
+        )
+
+    def test_the_descriptor_variant_needs_a_proven_pathname_sibling(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A descriptor cannot demonstrate a path rule, so it never stands alone.
+
+        A boundary that reaches a target through a symlink has no
+        ``RESOLVE_NO_SYMLINKS`` rule and is not the mediator this exemption may
+        rely on -- yet nothing a *descriptor* probe can issue would notice,
+        because ``fchmod`` resolves no path at all.  ``fchmod`` is therefore
+        yielded only alongside a pathname sibling that proved the path rules on
+        this very boundary, which keeps the whole family denied here.
+        """
+        scratch = tmp_path / "region" / "scratch"
+        scratch.mkdir(parents=True)
+        self._install_boundary(
+            monkeypatch,
+            scratch,
+            outside=PermissionError(1, "denied"),
+            follows_symlinks=True,
+        )
+        # The descriptor half on its own is satisfied by this boundary...
+        assert worker_workspace._brokered_fchmod_is_mediated(scratch) is True
+        # ...and it is still not exempted, because no sibling proved the path
+        # rules that a descriptor form cannot speak to.
+        assert (
+            worker_workspace._outer_metadata_broker_brokered_chmod_syscalls(scratch)
+            == frozenset()
+        )
+
+
+@pytest.mark.usefixtures("require_openat2")
+class TestBoundaryProbeDenialsAreNotRecordedAsValidatorDefects:
+    """NF-2026-00841 rework: the measurement must not forge denial telemetry.
+
+    ``_outer_metadata_broker_brokered_chmod_syscalls`` authenticates the outer
+    boundary by provoking refusals -- outside the scratch, beside it, and
+    through a symlink -- once per nested command.  Those refusals are real and
+    fail closed, but they are the measurement's own *expected* answer, not a
+    validator rejection: recording them printed a ``metadata_broker_denied``
+    line on every nested command and burned slots of the bounded 32-record
+    ledger that real denials need.
+
+    The reserved basename that marks them grants nothing.  It is resolved,
+    checked and refused by exactly the same rules as any other name; only the
+    telemetry distinguishes it, and only for the bounded, never-terminal
+    reasons a probe can legitimately provoke.
+    """
+
+    @staticmethod
+    def _record(exc: BaseException, syscall_nr: int = 90) -> tuple:
+        """Drive the real recorder with *both* of its sinks captured.
+
+        Returns ``(terminal, evidence, stderr_noise, ledger_count)``.
+        """
+        evidence_read, evidence_write = os.pipe()
+        noise_read, noise_write = os.pipe()
+        saved_stderr = os.dup(2)
+        previous_fd = worker_workspace._metadata_broker_evidence_fd
+        previous_count = worker_workspace._metadata_broker_denial_count
+        worker_workspace._metadata_broker_evidence_fd = evidence_write
+        worker_workspace._metadata_broker_denial_count = 0
+        request = _make_request(syscall_nr, os.getpid())
+        try:
+            os.dup2(noise_write, 2)
+            try:
+                terminal = worker_workspace._record_metadata_broker_denial(
+                    exc, request
+                )
+            finally:
+                os.dup2(saved_stderr, 2)
+            os.close(evidence_write)
+            os.close(noise_write)
+            evidence = os.read(evidence_read, 8192).decode("utf-8", "replace")
+            noise = os.read(noise_read, 8192).decode("utf-8", "replace")
+            count = worker_workspace._metadata_broker_denial_count
+        finally:
+            os.close(saved_stderr)
+            os.close(evidence_read)
+            os.close(noise_read)
+            worker_workspace._metadata_broker_evidence_fd = previous_fd
+            worker_workspace._metadata_broker_denial_count = previous_count
+        return terminal, evidence, noise, count
+
+    def test_a_probe_refusal_emits_no_record_and_no_stderr_line(self) -> None:
+        probe = f"/{worker_workspace._METADATA_BROKER_PROBE_BASENAME_PREFIX}abc123"
+        denial = worker_workspace._metadata_broker_probe_denial(
+            WorkspaceError(f"metadata_broker_outside_scratch:{probe}"), probe
+        )
+        assert denial is not None
+        terminal, evidence, noise, count = self._record(denial)
+        assert terminal is False
+        assert evidence == ""
+        assert noise == ""
+        # The bounded ledger a real denial needs is left completely intact.
+        assert count == 0
+
+    def test_an_ordinary_refusal_is_still_recorded_in_full(self) -> None:
+        terminal, evidence, noise, count = self._record(
+            WorkspaceError("metadata_broker_outside_scratch:/elsewhere/config.lock")
+        )
+        record = json.loads(evidence.splitlines()[0])
+        assert terminal is False
+        assert record["reason"] == "metadata_broker_outside_scratch"
+        assert record["authenticated"] is True
+        assert "metadata_broker_denied" in noise
+        assert count == 1
+
+    def test_the_reserved_name_cannot_silence_an_unexpected_reason(self) -> None:
+        """Only the bounded probe-reason set qualifies, whatever the name is."""
+        probe = f"/scratch/{worker_workspace._METADATA_BROKER_PROBE_BASENAME_PREFIX}x"
+        exc = WorkspaceError(f"metadata_broker_hardlink_forbidden:{probe}")
+        assert worker_workspace._metadata_broker_probe_denial(exc, probe) is None
+        _terminal, evidence, noise, count = self._record(exc)
+        assert json.loads(evidence.splitlines()[0])["reason"] == (
+            "metadata_broker_hardlink_forbidden"
+        )
+        assert "metadata_broker_denied" in noise
+        assert count == 1
+
+    def test_an_ordinary_name_never_qualifies_as_a_probe(self) -> None:
+        candidate = "/scratch/.git/config.lock"
+        assert (
+            worker_workspace._metadata_broker_probe_denial(
+                WorkspaceError(f"metadata_broker_outside_scratch:{candidate}"),
+                candidate,
+            )
+            is None
+        )
+
+    def test_no_suppressible_reason_is_ever_terminal(self) -> None:
+        """A probe label can never hide a denial that terminates the command."""
+        assert not (
+            worker_workspace._METADATA_BROKER_PROBE_SUPPRESSIBLE_REASONS
+            & worker_workspace._METADATA_BROKER_TERMINAL_DENIAL_REASONS
+        )
+
+    def test_a_probe_named_target_is_still_fully_checked_and_denied(
+        self, scratch: Path, tmp_path: Path
+    ) -> None:
+        """Outside the scratch the reserved name buys exactly nothing."""
+        library = _FakeLibrary()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        target = worker_workspace._metadata_broker_probe_path(outside)
+        target.write_text("x", encoding="utf-8")
+        before = stat.S_IMODE(target.lstat().st_mode)
+        fd, root = _scratch_fd_root(scratch)
+        buf = _path_buffer(target)
+        request = _make_request(library.number("chmod"), os.getpid())
+        request.data.args[0] = ctypes.addressof(buf)
+        request.data.args[1] = 0o640
+        try:
+            with pytest.raises(WorkspaceError, match="metadata_broker_outside_scratch"):
+                worker_workspace._metadata_broker_apply(
+                    library, -1, request, os.getpid(), fd, root
+                )
+        finally:
+            os.close(fd)
+        assert stat.S_IMODE(target.lstat().st_mode) == before
+
+    def test_a_probe_named_target_inside_the_scratch_is_an_ordinary_target(
+        self, scratch: Path
+    ) -> None:
+        """Nothing is skipped for the reserved name where the rules allow it."""
+        library = _FakeLibrary()
+        target = worker_workspace._metadata_broker_probe_path(scratch)
+        target.write_text("x", encoding="utf-8")
+        fd, root = _scratch_fd_root(scratch)
+        buf = _path_buffer(target)
+        request = _make_request(library.number("chmod"), os.getpid())
+        request.data.args[0] = ctypes.addressof(buf)
+        request.data.args[1] = 0o640
+        try:
+            worker_workspace._metadata_broker_apply(
+                library, -1, request, os.getpid(), fd, root
+            )
+        finally:
+            os.close(fd)
+        assert stat.S_IMODE(target.lstat().st_mode) == 0o640
+
+
+@pytest.mark.usefixtures("require_openat2")
+class TestNoReservedNameBypassesTheBrokerChecks:
+    """NF-2026-00841: nothing routes a brokered chmod around the checks.
+
+    The retired declaration handshake gave one reserved basename a branch of
+    its own inside ``_metadata_broker_apply``: it registered a nested scope and
+    answered with a reserved errno instead of resolving a target. It could
+    never bootstrap -- during a self-hosted canonical validation the boundary
+    mediating a candidate's exec scratch is the *already loaded* canonical
+    broker, which cannot answer a protocol that same candidate introduces, so
+    it performed the mode no-op, the nested child read that as
+    ``boundary_allowed`` and kept its full deny list, and unmodified Git was
+    left unable to set ``core.filemode`` on its own request-owned
+    ``.git/config.lock``. A name-triggered branch is also exactly the kind of
+    bypass this broker must never grow. A file carrying that former basename
+    is now an ordinary target: mediated, fully checked, and mutated only where
+    the same scratch-root, owner, symlink, traversal, hardlink and inode rules
+    already allow it.
+    """
+
+    RETIRED_BASENAME = ".aiworkhub-metadata-scope.v1"
+
+    def test_the_former_reserved_basename_is_an_ordinary_target(
+        self, scratch: Path
+    ) -> None:
+        library = _FakeLibrary()
+        target = scratch / self.RETIRED_BASENAME
+        target.write_text("x", encoding="utf-8")
+        fd, root = _scratch_fd_root(scratch)
+        buf = _path_buffer(target)
+        request = _make_request(library.number("chmod"), os.getpid())
+        request.data.args[0] = ctypes.addressof(buf)
+        request.data.args[1] = 0o640
+        try:
+            worker_workspace._metadata_broker_apply(
+                library, -1, request, os.getpid(), fd, root
+            )
+        finally:
+            os.close(fd)
+        # Resolved and mutated like any other beneath-scratch file: no
+        # registration, no reserved errno, no skipped mode change.
+        assert stat.S_IMODE(target.lstat().st_mode) == 0o640
+
+    def test_the_former_reserved_basename_outside_scratch_is_denied(
+        self, scratch: Path, tmp_path: Path
+    ) -> None:
+        """The retired name buys no authority it did not already have."""
+        library = _FakeLibrary()
+        outside = tmp_path / self.RETIRED_BASENAME
+        outside.write_text("keep\n", encoding="utf-8")
+        before = stat.S_IMODE(outside.lstat().st_mode)
+        fd, root = _scratch_fd_root(scratch)
+        buf = _path_buffer(outside)
+        request = _make_request(library.number("chmod"), os.getpid())
+        request.data.args[0] = ctypes.addressof(buf)
+        request.data.args[1] = 0o640
+        try:
+            with pytest.raises(WorkspaceError, match="outside_scratch"):
+                worker_workspace._metadata_broker_apply(
+                    library, -1, request, os.getpid(), fd, root
+                )
+        finally:
+            os.close(fd)
+        assert stat.S_IMODE(outside.lstat().st_mode) == before
+        assert outside.read_text(encoding="utf-8") == "keep\n"
+
+    def test_apply_takes_no_nested_scope_parameter(self) -> None:
+        """A second protocol must not reappear alongside the probe.
+
+        The nested child now decides by *measuring* the boundary already
+        mediating its exec scratch, which needs nothing from that boundary but
+        two syscall answers. Any re-added registry, reserved filename or
+        acknowledgement errno would be a parallel protocol with the same
+        unbootstrappable shape.
+        """
+        assert (
+            "scope_registry"
+            not in inspect.signature(
+                worker_workspace._metadata_broker_apply
+            ).parameters
+        )
+        for retired in (
+            "_METADATA_BROKER_SCOPE_FILENAME",
+            "_METADATA_BROKER_SCOPE_ACK_ERRNO",
+            "_MetadataBrokerScopeRegistry",
+            "_MetadataBrokerScopeRegistered",
+            "_metadata_broker_register_scope",
+            "_metadata_broker_enforce_scope",
+            "_register_nested_metadata_scope",
+        ):
+            assert not hasattr(worker_workspace, retired), retired
+
+
+class TestDeclaredMetadataAuthorityRootsAreTheRootsInForce:
+    """NF-2026-00841 rework: the widening a nested run cannot avoid is declared.
+
+    One seccomp user-notification listener exists per filter tree, so a nested
+    ``run_validations`` cannot install one of its own and the chmod variants it
+    leaves out of its deny-only filter are decided by the OUTER boundary --
+    against the *outer* request's exec scratch, which is strictly wider than
+    this nested run's scratch.  Every kernel/broker check still runs unchanged
+    in the mediating parent; what was missing was any statement of which roots
+    those checks run against, so the nested-Git integration compared an
+    authorized ``chmod`` to ``TMPDIR`` and read a legitimate mutation inside the
+    outer request's own root as an escape from every root.
+
+    ``declared_metadata_authority_roots`` states it.  It authorizes nothing: the
+    outer root is added only when a real exemption happened AND an
+    HMAC-authenticated outer context vouches for it, so neither an environment
+    variable nor command output can mint a wider declared authority.
+    """
+
+    def test_own_roots_only_when_nothing_was_left_to_an_outer_boundary(
+        self, tmp_path: Path
+    ) -> None:
+        scratch = tmp_path / "scratch"
+        worker_temp = tmp_path / "worker-temp"
+        scratch.mkdir()
+        worker_temp.mkdir()
+        assert worker_workspace.declared_metadata_authority_roots(
+            scratch, worker_temp
+        ) == (str(scratch.resolve()), str(worker_temp.resolve()))
+
+    def test_authentic_outer_scratch_is_added_only_with_a_real_exemption(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        scratch = tmp_path / "scratch"
+        outer = tmp_path / "outer-scratch"
+        scratch.mkdir()
+        outer.mkdir()
+        monkeypatch.setattr(
+            worker_workspace,
+            "authenticated_outer_validation_context",
+            lambda: {"exec_scratch": str(outer)},
+        )
+        # No exemption: nothing was left to the outer boundary, so nothing wider
+        # is declared even though an authentic outer context exists.
+        assert worker_workspace.declared_metadata_authority_roots(scratch, None) == (
+            str(scratch.resolve()),
+        )
+        assert worker_workspace.declared_metadata_authority_roots(
+            scratch, None, frozenset({"chmod"})
+        ) == (str(scratch.resolve()), str(outer.resolve()))
+
+    def test_no_authentic_outer_context_never_widens_the_declaration(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        scratch = tmp_path / "scratch"
+        scratch.mkdir()
+        monkeypatch.setattr(
+            worker_workspace, "authenticated_outer_validation_context", lambda: None
+        )
+        monkeypatch.setenv(
+            worker_workspace.METADATA_AUTHORITY_ROOTS_ENV, json.dumps(["/"])
+        )
+        assert worker_workspace.declared_metadata_authority_roots(
+            scratch, None, frozenset(worker_workspace._MEASURABLE_BROKERED_CHMOD_SYSCALLS)
+        ) == (str(scratch.resolve()),)
+
+    def test_publication_is_json_and_clears_any_inherited_claim(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        scratch = tmp_path / "scratch"
+        scratch.mkdir()
+        monkeypatch.setenv(
+            worker_workspace.METADATA_AUTHORITY_ROOTS_ENV, json.dumps(["/forged"])
+        )
+        worker_workspace._publish_metadata_authority_roots(
+            (str(scratch.resolve()),)
+        )
+        assert json.loads(
+            os.environ[worker_workspace.METADATA_AUTHORITY_ROOTS_ENV]
+        ) == [str(scratch.resolve())]
+        # An empty declaration must remove a stale/forged inherited value rather
+        # than leave it standing as this run's claimed authority.
+        worker_workspace._publish_metadata_authority_roots(())
+        assert worker_workspace.METADATA_AUTHORITY_ROOTS_ENV not in os.environ
+
+    def test_declaration_is_not_read_back_as_authority_by_the_broker(self) -> None:
+        """No brokered decision may consult the declaration.
+
+        The roots that decide a syscall are the verified directory descriptors
+        ``_run_metadata_broker`` opened, never a string a child could have
+        written into its own environment.
+        """
+        for symbol in (
+            worker_workspace._metadata_broker_verify_target,
+            worker_workspace._metadata_broker_verify_target_any,
+            worker_workspace._metadata_broker_verify_fd,
+            worker_workspace._metadata_broker_apply,
+            worker_workspace._metadata_broker_open_child_fd,
+        ):
+            source = inspect.getsource(symbol)
+            assert worker_workspace.METADATA_AUTHORITY_ROOTS_ENV not in source
+            assert "declared_metadata_authority_roots" not in source

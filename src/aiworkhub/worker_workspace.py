@@ -88,6 +88,13 @@ NESTED_LANDLOCK_AUTHORITY_LOCATOR_RELATIVE = (
 NESTED_LANDLOCK_AUTHORITY_LOCATOR_ANCHOR_RELATIVE = (
     ".aiworkhub/nested_landlock_authority_locator.v1.anchor"
 )
+# NF-2026-00841: the locator is planted read-only because it lives inside the
+# exec scratch, which Landlock leaves writable for the validator it confines.
+# ``plant_outer_validation_authority`` sets this at ``O_CREAT|O_EXCL`` time,
+# while the inode is still unshared, so no metadata syscall is ever brokered
+# for it and no sandboxed validator can rewrite its own nesting authority in
+# place.
+NESTED_LANDLOCK_AUTHORITY_LOCATOR_MODE = 0o444
 _NESTED_LANDLOCK_AUTHORITY_LOCATOR_KIND = "coordinator_nested_landlock_locator"
 _NESTED_LANDLOCK_AUTHORITY_LOCATOR_MAX_ANCESTORS = 16
 
@@ -3499,7 +3506,20 @@ def _write_authenticated_document(
         raise WorkspaceError("outer_validation_authority_symlink")
     if path.exists():
         path.unlink()
-    fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    # NF-2026-00841: same mode-at-creation rule as the nested locator below --
+    # the document's final owner-private mode is known before its first byte is
+    # written, so it is set on the fresh ``O_EXCL`` inode rather than by a
+    # separate metadata syscall the nested broker has to authorize.  The
+    # previous ``chmod_fd`` swallowed ``PermissionError``, so the document was
+    # already left at ``0o600`` whenever the brokered mutation was refused;
+    # ``verify_outer_validation_authority_file`` never read the mode beyond
+    # ``_coordinator_owned_regular_file``'s group/other-writability rejection,
+    # which ``0o600`` satisfies exactly.
+    previous_umask = os.umask(0)
+    try:
+        fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    finally:
+        os.umask(previous_umask)
     try:
         identity = os.fstat(fd)
         document = {
@@ -3512,10 +3532,6 @@ def _write_authenticated_document(
                 "utf-8"
             ),
         )
-        try:
-            chmod_fd(fd, 0o444)
-        except PermissionError:
-            pass
     finally:
         os.close(fd)
     return identity
@@ -3577,9 +3593,39 @@ def plant_outer_validation_authority(
         locator_path.unlink()
     if anchor_path.exists():
         anchor_path.unlink()
-    locator_fd = os.open(
-        str(locator_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
-    )
+    # NF-2026-00841: give this locator its final read-only mode at creation, on
+    # the fresh unique inode ``O_EXCL`` just produced and before the very next
+    # statement hardlinks it to the workspace anchor (which
+    # ``verify_nested_landlock_authority_locator`` needs for ``st_nlink == 2``).
+    # The mode must be decided here rather than by a later ``chmod``: once the
+    # anchor link exists the inode is shared, and a real mode change on a shared
+    # inode is -- correctly -- refused as
+    # ``metadata_broker_hardlink_forbidden`` inside a nested validation, so a
+    # create-then-chmod sequence raced its own ``os.link`` and silently left
+    # whatever mode it started with.
+    #
+    # The rework's reason for ``0o444`` rather than ``0o600``: this locator
+    # lives inside the exec scratch, which Landlock leaves *writable* for the
+    # validator it confines.  An owner-private but owner-writable locator could
+    # therefore be rewritten in place by the very sandboxed process whose
+    # nesting authority it establishes, leaving the HMAC re-derivable against an
+    # unchanged dev/ino.  Read-only removes that in-place rewrite entirely while
+    # still satisfying ``_coordinator_owned_regular_file`` (which rejects
+    # group/other writability), and it costs no metadata syscall at all: with
+    # ``O_CREAT|O_EXCL`` the kernel skips the access check on the file it just
+    # created, so the document below is still written through this descriptor.
+    # The umask is pinned across the ``open`` alone so the created mode is
+    # exactly ``0o444`` on every host rather than whatever the ambient umask
+    # leaves.
+    previous_umask = os.umask(0)
+    try:
+        locator_fd = os.open(
+            str(locator_path),
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+            NESTED_LANDLOCK_AUTHORITY_LOCATOR_MODE,
+        )
+    finally:
+        os.umask(previous_umask)
     try:
         locator_identity = os.fstat(locator_fd)
         payload["locator_dev"] = str(locator_identity.st_dev)
@@ -3604,10 +3650,6 @@ def plant_outer_validation_authority(
                 "utf-8"
             ),
         )
-        try:
-            chmod_fd(locator_fd, 0o444)
-        except PermissionError:
-            pass
         try:
             os.link(str(locator_path), str(anchor_path))
         except OSError as exc:
@@ -4961,7 +5003,7 @@ def _repair_removal_permissions(target: str) -> None:
     blanket ``os.chmod`` of the failing entry therefore mutated metadata the
     removal did not need -- and the validation substrate deliberately plants a
     shared inode inside a request-owned tree, because
-    ``plant_outer_validation_authority`` hardlinks the ``0o444`` nested
+    ``plant_outer_validation_authority`` hardlinks the owner-private nested
     Landlock authority locator to its workspace anchor precisely so
     ``verify_nested_landlock_authority_locator`` can require ``st_nlink == 2``.
     Inside a nested validation that blanket chmod is exactly the authenticated
@@ -6404,7 +6446,22 @@ def _probe_exec_capable_dir(directory: Path) -> bool:
 
 
 def _probe_metadata_capable_dir(directory: Path) -> bool:
-    """Best-effort, self-cleaning probe for platform metadata semantics."""
+    """Best-effort, self-cleaning probe for platform metadata semantics.
+
+    NF-2026-00841: the POSIX branch requests the mode change through
+    ``os.fchmod`` on the descriptor this function just created, and falls back
+    to the path form only when the platform exposes no ``fchmod``. Both forms
+    are mediated identically by the seccomp metadata broker, but the descriptor
+    form is authenticated by inode through ``/proc/<pid>/fd/<n>`` -- the
+    kernel's own canonical name for the target -- instead of by the caller's
+    ``TMPDIR`` path string, which ``_metadata_broker_verify_target`` compares
+    lexically against the resolved scratch root. A request-owned scratch file
+    therefore cannot be refused as ``metadata_broker_outside_scratch`` merely
+    because the child's path string and the broker's resolved scratch root
+    spell the same directory differently. The probe stays exactly as strict:
+    the requested mode must really apply and really stick on the same inode,
+    or the candidate root is rejected.
+    """
     if directory.is_symlink() or not directory.is_dir():
         return False
     probe_path = directory / f".metadata_probe_{uuid.uuid4().hex}"
@@ -6414,19 +6471,34 @@ def _probe_metadata_capable_dir(directory: Path) -> bool:
         return False
     replacement_path: Path | None = None
     try:
-        os.close(fd)
         if sys.platform == "win32":
+            os.close(fd)
+            fd = -1
             replacement_path = directory / f".metadata_replace_{uuid.uuid4().hex}"
             replacement_path.write_bytes(b"aiworkhub")
             os.replace(replacement_path, probe_path)
             return probe_path.read_bytes() == b"aiworkhub"
-        os.chmod(probe_path, 0o600)
-        if stat.S_IMODE(os.stat(probe_path).st_mode) != 0o600:
+        fchmod = getattr(os, "fchmod", None)
+        if fchmod is not None:
+            fchmod(fd, 0o600)
+        else:
+            os.chmod(probe_path, 0o600)
+        # Read the outcome back from the same descriptor, so a mode that only
+        # appears to stick on a re-resolved path cannot pass this gate.
+        probed = os.fstat(fd)
+        if stat.S_IMODE(probed.st_mode) != 0o600 or not stat.S_ISREG(probed.st_mode):
             return False
-        return stat.S_ISREG(os.stat(probe_path).st_mode) and probe_path.read_bytes() == b""
+        os.close(fd)
+        fd = -1
+        return probe_path.read_bytes() == b""
     except OSError:
         return False
     finally:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
         probe_path.unlink(missing_ok=True)
         if replacement_path is not None:
             replacement_path.unlink(missing_ok=True)
@@ -8247,11 +8319,55 @@ def _apply_landlock(
 
 
 _SCMP_ACT_NOTIFY = 0x7FC00000
-_METADATA_BROKER_SYSCALLS = (
+# The chmod family alone. NF-2026-00841 leaves out of a nested child's
+# deny-only filter exactly those variants an outer broker was measured to
+# mediate, so the subset is named once rather than sliced out of a larger tuple
+# by index.
+_METADATA_BROKER_CHMOD_SYSCALLS = (
     "chmod",
     "fchmod",
     "fchmodat",
     "fchmodat2",
+)
+# Each of these three can be issued *as itself* from this process -- ``chmod``
+# through ``os.chmod``, ``fchmodat`` through its ``dir_fd`` form, and ``fchmod``
+# through ``os.fchmod`` on a descriptor -- so each can be measured one syscall
+# at a time.  ``fchmodat2`` has no libc entry point here at all, so it can never
+# be issued, never measured, and never exempted.
+#
+# NF-2026-00841 rework: ``fchmod`` was previously excluded on the theory that a
+# descriptor form "has no path a boundary probe could place outside the
+# scratch".  That reasoning was wrong in a way that mattered -- it is the exact
+# syscall ``git`` reaches when it re-applies ``core.filemode`` through an open
+# ``.git/config.lock`` descriptor, so leaving it in the nested child's deny-only
+# filter kept answering it ``EPERM`` and outranking (and blinding) the very
+# outer broker that was already mediating its siblings.  A descriptor probe
+# does not need a path of its own: it opens a target *this process created*, so
+# it can place that target inside the scratch, beside it, or on a shared inode
+# at will.  ``_brokered_fchmod_is_mediated`` measures exactly those, and an
+# unmeasured variant is still never exempted.
+_MEASURABLE_BROKERED_CHMOD_SYSCALLS = ("chmod", "fchmod", "fchmodat")
+# Reserved basename prefix for the boundary measurement's own throwaway targets.
+# It grants nothing and skips nothing: a target carrying it is resolved,
+# owner/symlink/traversal/hardlink checked and refused exactly like any other
+# name.  It marks only the *expected* refusals below, so they are answered
+# silently instead of printing a line and consuming a slot of the bounded
+# denial ledger on every nested command.
+_METADATA_BROKER_PROBE_BASENAME_PREFIX = ".aiworkhub-broker-probe-"
+# The bounded set of refusals a boundary probe can legitimately provoke. None of
+# them is in _METADATA_BROKER_TERMINAL_DENIAL_REASONS, so labelling a refusal as
+# a probe can never hide a denial that terminates the command.
+_METADATA_BROKER_PROBE_SUPPRESSIBLE_REASONS = frozenset(
+    {
+        "metadata_broker_outside_scratch",
+        "oserror_ENOENT",
+        "oserror_ELOOP",
+    }
+)
+_METADATA_BROKER_PROBE_MODE = 0o600
+_METADATA_BROKER_PROBE_CHANGED_MODE = 0o640
+_METADATA_BROKER_SYSCALLS = (
+    *_METADATA_BROKER_CHMOD_SYSCALLS,
     "utimensat",
 )
 _METADATA_BROKER_POLL_MS = 200
@@ -8917,15 +9033,37 @@ def _metadata_broker_open_child_fd(
     scratch_specs: "list[tuple[int, PurePosixPath]]",
     requested_mode: int | None = None,
 ) -> "tuple[int, bool]":
-    """Reopen and authenticate the exact descriptor on which the child blocked."""
+    """Reopen and authenticate the exact descriptor on which the child blocked.
+
+    The descriptor's own ``/proc/<pid>/fd`` link is resolved through exactly the
+    same ``_metadata_broker_verify_target_any`` the pathname branch uses, so a
+    ``fchmod`` is confined to the request-owned scratch roots by the identical
+    ``openat2`` RESOLVE_BENEATH/RESOLVE_NO_SYMLINKS, owner, ``st_nlink``,
+    traversal and inode-drift checks -- the descriptor form widens nothing.  The
+    reopened fd is then inode-compared against the verified one, so a target
+    swapped between the two resolutions fails closed.
+
+    NF-2026-00841 rework: the refusal this raises is classified exactly as the
+    pathname branch classifies its own, so the bounded boundary measurement's
+    expected answers stay out of denial telemetry.  Classification changes
+    nothing about the ``EPERM`` the caller receives and grants nothing a
+    reserved basename would not otherwise get -- the refusal is already decided
+    by the ordinary checks before it is labelled.
+    """
     if raw_fd < 0:
         raise WorkspaceError(f"metadata_broker_bad_fd:{raw_fd}")
     link = _metadata_broker_child_link(pid, f"fd/{raw_fd}")
     if link.endswith(" (deleted)"):
         raise WorkspaceError("metadata_broker_deleted_fd")
-    verified_fd, _verified_mutate = _metadata_broker_verify_target_any(
-        link, scratch_specs, requested_mode
-    )
+    try:
+        verified_fd, _verified_mutate = _metadata_broker_verify_target_any(
+            link, scratch_specs, requested_mode
+        )
+    except (WorkspaceError, OSError, ValueError) as exc:
+        probe_denial = _metadata_broker_probe_denial(exc, link)
+        if probe_denial is None:
+            raise
+        raise probe_denial from exc
     try:
         verified_info = os.fstat(verified_fd)
         open_flags = os.O_RDONLY | os.O_NOCTTY
@@ -8970,6 +9108,15 @@ def _metadata_broker_apply(
     as authority (``openat2`` beneath one of the exact authorized scratch fds --
     the exec scratch and the request-owned worker temp authority) and mutates
     only a stable, inode-verified file or directory.
+
+    NF-2026-00841: a nested sandbox that cannot install a listener of its own
+    stops denying the chmod family in its own fallback filter, so those calls
+    arrive here as ordinary notifications instead of being answered ``EPERM``
+    by an inner filter that outranks -- and blinds -- this boundary. No
+    basename, errno or caller identity is special-cased on the way in: the
+    request-owned ``.git/config.lock`` Git needs is mediated exactly as it is
+    for a non-nested validator, and anything outside the authorized scratch
+    roots is refused by the same checks.
     """
     if legacy_scratch_root is not None:
         # Preserve the established private test/caller ABI while normalizing it
@@ -9041,7 +9188,7 @@ def _metadata_broker_apply(
         try:
             _metadata_broker_check_notification(library, listener_fd, request.id)
             if mutate:
-                os.fchmod(fd_target, mode)
+                _metadata_broker_emulate_fchmod(fd_target, mode)
         finally:
             os.close(fd_target)
         return
@@ -9075,13 +9222,22 @@ def _metadata_broker_apply(
         raise WorkspaceError(f"metadata_broker_unsupported_syscall:{name}")
 
     _metadata_broker_check_notification(library, listener_fd, request.id)
-    verified_fd, mutate = _metadata_broker_verify_target_any(
-        raw_target, scratch_specs, mode
-    )
+    try:
+        verified_fd, mutate = _metadata_broker_verify_target_any(
+            raw_target, scratch_specs, mode
+        )
+    except (WorkspaceError, OSError, ValueError) as exc:
+        # The refusal is already decided above by the ordinary checks; this only
+        # labels the bounded subset that is a boundary measurement's expected
+        # answer so it is not re-reported as a validator defect (NF-2026-00841).
+        probe_denial = _metadata_broker_probe_denial(exc, raw_target)
+        if probe_denial is None:
+            raise
+        raise probe_denial from exc
     try:
         _metadata_broker_check_notification(library, listener_fd, request.id)
         if mutate:
-            os.fchmod(verified_fd, mode)
+            _metadata_broker_emulate_fchmod(verified_fd, mode)
     finally:
         os.close(verified_fd)
 
@@ -9132,15 +9288,95 @@ def _metadata_broker_denial_reason(exc: BaseException) -> str:
 # ``aiworkhub.metadata_broker_denial.v1`` record, so the coordinator keeps the
 # full, structured evidence while the validated command reports its own real
 # status.  ``metadata_broker_deleted_fd`` (the caller raced the target away
-# between authentication and mutation) and ``oserror_EPERM`` (this parent could
-# not perform the emulation at all) remain terminal for exactly the original
-# reason: neither leaves a knowable post-state.
+# between authentication and mutation) and ``oserror_EPERM`` (an ``EPERM`` met
+# where this parent cannot bound the outcome: acquiring the target, reading
+# ``/proc``, or any emulation that is not all-or-nothing) remain terminal for
+# exactly the original reason: neither leaves a knowable post-state.  The one
+# bounded case that *is* knowable -- a refused ``fchmod(2)`` on an
+# already-verified descriptor -- carries its own reason instead, raised by
+# ``_metadata_broker_emulate_fchmod`` below.
 _METADATA_BROKER_TERMINAL_DENIAL_REASONS = frozenset(
     {
         "metadata_broker_deleted_fd",
         "oserror_EPERM",
     }
 )
+
+
+class _MetadataBrokerEmulationRefused(WorkspaceError):
+    """This parent's own boundary refused an already-verified mode change.
+
+    A ``run_validations`` that runs beneath an outer validation boundary makes
+    the trusted parent emulating a brokered syscall a confined process itself,
+    so its own ``fchmod(2)`` can come back ``EPERM``.  Collapsing that into
+    ``oserror_EPERM`` made it structurally terminal, killed the validator
+    process group and replaced the command's own exit status with ``rc=126`` --
+    which is what left the nested-Git cases red while every check they exercise
+    was deciding exactly as designed.
+
+    Nothing is authorized here.  The descriptor was already resolved beneath a
+    request-owned scratch root through ``openat2``
+    RESOLVE_BENEATH/RESOLVE_NO_SYMLINKS and already passed the owner,
+    ``st_nlink``, traversal and inode-drift checks, no pathname resolution is
+    repeated or widened, and the caller still receives ``EPERM``.  The single
+    difference is the post-state this parent can state afterwards:
+    ``fchmod(2)`` applies the whole mode or none of it, so a refused one leaves
+    the verified inode provably untouched -- knowable, audited and answered,
+    never a reason to disbelieve the command being brokered for.
+    """
+
+
+def _metadata_broker_emulate_fchmod(fd: int, mode: int) -> None:
+    """Apply one verified mode change, or report a provably untouched refusal.
+
+    ``fd`` is always a descriptor this parent opened and verified itself -- the
+    pathname branch resolves one with ``openat2`` beneath an authorized scratch
+    root, the descriptor branch reopens the child's own and inode-matches it --
+    so this is the single mutation site for the whole chmod family.  Only
+    ``EPERM``, the one errno that means the mode change was refused outright
+    rather than half applied, is reclassified; every other ``OSError`` keeps its
+    own reason and its own terminal status.  The detail half names the syscall
+    and never a path, so denial telemetry stays path-free.
+    """
+    try:
+        os.fchmod(fd, mode)
+    except PermissionError as exc:
+        raise _MetadataBrokerEmulationRefused(
+            "metadata_broker_emulation_refused:fchmod"
+        ) from exc
+
+
+class _MetadataBrokerProbeDenial(WorkspaceError):
+    """An expected refusal of a reserved boundary-probe target (NF-2026-00841).
+
+    Raised only *after* the ordinary checks already refused the target, so it
+    changes nothing about the ``EPERM`` the caller receives and grants nothing
+    the reserved basename would not otherwise get.  It exists solely so denial
+    telemetry can tell the once-per-command boundary measurement apart from a
+    real validator rejection.
+    """
+
+
+def _metadata_broker_probe_denial(
+    exc: BaseException, candidate: str
+) -> "_MetadataBrokerProbeDenial | None":
+    """Classify one refusal as the boundary measurement's own expected answer.
+
+    Both halves must hold: the refused target's basename carries the reserved
+    probe prefix, *and* the refusal is one of the bounded, never-terminal
+    reasons a probe can legitimately provoke.  Anything else -- any other
+    reason, any other name -- returns ``None`` and is recorded in full, so no
+    filename can silence a real denial and no terminal denial can hide behind
+    one.
+    """
+    reason = _metadata_broker_denial_reason(exc)
+    if reason not in _METADATA_BROKER_PROBE_SUPPRESSIBLE_REASONS:
+        return None
+    if not PurePosixPath(candidate).name.startswith(
+        _METADATA_BROKER_PROBE_BASENAME_PREFIX
+    ):
+        return None
+    return _MetadataBrokerProbeDenial(reason)
 
 
 def _record_metadata_broker_denial(
@@ -9155,7 +9391,17 @@ def _record_metadata_broker_denial(
     ``stderr_tail`` so a real broker rejection is diagnosable instead of
     invisible.  Best-effort and never raises -- telemetry must not perturb the
     fail-closed ``EPERM`` response already set by the caller.
+
+    NF-2026-00841 rework: the refusals
+    ``_outer_metadata_broker_brokered_chmod_syscalls`` provokes once per nested
+    command are the *expected* answer of a measurement, not a validator defect.
+    They are refused by exactly the same checks as any other target, but
+    recording them would print a line of noise on every nested command and burn
+    slots of the bounded 32-record ledger that real denials need, so that one
+    bounded class is answered silently instead.
     """
+    if isinstance(exc, _MetadataBrokerProbeDenial):
+        return False
     terminal = False
     try:
         reason = _metadata_broker_denial_reason(exc)
@@ -9242,6 +9488,13 @@ def _run_metadata_broker(
     validator process group is killed and the child reaped, so a wedged
     validator can never deadlock the broker, orphan descendants, or leak
     descriptors; every allocated notification pair is freed on every path.
+
+    A nested sandbox that could not install a listener of its own (the kernel
+    permits exactly one per filter tree) stops denying the chmod family in its
+    own fallback filter and lets this loop decide those calls instead
+    (NF-2026-00841). They arrive here as ordinary notifications and are
+    authenticated and resolved by exactly the same scratch roots, owner,
+    symlink, traversal, hardlink and inode checks as any other request.
     """
     import select
 
@@ -9352,16 +9605,565 @@ def _run_metadata_broker(
             os.close(spec_fd)
 
 
-def _apply_metadata_seccomp() -> None:
+def _metadata_broker_probe_path(root: Path) -> Path:
+    """One throwaway, reserved-basename target for a boundary measurement."""
+    return root / f"{_METADATA_BROKER_PROBE_BASENAME_PREFIX}{uuid.uuid4().hex}"
+
+
+def _issue_chmod_family_variant(
+    name: str, target: str, mode: int, scratch_fd: int
+) -> None:
+    """Issue exactly one chmod-family syscall variant against ``target``.
+
+    ``chmod`` reaches the kernel's ``chmod`` entry point and ``fchmodat``
+    reaches ``fchmodat`` with a zero flag word, so what this issues is evidence
+    about that one syscall number rather than about the family as a whole.
+    ``target`` is always absolute and ``fchmodat`` ignores its directory
+    descriptor for an absolute path, which keeps every probe below byte-for-byte
+    identical across the measured variants.
+    """
+    if name == "chmod":
+        os.chmod(target, mode)
+        return
+    if name == "fchmodat":
+        os.chmod(target, mode, dir_fd=scratch_fd)
+        return
+    raise WorkspaceError(f"metadata_broker_probe_variant_unmeasurable:{name}")
+
+
+def _brokered_chmod_variant_applies_in_scratch(
+    name: str, scratch: Path, scratch_fd: int
+) -> bool:
+    """This variant really applied a mode change to this request's own inode.
+
+    The target is a file this process just created with ``O_EXCL`` beneath the
+    exec scratch, and the outcome is re-read from that same descriptor, so a
+    mode that only appears to stick -- or a target that drifted to another
+    inode -- cannot pass.  A real change rather than a mode no-op is requested
+    on purpose: a no-op succeeds even where the syscall never runs.
+    """
+    probe = _metadata_broker_probe_path(scratch)
+    try:
+        fd = os.open(
+            probe, os.O_CREAT | os.O_EXCL | os.O_WRONLY, _METADATA_BROKER_PROBE_MODE
+        )
+    except OSError:
+        return False
+    try:
+        before = os.fstat(fd)
+        try:
+            _issue_chmod_family_variant(
+                name, str(probe), _METADATA_BROKER_PROBE_CHANGED_MODE, scratch_fd
+            )
+        except (OSError, WorkspaceError):
+            return False
+        after = os.fstat(fd)
+        if (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino):
+            return False
+        return stat.S_IMODE(after.st_mode) == _METADATA_BROKER_PROBE_CHANGED_MODE
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            probe.unlink()
+        except OSError:
+            pass
+
+
+def _brokered_chmod_variant_refused_outside_scratch(
+    name: str, scratch: Path, scratch_fd: int
+) -> bool:
+    """This variant is refused for targets this request's scratch does not own.
+
+    NF-2026-00841 rework: a refusal at ``/`` alone is ambient evidence.  A
+    path-scoped MAC (AppArmor/SELinux-like) that forbids the filesystem root
+    while permitting the temporary-file region an exec scratch lives in would
+    produce exactly that ``EPERM``, and yielding the syscall to such a policy
+    would let a nested validator chmod every neighbouring request's files.  The
+    discriminating probe is therefore a pair: one target at the filesystem root
+    and one *directly beside this exec scratch*, inside whatever region a
+    path-scoped policy would permit.  Only a boundary resolving against this
+    request's own roots refuses both; an unmediated or region-permissive policy
+    really executes at least one of them and reports ``ENOENT`` for a name that
+    does not exist, which fails this gate closed.
+
+    Neither target exists, so nothing is mutated on any outcome.
+    """
+    for outside in (
+        _metadata_broker_probe_path(Path("/")),
+        _metadata_broker_probe_path(scratch.parent),
+    ):
+        try:
+            _issue_chmod_family_variant(
+                name, str(outside), _METADATA_BROKER_PROBE_MODE, scratch_fd
+            )
+        except PermissionError:
+            continue
+        except (OSError, WorkspaceError):
+            return False
+        return False
+    return True
+
+
+def _brokered_chmod_variant_refuses_symlinked_target(
+    name: str, scratch: Path, scratch_fd: int
+) -> bool:
+    """This variant will not reach a target through a symlink.
+
+    ``openat2`` with ``RESOLVE_NO_SYMLINKS`` is the canonical broker's own rule
+    and no path-scoped MAC implements it, so a refusal here authenticates the
+    mediator instead of merely observing that something said no.  A boundary
+    that *follows* the link really mutates the target, which this reads back
+    from the target's own descriptor and fails closed on.
+
+    Best effort by design: a scratch that refuses symlink creation cannot be
+    measured this way, and the remaining probes then decide.  It never fails a
+    variant for a missing capability, only for a link that was actually
+    followed.
+    """
+    target = _metadata_broker_probe_path(scratch)
+    link = _metadata_broker_probe_path(scratch)
+    try:
+        fd = os.open(
+            target, os.O_CREAT | os.O_EXCL | os.O_WRONLY, _METADATA_BROKER_PROBE_MODE
+        )
+    except OSError:
+        return True
+    try:
+        try:
+            os.symlink(target, link)
+        except OSError:
+            return True
+        try:
+            _issue_chmod_family_variant(
+                name, str(link), _METADATA_BROKER_PROBE_CHANGED_MODE, scratch_fd
+            )
+        except (OSError, WorkspaceError):
+            pass
+        else:
+            return False
+        return stat.S_IMODE(os.fstat(fd).st_mode) == _METADATA_BROKER_PROBE_MODE
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        for leftover in (link, target):
+            try:
+                leftover.unlink()
+            except OSError:
+                pass
+
+
+def _brokered_fchmod_applies_in_scratch(scratch: Path) -> bool:
+    """``fchmod`` itself really applied a mode change to this request's own inode.
+
+    A descriptor is the only form ``fchmod`` can be issued in, so what this
+    issues is evidence about that one syscall number rather than about a
+    sibling that shares its name prefix.  The target is a file this process just
+    created with ``O_EXCL`` beneath the exec scratch, and the outcome is re-read
+    from that same descriptor, so a mode that only appears to stick -- or a
+    target that drifted to another inode -- cannot pass.  A real change rather
+    than a mode no-op is requested on purpose: a no-op succeeds even where the
+    syscall never runs.
+    """
+    fchmod = getattr(os, "fchmod", None)
+    if fchmod is None:
+        return False
+    probe = _metadata_broker_probe_path(scratch)
+    try:
+        fd = os.open(
+            probe, os.O_CREAT | os.O_EXCL | os.O_WRONLY, _METADATA_BROKER_PROBE_MODE
+        )
+    except OSError:
+        return False
+    try:
+        before = os.fstat(fd)
+        try:
+            fchmod(fd, _METADATA_BROKER_PROBE_CHANGED_MODE)
+        except (OSError, WorkspaceError):
+            return False
+        after = os.fstat(fd)
+        if (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino):
+            return False
+        return stat.S_IMODE(after.st_mode) == _METADATA_BROKER_PROBE_CHANGED_MODE
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            probe.unlink()
+        except OSError:
+            pass
+
+
+def _brokered_fchmod_refused_outside_scratch(scratch: Path) -> "bool | None":
+    """``fchmod`` is refused for a descriptor this request's scratch does not own.
+
+    The target is directly beside the exec scratch -- inside whatever region a
+    path-scoped MAC would permit -- so a boundary that resolves against this
+    request's own roots refuses it while an unmediated syscall, or a merely
+    region-permissive policy, really applies it.  Unlike the pathname probes
+    this one needs a target that exists, because a descriptor is what is being
+    measured; it is a throwaway this process creates under the reserved probe
+    basename and removes again, and the mode is read back so an application
+    that actually happened fails closed rather than passing silently.
+
+    Returns ``True`` when the refusal was observed, ``False`` when the boundary
+    applied it, and ``None`` when the neighbouring region cannot be written at
+    all.  That last case is not evidence either way: the Landlock ruleset a
+    nested validator runs under may confine creation to the exec scratch
+    itself, and ``_brokered_fchmod_refuses_shared_inode`` decides instead.
+    """
+    fchmod = getattr(os, "fchmod", None)
+    if fchmod is None:
+        return None
+    outside = _metadata_broker_probe_path(scratch.parent)
+    try:
+        fd = os.open(
+            outside, os.O_CREAT | os.O_EXCL | os.O_WRONLY, _METADATA_BROKER_PROBE_MODE
+        )
+    except OSError:
+        return None
+    try:
+        try:
+            fchmod(fd, _METADATA_BROKER_PROBE_CHANGED_MODE)
+        except PermissionError:
+            refused = True
+        except (OSError, WorkspaceError):
+            return False
+        else:
+            refused = False
+        # Read the outcome back either way: it catches a refusal that changed
+        # the mode anyway, and it leaves no applied change behind for a later
+        # probe that lands on this inode number once the file is unlinked.
+        unchanged = stat.S_IMODE(os.fstat(fd).st_mode) == _METADATA_BROKER_PROBE_MODE
+        return refused and unchanged
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            outside.unlink()
+        except OSError:
+            pass
+
+
+def _brokered_fchmod_refuses_shared_inode(scratch: Path) -> bool:
+    """``fchmod`` will not change the mode of a hardlinked inode.
+
+    ``st_nlink == 1`` is the canonical broker's own rule
+    (``_metadata_broker_verify_fd``) and neither a bare kernel nor any
+    path-scoped policy implements it -- an unmediated ``fchmod`` changes a
+    hardlinked file's mode exactly like any other -- so a refusal here
+    authenticates the mediator itself instead of merely observing that
+    something said no.  Both names live inside the exec scratch, so this stays
+    measurable under a ruleset that confines creation to the scratch, which is
+    precisely when ``_brokered_fchmod_refused_outside_scratch`` cannot decide.
+
+    The shared inode is never mutated on any outcome: the requested mode is
+    read back from the descriptor and a change that was actually applied fails
+    closed.  A scratch that refuses hardlink creation leaves nothing measured,
+    which fails closed too -- an unmeasured variant is never exempted.
+    """
+    fchmod = getattr(os, "fchmod", None)
+    if fchmod is None:
+        return False
+    target = _metadata_broker_probe_path(scratch)
+    link = _metadata_broker_probe_path(scratch)
+    try:
+        fd = os.open(
+            target, os.O_CREAT | os.O_EXCL | os.O_WRONLY, _METADATA_BROKER_PROBE_MODE
+        )
+    except OSError:
+        return False
+    try:
+        try:
+            os.link(target, link)
+        except OSError:
+            return False
+        try:
+            fchmod(fd, _METADATA_BROKER_PROBE_CHANGED_MODE)
+        except (OSError, WorkspaceError):
+            refused = True
+        else:
+            refused = False
+        # Read the outcome back either way, so a shared inode whose mode really
+        # did change fails closed and nothing applied is left to leak onto a
+        # later probe that reuses this inode number.
+        unchanged = stat.S_IMODE(os.fstat(fd).st_mode) == _METADATA_BROKER_PROBE_MODE
+        return refused and unchanged
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        for leftover in (link, target):
+            try:
+                leftover.unlink()
+            except OSError:
+                pass
+
+
+def _brokered_fchmod_is_mediated(scratch: Path) -> bool:
+    """Measure ``fchmod`` as itself, positive half and negative half.
+
+    The positive half alone cannot decide this: an unmediated ``fchmod`` on
+    this process's own fresh scratch inode succeeds just as a brokered one
+    does.  What discriminates is a negative half no unmediated kernel and no
+    merely region-scoped policy can answer, and one of the two is always
+    available:
+
+    * a descriptor on a throwaway *beside* the exec scratch must be refused
+      with its mode unchanged -- direct outside-the-scratch confinement
+      evidence for the descriptor form; or, when creation is confined to the
+      scratch so that target cannot be made at all,
+    * a descriptor on a *hardlinked* inode inside the scratch must be refused
+      with its mode unchanged -- the broker's own ``st_nlink`` rule.
+
+    If neither can be measured, nothing is exempted and ``fchmod`` keeps its
+    historical deny, exactly like any other unmeasured variant.
+    """
+    if not _brokered_fchmod_applies_in_scratch(scratch):
+        return False
+    outside = _brokered_fchmod_refused_outside_scratch(scratch)
+    if outside is not None:
+        return outside
+    return _brokered_fchmod_refuses_shared_inode(scratch)
+
+
+def _brokered_pathname_chmod_variant_is_mediated(
+    name: str, scratch: Path, scratch_fd: int
+) -> bool:
+    """Run the three pathname probes for one chmod-family variant.
+
+    Only the variants that carry a path of their own are measured here -- they
+    can place a target inside this request's scratch, outside it, and behind a
+    symlink.  ``fchmod`` resolves no path and is measured by
+    ``_brokered_fchmod_is_mediated`` on descriptors instead.
+    """
+    return (
+        _brokered_chmod_variant_applies_in_scratch(name, scratch, scratch_fd)
+        and _brokered_chmod_variant_refused_outside_scratch(name, scratch, scratch_fd)
+        and _brokered_chmod_variant_refuses_symlinked_target(name, scratch, scratch_fd)
+    )
+
+
+def _outer_metadata_broker_brokered_chmod_syscalls(
+    exec_scratch: Path | None,
+) -> "frozenset[str]":
+    """Measure, one syscall at a time, which chmod variants an OUTER broker mediates.
+
+    NF-2026-00841: the kernel allows exactly one seccomp user-notification
+    listener per filter tree (``has_duplicate_listener`` -> ``EBUSY``), so a
+    nested ``run_validations`` running *inside* an already-brokered validation
+    sandbox cannot install its own listener and
+    ``_seccomp_notify_supported()`` is ``False``.  The historical fallback then
+    loaded the deny-only filter -- and because ``SECCOMP_RET_ERRNO`` outranks
+    ``SECCOMP_RET_USER_NOTIF``, that inner filter *overrode* the outer broker
+    and returned ``EPERM`` for every chmod, so unmodified Git could not set
+    ``core.filemode`` on its own request-owned ``.git/config.lock``.  Denying a
+    syscall an outer boundary is already mediating buys no confinement; it only
+    blinds that boundary.
+
+    Every returned name was issued *as that syscall* and passed both halves of
+    ``_brokered_chmod_variant_is_mediated``: it applied a real mode change to a
+    fresh ``O_EXCL`` inode beneath this request's exec scratch, verified from
+    that inode's own descriptor, and it was refused in a way no unmediated
+    kernel and no merely region-scoped policy can produce.
+
+    The pathname variants take that refusal at the filesystem root, one
+    directory beside the exec scratch, and through a symlink inside it
+    (``RESOLVE_NO_SYMLINKS``, with the link target's mode read back unchanged).
+    ``fchmod`` has no path of its own, so it takes it on descriptors to targets
+    this process created: one beside the exec scratch, or -- when creation is
+    confined to the scratch -- one on a hardlinked inode inside it, which is
+    the broker's own ``st_nlink`` rule.  Neither target is ever mutated.
+
+    A descriptor cannot demonstrate a *path* rule, so ``fchmod`` is yielded
+    only in addition to a pathname sibling that already proved this very
+    boundary resolves beneath this request's own roots, refuses the
+    neighbouring region and honours ``RESOLVE_NO_SYMLINKS``.  That is a strictly
+    narrower condition than measuring it alone -- ``fchmod`` must still pass its
+    own descriptor probes, and a boundary that follows symlinks or guards only
+    the filesystem root yields nothing at all.
+
+    A name that fails any probe -- and every variant that cannot be issued as
+    itself from here at all -- keeps its historical deny.  The measurement asks
+    the boundary for nothing but those syscall answers, so it also holds for the
+    self-hosted case where the mediating parent is the already loaded canonical
+    broker and could never answer a protocol this candidate introduces.  Every
+    other outcome (no scratch, a plain deny-only ancestor, no filter at all, any
+    unexpected error) returns the empty set and keeps the full deny list.
+    """
+    if exec_scratch is None or os.name == "nt" or not sys.platform.startswith("linux"):
+        return frozenset()
+    try:
+        scratch_fd = os.open(
+            exec_scratch,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        )
+    except OSError:
+        return frozenset()
+    try:
+        pathname_variants = frozenset(
+            name
+            for name in _MEASURABLE_BROKERED_CHMOD_SYSCALLS
+            if name != "fchmod"
+            and _brokered_pathname_chmod_variant_is_mediated(
+                name, exec_scratch, scratch_fd
+            )
+        )
+        if not pathname_variants:
+            # Nothing proved this boundary resolves beneath this request's own
+            # roots, refuses the region beside them and honours
+            # RESOLVE_NO_SYMLINKS.  A descriptor cannot demonstrate a path rule,
+            # so there is nothing to yield ``fchmod`` to either.
+            return frozenset()
+        if _brokered_fchmod_is_mediated(exec_scratch):
+            return pathname_variants | {"fchmod"}
+        return pathname_variants
+    except OSError:
+        return frozenset()
+    finally:
+        os.close(scratch_fd)
+
+
+# The exact request-owned roots a validated command's metadata mutations are
+# actually decided against, published to that command's own environment.
+#
+# NF-2026-00841 rework: a nested ``run_validations`` cannot install a second
+# seccomp user-notification listener (one per filter tree -> ``EBUSY``), so the
+# chmod-family variants it leaves out of its deny-only filter are decided by the
+# OUTER boundary that is already mediating this process -- and that boundary
+# resolves against the *outer* request's exec scratch, which is wider than this
+# nested run's own scratch.  That widening was real but undeclared: the command
+# still reported ``TMPDIR`` as if it were the authority, so an authorized chmod
+# on a neighbouring canonical file beneath the outer scratch looked like an
+# escape from every request-owned root instead of what it is -- a mutation
+# inside the one authority actually in force.
+#
+# This declaration grants nothing and is never read as authority: every check
+# that decides a brokered syscall (``openat2`` RESOLVE_BENEATH/
+# RESOLVE_NO_SYMLINKS, owner, ``st_nlink``, traversal, inode-drift) still runs
+# in the mediating parent against its own verified scratch fds.  It is written
+# by the trusted child immediately before ``exec``, from the roots it just
+# established, so a stale or candidate-forged inherited value can never survive
+# (both branches set or clear it unconditionally).
+#
+# NF-2026-00841 rework: it is also, by construction, INCOMPLETE beneath an
+# outer boundary, and must never be used to decide whether a mutation escaped.
+# A nested run can authenticate that boundary's exec scratch (via the
+# owner-verified, HMAC-authenticated locator) but has no authenticated way to
+# name the other root that boundary equally owns -- its
+# ``.aiworkhub/temp/worker/<request_id>`` temp authority (NF430) -- and often
+# cannot reach the locator at all.  A test or tool that reads these roots as
+# "every request-owned root" therefore reports an authorized, request-owned
+# mutation as an escape.  The only sound way to prove the outside-all-roots
+# refusal is to aim at a target that is outside every root under every
+# boundary, which is what the nested-git canonical regression now does.
+METADATA_AUTHORITY_ROOTS_ENV = "AIWORKHUB_METADATA_AUTHORITY_ROOTS"
+
+
+def declared_metadata_authority_roots(
+    exec_scratch: Path | None,
+    worker_temp: Path | None,
+    exempted_chmod_syscalls: "frozenset[str]" = frozenset(),
+) -> "tuple[str, ...]":
+    """Return the resolved roots this command's metadata mutations are bound to.
+
+    Always this run's own request-owned roots -- the validation exec scratch and
+    the ``.aiworkhub/temp/worker/<request_id>`` authority (NF430) -- in that
+    order and de-duplicated.
+
+    The authenticated outer exec scratch is added ONLY when
+    ``exempted_chmod_syscalls`` is non-empty, i.e. only when this run really did
+    leave measured chmod variants to an outer boundary instead of denying them.
+    It is taken from ``authenticated_outer_validation_context()`` (an
+    HMAC-authenticated, owner-verified locator/authority document), never from a
+    plain environment variable or command output, so a candidate cannot mint a
+    wider declared authority for itself.  With no exemption, or no authentic
+    outer context, the declaration stays exactly this run's own roots.
+    """
+    roots: list[str] = []
+
+    def _add(candidate: Path | str | None) -> None:
+        if not candidate:
+            return
+        try:
+            resolved = str(Path(candidate).resolve())
+        except OSError:
+            return
+        if resolved not in roots:
+            roots.append(resolved)
+
+    _add(exec_scratch)
+    _add(worker_temp)
+    if exempted_chmod_syscalls:
+        context = authenticated_outer_validation_context()
+        if context is not None:
+            _add(str(context.get("exec_scratch") or ""))
+    return tuple(roots)
+
+
+def _publish_metadata_authority_roots(roots: "tuple[str, ...]") -> None:
+    """Set (or clear) the declaration in this process's environment before exec."""
+    if roots:
+        os.environ[METADATA_AUTHORITY_ROOTS_ENV] = json.dumps(list(roots))
+    else:
+        os.environ.pop(METADATA_AUTHORITY_ROOTS_ENV, None)
+
+
+def _apply_metadata_seccomp(
+    *, brokered_chmod_syscalls: "frozenset[str]" = frozenset()
+) -> None:
+    """Load the deny-only metadata filter for a child with no broker of its own.
+
+    ``brokered_chmod_syscalls`` carries only those chmod-family variants
+    ``_outer_metadata_broker_brokered_chmod_syscalls`` measured *individually*,
+    by issuing that exact syscall: each one applied a real mode change to this
+    request's own fresh scratch inode, and each one was refused where no
+    unmediated kernel and no merely region-scoped policy could refuse it -- the
+    pathname variants at the filesystem root, one directory beside that scratch
+    and through a symlink inside it, and ``fchmod`` on a descriptor to a target
+    beside the scratch or, failing that, to a hardlinked inode within it.  Those
+    variants alone are left out of this filter so the outer listener's
+    ``USER_NOTIF`` action (which ``SECCOMP_RET_ERRNO`` would otherwise outrank)
+    still decides each call, under that boundary's own owner, ``st_nlink``,
+    symlink, traversal and inode-drift checks against its request-owned scratch
+    roots.  Denying a variant a boundary is already mediating confines nothing
+    -- it only blinds it, which is exactly why unmodified Git could not set
+    ``core.filemode`` on its own ``.git/config.lock``.
+
+    NF-2026-00841 rework: an *unmeasured* variant is never exempted, so the
+    libc-less ``fchmodat2`` stays denied even when its siblings are proven
+    mediated, and the set is intersected with the chmod family so nothing
+    outside it can ever be traded away.  ``fchmod`` is no longer denied on the
+    assumption that a descriptor cannot be probed -- it is measured as itself
+    through descriptors on targets the probe created, because it is the exact
+    syscall Git reaches through an open ``.git/config.lock``, and an inner deny
+    there blinded the outer broker just as it did for the pathname forms.
+    Ownership, xattr, timestamp, ``ptrace``, ``pidfd_getfd`` and
+    ``open_by_handle_at`` stay denied unconditionally, and the default keeps the
+    complete historical deny list.
+    """
     library = _seccomp_library()
     if library is None:
         raise WorkspaceError("seccomp_unavailable")
+    exempt = frozenset(brokered_chmod_syscalls) & frozenset(
+        _METADATA_BROKER_CHMOD_SYSCALLS
+    )
+    denied = tuple(name for name in _SECCOMP_DENIED_SYSCALLS if name not in exempt)
     context = library.seccomp_init(_SCMP_ACT_ALLOW)
     if not context:
         raise WorkspaceError("seccomp_init_failed")
     try:
         action = _SCMP_ACT_ERRNO | errno.EPERM
-        for name in _SECCOMP_DENIED_SYSCALLS:
+        for name in denied:
             number = library.seccomp_syscall_resolve_name(name.encode("ascii"))
             if number < 0:
                 continue
@@ -9654,6 +10456,12 @@ def _landlock_exec(argv: list[str]) -> int:
             "--",
             *command,
         ]
+        # This branch installs a listener of our own, so the roots that decide
+        # every brokered syscall are exactly this request's: nothing is left to
+        # an outer boundary and nothing is declared beyond them.
+        _publish_metadata_authority_roots(
+            declared_metadata_authority_roots(exec_scratch, worker_temp)
+        )
         try:
             child_process = subprocess.Popen(
                 helper_argv,
@@ -9699,7 +10507,30 @@ def _landlock_exec(argv: list[str]) -> int:
     if _metadata_broker_evidence_fd is not None:
         os.close(_metadata_broker_evidence_fd)
         _metadata_broker_evidence_fd = None
-    _apply_metadata_seccomp()
+    # NF-2026-00841: this fallback runs when no listener of our own could be
+    # installed. Beneath an outer broker that is already mediating this exec
+    # scratch, denying the chmod family here only outranks (and blinds) that
+    # boundary, which is what stopped nested Git from setting ``core.filemode``
+    # on its own request-owned ``.git/config.lock``. What is left to that
+    # boundary is never "the family": it is exactly the individual syscall
+    # variants the measurement below issued as themselves and watched apply a
+    # real mode change to this request's own scratch inode while being refused
+    # at the filesystem root, one directory beside that scratch, and through a
+    # symlink inside it. Every unmeasured variant, and every other syscall,
+    # keeps the complete historical deny list.
+    exempted_chmod_syscalls = _outer_metadata_broker_brokered_chmod_syscalls(
+        exec_scratch
+    )
+    # Whatever was left to the outer boundary is decided against *its* roots,
+    # not this nested run's scratch.  Declare that truthfully before exec so the
+    # widening is stated rather than assumed away; the declaration is telemetry
+    # and grants the command nothing it did not already have.
+    _publish_metadata_authority_roots(
+        declared_metadata_authority_roots(
+            exec_scratch, worker_temp, exempted_chmod_syscalls
+        )
+    )
+    _apply_metadata_seccomp(brokered_chmod_syscalls=exempted_chmod_syscalls)
     os.execvpe(command[0], command, os.environ.copy())
     return 126
 
