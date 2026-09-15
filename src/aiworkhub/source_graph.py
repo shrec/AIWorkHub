@@ -5288,6 +5288,194 @@ def _include_semantic_symbols(
     return payload
 
 
+_CALLS_EDGE_SELECT = (
+    "SELECT DISTINCT e.src_qualname AS caller_symbol, e.file_path AS caller_file, "
+    "e.dst_name AS callee_symbol, e.dst_qualname, t.file_path AS callee_file, "
+    "e.line, e.evidence_label, e.confidence FROM edges e "
+    "LEFT JOIN entities t ON t.qualname=e.dst_qualname "
+)
+
+_CALLS_QUERY_SYMBOL_CANDIDATE_CAP = 8
+
+# Kinds that can actually own or receive a call edge. An ``import`` row
+# re-binds a definition that lives in another file, and an
+# ``annotation``/``attribute``/``decorator`` row only mentions one, so none of
+# them can make a callable name ambiguous -- treating them as rival symbols
+# would turn every imported function into an unanswerable ambiguous lookup.
+_CALLS_DEFINITION_KINDS: frozenset[str] = frozenset(
+    {"function", "method", "class", "struct"}
+)
+
+
+def _calls_edge_key(row: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        row.get("caller_symbol"), row.get("caller_file"),
+        row.get("callee_symbol"), row.get("dst_qualname"), row.get("line"),
+    )
+
+
+def _definition_name_is_unique(conn: sqlite3.Connection, name: str) -> bool:
+    """True when exactly one *definition* in the repository owns ``name``."""
+
+    placeholders = ",".join("?" for _ in _CALLS_DEFINITION_KINDS)
+    (count,) = conn.execute(
+        "SELECT COUNT(DISTINCT qualname) FROM entities "
+        f"WHERE name = ? AND kind IN ({placeholders})",
+        (name, *sorted(_CALLS_DEFINITION_KINDS)),
+    ).fetchone()
+    return int(count) == 1
+
+
+def _resolve_calls_query_symbol(
+    conn: sqlite3.Connection, query: str, scope: str,
+) -> tuple[list[dict[str, Any]], str]:
+    """Resolve ``query`` to the exact symbol ``calls`` was asked about.
+
+    Only an EXACT identifier resolves: the whole query must equal an
+    entity's ``name`` or its ``qualname`` (either the stored ``::`` form or
+    the dotted form the tool surface prints). A multi-word or partial query
+    stays deliberately unresolved rather than being guessed at -- ``calls``
+    publishes edges as fact, so a near miss would be published as a
+    confident answer about a symbol nobody named.
+    """
+
+    term = str(query or "").strip()
+    if not term or any(character.isspace() for character in term):
+        return [], "unresolvable_query"
+    clauses = [
+        "kind NOT IN ('file', 'module')",
+        "(name = ? OR qualname = ? OR REPLACE(qualname, '::', '.') = ?)",
+    ]
+    params: list[Any] = [term, term, term]
+    if scope:
+        predicate, scope_params = _analytics_scope_sql_predicate(scope)
+        clauses.append(predicate)
+        params.extend(scope_params)
+    params.append(_CALLS_QUERY_SYMBOL_CANDIDATE_CAP + 1)
+    rows = conn.execute(
+        "SELECT file_path, kind, name, qualname, line_start, line_end FROM entities "
+        "WHERE " + " AND ".join(clauses)
+        + " ORDER BY file_path, line_start, qualname LIMIT ?",
+        params,
+    ).fetchall()
+    by_qualname: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        by_qualname.setdefault(str(row["qualname"] or ""), dict(row))
+    candidates = list(by_qualname.values())
+    definitions = [
+        row for row in candidates
+        if str(row.get("kind") or "") in _CALLS_DEFINITION_KINDS
+    ]
+    # A definition outranks a mention of it: an unscoped query naming an
+    # imported function matched both the function and every ``import`` row
+    # binding it, which read as ambiguity where there was exactly one symbol.
+    # Only when nothing in range is a definition does the wider set decide.
+    candidates = definitions or candidates
+    if not candidates:
+        return [], "no_exact_symbol_in_scope"
+    if len(candidates) > 1:
+        return candidates, "ambiguous_query_symbol"
+    return candidates, "exact_symbol_match"
+
+
+def _calls_edges_for_symbol(
+    conn: sqlite3.Connection, symbol: dict[str, Any], *, limit: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Call edges whose caller or callee IS ``symbol``, not merely its file."""
+
+    cap = max(1, int(limit))
+    qualname = str(symbol.get("qualname") or "")
+    name = str(symbol.get("name") or "")
+    outgoing = [dict(row) for row in conn.execute(
+        _CALLS_EDGE_SELECT
+        + "WHERE e.kind='calls' AND e.src_qualname = ? "
+        "ORDER BY e.confidence DESC, e.file_path, e.line LIMIT ?",
+        (qualname, cap),
+    )]
+    incoming = [dict(row) for row in conn.execute(
+        _CALLS_EDGE_SELECT
+        + "WHERE e.kind='calls' AND e.dst_qualname = ? "
+        "ORDER BY e.confidence DESC, e.file_path, e.line LIMIT ?",
+        (qualname, cap),
+    )]
+    if name and len(incoming) < cap and _definition_name_is_unique(conn, name):
+        # An unresolved call edge records its callee's NAME but not the owner
+        # that name refers to. Attributing such an edge to this symbol is only
+        # safe when the repository defines exactly one definition with that
+        # name; otherwise a same-named function in another module would be
+        # published as a caller of this one -- the false confidence being fixed.
+        seen = {_calls_edge_key(row) for row in incoming}
+        for row in conn.execute(
+            _CALLS_EDGE_SELECT
+            + "WHERE e.kind='calls' AND e.dst_qualname IS NULL AND e.dst_name = ? "
+            "ORDER BY e.confidence DESC, e.file_path, e.line LIMIT ?",
+            (name, cap),
+        ):
+            edge = dict(row)
+            if _calls_edge_key(edge) in seen:
+                continue
+            incoming.append(edge)
+            if len(incoming) >= cap:
+                break
+    return outgoing[:cap], incoming[:cap]
+
+
+def _bind_calls_to_query_symbol(
+    payload: dict[str, Any], conn: sqlite3.Connection, *,
+    query: str, scope: str, limit: int,
+) -> dict[str, Any]:
+    """Make ``calls`` answer about the QUERY symbol, or say that it cannot.
+
+    ``calls`` derived its edges from the scoped FILE list alone, so every
+    call recorded anywhere in src/aiworkhub/task_store.py came back in line
+    order for query ``review_feedback_identity`` and, byte for byte, for any
+    unrelated word -- both labelled ``scope="query_matches"``, a confident
+    claim about a symbol the rows were never selected for. The query now
+    either resolves to exactly one symbol, in which case the edges returned
+    are the ones whose caller or callee IS that symbol (callers in other
+    files included -- that is the point of asking), or it does not resolve,
+    in which case the same file-level rows are still returned but under a
+    label that says what they actually are.
+    """
+
+    if not isinstance(payload, dict):
+        return payload
+    candidates, resolution = _resolve_calls_query_symbol(conn, query, scope)
+    query_symbol: dict[str, Any] = {
+        "requested": str(query or "").strip(),
+        "resolved": None,
+        "resolution": resolution,
+    }
+    if resolution == "exact_symbol_match":
+        symbol = candidates[0]
+        outgoing, incoming = _calls_edges_for_symbol(conn, symbol, limit=limit)
+        payload["scope"] = "query_symbol_matches"
+        payload["outgoing_calls"] = outgoing
+        payload["incoming_calls"] = incoming
+        payload["files"] = [str(symbol.get("file_path") or "")]
+        query_symbol.update({
+            "resolved": str(symbol.get("qualname") or ""),
+            "file_path": symbol.get("file_path"),
+            "line_start": symbol.get("line_start"),
+            "line_end": symbol.get("line_end"),
+        })
+    elif resolution == "ambiguous_query_symbol":
+        # Several distinct symbols answer to this name, so no single edge set
+        # is the answer. Returning one of them would be exactly the confident
+        # false match this mode used to publish, so the caller is handed the
+        # candidate qualnames to re-ask with instead.
+        payload["scope"] = "query_symbol_ambiguous"
+        payload["outgoing_calls"] = []
+        payload["incoming_calls"] = []
+        query_symbol["candidates"] = [
+            str(row.get("qualname") or "") for row in candidates
+        ]
+    else:
+        payload["scope"] = "file_level_call_edges"
+    payload["query_symbol"] = query_symbol
+    return payload
+
+
 def analytics_query(
     repo_root: Path,
     mode: str,
@@ -5431,6 +5619,17 @@ def analytics_query(
             if mode == "symbols":
                 payload = _include_semantic_symbols(
                     payload, corpus, limit=analytic_budget,
+                )
+            if mode == "calls":
+                # ``calls`` publishes edges as fact, so it has to answer about
+                # the symbol it was asked about rather than about whatever the
+                # scoped file happens to call (NF-2026-00861). This runs before
+                # paging and before scope re-assertion so a page is a page of
+                # that symbol's own edges, and so the engine still gets the last
+                # word on scope afterwards.
+                payload = _bind_calls_to_query_symbol(
+                    payload, conn, query=query, scope=normalized_target,
+                    limit=analytic_budget,
                 )
             if offset:
                 payload = _drop_analytics_result_prefix(payload, mode, offset)
