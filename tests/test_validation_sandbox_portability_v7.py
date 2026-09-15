@@ -1977,7 +1977,14 @@ class TestNF841AuthenticatedDenialIsNotStructurallyTerminal:
         git_dir = scratch / ".git"
         git_dir.mkdir(mode=0o700)
         target = git_dir / "config.lock"
-        handle = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o664)
+        # Creation modes are filtered through the host umask. Pin it while
+        # constructing this fixture so the untouched-mode assertion below is
+        # deterministic on local shells and GitHub runners alike.
+        previous_umask = os.umask(0)
+        try:
+            handle = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o664)
+        finally:
+            os.umask(previous_umask)
         try:
             os.write(handle, b"x")
         finally:
