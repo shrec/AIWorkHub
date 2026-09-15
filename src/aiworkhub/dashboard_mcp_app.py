@@ -218,6 +218,995 @@ def _storage_write_authority_flags() -> dict[str, bool]:
 
 MAX_MODEL_POLICY_CATALOG_ROWS = 64
 
+# Ingestion bound, distinct from the compact render bound above. The rows that
+# survive into the response are chosen per provider, and that choice can only
+# be fair if it has seen every provider first: a head slice taken before the
+# grouping deletes whichever providers sort last, entirely and silently.
+MAX_MODEL_POLICY_SOURCE_ROWS = 512
+
+# The hard ceilings neither of the two bounds above may pass. Both are raised
+# to a correctness floor -- every rendered provider represented, every
+# explicitly configured route reserved -- and the second half of that floor is
+# derived from ``models.json``, a file this module does not control and nothing
+# else bounds. One declared leaf per catalog row therefore pinned every row and
+# lifted both "bounds" to the whole catalog: not a bounded payload with a
+# raised floor, but an unbounded one still publishing a row_limit beside
+# itself. Past these numbers provider representation is admitted first and the
+# pins that did not fit are counted rather than dropped in silence.
+MAX_MODEL_POLICY_CATALOG_ROW_CEILING = 256
+MAX_MODEL_POLICY_SOURCE_ROW_CEILING = 1024
+
+# And the read of that file is bounded too, for the same reason: leaves become
+# pins, and pins become reserved rows. The payload publishes the file's real
+# leaf count beside this, so a declaration set larger than the view can read is
+# stated rather than silently shortened.
+MAX_MODEL_POLICY_DECLARED_LEAVES = 1024
+
+# The two discovery boundaries this module reads are already bounded by their
+# own producers, and neither publishes a total beside the list it returns. So
+# the ingestion bounds below could not bind on them at all: 512 never binds on
+# a list a producer already cut to 64 or 128, which made the bound's own
+# ``truncated`` signal unable to fire and published the survivors' count as the
+# host's total. A provider was therefore understated, and a configured route
+# the producer had omitted was labelled as one no source ever offered.
+#
+# These mirror those producers' caps -- ``workforce_catalog``'s OpenCode row
+# cap and ``vscode_lm_bridge``'s observed-model slice -- and are used ONLY as
+# evidence that an upstream bound bound, never to re-impose one here. A list
+# that comes back at its producer's ceiling is a list whose tail is unknown,
+# and that is what gets published rather than a total this module cannot see.
+OPENCODE_UPSTREAM_IDENTITY_CEILING = 64
+EDITOR_UPSTREAM_MODEL_CEILING = 128
+
+# The OpenCode snapshot this module RECOVERS is bounded by its own producer too,
+# and not by the generic source ceiling above. ``repo_policy`` publishes
+# ``provider_observed_models`` either as ``parse_opencode_models_output``'s
+# 64-row read of ``opencode models`` or as a 128-row slice of the host's
+# observed list, so a recovered list can never reach
+# MAX_MODEL_POLICY_SOURCE_ROW_CEILING: a floor tested against that number was
+# unreachable outside a synthetic snapshot, and an at-cap host therefore
+# published its recovered length as an exact total -- the same understatement
+# the recovery exists to remove, one layer in. These are the lengths that mean
+# "this list may itself have been cut", used ONLY as evidence and never to
+# re-impose a bound. A list longer than both was cut by neither.
+OPENCODE_UPSTREAM_OFFERED_CEILINGS = (
+    # The CLI path: the parser's own row cap, the same one that tells this
+    # module the producer's identity ceiling bound.
+    OPENCODE_UPSTREAM_IDENTITY_CEILING,
+    # The readiness path: repo_policy's slice of the host's observed list.
+    128,
+)
+
+
+def _policy_route_keys(
+    provider: str,
+    adapter: str,
+    model: str,
+) -> set[tuple[str, str, str]]:
+    """Both identities one launch route answers to: as written, and canonical.
+
+    ``models.json`` may name an OpenCode decision under the vendor provider it
+    was discovered as -- ``xai``/``opencode_cli`` -- while the catalog row for
+    that same launch route carries the canonical policy owner that
+    ``policy_route_identity`` assigns it, ``opencode``/``opencode_cli``.
+    Comparing a single spelling therefore fails to recognise the two as one
+    route, and an explicit decision silently stops pinning the row it was
+    written for. Emitting both spellings makes the comparison symmetric
+    whichever side of it the caller happens to hold.
+    """
+
+    written = (str(provider)[:128], str(adapter)[:128], str(model)[:128])
+    try:
+        canonical_provider, canonical_adapter = (
+            workforce_catalog.policy_route_identity(provider, adapter)
+        )
+    except model_settings.ModelSettingsError:
+        # An identity the policy layer refuses to normalise still names a row
+        # verbatim; it simply has no second spelling to be compared against.
+        return {written}
+    return {
+        written,
+        (canonical_provider[:128], canonical_adapter[:128], written[2]),
+    }
+
+
+def _declared_policy_leaves(
+    policy: Mapping[str, Any],
+    *,
+    limit: int,
+) -> tuple[list[tuple[str, str, str]], int]:
+    """Route leaves the owner wrote, bounded, beside the count the file holds.
+
+    Separated from the pin key space below because the two answer different
+    questions. Pinning needs both spellings of a route so a comparison against
+    an already-built row is symmetric; building a row *from* a declaration
+    needs the declaration itself, once, so one decision cannot become two rows.
+
+    The read is bounded because nothing else bounds this file and every leaf in
+    it becomes a pin -- a pin the row bounds then reserve a slot for. Read
+    without a limit, a large ``models.json`` therefore sized the payload rather
+    than the payload's own caps doing it. The declared total is returned
+    alongside so the caller can state that the file was read short, which a
+    shorter list of decisions cannot say for itself.
+    """
+
+    leaves: list[tuple[str, str, str]] = []
+    declared = 0
+    models = policy.get("models")
+    if not isinstance(models, Mapping):
+        return leaves, declared
+    for provider, adapters in models.items():
+        if not isinstance(adapters, Mapping):
+            continue
+        for adapter, entries in adapters.items():
+            if not isinstance(entries, Mapping):
+                continue
+            for model in entries:
+                declared += 1
+                if len(leaves) < limit:
+                    leaves.append((str(provider), str(adapter), str(model)))
+    return leaves, declared
+
+
+def _explicit_policy_routes(
+    leaves: list[tuple[str, str, str]],
+) -> set[tuple[str, str, str]]:
+    """Exact routes the repository owner named in the model settings file.
+
+    A route somebody explicitly switched on or off is a decision, not a
+    discovery. It must stay in the rendered payload whatever the compact bound
+    costs elsewhere, because a route the Webview never draws is a route nobody
+    can toggle back without hand-editing ``.aiworkhub/config/models.json``.
+
+    Every decision is recorded under both the identity it was written with and
+    the canonical policy identity the catalog rows carry, so a vendor-keyed
+    OpenCode decision pins the row it names rather than a route that does not
+    exist.
+
+    Takes the leaves the caller already read rather than the policy mapping, so
+    the pin set is exactly the set of decisions that caller reports on and the
+    two can never describe different reads of the same file.
+    """
+
+    routes: set[tuple[str, str, str]] = set()
+    for provider, adapter, model in leaves:
+        routes |= _policy_route_keys(provider, adapter, model)
+    return routes
+
+
+def _row_route_keys(row: Mapping[str, Any]) -> set[tuple[str, str, str]]:
+    """The canonical and vendor spellings of one already-built catalog row."""
+
+    keys = {(row["provider"], row["adapter"], row["model"])}
+    vendor_provider = str(row.get("vendor_provider") or "")
+    declared_adapter = str(row.get("declared_adapter") or "")
+    if vendor_provider and declared_adapter:
+        keys.add(
+            (vendor_provider[:128], declared_adapter[:128], row["model"])
+        )
+    return keys
+
+
+def _bounded_provider_selection(
+    group_keys: list[str],
+    *,
+    limit: int,
+    ceiling: int,
+    reserved: set[int],
+    rendered_keys: list[str] | None = None,
+) -> tuple[set[int], int, int]:
+    """Spend a row bound from a floor and one group at a time, never as a head.
+
+    A head slice deletes whichever groups sort or arrive last, entirely and
+    silently, and paying reserved rows out of the same budget first reproduces
+    that loss one layer down. So selection starts from what correctness
+    requires -- the caller's reserved indices, plus the first index of any
+    group those left unrepresented -- and only then hands the remaining budget
+    out one row per group per round.
+
+    ``group_keys`` is the partition the budget is spent *between*; where the
+    caller has a second, coarser partition that the payload is *rendered and
+    counted* in, it passes that as ``rendered_keys``. The two are genuinely
+    different maps rather than one nested inside the other: a vendor reaching
+    two adapters is a single group to be fair between and two rendered
+    providers. Representing only the finer one therefore still allowed a whole
+    rendered provider to be emptied -- and its loss entry, filed in the
+    rendered key space, to name a family nothing drew -- so both get a floor.
+
+    ``ceiling`` is the number that floor may not pass. ``reserved`` is derived
+    from the owner's declaration file, which nothing else bounds, so a
+    declaration naming every row pinned every row and raised the "bound" to the
+    whole catalog: an unbounded payload still reporting a limit. Past the
+    ceiling the representatives are admitted first -- rendered providers, then
+    vendors -- and the reserved indices in catalog order, and whatever does not
+    fit is returned as a count rather than disappearing. A bucket holding a
+    reserved index is represented by that index rather than by its first row,
+    so representation and an explicit decision share one slot wherever they
+    can and the ceiling refuses the fewest reserved indices it can.
+
+    Returns the selected indices, the limit actually honoured -- the declared
+    bound raised to the floor and clamped to the ceiling -- and how many
+    reserved indices the ceiling refused.
+    """
+
+    by_group: dict[str, list[int]] = {}
+    for index, key in enumerate(group_keys):
+        by_group.setdefault(key, []).append(index)
+    groups = sorted(by_group)
+
+    by_rendered: dict[str, list[int]] = {}
+    for index, key in enumerate(rendered_keys or group_keys):
+        by_rendered.setdefault(key, []).append(index)
+
+    hard_ceiling = max(0, ceiling)
+
+    def _represent(floor: set[int]) -> set[int]:
+        for buckets in (by_rendered, by_group):
+            for key in sorted(buckets):
+                indices = buckets[key]
+                if not any(index in floor for index in indices):
+                    floor.add(indices[0])
+        return floor
+
+    selected = _represent(set(reserved))
+    refused_reserved = 0
+    if len(selected) > hard_ceiling:
+        # The floor no longer fits, so what it is spent on has to be a decision
+        # rather than whatever a set happens to iterate first. A provider with
+        # no row at all is the one failure the Webview offers no remedy for, so
+        # representation is admitted ahead of the named decisions, and the
+        # decisions that do not fit are counted for the caller to publish.
+        ordered: list[int] = []
+        seen: set[int] = set()
+
+        def _push(index: int) -> None:
+            if index not in seen:
+                seen.add(index)
+                ordered.append(index)
+
+        for buckets in (by_rendered, by_group):
+            for key in sorted(buckets):
+                indices = buckets[key]
+                if any(index in seen for index in indices):
+                    continue
+                # A bucket that already holds a reserved index is represented
+                # BY that index. Rebuilding from an empty ``seen`` and taking
+                # ``indices[0]`` spent one slot on a row nobody asked for and
+                # then charged the pin it displaced to ``refused_reserved`` --
+                # two slots for one bucket, and a refusal count larger than the
+                # ceiling actually forces. Representation still outranks the
+                # decisions; it just stops paying twice for the same row.
+                _push(
+                    next(
+                        (index for index in indices if index in reserved),
+                        indices[0],
+                    )
+                )
+        for index in sorted(reserved):
+            _push(index)
+        selected = set(ordered[:hard_ceiling])
+        refused_reserved = sum(
+            1 for index in reserved if index not in selected
+        )
+
+    # A bound below the floor cannot represent every group and every explicit
+    # decision however fairly it is spent. It is still a bound, and the caller
+    # publishes this number so the payload never claims a tighter bound than
+    # the one it honoured -- nor a looser one than the ceiling allows.
+    effective_limit = min(max(limit, len(selected)), hard_ceiling)
+
+    cursors = dict.fromkeys(groups, 0)
+    progressed = True
+    while progressed and len(selected) < effective_limit:
+        progressed = False
+        for group in groups:
+            if len(selected) >= effective_limit:
+                break
+            indices = by_group[group]
+            cursor = cursors[group]
+            while cursor < len(indices) and indices[cursor] in selected:
+                cursor += 1
+            if cursor >= len(indices):
+                cursors[group] = cursor
+                continue
+            selected.add(indices[cursor])
+            cursors[group] = cursor + 1
+            progressed = True
+    return selected, effective_limit, refused_reserved
+
+
+def _canonical_route_key(
+    provider: str,
+    adapter: str,
+    model: str,
+) -> tuple[str, str, str]:
+    """The exact identity triple a rendered row carries for one launch route.
+
+    Its first element is the provider key a rendered row -- and the Webview's
+    tree -- groups by: one key space, used by ``provider_counts`` and by the
+    ingestion loss beside it, so a reader never has to know which of a route's
+    two spellings a given number was filed under. Counting how many routes a
+    bound actually cost needs the whole identity instead, because the
+    configured catalog and the discovery probes describe overlapping
+    populations: the same launch route refused by two sources is one route the
+    payload is missing, not two.
+    """
+
+    try:
+        canonical_provider, canonical_adapter = (
+            workforce_catalog.policy_route_identity(provider, adapter)
+        )
+    except model_settings.ModelSettingsError:
+        # An identity the policy layer refuses to normalise still names itself,
+        # and a row built from it would carry that same spelling.
+        return (str(provider)[:128], str(adapter)[:128], str(model)[:128])
+    return (
+        canonical_provider[:128],
+        canonical_adapter[:128],
+        str(model)[:128],
+    )
+
+
+def _ingestion_loss(
+    canonical_keys: list[str],
+    group_keys: list[str],
+    selected: set[int],
+) -> list[dict[str, Any]]:
+    """Per-provider truth about what one ingestion bound just cost.
+
+    Every ingestion source -- the configured catalog, the OpenCode discovery
+    probe and the editor bridge -- spends fairness per *vendor* spelling, which
+    is the finer partition: two vendors discovered through OpenCode are two
+    groups there and one family in the tree, so neither is starved by a sibling
+    that merely shares its canonical owner. The loss is *reported* in the
+    canonical key space instead, because that is the one the rendered rows and
+    the Webview group by -- filed under ``xai``, an ``xai``/``opencode_cli``
+    shortfall named a family the tree never draws, so the number was published
+    and still unreachable.
+
+    This is one source's own account of its own rows, and it is listed only for
+    providers that actually lost some. It is deliberately not the number a
+    provider's *size* is stated from: two sources can refuse the same launch
+    route, so summing their raw drop counts would count that route twice and
+    inflate the denominator the tree divides by. The caller dedupes dropped
+    route identities instead.
+    """
+
+    totals: dict[str, int] = {}
+    ingested: dict[str, int] = {}
+    vendors: dict[str, set[str]] = {}
+    for index, key in enumerate(canonical_keys):
+        totals[key] = totals.get(key, 0) + 1
+        if index in selected:
+            ingested[key] = ingested.get(key, 0) + 1
+        else:
+            vendors.setdefault(key, set()).add(group_keys[index])
+    return [
+        {
+            "provider": key,
+            "total": totals[key],
+            "ingested": ingested.get(key, 0),
+            "dropped": totals[key] - ingested.get(key, 0),
+            # Which vendor spellings under this canonical owner actually lost
+            # rows, so grouping by the canonical key never hides that it was
+            # xai rather than opencode itself that was cut.
+            "vendor_providers": sorted(vendors.get(key, set())),
+        }
+        for key in sorted(totals)
+        if totals[key] > ingested.get(key, 0)
+    ]
+
+
+def _bounded_source_rows(
+    source_rows: list[Mapping[str, Any]],
+    *,
+    limit: int,
+    ceiling: int,
+    pinned: set[tuple[str, str, str]],
+) -> tuple[
+    list[Mapping[str, Any]],
+    list[dict[str, Any]],
+    list[tuple[str, str, str]],
+    int,
+    int,
+]:
+    """Ingest at most ``limit`` catalog rows without losing a whole provider.
+
+    The render bound below can only be fair if it has seen every provider, so
+    ingestion cannot be a head slice either: a provider whose first row sits
+    at index 600 of a 1000-row catalog was deleted before grouping ever ran,
+    and no downstream fairness could bring it back. Ingestion is therefore
+    spent by the same floor-first, one-row-per-provider rule, with explicitly
+    configured routes reserved so a named decision survives its own catalog
+    position.
+
+    "Provider" means two things here and the bound owes both a floor. The
+    vendor spelling a row was declared under is the finer partition and the
+    fair one to spend a budget between; the canonical provider the row is
+    rendered, counted and reported under is the coarser one. They are not
+    nested the way a single key list assumes -- an ``xai`` vendor reaching both
+    ``opencode_cli`` and ``grok_kilo_cli`` is one vendor group and two rendered
+    providers -- so a floor spent only per vendor could still admit nothing but
+    the OpenCode half and delete the whole rendered ``xai`` provider, whose
+    ingestion-loss entry the tree would then have no family to reach. Both key
+    spaces are handed to the selection for exactly that reason.
+
+    Rows missing a provider, adapter or model are dropped up front because the
+    caller cannot build a route from them; spending ingestion budget on them
+    would cost a real provider a slot.
+
+    Returns the ingested rows in catalog order, the per-provider ingestion loss,
+    the canonical route identities the bound refused -- identities rather than a
+    count, because the caller has to fold three sources together and the same
+    route refused twice is one row missing -- the bound actually honoured, the
+    declared limit raised to the floor and then clamped to ``ceiling``, and how
+    many pins that clamp refused. The honoured figure used to be discarded, and
+    while it was, a floor a pin had legitimately raised and a cap that simply
+    failed to hold were indistinguishable from the payload.
+    """
+
+    usable: list[Mapping[str, Any]] = []
+    group_keys: list[str] = []
+    canonical_keys: list[str] = []
+    route_keys: list[tuple[str, str, str]] = []
+    reserved: set[int] = set()
+    for row in source_rows:
+        vendor_provider = str(row.get("provider") or "")
+        declared_adapter = str(row.get("adapter_id") or "")
+        model = str(row.get("model") or "")
+        if not vendor_provider or not declared_adapter or not model:
+            continue
+        if _policy_route_keys(vendor_provider, declared_adapter, model) & pinned:
+            reserved.add(len(usable))
+        usable.append(row)
+        group_keys.append(vendor_provider[:128])
+        route_keys.append(
+            _canonical_route_key(vendor_provider, declared_adapter, model)
+        )
+        canonical_keys.append(route_keys[-1][0])
+
+    selected, honoured, pins_refused = _bounded_provider_selection(
+        group_keys,
+        limit=limit,
+        ceiling=ceiling,
+        reserved=reserved,
+        rendered_keys=canonical_keys,
+    )
+    rows = [row for index, row in enumerate(usable) if index in selected]
+    loss = _ingestion_loss(canonical_keys, group_keys, selected)
+    dropped_routes = [
+        key for index, key in enumerate(route_keys) if index not in selected
+    ]
+    return rows, loss, dropped_routes, honoured, pins_refused
+
+
+def _refused_source_rows(
+    source_rows: list[Mapping[str, Any]],
+    dropped_routes: list[tuple[str, str, str]],
+) -> dict[tuple[str, str, str], Mapping[str, Any]]:
+    """Configured rows an ingestion bound refused, keyed by route identity.
+
+    A refused row is still a row the catalog stated: it carries a ``worker_id``
+    and an ``enabled`` value the owner can read. Rebuilding that route from the
+    owner's declaration instead blanks both -- publishing a configured, possibly
+    disabled route as one no source ever offered -- so the refused row itself is
+    carried past the bound and used to materialise its own identity.
+
+    Keyed in the same canonical space the rendered rows and the declared leaves
+    use, because the declaration and the catalog row may spell the same launch
+    route differently and a lookup on one spelling would miss the other.
+    """
+
+    refused = set(dropped_routes)
+    if not refused:
+        return {}
+    by_key: dict[tuple[str, str, str], Mapping[str, Any]] = {}
+    for row in source_rows:
+        vendor_provider = str(row.get("provider") or "")
+        declared_adapter = str(row.get("adapter_id") or "")
+        model = str(row.get("model") or "")
+        if not vendor_provider or not declared_adapter or not model:
+            continue
+        key = _canonical_route_key(vendor_provider, declared_adapter, model)
+        if key in refused:
+            by_key.setdefault(key, row)
+    return by_key
+
+
+def _bounded_identity_ingestion(
+    entries: list[tuple[str, str]],
+    *,
+    adapter: str,
+    limit: int,
+    ceiling: int,
+    pinned: set[tuple[str, str, str]],
+    upstream_refused: list[tuple[str, str]] | None = None,
+    upstream_ceiling_bound: bool = False,
+) -> dict[str, Any]:
+    """Ingest at most ``limit`` discovered identities, vendor-fairly.
+
+    A discovery probe is the second kind of ingestion source, and both of the
+    ones this module reads had kept the head slice the configured catalog
+    already gave up. ``opencode models`` lists every vendor it can reach in one
+    flat sequence and the editor bridge lists every identity the Copilot host
+    reported, so whatever either listed last was deleted whole before the tree
+    grouped anything -- and a route the owner had explicitly configured went
+    with it, because pins were never consulted here at all. Nothing downstream
+    could even report the loss: the discovery counts were incremented after the
+    slice, so they described the survivors and published that as the source's
+    total.
+
+    Selection is therefore the same floor-first, one-identity-per-vendor rule
+    the catalog source uses, with explicitly configured routes reserved under
+    either spelling, and the loss reported in the canonical key space the
+    Webview's tree actually groups by. That key space is also handed to the
+    selection as the rendered partition, because a vendor and the provider its
+    routes are drawn under are not the same map: one vendor reaching two
+    adapters is a single group to be fair between and two rendered providers,
+    so vendor fairness alone could still empty one of them and file that loss
+    under a family the tree never draws.
+
+    ``entries`` are ``(identity, vendor_provider)`` pairs the caller has already
+    reduced to identities it can build a route from, because spending ingestion
+    budget on one it would discard afterwards costs a real vendor a slot.
+
+    ``upstream_refused`` are identities the source's own PRODUCER cut before
+    this module was handed anything -- ``(identity, vendor_provider)`` pairs the
+    caller recovered from the producer's input. They are appended after the
+    selection has already run, so they can never be ingested here, yet they do
+    count in this source's total, in its per-provider loss and in the canonical
+    route identities it reports as refused. Without them the bound described
+    only the rows it was given: 512 cannot bind on a list a producer already cut
+    to 64, so ``truncated`` was structurally False and the delivered length was
+    published as the host's total -- an understated provider, and a configured
+    route the producer had dropped labelled as one nothing ever offered.
+
+    ``upstream_ceiling_bound`` says the producer's own cap bound while the
+    refused identities themselves could not be recovered (the editor bridge
+    returns a slice and no total). Then the total below is a floor and not a
+    measurement, and it is published as such rather than as a complete count.
+
+    Returns the ingested identities in discovery order alongside the exact
+    total/returned/truncated truth, the bound actually honoured, the pins the
+    ceiling refused, the per-provider loss, and the canonical route identities
+    the bound refused.
+    """
+
+    usable: list[str] = []
+    group_keys: list[str] = []
+    canonical_keys: list[str] = []
+    route_keys: list[tuple[str, str, str]] = []
+    reserved: set[int] = set()
+    for identity, vendor_provider in entries:
+        if _policy_route_keys(vendor_provider, adapter, identity) & pinned:
+            reserved.add(len(usable))
+        usable.append(identity)
+        group_keys.append(vendor_provider[:128])
+        route_keys.append(
+            _canonical_route_key(vendor_provider, adapter, identity)
+        )
+        canonical_keys.append(route_keys[-1][0])
+
+    selected, honoured, pins_refused = _bounded_provider_selection(
+        group_keys,
+        limit=limit,
+        ceiling=ceiling,
+        reserved=reserved,
+        rendered_keys=canonical_keys,
+    )
+    ingested = [
+        identity for index, identity in enumerate(usable) if index in selected
+    ]
+    # Delivered is what this bound was actually offered; everything appended
+    # below is what the producer had already refused. Both are published,
+    # because "the cap upstream bound" and "the cap here bound" have different
+    # remedies and only one of them is this module's to raise.
+    delivered = len(usable)
+    for identity, vendor_provider in upstream_refused or []:
+        usable.append(identity)
+        group_keys.append(vendor_provider[:128])
+        route_keys.append(
+            _canonical_route_key(vendor_provider, adapter, identity)
+        )
+        canonical_keys.append(route_keys[-1][0])
+    return {
+        "identities": ingested,
+        "total": len(usable),
+        "delivered": delivered,
+        "returned": len(ingested),
+        "truncated": len(ingested) < len(usable),
+        # The producer cut and this module could not name what it cut, so the
+        # total above is the largest population anyone here can evidence and
+        # not the host's. A label must say "at least" rather than claim it.
+        "total_is_lower_bound": bool(upstream_ceiling_bound),
+        "upstream_refused": len(usable) - delivered,
+        "row_limit_honoured": honoured,
+        "pinned_routes_refused": pins_refused,
+        "ingestion_loss": _ingestion_loss(
+            canonical_keys, group_keys, selected
+        ),
+        "dropped_routes": [
+            key for index, key in enumerate(route_keys) if index not in selected
+        ],
+        # The tail of that same list, named apart because it was refused by a
+        # different cap. These keys were appended after the selection had run,
+        # so none of them can be in ``selected`` -- they are dropped by
+        # construction and by a bound this module never applied. Folded into
+        # the count above they made a producer's ceiling read as this
+        # ingestion's, which points a reader at the wrong limit to raise.
+        "upstream_dropped_routes": route_keys[delivered:],
+    }
+
+
+def _opencode_offered_identities(
+    preflight: Mapping[str, Any] | None,
+) -> list[str]:
+    """The raw identity list the OpenCode producer was itself handed.
+
+    ``opencode_identities_from_preflight`` parses this list and stops at
+    ``workforce_catalog``'s own row cap, returning no count of what it left
+    behind. The snapshot it read is right here though, so the population the
+    parser was given is recoverable at this boundary rather than lost at it --
+    which is the difference between "this provider has 64 routes" and "this
+    provider has 201, of which 64 were parsed".
+    """
+
+    if not isinstance(preflight, Mapping):
+        return []
+    for item in preflight.get("providers") or []:
+        if not isinstance(item, Mapping):
+            continue
+        if str(item.get("adapter_id") or "") != "opencode_cli":
+            continue
+        raw = item.get("provider_observed_models")
+        if not isinstance(raw, list):
+            raw = item.get("observed_models")
+        if not isinstance(raw, list):
+            return []
+        # Bounded by the same ceiling the ingestion below honours, so recovering
+        # the producer's input can never make this payload unbounded.
+        return [
+            value for value in raw[:MAX_MODEL_POLICY_SOURCE_ROW_CEILING]
+            if isinstance(value, str)
+        ]
+    return []
+
+
+def _bounded_opencode_identities(
+    identities: list[str],
+    *,
+    offered: list[str],
+    limit: int,
+    ceiling: int,
+    pinned: set[tuple[str, str, str]],
+) -> dict[str, Any]:
+    """Bound the OpenCode probe, grouped by the vendor each identity names.
+
+    The vendor prefix is the finer partition and the fair one to spend the
+    bound between; the canonical ``opencode`` owner all of them share is what
+    the loss is later reported under, and what the rendered rows group by.
+
+    ``offered`` is what the producer was handed before its own 64-row cap ran.
+    The cap is only treated as having bound when the parse came back AT it:
+    below that the parser saw every candidate, so anything missing was rejected
+    on identity grounds rather than refused by a bound, and reporting those as
+    lost routes would invent a shortfall. At the cap the remainder is unexamined
+    and its well-formed identities are exactly the routes the producer cost this
+    view -- named, so they dedupe against the other sources and so a declared one
+    is rebuilt as the discovered row it is rather than as an undiscovered one.
+
+    That recovery can be partial, and where it is the total is published as a
+    floor, and the snapshot it reads is bounded by its own producer rather than
+    by this module's recovery ceiling: ``repo_policy`` publishes it as the
+    parser's 64-row read of ``opencode models`` or as a 128-row slice of the
+    host's observed list. An unreadable snapshot names nothing, one that
+    arrives AT either producer cap has an unexamined tail of its own, and one
+    longer than the recovery ceiling is read only that far -- so at the
+    producer's cap each case leaves identities past what anyone here can see:
+    ``at least N`` rather than ``N``, which is what ``total_is_lower_bound``
+    carries to the provider's own counts. A recovered list longer than both
+    producer caps was cut by neither, and its total stays a measurement.
+    """
+
+    entries: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for value in identities:
+        identity = str(value)[:128]
+        if not identity:
+            continue
+        seen.add(identity)
+        vendor_provider, _sep, _remainder = identity.partition("/")
+        entries.append((identity, vendor_provider.lower() or "opencode"))
+
+    upstream_refused: list[tuple[str, str]] = []
+    producer_capped = len(entries) >= OPENCODE_UPSTREAM_IDENTITY_CEILING
+    if producer_capped:
+        for value in offered:
+            identity = str(value).strip()[:128]
+            if not identity or identity in seen:
+                continue
+            if not workforce_catalog.model_identity_valid(identity):
+                continue
+            seen.add(identity)
+            vendor_provider, _sep, _remainder = identity.partition("/")
+            upstream_refused.append(
+                (identity, vendor_provider.lower() or "opencode")
+            )
+    # Recovering the producer's input is what makes this boundary's total a
+    # measurement rather than a floor, and the recovery can itself come up
+    # short: a snapshot that carries no readable list leaves nothing to read,
+    # and one longer than the recovery ceiling is read only as far as that
+    # ceiling. In both cases identities exist past what was recovered, so the
+    # total below is the largest population anyone here can evidence and the
+    # payload must say "at least". Detecting the producer's cap and then
+    # publishing an exact count over a tail nobody saw is the same
+    # understatement the cap detection exists to remove, one layer in.
+    #
+    # Which lengths mean "cut" comes from the producer that WROTE this
+    # snapshot, not from the ceiling this module happens to read it through.
+    # repo_policy publishes it as the parser's 64-row read or as a 128-row
+    # slice of the host's observed list, so it can never reach
+    # MAX_MODEL_POLICY_SOURCE_ROW_CEILING: tested against that number alone the
+    # floor was unreachable in production, and an at-cap host published its
+    # recovered length as an exact total. The recovery ceiling is still checked
+    # below it, because a snapshot read only that far has an unseen tail for
+    # this module's own reason, while a list longer than both producer caps was
+    # cut by neither and stays a measurement.
+    offered_count = len(offered)
+    upstream_ceiling_bound = producer_capped and (
+        not offered
+        or offered_count in OPENCODE_UPSTREAM_OFFERED_CEILINGS
+        or offered_count >= MAX_MODEL_POLICY_SOURCE_ROW_CEILING
+    )
+    return _bounded_identity_ingestion(
+        entries,
+        adapter="opencode_cli",
+        limit=limit,
+        ceiling=ceiling,
+        pinned=pinned,
+        upstream_refused=upstream_refused,
+        upstream_ceiling_bound=upstream_ceiling_bound,
+    )
+
+
+def _bounded_observed_models(
+    observed_models: list[Any],
+    *,
+    limit: int,
+    ceiling: int,
+    pinned: set[tuple[str, str, str]],
+) -> dict[str, Any]:
+    """Bound the editor bridge's observed identities the same way.
+
+    Every one of these is a ``copilot``/``vscode_lm`` route, so vendor fairness
+    has a single group to be fair between and the bound's real work here is the
+    pinned-route reservation and the count truth. A head slice was still a
+    defect for both: a host reporting more identities than the cap hid whichever
+    it listed last -- including a route the owner had explicitly configured, and
+    which therefore lost the control that would switch it back -- and then
+    published the survivors' count as the host's total, so the loss did not
+    merely go unfixed, it went unstated.
+
+    The bridge applies that same slice one layer up and publishes no total
+    beside it, and unlike the OpenCode boundary its input is not reachable from
+    here -- so at the ceiling the only honest statement is that the tail is
+    unknown. The count is published as a floor rather than as the host's total,
+    which is what ``total_is_lower_bound`` carries downstream; claiming the
+    delivered length instead is the same understatement one source over.
+
+    Identities the catalog could not build a route from are filtered here rather
+    than after selection, so the bound is never spent on a row that is about to
+    be discarded anyway.
+    """
+
+    entries: list[tuple[str, str]] = []
+    for value in observed_models:
+        model = str(value).strip()
+        if not model or not workforce_catalog.model_identity_valid(model):
+            continue
+        entries.append((model[:128], "copilot"))
+    return _bounded_identity_ingestion(
+        entries,
+        adapter="vscode_lm",
+        limit=limit,
+        ceiling=ceiling,
+        pinned=pinned,
+        upstream_ceiling_bound=(
+            len(observed_models) >= EDITOR_UPSTREAM_MODEL_CEILING
+        ),
+    )
+
+
+def _bounded_catalog_rows(
+    workers: list[dict[str, Any]],
+    *,
+    limit: int,
+    ceiling: int,
+    pinned: set[tuple[str, str, str]],
+    dropped_before_ingestion: Mapping[str, int] | None = None,
+    lower_bound_providers: set[str] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int, int]:
+    """Spend the compact row bound from a floor, not from the head of a sort.
+
+    A head slice over the globally sorted catalog is what dropped whole
+    providers, and paying pinned routes out of the same budget first
+    reproduced that loss one layer down: with 64 explicitly configured leaves
+    sorting before ``xai``, the bound was exhausted before the round-robin ran
+    at all, so the last provider vanished again and the pins past the cutoff
+    were dropped in silence.
+
+    So the selection starts from what correctness requires rather than from
+    what sorts first. Reserved are every explicitly configured route -- matched
+    on either its canonical or its vendor spelling, because the row and the
+    decision need not have been written the same way -- plus one route for
+    each provider those pins left unrepresented. Both parts are bounded by the
+    ingestion cap the caller applies before calling here. Whatever budget
+    remains is handed out one route per provider per round, and survivors are
+    returned in the caller's canonical sort order, so ordering still comes from
+    identity and never from a provider preference.
+
+    The floor is itself capped by ``ceiling``. Reserved is one index per
+    explicitly configured route and models.json is the owner's file, so without
+    that cap a declaration naming every catalog row raised the floor to the
+    whole catalog: the payload stopped being bounded while still publishing a
+    row_limit. Past the ceiling, provider representation is admitted first and
+    the pins that did not fit are counted.
+
+    Returns the rows, the per-provider count truth, the limit actually
+    honoured, and how many explicitly configured routes the ceiling refused.
+    """
+
+    by_provider: dict[str, list[int]] = {}
+    for index, row in enumerate(workers):
+        by_provider.setdefault(row["provider"], []).append(index)
+    providers = sorted(by_provider)
+
+    reserved: set[int] = {
+        index
+        for index, row in enumerate(workers)
+        if _row_route_keys(row) & pinned
+    }
+    # The rows are already in the canonical provider key space the Webview
+    # groups by, so the fairness partition and the rendered partition are the
+    # same one here and no second key list is needed.
+    selected, effective_limit, pins_refused = _bounded_provider_selection(
+        [row["provider"] for row in workers],
+        limit=limit,
+        ceiling=ceiling,
+        reserved=reserved,
+    )
+
+    rows = [row for index, row in enumerate(workers) if index in selected]
+    returned_by_provider: dict[str, int] = {}
+    enabled_returned: dict[str, int] = {}
+    for row in rows:
+        provider = row["provider"]
+        returned_by_provider[provider] = returned_by_provider.get(provider, 0) + 1
+        if row.get("effective_enabled"):
+            enabled_returned[provider] = enabled_returned.get(provider, 0) + 1
+    # The enabled count a reader cares about is the provider's, not the
+    # surviving rows'. Counting it only from ``rows`` would state the bound's
+    # arithmetic as the provider's truth, so it is counted over every row the
+    # provider had before the bound was spent.
+    enabled_total: dict[str, int] = {
+        provider: sum(
+            1 for index in indices if workers[index].get("effective_enabled")
+        )
+        for provider, indices in by_provider.items()
+    }
+    # What the ingestion caps already spent, before this bound saw a single row.
+    # ``by_provider`` can only count what survived those caps, so a provider's
+    # own size is not derivable here and has to be carried in. That now includes
+    # what each source's PRODUCER refused above this module: a 201-identity host
+    # parsed down to 64 is a 201-route provider, and counting the 64 was the
+    # understatement this bound then published as the provider's truth.
+    dropped = dropped_before_ingestion or {}
+    # Providers whose size is known only as a floor, because a producer cut
+    # without saying how much. "at least N" and "N" are different claims and the
+    # label must not print the second when only the first was measured.
+    lower_bound = lower_bound_providers or set()
+    provider_counts = [
+        {
+            "provider": provider,
+            # The provider's real size, ingested rows plus the rows the caps
+            # dropped. Taken from ``by_provider`` alone this reported the cap's
+            # arithmetic as the provider's truth -- a 600-row provider whose
+            # tail was cut published "511 of 511", which is not a bounded
+            # answer but a wrong one, and the tree then drew it as complete.
+            "total": len(by_provider[provider]) + int(dropped.get(provider, 0)),
+            "total_is_lower_bound": provider in lower_bound,
+            # Rows that reached this bound at all. The enabled counts below are
+            # counted over exactly this population and no larger one.
+            "ingested": len(by_provider[provider]),
+            "returned": returned_by_provider.get(provider, 0),
+            "truncated": returned_by_provider.get(provider, 0)
+            < len(by_provider[provider]) + int(dropped.get(provider, 0))
+            or provider in lower_bound,
+            "enabled_total": enabled_total[provider],
+            # The population ``enabled_total`` was counted over. Rows the
+            # ingestion cap dropped were never evaluated against the policy, so
+            # when this is smaller than ``total`` the enabled figure is the
+            # ingested provider's and a label must not claim it provider-wide.
+            "enabled_counted_over": len(by_provider[provider]),
+            "enabled_returned": enabled_returned.get(provider, 0),
+        }
+        for provider in providers
+    ]
+    return rows, provider_counts, effective_limit, pins_refused
+
+
+def _absent_route_attribution(
+    sources: list[
+        tuple[
+            list[tuple[str, str, str]],
+            list[dict[str, Any]],
+            set[tuple[str, str, str]],
+        ]
+    ],
+    *,
+    rendered_routes: set[tuple[str, str, str]],
+) -> dict[str, int]:
+    """Charge every route the payload is missing to exactly one bound.
+
+    ``dropped`` on an ingestion-loss entry counts what a single bound refused.
+    That is a fact about the probe and not about the tree: the three sources
+    describe overlapping populations, so a refusal whose route another source
+    already supplied is not a row anybody is missing. The provider totals
+    published beside these entries are deduped for exactly that reason, and a
+    label dividing a raw drop count by a deduped denominator states neither
+    population -- a discovery probe refusing 90 identities of which precisely
+    one was a route nothing else carried read as "90 not loaded" beside a
+    602-route provider whose payload was short by a single row.
+
+    So each distinct absent route is counted once, under the first bound that
+    refused it, and written back as ``absent_routes`` beside the raw
+    ``dropped`` it must not be confused with. Summed across the sources that is
+    the provider's ``total - ingested`` exactly, which is the denominator the
+    tree divides by. A route two bounds both refused is still one missing row,
+    and naming it under each would restate the same inflation one field over.
+
+    A source's absent routes are then split once more, into the share its own
+    PRODUCER refused before this module was handed anything. That subset is
+    written as ``upstream_absent_routes``, a strict part of ``absent_routes``
+    and never a second count to add to it: the two are one population reported
+    at two different bounds, and the reader needs the split because the remedy
+    differs. Without it a row the OpenCode parser cut at its own ceiling was
+    rendered as lost to the discovery bound -- a cap that was never offered the
+    route -- so the label named a limit that raising could not recover.
+
+    ``sources`` are ``(dropped_routes, ingestion_loss, upstream_routes)``
+    triples in the order the caller wants attribution to fall, and their loss
+    entries are annotated in place.
+    """
+
+    counted: set[tuple[str, str, str]] = set()
+    absent_by_provider: dict[str, int] = {}
+    for dropped_routes, loss, upstream_routes in sources:
+        source_absent: dict[str, int] = {}
+        source_upstream_absent: dict[str, int] = {}
+        for route in dropped_routes:
+            # Already drawn from another source, or already charged to an
+            # earlier bound. Either way it is not a second missing route.
+            if route in rendered_routes or route in counted:
+                continue
+            counted.add(route)
+            source_absent[route[0]] = source_absent.get(route[0], 0) + 1
+            if route in upstream_routes:
+                source_upstream_absent[route[0]] = (
+                    source_upstream_absent.get(route[0], 0) + 1
+                )
+        for entry in loss:
+            provider_key = str(entry.get("provider") or "")
+            entry["absent_routes"] = source_absent.get(provider_key, 0)
+            entry["upstream_absent_routes"] = source_upstream_absent.get(
+                provider_key, 0
+            )
+        for provider, count in source_absent.items():
+            absent_by_provider[provider] = (
+                absent_by_provider.get(provider, 0) + count
+            )
+    return absent_by_provider
+
 
 def _settings_preflight_snapshot(_root: Any) -> Mapping[str, Any] | None:
     """Reuse the catalog's already-built environment-preflight snapshot.
@@ -229,6 +1218,58 @@ def _settings_preflight_snapshot(_root: Any) -> Mapping[str, Any] | None:
     return workforce_catalog.cached_preflight_snapshot(_root)
 
 
+def _route_policy_enabled(
+    policy: Mapping[str, Any],
+    *,
+    provider: str,
+    adapter: str,
+    model: str,
+    vendor_provider: str = "",
+    declared_adapter: str = "",
+) -> bool:
+    """The launch gate's own identity decision, evaluated here for display.
+
+    This is deliberately not a second opinion about the same file.
+    ``workforce_catalog.build_catalog`` decides a route's ``effective_enabled``
+    by evaluating the canonical policy owner and the vendor spelling the row
+    was declared under and requiring *both*, and ``repo_policy`` filters
+    observed OpenCode identities on the canonical identity alone. Display
+    computes exactly that conjunction, so a checkbox drawn checked is a route
+    the repository will actually launch.
+
+    The more generous reading is what had to go. Letting an explicit leaf under
+    either spelling decide meant a vendor-keyed ``xai``/``opencode_cli`` entry
+    rendered its route enabled while the canonical ``opencode`` identity -- the
+    one the launcher consults -- still answered from the OpenCode identity
+    default and refused it. The UI promised a route the repository would not
+    run, which is a worse failure than the missing row it replaced, because
+    nothing about a checked box says the launcher disagrees.
+
+    Toggling that box in the Webview writes the canonical identity the row
+    carries, so the route an owner actually switches on is enabled under both
+    spellings, is reported enabled here, and is launch-eligible there. A
+    vendor-keyed ``true`` nobody has re-toggled is reported exactly as the
+    launcher treats it: not enabled.
+    """
+
+    identities = [(provider, adapter)]
+    if (
+        vendor_provider
+        and declared_adapter
+        and (vendor_provider, declared_adapter) != (provider, adapter)
+    ):
+        identities.append((vendor_provider, declared_adapter))
+    return all(
+        model_settings.evaluate_state(
+            policy,
+            provider=route_provider,
+            adapter=route_adapter,
+            model=model,
+        )
+        for route_provider, route_adapter in identities
+    )
+
+
 def _model_policy_view(
     root: Any,
     preflight: Mapping[str, Any] | None = None,
@@ -236,11 +1277,38 @@ def _model_policy_view(
     """Return bounded policy plus configured and live editor model inventory."""
     policy = model_settings.load(root)
     catalog = workforce_catalog.load_catalog(root)
+    # One bounded read of the owner's declarations serves both the pin set and
+    # the declared-route rows below, so the two can never disagree about which
+    # decisions this view actually saw.
+    declared_leaves, declared_leaf_total = _declared_policy_leaves(
+        policy, limit=MAX_MODEL_POLICY_DECLARED_LEAVES
+    )
+    declared_leaves_truncated = declared_leaf_total > len(declared_leaves)
+    pinned_routes = _explicit_policy_routes(declared_leaves)
     workers: list[dict[str, Any]] = []
     source_rows = [
         row for row in catalog.get("workers", []) if isinstance(row, Mapping)
     ]
-    for row in source_rows[:MAX_MODEL_POLICY_CATALOG_ROWS]:
+    # Provider-aware ingestion rather than a head slice: a provider whose
+    # first row sits past the cap was otherwise deleted before the render
+    # bound below had grouped anything, and nothing downstream could undo it.
+    # ``source_dropped_routes`` names the exact routes the cap refused, because
+    # the counts published below are the provider's truth, cannot be taken from
+    # the rows that happened to survive the cap, and cannot be a per-source
+    # count either -- another source may describe the same route.
+    (
+        ingested_rows,
+        source_ingestion_loss,
+        source_dropped_routes,
+        source_row_limit_honoured,
+        source_pins_refused,
+    ) = _bounded_source_rows(
+        source_rows,
+        limit=MAX_MODEL_POLICY_SOURCE_ROWS,
+        ceiling=MAX_MODEL_POLICY_SOURCE_ROW_CEILING,
+        pinned=pinned_routes,
+    )
+    for row in ingested_rows:
         vendor_provider = str(row.get("provider") or "")
         declared_adapter = str(row.get("adapter_id") or "")
         model = str(row.get("model") or "")
@@ -250,18 +1318,6 @@ def _model_policy_view(
             vendor_provider, declared_adapter
         )
         catalog_enabled = bool(row.get("enabled", True))
-        route_policy_enabled = model_settings.evaluate_state(
-            policy,
-            provider=provider,
-            adapter=adapter,
-            model=model,
-        )
-        vendor_policy_enabled = model_settings.evaluate_state(
-            policy,
-            provider=vendor_provider,
-            adapter=declared_adapter,
-            model=model,
-        )
         workers.append(
             {
                 "worker_id": str(row.get("worker_id") or "")[:128],
@@ -272,8 +1328,14 @@ def _model_policy_view(
                 "declared_adapter": declared_adapter[:128],
                 "catalog_enabled": catalog_enabled,
                 "effective_enabled": catalog_enabled
-                and route_policy_enabled
-                and vendor_policy_enabled,
+                and _route_policy_enabled(
+                    policy,
+                    provider=provider,
+                    adapter=adapter,
+                    model=model,
+                    vendor_provider=vendor_provider,
+                    declared_adapter=declared_adapter,
+                ),
                 "inventory_only": False,
             }
         )
@@ -294,49 +1356,68 @@ def _model_policy_view(
     }
     discovered_count = 0
     inventory_only_count = 0
-    if isinstance(observed_models, list):
-        for value in observed_models[:MAX_MODEL_POLICY_CATALOG_ROWS]:
-            model = str(value).strip()
-            key = ("copilot", "vscode_lm", model)
-            if (
-                not model
-                or not workforce_catalog.model_identity_valid(model)
-            ):
-                continue
-            discovered_count += 1
-            if key in existing:
-                for worker in workers:
-                    if (
-                        worker["provider"], worker["adapter"], worker["model"]
-                    ) == key:
-                        worker["discovered_from_editor"] = True
-                continue
-            inventory_only_count += 1
-            existing.add(key)
-            workers.append(
-                {
-                    "worker_id": "",
-                    "provider": "copilot",
-                    "adapter": "vscode_lm",
-                    "model": model[:128],
-                    "vendor_provider": "",
-                    "declared_adapter": "vscode_lm",
-                    "catalog_enabled": True,
-                    "effective_enabled": model_settings.evaluate_state(
-                        policy,
-                        provider="copilot",
-                        adapter="vscode_lm",
-                        model=model,
-                    ),
-                    "inventory_only": True,
-                    "discovered_from_editor": True,
-                }
-            )
-    opencode_identities = workforce_catalog.opencode_identities_from_preflight(
-        preflight
+    # The editor bridge is an ingestion source like the other two and gets the
+    # same pin-aware bound. The head slice it kept could hide whichever
+    # identities a large Copilot host listed last -- including an explicitly
+    # configured one, which then had no control to switch it back -- and the
+    # counts beside it were taken after the slice, so the payload published the
+    # survivors as the host's total.
+    editor_source = _bounded_observed_models(
+        observed_models if isinstance(observed_models, list) else [],
+        limit=MAX_MODEL_POLICY_SOURCE_ROWS,
+        ceiling=MAX_MODEL_POLICY_SOURCE_ROW_CEILING,
+        pinned=pinned_routes,
+    )
+    for model in editor_source["identities"]:
+        key = ("copilot", "vscode_lm", model)
+        discovered_count += 1
+        if key in existing:
+            for worker in workers:
+                if (
+                    worker["provider"], worker["adapter"], worker["model"]
+                ) == key:
+                    worker["discovered_from_editor"] = True
+            continue
+        inventory_only_count += 1
+        existing.add(key)
+        workers.append(
+            {
+                "worker_id": "",
+                "provider": "copilot",
+                "adapter": "vscode_lm",
+                "model": model,
+                "vendor_provider": "",
+                "declared_adapter": "vscode_lm",
+                "catalog_enabled": True,
+                "effective_enabled": _route_policy_enabled(
+                    policy,
+                    provider="copilot",
+                    adapter="vscode_lm",
+                    model=model,
+                ),
+                "inventory_only": True,
+                "discovered_from_editor": True,
+            }
+        )
+    # The discovery probe gets the same provider-aware, pin-aware ingestion the
+    # configured catalog gets. A head slice here deleted whichever vendor
+    # ``opencode models`` happened to list last -- and any decision the owner
+    # had written for it -- before the tree had grouped anything.
+    #
+    # The producer's own 64-row cap runs first and reports nothing, so the
+    # snapshot it parsed is handed in beside its result. Without it this bound
+    # could only ever describe the 64 it was given, and every count downstream
+    # -- the provider's size, its truncation flag, the "not loaded" clause --
+    # was computed over a population the host had never been asked about.
+    opencode_source = _bounded_opencode_identities(
+        workforce_catalog.opencode_identities_from_preflight(preflight),
+        offered=_opencode_offered_identities(preflight),
+        limit=MAX_MODEL_POLICY_SOURCE_ROWS,
+        ceiling=MAX_MODEL_POLICY_SOURCE_ROW_CEILING,
+        pinned=pinned_routes,
     )
     opencode_discovered_count = 0
-    for identity in opencode_identities[:MAX_MODEL_POLICY_CATALOG_ROWS]:
+    for identity in opencode_source["identities"]:
         vendor_provider, _sep, _remainder = identity.partition("/")
         vendor_provider = vendor_provider.lower() or "opencode"
         provider, adapter = workforce_catalog.policy_route_identity(
@@ -364,36 +1445,454 @@ def _model_policy_view(
                 "vendor_provider": vendor_provider[:128],
                 "declared_adapter": "opencode_cli",
                 "catalog_enabled": True,
-                "effective_enabled": model_settings.evaluate_state(
+                "effective_enabled": _route_policy_enabled(
                     policy,
                     provider=provider,
                     adapter=adapter,
                     model=identity,
+                    vendor_provider=vendor_provider,
+                    declared_adapter="opencode_cli",
                 ),
                 "inventory_only": True,
                 "discovered_from_opencode": True,
             }
         )
+    # Every ingestion source above can arrive already truncated, and none of
+    # them says so on its own. ``parse_opencode_models_output`` stops at its own
+    # 64-row cap before ``opencode_identities_from_preflight`` returns, and the
+    # editor bridge head-slices ``observed_models`` at 128 -- both before this
+    # module reads a single identity, so MAX_MODEL_POLICY_SOURCE_ROWS cannot
+    # bind on a discovery source and the pin reservation has nothing to reserve.
+    # A route the owner explicitly named can therefore be absent from every list
+    # this view can see, and an absent route has no checkbox to switch it on.
+    #
+    # The two boundaries differ in what can be recovered, and the payload keeps
+    # them distinct rather than calling both "undiscovered". The OpenCode
+    # producer's own input is reachable here, so the identities its cap refused
+    # are named above and arrive as ordinary refused routes -- deduped against
+    # the other sources, counted into the provider's real size, and rebuilt as
+    # the discovered rows they are. The editor bridge's input is not reachable,
+    # so at its ceiling the only recoverable fact is that the tail is unknown.
+    #
+    # A decision in ``models.json`` is authoritative on its own evidence: the
+    # owner wrote that exact identity. So the row is materialised from the
+    # declaration rather than waiting for a probe to re-offer it. It claims no
+    # discovery -- nothing observed this route on this host -- and carries
+    # ``declared_only`` so neither the payload nor the tree can label an
+    # unobserved row as discovered. That label is itself a claim, though, and it
+    # is withheld where the evidence cannot support it: under an editor ceiling
+    # that bound, the route is marked ``upstream_truncated`` instead, because
+    # "no host offers this" is not something a truncated list can establish.
+    # Bounded by the same read that produced the pins, so a models.json larger
+    # than MAX_MODEL_POLICY_DECLARED_LEAVES cannot materialise an unbounded
+    # number of rows here. What the read left out is published rather than
+    # silently absent.
+    #
+    # "No source supplied it" is a claim, and a route's absence from ``existing``
+    # is not evidence for it. An ingestion bound that reaches its ceiling refuses
+    # rows a source did supply, and rebuilding those from the declaration stated
+    # three things the payload had evidence against: a blank ``worker_id`` over a
+    # row that has one, a hardcoded ``catalog_enabled`` over a catalog that may
+    # have said ``enabled: false``, and ``declared_only`` over a route discovery
+    # did offer. Each refused route is therefore rebuilt from the source that
+    # offered it and marked ``source_truncated``; ``declared_only`` is left for
+    # the routes no source named at all.
+    refused_source = _refused_source_rows(source_rows, source_dropped_routes)
+    refused_probe: dict[tuple[str, str, str], str] = {}
+    for dropped_key in editor_source["dropped_routes"]:
+        refused_probe.setdefault(dropped_key, "editor")
+    for dropped_key in opencode_source["dropped_routes"]:
+        refused_probe.setdefault(dropped_key, "opencode")
+    declared_only_count = 0
+    source_truncated_count = 0
+    # A producer that cut and cannot say by how much makes "absent from what
+    # arrived" stop being evidence of "absent from the host" -- and that is a
+    # property of the SOURCE, not of one adapter spelling. The editor bridge
+    # returns a slice with no total; the OpenCode parser stops at its own 64-row
+    # cap and, where the snapshot it read was itself bounded, the identities
+    # past it cannot be recovered either. Both then publish
+    # ``total_is_lower_bound``, and both leave a configured route possibly
+    # sitting in a tail nobody here has seen.
+    #
+    # Which rows a given source would have supplied is decided by the canonical
+    # adapter its identities are ingested under, resolved through the same
+    # ``policy_route_identity`` normalisation the rows themselves went through
+    # rather than by naming a provider here: the adapter picks the policy owner,
+    # and the policy layer owns that map.
+    editor_upstream_unknown = bool(editor_source["total_is_lower_bound"])
+    opencode_upstream_unknown = bool(opencode_source["total_is_lower_bound"])
+    upstream_unknown_adapters: set[str] = set()
+    for (probe_provider, probe_adapter), producer_unknown in (
+        (("copilot", "vscode_lm"), editor_upstream_unknown),
+        (("opencode", "opencode_cli"), opencode_upstream_unknown),
+    ):
+        if not producer_unknown:
+            continue
+        upstream_unknown_adapters.add(
+            _canonical_route_key(probe_provider, probe_adapter, "")[1]
+        )
+    upstream_truncated_count = 0
+    for declared_provider, declared_adapter, declared_model in declared_leaves:
+        if not declared_provider or not declared_adapter or not declared_model:
+            continue
+        if not workforce_catalog.model_identity_valid(declared_model):
+            continue
+        key = _canonical_route_key(
+            declared_provider, declared_adapter, declared_model
+        )
+        if key in existing:
+            continue
+        existing.add(key)
+        refused_row = refused_source.get(key)
+        if refused_row is not None:
+            # A configured row the ingestion bound refused. Its worker_id and
+            # its ``enabled`` value are facts the catalog stated, so the row is
+            # rebuilt from them and claims neither inventory-only nor
+            # declared-only status -- both would deny a source that did supply
+            # it.
+            row_vendor = str(refused_row.get("provider") or "")
+            row_adapter = str(refused_row.get("adapter_id") or "")
+            row_enabled = bool(refused_row.get("enabled", True))
+            source_truncated_count += 1
+            workers.append(
+                {
+                    "worker_id": str(refused_row.get("worker_id") or "")[:128],
+                    "provider": key[0],
+                    "adapter": key[1],
+                    "model": key[2],
+                    "vendor_provider": row_vendor[:128],
+                    "declared_adapter": row_adapter[:128],
+                    "catalog_enabled": row_enabled,
+                    "effective_enabled": row_enabled
+                    and _route_policy_enabled(
+                        policy,
+                        provider=key[0],
+                        adapter=key[1],
+                        model=key[2],
+                        vendor_provider=row_vendor,
+                        declared_adapter=row_adapter,
+                    ),
+                    "inventory_only": False,
+                    "source_truncated": True,
+                }
+            )
+            continue
+        probe = refused_probe.get(key)
+        if probe is not None:
+            # A probe did list this identity and its own bound refused it. That
+            # is an inventory-only row like any other discovery row -- no
+            # worker_id, no catalog decision to carry -- but it is not
+            # undiscovered, so it names the probe that saw it instead of
+            # claiming ``declared_only``. The measured discovery counts stay
+            # untouched: they count identities that were ingested, and this one
+            # was not.
+            probe_row: dict[str, Any] = {
+                "worker_id": "",
+                "provider": key[0],
+                "adapter": key[1],
+                "model": key[2],
+                "vendor_provider": str(declared_provider)[:128],
+                "declared_adapter": str(declared_adapter)[:128],
+                "catalog_enabled": True,
+                "effective_enabled": _route_policy_enabled(
+                    policy,
+                    provider=key[0],
+                    adapter=key[1],
+                    model=key[2],
+                    vendor_provider=str(declared_provider),
+                    declared_adapter=str(declared_adapter),
+                ),
+                "inventory_only": True,
+                "source_truncated": True,
+            }
+            probe_row[
+                "discovered_from_opencode"
+                if probe == "opencode"
+                else "discovered_from_editor"
+            ] = True
+            inventory_only_count += 1
+            source_truncated_count += 1
+            workers.append(probe_row)
+            continue
+        # ``declared_only`` claims no source offered this route, and that claim
+        # needs the source that would have offered it to have been able to
+        # answer. A producer that cut its own list and published no total
+        # leaves a tail nothing here can read, and a declared route may simply
+        # be in it. Labelling that one undiscovered states a measurement nobody
+        # took -- and it is the same route the owner explicitly configured, so
+        # the payload would be asserting its absence from a host that may well
+        # be offering it. It is reported as upstream-truncated instead, which is
+        # exactly what the evidence supports and no more.
+        #
+        # Tested against every adapter whose producer came up short rather than
+        # against one spelling. Reading only the editor's flag here left a
+        # declared ``opencode_cli`` route -- ``xai/grok-4.6`` beyond a snapshot
+        # the OpenCode producer had already capped at 64 -- falling through to
+        # ``declared_only``, so the tree asserted "not offered by discovery"
+        # about a measurement that producer was never able to make.
+        upstream_unknown = key[1] in upstream_unknown_adapters
+        declared_row: dict[str, Any] = {
+            "worker_id": "",
+            "provider": key[0],
+            "adapter": key[1],
+            "model": key[2],
+            "vendor_provider": str(declared_provider)[:128],
+            "declared_adapter": str(declared_adapter)[:128],
+            "catalog_enabled": True,
+            "effective_enabled": _route_policy_enabled(
+                policy,
+                provider=key[0],
+                adapter=key[1],
+                model=key[2],
+                vendor_provider=str(declared_provider),
+                declared_adapter=str(declared_adapter),
+            ),
+            "inventory_only": True,
+        }
+        inventory_only_count += 1
+        if upstream_unknown:
+            declared_row["source_truncated"] = True
+            declared_row["upstream_truncated"] = True
+            upstream_truncated_count += 1
+        else:
+            declared_row["declared_only"] = True
+            declared_only_count += 1
+        workers.append(declared_row)
     workers.sort(
         key=lambda row: (
             row["provider"], row["adapter"], row["model"], row["worker_id"]
         )
     )
     total_rows = len(workers)
-    workers = workers[:MAX_MODEL_POLICY_CATALOG_ROWS]
+    # All three ingestion sources are bounded before the render bound sees a
+    # single row, so a provider's own size is what survived plus what those caps
+    # cost it. That second part is a count of *distinct launch routes*, never a
+    # sum of each source's raw drop count: the configured catalog and the
+    # discovery probes describe overlapping populations, so a dropped
+    # ``xai/grok-4.6`` identity that duplicates a configured ``opencode_cli``
+    # row is one route this payload is missing and not two. Summed instead, the
+    # duplicate inflated the denominator, and the tree then divided a real
+    # shown-count by a provider size that no longer existed.
+    rendered_routes = {
+        (row["provider"], row["adapter"], row["model"]) for row in workers
+    }
+    # The same pass charges each missing route to the bound that refused it, so
+    # every loss entry carries an ``absent_routes`` count taken over this
+    # deduped population beside the raw ``dropped`` its own probe reports. The
+    # Webview's "not loaded" clause is a claim about the tree, so it has to be
+    # counted over the tree's population and not the probe's. Each source also
+    # hands over the subset its own producer refused, so the split between "a
+    # cap here dropped it" and "a cap above dropped it" survives into the
+    # label. The configured catalog is read directly and has no producer above
+    # it, so its upstream set is empty rather than absent.
+    dropped_before_render = _absent_route_attribution(
+        [
+            (source_dropped_routes, source_ingestion_loss, set()),
+            (
+                editor_source["dropped_routes"],
+                editor_source["ingestion_loss"],
+                set(editor_source["upstream_dropped_routes"]),
+            ),
+            (
+                opencode_source["dropped_routes"],
+                opencode_source["ingestion_loss"],
+                set(opencode_source["upstream_dropped_routes"]),
+            ),
+        ],
+        rendered_routes=rendered_routes,
+    )
+    (
+        workers,
+        provider_counts,
+        row_limit_honoured,
+        row_pins_refused,
+    ) = _bounded_catalog_rows(
+        workers,
+        limit=MAX_MODEL_POLICY_CATALOG_ROWS,
+        ceiling=MAX_MODEL_POLICY_CATALOG_ROW_CEILING,
+        pinned=pinned_routes,
+        dropped_before_ingestion=dropped_before_render,
+        # Every editor-hosted route is drawn under ``copilot`` and every
+        # OpenCode one under ``opencode``, so when either producer's ceiling
+        # bound over a tail this module could not recover, that family's size is
+        # a floor rather than a count. The provider is marked instead of having
+        # a made-up number added to it: an unknown remainder is not a measured
+        # one. Reading only the editor's flag here left the OpenCode family
+        # publishing an exact total over a population it had never seen.
+        lower_bound_providers=(
+            ({"copilot"} if editor_upstream_unknown else set())
+            | (
+                {"opencode"}
+                if opencode_source["total_is_lower_bound"]
+                else set()
+            )
+        ),
+    )
     return {
         **policy,
         "catalog": {
             "workers": workers,
             "worker_count": total_rows,
+            "returned_worker_count": len(workers),
+            "provider_counts": provider_counts,
             "configured_worker_count": len(source_rows),
             "discovered_model_count": discovered_count,
             "opencode_discovered_model_count": opencode_discovered_count,
             "inventory_only_model_count": inventory_only_count,
+            # The subset of those inventory-only rows that no source observed:
+            # routes built from the owner's declaration because every discovery
+            # list reaching this module had already been cut upstream. Counted
+            # apart from discovered_model_count on purpose -- a row nothing
+            # observed must not be added to a measured discovery figure -- and
+            # published rather than inferred, because a non-zero value here is
+            # the reader's evidence that a source arrived short.
+            "declared_only_model_count": declared_only_count,
+            # The other half of that materialisation, and deliberately not
+            # folded into the count above: rows an ingestion bound refused and
+            # the declaration brought back, rebuilt from the source that did
+            # supply them. They are neither undiscovered nor freshly measured,
+            # so they are counted on their own rather than inflating a discovery
+            # figure or a declared-only one.
+            "source_truncated_model_count": source_truncated_count,
+            # And the third case, which used to be silently filed as the first:
+            # a configured route this view cannot classify, because the source
+            # that would have offered it was cut by its own producer without
+            # saying by how much. Counting it as declared-only asserted that no
+            # host offers the route; counting it as discovered would assert the
+            # opposite. It is counted as neither.
+            "upstream_truncated_model_count": upstream_truncated_count,
             "editor_catalog_live": bool(editor.get("launchable")),
             "editor_catalog_reason": str(editor.get("blocker_reason") or "")[:200],
             "row_limit": MAX_MODEL_POLICY_CATALOG_ROWS,
-            "truncated": total_rows > MAX_MODEL_POLICY_CATALOG_ROWS,
+            # The bound actually honoured. It exceeds row_limit only when the
+            # explicit-route/one-per-provider floor is larger, so a reader can
+            # tell a raised floor from a broken bound.
+            "row_limit_honoured": row_limit_honoured,
+            # The number row_limit_honoured may never pass. The floor above is
+            # derived from models.json, and that file is the caller's, not this
+            # module's: one leaf per catalog row pinned every row and raised the
+            # "bound" to the whole catalog, which is an unbounded payload still
+            # reporting itself as a bounded one.
+            "row_limit_ceiling": MAX_MODEL_POLICY_CATALOG_ROW_CEILING,
+            # Explicitly configured routes the ceiling refused. Unlike a
+            # refusal by an ingestion bound this one is final: these rows are
+            # absent from ``workers``, so the owner has no control for them and
+            # the count has to be stated rather than left to be inferred from a
+            # row list that merely stops short.
+            "pinned_routes_refused": row_pins_refused,
+            "source_row_limit": MAX_MODEL_POLICY_SOURCE_ROWS,
+            "source_rows_ingested": len(ingested_rows),
+            # The ingestion bound actually honoured, for the same reason the
+            # render bound publishes its own. Pins can raise this above
+            # source_row_limit, and while that number was discarded a raised
+            # floor and a cap that simply failed to hold read identically.
+            "source_row_limit_honoured": source_row_limit_honoured,
+            "source_row_limit_ceiling": MAX_MODEL_POLICY_SOURCE_ROW_CEILING,
+            # Pins this ingestion bound could not admit. Reported apart from
+            # the render bound's because a route refused here may still be
+            # materialised from its declaration below, so the two counts are
+            # facts about two different bounds and only one of them is a claim
+            # that a control is missing.
+            "source_pinned_routes_refused": source_pins_refused,
+            # Exact per-provider ingestion loss, published only for providers
+            # that actually lost rows, so nobody has to infer which provider a
+            # shortfall between configured_worker_count and worker_count came
+            # out of. Keyed by the canonical provider the rendered rows and the
+            # Webview both group by, so the number is reachable by the tree
+            # rather than filed under a family that is never drawn. Each entry
+            # carries three counts that must not be read for each other:
+            # ``dropped`` is what this bound refused, ``absent_routes`` is how
+            # many of those are routes no other source supplied -- the only one
+            # that belongs beside a deduped provider total -- and
+            # ``upstream_absent_routes`` is the part of THAT which a producer
+            # above this module refused, a strict subset and never an addend.
+            "source_ingestion_loss": source_ingestion_loss,
+            # The OpenCode discovery probe is a second ingestion source with its
+            # own bound. Its returned/total/truncated truth is published rather
+            # than inferred from opencode_discovered_model_count, which counts
+            # only the identities that became rows and so cannot report the ones
+            # the bound refused.
+            "opencode_source": {
+                # The population the PRODUCER was given, not the one it handed
+                # over. 512 cannot bind on a list already cut to 64, so while
+                # this read the delivered length the flag below was structurally
+                # False and a 201-identity host published itself as 64.
+                "total": opencode_source["total"],
+                # What actually reached this bound, so a reader can tell the
+                # producer's cap from this module's.
+                "delivered": opencode_source["delivered"],
+                "upstream_refused": opencode_source["upstream_refused"],
+                "upstream_ceiling": OPENCODE_UPSTREAM_IDENTITY_CEILING,
+                "returned": opencode_source["returned"],
+                # A floor says the population may be larger than the total
+                # printed beside it, so the row list is not this source's whole
+                # catalog even when this module's own bound refused nothing.
+                # The editor source below ORs its floor in for that reason and
+                # so do the provider counts; reading the ingestion's arithmetic
+                # alone here published a complete-looking source over a tail
+                # nobody had seen.
+                "truncated": opencode_source["truncated"]
+                or opencode_source["total_is_lower_bound"],
+                "total_is_lower_bound": opencode_source["total_is_lower_bound"],
+                "row_limit": MAX_MODEL_POLICY_SOURCE_ROWS,
+                "row_limit_honoured": opencode_source["row_limit_honoured"],
+                # The number row_limit_honoured may not pass, and how many
+                # explicitly configured routes this bound could not admit once
+                # it did bind. A refusal here is not automatically a missing
+                # row -- a named route no source supplied is materialised from
+                # the declaration further down -- so it is reported as this
+                # bound's own fact rather than as a claim about the tree.
+                "row_limit_ceiling": MAX_MODEL_POLICY_SOURCE_ROW_CEILING,
+                "pinned_routes_refused": opencode_source["pinned_routes_refused"],
+                "ingestion_loss": opencode_source["ingestion_loss"],
+            },
+            # The editor bridge is the third, and it reports the same way for
+            # the same reason: discovered_model_count counts only the identities
+            # that became rows, so a host listing more models than the bound
+            # admits had no way to say so. A Copilot catalog larger than the cap
+            # now states its own total, what was let in, and whether anything
+            # was refused.
+            #
+            # Unlike the OpenCode boundary its producer's input is unreachable
+            # from here, so at the bridge's ceiling the total is a floor. That
+            # is published as ``total_is_lower_bound`` rather than rounded off
+            # into a number, because "128" and "at least 128" are different
+            # claims and only the second one was measured.
+            "editor_source": {
+                "total": editor_source["total"],
+                "delivered": editor_source["delivered"],
+                "upstream_refused": editor_source["upstream_refused"],
+                "upstream_ceiling": EDITOR_UPSTREAM_MODEL_CEILING,
+                "returned": editor_source["returned"],
+                "truncated": editor_source["truncated"]
+                or editor_source["total_is_lower_bound"],
+                "total_is_lower_bound": editor_source["total_is_lower_bound"],
+                "row_limit": MAX_MODEL_POLICY_SOURCE_ROWS,
+                "row_limit_honoured": editor_source["row_limit_honoured"],
+                "row_limit_ceiling": MAX_MODEL_POLICY_SOURCE_ROW_CEILING,
+                "pinned_routes_refused": editor_source["pinned_routes_refused"],
+                "ingestion_loss": editor_source["ingestion_loss"],
+            },
+            # The owner's own declarations are bounded too. models.json is read
+            # up to declared_leaf_limit, and a file larger than that has leaves
+            # this view never saw -- so it also has pins it never reserved. That
+            # is published rather than inferred, because a decision that was
+            # never read is otherwise indistinguishable from one that lost.
+            "declared_leaf_count": declared_leaf_total,
+            "declared_leaf_limit": MAX_MODEL_POLICY_DECLARED_LEAVES,
+            "declared_leaves_truncated": declared_leaves_truncated,
+            # Rows were lost to the render bound or to any of the three
+            # ingestion caps before it, models.json itself was read short, or a
+            # producer cut above this module without saying by how much; any of
+            # them means the row list is not the whole catalog.
+            "truncated": len(workers) < total_rows
+            or bool(dropped_before_render)
+            or declared_leaves_truncated
+            or editor_upstream_unknown
+            # The OpenCode producer's own cap is the other unknown tail, and
+            # reading only the editor's flag here drew a catalog whose OpenCode
+            # family is a floor as if the row list were the whole of it.
+            or bool(opencode_source["total_is_lower_bound"]),
         },
     }
 

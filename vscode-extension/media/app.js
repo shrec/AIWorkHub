@@ -4536,6 +4536,26 @@ function modelFamilyLabel(family) {
   return family === OPENCODE_FAMILY ? "OpenCode" : family;
 }
 
+// Which host cut a family's unseen tail. A lower-bound total is only ever
+// published by the source that fed that family, and the two bounded discovery
+// sources have different owners and different remedies: the OpenCode family's
+// tail was cut by the OpenCode host/producer above the backend, the copilot
+// family's by the editor host the bridge talks to. One shared label named the
+// editor's cap over OpenCode rows it had never been offered, which is the same
+// misattribution the split "not loaded" clauses exist to prevent. A Map rather
+// than an object literal so a family name arriving from the payload cannot
+// reach Object.prototype and read back a label nobody wrote.
+const UPSTREAM_HOST_BOUND_LABELS = new Map([
+  [OPENCODE_FAMILY, "OpenCode host bound"],
+  ["copilot", "editor host bound"],
+]);
+
+function upstreamHostBoundLabel(family) {
+  // A family with no known producer above it still gets a true statement: the
+  // bound is upstream of this view, and this view cannot say whose.
+  return UPSTREAM_HOST_BOUND_LABELS.get(family) || "upstream host bound";
+}
+
 function isOpencodeOpenAIRoute(route, family) {
   return family === OPENCODE_FAMILY && String(route.model || "").toLowerCase().startsWith("openai/");
 }
@@ -4547,6 +4567,31 @@ function settingsFamilyExpanded(family) {
 function routeDiscoveredLabel(route) {
   if (route.discovered_from_opencode) return "opencode discovery";
   if (route.discovered_from_editor) return "editor discovery";
+  // Checked before the inventory_only fallback below, which would otherwise
+  // read "discovered" over a row nothing discovered. This row exists because
+  // the owner named the route in models.json while every discovery list that
+  // reached the server had already been truncated upstream, so the only true
+  // thing to say about its origin is that it was declared.
+  if (route.declared_only) return "declared, not discovered";
+  // Both truncation flags are tested BEFORE inventory_only, and the order is
+  // the correctness, not a tidy-up. A row the backend rebuilt from the owner's
+  // declaration because a producer had already cut the discovery list is
+  // inventory_only and carries no discovered_from_* evidence, so the fallback
+  // below answered "discovered" for it -- precisely the claim the backend
+  // declined to make when it published upstream_truncated rather than
+  // declared_only. Neither "a host offers this" nor "no host offers this" was
+  // measured here, so the label names the bound and stops.
+  if (route.upstream_truncated) return "configured, origin unknown past the host bound";
+  // A configured row that only reached this tree because the owner had named
+  // it: the catalog did supply it and an ingestion bound refused it. The
+  // payload used to send this row as declared_only, so the tree said discovery
+  // never offered a route the catalog had listed. Plain "configured" would be
+  // true but would hide that the source arrived short, which is the one thing
+  // a reader needs to know about the counts beside it.
+  if (route.source_truncated) return "configured, past the source bound";
+  // Only reached by a row with no origin evidence of any kind, and "discovered"
+  // is the strongest thing it may say -- every truncation case above has
+  // already been answered by the bound that caused it.
   if (route.inventory_only) return "discovered";
   return "configured";
 }
@@ -4704,12 +4749,67 @@ function renderSettings(payload, options = {}) {
     const workers = Array.isArray(modelPolicy.catalog?.workers)
       ? modelPolicy.catalog.workers
       : [];
+    // Per-provider total/returned/truncated truth from the bounded payload.
+    const providerCounts = new Map(
+      (Array.isArray(modelPolicy.catalog?.provider_counts) ? modelPolicy.catalog.provider_counts : [])
+        .filter((entry) => entry && typeof entry === "object")
+        .map((entry) => [String(entry.provider || ""), entry]),
+    );
+    // What the backend's ingestion caps cost each provider, keyed the same way
+    // provider_counts and modelFamilyOf are. Keyed by vendor instead, an
+    // xai/opencode_cli shortfall named a family this tree never draws, so the
+    // loss was published and no row here could reach it.
+    const ingestionLossMap = (entries) => new Map(
+      (Array.isArray(entries) ? entries : [])
+        .filter((entry) => entry && typeof entry === "object")
+        .map((entry) => [String(entry.provider || ""), entry]),
+    );
+    const ingestionLoss = ingestionLossMap(modelPolicy.catalog?.source_ingestion_loss);
+    // The OpenCode discovery probe is bounded separately from the configured
+    // catalog, and until now it was cut by a head slice that reported nothing
+    // at all -- a whole vendor could vanish from this tree with every published
+    // number still adding up. Its loss arrives in the same canonical key space,
+    // so the family label can name it beside the catalog's.
+    const discoveryLoss = ingestionLossMap(modelPolicy.catalog?.opencode_source?.ingestion_loss);
+    // The editor bridge is the third bounded source and was the last one still
+    // cut silently: a Copilot host listing more identities than the cap lost
+    // the tail, and the count printed beside it described the survivors. It
+    // reports in the same key space, so the copilot family can name its own.
+    const bridgeLoss = ingestionLossMap(modelPolicy.catalog?.editor_source?.ingestion_loss);
     const discoveredCount = Number(modelPolicy.catalog?.discovered_model_count || 0);
     heading.appendChild(createElement(
       "small",
       "",
       `${discoveredCount} live VS Code/Copilot model${discoveredCount === 1 ? "" : "s"} discovered`,
     ));
+    // The compact bound is raised to a correctness floor, and that floor stops
+    // at a hard ceiling. When the ceiling binds, routes the owner explicitly
+    // configured are not in the row list below -- so there is no checkbox for
+    // them, and the only visible symptom would be a tree that quietly stops
+    // short. Only the render bound's refusals are claimed here: a route the
+    // ingestion bound refused may still be drawn from its declaration, so
+    // counting that one as missing would be a claim about the wrong bound.
+    const refusedPins = numberValue(modelPolicy.catalog?.pinned_routes_refused);
+    const declaredTruncated = Boolean(modelPolicy.catalog?.declared_leaves_truncated);
+    if (refusedPins > 0 || declaredTruncated) {
+      const declaredCount = numberValue(modelPolicy.catalog?.declared_leaf_count);
+      const declaredLimit = numberValue(modelPolicy.catalog?.declared_leaf_limit);
+      const notices = [
+        refusedPins > 0
+          ? `${refusedPins} configured route${refusedPins === 1 ? "" : "s"} past the ${numberValue(modelPolicy.catalog?.row_limit_ceiling)}-row ceiling are not shown`
+          : "",
+        // A leaf the read never reached is a decision this view never saw, which
+        // is not the same failure as one it saw and could not fit.
+        declaredTruncated
+          ? `models.json declares ${declaredCount} routes, more than the ${declaredLimit} this view reads`
+          : "",
+      ].filter(Boolean);
+      heading.appendChild(createElement(
+        "small",
+        "settings-model-warning",
+        `${notices.join(" · ")} · edit .aiworkhub/config/models.json to narrow the declared set`,
+      ));
+    }
     // Two-level tree: each provider/effective-adapter family is a collapsible
     // parent, exact model routes are its indented children. OpenCode routes
     // group under one "opencode" family regardless of upstream provider
@@ -4721,6 +4821,131 @@ function renderSettings(payload, options = {}) {
       const configured = Object.prototype.hasOwnProperty.call(modelPolicy.providers || {}, family);
       const enabled = configured ? Boolean(modelPolicy.providers[family]) : true;
       const enabledRouteCount = familyRows.filter((row) => Boolean(row.effective_enabled)).length;
+      // familyRows is only what the compact bound returned. Printing its
+      // length alone reads as the whole provider, so when the backend reports
+      // this provider as truncated the label says shown-of-total instead.
+      const familyCounts = providerCounts.get(family);
+      const familyTotal = familyCounts ? numberValue(familyCounts.total) : familyRows.length;
+      // A producer above the backend can cut without reporting how much, and
+      // then the total is a floor rather than a count. Printing it bare would
+      // restate the defect this label exists to end -- "128 of 128 routes
+      // shown" for a host that may be offering three hundred -- so the
+      // lower-bound case says so in the number itself.
+      const familyTotalIsFloor = Boolean(familyCounts && familyCounts.total_is_lower_bound);
+      const familyTruncated = Boolean(familyCounts && familyCounts.truncated)
+        && (familyTotal > familyRows.length || familyTotalIsFloor);
+      const routeSummary = !familyTruncated
+        ? `${familyRows.length} route${familyRows.length === 1 ? "" : "s"}`
+        : familyTotalIsFloor
+          ? `${familyRows.length} of at least ${familyTotal} routes shown`
+          : `${familyRows.length} of ${familyTotal} routes shown`;
+      // Two different populations, and the old label mixed them: it printed
+      // enabledRouteCount -- the enabled rows among those the bound returned
+      // -- against the provider-wide enabled_total, so "28 of 36 enabled"
+      // named neither population and read as if 8 shown routes were off. Each
+      // number is now stated against the population it was counted over, and
+      // when an older payload omits enabled_total only the shown population
+      // is claimed.
+      const enabledTotalReported = familyCounts
+        && familyCounts.enabled_total !== undefined
+        && familyCounts.enabled_total !== null
+        ? numberValue(familyCounts.enabled_total)
+        : null;
+      // enabled_total was counted over the rows that survived the backend's
+      // ingestion cap, which is the whole provider only when nothing was
+      // dropped before that. Calling a partial count "provider-wide" is the
+      // same lie as printing 511 of 511 for a 600-row provider, so the
+      // denominator the number is actually true against is the one printed.
+      const enabledCountedOver = familyCounts
+        && familyCounts.enabled_counted_over !== undefined
+        && familyCounts.enabled_counted_over !== null
+        ? numberValue(familyCounts.enabled_counted_over)
+        : familyTotal;
+      // "provider-wide" needs the provider's size to be known. When the total
+      // is only a floor, a count that merely reaches it has still been counted
+      // over part of the provider, so the weaker claim is the true one.
+      const enabledScope = enabledCountedOver >= familyTotal && !familyTotalIsFloor
+        ? `${enabledTotalReported} of ${familyTotal} enabled provider-wide`
+        : `${enabledTotalReported} of ${enabledCountedOver} enabled among loaded routes`;
+      const enabledSummary = !familyTruncated
+        ? `${enabledRouteCount} enabled`
+        : enabledTotalReported === null
+          ? `${enabledRouteCount} of ${familyRows.length} shown enabled`
+          : `${enabledRouteCount} of ${familyRows.length} shown enabled · ${enabledScope}`;
+      // A provider whose rows were cut before they ever reached the render
+      // bound says so in its own label. Without it the only visible symptom is
+      // a routes-shown figure that silently stops adding up. The three
+      // ingestion sources are named separately rather than summed, because
+      // "not loaded" has a different remedy depending on which bound refused
+      // the row -- and because the same route refused by two of them is one
+      // missing row, so a summed figure would not even be a count of routes.
+      //
+      // Each clause is counted over the SAME deduped population as the
+      // routes-shown denominator beside it: absent_routes, the rows no other
+      // source supplied. An entry's raw `dropped` is a fact about that probe,
+      // not about this tree -- a discovery bound that refused 90 identities of
+      // which one was a route nothing else carried printed "90 not loaded"
+      // against a 602-route total that was short by exactly one row, which is
+      // two populations in one sentence and true of neither.
+      const absentRoutes = (entry) => (
+        entry && entry.absent_routes !== undefined && entry.absent_routes !== null
+          ? numberValue(entry.absent_routes)
+          : 0
+      );
+      // The subset of those absent routes the source's own PRODUCER refused
+      // before this backend was offered anything. It has to be split back out
+      // rather than printed inside the module's clause: a row the OpenCode
+      // parser cut at its 64-identity ceiling was never shown to the discovery
+      // bound at all, so "not loaded (discovery bound)" named a cap that never
+      // saw the route and pointed the reader at the wrong limit to raise. The
+      // backend charges each distinct absent route to one bound and marks the
+      // producer's share, so the two are subtracted rather than summed and no
+      // route is counted twice.
+      const upstreamAbsentRoutes = (entry) => (
+        entry
+        && entry.upstream_absent_routes !== undefined
+        && entry.upstream_absent_routes !== null
+          ? numberValue(entry.upstream_absent_routes)
+          : 0
+      );
+      const discoveryEntry = discoveryLoss.get(family);
+      const bridgeEntry = bridgeLoss.get(family);
+      const familyLoss = absentRoutes(ingestionLoss.get(family));
+      const familyDiscoveryUpstreamLoss = upstreamAbsentRoutes(discoveryEntry);
+      const familyDiscoveryLoss = Math.max(
+        0,
+        absentRoutes(discoveryEntry) - familyDiscoveryUpstreamLoss,
+      );
+      const familyBridgeUpstreamLoss = upstreamAbsentRoutes(bridgeEntry);
+      const familyBridgeLoss = Math.max(
+        0,
+        absentRoutes(bridgeEntry) - familyBridgeUpstreamLoss,
+      );
+      const lossSummary = [
+        familyLoss ? `${familyLoss} not loaded (catalog bound)` : "",
+        familyDiscoveryLoss ? `${familyDiscoveryLoss} not loaded (discovery bound)` : "",
+        familyDiscoveryUpstreamLoss
+          ? `${familyDiscoveryUpstreamLoss} not loaded (OpenCode host bound)`
+          : "",
+        familyBridgeLoss ? `${familyBridgeLoss} not loaded (editor bound)` : "",
+        familyBridgeUpstreamLoss
+          ? `${familyBridgeUpstreamLoss} not loaded (editor host cap)`
+          : "",
+        // The last case has no number, and inventing one is exactly the
+        // failure the clauses above exist to prevent. A producer cut its own
+        // list before the backend saw it and reported no total, so what is
+        // known is that there may be more and not how many.
+        //
+        // WHICH producer is read off the family rather than assumed. A floor on
+        // the opencode family was cut by the OpenCode host above the backend,
+        // and naming the editor host there pointed the reader at a cap that had
+        // never seen the route -- the same misattribution the split loss
+        // clauses above exist to end, restated in the clause that carries no
+        // number to check it against.
+        familyTotalIsFloor
+          ? `more may not be loaded (${upstreamHostBoundLabel(family)})`
+          : "",
+      ].filter(Boolean).map((part) => ` · ${part}`).join("");
       const familyLabel = modelFamilyLabel(family);
       const familyId = `model-family-${family.replace(/[^a-z0-9]+/gi, "-").toLowerCase() || "family"}`;
       const expanded = settingsFamilyExpanded(family);
@@ -4744,7 +4969,7 @@ function renderSettings(payload, options = {}) {
         createElement(
           "small",
           "",
-          `${familyRows.length} route${familyRows.length === 1 ? "" : "s"} · ${enabledRouteCount} enabled · ${configured ? "repository override" : "enabled by default"}`,
+          `${routeSummary} · ${enabledSummary}${lossSummary} · ${configured ? "repository override" : "enabled by default"}`,
         ),
       );
 
@@ -4782,11 +5007,25 @@ function renderSettings(payload, options = {}) {
           createElement(
             "small",
             "",
-            route.inventory_only
-              ? route.discovered_from_opencode
+            // Same ordering rule as routeDiscoveredLabel, and for the same
+            // defect: "discovered in VS Code" used to be the else-branch of
+            // inventory_only, so a row the editor bridge never reported --
+            // rebuilt from the declaration after a producer cut the list --
+            // named a host that had said nothing about it. The two discovery
+            // flags are now tested explicitly, the truncation cases answer for
+            // themselves, and the bare inventory fallback claims no origin it
+            // cannot evidence.
+            route.declared_only
+              ? `${String(route.adapter || "unknown adapter")} · declared in models.json · not offered by discovery`
+              : route.discovered_from_opencode
                 ? `${String(route.adapter || "unknown adapter")} · discovered by OpenCode · no task capability assigned`
-                : `${String(route.adapter || "unknown adapter")} · discovered in VS Code · no task capability assigned`
-              : `${String(route.adapter || "unknown adapter")} · ${String(route.worker_id || "unidentified worker")}`,
+                : route.discovered_from_editor
+                  ? `${String(route.adapter || "unknown adapter")} · discovered in VS Code · no task capability assigned`
+                  : route.upstream_truncated
+                    ? `${String(route.adapter || "unknown adapter")} · configured route · the host's list was cut before this view read it`
+                    : route.inventory_only
+                      ? `${String(route.adapter || "unknown adapter")} · configured route · no source reported its origin`
+                      : `${String(route.adapter || "unknown adapter")} · ${String(route.worker_id || "unidentified worker")}`,
           ),
           createElement("small", "settings-model-truth", routeTruthSummary(route)),
         );

@@ -853,3 +853,1873 @@ test("Models renders one OpenCode family with collapsible exact-model children a
   assert.equal(toggle.attrs["aria-label"], "OpenCode routes, collapsed");
   assert.equal(toggle.textContent, "▸");
 });
+
+function collectByTag(node, tag, acc = []) {
+  if (!node || typeof node !== "object") return acc;
+  if (node.tag === tag) acc.push(node);
+  for (const child of hostArray(node.children)) collectByTag(child, tag, acc);
+  return acc;
+}
+
+test("Models renders every provider the bounded catalog returned, with per-provider truncation truth and a toggleable xai route", () => {
+  // Mirrors what the backend publishes for an 81-row catalog: the compact
+  // selection keeps every provider, and provider_counts carries the
+  // total/returned/truncated truth the row list alone cannot state.
+  const bounded = [];
+  for (const [provider, adapter, kept] of [
+    ["anthropic", "claude_cli", 32],
+    ["copilot", "vscode_lm", 31],
+  ]) {
+    for (let index = 0; index < kept; index += 1) {
+      bounded.push({
+        provider,
+        adapter,
+        model: `${provider}-model-${String(index).padStart(2, "0")}`,
+        worker_id: `${provider}-${index}`,
+        catalog_enabled: true,
+        // Three of copilot's shown routes are switched off, so its shown
+        // enabled count (28) differs from both its shown row count and its
+        // provider-wide enabled total (36). Without that gap the label could
+        // pass by coincidence.
+        effective_enabled: !(provider === "copilot" && index < 3),
+        inventory_only: false,
+      });
+    }
+  }
+  bounded.push({
+    provider: "xai",
+    adapter: "grok_kilo_cli",
+    model: "grok-4.6",
+    worker_id: "xai-grok",
+    catalog_enabled: true,
+    effective_enabled: true,
+    inventory_only: false,
+  });
+  // enabled_total is the provider's, counted before the bound was spent;
+  // enabled_returned is the shown rows'. The two differ exactly where the
+  // provider is truncated, which is what the label has to survive.
+  const providerCounts = [
+    {
+      provider: "anthropic",
+      total: 40,
+      returned: 32,
+      truncated: true,
+      enabled_total: 40,
+      enabled_returned: 32,
+    },
+    {
+      provider: "copilot",
+      total: 40,
+      returned: 31,
+      truncated: true,
+      enabled_total: 36,
+      enabled_returned: 28,
+    },
+    {
+      provider: "xai",
+      total: 1,
+      returned: 1,
+      truncated: false,
+      enabled_total: 1,
+      enabled_returned: 1,
+    },
+  ];
+
+  const start = appSource.indexOf("const OPENCODE_ADAPTER_ID = \"opencode_cli\";");
+  const end = appSource.indexOf("function renderSettings(payload, options = {})");
+  assert.notEqual(start, -1);
+  assert.notEqual(end, -1);
+  const helpers = appSource.slice(start, end);
+  const renderStart = appSource.indexOf("function renderSettings(payload, options = {})");
+  const renderEnd = appSource.indexOf("\n// ═══ HISTORY_PAGE_BEGIN", renderStart);
+  assert.notEqual(renderStart, -1);
+  assert.notEqual(renderEnd, -1);
+  const renderFn = appSource.slice(renderStart, renderEnd);
+  const settingsList = makeSettingsElement("div");
+  settingsList.scrollTop = 0;
+  settingsList.scrollHeight = 0;
+  const settingsDialog = makeSettingsElement("dialog");
+  settingsDialog.scrollTop = 0;
+  const settingsSummary = makeSettingsElement("span");
+  const result = { families: null };
+  const harness = `
+    "use strict";
+    const FEATURE_LABELS = {};
+    const state = { settingsTab: "models", settingsCollapsedFamilies: {}, settingsPendingIdentity: null, featureSettings: null };
+    const elements = { settingsList, settingsDialog, settingsSummary };
+    function settingsTabDefinitions() {
+      return [
+        ["features", "Features"],
+        ["models", "Models"],
+        ["source-graph", "Source Graph"],
+        ["retention", "Retention"],
+        ["telemetry", "Telemetry"],
+      ];
+    }
+    function createElement(tag, className, text) {
+      const element = document.createElement(tag);
+      if (className) element.className = className;
+      if (text !== undefined && text !== null) element.textContent = String(text);
+      return element;
+    }
+    // A real identity, never null: settingsPendingIdentity is null when no
+    // control is in flight, so a null-returning stub would mark every control
+    // pending and disable it, hiding whether a route is actually toggleable.
+    function settingsControlIdentity(input) {
+      const data = (input && input.dataset) || {};
+      return [data.modelProvider || "", data.modelAdapter || "", data.modelName || ""].join("|");
+    }
+    function restoreSettingsFocus() {}
+    function setSettingsPending() {}
+    function renderSettingsPlaceholder() {}
+    function settingsStateMessage() { return document.createElement("div"); }
+    function numberValue(value) { const parsed = Number(value); return Number.isFinite(parsed) ? parsed : 0; }
+    function formatCount(value) { return String(value); }
+    function formatBytes() { return "0 B"; }
+    function formatMoney(value) { return String(value); }
+    ${helpers}
+    ${renderFn}
+    renderSettings({
+      ok: true,
+      revision: 2,
+      features: {},
+      model_policy: {
+        ok: true,
+        revision: 2,
+        providers: {},
+        catalog: {
+          discovered_model_count: 0,
+          worker_count: 81,
+          returned_worker_count: ${bounded.length},
+          row_limit: 64,
+          truncated: true,
+          provider_counts: ${JSON.stringify(providerCounts)},
+          workers: ${JSON.stringify(bounded)},
+        },
+      },
+    });
+    const families = [];
+    const collect = (node) => {
+      if (!node || typeof node !== "object") return;
+      if (String(node.className || "").split(/\\s+/).includes("settings-model-family")) families.push(node);
+      for (const child of Array.from(node.children || [])) collect(child);
+    };
+    collect(settingsList);
+    result.families = families;
+  `;
+  const context = vm.createContext({
+    document: {
+      createElement: (tag) => makeSettingsElement(tag),
+      createDocumentFragment: () => makeSettingsElement("fragment"),
+      activeElement: null,
+      scrollingElement: null,
+    },
+    settingsList,
+    settingsDialog,
+    settingsSummary,
+    result,
+  });
+  vm.runInContext(harness, context);
+
+  const families = hostArray(result.families);
+  const familyText = (family, className) => {
+    const provider = collectByClass(family, "settings-model-provider")[0];
+    const copy = collectByClass(provider || family, "settings-copy")[0];
+    const node = hostArray((copy || {}).children).find((child) => child.tag === className);
+    return node ? node.textContent : "";
+  };
+
+  // No provider is missing, including the one that sorts last.
+  assert.equal(families.length, 3);
+  assert.deepEqual(families.map((family) => familyText(family, "strong")), [
+    "anthropic",
+    "copilot",
+    "xai",
+  ]);
+
+  // A truncated provider says so; an intact one still reads as a plain count.
+  // The enabled counts move with it, and each one names the population it was
+  // counted over: the shown rows' enabled count is stated against the shown
+  // rows, the provider's against the provider. Neither number is ever printed
+  // against the other's denominator.
+  assert.match(
+    familyText(families[0], "small"),
+    /^32 of 40 routes shown · 32 of 32 shown enabled · 40 of 40 enabled provider-wide · /,
+  );
+  assert.match(
+    familyText(families[1], "small"),
+    /^31 of 40 routes shown · 28 of 31 shown enabled · 36 of 40 enabled provider-wide · /,
+  );
+  assert.match(familyText(families[2], "small"), /^1 route · 1 enabled · /);
+  // The bare "N enabled" form survives only where nothing was truncated, and
+  // the old mixed-population form is gone rather than merely reworded.
+  assert.doesNotMatch(familyText(families[0], "small"), /· 32 enabled ·/);
+  assert.doesNotMatch(familyText(families[1], "small"), /· 28 enabled ·/);
+  assert.doesNotMatch(familyText(families[1], "small"), /28 of 36 enabled/);
+
+  // xai/grok-4.6 is both rendered and toggleable.
+  const xaiRoutes = collectByClass(families[2], "settings-model-route");
+  assert.equal(xaiRoutes.length, 1);
+  const routeInput = collectByTag(xaiRoutes[0], "input")[0];
+  assert.ok(routeInput);
+  assert.equal(routeInput.disabled, false);
+  assert.equal(routeInput.checked, true);
+  assert.equal(routeInput.dataset.modelProvider, "xai");
+  assert.equal(routeInput.dataset.modelName, "grok-4.6");
+});
+
+// Renders the Models tree for one bounded payload and returns both the family
+// nodes and the section heading, so a test can state the payload it cares about
+// instead of restating the harness that drives the shipped renderSettings block.
+// The heading matters on its own: what a hard ceiling refused is a fact about
+// the whole tree rather than about any one family, so it has nowhere else to be
+// stated and a test that only ever sees families could not catch its absence.
+function renderModelSettings(catalog) {
+  const start = appSource.indexOf("const OPENCODE_ADAPTER_ID = \"opencode_cli\";");
+  const end = appSource.indexOf("function renderSettings(payload, options = {})");
+  assert.notEqual(start, -1);
+  assert.notEqual(end, -1);
+  const helpers = appSource.slice(start, end);
+  const renderStart = end;
+  const renderEnd = appSource.indexOf("\n// ═══ HISTORY_PAGE_BEGIN", renderStart);
+  assert.notEqual(renderEnd, -1);
+  const renderFn = appSource.slice(renderStart, renderEnd);
+  const settingsList = makeSettingsElement("div");
+  settingsList.scrollTop = 0;
+  settingsList.scrollHeight = 0;
+  const settingsDialog = makeSettingsElement("dialog");
+  settingsDialog.scrollTop = 0;
+  const settingsSummary = makeSettingsElement("span");
+  const result = { families: null, headings: null };
+  const harness = `
+    "use strict";
+    const FEATURE_LABELS = {};
+    const state = { settingsTab: "models", settingsCollapsedFamilies: {}, settingsPendingIdentity: null, featureSettings: null };
+    const elements = { settingsList, settingsDialog, settingsSummary };
+    function settingsTabDefinitions() {
+      return [
+        ["features", "Features"],
+        ["models", "Models"],
+        ["source-graph", "Source Graph"],
+        ["retention", "Retention"],
+        ["telemetry", "Telemetry"],
+      ];
+    }
+    function createElement(tag, className, text) {
+      const element = document.createElement(tag);
+      if (className) element.className = className;
+      if (text !== undefined && text !== null) element.textContent = String(text);
+      return element;
+    }
+    function settingsControlIdentity(input) {
+      const data = (input && input.dataset) || {};
+      return [data.modelProvider || "", data.modelAdapter || "", data.modelName || ""].join("|");
+    }
+    function restoreSettingsFocus() {}
+    function setSettingsPending() {}
+    function renderSettingsPlaceholder() {}
+    function settingsStateMessage() { return document.createElement("div"); }
+    function numberValue(value) { const parsed = Number(value); return Number.isFinite(parsed) ? parsed : 0; }
+    function formatCount(value) { return String(value); }
+    function formatBytes() { return "0 B"; }
+    function formatMoney(value) { return String(value); }
+    ${helpers}
+    ${renderFn}
+    renderSettings({
+      ok: true,
+      revision: 2,
+      features: {},
+      model_policy: { ok: true, revision: 2, providers: {}, catalog: ${JSON.stringify(catalog)} },
+    });
+    const families = [];
+    const headings = [];
+    const collect = (node) => {
+      if (!node || typeof node !== "object") return;
+      const classes = String(node.className || "").split(/\\s+/);
+      if (classes.includes("settings-model-family")) families.push(node);
+      if (classes.includes("settings-group-heading")) headings.push(node);
+      for (const child of Array.from(node.children || [])) collect(child);
+    };
+    collect(settingsList);
+    result.families = families;
+    result.headings = headings;
+  `;
+  const context = vm.createContext({
+    document: {
+      createElement: (tag) => makeSettingsElement(tag),
+      createDocumentFragment: () => makeSettingsElement("fragment"),
+      activeElement: null,
+      scrollingElement: null,
+    },
+    settingsList,
+    settingsDialog,
+    settingsSummary,
+    result,
+  });
+  vm.runInContext(harness, context);
+  return {
+    families: hostArray(result.families),
+    headings: hostArray(result.headings),
+  };
+}
+
+function renderModelFamilies(catalog) {
+  return renderModelSettings(catalog).families;
+}
+
+// Every warning line the Models heading carries, joined, so a test states what
+// the reader is told rather than which child index carried it.
+function headingWarningText(headings) {
+  return headings
+    .flatMap((heading) => hostArray(heading.children))
+    .filter((child) => String(child.className || "").split(/\s+/).includes("settings-model-warning"))
+    .map((child) => child.textContent)
+    .join(" · ");
+}
+
+function familySmallText(family) {
+  const provider = collectByClass(family, "settings-model-provider")[0];
+  const copy = collectByClass(provider || family, "settings-copy")[0];
+  const node = hostArray((copy || {}).children).find((child) => child.tag === "small");
+  return node ? node.textContent : "";
+}
+
+test("Models states ingestion loss against the population it was counted over, and keeps the xai route toggleable", () => {
+  // The backend's ingestion cap runs BEFORE the render bound, so a provider can
+  // lose rows that the render bound never saw. Two things went wrong with that.
+  //
+  // First, provider_counts.total was taken from the rows that survived the cap,
+  // so a 600-route provider published "511 of 511" and this tree drew a heavily
+  // truncated provider as complete. The total is now the provider's own size.
+  //
+  // Second, the loss beside it was keyed by the vendor spelling ("xai") while
+  // this tree groups by the canonical policy owner ("opencode"), so an
+  // xai/opencode_cli shortfall named a family that is never drawn: published,
+  // and still unreachable. Both are now in one canonical key space.
+  const families = renderModelFamilies({
+    discovered_model_count: 0,
+    worker_count: 512,
+    returned_worker_count: 2,
+    row_limit: 64,
+    truncated: true,
+    provider_counts: [
+      {
+        provider: "opencode",
+        total: 600,
+        ingested: 511,
+        returned: 2,
+        truncated: true,
+        enabled_total: 511,
+        enabled_counted_over: 511,
+        enabled_returned: 2,
+      },
+    ],
+    source_ingestion_loss: [
+      {
+        provider: "opencode",
+        total: 600,
+        ingested: 511,
+        dropped: 89,
+        absent_routes: 89,
+        vendor_providers: ["xai"],
+      },
+    ],
+    workers: [
+      {
+        provider: "opencode",
+        adapter: "opencode_cli",
+        model: "opencode/model-00-free",
+        worker_id: "",
+        vendor_provider: "opencode",
+        catalog_enabled: true,
+        effective_enabled: true,
+        inventory_only: true,
+        discovered_from_opencode: true,
+      },
+      {
+        provider: "opencode",
+        adapter: "opencode_cli",
+        model: "xai/grok-4.6",
+        worker_id: "grok_opencode",
+        vendor_provider: "xai",
+        catalog_enabled: true,
+        effective_enabled: true,
+        inventory_only: false,
+      },
+    ],
+  });
+
+  assert.equal(families.length, 1);
+  const label = familySmallText(families[0]);
+  // The provider's real size, not the ingestion cap's arithmetic.
+  assert.match(label, /^2 of 600 routes shown · /);
+  // The enabled figure names the population it was counted over. Claiming 511
+  // of 511 "provider-wide" for a 600-route provider is the same lie one field
+  // over, so that phrasing must be absent rather than merely reworded.
+  assert.match(label, /511 of 511 enabled among loaded routes/);
+  assert.doesNotMatch(label, /provider-wide/);
+  assert.doesNotMatch(label, /511 of 511 routes shown/);
+  // The loss is reachable from the family the tree actually draws.
+  assert.match(label, /89 not loaded \(catalog bound\)/);
+
+  // And the route this whole card is about is still drawn with a live control.
+  const routes = collectByClass(families[0], "settings-model-route");
+  const grok = routes.find((route) => collectByTag(route, "input")[0].dataset.modelName === "xai/grok-4.6");
+  assert.ok(grok);
+  const grokInput = collectByTag(grok, "input")[0];
+  assert.equal(grokInput.disabled, false);
+  assert.equal(grokInput.checked, true);
+  // Toggling writes the canonical policy owner the launcher consults, which is
+  // what makes a checked box and a launch-eligible route the same claim.
+  assert.equal(grokInput.dataset.modelProvider, "opencode");
+  assert.equal(grokInput.dataset.modelAdapter, "opencode_cli");
+});
+
+test("Models still claims a provider-wide enabled total when nothing was lost to ingestion", () => {
+  // The counterpart to the test above: with no ingestion loss the enabled count
+  // really is the provider's, and qualifying it would understate the payload.
+  const families = renderModelFamilies({
+    discovered_model_count: 0,
+    worker_count: 40,
+    returned_worker_count: 1,
+    row_limit: 64,
+    truncated: true,
+    provider_counts: [
+      {
+        provider: "anthropic",
+        total: 40,
+        ingested: 40,
+        returned: 1,
+        truncated: true,
+        enabled_total: 36,
+        enabled_counted_over: 40,
+        enabled_returned: 1,
+      },
+    ],
+    source_ingestion_loss: [],
+    workers: [
+      {
+        provider: "anthropic",
+        adapter: "claude_cli",
+        model: "anthropic-model-00",
+        worker_id: "anthropic-0",
+        catalog_enabled: true,
+        effective_enabled: true,
+        inventory_only: false,
+      },
+    ],
+  });
+
+  const label = familySmallText(families[0]);
+  assert.match(label, /^1 of 40 routes shown · 1 of 1 shown enabled · 36 of 40 enabled provider-wide · /);
+  assert.doesNotMatch(label, /among loaded routes/);
+  assert.doesNotMatch(label, /not loaded \(catalog bound\)/);
+  assert.doesNotMatch(label, /not loaded \(discovery bound\)/);
+  assert.doesNotMatch(label, /not loaded \(editor bound\)/);
+});
+
+test("Models names the OpenCode discovery bound's loss separately from the catalog bound's", () => {
+  // The OpenCode discovery probe is a second ingestion source with its own
+  // bound, and it kept the head slice the configured catalog had already given
+  // up: a vendor past the cap vanished from this tree with every published
+  // number still adding up, because the counts were taken after the slice.
+  //
+  // Its loss now arrives keyed by the canonical policy owner -- the same key
+  // space this tree groups by -- and is named in its own clause rather than
+  // summed into the catalog bound's, because "not loaded" has a different
+  // cause and a different remedy depending on which bound refused the row.
+  const families = renderModelFamilies({
+    discovered_model_count: 512,
+    opencode_discovered_model_count: 512,
+    worker_count: 512,
+    returned_worker_count: 2,
+    row_limit: 64,
+    truncated: true,
+    provider_counts: [
+      {
+        provider: "opencode",
+        total: 601,
+        ingested: 512,
+        returned: 2,
+        truncated: true,
+        enabled_total: 512,
+        enabled_counted_over: 512,
+        enabled_returned: 2,
+      },
+    ],
+    source_ingestion_loss: [],
+    opencode_source: {
+      total: 601,
+      returned: 512,
+      truncated: true,
+      row_limit: 512,
+      row_limit_honoured: 512,
+      ingestion_loss: [
+        {
+          provider: "opencode",
+          total: 601,
+          ingested: 512,
+          dropped: 89,
+          absent_routes: 89,
+          vendor_providers: ["opencode"],
+        },
+      ],
+    },
+    workers: [
+      {
+        provider: "opencode",
+        adapter: "opencode_cli",
+        model: "opencode/model-599-free",
+        worker_id: "",
+        vendor_provider: "opencode",
+        catalog_enabled: true,
+        effective_enabled: true,
+        inventory_only: true,
+        discovered_from_opencode: true,
+      },
+      {
+        provider: "opencode",
+        adapter: "opencode_cli",
+        model: "xai/grok-4.6",
+        worker_id: "",
+        vendor_provider: "xai",
+        catalog_enabled: true,
+        effective_enabled: true,
+        inventory_only: true,
+        discovered_from_opencode: true,
+      },
+    ],
+  });
+
+  assert.equal(families.length, 1);
+  const label = familySmallText(families[0]);
+  // The provider's real size, which now includes what the discovery bound cost
+  // it -- the row list alone would have read as 2 of 512.
+  assert.match(label, /^2 of 601 routes shown · /);
+  // Named as the discovery bound's loss, and not mislabelled as the catalog's.
+  assert.match(label, /89 not loaded \(discovery bound\)/);
+  assert.doesNotMatch(label, /not loaded \(catalog bound\)/);
+
+  // The vendor the discovery sequence listed last is still drawn, and still
+  // toggleable through the canonical owner the launcher consults.
+  const routes = collectByClass(families[0], "settings-model-route");
+  const grok = routes.find((route) => collectByTag(route, "input")[0].dataset.modelName === "xai/grok-4.6");
+  assert.ok(grok);
+  const grokInput = collectByTag(grok, "input")[0];
+  assert.equal(grokInput.disabled, false);
+  assert.equal(grokInput.checked, true);
+  assert.equal(grokInput.dataset.modelProvider, "opencode");
+  assert.equal(grokInput.dataset.modelAdapter, "opencode_cli");
+});
+
+test("Models names both ingestion bounds when a provider lost rows to each", () => {
+  // A provider can be cut twice over: configured catalog rows refused by the
+  // catalog bound, and discovered identities refused by the discovery bound.
+  // Summing them would publish one number that is true of neither population,
+  // so each clause is stated against the bound that produced it.
+  const families = renderModelFamilies({
+    discovered_model_count: 0,
+    worker_count: 3,
+    returned_worker_count: 1,
+    row_limit: 64,
+    truncated: true,
+    provider_counts: [
+      {
+        provider: "opencode",
+        total: 20,
+        ingested: 3,
+        returned: 1,
+        truncated: true,
+        enabled_total: 3,
+        enabled_counted_over: 3,
+        enabled_returned: 1,
+      },
+    ],
+    source_ingestion_loss: [
+      {
+        provider: "opencode",
+        total: 10,
+        ingested: 2,
+        dropped: 8,
+        absent_routes: 8,
+        vendor_providers: ["xai"],
+      },
+    ],
+    opencode_source: {
+      total: 10,
+      returned: 1,
+      truncated: true,
+      row_limit: 512,
+      row_limit_honoured: 512,
+      ingestion_loss: [
+        {
+          provider: "opencode",
+          total: 10,
+          ingested: 1,
+          dropped: 9,
+          absent_routes: 9,
+          vendor_providers: ["opencode"],
+        },
+      ],
+    },
+    workers: [
+      {
+        provider: "opencode",
+        adapter: "opencode_cli",
+        model: "xai/grok-4.6",
+        worker_id: "grok_opencode",
+        vendor_provider: "xai",
+        catalog_enabled: true,
+        effective_enabled: true,
+        inventory_only: false,
+      },
+    ],
+  });
+
+  const label = familySmallText(families[0]);
+  assert.match(label, /8 not loaded \(catalog bound\) · 9 not loaded \(discovery bound\)/);
+  // Not collapsed into a single 17, which would be true of no population here.
+  assert.doesNotMatch(label, /17 not loaded/);
+});
+
+test("Models names the editor bridge bound's loss as its own clause", () => {
+  // The editor bridge is the third bounded ingestion source and was the last
+  // one still cut silently: a Copilot host reporting more identities than the
+  // cap lost whichever it listed last, and the count printed beside it
+  // described the survivors rather than the host. Its loss now arrives in the
+  // same canonical key space as the other two, so the copilot family can say
+  // which bound refused its rows instead of showing a routes-shown figure that
+  // simply stops adding up.
+  const families = renderModelFamilies({
+    discovered_model_count: 512,
+    worker_count: 512,
+    returned_worker_count: 1,
+    row_limit: 64,
+    truncated: true,
+    provider_counts: [
+      {
+        provider: "copilot",
+        total: 600,
+        ingested: 512,
+        returned: 1,
+        truncated: true,
+        enabled_total: 512,
+        enabled_counted_over: 512,
+        enabled_returned: 1,
+      },
+    ],
+    source_ingestion_loss: [],
+    editor_source: {
+      total: 600,
+      returned: 512,
+      truncated: true,
+      row_limit: 512,
+      row_limit_honoured: 512,
+      ingestion_loss: [
+        {
+          provider: "copilot",
+          total: 600,
+          ingested: 512,
+          dropped: 88,
+          absent_routes: 88,
+          vendor_providers: ["copilot"],
+        },
+      ],
+    },
+    workers: [
+      {
+        provider: "copilot",
+        adapter: "vscode_lm",
+        model: "copilot-model-599",
+        worker_id: "",
+        vendor_provider: "",
+        catalog_enabled: true,
+        effective_enabled: true,
+        inventory_only: true,
+        discovered_from_editor: true,
+      },
+    ],
+  });
+
+  assert.equal(families.length, 1);
+  const label = familySmallText(families[0]);
+  // The host's real size, not the count of identities the bound let through.
+  assert.match(label, /^1 of 600 routes shown · /);
+  // Named as the editor bound's loss, and not attributed to either of the
+  // other two sources, which refused nothing here.
+  assert.match(label, /88 not loaded \(editor bound\)/);
+  assert.doesNotMatch(label, /not loaded \(catalog bound\)/);
+  assert.doesNotMatch(label, /not loaded \(discovery bound\)/);
+
+  // The identity the host listed last is drawn with a live control, which is
+  // the whole point of keeping it: a route nobody can see is a route nobody
+  // can switch back on.
+  const routes = collectByClass(families[0], "settings-model-route");
+  const input = collectByTag(routes[0], "input")[0];
+  assert.equal(input.dataset.modelName, "copilot-model-599");
+  assert.equal(input.disabled, false);
+  assert.equal(input.checked, true);
+});
+
+test("Models counts 'not loaded' over the deduped routes, not a source's raw refusals", () => {
+  // The three ingestion sources describe overlapping populations, so a bound's
+  // raw drop count and the rows this tree is actually missing are two different
+  // numbers. The backend already dedupes the denominator -- a discovery
+  // identity the bound refused is not a missing route when the configured
+  // catalog supplied the same one -- and the clause beside it was still built
+  // from the raw count, so a probe that refused 90 identities of which exactly
+  // one was a route nothing else carried announced "90 not loaded" next to a
+  // 602-route total short by a single row. Two populations, one sentence, true
+  // of neither.
+  const families = renderModelFamilies({
+    discovered_model_count: 512,
+    opencode_discovered_model_count: 512,
+    worker_count: 601,
+    returned_worker_count: 2,
+    row_limit: 64,
+    truncated: true,
+    provider_counts: [
+      {
+        provider: "opencode",
+        total: 602,
+        ingested: 601,
+        returned: 2,
+        truncated: true,
+        enabled_total: 601,
+        enabled_counted_over: 601,
+        enabled_returned: 2,
+      },
+    ],
+    source_ingestion_loss: [],
+    opencode_source: {
+      total: 602,
+      returned: 512,
+      truncated: true,
+      row_limit: 512,
+      row_limit_honoured: 512,
+      ingestion_loss: [
+        {
+          provider: "opencode",
+          // What the probe refused, which is a fact about the probe.
+          dropped: 90,
+          // How many of those are routes no other source supplied, which is
+          // the only one of the two counted over the population the
+          // routes-shown denominator uses.
+          absent_routes: 1,
+          total: 602,
+          ingested: 512,
+          vendor_providers: ["opencode"],
+        },
+      ],
+    },
+    workers: [
+      {
+        provider: "opencode",
+        adapter: "opencode_cli",
+        model: "opencode/model-000-free",
+        worker_id: "opencode-000",
+        vendor_provider: "opencode",
+        catalog_enabled: true,
+        effective_enabled: true,
+        inventory_only: false,
+      },
+      {
+        provider: "opencode",
+        adapter: "opencode_cli",
+        model: "xai/grok-4.6",
+        worker_id: "grok_opencode",
+        vendor_provider: "xai",
+        catalog_enabled: true,
+        effective_enabled: true,
+        inventory_only: false,
+      },
+    ],
+  });
+
+  assert.equal(families.length, 1);
+  const label = familySmallText(families[0]);
+  // The denominator is the deduped provider size, as before.
+  assert.match(label, /^2 of 602 routes shown · /);
+  // And the missing-row claim is now counted over that same population: one
+  // route absent, stated against the bound that refused it.
+  assert.match(label, /· 1 not loaded \(discovery bound\)/);
+  // The raw refusal count must not appear as a claim about this tree at all,
+  // neither as itself nor summed into another clause.
+  assert.doesNotMatch(label, /90 not loaded/);
+  assert.doesNotMatch(label, /not loaded \(catalog bound\)/);
+  assert.doesNotMatch(label, /not loaded \(editor bound\)/);
+
+  // The route the card is about stays visible and toggleable through the
+  // canonical owner the launcher consults.
+  const routes = collectByClass(families[0], "settings-model-route");
+  const grok = routes.find((route) => collectByTag(route, "input")[0].dataset.modelName === "xai/grok-4.6");
+  assert.ok(grok);
+  const grokInput = collectByTag(grok, "input")[0];
+  assert.equal(grokInput.disabled, false);
+  assert.equal(grokInput.checked, true);
+  assert.equal(grokInput.dataset.modelProvider, "opencode");
+  assert.equal(grokInput.dataset.modelAdapter, "opencode_cli");
+});
+
+test("Models draws a declared-only route as toggleable without claiming anything discovered it", () => {
+  // The backend now materialises a row for a route the owner named in
+  // models.json when every discovery list reaching it had already been cut
+  // upstream -- otherwise an explicitly enabled route past the producer's cap
+  // has no checkbox at all, which is the defect this card is about.
+  //
+  // Such a row is inventory_only (no worker) but nothing observed it, so the
+  // tree must not borrow a discovery label for it. "discovered in VS Code"
+  // over a route no VS Code host ever reported is a measurement claim the
+  // payload cannot back, and it reads exactly like a verified one.
+  const families = renderModelFamilies({
+    discovered_model_count: 0,
+    declared_only_model_count: 1,
+    worker_count: 2,
+    returned_worker_count: 2,
+    row_limit: 64,
+    truncated: false,
+    provider_counts: [
+      {
+        provider: "opencode",
+        total: 2,
+        ingested: 2,
+        returned: 2,
+        truncated: false,
+        enabled_total: 1,
+        enabled_counted_over: 2,
+        enabled_returned: 1,
+      },
+    ],
+    workers: [
+      {
+        provider: "opencode",
+        adapter: "opencode_cli",
+        model: "opencode/model-000",
+        worker_id: "",
+        vendor_provider: "opencode",
+        catalog_enabled: true,
+        effective_enabled: false,
+        inventory_only: true,
+        discovered_from_opencode: true,
+      },
+      {
+        provider: "opencode",
+        adapter: "opencode_cli",
+        model: "xai/grok-4.6",
+        worker_id: "",
+        vendor_provider: "opencode",
+        catalog_enabled: true,
+        effective_enabled: true,
+        inventory_only: true,
+        declared_only: true,
+      },
+    ],
+  });
+
+  assert.equal(families.length, 1);
+  const routes = collectByClass(families[0], "settings-model-route");
+  const declared = routes.find(
+    (route) => collectByTag(route, "input")[0].dataset.modelName === "xai/grok-4.6",
+  );
+  assert.ok(declared);
+
+  // Drawn checked and enabled: the owner's decision is reachable, which is the
+  // whole point of materialising the row.
+  const declaredInput = collectByTag(declared, "input")[0];
+  assert.equal(declaredInput.disabled, false);
+  assert.equal(declaredInput.checked, true);
+  assert.equal(declaredInput.dataset.modelProvider, "opencode");
+  assert.equal(declaredInput.dataset.modelAdapter, "opencode_cli");
+
+  // And labelled for what it is. Both label sites are asserted because either
+  // one alone would still print a false discovery claim beside the row.
+  const smalls = hostArray(collectByClass(declared, "settings-copy")[0].children)
+    .filter((child) => child.tag === "small")
+    .map((child) => child.textContent);
+  const subtitle = smalls[0];
+  const truth = collectByClass(declared, "settings-model-truth")[0].textContent;
+  assert.match(subtitle, /declared in models\.json/);
+  assert.match(subtitle, /not offered by discovery/);
+  assert.doesNotMatch(subtitle, /discovered/);
+  assert.match(truth, /declared, not discovered/);
+  assert.doesNotMatch(truth, /opencode discovery/);
+  assert.doesNotMatch(truth, /editor discovery/);
+
+  // The genuinely discovered sibling is unchanged, so the new branch did not
+  // reword every inventory row on its way past.
+  const found = routes.find(
+    (route) => collectByTag(route, "input")[0].dataset.modelName === "opencode/model-000",
+  );
+  assert.match(
+    collectByClass(found, "settings-model-truth")[0].textContent,
+    /opencode discovery/,
+  );
+});
+
+test("Models keeps a source-truncated configured route's worker and catalog truth", () => {
+  // A configured route the backend's ingestion ceiling refused is brought back
+  // because the owner had declared it, and it arrives with source_truncated
+  // set. It is deliberately NOT declared_only: the catalog did supply this
+  // route, it carries a worker_id, and it carries the "enabled": false the
+  // catalog stated about it. The previous payload sent exactly this row as a
+  // declared-only one, so this tree printed "declared, not discovered" and
+  // "unidentified worker" over evidence the payload was holding, and drew the
+  // switch as though the catalog had never turned the route off.
+  const families = renderModelFamilies({
+    discovered_model_count: 0,
+    declared_only_model_count: 0,
+    source_truncated_model_count: 1,
+    worker_count: 2,
+    returned_worker_count: 2,
+    row_limit: 64,
+    truncated: false,
+    provider_counts: [
+      {
+        provider: "anthropic",
+        total: 2,
+        ingested: 2,
+        returned: 2,
+        truncated: false,
+        enabled_total: 1,
+        enabled_counted_over: 2,
+        enabled_returned: 1,
+      },
+    ],
+    workers: [
+      {
+        provider: "anthropic",
+        adapter: "claude_cli",
+        model: "anthropic-model-0000",
+        worker_id: "anthropic-refused",
+        vendor_provider: "anthropic",
+        catalog_enabled: false,
+        effective_enabled: false,
+        inventory_only: false,
+        source_truncated: true,
+      },
+      {
+        provider: "anthropic",
+        adapter: "claude_cli",
+        model: "anthropic-model-0001",
+        worker_id: "anthropic-0001",
+        vendor_provider: "anthropic",
+        catalog_enabled: true,
+        effective_enabled: true,
+        inventory_only: false,
+      },
+    ],
+  });
+
+  assert.equal(families.length, 1);
+  const routes = collectByClass(families[0], "settings-model-route");
+  const recovered = routes.find(
+    (route) => collectByTag(route, "input")[0].dataset.modelName === "anthropic-model-0000",
+  );
+  assert.ok(recovered);
+
+  // The worker the payload is carrying, printed rather than replaced by a
+  // declaration line that would deny the catalog row exists.
+  const smalls = hostArray(collectByClass(recovered, "settings-copy")[0].children)
+    .filter((child) => child.tag === "small")
+    .map((child) => child.textContent);
+  assert.match(smalls[0], /anthropic-refused/);
+  assert.doesNotMatch(smalls[0], /declared in models\.json/);
+  assert.doesNotMatch(smalls[0], /unidentified worker/);
+
+  // And named for what it is: supplied by the catalog, reached this tree only
+  // past a bound that came up short. Never "declared, not discovered", which
+  // would claim no source ever offered it.
+  const truth = collectByClass(recovered, "settings-model-truth")[0].textContent;
+  assert.match(truth, /configured, past the source bound/);
+  assert.doesNotMatch(truth, /declared, not discovered/);
+  assert.doesNotMatch(truth, /discovered/);
+
+  // The catalog switched this route off, so the control says so instead of
+  // offering a toggle the repository would refuse.
+  const recoveredInput = collectByTag(recovered, "input")[0];
+  assert.equal(recoveredInput.checked, false);
+  assert.equal(recoveredInput.disabled, true);
+
+  // An ordinary configured sibling is untouched, so the new branch did not
+  // relabel every catalog row on its way past.
+  const sibling = routes.find(
+    (route) => collectByTag(route, "input")[0].dataset.modelName === "anthropic-model-0001",
+  );
+  const siblingTruth = collectByClass(sibling, "settings-model-truth")[0].textContent;
+  assert.match(siblingTruth, /^configured · /);
+  assert.doesNotMatch(siblingTruth, /past the source bound/);
+});
+
+test("Models states the configured routes a hard ceiling refused rather than stopping short", () => {
+  // The compact bound is raised to a correctness floor, and that floor was
+  // derived from models.json -- a file the extension does not control and
+  // nothing bounded. One declared leaf per catalog row therefore pinned every
+  // row and lifted the "bound" to the whole catalog. With a real ceiling in
+  // place the opposite risk appears: routes the owner explicitly configured are
+  // now absent from the row list, so they have no checkbox, and the only
+  // visible symptom would be a tree that quietly stops short of its own total.
+  const { families, headings } = renderModelSettings({
+    discovered_model_count: 0,
+    worker_count: 1025,
+    returned_worker_count: 2,
+    row_limit: 64,
+    row_limit_honoured: 256,
+    row_limit_ceiling: 256,
+    pinned_routes_refused: 769,
+    declared_leaf_count: 1400,
+    declared_leaf_limit: 1024,
+    declared_leaves_truncated: true,
+    truncated: true,
+    provider_counts: [
+      {
+        provider: "anthropic",
+        total: 1024,
+        ingested: 1024,
+        returned: 1,
+        truncated: true,
+        enabled_total: 1024,
+        enabled_counted_over: 1024,
+        enabled_returned: 1,
+      },
+      {
+        provider: "xai",
+        total: 1,
+        ingested: 1,
+        returned: 1,
+        truncated: false,
+        enabled_total: 1,
+        enabled_counted_over: 1,
+        enabled_returned: 1,
+      },
+    ],
+    source_ingestion_loss: [],
+    workers: [
+      {
+        provider: "anthropic",
+        adapter: "claude_cli",
+        model: "anthropic-model-000",
+        worker_id: "anthropic-000",
+        catalog_enabled: true,
+        effective_enabled: true,
+        inventory_only: false,
+      },
+      {
+        provider: "xai",
+        adapter: "grok_kilo_cli",
+        model: "grok-4.6",
+        worker_id: "xai-grok",
+        vendor_provider: "xai",
+        catalog_enabled: true,
+        effective_enabled: true,
+        inventory_only: false,
+      },
+    ],
+  });
+
+  const warning = headingWarningText(headings);
+  // Both facts, and each named for what it is: a decision the ceiling could not
+  // fit is not the same failure as one the read never reached.
+  assert.match(warning, /769 configured routes past the 256-row ceiling are not shown/);
+  assert.match(warning, /models\.json declares 1400 routes, more than the 1024 this view reads/);
+  assert.match(warning, /edit \.aiworkhub\/config\/models\.json/);
+
+  // And the provider that sorts last is still drawn and still toggleable, which
+  // is what representation-before-pins buys at the ceiling.
+  assert.equal(families.length, 2);
+  const xaiRoutes = collectByClass(families[1], "settings-model-route");
+  const xaiInput = collectByTag(xaiRoutes[0], "input")[0];
+  assert.equal(xaiInput.dataset.modelName, "grok-4.6");
+  assert.equal(xaiInput.dataset.modelProvider, "xai");
+  assert.equal(xaiInput.disabled, false);
+  assert.equal(xaiInput.checked, true);
+});
+
+test("Models says nothing about a ceiling that never bound", () => {
+  // The counterpart. A warning printed over a payload that fitted perfectly
+  // well is the same defect with the opposite sign: it would tell every reader
+  // their settings file is too large, on every ordinary repository.
+  const { headings } = renderModelSettings({
+    discovered_model_count: 0,
+    worker_count: 2,
+    returned_worker_count: 2,
+    row_limit: 64,
+    row_limit_honoured: 64,
+    row_limit_ceiling: 256,
+    pinned_routes_refused: 0,
+    declared_leaf_count: 2,
+    declared_leaf_limit: 1024,
+    declared_leaves_truncated: false,
+    truncated: false,
+    provider_counts: [
+      {
+        provider: "anthropic",
+        total: 2,
+        ingested: 2,
+        returned: 2,
+        truncated: false,
+        enabled_total: 2,
+        enabled_counted_over: 2,
+        enabled_returned: 2,
+      },
+    ],
+    source_ingestion_loss: [],
+    workers: [
+      {
+        provider: "anthropic",
+        adapter: "claude_cli",
+        model: "anthropic-model-000",
+        worker_id: "anthropic-000",
+        catalog_enabled: true,
+        effective_enabled: true,
+        inventory_only: false,
+      },
+      {
+        provider: "anthropic",
+        adapter: "claude_cli",
+        model: "anthropic-model-001",
+        worker_id: "anthropic-001",
+        catalog_enabled: true,
+        effective_enabled: true,
+        inventory_only: false,
+      },
+    ],
+  });
+
+  assert.equal(headingWarningText(headings), "");
+});
+
+test("Models keeps a vendor's second rendered provider visible under a bounded catalog", () => {
+  // One vendor spelling can span two of the providers this tree draws: an "xai"
+  // vendor reaches opencode through opencode_cli and stays xai through
+  // grok_kilo_cli. The backend used to spend ingestion fairness per vendor and
+  // report per rendered provider, so the whole xai family could be ingested
+  // away while its loss entry was filed under a family with no rows left. This
+  // is the payload the fixed backend produces: both providers present, and the
+  // loss named against one that is actually drawn.
+  const { families } = renderModelSettings({
+    discovered_model_count: 0,
+    worker_count: 512,
+    returned_worker_count: 2,
+    row_limit: 64,
+    row_limit_honoured: 64,
+    row_limit_ceiling: 256,
+    pinned_routes_refused: 0,
+    truncated: true,
+    provider_counts: [
+      {
+        provider: "opencode",
+        total: 512,
+        ingested: 511,
+        returned: 1,
+        truncated: true,
+        enabled_total: 511,
+        enabled_counted_over: 511,
+        enabled_returned: 1,
+      },
+      {
+        provider: "xai",
+        total: 1,
+        ingested: 1,
+        returned: 1,
+        truncated: false,
+        enabled_total: 1,
+        enabled_counted_over: 1,
+        enabled_returned: 1,
+      },
+    ],
+    source_ingestion_loss: [
+      {
+        provider: "opencode",
+        total: 512,
+        ingested: 511,
+        dropped: 1,
+        absent_routes: 1,
+        vendor_providers: ["xai"],
+      },
+    ],
+    workers: [
+      {
+        provider: "opencode",
+        adapter: "opencode_cli",
+        model: "xai/model-000",
+        worker_id: "xai-opencode-000",
+        vendor_provider: "xai",
+        catalog_enabled: true,
+        effective_enabled: true,
+        inventory_only: false,
+      },
+      {
+        provider: "xai",
+        adapter: "grok_kilo_cli",
+        model: "grok-4.6",
+        worker_id: "xai-grok",
+        vendor_provider: "xai",
+        catalog_enabled: true,
+        effective_enabled: true,
+        inventory_only: false,
+      },
+    ],
+  });
+
+  // Two families, and the second one is the provider a vendor-only fairness
+  // rule used to delete outright.
+  assert.equal(families.length, 2);
+  assert.match(familySmallText(families[0]), /^1 of 512 routes shown · /);
+  // The OpenCode loss names the vendor underneath it, so canonical keying never
+  // hides which half of the family was cut.
+  assert.match(familySmallText(families[0]), /1 not loaded \(catalog bound\)/);
+  assert.match(familySmallText(families[1]), /^1 route · 1 enabled · /);
+
+  const xaiRoutes = collectByClass(families[1], "settings-model-route");
+  assert.equal(xaiRoutes.length, 1);
+  const xaiInput = collectByTag(xaiRoutes[0], "input")[0];
+  assert.equal(xaiInput.dataset.modelName, "grok-4.6");
+  assert.equal(xaiInput.dataset.modelProvider, "xai");
+  assert.equal(xaiInput.disabled, false);
+  assert.equal(xaiInput.checked, true);
+});
+
+test("Models states an editor-host ceiling as a floor rather than as a total", () => {
+  // The bridge head-slices the host's model list at 128 and publishes no total
+  // beside the slice, so the backend's 512-row ingestion bound cannot bind on
+  // this source at all. While every count was taken after that slice, a host
+  // offering three hundred identities rendered here as "128 of 128 routes
+  // shown" -- a truncated provider drawn as complete, which is the same defect
+  // the 511-of-511 case above closed, one boundary further upstream.
+  //
+  // The remainder is genuinely unknowable from here, so the fix is not a bigger
+  // number: it is a weaker claim. The total is published as a floor and the
+  // label says "at least", because inventing a count would be the same error
+  // with a different value.
+  const families = renderModelFamilies({
+    discovered_model_count: 128,
+    worker_count: 129,
+    returned_worker_count: 2,
+    row_limit: 64,
+    truncated: true,
+    provider_counts: [
+      {
+        provider: "copilot",
+        total: 129,
+        total_is_lower_bound: true,
+        ingested: 129,
+        returned: 2,
+        truncated: true,
+        enabled_total: 129,
+        enabled_counted_over: 129,
+        enabled_returned: 2,
+      },
+    ],
+    editor_source: {
+      total: 128,
+      delivered: 128,
+      upstream_refused: 0,
+      upstream_ceiling: 128,
+      returned: 128,
+      truncated: true,
+      total_is_lower_bound: true,
+    },
+    workers: [
+      {
+        provider: "copilot",
+        adapter: "vscode_lm",
+        model: "copilot-model-000",
+        worker_id: "",
+        vendor_provider: "",
+        catalog_enabled: true,
+        effective_enabled: true,
+        inventory_only: true,
+        discovered_from_editor: true,
+      },
+      {
+        provider: "copilot",
+        adapter: "vscode_lm",
+        model: "copilot-model-999",
+        worker_id: "",
+        vendor_provider: "copilot",
+        catalog_enabled: true,
+        effective_enabled: true,
+        inventory_only: true,
+        source_truncated: true,
+        upstream_truncated: true,
+      },
+    ],
+  });
+
+  assert.equal(families.length, 1);
+  const label = familySmallText(families[0]);
+  // The denominator carries its own qualification, so the number cannot be read
+  // as the host's catalog size.
+  assert.match(label, /^2 of at least 129 routes shown · /);
+  assert.doesNotMatch(label, /^2 of 129 routes shown/);
+  // "provider-wide" is a claim about a known population, and this one is not.
+  assert.doesNotMatch(label, /provider-wide/);
+  assert.match(label, /129 of 129 enabled among loaded routes/);
+  // And the shortfall is named without a fabricated count beside it.
+  assert.match(label, /more may not be loaded \(editor host bound\)/);
+  assert.doesNotMatch(label, /0 not loaded/);
+
+  // The explicitly configured route the host's slice omitted is still drawn and
+  // still toggleable, which is the failure this whole card is about.
+  const routes = collectByClass(families[0], "settings-model-route");
+  const declared = routes.find(
+    (route) => collectByTag(route, "input")[0].dataset.modelName === "copilot-model-999",
+  );
+  assert.ok(declared);
+  const declaredInput = collectByTag(declared, "input")[0];
+  assert.equal(declaredInput.disabled, false);
+  assert.equal(declaredInput.checked, true);
+});
+
+test("Models keeps an exact total exact when no producer ceiling bound", () => {
+  // The control for the test above, and the reason the floor is keyed off a
+  // backend flag rather than applied to every provider. A source that returned
+  // everything it had states a measurement, and hedging it to "at least" would
+  // make the label unfalsifiable -- true of every payload and informative about
+  // none of them.
+  const families = renderModelFamilies({
+    discovered_model_count: 40,
+    worker_count: 40,
+    returned_worker_count: 2,
+    row_limit: 64,
+    truncated: true,
+    provider_counts: [
+      {
+        provider: "copilot",
+        total: 40,
+        total_is_lower_bound: false,
+        ingested: 40,
+        returned: 2,
+        truncated: true,
+        enabled_total: 40,
+        enabled_counted_over: 40,
+        enabled_returned: 2,
+      },
+    ],
+    workers: [
+      {
+        provider: "copilot",
+        adapter: "vscode_lm",
+        model: "copilot-model-000",
+        worker_id: "",
+        vendor_provider: "",
+        catalog_enabled: true,
+        effective_enabled: true,
+        inventory_only: true,
+        discovered_from_editor: true,
+      },
+      {
+        provider: "copilot",
+        adapter: "vscode_lm",
+        model: "copilot-model-001",
+        worker_id: "",
+        vendor_provider: "",
+        catalog_enabled: true,
+        effective_enabled: true,
+        inventory_only: true,
+        discovered_from_editor: true,
+      },
+    ],
+  });
+
+  const label = familySmallText(families[0]);
+  assert.match(label, /^2 of 40 routes shown · /);
+  assert.doesNotMatch(label, /at least/);
+  assert.doesNotMatch(label, /editor host bound/);
+  // A fully counted provider may still say "provider-wide", so the hedge above
+  // is the exception the evidence forces and not the new default.
+  assert.match(label, /40 of 40 enabled provider-wide/);
+});
+
+test("Models draws an OpenCode provider over the size its producer parsed, not the size it delivered", () => {
+  // The OpenCode boundary differs from the editor one in what is recoverable:
+  // the snapshot its 64-row parser read is reachable from the backend, so the
+  // identities that cap refused are named, deduped against the other sources
+  // and folded into the provider's size. The tree therefore gets an exact total
+  // and an exact "not loaded" count here, where the editor family can only get
+  // a floor -- two boundaries, two different strengths of claim, and the label
+  // must not blur them into one.
+  const families = renderModelFamilies({
+    discovered_model_count: 64,
+    worker_count: 64,
+    returned_worker_count: 2,
+    row_limit: 64,
+    truncated: true,
+    provider_counts: [
+      {
+        provider: "opencode",
+        total: 201,
+        total_is_lower_bound: false,
+        ingested: 64,
+        returned: 2,
+        truncated: true,
+        enabled_total: 64,
+        enabled_counted_over: 64,
+        enabled_returned: 2,
+      },
+    ],
+    opencode_source: {
+      total: 201,
+      delivered: 64,
+      upstream_refused: 137,
+      upstream_ceiling: 64,
+      returned: 64,
+      truncated: true,
+      total_is_lower_bound: false,
+      ingestion_loss: [
+        {
+          provider: "opencode",
+          total: 201,
+          ingested: 64,
+          dropped: 137,
+          absent_routes: 137,
+          // A strict subset of absent_routes, not a second number to add to
+          // it. Here it is the whole of it: the parser cut 137 identities
+          // before this backend's own bound was offered anything.
+          upstream_absent_routes: 137,
+          vendor_providers: ["opencode", "xai"],
+        },
+      ],
+    },
+    workers: [
+      {
+        provider: "opencode",
+        adapter: "opencode_cli",
+        model: "opencode/model-000",
+        worker_id: "",
+        vendor_provider: "opencode",
+        catalog_enabled: true,
+        effective_enabled: true,
+        inventory_only: true,
+        discovered_from_opencode: true,
+      },
+      {
+        provider: "opencode",
+        adapter: "opencode_cli",
+        model: "xai/grok-4.6",
+        worker_id: "",
+        vendor_provider: "xai",
+        catalog_enabled: true,
+        effective_enabled: true,
+        inventory_only: true,
+        source_truncated: true,
+        discovered_from_opencode: true,
+      },
+    ],
+  });
+
+  const label = familySmallText(families[0]);
+  // 201 is what the host offered; 64 is what the parser handed over. Printing
+  // the second as the provider's size was the understatement.
+  assert.match(label, /^2 of 201 routes shown · /);
+  assert.doesNotMatch(label, /2 of 64 routes shown/);
+  assert.doesNotMatch(label, /at least/);
+  // An exact loss, named against the bound that actually caused it. Every one
+  // of the 137 was refused by the OpenCode parser's own ceiling: this backend
+  // ingested all 64 identities it was handed (ingested === delivered), so its
+  // discovery bound refused nothing at all. "137 not loaded (discovery bound)"
+  // therefore blamed a cap that never saw the rows, and an owner raising that
+  // limit would recover none of them.
+  assert.match(label, /137 not loaded \(OpenCode host bound\)/);
+  assert.doesNotMatch(label, /not loaded \(discovery bound\)/);
+
+  // And xai/grok-4.6 -- the route past the producer's cut -- is drawn with a
+  // live, checked control rather than missing from the tree.
+  const routes = collectByClass(families[0], "settings-model-route");
+  const grok = routes.find(
+    (route) => collectByTag(route, "input")[0].dataset.modelName === "xai/grok-4.6",
+  );
+  assert.ok(grok);
+  const grokInput = collectByTag(grok, "input")[0];
+  assert.equal(grokInput.disabled, false);
+  assert.equal(grokInput.checked, true);
+});
+
+test("Models names the OpenCode host, not the editor, when an OpenCode total is a floor", () => {
+  // The floor clause carries no number, so the only thing a reader can check it
+  // against is the host it names -- and it named the editor for every family.
+  // An OpenCode total is only ever a floor because the OpenCode host/producer
+  // cut its list above the backend, so "editor host bound" pointed the owner at
+  // a cap that had never been offered these routes and cannot be raised to
+  // recover them. That is the same misattribution the split "not loaded"
+  // clauses fixed, restated in the one clause with no count beside it.
+  const families = renderModelFamilies({
+    discovered_model_count: 64,
+    worker_count: 64,
+    returned_worker_count: 2,
+    row_limit: 64,
+    truncated: true,
+    provider_counts: [
+      {
+        provider: "opencode",
+        total: 64,
+        total_is_lower_bound: true,
+        ingested: 64,
+        returned: 2,
+        truncated: true,
+        enabled_total: 64,
+        enabled_counted_over: 64,
+        enabled_returned: 2,
+      },
+    ],
+    // The snapshot arrived at the producer's own 64-row cap and every identity
+    // in it parsed, so there is nothing to recover and nothing to count: the
+    // backend publishes a floor and no loss entry at all.
+    opencode_source: {
+      total: 64,
+      delivered: 64,
+      upstream_refused: 0,
+      upstream_ceiling: 64,
+      returned: 64,
+      truncated: true,
+      total_is_lower_bound: true,
+    },
+    workers: [
+      {
+        provider: "opencode",
+        adapter: "opencode_cli",
+        model: "opencode/model-000",
+        worker_id: "",
+        vendor_provider: "opencode",
+        catalog_enabled: true,
+        effective_enabled: true,
+        inventory_only: true,
+        discovered_from_opencode: true,
+      },
+      {
+        provider: "opencode",
+        adapter: "opencode_cli",
+        model: "xai/grok-4.6",
+        worker_id: "",
+        vendor_provider: "xai",
+        catalog_enabled: true,
+        effective_enabled: true,
+        inventory_only: true,
+        discovered_from_opencode: true,
+      },
+    ],
+  });
+
+  assert.equal(families.length, 1);
+  const label = familySmallText(families[0]);
+  // The denominator still hedges itself, as it does for the editor family.
+  assert.match(label, /^2 of at least 64 routes shown · /);
+  // And the clause beside it names the host that actually cut the tail.
+  assert.match(label, /more may not be loaded \(OpenCode host bound\)/);
+  assert.doesNotMatch(label, /editor host bound/);
+  // Still no invented count: the shortfall is unknown, so none is printed.
+  assert.doesNotMatch(label, /not loaded \(discovery bound\)/);
+  assert.doesNotMatch(label, /0 not loaded/);
+
+  // And the route past the producer's cut keeps a live, checked control.
+  const routes = collectByClass(families[0], "settings-model-route");
+  const grok = routes.find(
+    (route) => collectByTag(route, "input")[0].dataset.modelName === "xai/grok-4.6",
+  );
+  assert.ok(grok);
+  const grokInput = collectByTag(grok, "input")[0];
+  assert.equal(grokInput.disabled, false);
+  assert.equal(grokInput.checked, true);
+});
+
+test("Models never calls an upstream-truncated route discovered at either label site", () => {
+  // The backend publishes upstream_truncated for a configured route it cannot
+  // classify: the source that would have offered it was cut by its own
+  // producer without saying by how much, so "a host offers this" and "no host
+  // offers this" are both unmeasured. The row is still inventory_only -- it
+  // has no worker -- and carries NO discovered_from_* flag.
+  //
+  // Both label sites used to answer that row from the inventory_only fallback
+  // alone, which sits after the truncation flags in evidence strength but used
+  // to sit before them in code: the subtitle said "discovered in VS Code" and
+  // the truth line said "discovered", inventing exactly the measurement the
+  // backend had refused to assert. Order is the fix, so both sites are pinned.
+  const families = renderModelFamilies({
+    discovered_model_count: 1,
+    worker_count: 2,
+    returned_worker_count: 2,
+    row_limit: 64,
+    truncated: false,
+    upstream_truncated_model_count: 1,
+    provider_counts: [
+      {
+        provider: "copilot",
+        total: 2,
+        ingested: 2,
+        returned: 2,
+        truncated: false,
+        enabled_total: 2,
+        enabled_counted_over: 2,
+        enabled_returned: 2,
+      },
+    ],
+    workers: [
+      {
+        provider: "copilot",
+        adapter: "vscode_lm",
+        model: "copilot-model-000",
+        worker_id: "",
+        vendor_provider: "copilot",
+        catalog_enabled: true,
+        effective_enabled: true,
+        inventory_only: true,
+        discovered_from_editor: true,
+      },
+      {
+        provider: "copilot",
+        adapter: "vscode_lm",
+        model: "copilot-model-999",
+        worker_id: "",
+        vendor_provider: "copilot",
+        catalog_enabled: true,
+        effective_enabled: true,
+        inventory_only: true,
+        source_truncated: true,
+        upstream_truncated: true,
+      },
+    ],
+  });
+
+  assert.equal(families.length, 1);
+  const routes = collectByClass(families[0], "settings-model-route");
+  const unknown = routes.find(
+    (route) => collectByTag(route, "input")[0].dataset.modelName === "copilot-model-999",
+  );
+  assert.ok(unknown);
+
+  const subtitle = hostArray(collectByClass(unknown, "settings-copy")[0].children)
+    .filter((child) => child.tag === "small")
+    .map((child) => child.textContent)[0];
+  const truth = collectByClass(unknown, "settings-model-truth")[0].textContent;
+
+  // Neither false discovery label, at either site.
+  assert.doesNotMatch(subtitle, /discovered/);
+  assert.doesNotMatch(truth, /discovered/);
+  assert.doesNotMatch(subtitle, /discovered in VS Code/);
+  assert.doesNotMatch(subtitle, /discovered by OpenCode/);
+
+  // And what IS said is the bound, which is all the payload measured.
+  assert.match(subtitle, /the host's list was cut before this view read it/);
+  assert.match(truth, /configured, origin unknown past the host bound/);
+  assert.doesNotMatch(truth, /declared, not discovered/);
+
+  // Still the owner's control to flip, which is what materialising the row was
+  // for in the first place.
+  const unknownInput = collectByTag(unknown, "input")[0];
+  assert.equal(unknownInput.disabled, false);
+  assert.equal(unknownInput.checked, true);
+
+  // The sibling that a host really did report keeps its discovery label, so
+  // the reordering did not simply delete the claim everywhere.
+  const observed = routes.find(
+    (route) => collectByTag(route, "input")[0].dataset.modelName === "copilot-model-000",
+  );
+  assert.match(
+    collectByClass(observed, "settings-model-truth")[0].textContent,
+    /editor discovery/,
+  );
+  assert.match(
+    hostArray(collectByClass(observed, "settings-copy")[0].children)
+      .filter((child) => child.tag === "small")
+      .map((child) => child.textContent)[0],
+    /discovered in VS Code/,
+  );
+});
+
+test("Models never claims discovery refused an OpenCode route its producer hid", () => {
+  // The OpenCode twin of the case above, and the one that went wrong before the
+  // tree ever saw it: the backend treated only vscode_lm routes as unknowable
+  // under a lower-bound source, so a configured xai/grok-4.6 sitting past the
+  // OpenCode parser's 64-row cap arrived as declared_only and this subtitle
+  // printed "not offered by discovery" -- a measurement the OpenCode producer
+  // was never in a position to make. The payload now sends the same
+  // upstream_truncated pair the editor case sends, and both label sites have to
+  // read it as the bound it is rather than as a verdict on the host.
+  const families = renderModelFamilies({
+    discovered_model_count: 1,
+    declared_only_model_count: 0,
+    upstream_truncated_model_count: 1,
+    worker_count: 2,
+    returned_worker_count: 2,
+    row_limit: 64,
+    truncated: true,
+    provider_counts: [
+      {
+        provider: "opencode",
+        total: 64,
+        ingested: 64,
+        returned: 2,
+        truncated: true,
+        total_is_lower_bound: true,
+        enabled_total: 2,
+        enabled_counted_over: 64,
+        enabled_returned: 2,
+      },
+    ],
+    workers: [
+      {
+        provider: "opencode",
+        adapter: "opencode_cli",
+        model: "opencode/model-000",
+        worker_id: "",
+        vendor_provider: "opencode",
+        catalog_enabled: true,
+        effective_enabled: true,
+        inventory_only: true,
+        discovered_from_opencode: true,
+      },
+      {
+        provider: "opencode",
+        adapter: "opencode_cli",
+        model: "xai/grok-4.6",
+        worker_id: "",
+        vendor_provider: "xai",
+        catalog_enabled: true,
+        effective_enabled: true,
+        inventory_only: true,
+        source_truncated: true,
+        upstream_truncated: true,
+      },
+    ],
+  });
+
+  assert.equal(families.length, 1);
+  const routes = collectByClass(families[0], "settings-model-route");
+  const grok = routes.find(
+    (route) => collectByTag(route, "input")[0].dataset.modelName === "xai/grok-4.6",
+  );
+  assert.ok(grok);
+
+  const subtitle = hostArray(collectByClass(grok, "settings-copy")[0].children)
+    .filter((child) => child.tag === "small")
+    .map((child) => child.textContent)[0];
+  const truth = collectByClass(grok, "settings-model-truth")[0].textContent;
+
+  // The claim this rework exists to remove, named exactly rather than inferred
+  // from the absence of some other string.
+  assert.doesNotMatch(subtitle, /not offered by discovery/);
+  assert.doesNotMatch(subtitle, /declared in models\.json/);
+  assert.doesNotMatch(truth, /declared, not discovered/);
+  // And no discovery claim invented in its place -- the opposite error.
+  assert.doesNotMatch(subtitle, /discovered/);
+  assert.doesNotMatch(truth, /discovered/);
+
+  // What IS said is the bound, which is the only thing anyone measured.
+  assert.match(subtitle, /the host's list was cut before this view read it/);
+  assert.match(truth, /configured, origin unknown past the host bound/);
+
+  // Visible and toggleable, which is the pair of claims this card is about.
+  const grokInput = collectByTag(grok, "input")[0];
+  assert.equal(grokInput.disabled, false);
+  assert.equal(grokInput.checked, true);
+  assert.equal(grokInput.dataset.modelProvider, "opencode");
+  assert.equal(grokInput.dataset.modelAdapter, "opencode_cli");
+
+  // The family's own uncertainty still belongs to the OpenCode producer, so the
+  // split "not loaded" clauses did not start borrowing the editor's bound.
+  assert.doesNotMatch(familySmallText(families[0]), /not loaded \(editor host bound\)/);
+
+  // The sibling OpenCode really did list keeps its discovery label, so the
+  // relabelling did not simply delete the claim across the family.
+  const observed = routes.find(
+    (route) => collectByTag(route, "input")[0].dataset.modelName === "opencode/model-000",
+  );
+  assert.match(
+    collectByClass(observed, "settings-model-truth")[0].textContent,
+    /opencode discovery/,
+  );
+});
+
+test("Models counts a producer's cap apart from this module's discovery bound", () => {
+  // Both bounds lose rows here, and they are different facts with different
+  // remedies: 137 identities the OpenCode parser refused before the backend was
+  // handed anything, and 3 more the backend's own discovery bound then dropped.
+  // Folded together the label read "140 not loaded (discovery bound)", which
+  // blames one cap for another's loss -- raising the discovery bound recovers
+  // three routes, not a hundred and forty.
+  const families = renderModelFamilies({
+    discovered_model_count: 64,
+    worker_count: 205,
+    returned_worker_count: 2,
+    row_limit: 64,
+    truncated: true,
+    provider_counts: [
+      {
+        provider: "opencode",
+        total: 205,
+        total_is_lower_bound: false,
+        ingested: 64,
+        returned: 2,
+        truncated: true,
+        enabled_total: 64,
+        enabled_counted_over: 64,
+        enabled_returned: 2,
+      },
+    ],
+    opencode_source: {
+      total: 205,
+      delivered: 68,
+      upstream_refused: 137,
+      upstream_ceiling: 64,
+      returned: 64,
+      truncated: true,
+      total_is_lower_bound: false,
+      ingestion_loss: [
+        {
+          provider: "opencode",
+          total: 205,
+          ingested: 64,
+          dropped: 141,
+          absent_routes: 140,
+          upstream_absent_routes: 137,
+          vendor_providers: ["opencode", "xai"],
+        },
+      ],
+    },
+    workers: [
+      {
+        provider: "opencode",
+        adapter: "opencode_cli",
+        model: "opencode/model-000",
+        worker_id: "",
+        vendor_provider: "opencode",
+        catalog_enabled: true,
+        effective_enabled: true,
+        inventory_only: true,
+        discovered_from_opencode: true,
+      },
+      {
+        provider: "opencode",
+        adapter: "opencode_cli",
+        model: "xai/grok-4.6",
+        worker_id: "",
+        vendor_provider: "xai",
+        catalog_enabled: true,
+        effective_enabled: true,
+        inventory_only: true,
+        source_truncated: true,
+        discovered_from_opencode: true,
+      },
+    ],
+  });
+
+  const label = familySmallText(families[0]);
+  assert.match(label, /3 not loaded \(discovery bound\)/);
+  assert.match(label, /137 not loaded \(OpenCode host bound\)/);
+  // The producer's share is subtracted from this bound's clause, never added
+  // beside it: 140 is the deduped population both clauses are drawn from, so
+  // printing it under either one would restate the conflation.
+  assert.doesNotMatch(label, /140 not loaded/);
+  assert.doesNotMatch(label, /137 not loaded \(discovery bound\)/);
+
+  // The provider-complete property this card exists for is unchanged: the
+  // explicitly enabled xai route is still drawn and still toggleable.
+  const routes = collectByClass(families[0], "settings-model-route");
+  const grok = routes.find(
+    (route) => collectByTag(route, "input")[0].dataset.modelName === "xai/grok-4.6",
+  );
+  assert.ok(grok);
+  const grokInput = collectByTag(grok, "input")[0];
+  assert.equal(grokInput.disabled, false);
+  assert.equal(grokInput.checked, true);
+});
