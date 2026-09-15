@@ -6,6 +6,52 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.42] - 2026-09-15
+
+### Fixed
+
+- The Models view no longer loses whole providers, or routes the repository
+  owner explicitly configured, when a bounded catalog read comes back short.
+  Ingestion is bounded separately from the compact render bound, the rows that
+  survive are chosen per provider only after every provider has been seen, and
+  routes named in `.aiworkhub/config/models.json` are reserved under both the
+  identity they were written with and the canonical policy identity the catalog
+  row carries -- so a vendor-keyed OpenCode decision pins the row it was written
+  for. Both bounds stop at a hard ceiling, and pins that do not fit past it are
+  counted as refused rather than dropped in silence.
+- Counts that a bounded source truncated upstream are no longer published as
+  exact totals. The OpenCode producer's row cap and the editor bridge's model
+  slice are read as evidence that an upstream bound already truncated the list,
+  never to re-impose one, and the payload carries per-provider
+  total/returned/truncated counts beside each source's ingestion loss. The
+  Webview labels a row by the bound that produced it -- `declared, not
+  discovered`, `configured, origin unknown past the host bound`, `configured,
+  past the source bound` -- and names the host that cut the tail instead of
+  attributing the editor's cap to OpenCode rows.
+- Compact counters in the web dashboard and in the VS Code Webview keep four
+  significant digits, so every integer in a decade stays distinct: 1000 renders
+  as `1k` and 1001 as `1.001k` instead of collapsing to the same label. A
+  mantissa that rounding carries to 1000 promotes its tier, so 999999999 reads
+  as `1B` rather than a grouped `1,000M`, and the decimal separator follows the
+  reader's locale through `navigator.language`.
+
+### Changed
+
+- The repository-local `.kilo/` directory is ignored, keeping local Kilo state
+  out of the canonical tree.
+
+### Validation
+
+- The bounded Models payload and its Webview projection are covered by the
+  dashboard MCP app and KPI dashboard regression suites added with the fix; the
+  compact counters are covered by the dashboard and Webview counter-precision
+  suites, which pin one deterministic locale rather than asserting against the
+  host's.
+- The release-metadata projection check is clean for tag v0.11.42, and the VSIX
+  version gate and scratch-containment gate pass. Release assurance, the release
+  evidence pack and VSIX packaging are verified from the canonical tree. This
+  change does not push, tag, publish or install anything.
+
 ## [0.11.41] - 2026-09-14
 
 ### Fixed

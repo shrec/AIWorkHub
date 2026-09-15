@@ -1,5 +1,27 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.42 — 2026-09-15
+
+### Fixed
+
+- The Models view keeps every provider visible and keeps the routes you
+  explicitly configured, even when a bounded catalog read comes back short.
+  Rows are selected per provider after all providers have been seen, and routes
+  named in `.aiworkhub/config/models.json` are reserved under both the identity
+  they were written with and the canonical policy identity the catalog row
+  carries, so a vendor-keyed OpenCode decision still pins its own row. Past the
+  hard ceiling, pins that do not fit are counted as refused rather than dropped
+  silently.
+- Model counts no longer present an upstream-truncated list as an exact total.
+  Each row is labelled by the bound that produced it — `declared, not
+  discovered`, `configured, origin unknown past the host bound`, `configured,
+  past the source bound` — and the view names the host that cut the tail rather
+  than attributing the editor host's cap to OpenCode rows.
+- Compact counters keep four significant digits, so 1000 reads as `1k` and 1001
+  as `1.001k` instead of collapsing to one label; a mantissa rounding up to 1000
+  promotes its tier, so 999999999 reads as `1B`. The decimal separator follows
+  your locale.
+
 ## 0.11.41 — 2026-09-14
 
 ### Fixed

@@ -14,7 +14,24 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.11.41
+## What's new in 0.11.42
+
+- The Models view keeps every provider visible and keeps explicitly configured
+  routes reachable when a bounded catalog read comes back short. Rows are chosen
+  per provider only after every provider has been seen, routes named in
+  `.aiworkhub/config/models.json` are reserved under both their written and
+  canonical identities, and pins that do not fit past the hard ceiling are
+  counted as refused instead of disappearing.
+
+- Model counts no longer present an upstream-truncated list as an exact total.
+  Each row states the bound that produced it — declared but not discovered,
+  configured with its origin unknown past the host bound, or configured past the
+  source bound — and the view names the host that cut the tail instead of
+  blaming the editor cap for OpenCode rows.
+
+- Compact dashboard counters keep four significant digits, so 1000 reads as 1k
+  and 1001 as 1.001k rather than collapsing to the same label, 999999999 reads
+  as 1B, and the decimal separator follows your locale.
 
 - Windows native-CLI workers now run inside the repo-scoped AppContainer
   profile and its kill-on-close Job Object when the platform, the host's
