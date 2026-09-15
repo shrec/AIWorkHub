@@ -792,6 +792,47 @@ def test_route_unavailable_recovery_does_not_requeue_other_failures(
     assert review_lifecycle.lifecycle_counts(db)["retired"] == 11
 
 
+def test_terminal_binding_recovery_reopens_only_the_exact_authorized_action(
+    tmp_path: Path,
+) -> None:
+    db = tmp_path / "task.sqlite"
+    _chain(db)
+    launch = _reserve(db)
+    assert review_lifecycle.complete_action(
+        db,
+        action_id=launch.action_id,
+        owner="worker-a",
+        lease_token="lease-a",
+        receipt={"ok": True},
+        now=NOW,
+    )
+    accept = _reserve(db)
+    assert accept.action_index == 1
+    review_lifecycle.fail_action(
+        db,
+        action_id=accept.action_id,
+        owner="worker-a",
+        lease_token="lease-a",
+        reason=review_lifecycle.TERMINAL_ROUTE_BINDING_FAILURE,
+        now=NOW,
+    )
+    assert review_lifecycle.reconcile_dead_chains(db, now=NOW)["retired"] == 10
+
+    failures = review_lifecycle.terminal_route_binding_failures(db)
+    assert [item.action_id for item in failures] == [accept.action_id]
+    recovered = review_lifecycle.recover_terminal_route_binding_failure(
+        db, action_id=accept.action_id, now=NOW,
+    )
+
+    assert recovered == {"recovered": 1, "descendants_requeued": 10}
+    rows = {row["action_index"]: row for row in review_lifecycle.rows_for_test(db)}
+    assert rows[0]["state"] == "completed"
+    assert {rows[index]["state"] for index in range(1, 12)} == {"pending"}
+    assert review_lifecycle.recover_terminal_route_binding_failure(
+        db, action_id=accept.action_id, now=NOW,
+    )["recovered"] == 0
+
+
 def test_reconcile_dead_chains_is_bounded_per_pass_and_progresses_deterministically(
     tmp_path: Path,
 ) -> None:

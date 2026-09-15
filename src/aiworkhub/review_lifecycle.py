@@ -1379,6 +1379,69 @@ def rows_for_test(db_path: str | Path) -> list[dict[str, Any]]:
 
 RECONCILE_BATCH_LIMIT = 256
 ROUTE_UNAVAILABLE_FAILURE_PREFIX = "RuntimeError:review_route_unavailable:"
+TERMINAL_ROUTE_BINDING_FAILURE = (
+    "RuntimeError:reviewer_terminal_route_binding_invalid"
+)
+
+
+def _requeue_failed_action_and_descendants(
+    conn: sqlite3.Connection,
+    failed: sqlite3.Row,
+    *,
+    now_text: str,
+) -> int:
+    """Requeue one verified failed action and only its bound retired descendants."""
+    chain_id = int(failed["chain_id"])
+    action_id = int(failed["action_id"])
+    chain_row = conn.execute(
+        "SELECT * FROM review_chains WHERE chain_id=?", (chain_id,)
+    ).fetchone()
+    if chain_row is None:
+        raise ReviewLifecycleError("descriptor_tamper")
+    identity = _verify_chain_row(chain_row)
+    chain_identity_sha256 = str(chain_row["chain_identity_sha256"])
+    _verify_action_row(conn, failed, identity, chain_identity_sha256)
+    descendants = conn.execute(
+        "SELECT * FROM review_action_outbox WHERE chain_id=? "
+        "AND action_index>? AND state='retired' "
+        "AND retired_due_to_action_id=? AND failure_reason=? "
+        "ORDER BY action_index",
+        (
+            chain_id,
+            int(failed["action_index"]),
+            str(action_id),
+            RETIRED_REASON,
+        ),
+    ).fetchall()
+    for descendant in descendants:
+        _verify_action_row(conn, descendant, identity, chain_identity_sha256)
+    for descendant in descendants:
+        updated = conn.execute(
+            "UPDATE review_action_outbox SET state='pending',owner='',"
+            "lease_token='',lease_expires_at='',receipt_json='',"
+            "receipt_sha256='',receipt_commitment_sha256='',"
+            "completed_at='',failure_reason='',retired_due_to_action_id='',"
+            "updated_at=? WHERE action_id=? AND "
+            + _preimage_where_clause(descendant),
+            (
+                now_text,
+                int(descendant["action_id"]),
+                *_preimage_values(descendant),
+            ),
+        )
+        if updated.rowcount != 1:
+            raise ReviewLifecycleError("cas_lost")
+    updated = conn.execute(
+        "UPDATE review_action_outbox SET state='pending',owner='',"
+        "lease_token='',lease_expires_at='',receipt_json='',"
+        "receipt_sha256='',receipt_commitment_sha256='',completed_at='',"
+        "failure_reason='',retired_due_to_action_id='',updated_at=? "
+        "WHERE action_id=? AND " + _preimage_where_clause(failed),
+        (now_text, action_id, *_preimage_values(failed)),
+    )
+    if updated.rowcount != 1:
+        raise ReviewLifecycleError("cas_lost")
+    return len(descendants)
 
 
 def recover_route_unavailable_chains(
@@ -1390,8 +1453,8 @@ def recover_route_unavailable_chains(
     """Requeue chains terminalized only because no reviewer route existed.
 
     Older orchestrators failed the launch action when the reviewer catalog had
-    no eligible route, then retired every descendant.  Route availability is
-    operational state, not a verdict on candidate bytes.  Recover only the
+    no eligible route, then retired every descendant. Route availability is
+    operational state, not a verdict on candidate bytes. Recover only the
     exact authenticated launch failure and descendants retired by that action;
     the orchestrator will either defer again or complete the ordinary chain.
     """
@@ -1413,59 +1476,9 @@ def recover_route_unavailable_chains(
             expected_reason = ROUTE_UNAVAILABLE_FAILURE_PREFIX + str(failed["lens"])
             if str(failed["failure_reason"]) != expected_reason:
                 continue
-            chain_id = int(failed["chain_id"])
-            action_id = int(failed["action_id"])
-            chain_row = conn.execute(
-                "SELECT * FROM review_chains WHERE chain_id=?", (chain_id,)
-            ).fetchone()
-            if chain_row is None:
-                raise ReviewLifecycleError("descriptor_tamper")
-            identity = _verify_chain_row(chain_row)
-            chain_identity_sha256 = str(chain_row["chain_identity_sha256"])
-            _verify_action_row(conn, failed, identity, chain_identity_sha256)
-            descendants = conn.execute(
-                "SELECT * FROM review_action_outbox WHERE chain_id=? "
-                "AND action_index>? AND state='retired' "
-                "AND retired_due_to_action_id=? AND failure_reason=? "
-                "ORDER BY action_index",
-                (
-                    chain_id,
-                    int(failed["action_index"]),
-                    str(action_id),
-                    RETIRED_REASON,
-                ),
-            ).fetchall()
-            for descendant in descendants:
-                _verify_action_row(
-                    conn, descendant, identity, chain_identity_sha256
-                )
-            for descendant in descendants:
-                updated = conn.execute(
-                    "UPDATE review_action_outbox SET state='pending',owner='',"
-                    "lease_token='',lease_expires_at='',receipt_json='',"
-                    "receipt_sha256='',receipt_commitment_sha256='',"
-                    "completed_at='',failure_reason='',retired_due_to_action_id='',"
-                    "updated_at=? WHERE action_id=? AND "
-                    + _preimage_where_clause(descendant),
-                    (
-                        now_text,
-                        int(descendant["action_id"]),
-                        *_preimage_values(descendant),
-                    ),
-                )
-                if updated.rowcount != 1:
-                    raise ReviewLifecycleError("cas_lost")
-                descendants_requeued += 1
-            updated = conn.execute(
-                "UPDATE review_action_outbox SET state='pending',owner='',"
-                "lease_token='',lease_expires_at='',receipt_json='',"
-                "receipt_sha256='',receipt_commitment_sha256='',completed_at='',"
-                "failure_reason='',retired_due_to_action_id='',updated_at=? "
-                "WHERE action_id=? AND " + _preimage_where_clause(failed),
-                (now_text, action_id, *_preimage_values(failed)),
+            descendants_requeued += _requeue_failed_action_and_descendants(
+                conn, failed, now_text=now_text
             )
-            if updated.rowcount != 1:
-                raise ReviewLifecycleError("cas_lost")
             recovered += 1
         conn.commit()
         return {
@@ -1473,6 +1486,79 @@ def recover_route_unavailable_chains(
             "recovered": recovered,
             "descendants_requeued": descendants_requeued,
         }
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def terminal_route_binding_failures(
+    db_path: str | Path,
+    *,
+    batch_limit: int = RECONCILE_BATCH_LIMIT,
+) -> list[ReviewAction]:
+    """Return exact failed accept actions that require a live binding recheck."""
+    limit = max(1, min(int(batch_limit), RECONCILE_BATCH_LIMIT))
+    conn = _connect(db_path)
+    try:
+        ensure_schema(conn)
+        conn.commit()
+        rows = conn.execute(
+            "SELECT * FROM review_action_outbox "
+            "WHERE state='failed' AND action_type='accept' "
+            "AND failure_reason=? ORDER BY action_id LIMIT ?",
+            (TERMINAL_ROUTE_BINDING_FAILURE, limit),
+        ).fetchall()
+        actions: list[ReviewAction] = []
+        for row in rows:
+            chain_row = conn.execute(
+                "SELECT * FROM review_chains WHERE chain_id=?",
+                (int(row["chain_id"]),),
+            ).fetchone()
+            if chain_row is None:
+                raise ReviewLifecycleError("descriptor_tamper")
+            identity = _verify_chain_row(chain_row)
+            _verify_action_row(
+                conn, row, identity, str(chain_row["chain_identity_sha256"])
+            )
+            actions.append(_action_from_row(row))
+        return actions
+    finally:
+        conn.close()
+
+
+def recover_terminal_route_binding_failure(
+    db_path: str | Path,
+    *,
+    action_id: int,
+    now: datetime,
+) -> dict[str, int]:
+    """Requeue one exact historical binding failure after external revalidation.
+
+    This primitive does not decide whether a terminal process now matches its
+    durable route. The orchestrator must prove that first; this transaction
+    only reopens the exact named failure and descendants retired by it.
+    """
+    now_text = _format_utc(now)
+    conn = _connect(db_path)
+    try:
+        ensure_schema(conn)
+        conn.commit()
+        conn.execute("BEGIN IMMEDIATE")
+        failed = conn.execute(
+            "SELECT * FROM review_action_outbox WHERE action_id=? "
+            "AND state='failed' AND action_type='accept' AND failure_reason=?",
+            (int(action_id), TERMINAL_ROUTE_BINDING_FAILURE),
+        ).fetchone()
+        if failed is None:
+            conn.commit()
+            return {"recovered": 0, "descendants_requeued": 0}
+        descendants = _requeue_failed_action_and_descendants(
+            conn, failed, now_text=now_text
+        )
+        conn.commit()
+        return {"recovered": 1, "descendants_requeued": descendants}
     except Exception:
         conn.rollback()
         raise

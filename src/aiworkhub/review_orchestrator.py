@@ -185,6 +185,32 @@ def _review_route_identity(route: Mapping[str, Any]) -> tuple[str, str, str]:
     )
 
 
+def _canonical_route_model(runner: str, adapter_id: str, model: str) -> str:
+    """Return the launch-time canonical name for ONE route's pinned model.
+
+    A durable route attempt keeps the model alias the route selection named;
+    the process that ran keeps the canonical model the launcher resolved from
+    it. Deciding they are the same identity belongs to the workforce table
+    that performed that resolution -- a second alias map here would be a
+    second answer to a question this repository already answers once, and the
+    two would drift.
+
+    Fail closed on anything that authority cannot resolve: an adapter it
+    refuses, a runner it does not pin, a model outside its table all return
+    the raw string, so such a route keeps exactly the byte-for-byte
+    comparison it had before.
+    """
+    from . import process_launcher  # local: process_launcher imports this module
+
+    try:
+        canonical = process_launcher.validate_workforce_identity(
+            runner, adapter_id, model
+        )
+    except Exception:  # noqa: BLE001 -- any refusal means "not canonicalizable"
+        return model
+    return str(canonical or model)
+
+
 def _manager_reserved_codex_route(route: Mapping[str, Any]) -> bool:
     """Keep Codex CLI reserved for the manager, without excluding Copilot GPT."""
     runner, adapter_id, _model = _review_route_identity(route)
@@ -1140,14 +1166,133 @@ def _status_review_ready(status: Any) -> bool:
     return isinstance(card, Mapping) and _review_substatus(card) == "review_ready"
 
 
-def _present_reviewer_lenses(
+# --- usable reviewer coverage -------------------------------------------
+#
+# Coverage used to mean EXISTENCE: any reviewer task row keyed to the lens
+# counted as covered, whatever had become of it. Measured on the queue this
+# card was cut from: 5 review_ready targets scanned, 4 skipped as
+# ``already_present``, 0 reviewers actually running. Each of those four
+# children had stopped -- blocked, worker_failed, cancelled -- without ever
+# filing a report, so the parents were reported as owing nothing and stayed
+# review_ready forever. A task row is not a review.
+#
+# ``task_store.canonical_status`` cannot answer this either: it folds every
+# state it does not name -- ``worker_failed``, ``launch_failed``,
+# ``timed_out``, ``finalize_failed``, ``cancelled`` -- onto ``pending``, so a
+# dead reviewer reads there as one still queued. The raw row states decide.
+_REVIEWER_FAILED_STATES = frozenset({
+    "worker_failed", "launch_failed", "finalize_failed", "cancelled",
+    "canceled", "timed_out", "failed", "error",
+})
+_REVIEWER_STOPPED_STATES = frozenset({
+    "archived", "finished", "completed", "stale_already_done", "done",
+    "superseded",
+})
+# The four verdicts a planned lens can carry. Only ``covered`` satisfies it.
+_COVERAGE_COVERED = "covered"
+_COVERAGE_UNUSABLE = "unusable"
+_COVERAGE_EXHAUSTED = "exhausted"
+_COVERAGE_ABSENT = "absent"
+# One first attempt plus the single distinct-route retry
+# ``terminal_failure_classification`` may authorise. That is the WHOLE ceiling
+# for one lens, and probing the successor's own canonical task id is what makes
+# an unusable reviewer replaced exactly ONCE: the pass after a replacement
+# observes the live successor instead of the dead first attempt, and ensures
+# nothing further. When every slot inside the ceiling has died the lens is
+# ``exhausted`` instead: ensuring it again buys no reviewer and would report
+# that it had.
+_MAX_ROUTE_ATTEMPTS = 1 + terminal_failure_classification.MAX_DISTINCT_ROUTE_RETRIES
+
+
+def _reviewer_row_states(row: Mapping[str, Any]) -> frozenset[str]:
+    """Every lifecycle state the raw reviewer row actually carries."""
+    states = {
+        str(row.get(key) or "").strip().lower()
+        for key in ("status", "worker_status")
+    }
+    if str(row.get("archived_at") or "").strip():
+        states.add("archived")
+    return frozenset(state for state in states if state)
+
+
+def _verified_lens_report(
+    card: Any, identity: Mapping[str, Any], lens: str, reviewer_task_id: str,
+) -> bool:
+    """True only for a reviewer card carrying THIS claim's sealed lens report.
+
+    This is the card-side half of ``ReviewOrchestrator._review_receipt`` at the
+    same strength: the packet binding, the five-field target identity, the
+    reviewer's own task binding, the lens, the read-only authority and the
+    single-submission counters must all hold, so a report written against
+    another request, another claim epoch or another lens is never coverage
+    here. The provider-identity half of that check needs the reviewer's LIVE
+    status and stays where it is, in the accept fold; recovery only asks
+    whether a report exists that the fold could still accept, and answers no
+    wherever it cannot tell.
+    """
+    if not isinstance(card, Mapping):
+        return False
+    terminal = card.get("terminal_review")
+    evidence = terminal.get("evidence") if isinstance(terminal, Mapping) else None
+    binding = evidence.get("quality_review") if isinstance(evidence, Mapping) else None
+    receipt = evidence.get("quality_review_receipt") if isinstance(evidence, Mapping) else None
+    if not isinstance(binding, Mapping) or not isinstance(receipt, Mapping):
+        return False
+    packet_sha256 = str(binding.get("packet_sha256") or "")
+    request_id = str(identity.get("target_request_id") or "")
+    task_id = str(identity.get("target_task_id") or "")
+    claim_epoch = str(identity.get("claim_epoch") or "")
+    if (
+        not re.fullmatch(r"[0-9a-f]{64}", packet_sha256)
+        or str(binding.get("lens") or "") != lens
+        or str(binding.get("target_request_id") or "") != request_id
+        or str(binding.get("target_task_id") or "") != task_id
+        or str(binding.get("target_claim_epoch") or "") != claim_epoch
+    ):
+        return False
+    target, reviewer, report, authority = (
+        receipt.get("target"), receipt.get("reviewer"),
+        receipt.get("report"), receipt.get("authority"),
+    )
+    if not all(
+        isinstance(value, Mapping) for value in (target, reviewer, report, authority)
+    ):
+        return False
+    findings = report.get("findings")
+    return (
+        str(receipt.get("packet_sha256") or "") == packet_sha256
+        and str(target.get("request_id") or "") == request_id
+        and str(target.get("task_id") or "") == task_id
+        and str(target.get("claim_epoch") or "") == claim_epoch
+        and str(reviewer.get("task_id") or "") == reviewer_task_id
+        and str(report.get("lens") or "") == lens
+        and report.get("read_only") is True
+        and report.get("can_mutate_repo") is False
+        and isinstance(findings, list)
+        and all(isinstance(finding, Mapping) for finding in findings)
+        and dict(authority) == {
+            "process_identity_verified": True,
+            "audit_verified": True,
+            "terminal_state": "review_ready",
+        }
+        and re.fullmatch(r"[0-9a-f]{64}", str(receipt.get("submission_id") or "")) is not None
+        and receipt.get("physical_submission_count") == 1
+        and receipt.get("logical_submission_count") == 1
+    )
+
+
+def _reviewer_lens_coverage(
     repo: Path, identity: Mapping[str, str], lenses: tuple[str, ...],
-) -> frozenset[str]:
-    # Live launch/plan paths key reviewer children by the canonical chain
-    # identity, whose hashed preimage includes schema_id. Normalize the
-    # recovered five-field mapping through the same review_lifecycle
-    # primitive so an already-live or terminal reviewer row is observed as
-    # present instead of being re-ensured by every periodic scan.
+) -> dict[str, str]:
+    """Classify each planned lens as covered, unusable, exhausted or absent.
+
+    Live launch/plan paths key reviewer children by the canonical chain
+    identity, whose hashed preimage includes schema_id. Normalize the
+    recovered five-field mapping through the same review_lifecycle primitive
+    so the children observed here are exactly the ones this claim owns -- a
+    stale request or a superseded claim epoch hashes to different task ids
+    and can never be read as coverage for the current lens.
+    """
     try:
         canonical = review_lifecycle._chain_identity(
             target_task_id=str(identity.get("target_task_id") or ""),
@@ -1158,20 +1303,51 @@ def _present_reviewer_lenses(
         )
     except review_lifecycle.ReviewLifecycleError:
         # An identity that cannot be keyed to canonical reviewer children
-        # must not crash the scan: report nothing present and let the
+        # must not crash the scan: report nothing covered and let the
         # caller's sealed registration path fail closed with its bounded
         # ensure_failed reason.
-        return frozenset()
-    present: set[str] = set()
+        return {lens: _COVERAGE_ABSENT for lens in lenses}
+    coverage = {lens: _COVERAGE_ABSENT for lens in lenses}
     for lens in lenses:
-        task_id = ReviewOrchestrator._reviewer_task_id(canonical, lens)
-        try:
-            row = task_store.get_task(repo, task_id)
-        except (task_store.TaskStoreError, OSError, TypeError, ValueError):
-            continue
-        if row is not None:
-            present.add(lens)
-    return frozenset(present)
+        for attempt in range(1, _MAX_ROUTE_ATTEMPTS + 1):
+            task_id = ReviewOrchestrator._reviewer_task_id(
+                canonical, lens, attempt_index=attempt
+            )
+            try:
+                row = task_store.get_task(repo, task_id)
+            except (task_store.TaskStoreError, OSError, TypeError, ValueError):
+                continue
+            if row is None:
+                continue
+            if _verified_lens_report(row, canonical, lens, task_id):
+                # Stopped or still open, this child already filed the report
+                # the lens exists to obtain. Replacing it would re-review
+                # bytes that have been reviewed.
+                coverage[lens] = _COVERAGE_COVERED
+                break
+            states = _reviewer_row_states(row)
+            if (
+                states & _REVIEWER_FAILED_STATES
+                or states & _REVIEWER_STOPPED_STATES
+                or any(state.startswith("blocked") for state in states)
+            ):
+                # It has stopped, and it can never file the report this lens
+                # still owes. Keep probing: a successor attempt bought by an
+                # earlier recovery pass may already be live. The LAST slot
+                # inside the retry ceiling dying is a different answer: there
+                # is no successor left to buy, so ensuring this chain again
+                # would report an ensure that bought nothing.
+                coverage[lens] = (
+                    _COVERAGE_EXHAUSTED
+                    if attempt >= _MAX_ROUTE_ATTEMPTS
+                    else _COVERAGE_UNUSABLE
+                )
+                continue
+            # Still live on this claim. Its report is owed, not missing, and a
+            # second child would duplicate the reviewer already running.
+            coverage[lens] = _COVERAGE_COVERED
+            break
+    return coverage
 
 
 def recover_review_ready_targets(
@@ -1212,10 +1388,6 @@ def recover_review_ready_targets(
         if _review_substatus(card) != "review_ready":
             continue
         scanned += 1
-        if task_store.manager_ready_marker(card) is not None:
-            skipped += 1
-            _recovery_reason(reasons, "manager_ready")
-            continue
         request_id = _card_request_id(card)
         if not request_id:
             skipped += 1
@@ -1265,6 +1437,28 @@ def recover_review_ready_targets(
             skipped += 1
             _recovery_reason(reasons, "mismatched_identity")
             continue
+        # manager_ready_marker() only authenticates the card's OWN self-
+        # consistency (its stored receipt against its own terminal_review and
+        # claim_epoch); a duplicate request can keep task/request/claim
+        # identical while sealing a brand-new candidate, so the skip must also
+        # bind the receipt's candidate digest to the resolved current episode.
+        marker = task_store.manager_ready_marker(card)
+        if marker is not None:
+            bound_aggregate = marker.get("manager_ready")
+            if (
+                isinstance(bound_aggregate, Mapping)
+                and str(bound_aggregate.get("target_task_id") or "")
+                == str(identity.get("target_task_id") or "")
+                and str(bound_aggregate.get("target_request_id") or "")
+                == str(identity.get("target_request_id") or "")
+                and str(bound_aggregate.get("claim_epoch") or "")
+                == str(identity.get("claim_epoch") or "")
+                and str(bound_aggregate.get("candidate_sha256") or "")
+                == str(identity.get("candidate_sha256") or "")
+            ):
+                skipped += 1
+                _recovery_reason(reasons, "manager_ready")
+                continue
         hashes = _sealed_hashes(status_card)
         if hashes is None:
             skipped += 1
@@ -1289,14 +1483,28 @@ def recover_review_ready_targets(
         planned = _normalize_lenses(registration.get("required_reviewer_lenses"))
         if not planned:
             planned = LENSES
+        coverage = _reviewer_lens_coverage(repo, identity, planned)
         missing = tuple(
-            lens for lens in planned
-            if lens not in _present_reviewer_lenses(repo, identity, planned)
+            lens for lens in planned if coverage[lens] != _COVERAGE_COVERED
         )
         if not missing:
             skipped += 1
             _recovery_reason(reasons, "already_present")
             continue
+        if all(coverage[lens] == _COVERAGE_EXHAUSTED for lens in missing):
+            # Every lens still owed has spent its whole retry ceiling on dead
+            # reviewers. Ensuring the chain again cannot buy one more -- the
+            # orchestrator refuses the route beyond that ceiling -- so saying
+            # "ensured" here would be the scan reporting work it did not do.
+            # A manager or a reset moves this target; the scan only names it.
+            skipped += 1
+            _recovery_reason(reasons, "retry_exhausted")
+            continue
+        if any(coverage[lens] == _COVERAGE_UNUSABLE for lens in missing):
+            # Named apart from a target that never had children: this one DID,
+            # and the scan that read their existence as coverage is exactly
+            # what stranded it. One reason per target, counted once.
+            _recovery_reason(reasons, "unusable_reviewer")
         try:
             register_candidate(manager, db_path=db_path, registration=registration)
         except Exception as exc:  # noqa: BLE001
@@ -1622,6 +1830,36 @@ class ReviewOrchestrator:
             published += 1
         return published
 
+    def _recover_terminal_route_binding_failures(self, *, now: datetime) -> int:
+        """Reopen historical alias failures only after the binding now verifies."""
+        recovered = 0
+        for action in review_lifecycle.terminal_route_binding_failures(self.db_path):
+            attempts = self._route_attempts(action.chain_id, action.lens)
+            if not attempts:
+                continue
+            attempt = attempts[-1]
+            request_id = str(attempt.get("reviewer_request_id") or "")
+            if not request_id:
+                continue
+            try:
+                status = self.manager.status(request_id)
+            except Exception:  # noqa: BLE001 -- unreadable evidence stays failed
+                continue
+            if not isinstance(status, Mapping):
+                continue
+            if str(status.get("state") or "") in _REVIEWER_RUNNING_STATES:
+                continue
+            if not mechanical_reviewer_failure_reason(status):
+                continue
+            if not self._attempt_route_binding_matches(status, attempt):
+                # A genuinely foreign terminal process is still fail-closed.
+                continue
+            result = review_lifecycle.recover_terminal_route_binding_failure(
+                self.db_path, action_id=action.action_id, now=now
+            )
+            recovered += int(result["recovered"])
+        return recovered
+
     def drain(
         self, *, max_actions: int = DEFAULT_DRAIN_MAX_ACTIONS, now: datetime | None = None
     ) -> DrainResult:
@@ -1635,6 +1873,7 @@ class ReviewOrchestrator:
         review_lifecycle.recover_route_unavailable_chains(
             self.db_path, now=instant
         )
+        self._recover_terminal_route_binding_failures(now=instant)
         review_lifecycle.reconcile_dead_chains(self.db_path, now=instant)
         # Recovery-first: a crash after completing the authenticated action but
         # before projecting it into the task card cannot lose the manager wake.
@@ -1645,11 +1884,12 @@ class ReviewOrchestrator:
         # waiting on the same thing; recording each of them would grow the
         # event ledger by the size of the backlog on every reconcile.
         deferred_recorded = False
-        # A deferred action goes straight back to ``pending``, and the pending
-        # cursor wraps to the start of its round once a window is exhausted, so
-        # without this the same waiting action is re-reserved -- and re-asks the
-        # manager for the same status -- several times in one pass. Seeing it
-        # twice means the reservable set is exhausted; stop.
+        # A deferred action goes straight back to ``pending``. When that row
+        # was the old round's high-water mark, the next reservation rolls over
+        # and can select it once more before the new round advances. Release
+        # that duplicate and continue: reserving it already moved the durable
+        # cursor into the new round, so later ready chains remain reachable.
+        # The bounded loop still caps work even if storage is adversarial.
         seen_actions: set[int] = set()
         for _ in range(max(0, min(int(max_actions), DEFAULT_DRAIN_MAX_ACTIONS))):
             token = uuid.uuid4().hex
@@ -1667,7 +1907,7 @@ class ReviewOrchestrator:
                     self.db_path, action_id=action.action_id, owner=self.owner,
                     lease_token=token, now=instant,
                 )
-                break
+                continue
             seen_actions.add(action.action_id)
             attempted += 1
             try:
@@ -1770,19 +2010,109 @@ class ReviewOrchestrator:
             raise RuntimeError("review_route_unavailable:" + lens)
         return route
 
+    def _attempt_route_binding_matches(
+        self, status: Mapping[str, Any], attempt: Mapping[str, Any]
+    ) -> bool:
+        """True only when a terminal status names THIS exact durable attempt.
+
+        Request, reviewer task, runner and adapter must match byte for byte. A
+        status that names anything else is evidence about a different process,
+        and it may never retire this attempt or authorise a successor for it.
+
+        The model must match too, but the two sides spell the SAME identity
+        differently: the plan records the alias its route selection named,
+        while the process reports the canonical model the launcher resolved.
+        Live chains 906 and 916 stored ``opus`` against a status saying
+        ``claude-opus-5`` for one identical request, task, runner and adapter,
+        so every recovery pass refused its own reviewer as foreign evidence
+        instead of reconciling it. Both sides are put through the one
+        launch-time authority for that exact ``(runner, adapter)`` pair before
+        they are compared; nothing else about the binding is relaxed.
+        """
+        runner = str(attempt.get("runner") or "")
+        adapter_id = str(attempt.get("adapter_id") or "")
+        return (
+            str(status.get("request_id") or "")
+            == str(attempt.get("reviewer_request_id") or "")
+            and str(status.get("task_id") or "")
+            == str(attempt.get("reviewer_task_id") or "")
+            and str(status.get("runner") or "") == runner
+            and str(status.get("adapter_id") or "") == adapter_id
+            and _canonical_route_model(
+                runner, adapter_id, str(status.get("model") or ""),
+            ) == _canonical_route_model(
+                runner, adapter_id, str(attempt.get("model") or ""),
+            )
+        )
+
+    def _reconcile_launched_attempt(
+        self, action: review_lifecycle.ReviewAction, attempt: Mapping[str, Any]
+    ) -> list[dict[str, Any]] | None:
+        """Retire a durably ``launched`` attempt whose exact process is terminal.
+
+        A row saying ``launched`` is a claim about a process, not the process.
+        When that process is already terminal -- ``launch_failed`` and
+        ``finalize_failed`` are the two seen live -- relaunching it reconciles
+        nothing, because the reviewer it names can never report; the attempt is
+        simply handed back unchanged to every later pass, which is how a
+        current candidate can sit on one lens for ever. Retire it to the same
+        TYPED disposition the accept path records, and let the bounded retry
+        policy below decide whether a successor is owed at all.
+
+        Returns the refreshed attempt history once the attempt is retired, or
+        ``None`` when it is still running, still unbound, or unreadable -- each
+        of which stays reconcilable exactly as before.
+        """
+        request_id = str(attempt.get("reviewer_request_id") or "")
+        if str(attempt.get("state") or "") != "launched" or not request_id:
+            return None
+        try:
+            status = self.manager.status(request_id)
+        except Exception:  # noqa: BLE001 -- an unreadable status stays retryable
+            return None
+        if not isinstance(status, Mapping):
+            return None
+        if str(status.get("state") or "") in _REVIEWER_RUNNING_STATES:
+            return None
+        route_failure = mechanical_reviewer_failure_reason(status)
+        if not route_failure:
+            # Terminal, but not mechanically so: the accept path owns reading
+            # that reviewer's sealed report. Nothing is retired on a guess.
+            return None
+        if not self._attempt_route_binding_matches(status, attempt):
+            raise RuntimeError("reviewer_terminal_route_binding_invalid")
+        dispatch = reviewer_recovery_dispatch(
+            status, attempts_made=int(attempt["attempt_index"]),
+        )
+        retirement = route_failure
+        if dispatch["route_hold"]:
+            retirement = f"{route_failure}{_ROUTE_HOLD_MARKER}{dispatch['action']}"
+        if not self._retire_route_attempt(action, attempt, retirement):
+            return None
+        return self._route_attempts(action.chain_id, action.lens)
+
     def _plan_route_attempt(
         self, action: review_lifecycle.ReviewAction
     ) -> dict[str, Any]:
         """Bind a distinct reviewer task and route before any external launch."""
         attempts = self._route_attempts(action.chain_id, action.lens)
         if attempts and attempts[-1]["state"] != "retired":
-            return attempts[-1]
+            reconciled = self._reconcile_launched_attempt(action, attempts[-1])
+            if reconciled is None:
+                return attempts[-1]
+            attempts = reconciled
         held = route_attempt_hold(attempts[-1]["failure_reason"]) if attempts else ""
         if held:
             # The typed disposition of the last attempt says no reviewer route
             # can settle this. Planning one anyway is the blind relaunch -- it
             # just spends the next pass's provider instead of this one's.
             raise RuntimeError("review_route_hold:" + held)
+        if len(attempts) >= _MAX_ROUTE_ATTEMPTS:
+            # The NF847 ceiling, stated once where the spend actually happens.
+            # Every caller turns a ``review_route_`` failure into a durable
+            # deferral, so an exhausted lens waits on a named reason instead of
+            # quietly planning a third route the policy never authorised.
+            raise RuntimeError("review_route_retries_exhausted:" + action.lens)
         attempt_index = len(attempts) + 1
         identity = action.descriptor["chain_identity"]
         reviewer_task_id = self._reviewer_task_id(
@@ -1811,6 +2141,25 @@ class ReviewOrchestrator:
         if not planned or int(planned[-1]["attempt_index"]) != attempt_index:
             raise RuntimeError("review_route_attempt_plan_conflict")
         return planned[-1]
+
+    def _plan_deferrable_route_attempt(
+        self, action: review_lifecycle.ReviewAction
+    ) -> dict[str, Any]:
+        """Plan the next attempt, deferring on any typed route refusal.
+
+        A hold, an unavailable route and a spent retry ceiling are all states
+        the chain WAITS in, never states it fails in: each raises a
+        ``review_route_`` refusal that the drain records as one durable
+        deferred-wait and re-reads on the next pass.
+        """
+        try:
+            return self._plan_route_attempt(action)
+        except RuntimeError as exc:
+            if str(exc).startswith("review_route_"):
+                raise _DeferredLaunch(
+                    str(exc), {"outcome": "deferred", "reason": str(exc)},
+                ) from exc
+            raise
 
     def _bind_route_attempt_request(
         self, action: review_lifecycle.ReviewAction, attempt: Mapping[str, Any], request_id: str
@@ -1934,15 +2283,7 @@ class ReviewOrchestrator:
                 dispatch.get("relaunch_distinct_route") is not True
             ):
                 return None
-            try:
-                current = self._plan_route_attempt(action)
-            except RuntimeError as exc:
-                if str(exc).startswith("review_route_"):
-                    raise _DeferredLaunch(
-                        str(exc),
-                        {"outcome": "deferred", "reason": str(exc)},
-                    ) from exc
-                raise
+            current = self._plan_deferrable_route_attempt(action)
         return None
 
     def _retire_route_attempt(
@@ -2125,15 +2466,7 @@ class ReviewOrchestrator:
                     target_readiness_receipt=readiness,
                     result={"ok": True, "state": "replayed", "task_id": target_task},
                 )
-            try:
-                attempt = self._plan_route_attempt(action)
-            except RuntimeError as exc:
-                if str(exc).startswith("review_route_"):
-                    raise _DeferredLaunch(
-                        str(exc),
-                        {"outcome": "deferred", "reason": str(exc)},
-                    ) from exc
-                raise
+            attempt = self._plan_deferrable_route_attempt(action)
             launched = self._launch_with_successor(action, attempt)
             if launched is None:
                 return None
@@ -2156,6 +2489,24 @@ class ReviewOrchestrator:
             replay = launch.get("replay") if isinstance(launch, Mapping) else None
             replay = replay if isinstance(replay, Mapping) else {}
             attempt = self._attempt_for_accept(action, launch)
+            if str(attempt.get("state") or "") == "retired":
+                # A LATER pass over an attempt some earlier pass already
+                # retired. Polling its status again re-reads the same dead
+                # reviewer and returns None for ever -- measured as current
+                # candidates parked on one lens with no reviewer alive and no
+                # reason recorded. The durable retirement, not this pass's
+                # dispatch, is the authority now: ``_plan_route_attempt``
+                # honours the recorded hold, refuses anything past the NF847
+                # ceiling with a named deferral, and otherwise buys the one
+                # distinct-route successor the policy still allows.
+                # Exactly as the in-pass terminal branch below ends: the
+                # successor is launched and THIS pass stops there. Polling a
+                # reviewer that has just started would only re-enter the launch
+                # with an attempt whose request binding is not read back yet.
+                self._launch_with_successor(
+                    action, self._plan_deferrable_route_attempt(action)
+                )
+                return None
             if not str(attempt.get("reviewer_request_id") or ""):
                 launched = self._launch_with_successor(action, attempt)
                 if launched is None:
@@ -2168,19 +2519,10 @@ class ReviewOrchestrator:
                 return None
             route_failure = mechanical_reviewer_failure_reason(status)
             if route_failure:
-                exact_status_route = (
-                    str(status.get("runner") or ""),
-                    str(status.get("adapter_id") or ""),
-                    str(status.get("model") or ""),
-                )
-                if (
-                    str(status.get("request_id") or "") != reviewer_request
-                    or str(status.get("task_id") or "") != reviewer_task
-                    or exact_status_route != (
-                        str(attempt["runner"]), str(attempt["adapter_id"]),
-                        str(attempt["model"]),
-                    )
-                ):
+                # ONE predicate for "does this terminal status belong to this
+                # exact attempt", shared with the launched-attempt
+                # reconciliation: two copies of an identity rule are two rules.
+                if not self._attempt_route_binding_matches(status, attempt):
                     raise RuntimeError("reviewer_terminal_route_binding_invalid")
                 # Same typed gate as the launch path. A reviewer that RAN and
                 # died is the more expensive half of the measured waste: before

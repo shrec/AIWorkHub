@@ -161,6 +161,56 @@ def test_launch_waits_until_target_is_ready_then_launches_once(tmp_path: Path) -
     assert len(manager.launches) == 1
 
 
+def test_round_rollover_duplicate_does_not_starve_later_chain(
+    tmp_path: Path,
+) -> None:
+    manager = _Manager(tmp_path)
+    manager.status_results["waiting-request"] = _target_status(
+        state="processing",
+        task_id="WAITING",
+        request_id="waiting-request",
+        candidate_sha256="b" * 64,
+        workspace_identity="workspace-waiting",
+    )
+    manager.status_results["ready-request"] = _target_status(
+        task_id="READY",
+        request_id="ready-request",
+        candidate_sha256="c" * 64,
+        workspace_identity="workspace-ready",
+    )
+    db_path = tmp_path / "review.sqlite"
+    driver = review_orchestrator.ReviewOrchestrator(
+        manager, db_path=db_path, route_selector=_route
+    )
+    driver.ensure_chain(
+        target_task_id="WAITING", target_request_id="waiting-request", claim_epoch=1,
+        packet_sha256="a" * 64, candidate_sha256="b" * 64, now=NOW,
+    )
+    first_action_id = review_lifecycle.rows_for_test(db_path)[0]["action_id"]
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO review_reservation_state "
+            "(id, last_pending_action_id, round_high_watermark) VALUES (1, 0, 0)"
+        )
+        conn.execute(
+            "UPDATE review_reservation_state SET last_pending_action_id=0, "
+            "round_high_watermark=? WHERE id=1",
+            (first_action_id,),
+        )
+        conn.commit()
+    driver.ensure_chain(
+        target_task_id="READY", target_request_id="ready-request", claim_epoch=1,
+        packet_sha256="a" * 64, candidate_sha256="c" * 64, now=NOW,
+    )
+
+    result = driver.drain(max_actions=3, now=NOW)
+
+    assert result.attempted == 2
+    assert result.pending == 1
+    assert result.completed == 1
+    assert len(manager.launches) == 1
+
+
 def test_initial_route_unavailable_defers_without_terminalizing_chain(
     tmp_path: Path,
 ) -> None:
@@ -3045,3 +3095,819 @@ def test_recover_review_ready_fails_closed_on_untrusted_targets(
     result = review_orchestrator.recover_review_ready_targets(manager, db_path=db)
     assert result["review_recovery_reasons"].get("mismatched_identity") == 1
     assert result["review_recovery_ensured"] == 0
+
+
+# ---------------------------------------------------------------------------
+# NF-2026-00887: a reviewer task ROW is not a review.
+#
+# Recovery counted any child keyed to the lens as coverage. On the live queue
+# that produced this card the scan reported 5 review_ready targets scanned, 4
+# skipped as ``already_present`` and 0 reviewers running -- four parents whose
+# only children had died were told they owed nothing, forever.
+# ---------------------------------------------------------------------------
+
+
+def _nf887_identity(task_id: str, request_id: str) -> dict[str, str]:
+    return review_lifecycle._chain_identity(
+        target_task_id=task_id,
+        target_request_id=request_id,
+        claim_epoch="1",
+        packet_sha256="a" * 64,
+        candidate_sha256=_SEALED_CANDIDATE_SHA256,
+    )
+
+
+def _nf887_reviewer_task(
+    task_id: str, request_id: str, lens: str, *, attempt: int = 1
+) -> str:
+    return review_orchestrator.ReviewOrchestrator._reviewer_task_id(
+        _nf887_identity(task_id, request_id), lens, attempt_index=attempt
+    )
+
+
+def _nf887_status(task_id: str, request_id: str, gate: dict) -> dict:
+    """One sealed review_ready target, in the shape the finalizer writes."""
+    return {
+        "ok": True,
+        "state": "review_ready",
+        "task_card": {
+            "task_id": task_id,
+            "claim_epoch": "1",
+            "terminal_review": {
+                "substatus": "review_ready",
+                "evidence": {
+                    "request_identity": {
+                        "request_id": request_id,
+                        "task_id": task_id,
+                        "claim_epoch": "1",
+                    },
+                    "attempt_artifact_manifest": {"manifest_sha256": "a" * 64},
+                    "changed_path_hashes": _sealed_changed_path_hashes(),
+                    "workspace": {
+                        "request_id": request_id,
+                        "path": "/candidate/worktree",
+                        "base_oid": "base-oid",
+                    },
+                    "quality_gate": gate,
+                    "source_graph_partition_readiness": {"target": True},
+                },
+            },
+            "evidence": {"source_graph_partition_readiness": {"target": True}},
+        },
+    }
+
+
+def _nf887_queue_card(task_id: str, request_id: str, gate: dict) -> dict:
+    status = _nf887_status(task_id, request_id, gate)
+    return {
+        "task_id": task_id,
+        "topic": "task_mcp",
+        "runner": "grok_4.6",
+        "status": "review",
+        "terminal_substatus": "review_ready",
+        "terminal_review": status["task_card"]["terminal_review"],
+        "claim_epoch": "1",
+    }
+
+
+def _dead_reviewer_row(task_id: str, request_id: str, lens: str, state: str) -> dict:
+    """A reviewer child that exists and can never file the report it owes."""
+    return {
+        "task_id": _nf887_reviewer_task(task_id, request_id, lens),
+        "topic": "quality_review",
+        "status": state,
+        "worker_status": "",
+    }
+
+
+def _live_reviewer_row(
+    task_id: str, request_id: str, lens: str, *, attempt: int = 1
+) -> dict:
+    return {
+        "task_id": _nf887_reviewer_task(task_id, request_id, lens, attempt=attempt),
+        "topic": "quality_review",
+        "status": "processing",
+        "worker_status": "claimed",
+    }
+
+
+def _reported_reviewer_row(
+    task_id: str, request_id: str, lens: str, *, state: str,
+    claim_epoch: str = "1",
+) -> dict:
+    """A stopped reviewer carrying the sealed report for ``claim_epoch``."""
+    reviewer_task = _nf887_reviewer_task(task_id, request_id, lens)
+    packet = hashlib.sha256(f"review-packet:{request_id}:{lens}".encode()).hexdigest()
+    receipt = {
+        "schema_id": "aiworkhub.quality_review_receipt.v1",
+        "packet_sha256": packet,
+        "target": {
+            "request_id": request_id, "task_id": task_id, "claim_epoch": claim_epoch,
+        },
+        "reviewer": {
+            "request_id": "review-request-" + lens,
+            "task_id": reviewer_task,
+            "provider": ROUTE["adapter_id"],
+        },
+        "report": {
+            "lens": lens, "provider": ROUTE["adapter_id"], "read_only": True,
+            "can_mutate_repo": False, "findings": [],
+        },
+        "authority": {
+            "process_identity_verified": True, "audit_verified": True,
+            "terminal_state": "review_ready",
+        },
+        "submission_id": hashlib.sha256(
+            f"submission:{request_id}:{lens}".encode()
+        ).hexdigest(),
+        "physical_submission_count": 1,
+        "logical_submission_count": 1,
+    }
+    return {
+        "task_id": reviewer_task,
+        "topic": "quality_review",
+        "status": state,
+        "archived_at": "2026-09-15T00:00:00+00:00" if state == "archived" else "",
+        "terminal_review": {
+            "substatus": "review_ready",
+            "evidence": {
+                "quality_review": {
+                    "lens": lens,
+                    "packet_sha256": packet,
+                    "target_request_id": request_id,
+                    "target_task_id": task_id,
+                    "target_claim_epoch": claim_epoch,
+                },
+                "quality_review_receipt": receipt,
+            },
+        },
+    }
+
+
+def _patch_nf887(monkeypatch, cards: list[dict], rows: dict[str, dict]) -> None:
+    monkeypatch.setattr(
+        review_orchestrator.task_store,
+        "list_review_queue_cards",
+        lambda _repo, limit=500: list(cards),
+    )
+    monkeypatch.setattr(
+        review_orchestrator.task_store,
+        "get_task",
+        lambda _repo, task_id: rows.get(task_id),
+    )
+
+
+def test_nf887_dead_reviewer_children_are_not_coverage_for_a_required_lens(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    """The measured live state, reproduced: 5 scanned, 4 "already_present", 0
+    reviewers running. Four of those five parents had children in exactly the
+    states that can never produce a report, and the fifth had none at all. All
+    five are owed both required lenses, so all five must be ensured."""
+    _stub_archive(monkeypatch)
+    gate = _high_tier_gate()
+    cards = [
+        _nf887_queue_card(f"TARGET-{index}", f"request-{index}", gate)
+        for index in range(1, 6)
+    ]
+    rows: dict[str, dict] = {}
+    for index, state in enumerate(
+        ("blocked", "worker_failed", "cancelled", "timed_out"), start=1
+    ):
+        for lens in ("correctness", "security"):
+            row = _dead_reviewer_row(f"TARGET-{index}", f"request-{index}", lens, state)
+            rows[row["task_id"]] = row
+    _patch_nf887(monkeypatch, cards, rows)
+    manager = _Manager(tmp_path)
+    for index in range(1, 6):
+        manager.status_results[f"request-{index}"] = _nf887_status(
+            f"TARGET-{index}", f"request-{index}", gate
+        )
+
+    result = review_orchestrator.recover_review_ready_targets(
+        manager, db_path=tmp_path / "nf887.sqlite"
+    )
+
+    assert result["review_recovery_scanned"] == 5
+    assert result["review_recovery_failed"] == 0
+    # The defect, pinned: not one of these five is "already present" any more.
+    assert result["review_recovery_reasons"].get("already_present") is None
+    assert result["review_recovery_reasons"]["unusable_reviewer"] == 4
+    assert result["review_recovery_ensured"] == 5
+
+
+def test_nf887_a_dead_lens_is_replaced_once_and_a_live_one_is_never_duplicated(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    """A reviewer still running on this claim owes its report and is left
+    alone; a dead sibling is replaced, and the pass after the replacement sees
+    the successor rather than buying a second one."""
+    _stub_archive(monkeypatch)
+    gate = _high_tier_gate()
+    live = _live_reviewer_row("TARGET", "request-1", "correctness")
+    dead = _dead_reviewer_row("TARGET", "request-1", "security", "worker_failed")
+    rows = {live["task_id"]: live, dead["task_id"]: dead}
+    _patch_nf887(monkeypatch, [_nf887_queue_card("TARGET", "request-1", gate)], rows)
+    manager = _Manager(tmp_path)
+    manager.status_results["request-1"] = _nf887_status("TARGET", "request-1", gate)
+    db = tmp_path / "nf887-once.sqlite"
+
+    first = review_orchestrator.recover_review_ready_targets(manager, db_path=db)
+
+    assert first["review_recovery_ensured"] == 1
+    assert first["review_recovery_reasons"]["unusable_reviewer"] == 1
+
+    # The replacement that ensure bought: a distinct-route successor with its
+    # own canonical task id. The dead first attempt is still on disk.
+    successor = _live_reviewer_row("TARGET", "request-1", "security", attempt=2)
+    rows[successor["task_id"]] = successor
+
+    second = review_orchestrator.recover_review_ready_targets(manager, db_path=db)
+
+    assert second["review_recovery_ensured"] == 0
+    assert second["review_recovery_reasons"]["already_present"] == 1
+    assert second["review_recovery_reasons"].get("unusable_reviewer") is None
+
+
+def test_nf887_only_a_current_claim_report_keeps_a_stopped_reviewer_present(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    """An archived or superseded reviewer that filed THIS claim's sealed report
+    is coverage. One whose only report was written against another claim epoch
+    is not, however finished its row says it is."""
+    _stub_archive(monkeypatch)
+    gate = {
+        "review_risk_profile": {
+            "effective_tier": "high",
+            "required_reviewer_lenses": list(review_orchestrator.LENSES),
+        }
+    }
+    reported = [
+        _reported_reviewer_row("TARGET", "request-1", "correctness", state="archived"),
+        _reported_reviewer_row("TARGET", "request-1", "security", state="superseded"),
+        _reported_reviewer_row(
+            "TARGET", "request-1", "code_quality", state="finished", claim_epoch="2",
+        ),
+    ]
+    rows = {row["task_id"]: row for row in reported}
+    _patch_nf887(monkeypatch, [_nf887_queue_card("TARGET", "request-1", gate)], rows)
+    manager = _Manager(tmp_path)
+    manager.status_results["request-1"] = _nf887_status("TARGET", "request-1", gate)
+
+    result = review_orchestrator.recover_review_ready_targets(
+        manager, db_path=tmp_path / "nf887-stale.sqlite"
+    )
+
+    assert result["review_recovery_ensured"] == 1
+    assert result["review_recovery_reasons"]["unusable_reviewer"] == 1
+    assert review_orchestrator._reviewer_lens_coverage(
+        manager.repo,
+        _nf887_identity("TARGET", "request-1"),
+        review_orchestrator.LENSES,
+    ) == {
+        "correctness": review_orchestrator._COVERAGE_COVERED,
+        "security": review_orchestrator._COVERAGE_COVERED,
+        "code_quality": review_orchestrator._COVERAGE_UNUSABLE,
+    }
+
+
+# ---------------------------------------------------------------------------
+# NF-2026-00888: a RETIRED attempt is not a reviewer either.
+#
+# NF887 stopped a dead reviewer CARD from being read as coverage. This is the
+# other half, one layer down, on the durable route attempt. Two shapes parked
+# a CURRENT candidate on one lens for ever, both with no successor and no
+# recorded reason: an attempt some earlier pass already retired, which every
+# later accept pass re-polled and returned nothing for; and an attempt still
+# recorded as ``launched`` whose process was already terminal, which every
+# later launch pass handed back unchanged and relaunched.
+# ---------------------------------------------------------------------------
+
+
+def _nf888_chain(
+    tmp_path: Path, name: str,
+) -> tuple[_FailoverManager, review_orchestrator.ReviewOrchestrator, object]:
+    """One real chain on a route table deep enough to never run dry."""
+    manager = _FailoverManager(tmp_path)
+    driver = review_orchestrator.ReviewOrchestrator(
+        manager,
+        db_path=tmp_path / f"nf888-{name}.sqlite",
+        route_selector=_unlimited_route_selector(),
+    )
+    chain = driver.ensure_chain(
+        target_task_id="TARGET", target_request_id="target-request", claim_epoch=1,
+        packet_sha256="a" * 64, candidate_sha256="b" * 64, now=NOW,
+    )
+    return manager, driver, chain
+
+
+def _nf888_kill(
+    manager: _FailoverManager,
+    driver: review_orchestrator.ReviewOrchestrator,
+    chain,
+    *,
+    state: str,
+    error_code: str,
+) -> dict:
+    """The latest reviewer dies on its own exact route, as a poll sees it."""
+    attempt = driver._route_attempts(chain.chain_id, "correctness")[-1]
+    request_id = str(attempt["reviewer_request_id"])
+    manager.status_results[request_id] = {
+        "ok": True,
+        "request_id": request_id,
+        "task_id": str(attempt["reviewer_task_id"]),
+        "state": state,
+        "error_code": error_code,
+        **{key: str(attempt[key]) for key in ROUTE},
+        "task_card": {"terminal_substatus": state, "worker_status": state},
+    }
+    return dict(attempt)
+
+
+def test_nf888_a_retired_attempt_on_accept_reaches_its_distinct_successor(
+    tmp_path: Path,
+) -> None:
+    """Capacity retires an attempt now and leaves a distinct route for later.
+
+    The launch path already honoured that. The accept path did not: it re-read
+    the SAME retired attempt, polled the SAME dead reviewer and returned None
+    on every pass afterwards, so a current candidate owed a lens no reviewer
+    was alive to file and nothing ever moved it.
+    """
+    manager, driver, chain = _nf888_chain(tmp_path, "accept-retired")
+    assert driver.drain(max_actions=1, now=NOW).completed == 1
+    assert len(manager.provider_launches) == 1
+
+    _nf888_kill(
+        manager, driver, chain, state="launch_failed", error_code="quota_exhausted",
+    )
+    # Capacity spends nothing NOW: retired, and no second provider this pass.
+    assert driver.drain(max_actions=1, now=NOW).pending == 1
+    attempts = driver._route_attempts(chain.chain_id, "correctness")
+    assert len(attempts) == 1
+    assert attempts[0]["state"] == "retired"
+    assert review_orchestrator.route_attempt_hold(attempts[0]["failure_reason"]) == ""
+    assert len(manager.provider_launches) == 1
+
+    # THE DEFECT, pinned: a later pass takes the distinct eligible route.
+    assert driver.drain(max_actions=1, now=NOW).pending == 1
+    attempts = driver._route_attempts(chain.chain_id, "correctness")
+    assert len(attempts) == 2
+    assert attempts[1]["state"] == "launched"
+    assert attempts[1]["runner"] != attempts[0]["runner"]
+    assert len(manager.provider_launches) == 2
+
+    successor_request = str(attempts[1]["reviewer_request_id"])
+    manager.status_results[successor_request] = _review_status(
+        reviewer_request=successor_request,
+        reviewer_task=str(attempts[1]["reviewer_task_id"]),
+        provider=str(attempts[1]["adapter_id"]),
+        route={key: str(attempts[1][key]) for key in ROUTE},
+    )
+
+    converged = driver.drain(max_actions=1, now=NOW)
+
+    assert converged.completed == 1
+    assert manager.accepts == [
+        (successor_request, str(attempts[1]["reviewer_task_id"]))
+    ]
+    assert len(manager.provider_launches) == 2
+
+
+@pytest.mark.parametrize(
+    ("state", "error_code", "hold", "attempts_after"),
+    [
+        ("launch_failed", "provider_unavailable", "", 2),
+        ("finalize_failed", "", "callback_reconcile", 1),
+    ],
+)
+def test_nf888_a_launched_attempt_whose_process_died_is_reconciled_not_relaunched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    state: str, error_code: str, hold: str, attempts_after: int,
+) -> None:
+    """A row saying ``launched`` is a claim about a process, not the process.
+
+    The launch is acknowledged and the attempt is durably ``launched``, then
+    the pass dies before completing its outbox action -- the state a restarted
+    driver finds. When that bound process is already terminal, relaunching it
+    reconciles nothing: it re-invokes a reviewer that can never report. Each
+    row is retired to its own TYPED disposition instead, and the chain then
+    advances exactly as far as the bounded policy allows: one distinct-route
+    successor for a provider-asserted transient, a durable hold for the
+    finalizer race that no second reviewer can settle.
+    """
+    manager, driver, chain = _nf888_chain(tmp_path, f"stale-{state}")
+    original_bind = driver._bind_route_attempt_request
+
+    def bind_then_lose_the_pass(action, attempt, request_id):
+        original_bind(action, attempt, request_id)
+        return False
+
+    monkeypatch.setattr(
+        driver, "_bind_route_attempt_request", bind_then_lose_the_pass
+    )
+    assert driver.drain(max_actions=1, now=NOW).pending == 1
+    monkeypatch.undo()
+    stale = driver._route_attempts(chain.chain_id, "correctness")[-1]
+    assert stale["state"] == "launched"
+    assert str(stale["reviewer_request_id"])
+    _nf888_kill(manager, driver, chain, state=state, error_code=error_code)
+
+    driver.drain(max_actions=1, now=NOW)
+
+    attempts = driver._route_attempts(chain.chain_id, "correctness")
+    assert attempts[0]["state"] == "retired"
+    assert attempts[0]["failure_reason"].startswith(state + ":")
+    assert review_orchestrator.route_attempt_hold(
+        attempts[0]["failure_reason"]
+    ) == hold
+    # THE DEFECT: the dead reviewer task was invoked again, every pass.
+    assert [
+        call["reviewer_task_id"] for call in manager.launches
+    ].count(str(stale["reviewer_task_id"])) == 1
+    assert len(attempts) == attempts_after
+    assert len(manager.provider_launches) == attempts_after
+    if attempts_after == 2:
+        assert attempts[1]["state"] == "launched"
+        assert attempts[1]["runner"] != attempts[0]["runner"]
+
+
+# The live NF888 recovery failure these tests pin. A durable attempt keeps the
+# model ALIAS its route selection named ("opus"); the process the launcher
+# actually started reports the canonical model ("claude-opus-5") for that
+# identical request, task, runner and adapter. Measured on current chains 906
+# and 916: actions 10862 and 10982 failed with
+# ``reviewer_terminal_route_binding_invalid`` -- the orchestrator refusing its
+# OWN reviewer as evidence about somebody else -- instead of reconciling the
+# launch_failed and finalize_failed processes it had itself launched.
+_NF888_ALIAS_ROUTES = (
+    {"runner": "claude_opus-5", "adapter_id": "claude_cli", "model": "opus"},
+    {"runner": "claude_sonnet-5", "adapter_id": "claude_cli", "model": "sonnet"},
+)
+_NF888_LAUNCHER_MODEL = {"opus": "claude-opus-5", "sonnet": "claude-sonnet-5"}
+
+
+def _nf888_alias_route_selector():
+    """Canonical workforce routes, recorded by the alias the plan named."""
+    assigned: dict[str, dict[str, str]] = {}
+
+    def select(_repo: Path, task_id: str, _lens: str) -> dict[str, str]:
+        if task_id not in assigned:
+            assigned[task_id] = dict(
+                _NF888_ALIAS_ROUTES[len(assigned) % len(_NF888_ALIAS_ROUTES)]
+            )
+        return dict(assigned[task_id])
+
+    return select
+
+
+def _nf888_alias_chain(tmp_path: Path, name: str):
+    manager = _FailoverManager(tmp_path)
+    driver = review_orchestrator.ReviewOrchestrator(
+        manager,
+        db_path=tmp_path / f"nf888-alias-{name}.sqlite",
+        route_selector=_nf888_alias_route_selector(),
+    )
+    chain = driver.ensure_chain(
+        target_task_id="TARGET", target_request_id="target-request", claim_epoch=1,
+        packet_sha256="a" * 64, candidate_sha256="b" * 64, now=NOW,
+    )
+    return manager, driver, chain
+
+
+def _nf888_stale_launched(driver, chain, monkeypatch: pytest.MonkeyPatch) -> dict:
+    """Leave the newest attempt durably ``launched`` with its pass lost."""
+    original_bind = driver._bind_route_attempt_request
+
+    def bind_then_lose_the_pass(action, attempt, request_id):
+        original_bind(action, attempt, request_id)
+        return False
+
+    monkeypatch.setattr(
+        driver, "_bind_route_attempt_request", bind_then_lose_the_pass
+    )
+    assert driver.drain(max_actions=1, now=NOW).pending == 1
+    monkeypatch.undo()
+    stale = driver._route_attempts(chain.chain_id, "correctness")[-1]
+    assert stale["state"] == "launched"
+    assert str(stale["reviewer_request_id"])
+    return dict(stale)
+
+
+def _nf888_kill_reporting_model(
+    manager: _FailoverManager,
+    driver: review_orchestrator.ReviewOrchestrator,
+    chain,
+    *,
+    state: str,
+    error_code: str,
+    model: str | None = None,
+) -> dict:
+    """The bound reviewer dies, naming its model the way the launcher does."""
+    attempt = driver._route_attempts(chain.chain_id, "correctness")[-1]
+    request_id = str(attempt["reviewer_request_id"])
+    reported = model or _NF888_LAUNCHER_MODEL[str(attempt["model"])]
+    assert reported != str(attempt["model"]), "the two spellings must differ"
+    manager.status_results[request_id] = {
+        "ok": True,
+        "request_id": request_id,
+        "task_id": str(attempt["reviewer_task_id"]),
+        "state": state,
+        "error_code": error_code,
+        "runner": str(attempt["runner"]),
+        "adapter_id": str(attempt["adapter_id"]),
+        "model": reported,
+        "task_card": {"terminal_substatus": state, "worker_status": state},
+    }
+    return dict(attempt)
+
+
+@pytest.mark.parametrize(
+    ("state", "error_code", "hold", "attempts_after"),
+    [
+        ("launch_failed", "provider_unavailable", "", 2),
+        ("finalize_failed", "", "callback_reconcile", 1),
+    ],
+)
+def test_nf888_a_planned_model_alias_and_its_launched_canonical_name_are_one_route(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    state: str, error_code: str, hold: str, attempts_after: int,
+) -> None:
+    """The recorded alias and the reported canonical model are ONE identity.
+
+    Everything else about the binding is unchanged and exact -- same request,
+    same reviewer task, same runner, same adapter. Only the model was compared
+    byte-for-byte across two vocabularies, and that alone made a chain refuse
+    its own terminal reviewer on every pass: no retirement, no successor, no
+    hold, just the same failed action again. Reconciliation must reach the
+    SAME typed dispositions it reaches when both sides spell the model alike --
+    one distinct-route successor for the provider-asserted transient, a durable
+    hold for the finalizer race no second reviewer can settle.
+    """
+    manager, driver, chain = _nf888_alias_chain(tmp_path, state)
+    stale = _nf888_stale_launched(driver, chain, monkeypatch)
+    assert stale["model"] == "opus"
+    killed = _nf888_kill_reporting_model(
+        manager, driver, chain, state=state, error_code=error_code,
+    )
+    reported = manager.status_results[str(killed["reviewer_request_id"])]
+    assert reported["model"] == "claude-opus-5"
+
+    result = driver.drain(max_actions=1, now=NOW)
+
+    # THE DEFECT: reviewer_terminal_route_binding_invalid, every pass.
+    assert result.failed == 0
+    attempts = driver._route_attempts(chain.chain_id, "correctness")
+    assert attempts[0]["state"] == "retired"
+    assert attempts[0]["failure_reason"].startswith(state + ":")
+    assert review_orchestrator.route_attempt_hold(
+        attempts[0]["failure_reason"]
+    ) == hold
+    assert [
+        call["reviewer_task_id"] for call in manager.launches
+    ].count(str(stale["reviewer_task_id"])) == 1
+    assert len(attempts) == attempts_after
+    assert len(manager.provider_launches) == attempts_after
+    if attempts_after == 2:
+        assert attempts[1]["state"] == "launched"
+        assert attempts[1]["runner"] != attempts[0]["runner"]
+        assert attempts[1]["model"] == "sonnet"
+
+
+def test_nf888_historical_binding_failure_recovers_after_alias_fix(
+    tmp_path: Path,
+) -> None:
+    """A chain failed by the old comparison resumes without losing its launch."""
+    manager, driver, chain = _nf888_alias_chain(tmp_path, "historical")
+    assert driver.drain(max_actions=1, now=NOW).completed == 1
+    killed = _nf888_kill_reporting_model(
+        manager,
+        driver,
+        chain,
+        state="launch_failed",
+        error_code="provider_unavailable",
+    )
+    assert killed["model"] == "opus"
+    accept = review_lifecycle.reserve_next_action(
+        driver.db_path,
+        owner="old-driver",
+        lease_token="old-lease",
+        now=NOW,
+    )
+    assert accept is not None
+    assert accept.action_type == "accept"
+    review_lifecycle.fail_action(
+        driver.db_path,
+        action_id=accept.action_id,
+        owner="old-driver",
+        lease_token="old-lease",
+        reason=review_lifecycle.TERMINAL_ROUTE_BINDING_FAILURE,
+        now=NOW,
+    )
+    review_lifecycle.reconcile_dead_chains(driver.db_path, now=NOW)
+    assert review_lifecycle.lifecycle_counts(driver.db_path)["retired"] == 10
+
+    result = driver.drain(max_actions=1, now=NOW)
+
+    assert result.failed == 0
+    assert result.pending == 1
+    attempts = driver._route_attempts(chain.chain_id, "correctness")
+    assert len(attempts) == 2
+    assert attempts[0]["state"] == "retired"
+    assert attempts[1]["state"] == "launched"
+    counts = review_lifecycle.lifecycle_counts(driver.db_path)
+    assert counts["failed"] == 0
+    assert counts["retired"] == 0
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("model", "claude-sonnet-5"),
+        ("runner", "claude_sonnet-5"),
+        ("adapter_id", "vscode_lm"),
+        ("task_id", "SOME_OTHER_REVIEWER"),
+        ("request_id", "some-other-request"),
+    ],
+)
+def test_nf888_a_terminal_status_naming_another_process_is_still_foreign(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field: str, value: str,
+) -> None:
+    """Canonicalizing a spelling may not canonicalize away the identity.
+
+    ``claude-sonnet-5`` is a canonical model name too, and it is not this
+    attempt's. Every field of the binding stays load-bearing: the attempt is
+    left exactly as it was, no reviewer is retired and no successor is bought
+    on somebody else's evidence.
+    """
+    manager, driver, chain = _nf888_alias_chain(tmp_path, f"foreign-{field}")
+    stale = _nf888_stale_launched(driver, chain, monkeypatch)
+    killed = _nf888_kill_reporting_model(
+        manager, driver, chain,
+        state="launch_failed", error_code="provider_unavailable",
+    )
+    request_id = str(killed["reviewer_request_id"])
+    manager.status_results[request_id][field] = value
+    assert not driver._attempt_route_binding_matches(
+        manager.status_results[request_id], killed
+    )
+
+    result = driver.drain(max_actions=1, now=NOW)
+
+    assert result.failed == 1
+    attempts = driver._route_attempts(chain.chain_id, "correctness")
+    assert len(attempts) == 1
+    assert attempts[0]["state"] == "launched"
+    assert attempts[0]["reviewer_task_id"] == stale["reviewer_task_id"]
+    assert len(manager.provider_launches) == 1
+
+
+def test_nf888_a_spent_retry_ceiling_waits_on_a_named_reason(
+    tmp_path: Path,
+) -> None:
+    """Advancing a retired attempt may never become a third reviewer.
+
+    The NF847 ceiling is one first attempt plus one distinct-route retry. Once
+    both are dead the lens waits, and it waits on a NAMED durable deferral --
+    the difference between a bound that is recorded and one that is silence.
+    """
+    manager, driver, chain = _nf888_chain(tmp_path, "exhausted")
+    assert driver.drain(max_actions=1, now=NOW).completed == 1
+
+    _nf888_kill(
+        manager, driver, chain,
+        state="worker_failed", error_code="provider_unavailable",
+    )
+    assert driver.drain(max_actions=1, now=NOW).pending == 1
+    assert len(manager.provider_launches) == 2, "the one retry, spent"
+
+    _nf888_kill(
+        manager, driver, chain,
+        state="worker_failed", error_code="provider_unavailable",
+    )
+    assert driver.drain(max_actions=1, now=NOW).pending == 1
+    assert [
+        row["state"]
+        for row in driver._route_attempts(chain.chain_id, "correctness")
+    ] == ["retired", "retired"]
+
+    for _ in range(3):
+        assert driver.drain(max_actions=1, now=NOW).pending == 1
+        assert len(manager.provider_launches) == 2
+        assert len(driver._route_attempts(chain.chain_id, "correctness")) == 2
+
+    wait = manager.events[-1]["review_automation"]
+    assert wait["state"] == "deferred"
+    assert wait["reason"] == "review_route_retries_exhausted:correctness"
+
+
+# The NF780 binding, kept executable. ``manager_ready_marker`` authenticates a
+# card against ITS OWN terminal_review and claim epoch; that seal is
+# task_store's and is not re-derived here. What recovery adds on top is the
+# binding under test: a duplicate request can hold task, request and claim
+# identical while sealing a brand-new candidate, so the skip must also name the
+# candidate digest the CURRENT episode resolved.
+_NF888_CURRENT_MARKER = {
+    "target_task_id": "TARGET",
+    "target_request_id": "request-1",
+    "claim_epoch": "1",
+    "candidate_sha256": _SEALED_CANDIDATE_SHA256,
+}
+
+
+def _nf888_recover_with_marker(
+    monkeypatch, tmp_path: Path, aggregate: dict,
+) -> dict:
+    _stub_archive(monkeypatch)
+    gate = _high_tier_gate()
+    card = _nf887_queue_card("TARGET", "request-1", gate)
+    _patch_nf887(monkeypatch, [card], {})
+    monkeypatch.setattr(
+        review_orchestrator.task_store,
+        "manager_ready_marker",
+        lambda _card: {"manager_ready": dict(aggregate)},
+    )
+    manager = _Manager(tmp_path)
+    manager.status_results["request-1"] = _nf887_status("TARGET", "request-1", gate)
+    return review_orchestrator.recover_review_ready_targets(
+        manager, db_path=tmp_path / "nf888-marker.sqlite"
+    )
+
+
+def test_nf888_manager_ready_skips_exactly_the_current_candidate(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    result = _nf888_recover_with_marker(monkeypatch, tmp_path, _NF888_CURRENT_MARKER)
+
+    assert result["review_recovery_scanned"] == 1
+    assert result["review_recovery_skipped"] == 1
+    assert result["review_recovery_reasons"]["manager_ready"] == 1
+    assert result["review_recovery_ensured"] == 0
+
+
+@pytest.mark.parametrize("field", sorted(_NF888_CURRENT_MARKER))
+def test_nf888_a_manager_ready_marker_off_by_one_field_never_skips(
+    monkeypatch, tmp_path: Path, field: str,
+) -> None:
+    """Every one of the four fields is load-bearing, candidate digest included.
+
+    A marker that matches three of them and misses the fourth belongs to some
+    other episode, and reading it as this one's would strand the current
+    candidate on an aggregate that was never about it.
+    """
+    result = _nf888_recover_with_marker(
+        monkeypatch, tmp_path, {**_NF888_CURRENT_MARKER, field: "d" * 64},
+    )
+
+    assert result["review_recovery_reasons"].get("manager_ready") is None
+    assert result["review_recovery_ensured"] == 1
+
+
+def test_nf888_a_lens_whose_whole_retry_ceiling_died_is_named_not_re_ensured(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    """Recovery may not report an ensure that cannot buy a reviewer.
+
+    Both slots inside the ceiling exist and both are dead, so the orchestrator
+    refuses another route for this lens. Ensuring the chain again would spend
+    nothing and count itself as recovery; the scan names the state instead.
+    """
+    _stub_archive(monkeypatch)
+    gate = _high_tier_gate()
+    rows: dict[str, dict] = {}
+    for lens in ("correctness", "security"):
+        for attempt in (1, 2):
+            row = {
+                "task_id": _nf887_reviewer_task(
+                    "TARGET", "request-1", lens, attempt=attempt
+                ),
+                "topic": "quality_review",
+                "status": "worker_failed",
+                "worker_status": "",
+            }
+            rows[row["task_id"]] = row
+    _patch_nf887(monkeypatch, [_nf887_queue_card("TARGET", "request-1", gate)], rows)
+    manager = _Manager(tmp_path)
+    manager.status_results["request-1"] = _nf887_status("TARGET", "request-1", gate)
+
+    result = review_orchestrator.recover_review_ready_targets(
+        manager, db_path=tmp_path / "nf888-exhausted-scan.sqlite"
+    )
+
+    assert result["review_recovery_scanned"] == 1
+    assert result["review_recovery_skipped"] == 1
+    assert result["review_recovery_ensured"] == 0
+    assert result["review_recovery_reasons"]["retry_exhausted"] == 1
+    assert result["review_recovery_reasons"].get("unusable_reviewer") is None
+
+    # A still-replaceable lens is NOT swept up in that: one dead first attempt
+    # with its retry unspent is the NF887 case, and it must still be ensured.
+    del rows[_nf887_reviewer_task("TARGET", "request-1", "security", attempt=2)]
+
+    partial = review_orchestrator.recover_review_ready_targets(
+        manager, db_path=tmp_path / "nf888-exhausted-scan.sqlite"
+    )
+
+    assert partial["review_recovery_ensured"] == 1
+    assert partial["review_recovery_reasons"].get("retry_exhausted") is None
+    assert partial["review_recovery_reasons"]["unusable_reviewer"] == 1
