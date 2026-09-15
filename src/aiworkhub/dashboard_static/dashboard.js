@@ -90,8 +90,76 @@ function numberValue(value) {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
-function formatCount(value) {
-  return new Intl.NumberFormat(undefined, { notation: "compact", maximumFractionDigits: 1 }).format(numberValue(value));
+const COMPACT_COUNT_TIERS = [
+  { limit: 1e12, suffix: "T" },
+  { limit: 1e9, suffix: "B" },
+  { limit: 1e6, suffix: "M" },
+  { limit: 1e3, suffix: "k" },
+];
+
+// Resolved through navigator so the decimal separator follows the reader's
+// locale and tests can pin one deterministic locale instead of asserting
+// against whatever locale the host machine happens to run.
+function compactLocale() {
+  return typeof navigator !== "undefined" && navigator.language ? navigator.language : undefined;
+}
+
+// Four significant digits: every integer in the 1k decade stays distinct
+// (1000 -> 1k, 1001 -> 1.001k) while the tile text stays within the same
+// six-character budget the compact KPI layout already assumed.
+function compactFractionDigits(mantissa) {
+  const magnitude = Math.abs(mantissa);
+  if (magnitude < 10) {
+    return 3;
+  }
+  if (magnitude < 100) {
+    return 2;
+  }
+  return 1;
+}
+
+function roundToDigits(value, digits) {
+  const factor = 10 ** digits;
+  const rounded = Math.round(Math.abs(value) * factor) / factor;
+  return value < 0 ? -rounded : rounded;
+}
+
+function formatMantissa(value, digits, locale) {
+  return new Intl.NumberFormat(locale, {
+    minimumFractionDigits: 0,
+    maximumFractionDigits: digits,
+    useGrouping: false,
+  }).format(value);
+}
+
+function formatCompactNumber(value, locale) {
+  const amount = numberValue(value);
+  const magnitude = Math.abs(amount);
+  const smallest = COMPACT_COUNT_TIERS[COMPACT_COUNT_TIERS.length - 1];
+  if (magnitude < smallest.limit) {
+    return formatMantissa(amount, 0, locale);
+  }
+  let index = COMPACT_COUNT_TIERS.length - 1;
+  while (index > 0 && magnitude >= COMPACT_COUNT_TIERS[index - 1].limit) {
+    index -= 1;
+  }
+  // Rounding can carry the mantissa up to 1000; promote a tier instead so
+  // 999999999 reads as 1B rather than a grouped 1,000M artifact.
+  for (;;) {
+    const tier = COMPACT_COUNT_TIERS[index];
+    const mantissa = amount / tier.limit;
+    const digits = compactFractionDigits(mantissa);
+    const rounded = roundToDigits(mantissa, digits);
+    if (Math.abs(rounded) >= 1000 && index > 0) {
+      index -= 1;
+      continue;
+    }
+    return `${formatMantissa(rounded, digits, locale)}${tier.suffix}`;
+  }
+}
+
+function formatCount(value, locale) {
+  return formatCompactNumber(value, locale || compactLocale());
 }
 
 function formatMoney(value) {
