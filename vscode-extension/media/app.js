@@ -351,51 +351,85 @@ function measuredCount(value) {
   return isMeasured(value) ? formatCount(value) : NO_MEASUREMENT_LABEL;
 }
 
-function formatCompactNumber(value, locale) {
-  return formatCount(value, locale);
+// One argument on purpose: this exact declaration is the seam other extension
+// tests extract verbatim from the shipped file, and history-charts.test.js
+// evaluates everything from this line down to formatRelativeTime() on its own.
+// So the compact helpers live BELOW this declaration rather than above it:
+// hoisting makes the call work either way, but only this order keeps the
+// extracted seam self-contained. Locale resolution stays internal, and
+// formatCompactNumber() is the locale-taking helper a deterministic harness
+// drives directly, so pinning a locale never changes this signature.
+function formatCount(value) {
+  return formatCompactNumber(value, compactLocale());
 }
 
-// One argument on purpose: this exact declaration is the seam other extension
-// tests extract verbatim from the shipped file. The algorithm therefore stays
-// self-contained. formatCompactNumber() supplies the optional second argument
-// only for a deterministic test harness without widening this public seam.
-function formatCount(value) {
-  const locale = arguments.length > 1
-    ? arguments[1]
-    : (typeof navigator !== "undefined" && navigator.language ? navigator.language : undefined);
-  const tiers = [
-    { limit: 1e12, suffix: "T" },
-    { limit: 1e9, suffix: "B" },
-    { limit: 1e6, suffix: "M" },
-    { limit: 1e3, suffix: "k" },
-  ];
-  const amount = numberValue(value);
-  const magnitude = Math.abs(amount);
-  const render = (number, digits) => new Intl.NumberFormat(locale, {
+const COMPACT_COUNT_TIERS = [
+  { limit: 1e12, suffix: "T" },
+  { limit: 1e9, suffix: "B" },
+  { limit: 1e6, suffix: "M" },
+  { limit: 1e3, suffix: "k" },
+];
+
+// Resolved through navigator so the decimal separator follows the reader's
+// locale and tests can pin one deterministic locale instead of asserting
+// against whatever locale the webview host happens to run.
+function compactLocale() {
+  return typeof navigator !== "undefined" && navigator.language ? navigator.language : undefined;
+}
+
+// Four significant digits: every integer in the 1k decade stays distinct
+// (1000 -> 1k, 1001 -> 1.001k) while the tile text stays within the same
+// six-character budget the compact KPI layout already assumed. One decimal
+// collapsed 1000 and 1001 onto the same label, so a lifecycle counter could
+// tick a thousand times without the panel showing any progress at all.
+function compactFractionDigits(mantissa) {
+  const magnitude = Math.abs(mantissa);
+  if (magnitude < 10) {
+    return 3;
+  }
+  if (magnitude < 100) {
+    return 2;
+  }
+  return 1;
+}
+
+function roundToDigits(value, digits) {
+  const factor = 10 ** digits;
+  const rounded = Math.round(Math.abs(value) * factor) / factor;
+  return value < 0 ? -rounded : rounded;
+}
+
+function formatMantissa(value, digits, locale) {
+  return new Intl.NumberFormat(locale, {
     minimumFractionDigits: 0,
     maximumFractionDigits: digits,
     useGrouping: false,
-  }).format(number);
-  if (magnitude < tiers[tiers.length - 1].limit) {
-    return render(amount, 0);
+  }).format(value);
+}
+
+function formatCompactNumber(value, locale) {
+  const amount = numberValue(value);
+  const magnitude = Math.abs(amount);
+  const smallest = COMPACT_COUNT_TIERS[COMPACT_COUNT_TIERS.length - 1];
+  if (magnitude < smallest.limit) {
+    return formatMantissa(amount, 0, locale);
   }
-  let index = tiers.length - 1;
-  while (index > 0 && magnitude >= tiers[index - 1].limit) {
+  let index = COMPACT_COUNT_TIERS.length - 1;
+  while (index > 0 && magnitude >= COMPACT_COUNT_TIERS[index - 1].limit) {
     index -= 1;
   }
+  // Rounding can carry the mantissa up to 1000; promote a tier instead so
+  // 999999999 reads as 1B rather than a grouped 1,000M artifact.
   for (;;) {
-    const tier = tiers[index];
+    const tier = COMPACT_COUNT_TIERS[index];
     const mantissa = amount / tier.limit;
-    const mantissaMagnitude = Math.abs(mantissa);
-    const digits = mantissaMagnitude < 10 ? 3 : (mantissaMagnitude < 100 ? 2 : 1);
-    const factor = 10 ** digits;
-    const absoluteRounded = Math.round(Math.abs(mantissa) * factor) / factor;
-    const rounded = mantissa < 0 ? -absoluteRounded : absoluteRounded;
+    const digits = compactFractionDigits(mantissa);
+    const rounded = roundToDigits(mantissa, digits);
     if (Math.abs(rounded) >= 1000 && index > 0) {
       index -= 1;
       continue;
     }
-    return `${render(rounded, digits)}${tier.suffix}`;
+    return `${formatMantissa(rounded, digits, locale)}${tier.suffix}`;
   }
 }
 

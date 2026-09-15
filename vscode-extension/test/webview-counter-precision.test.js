@@ -22,16 +22,31 @@ function extractRange(source, startMarker, tailMarker) {
   return source.slice(start, end + 2);
 }
 
-// The tail marker is the production one-argument declaration. Other extension
-// suites extract the same literal seam, so an assertion here fails loudly if a
-// future refactor widens the signature again.
+// The production one-argument declaration. Other extension suites extract this
+// same literal seam, so an assertion here fails loudly if a future refactor
+// widens the signature again.
 const FORMATCOUNT_SEAM = "function formatCount(value) {";
 
+// history-charts.test.js slices [formatCount .. formatRelativeTime) out of
+// app.js and evaluates that block on its own beside a three-helper harness, so
+// every helper formatCount reaches for has to be declared inside that region.
+const HISTORY_SEAM_TAIL = "function formatRelativeTime(";
+
+// The snippet reaches past the seam to the last compact helper: the helpers sit
+// below formatCount so the history extraction above stays self-contained.
 const FORMATTER_SNIPPET = extractRange(
   appSource,
   "function numberValue(value) {",
-  FORMATCOUNT_SEAM,
+  "function formatCompactNumber(value, locale) {",
 );
+
+function historySeamRegion() {
+  const start = appSource.indexOf(FORMATCOUNT_SEAM);
+  assert.notEqual(start, -1, `media/app.js must declare ${FORMATCOUNT_SEAM}`);
+  const end = appSource.indexOf(HISTORY_SEAM_TAIL, start);
+  assert.notEqual(end, -1, "media/app.js must declare formatRelativeTime after formatCount");
+  return appSource.slice(start, end);
+}
 
 // The lifecycle/outcome KPI writes, sliced verbatim out of renderSummary() so
 // the hover-truth assertions run the shipped rendering rather than a copy.
@@ -50,7 +65,7 @@ function extractCounterBlock(source) {
 const COUNTER_SNIPPET = extractCounterBlock(appSource);
 
 test("the extracted snippets are the shipped precision formatter", () => {
-  assert.match(FORMATTER_SNIPPET, /const tiers = \[/);
+  assert.match(FORMATTER_SNIPPET, /const COMPACT_COUNT_TIERS = \[/);
   assert.match(FORMATTER_SNIPPET, /function formatCompactNumber\(value, locale\)/);
   assert.ok(
     !appSource.includes('notation: "compact"'),
@@ -66,9 +81,35 @@ test("the shipped formatCount keeps its one-argument public seam", () => {
   );
   assert.ok(
     !/function formatCount\([^)]*,/.test(appSource),
-    "formatCount must not take a second declared parameter",
+    "formatCount must not take a second parameter; resolve locale through compactLocale() instead",
   );
-  assert.match(FORMATTER_SNIPPET, /arguments\.length > 1/);
+  assert.match(FORMATTER_SNIPPET, /function compactLocale\(\)/);
+});
+
+// The regression this file exists to prevent twice over: the seam kept its
+// one-argument shape, but its helpers lived above it, so history-charts.test.js
+// evaluated the extracted block and hit a ReferenceError. Reproduce that exact
+// harness -- the same three helpers the history suite injects, nothing else --
+// so the coupling fails here instead of only in the history suite.
+test("the extracted formatCount seam region evaluates on its own", () => {
+  const context = { navigator: { language: "en-US" } };
+  vm.createContext(context);
+  vm.runInContext(
+    `function numberValue(value) {
+      const parsed = Number(value);
+      return Number.isFinite(parsed) ? parsed : 0;
+    }
+    function asArray(value) { return Array.isArray(value) ? value : []; }
+    function createElement(tag, className, text) { return { tag, className, textContent: text }; }
+    ${historySeamRegion()}
+    globalThis.formatCount = formatCount;`,
+    context,
+  );
+  assert.equal(context.formatCount(999), "999");
+  assert.equal(context.formatCount(1000), "1k");
+  assert.equal(context.formatCount(1001), "1.001k");
+  assert.equal(context.formatCount(999999999), "1B");
+  assert.equal(context.formatCount(1.5e12), "1.5T");
 });
 
 function loadFormatter(language) {
@@ -129,6 +170,8 @@ test("compact output never carries a grouping separator", () => {
   const values = [1000, 1001, 12345, 123456, 999999, 999999999, 1.5e12, 999999999999999];
   for (const value of values) {
     const rendered = compact(value);
+    // A sign, digits, one optional en-US decimal point and one tier suffix --
+    // anything else (a comma, a thin space, an exponent) is a grouping artifact.
     assert.match(
       rendered,
       /^-?[0-9]+(\.[0-9]+)?[kMBT]?$/,
@@ -180,6 +223,7 @@ test("formatCount resolves the host locale internally from its single argument",
   assert.equal(enUS.formatCount.length, 1, "formatCount must stay a one-argument function");
   const deDe = loadFormatter("de-DE");
   assert.equal(deDe.formatCount(1001), deDeAvailable ? "1,001k" : "1.001k");
+  // A webview host without navigator.language must still render, not throw.
   const noNavigator = loadFormatter(undefined);
   assert.equal(typeof noNavigator.formatCount(1001), "string");
 });
