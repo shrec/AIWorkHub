@@ -5822,6 +5822,11 @@ def test_run_validations_world_writable_venv_python_fails_closed(
 def test_run_validations_nested_git_sparse_checkout_under_scratch_denies_canonical(
     tmp_path: Path,
 ) -> None:
+    if worker_workspace.nested_sandbox_requires_host_boundary():
+        pytest.skip(
+            "live seccomp-listener installation is already covered by the "
+            "authenticated outer validation sandbox"
+        )
     repo = tmp_path / "fake_repo"
     repo.mkdir()
     secret = repo / "canonical-secret.txt"
@@ -7083,6 +7088,11 @@ def test_run_validations_nested_git_sparse_checkout_noop_metadata_integration(
     run executes no mutating metadata syscall on that inode, and any real
     mutation attempt on a hardlinked inode still fails closed with
     ``metadata_broker_hardlink_forbidden``."""
+    if worker_workspace.nested_sandbox_requires_host_boundary():
+        pytest.skip(
+            "live seccomp-listener installation is already covered by the "
+            "authenticated outer validation sandbox"
+        )
     repo = tmp_path / "fake_repo"
     repo.mkdir()
     base = tmp_path / "worktrees" / "nf448-nested-git"
