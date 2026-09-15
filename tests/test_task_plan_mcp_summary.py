@@ -202,6 +202,127 @@ def test_summary_exposes_terminal_artifacts_excluded_and_agrees_with_full():
     assert "READY" in summary["ready"]
 
 
+def test_summary_bounds_historical_blocked_ids_and_keeps_exact_counts(monkeypatch):
+    hist = [f"HIST-{i:03d}" for i in range(400)]
+    plan = _full_plan()
+    plan.update(
+        {
+            "task_ids": ["DONE", "READY", "BLOCKED"] + hist,
+            "lifecycle": {
+                "DONE": "finished",
+                "READY": "pending",
+                "BLOCKED": "blocked",
+                **{task_id: "rework" for task_id in hist},
+            },
+            "blocked_count": 401,
+            "blocked_task_ids": ["BLOCKED"] + hist,
+            "dependency_blocked_count": 1,
+            "dependency_blocked_task_ids": ["BLOCKED"],
+            "lifecycle_blocked_count": 400,
+            "lifecycle_blocked_task_ids": hist,
+        }
+    )
+    monkeypatch.setattr(server.core, "task_plan_snapshot", lambda: plan)
+
+    summary = server.aiworkhub_task_plan_snapshot()
+
+    assert summary["snapshot_mode"] == "summary"
+    assert summary["full_snapshot_available"] is True
+    assert summary["task_count"] == 403
+    assert summary["actionable_task_count"] == 402
+    assert summary["terminal_task_count"] == 1
+    assert summary["ready_count"] == 1
+    assert summary["blocked_count"] == 401
+    assert summary["lifecycle_blocked_count"] == 400
+    assert summary["global_collision_count"] == 1
+
+    fields = summary["sample_bounds"]["fields"]
+    cap = summary["sample_bounds"]["max_sample_count"]
+    assert 0 < cap < 400
+
+    blocked = summary["blocked_task_ids"]
+    assert len(blocked) == cap
+    assert blocked == (["BLOCKED"] + hist)[:cap]
+    assert fields["blocked_task_ids"] == {
+        "total_count": 401,
+        "returned_count": cap,
+        "truncated": True,
+    }
+
+    lifecycle_blocked = summary["lifecycle_blocked_task_ids"]
+    assert len(lifecycle_blocked) == cap
+    assert lifecycle_blocked == hist[:cap]
+    assert fields["lifecycle_blocked_task_ids"] == {
+        "total_count": 400,
+        "returned_count": cap,
+        "truncated": True,
+    }
+
+    actionable = summary["actionable_lifecycle"]
+    assert len(actionable) == cap
+    assert list(actionable) == (["READY", "BLOCKED"] + hist)[:cap]
+    assert fields["actionable_lifecycle"] == {
+        "total_count": 402,
+        "returned_count": cap,
+        "truncated": True,
+    }
+
+    assert summary["ready"] == ["READY"]
+    assert fields["ready"]["truncated"] is False
+
+    assert "lifecycle" not in summary
+    assert "task_ids" not in summary
+    assert "dependencies" not in summary
+    assert "layers" not in summary
+    assert {"lifecycle", "task_ids", "dependencies", "layers"} <= set(
+        summary["omitted_fields"]
+    )
+
+
+def test_full_mode_preserves_complete_blocked_history_authority(monkeypatch):
+    hist = [f"HIST-{i:03d}" for i in range(400)]
+    plan = _full_plan()
+    plan.update(
+        {
+            "task_ids": ["DONE", "READY", "BLOCKED"] + hist,
+            "lifecycle": {
+                "DONE": "finished",
+                "READY": "pending",
+                "BLOCKED": "blocked",
+                **{task_id: "rework" for task_id in hist},
+            },
+            "blocked_count": 401,
+            "blocked_task_ids": ["BLOCKED"] + hist,
+            "dependency_blocked_count": 1,
+            "dependency_blocked_task_ids": ["BLOCKED"],
+            "lifecycle_blocked_count": 400,
+            "lifecycle_blocked_task_ids": hist,
+        }
+    )
+    monkeypatch.setattr(server.core, "task_plan_snapshot", lambda: plan)
+
+    summary = server.aiworkhub_task_plan_snapshot()
+    full = server.aiworkhub_task_plan_snapshot(full=True)
+
+    assert full["snapshot_mode"] == "full"
+    assert full["full_snapshot_available"] is True
+    assert full["task_ids"] == ["DONE", "READY", "BLOCKED"] + hist
+    assert full["lifecycle"] == plan["lifecycle"]
+    assert full["blocked_task_ids"] == ["BLOCKED"] + hist
+    assert full["lifecycle_blocked_task_ids"] == hist
+    assert "sample_bounds" not in full
+
+    assert summary["task_count"] == len(full["task_ids"])
+    assert summary["actionable_task_count"] == 402
+    assert summary["blocked_count"] == full["blocked_count"]
+    assert summary["lifecycle_blocked_count"] == len(
+        full["lifecycle_blocked_task_ids"]
+    )
+    assert len(summary["lifecycle_blocked_task_ids"]) < len(
+        full["lifecycle_blocked_task_ids"]
+    )
+
+
 def test_summary_retains_rework_and_unresolved_artifacts():
     cards = [
         {
@@ -703,3 +824,185 @@ def test_summary_non_superseded_and_invalid_successor_ids_fail_closed():
     assert "QR-bad" in summary["actionable_lifecycle"]
     assert task_plan.successor_task_id(cards[1]) == ""
     assert task_plan.successor_task_id(cards[2]) == ""
+
+
+def _pending_card(task_id: str, path: str, minute: int) -> dict[str, object]:
+    return {
+        "task_id": task_id,
+        "status": "pending",
+        "worker_status": "unclaimed",
+        "allowed_writes": [path],
+        "depends_on": [],
+        "created_at": f"2026-01-01T00:{minute % 60:02d}:00Z",
+        "launch_request_id": "",
+    }
+
+
+def test_summary_collision_sample_keeps_late_active_colliding_card():
+    # 58 collision-free cards created first, then the only colliding pair.
+    # Both the insertion order and the sorted order of the dense
+    # ``card_collision_free`` map therefore put the colliding cards last.
+    cards = [
+        _pending_card(f"OLD-{idx:03d}", f"src/old_{idx:03d}.py", idx)
+        for idx in range(58)
+    ]
+    cards.append(_pending_card("ZLATE-A", "src/late_shared.py", 58))
+    cards.append(_pending_card("ZLATE-B", "src/late_shared.py", 59))
+
+    full = task_plan.build_snapshot(cards)
+    summary = task_plan.summarize_task_plan_snapshot(full)
+    cap = summary["sample_bounds"]["max_sample_count"]
+
+    assert len(cards) == 60
+    assert cap < len(cards)
+    assert len(full["card_collision_free"]) == 60
+    assert full["card_collision_free"]["ZLATE-A"] is False
+    assert full["card_collision_free"]["ZLATE-B"] is False
+
+    # A plain insertion-order head sample of the dense source map is all-True
+    # here, i.e. exactly the all-clear the bounded payload must never report
+    # while ``global_collision_count`` is non-zero.
+    head = list(full["card_collision_free"].items())[:cap]
+    assert all(free for _, free in head)
+
+    flags = summary["card_collision_free"]
+    assert summary["global_collision_free"] is False
+    assert summary["global_collision_count"] == 1
+    assert len(flags) == cap
+    assert flags["ZLATE-A"] is False
+    assert flags["ZLATE-B"] is False
+    assert sorted(tid for tid, free in flags.items() if not free) == [
+        "ZLATE-A",
+        "ZLATE-B",
+    ]
+    assert summary["sample_bounds"]["fields"]["card_collision_free"] == {
+        "total_count": 60,
+        "returned_count": cap,
+        "truncated": True,
+        "colliding_total_count": 2,
+        "colliding_returned_count": 2,
+        "colliding_omitted_count": 0,
+    }
+
+    # The peer/path maps name the same cards the flags sample reports False.
+    assert summary["card_collision_task_ids"] == {
+        "ZLATE-A": ["ZLATE-B"],
+        "ZLATE-B": ["ZLATE-A"],
+    }
+    assert summary["card_collision_paths"]["ZLATE-A"] == ["src/late_shared.py"]
+
+    # full=true keeps the complete per-card authority unchanged.
+    assert full["global_collision_pairs"] == [["ZLATE-A", "ZLATE-B"]]
+    assert "sample_bounds" not in full
+
+
+def test_summary_collision_sample_bounds_colliding_cards_and_peer_maps():
+    cards = []
+    for idx in range(60):
+        path = f"src/pair_{idx:03d}.py"
+        cards.append(_pending_card(f"P-{idx:03d}-A", path, idx))
+        cards.append(_pending_card(f"P-{idx:03d}-B", path, idx))
+
+    full = task_plan.build_snapshot(cards)
+    summary = task_plan.summarize_task_plan_snapshot(full)
+    cap = summary["sample_bounds"]["max_sample_count"]
+    fields = summary["sample_bounds"]["fields"]
+
+    assert len(full["card_collision_free"]) == 120
+    assert full["global_collision_count"] == 60
+    assert len(full["card_collision_task_ids"]) == 120
+    assert len(full["card_collision_paths"]) == 120
+
+    flags = summary["card_collision_free"]
+    assert summary["global_collision_count"] == 60
+    assert len(flags) == cap
+    # Every slot is spent on a colliding card, and the omitted colliding
+    # remainder is stated rather than implied by the generic truncation flag.
+    assert all(free is False for free in flags.values())
+    assert fields["card_collision_free"] == {
+        "total_count": 120,
+        "returned_count": cap,
+        "truncated": True,
+        "colliding_total_count": 120,
+        "colliding_returned_count": cap,
+        "colliding_omitted_count": 120 - cap,
+    }
+
+    peers = summary["card_collision_task_ids"]
+    paths = summary["card_collision_paths"]
+    assert list(peers) == sorted(flags)
+    assert list(paths) == sorted(flags)
+    assert peers["P-000-A"] == ["P-000-B"]
+    assert paths["P-000-B"] == ["src/pair_000.py"]
+    assert fields["card_collision_task_ids"] == {
+        "total_count": 120,
+        "returned_count": cap,
+        "truncated": True,
+    }
+    assert fields["card_collision_paths"] == fields["card_collision_task_ids"]
+
+    assert len(summary["global_collision_task_ids"]) == cap
+    assert fields["global_collision_task_ids"]["total_count"] == 120
+    assert len(summary["global_collision_pairs"]) == cap
+    assert fields["global_collision_pairs"]["total_count"] == 60
+
+
+def test_summary_bounds_operational_maps_and_keeps_exact_counts(monkeypatch):
+    ops = [f"OPS-{idx:03d}" for idx in range(120)]
+    overlapping = [f"OVL-{idx:03d}" for idx in range(80)]
+    plan = _full_plan()
+    plan.update(
+        {
+            "task_ids": ["DONE", "READY", "BLOCKED"] + ops + overlapping,
+            "lifecycle": {
+                "DONE": "finished",
+                "READY": "pending",
+                "BLOCKED": "blocked",
+                **{task_id: "pending" for task_id in ops + overlapping},
+            },
+            "operational_blockers": {
+                task_id: "processing_without_launch_request" for task_id in ops
+            },
+            "operational_blocked_task_ids": ops,
+            "operational_blocked_count": 120,
+            "explicit_retry_task_ids": ops,
+            "explicit_retry_count": 120,
+            "write_scope_overlaps": {
+                task_id: ["READY"] for task_id in overlapping
+            },
+        }
+    )
+    monkeypatch.setattr(server.core, "task_plan_snapshot", lambda: plan)
+
+    summary = server.aiworkhub_task_plan_snapshot()
+    full = server.aiworkhub_task_plan_snapshot(full=True)
+    cap = summary["sample_bounds"]["max_sample_count"]
+    fields = summary["sample_bounds"]["fields"]
+
+    # Exact aggregates survive the bound.
+    assert summary["operational_blocked_count"] == 120
+    assert summary["explicit_retry_count"] == 120
+
+    assert list(summary["operational_blockers"]) == ops[:cap]
+    assert fields["operational_blockers"] == {
+        "total_count": 120,
+        "returned_count": cap,
+        "truncated": True,
+    }
+    assert summary["operational_blocked_task_ids"] == ops[:cap]
+    assert fields["operational_blocked_task_ids"]["total_count"] == 120
+    assert summary["explicit_retry_task_ids"] == ops[:cap]
+    assert fields["explicit_retry_task_ids"]["total_count"] == 120
+
+    assert list(summary["write_scope_overlaps"]) == overlapping[:cap]
+    assert fields["write_scope_overlaps"] == {
+        "total_count": 80,
+        "returned_count": cap,
+        "truncated": True,
+    }
+
+    # full=true remains the complete, unsampled authority.
+    assert len(full["operational_blockers"]) == 120
+    assert len(full["write_scope_overlaps"]) == 80
+    assert full["operational_blocked_task_ids"] == ops
+    assert "sample_bounds" not in full

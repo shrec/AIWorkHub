@@ -869,12 +869,24 @@ def build_snapshot(cards: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-# Bounded current-state fields the Plan-DAG summary projection forwards
-# verbatim.  The historical DAG (dependencies/dependents/layers/lifecycle/
-# task_ids) is intentionally excluded -- those stay behind ``full=True`` at
-# the MCP boundary.  Collision truth is current-state, not graph history, so
-# it belongs here.  Kept at the pure plan boundary so the summary projection
-# and any future caller share one authoritative list.
+# Canonical bound for every sampled surface of the Plan-DAG summary
+# projection: at most this many IDs or map entries are returned per bounded
+# field.  Exact aggregate counts always travel alongside the sample and
+# ``full=True`` remains the complete, unbounded Plan-DAG authority.
+MAX_SUMMARY_SAMPLE_IDS = 50
+
+# Current-state fields the Plan-DAG summary projection carries over from the
+# full snapshot.  Scalar counts and flags travel verbatim; the ID arrays and
+# per-card maps named in ``sequence_fields``/``mapping_fields`` below are
+# sampled to ``MAX_SUMMARY_SAMPLE_IDS`` entries with exact ``total_count``
+# and ``truncated`` metadata recorded under ``sample_bounds``.  Sampling order
+# is chosen per field so the sample can never look healthier than the exact
+# counts beside it -- see ``_bound_collision_flags``.  The historical
+# DAG (dependencies/dependents/layers/lifecycle/task_ids) is excluded
+# entirely -- those stay behind ``full=True`` at the MCP boundary.  Collision
+# truth is current-state, not graph history, so it belongs here.  Kept at the
+# pure plan boundary so the summary projection and any future caller share
+# one authoritative list.
 PLAN_SUMMARY_FIELDS = (
     "ready",
     "ready_capacity",
@@ -915,13 +927,82 @@ PLAN_SUMMARY_FIELDS = (
 def summarize_task_plan_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
     """Bounded summary projection of a full Plan-DAG snapshot.
 
-    Retains current planning truth -- ready work, live blockers, collision
-    health and malformed/orphaned state -- without replaying the historical
-    DAG (dependencies/dependents/layers/lifecycle/task_ids), which stays
-    behind ``full=True`` at the MCP boundary.  The global and exact per-card
-    collision fields are included because they are bounded current-state
-    facts, not historical graph structure.
+    Retains exact aggregate planning truth (task/actionable/terminal/
+    blocked/ready/collision counts) and exposes current ready, active,
+    operational, dependency and lifecycle blocker state through bounded,
+    deterministically ordered samples.  Historical lifecycle-blocked ID
+    arrays and per-card maps are never replayed unbounded here; their
+    complete authority stays behind ``full=True`` at the MCP boundary.
+    Every bounded surface reports ``total_count`` and truncation metadata
+    through ``sample_bounds`` so sampling is always distinguishable from
+    the exact counts carried alongside it, and a bounded sample never
+    reports a healthier state than the aggregate counts beside it: the
+    dense ``card_collision_free`` map is sampled colliding-cards-first so a
+    late colliding card cannot hide behind older collision-free rows.
     """
+
+    def _sample_meta(total: int) -> dict[str, Any]:
+        return {
+            "total_count": total,
+            "returned_count": min(total, MAX_SUMMARY_SAMPLE_IDS),
+            "truncated": total > MAX_SUMMARY_SAMPLE_IDS,
+        }
+
+    def _bound_sequence(value: Any) -> tuple[Any, dict[str, Any] | None]:
+        if not isinstance(value, (list, tuple)):
+            return value, None
+        return list(value[:MAX_SUMMARY_SAMPLE_IDS]), _sample_meta(len(value))
+
+    def _bound_mapping(value: Any) -> tuple[Any, dict[str, Any] | None]:
+        if not isinstance(value, Mapping):
+            return value, None
+        items = list(value.items())
+        return dict(items[:MAX_SUMMARY_SAMPLE_IDS]), _sample_meta(len(items))
+
+    def _bound_by_sorted_key(value: Any) -> tuple[Any, dict[str, Any] | None]:
+        """Bound a sparse per-card map on sorted task id.
+
+        ``card_collision_task_ids``/``card_collision_paths`` are keyed only by
+        the cards that actually collide, so ordering the sample by task id
+        makes it name exactly the cards reported ``False`` by the bounded
+        ``card_collision_free`` below instead of depending on the order in
+        which collision records happened to be discovered.
+        """
+
+        if not isinstance(value, Mapping):
+            return value, None
+        keys = sorted(value, key=str)
+        bounded = {key: value[key] for key in keys[:MAX_SUMMARY_SAMPLE_IDS]}
+        return bounded, _sample_meta(len(keys))
+
+    def _bound_collision_flags(value: Any) -> tuple[Any, dict[str, Any] | None]:
+        """Bound ``card_collision_free`` without hiding a colliding card.
+
+        Unlike every other bounded map here this one is dense: the snapshot
+        seeds one entry per known task and only flips the few cards sharing a
+        write scope to ``False``.  A plain head sample therefore returns an
+        all-``True`` page whenever the colliding cards are newer than the
+        sample budget, which reads as "collision free" while
+        ``global_collision_count`` is non-zero.  Retain every ``False`` entry
+        first in sorted task-id order, spend the remaining budget on ``True``
+        entries, and report how many colliding entries were still omitted so a
+        saturated sample is never mistaken for the complete collision set.
+        """
+
+        if not isinstance(value, Mapping):
+            return value, None
+        colliding = sorted(str(tid) for tid, free in value.items() if not free)
+        collision_free = sorted(str(tid) for tid, free in value.items() if free)
+        kept = colliding[:MAX_SUMMARY_SAMPLE_IDS]
+        filler = collision_free[: MAX_SUMMARY_SAMPLE_IDS - len(kept)]
+        bounded: dict[str, Any] = {tid: False for tid in kept}
+        bounded.update({tid: True for tid in filler})
+        meta = _sample_meta(len(value))
+        meta["colliding_total_count"] = len(colliding)
+        meta["colliding_returned_count"] = len(kept)
+        meta["colliding_omitted_count"] = len(colliding) - len(kept)
+        return bounded, meta
+
     lifecycle = snapshot.get("lifecycle")
     lifecycle_map = dict(lifecycle) if isinstance(lifecycle, Mapping) else {}
     actionable_lifecycle = {
@@ -942,12 +1023,67 @@ def summarize_task_plan_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
         "task_count": task_count,
         "actionable_task_count": len(actionable_lifecycle),
         "terminal_task_count": terminal_task_count,
-        "actionable_lifecycle": actionable_lifecycle,
         "layer_count": len(layers) if isinstance(layers, list) else 0,
     }
+    ready_ids = snapshot.get("ready")
+    if isinstance(ready_ids, list):
+        result["ready_count"] = len(ready_ids)
     for field in PLAN_SUMMARY_FIELDS:
         if field in snapshot:
             result[field] = snapshot[field]
+    sample_bounds: dict[str, dict[str, Any]] = {}
+    sequence_fields = (
+        "ready",
+        "blocked_task_ids",
+        "dependency_blocked_task_ids",
+        "lifecycle_blocked_task_ids",
+        "operational_blocked_task_ids",
+        "explicit_retry_task_ids",
+        "orphaned_processing",
+        "invalid_depends_on",
+        "global_collision_paths",
+        "global_collision_task_ids",
+        "global_collision_pairs",
+        "critical_path",
+        "cycle_nodes",
+    )
+    # ``actionable_lifecycle`` is bounded explicitly below, straight from the
+    # unbounded source map, so its ``total_count`` stays exact; re-bounding the
+    # already-sampled copy here would report the sample size as the total.
+    #
+    # ``operational_blockers``/``write_scope_overlaps`` are sparse -- only a
+    # card that actually carries a blocker or an overlap gets an entry -- so a
+    # head sample can drop a problem card but can never hide one behind healthy
+    # rows.  ``card_collision_free`` is the opposite: it is dense over every
+    # known task and mostly ``True``, so it needs the collision-first bound.
+    # The sparse peer/path maps sort on task id so their sample names the same
+    # cards as the colliding head of ``card_collision_free``.
+    mapping_fields = (
+        ("operational_blockers", _bound_mapping),
+        ("write_scope_overlaps", _bound_mapping),
+        ("card_collision_free", _bound_collision_flags),
+        ("card_collision_task_ids", _bound_by_sorted_key),
+        ("card_collision_paths", _bound_by_sorted_key),
+    )
+    lifecycle_items = list(actionable_lifecycle.items())
+    result["actionable_lifecycle"] = dict(lifecycle_items[:MAX_SUMMARY_SAMPLE_IDS])
+    sample_bounds["actionable_lifecycle"] = _sample_meta(len(lifecycle_items))
+    for field in sequence_fields:
+        if field in result:
+            bounded, meta = _bound_sequence(result[field])
+            result[field] = bounded
+            if meta is not None:
+                sample_bounds[field] = meta
+    for field, bound_mapping_field in mapping_fields:
+        if field in result:
+            bounded, meta = bound_mapping_field(result[field])
+            result[field] = bounded
+            if meta is not None:
+                sample_bounds[field] = meta
+    result["sample_bounds"] = {
+        "max_sample_count": MAX_SUMMARY_SAMPLE_IDS,
+        "fields": sample_bounds,
+    }
     result["omitted_fields"] = [
         "dependencies",
         "dependents",
