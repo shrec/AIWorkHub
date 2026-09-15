@@ -10000,7 +10000,7 @@ def _outer_metadata_broker_brokered_chmod_syscalls(
     other outcome (no scratch, a plain deny-only ancestor, no filter at all, any
     unexpected error) returns the empty set and keeps the full deny list.
     """
-    if exec_scratch is None or os.name == "nt" or not sys.platform.startswith("linux"):
+    if exec_scratch is None or not _platform_io.is_linux():
         return frozenset()
     try:
         scratch_fd = os.open(
@@ -10326,7 +10326,7 @@ def _seccomp_notify_runtime_supported() -> bool:
 
     if _SECCOMP_NOTIFY_RUNTIME_SUPPORTED is not None:
         return _SECCOMP_NOTIFY_RUNTIME_SUPPORTED
-    if os.name == "nt" or not sys.platform.startswith("linux"):
+    if not _platform_io.is_linux():
         _SECCOMP_NOTIFY_RUNTIME_SUPPORTED = False
         return False
 

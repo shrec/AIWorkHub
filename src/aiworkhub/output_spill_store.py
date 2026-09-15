@@ -38,6 +38,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .platform_io import is_windows
+
 _SPILL_SUBDIR = Path(".aiworkhub") / "spill"
 _LOCATOR_PREFIX = "aiworkhub-spill-sha256:"
 _MARKER_SCHEMA_ID = "aiworkhub.output_spill_store.measured_pruning_marker.v1"
@@ -100,7 +102,7 @@ def _fsync_dir(path: Path) -> None:
     directory-entry crash window is platform-dependent here.
     """
 
-    if os.name == "nt":
+    if is_windows():
         return
     fd = os.open(str(path), os.O_RDONLY)
     try:
