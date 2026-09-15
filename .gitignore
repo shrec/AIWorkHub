@@ -54,6 +54,7 @@ node_modules/
 # Local manager instructions and generated design drafts.
 /AGENTS.md
 /kilo.json
+/.kilo/
 /docs/assets/aiworkhub-architecture.png
 /docs/assets/aiworkhub-architecture.svg
 /docs/launch/AIWORKHUB_VIDEO_SCRIPT_3MIN_KA.md
