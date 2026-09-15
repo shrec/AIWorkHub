@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -528,3 +529,1002 @@ def test_preflight_carries_a_reduced_lock_guarantee_instead_of_flattening_it(
     assert report["reconciler"]["reduced_guarantees"] == [
         "lock_parent_not_pinned_to_a_descriptor"
     ]
+
+
+def _windows_native_row(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    sandbox_error: str,
+    sandbox_backend: str = "",
+    installed: bool = True,
+    name: str = "row",
+) -> dict:
+    """One native CLI row measured on a fake Windows host."""
+
+    root = _initialized_root(tmp_path / name)
+    monkeypatch.setattr(repo_policy, "_is_windows_host", lambda: True)
+    monkeypatch.setattr(
+        repo_policy.runtime_adapters,
+        "resolve_executable",
+        lambda adapter_id: runtime_adapters.ExecutableResolution(
+            adapter_id,
+            "claude" if installed else "",
+            installed,
+            "" if installed else "not_found_on_path",
+        ),
+    )
+    monkeypatch.setattr(
+        repo_policy.claude_auth,
+        "auth_status",
+        lambda executable=None: {
+            "launchable": True,
+            "authenticated": True,
+            "blocker_reason": "",
+        },
+    )
+    return repo_policy._provider_status(
+        root,
+        "claude_cli",
+        repo_policy.load_policy(root),
+        sandbox_backend,
+        sandbox_error,
+        model_policy={"providers": {}, "adapters": {}, "models": {}},
+    )
+
+
+def test_windows_native_route_names_the_measured_appcontainer_cause(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """NF-2026-00876: the legacy blocker text alone was never a diagnosis.
+
+    ``select_sandbox_backend`` measured which of three things refused the
+    host and encoded it in its bounded error; the row threw that away and
+    published one constant, so every Windows refusal read identically.
+    """
+
+    row = _windows_native_row(
+        monkeypatch,
+        tmp_path,
+        sandbox_error=(
+            "windows_appcontainer_sandbox_unavailable:win32_appcontainer_unavailable"
+        ),
+    )
+
+    # Still fail-closed: the diagnosis is additional, never a relaxation.
+    assert row["launchable"] is False
+    assert row["platform_excluded"] is True
+    assert row["status"] == "sandbox_unavailable"
+    assert row["sandbox_backend"] == ""
+    # The compatibility blocker code keeps its place AND gets its own field...
+    assert row["reason"] == runtime_adapters.WINDOWS_NATIVE_CLI_REQUIRES_APPCONTAINER
+    assert (
+        row["sandbox_blocker_code"]
+        == runtime_adapters.WINDOWS_NATIVE_CLI_REQUIRES_APPCONTAINER
+    )
+    # ...and the exact measured cause now travels beside it.
+    assert (
+        row["sandbox_unavailable_cause"]
+        == repo_policy.SANDBOX_CAUSE_HOST_APPCONTAINER_UNAVAILABLE
+    )
+    assert row["sandbox_unavailable_detail"] == (
+        "windows_appcontainer_sandbox_unavailable:win32_appcontainer_unavailable"
+    )
+
+
+def test_unwired_execution_path_is_distinct_from_host_and_binary_failures(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Three different repairs, so they must not share one indistinguishable row."""
+
+    prefix = repo_policy.WINDOWS_APPCONTAINER_SELECTION_PREFIX
+    unwired = _windows_native_row(
+        monkeypatch,
+        tmp_path,
+        sandbox_error=f"{prefix}:{repo_policy.SANDBOX_CAUSE_EXECUTION_PATH_NOT_WIRED}",
+        name="unwired",
+    )
+    hostless = _windows_native_row(
+        monkeypatch,
+        tmp_path,
+        sandbox_error=(
+            f"{prefix}:{repo_policy.SANDBOX_CAUSE_HOST_APPCONTAINER_UNAVAILABLE}"
+        ),
+        name="hostless",
+    )
+    missing_binary = _windows_native_row(
+        monkeypatch,
+        tmp_path,
+        sandbox_error=f"{prefix}:{repo_policy.SANDBOX_CAUSE_EXECUTION_PATH_NOT_WIRED}",
+        installed=False,
+        name="missing",
+    )
+
+    assert (
+        unwired["sandbox_unavailable_cause"]
+        == repo_policy.SANDBOX_CAUSE_EXECUTION_PATH_NOT_WIRED
+    )
+    assert (
+        hostless["sandbox_unavailable_cause"]
+        == repo_policy.SANDBOX_CAUSE_HOST_APPCONTAINER_UNAVAILABLE
+    )
+    assert unwired["sandbox_unavailable_cause"] != hostless["sandbox_unavailable_cause"]
+    # One stable blocker code across all three -- the code is the compatibility
+    # surface, the cause is the diagnosis.
+    assert {
+        row["sandbox_blocker_code"] for row in (unwired, hostless, missing_binary)
+    } == {runtime_adapters.WINDOWS_NATIVE_CLI_REQUIRES_APPCONTAINER}
+    # And a missing binary stays a separate, still-visible fact.
+    assert unwired["installed"] is True
+    assert missing_binary["installed"] is False
+    assert (
+        missing_binary["sandbox_unavailable_cause"]
+        == repo_policy.SANDBOX_CAUSE_EXECUTION_PATH_NOT_WIRED
+    )
+
+
+def test_a_native_route_never_republishes_a_host_path_from_selection(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The selection error is an exception string; other branches carry paths."""
+
+    row = _windows_native_row(
+        monkeypatch,
+        tmp_path,
+        sandbox_error="bubblewrap_unusable:/usr/bin/bwrap",
+    )
+
+    # The host path goes; the family token this build DOES name stays. Dropping
+    # both told a Windows operator less than a POSIX one about the same error.
+    assert (
+        row["sandbox_unavailable_cause"]
+        == repo_policy.SANDBOX_FAMILY_BUBBLEWRAP_UNUSABLE
+    )
+    assert (
+        row["sandbox_unavailable_detail"]
+        == repo_policy.SANDBOX_FAMILY_BUBBLEWRAP_UNUSABLE
+    )
+    assert "/usr/bin/bwrap" not in json.dumps(row, sort_keys=True)
+    # A refusal that named no cause at all says so rather than inventing one,
+    # and it carries no detail: there is no measurement to describe, so the
+    # field is pinned empty rather than echoing the prefix back as a diagnosis.
+    silent = _windows_native_row(
+        monkeypatch,
+        tmp_path,
+        sandbox_error=repo_policy.WINDOWS_APPCONTAINER_SELECTION_PREFIX,
+        name="silent",
+    )
+    assert silent["sandbox_unavailable_cause"] == repo_policy.SANDBOX_CAUSE_UNREPORTED
+    assert silent["sandbox_unavailable_detail"] == ""
+    # A prefix that named only whitespace after its colon is the same fact and
+    # must not be told apart from the silent one by its detail.
+    blank = _windows_native_row(
+        monkeypatch,
+        tmp_path,
+        sandbox_error=f"{repo_policy.WINDOWS_APPCONTAINER_SELECTION_PREFIX}:   ",
+        name="blank",
+    )
+    assert blank["sandbox_unavailable_cause"] == repo_policy.SANDBOX_CAUSE_UNREPORTED
+    assert blank["sandbox_unavailable_detail"] == ""
+
+
+def test_a_well_shaped_but_unknown_selection_cause_is_never_published(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Closed vocabulary means member-of-set, never looks-like-a-member.
+
+    Admitting any bare lowercase token would publish whatever future
+    ``select_sandbox_backend`` branches learn to emit, including causes
+    carrying facts this build never agreed to expose, so membership is the
+    only gate and an unknown token is refused with no detail at all.
+    """
+
+    unknown = "win32_token_handle_leaked_by_broker"
+    assert unknown not in repo_policy.WINDOWS_APPCONTAINER_SELECTION_CAUSES
+    row = _windows_native_row(
+        monkeypatch,
+        tmp_path,
+        sandbox_error=f"{repo_policy.WINDOWS_APPCONTAINER_SELECTION_PREFIX}:{unknown}",
+    )
+
+    assert row["sandbox_unavailable_cause"] == repo_policy.SANDBOX_CAUSE_UNRECOGNIZED
+    assert row["sandbox_unavailable_detail"] == ""
+    assert unknown not in json.dumps(row, sort_keys=True)
+    # And refusing to diagnose it never relaxes the refusal itself.
+    assert row["launchable"] is False
+    assert row["platform_excluded"] is True
+    assert (
+        row["sandbox_blocker_code"]
+        == runtime_adapters.WINDOWS_NATIVE_CLI_REQUIRES_APPCONTAINER
+    )
+
+
+def test_a_capable_appcontainer_host_admits_without_bypassing_other_checks(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The backend answers one question; it must not answer the others."""
+
+    root = _initialized_root(tmp_path)
+    monkeypatch.setattr(repo_policy, "_is_windows_host", lambda: True)
+    monkeypatch.setattr(
+        repo_policy.claude_auth,
+        "auth_status",
+        lambda executable=None: {
+            "launchable": True,
+            "authenticated": True,
+            "blocker_reason": "",
+        },
+    )
+    monkeypatch.setattr(
+        repo_policy.runtime_adapters,
+        "resolve_executable",
+        lambda adapter_id: runtime_adapters.ExecutableResolution(
+            adapter_id, "claude", True, ""
+        ),
+    )
+    policy = repo_policy.load_policy(root)
+    permissive = {"providers": {}, "adapters": {}, "models": {}}
+
+    admitted = repo_policy._provider_status(
+        root,
+        "claude_cli",
+        policy,
+        repo_policy.WINDOWS_APPCONTAINER_BACKEND,
+        "",
+        model_policy=permissive,
+    )
+    assert admitted["launchable"] is True
+    assert admitted["platform_excluded"] is False
+    assert admitted["coverage_required"] is True
+    assert admitted["sandbox_backend"] == repo_policy.WINDOWS_APPCONTAINER_BACKEND
+    assert admitted["sandbox_blocker_code"] == ""
+    assert admitted["sandbox_unavailable_cause"] == ""
+
+    provider, _adapter = repo_policy.model_settings.policy_identity_for_adapter(
+        "claude_cli"
+    )
+    model_policy_denied = repo_policy._provider_status(
+        root,
+        "claude_cli",
+        policy,
+        repo_policy.WINDOWS_APPCONTAINER_BACKEND,
+        "",
+        model_policy={"providers": {provider: False}, "adapters": {}, "models": {}},
+    )
+    assert model_policy_denied["launchable"] is False
+    assert model_policy_denied["status"] == "repository_model_policy_disabled"
+
+    monkeypatch.setattr(
+        repo_policy.runtime_adapters,
+        "resolve_executable",
+        lambda adapter_id: runtime_adapters.ExecutableResolution(
+            adapter_id, "", False, "not_found_on_path"
+        ),
+    )
+    uninstalled = repo_policy._provider_status(
+        root,
+        "claude_cli",
+        policy,
+        repo_policy.WINDOWS_APPCONTAINER_BACKEND,
+        "",
+        model_policy=permissive,
+    )
+    assert uninstalled["installed"] is False
+    assert uninstalled["launchable"] is False
+
+
+def _preflight_on_host(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    select_backend: Callable[[], str],
+    windows: bool = False,
+    name: str = "report",
+) -> dict:
+    """A whole preflight report built on one measured host.
+
+    ``select_backend`` stands in for ``select_sandbox_backend``: it either
+    returns the backend selection actually settled on or raises the bounded
+    refusal selection would have raised.  Both outcomes have to be reachable
+    from one fixture, because "selection succeeded with the wrong backend" and
+    "selection refused" are exactly the two facts the surfaces must not blur.
+    """
+
+    root = _initialized_root(tmp_path / name)
+    monkeypatch.setattr(repo_policy, "_is_windows_host", lambda: windows)
+    monkeypatch.setattr(
+        repo_policy.task_store,
+        "storage_readiness",
+        lambda _root: SimpleNamespace(ready=True, reason="ready", repo_id="repo_test"),
+    )
+    monkeypatch.setattr(
+        repo_policy.source_graph_daemon,
+        "daemon_health",
+        lambda _root: {
+            "ok": True,
+            "status": "ready",
+            "running": True,
+            "registered": True,
+            "readable_generation": True,
+            "last_success_at": "2026-09-14T10:00:00+00:00",
+            "stale_reason": "",
+            "build_revision": "aiworkhub.source_graph.semantic.v6",
+            "files_seen": 4,
+        },
+    )
+    monkeypatch.setattr(
+        repo_policy.task_store,
+        "callback_bridge_health",
+        lambda _root: {"ok": True, "backlog_count": 0, "retry_count": 0},
+    )
+    monkeypatch.setattr(
+        repo_policy.worker_workspace, "select_sandbox_backend", select_backend
+    )
+    monkeypatch.setattr(
+        repo_policy.runtime_adapters,
+        "resolve_executable",
+        lambda adapter_id: runtime_adapters.ExecutableResolution(
+            adapter_id, "claude", True, ""
+        ),
+    )
+    monkeypatch.setattr(
+        repo_policy.claude_auth,
+        "auth_status",
+        lambda executable=None: {
+            "launchable": True,
+            "authenticated": True,
+            "blocker_reason": "",
+        },
+    )
+    return repo_policy.build_preflight(root, adapter_id="claude_cli")
+
+
+def _preflight_after_selection_refused(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    sandbox_error: str,
+    windows: bool = False,
+    name: str = "report",
+) -> dict:
+    """A whole preflight report built on a host whose selection refused."""
+
+    def _refuse() -> str:
+        raise repo_policy.worker_workspace.WorkspaceError(sandbox_error)
+
+    return _preflight_on_host(
+        monkeypatch,
+        tmp_path,
+        select_backend=_refuse,
+        windows=windows,
+        name=name,
+    )
+
+
+def test_global_sandbox_block_never_republishes_selection_host_detail(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """NF-2026-00876: the per-route cause was vouched, the global block was not.
+
+    ``select_sandbox_backend`` puts a host path after ``bubblewrap_unusable``
+    and an environment value after ``invalid_sandbox_backend``, and the report
+    handed both straight to the dashboard through ``native_cli_reason``. The
+    family is the whole publishable fact.
+    """
+
+    pathful = _preflight_after_selection_refused(
+        monkeypatch,
+        tmp_path,
+        sandbox_error="bubblewrap_unusable:/usr/bin/bwrap",
+        name="pathful",
+    )
+    block = pathful["sandbox"]
+    assert block["enforceable"] is False
+    assert block["native_cli_reason"] == repo_policy.SANDBOX_FAMILY_BUBBLEWRAP_UNUSABLE
+    # The selected route feeds this field, so the route row is bounded too.
+    assert block["reason"] == repo_policy.SANDBOX_FAMILY_BUBBLEWRAP_UNUSABLE
+    assert "/usr/bin/bwrap" not in json.dumps(pathful, sort_keys=True, default=str)
+
+    leaked_env_value = "s3cret-backend-name-from-the-environment"
+    envful = _preflight_after_selection_refused(
+        monkeypatch,
+        tmp_path,
+        sandbox_error=f"{repo_policy.SANDBOX_FAMILY_INVALID_BACKEND}:{leaked_env_value}",
+        name="envful",
+    )
+    assert (
+        envful["sandbox"]["native_cli_reason"]
+        == repo_policy.SANDBOX_FAMILY_INVALID_BACKEND
+    )
+    assert leaked_env_value not in json.dumps(envful, sort_keys=True, default=str)
+
+    # A family this build does not name is refused outright rather than
+    # published on the strength of looking like a token.
+    unknown = _preflight_after_selection_refused(
+        monkeypatch,
+        tmp_path,
+        sandbox_error="future_sandbox_probe_failed:C:\\Users\\shrek\\key.pem",
+        name="unknown",
+    )
+    assert (
+        unknown["sandbox"]["native_cli_reason"] == repo_policy.SANDBOX_CAUSE_UNRECOGNIZED
+    )
+    assert "key.pem" not in json.dumps(unknown, sort_keys=True, default=str)
+
+
+def test_global_and_per_route_windows_causes_are_the_same_measurement(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Two surfaces, one answer -- and the vouched cause still travels."""
+
+    report = _preflight_after_selection_refused(
+        monkeypatch,
+        tmp_path,
+        sandbox_error=(
+            f"{repo_policy.WINDOWS_APPCONTAINER_SELECTION_PREFIX}"
+            f":{repo_policy.SANDBOX_CAUSE_HOST_APPCONTAINER_UNAVAILABLE}"
+        ),
+        windows=True,
+        name="windows",
+    )
+    block = report["sandbox"]
+    row = {item["adapter_id"]: item for item in report["providers"]}["claude_cli"]
+
+    assert (
+        block["native_cli_cause"]
+        == repo_policy.SANDBOX_CAUSE_HOST_APPCONTAINER_UNAVAILABLE
+    )
+    assert block["native_cli_cause"] == row["sandbox_unavailable_cause"]
+    assert block["native_cli_reason"] == row["sandbox_unavailable_detail"]
+    assert row["launchable"] is False
+    assert block["reason"] == runtime_adapters.WINDOWS_NATIVE_CLI_REQUIRES_APPCONTAINER
+
+
+def test_the_publication_guard_scrubs_any_future_unvouched_sandbox_field() -> None:
+    """The guard, not a per-field derivation, is what closed this defect.
+
+    The first repair vouched the per-route cause and its own tests passed while
+    one surviving projection of the raw error still reached the dashboard. The
+    boundary check exists so the next field wired to selection text is scrubbed
+    rather than shipped.
+    """
+
+    scrubbed = repo_policy._vouched_sandbox_block(
+        {
+            "native_cli_reason": "bubblewrap_unusable:/usr/bin/bwrap",
+            "native_cli_cause": "win32_token_handle_leaked_by_broker",
+            "backend": "C:\\Users\\shrek\\AppData\\bwrap.exe",
+            "enforceable": False,
+            "route_aware": True,
+        }
+    )
+
+    assert scrubbed["native_cli_reason"] == repo_policy.SANDBOX_CAUSE_UNRECOGNIZED
+    assert scrubbed["native_cli_cause"] == repo_policy.SANDBOX_CAUSE_UNRECOGNIZED
+    # An identifier field is EMPTIED, not handed a reason token: that token
+    # names no backend, so it was no more resolvable than the path it replaced.
+    assert scrubbed["backend"] == ""
+    # Non-string facts are untouched: the guard bounds text, not verdicts.
+    assert scrubbed["enforceable"] is False
+    assert scrubbed["route_aware"] is True
+    # Every string it does publish is a declared member, never a shape match.
+    for field in ("native_cli_reason", "native_cli_cause"):
+        assert scrubbed[field] in repo_policy.SANDBOX_PUBLISHABLE_SELECTION_REASONS
+
+
+def test_the_publication_guard_refuses_an_unknown_separator_free_field() -> None:
+    """Scrubbing on the separator alone left the real leak shape publishable.
+
+    ``select_sandbox_backend`` raises ``invalid_sandbox_backend:<env value>``,
+    and an environment value need not contain a path separator to be a secret.
+    The guard therefore refuses by default: a key it does not recognise as a
+    backend/adapter identifier must carry a DECLARED publishable reason or be
+    scrubbed, so the next sandbox field added to the block cannot inherit a
+    bypass simply by being new.
+    """
+
+    leaked = "invalid_sandbox_backend:s3cret-env-value"
+    assert "/" not in leaked and "\\" not in leaked
+    scrubbed = repo_policy._vouched_sandbox_block(
+        {
+            "native_cli_detail": leaked,
+            "some_future_sandbox_note": "seccomp_probe_returned_EPERM",
+            "native_cli_reason": repo_policy.SANDBOX_FAMILY_BUBBLEWRAP_UNUSABLE,
+            "backend": repo_policy.WINDOWS_APPCONTAINER_BACKEND,
+            "selected_adapter": "claude_cli",
+            "enforceable": False,
+        }
+    )
+
+    assert scrubbed["native_cli_detail"] == repo_policy.SANDBOX_CAUSE_UNRECOGNIZED
+    assert (
+        scrubbed["some_future_sandbox_note"] == repo_policy.SANDBOX_CAUSE_UNRECOGNIZED
+    )
+    assert "s3cret-env-value" not in json.dumps(scrubbed, sort_keys=True)
+    # Refusing by default must not start scrubbing the identifier fields the
+    # block has always published, nor the reasons it declared publishable.
+    assert scrubbed["native_cli_reason"] == repo_policy.SANDBOX_FAMILY_BUBBLEWRAP_UNUSABLE
+    assert scrubbed["backend"] == repo_policy.WINDOWS_APPCONTAINER_BACKEND
+    assert scrubbed["selected_adapter"] == "claude_cli"
+    assert scrubbed["enforceable"] is False
+
+
+def _posix_native_row(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    sandbox_error: str,
+    name: str = "posix",
+) -> dict:
+    """One native CLI row measured on a host that is not Windows."""
+
+    root = _initialized_root(tmp_path / name)
+    monkeypatch.setattr(repo_policy, "_is_windows_host", lambda: False)
+    monkeypatch.setattr(
+        repo_policy.runtime_adapters,
+        "resolve_executable",
+        lambda adapter_id: runtime_adapters.ExecutableResolution(
+            adapter_id, "claude", True, ""
+        ),
+    )
+    monkeypatch.setattr(
+        repo_policy.claude_auth,
+        "auth_status",
+        lambda executable=None: {
+            "launchable": True,
+            "authenticated": True,
+            "blocker_reason": "",
+        },
+    )
+    return repo_policy._provider_status(
+        root,
+        "claude_cli",
+        repo_policy.load_policy(root),
+        "",
+        sandbox_error,
+        model_policy={"providers": {}, "adapters": {}, "models": {}},
+    )
+
+
+def test_a_posix_sandbox_blocked_route_states_code_cause_and_detail(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A blocker that exists only in ``status`` is not a published blocker.
+
+    Windows rows gained a code, a cause and a detail; every other host kept a
+    row whose status said ``sandbox_unavailable`` beside three empty fields,
+    so a caller matching on ``sandbox_blocker_code`` could not tell a Linux
+    sandbox refusal from a route with no sandbox blocker at all.
+    """
+
+    pathful = _posix_native_row(
+        monkeypatch,
+        tmp_path,
+        sandbox_error="bubblewrap_unusable:/usr/bin/bwrap",
+        name="pathful",
+    )
+
+    assert pathful["launchable"] is False
+    assert pathful["status"] == repo_policy.SANDBOX_STATUS_UNAVAILABLE
+    # Not a platform exclusion: this host COULD run the route, and the missing
+    # sandbox is the only thing standing in the way.
+    assert pathful["platform_excluded"] is False
+    assert (
+        pathful["sandbox_blocker_code"]
+        == repo_policy.SANDBOX_BLOCKER_ENFORCEABLE_SANDBOX_UNAVAILABLE
+    )
+    assert (
+        pathful["sandbox_unavailable_cause"]
+        == repo_policy.SANDBOX_FAMILY_BUBBLEWRAP_UNUSABLE
+    )
+    assert (
+        pathful["sandbox_unavailable_detail"]
+        == repo_policy.SANDBOX_FAMILY_BUBBLEWRAP_UNUSABLE
+    )
+    assert "/usr/bin/bwrap" not in json.dumps(pathful, sort_keys=True)
+
+    # Silence is still a stated fact rather than an empty field.
+    silent = _posix_native_row(
+        monkeypatch, tmp_path, sandbox_error="", name="silent"
+    )
+    assert (
+        silent["sandbox_blocker_code"]
+        == repo_policy.SANDBOX_BLOCKER_ENFORCEABLE_SANDBOX_UNAVAILABLE
+    )
+    assert silent["sandbox_unavailable_cause"] == repo_policy.SANDBOX_CAUSE_UNREPORTED
+    assert silent["sandbox_unavailable_detail"] == repo_policy.SANDBOX_CAUSE_UNREPORTED
+    for row in (pathful, silent):
+        for field in ("sandbox_unavailable_cause", "sandbox_unavailable_detail"):
+            assert row[field] in repo_policy.SANDBOX_PUBLISHABLE_SELECTION_REASONS
+
+
+def test_the_closed_secure_sandbox_probe_vocabulary_is_not_collapsed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A kernel without Landlock is a different repair from a host without seccomp.
+
+    ``secure_sandbox_unavailable`` is the one family whose trailing token comes
+    from a closed probe vocabulary rather than from the host, so reducing it to
+    the family threw away the only actionable fact while the two open families
+    kept theirs reduced on purpose.
+    """
+
+    landlock = _posix_native_row(
+        monkeypatch,
+        tmp_path,
+        sandbox_error="secure_sandbox_unavailable:bubblewrap_unusable:landlock_unsupported",
+        name="landlock",
+    )
+    seccomp = _posix_native_row(
+        monkeypatch,
+        tmp_path,
+        sandbox_error="secure_sandbox_unavailable:bubblewrap_unusable:seccomp_unavailable",
+        name="seccomp",
+    )
+
+    assert (
+        landlock["sandbox_unavailable_cause"]
+        == repo_policy.SANDBOX_CAUSE_LANDLOCK_UNSUPPORTED
+    )
+    assert landlock["sandbox_unavailable_detail"] == (
+        "secure_sandbox_unavailable:bubblewrap_unusable:landlock_unsupported"
+    )
+    assert (
+        seccomp["sandbox_unavailable_cause"]
+        == repo_policy.SANDBOX_CAUSE_SECCOMP_UNAVAILABLE
+    )
+    assert (
+        landlock["sandbox_unavailable_cause"] != seccomp["sandbox_unavailable_cause"]
+    )
+    for row in (landlock, seccomp):
+        assert (
+            row["sandbox_unavailable_detail"]
+            in repo_policy.SANDBOX_PUBLISHABLE_SELECTION_REASONS
+        )
+
+    # Membership, never shape: an unknown probe token after the same family is
+    # host detail and collapses back to the family with nothing carried over.
+    probe_path = _posix_native_row(
+        monkeypatch,
+        tmp_path,
+        sandbox_error="secure_sandbox_unavailable:bubblewrap_unusable:/tmp/probe.log",
+        name="probe",
+    )
+    assert (
+        probe_path["sandbox_unavailable_cause"]
+        == repo_policy.SANDBOX_FAMILY_SECURE_SANDBOX_UNAVAILABLE
+    )
+    assert "/tmp/probe.log" not in json.dumps(probe_path, sort_keys=True)
+
+
+def test_posix_preflight_and_its_summary_agree_with_the_route_row(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """One measurement, three surfaces: row, global block and summary."""
+
+    report = _preflight_after_selection_refused(
+        monkeypatch,
+        tmp_path,
+        sandbox_error=(
+            "secure_sandbox_unavailable:bubblewrap_unusable:landlock_unsupported"
+        ),
+        name="posix_report",
+    )
+    row = {item["adapter_id"]: item for item in report["providers"]}["claude_cli"]
+    block = report["sandbox"]
+    projected = {
+        item["adapter_id"]: item
+        for item in report["provider_summary"]["unavailable_routes"]
+    }["claude_cli"]
+
+    assert row["status"] == repo_policy.SANDBOX_STATUS_UNAVAILABLE
+    assert block["native_cli_cause"] == row["sandbox_unavailable_cause"]
+    assert block["native_cli_reason"] == row["sandbox_unavailable_detail"]
+    assert block["reason"] == row["reason"]
+    assert projected["blocker_code"] == row["sandbox_blocker_code"]
+    assert projected["cause"] == row["sandbox_unavailable_cause"]
+    assert projected["detail"] == row["sandbox_unavailable_detail"]
+    for field in ("blocker_code", "cause", "detail"):
+        assert projected[field]
+
+
+def test_a_credential_blocker_is_never_published_as_a_sandbox_reason(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The sandbox block answers one question and must not borrow another's answer.
+
+    The block took the selected row's reason whenever that row was not
+    launchable, so a credential blocker landed on a surface whose whole
+    vocabulary is sandbox selection -- where the publication guard can only
+    refuse it as an unrecognised cause.
+    """
+
+    root = _initialized_root(tmp_path / "credential")
+    monkeypatch.setattr(repo_policy, "_is_windows_host", lambda: False)
+    monkeypatch.setattr(
+        repo_policy.task_store,
+        "storage_readiness",
+        lambda _root: SimpleNamespace(ready=True, reason="ready", repo_id="repo_test"),
+    )
+    monkeypatch.setattr(
+        repo_policy.task_store,
+        "callback_bridge_health",
+        lambda _root: {"ok": True, "backlog_count": 0, "retry_count": 0},
+    )
+    monkeypatch.setattr(
+        repo_policy.source_graph_daemon,
+        "daemon_health",
+        lambda _root: {
+            "ok": True,
+            "status": "ready",
+            "running": True,
+            "registered": True,
+            "readable_generation": True,
+            "last_success_at": "2026-09-14T10:00:00+00:00",
+            "stale_reason": "",
+            "build_revision": "aiworkhub.source_graph.semantic.v6",
+            "files_seen": 4,
+        },
+    )
+    monkeypatch.setattr(
+        repo_policy.worker_workspace, "select_sandbox_backend", lambda: "bubblewrap"
+    )
+    monkeypatch.setattr(
+        repo_policy.runtime_adapters,
+        "resolve_executable",
+        lambda adapter_id: runtime_adapters.ExecutableResolution(
+            adapter_id, "claude", True, ""
+        ),
+    )
+    monkeypatch.setattr(
+        repo_policy.claude_auth,
+        "auth_status",
+        lambda executable=None: {
+            "launchable": False,
+            "authenticated": False,
+            "blocker_reason": "subscription_credential_absent",
+        },
+    )
+
+    report = repo_policy.build_preflight(root, adapter_id="claude_cli")
+    row = {item["adapter_id"]: item for item in report["providers"]}["claude_cli"]
+
+    assert row["reason"] == "subscription_credential_absent"
+    assert row["sandbox_blocker_code"] == ""
+    # The sandbox WAS selected, so the block must not restate a credential fact
+    # in sandbox vocabulary -- but it published ``enforceable: false`` beside an
+    # empty reason, a verdict with its subject withheld. It now names the SHAPE
+    # of the blocker from its own closed vocabulary and leaves the blocker
+    # itself on the route row that owns it.
+    block = report["sandbox"]
+    assert block["enforceable"] is False
+    assert block["reason"] == repo_policy.SANDBOX_REASON_ROUTE_BLOCKED_OUTSIDE_SANDBOX
+    assert block["reason"] in repo_policy.SANDBOX_PUBLISHABLE_SELECTION_REASONS
+    assert "subscription_credential_absent" not in json.dumps(block, sort_keys=True)
+    assert block["native_cli_backend"] == "bubblewrap"
+
+
+def test_a_foreign_family_refusal_on_windows_agrees_across_every_surface(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """One derivation, or the block contradicts the row it claims to summarise.
+
+    Selection can refuse a Windows host with a family that is not the Windows
+    one: ``invalid_sandbox_backend:<env value>`` is raised from reading the
+    environment. Taking the global cause from the Windows derivation while the
+    global reason kept the general one published ``selection_cause_unrecognized``
+    beside ``invalid_sandbox_backend`` -- with the route row carrying neither.
+    """
+
+    leaked = "s3cret-env-value"
+    report = _preflight_after_selection_refused(
+        monkeypatch,
+        tmp_path,
+        sandbox_error=f"{repo_policy.SANDBOX_FAMILY_INVALID_BACKEND}:{leaked}",
+        windows=True,
+        name="windows_foreign_family",
+    )
+    block = report["sandbox"]
+    row = {item["adapter_id"]: item for item in report["providers"]}["claude_cli"]
+
+    assert block["native_cli_cause"] == row["sandbox_unavailable_cause"]
+    assert block["native_cli_reason"] == row["sandbox_unavailable_detail"]
+    # The family itself IS a token this build names, so both surfaces keep it
+    # and drop only the environment value after it. Answering an
+    # `invalid_sandbox_backend` refusal with `selection_cause_unrecognized` told
+    # a Windows operator less than a POSIX one about the identical error.
+    assert block["native_cli_cause"] == repo_policy.SANDBOX_FAMILY_INVALID_BACKEND
+    assert block["native_cli_reason"] == repo_policy.SANDBOX_FAMILY_INVALID_BACKEND
+    # Declining to diagnose it never relaxes the refusal, and the stable
+    # compatibility blocker code remains the token callers match on.
+    assert row["launchable"] is False
+    assert row["platform_excluded"] is True
+    assert (
+        row["sandbox_blocker_code"]
+        == runtime_adapters.WINDOWS_NATIVE_CLI_REQUIRES_APPCONTAINER
+    )
+    assert block["reason"] == runtime_adapters.WINDOWS_NATIVE_CLI_REQUIRES_APPCONTAINER
+    assert block["native_cli_enforceable"] is False
+    assert leaked not in json.dumps(report, sort_keys=True, default=str)
+
+
+def test_a_selected_non_appcontainer_backend_is_not_native_cli_enforceable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Selection succeeding is not the boundary native CLI needs on Windows.
+
+    ``native_cli_enforceable`` was ``bool(backend)``, so a Windows host that
+    selected any other backend advertised an enforceable native CLI sandbox on
+    the very report whose every native row was refused as platform-excluded.
+    """
+
+    report = _preflight_on_host(
+        monkeypatch,
+        tmp_path,
+        select_backend=lambda: repo_policy.SANDBOX_BACKEND_BUBBLEWRAP,
+        windows=True,
+        name="windows_other_backend",
+    )
+    block = report["sandbox"]
+    row = {item["adapter_id"]: item for item in report["providers"]}["claude_cli"]
+
+    assert block["native_cli_enforceable"] is False
+    assert row["launchable"] is False
+    assert row["platform_excluded"] is True
+    assert row["status"] == repo_policy.SANDBOX_STATUS_UNAVAILABLE
+    # A backend that WAS selected and is simply the wrong one is its own cause,
+    # distinct from selection having failed outright.
+    assert (
+        row["sandbox_unavailable_cause"]
+        == repo_policy.SANDBOX_CAUSE_BACKEND_NOT_APPCONTAINER
+    )
+    assert block["native_cli_cause"] == row["sandbox_unavailable_cause"]
+    assert block["native_cli_reason"] == row["sandbox_unavailable_detail"]
+
+    # The same selected backend off Windows is exactly what native CLI needs,
+    # so the field tracks the measurement rather than the platform.
+    posix = _preflight_on_host(
+        monkeypatch,
+        tmp_path,
+        select_backend=lambda: repo_policy.SANDBOX_BACKEND_BUBBLEWRAP,
+        windows=False,
+        name="posix_same_backend",
+    )
+    posix_row = {item["adapter_id"]: item for item in posix["providers"]}["claude_cli"]
+
+    assert posix["sandbox"]["native_cli_enforceable"] is True
+    assert posix_row["launchable"] is True
+    assert posix_row["sandbox_unavailable_cause"] == ""
+
+
+def test_a_known_selection_family_survives_the_windows_derivation() -> None:
+    """Windows must not be told LESS than POSIX about the identical refusal.
+
+    ``select_sandbox_backend`` reads the environment on every platform, so
+    ``invalid_sandbox_backend:<env value>`` reaches a Windows host exactly as it
+    reaches a Linux one.  Collapsing it to ``selection_cause_unrecognized``
+    discarded a family this build does name, when the secret suffix was the
+    only part that ever needed dropping.
+    """
+
+    leaked = "s3cret-backend-name-from-the-environment"
+    error = f"{repo_policy.SANDBOX_FAMILY_INVALID_BACKEND}:{leaked}"
+    windows = repo_policy._windows_native_sandbox_cause("", error)
+
+    assert windows == (
+        repo_policy.SANDBOX_FAMILY_INVALID_BACKEND,
+        repo_policy.SANDBOX_FAMILY_INVALID_BACKEND,
+    )
+    assert leaked not in "".join(windows)
+    # One refusal, one answer: the platform changes nothing about a family
+    # neither derivation owns.
+    assert windows == repo_policy._bounded_sandbox_selection("", error)
+
+    # Membership still decides. A family this build cannot name carries nothing
+    # over, on Windows exactly as anywhere else.
+    assert repo_policy._windows_native_sandbox_cause(
+        "", "future_sandbox_probe_failed:C:\\Users\\shrek\\key.pem"
+    ) == (
+        repo_policy.SANDBOX_CAUSE_UNRECOGNIZED,
+        repo_policy.SANDBOX_CAUSE_UNRECOGNIZED,
+    )
+    # And the Windows family keeps its own stricter rule inside itself: a cause
+    # outside the closed vocabulary is stated without borrowing a detail that
+    # was never measured.
+    assert repo_policy._windows_native_sandbox_cause(
+        "",
+        f"{repo_policy.WINDOWS_APPCONTAINER_SELECTION_PREFIX}:winsta_probe_returned_0x5",
+    ) == (repo_policy.SANDBOX_CAUSE_UNRECOGNIZED, "")
+    # Fail-closed admission is untouched: only the real backend clears it.
+    assert repo_policy._windows_native_sandbox_cause(
+        repo_policy.WINDOWS_APPCONTAINER_BACKEND, error
+    ) == ("", "")
+
+
+def test_no_sandbox_block_publishes_a_verdict_without_its_subject(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Two boundary invariants every measured host must satisfy at once.
+
+    ``enforceable: false`` beside an empty ``reason`` is a verdict with its
+    subject withheld -- the reader is told the sandbox cannot be enforced and
+    given nothing to act on.  And a scrubbed field must stay inside ITS OWN
+    vocabulary: an identifier scrubbed to a reason token named no backend and
+    no adapter, so it was no more resolvable than the value it replaced.
+    """
+
+    blocks = [
+        _preflight_after_selection_refused(
+            monkeypatch, tmp_path, sandbox_error=error, windows=windows, name=name
+        )["sandbox"]
+        for error, windows, name in (
+            ("bubblewrap_unusable:/usr/bin/bwrap", False, "vocab_posix_path"),
+            (
+                f"{repo_policy.SANDBOX_FAMILY_INVALID_BACKEND}:s3cret-env-value",
+                True,
+                "vocab_windows_env",
+            ),
+            ("", False, "vocab_silent"),
+            ("future_sandbox_probe_failed:/tmp/probe.log", False, "vocab_unknown"),
+        )
+    ]
+    # A host where selection SUCCEEDED and the route is blocked anyway is the
+    # case that published the empty reason, so it belongs in the same sweep.
+    blocks.append(
+        _preflight_on_host(
+            monkeypatch,
+            tmp_path,
+            select_backend=lambda: repo_policy.SANDBOX_BACKEND_BUBBLEWRAP,
+            windows=True,
+            name="vocab_windows_other_backend",
+        )["sandbox"]
+    )
+
+    for block in blocks:
+        if not block["enforceable"]:
+            assert block["reason"], block
+            assert block["reason"] in repo_policy.SANDBOX_PUBLISHABLE_SELECTION_REASONS
+        for field in ("reason", "native_cli_reason", "native_cli_cause"):
+            if block[field]:
+                assert block[field] in repo_policy.SANDBOX_PUBLISHABLE_SELECTION_REASONS
+        # An identifier field publishes a member of its own vocabulary or
+        # nothing at all -- never a reason token.
+        for field in ("backend", "selected_backend", "native_cli_backend"):
+            if block[field]:
+                assert block[field] in repo_policy.SANDBOX_PUBLISHABLE_BACKENDS
+        if block["selected_adapter"]:
+            assert block["selected_adapter"] in repo_policy._POLICY_ALLOWED_ADAPTERS
+
+
+def test_an_unvouched_identifier_is_emptied_rather_than_given_a_reason_token() -> None:
+    """The guard's refusal must not itself publish an unresolvable value.
+
+    Scrubbing a backend field to ``selection_cause_unrecognized`` swapped one
+    value no reader of that field can resolve for another: the token names no
+    backend this build selects, and it is not a member of the vocabulary that
+    field is read against. Empty is what those fields already publish for "no
+    identifier", so that is what a refusal writes.
+    """
+
+    scrubbed = repo_policy._vouched_sandbox_block(
+        {
+            "backend": "C:\\Users\\shrek\\AppData\\bwrap.exe",
+            "selected_backend": "invalid_sandbox_backend:s3cret-env-value",
+            "native_cli_backend": repo_policy.SANDBOX_BACKEND_BUBBLEWRAP,
+            "selected_adapter": "rogue_adapter_from_a_future_build",
+            "native_cli_reason": "bubblewrap_unusable:/usr/bin/bwrap",
+        }
+    )
+
+    assert scrubbed["backend"] == ""
+    assert scrubbed["selected_backend"] == ""
+    assert scrubbed["selected_adapter"] == ""
+    # A reason field keeps the reason vocabulary, where that token IS declared.
+    assert scrubbed["native_cli_reason"] == repo_policy.SANDBOX_CAUSE_UNRECOGNIZED
+    # Vouched values on either side of a scrubbed neighbour are left alone.
+    assert scrubbed["native_cli_backend"] == repo_policy.SANDBOX_BACKEND_BUBBLEWRAP
+    assert "s3cret-env-value" not in json.dumps(scrubbed, sort_keys=True)
+    assert "bwrap.exe" not in json.dumps(scrubbed, sort_keys=True)
+    assert repo_policy.SANDBOX_CAUSE_UNRECOGNIZED not in (
+        repo_policy.SANDBOX_PUBLISHABLE_BACKENDS | set(repo_policy._POLICY_ALLOWED_ADAPTERS)
+    )

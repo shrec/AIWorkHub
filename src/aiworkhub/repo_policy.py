@@ -349,6 +349,354 @@ def _is_windows_host() -> bool:
     return os.name == "nt"
 
 
+# ── Why native CLI execution is refused on a Windows host ──────────────────
+# ``worker_workspace.select_sandbox_backend`` already MEASURES which of three
+# things refused this host -- the AppContainer APIs did not resolve, the
+# execution path is not wired to them, or the host is not Windows at all --
+# and encodes that cause after the colon of its bounded error.  The route row
+# used to drop the measurement and publish only the stable legacy blocker
+# code, so an operator could not tell an unwired build from a host that
+# genuinely cannot confine anything (NF-2026-00876).  Both facts travel now.
+WINDOWS_APPCONTAINER_BACKEND = worker_workspace.WINDOWS_APPCONTAINER_BACKEND
+WINDOWS_APPCONTAINER_SELECTION_PREFIX = "windows_appcontainer_sandbox_unavailable"
+SANDBOX_CAUSE_HOST_APPCONTAINER_UNAVAILABLE = "win32_appcontainer_unavailable"
+SANDBOX_CAUSE_EXECUTION_PATH_NOT_WIRED = "execution_path_not_wired"
+SANDBOX_CAUSE_PLATFORM_NOT_WINDOWS = "platform_not_windows"
+WINDOWS_APPCONTAINER_SELECTION_CAUSES = frozenset(
+    {
+        SANDBOX_CAUSE_HOST_APPCONTAINER_UNAVAILABLE,
+        SANDBOX_CAUSE_EXECUTION_PATH_NOT_WIRED,
+        SANDBOX_CAUSE_PLATFORM_NOT_WINDOWS,
+    }
+)
+# A backend was selected and it is simply not the one native CLI execution
+# requires -- a different fact from selection having failed outright.
+SANDBOX_CAUSE_BACKEND_NOT_APPCONTAINER = "sandbox_backend_not_appcontainer"
+# Selection refused without naming a cause, or named one this build does not
+# recognise.  Both are stated, never guessed at or invented.  There is no
+# shape-based admission: a token is recognised because it is a member of
+# WINDOWS_APPCONTAINER_SELECTION_CAUSES above, never because it looks like one.
+SANDBOX_CAUSE_UNREPORTED = "selection_cause_not_reported"
+SANDBOX_CAUSE_UNRECOGNIZED = "selection_cause_unrecognized"
+# Every family ``select_sandbox_backend`` refuses with.  Only the family token
+# is publishable: it raises ``invalid_sandbox_backend:<env value>``,
+# ``bubblewrap_unusable:<host path>`` and
+# ``secure_sandbox_unavailable:bubblewrap_unusable:<probe detail>`` beside the
+# Windows family, so the text after the family is host detail in three of four
+# cases and the Windows cause is admitted only by membership above.
+SANDBOX_FAMILY_INVALID_BACKEND = "invalid_sandbox_backend"
+SANDBOX_FAMILY_BUBBLEWRAP_UNUSABLE = "bubblewrap_unusable"
+SANDBOX_FAMILY_SECURE_SANDBOX_UNAVAILABLE = "secure_sandbox_unavailable"
+SANDBOX_SELECTION_FAMILIES = frozenset(
+    {
+        WINDOWS_APPCONTAINER_SELECTION_PREFIX,
+        SANDBOX_FAMILY_INVALID_BACKEND,
+        SANDBOX_FAMILY_BUBBLEWRAP_UNUSABLE,
+        SANDBOX_FAMILY_SECURE_SANDBOX_UNAVAILABLE,
+    }
+)
+# ``secure_sandbox_unavailable`` is the one family whose text after the family
+# token is itself a CLOSED vocabulary: the Linux probe names the exact boundary
+# it could not establish and nothing host-specific.  Collapsing it to the bare
+# family threw away the only fact an operator can act on -- a kernel without
+# Landlock is a different repair from a host without seccomp -- so both tokens
+# are admitted by membership, exactly as the Windows causes are.
+SANDBOX_CAUSE_LANDLOCK_UNSUPPORTED = "landlock_unsupported"
+SANDBOX_CAUSE_SECCOMP_UNAVAILABLE = "seccomp_unavailable"
+SECURE_SANDBOX_PROBE_CAUSES = frozenset(
+    {SANDBOX_CAUSE_LANDLOCK_UNSUPPORTED, SANDBOX_CAUSE_SECCOMP_UNAVAILABLE}
+)
+# The one route status that means "an enforceable sandbox could not be
+# selected here".  It is spelled once so the rows that set it and the surfaces
+# that recognise a sandbox blocker cannot drift apart.
+SANDBOX_STATUS_UNAVAILABLE = "sandbox_unavailable"
+# The stable compatibility blocker code for a non-Windows route whose selection
+# refused.  Windows native CLI keeps its own long-standing code, so a caller
+# matching on ``sandbox_blocker_code`` finds a non-empty token on either host
+# instead of a blocker that exists in ``status`` and nowhere else.
+SANDBOX_BLOCKER_ENFORCEABLE_SANDBOX_UNAVAILABLE = "enforceable_sandbox_unavailable"
+# What the sandbox block says when a boundary WAS selected and the report is
+# still not enforceable because the ROUTE is blocked -- an absent credential, a
+# policy denial, no launchable route at all.  ``enforceable: false`` beside an
+# empty reason stated a verdict and withheld its subject, and the credential
+# text that would explain it must never be restated in sandbox vocabulary, so
+# the block names the shape of the blocker and leaves the blocker itself on the
+# route rows that own it.
+SANDBOX_REASON_ROUTE_BLOCKED_OUTSIDE_SANDBOX = "route_blocked_outside_sandbox"
+# The complete set of strings any surface may publish as a sandbox-selection
+# reason or cause.  The publication guard gates on membership in this set and
+# on nothing else, so a value is refused for not being here, never for looking
+# wrong.
+SANDBOX_PUBLISHABLE_SELECTION_REASONS = frozenset(
+    {
+        SANDBOX_CAUSE_UNREPORTED,
+        SANDBOX_CAUSE_UNRECOGNIZED,
+        SANDBOX_CAUSE_BACKEND_NOT_APPCONTAINER,
+        SANDBOX_BLOCKER_ENFORCEABLE_SANDBOX_UNAVAILABLE,
+        SANDBOX_REASON_ROUTE_BLOCKED_OUTSIDE_SANDBOX,
+        runtime_adapters.WINDOWS_NATIVE_CLI_REQUIRES_APPCONTAINER,
+        *SANDBOX_SELECTION_FAMILIES,
+        *WINDOWS_APPCONTAINER_SELECTION_CAUSES,
+        *SECURE_SANDBOX_PROBE_CAUSES,
+        *(
+            f"{WINDOWS_APPCONTAINER_SELECTION_PREFIX}:{cause}"
+            for cause in WINDOWS_APPCONTAINER_SELECTION_CAUSES
+        ),
+        *(
+            f"{SANDBOX_FAMILY_SECURE_SANDBOX_UNAVAILABLE}"
+            f":{SANDBOX_FAMILY_BUBBLEWRAP_UNUSABLE}:{cause}"
+            for cause in SECURE_SANDBOX_PROBE_CAUSES
+        ),
+    }
+)
+# The backends the sandbox block may name.  ``select_sandbox_backend`` returns
+# exactly one of the three real boundaries; the other two are this module's own
+# published identifiers for routes that execute inside the editor host and for
+# a block describing several launchable routes at once.  Closing the vocabulary
+# is what makes the publication guard a membership test rather than a shape
+# test -- an environment value carries no separator to be caught by.
+SANDBOX_BACKEND_BUBBLEWRAP = "bubblewrap"
+SANDBOX_BACKEND_LANDLOCK = "landlock"
+SANDBOX_BACKEND_VSCODE_LM_IN_PROCESS = worker_workspace.VSCODE_LM_IN_PROCESS_BACKEND
+SANDBOX_BACKEND_ROUTE_SPECIFIC = "route_specific"
+SANDBOX_PUBLISHABLE_BACKENDS = frozenset(
+    {
+        SANDBOX_BACKEND_BUBBLEWRAP,
+        SANDBOX_BACKEND_LANDLOCK,
+        SANDBOX_BACKEND_VSCODE_LM_IN_PROCESS,
+        SANDBOX_BACKEND_ROUTE_SPECIFIC,
+        WINDOWS_APPCONTAINER_BACKEND,
+    }
+)
+# Keys whose value is a backend or an adapter IDENTIFIER rather than selection
+# text.  They are named one by one, and each is gated on its own closed
+# vocabulary, because the guard's default is refusal: every other string field
+# is treated as selection-derived and must be a declared publishable reason, so
+# a sandbox field added later fails closed even when its value carries no
+# separator to notice it by.
+_SANDBOX_BACKEND_FIELDS = frozenset(
+    {"backend", "selected_backend", "native_cli_backend"}
+)
+_SANDBOX_ADAPTER_FIELDS = frozenset({"selected_adapter"})
+
+
+def _bounded_selection_family(family: str, remainder: str) -> tuple[str, str]:
+    """Reduce one selection family and its trailing text to publishable values.
+
+    Two of the families ``select_sandbox_backend`` raises put an environment
+    value or a host path after the family token, so for those the family IS the
+    whole publishable fact.  ``secure_sandbox_unavailable`` is the exception:
+    its trailing token comes from a CLOSED probe vocabulary, and a kernel
+    without Landlock is a different repair from a host without seccomp.  The
+    admitted detail is REBUILT from this module's own constants rather than
+    sliced out of the error, so no selection byte reaches a surface even when
+    the token matches.  A family this build does not name carries nothing over.
+    """
+
+    if family not in SANDBOX_SELECTION_FAMILIES:
+        return SANDBOX_CAUSE_UNRECOGNIZED, SANDBOX_CAUSE_UNRECOGNIZED
+    if family == SANDBOX_FAMILY_SECURE_SANDBOX_UNAVAILABLE:
+        nested, _, probe = remainder.partition(":")
+        probe = probe.strip()
+        if nested.strip() == SANDBOX_FAMILY_BUBBLEWRAP_UNUSABLE and (
+            probe in SECURE_SANDBOX_PROBE_CAUSES
+        ):
+            return probe, (
+                f"{SANDBOX_FAMILY_SECURE_SANDBOX_UNAVAILABLE}"
+                f":{SANDBOX_FAMILY_BUBBLEWRAP_UNUSABLE}:{probe}"
+            )
+    return family, family
+
+
+def _windows_native_sandbox_cause(
+    sandbox_backend: str, sandbox_error: str
+) -> tuple[str, str]:
+    """Name the measured cause native CLI execution is refused here.
+
+    Returns ``(cause, detail)``, both empty when the AppContainer backend was
+    actually selected.  Within the Windows family the vocabulary is closed by
+    membership and nothing else: a cause this build does not already name is
+    ``SANDBOX_CAUSE_UNRECOGNIZED`` however well shaped it looks, and it carries
+    NO detail, because there is no measurement to describe.
+
+    Selection can refuse a Windows host with a family that is not the Windows
+    one -- reading the environment raises ``invalid_sandbox_backend:<env
+    value>`` on every platform.  Collapsing those to
+    ``selection_cause_unrecognized`` discarded a family this build DOES name
+    and left a Windows host less informative than a POSIX host about the
+    identical refusal, so the known family token is kept and only the host text
+    after it is dropped -- through the same reduction the POSIX path uses, so
+    the two can never disagree about the same error.
+    """
+
+    backend = str(sandbox_backend or "").strip()
+    if backend == WINDOWS_APPCONTAINER_BACKEND:
+        return "", ""
+    text = str(sandbox_error or "").strip()
+    if not text:
+        return (
+            SANDBOX_CAUSE_BACKEND_NOT_APPCONTAINER
+            if backend
+            else SANDBOX_CAUSE_UNREPORTED
+        ), ""
+    family, _, remainder = text.partition(":")
+    family = family.strip()
+    if family != WINDOWS_APPCONTAINER_SELECTION_PREFIX:
+        return _bounded_selection_family(family, remainder)
+    cause = remainder.strip()
+    if not cause:
+        return SANDBOX_CAUSE_UNREPORTED, ""
+    if cause not in WINDOWS_APPCONTAINER_SELECTION_CAUSES:
+        return SANDBOX_CAUSE_UNRECOGNIZED, ""
+    return cause, f"{family}:{cause}"
+
+
+def _bounded_sandbox_selection(
+    sandbox_backend: str, sandbox_error: str
+) -> tuple[str, str]:
+    """Reduce a sandbox-selection refusal to the ``(cause, detail)`` published.
+
+    The per-route cause was vouched first, but the global block kept handing the
+    dashboard the raw error, so ``bubblewrap_unusable:/usr/bin/bwrap`` escaped
+    anyway (NF-2026-00876).  Every family reduces through
+    ``_bounded_selection_family`` except the Windows one, which keeps its own
+    stricter membership rule on the cause it names.
+    """
+
+    if str(sandbox_backend or "").strip():
+        return "", ""
+    text = str(sandbox_error or "").strip()
+    if not text:
+        return SANDBOX_CAUSE_UNREPORTED, SANDBOX_CAUSE_UNREPORTED
+    family, _, remainder = text.partition(":")
+    family = family.strip()
+    if family == WINDOWS_APPCONTAINER_SELECTION_PREFIX:
+        cause, detail = _windows_native_sandbox_cause("", text)
+        return cause, detail or cause
+    return _bounded_selection_family(family, remainder)
+
+
+def _native_cli_sandbox_diagnosis(
+    sandbox_backend: str, sandbox_error: str
+) -> tuple[str, str]:
+    """Derive ONCE the ``(cause, detail)`` every native CLI surface publishes.
+
+    The route row, the global sandbox block and the unavailable-route summary
+    all answer the same question -- why native CLI execution is refused on this
+    host -- so they must not each pick a derivation.  Recomputing only the
+    cause with the Windows rule while the detail kept the general one published
+    ``selection_cause_unrecognized`` beside ``invalid_sandbox_backend`` on the
+    same host, with the route row carrying neither (NF-2026-00876 rework).
+
+    Windows keeps its own stricter rule on purpose: its causes are admitted by
+    membership in ``WINDOWS_APPCONTAINER_SELECTION_CAUSES`` and a cause this
+    build cannot name carries NO detail at all, rather than borrowing a family
+    token from a derivation that was never applied to it.  Every other host
+    uses the general family reduction.  Both paths return only vouched values,
+    so whichever applies, the surfaces agree by construction.
+    """
+
+    if _is_windows_host():
+        return _windows_native_sandbox_cause(sandbox_backend, sandbox_error)
+    return _bounded_sandbox_selection(sandbox_backend, sandbox_error)
+
+
+def _native_cli_backend_enforceable(sandbox_backend: str) -> bool:
+    """Can native CLI execution actually run under the backend that was selected?
+
+    Selection succeeding is not the same fact as the selected boundary being
+    usable for native CLI here.  Reporting enforceability from ``bool(backend)``
+    alone told a Windows host with some other backend that its native CLI
+    sandbox was enforceable while every native row on that same report was
+    refused as ``platform_excluded`` -- the global/row contradiction this task
+    exists to close.  Fail closed: on Windows only the AppContainer backend
+    qualifies.
+    """
+
+    backend = str(sandbox_backend or "").strip()
+    if not backend:
+        return False
+    if _is_windows_host():
+        return backend == WINDOWS_APPCONTAINER_BACKEND
+    return True
+
+
+def _sandbox_block_reason(
+    selected: Mapping[str, Any] | None,
+    route_enforceable: bool,
+    native_cli_reason: str,
+) -> str:
+    """Say WHY the sandbox block is not enforceable, in sandbox vocabulary only.
+
+    Three facts can make the block unenforceable and they are not the same
+    fact: the selected route carries a sandbox blocker, selection itself
+    refused, or a boundary was selected and the route is blocked for a reason
+    that has nothing to do with sandboxing.  The third produced ``enforceable:
+    false`` beside an EMPTY reason -- a verdict with its subject withheld --
+    because the native CLI derivation correctly has nothing to say once a
+    backend was selected.
+
+    The answer is a declared token, never the route's own text: a credential or
+    consent blocker restated here would land on a surface whose whole
+    vocabulary is sandbox selection, where the publication guard can only refuse
+    it as an unrecognised cause.  The blocker itself stays on the route row that
+    owns it, and this field points at that row's existence.
+    """
+
+    if route_enforceable:
+        return ""
+    row = selected or {}
+    if row.get("status") == SANDBOX_STATUS_UNAVAILABLE:
+        reason = str(row.get("reason") or "")[:200]
+        if reason:
+            return reason
+    return native_cli_reason or SANDBOX_REASON_ROUTE_BLOCKED_OUTSIDE_SANDBOX
+
+
+def _vouched_sandbox_block(block: dict[str, Any]) -> dict[str, Any]:
+    """Enforce at the publication boundary what each derivation promised.
+
+    Derivation by derivation is how the first repair passed its own tests and
+    still leaked: one projection of ``sandbox_error`` was missed.  This is the
+    single place every sandbox field the report publishes is checked, so a new
+    field wired to raw selection text is scrubbed rather than shipped.
+
+    The default is REFUSAL, and every key is decided by MEMBERSHIP in a closed
+    vocabulary rather than by the shape of its value.  A backend field must
+    name a backend this build can select, an adapter field must name an adapter
+    this policy allows, and every other string must be a declared publishable
+    reason.  Filtering on the path separator alone was not enough twice over: a
+    leaked environment value reaches this boundary as
+    ``invalid_sandbox_backend:s3cret-env-value`` with no separator to notice it
+    by, and it would have passed an identifier field unchanged.  It scrubs
+    instead of raising because a preflight that cannot render is a worse
+    failure than one that reports an unrecognised cause.
+
+    A refusal must leave the field inside ITS OWN vocabulary.  Writing the
+    reason token ``selection_cause_unrecognized`` into a backend or adapter
+    field replaced one unreadable value with another that no reader of those
+    fields can resolve -- it names no backend and no adapter -- so an
+    identifier this build cannot vouch for is emptied instead, which is the one
+    value those fields already publish for "none".  Reason fields keep the
+    reason vocabulary, where that token is a declared member.
+    """
+
+    for key, value in block.items():
+        if not isinstance(value, str) or not value:
+            continue
+        if key in _SANDBOX_BACKEND_FIELDS:
+            if value not in SANDBOX_PUBLISHABLE_BACKENDS:
+                block[key] = ""
+            continue
+        if key in _SANDBOX_ADAPTER_FIELDS:
+            if value not in _POLICY_ALLOWED_ADAPTERS:
+                block[key] = ""
+            continue
+        if value not in SANDBOX_PUBLISHABLE_SELECTION_REASONS:
+            block[key] = SANDBOX_CAUSE_UNRECOGNIZED
+    return block
+
+
 def _list_opencode_models(executable: str | None) -> list[str]:
     """Bound ``opencode models`` discovery; listing is not round-trip evidence."""
 
@@ -396,7 +744,7 @@ def _provider_status(
     native_windows_cli_without_broker = (
         _is_windows_host()
         and adapter_id not in _VSCODE_LM_IN_PROCESS_ADAPTERS
-        and sandbox_backend != "windows_appcontainer"
+        and sandbox_backend != WINDOWS_APPCONTAINER_BACKEND
     )
     result: dict[str, Any] = {
         "adapter_id": adapter_id,
@@ -433,6 +781,13 @@ def _provider_status(
         "quota_state": QUOTA_STATE_UNAVAILABLE,
         "status": "installed_unverified_access" if resolution.ok else "not_installed",
         "reason": str(resolution.reason or "")[:200],
+        # A sandbox blocker is two separate facts and the row states both, or
+        # states neither.  The code is the stable token downstream callers
+        # match on; the cause and its bounded detail are what was actually
+        # measured about this host.  Empty means no sandbox blocker applies.
+        "sandbox_blocker_code": "",
+        "sandbox_unavailable_cause": "",
+        "sandbox_unavailable_detail": "",
     }
     readiness: Mapping[str, Any] | None = None
     try:
@@ -581,18 +936,53 @@ def _provider_status(
             result["status"] = "repository_model_policy_disabled"
             result["reason"] = "all_observed_models_disabled_by_repository_model_settings"
     if adapter_id in _VSCODE_LM_IN_PROCESS_ADAPTERS:
-        result["sandbox_backend"] = "vscode_lm_in_process"
+        result["sandbox_backend"] = SANDBOX_BACKEND_VSCODE_LM_IN_PROCESS
     else:
         result["sandbox_backend"] = sandbox_backend
         if native_windows_cli_without_broker:
+            # Fail closed, and say exactly why.  ``reason`` keeps the stable
+            # compatibility blocker code every existing caller and receipt
+            # matches on, and the code is mirrored into its own field so a
+            # reader never has to parse prose to find it.  The measured
+            # selection/probe cause travels beside both, so a host whose
+            # AppContainer APIs never resolved is no longer indistinguishable
+            # from a build whose execution path was never wired.  ``installed``
+            # is deliberately left alone: a missing binary stays its own fact.
+            cause, cause_detail = _native_cli_sandbox_diagnosis(
+                sandbox_backend, sandbox_error
+            )
             result["launchable"] = False
-            result["status"] = "sandbox_unavailable"
+            result["status"] = SANDBOX_STATUS_UNAVAILABLE
             result["reason"] = runtime_adapters.WINDOWS_NATIVE_CLI_REQUIRES_APPCONTAINER
+            result["sandbox_blocker_code"] = (
+                runtime_adapters.WINDOWS_NATIVE_CLI_REQUIRES_APPCONTAINER
+            )
+            result["sandbox_unavailable_cause"] = cause
+            result["sandbox_unavailable_detail"] = cause_detail
             result["sandbox_backend"] = ""
         elif not sandbox_backend:
+            # Every other host owes the reader the same three facts.  Setting
+            # only ``reason`` here left a Linux route whose status said
+            # ``sandbox_unavailable`` beside an empty code and an empty cause,
+            # so the row and its summary projection disagreed about whether a
+            # sandbox blocker existed at all.  The code is stable and the cause
+            # is what was measured, exactly as on the Windows branch -- through
+            # the same one derivation, so neither branch can drift from what
+            # the global block publishes.
+            cause, cause_detail = _native_cli_sandbox_diagnosis(
+                sandbox_backend, sandbox_error
+            )
             result["launchable"] = False
-            result["status"] = "sandbox_unavailable"
-            result["reason"] = sandbox_error or "sandbox_unavailable"
+            result["status"] = SANDBOX_STATUS_UNAVAILABLE
+            # The route row feeds the global block's ``reason`` when this
+            # adapter is the selected one, so it is bounded here too rather
+            # than echoing the selection exception.
+            result["reason"] = cause_detail
+            result["sandbox_blocker_code"] = (
+                SANDBOX_BLOCKER_ENFORCEABLE_SANDBOX_UNAVAILABLE
+            )
+            result["sandbox_unavailable_cause"] = cause
+            result["sandbox_unavailable_detail"] = cause_detail
     if not result["policy_allowed"]:
         result["launchable"] = False
         result["status"] = "policy_denied"
@@ -761,6 +1151,18 @@ def build_preflight(repo_root: Path | str, adapter_id: str | None = None) -> dic
     except worker_workspace.WorkspaceError as exc:
         sandbox_backend = ""
         sandbox_error = str(exc)[:200]
+    # Measure the refusal once and hand the same answer to both surfaces: the
+    # provider rows below and this report's sandbox block. Two independent
+    # derivations of "why is native CLI refused here" is exactly how a global
+    # blocker and a per-route blocker came to disagree (NF-2026-00876).  The
+    # first repair still ran two: it took the cause from the Windows derivation
+    # and left the reason on the general one, so an `invalid_sandbox_backend`
+    # refusal on Windows published cause `selection_cause_unrecognized` beside
+    # reason `invalid_sandbox_backend` while the route row carried no detail at
+    # all.  Cause AND detail now come from the one derivation the rows use.
+    native_cli_sandbox_cause, native_cli_sandbox_reason = _native_cli_sandbox_diagnosis(
+        sandbox_backend, sandbox_error
+    )
     providers = [
         _provider_status(
             root,
@@ -982,30 +1384,52 @@ def build_preflight(repo_root: Path | str, adapter_id: str | None = None) -> dic
             "ready_for_code": source_graph_ready_for_code,
             "refreshable_for_code": source_graph_refreshable,
         },
-        "sandbox": {
-            # Primary fields describe the selected route (or the set of
-            # launchable routes when no adapter is selected), not only native
-            # CLI sandbox availability. This prevents a ready VS Code LM
-            # in-process route from being displayed beside a contradictory
-            # global ``sandbox unenforceable`` warning.
-            "backend": (
-                selected_route_backend
-                if selected is not None
-                else (sandbox_backend or ("route_specific" if route_enforceable else ""))
-            ),
-            "enforceable": route_enforceable,
-            "reason": (
-                str((selected or {}).get("reason") or "")[:200]
-                if selected is not None and not route_enforceable
-                else ("" if route_enforceable else sandbox_error)
-            ),
-            "selected_adapter": str((selected or {}).get("adapter_id") or ""),
-            "selected_backend": selected_route_backend,
-            "native_cli_backend": sandbox_backend,
-            "native_cli_enforceable": bool(sandbox_backend),
-            "native_cli_reason": sandbox_error,
-            "route_aware": True,
-        },
+        "sandbox": _vouched_sandbox_block(
+            {
+                # Primary fields describe the selected route (or the set of
+                # launchable routes when no adapter is selected), not only
+                # native CLI sandbox availability. This prevents a ready VS
+                # Code LM in-process route from being displayed beside a
+                # contradictory global ``sandbox unenforceable`` warning.
+                "backend": (
+                    selected_route_backend
+                    if selected is not None
+                    else (
+                        sandbox_backend
+                        or (
+                            SANDBOX_BACKEND_ROUTE_SPECIFIC
+                            if route_enforceable
+                            else ""
+                        )
+                    )
+                ),
+                "enforceable": route_enforceable,
+                # Only a SANDBOX blocker belongs in the sandbox block's reason,
+                # and a "not enforceable" verdict always owes the reader one.
+                "reason": _sandbox_block_reason(
+                    selected, route_enforceable, native_cli_sandbox_reason
+                ),
+                "selected_adapter": str((selected or {}).get("adapter_id") or ""),
+                "selected_backend": selected_route_backend,
+                "native_cli_backend": sandbox_backend,
+                # A backend having been SELECTED is not the same fact as one
+                # native CLI execution may actually run under.  On Windows only
+                # AppContainer qualifies, so reporting "enforceable" for any
+                # non-empty token made this field contradict the very native
+                # rows the same host refuses.
+                "native_cli_enforceable": _native_cli_backend_enforceable(
+                    sandbox_backend
+                ),
+                # Never the raw selection error: three of its four families
+                # encode an environment value, a host path or a nested probe
+                # detail after the family token (NF-2026-00876).
+                "native_cli_reason": native_cli_sandbox_reason,
+                # The same measured cause the native CLI rows carry, so the
+                # global block and the per-route block never name it differently.
+                "native_cli_cause": native_cli_sandbox_cause,
+                "route_aware": True,
+            }
+        ),
         "callback": {
             key: callback_health.get(key)
             for key in (
@@ -1050,6 +1474,14 @@ def build_preflight(repo_root: Path | str, adapter_id: str | None = None) -> dic
                     "status": str(item.get("status") or "unavailable")[:128],
                     "reason": str(item.get("reason") or "unavailable")[:200],
                     "sandbox_backend": str(item.get("sandbox_backend") or "")[:128],
+                    # The same three facts the row states.  A projection that
+                    # carried only ``reason`` left a reader unable to tell a
+                    # sandbox blocker from a credential one, and left the
+                    # non-Windows sandbox blocker with no code at all
+                    # (NF-2026-00876).  Empty still means no sandbox blocker.
+                    "blocker_code": str(item.get("sandbox_blocker_code") or "")[:128],
+                    "cause": str(item.get("sandbox_unavailable_cause") or "")[:128],
+                    "detail": str(item.get("sandbox_unavailable_detail") or "")[:200],
                 }
                 for item in unavailable_routes
             ],
@@ -1058,6 +1490,15 @@ def build_preflight(repo_root: Path | str, adapter_id: str | None = None) -> dic
                     "adapter_id": str(item.get("adapter_id") or "")[:128],
                     "status": str(item.get("status") or "excluded")[:128],
                     "reason": str(item.get("reason") or "excluded")[:200],
+                    # The projection carries the same two facts the row does.
+                    # A summary that kept only the legacy blocker text made a
+                    # Windows host that cannot build an AppContainer look
+                    # identical to a build whose execution path was never
+                    # wired, so the two surfaces disagreed about the same
+                    # route (NF-2026-00876).
+                    "blocker_code": str(item.get("sandbox_blocker_code") or "")[:128],
+                    "cause": str(item.get("sandbox_unavailable_cause") or "")[:128],
+                    "detail": str(item.get("sandbox_unavailable_detail") or "")[:200],
                     "exclusion": (
                         "platform"
                         if item.get("platform_excluded")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -490,3 +491,162 @@ def test_source_graph_fresh_readable_generation_remains_ready_while_indexing(
 
     assert "source_graph_not_ready" not in report["errors"]
     assert report["source_graph"]["ready_for_code"] is True
+
+
+def test_windows_preflight_and_its_projections_name_one_appcontainer_cause(
+    monkeypatch, tmp_path,
+):
+    """NF-2026-00876: row, sandbox block and summary must state one cause.
+
+    A native CLI row that published only the legacy blocker code, beside a
+    sandbox block that published the raw selection error, left an operator
+    reconciling two different answers to the same question -- and neither of
+    them said whether this host cannot build an AppContainer or whether the
+    execution path was simply never wired to one.
+    """
+
+    root = _root(tmp_path)
+    _common(monkeypatch, graph=_ready_graph())
+    monkeypatch.setattr(repo_policy, "_is_windows_host", lambda: True)
+    monkeypatch.setattr(
+        repo_policy.worker_workspace,
+        "select_sandbox_backend",
+        lambda: (_ for _ in ()).throw(
+            worker_workspace.WorkspaceError(
+                "windows_appcontainer_sandbox_unavailable:execution_path_not_wired"
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        repo_policy.runtime_adapters,
+        "resolve_executable",
+        lambda adapter_id: runtime_adapters.ExecutableResolution(adapter_id, "/bin/x", True, ""),
+    )
+    monkeypatch.setattr(
+        repo_policy.vscode_lm_bridge,
+        "bridge_readiness",
+        lambda *args, **kwargs: {
+            "launchable": True,
+            "blocker_reason": "",
+            "access_observed": True,
+        },
+    )
+
+    report = repo_policy.build_preflight(root)
+    by_adapter = {item["adapter_id"]: item for item in report["providers"]}
+    native = by_adapter["claude_cli"]
+
+    # Fail-closed is unchanged; only the diagnosis got better.
+    assert native["launchable"] is False
+    assert native["platform_excluded"] is True
+    assert native["reason"] == runtime_adapters.WINDOWS_NATIVE_CLI_REQUIRES_APPCONTAINER
+    assert (
+        native["sandbox_unavailable_cause"]
+        == repo_policy.SANDBOX_CAUSE_EXECUTION_PATH_NOT_WIRED
+    )
+    # The global sandbox block names the same measured cause as the row...
+    assert report["sandbox"]["native_cli_cause"] == native["sandbox_unavailable_cause"]
+    # ...and so does the summary projection a workforce reader consumes.
+    projected = {
+        row["adapter_id"]: row
+        for row in report["provider_summary"]["excluded_routes"]
+    }
+    assert projected["claude_cli"]["cause"] == native["sandbox_unavailable_cause"]
+    assert projected["claude_cli"]["blocker_code"] == native["sandbox_blocker_code"]
+    # The editor-hosted route is untouched by the native CLI refusal.
+    editor = by_adapter[runtime_adapters.GLM_VSCODE_LM_ADAPTER]
+    assert editor["launchable"] is True
+    assert editor["sandbox_backend"] == "vscode_lm_in_process"
+    assert editor["sandbox_unavailable_cause"] == ""
+
+
+def test_a_shared_selection_family_reads_the_same_on_windows_and_off_it(
+    monkeypatch, tmp_path,
+):
+    """NF-2026-00876 rework: the platform must not change a shared diagnosis.
+
+    ``select_sandbox_backend`` reads the environment on every host, so
+    ``invalid_sandbox_backend:<env value>`` is the SAME refusal on both. The
+    Windows derivation answered it with ``selection_cause_unrecognized`` while
+    the POSIX one named the family, so a Windows operator was told strictly
+    less about an identical error -- and the environment value was the only
+    part that ever needed dropping.
+    """
+
+    leaked = "s3cret-backend-name-from-the-environment"
+
+    def _report(*, windows: bool, name: str) -> dict:
+        root = _root(tmp_path / name)
+        _common(monkeypatch, graph=_ready_graph())
+        monkeypatch.setattr(repo_policy, "_is_windows_host", lambda: windows)
+        monkeypatch.setattr(
+            repo_policy.worker_workspace,
+            "select_sandbox_backend",
+            lambda: (_ for _ in ()).throw(
+                worker_workspace.WorkspaceError(
+                    f"{repo_policy.SANDBOX_FAMILY_INVALID_BACKEND}:{leaked}"
+                )
+            ),
+        )
+        monkeypatch.setattr(
+            repo_policy.runtime_adapters,
+            "resolve_executable",
+            lambda adapter_id: runtime_adapters.ExecutableResolution(
+                adapter_id, "/bin/x", True, ""
+            ),
+        )
+        monkeypatch.setattr(
+            repo_policy.vscode_lm_bridge,
+            "bridge_readiness",
+            lambda *args, **kwargs: {
+                "launchable": True,
+                "blocker_reason": "",
+                "access_observed": True,
+            },
+        )
+        return repo_policy.build_preflight(root)
+
+    windows_report = _report(windows=True, name="windows_family")
+    posix_report = _report(windows=False, name="posix_family")
+    windows_row = {
+        item["adapter_id"]: item for item in windows_report["providers"]
+    }["claude_cli"]
+    posix_row = {
+        item["adapter_id"]: item for item in posix_report["providers"]
+    }["claude_cli"]
+
+    assert (
+        windows_row["sandbox_unavailable_cause"]
+        == repo_policy.SANDBOX_FAMILY_INVALID_BACKEND
+    )
+    assert (
+        windows_row["sandbox_unavailable_cause"]
+        == posix_row["sandbox_unavailable_cause"]
+    )
+    assert (
+        windows_row["sandbox_unavailable_detail"]
+        == posix_row["sandbox_unavailable_detail"]
+    )
+    # Row and global block still answer with one measurement, on both hosts.
+    for report, row in ((windows_report, windows_row), (posix_report, posix_row)):
+        block = report["sandbox"]
+        assert block["native_cli_cause"] == row["sandbox_unavailable_cause"]
+        assert block["native_cli_reason"] == row["sandbox_unavailable_detail"]
+        assert block["native_cli_enforceable"] is False
+        assert leaked not in json.dumps(report, sort_keys=True, default=str)
+
+    # Naming the family never relaxes admission, and the two hosts keep their
+    # distinct blocker codes: Windows excludes the route on platform grounds,
+    # a POSIX host could run it the moment a sandbox exists.
+    assert windows_row["launchable"] is False
+    assert posix_row["launchable"] is False
+    assert windows_row["platform_excluded"] is True
+    assert posix_row["platform_excluded"] is False
+    assert (
+        windows_row["sandbox_blocker_code"]
+        == runtime_adapters.WINDOWS_NATIVE_CLI_REQUIRES_APPCONTAINER
+    )
+    assert (
+        posix_row["sandbox_blocker_code"]
+        == repo_policy.SANDBOX_BLOCKER_ENFORCEABLE_SANDBOX_UNAVAILABLE
+    )
