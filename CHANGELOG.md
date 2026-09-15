@@ -6,6 +6,101 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.43] - 2026-09-15
+
+### Added
+
+- The manager MCP surface now exposes `aiworkhub_manager_semantic_edit_prepare`
+  and `aiworkhub_manager_semantic_edit_apply`, the same hash-bound range-edit
+  tools workers use, and `aiworkhub_manager_bootstrap` reports whether semantic
+  edit is available and whether the write gate is open -- so the manager can
+  make small, verified range edits instead of a whole-file rewrite.
+- A new read-only `aiworkhub_dashboard_skills` surface reports measured skill-
+  selection coverage: totals by lifecycle, how many recent receipts selected
+  and injected, and the consecutive run of newest receipts that injected
+  nothing. An absent or unreadable skill store reports `measured: False` with a
+  reason instead of a zero that reads as "healthy and empty."
+- A new deterministic, read-only attempt-trajectory export composes a card's
+  audit history, process lifecycle ledger, attempt artifacts and recorded
+  usage into one canonical JSON document per `request_id`. Every field is
+  either measured evidence or an explicit `UNKNOWN`; the accepted-outcome
+  signal is only ever granted by the existing sealed acceptance authority,
+  never self-declared.
+- A fixed, checked-in four-profile external-repository qualification corpus
+  (`llvm/llvm-project`, `microsoft/vscode`, `apache/airflow`, `grpc/grpc`,
+  each pinned at a release tag's exact commit) and its manifest/run-artifact
+  contracts are added as foundation only. Nothing in this change clones,
+  builds or executes an external repository, and no performance, cost or
+  token claim is established by it -- that stays `UNKNOWN` until a later
+  execution phase produces receipt-backed artifacts.
+
+### Fixed
+
+- Source Graph's `calls` mode now resolves a query to the one entity that
+  actually *defines* the named symbol before returning call edges, instead of
+  matching every entity sharing that name, including imports, decorators and
+  annotations. An imported function no longer reads as an ambiguous query, and
+  an edge whose callee is recorded by name only is attributed to a definition
+  solely when that name is unique across the repository.
+- The Windows sandbox/AppContainer route report now names the exact measured
+  cause native CLI execution was refused -- host AppContainer APIs
+  unavailable, the execution path not wired to them, or the platform is not
+  Windows -- from a closed, membership-checked vocabulary, instead of
+  publishing one stable blocker code that discarded which of the three
+  applied. This changes only the reported reason a route selection failed; it
+  does not change, and does not claim, which Windows routes are launchable.
+- Oversized Source Graph analytic-mode results returned by the worker AI-tools
+  MCP Source Graph route are now spilled in full to a repository-scoped,
+  content-addressed store (`.aiworkhub/spill/`) before the bounded preview a
+  model sees is built. The truncated wrapper carries a `spill_locator` and
+  retrieval hint so the original text stays retrievable and digest-verified
+  instead of being discarded the moment it is trimmed. The store has no
+  eviction, TTL or size cap yet; that remains out of scope.
+- `failure_disposition` now also returns a typed cause/action/retry-scope
+  projection derived from the same resolved evidence as its existing legacy
+  `failure_class`/`evidence` fields, so the two can never disagree. When a
+  bounded log tail names no cause, the classifier now also reads the reason
+  or terminal state this repository itself recorded, instead of falling back
+  to a blind relaunch.
+- The outer validation authority document and the nested Landlock authority
+  locator now receive their final file mode (owner-private, and read-only
+  0o444 respectively) at creation time, via `O_CREAT|O_EXCL` with a pinned
+  umask, instead of a separate chmod-after-write step that silently no-opped
+  on `PermissionError`. This closes a window in which the nested locator's
+  hardlinked, shared inode could be rewritten in place by the sandboxed
+  validator whose own nesting authority that locator establishes.
+- A duplicate manager launch request for a task already attached to a live
+  worker now returns an idempotent `already_attached` observation of the
+  existing claim instead of recording a new blocked-launch episode, which
+  previously could overwrite the original worker's processing ownership and
+  make its later successful finalization fail closed.
+- Three AppContainer-identity launch-denial reasons (platform mismatch,
+  invalid identity, repository identity unavailable) are now classified as
+  transient and retryable rather than deterministic card defects, closing a
+  release-consistency drift between two separate reads of the launch
+  platform within the same call.
+- The Plan-DAG summary MCP projection now bounds every sampled ID array and
+  per-card collision map to 50 entries, with exact `total_count` and
+  `truncated` metadata carried alongside each sample, instead of returning
+  some of those fields unbounded; the collision-map sample is ordered
+  colliding-cards-first so a late colliding card can never be hidden behind
+  older collision-free rows.
+- The VS Code Webview compact-counter formatter keeps its single-argument
+  extraction seam self-contained by moving the locale-aware implementation
+  below the pinned declaration line a test harness extracts verbatim. The
+  four-significant-digit rendering behavior shipped in 0.11.42 is unchanged.
+
+### Validation
+
+- Sandbox nested-listener test coverage was tightened to stop asserting an
+  impossible nested-stacking state, and the NF841 CI fixture no longer
+  depends on the ambient umask.
+- The release-metadata projection check is clean for tag v0.11.43, and the
+  VSIX version gate and scratch-containment gate pass. Release assurance,
+  the release evidence pack and VSIX packaging are verified from the
+  canonical tree. This change does not push, tag, publish or install
+  anything.
+
 ## [0.11.42] - 2026-09-15
 
 ### Fixed

@@ -1,5 +1,45 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.43 — 2026-09-15
+
+### Added
+
+- The manager can now make small, hash-bound range edits directly through the
+  MCP semantic-edit tools workers already use, instead of only reading and
+  reasoning about code.
+- A new read-only `aiworkhub_dashboard_skills` MCP surface reports measured
+  skill-selection coverage: how many recorded receipts actually selected and
+  injected a skill, and the streak of recent receipts that injected nothing.
+  An unreadable skill store reports "not measured" with a reason instead of a
+  healthy-looking zero.
+- A new read-only attempt-trajectory export composes one request's audit
+  history, process lifecycle, artifacts and usage into a single canonical
+  JSON document, with unmeasured fields reported as `UNKNOWN` rather than
+  guessed.
+
+### Fixed
+
+- Source Graph's `calls` mode now resolves a query to the one symbol that
+  actually defines the queried name before returning call edges, instead of
+  also matching every import, decorator or annotation that merely mentions
+  it.
+- The Windows sandbox report now names the exact measured cause native CLI
+  execution was refused — AppContainer APIs unavailable, the execution path
+  not wired to them, or the platform is not Windows — instead of one fixed
+  blocker code. This does not change, and does not claim, which Windows
+  routes are launchable.
+- Oversized Source Graph analytic-mode results from the worker AI-tools MCP
+  Source Graph route are now spilled to a repository-scoped store before
+  being trimmed for display, so the full original stays retrievable instead
+  of being discarded the moment it is truncated. The store has no eviction,
+  TTL or size cap yet.
+- A duplicate launch request for a task already attached to a live worker now
+  returns the existing claim instead of recording a new blocked episode that
+  could overwrite the original worker's ownership.
+- The compact-counter formatter keeps its extraction seam self-contained for
+  the test harness; the four-significant-digit rendering shipped in 0.11.42
+  is unchanged.
+
 ## 0.11.42 — 2026-09-15
 
 ### Fixed
