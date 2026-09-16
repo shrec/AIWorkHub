@@ -137,7 +137,7 @@ class TestApprovedSitePythonpath(unittest.TestCase):
 
     @unittest.skipUnless(os.name == "nt", "covers the Windows in-process path")
     @unittest.skipUnless(os.name == "nt", "requires Windows runtime authority")
-    def test_windows_in_process_pytest_validation_suppresses_redundant_pythonpath(
+    def test_windows_in_process_pytest_validation_retains_trusted_runtime_pythonpath(
         self,
     ) -> None:
         scratch = self.root / "validation-scratch"
@@ -156,6 +156,19 @@ class TestApprovedSitePythonpath(unittest.TestCase):
             "resolve_trusted_pytest_runtime_root",
             return_value=self.site.resolve(),
         ), mock.patch.object(
+            worker_workspace,
+            "_resolve_trusted_validation_executable",
+            side_effect=worker_workspace.WorkspaceError(
+                "validation_executable_unavailable:pytest"
+            ),
+        ), mock.patch.object(
+            worker_workspace,
+            "_select_module_validator_interpreter",
+            return_value=(
+                None,
+                "validation_executable_no_trusted_interpreter:pytest",
+            ),
+        ), mock.patch.object(
             worker_workspace.subprocess, "run", return_value=completed
         ) as run:
             results = worker_workspace.run_validations(
@@ -166,10 +179,10 @@ class TestApprovedSitePythonpath(unittest.TestCase):
             )
 
         self.assertEqual(results[0]["returncode"], 0)
-        self.assertNotIn("PYTHONPATH", run.call_args.kwargs["env"])
+        self.assertIn("PYTHONPATH", run.call_args.kwargs["env"])
         self.assertEqual(
-            results[0]["env_override"]["suppressed_for"],
-            "module_validator_no_trusted_root",
+            results[0]["env_override"]["retained_for"],
+            "trusted_pytest_runtime_and_candidate_imports",
         )
 
 
