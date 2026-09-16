@@ -211,6 +211,23 @@ def _canonical_route_model(runner: str, adapter_id: str, model: str) -> str:
     return str(canonical or model)
 
 
+def _route_model_matches(
+    runner: str, adapter_id: str, reported: str, planned: str
+) -> bool:
+    """True when two spellings name ONE pinned model for one exact route.
+
+    The planned side keeps the alias its route selection named; every side that
+    describes the process that actually ran -- a polled status and the
+    launcher's own synchronous receipt alike -- keeps the canonical model the
+    launcher resolved from it. One rule answers "same model?" for all of them,
+    because a second call site deriving its own answer is how one of them ends
+    up refusing its own reviewer while the other reconciles it.
+    """
+    return _canonical_route_model(runner, adapter_id, reported) == (
+        _canonical_route_model(runner, adapter_id, planned)
+    )
+
+
 def _manager_reserved_codex_route(route: Mapping[str, Any]) -> bool:
     """Keep Codex CLI reserved for the manager, without excluding Copilot GPT."""
     runner, adapter_id, _model = _review_route_identity(route)
@@ -2499,10 +2516,9 @@ class ReviewOrchestrator:
             == str(attempt.get("reviewer_task_id") or "")
             and str(status.get("runner") or "") == runner
             and str(status.get("adapter_id") or "") == adapter_id
-            and _canonical_route_model(
-                runner, adapter_id, str(status.get("model") or ""),
-            ) == _canonical_route_model(
-                runner, adapter_id, str(attempt.get("model") or ""),
+            and _route_model_matches(
+                runner, adapter_id,
+                str(status.get("model") or ""), str(attempt.get("model") or ""),
             )
         )
 
@@ -2692,15 +2708,31 @@ class ReviewOrchestrator:
             # just invoked.  Validate any identity fields it supplies before
             # retiring that durable attempt; an omitted field is legitimate
             # when the provider rejected before allocating a request.
-            expected = {
+            #
+            # A reconciling launch returns the LAUNCHER's receipt for the
+            # request already recorded against this reviewer task, so its model
+            # is the canonical name that launch resolved while the durable
+            # attempt still holds the alias its route selection named. Compared
+            # byte for byte those two spellings made this branch refuse the
+            # very route it had just invoked -- the same vocabulary split
+            # measured on chains 906 and 916, one call site further in -- so the
+            # model goes through the shared rule and every other field stays
+            # exact.
+            exact = {
                 "task_id": str(attempt["reviewer_task_id"]),
                 "runner": str(attempt["runner"]),
                 "adapter_id": str(attempt["adapter_id"]),
-                "model": str(attempt["model"]),
             }
+            reported_model = str(result.get("model") or "")
             if any(
                 str(result.get(key) or "") not in {"", value}
-                for key, value in expected.items()
+                for key, value in exact.items()
+            ) or (
+                reported_model
+                and not _route_model_matches(
+                    str(attempt["runner"]), str(attempt["adapter_id"]),
+                    reported_model, str(attempt["model"]),
+                )
             ):
                 raise RuntimeError("reviewer_launch_terminal_identity_invalid")
             # The typed dispatch is computed off this exact synchronous receipt,

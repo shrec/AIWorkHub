@@ -4167,3 +4167,121 @@ def test_nf888_a_lens_whose_whole_retry_ceiling_died_is_named_not_re_ensured(
     assert partial["review_recovery_ensured"] == 1
     assert partial["review_recovery_reasons"].get("retry_exhausted") is None
     assert partial["review_recovery_reasons"]["unusable_reviewer"] == 1
+
+
+# The same alias/canonical vocabulary split, one call site further in. A launch
+# that RECONCILES an already-recorded reviewer returns the launcher's own
+# receipt for that request, whose model is the canonical name launch resolved,
+# while the durable attempt still holds the alias its route selection named.
+def _nf888_alias_terminal_launch(
+    manager: _FailoverManager,
+    driver: review_orchestrator.ReviewOrchestrator,
+    chain,
+    *,
+    model: str,
+) -> str:
+    """Make the first alias route's launch return a terminal receipt."""
+    first_task = driver._reviewer_task_id(chain.chain_identity, "correctness")
+    manager.terminal_launch_results[first_task] = {
+        "ok": False,
+        "state": "launch_failed",
+        "error_code": "provider_unavailable",
+        "already_reserved": True,
+        "model": model,
+    }
+    return first_task
+
+
+def test_nf888_a_synchronous_terminal_receipt_may_name_the_canonical_model(
+    tmp_path: Path,
+) -> None:
+    """The launch path reads its own receipt as its own, not as somebody's.
+
+    ``reviewer_launch_terminal_identity_invalid`` failed the whole action here,
+    so the attempt was left ``planned`` with no retirement, no hold and no
+    successor -- the launch-path twin of the accept-path refusal, reached by
+    exactly one reviewer whose model the launcher had canonicalized. The typed
+    disposition must be the same one an identically-spelled receipt earns: the
+    route retires and the single distinct-route retry is spent once.
+    """
+    manager, driver, chain = _nf888_alias_chain(tmp_path, "sync-canonical")
+    first_task = _nf888_alias_terminal_launch(
+        manager, driver, chain, model="claude-opus-5",
+    )
+
+    result = driver.drain(max_actions=1, now=NOW)
+
+    assert result.failed == 0
+    assert result.completed == 1
+    attempts = driver._route_attempts(chain.chain_id, "correctness")
+    assert [row["state"] for row in attempts] == ["retired", "launched"]
+    assert attempts[0]["reviewer_task_id"] == first_task
+    assert attempts[0]["model"] == "opus"
+    assert attempts[0]["failure_reason"].startswith("launch_failed:")
+    assert review_orchestrator.route_attempt_hold(
+        attempts[0]["failure_reason"]
+    ) == ""
+    assert attempts[1]["model"] == "sonnet"
+    assert attempts[1]["runner"] != attempts[0]["runner"]
+    assert len(manager.provider_launches) == 1
+
+
+def test_nf888_a_synchronous_receipt_for_another_model_is_still_foreign(
+    tmp_path: Path,
+) -> None:
+    """``claude-sonnet-5`` is canonical too, and it is not this route's model.
+
+    Nothing may be retired or bought on a receipt about another process: the
+    planned attempt is left exactly as it was and no provider is spent.
+    """
+    manager, driver, chain = _nf888_alias_chain(tmp_path, "sync-foreign")
+    first_task = _nf888_alias_terminal_launch(
+        manager, driver, chain, model="claude-sonnet-5",
+    )
+
+    result = driver.drain(max_actions=1, now=NOW)
+
+    assert result.failed == 1
+    attempts = driver._route_attempts(chain.chain_id, "correctness")
+    assert len(attempts) == 1
+    assert attempts[0]["state"] == "planned"
+    assert attempts[0]["reviewer_task_id"] == first_task
+    assert attempts[0]["model"] == "opus"
+    assert not attempts[0]["failure_reason"]
+    assert manager.provider_launches == []
+
+
+def test_nf888_a_finalize_failed_hold_is_re_read_on_every_later_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A durable hold has to survive the passes that come after it.
+
+    Retiring the finalizer race once is only half of it: every later pass
+    re-reads that retirement, and a pass that read it as "no live attempt" would
+    buy the second route the disposition says no reviewer can use. The lens
+    waits on the NAMED hold instead, for a manager or a callback to settle.
+    """
+    manager, driver, chain = _nf888_alias_chain(tmp_path, "held-finalize")
+    stale = _nf888_stale_launched(driver, chain, monkeypatch)
+    _nf888_kill_reporting_model(
+        manager, driver, chain, state="finalize_failed", error_code="",
+    )
+
+    assert driver.drain(max_actions=1, now=NOW).pending == 1
+    held = driver._route_attempts(chain.chain_id, "correctness")
+    assert len(held) == 1
+    assert held[0]["state"] == "retired"
+    assert review_orchestrator.route_attempt_hold(
+        held[0]["failure_reason"]
+    ) == "callback_reconcile"
+
+    for _ in range(3):
+        assert driver.drain(max_actions=1, now=NOW).pending == 1
+        assert driver._route_attempts(chain.chain_id, "correctness") == held
+        assert len(manager.provider_launches) == 1
+        wait = manager.events[-1]["review_automation"]
+        assert wait["state"] == "deferred"
+        assert wait["reason"] == "review_route_hold:callback_reconcile"
+    assert [
+        call["reviewer_task_id"] for call in manager.launches
+    ].count(str(stale["reviewer_task_id"])) == 1
