@@ -6200,43 +6200,47 @@ def _open_authenticated_regular_file_snapshot_lstat_walk(
     """Best-effort fallback where the host has neither ``dir_fd`` nor
     ``O_NOFOLLOW`` (Windows).
 
-    Each path component is ``lstat``-checked for a symlink/reparse point
-    before the walk trusts it, mirroring
-    ``terminal_authority._windows_link_identity``. Unlike the ``dir_fd`` walk
-    above, a check and the next descent are not atomic with each other --
-    Windows has no directory-relative open to close that window -- so the
-    final file's identity is re-verified against its own pre-open ``lstat``
-    after opening, refusing a swap performed in that last, narrower window.
+    Each path component -- including ``repo_root``'s OWN ancestry all the way
+    up to the filesystem anchor, exactly like the ``dir_fd`` walk's
+    root-to-``repo_root`` component loop above, not just the components below
+    it -- is ``lstat``-checked for a symlink/reparse point before the walk
+    trusts it, mirroring ``terminal_authority._windows_link_identity``. A
+    single ``lstat`` on the full path would let the OS silently follow a
+    symlinked ANCESTOR (``lstat`` only refuses the final component), so this
+    walks one component at a time instead. Unlike the ``dir_fd`` walk, a
+    check and the next descent are not atomic with each other -- Windows has
+    no directory-relative open to close that window -- so the final file's
+    identity is re-verified against its own pre-open ``lstat`` after opening,
+    refusing a swap performed in that last, narrower window.
     """
 
     rel_display = rel_path.as_posix()
-    current = repo_root
-    try:
-        root_stat = current.lstat()
-    except OSError as exc:
-        raise SourceGraphError(
-            f"source_graph_single_file_unreadable:{repo_root}"
-        ) from exc
-    if not stat.S_ISDIR(root_stat.st_mode) or _windows_reparse_or_symlink(root_stat):
-        raise SourceGraphError(f"source_graph_single_file_non_directory:{repo_root}")
+
+    def _check_directory_component(candidate: Path, error_display: object) -> None:
+        try:
+            component_stat = candidate.lstat()
+        except OSError as exc:
+            raise SourceGraphError(
+                f"source_graph_single_file_unreadable:{error_display}"
+            ) from exc
+        if _windows_reparse_or_symlink(component_stat):
+            raise SourceGraphError(
+                f"source_graph_single_file_symlink:{error_display}"
+            )
+        if not stat.S_ISDIR(component_stat.st_mode):
+            raise SourceGraphError(
+                f"source_graph_single_file_non_directory:{error_display}"
+            )
+
+    current = Path(repo_root.anchor)
+    for part in repo_root.parts[1:]:
+        current = current / part
+        _check_directory_component(current, repo_root)
 
     parts = rel_path.parts
     for part in parts[:-1]:
         current = current / part
-        try:
-            component_stat = current.lstat()
-        except OSError as exc:
-            raise SourceGraphError(
-                f"source_graph_single_file_unreadable:{rel_display}"
-            ) from exc
-        if _windows_reparse_or_symlink(component_stat):
-            raise SourceGraphError(
-                f"source_graph_single_file_symlink:{rel_display}"
-            )
-        if not stat.S_ISDIR(component_stat.st_mode):
-            raise SourceGraphError(
-                f"source_graph_single_file_non_directory:{rel_display}"
-            )
+        _check_directory_component(current, rel_display)
 
     file_path = current / parts[-1]
     try:
