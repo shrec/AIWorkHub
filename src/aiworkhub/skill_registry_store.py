@@ -1264,3 +1264,152 @@ def skill_coverage(
             "truncated": receipts_truncated,
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# Learning-ledger reach -- how much of the learning commit ledger the skill
+# registry can see, measured only from rows this repository wrote.
+#
+# ``skill_coverage`` above answers "is the skill system reaching a worker".
+# This answers the companion question the learning-to-skill wiring needs: how
+# much of the LEDGER -- the manager's own learning commits -- has any edge
+# into anything at all, and how many stored skills carry evidence of their
+# own. It is not a second store: every commit count is read from the SAME
+# canonical task database :mod:`aiworkhub.learning_commit_store` already owns,
+# through the identical read-only connection that module uses internally, and
+# every skill count is read through this module's own public readers.
+# ---------------------------------------------------------------------------
+
+LEARNING_COVERAGE_SCHEMA_ID = "aiworkhub.skill_registry_store.learning_coverage.v1"
+MAX_LEARNING_COVERAGE_COMMITS = 5000
+
+
+def unmeasured_learning_coverage(reason: str) -> dict[str, Any]:
+    """The one shape an unavailable learning-coverage reading takes. Never zeros."""
+    return {
+        "schema_id": LEARNING_COVERAGE_SCHEMA_ID,
+        "measured": False,
+        "unavailable_reason": reason,
+        "commits": {},
+        "skills": {},
+    }
+
+
+def learning_registry_coverage(
+    repo_root: str | Path,
+    *,
+    commit_limit: int = MAX_LEARNING_COVERAGE_COMMITS,
+    record_limit: int = MAX_LOAD_LIMIT,
+) -> dict[str, Any]:
+    """Return bounded, measured reach between the learning ledger and this registry.
+
+    Four numbers, no rows:
+
+    * ``commits.total`` -- learning commits this repository has recorded, read
+      from the same ``learning_commits`` table
+      :mod:`aiworkhub.learning_commit_store` owns.
+    * ``commits.edge_connected`` / ``commits.edges`` -- commits that named at
+      least one Context Graph edge candidate, and the total edge count.
+    * ``commits.ai_memory_reachable`` / ``commits.ai_memory_reachable_percent``
+      -- commits whose AI Memory projection actually landed
+      (``state == "applied"``), never a commit merely ELIGIBLE for that
+      projection.
+    * ``skills.evidence_bearing`` -- stored skill records carrying at least
+      one evidence entry, of any outcome. This is a PRESENCE count, never a
+      claim of usage: a still-``proposed`` skill with one accepted evidence
+      entry is counted here and is not thereby active, injected, or used.
+
+    An absent or unreadable ledger, or an unreadable skills store, answers
+    ``measured: False`` with a reason -- the same "unavailable is not zero"
+    contract :func:`skill_coverage` and :func:`unmeasured_coverage` already
+    hold. Every population read here is bounded and discloses its own bound.
+    """
+    from . import task_store
+
+    try:
+        _readiness, db_path = task_store._require_ready(Path(repo_root))
+    except Exception as exc:  # noqa: BLE001 -- an uninitialized repo has no ledger
+        return unmeasured_learning_coverage(f"task_store_unavailable:{type(exc).__name__}")
+
+    commit_page = max(1, min(int(commit_limit), MAX_LEARNING_COVERAGE_COMMITS))
+    total = edge_connected = edges = ai_memory_reachable = 0
+    commits_truncated = False
+    try:
+        conn = connect_readonly(db_path)
+        try:
+            conn.row_factory = sqlite3.Row
+            has_table = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='learning_commits'"
+            ).fetchone() is not None
+            if has_table:
+                rows = conn.execute(
+                    "SELECT payload_json, projections_json FROM learning_commits "
+                    "ORDER BY created_at, task_id LIMIT ?",
+                    (commit_page + 1,),
+                ).fetchall()
+                commits_truncated = len(rows) > commit_page
+                for row in rows[:commit_page]:
+                    total += 1
+                    try:
+                        payload = json.loads(row["payload_json"] or "{}")
+                    except (TypeError, ValueError):
+                        payload = {}
+                    edge_list = (
+                        payload.get("edge_candidates") if isinstance(payload, dict) else None
+                    )
+                    if isinstance(edge_list, list) and edge_list:
+                        edge_connected += 1
+                        edges += len(edge_list)
+                    try:
+                        projections = json.loads(row["projections_json"] or "{}")
+                    except (TypeError, ValueError):
+                        projections = {}
+                    memory = (
+                        projections.get("ai_memory") if isinstance(projections, dict) else None
+                    )
+                    if isinstance(memory, dict) and memory.get("state") == "applied":
+                        ai_memory_reachable += 1
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        return unmeasured_learning_coverage(
+            f"learning_commit_ledger_unreadable:{type(exc).__name__}"
+        )
+
+    record_page = max(1, min(int(record_limit), MAX_LOAD_LIMIT))
+    try:
+        stored = list_records(repo_root, limit=record_page, strict=True)
+        records_truncated = _more_rows_beyond(
+            repo_root,
+            "SELECT identity FROM skill_records "
+            "ORDER BY identity ASC, version ASC LIMIT ? OFFSET ?",
+            offset=record_page,
+            strict=True,
+        )
+    except (SkillStoreError, sqlite3.Error, OSError, ValueError) as exc:
+        return unmeasured_learning_coverage(f"skill_store_unreadable:{type(exc).__name__}")
+
+    evidence_bearing = sum(1 for record in stored if record.evidence)
+
+    return {
+        "schema_id": LEARNING_COVERAGE_SCHEMA_ID,
+        "measured": True,
+        "unavailable_reason": "",
+        "commits": {
+            "total": total,
+            "edge_connected": edge_connected,
+            "edges": edges,
+            "ai_memory_reachable": ai_memory_reachable,
+            "ai_memory_reachable_percent": (
+                round(ai_memory_reachable / total * 100.0, 1) if total else None
+            ),
+            "commit_limit": commit_page,
+            "truncated": commits_truncated,
+        },
+        "skills": {
+            "total": len(stored),
+            "evidence_bearing": evidence_bearing,
+            "record_limit": record_page,
+            "truncated": records_truncated,
+        },
+    }

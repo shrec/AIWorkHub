@@ -17,6 +17,7 @@ import sqlite3
 import pytest
 
 import aiworkhub.skill_registry as sr
+from aiworkhub import learning_commit_store, task_store
 from aiworkhub import skill_registry_store as store
 from aiworkhub.dashboard import DashboardProvider
 
@@ -556,6 +557,104 @@ def test_stored_state_digest_keeps_a_demoted_record_advanceable(tmp_path):
     with pytest.raises(store.SkillStoreConflictError):
         store.advance_record(tmp_path, advanced, expected_state_digest=stored_token)
 
+
+# ---------------------------------------------------------------------------
+# Learning-ledger reach: the companion coverage question learning-to-skill
+# wiring needs, measured only from rows this repository wrote.
+# ---------------------------------------------------------------------------
+
+
+def _seed_learning_commit(
+    root, task_id, request_id, *, outcome="rejected", edges=None, ai_memory_applied=False
+):
+    task_store.initialize_repository(root)
+    db = root / ".aiworkhub" / "tasking" / "task_queue.sqlite"
+    conn = sqlite3.connect(str(db))
+    try:
+        conn.executescript(learning_commit_store._SCHEMA)
+        payload = {"failure_category": None, "edge_candidates": edges or []}
+        projections = {
+            "ai_memory": {"state": "applied" if ai_memory_applied else "not_requested"}
+        }
+        conn.execute(
+            "INSERT OR REPLACE INTO learning_commits(commit_id,idempotency_key,task_id,"
+            "request_id,repository_id,repo_area,outcome,payload_json,payload_sha256,"
+            "projections_json,state,manager_id,manager_provider,provenance,created_at,"
+            "updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                f"{task_id}:{request_id}", f"{task_id}:{request_id}", task_id, request_id,
+                "repo", "src/aiworkhub", outcome, json.dumps(payload), "sha",
+                json.dumps(projections), "completed", "m", "claude", "test",
+                "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00",
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_learning_registry_coverage_absent_repo_is_unmeasured(tmp_path):
+    coverage = store.learning_registry_coverage(tmp_path)
+    assert coverage["measured"] is False
+    assert coverage["unavailable_reason"]
+    assert coverage["commits"] == {}
+    assert coverage["skills"] == {}
+
+
+def test_unmeasured_learning_coverage_shape():
+    coverage = store.unmeasured_learning_coverage("some_reason")
+    assert coverage == {
+        "schema_id": store.LEARNING_COVERAGE_SCHEMA_ID,
+        "measured": False,
+        "unavailable_reason": "some_reason",
+        "commits": {},
+        "skills": {},
+    }
+
+
+def test_learning_registry_coverage_measures_commits_and_edges(tmp_path):
+    _seed_learning_commit(
+        tmp_path, "T1", "r1", outcome="accepted",
+        edges=[{"source": "a", "target": "b", "relation": "supports"}],
+        ai_memory_applied=True,
+    )
+    _seed_learning_commit(tmp_path, "T2", "r2", outcome="rejected")
+
+    coverage = store.learning_registry_coverage(tmp_path)
+
+    assert coverage["measured"] is True
+    assert coverage["unavailable_reason"] == ""
+    assert coverage["commits"]["total"] == 2
+    assert coverage["commits"]["edge_connected"] == 1
+    assert coverage["commits"]["edges"] == 1
+    assert coverage["commits"]["ai_memory_reachable"] == 1
+    assert coverage["commits"]["ai_memory_reachable_percent"] == 50.0
+    assert coverage["commits"]["truncated"] is False
+
+
+def test_learning_registry_coverage_counts_evidence_bearing_skills(tmp_path):
+    _seed_learning_commit(tmp_path, "T1", "r1")
+    store.put_record(tmp_path, base_record())
+    without_evidence = store.learning_registry_coverage(tmp_path)
+    assert without_evidence["skills"]["total"] == 1
+    assert without_evidence["skills"]["evidence_bearing"] == 0
+
+    store.put_record(tmp_path, active_record(version="2.0.0"))
+    with_evidence = store.learning_registry_coverage(tmp_path)
+    assert with_evidence["skills"]["total"] == 2
+    # Presence, never usage: neither newly-counted record is thereby active,
+    # injected, or used -- the count is only that at least one evidence entry
+    # was recorded against it.
+    assert with_evidence["skills"]["evidence_bearing"] == 1
+
+
+def test_learning_registry_coverage_never_writes(tmp_path):
+    _seed_learning_commit(tmp_path, "T1", "r1")
+    store.put_record(tmp_path, active_record())
+    before = store.get_record(tmp_path, "commit-msg-check", "1.0.0")
+    store.learning_registry_coverage(tmp_path)
+    after = store.get_record(tmp_path, "commit-msg-check", "1.0.0")
+    assert after == before
 
 def test_stored_state_digest_is_none_for_an_absent_store_or_row(tmp_path):
     assert store.stored_state_digest(tmp_path, "nope", "1.0.0") is None

@@ -1573,6 +1573,37 @@ def _selection_reasons(record: SkillRecord, context: Mapping[str, Any]) -> tuple
     return tuple(reasons[:_SELECT_REASON_LIMIT])
 
 
+def declared_match_reasons(
+    record: SkillRecord, context: Mapping[str, Any]
+) -> tuple[str, ...] | None:
+    """Return :func:`select`'s exact match reason tokens, independent of lifecycle.
+
+    :func:`select` answers "is this ACTIVE record reachable by this card" and
+    filters out every other record before the vocabulary comparison ever
+    runs. An evidence-attachment caller must ask a narrower question about a
+    record that is still ``proposed`` and accumulating the very evidence
+    :func:`can_activate` requires: "would this record's OWN declared
+    vocabulary match this context, whatever its lifecycle state is right
+    now". This is that comparison, exposed on its own rather than
+    re-implemented, so a caller never duplicates the closed-vocabulary
+    predicate to ask it.
+
+    The returned tokens replace the literal ``lifecycle:active`` head
+    :func:`select` always emits (a constant, not a real lifecycle read) with
+    ``lifecycle:any``, so a caller can never mistake this for proof that the
+    record is active. It decides nothing about eligibility and performs no
+    lifecycle transition: treating a match on a non-``active`` record as
+    evidence toward activation, never as an injection or an activation
+    itself, is the caller's responsibility.
+    """
+    record = validate_record(record)
+    normalized = _normalize_select_context(context)
+    reasons = _selection_reasons(record, normalized)
+    if reasons is None:
+        return None
+    return ("lifecycle:any", *reasons[1:])
+
+
 def _validate_select_limit(limit: Any) -> int:
     if isinstance(limit, bool) or not isinstance(limit, int):
         _fail("skill_registry.invalid_type", "limit must be a positive int")
@@ -2381,6 +2412,7 @@ __all__ = [
     "canonical_actor_id",
     "canonical_json",
     "canonical_payload",
+    "declared_match_reasons",
     "independent_accepted_actor_ids",
     "independent_accepted_evidence_count",
     "is_injectable",

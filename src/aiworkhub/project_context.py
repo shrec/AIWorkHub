@@ -1267,6 +1267,7 @@ def _skill_selection_metadata(section: dict[str, Any]) -> dict[str, Any]:
             "measured": False,
             "selected_count": None,
             "injected_count": None,
+            "evidence_backed_count": None,
             "empty_reason": "",
             "failure_reason": section["degraded_reason"],
         }
@@ -1274,6 +1275,7 @@ def _skill_selection_metadata(section: dict[str, Any]) -> dict[str, Any]:
         "measured": True,
         "selected_count": section["selected_count"],
         "injected_count": section["injected_count"],
+        "evidence_backed_count": section["evidence_backed_count"],
         "empty_reason": section["empty_reason"],
         "failure_reason": "",
     }
@@ -1320,6 +1322,22 @@ def _skills_section(repo: Path, card: dict[str, Any]) -> dict[str, Any] | None:
         candidates = tuple(skill_registry_store.load_registry(repo).records())
         receipt = skill_registry.select(candidates, context, limit=SKILL_SELECT_LIMIT)
         packet = skill_registry.build_runtime_packet(candidates, receipt)
+        # Presence, never usage: a record carries evidence the moment ANY
+        # accepted/negative entry lands on it (mining/decision wiring), long
+        # before that evidence clears the two-actor activation floor. This
+        # counts injected packet rows whose candidate carries at least one
+        # such entry -- a fact about the registry, reported beside the
+        # selection/injection counts below so a reader never mistakes one
+        # measured count for the other.
+        evidence_backed_identities = {
+            (candidate.identity, candidate.version)
+            for candidate in candidates
+            if candidate.evidence
+        }
+        evidence_backed_count = sum(
+            1 for row in packet.skills
+            if (row.identity, row.version) in evidence_backed_identities
+        )
         # WHY nothing was selected, derived from the same candidate set the
         # receipt came from. A bounded, well-formed, empty packet is what 24 of
         # 24 measured card contexts produced, and with no reason attached it
@@ -1374,6 +1392,7 @@ def _skills_section(repo: Path, card: dict[str, Any]) -> dict[str, Any] | None:
         stage=str(context["stage"]),
         selected_count=len(receipt.selected),
         injected_count=len(packet.skills),
+        evidence_backed_count=evidence_backed_count,
         empty_reason=empty_reason,
         content=content,
         truncated=False,

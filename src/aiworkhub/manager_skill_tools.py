@@ -27,6 +27,7 @@ evidence entries can never collapse into one lost update.
 
 from __future__ import annotations
 
+import bisect
 import re
 import sqlite3
 from collections import Counter
@@ -824,3 +825,299 @@ def retirement_report(
             "surface": "manager_mcp",
         }
     return {"ok": True, **report, "manager": manager, "surface": "manager_mcp"}
+
+
+# ---------------------------------------------------------------------------
+# Learning-commit evidence: connecting the learning ledger to the registry.
+#
+# ``record_decision_evidence`` attributes a decision to whichever skills a
+# SELECTION RECEIPT proves were actually injected into the judged card. Most
+# of the learning ledger's commits carry no such receipt -- the packet was
+# never persisted for them -- so they never contributed evidence at all. This
+# is the second, independent route: it matches a learning commit's OWN card
+# against a stored skill's OWN declared vocabulary, using the identical
+# closed-vocabulary predicate real-time selection uses
+# (:func:`skill_registry.declared_match_reasons`), and attaches the ledger's
+# own adjudicated outcome (:func:`learning_commit_store.read_card_outcomes`)
+# as evidence anchored to the exact ``task_id:request_id`` key that produced
+# it. Nothing here infers a family, a path, or an actor: every dimension is
+# read off an existing authority, never typed or guessed.
+# ---------------------------------------------------------------------------
+
+LEARNING_EVIDENCE_SCHEMA_ID = "aiworkhub.skill_learning_evidence.v1"
+MAX_LEARNING_EVIDENCE_SWEEP = 200
+
+
+def _learning_commit_outcome(
+    outcomes: dict[str, Any], task_id: str, request_id: str
+) -> tuple[str, str] | None:
+    """Return ``(resolved_request_id, decision)`` for one commit key, or ``None``.
+
+    An exact ``task_id:request_id`` entry wins; with no request id supplied,
+    the card's latest adjudication (the bare ``task_id`` key
+    :func:`learning_commit_store.read_card_outcomes` keeps pointed at the
+    newest row) is used instead. Either way the request id returned is the
+    one the ledger itself recorded, never the caller's unverified guess.
+    """
+    request = str(request_id or "").strip()
+    if request:
+        entry = outcomes.get(f"{task_id}:{request}")
+        if entry is None:
+            return None
+        return str(entry.get("request_id") or request), str(entry.get("outcome") or "")
+    entry = outcomes.get(task_id)
+    if entry is None:
+        return None
+    return str(entry.get("request_id") or ""), str(entry.get("outcome") or "")
+
+
+def _context_payload(context: dict[str, Any]) -> dict[str, Any]:
+    """A JSON-safe rendering of a :func:`project_context._skill_selection_context`."""
+    risk = context.get("risk")
+    return {
+        "task_family": str(context.get("task_family") or ""),
+        "path_or_symbol": str(context.get("path_or_symbol") or ""),
+        "risk": risk.value if hasattr(risk, "value") else str(risk or ""),
+        "stage": str(context.get("stage") or ""),
+        "triggers": list(context.get("triggers") or ()),
+        "applicability": list(context.get("applicability") or ()),
+    }
+
+
+def add_learning_commit_evidence(*, task_id: str, request_id: str = "") -> dict[str, Any]:
+    """MANAGER WRITE: attach one learning commit's outcome as evidence.
+
+    Deterministic in every dimension:
+
+    * KEY -- the exact ``task_id``/``request_id`` the learning ledger recorded
+      the commit under (:func:`learning_commit_store.read_card_outcomes`),
+      never a caller-supplied guess.
+    * FAMILY/PATH -- the commit's own card's selection context
+      (:func:`project_context._skill_selection_context`), matched against each
+      stored record's declared vocabulary with the identical predicate
+      real-time selection uses (:func:`skill_registry.declared_match_reasons`).
+      Matching is not gated on lifecycle, so a still-``proposed`` record --
+      the one case that actually needs evidence to reach ``active`` -- is
+      reachable here.
+    * ACTOR -- read off the card's own ``runner`` (:func:`_task_actor`), never
+      typed, for the same reason :func:`add_task_evidence` never accepts one.
+
+    A card with no adjudicated commit, no selection vocabulary, or an
+    unreadable ledger returns ``ok: True`` with an exact ``reason`` and no
+    ``recorded`` rows -- an unlinked commit is a fact, never a failure of
+    this call. A record-level write refusal (a stale advance, a rejected
+    ``add_evidence``) is reported per-record in ``unlinked`` and never
+    raised: one contested record must not block every other matching
+    record's evidence from landing.
+
+    This never activates, promotes, or injects anything: it only appends
+    evidence entries through the unchanged
+    :meth:`skill_registry.SkillRegistry.add_evidence` gate, and activation
+    still requires the store's own independent-actor floor.
+    """
+    from . import learning_commit_store
+    from . import project_context
+
+    root, _token, manager = _manager_context()
+    if root is None:
+        return manager
+    if not core.writes_allowed():
+        return {"ok": False, "error": "write_gate_closed", "surface": "manager_mcp", "manager": manager}
+
+    task = str(task_id or "").strip()
+    if not task or len(task) > 256:
+        return {"ok": False, "error": "task_id_required", "manager": manager, "surface": "manager_mcp"}
+
+    def _unlinked(reason: str) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "schema_id": LEARNING_EVIDENCE_SCHEMA_ID,
+            "task_id": task,
+            "request_id": str(request_id or ""),
+            "reason": reason,
+            "recorded": [],
+            "unlinked": [],
+            "manager": manager,
+            "surface": "manager_mcp",
+        }
+
+    try:
+        outcomes = learning_commit_store.read_card_outcomes(root)
+    except (OSError, sqlite3.Error) as exc:
+        return _unlinked(f"learning_commit_ledger_unreadable:{type(exc).__name__}")
+
+    resolved = _learning_commit_outcome(outcomes, task, str(request_id or ""))
+    if resolved is None:
+        return _unlinked("no_learning_commit_for_this_key")
+    resolved_request, decision = resolved
+    if decision not in DECISION_EVIDENCE_OUTCOMES:
+        return _unlinked("learning_commit_outcome_not_adjudicated")
+    evidence_outcome = DECISION_EVIDENCE_OUTCOMES[decision]
+
+    try:
+        card = task_store.get_task(root, task)
+    except Exception as exc:  # noqa: BLE001 -- an unreadable card cannot be linked
+        return _unlinked(f"task_card_unreadable:{type(exc).__name__}")
+    if not isinstance(card, dict):
+        return _unlinked("task_card_not_in_canonical_store")
+
+    try:
+        context = project_context._skill_selection_context(card)
+    except sr.SkillRegistryError as exc:
+        return _unlinked(f"card_selection_context_invalid:{exc.code}")
+    if context is None:
+        return _unlinked("card_declares_no_selection_vocabulary")
+
+    try:
+        _role, actor_id, anchor_task = _task_actor(root, task, require_finished=False)
+    except sr.SkillRegistryError as exc:
+        return _unlinked(str(exc)[:240])
+
+    anchor = f"{anchor_task}:{resolved_request}" if resolved_request else anchor_task
+
+    try:
+        stored = store.list_records(root, strict=True)
+    except (store.SkillStoreError, OSError, sqlite3.Error) as exc:
+        return _unlinked(f"skill_store_unreadable:{type(exc).__name__}")
+
+    recorded: list[dict[str, Any]] = []
+    unlinked: list[dict[str, Any]] = []
+    for record in stored:
+        try:
+            reasons = sr.declared_match_reasons(record, context)
+        except sr.SkillRegistryError:
+            continue
+        if reasons is None:
+            continue
+        if any(
+            item.source == anchor
+            and item.actor_id == actor_id
+            and item.outcome.value == evidence_outcome
+            for item in record.evidence
+        ):
+            recorded.append({
+                "identity": record.identity, "version": record.version,
+                "outcome": evidence_outcome, "idempotent": True,
+            })
+            continue
+        try:
+            registry = store.load_registry(root)
+            expected = store.stored_state_digest(root, record.identity, record.version)
+            authority = sr.Authority(sr.AuthorityRole.WORKER, actor_id=actor_id, token="")
+            updated = registry.add_evidence(
+                record.identity,
+                record.version,
+                {
+                    "source": anchor,
+                    "outcome": evidence_outcome,
+                    "note": f"learning commit {anchor} was {decision}"[:2000],
+                },
+                authority,
+            )
+            store.advance_record(root, updated, expected_state_digest=expected)
+        except (sr.SkillRegistryError, store.SkillStoreError, OSError, sqlite3.Error) as exc:
+            unlinked.append({
+                "identity": record.identity, "version": record.version,
+                "reason": str(exc)[:200],
+            })
+            continue
+        recorded.append({
+            "identity": record.identity, "version": record.version,
+            "outcome": evidence_outcome, "idempotent": False,
+        })
+
+    return {
+        "ok": True,
+        "schema_id": LEARNING_EVIDENCE_SCHEMA_ID,
+        "task_id": task,
+        "request_id": resolved_request,
+        "outcome": decision,
+        "evidence_outcome": evidence_outcome,
+        "actor_id": actor_id,
+        "actor_source": "task_card_runner",
+        "matched_context": _context_payload(context),
+        "recorded": recorded,
+        "unlinked": unlinked,
+        "manager": manager,
+        "surface": "manager_mcp",
+    }
+
+
+def sweep_learning_commit_evidence(
+    *, limit: int = MAX_LEARNING_EVIDENCE_SWEEP, cursor: str = ""
+) -> dict[str, Any]:
+    """MANAGER WRITE: attach evidence for every learning commit, bounded.
+
+    Calls :func:`add_learning_commit_evidence` once per distinct
+    ``task_id:request_id`` the learning ledger has recorded, in sorted key
+    order, up to ``limit``. This is the backfill path: connecting an
+    already-recorded commit to a matching skill needs no new decision, so a
+    manager can run this once to reach every commit written before this
+    wiring existed, or again later once new commits land.
+
+    Bounded and disclosed: ``limit`` is clamped to
+    :data:`MAX_LEARNING_EVIDENCE_SWEEP`. A ledger holding more commits than
+    the bounded window reports ``truncated: True`` and a non-empty
+    ``next_cursor`` rather than silently stopping partway through with no
+    signal. ``cursor`` resumes a prior sweep: pass back the ``next_cursor`` a
+    previous call returned to pick up immediately after the last key it
+    processed, in the same sorted order, so a ledger larger than
+    :data:`MAX_LEARNING_EVIDENCE_SWEEP` is reached in full across successive
+    calls instead of replaying the lexicographically first window forever.
+    ``next_cursor`` is ``""`` once nothing remains after this window.
+    """
+    from . import learning_commit_store
+
+    root, _token, manager = _manager_context()
+    if root is None:
+        return manager
+    if not core.writes_allowed():
+        return {"ok": False, "error": "write_gate_closed", "surface": "manager_mcp", "manager": manager}
+
+    bounded_limit = max(1, min(int(limit), MAX_LEARNING_EVIDENCE_SWEEP))
+    try:
+        outcomes = learning_commit_store.read_card_outcomes(root)
+    except (OSError, sqlite3.Error) as exc:
+        return {
+            "ok": False,
+            "error": f"learning_commit_ledger_unreadable:{type(exc).__name__}",
+            "manager": manager,
+            "surface": "manager_mcp",
+        }
+    keys = sorted(key for key in outcomes if ":" in key)
+    after = str(cursor or "").strip()
+    start = bisect.bisect_right(keys, after) if after else 0
+    window = keys[start : start + bounded_limit]
+    truncated = start + len(window) < len(keys)
+    next_cursor = window[-1] if truncated else ""
+    results = [
+        add_learning_commit_evidence(task_id=key.partition(":")[0], request_id=key.partition(":")[2])
+        for key in window
+    ]
+    return {
+        "ok": True,
+        "schema_id": LEARNING_EVIDENCE_SCHEMA_ID,
+        "cursor": after,
+        "next_cursor": next_cursor,
+        "commits_considered": len(results),
+        "commits_total": len(keys),
+        "truncated": truncated,
+        "recorded_total": sum(len(item.get("recorded") or []) for item in results),
+        "results": results,
+        "manager": manager,
+        "surface": "manager_mcp",
+    }
+
+
+def learning_skill_coverage() -> dict[str, Any]:
+    """MANAGER READ: measured reach between the learning ledger and the skill registry.
+
+    Wraps :func:`skill_registry_store.learning_registry_coverage`, the single
+    authority for these counts, behind the verified manager identity every
+    other read in this module requires. Never writes.
+    """
+    root, _token, manager = _manager_context()
+    if root is None:
+        return manager
+    coverage = store.learning_registry_coverage(root)
+    return {"ok": True, **coverage, "manager": manager, "surface": "manager_mcp"}

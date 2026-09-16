@@ -865,3 +865,305 @@ def test_the_usage_tool_names_every_reason_it_can_return():
         "lifecycle_state_is_proposed_not_active",
     ):
         assert reason in description, reason
+
+
+# ---------------------------------------------------------------------------
+# Learning-commit evidence: connecting the learning ledger to the registry
+# by deterministic family/path/key matching, independent of selection receipts.
+# ---------------------------------------------------------------------------
+
+LEARNING_BASE = {
+    "identity": "learning-linked-skill",
+    "version": "1.0.0",
+    "scope": "repository",
+    "task_family": "bugfix",
+    "path_or_symbol": "src/aiworkhub/*",
+    "risk": "medium",
+    "stage": "review",
+    "triggers": [],
+    "confidence": 0.7,
+}
+
+
+def _seed_skill_card(root, task_id, *, runner="claude_sonnet-5"):
+    """A card declaring the closed selection vocabulary the ledger cards need."""
+    _seed_card(root, task_id, runner=runner)
+    card = {
+        "task_id": task_id,
+        "runner": runner,
+        "allowed_writes": ["src/aiworkhub/foo.py"],
+        "skill_task_family": "bugfix",
+        "skill_stage": "review",
+        "skill_triggers": ["code_change"],
+        "skill_applicability": ["quality_gate"],
+        "risk_tier": "medium",
+    }
+    conn = sqlite3.connect(str(root / ".aiworkhub" / "tasking" / "task_queue.sqlite"))
+    try:
+        conn.execute(
+            "UPDATE tasks SET card_json=? WHERE task_id=?", (json.dumps(card), task_id)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _seed_template_skill_card(root, task_id, *, runner="claude_sonnet-5"):
+    """A template-created card with mixed src+tests writes and no explicit
+    ``skill_task_family``/``skill_path_scope`` -- the shape real card creation
+    produces, which only the runtime derivation
+    (:func:`project_context._skill_selection_context`) resolves via the
+    card's ``template_provenance`` and its production-only write scope.
+    """
+    _seed_card(root, task_id, runner=runner)
+    card = {
+        "task_id": task_id,
+        "runner": runner,
+        "template_provenance": {"template_name": "bugfix_with_regression"},
+        "allowed_writes": ["src/aiworkhub/foo.py", "tests/test_foo.py"],
+        "skill_stage": "review",
+        "skill_triggers": ["code_change"],
+        "skill_applicability": ["quality_gate"],
+        "risk_tier": "medium",
+    }
+    conn = sqlite3.connect(str(root / ".aiworkhub" / "tasking" / "task_queue.sqlite"))
+    try:
+        conn.execute(
+            "UPDATE tasks SET card_json=? WHERE task_id=?", (json.dumps(card), task_id)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _seed_learning_commit(
+    root, task_id, request_id, *, outcome="rejected", edges=None, ai_memory_applied=False
+):
+    task_store.initialize_repository(root)
+    db = root / ".aiworkhub" / "tasking" / "task_queue.sqlite"
+    conn = sqlite3.connect(str(db))
+    try:
+        conn.executescript(learning_commit_store._SCHEMA)
+        payload = {"failure_category": None, "edge_candidates": edges or []}
+        projections = {
+            "ai_memory": {"state": "applied" if ai_memory_applied else "not_requested"}
+        }
+        conn.execute(
+            "INSERT OR REPLACE INTO learning_commits(commit_id,idempotency_key,task_id,"
+            "request_id,repository_id,repo_area,outcome,payload_json,payload_sha256,"
+            "projections_json,state,manager_id,manager_provider,provenance,created_at,"
+            "updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                f"{task_id}:{request_id}", f"{task_id}:{request_id}", task_id, request_id,
+                "repo", "src/aiworkhub", outcome, json.dumps(payload), "sha",
+                json.dumps(projections), "completed", "m", "claude", "test",
+                "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00",
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_add_learning_commit_evidence_matches_by_family_path_and_key(manager):
+    mst.propose(**LEARNING_BASE)
+    _seed_skill_card(manager, "T_LEARN1")
+    _seed_learning_commit(manager, "T_LEARN1", "req-1", outcome="rejected")
+
+    result = mst.add_learning_commit_evidence(task_id="T_LEARN1", request_id="req-1")
+
+    assert result["ok"] is True
+    assert result["outcome"] == "rejected"
+    assert result["evidence_outcome"] == "negative"
+    assert result["actor_id"] == "worker.claude.sonnet.5"
+    assert result["actor_source"] == "task_card_runner"
+    assert [row["identity"] for row in result["recorded"]] == [LEARNING_BASE["identity"]]
+
+    record = store.load_registry(manager).get(
+        LEARNING_BASE["identity"], LEARNING_BASE["version"]
+    )
+    assert record.evidence[-1].outcome is sr.EvidenceOutcome.NEGATIVE
+    assert record.evidence[-1].source == "T_LEARN1:req-1"
+    # Attaching evidence never activates, promotes, or injects anything.
+    assert record.lifecycle_state is sr.LifecycleState.PROPOSED
+
+
+def test_add_learning_commit_evidence_is_idempotent(manager):
+    mst.propose(**LEARNING_BASE)
+    _seed_skill_card(manager, "T_LEARN2")
+    _seed_learning_commit(manager, "T_LEARN2", "req-2", outcome="accepted")
+
+    first = mst.add_learning_commit_evidence(task_id="T_LEARN2", request_id="req-2")
+    second = mst.add_learning_commit_evidence(task_id="T_LEARN2", request_id="req-2")
+
+    assert first["recorded"][0]["idempotent"] is False
+    assert second["recorded"][0]["idempotent"] is True
+    record = store.load_registry(manager).get(
+        LEARNING_BASE["identity"], LEARNING_BASE["version"]
+    )
+    assert len(record.evidence) == 1
+
+
+def test_add_learning_commit_evidence_reports_no_commit_for_unknown_key(manager):
+    mst.propose(**LEARNING_BASE)
+
+    result = mst.add_learning_commit_evidence(task_id="NOPE", request_id="r")
+
+    assert result["ok"] is True
+    assert result["reason"] == "no_learning_commit_for_this_key"
+    assert result["recorded"] == []
+
+
+def test_add_learning_commit_evidence_reports_when_card_declares_no_vocabulary(manager):
+    mst.propose(**LEARNING_BASE)
+    _seed_card(manager, "T_NOVOCAB", runner="claude_sonnet-5")
+    _seed_learning_commit(manager, "T_NOVOCAB", "req-3", outcome="accepted")
+
+    result = mst.add_learning_commit_evidence(task_id="T_NOVOCAB", request_id="req-3")
+
+    assert result["ok"] is True
+    assert result["reason"] == "card_declares_no_selection_vocabulary"
+    assert result["recorded"] == []
+
+
+def test_add_learning_commit_evidence_uses_the_runtime_selection_derivation(manager):
+    """A template-created card with mixed src/tests writes and no explicit
+    ``skill_task_family``/``skill_path_scope`` must resolve through the exact
+    fallback derivation runtime injection uses
+    (:func:`project_context._skill_selection_context`), not the raw
+    :func:`skill_registry.card_selection_context`, which sees neither the
+    template-derived family nor the production-only path scope and would
+    wrongly report ``card_declares_no_selection_vocabulary``.
+    """
+    mst.propose(**LEARNING_BASE)
+    _seed_template_skill_card(manager, "T_TEMPLATE1")
+    _seed_learning_commit(manager, "T_TEMPLATE1", "req-t1", outcome="accepted")
+
+    result = mst.add_learning_commit_evidence(task_id="T_TEMPLATE1", request_id="req-t1")
+
+    assert result["ok"] is True
+    assert result.get("reason") != "card_declares_no_selection_vocabulary"
+    assert [row["identity"] for row in result["recorded"]] == [LEARNING_BASE["identity"]]
+    assert result["matched_context"]["task_family"] == "bugfix"
+
+
+def test_add_learning_commit_evidence_reports_unreadable_on_corrupt_skill_store(manager):
+    mst.propose(**LEARNING_BASE)
+    _seed_skill_card(manager, "T_CORRUPT")
+    _seed_learning_commit(manager, "T_CORRUPT", "req-corrupt", outcome="accepted")
+
+    store._db_path(manager).write_bytes(b"not a sqlite database")
+
+    result = mst.add_learning_commit_evidence(task_id="T_CORRUPT", request_id="req-corrupt")
+
+    # A corrupt/unreadable skill store must be reported explicitly, never
+    # silently read back as zero matching records with ok: True and no reason.
+    assert result["ok"] is True
+    assert result["reason"].startswith("skill_store_unreadable:")
+    assert result["recorded"] == []
+
+
+def test_add_learning_commit_evidence_requires_a_verified_manager(tmp_path, monkeypatch):
+    monkeypatch.setattr(core, "manager_bootstrap", lambda: {"role": "worker"})
+    result = mst.add_learning_commit_evidence(task_id="T", request_id="r")
+    assert result["ok"] is False
+    assert result["error"] == "verified_manager_identity_required"
+
+
+def test_sweep_learning_commit_evidence_processes_every_recorded_commit(manager):
+    mst.propose(**LEARNING_BASE)
+    runners = ("claude_sonnet-5", "codex_gpt-5.5", "grok_4.6")
+    for index, runner in enumerate(runners):
+        task_id = f"T_SWEEP{index}"
+        _seed_skill_card(manager, task_id, runner=runner)
+        _seed_learning_commit(manager, task_id, f"req-{index}", outcome="accepted")
+
+    result = mst.sweep_learning_commit_evidence()
+
+    assert result["ok"] is True
+    assert result["commits_total"] == 3
+    assert result["commits_considered"] == 3
+    assert result["truncated"] is False
+    assert result["recorded_total"] == 3
+
+    record = store.load_registry(manager).get(
+        LEARNING_BASE["identity"], LEARNING_BASE["version"]
+    )
+    assert sr.independent_accepted_evidence_count(record) == 3
+    # Connecting the evidence never activates by itself: activation is still an
+    # explicit, separate manager call against the unchanged two-actor gate.
+    assert record.lifecycle_state is sr.LifecycleState.PROPOSED
+    activated = mst.activate(identity=LEARNING_BASE["identity"], version=LEARNING_BASE["version"])
+    assert activated["ok"] is True
+
+
+def test_sweep_learning_commit_evidence_progresses_across_successive_calls(manager, monkeypatch):
+    """A ledger larger than the bounded sweep window must be reached in full
+    across successive calls, each resuming from the prior ``next_cursor``,
+    with no key processed twice and no call left unable to make progress.
+    """
+    monkeypatch.setattr(mst, "MAX_LEARNING_EVIDENCE_SWEEP", 3)
+    mst.propose(**LEARNING_BASE)
+    task_ids = [f"T_PROG{index}" for index in range(7)]
+    for index, task_id in enumerate(task_ids):
+        _seed_skill_card(manager, task_id)
+        _seed_learning_commit(manager, task_id, f"req-{index}", outcome="accepted")
+
+    seen_task_ids: list[str] = []
+    cursor = ""
+    truncated = True
+    calls = 0
+    while truncated:
+        calls += 1
+        assert calls <= len(task_ids), "sweep did not converge"
+        result = mst.sweep_learning_commit_evidence(cursor=cursor)
+        assert result["ok"] is True
+        assert result["commits_considered"] <= 3
+        seen_task_ids.extend(item["task_id"] for item in result["results"])
+        cursor = result["next_cursor"]
+        truncated = result["truncated"]
+
+    assert calls > 1
+    # Every commit was reached exactly once, in total.
+    assert sorted(seen_task_ids) == sorted(task_ids)
+    assert len(seen_task_ids) == len(set(seen_task_ids))
+    record = store.load_registry(manager).get(
+        LEARNING_BASE["identity"], LEARNING_BASE["version"]
+    )
+    # Every commit's own evidence anchor landed exactly once -- no key was
+    # reprocessed and none was skipped.
+    assert len(record.evidence) == len(task_ids)
+
+
+def test_learning_skill_coverage_reports_measured_counts(manager):
+    mst.propose(**LEARNING_BASE)
+    _seed_skill_card(manager, "T_COV1")
+    _seed_learning_commit(
+        manager, "T_COV1", "req-c1", outcome="accepted",
+        edges=[{"source": "a", "target": "b", "relation": "supports"}],
+        ai_memory_applied=True,
+    )
+    _seed_learning_commit(manager, "T_COV1B", "req-c1b", outcome="rejected")
+
+    coverage = mst.learning_skill_coverage()
+
+    assert coverage["ok"] is True
+    assert coverage["measured"] is True
+    assert coverage["commits"]["total"] == 2
+    assert coverage["commits"]["edge_connected"] == 1
+    assert coverage["commits"]["edges"] == 1
+    assert coverage["commits"]["ai_memory_reachable"] == 1
+    assert coverage["commits"]["ai_memory_reachable_percent"] == 50.0
+    assert coverage["skills"]["total"] == 1
+    assert coverage["skills"]["evidence_bearing"] == 0
+
+    mst.add_learning_commit_evidence(task_id="T_COV1", request_id="req-c1")
+    after = mst.learning_skill_coverage()
+    assert after["skills"]["evidence_bearing"] == 1
+
+
+def test_learning_skill_coverage_requires_a_verified_manager(tmp_path, monkeypatch):
+    monkeypatch.setattr(core, "manager_bootstrap", lambda: {"role": "worker"})
+    result = mst.learning_skill_coverage()
+    assert result["ok"] is False
+    assert result["error"] == "verified_manager_identity_required"
