@@ -1022,6 +1022,7 @@ def test_an_empty_receipt_records_why_rather_than_only_that(
         "measured": True,
         "selected_count": 0,
         "injected_count": 0,
+        "evidence_backed_count": 0,
         "empty_reason": (
             skill_registry.SELECTION_EMPTY_ACTIVE_VOCABULARY_UNSELECTABLE
         ),
