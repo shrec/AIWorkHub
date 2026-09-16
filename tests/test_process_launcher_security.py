@@ -1888,7 +1888,9 @@ def test_validation_only_replay_route_is_explicit_and_not_env_spoofable(
         }
     )
     assert replay["outer_validation_authority"] is True
-    assert replay["backend"] in {"landlock", "bubblewrap"}
+    # "windows_appcontainer" is the real backend a Windows host resolves to;
+    # "landlock"/"bubblewrap" cover the two POSIX sandboxes.
+    assert replay["backend"] in {"landlock", "bubblewrap", "windows_appcontainer"}
 
     provider = process_launcher._validation_route_kwargs(
         {
