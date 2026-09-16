@@ -5,7 +5,7 @@ import subprocess
 import sys
 from types import SimpleNamespace
 
-from aiworkhub import claude_auth, deepseek_credentials, runtime_adapters
+from aiworkhub import claude_auth, deepseek_credentials, platform_io, runtime_adapters
 
 
 def test_subscription_status_is_bounded_cached_and_secret_free(monkeypatch) -> None:
@@ -166,8 +166,9 @@ def test_live_provider_401_survives_runtime_reload_without_persisting_secret(
     assert str(sys.executable) not in state
     assert payload["http_status"] == 401
     assert len(payload["session_id_sha256"]) == 64
-    assert state_path.stat().st_mode & 0o777 == 0o600
-    assert state_path.parent.stat().st_mode & 0o777 == 0o700
+    if platform_io.posix_path_modes_supported():
+        assert state_path.stat().st_mode & 0o777 == 0o600
+        assert state_path.parent.stat().st_mode & 0o777 == 0o700
 
 
 def test_runtime_auth_failure_classifier_rejects_non_exact_receipts(
