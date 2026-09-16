@@ -17,7 +17,12 @@ def _write(path: Path, text: str | bytes) -> None:
     if isinstance(text, bytes):
         path.write_bytes(text)
         return
-    path.write_text(str(text), encoding="utf-8")
+    # write_bytes, not write_text: callers hash/base64-encode this exact
+    # "\n"-only string separately and compare against what production reads
+    # back from disk, but Path.write_text translates "\n" to CRLF on
+    # Windows, which would silently change the on-disk bytes out from under
+    # those precomputed digests.
+    path.write_bytes(str(text).encode("utf-8"))
 
 
 def _packet(authority: Path, files: list[dict[str, object]]) -> dict[str, object]:
