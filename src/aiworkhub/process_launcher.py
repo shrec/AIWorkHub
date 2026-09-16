@@ -6814,6 +6814,7 @@ class ProcessManager:
                     runner=runner,
                     topic=topic,
                 )
+                card["request_id"] = request_id
                 claimed = True
 
                 committed_authorization = _validation_only_replay_authorization(
@@ -6828,6 +6829,13 @@ class ProcessManager:
                 if committed_authorization != expected_authorization:
                     raise LaunchRejected("validation_only_replay_committed_grant_mismatch")
                 authorization = committed_authorization
+                if isinstance(receipt, Mapping):
+                    try:
+                        _toolchain_authority.verify_authority_receipt(
+                            receipt, self.repo, card
+                        )
+                    except ValueError as exc:
+                        raise LaunchRejected(str(exc)) from None
                 predecessor_mcp_receipt = self._validation_replay_predecessor_mcp_receipt(
                     card, authorization, task_id
                 )
@@ -10165,39 +10173,38 @@ class ProcessManager:
     def _request_events(self, request_id: str) -> list[dict[str, Any]]:
         """Return exact request history without replaying an unchanged ledger.
 
-        The worker-tool bridge asks for the same active request on every tool
-        turn.  Cache only that request-scoped projection and trust it only while
-        every authoritative ledger segment has the same filesystem identity and
-        byte length.  New requests are scanned once even when the ledger itself
-        is unchanged; an append, rotation, truncation, rewrite, or replacement
-        invalidates all projections.
+        Delegates to the ledger's bounded multi-request projection, which
+        folds appended bytes into the buckets they belong to instead of
+        discarding every other request's history.  Two callers depend on that:
+        the worker-tool bridge asks for the same active request on every tool
+        turn, and a review drain asks for a different request per action while
+        each reviewer launch appends.  Both used to pay a full ledger replay
+        per call, because the previous cache was keyed on a whole-ledger
+        fingerprint and any append cleared every request at once.
         """
-        cache = getattr(self, "_request_event_cache", None)
-        if cache is None or cache["path"] != self.process_log_path:
-            cache = {
-                "path": self.process_log_path,
-                "lock": threading.Lock(),
-                "fingerprint": None,
-                "requests": {},
-            }
-            self._request_event_cache = cache
-        with cache["lock"]:
-            fingerprint = self._event_ledger_fingerprint()
-            if fingerprint != cache["fingerprint"]:
-                cache["fingerprint"] = fingerprint
-                cache["requests"].clear()
-            requests = cache["requests"]
-            if request_id not in requests:
-                requests[request_id] = [
-                    event
-                    for event in self._events()
-                    if event.get("request_id") == request_id
-                ]
-            events = requests.pop(request_id)
-            requests[request_id] = events
-            while len(requests) > self._REQUEST_EVENT_CACHE_LIMIT:
-                requests.pop(next(iter(requests)))
-            return [dict(event) for event in events]
+        return self._request_events_batch((request_id,)).get(request_id, [])
+
+    def _request_events_batch(
+        self, request_ids: Iterable[str]
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Project several requests' histories from one bounded ledger pass.
+
+        Every requested id is present in the result, mapped to an empty list
+        when the ledger holds nothing for it; missing event data is therefore
+        never indistinguishable from an unasked question.
+        """
+        return process_event_ledger.events_for_requests(
+            self.process_log_path, request_ids
+        )
+
+    def prime_request_events(self, request_ids: Iterable[str]) -> int:
+        """Warm the shared projection for a drain's targets in one pass.
+
+        Returns how many distinct request ids the projection now answers for.
+        This is a pure read over append-only evidence: it creates no durable
+        state, and skipping it costs only the drain's old per-action replay.
+        """
+        return len(self._request_events_batch(request_ids))
 
     def _event_ledger_fingerprint(self) -> tuple[Any, ...]:
         """Bounded metadata fingerprint for all durable ledger segments."""

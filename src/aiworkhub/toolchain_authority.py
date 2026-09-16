@@ -427,6 +427,10 @@ def _receipt_card_identity(card: Mapping[str, Any]) -> str:
             for command in card.get("validation") or ()
             if isinstance(command, str) and command.strip()
         ],
+        "immutable_inputs": [
+            str(item) for item in card.get("immutable_inputs") or ()
+        ],
+        "rework_predecessor": card.get("rework_predecessor"),
         "allowed_writes": [str(item) for item in card.get("allowed_writes") or ()],
         "required_outputs": [str(item) for item in card.get("required_outputs") or ()],
     }
@@ -734,6 +738,7 @@ class ToolchainAuthority:
             "validation": _ordered("validation"),
             "read_first": _unordered("read_first"),
             "immutable_inputs": _unordered("immutable_inputs"),
+            "rework_predecessor": card.get("rework_predecessor"),
             "allowed_writes": _unordered("allowed_writes"),
             "required_outputs": _unordered("required_outputs"),
         }

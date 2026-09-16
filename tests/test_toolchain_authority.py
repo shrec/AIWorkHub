@@ -149,6 +149,65 @@ def test_path_change_invalidates_snapshot(tmp_path: Path, monkeypatch: pytest.Mo
     assert second.digest != first.digest
 
 
+def test_request_6ba3c9b1_cache_and_receipt_bind_repository_input_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(
+        "AIWORKHUB_TOOLCHAIN_AUTHORITY_HMAC_KEY",
+        "hex:" + ("ac" * 32),
+    )
+    card = {
+        **_card(),
+        "task_id": "TASK_REPLAY_INPUT_IDENTITY",
+        "request_id": "6ba3c9b1f18d431cb048f640b37f4f30",
+        "immutable_inputs": ["inputs/one.json"],
+        "rework_predecessor": {
+            "schema_id": "aiworkhub.rework_predecessor.v1",
+            "request_id": "predecessor-one",
+            "changed_path_hashes": {"out/result.json": "a" * 64},
+        },
+    }
+    immutable_change = {
+        **card,
+        "immutable_inputs": ["inputs/two.json"],
+    }
+    rework_change = {
+        **card,
+        "rework_predecessor": {
+            **card["rework_predecessor"],
+            "changed_path_hashes": {"out/result.json": "b" * 64},
+        },
+    }
+    authority = _authority(tmp_path)
+
+    snapshot = authority.evaluate(card)
+    immutable_snapshot = authority.evaluate(immutable_change)
+    rework_snapshot = authority.evaluate(rework_change)
+
+    assert len(
+        {
+            snapshot.cache_identity,
+            immutable_snapshot.cache_identity,
+            rework_snapshot.cache_identity,
+        }
+    ) == 3
+    assert len(
+        {
+            toolchain_authority._receipt_card_identity(candidate)
+            for candidate in (card, immutable_change, rework_change)
+        }
+    ) == 3
+
+    receipt = toolchain_authority.authority_receipt(snapshot, card)
+    assert toolchain_authority.verify_authority_receipt(receipt, tmp_path, card)
+    for mismatched in (immutable_change, rework_change):
+        with pytest.raises(
+            ValueError,
+            match="validation_toolchain_authority_receipt_card_identity_mismatch",
+        ):
+            toolchain_authority.verify_authority_receipt(receipt, tmp_path, mismatched)
+
+
 def test_executable_and_symlink_replacement_invalidate_snapshot(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
