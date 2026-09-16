@@ -26,7 +26,6 @@ from typing import Any
 
 from . import runtime_temp
 from .platform_io import process_is_alive
-from .windows_file_structures import FILETIME
 
 
 # Liveness is one function, imported -- never a private copy. A POSIX branch
@@ -96,14 +95,6 @@ def _windows_pid_identity_once(
         kernel32.OpenProcess.restype = ctypes.c_void_p
         kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
         kernel32.CloseHandle.restype = ctypes.c_int
-        kernel32.GetProcessTimes.argtypes = [
-            ctypes.c_void_p,
-            ctypes.POINTER(FILETIME),
-            ctypes.POINTER(FILETIME),
-            ctypes.POINTER(FILETIME),
-            ctypes.POINTER(FILETIME),
-        ]
-        kernel32.GetProcessTimes.restype = ctypes.c_int
         getattr(ctypes, "set_last_error")(0)
         handle = kernel32.OpenProcess(
             _WINDOWS_PROCESS_QUERY_LIMITED_INFORMATION,
@@ -143,61 +134,43 @@ def _windows_pid_identity_once(
             exception="ProcessAbsent" if absent else "OpenProcessFailed",
         )
 
-    creation = FILETIME()
-    exit_time = FILETIME()
-    kernel = FILETIME()
-    user = FILETIME()
-    try:
-        try:
-            getattr(ctypes, "set_last_error")(0)
-            ok = kernel32.GetProcessTimes(
-                handle,
-                ctypes.byref(creation),
-                ctypes.byref(exit_time),
-                ctypes.byref(kernel),
-                ctypes.byref(user),
-            )
-        except OSError as exc:
-            winerror = getattr(exc, "winerror", None)
-            if winerror is None:
-                winerror = int(getattr(ctypes, "get_last_error")()) or None
-            return PidIdentityEvidence(
-                verdict=PidIdentityVerdict.UNKNOWN,
-                pid=pid,
-                expected_start_ticks=expected_start_ticks,
-                observed_start_ticks=None,
-                attempts=attempt,
-                operation="GetProcessTimes",
-                winerror=winerror,
-                exception=type(exc).__name__,
-            )
-        if not ok:
-            winerror = int(getattr(ctypes, "get_last_error")()) or None
-            return PidIdentityEvidence(
-                verdict=PidIdentityVerdict.UNKNOWN,
-                pid=pid,
-                expected_start_ticks=expected_start_ticks,
-                observed_start_ticks=None,
-                attempts=attempt,
-                operation="GetProcessTimes",
-                winerror=winerror,
-                exception="GetProcessTimesFailed",
-            )
-        observed = (int(creation.high) << 32) | int(creation.low)
+    # The handle proves the process exists right now; that is all this
+    # OpenProcess call is for. Release it immediately and read the creation
+    # time through the shared, mockable ``runtime_temp.process_start_ticks``
+    # -- the same primitive every other platform's identity check goes
+    # through -- instead of a second, independent GetProcessTimes wired
+    # directly into this function. A caller (or a test) that disables the
+    # shared primitive to simulate "identity cannot be read anywhere" must
+    # reach the Windows path too; duplicating the syscall here made that
+    # signal invisible on this one platform. The absence check above (this
+    # exact OpenProcess call and its winerror) keeps its own, more specific
+    # "genuinely absent" signal, since process_start_ticks' pid-only contract
+    # collapses every failure -- absent process included -- to a bare
+    # ``None`` and cannot express that distinction on its own.
+    kernel32.CloseHandle(handle)
+    observed = runtime_temp.process_start_ticks(pid)
+    if observed is None:
         return PidIdentityEvidence(
-            verdict=(
-                PidIdentityVerdict.MATCH
-                if observed == expected_start_ticks
-                else PidIdentityVerdict.MISMATCH
-            ),
+            verdict=PidIdentityVerdict.UNKNOWN,
             pid=pid,
             expected_start_ticks=expected_start_ticks,
-            observed_start_ticks=observed,
+            observed_start_ticks=None,
             attempts=attempt,
-            operation="GetProcessTimes",
+            operation="_pid_start_ticks",
+            exception="StartTicksUnavailable",
         )
-    finally:
-        kernel32.CloseHandle(handle)
+    return PidIdentityEvidence(
+        verdict=(
+            PidIdentityVerdict.MATCH
+            if observed == expected_start_ticks
+            else PidIdentityVerdict.MISMATCH
+        ),
+        pid=pid,
+        expected_start_ticks=expected_start_ticks,
+        observed_start_ticks=observed,
+        attempts=attempt,
+        operation="_pid_start_ticks",
+    )
 
 
 def _pid_identity_evidence(pid: Any, expected_start_ticks: Any) -> PidIdentityEvidence:

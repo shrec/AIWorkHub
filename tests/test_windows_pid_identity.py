@@ -139,6 +139,11 @@ def test_verdict_is_exact_tri_state_and_evidence_is_immutable() -> None:
 def test_equal_creation_time_is_match_and_handle_is_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """_windows_pid_identity_once's own OpenProcess proves the process exists
+    right now and is closed immediately; the creation time is then read
+    through the shared runtime_temp.process_start_ticks (same fake kernel32,
+    since that primitive resolves ``ctypes.WinDLL`` too), which opens and
+    closes its OWN handle -- hence two opens/closes for one identity probe."""
     ticks = 0x123456789
     kernel32, sleeps = _install_windows_probe(
         monkeypatch,
@@ -150,10 +155,10 @@ def test_equal_creation_time_is_match_and_handle_is_closed(
 
     assert evidence.verdict is process_identity.PidIdentityVerdict.MATCH
     assert evidence.observed_start_ticks == ticks
-    assert evidence.operation == "GetProcessTimes"
+    assert evidence.operation == "_pid_start_ticks"
     assert evidence.attempts == 1
     assert evidence.winerror is None
-    assert kernel32.closed_handles == [101]
+    assert kernel32.closed_handles == [101, 101]
     assert sleeps == []
 
 
@@ -171,7 +176,7 @@ def test_unequal_creation_time_is_mismatch(
     assert evidence.verdict is process_identity.PidIdentityVerdict.MISMATCH
     assert evidence.observed_start_ticks == 222
     assert evidence.attempts == 1
-    assert kernel32.closed_handles == [102]
+    assert kernel32.closed_handles == [102, 102]
 
 
 def test_explicit_absence_is_mismatch_without_retry(
@@ -218,6 +223,13 @@ def test_access_denied_resource_and_unclassified_open_errors_are_unknown(
 def test_get_process_times_failure_is_unknown_and_closes_every_handle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """runtime_temp.process_start_ticks swallows its own internal
+    GetProcessTimes failure to a bare None (like every platform's shared
+    primitive does), so this surfaces as the generic "the shared primitive
+    couldn't read it" outcome rather than a GetProcessTimes-specific
+    winerror -- still UNKNOWN, still fail-closed, still retried, and every
+    handle from every open (the identity-check open plus the shared
+    primitive's own open, per attempt) is still closed."""
     kernel32, sleeps = _install_windows_probe(
         monkeypatch,
         open_results=[(103, 0)],
@@ -227,11 +239,11 @@ def test_get_process_times_failure_is_unknown_and_closes_every_handle(
     evidence = process_launcher._pid_identity_evidence(44, 111)
 
     assert evidence.verdict is process_identity.PidIdentityVerdict.UNKNOWN
-    assert evidence.operation == "GetProcessTimes"
-    assert evidence.winerror == 6
-    assert evidence.exception == "GetProcessTimesFailed"
+    assert evidence.operation == "_pid_start_ticks"
+    assert evidence.winerror is None
+    assert evidence.exception == "StartTicksUnavailable"
     assert evidence.attempts == process_identity._PID_IDENTITY_MAX_ATTEMPTS
-    assert kernel32.closed_handles == [103, 103, 103]
+    assert kernel32.closed_handles == [103] * (2 * process_identity._PID_IDENTITY_MAX_ATTEMPTS)
     assert len(sleeps) == process_identity._PID_IDENTITY_MAX_ATTEMPTS - 1
 
 
@@ -261,8 +273,11 @@ def test_transient_open_failure_then_match_uses_bounded_retry(
 
     assert evidence.verdict is process_identity.PidIdentityVerdict.MATCH
     assert evidence.attempts == 2
-    assert kernel32.open_calls == 2
-    assert kernel32.closed_handles == [104]
+    # 3 opens: attempt 1's failing identity-check open, attempt 2's
+    # succeeding identity-check open, and the shared primitive's own open
+    # (clamped to the last configured result) once identity is confirmed.
+    assert kernel32.open_calls == 3
+    assert kernel32.closed_handles == [104, 104]
     assert sleeps == [process_identity._PID_IDENTITY_RETRY_DELAY_SECONDS]
 
 
