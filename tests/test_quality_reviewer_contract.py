@@ -583,11 +583,18 @@ def _sealed_reviewer_receipt() -> dict[str, object]:
 
 
 def _reviewer_workspace_metadata() -> dict[str, object]:
+    # A POSIX-absolute literal like "/var/..." is only drive-RELATIVE on
+    # Windows (no drive letter) -- WorkerWorkspace.from_metadata() calls
+    # Path(...).resolve(), which fills in the current drive, so the round
+    # trip through as_metadata()/from_metadata() below is not idempotent for
+    # it there. Anchoring to this host's own real root/drive keeps the path
+    # genuinely absolute on every platform.
+    anchor = Path(Path(__file__).resolve().anchor)
     return worker_workspace.WorkerWorkspace(
         request_id="review-request-1",
-        repo=Path("/var/aiworkhub/review-repo"),
-        path=Path("/var/aiworkhub/review-repo/workspace"),
-        home=Path("/var/aiworkhub/review-home"),
+        repo=anchor / "var" / "aiworkhub" / "review-repo",
+        path=anchor / "var" / "aiworkhub" / "review-repo" / "workspace",
+        home=anchor / "var" / "aiworkhub" / "review-home",
         allowed_writes=(),
         parent_baseline={},
         workspace_baseline={},
