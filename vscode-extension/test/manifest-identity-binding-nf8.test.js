@@ -102,8 +102,14 @@ try {
       linkStat.ino,
       "the same file must report the same inode through both stat forms",
     );
-    if (process.platform === "win32") {
-      assert.strictEqual(linkStat.dev, 0, "Windows lstat reports no device");
+    if (process.platform === "win32" && linkStat.dev === 0) {
+      // Not every Windows/Node build reproduces the historical failure mode
+      // (observed on Node v22.16.0): some report no device from lstat while
+      // fstat reports the real volume for the identical file. Others (e.g.
+      // Node v20.20.2 on GitHub Actions' windows-latest runner) report the
+      // same real, non-zero device from both calls. Only assert the
+      // reproduction shape when this host actually exhibits it; either way,
+      // the binding call below is what proves the production fix works.
       assert.notStrictEqual(openedStat.dev, 0, "Windows fstat reports a device");
     }
   }
