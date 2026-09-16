@@ -1500,6 +1500,7 @@ def _assert_lock_unavailable(exc, *, errno_name, repo):
     assert str(repo.resolve()) not in json.dumps(payload)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="fcntl.flock is POSIX-only")
 def test_posix_eagain_eacces_remain_build_in_progress(tmp_path, monkeypatch):
     repo = _new_repo(tmp_path, "posix_contention")
     _write(repo / "src" / "live.py", "def live():\n    return 1\n")
@@ -1524,6 +1525,7 @@ def test_posix_eagain_eacces_remain_build_in_progress(tmp_path, monkeypatch):
         sg.build_index(repo, incremental=True)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="fcntl.flock is POSIX-only")
 @pytest.mark.parametrize(
     "err",
     [

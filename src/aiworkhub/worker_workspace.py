@@ -20,6 +20,7 @@ import hashlib
 import hmac
 import importlib.util
 import json
+import ntpath
 import os
 import re
 import shlex
@@ -1857,7 +1858,7 @@ def _npm_validation_prefixes(commands: Iterable[str]) -> tuple[str, ...]:
         tokens, _components, _tmpdir, cd_relative = _parse_validation_command_detailed(
             command
         )
-        if not tokens or Path(tokens[0]).name.lower() not in {"npm", "npm.cmd"}:
+        if not tokens or ntpath.basename(tokens[0]).lower() not in {"npm", "npm.cmd"}:
             continue
         raw_prefix = ""
         for index, token in enumerate(tokens[1:], start=1):
@@ -6392,7 +6393,7 @@ def sanitized_env(
         "TEMP": str(temp_home),
     }
     if os.name == "nt":
-        drive, tail = os.path.splitdrive(str(selected_home))
+        drive, tail = ntpath.splitdrive(str(selected_home))
         username = os.environ.get("USERNAME", os.environ.get("USER", "user"))
         safe = {
             **common,
@@ -10905,7 +10906,7 @@ def _is_pytest_validation_command(argv: list[str]) -> bool:
     """True when *argv* (post-PYTHONPATH-prefix-strip) invokes pytest."""
     if not argv:
         return False
-    head = Path(argv[0]).name
+    head = ntpath.basename(argv[0])
     if head == "pytest":
         return True
     if not head.startswith("python"):
@@ -10919,7 +10920,7 @@ def _is_pytest_validation_command(argv: list[str]) -> bool:
 
 
 def _is_python_validation_command(argv: list[str]) -> bool:
-    return bool(argv) and Path(argv[0]).name.startswith("python")
+    return bool(argv) and ntpath.basename(argv[0]).startswith("python")
 
 
 def _normalize_pytest_validation_argv(argv: list[str]) -> list[str]:
@@ -10933,7 +10934,7 @@ def _normalize_pytest_validation_argv(argv: list[str]) -> list[str]:
     Explicit ``python* -m pytest`` commands remain byte-for-byte unchanged.
     """
 
-    if argv and Path(argv[0]).name == "pytest":
+    if argv and ntpath.basename(argv[0]) == "pytest":
         return [sys.executable, "-m", "pytest", *argv[1:]]
     return list(argv)
 

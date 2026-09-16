@@ -40,6 +40,11 @@ def _fchmod_permitted() -> bool:
     Outside the sandbox the probe succeeds and every case still runs.
     """
 
+    if not hasattr(os, "fchmod"):
+        # Windows has no fchmod at all -- not denied, absent -- so this
+        # environment cannot exercise the branch either way.
+        return False
+
     import tempfile
 
     descriptor, name = tempfile.mkstemp()

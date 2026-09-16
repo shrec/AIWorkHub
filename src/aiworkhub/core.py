@@ -781,13 +781,24 @@ def _pid_in_same_windows_user_ancestor_chain(
     *,
     max_depth: int,
     start_pid: int | None = None,
+    parents: dict[int, int] | None = None,
+    current_sid: str | None = None,
 ) -> bool:
-    """Windows equivalent of the same-uid bounded ``/proc`` ancestry check."""
+    """Windows equivalent of the same-uid bounded ``/proc`` ancestry check.
+
+    ``parents``/``current_sid`` let a caller checking many candidate PIDs in
+    one pass (see ``_implicit_windows_codex_repository_root``) take one
+    Toolhelp snapshot and one owner-SID lookup for every candidate instead of
+    this function repeating both, in full, per call -- a full process-table
+    walk is the same cost whether one PID or two hundred are being checked.
+    """
 
     if target_pid <= 1 or max_depth <= 0:
         return False
-    current_sid = _windows_process_owner_sid(os.getpid())
-    parents = _windows_process_parent_map()
+    if current_sid is None:
+        current_sid = _windows_process_owner_sid(os.getpid())
+    if parents is None:
+        parents = _windows_process_parent_map()
     if current_sid is None or parents is None:
         return False
     pid = os.getppid() if start_pid is None else start_pid
@@ -1126,6 +1137,9 @@ def _implicit_windows_codex_repository_root() -> Path | None:
         return None
 
     matches: dict[tuple[str, str, str], Path] = {}
+    parents: dict[int, int] | None = None
+    current_sid: str | None = None
+    snapshot_taken = False
     for record in registry.get("repositories", []):
         if not isinstance(record, dict):
             continue
@@ -1134,9 +1148,20 @@ def _implicit_windows_codex_repository_root() -> Path | None:
         if str(record.get("selected_provider") or "").strip().lower() != "codex":
             continue
         extension_host_pid = int(record.get("extension_host_pid") or 0)
-        if extension_host_pid <= 1 or not _pid_in_same_windows_user_ancestor_chain(
+        if extension_host_pid <= 1:
+            continue
+        if not snapshot_taken:
+            # One Toolhelp snapshot and one owner-SID lookup serve every
+            # candidate record below instead of each of up to 256 records
+            # separately re-enumerating the entire machine's process table.
+            parents = _windows_process_parent_map()
+            current_sid = _windows_process_owner_sid(os.getpid())
+            snapshot_taken = True
+        if not _pid_in_same_windows_user_ancestor_chain(
             extension_host_pid,
             max_depth=16,
+            parents=parents,
+            current_sid=current_sid,
         ):
             continue
         repo_id = str(record.get("repo_id") or "").strip()
