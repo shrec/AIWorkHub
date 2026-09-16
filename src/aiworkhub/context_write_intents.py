@@ -78,7 +78,17 @@ def _intent_append_lock(ledger_path: Path) -> Iterator[None]:
     while fd is None:
         try:
             fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        except FileExistsError as exc:
+        except (FileExistsError, PermissionError) as exc:
+            # PermissionError, not just FileExistsError: under real
+            # concurrent contention on Windows, a create racing another
+            # thread's create-then-unlink of this exact lock name can land
+            # in the brief "pending delete" window and come back as
+            # ERROR_ACCESS_DENIED (PermissionError) instead of
+            # ERROR_FILE_EXISTS. It is the same transient contention either
+            # way -- this directory was just created/chmodded by this same
+            # process, so a persistent permission problem is not the
+            # realistic alternative -- and the deadline below still bounds
+            # how long either is retried.
             if time.monotonic() >= deadline:
                 raise ContextWriteIntentError("intent_ledger_locked") from exc
             time.sleep(0.01)
