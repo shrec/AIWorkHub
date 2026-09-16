@@ -785,6 +785,63 @@ def _dropped_reasons(record: Iterable[Mapping[str, Any]]) -> str:
     return ",".join(reasons[:MAX_RECORDED_DROP_REASONS]) or "no_findings_retained"
 
 
+def _dropped_finding_is_actionable(raw_finding: Any) -> bool:
+    """Mirror the canonical actionable derivation: disposition defaults to "defect".
+
+    A finding this module cannot even read as a mapping is never assumed safe
+    to lose silently, so it counts as actionable.  Neither is a disposition
+    that is not a string, nor one outside the canonical vocabulary the
+    validator itself enforces (``quality_reviewer.FINDING_DISPOSITIONS``): an
+    unrecognisable disposition is exactly the shape this module cannot trust
+    to be harmless, so it fails closed to actionable instead of being read as
+    quiet observation noise.  The canonical validator also refuses any
+    non-"defect" disposition paired with a severity other than "low"
+    (``review_finding_<n>_nondefect_severity_must_be_low``): when a dropped
+    finding actually SUPPLIES a severity, "observation" at, say, "critical" is
+    exactly the combination the validator itself would never accept as
+    harmless, so it fails closed to actionable too.  A finding that never
+    named a severity at all carries no such contradiction to catch, so it is
+    read exactly as before, by disposition alone.
+    """
+    if not isinstance(raw_finding, Mapping):
+        return True
+    raw_disposition = raw_finding.get("disposition")
+    if raw_disposition in (None, ""):
+        return True
+    if not isinstance(raw_disposition, str):
+        return True
+    from . import quality_reviewer
+
+    disposition = raw_disposition.strip()
+    if disposition not in quality_reviewer.FINDING_DISPOSITIONS:
+        return True
+    if disposition == "defect":
+        return True
+    raw_severity = raw_finding.get("severity")
+    if raw_severity in (None, ""):
+        return False
+    return str(raw_severity).strip() != "low"
+
+
+def _dropped_findings_include_actionable(
+    supplied: list[Any], record: Iterable[Mapping[str, Any]]
+) -> bool:
+    """True when at least one DROPPED finding was an actionable defect claim.
+
+    A non-actionable observation lost to repairable schema noise must not sink
+    an otherwise clean review; a dropped defect claim always must.
+    """
+    for entry in record:
+        if "dropped" not in entry:
+            continue
+        index = entry.get("index")
+        if not isinstance(index, int) or index < 0 or index >= len(supplied):
+            return True
+        if _dropped_finding_is_actionable(supplied[index]):
+            return True
+    return False
+
+
 def normalize_review_findings(
     report: Mapping[str, Any],
 ) -> tuple[dict[str, Any], list[dict[str, Any]], list[int]]:
@@ -918,9 +975,13 @@ def supervisor_ingest(
             raise ReviewProtocolError(f"structured_report_invalid:{exc}") from exc
         finally:
             record_into.extend(record)
-        if supplied and not findings:
-            # Every finding was refused, so this review cannot be represented as
-            # a clean one; fail closed and name why each finding was dropped.
+        if supplied and not findings and _dropped_findings_include_actionable(
+            supplied, record
+        ):
+            # Every actionable finding was refused, so this review cannot be
+            # represented as a clean one; a dropped defect claim always fails
+            # closed.  An all-observation drop set reaches here too, but never
+            # raises: normalization already proved nothing blocking survived.
             raise ReviewProtocolError(
                 "structured_report_invalid:review_findings_all_invalid:"
                 f"{_dropped_reasons(record)}"

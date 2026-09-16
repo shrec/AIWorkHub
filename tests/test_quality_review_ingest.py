@@ -724,6 +724,131 @@ def test_a_reviewer_error_without_a_finding_index_is_never_swallowed(
         )
 
 
+def test_a_report_of_only_non_actionable_observations_survives_repairable_schema_noise(
+    tmp_path, monkeypatch
+):
+    """Regression: QUALITY_REVIEW_2FF7FF15A55C4493AE6DAD04's nested-evidence-then-
+    overbuild_removable_surface_unbound sequence used to discard a clean review and
+    force a reviewer relaunch. Both findings here are non-actionable observations,
+    so losing them to repairable schema noise must still land one findings=[]
+    receipt -- not a terminal fail-closed refusal, and never a second attempt.
+    """
+    from aiworkhub import quality_reviewer
+
+    def validator(packet, *, lens, findings):
+        if findings:
+            raise quality_reviewer.ReviewerEvidenceError(
+                "review_finding_0_overbuild_removable_surface_unbound"
+            )
+        return []
+
+    verification, submitted = _run_supervisor_ingest(
+        tmp_path,
+        monkeypatch,
+        findings=[
+            {
+                "summary": "nested evidence noise", "evidence": "e0",
+                "disposition": "observation",
+                "evidence_reference": {"path": "src/a.py", "unbound": True},
+            },
+            {
+                "summary": "unbound removable surface", "evidence": "e1",
+                "disposition": "observation",
+            },
+        ],
+        validator=validator,
+    )
+
+    assert len(submitted) == 1
+    assert submitted[0]["findings"] == []
+    dropped = verification["review_finding_normalization"]
+    assert [entry["index"] for entry in dropped] == [0, 1]
+    assert dropped[0]["dropped"].endswith("review_finding_0_evidence_reference_invalid")
+    assert dropped[1]["dropped"] == "review_finding_0_overbuild_removable_surface_unbound"
+
+
+def test_a_dropped_actionable_finding_still_fails_closed_beside_dropped_observations(
+    tmp_path, monkeypatch
+):
+    """An actionable defect claim lost to schema noise must never be treated as
+    if the review were clean, even when another dropped finding beside it really
+    was just a non-actionable observation."""
+    with pytest.raises(
+        ingest.ReviewProtocolError, match="review_findings_all_invalid"
+    ):
+        _run_supervisor_ingest(
+            tmp_path,
+            monkeypatch,
+            findings=[
+                {"summary": "defect claim", "evidence": "e0"},
+                {
+                    "summary": "noise", "evidence": "e1", "disposition": "observation",
+                    "evidence_reference": {"path": "src/a.py", "unbound": True},
+                },
+            ],
+            validator=_refusing_validator("defect claim"),
+        )
+
+
+@pytest.mark.parametrize("malformed_disposition", [123, True, "nitpick", "Observation"])
+def test_a_dropped_finding_with_a_non_canonical_disposition_fails_closed(
+    tmp_path, monkeypatch, malformed_disposition
+):
+    """A dropped finding's disposition is only ever read from the same
+    canonical vocabulary the validator enforces
+    (``quality_reviewer.FINDING_DISPOSITIONS``). A disposition that is not a
+    string, or a string outside that vocabulary, must never be assumed a
+    harmless observation merely because it is not literally "defect" -- it
+    fails closed to actionable, exactly like a finding this module could not
+    even read as a mapping.
+    """
+    with pytest.raises(
+        ingest.ReviewProtocolError, match="review_findings_all_invalid"
+    ):
+        _run_supervisor_ingest(
+            tmp_path,
+            monkeypatch,
+            findings=[
+                {
+                    "summary": "malformed disposition", "evidence": "e0",
+                    "disposition": malformed_disposition,
+                    "evidence_reference": {"path": "src/a.py", "unbound": True},
+                },
+            ],
+            validator=_refusing_validator(),
+        )
+
+
+@pytest.mark.parametrize("non_low_severity", ["critical", "high", "medium"])
+def test_a_dropped_observation_at_non_low_severity_fails_closed(
+    tmp_path, monkeypatch, non_low_severity
+):
+    """Mirror the canonical severity/disposition invariant exactly.
+
+    ``quality_reviewer.normalize_packet_findings`` refuses any non-"defect"
+    disposition paired with a severity other than "low"
+    (``review_finding_<n>_nondefect_severity_must_be_low``). A dropped finding
+    that claims "observation" at "critical" severity is exactly that invalid
+    combination the canonical validator would never accept as harmless, so it
+    must fail closed to actionable too -- never trusted as safe observation
+    noise merely because its disposition string reads "observation".
+    """
+    with pytest.raises(
+        ingest.ReviewProtocolError, match="review_findings_all_invalid"
+    ):
+        _run_supervisor_ingest(
+            tmp_path,
+            monkeypatch,
+            findings=[
+                {
+                    "summary": "critical mislabeled as observation", "evidence": "e0",
+                    "disposition": "observation", "severity": non_low_severity,
+                    "evidence_reference": {"path": "src/a.py", "unbound": True},
+                },
+            ],
+            validator=_refusing_validator(),
+        )
+
 def test_an_empty_findings_list_is_still_a_clean_report():
     normalized, record, kept = ingest.normalize_review_findings(
         {"lens": "correctness", "findings": []}
