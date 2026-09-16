@@ -310,8 +310,20 @@ def test_non_app_server_invocation_never_touches_sideband_dir():
 
 
 def test_windows_passthrough_keeps_tracked_parent_until_child_exit(monkeypatch):
+    """_hold_passthrough_child must NOT apply background_process_launch_kwargs.
+
+    Those flags (CREATE_NO_WINDOW + a hidden STARTUPINFO) are for a headless
+    child with explicitly piped stdio, like the App Server child in
+    AppServerMux.start(). This child inherits stdin/stdout/stderr directly
+    to match os.execvp's POSIX passthrough semantics -- CREATE_NO_WINDOW on a
+    console-less parent (VS Code's extension host) silently drops that
+    inheritance instead of passing the real handles through, so the real
+    CLI's own output never reaches the caller. Verified by direct
+    reproduction: a grandchild spawned with CREATE_NO_WINDOW under a
+    console-less parent produced empty captured stdout even though its exit
+    code arrived intact.
+    """
     events = []
-    startupinfo = object()
 
     class _Child:
         _handle = 91
@@ -319,12 +331,6 @@ def test_windows_passthrough_keeps_tracked_parent_until_child_exit(monkeypatch):
         def wait(self, timeout=None):
             events.append(("wait", timeout))
             return 23
-
-    monkeypatch.setattr(
-        app_server_mux,
-        "background_process_launch_kwargs",
-        lambda: {"creationflags": 8, "startupinfo": startupinfo},
-    )
 
     def popen(*args, **kwargs):
         events.append(("popen", args, kwargs))
@@ -344,11 +350,7 @@ def test_windows_passthrough_keeps_tracked_parent_until_child_exit(monkeypatch):
 
     assert app_server_mux._hold_passthrough_child("codex.exe", ["app-server"]) == 23
     assert events == [
-        (
-            "popen",
-            (["codex.exe", "app-server"],),
-            {"shell": False, "creationflags": 8, "startupinfo": startupinfo},
-        ),
+        ("popen", (["codex.exe", "app-server"],), {"shell": False}),
         ("bind", 91),
         ("wait", None),
         ("close", 77),

@@ -395,12 +395,22 @@ def _bind_child_lifetime_to_this_process(child: subprocess.Popen[Any]) -> int | 
 
 
 def _hold_passthrough_child(real_executable: str, argv: list[str]) -> int:
-    """Keep the Windows PID tracked by VS Code alive until Codex exits."""
+    """Keep the Windows PID tracked by VS Code alive until Codex exits.
+
+    Deliberately does NOT apply ``background_process_launch_kwargs()``:
+    those flags (``CREATE_NO_WINDOW`` plus a hidden ``STARTUPINFO``) are for
+    a headless child whose stdio is explicitly piped, like the App Server
+    child a few lines below this in ``start()``. This child's stdin/stdout/
+    stderr are left as ``None`` so they inherit directly, matching what
+    ``os.execvp`` gives POSIX -- but ``CREATE_NO_WINDOW`` on a parent with no
+    console of its own (the common case: VS Code's extension host) silently
+    drops that inheritance instead of passing the handles through, so the
+    real CLI's own output never reaches the caller.
+    """
 
     child = subprocess.Popen(
         [real_executable, *argv],
         shell=False,
-        **background_process_launch_kwargs(),
     )
     job_handle = _bind_child_lifetime_to_this_process(child)
     try:
