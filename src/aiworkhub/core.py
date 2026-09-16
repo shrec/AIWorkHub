@@ -8470,6 +8470,10 @@ def launch_collision_guard(
         command.append("--print")
     try:
         cards = _active_cards_for_collision_guard()
+        # Dependency completion and terminal-artifact replacement live outside
+        # the active-card slice.  The launch winner therefore has to come from
+        # the same full canonical snapshot used by task_plan_snapshot.
+        plan_snapshot = task_plan.build_snapshot(_full_cards_for_plan())
     except task_store.TaskStoreError as exc:
         return _canonical_result(ok=False, returncode=1, stderr=str(exc), command=command)
 
@@ -8483,25 +8487,15 @@ def launch_collision_guard(
             command=command,
         )
 
-    def dependencies_ready(card: dict[str, Any]) -> bool:
-        dependencies = card.get("depends_on") or []
-        if not isinstance(dependencies, list):
-            return False
-        for raw_dependency in dependencies:
-            dependency = by_id.get(str(raw_dependency or ""))
-            if dependency is None:
-                # Finished dependencies are absent from the active-card map;
-                # confirm them from canonical storage before declaring ready.
-                dependency = task_store.get_task(repo_root(), str(raw_dependency or ""))
-            if dependency is None or task_store.canonical_status(dependency) != "finished":
-                return False
-        return True
-
-    priority_rank = {"critical": 0, "high": 1, "medium": 2, "low": 3, "": 4}
-
-    def order_key(card: dict[str, Any]) -> tuple[int, str]:
-        priority = str(card.get("priority") or "").strip().lower()
-        return priority_rank.get(priority, 4), str(card.get("task_id") or "")
+    # Reuse the Plan-DAG's complete arbitration result.  Looking only at
+    # pairwise priority lets a pending card reserve one path here even when an
+    # active processing/review owner already prevents that card from launching
+    # on another path.  Such a transitive loser must not block the actual
+    # Plan-DAG winner.
+    admitted_pending = {
+        str(ready_task_id)
+        for ready_task_id in plan_snapshot.get("ready") or []
+    }
 
     candidate_paths = [
         normalized
@@ -8529,8 +8523,8 @@ def launch_collision_guard(
             continue
         lifecycle = task_store.canonical_status(other)
         owns_scope = lifecycle in {"processing", "review"}
-        if lifecycle == "pending" and dependencies_ready(other):
-            owns_scope = order_key(other) < order_key(candidate)
+        if lifecycle == "pending":
+            owns_scope = other_id in admitted_pending
         if owns_scope:
             blockers.append(
                 {"task_id": other_id, "lifecycle": lifecycle, "paths": overlaps}

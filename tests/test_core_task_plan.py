@@ -475,3 +475,34 @@ def test_plan_and_launch_guard_select_same_priority_winner():
     assert critical_launch["ok"] is True
     assert low_launch["ok"] is False
     assert json.loads(low_launch["stdout"])["blockers"][0]["task_id"] == "newer_critical"
+
+
+def test_launch_guard_ignores_pending_contender_blocked_by_retained_scope():
+    repo = core.repo_root()
+    _insert_card(
+        repo,
+        "active_review",
+        status="review",
+        worker_status="review",
+        allowed_writes=["owned.py"],
+    )
+    _insert_card(
+        repo,
+        "a_pending_loser",
+        priority="critical",
+        allowed_writes=["owned.py", "shared.py"],
+    )
+    _insert_card(
+        repo,
+        "z_plan_winner",
+        priority="critical",
+        allowed_writes=["shared.py"],
+    )
+
+    snapshot = core.task_plan_snapshot()
+    launch = core.launch_collision_guard(task_id="z_plan_winner", print_json=True)
+
+    assert snapshot["ready"] == ["z_plan_winner"]
+    assert snapshot["write_scope_overlaps"]["a_pending_loser"] == ["owned.py"]
+    assert launch["ok"] is True
+    assert json.loads(launch["stdout"])["blockers"] == []
