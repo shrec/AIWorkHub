@@ -2935,13 +2935,32 @@ def _update_worker_contract_packet(home: Path, **fields: Any) -> None:
         return
 
 
+def _resolve_source_home() -> Path:
+    """The real user's home directory whose credentials get projected.
+
+    ``pathlib.Path.home()`` only consults ``$HOME`` on POSIX --
+    ``ntpath.expanduser`` (what it delegates to on Windows) reads
+    ``USERPROFILE``/``HOMEDRIVE``+``HOMEPATH`` instead and never looks at
+    ``HOME`` at all. An explicit ``HOME`` override -- the isolation lever
+    every credential-projection test here uses to point at a fixture
+    "source home" instead of the real one -- was therefore silently
+    ignored on Windows, and every one of these call sites read this
+    machine's REAL ``~/.claude``/``~/.codex``/``~/.local/share/opencode``
+    instead. Honor ``HOME`` uniformly so the isolation contract holds on
+    every platform; unset, this is exactly ``Path.home()`` as before.
+    """
+
+    override = os.environ.get("HOME")
+    return Path(override) if override else Path.home()
+
+
 def _credential_home(home: Path, adapter_id: str, project_root: Path | None = None) -> None:
     home.mkdir(parents=True, exist_ok=True, mode=0o700)
     chmod_path(home, 0o700)
     temp_home = home / "tmp"
     temp_home.mkdir(parents=True, exist_ok=True, mode=0o700)
     chmod_path(temp_home, 0o700)
-    source_home = Path.home()
+    source_home = _resolve_source_home()
     if adapter_id == "claude_cli":
         refresh_claude_credential_projection(home)
         # Claude Code ignores the repository's permissions allowlist until the
@@ -3050,7 +3069,7 @@ def refresh_claude_credential_projection(home: Path) -> dict[str, Any]:
     """Refresh only Claude's narrow request-local credential projection."""
 
     selected_home = _verify_owner_private_directory(home, "claude_projection_home")
-    source_root_path = Path.home() / ".claude"
+    source_root_path = _resolve_source_home() / ".claude"
     if source_root_path.exists() or source_root_path.is_symlink():
         source_root = _verify_owner_private_directory(
             source_root_path, "claude_credential_source_home"
@@ -3551,7 +3570,7 @@ def _directory_write_denied_by_landlock(directory: Path) -> bool:
         return False
     if not stat.S_ISDIR(status.st_mode):
         return False
-    if status.st_uid != os.geteuid():
+    if posix_path_modes_supported() and status.st_uid != os.geteuid():
         return False
     if stat.S_IMODE(status.st_mode) & 0o200 == 0:
         return False
@@ -3596,9 +3615,29 @@ def plant_outer_validation_authority(
         raise WorkspaceError("nested_landlock_locator_symlink")
     if anchor_path.is_symlink():
         raise WorkspaceError("nested_landlock_locator_anchor_symlink")
+    def _clear_read_only_best_effort(path: Path) -> None:
+        # Removal authority lives in the parent directory alone on POSIX, so
+        # a prior locator's own read-only mode never needs clearing there --
+        # chmod_path is deliberately a no-op on Windows for exactly that
+        # reason elsewhere (WinError 5 on otherwise-valid paths). But Windows
+        # enforces a file's OWN read-only attribute for unlink regardless of
+        # parent permissions, so a prior locator from an earlier plant would
+        # otherwise make every replant fail there -- a direct (not
+        # chmod_path-wrapped) chmod is required. Best effort and swallowed:
+        # if an old locator is still a shared (hardlinked) inode inside a
+        # nested POSIX validation, the metadata broker's hardlink denial
+        # (NF-2026-00841) is expected and harmless here, since POSIX doesn't
+        # need this chmod for the unlink to succeed anyway.
+        try:
+            os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
+        except OSError:
+            pass
+
     if locator_path.exists():
+        _clear_read_only_best_effort(locator_path)
         locator_path.unlink()
     if anchor_path.exists():
+        _clear_read_only_best_effort(anchor_path)
         anchor_path.unlink()
     # NF-2026-00841: give this locator its final read-only mode at creation, on
     # the fresh unique inode ``O_EXCL`` just produced and before the very next
@@ -3830,7 +3869,7 @@ def _nested_landlock_validator_cwd(
             return False
         if (
             not stat.S_ISDIR(status.st_mode)
-            or status.st_uid != os.geteuid()
+            or (posix_path_modes_supported() and status.st_uid != os.geteuid())
         ):
             return False
     return True

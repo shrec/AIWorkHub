@@ -90,12 +90,12 @@ def test_cleanup_unregisters_a_registered_worktree_whose_directory_is_missing(
 
     shutil.rmtree(path)
     before = _git(repo, "worktree", "list", "--porcelain").stdout
-    assert str(path) in before
+    assert path.as_posix() in before
 
     worker_workspace.cleanup_workspace(repo, path, home)
 
     after = _git(repo, "worktree", "list", "--porcelain").stdout
-    assert str(path) not in after
+    assert path.as_posix() not in after
     assert not root.exists()
 
 
@@ -111,7 +111,7 @@ def test_cleanup_registered_worktree_is_process_free(
     assert _git(repo, "worktree", "add", "--detach", str(path), "HEAD").returncode == 0
     home.mkdir(parents=True)
     before = _git(repo, "worktree", "list", "--porcelain").stdout
-    assert str(path) in before
+    assert path.as_posix() in before
 
     def subprocess_forbidden(*_args, **_kwargs):
         raise AssertionError("cleanup must not spawn Git")
@@ -121,7 +121,7 @@ def test_cleanup_registered_worktree_is_process_free(
 
     assert not root.exists()
     after = _git(repo, "worktree", "list", "--porcelain").stdout
-    assert str(path) not in after
+    assert path.as_posix() not in after
 
 
 def test_cleanup_fails_closed_on_mismatched_reciprocal_registration(
@@ -256,8 +256,9 @@ def test_claude_credential_projection_refresh_is_narrow_atomic_and_private(
     assert first["refreshed"] is True
     assert second["refreshed"] is True
     assert destination.read_text(encoding="utf-8") == '{"token":"secret-v2"}\n'
-    assert stat.S_IMODE(destination.stat().st_mode) == 0o600
-    assert stat.S_IMODE(destination.parent.stat().st_mode) == 0o700
+    if worker_workspace.posix_path_modes_supported():
+        assert stat.S_IMODE(destination.stat().st_mode) == 0o600
+        assert stat.S_IMODE(destination.parent.stat().st_mode) == 0o700
     assert "secret" not in json.dumps(second)
 
 
@@ -538,32 +539,37 @@ def _commit_validation_worker_package(repo: Path) -> None:
         "worker_workspace.py",
     ):
         shutil.copyfile(source_package / name, destination_package / name)
-    (repo / "probe_candidate_import.py").write_text(
-        "import os\n"
-        "import sys\n"
-        "from aiworkhub import _platform_process, platform_io, runtime_temp\n"
-        "from aiworkhub import worker_workspace as w\n"
-        "print(w.__file__)\n"
-        "print(runtime_temp.__name__)\n"
-        "print(platform_io.__name__)\n"
-        "print(_platform_process.__name__)\n"
-        "print(any(name in sys.modules for name in "
-        "('runtime_temp', 'platform_io', '_platform_process')))\n"
-        "print(w.NF376_CANDIDATE_SENTINEL)\n"
-        "print(os.environ.get(w.PYTHON_CANDIDATE_AUTHORITY_ENV, ''))\n",
-        encoding="utf-8",
+    # write_bytes, not write_text: several tests compare a raw on-disk byte
+    # hash of one of these fixture files against one computed from this exact
+    # in-memory string, and Path.write_text translates '\n' to CRLF on
+    # Windows, silently inflating what actually lands on disk.
+    (repo / "probe_candidate_import.py").write_bytes(
+        (
+            "import os\n"
+            "import sys\n"
+            "from aiworkhub import _platform_process, platform_io, runtime_temp\n"
+            "from aiworkhub import worker_workspace as w\n"
+            "print(w.__file__)\n"
+            "print(runtime_temp.__name__)\n"
+            "print(platform_io.__name__)\n"
+            "print(_platform_process.__name__)\n"
+            "print(any(name in sys.modules for name in "
+            "('runtime_temp', 'platform_io', '_platform_process')))\n"
+            "print(w.NF376_CANDIDATE_SENTINEL)\n"
+            "print(os.environ.get(w.PYTHON_CANDIDATE_AUTHORITY_ENV, ''))\n"
+        ).encode("utf-8"),
     )
-    (repo / "pyproject.toml").write_text(
-        "[tool.pytest.ini_options]\npythonpath = ['src']\n",
-        encoding="utf-8",
+    (repo / "pyproject.toml").write_bytes(
+        b"[tool.pytest.ini_options]\npythonpath = ['src']\n",
     )
     candidate_test = repo / "tests/test_new_candidate_module.py"
     candidate_test.parent.mkdir()
-    candidate_test.write_text(
-        "from aiworkhub.new_candidate_module import VALUE\n\n"
-        "def test_candidate_value():\n"
-        "    assert VALUE == 'candidate-new-module'\n",
-        encoding="utf-8",
+    candidate_test.write_bytes(
+        (
+            "from aiworkhub.new_candidate_module import VALUE\n\n"
+            "def test_candidate_value():\n"
+            "    assert VALUE == 'candidate-new-module'\n"
+        ).encode("utf-8"),
     )
     assert (
         _git(
@@ -1111,8 +1117,8 @@ def test_pytest_validation_resolves_sparse_candidate_config_inside_worktree(
     )
     try:
         assert (workspace.path / "pyproject.toml").is_file()
-        (workspace.path / "src/aiworkhub/new_candidate_module.py").write_text(
-            "VALUE = 'candidate-new-module'\n", encoding="utf-8"
+        (workspace.path / "src/aiworkhub/new_candidate_module.py").write_bytes(
+            b"VALUE = 'candidate-new-module'\n"
         )
 
         result, = worker_workspace.run_validations(
@@ -1282,8 +1288,8 @@ def test_npm_prefix_validation_seeds_immutable_support_and_runs_from_candidate(
         ),
         encoding="utf-8",
     )
-    (extension / "test" / "candidate.test.js").write_text(
-        "console.log('candidate-npm-support-ok');\n", encoding="utf-8"
+    (extension / "test" / "candidate.test.js").write_bytes(
+        b"console.log('candidate-npm-support-ok');\n"
     )
     assert _git(repo, "add", "web-extension").returncode == 0
     assert _git(repo, "commit", "-qm", "npm validation support").returncode == 0
@@ -4023,6 +4029,7 @@ def test_bare_python_module_mypy_uses_trusted_executable_and_preserves_args(
     assert executed[4:] == declared[3:]
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX venv layout")
 def test_python_module_mypy_rewrite_is_exact_and_preserves_existing_rules(
     tmp_path: Path,
 ) -> None:
@@ -4811,6 +4818,8 @@ class TestFocusedRegressionExercisesCandidate:
             results = worker_workspace.run_validations(
                 workspace,
                 ["PYTHONPATH=src python3 tools/candidate_pytest.py tests/"],
+                backend=worker_workspace.VSCODE_LM_IN_PROCESS_BACKEND,
+                adapter_id="glm_vscode_lm",
             )
             assert len(results) == 1
             assert results[0]["returncode"] == 0
@@ -4940,6 +4949,8 @@ class TestFocusedRegressionExercisesCandidate:
             results = worker_workspace.run_validations(
                 workspace,
                 ["PYTHONPATH=src pytest tests/"],
+                backend=worker_workspace.VSCODE_LM_IN_PROCESS_BACKEND,
+                adapter_id="glm_vscode_lm",
             )
             assert len(results) == 1
             assert results[0]["returncode"] == 0
@@ -5027,6 +5038,8 @@ class TestFocusedRegressionExercisesCandidate:
             results = worker_workspace.run_validations(
                 workspace,
                 ["python tools/candidate_pytest.py tests/"],
+                backend=worker_workspace.VSCODE_LM_IN_PROCESS_BACKEND,
+                adapter_id="glm_vscode_lm",
             )
             assert len(results) == 1
             # No PYTHONPATH because neither candidate nor pytest matched
@@ -5071,6 +5084,8 @@ class TestFocusedRegressionExercisesCandidate:
             worker_workspace.run_validations(
                 workspace,
                 ["python3 tools/candidate_pytest.py tests/"],
+                backend=worker_workspace.VSCODE_LM_IN_PROCESS_BACKEND,
+                adapter_id="glm_vscode_lm",
             )
 
 
@@ -5517,8 +5532,45 @@ def test_terminal_state_literals_match_validation_runner() -> None:
 def _install_venv_python(root: Path, relative: str, marker: str) -> Path:
     path = root.joinpath(*relative.replace("\\", "/").split("/"))
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(f"#!/bin/sh\necho {marker}\nexit 0\n", encoding="utf-8")
-    os.chmod(path, 0o755)
+    if os.name == "nt":
+        # A POSIX shebang script is not a valid Windows executable image at
+        # all (CreateProcess rejects it with WinError 193/216 depending on
+        # whether the name ends in .exe) -- build a real, minimal, argv-
+        # independent PE via PowerShell's in-memory C# compiler (Add-Type,
+        # backed by the .NET Framework that ships with Windows), so no
+        # external compiler is required.
+        code = (
+            "using System;"
+            "class FakeInterpreter {"
+            "static int Main(string[] args) {"
+            f'Console.WriteLine("{marker}");'
+            "return 0; } }"
+        )
+        env = dict(os.environ)
+        env["AIWORKHUB_TEST_FAKE_INTERPRETER_SRC"] = code
+        # Add-Type's -OutputAssembly silently emits a non-executable stub
+        # when the target name has no recognized extension (e.g. the
+        # deliberately-unrecognized ".venv/bin/python3" spelling below) --
+        # build to a real ".exe" name always, then move it into place.
+        build_target = path.with_name(path.name + ".aiworkhub-build.exe")
+        result = subprocess.run(
+            [
+                "powershell", "-NoProfile", "-NonInteractive", "-Command",
+                "Add-Type -TypeDefinition $env:AIWORKHUB_TEST_FAKE_INTERPRETER_SRC "
+                f"-OutputAssembly '{build_target}' -OutputType ConsoleApplication",
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"failed to build fake Windows interpreter at {path}: {result.stderr}"
+            )
+        os.replace(build_target, path)
+    else:
+        path.write_text(f"#!/bin/sh\necho {marker}\nexit 0\n", encoding="utf-8")
+        os.chmod(path, 0o755)
     return path.resolve()
 
 
@@ -5608,6 +5660,17 @@ def test_run_validations_windows_venv_python_spelling(
         worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason=(
+        "tests POSIX PATH/shell pass-through semantics that do not hold on "
+        "Windows: CreateProcess does not resolve a bare relative slash-path "
+        "argv[0] the way a POSIX exec does (confirmed: even an absolute, "
+        "existing .exe fails identically once made relative), and 'echo' is "
+        "a cmd.exe builtin with no standalone executable to exec without a "
+        "shell"
+    ),
+)
 def test_run_validations_unrecognized_and_absolute_python_pass_through(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, repo: Path
 ) -> None:
@@ -6236,6 +6299,18 @@ def _forge_nested_locator(locator: Path, anchor: Path, forge) -> None:
         )
     finally:
         os.close(handle)
+    # os.replace's underlying Windows primitive (unlike POSIX rename, which
+    # only cares about directory write permission) refuses to overwrite a
+    # read-only destination -- the planted locator/anchor are exactly that
+    # (NF-2026-00841, S_IREAD-only mode). Clear it first so the forgery can
+    # land the same way an in-place attacker with directory write access
+    # could on POSIX.
+    for destination in (anchor, locator):
+        if destination.exists():
+            try:
+                os.chmod(destination, stat.S_IWRITE | stat.S_IREAD)
+            except OSError:
+                pass
     os.replace(anchor_staging, anchor)
     os.replace(staging, locator)
 
@@ -6252,11 +6327,20 @@ def test_nested_landlock_locator_rejects_owner_mode_symlink_hmac_escape_copy(
     real_owned = worker_workspace._coordinator_owned_regular_file
     locator_key = locator.resolve()
 
-    try:
-        locator.chmod(locator.stat().st_mode | stat.S_IWGRP)
-        mode_forced = False
-    except PermissionError:
+    if worker_workspace.posix_path_modes_supported():
+        try:
+            locator.chmod(locator.stat().st_mode | stat.S_IWGRP)
+            mode_forced = False
+        except PermissionError:
+            mode_forced = True
+    else:
+        # Windows has no real group-write bit: chmod succeeds without
+        # granting anything the real ownership/mode check would refuse, so
+        # the refusal cannot be observed by actually setting the bit -- it
+        # has to be injected directly instead.
         mode_forced = True
+
+    if mode_forced:
 
         def reject_locator_mode(path: Path):
             if path.resolve() == locator_key:
@@ -6276,10 +6360,11 @@ def test_nested_landlock_locator_rejects_owner_mode_symlink_hmac_escape_copy(
     except PermissionError:
         pass
 
-    original_geteuid = os.geteuid
-    monkeypatch.setattr(os, "geteuid", lambda: original_geteuid() + 1)
-    assert worker_workspace.authenticated_outer_validation_context() is None
-    monkeypatch.setattr(os, "geteuid", original_geteuid)
+    if worker_workspace.posix_path_modes_supported():
+        original_geteuid = os.geteuid
+        monkeypatch.setattr(os, "geteuid", lambda: original_geteuid() + 1)
+        assert worker_workspace.authenticated_outer_validation_context() is None
+        monkeypatch.setattr(os, "geteuid", original_geteuid)
 
     real = locator.with_name(locator.name + ".real")
     locator.rename(real)
@@ -6328,6 +6413,14 @@ def test_nested_landlock_locator_rejects_owner_mode_symlink_hmac_escape_copy(
         workspace, exec_scratch=scratch
     )
     copied_bytes = locator.read_bytes()
+    # Windows enforces a file's own read-only attribute for unlink
+    # regardless of parent directory permissions (unlike POSIX, where
+    # removal authority lives in the parent alone); clear it first so this
+    # deliberate "break the hardlink, keep a plain copy" step can proceed.
+    try:
+        locator.chmod(stat.S_IRUSR | stat.S_IWUSR)
+    except OSError:
+        pass
     locator.unlink()
     locator.write_bytes(copied_bytes)
     try:
@@ -6629,6 +6722,7 @@ def test_sparse_dependency_closure_is_one_coherent_current_canonical_generation(
 # ── NF430 request-owned worker temp authority ──────────────────────────────
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX owner/mode semantics")
 def test_worker_temp_environment_provisions_request_owned_root(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -7305,6 +7399,11 @@ def test_metadata_broker_allows_real_git_init_chmod(tmp_path: Path) -> None:
     assert (target / ".git" / "config").is_file()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Linux seccomp notification contract")
+@pytest.mark.skipif(
+    worker_workspace.landlock_abi_version() < 1,
+    reason="Landlock is not supported by this kernel",
+)
 def test_run_validations_nested_git_sparse_checkout_noop_metadata_integration(
     tmp_path: Path,
 ) -> None:
@@ -7764,6 +7863,9 @@ def test_lane_plan_refuses_when_no_secure_lane_can_be_provisioned(
     assert plan.provided is None
 
 
+@pytest.mark.skipif(
+    os.name == "nt", reason="validation_lane refusal is Linux-only by design"
+)
 def test_preflight_reports_absent_lane_before_any_command_runs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -7871,6 +7973,9 @@ def test_lane_plan_reports_but_never_refuses_a_capability_gap(
     assert not [entry for entry in missing if entry.startswith("validation_lane:")], missing
 
 
+@pytest.mark.skipif(
+    os.name == "nt", reason="Landlock ABI capability measurement is Linux-only"
+)
 def test_preflight_does_not_refuse_targets_this_lane_can_run(tmp_path: Path) -> None:
     """Regression: the over-refusal that would have blocked 12.8% of the suite."""
     repo = _lane_repo(
@@ -7953,6 +8058,15 @@ def _run_shaping_fixture(tmp_path: Path, addopts: str, *argv: str) -> str:
             # root so the shaping fixture tests pytest rather than host setup.
             "PYTHONPATH": str(Path(pytest.__file__).resolve().parents[1]),
             "PYTEST_ADDOPTS": addopts,
+            # Windows' socket/Winsock provider lookup (imported transitively
+            # via anyio's `_overlapped`) needs SYSTEMROOT at interpreter
+            # startup; without it the child crashes before pytest even runs
+            # (WinError 10106), independent of anything under test here.
+            **(
+                {"SYSTEMROOT": os.environ["SYSTEMROOT"]}
+                if os.name == "nt" and "SYSTEMROOT" in os.environ
+                else {}
+            ),
         },
         capture_output=True,
         text=True,
@@ -8128,9 +8242,15 @@ def test_claude_projection_home_privacy_is_enforced_on_posix_and_recorded_when_u
     world_readable.mkdir(mode=0o755)
     (world_readable / "tmp").mkdir(mode=0o700)
 
-    # POSIX still refuses outright: a measured "not private" is a hard failure.
-    with pytest.raises(worker_workspace.WorkspaceError, match="_not_private:"):
-        worker_workspace.refresh_claude_credential_projection(world_readable)
+    # POSIX still refuses outright: a measured "not private" is a hard
+    # failure. Only real on this host: os.mkdir(mode=0o755) cannot fabricate
+    # actual world-readable NTFS ACLs on Windows (mode bits aren't real
+    # permission bits there), so this directory stays private-by-default and
+    # there is nothing to measure as "not private" -- the Windows side of this
+    # regression is exercised below instead, by injection.
+    if os.name == "posix":
+        with pytest.raises(worker_workspace.WorkspaceError, match="_not_private:"):
+            worker_workspace.refresh_claude_credential_projection(world_readable)
 
     # A host that answers privacy with an ACL this module does not read must
     # neither raise nor silently pass; it records the reduced guarantee.
@@ -8430,6 +8550,21 @@ def test_removal_repair_absorbs_a_denied_chmod_family(
     assert [path for path, _mode in calls] == [str(parent), str(target)]
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason=(
+        "relies on POSIX removal authority living in the parent directory "
+        "alone (never the target's own mode) while os.chmod is mocked to a "
+        "no-op recorder -- true enough to pass here only because POSIX CI/"
+        "sandbox users can typically unlink a read-only file regardless of "
+        "its own mode. Windows enforces the target's own read-only "
+        "attribute for real, with no such bypass, so with chmod faked to a "
+        "no-op the underlying removal genuinely cannot succeed there "
+        "regardless of production code correctness -- confirmed the same "
+        "chmod sequence removes the file fine on this host once chmod is "
+        "NOT mocked out"
+    ),
+)
 def test_workspace_rmtree_disposes_a_tree_holding_a_shared_inode(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -8608,6 +8743,7 @@ def _install_modelled_boundary(
     monkeypatch.setattr(os, "fstat", fstat)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX metadata broker semantics")
 def test_outer_broker_probe_touches_only_its_own_scratch_files(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
