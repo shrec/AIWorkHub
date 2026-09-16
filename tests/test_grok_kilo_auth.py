@@ -115,15 +115,26 @@ def test_resolve_auth_source_honors_explicit_xdg_root(tmp_path):
     ) == data / "kilo" / "auth.json"
 
 
+# resolve_kilo_auth_source checks home_path.is_absolute() using this host's
+# REAL Path semantics regardless of the platform_name kwarg (that kwarg only
+# gates the separate "unsupported platform name" check) -- so a POSIX-style
+# literal like "/safe" is only drive-relative on Windows and would trip the
+# home check before the XDG one under test ever gets a chance to fire.
+_SAFE_ABS_HOME = str(Path(Path(__file__).resolve().anchor) / "safe")
+
+
 @pytest.mark.parametrize(
     ("kwargs", "reason"),
     [
         ({"home": "relative"}, "home must be an absolute normalized path"),
         (
-            {"home": "/safe", "xdg_data_home": "relative"},
+            {"home": _SAFE_ABS_HOME, "xdg_data_home": "relative"},
             "XDG data home must be an absolute normalized path",
         ),
-        ({"home": "/safe", "platform_name": "other"}, "unsupported platform name"),
+        (
+            {"home": _SAFE_ABS_HOME, "platform_name": "other"},
+            "unsupported platform name",
+        ),
     ],
 )
 def test_resolve_auth_source_fails_closed_without_ambient_reads(kwargs, reason):
