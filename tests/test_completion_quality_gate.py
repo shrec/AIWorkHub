@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 from types import SimpleNamespace
 
 import pytest
@@ -709,7 +710,44 @@ def test_pytest_quality_check_prefers_toolchain_entrypoint_even_when_runtime_imp
     entrypoint.chmod(0o755)
     observed: dict[str, object] = {}
 
+    # This test simulates a POSIX venv layout end to end, which needs two
+    # independent Windows behaviors neutralized:
+    # 1. _run_command_array's toolchain-entrypoint branch decides the
+    #    POSIX-vs-Windows candidate layout via platform_io.is_windows(), not
+    #    quality_evidence.os.name -- so the os.name mock below alone looked
+    #    for ".venv/Scripts/pytest.exe" instead of the ".venv/bin/pytest"
+    #    this test creates, silently falling through to sys.executable.
+    # 2. Once a real Windows host is forced down the POSIX branch, it also
+    #    always runs argv[0] through _windows_native_command_argv (gated on
+    #    the real os.name, which quality_evidence.os.name below DOES reach)
+    #    -- a genuine, always-on safety gate that forbids executing a
+    #    non-native (no .exe/.com/.cmd/.bat) file. The os.name mock below
+    #    is what keeps that gate from firing for this deliberately
+    #    POSIX-shaped entrypoint.
     monkeypatch.setattr(quality_evidence, "os", SimpleNamespace(name="posix"))
+    monkeypatch.setattr(quality_evidence.platform_io, "is_windows", lambda: False)
+    # With is_windows() forced False, the layout branch also requires the
+    # candidate's real S_IXUSR bit -- which a real Windows host never sets
+    # for an extensionless file regardless of chmod(), since Windows
+    # synthesizes execute bits from the file extension, not from chmod.
+    # Fake just that one stat() call so the POSIX "executable" precondition
+    # is satisfied the way it would be on a real POSIX host.
+    real_stat = os.stat
+
+    def fake_stat(path, *args, **kwargs):
+        result = real_stat(path, *args, **kwargs)
+        if os.fspath(path) != os.fspath(entrypoint):
+            return result
+        # os.stat_result is a structseq, not a namedtuple -- no _replace --
+        # so rebuild it from its 10 basic fields with only st_mode changed.
+        return os.stat_result((
+            result.st_mode | stat.S_IXUSR,
+            result.st_ino, result.st_dev, result.st_nlink,
+            result.st_uid, result.st_gid, result.st_size,
+            int(result.st_atime), int(result.st_mtime), int(result.st_ctime),
+        ))
+
+    monkeypatch.setattr(os, "stat", fake_stat)
     monkeypatch.setattr(quality_evidence.importlib.util, "find_spec", lambda _name: object())
     monkeypatch.setattr(quality_evidence, "_which", lambda _name: str(entrypoint))
     def fake_run(argv, **_kwargs):
