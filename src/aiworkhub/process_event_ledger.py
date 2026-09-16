@@ -7,18 +7,19 @@ rotated files remain immutable and readers stream them in chronological order.
 
 from __future__ import annotations
 
-import json
 import heapq
+import json
 import os
 import stat
 import threading
 import uuid
 from collections import OrderedDict
 from contextlib import contextmanager
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterable, Iterator
 
 from .platform_io import atomic_replace, chmod_fd, lock_fd, unlock_fd
 
@@ -538,14 +539,30 @@ def _parse_complete_jsonl(payload: bytes) -> Iterator[dict[str, Any]]:
             yield row
 
 
+def _cache_bounded_projection(
+    cache: OrderedDict[Any, Any],
+    lock: Any,
+    cache_key: Any,
+    projection: Any,
+    max_entries: int,
+) -> None:
+    with lock:
+        cache[cache_key] = projection
+        cache.move_to_end(cache_key)
+        while len(cache) > max_entries:
+            cache.popitem(last=False)
+
+
 def _cache_projection(
     cache_key: _ProjectionKey, projection: _LatestEventProjection
 ) -> None:
-    with _LATEST_EVENT_CACHE_LOCK:
-        _LATEST_EVENT_CACHE[cache_key] = projection
-        _LATEST_EVENT_CACHE.move_to_end(cache_key)
-        while len(_LATEST_EVENT_CACHE) > _LATEST_EVENT_CACHE_MAX_ENTRIES:
-            _LATEST_EVENT_CACHE.popitem(last=False)
+    _cache_bounded_projection(
+        _LATEST_EVENT_CACHE,
+        _LATEST_EVENT_CACHE_LOCK,
+        cache_key,
+        projection,
+        _LATEST_EVENT_CACHE_MAX_ENTRIES,
+    )
 
 
 def _rebuild_latest_events(
@@ -701,3 +718,327 @@ def latest_events(
         replace=replace,
         drop_fields=drop_fields,
     )
+
+
+# --- Bounded multi-request event projection ---------------------------------
+#
+# ``latest_events`` answers "what is the newest row per key".  A review drain
+# asks a different question of the same bytes: "what is the FULL history of
+# these particular request ids".  Answering it by filtering a fresh
+# ``iter_events`` pass per request made recovery O(ledger x action): every
+# reviewer launch appends, the launcher's request projection was invalidated
+# wholesale by any append, and so the measured 22-action backlog replayed the
+# whole ledger once per action.
+#
+# This projection folds ONE canonical pass into a bounded set of tracked keys,
+# and a subsequent append parses only the bytes added after the last complete
+# row -- it never discards the rows already folded for unrelated requests.
+
+_REQUEST_EVENT_PROJECTION_MAX_KEYS = 64
+_REQUEST_EVENT_CACHE_MAX_ENTRIES = 8
+
+
+@dataclass(frozen=True)
+class _RequestEventProjection:
+    signatures: tuple[_FileSignature, ...]
+    complete_active_offset: int
+    events: dict[str, list[dict[str, Any]]]
+
+
+# (resolved ledger path, key field).  The key field joins the identity for the
+# same reason it does for ``latest_events``: a projection bucketed by
+# ``request_id`` must never answer a question asked about ``task_id``.
+_RequestProjectionKey = tuple[str, str]
+
+_REQUEST_EVENT_CACHE_LOCK = threading.RLock()
+_REQUEST_EVENT_CACHE: OrderedDict[
+    _RequestProjectionKey, _RequestEventProjection
+] = OrderedDict()
+
+
+def reset_request_event_cache() -> None:
+    """Drop every retained request projection.
+
+    The cache is never an authority, so this costs at most one cold replay. It
+    exists so a caller -- or a test asserting cold-path behaviour -- can pin
+    the projection to a known empty state.
+    """
+
+    with _REQUEST_EVENT_CACHE_LOCK:
+        _REQUEST_EVENT_CACHE.clear()
+
+
+def _distinct_request_keys(request_ids: Iterable[Any]) -> list[str]:
+    """Order-preserving unique keys, by exact string identity only.
+
+    A non-string id is dropped rather than coerced: ``str(123)`` would let a
+    row whose ``request_id`` is the integer 123 answer for the request id
+    ``"123"``, which is exactly the identity confusion this projection must
+    not introduce.
+    """
+
+    keys: list[str] = []
+    seen: set[str] = set()
+    for value in request_ids:
+        if not isinstance(value, str) or value in seen:
+            continue
+        seen.add(value)
+        keys.append(value)
+    return keys
+
+
+def _fold_request_rows(
+    events: dict[str, list[dict[str, Any]]],
+    rows: Iterable[dict[str, Any]],
+    key_field: str,
+) -> None:
+    """Append each row to its tracked bucket, by exact key identity.
+
+    A row whose key is untracked is skipped, never created: a key that was
+    never asked for must not silently start being retained, and a key that was
+    asked for always has a bucket already.
+    """
+
+    for row in rows:
+        value = row.get(key_field)
+        if not isinstance(value, str):
+            continue
+        bucket = events.get(value)
+        if bucket is not None:
+            bucket.append(row)
+
+
+def _scan_request_events(
+    path: Path, keys: list[str], *, key_field: str
+) -> dict[str, list[dict[str, Any]]]:
+    """One canonical ledger pass collecting exactly ``keys``."""
+
+    events: dict[str, list[dict[str, Any]]] = {key: [] for key in keys}
+    _fold_request_rows(events, iter_events(path), key_field)
+    return events
+
+
+def _copy_event_value(value: Any) -> Any:
+    """Deep-copy one JSON ledger value so cached rows cannot be mutated."""
+
+    return deepcopy(value)
+
+
+def _request_slice(
+    events: dict[str, list[dict[str, Any]]], requested: list[str]
+) -> dict[str, list[dict[str, Any]]]:
+    """Copy out the requested buckets so no caller can mutate the cache.
+
+    ``dict(row)`` alone is a shallow copy: the new row still points at the
+    cached nested values, so a caller mutating ``row["payload"]["x"]`` would
+    edit retained state every later reader of this projection sees, and the
+    cache would serve that edit back as ledger truth.  Rows are copied all the
+    way down, which is what this function's isolation has always claimed.
+    """
+
+    return {
+        key: [_copy_event_value(row) for row in events.get(key, ())]
+        for key in requested
+    }
+
+
+def _cache_request_projection(
+    cache_key: _RequestProjectionKey, projection: _RequestEventProjection
+) -> None:
+    _cache_bounded_projection(
+        _REQUEST_EVENT_CACHE,
+        _REQUEST_EVENT_CACHE_LOCK,
+        cache_key,
+        projection,
+        _REQUEST_EVENT_CACHE_MAX_ENTRIES,
+    )
+
+
+def _retained_request_keys(
+    requested: list[str], tracked: Iterable[str]
+) -> list[str]:
+    """Bound the tracked key set, keeping this call's own keys first.
+
+    Eviction can only cost a later cold replay for the evicted key, never a
+    wrong answer: an untracked key is rebuilt from the canonical ordering
+    rather than reported empty.
+    """
+
+    keys = list(requested)
+    seen = set(keys)
+    for key in tracked:
+        if len(keys) >= _REQUEST_EVENT_PROJECTION_MAX_KEYS:
+            break
+        if key in seen:
+            continue
+        seen.add(key)
+        keys.append(key)
+    return keys
+
+
+def _rebuild_request_events(
+    path: Path,
+    *,
+    keys: list[str],
+    key_field: str,
+    cache_key: _RequestProjectionKey,
+) -> dict[str, list[dict[str, Any]]]:
+    before = _ledger_signatures(path)
+    events = _scan_request_events(path, keys, key_field=key_field)
+    after = _ledger_signatures(path)
+
+    # Cache only a stable read.  A rotation or append concurrent with the pass
+    # still yields iter_events' own bounded semantics to this caller, but must
+    # never seed a projection that later incremental replays would extend.
+    if before is not None and before == after:
+        active_offset = 0
+        if after and after[-1][0] == str(path.resolve(strict=False)):
+            active_offset = _active_complete_offset(path, size=after[-1][3])
+            if _ledger_signatures(path) != after:
+                return events
+        _cache_request_projection(
+            cache_key,
+            _RequestEventProjection(
+                signatures=after,
+                complete_active_offset=active_offset,
+                events=events,
+            ),
+        )
+    return events
+
+
+def _replay_appended_request_events(
+    path: Path,
+    *,
+    cached: _RequestEventProjection,
+    current: tuple[_FileSignature, ...],
+    resolved_path: str,
+    key_field: str,
+    cache_key: _RequestProjectionKey,
+) -> dict[str, list[dict[str, Any]]] | None:
+    """Fold only the bytes appended since ``cached``, or return ``None``.
+
+    ``None`` means the change was not pure growth of the same active file --
+    a rotation, spill, truncation, replacement or any immutable-segment change
+    -- and the caller must replay the canonical ordering instead.  Every one of
+    those is fail-closed: an unrecognised change never reuses folded rows.
+    """
+
+    old = cached.signatures
+    if any(_is_spill(path, Path(item[0])) for item in current):
+        # A spill is published out of band and iter_events merges it by
+        # timestamp, so appended bytes are no longer the whole delta.
+        return None
+    if len(old) != len(current) or old[:-1] != current[:-1]:
+        return None
+    if not (old and current):
+        return None
+    if old[-1][0] != resolved_path or current[-1][0] != resolved_path:
+        return None
+    if old[-1][1:3] != current[-1][1:3]:
+        # Same path, different device/inode: the active file was replaced.
+        return None
+    observed_size = current[-1][3]
+    if observed_size <= old[-1][3]:
+        # Truncated or rewritten in place at the same length.
+        return None
+
+    start = cached.complete_active_offset
+    try:
+        with path.open("rb") as handle:
+            opened = os.fstat(handle.fileno())
+            if (
+                int(opened.st_dev),
+                int(opened.st_ino),
+                int(opened.st_size),
+            ) != (current[-1][1], current[-1][2], observed_size):
+                raise OSError("process_event_ledger_changed_during_read")
+            handle.seek(start)
+            payload = handle.read(observed_size - start)
+    except OSError:
+        return None
+
+    complete_length = payload.rfind(b"\n") + 1
+    events = {key: list(rows) for key, rows in cached.events.items()}
+    if complete_length:
+        _fold_request_rows(
+            events, _parse_complete_jsonl(payload[:complete_length]), key_field
+        )
+    if _ledger_signatures(path) != current:
+        return None
+    _cache_request_projection(
+        cache_key,
+        _RequestEventProjection(
+            signatures=current,
+            complete_active_offset=start + complete_length,
+            events=events,
+        ),
+    )
+    return events
+
+
+def events_for_requests(
+    path: Path,
+    request_ids: Iterable[Any],
+    *,
+    key_field: str = "request_id",
+) -> dict[str, list[dict[str, Any]]]:
+    """Return several keys' full ledger-ordered histories from one pass.
+
+    Every requested key appears in the result, mapped to an empty list when
+    the ledger holds nothing for it, so a caller can never mistake "not
+    tracked" for "no events".  Rows are returned in canonical ``iter_events``
+    order and are copies, so the retained projection is unreachable.
+
+    The common path is append-aware: rows appended since the previous call are
+    parsed once and folded into the buckets they belong to.  Appending events
+    for one request therefore does not discard the rows already projected for
+    the others -- which is precisely what made a review drain replay the whole
+    ledger once per action.  The cache is process-local, bounded and never an
+    authority: a restart, an eviction or any non-append change merely pays one
+    cold replay.
+    """
+
+    requested = _distinct_request_keys(request_ids)
+    if not requested:
+        return {}
+
+    resolved_path = str(path.resolve(strict=False))
+    cache_key = (resolved_path, key_field)
+    if len(requested) > _REQUEST_EVENT_PROJECTION_MAX_KEYS:
+        # More keys than the projection is allowed to retain.  Answer them in
+        # one uncached pass rather than truncating the request or degrading
+        # back to one pass per key, and leave the retained projection alone.
+        return _scan_request_events(path, requested, key_field=key_field)
+
+    current = _ledger_signatures(path)
+    with _REQUEST_EVENT_CACHE_LOCK:
+        cached = _REQUEST_EVENT_CACHE.get(cache_key)
+        if cached is not None:
+            _REQUEST_EVENT_CACHE.move_to_end(cache_key)
+
+    if (
+        cached is not None
+        and current is not None
+        and all(key in cached.events for key in requested)
+    ):
+        if current == cached.signatures:
+            return _request_slice(cached.events, requested)
+        replayed = _replay_appended_request_events(
+            path,
+            cached=cached,
+            current=current,
+            resolved_path=resolved_path,
+            key_field=key_field,
+            cache_key=cache_key,
+        )
+        if replayed is not None:
+            return _request_slice(replayed, requested)
+
+    keys = _retained_request_keys(
+        requested, cached.events.keys() if cached is not None else ()
+    )
+    rebuilt = _rebuild_request_events(
+        path, keys=keys, key_field=key_field, cache_key=cache_key
+    )
+    return _request_slice(rebuilt, requested)
