@@ -460,6 +460,7 @@ ROUTE_HOLD_ACTIONS: frozenset[str] = (
 # row that already records WHY this route was retired now also records what the
 # typed disposition said to do about it.
 _ROUTE_HOLD_MARKER = ":hold="
+_PRE_PROVIDER_HOLD_MARKER = ":provider_launched=false"
 
 
 def route_attempt_hold(failure_reason: Any) -> str:
@@ -473,6 +474,11 @@ def route_attempt_hold(failure_reason: Any) -> str:
     if not separator:
         return ""
     return held if held in ROUTE_HOLD_ACTIONS else ""
+
+
+def _route_attempt_was_pre_provider_hold(failure_reason: Any) -> bool:
+    """Whether a typed launch receipt proved no provider process was started."""
+    return _PRE_PROVIDER_HOLD_MARKER in str(failure_reason or "")
 
 
 def reviewer_recovery_dispatch(
@@ -2292,16 +2298,27 @@ class ReviewOrchestrator:
                 terminal_failure_classification.ACTION_CREDENTIAL_HOLD,
             }:
                 return {"ok": False, "error": "review_existing_attempt_retry_not_allowed"}
-            if not reviewer_request_id or retry_terminal is None:
-                return {"ok": False, "error": "review_existing_attempt_retry_unavailable"}
-            status = self.manager.status(reviewer_request_id)
-            disposition = reviewer_terminal_disposition(status)
-            if (
-                not isinstance(status, Mapping)
-                or not self._attempt_route_binding_matches(status, attempt)
-                or disposition.get("provider_launched") is not False
+            pre_provider_credential_hold = (
+                hold == terminal_failure_classification.ACTION_CREDENTIAL_HOLD
+                and not reviewer_request_id
+                and _route_attempt_was_pre_provider_hold(attempt["failure_reason"])
+            )
+            if not pre_provider_credential_hold and (
+                not reviewer_request_id or retry_terminal is None
             ):
-                return {"ok": False, "error": "review_existing_attempt_was_provider_launched"}
+                return {"ok": False, "error": "review_existing_attempt_retry_unavailable"}
+            if not pre_provider_credential_hold:
+                status = self.manager.status(reviewer_request_id)
+                disposition = reviewer_terminal_disposition(status)
+                if (
+                    not isinstance(status, Mapping)
+                    or not self._attempt_route_binding_matches(status, attempt)
+                    or disposition.get("provider_launched") is not False
+                ):
+                    return {
+                        "ok": False,
+                        "error": "review_existing_attempt_was_provider_launched",
+                    }
 
         # Persist the manager's exact intent BEFORE any external task-store
         # transition.  A crash after this point is retry-safe: the same call
@@ -2356,27 +2373,31 @@ class ReviewOrchestrator:
             }
 
         if decision == "retry_existing_attempt":
-            assert retry_terminal is not None
-            assert status is not None
-            card = status.get("task_card")
-            card = card if isinstance(card, Mapping) else {}
-            retry_result = retry_terminal(
-                task_id=reviewer_task_id,
-                request_id=reviewer_request_id,
-                terminal_substatus=str(
-                    card.get("terminal_substatus") or card.get("worker_status")
-                    or status.get("state") or ""
-                ),
-                topic="quality_review",
-                reason="manager-authorized exact reviewer attempt recovery",
-            )
-            if not isinstance(retry_result, Mapping) or retry_result.get("ok") is not True:
-                return {
-                    "ok": False,
-                    "error": "review_existing_attempt_retry_failed",
-                    "decision_id": decision_id,
-                    "retry_result": dict(retry_result or {}),
-                }
+            if reviewer_request_id:
+                assert retry_terminal is not None
+                assert status is not None
+                card = status.get("task_card")
+                card = card if isinstance(card, Mapping) else {}
+                retry_result = retry_terminal(
+                    task_id=reviewer_task_id,
+                    request_id=reviewer_request_id,
+                    terminal_substatus=str(
+                        card.get("terminal_substatus") or card.get("worker_status")
+                        or status.get("state") or ""
+                    ),
+                    topic="quality_review",
+                    reason="manager-authorized exact reviewer attempt recovery",
+                )
+                if (
+                    not isinstance(retry_result, Mapping)
+                    or retry_result.get("ok") is not True
+                ):
+                    return {
+                        "ok": False,
+                        "error": "review_existing_attempt_retry_failed",
+                        "decision_id": decision_id,
+                        "retry_result": dict(retry_result or {}),
+                    }
 
         applied_at = datetime.now(timezone.utc).isoformat()
         try:
@@ -2690,8 +2711,19 @@ class ReviewOrchestrator:
                 result, attempts_made=int(attempt["attempt_index"]),
             )
             retirement = route_failure
+            pre_provider_credential_hold = (
+                dispatch["action"]
+                == terminal_failure_classification.ACTION_CREDENTIAL_HOLD
+                and dispatch["disposition"].get("provider_launched") is False
+                and result.get("provider_launched") is False
+            )
+            if pre_provider_credential_hold:
+                # The route identity is already bound, but no provider process
+                # spent this slot. Keep that fact beside the durable hold so an
+                # audited manager can re-arm this exact attempt, never attempt 3.
+                retirement += _PRE_PROVIDER_HOLD_MARKER
             if dispatch["route_hold"]:
-                retirement = f"{route_failure}{_ROUTE_HOLD_MARKER}{dispatch['action']}"
+                retirement = f"{retirement}{_ROUTE_HOLD_MARKER}{dispatch['action']}"
             if not self._retire_route_attempt(action, attempt, retirement):
                 return None
             return {

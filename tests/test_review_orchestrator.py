@@ -658,6 +658,93 @@ def test_manager_rearms_exact_credential_held_attempt_two_without_attempt_three(
     assert relaunched[-1]["reviewer_request_id"] != successor_request
 
 
+def test_pre_provider_auth_hold_rearms_exact_attempt_two_without_attempt_three(
+    tmp_path: Path,
+) -> None:
+    """Chains 915/917/923 keep the refused second route without spending it."""
+    manager = _FailoverManager(tmp_path)
+    db_path = tmp_path / "pre-provider-auth-attempt-two.sqlite"
+    driver = review_orchestrator.ReviewOrchestrator(
+        manager, db_path=db_path, route_selector=lambda *_args: dict(FIRST_ROUTE)
+    )
+    chain = driver.ensure_chain(
+        target_task_id="TARGET", target_request_id="target-request", claim_epoch=1,
+        packet_sha256="a" * 64, candidate_sha256="b" * 64, now=NOW,
+    )
+    first_task = driver._reviewer_task_id(chain.chain_identity, "correctness")
+    second_task = driver._reviewer_task_id(
+        chain.chain_identity, "correctness", attempt_index=2
+    )
+    driver.route_selector = _two_route_selector(first_task)
+    assert driver.drain(max_actions=1, now=NOW).completed == 1
+    first_request = manager.requests_by_task[first_task]
+    manager.status_results[first_request] = _terminal_status(first_request, first_task)
+    manager.terminal_launch_results[second_task] = {
+        "ok": False,
+        "state": "launch_failed",
+        "reason": "claude_subscription_session_refresh_required",
+        "provider_launched": False,
+    }
+
+    assert driver.drain(max_actions=1, now=NOW).pending == 1
+    first, held = driver._route_attempts(chain.chain_id, "correctness")
+    assert first["state"] == "retired"
+    assert held["state"] == "retired"
+    assert held["attempt_index"] == 2
+    assert held["reviewer_task_id"] == second_task
+    assert held["reviewer_request_id"] == ""
+    assert {key: held[key] for key in SUCCESSOR_ROUTE} == SUCCESSOR_ROUTE
+    assert review_orchestrator.route_attempt_hold(
+        held["failure_reason"]
+    ) == "credential_hold"
+    assert review_orchestrator._route_attempt_was_pre_provider_hold(
+        held["failure_reason"]
+    )
+    assert len(manager.provider_launches) == 1
+
+    # The hold survives later passes without consuming another route or silently
+    # retrying stale credentials.
+    assert driver.drain(max_actions=1, now=NOW).pending == 1
+    assert len(driver._route_attempts(chain.chain_id, "correctness")) == 2
+    assert len(manager.launches) == 2
+    assert len(manager.provider_launches) == 1
+
+    third_route = driver.resolve_manager_hold(
+        **_hold_resolution_args(
+            chain, held, decision="authorize_distinct_route_successor"
+        )
+    )
+    assert third_route == {
+        "ok": False, "error": "review_route_retries_exhausted:correctness"
+    }
+    resolved = driver.resolve_manager_hold(
+        **_hold_resolution_args(chain, held, decision="retry_existing_attempt")
+    )
+    assert resolved["ok"] is True
+    rearmed = driver._route_attempts(chain.chain_id, "correctness")
+    assert len(rearmed) == 2
+    assert rearmed[-1]["state"] == "planned"
+    assert rearmed[-1]["reviewer_task_id"] == second_task
+    assert {key: rearmed[-1][key] for key in SUCCESSOR_ROUTE} == SUCCESSOR_ROUTE
+
+    assert driver.drain(max_actions=1, now=NOW).pending == 1
+    launched = driver._route_attempts(chain.chain_id, "correctness")
+    assert len(launched) == 2
+    assert launched[-1]["state"] == "launched"
+    assert launched[-1]["reviewer_task_id"] == second_task
+    assert len(manager.provider_launches) == 2
+
+    second_request = str(launched[-1]["reviewer_request_id"])
+    manager.status_results[second_request] = {
+        **_terminal_status(second_request, second_task),
+        **SUCCESSOR_ROUTE,
+    }
+    assert driver.drain(max_actions=1, now=NOW).pending == 1
+    assert len(driver._route_attempts(chain.chain_id, "correctness")) == 2
+    assert len(manager.provider_launches) == 2
+    assert manager.accepts == []
+
+
 def test_manager_callback_reconcile_requires_exact_ready_evidence(
     tmp_path: Path,
 ) -> None:
