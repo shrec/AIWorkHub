@@ -127,6 +127,7 @@ def test_symlink_terminal_intent_diagnostic_never_follows_subject(tmp_path, monk
     _assert_nonregular_intent_is_contained(tmp_path, monkeypatch, intent)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="named FIFOs are unavailable on Windows")
 def test_fifo_terminal_intent_diagnostic_never_blocks_on_subject(tmp_path, monkeypatch):
     manager = _manager_for_periodic_scan(tmp_path, monkeypatch)
     intent = manager.process_dir / ("fifo" + manager._REVIEWER_TERMINAL_INTENT_SUFFIX)
