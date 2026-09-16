@@ -19,6 +19,21 @@ def _initialized_root(tmp_path: Path) -> Path:
     return root
 
 
+def _native_cli_sandbox_backend() -> str:
+    """A sandbox_backend value that does NOT itself fail-close a native CLI.
+
+    ``_provider_status`` deliberately marks a native (non-VS-Code-LM) CLI
+    adapter unlaunchable on Windows unless ``sandbox_backend`` is exactly
+    ``WINDOWS_APPCONTAINER_BACKEND`` -- "bubblewrap" (a POSIX-only sandbox)
+    would trip that gate on Windows and mask whatever the test actually
+    means to exercise.
+    """
+
+    if os.name == "nt":
+        return repo_policy.WINDOWS_APPCONTAINER_BACKEND
+    return "bubblewrap"
+
+
 def test_ensure_policy_is_owner_only_idempotent_and_valid(tmp_path: Path) -> None:
     root = _initialized_root(tmp_path)
     path, created = repo_policy.ensure_policy(root)
@@ -62,7 +77,7 @@ def test_grok_kilo_preflight_uses_local_xai_auth_without_exposing_it(
         root,
         "grok_kilo_cli",
         repo_policy.load_policy(root),
-        "bubblewrap",
+        _native_cli_sandbox_backend(),
         "",
     )
 
@@ -106,7 +121,7 @@ def test_codex_preflight_uses_exact_secret_free_capability_receipt(
         root,
         "codex_cli",
         repo_policy.load_policy(root),
-        "bubblewrap",
+        _native_cli_sandbox_backend(),
         "",
     )
 
