@@ -665,9 +665,19 @@ def available_memory_bytes(platform_name: str | None = None) -> int | None:
 
 
 def _windows_creation_flag() -> int:
-    """Return the named Windows process-group flag through a typed boundary."""
+    """Return the named Windows process-group flag through a typed boundary.
 
-    return cast(int, getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+    ``subprocess.CREATE_NEW_PROCESS_GROUP`` only exists in the ``subprocess``
+    module when Python itself is built for Windows, so on Linux/macOS
+    ``getattr`` cannot see it. This function must describe what Windows
+    WOULD use even when queried from a non-Windows host (``platform_name``
+    lets a caller ask for the Windows answer while running elsewhere), so the
+    fallback is the documented, stable literal (0x00000200) rather than 0.
+    """
+
+    return cast(
+        int, getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+    )
 
 
 def process_group_launch_kwargs(
