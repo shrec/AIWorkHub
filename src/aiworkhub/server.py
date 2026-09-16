@@ -3714,6 +3714,45 @@ def aiworkhub_agent_retry_finalization(
 
 
 @mcp.tool()
+@_serialize_task_lifecycle_write
+def aiworkhub_manager_review_hold_resolve(
+    target_task_id: str,
+    target_request_id: str,
+    claim_epoch: str,
+    candidate_sha256: str,
+    lens: Literal["correctness", "security", "code_quality"],
+    attempt_index: int,
+    reviewer_task_id: str,
+    reviewer_request_id: str,
+    decision: Literal[
+        "authorize_distinct_route_successor",
+        "callback_reconcile",
+        "retry_existing_attempt",
+    ],
+) -> dict[str, Any]:
+    """MANAGER WRITE: resolve one exact durable reviewer-route hold.
+
+    Every chain, candidate and retired-attempt identity is mandatory.  The
+    action can only expose an already-recorded callback, authorize the one
+    bounded distinct-route successor, or re-arm the exact pre-provider
+    reviewer attempt after its operational blocker was repaired.  It never
+    accepts the target and never relaunches its implementation worker.
+    """
+
+    return process_launcher.default_manager().resolve_review_route_hold(
+        target_task_id=target_task_id,
+        target_request_id=target_request_id,
+        claim_epoch=claim_epoch,
+        candidate_sha256=candidate_sha256,
+        lens=lens,
+        attempt_index=attempt_index,
+        reviewer_task_id=reviewer_task_id,
+        reviewer_request_id=reviewer_request_id,
+        decision=decision,
+    )
+
+
+@mcp.tool()
 def aiworkhub_agent_accept_preview(
     request_id: str,
     task_id: str,

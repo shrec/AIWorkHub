@@ -16,6 +16,34 @@ if str(_SRC) not in sys.path:
 from aiworkhub import server  # noqa: E402
 
 
+def test_manager_review_hold_tool_forwards_the_exact_identity(monkeypatch) -> None:
+    captured: dict = {}
+
+    class Manager:
+        def resolve_review_route_hold(self, **kwargs):
+            captured.update(kwargs)
+            return {"ok": True, "state": "review_manager_hold_resolved"}
+
+    monkeypatch.setattr(server.process_launcher, "default_manager", lambda: Manager())
+    result = server.aiworkhub_manager_review_hold_resolve(
+        target_task_id="TARGET", target_request_id="target-request",
+        claim_epoch="7", candidate_sha256="b" * 64, lens="correctness",
+        attempt_index=2, reviewer_task_id="QUALITY_REVIEW_EXACT",
+        reviewer_request_id="review-request-exact",
+        decision="retry_existing_attempt",
+    )
+
+    assert result == {"ok": True, "state": "review_manager_hold_resolved"}
+    assert captured == {
+        "target_task_id": "TARGET", "target_request_id": "target-request",
+        "claim_epoch": "7", "candidate_sha256": "b" * 64,
+        "lens": "correctness", "attempt_index": 2,
+        "reviewer_task_id": "QUALITY_REVIEW_EXACT",
+        "reviewer_request_id": "review-request-exact",
+        "decision": "retry_existing_attempt",
+    }
+
+
 def test_stdlib_backend_can_be_selected_even_when_sdk_is_installed() -> None:
     env = dict(os.environ)
     env["PYTHONPATH"] = str(_SRC)

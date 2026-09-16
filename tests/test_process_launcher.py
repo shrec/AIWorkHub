@@ -12772,6 +12772,71 @@ def test_process_manager_satisfies_the_review_orchestrator_manager_protocol(
     assert protocol.parameters["to"].kind is inspect.Parameter.KEYWORD_ONLY
 
 
+def test_review_hold_resolution_uses_verified_manager_and_exact_reviewer_retry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    manager = object.__new__(process_launcher.ProcessManager)
+    manager.repo = tmp_path.resolve()
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        process_launcher.core,
+        "manager_bootstrap",
+        lambda: {
+            "role": "manager", "repo": str(tmp_path), "provider": "codex",
+            "manager_route": {"provider": "codex", "thread_id": "thread-exact"},
+        },
+    )
+    monkeypatch.setattr(process_launcher.core, "writes_allowed", lambda: True)
+    monkeypatch.setattr(
+        process_launcher.review_orchestrator,
+        "canonical_review_db",
+        lambda _manager: tmp_path / "queue.sqlite",
+    )
+
+    def retry_terminal_task(**kwargs):
+        captured["retry"] = kwargs
+        return {"ok": True}
+
+    monkeypatch.setattr(process_launcher.core, "retry_terminal_task", retry_terminal_task)
+
+    class Driver:
+        def __init__(self, bound_manager, *, db_path):
+            captured["manager"] = bound_manager
+            captured["db_path"] = db_path
+
+        def resolve_manager_hold(self, **kwargs):
+            captured["resolution"] = kwargs
+            return kwargs["retry_terminal"](
+                task_id=kwargs["reviewer_task_id"],
+                request_id=kwargs["reviewer_request_id"],
+                terminal_substatus="launch_failed",
+                topic="quality_review",
+                reason="exact",
+            )
+
+    monkeypatch.setattr(
+        process_launcher.review_orchestrator, "ReviewOrchestrator", Driver
+    )
+    result = manager.resolve_review_route_hold(
+        target_task_id="TARGET", target_request_id="target-request",
+        claim_epoch="7", candidate_sha256="b" * 64, lens="correctness",
+        attempt_index=2, reviewer_task_id="QUALITY_REVIEW_EXACT",
+        reviewer_request_id="review-request-exact",
+        decision="retry_existing_attempt",
+    )
+
+    assert result == {"ok": True}
+    assert captured["db_path"] == tmp_path / "queue.sqlite"
+    assert captured["resolution"]["actor"] == "codex:thread-exact"
+    assert captured["retry"] == {
+        "task_id": "QUALITY_REVIEW_EXACT",
+        "request_id": "review-request-exact",
+        "terminal_substatus": "launch_failed",
+        "topic": "quality_review",
+        "reason": "exact",
+    }
+
+
 class _PromptSeamReached(Exception):
     """Stops the launch at the exact seam under test."""
 

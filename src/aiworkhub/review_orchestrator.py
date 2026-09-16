@@ -951,6 +951,32 @@ ROUTE_ATTEMPT_TABLE = (
     "UNIQUE (chain_id, lens, reviewer_task_id))"
 )
 
+MANAGER_HOLD_DECISION_SCHEMA = "aiworkhub.review_manager_hold_decision.v1"
+MANAGER_HOLD_DECISION_TABLE = (
+    "CREATE TABLE IF NOT EXISTS review_orchestrator_manager_hold_decisions ("
+    "decision_id TEXT PRIMARY KEY, chain_id INTEGER NOT NULL, "
+    "target_task_id TEXT NOT NULL, target_request_id TEXT NOT NULL, "
+    "claim_epoch TEXT NOT NULL, candidate_sha256 TEXT NOT NULL, "
+    "lens TEXT NOT NULL, attempt_index INTEGER NOT NULL, "
+    "reviewer_task_id TEXT NOT NULL, reviewer_request_id TEXT NOT NULL DEFAULT '', "
+    "prior_hold TEXT NOT NULL, prior_failure_reason TEXT NOT NULL, "
+    "decision TEXT NOT NULL, actor TEXT NOT NULL, decided_at TEXT NOT NULL, "
+    "applied_at TEXT NOT NULL DEFAULT '', receipt_json TEXT NOT NULL, "
+    "receipt_sha256 TEXT NOT NULL, "
+    "UNIQUE (chain_id,lens,attempt_index))"
+)
+
+MANAGER_HOLD_DECISIONS = frozenset({
+    "authorize_distinct_route_successor",
+    "callback_reconcile",
+    "retry_existing_attempt",
+})
+MANAGER_RESOLVABLE_ROUTE_HOLDS = frozenset({
+    terminal_failure_classification.ACTION_MANAGER_JUDGMENT_UNKNOWN,
+    terminal_failure_classification.ACTION_CALLBACK_RECONCILE,
+    terminal_failure_classification.ACTION_CREDENTIAL_HOLD,
+})
+
 
 def _normalize_lenses(lenses: Any) -> tuple[str, ...]:
     if isinstance(lenses, str) or not isinstance(lenses, (list, tuple, set, frozenset)):
@@ -1985,6 +2011,420 @@ class ReviewOrchestrator:
         )
         return [dict(zip(keys, row, strict=True)) for row in rows]
 
+    def _manager_hold_decision(
+        self, chain_id: int, lens: str, attempt_index: int,
+    ) -> dict[str, Any] | None:
+        """Return one authenticated manager hold decision, or fail closed."""
+        with closing(_side_table_connection(self.db_path, readonly=True)) as conn:
+            try:
+                row = conn.execute(
+                    "SELECT receipt_json,receipt_sha256,applied_at FROM "
+                    "review_orchestrator_manager_hold_decisions "
+                    "WHERE chain_id=? AND lens=? AND attempt_index=?",
+                    (int(chain_id), str(lens), int(attempt_index)),
+                ).fetchone()
+            except sqlite3.OperationalError as exc:
+                if "no such table" in str(exc).lower():
+                    return None
+                raise
+        if row is None:
+            return None
+        try:
+            receipt = json.loads(str(row[0]))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            raise RuntimeError("review_manager_hold_decision_invalid") from None
+        if (
+            not isinstance(receipt, dict)
+            or receipt.get("schema_id") != MANAGER_HOLD_DECISION_SCHEMA
+            or canonical_digest(receipt) != str(row[1])
+        ):
+            raise RuntimeError("review_manager_hold_decision_invalid")
+        receipt["_applied_at"] = str(row[2] or "")
+        return receipt
+
+    def _manager_hold_snapshot(
+        self,
+        *,
+        target_task_id: str,
+        target_request_id: str,
+        claim_epoch: str | int,
+        candidate_sha256: str,
+        lens: str,
+        attempt_index: int,
+        reviewer_task_id: str,
+        reviewer_request_id: str,
+    ) -> dict[str, Any]:
+        """Authenticate the exact current chain, lens and retired attempt."""
+        if lens not in LENSES:
+            raise RuntimeError("review_manager_hold_lens_invalid")
+        if not re.fullmatch(r"[0-9a-f]{64}", str(candidate_sha256 or "")):
+            raise RuntimeError("review_manager_hold_candidate_invalid")
+        if int(attempt_index) < 1:
+            raise RuntimeError("review_manager_hold_attempt_invalid")
+
+        expected = {
+            "target_task_id": str(target_task_id),
+            "target_request_id": str(target_request_id),
+            "claim_epoch": str(claim_epoch),
+            "candidate_sha256": str(candidate_sha256),
+        }
+        with closing(_side_table_connection(self.db_path)) as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(ROUTE_ATTEMPT_TABLE)
+            conn.execute(MANAGER_HOLD_DECISION_TABLE)
+            chain = conn.execute(
+                "SELECT chain_id,chain_identity_json,chain_identity_sha256 "
+                "FROM review_chains WHERE target_task_id=? AND target_request_id=? "
+                "AND claim_epoch=?",
+                (expected["target_task_id"], expected["target_request_id"],
+                 expected["claim_epoch"]),
+            ).fetchone()
+            if chain is None:
+                raise RuntimeError("review_manager_hold_chain_missing")
+            try:
+                chain_identity = json.loads(str(chain[1]))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                raise RuntimeError("review_manager_hold_chain_invalid") from None
+            if (
+                not isinstance(chain_identity, dict)
+                or any(str(chain_identity.get(key) or "") != value
+                       for key, value in expected.items())
+                or canonical_digest(chain_identity) != str(chain[2])
+            ):
+                raise RuntimeError("review_manager_hold_chain_identity_mismatch")
+            chain_id = int(chain[0])
+            prior = self._manager_hold_decision(chain_id, lens, attempt_index)
+            if prior is not None:
+                prior_expected = {
+                    **expected,
+                    "lens": str(lens),
+                    "attempt_index": int(attempt_index),
+                    "reviewer_task_id": str(reviewer_task_id),
+                    "reviewer_request_id": str(reviewer_request_id),
+                }
+                if any(prior.get(key) != value for key, value in prior_expected.items()):
+                    raise RuntimeError("review_manager_hold_attempt_identity_mismatch")
+                return {"chain_id": chain_id, "prior_decision": prior}
+            latest = conn.execute(
+                "SELECT attempt_index,reviewer_task_id,reviewer_request_id,"
+                "runner,adapter_id,model,state,failure_reason "
+                "FROM review_orchestrator_route_attempts "
+                "WHERE chain_id=? AND lens=? ORDER BY attempt_index DESC LIMIT 1",
+                (chain_id, lens),
+            ).fetchone()
+            if latest is None:
+                raise RuntimeError("review_manager_hold_attempt_missing")
+            keys = (
+                "attempt_index", "reviewer_task_id", "reviewer_request_id", "runner",
+                "adapter_id", "model", "state", "failure_reason",
+            )
+            attempt = dict(zip(keys, latest, strict=True))
+            if (
+                int(attempt["attempt_index"]) != int(attempt_index)
+                or str(attempt["reviewer_task_id"]) != str(reviewer_task_id)
+                or str(attempt["reviewer_request_id"]) != str(reviewer_request_id)
+            ):
+                raise RuntimeError("review_manager_hold_attempt_identity_mismatch")
+            if str(attempt["state"]) != "retired":
+                raise RuntimeError("review_manager_hold_attempt_not_retired")
+            hold = route_attempt_hold(attempt["failure_reason"])
+            if hold not in MANAGER_RESOLVABLE_ROUTE_HOLDS:
+                raise RuntimeError("review_manager_hold_not_resolvable:" + hold)
+
+        # The chain table authenticates its immutable identity; the live target
+        # proves those bytes are still the current candidate rather than a
+        # superseded chain a manager happened to remember.
+        status = self.manager.status(expected["target_request_id"])
+        resolved = resolve_target_identity(status)
+        live_identity = resolved.get("identity")
+        if (
+            resolved.get("conflict")
+            or not isinstance(live_identity, Mapping)
+            or any(str(live_identity.get(key) or "") != value
+                   for key, value in expected.items())
+        ):
+            raise RuntimeError("review_manager_hold_target_identity_stale")
+        return {
+            "chain_id": chain_id,
+            "chain_identity": chain_identity,
+            "attempt": attempt,
+            "prior_hold": hold,
+            "target_status": status,
+        }
+
+    def _authorized_successor_decision(
+        self, action: review_lifecycle.ReviewAction, attempt: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        receipt = self._manager_hold_decision(
+            action.chain_id, action.lens, int(attempt["attempt_index"])
+        )
+        if receipt is None or receipt.get("decision") != "authorize_distinct_route_successor":
+            return None
+        identity = action.descriptor["chain_identity"]
+        exact = {
+            "target_task_id": str(identity["target_task_id"]),
+            "target_request_id": str(identity["target_request_id"]),
+            "claim_epoch": str(identity["claim_epoch"]),
+            "candidate_sha256": str(identity["candidate_sha256"]),
+            "lens": action.lens,
+            "attempt_index": int(attempt["attempt_index"]),
+            "reviewer_task_id": str(attempt["reviewer_task_id"]),
+            "reviewer_request_id": str(attempt["reviewer_request_id"]),
+            "prior_hold": route_attempt_hold(attempt["failure_reason"]),
+        }
+        if any(receipt.get(key) != value for key, value in exact.items()):
+            raise RuntimeError("review_manager_hold_decision_binding_invalid")
+        return receipt
+
+    def resolve_manager_hold(
+        self,
+        *,
+        target_task_id: str,
+        target_request_id: str,
+        claim_epoch: str | int,
+        candidate_sha256: str,
+        lens: str,
+        attempt_index: int,
+        reviewer_task_id: str,
+        reviewer_request_id: str,
+        decision: str,
+        actor: str,
+        retry_terminal: Callable[..., Mapping[str, Any]] | None = None,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Apply one audited manager-only transition to an exact held route.
+
+        This surface never accepts a candidate and never launches an
+        implementation worker.  It either makes an already-recorded reviewer
+        report visible again, authorizes the one still-unspent distinct route,
+        or re-arms the exact pre-provider reviewer attempt after its operational
+        blocker was repaired.
+        """
+        if decision not in MANAGER_HOLD_DECISIONS:
+            return {"ok": False, "error": "review_manager_hold_decision_invalid"}
+        actor = str(actor or "").strip()
+        if not actor or len(actor) > 240:
+            return {"ok": False, "error": "review_manager_hold_actor_invalid"}
+        try:
+            snapshot = self._manager_hold_snapshot(
+                target_task_id=target_task_id,
+                target_request_id=target_request_id,
+                claim_epoch=claim_epoch,
+                candidate_sha256=candidate_sha256,
+                lens=lens,
+                attempt_index=attempt_index,
+                reviewer_task_id=reviewer_task_id,
+                reviewer_request_id=reviewer_request_id,
+            )
+        except (RuntimeError, sqlite3.Error, review_lifecycle.ReviewLifecycleError) as exc:
+            return {"ok": False, "error": str(exc)[:300]}
+        prior = snapshot.get("prior_decision")
+        if isinstance(prior, dict):
+            if prior.get("decision") != decision or prior.get("actor") != actor:
+                return {"ok": False, "error": "review_manager_hold_already_decided"}
+            if prior.get("_applied_at"):
+                public = {key: value for key, value in prior.items() if not key.startswith("_")}
+                return {"ok": True, "idempotent": True, **public}
+            receipt = {key: value for key, value in prior.items() if not key.startswith("_")}
+            decision_id = canonical_digest(receipt)
+            attempts = self._route_attempts(int(prior["chain_id"]), str(prior["lens"]))
+            if not attempts:
+                return {"ok": False, "error": "review_manager_hold_attempt_missing"}
+            attempt = attempts[-1]
+            if (
+                int(attempt["attempt_index"]) != int(prior["attempt_index"])
+                or str(attempt["state"]) != "retired"
+                or str(attempt["failure_reason"]) != str(prior["prior_failure_reason"])
+                or str(attempt["reviewer_task_id"]) != str(prior["reviewer_task_id"])
+                or str(attempt["reviewer_request_id"]) != str(prior["reviewer_request_id"])
+            ):
+                return {"ok": False, "error": "review_manager_hold_transition_conflict"}
+            snapshot = {
+                "chain_id": int(prior["chain_id"]),
+                "attempt": attempt,
+                "prior_hold": str(prior["prior_hold"]),
+            }
+        else:
+            attempt = snapshot["attempt"]
+            hold = str(snapshot["prior_hold"])
+            decided_at = (now or datetime.now(timezone.utc)).isoformat()
+            receipt = {
+                "schema_id": MANAGER_HOLD_DECISION_SCHEMA,
+                "chain_id": int(snapshot["chain_id"]),
+                "target_task_id": str(target_task_id),
+                "target_request_id": str(target_request_id),
+                "claim_epoch": str(claim_epoch),
+                "candidate_sha256": str(candidate_sha256),
+                "lens": str(lens),
+                "attempt_index": int(attempt_index),
+                "reviewer_task_id": str(reviewer_task_id),
+                "reviewer_request_id": str(reviewer_request_id),
+                "prior_hold": hold,
+                "prior_failure_reason": str(attempt["failure_reason"]),
+                "decision": decision,
+                "actor": actor,
+                "decided_at": decided_at,
+            }
+            decision_id = canonical_digest(receipt)
+
+        hold = str(receipt["prior_hold"])
+        status: Mapping[str, Any] | None = None
+        if decision == "authorize_distinct_route_successor":
+            if int(attempt_index) >= _MAX_ROUTE_ATTEMPTS:
+                return {"ok": False, "error": "review_route_retries_exhausted:" + lens}
+        elif decision == "callback_reconcile":
+            if hold != terminal_failure_classification.ACTION_CALLBACK_RECONCILE:
+                return {"ok": False, "error": "review_callback_hold_required"}
+            if not reviewer_request_id:
+                return {"ok": False, "error": "review_callback_evidence_unavailable"}
+            status = self.manager.status(reviewer_request_id)
+            if (
+                not isinstance(status, Mapping)
+                or not self._attempt_route_binding_matches(status, attempt)
+                or str(status.get("state") or "") in _REVIEWER_RUNNING_STATES
+                or mechanical_reviewer_failure_reason(status)
+                or str(status.get("state") or "") != "review_ready"
+            ):
+                return {"ok": False, "error": "review_callback_evidence_unavailable"}
+        else:
+            if hold not in {
+                terminal_failure_classification.ACTION_MANAGER_JUDGMENT_UNKNOWN,
+                terminal_failure_classification.ACTION_CREDENTIAL_HOLD,
+            }:
+                return {"ok": False, "error": "review_existing_attempt_retry_not_allowed"}
+            if not reviewer_request_id or retry_terminal is None:
+                return {"ok": False, "error": "review_existing_attempt_retry_unavailable"}
+            status = self.manager.status(reviewer_request_id)
+            disposition = reviewer_terminal_disposition(status)
+            if (
+                not isinstance(status, Mapping)
+                or not self._attempt_route_binding_matches(status, attempt)
+                or disposition.get("provider_launched") is not False
+            ):
+                return {"ok": False, "error": "review_existing_attempt_was_provider_launched"}
+
+        # Persist the manager's exact intent BEFORE any external task-store
+        # transition.  A crash after this point is retry-safe: the same call
+        # reloads this receipt, the terminal retry is idempotent, and the route
+        # CAS below either completes once or reports a real conflict.
+        if not isinstance(prior, dict):
+            receipt_sha256 = decision_id
+            receipt_json = json.dumps(receipt, ensure_ascii=False, sort_keys=True)
+            try:
+                with closing(_side_table_connection(self.db_path)) as conn, conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    conn.execute(ROUTE_ATTEMPT_TABLE)
+                    conn.execute(MANAGER_HOLD_DECISION_TABLE)
+                    current = conn.execute(
+                        "SELECT state,failure_reason,reviewer_task_id,reviewer_request_id "
+                        "FROM review_orchestrator_route_attempts "
+                        "WHERE chain_id=? AND lens=? AND attempt_index=?",
+                        (int(snapshot["chain_id"]), lens, int(attempt_index)),
+                    ).fetchone()
+                    if current is None or (
+                        str(current[0]) != "retired"
+                        or str(current[1]) != str(attempt["failure_reason"])
+                        or str(current[2]) != reviewer_task_id
+                        or str(current[3]) != reviewer_request_id
+                    ):
+                        raise RuntimeError("review_manager_hold_transition_conflict")
+                    conn.execute(
+                        "INSERT INTO review_orchestrator_manager_hold_decisions "
+                        "(decision_id,chain_id,target_task_id,target_request_id,claim_epoch,"
+                        "candidate_sha256,lens,attempt_index,reviewer_task_id,"
+                        "reviewer_request_id,prior_hold,prior_failure_reason,decision,actor,"
+                        "decided_at,receipt_json,receipt_sha256) "
+                        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (
+                            decision_id, int(snapshot["chain_id"]), target_task_id,
+                            target_request_id, str(claim_epoch), candidate_sha256, lens,
+                            int(attempt_index), reviewer_task_id, reviewer_request_id,
+                            hold, str(attempt["failure_reason"]), decision, actor,
+                            receipt["decided_at"], receipt_json, receipt_sha256,
+                        ),
+                    )
+            except (RuntimeError, sqlite3.Error) as exc:
+                return {"ok": False, "error": str(exc)[:300]}
+
+        if decision == "authorize_distinct_route_successor":
+            return {
+                "ok": True,
+                "state": "review_manager_hold_successor_authorized",
+                "decision_id": decision_id,
+                "receipt_sha256": decision_id,
+                **receipt,
+            }
+
+        if decision == "retry_existing_attempt":
+            assert retry_terminal is not None
+            assert status is not None
+            card = status.get("task_card")
+            card = card if isinstance(card, Mapping) else {}
+            retry_result = retry_terminal(
+                task_id=reviewer_task_id,
+                request_id=reviewer_request_id,
+                terminal_substatus=str(
+                    card.get("terminal_substatus") or card.get("worker_status")
+                    or status.get("state") or ""
+                ),
+                topic="quality_review",
+                reason="manager-authorized exact reviewer attempt recovery",
+            )
+            if not isinstance(retry_result, Mapping) or retry_result.get("ok") is not True:
+                return {
+                    "ok": False,
+                    "error": "review_existing_attempt_retry_failed",
+                    "decision_id": decision_id,
+                    "retry_result": dict(retry_result or {}),
+                }
+
+        applied_at = datetime.now(timezone.utc).isoformat()
+        try:
+            with closing(_side_table_connection(self.db_path)) as conn, conn:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(ROUTE_ATTEMPT_TABLE)
+                conn.execute(MANAGER_HOLD_DECISION_TABLE)
+                current = conn.execute(
+                    "SELECT state,failure_reason,reviewer_task_id,reviewer_request_id "
+                    "FROM review_orchestrator_route_attempts "
+                    "WHERE chain_id=? AND lens=? AND attempt_index=?",
+                    (int(snapshot["chain_id"]), lens, int(attempt_index)),
+                ).fetchone()
+                if current is None or (
+                    str(current[0]) != "retired"
+                    or str(current[1]) != str(attempt["failure_reason"])
+                    or str(current[2]) != reviewer_task_id
+                    or str(current[3]) != reviewer_request_id
+                ):
+                    raise RuntimeError("review_manager_hold_transition_conflict")
+                if decision == "callback_reconcile":
+                    conn.execute(
+                        "UPDATE review_orchestrator_route_attempts SET state='launched' "
+                        "WHERE chain_id=? AND lens=? AND attempt_index=? AND state='retired'",
+                        (int(snapshot["chain_id"]), lens, int(attempt_index)),
+                    )
+                elif decision == "retry_existing_attempt":
+                    conn.execute(
+                        "UPDATE review_orchestrator_route_attempts "
+                        "SET state='planned',reviewer_request_id='' "
+                        "WHERE chain_id=? AND lens=? AND attempt_index=? AND state='retired'",
+                        (int(snapshot["chain_id"]), lens, int(attempt_index)),
+                    )
+                conn.execute(
+                    "UPDATE review_orchestrator_manager_hold_decisions SET applied_at=? "
+                    "WHERE decision_id=? AND applied_at=''",
+                    (applied_at, decision_id),
+                )
+        except (RuntimeError, sqlite3.Error) as exc:
+            return {"ok": False, "error": str(exc)[:300]}
+        return {
+            "ok": True,
+            "state": "review_manager_hold_resolved",
+            "decision_id": decision_id,
+            "receipt_sha256": decision_id,
+            **receipt,
+        }
+
     def _select_attempt_route(
         self,
         reviewer_task_id: str,
@@ -2102,11 +2542,17 @@ class ReviewOrchestrator:
                 return attempts[-1]
             attempts = reconciled
         held = route_attempt_hold(attempts[-1]["failure_reason"]) if attempts else ""
+        manager_authorization = (
+            self._authorized_successor_decision(action, attempts[-1])
+            if held and attempts
+            else None
+        )
         if held:
             # The typed disposition of the last attempt says no reviewer route
             # can settle this. Planning one anyway is the blind relaunch -- it
             # just spends the next pass's provider instead of this one's.
-            raise RuntimeError("review_route_hold:" + held)
+            if manager_authorization is None:
+                raise RuntimeError("review_route_hold:" + held)
         if len(attempts) >= _MAX_ROUTE_ATTEMPTS:
             # The NF847 ceiling, stated once where the spend actually happens.
             # Every caller turns a ``review_route_`` failure into a durable
@@ -2127,6 +2573,7 @@ class ReviewOrchestrator:
         with closing(_side_table_connection(self.db_path)) as conn, conn:
             conn.execute("BEGIN IMMEDIATE")
             conn.execute(ROUTE_ATTEMPT_TABLE)
+            conn.execute(MANAGER_HOLD_DECISION_TABLE)
             conn.execute(
                 "INSERT OR IGNORE INTO review_orchestrator_route_attempts "
                 "(chain_id,lens,attempt_index,reviewer_task_id,runner,adapter_id,"
@@ -2137,6 +2584,18 @@ class ReviewOrchestrator:
                     route["model"],
                 ),
             )
+            if manager_authorization is not None:
+                conn.execute(
+                    "UPDATE review_orchestrator_manager_hold_decisions "
+                    "SET applied_at=? WHERE decision_id=? AND applied_at=''",
+                    (
+                        datetime.now(timezone.utc).isoformat(),
+                        canonical_digest({
+                            key: value for key, value in manager_authorization.items()
+                            if not key.startswith("_")
+                        }),
+                    ),
+                )
         planned = self._route_attempts(action.chain_id, action.lens)
         if not planned or int(planned[-1]["attempt_index"]) != attempt_index:
             raise RuntimeError("review_route_attempt_plan_conflict")

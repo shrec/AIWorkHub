@@ -529,6 +529,175 @@ def test_terminal_receipt_without_a_route_cause_holds_instead_of_relaunching(
     assert len(manager.provider_launches) == 0
 
 
+def _hold_resolution_args(chain, attempt, *, decision: str) -> dict:
+    identity = chain.chain_identity
+    return {
+        "target_task_id": identity["target_task_id"],
+        "target_request_id": identity["target_request_id"],
+        "claim_epoch": identity["claim_epoch"],
+        "candidate_sha256": identity["candidate_sha256"],
+        "lens": "correctness",
+        "attempt_index": int(attempt["attempt_index"]),
+        "reviewer_task_id": str(attempt["reviewer_task_id"]),
+        "reviewer_request_id": str(attempt["reviewer_request_id"]),
+        "decision": decision,
+        "actor": "codex:thread-exact",
+        "now": NOW,
+    }
+
+
+def test_manager_hold_decision_binds_exact_candidate_and_authorizes_one_successor(
+    tmp_path: Path,
+) -> None:
+    manager, db_path, chain, first_task, driver = _seed_terminal_launch(
+        tmp_path, "manager-resolution",
+        {"state": "launch_failed", "error_code": "runtime_error"},
+    )
+    assert driver.drain(max_actions=1, now=NOW).pending == 1
+    attempt = driver._route_attempts(chain.chain_id, "correctness")[-1]
+    args = _hold_resolution_args(
+        chain, attempt, decision="authorize_distinct_route_successor"
+    )
+
+    stale = driver.resolve_manager_hold(**{**args, "candidate_sha256": "c" * 64})
+    assert stale == {"ok": False, "error": "review_manager_hold_chain_identity_mismatch"}
+    authorized = driver.resolve_manager_hold(**args)
+    assert authorized["ok"] is True
+    assert authorized["prior_hold"] == "manager_judgment_unknown"
+    assert authorized["reviewer_task_id"] == first_task
+    assert len(manager.provider_launches) == 0
+
+    assert driver.drain(max_actions=1, now=NOW).completed == 1
+    attempts = driver._route_attempts(chain.chain_id, "correctness")
+    assert len(attempts) == 2
+    assert attempts[-1]["state"] == "launched"
+    assert attempts[-1]["reviewer_task_id"] != first_task
+    assert len(manager.provider_launches) == 1
+
+    replay = driver.resolve_manager_hold(**args)
+    assert replay["ok"] is True
+    assert replay["idempotent"] is True
+    assert replay["decision"] == "authorize_distinct_route_successor"
+    wrong_attempt = driver.resolve_manager_hold(
+        **{**args, "reviewer_request_id": "foreign-request"}
+    )
+    assert wrong_attempt == {
+        "ok": False, "error": "review_manager_hold_attempt_identity_mismatch"
+    }
+    with sqlite3.connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT actor,decision,prior_hold,applied_at,receipt_sha256 "
+            "FROM review_orchestrator_manager_hold_decisions"
+        ).fetchone()
+    assert row is not None
+    assert row[:3] == (
+        "codex:thread-exact", "authorize_distinct_route_successor",
+        "manager_judgment_unknown",
+    )
+    assert row[3]
+    assert row[4] == authorized["receipt_sha256"]
+
+
+def test_manager_rearms_exact_credential_held_attempt_two_without_attempt_three(
+    tmp_path: Path,
+) -> None:
+    manager, _db_path, chain, first_task, driver = _seed_terminal_launch(
+        tmp_path, "credential-attempt-two",
+        {"state": "launch_failed", "error_code": "provider_unavailable"},
+    )
+    assert driver.drain(max_actions=1, now=NOW).completed == 1
+    successor = driver._route_attempts(chain.chain_id, "correctness")[-1]
+    successor_task = str(successor["reviewer_task_id"])
+    successor_request = str(successor["reviewer_request_id"])
+    manager.status_results[successor_request] = {
+        "ok": False,
+        "request_id": successor_request,
+        "task_id": successor_task,
+        "state": "launch_failed",
+        "error_code": "credential_rejected",
+        **SUCCESSOR_ROUTE,
+        "task_card": {
+            "terminal_substatus": "launch_failed",
+            "worker_status": "launch_failed",
+        },
+    }
+    assert driver.drain(max_actions=1, now=NOW).pending == 1
+    held = driver._route_attempts(chain.chain_id, "correctness")[-1]
+    assert int(held["attempt_index"]) == 2
+    assert review_orchestrator.route_attempt_hold(held["failure_reason"]) == "credential_hold"
+
+    retries: list[dict] = []
+
+    def retry_terminal(**kwargs):
+        retries.append(kwargs)
+        return {"ok": len(retries) > 1}
+
+    args = _hold_resolution_args(
+        chain, held, decision="retry_existing_attempt"
+    )
+    first = driver.resolve_manager_hold(**args, retry_terminal=retry_terminal)
+    assert first["ok"] is False
+    assert first["error"] == "review_existing_attempt_retry_failed"
+    # The manager intent is durable before the external retry; the same exact
+    # call resumes it instead of creating another decision or route.
+    second = driver.resolve_manager_hold(**args, retry_terminal=retry_terminal)
+    assert second["ok"] is True
+    assert len(retries) == 2
+    rearmed = driver._route_attempts(chain.chain_id, "correctness")
+    assert len(rearmed) == 2
+    assert rearmed[-1]["state"] == "planned"
+    assert rearmed[-1]["reviewer_request_id"] == ""
+
+    manager.requests_by_task.pop(successor_task)
+    manager.requests_by_task["already-used-request-slot"] = successor_request
+    assert driver.drain(max_actions=1, now=NOW).pending == 1
+    relaunched = driver._route_attempts(chain.chain_id, "correctness")
+    assert len(relaunched) == 2, "manager recovery must never create attempt three"
+    assert relaunched[-1]["state"] == "launched"
+    assert relaunched[-1]["reviewer_task_id"] == successor_task
+    assert relaunched[-1]["reviewer_request_id"] != successor_request
+
+
+def test_manager_callback_reconcile_requires_exact_ready_evidence(
+    tmp_path: Path,
+) -> None:
+    manager = _FailoverManager(tmp_path)
+    db_path = tmp_path / "callback-manager.sqlite"
+    driver = review_orchestrator.ReviewOrchestrator(
+        manager, db_path=db_path, route_selector=lambda *_args: dict(FIRST_ROUTE)
+    )
+    chain = driver.ensure_chain(
+        target_task_id="TARGET", target_request_id="target-request", claim_epoch=1,
+        packet_sha256="a" * 64, candidate_sha256="b" * 64, now=NOW,
+    )
+    assert driver.drain(max_actions=1, now=NOW).completed == 1
+    attempt = driver._route_attempts(chain.chain_id, "correctness")[-1]
+    request_id = str(attempt["reviewer_request_id"])
+    reviewer_task = str(attempt["reviewer_task_id"])
+    manager.status_results[request_id] = {
+        "ok": False, "request_id": request_id, "task_id": reviewer_task,
+        "state": "finalize_failed", **FIRST_ROUTE,
+        "task_card": {"terminal_substatus": "finalize_failed"},
+    }
+    assert driver.drain(max_actions=1, now=NOW).pending == 1
+    held = driver._route_attempts(chain.chain_id, "correctness")[-1]
+    args = _hold_resolution_args(chain, held, decision="callback_reconcile")
+    refused = driver.resolve_manager_hold(**args)
+    assert refused["error"] == "review_callback_evidence_unavailable"
+
+    manager.status_results[request_id] = _review_status(
+        reviewer_request=request_id,
+        reviewer_task=reviewer_task,
+        provider=FIRST_ROUTE["adapter_id"],
+        route=FIRST_ROUTE,
+    )
+    recovered = driver.resolve_manager_hold(**args)
+    assert recovered["ok"] is True
+    assert driver._route_attempts(chain.chain_id, "correctness")[-1]["state"] == "launched"
+    assert driver.drain(max_actions=1, now=NOW).completed == 1
+    assert manager.accepts == [(request_id, reviewer_task)]
+
+
 def test_capacity_is_never_a_credential_hold_and_keeps_a_distinct_route(
     tmp_path: Path,
 ) -> None:

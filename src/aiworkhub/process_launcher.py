@@ -13919,6 +13919,61 @@ class ProcessManager:
                 "recorded_at": _utcnow(),
             })
 
+    def resolve_review_route_hold(
+        self,
+        *,
+        target_task_id: str,
+        target_request_id: str,
+        claim_epoch: str | int,
+        candidate_sha256: str,
+        lens: str,
+        attempt_index: int,
+        reviewer_task_id: str,
+        reviewer_request_id: str,
+        decision: str,
+    ) -> dict[str, Any]:
+        """Resolve one exact reviewer hold under verified manager authority.
+
+        The orchestrator owns the chain/attempt CAS and durable decision
+        receipt.  This boundary contributes the active manager identity and,
+        only for an exact pre-provider retry, the canonical terminal-retry
+        transaction for the reviewer card.  It never retries the target
+        implementation task.
+        """
+        route = core.manager_bootstrap()
+        identity = route.get("manager_route") if isinstance(route, dict) else None
+        if route.get("role") != "manager" or not isinstance(identity, dict):
+            return {"ok": False, "error": "verified_manager_identity_required"}
+        if Path(str(route.get("repo") or self.repo)).resolve() != self.repo:
+            return {"ok": False, "error": "manager_repository_mismatch"}
+        if not core.writes_allowed():
+            return {"ok": False, "error": "write_gate_closed"}
+        provider = str(identity.get("provider") or route.get("provider") or "").strip()
+        session_id = str(identity.get("thread_id") or identity.get("session_id") or "").strip()
+        if not provider or not session_id:
+            return {"ok": False, "error": "manager_session_identity_missing"}
+        review_db = review_orchestrator.canonical_review_db(self)
+        if review_db is None:
+            return {"ok": False, "error": "review_storage_unavailable"}
+        driver = review_orchestrator.ReviewOrchestrator(self, db_path=review_db)
+
+        def retry_terminal(**kwargs: Any) -> Mapping[str, Any]:
+            return core.retry_terminal_task(**kwargs)
+
+        return driver.resolve_manager_hold(
+            target_task_id=target_task_id,
+            target_request_id=target_request_id,
+            claim_epoch=claim_epoch,
+            candidate_sha256=candidate_sha256,
+            lens=lens,
+            attempt_index=attempt_index,
+            reviewer_task_id=reviewer_task_id,
+            reviewer_request_id=reviewer_request_id,
+            decision=decision,
+            actor=f"{provider}:{session_id}",
+            retry_terminal=retry_terminal,
+        )
+
     def accept_review(
         self,
         request_id: str,
