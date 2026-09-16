@@ -236,13 +236,29 @@ def _snapshot_dir(d: Path) -> list[tuple[str, int, str]]:
 _TOLERATED_ADVISORY_LOCK = "process_events.jsonl.lock"
 
 
+_TOLERATED_ADVISORY_LOCK_SIZES = (
+    # 0 bytes on POSIX: flock() needs neither a writable fd nor any file
+    # content, so the reconciler's advisory lock file stays genuinely empty.
+    # 1 byte on Windows: msvcrt.locking() locks a byte range that has to
+    # exist, so platform_io._prepare_windows_lock_byte writes a single "0"
+    # byte into an empty lock file before locking it -- see that function's
+    # own docstring. Both are the same harmless startup reconciler lock,
+    # just with a platform-mandated content difference.
+    0,
+    1,
+)
+
+
 def _exclude_tolerated_lock(
     rows: list[tuple[str, int, str]],
 ) -> list[tuple[str, int, str]]:
-    """Drop exactly the zero-byte reconciler startup lock, nothing else."""
+    """Drop exactly the reconciler startup lock, nothing else."""
     return [
         row for row in rows
-        if not (row[0] == _TOLERATED_ADVISORY_LOCK and row[1] == 0)
+        if not (
+            row[0] == _TOLERATED_ADVISORY_LOCK
+            and row[1] in _TOLERATED_ADVISORY_LOCK_SIZES
+        )
     ]
 
 
