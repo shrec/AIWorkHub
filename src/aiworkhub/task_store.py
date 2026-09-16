@@ -4516,6 +4516,188 @@ def recover_blocked_rework(
                     if type(claim_epoch) is not int or claim_epoch < 1:
                         return False, "validation_only_replay_claim_epoch_invalid"
 
+                    current_authorization = card.get(
+                        "validation_only_replay_authorization"
+                    )
+                    sealed_lineage = card.get("validation_only_replay_lineage")
+                    if not isinstance(sealed_lineage, dict):
+                        return False, "validation_only_replay_lineage_invalid"
+                    predecessor_workspace = predecessor.get("workspace")
+                    if not isinstance(predecessor_workspace, dict):
+                        return False, "validation_only_replay_workspace_invalid"
+                    if isinstance(predecessor_workspace, dict):
+                        carried_hashes = sealed_lineage.get(
+                            "changed_path_hashes"
+                        )
+                        allowed_writes = card.get("allowed_writes")
+                        predecessor_task_id = str(
+                            predecessor.get("task_id") or ""
+                        ).strip()
+                        lineage_request_id = str(
+                            sealed_lineage.get("predecessor_request_id") or ""
+                        ).strip()
+                        lineage_claim_epoch = sealed_lineage.get(
+                            "predecessor_claim_epoch"
+                        )
+                        lineage_event_rows = conn.execute(
+                            "SELECT payload_json FROM task_events WHERE task_id=? "
+                            "AND event IN ('blocked_rework_recovery', "
+                            "'blocked_rework_validation_replay_reauthorized') "
+                            "ORDER BY event_id DESC",
+                            (task_id,),
+                        ).fetchall()
+                        lineage_authenticated = False
+                        for lineage_event_row in lineage_event_rows:
+                            try:
+                                lineage_event = json.loads(
+                                    str(lineage_event_row["payload_json"] or "{}")
+                                )
+                            except json.JSONDecodeError:
+                                continue
+                            if (
+                                isinstance(lineage_event, dict)
+                                and lineage_event.get(
+                                    "validation_only_replay_lineage"
+                                )
+                                == sealed_lineage
+                            ):
+                                lineage_authenticated = True
+                                break
+                        try:
+                            expected_repo = Path(root).resolve(strict=True)
+                            authority_repo = Path(
+                                str(predecessor_workspace.get("repo") or "")
+                            ).resolve(strict=True)
+                            workspace_path = Path(
+                                str(predecessor_workspace.get("path") or "")
+                            )
+                            resolved_workspace = workspace_path.resolve(strict=True)
+                        except (OSError, RuntimeError, ValueError):
+                            return False, "validation_only_replay_workspace_invalid"
+                        if (
+                            sealed_lineage.get("schema_id")
+                            != "aiworkhub.validation_only_replay_lineage.v1"
+                            or sealed_lineage.get("task_id") != task_id
+                            or sealed_lineage.get("repo") != str(expected_repo)
+                            or not lineage_request_id
+                            or type(lineage_claim_epoch) is not int
+                            or lineage_claim_epoch < 1
+                            or not lineage_authenticated
+                            or predecessor_task_id != task_id
+                            or str(
+                                predecessor_workspace.get("request_id") or ""
+                            ).strip()
+                            != predecessor_request_id
+                            or authority_repo != expected_repo
+                            or not isinstance(allowed_writes, list)
+                            or not allowed_writes
+                            or set(
+                                predecessor.get("allowed_writes") or allowed_writes
+                            )
+                            != set(allowed_writes)
+                            or set(
+                                predecessor_workspace.get("allowed_writes") or ()
+                            )
+                            != set(allowed_writes)
+                            or not isinstance(carried_hashes, dict)
+                            or not carried_hashes
+                            or not workspace_path.is_absolute()
+                            or workspace_path.is_symlink()
+                            or not resolved_workspace.is_dir()
+                            or resolved_workspace
+                            != expected_repo
+                            / ".aiworkhub"
+                            / "runtime"
+                            / "worktrees"
+                            / predecessor_request_id
+                            / "worktree"
+                            or any(
+                                (expected_repo.joinpath(*parts)).is_symlink()
+                                for parts in (
+                                    (".aiworkhub",),
+                                    (".aiworkhub", "runtime"),
+                                    (".aiworkhub", "runtime", "worktrees"),
+                                    (
+                                        ".aiworkhub",
+                                        "runtime",
+                                        "worktrees",
+                                        predecessor_request_id,
+                                    ),
+                                    (
+                                        ".aiworkhub",
+                                        "runtime",
+                                        "worktrees",
+                                        predecessor_request_id,
+                                        "worktree",
+                                    ),
+                                )
+                            )
+                        ):
+                            return False, "validation_only_replay_predecessor_invalid"
+                        lineage_hashes = {
+                            **carried_hashes,
+                            **predecessor_changed_path_hashes,
+                        }
+                        for raw_path, expected_hash in lineage_hashes.items():
+                            if (
+                                not isinstance(raw_path, str)
+                                or not raw_path
+                                or raw_path.startswith("/")
+                                or "\\" in raw_path
+                                or any(
+                                    part in {"", ".", ".."}
+                                    for part in raw_path.split("/")
+                                )
+                                or raw_path not in allowed_writes
+                                or not isinstance(expected_hash, str)
+                                or len(expected_hash) != 64
+                                or any(
+                                    ch not in "0123456789abcdef"
+                                    for ch in expected_hash
+                                )
+                            ):
+                                return False, "validation_only_replay_manifest_invalid"
+                            candidate = resolved_workspace.joinpath(
+                                *raw_path.split("/")
+                            )
+                            try:
+                                candidate_stat = candidate.lstat()
+                                resolved_candidate = candidate.resolve(strict=True)
+                                candidate_bytes = candidate.read_bytes()
+                            except OSError:
+                                return False, "validation_only_replay_candidate_invalid"
+                            if (
+                                candidate.is_symlink()
+                                or not candidate.is_file()
+                                or candidate_stat.st_nlink != 1
+                                or not resolved_candidate.is_relative_to(
+                                    resolved_workspace
+                                )
+                                or any(
+                                    resolved_workspace.joinpath(
+                                        *raw_path.split("/")[:index]
+                                    ).is_symlink()
+                                    for index in range(1, len(raw_path.split("/")))
+                                )
+                            ):
+                                return False, "validation_only_replay_candidate_invalid"
+                            if (
+                                hashlib.sha256(candidate_bytes).hexdigest()
+                                != expected_hash
+                            ):
+                                return False, "validation_only_replay_hash_mismatch"
+                        predecessor_changed_path_hashes = lineage_hashes
+                        predecessor["changed_path_hashes"] = dict(lineage_hashes)
+                        predecessor["changed_paths"] = list(lineage_hashes)
+                        card["validation_only_replay_lineage"] = {
+                            "schema_id": "aiworkhub.validation_only_replay_lineage.v1",
+                            "task_id": task_id,
+                            "repo": str(expected_repo),
+                            "predecessor_request_id": predecessor_request_id,
+                            "predecessor_claim_epoch": claim_epoch,
+                            "changed_path_hashes": dict(lineage_hashes),
+                        }
+
                     # A task can complete a validation-only replay, be rejected
                     # back to pending with a newly pinned predecessor, and then
                     # need another provider-free validation episode.  The first
@@ -4535,9 +4717,6 @@ def recover_blocked_rework(
                         "next_claim_epoch": claim_epoch,
                         "one_episode_binding": True,
                     }
-                    current_authorization = card.get(
-                        "validation_only_replay_authorization"
-                    )
                     if isinstance(current_authorization, dict) and all(
                         current_authorization.get(key) == authorization[key]
                         for key in (
@@ -4578,6 +4757,9 @@ def recover_blocked_rework(
                                     **authorization,
                                     "actor": actor[:120],
                                     "recorded_at": now,
+                                    "validation_only_replay_lineage": card.get(
+                                        "validation_only_replay_lineage"
+                                    ),
                                 },
                                 ensure_ascii=False,
                                 sort_keys=True,
@@ -5190,7 +5372,11 @@ def recover_blocked_rework(
             "changed_path_hashes"
         )
         if validation_only_replay:
-            if not predecessor_request_id or not predecessor_changed_path_hashes:
+            if (
+                not predecessor_request_id
+                or not isinstance(predecessor_changed_path_hashes, dict)
+                or not predecessor_changed_path_hashes
+            ):
                 return False, "validation_only_replay_missing_evidence"
 
         terminal_substatus = str(
@@ -5252,6 +5438,14 @@ def recover_blocked_rework(
         card["recovery_feedback"] = bounded_feedback[:2000]
 
         if validation_only_replay:
+            card["validation_only_replay_lineage"] = {
+                "schema_id": "aiworkhub.validation_only_replay_lineage.v1",
+                "task_id": task_id,
+                "repo": str(Path(root).resolve()),
+                "predecessor_request_id": predecessor_request_id,
+                "predecessor_claim_epoch": claim_epoch,
+                "changed_path_hashes": dict(predecessor_changed_path_hashes),
+            }
             card["validation_only_replay_authorization"] = {
                 "task_id": task_id,
                 "actor": actor,
@@ -5305,6 +5499,10 @@ def recover_blocked_rework(
             "actor": actor[:120],
             "validation_only_replay": bool(validation_only_replay),
         }
+        if validation_only_replay:
+            recovery_payload["validation_only_replay_lineage"] = card[
+                "validation_only_replay_lineage"
+            ]
         if successful_preparation:
             recovery_payload["successful_rework_delta"] = (
                 successful_preparation["predecessor"]["rework_delta"]

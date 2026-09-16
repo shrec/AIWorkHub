@@ -838,7 +838,6 @@ def _strict_retained_workspace(
     path.mkdir(parents=True, exist_ok=True)
     return {
         "request_id": request_id,
-        "task_id": task_id,
         "repo": str(coord),
         "path": str(path),
         "home": str(path.parent / "home"),
@@ -2089,10 +2088,14 @@ def test_pending_rework_rebinds_validation_only_replay_to_latest_episode(tmp_pat
     task_store.initialize_repository(root)
     first_request = "a" * 32
     second_request = "b" * 32
+    first_content = b"first generation\n"
+    second_content = b"second generation\n"
+    first_hash = hashlib.sha256(first_content).hexdigest()
+    second_hash = hashlib.sha256(second_content).hexdigest()
     task_id = _make_blocked_rework_task_with_terminal_review(
         root,
         request_id=first_request,
-        changed_path_hashes={"a.py": "1" * 64},
+        changed_path_hashes={"a.py": first_hash},
         terminal_failure=True,
     )
     ok, state = task_store.recover_blocked_rework(
@@ -2104,15 +2107,26 @@ def test_pending_rework_rebinds_validation_only_replay_to_latest_episode(tmp_pat
     )
     assert (ok, state) == (True, "recovered")
 
-    # Model the completed replay being rejected back to pending: the current
-    # retained predecessor and claim epoch advance, while the old one-episode
-    # authorization remains on the decoded card until recovery refreshes it.
+    # Model the completed replay being rejected back to pending after its
+    # one-episode launch authorization has been consumed.
     card = task_store.get_task(root, task_id)
     assert card is not None
+    card.pop("validation_only_replay_authorization")
     card["claim_epoch"] = 3
+    workspace = _strict_retained_workspace(
+        root, task_id, second_request, ["a.py", "b.py"]
+    )
+    Path(workspace["path"], "a.py").write_bytes(first_content)
+    Path(workspace["path"], "b.py").write_bytes(second_content)
+    card["allowed_writes"] = ["a.py", "b.py"]
     card["rework_predecessor"] = {
+        "schema_id": "aiworkhub.rework_predecessor.v1",
         "request_id": second_request,
-        "changed_path_hashes": {"b.py": "2" * 64},
+        "task_id": task_id,
+        "claim_epoch": 3,
+        "allowed_writes": ["a.py", "b.py"],
+        "changed_path_hashes": {"b.py": second_hash},
+        "workspace": workspace,
     }
     card["operational_blocker"] = {
         "kind": "launch_blocked",
@@ -2149,7 +2163,10 @@ def test_pending_rework_rebinds_validation_only_replay_to_latest_episode(tmp_pat
     assert rebound is not None
     auth = rebound["validation_only_replay_authorization"]
     assert auth["predecessor_request_id"] == second_request
-    assert auth["changed_path_hashes"] == {"b.py": "2" * 64}
+    assert auth["changed_path_hashes"] == {
+        "a.py": first_hash,
+        "b.py": second_hash,
+    }
     assert auth["next_claim_epoch"] == rebound["claim_epoch"] == 3
     assert "operational_blocker" not in rebound
     events = task_store.get_task_events(root, task_id)
@@ -2157,6 +2174,241 @@ def test_pending_rework_rebinds_validation_only_replay_to_latest_episode(tmp_pat
         event["event"] == "blocked_rework_validation_replay_reauthorized"
         for event in events
     ) == 1
+
+
+def test_pending_replay_recovery_preserves_authenticated_lineage(
+    tmp_path, monkeypatch
+):
+    """Canonical receipts bind task on predecessor and repo on workspace."""
+    root = tmp_path
+    task_store.initialize_repository(root)
+    task_id = "nf894-repeated-validation-replay"
+    first_request = "a" * 32
+    latest_request = "b" * 32
+    paths = [f"out/result-{index}.txt" for index in range(8)]
+    contents = {path: f"generation-one-{path}\n".encode() for path in paths}
+    first_hashes = {
+        path: hashlib.sha256(content).hexdigest()
+        for path, content in contents.items()
+    }
+    task_id = _make_blocked_rework_task_with_terminal_review(
+        root,
+        task_id=task_id,
+        request_id=first_request,
+        changed_path_hashes=first_hashes,
+        terminal_failure=True,
+    )
+    ok, state = task_store.recover_blocked_rework(
+        root,
+        task_id,
+        actor=core.CODEX_RUNNER,
+        feedback_reason="first validation replay",
+        validation_only_replay=True,
+    )
+    assert (ok, state) == (True, "recovered")
+
+    card = _persist_required_outputs(root, task_id, paths[:4])
+    first_selected, first_result = _probe_process_manager_launch_lane(
+        root, task_id, tmp_path, monkeypatch
+    )
+    assert first_selected == ["validation_only_replay"]
+    assert first_result["provider_launched"] is False
+
+    # The launch authorization is one-episode state and is consumed before the
+    # replay's terminal/rework transition. The sealed lineage is deliberately
+    # separate and survives that lifecycle boundary.
+    card = task_store.get_task(root, task_id)
+    assert card is not None
+    card.pop("validation_only_replay_authorization")
+    assert (
+        card["validation_only_replay_lineage"]["changed_path_hashes"]
+        == first_hashes
+    )
+
+    latest_path = paths[-1]
+    contents[latest_path] = b"generation-two-latest-delta\n"
+    latest_hash = hashlib.sha256(contents[latest_path]).hexdigest()
+    workspace = _strict_retained_workspace(root, task_id, latest_request, paths)
+    assert "task_id" not in workspace
+    workspace_path = Path(workspace["path"])
+    for path, content in contents.items():
+        candidate = workspace_path / path
+        candidate.parent.mkdir(parents=True, exist_ok=True)
+        candidate.write_bytes(content)
+
+    card["claim_epoch"] = 3
+    card["allowed_writes"] = paths
+    card["required_outputs"] = paths[:4]
+    card["rework_predecessor"] = {
+        "schema_id": "aiworkhub.rework_predecessor.v1",
+        "request_id": latest_request,
+        "task_id": task_id,
+        "claim_epoch": 3,
+        "allowed_writes": paths,
+        "changed_paths": [latest_path],
+        "changed_path_hashes": {latest_path: latest_hash},
+        "workspace": workspace,
+    }
+    assert "repo" not in card["rework_predecessor"]
+    card["operational_blocker"] = {
+        "kind": "launch_blocked",
+        "reason": "validation_only_replay_predecessor_mismatch",
+    }
+    _readiness, db_path = task_store._require_ready(root)
+    conn = task_store._connect(db_path)
+    try:
+        conn.execute(
+            "UPDATE tasks SET card_json=? WHERE task_id=?",
+            (
+                json.dumps(
+                    task_store.persistable_card_payload(card),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                task_id,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    ok, state = task_store.recover_blocked_rework(
+        root,
+        task_id,
+        actor=core.CODEX_RUNNER,
+        feedback_reason="replay complete retained candidate",
+        validation_only_replay=True,
+    )
+
+    assert (ok, state) == (True, "recovered_validation_only_replay")
+    recovered = task_store.get_task(root, task_id)
+    expected_hashes = {**first_hashes, latest_path: latest_hash}
+    assert (
+        recovered["rework_predecessor"]["changed_path_hashes"] == expected_hashes
+    )
+    assert recovered["validation_only_replay_authorization"][
+        "changed_path_hashes"
+    ] == expected_hashes
+    assert recovered["required_outputs"] == paths[:4]
+    selected, result = _probe_process_manager_launch_lane(
+        root, task_id, tmp_path, monkeypatch
+    )
+    assert selected == ["validation_only_replay"]
+    assert result["provider_launched"] is False
+
+    (workspace_path / paths[0]).write_bytes(b"tampered\n")
+    card = task_store.get_task(root, task_id)
+    card["operational_blocker"] = {
+        "kind": "launch_blocked",
+        "reason": "validation_only_replay_predecessor_mismatch",
+    }
+    conn = task_store._connect(db_path)
+    try:
+        conn.execute(
+            "UPDATE tasks SET card_json=? WHERE task_id=?",
+            (
+                json.dumps(
+                    task_store.persistable_card_payload(card),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                task_id,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    assert task_store.recover_blocked_rework(
+        root,
+        task_id,
+        actor=core.CODEX_RUNNER,
+        feedback_reason="must fail closed",
+        validation_only_replay=True,
+    ) == (False, "validation_only_replay_hash_mismatch")
+
+
+def test_pending_replay_recovery_rejects_missing_predecessor_workspace(tmp_path):
+    root = tmp_path
+    task_store.initialize_repository(root)
+    task_id = "nf894-repeated-replay-missing-workspace"
+    first_request = "a" * 32
+    latest_request = "b" * 32
+    paths = [f"out/result-{index}.txt" for index in range(8)]
+    first_hashes = {
+        path: hashlib.sha256(path.encode()).hexdigest() for path in paths
+    }
+    _make_blocked_rework_task_with_terminal_review(
+        root,
+        task_id=task_id,
+        request_id=first_request,
+        changed_path_hashes=first_hashes,
+        terminal_failure=True,
+    )
+    assert task_store.recover_blocked_rework(
+        root,
+        task_id,
+        actor=core.CODEX_RUNNER,
+        feedback_reason="first validation replay",
+        validation_only_replay=True,
+    ) == (True, "recovered")
+
+    card = task_store.get_task(root, task_id)
+    assert card is not None
+    card.pop("validation_only_replay_authorization")
+    card["claim_epoch"] = 3
+    card["allowed_writes"] = paths
+    card["required_outputs"] = paths[:4]
+    card["rework_predecessor"] = {
+        "schema_id": "aiworkhub.rework_predecessor.v1",
+        "request_id": latest_request,
+        "task_id": task_id,
+        "claim_epoch": 3,
+        "allowed_writes": paths,
+        "changed_paths": [paths[-1]],
+        "changed_path_hashes": {paths[-1]: "c" * 64},
+    }
+    card["operational_blocker"] = {
+        "kind": "launch_blocked",
+        "reason": "validation_only_replay_predecessor_mismatch",
+    }
+    _readiness, db_path = task_store._require_ready(root)
+    conn = task_store._connect(db_path)
+    try:
+        conn.execute(
+            "UPDATE tasks SET card_json=? WHERE task_id=?",
+            (
+                json.dumps(
+                    task_store.persistable_card_payload(card),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                task_id,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    assert task_store.recover_blocked_rework(
+        root,
+        task_id,
+        actor=core.CODEX_RUNNER,
+        feedback_reason="reject malformed retained candidate",
+        validation_only_replay=True,
+    ) == (False, "validation_only_replay_workspace_invalid")
+    retained = task_store.get_task(root, task_id)
+    assert "validation_only_replay_authorization" not in retained
+    assert (
+        retained["validation_only_replay_lineage"]["predecessor_request_id"]
+        == first_request
+    )
+    assert (
+        retained["validation_only_replay_lineage"]["changed_path_hashes"]
+        == first_hashes
+    )
+    assert retained["rework_predecessor"]["changed_path_hashes"] == {
+        paths[-1]: "c" * 64
+    }
 
 
 def test_recover_blocked_rework_ordinary_recovery_regression(tmp_path):
@@ -2541,7 +2793,8 @@ def test_second_block_ordinary_recovery_fences_claim_epoch_and_launch(
     root = tmp_path
     task_store.initialize_repository(root)
     request_id = "a" * 32
-    path_hash = "d" * 64
+    path_content = b"retained replay candidate\n"
+    path_hash = hashlib.sha256(path_content).hexdigest()
     task_id = _make_blocked_rework_task_with_terminal_review(
         root,
         task_id="nf393-second-block-ordinary",
@@ -2613,7 +2866,33 @@ def test_second_block_ordinary_recovery_fences_claim_epoch_and_launch(
     )
     assert after == ["provider"]
 
+    retained_workspace = _strict_retained_workspace(
+        root, task_id, request_id, ["src/example.py"]
+    )
+    retained_path = Path(retained_workspace["path"]) / "src" / "example.py"
+    retained_path.parent.mkdir(parents=True, exist_ok=True)
+    retained_path.write_bytes(path_content)
     copied = task_store.persistable_card_payload(consumed)
+    copied["allowed_writes"] = ["src/example.py"]
+    copied["rework_predecessor"] = {
+        "schema_id": "aiworkhub.rework_predecessor.v1",
+        "request_id": request_id,
+        "task_id": task_id,
+        "claim_epoch": 3,
+        "allowed_writes": ["src/example.py"],
+        "changed_path_hashes": {"src/example.py": path_hash},
+        "workspace": retained_workspace,
+    }
+    conn = task_store._connect(db_path)
+    try:
+        conn.execute(
+            "UPDATE tasks SET card_json=? WHERE task_id=?",
+            (json.dumps(copied, ensure_ascii=False, sort_keys=True), task_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
     copied["validation_only_replay_authorization"] = first_auth
     with pytest.raises(process_launcher.LaunchRejected) as excinfo:
         process_launcher._validation_only_replay_authorization(copied, task_id)
