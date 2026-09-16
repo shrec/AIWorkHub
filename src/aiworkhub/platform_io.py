@@ -2182,10 +2182,62 @@ def open_lock_file(path: Path) -> int:
     The descriptor is opened for WRITING because :func:`lock_fd` needs a
     writable fd on Windows -- ``msvcrt.locking`` locks a byte range that has to
     exist, and the read-only descriptor POSIX would accept fails with EBADF.
+
+    On Windows this goes through :func:`_open_windows_lock_file` instead of
+    ``os.open``: a caller (``db_writer.py``) deliberately keeps this
+    descriptor open for the life of the process to save a syscall pair per
+    write, and the CRT open ``os.open`` performs has no way to ask for
+    ``FILE_SHARE_DELETE`` -- so any later ``os.unlink``/``shutil.rmtree`` of
+    this exact path, from this or another process, is refused for as long as
+    the process runs. Only a native ``CreateFileW`` call can request that
+    share bit; the CRT's ``_wsopen_s`` (what ``os.open`` uses under the hood)
+    does not expose it at all.
     """
 
     path.parent.mkdir(parents=True, exist_ok=True)
+    if is_windows():
+        return _open_windows_lock_file(path)
     return os.open(str(path), lock_file_open_flags(), 0o600)
+
+
+def _open_windows_lock_file(path: Path) -> int:
+    """``open_lock_file``'s Windows path: a writable fd shared for delete too."""
+
+    from ctypes import wintypes
+
+    GENERIC_READ = 0x80000000
+    GENERIC_WRITE = 0x40000000
+    FILE_SHARE_READ_WRITE_DELETE = 0x7
+    OPEN_ALWAYS = 4
+    FILE_ATTRIBUTE_NORMAL = 0x80
+
+    kernel32 = _windows_dll_loader()("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+
+    handle = create_file(
+        str(path),
+        GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ_WRITE_DELETE,
+        None,
+        OPEN_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        None,
+    )
+    if handle in (None, 0, _INVALID_HANDLE_VALUE):
+        raise _windows_error(ctypes.get_last_error())
+    import msvcrt
+
+    return msvcrt.open_osfhandle(handle, os.O_RDWR | getattr(os, "O_BINARY", 0))
 
 
 def _prepare_windows_lock_byte(fd: int) -> None:
