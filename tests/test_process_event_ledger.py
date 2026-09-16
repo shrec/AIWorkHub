@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import os
 from contextlib import contextmanager
 from copy import deepcopy
 from pathlib import Path
@@ -762,3 +764,318 @@ def test_huge_integer_terminal_reason_is_replaced_not_serialized(
     assert raw["big"] == "int_out_of_bounds"
     assert raw["small"] == 7
     assert raw["code"] == "x"
+
+
+# --- Bounded multi-request event projection (NF-853) -------------------------
+#
+# These build ledger bytes directly rather than through ``append_event``: the
+# projection under test is a reader, and writing the JSONL keeps each test to
+# exactly the append/rotate/truncate/replace shape it is asserting about.
+
+
+def _write_rows(path: Path, rows: list[dict[str, object]], *, mode: str = "a") -> None:
+    with path.open(mode, encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row, sort_keys=True) + "\n")
+
+
+def _count_full_passes(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
+    """Count canonical whole-ledger replays, not wall-clock time."""
+
+    calls = {"count": 0}
+    original = process_event_ledger.iter_events
+
+    def counting(path: Path):
+        calls["count"] += 1
+        return original(path)
+
+    monkeypatch.setattr(process_event_ledger, "iter_events", counting)
+    return calls
+
+
+def _event(request_id: str, index: int, **extra: object) -> dict[str, object]:
+    row = {"request_id": request_id, "state": "running", "seq": index}
+    row.update(extra)
+    return row
+
+
+def test_events_for_requests_projects_every_key_from_one_ledger_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    process_event_ledger.reset_request_event_cache()
+    path = tmp_path / "process_events.jsonl"
+    _write_rows(
+        path,
+        [
+            _event("a", 0),
+            _event("b", 0),
+            _event("a", 1),
+            _event("c", 0),
+            _event("a", 2),
+        ],
+        mode="w",
+    )
+
+    passes = _count_full_passes(monkeypatch)
+    projection = process_event_ledger.events_for_requests(path, ["a", "b", "absent"])
+
+    assert passes["count"] == 1
+    assert [row["seq"] for row in projection["a"]] == [0, 1, 2]
+    assert [row["seq"] for row in projection["b"]] == [0]
+    # Present-but-empty, never missing: a caller must not have to guess whether
+    # a key was unasked or simply has no events.
+    assert projection["absent"] == []
+
+
+def test_appending_one_request_does_not_rebuild_unrelated_projections(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    process_event_ledger.reset_request_event_cache()
+    path = tmp_path / "process_events.jsonl"
+    _write_rows(path, [_event("a", 0), _event("b", 0)], mode="w")
+
+    passes = _count_full_passes(monkeypatch)
+    first = process_event_ledger.events_for_requests(path, ["a", "b"])
+    assert passes["count"] == 1
+    assert [row["seq"] for row in first["a"]] == [0]
+
+    # The NF-853 shape: a reviewer launch appends for ONE request, and the old
+    # whole-ledger fingerprint cache then threw away every other request too.
+    _write_rows(path, [_event("a", 1)])
+    second = process_event_ledger.events_for_requests(path, ["a", "b"])
+
+    assert passes["count"] == 1
+    assert [row["seq"] for row in second["a"]] == [0, 1]
+    assert [row["seq"] for row in second["b"]] == [0]
+
+
+def test_synthetic_review_backlog_drains_without_per_action_full_ledger_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The measured 22-action case: one pass total, not one pass per action."""
+
+    process_event_ledger.reset_request_event_cache()
+    path = tmp_path / "process_events.jsonl"
+    targets = [f"request-{index:02d}" for index in range(22)]
+    _write_rows(path, [_event(target, 0) for target in targets], mode="w")
+
+    passes = _count_full_passes(monkeypatch)
+    primed = process_event_ledger.events_for_requests(path, targets)
+    assert passes["count"] == 1
+    assert len(primed) == 22
+
+    for index, target in enumerate(targets):
+        # Each action appends its own launch evidence and then reads back the
+        # request it just acted on, exactly as the drain does.
+        _write_rows(path, [_event(target, 1, action_index=index)])
+        seen = process_event_ledger.events_for_requests(path, [target])
+        assert [row["seq"] for row in seen[target]] == [0, 1]
+
+    assert passes["count"] == 1
+    final = process_event_ledger.events_for_requests(path, targets)
+    assert passes["count"] == 1
+    assert all(len(rows) == 2 for rows in final.values())
+
+
+def test_request_projection_never_borrows_another_requests_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    process_event_ledger.reset_request_event_cache()
+    path = tmp_path / "process_events.jsonl"
+    _write_rows(
+        path,
+        [
+            _event("req", 0),
+            _event("req-successor", 0),
+            {"request_id": 123, "state": "running", "seq": 0},
+            {"state": "running", "seq": 0},
+        ],
+        mode="w",
+    )
+
+    passes = _count_full_passes(monkeypatch)
+    projection = process_event_ledger.events_for_requests(
+        path, ["req", "req-successor", "123"]
+    )
+
+    assert passes["count"] == 1
+    assert [row["seq"] for row in projection["req"]] == [0]
+    assert [row["seq"] for row in projection["req-successor"]] == [0]
+    # A non-string ledger id is not coerced: 123 must never answer for "123".
+    assert projection["123"] == []
+
+
+def test_projection_identity_includes_the_key_field(
+    tmp_path: Path
+) -> None:
+    process_event_ledger.reset_request_event_cache()
+    path = tmp_path / "process_events.jsonl"
+    _write_rows(
+        path,
+        [{"request_id": "shared", "task_id": "shared", "seq": 0, "who": "request"}],
+        mode="w",
+    )
+
+    by_request = process_event_ledger.events_for_requests(path, ["shared"])
+    by_task = process_event_ledger.events_for_requests(
+        path, ["shared"], key_field="task_id"
+    )
+    assert by_request["shared"] == by_task["shared"]
+
+    # A row that belongs to only one of the two projections must not be served
+    # from the other's retained answer.
+    _write_rows(path, [{"task_id": "shared", "seq": 1, "who": "task"}])
+    assert len(process_event_ledger.events_for_requests(path, ["shared"])["shared"]) == 1
+    assert (
+        len(
+            process_event_ledger.events_for_requests(
+                path, ["shared"], key_field="task_id"
+            )["shared"]
+        )
+        == 2
+    )
+
+
+def test_incomplete_trailing_row_is_projected_only_once_complete(
+    tmp_path: Path
+) -> None:
+    process_event_ledger.reset_request_event_cache()
+    path = tmp_path / "process_events.jsonl"
+    _write_rows(path, [_event("a", 0)], mode="w")
+    process_event_ledger.events_for_requests(path, ["a"])
+
+    partial = json.dumps(_event("a", 1), sort_keys=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(partial[:-3])
+    assert [
+        row["seq"] for row in process_event_ledger.events_for_requests(path, ["a"])["a"]
+    ] == [0]
+
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(partial[-3:] + "\n")
+    assert [
+        row["seq"] for row in process_event_ledger.events_for_requests(path, ["a"])["a"]
+    ] == [0, 1]
+
+
+def test_truncation_replacement_and_rotation_replay_the_canonical_ordering(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    process_event_ledger.reset_request_event_cache()
+    path = tmp_path / "process_events.jsonl"
+    _write_rows(path, [_event("a", 0), _event("a", 1)], mode="w")
+
+    passes = _count_full_passes(monkeypatch)
+    assert len(process_event_ledger.events_for_requests(path, ["a"])["a"]) == 2
+    assert passes["count"] == 1
+
+    # Truncation: the active file shrank, so folded rows are not extendable.
+    os.truncate(path, path.stat().st_size - len(json.dumps(_event("a", 1))))
+    assert len(process_event_ledger.events_for_requests(path, ["a"])["a"]) == 1
+    assert passes["count"] == 2
+
+    # Replacement: same path, different inode.
+    replacement = tmp_path / "replacement.jsonl"
+    _write_rows(replacement, [_event("a", 7), _event("a", 8), _event("a", 9)], mode="w")
+    os.replace(replacement, path)
+    assert [
+        row["seq"] for row in process_event_ledger.events_for_requests(path, ["a"])["a"]
+    ] == [7, 8, 9]
+    assert passes["count"] == 3
+
+    # Rotation: the active file became an immutable archive behind a new active.
+    archive = path.with_name("process_events.20260915T000000.000000Z.1.abcdef01.jsonl")
+    os.replace(path, archive)
+    _write_rows(path, [_event("a", 10)], mode="w")
+    assert [
+        row["seq"] for row in process_event_ledger.events_for_requests(path, ["a"])["a"]
+    ] == [7, 8, 9, 10]
+    assert passes["count"] == 4
+
+
+def test_untracked_key_is_rebuilt_rather_than_reported_empty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    process_event_ledger.reset_request_event_cache()
+    path = tmp_path / "process_events.jsonl"
+    _write_rows(path, [_event("a", 0), _event("b", 0)], mode="w")
+
+    passes = _count_full_passes(monkeypatch)
+    assert process_event_ledger.events_for_requests(path, ["a"])["a"]
+    assert passes["count"] == 1
+
+    # "b" was never tracked. Serving it from the retained projection would
+    # report an empty history for a request that has one.
+    widened = process_event_ledger.events_for_requests(path, ["b"])
+    assert passes["count"] == 2
+    assert [row["seq"] for row in widened["b"]] == [0]
+    # The earlier key is retained alongside it, so neither costs a third pass.
+    both = process_event_ledger.events_for_requests(path, ["a", "b"])
+    assert passes["count"] == 2
+    assert both["a"] and both["b"]
+
+
+def test_over_bound_batch_answers_in_one_pass_without_evicting_the_projection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    process_event_ledger.reset_request_event_cache()
+    path = tmp_path / "process_events.jsonl"
+    oversized = [
+        f"request-{index:03d}"
+        for index in range(process_event_ledger._REQUEST_EVENT_PROJECTION_MAX_KEYS + 5)
+    ]
+    _write_rows(path, [_event(target, 0) for target in oversized], mode="w")
+
+    passes = _count_full_passes(monkeypatch)
+    projection = process_event_ledger.events_for_requests(path, oversized)
+    # One pass, every key answered -- never one pass per key, and never a
+    # silently truncated request.
+    assert passes["count"] == 1
+    assert sorted(projection) == sorted(oversized)
+    assert all(len(rows) == 1 for rows in projection.values())
+
+
+def test_returned_rows_cannot_mutate_the_retained_projection(
+    tmp_path: Path
+) -> None:
+    process_event_ledger.reset_request_event_cache()
+    path = tmp_path / "process_events.jsonl"
+    _write_rows(path, [_event("a", 0)], mode="w")
+
+    first = process_event_ledger.events_for_requests(path, ["a"])
+    first["a"][0]["state"] = "tampered"
+    first["a"].append(_event("a", 99))
+
+    second = process_event_ledger.events_for_requests(path, ["a"])
+    assert [row["seq"] for row in second["a"]] == [0]
+    assert second["a"][0]["state"] == "running"
+
+
+def test_returned_nested_values_cannot_mutate_the_retained_projection(
+    tmp_path: Path
+) -> None:
+    """Isolation has to go all the way down, not one level.
+
+    ``dict(row)`` copies the row but not what the row points at, so a caller
+    editing ``row["detail"]`` reached straight into the retained projection and
+    every later reader was served that edit back as ledger truth.  Events carry
+    nested payloads routinely, so this is the ordinary case, not an exotic one.
+    """
+
+    process_event_ledger.reset_request_event_cache()
+    path = tmp_path / "process_events.jsonl"
+    _write_rows(
+        path,
+        [_event("a", 0, detail={"phase": "security", "lenses": ["x", "y"]})],
+        mode="w",
+    )
+
+    first = process_event_ledger.events_for_requests(path, ["a"])
+    first["a"][0]["detail"]["phase"] = "tampered"
+    first["a"][0]["detail"]["lenses"].append("injected")
+
+    second = process_event_ledger.events_for_requests(path, ["a"])
+    assert second["a"][0]["detail"] == {"phase": "security", "lenses": ["x", "y"]}
+    # Each read owns its own nested containers, so one caller's edit is not a
+    # later caller's input.
+    assert first["a"][0]["detail"] is not second["a"][0]["detail"]

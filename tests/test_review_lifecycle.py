@@ -55,6 +55,29 @@ def _tamper(db: Path, column: str, value: object, *, action_index: int = 0) -> N
         conn.close()
 
 
+def _tamper_completed(
+    db: Path, column: str, value: object, *, action_index: int = 0
+) -> None:
+    """Rewrite a completed action's column the way a file-level attacker would.
+
+    ``trg_review_action_completed_no_update`` stops this schema's own writers,
+    but a reader must not treat it as the authority: anyone who can open the
+    database can drop the trigger first, and ``ensure_schema`` then quietly
+    recreates it, leaving the forged row behind and the guard looking intact.
+    """
+
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute("DROP TRIGGER IF EXISTS trg_review_action_completed_no_update")
+        conn.execute(
+            f"UPDATE review_action_outbox SET {column}=? WHERE action_index=?",
+            (value, action_index),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def _tamper_chain_digest(db: Path, column: str, value: object) -> None:
     conn = sqlite3.connect(db)
     try:
@@ -1371,6 +1394,65 @@ def test_orchestrator_drain_reconciles_dead_chain_descendants_before_reserving(
     assert manager.events == []
 
 
+def test_drain_recovers_a_stalled_chain_while_binding_recovery_stays_fail_closed(
+    tmp_path: Path,
+) -> None:
+    """One drain pass must reach BOTH recovery entry points.
+
+    The rebase that dropped ``terminal_route_binding_failures`` made every
+    drain raise before it reserved anything, so the two recoveries are pinned
+    together here: a route-unavailable successor chain is requeued in the same
+    pass in which a binding failure with no durable route attempt to verify
+    stays exactly where it is, still named by the canonical query.
+    """
+    db = tmp_path / "task.sqlite"
+    stranded = _chain(db)
+    launch = _reserve(db)
+    assert review_lifecycle.complete_action(
+        db, action_id=launch.action_id, owner="worker-a",
+        lease_token="lease-a", receipt={"ok": True}, now=NOW,
+    )
+    held = _reserve(db)
+    assert held.action_index == 1
+    review_lifecycle.fail_action(
+        db, action_id=held.action_id, owner="worker-a", lease_token="lease-a",
+        reason=review_lifecycle.TERMINAL_ROUTE_BINDING_FAILURE, now=NOW,
+    )
+    successor = _named_chain(db, index=1)
+    stalled = _reserve(db)
+    assert stalled.chain_id == successor.chain_id
+    assert stalled.action_index == 0
+    review_lifecycle.fail_action(
+        db, action_id=stalled.action_id, owner="worker-a", lease_token="lease-a",
+        reason=review_lifecycle.ROUTE_UNAVAILABLE_FAILURE_PREFIX + stalled.lens,
+        now=NOW,
+    )
+    review_lifecycle.reconcile_dead_chains(db, now=NOW)
+
+    manager = _RecordingManager(tmp_path)
+    orchestrator = review_orchestrator.ReviewOrchestrator(manager, db_path=db)
+    result = orchestrator.drain(max_actions=0, now=NOW + timedelta(seconds=1))
+
+    assert result.attempted == 0
+    rows = review_lifecycle.rows_for_test(db)
+    successor_rows = [row for row in rows if row["chain_id"] == successor.chain_id]
+    assert len(successor_rows) == len(review_lifecycle.PLAN)
+    assert {row["state"] for row in successor_rows} == {"pending"}
+    stranded_rows = {
+        row["action_index"]: row
+        for row in rows
+        if row["chain_id"] == stranded.chain_id
+    }
+    assert stranded_rows[0]["state"] == "completed"
+    assert stranded_rows[1]["state"] == "failed"
+    assert {
+        stranded_rows[index]["state"]
+        for index in range(2, len(review_lifecycle.PLAN))
+    } == {"retired"}
+    remaining = review_lifecycle.terminal_route_binding_failures(db)
+    assert [item.action_id for item in remaining] == [held.action_id]
+
+
 def test_orchestrator_mechanical_failure_reason_still_short_circuits_review() -> None:
     """The mechanical short-circuit this rework must preserve still fires only
     on a positive, in-epoch measured failure and fails closed on everything
@@ -1438,3 +1520,312 @@ def test_orchestrator_routing_catalog_cache_reset_still_clears_memoised_entries(
     review_orchestrator._ROUTING_CATALOG_CACHE["test-repo"] = (0.0, {"workers": ["w"]})
     review_orchestrator.reset_routing_catalog_cache()
     assert review_orchestrator._ROUTING_CATALOG_CACHE == {}
+
+
+# --- Advisory drain request identities (NF-853) ------------------------------
+
+
+def test_drain_request_ids_name_each_reservable_target_once(tmp_path: Path) -> None:
+    db = tmp_path / "task.sqlite"
+    _chain(db)
+
+    # Every action in the chain carries the same target request; the drain
+    # needs it projected once, not once per action.
+    assert review_lifecycle.drain_process_request_ids(db) == ["req-target"]
+
+
+def test_drain_request_ids_include_a_recorded_reviewer_child(tmp_path: Path) -> None:
+    db = tmp_path / "task.sqlite"
+    _chain(db)
+    action = _reserve(db)
+    assert review_lifecycle.complete_action(
+        db,
+        action_id=action.action_id,
+        owner="worker-a",
+        lease_token="lease-a",
+        receipt={"ok": True, "reviewer_request_id": "reviewer-child"},
+        now=NOW + timedelta(seconds=1),
+    )
+
+    # An accept action reads back the reviewer child its chain launched, so
+    # both requests must be in the one pass the caller pays for.
+    assert review_lifecycle.drain_process_request_ids(db) == [
+        "req-target",
+        "reviewer-child",
+    ]
+
+
+def test_drain_request_ids_exclude_chains_parked_behind_a_failure(
+    tmp_path: Path,
+) -> None:
+    db = tmp_path / "task.sqlite"
+    _chain(db)
+    action = _reserve(db)
+    review_lifecycle.fail_action(
+        db,
+        action_id=action.action_id,
+        owner="worker-a",
+        lease_token="lease-a",
+        reason="injected",
+        now=NOW + timedelta(seconds=1),
+    )
+
+    # This pass cannot reserve a parked chain, so projecting its requests
+    # would size the batch against work that will not happen.
+    assert review_lifecycle.drain_process_request_ids(db) == []
+
+
+def test_drain_request_ids_respect_the_declared_bound(tmp_path: Path) -> None:
+    db = tmp_path / "task.sqlite"
+    _chain(db)
+    action = _reserve(db)
+    assert review_lifecycle.complete_action(
+        db,
+        action_id=action.action_id,
+        owner="worker-a",
+        lease_token="lease-a",
+        receipt={"ok": True, "reviewer_request_id": "reviewer-child"},
+        now=NOW + timedelta(seconds=1),
+    )
+
+    assert review_lifecycle.drain_process_request_ids(db, limit=0) == []
+    assert review_lifecycle.drain_process_request_ids(db, limit=-1) == []
+    assert review_lifecycle.drain_process_request_ids(db, limit=1) == ["req-target"]
+
+
+def test_drain_request_ids_ignore_unusable_receipt_identities(tmp_path: Path) -> None:
+    db = tmp_path / "task.sqlite"
+    _chain(db)
+
+    # A pending action legitimately carries no receipt at all, so there is no
+    # identity to read and the drain still names the target.
+    _tamper(db, "receipt_json", "")
+    assert review_lifecycle.drain_process_request_ids(db) == ["req-target"]
+
+    for planted in ("not-json", json.dumps({"reviewer_request_id": 7}), "[]"):
+        _tamper(db, "receipt_json", planted)
+        # A pending action that carries a receipt at all is a tampered chain.
+        # A malformed, non-mapping or non-string identity is never coerced
+        # into a request id: an advisory hint must not invent one, and an
+        # unauthenticated row must not be read for one either.
+        with pytest.raises(
+            review_lifecycle.ReviewLifecycleError, match="descriptor_tamper"
+        ):
+            review_lifecycle.drain_process_request_ids(db)
+
+
+def test_drain_request_ids_reject_a_forged_reviewer_child(tmp_path: Path) -> None:
+    """A hash-inconsistent receipt must not smuggle in a reviewer identity.
+
+    The drain reads ``receipt_json`` to name the reviewer child a later accept
+    action will ask the process manager about.  If that read happened before
+    the chain was authenticated, anyone who could write the row could aim a
+    drain -- and the manager wake that follows it -- at a request no chain ever
+    launched.  Well-formed JSON is not authority; the committed hashes are.
+    """
+
+    db = tmp_path / "task.sqlite"
+    _chain(db)
+    action = _reserve(db)
+    assert review_lifecycle.complete_action(
+        db,
+        action_id=action.action_id,
+        owner="worker-a",
+        lease_token="lease-a",
+        receipt={"ok": True, "reviewer_request_id": "reviewer-child"},
+        now=NOW + timedelta(seconds=1),
+    )
+    assert review_lifecycle.drain_process_request_ids(db) == [
+        "req-target",
+        "reviewer-child",
+    ]
+
+    def _canonical(payload: dict[str, object]) -> tuple[str, str]:
+        encoded = json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        )
+        return encoded, hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    forged_json, forged_sha = _canonical(
+        {"ok": True, "reviewer_request_id": "attacker-child"}
+    )
+
+    # Canonically encoded, so it parses and re-encodes identically -- only the
+    # committed receipt hash still disagrees.
+    _tamper_completed(db, "receipt_json", forged_json)
+    with pytest.raises(review_lifecycle.ReviewLifecycleError, match="receipt_tamper"):
+        review_lifecycle.drain_process_request_ids(db)
+
+    # Recomputing receipt_sha256 over the forged bytes does not help either:
+    # the commitment binds the receipt to the row that actually completed.
+    _tamper_completed(db, "receipt_sha256", forged_sha)
+    with pytest.raises(review_lifecycle.ReviewLifecycleError, match="receipt_tamper"):
+        review_lifecycle.drain_process_request_ids(db)
+
+
+def _named_chain(db: Path, *, index: int) -> review_lifecycle.ReviewChain:
+    return review_lifecycle.create_or_replay_chain(
+        db,
+        target_task_id=f"TASK_TARGET_{index}",
+        target_request_id=f"req-{index}",
+        claim_epoch="7",
+        packet_sha256=PACKET,
+        candidate_sha256=f"{index:064x}",
+        now=NOW,
+    )
+
+
+def test_drain_projection_answers_depth_and_targets_from_one_authentication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Counts and drain targets are two questions about the same rows.
+
+    Answering them through two entry points ran the whole-store chain
+    authentication twice.  The grouped count is cheap; the authenticated scan
+    in front of it is the cost a caller must not pay again.
+    """
+
+    db = tmp_path / "task.sqlite"
+    _chain(db)
+
+    calls: list[int] = []
+    verify_all = review_lifecycle._verify_all_chains
+
+    def _counted(conn: sqlite3.Connection) -> None:
+        calls.append(1)
+        verify_all(conn)
+
+    monkeypatch.setattr(review_lifecycle, "_verify_all_chains", _counted)
+    projection = review_lifecycle.drain_projection(db, max_actions=4, now=NOW)
+
+    assert len(calls) == 1
+    assert projection.counts["pending"] == len(review_lifecycle.PLAN)
+    assert projection.counts["pending_reservable"] == len(review_lifecycle.PLAN)
+    # Four actions ahead, every one of them reading the same target request.
+    assert len(projection.action_request_ids) == 4
+    assert projection.request_ids() == ["req-target"]
+    assert projection.request_ids(0) == []
+
+
+def test_drain_projection_primes_the_requests_a_rotating_cursor_will_reach(
+    tmp_path: Path,
+) -> None:
+    """Prime from the drain's own reservation window, not the lowest chain ids.
+
+    The real drain reserves through a persistent rotating ``action_id`` cursor,
+    so the lowest chain ids are exactly the ones it has already walked past.
+    A chain also yields far more than two request ids -- one target plus a
+    reviewer child for every completed action -- so a ``budget * 2`` window
+    taken in chain order filled itself with passed-over chains and left every
+    request the pass actually reserved unprimed.
+    """
+
+    db = tmp_path / "task.sqlite"
+    targets = {
+        _named_chain(db, index=index).chain_id: f"req-{index}" for index in range(3)
+    }
+
+    plan_length = len(review_lifecycle.PLAN)
+    moment = NOW
+    # Walk the cursor past chains 0 and 1 exactly as a drain would, leaving
+    # each of them one deferred pending action so both stay unfailed, still
+    # reservable later, and still first in chain order.
+    for index in range(2):
+        for action_index in range(plan_length):
+            moment = moment + timedelta(seconds=1)
+            action = _reserve(db, now=moment)
+            assert targets[action.chain_id] == f"req-{index}"
+            if action_index == plan_length - 1:
+                assert review_lifecycle.defer_action(
+                    db,
+                    action_id=action.action_id,
+                    owner="worker-a",
+                    lease_token="lease-a",
+                    now=moment,
+                )
+                continue
+            assert review_lifecycle.complete_action(
+                db,
+                action_id=action.action_id,
+                owner="worker-a",
+                lease_token="lease-a",
+                receipt={
+                    "ok": True,
+                    "reviewer_request_id": f"child-{index}-{action_index}",
+                },
+                now=moment,
+            )
+
+    budget = 6
+    projection = review_lifecycle.drain_projection(db, max_actions=budget, now=moment)
+    primed = projection.request_ids(budget)
+
+    # Both passed-over chains are still pending and still unfailed, so chain
+    # order names them first -- and each one spends a target plus nine reviewer
+    # children of the window before the drain's real chain is ever reached.
+    assert projection.counts["pending"] == plan_length + 2
+    assert projection.counts["pending_parked"] == 0
+    assert primed == ["req-2"]
+    assert "req-0" not in primed
+    assert "child-0-0" not in primed
+
+    drained: list[str] = []
+    for _ in range(budget):
+        moment = moment + timedelta(seconds=1)
+        action = _reserve(db, now=moment)
+        drained.append(targets[action.chain_id])
+        assert review_lifecycle.complete_action(
+            db,
+            action_id=action.action_id,
+            owner="worker-a",
+            lease_token="lease-a",
+            receipt={"ok": True},
+            now=moment,
+        )
+
+    # Every request this drain actually read was named before the pass began.
+    assert len(drained) == budget
+    assert set(drained) <= set(primed)
+
+
+def test_drain_projection_reaches_a_deferred_action_after_the_round_wraps(
+    tmp_path: Path,
+) -> None:
+    """A wrapped round is part of the drain's order, so it is part of priming."""
+
+    db = tmp_path / "task.sqlite"
+    targets = {
+        _named_chain(db, index=index).chain_id: f"req-{index}" for index in range(2)
+    }
+
+    plan_length = len(review_lifecycle.PLAN)
+    moment = NOW
+    # Chain 0 keeps one deferred action below the cursor; chain 1 is drained
+    # out entirely, which exhausts the round and forces the wrap.
+    for index in range(2):
+        for action_index in range(plan_length):
+            moment = moment + timedelta(seconds=1)
+            action = _reserve(db, now=moment)
+            if index == 0 and action_index == plan_length - 1:
+                assert review_lifecycle.defer_action(
+                    db,
+                    action_id=action.action_id,
+                    owner="worker-a",
+                    lease_token="lease-a",
+                    now=moment,
+                )
+                continue
+            assert review_lifecycle.complete_action(
+                db,
+                action_id=action.action_id,
+                owner="worker-a",
+                lease_token="lease-a",
+                receipt={"ok": True},
+                now=moment,
+            )
+
+    projection = review_lifecycle.drain_projection(db, max_actions=2, now=moment)
+    assert projection.request_ids() == ["req-0"]
+
+    moment = moment + timedelta(seconds=1)
+    assert targets[_reserve(db, now=moment).chain_id] == "req-0"

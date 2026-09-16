@@ -714,6 +714,13 @@ def test_request_events_cache_is_request_scoped_and_invalidates_on_append(
     manager._append_event({"request_id": first_id, "state": "running"})
     manager._append_event({"request_id": second_id, "state": "running"})
 
+    ledger = process_launcher.process_event_ledger
+    # The projection is process-local and never an authority, so start from a
+    # cold one: the bounded counts below must describe this drain's own work,
+    # not whatever another test left in the shared index.
+    with ledger._REQUEST_EVENT_CACHE_LOCK:
+        ledger._REQUEST_EVENT_CACHE.clear()
+
     scans = 0
     original_events = manager._events
 
@@ -722,22 +729,84 @@ def test_request_events_cache_is_request_scoped_and_invalidates_on_append(
         scans += 1
         return original_events()
 
+    passes = 0
+    original_scan = ledger._scan_request_events
+
+    def counted_scan(*args, **kwargs):
+        nonlocal passes
+        passes += 1
+        return original_scan(*args, **kwargs)
+
+    rebuilds = 0
+    original_rebuild = ledger._rebuild_request_events
+
+    def counted_rebuild(*args, **kwargs):
+        nonlocal rebuilds
+        rebuilds += 1
+        return original_rebuild(*args, **kwargs)
+
+    folds = 0
+    original_replay = ledger._replay_appended_request_events
+
+    def counted_replay(*args, **kwargs):
+        nonlocal folds
+        replayed = original_replay(*args, **kwargs)
+        if replayed is not None:
+            folds += 1
+        return replayed
+
     monkeypatch.setattr(manager, "_events", counted_events)
+    monkeypatch.setattr(ledger, "_scan_request_events", counted_scan)
+    monkeypatch.setattr(ledger, "_rebuild_request_events", counted_rebuild)
+    monkeypatch.setattr(ledger, "_replay_appended_request_events", counted_replay)
 
     assert manager._request_events(first_id)[-1]["state"] == "running"
     assert manager._request_events(first_id)[-1]["state"] == "running"
-    assert scans == 1
+    # Repeating one request's lookup costs no ledger work at all: neither the
+    # manager's whole-ledger replay nor a second full projection pass.
+    assert scans == 0
+    assert (passes, rebuilds, folds) == (1, 1, 0)
 
     # A new request must never reuse another request's empty projection merely
     # because the durable ledger fingerprint is unchanged.
     assert manager._request_events(second_id)[-1]["state"] == "running"
     assert manager._request_events(second_id)[-1]["request_id"] == second_id
     assert manager._request_events(first_id)[-1]["request_id"] == first_id
-    assert scans == 2
+    # One cold pass per newly tracked request, never one per lookup: five
+    # lookups so far have cost exactly two full passes.
+    assert scans == 0
+    assert (passes, rebuilds, folds) == (2, 2, 0)
 
     manager._append_event({"request_id": first_id, "state": "review_ready"})
-    assert manager._request_events(first_id)[-1]["state"] == "review_ready"
-    assert scans == 3
+    appended = manager._request_events(first_id)
+
+    # Direct proof that the maintained per-request index received the appended
+    # event: the growth was folded into the retained projection instead of
+    # rebuilt by a cold pass, and it landed in its own request's bucket.
+    assert [row["state"] for row in appended] == ["running", "review_ready"]
+    assert {row["request_id"] for row in appended} == {first_id}
+    assert scans == 0
+    assert (passes, rebuilds, folds) == (2, 2, 1)
+
+    # Appending for one request must not invalidate any other request: the
+    # untouched bucket is still served whole, with no new full pass.
+    second_rows = manager._request_events(second_id)
+    assert [row["state"] for row in second_rows] == ["running"]
+    assert {row["request_id"] for row in second_rows} == {second_id}
+    assert (passes, rebuilds, folds) == (2, 2, 1)
+
+    # The same holds for the other request's append, so a drain over many
+    # requests keeps paying folds rather than full ledger replays.
+    manager._append_event({"request_id": second_id, "state": "review_ready"})
+    second_appended = manager._request_events(second_id)
+    assert [row["state"] for row in second_appended] == ["running", "review_ready"]
+    assert {row["request_id"] for row in second_appended} == {second_id}
+    assert [row["state"] for row in manager._request_events(first_id)] == [
+        "running",
+        "review_ready",
+    ]
+    assert scans == 0
+    assert (passes, rebuilds, folds) == (2, 2, 2)
 
 
 def _wait_terminal(manager, request_id, timeout=5.0):
@@ -12943,3 +13012,146 @@ def test_a_first_reviewer_launch_carries_no_repair_ask(monkeypatch, tmp_path):
         )
         is None
     )
+
+
+# --- Review-drain request projection (NF-853) --------------------------------
+#
+# The ledger bytes are written directly rather than through ``append_event``:
+# these assert what the manager's READER does across appends, and writing the
+# JSONL keeps each case to exactly the append shape it is about.
+
+
+def _append_ledger_rows(path: Path, rows: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row, sort_keys=True) + "\n")
+
+
+def _count_ledger_replays(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
+    """Count whole-ledger replays -- a bounded call count, never a duration."""
+
+    calls = {"count": 0}
+    original = process_launcher.process_event_ledger.iter_events
+
+    def counting(path: Path):
+        calls["count"] += 1
+        return original(path)
+
+    monkeypatch.setattr(
+        process_launcher.process_event_ledger, "iter_events", counting
+    )
+    return calls
+
+
+def _ledger_manager(tmp_path: Path) -> process_launcher.ProcessManager:
+    manager = _manager(
+        tmp_path,
+        show_task=_show(lambda: _card()),
+        argv=[sys.executable, "-c", "pass"],
+    )
+    process_launcher.process_event_ledger.reset_request_event_cache()
+    return manager
+
+
+def test_request_events_survive_appends_for_other_requests(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = _ledger_manager(tmp_path)
+    log = manager.process_log_path
+    _append_ledger_rows(
+        log,
+        [
+            {"request_id": "alpha", "state": "starting", "seq": 0},
+            {"request_id": "beta", "state": "starting", "seq": 0},
+        ],
+    )
+
+    replays = _count_ledger_replays(monkeypatch)
+    assert [row["seq"] for row in manager._request_events("alpha")] == [0]
+    assert [row["seq"] for row in manager._request_events("beta")] == [0]
+    first_pass_count = replays["count"]
+
+    # A reviewer launch appends for ONE request. The projection used to be
+    # keyed on a whole-ledger fingerprint, so this discarded every other
+    # request's folded history and the next read replayed the whole ledger.
+    _append_ledger_rows(log, [{"request_id": "alpha", "state": "running", "seq": 1}])
+
+    assert [row["seq"] for row in manager._request_events("alpha")] == [0, 1]
+    assert [row["seq"] for row in manager._request_events("beta")] == [0]
+    assert replays["count"] == first_pass_count
+
+
+def test_prime_request_events_drains_a_backlog_without_per_action_replays(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Synthetic stand-in for the measured 22-action review backlog."""
+
+    manager = _ledger_manager(tmp_path)
+    log = manager.process_log_path
+    targets = [f"reviewer-{index:02d}" for index in range(22)]
+    _append_ledger_rows(
+        log,
+        [{"request_id": target, "state": "starting", "seq": 0} for target in targets],
+    )
+
+    replays = _count_ledger_replays(monkeypatch)
+    assert manager.prime_request_events(targets) == 22
+    assert replays["count"] == 1
+
+    for index, target in enumerate(targets):
+        _append_ledger_rows(
+            log,
+            [{"request_id": target, "state": "running", "seq": 1, "action": index}],
+        )
+        assert [row["seq"] for row in manager._request_events(target)] == [0, 1]
+
+    # One bounded projection for the whole drain, not one replay per action.
+    assert replays["count"] == 1
+
+
+def test_request_events_never_serve_another_requests_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = _ledger_manager(tmp_path)
+    log = manager.process_log_path
+    _append_ledger_rows(
+        log,
+        [
+            {"request_id": "req", "state": "starting", "seq": 0},
+            {"request_id": "req-successor", "state": "starting", "seq": 0},
+            {"request_id": "req", "state": "running", "seq": 1},
+        ],
+    )
+
+    replays = _count_ledger_replays(monkeypatch)
+    manager.prime_request_events(["req", "req-successor"])
+
+    assert [row["seq"] for row in manager._request_events("req")] == [0, 1]
+    assert [row["seq"] for row in manager._request_events("req-successor")] == [0]
+    assert replays["count"] == 1
+    # An untracked request is rebuilt rather than reported empty from the
+    # projection it was never part of.
+    assert manager._request_events("req-unknown") == []
+    assert replays["count"] == 2
+
+
+def test_request_events_replay_the_ledger_after_a_rotation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = _ledger_manager(tmp_path)
+    log = manager.process_log_path
+    _append_ledger_rows(log, [{"request_id": "r", "state": "starting", "seq": 0}])
+
+    replays = _count_ledger_replays(monkeypatch)
+    assert len(manager._request_events("r")) == 1
+    assert replays["count"] == 1
+
+    archive = log.with_name(f"{log.stem}.20260915T000000.000000Z.1.aabbccdd{log.suffix}")
+    os.replace(log, archive)
+    _append_ledger_rows(log, [{"request_id": "r", "state": "running", "seq": 1}])
+
+    # Rotation is not growth of the same active file: fail closed to a full
+    # canonical replay rather than extending stale folded rows.
+    assert [row["seq"] for row in manager._request_events("r")] == [0, 1]
+    assert replays["count"] == 2

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -9,6 +10,8 @@ if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 from aiworkhub import task_reconciler  # noqa: E402
+
+NOW = datetime(2026, 8, 29, 18, 0, tzinfo=timezone.utc)
 
 
 class _Mgr:
@@ -76,6 +79,19 @@ class _Outbox:
             "completed": len(self.executed),
         }
 
+    def projection(self, _db_path, *, max_actions, now=None):
+        """One authenticated read answering depth AND this drain's targets.
+
+        The groups are ordered exactly as the drain will reserve them, so a
+        budget smaller than ``max_actions`` primes a prefix of what runs.
+        """
+        return task_reconciler.review_lifecycle.DrainProjection(
+            counts=self.counts(_db_path),
+            action_request_ids=tuple(
+                (f"req-{name}",) for name in self.pending[:max_actions]
+            ),
+        )
+
     def driver(self):
         outbox = self
 
@@ -122,7 +138,7 @@ def _install_recovery(monkeypatch, tmp_path, outbox, *, ensured=0, skipped=0):
         },
     )
     monkeypatch.setattr(
-        task_reconciler.review_lifecycle, "lifecycle_counts", outbox.counts,
+        task_reconciler.review_lifecycle, "drain_projection", outbox.projection,
     )
     monkeypatch.setattr(
         task_reconciler.review_orchestrator, "ReviewOrchestrator", outbox.driver(),
@@ -231,7 +247,7 @@ def test_nf865_target_is_not_starved_behind_a_35_action_backlog(monkeypatch, tmp
         task_reconciler.review_orchestrator, "recover_review_ready_targets", _recover,
     )
     monkeypatch.setattr(
-        task_reconciler.review_lifecycle, "lifecycle_counts", outbox.counts,
+        task_reconciler.review_lifecycle, "drain_projection", outbox.projection,
     )
     monkeypatch.setattr(
         task_reconciler.review_orchestrator, "ReviewOrchestrator", outbox.driver(),
@@ -255,3 +271,179 @@ def test_nf865_target_is_not_starved_behind_a_35_action_backlog(monkeypatch, tmp
     result = task_reconciler.run_scan(mgr, include_gc=False)
     assert len(outbox.executed) == 36
     assert result["review_recovery"]["review_recovery_drain"]["reason"] == "no_work"
+
+
+# --- One bounded projection per drain (NF-853) -------------------------------
+
+
+class _PrimingMgr(_Mgr):
+    def __init__(self, repo: Path) -> None:
+        super().__init__(repo)
+        self.primed: list[list[str]] = []
+
+    def prime_request_events(self, request_ids) -> int:
+        batch = list(request_ids)
+        self.primed.append(batch)
+        return len(batch)
+
+
+def _projection(groups, counts=None):
+    return task_reconciler.review_lifecycle.DrainProjection(
+        counts=dict(counts or {}),
+        action_request_ids=tuple(tuple(group) for group in groups),
+    )
+
+
+def test_drain_projects_every_target_request_in_one_batch(tmp_path):
+    mgr = _PrimingMgr(tmp_path)
+    # A chain yields far more than two request ids -- one target plus every
+    # reviewer child an accept reads back -- so the batch is sized by the
+    # actions this budget can reserve, not by a fixed per-action guess.
+    groups = [
+        (f"request-{index:02d}", f"child-{index:02d}-a", f"child-{index:02d}-b")
+        for index in range(6)
+    ]
+
+    projected = task_reconciler._prime_drain_process_events(
+        mgr, _projection(groups), 6
+    )
+
+    # One batch for the whole drain, in the order the drain will read them.
+    assert len(mgr.primed) == 1
+    assert mgr.primed[0] == [name for group in groups for name in group]
+    assert projected == 18
+
+
+def test_priming_never_exceeds_the_actions_the_budget_can_reserve(tmp_path):
+    """A smaller budget primes a prefix of the drain's own reservation order.
+
+    Never a differently chosen set: the projection is ordered by what
+    ``reserve_next_action`` will hand out, so a prefix is exactly what a
+    shorter pass consumes.
+    """
+    mgr = _PrimingMgr(tmp_path)
+    groups = [(f"request-{index:02d}",) for index in range(6)]
+
+    assert task_reconciler._prime_drain_process_events(mgr, _projection(groups), 2) == 2
+    assert mgr.primed == [["request-00", "request-01"]]
+
+
+def test_priming_is_advisory_and_never_blocks_the_drain(tmp_path):
+    groups = [("request-00",)]
+
+    # A manager that predates the batch projection.
+    assert task_reconciler._prime_drain_process_events(
+        SimpleNamespace(), _projection(groups), 6
+    ) == 0
+
+    class _Exploding(_PrimingMgr):
+        def prime_request_events(self, request_ids) -> int:
+            raise RuntimeError("ledger unreadable")
+
+    assert task_reconciler._prime_drain_process_events(
+        _Exploding(tmp_path), _projection(groups), 6
+    ) == 0
+
+    # Nothing to project is zero, not a failure and not a claimed success.
+    mgr = _PrimingMgr(tmp_path)
+    assert task_reconciler._prime_drain_process_events(mgr, _projection([]), 6) == 0
+    assert mgr.primed == []
+
+
+def test_a_22_action_backlog_primes_once_for_the_whole_pass(monkeypatch, tmp_path):
+    """The measured NF-853 shape: 22 pending actions, one projection.
+
+    Asserted as a bounded call count and never as wall-clock time. The defect
+    was O(full ledger x action), so the property that matters is that the
+    number of ledger passes does not grow with the backlog.
+    """
+    mgr = _PrimingMgr(tmp_path)
+    outbox = _Outbox([f"action-{index:02d}" for index in range(22)])
+    _install_recovery(monkeypatch, tmp_path, outbox, skipped=1)
+
+    result = task_reconciler.run_scan(mgr, include_gc=False)
+    drain = result["review_recovery"]["review_recovery_drain"]
+
+    assert drain["budget"] == task_reconciler.REVIEW_DRAIN_MAX_ACTIONS
+    assert len(mgr.primed) == 1
+    assert mgr.primed[0] == [
+        f"req-action-{index:02d}"
+        for index in range(task_reconciler.REVIEW_DRAIN_MAX_ACTIONS)
+    ]
+    assert drain["process_events_projected"] == task_reconciler.REVIEW_DRAIN_MAX_ACTIONS
+
+
+def test_one_recovery_pass_authenticates_the_review_store_once(monkeypatch, tmp_path):
+    """Sizing the batch and naming its requests are one authenticated read.
+
+    Two entry points each ran ``_verify_all_chains``, so every 30 s pass paid
+    for a second whole-store authenticated scan of rows that had not moved in
+    between.
+    """
+    review_lifecycle = task_reconciler.review_lifecycle
+    review_db = tmp_path / "review.sqlite"
+    for index in range(3):
+        review_lifecycle.create_or_replay_chain(
+            review_db,
+            target_task_id=f"TASK_TARGET_{index}",
+            target_request_id=f"req-{index}",
+            claim_epoch="7",
+            packet_sha256="a" * 64,
+            candidate_sha256=f"{index:064x}",
+            now=NOW,
+        )
+
+    calls: list[int] = []
+    verify_all = review_lifecycle._verify_all_chains
+
+    def _counted(conn) -> None:
+        calls.append(1)
+        verify_all(conn)
+
+    monkeypatch.setattr(review_lifecycle, "_verify_all_chains", _counted)
+    monkeypatch.setattr(
+        task_reconciler.review_orchestrator,
+        "canonical_review_db",
+        lambda _mgr: review_db,
+    )
+    monkeypatch.setattr(
+        task_reconciler.review_orchestrator,
+        "recover_review_ready_targets",
+        lambda _mgr, *, db_path: {
+            "state": "ok",
+            "review_recovery_scanned": 3,
+            "review_recovery_ensured": 0,
+            "review_recovery_skipped": 3,
+            "review_recovery_failed": 0,
+            "review_recovery_reasons": {},
+            "review_recovery_failures": [],
+        },
+    )
+
+    class _Driver:
+        def __init__(self, manager, *, db_path) -> None:
+            self.manager = manager
+            self.db_path = db_path
+
+        def drain(self, *, max_actions, **_kwargs):
+            return SimpleNamespace(
+                as_dict=lambda: {"attempted": 0, "completed": 0, "failed": 0}
+            )
+
+    monkeypatch.setattr(
+        task_reconciler.review_orchestrator, "ReviewOrchestrator", _Driver
+    )
+
+    mgr = _PrimingMgr(tmp_path)
+    recovery = task_reconciler._scan_review_ready_recovery(mgr)
+    drain = recovery["review_recovery_drain"]
+
+    # The pass really took the drain path, and paid for the store-wide chain
+    # authentication exactly once while doing it.
+    assert drain["state"] == "ok"
+    assert drain["budget"] == task_reconciler.REVIEW_DRAIN_MAX_ACTIONS
+    assert drain["backlog"]["pending_reservable"] == 3 * len(review_lifecycle.PLAN)
+    assert calls == [1]
+    # Lenses inside one parent stay sequential, so a fresh cursor spends the
+    # whole budget on one chain and one request answers the batch.
+    assert mgr.primed == [["req-0"]]

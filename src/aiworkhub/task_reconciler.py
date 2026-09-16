@@ -36,6 +36,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -542,19 +543,66 @@ def _review_drain_budget(ready: int) -> int:
     return max(REVIEW_DRAIN_MIN_ACTIONS, min(REVIEW_DRAIN_MAX_ACTIONS, ready))
 
 
-def _review_backlog(review_db: Path) -> dict[str, int]:
+def _review_drain_projection(review_db: Path) -> review_lifecycle.DrainProjection:
+    """Read this pass's outbox depth and drain targets under one authentication.
+
+    ``REVIEW_DRAIN_MAX_ACTIONS`` bounds the prediction because no pass may
+    reserve more than that; the batch actually primed is sliced back to the
+    budget this pass computes, and a prefix of the drain's own reservation
+    order is exactly what a smaller budget consumes.
+    """
+    return review_lifecycle.drain_projection(
+        review_db, max_actions=REVIEW_DRAIN_MAX_ACTIONS
+    )
+
+
+def _review_backlog(counts: Mapping[str, int]) -> dict[str, int]:
     """Observed outbox depth, from the lifecycle's own truthful counts.
 
     ``pending_reservable`` and never ``pending``: an action parked behind a
     failed action in its own chain can never be reserved, so counting it
     would size a batch against work this pass cannot possibly do.
     """
-    counts = review_lifecycle.lifecycle_counts(review_db)
     return {
         "pending": int(counts.get("pending") or 0),
         "pending_parked": int(counts.get("pending_parked") or 0),
         "pending_reservable": int(counts.get("pending_reservable") or 0),
     }
+
+
+def _prime_drain_process_events(
+    manager: Any, projection: review_lifecycle.DrainProjection, budget: int
+) -> int:
+    """Project this drain's process-event truth from one bounded ledger pass.
+
+    Recovery asks the process manager for a status per action, and every
+    reviewer launch appends to the same ledger.  Read cold and action by
+    action that was O(full ledger x action): the measured 22-action backlog
+    replayed the whole ledger once per action.  Naming the drain's request ids
+    first folds them all in a single pass, after which the projection absorbs
+    each append incrementally instead of being rebuilt.
+
+    The ids come from the drain's own reservation ordering, capped at the
+    actions this budget can reserve -- not from a fixed requests-per-action
+    guess over the lowest chain ids, which primed rows the rotating cursor had
+    already passed and left the ones it was about to reserve cold.
+
+    Best effort by construction.  It reserves nothing and decides nothing, so
+    a failure here costs only the old per-action read -- never a launch, a
+    skipped action or a success claimed from missing event data.  Returns how
+    many request ids the projection now answers for.
+    """
+
+    prime = getattr(manager, "prime_request_events", None)
+    if not callable(prime):
+        return 0
+    try:
+        targets = projection.request_ids(max(0, int(budget)))
+        if not targets:
+            return 0
+        return int(prime(targets))
+    except Exception:  # noqa: BLE001 -- a warm projection is never a precondition
+        return 0
 
 
 def _scan_review_ready_recovery(manager: Any) -> dict[str, Any]:
@@ -589,7 +637,13 @@ def _scan_review_ready_recovery(manager: Any) -> dict[str, Any]:
         # provider launches. Gating on ``ensured`` alone was the other half
         # of the starvation, because a backlog nobody added to was never
         # worked off at all.
-        backlog = _review_backlog(review_db)
+        # ONE authenticated read of the outbox for the whole pass. The same
+        # projection sizes the batch and names the process requests that batch
+        # will read; asking those two questions through two entry points ran
+        # the lifecycle's full-store chain authentication twice per pass, on a
+        # 30 s cadence, for rows that had not moved in between.
+        projection = _review_drain_projection(review_db)
+        backlog = _review_backlog(projection.counts)
         ensured = int(recovery.get("review_recovery_ensured") or 0)
         # Chains ensured just above have already written their pending
         # actions, so the reservable count already includes them; ``max``
@@ -597,6 +651,7 @@ def _scan_review_ready_recovery(manager: Any) -> dict[str, Any]:
         ready = max(int(backlog["pending_reservable"]), ensured)
         budget = _review_drain_budget(ready)
         if budget:
+            projected = _prime_drain_process_events(manager, projection, budget)
             drain = review_orchestrator.ReviewOrchestrator(
                 manager, db_path=review_db,
             ).drain(max_actions=budget)
@@ -609,6 +664,9 @@ def _scan_review_ready_recovery(manager: Any) -> dict[str, Any]:
                 "budget": budget,
                 "ready": ready,
                 "backlog": backlog,
+                # How many request ids this drain's process-event truth was
+                # projected from, in one pass, before any action ran.
+                "process_events_projected": projected,
             })
             recovery["review_recovery_drain"] = receipt
         else:

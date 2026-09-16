@@ -7,6 +7,7 @@ Process launch and other external effects deliberately live elsewhere.
 
 from __future__ import annotations
 
+import bisect
 import hashlib
 import json
 import re
@@ -721,21 +722,296 @@ def lifecycle_counts(db_path: str | Path) -> dict[str, int]:
     try:
         ensure_schema(conn)
         _verify_all_chains(conn)
-        counts = {state: 0 for state in sorted(VALID_STATES)}
-        for row in conn.execute(
-            "SELECT state, COUNT(*) AS count FROM review_action_outbox GROUP BY state"
-        ):
-            counts[str(row["state"])] = int(row["count"])
-        parked = conn.execute(
-            "SELECT COUNT(*) FROM review_action_outbox WHERE state='pending' "
-            "AND chain_id IN (SELECT chain_id FROM review_action_outbox "
-            "WHERE state='failed')"
-        ).fetchone()[0]
-        counts["pending_parked"] = int(parked)
-        counts["pending_reservable"] = max(0, counts.get("pending", 0) - int(parked))
-        return counts
+        return _state_counts(conn)
     finally:
         conn.close()
+
+
+def _state_counts(conn: sqlite3.Connection) -> dict[str, int]:
+    """Bounded state counts over an already-authenticated connection.
+
+    Split out so one caller can ask for counts AND the drain's request ids
+    while paying for a single ``_verify_all_chains``. The grouped count is
+    cheap; the whole-store chain authentication in front of it is what a 30 s
+    reconciler pass must not run twice.
+    """
+    counts = {state: 0 for state in sorted(VALID_STATES)}
+    for row in conn.execute(
+        "SELECT state, COUNT(*) AS count FROM review_action_outbox GROUP BY state"
+    ):
+        counts[str(row["state"])] = int(row["count"])
+    parked = conn.execute(
+        "SELECT COUNT(*) FROM review_action_outbox WHERE state='pending' "
+        "AND chain_id IN (SELECT chain_id FROM review_action_outbox "
+        "WHERE state='failed')"
+    ).fetchone()[0]
+    counts["pending_parked"] = int(parked)
+    counts["pending_reservable"] = max(0, counts.get("pending", 0) - int(parked))
+    return counts
+
+
+def _receipt_reviewer_request_id(receipt_json: Any) -> str:
+    """Read the reviewer child's request id out of a stored receipt."""
+
+    if not isinstance(receipt_json, str) or not receipt_json:
+        return ""
+    try:
+        receipt = json.loads(receipt_json)
+    except json.JSONDecodeError:
+        return ""
+    if not isinstance(receipt, Mapping):
+        return ""
+    value = receipt.get("reviewer_request_id")
+    return value if isinstance(value, str) else ""
+
+
+DRAIN_PROJECTION_MAX_ACTIONS = 64
+
+
+@dataclass(frozen=True)
+class DrainProjection:
+    """One drain pass's outbox truth, read under a single authentication.
+
+    How deep the backlog is and which process requests the batch will read are
+    two questions about the same rows. Asked through two entry points they each
+    ran the whole-store chain authentication, so a recovery pass paid for it
+    twice; asked through one projection it runs once.
+
+    ``action_request_ids`` is ordered: group *i* holds the requests the *i*-th
+    action this drain reserves will read, in the order ``reserve_next_action``
+    hands them out. A caller whose budget turns out smaller than the projection
+    therefore primes a prefix of what the drain consumes, never a differently
+    chosen set.
+    """
+
+    counts: Mapping[str, int]
+    action_request_ids: tuple[tuple[str, ...], ...]
+
+    def request_ids(self, max_actions: int | None = None) -> list[str]:
+        """Name each distinct request the first ``max_actions`` actions read.
+
+        An omitted budget still names a bounded prefix: the drain's declared
+        action ceiling, never an unbounded walk of the projected outbox.
+        """
+
+        groups = self.action_request_ids
+        if max_actions is None:
+            max_actions = DRAIN_PROJECTION_MAX_ACTIONS
+        groups = groups[: max(0, int(max_actions))]
+        ordered: list[str] = []
+        seen: set[str] = set()
+        for group in groups:
+            for request_id in group:
+                if not request_id or request_id in seen:
+                    continue
+                seen.add(request_id)
+                ordered.append(request_id)
+        return ordered
+
+
+def drain_projection(
+    db_path: str | Path,
+    *,
+    max_actions: int = DRAIN_PROJECTION_MAX_ACTIONS,
+    now: datetime | None = None,
+) -> DrainProjection:
+    """Project one bounded drain's depth and request ids in a single pass.
+
+    A drain asks the process manager about the target candidate's request, and
+    -- for an accept action -- about the reviewer child recorded in its chain's
+    launch receipt. Naming both up front lets the caller project them from ONE
+    bounded ledger pass instead of replaying the whole ledger once per action.
+
+    Advisory only. It reserves nothing, writes no reservation cursor and
+    decides nothing: an id it omits merely costs that action its own
+    projection, and an id it includes grants no chain, claim or launch rights.
+    Chains parked behind a failed action never appear, because this pass cannot
+    reserve them, exactly as ``pending_reservable`` excludes them from depth.
+
+    Advisory does not mean unauthenticated. ``target_request_id`` and the
+    reviewer child inside ``receipt_json`` are read straight out of the outbox,
+    so a tampered row would hand the caller a request id no chain ever claimed
+    and the drain would project -- and wake a manager on -- someone else's
+    process. Every chain is verified first, exactly as ``lifecycle_counts``
+    does, and a tampered chain raises instead of returning a hint.
+    """
+
+    moment = now if now is not None else datetime.now(timezone.utc)
+    conn = _connect(db_path)
+    try:
+        ensure_schema(conn)
+        _verify_all_chains(conn)
+        return DrainProjection(
+            counts=_state_counts(conn),
+            action_request_ids=_predicted_drain_request_ids(
+                conn, moment, max(0, int(max_actions))
+            ),
+        )
+    finally:
+        conn.close()
+
+
+def drain_process_request_ids(
+    db_path: str | Path, *, limit: int = 64
+) -> list[str]:
+    """Name the distinct process request ids a bounded drain may read.
+
+    Identity-only view over :func:`drain_projection` for callers that do not
+    need the counts. ``limit`` caps distinct identities and also caps the
+    prediction window, so neither the walk nor the result can run away.
+    """
+
+    if limit <= 0:
+        return []
+    return drain_projection(db_path, max_actions=limit).request_ids()[:limit]
+
+
+def _predicted_drain_request_ids(
+    conn: sqlite3.Connection, now: datetime, max_actions: int
+) -> tuple[tuple[str, ...], ...]:
+    """Walk the exact reservation order a drain is about to consume.
+
+    This replays ``_reservable_candidate``'s own order over one in-memory
+    snapshot of the already-authenticated outbox: expired leases first, then
+    the persistent rotating pending cursor clamped to its round high-water
+    mark, with the same single rollover. Ordering by ``chain_id`` instead lost
+    the projection exactly when it mattered -- with a non-zero cursor and
+    several chains, the lowest chain ids are the ones the cursor has already
+    passed, so every request the pass really reserved went unprimed -- and no
+    fixed requests-per-action bound is right either, because one chain can
+    yield far more than two of them.
+
+    Each selected action is folded forward as completed, because that is what
+    the drain does before reserving the next one, so a chain's next action
+    appears here exactly where the drain will meet it. Nothing is written: the
+    cursor is read, never advanced.
+    """
+
+    if max_actions <= 0:
+        return ()
+    rows = conn.execute(
+        "SELECT action_id, chain_id, action_index, state, lease_expires_at, "
+        "target_request_id, receipt_json FROM review_action_outbox "
+        "ORDER BY action_id"
+    ).fetchall()
+    if not rows:
+        return ()
+
+    state = {int(row["action_id"]): str(row["state"]) for row in rows}
+    chains: dict[int, list[sqlite3.Row]] = {}
+    for row in rows:
+        chains.setdefault(int(row["chain_id"]), []).append(row)
+    for actions in chains.values():
+        actions.sort(key=lambda row: int(row["action_index"]))
+
+    def _unblocked(row: sqlite3.Row) -> bool:
+        index = int(row["action_index"])
+        for prior in chains[int(row["chain_id"])]:
+            if int(prior["action_index"]) >= index:
+                break
+            if state[int(prior["action_id"])] != "completed":
+                return False
+        return True
+
+    def _pending_watermark() -> int:
+        return max(
+            (action_id for action_id, value in state.items() if value == "pending"),
+            default=0,
+        )
+
+    now_text = _format_utc(now)
+    expired_rows = sorted(
+        (
+            row
+            for row in rows
+            if str(row["state"]) == "reserved"
+            and str(row["lease_expires_at"]) <= now_text
+        ),
+        key=lambda row: (str(row["lease_expires_at"]), int(row["action_id"])),
+    )
+
+    def _next_expired_lease() -> sqlite3.Row | None:
+        scanned = 0
+        for row in expired_rows:
+            if state[int(row["action_id"])] != "reserved":
+                continue
+            scanned += 1
+            if scanned > RESERVE_SCAN_LIMIT:
+                break
+            if _unblocked(row):
+                return row
+        return None
+
+    pending_rows = [row for row in rows if str(row["state"]) == "pending"]
+    pending_ids = [int(row["action_id"]) for row in pending_rows]
+    cursor, watermark = _reservation_cursor_snapshot(conn)
+
+    def _pending_window() -> list[sqlite3.Row]:
+        window: list[sqlite3.Row] = []
+        for row in pending_rows[bisect.bisect_right(pending_ids, cursor):]:
+            action_id = int(row["action_id"])
+            if action_id > watermark:
+                break
+            if state[action_id] != "pending":
+                continue
+            window.append(row)
+            if len(window) >= RESERVE_SCAN_LIMIT:
+                break
+        return window
+
+    def _next_pending() -> sqlite3.Row | None:
+        nonlocal cursor, watermark
+        if watermark == 0:
+            watermark = _pending_watermark()
+            cursor = 0
+        for scan_index in range(2):
+            window = _pending_window() if watermark else []
+            for row in window:
+                if _unblocked(row):
+                    cursor = int(row["action_id"])
+                    return row
+            cursor = max((int(row["action_id"]) for row in window), default=cursor)
+            if scan_index == 0 and (not window or cursor >= watermark):
+                cursor = 0
+                watermark = _pending_watermark()
+                continue
+            break
+        return None
+
+    predicted: list[tuple[str, ...]] = []
+    for _ in range(max_actions):
+        chosen = _next_expired_lease()
+        if chosen is None:
+            chosen = _next_pending()
+        if chosen is None:
+            break
+        state[int(chosen["action_id"])] = "completed"
+        predicted.append(_action_request_ids(chosen, chains[int(chosen["chain_id"])]))
+    return tuple(predicted)
+
+
+def _action_request_ids(
+    row: sqlite3.Row, chain_rows: list[sqlite3.Row]
+) -> tuple[str, ...]:
+    """Name the exact requests one reserved action reads.
+
+    Its own ``target_request_id``, plus any reviewer child its own chain has
+    already recorded in a launch receipt: an accept action asks the process
+    manager about the child an earlier action in the SAME chain launched.
+    """
+
+    target = row["target_request_id"]
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for candidate in (
+        target if isinstance(target, str) else "",
+        *(_receipt_reviewer_request_id(other["receipt_json"]) for other in chain_rows),
+    ):
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        ordered.append(candidate)
+    return tuple(ordered)
 
 
 def _connect(db_path: str | Path) -> sqlite3.Connection:
@@ -1702,6 +1978,21 @@ def _reservation_cursor(conn: sqlite3.Connection) -> tuple[int, int]:
         "INSERT OR IGNORE INTO review_reservation_state "
         "(id, last_pending_action_id, round_high_watermark) VALUES (1, 0, 0)"
     )
+    row = conn.execute(
+        "SELECT last_pending_action_id, round_high_watermark "
+        "FROM review_reservation_state WHERE id=1"
+    ).fetchone()
+    return (int(row[0]), int(row[1])) if row is not None else (0, 0)
+
+
+def _reservation_cursor_snapshot(conn: sqlite3.Connection) -> tuple[int, int]:
+    """Read the persistent reservation cursor without creating or moving it.
+
+    ``_reservation_cursor`` seeds the default row, which is a write. A drain
+    projection only predicts where the next reservations will land, so it reads
+    what is already there and treats an absent row as a fresh round, exactly as
+    the seeded default would.
+    """
     row = conn.execute(
         "SELECT last_pending_action_id, round_high_watermark "
         "FROM review_reservation_state WHERE id=1"
