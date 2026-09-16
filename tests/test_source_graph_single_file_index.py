@@ -709,39 +709,71 @@ def test_extract_file_from_bytes_matches_extract_file_for_same_bytes(tmp_path):
     assert from_bytes == from_path
 
 
-def test_index_file_fails_closed_when_no_safe_nofollow_authority(tmp_path, monkeypatch):
+def test_index_file_uses_lstat_walk_fallback_when_no_safe_nofollow_authority(
+    tmp_path, monkeypatch,
+):
+    """No ``O_NOFOLLOW`` (e.g. Windows) degrades to the ``lstat``-walk
+    fallback instead of refusing to index at all -- see
+    ``_open_authenticated_regular_file_snapshot_lstat_walk``."""
     repo = _new_repo(tmp_path, "no_nofollow")
     source = "def blocked():\n    return 1\n"
     _write(repo / "blocked.py", source)
     monkeypatch.delattr(sg.os, "O_NOFOLLOW", raising=False)
 
-    with pytest.raises(sg.SourceGraphError, match="safe_open_unsupported"):
-        sg.index_file(repo, "blocked.py", _sha256(source))
+    result = sg.index_file(repo, "blocked.py", _sha256(source))
+    assert result["ok"] is True
 
     conn = sg.connect(sg.resolve_db_path(repo))
     try:
-        assert _entity_count_for_file(conn, "blocked.py") == 0
+        assert _entity_count_for_file(conn, "blocked.py") == result["entities"]
         assert conn.execute(
             "SELECT COUNT(*) FROM files WHERE file_path='blocked.py'"
-        ).fetchone()[0] == 0
+        ).fetchone()[0] == 1
     finally:
         conn.close()
 
 
-def test_index_file_fails_closed_when_nofollow_flag_is_zero(tmp_path, monkeypatch):
+def test_index_file_uses_lstat_walk_fallback_when_nofollow_flag_is_zero(
+    tmp_path, monkeypatch,
+):
     repo = _new_repo(tmp_path, "zero_nofollow")
     source = "def blocked_zero():\n    return 1\n"
     _write(repo / "blocked_zero.py", source)
     monkeypatch.setattr(sg.os, "O_NOFOLLOW", 0, raising=False)
 
-    with pytest.raises(sg.SourceGraphError, match="safe_open_unsupported"):
-        sg.index_file(repo, "blocked_zero.py", _sha256(source))
+    result = sg.index_file(repo, "blocked_zero.py", _sha256(source))
+    assert result["ok"] is True
 
     conn = sg.connect(sg.resolve_db_path(repo))
     try:
-        assert _entity_count_for_file(conn, "blocked_zero.py") == 0
+        assert _entity_count_for_file(conn, "blocked_zero.py") == result["entities"]
         assert conn.execute(
             "SELECT COUNT(*) FROM files WHERE file_path='blocked_zero.py'"
+        ).fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def test_index_file_lstat_walk_fallback_still_refuses_a_symlinked_component(
+    tmp_path, monkeypatch,
+):
+    """The no-``O_NOFOLLOW`` fallback keeps the core security property: a
+    symlinked directory component is still refused, not silently followed."""
+    repo = _new_repo(tmp_path, "fallback_symlink_refused")
+    outside = tmp_path / "outside_fallback_symlink_refused"
+    outside.mkdir()
+    source = "def secret():\n    return 1\n"
+    _write(outside / "secret.py", source)
+    (repo / "linked").symlink_to(outside, target_is_directory=True)
+    monkeypatch.delattr(sg.os, "O_NOFOLLOW", raising=False)
+
+    with pytest.raises(sg.SourceGraphError, match="symlink"):
+        sg.index_file(repo, "linked/secret.py", _sha256(source))
+
+    conn = sg.connect(sg.resolve_db_path(repo))
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM files WHERE file_path='linked/secret.py'"
         ).fetchone()[0] == 0
     finally:
         conn.close()
@@ -854,6 +886,8 @@ def test_index_file_rejects_cumulative_overrun_and_rolls_back(
             self.st_mode = original_stat.st_mode
             self.st_size = 24
             self.st_mtime_ns = original_stat.st_mtime_ns
+            self.st_ino = original_stat.st_ino
+            self.st_dev = original_stat.st_dev
 
     def lie_about_regular_file_size(fd: int):
         file_stat = real_fstat(fd)

@@ -6011,30 +6011,121 @@ def _open_nofollow_directory_component(
     return next_fd
 
 
-def _open_authenticated_regular_file_snapshot(
+def _read_authenticated_snapshot_from_verified_fd(
+    fd: int,
+    rel_display: str,
+    *,
+    expected_identity: tuple[int, int] | None = None,
+) -> _AuthenticatedFileSnapshot:
+    """Read and size-bound a snapshot from an fd already proven regular.
+
+    ``expected_identity`` is the ``(st_dev, st_ino)`` a caller observed via a
+    pre-open ``lstat`` on a host with no ``dir_fd``/``O_NOFOLLOW`` (Windows):
+    when given, a mismatch means the path was swapped between that lstat and
+    this open, and the read is refused rather than trusting whatever now sits
+    there.
+    """
+
+    try:
+        file_stat = os.fstat(fd)
+    except OSError as exc:
+        raise SourceGraphError(
+            f"source_graph_single_file_unreadable:{rel_display}"
+        ) from exc
+    if not stat.S_ISREG(file_stat.st_mode):
+        raise SourceGraphError(
+            f"source_graph_single_file_non_regular:{rel_display}"
+        )
+    if expected_identity is not None and (
+        not file_stat.st_ino
+        or (file_stat.st_dev, file_stat.st_ino) != expected_identity
+    ):
+        raise SourceGraphError(f"source_graph_single_file_symlink:{rel_display}")
+    file_size = int(file_stat.st_size)
+    limit = SOURCE_GRAPH_AUTHENTICATED_FILE_BYTE_LIMIT
+    if file_size > limit:
+        raise SourceGraphError(
+            f"source_graph_single_file_too_large:{rel_display}:"
+            f"size={file_size} limit={limit}"
+        )
+    raw = bytearray()
+    try:
+        while True:
+            read_size = min(1024 * 1024, limit + 1 - len(raw))
+            if read_size <= 0:
+                raise SourceGraphError(
+                    f"source_graph_single_file_too_large:{rel_display}:"
+                    f"size>{limit} limit={limit}"
+                )
+            chunk = os.read(fd, read_size)
+            if not chunk:
+                break
+            raw.extend(chunk)
+            if len(raw) > limit:
+                raise SourceGraphError(
+                    f"source_graph_single_file_too_large:{rel_display}:"
+                    f"size>{limit} limit={limit}"
+                )
+            if len(raw) > file_size:
+                raise SourceGraphError(
+                    f"source_graph_single_file_unstable_size:{rel_display}"
+                )
+    except OSError as exc:
+        raise SourceGraphError(
+            f"source_graph_single_file_unreadable:{rel_display}"
+        ) from exc
+    if len(raw) != file_size:
+        raise SourceGraphError(
+            f"source_graph_single_file_unstable_size:{rel_display}"
+        )
+    authenticated = bytes(raw)
+    return _AuthenticatedFileSnapshot(
+        raw=authenticated,
+        source_hash=sgast.sha256_bytes(authenticated),
+        file_size=file_size,
+        mtime_ns=int(file_stat.st_mtime_ns),
+    )
+
+
+def _dir_fd_walk_supported() -> bool:
+    """True when this host can walk a path with ``dir_fd``-relative opens.
+
+    Windows offers neither ``O_NOFOLLOW`` nor ``dir_fd``-relative ``os.open``,
+    so this is false there and the caller degrades to the ``lstat``-walk
+    fallback below instead of failing the whole feature closed.
+    """
+
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if isinstance(nofollow, bool) or not isinstance(nofollow, int) or nofollow <= 0:
+        return False
+    if not isinstance(getattr(os, "O_DIRECTORY", None), int):
+        return False
+    return os.open in os.supports_dir_fd
+
+
+def _windows_reparse_or_symlink(st: os.stat_result) -> bool:
+    """Mirrors ``terminal_authority._windows_link_identity``'s reparse check."""
+
+    reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    return bool(
+        stat.S_ISLNK(st.st_mode)
+        or (reparse and getattr(st, "st_file_attributes", 0) & reparse)
+    )
+
+
+def _open_authenticated_regular_file_snapshot_dir_fd(
     repo_root: Path,
     rel_path: Path,
 ) -> _AuthenticatedFileSnapshot:
-    """Read one full-component no-follow regular-file snapshot."""
+    """POSIX path: a real no-follow, race-free walk via ``dir_fd``.
 
-    nofollow = getattr(os, "O_NOFOLLOW", None)
-    if (
-        isinstance(nofollow, bool)
-        or not isinstance(nofollow, int)
-        or nofollow <= 0
-    ):
-        raise SourceGraphError(
-            "source_graph_single_file_safe_open_unsupported:O_NOFOLLOW"
-        )
-    directory = getattr(os, "O_DIRECTORY", None)
-    if not isinstance(directory, int):
-        raise SourceGraphError(
-            "source_graph_single_file_safe_open_unsupported:O_DIRECTORY"
-        )
-    if os.open not in os.supports_dir_fd:
-        raise SourceGraphError(
-            "source_graph_single_file_safe_open_unsupported:dir_fd"
-        )
+    Only reached when ``_dir_fd_walk_supported()`` has already confirmed both
+    flags exist; ``getattr`` here is for the type checker (these names are
+    unresolvable on a Windows platform stub), not a runtime fallback.
+    """
+
+    nofollow = getattr(os, "O_NOFOLLOW")
+    directory = getattr(os, "O_DIRECTORY")
     cloexec = getattr(os, "O_CLOEXEC", None)
     dir_flags = os.O_RDONLY | nofollow | directory
     if isinstance(cloexec, int):
@@ -6093,66 +6184,99 @@ def _open_authenticated_regular_file_snapshot(
         raise
 
     try:
-        try:
-            file_stat = os.fstat(fd)
-        except OSError as exc:
-            raise SourceGraphError(
-                f"source_graph_single_file_unreadable:{rel_display}"
-            ) from exc
-        if not stat.S_ISREG(file_stat.st_mode):
-            raise SourceGraphError(
-                f"source_graph_single_file_non_regular:{rel_display}"
-            )
-        file_size = int(file_stat.st_size)
-        limit = SOURCE_GRAPH_AUTHENTICATED_FILE_BYTE_LIMIT
-        if file_size > limit:
-            raise SourceGraphError(
-                f"source_graph_single_file_too_large:{rel_display}:"
-                f"size={file_size} limit={limit}"
-            )
-        raw = bytearray()
-        try:
-            while True:
-                read_size = min(1024 * 1024, limit + 1 - len(raw))
-                if read_size <= 0:
-                    raise SourceGraphError(
-                        f"source_graph_single_file_too_large:{rel_display}:"
-                        f"size>{limit} limit={limit}"
-                    )
-                chunk = os.read(fd, read_size)
-                if not chunk:
-                    break
-                raw.extend(chunk)
-                if len(raw) > limit:
-                    raise SourceGraphError(
-                        f"source_graph_single_file_too_large:{rel_display}:"
-                        f"size>{limit} limit={limit}"
-                    )
-                if len(raw) > file_size:
-                    raise SourceGraphError(
-                        f"source_graph_single_file_unstable_size:{rel_display}"
-                    )
-        except OSError as exc:
-            raise SourceGraphError(
-                f"source_graph_single_file_unreadable:{rel_display}"
-            ) from exc
-        if len(raw) != file_size:
-            raise SourceGraphError(
-                f"source_graph_single_file_unstable_size:{rel_display}"
-            )
-        authenticated = bytes(raw)
-        return _AuthenticatedFileSnapshot(
-            raw=authenticated,
-            source_hash=sgast.sha256_bytes(authenticated),
-            file_size=file_size,
-            mtime_ns=int(file_stat.st_mtime_ns),
-        )
+        return _read_authenticated_snapshot_from_verified_fd(fd, rel_display)
     finally:
         for descriptor in reversed(descriptors):
             try:
                 os.close(descriptor)
             except OSError:
                 pass
+
+
+def _open_authenticated_regular_file_snapshot_lstat_walk(
+    repo_root: Path,
+    rel_path: Path,
+) -> _AuthenticatedFileSnapshot:
+    """Best-effort fallback where the host has neither ``dir_fd`` nor
+    ``O_NOFOLLOW`` (Windows).
+
+    Each path component is ``lstat``-checked for a symlink/reparse point
+    before the walk trusts it, mirroring
+    ``terminal_authority._windows_link_identity``. Unlike the ``dir_fd`` walk
+    above, a check and the next descent are not atomic with each other --
+    Windows has no directory-relative open to close that window -- so the
+    final file's identity is re-verified against its own pre-open ``lstat``
+    after opening, refusing a swap performed in that last, narrower window.
+    """
+
+    rel_display = rel_path.as_posix()
+    current = repo_root
+    try:
+        root_stat = current.lstat()
+    except OSError as exc:
+        raise SourceGraphError(
+            f"source_graph_single_file_unreadable:{repo_root}"
+        ) from exc
+    if not stat.S_ISDIR(root_stat.st_mode) or _windows_reparse_or_symlink(root_stat):
+        raise SourceGraphError(f"source_graph_single_file_non_directory:{repo_root}")
+
+    parts = rel_path.parts
+    for part in parts[:-1]:
+        current = current / part
+        try:
+            component_stat = current.lstat()
+        except OSError as exc:
+            raise SourceGraphError(
+                f"source_graph_single_file_unreadable:{rel_display}"
+            ) from exc
+        if _windows_reparse_or_symlink(component_stat):
+            raise SourceGraphError(
+                f"source_graph_single_file_symlink:{rel_display}"
+            )
+        if not stat.S_ISDIR(component_stat.st_mode):
+            raise SourceGraphError(
+                f"source_graph_single_file_non_directory:{rel_display}"
+            )
+
+    file_path = current / parts[-1]
+    try:
+        link_stat = file_path.lstat()
+    except OSError as exc:
+        raise SourceGraphError(
+            f"source_graph_single_file_unreadable:{rel_display}"
+        ) from exc
+    if _windows_reparse_or_symlink(link_stat):
+        raise SourceGraphError(f"source_graph_single_file_symlink:{rel_display}")
+    if not stat.S_ISREG(link_stat.st_mode):
+        raise SourceGraphError(
+            f"source_graph_single_file_non_regular:{rel_display}"
+        )
+
+    try:
+        fd = os.open(file_path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+    except OSError as exc:
+        raise SourceGraphError(
+            f"source_graph_single_file_unreadable:{rel_display}"
+        ) from exc
+    try:
+        return _read_authenticated_snapshot_from_verified_fd(
+            fd,
+            rel_display,
+            expected_identity=(link_stat.st_dev, link_stat.st_ino),
+        )
+    finally:
+        os.close(fd)
+
+
+def _open_authenticated_regular_file_snapshot(
+    repo_root: Path,
+    rel_path: Path,
+) -> _AuthenticatedFileSnapshot:
+    """Read one full-component no-follow regular-file snapshot."""
+
+    if _dir_fd_walk_supported():
+        return _open_authenticated_regular_file_snapshot_dir_fd(repo_root, rel_path)
+    return _open_authenticated_regular_file_snapshot_lstat_walk(repo_root, rel_path)
 
 
 def index_file(repo_root: Path, path: str, expected_hash: str) -> dict[str, Any]:
