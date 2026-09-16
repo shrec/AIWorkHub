@@ -75,12 +75,53 @@ def _ready_preflight_deps(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
+def _appcontainer_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Report AppContainer as unavailable, whatever this host can actually do.
+
+    These refusal tests used to depend on the host lacking AppContainer, which
+    held on every CI runner and on a Windows host whose probe was looking the
+    export up in the wrong library. Now that the probe resolves
+    ``DeriveCapabilitySidsFromName`` where Windows really publishes it, a
+    capable Windows host does NOT refuse -- and a test that measures a refusal
+    has to create the condition it measures rather than inherit it.
+    """
+
+    monkeypatch.setattr(worker_workspace, "_is_windows_host", lambda: True)
+    monkeypatch.setattr(
+        worker_workspace,
+        "windows_confinement_report",
+        lambda **_kwargs: {
+            "available": False,
+            "reason": "win32_appcontainer_unavailable",
+        },
+    )
+
+
 def test_windows_sandbox_selection_fails_closed_without_appcontainer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(worker_workspace, "_is_windows_host", lambda: True)
+    _appcontainer_unavailable(monkeypatch)
     with pytest.raises(worker_workspace.WorkspaceError, match="windows_appcontainer_sandbox_unavailable"):
         worker_workspace.select_sandbox_backend()
+
+
+def test_windows_sandbox_selection_uses_appcontainer_when_it_is_available(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other half of the contract: a capable host gets the secure lane."""
+
+    monkeypatch.setattr(worker_workspace, "_is_windows_host", lambda: True)
+    monkeypatch.setattr(
+        worker_workspace,
+        "windows_confinement_report",
+        lambda **_kwargs: {"available": True, "reason": ""},
+    )
+
+    assert (
+        worker_workspace.select_sandbox_backend()
+        == worker_workspace.WINDOWS_APPCONTAINER_BACKEND
+    )
+
 
 
 @pytest.mark.parametrize(
@@ -581,7 +622,7 @@ def test_confinement_report_does_not_describe_windows_on_another_platform(
 def test_windows_sandbox_refusal_carries_the_measured_cause(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(worker_workspace, "_is_windows_host", lambda: True)
+    _appcontainer_unavailable(monkeypatch)
 
     with pytest.raises(worker_workspace.WorkspaceError) as excinfo:
         worker_workspace.select_sandbox_backend()

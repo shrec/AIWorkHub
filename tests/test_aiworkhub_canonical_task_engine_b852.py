@@ -77,17 +77,29 @@ def _write_claude_descriptor(
 
 
 def _windows_claude_env(monkeypatch, tmp_path, *, pid, image="claude.exe"):
-    """Wire the Windows-native Claude helpers to deterministic fakes."""
+    """Wire the Windows-native Claude helpers to deterministic fakes.
+
+    NF-2026-00... (Claude manager route): production now walks a full ancestry
+    via ``_windows_process_tree()`` -- one Toolhelp snapshot answering parent
+    AND image for every PID -- rather than reading only the direct parent's
+    image name, because a Windows venv ``Scripts\\python.exe`` is a redirector
+    that re-executes the base interpreter as a separate hop before ``claude.exe``.
+    This fixture models the single-hop case (``pid`` is already claude.exe, as
+    every pre-existing test here assumes); the multi-hop redirector case has its
+    own dedicated coverage in test_claude_manager_route_windows.py.
+    """
     fake_home = tmp_path / "home"
     fake_home.mkdir(parents=True, exist_ok=True)
     repo = (tmp_path / "repo").resolve()
     repo.mkdir(parents=True, exist_ok=True)
     sid = "S-1-5-21-test"
+    tree = {pid: (1, image)}
 
     def _owner(p: int) -> str | None:
         return sid if p in (pid, os.getpid()) else None
 
     monkeypatch.setattr(core, "_windows_process_owner_sid", _owner)
+    monkeypatch.setattr(core, "_windows_process_tree", lambda: tree)
     monkeypatch.setattr(core, "_windows_process_image_names", lambda: {pid: image})
     monkeypatch.setattr(os, "getppid", lambda: pid)
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
@@ -196,7 +208,10 @@ def test_claude_manager_identity_windows_fails_closed_on_unverifiable_process(
     pid = 4242
     fake_home, repo = _windows_claude_env(monkeypatch, tmp_path, pid=pid)
     _write_claude_descriptor(fake_home, pid, cwd=repo)
-    monkeypatch.setattr(core, "_windows_process_image_names", lambda: None)
+    # Production now walks the ancestry via ``_windows_process_tree()`` (one
+    # Toolhelp snapshot answering parent AND image for every PID); patching the
+    # now-unused ``_windows_process_image_names`` no longer reaches it.
+    monkeypatch.setattr(core, "_windows_process_tree", lambda: None)
     assert core._claude_windows_manager_identity() is None
 
 

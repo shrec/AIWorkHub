@@ -1055,6 +1055,49 @@ def _load_windows_dll(name: str) -> "ctypes.CDLL":
     return loader(name, use_last_error=True)
 
 
+# Where each Win32 export actually lives, most specific library first. Windows
+# moved most of the Win32 base APIs into kernelbase.dll and publishes them
+# through API sets; kernel32.dll forwards many of them but NOT the
+# security-base ones. Measured on Windows 11 26200:
+#   advapi32  ->  (no DeriveCapabilitySidsFromName)
+#   kernel32  ->  (no DeriveCapabilitySidsFromName)
+#   kernelbase, api-ms-win-security-base-l1-2-2  ->  exports it
+# Binding it to kernel32 therefore raised AttributeError on a host that is
+# perfectly capable of AppContainer confinement, the probe answered
+# CAPABILITY_DERIVATION_FAILED, and every native CLI route was excluded as
+# "windows_appcontainer_sandbox_unavailable" while the real cause was a lookup
+# in the wrong library.
+_WINDOWS_EXPORT_LIBRARIES: dict[str, tuple[str, ...]] = {
+    "DeriveCapabilitySidsFromName": (
+        "kernelbase",
+        "api-ms-win-security-base-l1-2-2",
+        "advapi32",
+        "kernel32",
+    ),
+}
+
+
+def _load_windows_export(name: str) -> tuple["ctypes.CDLL", str] | None:
+    """Return the first loadable library that exports ``name``, or None.
+
+    Fails closed rather than guessing: a caller that gets None reports the
+    export as unavailable instead of binding a same-named symbol from a library
+    that happens to load.
+    """
+
+    for library in _WINDOWS_EXPORT_LIBRARIES.get(name, ()):
+        try:
+            handle = _load_windows_dll(library)
+        except OSError:
+            continue
+        try:
+            getattr(handle, name)
+        except AttributeError:
+            continue
+        return handle, library
+    return None
+
+
 def _last_win_error() -> int:
     """Return the last Win32 error code (``GetLastError``).
 
@@ -1099,10 +1142,27 @@ class _CtypesWin32Api:
         self._kernel32 = _load_windows_dll("kernel32")
         self._userenv = _load_windows_dll("userenv")
         self._advapi32 = _load_windows_dll("advapi32")
+        # DeriveCapabilitySidsFromName is a security-base export that kernel32
+        # does not forward; resolve it where this host actually publishes it.
+        resolved = _load_windows_export("DeriveCapabilitySidsFromName")
+        if resolved is None:
+            libraries = ", ".join(
+                _WINDOWS_EXPORT_LIBRARIES["DeriveCapabilitySidsFromName"]
+            )
+            raise AppContainerError(
+                AppContainerReason.CAPABILITY_DERIVATION_FAILED,
+                detail=(
+                    "required Win32 export unavailable: function "
+                    f"'DeriveCapabilitySidsFromName' not found in {libraries}"
+                ),
+                operation="DeriveCapabilitySidsFromName",
+            )
+        self._security_base, self._security_base_library = resolved
         self._configure_signatures()
 
     def _configure_signatures(self) -> None:
         k = self._kernel32
+        s = self._security_base
         u = self._userenv
         a = self._advapi32
 
@@ -1121,8 +1181,8 @@ class _CtypesWin32Api:
             ctypes.POINTER(wintypes.LPVOID),
         ]
 
-        k.DeriveCapabilitySidsFromName.restype = wintypes.BOOL
-        k.DeriveCapabilitySidsFromName.argtypes = [
+        s.DeriveCapabilitySidsFromName.restype = wintypes.BOOL
+        s.DeriveCapabilitySidsFromName.argtypes = [
             wintypes.LPCWSTR,
             ctypes.POINTER(ctypes.POINTER(wintypes.LPVOID)),
             ctypes.POINTER(wintypes.DWORD),
@@ -1297,7 +1357,7 @@ class _CtypesWin32Api:
         group_count = wintypes.DWORD(0)
         cap_sids = ctypes.POINTER(wintypes.LPVOID)()
         cap_count = wintypes.DWORD(0)
-        ok = self._kernel32.DeriveCapabilitySidsFromName(
+        ok = self._security_base.DeriveCapabilitySidsFromName(
             cap_name,
             ctypes.byref(group_sids),
             ctypes.byref(group_count),

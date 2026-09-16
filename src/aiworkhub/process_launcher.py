@@ -5973,18 +5973,43 @@ class ProcessManager:
 
     @staticmethod
     def _read_regular_intent(path: Path) -> tuple[str, os.stat_result]:
-        """Read one regular intent without following or blocking on a node."""
+        """Read one regular intent without following or blocking on a node.
+
+        NF-2026-00009: this used to raise outright when ``os.O_NOFOLLOW`` was
+        absent. Windows has no such flag, so EVERY terminal-intent read failed
+        there -- and because ``record_reviewer_terminal_intent`` cannot tell
+        "unreadable" from "absent", it answered ``record_failed`` for an intent
+        that simply did not exist yet. No reservation could then be terminalized
+        and reviewer cards stayed in ``processing`` with nothing left to finish
+        the transition. Where the flag is missing the reparse point is refused
+        before the open and the exact identity is re-verified on the descriptor,
+        which closes the same check->open swap window the flag closes atomically.
+        """
 
         max_bytes = 1_048_576
         flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
         nofollow = getattr(os, "O_NOFOLLOW", None)
-        if nofollow is None:
-            raise OSError("nofollow intent reads are unavailable")
-        fd = os.open(path, flags | nofollow)
+        link_identity: os.stat_result | None = None
+        if nofollow is not None:
+            flags |= nofollow
+        else:
+            link_identity = os.lstat(path)
+            reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+            if stat.S_ISLNK(link_identity.st_mode) or (
+                reparse and getattr(link_identity, "st_file_attributes", 0) & reparse
+            ):
+                raise OSError("terminal intent is a reparse point")
+        fd = os.open(path, flags)
         try:
             opened = os.fstat(fd)
             if not stat.S_ISREG(opened.st_mode):
                 raise OSError("terminal intent is not a regular file")
+            if link_identity is not None and (
+                not opened.st_ino
+                or (opened.st_dev, opened.st_ino)
+                != (link_identity.st_dev, link_identity.st_ino)
+            ):
+                raise OSError("terminal intent identity changed while opening")
             if opened.st_size > max_bytes:
                 raise OSError("terminal intent exceeds read bound")
             with os.fdopen(fd, "r", encoding="utf-8") as handle:

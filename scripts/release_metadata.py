@@ -103,8 +103,25 @@ def check(root: Path, *, tag: str = "") -> dict[str, object]:
     }
 
 
+def _write_text_preserving_newlines(path: Path, text: str) -> None:
+    """Write ``text`` with the exact newlines it contains.
+
+    ``Path.write_text`` opens in text mode, and on Windows that translates every
+    "\\n" into "\\r\\n". Measured on this repository: one ``sync`` rewrote
+    vscode-extension/extension.js, package.json and package-lock.json from LF to
+    CRLF -- 11,332 line endings changed in extension.js alone -- which turned a
+    three-line version bump into a whole-file diff and broke a test that matches
+    the extension source with an "\\n}\\n\\nasync function" pattern. A metadata
+    projection must change the version and nothing else.
+    """
+
+    path.write_text(text, encoding="utf-8", newline="")
+
+
 def _write_json(path: Path, value: object) -> None:
-    path.write_text(json.dumps(value, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    _write_text_preserving_newlines(
+        path, json.dumps(value, indent=2, ensure_ascii=False) + "\n"
+    )
 
 
 def sync(root: Path) -> dict[str, object]:
@@ -129,7 +146,7 @@ def sync(root: Path) -> dict[str, object]:
     )
     if count != 1:
         raise ValueError("extension runtime version projection is missing or ambiguous")
-    extension_path.write_text(rewritten, encoding="utf-8")
+    _write_text_preserving_newlines(extension_path, rewritten)
     return check(root)
 
 

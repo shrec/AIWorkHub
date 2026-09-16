@@ -755,6 +755,12 @@ class FakeKernel32:
 def make_ctypes_api(kernel32):
     api = wac._CtypesWin32Api.__new__(wac._CtypesWin32Api)
     api._kernel32 = kernel32
+    # DeriveCapabilitySidsFromName is a security-base export that kernel32 does
+    # not forward, so production resolves it separately. The fake publishes the
+    # function itself, so both names bind to the same recording library and
+    # these SID-lifetime assertions keep measuring exactly what they did.
+    api._security_base = kernel32
+    api._security_base_library = "kernelbase"
     api._userenv = None
     api._advapi32 = None
     return api
@@ -885,6 +891,7 @@ class _RecordingLib:
 def test_set_handle_information_signature_is_handle_width_safe():
     api = wac._CtypesWin32Api.__new__(wac._CtypesWin32Api)
     api._kernel32 = _RecordingLib()
+    api._security_base = _RecordingLib()
     api._userenv = _RecordingLib()
     api._advapi32 = _RecordingLib()
 

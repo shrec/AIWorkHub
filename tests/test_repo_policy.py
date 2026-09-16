@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from aiworkhub import repo_policy, runtime_adapters
+from aiworkhub import repo_policy, runtime_adapters, workforce_catalog
 
 
 def _initialized_root(tmp_path: Path) -> Path:
@@ -1528,3 +1528,33 @@ def test_an_unvouched_identifier_is_emptied_rather_than_given_a_reason_token() -
     assert repo_policy.SANDBOX_CAUSE_UNRECOGNIZED not in (
         repo_policy.SANDBOX_PUBLISHABLE_BACKENDS | set(repo_policy._POLICY_ALLOWED_ADAPTERS)
     )
+
+
+def test_build_preflight_warms_the_settings_catalog_handoff(tmp_path: Path) -> None:
+    """NF-2026-... (OpenCode never appeared in model settings, take two).
+
+    workforce_catalog.cached_preflight_snapshot / _settings_preflight_
+    snapshot exist specifically so a Settings read reuses an already-built
+    preflight instead of spawning a second ``opencode models`` probe -- but
+    the write side, ``remember_preflight_snapshot``, was previously called
+    only from ``workforce_catalog.build_catalog``, which the Settings/Workforce
+    read path does not itself invoke. Measured: ``resolve_executable`` and the
+    OpenCode discovery probe both worked correctly end to end, and a fresh
+    ``build_preflight`` call already carried every discovered model in its own
+    return value -- but a Settings read taken before anything happened to call
+    ``build_catalog`` first saw an empty handoff and reported zero OpenCode
+    models regardless. ``build_preflight`` is the one place every preflight
+    consumer (the MCP tool, the dashboard, this test) ultimately returns from,
+    so warming the handoff there closes the gap regardless of call order.
+    """
+
+    root = _initialized_root(tmp_path)
+    assert workforce_catalog.cached_preflight_snapshot(root) is None
+
+    report = repo_policy.build_preflight(root)
+
+    cached = workforce_catalog.cached_preflight_snapshot(root)
+    assert cached is not None
+    cached_ids = {item["adapter_id"] for item in cached["providers"]}
+    report_ids = {item["adapter_id"] for item in report["providers"]}
+    assert cached_ids == report_ids

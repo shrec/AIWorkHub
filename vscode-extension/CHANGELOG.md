@@ -1,5 +1,70 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.48 — 2026-09-16
+
+### Fixed
+
+- OpenCode's model list in Settings was still missing many installed models
+  (nemotron and several others among them) even after last release's cache
+  fix -- the compact list shared its row budget unfairly across providers, so
+  a provider you had individually toggled models for many times before could
+  crowd out one you had barely touched yet. The budget is now large enough
+  that today's full catalog fits without crowding anyone out.
+
+## 0.11.47 — 2026-09-16
+
+### Fixed
+
+- OpenCode's model list in Settings now stays current regardless of which
+  panel you opened first -- it previously only showed installed models after
+  the Workforce view had loaded at least once in the same session.
+
+## 0.11.46 — 2026-09-16
+
+### Fixed
+
+- Windows: worker launches no longer fail with an unexplained authority-key
+  error. A freshly created key could still be refused by last release's
+  security check because nothing had hardened its permissions to match; it
+  now is, before the key is ever used.
+- Windows: OpenCode now appears in model settings when it's actually
+  installed, instead of being refused outright before it was ever looked for.
+
+## 0.11.45 — 2026-09-16
+
+### Fixed
+
+- Windows: Claude Code can now hold the manager seat. The venv launcher
+  interposes a redirector process between the MCP server and `claude.exe`;
+  identity verification now walks past that one known hop instead of refusing
+  because the direct parent process wasn't `claude.exe`.
+- Windows: native-CLI sandboxing works on capable hosts again. A required
+  security API was being looked up in the wrong system library, so every
+  Windows 11 host reported AppContainer confinement as unavailable even when
+  it wasn't.
+
+## 0.11.44 — 2026-09-15
+
+### Fixed
+
+- Windows: creating a task no longer stalls. A child process that inherited the
+  MCP server's JSON-RPC stdin pipe hung before running its own first
+  instruction, so every `git` the coordinator ran burned its whole timeout and
+  `aiworkhub_task_create` appeared frozen — it now answers in 0.09 s instead of
+  120 s.
+- Windows: installed tools are measured again. Node and Ruff reported empty
+  version facts, so a card requiring `node>=20.0.0` and `ruff>=0.12` was refused
+  as unwinnable on a machine that had Node v22.16.0 and Ruff 0.16.1.
+- Windows: the authority key is protected properly. It no longer follows a
+  symlink, and its owner and ACL are checked against the security descriptor of
+  the open file rather than trusted unconditionally.
+- Windows: the reconciler heartbeat is readable again, so health reports stop
+  showing a durable status that is present as missing.
+- Windows: reviewer cards no longer stay stuck in `processing` — every terminal
+  intent read failed, so no reservation could ever be completed.
+- Windows: connecting a repository works again. A valid project manifest was
+  read as unreadable because Node reports no device for a path it can open.
+
 ## 0.11.43 — 2026-09-15
 
 ### Added

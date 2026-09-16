@@ -7262,8 +7262,16 @@ def test_crash_retry_packet_carries_unsanitized_diagnostics_and_hashes_delivered
     long_token = "SECRET" + "x" * 80
     stdout_text = f"<step> a & b {long_token}\n"
     stderr_text = f'trace <b>"boom"</b> {long_token}\n'
-    (process_dir / f"{predecessor}.stdout.log").write_text(stdout_text, encoding="utf-8")
-    (process_dir / f"{predecessor}.stderr.log").write_text(stderr_text, encoding="utf-8")
+    # NF-2026-00014: ``write_text`` translates "\n" to "\r\n" on Windows, so the
+    # fixture wrote different bytes than it asserted and the verbatim-tail check
+    # failed on a fixture artefact. The packet's job is to deliver the log bytes
+    # unchanged, so the fixture must write exactly the bytes it claims to.
+    (process_dir / f"{predecessor}.stdout.log").write_text(
+        stdout_text, encoding="utf-8", newline=""
+    )
+    (process_dir / f"{predecessor}.stderr.log").write_text(
+        stderr_text, encoding="utf-8", newline=""
+    )
     overlay = {
         "predecessor_request_id": predecessor,
         "predecessor_task_id": "TASK_SAME",
@@ -9637,7 +9645,17 @@ def test_worker_launch_env_routes_tmpdir_at_request_owned_authority(tmp_path):
     assert "worktree" not in parts
     # Provisioned before spawn: a real 0700 directory the child can write to.
     assert tmp.is_dir()
-    assert tmp.stat().st_mode & 0o777 == 0o700
+    # NF-2026-00009: "0700" is a POSIX MODE answer. Windows synthesises 0o777
+    # for every directory and expresses privacy through ACLs instead, which is
+    # exactly what ``directory_privacy_backend()`` exists to say. Assert the
+    # mode only where the host actually carries one.
+    from aiworkhub import platform_io as _platform_io
+
+    if (
+        _platform_io.directory_privacy_backend()
+        == _platform_io.DIRECTORY_PRIVACY_BACKEND_POSIX_MODE
+    ):
+        assert tmp.stat().st_mode & 0o777 == 0o700
     # The sanitized allowlist is untouched: a request-scoped HOME survives and
     # launch/credential authority never leaks into the child.
     assert env["HOME"]

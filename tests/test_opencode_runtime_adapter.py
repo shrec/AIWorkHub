@@ -175,27 +175,72 @@ def test_opencode_model_without_provider_identity_fails_closed(
     )
 
 
-def test_opencode_windows_resolution_fails_closed_without_shell(
+def test_opencode_windows_resolves_through_the_same_path_as_every_adapter(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    """Windows OpenCode resolution is no longer a blanket refusal.
+
+    Measured live: on a real Windows host with OpenCode installed the normal
+    way (``npm install -g opencode-ai``), ``shutil.which("opencode")`` already
+    resolves the generated ``opencode.cmd`` shim correctly -- the exact same
+    mechanism every other Windows-supported adapter (``codex_cli``,
+    ``grok_kilo_cli``) already relies on. The unconditional
+    ``adapter_id == OPENCODE_CLI_ADAPTER and _is_windows_host()`` refusal ran
+    BEFORE that generic path ever got a chance, so a perfectly installed,
+    PATH-resolvable OpenCode never appeared as a model-settings route on
+    Windows at all. No new Windows-specific trust logic is introduced here:
+    this asserts OpenCode now falls through to the same ``is_file`` /
+    ``os.access(X_OK)`` verification every other adapter is already trusted
+    to pass.
+    """
+
     monkeypatch.setattr(runtime_adapters, "_is_windows_host", lambda: True)
+    executable = _executable(tmp_path, "opencode")
     called = []
 
     def _which(binary: str) -> str | None:
         called.append(binary)
-        return str(tmp_path / "opencode.exe")
+        return str(executable)
 
     monkeypatch.setattr(runtime_adapters.shutil, "which", _which)
+
+    resolution = runtime_adapters.resolve_executable(runtime_adapters.OPENCODE_CLI_ADAPTER)
+
+    assert called, "resolution must actually attempt shutil.which on Windows now"
+    assert resolution.ok is True
+    assert resolution.executable == str(executable)
+    assert resolution.reason == ""
+
+
+def test_opencode_windows_respects_an_explicit_executable_override(
+    tmp_path: Path,
+) -> None:
+    """An administrator-supplied override must not be refused sight unseen."""
+
     resolution = runtime_adapters.resolve_executable(
         runtime_adapters.OPENCODE_CLI_ADAPTER,
         executable_overrides={
             runtime_adapters.OPENCODE_CLI_ADAPTER: _executable(tmp_path, "opencode")
         },
     )
+
+    assert resolution.ok is True
+    assert resolution.executable == str(Path(sys.executable).resolve())
+
+
+def test_opencode_windows_still_fails_closed_when_nothing_is_installed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The generic contract is preserved: no OpenCode on PATH is still refused."""
+
+    monkeypatch.setattr(runtime_adapters, "_is_windows_host", lambda: True)
+    monkeypatch.setattr(runtime_adapters.shutil, "which", lambda _binary: None)
+
+    resolution = runtime_adapters.resolve_executable(runtime_adapters.OPENCODE_CLI_ADAPTER)
+
     assert resolution.ok is False
     assert resolution.executable is None
-    assert resolution.reason == runtime_adapters.OPENCODE_WINDOWS_RESOLUTION_FAIL_CLOSED
-    assert called == []
+    assert resolution.reason == "executable not found: opencode"
 
 
 def test_opencode_linux_snap_bin_is_used_when_path_lookup_misses(

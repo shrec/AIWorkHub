@@ -35,6 +35,77 @@ from aiworkhub import core, repository_bootstrap, server, source_graph, source_g
 
 
 @pytest.fixture(autouse=True)
+def posix_killpg_seam(monkeypatch):
+    """Publish the POSIX seam these tests patch, on hosts that lack it.
+
+    NF-2026-00009: ``os.killpg`` does not exist on Windows, so every
+    ``monkeypatch.setattr(source_graph_daemon.os, "killpg", ...)`` raised
+    AttributeError and 11 POSIX-contract tests failed for a reason that says
+    nothing about the contract under test.
+
+    The daemon resolves killpg at call time via
+    ``getattr(os, "killpg", None)`` and only reaches it on the POSIX branch
+    (``is_windows(platform_name)`` decides, and those tests inject the platform),
+    so publishing a FAIL-CLOSED placeholder changes no Windows behaviour: a test
+    that drives the POSIX branch installs its own, and one that does not can only
+    ever raise here. ``monkeypatch`` removes the attribute again after each test,
+    so nothing leaks into another module.
+    """
+
+    if not hasattr(os, "killpg"):
+
+        def _killpg_unavailable(pgid: int, sig: int) -> None:
+            raise OSError("os.killpg is unavailable on this host")
+
+        monkeypatch.setattr(os, "killpg", _killpg_unavailable, raising=False)
+    if not hasattr(signal, "SIGKILL"):
+        # Same seam for the escalation signal these POSIX assertions name.
+        # ``platform_io._POSIX_SIGKILL`` already resolves to the invariant POSIX
+        # value 9 on this host, so the assertions compare against exactly what
+        # production sends -- publishing it changes no behaviour, it only makes
+        # the POSIX contract nameable from a host whose signal module lacks it.
+        monkeypatch.setattr(signal, "SIGKILL", 9, raising=False)
+
+
+# NF-2026-00009: these tests assert the POSIX CROSS-INSTANCE identity contract
+# -- /proc start identity, owned process groups, killpg escalation. Windows
+# answers ``_cross_instance_identity_supported()`` False and routes to
+# ``_recover_dead_windows_build_identity`` instead, so on Windows every one of
+# them exercised the wrong branch and failed for a reason that said nothing
+# about the contract. They are named here rather than each taking a fixture
+# argument so the set of POSIX-contract tests stays visible in one place; the
+# Windows-branch tests in this module deliberately are NOT in it.
+_POSIX_BRANCH_CONTRACT_TESTS = frozenset(
+    {
+        "test_failed_retained_stop_restores_buildable_identity",
+        "test_failed_stop_rollback_does_not_overwrite_newer_owner",
+        "test_stop_transition_cas_preserves_replacement_owner",
+        "test_mismatched_retained_leader_never_authorizes_group_signal",
+        "test_dead_retained_leader_escalates_authenticated_surviving_tree",
+        "test_retained_stop_revalidates_owned_group_immediately_before_signal",
+        "test_identity_publish_failure_reaps_through_exact_owner_handle",
+        "test_drain_after_stop_force_signals_only_live_leader_posix",
+        "test_drain_after_stop_never_signals_reaped_leader_posix",
+        "test_posix_and_macos_stop_signals_exact_owned_process_group",
+    }
+)
+
+
+@pytest.fixture(autouse=True)
+def posix_branch_host(request, monkeypatch):
+    """Select the POSIX branch for the POSIX-contract tests, on any host."""
+
+    if request.node.name.partition("[")[0] not in _POSIX_BRANCH_CONTRACT_TESTS:
+        return
+    monkeypatch.setattr(
+        source_graph_daemon, "_cross_instance_identity_supported", lambda: True
+    )
+    monkeypatch.setattr(
+        source_graph_daemon.platform_io, "is_windows", lambda *_a, **_k: False
+    )
+
+
+@pytest.fixture(autouse=True)
 def in_process_builds_for_monkeypatches(monkeypatch):
     """Keep unit-test monkeypatches in-process.
 
@@ -1188,6 +1259,19 @@ def _procfs_available() -> bool:
     return os.path.isdir("/proc/self")
 
 
+def _proc_stat_state(pid: int) -> str | None:
+    """The procfs state letter for ``pid``, or ``None`` when it has no entry.
+
+    Split out from ``_terminated`` so the procfs CONTRACT can be driven from any
+    host (NF-2026-00009): faking only ``_procfs_available`` left the real
+    ``open("/proc/<pid>/stat")`` behind it, which on Windows raised
+    FileNotFoundError for a LIVE pid and reported it as gone.
+    """
+
+    with open(f"/proc/{pid}/stat", encoding="ascii") as handle:
+        return handle.read().rsplit(")", 1)[1].split()[0]
+
+
 def _terminated(pid: int) -> bool:
     """True when ``pid`` is gone or a not-yet-reaped zombie (i.e. dead).
 
@@ -1205,14 +1289,13 @@ def _terminated(pid: int) -> bool:
     if not _procfs_available():
         return not _alive(pid)
     try:
-        with open(f"/proc/{pid}/stat", encoding="ascii") as handle:
-            state = handle.read().rsplit(")", 1)[1].split()[0]
-        return state == "Z"
+        state = _proc_stat_state(pid)
     except FileNotFoundError:
         # Procfs is present but this PID has no entry -> it is gone.
         return True
     except OSError:
         return not _alive(pid)
+    return state is None or state == "Z"
 
 
 def _tree_probe_script(pidfile: Path) -> str:
@@ -1528,11 +1611,26 @@ def test_exited_group_leader_pipe_inheriting_grandchild(
         daemon._drain_after_stop(proc, proc.pid)
 
 
-def test_new_process_group_popen_kwargs_is_platform_appropriate(monkeypatch):
-    monkeypatch.setattr(source_graph_daemon.os, "name", "posix")
+def test_new_process_group_popen_kwargs_is_platform_appropriate():
+    # NF-2026-00009: this used to patch ``source_graph_daemon.os.name`` to
+    # "posix", but the kwargs come from
+    # ``platform_io.process_group_launch_kwargs()``, which decides on
+    # ``is_windows(platform_name)`` and never reads ``os.name``. The patch
+    # therefore changed nothing, and on Windows the test asserted the POSIX
+    # answer against the correct Windows one. Drive the real seam instead, so
+    # BOTH platform answers are asserted from either host.
+    platform_io = source_graph_daemon.platform_io
+    assert platform_io.process_group_launch_kwargs("linux") == {"start_new_session": True}
+    assert platform_io.process_group_launch_kwargs("macos") == {"start_new_session": True}
+    windows_kwargs = platform_io.process_group_launch_kwargs("windows")
+    assert set(windows_kwargs) == {"creationflags"}
+    assert windows_kwargs["creationflags"] == getattr(
+        subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200
+    )
+    # And the daemon publishes the answer for the host it is actually running on.
     assert (
         source_graph_daemon.SourceGraphDaemon._new_process_group_popen_kwargs()
-        == {"start_new_session": True}
+        == platform_io.process_group_launch_kwargs()
     )
 
 
@@ -1894,6 +1992,7 @@ def test_stop_transition_cas_preserves_replacement_owner(tmp_path, monkeypatch):
     assert source_graph_daemon._read_build_identity(root) == newer
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process-group build spawn")
 def test_standby_builder_cannot_replace_or_clear_live_writer_identity(
     tmp_path, monkeypatch,
 ):
@@ -2198,6 +2297,7 @@ def test_stop_uses_exact_owner_handle_when_stopping_fence_write_fails(
     assert terminated == [owned]
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process-group build spawn")
 def test_dead_stale_identity_is_atomically_replaced_before_child_continues(
     tmp_path, monkeypatch,
 ):
@@ -2237,6 +2337,28 @@ def test_dead_stale_identity_is_atomically_replaced_before_child_continues(
     assert source_graph_daemon._read_build_identity(root) is None
 
 
+def _assert_owner_only(path: Path) -> None:
+    """Assert "only the owner can read this" in the host's own vocabulary.
+
+    NF-2026-00009: Windows synthesises ``0o666`` for every writable file, so the
+    POSIX mode assertion could never hold there and said nothing about privacy.
+    The equivalent Windows question -- owner plus DACL -- is asked of an open
+    descriptor, which is also immune to a pathname race.
+    """
+
+    if os.name == "nt":
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+        try:
+            trusted, reason = source_graph_daemon.platform_io.windows_descriptor_secret_trust(
+                descriptor
+            )
+        finally:
+            os.close(descriptor)
+        assert trusted, f"{path} is not owner-only: {reason}"
+        return
+    assert path.stat().st_mode & 0o777 == 0o600
+
+
 def test_build_identity_publications_are_owner_only_under_permissive_umask(tmp_path):
     root = _init_repo(tmp_path, "private_build_identity")
     path = source_graph_daemon._build_identity_path(root)
@@ -2247,13 +2369,13 @@ def test_build_identity_publications_are_owner_only_under_permissive_umask(tmp_p
     previous_umask = os.umask(0)
     try:
         source_graph_daemon._write_build_identity(root, first)
-        assert path.stat().st_mode & 0o777 == 0o600
+        _assert_owner_only(path)
         path.unlink()
         assert source_graph_daemon._publish_build_identity_if_unowned(root, first)
-        assert path.stat().st_mode & 0o777 == 0o600
+        _assert_owner_only(path)
         second = {**first, "state": "stopping"}
         assert source_graph_daemon._compare_and_write_build_identity(root, first, second)
-        assert path.stat().st_mode & 0o777 == 0o600
+        _assert_owner_only(path)
     finally:
         os.umask(previous_umask)
 
@@ -2564,13 +2686,30 @@ def test_terminated_without_procfs_falls_back_to_exact_pid_liveness(monkeypatch)
 
 def test_terminated_on_procfs_host_reports_missing_pid_entry_as_gone(monkeypatch):
     """Procfs present but PID entry absent -> gone; a live entry -> not gone."""
+    # NF-2026-00009: faking only ``_procfs_available`` left the REAL
+    # ``open("/proc/<pid>/stat")`` behind it, so on a host without procfs a live
+    # PID raised FileNotFoundError and was reported gone. Simulate the procfs
+    # HOST -- availability and entries together -- so the contract is asserted
+    # deterministically from any platform.
+    live_pid = os.getpid()
+    entries: dict[int, str] = {live_pid: "R"}
+
+    def _fake_stat_state(pid: int) -> str:
+        if pid not in entries:
+            raise FileNotFoundError(f"/proc/{pid}/stat")
+        return entries[pid]
+
     monkeypatch.setattr(_THIS_MODULE, "_procfs_available", lambda: True)
+    monkeypatch.setattr(_THIS_MODULE, "_proc_stat_state", _fake_stat_state)
 
     # An impossible/never-allocated PID has no ``/proc`` entry on a procfs
     # host, which is an unambiguous "gone" -- FileNotFoundError means absent.
     assert _terminated(2**31 - 1) is True
-    # The running test process itself has a live, non-zombie ``/proc`` entry.
-    assert _terminated(os.getpid()) is False
+    # A live, non-zombie ``/proc`` entry is NOT terminated.
+    assert _terminated(live_pid) is False
+    # A not-yet-reaped zombie still has an entry, and is terminated.
+    entries[live_pid] = "Z"
+    assert _terminated(live_pid) is True
 
 
 def test_procfs_available_matches_this_host():

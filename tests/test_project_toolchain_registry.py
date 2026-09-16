@@ -551,3 +551,158 @@ def test_persisted_snapshot_requires_matching_card_contract_identity(
     ).evaluate({"validation": [], "read_first": ["b.py"]})
 
     assert second.cache_identity != first.cache_identity
+
+
+def _dash_m_registry(minimum: str = "0.12") -> dict[str, object]:
+    return {
+        "schema_id": toolchain_authority.REGISTRY_SCHEMA_ID,
+        "version": 1,
+        "baseline": ["ruff"],
+        "tools": {
+            "ruff": {
+                "candidates": [{"executable": "python", "args": ["-m", "ruff"]}],
+                "minimum_version": minimum,
+            }
+        },
+        "sandbox_capabilities": ["validation_subprocess"],
+    }
+
+
+def _stub_dash_m_probes(
+    monkeypatch: pytest.MonkeyPatch, *, module_version: str
+) -> list[tuple[str, str]]:
+    from aiworkhub import worker_workspace
+
+    calls: list[tuple[str, str]] = []
+
+    monkeypatch.setattr(
+        worker_workspace,
+        "_normalize_trusted_validation_executable_argv_with_roots",
+        lambda argv, _repo: ([sys.executable, *argv[1:]], ()),
+    )
+    monkeypatch.setattr(
+        worker_workspace,
+        "trusted_validation_executable_version",
+        lambda *args, **kwargs: "Python 3.12.4",
+    )
+
+    def module_probe(resolved: str, module: str) -> str:
+        calls.append((resolved, module))
+        return module_version
+
+    monkeypatch.setattr(
+        worker_workspace, "trusted_validation_module_version", module_probe
+    )
+    return calls
+
+
+def test_dash_m_candidate_records_the_module_version_not_the_interpreter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # NF-2026-00010: the fact came from argv[0], so "python -m ruff" recorded
+    # "Python 3.12.4" and compared the INTERPRETER against Ruff's minimum.
+    _write_registry(tmp_path, _dash_m_registry())
+    calls = _stub_dash_m_probes(monkeypatch, module_version="ruff 0.16.1")
+    authority = toolchain_authority.ToolchainAuthority(
+        tmp_path, capability_probe=lambda _repo, _card: ()
+    )
+
+    snapshot = authority.evaluate({"validation": []})
+
+    assert snapshot.available
+    assert [fact.version_fact for fact in snapshot.executables] == ["ruff 0.16.1"]
+    assert calls == [(sys.executable, "ruff")]
+
+
+def test_outdated_dash_m_module_is_still_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_registry(tmp_path, _dash_m_registry())
+    _stub_dash_m_probes(monkeypatch, module_version="ruff 0.9.0")
+    authority = toolchain_authority.ToolchainAuthority(
+        tmp_path, capability_probe=lambda _repo, _card: ()
+    )
+
+    snapshot = authority.evaluate({"validation": []})
+
+    assert not snapshot.available
+    assert [(item.kind, item.value) for item in snapshot.missing] == [
+        ("version", "ruff>=0.12")
+    ]
+
+
+def test_unmeasurable_dash_m_module_is_still_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # An empty fact must keep refusing: the fix restores real measurement, it
+    # does not let an unmeasurable tool through.
+    _write_registry(tmp_path, _dash_m_registry())
+    _stub_dash_m_probes(monkeypatch, module_version="")
+    authority = toolchain_authority.ToolchainAuthority(
+        tmp_path, capability_probe=lambda _repo, _card: ()
+    )
+
+    snapshot = authority.evaluate({"validation": []})
+
+    assert not snapshot.available
+    assert [(item.kind, item.value) for item in snapshot.missing] == [
+        ("version", "ruff>=0.12")
+    ]
+
+
+def test_node_and_ruff_minimums_are_winnable_with_installed_versions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Measured reproduction of NF-2026-00010: node>=20.0.0 and ruff>=0.12 were
+    # refused as task_contract_unwinnable on a host with Node v22.16.0 and
+    # Ruff 0.16.1, because both facts were recorded empty.
+    from aiworkhub import worker_workspace
+
+    node = _versioned_executable(tmp_path / "bin" / "node", "v22.16.0")
+    ruff = _versioned_executable(tmp_path / "bin" / "ruff", "ruff 0.16.1")
+    _write_registry(
+        tmp_path,
+        {
+            "schema_id": toolchain_authority.REGISTRY_SCHEMA_ID,
+            "version": 1,
+            "baseline": ["node", "ruff"],
+            "tools": {
+                "node": {
+                    "candidates": [{"executable": "node"}],
+                    "minimum_version": "20.0.0",
+                },
+                "ruff": {
+                    "candidates": [{"executable": "ruff"}],
+                    "minimum_version": "0.12",
+                },
+            },
+            "sandbox_capabilities": ["validation_subprocess"],
+        },
+    )
+    resolved = {"node": str(node), "ruff": str(ruff)}
+    versions = {
+        str(node.resolve()): "v22.16.0",
+        str(ruff.resolve()): "ruff 0.16.1",
+    }
+    monkeypatch.setattr(
+        worker_workspace,
+        "_normalize_trusted_validation_executable_argv_with_roots",
+        lambda argv, _repo: ([resolved[argv[0]], *argv[1:]], ()),
+    )
+    monkeypatch.setattr(
+        worker_workspace,
+        "trusted_validation_executable_version",
+        lambda target, *args, **kwargs: versions[str(Path(target).resolve())],
+    )
+    authority = toolchain_authority.ToolchainAuthority(
+        tmp_path, capability_probe=lambda _repo, _card: ()
+    )
+
+    snapshot = authority.evaluate({"validation": []})
+
+    assert snapshot.available
+    assert snapshot.missing == ()
+    assert sorted(fact.version_fact for fact in snapshot.executables) == [
+        "ruff 0.16.1",
+        "v22.16.0",
+    ]

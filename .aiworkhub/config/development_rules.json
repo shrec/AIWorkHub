@@ -1045,7 +1045,7 @@
       {
         "path": "src/aiworkhub/core.py",
         "pattern": "parallel_implementation",
-        "count": 3
+        "count": 1
       },
       {
         "path": "src/aiworkhub/dashboard.py",
@@ -1281,8 +1281,8 @@
     "measurement": {
       "reference_commit": "a86934dbfcca6389595c5e0fa5cbbf74e9537fb4",
       "reference_total": 119,
-      "current_total": 115,
-      "accepted_predecessor_delta": -4
+      "current_total": 113,
+      "accepted_predecessor_delta": -6
     }
   }
 }
