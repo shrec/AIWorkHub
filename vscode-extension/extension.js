@@ -696,9 +696,18 @@ function readRepositoryManifestInfo(root, label) {
     try {
       descriptor = fs.openSync(manifestPath, fs.constants.O_RDONLY | noFollow);
       const openedStat = fs.fstatSync(descriptor);
+      // NF-2026-00008: on Windows Node reports lstat().dev as 0 while
+      // fstat().dev carries the real volume serial, so comparing the two
+      // strictly declared every VALID manifest "manifest-unreadable" and no
+      // repository could bind. A dev of 0 means "this platform did not report a
+      // device", not "a different volume". The inode -- the NTFS file index
+      // here -- must still match exactly, and a zero/absent inode is refused,
+      // so the identity binding is never weakened, only stated correctly.
+      const devicesComparable = openedStat.dev !== 0 && manifestStat.dev !== 0;
       if (
         !openedStat.isFile()
-        || openedStat.dev !== manifestStat.dev
+        || !openedStat.ino
+        || (devicesComparable && openedStat.dev !== manifestStat.dev)
         || openedStat.ino !== manifestStat.ino
       ) {
         operationFailed = true;

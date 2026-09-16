@@ -1129,3 +1129,159 @@ def test_run_validations_bare_pytest_executes_trusted_repo_interpreter(
     assert result[0]["argv_rewritten"] is True
     assert captured["argv"] == expected
     assert captured["shell"] is False
+
+
+def _no_secure_lane(monkeypatch: pytest.MonkeyPatch) -> None:
+    def unavailable() -> str:
+        raise worker_workspace.WorkspaceError(
+            "windows_appcontainer_sandbox_unavailable:win32_appcontainer_unavailable"
+        )
+
+    monkeypatch.setattr(worker_workspace, "select_sandbox_backend", unavailable)
+
+
+def _capture_direct_probe(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    stdout: str = "tool 9.9.9\n",
+    returncode: int = 0,
+) -> dict[str, object]:
+    captured: dict[str, object] = {}
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = list(argv)
+        captured["kwargs"] = kwargs
+        return subprocess.CompletedProcess(argv, returncode, stdout, "")
+
+    monkeypatch.setattr(worker_workspace.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        worker_workspace,
+        "sanitized_env",
+        lambda *args, **kwargs: {"PATH": "/usr/bin:/bin", "PYTHONPATH": "/attacker"},
+    )
+    monkeypatch.setattr(
+        worker_workspace,
+        "sandbox_argv",
+        lambda *args, **kwargs: pytest.fail("this host has no sandbox lane to use"),
+    )
+    return captured
+
+
+def test_version_probe_measures_directly_when_no_secure_lane_exists(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # NF-2026-00010: Windows has neither bubblewrap nor Landlock, and returning
+    # the empty fact there recorded every installed tool as version-less.
+    executable = _executable(tmp_path / "bin" / "tool")
+    _no_secure_lane(monkeypatch)
+    captured = _capture_direct_probe(monkeypatch)
+
+    assert (
+        worker_workspace.trusted_validation_executable_version(str(executable))
+        == "tool 9.9.9"
+    )
+    assert captured["argv"] == [str(executable.resolve()), "--version"]
+
+
+def test_version_probe_measures_directly_on_editor_hosted_backend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executable = _executable(tmp_path / "bin" / "tool")
+    monkeypatch.setattr(
+        worker_workspace,
+        "select_sandbox_backend",
+        lambda: worker_workspace.VSCODE_LM_IN_PROCESS_BACKEND,
+    )
+    captured = _capture_direct_probe(monkeypatch)
+
+    assert (
+        worker_workspace.trusted_validation_executable_version(str(executable))
+        == "tool 9.9.9"
+    )
+    assert captured["argv"] == [str(executable.resolve()), "--version"]
+
+
+def test_direct_version_probe_is_shell_free_path_bound_and_time_limited(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executable = _executable(tmp_path / "bin" / "tool")
+    _no_secure_lane(monkeypatch)
+    captured = _capture_direct_probe(monkeypatch)
+
+    worker_workspace.trusted_validation_executable_version(str(executable))
+
+    kwargs = captured["kwargs"]
+    assert kwargs["shell"] is False
+    assert kwargs["timeout"] == 5
+    assert Path(captured["argv"][0]).is_absolute()
+    # The probe must not inherit an import path that could shadow a validator.
+    assert "PYTHONPATH" not in kwargs["env"]
+    assert kwargs["cwd"] != str(tmp_path)
+
+
+def test_direct_version_probe_stays_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executable = _executable(tmp_path / "bin" / "tool")
+    _no_secure_lane(monkeypatch)
+    _capture_direct_probe(monkeypatch, returncode=1)
+
+    assert worker_workspace.trusted_validation_executable_version(str(executable)) == ""
+
+    _no_secure_lane(monkeypatch)
+    _capture_direct_probe(monkeypatch, stdout="   \n")
+
+    assert worker_workspace.trusted_validation_executable_version(str(executable)) == ""
+
+
+def test_direct_version_probe_refuses_a_missing_executable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _no_secure_lane(monkeypatch)
+    monkeypatch.setattr(
+        worker_workspace.subprocess,
+        "run",
+        lambda *args, **kwargs: pytest.fail("a missing tool must never be probed"),
+    )
+
+    assert (
+        worker_workspace.trusted_validation_executable_version(
+            str(tmp_path / "bin" / "absent")
+        )
+        == ""
+    )
+
+
+def test_module_version_probe_reports_the_module_not_the_interpreter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The running interpreter answers its own ``--version`` from sys.version_info,
+    # but ``-m ruff`` asks about Ruff and must still be measured (NF-2026-00010).
+    _no_secure_lane(monkeypatch)
+    captured = _capture_direct_probe(monkeypatch, stdout="ruff 0.16.1\n")
+
+    assert (
+        worker_workspace.trusted_validation_module_version(sys.executable, "ruff")
+        == "ruff 0.16.1"
+    )
+    assert captured["argv"][1:] == ["-I", "-m", "ruff", "--version"]
+
+
+def test_module_version_probe_refuses_a_malformed_module(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        worker_workspace.subprocess,
+        "run",
+        lambda *args, **kwargs: pytest.fail("a malformed module must never be probed"),
+    )
+
+    assert worker_workspace.trusted_validation_module_version(sys.executable, "") == ""
+    assert (
+        worker_workspace.trusted_validation_module_version(sys.executable, "ruff check")
+        == ""
+    )
+    assert (
+        worker_workspace.trusted_validation_module_version(sys.executable, "-mruff")
+        == ""
+    )

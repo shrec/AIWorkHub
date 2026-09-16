@@ -1335,7 +1335,7 @@ def build_preflight(repo_root: Path | str, adapter_id: str | None = None) -> dic
     warnings = list(degraded_reasons)
     if finalization_pending:
         warnings.append("worker_finalization_probe_pending")
-    return {
+    result = {
         "ok": not unique_errors and not finalization_pending,
         "schema_id": PREFLIGHT_SCHEMA_ID,
         "status": (
@@ -1569,6 +1569,23 @@ def build_preflight(repo_root: Path | str, adapter_id: str | None = None) -> dic
         },
         "selected_adapter": selected,
     }
+    # NF-2026-00... (OpenCode model discovery never reached settings):
+    # ``workforce_catalog.cached_preflight_snapshot`` / ``_settings_preflight_
+    # snapshot`` exist specifically to reuse THIS build so a settings read
+    # never spawns a second ``opencode models`` probe -- but nothing ever
+    # called the write side, ``remember_preflight_snapshot``, from production
+    # code. Measured: ``resolve_executable`` and ``_list_opencode_models``
+    # both discovered every OpenCode model correctly when called directly, and
+    # a fresh ``build_preflight`` call here also carries them in
+    # ``result["providers"]`` -- but ``aiworkhub_dashboard_settings`` kept
+    # reporting zero OpenCode models regardless, because the snapshot it reads
+    # was never written. This is the one place ``build_preflight`` always
+    # returns from, so remembering it here reaches every caller, including the
+    # ``environment_preflight`` MCP tool.
+    from . import workforce_catalog
+
+    workforce_catalog.remember_preflight_snapshot(root, result)
+    return result
 
 
 # ---------------------------------------------------------------------------

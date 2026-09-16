@@ -1331,9 +1331,24 @@ def test_read_status_rejects_symlink_and_insecure_mode(tmp_path):
     assert task_reconciler.read_status(tmp_path) == {}
 
     target.unlink()
-    fd = os.open(target, os.O_CREAT | os.O_WRONLY, 0o666)
-    os.write(fd, b'{"ok": true}')
-    os.close(fd)
+    # NF-2026-00012: "insecure" is a MODE on POSIX and an ACL on Windows, where
+    # 0o666 is what every writable file reports and exposes nothing. Create the
+    # exposure this host can actually have, and refuse to assert when it cannot.
+    if os.name == "nt":
+        import subprocess
+
+        target.write_bytes(b'{"ok": true}')
+        exposed = subprocess.run(
+            ["icacls", str(target), "/grant", "*S-1-1-0:(R)"],
+            capture_output=True,
+            check=False,
+        )
+        if exposed.returncode != 0:
+            pytest.skip("validation_unsupported_in_sandbox:cannot_expose_status")
+    else:
+        fd = os.open(target, os.O_CREAT | os.O_WRONLY, 0o666)
+        os.write(fd, b'{"ok": true}')
+        os.close(fd)
     assert task_reconciler.read_status(tmp_path) == {}
 
 

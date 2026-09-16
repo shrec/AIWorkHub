@@ -6,6 +6,119 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.48] - 2026-09-16
+
+### Fixed
+
+- OpenCode's Settings model list still dropped newly-discovered models (the
+  `nemotron`, `ling`, `mimo` and `muse-spark` variants among them) even after
+  0.11.47 fixed the discovery cache handoff: the compact catalog row budget
+  (64) was shared unfairly across providers, because every model a repository
+  owner had ever individually toggled in `.aiworkhub/config/models.json` was
+  treated as a reserved, priority row before any per-provider fair share ran.
+  Copilot's long history of individually-toggled `vscode_lm` models consumed
+  nearly the whole budget, starving OpenCode's largely-undeclared catalog down
+  to a fraction of its real size. `MAX_MODEL_POLICY_CATALOG_ROWS` is raised
+  from 64 to 128, comfortably inside the existing 256 ceiling, so today's
+  catalog fits without truncation.
+
+## [0.11.47] - 2026-09-16
+
+### Fixed
+
+- OpenCode's model settings still under-reported what was actually installed,
+  even after 0.11.46 fixed executable resolution: `remember_preflight_snapshot`
+  -- the write side of the cache Settings reuses so it never spawns a second
+  `opencode models` probe -- was only ever called from the Workforce catalog
+  builder, which the Settings read path does not itself invoke. A Settings
+  read taken before the Workforce view had run once therefore always saw an
+  empty cache and reported zero OpenCode models, regardless of how many were
+  actually installed. `build_preflight` now warms that cache itself, so any
+  preflight read -- Settings, Workforce, or the `environment_preflight` tool
+  -- keeps it current regardless of call order.
+
+## [0.11.46] - 2026-09-16
+
+### Fixed
+
+- Windows: a fresh, correctly-created terminal-authority key could still be
+  refused by the read-side trust check landed in 0.11.44, because the create
+  path never hardened the key's DACL and it kept inheriting whatever the
+  parent runtime directory already granted. Measured live on this host: the
+  create path reproduced the identical refusal after deleting and recreating
+  the key, blocking every worker launch. The create path now applies a
+  protected, owner-only DACL (granting the token USER and token OWNER SIDs,
+  so an elevation change never locks the same account out) before the key is
+  ever readable, and a refusal for an existing key now names the specific
+  reason instead of an unexplained dead end.
+- Windows: OpenCode never appeared as a model-settings route, even when
+  correctly installed, because executable resolution refused it outright on
+  every Windows host before ever attempting `shutil.which` -- including when
+  an administrator supplied an explicit executable override. OpenCode now
+  resolves through the exact same path already trusted for `codex_cli` and
+  the other Windows-supported adapters.
+
+## [0.11.45] - 2026-09-16
+
+### Fixed
+
+- Windows: Claude Code could never hold the repository's manager seat. The
+  verification read only the MCP server's direct parent process, but a Windows
+  venv's `Scripts\python.exe` is a redirector that re-executes the base
+  interpreter as a separate process, so the server's real parent was always
+  that stub rather than `claude.exe`. Measured on this host: server pid 2652
+  &lt;- venv-stub pid 38272 &lt;- pid 29612 (`claude.exe`, whose session descriptor
+  validated cleanly). The check now walks the full ancestry through one native
+  Toolhelp snapshot, skipping only this interpreter's own re-exec hop under the
+  same user, and still requires one exact `claude` ancestor with a valid,
+  repository-bound session descriptor.
+- Windows: native-CLI sandboxing (AppContainer confinement for `claude_cli`,
+  `codex_cli` and the other native adapters) reported
+  `windows_appcontainer_sandbox_unavailable` on every capable Windows 11 host.
+  `DeriveCapabilitySidsFromName` is a security-base export that `kernel32.dll`
+  does not forward, and the probe was looking it up there; it is now resolved
+  from `kernelbase.dll` (falling back through the documented API sets), where
+  Windows actually publishes it.
+
+## [0.11.44] - 2026-09-15
+
+### Fixed
+
+- Windows: a child process that inherited the MCP server's JSON-RPC stdin pipe
+  hung before executing its own first instruction, so every `git` the
+  coordinator ran burned its whole timeout. `git ls-files -z` inside
+  `repository_tracked_paths` spent its full 120 s budget and
+  `aiworkhub_task_create` looked like it had stalled, while the create path
+  itself answers in 0.16 s. The server now detaches descriptor 0 to the null
+  device at startup and keeps a private, non-inheritable reader for the
+  protocol stream: task creation went from 120.08 s to 0.09 s. This also closes
+  a platform-independent hazard, since a child holding the request pipe could
+  consume JSON-RPC bytes addressed to the server.
+- Windows: the toolchain authority recorded an empty version fact for every
+  installed tool, because no secure sandbox lane exists there to probe through.
+  A card declaring `node>=20.0.0` and `ruff>=0.12` was refused as
+  `task_contract_unwinnable` on a host carrying Node v22.16.0 and Ruff 0.16.1.
+  Version facts are now measured with a shell-free, path-bound, time-limited
+  probe, and `python -m <validator>` reports the validator's version instead of
+  the interpreter's.
+- Windows: the terminal-authority HMAC key followed a symlink and skipped the
+  owner check entirely, because `O_NOFOLLOW` does not exist there. The key is
+  now refused when it is a reparse point, its identity is re-verified on the
+  open descriptor, and its owner and DACL are read from the security
+  descriptor, refusing any Everyone/Users/Authenticated Users grant.
+- Windows: the reconciler discarded the heartbeat it had just written, because
+  the POSIX `mode & 0o077` privacy test is always true against the synthetic
+  `0o666` Windows reports. `durable_status_present` now reads true.
+- Windows: every reviewer terminal-intent read failed, so no reservation could
+  be terminalized and reviewer cards stayed in `processing` with nothing left
+  to finish the transition.
+- Windows: `python -m <validator>` was not recognised as a validator invocation
+  at all, because the interpreter path was split on `/` only and the name
+  pattern did not accept `python.exe`.
+- Multi-repo binding on Windows: Node reports `lstat().dev` as 0 while
+  `fstat().dev` carries the real volume serial, so every valid manifest was
+  read as `manifest-unreadable` and no repository could bind.
+
 ## [0.11.43] - 2026-09-15
 
 ### Added

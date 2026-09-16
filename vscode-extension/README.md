@@ -14,6 +14,44 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.11.48
+
+- OpenCode's model list in Settings no longer crowds out newly-discovered
+  models behind a heavily-toggled provider's history; today's full catalog
+  fits without truncation.
+
+## What's new in 0.11.47
+
+- OpenCode's model list in Settings now stays current regardless of which
+  panel you opened first.
+
+## What's new in 0.11.46
+
+- Windows: worker launches no longer fail with an unexplained authority-key
+  error after upgrading.
+- Windows: OpenCode now appears in model settings when it's installed.
+
+## What's new in 0.11.45
+
+- Windows: Claude Code can now hold the manager seat. The venv launcher's
+  redirector process no longer blocks identity verification.
+- Windows: native-CLI sandboxing (AppContainer confinement) works on capable
+  hosts again, instead of reporting unavailable everywhere.
+
+## What's new in 0.11.44
+
+- Windows: creating a task no longer stalls. A child process that inherited the
+  MCP server's request pipe hung before running its own first instruction, so
+  every `git` the coordinator ran burned its whole timeout — task creation now
+  answers in 0.09 s instead of 120 s.
+- Windows: installed tools are measured again, so a card requiring
+  `node>=20.0.0` and `ruff>=0.12` is no longer refused as unwinnable on a
+  machine that has them.
+- Windows: the authority key no longer follows a symlink, and its owner and ACL
+  are checked against the open file's security descriptor.
+- Windows: the reconciler heartbeat is readable again, reviewer cards no longer
+  stay stuck in `processing`, and connecting a repository works again.
+
 ## What's new in 0.11.43
 
 - The manager can now make small, hash-bound range edits directly through the

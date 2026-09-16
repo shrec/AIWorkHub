@@ -49,11 +49,13 @@ from .platform_io import (
     chmod_fd,
     close_directory_descriptor,
     directory_descriptor_backend,
+    is_windows,
     lock_fd,
     lock_file_open_flags,
     nofollow_open_flag,
     open_directory_descriptor,
     stat_owned_by_current_user,
+    windows_descriptor_secret_trust,
     unlock_fd,
 )
 
@@ -374,6 +376,23 @@ def write_status(repo: Path | str, payload: dict[str, Any]) -> None:
                 os.unlink(tmp)
 
 
+def _status_privacy_unsafe(metadata: os.stat_result, fd: int) -> bool:
+    """Is this heartbeat readable beyond its owner, in the host's own terms?
+
+    NF-2026-00012: POSIX answers with the mode bits, but Windows synthesises
+    ``0o666`` for every writable file, so ``mode & 0o077`` was ALWAYS true there
+    and ``read_status`` discarded a heartbeat the reconciler had just written --
+    which is why ``durable_status_present`` read false on a healthy Windows host.
+    Windows answers the same question against the open descriptor's security
+    descriptor instead, and still fails closed when it cannot be read.
+    """
+
+    if is_windows():
+        trusted, _reason = windows_descriptor_secret_trust(fd)
+        return not trusted
+    return bool(stat.S_IMODE(metadata.st_mode) & 0o077)
+
+
 def read_status(repo: Path | str) -> dict[str, Any]:
     target = status_path(repo)
     try:
@@ -397,7 +416,7 @@ def read_status(repo: Path | str) -> dict[str, Any]:
             or _lock_metadata_unsafe(after)
             or (after.st_dev, after.st_ino) != identity
             or (before.st_dev, before.st_ino) != identity
-            or stat.S_IMODE(metadata.st_mode) & 0o077
+            or _status_privacy_unsafe(metadata, fd)
         ):
             return {}
         with os.fdopen(fd, encoding="utf-8") as stream:

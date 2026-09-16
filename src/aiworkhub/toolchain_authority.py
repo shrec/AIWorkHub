@@ -666,6 +666,22 @@ def _load_project_registry(repo: Path) -> ProjectToolchainRegistry:
     )
 
 
+def _declared_dash_m_module(normalized: Sequence[str]) -> str:
+    """The module a ``-m`` command runs, or "" when it runs none.
+
+    Read from the NORMALIZED argv the trusted boundary already produced, so this
+    introduces no second parser. Only the first ``-m`` counts: it consumes the
+    next token, and everything after it is the module's own argument vector.
+    """
+    for index, token in enumerate(normalized[1:], start=1):
+        if token == "-m":
+            candidate = normalized[index + 1] if index + 1 < len(normalized) else ""
+            return candidate if candidate and not candidate.startswith("-") else ""
+        if not token.startswith("-"):
+            return ""
+    return ""
+
+
 def _read_executable_version(resolved: str) -> str:
     from . import worker_workspace
 
@@ -902,7 +918,23 @@ class ToolchainAuthority:
                     normalized, _roots = worker_workspace._normalize_trusted_validation_executable_argv_with_roots(argv, self.repo)
                 except (ValueError, worker_workspace.WorkspaceError):
                     continue
-                fact = _executable_fact(argv[0], normalized[0]) if normalized else None
+                # NF-2026-00010: ``python -m ruff`` is a RUFF requirement. Taking
+                # the fact from ``argv[0]`` recorded the interpreter's version and
+                # compared "Python 3.12.4" against Ruff's ``>=0.12``, which both
+                # hid a genuinely outdated Ruff and refused a current one. Probe
+                # the module itself, and only when the declared module IS the
+                # requirement being resolved, so ``python -m pytest`` keeps
+                # answering for the tool the registry actually named.
+                version_fact: str | None = None
+                if normalized and _declared_dash_m_module(normalized) == name:
+                    version_fact = worker_workspace.trusted_validation_module_version(
+                        normalized[0], name
+                    )
+                fact = (
+                    _executable_fact(argv[0], normalized[0], version_fact=version_fact)
+                    if normalized
+                    else None
+                )
                 if fact is None:
                     continue
                 if minimum_version and not _version_meets(fact.version_fact, minimum_version):

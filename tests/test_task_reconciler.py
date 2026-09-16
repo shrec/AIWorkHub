@@ -255,3 +255,42 @@ def test_nf865_target_is_not_starved_behind_a_35_action_backlog(monkeypatch, tmp
     result = task_reconciler.run_scan(mgr, include_gc=False)
     assert len(outbox.executed) == 36
     assert result["review_recovery"]["review_recovery_drain"]["reason"] == "no_work"
+
+
+def test_written_status_is_readable_back_on_this_host(tmp_path: Path) -> None:
+    # NF-2026-00012: Windows synthesises 0o666 for every writable file, so the
+    # POSIX ``mode & 0o077`` privacy test was ALWAYS true there and read_status
+    # discarded the heartbeat write_status had just produced -- which is why
+    # durable_status_present read false on a healthy host.
+    task_reconciler.write_status(
+        tmp_path, {"authority_state": "standby", "last_error": ""}
+    )
+
+    record = task_reconciler.read_status(tmp_path)
+
+    assert record.get("schema_id") == "aiworkhub.task_reconciler_status.v1"
+    assert record.get("authority_state") == "standby"
+    assert bool(record) is True
+
+
+def test_world_readable_status_is_still_discarded(tmp_path: Path) -> None:
+    import os
+    import stat as stat_module
+    import subprocess
+
+    task_reconciler.write_status(tmp_path, {"authority_state": "standby"})
+    target = task_reconciler.status_path(tmp_path)
+    if os.name == "nt":
+        exposed = subprocess.run(
+            ["icacls", str(target), "/grant", "*S-1-1-0:(R)"],
+            capture_output=True,
+            check=False,
+        )
+        if exposed.returncode != 0:
+            import pytest
+
+            pytest.skip("validation_unsupported_in_sandbox:cannot_expose_status")
+    else:
+        os.chmod(target, stat_module.S_IRUSR | stat_module.S_IWUSR | stat_module.S_IROTH)
+
+    assert task_reconciler.read_status(tmp_path) == {}

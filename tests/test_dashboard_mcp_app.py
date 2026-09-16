@@ -501,8 +501,14 @@ def _fake_model_settings(models: dict[str, Any] | None = None) -> dict[str, Any]
     }
 
 
+# Sized relative to the real compact bound rather than a literal, so this
+# fixture stays oversized (and the pinned-routes test below still has enough
+# real rows to pin) whatever MAX_MODEL_POLICY_CATALOG_ROWS is configured to.
+_OVERSIZED_ROWS_PER_PROVIDER = dashboard_mcp_app.MAX_MODEL_POLICY_CATALOG_ROWS // 2 + 20
+
+
 def _catalog_with_81_workers() -> dict[str, Any]:
-    """40 anthropic + 40 copilot routes, then xai past the former 64-row cut.
+    """N anthropic + N copilot routes, then xai past the compact row cut.
 
     xai sorts last, so under a global head slice of the sorted catalog it was
     the whole provider that disappeared -- not merely some of its routes.
@@ -510,7 +516,7 @@ def _catalog_with_81_workers() -> dict[str, Any]:
 
     rows: list[dict[str, Any]] = []
     for provider, adapter in (("anthropic", "claude_cli"), ("copilot", "vscode_lm")):
-        for index in range(40):
+        for index in range(_OVERSIZED_ROWS_PER_PROVIDER):
             rows.append(
                 {
                     "worker_id": f"{provider}-{index:02d}",
@@ -564,13 +570,14 @@ def test_compact_model_catalog_never_drops_a_whole_provider(
     )
 
     catalog = dashboard_mcp_app._model_policy_view(Path("/repo"))["catalog"]
+    total = 2 * _OVERSIZED_ROWS_PER_PROVIDER + 1
 
-    assert catalog["worker_count"] == 81
-    assert catalog["configured_worker_count"] == 81
+    assert catalog["worker_count"] == total
+    assert catalog["configured_worker_count"] == total
     assert catalog["truncated"] is True
     # Still bounded: the response never grows to the full catalog.
     assert catalog["returned_worker_count"] == len(catalog["workers"])
-    assert catalog["returned_worker_count"] < 81
+    assert catalog["returned_worker_count"] < total
     assert (
         catalog["returned_worker_count"]
         <= dashboard_mcp_app.MAX_MODEL_POLICY_CATALOG_ROWS
@@ -617,14 +624,14 @@ def test_compact_model_catalog_reports_per_provider_count_truth(
         "enabled_returned": 1,
     }
     for provider in ("anthropic", "copilot"):
-        assert counts[provider]["total"] == 40
-        assert counts[provider]["ingested"] == 40
-        assert 0 < counts[provider]["returned"] < 40
+        assert counts[provider]["total"] == _OVERSIZED_ROWS_PER_PROVIDER
+        assert counts[provider]["ingested"] == _OVERSIZED_ROWS_PER_PROVIDER
+        assert 0 < counts[provider]["returned"] < _OVERSIZED_ROWS_PER_PROVIDER
         assert counts[provider]["truncated"] is True
         # Nothing is disabled here, so the provider's enabled total is its
         # whole row count -- a number the truncated row list cannot state.
-        assert counts[provider]["enabled_total"] == 40
-        assert counts[provider]["enabled_counted_over"] == 40
+        assert counts[provider]["enabled_total"] == _OVERSIZED_ROWS_PER_PROVIDER
+        assert counts[provider]["enabled_counted_over"] == _OVERSIZED_ROWS_PER_PROVIDER
         assert (
             counts[provider]["enabled_returned"] == counts[provider]["returned"]
         )
@@ -642,24 +649,25 @@ def test_explicitly_configured_route_outranks_the_compact_bound(
 ):
     # A route the repository owner named in models.json must stay visible, or
     # the only way to switch it back is to hand-edit the settings file.
+    last = _OVERSIZED_ROWS_PER_PROVIDER - 1
+    pinned_model = f"anthropic-model-{last:02d}"
+    unconfigured_neighbour = f"anthropic-model-{last - 1:02d}"
     monkeypatch.setattr(
         dashboard_mcp_app.model_settings,
         "load",
         lambda _root: _fake_model_settings(
-            {"anthropic": {"claude_cli": {"anthropic-model-39": True}}}
+            {"anthropic": {"claude_cli": {pinned_model: True}}}
         ),
     )
 
     catalog = dashboard_mcp_app._model_policy_view(Path("/repo"))["catalog"]
     models = [row["model"] for row in catalog["workers"]]
 
-    assert "anthropic-model-39" in models
+    assert pinned_model in models
     # Its unconfigured neighbour is still past this provider's fair share, so
     # the pin -- not a raised bound -- is what carried the configured route.
-    assert "anthropic-model-38" not in models
-    pinned = next(
-        row for row in catalog["workers"] if row["model"] == "anthropic-model-39"
-    )
+    assert unconfigured_neighbour not in models
+    pinned = next(row for row in catalog["workers"] if row["model"] == pinned_model)
     assert pinned["effective_enabled"] is True
 
 
@@ -667,19 +675,22 @@ def test_sixty_four_pinned_routes_cannot_starve_a_later_provider(
     monkeypatch, _oversized_model_catalog
 ):
     # The defect this pins down: explicit routes used to be paid out of the
-    # same budget as everything else, in sorted order. Sixty-four leaves that
-    # all sort before "xai" therefore consumed the whole bound before the
-    # per-provider round-robin ran even once, and the last provider vanished
-    # exactly as it did under the original global head slice.
+    # same budget as everything else, in sorted order. Pins sized to exactly
+    # fill the compact bound and all sorting before "xai" therefore used to
+    # consume the whole budget before the per-provider round-robin ran even
+    # once, and the last provider vanished exactly as it did under the
+    # original global head slice.
+    bound = dashboard_mcp_app.MAX_MODEL_POLICY_CATALOG_ROWS
+    half = bound // 2
     pins = {
         "anthropic": {
             "claude_cli": {
-                f"anthropic-model-{index:02d}": True for index in range(32)
+                f"anthropic-model-{index:02d}": True for index in range(half)
             }
         },
         "copilot": {
             "vscode_lm": {
-                f"copilot-model-{index:02d}": True for index in range(32)
+                f"copilot-model-{index:02d}": True for index in range(half)
             }
         },
     }
@@ -692,17 +703,17 @@ def test_sixty_four_pinned_routes_cannot_starve_a_later_provider(
     catalog = dashboard_mcp_app._model_policy_view(Path("/repo"))["catalog"]
     models = {row["model"] for row in catalog["workers"]}
 
-    assert catalog["worker_count"] == 81
+    assert catalog["worker_count"] == 2 * _OVERSIZED_ROWS_PER_PROVIDER + 1
     # Every provider still reaches the Webview, the last-sorting one included.
     assert {row["provider"] for row in catalog["workers"]} == {
         "anthropic",
         "copilot",
         "xai",
     }
-    # Every one of the 64 explicit leaves survived; none was dropped silently.
+    # Every one of the pinned leaves survived; none was dropped silently.
     for provider in ("anthropic", "copilot"):
         assert {
-            f"{provider}-model-{index:02d}" for index in range(32)
+            f"{provider}-model-{index:02d}" for index in range(half)
         } <= models
     # And the explicitly enabled routes are still toggleable rather than
     # merely present.
@@ -715,13 +726,13 @@ def test_sixty_four_pinned_routes_cannot_starve_a_later_provider(
     assert xai_routes[0]["effective_enabled"] is True
 
     # Still bounded. The floor raised the honoured limit by exactly the slots
-    # correctness required -- the 64 pins plus one route for the provider the
+    # correctness required -- the pins plus one route for the provider the
     # pins left unrepresented -- and never to the whole catalog.
     assert catalog["truncated"] is True
-    assert catalog["returned_worker_count"] == 65
+    assert catalog["returned_worker_count"] == 2 * half + 1
     assert catalog["returned_worker_count"] < catalog["worker_count"]
     assert catalog["row_limit"] == dashboard_mcp_app.MAX_MODEL_POLICY_CATALOG_ROWS
-    assert catalog["row_limit_honoured"] == 65
+    assert catalog["row_limit_honoured"] == 2 * half + 1
 
 
 def test_provider_counts_state_the_enabled_total_the_bound_cannot_show(
@@ -750,9 +761,9 @@ def test_provider_counts_state_the_enabled_total_the_bound_cannot_show(
     counts = {entry["provider"]: entry for entry in catalog["provider_counts"]}
     shown = [row for row in catalog["workers"] if row["provider"] == "anthropic"]
 
-    assert counts["anthropic"]["total"] == 40
+    assert counts["anthropic"]["total"] == _OVERSIZED_ROWS_PER_PROVIDER
     assert counts["anthropic"]["truncated"] is True
-    assert counts["anthropic"]["enabled_total"] == 30
+    assert counts["anthropic"]["enabled_total"] == _OVERSIZED_ROWS_PER_PROVIDER - 10
     assert counts["anthropic"]["enabled_returned"] == sum(
         1 for row in shown if row["effective_enabled"]
     )
@@ -762,7 +773,7 @@ def test_provider_counts_state_the_enabled_total_the_bound_cannot_show(
         counts["anthropic"]["enabled_returned"]
         < counts["anthropic"]["enabled_total"]
     )
-    assert counts["copilot"]["enabled_total"] == 40
+    assert counts["copilot"]["enabled_total"] == _OVERSIZED_ROWS_PER_PROVIDER
     assert counts["xai"]["enabled_total"] == 1
     assert counts["xai"]["enabled_returned"] == 1
 
@@ -844,7 +855,18 @@ def test_explicit_opencode_decision_survives_the_bound_under_either_spelling(
         }
         for index in range(20)
     ]
-    identities = [f"opencode/model-{index:02d}-free" for index in range(80)]
+    bound = dashboard_mcp_app.MAX_MODEL_POLICY_CATALOG_ROWS
+    # Comfortably larger than the bound minus anthropic's fixed 20, so the
+    # scenario below stays "well past the compact bound" whatever the bound is
+    # configured to, the same way the original fixed 80/64 pairing was.
+    opencode_plain_count = bound + 39
+    # Zero-padded to a fixed width so the catalog's alphabetic model sort
+    # agrees with numeric order all the way past two digits -- otherwise
+    # "model-100-free" sorts ahead of "model-99-free" and the boundary below
+    # no longer names the row the fair-share cutoff actually excludes.
+    identities = [
+        f"opencode/model-{index:03d}-free" for index in range(opencode_plain_count)
+    ]
     identities.append("xai/grok-4.6")
     _stub_model_policy_sources(
         monkeypatch,
@@ -862,17 +884,17 @@ def test_explicit_opencode_decision_survives_the_bound_under_either_spelling(
     catalog = dashboard_mcp_app._model_policy_view(Path("/repo"))["catalog"]
     models = {row["model"] for row in catalog["workers"]}
 
-    # Well past the compact bound: 101 routes, 81 of them under OpenCode.
-    assert catalog["worker_count"] == 101
+    # Well past the compact bound: anthropic's fixed 20 plus the OpenCode pool.
+    assert catalog["worker_count"] == 20 + opencode_plain_count + 1
     assert catalog["truncated"] is True
-    assert catalog["returned_worker_count"] == 64
+    assert catalog["returned_worker_count"] == bound
     # Pinned under either spelling -- a route nobody can draw is a route nobody
     # can switch back on.
     assert "xai/grok-4.6" in models
     # It was the pin that carried it, not a raised bound: the unconfigured
     # OpenCode leaf sorting immediately before it is past this provider's fair
     # share and did not survive.
-    assert "opencode/model-79-free" not in models
+    assert f"opencode/model-{opencode_plain_count - 1:03d}-free" not in models
     pinned = next(
         row for row in catalog["workers"] if row["model"] == "xai/grok-4.6"
     )
@@ -1917,7 +1939,10 @@ def test_a_declaration_within_the_ceiling_still_raises_the_floor_untouched(
 ):
     # The control for the test above. The ceiling must bind only when the floor
     # actually exceeds it; a fixed 256-row payload would be the same defect with
-    # the opposite sign, refusing pins that fit perfectly well.
+    # the opposite sign, refusing pins that fit perfectly well. Pin count is
+    # sized relative to the compact bound so the floor keeps exceeding it (and
+    # stays under the ceiling) whatever the bound is configured to.
+    pin_count = dashboard_mcp_app.MAX_MODEL_POLICY_CATALOG_ROWS + 20
     monkeypatch.setattr(
         dashboard_mcp_app.model_settings,
         "load",
@@ -1926,7 +1951,7 @@ def test_a_declaration_within_the_ceiling_still_raises_the_floor_untouched(
                 "anthropic": {
                     "claude_cli": {
                         f"anthropic-model-{index:03d}": True
-                        for index in range(100)
+                        for index in range(pin_count)
                     }
                 }
             }
@@ -1939,9 +1964,9 @@ def test_a_declaration_within_the_ceiling_still_raises_the_floor_untouched(
     catalog = dashboard_mcp_app._model_policy_view(Path("/repo"))["catalog"]
 
     assert catalog["declared_leaves_truncated"] is False
-    assert catalog["declared_leaf_count"] == 100
-    # 100 pins plus one row for the provider they left unrepresented.
-    assert catalog["row_limit_honoured"] == 101
+    assert catalog["declared_leaf_count"] == pin_count
+    # The pins plus one row for the provider they left unrepresented.
+    assert catalog["row_limit_honoured"] == pin_count + 1
     assert (
         catalog["row_limit_honoured"]
         < dashboard_mcp_app.MAX_MODEL_POLICY_CATALOG_ROW_CEILING

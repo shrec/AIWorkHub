@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -24,6 +25,16 @@ def _authority(tmp_path: Path, **kwargs: object) -> toolchain_authority.Toolchai
 
 def _secret_path(repo: Path) -> Path:
     return repo / ".aiworkhub" / "toolchain-authority" / "receipt-hmac.key"
+
+
+def _host_executable(path: Path) -> Path:
+    """One real file this host treats as executable, on POSIX and on Windows."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    os.chmod(path, 0o755)
+    return path
+
 
 
 def _clear_secret_env(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -57,16 +68,36 @@ def test_authority_secret_rejects_symlink_key(
     assert toolchain_authority._authority_secret(tmp_path, create=False) == b""
 
 
+def _expose_key_to_everyone(key_path: Path) -> bool:
+    """Make the key readable beyond its owner, in this host's own vocabulary.
+
+    POSIX exposure is a mode bit. Windows has no such bit -- ``0o666`` there only
+    means "not read-only" and exposes nothing -- so the equivalent exposure is an
+    explicit Everyone (S-1-1-0) ACE. Returns whether the exposure was actually
+    created, so the test refuses to assert against a setup that did not happen.
+    """
+
+    if os.name != "nt":
+        fd = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(b"k" * 32)
+        return key_path.stat().st_mode & 0o077 != 0
+    key_path.write_bytes(b"k" * 32)
+    completed = subprocess.run(
+        ["icacls", str(key_path), "/grant", "*S-1-1-0:(R)"],
+        capture_output=True,
+        check=False,
+    )
+    return completed.returncode == 0
+
+
 def test_authority_secret_rejects_wrong_mode_key(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _clear_secret_env(monkeypatch)
     key_path = _secret_path(tmp_path)
     key_path.parent.mkdir(parents=True)
-    fd = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
-    with os.fdopen(fd, "wb") as handle:
-        handle.write(b"k" * 32)
-    if key_path.stat().st_mode & 0o077 == 0:
+    if not _expose_key_to_everyone(key_path):
         pytest.skip("validation_unsupported_in_sandbox:wrong_mode_key_setup")
 
     assert toolchain_authority._authority_secret(tmp_path, create=False) == b""
@@ -154,8 +185,15 @@ def test_executable_and_symlink_replacement_invalidate_snapshot(
 ) -> None:
     from aiworkhub import worker_workspace
 
+    # Two REAL, distinct executables. "/bin/true" and "/bin/false" do not exist
+    # on Windows, where both sides then resolved to nothing and the assertion
+    # proved nothing about symlink replacement.
+    targets = tmp_path / "targets"
+    targets.mkdir()
+    first_target = _host_executable(targets / "first")
+    second_target = _host_executable(targets / "second")
     link = tmp_path / "validator"
-    link.symlink_to("/bin/true")
+    link.symlink_to(first_target)
 
     def normalize(argv: list[str], _repo: Path) -> tuple[list[str], tuple[Path, ...]]:
         return [str(link), *argv[1:]], ()
@@ -168,7 +206,7 @@ def test_executable_and_symlink_replacement_invalidate_snapshot(
     authority = _authority(tmp_path)
     first = authority.evaluate({"validation": ["validator --version"]})
     link.unlink()
-    link.symlink_to("/bin/false")
+    link.symlink_to(second_target)
 
     second = authority.evaluate({"validation": ["validator --version"]})
 
@@ -254,3 +292,25 @@ def test_typed_extension_boundary_is_not_an_ordinary_requirement() -> None:
         "repository_overlay",
         "kernel_backend",
     }
+
+
+def test_declared_dash_m_module_reads_only_the_interpreter_option() -> None:
+    # NF-2026-00010: the requirement behind ``python -m ruff`` is Ruff, so the
+    # module has to be identified before a version fact is attributed to it.
+    assert (
+        toolchain_authority._declared_dash_m_module(["python", "-m", "ruff", "check"])
+        == "ruff"
+    )
+    assert (
+        toolchain_authority._declared_dash_m_module(["python", "-I", "-m", "pytest"])
+        == "pytest"
+    )
+    assert toolchain_authority._declared_dash_m_module(["node", "--version"]) == ""
+    assert toolchain_authority._declared_dash_m_module([]) == ""
+    # A ``-m`` that belongs to the SCRIPT's own argument vector is not a module.
+    assert (
+        toolchain_authority._declared_dash_m_module(["python", "script.py", "-m", "x"])
+        == ""
+    )
+    assert toolchain_authority._declared_dash_m_module(["python", "-m"]) == ""
+    assert toolchain_authority._declared_dash_m_module(["python", "-m", "-q"]) == ""
