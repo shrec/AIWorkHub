@@ -32,10 +32,13 @@ def changelog_versions(root: Path) -> set[str]:
 # failed extension-static.test.js on all four platforms, twice over: the
 # extension README had no "What's new in <version>" heading and the extension
 # CHANGELOG had no "## <version> —" section. A local gate that passes while the
-# release gate fails is worse than no local gate, because it is trusted.
+# release gate fails is worse than no local gate, because it is trusted. The
+# root README's own release-current section is a narrative projection too, so
+# it is gated the same way instead of drifting silently behind the changelog.
 NARRATIVE_PROJECTIONS: tuple[tuple[str, str], ...] = (
     ("vscode-extension/README.md", "What's new in {version}"),
-    ("vscode-extension/CHANGELOG.md", "## {version} \u2014"),
+    ("vscode-extension/CHANGELOG.md", "## {version} —"),
+    ("README.md", "What's new in {version}"),
 )
 
 

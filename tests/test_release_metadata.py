@@ -47,11 +47,16 @@ def _fixture(root: Path, *, canonical: str = "1.2.3", projected: str = "0.0.1") 
     # propagates version LITERALS; this prose is written deliberately, so a
     # releasable fixture already names the canonical version here.
     (root / "vscode-extension" / "README.md").write_text(
-        f"# AIWorkHub\n\n## What's new in {canonical} \u2014 2026-01-01\n",
+        f"# AIWorkHub\n\n## What's new in {canonical} — 2026-01-01\n",
         encoding="utf-8",
     )
     (root / "vscode-extension" / "CHANGELOG.md").write_text(
-        f"# Changelog\n\n## {canonical} \u2014 2026-01-01\n", encoding="utf-8"
+        f"# Changelog\n\n## {canonical} — 2026-01-01\n", encoding="utf-8"
+    )
+    # The root README's own release-current heading is gated the same way.
+    (root / "README.md").write_text(
+        f"# AIWorkHub\n\n## What's new in {canonical} — 2026-01-01\n",
+        encoding="utf-8",
     )
 
 
@@ -173,6 +178,7 @@ def test_check_covers_the_documents_the_extension_test_gates_on(tmp_path):
     assert set(gaps) == {
         "vscode-extension/README.md",
         "vscode-extension/CHANGELOG.md",
+        "README.md",
     }
     for relative, _template in release_metadata.NARRATIVE_PROJECTIONS:
         assert relative in gaps
@@ -184,8 +190,23 @@ def test_an_unreadable_release_document_is_a_mismatch_not_a_pass(tmp_path):
     assert set(gaps) == {
         "vscode-extension/README.md",
         "vscode-extension/CHANGELOG.md",
+        "README.md",
     }
     assert all("unreadable" in reason for reason in gaps.values())
+
+
+def test_root_readme_release_projection_is_gated(tmp_path: Path) -> None:
+    """The root README's own release-current heading is a checked projection."""
+    _fixture(tmp_path, canonical="1.2.3", projected="1.2.3")
+    assert release_metadata.check(tmp_path)["ok"] is True
+
+    (tmp_path / "README.md").write_text(
+        "# AIWorkHub\n\n## What's new in 0.9.9 — 2026-01-01\n", encoding="utf-8"
+    )
+    result = release_metadata.check(tmp_path)
+    assert result["ok"] is False
+    assert "missing" in result["mismatches"]["README.md"]
+    assert "What's new in 1.2.3" in result["mismatches"]["README.md"]
 
 
 def test_release_vsix_smoke_checks_packaged_assets_not_false_dist_prefix() -> None:

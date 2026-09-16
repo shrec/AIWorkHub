@@ -30,7 +30,7 @@ or follow the [getting-started guide](docs/GETTING_STARTED.md).
 ## The whole system
 
 <div align="center">
-  <a href="site/assets/aiworkhub-system-architecture.png"><img src="site/assets/aiworkhub-system-architecture.png" alt="AIWorkHub autonomous development control plane architecture" width="100%"></a>
+  <a href="site/assets/aiworkhub-system-architecture.png"><img src="site/assets/aiworkhub-system-architecture.svg" alt="AIWorkHub system block diagram: seats and MCP surface over a five-pillar control plane, a durable runtime and repository-local .aiworkhub storage" width="100%"></a>
 </div>
 
 AIWorkHub follows one durable loop: **Observe → Decide → Delegate → Verify →
@@ -62,17 +62,19 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
-## What's new in 0.11.29
+## What's new in 0.11.43
 
-- The Models tab now presents a bounded provider-to-model tree and includes
-  OpenCode identities discovered from the cached preflight snapshot.
-- Discovery is reported separately from repository enablement, launchability,
-  access and observed round-trip execution; a listed model is never presented
-  as proven runnable without evidence.
-- Automatic quality-review launch runs a system-owned correctness, security
-  and code-quality chain after worker completion and emits one authenticated
-  manager callback; review automation never accepts or rejects the target.
-- 0.11.29 is the current source release in this repository; Marketplace and
+- The manager MCP surface now exposes the same hash-bound, range-scoped
+  semantic-edit tools workers use, so the manager can make small, verified
+  edits instead of a whole-file rewrite.
+- A new read-only dashboard surface reports measured skill-selection
+  coverage; an absent or unreadable skill store reports `measured: False`
+  with a reason instead of a zero that reads as healthy and empty.
+- A deterministic, read-only attempt-trajectory export composes a card's
+  audit history, process lifecycle ledger, attempt artifacts and recorded
+  usage into one canonical JSON document per request; every field is
+  measured evidence or an explicit `UNKNOWN`.
+- 0.11.43 is the current source release in this repository; Marketplace and
   GitHub Release publication of that exact version are separate channels this
   README does not assert without measured evidence.
 ## Supported models
@@ -145,6 +147,10 @@ manager-accepted quality; a cheap failed run is not an economic success.
 | **Actual alternative today** | Manual multi-chat coordination or custom in-house glue | The workflow AIWorkHub replaces: copy/paste context, hand-managed worktrees, retries and review state |
 
 ## Source intelligence and durable context
+
+<div align="center">
+  <a href="site/assets/aiworkhub-source-graph-architecture.png"><img src="site/assets/aiworkhub-source-graph-architecture.svg" alt="AIWorkHub Source Graph architecture: refresh control, the five-stage write path, the repository-local SQLite index, and the five-stage read path that feeds focused semantic edits and the review overlay" width="100%"></a>
+</div>
 
 AIWorkHub has two graphs with different authority. They are complementary,
 not alternate names for the same feature.
