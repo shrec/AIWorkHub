@@ -990,6 +990,7 @@ _WINDOWS_CHILD_DESIRED_ACCESS = 0x00110080  # DELETE | FILE_READ_ATTRIBUTES | SY
 _WINDOWS_CHILD_SHARE_ACCESS = 0x3  # FILE_SHARE_READ | FILE_SHARE_WRITE
 
 _FILE_OPEN = 0x1
+_FILE_CREATE = 0x2
 _FILE_DIRECTORY_FILE = 0x1
 _FILE_SYNCHRONOUS_IO_NONALERT = 0x20
 _FILE_OPEN_REPARSE_POINT = 0x00200000
@@ -1051,8 +1052,21 @@ _FILE_ATTRIBUTE_TAG_INFO = 9
 _FILE_ID_INFO = 18
 _FILE_DISPOSITION_INFO = 4
 _FILE_DISPOSITION_INFO_EX = 21
+# Native NtSetInformationFile FILE_INFORMATION_CLASS values (a different
+# numbering from the FILE_INFO_BY_HANDLE_CLASS values just above, which are
+# Win32's SetFileInformationByHandle enum and only used for disposition).
+_FILE_RENAME_INFO = 10
+_FILE_RENAME_INFO_EX = 65
+_FILE_LINK_INFO = 11
+_FILE_LINK_INFO_EX = 72
 _FILE_DISPOSITION_FLAG_DELETE = 0x00000001
 _FILE_DISPOSITION_FLAG_POSIX_SEMANTICS = 0x00000002
+# CreateFileW-only flags (distinct namespace from the NtCreateFile
+# CreateOptions constants above, though FILE_FLAG_OPEN_REPARSE_POINT
+# happens to share _FILE_OPEN_REPARSE_POINT's bit value).
+_WINDOWS_OPEN_EXISTING = 3
+_FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+_FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
 # The one documented "unsupported" result: pre-Windows 10 1709 filesystems
 # reject FileDispositionInfoEx with ERROR_INVALID_PARAMETER (87) -- the exact
 # signal that plain FileDispositionInfo delete semantics is the only fallback.
@@ -1203,8 +1217,10 @@ def _open_windows_relative_child_handle(
     desired_access: int,
     share_access: int,
     create_options: int,
+    disposition: int = _FILE_OPEN,
 ) -> tuple[OwnedWindowsHandle, Any, Callable[[], int]]:
-    """Open one exact child segment beneath a borrowed parent HANDLE.
+    """Open (or, with ``disposition=_FILE_CREATE``, exclusively create) one
+    exact child segment beneath a borrowed parent HANDLE.
 
     Returns the owned HANDLE together with the bound
     ``GetFileInformationByHandleEx`` and last-error getters so the caller can
@@ -1276,7 +1292,7 @@ def _open_windows_relative_child_handle(
             None,
             0,
             share_access,
-            _FILE_OPEN,
+            disposition,
             create_options,
             None,
             0,
@@ -1325,11 +1341,13 @@ def open_windows_relative_child_directory(
             ctypes.sizeof(tag_info),
         ):
             raise _windows_error(get_last_error())
-        if (
-            not tag_info.FileAttributes & _FILE_ATTRIBUTE_DIRECTORY
-            or tag_info.ReparseTag != 0
-        ):
-            raise OSError("opened child is not a non-reparse directory")
+        if tag_info.ReparseTag != 0:
+            # A distinct errno (matching POSIX ELOOP) lets every caller reuse
+            # the same "refuse a symlink/junction without following it" branch
+            # it already has for ``os.open(..., O_NOFOLLOW)``.
+            raise OSError(errno.ELOOP, "opened child is a reparse point")
+        if not tag_info.FileAttributes & _FILE_ATTRIBUTE_DIRECTORY:
+            raise OSError(errno.ENOTDIR, "opened child is not a directory")
         file_id = FILE_ID_INFO()
         if not get_file_information(
             owned.value,
@@ -1339,7 +1357,7 @@ def open_windows_relative_child_directory(
         ):
             raise _windows_error(get_last_error())
         if file_id.volume_serial_number == 0 or not any(file_id.file_id):
-            raise OSError("opened child has no stable volume/file identity")
+            raise OSError(errno.EINVAL, "opened child has no stable volume/file identity")
     except BaseException:
         owned.close()
         raise
@@ -1364,15 +1382,59 @@ def open_windows_relative_regular_file_descriptor(parent_handle: int, child_name
         for info_class, value in ((_FILE_ATTRIBUTE_TAG_INFO, attributes), (_FILE_ID_INFO, identity)):
             if not information(owned.value, info_class, ctypes.byref(value), ctypes.sizeof(value)):
                 raise _windows_error(last_error())
-        if (
-            attributes.FileAttributes & (_FILE_ATTRIBUTE_DIRECTORY | _FILE_ATTRIBUTE_DEVICE | 0x400)
-            or attributes.ReparseTag or identity.volume_serial_number == 0
-            or not any(identity.file_id)
-        ):
-            raise OSError("opened child is not an identified non-reparse regular file")
+        if attributes.ReparseTag:
+            # A distinct errno (matching POSIX ELOOP) lets every caller reuse
+            # the same "refuse a symlink/junction without following it" branch
+            # it already has for ``os.open(..., O_NOFOLLOW)``.
+            raise OSError(errno.ELOOP, "opened child is a reparse point")
+        if attributes.FileAttributes & (_FILE_ATTRIBUTE_DIRECTORY | _FILE_ATTRIBUTE_DEVICE | 0x400):
+            raise OSError(errno.EISDIR, "opened child is not a regular file")
+        if identity.volume_serial_number == 0 or not any(identity.file_id):
+            raise OSError(errno.EINVAL, "opened child has no stable volume/file identity")
         import msvcrt
 
         descriptor = msvcrt.open_osfhandle(owned.value, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+        owned.detach()  # the CRT descriptor now owns the original HANDLE
+        return descriptor
+    except BaseException:
+        owned.close()
+        raise
+
+
+# NtCreateFile failures raise a bare ``OSError(winerror, ...)`` (see
+# ``_open_windows_relative_child_handle``): a test pins that ``.errno`` stays
+# the *raw* DOS error rather than the POSIX-mapped one, so a caller that wants
+# a proper ``FileExistsError`` has to translate these specific codes itself.
+_WINDOWS_ALREADY_EXISTS_ERRNOS = frozenset({80, 183})  # ERROR_FILE_EXISTS, ERROR_ALREADY_EXISTS
+
+
+def create_windows_relative_regular_file_descriptor(parent_handle: int, child_name: str) -> int:
+    """Exclusively create one new regular file beneath a borrowed parent HANDLE.
+
+    Mirrors ``os.open(name, O_WRONLY | O_CREAT | O_EXCL, dir_fd=parent_fd)``:
+    NtCreateFile's ``FILE_CREATE`` disposition fails if anything at all --  a
+    regular file, a directory, or a symlink/reparse point -- already exists at
+    that exact name, so this can never silently follow or replace an existing
+    object the way a plain ``CREATE_ALWAYS`` open could. The returned CRT
+    descriptor owns the HANDLE.
+    """
+    try:
+        owned, _information, _last_error = _open_windows_relative_child_handle(
+            parent_handle,
+            child_name,
+            0x00100182,  # FILE_WRITE_DATA | FILE_WRITE_ATTRIBUTES | FILE_READ_ATTRIBUTES | SYNCHRONIZE
+            0x0,  # no sharing: this name is meant to be exclusively ours until closed
+            _FILE_SYNCHRONOUS_IO_NONALERT | 0x40,  # NON_DIRECTORY_FILE
+            disposition=_FILE_CREATE,
+        )
+    except OSError as exc:
+        if exc.errno in _WINDOWS_ALREADY_EXISTS_ERRNOS:
+            raise FileExistsError(errno.EEXIST, "opened child already exists") from exc
+        raise
+    try:
+        import msvcrt
+
+        descriptor = msvcrt.open_osfhandle(owned.value, os.O_WRONLY | getattr(os, "O_BINARY", 0))
         owned.detach()  # the CRT descriptor now owns the original HANDLE
         return descriptor
     except BaseException:
@@ -1409,9 +1471,12 @@ def open_windows_relative_child_disposition(
         ):
             raise _windows_error(get_last_error())
         if tag_info.ReparseTag != 0:
-            raise OSError("opened child is a reparse point")
+            # A distinct errno (matching POSIX ELOOP) lets every caller reuse
+            # the same "refuse a symlink/junction without following it" branch
+            # it already has for ``os.open(..., O_NOFOLLOW)``.
+            raise OSError(errno.ELOOP, "opened child is a reparse point")
         if tag_info.FileAttributes & _FILE_ATTRIBUTE_DEVICE:
-            raise OSError("opened child has an unexpected device type")
+            raise OSError(errno.EINVAL, "opened child has an unexpected device type")
         is_directory = bool(tag_info.FileAttributes & _FILE_ATTRIBUTE_DIRECTORY)
         file_id = FILE_ID_INFO()
         if not get_file_information(
@@ -1422,7 +1487,7 @@ def open_windows_relative_child_disposition(
         ):
             raise _windows_error(get_last_error())
         if file_id.volume_serial_number == 0 or not any(file_id.file_id):
-            raise OSError("opened child has no stable volume/file identity")
+            raise OSError(errno.EINVAL, "opened child has no stable volume/file identity")
     except BaseException:
         owned.close()
         raise
@@ -1483,6 +1548,287 @@ def mark_windows_relative_child_disposition(
             ctypes.sizeof(disposition),
         ):
             raise _windows_error(get_last_error())
+
+
+def open_windows_root_directory_handle(path: Path | str) -> OwnedWindowsHandle:
+    """Open one absolute directory path as an authenticated, non-reparse HANDLE.
+
+    Every other primitive above resolves a single path *segment* relative to an
+    already-open parent HANDLE, but that chain has to start somewhere: from a
+    pathname. ``CreateFileW`` with ``FILE_FLAG_OPEN_REPARSE_POINT`` opens the
+    reparse point itself instead of following it -- exactly like
+    ``NtCreateFile`` does for a relative child in
+    :func:`_open_windows_relative_child_handle` -- and the same
+    attribute/reparse-tag/volume-serial/FileId checks
+    :func:`open_windows_relative_child_directory` applies to a child are applied
+    here, so a symlinked or junctioned root is rejected exactly like a
+    symlinked intermediate component would be. ``FILE_SHARE_DELETE`` is
+    included (via ``_WINDOWS_DIRECTORY_SHARE_ACCESS``) so this open never blocks
+    directory enumeration or cleanup elsewhere.
+    """
+
+    from ctypes import wintypes
+
+    win_dll = _windows_dll_loader()
+    kernel32 = win_dll("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (ctypes.c_void_p,)
+    close_handle.restype = ctypes.c_int
+    get_last_error = _windows_last_error_getter()
+
+    handle_value = create_file(
+        str(path),
+        _WINDOWS_DIRECTORY_DESIRED_ACCESS,
+        _WINDOWS_DIRECTORY_SHARE_ACCESS,
+        None,
+        _WINDOWS_OPEN_EXISTING,
+        _FILE_FLAG_BACKUP_SEMANTICS | _FILE_FLAG_OPEN_REPARSE_POINT,
+        None,
+    )
+    if handle_value in (None, 0, _INVALID_HANDLE_VALUE):
+        raise _windows_error(get_last_error())
+
+    owned = OwnedWindowsHandle(int(handle_value), close_handle, get_last_error)
+    try:
+        get_file_information = kernel32.GetFileInformationByHandleEx
+        get_file_information.argtypes = (
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+        )
+        get_file_information.restype = ctypes.c_int
+        tag_info = _FileAttributeTagInfo()
+        if not get_file_information(
+            owned.value,
+            _FILE_ATTRIBUTE_TAG_INFO,
+            ctypes.byref(tag_info),
+            ctypes.sizeof(tag_info),
+        ):
+            raise _windows_error(get_last_error())
+        if tag_info.ReparseTag != 0:
+            raise OSError(errno.ELOOP, "root directory is a reparse point")
+        if not tag_info.FileAttributes & _FILE_ATTRIBUTE_DIRECTORY:
+            raise OSError(errno.ENOTDIR, "root path is not a directory")
+        file_id = FILE_ID_INFO()
+        if not get_file_information(
+            owned.value,
+            _FILE_ID_INFO,
+            ctypes.byref(file_id),
+            ctypes.sizeof(file_id),
+        ):
+            raise _windows_error(get_last_error())
+        if file_id.volume_serial_number == 0 or not any(file_id.file_id):
+            raise OSError(errno.EINVAL, "root directory has no stable volume/file identity")
+    except BaseException:
+        owned.close()
+        raise
+    return owned
+
+
+class _FileRenameOrLinkInfoHeader(ctypes.Structure):
+    """The layout ``FILE_RENAME_INFO(_EX)`` and ``FILE_LINK_INFO(_EX)`` share.
+
+    All four structures are, physically, the same three fixed fields (a
+    4-byte flags/boolean, a HANDLE, a length) followed by the inline
+    ``WCHAR`` name -- only the *meaning* of the first field (a bare
+    ``BOOLEAN ReplaceIfExists`` for the legacy classes, a ``ULONG Flags`` for
+    the ``_Ex`` ones) differs, and a bit-0 "replace if exists" reads correctly
+    either way. One header, reused for rename and hard-link creation alike.
+    """
+
+    _fields_ = [
+        ("Flags", ctypes.c_uint32),
+        ("RootDirectory", ctypes.c_void_p),
+        ("FileNameLength", ctypes.c_uint32),
+    ]
+
+
+def _set_file_relative_name_information(
+    handle_value: int,
+    root_directory_handle: int,
+    new_name: str,
+    *,
+    ex_info_class: int,
+    legacy_info_class: int,
+    replace_if_exists: bool,
+) -> None:
+    """Point one already-open, authenticated HANDLE at a new name/parent.
+
+    ``handle_value`` is the exact child HANDLE authenticated by
+    :func:`open_windows_relative_child_disposition` -- never a reopened
+    pathname -- and ``root_directory_handle`` names the new parent directory by
+    HANDLE, not by path, so the destination is exactly the borrowed parent the
+    caller already authenticated. This goes through ``NtSetInformationFile``
+    (ntdll) rather than the Win32 ``SetFileInformationByHandle`` wrapper: the
+    Win32 wrapper's documented contract has never guaranteed honoring a
+    non-NULL ``RootDirectory`` for a relative rename/link, while the native
+    call -- the same one ``_open_windows_relative_child_handle`` already uses
+    for relative opens -- is the documented way every other HANDLE-relative
+    filesystem operation in Windows (Chromium, .NET, Sysinternals) implements
+    a POSIX-style ``renameat``/``linkat``. The ``_Ex`` information class is
+    tried first (it alone can request atomic replace-if-exists semantics); a
+    pre-Windows-10 1709 filesystem rejects it with ``STATUS_INVALID_PARAMETER``
+    -- the one documented "unsupported" signal, matching
+    :func:`mark_windows_relative_child_disposition` -- at which point the
+    legacy, boolean-only class is retried.
+    """
+
+    new_name, byte_length = _canonical_windows_child_segment(new_name)
+    win_dll = _windows_dll_loader()
+    ntdll = win_dll("ntdll", use_last_error=True)
+    nt_set_information_file = ntdll.NtSetInformationFile
+    nt_set_information_file.argtypes = (
+        ctypes.c_void_p,
+        ctypes.POINTER(_IoStatusBlock),
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+    )
+    nt_set_information_file.restype = ctypes.c_int32
+    rtl_status_to_dos_error = ntdll.RtlNtStatusToDosError
+    rtl_status_to_dos_error.argtypes = (ctypes.c_int32,)
+    rtl_status_to_dos_error.restype = ctypes.c_uint32
+
+    # Not ``ctypes.sizeof(_FileRenameOrLinkInfoHeader)``: ctypes pads a
+    # standalone struct's overall size up to its largest member's alignment
+    # (8, for the HANDLE), but the real ``FILE_RENAME_INFORMATION`` layout has
+    # no such trailing pad -- ``FileName`` immediately follows
+    # ``FileNameLength`` at its natural 4-byte-aligned offset. Using the padded
+    # ``sizeof`` here inserted 4 bytes of garbage before the name on 64-bit and
+    # the kernel rejected it as ``ERROR_INVALID_NAME``. The field's own
+    # ``.offset`` is exact regardless of trailing struct padding.
+    header_size = (
+        _FileRenameOrLinkInfoHeader.FileNameLength.offset + ctypes.sizeof(ctypes.c_uint32)
+    )
+    name_buffer = ctypes.create_unicode_buffer(new_name)
+
+    def build_buffer(flags: int) -> ctypes.Array:
+        buffer = ctypes.create_string_buffer(header_size + byte_length + 2)
+        header = ctypes.cast(buffer, ctypes.POINTER(_FileRenameOrLinkInfoHeader)).contents
+        header.Flags = flags
+        header.RootDirectory = root_directory_handle
+        header.FileNameLength = byte_length
+        ctypes.memmove(ctypes.byref(buffer, header_size), name_buffer, byte_length)
+        return buffer
+
+    def set_information(info_class: int, buffer: ctypes.Array) -> int:
+        io_status = _IoStatusBlock()
+        return int(
+            nt_set_information_file(
+                ctypes.c_void_p(handle_value),
+                ctypes.byref(io_status),
+                buffer,
+                len(buffer),
+                info_class,
+            )
+        )
+
+    def raise_for_status(status: int) -> None:
+        winerror = int(rtl_status_to_dos_error(status))
+        if winerror in _WINDOWS_ALREADY_EXISTS_ERRNOS:
+            raise FileExistsError(errno.EEXIST, f"{new_name!r} already exists")
+        raise OSError(winerror, f"NtSetInformationFile failed for {new_name!r}")
+
+    status = set_information(ex_info_class, build_buffer(0x1 if replace_if_exists else 0x0))
+    if status >= 0:
+        return
+    winerror = int(rtl_status_to_dos_error(status))
+    if winerror not in _WINDOWS_DISPOSITION_UNSUPPORTED_ERRNOS:
+        raise_for_status(status)
+    status = set_information(legacy_info_class, build_buffer(1 if replace_if_exists else 0))
+    if status < 0:
+        raise_for_status(status)
+
+
+def rename_windows_relative_child(
+    src_parent_handle: int,
+    old_name: str,
+    dst_parent_handle: int,
+    new_name: str,
+    *,
+    replace_if_exists: bool = False,
+) -> None:
+    """Rename one exact child from beneath one borrowed parent HANDLE to another.
+
+    Mirrors ``os.replace(old, new, src_dir_fd=..., dst_dir_fd=...)``: the child
+    named ``old_name`` beneath ``src_parent_handle`` is opened and authenticated
+    (non-reparse, stable identity) by
+    :func:`open_windows_relative_child_disposition` first, so a symlink swapped
+    in under the old name is refused with the same ``ELOOP``-style errno every
+    other primitive here uses, and the rename never re-resolves a pathname from
+    scratch. ``src_parent_handle`` and ``dst_parent_handle`` may be the same
+    HANDLE (a sibling rename, the shape this script always uses) or different
+    ones.
+    """
+
+    authority = open_windows_relative_child_disposition(src_parent_handle, old_name)
+    try:
+        _set_file_relative_name_information(
+            authority.handle.value,
+            dst_parent_handle,
+            new_name,
+            ex_info_class=_FILE_RENAME_INFO_EX,
+            legacy_info_class=_FILE_RENAME_INFO,
+            replace_if_exists=replace_if_exists,
+        )
+    finally:
+        authority.close()
+
+
+def link_windows_relative_child(
+    src_parent_handle: int,
+    existing_name: str,
+    dst_parent_handle: int,
+    new_name: str,
+) -> None:
+    """Create a hard link ``new_name`` for ``existing_name``, HANDLE to HANDLE.
+
+    Mirrors ``os.link(old, new, src_dir_fd=..., dst_dir_fd=...)`` and
+    :func:`rename_windows_relative_child`'s shape: the existing child is opened
+    and authenticated first, so a symlink swapped in under ``existing_name`` is
+    refused rather than linked.
+    """
+
+    authority = open_windows_relative_child_disposition(src_parent_handle, existing_name)
+    try:
+        _set_file_relative_name_information(
+            authority.handle.value,
+            dst_parent_handle,
+            new_name,
+            ex_info_class=_FILE_LINK_INFO_EX,
+            legacy_info_class=_FILE_LINK_INFO,
+            replace_if_exists=False,
+        )
+    finally:
+        authority.close()
+
+
+def delete_windows_relative_child(parent_handle: int, child_name: str) -> None:
+    """Authenticate and delete one exact child beneath a borrowed parent HANDLE.
+
+    Composes :func:`open_windows_relative_child_disposition` and
+    :func:`mark_windows_relative_child_disposition` -- the two-step shape every
+    other disposition caller already uses -- into the one-call ``os.unlink``
+    shape the sync script's cleanup paths want.
+    """
+
+    authority = open_windows_relative_child_disposition(parent_handle, child_name)
+    try:
+        mark_windows_relative_child_disposition(authority)
+    finally:
+        authority.close()
 
 
 WINDOWS_REPLACE_RETRY_SECONDS = 1.0
