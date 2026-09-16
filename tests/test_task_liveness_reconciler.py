@@ -1174,7 +1174,18 @@ def test_single_instance_lock_rejects_path_replaced_after_lock(tmp_path, monkeyp
         os.close(replacement_fd)
 
     monkeypatch.setattr(task_reconciler, "lock_fd", _lock_then_replace)
-    with pytest.raises(task_reconciler.ReconcilerLockUnsafe, match="lock_unsafe"):
+    # On Windows the swap can never even complete: a plain os.open lock
+    # descriptor requests no FILE_SHARE_DELETE, so lock_path.unlink() above
+    # itself raises before the replacement file is created.
+    # single_instance_lock observes that OSError from within its own
+    # lock_fd call and reports ReconcilerLockHeld rather than
+    # ReconcilerLockUnsafe -- a different but equally fail-closed refusal,
+    # since the identity check never even gets a chance to be defeated.
+    if os.name == "nt":
+        expected_exc, expected_match = task_reconciler.ReconcilerLockHeld, "lock_held"
+    else:
+        expected_exc, expected_match = task_reconciler.ReconcilerLockUnsafe, "lock_unsafe"
+    with pytest.raises(expected_exc, match=expected_match):
         with task_reconciler.single_instance_lock(lock_path):
             pass
 
@@ -1287,7 +1298,20 @@ def test_write_status_rejects_substituted_mkstemp_path_and_preserves_status(
     task_reconciler.write_status(tmp_path, {"scan_finished_epoch": 456.0})
 
     assert victim.read_text(encoding="utf-8") == "do-not-touch"
-    assert attacked_paths and not Path(attacked_paths[0]).exists()
+    assert attacked_paths
+    if os.name != "nt":
+        assert not Path(attacked_paths[0]).exists()
+    else:
+        # Windows refuses to unlink a file this same process still holds
+        # open (a plain os.open/mkstemp descriptor requests no
+        # FILE_SHARE_DELETE), so the substitution above can never complete
+        # there: os.unlink(created_path) itself raises before os.link ever
+        # runs. write_status sees that OSError and fails closed -- never
+        # writing attacker content -- but its own now-orphaned, still-empty
+        # temp file is left on disk rather than hijacked: a stronger,
+        # OS-level mitigation than the POSIX path, with a harmless leftover
+        # instead of a cleaned-up malicious one.
+        assert Path(attacked_paths[0]).read_bytes() == b""
     assert task_reconciler.read_status(tmp_path)["scan_finished_epoch"] == 123.0
 
     monkeypatch.setattr(task_reconciler.tempfile, "mkstemp", real_mkstemp)
@@ -2241,7 +2265,15 @@ def test_reduced_authority_still_proves_the_locked_file_is_the_validated_file(
         os.close(replacement)
 
     monkeypatch.setattr(task_reconciler, "lock_fd", _lock_then_replace)
-    with pytest.raises(task_reconciler.ReconcilerLockUnsafe, match="lock_unsafe"):
+    # As above: on Windows the swap can't complete at all (unlink of an
+    # open, non-delete-shared descriptor raises first), so single_instance_lock
+    # reports ReconcilerLockHeld from within its own lock_fd call rather than
+    # ReconcilerLockUnsafe from the identity re-check -- equally fail-closed.
+    if os.name == "nt":
+        expected_exc, expected_match = task_reconciler.ReconcilerLockHeld, "lock_held"
+    else:
+        expected_exc, expected_match = task_reconciler.ReconcilerLockUnsafe, "lock_unsafe"
+    with pytest.raises(expected_exc, match=expected_match):
         with task_reconciler.single_instance_lock(lock_path):
             pass
 
