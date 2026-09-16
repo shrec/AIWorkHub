@@ -593,7 +593,7 @@ def test_cleanup_registered_worktree_prunes_git_registration(retained) -> None:
         capture_output=True,
         text=True,
     ).stdout
-    assert str(checkout) in listed
+    assert checkout.as_posix() in listed
     _finish_accepted_card(repo, "TASK-REG", "request-safe")
 
     result = storage_retention.cleanup_accepted_artifacts(
@@ -683,8 +683,8 @@ def test_cleanup_missing_dir_stale_registration_unregisters_only_owned(retained)
     _git(repo, "worktree", "add", "--detach", str(other), "HEAD")
     shutil.rmtree(checkout)
     listed = _worktree_list(repo)
-    assert str(checkout) in listed
-    assert str(other) in listed
+    assert checkout.as_posix() in listed
+    assert other.as_posix() in listed
     _finish_accepted_card(repo, "TASK-STALE", "request-safe")
     evidence = _accepted_evidence("TASK-STALE", "request-safe")
     phase_path = (
@@ -717,7 +717,7 @@ def test_cleanup_missing_dir_stale_registration_unregisters_only_owned(retained)
     assert "worktree" in result["removed"]
     after = _worktree_list(repo)
     assert str(checkout) not in after
-    assert str(other) in after
+    assert other.as_posix() in after
     assert other.is_dir()
     assert not checkout.exists()
 

@@ -105,8 +105,11 @@ def _write_batch(
 
 def _payload_files(repo: Path) -> set[str]:
     qroot = repo / terminal_log_retention.QUARANTINE_RELATIVE_PATH
+    # as_posix(), not str(): callers compare this against "/"-joined
+    # literals, but str() on a relative path uses the host separator
+    # (backslash on Windows).
     return {
-        str(path.relative_to(qroot))
+        path.relative_to(qroot).as_posix()
         for path in qroot.rglob("*")
         if path.is_file() and path.name != terminal_log_retention.MANIFEST_NAME
     }
