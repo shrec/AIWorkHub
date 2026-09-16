@@ -54,8 +54,12 @@ def _new_repo(tmp_path: Path, name: str) -> Path:
 
 
 def _write(path: Path, text: str) -> None:
+    # write_bytes, not write_text: many tests compare a raw on-disk byte
+    # count/hash against one computed from this exact in-memory string, and
+    # Path.write_text translates '\n' to the platform newline (CRLF on
+    # Windows), silently inflating what actually lands on disk.
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8")
+    path.write_bytes(text.encode("utf-8"))
 
 
 @pytest.mark.parametrize("operation", ["index", "remove"])
@@ -388,7 +392,13 @@ def test_db_path_requires_manifest_never_falls_back_to_cwd(tmp_path, monkeypatch
 
 def test_migrate_legacy_db_reads_uri_quoted_source_without_wal_sidecars(tmp_path):
     repo = _new_repo(tmp_path, "readonly_migration")
-    legacy = tmp_path / "legacy source #1?.sqlite"
+    # '#' and the space both require percent-encoding in the file: URI
+    # migrate_legacy_db builds (a literal '#' would otherwise start a URI
+    # fragment) -- that's the scenario this test names. '?' is deliberately
+    # excluded: unlike '#', it is not a legal Windows filename character at
+    # all (CreateFileW itself refuses it, independent of sqlite3 or URIs), so
+    # a name containing it cannot be created on Windows by any API.
+    legacy = tmp_path / "legacy source #1.sqlite"
     conn = sqlite3.connect(legacy)
     try:
         conn.execute("CREATE TABLE symbols (name TEXT NOT NULL)")
@@ -1500,6 +1510,7 @@ def _assert_lock_unavailable(exc, *, errno_name, repo):
     assert str(repo.resolve()) not in json.dumps(payload)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="fcntl.flock is POSIX-only")
 def test_posix_eagain_eacces_remain_build_in_progress(tmp_path, monkeypatch):
     repo = _new_repo(tmp_path, "posix_contention")
     _write(repo / "src" / "live.py", "def live():\n    return 1\n")
@@ -1524,6 +1535,7 @@ def test_posix_eagain_eacces_remain_build_in_progress(tmp_path, monkeypatch):
         sg.build_index(repo, incremental=True)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="fcntl.flock is POSIX-only")
 @pytest.mark.parametrize(
     "err",
     [
@@ -2001,7 +2013,12 @@ def test_multicore_extraction_is_bounded_and_merge_order_is_deterministic(
     assert report.extraction_workers == 2
     assert report.extraction_backend == "process_pool"
     assert report.extraction_fallback_reason == ""
-    assert report.extraction_seconds > 0
+    # >= 0, not > 0: this in-process fake executor extracts four one-line
+    # files, an operation genuinely fast enough to round to 0.0 on some
+    # clocks/loads -- the same tolerance already given every phase in
+    # phase_seconds below (`all(seconds >= 0 ...)`); this one just repeats it
+    # ahead of time for extraction_seconds specifically.
+    assert report.extraction_seconds >= 0
     assert report.files_changed == 4
     assert write_order == [f"pkg/{name}" for name in names]
     assert report.extraction_telemetry["selected_workers"] == 2
@@ -3814,7 +3831,7 @@ def test_same_size_same_mtime_content_mutation_is_reindexed_via_hash(tmp_path):
 
     new_content = "def a():\n    return 2\n"
     assert len(new_content) == len(target.read_text(encoding="utf-8"))
-    target.write_text(new_content, encoding="utf-8")
+    target.write_bytes(new_content.encode("utf-8"))
 
     # Recreate the exact "same size, same mtime" hint condition without
     # depending on ``os.utime`` (unavailable/unpermitted under some
@@ -4152,7 +4169,9 @@ def test_bodygrep_large_no_match_file_rejected_before_decode_and_split(tmp_path,
     """Large ASCII no-match bytes must be rejected before decode/split."""
     repo = _new_repo(tmp_path, "bodygrep_no_match_reject")
     big = repo / "big.md"
-    big.write_text("padding line\n" * 120_000 + "still absent here\n", encoding="utf-8")
+    big.write_bytes(
+        ("padding line\n" * 120_000 + "still absent here\n").encode("utf-8")
+    )
     _write(repo / "hit.md", "the needle appears here\n")
     sg.build_index(repo, incremental=False)
 

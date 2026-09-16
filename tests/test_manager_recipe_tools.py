@@ -625,7 +625,13 @@ mode = sys.argv[1] if len(sys.argv) > 1 else "ok"
 if mode == "big":
     sys.stdout.write("x" * 12000)
 elif mode == "fail":
-    sys.stderr.write("boom\\n")
+    # buffer.write, not stderr.write: production captures raw subprocess
+    # bytes verbatim (byte-for-byte, by design), but sys.stderr is a
+    # text stream that translates "\\n" to os.linesep on write -- "\\r\\n"
+    # on Windows -- before the bytes ever reach the pipe. Writing to the
+    # underlying buffer keeps this probe's own output "\\n"-only on every
+    # platform, which is what this test's exact stderr_tail asserts.
+    sys.stderr.buffer.write(b"boom\\n")
     raise SystemExit(3)
 elif mode == "slow":
     time.sleep(30)
@@ -1661,7 +1667,9 @@ def test_the_packaged_operator_modules_run_as_module_arguments(manager):
     assert str(manager) in payload["detail"]
 
 
-def test_the_operator_modules_resolve_the_repository_they_are_run_in(tmp_path):
+def test_the_operator_modules_resolve_the_repository_they_are_run_in(
+    tmp_path, monkeypatch
+):
     """The portability fix itself: the root comes from the cwd, not __file__."""
     from aiworkhub.recipes import _common
 
@@ -1676,6 +1684,19 @@ def test_the_operator_modules_resolve_the_repository_they_are_run_in(tmp_path):
     # With no .aiworkhub anywhere above, the cwd stands rather than a guess.
     outside = tmp_path / "outside"
     outside.mkdir()
+    # pytest nests tmp_path under the user's own profile directory on
+    # Windows (unlike POSIX's usually-unrelated /tmp), so a real ancestor
+    # above tmp_path -- e.g. a developer's own ~/.aiworkhub -- can otherwise
+    # leak into this walk. Bound the ancestor lookup to tmp_path so only the
+    # directories this test actually created can answer it.
+    real_is_dir = Path.is_dir
+
+    def bounded_is_dir(self: Path) -> bool:
+        if self != tmp_path and tmp_path not in self.parents:
+            return False
+        return real_is_dir(self)
+
+    monkeypatch.setattr(Path, "is_dir", bounded_is_dir)
     assert _common.resolve_repo_root(outside) == outside.resolve()
 
 

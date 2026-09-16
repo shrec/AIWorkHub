@@ -4,6 +4,7 @@ import fnmatch
 import hashlib
 import hmac
 import json
+import ntpath
 import os
 import re
 import sqlite3
@@ -27,6 +28,7 @@ from . import (
     coordinator_config,
     refresh_coordinator_config,
 )
+from . import platform_io
 from . import repository_state
 from . import shared_router
 from . import sqlite_readonly
@@ -176,6 +178,13 @@ def _canonical_result(
     }
 
 
+# How many of THIS interpreter's own re-exec stubs may sit between the MCP
+# server and the Claude process that owns it. A Windows venv contributes exactly
+# one (Scripts\python.exe re-executes the base interpreter); the limit is two so
+# a launcher shim may add one more, and no further, before the chain is refused.
+_CLAUDE_LAUNCHER_HOP_LIMIT = 2
+
+
 def _claude_manager_identity() -> dict[str, str] | None:
     """Verify that this MCP server is the direct child of an interactive
     Claude Code VS Code session bound to the same repository.
@@ -233,31 +242,65 @@ def _claude_descriptor_identity(
 def _claude_windows_manager_identity() -> dict[str, str] | None:
     """Windows-native Claude Code VS Code manager verification.
 
-    There is no ``/proc`` on Windows. Confirm the exact direct parent process
-    through a native Toolhelp snapshot (same-user SID and a live ``claude``
+    There is no ``/proc`` on Windows. Confirm the owning Claude process through
+    a native Toolhelp snapshot (same-user SID at every hop and a live ``claude``
     image name), then validate ``~/.claude/sessions/<pid>.json`` exactly like
-    the POSIX path. Missing, malformed, foreign, stale or unverifiable
-    evidence fails closed.
+    the POSIX path. Missing, malformed, foreign, stale or unverifiable evidence
+    fails closed.
+
+    The chain is walked rather than read one level deep because a Windows venv
+    ``Scripts\\python.exe`` is a REDIRECTOR: it re-executes the base interpreter
+    as a separate process, so this server's direct parent is that stub and never
+    ``claude.exe``. Measured on this host: pid 2652 (the server) <- pid 38272
+    (the venv stub) <- pid 29612 (claude.exe, whose session descriptor validates
+    cleanly). POSIX has no such hop, because ``.venv/bin/python`` is a symlink
+    the loader follows in place -- which is why the same verification passed on
+    Linux and could never pass here, leaving Claude unable to hold the manager
+    seat on Windows at all.
+
+    Only a hop that is THIS interpreter's own image name, owned by the same
+    user, is skipped, and at most ``_CLAUDE_LAUNCHER_HOP_LIMIT`` of them: the
+    evidence that grants the seat is still one exact ``claude`` ancestor with a
+    valid, repository-bound descriptor.
     """
+
     parent_pid = os.getppid()
     if parent_pid <= 1:
         return None
     current_sid = _windows_process_owner_sid(os.getpid())
-    parent_sid = _windows_process_owner_sid(parent_pid)
-    if current_sid is None or parent_sid is None or parent_sid != current_sid:
+    if current_sid is None:
         return None
-    image_names = _windows_process_image_names()
-    if image_names is None:
+    tree = _windows_process_tree()
+    if tree is None:
         return None
-    parent_image = str(image_names.get(parent_pid) or "")
-    if not parent_image or "claude" not in parent_image.lower():
+    interpreter_image = ntpath.basename(sys.executable).lower()
+    candidate = parent_pid
+    owner_pid: int | None = None
+    for _hop in range(_CLAUDE_LAUNCHER_HOP_LIMIT + 1):
+        entry = tree.get(candidate)
+        if entry is None:
+            return None
+        candidate_parent, candidate_image = entry
+        if _windows_process_owner_sid(candidate) != current_sid:
+            return None
+        image = str(candidate_image or "").lower()
+        if not image:
+            return None
+        if "claude" in image:
+            owner_pid = candidate
+            break
+        if image != interpreter_image:
+            # Not our own re-exec stub: this chain does not belong to Claude.
+            return None
+        candidate = candidate_parent
+    if owner_pid is None:
         return None
     try:
-        descriptor_path = Path.home() / ".claude" / "sessions" / f"{parent_pid}.json"
+        descriptor_path = Path.home() / ".claude" / "sessions" / f"{owner_pid}.json"
         descriptor = json.loads(descriptor_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return None
-    return _claude_descriptor_identity(parent_pid, descriptor)
+    return _claude_descriptor_identity(owner_pid, descriptor)
 
 
 def _codex_manager_identity() -> dict[str, str] | None:
@@ -640,61 +683,25 @@ def _windows_process_parent_map() -> dict[int, int] | None:
         return None
 
 
+def _windows_process_tree() -> dict[int, tuple[int, str]] | None:
+    """Windows PID -> (parent PID, image name), through the platform facade.
+
+    The Toolhelp snapshot itself belongs to ``platform_io``: that module owns
+    every "how does this host answer it" difference, and keeping the ctypes
+    here would put a second native implementation beside the one that already
+    enumerates and terminates process trees.
+    """
+
+    return platform_io.windows_process_tree()
+
+
 def _windows_process_image_names() -> dict[int, str] | None:
     """Return a native Windows PID -> executable image name snapshot."""
 
-    if os.name != "nt":
+    tree = _windows_process_tree()
+    if tree is None:
         return None
-    try:
-        import ctypes
-        from ctypes import wintypes
-
-        class PROCESSENTRY32W(ctypes.Structure):
-            _fields_ = [
-                ("dwSize", wintypes.DWORD),
-                ("cntUsage", wintypes.DWORD),
-                ("th32ProcessID", wintypes.DWORD),
-                ("th32DefaultHeapID", ctypes.c_size_t),
-                ("th32ModuleID", wintypes.DWORD),
-                ("cntThreads", wintypes.DWORD),
-                ("th32ParentProcessID", wintypes.DWORD),
-                ("pcPriClassBase", wintypes.LONG),
-                ("dwFlags", wintypes.DWORD),
-                ("szExeFile", wintypes.WCHAR * 260),
-            ]
-
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        create_snapshot = kernel32.CreateToolhelp32Snapshot
-        create_snapshot.argtypes = (wintypes.DWORD, wintypes.DWORD)
-        create_snapshot.restype = wintypes.HANDLE
-        process_first = kernel32.Process32FirstW
-        process_first.argtypes = (wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W))
-        process_first.restype = wintypes.BOOL
-        process_next = kernel32.Process32NextW
-        process_next.argtypes = (wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W))
-        process_next.restype = wintypes.BOOL
-        close_handle = kernel32.CloseHandle
-        close_handle.argtypes = (wintypes.HANDLE,)
-        close_handle.restype = wintypes.BOOL
-
-        snapshot = create_snapshot(0x00000002, 0)  # TH32CS_SNAPPROCESS
-        if snapshot == wintypes.HANDLE(-1).value:
-            return None
-        names: dict[int, str] = {}
-        try:
-            entry = PROCESSENTRY32W()
-            entry.dwSize = ctypes.sizeof(entry)
-            if not process_first(snapshot, ctypes.byref(entry)):
-                return None
-            while True:
-                names[int(entry.th32ProcessID)] = str(entry.szExeFile)
-                if not process_next(snapshot, ctypes.byref(entry)):
-                    break
-        finally:
-            close_handle(snapshot)
-        return names
-    except (AttributeError, OSError, TypeError, ValueError):
-        return None
+    return {pid: image for pid, (_parent, image) in tree.items()}
 
 
 def _windows_process_owner_sid(pid: int) -> str | None:
@@ -774,13 +781,24 @@ def _pid_in_same_windows_user_ancestor_chain(
     *,
     max_depth: int,
     start_pid: int | None = None,
+    parents: dict[int, int] | None = None,
+    current_sid: str | None = None,
 ) -> bool:
-    """Windows equivalent of the same-uid bounded ``/proc`` ancestry check."""
+    """Windows equivalent of the same-uid bounded ``/proc`` ancestry check.
+
+    ``parents``/``current_sid`` let a caller checking many candidate PIDs in
+    one pass (see ``_implicit_windows_codex_repository_root``) take one
+    Toolhelp snapshot and one owner-SID lookup for every candidate instead of
+    this function repeating both, in full, per call -- a full process-table
+    walk is the same cost whether one PID or two hundred are being checked.
+    """
 
     if target_pid <= 1 or max_depth <= 0:
         return False
-    current_sid = _windows_process_owner_sid(os.getpid())
-    parents = _windows_process_parent_map()
+    if current_sid is None:
+        current_sid = _windows_process_owner_sid(os.getpid())
+    if parents is None:
+        parents = _windows_process_parent_map()
     if current_sid is None or parents is None:
         return False
     pid = os.getppid() if start_pid is None else start_pid
@@ -1119,6 +1137,9 @@ def _implicit_windows_codex_repository_root() -> Path | None:
         return None
 
     matches: dict[tuple[str, str, str], Path] = {}
+    parents: dict[int, int] | None = None
+    current_sid: str | None = None
+    snapshot_taken = False
     for record in registry.get("repositories", []):
         if not isinstance(record, dict):
             continue
@@ -1127,9 +1148,20 @@ def _implicit_windows_codex_repository_root() -> Path | None:
         if str(record.get("selected_provider") or "").strip().lower() != "codex":
             continue
         extension_host_pid = int(record.get("extension_host_pid") or 0)
-        if extension_host_pid <= 1 or not _pid_in_same_windows_user_ancestor_chain(
+        if extension_host_pid <= 1:
+            continue
+        if not snapshot_taken:
+            # One Toolhelp snapshot and one owner-SID lookup serve every
+            # candidate record below instead of each of up to 256 records
+            # separately re-enumerating the entire machine's process table.
+            parents = _windows_process_parent_map()
+            current_sid = _windows_process_owner_sid(os.getpid())
+            snapshot_taken = True
+        if not _pid_in_same_windows_user_ancestor_chain(
             extension_host_pid,
             max_depth=16,
+            parents=parents,
+            current_sid=current_sid,
         ):
             continue
         repo_id = str(record.get("repo_id") or "").strip()

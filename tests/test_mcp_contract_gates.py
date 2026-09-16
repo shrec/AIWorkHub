@@ -101,6 +101,14 @@ def _gate_env(repo: Path) -> dict[str, str]:
     env["PYTHONPATH"] = os.pathsep.join(
         [str(REPO / "src"), env.get("PYTHONPATH", "")]
     ).rstrip(os.pathsep)
+    # Several of these gate scripts print a literal U+2713 checkmark.
+    # subprocess.run here captures stdout through a pipe, and Python falls
+    # back to the OS's ANSI codepage for a piped stream unless told
+    # otherwise -- on a non-UTF-8 codepage host (e.g. Windows set to
+    # cp1251) that raises UnicodeEncodeError before the gate ever runs its
+    # own checks. Force UTF-8 the same way every OS already gives a real
+    # terminal.
+    env["PYTHONIOENCODING"] = "utf-8"
     return env
 
 

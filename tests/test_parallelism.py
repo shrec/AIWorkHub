@@ -7,13 +7,18 @@ from aiworkhub import parallelism
 
 
 def test_cpu_capacity_prefers_process_affinity() -> None:
-    with mock.patch.object(os, "sched_getaffinity", return_value={0, 1, 2}):
+    # create=True: os.sched_getaffinity does not exist on Windows at all, so
+    # mock.patch.object needs permission to add the attribute for the
+    # duration of the patch rather than requiring it to already be there.
+    with mock.patch.object(
+        os, "sched_getaffinity", create=True, return_value={0, 1, 2}
+    ):
         with mock.patch.object(os, "cpu_count", return_value=64):
             assert parallelism.get_cpu_capacity() == 3
 
 
 def test_cpu_capacity_has_safe_fallback() -> None:
-    with mock.patch.object(os, "sched_getaffinity", side_effect=OSError):
+    with mock.patch.object(os, "sched_getaffinity", create=True, side_effect=OSError):
         with mock.patch.object(os, "cpu_count", return_value=None):
             assert parallelism.get_cpu_capacity() == 1
 

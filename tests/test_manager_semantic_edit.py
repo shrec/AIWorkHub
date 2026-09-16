@@ -32,7 +32,12 @@ CLI = _ROOT / "scripts" / "manager_semantic_edit.py"
 
 
 def _repo(tmp_path: Path, text: str = "one\ntwo\nthree\nfour\nfive\n") -> Path:
-    (tmp_path / "x.py").write_text(text, encoding="utf-8")
+    # NF-2026-00014: ``write_text`` uses universal newlines, so on Windows these
+    # LF fixtures landed on disk as CRLF and the byte-exact fragment assertions
+    # compared "two\r\nthree\r\n" against "two\nthree\n" -- a fixture artefact,
+    # not an applier defect. The applier's job is to preserve whatever bytes are
+    # there, so the fixture must write exactly the bytes it claims to write.
+    (tmp_path / "x.py").write_text(text, encoding="utf-8", newline="")
     return tmp_path
 
 
@@ -70,11 +75,18 @@ def test_an_executable_file_keeps_its_mode(tmp_path):
     """mkstemp makes 0600 and os.replace carries it; the mode must survive."""
     root = _repo(tmp_path, "#!/bin/sh\necho one\necho two\n")
     os.chmod(root / "x.py", 0o755)
+    # NF-2026-00014: Windows has no executable bit -- os.chmod only toggles the
+    # read-only attribute, so 0o755 reads back as 0o666 there. The invariant the
+    # applier owns is that the atomic swap PRESERVES the mode the host reports,
+    # not that it invents a POSIX one; POSIX additionally pins the exact bits.
+    before = os.stat(root / "x.py").st_mode & 0o777
+    if os.name != "nt":
+        assert before == 0o755
     target = _prepare(root, 2, 2)
     semantic_edit_applier.replace_prepared_range(
         root, target, "echo ONE\n", allowed_writes=["x.py"]
     )
-    assert os.stat(root / "x.py").st_mode & 0o777 == 0o755
+    assert os.stat(root / "x.py").st_mode & 0o777 == before
 
 
 def test_a_path_outside_allowed_writes_is_refused(tmp_path):

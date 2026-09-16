@@ -135,12 +135,444 @@ def stat_owned_by_current_user(
     return uid is not None and owner_uid == uid
 
 
+# Windows secret-file trust. POSIX answers "may only the owner read this key"
+# with st_uid plus mode 0o600. Windows has neither: os.chmod(..., 0o600) reads
+# back as 0o666, and st_uid is always 0. The equivalent question there is asked
+# of the security descriptor on an ALREADY-OPEN handle -- never of a pathname,
+# which a symlink or a swap can redirect between the check and the read.
+_OWNER_SECURITY_INFORMATION = 0x00000001
+_DACL_SECURITY_INFORMATION = 0x00000004
+_SE_FILE_OBJECT = 1
+_TOKEN_QUERY = 0x0008
+_TOKEN_USER_CLASS = 1
+_TOKEN_OWNER_CLASS = 4
+_ACL_SIZE_INFORMATION = 2
+_ACCESS_ALLOWED_ACE_TYPE = 0x00
+_ACCESS_ALLOWED_OBJECT_ACE_TYPE = 0x05
+
+# Principals whose presence in a key file's DACL means the secret is readable
+# beyond its owner. SYSTEM and BUILTIN\Administrators are deliberately NOT in
+# this set: they are inherited by essentially every file on a Windows host and
+# already hold the privilege to read anything, so refusing them would refuse
+# every legitimately created key rather than describe a real exposure.
+WINDOWS_UNTRUSTED_SECRET_SIDS = frozenset(
+    {
+        "S-1-1-0",  # Everyone
+        "S-1-5-7",  # Anonymous Logon
+        "S-1-5-11",  # Authenticated Users
+        "S-1-5-32-545",  # BUILTIN\\Users
+        "S-1-5-32-546",  # BUILTIN\\Guests
+        "S-1-5-113",  # Local account
+        "S-1-5-114",  # Local account and member of Administrators group
+    }
+)
+
+
+def _windows_sid_string(advapi32: Any, kernel32: Any, sid: Any) -> str:
+    """Render one PSID as its canonical ``S-1-...`` string, or "" on failure."""
+
+    convert = advapi32.ConvertSidToStringSidW
+    convert.argtypes = (ctypes.c_void_p, ctypes.POINTER(ctypes.c_wchar_p))
+    convert.restype = ctypes.c_int
+    out = ctypes.c_wchar_p()
+    if not convert(sid, ctypes.byref(out)):
+        return ""
+    try:
+        return str(out.value or "")
+    finally:
+        kernel32.LocalFree(ctypes.c_void_p(ctypes.cast(out, ctypes.c_void_p).value))
+
+
+def _windows_token_sids(advapi32: Any, kernel32: Any) -> frozenset[str]:
+    """The SIDs this process legitimately creates files as.
+
+    Both the token USER and the token OWNER are accepted: an elevated session
+    creates files owned by BUILTIN\\Administrators rather than by the user, so
+    checking only the user SID would refuse the key the host itself just wrote.
+    """
+
+    get_current_process = kernel32.GetCurrentProcess
+    get_current_process.restype = ctypes.c_void_p
+    open_process_token = advapi32.OpenProcessToken
+    open_process_token.argtypes = (
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_void_p),
+    )
+    open_process_token.restype = ctypes.c_int
+    get_token_information = advapi32.GetTokenInformation
+    get_token_information.argtypes = (
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_uint32),
+    )
+    get_token_information.restype = ctypes.c_int
+
+    token = ctypes.c_void_p()
+    if not open_process_token(
+        get_current_process(), _TOKEN_QUERY, ctypes.byref(token)
+    ):
+        return frozenset()
+    try:
+        sids: set[str] = set()
+        for token_class in (_TOKEN_USER_CLASS, _TOKEN_OWNER_CLASS):
+            needed = ctypes.c_uint32(0)
+            get_token_information(token, token_class, None, 0, ctypes.byref(needed))
+            if not needed.value:
+                continue
+            buffer = ctypes.create_string_buffer(needed.value)
+            if not get_token_information(
+                token, token_class, buffer, needed.value, ctypes.byref(needed)
+            ):
+                continue
+            # TOKEN_USER and TOKEN_OWNER both begin with one PSID field.
+            sid = ctypes.c_void_p.from_buffer(buffer)
+            rendered = _windows_sid_string(advapi32, kernel32, sid)
+            if rendered:
+                sids.add(rendered)
+        return frozenset(sids)
+    finally:
+        kernel32.CloseHandle(token)
+
+
+class _AclSizeInformation(ctypes.Structure):
+    _fields_ = (
+        ("AceCount", ctypes.c_uint32),
+        ("AclBytesInUse", ctypes.c_uint32),
+        ("AclBytesFree", ctypes.c_uint32),
+    )
+
+
+class _AceHeader(ctypes.Structure):
+    _fields_ = (
+        ("AceType", ctypes.c_ubyte),
+        ("AceFlags", ctypes.c_ubyte),
+        ("AceSize", ctypes.c_uint16),
+    )
+
+
+class _AccessAllowedAce(ctypes.Structure):
+    _fields_ = (
+        ("Header", _AceHeader),
+        ("Mask", ctypes.c_uint32),
+        ("SidStart", ctypes.c_uint32),
+    )
+
+
+def windows_descriptor_secret_trust(fd: int) -> tuple[bool, str]:
+    """Answer the Windows form of "only the owner can read this key".
+
+    Reads the OWNER and the DACL from the security descriptor of THIS open
+    descriptor's handle, so neither answer can be redirected by a pathname race.
+    Returns ``(trusted, reason)`` and fails closed: every error path answers
+    ``False`` with a named reason rather than defaulting to trusted.
+    """
+
+    if os.name != "nt":
+        return False, "not_a_windows_host"
+    try:
+        import msvcrt
+
+        handle = msvcrt.get_osfhandle(fd)
+    except (ImportError, OSError, ValueError):
+        return False, "handle_unavailable"
+    try:
+        win_dll = _windows_dll_loader()
+        advapi32 = win_dll("advapi32", use_last_error=True)
+        kernel32 = win_dll("kernel32", use_last_error=True)
+        kernel32.LocalFree.argtypes = (ctypes.c_void_p,)
+        kernel32.LocalFree.restype = ctypes.c_void_p
+        kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+        kernel32.CloseHandle.restype = ctypes.c_int
+
+        get_security_info = advapi32.GetSecurityInfo
+        get_security_info.argtypes = (
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(ctypes.c_void_p),
+        )
+        get_security_info.restype = ctypes.c_uint32
+
+        owner = ctypes.c_void_p()
+        dacl = ctypes.c_void_p()
+        descriptor = ctypes.c_void_p()
+        status = int(
+            get_security_info(
+                ctypes.c_void_p(handle),
+                _SE_FILE_OBJECT,
+                _OWNER_SECURITY_INFORMATION | _DACL_SECURITY_INFORMATION,
+                ctypes.byref(owner),
+                None,
+                ctypes.byref(dacl),
+                None,
+                ctypes.byref(descriptor),
+            )
+        )
+        if status != 0:
+            return False, f"security_descriptor_unreadable:{status}"
+        try:
+            trusted_sids = _windows_token_sids(advapi32, kernel32)
+            if not trusted_sids:
+                return False, "process_token_unreadable"
+            owner_sid = _windows_sid_string(advapi32, kernel32, owner)
+            if not owner_sid:
+                return False, "owner_unreadable"
+            if owner_sid not in trusted_sids:
+                return False, f"foreign_owner:{owner_sid}"
+            if not dacl.value:
+                # A NULL DACL grants everyone full control.
+                return False, "null_dacl_grants_everyone"
+            get_acl_information = advapi32.GetAclInformation
+            get_acl_information.argtypes = (
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+                ctypes.c_int,
+            )
+            get_acl_information.restype = ctypes.c_int
+            get_ace = advapi32.GetAce
+            get_ace.argtypes = (
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+                ctypes.POINTER(ctypes.c_void_p),
+            )
+            get_ace.restype = ctypes.c_int
+
+            size_info = _AclSizeInformation()
+            if not get_acl_information(
+                dacl,
+                ctypes.byref(size_info),
+                ctypes.sizeof(size_info),
+                _ACL_SIZE_INFORMATION,
+            ):
+                return False, "dacl_unreadable"
+            for index in range(size_info.AceCount):
+                ace = ctypes.c_void_p()
+                if not get_ace(dacl, index, ctypes.byref(ace)):
+                    return False, f"ace_unreadable:{index}"
+                header = _AceHeader.from_address(int(ace.value or 0))
+                if header.AceType not in (
+                    _ACCESS_ALLOWED_ACE_TYPE,
+                    _ACCESS_ALLOWED_OBJECT_ACE_TYPE,
+                ):
+                    continue
+                sid_address = int(ace.value or 0) + _AccessAllowedAce.SidStart.offset
+                granted = _windows_sid_string(
+                    advapi32, kernel32, ctypes.c_void_p(sid_address)
+                )
+                if not granted:
+                    return False, f"ace_sid_unreadable:{index}"
+                if granted in WINDOWS_UNTRUSTED_SECRET_SIDS:
+                    return False, f"world_readable_ace:{granted}"
+            return True, "owner_bound_dacl"
+        finally:
+            if descriptor.value:
+                kernel32.LocalFree(descriptor)
+    except (AttributeError, OSError, ValueError) as exc:
+        return False, f"windows_security_api_unavailable:{exc}"
+
+
 # Directory-privacy vocabulary. "Is this directory readable only by its owner"
 # is a POSIX MODE question on POSIX and an ACL question on Windows; this module
 # reads the first and does not yet read the second, so it must be able to say
 # so rather than return a boolean it cannot justify.
 DIRECTORY_PRIVACY_BACKEND_POSIX_MODE = "posix_mode_bits"
 DIRECTORY_PRIVACY_BACKEND_NONE = "none"
+
+
+def republish_standard_input_handle() -> bool:
+    """Make the PROCESS std input handle agree with descriptor 0 again.
+
+    ``os.dup2`` rebinds the C runtime's descriptor 0, but a child is handed the
+    PROCESS-level ``STD_INPUT_HANDLE``. Windows is the only host where the two
+    can disagree, and a child that inherits the stale one keeps whatever the
+    descriptor no longer points at. Publishing the current handle keeps the two
+    answers identical. Returns whether the handle was republished; every other
+    host answers ``False`` because it has nothing to republish.
+    """
+
+    if not is_windows():
+        return False
+    try:
+        import msvcrt
+
+        kernel32 = _windows_dll_loader()("kernel32", use_last_error=True)
+        kernel32.SetStdHandle.argtypes = (ctypes.c_uint32, ctypes.c_void_p)
+        kernel32.SetStdHandle.restype = ctypes.c_int
+        return bool(
+            kernel32.SetStdHandle(
+                ctypes.c_uint32(0xFFFFFFF6),  # STD_INPUT_HANDLE (-10) as DWORD
+                ctypes.c_void_p(msvcrt.get_osfhandle(0)),
+            )
+        )
+    except (AttributeError, ImportError, OSError, ValueError):
+        return False
+
+
+_PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000
+_ACL_REVISION = 2
+_FILE_ALL_ACCESS = 0x1F01FF
+
+
+_GENERIC_WRITE_DAC = 0x00040000  # WRITE_DAC
+_GENERIC_READ_CONTROL = 0x00020000  # READ_CONTROL
+# Measured: SetSecurityInfo(..., DACL_SECURITY_INFORMATION, ...) on a handle
+# opened with WRITE_DAC alone fails ACCESS_DENIED (5); it also reads the
+# existing security descriptor as part of applying the new DACL, so the
+# handle needs READ_CONTROL too. WRITE_DAC|READ_CONTROL together succeeded.
+_DACL_WRITE_ACCESS = _GENERIC_WRITE_DAC | _GENERIC_READ_CONTROL
+_FILE_SHARE_ALL = 0x00000007  # READ | WRITE | DELETE
+_OPEN_EXISTING = 3
+
+
+def windows_harden_owner_only_key_dacl(path: "Path | str") -> tuple[bool, str]:
+    """Replace a key file's DACL with a protected, owner-only grant.
+
+    NF-2026-00011 follow-up, found live: a key created BEFORE this module's
+    read-side trust check existed inherits its parent directory's DACL, which
+    on this host granted Authenticated Users (S-1-5-11) read access.
+    ``windows_descriptor_secret_trust`` then correctly refuses it -- which is
+    exactly right for a key someone else can read -- but nothing had ever
+    hardened the WRITE side to stop producing one. Measured: deleting and
+    recreating the key through the unpatched create path reproduced the
+    identical refusal, so this is not a one-off bad file, it is every key this
+    process creates under a permissive parent, forever, until the create path
+    is fixed.
+
+    Takes a PATH rather than an already-open descriptor and opens its own
+    handle requesting ``WRITE_DAC | READ_CONTROL``: measured on this host, a
+    CRT descriptor from ``os.open`` (``O_RDWR``/``O_WRONLY``) never carries
+    those rights -- ``SetSecurityInfo`` on it failed ``ACCESS_DENIED`` even
+    though this process owns the file, because Windows grants a right only
+    when the handle's own open request asked for it. ``WRITE_DAC`` alone is
+    also not enough: ``SetSecurityInfo`` reads the existing security
+    descriptor as part of applying the new one, so it needs ``READ_CONTROL``
+    too -- measured directly, a ``WRITE_DAC``-only handle still failed
+    ``ACCESS_DENIED`` on this same call. The caller has already pinned the
+    file's identity (no symlink, matching ``(st_dev, st_ino)``) immediately
+    before calling this, on the SAME repo-local, non-adversarial path; this
+    function does not repeat that check.
+
+    Grants FILE_ALL_ACCESS to both the process token's USER SID and its OWNER
+    SID -- an elevated session creates files owned by BUILTIN\\Administrators,
+    and granting only one would lock the same account out of its own key
+    across an elevation change -- and marks the DACL PROTECTED so it stops
+    inheriting from the parent directory, closing the exact channel that
+    caused this. Returns ``(ok, reason)`` and never raises; a caller that gets
+    ``False`` must fail closed rather than keep the (unprotected, inherited)
+    DACL the file already had.
+    """
+
+    if not is_windows():
+        return False, "not_a_windows_host"
+    try:
+        win_dll = _windows_dll_loader()
+        advapi32 = win_dll("advapi32", use_last_error=True)
+        kernel32 = win_dll("kernel32", use_last_error=True)
+        kernel32.LocalFree.argtypes = (ctypes.c_void_p,)
+        kernel32.LocalFree.restype = ctypes.c_void_p
+        create_file = kernel32.CreateFileW
+        create_file.argtypes = (
+            ctypes.c_wchar_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+        )
+        create_file.restype = ctypes.c_void_p
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = (ctypes.c_void_p,)
+        close_handle.restype = ctypes.c_int
+
+        handle = create_file(
+            str(path),
+            _DACL_WRITE_ACCESS,
+            _FILE_SHARE_ALL,
+            None,
+            _OPEN_EXISTING,
+            0,
+            None,
+        )
+        if not handle or handle == _INVALID_HANDLE_VALUE:
+            return False, f"create_file_write_dac_failed:{ctypes.get_last_error()}"
+        try:
+            trusted_sids = _windows_token_sids(advapi32, kernel32)
+            if not trusted_sids:
+                return False, "process_token_unreadable"
+
+            convert = advapi32.ConvertStringSidToSidW
+            convert.argtypes = (ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_void_p))
+            convert.restype = ctypes.c_int
+            initialize_acl = advapi32.InitializeAcl
+            initialize_acl.argtypes = (ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32)
+            initialize_acl.restype = ctypes.c_int
+            add_ace = advapi32.AddAccessAllowedAce
+            add_ace.argtypes = (
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+                ctypes.c_void_p,
+            )
+            add_ace.restype = ctypes.c_int
+            set_security_info = advapi32.SetSecurityInfo
+            set_security_info.argtypes = (
+                ctypes.c_void_p,
+                ctypes.c_int,
+                ctypes.c_uint32,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+            )
+            set_security_info.restype = ctypes.c_uint32
+
+            # 1024 bytes comfortably holds a handful of ACEs; InitializeAcl
+            # takes the BUFFER capacity, not the bytes actually used, so
+            # over-allocating is harmless and avoids hand-computing exact
+            # ACE/header sizes.
+            acl_buffer = ctypes.create_string_buffer(1024)
+            if not initialize_acl(acl_buffer, len(acl_buffer), _ACL_REVISION):
+                return False, f"initialize_acl_failed:{ctypes.get_last_error()}"
+
+            psids: list[ctypes.c_void_p] = []
+            try:
+                for sid_string in sorted(trusted_sids):
+                    psid = ctypes.c_void_p()
+                    if not convert(sid_string, ctypes.byref(psid)):
+                        return False, f"convert_sid_failed:{sid_string}"
+                    psids.append(psid)
+                    if not add_ace(acl_buffer, _ACL_REVISION, _FILE_ALL_ACCESS, psid):
+                        return False, f"add_access_allowed_ace_failed:{ctypes.get_last_error()}"
+
+                status = set_security_info(
+                    ctypes.c_void_p(handle),
+                    _SE_FILE_OBJECT,
+                    _DACL_SECURITY_INFORMATION | _PROTECTED_DACL_SECURITY_INFORMATION,
+                    None,
+                    None,
+                    acl_buffer,
+                    None,
+                )
+                if status != 0:
+                    return False, f"set_security_info_failed:{status}"
+                return True, "owner_only_dacl_applied"
+            finally:
+                for psid in psids:
+                    if psid.value:
+                        kernel32.LocalFree(psid)
+        finally:
+            close_handle(ctypes.c_void_p(handle))
+    except (AttributeError, OSError, ValueError) as exc:
+        return False, f"windows_security_api_unavailable:{exc}"
 
 
 def directory_privacy_backend(platform_name: str | None = None) -> str:
@@ -233,9 +665,19 @@ def available_memory_bytes(platform_name: str | None = None) -> int | None:
 
 
 def _windows_creation_flag() -> int:
-    """Return the named Windows process-group flag through a typed boundary."""
+    """Return the named Windows process-group flag through a typed boundary.
 
-    return cast(int, getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+    ``subprocess.CREATE_NEW_PROCESS_GROUP`` only exists in the ``subprocess``
+    module when Python itself is built for Windows, so on Linux/macOS
+    ``getattr`` cannot see it. This function must describe what Windows
+    WOULD use even when queried from a non-Windows host (``platform_name``
+    lets a caller ask for the Windows answer while running elsewhere), so the
+    fallback is the documented, stable literal (0x00000200) rather than 0.
+    """
+
+    return cast(
+        int, getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+    )
 
 
 def process_group_launch_kwargs(
@@ -548,6 +990,7 @@ _WINDOWS_CHILD_DESIRED_ACCESS = 0x00110080  # DELETE | FILE_READ_ATTRIBUTES | SY
 _WINDOWS_CHILD_SHARE_ACCESS = 0x3  # FILE_SHARE_READ | FILE_SHARE_WRITE
 
 _FILE_OPEN = 0x1
+_FILE_CREATE = 0x2
 _FILE_DIRECTORY_FILE = 0x1
 _FILE_SYNCHRONOUS_IO_NONALERT = 0x20
 _FILE_OPEN_REPARSE_POINT = 0x00200000
@@ -609,8 +1052,21 @@ _FILE_ATTRIBUTE_TAG_INFO = 9
 _FILE_ID_INFO = 18
 _FILE_DISPOSITION_INFO = 4
 _FILE_DISPOSITION_INFO_EX = 21
+# Native NtSetInformationFile FILE_INFORMATION_CLASS values (a different
+# numbering from the FILE_INFO_BY_HANDLE_CLASS values just above, which are
+# Win32's SetFileInformationByHandle enum and only used for disposition).
+_FILE_RENAME_INFO = 10
+_FILE_RENAME_INFO_EX = 65
+_FILE_LINK_INFO = 11
+_FILE_LINK_INFO_EX = 72
 _FILE_DISPOSITION_FLAG_DELETE = 0x00000001
 _FILE_DISPOSITION_FLAG_POSIX_SEMANTICS = 0x00000002
+# CreateFileW-only flags (distinct namespace from the NtCreateFile
+# CreateOptions constants above, though FILE_FLAG_OPEN_REPARSE_POINT
+# happens to share _FILE_OPEN_REPARSE_POINT's bit value).
+_WINDOWS_OPEN_EXISTING = 3
+_FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+_FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
 # The one documented "unsupported" result: pre-Windows 10 1709 filesystems
 # reject FileDispositionInfoEx with ERROR_INVALID_PARAMETER (87) -- the exact
 # signal that plain FileDispositionInfo delete semantics is the only fallback.
@@ -761,8 +1217,10 @@ def _open_windows_relative_child_handle(
     desired_access: int,
     share_access: int,
     create_options: int,
+    disposition: int = _FILE_OPEN,
 ) -> tuple[OwnedWindowsHandle, Any, Callable[[], int]]:
-    """Open one exact child segment beneath a borrowed parent HANDLE.
+    """Open (or, with ``disposition=_FILE_CREATE``, exclusively create) one
+    exact child segment beneath a borrowed parent HANDLE.
 
     Returns the owned HANDLE together with the bound
     ``GetFileInformationByHandleEx`` and last-error getters so the caller can
@@ -834,7 +1292,7 @@ def _open_windows_relative_child_handle(
             None,
             0,
             share_access,
-            _FILE_OPEN,
+            disposition,
             create_options,
             None,
             0,
@@ -883,11 +1341,13 @@ def open_windows_relative_child_directory(
             ctypes.sizeof(tag_info),
         ):
             raise _windows_error(get_last_error())
-        if (
-            not tag_info.FileAttributes & _FILE_ATTRIBUTE_DIRECTORY
-            or tag_info.ReparseTag != 0
-        ):
-            raise OSError("opened child is not a non-reparse directory")
+        if tag_info.ReparseTag != 0:
+            # A distinct errno (matching POSIX ELOOP) lets every caller reuse
+            # the same "refuse a symlink/junction without following it" branch
+            # it already has for ``os.open(..., O_NOFOLLOW)``.
+            raise OSError(errno.ELOOP, "opened child is a reparse point")
+        if not tag_info.FileAttributes & _FILE_ATTRIBUTE_DIRECTORY:
+            raise OSError(errno.ENOTDIR, "opened child is not a directory")
         file_id = FILE_ID_INFO()
         if not get_file_information(
             owned.value,
@@ -897,7 +1357,7 @@ def open_windows_relative_child_directory(
         ):
             raise _windows_error(get_last_error())
         if file_id.volume_serial_number == 0 or not any(file_id.file_id):
-            raise OSError("opened child has no stable volume/file identity")
+            raise OSError(errno.EINVAL, "opened child has no stable volume/file identity")
     except BaseException:
         owned.close()
         raise
@@ -922,15 +1382,59 @@ def open_windows_relative_regular_file_descriptor(parent_handle: int, child_name
         for info_class, value in ((_FILE_ATTRIBUTE_TAG_INFO, attributes), (_FILE_ID_INFO, identity)):
             if not information(owned.value, info_class, ctypes.byref(value), ctypes.sizeof(value)):
                 raise _windows_error(last_error())
-        if (
-            attributes.FileAttributes & (_FILE_ATTRIBUTE_DIRECTORY | _FILE_ATTRIBUTE_DEVICE | 0x400)
-            or attributes.ReparseTag or identity.volume_serial_number == 0
-            or not any(identity.file_id)
-        ):
-            raise OSError("opened child is not an identified non-reparse regular file")
+        if attributes.ReparseTag:
+            # A distinct errno (matching POSIX ELOOP) lets every caller reuse
+            # the same "refuse a symlink/junction without following it" branch
+            # it already has for ``os.open(..., O_NOFOLLOW)``.
+            raise OSError(errno.ELOOP, "opened child is a reparse point")
+        if attributes.FileAttributes & (_FILE_ATTRIBUTE_DIRECTORY | _FILE_ATTRIBUTE_DEVICE | 0x400):
+            raise OSError(errno.EISDIR, "opened child is not a regular file")
+        if identity.volume_serial_number == 0 or not any(identity.file_id):
+            raise OSError(errno.EINVAL, "opened child has no stable volume/file identity")
         import msvcrt
 
         descriptor = msvcrt.open_osfhandle(owned.value, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+        owned.detach()  # the CRT descriptor now owns the original HANDLE
+        return descriptor
+    except BaseException:
+        owned.close()
+        raise
+
+
+# NtCreateFile failures raise a bare ``OSError(winerror, ...)`` (see
+# ``_open_windows_relative_child_handle``): a test pins that ``.errno`` stays
+# the *raw* DOS error rather than the POSIX-mapped one, so a caller that wants
+# a proper ``FileExistsError`` has to translate these specific codes itself.
+_WINDOWS_ALREADY_EXISTS_ERRNOS = frozenset({80, 183})  # ERROR_FILE_EXISTS, ERROR_ALREADY_EXISTS
+
+
+def create_windows_relative_regular_file_descriptor(parent_handle: int, child_name: str) -> int:
+    """Exclusively create one new regular file beneath a borrowed parent HANDLE.
+
+    Mirrors ``os.open(name, O_WRONLY | O_CREAT | O_EXCL, dir_fd=parent_fd)``:
+    NtCreateFile's ``FILE_CREATE`` disposition fails if anything at all --  a
+    regular file, a directory, or a symlink/reparse point -- already exists at
+    that exact name, so this can never silently follow or replace an existing
+    object the way a plain ``CREATE_ALWAYS`` open could. The returned CRT
+    descriptor owns the HANDLE.
+    """
+    try:
+        owned, _information, _last_error = _open_windows_relative_child_handle(
+            parent_handle,
+            child_name,
+            0x00100182,  # FILE_WRITE_DATA | FILE_WRITE_ATTRIBUTES | FILE_READ_ATTRIBUTES | SYNCHRONIZE
+            0x0,  # no sharing: this name is meant to be exclusively ours until closed
+            _FILE_SYNCHRONOUS_IO_NONALERT | 0x40,  # NON_DIRECTORY_FILE
+            disposition=_FILE_CREATE,
+        )
+    except OSError as exc:
+        if exc.errno in _WINDOWS_ALREADY_EXISTS_ERRNOS:
+            raise FileExistsError(errno.EEXIST, "opened child already exists") from exc
+        raise
+    try:
+        import msvcrt
+
+        descriptor = msvcrt.open_osfhandle(owned.value, os.O_WRONLY | getattr(os, "O_BINARY", 0))
         owned.detach()  # the CRT descriptor now owns the original HANDLE
         return descriptor
     except BaseException:
@@ -967,9 +1471,12 @@ def open_windows_relative_child_disposition(
         ):
             raise _windows_error(get_last_error())
         if tag_info.ReparseTag != 0:
-            raise OSError("opened child is a reparse point")
+            # A distinct errno (matching POSIX ELOOP) lets every caller reuse
+            # the same "refuse a symlink/junction without following it" branch
+            # it already has for ``os.open(..., O_NOFOLLOW)``.
+            raise OSError(errno.ELOOP, "opened child is a reparse point")
         if tag_info.FileAttributes & _FILE_ATTRIBUTE_DEVICE:
-            raise OSError("opened child has an unexpected device type")
+            raise OSError(errno.EINVAL, "opened child has an unexpected device type")
         is_directory = bool(tag_info.FileAttributes & _FILE_ATTRIBUTE_DIRECTORY)
         file_id = FILE_ID_INFO()
         if not get_file_information(
@@ -980,7 +1487,7 @@ def open_windows_relative_child_disposition(
         ):
             raise _windows_error(get_last_error())
         if file_id.volume_serial_number == 0 or not any(file_id.file_id):
-            raise OSError("opened child has no stable volume/file identity")
+            raise OSError(errno.EINVAL, "opened child has no stable volume/file identity")
     except BaseException:
         owned.close()
         raise
@@ -1041,6 +1548,287 @@ def mark_windows_relative_child_disposition(
             ctypes.sizeof(disposition),
         ):
             raise _windows_error(get_last_error())
+
+
+def open_windows_root_directory_handle(path: Path | str) -> OwnedWindowsHandle:
+    """Open one absolute directory path as an authenticated, non-reparse HANDLE.
+
+    Every other primitive above resolves a single path *segment* relative to an
+    already-open parent HANDLE, but that chain has to start somewhere: from a
+    pathname. ``CreateFileW`` with ``FILE_FLAG_OPEN_REPARSE_POINT`` opens the
+    reparse point itself instead of following it -- exactly like
+    ``NtCreateFile`` does for a relative child in
+    :func:`_open_windows_relative_child_handle` -- and the same
+    attribute/reparse-tag/volume-serial/FileId checks
+    :func:`open_windows_relative_child_directory` applies to a child are applied
+    here, so a symlinked or junctioned root is rejected exactly like a
+    symlinked intermediate component would be. ``FILE_SHARE_DELETE`` is
+    included (via ``_WINDOWS_DIRECTORY_SHARE_ACCESS``) so this open never blocks
+    directory enumeration or cleanup elsewhere.
+    """
+
+    from ctypes import wintypes
+
+    win_dll = _windows_dll_loader()
+    kernel32 = win_dll("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (ctypes.c_void_p,)
+    close_handle.restype = ctypes.c_int
+    get_last_error = _windows_last_error_getter()
+
+    handle_value = create_file(
+        str(path),
+        _WINDOWS_DIRECTORY_DESIRED_ACCESS,
+        _WINDOWS_DIRECTORY_SHARE_ACCESS,
+        None,
+        _WINDOWS_OPEN_EXISTING,
+        _FILE_FLAG_BACKUP_SEMANTICS | _FILE_FLAG_OPEN_REPARSE_POINT,
+        None,
+    )
+    if handle_value in (None, 0, _INVALID_HANDLE_VALUE):
+        raise _windows_error(get_last_error())
+
+    owned = OwnedWindowsHandle(int(handle_value), close_handle, get_last_error)
+    try:
+        get_file_information = kernel32.GetFileInformationByHandleEx
+        get_file_information.argtypes = (
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+        )
+        get_file_information.restype = ctypes.c_int
+        tag_info = _FileAttributeTagInfo()
+        if not get_file_information(
+            owned.value,
+            _FILE_ATTRIBUTE_TAG_INFO,
+            ctypes.byref(tag_info),
+            ctypes.sizeof(tag_info),
+        ):
+            raise _windows_error(get_last_error())
+        if tag_info.ReparseTag != 0:
+            raise OSError(errno.ELOOP, "root directory is a reparse point")
+        if not tag_info.FileAttributes & _FILE_ATTRIBUTE_DIRECTORY:
+            raise OSError(errno.ENOTDIR, "root path is not a directory")
+        file_id = FILE_ID_INFO()
+        if not get_file_information(
+            owned.value,
+            _FILE_ID_INFO,
+            ctypes.byref(file_id),
+            ctypes.sizeof(file_id),
+        ):
+            raise _windows_error(get_last_error())
+        if file_id.volume_serial_number == 0 or not any(file_id.file_id):
+            raise OSError(errno.EINVAL, "root directory has no stable volume/file identity")
+    except BaseException:
+        owned.close()
+        raise
+    return owned
+
+
+class _FileRenameOrLinkInfoHeader(ctypes.Structure):
+    """The layout ``FILE_RENAME_INFO(_EX)`` and ``FILE_LINK_INFO(_EX)`` share.
+
+    All four structures are, physically, the same three fixed fields (a
+    4-byte flags/boolean, a HANDLE, a length) followed by the inline
+    ``WCHAR`` name -- only the *meaning* of the first field (a bare
+    ``BOOLEAN ReplaceIfExists`` for the legacy classes, a ``ULONG Flags`` for
+    the ``_Ex`` ones) differs, and a bit-0 "replace if exists" reads correctly
+    either way. One header, reused for rename and hard-link creation alike.
+    """
+
+    _fields_ = [
+        ("Flags", ctypes.c_uint32),
+        ("RootDirectory", ctypes.c_void_p),
+        ("FileNameLength", ctypes.c_uint32),
+    ]
+
+
+def _set_file_relative_name_information(
+    handle_value: int,
+    root_directory_handle: int,
+    new_name: str,
+    *,
+    ex_info_class: int,
+    legacy_info_class: int,
+    replace_if_exists: bool,
+) -> None:
+    """Point one already-open, authenticated HANDLE at a new name/parent.
+
+    ``handle_value`` is the exact child HANDLE authenticated by
+    :func:`open_windows_relative_child_disposition` -- never a reopened
+    pathname -- and ``root_directory_handle`` names the new parent directory by
+    HANDLE, not by path, so the destination is exactly the borrowed parent the
+    caller already authenticated. This goes through ``NtSetInformationFile``
+    (ntdll) rather than the Win32 ``SetFileInformationByHandle`` wrapper: the
+    Win32 wrapper's documented contract has never guaranteed honoring a
+    non-NULL ``RootDirectory`` for a relative rename/link, while the native
+    call -- the same one ``_open_windows_relative_child_handle`` already uses
+    for relative opens -- is the documented way every other HANDLE-relative
+    filesystem operation in Windows (Chromium, .NET, Sysinternals) implements
+    a POSIX-style ``renameat``/``linkat``. The ``_Ex`` information class is
+    tried first (it alone can request atomic replace-if-exists semantics); a
+    pre-Windows-10 1709 filesystem rejects it with ``STATUS_INVALID_PARAMETER``
+    -- the one documented "unsupported" signal, matching
+    :func:`mark_windows_relative_child_disposition` -- at which point the
+    legacy, boolean-only class is retried.
+    """
+
+    new_name, byte_length = _canonical_windows_child_segment(new_name)
+    win_dll = _windows_dll_loader()
+    ntdll = win_dll("ntdll", use_last_error=True)
+    nt_set_information_file = ntdll.NtSetInformationFile
+    nt_set_information_file.argtypes = (
+        ctypes.c_void_p,
+        ctypes.POINTER(_IoStatusBlock),
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+    )
+    nt_set_information_file.restype = ctypes.c_int32
+    rtl_status_to_dos_error = ntdll.RtlNtStatusToDosError
+    rtl_status_to_dos_error.argtypes = (ctypes.c_int32,)
+    rtl_status_to_dos_error.restype = ctypes.c_uint32
+
+    # Not ``ctypes.sizeof(_FileRenameOrLinkInfoHeader)``: ctypes pads a
+    # standalone struct's overall size up to its largest member's alignment
+    # (8, for the HANDLE), but the real ``FILE_RENAME_INFORMATION`` layout has
+    # no such trailing pad -- ``FileName`` immediately follows
+    # ``FileNameLength`` at its natural 4-byte-aligned offset. Using the padded
+    # ``sizeof`` here inserted 4 bytes of garbage before the name on 64-bit and
+    # the kernel rejected it as ``ERROR_INVALID_NAME``. The field's own
+    # ``.offset`` is exact regardless of trailing struct padding.
+    header_size = (
+        _FileRenameOrLinkInfoHeader.FileNameLength.offset + ctypes.sizeof(ctypes.c_uint32)
+    )
+    name_buffer = ctypes.create_unicode_buffer(new_name)
+
+    def build_buffer(flags: int) -> ctypes.Array:
+        buffer = ctypes.create_string_buffer(header_size + byte_length + 2)
+        header = ctypes.cast(buffer, ctypes.POINTER(_FileRenameOrLinkInfoHeader)).contents
+        header.Flags = flags
+        header.RootDirectory = root_directory_handle
+        header.FileNameLength = byte_length
+        ctypes.memmove(ctypes.byref(buffer, header_size), name_buffer, byte_length)
+        return buffer
+
+    def set_information(info_class: int, buffer: ctypes.Array) -> int:
+        io_status = _IoStatusBlock()
+        return int(
+            nt_set_information_file(
+                ctypes.c_void_p(handle_value),
+                ctypes.byref(io_status),
+                buffer,
+                len(buffer),
+                info_class,
+            )
+        )
+
+    def raise_for_status(status: int) -> None:
+        winerror = int(rtl_status_to_dos_error(status))
+        if winerror in _WINDOWS_ALREADY_EXISTS_ERRNOS:
+            raise FileExistsError(errno.EEXIST, f"{new_name!r} already exists")
+        raise OSError(winerror, f"NtSetInformationFile failed for {new_name!r}")
+
+    status = set_information(ex_info_class, build_buffer(0x1 if replace_if_exists else 0x0))
+    if status >= 0:
+        return
+    winerror = int(rtl_status_to_dos_error(status))
+    if winerror not in _WINDOWS_DISPOSITION_UNSUPPORTED_ERRNOS:
+        raise_for_status(status)
+    status = set_information(legacy_info_class, build_buffer(1 if replace_if_exists else 0))
+    if status < 0:
+        raise_for_status(status)
+
+
+def rename_windows_relative_child(
+    src_parent_handle: int,
+    old_name: str,
+    dst_parent_handle: int,
+    new_name: str,
+    *,
+    replace_if_exists: bool = False,
+) -> None:
+    """Rename one exact child from beneath one borrowed parent HANDLE to another.
+
+    Mirrors ``os.replace(old, new, src_dir_fd=..., dst_dir_fd=...)``: the child
+    named ``old_name`` beneath ``src_parent_handle`` is opened and authenticated
+    (non-reparse, stable identity) by
+    :func:`open_windows_relative_child_disposition` first, so a symlink swapped
+    in under the old name is refused with the same ``ELOOP``-style errno every
+    other primitive here uses, and the rename never re-resolves a pathname from
+    scratch. ``src_parent_handle`` and ``dst_parent_handle`` may be the same
+    HANDLE (a sibling rename, the shape this script always uses) or different
+    ones.
+    """
+
+    authority = open_windows_relative_child_disposition(src_parent_handle, old_name)
+    try:
+        _set_file_relative_name_information(
+            authority.handle.value,
+            dst_parent_handle,
+            new_name,
+            ex_info_class=_FILE_RENAME_INFO_EX,
+            legacy_info_class=_FILE_RENAME_INFO,
+            replace_if_exists=replace_if_exists,
+        )
+    finally:
+        authority.close()
+
+
+def link_windows_relative_child(
+    src_parent_handle: int,
+    existing_name: str,
+    dst_parent_handle: int,
+    new_name: str,
+) -> None:
+    """Create a hard link ``new_name`` for ``existing_name``, HANDLE to HANDLE.
+
+    Mirrors ``os.link(old, new, src_dir_fd=..., dst_dir_fd=...)`` and
+    :func:`rename_windows_relative_child`'s shape: the existing child is opened
+    and authenticated first, so a symlink swapped in under ``existing_name`` is
+    refused rather than linked.
+    """
+
+    authority = open_windows_relative_child_disposition(src_parent_handle, existing_name)
+    try:
+        _set_file_relative_name_information(
+            authority.handle.value,
+            dst_parent_handle,
+            new_name,
+            ex_info_class=_FILE_LINK_INFO_EX,
+            legacy_info_class=_FILE_LINK_INFO,
+            replace_if_exists=False,
+        )
+    finally:
+        authority.close()
+
+
+def delete_windows_relative_child(parent_handle: int, child_name: str) -> None:
+    """Authenticate and delete one exact child beneath a borrowed parent HANDLE.
+
+    Composes :func:`open_windows_relative_child_disposition` and
+    :func:`mark_windows_relative_child_disposition` -- the two-step shape every
+    other disposition caller already uses -- into the one-call ``os.unlink``
+    shape the sync script's cleanup paths want.
+    """
+
+    authority = open_windows_relative_child_disposition(parent_handle, child_name)
+    try:
+        mark_windows_relative_child_disposition(authority)
+    finally:
+        authority.close()
 
 
 WINDOWS_REPLACE_RETRY_SECONDS = 1.0
@@ -1125,6 +1913,73 @@ def windows_pid_is_alive(pid: int) -> bool:
     """
 
     return _platform_process_backend.windows_process_is_alive(pid)
+
+
+def windows_process_tree() -> dict[int, tuple[int, str]] | None:
+    """One Windows PID -> (parent PID, image name) snapshot, or None.
+
+    POSIX answers ancestry from ``/proc``; Windows needs a Toolhelp snapshot,
+    which is exactly the kind of platform difference this module exists to own.
+    A single snapshot answers parent AND image for every PID, so a caller
+    walking an ancestry chain reads one consistent view of the process table
+    instead of racing a second enumeration between hops. Fails closed: any
+    error, and every non-Windows host, answers None rather than a partial tree.
+    """
+
+    if not is_windows():
+        return None
+    try:
+        from ctypes import wintypes
+
+        class _ProcessEntry32W(ctypes.Structure):
+            _fields_ = (
+                ("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.c_size_t),
+                ("th32ModuleID", wintypes.DWORD),
+                ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD),
+                ("pcPriClassBase", wintypes.LONG),
+                ("dwFlags", wintypes.DWORD),
+                ("szExeFile", wintypes.WCHAR * 260),
+            )
+
+        kernel32 = _windows_dll_loader()("kernel32", use_last_error=True)
+        create_snapshot = kernel32.CreateToolhelp32Snapshot
+        create_snapshot.argtypes = (wintypes.DWORD, wintypes.DWORD)
+        create_snapshot.restype = wintypes.HANDLE
+        process_first = kernel32.Process32FirstW
+        process_first.argtypes = (wintypes.HANDLE, ctypes.POINTER(_ProcessEntry32W))
+        process_first.restype = wintypes.BOOL
+        process_next = kernel32.Process32NextW
+        process_next.argtypes = (wintypes.HANDLE, ctypes.POINTER(_ProcessEntry32W))
+        process_next.restype = wintypes.BOOL
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = (wintypes.HANDLE,)
+        close_handle.restype = wintypes.BOOL
+
+        snapshot = create_snapshot(0x00000002, 0)  # TH32CS_SNAPPROCESS
+        if snapshot == wintypes.HANDLE(-1).value:
+            return None
+        tree: dict[int, tuple[int, str]] = {}
+        try:
+            entry = _ProcessEntry32W()
+            entry.dwSize = ctypes.sizeof(entry)
+            if not process_first(snapshot, ctypes.byref(entry)):
+                return None
+            while True:
+                tree[int(entry.th32ProcessID)] = (
+                    int(entry.th32ParentProcessID),
+                    str(entry.szExeFile),
+                )
+                if not process_next(snapshot, ctypes.byref(entry)):
+                    break
+        finally:
+            close_handle(snapshot)
+        return tree
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
 
 
 def process_is_alive(pid: int) -> bool:
@@ -1673,10 +2528,62 @@ def open_lock_file(path: Path) -> int:
     The descriptor is opened for WRITING because :func:`lock_fd` needs a
     writable fd on Windows -- ``msvcrt.locking`` locks a byte range that has to
     exist, and the read-only descriptor POSIX would accept fails with EBADF.
+
+    On Windows this goes through :func:`_open_windows_lock_file` instead of
+    ``os.open``: a caller (``db_writer.py``) deliberately keeps this
+    descriptor open for the life of the process to save a syscall pair per
+    write, and the CRT open ``os.open`` performs has no way to ask for
+    ``FILE_SHARE_DELETE`` -- so any later ``os.unlink``/``shutil.rmtree`` of
+    this exact path, from this or another process, is refused for as long as
+    the process runs. Only a native ``CreateFileW`` call can request that
+    share bit; the CRT's ``_wsopen_s`` (what ``os.open`` uses under the hood)
+    does not expose it at all.
     """
 
     path.parent.mkdir(parents=True, exist_ok=True)
+    if is_windows():
+        return _open_windows_lock_file(path)
     return os.open(str(path), lock_file_open_flags(), 0o600)
+
+
+def _open_windows_lock_file(path: Path) -> int:
+    """``open_lock_file``'s Windows path: a writable fd shared for delete too."""
+
+    from ctypes import wintypes
+
+    GENERIC_READ = 0x80000000
+    GENERIC_WRITE = 0x40000000
+    FILE_SHARE_READ_WRITE_DELETE = 0x7
+    OPEN_ALWAYS = 4
+    FILE_ATTRIBUTE_NORMAL = 0x80
+
+    kernel32 = _windows_dll_loader()("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+
+    handle = create_file(
+        str(path),
+        GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ_WRITE_DELETE,
+        None,
+        OPEN_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        None,
+    )
+    if handle in (None, 0, _INVALID_HANDLE_VALUE):
+        raise _windows_error(ctypes.get_last_error())
+    import msvcrt
+
+    return msvcrt.open_osfhandle(handle, os.O_RDWR | getattr(os, "O_BINARY", 0))
 
 
 def _prepare_windows_lock_byte(fd: int) -> None:

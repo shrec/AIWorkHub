@@ -49,18 +49,35 @@ def _fake_msvcrt(calls: list[tuple[int, int, int]]) -> SimpleNamespace:
 
 
 def test_chmod_fd_accepts_platform_name_and_no_ops_on_windows(tmp_path):
-    """The Windows branch of chmod_fd is reachable from a test at all."""
+    """The Windows branch of chmod_fd is reachable from a test at all.
+
+    Seeded via os.chmod(path, ...), not os.fchmod(fd, ...): the latter does
+    not exist on Windows at all, so a real host and a "platform_name='nt'"
+    simulated host both need the path-based seed. The no-op is asserted as
+    "unchanged from its seeded mode", not against a literal 0o600 -- Windows
+    synthesizes st_mode from the read-only attribute alone (0o666 writable or
+    0o444 read-only), so the exact achievable value is itself host-dependent.
+    """
     path = tmp_path / "mode.txt"
     path.write_bytes(b"x")
+    os.chmod(path, 0o600)
     fd = os.open(path, os.O_RDWR)
     try:
-        os.fchmod(fd, 0o600)
+        before = os.fstat(fd).st_mode & 0o777
         platform_io.chmod_fd(fd, 0o644, platform_name="nt")
-        assert (os.fstat(fd).st_mode & 0o777) == 0o600
+        assert (os.fstat(fd).st_mode & 0o777) == before
     finally:
         os.close(fd)
 
 
+@pytest.mark.skipif(
+    not hasattr(os, "fchmod"),
+    reason=(
+        "platform_name='posix' only overrides chmod_fd's POLICY decision; it "
+        "cannot fake the underlying os.fchmod primitive chmod_fd still calls, "
+        "which genuinely does not exist on Windows regardless of the override"
+    ),
+)
 def test_chmod_fd_still_applies_the_mode_on_a_posix_platform_name(tmp_path):
     path = tmp_path / "mode.txt"
     path.write_bytes(b"x")
@@ -76,6 +93,10 @@ def test_chmod_fd_still_applies_the_mode_on_a_posix_platform_name(tmp_path):
 @pytest.mark.parametrize("platform_name", ["nt", "posix", None])
 def test_chmod_fd_and_chmod_path_agree_on_applicability(tmp_path, platform_name):
     """Both entry points must answer the one policy question identically."""
+    if platform_name == "posix" and not hasattr(os, "fchmod"):
+        pytest.skip(
+            "platform_name='posix' cannot fake the os.fchmod primitive itself"
+        )
     expected = platform_io.posix_path_modes_supported(platform_name)
 
     path = tmp_path / "agree.txt"
@@ -86,9 +107,9 @@ def test_chmod_fd_and_chmod_path_agree_on_applicability(tmp_path, platform_name)
 
     fd_path = tmp_path / "agree-fd.txt"
     fd_path.write_bytes(b"x")
+    os.chmod(fd_path, 0o600)
     fd = os.open(fd_path, os.O_RDWR)
     try:
-        os.fchmod(fd, 0o600)
         platform_io.chmod_fd(fd, 0o640, platform_name=platform_name)
         fd_applied = (os.fstat(fd).st_mode & 0o777) == 0o640
     finally:
@@ -101,11 +122,12 @@ def test_chmod_fd_and_chmod_path_agree_on_applicability(tmp_path, platform_name)
 def test_chmod_fd_defaults_to_the_host_when_no_platform_name_is_given(tmp_path):
     path = tmp_path / "default.txt"
     path.write_bytes(b"x")
+    os.chmod(path, 0o600)
     fd = os.open(path, os.O_RDWR)
     try:
-        os.fchmod(fd, 0o600)
+        before = os.fstat(fd).st_mode & 0o777
         platform_io.chmod_fd(fd, 0o640)
-        expected = 0o640 if platform_io.posix_path_modes_supported() else 0o600
+        expected = 0o640 if platform_io.posix_path_modes_supported() else before
         assert (os.fstat(fd).st_mode & 0o777) == expected
     finally:
         os.close(fd)

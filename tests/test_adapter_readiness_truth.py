@@ -23,6 +23,7 @@ axis, and an unobserved quota stays unobserved rather than being reported ready.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -36,6 +37,21 @@ def _ok_resolution() -> runtime_adapters.ExecutableResolution:
         ok=True,
         reason="",
     )
+
+
+def _native_cli_sandbox_backend() -> str:
+    """A sandbox_backend value that does NOT itself fail-close a native CLI.
+
+    ``_provider_status`` deliberately marks a native (non-VS-Code-LM) CLI
+    adapter unlaunchable on Windows unless ``sandbox_backend`` is exactly
+    ``WINDOWS_APPCONTAINER_BACKEND`` -- "landlock" (a POSIX-only sandbox)
+    would trip that gate on Windows and mask whatever the test actually
+    means to exercise.
+    """
+
+    if os.name == "nt":
+        return repo_policy.WINDOWS_APPCONTAINER_BACKEND
+    return "landlock"
 
 
 _POLICY = {"providers": {"allowed_adapters": ["claude_cli"]}}
@@ -67,7 +83,7 @@ def test_route_is_ready_unverified_until_quota_is_actually_observed(monkeypatch)
         Path("."),
         "claude_cli",
         _POLICY,
-        "landlock",
+        _native_cli_sandbox_backend(),
         "",
         model_policy={"providers": {}, "adapters": {}, "models": {}},
     )
@@ -108,7 +124,7 @@ def test_route_is_ready_only_when_quota_was_observed(monkeypatch) -> None:
         Path("."),
         "claude_cli",
         _POLICY,
-        "landlock",
+        _native_cli_sandbox_backend(),
         "",
         model_policy={"providers": {}, "adapters": {}, "models": {}},
     )

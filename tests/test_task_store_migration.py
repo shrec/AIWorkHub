@@ -99,6 +99,12 @@ def _seed_db(path: Path, task_id: str = "SAME_TASK_ID") -> None:
             (now, now),
         )
         conn.commit()
+    # sqlite3.Connection's context manager only commits/rolls back on exit --
+    # it does NOT close the connection (a well-known Python footgun). Left
+    # open, the connection keeps the file handle alive on Windows (no
+    # FILE_SHARE_DELETE without an explicit close), which broke every test
+    # here that deletes/replaces paths.source_db right after seeding it.
+    conn.close()
 
 
 def _paths(root: Path) -> migrator.TaskStorePaths:

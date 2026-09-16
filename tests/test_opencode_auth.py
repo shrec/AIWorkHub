@@ -111,11 +111,21 @@ def test_source_replacement_during_read_fails_closed(
         return original_read(fd, size)
 
     monkeypatch.setattr(opencode_auth.os, "read", replace_then_read)
-    with pytest.raises(
-        opencode_auth.OpenCodeAuthSourceError,
-        match="^opencode_auth_source_identity_changed$",
-    ):
-        opencode_auth.project_opencode_auth(source, tmp_path / "isolated")
+    # On Windows the swap can never complete: _read_verified_source's plain
+    # os.open descriptor requests no FILE_SHARE_DELETE, so source.replace()
+    # above itself raises before the swap lands -- propagating as a bare
+    # PermissionError instead of ever reaching the identity re-check below.
+    # Both outcomes are fail-closed; Windows just blocks the race one layer
+    # earlier, at the OS level, before production's own check is even needed.
+    if os.name == "nt":
+        with pytest.raises(PermissionError):
+            opencode_auth.project_opencode_auth(source, tmp_path / "isolated")
+    else:
+        with pytest.raises(
+            opencode_auth.OpenCodeAuthSourceError,
+            match="^opencode_auth_source_identity_changed$",
+        ):
+            opencode_auth.project_opencode_auth(source, tmp_path / "isolated")
     assert not (tmp_path / "isolated").exists()
 
 

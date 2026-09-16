@@ -877,7 +877,7 @@ def test_windows_repo_root_prefers_exact_owning_window_without_thread_env(tmp_pa
     monkeypatch.setattr(
         core,
         "_pid_in_same_windows_user_ancestor_chain",
-        lambda pid, *, max_depth: pid == 12345 and max_depth == 16,
+        lambda pid, *, max_depth, **_snapshot: pid == 12345 and max_depth == 16,
     )
 
     assert core._implicit_windows_codex_repository_root() == routed.resolve()
@@ -913,7 +913,7 @@ def test_windows_repo_root_route_fails_closed_when_two_owning_windows_match(tmp_
     monkeypatch.setattr(
         core,
         "_pid_in_same_windows_user_ancestor_chain",
-        lambda pid, *, max_depth: True,
+        lambda pid, *, max_depth, **_snapshot: True,
     )
 
     assert core._implicit_windows_codex_repository_root() is None

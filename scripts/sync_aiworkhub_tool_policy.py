@@ -88,6 +88,14 @@ class AuthenticatedPath:
     parent_fd: int
     leaf_name: str
     purpose: str
+    # Windows has no dir_fd-based directory descriptor at all (see
+    # platform_io.directory_descriptor_backend): ``parent_fd`` there is a
+    # harmless ``-1`` sentinel, never a usable POSIX fd. The immediate parent
+    # directory is instead pinned by this identity-authenticated, non-reparse
+    # Windows HANDLE (``platform_io.OwnedWindowsHandle``), which every
+    # Windows-side caller of ``authenticated_path`` uses instead of
+    # ``parent_fd``. ``None`` on POSIX.
+    windows_parent_handle: object | None = None
 
 
 StagedFileIdentity = FileIdentity
@@ -151,6 +159,73 @@ def _validated_relative_path(relative_path: Path) -> Path:
     return relative_path
 
 
+def _windows_directory_chain_primitives_available() -> bool:
+    """Whether this host can authenticate a directory walk the Windows way.
+
+    Distinct from ``platform_io is not None``: a caller (or a test double) may
+    provide ``platform_io`` with only file-level helpers -- e.g. a fake
+    ``read_regular_file_snapshot`` -- without the HANDLE-based directory
+    primitives a *parent* authentication actually needs. Checking the exact
+    attributes this module calls keeps the "no enforceable no-follow open
+    primitive" fail-closed path honest about what it actually verified.
+    """
+
+    return (
+        platform_io is not None
+        and getattr(platform_io, "open_windows_root_directory_handle", None) is not None
+        and getattr(platform_io, "open_windows_relative_child_directory", None) is not None
+    )
+
+
+def _authenticate_windows_directory_chain(
+    root: Path,
+    relative_path: Path,
+    display_path: Path,
+    purpose: str,
+) -> "object":
+    """Windows counterpart of the POSIX ``O_NOFOLLOW``/``dir_fd`` walk above.
+
+    ``os.open()`` cannot open a directory at all on Windows (it always raises
+    ``PermissionError``, regardless of flags) and ``os.supports_dir_fd`` is
+    empty there, so there is no dir-fd chain to build. Instead this resolves
+    the root and every intermediate component as a raw, identity-authenticated
+    Windows HANDLE via ``platform_io``'s ``NtCreateFile``-based primitives,
+    which reject a symlink/junction at any component atomically (the reparse
+    point itself is opened, never its target) -- the same guarantee
+    ``O_NOFOLLOW`` gives POSIX, raised through the same ``errno.ELOOP`` so this
+    function's callers need only one branch to recognize it.
+    """
+
+    if not _windows_directory_chain_primitives_available():
+        raise PolicySyncError(
+            f"{display_path}: cannot authenticate parent directory without an enforceable no-follow open primitive"
+        )
+    try:
+        handle = platform_io.open_windows_root_directory_handle(root)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise PolicySyncError(_reject_message(display_path, purpose)) from exc
+        raise PolicySyncError(
+            _cannot_authenticate_message(display_path, purpose, exc.strerror or str(exc))
+        ) from exc
+    try:
+        for component in relative_path.parts[:-1]:
+            try:
+                next_handle = platform_io.open_windows_relative_child_directory(handle.value, component)
+            except OSError as exc:
+                if exc.errno == errno.ELOOP:
+                    raise PolicySyncError(_reject_message(display_path, purpose)) from exc
+                raise PolicySyncError(
+                    _cannot_authenticate_message(display_path, purpose, exc.strerror or str(exc))
+                ) from exc
+            handle.close()
+            handle = next_handle
+        return handle
+    except BaseException:
+        handle.close()
+        raise
+
+
 @contextmanager
 def authenticated_path(
     root: Path,
@@ -159,6 +234,23 @@ def authenticated_path(
     purpose: str = "host",
 ) -> Iterator[AuthenticatedPath]:
     relative_path = _validated_relative_path(relative_path)
+
+    if os.name == "nt":
+        handle = _authenticate_windows_directory_chain(root, relative_path, display_path, purpose)
+        try:
+            yield AuthenticatedPath(
+                root=root,
+                relative_path=relative_path,
+                path=root / relative_path,
+                parent_fd=-1,
+                leaf_name=relative_path.name,
+                purpose=purpose,
+                windows_parent_handle=handle,
+            )
+        finally:
+            handle.close()
+        return
+
     no_follow = getattr(os, "O_NOFOLLOW", None)
     root_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
     if no_follow is not None:
@@ -215,6 +307,7 @@ def authenticated_path(
             parent_fd=parent_fd,
             leaf_name=relative_path.name,
             purpose=purpose,
+            windows_parent_handle=None,
         )
     finally:
         os.close(parent_fd)
@@ -226,44 +319,26 @@ def _relative_from_path(path: Path) -> tuple[Path, Path]:
     return parent, Path(absolute_path.name)
 
 
-def platform_io_regular_file_snapshot(path: Path, relative_path: Path) -> FileSnapshot | None:
-    if platform_io is None:
-        return None
-    read_snapshot = getattr(platform_io, "read_regular_file_snapshot", None)
-    if read_snapshot is None:
-        return None
-    try:
-        snapshot = read_snapshot(path, relative_path)
-    except FileNotFoundError as exc:
-        raise PolicySyncError(f"{relative_path}: file is missing") from exc
-    except OSError as exc:
-        if exc.errno == errno.ELOOP:
-            raise PolicySyncError(f"{relative_path}: refusing to sync through symlink") from exc
-        raise PolicySyncError(f"{relative_path}: cannot authenticate file: {exc.strerror or exc}") from exc
-    if not isinstance(snapshot, FileSnapshot):
-        raise PolicySyncError(f"{relative_path}: platform_io returned an invalid file snapshot")
-    if not snapshot.identity.is_regular:
-        raise PolicySyncError(f"{relative_path}: refusing to sync non-regular file")
-    return snapshot
+def _open_authenticated_leaf_for_read(authenticated: AuthenticatedPath, relative_path: Path) -> int:
+    """Open the already-authenticated leaf for reading; caller owns the fd.
 
+    Tries the portable ``dir_fd``-relative open first -- the real mechanism on
+    POSIX. Windows defines neither ``O_DIRECTORY`` nor ``O_NOFOLLOW`` and
+    ``os.supports_dir_fd`` is empty there, so ``os.open`` raises
+    ``NotImplementedError`` immediately (before touching the filesystem) for
+    any non-``None`` ``dir_fd`` -- a harmless, side-effect-free probe -- and
+    this falls back to ``platform_io``'s HANDLE-relative primitive, which
+    reuses the very same parent HANDLE :func:`authenticated_path` already
+    authenticated.
+    """
 
-def read_regular_file_snapshot(path: Path, relative_path: Path, root: Path | None = None) -> FileSnapshot:
-    if root is None:
-        root, relative_path = _relative_from_path(path)
-
-    with authenticated_path(root, relative_path, relative_path) as authenticated:
-        platform_snapshot = platform_io_regular_file_snapshot(path, relative_path)
-        if platform_snapshot is not None:
-            return platform_snapshot
-
-        no_follow = getattr(os, "O_NOFOLLOW", None)
-        if no_follow is None:
-            raise PolicySyncError(
-                f"{relative_path}: cannot authenticate file without an enforceable no-follow open primitive"
-            )
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    if no_follow is not None:
         flags = os.O_RDONLY | no_follow | getattr(os, "O_NONBLOCK", 0)
         try:
-            fd = os.open(authenticated.leaf_name, flags, dir_fd=authenticated.parent_fd)
+            return os.open(authenticated.leaf_name, flags, dir_fd=authenticated.parent_fd)
+        except NotImplementedError:
+            pass
         except FileNotFoundError as exc:
             raise PolicySyncError(f"{relative_path}: file is missing") from exc
         except OSError as exc:
@@ -271,50 +346,132 @@ def read_regular_file_snapshot(path: Path, relative_path: Path, root: Path | Non
                 raise PolicySyncError(f"{relative_path}: refusing to sync through symlink") from exc
             raise PolicySyncError(f"{relative_path}: cannot authenticate file: {exc.strerror or exc}") from exc
 
+    if authenticated.windows_parent_handle is None:
+        raise PolicySyncError(
+            f"{relative_path}: cannot authenticate file without an enforceable no-follow open primitive"
+        )
+    try:
+        return platform_io.open_windows_relative_regular_file_descriptor(
+            authenticated.windows_parent_handle.value, authenticated.leaf_name
+        )
+    except FileNotFoundError as exc:
+        raise PolicySyncError(f"{relative_path}: file is missing") from exc
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise PolicySyncError(f"{relative_path}: refusing to sync through symlink") from exc
+        raise PolicySyncError(f"{relative_path}: cannot authenticate file: {exc.strerror or exc}") from exc
+
+
+def _verify_authenticated_leaf_identity_unchanged(
+    authenticated: AuthenticatedPath,
+    relative_path: Path,
+    file_stat: os.stat_result,
+) -> None:
+    """Re-authenticate the leaf's identity after reading its content.
+
+    The read itself came from a pinned descriptor/HANDLE that cannot drift,
+    but this closes the same window the POSIX ``dir_fd`` re-``stat`` always
+    closed: a same-name replace that lands *during* the read must still be
+    caught rather than silently accepted as the file's content. Same
+    probe-then-native-fallback shape as :func:`_open_authenticated_leaf_for_read`.
+    """
+
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    if no_follow is not None:
         try:
-            file_stat = os.fstat(fd)
-            if not stat.S_ISREG(file_stat.st_mode):
-                raise PolicySyncError(f"{relative_path}: refusing to sync non-regular file")
-
-            digest = hashlib.sha256()
-            chunks = []
-            with os.fdopen(fd, "rb") as host_file:
-                for chunk in iter(lambda: host_file.read(1024 * 1024), b""):
-                    chunks.append(chunk)
-                    digest.update(chunk)
-            data = b"".join(chunks)
-
-            try:
-                path_stat = os.stat(authenticated.leaf_name, dir_fd=authenticated.parent_fd, follow_symlinks=False)
-            except FileNotFoundError as exc:
-                raise PolicySyncError(f"{relative_path}: file was removed while authenticating") from exc
-            except OSError as exc:
-                raise PolicySyncError(f"{relative_path}: cannot inspect file: {exc.strerror or exc}") from exc
-            if (file_stat.st_dev, file_stat.st_ino) != (path_stat.st_dev, path_stat.st_ino):
-                raise PolicySyncError(f"{relative_path}: file identity changed while authenticating")
-
-            return FileSnapshot(
-                data=data,
-                identity=FileIdentity(
-                    device=file_stat.st_dev,
-                    inode=file_stat.st_ino,
-                    mode=file_stat.st_mode,
-                    is_regular=True,
-                    nlink=getattr(file_stat, "st_nlink", None),
-                    uid=getattr(file_stat, "st_uid", None),
-                    gid=getattr(file_stat, "st_gid", None),
-                    size=file_stat.st_size,
-                    digest=digest.hexdigest(),
-                ),
-            )
-        except PolicySyncError:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-            raise
+            path_stat = os.stat(authenticated.leaf_name, dir_fd=authenticated.parent_fd, follow_symlinks=False)
+        except FileNotFoundError as exc:
+            raise PolicySyncError(f"{relative_path}: file was removed while authenticating") from exc
         except OSError as exc:
-            raise PolicySyncError(f"{relative_path}: cannot read file: {exc.strerror or exc}") from exc
+            raise PolicySyncError(f"{relative_path}: cannot inspect file: {exc.strerror or exc}") from exc
+        if (file_stat.st_dev, file_stat.st_ino) != (path_stat.st_dev, path_stat.st_ino):
+            raise PolicySyncError(f"{relative_path}: file identity changed while authenticating")
+        return
+
+    # Windows: no_follow is unavailable. Still attempt the same dir_fd-relative
+    # probe purely for cross-platform code-path symmetry -- os.stat() there
+    # raises NotImplementedError immediately for any non-None dir_fd, before
+    # touching the filesystem, so this is side-effect free -- then fall back to
+    # a HANDLE-relative reopen-and-compare using the same parent HANDLE
+    # authenticated_path already pinned.
+    try:
+        os.stat(authenticated.leaf_name, dir_fd=authenticated.parent_fd, follow_symlinks=False)
+    except NotImplementedError:
+        pass
+
+    if authenticated.windows_parent_handle is None:
+        return
+    try:
+        second_fd = platform_io.open_windows_relative_regular_file_descriptor(
+            authenticated.windows_parent_handle.value, authenticated.leaf_name
+        )
+    except FileNotFoundError as exc:
+        raise PolicySyncError(f"{relative_path}: file was removed while authenticating") from exc
+    except OSError as exc:
+        raise PolicySyncError(f"{relative_path}: cannot inspect file: {exc.strerror or exc}") from exc
+    try:
+        path_stat = os.fstat(second_fd)
+    finally:
+        os.close(second_fd)
+    if (file_stat.st_dev, file_stat.st_ino) != (path_stat.st_dev, path_stat.st_ino):
+        raise PolicySyncError(f"{relative_path}: file identity changed while authenticating")
+
+
+def _read_authenticated_regular_file(authenticated: AuthenticatedPath, relative_path: Path) -> FileSnapshot:
+    """Read, hash and re-verify the leaf :func:`authenticated_path` pinned.
+
+    Shared by :func:`read_regular_file_snapshot` (host/policy-source reads,
+    which need the bytes) and :func:`staged_file_identity` (which only needs
+    the identity) so both platforms' leaf-open logic lives in exactly one
+    place.
+    """
+
+    fd = _open_authenticated_leaf_for_read(authenticated, relative_path)
+    try:
+        file_stat = os.fstat(fd)
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise PolicySyncError(f"{relative_path}: refusing to sync non-regular file")
+
+        digest = hashlib.sha256()
+        chunks = []
+        with os.fdopen(fd, "rb") as source_file:
+            for chunk in iter(lambda: source_file.read(1024 * 1024), b""):
+                chunks.append(chunk)
+                digest.update(chunk)
+        data = b"".join(chunks)
+
+        _verify_authenticated_leaf_identity_unchanged(authenticated, relative_path, file_stat)
+
+        return FileSnapshot(
+            data=data,
+            identity=FileIdentity(
+                device=file_stat.st_dev,
+                inode=file_stat.st_ino,
+                mode=file_stat.st_mode,
+                is_regular=True,
+                nlink=getattr(file_stat, "st_nlink", None),
+                uid=getattr(file_stat, "st_uid", None),
+                gid=getattr(file_stat, "st_gid", None),
+                size=file_stat.st_size,
+                digest=digest.hexdigest(),
+            ),
+        )
+    except PolicySyncError:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+    except OSError as exc:
+        raise PolicySyncError(f"{relative_path}: cannot read file: {exc.strerror or exc}") from exc
+
+
+def read_regular_file_snapshot(path: Path, relative_path: Path, root: Path | None = None) -> FileSnapshot:
+    if root is None:
+        root, relative_path = _relative_from_path(path)
+
+    with authenticated_path(root, relative_path, relative_path) as authenticated:
+        return _read_authenticated_regular_file(authenticated, relative_path)
 
 
 def read_canonical(root: Path = REPO_ROOT) -> bytes:
@@ -334,11 +491,15 @@ def generated_block(canonical: bytes, provider: Path | str | None = None) -> byt
 
 
 def extract_block(data: bytes, path: Path) -> PolicyBlock:
+    # ``.as_posix()``, not the bare Path (whose ``str()`` uses the host's
+    # native separator): these messages are compared against literal,
+    # slash-spelled expectations regardless of platform.
+    display = path.as_posix()
     start_count = data.count(START_MARKER_BYTES)
     end_count = data.count(END_MARKER_BYTES)
     if start_count != 1 or end_count != 1:
         raise PolicySyncError(
-            f"{path}: expected one policy block, found "
+            f"{display}: expected one policy block, found "
             f"{start_count} start marker(s) and {end_count} end marker(s)"
         )
 
@@ -346,13 +507,13 @@ def extract_block(data: bytes, path: Path) -> PolicyBlock:
     inner_start = start + len(START_MARKER_BYTES)
     end = data.index(END_MARKER_BYTES)
     if end < inner_start:
-        raise PolicySyncError(f"{path}: policy markers are reordered")
+        raise PolicySyncError(f"{display}: policy markers are reordered")
     if data[inner_start : inner_start + 1] == b"\n":
         inner_start += 1
     elif data[inner_start : inner_start + 2] == b"\r\n":
         inner_start += 2
     else:
-        raise PolicySyncError(f"{path}: start marker must be followed by newline")
+        raise PolicySyncError(f"{display}: start marker must be followed by newline")
     return PolicyBlock(start=start, end=end + len(END_MARKER_BYTES), inner=data[inner_start:end])
 
 
@@ -492,10 +653,40 @@ def staged_path(path: Path, role: str) -> Path:
     return path.with_name(f".{path.name}.{STAGED_NAME_PREFIX}.{secrets.token_hex(16)}.{role}")
 
 
+def _create_authenticated_staged_leaf(authenticated: AuthenticatedPath, flags: int) -> int:
+    """Exclusively create the staged leaf; caller owns the returned fd.
+
+    Every caller of :func:`open_new_staged_file` passes
+    ``O_WRONLY | O_CREAT | O_EXCL`` (optionally ``O_NOFOLLOW``): the file must
+    not already exist under any form -- regular file, directory, or
+    symlink/reparse point. Same probe-then-native-fallback shape as
+    :func:`_open_authenticated_leaf_for_read`: the portable ``dir_fd`` create
+    is tried first and raises ``NotImplementedError`` immediately on Windows
+    (no filesystem access attempted), falling back to
+    :func:`platform_io.create_windows_relative_regular_file_descriptor`, whose
+    ``FILE_CREATE`` disposition gives the same "fail if anything is already
+    there" guarantee.
+    """
+
+    try:
+        return os.open(authenticated.leaf_name, flags, 0o600, dir_fd=authenticated.parent_fd)
+    except NotImplementedError:
+        pass
+    return platform_io.create_windows_relative_regular_file_descriptor(
+        authenticated.windows_parent_handle.value, authenticated.leaf_name
+    )
+
+
 def open_new_staged_file(path: Path, flags: int, mode: int) -> int:
     root, relative_path = _relative_from_path(path)
     with authenticated_path(root, relative_path, path, "staged") as authenticated:
-        fd = os.open(authenticated.leaf_name, flags, 0o600, dir_fd=authenticated.parent_fd)
+        fd = _create_authenticated_staged_leaf(authenticated, flags)
+    if not hasattr(os, "fchmod"):
+        # Windows has no POSIX mode bits to set (see
+        # platform_io.chmod_fd): the secure O_EXCL creation above is the
+        # authority there and this becomes a documented no-op, exactly like
+        # chmod_fd's own Windows branch.
+        return fd
     try:
         os.fchmod(fd, mode)
     except OSError:
@@ -523,25 +714,79 @@ def _fstat_identity(fd: int, digest: str) -> StagedFileIdentity:
     )
 
 
-def platform_io_staged_file_snapshot(path: Path) -> FileSnapshot | None:
-    if platform_io is None:
-        return None
-    read_snapshot = getattr(platform_io, "read_regular_file_snapshot", None)
-    if read_snapshot is None:
-        return None
+def _open_authenticated_staged_leaf(authenticated: AuthenticatedPath, path: Path) -> int:
+    """``_open_authenticated_leaf_for_read``'s counterpart, staged messages."""
+
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    if no_follow is not None:
+        flags = os.O_RDONLY | no_follow
+        try:
+            return os.open(authenticated.leaf_name, flags, dir_fd=authenticated.parent_fd)
+        except NotImplementedError:
+            pass
+        except FileNotFoundError as exc:
+            raise PolicySyncError(f"{path}: staged file was removed before install") from exc
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                raise PolicySyncError(f"{path}: refusing to authenticate staged symlink") from exc
+            raise PolicySyncError(f"{path}: cannot authenticate staged file: {exc.strerror or exc}") from exc
+
+    if authenticated.windows_parent_handle is None:
+        raise PolicySyncError(
+            f"{path}: cannot authenticate staged file without an enforceable no-follow open primitive"
+        )
     try:
-        snapshot = read_snapshot(path, path)
+        return platform_io.open_windows_relative_regular_file_descriptor(
+            authenticated.windows_parent_handle.value, authenticated.leaf_name
+        )
     except FileNotFoundError as exc:
         raise PolicySyncError(f"{path}: staged file was removed before install") from exc
     except OSError as exc:
         if exc.errno == errno.ELOOP:
             raise PolicySyncError(f"{path}: refusing to authenticate staged symlink") from exc
         raise PolicySyncError(f"{path}: cannot authenticate staged file: {exc.strerror or exc}") from exc
-    if not isinstance(snapshot, FileSnapshot):
-        raise PolicySyncError(f"{path}: platform_io returned an invalid staged file snapshot")
-    if not snapshot.identity.is_regular:
-        raise PolicySyncError(f"{path}: staged path is not a regular file")
-    return snapshot
+
+
+def _verify_authenticated_staged_leaf_identity_unchanged(
+    authenticated: AuthenticatedPath,
+    path: Path,
+    file_stat: os.stat_result,
+) -> None:
+    """``_verify_authenticated_leaf_identity_unchanged``'s counterpart, staged messages."""
+
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    if no_follow is not None:
+        try:
+            path_stat = os.stat(authenticated.leaf_name, dir_fd=authenticated.parent_fd, follow_symlinks=False)
+        except FileNotFoundError as exc:
+            raise PolicySyncError(f"{path}: staged file was removed while authenticating") from exc
+        except OSError as exc:
+            raise PolicySyncError(f"{path}: cannot inspect staged file: {exc.strerror or exc}") from exc
+        if (file_stat.st_dev, file_stat.st_ino) != (path_stat.st_dev, path_stat.st_ino):
+            raise PolicySyncError(f"{path}: staged file identity changed while authenticating")
+        return
+
+    try:
+        os.stat(authenticated.leaf_name, dir_fd=authenticated.parent_fd, follow_symlinks=False)
+    except NotImplementedError:
+        pass
+
+    if authenticated.windows_parent_handle is None:
+        return
+    try:
+        second_fd = platform_io.open_windows_relative_regular_file_descriptor(
+            authenticated.windows_parent_handle.value, authenticated.leaf_name
+        )
+    except FileNotFoundError as exc:
+        raise PolicySyncError(f"{path}: staged file was removed while authenticating") from exc
+    except OSError as exc:
+        raise PolicySyncError(f"{path}: cannot inspect staged file: {exc.strerror or exc}") from exc
+    try:
+        path_stat = os.fstat(second_fd)
+    finally:
+        os.close(second_fd)
+    if (file_stat.st_dev, file_stat.st_ino) != (path_stat.st_dev, path_stat.st_ino):
+        raise PolicySyncError(f"{path}: staged file identity changed while authenticating")
 
 
 def staged_file_identity(
@@ -552,40 +797,14 @@ def staged_file_identity(
     if root is None or relative_path is None:
         root, relative_path = _relative_from_path(path)
     with authenticated_path(root, relative_path, path, "staged") as authenticated:
-        platform_snapshot = platform_io_staged_file_snapshot(path)
-        if platform_snapshot is not None:
-            return platform_snapshot.identity
-
-        no_follow = getattr(os, "O_NOFOLLOW", None)
-        if no_follow is None:
-            raise PolicySyncError(
-                f"{path}: cannot authenticate staged file without an enforceable no-follow open primitive"
-            )
-
-        flags = os.O_RDONLY | no_follow
-        try:
-            fd = os.open(authenticated.leaf_name, flags, dir_fd=authenticated.parent_fd)
-        except FileNotFoundError as exc:
-            raise PolicySyncError(f"{path}: staged file was removed before install") from exc
-        except OSError as exc:
-            if exc.errno == errno.ELOOP:
-                raise PolicySyncError(f"{path}: refusing to authenticate staged symlink") from exc
-            raise PolicySyncError(f"{path}: cannot authenticate staged file: {exc.strerror or exc}") from exc
-
+        fd = _open_authenticated_staged_leaf(authenticated, path)
         try:
             file_stat = os.fstat(fd)
             digest = hashlib.sha256()
             with os.fdopen(fd, "rb") as staged_file:
                 for chunk in iter(lambda: staged_file.read(1024 * 1024), b""):
                     digest.update(chunk)
-            try:
-                path_stat = os.stat(authenticated.leaf_name, dir_fd=authenticated.parent_fd, follow_symlinks=False)
-            except FileNotFoundError as exc:
-                raise PolicySyncError(f"{path}: staged file was removed while authenticating") from exc
-            except OSError as exc:
-                raise PolicySyncError(f"{path}: cannot inspect staged file: {exc.strerror or exc}") from exc
-            if (file_stat.st_dev, file_stat.st_ino) != (path_stat.st_dev, path_stat.st_ino):
-                raise PolicySyncError(f"{path}: staged file identity changed while authenticating")
+            _verify_authenticated_staged_leaf_identity_unchanged(authenticated, path, file_stat)
             return FileIdentity(
                 device=file_stat.st_dev,
                 inode=file_stat.st_ino,
@@ -691,7 +910,14 @@ def authenticated_unlink(path: Path, root: Path | None = None, relative_path: Pa
     if root is None or relative_path is None:
         root, relative_path = _relative_from_path(path)
     with authenticated_path(root, relative_path, path, "staged") as authenticated:
-        os.unlink(authenticated.leaf_name, dir_fd=authenticated.parent_fd)
+        try:
+            os.unlink(authenticated.leaf_name, dir_fd=authenticated.parent_fd)
+            return
+        except NotImplementedError:
+            pass
+        platform_io.delete_windows_relative_child(
+            authenticated.windows_parent_handle.value, authenticated.leaf_name
+        )
 
 
 def authenticated_replace(
@@ -703,11 +929,28 @@ def authenticated_replace(
 ) -> None:
     with authenticated_path(root, src_relative_path, src_path, "staged") as src:
         with authenticated_path(root, dst_relative_path, dst_path, "host") as dst:
-            os.replace(
+            # Portable dir_fd-relative replace tried first (the real
+            # mechanism on POSIX); Windows' os.replace() does not even accept
+            # src_dir_fd/dst_dir_fd (TypeError, raised before any filesystem
+            # access), so this falls back to platform_io's HANDLE-to-HANDLE
+            # rename, which reuses the exact parent HANDLEs already
+            # authenticated above instead of re-resolving either pathname.
+            try:
+                os.replace(
+                    src.leaf_name,
+                    dst.leaf_name,
+                    src_dir_fd=src.parent_fd,
+                    dst_dir_fd=dst.parent_fd,
+                )
+                return
+            except (NotImplementedError, TypeError):
+                pass
+            platform_io.rename_windows_relative_child(
+                src.windows_parent_handle.value,
                 src.leaf_name,
+                dst.windows_parent_handle.value,
                 dst.leaf_name,
-                src_dir_fd=src.parent_fd,
-                dst_dir_fd=dst.parent_fd,
+                replace_if_exists=True,
             )
 
 
@@ -754,10 +997,44 @@ def staged_artifacts(staged_updates: Sequence[StagedUpdate]) -> list[tuple[Path,
     ]
 
 
+def _check_windows_rollback_target_missing(
+    parent_handle_value: int, leaf_name: str, relative_path: Path
+) -> None:
+    """Windows counterpart of the ``os.stat(dir_fd=...)`` missing-target probe.
+
+    ``open_windows_relative_child_disposition`` opens either a file or a
+    directory generically and refuses a reparse point, so one call answers
+    both "does anything already exist here" and "is it a symlink" the same way
+    the POSIX ``lstat`` did -- without ever resolving a full pathname a second
+    time.
+    """
+
+    try:
+        authority = platform_io.open_windows_relative_child_disposition(parent_handle_value, leaf_name)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise PolicySyncError(
+                f"{relative_path}: rollback conflict; destination symlink appeared after sync failure"
+            ) from exc
+        raise PolicySyncError(
+            f"{relative_path}: cannot inspect rollback target: {exc.strerror or exc}"
+        ) from exc
+    authority.close()
+    raise PolicySyncError(
+        f"{relative_path}: rollback conflict; destination appeared after sync failure"
+    )
+
+
 def restore_missing_host_from_backup(staged: StagedUpdate) -> None:
     with authenticated_path(staged.update.root, staged.update.relative_path, staged.update.relative_path) as host:
         try:
             current = os.stat(host.leaf_name, dir_fd=host.parent_fd, follow_symlinks=False)
+        except NotImplementedError:
+            _check_windows_rollback_target_missing(
+                host.windows_parent_handle.value, host.leaf_name, staged.update.relative_path
+            )
         except FileNotFoundError:
             pass
         except OSError as exc:
@@ -785,12 +1062,20 @@ def restore_missing_host_from_backup(staged: StagedUpdate) -> None:
     try:
         with authenticated_path(staged.update.root, staged.backup_relative_path, staged.backup_path, "staged") as backup:
             with authenticated_path(staged.update.root, staged.update.relative_path, staged.update.relative_path) as host:
-                os.link(
-                    backup.leaf_name,
-                    host.leaf_name,
-                    src_dir_fd=backup.parent_fd,
-                    dst_dir_fd=host.parent_fd,
-                )
+                try:
+                    os.link(
+                        backup.leaf_name,
+                        host.leaf_name,
+                        src_dir_fd=backup.parent_fd,
+                        dst_dir_fd=host.parent_fd,
+                    )
+                except NotImplementedError:
+                    platform_io.link_windows_relative_child(
+                        backup.windows_parent_handle.value,
+                        backup.leaf_name,
+                        host.windows_parent_handle.value,
+                        host.leaf_name,
+                    )
         authenticated_unlink(staged.backup_path, staged.update.root, staged.backup_relative_path)
     except FileExistsError as exc:
         raise PolicySyncError(

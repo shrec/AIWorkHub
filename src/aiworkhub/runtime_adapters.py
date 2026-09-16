@@ -100,7 +100,6 @@ OPENCODE_SNAP_FAIL_CLOSED = "opencode_snap_launcher_fail_closed"
 OPENCODE_WORKER_MCP_SERVER = "aiworkhub_worker_ai_tools"
 OPENCODE_PERMISSION_ALLOW = "allow"
 OPENCODE_PERMISSION_DENY = "deny"
-OPENCODE_WINDOWS_RESOLUTION_FAIL_CLOSED = "opencode_cli_windows_resolution_fail_closed"
 VSCODE_LM_ADAPTER = "vscode_lm"
 WINDOWS_NATIVE_CLI_REQUIRES_APPCONTAINER = "windows_native_cli_requires_appcontainer_sandbox"
 # The single spelling of the Windows confinement backend.  This exact string is
@@ -967,11 +966,6 @@ def resolve_executable(
     if adapter_id not in SUPPORTED_ADAPTERS:
         return ExecutableResolution(
             adapter_id, None, False, "unsupported adapter"
-        )
-
-    if adapter_id == OPENCODE_CLI_ADAPTER and _is_windows_host():
-        return ExecutableResolution(
-            adapter_id, None, False, OPENCODE_WINDOWS_RESOLUTION_FAIL_CLOSED
         )
 
     override_error = _validate_override_mapping(executable_overrides)

@@ -9,7 +9,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .platform_io import chmod_fd, is_windows, stat_owned_by_current_user
+from .platform_io import (
+    chmod_fd,
+    is_windows,
+    stat_owned_by_current_user,
+    windows_descriptor_secret_trust,
+    windows_harden_owner_only_key_dacl,
+)
 from .worker_workspace import write_json_0600
 
 
@@ -25,40 +31,110 @@ def signing_material(
     ).encode("utf-8")
 
 
-def _trusted_key_file(st: os.stat_result, *, platform_name: str) -> bool:
+def _trusted_key_file(
+    st: os.stat_result, *, platform_name: str, fd: int | None = None
+) -> bool:
     """Return whether an opened key file satisfies the host trust model.
 
-    Windows does not represent profile ACLs through POSIX permission bits:
-    ``os.chmod(..., 0o600)`` commonly reads back as ``0o666`` or ``0o444``.
-    Requiring an exact ``0o600`` there rejected AIWorkHub's own existing key,
-    then the create-once race path recursively retried forever.  POSIX keeps
-    the original owner + exact-mode requirement.
+    POSIX asks this with ``st_uid`` plus an exact ``0o600`` mode. Windows can
+    answer neither: ``os.chmod(..., 0o600)`` reads back as ``0o666`` and
+    ``st_uid`` is always 0, so requiring the POSIX answer there rejected
+    AIWorkHub's own key and drove the create-once path into an endless retry.
+
+    NF-2026-00011: answering "trusted" unconditionally instead removed the owner
+    check altogether, so a key planted by any other principal was accepted.
+    Windows now asks the EQUIVALENT question -- owner plus DACL -- against the
+    security descriptor of this exact open descriptor.
     """
 
     if not stat.S_ISREG(st.st_mode):
         return False
     if is_windows(platform_name):
-        return True
+        if not is_windows() or fd is None:
+            # Cross-platform tests drive the Windows BRANCH from a POSIX host,
+            # where there is no Windows security descriptor to read.
+            return True
+        trusted, _reason = windows_descriptor_secret_trust(fd)
+        return trusted
     return stat_owned_by_current_user(
         st, platform_name=platform_name
     ) and stat.S_IMODE(st.st_mode) == 0o600
 
 
+def _windows_link_identity(key_path: Path) -> os.stat_result | None:
+    """Refuse a reparse point before opening, and pin the identity observed.
+
+    Windows has no ``O_NOFOLLOW``, so ``os.open`` follows a symlink silently and
+    the key file could be redirected anywhere. The link is refused here, and the
+    caller re-checks ``(st_dev, st_ino)`` on the OPEN descriptor so a swap
+    performed between these two steps is refused as well.
+    """
+
+    try:
+        link_st = os.lstat(key_path)
+    except OSError:
+        return None
+    reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    if stat.S_ISLNK(link_st.st_mode) or (
+        reparse and getattr(link_st, "st_file_attributes", 0) & reparse
+    ):
+        return None
+    return link_st
+
+
 def _read_existing_key(key_path: Path, *, platform_name: str) -> bytes | None:
-    flags = os.O_RDONLY
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+    link_identity: os.stat_result | None = None
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
+    else:
+        # No O_NOFOLLOW on this runtime (Windows): pin the pre-open identity.
+        link_identity = _windows_link_identity(key_path)
+        if link_identity is None:
+            return None
     try:
         fd = os.open(key_path, flags)
     except OSError:
         return None
     try:
         st = os.fstat(fd)
-        if not _trusted_key_file(st, platform_name=platform_name):
+        if link_identity is not None and (
+            not st.st_ino
+            or (st.st_dev, st.st_ino) != (link_identity.st_dev, link_identity.st_ino)
+        ):
+            return None
+        if not _trusted_key_file(st, platform_name=platform_name, fd=fd):
             return None
         with os.fdopen(fd, "rb", closefd=False) as handle:
             data = handle.read(33)
         return data if len(data) == 32 else None
+    finally:
+        os.close(fd)
+
+
+def _windows_untrusted_reason(key_path: Path) -> str:
+    """Name WHY an existing key on Windows fails the trust check, for the
+    diagnostic only -- this never changes whether the key is accepted.
+
+    Deliberately does not attempt any repair. A key someone else broadened
+    the ACL on after creation, and a key this process itself created before
+    the write-side DACL hardening existed, produce the IDENTICAL evidence from
+    the file alone (an over-broad DACL); silently accepting one to fix the
+    other would also silently accept the first. Naming the reason keeps the
+    refusal fail-closed while turning "terminal_authority_key_invalid" from an
+    unexplained dead end into an actionable diagnostic -- delete the file and
+    let the (now-hardened) create path mint a new one.
+    """
+
+    try:
+        fd = os.open(key_path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+    except OSError:
+        return "unreadable"
+    try:
+        _trusted, reason = windows_descriptor_secret_trust(fd)
+        return reason or "untrusted"
+    except OSError:
+        return "unreadable"
     finally:
         os.close(fd)
 
@@ -87,7 +163,12 @@ def load_or_create_key(
             existing = _read_existing_key(key_path, platform_name=platform_name)
             if existing is not None:
                 return existing
-            raise RuntimeError("terminal_authority_key_invalid")
+            reason = (
+                _windows_untrusted_reason(key_path)
+                if is_windows(platform_name)
+                else "owner_or_mode_mismatch"
+            )
+            raise RuntimeError(f"terminal_authority_key_invalid:{reason}")
 
         key = os.urandom(32)
         flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
@@ -100,6 +181,20 @@ def load_or_create_key(
             # exact file on the next bounded iteration; never recurse.
             continue
         chmod_fd(new_fd, 0o600)
+        if is_windows(platform_name):
+            # Harden the DACL before this key is ever readable as trusted, so
+            # the create path can never again produce one the read side must
+            # refuse. Fail closed: an unhardened key is deleted, never kept.
+            hardened, reason = windows_harden_owner_only_key_dacl(key_path)
+            if not hardened:
+                os.close(new_fd)
+                try:
+                    key_path.unlink()
+                except OSError:
+                    pass
+                raise RuntimeError(
+                    f"terminal_authority_key_dacl_hardening_failed:{reason}"
+                )
         with os.fdopen(new_fd, "wb") as handle:
             handle.write(key)
         return key

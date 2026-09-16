@@ -166,6 +166,10 @@ def test_codex_provider_capability_keeps_quota_explicitly_unobserved(
     monkeypatch, tmp_path
 ):
     root = _root(tmp_path)
+    # As in _patch_runtime above: sandbox_backend="bubblewrap" (POSIX-only)
+    # would otherwise trip _provider_status's Windows native-CLI sandbox
+    # gate on a real Windows host, which is not what this test measures.
+    monkeypatch.setattr(repo_policy, "_is_windows_host", lambda: False)
     monkeypatch.setattr(
         repo_policy.runtime_adapters,
         "resolve_executable",

@@ -550,9 +550,12 @@ def test_review_packet_source_evidence_centers_nf3_late_changed_symbol(
         + "def _v3_planned_outputs():\n"
         + "    return ['tests/test_quality_reviewer_candidate_source_graph_b1461.py']\n"
     )
-    (canonical / "module.py").write_text(original, encoding="utf-8")
+    # write_bytes, not write_text: assertions below match "\n"-only literal
+    # substrings against the excerpt built from these exact on-disk bytes,
+    # and Path.write_text translates '\n' to CRLF on Windows.
+    (canonical / "module.py").write_bytes(original.encode("utf-8"))
     candidate_file = candidate / "module.py"
-    candidate_file.write_text(changed, encoding="utf-8")
+    candidate_file.write_bytes(changed.encode("utf-8"))
     digest = hashlib.sha256(candidate_file.read_bytes()).hexdigest()
     manager = SimpleNamespace(
         repo=canonical,
@@ -711,9 +714,9 @@ def test_review_packet_carries_whole_diff_hunks_with_removed_and_added_lines(
                 "OLD_TWO = 'y'\n", "z = 9\n"]
     changed = ["a = 1\n", "b = 2\n", "NEW_ONE = 'x'\n", "gap1 = 0\n", "gap2 = 0\n",
                "NEW_TWO = 'y'\n", "z = 9\n"]
-    (canonical / "m.py").write_text("".join(baseline), encoding="utf-8")
+    (canonical / "m.py").write_bytes("".join(baseline).encode("utf-8"))
     candidate_file = candidate / "m.py"
-    candidate_file.write_text("".join(changed), encoding="utf-8")
+    candidate_file.write_bytes("".join(changed).encode("utf-8"))
     digest = hashlib.sha256(candidate_file.read_bytes()).hexdigest()
     manager = SimpleNamespace(
         repo=canonical,
@@ -779,8 +782,10 @@ def test_caller_context_reads_canonical_source_around_graph_resolved_callers(
     """
     canonical = tmp_path / "canonical"
     (canonical / "src").mkdir(parents=True)
-    (canonical / "src" / "caller.py").write_text(
-        "".join(f"line {index}\n" for index in range(1, 31)), encoding="utf-8"
+    # write_bytes, not write_text: the expected "text" below is a "\n"-only
+    # literal compared exactly against what production reads back from disk.
+    (canonical / "src" / "caller.py").write_bytes(
+        "".join(f"line {index}\n" for index in range(1, 31)).encode("utf-8")
     )
     scoped = {
         "correctness": {"packet": {"impact_evidence": [

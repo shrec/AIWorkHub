@@ -14,7 +14,7 @@ _SRC = _ROOT / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from aiworkhub import model_settings, task_store  # noqa: E402
+from aiworkhub import model_settings, platform_io, task_store  # noqa: E402
 
 
 def test_grok_kilo_has_repository_local_xai_policy_identity() -> None:
@@ -341,7 +341,8 @@ def test_atomic_write_and_repository_isolation(tmp_path: Path) -> None:
         "models",
     }
     assert stored["providers"] == {"openai": False}
-    assert stat.S_IMODE(model_settings.settings_path(first).stat().st_mode) == 0o600
+    if platform_io.posix_path_modes_supported():
+        assert stat.S_IMODE(model_settings.settings_path(first).stat().st_mode) == 0o600
 
     config_dir = model_settings.settings_path(first).parent
     leftovers = [entry.name for entry in config_dir.iterdir() if ".tmp" in entry.name]

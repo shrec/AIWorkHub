@@ -590,8 +590,11 @@ def test_grok_kilo_discovers_newest_bounded_vscode_extension(monkeypatch, tmp_pa
     newer_bin = root / "kilocode.kilo-code-7.10.0" / "bin"
     older_bin.mkdir(parents=True)
     newer_bin.mkdir(parents=True)
-    older = _executable(older_bin, "kilo")
-    newer = _executable(newer_bin, "kilo")
+    # _resolve_kilo_extension_executable globs for platform_io.executable_name
+    # ("kilo.exe" on Windows), not the bare "kilo" _executable() defaults to.
+    binary_name = runtime_adapters.platform_io.executable_name("kilo")
+    older = _executable(older_bin, binary_name)
+    newer = _executable(newer_bin, binary_name)
     monkeypatch.setattr(runtime_adapters.shutil, "which", lambda _: None)
     monkeypatch.setattr(
         runtime_adapters, "_default_kilo_extension_roots", lambda: (root,)

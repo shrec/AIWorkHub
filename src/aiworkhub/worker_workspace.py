@@ -20,6 +20,7 @@ import hashlib
 import hmac
 import importlib.util
 import json
+import ntpath
 import os
 import re
 import shlex
@@ -237,6 +238,12 @@ TEMP_ROOT_ENV = runtime_temp.TEMP_ROOT_ENV
 BWRAP_ENV = "AIWORKHUB_BWRAP"
 SANDBOX_BACKEND_ENV = "AIWORKHUB_SANDBOX_BACKEND"
 VSCODE_LM_IN_PROCESS_BACKEND = "vscode_lm_in_process"
+# The backends whose confinement is expressed by REWRITING a command's argv, so
+# a caller can wrap one bounded command in them. Windows AppContainer confines a
+# launched worker through a profile SID and a Job Object instead, and the
+# editor-hosted backend owns no subprocess lane at all; neither has an argv
+# prefix a single ``--version`` read could be wrapped in.
+_ARGV_WRAPPING_SANDBOX_BACKENDS = frozenset({"bubblewrap", "landlock"})
 _VSCODE_LM_IN_PROCESS_ADAPTERS = frozenset(
     {"vscode_lm", "glm_vscode_lm", "deepseek_vscode_lm"}
 )
@@ -1851,7 +1858,7 @@ def _npm_validation_prefixes(commands: Iterable[str]) -> tuple[str, ...]:
         tokens, _components, _tmpdir, cd_relative = _parse_validation_command_detailed(
             command
         )
-        if not tokens or Path(tokens[0]).name.lower() not in {"npm", "npm.cmd"}:
+        if not tokens or ntpath.basename(tokens[0]).lower() not in {"npm", "npm.cmd"}:
             continue
         raw_prefix = ""
         for index, token in enumerate(tokens[1:], start=1):
@@ -2928,13 +2935,32 @@ def _update_worker_contract_packet(home: Path, **fields: Any) -> None:
         return
 
 
+def _resolve_source_home() -> Path:
+    """The real user's home directory whose credentials get projected.
+
+    ``pathlib.Path.home()`` only consults ``$HOME`` on POSIX --
+    ``ntpath.expanduser`` (what it delegates to on Windows) reads
+    ``USERPROFILE``/``HOMEDRIVE``+``HOMEPATH`` instead and never looks at
+    ``HOME`` at all. An explicit ``HOME`` override -- the isolation lever
+    every credential-projection test here uses to point at a fixture
+    "source home" instead of the real one -- was therefore silently
+    ignored on Windows, and every one of these call sites read this
+    machine's REAL ``~/.claude``/``~/.codex``/``~/.local/share/opencode``
+    instead. Honor ``HOME`` uniformly so the isolation contract holds on
+    every platform; unset, this is exactly ``Path.home()`` as before.
+    """
+
+    override = os.environ.get("HOME")
+    return Path(override) if override else Path.home()
+
+
 def _credential_home(home: Path, adapter_id: str, project_root: Path | None = None) -> None:
     home.mkdir(parents=True, exist_ok=True, mode=0o700)
     chmod_path(home, 0o700)
     temp_home = home / "tmp"
     temp_home.mkdir(parents=True, exist_ok=True, mode=0o700)
     chmod_path(temp_home, 0o700)
-    source_home = Path.home()
+    source_home = _resolve_source_home()
     if adapter_id == "claude_cli":
         refresh_claude_credential_projection(home)
         # Claude Code ignores the repository's permissions allowlist until the
@@ -3043,7 +3069,7 @@ def refresh_claude_credential_projection(home: Path) -> dict[str, Any]:
     """Refresh only Claude's narrow request-local credential projection."""
 
     selected_home = _verify_owner_private_directory(home, "claude_projection_home")
-    source_root_path = Path.home() / ".claude"
+    source_root_path = _resolve_source_home() / ".claude"
     if source_root_path.exists() or source_root_path.is_symlink():
         source_root = _verify_owner_private_directory(
             source_root_path, "claude_credential_source_home"
@@ -3544,7 +3570,7 @@ def _directory_write_denied_by_landlock(directory: Path) -> bool:
         return False
     if not stat.S_ISDIR(status.st_mode):
         return False
-    if status.st_uid != os.geteuid():
+    if posix_path_modes_supported() and status.st_uid != os.geteuid():
         return False
     if stat.S_IMODE(status.st_mode) & 0o200 == 0:
         return False
@@ -3589,9 +3615,29 @@ def plant_outer_validation_authority(
         raise WorkspaceError("nested_landlock_locator_symlink")
     if anchor_path.is_symlink():
         raise WorkspaceError("nested_landlock_locator_anchor_symlink")
+    def _clear_read_only_best_effort(path: Path) -> None:
+        # Removal authority lives in the parent directory alone on POSIX, so
+        # a prior locator's own read-only mode never needs clearing there --
+        # chmod_path is deliberately a no-op on Windows for exactly that
+        # reason elsewhere (WinError 5 on otherwise-valid paths). But Windows
+        # enforces a file's OWN read-only attribute for unlink regardless of
+        # parent permissions, so a prior locator from an earlier plant would
+        # otherwise make every replant fail there -- a direct (not
+        # chmod_path-wrapped) chmod is required. Best effort and swallowed:
+        # if an old locator is still a shared (hardlinked) inode inside a
+        # nested POSIX validation, the metadata broker's hardlink denial
+        # (NF-2026-00841) is expected and harmless here, since POSIX doesn't
+        # need this chmod for the unlink to succeed anyway.
+        try:
+            os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
+        except OSError:
+            pass
+
     if locator_path.exists():
+        _clear_read_only_best_effort(locator_path)
         locator_path.unlink()
     if anchor_path.exists():
+        _clear_read_only_best_effort(anchor_path)
         anchor_path.unlink()
     # NF-2026-00841: give this locator its final read-only mode at creation, on
     # the fresh unique inode ``O_EXCL`` just produced and before the very next
@@ -3823,7 +3869,7 @@ def _nested_landlock_validator_cwd(
             return False
         if (
             not stat.S_ISDIR(status.st_mode)
-            or status.st_uid != os.geteuid()
+            or (posix_path_modes_supported() and status.st_uid != os.geteuid())
         ):
             return False
     return True
@@ -4513,22 +4559,110 @@ def validation_toolchain_authority(
     return snapshot
 
 
-def trusted_validation_executable_version(resolved: str) -> str:
+def _direct_trusted_version_fact(argv: tuple[str, ...]) -> str:
+    """Probe an already-resolved trusted executable without a sandbox lane.
+
+    NF-2026-00010: Windows has neither bubblewrap nor Landlock, so
+    ``select_sandbox_backend`` raises there unless AppContainer resolves, and the
+    editor-hosted backend owns no validation subprocess lane of its own.
+    Returning an empty fact in those two cases recorded EVERY installed tool as
+    version-less, and a card declaring ``node>=20.0.0``/``ruff>=0.12`` was then
+    refused as ``task_contract_unwinnable`` on a host carrying Node v22.16.0 and
+    Ruff 0.16.1 -- an unwinnable contract produced by the measurement, not by the
+    toolchain.
+
+    A version fact is coordinator-side toolchain verification, not a model or a
+    native CLI launch, so measuring it here is the honest reading. ``argv[0]`` is
+    the exact path the trusted normalizer already resolved: this adds no PATH
+    lookup, no shell, and no repository cwd, and it stays fail-closed -- any
+    error, non-zero exit, or empty output is still the empty fact that refuses.
+    """
+    try:
+        executable = Path(argv[0]).resolve(strict=True)
+    except (IndexError, OSError):
+        return ""
+    if not executable.is_file() or not os.access(executable, os.X_OK):
+        return ""
+    try:
+        env = sanitized_env(
+            "validation",
+            home=None,
+            isolated_task_queue_db=False,
+            verify_preprovisioned_home=False,
+        )
+    except WorkspaceError:
+        return ""
+    # A version probe never needs caller-supplied import roots. Dropping them
+    # keeps a ``python -m <validator>`` probe from resolving a shadowed module.
+    env.pop("PYTHONPATH", None)
+    try:
+        with tempfile.TemporaryDirectory(prefix="aiworkhub-version-probe-") as scratch:
+            env["TMPDIR"] = scratch
+            env["TMP"] = scratch
+            env["TEMP"] = scratch
+            result = subprocess.run(
+                [str(executable), *argv[1:]],
+                cwd=scratch,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+                shell=False,
+            )
+    except (OSError, subprocess.SubprocessError, WorkspaceError):
+        return ""
+    output = (result.stdout or result.stderr).strip().splitlines()
+    if result.returncode != 0 or not output:
+        return ""
+    return output[0][:256]
+
+
+def trusted_validation_module_version(resolved: str, module: str) -> str:
+    """Version fact for ``<interpreter> -m <module>``, never the interpreter's.
+
+    The project registry declares Ruff as ``ruff`` OR ``python -m ruff``. Reading
+    the second candidate's fact from ``argv[0]`` recorded the interpreter's
+    version and compared it against Ruff's minimum, so the module is probed
+    explicitly. ``-I`` isolates the run from ``PYTHONPATH``, the user site, and
+    the working directory, which keeps the existing validator-module
+    substitution defence intact rather than widening it.
+    """
+    if not module or not module.replace(".", "_").isidentifier():
+        return ""
+    return trusted_validation_executable_version(
+        resolved, probe_args=("-I", "-m", module, "--version")
+    )
+
+
+def trusted_validation_executable_version(
+    resolved: str, probe_args: tuple[str, ...] = ("--version",)
+) -> str:
     """Read ``--version`` through the validation sandbox boundary."""
     try:
         executable = Path(resolved).resolve(strict=True)
         running_interpreter = Path(sys.executable).resolve(strict=True)
     except OSError:
         return ""
-    if executable == running_interpreter:
+    # The authoritative shortcut answers for the interpreter itself only. A
+    # ``-m <module>`` probe asks about the module, so it must still be measured.
+    if executable == running_interpreter and probe_args == ("--version",):
         version = sys.version_info
         return f"Python {version.major}.{version.minor}.{version.micro}"
     try:
         backend = select_sandbox_backend()
     except WorkspaceError:
-        return ""
-    if backend == VSCODE_LM_IN_PROCESS_BACKEND:
-        return ""
+        return _direct_trusted_version_fact((str(executable), *probe_args))
+    if backend not in _ARGV_WRAPPING_SANDBOX_BACKENDS:
+        # ``sandbox_argv`` wraps a command by REWRITING its argv, which only
+        # bubblewrap and Landlock do. The editor-hosted backend owns no
+        # subprocess lane, and the Windows AppContainer backend confines a
+        # launched worker through a profile SID and a Job Object rather than an
+        # argv prefix -- there is nothing to wrap a ``--version`` read in. Using
+        # the wrapped path there returned the empty fact for every installed
+        # tool, which is exactly the NF-2026-00010 failure this probe exists to
+        # avoid, so a backend with no argv boundary is measured directly.
+        return _direct_trusted_version_fact((str(executable), *probe_args))
     executable_roots: tuple[Path, ...] = (executable.parent,)
     python_runtime_identity_root: Path | None = None
     try:
@@ -4578,7 +4712,7 @@ def trusted_validation_executable_version(resolved: str) -> str:
             wrapped = sandbox_argv(
                 workspace,
                 "validation",
-                [str(executable), "--version"],
+                [str(executable), *probe_args],
                 backend=backend,
                 validation_exec_scratch=scratch,
                 validation_executable_roots=executable_roots,
@@ -6298,7 +6432,7 @@ def sanitized_env(
         "TEMP": str(temp_home),
     }
     if os.name == "nt":
-        drive, tail = os.path.splitdrive(str(selected_home))
+        drive, tail = ntpath.splitdrive(str(selected_home))
         username = os.environ.get("USERNAME", os.environ.get("USER", "user"))
         safe = {
             **common,
@@ -10811,7 +10945,7 @@ def _is_pytest_validation_command(argv: list[str]) -> bool:
     """True when *argv* (post-PYTHONPATH-prefix-strip) invokes pytest."""
     if not argv:
         return False
-    head = Path(argv[0]).name
+    head = ntpath.basename(argv[0])
     if head == "pytest":
         return True
     if not head.startswith("python"):
@@ -10825,7 +10959,7 @@ def _is_pytest_validation_command(argv: list[str]) -> bool:
 
 
 def _is_python_validation_command(argv: list[str]) -> bool:
-    return bool(argv) and Path(argv[0]).name.startswith("python")
+    return bool(argv) and ntpath.basename(argv[0]).startswith("python")
 
 
 def _normalize_pytest_validation_argv(argv: list[str]) -> list[str]:
@@ -10839,7 +10973,7 @@ def _normalize_pytest_validation_argv(argv: list[str]) -> list[str]:
     Explicit ``python* -m pytest`` commands remain byte-for-byte unchanged.
     """
 
-    if argv and Path(argv[0]).name == "pytest":
+    if argv and ntpath.basename(argv[0]) == "pytest":
         return [sys.executable, "-m", "pytest", *argv[1:]]
     return list(argv)
 

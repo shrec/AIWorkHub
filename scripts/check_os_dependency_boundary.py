@@ -179,7 +179,15 @@ def main() -> int:
         config = args.config or root / ".aiworkhub/config/development_rules.json"
         failures = check(root, config)
     except (OSError, ValueError, UnicodeError, json.JSONDecodeError) as exc:
-        print(f"os-dependency boundary check failed closed: {exc}")
+        if isinstance(exc, OSError) and exc.filename is not None:
+            # OSError.__str__ embeds repr(filename), which doubles every
+            # backslash on Windows -- fine for a Python traceback, useless
+            # for a human reading this CLI's own diagnostic. Print the raw
+            # path instead.
+            detail = f"{exc.strerror or exc}: {exc.filename}"
+        else:
+            detail = str(exc)
+        print(f"os-dependency boundary check failed closed: {detail}")
         return 2
     for failure in failures:
         print(failure)

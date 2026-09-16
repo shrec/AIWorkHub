@@ -514,7 +514,13 @@ def test_durable_publication_syncs_file_before_replace_and_directory_after(
     monkeypatch.setattr(platform_io.os, "fsync", recorded_fsync)
     monkeypatch.setattr(platform_io, "atomic_replace", recorded_replace)
     platform_io.durable_atomic_replace(source, destination)
-    assert events == ["sync", "replace", "sync"]
+    # durable_atomic_replace deliberately skips the post-replace directory
+    # open+fsync on Windows (os.open on a directory raises PermissionError
+    # there), so only the pre-replace source sync happens on that platform.
+    if platform_io.os.name == "nt":
+        assert events == ["sync", "replace"]
+    else:
+        assert events == ["sync", "replace", "sync"]
 
 
 @pytest.mark.parametrize("failure", ["source_sync", "directory_open", "replace"])
@@ -529,6 +535,12 @@ def test_durable_publication_precommit_failures_preserve_destination(
     real_fsync = platform_io.os.fsync
 
     if failure == "directory_open":
+        if platform_io.os.name == "nt":
+            pytest.skip(
+                "durable_atomic_replace never opens the destination directory "
+                "on Windows (os.name != 'nt' guard), so this failure injection "
+                "has nothing to attach to there"
+            )
 
         def failing_open(path, flags, *args):
             if platform_io.os.fspath(path) == platform_io.os.fspath(tmp_path):
@@ -553,6 +565,13 @@ def test_durable_publication_precommit_failures_preserve_destination(
     assert destination.read_bytes() == b"committed"
 
 
+@pytest.mark.skipif(
+    platform_io.os.name == "nt",
+    reason=(
+        "durable_atomic_replace never opens/fsyncs the destination directory "
+        "on Windows, so there is no post-replace directory sync to fail here"
+    ),
+)
 def test_durable_publication_post_replace_sync_failure_identifies_commit(
     tmp_path, monkeypatch
 ):

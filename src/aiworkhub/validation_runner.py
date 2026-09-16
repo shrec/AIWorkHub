@@ -416,7 +416,7 @@ def command_needs_multiprocessing_semlock(
     command: str, *, source_text: Callable[[str], str | None] | None = None
 ) -> bool:
     for segment in _command_segments(str(command)):
-        if segment and _PYTHON_INTERPRETER_RE.match(segment[0].rsplit("/", 1)[-1]):
+        if segment and _PYTHON_INTERPRETER_RE.match(_program_basename(segment[0])):
             for index, token in enumerate(segment):
                 if token == "-c" and index + 1 < len(segment):
                     if _source_needs_semlock(segment[index + 1]):
@@ -752,8 +752,12 @@ def classify_validation_results(results: Iterable[Mapping[str, Any]]) -> Termina
 # resolved here, once, so a full-suite run cannot escape and a bounded run
 # cannot be misread as full-suite.
 
-# python interpreter basenames: python / python3 / python3.11 / ...
-_PYTHON_INTERPRETER_RE = re.compile(r"python[0-9.]*$")
+# python interpreter basenames: python / python3 / python3.11 / python.exe / ...
+# NF-2026-00013: a Windows interpreter is ``python.exe``. Without the suffix this
+# matched nothing there, so ``python -m <validator>`` was not recognised as a
+# validator invocation at all -- not by capability preflight, not by execution
+# classification. Anchored and case-insensitive, because Windows filenames are.
+_PYTHON_INTERPRETER_RE = re.compile(r"python[0-9.]*(?:\.exe)?$", re.IGNORECASE)
 # python interpreter options that consume the following token as their value, so
 # a later ``-m`` is not mistaken for one hidden behind them.
 _PYTHON_INTERP_VALUE_FLAGS = frozenset({"-W", "-X", "--check-hash-based-pycs"})
@@ -862,8 +866,23 @@ def _iter_pytest_args(args):
             index += 1
 
 
+def _program_basename(token: str) -> str:
+    """The program name from a path recorded on EITHER platform.
+
+    NF-2026-00013: splitting only on ``/`` left a Windows interpreter path
+    (``D:\\repo\\.venv\\Scripts\\python.exe``) whole, so ``_PYTHON_INTERPRETER_RE``
+    never matched it and ``python -m <validator>`` silently stopped being a
+    validator invocation there -- for launch-time capability preflight and for
+    execution classification alike. A backslash is a path separator in this
+    vocabulary on every host, because the path may have been resolved on Windows
+    and written into a card that another host later reads.
+    """
+
+    return token.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+
+
 def _module_basename(module: str) -> str:
-    return module.rsplit("/", 1)[-1].split(".")[0]
+    return _program_basename(module).split(".")[0]
 
 
 def _python_module_selection(tokens: list[str]) -> tuple[str | None, list[str]]:
@@ -880,7 +899,7 @@ def _python_module_selection(tokens: list[str]) -> tuple[str | None, list[str]]:
 
     if not tokens:
         return None, []
-    head = tokens[0].rsplit("/", 1)[-1]
+    head = _program_basename(tokens[0])
     if not _PYTHON_INTERPRETER_RE.match(head):
         return None, []
     index = 1
@@ -969,7 +988,7 @@ def _pytest_args(tokens: list[str]) -> list[str] | None:
     module, rest = _python_module_selection(tokens)
     if module is not None:
         return rest if _module_basename(module) == "pytest" else None
-    if tokens and tokens[0].rsplit("/", 1)[-1] == "pytest":
+    if tokens and _program_basename(tokens[0]) == "pytest":
         return list(tokens[1:])
     return None
 

@@ -217,7 +217,7 @@ def _storage_write_authority_flags() -> dict[str, bool]:
     }
 
 
-MAX_MODEL_POLICY_CATALOG_ROWS = 64
+MAX_MODEL_POLICY_CATALOG_ROWS = 128
 
 # Ingestion bound, distinct from the compact render bound above. The rows that
 # survive into the response are chosen per provider, and that choice can only

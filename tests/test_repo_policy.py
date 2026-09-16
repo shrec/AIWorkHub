@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from aiworkhub import repo_policy, runtime_adapters
+from aiworkhub import repo_policy, runtime_adapters, workforce_catalog
 
 
 def _initialized_root(tmp_path: Path) -> Path:
@@ -17,6 +17,21 @@ def _initialized_root(tmp_path: Path) -> Path:
     (root / ".aiworkhub/config").mkdir(parents=True)
     (root / ".aiworkhub/project.json").write_text("{}\n", encoding="utf-8")
     return root
+
+
+def _native_cli_sandbox_backend() -> str:
+    """A sandbox_backend value that does NOT itself fail-close a native CLI.
+
+    ``_provider_status`` deliberately marks a native (non-VS-Code-LM) CLI
+    adapter unlaunchable on Windows unless ``sandbox_backend`` is exactly
+    ``WINDOWS_APPCONTAINER_BACKEND`` -- "bubblewrap" (a POSIX-only sandbox)
+    would trip that gate on Windows and mask whatever the test actually
+    means to exercise.
+    """
+
+    if os.name == "nt":
+        return repo_policy.WINDOWS_APPCONTAINER_BACKEND
+    return "bubblewrap"
 
 
 def test_ensure_policy_is_owner_only_idempotent_and_valid(tmp_path: Path) -> None:
@@ -62,7 +77,7 @@ def test_grok_kilo_preflight_uses_local_xai_auth_without_exposing_it(
         root,
         "grok_kilo_cli",
         repo_policy.load_policy(root),
-        "bubblewrap",
+        _native_cli_sandbox_backend(),
         "",
     )
 
@@ -106,7 +121,7 @@ def test_codex_preflight_uses_exact_secret_free_capability_receipt(
         root,
         "codex_cli",
         repo_policy.load_policy(root),
-        "bubblewrap",
+        _native_cli_sandbox_backend(),
         "",
     )
 
@@ -1528,3 +1543,33 @@ def test_an_unvouched_identifier_is_emptied_rather_than_given_a_reason_token() -
     assert repo_policy.SANDBOX_CAUSE_UNRECOGNIZED not in (
         repo_policy.SANDBOX_PUBLISHABLE_BACKENDS | set(repo_policy._POLICY_ALLOWED_ADAPTERS)
     )
+
+
+def test_build_preflight_warms_the_settings_catalog_handoff(tmp_path: Path) -> None:
+    """NF-2026-... (OpenCode never appeared in model settings, take two).
+
+    workforce_catalog.cached_preflight_snapshot / _settings_preflight_
+    snapshot exist specifically so a Settings read reuses an already-built
+    preflight instead of spawning a second ``opencode models`` probe -- but
+    the write side, ``remember_preflight_snapshot``, was previously called
+    only from ``workforce_catalog.build_catalog``, which the Settings/Workforce
+    read path does not itself invoke. Measured: ``resolve_executable`` and the
+    OpenCode discovery probe both worked correctly end to end, and a fresh
+    ``build_preflight`` call already carried every discovered model in its own
+    return value -- but a Settings read taken before anything happened to call
+    ``build_catalog`` first saw an empty handoff and reported zero OpenCode
+    models regardless. ``build_preflight`` is the one place every preflight
+    consumer (the MCP tool, the dashboard, this test) ultimately returns from,
+    so warming the handoff there closes the gap regardless of call order.
+    """
+
+    root = _initialized_root(tmp_path)
+    assert workforce_catalog.cached_preflight_snapshot(root) is None
+
+    report = repo_policy.build_preflight(root)
+
+    cached = workforce_catalog.cached_preflight_snapshot(root)
+    assert cached is not None
+    cached_ids = {item["adapter_id"] for item in cached["providers"]}
+    report_ids = {item["adapter_id"] for item in report["providers"]}
+    assert cached_ids == report_ids

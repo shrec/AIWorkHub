@@ -104,7 +104,11 @@ def _promoted_repo(root: Path) -> Path:
     for relative, content in PROMOTED_CONTENT.items():
         path = root / relative
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding="utf-8")
+        # write_bytes, not write_text: CHANGED_PATH_HASHES below is computed
+        # from these exact '\n'-only strings, and Path.write_text translates
+        # '\n' to CRLF on Windows, inflating the real on-disk bytes past what
+        # the fixture's pre-baked hash expects.
+        path.write_bytes(content.encode("utf-8"))
     return root
 
 
@@ -719,7 +723,7 @@ def test_canonical_authority_rejects_promoted_bytes_that_changed(normalized_mani
     authority = eq.canonical_acceptance_authority(
         repo, _sealed_card(), task_id=TASK_ID, request_id=REQUEST_ID
     )
-    (repo / PROMOTED_PATHS[0]).write_text("edited after promotion\n", encoding="utf-8")
+    (repo / PROMOTED_PATHS[0]).write_bytes(b"edited after promotion\n")
     with pytest.raises(eq.InvalidRunArtifactError, match="canonical_hash_mismatch"):
         eq.validate_run_artifact(_artifact(normalized_manifest), acceptance_authority=authority)
 

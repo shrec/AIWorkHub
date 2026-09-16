@@ -4358,7 +4358,71 @@ def _start_task_reconciler_safely(root: Path) -> None:
             "scan_finished_epoch": None,
         })
 
+
+def _detach_inheritable_stdin() -> None:
+    """Keep the JSON-RPC request pipe out of every child process.
+
+    NF-2026-00015, measured on Windows inside this exact server process: a child
+    that inherits this server's stdin handle hangs BEFORE it executes its own
+    first statement. ``git --version``, which opens no repository, timed out at
+    15 s, and so did a bare ``python -c`` whose only job was to append a marker
+    file -- the marker was never written. The identical commands with a detached
+    stdin returned in 0.03 s and 0.10 s. Every coordinator child that does not
+    redirect stdin is therefore affected: ``git ls-files -z`` burned its entire
+    120 s budget inside ``toolchain_authority.repository_tracked_paths`` and
+    ``aiworkhub_task_create`` looked like it had stalled, while the create path
+    itself answers in 0.16 s. Linux does not share the behaviour, which is why
+    the same code is healthy there.
+
+    Rebinding descriptor 0 to the null device also removes a correctness hazard
+    that exists on EVERY platform: a child holding the request pipe can consume
+    JSON-RPC bytes addressed to this server. The reader keeps a private
+    duplicate, which PEP 446 makes non-inheritable, so the protocol stream
+    itself is untouched. Failing to detach is never fatal -- the server keeps
+    the original stdin and stays serviceable.
+    """
+
+    import io
+
+    from . import platform_io
+
+    try:
+        private = os.dup(0)
+    except OSError:
+        return
+    try:
+        null_fd = os.open(os.devnull, os.O_RDONLY)
+    except OSError:
+        os.close(private)
+        return
+    try:
+        os.dup2(null_fd, 0)
+    except OSError:
+        os.close(private)
+        return
+    finally:
+        os.close(null_fd)
+    # The C runtime owns descriptor 0; a child is handed the PROCESS std handle.
+    # Only Windows can hold two different answers, and platform_io owns that.
+    platform_io.republish_standard_input_handle()
+    try:
+        reader = io.TextIOWrapper(
+            io.BufferedReader(io.FileIO(private, mode="rb", closefd=True)),
+            encoding="utf-8",
+            errors="replace",
+            newline="",
+        )
+    except (OSError, ValueError):
+        os.close(private)
+        return
+    sys.stdin = reader
+
+
 def main() -> None:
+    # Before ANY store initialization, reconciler thread or repository probe:
+    # each of those spawns children, and a child that inherits the request pipe
+    # is exactly what stalls this server on Windows.
+    _detach_inheritable_stdin()
     root = core.repo_root()
     # Additive schema migration for repositories created before NeedFix was
     # introduced. This runs before any read-only dashboard/list call so those

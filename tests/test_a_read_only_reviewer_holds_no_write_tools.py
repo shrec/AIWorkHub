@@ -22,6 +22,8 @@ Run: python3 -m pytest -q tests/test_a_read_only_reviewer_holds_no_write_tools.p
 
 from __future__ import annotations
 
+import os
+
 from aiworkhub import runtime_adapters as ra
 
 
@@ -178,12 +180,20 @@ def _plan(tmp_path, *, read_only: bool):
     fake = tmp_path / "claude"
     fake.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     fake.chmod(0o755)
+    # This test is about the argv's allowed/disallowed tool shape, not
+    # sandbox selection -- but build_runtime_command fails a native CLI
+    # closed on Windows unless outer_sandbox_backend names the AppContainer
+    # backend, so it must be supplied for the plan to have any argv to check.
+    outer_sandbox_backend = (
+        ra.WINDOWS_APPCONTAINER_SANDBOX_BACKEND if os.name == "nt" else None
+    )
     return ra.build_runtime_command(
         "claude_cli",
         "review this",
         tmp_path,
         read_only=read_only,
         executable_overrides={"claude_cli": str(fake)},
+        outer_sandbox_backend=outer_sandbox_backend,
     )
 
 

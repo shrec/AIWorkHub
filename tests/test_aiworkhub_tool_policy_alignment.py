@@ -88,7 +88,16 @@ def test_check_rejects_host_symlink_without_opening_target(tmp_path: Path, monke
 
     assert policy_sync.check(tmp_path) == [f"{host}: refusing to sync through symlink"]
     assert target_path not in opened_paths
-    assert Path(host.name) in opened_paths
+    if policy_sync.platform_io is None or policy_sync.platform_io.posix_path_modes_supported():
+        assert Path(host.name) in opened_paths
+    else:
+        # Windows authenticates the leaf via a native NtCreateFile HANDLE
+        # open (os.open() can never open a directory there, and the leaf's
+        # parent authentication uses the same HANDLE-relative primitive), so
+        # os.open() itself is never called for it -- opened_paths can only
+        # observe POSIX's mechanism. The rejection above, from the SAME
+        # symlinked leaf, is what proves it was actually inspected.
+        assert Path(host.name) not in opened_paths
 
 
 def test_check_fails_closed_without_nofollow_before_opening_target(
@@ -234,7 +243,13 @@ def test_sync_preserves_host_file_mode(tmp_path: Path, monkeypatch) -> None:
 
     assert changed == [policy_sync.HOST_FILES[0]]
     assert drifted_path.read_bytes() == original
-    assert drifted_path.stat().st_mode & 0o7777 == 0o644
+    if policy_sync.platform_io is None or policy_sync.platform_io.posix_path_modes_supported():
+        assert drifted_path.stat().st_mode & 0o7777 == 0o644
+    else:
+        # Windows' CRT stat() reports only 0o666 (writable) or 0o444
+        # (read-only) for a regular file, synthesized from the read-only
+        # attribute alone -- never the exact mode requested at creation.
+        assert drifted_path.stat().st_mode & 0o7777 == 0o666
 
 
 def test_open_new_staged_file_does_not_change_process_umask(tmp_path: Path) -> None:
@@ -248,7 +263,12 @@ def test_open_new_staged_file_does_not_change_process_umask(tmp_path: Path) -> N
     after_umask = os.umask(original_umask)
     os.umask(after_umask)
     assert after_umask == original_umask
-    assert path.stat().st_mode & 0o7777 == 0o644
+    if policy_sync.platform_io is None or policy_sync.platform_io.posix_path_modes_supported():
+        assert path.stat().st_mode & 0o7777 == 0o644
+    else:
+        # See test_sync_preserves_host_file_mode: Windows never reports an
+        # exact requested mode, only 0o666 (writable) or 0o444 (read-only).
+        assert path.stat().st_mode & 0o7777 == 0o666
 
 
 def test_open_new_staged_file_does_not_relax_concurrent_file_creation_permissions(
@@ -283,7 +303,13 @@ def test_open_new_staged_file_does_not_relax_concurrent_file_creation_permission
     finally:
         os.umask(original_umask)
 
-    assert observed_mode == 0o600
+    if policy_sync.platform_io is None or policy_sync.platform_io.posix_path_modes_supported():
+        assert observed_mode == 0o600
+    else:
+        # See test_sync_preserves_host_file_mode: Windows collapses any
+        # masked-writable mode to 0o666 rather than reporting the exact
+        # umask-applied bits.
+        assert observed_mode == 0o666
 
 
 def _claude_stale_copy() -> bytes:
@@ -665,24 +691,63 @@ def test_sync_rollback_preserves_concurrent_edit_after_applied_host_changes(
     concurrent = originals[policy_sync.HOST_FILES[0]].replace(
         b"Stop at manager review.", b"Stop at concurrent review."
     )
-    real_replace = policy_sync.os.replace
     host_names = {relative_path.name for relative_path in policy_sync.HOST_FILES}
     staged_write_count = 0
 
-    def change_first_host_then_fail_second_install(src: Path, dst: Path, *args, **kwargs) -> None:
-        nonlocal staged_write_count
-        src_path = Path(src)
-        dst_path = Path(dst)
-        if ".aiworkhub-policy-sync." in src_path.name and src_path.name.endswith(".tmp") and dst_path.name in host_names:
-            staged_write_count += 1
-            if staged_write_count == 2:
-                raise OSError("injected second write failure")
-            real_replace(src, dst, *args, **kwargs)
-            first_host.write_bytes(concurrent)
-            return
-        real_replace(src, dst, *args, **kwargs)
+    def is_staged_install(src_name: str, dst_name: str) -> bool:
+        return (
+            ".aiworkhub-policy-sync." in src_name
+            and src_name.endswith(".tmp")
+            and dst_name in host_names
+        )
 
-    monkeypatch.setattr(policy_sync.os, "replace", change_first_host_then_fail_second_install)
+    def run_install_attempt(perform_real_install) -> None:
+        nonlocal staged_write_count
+        staged_write_count += 1
+        if staged_write_count == 2:
+            raise OSError("injected second write failure")
+        perform_real_install()
+        first_host.write_bytes(concurrent)
+
+    # authenticated_replace() tries the portable os.replace(dir_fd=...) form
+    # first, but on Windows that call ALWAYS raises NotImplementedError
+    # before touching the filesystem (os.replace does not support dir_fd
+    # there at all), and authenticated_replace catches exactly that to fall
+    # back to platform_io.rename_windows_relative_child -- the real
+    # mechanism on that platform. Hooking only os.replace would either miss
+    # the actual install on Windows entirely, or (if os.replace also
+    # incremented the counter before raising) double-count a single install
+    # attempt across both hooks. Hook whichever function actually performs
+    # the rename on this host.
+    if os.name == "nt":
+        real_rename_windows = policy_sync.platform_io.rename_windows_relative_child
+
+        def windows_install_hook(
+            src_parent_handle, src_leaf_name, dst_parent_handle, dst_leaf_name, **kwargs
+        ) -> None:
+            if is_staged_install(src_leaf_name, dst_leaf_name):
+                run_install_attempt(
+                    lambda: real_rename_windows(
+                        src_parent_handle, src_leaf_name, dst_parent_handle, dst_leaf_name, **kwargs
+                    )
+                )
+                return
+            real_rename_windows(src_parent_handle, src_leaf_name, dst_parent_handle, dst_leaf_name, **kwargs)
+
+        monkeypatch.setattr(
+            policy_sync.platform_io, "rename_windows_relative_child", windows_install_hook
+        )
+    else:
+        real_replace = policy_sync.os.replace
+
+        def posix_install_hook(src: Path, dst: Path, *args, **kwargs) -> None:
+            src_path, dst_path = Path(src), Path(dst)
+            if is_staged_install(src_path.name, dst_path.name):
+                run_install_attempt(lambda: real_replace(src, dst, *args, **kwargs))
+                return
+            real_replace(src, dst, *args, **kwargs)
+
+        monkeypatch.setattr(policy_sync.os, "replace", posix_install_hook)
 
     try:
         policy_sync.sync(tmp_path)
