@@ -1847,7 +1847,7 @@ def test_cross_instance_stop_uses_durable_exact_builder_identity(tmp_path, monke
         win_kwargs = source_graph_daemon.SourceGraphDaemon._new_process_group_popen_kwargs()
     assert set(win_kwargs) == {"creationflags"}
     assert win_kwargs["creationflags"] == getattr(
-        source_graph_daemon.subprocess, "CREATE_NEW_PROCESS_GROUP", 0
+        source_graph_daemon.subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200
     )
 
 
