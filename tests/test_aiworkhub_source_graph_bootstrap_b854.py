@@ -198,7 +198,15 @@ def test_incremental_rebuild_idempotent_no_duplicate_entities_or_edges(tmp_path)
         ).fetchone()[0]
         assert total == distinct
         edge_total = conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0]
-        sg.build_index(repo, incremental=False)
+    finally:
+        conn.close()
+    # build_index publishes the rebuilt database by replacing this exact
+    # path, which Windows refuses while any connection to it -- like the one
+    # above -- is still open; close it first, matching how a real caller
+    # never holds a read connection open across a rebuild.
+    sg.build_index(repo, incremental=False)
+    conn = sg.connect(sg.resolve_db_path(repo))
+    try:
         edge_total_after_full = conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0]
     finally:
         conn.close()
