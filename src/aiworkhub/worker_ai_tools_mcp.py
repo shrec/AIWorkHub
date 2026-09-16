@@ -6197,7 +6197,12 @@ MAX_FINDING_JSON_STRING_CHARS = 32_768
 def _decode_finding_json_object(
     raw: str,
 ) -> tuple[dict[str, Any] | None, str | None, dict[str, Any]]:
-    """Decode one bounded, one-level JSON-object finding input string."""
+    """Decode one bounded JSON-object finding input string.
+
+    The callable MCP schema may expose findings as JSON strings.  Preserve the
+    documented canonical evidence object so the shared finding normalizer can
+    validate and flatten it; all other nested values remain fail-closed here.
+    """
     empty: dict[str, Any] = {}
     if len(raw) > MAX_FINDING_JSON_STRING_CHARS:
         return None, "finding_json_object_string_too_large", empty
@@ -6208,16 +6213,11 @@ def _decode_finding_json_object(
     if not isinstance(decoded, dict):
         return None, "finding_json_object_string_not_object", empty
     for key, value in decoded.items():
+        if key == "evidence" and isinstance(value, Mapping):
+            continue
         if value is not None and not isinstance(value, (bool, int, float, str)):
             field = str(key)
             correction: dict[str, Any] = {"field": field}
-            if field == "evidence":
-                correction["schema"] = quality_reviewer.QUALITY_REVIEW_FINDING_SCHEMA_DOC
-                correction["example"] = {
-                    "severity": "high",
-                    "summary": "one sentence",
-                    "evidence": "src/path.py:1",
-                }
             return None, f"finding_json_object_nested_field:{field}", correction
     return decoded, None, empty
 

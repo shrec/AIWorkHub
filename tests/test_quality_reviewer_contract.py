@@ -168,7 +168,7 @@ def test_finding_json_string_failures_have_distinct_deterministic_reasons(
     }
 
 
-def test_nested_evidence_object_guides_flat_correction_without_second_receipt(
+def test_nested_evidence_json_string_normalizes_without_correction(
     tmp_path: Path,
 ) -> None:
     nested = dict(_in_scope_finding("nested-evidence"))
@@ -181,47 +181,36 @@ def test_nested_evidence_object_guides_flat_correction_without_second_receipt(
     packet_path = tmp_path / "review_packet.json"
     packet_path.write_text(json.dumps(packet), encoding="utf-8")
     ctx = _worker_context(tmp_path, packet_path)
-    rejected = worker_tools.quality_review_submit(
+    accepted = worker_tools.quality_review_submit(
         ctx,
         packet_sha256=str(packet["packet_sha256"]),
         lens="correctness",
         findings=[json.dumps(nested)],
     )
-    assert rejected["ok"] is False
-    assert rejected["reason"] == "finding_json_object_nested_field:evidence"
-    assert rejected["field"] == "evidence"
-    assert rejected["schema"] == qr.QUALITY_REVIEW_FINDING_SCHEMA_DOC
-    assert rejected["example"] == {
-        "severity": "high",
-        "summary": "one sentence",
-        "evidence": "src/path.py:1",
-    }
-    assert rejected["attempt"] == 1
-    assert rejected["corrections_remaining"] == 1
-    assert rejected["terminal"] is False
-    accepted = worker_tools.quality_review_submit(
-        ctx,
-        packet_sha256=str(packet["packet_sha256"]),
-        lens="correctness",
-        findings=[_in_scope_finding("nested-evidence")],
-    )
     assert accepted["ok"] is True, accepted
     assert accepted["durable"] is True
     payloads = _verified_payloads(ctx)
     assert len(payloads) == 1
-    assert payloads[0]["report"]["findings"][0]["id"] == "nested-evidence"
+    finding = payloads[0]["report"]["findings"][0]
+    assert finding["id"] == "nested-evidence"
+    assert finding["evidence"] == "src/aiworkhub/core.py:7"
+    assert finding["evidence_reference"] == {
+        "kind": "source",
+        "path": "src/aiworkhub/core.py",
+        "line_start": 7,
+        "line_end": 7,
+    }
 
 
-def test_nested_evidence_two_failures_refuse_a_third_attempt(tmp_path: Path) -> None:
+def test_invalid_nested_field_two_failures_refuse_a_third_attempt(
+    tmp_path: Path,
+) -> None:
     nested = json.dumps(
         {
             "severity": "high",
             "summary": "gate",
-            "evidence": {
-                "path": "src/aiworkhub/core.py",
-                "line_start": 7,
-                "line_end": 7,
-            },
+            "evidence": "src/aiworkhub/core.py:7",
+            "path": ["src/aiworkhub/core.py"],
         }
     )
     packet = _packet()
@@ -234,6 +223,7 @@ def test_nested_evidence_two_failures_refuse_a_third_attempt(tmp_path: Path) -> 
         lens="correctness",
         findings=[nested],
     )
+    assert first["reason"] == "finding_json_object_nested_field:path"
     assert first["attempt"] == 1
     assert first["terminal"] is False
     second = worker_tools.quality_review_submit(
@@ -242,7 +232,7 @@ def test_nested_evidence_two_failures_refuse_a_third_attempt(tmp_path: Path) -> 
         lens="correctness",
         findings=[nested],
     )
-    assert second["reason"] == "finding_json_object_nested_field:evidence"
+    assert second["reason"] == "finding_json_object_nested_field:path"
     assert second["terminal"] is True
     third = worker_tools.quality_review_submit(
         ctx,
