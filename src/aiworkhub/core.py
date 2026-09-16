@@ -4,6 +4,7 @@ import fnmatch
 import hashlib
 import hmac
 import json
+import ntpath
 import os
 import re
 import sqlite3
@@ -272,7 +273,7 @@ def _claude_windows_manager_identity() -> dict[str, str] | None:
     tree = _windows_process_tree()
     if tree is None:
         return None
-    interpreter_image = Path(sys.executable).name.lower()
+    interpreter_image = ntpath.basename(sys.executable).lower()
     candidate = parent_pid
     owner_pid: int | None = None
     for _hop in range(_CLAUDE_LAUNCHER_HOP_LIMIT + 1):
