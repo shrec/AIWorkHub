@@ -215,7 +215,14 @@ def test_spill_fsyncs_containing_directory_after_publish(tmp_path, monkeypatch) 
 
     output_spill_store.spill_text("durable directory entry", repo=tmp_path)
 
-    assert str(tmp_path / ".aiworkhub" / "spill") in fsynced_paths
+    # _fsync_dir deliberately no-ops on Windows (os.open on a directory
+    # raises PermissionError there; see
+    # test_directory_fsync_is_skipped_on_windows_without_touching_disk), so
+    # the directory entry itself is only ever fsynced on POSIX.
+    if output_spill_store.os.name == "nt":
+        assert str(tmp_path / ".aiworkhub" / "spill") not in fsynced_paths
+    else:
+        assert str(tmp_path / ".aiworkhub" / "spill") in fsynced_paths
 
 
 def test_directory_fsync_is_skipped_on_windows_without_touching_disk(
