@@ -133,6 +133,12 @@ def load_registry(repo_root: Path | str) -> dict[str, Any]:
     artifacts = document["artifacts"]
     if len(artifacts) > MAX_ARTIFACTS or any(not isinstance(row, Mapping) for row in artifacts):
         raise EvalArtifactError("registry_artifacts_invalid")
+    seen_ids: set[str] = set()
+    for row in artifacts:
+        artifact_id = str(row.get("id") or "")
+        if artifact_id and artifact_id in seen_ids:
+            raise EvalArtifactError(f"registry_duplicate_id:{artifact_id}")
+        seen_ids.add(artifact_id)
     return {**document, "schema_id": SCHEMA_ID}
 
 

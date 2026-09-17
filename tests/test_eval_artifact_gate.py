@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from aiworkhub import eval_artifact_gate, quality_evidence
 
 
@@ -166,3 +168,20 @@ def test_failed_eval_artifact_always_blocks() -> None:
         "combined_tree:builtin:eval_artifact_truth"
         in verdict["blocking_evidence"]
     )
+
+
+def test_load_registry_rejects_duplicate_artifact_ids(tmp_path: Path) -> None:
+    config = tmp_path / ".aiworkhub"
+    config.mkdir()
+    (config / "eval-artifacts.json").write_text(
+        json.dumps({
+            "artifacts": [
+                {"id": "demo", "summary_path": "eval/a.json", "rows_path": "eval/a.jsonl"},
+                {"id": "demo", "summary_path": "eval/b.json", "rows_path": "eval/b.jsonl"},
+            ],
+        }),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(eval_artifact_gate.EvalArtifactError, match="registry_duplicate_id:demo"):
+        eval_artifact_gate.load_registry(tmp_path)

@@ -478,6 +478,8 @@ def export_attempt_trajectory(
     request_id: str,
     process_events_path: str | Path | None = None,
     attempt_artifact_bundle_dir: str | Path | None = None,
+    manager_decisions: dict[str, dict[str, str]] | None = None,
+    usage_rows: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Compose one deterministic, read-only attempt trajectory export.
 
@@ -486,6 +488,15 @@ def export_attempt_trajectory(
     rather than raising, but a *present and tampered* artifact bundle or a
     contradictory terminal decision still fails closed via the named errors
     above. Nothing here mutates any store.
+
+    ``manager_decisions`` and ``usage_rows`` are whole-store snapshots
+    (``task_store.latest_manager_decisions`` / ``list_usage_events``). A
+    caller exporting many trajectories from the same store snapshot -- for
+    example a corpus builder iterating over thousands of cards -- should
+    fetch each once and pass it in here, rather than let every call re-run
+    its own whole-table query; that per-call re-fetch is what turns an
+    N-card rebuild into O(N) whole-store scans. Omitting either argument
+    preserves the original single-call behavior of fetching it fresh.
     """
     repo_path = Path(repo)
     ledger_path = (
@@ -507,14 +518,18 @@ def export_attempt_trajectory(
         task_events = task_store.get_task_events(repo_path, task_id, limit=500)
     except task_store.TaskStoreError:
         task_events = []
-    try:
-        usage_rows = task_store.list_usage_events(repo_path, limit=10_000)
-    except task_store.TaskStoreError:
-        usage_rows = []
-    try:
-        manager_decision = task_store.latest_manager_decisions(repo_path).get(task_id)
-    except task_store.TaskStoreError:
-        manager_decision = None
+    if usage_rows is None:
+        try:
+            usage_rows = task_store.list_usage_events(repo_path, limit=10_000)
+        except task_store.TaskStoreError:
+            usage_rows = []
+    if manager_decisions is None:
+        try:
+            manager_decision = task_store.latest_manager_decisions(repo_path).get(task_id)
+        except task_store.TaskStoreError:
+            manager_decision = None
+    else:
+        manager_decision = manager_decisions.get(task_id)
 
     ledger_events = (
         list(
@@ -561,3 +576,18 @@ def export_attempt_trajectory(
         artifact_bundle=artifact_bundle,
         accepted_outcome_authority=partial(task_engine._validate_accepted_outcome_receipt, repo_path),
     )
+
+
+__all__ = [
+    "SCHEMA_ID",
+    "UNKNOWN",
+    "AttemptTrajectoryExportError",
+    "IdentityMismatchError",
+    "DuplicateSequenceError",
+    "ArtifactDigestMismatchError",
+    "ContradictoryTerminalDecisionError",
+    "redact",
+    "to_canonical_json",
+    "build_attempt_trajectory",
+    "export_attempt_trajectory",
+]

@@ -4,6 +4,41 @@
       "aggregates": [
         {
           "operation": "sum",
+          "row_field": "events_count",
+          "summary_field": "total_events_count"
+        },
+        {
+          "equals": "accepted",
+          "operation": "all",
+          "row_field": "outcome_state",
+          "summary_field": "all_rows_accepted"
+        }
+      ],
+      "count_fields": [
+        "record_count"
+      ],
+      "id": "accepted-task-trajectories-v1",
+      "minimum_rows": 20,
+      "pass_values": [
+        "PASS"
+      ],
+      "required_row_fields": [
+        "task_id",
+        "request_id",
+        "task_family",
+        "risk_tier",
+        "outcome_complexity",
+        "row_sha256"
+      ],
+      "row_format": "jsonl",
+      "rows_path": "eval/aiworkhub_accepted_task_trajectories_rows_v1.jsonl",
+      "summary_path": "eval/aiworkhub_accepted_task_trajectories_v1.json",
+      "verdict_field": "verdict"
+    },
+    {
+      "aggregates": [
+        {
+          "operation": "sum",
           "row_field": "before_bundle_bytes",
           "summary_field": "before_bundle_bytes"
         },
@@ -39,5 +74,5 @@
       "verdict_field": "verdict"
     }
   ],
-  "schema_id": "aiworkhub.eval_artifact_registry.v1"
+  "schema_id": "aiworkhub.eval_artifact_gate.v1"
 }

@@ -754,3 +754,102 @@ def test_export_attempt_trajectory_verified_artifact_bundle_end_to_end(tmp_path:
     assert result["artifacts"]["state"] == "verified"
     assert result["artifacts"]["verification"]["attempt_id"] == REQUEST_ID
     assert result["validations"]["passed"] is True
+
+
+# --------------------------------------------------------------------------
+# Public contract: the exact symbols scripts/build_accepted_task_eval.py
+# depends on must stay importable, or the accepted-task eval corpus builder
+# silently breaks.
+# --------------------------------------------------------------------------
+
+def test_public_contract_symbols_used_by_accepted_task_eval_builder_are_stable() -> None:
+    assert export_mod.__all__ == [
+        "SCHEMA_ID",
+        "UNKNOWN",
+        "AttemptTrajectoryExportError",
+        "IdentityMismatchError",
+        "DuplicateSequenceError",
+        "ArtifactDigestMismatchError",
+        "ContradictoryTerminalDecisionError",
+        "redact",
+        "to_canonical_json",
+        "build_attempt_trajectory",
+        "export_attempt_trajectory",
+    ]
+    assert export_mod.UNKNOWN == "UNKNOWN"
+    assert callable(export_mod.export_attempt_trajectory)
+
+
+# --------------------------------------------------------------------------
+# Batched manager_decisions / usage_rows: a caller exporting many
+# trajectories from one store snapshot (the accepted-task eval corpus
+# builder) must be able to fetch each whole-store query once and reuse it,
+# rather than have every export call re-run its own whole-table scan --
+# that per-call re-fetch is what turns an N-card rebuild into O(N) whole-
+# store scans.
+# --------------------------------------------------------------------------
+
+def test_export_attempt_trajectory_reuses_prefetched_manager_decisions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    card = _seed_genuine_accepted_evidence(repo, task_id=TASK_ID, request_id=REQUEST_ID)
+    _seed_task(repo, task_id=TASK_ID, card=card)
+
+    def _boom(*_args, **_kwargs):
+        raise AssertionError("latest_manager_decisions must not be re-queried when prefetched")
+
+    monkeypatch.setattr(task_store, "latest_manager_decisions", _boom)
+
+    result = export_mod.export_attempt_trajectory(
+        repo, task_id=TASK_ID, request_id=REQUEST_ID,
+        manager_decisions={
+            TASK_ID: {
+                "decision": "accepted", "event": "accept_review",
+                "created_at": "2026-09-01T00:00:00+00:00",
+            },
+        },
+    )
+
+    assert result["manager_decision"]["decision"] == "accepted"
+
+
+def test_export_attempt_trajectory_reuses_prefetched_usage_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    card = _seed_genuine_accepted_evidence(repo, task_id=TASK_ID, request_id=REQUEST_ID)
+    _seed_task(repo, task_id=TASK_ID, card=card)
+
+    def _boom(*_args, **_kwargs):
+        raise AssertionError("list_usage_events must not be re-queried when prefetched")
+
+    monkeypatch.setattr(task_store, "list_usage_events", _boom)
+
+    usage_row = {
+        "request_id": REQUEST_ID, "usage_observed": True, "cost_known": True,
+        "total_tokens": 42, "cost_usd": 0.5,
+    }
+    result = export_mod.export_attempt_trajectory(
+        repo, task_id=TASK_ID, request_id=REQUEST_ID, usage_rows=[usage_row],
+    )
+
+    assert result["usage"]["state"] == "measured"
+    assert result["usage"]["total_tokens"] == 42
+
+
+def test_export_attempt_trajectory_still_fetches_when_not_prefetched(tmp_path: Path) -> None:
+    """Omitting both arguments preserves the original single-call behavior."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    card = _seed_genuine_accepted_evidence(repo, task_id=TASK_ID, request_id=REQUEST_ID)
+    _seed_task(repo, task_id=TASK_ID, card=card)
+
+    result = export_mod.export_attempt_trajectory(repo, task_id=TASK_ID, request_id=REQUEST_ID)
+
+    assert result["outcome"]["state"] == "accepted"
+    assert result["manager_decision"]["decision"] == export_mod.UNKNOWN
+    assert result["usage"]["state"] == export_mod.UNKNOWN
+    assert issubclass(export_mod.AttemptTrajectoryExportError, ValueError)
