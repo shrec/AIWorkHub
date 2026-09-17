@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import tempfile
 from pathlib import Path
 from typing import Any, Mapping
@@ -360,3 +362,124 @@ def test_unrelated_and_forged_events_do_not_count_toward_generation(init: Path):
     )
     assert reopened["reopen_generation"] == 1
     assert needfix_store.get_needfix(init, rec["id"])["reopen_generation"] == 1
+
+
+def _receipt(task_id: str = "TASK-1", request_id: str = "request-1") -> dict[str, Any]:
+    hashes = {"src/fix.py": "b" * 64}
+    unsigned = {
+        "schema_id": needfix_store.ACCEPTED_OUTCOME_RECEIPT_SCHEMA_ID,
+        "task_id": task_id,
+        "request_id": request_id,
+        "claim_epoch": 1,
+        "base_oid": "base",
+        "promoted_paths": ["src/fix.py"],
+        "changed_path_hashes": hashes,
+        "attempt_artifact_manifest_id": "c" * 64,
+        "repository_revision": "sha256:" + hashlib.sha256(
+            json.dumps(
+                {"base_oid": "base", "changed_path_hashes": hashes},
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest(),
+    }
+    return {
+        **unsigned,
+        "receipt_id": "sha256:" + hashlib.sha256(
+            json.dumps(
+                unsigned, sort_keys=True, separators=(",", ":")
+            ).encode()
+        ).hexdigest(),
+    }
+
+
+def _cause(**overrides: Any) -> dict[str, Any]:
+    result = {
+        "schema_id": needfix_store.CAUSED_BY_SCHEMA_ID,
+        "repository_id": "repo-one",
+        "task_id": "TASK-1",
+        "request_id": "request-1",
+        "accepted_outcome_receipt": _receipt(),
+    }
+    result.update(overrides)
+    return result
+
+
+def _accepted(identity: Mapping[str, Any]) -> dict[str, Any]:
+    return {**identity, "outcome": "accepted"}
+
+
+def test_capture_persists_verified_caused_by_and_is_idempotent(init: Path):
+    kwargs = {
+        "title": "escaped defect",
+        "description": "regression after accepted outcome",
+        "caused_by": _cause(),
+        "repository_id": "repo-one",
+        "verify_accepted_outcome": _accepted,
+    }
+    first = needfix_store.capture_proposal(init, **kwargs)
+    second = needfix_store.capture_proposal(init, **kwargs)
+    assert second["id"] == first["id"]
+    assert needfix_store.get_needfix(init, first["id"])["caused_by"] == _cause()
+
+
+def test_dedupe_without_incoming_cause_preserves_stored_attribution(init: Path):
+    first = needfix_store.capture_proposal(
+        init,
+        title="escaped defect",
+        description="regression after accepted outcome",
+        caused_by=_cause(),
+        repository_id="repo-one",
+        verify_accepted_outcome=_accepted,
+    )
+    second = needfix_store.capture_proposal(
+        init,
+        title="escaped defect",
+        description="regression after accepted outcome",
+    )
+    assert second["id"] == first["id"]
+    assert second["caused_by"] == _cause()
+
+
+@pytest.mark.parametrize(
+    "cause,repo,verifier",
+    [
+        (_cause(accepted_outcome_receipt={}), "repo-one", _accepted),
+        (_cause(repository_id="repo-two"), "repo-one", _accepted),
+        (_cause(), "repo-one", lambda identity: {**identity, "outcome": "rejected"}),
+        (_cause(), "repo-one", lambda identity: None),
+        (
+            _cause(accepted_outcome_receipt=_receipt(request_id="stale")),
+            "repo-one",
+            _accepted,
+        ),
+        (
+            _cause(
+                accepted_outcome_receipt={
+                    **_receipt(),
+                    "receipt_id": "sha256:" + "e" * 64,
+                }
+            ),
+            "repo-one",
+            lambda identity: _accepted(_cause()),
+        ),
+    ],
+)
+def test_caused_by_forged_stale_cross_repo_or_unverifiable_fails_closed(
+    init: Path, cause: dict[str, Any], repo: str, verifier
+):
+    with pytest.raises(needfix_store.NeedFixValidationError):
+        needfix_store.capture_proposal(
+            init,
+            title="bad cause",
+            description="must not persist",
+            caused_by=cause,
+            repository_id=repo,
+            verify_accepted_outcome=verifier,
+        )
+
+
+def test_legacy_row_has_explicitly_absent_caused_by(init: Path):
+    row = needfix_store.capture_proposal(init, title="legacy", description="no cause")
+    assert row["caused_by"] is None
+    assert needfix_store.get_needfix(init, row["id"])["caused_by"] is None

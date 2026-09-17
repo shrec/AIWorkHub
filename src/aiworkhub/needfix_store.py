@@ -59,7 +59,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
-SCHEMA_ID = "aiworkhub.needfix_store.v3"
+SCHEMA_ID = "aiworkhub.needfix_store.v4"
+CAUSED_BY_SCHEMA_ID = "aiworkhub.accepted_outcome_identity.v1"
+ACCEPTED_OUTCOME_RECEIPT_SCHEMA_ID = "aiworkhub.accepted_outcome_receipt.v1"
+ACCEPTED_OUTCOME_RECEIPT_FIELDS = frozenset({
+    "schema_id", "receipt_id", "task_id", "request_id", "claim_epoch",
+    "base_oid", "promoted_paths", "changed_path_hashes",
+    "attempt_artifact_manifest_id", "repository_revision",
+})
+_PREFIXED_SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 HUB_DIRNAME = ".aiworkhub"
 NEEDFIX_DB_REL = (HUB_DIRNAME, "tasking", "needfix.sqlite")
@@ -284,6 +292,65 @@ class NeedFixValidationError(NeedFixError):
     pass
 
 
+def accepted_outcome_receipt_is_well_formed(
+    receipt: Any, *, task_id: str, request_id: str
+) -> bool:
+    """Validate the exact receipt schema persisted by task_engine.accept_review."""
+
+    if (
+        not isinstance(receipt, Mapping)
+        or set(receipt) != ACCEPTED_OUTCOME_RECEIPT_FIELDS
+        or receipt.get("schema_id") != ACCEPTED_OUTCOME_RECEIPT_SCHEMA_ID
+        or receipt.get("task_id") != task_id
+        or receipt.get("request_id") != request_id
+        or not isinstance(receipt.get("claim_epoch"), int)
+        or isinstance(receipt.get("claim_epoch"), bool)
+        or not isinstance(receipt.get("base_oid"), str)
+        or not receipt.get("base_oid")
+    ):
+        return False
+    paths = receipt.get("promoted_paths")
+    hashes = receipt.get("changed_path_hashes")
+    if (
+        not isinstance(paths, list)
+        or any(not isinstance(path, str) for path in paths)
+        or paths != sorted(set(paths))
+        or not isinstance(hashes, Mapping)
+        or set(hashes) != set(paths)
+        or any(
+            value is not None
+            and (not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value))
+            for value in hashes.values()
+        )
+    ):
+        return False
+    digest_shape_valid = bool(
+        isinstance(receipt.get("receipt_id"), str)
+        and _PREFIXED_SHA256_RE.fullmatch(receipt["receipt_id"])
+        and isinstance(receipt.get("attempt_artifact_manifest_id"), str)
+        and re.fullmatch(r"[0-9a-f]{64}", receipt["attempt_artifact_manifest_id"])
+        and isinstance(receipt.get("repository_revision"), str)
+        and _PREFIXED_SHA256_RE.fullmatch(receipt["repository_revision"])
+    )
+    if not digest_shape_valid:
+        return False
+    revision = "sha256:" + hashlib.sha256(json.dumps(
+        {"base_oid": receipt["base_oid"], "changed_path_hashes": dict(hashes)},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()).hexdigest()
+    unsigned = dict(receipt)
+    receipt_id = unsigned.pop("receipt_id")
+    expected_receipt_id = "sha256:" + hashlib.sha256(json.dumps(
+        unsigned,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()).hexdigest()
+    return receipt["repository_revision"] == revision and receipt_id == expected_receipt_id
+
+
 def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -343,6 +410,7 @@ CREATE TABLE IF NOT EXISTS needfix (
     duplicate_parent_id TEXT,
     converted_task_id TEXT,
     conversion_claim_id TEXT,
+    caused_by_json TEXT,
     reopen_generation INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -428,6 +496,7 @@ def _migrate_needfix_schema(conn: sqlite3.Connection) -> None:
     for column, declaration in (
         ("reopen_generation", "INTEGER NOT NULL DEFAULT 0"),
         ("conversion_claim_id", "TEXT"),
+        ("caused_by_json", "TEXT"),
     ):
         if _column_exists(conn, "needfix", column):
             continue
@@ -576,6 +645,58 @@ def _validate_payload(
         raise NeedFixValidationError("readiness_score must be 0-100")
 
 
+def validate_caused_by(
+    caused_by: Mapping[str, Any],
+    *,
+    repository_id: str,
+    verify_accepted_outcome: Callable[[Mapping[str, Any]], Mapping[str, Any] | None],
+) -> dict[str, Any]:
+    """Validate one exact accepted-outcome identity, failing closed.
+
+    The verifier is the canonical task/review authority. Its answer must repeat
+    every identity field and explicitly name an accepted outcome; a truthy
+    boolean or a task/title similarity is intentionally insufficient.
+    """
+
+    if not isinstance(caused_by, Mapping):
+        raise NeedFixValidationError("caused_by must be an object")
+    fields = (
+        "schema_id", "repository_id", "task_id", "request_id",
+        "accepted_outcome_receipt",
+    )
+    extra = set(caused_by) - set(fields)
+    if extra:
+        raise NeedFixValidationError(f"caused_by has unsupported fields: {sorted(extra)}")
+    identity: dict[str, Any] = {
+        field: str(caused_by.get(field) or "").strip()
+        for field in fields[:-1]
+    }
+    receipt = caused_by.get("accepted_outcome_receipt")
+    identity["accepted_outcome_receipt"] = dict(receipt) if isinstance(receipt, Mapping) else None
+    if identity["schema_id"] != CAUSED_BY_SCHEMA_ID:
+        raise NeedFixValidationError("caused_by has an invalid schema_id")
+    if not all(identity[field] for field in fields):
+        raise NeedFixValidationError("caused_by identity fields are required")
+    if identity["repository_id"] != str(repository_id or "").strip():
+        raise NeedFixValidationError("caused_by repository_id does not match this repository")
+    if not accepted_outcome_receipt_is_well_formed(
+        identity["accepted_outcome_receipt"],
+        task_id=identity["task_id"],
+        request_id=identity["request_id"],
+    ):
+        raise NeedFixValidationError("caused_by accepted_outcome_receipt is malformed")
+    try:
+        verified = verify_accepted_outcome(identity)
+    except Exception as exc:
+        raise NeedFixValidationError("caused_by accepted outcome is unverifiable") from exc
+    if not isinstance(verified, Mapping) or verified.get("outcome") != "accepted":
+        raise NeedFixValidationError("caused_by does not identify an accepted outcome")
+    for field in fields:
+        if verified.get(field) != identity[field]:
+            raise NeedFixValidationError(f"caused_by verified {field} does not match")
+    return identity
+
+
 def _record_event(
     conn: sqlite3.Connection,
     needfix_id: str,
@@ -611,6 +732,11 @@ def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         "duplicate_parent_id": row["duplicate_parent_id"],
         "converted_task_id": row["converted_task_id"],
         "conversion_claim_id": row["conversion_claim_id"],
+        "caused_by": (
+            json.loads(row["caused_by_json"])
+            if "caused_by_json" in row.keys() and row["caused_by_json"]
+            else None
+        ),
         "reopen_generation": row["reopen_generation"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
@@ -825,6 +951,9 @@ def _insert(
     scope_symbols: Sequence[str] | None = None,
     evidence_refs: Sequence[str] | None = None,
     readiness_score: int = 0,
+    caused_by: Mapping[str, Any] | None = None,
+    repository_id: str = "",
+    verify_accepted_outcome: Callable[[Mapping[str, Any]], Mapping[str, Any] | None] | None = None,
 ) -> dict[str, Any]:
     _validate_payload(
         title,
@@ -837,6 +966,15 @@ def _insert(
         scope_symbols=scope_symbols,
         readiness_score=readiness_score,
     )
+    verified_cause: dict[str, Any] | None = None
+    if caused_by is not None:
+        if verify_accepted_outcome is None:
+            raise NeedFixValidationError("caused_by requires canonical accepted-outcome verification")
+        verified_cause = validate_caused_by(
+            caused_by,
+            repository_id=repository_id,
+            verify_accepted_outcome=verify_accepted_outcome,
+        )
     dedupe_key = _dedupe_key(title, description, scope)
     conn = _connect(repo_root)
     try:
@@ -846,6 +984,14 @@ def _insert(
             (dedupe_key,),
         ).fetchone()
         if existing is not None:
+            existing_cause = (
+                json.loads(existing["caused_by_json"])
+                if existing["caused_by_json"] else None
+            )
+            if verified_cause is not None and existing_cause != verified_cause:
+                raise NeedFixConflictError(
+                    "dedupe match has a different caused_by identity; refusing to rewrite causality"
+                )
             _record_event(conn, existing["id"], "dedupe_hit", {"dedupe_key": dedupe_key})
             return _row_to_dict(existing)
 
@@ -857,9 +1003,9 @@ def _insert(
              tags_json, scope, scope_files_json, scope_symbols_json,
              provenance_json, evidence_json, evidence_refs_json,
              readiness_score, status, duplicate_parent_id,
-             converted_task_id, created_at, updated_at,
+             converted_task_id, caused_by_json, created_at, updated_at,
              task_planned_at, resolved_at, archived_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, NULL, NULL, NULL)""",
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, NULL, NULL, NULL)""",
             (
                 needfix_id,
                 dedupe_key,
@@ -876,6 +1022,7 @@ def _insert(
                 json.dumps(list(evidence_refs or [])),
                 readiness_score,
                 status,
+                json.dumps(verified_cause, sort_keys=True) if verified_cause else None,
                 now,
                 now,
             ),
@@ -902,6 +1049,9 @@ def capture_proposal(
     scope_symbols: Sequence[str] | None = None,
     evidence_refs: Sequence[str] | None = None,
     readiness_score: int = 0,
+    caused_by: Mapping[str, Any] | None = None,
+    repository_id: str = "",
+    verify_accepted_outcome: Callable[[Mapping[str, Any]], Mapping[str, Any] | None] | None = None,
 ) -> dict[str, Any]:
     """Worker/unverified entry point. Always lands as ``captured``.
 
@@ -929,6 +1079,9 @@ def capture_proposal(
         scope_symbols=scope_symbols,
         evidence_refs=evidence_refs,
         readiness_score=readiness_score,
+        caused_by=caused_by,
+        repository_id=repository_id,
+        verify_accepted_outcome=verify_accepted_outcome,
     )
 
 
@@ -948,6 +1101,9 @@ def add_needfix(
     scope_symbols: Sequence[str] | None = None,
     evidence_refs: Sequence[str] | None = None,
     readiness_score: int = 0,
+    caused_by: Mapping[str, Any] | None = None,
+    repository_id: str = "",
+    verify_accepted_outcome: Callable[[Mapping[str, Any]], Mapping[str, Any] | None] | None = None,
 ) -> dict[str, Any]:
     """Manager mutation entry point with explicit, distinct authority.
 
@@ -978,6 +1134,9 @@ def add_needfix(
         scope_symbols=scope_symbols,
         evidence_refs=evidence_refs,
         readiness_score=readiness_score,
+        caused_by=caused_by,
+        repository_id=repository_id,
+        verify_accepted_outcome=verify_accepted_outcome,
     )
 
 

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import builtins
+import hashlib
 import importlib.util
 import io
 import json
 import os
 import subprocess
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -222,3 +224,114 @@ def test_fallback_stdio_writer_is_binary_utf8_and_transport_safe() -> None:
         for name in list(sys.modules):
             if name == package_name or name.startswith(f"{package_name}."):
                 sys.modules.pop(name, None)
+
+
+def test_sdlc_metrics_tool_is_read_only_forwarder(monkeypatch, tmp_path: Path) -> None:
+    class Readiness:
+        ready = True
+        reason = "ready"
+        repo_id = "repo-one"
+
+    monkeypatch.setattr(server.core, "repo_root", lambda: tmp_path)
+    monkeypatch.setattr(server.task_store, "storage_readiness", lambda root: Readiness())
+    monkeypatch.setattr(
+        server.sdlc_outcome_metrics,
+        "read_repository_metrics",
+        lambda root, *, repository_id, limit: {
+            "readonly": True,
+            "root": root,
+            "repository_id": repository_id,
+            "limit": limit,
+        },
+    )
+    assert server.aiworkhub_manager_sdlc_outcome_metrics(17) == {
+        "readonly": True,
+        "root": tmp_path,
+        "repository_id": "repo-one",
+        "limit": 17,
+    }
+
+
+def test_needfix_caused_by_verifies_real_canonical_accepted_task(
+    monkeypatch, tmp_path: Path
+) -> None:
+    db_path = tmp_path / "task.sqlite"
+    conn = sqlite3.connect(db_path)
+    conn.executescript(server.task_store.SCHEMA)
+    changed = tmp_path / "fixed.txt"
+    changed.write_text("fixed", encoding="utf-8")
+    changed_digest = hashlib.sha256(changed.read_bytes()).hexdigest()
+    manifest = {"request_id": "request-real"}
+    card = {
+        "task_id": "TASK-REAL",
+        "runner": "codex",
+        "topic": "metrics",
+        "claim_epoch": 1,
+        "terminal_review": {
+            "substatus": "review_ready",
+            "evidence": {
+                "request_identity": {"request_id": "request-real"},
+                "changed_paths": ["fixed.txt"],
+                "changed_path_hashes": {"fixed.txt": changed_digest},
+                "attempt_artifact_manifest": manifest,
+                "workspace": {"base_oid": "base"},
+            },
+        },
+    }
+    conn.execute(
+        "INSERT INTO tasks (task_id, runner, topic, status, worker_status, card_json, "
+        "created_at, updated_at, claimed_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "TASK-REAL", "codex", "metrics", "review", "review",
+            json.dumps(card), "now", "now", "codex",
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    readiness = server.task_store.StorageReadiness(True, "ready", "repo-one", str(db_path))
+    monkeypatch.setattr(server.core, "repo_root", lambda: tmp_path)
+    monkeypatch.setattr(server.task_store, "_require_ready", lambda repo: (readiness, db_path))
+    monkeypatch.setattr(server.task_store, "storage_readiness", lambda repo: readiness)
+    unsigned = {
+        "schema_id": server.task_engine.ACCEPTED_OUTCOME_RECEIPT_SCHEMA,
+        "task_id": "TASK-REAL",
+        "request_id": "request-real",
+        "claim_epoch": 1,
+        "base_oid": "base",
+        "promoted_paths": ["fixed.txt"],
+        "changed_path_hashes": {"fixed.txt": changed_digest},
+        "attempt_artifact_manifest_id": server.task_engine._canonical_json_hash(manifest),
+        "repository_revision": "sha256:" + server.task_engine._canonical_json_hash({
+            "base_oid": "base", "changed_path_hashes": {"fixed.txt": changed_digest}
+        }),
+    }
+    receipt = {
+        **unsigned,
+        "receipt_id": "sha256:" + server.task_engine._canonical_json_hash(unsigned),
+    }
+    accepted = server.task_engine.accept_review(
+        tmp_path,
+        "TASK-REAL",
+        runner="codex",
+        topic="metrics",
+        request_id="request-real",
+        evidence={},
+        accepted_outcome_receipt=receipt,
+    )
+    assert accepted["ok"] is True
+
+    result = server.needfix_add(
+        title="escaped defect",
+        description="found after canonical acceptance",
+        caused_by={
+            "schema_id": server.needfix_store.CAUSED_BY_SCHEMA_ID,
+            "repository_id": "repo-one",
+            "task_id": "TASK-REAL",
+            "request_id": "request-real",
+            "accepted_outcome_receipt": receipt,
+        },
+    )
+    assert result["ok"] is True
+    stored = server.needfix_store.get_needfix(tmp_path, result["id"])
+    assert stored["caused_by"]["accepted_outcome_receipt"] == receipt

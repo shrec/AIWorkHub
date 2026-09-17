@@ -16,7 +16,14 @@ from functools import wraps
 from pathlib import Path
 from typing import Any, Literal
 
-from . import needfix_store, roadmap_store, skill_registry_store, task_store, tool_recipes_store
+from . import (
+    needfix_store,
+    roadmap_store,
+    sdlc_outcome_metrics,
+    skill_registry_store,
+    task_store,
+    tool_recipes_store,
+)
 from .tool_recovery import unknown_tool_message
 
 _MCP_SDK_AVAILABLE = True
@@ -4597,6 +4604,7 @@ def needfix_add(
     scope_symbols: list[str] | None = None,
     evidence_refs: list[str] | None = None,
     readiness_score: int = 0,
+    caused_by: dict | None = None,
 ) -> dict:
     """Manager-authority add of a NeedFix (dedupe-aware).
 
@@ -4617,21 +4625,48 @@ def needfix_add(
     """
     canonical_kind, kind_normalized = needfix_store.normalize_kind(kind)
     before = _utc_now_iso()
-    row = core.needfix_add(
-        title=title,
-        description=description,
-        scope=scope,
-        provenance=provenance,
-        evidence=evidence,
-        status=status,
-        kind=canonical_kind,
-        severity=severity,
-        tags=tags,
-        scope_files=scope_files,
-        scope_symbols=scope_symbols,
-        evidence_refs=evidence_refs,
-        readiness_score=readiness_score,
-    )
+    kwargs = {
+        "title": title,
+        "description": description,
+        "scope": scope,
+        "provenance": provenance,
+        "evidence": evidence,
+        "status": status,
+        "kind": canonical_kind,
+        "severity": severity,
+        "tags": tags,
+        "scope_files": scope_files,
+        "scope_symbols": scope_symbols,
+        "evidence_refs": evidence_refs,
+        "readiness_score": readiness_score,
+    }
+    if caused_by is None:
+        row = core.needfix_add(**kwargs)
+    else:
+        root = core.repo_root()
+        readiness = task_store.storage_readiness(root)
+        if not readiness.ready:
+            raise needfix_store.NeedFixValidationError(
+                "caused_by accepted outcome is unverifiable: canonical task store is not ready"
+            )
+
+        def verify(identity: Mapping[str, Any]) -> Mapping[str, Any] | None:
+            events = task_store.get_task_events(root, str(identity["task_id"]), limit=100)
+            for event in events:
+                accepted = sdlc_outcome_metrics.accepted_outcome_identity(
+                    {**event, "task_id": identity["task_id"]}, readiness.repo_id
+                )
+                if accepted == dict(identity):
+                    return {**accepted, "outcome": "accepted"}
+            return None
+
+        row = needfix_store.add_needfix(
+            root,
+            **kwargs,
+            caused_by=caused_by,
+            repository_id=readiness.repo_id,
+            verify_accepted_outcome=verify,
+        )
     return _needfix_add_receipt(row, before=before, kind_normalized=kind_normalized)
 
 
@@ -4737,6 +4772,25 @@ def needfix_count(status: str | None = None, kind: str | None = None, severity: 
 def needfix_events(needfix_id: str, limit: int = 100) -> list[dict]:
     """List events for a NeedFix entry."""
     return core.needfix_events(needfix_id, limit=limit)
+
+
+@mcp.tool()
+def aiworkhub_manager_sdlc_outcome_metrics(limit: int = 500) -> dict[str, Any]:
+    """READ-ONLY: bounded outcome metrics from canonical task/review events."""
+
+    root = core.repo_root()
+    readiness = task_store.storage_readiness(root)
+    if not readiness.ready:
+        return {
+            "schema_id": sdlc_outcome_metrics.SCHEMA_ID,
+            "ok": False,
+            "readonly": True,
+            "error": "canonical_task_store_not_ready",
+            "reason": readiness.reason,
+        }
+    return sdlc_outcome_metrics.read_repository_metrics(
+        root, repository_id=readiness.repo_id, limit=limit
+    )
 
 
 @mcp.tool()
