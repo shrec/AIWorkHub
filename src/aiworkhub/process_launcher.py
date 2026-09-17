@@ -3523,6 +3523,10 @@ def adapter_identity_tuple(runner: str) -> tuple[str, ...]:
         # Claude Code/Codex subscriptions. They may use only the editor's
         # public VS Code Language Model API bridge.
         return ("vscode_lm",)
+    if runner.startswith("opencode_"):
+        # OpenCode model identities are executed only through the repository-
+        # bound OpenCode CLI adapter; their provider/model suffix is opaque.
+        return ("opencode_cli",)
     return ()
 
 

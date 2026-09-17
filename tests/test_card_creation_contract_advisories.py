@@ -479,6 +479,7 @@ def test_adapter_identity_tuple_is_the_validator_table(tmp_path):
         "deepseek_v4",
         "glm_5",
         "copilot_x",
+        "opencode_openai_gpt-5.6-sol",
     ):
         allowed = process_launcher.adapter_identity_tuple(runner)
         assert allowed
