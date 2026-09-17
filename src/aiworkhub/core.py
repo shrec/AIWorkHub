@@ -8415,9 +8415,78 @@ def _normalize_allowed_write_path(path: str) -> str:
     return str(path or "").replace("\\", "/").lstrip("./")
 
 
+def _card_dependencies_have_accepted_outcomes(
+    card: dict[str, Any], by_id: dict[str, dict[str, Any]]
+) -> bool:
+    """Return whether every dependency has a canonical accepted-outcome receipt.
+
+    A bare lifecycle projection such as ``finished`` / ``done`` is not
+    acceptance authority. Pending cards blocked by an unauthenticated
+    predecessor do not own write scope yet and therefore must not create
+    global collision noise.
+    """
+    dependencies = card.get("depends_on") or []
+    if not isinstance(dependencies, list):
+        return False
+    root = repo_root()
+    from . import task_engine
+
+    for raw_dependency in dependencies:
+        dependency_id = str(raw_dependency or "").strip()
+        if not dependency_id:
+            return False
+        dependency = by_id.get(dependency_id)
+        if dependency is None:
+            try:
+                dependency = task_store.get_task(root, dependency_id)
+            except task_store.TaskStoreError:
+                return False
+        if (
+            dependency is None
+            or task_store.canonical_status(dependency) != "finished"
+        ):
+            return False
+        accept_evidence = dependency.get("accept_evidence")
+        receipt = (
+            accept_evidence.get("accepted_outcome_receipt")
+            if isinstance(accept_evidence, dict)
+            else None
+        )
+        request_id = (
+            str(receipt.get("request_id") or "").strip()
+            if isinstance(receipt, dict)
+            else ""
+        )
+        if not request_id:
+            return False
+        validated, _reason = task_engine._validate_accepted_outcome_receipt(
+            root,
+            dependency,
+            dependency_id,
+            request_id,
+            receipt,
+        )
+        if validated is None:
+            return False
+    return True
+
+
 def _scan_aiworkhub_collisions(cards: list[dict[str, Any]]) -> dict[str, Any]:
+    by_id = {str(card.get("task_id") or ""): card for card in cards}
+    eligible = [
+        card
+        for card in cards
+        if (
+            task_store.canonical_status(card) in {"processing", "review"}
+            or (
+                task_store.canonical_status(card) == "pending"
+                and _card_dependencies_have_accepted_outcomes(card, by_id)
+            )
+        )
+    ]
+
     entries: list[tuple[str, str]] = []
-    for card in cards:
+    for card in eligible:
         task_id = str(card.get("task_id") or "?")
         for raw_path in card.get("allowed_writes") or []:
             normalized = _normalize_allowed_write_path(str(raw_path))
@@ -8445,7 +8514,7 @@ def _scan_aiworkhub_collisions(cards: list[dict[str, Any]]) -> dict[str, Any]:
         "repo": str(root),
         "cards_source": storage.canonical_db,
         "collision_free": not file_collisions,
-        "active_cards": len(cards),
+        "active_cards": len(eligible),
         "collision_count": len(file_collisions),
         "file_collisions": file_collisions,
         "coordination_commands": [],

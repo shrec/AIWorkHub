@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import sys
@@ -11,7 +12,7 @@ _SRC = Path(__file__).resolve().parents[1] / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from aiworkhub import core, task_store  # noqa: E402
+from aiworkhub import core, task_engine, task_store  # noqa: E402
 
 
 def _init_repo(tmp_path: Path) -> Path:
@@ -390,7 +391,7 @@ def test_archived_rework_does_not_block_pending_codex_runner_auto_pickup():
     assert result["would_claim_task_id"] == "codex_runner"
 
 
-def test_launch_collision_guard_ignores_unrelated_planned_collision():
+def test_global_and_launch_guards_ignore_dependency_blocked_pending_scope():
     repo = core.repo_root()
     _insert_card(repo, "blocked_parent", allowed_writes=["shared.py"])
     _insert_card(
@@ -405,8 +406,11 @@ def test_launch_collision_guard_ignores_unrelated_planned_collision():
     launch_report = core.launch_collision_guard(
         task_id="independent", print_json=True
     )
+    payload = core._extract_collision_report(global_report["stdout"])
 
-    assert global_report["ok"] is False
+    assert global_report["ok"] is True
+    assert payload["active_cards"] == 2
+    assert payload["collision_count"] == 0
     assert launch_report["ok"] is True
 
 
@@ -506,3 +510,136 @@ def test_launch_guard_ignores_pending_contender_blocked_by_retained_scope():
     assert snapshot["write_scope_overlaps"]["a_pending_loser"] == ["owned.py"]
     assert launch["ok"] is True
     assert json.loads(launch["stdout"])["blockers"] == []
+
+
+def _seal_dependency_acceptance(
+    repo: Path, task_id: str, *, forge_receipt: bool = False
+) -> None:
+    card = task_store.get_task(repo, task_id)
+    assert card is not None
+    request_id = f"request-{task_id}"
+    base_oid = "base-oid"
+    manifest = {
+        "schema_id": "aiworkhub.attempt_artifact_manifest.v1",
+        "entries": [],
+    }
+    card["claim_epoch"] = 1
+    card["terminal_review"] = {
+        "evidence": {
+            "request_id": request_id,
+            "workspace": {"base_oid": base_oid},
+            "changed_paths": [],
+            "changed_path_hashes": {},
+            "attempt_artifact_manifest": manifest,
+        }
+    }
+    unsigned = {
+        "schema_id": task_engine.ACCEPTED_OUTCOME_RECEIPT_SCHEMA,
+        "task_id": task_id,
+        "request_id": request_id,
+        "claim_epoch": 1,
+        "base_oid": base_oid,
+        "promoted_paths": [],
+        "changed_path_hashes": {},
+        "attempt_artifact_manifest_id": task_engine._canonical_json_hash(manifest),
+        "repository_revision": "sha256:"
+        + task_engine._canonical_json_hash(
+            {"base_oid": base_oid, "changed_path_hashes": {}}
+        ),
+    }
+    receipt = dict(unsigned)
+    receipt["receipt_id"] = "sha256:" + task_engine._canonical_json_hash(unsigned)
+    if forge_receipt:
+        receipt["receipt_id"] = "sha256:" + ("0" * 64)
+    card["accept_evidence"] = {"accepted_outcome_receipt": receipt}
+
+    _readiness, db_path = task_store._require_ready(repo)
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "UPDATE tasks SET card_json=? WHERE task_id=?",
+            (json.dumps(card, sort_keys=True), task_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _collision_case(*, acceptance: str) -> dict:
+    repo = core.repo_root()
+    _insert_card(
+        repo,
+        "prerequisite",
+        status="finished",
+        worker_status="done",
+        allowed_writes=["prerequisite.py"],
+    )
+    if acceptance == "valid":
+        _seal_dependency_acceptance(repo, "prerequisite")
+    elif acceptance == "forged":
+        _seal_dependency_acceptance(repo, "prerequisite", forge_receipt=True)
+    _insert_card(
+        repo,
+        "dependent",
+        depends_on=["prerequisite"],
+        allowed_writes=["shared.py"],
+    )
+    _insert_card(repo, "other_claimant", allowed_writes=["shared.py"])
+    result = core.collision_guard(print_json=True)
+    return {
+        "result": result,
+        "payload": core._extract_collision_report(result["stdout"]),
+    }
+
+
+def test_collision_guard_rejects_bare_finished_dependency_as_acceptance():
+    case = _collision_case(acceptance="missing")
+
+    assert case["result"]["ok"] is True
+    assert case["payload"]["active_cards"] == 1
+    assert case["payload"]["collision_count"] == 0
+
+
+def test_collision_guard_rejects_forged_dependency_acceptance_receipt():
+    case = _collision_case(acceptance="forged")
+
+    assert case["result"]["ok"] is True
+    assert case["payload"]["active_cards"] == 1
+    assert case["payload"]["collision_count"] == 0
+
+
+def test_collision_guard_includes_dependent_after_authenticated_acceptance():
+    case = _collision_case(acceptance="valid")
+
+    assert case["result"]["ok"] is False
+    assert case["payload"]["active_cards"] == 2
+    assert case["payload"]["collision_count"] == 1
+    assert case["payload"]["file_collisions"][0]["conflicting_tasks"] == [
+        "dependent",
+        "other_claimant",
+    ]
+
+
+def test_collision_guard_keeps_processing_and_review_scopes_active():
+    repo = core.repo_root()
+    _insert_card(
+        repo,
+        "processing",
+        status="processing",
+        worker_status="claimed",
+        allowed_writes=["shared.py"],
+    )
+    _insert_card(
+        repo,
+        "review",
+        status="review",
+        worker_status="review",
+        allowed_writes=["shared.py"],
+    )
+
+    result = core.collision_guard(print_json=True)
+    payload = core._extract_collision_report(result["stdout"])
+
+    assert result["ok"] is False
+    assert payload["active_cards"] == 2
+    assert payload["collision_count"] == 1
