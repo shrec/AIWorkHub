@@ -62,6 +62,17 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
+## What's new in 0.11.44
+
+- Windows task creation, installed-tool measurement, authority-key validation and
+  reconciler recovery now use platform-safe paths from the merged Windows fix
+  stack.
+- The global collision guard now ignores pending cards whose dependencies lack
+  an authenticated accepted-outcome receipt, while processing and review scopes
+  remain active.
+- 0.11.44 is the current source release in this repository; Marketplace and
+  GitHub Release publication remain separate measured channels.
+
 ## What's new in 0.11.43
 
 - The manager MCP surface now exposes the same hash-bound, range-scoped
