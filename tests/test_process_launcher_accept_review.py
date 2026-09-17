@@ -657,3 +657,577 @@ def test_accept_preview_never_raises_on_an_unreadable_card():
     result = process_launcher_accept_review.accept_preview(_Broken(), "R-1", "T-1")
     assert result["ok"] is False and result["evaluated"] is False
     assert result["error"].startswith("task_lookup_failed:")
+
+
+# ---------------------------------------------------------------------------
+# NF-805 / NF-2026-00884: automatic supplemental inspection, on the real path.
+#
+# The regression: a 23-hunk candidate whose correctness reviewer came back with
+# nothing but ``process_limit`` findings. The gate said
+# ``reviewer_could_not_inspect`` -- correctly -- and then nothing happened.
+# Whoever read the blocker had two bad options: relaunch the implementation
+# worker, whose bytes were never in question, or hand-launch a reviewer.
+#
+# The tests below drive ``accept_review`` itself, through its declared seams,
+# so the transition being proven is the production one. The fold is never
+# called twice by hand here: the second round exists because the first accept
+# created it.
+# ---------------------------------------------------------------------------
+
+import hashlib
+from types import SimpleNamespace
+
+from aiworkhub import evidence_instruments, learning_commit_store, needfix_store
+from aiworkhub import quality_reviewer
+
+_SUPPLEMENTAL_CHANGED = ("src/alpha.py", "src/beta.py")
+
+
+def _supplemental_segments(count: int, *, truncated: bool) -> list[dict]:
+    return [
+        {
+            "kind": "replace",
+            "candidate_start_line": 10 * index + 1,
+            "candidate_end_line": 10 * index + 4,
+            "changed_start_line": 10 * index + 1,
+            "changed_end_line": 10 * index + 4,
+            "baseline_start_line": 10 * index + 1,
+            "baseline_end_line": 10 * index + 4,
+            "excerpt_bytes": 40,
+            "truncated": truncated,
+        }
+        for index in range(count)
+    ]
+
+
+class _StubWorkspace:
+    def __init__(self, *, repo: Path, path: Path, home: Path, request_id: str) -> None:
+        self.repo = repo
+        self.path = path
+        self.home = home
+        self.request_id = request_id
+
+    def as_metadata(self) -> dict:
+        return {"request_id": self.request_id, "path": str(self.path)}
+
+
+class _WorkspaceRegistry:
+    """Stands in for ``WorkerWorkspace``; resolves metadata by request id."""
+
+    def __init__(self) -> None:
+        self.by_request: dict[str, _StubWorkspace] = {}
+
+    def add(self, workspace: _StubWorkspace) -> _StubWorkspace:
+        self.by_request[workspace.request_id] = workspace
+        return workspace
+
+    def from_metadata(self, metadata: dict) -> _StubWorkspace:
+        return self.by_request[str(metadata["request_id"])]
+
+
+class _EvidenceLevelsStub:
+    class EvidenceValidationError(Exception):
+        pass
+
+    class EvidenceLevel:
+        FIXED_AND_VERIFIED = "fixed_and_verified"
+
+    @staticmethod
+    def validate_evidence_record(record):
+        return SimpleNamespace(
+            evidence_level="fixed_and_verified",
+            reference="attempt:R-1",
+            to_dict=lambda: {"reference": "attempt:R-1"},
+        )
+
+    @staticmethod
+    def meets_evidence_level(observed, required) -> bool:
+        return True
+
+
+class _QualityEvidenceProxy:
+    """The real ``quality_evidence``, minus the two collaborators needing git.
+
+    The gate under test -- ``run_completion_quality_gate`` and the fold beneath
+    it -- is the REAL one. Only the destructive-diff and policy-authority
+    probes, which compare a canonical tree against a candidate one, are
+    answered with their no-finding results.
+    """
+
+    def __getattr__(self, name):
+        return getattr(quality_evidence, name)
+
+    @staticmethod
+    def run_destructive_diff_checks(repo, workspace_path, *, changed_paths):
+        return []
+
+    @staticmethod
+    def assess_quality_policy_authority(repo, workspace_path, *, changed_paths):
+        return {
+            "weakened": False,
+            "escalation_signal": "",
+            "candidate_policy_source": "candidate_declared",
+            "canonical_declared_checks": 0,
+            "canonical_config_readable": True,
+        }
+
+
+_BLIND_FINDINGS = [
+    {
+        "id": "PL-1",
+        "severity": "low",
+        "disposition": "process_limit",
+        "summary": "the reviewer could not read its packet",
+        "evidence": "no packet bytes reached the reviewer process",
+    }
+]
+
+
+class _AcceptManager:
+    """Only the collaborators ``accept_review`` actually calls on ``self``."""
+
+    def __init__(self, repo: Path, process_dir: Path) -> None:
+        self.repo = repo
+        self.process_dir = process_dir
+        self.events: dict[str, list[dict]] = {}
+        self.latest: dict[str, dict] = {}
+        self.cards: dict[str, dict] = {}
+        self.reviewer_launches: list[dict] = []
+        self.implementation_relaunches = 0
+
+    # -- lifecycle seams ----------------------------------------------------
+    def _promotion_lock(self):
+        return contextlib.nullcontext()
+
+    def _request_lock(self, request_id: str):
+        return contextlib.nullcontext()
+
+    def _request_events(self, request_id: str) -> list[dict]:
+        return [dict(row) for row in self.events.get(request_id, [])]
+
+    def _show_task(self, task_id: str) -> dict:
+        return self.cards[task_id]
+
+    def _latest_by_request(self) -> dict:
+        return {key: dict(value) for key, value in self.latest.items()}
+
+    def _metadata_from_events(self, events: list[dict]) -> Path:
+        return self.process_dir / f"{events[-1]['request_id']}.json"
+
+    # -- evidence seams -----------------------------------------------------
+    def _context_write_intent_snapshot(self, request_id: str) -> dict:
+        return {"ok": True, "counts": {"pending": 0}, "intents": []}
+
+    def _verify_attempt_artifact_receipt(self, request_id, manifest) -> dict:
+        return {"schema_id": "aiworkhub.attempt_artifact_manifest.v1"}
+
+    def _minimum_acceptance_evidence_level(self, card, **kwargs) -> str:
+        return "fixed_and_verified"
+
+    def _attempt_evidence_reference(self, request_id, receipt) -> str:
+        return "attempt:R-1"
+
+    def _canonical_outcome_evidence(self, request_id, receipt, **kwargs) -> dict:
+        return {"reference": "attempt:R-1"}
+
+    def _candidate_reachability_inputs(self, workspace, changed):
+        return None
+
+    # -- promotion seams ----------------------------------------------------
+    def _promote_accepted_candidate(self, workspace, changed) -> list[str]:
+        return list(changed)
+
+    def _close_accepted_task_needfix(self, task_id, request_id) -> dict:
+        return {}
+
+    def _retention_event(self, payload, disposition="") -> None:
+        return None
+
+    # -- the two launches this card is about --------------------------------
+    def launch_quality_reviewer(self, **kwargs) -> dict:
+        self.reviewer_launches.append(dict(kwargs))
+        return {
+            "ok": True,
+            "request_id": "rq-" + str(kwargs["reviewer_task_id"]).lower(),
+            "task_id": kwargs["reviewer_task_id"],
+        }
+
+    def _launch_isolated(self, *args, **kwargs):
+        self.implementation_relaunches += 1
+        raise AssertionError("the implementation worker must never be relaunched")
+
+
+def _supplemental_env(tmp_path: Path, monkeypatch, reviewer_specs: list[dict]):
+    """One ``review_ready`` 23-hunk candidate plus its bound reviewer children.
+
+    ``reviewer_specs`` rows carry ``task_id``/``request_id``/``lens``, the
+    reviewer's ``findings``, and ``packet``: ``"sealed"`` writes the real
+    packet, ``"tampered"`` writes one whose body no longer hashes to the digest
+    its receipt is bound to, and ``"absent"`` writes none at all.
+    """
+
+    repo = _store_with_reviewers(
+        tmp_path,
+        [
+            _reviewer_card(
+                spec["task_id"], spec["lens"], findings=list(spec["findings"])
+            )
+            for spec in reviewer_specs
+        ],
+    )
+    process_dir = tmp_path / "processes"
+    candidate = tmp_path / "candidate"
+    (candidate / "src").mkdir(parents=True)
+    process_dir.mkdir()
+    for index, relative in enumerate(_SUPPLEMENTAL_CHANGED):
+        (candidate / relative).write_text(
+            f"def alpha_{index}():\n    return {index}\n", encoding="utf-8"
+        )
+    stored_hashes = {
+        relative: hashlib.sha256((candidate / relative).read_bytes()).hexdigest()
+        for relative in _SUPPLEMENTAL_CHANGED
+    }
+    # 11 hunks carried inline, 12 reachable only through the packet-bound
+    # candidate overlay: 23, the exact NF-805 shape.
+    packet = quality_reviewer.build_review_packet(
+        request_id="R-1",
+        task_id="T-1",
+        claim_epoch=1,
+        worker_provider="codex_cli",
+        changed_path_hashes=stored_hashes,
+        source_evidence={
+            "src/alpha.py": {
+                "candidate_sha256": stored_hashes["src/alpha.py"],
+                "excerpt": "@@ alpha @@\n+return 0\n",
+                "excerpt_bytes": 22,
+                "source_bytes": 22,
+                "truncated": False,
+                "diff_complete": True,
+                "segments": _supplemental_segments(11, truncated=False),
+            },
+            "src/beta.py": {
+                "candidate_sha256": stored_hashes["src/beta.py"],
+                "excerpt": "@@ beta @@\n+return 1\n",
+                "excerpt_bytes": 21,
+                "source_bytes": 8192,
+                "truncated": True,
+                "segments": _supplemental_segments(12, truncated=True),
+                "omission_reason": "changed_hunks_omitted:12",
+            },
+        },
+    )
+
+    registry = _WorkspaceRegistry()
+    manager = _AcceptManager(repo, process_dir)
+    target_workspace = registry.add(
+        _StubWorkspace(
+            repo=repo, path=candidate, home=tmp_path / "target-home", request_id="R-1"
+        )
+    )
+    manager.events["R-1"] = [
+        {
+            "request_id": "R-1", "task_id": "T-1", "runner": "codex_gpt-5.5",
+            "topic": "code", "adapter_id": "codex_cli", "state": "review_ready",
+        }
+    ]
+    manager.cards["T-1"] = {
+        "task_id": "T-1",
+        "runner": "codex_gpt-5.5",
+        "topic": "code",
+        "claimed_by": "codex_gpt-5.5",
+        "claim_epoch": 1,
+        "required_outputs": [],
+        "validation": ["true"],
+        "terminal_review": {
+            "substatus": "review_ready",
+            "evidence": {
+                "request_identity": {
+                    "request_id": "R-1", "task_id": "T-1",
+                    "runner": "codex_gpt-5.5", "topic": "code",
+                },
+                "changed_paths": list(_SUPPLEMENTAL_CHANGED),
+                "changed_path_hashes": dict(stored_hashes),
+                "workspace": {"request_id": "R-1"},
+                "evidence_record": {"reference": "attempt:R-1"},
+                "validation": [],
+            },
+        },
+    }
+
+    receipts: dict[str, dict] = {}
+    for spec in reviewer_specs:
+        request_id = spec["request_id"]
+        home = tmp_path / f"home-{request_id}"
+        home.mkdir()
+        registry.add(
+            _StubWorkspace(
+                repo=repo, path=home / "tree", home=home, request_id=request_id
+            )
+        )
+        packet_path = home / "quality_review_packet.json"
+        if spec["packet"] == "sealed":
+            packet_path.write_text(json.dumps(packet), encoding="utf-8")
+        elif spec["packet"] == "tampered":
+            forged = json.loads(json.dumps(packet))
+            forged["contract"]["objective"] = "rewritten after sealing"
+            packet_path.write_text(json.dumps(forged), encoding="utf-8")
+        (process_dir / f"{request_id}.json").write_text(
+            json.dumps(
+                {
+                    "task_id": spec["task_id"],
+                    "request_id": request_id,
+                    "adapter_id": "claude_cli",
+                    "workspace": {"request_id": request_id},
+                    "quality_review": {
+                        "lens": spec["lens"],
+                        "packet_path": str(packet_path),
+                        "target_request_id": "R-1",
+                        "target_task_id": "T-1",
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        manager.events[request_id] = [
+            {
+                "request_id": request_id, "task_id": spec["task_id"],
+                "runner": "claude_sonnet5", "topic": "quality_review",
+                "adapter_id": "claude_cli", "state": "review_ready",
+            }
+        ]
+        manager.latest[request_id] = {
+            "task_id": spec["task_id"], "state": "review_ready",
+            "finished_at": "2026-09-16T00:00:0%d+00:00" % len(receipts),
+        }
+        receipts[request_id] = {
+            "packet_sha256": packet["packet_sha256"],
+            "report": {
+                "lens": spec["lens"],
+                "provider": "claude_cli",
+                "read_only": True,
+                "can_mutate_repo": False,
+                "findings": list(spec["findings"]),
+            },
+        }
+
+    seams = {
+        "_parse_card": lambda raw, task_id: raw,
+        "_canonical_task_status": lambda card: "review",
+        "_finished_acceptance_result": lambda *a, **k: None,
+        "_card_is_readonly_quality_review": lambda card: False,
+        "_card_is_readonly_research": lambda card: False,
+        "WorkerWorkspace": registry,
+        "assert_gc_safe_workspace_shape": lambda *a, **k: None,
+        "evidence_levels": _EvidenceLevelsStub,
+        "core": SimpleNamespace(
+            writes_allowed=lambda: True,
+            CODEX_RUNNER="codex",
+            _claude_manager_identity=lambda: {},
+            _codex_manager_identity=lambda: {},
+        ),
+        "_worker_workspace": SimpleNamespace(
+            finalization_git_timeout_seconds=lambda: 30
+        ),
+        "enforce_scope": lambda workspace, **k: (
+            list(_SUPPLEMENTAL_CHANGED) if workspace is target_workspace else []
+        ),
+        "validate_required_outputs": lambda *a, **k: [],
+        "quality_evidence": _QualityEvidenceProxy(),
+        "create_combined_validation_workspace": lambda workspace, card, changed: (
+            target_workspace, {"schema_id": "aiworkhub.combined_tree.v1"}
+        ),
+        "_run_declared_validations": lambda *a, **k: [],
+        "cleanup_workspace": lambda *a, **k: None,
+        "_changed_path_hashes": lambda workspace, changed: dict(stored_hashes),
+        "_verified_quality_review_receipt": (
+            lambda metadata, workspace, request_id: receipts[request_id]
+        ),
+        "_run_full_snapshot_validations": lambda *a, **k: ([], {}),
+        "_enforce_behavioral_gate": lambda *a, **k: None,
+        "_accepted_outcome_receipt": lambda *a, **k: {"schema_id": "accepted"},
+        "task_engine": SimpleNamespace(
+            accept_review=lambda *a, **k: {"ok": True},
+            disposition_reviewer_children=lambda *a, **k: {
+                "ok": True, "stdout": "{}"
+            },
+        ),
+        "learning_commit": SimpleNamespace(commit_owed=lambda **k: {}),
+    }
+    for name, value in seams.items():
+        monkeypatch.setattr(process_launcher, name, value)
+    monkeypatch.setattr(
+        evidence_instruments, "review_evidence_audit",
+        lambda *a, **k: {"blocking": False, "blockers": []},
+    )
+    monkeypatch.setattr(
+        process_launcher_accept_review, "manager_skill_tools",
+        SimpleNamespace(record_decision_evidence=lambda *a, **k: None),
+    )
+    monkeypatch.setattr(
+        needfix_store, "draft_from_review_evidence", lambda *a, **k: []
+    )
+    monkeypatch.setattr(
+        learning_commit_store, "record_decision_event", lambda *a, **k: {}
+    )
+    return manager, packet
+
+
+def _accept(manager):
+    return process_launcher_accept_review.accept_review(
+        manager, "R-1", "T-1", requested_risk_tier="medium"
+    )
+
+
+def test_supplemental_rounds_completed_counts_only_the_extra_same_lens_reviewers():
+    """The first reviewer for a lens IS the review; every later one is a round."""
+    rows = [
+        {"lens": "correctness", "task_id": "QR-C"},
+        {"lens": "correctness", "task_id": "QR-C-SUPPLEMENTAL-1"},
+        {"lens": "security", "task_id": "QR-S"},
+        {"lens": "", "task_id": "QR-UNBOUND"},
+    ]
+
+    assert process_launcher_accept_review.supplemental_rounds_completed(rows) == {
+        "correctness": 1, "security": 0,
+    }
+
+
+def test_sealed_supplemental_packet_is_refused_outside_the_reviewer_home(
+    tmp_path: Path,
+):
+    """A packet path the reviewer's own home does not contain is not evidence."""
+    home = tmp_path / "home"
+    elsewhere = tmp_path / "elsewhere"
+    home.mkdir()
+    elsewhere.mkdir()
+    packet = {"candidate": {}}
+    packet["packet_sha256"] = quality_reviewer._canonical_digest(packet)
+    outside = elsewhere / "packet.json"
+    outside.write_text(json.dumps(packet), encoding="utf-8")
+    workspace = SimpleNamespace(home=home)
+    metadata = {"quality_review": {"packet_path": str(outside)}}
+
+    assert process_launcher_accept_review.sealed_review_packet(
+        metadata, workspace, {"packet_sha256": packet["packet_sha256"]}
+    ) is None
+
+
+def test_process_limit_review_automatically_creates_one_supplemental_round(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The whole card, on the production path.
+
+    The accept still fails, with the error it always produced -- but by the
+    time it returns, the bounded same-lens re-read of the SAME sealed packet
+    has already been launched. Nothing asked a manager to do it, and the
+    implementation worker was never touched.
+    """
+    manager, packet = _supplemental_env(
+        tmp_path, monkeypatch,
+        [{"task_id": "QR-C", "request_id": "rq-c", "lens": "correctness",
+          "findings": _BLIND_FINDINGS, "packet": "sealed"}],
+    )
+
+    result = _accept(manager)
+
+    assert result["ok"] is False
+    assert "reviewer_could_not_inspect:correctness" in result["error"]
+    assert manager.implementation_relaunches == 0
+    assert len(manager.reviewer_launches) == 1
+    launch = manager.reviewer_launches[0]
+    assert launch["lens"] == "correctness"
+    assert launch["target_request_id"] == "R-1"
+    assert launch["target_task_id"] == "T-1"
+    assert launch["reviewer_task_id"] == "QR-C-SUPPLEMENTAL-1"
+    # The same route the blind reviewer itself ran on: a re-read, not a reroute.
+    assert (launch["runner"], launch["adapter_id"]) == ("claude_sonnet5", "claude_cli")
+    row = result["supplemental_inspection"][0]
+    assert row["created"] is True and row["eligible"] is True
+    assert row["round"] == 1 and row["max_rounds"] == 1
+    assert row["packet_sha256"] == packet["packet_sha256"]
+    assert row["inspection_target_count"] == len(_SUPPLEMENTAL_CHANGED)
+    assert row["implementation_worker_relaunched"] is False
+
+
+def test_supplemental_round_is_refused_when_the_packet_cannot_be_proven(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Missing evidence stays missing.
+
+    A packet whose body no longer hashes to the digest its receipt is bound to
+    is not this reviewer's packet, so no round is created -- and the lens stays
+    exactly as blocked as it was.
+    """
+    manager, _packet = _supplemental_env(
+        tmp_path, monkeypatch,
+        [{"task_id": "QR-C", "request_id": "rq-c", "lens": "correctness",
+          "findings": _BLIND_FINDINGS, "packet": "tampered"}],
+    )
+
+    result = _accept(manager)
+
+    assert result["ok"] is False
+    assert "reviewer_could_not_inspect:correctness" in result["error"]
+    assert manager.reviewer_launches == []
+    row = result["supplemental_inspection"][0]
+    assert row["eligible"] is False and row["created"] is False
+    assert row["reason"] == "packet_evidence_missing"
+
+
+def test_repeated_blindness_stops_at_the_bounded_supplemental_attempt_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The round this card creates is the LAST one.
+
+    Two bound correctness reviewers means one supplemental round already
+    happened; the second blindness is not a transient, so the accept stays
+    blocked and nothing new is launched.
+    """
+    manager, _packet = _supplemental_env(
+        tmp_path, monkeypatch,
+        [
+            {"task_id": "QR-C", "request_id": "rq-c", "lens": "correctness",
+             "findings": _BLIND_FINDINGS, "packet": "sealed"},
+            {"task_id": "QR-C-SUPPLEMENTAL-1", "request_id": "rq-c-s1",
+             "lens": "correctness", "findings": _BLIND_FINDINGS,
+             "packet": "sealed"},
+        ],
+    )
+
+    result = _accept(manager)
+
+    assert result["ok"] is False
+    assert "reviewer_could_not_inspect:correctness" in result["error"]
+    assert manager.reviewer_launches == []
+    row = result["supplemental_inspection"][0]
+    assert row["eligible"] is False and row["reason"] == "attempt_limit_reached"
+    assert row["round"] == 2
+
+
+def test_the_supplemental_rounds_sighted_report_makes_the_candidate_acceptable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The second production transition, on the round the first one created.
+
+    Same 23-hunk candidate, same sealed packet, same lens -- and this time the
+    reviewer read it. Nothing about the candidate changed between the two
+    transitions, which is the point: the first failure was the review process,
+    not the code.
+    """
+    manager, _packet = _supplemental_env(
+        tmp_path, monkeypatch,
+        [
+            {"task_id": "QR-C", "request_id": "rq-c", "lens": "correctness",
+             "findings": _BLIND_FINDINGS, "packet": "sealed"},
+            {"task_id": "QR-C-SUPPLEMENTAL-1", "request_id": "rq-c-s1",
+             "lens": "correctness", "findings": [], "packet": "sealed"},
+        ],
+    )
+
+    result = _accept(manager)
+
+    assert result["ok"] is True, result
+    assert result["promoted_paths"] == list(_SUPPLEMENTAL_CHANGED)
+    assert "supplemental_inspection" not in result
+    assert manager.reviewer_launches == []
+    assert manager.implementation_relaunches == 0

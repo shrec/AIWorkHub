@@ -1334,6 +1334,8 @@ def fold_quality_verdict(
     human_approval: bool = False,
     config_error: str = "",
     replay_binding: Mapping[str, Any] | None = None,
+    review_packets: Mapping[str, Mapping[str, Any]] | None = None,
+    supplemental_rounds: Mapping[str, int] | None = None,
 ) -> dict[str, Any]:
     """Purely fold mechanical and reviewer evidence into one final verdict.
 
@@ -1433,7 +1435,22 @@ def fold_quality_verdict(
     # was consumed only inside the required-lenses loop, so a blind reviewer for
     # a lens the tier did not require (security/code_quality at medium) was
     # never checked and its report's mere existence lifted the lens to passed.
+    #
+    # A LENS is blind when NOTHING inspected it. That is the exact claim
+    # ``reviewer_could_not_inspect`` makes, and stating it per LENS rather than
+    # per REPORT is what makes a supplemental round able to answer it: a lens
+    # can now carry a blind first read and a sighted second one, and the second
+    # is a real attributable review of these exact bytes.
+    #
+    # This cannot weaken the gate. A lens whose every report is blind is still
+    # blind, still never PASSED, and still blocks; a blind report still
+    # satisfies nothing by existing. The single-report case -- every dispatch
+    # before supplemental rounds existed -- is bit-for-bit unchanged. What it
+    # refuses to do is let one blind reviewer permanently veto a lens that was
+    # afterwards actually read, which would make the re-read pointless and
+    # leave the chain with no exit but a rerun of the untouched candidate.
     blind_lenses: set[str] = set()
+    sighted_lenses: set[str] = set()
     for report in raw_reports:
         if not isinstance(report, Mapping):
             continue
@@ -1442,6 +1459,9 @@ def fold_quality_verdict(
             continue
         if reviewer_report_could_not_inspect(report):
             blind_lenses.add(report_lens)
+        else:
+            sighted_lenses.add(report_lens)
+    blind_lenses -= sighted_lenses
 
     reports_by_lens: dict[str, list[dict[str, Any]]] = {}
     refine_required = False
@@ -1484,6 +1504,40 @@ def fold_quality_verdict(
         for lens in sorted(blind_lenses):
             lens_rows[lens]["status"] = STATUS_REVIEWER_COULD_NOT_INSPECT
             blockers.append(f"reviewer_could_not_inspect:{lens}")
+
+    # THE PLAN IS NOT A PARDON.
+    #
+    # Every blocker above stands exactly as written: a blind lens is
+    # reviewer_could_not_inspect and this verdict is unverified. What follows
+    # only NAMES the bounded remedy proportionate to that failure -- one more
+    # read of the same sealed packet by the same lens -- so the caller that
+    # can act on it does not have to re-derive it from prose, and so the
+    # decision is made once, from the packet, rather than by whichever manager
+    # happens to read the blockers.
+    #
+    # A lens with no sealed packet here gets no plan (``packet_evidence_missing``)
+    # and therefore no round: missing evidence stays missing. Nothing in this
+    # block appends to ``blockers``, removes from it, or touches ``lens_rows``.
+    supplemental_inspection: list[dict[str, Any]] = []
+    if review_active and blind_lenses:
+        from . import quality_reviewer as _quality_reviewer
+
+        packets = review_packets if isinstance(review_packets, Mapping) else {}
+        rounds = supplemental_rounds if isinstance(supplemental_rounds, Mapping) else {}
+        for lens in sorted(blind_lenses):
+            completed = rounds.get(lens)
+            supplemental_inspection.append(
+                _quality_reviewer.plan_supplemental_inspection(
+                    lens=lens,
+                    packet=packets.get(lens),
+                    completed_rounds=(
+                        completed
+                        if isinstance(completed, int)
+                        and not isinstance(completed, bool)
+                        else 0
+                    ),
+                )
+            )
 
     # Independence is a recorded ladder, not a vendor check. The
     # ``cross_provider_required`` flag now only marks the tiers that *require* an
@@ -1570,6 +1624,10 @@ def fold_quality_verdict(
         # The achieved independence rung per required lens, so an accepted card
         # records exactly how independent each review was.
         "independence_rungs": independence_rungs,
+        # One bounded plan per blind lens, empty whenever nothing is blind.
+        # Advisory to this verdict and load-bearing for its caller: it never
+        # appears in ``blocking_evidence`` and never changes ``passed``.
+        "supplemental_inspection": supplemental_inspection,
         "config_error": config_error[:MAX_SUMMARY_CHARS],
     }
 
@@ -2674,6 +2732,8 @@ def run_completion_quality_gate(
     combined_tree_scope: bool = False,
     review_meta_gates: bool = True,
     policy_root: Path | str | None = None,
+    review_packets: Mapping[str, Mapping[str, Any]] | None = None,
+    supplemental_rounds: Mapping[str, int] | None = None,
     replay_binding: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Execute the mandatory review-quality floor for one task delta.
@@ -2776,6 +2836,8 @@ def run_completion_quality_gate(
             human_approval=human_approval,
             config_error=config_error,
             replay_binding=replay_binding,
+            review_packets=review_packets,
+            supplemental_rounds=supplemental_rounds,
         )
     except MalformedConfigError as exc:
         risk_profile = {}
@@ -2790,6 +2852,7 @@ def run_completion_quality_gate(
             "combined_tree_checks": [],
             "blocking_evidence": ["quality_verdict_schema_error"],
             "refine_required": False,
+            "supplemental_inspection": [],
             "config_error": str(exc)[:MAX_SUMMARY_CHARS],
         }
     blockers = list(verdict["blocking_evidence"])
@@ -2803,6 +2866,10 @@ def run_completion_quality_gate(
         "config_error": config_error,
         "optional_gates": optional,
         "risk_profile": risk_profile,
+        # Surfaced on the gate, not only buried in the verdict, because the
+        # accept path acts on it: this is the record that says a blind lens
+        # is owed one more read of its own sealed packet.
+        "supplemental_inspection": list(verdict.get("supplemental_inspection") or []),
         "review_meta_gates_enforced": bool(review_meta_gates and not combined_tree_scope),
         "quality_verdict": verdict,
         "repository_quality_policy": config_status,

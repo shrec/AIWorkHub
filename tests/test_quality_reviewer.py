@@ -2429,3 +2429,213 @@ class TestSchemaRepairTurn:
             instruction = str(request["instruction"]).lower()
             for forbidden in ("severity", "disposition", "defect", "approve", "accept"):
                 assert forbidden not in instruction, request
+
+
+# ---------------------------------------------------------------------------
+# NF-805 / NF-2026-00884: the bounded second READ a blind lens is owed.
+#
+# The 23-hunk regression is the shape that broke: a candidate large enough that
+# some paths carry every hunk inline and others carry only part of the diff and
+# must be resolved through the packet-bound candidate overlay. Both routes are
+# inspection; neither is a pass.
+# ---------------------------------------------------------------------------
+
+
+def _segments(count: int, *, truncated: bool = False) -> list[dict]:
+    return [
+        {
+            "kind": "replace",
+            "candidate_start_line": 10 * index + 1,
+            "candidate_end_line": 10 * index + 4,
+            "changed_start_line": 10 * index + 1,
+            "changed_end_line": 10 * index + 4,
+            "baseline_start_line": 10 * index + 1,
+            "baseline_end_line": 10 * index + 4,
+            "excerpt_bytes": 40,
+            "truncated": truncated,
+        }
+        for index in range(count)
+    ]
+
+
+def _nf805_packet() -> dict:
+    """A 23-hunk candidate: 11 hunks inline, 12 reachable only through overlay."""
+
+    inline_digest = hashlib.sha256(b"inline").hexdigest()
+    overlay_digest = hashlib.sha256(b"overlay").hexdigest()
+    return quality_reviewer.build_review_packet(
+        request_id="R-NF805",
+        task_id="T-NF805",
+        claim_epoch=1,
+        worker_provider="codex_cli",
+        changed_path_hashes={
+            "src/inline.py": inline_digest,
+            "src/overlay.py": overlay_digest,
+        },
+        source_evidence={
+            "src/inline.py": {
+                "candidate_sha256": inline_digest,
+                "excerpt": "@@ inline @@\n+alpha\n",
+                "excerpt_bytes": 20,
+                "source_bytes": 20,
+                "truncated": False,
+                "diff_complete": True,
+                "segments": _segments(11),
+            },
+            "src/overlay.py": {
+                "candidate_sha256": overlay_digest,
+                "excerpt": "@@ overlay @@\n+beta\n",
+                "excerpt_bytes": 20,
+                "source_bytes": 4096,
+                "truncated": True,
+                "segments": _segments(12, truncated=True),
+                "omission_reason": "changed_hunks_omitted:12",
+            },
+        },
+    )
+
+
+def test_every_changed_hunk_is_inline_or_overlay_reachable_at_23_hunks():
+    """Acceptance 1, stated as one record: no changed hunk is unreachable.
+
+    The inline path promises ``diff_complete``; the truncated one does not and
+    must not -- it earns its place through the candidate digest the packet
+    sealed for it, which is exactly what the reviewer's ``candidate_overlay``
+    index is bound to.
+    """
+
+    coverage = quality_reviewer.candidate_hunk_inspection_coverage(_nf805_packet())
+
+    assert coverage["complete"] is True
+    assert coverage["unreachable"] == []
+    assert sum(row["changed_hunks"] for row in coverage["paths"]) == 23
+    inline, overlay = coverage["paths"]
+    assert (inline["path"], inline["inline"], inline["overlay_reachable"]) == (
+        "src/inline.py", True, True,
+    )
+    assert (overlay["path"], overlay["inline"]) == ("src/overlay.py", False)
+    assert overlay["overlay_reachable"] is True
+    assert overlay["authority_source"] == "candidate_overlay"
+    assert overlay["omitted_hunks"] == 12
+
+
+def test_supplemental_inspection_is_bounded_to_the_declared_candidate_delta():
+    packet = _nf805_packet()
+
+    plan = quality_reviewer.plan_supplemental_inspection(
+        lens="correctness", packet=packet
+    )
+
+    assert plan["eligible"] is True
+    assert plan["reason"] == ""
+    assert plan["round"] == 1 and plan["max_rounds"] == 1
+    assert plan["packet_sha256"] == packet["packet_sha256"]
+    assert plan["target_request_id"] == "R-NF805"
+    assert [row["path"] for row in plan["inspection_targets"]] == [
+        "src/inline.py", "src/overlay.py",
+    ]
+    assert plan["coverage"]["changed_hunks"] == 23
+
+
+def test_supplemental_inspection_never_names_a_path_outside_the_delta():
+    """A row for an undeclared path invalidates the record instead of leaking it."""
+
+    packet = _nf805_packet()
+    packet["candidate"]["source_evidence"].append(
+        {"path": "src/secret.py", "candidate_sha256": None, "excerpt": "x",
+         "diff_complete": True, "segments": []}
+    )
+
+    coverage = quality_reviewer.candidate_hunk_inspection_coverage(packet)
+
+    assert coverage["complete"] is False
+    assert coverage["reason"] == "candidate_source_evidence_path_mismatch"
+    assert coverage["paths"] == []
+
+
+def test_supplemental_inspection_fails_closed_without_a_packet():
+    plan = quality_reviewer.plan_supplemental_inspection(
+        lens="correctness", packet=None
+    )
+
+    assert plan["eligible"] is False
+    assert plan["reason"] == "packet_evidence_missing"
+    assert plan["inspection_targets"] == []
+
+
+def test_supplemental_inspection_fails_closed_on_a_packet_that_is_not_its_digest():
+    """Evidence that cannot be proven is not evidence, and a re-read of it
+    would be exactly the laundering this refuses."""
+
+    packet = _nf805_packet()
+    packet["contract"]["objective"] = "silently rewritten after sealing"
+
+    plan = quality_reviewer.plan_supplemental_inspection(
+        lens="correctness", packet=packet
+    )
+
+    assert plan["eligible"] is False
+    assert plan["reason"] == "packet_digest_mismatch"
+
+
+def test_supplemental_inspection_refuses_an_unreachable_hunk():
+    """No inline diff and no sealed digest: nothing for a re-read to read."""
+
+    packet = quality_reviewer.build_review_packet(
+        request_id="R-NF805", task_id="T-NF805", claim_epoch=1,
+        worker_provider="codex_cli",
+        changed_path_hashes={"src/gone.py": None},
+        source_evidence={
+            "src/gone.py": {
+                "candidate_sha256": None,
+                "excerpt": "",
+                "truncated": True,
+                "segments": _segments(3, truncated=True),
+                "omission_reason": "changed_hunks_omitted:3",
+            },
+        },
+    )
+
+    plan = quality_reviewer.plan_supplemental_inspection(
+        lens="correctness", packet=packet
+    )
+
+    assert plan["eligible"] is False
+    assert plan["reason"] == "candidate_hunks_unreachable"
+    assert plan["coverage"]["unreachable"] == ["src/gone.py"]
+
+
+def test_supplemental_inspection_stops_at_the_bounded_attempt_limit():
+    """One re-read, then blocked. Repeated blindness is not a transient."""
+
+    packet = _nf805_packet()
+
+    first = quality_reviewer.plan_supplemental_inspection(
+        lens="correctness", packet=packet, completed_rounds=0
+    )
+    second = quality_reviewer.plan_supplemental_inspection(
+        lens="correctness", packet=packet, completed_rounds=1
+    )
+
+    assert first["eligible"] is True
+    assert second["eligible"] is False
+    assert second["reason"] == "attempt_limit_reached"
+    assert second["round"] == 2
+
+
+def test_supplemental_inspection_refuses_a_lens_the_packet_was_not_sealed_for():
+    packet = _nf805_packet()
+    # Re-sealed, not patched: a packet carrying another lens's scope has to be
+    # a VALID packet, or the digest check below would answer first and this
+    # would prove nothing about lens scoping.
+    packet["candidate"]["scoped_audits"] = {"security": {}}
+    packet["packet_sha256"] = quality_reviewer._canonical_digest(
+        {key: value for key, value in packet.items() if key != "packet_sha256"}
+    )
+
+    assert quality_reviewer.plan_supplemental_inspection(
+        lens="correctness", packet=packet
+    )["reason"] == "review_scope_lens_missing"
+    assert quality_reviewer.plan_supplemental_inspection(
+        lens="not_a_lens", packet=packet
+    )["reason"] == "reviewer_lens_invalid"

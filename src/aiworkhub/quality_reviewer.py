@@ -2642,11 +2642,243 @@ def _source_evidence_rows(
     return rows
 
 
+# ---------------------------------------------------------------------------
+# Supplemental inspection: the bounded second READ a blind lens is owed.
+#
+# A reviewer whose every finding is ``process_limit`` did not judge the
+# candidate -- it reported that it was PREVENTED from reading the packet.  The
+# candidate's bytes are not in question, so relaunching the implementation
+# worker answers a question nobody asked and throws away a sealed packet that
+# was never the problem.  The proportionate remedy is one more READ of that
+# exact packet by that exact lens.
+#
+# "One" is the whole discipline here.  A second blindness is not a transient,
+# and a chain that keeps re-reading spends provider budget to learn nothing.
+# ---------------------------------------------------------------------------
+SUPPLEMENTAL_INSPECTION_SCHEMA_ID = (
+    "aiworkhub.quality_review_supplemental_inspection.v1"
+)
+MAX_SUPPLEMENTAL_INSPECTION_ROUNDS = 1
+# Carried inside the plan, in the plan's own words, so a reviewer reading only
+# the JSON cannot mistake a re-read for a new scope or for permission to judge
+# anything the sealed packet does not carry.
+SUPPLEMENTAL_INSPECTION_NOTICE = (
+    "SUPPLEMENTAL INSPECTION -- A SECOND READ, NOT A SECOND SCOPE. The prior "
+    "reviewer for this lens reported it could not inspect its packet. This "
+    "round re-reads the SAME sealed packet under the SAME lens. Every path "
+    "below is already in this candidate's declared delta: a row marked inline "
+    "carries all of its changed hunks in the packet excerpt, and a row marked "
+    "overlay is resolvable through the packet-bound candidate_overlay index at "
+    "the exact candidate_sha256 named here. Nothing outside this list is in "
+    "scope, and a re-read that is again blind ends the chain rather than "
+    "extending it."
+)
+
+
+def candidate_hunk_inspection_coverage(
+    packet: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Say, per changed path, HOW this packet's changed hunks can be inspected.
+
+    There are exactly two routes, and a path needs one of them:
+
+    * ``inline`` -- the row's ``diff_complete`` is true, so every changed hunk
+      of that path is in the packet's own excerpt in full; or
+    * ``overlay`` -- the row carries the path's candidate sha256 and it equals
+      the digest the packet sealed for that path, so the reviewer's
+      packet-bound ``candidate_overlay`` Source Graph index resolves exactly
+      the bytes that digest names.
+
+    A path with neither is UNREACHABLE and is named as such.  Nothing here is a
+    judgment and nothing here is a pass: the record says only what a reviewer
+    COULD have read.  A path outside the packet's own declared candidate delta
+    is never emitted -- a source-evidence row naming one invalidates the whole
+    record instead, because the alternative is leaking a path this candidate
+    never declared.
+    """
+
+    empty: dict[str, Any] = {
+        "complete": False,
+        "reason": "packet_evidence_missing",
+        "paths": [],
+        "unreachable": [],
+    }
+    if not isinstance(packet, Mapping):
+        return empty
+    candidate = packet.get("candidate")
+    if not isinstance(candidate, Mapping):
+        return {**empty, "reason": "candidate_evidence_missing"}
+    declared: dict[str, Any] = {}
+    for row in candidate.get("changed_paths") or []:
+        if not isinstance(row, Mapping):
+            return {**empty, "reason": "candidate_changed_paths_invalid"}
+        path = str(row.get("path") or "")
+        if not path:
+            return {**empty, "reason": "candidate_changed_paths_invalid"}
+        declared[path] = row.get("sha256")
+    if not declared:
+        return {**empty, "reason": "candidate_changed_paths_invalid"}
+    rows = candidate.get("source_evidence")
+    if not isinstance(rows, list) or not rows:
+        return {
+            **empty,
+            "reason": "candidate_source_evidence_missing",
+            "unreachable": sorted(declared),
+        }
+    paths: list[dict[str, Any]] = []
+    unreachable: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        if not isinstance(row, Mapping):
+            return {**empty, "reason": "candidate_source_evidence_invalid"}
+        path = str(row.get("path") or "")
+        if path not in declared or path in seen:
+            # Never name a path the candidate did not declare, and never count
+            # one twice: either would make the "bounded to the delta" promise
+            # above false.
+            return {**empty, "reason": "candidate_source_evidence_path_mismatch"}
+        seen.add(path)
+        digest = row.get("candidate_sha256")
+        inline = row.get("diff_complete") is True
+        overlay = (
+            isinstance(digest, str)
+            and bool(_SHA256_RE.fullmatch(digest))
+            and digest == declared[path]
+        )
+        omission_reason = str(row.get("omission_reason") or "")
+        omitted_hunks = 0
+        if omission_reason.startswith("changed_hunks_omitted:"):
+            try:
+                omitted_hunks = max(0, int(omission_reason.split(":", 1)[1]))
+            except (TypeError, ValueError):
+                return {**empty, "reason": "candidate_source_evidence_invalid"}
+        segments = row.get("segments")
+        paths.append(
+            {
+                "path": path,
+                "inline": inline,
+                "overlay_reachable": overlay,
+                "authority_source": "candidate_overlay" if overlay else "",
+                "candidate_sha256": digest if overlay else None,
+                "changed_hunks": len(segments) if isinstance(segments, list) else 0,
+                "omitted_hunks": omitted_hunks,
+            }
+        )
+        if not inline and not overlay:
+            unreachable.append(path)
+    if seen != set(declared):
+        return {**empty, "reason": "candidate_source_evidence_path_mismatch"}
+    return {
+        "complete": not unreachable,
+        "reason": "" if not unreachable else "candidate_hunks_unreachable",
+        "paths": paths,
+        "unreachable": sorted(unreachable),
+    }
+
+
+def plan_supplemental_inspection(
+    *,
+    lens: str,
+    packet: Mapping[str, Any] | None,
+    completed_rounds: int = 0,
+    max_rounds: int = MAX_SUPPLEMENTAL_INSPECTION_ROUNDS,
+) -> dict[str, Any]:
+    """Decide whether a blind lens is owed one re-read, and name what it reads.
+
+    Pure: no I/O, no launch, no verdict.  It can only ever be ADDITIVE -- it
+    removes no blocker, satisfies no lens, and never touches
+    ``reviewer_could_not_inspect``.  Every refusal below is closed, and each
+    one says which fact was missing rather than defaulting to "try again":
+
+    * a lens outside :data:`REVIEWER_LENSES`, or a lens this packet was not
+      sealed for;
+    * no packet at all, or a packet whose body does not hash to its own
+      ``packet_sha256`` -- evidence that cannot be proven is not evidence, and
+      re-reading an unproven packet would launder it into one;
+    * a packet whose changed hunks are not all reachable, because a second read
+      of something unreadable is not a remedy; and
+    * ``completed_rounds >= max_rounds`` -- the bound. Repeated blindness stays
+      blocked.
+    """
+
+    plan: dict[str, Any] = {
+        "schema_id": SUPPLEMENTAL_INSPECTION_SCHEMA_ID,
+        "notice": SUPPLEMENTAL_INSPECTION_NOTICE,
+        "lens": str(lens)[:100],
+        "eligible": False,
+        "reason": "supplemental_rounds_invalid",
+        "round": 0,
+        "completed_rounds": 0,
+        "max_rounds": 0,
+        "packet_sha256": "",
+        "target_request_id": "",
+        "target_task_id": "",
+        "inspection_targets": [],
+        "coverage": {"complete": False, "reason": "packet_evidence_missing",
+                     "unreachable": []},
+    }
+    if (
+        not isinstance(max_rounds, int)
+        or isinstance(max_rounds, bool)
+        or not isinstance(completed_rounds, int)
+        or isinstance(completed_rounds, bool)
+        or max_rounds < 0
+        or completed_rounds < 0
+    ):
+        return plan
+    plan["max_rounds"] = max_rounds
+    plan["completed_rounds"] = completed_rounds
+    plan["round"] = completed_rounds + 1
+    if lens not in REVIEWER_LENSES:
+        plan["reason"] = "reviewer_lens_invalid"
+        return plan
+    if not isinstance(packet, Mapping):
+        plan["reason"] = "packet_evidence_missing"
+        return plan
+    sealed = str(packet.get("packet_sha256") or "")
+    body = {key: value for key, value in packet.items() if key != "packet_sha256"}
+    if not _SHA256_RE.fullmatch(sealed) or _canonical_digest(body) != sealed:
+        plan["reason"] = "packet_digest_mismatch"
+        return plan
+    plan["packet_sha256"] = sealed
+    target = packet.get("target")
+    if isinstance(target, Mapping):
+        plan["target_request_id"] = str(target.get("request_id") or "")[:200]
+        plan["target_task_id"] = str(target.get("task_id") or "")[:200]
+    candidate = packet.get("candidate")
+    scoped = candidate.get("scoped_audits") if isinstance(candidate, Mapping) else None
+    if isinstance(scoped, Mapping) and lens not in scoped:
+        plan["reason"] = "review_scope_lens_missing"
+        return plan
+    coverage = candidate_hunk_inspection_coverage(packet)
+    plan["inspection_targets"] = list(coverage["paths"])
+    plan["coverage"] = {
+        "complete": bool(coverage["complete"]),
+        "reason": str(coverage["reason"]),
+        "unreachable": list(coverage["unreachable"]),
+        "inline_paths": sum(1 for row in coverage["paths"] if row["inline"]),
+        "overlay_paths": sum(
+            1 for row in coverage["paths"] if row["overlay_reachable"]
+        ),
+        "changed_hunks": sum(int(row["changed_hunks"]) for row in coverage["paths"]),
+    }
+    if not coverage["complete"]:
+        plan["reason"] = str(coverage["reason"] or "candidate_evidence_incomplete")
+        return plan
+    if completed_rounds >= max_rounds:
+        plan["reason"] = "attempt_limit_reached"
+        return plan
+    plan["reason"] = ""
+    plan["eligible"] = True
+    return plan
+
+
 __all__ = [
     "PACKET_SCHEMA_ID",
     "RECEIPT_SCHEMA_ID",
     "MAX_SOURCE_EVIDENCE_CHARS",
     "MAX_SOURCE_EVIDENCE_TOTAL_CHARS",
+    "MAX_SUPPLEMENTAL_INSPECTION_ROUNDS",
     "MAX_VALIDATION_OUTPUT_TAIL_CHARS",
     "REVIEWER_LENSES",
     "FINDING_SEVERITIES",
@@ -2660,11 +2892,15 @@ __all__ = [
     "QUALITY_REVIEW_FINDING_KEYS",
     "QUALITY_REVIEW_FINDING_SCHEMA_DOC",
     "QUALITY_REVIEW_SUBMIT_TOOL_DESCRIPTION",
+    "SUPPLEMENTAL_INSPECTION_NOTICE",
+    "SUPPLEMENTAL_INSPECTION_SCHEMA_ID",
     "ReviewerEvidenceError",
     "build_lens_packet",
     "build_review_packet",
     "build_review_prompt",
+    "candidate_hunk_inspection_coverage",
     "normalize_packet_findings",
+    "plan_supplemental_inspection",
     "verify_review_packet_candidate",
     "verify_reviewer_receipt",
 ]

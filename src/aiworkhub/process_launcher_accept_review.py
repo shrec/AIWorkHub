@@ -23,15 +23,19 @@ if TYPE_CHECKING:  # names used only in annotations, which are never evaluated
 __all__ = [
     "ACCEPT_BLOCKER_KINDS",
     "ACCEPT_PREVIEW_SCHEMA_ID",
+    "SUPPLEMENTAL_REVIEW_SCHEMA_ID",
     "accept_preview",
     "accept_review",
     "bound_reviewer_request_ids",
     "bound_reviewer_rows",
     "bound_reviewer_task_ids",
+    "create_supplemental_inspection_rounds",
     "effective_requested_risk_tier",
     "fold_accept_blockers",
     "reviewer_evidence",
+    "sealed_review_packet",
     "server_derived_risk_tier",
+    "supplemental_rounds_completed",
 ]
 
 _REVIEWER_USABLE_STATES = ("review_ready", "accepted")
@@ -363,6 +367,224 @@ def _refinement_blockers(reviewers: list[dict[str, Any]]) -> list[dict[str, Any]
     return blockers
 
 
+# ---------------------------------------------------------------------------
+# Supplemental inspection, on the production accept path.
+#
+# A reviewer that returns nothing but ``process_limit`` findings has told us it
+# could not READ its packet.  Until now the only thing that could happen next
+# was a manager noticing ``reviewer_could_not_inspect`` in a blocker list and
+# launching a reviewer by hand -- or, worse, sending the candidate back through
+# the implementation worker, whose bytes were never in question.
+#
+# The three helpers below make the proportionate answer mechanical: recover the
+# exact packet the blind reviewer was sealed against, count how many re-reads
+# this lens has already had, and execute the ONE bounded round the gate's own
+# plan authorized.  None of them can accept anything: every failure path here
+# leaves the acceptance exactly as blocked as it already was.
+# ---------------------------------------------------------------------------
+SUPPLEMENTAL_REVIEW_SCHEMA_ID = "aiworkhub.accept_supplemental_review.v1"
+
+# The reviewer packet cap the worker MCP surface already enforces when it hands
+# the packet to a reviewer. Re-stated here because this read is a SECOND reader
+# of the same file and must not become the one unbounded path to it.
+MAX_SEALED_PACKET_BYTES = 8 * 1024 * 1024
+
+
+def sealed_review_packet(
+    metadata: Mapping[str, Any],
+    workspace: Any,
+    receipt: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """The exact packet THIS reviewer was sealed against, or ``None``.
+
+    Three independent facts have to line up before a packet is returned, and
+    each one is checked here rather than assumed from the one before it: the
+    file lives inside the reviewer's own home, its body hashes to its own
+    ``packet_sha256``, and that digest is the one the already-verified receipt
+    is bound to. A packet that fails any of them is not this reviewer's packet.
+
+    Fail-closed by construction, and cheaply so: ``None`` can only REMOVE the
+    supplemental round the gate would otherwise plan. There is no return value
+    of this function that satisfies a lens, clears a blocker or weakens
+    ``reviewer_could_not_inspect``.
+    """
+
+    import json as _json
+    from pathlib import Path as _Path
+
+    from . import quality_reviewer
+
+    binding = metadata.get("quality_review") if isinstance(metadata, Mapping) else None
+    if not isinstance(binding, Mapping) or not isinstance(receipt, Mapping):
+        return None
+    raw_path = binding.get("packet_path")
+    if not isinstance(raw_path, str) or not raw_path:
+        return None
+    try:
+        packet_path = _Path(raw_path).resolve()
+        packet_path.relative_to(_Path(workspace.home).resolve())
+        if packet_path.is_symlink() or not packet_path.is_file():
+            return None
+        if packet_path.stat().st_size > MAX_SEALED_PACKET_BYTES:
+            return None
+        packet = _json.loads(packet_path.read_text(encoding="utf-8"))
+    except (AttributeError, OSError, TypeError, ValueError):
+        # ValueError covers both the outside-home ``relative_to`` refusal and
+        # every decode failure (JSONDecodeError/UnicodeDecodeError subclass it).
+        return None
+    if not isinstance(packet, dict):
+        return None
+    sealed = str(packet.get("packet_sha256") or "")
+    if not sealed or sealed != str(receipt.get("packet_sha256") or ""):
+        return None
+    body = {key: value for key, value in packet.items() if key != "packet_sha256"}
+    if quality_reviewer._canonical_digest(body) != sealed:
+        return None
+    return packet
+
+
+def supplemental_rounds_completed(
+    reviewers: list[dict[str, Any]],
+) -> dict[str, int]:
+    """How many re-reads each lens has already had, counted from the store.
+
+    The first reviewer for a lens is the review itself; every additional bound
+    reviewer task for that same lens is a round that already EXISTS. Counting
+    them off the reviewer children -- the same rows the accept fold reads --
+    means the bound needs no new durable state and cannot drift from what the
+    store actually shows.
+
+    "Exists" rather than "finished" is deliberate and errs toward refusing: a
+    second reviewer for a lens that is still running already consumed the
+    round, and launching another beside it would spend the bound twice on the
+    same question.
+    """
+
+    counts: dict[str, int] = {}
+    for row in reviewers:
+        lens = str(row.get("lens") or "")
+        if lens:
+            counts[lens] = counts.get(lens, 0) + 1
+    return {lens: max(0, count - 1) for lens, count in counts.items()}
+
+
+def _reviewer_launch_route(self, reviewer: Mapping[str, Any]) -> dict[str, str]:
+    """The runner/adapter the blind reviewer itself ran on.
+
+    A supplemental round is the same lens on the same route reading the same
+    packet: nothing about the review is re-planned, only re-read. An identity
+    this cannot recover returns ``{}``, which refuses the round rather than
+    guessing a provider.
+    """
+
+    request_id = str(reviewer.get("request_id") or "")
+    if not request_id:
+        return {}
+    try:
+        events = self._request_events(request_id)
+    except Exception:  # noqa: BLE001 -- an unreadable ledger launches nothing
+        return {}
+    event = _latest_request_identity_event(
+        [row for row in (events or []) if isinstance(row, dict)],
+        str(reviewer.get("task_id") or ""),
+    )
+    if event is None:
+        return {}
+    runner = str(event.get("runner") or "")
+    adapter_id = str(event.get("adapter_id") or runner)
+    if not runner or not adapter_id:
+        return {}
+    return {"runner": runner, "adapter_id": adapter_id}
+
+
+def create_supplemental_inspection_rounds(
+    self,
+    *,
+    request_id: str,
+    task_id: str,
+    reviewers: list[dict[str, Any]],
+    quality_gate: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Execute the bounded re-reads the gate's own plan already authorized.
+
+    This decides nothing. ``run_completion_quality_gate`` computed the plan
+    from the sealed packet and the recorded round count; this only launches the
+    rounds it marked eligible, on the blind reviewer's own route, against the
+    same target request. The implementation worker is never relaunched -- the
+    candidate is not what failed -- and no manager has to name a reviewer.
+
+    Every row is reported, launched or not, with the reason it was not: a round
+    that could not be created must be visible, because the acceptance stays
+    blocked either way and the manager needs to know which of the two states
+    they are in.
+    """
+
+    plans = quality_gate.get("supplemental_inspection")
+    if not isinstance(plans, list) or not plans:
+        return []
+    launch = getattr(self, "launch_quality_reviewer", None)
+    rows: list[dict[str, Any]] = []
+    for plan in plans:
+        if not isinstance(plan, Mapping):
+            continue
+        lens = str(plan.get("lens") or "")
+        row: dict[str, Any] = {
+            "schema_id": SUPPLEMENTAL_REVIEW_SCHEMA_ID,
+            "lens": lens,
+            "round": int(plan.get("round") or 0),
+            "max_rounds": int(plan.get("max_rounds") or 0),
+            "packet_sha256": str(plan.get("packet_sha256") or ""),
+            "inspection_target_count": len(plan.get("inspection_targets") or []),
+            "eligible": bool(plan.get("eligible")),
+            "reason": str(plan.get("reason") or "")[:200],
+            "created": False,
+            "reviewer_task_id": "",
+            "reviewer_request_id": "",
+            "implementation_worker_relaunched": False,
+        }
+        if not row["eligible"]:
+            rows.append(row)
+            continue
+        prior = next(
+            (
+                candidate
+                for candidate in reviewers
+                if str(candidate.get("lens") or "") == lens
+                and str(candidate.get("task_id") or "")
+            ),
+            None,
+        )
+        route = _reviewer_launch_route(self, prior) if prior is not None else {}
+        if not callable(launch) or not route:
+            row["reason"] = "supplemental_route_unavailable"
+            rows.append(row)
+            continue
+        reviewer_task_id = f"{prior['task_id']}-SUPPLEMENTAL-{row['round']}"
+        row["reviewer_task_id"] = reviewer_task_id
+        try:
+            result = launch(
+                target_request_id=request_id,
+                target_task_id=task_id,
+                reviewer_task_id=reviewer_task_id,
+                runner=route["runner"],
+                adapter_id=route["adapter_id"],
+                lens=lens,
+            )
+        except Exception as exc:  # noqa: BLE001 -- a refused launch never accepts
+            row["reason"] = f"supplemental_launch_failed:{type(exc).__name__}"[:200]
+            rows.append(row)
+            continue
+        result = result if isinstance(result, Mapping) else {}
+        row["created"] = result.get("ok") is True
+        row["reviewer_request_id"] = str(result.get("request_id") or "")
+        if not row["created"]:
+            row["reason"] = str(
+                result.get("error") or "supplemental_launch_refused"
+            )[:200]
+        rows.append(row)
+    return rows
+
+
 def fold_accept_blockers(
     *,
     reviewers: list[dict[str, Any]],
@@ -595,12 +817,15 @@ def accept_preview(self, request_id: str, task_id: str, **overrides: Any) -> dic
 # global enters this body unannounced" -- and a name that belongs to neither
 # list is exactly the drift it exists to catch.
 ACCEPT_REVIEW_LOCAL_NAMES: tuple[str, ...] = (
+    "create_supplemental_inspection_rounds",
     "effective_requested_risk_tier",
     "fold_accept_blockers",
     "_latest_request_identity_event",
     "manager_skill_tools",
     "reviewer_evidence",
+    "sealed_review_packet",
     "server_derived_risk_tier",
+    "supplemental_rounds_completed",
 )
 
 ACCEPT_REVIEW_SEAM_NAMES: tuple[str, ...] = (
@@ -1689,6 +1914,12 @@ def accept_review(
             verified_reviewer_tasks: list[
                 tuple[str, _WorkerWorkspaceT | None, bool]
             ] = []
+            # The sealed packet each verified reviewer actually read, keyed by
+            # the lens its own receipt names. An already-accepted reviewer has
+            # no live workspace and therefore contributes none -- which is a
+            # fact about what can be proven now, not a defect: a lens with no
+            # packet here simply gets no supplemental round.
+            sealed_review_packets: dict[str, dict[str, Any]] = {}
             for reviewer_request_id in reviewer_ids:
                 reviewer_events = self._request_events(reviewer_request_id)
                 if not reviewer_events:
@@ -1778,6 +2009,19 @@ def accept_review(
                         False,
                     )
                 )
+                # Recovered from the reviewer's own home and bound to the
+                # receipt just verified above, so the gate decides the
+                # supplemental question from the packet ITSELF rather than from
+                # the report's account of it. Unprovable packets return None
+                # and are simply absent.
+                reviewer_packet = sealed_review_packet(
+                    reviewer_metadata, reviewer_workspace, receipt
+                )
+                reviewer_report_lens = str(
+                    (receipt.get("report") or {}).get("lens") or ""
+                )
+                if reviewer_packet is not None and reviewer_report_lens:
+                    sealed_review_packets[reviewer_report_lens] = reviewer_packet
             quality_gate = quality_evidence.run_completion_quality_gate(
                 workspace.path,
                 changed_paths=changed,
@@ -1790,6 +2034,11 @@ def accept_review(
                 reachability_inputs=self._candidate_reachability_inputs(
                     workspace, changed
                 ),
+                # The two inputs the supplemental decision needs, and nothing
+                # the gate can use to PASS anything: the packet each lens was
+                # sealed against, and how many re-reads that lens already had.
+                review_packets=sealed_review_packets,
+                supplemental_rounds=supplemental_rounds_completed(reviewers),
             )
             quality_gate["combined_tree"] = combined_tree
             quality_gate["quality_policy_authority"] = policy_authority
@@ -1852,6 +2101,31 @@ def accept_review(
                 if not isinstance(quality_blockers, list):
                     raise WorkspaceError("quality_gate_failed:invalid_blocking_checks")
                 reason = quality_gate.get("config_error") or ",".join(str(v) for v in quality_blockers)
+                # The acceptance fails either way, and with the identical error
+                # string it always had. What changes is what has already
+                # happened by the time the manager reads it: where the gate's
+                # own plan authorized a bounded same-lens re-read of the same
+                # sealed packet, that round is launched HERE, not left as an
+                # instruction for someone to carry out. The implementation
+                # worker is untouched -- its bytes are not what failed.
+                supplemental = create_supplemental_inspection_rounds(
+                    self,
+                    request_id=request_id,
+                    task_id=task_id,
+                    reviewers=reviewers,
+                    quality_gate=quality_gate,
+                )
+                if supplemental:
+                    return {
+                        "ok": False,
+                        "error": (
+                            "revalidation_failed:quality_gate_failed:"
+                            + str(reason)[:400]
+                        ),
+                        "request_id": request_id,
+                        "task_id": task_id,
+                        "supplemental_inspection": supplemental,
+                    }
                 raise WorkspaceError("quality_gate_failed:" + str(reason)[:400])
             quality_gate["destructive_diff_checks"] = destructive_rows
             quality_gate["destructive_diff_blockers"] = destructive_blockers
