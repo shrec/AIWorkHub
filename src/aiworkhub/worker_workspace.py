@@ -5775,6 +5775,19 @@ def create_quality_review_workspace(
             for relative in baseline_paths
         }
         for relative in candidate:
+            source_hash = _hash_path(source_workspace.path / relative)
+            if (
+                relative in canonical_delta
+                and canonical_baseline.get(relative) == source_hash
+            ):
+                if relative not in source_workspace.parent_baseline:
+                    raise WorkspaceError(
+                        f"quality_review_candidate_baseline_missing:{relative}"
+                    )
+                # A bounded self-host repair may already have promoted these
+                # exact sealed bytes. Preserve the candidate's authenticated
+                # parent baseline so the review delta remains observable.
+                canonical_baseline[relative] = source_workspace.parent_baseline[relative]
             _overlay_regular_path(source_workspace.path, review_workspace.path, relative)
         observed = changed_paths(
             replace(review_workspace, workspace_baseline=canonical_baseline)
@@ -8433,15 +8446,35 @@ def _apply_landlock(
                 continue
             target = workspace / pattern
             _require_beneath(workspace, target)
-            if not target.is_file() or target.is_symlink():
-                raise WorkspaceError(f"landlock_target_not_regular:{pattern}")
-            file_rights = _LL_WRITE_FILE | (_LL_TRUNCATE if abi >= 3 else 0)
-            _landlock_add_path_rule(libc, ruleset_fd, target, file_rights)
-            # Nested output directories may use atomic temp-file replacement.
-            # The repository root is deliberately never granted directory
-            # mutation rights, preserving the detached worktree's .git file.
-            if target.parent != workspace:
-                _landlock_add_path_rule(libc, ruleset_fd, target.parent, handled)
+            # NF-2026-00885: an allowed-write leaf the candidate deliberately
+            # deleted is legitimate work, not tampering, yet the previous
+            # ``not target.is_file()`` test could not tell ENOENT apart from a
+            # symlink or a special file, so one ordinary deletion blocked every
+            # declared gate before a single command ran. A single lstat splits
+            # the three cases: a regular file is granted write rights exactly as
+            # before, an absent leaf is skipped without being recreated, and a
+            # symlink or any other unexpected existing target still fails closed.
+            try:
+                status: os.stat_result | None = os.lstat(target)
+            except FileNotFoundError:
+                status = None
+            except OSError as exc:
+                raise WorkspaceError(f"landlock_target_not_regular:{pattern}") from exc
+            if status is not None:
+                if not stat.S_ISREG(status.st_mode):
+                    raise WorkspaceError(f"landlock_target_not_regular:{pattern}")
+                file_rights = _LL_WRITE_FILE | (_LL_TRUNCATE if abi >= 3 else 0)
+                _landlock_add_path_rule(libc, ruleset_fd, target, file_rights)
+            # Nested output directories may use atomic temp-file replacement, and
+            # a deleted leaf is restored through exactly that same parent, so the
+            # grant stays on the one authorized parent in both cases and is never
+            # widened. A parent that is itself gone is skipped rather than
+            # recreated, which grants strictly less. The repository root is
+            # deliberately never granted directory mutation rights, preserving
+            # the detached worktree's .git file.
+            parent = target.parent
+            if parent != workspace and not parent.is_symlink() and parent.is_dir():
+                _landlock_add_path_rule(libc, ruleset_fd, parent, handled)
         if libc.prctl(_PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0:
             error = ctypes.get_errno()
             raise WorkspaceError(f"landlock_no_new_privs_failed:{os.strerror(error)}")

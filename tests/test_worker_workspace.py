@@ -8838,3 +8838,171 @@ def test_nested_scope_declaration_protocol_is_gone() -> None:
         "_register_nested_metadata_scope",
     ):
         assert not hasattr(worker_workspace, retired), retired
+
+
+def _stub_landlock_syscalls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[tuple[Path, int]]:
+    """Exercise ``_apply_landlock``'s rule selection without confining pytest.
+
+    ``_apply_landlock`` ends in ``prctl(NO_NEW_PRIVS)`` plus
+    ``LANDLOCK_RESTRICT_SELF``, which would sandbox the test runner itself for
+    the remainder of the session, so the libc entry points are replaced and the
+    granted rules are recorded instead. Everything actually under test here --
+    which allowed-write leaf gets a rule, which one raises, and which parent is
+    authorized -- is ordinary Python and still runs for real, on real inodes.
+    Stubbing the ABI probe as well keeps the expected rights host-independent.
+    """
+
+    import ctypes
+
+    granted: list[tuple[Path, int]] = []
+
+    class _FakeLibc:
+        def syscall(self, number: int, *args: object) -> int:
+            if number == worker_workspace._LANDLOCK_CREATE_RULESET:
+                # A real descriptor: the production ``finally`` closes it.
+                return os.open(os.devnull, os.O_RDONLY | os.O_CLOEXEC)
+            return 0
+
+        def prctl(self, *args: object) -> int:
+            return 0
+
+    monkeypatch.setattr(worker_workspace, "landlock_abi_version", lambda: 3)
+    monkeypatch.setattr(ctypes, "CDLL", lambda *args, **kwargs: _FakeLibc())
+    monkeypatch.setattr(
+        worker_workspace,
+        "_landlock_add_path_rule",
+        lambda libc, fd, path, rights: granted.append((Path(path), rights)),
+    )
+    return granted
+
+
+def _granted_rights(granted: list[tuple[Path, int]], path: Path) -> list[int]:
+    return [rights for recorded, rights in granted if recorded == path]
+
+
+def _landlock_fixture(tmp_path: Path) -> tuple[Path, Path]:
+    root = tmp_path.resolve()
+    workspace = root / "worktree"
+    home = root / "home"
+    (workspace / "out").mkdir(parents=True)
+    home.mkdir()
+    return workspace, home
+
+
+def test_landlock_lets_every_gate_run_when_an_allowed_write_leaf_was_deleted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """NF-2026-00885 regression: deleting a declared output file is ordinary
+    work, not tampering, yet the old ``not target.is_file()`` test could not
+    tell ENOENT apart from a special file, so one deletion made all four
+    declared validations exit 126 with ``landlock_target_not_regular`` before a
+    single command ran.
+
+    Setup must stay deletion-aware while granting strictly less: nothing at all
+    for the absent leaf, which is never recreated, and only the one authorized
+    parent it would be restored through -- exactly what a present file already
+    receives, so no scope is widened.
+    """
+
+    workspace, home = _landlock_fixture(tmp_path)
+    deleted = workspace / "out" / "result.txt"
+
+    granted = _stub_landlock_syscalls(monkeypatch)
+    worker_workspace._apply_landlock(workspace, home, ["out/result.txt"])
+
+    assert not deleted.exists(), "the deleted leaf must never be recreated"
+    assert _granted_rights(granted, deleted) == [], "no rule for an absent leaf"
+    assert _granted_rights(granted, workspace / "out") == [
+        worker_workspace._landlock_supported_mutations(3)
+    ]
+    assert _granted_rights(granted, workspace) == [], "root stays unwritable"
+
+
+def test_landlock_never_grants_the_workspace_root_for_a_deleted_top_level_leaf(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A deleted leaf sitting directly in the worktree root must not promote
+    the root itself to a writable directory. The root is deliberately never
+    granted mutation rights -- that is what keeps the detached worktree's
+    ``.git`` file intact -- so this leaf simply gets no rule at all and the
+    gates still run."""
+
+    workspace, home = _landlock_fixture(tmp_path)
+    deleted = workspace / "gone.txt"
+
+    granted = _stub_landlock_syscalls(monkeypatch)
+    worker_workspace._apply_landlock(workspace, home, ["gone.txt"])
+
+    assert not deleted.exists()
+    assert _granted_rights(granted, deleted) == []
+    assert _granted_rights(granted, workspace) == [], "root stays unwritable"
+
+
+@pytest.mark.parametrize(
+    ("kind", "marker"),
+    [
+        ("directory", "landlock_target_not_regular:"),
+        ("symlink", "symlink_path_component_forbidden:"),
+        ("dangling_symlink", "symlink_path_component_forbidden:"),
+    ],
+)
+def test_landlock_still_fails_closed_on_non_regular_allowed_write_targets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+    marker: str,
+) -> None:
+    """Deletion-awareness must not become "anything that is not a plain file is
+    fine". A directory standing in for the leaf, a symlink pointing at a file
+    outside the declared scope, and a dangling symlink -- the nearest miss to a
+    genuine deletion, since it resolves to nothing -- all still refuse to set
+    up the sandbox, and none of them hands out a rule."""
+
+    workspace, home = _landlock_fixture(tmp_path)
+    target = workspace / "out" / "result.txt"
+    outside = tmp_path.resolve() / "sensitive.txt"
+    outside.write_text("do-not-grant", encoding="utf-8")
+
+    if kind == "directory":
+        target.mkdir()
+    elif kind == "symlink":
+        target.symlink_to(outside)
+    else:
+        target.symlink_to(tmp_path.resolve() / "never_created.txt")
+
+    granted = _stub_landlock_syscalls(monkeypatch)
+    with pytest.raises(worker_workspace.WorkspaceError) as excinfo:
+        worker_workspace._apply_landlock(workspace, home, ["out/result.txt"])
+
+    assert str(excinfo.value).startswith(marker), str(excinfo.value)
+    assert _granted_rights(granted, target) == []
+    assert _granted_rights(granted, outside) == []
+    assert outside.read_text(encoding="utf-8") == "do-not-grant"
+
+
+def test_landlock_still_grants_a_present_allowed_write_file_and_its_parent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The ordinary case is unchanged: a present regular leaf keeps its write
+    and truncate rights, and its nested parent keeps the directory rights that
+    atomic temp-file replacement needs."""
+
+    workspace, home = _landlock_fixture(tmp_path)
+    present = workspace / "out" / "result.txt"
+    present.write_text("payload", encoding="utf-8")
+
+    granted = _stub_landlock_syscalls(monkeypatch)
+    worker_workspace._apply_landlock(workspace, home, ["out/result.txt"])
+
+    assert _granted_rights(granted, present) == [
+        worker_workspace._LL_WRITE_FILE | worker_workspace._LL_TRUNCATE
+    ]
+    assert _granted_rights(granted, workspace / "out") == [
+        worker_workspace._landlock_supported_mutations(3)
+    ]
+    assert _granted_rights(granted, workspace) == [], "root stays unwritable"

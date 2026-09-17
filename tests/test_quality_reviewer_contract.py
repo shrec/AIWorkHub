@@ -1463,6 +1463,44 @@ def test_review_workspace_materializes_candidate_but_is_read_only(
         worker_workspace.cleanup_workspace(repo, source.path, source.home)
 
 
+def test_review_workspace_keeps_already_canonical_candidate_observable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _quality_review_repo(tmp_path, monkeypatch)
+    source_file = repo / "source.py"
+    source_file.write_text("value = 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "source.py"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "baseline"], cwd=repo, check=True)
+
+    source = worker_workspace.create_workspace(
+        repo,
+        "1" * 32,
+        {"allowed_writes": ["source.py"], "required_outputs": []},
+        "validation",
+    )
+    review = None
+    try:
+        (source.path / "source.py").write_text("value = 2\n", encoding="utf-8")
+        source_file.write_text("value = 2\n", encoding="utf-8")
+
+        review, evidence = worker_workspace.create_quality_review_workspace(
+            source,
+            "2" * 32,
+            ["source.py"],
+            "validation",
+        )
+
+        assert evidence["candidate_paths"] == ["source.py"]
+        assert evidence["canonical_delta_paths"] == ["source.py"]
+        assert (review.path / "source.py").read_text(encoding="utf-8") == "value = 2\n"
+        assert review.allowed_writes == ()
+        assert worker_workspace.enforce_scope(review) == []
+    finally:
+        if review is not None:
+            worker_workspace.cleanup_workspace(repo, review.path, review.home)
+        worker_workspace.cleanup_workspace(repo, source.path, source.home)
+
+
 def _quality_review_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     repo = tmp_path / "repo"
     repo.mkdir()
