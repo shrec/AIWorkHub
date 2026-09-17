@@ -11,70 +11,114 @@
       "id": "worker-audit-verifier",
       "mode": "focus",
       "query": "verify_audit_ledger",
-      "expected_paths": ["src/aiworkhub/worker_ai_tools_mcp.py"],
-      "k": 10
+      "expected_paths": [
+        "src/aiworkhub/worker_ai_tools_mcp.py"
+      ],
+      "k": 10,
+      "accepted_outcome_task_id": "needfix-NF-2026-00900",
+      "accepted_outcome_request_id": "b732937fe44440589b1614c1201f4d46",
+      "accepted_outcome_receipt": {
+        "attempt_artifact_manifest_id": "33e441ab6dd3bb948e194486cc9cc23f1646f5ab7fc2fe14c16697b0caad1b0e",
+        "base_oid": "c52377fe34b11acd428191c175cbc2f8a15c9b70",
+        "changed_path_hashes": {
+          "tests/test_aiworkhub_vscode_repo_binding_lifecycle_b865.py": "09f83a0eda0f655702fd0d376f30ad995f5f37537f69da6f62a9698f3ff1079e",
+          "tests/test_opencode_workforce_integration.py": "169f512acda03a83ffc962c8df905debd8a3fb3a37682a96e2bcbbf4a8443e41",
+          "vscode-extension/extension.js": "516d72b97bf4c2060f03c076c546044e908ab4dbff6fba7350ce499270fe283f",
+          "vscode-extension/test/extension.test.js": "2aa0877b115acd164adb6e7b68b008fc2a7389861b18775a6575c2cdbd5b92ac"
+        },
+        "claim_epoch": 8,
+        "promoted_paths": [
+          "tests/test_aiworkhub_vscode_repo_binding_lifecycle_b865.py",
+          "tests/test_opencode_workforce_integration.py",
+          "vscode-extension/extension.js",
+          "vscode-extension/test/extension.test.js"
+        ],
+        "receipt_id": "sha256:0f3cdeda7694ad83037f7314acabc4599016d9063cf9d5dc56d039ec2a80775f",
+        "repository_revision": "sha256:d38ae8994a9c2006116eefec7fb0d7dd4a15b20aa7abcd3b8db7e4e572020627",
+        "request_id": "b732937fe44440589b1614c1201f4d46",
+        "schema_id": "aiworkhub.accepted_outcome_receipt.v1",
+        "task_id": "needfix-NF-2026-00900"
+      }
     },
     {
       "id": "review-acceptance",
       "mode": "focus",
       "query": "accept_review",
-      "expected_paths": ["src/aiworkhub/process_launcher.py"],
+      "expected_paths": [
+        "src/aiworkhub/process_launcher.py"
+      ],
       "k": 10
     },
     {
       "id": "provider-policy-renderer",
       "mode": "focus",
       "query": "render_projection",
-      "expected_paths": ["src/aiworkhub/agent_tool_instructions.py"],
+      "expected_paths": [
+        "src/aiworkhub/agent_tool_instructions.py"
+      ],
       "k": 10
     },
     {
       "id": "source-graph-retrieval-evaluator",
       "mode": "focus",
       "query": "source_graph_retrieval_eval",
-      "expected_paths": ["src/aiworkhub/evidence_instruments.py"],
+      "expected_paths": [
+        "src/aiworkhub/evidence_instruments.py"
+      ],
       "k": 10
     },
     {
       "id": "dashboard-snapshot-builder",
       "mode": "focus",
       "query": "build_snapshot dashboard",
-      "expected_paths": ["src/aiworkhub/dashboard.py"],
+      "expected_paths": [
+        "src/aiworkhub/dashboard.py"
+      ],
       "k": 10
     },
     {
       "id": "accepted-outcome-cost-view",
       "mode": "focus",
       "query": "cost_per_accepted_outcome_view",
-      "expected_paths": ["src/aiworkhub/cost_ledger.py"],
+      "expected_paths": [
+        "src/aiworkhub/cost_ledger.py"
+      ],
       "k": 10
     },
     {
       "id": "needfix-transition-view",
       "mode": "focus",
       "query": "needfix_transition_view",
-      "expected_paths": ["src/aiworkhub/dashboard_mcp_app.py"],
+      "expected_paths": [
+        "src/aiworkhub/dashboard_mcp_app.py"
+      ],
       "k": 10
     },
     {
       "id": "context-graph-session-append",
       "mode": "focus",
       "query": "append_session_document_in_transaction",
-      "expected_paths": ["src/aiworkhub/context_graph.py"],
+      "expected_paths": [
+        "src/aiworkhub/context_graph.py"
+      ],
       "k": 10
     },
     {
       "id": "worker-source-graph-wrapper",
       "mode": "focus",
       "query": "session_current_state worker",
-      "expected_paths": ["src/aiworkhub/worker_ai_tools_mcp.py"],
+      "expected_paths": [
+        "src/aiworkhub/worker_ai_tools_mcp.py"
+      ],
       "k": 10
     },
     {
       "id": "worker-prompt-builder",
       "mode": "focus",
       "query": "build_worker_prompt",
-      "expected_paths": ["src/aiworkhub/process_launcher.py"],
+      "expected_paths": [
+        "src/aiworkhub/process_launcher.py"
+      ],
       "k": 10
     }
   ]
