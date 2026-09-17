@@ -368,8 +368,11 @@ def test_opencode_permission_allows_only_worker_mcp_namespace() -> None:
     denied = (
         "aiworkhub_manager_bootstrap",
         "aiworkhub_worker_ai_tools_quality_review_submit",
-        "aiworkhub_worker_ai_tools_aiworkhub_worker_quality_review_submit",
-        "aiworkhub_worker_ai_tools_aiworkhub_worker_quality_review_packet_read",
+        # Both reviewer tools are declared now, so they are asserted allowed
+        # by the loop above.  A truncated prefix of a declared name stays
+        # denied, which is what proves the matcher is not prefix-matching its
+        # way into granting an undeclared tool.
+        "aiworkhub_worker_ai_tools_aiworkhub_worker_quality_review",
         "aiworkhub_worker_ai_tools_aiworkhub_worker_undeclared",
     )
     for name in denied:

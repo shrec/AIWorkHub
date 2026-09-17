@@ -1408,6 +1408,15 @@ OPENCODE_WORKER_MCP_TOOLS: tuple[str, ...] = (
     "aiworkhub_worker_session_write_intent",
     "aiworkhub_worker_ai_memory_write_intent",
     "aiworkhub_worker_kb_write_intent",
+    # A reviewer on this family reads the sealed packet and submits findings
+    # through these two tools and nothing else.  While they were absent, the
+    # ``"*": deny`` default made every OpenCode-routed quality review
+    # impossible to complete: the reviewer launched, found no packet tool, and
+    # died with ``review_protocol:no_report_in_final`` after burning its
+    # prompt.  Both are bound server-side to the reviewer's own card, so a code
+    # worker that reaches for them is refused there, not here.
+    "aiworkhub_worker_quality_review_packet_read",
+    "aiworkhub_worker_quality_review_submit",
 )
 OPENCODE_DENIED_BUILTIN_TOOLS: tuple[str, ...] = (
     "read",
