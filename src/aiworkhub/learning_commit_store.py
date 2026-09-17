@@ -67,6 +67,70 @@ CREATE INDEX IF NOT EXISTS idx_learning_commits_state
 ON learning_commits(state, updated_at);
 """
 
+# ---------------------------------------------------------------------------
+# Typed learning dispositions (NF-2026-00899 foundation).
+#
+# A lesson is owed after every adjudicated decision, but most decisions do not
+# produce a NEW lesson -- and the ledger above can only record the ones that
+# did. So a decision with no lesson is indistinguishable from a decision nobody
+# closed out, and measured lesson coverage sat at 49.7% with no way to tell
+# which half was diligence and which half was silence.
+#
+# A disposition closes that gap WITHOUT inventing prose. Exactly two shapes:
+# ``lesson_committed``, which points at a real row in ``learning_commits`` and
+# duplicates none of its payload, and ``no_new_lesson``, which carries one
+# token from a closed vocabulary. Recording "there was nothing new here" is
+# therefore mechanical -- no model call, no generated sentence -- which is the
+# only way it can be asked of every decision.
+#
+# The table is created lazily like ``learning_commits``, so a repository that
+# predates it reads as "no dispositions recorded" rather than raising.
+# ---------------------------------------------------------------------------
+
+DISPOSITION_SCHEMA_ID = "aiworkhub.learning_disposition.v1"
+
+#: A lesson was written for this decision; ``commit_id`` names the ledger row.
+DISPOSITION_LESSON_COMMITTED = "lesson_committed"
+#: This decision taught nothing new, for one of the reasons below.
+DISPOSITION_NO_NEW_LESSON = "no_new_lesson"
+
+DISPOSITIONS: tuple[str, ...] = (
+    DISPOSITION_LESSON_COMMITTED,
+    DISPOSITION_NO_NEW_LESSON,
+)
+
+# Closed vocabulary. A typed token is auditable and countable; a sentence is
+# neither, and asking for one is what makes the mechanical case expensive
+# enough to skip. Anything outside this tuple is refused, never stored as prose.
+NO_NEW_LESSON_REASONS: tuple[str, ...] = (
+    # The cause is already stated by a lesson in the ledger.
+    "duplicate_of_recorded_lesson",
+    # A real cause, but specific to this card; nothing generalizes.
+    "no_generalizable_cause",
+    # Rename, formatting, dependency bump: no defect to learn from.
+    "mechanical_change_only",
+    # The decision's own evidence does not support naming a cause.
+    "evidence_insufficient",
+    # A reviewer run or other decision that is not about the code.
+    "decision_not_about_code",
+)
+
+_DISPOSITION_SCHEMA = """
+CREATE TABLE IF NOT EXISTS learning_dispositions(
+    disposition_id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    request_id TEXT NOT NULL,
+    disposition TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    commit_id TEXT NOT NULL,
+    recorded_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(task_id, request_id)
+);
+CREATE INDEX IF NOT EXISTS idx_learning_dispositions_task
+ON learning_dispositions(task_id);
+"""
+
 
 class LearningCommitStoreError(RuntimeError):
     """Invalid authority, evidence, identity or durable projection state."""
@@ -209,10 +273,19 @@ def _rejection_failure_category(card: dict[str, Any], request_id: str) -> str:
     return str(core.classify_terminal_disposition(card).value)
 
 
-def _open(repo: Path) -> sqlite3.Connection:
+def _open(repo: Path, *, schema: str = _SCHEMA) -> sqlite3.Connection:
+    """Open the canonical store with ``schema`` applied, and nothing else.
+
+    This is the single connection-opening owner for this module. ``schema``
+    selects WHICH lazily created structure a caller needs, so committing a
+    lesson never creates a disposition table as a side effect and recording a
+    disposition never creates the ledger: each appears the first time it is
+    actually written, and every reader below tolerates its absence, which is
+    what makes the migration lazy rather than a step somebody has to run.
+    """
     _readiness, db_path = task_store._require_ready(repo)
     con = cast(sqlite3.Connection, task_store._connect(db_path))
-    con.executescript(_SCHEMA)
+    con.executescript(schema)
     return con
 
 
@@ -350,6 +423,265 @@ def _summary(commit_id: str, request_id: str, commit: LearningCommit) -> dict[st
     }
 
 
+def _disposition_id(task_id: str, request_id: str) -> str:
+    """The decision identity, hashed. One row per exact task/request pair."""
+    return hashlib.sha256(f"{task_id}\0{request_id}".encode("utf-8")).hexdigest()
+
+
+def _validated_disposition(
+    disposition: Any, reason: Any, commit_id: Any
+) -> tuple[str, str, str]:
+    """Normalize one disposition into ``(kind, reason, commit_id)`` or refuse.
+
+    The two shapes are mutually exclusive by construction, so neither can be
+    mistaken for the other downstream: ``lesson_committed`` carries a ledger
+    reference and no reason, ``no_new_lesson`` carries a reason token and no
+    ledger reference. A reason on a committed lesson, or a commit id on a
+    no-new-lesson, is a caller confusing the two and is refused rather than
+    silently dropped.
+    """
+    kind = str(disposition or "").strip().lower()
+    if kind not in DISPOSITIONS:
+        raise LearningCommitStoreError(
+            "learning_disposition_invalid:unknown_disposition; allowed: "
+            + ", ".join(DISPOSITIONS)
+        )
+    reason_token = str(reason or "").strip()
+    commit_ref = str(commit_id or "").strip()
+    if kind == DISPOSITION_LESSON_COMMITTED:
+        if reason_token:
+            raise LearningCommitStoreError(
+                "learning_disposition_invalid:lesson_committed_takes_no_reason"
+            )
+        if not commit_ref:
+            raise LearningCommitStoreError(
+                "learning_disposition_invalid:lesson_committed_requires_commit_id"
+            )
+        return kind, "", commit_ref
+    if commit_ref:
+        raise LearningCommitStoreError(
+            "learning_disposition_invalid:no_new_lesson_takes_no_commit_id"
+        )
+    if reason_token not in NO_NEW_LESSON_REASONS:
+        raise LearningCommitStoreError(
+            "learning_disposition_invalid:unknown_no_new_lesson_reason; allowed: "
+            + ", ".join(NO_NEW_LESSON_REASONS)
+        )
+    return kind, reason_token, ""
+
+
+def _committed_lesson_exists(
+    con: sqlite3.Connection, commit_id: str, task_id: str, request_id: str
+) -> bool:
+    """Is ``commit_id`` a real ledger row for THIS decision identity?
+
+    ``lesson_committed`` is a claim that a lesson exists, so it is checked
+    against the ledger instead of being believed. A repository with no ledger
+    table at all has committed nothing, which is the same answer.
+    """
+    if (
+        con.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='learning_commits'"
+        ).fetchone()
+        is None
+    ):
+        return False
+    return (
+        con.execute(
+            "SELECT 1 FROM learning_commits "
+            "WHERE commit_id=? AND task_id=? AND request_id=?",
+            (commit_id, task_id, request_id),
+        ).fetchone()
+        is not None
+    )
+
+
+def _disposition_record(
+    *,
+    disposition_id: str,
+    task_id: str,
+    request_id: str,
+    kind: str,
+    reason: str,
+    commit_id: str,
+    recorded_by: str,
+    created_at: str,
+    idempotent: bool,
+) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "schema_id": DISPOSITION_SCHEMA_ID,
+        "disposition_id": disposition_id,
+        "task_id": task_id,
+        "request_id": request_id,
+        "disposition": kind,
+        "reason": reason,
+        "commit_id": commit_id,
+        "recorded_by": recorded_by,
+        "created_at": created_at,
+        "idempotent": idempotent,
+    }
+
+
+def record_disposition(
+    repo: str | Path,
+    *,
+    task_id: str,
+    request_id: str,
+    disposition: str,
+    reason: str = "",
+    commit_id: str = "",
+    recorded_by: str = "",
+) -> dict[str, Any]:
+    """Record ONE typed learning disposition for ONE decision identity.
+
+    ``disposition`` is either :data:`DISPOSITION_LESSON_COMMITTED`, which must
+    name an existing ``learning_commits`` row for this same task and request
+    and duplicates none of that row's payload, or
+    :data:`DISPOSITION_NO_NEW_LESSON` with one token from
+    :data:`NO_NEW_LESSON_REASONS`. Nothing here writes, derives or requires
+    lesson prose: the no-new-lesson case is a single enumerated value, which is
+    what makes recording it mechanical enough to be asked of every decision.
+
+    Replaying the identical disposition is idempotent and returns the original
+    ``created_at``. A *different* disposition for the same identity is refused
+    with ``learning_disposition_conflict``: the first close-out of a decision
+    is the record of what was judged at the time, and letting a second one
+    overwrite it would turn the ledger into whatever was written last.
+
+    The ``learning_dispositions`` table is created here on first use, so an
+    existing repository migrates lazily on its first recorded disposition and
+    needs no migration step.
+    """
+    task = _bounded(task_id, "task_id", 256)
+    request = _bounded(request_id, "request_id", 256)
+    kind, reason_token, commit_ref = _validated_disposition(
+        disposition, reason, commit_id
+    )
+    actor = str(recorded_by or "").strip()[:256]
+    disposition_id = _disposition_id(task, request)
+    now = datetime.now(timezone.utc).isoformat()
+
+    con = _open(Path(repo), schema=_DISPOSITION_SCHEMA)
+    try:
+        con.row_factory = sqlite3.Row
+        con.execute("BEGIN IMMEDIATE")
+        if kind == DISPOSITION_LESSON_COMMITTED and not _committed_lesson_exists(
+            con, commit_ref, task, request
+        ):
+            raise LearningCommitStoreError("learning_disposition_commit_not_found")
+        existing = con.execute(
+            "SELECT * FROM learning_dispositions WHERE task_id=? AND request_id=?",
+            (task, request),
+        ).fetchone()
+        if existing is not None:
+            recorded = (
+                str(existing["disposition"]),
+                str(existing["reason"]),
+                str(existing["commit_id"]),
+            )
+            if recorded != (kind, reason_token, commit_ref):
+                raise LearningCommitStoreError(
+                    "learning_disposition_conflict:already_recorded_as_"
+                    + recorded[0]
+                    + (f":{recorded[1]}" if recorded[1] else "")
+                )
+            con.rollback()
+            return _disposition_record(
+                disposition_id=str(existing["disposition_id"]),
+                task_id=task,
+                request_id=request,
+                kind=kind,
+                reason=reason_token,
+                commit_id=commit_ref,
+                recorded_by=str(existing["recorded_by"] or ""),
+                created_at=str(existing["created_at"] or ""),
+                idempotent=True,
+            )
+        con.execute(
+            "INSERT INTO learning_dispositions(disposition_id,task_id,request_id,"
+            "disposition,reason,commit_id,recorded_by,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (
+                disposition_id,
+                task,
+                request,
+                kind,
+                reason_token,
+                commit_ref,
+                actor,
+                now,
+            ),
+        )
+        con.commit()
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+    return _disposition_record(
+        disposition_id=disposition_id,
+        task_id=task,
+        request_id=request,
+        kind=kind,
+        reason=reason_token,
+        commit_id=commit_ref,
+        recorded_by=actor,
+        created_at=now,
+        idempotent=False,
+    )
+
+
+def read_disposition(
+    repo: str | Path, *, task_id: str, request_id: str
+) -> dict[str, Any] | None:
+    """Return the disposition recorded for one decision identity, or ``None``.
+
+    Read-only and total. A repository that predates the table, an unreadable
+    store and an identity nobody closed out all answer ``None`` -- an absent
+    record, never a fabricated ``no_new_lesson``.
+    """
+    task = str(task_id or "").strip()
+    request = str(request_id or "").strip()
+    if not task or not request:
+        return None
+    try:
+        conn = _readonly(Path(repo))
+    except Exception:  # noqa: BLE001 -- an unreadable store knows no dispositions
+        return None
+    try:
+        conn.row_factory = sqlite3.Row
+        if (
+            conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='learning_dispositions'"
+            ).fetchone()
+            is None
+        ):
+            return None
+        row = conn.execute(
+            "SELECT * FROM learning_dispositions WHERE task_id=? AND request_id=?",
+            (task, request),
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+    if row is None:
+        return None
+    return _disposition_record(
+        disposition_id=str(row["disposition_id"]),
+        task_id=str(row["task_id"]),
+        request_id=str(row["request_id"]),
+        kind=str(row["disposition"]),
+        reason=str(row["reason"] or ""),
+        commit_id=str(row["commit_id"] or ""),
+        recorded_by=str(row["recorded_by"] or ""),
+        created_at=str(row["created_at"] or ""),
+        idempotent=True,
+    )
+
 # How far back a coverage measurement looks. Older cards predate the learning
 # path being wired at all, so counting them would report a permanent failure
 # rather than current practice.
@@ -387,6 +719,22 @@ def coverage(root: str | Path, *, window_days: int = COVERAGE_WINDOW_DAYS) -> di
     one lesson for the decision in hand. It is the one an invariant can hold a
     manager to. ``None`` for ``coverage_percent`` means no decided cards in the
     window -- an absent denominator, never zero coverage.
+
+    Lesson coverage and DISPOSITION coverage are reported side by side and are
+    never merged. ``cards_with_lesson`` and ``coverage_percent`` keep counting
+    exactly what they always counted -- decided cards with a row in
+    ``learning_commits`` -- so the measured 49.7% stays 49.7% and a
+    ``no_new_lesson`` can never be read as a lesson that was written.
+    ``cards_with_disposition`` and ``disposition_coverage_percent`` count
+    decided cards that were CLOSED OUT either way. The gap between the two is
+    the point of the pair: the first says how much was learned, the second says
+    how much was answered for.
+
+    Disposition counts join the tasks table, so a disposition recorded for an
+    identity that is not a decided card in this window contributes nothing and
+    cannot inflate the percentage. A repository whose dispositions table does
+    not exist yet reports zero recorded dispositions rather than raising, which
+    is the true reading before any call site records one.
     """
 
     _readiness, db_path = task_store._require_ready(root)
@@ -422,6 +770,33 @@ def coverage(root: str | Path, *, window_days: int = COVERAGE_WINDOW_DAYS) -> di
             + "WHERE t.updated_at >= ? "
             + ("AND l.task_id IS NULL " if has_store else "")
             + "AND t.topic <> 'quality_review' AND (t.status='finished' OR t.status LIKE 'blocked%') "
+            "ORDER BY t.updated_at DESC LIMIT 5",
+            (cutoff,),
+        ).fetchall()
+        # Dispositions live in their own lazily created table. A repository
+        # that predates it -- or one where no call site records a disposition
+        # yet -- reads as zero recorded dispositions rather than raising, and
+        # the lesson numbers above are computed independently of it.
+        has_dispositions = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='learning_dispositions'"
+        ).fetchone() is not None
+        with_disposition = int(conn.execute(
+            "SELECT COUNT(DISTINCT t.task_id) FROM tasks t "
+            "JOIN learning_dispositions d ON d.task_id = t.task_id "
+            "WHERE t.updated_at >= ? "
+            "AND t.topic <> 'quality_review' "
+            "AND (t.status='finished' OR t.status LIKE 'blocked%')",
+            (cutoff,),
+        ).fetchone()[0]) if has_dispositions else 0
+        missing_disposition = conn.execute(
+            "SELECT t.task_id FROM tasks t "
+            + ("LEFT JOIN learning_dispositions d ON d.task_id = t.task_id "
+               if has_dispositions else "")
+            + "WHERE t.updated_at >= ? "
+            + ("AND d.task_id IS NULL " if has_dispositions else "")
+            + "AND t.topic <> 'quality_review' "
+            + "AND (t.status='finished' OR t.status LIKE 'blocked%') "
             "ORDER BY t.updated_at DESC LIMIT 5",
             (cutoff,),
         ).fetchall()
@@ -468,6 +843,19 @@ def coverage(root: str | Path, *, window_days: int = COVERAGE_WINDOW_DAYS) -> di
         "consecutive_recent_without_lesson_capped": (
             streak >= RECENT_DECISION_SCAN_LIMIT
         ),
+        # Disposition coverage: decided cards CLOSED OUT either way. Reported
+        # beside the lesson numbers above and never folded into them, so the
+        # answer to "how much was learned" cannot be improved by answering
+        # "nothing new here" -- which is exactly the pressure a single merged
+        # number would create.
+        "cards_with_disposition": with_disposition,
+        "cards_without_disposition": max(0, decided - with_disposition),
+        "disposition_coverage_percent": (
+            round(with_disposition / decided * 100.0, 1) if decided else None
+        ),
+        "recent_without_disposition": [
+            str(row["task_id"]) for row in missing_disposition
+        ],
     }
 
 
@@ -1017,13 +1405,21 @@ def resolve_short_form(
 
 __all__ = [
     "ALLOWED_EVIDENCE_ID_SCHEMES",
+    "DISPOSITIONS",
+    "DISPOSITION_LESSON_COMMITTED",
+    "DISPOSITION_NO_NEW_LESSON",
+    "DISPOSITION_SCHEMA_ID",
     "LearningCommitStoreError",
+    "NO_NEW_LESSON_REASONS",
     "SCHEMA_ID",
     "adjudicated_decision",
     "commit_learning",
+    "coverage",
     "injection_ledger_state",
     "read_card_outcomes",
     "read_correction_record",
+    "read_disposition",
+    "record_disposition",
     "resolve_short_form",
 ]
 

@@ -1238,3 +1238,308 @@ def test_supplied_repo_area_is_honored_at_manager_entry(tmp_path, monkeypatch):
 
     assert result["ok"] is True, result
     assert _fetch_commit(root, "TASK-SUPPLIED-3")["repo_area"] == "src/custom/area"
+
+
+# --------------------------------------------------------------------------- #
+# Typed learning dispositions (NF-2026-00899 foundation).
+#
+# Most adjudicated decisions teach nothing new, and the lesson ledger can only
+# record the ones that do -- so "no lesson" and "nobody closed this out" looked
+# identical. A disposition separates them with exactly two shapes and no prose:
+# a pointer at a real ledger row, or one token from a closed vocabulary.
+# --------------------------------------------------------------------------- #
+
+
+def _disposition_count(root: Path) -> int:
+    con = sqlite3.connect(str(task_store.canonical_db_path(root)))
+    try:
+        return con.execute("SELECT COUNT(*) FROM learning_dispositions").fetchone()[0]
+    finally:
+        con.close()
+
+
+def test_a_repository_without_the_disposition_table_reads_as_no_record(
+    tmp_path, monkeypatch
+):
+    """Lazy migration: an unmigrated repository answers, it does not raise."""
+    root, task_id, request_id = _setup(tmp_path, monkeypatch)
+
+    assert learning_commit_store.read_disposition(
+        root, task_id=task_id, request_id=request_id
+    ) is None
+
+
+def test_a_real_commit_is_recorded_as_lesson_committed_without_repeating_it(
+    tmp_path, monkeypatch
+):
+    root, task_id, request_id = _setup(tmp_path, monkeypatch)
+    committed = _commit(task_id, request_id)
+
+    recorded = learning_commit_store.record_disposition(
+        root,
+        task_id=task_id,
+        request_id=request_id,
+        disposition=learning_commit_store.DISPOSITION_LESSON_COMMITTED,
+        commit_id=committed["commit_id"],
+        recorded_by="manager",
+    )
+
+    assert recorded["ok"] is True
+    assert recorded["idempotent"] is False
+    assert recorded["disposition"] == "lesson_committed"
+    assert recorded["commit_id"] == committed["commit_id"]
+    assert recorded["reason"] == ""
+
+    stored = learning_commit_store.read_disposition(
+        root, task_id=task_id, request_id=request_id
+    )
+    assert stored["commit_id"] == committed["commit_id"]
+    assert "gate learning promotion" not in json.dumps(stored), (
+        "the disposition references the ledger row, it never copies the lesson"
+    )
+
+
+def test_lesson_committed_must_name_a_real_ledger_row_for_this_decision(
+    tmp_path, monkeypatch
+):
+    """A claim that a lesson exists is checked against the ledger, not believed."""
+    root, task_id, request_id = _setup(tmp_path, monkeypatch)
+    _commit(task_id, request_id)
+
+    with pytest.raises(
+        learning_commit_store.LearningCommitStoreError,
+        match="learning_disposition_commit_not_found",
+    ):
+        learning_commit_store.record_disposition(
+            root,
+            task_id=task_id,
+            request_id=request_id,
+            disposition="lesson_committed",
+            commit_id="0" * 64,
+        )
+
+
+def test_a_mechanical_no_new_lesson_needs_a_token_and_no_prose(tmp_path, monkeypatch):
+    root, task_id, request_id = _setup(tmp_path, monkeypatch)
+
+    recorded = learning_commit_store.record_disposition(
+        root,
+        task_id=task_id,
+        request_id=request_id,
+        disposition=learning_commit_store.DISPOSITION_NO_NEW_LESSON,
+        reason="mechanical_change_only",
+    )
+
+    assert recorded["disposition"] == "no_new_lesson"
+    assert recorded["reason"] == "mechanical_change_only"
+    assert recorded["commit_id"] == ""
+    assert learning_commit_store.coverage(root)["cards_with_lesson"] == 0, (
+        "a no-new-lesson disposition is never reported as a committed lesson"
+    )
+
+
+def test_free_form_prose_is_not_an_allowed_no_new_lesson_reason(tmp_path, monkeypatch):
+    """A sentence is neither auditable nor countable, and is refused."""
+    root, task_id, request_id = _setup(tmp_path, monkeypatch)
+
+    with pytest.raises(
+        learning_commit_store.LearningCommitStoreError,
+        match="learning_disposition_invalid:unknown_no_new_lesson_reason",
+    ):
+        learning_commit_store.record_disposition(
+            root,
+            task_id=task_id,
+            request_id=request_id,
+            disposition="no_new_lesson",
+            reason="nothing much happened here, it was a small change",
+        )
+
+
+@pytest.mark.parametrize(
+    "kwargs, reason",
+    [
+        ({"disposition": "made_up"}, "unknown_disposition"),
+        ({"disposition": "lesson_committed"}, "lesson_committed_requires_commit_id"),
+        (
+            {
+                "disposition": "lesson_committed",
+                "commit_id": "0" * 64,
+                "reason": "mechanical_change_only",
+            },
+            "lesson_committed_takes_no_reason",
+        ),
+        (
+            {
+                "disposition": "no_new_lesson",
+                "reason": "mechanical_change_only",
+                "commit_id": "0" * 64,
+            },
+            "no_new_lesson_takes_no_commit_id",
+        ),
+    ],
+)
+def test_the_two_disposition_shapes_cannot_be_mixed(
+    tmp_path, monkeypatch, kwargs, reason
+):
+    root, task_id, request_id = _setup(tmp_path, monkeypatch)
+
+    with pytest.raises(
+        learning_commit_store.LearningCommitStoreError,
+        match=f"learning_disposition_invalid:{reason}",
+    ):
+        learning_commit_store.record_disposition(
+            root, task_id=task_id, request_id=request_id, **kwargs
+        )
+
+
+def test_replaying_the_identical_disposition_is_idempotent(tmp_path, monkeypatch):
+    root, task_id, request_id = _setup(tmp_path, monkeypatch)
+
+    first = learning_commit_store.record_disposition(
+        root,
+        task_id=task_id,
+        request_id=request_id,
+        disposition="no_new_lesson",
+        reason="no_generalizable_cause",
+    )
+    second = learning_commit_store.record_disposition(
+        root,
+        task_id=task_id,
+        request_id=request_id,
+        disposition="no_new_lesson",
+        reason="no_generalizable_cause",
+    )
+
+    assert first["idempotent"] is False
+    assert second["idempotent"] is True
+    assert second["disposition_id"] == first["disposition_id"]
+    assert second["created_at"] == first["created_at"]
+    assert _disposition_count(root) == 1
+
+
+def test_a_conflicting_second_disposition_is_refused_not_overwritten(
+    tmp_path, monkeypatch
+):
+    """The first close-out is the record of what was judged; last write must not win."""
+    root, task_id, request_id = _setup(tmp_path, monkeypatch)
+    committed = _commit(task_id, request_id)
+    learning_commit_store.record_disposition(
+        root,
+        task_id=task_id,
+        request_id=request_id,
+        disposition="lesson_committed",
+        commit_id=committed["commit_id"],
+    )
+
+    with pytest.raises(
+        learning_commit_store.LearningCommitStoreError,
+        match="learning_disposition_conflict",
+    ):
+        learning_commit_store.record_disposition(
+            root,
+            task_id=task_id,
+            request_id=request_id,
+            disposition="no_new_lesson",
+            reason="mechanical_change_only",
+        )
+
+    stored = learning_commit_store.read_disposition(
+        root, task_id=task_id, request_id=request_id
+    )
+    assert stored["disposition"] == "lesson_committed"
+    assert stored["commit_id"] == committed["commit_id"]
+    assert _disposition_count(root) == 1
+
+
+def test_each_request_on_one_card_is_its_own_decision_identity(tmp_path, monkeypatch):
+    """A card reworked twice was judged twice, and owes a disposition each time."""
+    root, task_id, request_id = _setup(tmp_path, monkeypatch)
+
+    first = learning_commit_store.record_disposition(
+        root,
+        task_id=task_id,
+        request_id=request_id,
+        disposition="no_new_lesson",
+        reason="mechanical_change_only",
+    )
+    second = learning_commit_store.record_disposition(
+        root,
+        task_id=task_id,
+        request_id=request_id + "-rework",
+        disposition="no_new_lesson",
+        reason="evidence_insufficient",
+    )
+
+    assert second["idempotent"] is False
+    assert second["disposition_id"] != first["disposition_id"]
+    assert _disposition_count(root) == 2
+
+
+def _table_exists(root: Path, name: str) -> bool:
+    con = sqlite3.connect(str(task_store.canonical_db_path(root)))
+    try:
+        return (
+            con.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
+            ).fetchone()
+            is not None
+        )
+    finally:
+        con.close()
+
+
+def test_recording_a_disposition_does_not_create_the_lesson_ledger(
+    tmp_path, monkeypatch
+):
+    """One connection owner, but each structure still appears only when written.
+
+    A disposition recorded in a repository that has never committed a lesson
+    must leave ``learning_commits`` absent: coverage reads that table's absence
+    as "no lessons recorded", so creating it as a side effect here would make a
+    repository look like it had a ledger it never wrote to.
+    """
+    root, task_id, request_id = _setup(tmp_path, monkeypatch)
+
+    learning_commit_store.record_disposition(
+        root,
+        task_id=task_id,
+        request_id=request_id,
+        disposition="no_new_lesson",
+        reason="mechanical_change_only",
+    )
+
+    assert _table_exists(root, "learning_dispositions") is True
+    assert _table_exists(root, "learning_commits") is False
+
+
+def test_the_reason_vocabulary_is_matched_exactly_while_the_kind_is_folded(
+    tmp_path, monkeypatch
+):
+    """The documented contract: kind is case-insensitive, reason tokens are not.
+
+    Both are stored lowercase either way, so the asymmetry is only about what a
+    caller may send. Pinning it keeps a later widening of the reason vocabulary
+    to case-insensitive from being an accident nobody noticed.
+    """
+    root, task_id, request_id = _setup(tmp_path, monkeypatch)
+
+    recorded = learning_commit_store.record_disposition(
+        root,
+        task_id=task_id,
+        request_id=request_id,
+        disposition="No_New_Lesson",
+        reason="mechanical_change_only",
+    )
+    assert recorded["disposition"] == "no_new_lesson"
+
+    with pytest.raises(
+        learning_commit_store.LearningCommitStoreError,
+        match="learning_disposition_invalid:unknown_no_new_lesson_reason",
+    ):
+        learning_commit_store.record_disposition(
+            root,
+            task_id=task_id,
+            request_id=request_id + "-upper",
+            disposition="no_new_lesson",
+            reason="MECHANICAL_CHANGE_ONLY",
+        )

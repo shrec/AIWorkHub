@@ -40,7 +40,12 @@ def _card(task_id: str, *, status: str, topic: str, age_days: float) -> tuple:
             json.dumps(card), when, when)
 
 
-def _seed(root: Path, rows: list[tuple], lessons: list[str]) -> None:
+def _seed(
+    root: Path,
+    rows: list[tuple],
+    lessons: list[str],
+    dispositions: list[tuple[str, str, str]] | None = None,
+) -> None:
     db = task_store.canonical_db_path(root)
     with sqlite3.connect(db) as conn:
         conn.executemany(
@@ -61,6 +66,19 @@ def _seed(root: Path, rows: list[tuple], lessons: list[str]) -> None:
                 (task_id + "-c", task_id + "-k", task_id, "r", "repo", "src",
                  "accepted", "{}", "0" * 64, "{}", "completed", "m", "claude",
                  "manager_accept_review", "2026-09-02", "2026-09-02"),
+            )
+        # Dispositions live in their own table, created only when one is
+        # recorded -- so a fixture that seeds none leaves a repository in the
+        # legacy shape, which is the state every existing installation is in.
+        if dispositions:
+            conn.executescript(learning_commit_store._DISPOSITION_SCHEMA)
+        for task_id, disposition, reason in dispositions or []:
+            conn.execute(
+                "INSERT INTO learning_dispositions(disposition_id, task_id,"
+                " request_id, disposition, reason, commit_id, recorded_by,"
+                " created_at) VALUES (?,?,?,?,?,?,?,?)",
+                (task_id + "-d", task_id, "r", disposition, reason,
+                 "" if reason else task_id + "-c", "m", "2026-09-02"),
             )
 
 
@@ -211,3 +229,120 @@ def test_an_undecided_repository_reports_no_run_and_no_percentage(tmp_path: Path
     assert result["decided_cards"] == 0
     assert result["consecutive_recent_without_lesson"] == 0
     assert result["coverage_percent"] is None
+
+
+# --------------------------------------------------------------------------- #
+# disposition coverage
+#
+# Lesson coverage answers "how much was learned" and sat at 49.7%. Reporting it
+# as 100% by counting "nothing new here" as a lesson would destroy the only
+# number that says anything about learning, so the two are measured separately
+# and both are returned. The gap between them is the backlog of decisions
+# nobody closed out either way.
+# --------------------------------------------------------------------------- #
+
+
+def test_a_repository_with_no_disposition_store_owes_every_decision_one(
+    tmp_path: Path,
+):
+    """The table is created on first record, so "no table" must measure."""
+    root = _repo(tmp_path)
+    _seed(root, [_aged("A", 1), _aged("B", 2)], lessons=[])
+
+    result = learning_commit_store.coverage(root)
+
+    assert result["cards_with_disposition"] == 0
+    assert result["cards_without_disposition"] == 2
+    assert result["disposition_coverage_percent"] == 0.0
+    assert result["recent_without_disposition"] == ["A", "B"]
+    assert result["cards_with_lesson"] == 0
+    assert result["coverage_percent"] == 0.0
+
+
+def test_a_legacy_repository_with_lessons_and_no_disposition_table_still_reads(
+    tmp_path: Path,
+):
+    """Every installed repository is in this shape until a call site records one."""
+    root = _repo(tmp_path)
+    _seed(root, [_aged("A", 1), _aged("B", 2)], lessons=["A"])
+
+    with sqlite3.connect(task_store.canonical_db_path(root)) as conn:
+        assert conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='learning_dispositions'"
+        ).fetchone() is None, "the fixture must leave the legacy shape intact"
+
+    result = learning_commit_store.coverage(root)
+
+    assert result["cards_with_lesson"] == 1
+    assert result["coverage_percent"] == 50.0
+    assert result["cards_with_disposition"] == 0
+    assert result["disposition_coverage_percent"] == 0.0
+
+
+def test_lesson_coverage_and_disposition_coverage_are_different_numbers(
+    tmp_path: Path,
+):
+    """A no-new-lesson closes a decision out; it never becomes a lesson."""
+    root = _repo(tmp_path)
+    _seed(
+        root,
+        [_aged("LESSON", 1), _aged("NOTHING_NEW", 2), _aged("UNANSWERED", 3)],
+        lessons=["LESSON"],
+        dispositions=[
+            ("LESSON", learning_commit_store.DISPOSITION_LESSON_COMMITTED, ""),
+            (
+                "NOTHING_NEW",
+                learning_commit_store.DISPOSITION_NO_NEW_LESSON,
+                "mechanical_change_only",
+            ),
+        ],
+    )
+
+    result = learning_commit_store.coverage(root)
+
+    assert result["cards_with_lesson"] == 1
+    assert result["coverage_percent"] == 33.3
+    assert result["cards_with_disposition"] == 2
+    assert result["cards_without_disposition"] == 1
+    assert result["disposition_coverage_percent"] == 66.7
+    assert result["recent_without_disposition"] == ["UNANSWERED"]
+    assert result["coverage_percent"] != result["disposition_coverage_percent"]
+
+
+def test_a_disposition_for_an_uncounted_card_cannot_inflate_the_percentage(
+    tmp_path: Path,
+):
+    """Dispositions are joined to decided cards, so a stray row counts nowhere."""
+    root = _repo(tmp_path)
+    _seed(
+        root,
+        [_aged("REAL", 1), _card("RUNNING", status="processing", topic="coding", age_days=1)],
+        lessons=[],
+        dispositions=[
+            ("RUNNING", learning_commit_store.DISPOSITION_NO_NEW_LESSON,
+             "no_generalizable_cause"),
+            ("GHOST", learning_commit_store.DISPOSITION_NO_NEW_LESSON,
+             "no_generalizable_cause"),
+        ],
+    )
+
+    result = learning_commit_store.coverage(root)
+
+    assert result["decided_cards"] == 1
+    assert result["cards_with_disposition"] == 0
+    assert result["disposition_coverage_percent"] == 0.0
+    assert result["recent_without_disposition"] == ["REAL"]
+
+
+def test_an_undecided_repository_reports_no_disposition_percentage(tmp_path: Path):
+    """An absent denominator is an absent percentage, never zero coverage."""
+    root = _repo(tmp_path)
+    _seed(root, [_card("RUNNING", status="processing", topic="coding", age_days=1)], [])
+
+    result = learning_commit_store.coverage(root)
+
+    assert result["disposition_coverage_percent"] is None
+    assert result["cards_with_disposition"] == 0
+    assert result["cards_without_disposition"] == 0
+    assert result["recent_without_disposition"] == []
