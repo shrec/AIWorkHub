@@ -143,6 +143,7 @@ def test_native_blocked_shape_recovers_current_episode_and_preserves_history(epi
     card = task_store.get_task(episode.repo, episode.task_id)
     assert card["status"] == "pending"
     assert card["claim_epoch"] == 4
+    assert "launch_request_id" not in card
     assert card["rework_predecessor"]["request_id"] == episode.request_id
     assert card["rework_predecessor"]["claim_epoch"] == 3
     assert card["rework_predecessor"]["changed_path_hashes"] == episode.evidence["changed_path_hashes"]
@@ -152,6 +153,7 @@ def test_native_blocked_shape_recovers_current_episode_and_preserves_history(epi
     again = _snapshot(episode)
     assert task_store.recover_blocked_rework(episode.repo, episode.task_id, feedback_reason="Add missing initializer") == (True, "already_recovered")
     assert _snapshot(episode) == again
+    assert task_store.archive_task(episode.repo, episode.task_id, reason="done") == (True, "archived")
 
 
 def test_review_rejection_recovers_the_exact_current_successful_payload(episode):

@@ -5636,6 +5636,11 @@ def recover_blocked_rework(
         }
 
         prior_episode_summary = begin_claim_episode(card)
+        # Recovery starts a new, unclaimed episode. The previous request ID is
+        # append-only history in task_events/recovery_predecessor, not a live
+        # reservation; retaining it makes archive/retention mistake this
+        # pending card for a reviewer that is still preparing.
+        card.pop("launch_request_id", None)
 
         card["claim_epoch"] = claim_epoch
         card["recovery_epoch"] = claim_epoch
