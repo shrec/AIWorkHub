@@ -34,6 +34,8 @@ import re
 import sys
 from pathlib import Path
 
+import pytest
+
 from aiworkhub import __version__, callback_bridge, core, dashboard_mcp_app, task_store  # noqa: E402
 
 _TOOL_ROOT = Path(__file__).resolve().parents[1]
@@ -320,3 +322,114 @@ def test_extension_dispatcher_tools_match_the_python_server_contract():
     assert 'ensureStarted: "aiworkhub_dispatcher_ensure_started"' in _EXTENSION_JS
     assert 'health: "aiworkhub_dispatcher_health"' in _EXTENSION_JS
     assert 'stop: "aiworkhub_dispatcher_stop"' in _EXTENSION_JS
+
+
+# ---------------------------------------------------------------------------
+# 7. OpenCode's application-global MCP registration never carries a
+#    repository path -- the same core.repo_root() precedence Codex and
+#    Claude already rely on binds an OpenCode-launched MCP child from its own
+#    process cwd, and an explicit workspace-local binding still fails closed
+#    on a mismatch rather than silently crossing repositories.
+# ---------------------------------------------------------------------------
+
+def test_opencode_global_mcp_entry_never_persists_repository_identity_keys():
+    body = _slice(_EXTENSION_JS, "function repairOpencodeConfigJsonObject(", 3200)
+    assert "OPENCODE_REPO_IDENTITY_ENV_KEYS" in body
+    assert "delete environment[key]" in body
+    keys_block = _slice(_EXTENSION_JS, "const OPENCODE_REPO_IDENTITY_ENV_KEYS = Object.freeze([", 200)
+    for key in ("AIWORKHUB_REPO_ROOT", "AIWORKHUB_REPO", "AIWORKHUB_REPO_ID"):
+        assert f'"{key}"' in keys_block
+
+
+def test_opencode_global_mcp_repair_strips_every_owned_entry_and_names_the_canonical_one():
+    # OWNED_MCP_SERVER_NAMES legitimately contains two distinct entries
+    # ("aiworkhub" and "aiworkhub_ultrafast"); repair must not stop at the
+    # first one it finds, and the entry that gets re-pointed at the stable
+    # launcher must be chosen by an explicit canonical NAME -- JSON object key
+    # ordering is not a policy. The executing regression that drives the real
+    # JavaScript through a node child lives in
+    # tests/test_opencode_workforce_integration.py.
+    body = _slice(_EXTENSION_JS, "function repairOpencodeConfigJsonObject(", 3200)
+    loop_start = body.index("for (const [name, entry] of Object.entries(servers)) {")
+    loop_end = body.index("\n  }\n", loop_start)
+    loop_body = body[loop_start:loop_end]
+    assert "break" not in loop_body
+    assert "ownedName" not in body
+    assert 'const CANONICAL_OPENCODE_MCP_SERVER_NAME = "aiworkhub";' in _EXTENSION_JS
+    assert "const name = CANONICAL_OPENCODE_MCP_SERVER_NAME;" in body
+
+
+def test_extension_expected_mcp_package_version_tracks_the_canonical_release_version():
+    # src/aiworkhub/_version.py is the single source of truth; a drifting
+    # projection here makes the extension refuse the installed MCP package at
+    # preflight (see scripts/release_metadata.py).
+    assert f'const EXPECTED_MCP_PACKAGE_VERSION = "{__version__}";' in _EXTENSION_JS
+
+
+def test_opencode_registration_runs_at_activation_before_workspace_repair():
+    body = _slice(_EXTENSION_JS, 'debugTrace("activation.config_repair.begin");', 400)
+    codex_index = body.index("ensureCodexStableMcpRegistered(context)")
+    opencode_index = body.index("ensureOpencodeMcpRegistered(context)")
+    workspace_index = body.index("ensureWorkspaceMcpConfigsRepaired(context)")
+    assert codex_index < opencode_index < workspace_index
+
+
+def test_opencode_process_launched_in_repository_b_binds_mcp_to_b_even_though_registration_predates_it(
+    tmp_path, monkeypatch
+):
+    repo_a = tmp_path / "repo_a"
+    repo_b = tmp_path / "repo_b"
+    for root in (repo_a, repo_b):
+        root.mkdir()
+        assert task_store.initialize_repository(root)["ok"]
+
+    # The global OpenCode registration is written once, while repository A is
+    # active, and -- unlike the workspace-local Claude/.mcp.json entry -- it
+    # never bakes AIWORKHUB_REPO_ROOT/AIWORKHUB_REPO/AIWORKHUB_REPO_ID into the
+    # entry (see repairOpencodeConfigJsonObject in extension.js). A later
+    # OpenCode process therefore always resolves its own cwd through the real
+    # production resolver, never whatever repository happened to be active
+    # when the registration file was first written. This exercises the
+    # actual cwd-walking resolver (no monkeypatch of resolve_repository_root
+    # itself), which is what proves cwd precedence rather than assuming it.
+    monkeypatch.delenv("AIWORKHUB_REPO_ROOT", raising=False)
+    monkeypatch.delenv("AIWORKHUB_REPO", raising=False)
+    # Neutralize the two precedence tiers that sit between the env binding and
+    # the cwd resolver -- a process-local manager switch and a live Codex chat
+    # route -- so this asserts the cwd tier and nothing else. The production
+    # resolver itself (repository_state.resolve_repository_root, reached through
+    # core.repo_root) is deliberately NOT patched: it is the behavior under test.
+    monkeypatch.setattr(core, "_PROCESS_REPO_ROOT_OVERRIDE", None, raising=False)
+    monkeypatch.setattr(core, "_implicit_codex_repository_root", lambda: None)
+
+    monkeypatch.chdir(repo_b)
+    assert core.repo_root() == repo_b.resolve()
+
+    # Same process, same application-global registration: the binding follows
+    # the cwd, so an OpenCode session started in repository A binds to A.
+    monkeypatch.chdir(repo_a)
+    assert core.repo_root() == repo_a.resolve()
+
+
+def test_explicit_workspace_local_opencode_binding_is_immutable_and_fails_closed_on_mismatch(
+    tmp_path, monkeypatch
+):
+    repo_a = tmp_path / "repo_a"
+    repo_b = tmp_path / "repo_b"
+    for root in (repo_a, repo_b):
+        root.mkdir()
+        assert task_store.initialize_repository(root)["ok"]
+
+    # An explicitly workspace-local OpenCode project config (mirroring Claude
+    # Code's .mcp.json, which repairClaudeMcpConfigObject bakes a repository
+    # path into on purpose) sets both env vars to the SAME repository -- that
+    # binding is immutable and must never be silently overridden.
+    monkeypatch.setenv("AIWORKHUB_REPO_ROOT", str(repo_a))
+    monkeypatch.setenv("AIWORKHUB_REPO", str(repo_a))
+    assert core.repo_root() == repo_a.resolve()
+
+    # A mismatched pair -- as if a stale/foreign binding crossed repositories
+    # -- fails closed with a named error instead of silently picking one.
+    monkeypatch.setenv("AIWORKHUB_REPO", str(repo_b))
+    with pytest.raises(RuntimeError, match="repo_root_env_mismatch"):
+        core.repo_root()

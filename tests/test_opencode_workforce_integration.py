@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import shutil
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -405,3 +407,193 @@ def test_listing_probe_does_not_mark_access_observed(
     assert _FREE in status["observed_models"]
     assert _PAID not in status["observed_models"]
     assert "round_trip_observed" not in status
+
+
+def test_opencode_worker_mcp_config_never_bakes_repository_identity() -> None:
+    # The generated worker MCP config is request-local (see
+    # test_opencode_worker_mcp_config_is_request_local_and_secret_free in
+    # tests/test_opencode_runtime_adapter.py); it must also never carry a
+    # repository-identity env var, the same repository-neutral contract the
+    # VS Code extension's application-global OpenCode MCP registration
+    # enforces for repairOpencodeConfigJsonObject.
+    config = runtime_adapters.build_opencode_worker_mcp_config(["python3", "-m", "aiworkhub.server"])
+    serialized = json.dumps(config)
+    assert "AIWORKHUB_REPO" not in serialized
+
+
+# ---------------------------------------------------------------------------
+# The VS Code extension's application-global OpenCode MCP registration is
+# JavaScript, so a Python string-slice assertion can only prove the source
+# *looks* right. The helper below executes the shipped functions in a real
+# ``node`` child and asserts on their actual output, under the pytest command
+# this repository declares as validation (``node --test`` is never run).
+# ---------------------------------------------------------------------------
+
+_EXTENSION_JS_PATH = Path(__file__).resolve().parents[1] / "vscode-extension" / "extension.js"
+_REPO_IDENTITY_ENV_KEYS = ("AIWORKHUB_REPO_ROOT", "AIWORKHUB_REPO", "AIWORKHUB_REPO_ID")
+
+# extension.js requires("vscode") at module scope; that module exists only
+# inside a running VS Code extension host. None of the pure functions driven
+# here touch vscode.* at require time, so a minimal stub loads the real module.
+_NODE_DRIVER_PRELUDE = r"""
+"use strict";
+const Module = require("node:module");
+const VSCODE_STUB_ID = "\0aiworkhub-vscode-stub";
+const originalResolveFilename = Module._resolveFilename;
+Module._resolveFilename = function patchedResolveFilename(request, ...rest) {
+  if (request === "vscode") return VSCODE_STUB_ID;
+  return originalResolveFilename.call(this, request, ...rest);
+};
+require.cache[VSCODE_STUB_ID] = {
+  id: VSCODE_STUB_ID,
+  filename: VSCODE_STUB_ID,
+  loaded: true,
+  exports: {
+    workspace: {
+      getConfiguration: () => ({ get: (_key, fallback) => fallback }),
+      workspaceFolders: [],
+    },
+    window: {},
+    commands: {},
+    extensions: { getExtension: () => null },
+    ConfigurationTarget: { Global: 1 },
+  },
+};
+"""
+
+
+def _drive_extension_internals(tmp_path: Path, expression: str):
+    """Run ``expression`` against extension.js's real exported internals."""
+    node = shutil.which("node")
+    if node is None:  # pragma: no cover - node ships with the extension toolchain
+        pytest.skip("node is required to execute vscode-extension/extension.js")
+    script = tmp_path / "drive_extension_internals.js"
+    script.write_text(
+        _NODE_DRIVER_PRELUDE
+        + f"const {{ __testInternals }} = require({json.dumps(str(_EXTENSION_JS_PATH))});\n"
+        + f"const main = {expression};\n"
+        + "process.stdout.write(JSON.stringify(main(__testInternals)));\n",
+        encoding="utf-8",
+    )
+    proc = subprocess.run(
+        [node, str(script)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        cwd=str(tmp_path),
+    )
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(proc.stdout)
+
+
+def test_opencode_global_mcp_entry_is_created_repository_neutral(tmp_path: Path) -> None:
+    result = _drive_extension_internals(
+        tmp_path,
+        """(internals) => internals.repairOpencodeConfigJsonObject({}, ["python3", "/launcher.py"])""",
+    )
+    assert result["changed"] is True
+    entry = result["document"]["mcp"]["aiworkhub"]
+    assert entry["type"] == "local"
+    assert entry["command"] == ["python3", "/launcher.py"]
+    assert entry["enabled"] is True
+    for key in _REPO_IDENTITY_ENV_KEYS:
+        assert key not in entry["environment"]
+
+
+def test_opencode_global_mcp_repair_sanitizes_both_owned_entries_and_picks_the_canonical_one(
+    tmp_path: Path,
+) -> None:
+    # Two AIWorkHub-owned entries coexist and "aiworkhub_ultrafast" is declared
+    # FIRST on purpose: repair must sanitize BOTH, and must re-point the
+    # canonical "aiworkhub" entry -- selected by name, never by whichever owned
+    # entry happens to come first in Object.entries -- at the stable launcher.
+    result = _drive_extension_internals(
+        tmp_path,
+        """(internals) => internals.repairOpencodeConfigJsonObject({
+          theme: "dark",
+          mcp: {
+            aiworkhub_ultrafast: {
+              type: "local",
+              command: ["stale-python", "/old/ultrafast-launcher.py"],
+              environment: {
+                AIWORKHUB_REPO_ROOT: "/repo/a",
+                AIWORKHUB_REPO: "/repo/a",
+                AIWORKHUB_REPO_ID: "repo_deadbeef",
+                KEEP_ME: "ultrafast-flag",
+              },
+            },
+            aiworkhub: {
+              type: "local",
+              command: ["stale-python", "/old/launcher.py"],
+              enabled: false,
+              environment: {
+                AIWORKHUB_REPO_ROOT: "/repo/a",
+                AIWORKHUB_REPO: "/repo/a",
+                AIWORKHUB_REPO_ID: "repo_deadbeef",
+                AIWORKHUB_ALLOW_WRITES: "0",
+                SOME_SECRET: "keep-me",
+              },
+            },
+            "unrelated-server": {
+              type: "local",
+              command: ["node", "unrelated.js"],
+              environment: { AIWORKHUB_REPO_ROOT: "/should/not/be/touched" },
+            },
+          },
+        }, ["python3", "/new/launcher.py"])""",
+    )
+    assert result["changed"] is True
+    document = result["document"]
+    assert document["theme"] == "dark"
+    servers = document["mcp"]
+
+    # No AIWorkHub-owned entry retains ANY repository-identity key.
+    for owned_name in ("aiworkhub", "aiworkhub_ultrafast"):
+        environment = servers[owned_name]["environment"]
+        for key in _REPO_IDENTITY_ENV_KEYS:
+            assert key not in environment, f"{owned_name} still carries {key}"
+
+    # The canonical entry is the one re-pointed at the stable launcher.
+    assert servers["aiworkhub"]["command"] == ["python3", "/new/launcher.py"]
+    assert servers["aiworkhub_ultrafast"]["command"] == [
+        "stale-python",
+        "/old/ultrafast-launcher.py",
+    ]
+
+    # Secrets, capability gates and an operator-disabled flag survive repair.
+    assert servers["aiworkhub"]["environment"]["SOME_SECRET"] == "keep-me"
+    assert servers["aiworkhub"]["environment"]["AIWORKHUB_ALLOW_WRITES"] == "0"
+    assert servers["aiworkhub"]["enabled"] is False
+    assert servers["aiworkhub_ultrafast"]["environment"]["KEEP_ME"] == "ultrafast-flag"
+
+    # An unrelated MCP registration is never rewritten, not even its env.
+    assert servers["unrelated-server"] == {
+        "type": "local",
+        "command": ["node", "unrelated.js"],
+        "environment": {"AIWORKHUB_REPO_ROOT": "/should/not/be/touched"},
+    }
+
+
+def test_opencode_global_mcp_repair_is_idempotent(tmp_path: Path) -> None:
+    result = _drive_extension_internals(
+        tmp_path,
+        """(internals) => {
+          const first = internals.repairOpencodeConfigJsonObject({}, ["python3", "/launcher.py"]);
+          const second = internals.repairOpencodeConfigJsonObject(first.document, ["python3", "/launcher.py"]);
+          return { first: first.changed, second: second.changed };
+        }""",
+    )
+    assert result == {"first": True, "second": False}
+
+
+def test_opencode_registration_leaves_codex_and_claude_repair_helpers_untouched(
+    tmp_path: Path,
+) -> None:
+    # Codex and Claude keep their own, deliberately repository-bound helpers;
+    # the OpenCode work must not have merged them into one code path.
+    result = _drive_extension_internals(
+        tmp_path,
+        """(internals) => Object.keys(internals).sort()""",
+    )
+    assert "repairOpencodeConfigJsonObject" in result
+    assert "repairClaudeMcpConfigObject" in result

@@ -7307,6 +7307,230 @@ function ensureCodexManagerGatesRepaired() {
   }
 }
 
+// ── OpenCode global MCP registration (repository-neutral) ──────────────────
+// OpenCode reads its MCP servers from one application-global config file
+// (opencode.json), never a per-repository one, so this entry must never carry
+// a repository path -- the last window/repo to (re)register would otherwise
+// silently steal every other window's binding, exactly like the Codex
+// application-global mcp_servers.aiworkhub table above. The MCP child instead
+// resolves its own repository from its process cwd (core.repo_root()'s
+// implicit fallback). An operator-authored, explicitly workspace-local
+// OpenCode project config is never touched here, and core.repo_root() fails
+// closed on a mismatch rather than silently crossing repositories.
+function resolveOpencodeConfigJsonPath(env) {
+  const source = env || process.env || {};
+  const explicit = String(source.OPENCODE_CONFIG || "").trim();
+  if (explicit) return explicit;
+  const configHome = String(source.XDG_CONFIG_HOME || "").trim() || path.join(os.homedir(), ".config");
+  const dir = path.join(configHome, "opencode");
+  const jsonPath = path.join(dir, "opencode.json");
+  const jsoncPath = path.join(dir, "opencode.jsonc");
+  // OpenCode's one application-global config file may be named opencode.json
+  // or the comment/trailing-comma tolerant opencode.jsonc. When neither
+  // exists yet, opencode.json is the canonical creation target. When exactly
+  // one exists on disk, that file is the effective target regardless of its
+  // name. When both exist, opencode.json -- the plain, unambiguous name --
+  // takes precedence as a deterministic choice.
+  if (!fs.existsSync(jsonPath) && fs.existsSync(jsoncPath)) return jsoncPath;
+  return jsonPath;
+}
+
+function opencodeConfigJsonPath() {
+  return resolveOpencodeConfigJsonPath(process.env);
+}
+
+// The exact AIWorkHub-owned repository-identity keys a global OpenCode entry
+// must never persist. Any other environment key (secrets, capability gates,
+// backend selection) is left untouched by the repair below.
+const OPENCODE_REPO_IDENTITY_ENV_KEYS = Object.freeze([
+  "AIWORKHUB_REPO_ROOT",
+  "AIWORKHUB_REPO",
+  "AIWORKHUB_REPO_ID",
+]);
+
+function isOwnedOpencodeMcpEntry(name, entry) {
+  if (OWNED_MCP_SERVER_NAMES.has(String(name || "").toLowerCase())) return true;
+  const command = entry && Array.isArray(entry.command) ? entry.command.map(String) : [];
+  return command.some((token) => token === "aiworkhub.server" || /aiworkhub-mcp-server\.py$/.test(token));
+}
+
+// The one OpenCode MCP entry this extension creates and keeps pointed at the
+// host-stable launcher. It is selected by this exact name, never by whichever
+// AIWorkHub-owned entry happens to come first in `Object.entries(document.mcp)`:
+// JSON object ordering is not a policy, and letting it decide would silently
+// overwrite a deliberately separate registration's type/command.
+const CANONICAL_OPENCODE_MCP_SERVER_NAME = "aiworkhub";
+
+/** Pure repair of an in-memory opencode.json document: create or repair the
+ * canonical AIWorkHub-owned entry to point at the host-stable launcher, and
+ * strip only AIWorkHub-owned repository-identity keys from the environment of
+ * EVERY AIWorkHub-owned entry.
+ * Every other MCP entry, every non-`mcp` top-level key (permission, theme,
+ * model, ...), and every other environment key already on an owned entry
+ * (secrets, capability gates, backend selection) is left byte-for-byte
+ * untouched. An existing `enabled` value is preserved so an operator can
+ * still disable the entry. */
+function repairOpencodeConfigJsonObject(document, launcherArgs) {
+  let changed = false;
+  if (!document || typeof document !== "object" || Array.isArray(document)) {
+    document = {};
+    changed = true;
+  }
+  if (!document.mcp || typeof document.mcp !== "object" || Array.isArray(document.mcp)) {
+    document.mcp = {};
+  }
+  const servers = document.mcp;
+  // Sanitize EVERY AIWorkHub-owned entry ("aiworkhub" and "aiworkhub_ultrafast"
+  // can coexist as distinct, deliberately separate registrations, and an
+  // operator may have added an owned entry under another name), not just one --
+  // otherwise a second owned entry keeps a stale repository binding forever.
+  // Only the canonical entry below has its type/command rewritten: AIWorkHub
+  // does not own the launcher choice of an entry it did not name.
+  for (const [name, entry] of Object.entries(servers)) {
+    if (!entry || typeof entry !== "object" || !isOwnedOpencodeMcpEntry(name, entry)) continue;
+    const environment = entry.environment && typeof entry.environment === "object" ? entry.environment : null;
+    if (!environment) continue;
+    for (const key of OPENCODE_REPO_IDENTITY_ENV_KEYS) {
+      if (Object.prototype.hasOwnProperty.call(environment, key)) {
+        delete environment[key];
+        changed = true;
+      }
+    }
+  }
+  const name = CANONICAL_OPENCODE_MCP_SERVER_NAME;
+  const current = servers[name];
+  const existing = current && typeof current === "object" && !Array.isArray(current) ? current : null;
+  const nextEnvironment = {
+    ...(existing && existing.environment && typeof existing.environment === "object" ? existing.environment : {}),
+  };
+  if (!Object.prototype.hasOwnProperty.call(nextEnvironment, "AIWORKHUB_MCP_STDIO_BACKEND")) {
+    nextEnvironment.AIWORKHUB_MCP_STDIO_BACKEND = "stdlib";
+  }
+  if (!Object.prototype.hasOwnProperty.call(nextEnvironment, "AIWORKHUB_ALLOW_WRITES")) {
+    nextEnvironment.AIWORKHUB_ALLOW_WRITES = "1";
+  }
+  if (!Object.prototype.hasOwnProperty.call(nextEnvironment, "AIWORKHUB_ALLOW_LAUNCH")) {
+    nextEnvironment.AIWORKHUB_ALLOW_LAUNCH = "1";
+  }
+  const next = {
+    ...(existing && typeof existing === "object" ? existing : {}),
+    type: "local",
+    command: launcherArgs,
+    environment: nextEnvironment,
+    enabled: existing && typeof existing.enabled === "boolean" ? existing.enabled : true,
+  };
+  if (JSON.stringify(next) !== JSON.stringify(existing)) {
+    servers[name] = next;
+    changed = true;
+  }
+  return { document, changed };
+}
+
+/** Read and parse an existing opencode.json/opencode.jsonc document.
+ *
+ * Returns `{ ok: true, exists, document }` when the file is absent (safe to
+ * create fresh) or its content is strict JSON. Returns `{ ok: false, reason
+ * }` for anything else: `JSON.parse` cannot read OpenCode's comment- and
+ * trailing-comma-tolerant opencode.jsonc, and with no proven lossless JSONC
+ * edit path available, that content -- like a genuinely corrupt or
+ * permission-denied file -- must fail closed and stay byte-for-byte
+ * untouched rather than being silently replaced with an empty document.
+ */
+function readOpencodeConfigDocument(configPath) {
+  let rawText;
+  try {
+    rawText = fs.readFileSync(configPath, "utf8");
+  } catch (err) {
+    if (err && err.code === "ENOENT") {
+      return { ok: true, exists: false, document: {} };
+    }
+    return { ok: false, reason: sanitizeErrorMessage(err) };
+  }
+  try {
+    return { ok: true, exists: true, document: JSON.parse(rawText) };
+  } catch (err) {
+    return { ok: false, reason: sanitizeErrorMessage(err) };
+  }
+}
+
+/** Same-directory atomic JSON write that preserves an existing file's POSIX
+ * permission bits instead of letting the temp-file/rename path fall back to
+ * the process umask default. A brand-new file is created with
+ * `restrictiveCreateMode` (default 0600) rather than the process default,
+ * since the OpenCode global MCP registration's environment can carry
+ * operator-set secret values. Kept separate from the general-purpose
+ * `atomicWriteJson` so its many other, non-secret-bearing callers are
+ * unaffected.
+ */
+function atomicWriteJsonPreservingMode(file, payload, options = {}) {
+  const restrictiveCreateMode = typeof options.restrictiveCreateMode === "number" ? options.restrictiveCreateMode : 0o600;
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  let existingMode = null;
+  try {
+    existingMode = fs.statSync(file).mode & 0o777;
+  } catch (_err) {
+    existingMode = null;
+  }
+  const mode = existingMode !== null ? existingMode : restrictiveCreateMode;
+  const nonce = crypto.randomBytes(6).toString("hex");
+  const tmp = path.join(path.dirname(file), `.${path.basename(file)}.${process.pid}.${Date.now()}.${nonce}.tmp`);
+  try {
+    fs.writeFileSync(tmp, `${JSON.stringify(payload, null, 2)}\n`, { encoding: "utf8", mode });
+    if (process.platform !== "win32") {
+      // writeFileSync's create-time mode above already applies `mode`
+      // (subject to umask); this chmod only tightens bits umask stripped.
+      // Some sandboxes/policy-managed filesystems deny chmod outright even
+      // on a file the process just created, so treat it as best-effort
+      // rather than aborting a registration that already got a reasonable
+      // permission at creation time.
+      try {
+        fs.chmodSync(tmp, mode);
+      } catch (_chmodErr) {
+        // Best-effort only; see comment above.
+      }
+    }
+    fs.renameSync(tmp, file);
+  } catch (err) {
+    try {
+      fs.unlinkSync(tmp);
+    } catch (_cleanupErr) {
+      // Best-effort cleanup; preserve the original filesystem failure.
+    }
+    throw err;
+  }
+}
+
+/** Activation-time counterpart to ensureCodexStableMcpRegistered: register or
+ * repair the application-global OpenCode AIWorkHub MCP entry, pointed at the
+ * same host-stable launcher Codex uses. An unreadable, corrupt, or
+ * JSONC-with-comments config fails closed and is left byte-for-byte
+ * untouched rather than risking data loss; an unwritable config is logged
+ * and left alone.
+ */
+function ensureOpencodeMcpRegistered(context) {
+  const configPath = resolveOpencodeConfigJsonPath(process.env);
+  const read = readOpencodeConfigDocument(configPath);
+  if (!read.ok) {
+    if (outputChannel) {
+      outputChannel.appendLine(`[opencode] existing config is unreadable or not strict JSON; leaving it untouched: ${read.reason}`);
+    }
+    return false;
+  }
+  const launcher = materializeStableMcpLauncher(context);
+  const python = findPythonCommand(os.homedir(), { preflight: false });
+  const launcherArgs = [python.command, ...(Array.isArray(python.argsPrefix) ? python.argsPrefix : []), launcher];
+  const result = repairOpencodeConfigJsonObject(read.document, launcherArgs);
+  if (!result.changed) return false;
+  try {
+    atomicWriteJsonPreservingMode(configPath, result.document);
+    if (outputChannel) outputChannel.appendLine("[opencode] registered the AIWorkHub MCP host-stable launcher");
+    return true;
+  } catch (err) {
+    if (outputChannel) outputChannel.appendLine(`[opencode] failed to register AIWorkHub MCP: ${sanitizeErrorMessage(err)}`);
+    return false;
+  }
+}
+
 /** Materialize the same-host App Server mux launcher at a stable host-local
  * path. It is advertised only after OpenAI's extension is proven co-located;
  * the setting is excluded from Settings Sync and repaired independently on
@@ -11044,6 +11268,7 @@ async function activate(context) {
   outputChannel.appendLine(`[runtime] using ${runtimeLabel}`);
   debugTrace("activation.config_repair.begin");
   ensureCodexStableMcpRegistered(context);
+  ensureOpencodeMcpRegistered(context);
   ensureWorkspaceMcpConfigsRepaired(context);
   debugTrace("activation.config_repair.end");
 
@@ -11202,6 +11427,13 @@ module.exports = {
     ensureCodexStableMcpRegistrationTomlText,
     materializeStableMcpLauncher,
     ensureCodexStableMcpRegistered,
+    resolveOpencodeConfigJsonPath,
+    opencodeConfigJsonPath,
+    isOwnedOpencodeMcpEntry,
+    repairOpencodeConfigJsonObject,
+    readOpencodeConfigDocument,
+    atomicWriteJsonPreservingMode,
+    ensureOpencodeMcpRegistered,
     splitCodexPythonPathValue,
     ensureCodexConfigTomlRepaired,
     CODEX_OWNED_RUNTIME_SEGMENT_RE,
