@@ -117,6 +117,192 @@ def _retained_terminal_failure_fixture(
     return repo, candidate, evidence["changed_path_hashes"]
 
 
+def _no_candidate_terminal_failure_fixture(tmp_path: Path) -> tuple[Path, str, str]:
+    repo = _setup_repo(tmp_path)
+    task_id = "BLOCKED_NO_CANDIDATE_PROVIDER_FAILURE"
+    request_id = "d" * 32
+    _insert_processing_task(
+        repo,
+        task_id,
+        request_id=request_id,
+        required_outputs=["src/aiworkhub/task_store.py"],
+    )
+    evidence = {
+        "adapter_id": "claude_cli",
+        "error": "worker_failed:runtime_error:exit_code=1",
+        "exit_code": 1,
+        "failure_class": "unknown",
+        "request_id": request_id,
+        "required_outputs": [
+            {
+                "bytes": None,
+                "missing": True,
+                "path": "src/aiworkhub/task_store.py",
+                "reason": "worker_terminal_before_output_validation",
+                "sha256": "",
+            }
+        ],
+    }
+    assert task_store.mark_terminal_failure(
+        repo,
+        task_id,
+        runner="codex_worker_test",
+        substatus="worker_failed",
+        evidence=evidence,
+        request_id=request_id,
+        claim_epoch=1,
+    ) == (True, "blocked")
+    return repo, task_id, request_id
+
+
+def _rewrite_no_candidate_failure(
+    repo: Path,
+    task_id: str,
+    mutate,
+) -> None:
+    card = _get_card(repo, task_id)
+    failure = card["terminal_failure"]
+    mutate(card, failure)
+    _ready, db_path = task_store._require_ready(repo)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE tasks SET card_json=? WHERE task_id=?",
+            (json.dumps(card), task_id),
+        )
+        conn.execute(
+            "UPDATE task_events SET payload_json=? "
+            "WHERE task_id=? AND event='terminal_failure'",
+            (json.dumps(failure), task_id),
+        )
+
+
+def test_clean_root_recovers_authenticated_terminal_failure_without_candidate(
+    tmp_path: Path,
+) -> None:
+    repo, task_id, request_id = _no_candidate_terminal_failure_fixture(tmp_path)
+
+    assert task_store.recover_blocked_rework(
+        repo,
+        task_id,
+        actor="coordinator",
+        feedback_reason="Retry provider failure from the canonical root",
+        clean_root_if_predecessor_missing=True,
+    ) == (True, "recovered")
+
+    card = _get_card(repo, task_id)
+    assert card["status"] == "pending"
+    assert "rework_predecessor" not in card
+    assert card["recovery_mode"] == "clean_root_no_candidate_terminal_failure"
+    authorization = card["clean_root_recovery_authorization"]
+    assert authorization["schema_id"] == (
+        "aiworkhub.clean_root_no_candidate_authority.v1"
+    )
+    assert authorization["predecessor_request_id"] == request_id
+    assert authorization["changed_path_hashes"] == {}
+    assert authorization["claim_epoch"] == 2
+    assert card["recovery_predecessor"]["changed_path_hashes"] == {}
+    assert task_store.recover_blocked_rework(
+        repo,
+        task_id,
+        actor="coordinator",
+        feedback_reason="Retry provider failure from the canonical root",
+        clean_root_if_predecessor_missing=True,
+    ) == (True, "already_recovered")
+
+
+def test_no_candidate_terminal_failure_requires_explicit_clean_root(
+    tmp_path: Path,
+) -> None:
+    repo, task_id, _request_id = _no_candidate_terminal_failure_fixture(tmp_path)
+
+    ok, state = task_store.recover_blocked_rework(
+        repo,
+        task_id,
+        actor="coordinator",
+        feedback_reason="Retry provider failure from the canonical root",
+    )
+
+    assert (ok, state) == (
+        False,
+        "retained_terminal_candidate_identity_invalid",
+    )
+    assert _get_card(repo, task_id)["status"] == "blocked"
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected"),
+    [
+        ("claim_epoch", "retained_terminal_candidate_claim_epoch_invalid"),
+        ("launch_request_id", "clean_root_no_candidate_identity_invalid"),
+        ("live_pid", "retained_terminal_candidate_process_live"),
+        ("completed_output", "clean_root_no_candidate_identity_invalid"),
+        ("candidate_metadata", "retained_terminal_candidate_identity_invalid"),
+        ("workspace_present", "clean_root_no_candidate_workspace_still_available"),
+    ],
+)
+def test_clean_root_no_candidate_recovery_fails_closed(
+    tmp_path: Path,
+    mutation: str,
+    expected: str,
+) -> None:
+    repo, task_id, request_id = _no_candidate_terminal_failure_fixture(tmp_path)
+
+    if mutation == "claim_epoch":
+        _rewrite_no_candidate_failure(
+            repo, task_id, lambda card, _failure: card.update(claim_epoch=2)
+        )
+    elif mutation == "launch_request_id":
+        _rewrite_no_candidate_failure(
+            repo,
+            task_id,
+            lambda card, _failure: card.update(launch_request_id="e" * 32),
+        )
+    elif mutation == "live_pid":
+        _rewrite_no_candidate_failure(
+            repo,
+            task_id,
+            lambda _card, failure: failure["evidence"].update(
+                stall_supervisor_pid=os.getpid()
+            ),
+        )
+    elif mutation == "completed_output":
+        _rewrite_no_candidate_failure(
+            repo,
+            task_id,
+            lambda _card, failure: failure["evidence"]["required_outputs"][0].update(
+                missing=False,
+                bytes=1,
+                sha256="f" * 64,
+            ),
+        )
+    elif mutation == "candidate_metadata":
+        _rewrite_no_candidate_failure(
+            repo,
+            task_id,
+            lambda _card, failure: failure["evidence"].update(
+                changed_paths=["src/aiworkhub/task_store.py"]
+            ),
+        )
+    elif mutation == "workspace_present":
+        (
+            repo
+            / ".aiworkhub"
+            / "runtime"
+            / "worktrees"
+            / request_id
+            / "worktree"
+        ).mkdir(parents=True)
+
+    assert task_store.recover_blocked_rework(
+        repo,
+        task_id,
+        actor="coordinator",
+        feedback_reason="Retry provider failure from the canonical root",
+        clean_root_if_predecessor_missing=True,
+    ) == (False, expected)
+    assert _get_card(repo, task_id)["status"] == "blocked"
+
+
 @pytest.mark.parametrize("validation_only_replay", [False, True])
 @pytest.mark.parametrize("required_outputs", [False, True])
 def test_recover_blocked_terminal_failure_retained_delta_without_required_outputs(

@@ -4135,6 +4135,148 @@ _REWORK_ELIGIBLE_SUBSTATUSES: frozenset[str] = frozenset(
     }
 )
 
+_NO_CANDIDATE_RECOVERY_SUBSTATUSES: frozenset[str] = frozenset(
+    {
+        "worker_failed",
+        "launch_failed",
+        "timed_out",
+        "liveness_lost",
+        "process_lost",
+    }
+)
+
+
+def _clean_root_no_candidate_failure_authority(
+    root: str | Path,
+    task_id: str,
+    *,
+    card: dict[str, Any],
+    terminal_review: dict[str, Any],
+    terminal_runner: str,
+) -> tuple[bool, str, dict[str, Any]]:
+    """Authenticate one terminal provider failure that produced no candidate.
+
+    This is deliberately narrower than retained-candidate recovery: it applies
+    only when the terminal event is the card's exact event, no candidate
+    metadata or bytes exist, and the request worktree is absent.
+    """
+
+    recorded_failure = card.get("terminal_failure")
+    if recorded_failure != terminal_review:
+        return False, "retained_terminal_candidate_event_mismatch", {}
+
+    claim_epoch = terminal_review.get("claim_epoch")
+    if (
+        type(claim_epoch) is not int
+        or claim_epoch < 1
+        or type(card.get("claim_epoch")) is not int
+        or card.get("claim_epoch") != claim_epoch
+    ):
+        return False, "retained_terminal_candidate_claim_epoch_invalid", {}
+
+    evidence = terminal_review.get("evidence")
+    if not isinstance(evidence, dict):
+        return False, "clean_root_no_candidate_evidence_invalid", {}
+
+    # Any candidate-bearing evidence belongs to the existing hash-pinned path.
+    # Returning not_applicable lets that path validate it without weakening it.
+    if (
+        evidence.get("changed_paths") not in (None, [])
+        or evidence.get("changed_path_hashes") not in (None, {})
+        or evidence.get("python_candidate_authority") not in (None, {})
+        or evidence.get("workspace") not in (None, {})
+    ):
+        return False, "clean_root_no_candidate_not_applicable", {}
+
+    request_id = str(terminal_review.get("request_id") or "").strip()
+    terminal_substatus = str(terminal_review.get("substatus") or "").strip()
+    required_outputs = evidence.get("required_outputs")
+    if (
+        len(request_id) != 32
+        or any(ch not in "0123456789abcdef" for ch in request_id)
+        or evidence.get("request_id") != request_id
+        or card.get("launch_request_id") != request_id
+        or card.get("task_id") != task_id
+        or not isinstance(card.get("allowed_writes"), list)
+        or not card.get("allowed_writes")
+        or str(card.get("runner") or "") != str(terminal_review.get("runner") or "")
+        or str(terminal_review.get("runner") or "") != terminal_runner
+        or terminal_substatus not in _NO_CANDIDATE_RECOVERY_SUBSTATUSES
+        or str(card.get("terminal_substatus") or "") != terminal_substatus
+        or not isinstance(required_outputs, list)
+        or any(
+            not isinstance(item, dict)
+            or item.get("missing") is not True
+            or item.get("sha256") not in (None, "")
+            or item.get("bytes") is not None
+            for item in required_outputs
+        )
+    ):
+        return False, "clean_root_no_candidate_identity_invalid", {}
+
+    request_identity = evidence.get("request_identity")
+    if request_identity not in (None, {}):
+        if (
+            not isinstance(request_identity, dict)
+            or request_identity.get("request_id") != request_id
+            or request_identity.get("task_id") != task_id
+        ):
+            return False, "clean_root_no_candidate_identity_invalid", {}
+
+    for pid_key in (
+        "pid",
+        "provider_pid",
+        "supervisor_pid",
+        "stall_supervisor_pid",
+    ):
+        raw_pid = evidence.get(pid_key)
+        if type(raw_pid) is not int or raw_pid <= 0:
+            continue
+        try:
+            os.kill(raw_pid, 0)
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            return False, "retained_terminal_candidate_process_live", {}
+        else:
+            return False, "retained_terminal_candidate_process_live", {}
+
+    try:
+        expected_repo = Path(root).resolve(strict=True)
+        expected_workspace = (
+            expected_repo
+            / ".aiworkhub"
+            / "runtime"
+            / "worktrees"
+            / request_id
+            / "worktree"
+        )
+    except (OSError, RuntimeError, ValueError):
+        return False, "clean_root_no_candidate_repo_invalid", {}
+    request_repo = (
+        request_identity.get("repo")
+        if isinstance(request_identity, dict)
+        else None
+    )
+    if (
+        evidence.get("repo") not in (None, "", str(expected_repo))
+        or request_repo not in (None, "", str(expected_repo))
+    ):
+        return False, "clean_root_no_candidate_identity_invalid", {}
+    if expected_workspace.exists() or expected_workspace.is_symlink():
+        return False, "clean_root_no_candidate_workspace_still_available", {}
+
+    return True, "authenticated", {
+        "schema_id": "aiworkhub.clean_root_no_candidate_authority.v1",
+        "predecessor_request_id": request_id,
+        "predecessor_claim_epoch": claim_epoch,
+        "changed_path_hashes": {},
+        "missing_workspace": str(expected_workspace),
+        "repo": str(expected_repo),
+        "terminal_substatus": terminal_substatus,
+        "recovery_mode": "clean_root_no_candidate_terminal_failure",
+    }
+
 
 def retry_finalize_failed(
     root: str | Path,
@@ -4357,7 +4499,13 @@ def recover_blocked_rework(
         if clean_root_if_predecessor_missing and validation_only_replay:
             return False, "clean_root_incompatible_with_validation_only_replay"
 
+        clean_root_terminal_failure_evidence: dict[str, Any] | None = None
+
         def clean_root_predecessor_authority() -> tuple[bool, str, dict[str, Any]]:
+            if clean_root_terminal_failure_evidence is not None:
+                return True, "no_candidate", dict(
+                    clean_root_terminal_failure_evidence
+                )
             predecessor = card.get("rework_predecessor")
             if not isinstance(predecessor, dict):
                 return False, "clean_root_rework_predecessor_invalid", {}
@@ -4496,6 +4644,20 @@ def recover_blocked_rework(
         )
         if already is not None or pending_clean_root_blocker:
             if current_canonical == "pending":
+                clean_root_authorization = card.get(
+                    "clean_root_recovery_authorization"
+                )
+                if (
+                    already is not None
+                    and clean_root_if_predecessor_missing
+                    and isinstance(clean_root_authorization, dict)
+                    and clean_root_authorization.get("task_id") == task_id
+                    and clean_root_authorization.get("claim_epoch")
+                    == card.get("claim_epoch")
+                    and clean_root_authorization.get("one_episode_binding")
+                    is True
+                ):
+                    return True, "already_recovered"
                 if validation_only_replay:
                     predecessor = card.get("rework_predecessor")
                     if not isinstance(predecessor, dict):
@@ -4533,6 +4695,7 @@ def recover_blocked_rework(
                         predecessor_task_id = str(
                             predecessor.get("task_id") or ""
                         ).strip()
+                        predecessor_claim_epoch = predecessor.get("claim_epoch")
                         lineage_request_id = str(
                             sealed_lineage.get("predecessor_request_id") or ""
                         ).strip()
@@ -4584,6 +4747,8 @@ def recover_blocked_rework(
                             or lineage_claim_epoch < 1
                             or not lineage_authenticated
                             or predecessor_task_id != task_id
+                            or type(predecessor_claim_epoch) is not int
+                            or predecessor_claim_epoch != claim_epoch
                             or str(
                                 predecessor_workspace.get("request_id") or ""
                             ).strip()
@@ -5157,6 +5322,45 @@ def recover_blocked_rework(
         if not isinstance(terminal_review, dict) or not terminal_review:
             return False, "retained_predecessor_evidence_invalid"
 
+        # A provider/transport failure can terminate before the worker emits
+        # any candidate bytes.  The clean-root escape is explicit and admits
+        # only the exact repo-local terminal event with an absent worktree.
+        if (
+            terminal_event == "terminal_failure"
+            and not retained_predecessor
+            and clean_root_if_predecessor_missing
+        ):
+            (
+                no_candidate_allowed,
+                no_candidate_reason,
+                no_candidate_evidence,
+            ) = _clean_root_no_candidate_failure_authority(
+                root,
+                task_id,
+                card=card,
+                terminal_review=terminal_review,
+                terminal_runner=str(terminal_row["runner"] or ""),
+            )
+            if no_candidate_allowed:
+                clean_root_terminal_failure_evidence = no_candidate_evidence
+                retained_predecessor = {
+                    "schema_id": "aiworkhub.rework_predecessor.v1",
+                    "request_id": no_candidate_evidence[
+                        "predecessor_request_id"
+                    ],
+                    "task_id": task_id,
+                    "repo": no_candidate_evidence["repo"],
+                    "claim_epoch": no_candidate_evidence[
+                        "predecessor_claim_epoch"
+                    ],
+                    "allowed_writes": list(card.get("allowed_writes") or ()),
+                    "changed_paths": [],
+                    "changed_path_hashes": {},
+                }
+                card["rework_predecessor"] = retained_predecessor
+            elif no_candidate_reason != "clean_root_no_candidate_not_applicable":
+                return False, no_candidate_reason
+
         # A terminal failure can leave a perfectly usable candidate without
         # ever reaching reject_review (notably worker quota refusals and
         # finalizer failures with required_outputs=[]).  For an explicit
@@ -5419,8 +5623,11 @@ def recover_blocked_rework(
             ),
             "changed_path_hashes": (
                 retained_predecessor.get("changed_path_hashes")
-                or (
-                    terminal_review.get("evidence", {}).get("changed_path_hashes")
+                if "changed_path_hashes" in retained_predecessor
+                else (
+                    terminal_review.get("evidence", {}).get(
+                        "changed_path_hashes"
+                    )
                     if isinstance(terminal_review.get("evidence"), dict)
                     else None
                 )

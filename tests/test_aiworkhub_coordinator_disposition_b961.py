@@ -2296,8 +2296,39 @@ def test_pending_replay_recovery_preserves_authenticated_lineage(
     assert selected == ["validation_only_replay"]
     assert result["provider_launched"] is False
 
+    card = task_store.get_task(root, task_id)
+    card["rework_predecessor"]["claim_epoch"] = 2
+    card["operational_blocker"] = {
+        "kind": "launch_blocked",
+        "reason": "validation_only_replay_predecessor_mismatch",
+    }
+    conn = task_store._connect(db_path)
+    try:
+        conn.execute(
+            "UPDATE tasks SET card_json=? WHERE task_id=?",
+            (
+                json.dumps(
+                    task_store.persistable_card_payload(card),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                task_id,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    assert task_store.recover_blocked_rework(
+        root,
+        task_id,
+        actor=core.CODEX_RUNNER,
+        feedback_reason="reject wrong predecessor episode",
+        validation_only_replay=True,
+    ) == (False, "validation_only_replay_predecessor_invalid")
+
     (workspace_path / paths[0]).write_bytes(b"tampered\n")
     card = task_store.get_task(root, task_id)
+    card["rework_predecessor"]["claim_epoch"] = 3
     card["operational_blocker"] = {
         "kind": "launch_blocked",
         "reason": "validation_only_replay_predecessor_mismatch",
