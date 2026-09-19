@@ -14,8 +14,20 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.11.49
+## What's new in 0.11.50
 
+- The identity strip has a wave mini-roadmap info popup for the current
+  in-progress Roadmap wave.
+- VS Code LM requests apply reasoning effort only when the model
+  declares a selectable control that honors the canonical profile;
+  context capacity is recorded and never used to pad the prompt. CLI
+  workers in the bundled runtime follow the same APPLIED-only rule.
+- Native reviewer retained streams also compact thinking deltas.
+- Sparse-worktree VS Code test-asset seeding and the sandbox-safe
+  OpenCode config check are repository-only test/manager work, not
+  VSIX features.
+
+## What's new in 0.11.49
 - This intermediate release combines the staged Windows and OpenCode fixes
   below; the 0.11.45-0.11.48 headings were development notes, not separate
   published releases.

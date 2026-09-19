@@ -62,6 +62,20 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
+## What's new in 0.11.50
+
+- Verified reasoning and context wiring for CLI workers and the VS Code
+  LM bridge: effort flags or modelOptions are applied only when the
+  decision is APPLIED; context capacity is recorded and never used to
+  pad prompts.
+- The dashboard identity strip includes a wave mini-roadmap info popup
+  for the current in-progress Roadmap wave.
+- Native reviewer retained streams also compact thinking deltas so a
+  long reasoning turn does not refuse a completed review.
+- Repository-only: sparse worker validation seeds the VS Code test
+  raster fixtures, and the unreadable OpenCode config check is
+  sandbox-safe. Those are not VSIX-shipped features.
+
 ## What's new in 0.11.49
 
 - This intermediate release combines the previously staged Windows and

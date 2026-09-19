@@ -6,6 +6,34 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.50] - 2026-09-19
+
+### Added
+
+- CLI worker launches apply the verified reasoning-effort decision and
+  record the verified provider/model context window. Effort-control argv
+  tokens are emitted only when that decision is APPLIED; context capacity
+  is never used to pad the prompt.
+- The VS Code LM bridge now receives the authenticated card and publishes
+  a reasoning decision plus a model-context receipt. The VSIX host applies
+  a declared effort option only when the selected model exposes selectable
+  keys that honor the canonical profile; otherwise it records
+  unsupported, provider-default, unverifiable or capability-ceiling and
+  does not claim an applied value.
+- The dashboard identity strip includes a wave mini-roadmap info popup
+  for the current in-progress, current or active Roadmap wave.
+
+### Fixed
+
+- Native reviewer retained-stream compaction now also drops
+  `assistant.reasoning_delta` ticks, so a long thinking turn no longer
+  fails a completed review as `provider_events_oversized`. The live
+  stream a human watches is unchanged.
+- Sparse worker validation worktrees seed the four committed VS Code
+  raster fixtures that extension-static tests require. That manager/test
+  support is not a VSIX UI feature. The unreadable OpenCode config check
+  remains repository-only test work.
+
 ## [0.11.49] - 2026-09-19
 
 ### Added

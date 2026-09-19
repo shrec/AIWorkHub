@@ -1,5 +1,29 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.50 — 2026-09-19
+
+### Added
+
+- The identity strip includes a wave mini-roadmap info popup for the
+  current in-progress, current or active Roadmap wave.
+- VS Code language-model requests apply a declared effort option only
+  when the selected model exposes selectable keys that honor the
+  canonical profile; otherwise the host records unsupported,
+  provider-default, unverifiable or capability-ceiling and does not
+  claim an applied value. Model context capacity is recorded from
+  `maxInputTokens` and is never used to pad the prompt. The bundled
+  runtime also applies the same verified effort and context receipts on
+  CLI worker launches.
+
+### Fixed
+
+- The bundled reviewer retained stream also compacts
+  `assistant.reasoning_delta` events so a long thinking turn does not
+  refuse a completed review.
+- Sparse-worktree VS Code raster fixture seeding and the sandbox-safe
+  OpenCode config check are repository-only test/manager work and are
+  not packaged as VSIX features.
+
 ## 0.11.49 — 2026-09-19
 
 ### Added
