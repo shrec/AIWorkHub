@@ -1,8 +1,10 @@
 """Pure runtime command planning for supported local task adapters.
 
 The plans produced here are inert data.  They contain an argument vector and
-working directory for a launcher to use, but this module never starts a child
-process and never accepts or returns an environment mapping.
+working directory for a launcher to use.  This module never accepts or returns
+an environment mapping, and it starts a child process only inside the bounded
+release probe :func:`probe_release`, which is version detection -- not a task
+launch -- and drains its streams deterministically.
 """
 
 from __future__ import annotations
@@ -18,7 +20,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
-from . import platform_io
+from . import platform_io, reasoning_policy
 
 
 SUPPORTED_ADAPTERS: tuple[str, ...] = (
@@ -656,6 +658,13 @@ class RuntimeAdapterPlan:
 
     ``argv`` is always a token list, never a shell command.  A manual-only
     plan is validation-successful but deliberately not launchable.
+
+    ``reasoning_decision`` is the canonical effort decision (or ``None`` for a
+    route with no verified effort control); ``context_capacity`` is a verified
+    provider/model context window (or ``None`` when unknown), never a task
+    spend cap or an estimate.  The effort control tokens are already present in
+    ``argv`` when the decision was applied, so ``argv`` is the single source of
+    truth for what actually runs.
     """
 
     adapter_id: str
@@ -666,11 +675,42 @@ class RuntimeAdapterPlan:
     manual_only: bool
     validation_ok: bool
     validation_reason: str
+    reasoning_decision: reasoning_policy.ReasoningDecision | None = None
+    context_capacity: int | None = None
 
     @property
     def reason(self) -> str:
         """Short alias useful to callers rendering adapter status."""
         return self.validation_reason
+
+    @property
+    def reasoning_receipt(self) -> dict[str, Any] | None:
+        """Truthful, bounded account of the effort control on this plan.
+
+        ``None`` when no decision was derived (an editor bridge or a route with
+        no verified effort control).  ``flag_emitted`` is ``True`` only when the
+        decision status is APPLIED *and* this route's verified spelling actually
+        placed tokens in ``argv``; a capability-ceiling, provider-default,
+        unsupported, or unverifiable decision is reported as not applied and not
+        emitted, never claimed otherwise.
+        """
+
+        decision = self.reasoning_decision
+        if decision is None:
+            return None
+        route_effort = decision.route_effort
+        applied = bool(route_effort is not None and route_effort.applied)
+        applied_key = route_effort.applied_key if applied and route_effort is not None else None
+        flag_emitted = bool(applied and applied_key is not None and _effort_flag_tokens(self.adapter_id, applied_key))
+        return {
+            "applied": applied,
+            "flag_emitted": flag_emitted,
+            "status": None if route_effort is None else route_effort.status.value,
+            "profile": decision.profile.value,
+            "applied_key": applied_key,
+            "provider_family": decision.request.provider_family.value,
+            "context_capacity": self.context_capacity,
+        }
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -1499,12 +1539,18 @@ def build_runtime_command(
     additional_readonly_dirs: Sequence[PathValue] | None = None,
     include_partial_messages: bool = False,
     read_only: bool = False,
+    reasoning_decision: reasoning_policy.ReasoningDecision | None = None,
+    context_capacity: int | None = None,
 ) -> RuntimeAdapterPlan:
     """Build a validated argv/cwd plan for one supported adapter.
 
     Invalid input and unavailable executables produce non-launchable plans
     with empty argv.  Prompt and model strings are preserved as single argv
-    tokens, including spaces and Unicode text.
+    tokens, including spaces and Unicode text.  A supplied
+    ``reasoning_decision`` contributes verified effort-control argv tokens only
+    when its status is APPLIED; ``context_capacity`` records a verified
+    provider/model context window on the plan but never pads the prompt toward
+    it.
     """
 
     if not isinstance(adapter_id, str) or adapter_id not in SUPPORTED_ADAPTERS:
@@ -1580,6 +1626,13 @@ def build_runtime_command(
             WINDOWS_NATIVE_CLI_REQUIRES_APPCONTAINER,
             cwd=cwd,
         )
+
+    effort_tokens: list[str] = []
+    if reasoning_decision is not None and reasoning_decision.route_effort is not None:
+        route_effort = reasoning_decision.route_effort
+        if route_effort.applied and route_effort.applied_key is not None:
+            effort_tokens = _effort_flag_tokens(adapter_id, route_effort.applied_key)
+
     if adapter_id == "claude_cli":
         argv = [
             executable,
@@ -1605,6 +1658,7 @@ def build_runtime_command(
             argv.insert(argv.index("--permission-mode"), "--include-partial-messages")
         if model is not None:
             argv.extend(("--model", model))
+        argv.extend(effort_tokens)
     elif adapter_id == "codex_cli":
         if outer_sandbox_backend in {"landlock", "bubblewrap"}:
             codex_sandbox_mode = "danger-full-access"
@@ -1631,6 +1685,7 @@ def build_runtime_command(
         ]
         if model is not None:
             argv.extend(("--model", model))
+        argv.extend(effort_tokens)
         argv.append(prompt)
     elif adapter_id == GROK_KILO_ADAPTER:
         resolved_model, model_error = resolve_grok_kilo_model(model)
@@ -1662,6 +1717,7 @@ def build_runtime_command(
             "json",
             "--model",
             resolved_model,
+            *effort_tokens,
             prompt,
         ]
     else:  # Copilot CLI in BYOK mode for OpenAI-compatible local-worker adapters
@@ -1713,6 +1769,8 @@ def build_runtime_command(
         manual_only=False,
         validation_ok=True,
         validation_reason="",
+        reasoning_decision=reasoning_decision,
+        context_capacity=context_capacity,
     )
 
 
@@ -1766,6 +1824,8 @@ def inject_worker_mcp_config(
         manual_only=plan.manual_only,
         validation_ok=plan.validation_ok,
         validation_reason=plan.validation_reason,
+        reasoning_decision=plan.reasoning_decision,
+        context_capacity=plan.context_capacity,
     )
 
 
@@ -1780,6 +1840,8 @@ def build_adapter_command(
     additional_readonly_dirs: Sequence[PathValue] | None = None,
     include_partial_messages: bool = False,
     read_only: bool = False,
+    reasoning_decision: reasoning_policy.ReasoningDecision | None = None,
+    context_capacity: int | None = None,
 ) -> RuntimeAdapterPlan:
     """Compatibility name for callers that describe commands by adapter."""
 
@@ -1793,6 +1855,8 @@ def build_adapter_command(
         additional_readonly_dirs=additional_readonly_dirs,
         include_partial_messages=include_partial_messages,
         read_only=read_only,
+        reasoning_decision=reasoning_decision,
+        context_capacity=context_capacity,
     )
 
 
@@ -2158,6 +2222,345 @@ def classify_provider_outcome(
     }
 
 
+# --- reasoning-effort wiring ------------------------------------------------
+# Verified provider spellings for reasoning-effort controls.  Each ladder is
+# the route's OWN declared key names (consumed through
+# ``reasoning_policy.RouteCapability``).  A key is emitted on a command only
+# when the canonical decision status is APPLIED, so a non-applied decision can
+# never place a control flag on the argv, and the plan receipt records
+# ``flag_emitted`` truthfully instead of claiming an applied value.
+_ROUTE_EFFORT_KEYS: Mapping[str, tuple[str, ...]] = MappingProxyType(
+    {
+        ROUTE_FAMILY_CODEX_CLI: ("minimal", "low", "medium", "high", "xhigh"),
+    }
+)
+
+
+# Verified maximum context windows (tokens) per canonical model id, mirroring
+# the canonical workforce catalog's declared ``max_context_tokens`` route
+# capability (the seed rows in ``workforce_catalog``).  These are used only to
+# report ``context_capacity`` truthfully; a task card's token budget is a spend
+# cap and is never conflated with them.  An unknown model yields ``None``.
+_VERIFIED_CONTEXT_CAPACITY: Mapping[str, int] = MappingProxyType(
+    {
+        "claude-opus-5": 1_000_000,
+        "claude-sonnet-5": 1_000_000,
+        "claude-haiku-4.5": 200_000,
+        "gpt-5.5": 921_000,
+    }
+)
+
+
+# Canonical workforce model aliases.  The workforce catalog names Claude-5
+# models by their short ``model`` field (``opus``/``sonnet``/``haiku``) while the
+# canonical workforce table and every CLI ``--model`` spelling use the full id.
+# These are the SAME documented aliases ``process_launcher._WORKFORCE_MODEL_ALIASES``
+# normalizes, mirrored here so an adapter-facing resolver is robust to whichever
+# verified spelling reaches it -- and still fails closed on anything else.
+_WORKFORCE_MODEL_ALIASES: Mapping[str, str] = MappingProxyType(
+    {
+        "opus": "claude-opus-5",
+        "sonnet": "claude-sonnet-5",
+        "haiku": "claude-haiku-4.5",
+    }
+)
+
+
+def _canonical_model_id(model: str | None) -> str:
+    """Resolve a verified workforce model spelling to its canonical id."""
+
+    stripped = (model or "").strip().lower()
+    return _WORKFORCE_MODEL_ALIASES.get(stripped, stripped)
+
+
+# Claude CLI's documented ``--effort`` ladder.  Claude-5-class models attest
+# the full rungs up to ``max``, so a MAXIMUM profile maps to ``max`` instead of
+# silently downgrading to ``high``.  Standard-tier models attest only
+# ``low``/``medium``/``high``, and any unverified model attests nothing (fail
+# closed) so no effort flag is ever emitted without model-specific evidence.
+_CLAUDE_EFFORT_FULL: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
+_CLAUDE_MAX_EFFORT_MODELS: frozenset[str] = frozenset(
+    ("claude-opus-5", "claude-sonnet-5")
+)
+
+
+def _claude_effort_keys(model: str | None) -> tuple[str, ...]:
+    """Verified Claude ``--effort`` ladder for one canonical model id.
+
+    Accepts either the canonical id (``claude-opus-5``) or a verified workforce
+    alias (``opus``) and resolves it through ``_canonical_model_id``.
+    """
+
+    canonical = _canonical_model_id(model)
+    if canonical in _CLAUDE_MAX_EFFORT_MODELS:
+        return _CLAUDE_EFFORT_FULL
+    if canonical == "claude-haiku-4.5":
+        return ("low", "medium", "high")
+    return ()
+
+
+def route_reasoning_capability(
+    adapter_id: str,
+    model: str | None = None,
+) -> reasoning_policy.RouteCapability | None:
+    """Declared reasoning-effort capability for one adapter, or ``None``.
+
+    Only the Claude and Codex CLI routes declare a selectable effort ladder.
+    Claude's ladder is model-aware: a Claude-5 model selects its verified
+    ceiling (``max``) for MAXIMUM, a standard-tier model selects ``high``, and
+    an unverified model yields no ladder (fail closed).  OpenCode's
+    ``--variant`` is not a rankable effort ladder, so it declares none.  Editor
+    bridges and Copilot-BYOK routes also return ``None``: they expose no
+    verified effort control, so no decision can be applied.
+    """
+
+    family = route_family(adapter_id)
+    if family == ROUTE_FAMILY_CLAUDE_CLI:
+        keys = _claude_effort_keys(model)
+    else:
+        keys = _ROUTE_EFFORT_KEYS.get(family)
+    if not keys:
+        return None
+    return reasoning_policy.RouteCapability(
+        route_id=adapter_id,
+        provider_family=reasoning_policy.provider_family_for_route(adapter_id),
+        supports_effort_control=True,
+        effort_keys=keys,
+    )
+
+
+def _effort_flag_tokens(adapter_id: str, applied_key: str) -> list[str]:
+    """Verified argv tokens that apply one applied effort key to a route.
+
+    The spellings are the providers' own documented CLI surfaces: Claude
+    ``--effort`` and Codex ``-c model_reasoning_effort="..."`` (a TOML value
+    quote).  Callers must only invoke this with a decision whose status is
+    APPLIED; any other route returns no tokens.
+    """
+
+    if adapter_id == "claude_cli":
+        return ["--effort", applied_key]
+    if adapter_id == "codex_cli":
+        return ["-c", f'model_reasoning_effort="{applied_key}"']
+    return []
+
+
+_RISK_TIER_BY_CARD: Mapping[str, reasoning_policy.RiskTier] = MappingProxyType(
+    {
+        "low": reasoning_policy.RiskTier.LOW,
+        "medium": reasoning_policy.RiskTier.MEDIUM,
+        "high": reasoning_policy.RiskTier.HIGH,
+        "critical": reasoning_policy.RiskTier.CRITICAL,
+    }
+)
+
+
+def _coerce_risk_tier(value: Any) -> reasoning_policy.RiskTier:
+    if not isinstance(value, str):
+        return reasoning_policy.RiskTier.MEDIUM
+    return _RISK_TIER_BY_CARD.get(
+        value.strip().lower(), reasoning_policy.RiskTier.MEDIUM
+    )
+
+
+def _coerce_work_kind(value: Any, *, is_reviewer: bool) -> reasoning_policy.WorkKind:
+    if isinstance(value, str) and value.strip().lower() == "security":
+        return reasoning_policy.WorkKind.SECURITY
+    if is_reviewer:
+        return reasoning_policy.WorkKind.CORRECTNESS_REVIEW
+    return reasoning_policy.WorkKind.REPOSITORY_CODING
+
+
+def _derive_reasoning_request(
+    adapter_id: str,
+    card: Mapping[str, Any],
+    *,
+    is_reviewer: bool,
+) -> reasoning_policy.EffortRequest:
+    """Derive the canonical effort request from a real task card.
+
+    The card vocabulary differs from the policy vocabulary: a card carries
+    ``risk_tier`` and ``work_kind`` but no ``role`` or ``difficulty``.  Role is
+    derived from whether this is a quality-review launch, difficulty is STANDARD
+    unless the card declares a rework predecessor, and the provider family is
+    the route's own family so a Claude route still receives the Claude
+    repository default.
+    """
+
+    return reasoning_policy.EffortRequest(
+        role=(
+            reasoning_policy.TaskRole.REVIEWER
+            if is_reviewer
+            else reasoning_policy.TaskRole.IMPLEMENTER
+        ),
+        risk_tier=_coerce_risk_tier(card.get("risk_tier")),
+        work_kind=_coerce_work_kind(card.get("work_kind"), is_reviewer=is_reviewer),
+        difficulty=(
+            reasoning_policy.Difficulty.COMPLEX
+            if isinstance(card.get("rework_predecessor"), Mapping)
+            else reasoning_policy.Difficulty.STANDARD
+        ),
+        provider_family=reasoning_policy.provider_family_for_route(adapter_id),
+    )
+
+
+def resolve_adapter_reasoning(
+    adapter_id: str,
+    card: Mapping[str, Any],
+    *,
+    is_reviewer: bool = False,
+    model: str | None = None,
+) -> reasoning_policy.ReasoningDecision | None:
+    """Derive the canonical effort decision for one adapter launch.
+
+    A route with no verified effort control yields ``None`` (nothing to apply).
+    Claude's capability is model-aware, so ``model`` (the canonical workforce
+    model id) selects the verified ladder; an unverified model fails closed to
+    ``None``.  Otherwise the decision is the pure
+    :func:`reasoning_policy.resolve_reasoning_effort` result for the request
+    derived from ``card`` against the route's declared capability.
+    """
+
+    capability = route_reasoning_capability(adapter_id, model)
+    if capability is None:
+        return None
+    request = _derive_reasoning_request(adapter_id, card, is_reviewer=is_reviewer)
+    return reasoning_policy.resolve_reasoning_effort(request, capability)
+
+
+def resolve_context_capacity(
+    adapter_id: str,
+    model: str | None = None,
+) -> int | None:
+    """Verified route-declared context window, or ``None`` when unknown.
+
+    Reads the declared maximum context capacity (``max_context_tokens``) for the
+    canonical model id, resolving a verified workforce alias (``opus``) through
+    ``_canonical_model_id``.  A task card's ``token_budget.cap_tokens`` is a
+    spend cap, not a context window, and is deliberately never used here.  An
+    unverified model yields ``None`` -- never an estimate -- and callers must
+    not pad the prompt toward this value.
+    """
+
+    family = route_family(adapter_id)
+    if family not in (ROUTE_FAMILY_CLAUDE_CLI, ROUTE_FAMILY_CODEX_CLI):
+        return None
+    return _VERIFIED_CONTEXT_CAPACITY.get(_canonical_model_id(model))
+
+
+def probe_release(
+    executable: str,
+    *,
+    args: Sequence[str] = ("--version",),
+    limit: int = 4096,
+    timeout: float = 5.0,
+) -> dict[str, Any]:
+    """Bounded cross-platform release probe for one CLI executable.
+
+    Runs ``executable args`` and drains BOTH stdout and stderr to a combined
+    ``limit + 1`` byte cap using two reader threads -- never a selector on the
+    anonymous child pipes -- so a fast-exit child is fully drained before its
+    pipes close and a talkative one cannot grow memory without bound.  The child
+    is always waited and its handles closed (deterministic cleanup, no temp
+    files).  A spawn failure, timeout, combined-output overflow, or non-zero
+    exit all return an evidence-free result with an empty ``release``.
+    """
+
+    import subprocess
+    import threading
+
+    result: dict[str, Any] = {
+        "ok": False,
+        "status": "spawn_failed",
+        "release": "",
+        "returncode": None,
+    }
+    try:
+        proc = subprocess.Popen(
+            [executable, *args],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except OSError:
+        return result
+
+    chunks: list[bytes] = []
+    total = 0
+    overflow = False
+    lock = threading.Lock()
+
+    def drain(stream: Any) -> None:
+        nonlocal total, overflow
+        while True:
+            try:
+                piece = stream.read(4096)
+            except OSError:
+                piece = b""
+            if not piece:
+                return
+            with lock:
+                if overflow:
+                    continue
+                remaining = (limit + 1) - total
+                if remaining <= 0:
+                    overflow = True
+                    continue
+                if len(piece) <= remaining:
+                    total += len(piece)
+                    chunks.append(piece)
+                else:
+                    total = limit + 1
+                    chunks.append(piece[:remaining])
+                    overflow = True
+
+    stdout_reader = threading.Thread(target=drain, args=(proc.stdout,), daemon=True)
+    stderr_reader = threading.Thread(target=drain, args=(proc.stderr,), daemon=True)
+    stdout_reader.start()
+    stderr_reader.start()
+
+    try:
+        returncode = proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        stdout_reader.join(timeout=2.0)
+        stderr_reader.join(timeout=2.0)
+        if proc.stdout is not None:
+            proc.stdout.close()
+        if proc.stderr is not None:
+            proc.stderr.close()
+        return {"ok": False, "status": "timeout", "release": "", "returncode": None}
+    stdout_reader.join(timeout=2.0)
+    stderr_reader.join(timeout=2.0)
+    if proc.stdout is not None:
+        proc.stdout.close()
+    if proc.stderr is not None:
+        proc.stderr.close()
+
+    if overflow:
+        return {
+            "ok": False,
+            "status": "overflow",
+            "release": "",
+            "returncode": returncode,
+        }
+    if returncode != 0:
+        return {
+            "ok": False,
+            "status": "nonzero_exit",
+            "release": "",
+            "returncode": returncode,
+        }
+    release = b"".join(chunks).decode("utf-8", errors="replace")
+    return {
+        "ok": True,
+        "status": "ok",
+        "release": release,
+        "returncode": returncode,
+    }
+
+
 __all__ = [
     "ADAPTER_EXECUTABLES",
     "DEEPSEEK_COPILOT_ADAPTER",
@@ -2181,6 +2584,10 @@ __all__ = [
     "ROUTE_FAMILY_KILO_XAI_CLI",
     "ROUTE_FAMILY_UNKNOWN",
     "route_family",
+    "route_reasoning_capability",
+    "resolve_adapter_reasoning",
+    "resolve_context_capacity",
+    "probe_release",
     "EDITOR_NONCALLABLE_VENDORS",
     "EDITOR_NONCALLABLE_ID_PREFIXES",
     "EDITOR_REQUESTED_MODEL_RE",

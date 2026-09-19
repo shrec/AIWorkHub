@@ -735,6 +735,22 @@ def launch_isolated(
                 and isinstance(card.get("token_budget"), dict)
                 and bool(card["token_budget"])
             )
+            # NF-2026-00897.  Derive the canonical reasoning-effort decision and
+            # the verified provider/model context window ONCE, from the real card
+            # and the canonical workforce model, and thread them into the adapter
+            # plan.  The decision is None for any route with no verified effort
+            # control (or an unverified model), and only an APPLIED decision ever
+            # contributes argv tokens (see runtime_adapters).
+            reasoning_decision = runtime_adapters.resolve_adapter_reasoning(
+                adapter_id,
+                card,
+                is_reviewer=quality_review_binding is not None,
+                model=model,
+            )
+            context_capacity = runtime_adapters.resolve_context_capacity(
+                adapter_id,
+                model,
+            )
             if adapter_id in _VSCODE_LM_IN_PROCESS_ADAPTERS:
                 bridge_request = vscode_lm_bridge.create_request(
                     repo=self.repo,
@@ -763,6 +779,8 @@ def launch_isolated(
                     manual_only=False,
                     validation_ok=True,
                     validation_reason="",
+                    reasoning_decision=reasoning_decision,
+                    context_capacity=context_capacity,
                 )
                 provider_env = _vscode_lm_worker_env(
                     provider_env,
@@ -779,6 +797,8 @@ def launch_isolated(
                     include_partial_messages=include_partial_messages,
                     # A read-only card gets a read-only toolset.
                     read_only=bool(card.get("read_only")),
+                    reasoning_decision=reasoning_decision,
+                    context_capacity=context_capacity,
                 )
             if not getattr(plan, "launchable", False):
                 reason = getattr(plan, "reason", "adapter_not_launchable")
@@ -791,6 +811,21 @@ def launch_isolated(
                 }.get(adapter_id)
                 if worker_mcp_config_path is not None:
                     plan = runtime_adapters.inject_worker_mcp_config(plan, worker_mcp_config_path)
+            # NF-2026-00897.  Detect the installed Claude CLI release once so the
+            # effort ceiling recorded on the plan is backed by the actual CLI.
+            # The probe is bounded (combined stdout/stderr cap, fast-exit drain,
+            # timeout) and never gates the launch; an unreadable release records
+            # None.
+            claude_cli_release: str | None = None
+            if (
+                adapter_id == "claude_cli"
+                and isinstance(plan, runtime_adapters.RuntimeAdapterPlan)
+                and plan.executable
+            ):
+                probe = runtime_adapters.probe_release(plan.executable)
+                if probe.get("ok"):
+                    release = probe.get("release")
+                    claude_cli_release = str(release) if release else None
             # Provision the request-owned temp authority before composing
             # the Landlock command.  sandbox_argv deliberately grants
             # --worker-temp only for an already-provisioned directory;
@@ -893,10 +928,16 @@ def launch_isolated(
                 ),
                 "adapter_id": adapter_id,
                 "model": model,
+                "claude_cli_release": claude_cli_release,
                 "provider_stream_mode": (
                     "partial_messages_for_explicit_live_budget"
                     if include_partial_messages
                     else "terminal_events"
+                ),
+                "reasoning_effort": (
+                    plan.reasoning_receipt
+                    if isinstance(plan, runtime_adapters.RuntimeAdapterPlan)
+                    else None
                 ),
                 **_legacy_timeout_fields(timeout_seconds),
                 "token_budget": (
