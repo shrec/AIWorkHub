@@ -4739,6 +4739,166 @@ function synthesizeVscodeLmProviderCallId(requestId, turn, canonicalMessages, mo
   return `pci_${base36.slice(0, 28)}`;
 }
 
+const VSCODE_LM_REQUEST_JUSTIFICATION = "Run this explicitly queued AIWorkHub repository task using the user's existing VS Code model authorization.";
+const VSCODE_LM_EFFORT_KEY_RANK = Object.freeze(Object.assign(Object.create(null), {
+  minimal: 10, none: 10, off: 10, low: 20, med: 30, medium: 30, standard: 30,
+  medhigh: 40, mediumhigh: 40, high: 50, extrahigh: 60, veryhigh: 60, xhigh: 60,
+  highest: 70, max: 70, maximum: 70, ultra: 70, ultrahigh: 70,
+}));
+const VSCODE_LM_REQUIRED_EFFORT_RANK = Object.freeze(Object.assign(Object.create(null), {
+  canonical_medium_high: 40,
+  canonical_high: 50,
+  canonical_maximum: 50,
+}));
+
+function vscodeLmCanonicalEffortKey(name) {
+  return String(name || "").trim().toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
+function vscodeLmOwnRank(table, name) {
+  const key = vscodeLmCanonicalEffortKey(name);
+  return Object.prototype.hasOwnProperty.call(table, key) ? table[key] : undefined;
+}
+
+function vscodeLmDeclaredEffortControl(model) {
+  const caps = model && model.capabilities;
+  if (!caps || typeof caps !== "object" || Array.isArray(caps)) return null;
+  const nested = caps.effortControl && typeof caps.effortControl === "object" && !Array.isArray(caps.effortControl)
+    ? caps.effortControl
+    : caps;
+  const optionKey = String(nested.effortOptionKey || nested.optionKey || "").trim();
+  if (!optionKey) return null;
+  const rawKeys = nested.effortKeys || nested.keys;
+  const keys = Array.isArray(rawKeys)
+    ? rawKeys.map((key) => String(key || "").trim()).filter(Boolean)
+    : [];
+  return { optionKey, keys };
+}
+
+function vscodeLmCanonicalProfile(request) {
+  const profile = request && request.reasoning_decision && String(request.reasoning_decision.profile || "");
+  if (profile === "canonical_maximum" || profile === "canonical_high" || profile === "canonical_medium_high") {
+    return profile;
+  }
+  return request && request.request_kind === "quality_review" ? "canonical_maximum" : "canonical_high";
+}
+
+function vscodeLmNormalizeEffortForControl(profile, control) {
+  if (!control || !control.optionKey) {
+    return {
+      status: "unsupported",
+      applied: false,
+      applied_key: null,
+      option_key: null,
+      mapping: "none",
+      detail: "route declares no reasoning-effort control",
+    };
+  }
+  if (!control.keys.length) {
+    return {
+      status: "provider_default",
+      applied: false,
+      applied_key: null,
+      option_key: control.optionKey,
+      mapping: "none",
+      detail: "route exposes the control but declares no selectable keys",
+    };
+  }
+  const ranked = [];
+  const ignored = [];
+  control.keys.forEach((raw, index) => {
+    const rank = vscodeLmOwnRank(VSCODE_LM_EFFORT_KEY_RANK, raw);
+    if (typeof rank !== "number") ignored.push(raw);
+    else ranked.push([rank, index, raw]);
+  });
+  const required = vscodeLmOwnRank(VSCODE_LM_REQUIRED_EFFORT_RANK, profile);
+  const requiredRank = typeof required === "number" ? required : 50;
+  if (!ranked.length) {
+    return {
+      status: "unverifiable",
+      applied: false,
+      applied_key: null,
+      option_key: control.optionKey,
+      mapping: "positional",
+      detail: "no rankable key names; canonical request was not applied",
+    };
+  }
+  let ceiling = ranked[0];
+  ranked.forEach((entry) => {
+    if (entry[0] > ceiling[0] || (entry[0] === ceiling[0] && entry[1] > ceiling[1])) ceiling = entry;
+  });
+  let chosen = ceiling;
+  if (profile !== "canonical_maximum") {
+    const honoring = ranked.filter((entry) => entry[0] >= requiredRank);
+    if (honoring.length) {
+      chosen = honoring.reduce((best, entry) => (
+        entry[0] < best[0] || (entry[0] === best[0] && entry[1] < best[1]) ? entry : best
+      ));
+    }
+  }
+  if (chosen[0] < requiredRank) {
+    return {
+      status: "capability_ceiling",
+      applied: false,
+      applied_key: ceiling[2],
+      option_key: control.optionKey,
+      mapping: "semantic",
+      detail: `route ceiling ${JSON.stringify(ceiling[2])} sits below ${profile}`,
+    };
+  }
+  return {
+    status: "applied",
+    applied: true,
+    applied_key: chosen[2],
+    option_key: control.optionKey,
+    mapping: "semantic",
+    detail: `${profile} honored by ${JSON.stringify(chosen[2])}`,
+  };
+}
+
+function vscodeLmReasoningEffortReceipt(model, request) {
+  const profile = vscodeLmCanonicalProfile(request);
+  const control = vscodeLmDeclaredEffortControl(model);
+  const normalized = vscodeLmNormalizeEffortForControl(profile, control);
+  if (!normalized.applied) {
+    return { ...normalized, profile, model_options: undefined };
+  }
+  return {
+    ...normalized,
+    profile,
+    model_options: { [normalized.option_key]: normalized.applied_key },
+  };
+}
+
+function vscodeLmModelContextReceipt(model, request) {
+  const declared = Number(model && model.maxInputTokens);
+  const capacity = Number.isFinite(declared) && declared > 0 ? declared : null;
+  const published = request && request.model_context && Number(request.model_context.capacity_tokens);
+  const requestCapacity = Number.isFinite(published) && published > 0 ? published : null;
+  const capacitySource = capacity != null
+    ? "model.maxInputTokens"
+    : (requestCapacity != null ? "request.model_context" : "unknown");
+  return {
+    capacity_tokens: capacity != null ? capacity : requestCapacity,
+    capacity_source: capacitySource,
+    prompt_byte_cap: request && request.model_context ? request.model_context.prompt_byte_cap : undefined,
+    pad_prompt: false,
+    token_spend_cap_tokens: null,
+  };
+}
+
+function vscodeLmLanguageModelRequestOptions(model, request, extra) {
+  const effort = vscodeLmReasoningEffortReceipt(model, request);
+  const options = {
+    justification: VSCODE_LM_REQUEST_JUSTIFICATION,
+    ...(extra && typeof extra === "object" ? extra : {}),
+  };
+  if (effort.applied && effort.option_key && effort.applied_key) {
+    options.modelOptions = { [effort.option_key]: effort.applied_key };
+  }
+  return options;
+}
+
 function canonicalizeVscodeLmOptions(options) {
   if (!options || typeof options !== "object") return "";
   const normalized = {};
@@ -4988,9 +5148,7 @@ async function runVscodeLmTextProtocol(
     const sendRequest = dedupeVscodeLmSendRequest(
       model,
       messages,
-      {
-        justification: "Run this explicitly queued AIWorkHub repository task using the user's existing VS Code model authorization.",
-      },
+      vscodeLmLanguageModelRequestOptions(model, request),
       cancellationToken,
       request.requestId,
       turn,
@@ -5541,9 +5699,7 @@ async function runVscodeLmAgent(
     const availableTools = vscodeLmToolsForRequest(
       request, sourceGraphAcknowledged, forceStagedEdit,
     );
-    const options = {
-      justification: "Run this explicitly queued AIWorkHub repository task using the user's existing VS Code model authorization.",
-    };
+    const options = vscodeLmLanguageModelRequestOptions(model, request);
     if (!forceFinal) {
       options.tools = availableTools;
       options.toolMode = qualityReview || forceStagedEdit ||
@@ -6070,6 +6226,7 @@ class VscodeLmBridgeHost {
     const modelMetadata = visibleModels.slice(0, 64).flatMap((name) => {
       const model = selectVscodeLanguageModel(models, name);
       if (!model) return [];
+      const effort = vscodeLmDeclaredEffortControl(model);
       return [{
         canonical: name,
         id: model.id,
@@ -6078,6 +6235,7 @@ class VscodeLmBridgeHost {
         vendor: model.vendor,
         version: model.version,
         maxInputTokens: model.maxInputTokens,
+        ...(effort ? { effortOptionKey: effort.optionKey, effortKeys: effort.keys } : {}),
         access_state: this.modelAccessState(model),
       }];
     });
@@ -11542,6 +11700,10 @@ module.exports = {
     validateProviderHistory,
     canonicalizeVscodeLmMessages,
     canonicalizeVscodeLmOptions,
+    vscodeLmDeclaredEffortControl,
+    vscodeLmReasoningEffortReceipt,
+    vscodeLmModelContextReceipt,
+    vscodeLmLanguageModelRequestOptions,
     synthesizeVscodeLmProviderCallId,
     dedupeVscodeLmSendRequest,
     vscodeLmInFlightCallsSize: () => vscodeLmInFlightCalls.size,

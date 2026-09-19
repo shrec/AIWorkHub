@@ -769,6 +769,12 @@ def launch_isolated(
                         if quality_review_binding is not None
                         else "worker"
                     ),
+                    card=card,
+                    token_budget=(
+                        dict(card["token_budget"])
+                        if isinstance(card.get("token_budget"), dict)
+                        else None
+                    ),
                 )
                 plan = runtime_adapters.RuntimeAdapterPlan(
                     adapter_id=adapter_id,

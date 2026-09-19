@@ -425,6 +425,11 @@ def test_vscode_launch_prefetch_accepts_parse_broken_rework_overlay(
             return {
                 "request_id": "R-prefetch",
                 "allowed_writes": ["src/changed.py"],
+                "role": "implementer",
+                "risk_tier": "high",
+                "work_kind": "architecture",
+                "difficulty": "complex",
+                "token_budget": {"cap_tokens": 2048},
                 "project_context": {
                     "source_graph": {
                         "mode": "file",
@@ -624,6 +629,12 @@ def test_vscode_launch_prefetch_accepts_parse_broken_rework_overlay(
     assert result["state"] == "running"
     assert "kwargs" in created
     bridge_kwargs = dict(created["kwargs"])
+    launched_card = dict(bridge_kwargs["card"])
+    assert launched_card["role"] == "implementer"
+    assert launched_card["risk_tier"] == "high"
+    assert launched_card["work_kind"] == "architecture"
+    assert launched_card["difficulty"] == "complex"
+    assert bridge_kwargs["token_budget"] == {"cap_tokens": 2048}
     assert bridge_kwargs["source_graph_request"]["query"] == "src/changed.py"
     source_graph_result = dict(bridge_kwargs["source_graph_result"])
     assert source_graph_result["ok"] is True
@@ -863,3 +874,23 @@ def test_vscode_launch_prefetch_rejects_overlay_identity_mismatch(
     reason = str(result.get("blocked_reason") or "")
     assert reason.startswith("vscode_lm_initial_source_graph_prefetch_failed:")
     assert "successor_request_id_mismatch" in reason
+
+
+def test_vscode_lm_create_request_passes_authenticated_card_for_worker_and_review() -> None:
+    fn = _moved_function_node()
+    calls = [
+        node
+        for node in ast.walk(fn)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "create_request"
+    ]
+    assert len(calls) == 1
+    keywords = {keyword.arg: keyword.value for keyword in calls[0].keywords if keyword.arg}
+    assert "card" in keywords
+    assert isinstance(keywords["card"], ast.Name) and keywords["card"].id == "card"
+    assert "token_budget" in keywords
+    assert "request_kind" in keywords
+    request_kind = ast.unparse(keywords["request_kind"])
+    assert "quality_review" in request_kind
+    assert "worker" in request_kind

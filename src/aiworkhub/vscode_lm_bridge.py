@@ -22,7 +22,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-from . import repository_state
+from . import reasoning_policy, repository_state
 from .runtime_adapters import (  # the ONE editor model vocabulary declaration
     EDITOR_REQUESTED_MODEL_RE,
     GLM_COLD_START_FALLBACK_MODEL,
@@ -46,6 +46,7 @@ EDIT_RESPONSE_SCHEMA_ID = "aiworkhub.vscode_lm.semantic_edit_response.v3"
 PROGRESS_RECEIPT_SCHEMA_ID = "aiworkhub.vscode_lm.progress_receipt.v1"
 CANCEL_DECISION_SCHEMA_ID = RESPONSE_SCHEMA_ID
 BRIDGE_REQUEST_METADATA_SCHEMA_ID = "aiworkhub.vscode_lm.bridge_request_metadata.v1"
+MODEL_CONTEXT_SCHEMA_ID = "aiworkhub.vscode_lm.model_context.v1"
 PROGRESS_PHASES: tuple[str, ...] = (
     "request_accepted",
     "provider_response",
@@ -509,6 +510,7 @@ def bridge_readiness(
     )
     selected_model = resolved_by_host.get(id(selected), "") if selected is not None else ""
     selected_access_state = "unknown"
+    selected_model_entry: dict[str, Any] = {}
     if selected is not None:
         metadata = selected.get("model_metadata")
         if isinstance(metadata, list):
@@ -521,6 +523,7 @@ def bridge_readiness(
                 }
                 if model is None or selected_model in identities:
                     selected_access_state = str(entry.get("access_state") or "unknown")[:64]
+                    selected_model_entry = entry
                     if selected_access_state.startswith("granted") or model is not None:
                         break
         if model is None and selected_access_state == "unknown" and selected.get("permission_granted") is True:
@@ -560,6 +563,7 @@ def bridge_readiness(
         "live_host_count": len(live_hosts),
         "stale_host_count": max(0, len(candidates) - len(live_hosts)),
         "observed_models": observed_models,
+        "selected_model_entry": selected_model_entry,
         "freshest_age_seconds": min(
             (float(item["age_seconds"]) for item in candidates),
             default=None,
@@ -616,6 +620,182 @@ def _normalize_required_outputs(
     return normalized
 
 
+
+def _enum_member(enum_cls: Any, value: object, default: Any) -> Any:
+    if value is None:
+        return default
+    text = str(value).strip().lower().replace("-", "_")
+    if not text:
+        return default
+    for member in enum_cls:
+        if member.value == text or member.name.lower() == text:
+            return member
+    raise BridgeError(f"bridge_reasoning_{enum_cls.__name__.lower()}_invalid")
+
+
+def _coerce_card_work_kind(value: object, *, review: bool) -> Any:
+    default = (
+        reasoning_policy.WorkKind.CORRECTNESS_REVIEW
+        if review
+        else reasoning_policy.WorkKind.REPOSITORY_CODING
+    )
+    if isinstance(value, reasoning_policy.WorkKind):
+        return value
+    if value is None:
+        return default
+    text = str(value).strip().lower().replace("-", "_")
+    if not text:
+        return default
+    for member in reasoning_policy.WorkKind:
+        if member.value == text or member.name.lower() == text:
+            return member
+    if str(value).strip().lower() == "security":
+        return reasoning_policy.WorkKind.SECURITY
+    return default
+
+
+def _host_model_entry(host_readiness: dict[str, Any] | None) -> dict[str, Any]:
+    entry = (host_readiness or {}).get("selected_model_entry")
+    return entry if isinstance(entry, dict) else {}
+
+
+def _positive_int(value: object) -> int | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if isinstance(value, str) and value.strip():
+        try:
+            number = int(value.strip())
+        except ValueError:
+            return None
+        return number if number > 0 else None
+    return None
+
+
+def vscode_lm_effort_request(
+    *,
+    request_kind: str,
+    card: dict[str, Any] | None = None,
+    model: str = "",
+    provider_family: object = None,
+) -> reasoning_policy.EffortRequest:
+    fields = card if isinstance(card, dict) else {}
+    review = request_kind == "quality_review"
+    family_value = provider_family if provider_family is not None else fields.get("provider_family")
+    if family_value is None or str(family_value).strip() == "":
+        family = reasoning_policy.provider_family_for_route(
+            " ".join(
+                part for part in (
+                    model,
+                    str(fields.get("model") or ""),
+                    str(fields.get("vendor") or ""),
+                ) if part
+            )
+        )
+    else:
+        family = _enum_member(
+            reasoning_policy.ProviderFamily,
+            family_value,
+            reasoning_policy.ProviderFamily.OTHER,
+        )
+    return reasoning_policy.EffortRequest(
+        role=_enum_member(
+            reasoning_policy.TaskRole,
+            fields.get("role"),
+            reasoning_policy.TaskRole.REVIEWER if review else reasoning_policy.TaskRole.IMPLEMENTER,
+        ),
+        risk_tier=_enum_member(
+            reasoning_policy.RiskTier,
+            fields.get("risk_tier") or fields.get("risk"),
+            reasoning_policy.RiskTier.HIGH if review else reasoning_policy.RiskTier.MEDIUM,
+        ),
+        work_kind=_coerce_card_work_kind(fields.get("work_kind"), review=review),
+        difficulty=_enum_member(
+            reasoning_policy.Difficulty,
+            fields.get("difficulty"),
+            reasoning_policy.Difficulty.STANDARD,
+        ),
+        provider_family=family,
+    )
+
+
+def vscode_lm_route_capability(
+    model: str,
+    host_readiness: dict[str, Any] | None = None,
+) -> reasoning_policy.RouteCapability:
+    entry = _host_model_entry(host_readiness)
+    option_key = str(entry.get("effortOptionKey") or entry.get("effort_option_key") or "").strip()
+    raw_keys = entry.get("effortKeys") if "effortKeys" in entry else entry.get("effort_keys")
+    keys: tuple[str, ...] = ()
+    if isinstance(raw_keys, (list, tuple)):
+        keys = tuple(str(item).strip() for item in raw_keys if str(item).strip())
+    family = reasoning_policy.provider_family_for_route(
+        " ".join(
+            part for part in (
+                model,
+                str(entry.get("canonical") or ""),
+                str(entry.get("id") or ""),
+                str(entry.get("family") or ""),
+                str(entry.get("vendor") or ""),
+            ) if part
+        )
+    )
+    return reasoning_policy.RouteCapability(
+        route_id=str(entry.get("id") or model or "vscode_lm"),
+        provider_family=family,
+        supports_effort_control=bool(option_key),
+        effort_keys=keys,
+    )
+
+
+def vscode_lm_model_context(
+    host_readiness: dict[str, Any] | None = None,
+    token_budget: object = None,
+) -> dict[str, Any]:
+    _ = token_budget
+    entry = _host_model_entry(host_readiness)
+    capacity = _positive_int(entry.get("maxInputTokens"))
+    if capacity is None:
+        capacity = _positive_int(entry.get("max_input_tokens"))
+    return {
+        "schema_id": MODEL_CONTEXT_SCHEMA_ID,
+        "capacity_tokens": capacity,
+        "capacity_source": "model.maxInputTokens" if capacity is not None else "unknown",
+        "prompt_byte_cap": MAX_PROMPT_BYTES,
+        "pad_prompt": False,
+        "token_spend_cap_tokens": None,
+    }
+
+
+def resolve_vscode_lm_reasoning(
+    *,
+    request_kind: str,
+    model: str,
+    card: dict[str, Any] | None = None,
+    host_readiness: dict[str, Any] | None = None,
+    token_budget: object = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    request = vscode_lm_effort_request(request_kind=request_kind, card=card, model=model)
+    route = vscode_lm_route_capability(model, host_readiness)
+    decision = reasoning_policy.resolve_reasoning_effort(request, route)
+    payload = decision.as_dict()
+    option_key = str(
+        _host_model_entry(host_readiness).get("effortOptionKey")
+        or _host_model_entry(host_readiness).get("effort_option_key")
+        or ""
+    ).strip()
+    route_effort = payload.get("route_effort")
+    if isinstance(route_effort, dict):
+        route_effort["option_key"] = option_key or None
+        if not option_key:
+            route_effort["applied"] = False
+            if route_effort.get("status") == reasoning_policy.ControlStatus.APPLIED.value:
+                route_effort["status"] = reasoning_policy.ControlStatus.UNSUPPORTED.value
+                route_effort["applied_key"] = None
+    return payload, vscode_lm_model_context(host_readiness, token_budget)
+
+
 def create_request(
     *,
     repo: Path,
@@ -631,6 +811,8 @@ def create_request(
     source_graph_result: dict[str, Any] | None = None,
     request_kind: str = "worker",
     required_outputs: list[str] | None = None,
+    card: dict[str, Any] | None = None,
+    token_budget: dict[str, Any] | None = None,
 ) -> BridgeRequest:
     """Publish one repo-scoped request and private worker-side contract."""
     if not _REQUEST_ID_RE.fullmatch(request_id):
@@ -650,6 +832,13 @@ def create_request(
         raise BridgeError("bridge_workspace_request_mismatch")
     repo_id = _repo_id(repo)
     host_readiness = bridge_readiness(repo, model=model, adapter_id="vscode_lm")
+    reasoning_decision, model_context = resolve_vscode_lm_reasoning(
+        request_kind=request_kind,
+        model=model,
+        card=card,
+        host_readiness=host_readiness,
+        token_budget=token_budget,
+    )
     target_window_id = str(host_readiness.get("window_id") or "").strip()
     response_path = workspace_home / ".aiworkhub_vscode_lm_response.json"
     progress_path = workspace_home / ".aiworkhub_vscode_lm_progress.json"
@@ -761,6 +950,8 @@ def create_request(
         "initial_source_graph_request": initial_source_graph_request,
         "initial_source_graph_result": initial_source_graph_result,
         "request_kind": request_kind,
+        "reasoning_decision": reasoning_decision,
+        "model_context": model_context,
         # Bind the request to the fresh host selected by readiness.  Older
         # request fixtures may omit this field, but production requests must
         # never be stolen by another/stale VS Code window sharing the repo.

@@ -250,8 +250,10 @@ def _host(
     *,
     models: list[str],
     access_state: str = "unknown",
+    metadata_extra: dict[str, object] | None = None,
 ) -> Path:
     path = bridge_root / "hosts" / repo_id / "window_test.json"
+    extra = dict(metadata_extra or {})
     vscode_lm_bridge._atomic_json(  # noqa: SLF001 - contract-level test
         path,
         {
@@ -260,7 +262,13 @@ def _host(
             "window_id": "window_test",
             "models": models,
             "model_metadata": [
-                {"canonical": model, "id": model, "family": model, "access_state": access_state}
+                {
+                    "canonical": model,
+                    "id": model,
+                    "family": model,
+                    "access_state": access_state,
+                    **extra,
+                }
                 for model in models
             ],
             "permission_granted": access_state.startswith("granted"),
@@ -2470,3 +2478,286 @@ def test_bridge_prefetch_provenance_auditable_never_live(
     assert verification2["provenance_counts"] == {"prefetch": 1, "live": 1}
     assert verification2["live_source_graph_calls"] == 1
     assert verification2["fresh_source_graph_calls"] == 1
+
+
+def _effort_workspace(tmp_path: Path, request_id: str) -> tuple[Path, Path]:
+    workspace = tmp_path / request_id / "worktree"
+    home = tmp_path / request_id / "home"
+    workspace.mkdir(parents=True)
+    home.mkdir()
+    return workspace, home
+
+
+def test_create_request_worker_ordinary_code_selects_high_without_claiming_applied(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "bridge"
+    monkeypatch.setenv(vscode_lm_bridge.BRIDGE_ROOT_ENV, str(root))
+    repo = _repo(tmp_path)
+    repo_id = repository_state.inspect_repository(repo).manifest.repo_id
+    _host(root, repo_id, models=["glm-5.2"], access_state="granted_remembered")
+    request_id = "b" * 32
+    workspace, home = _effort_workspace(tmp_path, request_id)
+
+    request = vscode_lm_bridge.create_request(
+        repo=repo,
+        request_id=request_id,
+        workspace_path=workspace,
+        workspace_home=home,
+        prompt="Ordinary repository coding.",
+        model="glm-5.2",
+        allowed_writes=[],
+        timeout_seconds=30,
+        token_budget={"cap_tokens": 2048},
+    )
+    payload = json.loads(request.request_path.read_text(encoding="utf-8"))
+    decision = payload["reasoning_decision"]
+    effort = decision["route_effort"]
+    context = payload["model_context"]
+    assert decision["schema_id"] == "aiworkhub.reasoning_policy.decision.v1"
+    assert decision["profile"] == "canonical_high"
+    assert decision["request"]["role"] == "implementer"
+    assert decision["request"]["work_kind"] == "repository_coding"
+    assert effort["applied"] is False
+    assert effort["status"] == "unsupported"
+    assert effort["applied_key"] is None
+    assert context["capacity_tokens"] is None
+    assert context["capacity_source"] == "unknown"
+    assert context["prompt_byte_cap"] == vscode_lm_bridge.MAX_PROMPT_BYTES
+    assert context["pad_prompt"] is False
+    assert context["token_spend_cap_tokens"] is None
+
+
+def test_create_request_reviewer_and_high_risk_select_maximum_and_apply_verified_keys(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "bridge"
+    monkeypatch.setenv(vscode_lm_bridge.BRIDGE_ROOT_ENV, str(root))
+    repo = _repo(tmp_path)
+    repo_id = repository_state.inspect_repository(repo).manifest.repo_id
+    _host(
+        root,
+        repo_id,
+        models=["glm-5.2"],
+        access_state="granted_remembered",
+        metadata_extra={
+            "maxInputTokens": 128000,
+            "effortOptionKey": "reasoningEffort",
+            "effortKeys": ["low", "medium", "high", "xhigh"],
+        },
+    )
+    request_id = "c" * 32
+    workspace, home = _effort_workspace(tmp_path, request_id)
+
+    worker = vscode_lm_bridge.create_request(
+        repo=repo,
+        request_id=request_id,
+        workspace_path=workspace,
+        workspace_home=home,
+        prompt="Ordinary repository coding with verified keys.",
+        model="glm-5.2",
+        allowed_writes=[],
+        timeout_seconds=30,
+        token_budget={"cap_tokens": 512},
+    )
+    worker_payload = json.loads(worker.request_path.read_text(encoding="utf-8"))
+    worker_effort = worker_payload["reasoning_decision"]["route_effort"]
+    assert worker_payload["reasoning_decision"]["profile"] == "canonical_high"
+    assert worker_effort["applied"] is True
+    assert worker_effort["status"] == "applied"
+    assert worker_effort["applied_key"] == "high"
+    assert worker_effort["option_key"] == "reasoningEffort"
+    assert worker_payload["model_context"]["capacity_tokens"] == 128000
+    assert worker_payload["model_context"]["capacity_source"] == "model.maxInputTokens"
+    assert worker_payload["model_context"]["token_spend_cap_tokens"] is None
+
+    review_id = "d" * 32
+    review_workspace, review_home = _effort_workspace(tmp_path, review_id)
+    review = vscode_lm_bridge.create_request(
+        repo=repo,
+        request_id=review_id,
+        workspace_path=review_workspace,
+        workspace_home=review_home,
+        prompt="Quality review.",
+        model="glm-5.2",
+        allowed_writes=[],
+        timeout_seconds=30,
+        request_kind="quality_review",
+        card={
+            "role": "reviewer",
+            "risk_tier": "critical",
+            "work_kind": "correctness_review",
+            "difficulty": "complex",
+        },
+        token_budget={"cap_tokens": 99},
+    )
+    review_payload = json.loads(review.request_path.read_text(encoding="utf-8"))
+    review_effort = review_payload["reasoning_decision"]["route_effort"]
+    assert review_payload["reasoning_decision"]["profile"] == "canonical_maximum"
+    assert review_effort["applied"] is True
+    assert review_effort["applied_key"] == "xhigh"
+    assert review_payload["model_context"]["capacity_tokens"] == 128000
+    assert review_payload["model_context"]["token_spend_cap_tokens"] is None
+
+
+def test_resolve_vscode_lm_reasoning_uses_card_and_never_applies_without_keys() -> None:
+    decision, context = vscode_lm_bridge.resolve_vscode_lm_reasoning(
+        request_kind="worker",
+        model="glm-5.2",
+        card={
+            "role": "implementer",
+            "risk_tier": "high",
+            "work_kind": "architecture",
+            "difficulty": "complex",
+        },
+        host_readiness={},
+        token_budget={"cap_tokens": 32},
+    )
+    assert decision["profile"] == "canonical_maximum"
+    assert decision["request"]["risk_tier"] == "high"
+    assert decision["request"]["work_kind"] == "architecture"
+    assert decision["request"]["difficulty"] == "complex"
+    assert decision["route_effort"]["applied"] is False
+    assert decision["route_effort"]["status"] == "unsupported"
+    assert decision["route_effort"]["applied_key"] is None
+    assert context["token_spend_cap_tokens"] is None
+    assert context["pad_prompt"] is False
+
+
+def test_resolve_vscode_lm_reasoning_applies_only_declared_selectable_keys() -> None:
+    host = {
+        "selected_model_entry": {
+            "id": "glm-5.2",
+            "maxInputTokens": 64000,
+            "effortOptionKey": "reasoningEffort",
+            "effortKeys": ["low", "medium", "high", "xhigh"],
+        }
+    }
+    worker, worker_ctx = vscode_lm_bridge.resolve_vscode_lm_reasoning(
+        request_kind="worker",
+        model="glm-5.2",
+        card={"risk_tier": "medium", "work_kind": "repository_coding"},
+        host_readiness=host,
+        token_budget={"cap_tokens": 8},
+    )
+    assert worker["profile"] == "canonical_high"
+    assert worker["route_effort"]["applied"] is True
+    assert worker["route_effort"]["applied_key"] == "high"
+    assert worker["route_effort"]["option_key"] == "reasoningEffort"
+    assert worker_ctx["capacity_tokens"] == 64000
+    assert worker_ctx["capacity_source"] == "model.maxInputTokens"
+    assert worker_ctx["token_spend_cap_tokens"] is None
+
+    review, _review_ctx = vscode_lm_bridge.resolve_vscode_lm_reasoning(
+        request_kind="quality_review",
+        model="glm-5.2",
+        card={
+            "role": "reviewer",
+            "risk_tier": "critical",
+            "work_kind": "correctness_review",
+            "difficulty": "complex",
+        },
+        host_readiness=host,
+    )
+    assert review["profile"] == "canonical_maximum"
+    assert review["request"]["role"] == "reviewer"
+    assert review["route_effort"]["applied_key"] == "xhigh"
+
+
+def test_create_request_production_card_work_kinds_generic_and_bugfix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "bridge"
+    monkeypatch.setenv(vscode_lm_bridge.BRIDGE_ROOT_ENV, str(root))
+    repo = _repo(tmp_path)
+    repo_id = repository_state.inspect_repository(repo).manifest.repo_id
+    _host(root, repo_id, models=["glm-5.2"], access_state="granted_remembered")
+    for work_kind, request_id in (("generic", "e" * 32), ("bugfix", "f" * 32)):
+        workspace, home = _effort_workspace(tmp_path, request_id)
+        request = vscode_lm_bridge.create_request(
+            repo=repo,
+            request_id=request_id,
+            workspace_path=workspace,
+            workspace_home=home,
+            prompt=f"Production {work_kind} card.",
+            model="glm-5.2",
+            allowed_writes=[],
+            timeout_seconds=30,
+            card={"work_kind": work_kind, "risk_tier": "medium"},
+        )
+        payload = json.loads(request.request_path.read_text(encoding="utf-8"))
+        assert payload["reasoning_decision"]["request"]["work_kind"] == "repository_coding"
+        assert payload["reasoning_decision"]["profile"] == "canonical_high"
+
+
+def test_create_request_security_stays_security_and_review_stays_review(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "bridge"
+    monkeypatch.setenv(vscode_lm_bridge.BRIDGE_ROOT_ENV, str(root))
+    repo = _repo(tmp_path)
+    repo_id = repository_state.inspect_repository(repo).manifest.repo_id
+    _host(root, repo_id, models=["glm-5.2"], access_state="granted_remembered")
+    security_id = "a" * 32
+    workspace, home = _effort_workspace(tmp_path, security_id)
+    security = vscode_lm_bridge.create_request(
+        repo=repo,
+        request_id=security_id,
+        workspace_path=workspace,
+        workspace_home=home,
+        prompt="Security card.",
+        model="glm-5.2",
+        allowed_writes=[],
+        timeout_seconds=30,
+        card={"work_kind": "security"},
+    )
+    security_payload = json.loads(security.request_path.read_text(encoding="utf-8"))
+    assert security_payload["reasoning_decision"]["request"]["work_kind"] == "security"
+    review_id = "1" * 32
+    review_workspace, review_home = _effort_workspace(tmp_path, review_id)
+    review = vscode_lm_bridge.create_request(
+        repo=repo,
+        request_id=review_id,
+        workspace_path=review_workspace,
+        workspace_home=review_home,
+        prompt="Review card.",
+        model="glm-5.2",
+        allowed_writes=[],
+        timeout_seconds=30,
+        request_kind="quality_review",
+        card={"work_kind": "generic"},
+    )
+    review_payload = json.loads(review.request_path.read_text(encoding="utf-8"))
+    assert review_payload["reasoning_decision"]["request"]["work_kind"] == "correctness_review"
+    assert review_payload["request_kind"] == "quality_review"
+
+
+def test_vscode_lm_effort_request_maps_card_vocabulary_without_bridge_error() -> None:
+    generic = vscode_lm_bridge.vscode_lm_effort_request(
+        request_kind="worker", card={"work_kind": "generic"},
+    )
+    bugfix = vscode_lm_bridge.vscode_lm_effort_request(
+        request_kind="worker", card={"work_kind": "bugfix"},
+    )
+    refactor = vscode_lm_bridge.vscode_lm_effort_request(
+        request_kind="worker", card={"work_kind": "refactor"},
+    )
+    performance = vscode_lm_bridge.vscode_lm_effort_request(
+        request_kind="worker", card={"work_kind": "performance"},
+    )
+    data_ml = vscode_lm_bridge.vscode_lm_effort_request(
+        request_kind="worker", card={"work_kind": "data_ml"},
+    )
+    security = vscode_lm_bridge.vscode_lm_effort_request(
+        request_kind="worker", card={"work_kind": "security"},
+    )
+    review = vscode_lm_bridge.vscode_lm_effort_request(
+        request_kind="quality_review", card={"work_kind": "bugfix"},
+    )
+    assert generic.work_kind.value == "repository_coding"
+    assert bugfix.work_kind.value == "repository_coding"
+    assert refactor.work_kind.value == "repository_coding"
+    assert performance.work_kind.value == "repository_coding"
+    assert data_ml.work_kind.value == "repository_coding"
+    assert security.work_kind.value == "security"
+    assert review.work_kind.value == "correctness_review"

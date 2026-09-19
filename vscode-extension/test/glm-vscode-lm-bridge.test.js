@@ -4660,7 +4660,268 @@ async function nf831DirectFinalSubsetChecks() {
   }
 }
 
+async function nf897EffortContextChecks() {
+  const highDecision = {
+    schema_id: "aiworkhub.reasoning_policy.decision.v1",
+    profile: "canonical_high",
+    request: {
+      role: "implementer",
+      risk_tier: "medium",
+      work_kind: "repository_coding",
+      difficulty: "standard",
+      provider_family: "glm",
+    },
+    route_effort: { status: "unsupported", applied: false, applied_key: null },
+  };
+  const maxDecision = {
+    schema_id: "aiworkhub.reasoning_policy.decision.v1",
+    profile: "canonical_maximum",
+    request: {
+      role: "reviewer",
+      risk_tier: "critical",
+      work_kind: "correctness_review",
+      difficulty: "complex",
+      provider_family: "glm",
+    },
+    route_effort: { status: "unsupported", applied: false, applied_key: null },
+  };
+  const supported = {
+    maxInputTokens: 128000,
+    capabilities: {
+      toolCalling: false,
+      effortOptionKey: "reasoningEffort",
+      effortKeys: ["low", "medium", "high", "xhigh"],
+    },
+  };
+  const unsupported = { maxInputTokens: 8000, capabilities: { toolCalling: false } };
+  const workerReq = {
+    request_kind: "worker",
+    reasoning_decision: highDecision,
+    model_context: { capacity_tokens: 128000, prompt_byte_cap: 100, pad_prompt: false, token_spend_cap_tokens: null },
+    token_budget: { cap_tokens: 32 },
+  };
+  const reviewReq = { request_kind: "quality_review", reasoning_decision: maxDecision };
+
+  const workerApplied = internals.vscodeLmReasoningEffortReceipt(supported, workerReq);
+  assert.strictEqual(workerApplied.applied, true);
+  assert.strictEqual(workerApplied.status, "applied");
+  assert.strictEqual(workerApplied.applied_key, "high");
+  assert.strictEqual(workerApplied.option_key, "reasoningEffort");
+  assert.deepStrictEqual(workerApplied.model_options, { reasoningEffort: "high" });
+  const workerOptions = internals.vscodeLmLanguageModelRequestOptions(supported, workerReq);
+  assert.deepStrictEqual(workerOptions.modelOptions, { reasoningEffort: "high" });
+  assert.ok(!Object.prototype.hasOwnProperty.call(
+    internals.vscodeLmLanguageModelRequestOptions(unsupported, workerReq),
+    "modelOptions",
+  ));
+  const unsupportedReceipt = internals.vscodeLmReasoningEffortReceipt(unsupported, workerReq);
+  assert.strictEqual(unsupportedReceipt.applied, false);
+  assert.strictEqual(unsupportedReceipt.status, "unsupported");
+  assert.strictEqual(unsupportedReceipt.applied_key, null);
+
+  const reviewApplied = internals.vscodeLmReasoningEffortReceipt(supported, reviewReq);
+  assert.strictEqual(reviewApplied.profile, "canonical_maximum");
+  assert.strictEqual(reviewApplied.applied_key, "xhigh");
+  assert.deepStrictEqual(
+    internals.vscodeLmLanguageModelRequestOptions(supported, reviewReq).modelOptions,
+    { reasoningEffort: "xhigh" },
+  );
+
+  const staleHighLiveXhigh = internals.vscodeLmReasoningEffortReceipt(supported, {
+    request_kind: "quality_review",
+    reasoning_decision: {
+      ...maxDecision,
+      route_effort: { status: "applied", applied: true, applied_key: "high" },
+    },
+  });
+  assert.strictEqual(staleHighLiveXhigh.profile, "canonical_maximum");
+  assert.strictEqual(staleHighLiveXhigh.applied_key, "xhigh");
+  assert.deepStrictEqual(staleHighLiveXhigh.model_options, { reasoningEffort: "xhigh" });
+
+  const staleLowCanonicalHigh = internals.vscodeLmReasoningEffortReceipt(supported, {
+    request_kind: "worker",
+    reasoning_decision: {
+      ...highDecision,
+      route_effort: { status: "applied", applied: true, applied_key: "low" },
+    },
+  });
+  assert.strictEqual(staleLowCanonicalHigh.profile, "canonical_high");
+  assert.strictEqual(staleLowCanonicalHigh.applied_key, "high");
+  assert.deepStrictEqual(staleLowCanonicalHigh.model_options, { reasoningEffort: "high" });
+
+  const context = internals.vscodeLmModelContextReceipt(supported, workerReq);
+  assert.strictEqual(context.capacity_tokens, 128000);
+  assert.strictEqual(context.capacity_source, "model.maxInputTokens");
+  assert.strictEqual(context.pad_prompt, false);
+  assert.strictEqual(context.token_spend_cap_tokens, null);
+
+  const fallbackContext = internals.vscodeLmModelContextReceipt(
+    { capabilities: { toolCalling: false } },
+    workerReq,
+  );
+  assert.strictEqual(fallbackContext.capacity_tokens, 128000);
+  assert.strictEqual(fallbackContext.capacity_source, "request.model_context");
+  assert.notStrictEqual(fallbackContext.capacity_source, "model.maxInputTokens");
+  assert.strictEqual(fallbackContext.pad_prompt, false);
+  assert.strictEqual(fallbackContext.token_spend_cap_tokens, null);
+
+  const constructorLow = {
+    capabilities: {
+      toolCalling: false,
+      effortOptionKey: "reasoningEffort",
+      effortKeys: ["constructor", "low"],
+    },
+  };
+  const constructorLowReceipt = internals.vscodeLmReasoningEffortReceipt(constructorLow, workerReq);
+  assert.strictEqual(constructorLowReceipt.applied, false);
+  assert.notStrictEqual(constructorLowReceipt.applied_key, "constructor");
+  assert.ok(!Object.prototype.hasOwnProperty.call(
+    internals.vscodeLmLanguageModelRequestOptions(constructorLow, workerReq),
+    "modelOptions",
+  ));
+
+  const constructorHigh = {
+    capabilities: {
+      toolCalling: false,
+      effortOptionKey: "reasoningEffort",
+      effortKeys: ["constructor", "high"],
+    },
+  };
+  const constructorHighReceipt = internals.vscodeLmReasoningEffortReceipt(constructorHigh, workerReq);
+  assert.strictEqual(constructorHighReceipt.applied, true);
+  assert.strictEqual(constructorHighReceipt.applied_key, "high");
+  assert.deepStrictEqual(
+    internals.vscodeLmLanguageModelRequestOptions(constructorHigh, workerReq).modelOptions,
+    { reasoningEffort: "high" },
+  );
+
+  for (const inherited of ["toString", "__proto__"]) {
+    const inheritedOnly = {
+      capabilities: {
+        toolCalling: false,
+        effortOptionKey: "reasoningEffort",
+        effortKeys: [inherited],
+      },
+    };
+    const inheritedReceipt = internals.vscodeLmReasoningEffortReceipt(inheritedOnly, workerReq);
+    assert.strictEqual(inheritedReceipt.applied, false, inherited);
+    assert.notStrictEqual(inheritedReceipt.applied_key, inherited, inherited);
+    assert.ok(!Object.prototype.hasOwnProperty.call(
+      internals.vscodeLmLanguageModelRequestOptions(inheritedOnly, workerReq),
+      "modelOptions",
+    ), inherited);
+  }
+
+  const defaultKeys = {
+    capabilities: { toolCalling: false, effortOptionKey: "reasoningEffort", effortKeys: [] },
+  };
+  const defaultReceipt = internals.vscodeLmReasoningEffortReceipt(defaultKeys, workerReq);
+  assert.strictEqual(defaultReceipt.applied, false);
+  assert.strictEqual(defaultReceipt.status, "provider_default");
+  assert.ok(!Object.prototype.hasOwnProperty.call(
+    internals.vscodeLmLanguageModelRequestOptions(defaultKeys, workerReq),
+    "modelOptions",
+  ));
+
+  const finalResponse = JSON.stringify({
+    schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+    summary: "nf897",
+    edits: [],
+    creates: [{ path: "out/result.json", content: "{}\n" }],
+  });
+  const captured = [];
+  const execModel = {
+    ...supported,
+    sendRequest: async (_messages, options) => {
+      captured.push(options);
+      return { stream: (async function* stream() { yield { value: finalResponse }; }()) };
+    },
+  };
+  const textResult = await internals.runVscodeLmTextProtocol(
+    execModel,
+    {
+      prompt: "bounded",
+      allowedWrites: ["out/result.json"],
+      request_kind: "worker",
+      reasoning_decision: highDecision,
+      initial_source_graph_request: { mode: "focus", query: "nf897", workflow_stage: "orientation" },
+      initial_source_graph_result: { ok: true, content: "graph" },
+    },
+    undefined,
+    async () => ({ ok: true, content: "graph" }),
+  );
+  assert.strictEqual(textResult, finalResponse);
+  assert.ok(captured.length >= 1);
+  assert.deepStrictEqual(captured[0].modelOptions, { reasoningEffort: "high" });
+  assert.ok(!Object.prototype.hasOwnProperty.call(captured[0], "tools"));
+
+  const reviewSubmit = JSON.stringify({
+    schema_id: internals.constants.VSCODE_LM_TOOL_REQUEST_SCHEMA,
+    name: "aiworkhub_worker_quality_review_submit",
+    input: { packet_sha256: "a".repeat(64), lens: "correctness", findings: [] },
+  });
+  const reviewCaptured = [];
+  const reviewModel = {
+    ...supported,
+    sendRequest: async (_messages, options) => {
+      reviewCaptured.push(options);
+      return { stream: (async function* stream() { yield { value: reviewSubmit }; }()) };
+    },
+  };
+  await internals.runVscodeLmTextProtocol(
+    reviewModel,
+    {
+      prompt: "bounded review",
+      request_kind: "quality_review",
+      allowedWrites: [],
+      reasoning_decision: maxDecision,
+    },
+    undefined,
+    async () => ({ ok: true, durable: true, submission_id: "b".repeat(64) }),
+  );
+  assert.ok(reviewCaptured.length >= 1);
+  assert.deepStrictEqual(reviewCaptured[0].modelOptions, { reasoningEffort: "xhigh" });
+
+  const nativeFinal = JSON.stringify({
+    schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+    summary: "nf897 native",
+    edits: [],
+    creates: [{ path: "out/result.json", content: "{}\n" }],
+  });
+  const nativeCaptured = [];
+  const nativeModel = {
+    maxInputTokens: 128000,
+    capabilities: {
+      toolCalling: true,
+      effortOptionKey: "reasoningEffort",
+      effortKeys: ["low", "medium", "high", "xhigh"],
+    },
+    sendRequest: async (_messages, options) => {
+      nativeCaptured.push(options);
+      return { stream: (async function* stream() { yield { value: nativeFinal }; }()) };
+    },
+  };
+  const nativeResult = await internals.runVscodeLmAgent(
+    nativeModel,
+    {
+      requestId: "e".repeat(32),
+      prompt: "bounded native",
+      allowedWrites: ["out/result.json"],
+      request_kind: "worker",
+      reasoning_decision: highDecision,
+      initial_source_graph_request: { mode: "focus", query: "nf897", workflow_stage: "orientation" },
+      initial_source_graph_result: { ok: true, content: "graph" },
+    },
+    undefined,
+    async () => ({ ok: true, content: "graph" }),
+  );
+  assert.ok(nativeCaptured.length >= 1);
+  assert.deepStrictEqual(nativeCaptured[0].modelOptions, { reasoningEffort: "high" });
+  assert.ok(String(nativeResult).length > 0);
+}
+
 async function main() {
+  await nf897EffortContextChecks();
   await nf831DirectFinalSubsetChecks();
   const schema = internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA;
   const allowed = ["src/*.py", "tests/*.py"];
