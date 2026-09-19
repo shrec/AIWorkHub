@@ -6,6 +6,26 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.49] - 2026-09-19
+
+### Added
+
+- The accepted-task evaluation corpus is resealed against 49 current-byte,
+  receipt-authenticated examples, with a live provenance check.
+- Outcome-linked NeedFix and SDLC metrics, provider reasoning policy, typed
+  learning dispositions and review-chain recovery are included from this wave.
+
+### Fixed
+
+- SDLC metrics use the shared read-only SQLite connector, so repository paths
+  containing `#` are encoded correctly rather than opening the wrong database.
+- OpenCode's global AIWorkHub MCP registration uses the short `awh` alias and
+  remains repository-neutral; reviewer tools and worker adapter identity are
+  wired for OpenCode routes.
+- Windows and OpenCode fixes documented in the staged 0.11.45-0.11.48 sections
+  below are included in this release. Those numbers were written as development
+  notes but were never published as Git tags or separate VSIX releases.
+
 ## [0.11.48] - 2026-09-16
 
 ### Fixed

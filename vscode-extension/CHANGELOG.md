@@ -1,5 +1,22 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.49 — 2026-09-19
+
+### Added
+
+- Outcome-linked NeedFix metrics are included in the bundled runtime; the
+  source repository release includes a receipt-authenticated accepted-task
+  evaluation corpus, which is not packaged in the VSIX.
+
+### Fixed
+
+- OpenCode's global MCP registration uses the short `awh` alias and is not
+  pinned to the AIWorkHub repository.
+- The bundled SDLC metrics reader uses the shared read-only SQLite connector
+  for paths containing URI-significant characters such as `#`.
+- The Windows and OpenCode fixes in the 0.11.45-0.11.48 development notes below
+  ship together here; those intermediate numbers were not separately tagged.
+
 ## 0.11.48 — 2026-09-16
 
 ### Fixed

@@ -62,6 +62,16 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
+## What's new in 0.11.49
+
+- This intermediate release combines the previously staged Windows and
+  OpenCode fixes with repository-neutral OpenCode MCP registration (`awh`),
+  outcome-linked NeedFix metrics and accepted-task evaluation evidence.
+- SDLC metrics now read SQLite safely even when the repository path contains
+  `#`; the accepted-task corpus is resealed against 49 current-byte examples.
+- The 0.11.45-0.11.48 changelog entries describe changes included here; no
+  separate Git tags were published for those numbers.
+
 ## What's new in 0.11.44
 
 - Windows task creation, installed-tool measurement, authority-key validation and
@@ -70,8 +80,8 @@ structured findings into NeedFix with provenance.
 - The global collision guard now ignores pending cards whose dependencies lack
   an authenticated accepted-outcome receipt, while processing and review scopes
   remain active.
-- 0.11.44 is the current source release in this repository; Marketplace and
-  GitHub Release publication remain separate measured channels.
+- 0.11.44 was the previous source metadata version; Marketplace and GitHub
+  Release publication are separate measured channels.
 
 ## What's new in 0.11.43
 
@@ -160,7 +170,7 @@ manager-accepted quality; a cheap failed run is not an economic success.
 ## Source intelligence and durable context
 
 <div align="center">
-  <a href="site/assets/aiworkhub-source-graph-architecture.png"><img src="site/assets/aiworkhub-source-graph-architecture.svg" alt="AIWorkHub Source Graph architecture: refresh control, the five-stage write path, the repository-local SQLite index, and the five-stage read path that feeds focused semantic edits and the review overlay" width="100%"></a>
+  <a href="site/assets/aiworkhub-source-graph-architecture.svg"><img src="site/assets/aiworkhub-source-graph-architecture.svg" alt="AIWorkHub Source Graph architecture: refresh control, the five-stage write path, the repository-local SQLite index, and the five-stage read path that feeds focused semantic edits and the review overlay" width="100%"></a>
 </div>
 
 AIWorkHub has two graphs with different authority. They are complementary,

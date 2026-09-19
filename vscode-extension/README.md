@@ -14,6 +14,17 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.11.49
+
+- This intermediate release combines the staged Windows and OpenCode fixes
+  below; the 0.11.45-0.11.48 headings were development notes, not separate
+  published releases.
+- OpenCode's global AIWorkHub MCP server is registered as `awh` so models with
+  a short MCP-name limit can use it without changing the server's identity.
+- The bundled runtime includes outcome-linked NeedFix metrics; the source
+  repository release includes the resealed accepted-task evaluation corpus
+  (the corpus is not packaged in the VSIX).
+
 ## What's new in 0.11.48
 
 - OpenCode's model list in Settings no longer crowds out newly-discovered
