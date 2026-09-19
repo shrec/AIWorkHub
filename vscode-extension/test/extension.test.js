@@ -277,25 +277,28 @@ test("readOpencodeConfigDocument fails closed on malformed/corrupt JSON content"
   });
 });
 
-test(
-  "readOpencodeConfigDocument fails closed on an unreadable (permission-denied) config",
-  { skip: process.platform === "win32" },
-  () => {
-    withTempConfigHome((configHome) => {
-      if (process.getuid && process.getuid() === 0) return;
-      const configPath = path.join(configHome, "opencode.json");
-      const original = '{"theme":"dark"}\n';
-      fs.writeFileSync(configPath, original, "utf8");
-      fs.chmodSync(configPath, 0o000);
-      try {
-        const result = readOpencodeConfigDocument(configPath);
-        assert.equal(result.ok, false);
-      } finally {
-        fs.chmodSync(configPath, 0o600);
+test("readOpencodeConfigDocument fails closed on an unreadable (permission-denied) config", () => {
+  withTempConfigHome((configHome) => {
+    const configPath = path.join(configHome, "opencode.json");
+    const original = '{"theme":"dark"}\n';
+    fs.writeFileSync(configPath, original, "utf8");
+    const originalReadFileSync = fs.readFileSync;
+    fs.readFileSync = function patchedReadFileSync(file, ...rest) {
+      if (file === configPath) {
+        const err = new Error(`EACCES: permission denied, open '${configPath}'`);
+        err.code = "EACCES";
+        throw err;
       }
-    });
-  },
-);
+      return originalReadFileSync.call(this, file, ...rest);
+    };
+    try {
+      const result = readOpencodeConfigDocument(configPath);
+      assert.equal(result.ok, false);
+    } finally {
+      fs.readFileSync = originalReadFileSync;
+    }
+  });
+});
 
 test(
   "atomicWriteJsonPreservingMode preserves an existing file's permission bits instead of the umask default",
