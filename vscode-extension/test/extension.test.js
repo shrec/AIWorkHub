@@ -62,7 +62,7 @@ test("resolveOpencodeConfigJsonPath falls back to XDG_CONFIG_HOME/opencode/openc
 test("repairOpencodeConfigJsonObject creates a repository-neutral entry with no repo identity keys", () => {
   const { document, changed } = repairOpencodeConfigJsonObject({}, ["python3", "/launcher.py"]);
   assert.equal(changed, true);
-  const entry = document.mcp.aiworkhub;
+  const entry = document.mcp.awh;
   assert.deepEqual(entry.command, ["python3", "/launcher.py"]);
   assert.equal(entry.type, "local");
   assert.equal(entry.enabled, true);
@@ -76,7 +76,7 @@ test("repairOpencodeConfigJsonObject strips only AIWorkHub-owned repository iden
     theme: "dark",
     permission: { "*": "allow" },
     mcp: {
-      aiworkhub: {
+      awh: {
         type: "local",
         command: ["stale-python", "/old/launcher.py"],
         enabled: false,
@@ -99,7 +99,7 @@ test("repairOpencodeConfigJsonObject strips only AIWorkHub-owned repository iden
   assert.equal(changed, true);
   assert.equal(document.theme, "dark");
   assert.deepEqual(document.permission, { "*": "allow" });
-  const entry = document.mcp.aiworkhub;
+  const entry = document.mcp.awh;
   assert.deepEqual(entry.command, ["python3", "/new/launcher.py"]);
   assert.equal(entry.enabled, false, "an operator-disabled entry must not be silently re-enabled");
   assert.equal(entry.environment.AIWORKHUB_ALLOW_WRITES, "0", "an operator-set capability gate must not be overwritten");
@@ -125,7 +125,7 @@ test("repairOpencodeConfigJsonObject repairs every AIWorkHub-owned entry, not ju
           KEEP_ME: "ultrafast-flag",
         },
       },
-      aiworkhub: {
+      awh: {
         type: "local",
         command: ["stale-python", "/old/launcher.py"],
         environment: {
@@ -138,7 +138,7 @@ test("repairOpencodeConfigJsonObject repairs every AIWorkHub-owned entry, not ju
   };
   const { document, changed } = repairOpencodeConfigJsonObject(before, ["python3", "/new/launcher.py"]);
   assert.equal(changed, true);
-  for (const ownedName of ["aiworkhub", "aiworkhub_ultrafast"]) {
+  for (const ownedName of ["awh", "aiworkhub_ultrafast"]) {
     const entry = document.mcp[ownedName];
     for (const key of ["AIWORKHUB_REPO_ROOT", "AIWORKHUB_REPO", "AIWORKHUB_REPO_ID"]) {
       assert.equal(
@@ -151,7 +151,7 @@ test("repairOpencodeConfigJsonObject repairs every AIWorkHub-owned entry, not ju
   assert.equal(document.mcp.aiworkhub_ultrafast.environment.KEEP_ME, "ultrafast-flag");
   // Only the canonical entry is re-pointed at the stable launcher; a distinct
   // owned registration keeps its own launcher.
-  assert.deepEqual(document.mcp.aiworkhub.command, ["python3", "/new/launcher.py"]);
+  assert.deepEqual(document.mcp.awh.command, ["python3", "/new/launcher.py"]);
   assert.deepEqual(
     document.mcp.aiworkhub_ultrafast.command,
     ["stale-python", "/old/ultrafast-launcher.py"],
@@ -170,13 +170,29 @@ test("repairOpencodeConfigJsonObject creates the canonical entry rather than hij
     },
   };
   const { document } = repairOpencodeConfigJsonObject(before, ["python3", "/new/launcher.py"]);
-  assert.deepEqual(document.mcp.aiworkhub.command, ["python3", "/new/launcher.py"]);
+  assert.deepEqual(document.mcp.awh.command, ["python3", "/new/launcher.py"]);
   assert.deepEqual(
     document.mcp["aiworkhub-renamed"].command,
     ["python3", "/bin/aiworkhub-mcp-server.py"],
     "a command-detected owned entry keeps its launcher and only loses repo identity",
   );
   assert.deepEqual(document.mcp["aiworkhub-renamed"].environment, { TOKEN: "keep-me" });
+});
+
+test("repairOpencodeConfigJsonObject keeps an existing aiworkhub entry while adding awh", () => {
+  const legacy = {
+    type: "local",
+    command: ["python3", "/legacy.py"],
+    enabled: false,
+    environment: { KEEP: "legacy" },
+  };
+  const { document } = repairOpencodeConfigJsonObject(
+    { mcp: { aiworkhub: legacy } },
+    ["python3", "/new/launcher.py"],
+  );
+  assert.deepEqual(Object.keys(document.mcp).sort(), ["aiworkhub", "awh"]);
+  assert.deepEqual(document.mcp.aiworkhub, legacy);
+  assert.deepEqual(document.mcp.awh.command, ["python3", "/new/launcher.py"]);
 });
 
 test("repairOpencodeConfigJsonObject is idempotent once repaired", () => {
@@ -186,6 +202,7 @@ test("repairOpencodeConfigJsonObject is idempotent once repaired", () => {
 });
 
 test("isOwnedOpencodeMcpEntry recognizes the canonical name and the stable launcher, never an unrelated server", () => {
+  assert.equal(isOwnedOpencodeMcpEntry("awh", { command: ["anything"] }), true);
   assert.equal(isOwnedOpencodeMcpEntry("aiworkhub", { command: ["anything"] }), true);
   assert.equal(isOwnedOpencodeMcpEntry("custom", { command: ["python3", "/bin/aiworkhub-mcp-server.py"] }), true);
   assert.equal(isOwnedOpencodeMcpEntry("custom", { command: ["node", "unrelated.js"] }), false);

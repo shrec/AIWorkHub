@@ -492,7 +492,8 @@ def test_opencode_global_mcp_entry_is_created_repository_neutral(tmp_path: Path)
         """(internals) => internals.repairOpencodeConfigJsonObject({}, ["python3", "/launcher.py"])""",
     )
     assert result["changed"] is True
-    entry = result["document"]["mcp"]["aiworkhub"]
+    entry = result["document"]["mcp"]["awh"]
+    assert "aiworkhub" not in result["document"]["mcp"]
     assert entry["type"] == "local"
     assert entry["command"] == ["python3", "/launcher.py"]
     assert entry["enabled"] is True
@@ -505,7 +506,7 @@ def test_opencode_global_mcp_repair_sanitizes_both_owned_entries_and_picks_the_c
 ) -> None:
     # Two AIWorkHub-owned entries coexist and "aiworkhub_ultrafast" is declared
     # FIRST on purpose: repair must sanitize BOTH, and must re-point the
-    # canonical "aiworkhub" entry -- selected by name, never by whichever owned
+    # canonical "awh" entry -- selected by name, never by whichever owned
     # entry happens to come first in Object.entries -- at the stable launcher.
     result = _drive_extension_internals(
         tmp_path,
@@ -522,7 +523,7 @@ def test_opencode_global_mcp_repair_sanitizes_both_owned_entries_and_picks_the_c
                 KEEP_ME: "ultrafast-flag",
               },
             },
-            aiworkhub: {
+            awh: {
               type: "local",
               command: ["stale-python", "/old/launcher.py"],
               enabled: false,
@@ -548,22 +549,22 @@ def test_opencode_global_mcp_repair_sanitizes_both_owned_entries_and_picks_the_c
     servers = document["mcp"]
 
     # No AIWorkHub-owned entry retains ANY repository-identity key.
-    for owned_name in ("aiworkhub", "aiworkhub_ultrafast"):
+    for owned_name in ("awh", "aiworkhub_ultrafast"):
         environment = servers[owned_name]["environment"]
         for key in _REPO_IDENTITY_ENV_KEYS:
             assert key not in environment, f"{owned_name} still carries {key}"
 
     # The canonical entry is the one re-pointed at the stable launcher.
-    assert servers["aiworkhub"]["command"] == ["python3", "/new/launcher.py"]
+    assert servers["awh"]["command"] == ["python3", "/new/launcher.py"]
     assert servers["aiworkhub_ultrafast"]["command"] == [
         "stale-python",
         "/old/ultrafast-launcher.py",
     ]
 
     # Secrets, capability gates and an operator-disabled flag survive repair.
-    assert servers["aiworkhub"]["environment"]["SOME_SECRET"] == "keep-me"
-    assert servers["aiworkhub"]["environment"]["AIWORKHUB_ALLOW_WRITES"] == "0"
-    assert servers["aiworkhub"]["enabled"] is False
+    assert servers["awh"]["environment"]["SOME_SECRET"] == "keep-me"
+    assert servers["awh"]["environment"]["AIWORKHUB_ALLOW_WRITES"] == "0"
+    assert servers["awh"]["enabled"] is False
     assert servers["aiworkhub_ultrafast"]["environment"]["KEEP_ME"] == "ultrafast-flag"
 
     # An unrelated MCP registration is never rewritten, not even its env.
@@ -572,6 +573,31 @@ def test_opencode_global_mcp_repair_sanitizes_both_owned_entries_and_picks_the_c
         "command": ["node", "unrelated.js"],
         "environment": {"AIWORKHUB_REPO_ROOT": "/should/not/be/touched"},
     }
+
+
+def test_opencode_global_alias_does_not_migrate_existing_aiworkhub_entry(tmp_path: Path) -> None:
+    result = _drive_extension_internals(
+        tmp_path,
+        """(internals) => internals.repairOpencodeConfigJsonObject({
+          mcp: {
+            aiworkhub: {
+              type: "local",
+              command: ["python3", "/legacy.py"],
+              enabled: false,
+              environment: { KEEP: "legacy" },
+            },
+          },
+        }, ["python3", "/new/launcher.py"])""",
+    )
+    servers = result["document"]["mcp"]
+    assert set(servers) == {"aiworkhub", "awh"}
+    assert servers["aiworkhub"] == {
+        "type": "local",
+        "command": ["python3", "/legacy.py"],
+        "enabled": False,
+        "environment": {"KEEP": "legacy"},
+    }
+    assert servers["awh"]["command"] == ["python3", "/new/launcher.py"]
 
 
 def test_opencode_global_mcp_repair_is_idempotent(tmp_path: Path) -> None:

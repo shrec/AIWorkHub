@@ -342,20 +342,16 @@ def test_opencode_global_mcp_entry_never_persists_repository_identity_keys():
 
 
 def test_opencode_global_mcp_repair_strips_every_owned_entry_and_names_the_canonical_one():
-    # OWNED_MCP_SERVER_NAMES legitimately contains two distinct entries
-    # ("aiworkhub" and "aiworkhub_ultrafast"); repair must not stop at the
-    # first one it finds, and the entry that gets re-pointed at the stable
-    # launcher must be chosen by an explicit canonical NAME -- JSON object key
-    # ordering is not a policy. The executing regression that drives the real
-    # JavaScript through a node child lives in
-    # tests/test_opencode_workforce_integration.py.
+    # The legacy names "aiworkhub" and "aiworkhub_ultrafast" are owned;
+    # "awh" is recognized separately. Repair sanitizes all owned entries but
+    # repoints only the canonical awh entry, regardless of JSON object order.
+    # The behavioral regression lives in test_opencode_workforce_integration.py.
     body = _slice(_EXTENSION_JS, "function repairOpencodeConfigJsonObject(", 3200)
     loop_start = body.index("for (const [name, entry] of Object.entries(servers)) {")
     loop_end = body.index("\n  }\n", loop_start)
     loop_body = body[loop_start:loop_end]
     assert "break" not in loop_body
     assert "ownedName" not in body
-    assert 'const CANONICAL_OPENCODE_MCP_SERVER_NAME = "aiworkhub";' in _EXTENSION_JS
     assert "const name = CANONICAL_OPENCODE_MCP_SERVER_NAME;" in body
 
 

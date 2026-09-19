@@ -7349,7 +7349,7 @@ const OPENCODE_REPO_IDENTITY_ENV_KEYS = Object.freeze([
 ]);
 
 function isOwnedOpencodeMcpEntry(name, entry) {
-  if (OWNED_MCP_SERVER_NAMES.has(String(name || "").toLowerCase())) return true;
+  if (name === CANONICAL_OPENCODE_MCP_SERVER_NAME || OWNED_MCP_SERVER_NAMES.has(String(name || "").toLowerCase())) return true;
   const command = entry && Array.isArray(entry.command) ? entry.command.map(String) : [];
   return command.some((token) => token === "aiworkhub.server" || /aiworkhub-mcp-server\.py$/.test(token));
 }
@@ -7359,7 +7359,7 @@ function isOwnedOpencodeMcpEntry(name, entry) {
 // AIWorkHub-owned entry happens to come first in `Object.entries(document.mcp)`:
 // JSON object ordering is not a policy, and letting it decide would silently
 // overwrite a deliberately separate registration's type/command.
-const CANONICAL_OPENCODE_MCP_SERVER_NAME = "aiworkhub";
+const CANONICAL_OPENCODE_MCP_SERVER_NAME = "awh";
 
 /** Pure repair of an in-memory opencode.json document: create or repair the
  * canonical AIWorkHub-owned entry to point at the host-stable launcher, and
