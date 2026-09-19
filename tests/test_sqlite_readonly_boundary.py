@@ -31,6 +31,7 @@ SCOPE_FILES = (
     "aiworkhub/task_store.py",
     "aiworkhub/task_retention.py",
     "aiworkhub/source_graph.py",
+    "aiworkhub/sdlc_outcome_metrics.py",
     "aiworkhub/context_importer.py",
     "aiworkhub/context_write_intents.py",
     "aiworkhub/worker_ai_tools_mcp.py",
@@ -44,6 +45,8 @@ EXPECTED_USERS = (
     ("aiworkhub/task_store.py", "connect_readonly(canonical)"),
     ("aiworkhub/task_retention.py", "connect_readonly(path)"),
     ("aiworkhub/source_graph.py", "connect_readonly(db_path, timeout=30.0)"),
+    ("aiworkhub/sdlc_outcome_metrics.py", "connect_readonly(readiness.canonical_db)"),
+    ("aiworkhub/sdlc_outcome_metrics.py", "connect_readonly(needfix_path)"),
     ("aiworkhub/context_importer.py", "connect_readonly(path, timeout=5)"),
     ("aiworkhub/context_write_intents.py", "connect_readonly(path, timeout=5)"),
     (
@@ -162,6 +165,8 @@ def test_timeout_preserved_per_site() -> None:
         ("aiworkhub/task_store.py", "connect_readonly(canonical)", "5.0 (default)", "5.0 (default)"),
         ("aiworkhub/task_retention.py", "connect_readonly(path)", "5.0 (default)", "5.0 (default)"),
         ("aiworkhub/source_graph.py", "connect_readonly(db_path, timeout=30.0)", "30.0", "30.0"),
+        ("aiworkhub/sdlc_outcome_metrics.py", "connect_readonly(readiness.canonical_db)", "5.0 (default)", "5.0 (default)"),
+        ("aiworkhub/sdlc_outcome_metrics.py", "connect_readonly(needfix_path)", "5.0 (default)", "5.0 (default)"),
         ("aiworkhub/context_importer.py", "connect_readonly(path, timeout=5)", "5", "5"),
         ("aiworkhub/context_write_intents.py", "connect_readonly(path, timeout=5)", "5", "5"),
         (

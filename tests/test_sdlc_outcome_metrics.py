@@ -50,6 +50,80 @@ def _cause(task_id: str, request_id: str, digest: str):
     }
 
 
+def test_read_repository_metrics_reads_real_hash_paths_readonly(
+    tmp_path, monkeypatch
+):
+    from types import SimpleNamespace
+
+    repo_root = tmp_path / "repo#frag"
+    repo_root.mkdir()
+    task_db = repo_root / "tasks#main.db"
+    conn = sqlite3.connect(str(task_db))
+    try:
+        conn.execute(
+            "CREATE TABLE task_events("
+            "event_id INTEGER PRIMARY KEY, task_id TEXT, event TEXT, "
+            "payload_json TEXT, created_at TEXT)"
+        )
+        event = _accepted(1, "T1", "R1", "a" * 64)
+        conn.execute(
+            "INSERT INTO task_events"
+            "(event_id, task_id, event, payload_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                1,
+                "T1",
+                "accept_review",
+                json.dumps(event["payload"]),
+                "2026-01-01T00:00:00Z",
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    needfix_db = repo_root.joinpath(*needfix_store.NEEDFIX_DB_REL)
+    needfix_db.parent.mkdir(parents=True, exist_ok=True)
+    nf_conn = sqlite3.connect(str(needfix_db))
+    try:
+        nf_conn.execute(
+            "CREATE TABLE needfix("
+            "id TEXT, caused_by_json TEXT, created_at TEXT)"
+        )
+        nf_conn.execute(
+            "INSERT INTO needfix(id, caused_by_json, created_at) "
+            "VALUES (?, ?, ?)",
+            (
+                "NF-1",
+                json.dumps(_cause("T1", "R1", "a" * 64)),
+                "2026-01-01T00:00:01Z",
+            ),
+        )
+        nf_conn.commit()
+    finally:
+        nf_conn.close()
+    monkeypatch.setattr(
+        task_store,
+        "storage_readiness",
+        lambda root: SimpleNamespace(
+            ready=True, reason="", canonical_db=task_db
+        ),
+    )
+    result = sdlc_outcome_metrics.read_repository_metrics(
+        repo_root, repository_id="repo-one"
+    )
+    assert result["first_pass_acceptance"]["numerator"] == 1
+    assert result["first_pass_acceptance"]["denominator"] == 1
+    assert result["escaped_defect_attribution"]["numerator"] == 1
+    assert result["escaped_defect_attribution"]["unknown_unattributed"] == 0
+    assert (
+        result["population_bounds"]["canonical_events_after_deduplication"] == 1
+    )
+    # Filesystem truth: both '#' databases still exist and no fragment-stripped
+    # sibling file a raw f-string URI open would create was materialised.
+    assert task_db.exists()
+    assert needfix_db.exists()
+    assert not (tmp_path / "repo").exists()
+
 def test_mixed_population_reports_coverage_and_unknown_without_guessing():
     events = [
         _accepted(1, "T1", "R1", "a" * 64),

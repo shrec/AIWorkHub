@@ -7,14 +7,14 @@
     "small",
     "trivial"
   ],
-  "record_count": 50,
+  "record_count": 49,
   "record_type": "accepted_task_trajectory_eval_corpus",
   "risk_tiers": [
     "high",
     "low",
     "medium"
   ],
-  "rows_sha256": "8050b7e4188d22cb37f691187921089cc30253460e94c4843029432cd2f00b65",
+  "rows_sha256": "9d3e55a75f2ed76bc6e50f061c11ccdaa318abba76696df8a95fa8c262cccdb9",
   "schema_id": "aiworkhub.accepted_task_trajectories.v1",
   "task_families": [
     "ai-native-sdlc-playbook-gap-audit",
@@ -23,7 +23,6 @@
     "needfix-NF-2026-00849",
     "needfix-NF-2026-00897",
     "needfix-NF-2026-00899",
-    "needfix-event-vocabulary",
     "nf697-release-verify",
     "opencode-gpt-canary",
     "ponytail-high-roi-adoption-contract",
@@ -41,6 +40,6 @@
     "vscode-counter-precision",
     "windows-runtime-reliability"
   ],
-  "total_events_count": 212,
+  "total_events_count": 207,
   "verdict": "PASS"
 }

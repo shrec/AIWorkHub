@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from . import needfix_store, task_store
+from .sqlite_readonly import connect_readonly
 
 SCHEMA_ID = "aiworkhub.sdlc_outcome_metrics.v1"
 DEFAULT_LIMIT = 500
@@ -201,7 +202,7 @@ def read_repository_metrics(
     readiness = task_store.storage_readiness(Path(repo_root))
     if not readiness.ready:
         raise task_store.StorageNotReadyError(readiness.reason)
-    task_conn = sqlite3.connect(f"file:{readiness.canonical_db}?mode=ro", uri=True)
+    task_conn = connect_readonly(readiness.canonical_db)
     task_conn.row_factory = sqlite3.Row
     try:
         event_rows = [
@@ -215,7 +216,7 @@ def read_repository_metrics(
     needfix_path = Path(repo_root).joinpath(*needfix_store.NEEDFIX_DB_REL)
     needfix_rows: list[dict[str, Any]] = []
     if needfix_path.is_file():
-        nf_conn = sqlite3.connect(f"file:{needfix_path}?mode=ro", uri=True)
+        nf_conn = connect_readonly(needfix_path)
         nf_conn.row_factory = sqlite3.Row
         try:
             needfix_rows = [
