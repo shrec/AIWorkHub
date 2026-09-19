@@ -12,14 +12,16 @@ from typing import Any
 MAX_EVENT_BYTES = 1_048_576
 MAX_EVENTS = 4096
 # Provider events whose entire content is live progress: one streamed
-# assistant text delta, and one background-task roster change.  Both are
-# emitted per UI tick, so a single long reviewer turn can push tens of
-# thousands of them into the retained stream and refuse a review that did
-# produce one clean report as ``provider_events_oversized``.  They are
-# compacted out of the RETAINED stream only (see ``replayable_progress_event``
-# for why that is safe); the live stream a human watches is untouched.
+# assistant text delta, one streamed assistant reasoning (thinking) delta,
+# and one background-task roster change.  All three are emitted per UI tick,
+# so a single long reviewer turn can push tens of thousands of them into the
+# retained stream and refuse a review that did produce one clean report as
+# ``provider_events_oversized``.  They are compacted out of the RETAINED
+# stream only (see ``replayable_progress_event`` for why that is safe); the
+# live stream a human watches is untouched.
 REPLAYABLE_PROGRESS_EVENT_TYPES: frozenset[str] = frozenset({
     "assistant.message_delta",
+    "assistant.reasoning_delta",
     "session.background_tasks_changed",
 })
 # Compaction must not trade a bounded refusal for unbounded work, so the

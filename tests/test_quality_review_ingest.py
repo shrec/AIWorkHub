@@ -1014,13 +1014,13 @@ def test_every_protocol_category_is_repairable_or_disclaimed() -> None:
 # --- NF-2026-00163: bounded replayable progress-event compaction ----------
 #
 # A reviewer stream carries one record per UI tick, so a long review routinely
-# emits tens of thousands of ``assistant.message_delta`` and
-# ``session.background_tasks_changed`` events.  That amplification pushed the
-# RETAINED stream past ``MAX_EVENTS`` and refused complete reviews as
-# ``provider_events_oversized``.  Those two types -- and only those two -- are
-# now compacted out before the count.  Most of what follows pins down what may
-# NOT change: the ceilings themselves, retained ordering, every other event
-# type, and each fail-closed refusal.
+# emits tens of thousands of ``assistant.message_delta``,
+# ``assistant.reasoning_delta`` and ``session.background_tasks_changed``
+# events.  That amplification pushed the RETAINED stream past ``MAX_EVENTS``
+# and refused complete reviews as ``provider_events_oversized``.  Those three
+# types -- and only those three -- are now compacted out before the count.
+# Most of what follows pins down what may NOT change: the ceilings themselves,
+# retained ordering, every other event type, and each fail-closed refusal.
 
 LENS = "correctness"
 
@@ -1043,12 +1043,17 @@ def _background_tasks_changed(index: int) -> str:
     })
 
 
+def _reasoning_delta(index: int) -> str:
+    return json.dumps({
+        "type": "assistant.reasoning_delta",
+        "data": {"delta": f"reason {index}"},
+    })
+
+
 def _progress_chatter(count: int) -> list[str]:
-    """``count`` known replayable progress events, both types interleaved."""
-    return [
-        _message_delta(index) if index % 2 else _background_tasks_changed(index)
-        for index in range(count)
-    ]
+    """``count`` known replayable progress events, all three types interleaved."""
+    builders = (_message_delta, _reasoning_delta, _background_tasks_changed)
+    return [builders[index % len(builders)](index) for index in range(count)]
 
 
 def test_an_amplified_progress_stream_reconstructs_the_unamplified_report():
@@ -1110,6 +1115,8 @@ def test_a_named_progress_type_carrying_a_report_channel_is_retained(monkeypatch
         # A near-miss on each known name, so the allowlist is exact.
         lambda index: json.dumps({"type": "assistant.message_delta_v2",
                                   "data": {"delta": index}}),
+        lambda index: json.dumps({"type": "assistant.reasoning_delta_v2",
+                                  "data": {"delta": index}}),
         lambda index: json.dumps({"type": "session.background_tasks",
                                   "data": {"tasks": []}}),
         # Already ignored by both readers -- but ignored is not compactable.
@@ -1138,14 +1145,56 @@ def test_tool_calls_are_retained_and_still_counted():
 
 def test_an_individually_oversized_progress_event_still_fails_closed():
     """A known type does not buy an exemption from ``MAX_EVENT_BYTES``."""
-    fat = json.dumps({
-        "type": "assistant.message_delta",
-        "data": {"delta": "x" * (ingest.MAX_EVENT_BYTES + 1)},
-    })
-    assert len(fat.encode("utf-8")) > ingest.MAX_EVENT_BYTES
+    for event_type in ("assistant.message_delta", "assistant.reasoning_delta"):
+        fat = json.dumps({
+            "type": event_type,
+            "data": {"delta": "x" * (ingest.MAX_EVENT_BYTES + 1)},
+        })
+        assert len(fat.encode("utf-8")) > ingest.MAX_EVENT_BYTES
 
-    with pytest.raises(ingest.ReviewProtocolError, match="provider_events_oversized"):
-        ingest.extract_structured_final([fat, _final_event()], expected_lens=LENS)
+        with pytest.raises(ingest.ReviewProtocolError, match="provider_events_oversized"):
+            ingest.extract_structured_final([fat, _final_event()], expected_lens=LENS)
+
+
+def test_a_14k_reasoning_delta_stream_compacts_to_the_report():
+    """NF-913: the observed native shape is tens of thousands of reasoning deltas.
+
+    The native reviewer stream emitted 14,257 ``assistant.reasoning_delta``
+    records before one clean final (request ba55fc698e394a369ac0d8da8ffdd4fe),
+    which the pre-fix reader refused as ``provider_events_oversized`` because
+    the retained stream blew past ``MAX_EVENTS``.  Compaction must shrink the
+    retained stream to exactly the final report and name the dropped records.
+    """
+    count = 14_257
+    stream = [_reasoning_delta(index) for index in range(count)]
+    stream.append(_final_event())
+
+    result = ingest.extract_structured_final(stream, expected_lens=LENS)
+
+    assert len(stream) > ingest.MAX_EVENTS
+    assert result.status == "structured_final"
+    assert result.report == json.loads(_report())
+    record = result.event_compaction
+    assert record["persisted_events_dropped"] == count
+    assert record["dropped_event_types"] == {"assistant.reasoning_delta": count}
+    assert record["retained_events"] == 1
+
+
+def test_a_reasoning_delta_carrying_a_report_channel_is_retained(monkeypatch):
+    """The channel guard stays load-bearing for the new native type.
+
+    A reasoning delta whose content is only thinking text is report-free and
+    compacted; one that somehow speaks on either report channel is RETAINED.
+    """
+    event = json.loads(_reasoning_delta(1))
+    assert ingest.replayable_progress_event(event) is True
+
+    monkeypatch.setattr(ingest, "provider_final_text", lambda event: _report())
+    assert ingest.replayable_progress_event(event) is False
+
+    monkeypatch.setattr(ingest, "provider_final_text", lambda event: "")
+    monkeypatch.setattr(ingest, "provider_tool_use_findings", lambda event: [])
+    assert ingest.replayable_progress_event(event) is False
 
 
 def test_compacted_progress_chatter_is_itself_bounded(monkeypatch):
