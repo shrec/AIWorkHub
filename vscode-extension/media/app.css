@@ -1273,6 +1273,129 @@ main {
   user-select: text;
 }
 
+.wave-mini-roadmap-info {
+  position: relative;
+  margin-left: 5px;
+  color: var(--ink);
+}
+
+.wave-mini-roadmap-button {
+  display: grid;
+  width: 20px;
+  height: 20px;
+  box-sizing: border-box;
+  place-items: center;
+  border: 1px solid currentColor;
+  border-radius: 50%;
+  font-weight: 700;
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+
+.wave-mini-roadmap-button::-webkit-details-marker {
+  display: none;
+}
+
+.wave-mini-roadmap-info[open] .wave-mini-roadmap-button {
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.wave-mini-roadmap-panel {
+  position: absolute;
+  z-index: 20;
+  top: calc(100% + 7px);
+  right: 0;
+  width: min(440px, calc(100vw - 36px));
+  max-height: min(420px, calc(100vh - 120px));
+  overflow: auto;
+  scrollbar-gutter: stable;
+  overscroll-behavior: contain;
+  padding: 10px 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: 5px;
+  color: var(--ink);
+  background: var(--surface-subtle);
+}
+
+.wave-mini-roadmap-panel > strong {
+  display: block;
+  margin-bottom: 7px;
+  font-size: var(--fs-xs);
+}
+
+.wave-mini-roadmap-title {
+  overflow-wrap: anywhere;
+  font-size: var(--fs-sm);
+  font-weight: 700;
+}
+
+.wave-mini-roadmap-milestone {
+  color: var(--accent);
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: var(--fs-2xs);
+}
+
+.wave-mini-roadmap-count {
+  margin: 4px 0 8px;
+  color: var(--muted);
+  font-size: var(--fs-2xs);
+}
+
+.wave-mini-roadmap-unknown {
+  color: var(--pending);
+  font-size: var(--fs-sm);
+  font-weight: 700;
+}
+
+.wave-mini-roadmap-reason {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: var(--fs-2xs);
+}
+
+.wave-mini-roadmap-section {
+  margin-top: 8px;
+}
+
+.wave-mini-roadmap-section h4 {
+  margin: 0 0 4px;
+  color: var(--muted);
+  font-size: var(--fs-2xs);
+  font-weight: 700;
+}
+
+.wave-mini-roadmap-goals,
+.wave-mini-roadmap-tasks {
+  margin: 0;
+  padding-left: 16px;
+  font-size: var(--fs-2xs);
+}
+
+.wave-mini-roadmap-goals li,
+.wave-mini-roadmap-tasks li {
+  margin: 2px 0;
+  overflow-wrap: anywhere;
+}
+
+.wave-mini-roadmap-task {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.wave-mini-roadmap-task-id {
+  font-family: var(--vscode-editor-font-family, monospace);
+  user-select: text;
+}
+
+.wave-mini-roadmap-more {
+  color: var(--muted);
+  list-style: none;
+}
+
 .source-alert strong {
   flex: 0 0 auto;
 }

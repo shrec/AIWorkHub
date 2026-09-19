@@ -420,6 +420,8 @@ const OUTBOUND_TYPES = Object.freeze({
   needfixAction: "needfixAction",
   roadmap: "roadmap",
   roadmapDetail: "roadmapDetail",
+  waveMiniRoadmap: "waveMiniRoadmap",
+  waveMiniRoadmapDetail: "waveMiniRoadmapDetail",
   settings: "settings",
 });
 
@@ -8738,7 +8740,7 @@ async function pushNeedfixDetail(view, needfixId) {
   }
 }
 
-async function pushRoadmapList(view, filters = {}) {
+async function pushRoadmapList(view, filters = {}, outboundType = OUTBOUND_TYPES.roadmap, correlation = null) {
   try {
     const client = getMcpClient();
     view.bindClient(client);
@@ -8749,17 +8751,18 @@ async function pushRoadmapList(view, filters = {}) {
       offset: 0,
     });
     if (view.stillBoundTo(client)) {
-      view.postMessage({ type: OUTBOUND_TYPES.roadmap, payload: sanitizeWebviewPayload(payload) });
+      view.postMessage({ type: outboundType, correlation, payload: sanitizeWebviewPayload(payload) });
     }
   } catch (err) {
     view.postMessage({
-      type: OUTBOUND_TYPES.roadmap,
+      type: outboundType,
+      correlation,
       payload: { ok: false, error: sanitizeErrorMessage(err), entries: [] },
     });
   }
 }
 
-async function pushRoadmapDetail(view, roadmapId) {
+async function pushRoadmapDetail(view, roadmapId, outboundType = OUTBOUND_TYPES.roadmapDetail, correlation = null) {
   try {
     const client = getMcpClient();
     view.bindClient(client);
@@ -8768,11 +8771,12 @@ async function pushRoadmapDetail(view, roadmapId) {
       event_limit: 50,
     });
     if (view.stillBoundTo(client)) {
-      view.postMessage({ type: OUTBOUND_TYPES.roadmapDetail, payload: sanitizeWebviewPayload(payload) });
+      view.postMessage({ type: outboundType, correlation, payload: sanitizeWebviewPayload(payload) });
     }
   } catch (err) {
     view.postMessage({
-      type: OUTBOUND_TYPES.roadmapDetail,
+      type: outboundType,
+      correlation,
       payload: { ok: false, error: sanitizeErrorMessage(err) },
     });
   }
@@ -9574,15 +9578,32 @@ function handleInboundMessage(view, message) {
       if (NEEDFIX_ID_RE.test(needfixId)) pushNeedfixDetail(view, needfixId);
       break;
     }
-    case "requestRoadmap":
-      pushRoadmapList(view, {
-        status: message.status,
-        includeArchived: message.includeArchived,
-      });
+    case "requestRoadmap": {
+      const wavePurpose = message.purpose === "waveMiniRoadmap";
+      const waveGeneration = wavePurpose ? Number(message.waveGeneration) : null;
+      pushRoadmapList(
+        view,
+        {
+          status: message.status,
+          includeArchived: message.includeArchived,
+        },
+        wavePurpose ? OUTBOUND_TYPES.waveMiniRoadmap : OUTBOUND_TYPES.roadmap,
+        Number.isFinite(waveGeneration) ? waveGeneration : null,
+      );
       break;
+    }
     case "requestRoadmapDetail": {
       const roadmapId = String(message.roadmapId || "");
-      if (ROADMAP_ID_RE.test(roadmapId)) pushRoadmapDetail(view, roadmapId);
+      const wavePurpose = message.purpose === "waveMiniRoadmap";
+      if (ROADMAP_ID_RE.test(roadmapId)) {
+        const waveGeneration = wavePurpose ? Number(message.waveGeneration) : null;
+        pushRoadmapDetail(
+          view,
+          roadmapId,
+          wavePurpose ? OUTBOUND_TYPES.waveMiniRoadmapDetail : OUTBOUND_TYPES.roadmapDetail,
+          Number.isFinite(waveGeneration) ? waveGeneration : null,
+        );
+      }
       break;
     }
     // The three NeedFix mutation tools now answer with a receipt whose `item`
@@ -10393,6 +10414,10 @@ function getHtmlForWebview(webview, extensionUri) {
             <dt>Diagnostics</dt><dd id="identity-diagnostics">none</dd>
           </dl>
         </div>
+      </details>
+      <details class="wave-mini-roadmap-info" id="wave-mini-roadmap-info">
+        <summary class="wave-mini-roadmap-button" aria-label="Show wave mini-roadmap" title="Wave mini-roadmap">◈</summary>
+        <div class="wave-mini-roadmap-panel" id="wave-mini-roadmap-content" role="region" aria-label="Wave mini-roadmap"></div>
       </details>
     </section>
 

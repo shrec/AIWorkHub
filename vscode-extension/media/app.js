@@ -51,6 +51,11 @@ const state = {
   needfixConversionPreview: null,
   roadmapEntries: [],
   roadmapDetail: null,
+  waveMiniRoadmapEntries: [],
+  waveMiniRoadmapDetail: null,
+  waveMiniRoadmapWaitingFor: null,
+  waveMiniRoadmapRequested: false,
+  waveMiniRoadmapGeneration: 0,
   featureSettings: null,
   settingsPendingIdentity: null,
   settingsCollapsedFamilies: {},
@@ -162,6 +167,8 @@ const elements = {
   identityRoleBadge: document.querySelector("#identity-role-badge"),
   identityProviderBadge: document.querySelector("#identity-provider-badge"),
   identityInfo: document.querySelector("#identity-info"),
+  waveMiniRoadmapContent: document.querySelector("#wave-mini-roadmap-content"),
+  waveMiniRoadmap: document.querySelector("#wave-mini-roadmap-info"),
   identityWindowId: document.querySelector("#identity-window-id"),
   identityThreadId: document.querySelector("#identity-thread-id"),
   identitySessionId: document.querySelector("#identity-session-id"),
@@ -819,6 +826,206 @@ function renderManagerIdentity(snapshot) {
   elements.identityRepoId.textContent = String(delivery.repo_id || identity.repo_id || "Not available");
   const diagnostics = [identity.reason, routeReason, ...deliveryProblems].filter(Boolean);
   elements.identityDiagnostics.textContent = diagnostics.length ? diagnostics.join(" · ") : "none";
+}
+
+// ── wave-mini-roadmap-helpers-begin ─────────────────────────────────────────
+// Pure, self-contained helpers for the identity-alert Wave Mini-Roadmap popup.
+// No DOM, no storage, no vscode access: wave-mini-roadmap.test.js extracts this
+// block verbatim and evaluates it in isolation to pin wave selection/counting.
+function waveVersionCompare(a, b) {
+  return (a.major - b.major) || (a.minor - b.minor) || (a.patch - b.patch);
+}
+
+function waveSemver(milestone) {
+  if (typeof milestone !== "string") return null;
+  const match = String(milestone).trim().match(/^v?(\d+)\.(\d+)\.(\d+)(?:[-+][0-9A-Za-z.-]+)?$/);
+  if (!match) return null;
+  return { major: Number(match[1]), minor: Number(match[2]), patch: Number(match[3]) };
+}
+
+// Only canonical current/active Roadmap statuses may supply the active wave.
+// A newer proposed/completed/archived milestone must never displace the wave
+// that is actually in progress.
+const WAVE_ACTIVE_STATUSES = new Set(["in_progress", "current", "active"]);
+
+function waveIsActive(entry) {
+  if (!entry || typeof entry !== "object") return false;
+  const status = entry.status === undefined || entry.status === null
+    ? ""
+    : String(entry.status).trim().toLowerCase();
+  return WAVE_ACTIVE_STATUSES.has(status);
+}
+
+function waveSelectActive(entries) {
+  const rows = Array.isArray(entries) ? entries : [];
+  let best = null;
+  let bestVersion = null;
+  let ambiguous = false;
+  for (const entry of rows) {
+    if (!entry || typeof entry !== "object") continue;
+    if (!waveIsActive(entry)) continue;
+    const version = waveSemver(entry.milestone);
+    if (!version) continue;
+    if (bestVersion === null || waveVersionCompare(version, bestVersion) > 0) {
+      best = entry;
+      bestVersion = version;
+      ambiguous = false;
+    } else if (waveVersionCompare(version, bestVersion) === 0) {
+      ambiguous = true;
+    }
+  }
+  return best && !ambiguous ? best : null;
+}
+
+const WAVE_COMPLETE_STATUSES = new Set(["finished", "accepted"]);
+
+function waveTaskCounts(tasks) {
+  const rows = Array.isArray(tasks) ? tasks : [];
+  const states = {};
+  let complete = 0;
+  for (const task of rows) {
+    const status = task && task.status ? String(task.status) : "unknown";
+    states[status] = (states[status] || 0) + 1;
+    if (WAVE_COMPLETE_STATUSES.has(status)) complete += 1;
+  }
+  return { complete, total: rows.length, states };
+}
+
+// A finished/accepted count is only trustworthy when the task-status join is
+// complete: every linked task_id must have a matching task row with a non-empty
+// status. Missing or partial wave.tasks must fail closed to UNKNOWN.
+function waveTaskJoinComplete(wave) {
+  const taskIds = Array.isArray(wave && wave.task_ids) ? wave.task_ids : [];
+  if (taskIds.length === 0) return true;
+  const tasks = wave && wave.tasks;
+  if (!Array.isArray(tasks)) return false;
+  const byId = new Map();
+  for (const task of tasks) {
+    if (!task || typeof task !== "object") continue;
+    const id = task.task_id === undefined || task.task_id === null
+      ? ""
+      : String(task.task_id);
+    byId.set(id, task);
+  }
+  for (const id of taskIds) {
+    const task = byId.get(String(id));
+    if (!task) return false;
+    const status = task.status === undefined || task.status === null
+      ? ""
+      : String(task.status).trim();
+    if (status.length === 0) return false;
+  }
+  return true;
+}
+// ── wave-mini-roadmap-helpers-end ───────────────────────────────────────────
+
+function renderWaveMiniRoadmap(snapshot) {
+  const content = elements.waveMiniRoadmapContent;
+  if (!content) return;
+  const roadmap = snapshot && snapshot.roadmap && typeof snapshot.roadmap === "object"
+    ? snapshot.roadmap
+    : null;
+  if (!roadmap || roadmap.available === false) {
+    renderWaveMiniRoadmapState(
+      content,
+      "UNKNOWN",
+      roadmap && roadmap.error ? String(roadmap.error) : "Roadmap data unavailable",
+    );
+    return;
+  }
+  if (roadmap.truncated === true) {
+    renderWaveMiniRoadmapState(
+      content,
+      "UNKNOWN",
+      "Roadmap list is truncated; wave selection is incomplete",
+    );
+    return;
+  }
+  const listEntry = waveSelectActive(state.waveMiniRoadmapEntries);
+  if (!listEntry) {
+    renderWaveMiniRoadmapState(
+      content,
+      "UNKNOWN",
+      "No active versioned wave is available, or wave selection is ambiguous",
+    );
+    return;
+  }
+  const detail = state.waveMiniRoadmapDetail && typeof state.waveMiniRoadmapDetail === "object"
+    ? state.waveMiniRoadmapDetail
+    : null;
+  if (!detail || String(detail.id || "") !== String(listEntry.id || "")) {
+    renderWaveMiniRoadmapState(
+      content,
+      "UNKNOWN",
+      "Wave detail is unavailable for the active wave; finished counts are unavailable",
+    );
+    return;
+  }
+  const taskIds = Array.isArray(detail.task_ids) && detail.task_ids.length
+    ? detail.task_ids
+    : asArray(listEntry.task_ids);
+  const tasks = detail.tasks !== undefined ? detail.tasks : detail.task_ids;
+  const wave = Object.assign({}, listEntry, detail, { task_ids: taskIds, tasks });
+  if (!waveTaskJoinComplete(wave)) {
+    renderWaveMiniRoadmapState(
+      content,
+      "UNKNOWN",
+      "Wave task statuses are incomplete; finished counts are unavailable",
+    );
+    return;
+  }
+  const taskRows = asArray(wave.tasks);
+  const counts = waveTaskCounts(taskRows);
+  const goalCap = 8;
+  const taskCap = 20;
+  const fragment = document.createDocumentFragment();
+  fragment.append(
+    createElement("strong", "", "Wave mini-roadmap"),
+    createElement("div", "wave-mini-roadmap-title", String(wave.title || wave.roadmap_id || wave.id || "Untitled wave")),
+    createElement("div", "wave-mini-roadmap-milestone", String(wave.milestone || "No milestone")),
+    createElement("div", "wave-mini-roadmap-count", `${counts.complete}/${counts.total} finished`),
+  );
+  const goals = asArray(wave.acceptance).filter((goal) => goal !== null && goal !== undefined && String(goal).trim() !== "");
+  if (goals.length) {
+    const section = createElement("div", "wave-mini-roadmap-section");
+    section.appendChild(createElement("h4", "", "Acceptance goals"));
+    const list = createElement("ul", "wave-mini-roadmap-goals");
+    for (const goal of goals.slice(0, goalCap)) {
+      list.appendChild(createElement("li", "", String(goal)));
+    }
+    if (goals.length > goalCap) {
+      list.appendChild(createElement("li", "wave-mini-roadmap-more", `...${goals.length - goalCap} more`));
+    }
+    section.appendChild(list);
+    fragment.appendChild(section);
+  }
+  const taskSection = createElement("div", "wave-mini-roadmap-section");
+  taskSection.appendChild(createElement("h4", "", `Tasks (${counts.complete}/${counts.total} finished)`));
+  const taskList = createElement("ul", "wave-mini-roadmap-tasks");
+  for (const task of taskRows.slice(0, taskCap)) {
+    const status = task && task.status ? String(task.status) : "unknown";
+    const complete = WAVE_COMPLETE_STATUSES.has(status);
+    const li = createElement("li", `wave-mini-roadmap-task ${complete ? "wave-task-complete" : "wave-task-incomplete"}`);
+    li.append(
+      createElement("span", "wave-mini-roadmap-task-id", String(task && task.task_id ? task.task_id : "unknown")),
+      createElement("span", `status-badge status-${status}`, status),
+    );
+    taskList.appendChild(li);
+  }
+  if (taskRows.length > taskCap) {
+    taskList.appendChild(createElement("li", "wave-mini-roadmap-more", `...${taskRows.length - taskCap} more`));
+  }
+  taskSection.appendChild(taskList);
+  fragment.appendChild(taskSection);
+  content.replaceChildren(fragment);
+}
+
+function renderWaveMiniRoadmapState(content, headline, reason) {
+  content.replaceChildren(
+    createElement("strong", "", "Wave mini-roadmap"),
+    createElement("div", "wave-mini-roadmap-unknown", headline),
+    createElement("p", "wave-mini-roadmap-reason", String(reason || "")),
+  );
 }
 
 function renderCallbackObservability(snapshot) {
@@ -2943,6 +3150,61 @@ function requestRoadmapList() {
   });
 }
 
+function requestWaveMiniRoadmap() {
+  state.waveMiniRoadmapRequested = true;
+  state.waveMiniRoadmapWaitingFor = null;
+  state.waveMiniRoadmapGeneration = (state.waveMiniRoadmapGeneration || 0) + 1;
+  vscode.postMessage({
+    type: "requestRoadmap",
+    purpose: "waveMiniRoadmap",
+    status: "",
+    includeArchived: false,
+    waveGeneration: state.waveMiniRoadmapGeneration,
+  });
+}
+
+// A per-popup monotonic generation tags each wave list/detail request; the
+// extension bridge echoes it back as `correlation`. Responses from superseded
+// cycles are ignored so a stale in-flight detail can never poison a newer cycle.
+function waveCycleCurrent(correlation) {
+  if (correlation === undefined || correlation === null) return true;
+  return correlation === state.waveMiniRoadmapGeneration;
+}
+
+function renderWaveMiniRoadmapList(payload, correlation) {
+  if (!waveCycleCurrent(correlation)) return;
+  if (!payload || payload.ok === false) {
+    state.waveMiniRoadmapEntries = [];
+    state.waveMiniRoadmapDetail = null;
+    state.waveMiniRoadmapWaitingFor = null;
+    state.waveMiniRoadmapRequested = false;
+    renderWaveMiniRoadmap(state.snapshot);
+    return;
+  }
+  state.waveMiniRoadmapEntries = asArray(payload.entries);
+  reconcileWaveMiniRoadmap();
+}
+
+function reconcileWaveMiniRoadmap() {
+  if (!state.waveMiniRoadmapRequested) return;
+  const wave = waveSelectActive(state.waveMiniRoadmapEntries);
+  if (!wave || !wave.id) {
+    state.waveMiniRoadmapDetail = null;
+    state.waveMiniRoadmapWaitingFor = null;
+    state.waveMiniRoadmapRequested = false;
+    renderWaveMiniRoadmap(state.snapshot);
+    return;
+  }
+  if (state.waveMiniRoadmapWaitingFor !== null) return;
+  state.waveMiniRoadmapWaitingFor = String(wave.id);
+  vscode.postMessage({
+    type: "requestRoadmapDetail",
+    roadmapId: wave.id,
+    purpose: "waveMiniRoadmap",
+    waveGeneration: state.waveMiniRoadmapGeneration,
+  });
+}
+
 function renderRoadmapList() {
   const query = String(elements.roadmapSearch.value || "").trim().toLocaleLowerCase();
   const rows = state.roadmapEntries.filter((entry) => !query || [
@@ -2976,11 +3238,10 @@ function renderRoadmap(payload) {
   if (!payload || payload.ok === false) {
     state.roadmapEntries = [];
     elements.roadmapSummary.textContent = (payload && payload.error) || "Roadmap unavailable";
-    renderRoadmapList();
-    return;
+  } else {
+    state.roadmapEntries = asArray(payload.entries);
+    elements.roadmapSummary.textContent = `${formatCount(payload.active)} active · ${formatCount(payload.total)} outcomes`;
   }
-  state.roadmapEntries = asArray(payload.entries);
-  elements.roadmapSummary.textContent = `${formatCount(payload.active)} active · ${formatCount(payload.total)} outcomes`;
   renderRoadmapList();
 }
 
@@ -3015,6 +3276,21 @@ function renderRoadmapDetail(payload) {
   appendNeedfixObject(fragment, "Evidence references", item.evidence_refs, false);
   appendNeedfixEvents(fragment, asArray(payload.events));
   elements.roadmapDetailPanel.replaceChildren(fragment);
+}
+
+function renderWaveMiniRoadmapDetail(payload, correlation) {
+  if (!waveCycleCurrent(correlation)) return;
+  if (!payload || payload.ok === false || !payload.item) {
+    state.waveMiniRoadmapDetail = null;
+    state.waveMiniRoadmapWaitingFor = null;
+    state.waveMiniRoadmapRequested = false;
+    renderWaveMiniRoadmap(state.snapshot);
+    return;
+  }
+  state.waveMiniRoadmapDetail = payload.item;
+  state.waveMiniRoadmapWaitingFor = null;
+  state.waveMiniRoadmapRequested = false;
+  renderWaveMiniRoadmap(state.snapshot);
 }
 
 function taskSignalRow(task, badgeText, badgeClass) {
@@ -3231,6 +3507,7 @@ function renderSnapshot(snapshot) {
   const storageReady = renderStorageState(snapshot);
   renderSummary(snapshot);
   renderManagerIdentity(snapshot);
+  renderWaveMiniRoadmap(snapshot);
   renderCallbackObservability(snapshot);
   renderKnownRepositories(snapshot);
   if (storageReady) {
@@ -3383,6 +3660,9 @@ function requestRefresh() {
     elements.tableLoading.hidden = false;
   }
   vscode.postMessage({ type: "refresh" });
+  if (elements.waveMiniRoadmap && elements.waveMiniRoadmap.open) {
+    requestWaveMiniRoadmap();
+  }
   window.setTimeout(() => {
     elements.refreshButton.disabled = false;
     elements.refreshButton.textContent = "Refresh";
@@ -6401,8 +6681,14 @@ window.addEventListener("message", (event) => {
     case "roadmap":
       renderRoadmap(message.payload);
       break;
+    case "waveMiniRoadmap":
+      renderWaveMiniRoadmapList(message.payload, message.correlation);
+      break;
     case "roadmapDetail":
       renderRoadmapDetail(message.payload);
+      break;
+    case "waveMiniRoadmapDetail":
+      renderWaveMiniRoadmapDetail(message.payload, message.correlation);
       break;
     case "settings":
       renderSettings(message.payload);
@@ -6825,9 +7111,33 @@ elements.roadmapList.addEventListener("click", (event) => {
   if (target) vscode.postMessage({ type: "requestRoadmapDetail", roadmapId: target.dataset.roadmapId });
 });
 
+function closeIdentityInfoPopover() {
+  if (elements.identityInfo && elements.identityInfo.open) elements.identityInfo.open = false;
+}
+
+function closeWaveMiniRoadmapPopover() {
+  if (elements.waveMiniRoadmap && elements.waveMiniRoadmap.open) elements.waveMiniRoadmap.open = false;
+}
+
+elements.identityInfo.addEventListener("toggle", () => {
+  if (elements.identityInfo.open) closeWaveMiniRoadmapPopover();
+});
+
+elements.waveMiniRoadmap.addEventListener("toggle", () => {
+  if (elements.waveMiniRoadmap.open) {
+    closeIdentityInfoPopover();
+    requestWaveMiniRoadmap();
+  }
+});
+
 document.addEventListener("keydown", (event) => {
-  if (event.key === "Escape" && elements.identityInfo && elements.identityInfo.open) {
-    elements.identityInfo.open = false;
+  if (event.key === "Escape") {
+    if (elements.identityInfo && elements.identityInfo.open) {
+      elements.identityInfo.open = false;
+    }
+    if (elements.waveMiniRoadmap && elements.waveMiniRoadmap.open) {
+      elements.waveMiniRoadmap.open = false;
+    }
   }
 });
 
