@@ -1947,6 +1947,13 @@ def _npm_validation_support(repo: Path, commands: Iterable[str]) -> tuple[str, .
                 "README.md",
                 "scripts/aiworkhub-app-server-mux",
                 "scripts/aiworkhub-app-server-mux.cmd",
+                # extension-static.test.js asserts these committed raster
+                # fixtures exist at the repository root; keep the closure
+                # exact so unrelated repositories receive nothing extra.
+                "docs/assets/aiworkhub-block-diagram.png",
+                "docs/assets/aiworkhub-source-graph-architecture.png",
+                "docs/assets/demo/aiworkhub-task-review-loop.gif",
+                "docs/assets/screenshots/aiworkhub-self-hosted-dashboard.png",
             ):
                 candidate = repo / relative
                 if candidate.is_symlink() or not candidate.is_file():

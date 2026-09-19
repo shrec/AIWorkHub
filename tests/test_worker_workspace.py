@@ -1259,6 +1259,9 @@ def test_npm_prefix_validation_seeds_immutable_support_and_runs_from_candidate(
     npm = shutil.which("npm")
     if npm is None:
         pytest.skip("npm is not installed")
+    # Unrelated-package guard: this package is neither named "aiworkhub" nor
+    # hosted under the "vscode-extension" prefix, so its sparse worktree must
+    # not receive any AIWorkHub-specific assets or repository roots.
     extension = repo / "web-extension"
     (extension / "test").mkdir(parents=True)
     (extension / "package.json").write_text(
@@ -1315,9 +1318,16 @@ def test_npm_prefix_validation_seeds_immutable_support_and_runs_from_candidate(
         ):
             candidate = workspace.path / relative
             assert candidate.is_file()
+            assert not candidate.is_symlink()
             assert hashlib.sha256(candidate.read_bytes()).digest() == hashlib.sha256(
                 (repo / relative).read_bytes()
             ).digest()
+
+        # Negative guard: an unrelated package must not pull any of the
+        # AIWorkHub extension roots into its sparse validation worktree.
+        assert not (workspace.path / "docs").exists()
+        assert not (workspace.path / "src").exists()
+        assert not (workspace.path / "README.md").exists()
 
         result, = worker_workspace.run_validations(
             workspace,
@@ -1330,6 +1340,111 @@ def test_npm_prefix_validation_seeds_immutable_support_and_runs_from_candidate(
         assert worker_workspace.changed_paths(workspace) == []
     finally:
         worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
+
+    # AIWorkHub extension gate (NF-2026-00914): when the validated package is
+    # named "aiworkhub" under the "vscode-extension" prefix, the committed
+    # docs assets raster fixtures asserted by the extension static suite must
+    # be materialized as immutable support in the sparse worker worktree.
+    raster_fixtures = (
+        "docs/assets/aiworkhub-block-diagram.png",
+        "docs/assets/aiworkhub-source-graph-architecture.png",
+        "docs/assets/demo/aiworkhub-task-review-loop.gif",
+        "docs/assets/screenshots/aiworkhub-self-hosted-dashboard.png",
+    )
+    for relative in raster_fixtures:
+        fixture = repo / relative
+        fixture.parent.mkdir(parents=True, exist_ok=True)
+        fixture.write_bytes(b"\x89PNG-raster-fixture\n" + relative.encode("utf-8"))
+    (repo / "README.md").write_text("# AIWorkHub\n", encoding="utf-8")
+    scripts = repo / "scripts"
+    scripts.mkdir(parents=True, exist_ok=True)
+    (scripts / "aiworkhub-app-server-mux").write_text("#!/bin/sh\n", encoding="utf-8")
+    (scripts / "aiworkhub-app-server-mux.cmd").write_text(
+        "@echo off\r\n", encoding="utf-8"
+    )
+    runtime_package = repo / "src" / "aiworkhub"
+    runtime_package.mkdir(parents=True, exist_ok=True)
+    (runtime_package / "__init__.py").write_text(
+        '"""Stub package for extension runtime sibling seeding."""\n',
+        encoding="utf-8",
+    )
+    vscode = repo / "vscode-extension"
+    (vscode / "test").mkdir(parents=True)
+    (vscode / "package.json").write_text(
+        json.dumps(
+            {
+                "name": "aiworkhub",
+                "version": "1.0.0",
+                "scripts": {"test": "node test/extension.test.js"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (vscode / "package-lock.json").write_text(
+        json.dumps(
+            {
+                "name": "aiworkhub",
+                "version": "1.0.0",
+                "lockfileVersion": 3,
+                "requires": True,
+                "packages": {"": {"name": "aiworkhub", "version": "1.0.0"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (vscode / "test" / "extension.test.js").write_bytes(
+        b"console.log('aiworkhub-extension-npm-support-ok');\n"
+    )
+    assert (
+        _git(
+            repo, "add", "README.md", "scripts", "docs", "src", "vscode-extension"
+        ).returncode
+        == 0
+    )
+    assert (
+        _git(repo, "commit", "-qm", "aiworkhub extension fixtures").returncode == 0
+    )
+    extension_workspace = worker_workspace.create_workspace(
+        repo,
+        "npm-validation-support-aiworkhub",
+        {
+            "allowed_writes": ["out/result.txt"],
+            "read_first": ["read/input.txt"],
+            "validation": ["npm --prefix vscode-extension test"],
+        },
+        "glm_vscode_lm",
+    )
+    try:
+        for relative in (
+            "README.md",
+            "scripts/aiworkhub-app-server-mux",
+            "scripts/aiworkhub-app-server-mux.cmd",
+            "src/aiworkhub/__init__.py",
+            "vscode-extension/package.json",
+            "vscode-extension/package-lock.json",
+            "vscode-extension/test/extension.test.js",
+            *raster_fixtures,
+        ):
+            candidate = extension_workspace.path / relative
+            assert candidate.is_file()
+            assert not candidate.is_symlink()
+            assert hashlib.sha256(candidate.read_bytes()).digest() == hashlib.sha256(
+                (repo / relative).read_bytes()
+            ).digest()
+
+        extension_result, = worker_workspace.run_validations(
+            extension_workspace,
+            ["npm --prefix vscode-extension test"],
+            backend=worker_workspace.VSCODE_LM_IN_PROCESS_BACKEND,
+            adapter_id="glm_vscode_lm",
+        )
+        assert extension_result["returncode"] == 0
+        assert "aiworkhub-extension-npm-support-ok" in extension_result["stdout_head"]
+        assert worker_workspace.changed_paths(extension_workspace) == []
+    finally:
+        worker_workspace.cleanup_workspace(
+            repo, extension_workspace.path, extension_workspace.home
+        )
 
 
 def test_npm_prefix_validation_fails_closed_for_unbound_dependency_tree(
