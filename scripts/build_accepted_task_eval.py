@@ -5,12 +5,18 @@ Selects 20-50 accepted task trajectories from the canonical AIWorkHub task
 store -- stratified across task family (topic), risk tier and outcome
 complexity -- using ``attempt_trajectory_export`` to authenticate each
 candidate's accepted-outcome receipt against ``task_engine``'s own canonical
-authority (the same authority ``export_attempt_trajectory`` binds). Nothing
-here invokes a model or trusts chat prose: every row is derived from a
-receipt that actually re-verified against sealed evidence, and a receipt that
-fails authentication is silently excluded rather than counted.
+authority (the same live authority ``export_attempt_trajectory`` binds by
+default). Nothing here invokes a model or trusts chat prose: every row is
+derived from a receipt that actually re-verified against sealed evidence,
+and a receipt that fails authentication is silently excluded rather than
+counted.
 
-Two entry points:
+Committed-row provenance uses a separate read-only historical authority:
+sealed task-store identity plus one canonical git descendant commit after
+``base_oid`` that holds every promoted-path hash. Current working-tree
+bytes may change later without invalidating those rows.
+
+Entry points:
 
 * ``python3 scripts/build_accepted_task_eval.py [--repo-root PATH]`` rebuilds
   the corpus from the live canonical task store and registers it with
@@ -19,6 +25,9 @@ Two entry points:
   recomputes the summary purely from the already-committed rows file (no
   task store access, no model) and reports any drift between the rows, the
   summary and ``eval_artifact_gate``'s own recomputation.
+* ``python3 scripts/build_accepted_task_eval.py --verify-provenance``
+  re-authenticates committed rows against sealed store identity and
+  immutable git history.
 """
 
 from __future__ import annotations
@@ -26,11 +35,14 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
+import subprocess
+from functools import partial
 from pathlib import Path
 from typing import Any
 
 from aiworkhub import attempt_trajectory_export as trajectory_export
-from aiworkhub import eval_artifact_gate, task_store
+from aiworkhub import eval_artifact_gate, task_engine, task_store
 
 SCHEMA_ID = "aiworkhub.accepted_task_trajectories.v1"
 ROW_SCHEMA_ID = "aiworkhub.accepted_task_trajectories.row.v1"
@@ -300,28 +312,229 @@ def _update_registry(repo_root: Path) -> None:
     )
 
 
-def verify_provenance(repo_root: Path, rows: list[dict[str, Any]]) -> None:
-    """Re-authenticate every row's identity against the live canonical store.
+_GIT_TIMEOUT_SECONDS = 30
+_GIT_ENV_BLOCKLIST = (
+    "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY", "GIT_COMMON_DIR", "GIT_PREFIX",
+)
+
+
+def _safe_git_oid(value: str) -> bool:
+    if not value or value.startswith("-") or ".." in value:
+        return False
+    if any(char.isspace() for char in value):
+        return False
+    return 7 <= len(value) <= 64 and all(
+        char in "0123456789abcdefABCDEF" for char in value
+    )
+
+
+def _safe_repo_relative_path(relative: str) -> bool:
+    if not relative or relative.startswith("/") or "\\" in relative or ":" in relative:
+        return False
+    if any(char in relative for char in ("\x00", "\n", "\r")):
+        return False
+    parts = relative.split("/")
+    return bool(parts) and all(part not in ("", ".", "..") for part in parts)
+
+
+def _git_clean_env() -> dict[str, str]:
+    env = os.environ.copy()
+    for key in _GIT_ENV_BLOCKLIST:
+        env.pop(key, None)
+    return env
+
+
+def _git_run(repo: Path, *args: str) -> tuple[int, bytes]:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo), *args],
+            capture_output=True,
+            timeout=_GIT_TIMEOUT_SECONDS,
+            env=_git_clean_env(),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return 1, b""
+    return result.returncode, result.stdout
+
+
+def _historical_descendant_commits(repo: Path, base_oid: str) -> list[str] | None:
+    if not _safe_git_oid(base_oid):
+        return None
+    rc, kind = _git_run(repo, "cat-file", "-t", "--", base_oid)
+    if rc != 0 or kind.strip() != b"commit":
+        return None
+    rc, out = _git_run(
+        repo, "rev-list", "--reverse", "--ancestry-path", f"{base_oid}..HEAD",
+    )
+    if rc != 0:
+        return None
+    return [
+        line.decode("ascii", "replace").strip()
+        for line in out.splitlines() if line.strip()
+    ]
+
+
+def _commit_path_sha256(repo: Path, commit: str, path: str) -> str | None:
+    if not _safe_git_oid(commit) or not _safe_repo_relative_path(path):
+        return None
+    rc, listing = _git_run(
+        repo, "ls-tree", "--full-tree", "-z", commit, "--", path,
+    )
+    if rc != 0 or not listing:
+        return None
+    entries = [entry for entry in listing.split(b"\0") if entry]
+    if len(entries) != 1:
+        return None
+    meta, sep, name = entries[0].partition(b"\t")
+    if not sep or name != path.encode("utf-8"):
+        return None
+    parts = meta.split(b" ", 2)
+    if len(parts) != 3:
+        return None
+    mode, kind, _object = parts
+    if kind != b"blob" or mode not in (b"100644", b"100755"):
+        return None
+    rc, blob = _git_run(repo, "cat-file", "blob", f"{commit}:{path}")
+    if rc != 0:
+        return None
+    return hashlib.sha256(blob).hexdigest()
+
+
+def historical_accepted_outcome_authority(
+    repo: Path,
+    card: dict[str, Any],
+    task_id: str,
+    request_id: str,
+    receipt: dict[str, Any] | None,
+) -> tuple[dict[str, Any] | None, str]:
+    """Read-only historical authority: sealed identity plus git ancestry hashes."""
+    if not isinstance(receipt, dict):
+        return None, "accepted_outcome_receipt_missing"
+    required = {
+        "schema_id", "receipt_id", "task_id", "request_id", "claim_epoch",
+        "base_oid", "promoted_paths", "changed_path_hashes",
+        "attempt_artifact_manifest_id", "repository_revision",
+    }
+    if (
+        set(receipt) != required
+        or receipt.get("schema_id") != task_engine.ACCEPTED_OUTCOME_RECEIPT_SCHEMA
+    ):
+        return None, "accepted_outcome_receipt_malformed"
+    digest_fields = (
+        receipt.get("receipt_id"),
+        receipt.get("attempt_artifact_manifest_id"),
+        receipt.get("repository_revision"),
+    )
+    promoted_paths = receipt.get("promoted_paths")
+    if (
+        not isinstance(receipt.get("task_id"), str)
+        or not isinstance(receipt.get("request_id"), str)
+        or not isinstance(receipt.get("claim_epoch"), int)
+        or isinstance(receipt.get("claim_epoch"), bool)
+        or not isinstance(receipt.get("base_oid"), str)
+        or not receipt.get("base_oid")
+        or not isinstance(promoted_paths, list)
+        or any(not isinstance(path, str) for path in promoted_paths)
+        or promoted_paths != sorted(set(promoted_paths))
+        or not isinstance(receipt.get("changed_path_hashes"), dict)
+        or any(
+            not isinstance(raw_digest, str)
+            or len(raw_digest.removeprefix("sha256:")) != 64
+            or any(
+                char not in "0123456789abcdef"
+                for char in raw_digest.removeprefix("sha256:")
+            )
+            for raw_digest in digest_fields
+        )
+    ):
+        return None, "accepted_outcome_receipt_malformed"
+    terminal = card.get("terminal_review") or {}
+    sealed = terminal.get("evidence") or {}
+    paths = sorted(str(path) for path in (sealed.get("changed_paths") or []))
+    hashes = sealed.get("changed_path_hashes")
+    manifest = sealed.get("attempt_artifact_manifest")
+    workspace = sealed.get("workspace") or {}
+    expected = {
+        "schema_id": task_engine.ACCEPTED_OUTCOME_RECEIPT_SCHEMA,
+        "task_id": task_id,
+        "request_id": request_id,
+        "claim_epoch": int(card.get("claim_epoch") or 0),
+        "base_oid": str(workspace.get("base_oid") or ""),
+        "promoted_paths": paths,
+        "changed_path_hashes": hashes,
+        "attempt_artifact_manifest_id": _digest(manifest),
+    }
+    if not isinstance(hashes, dict) or not isinstance(manifest, dict):
+        return None, "accepted_outcome_receipt_sealed_evidence_missing"
+    if any(receipt.get(key) != value for key, value in expected.items()):
+        return None, "accepted_outcome_receipt_identity_mismatch"
+    if any(not _safe_repo_relative_path(path) for path in paths):
+        return None, "accepted_outcome_receipt_path_traversal"
+    if paths:
+        commits = _historical_descendant_commits(repo, expected["base_oid"])
+        if commits is None:
+            return None, "accepted_outcome_receipt_historical_git_unavailable"
+        matched = False
+        for commit in commits:
+            observed: dict[str, str] = {}
+            missing = False
+            for relative in paths:
+                digest = _commit_path_sha256(repo, commit, relative)
+                if digest is None:
+                    missing = True
+                    break
+                observed[relative] = digest
+            if missing:
+                continue
+            if observed == hashes:
+                matched = True
+                break
+        if not matched:
+            return None, "accepted_outcome_receipt_historical_hash_mismatch"
+    revision = "sha256:" + _digest({
+        "base_oid": expected["base_oid"], "changed_path_hashes": hashes,
+    })
+    if receipt.get("repository_revision") != revision:
+        return None, "accepted_outcome_receipt_revision_mismatch"
+    unsigned = dict(receipt)
+    receipt_id = str(unsigned.pop("receipt_id", ""))
+    if receipt_id != "sha256:" + _digest(unsigned):
+        return None, "accepted_outcome_receipt_id_mismatch"
+    return dict(receipt), ""
+
+
+def verify_provenance(
+    repo_root: Path,
+    rows: list[dict[str, Any]],
+    *,
+    accepted_outcome_authority: trajectory_export.AcceptedOutcomeAuthority | None = None,
+) -> None:
+    """Re-authenticate every row against sealed store identity and git history.
 
     A row's own ``row_sha256`` only proves the row is internally
     self-consistent -- a fabricated (task_id, request_id, receipt) triple can
     compute a valid digest over its own fabricated content just as easily as
-    a genuine one. This is the explicit canonical-source check: each row
-    must resolve, live, to a task card whose own authenticated
-    accepted-outcome receipt matches the row's declared identity and receipt
-    id, or the row is refused as provenance-absent. This is intentionally
-    separate from ``check()``, which is documented to never touch the task
-    store; this function is the one place that re-derives "is this row real"
-    from the sealed source rather than from the row's own claims about
-    itself.
+    a genuine one. Each row must resolve to a task card whose sealed
+    accepted-outcome receipt matches the row, and every promoted-path hash
+    must appear together in one canonical descendant commit after the
+    accepted ``base_oid``. Current working-tree bytes are not the authority;
+    later canonical edits must not invalidate historical rows. Isolated git
+    blobs that are not in that descendant tree are refused.
+
+    Pass ``accepted_outcome_authority`` to use live current-byte checks
+    instead of the historical default (rebuild does this).
     """
     if not rows:
         return
     try:
         manager_decisions = task_store.latest_manager_decisions(repo_root)
         usage_rows = task_store.list_usage_events(repo_root, limit=10_000)
-    except task_store.TaskStoreError as exc:
-        raise AcceptedTaskEvalError(f"task_store_unavailable:{exc}") from exc
+    except task_store.TaskStoreError as orig:
+        raise AcceptedTaskEvalError(f"task_store_unavailable:{orig}") from orig
+    authority = accepted_outcome_authority or partial(
+        historical_accepted_outcome_authority, repo_root,
+    )
     for row in rows:
         task_id = str(row.get("task_id") or "")
         request_id = str(row.get("request_id") or "")
@@ -329,14 +542,15 @@ def verify_provenance(repo_root: Path, rows: list[dict[str, Any]]) -> None:
             trajectory = trajectory_export.export_attempt_trajectory(
                 repo_root, task_id=task_id, request_id=request_id,
                 manager_decisions=manager_decisions, usage_rows=usage_rows,
+                accepted_outcome_authority=authority,
             )
-        except trajectory_export.AttemptTrajectoryExportError as exc:
+        except trajectory_export.AttemptTrajectoryExportError as orig:
             raise AcceptedTaskEvalError(
-                f"provenance_absent_from_sealed_source:{task_id}:{request_id}:{exc}"
-            ) from exc
+                f"provenance_absent_from_sealed_source:{task_id}:{request_id}:{orig}"
+            ) from orig
         if trajectory["outcome"]["state"] != "accepted":
             raise AcceptedTaskEvalError(
-                f"provenance_absent_from_sealed_source:{task_id}:{request_id}:not_accepted_live"
+                f"provenance_absent_from_sealed_source:{task_id}:{request_id}:not_accepted"
             )
         live_receipt = trajectory["outcome"]["accepted_outcome_receipt"] or {}
         live_receipt_id = live_receipt.get("receipt_id", trajectory_export.UNKNOWN)
@@ -356,7 +570,13 @@ def rebuild(repo_root: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """
     candidates = discover_candidates(repo_root)
     rows = build_rows(candidates)
-    verify_provenance(repo_root, rows)
+    verify_provenance(
+        repo_root,
+        rows,
+        accepted_outcome_authority=partial(
+            task_engine._validate_accepted_outcome_receipt, repo_root,
+        ),
+    )
     summary = build_summary(rows)
     _write_json(repo_root / SUMMARY_RELATIVE_PATH, summary)
     _write_jsonl(repo_root / ROWS_RELATIVE_PATH, rows)

@@ -3,8 +3,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
+import subprocess
 import sys
+from functools import partial
 from pathlib import Path
 
 import pytest
@@ -28,12 +31,47 @@ def _digest(payload) -> str:
     ).hexdigest()
 
 
+def _git(repo: Path, *args: str, input_bytes: bytes | None = None) -> str:
+    env = os.environ.copy()
+    for key in (
+        "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY", "GIT_COMMON_DIR", "GIT_PREFIX",
+    ):
+        env.pop(key, None)
+    result = subprocess.run(
+        ["git", "-C", str(repo), *args],
+        check=True,
+        capture_output=True,
+        input=input_bytes,
+        env=env,
+    )
+    return result.stdout.decode().strip()
+
+
+def _init_git_base(repo: Path) -> str:
+    _git(repo, "init")
+    _git(repo, "config", "user.email", "fixture@example.com")
+    _git(repo, "config", "user.name", "Fixture")
+    _git(repo, "config", "commit.gpgsign", "false")
+    (repo / ".keep").write_text("base\n", encoding="utf-8")
+    _git(repo, "add", ".keep")
+    _git(repo, "commit", "-m", "base")
+    return _git(repo, "rev-parse", "HEAD")
+
+
+def _git_commit_paths(repo: Path, message: str, *paths: str) -> str:
+    _git(repo, "add", "--", *paths)
+    _git(repo, "commit", "-m", message)
+    return _git(repo, "rev-parse", "HEAD")
+
+
 def _scenario_id(family: str, risk_tier: str, complexity: str) -> str:
     return f"{family}_{risk_tier}_{complexity}".upper()
 
 
 def _seed_accepted_scenario(
     repo: Path, *, family: str, risk_tier: str, complexity: str, promoted_count: int,
+    base_oid: str | None = None,
 ) -> tuple[str, str]:
     """Seed one genuinely-authenticatable accepted task episode.
 
@@ -58,7 +96,8 @@ def _seed_accepted_scenario(
         full.write_text(f"# fixture {relative}\n", encoding="utf-8")
         changed_path_hashes[relative] = hashlib.sha256(full.read_bytes()).hexdigest()
     manifest = {"artifacts": ["metadata.json"]}
-    base_oid = f"base-oid-{scenario.lower()}"
+    if base_oid is None:
+        base_oid = f"base-oid-{scenario.lower()}"
     claim_epoch = 1
     receipt = {
         "schema_id": task_engine.ACCEPTED_OUTCOME_RECEIPT_SCHEMA,
@@ -121,6 +160,22 @@ def seed_fixture_repository(repo: Path) -> list[tuple[str, str]]:
                     repo, family=family, risk_tier=risk_tier,
                     complexity=complexity, promoted_count=promoted_count,
                 ))
+    return seeded
+
+
+def seed_historical_fixture_repository(repo: Path) -> list[tuple[str, str]]:
+    task_store.initialize_repository(repo)
+    base_oid = _init_git_base(repo)
+    seeded = []
+    for family in FAMILIES:
+        for risk_tier in RISK_TIERS:
+            for complexity, promoted_count in COMPLEXITY_PROMOTED_COUNTS.items():
+                seeded.append(_seed_accepted_scenario(
+                    repo, family=family, risk_tier=risk_tier,
+                    complexity=complexity, promoted_count=promoted_count,
+                    base_oid=base_oid,
+                ))
+    _git_commit_paths(repo, "promote fixtures", "src")
     return seeded
 
 
@@ -500,6 +555,10 @@ def test_production_artifact_pair_provenance_matches_live_store_when_reachable()
 # verify_provenance: the explicit canonical-source re-authentication step
 # --------------------------------------------------------------------------
 
+def _live_authority(repo: Path):
+    return partial(task_engine._validate_accepted_outcome_receipt, repo)
+
+
 def test_verify_provenance_accepts_rows_matching_live_store(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -507,7 +566,9 @@ def test_verify_provenance_accepts_rows_matching_live_store(tmp_path: Path) -> N
     candidates = builder.discover_candidates(repo)
     rows = builder.build_rows(candidates)
 
-    builder.verify_provenance(repo, rows)  # must not raise
+    builder.verify_provenance(
+        repo, rows, accepted_outcome_authority=_live_authority(repo),
+    )
 
 
 def test_verify_provenance_rejects_row_absent_from_live_store(tmp_path: Path) -> None:
@@ -524,7 +585,9 @@ def test_verify_provenance_rejects_row_absent_from_live_store(tmp_path: Path) ->
     )
 
     with pytest.raises(builder.AcceptedTaskEvalError, match="provenance_absent_from_sealed_source"):
-        builder.verify_provenance(repo, [forged_row])
+        builder.verify_provenance(
+            repo, [forged_row], accepted_outcome_authority=_live_authority(repo),
+        )
 
 
 def test_verify_provenance_rejects_receipt_mismatch(tmp_path: Path) -> None:
@@ -537,8 +600,9 @@ def test_verify_provenance_rejects_receipt_mismatch(tmp_path: Path) -> None:
     tampered_row["accepted_outcome_receipt_id"] = "sha256:" + "0" * 64
 
     with pytest.raises(builder.AcceptedTaskEvalError, match="provenance_receipt_mismatch"):
-        builder.verify_provenance(repo, [tampered_row])
-
+        builder.verify_provenance(
+            repo, [tampered_row], accepted_outcome_authority=_live_authority(repo),
+        )
 
 def test_rebuild_fails_closed_and_writes_nothing_when_a_row_is_forged(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
@@ -569,7 +633,7 @@ def test_rebuild_fails_closed_and_writes_nothing_when_a_row_is_forged(
 def test_verify_provenance_cli_flag_rejects_forged_committed_row(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
-    seed_fixture_repository(repo)
+    seed_historical_fixture_repository(repo)
     builder.rebuild(repo)
     rows_path = repo / builder.ROWS_RELATIVE_PATH
     lines = rows_path.read_text(encoding="utf-8").splitlines()
@@ -589,12 +653,235 @@ def test_verify_provenance_cli_flag_rejects_forged_committed_row(tmp_path: Path)
 def test_verify_provenance_cli_flag_passes_genuine_committed_rows(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
-    seed_fixture_repository(repo)
+    seed_historical_fixture_repository(repo)
     builder.rebuild(repo)
 
     exit_code = builder.main(["--repo-root", str(repo), "--verify-provenance"])
 
     assert exit_code == 0
+
+
+def _insert_accepted_card(
+    repo: Path,
+    *,
+    task_id: str,
+    request_id: str,
+    files: dict[str, bytes],
+    base_oid: str,
+    family: str = "task_mcp",
+) -> dict:
+    relative_paths = sorted(files)
+    changed_path_hashes = {
+        relative: hashlib.sha256(payload).hexdigest() for relative, payload in files.items()
+    }
+    for relative, payload in files.items():
+        full = repo / relative
+        full.parent.mkdir(parents=True, exist_ok=True)
+        full.write_bytes(payload)
+    manifest = {"artifacts": ["metadata.json"]}
+    claim_epoch = 1
+    receipt = {
+        "schema_id": task_engine.ACCEPTED_OUTCOME_RECEIPT_SCHEMA,
+        "task_id": task_id,
+        "request_id": request_id,
+        "claim_epoch": claim_epoch,
+        "base_oid": base_oid,
+        "promoted_paths": relative_paths,
+        "changed_path_hashes": changed_path_hashes,
+        "attempt_artifact_manifest_id": _digest(manifest),
+        "repository_revision": "sha256:"
+        + _digest({"base_oid": base_oid, "changed_path_hashes": changed_path_hashes}),
+    }
+    receipt["receipt_id"] = "sha256:" + _digest(receipt)
+    card = {
+        "runner": "hist_runner",
+        "topic": family,
+        "risk_tier": "low",
+        "status": "finished",
+        "claim_epoch": claim_epoch,
+        "accepted_request_id": request_id,
+        "accept_evidence": {"accepted_outcome_receipt": receipt},
+        "terminal_review": {
+            "evidence": {
+                "request_identity": {"request_id": request_id},
+                "changed_paths": relative_paths,
+                "changed_path_hashes": changed_path_hashes,
+                "attempt_artifact_manifest": manifest,
+                "workspace": {"base_oid": base_oid},
+            }
+        },
+    }
+    now = "2026-09-01T00:00:00+00:00"
+    _readiness, db_path = task_store._require_ready(repo)
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO tasks(task_id, runner, topic, status, worker_status, priority, "
+            "objective, card_json, created_at, updated_at, claimed_by, claimed_at, started_at, "
+            "origin_thread_id) VALUES (?, ?, ?, ?, ?, '', '', ?, ?, ?, ?, ?, ?, ?)",
+            (
+                task_id, "hist_runner", family, "finished", "finished", json.dumps(card),
+                now, now, "hist_runner", now, now, "thread-hist",
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return receipt
+
+
+def _provenance_row(task_id: str, request_id: str, receipt: dict) -> dict:
+    return {
+        "task_id": task_id,
+        "request_id": request_id,
+        "accepted_outcome_receipt_id": receipt["receipt_id"],
+    }
+
+
+def test_verify_provenance_survives_later_canonical_edits(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    task_store.initialize_repository(repo)
+    base_oid = _init_git_base(repo)
+    original = b"promoted-bytes\n"
+    receipt = _insert_accepted_card(
+        repo,
+        task_id="HIST_LATER_TASK",
+        request_id="req-hist-later",
+        files={"src/later.py": original},
+        base_oid=base_oid,
+    )
+    _git_commit_paths(repo, "promote", "src")
+    (repo / "src" / "later.py").write_bytes(b"later-canonical-edit\n")
+
+    builder.verify_provenance(
+        repo, [_provenance_row("HIST_LATER_TASK", "req-hist-later", receipt)],
+    )
+    card = task_store.get_task(repo, "HIST_LATER_TASK")
+    authenticated, reason = task_engine._validate_accepted_outcome_receipt(
+        repo, card, "HIST_LATER_TASK", "req-hist-later", receipt,
+    )
+    assert authenticated is None
+    assert reason == "accepted_outcome_receipt_canonical_hash_mismatch"
+
+def test_verify_provenance_rejects_isolated_git_blobs(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    task_store.initialize_repository(repo)
+    base_oid = _init_git_base(repo)
+    payload = b"isolated-blob-bytes\n"
+    receipt = _insert_accepted_card(
+        repo,
+        task_id="HIST_ISOLATED_TASK",
+        request_id="req-hist-isolated",
+        files={"src/isolated.py": payload},
+        base_oid=base_oid,
+    )
+    _git(repo, "hash-object", "-w", "--stdin", input_bytes=payload)
+
+    with pytest.raises(builder.AcceptedTaskEvalError, match="provenance_absent_from_sealed_source"):
+        builder.verify_provenance(
+            repo, [_provenance_row("HIST_ISOLATED_TASK", "req-hist-isolated", receipt)],
+        )
+
+
+def test_verify_provenance_rejects_committed_symlink_matching_digest(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    task_store.initialize_repository(repo)
+    base_oid = _init_git_base(repo)
+    payload = b"sealed-file-bytes"
+    receipt = _insert_accepted_card(
+        repo,
+        task_id="HIST_SYMLINK_TASK",
+        request_id="req-hist-symlink",
+        files={"src/linked.py": payload},
+        base_oid=base_oid,
+    )
+    linked = repo / "src" / "linked.py"
+    linked.unlink()
+    linked.symlink_to(payload.decode("ascii"))
+    _git_commit_paths(repo, "promote-symlink", "src")
+
+    with pytest.raises(builder.AcceptedTaskEvalError, match="provenance_absent_from_sealed_source"):
+        builder.verify_provenance(
+            repo, [_provenance_row("HIST_SYMLINK_TASK", "req-hist-symlink", receipt)],
+        )
+
+
+def test_verify_provenance_rejects_hashes_split_across_commits(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    task_store.initialize_repository(repo)
+    base_oid = _init_git_base(repo)
+    first = b"alpha-correct\n"
+    second = b"beta-correct\n"
+    receipt = _insert_accepted_card(
+        repo,
+        task_id="HIST_SPLIT_TASK",
+        request_id="req-hist-split",
+        files={"src/a.py": first, "src/b.py": second},
+        base_oid=base_oid,
+    )
+    (repo / "src" / "b.py").write_bytes(b"beta-wrong\n")
+    _git_commit_paths(repo, "only a.py matches", "src")
+    (repo / "src" / "a.py").write_bytes(b"alpha-wrong\n")
+    (repo / "src" / "b.py").write_bytes(second)
+    _git_commit_paths(repo, "only b.py matches", "src")
+
+    with pytest.raises(builder.AcceptedTaskEvalError, match="provenance_absent_from_sealed_source"):
+        builder.verify_provenance(
+            repo, [_provenance_row("HIST_SPLIT_TASK", "req-hist-split", receipt)],
+        )
+
+
+def test_verify_provenance_rejects_path_traversal(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    task_store.initialize_repository(repo)
+    base_oid = _init_git_base(repo)
+    receipt = _insert_accepted_card(
+        repo,
+        task_id="HIST_TRAV_TASK",
+        request_id="req-hist-trav",
+        files={"../escape.py": b"escaped\n"},
+        base_oid=base_oid,
+    )
+
+    with pytest.raises(builder.AcceptedTaskEvalError, match="provenance_absent_from_sealed_source"):
+        builder.verify_provenance(
+            repo, [_provenance_row("HIST_TRAV_TASK", "req-hist-trav", receipt)],
+        )
+
+
+def test_verify_provenance_rejects_matching_commit_not_after_base(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    task_store.initialize_repository(repo)
+    _git(repo, "init")
+    _git(repo, "config", "user.email", "fixture@example.com")
+    _git(repo, "config", "user.name", "Fixture")
+    _git(repo, "config", "commit.gpgsign", "false")
+    payload = b"only-at-base\n"
+    (repo / "src").mkdir(parents=True)
+    (repo / "src" / "base_only.py").write_bytes(payload)
+    _git(repo, "add", "src")
+    _git(repo, "commit", "-m", "files at base")
+    base_oid = _git(repo, "rev-parse", "HEAD")
+    receipt = _insert_accepted_card(
+        repo,
+        task_id="HIST_BASE_TASK",
+        request_id="req-hist-base",
+        files={"src/base_only.py": payload},
+        base_oid=base_oid,
+    )
+    (repo / "src" / "base_only.py").write_bytes(b"changed-after-base\n")
+    _git_commit_paths(repo, "later edit", "src")
+
+    with pytest.raises(builder.AcceptedTaskEvalError, match="provenance_absent_from_sealed_source"):
+        builder.verify_provenance(
+            repo, [_provenance_row("HIST_BASE_TASK", "req-hist-base", receipt)],
+        )
 
 
 # --------------------------------------------------------------------------

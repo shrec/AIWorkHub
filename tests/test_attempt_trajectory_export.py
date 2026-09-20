@@ -585,6 +585,31 @@ def test_export_attempt_trajectory_canonical_hash_mismatch_refuses(tmp_path: Pat
         export_mod.export_attempt_trajectory(repo, task_id=TASK_ID, request_id=REQUEST_ID)
 
 
+def test_export_attempt_trajectory_honors_opt_in_authority(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    card = _seed_genuine_accepted_evidence(repo, task_id=TASK_ID, request_id=REQUEST_ID)
+    _seed_task(repo, task_id=TASK_ID, card=card)
+
+    def _refusing(_card, _task_id, _request_id, _receipt):
+        return None, "opt_in_authority_refused"
+
+    with pytest.raises(export_mod.IdentityMismatchError, match="opt_in_authority_refused"):
+        export_mod.export_attempt_trajectory(
+            repo, task_id=TASK_ID, request_id=REQUEST_ID,
+            accepted_outcome_authority=_refusing,
+        )
+
+    def _accepting(_card, _task_id, _request_id, receipt):
+        return dict(receipt), ""
+
+    (repo / "src" / "foo.py").write_text("print('later edit')\n", encoding="utf-8")
+    result = export_mod.export_attempt_trajectory(
+        repo, task_id=TASK_ID, request_id=REQUEST_ID,
+        accepted_outcome_authority=_accepting,
+    )
+    assert result["outcome"]["state"] == "accepted"
+
 def test_export_attempt_trajectory_accept_review_event_without_receipt_stays_unknown(
     tmp_path: Path,
 ) -> None:

@@ -25,8 +25,8 @@ UNKNOWN = "UNKNOWN"
 
 # Matches task_engine._validate_accepted_outcome_receipt(repo, card, task_id,
 # request_id, receipt) with `repo` pre-bound by the caller (see
-# export_attempt_trajectory). Only this canonical, sealed-evidence-bound
-# authority may grant the "accepted" signal -- a receipt's own self-digest
+# export_attempt_trajectory). Default export binds that live authority;
+# callers may pass an explicit opt-in callback. A receipt's own self-digest
 # proves internal consistency, never that it was canonically issued.
 AcceptedOutcomeAuthority = Callable[
     [dict, str, str, dict], tuple
@@ -480,6 +480,7 @@ def export_attempt_trajectory(
     attempt_artifact_bundle_dir: str | Path | None = None,
     manager_decisions: dict[str, dict[str, str]] | None = None,
     usage_rows: list[dict[str, Any]] | None = None,
+    accepted_outcome_authority: AcceptedOutcomeAuthority | None = None,
 ) -> dict[str, Any]:
     """Compose one deterministic, read-only attempt trajectory export.
 
@@ -497,6 +498,11 @@ def export_attempt_trajectory(
     its own whole-table query; that per-call re-fetch is what turns an
     N-card rebuild into O(N) whole-store scans. Omitting either argument
     preserves the original single-call behavior of fetching it fresh.
+
+    ``accepted_outcome_authority`` is opt-in. When omitted, export binds
+    ``task_engine._validate_accepted_outcome_receipt`` so current-byte
+    mismatch still refuses accepted. Pass a callback to use a different
+    sealed-evidence authority without changing that default.
     """
     repo_path = Path(repo)
     ledger_path = (
@@ -564,6 +570,10 @@ def export_attempt_trajectory(
                 payloads[entry.role] = {"unparseable_bytes_sha256": hashlib.sha256(raw).hexdigest()}
         artifact_bundle = {"verification": verification, "payloads": payloads}
 
+    if accepted_outcome_authority is None:
+        accepted_outcome_authority = partial(
+            task_engine._validate_accepted_outcome_receipt, repo_path,
+        )
     return build_attempt_trajectory(
         task_id=task_id,
         request_id=request_id,
@@ -574,7 +584,7 @@ def export_attempt_trajectory(
         usage_rows=usage_rows,
         manager_decision=manager_decision,
         artifact_bundle=artifact_bundle,
-        accepted_outcome_authority=partial(task_engine._validate_accepted_outcome_receipt, repo_path),
+        accepted_outcome_authority=accepted_outcome_authority,
     )
 
 
