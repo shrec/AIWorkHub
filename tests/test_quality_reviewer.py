@@ -22,6 +22,125 @@ def _canonical_digest(payload: dict) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _discontiguous_delta_packet(*, unchanged: bool) -> dict:
+    source = "changed code"
+    digest = hashlib.sha256(source.encode("utf-8")).hexdigest()
+    segment_near = {
+        "kind": "replace",
+        "candidate_start_line": 12,
+        "candidate_end_line": 14,
+        "changed_start_line": 12,
+        "changed_end_line": 14,
+        "baseline_start_line": 12,
+        "baseline_end_line": 14,
+        "excerpt_bytes": len(source),
+        "truncated": False,
+    }
+    segment_far = dict(
+        segment_near,
+        candidate_start_line=988,
+        candidate_end_line=990,
+        changed_start_line=988,
+        changed_end_line=990,
+        baseline_start_line=988,
+        baseline_end_line=990,
+    )
+    inner = {
+        "task_id": "task1",
+        "review_lens": {"lens_kind": "correctness"},
+        "changed_paths": [{"path": "src/module.py"}],
+        "target_symbols": [
+            {"qualified_name": "module.alpha_hunk"},
+            {"qualified_name": "module.omega_hunk"},
+        ],
+        "known_unknowns": ["correctness graph boundary"],
+    }
+    audit = {
+        "schema_id": "aiworkhub.scoped_audit.v1",
+        "fingerprint": _canonical_digest(inner),
+        "known_unknowns": inner["known_unknowns"],
+        "packet": inner,
+    }
+    return quality_reviewer.build_review_packet(
+        request_id="req1",
+        task_id="task1",
+        claim_epoch=1,
+        worker_provider="adapter-a",
+        changed_path_hashes={"src/module.py": digest},
+        objective="review only the changed delta",
+        acceptance=["contract row must survive the boundary"],
+        required_outputs=["src/module.py"],
+        source_evidence={
+            "src/module.py": {
+                "candidate_sha256": digest,
+                "excerpt": source,
+                "excerpt_bytes": len(source),
+                "source_bytes": len(source),
+                "truncated": False,
+                "segments": [segment_near, segment_far],
+            }
+        },
+        scoped_audits={"correctness": audit},
+        candidate_delta={
+            "predecessor_request_id": "req0",
+            "paths": {
+                "src/module.py": {
+                    "unchanged_since_reviewed": unchanged,
+                    "predecessor_sha256": digest,
+                }
+            },
+        },
+    )
+
+
+def test_identical_fixture_yields_identical_sealed_packet_hashes():
+    before = _discontiguous_delta_packet(unchanged=False)
+    after = _discontiguous_delta_packet(unchanged=False)
+    assert before["packet_sha256"] == after["packet_sha256"]
+    body = {k: v for k, v in before.items() if k != "packet_sha256"}
+    assert before["packet_sha256"] == _canonical_digest(body)
+    lens_packet = quality_reviewer.build_lens_packet(before, lens="correctness")
+    assert lens_packet["packet_sha256"] == before["packet_sha256"]
+
+
+def test_discontiguous_fixture_measures_target_symbols_and_packet_bytes():
+    packet = _discontiguous_delta_packet(unchanged=False)
+    lens_packet = quality_reviewer.build_lens_packet(packet, lens="correctness")
+    audit_packet = lens_packet["candidate"]["scoped_audits"]["correctness"]["packet"]
+    targets = audit_packet["target_symbols"]
+    measured_targets = len(targets)
+    measured_bytes = len(
+        json.dumps(
+            lens_packet, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+        ).encode("utf-8")
+    )
+    assert measured_targets == 2
+    assert [t["qualified_name"] for t in targets] == [
+        "module.alpha_hunk",
+        "module.omega_hunk",
+    ]
+    assert isinstance(measured_bytes, int)
+    assert measured_bytes < 96 * 1024
+    prompt = quality_reviewer.build_review_prompt(lens_packet, lens="correctness")
+    assert "module.alpha_hunk" in prompt
+    assert "module.omega_hunk" in prompt
+    assert "middle_untouched_symbol" not in prompt
+    assert "candidate.delta marks src/module.py as unchanged_since_reviewed" not in prompt
+
+
+def test_unchanged_delta_paths_are_recognized_without_dropping_contract():
+    packet = _discontiguous_delta_packet(unchanged=True)
+    lens_packet = quality_reviewer.build_lens_packet(packet, lens="correctness")
+    prompt = quality_reviewer.build_review_prompt(lens_packet, lens="correctness")
+    assert "candidate.delta marks src/module.py as unchanged_since_reviewed" in prompt
+    assert "contract row must survive the boundary" in prompt
+    delta_row = lens_packet["candidate"]["delta"]["paths"]["src/module.py"]
+    assert delta_row["unchanged_since_reviewed"] is True
+    assert lens_packet["contract"]["acceptance"] == [
+        "contract row must survive the boundary"
+    ]
+
+
 def _packet_with_findings(
     packet_sha256: str | None = None,
     candidate_path: str = "src/module.py",

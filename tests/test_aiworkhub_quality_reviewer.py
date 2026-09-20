@@ -125,8 +125,107 @@ def test_changed_hunk_segments_are_preserved_in_packet_and_prompt():
 
     assert row["segments"] == [segment]
     assert "candidate_start_line" in quality_reviewer.build_review_prompt(
-        packet, lens="correctness"
+        packet, lens="correctness")
+
+def _audit_with_targets(lens: str, targets: list[str]) -> dict:
+    inner = {
+        "task_id": "task1",
+        "review_lens": {"lens_kind": lens},
+        "changed_paths": [{"path": "src/mod.py"}],
+        "targets": targets,
+        "known_unknowns": [f"{lens} graph boundary"],
+    }
+    return {
+        "schema_id": "aiworkhub.scoped_audit.v1",
+        "fingerprint": hashlib.sha256(
+            json.dumps(
+                inner,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest(),
+        "known_unknowns": inner["known_unknowns"],
+        "packet": inner,
+    }
+
+def _segment(start: int, end: int) -> dict:
+    return {
+        "kind": "insert",
+        "candidate_start_line": start,
+        "candidate_end_line": end,
+        "changed_start_line": start,
+        "changed_end_line": end,
+        "baseline_start_line": start,
+        "baseline_end_line": start,
+        "excerpt_bytes": len(SOURCE.encode("utf-8")),
+        "truncated": False,
+    }
+
+def test_prompt_leads_with_changed_hunks_then_bounded_graph_impact():
+    packet = _packet(scoped_audits=_scoped_audits("correctness"))
+    prompt = quality_reviewer.build_review_prompt(packet, lens="correctness")
+    hunks = prompt.index("authenticated changed hunks")
+    impact = prompt.index("graph-connected affected callers and tests")
+    unknowns = prompt.index("then its explicit known_unknowns")
+    assert hunks < impact < unknowns
+    assert "do not re-read whole files" in prompt
+    assert "do not scan the whole repository" in prompt
+
+def test_known_unknowns_escalate_instead_of_claiming_clean():
+    packet = _packet(scoped_audits=_scoped_audits("correctness"))
+    prompt = quality_reviewer.build_review_prompt(packet, lens="correctness")
+    assert "escalated as a process_limit finding" in prompt
+    assert "can never support a clean result" in prompt
+
+def test_candidate_delta_marks_unchanged_paths_without_dropping_contract():
+    delta = {
+        "predecessor_request_id": "req0",
+        "paths": {
+            "src/mod.py": {
+                "unchanged_since_reviewed": True,
+                "predecessor_sha256": DIGEST,
+            }
+        },
+    }
+    packet = _packet(
+        acceptance=["acceptance row must survive"],
+        required_outputs=["src/mod.py"],
+        scoped_audits=_scoped_audits("correctness"),
+        candidate_delta=delta,
     )
+    assert packet["contract"]["acceptance"] == ["acceptance row must survive"]
+    prompt = quality_reviewer.build_review_prompt(packet, lens="correctness")
+    assert (
+        "candidate.delta marks src/mod.py as unchanged_since_reviewed" in prompt
+    )
+    assert "acceptance row must survive" in prompt
+
+def test_identical_discontiguous_fixture_measured_for_targets_and_packet_bytes():
+    audit = _audit_with_targets("correctness", ["near_handler", "far_handler"])
+    packet = _packet(
+        source_evidence=_evidence(segments=[_segment(12, 14), _segment(988, 990)]),
+        scoped_audits={"correctness": audit},
+    )
+    lens_packet = quality_reviewer.build_lens_packet(packet, lens="correctness")
+    measured_bytes = len(
+        json.dumps(
+            lens_packet, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+        ).encode("utf-8")
+    )
+    body = {k: v for k, v in lens_packet.items() if k != "packet_sha256"}
+    resealed = hashlib.sha256(
+        json.dumps(
+            body, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+        ).encode("utf-8")
+    ).hexdigest()
+    assert lens_packet["packet_sha256"] == resealed == packet["packet_sha256"]
+    assert isinstance(measured_bytes, int)
+    assert measured_bytes < 96 * 1024
+    prompt = quality_reviewer.build_review_prompt(lens_packet, lens="correctness")
+    assert prompt.count("near_handler") == 1
+    assert prompt.count("far_handler") == 1
+    assert "between_handler" not in prompt
 
 
 def _deleted_packet():

@@ -739,10 +739,44 @@ def build_review_prompt(
     # the sealed packet.  It used to be inlined a second time here as
     # ACTIVE_SCOPED_AUDIT (measured: the reviewer received its own scope twice
     # and the other lenses' identical scopes once, on every launch).
+    # Semantic-delta boundary: the statement below leads with the changed
+    # hunks the packet authenticates, then the graph-connected impact, then
+    # the explicit known_unknowns, and recognizes candidate.delta's unchanged
+    # paths without dropping the contract section that governs the task.
+    candidate_section = packet.get("candidate")
+    delta_paths = (
+        candidate_section.get("delta", {}).get("paths")
+        if isinstance(candidate_section, Mapping)
+        else None
+    )
+    unchanged_paths: list[str] = []
+    if isinstance(delta_paths, Mapping):
+        unchanged_paths = sorted(
+            path
+            for path, row in delta_paths.items()
+            if isinstance(row, Mapping) and row.get("unchanged_since_reviewed") is True
+        )
+    unchanged_instruction = (
+        "candidate.delta marks "
+        f"{', '.join(unchanged_paths)} as unchanged_since_reviewed: recognize "
+        "those paths as previously reviewed context, not new review surface, "
+        "while the contract section still governs the whole task.\n"
+        if unchanged_paths
+        else ""
+    )
     scope_instruction = (
         f"candidate.scoped_audits.{lens} is the graph-scoped audit for this "
         "lens: use it as the primary behavior boundary and treat its "
         "known_unknowns as explicit limits.\n"
+        "Review boundary, in order: first the authenticated changed hunks in "
+        "candidate.source_evidence[*].segments; then only the graph-connected "
+        "affected callers and tests the scoped audit lists; then its explicit "
+        "known_unknowns. Review exactly that bounded delta: do not re-read "
+        "whole files and do not scan the whole repository.\n"
+        "Fail closed on unknowns: a non-empty known_unknowns list, or missing "
+        "or stale changed-segment evidence for any changed path, must be "
+        "escalated as a process_limit finding and can never support a clean "
+        f"result.\n{unchanged_instruction}"
         if active_scope is not None
         else ""
     )
