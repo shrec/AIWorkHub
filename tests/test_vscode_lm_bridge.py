@@ -2118,6 +2118,50 @@ def test_create_request_rejects_required_outputs_before_publication(
     assert not (home / ".aiworkhub_vscode_lm_worker.json").exists()
     assert not (root / "requests" / repo_id / f"{request_id}.json").exists()
 
+def test_read_only_review_allows_explicit_empty_required_outputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request_id = "9" * 32
+    _root, repo, workspace, home = _required_output_request_env(
+        tmp_path, monkeypatch, request_id=request_id
+    )
+    request = vscode_lm_bridge.create_request(
+        repo=repo,
+        request_id=request_id,
+        workspace_path=workspace,
+        workspace_home=home,
+        prompt="read-only quality review",
+        model="glm-5.2",
+        allowed_writes=[],
+        required_outputs=[],
+        timeout_seconds=30,
+        request_kind="quality_review",
+    )
+    published = json.loads(request.request_path.read_text(encoding="utf-8"))
+    assert published["allowed_writes"] == []
+    assert published["required_outputs"] == []
+
+
+def test_writable_bridge_request_still_rejects_empty_required_outputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request_id = "8" * 32
+    _root, repo, workspace, home = _required_output_request_env(
+        tmp_path, monkeypatch, request_id=request_id
+    )
+    with pytest.raises(vscode_lm_bridge.BridgeError, match="bridge_required_outputs_invalid"):
+        vscode_lm_bridge.create_request(
+            repo=repo,
+            request_id=request_id,
+            workspace_path=workspace,
+            workspace_home=home,
+            prompt="writable worker",
+            model="glm-5.2",
+            allowed_writes=["src/app.py"],
+            required_outputs=[],
+            timeout_seconds=30,
+        )
+
 
 def test_bridge_validates_and_forwards_provider_identity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

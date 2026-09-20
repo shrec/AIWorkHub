@@ -598,8 +598,12 @@ def _normalize_required_outputs(
 ) -> list[str] | None:
     if required_outputs is None:
         return None
-    if not isinstance(required_outputs, list) or not required_outputs:
+    if not isinstance(required_outputs, list):
         raise BridgeError("bridge_required_outputs_invalid")
+    if not required_outputs:
+        if allowed:
+            raise BridgeError("bridge_required_outputs_invalid")
+        return []
     allowed_exact: set[str] = set()
     for item in allowed:
         if any(marker in item for marker in ("*", "?", "[")):
