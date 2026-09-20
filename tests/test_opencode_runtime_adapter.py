@@ -367,11 +367,10 @@ def test_opencode_permission_allows_only_worker_mcp_namespace() -> None:
         )
     denied = (
         "aiworkhub_manager_bootstrap",
+        "awh_aiworkhub_manager_bootstrap",
         "aiworkhub_worker_ai_tools_quality_review_submit",
-        # Both reviewer tools are declared now, so they are asserted allowed
-        # by the loop above.  A truncated prefix of a declared name stays
-        # denied, which is what proves the matcher is not prefix-matching its
-        # way into granting an undeclared tool.
+        "awh_aiworkhub_worker_quality_review",
+        "awh_aiworkhub_worker_undeclared",
         "aiworkhub_worker_ai_tools_aiworkhub_worker_quality_review",
         "aiworkhub_worker_ai_tools_aiworkhub_worker_undeclared",
     )
@@ -406,3 +405,38 @@ def test_opencode_worker_mcp_config_is_request_local_and_secret_free() -> None:
 def test_opencode_worker_mcp_config_rejects_shell_string_command() -> None:
     with pytest.raises(ValueError, match="opencode_mcp_command_must_be_argv"):
         runtime_adapters.build_opencode_worker_mcp_config("python -m aiworkhub")
+
+
+def test_opencode_worker_mcp_tool_names_fit_muse_limit() -> None:
+    old_alias = "aiworkhub_worker_ai_tools"
+    published = tuple(
+        runtime_adapters.opencode_mcp_tool_name(mcp_tool)
+        for mcp_tool in runtime_adapters.OPENCODE_WORKER_MCP_TOOLS
+    )
+    assert runtime_adapters.OPENCODE_WORKER_MCP_SERVER == "awh"
+    assert all(len(name) <= 64 for name in published)
+    assert all(name.startswith("awh_") for name in published)
+    assert any(
+        len(f"{old_alias}_{mcp_tool}") > 64
+        for mcp_tool in runtime_adapters.OPENCODE_WORKER_MCP_TOOLS
+    )
+    permission = runtime_adapters.opencode_worker_permission_contract()
+    config = runtime_adapters.build_opencode_worker_mcp_config(
+        ("/usr/bin/python3", "-m", "aiworkhub.worker_ai_tools_mcp")
+    )
+    allow_names = {
+        name
+        for name, action in permission.items()
+        if action == runtime_adapters.OPENCODE_PERMISSION_ALLOW
+    }
+    config_allow = {
+        name
+        for name, action in config["permission"].items()
+        if action == runtime_adapters.OPENCODE_PERMISSION_ALLOW
+    }
+    assert set(published) == allow_names == config_allow
+    assert list(config["mcp"]) == ["awh"]
+    assert old_alias not in config["mcp"]
+    for mcp_tool in runtime_adapters.OPENCODE_WORKER_MCP_TOOLS:
+        assert runtime_adapters.opencode_tool_is_allowed(f"{old_alias}_{mcp_tool}") is False
+        assert "manager" not in mcp_tool
