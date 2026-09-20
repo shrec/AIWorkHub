@@ -1316,6 +1316,619 @@ def test_ordinary_permission_denied_stays_auth_forbidden() -> None:
     assert _ALLOWLISTED_DIAGNOSTIC.match(result["diagnostic"])
 
 
+# provider_timeout needs timeout evidence, never a field name that merely contains "timeout".
+_BRIDGE_TIMEOUT_ENVELOPE = json.dumps(
+    {
+        "type": "result",
+        "is_error": True,
+        "subtype": "error",
+        "error": "vscode_lm_response_timeout",
+    },
+    separators=(",", ":"),
+)
+_WORKER_FAILED_WRAPPER = "worker_failed:supervisor_state=exited:exit_code=1"
+# The CLI's own typed error line, as opposed to model text or tool output that quotes one.
+_CLI_ERROR_TIMEOUT_ENVELOPE = '{"type":"system","subtype":"error","message":"request timed out"}'
+_POST_EXIT_OUTCOME_STATES = (
+    "validation_failed", "finalize_failed", "scope_rejected", "promotion_conflict",
+)
+_ASSISTANT_PROSE = {
+    "type": "assistant",
+    "message": {"content": [{"type": "text", "text": "the request timed out, so I retried"}]},
+}
+_BENIGN_TIMEOUT_TAILS = [
+    '{"timeout_ms":0,"timeout_phase":""}',
+    '{"timeout_ms":120000,"timeout_phase":"response","elapsed_ms":15}',
+    '{"timeout":0,"timed_out":false,"timedOut":false}',
+    '{"type":"system","subtype":"init","idle_timeout_seconds":600}',
+    json.dumps(_ASSISTANT_PROSE),
+    "timeout_ms=0 timeout_phase=",
+    "--timeout=30 --idle-timeout 600",
+    'ms":0,"timeout_phase":""}',
+    # A key echoing a number or boolean stays progress metadata, also as an unparseable fragment.
+    'Out":false,"timedOut":false}',
+    "timedOut: false",
+    "{ exitCode: 0, timedOut: false, isCanceled: false }",
+    "timedout=false next=1",
+    "--request-timeout=30",
+    "Request timeout=30",
+    "Request timeout: 30000ms",
+    "readTimeout=30 connectTimeout=5",
+    '"connectTimeout":5000}',
+    "ReadTimeout:30s WriteTimeout:30s",
+]
+_TAIL_STREAMS = ["stdout_tail", "stderr_tail"]
+
+
+def test_validation_failed_with_progress_timeout_fields_is_not_a_provider_timeout() -> None:
+    """Request d2a2efe93f494eafab700a2d24358596: only pytest NameError and Ruff F821 were red."""
+    result = classify_terminal_failure(
+        state="validation_failed",
+        exit_code=0,
+        error="validation_failed",
+        stdout_tail='{"timeout_ms":0,"timeout_phase":""}',
+    )
+    assert result["failure_kind"] == "validation_failed"
+    assert result["diagnostic"] == "validation_failed:unclassified:exit_code=0"
+
+
+def test_terminal_event_authority_reads_progress_timeout_fields_from_the_log_tail(
+    tmp_path: Path,
+) -> None:
+    stdout_path = tmp_path / "out.log"
+    stdout_path.write_text('{"timeout_ms":0,"timeout_phase":""}\n', encoding="utf-8")
+
+    result = terminal_event_authority(
+        state="validation_failed",
+        exit_code=0,
+        error="validation_failed",
+        stdout_path=stdout_path,
+    )
+    assert result["failure_kind"] == "validation_failed"
+    assert result["diagnostic"] == "validation_failed:unclassified:exit_code=0"
+    assert result["error"] == result["diagnostic"]
+
+
+@pytest.mark.parametrize("tail", _BENIGN_TIMEOUT_TAILS)
+@pytest.mark.parametrize("stream", _TAIL_STREAMS)
+@pytest.mark.parametrize(
+    ("state", "exit_code", "error"),
+    [
+        ("validation_failed", 0, "validation_failed"),
+        ("worker_failed", 1, _WORKER_FAILED_WRAPPER),
+    ],
+)
+def test_progress_timeout_fields_cannot_impersonate_a_provider_timeout(
+    state: str, exit_code: int, error: str, stream: str, tail: str,
+) -> None:
+    result = classify_terminal_failure(
+        state=state, exit_code=exit_code, error=error, **{stream: tail},
+    )
+    assert result["diagnostic"] == f"{state}:unclassified:exit_code={exit_code}"
+
+
+@pytest.mark.parametrize("stream", _TAIL_STREAMS)
+@pytest.mark.parametrize(
+    ("state", "exit_code", "error"),
+    [
+        ("worker_failed", 1, _WORKER_FAILED_WRAPPER),
+        ("validation_failed", 0, "validation_failed"),
+    ],
+)
+def test_the_bridge_timeout_envelope_still_classifies_as_a_provider_timeout(
+    state: str, exit_code: int, error: str, stream: str,
+) -> None:
+    tail = '{"type":"system","subtype":"init"}\n' + _BRIDGE_TIMEOUT_ENVELOPE + "\n"
+    result = classify_terminal_failure(
+        state=state, exit_code=exit_code, error=error, **{stream: tail},
+    )
+    assert result["diagnostic"] == f"{state}:provider_timeout:exit_code={exit_code}"
+
+
+def test_terminal_event_authority_reads_the_bridge_envelope_from_the_log_tail(
+    tmp_path: Path,
+) -> None:
+    stdout_path = tmp_path / "out.log"
+    stdout_path.write_text(_BRIDGE_TIMEOUT_ENVELOPE + "\n", encoding="utf-8")
+
+    result = terminal_event_authority(
+        state="worker_failed",
+        exit_code=1,
+        error=_WORKER_FAILED_WRAPPER,
+        stdout_path=stdout_path,
+    )
+    assert result["diagnostic"] == "worker_failed:provider_timeout:exit_code=1"
+    assert result["error"] == result["diagnostic"]
+
+
+@pytest.mark.parametrize("stream", _TAIL_STREAMS)
+@pytest.mark.parametrize(
+    "tail",
+    [
+        "openai.APITimeoutError: Request timed out.",
+        "Error: connect ETIMEDOUT 10.0.0.1:443",
+        "Error: read ESOCKETTIMEDOUT",
+        "asyncio.exceptions.TimeoutError",
+        "Error: timeout of 30000ms exceeded",
+        "RuntimeError: vscode_lm_response_timeout",
+        '{"type":"error","message":"stream disconnected: request timed out"}',
+        '{"type":"turn.failed","error":{"message":"request timed out"}}',
+        '{"type":"result","is_error":true,"result":"API Error: Request timed out"}',
+        "504 Gateway Timeout",
+        "Request timeout",
+        "httpx.ReadTimeout",
+        "timedout",
+        _CLI_ERROR_TIMEOUT_ENVELOPE,
+        "504 Gateway Time-out",
+        "unexpected status 504 Gateway Timeout: upstream connect error",
+        "httpx.ConnectTimeout",
+    ],
+)
+def test_real_provider_timeout_signatures_still_classify_as_a_provider_timeout(
+    stream: str, tail: str,
+) -> None:
+    result = classify_terminal_failure(
+        state="worker_failed", exit_code=1, error=_WORKER_FAILED_WRAPPER, **{stream: tail},
+    )
+    assert result["diagnostic"] == "worker_failed:provider_timeout:exit_code=1"
+
+
+@pytest.mark.parametrize(
+    ("state", "exit_code", "error", "code"),
+    [
+        ("worker_failed", 1, _WORKER_FAILED_WRAPPER, "provider_timeout"),
+        ("validation_failed", 0, "validation_failed", "unclassified"),
+    ],
+)
+def test_terminal_event_authority_reads_a_cli_error_envelope_from_the_log_tail(
+    tmp_path: Path, state: str, exit_code: int, error: str, code: str,
+) -> None:
+    stdout_path = tmp_path / "out.log"
+    stdout_path.write_text(_CLI_ERROR_TIMEOUT_ENVELOPE + "\n", encoding="utf-8")
+
+    result = terminal_event_authority(
+        state=state, exit_code=exit_code, error=error, stdout_path=stdout_path,
+    )
+    assert result["diagnostic"] == f"{state}:{code}:exit_code={exit_code}"
+    assert result["error"] == result["diagnostic"]
+
+
+@pytest.mark.parametrize("stream", _TAIL_STREAMS)
+@pytest.mark.parametrize("state", _POST_EXIT_OUTCOME_STATES)
+def test_provider_log_prose_cannot_make_a_post_exit_outcome_a_provider_timeout(
+    state: str, stream: str,
+) -> None:
+    result = classify_terminal_failure(
+        state=state,
+        exit_code=0,
+        error=state,
+        **{stream: "Error: connect ETIMEDOUT 10.0.0.1:443"},
+    )
+    assert result["failure_kind"] == state
+    assert "provider_timeout" not in result["diagnostic"]
+    assert _ALLOWLISTED_DIAGNOSTIC.match(result["diagnostic"])
+
+
+# Stream prose the heuristics read as a provider cause; a post-exit outcome ignores all of it.
+_STALE_PROVIDER_PROSE = [
+    "Error: connect ETIMEDOUT 10.0.0.1:443",
+    "Traceback (most recent call last):\nValueError: boom",
+    "fatal: invalid credential, please re-authenticate",
+    "Permission denied: /etc/shadow",
+    "429 Too Many Requests: rate limit exceeded",
+    "Error: connect ECONNREFUSED 127.0.0.1:8080",
+    "FATAL ERROR: JavaScript heap out of memory",
+    "the provider refused the request",
+    "RuntimeError: missing required output artifact",
+    "504 Gateway Timeout",
+    "Request timeout",
+    "httpx.ReadTimeout",
+    "timedout",
+    _CLI_ERROR_TIMEOUT_ENVELOPE,
+]
+
+
+def test_stale_provider_error_line_cannot_relabel_validation_failed_as_runtime_error() -> None:
+    result = classify_terminal_failure(
+        state="validation_failed",
+        exit_code=0,
+        error="validation_failed",
+        stderr_tail="Error: connect ETIMEDOUT 10.0.0.1:443",
+    )
+    assert result["failure_kind"] == "validation_failed"
+    assert result["diagnostic"] == "validation_failed:unclassified:exit_code=0"
+
+
+@pytest.mark.parametrize("stream", _TAIL_STREAMS)
+@pytest.mark.parametrize("state", _POST_EXIT_OUTCOME_STATES)
+@pytest.mark.parametrize("prose", _STALE_PROVIDER_PROSE)
+def test_stale_provider_prose_cannot_name_the_cause_of_a_post_exit_outcome(
+    prose: str, state: str, stream: str,
+) -> None:
+    result = classify_terminal_failure(
+        state=state, exit_code=0, error=state, **{stream: prose},
+    )
+    assert result["failure_kind"] == state
+    assert result["diagnostic"] == f"{state}:unclassified:exit_code=0"
+
+
+def test_the_same_stream_prose_still_names_a_worker_failed_cause() -> None:
+    tail = "Error: connect ETIMEDOUT 10.0.0.1:443"
+    failed = classify_terminal_failure(
+        state="worker_failed", exit_code=1, error=_WORKER_FAILED_WRAPPER, stderr_tail=tail,
+    )
+    assert failed["diagnostic"] == "worker_failed:provider_timeout:exit_code=1"
+    outcome = classify_terminal_failure(
+        state="validation_failed", exit_code=0, error="validation_failed", stderr_tail=tail,
+    )
+    assert outcome["diagnostic"] == "validation_failed:unclassified:exit_code=0"
+
+
+@pytest.mark.parametrize("stream", _TAIL_STREAMS)
+@pytest.mark.parametrize("tail", ["Error: connect ETIMEDOUT 10.0.0.1:443", _BRIDGE_TIMEOUT_ENVELOPE])
+@pytest.mark.parametrize(
+    ("state", "error", "reason"),
+    [
+        (
+            "validation_failed",
+            _required_output_mismatch(
+                legacy_error_codes=["required_output_unchanged:out/result.json"],
+            ),
+            "required_output_unchanged",
+        ),
+        ("finalize_failed", "metadata_invalid:boom", "metadata_invalid"),
+    ],
+)
+def test_a_typed_finalizer_reason_outranks_every_provider_stream(
+    state: str, error: str, reason: str, tail: str, stream: str,
+) -> None:
+    result = classify_terminal_failure(state=state, exit_code=0, error=error, **{stream: tail})
+    assert result["diagnostic"] == f"{state}:{reason}:exit_code=0"
+
+
+@pytest.mark.parametrize("log", ["stdout_path", "stderr_path"])
+def test_terminal_event_authority_ignores_stale_prose_in_a_post_exit_log_tail(
+    tmp_path: Path, log: str,
+) -> None:
+    path = tmp_path / "provider.log"
+    path.write_text("Error: connect ETIMEDOUT 10.0.0.1:443\n", encoding="utf-8")
+
+    result = terminal_event_authority(
+        state="validation_failed", exit_code=0, error="validation_failed", **{log: path},
+    )
+    assert result["failure_kind"] == "validation_failed"
+    assert result["diagnostic"] == "validation_failed:unclassified:exit_code=0"
+    assert result["error"] == result["diagnostic"]
+
+
+def test_terminal_event_authority_keeps_the_typed_bridge_envelope_for_a_post_exit_outcome(
+    tmp_path: Path,
+) -> None:
+    stdout_path = tmp_path / "out.log"
+    stdout_path.write_text(_BRIDGE_TIMEOUT_ENVELOPE + "\n", encoding="utf-8")
+
+    result = terminal_event_authority(
+        state="validation_failed", exit_code=0, error="validation_failed", stdout_path=stdout_path,
+    )
+    assert result["diagnostic"] == "validation_failed:provider_timeout:exit_code=0"
+    assert result["error"] == result["diagnostic"]
+
+
+@pytest.mark.parametrize("state", _POST_EXIT_OUTCOME_STATES)
+def test_stale_snap_confine_stderr_cannot_relabel_a_post_exit_outcome(state: str) -> None:
+    result = classify_terminal_failure(
+        state=state,
+        exit_code=0,
+        error=state,
+        stderr_tail=(
+            "snap-confine is packaged without necessary permissions: cap_dac_override not found"
+        ),
+    )
+    assert result["failure_kind"] == state
+    assert result["diagnostic"] == f"{state}:unclassified:exit_code=0"
+
+
+def test_an_unknown_exit_code_does_not_reopen_provider_prose_for_a_post_exit_outcome() -> None:
+    result = classify_terminal_failure(
+        state="finalize_failed",
+        exit_code=None,
+        error="finalize_failed",
+        stderr_tail="Error: connect ETIMEDOUT 10.0.0.1:443",
+    )
+    assert result["diagnostic"] == "finalize_failed:unclassified"
+
+
+@pytest.mark.parametrize("payload", _SECRET_PAYLOADS)
+@pytest.mark.parametrize("state", _POST_EXIT_OUTCOME_STATES)
+def test_a_post_exit_outcome_never_persists_secret_bearing_stream_text(
+    state: str, payload: str,
+) -> None:
+    tail = f"Error: connect ETIMEDOUT 10.0.0.1:443\n{payload}\n"
+    result = classify_terminal_failure(
+        state=state, exit_code=0, error=state, stdout_tail=tail, stderr_tail=tail,
+    )
+    assert result["diagnostic"] == f"{state}:unclassified:exit_code=0"
+    assert payload not in result["diagnostic"]
+    assert _ALLOWLISTED_DIAGNOSTIC.match(result["diagnostic"])
+
+
+def test_a_validation_run_timeout_is_not_a_provider_timeout() -> None:
+    error = "subprocess.TimeoutExpired: Command 'pytest' timed out after 120 seconds"
+    classified = classify_terminal_failure(state="validation_failed", exit_code=0, error=error)
+    assert classified["diagnostic"] == "validation_failed:unclassified:exit_code=0"
+    assert safe_error_text(state="validation_failed", exit_code=0, error=error) == (
+        "validation_failed:unclassified:exit_code=0"
+    )
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        json.dumps(
+            {
+                "type": "assistant",
+                "message": {"content": [{"type": "text", "text": _BRIDGE_TIMEOUT_ENVELOPE}]},
+            }
+        ),
+        json.dumps({**json.loads(_BRIDGE_TIMEOUT_ENVELOPE), "is_error": False}),
+        '{"type":"tool_result","content":"vscode_lm_response_timeout"}',
+        '{"type":"result","is_error":false,"result":"the request timed out"}',
+        '{"type":"system","subtype":"init","message":"request timed out"}',
+        '{"type":"system","subtype":"info","message":"request timed out"}',
+        json.dumps(
+            {
+                "type": "assistant",
+                "message": {"content": [{"type": "text", "text": _CLI_ERROR_TIMEOUT_ENVELOPE}]},
+            }
+        ),
+        json.dumps(
+            {
+                "type": "user",
+                "message": {
+                    "content": [{"type": "tool_result", "content": _CLI_ERROR_TIMEOUT_ENVELOPE}],
+                },
+            }
+        ),
+    ],
+)
+def test_worker_output_cannot_forge_a_provider_timeout(tail: str) -> None:
+    for state, exit_code, error in (
+        ("worker_failed", 1, _WORKER_FAILED_WRAPPER),
+        ("validation_failed", 0, "validation_failed"),
+    ):
+        result = classify_terminal_failure(
+            state=state, exit_code=exit_code, error=error, stdout_tail=tail,
+        )
+        assert "provider_timeout" not in result["diagnostic"]
+
+
+@pytest.mark.parametrize("payload", _SECRET_PAYLOADS)
+def test_provider_timeout_diagnostic_never_persists_secret_bearing_text(payload: str) -> None:
+    envelope = json.dumps({**json.loads(_BRIDGE_TIMEOUT_ENVELOPE), "detail": payload})
+    cli_error = json.dumps({**json.loads(_CLI_ERROR_TIMEOUT_ENVELOPE), "detail": payload})
+    tails = (
+        f"Request timed out\n{payload}\n",
+        f"504 Gateway Timeout\n{payload}\n",
+        envelope,
+        cli_error,
+    )
+    for tail in tails:
+        result = classify_terminal_failure(
+            state="worker_failed",
+            exit_code=1,
+            error=_WORKER_FAILED_WRAPPER,
+            stdout_tail=tail,
+            stderr_tail=tail,
+        )
+        assert result["diagnostic"] == "worker_failed:provider_timeout:exit_code=1"
+        assert payload not in result["diagnostic"]
+        assert _ALLOWLISTED_DIAGNOSTIC.match(result["diagnostic"])
+
+
+def test_a_nonzero_exit_makes_provider_stream_prose_causal_for_a_finalizer_outcome() -> None:
+    result = classify_terminal_failure(
+        state="finalize_failed",
+        exit_code=1,
+        error="RuntimeError: boom",
+        stderr_tail="Error: connect ETIMEDOUT 10.0.0.1:443",
+    )
+    assert result["failure_kind"] == "finalize_failed"
+    assert result["diagnostic"] == "finalize_failed:provider_timeout:exit_code=1"
+
+
+@pytest.mark.parametrize("stream", _TAIL_STREAMS)
+@pytest.mark.parametrize("exit_code", [1, 2, 137, -9])
+@pytest.mark.parametrize("state", _POST_EXIT_OUTCOME_STATES)
+def test_every_post_exit_outcome_reads_provider_stream_prose_after_a_failed_exit(
+    state: str, exit_code: int, stream: str,
+) -> None:
+    result = classify_terminal_failure(
+        state=state,
+        exit_code=exit_code,
+        error="RuntimeError: boom",
+        **{stream: "Error: connect ETIMEDOUT 10.0.0.1:443"},
+    )
+    assert result["failure_kind"] == state
+    assert result["diagnostic"] == f"{state}:provider_timeout:exit_code={exit_code}"
+    assert _ALLOWLISTED_DIAGNOSTIC.match(result["diagnostic"])
+
+
+@pytest.mark.parametrize("stream", _TAIL_STREAMS)
+def test_a_typed_finalizer_reason_still_outranks_provider_prose_after_a_failed_exit(
+    stream: str,
+) -> None:
+    result = classify_terminal_failure(
+        state="finalize_failed",
+        exit_code=1,
+        error="metadata_invalid:boom",
+        **{stream: "Error: connect ETIMEDOUT 10.0.0.1:443"},
+    )
+    assert result["diagnostic"] == "finalize_failed:metadata_invalid:exit_code=1"
+
+
+@pytest.mark.parametrize("state", _POST_EXIT_OUTCOME_STATES)
+def test_a_post_exit_outcomes_own_error_text_is_never_provider_timeout_evidence(
+    state: str,
+) -> None:
+    error = "subprocess.TimeoutExpired: Command 'pytest' timed out after 120 seconds"
+    for exit_code in (0, 1):
+        result = classify_terminal_failure(state=state, exit_code=exit_code, error=error)
+        assert result["diagnostic"] == f"{state}:unclassified:exit_code={exit_code}"
+        assert safe_error_text(state=state, exit_code=exit_code, error=error) == (
+            result["diagnostic"]
+        )
+
+
+@pytest.mark.parametrize("log", ["stdout_path", "stderr_path"])
+def test_terminal_event_authority_reads_stream_prose_for_an_outcome_after_a_failed_exit(
+    tmp_path: Path, log: str,
+) -> None:
+    path = tmp_path / "provider.log"
+    path.write_text("Error: connect ETIMEDOUT 10.0.0.1:443\n", encoding="utf-8")
+
+    result = terminal_event_authority(
+        state="finalize_failed", exit_code=1, error="RuntimeError: boom", **{log: path},
+    )
+    assert result["failure_kind"] == "finalize_failed"
+    assert result["diagnostic"] == "finalize_failed:provider_timeout:exit_code=1"
+    assert result["error"] == result["diagnostic"]
+
+
+# Model and tool text travels inside JSON strings; a record cut open no longer parses.
+_MODEL_JSON_RECORDS = {
+    "assistant": json.dumps(_ASSISTANT_PROSE),
+    "assistant_compact": json.dumps(_ASSISTANT_PROSE, separators=(",", ":")),
+    "assistant_escapes_and_scalars": json.dumps(
+        {
+            "type": "assistant",
+            "message": {
+                "content": [{"type": "text", "text": 'he said "the request timed out" \\ twice'}],
+                "stop_reason": None,
+                "usage": {"input_tokens": 12, "ratio": 1e-7, "cached": False, "fresh": True},
+            },
+        }
+    ),
+    "user_tool_result": json.dumps(
+        {
+            "type": "user",
+            "message": {
+                "content": [{"type": "tool_result", "content": _CLI_ERROR_TIMEOUT_ENVELOPE}],
+            },
+        }
+    ),
+}
+_MODEL_RECORD_IDS = list(_MODEL_JSON_RECORDS)
+_MODEL_RECORDS = list(_MODEL_JSON_RECORDS.values())
+
+
+def test_a_model_json_line_sliced_mid_record_is_not_a_provider_timeout() -> None:
+    line = json.dumps(_ASSISTANT_PROSE)
+    for tail in (line, line[40:]):
+        result = classify_terminal_failure(
+            state="worker_failed", exit_code=1, error=_WORKER_FAILED_WRAPPER, stdout_tail=tail,
+        )
+        assert result["diagnostic"] == "worker_failed:unclassified:exit_code=1"
+
+
+@pytest.mark.parametrize("state", ["worker_failed", "finalize_failed"])
+@pytest.mark.parametrize("stream", _TAIL_STREAMS)
+@pytest.mark.parametrize("record", _MODEL_RECORDS, ids=_MODEL_RECORD_IDS)
+def test_a_model_json_record_cut_anywhere_is_never_a_provider_timeout(
+    record: str, stream: str, state: str,
+) -> None:
+    for cut in range(len(record)):
+        for fragment in (record[cut:], record[: cut + 1]):
+            result = classify_terminal_failure(
+                state=state, exit_code=1, error=_WORKER_FAILED_WRAPPER, **{stream: fragment},
+            )
+            assert "provider_timeout" not in result["diagnostic"], fragment
+
+
+def test_a_killed_writers_partial_sse_framed_record_is_not_a_provider_timeout() -> None:
+    framed = "data: " + json.dumps(_ASSISTANT_PROSE)
+    for cut in range(len(framed)):
+        result = classify_terminal_failure(
+            state="worker_failed",
+            exit_code=1,
+            error=_WORKER_FAILED_WRAPPER,
+            stdout_tail=framed[: cut + 1],
+        )
+        assert "provider_timeout" not in result["diagnostic"], framed[: cut + 1]
+
+
+def test_plain_provider_prose_beside_a_cut_model_record_is_still_a_provider_timeout() -> None:
+    tail = json.dumps(_ASSISTANT_PROSE)[40:] + "\nopenai.APITimeoutError: Request timed out.\n"
+    result = classify_terminal_failure(
+        state="worker_failed", exit_code=1, error=_WORKER_FAILED_WRAPPER, stdout_tail=tail,
+    )
+    assert result["diagnostic"] == "worker_failed:provider_timeout:exit_code=1"
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        'Post "https://api.example.com/v1": net/http: request canceled (Client.Timeout exceeded)',
+        'Error: 504 "Gateway Timeout"',
+        'connect "10.0.0.1:443": timed out',
+    ],
+)
+def test_plain_provider_prose_holding_quotes_is_not_mistaken_for_a_cut_json_record(
+    line: str,
+) -> None:
+    result = classify_terminal_failure(
+        state="worker_failed", exit_code=1, error=_WORKER_FAILED_WRAPPER, stderr_tail=line,
+    )
+    assert result["diagnostic"] == "worker_failed:provider_timeout:exit_code=1"
+
+
+def test_read_log_tail_never_returns_a_line_the_window_cut(tmp_path: Path) -> None:
+    log = tmp_path / "out.log"
+    log.write_bytes(b"aaaaaaaa\nbbbbbbbb\ncccccccc\n")
+    assert tfc._read_log_tail(log, max_bytes=16) == "cccccccc\n"
+    assert tfc._read_log_tail(log, max_bytes=18) == "bbbbbbbb\ncccccccc\n"
+    assert tfc._read_log_tail(log, max_bytes=100) == "aaaaaaaa\nbbbbbbbb\ncccccccc\n"
+    log.write_bytes(b"x" * 50 + b"\n")
+    assert tfc._read_log_tail(log, max_bytes=16) == ""
+
+
+def test_a_log_window_cut_through_a_model_json_line_cannot_mint_a_provider_timeout(
+    tmp_path: Path,
+) -> None:
+    text = "x" * (MAX_TAIL_READ_BYTES + 200) + " the request timed out, so I retried"
+    record = {"type": "assistant", "message": {"content": [{"type": "text", "text": text}]}}
+    stdout_path = tmp_path / "out.log"
+    stdout_path.write_text(
+        '{"type":"system","subtype":"init"}\n' + json.dumps(record) + "\n", encoding="utf-8",
+    )
+
+    result = terminal_event_authority(
+        state="worker_failed", exit_code=1, error=_WORKER_FAILED_WRAPPER, stdout_path=stdout_path,
+    )
+    assert result["diagnostic"] == "worker_failed:unclassified:exit_code=1"
+    assert result["error"] == result["diagnostic"]
+
+
+def test_a_log_window_keeps_the_complete_lines_after_a_cut_line(tmp_path: Path) -> None:
+    stdout_path = tmp_path / "out.log"
+    stdout_path.write_text(
+        "x" * (MAX_TAIL_READ_BYTES + 200) + "\n" + _BRIDGE_TIMEOUT_ENVELOPE + "\n",
+        encoding="utf-8",
+    )
+
+    result = terminal_event_authority(
+        state="worker_failed", exit_code=1, error=_WORKER_FAILED_WRAPPER, stdout_path=stdout_path,
+    )
+    assert result["diagnostic"] == "worker_failed:provider_timeout:exit_code=1"
+
+
+def test_a_deeply_nested_json_tail_cannot_crash_classification() -> None:
+    hostile = '{"a":' * 20000 + "1" + "}" * 20000
+    result = classify_terminal_failure(
+        state="worker_failed", exit_code=1, error=_WORKER_FAILED_WRAPPER, stderr_tail=hostile,
+    )
+    assert result["diagnostic"] == "worker_failed:unclassified:exit_code=1"
+
+
 def test_semlock_unsupported_maps_to_finalize_failed_terminal() -> None:
     from aiworkhub.process_launcher import _terminal_state_for_workspace_error
     from aiworkhub.worker_workspace import (

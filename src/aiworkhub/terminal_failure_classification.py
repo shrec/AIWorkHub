@@ -54,7 +54,28 @@ _NAMED_FAILURE_KINDS: dict[str, str] = {
     "finalize_abandoned": "finalize_abandoned",
 }
 
+# The finalizer's own post-exited outcomes: after a clean exit, stream prose names no cause.
+_FINALIZER_OUTCOME_STATES = frozenset({
+    "validation_failed", "finalize_failed", "scope_rejected", "promotion_conflict",
+})
+
 _UNCLASSIFIED = "unclassified"
+
+_PROVIDER_TIMEOUT = "provider_timeout"
+# The VS Code LM bridge's machine-generated timeout reason (see process_launcher).
+_BRIDGE_TIMEOUT_REASON = "vscode_lm_response_timeout"
+# Timeout EVENT phrases only: a bare "timeout" also matches timeout_ms/timeout_phase fields.
+# Identifier-like forms (bare "timedout", httpx "ReadTimeout", "Gateway/Request timeout") stop
+# counting when they are a key echoing a number or boolean: "timedOut: false", "readTimeout=30".
+_TIMEOUT_KEY_ECHO = r"""(?!["']?\s*[:=]\s*["']?(?:\d|true\b|false\b))"""
+_PROVIDER_TIMEOUT_PROSE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:timed[ -]out|e(?:socket)?timedout|[a-z]*timeout(?:error|exception)"
+    r"|timeout(?: of \d+ ?m?s)? exceeded"
+    r"|(?:timedout|(?:read|connect|write|pool)timeout|(?:gateway|request) time-?out)"
+    rf"{_TIMEOUT_KEY_ECHO}"
+    rf"|{_BRIDGE_TIMEOUT_REASON})(?![A-Za-z0-9_])",
+    re.I,
+)
 
 # NF-2026-00622 V7 rework: a regex that tries to spot-and-redact secrets
 # inside free provider text is provably bypassable -- quoted JSON
@@ -81,7 +102,7 @@ _SIGNATURES: tuple[tuple[re.Pattern[str], str], ...] = (
         "liveness_lost",
     ),
     (re.compile(r"connection refused|econnrefused", re.I), "connection_refused"),
-    (re.compile(r"timed? ?out", re.I), "provider_timeout"),
+    (_PROVIDER_TIMEOUT_PROSE, _PROVIDER_TIMEOUT),
     (re.compile(r"provider[ _]refused", re.I), "provider_refused"),
     (re.compile(r"traceback|exception|error|fatal", re.I), "runtime_error"),
 )
@@ -326,14 +347,99 @@ def normalize_exit_code(value: Any) -> int | None:
     return value
 
 
-def _signature_code(text: str) -> str | None:
+def _frame_payload(line: str) -> str:
+    payload = line.strip()
+    return payload[5:].strip() if payload.startswith("data:") else payload
+
+
+def _json_event(line: str) -> dict[str, Any] | None:
+    stripped = _frame_payload(line)
+    if not stripped.startswith("{"):
+        return None
+    try:
+        event = json.loads(stripped)
+    except (ValueError, RecursionError):
+        return None
+    return event if isinstance(event, dict) else None
+
+
+_UNESCAPED_QUOTE = re.compile(r'(?<!\\)(?:\\\\)*"')
+_JSON_STRUCTURE = re.compile(r"[\s\[\]{}:,]+")
+_JSON_NUMBER_PIECE = re.compile(r"[+-]?\d*(?:\.\d*)?(?:[eE][+-]?\d*)?")
+_JSON_LITERALS = ("true", "false", "null")
+
+
+def _json_structure_only(text: str) -> bool:
+    """Only JSON structure and scalars, either of which the cut may have clipped."""
+    return all(
+        _JSON_NUMBER_PIECE.fullmatch(token) or any(token in word for word in _JSON_LITERALS)
+        for token in _JSON_STRUCTURE.split(text)
+        if token
+    )
+
+
+def _json_fragment(line: str) -> bool:
+    """A line cut out of a JSON record: outside its strings only structure, inside model text."""
+    parts = _UNESCAPED_QUOTE.split(_frame_payload(line))
+    # Quotes alternate string and structure, and a cut can land in either: try both alignments.
+    return len(parts) > 1 and any(
+        all(map(_json_structure_only, parts[start::2])) for start in (0, 1)
+    )
+
+
+def _timeout_event(event: dict[str, Any], *, prose: bool) -> bool:
+    """Timeout evidence from one JSON line's typed fields; key names never count."""
+    kind = str(event.get("type") or "").strip().lower()
+    subtype = str(event.get("subtype") or "").strip().lower()
+    failed_result = kind == "result" and event.get("is_error") is True
+    error = event.get("error")
+    if (
+        failed_result
+        and subtype == "error"
+        and str(error or "").strip() == _BRIDGE_TIMEOUT_REASON
+    ):
+        return True
+    # A CLI's own failure lines; assistant/user lines carry model or tool text and never count.
+    cli_failure = failed_result or kind in _PROVIDER_OWNED_MESSAGE_TYPES
+    if not prose or not (cli_failure or (kind == "system" and subtype == "error")):
+        return False
+    narration = [event.get("message"), event.get("result"), error]
+    if isinstance(error, dict):
+        narration.append(error.get("message"))
+    return any(
+        isinstance(text, str) and _PROVIDER_TIMEOUT_PROSE.search(text) is not None
+        for text in narration
+    )
+
+
+def _provider_timeout_evidence(text: str, *, prose: bool) -> bool:
+    """The typed bridge envelope always counts; phrases only when ``prose`` is allowed."""
+    for line in text.splitlines():
+        event = _json_event(line)
+        if event is None:
+            if prose and _PROVIDER_TIMEOUT_PROSE.search(line) and not _json_fragment(line):
+                return True
+        elif _timeout_event(event, prose=prose):
+            return True
+    return False
+
+
+def _signature_code(text: str, *, timeout_prose: bool = True) -> str | None:
     for pattern, code in _SIGNATURES:
-        if pattern.search(text):
+        if code == _PROVIDER_TIMEOUT:
+            if _provider_timeout_evidence(text, prose=timeout_prose):
+                return code
+        elif pattern.search(text):
             return code
     return None
 
 
-def _classify_evidence(*sources: str, control_plane: str = "") -> str:
+def _classify_evidence(
+    *sources: str,
+    control_plane: str = "",
+    timeout_prose: bool = True,
+    typed_timeout_sources: Sequence[str] = (),
+) -> str:
     """Pick the first matching closed-vocabulary code across ``sources``, in order.
 
     Sources are scanned but never copied -- callers pass stderr before stdout
@@ -350,15 +456,21 @@ def _classify_evidence(*sources: str, control_plane: str = "") -> str:
     outranks provider text, which describes something that happened earlier
     and did not cause this outcome. Unrecognised text falls straight through
     to the provider signatures and, failing those, ``_UNCLASSIFIED``.
+
+    ``timeout_prose`` gates the timeout-phrase heuristic; the typed bridge envelope always counts.
+    ``typed_timeout_sources`` are provider streams read for that typed envelope alone.
     """
     if control_plane:
         code = _control_plane_code(control_plane)
         if code is not None:
             return code
+    for source in typed_timeout_sources:
+        if _provider_timeout_evidence(source, prose=False):
+            return _PROVIDER_TIMEOUT
     for source in sources:
         if not source:
             continue
-        code = _signature_code(source)
+        code = _signature_code(source, timeout_prose=timeout_prose)
         if code is not None:
             return code
     return _UNCLASSIFIED
@@ -381,14 +493,16 @@ def _assemble_diagnostic(
 
 
 def _read_log_tail(path: str | Path | None, *, max_bytes: int = MAX_TAIL_READ_BYTES) -> str:
-    """Read up to ``max_bytes`` from the end of ``path``, exactly once, transiently.
+    """Read up to ``max_bytes`` of whole lines from the end of ``path``, exactly once, transiently.
 
     The result is fed only to ``_classify_evidence`` for code selection and is
     never itself persisted, so a tail read landing mid-secret or mid-PEM-body
-    carries no durability risk. Never raises on a missing, unreadable, or
-    foreign-owned file -- absent log evidence must fall back to the generic
-    supervisor error, not crash terminal finalization. Symlink-safe: a
-    pre-open ``is_symlink`` check plus an O_NOFOLLOW-guarded open, since a log
+    carries no durability risk. A line the window cuts is dropped, not read: a
+    JSON record cut open no longer parses, and its model or tool text would be
+    scanned as if the provider had written it. Never raises on a missing,
+    unreadable, or foreign-owned file -- absent log evidence must fall back to
+    the generic supervisor error, not crash terminal finalization. Symlink-safe:
+    a pre-open ``is_symlink`` check plus an O_NOFOLLOW-guarded open, since a log
     path can be replaced by a symlink to an arbitrary host file between
     process exit and terminal finalization reading it.
     """
@@ -409,10 +523,13 @@ def _read_log_tail(path: str | Path | None, *, max_bytes: int = MAX_TAIL_READ_BY
             handle.seek(0, os.SEEK_END)
             size = handle.tell()
             start = max(0, size - max_bytes)
-            handle.seek(start)
-            data = handle.read(max_bytes)
+            # The byte before the window says whether the window opens on a line boundary.
+            handle.seek(max(0, start - 1))
+            data = handle.read(max_bytes + 1)
     except OSError:
         return ""
+    if start:
+        data = data.partition(b"\n")[2]
     return data.decode("utf-8", errors="replace")
 
 
@@ -452,14 +569,23 @@ def classify_terminal_failure(
         }
 
     error_text = str(error or "")
+    tails = (str(stderr_tail or ""), str(stdout_tail or ""))
+    finalizer_outcome = state_norm in _FINALIZER_OUTCOME_STATES
+    # If the provider did not fail, a finalizer outcome's streams are worker output, not a cause.
+    streams_stale = finalizer_outcome and exit_code in (None, 0)
     code = _classify_evidence(
-        str(stderr_tail or ""), str(stdout_tail or ""), error_text,
+        *(() if streams_stale else tails),
         control_plane=error_text,
+        timeout_prose=not streams_stale,
+        typed_timeout_sources=tails if streams_stale else (),
     )
+    if code == _UNCLASSIFIED:
+        # A finalizer outcome's own error is validation or exception text, never provider prose.
+        code = _classify_evidence(error_text, timeout_prose=not finalizer_outcome)
     http_status = _http_status(error_text)
 
-    stderr_text = str(stderr_tail or "").lower()
-    if "snap-confine" in stderr_text and "cap_dac_override" in stderr_text:
+    stderr_text = tails[0].lower()
+    if not streams_stale and "snap-confine" in stderr_text and "cap_dac_override" in stderr_text:
         return {
             "failure_kind": "snap_confine_sandbox_failure",
             "diagnostic": _assemble_diagnostic(
@@ -571,9 +697,12 @@ def safe_error_text(*, state: str | None, exit_code: int | None, error: str | No
     if not error:
         return ""
     error_text = str(error)
-    code = _classify_evidence(error_text, control_plane=error_text)
-    http_status = _http_status(error_text)
     label = str(state or "").strip().lower() or "unknown"
+    code = _classify_evidence(
+        error_text, control_plane=error_text,
+        timeout_prose=label not in _FINALIZER_OUTCOME_STATES,
+    )
+    http_status = _http_status(error_text)
     return _assemble_diagnostic(
         label, code=code, exit_code=normalize_exit_code(exit_code), http_status=http_status,
     )
