@@ -3198,6 +3198,251 @@ def aiworkhub_task_stale_recovery_recommend(
     return stale_recovery.build_recovery_actions(topic=topic, limit=limit)
 
 
+_COST_LEDGER_SUMMARY_TOP_N = 10
+
+
+def _ledger_row_number(
+    row: Mapping[str, Any], fields: tuple[str, ...]
+) -> float | None:
+    """First numeric value among ``fields``, or ``None`` when none is set.
+
+    ``bool`` is excluded deliberately: it is an ``int`` subclass, so a
+    flag would otherwise be read as the quantity 1.
+    """
+    for field in fields:
+        value = row.get(field)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value)
+    return None
+
+
+def _ledger_row_magnitude(row: Any) -> float:
+    """Deterministic activity magnitude for one aggregate row.
+
+    Real ledger rows carry ``total_tokens``; derived views may carry only
+    ``records`` or ``decided_tasks``.  A present-but-zero ``total_tokens``
+    is absence rather than evidence of no activity: ``model_outcomes``
+    counts a decided task whose usage attempt was never observed, so the
+    row reads 0 tokens beside a real ``decided_tasks`` count.  Stopping at
+    the first field merely *present* ranked every such row at 0.0 and left
+    the key tie-break to order them alphabetically, so the fallback
+    continues past a non-positive value instead.  A row with no positive
+    field ranks as zero rather than raising, so bounding never decides
+    which rows exist.  This measures activity, not spend: dollars are read
+    by ``_ledger_row_observed_cost``.
+    """
+    if not isinstance(row, Mapping):
+        return 0.0
+    for field in ("total_tokens", "records", "decided_tasks"):
+        value = _ledger_row_number(row, (field,))
+        if value is not None and value > 0:
+            return value
+    return 0.0
+
+
+def _ledger_row_observed_cost(row: Any) -> float | None:
+    """Observed dollars for one row, or ``None`` when none were reported.
+
+    ``_aggregate`` writes ``cost_usd`` into every bucket and leaves it at
+    ``0.0`` when no attempt carried a price, so the amount alone cannot
+    tell a genuinely cheap bucket from an unpriced one.  The coverage
+    counter beside it -- ``cost_known_records``, or ``cost_observed_tasks``
+    in the model outcome matrix -- is what makes that observable.  Without
+    one the ledger's own rule stands,
+    ``provider_cost_absence_is_unknown_not_zero``, and this reports
+    ``None`` rather than ranking absence as $0.  Any priced record makes
+    the amount real; whether it priced the *whole* bucket is a separate
+    question, answered by ``_ledger_row_cost_rank``.
+    """
+    if not isinstance(row, Mapping):
+        return None
+    cost = _ledger_row_number(row, ("cost_usd",))
+    if cost is None:
+        return None
+    known = _ledger_row_number(
+        row, ("cost_known_records", "cost_observed_tasks")
+    )
+    if known is None:
+        return cost if cost > 0 else None
+    return cost if known > 0 else None
+
+
+def _ledger_row_cost_rank(row: Any) -> tuple[float | None, float | None]:
+    """The two rank keys for one row: observed dollars, unpriced activity.
+
+    Reading ``cost_known_records > 0`` as full coverage let a single cheap
+    priced record reclassify a mostly-unpriced high-volume bucket as
+    priced: it then ranked on those few observed cents and was evicted,
+    while the identical bucket with *zero* priced records survived on its
+    magnitude.  Adding one price must never delete the magnitude that
+    price does not cover.  A row therefore keeps a claim on the unpriced
+    order for exactly the activity whose dollars are still unknown -- the
+    ledger's own ``tokens_with_unknown_cost`` wherever it reports one --
+    and only a fully covered row is left to the dollar order alone.
+    Either key may be ``None``, but never both: a row no order can see is
+    a silent omission.
+    """
+    observed = _ledger_row_observed_cost(row)
+    unpriced: float | None = None
+    if isinstance(row, Mapping):
+        known = _ledger_row_number(
+            row, ("cost_known_records", "cost_observed_tasks")
+        )
+        unknown = _ledger_row_number(
+            row, ("cost_unknown_records", "cost_unobserved_tasks")
+        )
+        population = _ledger_row_number(row, ("records", "decided_tasks"))
+        if population is None and known is not None and unknown is not None:
+            population = known + unknown
+        if known is not None and population is not None and known < population:
+            unpriced = _ledger_row_number(row, ("tokens_with_unknown_cost",))
+            if unpriced is None:
+                unpriced = _ledger_row_magnitude(row)
+    if observed is None and unpriced is None:
+        unpriced = _ledger_row_magnitude(row)
+    return (observed, unpriced)
+
+
+def _row_bound(total: int, returned: int, *, ranked_by: str) -> dict[str, Any]:
+    """Explicit no-silent-omission receipt for one bounded dimension.
+
+    ``ranked_by`` names the order the bound applied, so a reader of a
+    truncated dimension knows which rows survived and why.
+    """
+    return {
+        "total_count": total,
+        "returned_count": returned,
+        "truncated": returned < total,
+        "ranked_by": ranked_by,
+    }
+
+
+def _bounded_cost_rows(
+    rows: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Cost-first deterministic top-N slice of one model-keyed dimension.
+
+    Ranking on tokens alone evicted the expensive low-token model and kept
+    the cheap high-token one -- an inversion of the question a cost summary
+    exists to answer.  Ranking on dollars alone is the mirror failure: an
+    unpriced bucket aggregates to ``cost_usd`` 0.0 and would be cut as if
+    it were free, which is the one thing
+    ``cost_quality.zero_cost_is_free = false`` denies.  Rows therefore
+    rank by observed dollars, by still-unpriced activity, or -- where the
+    provider priced only part of the bucket -- by both, and the bound is
+    filled from the two orders in turn so neither can starve the other.  A
+    row present in both takes the first slot either order reaches it in,
+    never two.  Each order is total, so one ledger always yields the same
+    rows.
+    """
+    priced: dict[str, float] = {}
+    unpriced: dict[str, float] = {}
+    for key in rows:
+        observed, activity = _ledger_row_cost_rank(rows[key])
+        if observed is not None:
+            priced[key] = observed
+        if activity is not None:
+            unpriced[key] = activity
+    by_cost = sorted(priced, key=lambda key: (-priced[key], key))
+    by_activity = sorted(unpriced, key=lambda key: (-unpriced[key], key))
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for index in range(max(len(by_cost), len(by_activity))):
+        for order in (by_cost, by_activity):
+            if index >= len(order) or order[index] in seen:
+                continue
+            seen.add(order[index])
+            ordered.append(order[index])
+    kept = ordered[:_COST_LEDGER_SUMMARY_TOP_N]
+    return (
+        {key: rows[key] for key in kept},
+        _row_bound(
+            len(rows),
+            len(kept),
+            ranked_by="observed_cost_usd_then_unpriced_activity",
+        ),
+    )
+
+
+def _is_iso_day(key: Any) -> bool:
+    """True only for a ``YYYY-MM-DD`` bucket: a day's identity is its date."""
+    text = str(key)
+    return (
+        len(text) == 10
+        and text[4] == "-"
+        and text[7] == "-"
+        and text[:4].isdigit()
+        and text[5:7].isdigit()
+        and text[8:].isdigit()
+    )
+
+
+def _bounded_day_rows(
+    rows: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Recent-first bounded slice of ``by_day`` that keeps undated spend.
+
+    ``_aggregate`` files a record with no timestamp under ``unknown``, and
+    a plain reverse-lexical order ranks that string above every ISO date:
+    the bound spent a slot on a bucket that is not a day at all and evicted
+    a real recent one.  Dates rank first and most-recent-first; undated
+    buckets are retained beside them instead of competing with them, so
+    neither the days nor the undated spend disappears.  Both groups are
+    capped, so the dimension stays bounded however history grows.
+    """
+    dated = sorted((key for key in rows if _is_iso_day(key)), reverse=True)
+    undated = sorted(key for key in rows if not _is_iso_day(key))
+    kept = (
+        dated[:_COST_LEDGER_SUMMARY_TOP_N]
+        + undated[:_COST_LEDGER_SUMMARY_TOP_N]
+    )
+    return (
+        {key: rows[key] for key in kept},
+        _row_bound(
+            len(rows), len(kept), ranked_by="most_recent_day_then_undated"
+        ),
+    )
+
+
+def _bounded_outcome_routes(
+    routes: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Deterministic top-N model slice of the outcome-route tree.
+
+    Models rank by token magnitude summed across their route tree, key as
+    tie-break.  A kept model's subtree stays intact: its breadth is bounded
+    by the provider catalog, not by usage history.  Truth outside
+    ``routes`` (UNKNOWN/UNMEASURED accounting, claim boundary) is not this
+    function's to touch.
+    """
+
+    def _model_magnitude(model_routes: Any) -> float:
+        total = 0.0
+        if isinstance(model_routes, Mapping):
+            for families in model_routes.values():
+                if not isinstance(families, Mapping):
+                    continue
+                for risks in families.values():
+                    if not isinstance(risks, Mapping):
+                        continue
+                    for row in risks.values():
+                        total += _ledger_row_magnitude(row)
+        return total
+
+    ordered = sorted(
+        routes, key=lambda model: (-_model_magnitude(routes[model]), model)
+    )
+    kept = ordered[:_COST_LEDGER_SUMMARY_TOP_N]
+    return (
+        {model: routes[model] for model in kept},
+        _row_bound(
+            len(routes),
+            len(kept),
+            ranked_by="summed_matched_attempt_token_magnitude",
+        ),
+    )
+
+
 @mcp.tool()
 def aiworkhub_task_cost_ledger(
     runner: str | None = None,
@@ -3209,9 +3454,24 @@ def aiworkhub_task_cost_ledger(
     """READ-ONLY: bounded cost summary, with opt-in detailed dimensions.
 
     Default mode retains cost/cache truth plus provider, model and day
-    aggregates.  Per-runner and per-topic maps are available with
-    ``full=true``; task rows remain independently opt-in through
-    ``include_tasks``.
+    aggregates, and stays bounded as usage history grows.  ``by_model``,
+    ``cost_per_accepted_outcome.routes`` and ``model_outcomes.models``
+    each return at most ``_COST_LEDGER_SUMMARY_TOP_N`` rows.  ``by_day``
+    is bounded as two independent groups -- up to
+    ``_COST_LEDGER_SUMMARY_TOP_N`` most-recent dated buckets beside up to
+    ``_COST_LEDGER_SUMMARY_TOP_N`` undated ones -- so its exact ceiling is
+    ``2 * _COST_LEDGER_SUMMARY_TOP_N`` rows, not ``N``; undated spend is
+    retained rather than made to compete with real days for one shared
+    bound.  Every bounded dimension carries explicit ``total_count``/
+    ``returned_count``/``truncated``/``ranked_by`` metadata under
+    ``summary_row_bounds``, so no row is dropped silently.  The two
+    model-keyed dimensions rank by observed dollars rather than tokens; a
+    bucket whose provider reported no price ranks on its activity instead
+    of being cut as though it were free, and a partially priced bucket
+    ranks in both orders so one cheap priced record cannot hide the
+    magnitude whose dollars are still unknown.  Per-runner and per-topic
+    maps are available with ``full=true``; task rows remain independently
+    opt-in through ``include_tasks``.
 
     The repository binding is what makes those aggregates answerable.
     ``build_cost_ledger`` reads canonical usage events only when it is given a
@@ -3244,10 +3504,41 @@ def aiworkhub_task_cost_ledger(
     aggregates = result.get("aggregates")
     aggregate_map = dict(aggregates) if isinstance(aggregates, Mapping) else {}
     summary_dimensions = ("by_model", "by_provider", "by_day")
+    by_model, model_bound = _bounded_cost_rows(
+        aggregate_map.get("by_model", {})
+    )
+    by_day, day_bound = _bounded_day_rows(aggregate_map.get("by_day", {}))
     result["aggregates"] = {
-        key: aggregate_map.get(key, {})
-        for key in summary_dimensions
+        "by_model": by_model,
+        "by_provider": aggregate_map.get("by_provider", {}),
+        "by_day": by_day,
     }
+    row_bounds = {"by_model": model_bound, "by_day": day_bound}
+    outcome = result.get("cost_per_accepted_outcome")
+    routes_map = outcome.get("routes") if isinstance(outcome, Mapping) else None
+    if isinstance(routes_map, Mapping):
+        bounded_routes, routes_bound = _bounded_outcome_routes(routes_map)
+        bounded_outcome = dict(outcome)
+        bounded_outcome["routes"] = bounded_routes
+        result["cost_per_accepted_outcome"] = bounded_outcome
+        row_bounds["cost_per_accepted_outcome_routes"] = routes_bound
+    # build_cost_ledger also emits one row per model it ever saw under
+    # model_outcomes.models.  That dimension grows with usage history
+    # exactly like by_model, and passing it through untouched kept the
+    # default summary growing after by_model had stopped.  Only the row map
+    # is bounded: schema_id, association_only, attribution and
+    # unmatched_decisions are totals about the whole population, so they
+    # stay whole.
+    outcomes = result.get("model_outcomes")
+    outcome_models = (
+        outcomes.get("models") if isinstance(outcomes, Mapping) else None
+    )
+    if isinstance(outcome_models, Mapping):
+        bounded_models, models_bound = _bounded_cost_rows(outcome_models)
+        bounded_outcomes = dict(outcomes)
+        bounded_outcomes["models"] = bounded_models
+        result["model_outcomes"] = bounded_outcomes
+        row_bounds["model_outcomes_models"] = models_bound
     result.update({
         "snapshot_mode": "summary",
         "full_snapshot_available": True,
@@ -3259,6 +3550,9 @@ def aiworkhub_task_cost_ledger(
         "omitted_dimensions": sorted(
             key for key in aggregate_map if key not in summary_dimensions
         ),
+        # Bounded rows are counted, never silently dropped: each bounded
+        # dimension names its total, returned and truncated truth.
+        "summary_row_bounds": row_bounds,
         "detail_request": {"full": True},
     })
     return result
