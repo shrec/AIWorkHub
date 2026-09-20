@@ -2240,3 +2240,210 @@ def test_nf780_advanced_claim_epoch_without_recovery_fails_closed(
 
     assert receipt is None
     assert error == "reroute_manager_rejection_identity_mismatch"
+
+
+def test_timed_out_sealed_delta_supersedes_earlier_predecessor(
+    tmp_path: Path,
+) -> None:
+    """NF-2026-00515: a later timed_out episode's sealed seven-path delta
+    replaces the earlier three-path predecessor instead of failing with
+    ``no_retained_predecessor_evidence``."""
+    repo = _setup_repo(tmp_path)
+    task_id = "NF2026_00515_TIMED_OUT_SUPERSEDES"
+    runner = "codex_worker_test"
+    topic = "aiworkhub_blocked_rework_recovery"
+    now = "2026-08-06T00:00:00+00:00"
+
+    early_paths = [
+        "src/aiworkhub/a.py",
+        "src/aiworkhub/b.py",
+        "src/aiworkhub/c.py",
+    ]
+    late_paths = early_paths + [
+        "src/aiworkhub/d.py",
+        "src/aiworkhub/e.py",
+        "src/aiworkhub/f.py",
+        "src/aiworkhub/g.py",
+    ]
+    early_request_id = "e" * 32
+    late_request_id = "f" * 32
+
+    # The committed baseline is identical across episodes; only the worktree
+    # candidate bytes differ between the two timed_out runs.
+    baselines: dict[str, str] = {}
+    for path in late_paths:
+        baseline = repo / path
+        baseline.parent.mkdir(parents=True, exist_ok=True)
+        baseline.write_bytes(f"baseline {path}\n".encode())
+        baselines[path] = (
+            "file:664:" + hashlib.sha256(baseline.read_bytes()).hexdigest()
+        )
+
+    def seal(paths: list[str], request_id: str, claim_epoch: int) -> tuple[dict, dict]:
+        workspace = (
+            repo / ".aiworkhub" / "runtime" / "worktrees" / request_id / "worktree"
+        )
+        hashes: dict[str, str] = {}
+        authority_sources: list[dict] = []
+        for path in paths:
+            candidate = workspace / path
+            candidate.parent.mkdir(parents=True, exist_ok=True)
+            candidate.write_bytes(f"{request_id} candidate {path}\n".encode())
+            digest = hashlib.sha256(candidate.read_bytes()).hexdigest()
+            hashes[path] = digest
+            authority_sources.append(
+                {"path": path, "state": "modified", "bytes_sha256": digest}
+            )
+        authority = {
+            "schema_id": "aiworkhub.python_candidate_authority.v1",
+            "sources": authority_sources,
+        }
+        parent_baseline = {path: baselines[path] for path in paths}
+        evidence = {
+            "changed_paths": list(paths),
+            "changed_path_hashes": dict(hashes),
+            "request_identity": {
+                "request_id": request_id,
+                "task_id": task_id,
+                "runner": runner,
+                "topic": topic,
+                "repo": str(repo),
+                "claim_epoch": claim_epoch,
+                "allowed_writes": list(paths),
+                "parent_baseline": dict(parent_baseline),
+                "base_oid": "b" * 40,
+            },
+            "workspace": {
+                "request_id": request_id,
+                "repo": str(repo),
+                "path": str(workspace),
+                "allowed_writes": list(paths),
+                "parent_baseline": dict(parent_baseline),
+                "base_oid": "b" * 40,
+                "python_candidate_authority": authority,
+            },
+            "python_candidate_authority": authority,
+        }
+        return evidence, hashes
+
+    early_evidence, early_hashes = seal(early_paths, early_request_id, 1)
+    late_evidence, late_hashes = seal(late_paths, late_request_id, 2)
+
+    # The earlier episode's delta was already pinned as the rework predecessor.
+    early_predecessor = {
+        "schema_id": "aiworkhub.rework_predecessor.v1",
+        "request_id": early_request_id,
+        "task_id": task_id,
+        "repo": str(repo),
+        "claim_epoch": 1,
+        "allowed_writes": list(early_paths),
+        "changed_paths": list(early_paths),
+        "changed_path_hashes": dict(early_hashes),
+    }
+
+    late_terminal = {
+        "substatus": "timed_out",
+        "claim_epoch": 2,
+        "request_id": late_request_id,
+        "evidence": late_evidence,
+    }
+    card = {
+        "task_id": task_id,
+        "runner": runner,
+        "topic": topic,
+        "allowed_writes": list(late_paths),
+        "required_outputs": [],
+        "claim_epoch": 2,
+        "launch_request_id": late_request_id,
+        "status": "blocked",
+        "worker_status": "timed_out",
+        "terminal_substatus": "timed_out",
+        "terminal_failure": late_terminal,
+        "rework_predecessor": early_predecessor,
+        "blocker_reason": "timed_out: worker timed out",
+        "blocked_at": now,
+        "blocked_by": runner,
+    }
+
+    _readiness, db_path = task_store._require_ready(repo)
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO tasks(task_id, runner, topic, status, worker_status, "
+            "priority, objective, card_json, created_at, updated_at, claimed_by, "
+            "claimed_at, started_at, completed_at) "
+            "VALUES (?, ?, ?, 'blocked', ?, '', '', ?, ?, ?, ?, ?, ?, ?)",
+            (
+                task_id,
+                runner,
+                topic,
+                "timed_out",
+                json.dumps(card),
+                now,
+                now,
+                "",
+                "",
+                "",
+                now,
+            ),
+        )
+        conn.execute(
+            "INSERT INTO task_events(task_id, event, runner, payload_json, created_at) "
+            "VALUES (?, 'terminal_failure', ?, ?, ?)",
+            (
+                task_id,
+                runner,
+                json.dumps(
+                    {
+                        "substatus": "timed_out",
+                        "claim_epoch": 1,
+                        "request_id": early_request_id,
+                        "evidence": early_evidence,
+                    }
+                ),
+                "2026-08-06T00:00:01+00:00",
+            ),
+        )
+        conn.execute(
+            "INSERT INTO task_events(task_id, event, runner, payload_json, created_at) "
+            "VALUES (?, 'terminal_failure', ?, ?, ?)",
+            (
+                task_id,
+                runner,
+                json.dumps(late_terminal),
+                "2026-08-06T00:00:02+00:00",
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    late_workspace = (
+        repo / ".aiworkhub" / "runtime" / "worktrees" / late_request_id / "worktree"
+    )
+    before_bytes = {
+        path: (late_workspace / path).read_bytes() for path in late_paths
+    }
+
+    assert task_store.recover_blocked_rework(
+        repo,
+        task_id,
+        actor="coordinator",
+        feedback_reason="NeedFix: retry timed out rework",
+    ) == (True, "recovered")
+
+    recovered = _get_card(repo, task_id)
+    assert recovered["status"] == "pending"
+    pred = recovered["rework_predecessor"]
+    assert pred["request_id"] == late_request_id
+    assert pred["claim_epoch"] == 2
+    # The second sealed seven-path delta is inherited byte-identically, not the
+    # stale three-path predecessor.
+    assert pred["changed_path_hashes"] == late_hashes
+    assert pred["changed_path_hashes"] != early_hashes
+    assert len(pred["changed_path_hashes"]) == 7
+    # No clean-root fallback; the sealed worktree bytes are untouched.
+    assert "clean_root_recovery_authorization" not in recovered
+    assert "recovery_mode" not in recovered
+    for path, original in before_bytes.items():
+        assert (late_workspace / path).read_bytes() == original

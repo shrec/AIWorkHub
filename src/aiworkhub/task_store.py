@@ -4407,6 +4407,31 @@ def retry_finalize_failed(
         return True, "processing"
 
 
+def _terminal_failure_supersedes_predecessor(
+    terminal_failure: dict[str, object],
+    retained_predecessor: dict[str, object],
+) -> bool:
+    """True only when ``terminal_failure`` is provably from a strictly later
+    claim epoch than ``retained_predecessor``.
+
+    A later timed_out/cancelled run seals a new rework delta under a newer
+    claim epoch than the predecessor retained from the earlier episode; that
+    newer delta must replace the stale predecessor instead of being shadowed
+    by it (NF-2026-00515).  A predecessor without a trustworthy claim epoch
+    (for example a reviewer-pinned workspace) is never superseded by failure
+    history.
+    """
+    predecessor_epoch = retained_predecessor.get("claim_epoch")
+    failure_epoch = terminal_failure.get("claim_epoch")
+    return (
+        type(failure_epoch) is int
+        and failure_epoch > 0
+        and type(predecessor_epoch) is int
+        and predecessor_epoch > 0
+        and failure_epoch > predecessor_epoch
+    )
+
+
 def recover_blocked_rework(
     root: str | Path,
     task_id: str,
@@ -5068,13 +5093,37 @@ def recover_blocked_rework(
         # A first failed finalization has no reviewer transport yet. Normal
         # rework may reuse its exact retained candidate, but must not replace
         # any review evidence or pinned predecessor with failure history.
-        if terminal_row is None and not retained_predecessor:
-            terminal_event = "terminal_failure"
-            terminal_row = conn.execute(
+        # A later terminal failure (a re-run that timed out after an earlier
+        # pinned predecessor) supersedes that stale predecessor, so bind the
+        # newest failure and re-derive the predecessor from its sealed delta
+        # instead of inheriting the earlier one (NF-2026-00515).
+        if terminal_row is None:
+            newest_terminal_failure = conn.execute(
                 "SELECT runner, payload_json, created_at FROM task_events "
                 "WHERE task_id=? AND event='terminal_failure' ORDER BY rowid DESC LIMIT 1",
                 (task_id,),
             ).fetchone()
+            newest_failure_payload: dict[str, object] = {}
+            if newest_terminal_failure is not None:
+                try:
+                    parsed_failure = json.loads(
+                        str(newest_terminal_failure["payload_json"] or "{}")
+                    )
+                    if isinstance(parsed_failure, dict):
+                        newest_failure_payload = parsed_failure
+                except json.JSONDecodeError:
+                    newest_failure_payload = {}
+            if newest_terminal_failure is not None and (
+                not retained_predecessor
+                or (
+                    not validation_only_replay
+                    and _terminal_failure_supersedes_predecessor(
+                        newest_failure_payload, retained_predecessor
+                    )
+                )
+            ):
+                terminal_event = "terminal_failure"
+                terminal_row = newest_terminal_failure
 
         if validation_only_replay and has_reviewer_transport and not successful_preparation:
             predecessor_request_id = str(
@@ -5367,7 +5416,15 @@ def recover_blocked_rework(
         # manager recovery, authenticate the newest terminal event
         # and synthesize the predecessor from its mechanically collected
         # evidence. Replay authorization remains a separate explicit grant.
-        if terminal_event == "terminal_failure" and not retained_predecessor:
+        if terminal_event == "terminal_failure" and (
+            not retained_predecessor
+            or (
+                not validation_only_replay
+                and _terminal_failure_supersedes_predecessor(
+                    terminal_review, retained_predecessor
+                )
+            )
+        ):
             recorded_failure = card.get("terminal_failure")
             if recorded_failure != terminal_review:
                 return False, "retained_terminal_candidate_event_mismatch"
