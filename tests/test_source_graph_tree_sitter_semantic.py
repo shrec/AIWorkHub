@@ -136,3 +136,86 @@ def test_large_javascript_tree_lifetime_is_stable(tmp_path: Path) -> None:
     assert extraction.status == "ok"
     assert sum(entity.kind == "function" for entity in extraction.entities) == 2500
     assert sum(edge.kind == "calls" for edge in extraction.edges) == 2500
+
+
+def test_js_ts_call_source_col_is_utf8_byte_offset_of_called_identifier(tmp_path: Path) -> None:
+    source = (
+        'import { helper as h } from "./util";\n'
+        "function helper() { return 0; }\n"
+        "export function run(obj: { method: () => number }) {\n"
+        '  const prefix = "é"; obj.method(); obj.method(); h(); helper();\n'
+        "  return new Widget();\n"
+        "}\n"
+    )
+    target = tmp_path / "app" / "main.ts"
+    _write(target, source)
+    raw = semantic.extract_javascript_typescript(
+        file_path="app/main.ts", raw=source.encode("utf-8"), language="typescript",
+    )
+    assert raw is not None
+    call_rows = [row for row in raw.edges if row["kind"] == "calls"]
+    call_line = source.splitlines()[3]
+    encoded = call_line.encode("utf-8")
+    first_method = encoded.find(b"method")
+    second_method = encoded.find(b"method", first_method + 1)
+    alias_col = encoded.find(b"h()")
+    shadow_col = encoded.find(b"helper")
+    assert first_method != call_line.find("method")
+    method_cols = sorted(
+        int(row["source_col"])
+        for row in call_rows
+        if row["dst_name"] == "method" and int(row["line"]) == 4
+    )
+    assert method_cols == [first_method, second_method]
+    assert encoded.find(b"obj") not in method_cols
+    assert encoded.find(b"(") not in method_cols
+    alias_row = next(
+        row for row in call_rows
+        if row["dst_name"] == "helper" and int(row["source_col"]) == alias_col
+    )
+    shadow_row = next(
+        row for row in call_rows
+        if row["dst_name"] == "helper" and int(row["source_col"]) == shadow_col
+    )
+    assert int(alias_row["line"]) == 4
+    assert int(shadow_row["line"]) == 4
+    assert int(alias_row["source_col"]) != int(shadow_row["source_col"])
+    widget_line = source.splitlines()[4]
+    widget_col = widget_line.encode("utf-8").find(b"Widget")
+    new_row = next(row for row in call_rows if row["dst_name"] == "Widget")
+    assert int(new_row["line"]) == 5
+    assert int(new_row["source_col"]) == widget_col
+    assert widget_col != widget_line.encode("utf-8").find(b"new")
+    projected = sgast.extract_file(tmp_path, target, build_revision="coord-test")
+    projected_calls = [edge for edge in projected.edges if edge.kind == "calls"]
+    assert {(edge.dst_name, edge.line, edge.source_col) for edge in projected_calls} == {
+        (row["dst_name"], int(row["line"]), int(row["source_col"])) for row in call_rows
+    }
+    task_store.initialize_repository(tmp_path)
+    _write(tmp_path / "app" / "util.ts", "export function helper() { return 1; }\n")
+    report = sg.build_index(tmp_path, incremental=False)
+    assert report.errors == []
+    conn = sg.connect(sg.resolve_db_path(tmp_path))
+    try:
+        persisted = conn.execute(
+            "SELECT dst_name, line, source_col FROM edges "
+            "WHERE file_path='app/main.ts' AND kind='calls' "
+            "ORDER BY line, source_col, dst_name"
+        ).fetchall()
+    finally:
+        conn.close()
+    expected = sorted(
+        (int(row["line"]), int(row["source_col"]), row["dst_name"]) for row in call_rows
+    )
+    assert [(row["line"], row["source_col"], row["dst_name"]) for row in persisted] == expected
+
+
+def test_js_ts_parser_fallback_leaves_call_source_col_unknown(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    monkeypatch.setattr(semantic, "extract_javascript_typescript", lambda **kwargs: None)
+    target = tmp_path / "src" / "widget.js"
+    _write(target, "export function run() { return helper(); }\n")
+    extraction = sgast.extract_file(tmp_path, target, build_revision="fallback-col")
+    assert extraction.status == "ok"
+    assert all(edge.source_col == -1 for edge in extraction.edges)

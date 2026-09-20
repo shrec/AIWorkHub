@@ -256,6 +256,7 @@ def extract_file_from_bytes(
                         confidence=float(row["confidence"]),
                         source_hash=source_hash,
                         build_revision=build_revision,
+                        source_col=int(row.get("source_col", -1)),
                     ) for row in semantic.edges),
                 )
         try:

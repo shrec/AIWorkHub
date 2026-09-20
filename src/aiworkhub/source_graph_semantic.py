@@ -332,7 +332,7 @@ def extract_javascript_typescript(
             parent = parent.parent
         return None
 
-    observed_calls: set[tuple[str, str, int]] = set()
+    observed_calls: set[tuple[str, str, int, int]] = set()
     for node in _walk(root):
         if node.type not in {"call_expression", "new_expression"}:
             continue
@@ -343,10 +343,12 @@ def extract_javascript_typescript(
         if function is None:
             continue
         exact_binding = False
+        name_node = None
         if function.type in {"identifier", "type_identifier"}:
             observed_name = _text(raw, function)
             called = aliases.get(observed_name, observed_name)
             exact_binding = observed_name in aliases or called in local_targets
+            name_node = function
         elif function.type in {"member_expression", "subscript_expression"}:
             property_node = function.child_by_field_name("property")
             object_node = function.child_by_field_name("object")
@@ -354,13 +356,19 @@ def extract_javascript_typescript(
             exact_binding = bool(
                 object_node is not None and _text(raw, object_node) in namespaces and called
             )
+            name_node = property_node
         else:
             named = [child for child in function.named_children if child.type in {"identifier", "property_identifier", "type_identifier"}]
             called = _text(raw, named[-1]) if named else ""
+            name_node = named[-1] if named else None
         if not called or called in {"require", "if", "for", "while", "switch"}:
             continue
-        line = line_at(node.start_byte)
-        identity = (src, called, line)
+        if name_node is None:
+            continue
+        name_byte = int(name_node.start_byte)
+        line = line_at(name_byte)
+        source_col = name_byte - line_starts[line - 1]
+        identity = (src, called, line, source_col)
         if identity in observed_calls:
             continue
         observed_calls.add(identity)
@@ -370,10 +378,10 @@ def extract_javascript_typescript(
         edges.append({
             "kind": "calls", "src_qualname": src, "dst_name": called,
             "dst_qualname": dst_qualname, "line": line,
+            "source_col": source_col,
             "evidence_label": label,
             "confidence": 1.0 if label == "EXTRACTED" else 0.75,
         })
-
     return SemanticExtraction(
         entities=tuple(entities), edges=tuple(edges), parser_id=parser_id,
         has_parse_error=bool(root.has_error),
