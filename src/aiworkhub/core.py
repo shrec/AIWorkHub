@@ -5183,6 +5183,39 @@ def sdlc_stage_packet(case_id: str, stage: str) -> dict[str, Any]:
         return _sdlc_case_refusal(exc, repo_id=repo_id, case_id=case_id, stage=stage)
 
 
+def _sdlc_task_case_id(task_id: str) -> str:
+    # Pure function of the task so a replay or a competing request for the same
+    # task always resolves to the same case row.
+    seed = json.dumps(["aiworkhub.sdlc.task_case.v1", task_id])
+    return "case_" + hashlib.sha256(seed.encode("utf-8")).hexdigest()[:32]
+
+
+def sdlc_case_create_for_task(task_id: str, request_id: str) -> dict[str, Any]:
+    from . import sdlc_case_store
+
+    return sdlc_case_create(
+        _sdlc_task_case_id(task_id),
+        request_id,
+        {sdlc_case_store.TASK_LINK_KEY: task_id},
+    )
+
+
+def sdlc_case_for_task(task_id: str) -> dict[str, Any]:
+    binding = _sdlc_verified_repo()
+    if isinstance(binding, dict):
+        return binding
+    root, repo_id = binding
+    from . import sdlc_case_store
+
+    try:
+        return sdlc_case_store.case_for_task(root, repo_id, task_id)
+    except (
+        sdlc_case_store.SdlcCaseConflict,
+        sdlc_case_store.SdlcCaseValidationError,
+    ) as exc:
+        return _sdlc_case_refusal(exc, repo_id=repo_id)
+
+
 def mark_review(task_id: str, runner: str | None = None, topic: str | None = None) -> dict[str, Any]:
     """Request review for the exact task owner recorded on the live card.
 

@@ -4858,6 +4858,20 @@ def aiworkhub_manager_sdlc_stage_packet(case_id: str, stage: str) -> dict[str, A
 
 
 @mcp.tool()
+def aiworkhub_manager_sdlc_case_create_for_task(
+    task_id: str, request_id: str
+) -> dict[str, Any]:
+    """Create the SDLC case bound to one canonical task under verified manager authority."""
+    return core.sdlc_case_create_for_task(task_id=task_id, request_id=request_id)
+
+
+@mcp.tool()
+def aiworkhub_manager_sdlc_case_for_task(task_id: str) -> dict[str, Any]:
+    """READ-ONLY: bounded case packet bound to one canonical task, or a typed unknown."""
+    return core.sdlc_case_for_task(task_id=task_id)
+
+
+@mcp.tool()
 def needfix_preview_convert(
     needfix_id: str, task_plan: dict[str, Any] | None = None
 ) -> dict:
