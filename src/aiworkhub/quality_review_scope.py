@@ -16,9 +16,10 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from bisect import bisect_left, bisect_right
 from collections.abc import Iterable, Mapping
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, NamedTuple, cast
 
 from . import source_graph
 from . import source_graph_ast as sgast
@@ -83,6 +84,7 @@ def _strings(values: Iterable[object], *, limit: int = MAX_SCOPE_ROWS) -> tuple[
 
 
 def _line_span(row: Mapping[str, Any]) -> tuple[int, int]:
+    """Presentation envelope for ChangedPath rows; never used to select symbols."""
     segments = row.get("segments") or []
     starts: list[int] = []
     ends: list[int] = []
@@ -103,6 +105,85 @@ def _line_span(row: Mapping[str, Any]) -> tuple[int, int]:
     if not starts or not ends:
         return 1, 1
     return min(starts), max(max(ends), min(starts))
+
+
+_Span = tuple[int, int]
+# A removed path is deleted in full; no hunk row is needed to say so.
+_WHOLE_FILE: tuple[_Span, ...] = ((1, 2**31 - 1),)
+
+
+class _ChangedSegments(NamedTuple):
+    candidate: tuple[_Span, ...]
+    baseline: tuple[_Span, ...]
+    replaced: tuple[_Span, ...]
+    malformed: int
+
+
+def _line_pair(
+    segment: Mapping[str, Any], start_key: str, end_key: str
+) -> _Span | None:
+    start = segment.get(start_key)
+    end = segment.get(end_key)
+    for value in (start, end):
+        if not isinstance(value, int) or isinstance(value, bool):
+            return None
+    if start < 1 or end < start:
+        return None
+    return start, end
+
+
+def _merge_spans(spans: Iterable[_Span]) -> tuple[_Span, ...]:
+    merged: list[_Span] = []
+    for start, end in sorted(spans):
+        if merged and start <= merged[-1][1] + 1:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return tuple(merged)
+
+
+def _changed_segments(row: Mapping[str, Any]) -> _ChangedSegments:
+    """Merged changed intervals; deletes and replaces also carry their baseline lines."""
+    rows = row.get("segments")
+    if not isinstance(rows, list):
+        return _ChangedSegments((), (), (), 0)
+    candidate: list[_Span] = []
+    baseline: list[_Span] = []
+    replaced: list[_Span] = []
+    malformed = 0
+    for segment in rows:
+        if not isinstance(segment, Mapping):
+            malformed += 1
+            continue
+        changed = _line_pair(
+            segment, "changed_start_line", "changed_end_line"
+        ) or _line_pair(segment, "candidate_start_line", "candidate_end_line")
+        deleted = _line_pair(segment, "baseline_start_line", "baseline_end_line")
+        kind = segment.get("kind")
+        is_deletion = kind == "delete" or (kind is None and changed is None)
+        span = deleted if is_deletion else changed
+        if span is None:
+            malformed += 1
+        elif is_deletion:
+            baseline.append(span)
+        else:
+            candidate.append(span)
+            # An insert's baseline range only marks where it landed; nothing was removed.
+            if deleted is not None and kind != "insert":
+                replaced.append(deleted)
+            elif kind == "replace":
+                malformed += 1
+    return _ChangedSegments(
+        _merge_spans(candidate),
+        _merge_spans(baseline),
+        _merge_spans(replaced),
+        malformed,
+    )
+
+
+def _within(spans: tuple[_Span, ...], line: int) -> bool:
+    index = bisect_left(spans, line, key=lambda span: span[1])
+    return index < len(spans) and spans[index][0] <= line
 
 
 def _change_kind(
@@ -169,6 +250,51 @@ def _graph_connection(authority_repo: Path) -> sqlite3.Connection | None:
         return None
 
 
+def _canonical_entities(conn: sqlite3.Connection, path: str) -> list[Any]:
+    return list(
+        conn.execute(
+            "SELECT kind,name,qualname,file_path,line_start,line_end "
+            "FROM entities WHERE file_path=? ORDER BY line_start,qualname",
+            (path,),
+        )
+    )
+
+
+def _owners(
+    rows: Iterable[Any], spans: tuple[_Span, ...]
+) -> tuple[list[Any], list[_Span]]:
+    """Symbol rows intersecting any span, and the spans no symbol row intersects."""
+    owners: list[Any] = []
+    depth = [0] * (len(spans) + 1)
+    for row in rows:
+        if str(_row_value(row, "kind", "")) not in _SYMBOL_KIND_MAP:
+            continue
+        line_start = int(_row_value(row, "line_start", 0))
+        line_end = int(_row_value(row, "line_end", 0))
+        first = bisect_left(spans, line_start, key=lambda span: span[1])
+        last = bisect_right(spans, line_end, key=lambda span: span[0])
+        if first < last:
+            owners.append(row)
+            depth[first] += 1
+            depth[last] -= 1
+    uncovered: list[_Span] = []
+    covering = 0
+    for index, span in enumerate(spans):
+        covering += depth[index]
+        if covering <= 0:
+            uncovered.append(span)
+    return owners, uncovered
+
+
+def _edge_line(edge: Any) -> int:
+    return max(1, int(edge.line or 1))
+
+
+def _path_list(paths: Iterable[str]) -> str:
+    text = ", ".join(paths)
+    return text if len(text) <= 600 else f"{text[:597]}..."
+
+
 def build_scoped_audits(
     *,
     authority_repo: Path,
@@ -192,6 +318,12 @@ def build_scoped_audits(
     callers and related tests.  This avoids mutating either repository while
     still covering newly added symbols that are absent from the canonical
     generation.
+
+    Symbols and edges are selected by intersection with the union of the exact
+    changed segments, never with the min-max span enclosing them.  Deleted lines
+    and the baseline lines a replace overwrote resolve against canonical baseline
+    symbols, so removed or renamed code keeps its callers; a deletion no symbol
+    owns, or a graph that is unavailable, becomes a known unknown.
     """
 
     authority_repo = authority_repo.resolve()
@@ -225,9 +357,12 @@ def build_scoped_audits(
         required_output_paths = {str(value) for value in required_outputs}
 
         target_names: set[str] = set()
+        unresolved_lines: list[str] = []
+        unresolved_deletions: list[str] = []
         for path, digest_value in sorted(changed_path_hashes.items()):
             digest = None if digest_value is None else str(digest_value)
             evidence_row = source_evidence[path]
+            segments = _changed_segments(evidence_row)
             line_start, line_end = _line_span(evidence_row)
             changed_paths.append(
                 ChangedPath(
@@ -257,22 +392,31 @@ def build_scoped_audits(
                 entity_rows = list(extraction.entities)
                 edge_rows = list(extraction.edges)
             elif conn is not None:
-                entity_rows = list(
-                    conn.execute(
-                        "SELECT kind,name,qualname,file_path,line_start,line_end "
-                        "FROM entities WHERE file_path=? ORDER BY line_start,qualname",
-                        (path,),
-                    )
-                )
+                entity_rows = _canonical_entities(conn, path)
 
-            selected = [
-                entity
-                for entity in entity_rows
-                if int(_row_value(entity, "line_end", 0)) >= line_start
-                and int(_row_value(entity, "line_start", 0)) <= line_end
-            ]
-            if not selected and entity_rows:
-                selected = [entity_rows[0]]
+            deleted_file = digest is None
+            candidate_spans = () if deleted_file else segments.candidate
+            deleted_spans = _WHOLE_FILE if deleted_file else segments.baseline
+            replaced_spans = () if deleted_file else segments.replaced
+            baseline_rows: list[Any] = []
+            if deleted_file:
+                baseline_rows = entity_rows
+            elif (deleted_spans or replaced_spans) and conn is not None:
+                baseline_rows = _canonical_entities(conn, path)
+
+            selected, uncovered = _owners(entity_rows, candidate_spans)
+            deleted, unowned = _owners(baseline_rows, deleted_spans)
+            # A replace leaves candidate lines to review, so only a missing graph is unresolved.
+            replaced, _ = _owners(baseline_rows, replaced_spans)
+            if unowned or (replaced_spans and conn is None):
+                unresolved_deletions.append(path)
+            if not deleted_file and (
+                segments.malformed or not (segments.candidate or segments.baseline)
+            ):
+                unresolved_lines.append(path)
+            if entity_rows and (uncovered or not (selected or deleted)):
+                selected.append(entity_rows[0])
+            selected += deleted + replaced
             for entity in selected[:MAX_SCOPE_ROWS]:
                 kind = _SYMBOL_KIND_MAP.get(str(_row_value(entity, "kind", "")))
                 if kind is None:
@@ -284,12 +428,14 @@ def build_scoped_audits(
                 targets.setdefault(qualname, TargetSymbol(qualname, kind))
                 target_names.add(entity_name or qualname.rsplit(".", 1)[-1])
 
-            for edge in edge_rows[:MAX_SCOPE_ROWS]:
-                edge_line = max(1, int(edge.line or 1))
-                if edge.src_qualname not in targets and not (
-                    line_start <= edge_line <= line_end
-                ):
-                    continue
+            scoped_edges = [
+                edge
+                for edge in edge_rows
+                if _within(candidate_spans, _edge_line(edge))
+                or (edge.src_qualname in targets and edge.src_qualname != path)
+            ]
+            for edge in scoped_edges[:MAX_SCOPE_ROWS]:
+                edge_line = _edge_line(edge)
                 description = (
                     f"Candidate Source Graph {edge.kind}: {edge.src_qualname} -> "
                     f"{edge.dst_qualname or edge.dst_name}; "
@@ -333,6 +479,28 @@ def build_scoped_audits(
                     line_end=line_end,
                     description=f"Required output is present with candidate sha256={digest}.",
                 )
+
+        if unresolved_lines:
+            unknowns["changed-lines-unresolved"] = KnownUnknown(
+                identity="changed-lines-unresolved",
+                question=f"Which lines changed in {_path_list(unresolved_lines)}?",
+                why_relevant=(
+                    "Hunk evidence was missing or malformed, so the review scope "
+                    "could not be narrowed to exact changed segments."
+                ),
+            )
+        if unresolved_deletions:
+            unknowns["deleted-symbols-unresolved"] = KnownUnknown(
+                identity="deleted-symbols-unresolved",
+                question=(
+                    "Which symbols owned the deleted or replaced lines of "
+                    f"{_path_list(unresolved_deletions)}?"
+                ),
+                why_relevant=(
+                    "No canonical Source Graph symbol covered the removed baseline "
+                    "lines, so callers of removed code cannot be enumerated."
+                ),
+            )
 
         if not targets:
             first = changed_paths[0]
