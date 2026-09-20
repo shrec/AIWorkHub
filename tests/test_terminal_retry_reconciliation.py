@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
@@ -1677,3 +1678,254 @@ def test_recorded_failure_class_reads_the_card_and_never_recomputes() -> None:
         )
         == "defect"
     )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_error"),
+    [
+        ("none", ""),
+        ("authorization_request", "reroute_requires_terminal_retry_provenance"),
+        ("recovery_event_missing", "reroute_requires_terminal_retry_provenance"),
+        ("terminal_event_request", "reroute_requires_terminal_retry_provenance"),
+        ("card_terminal_request", "reroute_requires_terminal_retry_provenance"),
+        ("terminal_evidence_request_absent", ""),
+        ("terminal_evidence_request_empty", ""),
+        ("terminal_evidence_request_null", ""),
+        ("terminal_evidence_request_wrong", "reroute_requires_terminal_retry_provenance"),
+        ("foreign_event", "reroute_requires_terminal_retry_provenance"),
+        ("recovery_row_runner", "reroute_requires_terminal_retry_provenance"),
+        ("terminal_row_runner", "reroute_requires_terminal_retry_provenance"),
+        ("recovery_terminal_runner", "reroute_requires_terminal_retry_provenance"),
+        ("recovery_timestamp", "reroute_requires_terminal_retry_provenance"),
+        ("authorization_timestamp", "reroute_requires_terminal_retry_provenance"),
+        ("recovery_row_timestamp", "reroute_requires_terminal_retry_provenance"),
+        ("predecessor_terminal_timestamp", "reroute_requires_terminal_retry_provenance"),
+        ("recovery_epoch_float", "reroute_requires_terminal_retry_provenance"),
+        ("predecessor_epoch_bool", "reroute_requires_terminal_retry_provenance"),
+        ("lineage_epoch_float", "reroute_requires_terminal_retry_provenance"),
+        ("authorization_epoch_float", "reroute_requires_terminal_retry_provenance"),
+        ("recovery_substatus_list", "reroute_requires_terminal_retry_provenance"),
+        ("event_recovery_epoch_float", "reroute_requires_terminal_retry_provenance"),
+        ("event_terminal_epoch_bool", "reroute_requires_terminal_retry_provenance"),
+        ("event_recovery_substatus", "reroute_requires_terminal_retry_provenance"),
+        ("workspace_bytes", "reroute_retained_candidate_hash_mismatch"),
+        ("workspace_missing", "reroute_retained_candidate_workspace_invalid"),
+        ("malformed_delta", "reroute_requires_terminal_retry_provenance"),
+    ],
+)
+def test_reroute_preserves_unsealed_validation_replay_candidate(
+    coordinator_repo: Path, monkeypatch: pytest.MonkeyPatch,
+    mutation: str, expected_error: str,
+) -> None:
+    """An exact recovered worker failure can change routes without a stale retry."""
+    task_id = "REROUTE_VALIDATION_REPLAY_RETAINED"
+    predecessor = _retained_predecessor(coordinator_repo, task_id=task_id)
+    predecessor.pop("rework_delta")
+    predecessor.pop("delta_artifact")
+    request_id = predecessor["request_id"]
+    hashes = dict(predecessor["changed_path_hashes"])
+    recovery_epoch = predecessor["claim_epoch"] + 1
+    recovery = {
+        "request_id": request_id,
+        "terminal_claim_epoch": predecessor["claim_epoch"],
+        "terminal_substatus": "worker_failed",
+        "terminal_runner": "glm_5.3",
+        "terminal_recorded_at": "2026-08-03T00:01:00+00:00",
+        "changed_path_hashes": hashes,
+    }
+    lineage = {
+        "schema_id": "aiworkhub.validation_only_replay_lineage.v1",
+        "task_id": task_id,
+        "repo": str(coordinator_repo.resolve()),
+        "predecessor_request_id": request_id,
+        "predecessor_claim_epoch": recovery_epoch,
+        "changed_path_hashes": hashes,
+    }
+    terminal_payload = {
+        "substatus": "worker_failed",
+        "request_id": request_id,
+        "claim_epoch": predecessor["claim_epoch"],
+        "evidence": {"request_id": request_id},
+        "runner": "glm_5.3",
+        "recorded_at": "2026-08-03T00:01:00+00:00",
+    }
+    overrides = {
+        "claim_epoch": recovery_epoch,
+        "recovered_by": "codex",
+        "recovered_from_blocked_at": "2026-08-03T00:02:00+00:00",
+        "recovery_epoch": recovery_epoch,
+        "recovery_predecessor": recovery,
+        "validation_only_replay_lineage": lineage,
+        "validation_only_replay_authorization": {
+            "task_id": task_id,
+            "actor": "codex",
+            "authorized_at": "2026-08-03T00:02:00+00:00",
+            "predecessor_request_id": request_id,
+            "changed_path_hashes": hashes,
+            "next_claim_epoch": recovery_epoch,
+            "one_episode_binding": True,
+        },
+        "terminal_failure": copy.deepcopy(terminal_payload),
+    }
+    if mutation == "authorization_request":
+        overrides["validation_only_replay_authorization"][
+            "predecessor_request_id"
+        ] = "f" * 32
+    elif mutation == "recovery_terminal_runner":
+        overrides["recovery_predecessor"] = {
+            **recovery,
+            "terminal_runner": "not-glm",
+        }
+    elif mutation == "predecessor_terminal_timestamp":
+        overrides["recovery_predecessor"] = {
+            **recovery,
+            "terminal_recorded_at": "2026-08-03T00:00:00+00:00",
+        }
+    elif mutation == "recovery_timestamp":
+        overrides["recovered_from_blocked_at"] = "2026-08-03T00:03:00+00:00"
+    elif mutation == "authorization_timestamp":
+        overrides["validation_only_replay_authorization"]["authorized_at"] = (
+            "2026-08-03T00:03:00+00:00"
+        )
+    elif mutation == "recovery_epoch_float":
+        overrides["recovery_epoch"] = float(recovery_epoch)
+    elif mutation == "predecessor_epoch_bool":
+        overrides["recovery_predecessor"] = {
+            **recovery,
+            "terminal_claim_epoch": True,
+        }
+    elif mutation == "lineage_epoch_float":
+        overrides["validation_only_replay_lineage"] = {
+            **lineage,
+            "predecessor_claim_epoch": float(recovery_epoch),
+        }
+    elif mutation == "authorization_epoch_float":
+        overrides["validation_only_replay_authorization"]["next_claim_epoch"] = (
+            float(recovery_epoch)
+        )
+    elif mutation == "recovery_substatus_list":
+        overrides["recovery_predecessor"] = {
+            **recovery,
+            "terminal_substatus": ["worker_failed"],
+        }
+    elif mutation == "workspace_bytes":
+        workspace_path = Path(predecessor["workspace"]["path"])
+        (workspace_path / "out/result.json").write_bytes(b"tampered")
+    elif mutation == "workspace_missing":
+        workspace_path = Path(predecessor["workspace"]["path"])
+        (workspace_path / "out/result.json").unlink()
+        (workspace_path / "out").rmdir()
+        workspace_path.rmdir()
+    elif mutation == "malformed_delta":
+        predecessor["rework_delta"] = {"sealed": False}
+    events = [
+        {
+            "event": "blocked_rework_recovery",
+            "runner": "codex",
+            "created_at": "2026-08-03T00:02:00+00:00",
+            "payload": {
+                "transition": "blocked->pending",
+                "terminal_substatus": "worker_failed",
+                "claim_epoch": recovery_epoch,
+                "recorded_at": "2026-08-03T00:02:00+00:00",
+                "actor": "codex",
+                "prior_episode": {
+                    "terminal_substatus": "worker_failed",
+                    "request_id": request_id,
+                },
+                "predecessor": recovery,
+                "validation_only_replay": True,
+                "validation_only_replay_lineage": lineage,
+            },
+        },
+        {
+            "event": "terminal_failure",
+            "runner": "glm_5.3",
+            "created_at": "2026-08-03T00:01:00+00:00",
+            "payload": copy.deepcopy(terminal_payload),
+        },
+    ]
+    if mutation == "recovery_event_missing":
+        events.pop(0)
+    elif mutation == "terminal_event_request":
+        events[1]["payload"]["request_id"] = "e" * 32
+    elif mutation == "card_terminal_request":
+        overrides["terminal_failure"]["request_id"] = "e" * 32
+    elif mutation == "terminal_evidence_request_absent":
+        events[1]["payload"]["evidence"].pop("request_id")
+        overrides["terminal_failure"]["evidence"].pop("request_id")
+    elif mutation == "terminal_evidence_request_empty":
+        events[1]["payload"]["evidence"]["request_id"] = ""
+        overrides["terminal_failure"]["evidence"]["request_id"] = ""
+    elif mutation == "terminal_evidence_request_null":
+        events[1]["payload"]["evidence"]["request_id"] = None
+        overrides["terminal_failure"]["evidence"]["request_id"] = None
+    elif mutation == "terminal_evidence_request_wrong":
+        events[1]["payload"]["evidence"]["request_id"] = "e" * 32
+        overrides["terminal_failure"]["evidence"]["request_id"] = "e" * 32
+    elif mutation == "foreign_event":
+        events[0]["task_id"] = "OTHER_TASK"
+    elif mutation == "recovery_row_runner":
+        events[0]["runner"] = "not-codex"
+    elif mutation == "terminal_row_runner":
+        events[1]["runner"] = "not-glm"
+    elif mutation == "recovery_row_timestamp":
+        events[0]["created_at"] = "2026-08-03T00:03:00+00:00"
+    elif mutation == "event_recovery_epoch_float":
+        events[0]["payload"]["claim_epoch"] = float(recovery_epoch)
+    elif mutation == "event_terminal_epoch_bool":
+        events[1]["payload"]["claim_epoch"] = True
+    elif mutation == "event_recovery_substatus":
+        events[0]["payload"]["terminal_substatus"] = "launch_failed"
+    _insert_pending_reroutable(
+        coordinator_repo,
+        task_id=task_id,
+        runner="glm_5.3",
+        terminal_retry=None,
+        rework_predecessor=predecessor,
+        risk_tier="medium",
+        card_overrides=overrides,
+    )
+    readiness = task_store.storage_readiness(coordinator_repo)
+    conn = sqlite3.connect(readiness.canonical_db)
+    try:
+        for event in reversed(events):
+            conn.execute(
+                "INSERT INTO task_events(task_id,event,runner,payload_json,created_at) "
+                "VALUES (?,?,?,?,?)",
+                (
+                    event.get("task_id", task_id),
+                    event["event"],
+                    event["runner"],
+                    json.dumps(event["payload"]),
+                    event["created_at"],
+                ),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    monkeypatch.setattr(
+        worker_workspace,
+        "changed_paths",
+        lambda _workspace, **_kwargs: ["out/result.json"],
+    )
+
+    result = core.reroute_launch_identity(
+        task_id,
+        from_runner="glm_5.3",
+        to_runner="claude_sonnet-5",
+        to_adapter_id="claude_cli",
+        to_model="sonnet",
+    )
+
+    if expected_error:
+        assert result["ok"] is False, result
+        assert expected_error in result["stderr"]
+        assert _row(coordinator_repo, task_id)["runner"] == "glm_5.3"
+        return
+    assert result["ok"] is True, result
+    row = _row(coordinator_repo, task_id)
+    assert row["runner"] == "claude_sonnet-5"
+    card = json.loads(row["card_json"])
+    assert card["identity_reroute"]["retained_candidate_preserved"] is True
+    assert card["identity_reroute"]["validation_replay_authorization"]

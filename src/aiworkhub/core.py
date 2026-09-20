@@ -7630,8 +7630,166 @@ def _verified_manager_rejection_receipt(
     return receipt, None
 
 
-def _verified_retained_predecessor_receipt(
+def _verified_validation_replay_reroute_receipt(
     card: Mapping[str, Any], *, task_id: str
+) -> dict[str, Any] | None:
+    """Bind an unsealed retained candidate to its canonical recovery episode.
+
+    Recovery verifies the on-disk candidate before granting one validation-only
+    replay. Reroute must recheck that grant against the append-only terminal and
+    recovery events; card fields alone cannot authorize a provider change.
+    """
+    predecessor = card.get("rework_predecessor")
+    recovery = card.get("recovery_predecessor")
+    lineage = card.get("validation_only_replay_lineage")
+    authorization = card.get("validation_only_replay_authorization")
+    epoch = card.get("claim_epoch")
+    if not all(isinstance(item, dict) for item in (
+        predecessor, recovery, lineage, authorization,
+    )):
+        return None
+    assert isinstance(predecessor, dict)
+    assert isinstance(recovery, dict)
+    assert isinstance(lineage, dict)
+    assert isinstance(authorization, dict)
+    request_id = str(predecessor.get("request_id") or "").strip()
+    hashes = predecessor.get("changed_path_hashes")
+    prior_epoch = predecessor.get("claim_epoch")
+    actor = _verified_manager_actor()
+    if (
+        predecessor.get("schema_id") != "aiworkhub.rework_predecessor.v1"
+        or str(predecessor.get("task_id") or "") != task_id
+        or re.fullmatch(r"[0-9a-f]{32}", request_id) is None
+        or type(epoch) is not int
+        or type(prior_epoch) is not int
+        or epoch != prior_epoch + 1
+        or type(card.get("recovery_epoch")) is not int
+        or card.get("recovery_epoch") != epoch
+        or str(card.get("recovered_by") or "") != actor
+        or not str(card.get("recovered_from_blocked_at") or "").strip()
+        or not isinstance(hashes, dict)
+        or not hashes
+        or predecessor.get("rework_delta") is not None
+        or predecessor.get("delta_artifact") is not None
+        or recovery.get("request_id") != request_id
+        or type(recovery.get("terminal_claim_epoch")) is not int
+        or recovery.get("terminal_claim_epoch") != prior_epoch
+        or not isinstance(recovery.get("terminal_substatus"), str)
+        or recovery.get("terminal_substatus")
+        not in _RETRYABLE_OPERATIONAL_TERMINAL_SUBSTATUSES
+        or recovery.get("changed_path_hashes") != hashes
+        or lineage.get("schema_id")
+        != "aiworkhub.validation_only_replay_lineage.v1"
+        or lineage.get("task_id") != task_id
+        or lineage.get("repo") != str(repo_root().resolve())
+        or lineage.get("predecessor_request_id") != request_id
+        or type(lineage.get("predecessor_claim_epoch")) is not int
+        or lineage.get("predecessor_claim_epoch") != epoch
+        or lineage.get("changed_path_hashes") != hashes
+        or authorization.get("task_id") != task_id
+        or authorization.get("actor") != actor
+        or authorization.get("predecessor_request_id") != request_id
+        or authorization.get("changed_path_hashes") != hashes
+        or type(authorization.get("next_claim_epoch")) is not int
+        or authorization.get("next_claim_epoch") != epoch
+        or authorization.get("one_episode_binding") is not True
+    ):
+        return None
+    try:
+        events = task_store.get_task_events(repo_root(), task_id, limit=200)
+    except Exception:  # pragma: no cover - unreadable authority fails closed
+        return None
+    if not isinstance(events, list):
+        return None
+    recovery_event: dict[str, Any] | None = None
+    terminal_event: dict[str, Any] | None = None
+    for event in events:
+        # get_task_events queries by task_id but does not project that column.
+        # Synthetic or future explicit identities must still agree if present.
+        if not isinstance(event, dict) or event.get("task_id", task_id) != task_id:
+            continue
+        name = event.get("event")
+        payload = event.get("payload")
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except json.JSONDecodeError:
+                return None
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("task_id", task_id) != task_id:
+            continue
+        if recovery_event is None:
+            if name in {"terminal_failure", "terminal_review"}:
+                return None  # a later terminal episode superseded this recovery
+            if name == "blocked_rework_recovery":
+                if (
+                    event.get("runner") != actor
+                    or event.get("created_at") != payload.get("recorded_at")
+                ):
+                    return None
+                recovery_event = payload
+        elif name in {"terminal_failure", "terminal_review"}:
+            if (
+                event.get("runner") != card.get("runner")
+                or event.get("created_at") != payload.get("recorded_at")
+            ):
+                return None
+            terminal_event = payload if name == "terminal_failure" else None
+            break
+        elif name == "blocked_rework_recovery":
+            return None
+    if recovery_event is None or terminal_event is None:
+        return None
+    event_predecessor = recovery_event.get("predecessor")
+    prior_episode = recovery_event.get("prior_episode")
+    terminal_evidence = terminal_event.get("evidence")
+    if (
+        recovery_event.get("transition") != "blocked->pending"
+        or recovery_event.get("terminal_substatus")
+        != recovery.get("terminal_substatus")
+        or type(recovery_event.get("claim_epoch")) is not int
+        or recovery_event.get("claim_epoch") != epoch
+        or recovery_event.get("actor") != actor
+        or not str(recovery_event.get("recorded_at") or "").strip()
+        or recovery_event.get("recorded_at")
+        != card.get("recovered_from_blocked_at")
+        or recovery_event.get("recorded_at")
+        != authorization.get("authorized_at")
+        or recovery_event.get("validation_only_replay") is not True
+        or recovery_event.get("validation_only_replay_lineage") != lineage
+        or not isinstance(event_predecessor, dict)
+        or event_predecessor != recovery
+        or not isinstance(prior_episode, dict)
+        or prior_episode.get("terminal_substatus")
+        != recovery.get("terminal_substatus")
+        or terminal_event.get("substatus") != recovery.get("terminal_substatus")
+        or type(terminal_event.get("claim_epoch")) is not int
+        or terminal_event.get("claim_epoch") != prior_epoch
+        or terminal_event.get("request_id") != request_id
+        or terminal_event != card.get("terminal_failure")
+        or not isinstance(terminal_evidence, dict)
+        or terminal_evidence.get("request_id") not in (None, "", request_id)
+        or terminal_event.get("runner") != card.get("runner")
+        or terminal_event.get("runner") != recovery.get("terminal_runner")
+        or terminal_event.get("recorded_at")
+        != recovery.get("terminal_recorded_at")
+    ):
+        return None
+    return {
+        "schema_id": "aiworkhub.validation_replay_reroute_authorization.v1",
+        "task_id": task_id,
+        "request_id": request_id,
+        "claim_epoch": epoch,
+        "recovery_event_sha256": _canonical_receipt_digest(recovery_event),
+        "terminal_event_sha256": _canonical_receipt_digest(terminal_event),
+        "authorization_sha256": _canonical_receipt_digest(authorization),
+    }
+
+
+def _verified_retained_predecessor_receipt(
+    card: Mapping[str, Any], *, task_id: str,
+    validation_replay_receipt: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, Any] | None, str | None]:
     """Verify a retained candidate before changing its launch identity.
 
@@ -7688,9 +7846,10 @@ def _verified_retained_predecessor_receipt(
         str(item) for item in card_allowed
     ) != workspace.allowed_writes:
         return None, "reroute_retained_candidate_scope_mismatch"
-    if not worker_workspace.has_verified_rework_delta(
+    sealed_delta = worker_workspace.has_verified_rework_delta(
         predecessor, authority_repo=authority_repo
-    ):
+    )
+    if not sealed_delta and not validation_replay_receipt:
         return None, "reroute_retained_candidate_delta_unverified"
 
     normalized_hashes: dict[str, str | None] = {}
@@ -7765,7 +7924,7 @@ def _verified_retained_predecessor_receipt(
         verification_error = verify_candidate(workspace.path, observed_paths)
     elif workspace.path.exists():
         return None, "reroute_retained_candidate_workspace_invalid"
-    else:
+    elif sealed_delta:
         try:
             with tempfile.TemporaryDirectory(
                 prefix="aiworkhub-reroute-delta-"
@@ -7791,6 +7950,10 @@ def _verified_retained_predecessor_receipt(
             worker_workspace.WorkspaceError,
         ):
             return None, "reroute_retained_candidate_delta_unverified"
+    else:
+        # An unsealed recovery has no portable artifact. Never silently turn
+        # a missing retained workspace into a clean-root launch.
+        return None, "reroute_retained_candidate_workspace_invalid"
     if verification_error:
         return None, verification_error
 
@@ -7892,6 +8055,15 @@ def reroute_launch_identity(
     )
     manager_rejection_receipt: dict[str, Any] = {}
     identical_outcome_receipt: dict[str, Any] = {}
+    validation_replay_receipt: dict[str, Any] = {}
+    if _has_retained_candidate_delta(card) and isinstance(predecessor, dict):
+        # Only an unsealed, exact validation-only recovery takes this path.
+        # A malformed sealed descriptor must not fall back to this authority.
+        if "rework_delta" not in predecessor and "delta_artifact" not in predecessor:
+            validation_replay_receipt = (
+                _verified_validation_replay_reroute_receipt(card, task_id=task_id)
+                or {}
+            )
     if has_manager_rework_evidence:
         manager_rejection, manager_rejection_error = (
             _verified_manager_rejection_receipt(card, task_id=task_id)
@@ -7902,7 +8074,7 @@ def reroute_launch_identity(
                 or "reroute_manager_rejection_provenance_invalid"
             )
         manager_rejection_receipt = manager_rejection
-    elif not valid_terminal_retry:
+    elif not valid_terminal_retry and not validation_replay_receipt:
         # A semantic terminal (``validation_failed``) is not an operational
         # retry and never will be: an unattended retry must not re-run a
         # finding about the work.  But a card the launch guard has REFUSED on
@@ -7924,7 +8096,10 @@ def reroute_launch_identity(
     retained_candidate_receipt: dict[str, Any] = {}
     if _has_retained_candidate_delta(card):
         retained_candidate_receipt, retained_error = (
-            _verified_retained_predecessor_receipt(card, task_id=task_id)
+            _verified_retained_predecessor_receipt(
+                card, task_id=task_id,
+                validation_replay_receipt=validation_replay_receipt,
+            )
         )
         if retained_error is not None or retained_candidate_receipt is None:
             return _lifecycle_error(
@@ -8039,6 +8214,10 @@ def reroute_launch_identity(
     if manager_rejection_receipt:
         semantic_card["identity_reroute"]["manager_rejection_authorization"] = (
             manager_rejection_receipt
+        )
+    if validation_replay_receipt:
+        semantic_card["identity_reroute"]["validation_replay_authorization"] = (
+            validation_replay_receipt
         )
     encoded_card = json.dumps(semantic_card, ensure_ascii=False, sort_keys=True)
     try:
