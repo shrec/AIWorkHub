@@ -28,6 +28,11 @@ def test_terminal_hints_coalesce_without_running_scan_inline(monkeypatch, tmp_pa
     assert entered.wait(1)
     assert storage_retention.schedule_repository_cleanup(tmp_path) is False
     release.set()
+    for _ in range(500):
+        if not storage_retention.repository_cleanup_status(tmp_path)["running"]:
+            break
+        threading.Event().wait(0.01)
+    assert not storage_retention.repository_cleanup_status(tmp_path)["running"]
 
 
 def test_cleanup_single_flight_uses_platform_lock_not_sqlite(
