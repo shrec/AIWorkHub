@@ -10,7 +10,7 @@ The protocol baseline is the official [LSP 3.17 specification](https://github.co
 
 ## Task 1 — exact JS/TS call-site coordinates
 
-**Write scope:** `src/aiworkhub/source_graph_semantic.py`, `tests/test_source_graph_tree_sitter_semantic.py`, plus an exact extractor regression file if needed. This does not overlap the active NF864 worker.
+**Write scope:** `src/aiworkhub/source_graph_semantic.py`, `src/aiworkhub/source_graph_ast.py`, `tests/test_source_graph_tree_sitter_semantic.py`, plus an exact extractor regression file if needed. `source_graph_ast.py` must project the semantic row's `source_col` into `Edge`; otherwise the new coordinate is discarded. This does not overlap the active NF864 worker.
 
 1. TDD: a fixture with two calls to the same property on one line, a multibyte prefix, an aliased import, and a locally shadowed name must preserve distinct name-token byte positions. The indexed edge's `source_col` must point to the called identifier, not the receiver or opening parenthesis. Existing Python coordinate semantics stay unchanged.
 2. Extend the JS/TS semantic extraction to emit an exact source column for each call. Determine whether its persisted unit is UTF-8 byte offset or Unicode scalar position and make that explicit in the adapter contract; convert to LSP's negotiated position encoding at the boundary. No guessed column on an unsupported parser fallback.
