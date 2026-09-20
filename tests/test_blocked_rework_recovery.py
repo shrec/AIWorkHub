@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
@@ -1855,6 +1856,152 @@ def test_nf780_sequential_recovery_authorizes_retained_rework_reroute(
     assert rebind["recovery_epoch"] == 5
     assert len(rebind["recovery_predecessor_sha256"]) == 64
     assert len(rebind["terminal_failure_sha256"]) == 64
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_error"),
+    [
+        ("none", ""),
+        ("recovery_missing", "reroute_manager_rejection_identity_mismatch"),
+        ("event_request", "reroute_manager_rejection_identity_mismatch"),
+        ("event_epoch", "reroute_manager_rejection_identity_mismatch"),
+        ("event_predecessor", "reroute_manager_rejection_identity_mismatch"),
+        ("event_actor", "reroute_manager_rejection_identity_mismatch"),
+        ("transition_missing", "reroute_manager_rejection_identity_mismatch"),
+        ("terminal_substatus_missing", "reroute_manager_rejection_identity_mismatch"),
+        ("terminal_runner_missing", "reroute_manager_rejection_identity_mismatch"),
+        ("terminal_created_at_missing", "reroute_manager_rejection_identity_mismatch"),
+        ("recovery_runner_missing", "reroute_manager_rejection_identity_mismatch"),
+        ("recovery_created_at_missing", "reroute_manager_rejection_identity_mismatch"),
+        ("card_runner_changed", "reroute_manager_rejection_identity_mismatch"),
+        ("malformed_later_terminal", "reroute_manager_rejection_identity_mismatch"),
+        ("malformed_later_recovery", "reroute_manager_rejection_identity_mismatch"),
+        ("malformed_interposed_terminal", "reroute_manager_rejection_identity_mismatch"),
+        ("malformed_interposed_recovery", "reroute_manager_rejection_identity_mismatch"),
+        ("substatus_malformed", "reroute_manager_rejection_identity_mismatch"),
+        ("nondict_event", "reroute_manager_rejection_identity_mismatch"),
+        ("empty_event_task_id", "reroute_manager_rejection_identity_mismatch"),
+        ("empty_payload_task_id", "reroute_manager_rejection_identity_mismatch"),
+        ("later_terminal_review", "reroute_manager_rejection_identity_mismatch"),
+        ("evidence_request_missing", ""),
+    ],
+)
+def test_nf824_recovered_rejection_uses_terminal_failure_without_live_request(
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+    expected_error: str,
+) -> None:
+    """Recovery clears launch_request_id but retains the exact terminal event."""
+    terminal = {
+        "substatus": "worker_failed",
+        "request_id": _NF780_LATEST_REQUEST,
+        "claim_epoch": 4,
+        "evidence": {"request_id": _NF780_LATEST_REQUEST},
+        "runner": "deepseek_native-v4-pro",
+        "recorded_at": "2026-08-03T00:01:45+00:00",
+    }
+    predecessor = {
+        "request_id": _NF780_PREDECESSOR_REQUEST,
+        "terminal_claim_epoch": 3,
+        "terminal_substatus": "review_ready",
+        "terminal_runner": "deepseek_native-v4-pro",
+        "terminal_recorded_at": "2026-08-03T00:01:00+00:00",
+        "changed_path_hashes": dict(_NF780_HASHES),
+    }
+    card = _nf780_card(
+        runner="deepseek_native-v4-pro",
+        terminal_failure=terminal,
+        recovery_predecessor=predecessor,
+    )
+    card.pop("launch_request_id")
+    recovery = {
+        "event": "blocked_rework_recovery",
+        "runner": "codex",
+        "created_at": "2026-08-03T00:02:00+00:00",
+        "payload": {
+            "transition": "blocked->pending",
+            "terminal_substatus": "review_ready",
+            "claim_epoch": 5,
+            "recorded_at": "2026-08-03T00:02:00+00:00",
+            "actor": "codex",
+            "prior_episode": {"terminal_substatus": "worker_failed"},
+            "predecessor": predecessor,
+        },
+    }
+    terminal_event = {
+        "event": "terminal_failure",
+        "runner": "deepseek_native-v4-pro",
+        "created_at": "2026-08-03T00:01:45+00:00",
+        "payload": copy.deepcopy(terminal),
+    }
+    # Real histories retain earlier launch failures and accepted review
+    # terminals; neither may invalidate this newer, exact recovery pair.
+    events = [
+        recovery,
+        terminal_event,
+        {"event": "terminal_review", "payload": {"request_id": "b" * 32}},
+        {"event": "launch_failed", "payload": {"request_id": "b" * 32}},
+    ]
+    if mutation == "recovery_missing":
+        events.pop(0)
+    elif mutation == "event_request":
+        terminal_event["payload"]["request_id"] = "e" * 32
+    elif mutation == "event_epoch":
+        terminal_event["payload"]["claim_epoch"] = 3
+    elif mutation == "event_predecessor":
+        recovery["payload"]["predecessor"] = {
+            **predecessor,
+            "request_id": "e" * 32,
+        }
+    elif mutation == "event_actor":
+        recovery["payload"]["actor"] = "not-codex"
+    elif mutation == "transition_missing":
+        recovery["payload"].pop("transition")
+    elif mutation == "terminal_substatus_missing":
+        recovery["payload"].pop("terminal_substatus")
+    elif mutation == "terminal_runner_missing":
+        terminal_event.pop("runner")
+    elif mutation == "terminal_created_at_missing":
+        terminal_event.pop("created_at")
+    elif mutation == "recovery_runner_missing":
+        recovery.pop("runner")
+    elif mutation == "recovery_created_at_missing":
+        recovery.pop("created_at")
+    elif mutation == "card_runner_changed":
+        card["runner"] = "copilot_claude-opus-5"
+    elif mutation == "evidence_request_missing":
+        terminal["evidence"].pop("request_id")
+        terminal_event["payload"]["evidence"].pop("request_id", None)
+    elif mutation == "substatus_malformed":
+        terminal["substatus"] = []
+    elif mutation == "empty_event_task_id":
+        terminal_event["task_id"] = ""
+    elif mutation == "empty_payload_task_id":
+        terminal_event["payload"]["task_id"] = ""
+    for event in events:
+        event["payload"] = json.dumps(event["payload"])
+    if mutation == "malformed_later_terminal":
+        events.insert(0, {"event": "terminal_failure", "payload": "{broken"})
+    elif mutation == "malformed_later_recovery":
+        events.insert(0, {"event": "blocked_rework_recovery", "payload": "{broken"})
+    elif mutation == "malformed_interposed_terminal":
+        events.insert(1, {"event": "terminal_failure", "payload": "{broken"})
+    elif mutation == "malformed_interposed_recovery":
+        events.insert(1, {"event": "blocked_rework_recovery", "payload": "{broken"})
+    elif mutation == "nondict_event":
+        events.insert(1, "malformed_event_row")
+    elif mutation == "later_terminal_review":
+        events.insert(0, {"event": "terminal_review", "payload": "{}"})
+
+    receipt, error = _nf780_authorize(monkeypatch, card, events)
+
+    if expected_error:
+        assert receipt is None
+        assert error == expected_error
+        return
+    assert error is None
+    assert receipt is not None
+    assert receipt["recovery_rebind"]["recovery_epoch"] == 5
 
 
 def test_nf780_json_encoded_event_payloads_are_authenticated(

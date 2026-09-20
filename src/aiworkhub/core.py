@@ -7143,18 +7143,28 @@ def _latest_operational_recovery_projection(
     recovery = card.get("recovery_predecessor")
     recovery_epoch = card.get("recovery_epoch")
     current_claim_epoch = card.get("claim_epoch")
-    latest_request_id = str(card.get("launch_request_id") or "").strip()
+    live_request_id = str(card.get("launch_request_id") or "").strip()
+    inline = card.get("terminal_failure")
+    # recover_blocked_rework intentionally removes launch_request_id.  The
+    # retained inline terminal can identify the candidate event to check, but
+    # is never authority by itself when the live reservation is absent.
+    recovered_request_id = (
+        str(inline.get("request_id") or "").strip()
+        if isinstance(inline, dict)
+        else ""
+    )
+    latest_request_id = live_request_id or recovered_request_id
     if (
         not isinstance(recovery, dict)
         or type(recovery_epoch) is not int
         or type(current_claim_epoch) is not int
         or recovery_epoch != current_claim_epoch
+        or (live_request_id and re.fullmatch(r"[0-9a-f]{32}", live_request_id) is None)
         or re.fullmatch(r"[0-9a-f]{32}", latest_request_id) is None
         or str(recovery.get("task_id") or task_id) != task_id
     ):
         return None
 
-    inline = card.get("terminal_failure")
     if isinstance(inline, dict):
         evidence = inline.get("evidence")
         inline_request_id = (
@@ -7171,19 +7181,26 @@ def _latest_operational_recovery_projection(
         # all (only ``evidence.request_id``), so its absence is not itself a
         # tamper signal.
         inline_own_request_id = str(inline.get("request_id") or "").strip()
+        inline_substatus = inline.get("substatus")
         if (
             str(inline.get("task_id") or task_id) == task_id
-            and inline.get("substatus")
-            in _RETRYABLE_OPERATIONAL_TERMINAL_SUBSTATUSES
+            and isinstance(inline_substatus, str)
+            and inline_substatus in _RETRYABLE_OPERATIONAL_TERMINAL_SUBSTATUSES
             and isinstance(evidence, dict)
-            and re.fullmatch(r"[0-9a-f]{32}", inline_request_id) is not None
+            and (
+                re.fullmatch(r"[0-9a-f]{32}", inline_request_id) is not None
+                if live_request_id
+                else re.fullmatch(r"[0-9a-f]{32}", inline_own_request_id)
+                is not None
+            )
             and type(inline.get("claim_epoch")) is int
             and (
                 not inline_own_request_id
+                or not inline_request_id
                 or inline_own_request_id == inline_request_id
             )
         ):
-            if inline_request_id == latest_request_id:
+            if live_request_id and inline_request_id == latest_request_id:
                 return dict(inline)
             # A recovered card may retain an older valid terminal projection.
             # Authenticate the latest episode from the canonical event pair.
@@ -7197,14 +7214,15 @@ def _latest_operational_recovery_projection(
             persisted.get("schema_id")
             == "aiworkhub.recovery_terminal_projection.v1"
             and str(persisted.get("task_id") or "").strip() == task_id
-            and persisted.get("substatus")
-            in _RETRYABLE_OPERATIONAL_TERMINAL_SUBSTATUSES
+            and isinstance(persisted.get("substatus"), str)
+            and persisted["substatus"] in _RETRYABLE_OPERATIONAL_TERMINAL_SUBSTATUSES
             and isinstance(evidence, dict)
             and str(evidence.get("request_id") or "").strip() == latest_request_id
             and type(persisted.get("claim_epoch")) is int
             and persisted.get("claim_epoch") == recovery_epoch - 1
         ):
-            return dict(persisted)
+            if live_request_id:
+                return dict(persisted)
         return None
 
     # No projection is retained on the live card after a second
@@ -7237,7 +7255,14 @@ def _latest_operational_recovery_projection(
     authenticated: dict[str, Any] | None = None
     for event in events:
         if not isinstance(event, dict):
+            if not live_request_id:
+                return None
             continue
+        name = str(event.get("event") or "").strip()
+        relevant = (
+            name in _RETRYABLE_OPERATIONAL_TERMINAL_SUBSTATUSES
+            or name in {"terminal_failure", "terminal_review", "blocked_rework_recovery"}
+        )
         raw_payload = event.get("payload")
         try:
             payload = (
@@ -7246,17 +7271,70 @@ def _latest_operational_recovery_projection(
                 else raw_payload
             )
         except json.JSONDecodeError:
+            if not live_request_id and relevant:
+                return None
             continue
         if not isinstance(payload, dict):
+            if not live_request_id and relevant:
+                return None
             continue
-        if str(event.get("task_id") or task_id) != task_id:
+        if "task_id" in event and event["task_id"] != task_id:
+            if not live_request_id and relevant:
+                return None
             continue
-        if str(payload.get("task_id") or task_id) != task_id:
+        if "task_id" in payload and payload["task_id"] != task_id:
+            if not live_request_id and relevant:
+                return None
             continue
-        name = str(event.get("event") or "").strip()
+        if name == "terminal_failure":
+            substatus = payload.get("substatus")
+            if (
+                not isinstance(substatus, str)
+                or substatus not in _RETRYABLE_OPERATIONAL_TERMINAL_SUBSTATUSES
+                or type(payload.get("claim_epoch")) is not int
+                or payload.get("claim_epoch") != recovery_epoch - 1
+                or payload != inline
+                or (
+                    (not live_request_id and event.get("runner") is None)
+                    or (
+                        event.get("runner") is not None
+                        and event.get("runner") != payload.get("runner")
+                    )
+                )
+                or (
+                    (not live_request_id and event.get("created_at") is None)
+                    or (
+                        event.get("created_at") is not None
+                        and event.get("created_at") != payload.get("recorded_at")
+                    )
+                )
+                or (
+                    not live_request_id
+                    and payload.get("runner") != card.get("runner")
+                )
+            ):
+                if not live_request_id and (pending_terminal or authenticated):
+                    return None
+                pending_terminal = None
+                continue
+            pending_terminal = {
+                "substatus": substatus,
+                "request_id": str(payload.get("request_id") or "").strip(),
+                "payload": payload,
+            }
+            continue
         if name in _RETRYABLE_OPERATIONAL_TERMINAL_SUBSTATUSES:
+            # Without a live request, only the exact inline terminal_failure
+            # row can begin the authenticated pair.  Older operational
+            # events belong to other episodes; a newer one supersedes it.
+            if not live_request_id:
+                if pending_terminal or authenticated:
+                    return None
+                continue
             event_request_id = str(payload.get("request_id") or "").strip()
             if re.fullmatch(r"[0-9a-f]{32}", event_request_id) is None:
+                if not live_request_id and (pending_terminal or authenticated):
+                    return None
                 pending_terminal = None
                 continue
             pending_terminal = {
@@ -7264,6 +7342,10 @@ def _latest_operational_recovery_projection(
                 "request_id": event_request_id,
                 "payload": payload,
             }
+            continue
+        if name == "terminal_review":
+            if not live_request_id and (pending_terminal or authenticated):
+                return None
             continue
         if name != "blocked_rework_recovery":
             continue
@@ -7283,6 +7365,27 @@ def _latest_operational_recovery_projection(
             or str(predecessor.get("request_id") or "").strip()
             != recovery_request_id
             or predecessor.get("terminal_claim_epoch") != recovery_terminal_epoch
+            or (
+                not live_request_id
+                and (
+                    predecessor != recovery
+                    or payload.get("transition") != "blocked->pending"
+                    or payload.get("terminal_substatus")
+                    != recovery.get("terminal_substatus")
+                    or payload.get("claim_epoch") != current_claim_epoch
+                    or payload.get("actor") != card.get("recovered_by")
+                    or payload.get("recorded_at")
+                    != card.get("recovered_from_blocked_at")
+                    or (
+                        event.get("runner") is None
+                        or event.get("runner") != payload.get("actor")
+                    )
+                    or (
+                        event.get("created_at") is None
+                        or event.get("created_at") != payload.get("recorded_at")
+                    )
+                )
+            )
         ):
             pending_terminal = None
             continue
@@ -7446,6 +7549,13 @@ def _verified_manager_rejection_receipt(
         else None
     )
     latest_request_id = str(card.get("launch_request_id") or "").strip()
+    if (
+        not latest_request_id
+        and isinstance(terminal_failure, dict)
+        and terminal_failure.get("source") == "canonical_task_event_pair"
+        and isinstance(terminal_evidence, dict)
+    ):
+        latest_request_id = str(terminal_evidence.get("request_id") or "").strip()
     recovery_request_id = (
         str(recovery.get("request_id") or "").strip()
         if isinstance(recovery, dict)
@@ -7483,7 +7593,8 @@ def _verified_manager_rejection_receipt(
         and isinstance(terminal_failure, dict)
         and str(terminal_failure.get("task_id") or task_id) == task_id
         and str(recovery.get("task_id") or task_id) == task_id
-        and terminal_failure.get("substatus")
+        and isinstance(terminal_failure.get("substatus"), str)
+        and terminal_failure["substatus"]
         in _RETRYABLE_OPERATIONAL_TERMINAL_SUBSTATUSES
         and isinstance(terminal_evidence, dict)
         and re.fullmatch(r"[0-9a-f]{32}", latest_request_id) is not None
