@@ -6,6 +6,31 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.51] - 2026-09-20
+
+### Added
+
+- Repository-bound SDLC cases now have durable stage receipts and MCP read/write
+  surfaces, with exact canonical task binding. This is the case protocol
+  foundation, not the completed Plan-to-Maintain gate.
+- VS Code LM workers now record what reasoning option was actually passed to
+  `sendRequest`, the selected model's reported context capacity, and explicit
+  unknown/provider-internal state. Durable process-attempt comparison is still
+  pending; a sent option is not proof of internal reasoning effort.
+- Accepted-task outcome metrics read complete histories for a bounded recent
+  cohort and report incomplete and unverified histories separately instead of
+  treating a raw event cap as complete evidence.
+
+### Fixed
+
+- OpenCode worker MCP registration uses the bounded `awh` alias and no longer
+  leaves a duplicate legacy alias. VS Code LM bridge requests preserve required
+  outputs and recover from oversized tool input without falsely losing the
+  worker attempt.
+- Manager cost-ledger summaries report bounded coverage and unknown-cost truth.
+  Source Graph preserves JavaScript/TypeScript call-site byte coordinates for
+  subsequent LSP qualification; the LSP resolver itself is not shipped yet.
+
 ## [0.11.50] - 2026-09-19
 
 ### Added

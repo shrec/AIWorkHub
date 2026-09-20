@@ -62,6 +62,18 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
+## What's new in 0.11.51
+
+- Repository-bound SDLC case receipts and exact task links are available through
+  MCP. The full stage-gated Playbook remains in progress.
+- VS Code LM records the reasoning option actually sent and the model-reported
+  context capacity; provider-internal effort and outcome improvement remain
+  unverified. Accepted-task metrics now distinguish complete, incomplete and
+  unverified histories.
+- OpenCode's MCP alias stays bounded to `awh`; several worker recovery and
+  Source Graph call-coordinate fixes are included. Semantic Review's new delta
+  scope and LSP index resolution are not yet part of this release.
+
 ## What's new in 0.11.50
 
 - Verified reasoning and context wiring for CLI workers and the VS Code

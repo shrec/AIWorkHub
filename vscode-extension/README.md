@@ -14,6 +14,17 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.11.51
+
+- The bundled runtime exposes repository-bound SDLC case receipts and exact
+  task links. Full Playbook stage gates are still under development.
+- VS Code LM records the exact reasoning option handed to `sendRequest` and
+  the model-reported context capacity, while leaving provider-internal effort
+  unknown. Accepted-task outcome metrics now report complete-history coverage.
+- OpenCode uses the short `awh` MCP alias; worker recovery and required-output
+  handling are hardened. Semantic Review's delta scope and LSP resolution are
+  not claimed as complete in this intermediate release.
+
 ## What's new in 0.11.50
 
 - The identity strip has a wave mini-roadmap info popup for the current

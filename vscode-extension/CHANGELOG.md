@@ -1,5 +1,25 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.51 — 2026-09-20
+
+### Added
+
+- Bundled SDLC case receipts and MCP surfaces link stages to exact canonical
+  task identities. Full stage-gated Playbook transitions remain in progress.
+- VS Code LM records the reasoning option actually handed to `sendRequest`
+  and the model-reported context capacity, with provider-internal state kept
+  unknown. Accepted-task metrics distinguish complete, incomplete and
+  unverified event histories.
+
+### Fixed
+
+- OpenCode worker MCP registration uses the bounded `awh` alias without a
+  duplicate legacy alias. VS Code LM worker requests retain required outputs
+  and recover from oversized tool input.
+- Manager cost-ledger summaries report bounded coverage; Source Graph retains
+  JS/TS call-site coordinates for later LSP qualification. The LSP resolver
+  and Semantic Review delta scope are not shipped as complete features.
+
 ## 0.11.50 — 2026-09-19
 
 ### Added
