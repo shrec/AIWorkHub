@@ -131,7 +131,13 @@ def test_current_tree_passes_and_baseline_is_sorted():
     # ``launch_isolated`` gained one ``sys.platform`` read when the AppContainer
     # supervisor identity was propagated into it -- a real new dependency, not
     # a scope change.
-    assert sum(entry.count for entry in boundary.baseline) == 137
+    # 137 -> 130 on 2026-09-20: four existing identities fell by eight
+    # measured occurrences (core.py os_name_ne -1, review_orchestrator.py
+    # sqlite_connect -5, worker_workspace.py os_name_eq -1/sys_platform -1).
+    # The new SDLC case store adds one SQLite connection, matching the existing
+    # per-store connection precedent. Keep its identity explicit and ratchet
+    # every real decrease instead of preserving stale allowance.
+    assert sum(entry.count for entry in boundary.baseline) == 130
 
 
 def test_new_identity_and_same_identity_growth_fail(tmp_path):

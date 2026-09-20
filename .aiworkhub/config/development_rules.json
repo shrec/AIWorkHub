@@ -671,7 +671,7 @@
       {
         "path": "src/aiworkhub/core.py",
         "pattern": "os_name_ne",
-        "count": 3
+        "count": 2
       },
       {
         "path": "src/aiworkhub/core.py",
@@ -766,7 +766,7 @@
       {
         "path": "src/aiworkhub/review_orchestrator.py",
         "pattern": "sqlite_connect",
-        "count": 6
+        "count": 1
       },
       {
         "path": "src/aiworkhub/roadmap_store.py",
@@ -791,6 +791,11 @@
       {
         "path": "src/aiworkhub/runtime_temp.py",
         "pattern": "sys_platform",
+        "count": 1
+      },
+      {
+        "path": "src/aiworkhub/sdlc_case_store.py",
+        "pattern": "sqlite_connect",
         "count": 1
       },
       {
@@ -936,7 +941,7 @@
       {
         "path": "src/aiworkhub/worker_workspace.py",
         "pattern": "os_name_eq",
-        "count": 8
+        "count": 7
       },
       {
         "path": "src/aiworkhub/worker_workspace.py",
@@ -946,7 +951,7 @@
       {
         "path": "src/aiworkhub/worker_workspace.py",
         "pattern": "sys_platform",
-        "count": 6
+        "count": 5
       },
       {
         "path": "src/aiworkhub/workforce_catalog.py",
@@ -977,8 +982,8 @@
     "measurement": {
       "reference_commit": "4ef0001cf9ef66fc9ebd70d5b724d46c485b1840",
       "reference_total": 161,
-      "current_total": 137,
-      "accepted_predecessor_delta": -24
+      "current_total": 130,
+      "accepted_predecessor_delta": -31
     }
   },
   "single_definition_boundary": {
