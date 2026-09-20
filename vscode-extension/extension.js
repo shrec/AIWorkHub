@@ -5456,27 +5456,45 @@ async function runVscodeLmTextProtocol(
       invalidInputError.responseDiagnostics = diagnostic;
       throw invalidInputError;
     }
-    if (Buffer.byteLength(JSON.stringify(envelope.input), "utf8") > VSCODE_LM_MAX_EMULATED_TOOL_INPUT_BYTES) {
-      throw new Error("vscode_lm_tool_input_too_large");
+    const toolInputBytes = Buffer.byteLength(JSON.stringify(envelope.input), "utf8");
+    const toolInputTooLarge = toolInputBytes > VSCODE_LM_MAX_EMULATED_TOOL_INPUT_BYTES;
+    if (toolInputTooLarge) {
+      protocolTrace.push({
+        turn,
+        phase: "tool_input_validation",
+        outcome: "vscode_lm_tool_input_too_large",
+        tool_name: String(envelope.name || "unknown").slice(0, 120),
+        actual_bytes: toolInputBytes,
+        max_bytes: VSCODE_LM_MAX_EMULATED_TOOL_INPUT_BYTES,
+      });
     }
     let result;
     let toolFailureReported = false;
     const toolStartedAt = Date.now();
-    if (typeof onToolTurn === "function") {
+    if (!toolInputTooLarge && typeof onToolTurn === "function") {
       try { onToolTurn(envelope.name, { tool_state: "started" }); } catch (_err) { /* liveness only */ }
     }
     try {
       assertRequestActive();
-      result = await raceVscodeLmCancellation(
-        invokeVscodeLmProtocolTool(
-          { name: envelope.name, input: envelope.input },
-          request.requestId,
-          invokeTool,
-          stagedEdits,
-          turnProviderCallId,
-        ),
-        cancellationToken,
-      );
+      if (toolInputTooLarge) {
+        result = {
+          ok: false,
+          error: "vscode_lm_tool_input_too_large",
+          actual_bytes: toolInputBytes,
+          max_bytes: VSCODE_LM_MAX_EMULATED_TOOL_INPUT_BYTES,
+        };
+      } else {
+        result = await raceVscodeLmCancellation(
+          invokeVscodeLmProtocolTool(
+            { name: envelope.name, input: envelope.input },
+            request.requestId,
+            invokeTool,
+            stagedEdits,
+            turnProviderCallId,
+          ),
+          cancellationToken,
+        );
+      }
       assertRequestActive();
     } catch (err) {
       if (String(err && err.message || err) === "vscode_lm_request_cancelled") throw err;
@@ -5546,15 +5564,19 @@ async function runVscodeLmTextProtocol(
       );
     }
     protocolTrace.push({ turn, phase: "work", outcome: `tool:${envelope.name}` });
-    messages.push(vscode.LanguageModelChatMessage.Assistant([languageModelTextPart(text)]));
+    const historyText = toolInputTooLarge ? "[oversized tool request omitted]" : text;
+    messages.push(vscode.LanguageModelChatMessage.Assistant([languageModelTextPart(historyText)]));
     const nextMissing = vscodeLmNextMissingRequiredOutput(stagedEdits);
+    const nextInstruction = nextMissing || forceStagedEdit
+      ? vscodeLmMissingRequiredStageInstruction(nextMissing, false)
+      : "Output only the next strict tool-request JSON or final edit-response JSON object.";
     messages.push(vscode.LanguageModelChatMessage.User(JSON.stringify({
       schema_id: VSCODE_LM_TOOL_RESULT_SCHEMA,
       name: envelope.name,
       result,
-      instruction: nextMissing
-        ? vscodeLmMissingRequiredStageInstruction(nextMissing, false)
-        : "Output only the next strict tool-request JSON or final edit-response JSON object.",
+      instruction: toolInputTooLarge
+        ? `This tool input was not executed. Split it into smaller bounded calls. ${nextInstruction}`
+        : nextInstruction,
     })));
   }
   throw vscodeLmProtocolFailure(
