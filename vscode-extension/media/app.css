@@ -1355,45 +1355,64 @@ main {
   font-size: var(--fs-2xs);
 }
 
-.wave-mini-roadmap-section {
+.wave-mini-roadmap-goals {
+  display: grid;
+  gap: 5px;
   margin-top: 8px;
+  font-size: var(--fs-xs);
 }
 
-.wave-mini-roadmap-section h4 {
-  margin: 0 0 4px;
-  color: var(--muted);
+.wave-goal {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+}
+
+.wave-goal-mark {
+  display: inline-grid;
+  flex: 0 0 auto;
+  width: 1.2em;
+  height: 1.2em;
+  margin-top: 1px;
+  place-items: center;
+  border: 1px solid currentColor;
+  border-radius: 3px;
+  color: var(--ink-soft);
+  font-size: var(--fs-2xs);
+  font-weight: 700;
+  line-height: 1;
+}
+
+.wave-goal-checked .wave-goal-mark {
+  color: var(--review);
+  background: var(--review-soft);
+}
+
+.wave-goal-unknown .wave-goal-mark {
+  color: var(--pending);
+  background: var(--pending-soft);
+}
+
+.wave-goal-label {
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow-wrap: anywhere;
+}
+
+.wave-goal-flag {
+  flex: 0 0 auto;
+  color: var(--pending);
   font-size: var(--fs-2xs);
   font-weight: 700;
 }
 
-.wave-mini-roadmap-goals,
-.wave-mini-roadmap-tasks {
-  margin: 0;
-  padding-left: 16px;
-  font-size: var(--fs-2xs);
-}
-
-.wave-mini-roadmap-goals li,
-.wave-mini-roadmap-tasks li {
-  margin: 2px 0;
-  overflow-wrap: anywhere;
-}
-
-.wave-mini-roadmap-task {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 8px;
-}
-
-.wave-mini-roadmap-task-id {
-  font-family: var(--vscode-editor-font-family, monospace);
-  user-select: text;
+.wave-goal-flag-blocked {
+  color: var(--blocked);
 }
 
 .wave-mini-roadmap-more {
   color: var(--muted);
-  list-style: none;
+  font-size: var(--fs-2xs);
 }
 
 .source-alert strong {

@@ -56,6 +56,7 @@ const state = {
   waveMiniRoadmapWaitingFor: null,
   waveMiniRoadmapRequested: false,
   waveMiniRoadmapGeneration: 0,
+  waveMiniRoadmapTaskStates: null,
   featureSettings: null,
   settingsPendingIdentity: null,
   settingsCollapsedFamilies: {},
@@ -493,28 +494,6 @@ function formatRelativeTime(value) {
   return `${Math.floor(hours / 24)}d ago`;
 }
 
-function canonicalStatus(task) {
-  if (String(task.archived_at || "").trim()) {
-    return "archived";
-  }
-  const status = String(task.status || "").trim().toLowerCase();
-  const worker = String(task.worker_status || "").trim().toLowerCase();
-  if (["finished", "completed", "stale_already_done"].includes(status) || worker === "done") {
-    return "finished";
-  }
-  if (status.startsWith("blocked") || worker.startsWith("blocked") || worker.startsWith("deferred")) {
-    return "blocked";
-  }
-  if (["review", "ready_for_review", "codex_review", "awaiting_review"].includes(status) ||
-      ["review", "ready_for_review", "codex_review", "awaiting_review"].includes(worker)) {
-    return "review";
-  }
-  if (["processing", "in_progress"].includes(status) || ["claimed", "in_progress"].includes(worker)) {
-    return "processing";
-  }
-  return "pending";
-}
-
 function flattenTasks(snapshot) {
   const byId = new Map();
   const groups = snapshot && snapshot.tasks ? snapshot.tasks : {};
@@ -878,44 +857,150 @@ function waveSelectActive(entries) {
 }
 
 const WAVE_COMPLETE_STATUSES = new Set(["finished", "accepted"]);
+const WAVE_UNRESOLVED_STATUSES = new Set(["missing", "unknown"]);
 
-function waveTaskCounts(tasks) {
-  const rows = Array.isArray(tasks) ? tasks : [];
-  const states = {};
-  let complete = 0;
-  for (const task of rows) {
-    const status = task && task.status ? String(task.status) : "unknown";
-    states[status] = (states[status] || 0) + 1;
-    if (WAVE_COMPLETE_STATUSES.has(status)) complete += 1;
-  }
-  return { complete, total: rows.length, states };
+function waveRowStatus(row) {
+  return row && typeof row.status === "string" ? row.status.trim().toLowerCase() : "";
 }
 
-// A finished/accepted count is only trustworthy when the task-status join is
-// complete: every linked task_id must have a matching task row with a non-empty
-// status. Missing or partial wave.tasks must fail closed to UNKNOWN.
-function waveTaskJoinComplete(wave) {
-  const taskIds = Array.isArray(wave && wave.task_ids) ? wave.task_ids : [];
-  if (taskIds.length === 0) return true;
-  const tasks = wave && wave.tasks;
-  if (!Array.isArray(tasks)) return false;
+// Canonical joined status: finished covers completed/stale_already_done status
+// or a done worker; blocked covers blocked*/deferred* workers.
+function canonicalStatus(task) {
+  if (String(task.archived_at || "").trim()) {
+    return "archived";
+  }
+  const status = String(task.status || "").trim().toLowerCase();
+  const worker = String(task.worker_status || "").trim().toLowerCase();
+  if (["finished", "completed", "stale_already_done"].includes(status) || worker === "done") {
+    return "finished";
+  }
+  if (status.startsWith("blocked") || worker.startsWith("blocked") || worker.startsWith("deferred")) {
+    return "blocked";
+  }
+  if (["review", "ready_for_review", "codex_review", "awaiting_review"].includes(status) ||
+      ["review", "ready_for_review", "codex_review", "awaiting_review"].includes(worker)) {
+    return "review";
+  }
+  if (["processing", "in_progress"].includes(status) || ["claimed", "in_progress"].includes(worker)) {
+    return "processing";
+  }
+  return "pending";
+}
+
+// provenance.wave_goals is [{id, label, task_ids}]; any other shape counts as absent.
+function waveGoalsFromDetail(detail) {
+  const provenance = detail && typeof detail.provenance === "object" ? detail.provenance : null;
+  return provenance && Array.isArray(provenance.wave_goals) ? provenance.wave_goals : null;
+}
+
+function waveTaskRowsById(taskRows) {
   const byId = new Map();
-  for (const task of tasks) {
-    if (!task || typeof task !== "object") continue;
-    const id = task.task_id === undefined || task.task_id === null
-      ? ""
-      : String(task.task_id);
-    byId.set(id, task);
+  for (const row of Array.isArray(taskRows) ? taskRows : []) {
+    if (!row || typeof row.task_id !== "string" || row.task_id === "") continue;
+    const rows = byId.get(row.task_id);
+    if (rows) rows.push(row);
+    else byId.set(row.task_id, [row]);
   }
-  for (const id of taskIds) {
-    const task = byId.get(String(id));
-    if (!task) return false;
-    const status = task.status === undefined || task.status === null
-      ? ""
-      : String(task.status).trim();
-    if (status.length === 0) return false;
+  return byId;
+}
+
+// Missing, duplicated, statusless or unreadable rows are unresolved; a duplicate that also holds a blocked row is unresolved_blocked.
+function waveTaskEvidence(rowsById, taskId) {
+  const rows = rowsById.get(taskId) || [];
+  if (rows.length !== 1) {
+    return rows.some((row) => canonicalStatus(row) === "blocked") ? "unresolved_blocked" : "unresolved";
   }
-  return true;
+  const row = rows[0];
+  const status = waveRowStatus(row);
+  if (status === "" || WAVE_UNRESOLVED_STATUSES.has(status)) return "unresolved";
+  if (WAVE_COMPLETE_STATUSES.has(status)) return "complete";
+  const canonical = canonicalStatus(row);
+  if (canonical === "finished") return "complete";
+  if (canonical === "blocked") return "blocked";
+  return "open";
+}
+
+// Checked needs at least one task and every one complete. A known unfinished task keeps the box open even beside unresolved evidence, which stays flagged UNKNOWN.
+function waveGoalState(goal, rowsById, duplicateId) {
+  const source = goal && typeof goal === "object" ? goal : {};
+  const label = typeof source.label === "string" ? source.label.trim() : "";
+  const listed = Array.isArray(source.task_ids) ? source.task_ids : [];
+  const taskIds = Array.from(new Set(listed.filter((id) => typeof id === "string" && id.trim() !== "")));
+  let unresolved = Boolean(duplicateId) || label === ""
+    || typeof source.id !== "string" || source.id.trim() === ""
+    || taskIds.length === 0 || taskIds.length !== listed.length;
+  let open = false;
+  let blocked = false;
+  for (const taskId of taskIds) {
+    const evidence = waveTaskEvidence(rowsById, taskId);
+    if (evidence === "unresolved" || evidence === "unresolved_blocked") unresolved = true;
+    if (evidence !== "complete" && evidence !== "unresolved") open = true;
+    if (evidence === "blocked" || evidence === "unresolved_blocked") blocked = true;
+  }
+  return {
+    label: label || "Unlabelled goal",
+    state: open ? "open" : unresolved ? "unknown" : "checked",
+    unresolved,
+    blocked,
+  };
+}
+
+function waveGoalChecklist(goals, taskRows) {
+  const rowsById = waveTaskRowsById(taskRows);
+  const goalKey = (goal) => (goal && typeof goal.id === "string" ? goal.id.trim() : "");
+  const idCounts = new Map();
+  for (const goal of goals) idCounts.set(goalKey(goal), (idCounts.get(goalKey(goal)) || 0) + 1);
+  const items = goals.map((goal) => waveGoalState(goal, rowsById, idCounts.get(goalKey(goal)) > 1));
+  let blockedTasks = 0;
+  for (const rows of rowsById.values()) {
+    if (rows.some((row) => canonicalStatus(row) === "blocked")) blockedTasks += 1;
+  }
+  return { items, blockedTasks };
+}
+
+// build_snapshot() ships task rows for active statuses only; these reach the webview solely as exact status_counts totals.
+const WAVE_ROWLESS_STATUSES = ["blocked", "superseded", "finished", "archived"];
+
+// What a snapshot says about task state: a status fingerprint per task row it carries, plus the rowless status totals.
+function waveTaskStates(snapshot, tasks) {
+  const rows = new Map();
+  for (const task of Array.isArray(tasks) ? tasks : []) {
+    if (!task || task.task_id === undefined || task.task_id === null) continue;
+    rows.set(String(task.task_id), `${task.status}|${task.worker_status}|${task.archived_at ? "archived" : ""}`);
+  }
+  const counts = snapshot && typeof snapshot.status_counts === "object" && snapshot.status_counts ? snapshot.status_counts : {};
+  const totals = WAVE_ROWLESS_STATUSES
+    .map((status) => `${status}=${Number.isFinite(counts[status]) ? counts[status] : "?"}`)
+    .join("|");
+  return { rows, totals };
+}
+
+// Task ids the active wave depends on; null while no active wave is known.
+function waveWatchedTaskIds(entries, detail) {
+  const wave = waveSelectActive(entries);
+  if (!wave) return null;
+  const ids = new Set();
+  const add = (list) => {
+    for (const id of Array.isArray(list) ? list : []) {
+      if (typeof id === "string") ids.add(id);
+    }
+  };
+  add(wave.task_ids);
+  if (detail && String(detail.id || "") === String(wave.id || "")) {
+    add(detail.task_ids);
+    for (const goal of waveGoalsFromDetail(detail) || []) add(goal && goal.task_ids);
+  }
+  return ids;
+}
+
+// Changed if a watched task's row moved, or a rowless status total moved (such a task leaves no row to compare).
+function waveTaskStatesChanged(before, after, watched) {
+  if (watched.size === 0) return false;
+  if (before.totals !== after.totals) return true;
+  for (const taskId of watched) {
+    if (before.rows.get(taskId) !== after.rows.get(taskId)) return true;
+  }
+  return false;
 }
 // ── wave-mini-roadmap-helpers-end ───────────────────────────────────────────
 
@@ -957,67 +1042,55 @@ function renderWaveMiniRoadmap(snapshot) {
     renderWaveMiniRoadmapState(
       content,
       "UNKNOWN",
-      "Wave detail is unavailable for the active wave; finished counts are unavailable",
+      "Wave detail is unavailable for the active wave; goal status is unavailable",
     );
     return;
   }
-  const taskIds = Array.isArray(detail.task_ids) && detail.task_ids.length
-    ? detail.task_ids
-    : asArray(listEntry.task_ids);
-  const tasks = detail.tasks !== undefined ? detail.tasks : detail.task_ids;
-  const wave = Object.assign({}, listEntry, detail, { task_ids: taskIds, tasks });
-  if (!waveTaskJoinComplete(wave)) {
-    renderWaveMiniRoadmapState(
-      content,
-      "UNKNOWN",
-      "Wave task statuses are incomplete; finished counts are unavailable",
-    );
+  const goals = waveGoalsFromDetail(detail);
+  if (!goals || goals.length === 0) {
+    renderWaveMiniRoadmapState(content, "UNKNOWN", "Wave goals are not recorded for the active wave");
     return;
   }
-  const taskRows = asArray(wave.tasks);
-  const counts = waveTaskCounts(taskRows);
-  const goalCap = 8;
-  const taskCap = 20;
+  const wave = Object.assign({}, listEntry, detail);
+  const { items, blockedTasks } = waveGoalChecklist(goals, detail.tasks);
+  const done = items.filter((item) => item.state === "checked").length;
+  const unknown = items.filter((item) => item.unresolved).length;
+  const summary = [`${done}/${items.length} goal${items.length === 1 ? "" : "s"} done`];
+  if (unknown) summary.push(`${unknown} UNKNOWN`);
+  if (blockedTasks) summary.push(`${blockedTasks} blocked task${blockedTasks === 1 ? "" : "s"}`);
+  const goalCap = 20;
+  const list = createElement("div", "wave-mini-roadmap-goals");
+  list.setAttribute("role", "group");
+  list.setAttribute("aria-label", "Wave goals");
+  for (const item of items.slice(0, goalCap)) list.appendChild(waveGoalRow(item));
+  if (items.length > goalCap) {
+    list.appendChild(createElement("div", "wave-mini-roadmap-more", `...${items.length - goalCap} more`));
+  }
   const fragment = document.createDocumentFragment();
   fragment.append(
     createElement("strong", "", "Wave mini-roadmap"),
     createElement("div", "wave-mini-roadmap-title", String(wave.title || wave.roadmap_id || wave.id || "Untitled wave")),
     createElement("div", "wave-mini-roadmap-milestone", String(wave.milestone || "No milestone")),
-    createElement("div", "wave-mini-roadmap-count", `${counts.complete}/${counts.total} finished`),
+    createElement("div", "wave-mini-roadmap-count", summary.join(" · ")),
+    list,
   );
-  const goals = asArray(wave.acceptance).filter((goal) => goal !== null && goal !== undefined && String(goal).trim() !== "");
-  if (goals.length) {
-    const section = createElement("div", "wave-mini-roadmap-section");
-    section.appendChild(createElement("h4", "", "Acceptance goals"));
-    const list = createElement("ul", "wave-mini-roadmap-goals");
-    for (const goal of goals.slice(0, goalCap)) {
-      list.appendChild(createElement("li", "", String(goal)));
-    }
-    if (goals.length > goalCap) {
-      list.appendChild(createElement("li", "wave-mini-roadmap-more", `...${goals.length - goalCap} more`));
-    }
-    section.appendChild(list);
-    fragment.appendChild(section);
-  }
-  const taskSection = createElement("div", "wave-mini-roadmap-section");
-  taskSection.appendChild(createElement("h4", "", `Tasks (${counts.complete}/${counts.total} finished)`));
-  const taskList = createElement("ul", "wave-mini-roadmap-tasks");
-  for (const task of taskRows.slice(0, taskCap)) {
-    const status = task && task.status ? String(task.status) : "unknown";
-    const complete = WAVE_COMPLETE_STATUSES.has(status);
-    const li = createElement("li", `wave-mini-roadmap-task ${complete ? "wave-task-complete" : "wave-task-incomplete"}`);
-    li.append(
-      createElement("span", "wave-mini-roadmap-task-id", String(task && task.task_id ? task.task_id : "unknown")),
-      createElement("span", `status-badge status-${status}`, status),
-    );
-    taskList.appendChild(li);
-  }
-  if (taskRows.length > taskCap) {
-    taskList.appendChild(createElement("li", "wave-mini-roadmap-more", `...${taskRows.length - taskCap} more`));
-  }
-  taskSection.appendChild(taskList);
-  fragment.appendChild(taskSection);
   content.replaceChildren(fragment);
+}
+
+function waveGoalRow(item) {
+  const row = createElement("div", `wave-goal wave-goal-${item.state}`);
+  row.setAttribute("role", "checkbox");
+  row.setAttribute("aria-checked", item.state === "checked" ? "true" : item.state === "unknown" ? "mixed" : "false");
+  row.setAttribute("aria-readonly", "true");
+  const mark = createElement("span", "wave-goal-mark", item.state === "checked" ? "✓" : item.state === "unknown" ? "?" : "");
+  mark.setAttribute("aria-hidden", "true");
+  const truncated = item.label.length > 160;
+  const label = createElement("span", "wave-goal-label", truncated ? `${item.label.slice(0, 159)}…` : item.label);
+  if (truncated) label.title = item.label;
+  row.append(mark, label);
+  if (item.unresolved) row.appendChild(createElement("span", "wave-goal-flag", "UNKNOWN"));
+  if (item.blocked) row.appendChild(createElement("span", "wave-goal-flag wave-goal-flag-blocked", "blocked"));
+  return row;
 }
 
 function renderWaveMiniRoadmapState(content, headline, reason) {
@@ -3154,6 +3227,7 @@ function requestWaveMiniRoadmap() {
   state.waveMiniRoadmapRequested = true;
   state.waveMiniRoadmapWaitingFor = null;
   state.waveMiniRoadmapGeneration = (state.waveMiniRoadmapGeneration || 0) + 1;
+  state.waveMiniRoadmapTaskStates = state.snapshot ? waveTaskStates(state.snapshot, state.tasks) : null;
   vscode.postMessage({
     type: "requestRoadmap",
     purpose: "waveMiniRoadmap",
@@ -3161,6 +3235,19 @@ function requestWaveMiniRoadmap() {
     includeArchived: false,
     waveGeneration: state.waveMiniRoadmapGeneration,
   });
+}
+
+// Open popover only: a task-state change the wave depends on restarts the generation-guarded cycle once.
+function refreshWaveMiniRoadmapOnTaskChange() {
+  if (!elements.waveMiniRoadmap || !elements.waveMiniRoadmap.open) return;
+  const current = waveTaskStates(state.snapshot, state.tasks);
+  const baseline = state.waveMiniRoadmapTaskStates;
+  if (!baseline) {
+    state.waveMiniRoadmapTaskStates = current;
+    return;
+  }
+  const watched = waveWatchedTaskIds(state.waveMiniRoadmapEntries, state.waveMiniRoadmapDetail);
+  if (watched && waveTaskStatesChanged(baseline, current, watched)) requestWaveMiniRoadmap();
 }
 
 // A per-popup monotonic generation tags each wave list/detail request; the
@@ -6619,6 +6706,7 @@ window.addEventListener("message", (event) => {
       break;
     case "snapshot":
       renderSnapshot(message.payload);
+      refreshWaveMiniRoadmapOnTaskChange();
       break;
     case "taskDetail":
       applyTaskDetail(message.payload);
