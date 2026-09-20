@@ -425,6 +425,7 @@ def test_vscode_launch_prefetch_accepts_parse_broken_rework_overlay(
             return {
                 "request_id": "R-prefetch",
                 "allowed_writes": ["src/changed.py"],
+                "required_outputs": ["src/changed.py"],
                 "role": "implementer",
                 "risk_tier": "high",
                 "work_kind": "architecture",
@@ -635,6 +636,7 @@ def test_vscode_launch_prefetch_accepts_parse_broken_rework_overlay(
     assert launched_card["work_kind"] == "architecture"
     assert launched_card["difficulty"] == "complex"
     assert bridge_kwargs["token_budget"] == {"cap_tokens": 2048}
+    assert bridge_kwargs["required_outputs"] == ["src/changed.py"]
     assert bridge_kwargs["source_graph_request"]["query"] == "src/changed.py"
     source_graph_result = dict(bridge_kwargs["source_graph_result"])
     assert source_graph_result["ok"] is True

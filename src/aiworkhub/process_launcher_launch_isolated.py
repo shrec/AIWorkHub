@@ -760,6 +760,7 @@ def launch_isolated(
                     prompt=prompt,
                     model=str(model or runtime_adapters.GLM_DEFAULT_MODEL),
                     allowed_writes=workspace.allowed_writes,
+                    required_outputs=card.get("required_outputs"),
                     workspace_parent_baseline=workspace.parent_baseline,
                     timeout_seconds=timeout_seconds,
                     source_graph_request=vscode_source_graph_request,
