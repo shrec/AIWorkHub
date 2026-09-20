@@ -475,6 +475,7 @@ from . import core
 from . import dashboard_mcp_app
 from . import deepseek_credentials
 from . import evidence_instruments
+from . import external_qualification
 from . import launch_queue_contract
 from . import launch_queue_persist
 from . import known_bug_scanner
@@ -4151,13 +4152,38 @@ def aiworkhub_contract_consistency_check() -> dict[str, Any]:
 
 @mcp.tool()
 def aiworkhub_source_graph_retrieval_eval() -> dict[str, Any]:
-    """READ-ONLY: run registered precision@k/MRR cases through manager MCP wrapper."""
+    """READ-ONLY: run registered precision@k/MRR cases through manager MCP wrapper.
+
+    Threads a real, repository-bound
+    ``external_qualification.canonical_acceptance_authority`` per declared
+    case attempt, so ``accepted_outcome_coverage`` is measured from canonical
+    task evidence instead of staying permanently pending.
+    """
+
+    repo_root = core.repo_root()
+
+    def _acceptance_authority_factory(task_id: str, request_id: str):
+        try:
+            card = task_store.get_task(repo_root, task_id)
+        except (task_store.TaskStoreError, OSError, ValueError, TypeError):
+            return None
+        if not isinstance(card, dict):
+            return None
+        try:
+            authority = external_qualification.canonical_acceptance_authority(
+                repo_root, card, task_id=task_id, request_id=request_id,
+            )
+        except ValueError:
+            return None
+        authority.current_card = card
+        return authority
 
     return evidence_instruments.source_graph_retrieval_eval(
-        core.repo_root(),
+        repo_root,
         query_fn=lambda **kwargs: manager_ai_tools.source_graph_query(
             **kwargs, compact_replay=False,
         ),
+        acceptance_authority_factory=_acceptance_authority_factory,
     )
 
 

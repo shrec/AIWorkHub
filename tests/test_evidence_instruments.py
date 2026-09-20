@@ -141,7 +141,7 @@ def test_retrieval_eval_measures_wrapper_rank(tmp_path: Path) -> None:
     assert report["mean_returned_bytes"] > 0
     assert report["mean_latency_ms"] >= 0
     assert report["p95_latency_ms"] >= 0
-    assert report["accepted_outcome_coverage"] == 0.0
+    assert report["accepted_outcome_coverage"] is None
     assert report["accepted_outcome_measurement_pending"] is True
     assert report["blocking"] is False
     assert report["cases"][0]["returned_bytes"] > 0
@@ -191,6 +191,453 @@ def test_retrieval_eval_fails_declared_quality_minimum(tmp_path: Path) -> None:
     assert report["status"] == "below_gate"
     assert report["blocking"] is True
     assert report["gate_failures"] == ["recall_at_k:0.0<1.0"]
+
+
+def test_retrieval_eval_accepted_outcome_coverage_reflects_authenticated_receipt(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / ".aiworkhub/source-graph-retrieval-eval.json"
+    config.parent.mkdir()
+    config.write_text(json.dumps({
+        "cases": [
+            {
+                "id": "authenticated", "query": "symbol", "mode": "focus", "k": 2,
+                "expected_paths": ["src/right.py"],
+                "accepted_outcome_task_id": "T1", "accepted_outcome_request_id": "r1",
+                "accepted_outcome_receipt": {"schema_id": "aiworkhub.accepted_outcome_receipt.v1"},
+            },
+            {
+                "id": "refused", "query": "symbol", "mode": "focus", "k": 2,
+                "expected_paths": ["src/right.py"],
+                "accepted_outcome_task_id": "T2", "accepted_outcome_request_id": "r2",
+                "accepted_outcome_receipt": {"schema_id": "tampered"},
+            },
+            {
+                "id": "missing_authority", "query": "symbol", "mode": "focus", "k": 2,
+                "expected_paths": ["src/right.py"],
+                "accepted_outcome_task_id": "T3", "accepted_outcome_request_id": "r3",
+                "accepted_outcome_receipt": {"schema_id": "aiworkhub.accepted_outcome_receipt.v1"},
+            },
+            {
+                "id": "not_claimed", "query": "symbol", "mode": "focus", "k": 2,
+                "expected_paths": ["src/right.py"],
+            },
+        ],
+    }), encoding="utf-8")
+
+    def query_fn(**_kwargs):
+        return {
+            "ok": True,
+            "content": json.dumps({"ranked_symbols": [{"file_path": "src/right.py"}]}),
+        }
+
+    def authority_factory(task_id: str, request_id: str):
+        if task_id == "T1":
+            return lambda receipt: (dict(receipt), "")
+        if task_id == "T2":
+            return lambda receipt: (None, "repository_revision_mismatch")
+        return None  # T3: no canonical evidence exists for this attempt
+
+    report = evidence.source_graph_retrieval_eval(
+        tmp_path, query_fn=query_fn, acceptance_authority_factory=authority_factory,
+    )
+
+    by_id = {row["id"]: row for row in report["cases"]}
+    assert by_id["authenticated"]["accepted_outcome_status"] == "accepted"
+    assert by_id["authenticated"]["accepted_outcome_observed"] is True
+    assert by_id["refused"]["accepted_outcome_status"] == "refused"
+    assert by_id["refused"]["accepted_outcome_observed"] is False
+    assert by_id["refused"]["accepted_outcome_reason"] == "repository_revision_mismatch"
+    assert by_id["missing_authority"]["accepted_outcome_status"] == "pending"
+    assert by_id["missing_authority"]["accepted_outcome_observed"] is False
+    assert by_id["not_claimed"]["accepted_outcome_status"] == "not_claimed"
+
+    # Coverage is computed only from the two definitively evaluated cases
+    # (one accepted, one refused) -- pending/not_claimed cases never dilute
+    # or zero it out, and it is a real fraction, not a hardcoded floor.
+    assert report["accepted_outcome_coverage"] == 0.5
+    assert report["accepted_outcome_measurement_pending"] is False
+    # accepted_outcome_coverage_measures_a_real_case: three cases declared a
+    # claim (authenticated, refused, missing_authority); the fourth declared
+    # nothing, so it never inflates the declared count.
+    assert report["accepted_outcome_claims_declared"] == 3
+    assert report["accepted_outcome_measurement_pending_reason"] is None
+
+
+def test_retrieval_eval_accepted_outcome_stays_pending_without_authority_factory(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / ".aiworkhub/source-graph-retrieval-eval.json"
+    config.parent.mkdir()
+    config.write_text(json.dumps({
+        "cases": [{
+            "id": "one", "query": "symbol", "mode": "focus", "k": 2,
+            "expected_paths": ["src/right.py"],
+            "accepted_outcome_task_id": "T1", "accepted_outcome_request_id": "r1",
+            "accepted_outcome_receipt": {"schema_id": "aiworkhub.accepted_outcome_receipt.v1"},
+        }],
+    }), encoding="utf-8")
+
+    report = evidence.source_graph_retrieval_eval(
+        tmp_path,
+        query_fn=lambda **_kwargs: {
+            "ok": True,
+            "content": json.dumps({"ranked_symbols": [{"file_path": "src/right.py"}]}),
+        },
+    )
+
+    assert report["cases"][0]["accepted_outcome_status"] == "pending"
+    assert report["accepted_outcome_coverage"] is None
+    assert report["accepted_outcome_measurement_pending"] is True
+    # The claim was declared (all three fields present); it just could not be
+    # authenticated -- a different, louder condition than nobody claiming
+    # anything at all.
+    assert report["accepted_outcome_claims_declared"] == 1
+    assert report["accepted_outcome_measurement_pending_reason"] == (
+        "declared_claims_present_but_none_authenticated"
+    )
+
+
+def test_retrieval_eval_zero_declaring_cases_is_reported_loudly(tmp_path: Path) -> None:
+    config = tmp_path / ".aiworkhub/source-graph-retrieval-eval.json"
+    config.parent.mkdir()
+    config.write_text(json.dumps({
+        "cases": [{
+            "id": "one", "query": "symbol", "mode": "focus", "k": 2,
+            "expected_paths": ["src/right.py"],
+        }],
+    }), encoding="utf-8")
+
+    report = evidence.source_graph_retrieval_eval(
+        tmp_path,
+        query_fn=lambda **_kwargs: {
+            "ok": True,
+            "content": json.dumps({"ranked_symbols": [{"file_path": "src/right.py"}]}),
+        },
+    )
+
+    # No case in the registry declares any accepted-outcome claim field at
+    # all: this must not read the same as a healthy "nothing to report yet".
+    assert report["accepted_outcome_claims_declared"] == 0
+    assert report["accepted_outcome_measurement_pending"] is True
+    assert report["accepted_outcome_measurement_pending_reason"] == (
+        "no_registered_case_declares_an_accepted_outcome_claim"
+    )
+
+
+def test_accepted_outcome_authority_exception_is_pending_not_refused(tmp_path: Path) -> None:
+    config = tmp_path / ".aiworkhub/source-graph-retrieval-eval.json"
+    config.parent.mkdir()
+    config.write_text(json.dumps({
+        "cases": [{
+            "id": "throws", "query": "symbol", "mode": "focus", "k": 2,
+            "expected_paths": ["src/right.py"],
+            "accepted_outcome_task_id": "T1", "accepted_outcome_request_id": "r1",
+            "accepted_outcome_receipt": {"schema_id": "aiworkhub.accepted_outcome_receipt.v1"},
+        }],
+    }), encoding="utf-8")
+
+    def authority_factory(task_id: str, request_id: str):
+        def _authority(receipt):
+            raise RuntimeError("authority backend unavailable")
+        return _authority
+
+    report = evidence.source_graph_retrieval_eval(
+        tmp_path,
+        query_fn=lambda **_kwargs: {
+            "ok": True,
+            "content": json.dumps({"ranked_symbols": [{"file_path": "src/right.py"}]}),
+        },
+        acceptance_authority_factory=authority_factory,
+    )
+
+    row = report["cases"][0]
+    # An authority that throws failed to answer; it never actively refused
+    # the receipt, so this must not count as a measured zero.
+    assert row["accepted_outcome_status"] == "pending"
+    assert row["accepted_outcome_observed"] is False
+    assert "acceptance_authority_error" in row["accepted_outcome_reason"]
+    assert report["accepted_outcome_coverage"] is None
+    assert report["accepted_outcome_measurement_pending"] is True
+
+
+def test_absent_or_stale_evidence_is_pending_not_refused(tmp_path: Path) -> None:
+    config = tmp_path / ".aiworkhub/source-graph-retrieval-eval.json"
+    config.parent.mkdir()
+    config.write_text(json.dumps({
+        "cases": [
+            {
+                "id": "evidence_never_sealed", "query": "symbol", "mode": "focus", "k": 2,
+                "expected_paths": ["src/right.py"],
+                "accepted_outcome_task_id": "T1", "accepted_outcome_request_id": "r1",
+                "accepted_outcome_receipt": {"schema_id": "aiworkhub.accepted_outcome_receipt.v1"},
+            },
+            {
+                "id": "promoted_file_edited_after_acceptance",
+                "query": "symbol", "mode": "focus", "k": 2,
+                "expected_paths": ["src/right.py"],
+                "accepted_outcome_task_id": "T2", "accepted_outcome_request_id": "r2",
+                "accepted_outcome_receipt": {"schema_id": "aiworkhub.accepted_outcome_receipt.v1"},
+            },
+            {
+                "id": "identity_tampered", "query": "symbol", "mode": "focus", "k": 2,
+                "expected_paths": ["src/right.py"],
+                "accepted_outcome_task_id": "T3", "accepted_outcome_request_id": "r3",
+                "accepted_outcome_receipt": {"schema_id": "aiworkhub.accepted_outcome_receipt.v1"},
+            },
+        ],
+    }), encoding="utf-8")
+
+    def authority_factory(task_id: str, request_id: str):
+        # The exact canonical reason strings task_engine's own receipt
+        # authority returns for each situation -- reused verbatim here so
+        # this test exercises the real vocabulary, not a stand-in for it.
+        if task_id == "T1":
+            return lambda receipt: (None, "accepted_outcome_receipt_sealed_evidence_missing")
+        if task_id == "T2":
+            return lambda receipt: (None, "accepted_outcome_receipt_canonical_hash_mismatch")
+        return lambda receipt: (None, "accepted_outcome_receipt_identity_mismatch")
+
+    report = evidence.source_graph_retrieval_eval(
+        tmp_path,
+        query_fn=lambda **_kwargs: {
+            "ok": True,
+            "content": json.dumps({"ranked_symbols": [{"file_path": "src/right.py"}]}),
+        },
+        acceptance_authority_factory=authority_factory,
+    )
+
+    by_id = {row["id"]: row for row in report["cases"]}
+    # Absent evidence (never sealed) and stale evidence (a promoted path
+    # edited since acceptance) are both "could not find or trust the
+    # evidence any more" -- pending, never a false-negative refusal.
+    assert by_id["evidence_never_sealed"]["accepted_outcome_status"] == "pending"
+    assert by_id["promoted_file_edited_after_acceptance"]["accepted_outcome_status"] == "pending"
+    # An actual identity/tamper rejection of the receipt itself is still
+    # refused.
+    assert by_id["identity_tampered"]["accepted_outcome_status"] == "refused"
+
+    # The one genuine rejection drives coverage; the two pending cases are
+    # excluded rather than silently counted as failures.
+    assert report["accepted_outcome_coverage"] == 0.0
+    assert report["accepted_outcome_measurement_pending"] is False
+
+
+def _sealed_current_card_and_receipt(
+    *,
+    task_id: str,
+    request_id: str,
+    card_claim_epoch: int,
+    receipt_claim_epoch: int,
+    receipt_base_oid: str = "b" * 40,
+    card_base_oid: str = "b" * 40,
+) -> tuple[dict[str, object], dict[str, object]]:
+    hashes = {"src/right.py": "a" * 64}
+    manifest = {"schema_id": "aiworkhub.attempt_artifact_manifest.v1", "entries": []}
+    manifest_id = hashlib.sha256(
+        json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    current_card = {
+        "claim_epoch": card_claim_epoch,
+        "terminal_review": {
+            "evidence": {
+                "changed_paths": ["src/right.py"],
+                "changed_path_hashes": hashes,
+                "attempt_artifact_manifest": manifest,
+                "workspace": {"base_oid": card_base_oid},
+            },
+        },
+    }
+    receipt = {
+        "schema_id": "aiworkhub.accepted_outcome_receipt.v1",
+        "task_id": task_id,
+        "request_id": request_id,
+        "claim_epoch": receipt_claim_epoch,
+        "base_oid": receipt_base_oid,
+        "promoted_paths": ["src/right.py"],
+        "changed_path_hashes": hashes,
+        "attempt_artifact_manifest_id": manifest_id,
+    }
+    return current_card, receipt
+
+
+def test_advanced_claim_epoch_does_not_publish_a_measured_zero(tmp_path: Path) -> None:
+    current_card, receipt = _sealed_current_card_and_receipt(
+        task_id="T1",
+        request_id="r1",
+        card_claim_epoch=4,
+        receipt_claim_epoch=3,
+    )
+    config = tmp_path / ".aiworkhub/source-graph-retrieval-eval.json"
+    config.parent.mkdir()
+    config.write_text(json.dumps({
+        "cases": [{
+            "id": "reclaimed", "query": "symbol", "mode": "focus", "k": 2,
+            "expected_paths": ["src/right.py"],
+            "accepted_outcome_task_id": "T1", "accepted_outcome_request_id": "r1",
+            "accepted_outcome_receipt": receipt,
+        }],
+    }), encoding="utf-8")
+
+    def authority_factory(task_id: str, request_id: str):
+        # The canonical authority folds an advanced claim_epoch -- the card
+        # was re-claimed after this receipt was sealed -- into the same
+        # identity_mismatch code it uses for a tampered receipt. Authenticated
+        # current-card evidence is what distinguishes that staleness from a
+        # same-task/same-request forged field.
+        def _authority(raw_receipt):
+            return None, "accepted_outcome_receipt_identity_mismatch"
+
+        _authority.current_card = current_card
+        return _authority
+
+    report = evidence.source_graph_retrieval_eval(
+        tmp_path,
+        query_fn=lambda **_kwargs: {
+            "ok": True,
+            "content": json.dumps({"ranked_symbols": [{"file_path": "src/right.py"}]}),
+        },
+        acceptance_authority_factory=authority_factory,
+    )
+
+    row = report["cases"][0]
+    # Authenticated current-card evidence shows only claim_epoch advanced,
+    # so a re-claim is stale evidence, not a forged claim.
+    assert row["accepted_outcome_status"] == "pending"
+    assert row["accepted_outcome_observed"] is False
+    assert row["accepted_outcome_reason"] == "accepted_outcome_receipt_identity_mismatch"
+    # A re-claim must never silently drop coverage to a measured 0.0.
+    assert report["accepted_outcome_coverage"] is None
+    assert report["accepted_outcome_measurement_pending"] is True
+
+
+def test_cross_task_identity_mismatch_still_refuses(tmp_path: Path) -> None:
+    config = tmp_path / ".aiworkhub/source-graph-retrieval-eval.json"
+    config.parent.mkdir()
+    config.write_text(json.dumps({
+        "cases": [{
+            "id": "foreign", "query": "symbol", "mode": "focus", "k": 2,
+            "expected_paths": ["src/right.py"],
+            "accepted_outcome_task_id": "T1", "accepted_outcome_request_id": "r1",
+            "accepted_outcome_receipt": {
+                "schema_id": "aiworkhub.accepted_outcome_receipt.v1",
+                "task_id": "T9-foreign-task", "request_id": "r1",
+            },
+        }],
+    }), encoding="utf-8")
+
+    def authority_factory(task_id: str, request_id: str):
+        return lambda receipt: (None, "accepted_outcome_receipt_identity_mismatch")
+
+    report = evidence.source_graph_retrieval_eval(
+        tmp_path,
+        query_fn=lambda **_kwargs: {
+            "ok": True,
+            "content": json.dumps({"ranked_symbols": [{"file_path": "src/right.py"}]}),
+        },
+        acceptance_authority_factory=authority_factory,
+    )
+
+    row = report["cases"][0]
+    # The receipt names a different task than the one it is declared
+    # against -- a genuine tampered/foreign-identity rejection.
+    assert row["accepted_outcome_status"] == "refused"
+    assert row["accepted_outcome_reason"] == "accepted_outcome_receipt_identity_mismatch"
+    assert report["accepted_outcome_coverage"] == 0.0
+    assert report["accepted_outcome_measurement_pending"] is False
+
+
+def test_same_task_same_request_tampered_expected_field_stays_refused(
+    tmp_path: Path,
+) -> None:
+    current_card, receipt = _sealed_current_card_and_receipt(
+        task_id="T1",
+        request_id="r1",
+        card_claim_epoch=3,
+        receipt_claim_epoch=3,
+        receipt_base_oid="c" * 40,
+        card_base_oid="b" * 40,
+    )
+    config = tmp_path / ".aiworkhub/source-graph-retrieval-eval.json"
+    config.parent.mkdir()
+    config.write_text(json.dumps({
+        "cases": [{
+            "id": "tampered_base_oid", "query": "symbol", "mode": "focus", "k": 2,
+            "expected_paths": ["src/right.py"],
+            "accepted_outcome_task_id": "T1", "accepted_outcome_request_id": "r1",
+            "accepted_outcome_receipt": receipt,
+        }],
+    }), encoding="utf-8")
+
+    def query_fn(**_kwargs):
+        return {
+            "ok": True,
+            "content": json.dumps({"ranked_symbols": [{"file_path": "src/right.py"}]}),
+        }
+
+    def authority_factory_with_card(task_id: str, request_id: str):
+        def _authority(raw_receipt):
+            return None, "accepted_outcome_receipt_identity_mismatch"
+
+        _authority.current_card = current_card
+        return _authority
+
+    report = evidence.source_graph_retrieval_eval(
+        tmp_path,
+        query_fn=query_fn,
+        acceptance_authority_factory=authority_factory_with_card,
+    )
+    row = report["cases"][0]
+    # Same task/request, but base_oid was forged against the current card.
+    assert row["accepted_outcome_status"] == "refused"
+    assert row["accepted_outcome_reason"] == "accepted_outcome_receipt_identity_mismatch"
+    assert report["accepted_outcome_coverage"] == 0.0
+    assert report["accepted_outcome_measurement_pending"] is False
+
+    def authority_factory_without_card(task_id: str, request_id: str):
+        return lambda raw_receipt: (None, "accepted_outcome_receipt_identity_mismatch")
+
+    closed = evidence.source_graph_retrieval_eval(
+        tmp_path,
+        query_fn=query_fn,
+        acceptance_authority_factory=authority_factory_without_card,
+    )
+    # Missing current-card evidence fails closed even when task_id/request_id
+    # still match -- it cannot be proved claim_epoch-only.
+    assert closed["cases"][0]["accepted_outcome_status"] == "refused"
+    assert closed["accepted_outcome_coverage"] == 0.0
+
+
+def test_accepted_outcome_incomplete_claim_is_named_not_conflated_with_no_claim(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / ".aiworkhub/source-graph-retrieval-eval.json"
+    config.parent.mkdir()
+    config.write_text(json.dumps({
+        "cases": [{
+            "id": "partial", "query": "symbol", "mode": "focus", "k": 2,
+            "expected_paths": ["src/right.py"],
+            "accepted_outcome_task_id": "T1",
+            "accepted_outcome_request_id": "r1",
+        }],
+    }), encoding="utf-8")
+
+    report = evidence.source_graph_retrieval_eval(
+        tmp_path,
+        query_fn=lambda **_kwargs: {
+            "ok": True,
+            "content": json.dumps({"ranked_symbols": [{"file_path": "src/right.py"}]}),
+        },
+        acceptance_authority_factory=lambda task_id, request_id: (
+            lambda receipt: (dict(receipt), "")
+        ),
+    )
+
+    row = report["cases"][0]
+    # task_id/request_id were declared but the receipt was not -- a malformed
+    # claim, distinct from a case that never claimed anything.
+    assert row["accepted_outcome_status"] == "not_claimed"
+    assert row["accepted_outcome_reason"] == "accepted_outcome_claim_incomplete"
 
 
 def test_ab_report_excludes_unobserved_and_measures_complete_pair(tmp_path: Path) -> None:

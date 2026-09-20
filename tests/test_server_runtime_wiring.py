@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -13,7 +14,7 @@ _SRC = Path(__file__).resolve().parents[1] / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from aiworkhub import core, process_launcher, server, task_store  # noqa: E402
+from aiworkhub import core, process_launcher, server, task_engine, task_store  # noqa: E402
 
 _NOW = "2026-07-20T00:00:00+00:00"
 
@@ -787,3 +788,323 @@ def test_write_command_classification_and_capability_scope(monkeypatch):
             runner="codex",
             coordinator_capability=True,
         )
+
+
+def test_source_graph_retrieval_eval_wires_real_canonical_acceptance_authority(
+    monkeypatch, tmp_path,
+):
+    """NF-2026-00864: the production MCP path must build a real,
+    repository-bound external_qualification.canonical_acceptance_authority
+    per declared case attempt -- not a test-only stand-in -- so that
+    accepted_outcome_coverage stops being a permanently-pending constant. A
+    garbage/tampered receipt is refused by the real canonical authority; a
+    task with no canonical evidence in the store stays pending; neither
+    corrupts the other's measurement."""
+
+    root = _init_lifecycle_repo(tmp_path)
+    monkeypatch.setattr(core, "repo_root", lambda: root)
+
+    runner = "claude_task_mcp_runtime_wiring"
+    topic = "task_mcp"
+    real_task_id = "RUNTIME_WIRING_RETRIEVAL_TASK"
+    _insert_lifecycle_task(root, real_task_id, runner, topic)
+
+    registry = root / ".aiworkhub" / "source-graph-retrieval-eval.json"
+    registry.write_text(json.dumps({
+        "cases": [
+            {
+                "id": "tampered",
+                "query": "symbol", "mode": "focus", "k": 2,
+                "expected_paths": ["src/right.py"],
+                "accepted_outcome_task_id": real_task_id,
+                "accepted_outcome_request_id": "req_tampered_1",
+                "accepted_outcome_receipt": {"schema_id": "forged"},
+            },
+            {
+                "id": "missing_task",
+                "query": "symbol", "mode": "focus", "k": 2,
+                "expected_paths": ["src/right.py"],
+                "accepted_outcome_task_id": "RUNTIME_WIRING_RETRIEVAL_TASK_MISSING",
+                "accepted_outcome_request_id": "req_missing_1",
+                "accepted_outcome_receipt": {"schema_id": "aiworkhub.accepted_outcome_receipt.v1"},
+            },
+        ],
+    }), encoding="utf-8")
+
+    calls = []
+    real_authority = server.external_qualification.canonical_acceptance_authority
+
+    def spy_authority(repo, card, *, task_id, request_id):
+        calls.append((Path(repo), dict(card) if isinstance(card, dict) else card, task_id, request_id))
+        return real_authority(repo, card, task_id=task_id, request_id=request_id)
+
+    monkeypatch.setattr(server.external_qualification, "canonical_acceptance_authority", spy_authority)
+    monkeypatch.setattr(
+        server.manager_ai_tools, "source_graph_query",
+        lambda **_kwargs: {
+            "ok": True,
+            "content": json.dumps({"ranked_symbols": [{"file_path": "src/right.py"}]}),
+        },
+    )
+
+    report = server.aiworkhub_source_graph_retrieval_eval()
+
+    # The real authority was invoked exactly once, with the real repo root
+    # and the real card task_store just stored for the one case whose task
+    # actually exists -- never a fixture double, and never invoked for the
+    # case whose task cannot be found.
+    assert len(calls) == 1
+    called_repo, called_card, called_task_id, called_request_id = calls[0]
+    assert called_repo == root
+    assert called_task_id == real_task_id
+    assert called_request_id == "req_tampered_1"
+    assert called_card["task_id"] == real_task_id
+
+    by_id = {row["id"]: row for row in report["cases"]}
+    assert by_id["tampered"]["accepted_outcome_status"] == "refused"
+    assert by_id["tampered"]["accepted_outcome_observed"] is False
+    assert by_id["tampered"]["accepted_outcome_reason"]
+
+    assert by_id["missing_task"]["accepted_outcome_status"] == "pending"
+    assert by_id["missing_task"]["accepted_outcome_observed"] is False
+
+    # Coverage is real: the one definitively-evaluated (refused) case drives
+    # it to 0.0 -- never a hardcoded floor -- and the pending case is
+    # excluded rather than silently counted as a failure.
+    assert report["accepted_outcome_coverage"] == 0.0
+    assert report["accepted_outcome_measurement_pending"] is False
+
+
+def test_source_graph_retrieval_eval_accepted_outcome_through_the_real_canonical_authority(
+    monkeypatch, tmp_path,
+):
+    """NF-2026-00864-r1: the wiring test above proves refusal and a missing
+    task both flow through the real canonical authority, but neither of its
+    cases ever authenticates -- so accepted_outcome_coverage has never been
+    observed leaving the permanently-pending state on an ordinary run. Build
+    one genuinely accepted attempt exactly the way a real acceptance would
+    produce it: real promoted bytes on disk, a card whose
+    terminal_review.evidence seals their hashes, and a receipt recomputed
+    with task_engine's own canonical digest -- then drive it through the
+    real, unstubbed external_qualification.canonical_acceptance_authority
+    and assert it authenticates."""
+
+    root = _init_lifecycle_repo(tmp_path)
+    monkeypatch.setattr(core, "repo_root", lambda: root)
+
+    runner = "claude_task_mcp_runtime_wiring"
+    topic = "task_mcp"
+    task_id = "RUNTIME_WIRING_RETRIEVAL_ACCEPTED_TASK"
+    request_id = "req_accepted_1"
+
+    promoted_relative = "accepted_case_evidence.txt"
+    (root / promoted_relative).write_text("genuinely accepted evidence\n", encoding="utf-8")
+    promoted_hash = hashlib.sha256((root / promoted_relative).read_bytes()).hexdigest()
+
+    base_oid = "b" * 40
+    claim_epoch = 3
+    manifest = {"schema_id": "aiworkhub.attempt_artifact_manifest.v1", "entries": []}
+    manifest_id = task_engine._canonical_json_hash(manifest)
+    changed_path_hashes = {promoted_relative: promoted_hash}
+
+    card_json = {
+        "claim_epoch": claim_epoch,
+        "terminal_review": {
+            "evidence": {
+                "changed_paths": [promoted_relative],
+                "changed_path_hashes": changed_path_hashes,
+                "attempt_artifact_manifest": manifest,
+                "workspace": {"base_oid": base_oid},
+            },
+        },
+    }
+
+    readiness = task_store.storage_readiness(root)
+    conn = sqlite3.connect(readiness.canonical_db)
+    try:
+        conn.execute(
+            "INSERT INTO tasks (task_id, runner, topic, mode, status, worker_status, priority, "
+            "objective, card_json, created_at, updated_at, claimed_by, origin_thread_id) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (task_id, runner, topic, "solo", "accepted", "accepted", "normal", "objective",
+             json.dumps(card_json), _NOW, _NOW, None, "runtime-wiring-thread"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # Recomputed the same way task_engine._validate_accepted_outcome_receipt
+    # recomputes it -- this is what makes the receipt genuine rather than
+    # hand-waved, since a hand-picked digest would simply be refused.
+    revision = "sha256:" + task_engine._canonical_json_hash({
+        "base_oid": base_oid, "changed_path_hashes": changed_path_hashes,
+    })
+    unsigned_receipt = {
+        "schema_id": task_engine.ACCEPTED_OUTCOME_RECEIPT_SCHEMA,
+        "task_id": task_id,
+        "request_id": request_id,
+        "claim_epoch": claim_epoch,
+        "base_oid": base_oid,
+        "promoted_paths": [promoted_relative],
+        "changed_path_hashes": changed_path_hashes,
+        "attempt_artifact_manifest_id": manifest_id,
+        "repository_revision": revision,
+    }
+    receipt_id = "sha256:" + task_engine._canonical_json_hash(unsigned_receipt)
+    receipt = {**unsigned_receipt, "receipt_id": receipt_id}
+
+    registry = root / ".aiworkhub" / "source-graph-retrieval-eval.json"
+    registry.write_text(json.dumps({
+        "cases": [{
+            "id": "accepted",
+            "query": "symbol", "mode": "focus", "k": 2,
+            "expected_paths": ["src/right.py"],
+            "accepted_outcome_task_id": task_id,
+            "accepted_outcome_request_id": request_id,
+            "accepted_outcome_receipt": receipt,
+        }],
+    }), encoding="utf-8")
+
+    # external_qualification.canonical_acceptance_authority is deliberately
+    # left unpatched here -- the point of this test is that the real
+    # authority, not a spy or a stand-in, authenticates the receipt.
+    monkeypatch.setattr(
+        server.manager_ai_tools, "source_graph_query",
+        lambda **_kwargs: {
+            "ok": True,
+            "content": json.dumps({"ranked_symbols": [{"file_path": "src/right.py"}]}),
+        },
+    )
+
+    report = server.aiworkhub_source_graph_retrieval_eval()
+
+    row = report["cases"][0]
+    assert row["accepted_outcome_status"] == "accepted"
+    assert row["accepted_outcome_observed"] is True
+    assert row["accepted_outcome_reason"] == ""
+
+    # Coverage is a real, observed fraction on an ordinary run -- not a
+    # hardcoded floor and no longer permanently pending.
+    assert report["accepted_outcome_coverage"] == 1.0
+    assert report["accepted_outcome_measurement_pending"] is False
+    assert report["accepted_outcome_claims_declared"] == 1
+    assert report["accepted_outcome_measurement_pending_reason"] is None
+
+
+def test_source_graph_retrieval_eval_same_task_tampered_field_stays_refused(
+    monkeypatch, tmp_path,
+):
+    """A same-task/same-request receipt that tampers base_oid must stay
+    refused through the real MCP path; claim_epoch-only staleness against
+    authenticated current-card evidence stays pending."""
+
+    root = _init_lifecycle_repo(tmp_path)
+    monkeypatch.setattr(core, "repo_root", lambda: root)
+
+    runner = "claude_task_mcp_runtime_wiring"
+    topic = "task_mcp"
+    promoted_relative = "accepted_case_evidence.txt"
+    (root / promoted_relative).write_text("genuinely accepted evidence\n", encoding="utf-8")
+    promoted_hash = hashlib.sha256((root / promoted_relative).read_bytes()).hexdigest()
+    base_oid = "b" * 40
+    manifest = {"schema_id": "aiworkhub.attempt_artifact_manifest.v1", "entries": []}
+    manifest_id = task_engine._canonical_json_hash(manifest)
+    changed_path_hashes = {promoted_relative: promoted_hash}
+    revision = "sha256:" + task_engine._canonical_json_hash({
+        "base_oid": base_oid, "changed_path_hashes": changed_path_hashes,
+    })
+
+    def _insert(task_id: str, claim_epoch: int) -> None:
+        card_json = {
+            "claim_epoch": claim_epoch,
+            "terminal_review": {
+                "evidence": {
+                    "changed_paths": [promoted_relative],
+                    "changed_path_hashes": changed_path_hashes,
+                    "attempt_artifact_manifest": manifest,
+                    "workspace": {"base_oid": base_oid},
+                },
+            },
+        }
+        readiness = task_store.storage_readiness(root)
+        conn = sqlite3.connect(readiness.canonical_db)
+        try:
+            conn.execute(
+                "INSERT INTO tasks (task_id, runner, topic, mode, status, worker_status, priority, "
+                "objective, card_json, created_at, updated_at, claimed_by, origin_thread_id) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (task_id, runner, topic, "solo", "accepted", "accepted", "normal", "objective",
+                 json.dumps(card_json), _NOW, _NOW, None, "runtime-wiring-thread"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _receipt(task_id: str, request_id: str, claim_epoch: int, receipt_base_oid: str) -> dict:
+        unsigned = {
+            "schema_id": task_engine.ACCEPTED_OUTCOME_RECEIPT_SCHEMA,
+            "task_id": task_id,
+            "request_id": request_id,
+            "claim_epoch": claim_epoch,
+            "base_oid": receipt_base_oid,
+            "promoted_paths": [promoted_relative],
+            "changed_path_hashes": changed_path_hashes,
+            "attempt_artifact_manifest_id": manifest_id,
+            "repository_revision": revision,
+        }
+        return {
+            **unsigned,
+            "receipt_id": "sha256:" + task_engine._canonical_json_hash(unsigned),
+        }
+
+    stale_task = "RUNTIME_WIRING_RETRIEVAL_STALE_EPOCH_TASK"
+    tamper_task = "RUNTIME_WIRING_RETRIEVAL_TAMPERED_OID_TASK"
+    _insert(stale_task, 4)
+    _insert(tamper_task, 3)
+
+    registry = root / ".aiworkhub" / "source-graph-retrieval-eval.json"
+    registry.write_text(json.dumps({
+        "cases": [
+            {
+                "id": "stale_claim_epoch",
+                "query": "symbol", "mode": "focus", "k": 2,
+                "expected_paths": ["src/right.py"],
+                "accepted_outcome_task_id": stale_task,
+                "accepted_outcome_request_id": "req_stale_1",
+                "accepted_outcome_receipt": _receipt(
+                    stale_task, "req_stale_1", 3, base_oid,
+                ),
+            },
+            {
+                "id": "tampered_base_oid",
+                "query": "symbol", "mode": "focus", "k": 2,
+                "expected_paths": ["src/right.py"],
+                "accepted_outcome_task_id": tamper_task,
+                "accepted_outcome_request_id": "req_tamper_1",
+                "accepted_outcome_receipt": _receipt(
+                    tamper_task, "req_tamper_1", 3, "c" * 40,
+                ),
+            },
+        ],
+    }), encoding="utf-8")
+
+    monkeypatch.setattr(
+        server.manager_ai_tools, "source_graph_query",
+        lambda **_kwargs: {
+            "ok": True,
+            "content": json.dumps({"ranked_symbols": [{"file_path": "src/right.py"}]}),
+        },
+    )
+
+    report = server.aiworkhub_source_graph_retrieval_eval()
+    by_id = {row["id"]: row for row in report["cases"]}
+    assert by_id["stale_claim_epoch"]["accepted_outcome_status"] == "pending"
+    assert by_id["stale_claim_epoch"]["accepted_outcome_reason"] == (
+        "accepted_outcome_receipt_identity_mismatch"
+    )
+    assert by_id["tampered_base_oid"]["accepted_outcome_status"] == "refused"
+    assert by_id["tampered_base_oid"]["accepted_outcome_reason"] == (
+        "accepted_outcome_receipt_identity_mismatch"
+    )
+    assert report["accepted_outcome_coverage"] == 0.0
+    assert report["accepted_outcome_measurement_pending"] is False

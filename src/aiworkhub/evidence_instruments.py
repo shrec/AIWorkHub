@@ -245,8 +245,26 @@ def source_graph_retrieval_eval(
     *,
     query_fn: Callable[..., Mapping[str, Any]],
     registry_path: str = ".aiworkhub/source-graph-retrieval-eval.json",
+    acceptance_authority_factory: Callable[
+        [str, str], Callable[[Mapping[str, Any]], tuple[dict[str, Any] | None, str]] | None
+    ] | None = None,
 ) -> dict[str, Any]:
-    """Measure bounded retrieval quality, payload bytes, and wrapper latency."""
+    """Measure bounded retrieval quality, payload bytes, latency, and
+    accepted-outcome coverage.
+
+    ``acceptance_authority_factory``, when supplied, is called with
+    ``(task_id, request_id)`` for any case that declares
+    ``accepted_outcome_task_id``/``accepted_outcome_request_id``/
+    ``accepted_outcome_receipt`` and must return a repository-bound
+    ``external_qualification.AcceptanceAuthority`` (or ``None`` when no
+    canonical evidence exists for that attempt). A case whose receipt the
+    authority authenticates counts as ``accepted``; one it actively refuses
+    (tampered, foreign-repository, identity mismatch) counts as ``refused``.
+    A case with no factory, no authority, or no declared receipt stays
+    ``pending``/``not_claimed`` and is excluded from
+    ``accepted_outcome_coverage`` -- missing evidence is never coerced into a
+    measured zero.
+    """
 
     root = Path(repo_root).resolve()
     candidate = _regular(root, registry_path, must_exist=False)
@@ -314,6 +332,9 @@ def source_graph_retrieval_eval(
         precision = len(relevant_ranks) / budget
         recall = len(relevant_ranks) / len(expected) if expected else 0.0
         reciprocal = 1.0 / min(relevant_ranks) if relevant_ranks else 0.0
+        outcome_status, outcome_observed, outcome_reason = _case_accepted_outcome(
+            case, acceptance_authority_factory
+        )
         rows.append({
             "id": str(case.get("id") or f"case-{index}"),
             "ok": bool(result.get("ok")),
@@ -326,7 +347,9 @@ def source_graph_retrieval_eval(
             "success_at_k": bool(relevant_ranks),
             "returned_bytes": returned_bytes,
             "latency_ms": round(elapsed_ms, 3),
-            "accepted_outcome_observed": False,
+            "accepted_outcome_observed": outcome_observed,
+            "accepted_outcome_status": outcome_status,
+            "accepted_outcome_reason": outcome_reason,
         })
     measured = bool(rows)
     ordered_latencies = sorted(row["latency_ms"] for row in rows)
@@ -345,6 +368,35 @@ def source_graph_retrieval_eval(
         for metric, minimum in minimums.items()
         if observed_metrics[metric] is None or observed_metrics[metric] < minimum
     ]
+    evaluated_outcomes = [
+        row for row in rows if row["accepted_outcome_status"] in ("accepted", "refused")
+    ]
+    accepted_outcome_coverage = (
+        round(
+            sum(1 for row in evaluated_outcomes if row["accepted_outcome_status"] == "accepted")
+            / len(evaluated_outcomes),
+            6,
+        )
+        if evaluated_outcomes else None
+    )
+    # A permanently-pending metric that looks identical to a healthy "nothing
+    # to report yet" is the exact defect class this instrument exists to
+    # end. Name the zero-declaring-registry condition explicitly so a
+    # forever-pending coverage cannot silently read as measured and fine.
+    accepted_outcome_claims_declared = sum(
+        1 for row in rows
+        if row["accepted_outcome_status"] != "not_claimed" or row["accepted_outcome_reason"]
+    )
+    if evaluated_outcomes:
+        accepted_outcome_measurement_pending_reason = None
+    elif accepted_outcome_claims_declared == 0:
+        accepted_outcome_measurement_pending_reason = (
+            "no_registered_case_declares_an_accepted_outcome_claim"
+        )
+    else:
+        accepted_outcome_measurement_pending_reason = (
+            "declared_claims_present_but_none_authenticated"
+        )
     return {
         "schema_id": "aiworkhub.source_graph_retrieval_eval.v1",
         "status": "below_gate" if gate_failures else ("measured" if measured else "inconclusive"),
@@ -359,13 +411,218 @@ def source_graph_retrieval_eval(
         "mean_returned_bytes": round(sum(row["returned_bytes"] for row in rows) / len(rows), 3) if rows else None,
         "mean_latency_ms": round(sum(row["latency_ms"] for row in rows) / len(rows), 3) if rows else None,
         "p95_latency_ms": ordered_latencies[p95_index] if rows else None,
-        "accepted_outcome_coverage": 0.0 if rows else None,
-        "accepted_outcome_measurement_pending": measured,
+        "accepted_outcome_coverage": accepted_outcome_coverage,
+        "accepted_outcome_measurement_pending": not evaluated_outcomes,
+        "accepted_outcome_claims_declared": accepted_outcome_claims_declared,
+        "accepted_outcome_measurement_pending_reason": accepted_outcome_measurement_pending_reason,
         "minimums": minimums,
         "gate_failures": gate_failures,
         "cases": rows,
         "causal_token_savings_claimed": False,
     }
+
+
+# The canonical authority's own refusal vocabulary
+# (``task_engine._validate_accepted_outcome_receipt``) conflates two very
+# different situations under one non-empty reason string: a receipt whose
+# *identity* the authority actively rejected (tampered field, foreign
+# repository, mismatched digest) and a receipt whose *evidence* the
+# authority simply could not find or trust any more (the card never sealed
+# terminal evidence, or a promoted path was edited after acceptance so its
+# on-disk bytes no longer match the sealed hash). Only the first is a
+# rejection of the claim; the second is exactly the "absent evidence" case
+# this module elsewhere refuses to coerce into a measured negative.
+_ACCEPTED_OUTCOME_ABSENT_OR_STALE_REASONS: frozenset[str] = frozenset({
+    "accepted_outcome_receipt_missing",
+    "accepted_outcome_receipt_sealed_evidence_missing",
+    "accepted_outcome_receipt_canonical_hash_mismatch",
+})
+
+# The one reason string this frozenset does *not* cover:
+# ``accepted_outcome_receipt_identity_mismatch`` itself folds a re-claimed
+# card's advanced ``claim_epoch`` into the very same code it uses for a
+# tampered or foreign-task receipt, because the canonical authority compares
+# its whole expected-field set in one pass. Adding that code to the frozenset
+# above would also excuse a receipt naming a different task or request, which
+# is a real identity rejection and must stay refused. Same-task/same-request
+# is not enough either: a forged receipt can keep those two fields and still
+# tamper ``base_oid``, ``changed_path_hashes``, or another expected field.
+# Pending is only claim_epoch-only staleness proved against authenticated
+# current-card evidence; anything else, including missing card evidence,
+# stays refused (fail closed).
+_ACCEPTED_OUTCOME_IDENTITY_MISMATCH_REASON = "accepted_outcome_receipt_identity_mismatch"
+_ACCEPTED_OUTCOME_IDENTITY_EXPECTED_FIELDS: tuple[str, ...] = (
+    "schema_id",
+    "task_id",
+    "request_id",
+    "claim_epoch",
+    "base_oid",
+    "promoted_paths",
+    "changed_path_hashes",
+    "attempt_artifact_manifest_id",
+)
+
+
+def _absent_or_stale_evidence_is_pending_not_refused(reason: str) -> bool:
+    """Report whether ``reason`` names evidence the authority never found or
+    trusted, rather than an identity/tamper rejection of the claim itself."""
+
+    return reason in _ACCEPTED_OUTCOME_ABSENT_OR_STALE_REASONS
+
+
+def _accepted_outcome_expected_identity_from_card(
+    card: Any, task_id: str, request_id: str
+) -> dict[str, Any] | None:
+    """Reconstruct the canonical expected-identity set from a current card.
+
+    Mirrors ``task_engine._validate_accepted_outcome_receipt``'s expected
+    dict so claim_epoch-only staleness can be distinguished without treating
+    every same-task identity_mismatch as pending. Incomplete sealed evidence
+    yields ``None`` and the caller fails closed.
+    """
+
+    if not isinstance(card, Mapping):
+        return None
+    terminal = card.get("terminal_review") or {}
+    if not isinstance(terminal, Mapping):
+        return None
+    sealed = terminal.get("evidence") or {}
+    if not isinstance(sealed, Mapping):
+        return None
+    hashes = sealed.get("changed_path_hashes")
+    manifest = sealed.get("attempt_artifact_manifest")
+    workspace = sealed.get("workspace") or {}
+    if (
+        not isinstance(hashes, dict)
+        or not isinstance(manifest, dict)
+        or not isinstance(workspace, Mapping)
+    ):
+        return None
+    try:
+        claim_epoch = int(card.get("claim_epoch") or 0)
+    except (TypeError, ValueError):
+        return None
+    return {
+        "schema_id": "aiworkhub.accepted_outcome_receipt.v1",
+        "task_id": task_id,
+        "request_id": request_id,
+        "claim_epoch": claim_epoch,
+        "base_oid": str(workspace.get("base_oid") or ""),
+        "promoted_paths": sorted(str(path) for path in (sealed.get("changed_paths") or [])),
+        "changed_path_hashes": hashes,
+        "attempt_artifact_manifest_id": hashlib.sha256(
+            json.dumps(
+                manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ).encode()
+        ).hexdigest(),
+    }
+
+
+def _stale_claim_epoch_is_pending_tampered_identity_stays_refused(
+    raw_receipt: Mapping[str, Any],
+    task_id: str,
+    request_id: str,
+    current_card: Any = None,
+) -> bool:
+    """Report whether identity_mismatch is claim_epoch-only staleness.
+
+    Pending only when authenticated current-card evidence shows every
+    expected identity field still matches except ``claim_epoch``, which the
+    card advanced after this receipt was sealed. A receipt that keeps
+    ``task_id``/``request_id`` but tampers another expected field, or a
+    mismatch with no current-card evidence, stays refused.
+    """
+
+    expected = _accepted_outcome_expected_identity_from_card(
+        current_card, task_id, request_id
+    )
+    if expected is None:
+        return False
+    if (
+        str(raw_receipt.get("task_id") or "") != task_id
+        or str(raw_receipt.get("request_id") or "") != request_id
+    ):
+        return False
+    mismatched = [
+        field
+        for field in _ACCEPTED_OUTCOME_IDENTITY_EXPECTED_FIELDS
+        if raw_receipt.get(field) != expected.get(field)
+    ]
+    if mismatched != ["claim_epoch"]:
+        return False
+    receipt_epoch = raw_receipt.get("claim_epoch")
+    expected_epoch = expected.get("claim_epoch")
+    return (
+        isinstance(receipt_epoch, int)
+        and not isinstance(receipt_epoch, bool)
+        and isinstance(expected_epoch, int)
+        and not isinstance(expected_epoch, bool)
+        and receipt_epoch < expected_epoch
+    )
+
+
+def _case_accepted_outcome(
+    case: Mapping[str, Any],
+    acceptance_authority_factory: Callable[
+        [str, str], Callable[[Mapping[str, Any]], tuple[dict[str, Any] | None, str]] | None
+    ] | None,
+) -> tuple[str, bool, str]:
+    """Authenticate one case's declared accepted-outcome receipt, if any.
+
+    Returns ``(status, observed, reason)``. ``status`` is one of
+    ``not_claimed`` (no receipt declared, or an incomplete/malformed claim --
+    named in ``reason`` rather than left indistinguishable from no claim at
+    all), ``pending`` (a claim was declared but no authority could
+    authenticate it -- missing factory, missing canonical task evidence, the
+    authority itself failed to answer, the authority found the receipt's
+    *evidence* absent or gone stale (see
+    ``_absent_or_stale_evidence_is_pending_not_refused``), or the authority
+    refused on identity while authenticated current-card evidence shows
+    claim_epoch-only staleness (see
+    ``_stale_claim_epoch_is_pending_tampered_identity_stays_refused``)),
+    ``accepted`` (the canonical authority authenticated the receipt), or
+    ``refused`` (the authority actively rejected the receipt's *identity*:
+    a different task, a different request, a tampered expected field, or a
+    digest mismatch). Only ``accepted``/``refused`` are evaluated outcomes;
+    the other two are excluded from ``accepted_outcome_coverage`` so an
+    absent signal never masquerades as a measured zero.
+    """
+
+    raw_receipt = case.get("accepted_outcome_receipt")
+    task_id = str(case.get("accepted_outcome_task_id") or "").strip()
+    request_id = str(case.get("accepted_outcome_request_id") or "").strip()
+    claim_attempted = raw_receipt is not None or bool(task_id) or bool(request_id)
+    if not isinstance(raw_receipt, Mapping) or not task_id or not request_id:
+        if claim_attempted:
+            return "not_claimed", False, "accepted_outcome_claim_incomplete"
+        return "not_claimed", False, ""
+    if acceptance_authority_factory is None:
+        return "pending", False, "acceptance_authority_not_supplied"
+    try:
+        authority = acceptance_authority_factory(task_id, request_id)
+    except Exception as exc:  # a broken factory must degrade, never crash the eval
+        return "pending", False, f"acceptance_authority_factory_error:{exc}"
+    if authority is None:
+        return "pending", False, "acceptance_authority_unavailable"
+    try:
+        authenticated, refusal_reason = authority(dict(raw_receipt))
+    except Exception as exc:  # an authority that throws failed to answer -- it never actively refused
+        return "pending", False, f"acceptance_authority_error:{exc}"
+    if authenticated is not None and not refusal_reason:
+        return "accepted", True, ""
+    if _absent_or_stale_evidence_is_pending_not_refused(refusal_reason):
+        return "pending", False, refusal_reason
+    if (
+        refusal_reason == _ACCEPTED_OUTCOME_IDENTITY_MISMATCH_REASON
+        and _stale_claim_epoch_is_pending_tampered_identity_stays_refused(
+            raw_receipt,
+            task_id,
+            request_id,
+            getattr(authority, "current_card", None),
+        )
+    ):
+        return "pending", False, refusal_reason
+    return "refused", False, refusal_reason or "acceptance_authority_refused"
 
 
 def _ranked_paths(value: Any) -> list[str]:
