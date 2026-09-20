@@ -6,6 +6,39 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.52] - 2026-09-20
+
+### Added
+
+- Semantic review scope is bounded to a candidate's exact changed segments:
+  reviewer prompts lead with the authenticated changed hunks, then only the
+  graph-connected callers and tests the scoped audit lists, then its explicit
+  known unknowns. Unchanged, previously-reviewed paths are recognized as
+  context rather than new review surface, and missing or stale changed-segment
+  evidence fails closed instead of supporting a clean result.
+- Source Graph adds a bounded LSP transport with fail-closed definition
+  classification (repo-internal, stdlib, dependency, unresolved, ambiguous,
+  server-unavailable) over a private workspace. This is the transport
+  foundation only; LSP index integration is not included.
+- The dashboard wave mini-roadmap renders the current wave's goals as a live
+  checklist joined to each goal's task states, instead of a static list.
+
+### Fixed
+
+- Blocked-rework recovery lets a strictly later terminal failure (a newer
+  claim epoch) supersede a stale retained predecessor, re-deriving the
+  predecessor from the failure's sealed delta instead of inheriting the
+  earlier episode's candidate (NF-2026-00515). A predecessor without a
+  trustworthy claim epoch is never superseded by failure history.
+
+### Not in this release
+
+- LSP index integration, the full stage-gated Playbook, reasoning matched to
+  an accepted outcome, and Muse/OpenCode worker qualification remain
+  incomplete. VS Code LM still records only the reasoning option sent and the
+  reported context capacity; a sent option is not proof of matched internal
+  reasoning effort.
+
 ## [0.11.51] - 2026-09-20
 
 ### Added

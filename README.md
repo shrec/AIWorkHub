@@ -62,6 +62,20 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
+## What's new in 0.11.52
+
+- Semantic review is now bounded to a candidate's exact changed segments and
+  fails closed on missing or stale changed-segment evidence.
+- Source Graph adds a bounded LSP transport with fail-closed definition
+  classification over a private workspace. LSP index integration is not
+  included in this release.
+- The dashboard wave mini-roadmap renders the current wave's goals as a live
+  checklist joined to each goal's task states.
+- Blocked-rework recovery lets a strictly later terminal failure supersede a
+  stale retained predecessor (NF-2026-00515).
+- The full stage-gated Playbook, reasoning matched to an accepted outcome, and
+  Muse/OpenCode worker qualification remain incomplete.
+
 ## What's new in 0.11.51
 
 - Repository-bound SDLC case receipts and exact task links are available through

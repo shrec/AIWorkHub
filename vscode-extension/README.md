@@ -14,6 +14,20 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.11.52
+
+- The wave mini-roadmap now shows the current wave's goals as a live checklist
+  joined to each goal's task states.
+- The bundled runtime bounds semantic review to a candidate's exact changed
+  segments and fails closed on missing or stale changed-segment evidence.
+- Source Graph ships a bounded LSP transport with fail-closed definition
+  classification over a private workspace. LSP index integration is not
+  included in this release.
+- Blocked-rework recovery lets a strictly later terminal failure supersede a
+  stale retained predecessor (NF-2026-00515).
+- The full stage-gated Playbook, reasoning matched to an accepted outcome, and
+  Muse/OpenCode worker qualification are still incomplete.
+
 ## What's new in 0.11.51
 
 - The bundled runtime exposes repository-bound SDLC case receipts and exact

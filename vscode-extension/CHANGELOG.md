@@ -1,5 +1,31 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.52 — 2026-09-20
+
+### Added
+
+- The wave mini-roadmap now shows the current wave's goals as a live checklist
+  joined to each goal's task states, rather than a static list.
+- Bundled runtime: semantic review scope is bounded to a candidate's exact
+  changed segments, leading with the authenticated changed hunks and only the
+  graph-connected callers and tests in the scoped audit, and failing closed on
+  missing or stale changed-segment evidence.
+- Bundled runtime: Source Graph ships a bounded LSP transport with fail-closed
+  definition classification over a private workspace. LSP index integration is
+  not included.
+
+### Fixed
+
+- Bundled runtime: blocked-rework recovery lets a strictly later terminal
+  failure supersede a stale retained predecessor, re-deriving the predecessor
+  from the failure's sealed delta (NF-2026-00515).
+
+### Not in this release
+
+- LSP index integration, the full stage-gated Playbook, reasoning matched to
+  an accepted outcome, and Muse/OpenCode worker qualification remain
+  incomplete.
+
 ## 0.11.51 — 2026-09-20
 
 ### Added
