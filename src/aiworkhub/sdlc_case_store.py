@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from aiworkhub.repository_state import inspect_repository
+from aiworkhub import task_store
 
 STAGES = ("plan", "design", "build", "test", "deploy", "maintain")
 STATES = frozenset({"ready", "blocked", "unknown", "not_applicable"})
@@ -17,6 +18,7 @@ MAX_PAYLOAD_BYTES = 16384
 MAX_SOURCE_REFS = 32
 MAX_REF_CHARS = 256
 MAX_LINKS = 16
+TASK_LINK_KEY = "task_id"
 
 
 class SdlcCaseConflict(Exception):
@@ -68,7 +70,15 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         "request_id TEXT NOT NULL,"
         "links_json TEXT NOT NULL,"
         "canonical_sha256 TEXT NOT NULL,"
-        "created_at TEXT NOT NULL)"
+        "created_at TEXT NOT NULL,"
+        "task_id TEXT)"
+    )
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(cases)")}
+    if "task_id" not in columns:
+        conn.execute("ALTER TABLE cases ADD COLUMN task_id TEXT")
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_cases_repo_task "
+        "ON cases(repo_id, task_id) WHERE task_id IS NOT NULL"
     )
     conn.execute(
         "CREATE TABLE IF NOT EXISTS stage_receipts ("
@@ -245,21 +255,50 @@ def create_case(
     }
     digest = _digest(canonical)
     path = _db_path(root)
+
+    # Resolve an existing case_id before any task verification so an exact
+    # replay stays idempotent even if the linked task was later retired, and a
+    # conflicting replay fails before touching the task store.
+    if path.is_file():
+        probe = _connect(path)
+        try:
+            try:
+                row = probe.execute(
+                    "SELECT request_id, links_json, canonical_sha256 FROM cases WHERE case_id=?",
+                    (case_id,),
+                ).fetchone()
+            except sqlite3.OperationalError:
+                # A schema-less file (empty or interrupted creation) has no
+                # cases table to replay; the write path initializes it below.
+                row = None
+        finally:
+            probe.close()
+        if row is not None:
+            if row["request_id"] == request_id and row["canonical_sha256"] == digest:
+                return {
+                    "case_id": case_id,
+                    "repo_id": repo_id,
+                    "request_id": request_id,
+                    "receipt_sha256": digest,
+                    "idempotent": True,
+                    "links": json.loads(row["links_json"]),
+                }
+            raise SdlcCaseConflict("request_id conflict")
+
+    task_id = _verify_task_link(root, links)
+
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = _connect(path)
     try:
         conn.execute("BEGIN IMMEDIATE")
         try:
             _ensure_schema(conn)
-            existing = conn.execute(
+            row = conn.execute(
                 "SELECT request_id, links_json, canonical_sha256 FROM cases WHERE case_id=?",
                 (case_id,),
             ).fetchone()
-            if existing is not None:
-                if (
-                    existing["request_id"] == request_id
-                    and existing["canonical_sha256"] == digest
-                ):
+            if row is not None:
+                if row["request_id"] == request_id and row["canonical_sha256"] == digest:
                     conn.execute("COMMIT")
                     return {
                         "case_id": case_id,
@@ -267,16 +306,27 @@ def create_case(
                         "request_id": request_id,
                         "receipt_sha256": digest,
                         "idempotent": True,
-                        "links": json.loads(existing["links_json"]),
+                        "links": json.loads(row["links_json"]),
                     }
                 raise SdlcCaseConflict("request_id conflict")
             conn.execute(
                 "INSERT INTO cases("
-                "case_id, repo_id, request_id, links_json, canonical_sha256, created_at"
-                ") VALUES (?, ?, ?, ?, ?, ?)",
-                (case_id, repo_id, request_id, _canonical_dumps(links), digest, _now()),
+                "case_id, repo_id, request_id, links_json, canonical_sha256, created_at, task_id"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    case_id,
+                    repo_id,
+                    request_id,
+                    _canonical_dumps(links),
+                    digest,
+                    _now(),
+                    task_id,
+                ),
             )
             conn.execute("COMMIT")
+        except sqlite3.IntegrityError:
+            conn.execute("ROLLBACK")
+            raise SdlcCaseConflict("task already bound") from None
         except Exception:
             conn.execute("ROLLBACK")
             raise
@@ -465,3 +515,56 @@ def stage_packet(
         return _effective_packet(conn, repo_id, case_id, stage, row)
     finally:
         conn.close()
+
+
+def _verify_task_link(root: Path, links: dict[str, str]) -> str | None:
+    task_id = links.get(TASK_LINK_KEY)
+    if task_id is None:
+        return None
+    task_id = _require_text(TASK_LINK_KEY, task_id)
+    try:
+        found = task_store.get_task(root, task_id)
+    except task_store.StorageNotReadyError as exc:
+        raise SdlcCaseValidationError(f"task store not ready: {exc}") from exc
+    if found is None:
+        raise SdlcCaseValidationError("task not found")
+    return task_id
+
+
+def _unknown_task_case(repo_id: str, task_id: str) -> dict[str, Any]:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "repo_id": repo_id,
+        "task_id": task_id,
+        "case_id": None,
+        "state": "unknown",
+        "links": {},
+        "stages": {},
+    }
+
+
+def case_for_task(repo_root: Path, repo_id: str, task_id: str) -> dict[str, Any]:
+    task_id = _require_text(TASK_LINK_KEY, task_id)
+    root = _require_repo_id(Path(repo_root), repo_id)
+    path = _db_path(root)
+    if not path.is_file():
+        return _unknown_task_case(repo_id, task_id)
+    conn = _connect(path)
+    try:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(cases)")}
+        if TASK_LINK_KEY not in columns:
+            return _unknown_task_case(repo_id, task_id)
+        rows = conn.execute(
+            "SELECT case_id FROM cases WHERE repo_id=? AND task_id=?",
+            (repo_id, task_id),
+        ).fetchall()
+    finally:
+        conn.close()
+    if not rows:
+        return _unknown_task_case(repo_id, task_id)
+    if len(rows) > 1:
+        raise SdlcCaseConflict("ambiguous task link")
+    packet = read_case(repo_root, repo_id, rows[0]["case_id"])
+    packet[TASK_LINK_KEY] = task_id
+    packet["state"] = "bound"
+    return packet
