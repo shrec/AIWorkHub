@@ -5051,6 +5051,7 @@ async function runVscodeLmTextProtocol(
   let stagedEditInstructionSent = false;
   let stagedEditMissingPathSent = "";
   const stagedEditFailure = { key: "", count: 0 };
+  const stageContextReads = new Map(); // At most two exact reads for each next required edit path.
   let lastMissingCreateRejectionIdentity = "";
   const protocolTrace = [];
   let lastProtocolPreview = "";
@@ -5381,7 +5382,21 @@ async function runVscodeLmTextProtocol(
       request, sourceGraphAcknowledged, forceStagedEdit,
     );
     const permitted = availableTools.find((tool) => tool.name === envelope.name);
-    if (!permitted) {
+    const nextRequired = forceStagedEdit ? vscodeLmNextMissingRequiredOutput(stagedEdits) : null;
+    const stageInput = envelope.input && typeof envelope.input === "object" &&
+      !Array.isArray(envelope.input) ? envelope.input : null;
+    // Forced staging still needs bounded context for a later required edit file.
+    // Permit only exact, read-only Source Graph access to that next file.
+    const stageTarget = nextRequired && nextRequired.path;
+    const stageRead = !permitted && nextRequired && nextRequired.action === "replace_range" &&
+      envelope.name === expectedSgTool && stageInput && stageInput.target === stageTarget &&
+      ((stageInput.mode === "file" && stageInput.query === stageTarget) ||
+        (stageInput.mode === "body" && typeof stageInput.query === "string" &&
+          stageInput.query.trim() && stageInput.query.length <= 512)) &&
+      (stageInput.budget === undefined ||
+        (Number.isInteger(stageInput.budget) && stageInput.budget > 0 && stageInput.budget <= 160)) &&
+      (stageContextReads.get(stageTarget) || 0) < 2;
+    if (!permitted && !stageRead) {
       // A non-stage tool request during forced staging is a phase violation, not
       // an authority violation. Correct it once without invoking MCP; a repeated
       // request fails with one bounded structured error.
@@ -5467,6 +5482,9 @@ async function runVscodeLmTextProtocol(
         actual_bytes: toolInputBytes,
         max_bytes: VSCODE_LM_MAX_EMULATED_TOOL_INPUT_BYTES,
       });
+    }
+    if (stageRead && !toolInputTooLarge) {
+      stageContextReads.set(stageTarget, (stageContextReads.get(stageTarget) || 0) + 1);
     }
     let result;
     let toolFailureReported = false;

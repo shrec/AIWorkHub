@@ -4920,7 +4920,104 @@ async function nf897EffortContextChecks() {
   assert.ok(String(nativeResult).length > 0);
 }
 
+async function nf651StageContextReadForNextRequiredFile() {
+  const first = "src/first.js";
+  const second = "src/second.js";
+  const request = {
+    requestId: "1".repeat(32),
+    request_kind: "worker",
+    prompt: "Edit both required files.",
+    allowedWrites: [first, second],
+    required_outputs: [first, second],
+    path_contracts: {
+      [first]: { action: "edit", current_sha256: "a".repeat(64), line_count: 1, parent_existed: true },
+      [second]: { action: "edit", current_sha256: "b".repeat(64), line_count: 1, parent_existed: true },
+    },
+    initial_source_graph_result: { ok: true, content: "prefetched graph" },
+  };
+  let stagedFirst = false;
+  let exactReads = 0;
+  let modelTurns = 0;
+  const toolRequest = (name, input) => JSON.stringify({
+    schema_id: internals.constants.VSCODE_LM_TOOL_REQUEST_SCHEMA, name, input,
+  });
+  const model = {
+    capabilities: { toolCalling: false },
+    sendRequest: async (messages) => {
+      modelTurns += 1;
+      const last = messages[messages.length - 1];
+      const instruction = last && last.role === "user" ? String(last.content) : "";
+      let value;
+      if (!stagedFirst && modelTurns >= 13 && instruction.includes("Required output " + first)) {
+        stagedFirst = true;
+        value = toolRequest("aiworkhub_manager_semantic_edit_stage", {
+          operation: "replace_range", file_path: first, start_line: 1, end_line: 1, new: "const first = 1;\n",
+        });
+      } else if (stagedFirst && exactReads === 0) {
+        value = toolRequest("aiworkhub_worker_source_graph_query", {
+          mode: "file", query: second, target: second, workflow_stage: "implementation",
+        });
+      } else if (stagedFirst) {
+        value = toolRequest("aiworkhub_manager_semantic_edit_stage", {
+          operation: "replace_range", file_path: second, start_line: 1, end_line: 1, new: "const second = 2;\n",
+        });
+      } else {
+        value = toolRequest("aiworkhub_worker_source_graph_query", {
+          mode: "focus", query: "orientation", workflow_stage: "implementation",
+        });
+      }
+      return { stream: (async function* stream() { yield { value }; }()) };
+    },
+  };
+  const final = JSON.parse(await internals.runVscodeLmTextProtocol(
+    model, request, undefined, async (call) => {
+      if (call.name === "aiworkhub_worker_source_graph_query" && call.input.target === second) exactReads += 1;
+      return { ok: true, content: "bounded graph" };
+    },
+  ));
+  assert.deepStrictEqual(final.edits.map((edit) => edit.path), [first, second]);
+  assert.strictEqual(exactReads, 1, "one exact next-output read must execute after a staged edit");
+  assert.ok(modelTurns < 24);
+  let repeatedTurns = 0;
+  let repeatedStage = false;
+  let repeatedExactReads = 0;
+  const repeatedModel = {
+    capabilities: { toolCalling: false },
+    sendRequest: async (messages) => {
+      repeatedTurns += 1;
+      const last = messages[messages.length - 1];
+      const instruction = last && last.role === "user" ? String(last.content) : "";
+      let value;
+      if (!repeatedStage && repeatedTurns >= 13 && instruction.includes("Required output " + first)) {
+        repeatedStage = true;
+        value = toolRequest("aiworkhub_manager_semantic_edit_stage", {
+          operation: "replace_range", file_path: first, start_line: 1, end_line: 1, new: "const first = 1;\n",
+        });
+      } else if (repeatedStage) {
+        value = toolRequest("aiworkhub_worker_source_graph_query", {
+          mode: "file", query: second, target: second, workflow_stage: "implementation",
+        });
+      } else {
+        value = toolRequest("aiworkhub_worker_source_graph_query", {
+          mode: "focus", query: "orientation", workflow_stage: "implementation",
+        });
+      }
+      return { stream: (async function* stream() { yield { value }; }()) };
+    },
+  };
+  await assert.rejects(
+    internals.runVscodeLmTextProtocol(repeatedModel, { ...request, requestId: "2".repeat(32) }, undefined,
+      async (call) => {
+        if (call.name === "aiworkhub_worker_source_graph_query" && call.input.target === second) repeatedExactReads += 1;
+        return { ok: true, content: "bounded graph" };
+      }),
+    /vscode_lm_semantic_edit_stage_required/,
+  );
+  assert.strictEqual(repeatedExactReads, 2, "exact next-output reads must be bounded per output");
+}
+
 async function main() {
+  await nf651StageContextReadForNextRequiredFile();
   await nf897EffortContextChecks();
   await nf831DirectFinalSubsetChecks();
   const schema = internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA;
