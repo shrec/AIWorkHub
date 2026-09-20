@@ -3924,12 +3924,53 @@ async function nf723StagedFinalizationCompletenessChecks() {
   assert.strictEqual(textResult.edits[0].path, editPath);
   assert.strictEqual(textResult.creates[0].path, createPath);
   assert.ok(textEditStaged);
-  const textAfterEdit = textTurns.find((instruction) =>
+  const createInstructions = textTurns.filter((instruction) =>
     instruction.includes("is still missing") && instruction.includes("operation create"));
-  assert.ok(textAfterEdit, "text protocol must name the missing create after the edit is staged");
+  assert.strictEqual(createInstructions.length, 1, "stage receipt must not be masked by a second bare instruction");
+  const textAfterEdit = createInstructions[0];
   assert.match(textAfterEdit, /operation create/);
+  const stagedReceipt = JSON.parse(textAfterEdit);
+  assert.strictEqual(stagedReceipt.schema_id, "aiworkhub.vscode_lm.tool_result.v1");
+  assert.strictEqual(stagedReceipt.name, stageName);
+  assert.strictEqual(stagedReceipt.result.ok, true);
+  assert.strictEqual(stagedReceipt.result.next_missing_path, createPath);
   assert.ok(!/Output ONLY one final /.test(textAfterEdit));
   assert.ok(!textTurns.some((instruction) => instruction.includes("The bounded tool/reasoning phase is complete")));
+
+  let forcedTurn = 0;
+  let forcedEditStaged = false;
+  let forcedCreateInput = "";
+  const forcedTextModel = {
+    capabilities: { toolCalling: false },
+    sendRequest: async (messages) => {
+      const instruction = lastUserText(messages);
+      let value;
+      if (!forcedEditStaged && !instruction.startsWith("{") &&
+          instruction.includes(`Required output ${editPath} is still missing`)) {
+        forcedEditStaged = true;
+        value = toolRequest(stageName, {
+          operation: "replace_range", file_path: editPath,
+          start_line: 1, end_line: 1, new: "const edited = true;\n",
+        });
+      } else if (forcedEditStaged) {
+        forcedCreateInput = instruction;
+        value = toolRequest(stageName, {
+          operation: "create", file_path: createPath, content: "module.exports = {};\n",
+        });
+      } else {
+        value = toolRequest("aiworkhub_worker_source_graph_query", {
+          mode: "focus", query: `forced-${forcedTurn++}`, workflow_stage: "implementation",
+        });
+      }
+      return { stream: (async function* stream() { yield { value }; }()) };
+    },
+  };
+  const forcedResult = JSON.parse(await runText(forcedTextModel));
+  assert.strictEqual(forcedResult.edits[0].path, editPath);
+  assert.strictEqual(forcedResult.creates[0].path, createPath);
+  const forcedReceipt = JSON.parse(forcedCreateInput);
+  assert.strictEqual(forcedReceipt.schema_id, "aiworkhub.vscode_lm.tool_result.v1");
+  assert.strictEqual(forcedReceipt.result.next_missing_path, createPath);
 
   let textRefuseTurns = 0;
   let textRefuseEditStaged = false;

@@ -5596,6 +5596,12 @@ async function runVscodeLmTextProtocol(
         ? `This tool input was not executed. Split it into smaller bounded calls. ${nextInstruction}`
         : nextInstruction,
     })));
+    if (envelope.name === VSCODE_LM_STAGE_EDIT_TOOL && result && result.ok === true && nextMissing) {
+      // The result envelope already carries the next stage instruction. Keep
+      // its receipt visible as the latest user turn instead of masking it.
+      stagedEditInstructionSent = true;
+      stagedEditMissingPathSent = vscodeLmForcedStageMissingKey(nextMissing);
+    }
   }
   throw vscodeLmProtocolFailure(
     request.request_kind === "quality_review"
