@@ -4820,6 +4820,44 @@ def aiworkhub_manager_sdlc_outcome_metrics(limit: int = 500) -> dict[str, Any]:
 
 
 @mcp.tool()
+def aiworkhub_manager_sdlc_case_create(
+    case_id: str, request_id: str, links: dict[str, str] | None = None
+) -> dict[str, Any]:
+    """Create one repository-bound SDLC case under verified manager authority."""
+    return core.sdlc_case_create(case_id=case_id, request_id=request_id, links=links or {})
+
+
+@mcp.tool()
+def aiworkhub_manager_sdlc_stage_record(
+    case_id: str,
+    stage: str,
+    state: str,
+    payload: dict[str, Any],
+    request_id: str,
+) -> dict[str, Any]:
+    """Append one bounded stage receipt under verified manager authority."""
+    return core.sdlc_stage_record(
+        case_id=case_id,
+        stage=stage,
+        state=state,
+        payload=payload,
+        request_id=request_id,
+    )
+
+
+@mcp.tool()
+def aiworkhub_manager_sdlc_case_get(case_id: str) -> dict[str, Any]:
+    """READ-ONLY: bounded repository-bound case packet."""
+    return core.sdlc_case_get(case_id=case_id)
+
+
+@mcp.tool()
+def aiworkhub_manager_sdlc_stage_packet(case_id: str, stage: str) -> dict[str, Any]:
+    """READ-ONLY: one bounded repository-bound stage packet."""
+    return core.sdlc_stage_packet(case_id=case_id, stage=stage)
+
+
+@mcp.tool()
 def needfix_preview_convert(
     needfix_id: str, task_plan: dict[str, Any] | None = None
 ) -> dict:

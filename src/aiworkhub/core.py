@@ -5054,6 +5054,135 @@ def create_task(
     return result
 
 
+def _sdlc_verified_repo() -> tuple[Any, str] | dict[str, Any]:
+    root = repo_root()
+    readiness = task_store.storage_readiness(root)
+    if not readiness.ready:
+        return _lifecycle_error(
+            f"canonical_task_store_not_ready:{readiness.reason}", 126
+        )
+    return root, readiness.repo_id
+
+
+def _sdlc_case_write_authority() -> dict[str, Any] | None:
+    identity = _claude_manager_identity() or _codex_manager_identity()
+    if identity is None:
+        return _lifecycle_error("manager_identity_required:sdlc_case", 126)
+    blocked = _canonical_write_gate("sdlc-case")
+    if blocked is not None:
+        return blocked
+    capability_ok, capability_reason = _verify_coordinator_capability(CODEX_RUNNER)
+    if not capability_ok:
+        return _lifecycle_error(capability_reason, 126)
+    return None
+
+
+def _sdlc_case_refusal(
+    exc: Exception,
+    *,
+    repo_id: str = "",
+    case_id: str = "",
+    stage: str = "",
+    state: str = "",
+) -> dict[str, Any]:
+    result: dict[str, Any] = {"ok": False, "reason": str(exc)}
+    if repo_id:
+        result["repo_id"] = repo_id
+    if case_id:
+        result["case_id"] = case_id
+    if stage:
+        result["stage"] = stage
+    if state:
+        result["state"] = state
+    return result
+
+
+def sdlc_case_create(
+    case_id: str, request_id: str, links: dict[str, str] | None = None
+) -> dict[str, Any]:
+    denied = _sdlc_case_write_authority()
+    if denied is not None:
+        return denied
+    binding = _sdlc_verified_repo()
+    if isinstance(binding, dict):
+        return binding
+    root, repo_id = binding
+    from . import sdlc_case_store
+
+    try:
+        receipt = sdlc_case_store.create_case(
+            root, repo_id, case_id, request_id, links or {}
+        )
+    except (
+        sdlc_case_store.SdlcCaseConflict,
+        sdlc_case_store.SdlcCaseValidationError,
+    ) as exc:
+        return _sdlc_case_refusal(exc, repo_id=repo_id, case_id=case_id)
+    return {"ok": True, **receipt}
+
+
+def sdlc_stage_record(
+    case_id: str,
+    stage: str,
+    state: str,
+    payload: dict[str, Any],
+    request_id: str,
+) -> dict[str, Any]:
+    denied = _sdlc_case_write_authority()
+    if denied is not None:
+        return denied
+    binding = _sdlc_verified_repo()
+    if isinstance(binding, dict):
+        return binding
+    root, repo_id = binding
+    from . import sdlc_case_store
+
+    try:
+        receipt = sdlc_case_store.append_stage(
+            root, repo_id, case_id, stage, state, payload or {}, request_id
+        )
+    except (
+        sdlc_case_store.SdlcCaseConflict,
+        sdlc_case_store.SdlcCaseValidationError,
+    ) as exc:
+        return _sdlc_case_refusal(
+            exc, repo_id=repo_id, case_id=case_id, stage=stage, state=state
+        )
+    return {"ok": True, **receipt}
+
+
+def sdlc_case_get(case_id: str) -> dict[str, Any]:
+    binding = _sdlc_verified_repo()
+    if isinstance(binding, dict):
+        return binding
+    root, repo_id = binding
+    from . import sdlc_case_store
+
+    try:
+        return sdlc_case_store.read_case(root, repo_id, case_id)
+    except (
+        sdlc_case_store.SdlcCaseConflict,
+        sdlc_case_store.SdlcCaseValidationError,
+    ) as exc:
+        return _sdlc_case_refusal(exc, repo_id=repo_id, case_id=case_id)
+
+
+def sdlc_stage_packet(case_id: str, stage: str) -> dict[str, Any]:
+    binding = _sdlc_verified_repo()
+    if isinstance(binding, dict):
+        return binding
+    root, repo_id = binding
+    from . import sdlc_case_store
+
+    try:
+        return sdlc_case_store.stage_packet(root, repo_id, case_id, stage)
+    except (
+        sdlc_case_store.SdlcCaseConflict,
+        sdlc_case_store.SdlcCaseValidationError,
+    ) as exc:
+        return _sdlc_case_refusal(exc, repo_id=repo_id, case_id=case_id, stage=stage)
+
+
 def mark_review(task_id: str, runner: str | None = None, topic: str | None = None) -> dict[str, Any]:
     """Request review for the exact task owner recorded on the live card.
 
