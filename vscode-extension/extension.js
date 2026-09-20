@@ -7522,14 +7522,11 @@ function isOwnedOpencodeMcpEntry(name, entry) {
 const CANONICAL_OPENCODE_MCP_SERVER_NAME = "awh";
 
 /** Pure repair of an in-memory opencode.json document: create or repair the
- * canonical AIWorkHub-owned entry to point at the host-stable launcher, and
- * strip only AIWorkHub-owned repository-identity keys from the environment of
- * EVERY AIWorkHub-owned entry.
- * Every other MCP entry, every non-`mcp` top-level key (permission, theme,
- * model, ...), and every other environment key already on an owned entry
- * (secrets, capability gates, backend selection) is left byte-for-byte
- * untouched. An existing `enabled` value is preserved so an operator can
- * still disable the entry. */
+ * canonical AIWorkHub-owned entry to point at the host-stable launcher, strip
+ * repository-identity keys from every AIWorkHub-owned entry, and disable the
+ * legacy "aiworkhub" alias only when it duplicates the enabled "awh" launcher.
+ * Other MCP entries, top-level keys, and unrelated environment keys are
+ * preserved. An operator-disabled canonical entry remains disabled. */
 function repairOpencodeConfigJsonObject(document, launcherArgs) {
   let changed = false;
   if (!document || typeof document !== "object" || Array.isArray(document)) {
@@ -7581,6 +7578,28 @@ function repairOpencodeConfigJsonObject(document, launcherArgs) {
   };
   if (JSON.stringify(next) !== JSON.stringify(existing)) {
     servers[name] = next;
+    changed = true;
+  }
+  // The legacy name and the short canonical alias publish the same tool set.
+  // Retire only the measured duplicate; MAX_PROCESSES changes capacity, not
+  // server identity, while permission/backend differences preserve separate use.
+  const legacy = servers.aiworkhub;
+  const legacyEnvironment = legacy && legacy.environment
+      && typeof legacy.environment === "object" && !Array.isArray(legacy.environment)
+    ? legacy.environment : {};
+  const environmentKeys = new Set([
+    ...Object.keys(nextEnvironment), ...Object.keys(legacyEnvironment),
+  ]);
+  environmentKeys.delete("AIWORKHUB_MAX_PROCESSES");
+  const sameEnvironment = [...environmentKeys].every((key) =>
+    Object.prototype.hasOwnProperty.call(legacyEnvironment, key)
+      === Object.prototype.hasOwnProperty.call(nextEnvironment, key)
+    && legacyEnvironment[key] === nextEnvironment[key]);
+  if (next.enabled && legacy && typeof legacy === "object" && !Array.isArray(legacy)
+      && legacy !== servers[name] && Array.isArray(legacy.command)
+      && JSON.stringify(legacy.command) === JSON.stringify(launcherArgs)
+      && sameEnvironment && legacy.enabled !== false) {
+    legacy.enabled = false;
     changed = true;
   }
   return { document, changed };

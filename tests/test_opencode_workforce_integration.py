@@ -600,6 +600,107 @@ def test_opencode_global_alias_does_not_migrate_existing_aiworkhub_entry(tmp_pat
     assert servers["awh"]["command"] == ["python3", "/new/launcher.py"]
 
 
+def test_opencode_global_mcp_repair_disables_duplicate_legacy_alias(tmp_path: Path) -> None:
+    result = _drive_extension_internals(
+        tmp_path,
+        """(internals) => internals.repairOpencodeConfigJsonObject({
+          mcp: {
+            awh: {
+              type: "local",
+              command: ["python3", "/launcher.py"],
+              enabled: true,
+              environment: {
+                AIWORKHUB_ALLOW_WRITES: "1",
+                AIWORKHUB_ALLOW_LAUNCH: "1",
+                AIWORKHUB_MCP_STDIO_BACKEND: "stdlib",
+                AIWORKHUB_MAX_PROCESSES: "32",
+              },
+            },
+            aiworkhub: {
+              type: "local",
+              command: ["python3", "/launcher.py"],
+              enabled: true,
+              environment: {
+                AIWORKHUB_ALLOW_WRITES: "1",
+                AIWORKHUB_ALLOW_LAUNCH: "1",
+                AIWORKHUB_MCP_STDIO_BACKEND: "stdlib",
+              },
+            },
+          },
+        }, ["python3", "/launcher.py"])""",
+    )
+    servers = result["document"]["mcp"]
+    assert result["changed"] is True
+    assert servers["awh"]["enabled"] is True
+    assert servers["aiworkhub"]["enabled"] is False
+    assert servers["aiworkhub"]["command"] == ["python3", "/launcher.py"]
+    assert servers["aiworkhub"]["environment"] == {
+        "AIWORKHUB_ALLOW_WRITES": "1",
+        "AIWORKHUB_ALLOW_LAUNCH": "1",
+        "AIWORKHUB_MCP_STDIO_BACKEND": "stdlib",
+    }
+
+
+def test_opencode_global_mcp_repair_keeps_distinct_legacy_launcher_enabled(tmp_path: Path) -> None:
+    result = _drive_extension_internals(
+        tmp_path,
+        """(internals) => internals.repairOpencodeConfigJsonObject({
+          mcp: {
+            aiworkhub: {
+              type: "local",
+              command: ["python3", "/separate-launcher.py"],
+              enabled: true,
+              environment: { KEEP: "separate" },
+            },
+          },
+        }, ["python3", "/canonical-launcher.py"])""",
+    )
+    servers = result["document"]["mcp"]
+    assert servers["awh"]["enabled"] is True
+    assert servers["aiworkhub"] == {
+        "type": "local",
+        "command": ["python3", "/separate-launcher.py"],
+        "enabled": True,
+        "environment": {"KEEP": "separate"},
+    }
+
+
+def test_opencode_global_mcp_repair_preserves_same_launcher_with_distinct_permissions(
+    tmp_path: Path,
+) -> None:
+    result = _drive_extension_internals(
+        tmp_path,
+        """(internals) => internals.repairOpencodeConfigJsonObject({
+          mcp: {
+            awh: {
+              type: "local",
+              command: ["python3", "/launcher.py"],
+              enabled: true,
+              environment: {
+                AIWORKHUB_ALLOW_WRITES: "1",
+                AIWORKHUB_ALLOW_LAUNCH: "1",
+                AIWORKHUB_MCP_STDIO_BACKEND: "stdlib",
+              },
+            },
+            aiworkhub: {
+              type: "local",
+              command: ["python3", "/launcher.py"],
+              enabled: true,
+              environment: {
+                AIWORKHUB_ALLOW_WRITES: "0",
+                AIWORKHUB_ALLOW_LAUNCH: "1",
+                AIWORKHUB_MCP_STDIO_BACKEND: "stdlib",
+              },
+            },
+          },
+        }, ["python3", "/launcher.py"])""",
+    )
+    servers = result["document"]["mcp"]
+    assert servers["awh"]["enabled"] is True
+    assert servers["aiworkhub"]["enabled"] is True
+    assert servers["aiworkhub"]["environment"]["AIWORKHUB_ALLOW_WRITES"] == "0"
+
+
 def test_opencode_global_mcp_repair_is_idempotent(tmp_path: Path) -> None:
     result = _drive_extension_internals(
         tmp_path,
