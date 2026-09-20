@@ -1004,6 +1004,7 @@ def create_request(
         "schema_id": "aiworkhub.vscode_lm.worker_spec.v1",
         "request_id": request_id,
         "repo_id": repo_id,
+        "model": model,
         "workspace_path": str(workspace_path),
         "response_path": str(response_path),
         "cancel_path": str(cancel_path),

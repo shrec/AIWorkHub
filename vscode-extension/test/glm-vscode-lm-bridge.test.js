@@ -4959,6 +4959,455 @@ async function nf897EffortContextChecks() {
   assert.ok(nativeCaptured.length >= 1);
   assert.deepStrictEqual(nativeCaptured[0].modelOptions, { reasoningEffort: "high" });
   assert.ok(String(nativeResult).length > 0);
+  await nf925ReasoningContextAttemptChecks();
+}
+
+async function nf925ReasoningContextAttemptChecks() {
+  const schemaId = "aiworkhub.reasoning_context_attempt.v1";
+  assert.strictEqual(internals.constants.VSCODE_LM_REASONING_CONTEXT_ATTEMPT_SCHEMA, schemaId);
+  const policyDecision = (profile) => ({
+    schema_id: "aiworkhub.reasoning_policy.decision.v1",
+    profile,
+    request: {
+      role: "implementer",
+      risk_tier: "medium",
+      work_kind: "repository_coding",
+      difficulty: "standard",
+      provider_family: "glm",
+    },
+    route_effort: { status: "unsupported", applied: false, applied_key: null },
+  });
+  const highDecision = policyDecision("canonical_high");
+  const effort = { effortOptionKey: "reasoningEffort", effortKeys: ["low", "medium", "high", "xhigh"] };
+  const finalResponse = JSON.stringify({
+    schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+    summary: "nf925 receipt",
+    edits: [],
+    creates: [],
+  });
+  const toolEnvelope = JSON.stringify({
+    schema_id: internals.constants.VSCODE_LM_TOOL_REQUEST_SCHEMA,
+    name: "aiworkhub_worker_session_current_state",
+    input: { limit: 1 },
+  });
+  const streamOf = (...parts) => ({
+    stream: (async function* stream() { for (const part of parts) yield part; }()),
+  });
+  const settle = () => new Promise((resolve) => setImmediate(resolve));
+  const glmIdentity = { id: "glm-5.2", family: "glm-5.2", name: "GLM-5.2", vendor: "customendpoint", version: "1.0.0" };
+  const boundaryModel = { ...glmIdentity, maxInputTokens: 128000, capabilities: { toolCalling: false, ...effort } };
+  const boundaryRequest = { requestId: "a".repeat(32), request_kind: "worker", reasoning_decision: highDecision };
+  const boundaryIdentity = { requestId: "a".repeat(32), repoId: `repo_${"a".repeat(32)}`, requestedModel: "glm-5.2" };
+  const newRecorder = (model = boundaryModel, request = boundaryRequest, identity = boundaryIdentity) =>
+    internals.createVscodeLmSendReceiptRecorder(request, model, identity);
+  const expectedReceipt = (overrides = {}) => ({
+    schema_id: schemaId,
+    request_id: boundaryIdentity.requestId,
+    repo_id: boundaryIdentity.repoId,
+    requested_model: "glm-5.2",
+    host_model: glmIdentity,
+    requested_profile: "canonical_high",
+    send_state: "sent",
+    send_turn_count: 1,
+    provider_request_acknowledged: true,
+    option_status: "applied",
+    option_key: "reasoningEffort",
+    option_value: "high",
+    context_capacity_tokens: 128000,
+    context_capacity_source: "model.maxInputTokens",
+    provider_internal_state: "unknown",
+    unknown_reason: null,
+    ...overrides,
+  });
+  const notSentReceipt = (overrides = {}) => expectedReceipt({
+    send_state: "not_sent",
+    send_turn_count: 0,
+    provider_request_acknowledged: false,
+    option_status: "not_sent",
+    option_key: null,
+    option_value: null,
+    ...overrides,
+  });
+
+  // An attempt that never reached sendRequest is not_sent and carries no option.
+  assert.deepStrictEqual(newRecorder().snapshot(), notSentReceipt());
+  assert.ok(
+    !Object.keys(newRecorder().snapshot()).some((key) => /budget|spend|price|quota/i.test(key)),
+    "context capacity is never relabeled as a spend or token budget",
+  );
+
+  // The real send boundary: the option is captured when model.sendRequest is
+  // invoked, a single-flight replay is not a second send, and a pending call
+  // is not provider-acknowledged.
+  internals.clearVscodeLmInFlightCalls();
+  const boundaryMessages = [{ role: "user", content: "nf925 boundary" }];
+  const boundaryOptions = internals.vscodeLmLanguageModelRequestOptions(boundaryModel, boundaryRequest);
+  const boundarySent = [];
+  let resolveBoundaryProvider;
+  const pendingModel = {
+    ...boundaryModel,
+    sendRequest: (_messages, options) => {
+      boundarySent.push(options);
+      return new Promise((resolve) => { resolveBoundaryProvider = resolve; });
+    },
+  };
+  const pendingRecorder = newRecorder(pendingModel);
+  const pendingCall = internals.dedupeVscodeLmSendRequest(
+    pendingModel, boundaryMessages, boundaryOptions, undefined, "nf925-boundary", 0, pendingRecorder,
+  );
+  const replayedCall = internals.dedupeVscodeLmSendRequest(
+    pendingModel, boundaryMessages, boundaryOptions, undefined, "nf925-boundary", 0, pendingRecorder,
+  );
+  assert.strictEqual(replayedCall, pendingCall, "a single-flight replay is not a second send");
+  assert.strictEqual(boundarySent.length, 1);
+  assert.deepStrictEqual(boundarySent[0].modelOptions, { reasoningEffort: "high" });
+  assert.deepStrictEqual(
+    pendingRecorder.snapshot(),
+    expectedReceipt({ provider_request_acknowledged: false }),
+    "a send in flight records the exact sent option and does not claim acknowledgement",
+  );
+  resolveBoundaryProvider(streamOf());
+  await pendingCall.promise;
+  assert.deepStrictEqual(pendingRecorder.snapshot(), expectedReceipt());
+  internals.clearVscodeLmInFlightCalls();
+
+  const syncFailureRecorder = newRecorder();
+  assert.throws(
+    () => internals.dedupeVscodeLmSendRequest(
+      { ...boundaryModel, sendRequest: () => { throw new Error("sync_send_failed"); } },
+      boundaryMessages, boundaryOptions, undefined, "nf925-sync", 0, syncFailureRecorder,
+    ),
+    /sync_send_failed/,
+  );
+  assert.deepStrictEqual(
+    syncFailureRecorder.snapshot(),
+    expectedReceipt({ provider_request_acknowledged: false }),
+    "a send that throws was attempted with this option but is never provider-acknowledged",
+  );
+  const rejectFailureRecorder = newRecorder();
+  const rejectedCall = internals.dedupeVscodeLmSendRequest(
+    { ...boundaryModel, sendRequest: async () => { throw new Error("async_send_failed"); } },
+    boundaryMessages, boundaryOptions, undefined, "nf925-reject", 0, rejectFailureRecorder,
+  );
+  await assert.rejects(rejectedCall.promise, /async_send_failed/);
+  await settle();
+  assert.deepStrictEqual(
+    rejectFailureRecorder.snapshot(),
+    expectedReceipt({ provider_request_acknowledged: false }),
+  );
+  internals.clearVscodeLmInFlightCalls();
+
+  // Options that were actually sent, not options that were merely computed.
+  const optionCases = [
+    ["option_shape_unrecognized", boundaryModel, { justification: "x", modelOptions: { reasoningEffort: "high", other: "x" } }],
+    ["option_shape_unrecognized", boundaryModel, { justification: "x", modelOptions: { reasoningEffort: 5 } }],
+    ["option_shape_unrecognized", boundaryModel, { justification: "x", modelOptions: { reasoningEffort: "h".repeat(65) } }],
+    ["option_shape_unrecognized", boundaryModel, { justification: "x", modelOptions: [] }],
+    ["sent_option_disagrees_with_effort_status", boundaryModel, { justification: "x", modelOptions: { reasoningEffort: "xhigh" } }],
+    ["sent_option_disagrees_with_effort_status", boundaryModel, { justification: "x" }],
+    [
+      "sent_option_disagrees_with_effort_status",
+      { ...boundaryModel, capabilities: { toolCalling: false } },
+      { justification: "x", modelOptions: { reasoningEffort: "high" } },
+    ],
+  ];
+  for (const [reason, model, options] of optionCases) {
+    const recorder = newRecorder(model);
+    recorder.recordSend(model, options);
+    const receipt = recorder.snapshot();
+    assert.strictEqual(receipt.send_state, "sent", reason);
+    assert.strictEqual(receipt.option_status, "unknown", reason);
+    assert.strictEqual(receipt.unknown_reason, reason);
+    assert.strictEqual(receipt.option_key, null, reason);
+    assert.strictEqual(receipt.option_value, null, reason);
+  }
+  const bounded = newRecorder();
+  for (let index = 0; index <= internals.constants.VSCODE_LM_ATTEMPT_MAX_SEND_TURNS; index += 1) {
+    bounded.recordSend(boundaryModel, boundaryOptions);
+  }
+  const boundedReceipt = bounded.snapshot();
+  assert.strictEqual(boundedReceipt.send_turn_count, internals.constants.VSCODE_LM_ATTEMPT_MAX_SEND_TURNS);
+  assert.strictEqual(boundedReceipt.option_status, "unknown");
+  assert.strictEqual(boundedReceipt.unknown_reason, "send_turn_count_out_of_bounds");
+
+  // A declared control that cannot honor the profile sends no option and invents none.
+  for (const [status, effortKeys] of [["capability_ceiling", ["low"]], ["unverifiable", ["alpha", "beta"]]]) {
+    const limitedModel = {
+      ...boundaryModel,
+      capabilities: { toolCalling: false, effortOptionKey: "reasoningEffort", effortKeys },
+    };
+    const limitedOptions = internals.vscodeLmLanguageModelRequestOptions(limitedModel, boundaryRequest);
+    assert.ok(!Object.prototype.hasOwnProperty.call(limitedOptions, "modelOptions"), status);
+    const limitedRecorder = newRecorder(limitedModel);
+    limitedRecorder.recordSend(limitedModel, limitedOptions);
+    limitedRecorder.recordAcknowledged();
+    assert.deepStrictEqual(
+      limitedRecorder.snapshot(),
+      expectedReceipt({ option_status: status, option_key: null, option_value: null }),
+      status,
+    );
+  }
+
+  // Context capacity always names its source and never becomes a budget.
+  const noCapacityModel = { ...boundaryModel, maxInputTokens: undefined };
+  const fallbackRequest = { ...boundaryRequest, model_context: { capacity_tokens: 64000, prompt_byte_cap: 100 } };
+  const fallbackReceipt = newRecorder(noCapacityModel, fallbackRequest).snapshot();
+  assert.strictEqual(fallbackReceipt.context_capacity_tokens, 64000);
+  assert.strictEqual(fallbackReceipt.context_capacity_source, "request.model_context");
+  for (const hostile of [undefined, -5, 0, 1000.5, Number.POSITIVE_INFINITY, Number.NaN]) {
+    const unknownCapacity = newRecorder({ ...boundaryModel, maxInputTokens: hostile }).snapshot();
+    assert.strictEqual(unknownCapacity.context_capacity_tokens, null, String(hostile));
+    assert.strictEqual(unknownCapacity.context_capacity_source, "unknown", String(hostile));
+  }
+  const hostileIdentity = newRecorder({
+    ...boundaryModel, family: 42, name: "GLM\n5.2", vendor: "v".repeat(129),
+  }).snapshot().host_model;
+  assert.deepStrictEqual(hostileIdentity, {
+    id: "glm-5.2", family: null, name: null, vendor: null, version: "1.0.0",
+  }, "model identity is echoed only as a bounded printable scalar");
+
+  // Text and native protocols share receipt semantics across multiple turns.
+  const parityRequest = (requestId) => ({
+    requestId,
+    prompt: "bounded",
+    allowedWrites: [],
+    request_kind: "worker",
+    reasoning_decision: highDecision,
+    initial_source_graph_request: { mode: "focus", query: "nf925", workflow_stage: "orientation" },
+    initial_source_graph_result: { ok: true, content: "graph" },
+  });
+  const textTurns = [toolEnvelope, finalResponse];
+  const textSent = [];
+  const textModel = {
+    ...boundaryModel,
+    sendRequest: async (_messages, options) => {
+      textSent.push(options);
+      return streamOf({ value: textTurns.shift() });
+    },
+  };
+  const textRequest = parityRequest("b".repeat(32));
+  const textRecorder = newRecorder(textModel, textRequest, { ...boundaryIdentity, requestId: textRequest.requestId });
+  const textResult = await internals.runVscodeLmTextProtocol(
+    textModel, textRequest, undefined, async () => ({ ok: true, content: "tool" }), null, null, null, textRecorder,
+  );
+  assert.strictEqual(JSON.parse(textResult).schema_id, internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA);
+  assert.strictEqual(textSent.length, 2);
+  assert.ok(textSent.every((options) => options.modelOptions.reasoningEffort === "high"));
+  const textReceipt = textRecorder.snapshot();
+  assert.deepStrictEqual(textReceipt, expectedReceipt({ request_id: textRequest.requestId, send_turn_count: 2 }));
+
+  const nativeFinal = JSON.stringify({
+    schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+    summary: "nf925 native",
+    edits: [],
+    creates: [{ path: "out/result.json", content: "{}\n" }],
+  });
+  const nativeTurns = [
+    [{ callId: "call-1", name: "aiworkhub_manager_source_graph_query", input: { mode: "focus", query: "model" } }],
+    [],
+    [{ value: `Completed:\n\`\`\`json\n${nativeFinal}\n\`\`\`` }],
+  ];
+  const nativeSent = [];
+  const nativeParityModel = {
+    ...boundaryModel,
+    capabilities: { toolCalling: true, ...effort },
+    sendRequest: async (_messages, options) => {
+      nativeSent.push(options);
+      return streamOf(...nativeTurns.shift());
+    },
+  };
+  const nativeParityRequest = {
+    requestId: "c".repeat(32), prompt: "bounded", allowedWrites: ["out/result.json"], reasoning_decision: highDecision,
+  };
+  const nativeRecorder = newRecorder(
+    nativeParityModel, nativeParityRequest, { ...boundaryIdentity, requestId: nativeParityRequest.requestId },
+  );
+  const nativeParityResult = await internals.runVscodeLmAgent(
+    nativeParityModel, nativeParityRequest, undefined, async () => ({ ok: true, content: "graph" }),
+    null, null, null, nativeRecorder,
+  );
+  assert.strictEqual(nativeParityResult, nativeFinal);
+  assert.strictEqual(nativeSent.length, 3);
+  assert.ok(nativeSent.every((options) => options.modelOptions.reasoningEffort === "high"));
+  const nativeParityReceipt = nativeRecorder.snapshot();
+  assert.deepStrictEqual(
+    nativeParityReceipt,
+    expectedReceipt({ request_id: nativeParityRequest.requestId, send_turn_count: 3 }),
+  );
+  assert.deepStrictEqual(
+    { ...textReceipt, request_id: "", send_turn_count: 0 },
+    { ...nativeParityReceipt, request_id: "", send_turn_count: 0 },
+    "text and native protocols publish the same receipt semantics",
+  );
+
+  // A control whose declared keys change between turns is typed unknown.
+  const driftSent = [];
+  const driftModel = {
+    ...boundaryModel,
+    capabilities: { toolCalling: false, ...effort, effortKeys: [...effort.effortKeys] },
+    sendRequest: async (_messages, options) => {
+      driftSent.push(options);
+      if (driftSent.length === 1) driftModel.capabilities.effortKeys = ["low"];
+      return streamOf({ value: driftSent.length === 1 ? toolEnvelope : finalResponse });
+    },
+  };
+  const driftRequest = parityRequest("d".repeat(32));
+  const driftRecorder = newRecorder(driftModel, driftRequest, { ...boundaryIdentity, requestId: driftRequest.requestId });
+  await internals.runVscodeLmTextProtocol(
+    driftModel, driftRequest, undefined, async () => ({ ok: true, content: "tool" }), null, null, null, driftRecorder,
+  );
+  assert.deepStrictEqual(driftSent[0].modelOptions, { reasoningEffort: "high" });
+  assert.ok(!Object.prototype.hasOwnProperty.call(driftSent[1], "modelOptions"));
+  assert.deepStrictEqual(driftRecorder.snapshot(), expectedReceipt({
+    request_id: driftRequest.requestId,
+    send_turn_count: 2,
+    option_status: "unknown",
+    option_key: null,
+    option_value: null,
+    unknown_reason: "option_changed_between_turns",
+  }));
+
+  // The host publishes the receipt in the owner-only atomic terminal response.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "aiworkhub-attempt-receipt-"));
+  const previousRoot = process.env.AIWORKHUB_VSCODE_LM_BRIDGE_ROOT;
+  process.env.AIWORKHUB_VSCODE_LM_BRIDGE_ROOT = root;
+  internals.bindVscodeLmProviderBridgeForTest({});
+  let host = null;
+  try {
+    const repoInfo = { root: path.join(root, "repo"), repoId: `repo_${"d".repeat(32)}` };
+    fs.mkdirSync(repoInfo.root);
+    host = new internals.VscodeLmBridgeHost({ globalState: { get: () => true, update: async () => {} } });
+    host.repoInfo = { ...repoInfo };
+    host.ensurePermission = async () => true;
+    const modelContext = {
+      schema_id: "aiworkhub.vscode_lm.model_context.v1",
+      capacity_tokens: 128000,
+      capacity_source: "model.maxInputTokens",
+      prompt_byte_cap: 100,
+      pad_prompt: false,
+      token_spend_cap_tokens: null,
+    };
+    let sequence = 0;
+    const runHost = async (model, overrides = {}) => {
+      sequence += 1;
+      const requestId = String(sequence).padStart(2, "0").repeat(16);
+      const fixture = bridgeRequestFixture(root, repoInfo, requestId, "e".repeat(64), {
+        reasoning_decision: highDecision,
+        model_context: modelContext,
+        ...overrides,
+      });
+      host.models = async () => [model];
+      await host.poll();
+      assert.ok(fs.existsSync(fixture.responsePath), JSON.stringify(internals.systemLogSnapshot().slice(-6)));
+      const response = JSON.parse(fs.readFileSync(fixture.responsePath, "utf8"));
+      return { requestId, fixture, response, receipt: response.reasoning_context_attempt };
+    };
+    const hostReceipt = (requestId, overrides = {}) => expectedReceipt({
+      request_id: requestId, repo_id: repoInfo.repoId, ...overrides,
+    });
+    const hostNotSent = (requestId, overrides = {}) => notSentReceipt({
+      request_id: requestId, repo_id: repoInfo.repoId, ...overrides,
+    });
+    const okModel = (extra = {}) => ({
+      ...glmIdentity,
+      maxInputTokens: 128000,
+      capabilities: { toolCalling: false, ...effort },
+      sendRequest: async () => streamOf({ value: finalResponse }),
+      ...extra,
+    });
+
+    for (const toolCalling of [true, false]) {
+      const hostSent = [];
+      const sentHost = await runHost(okModel({
+        capabilities: { toolCalling, ...effort },
+        sendRequest: async (_messages, options) => {
+          hostSent.push(options);
+          return streamOf({ value: finalResponse });
+        },
+      }));
+      assert.strictEqual(sentHost.response.error, "", `toolCalling=${toolCalling}`);
+      assert.deepStrictEqual(sentHost.receipt, hostReceipt(sentHost.requestId), `toolCalling=${toolCalling}`);
+      assert.strictEqual(hostSent.length, sentHost.receipt.send_turn_count);
+      assert.deepStrictEqual(
+        hostSent[0].modelOptions,
+        { [sentHost.receipt.option_key]: sentHost.receipt.option_value },
+        "the receipt names exactly the option the provider call carried",
+      );
+    }
+
+    const unsupportedSent = [];
+    const unsupportedHost = await runHost(okModel({
+      maxInputTokens: 8000,
+      capabilities: { toolCalling: false },
+      sendRequest: async (_messages, options) => {
+        unsupportedSent.push(options);
+        return streamOf({ value: finalResponse });
+      },
+    }));
+    assert.deepStrictEqual(unsupportedHost.receipt, hostReceipt(unsupportedHost.requestId, {
+      option_status: "unsupported", option_key: null, option_value: null, context_capacity_tokens: 8000,
+    }));
+    assert.ok(!Object.prototype.hasOwnProperty.call(unsupportedSent[0], "modelOptions"));
+
+    const providerDefaultHost = await runHost(okModel({
+      capabilities: { toolCalling: false, effortOptionKey: "reasoningEffort", effortKeys: [] },
+    }));
+    assert.deepStrictEqual(providerDefaultHost.receipt, hostReceipt(providerDefaultHost.requestId, {
+      option_status: "provider_default", option_key: null, option_value: null,
+    }));
+
+    for (const failingSend of [
+      async () => { throw new Error("provider_send_failed_by_test"); },
+      () => { throw new Error("provider_send_threw_synchronously"); },
+    ]) {
+      const failedHost = await runHost(okModel({ sendRequest: failingSend }));
+      assert.notStrictEqual(failedHost.response.error, "");
+      assert.deepStrictEqual(
+        failedHost.receipt,
+        hostReceipt(failedHost.requestId, { provider_request_acknowledged: false }),
+        "a failed send stays diagnostic: attempted, never provider-acknowledged",
+      );
+    }
+
+    let unsentCalls = 0;
+    const notSentHost = await runHost(okModel({
+      sendRequest: async () => { unsentCalls += 1; return streamOf({ value: finalResponse }); },
+    }), { initial_source_graph_result: null });
+    assert.match(notSentHost.response.error, /vscode_lm_initial_source_graph_failed/);
+    assert.strictEqual(unsentCalls, 0);
+    assert.deepStrictEqual(notSentHost.receipt, hostNotSent(notSentHost.requestId));
+
+    const aliasHost = await runHost(okModel(), { model: "glm52" });
+    assert.strictEqual(aliasHost.receipt.requested_model, "glm52", "the bridge-requested model is echoed exactly");
+    assert.strictEqual(aliasHost.receipt.host_model.id, "glm-5.2");
+    const spacedHost = await runHost(okModel(), { model: "GLM 5.2" });
+    assert.strictEqual(spacedHost.receipt.requested_model, null, "an unbounded requested-model spelling is never echoed");
+
+    const raced = bridgeRequestFixture(root, repoInfo, "f".repeat(32), "f".repeat(64), {
+      reasoning_decision: highDecision,
+    });
+    host.models = async () => [okModel({
+      sendRequest: async () => ({
+        stream: (async function* stream() {
+          publishCancelDecision(raced, repoInfo);
+          yield { value: finalResponse };
+        }()),
+      }),
+    })];
+    await host.poll();
+    const racedResponse = JSON.parse(fs.readFileSync(raced.responsePath, "utf8"));
+    assert.strictEqual(racedResponse.error, "vscode_lm_request_cancelled");
+    assert.strictEqual(racedResponse.decision.action, "cancel");
+    assert.ok(
+      !Object.prototype.hasOwnProperty.call(racedResponse, "reasoning_context_attempt"),
+      "cancellation arbitration is unchanged: the manager's cancel decision carries no receipt",
+    );
+  } finally {
+    if (host) host.dispose();
+    if (previousRoot === undefined) delete process.env.AIWORKHUB_VSCODE_LM_BRIDGE_ROOT;
+    else process.env.AIWORKHUB_VSCODE_LM_BRIDGE_ROOT = previousRoot;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 }
 
 async function nf651StageContextReadForNextRequiredFile() {
@@ -5244,7 +5693,7 @@ async function cancellationToolBoundaryChecks() {
   );
 }
 
-function bridgeRequestFixture(root, repoInfo, requestId, cancelToken) {
+function bridgeRequestFixture(root, repoInfo, requestId, cancelToken, overrides = {}) {
   const requestDir = path.join(root, "requests", repoInfo.repoId);
   const requestPath = path.join(requestDir, `${requestId}.json`);
   const workspacePath = path.join(root, "workspaces", requestId, "worktree");
@@ -5273,6 +5722,7 @@ function bridgeRequestFixture(root, repoInfo, requestId, cancelToken) {
     initial_source_graph_request: { mode: "focus", query: "cancellation bridge", workflow_stage: "orientation" },
     initial_source_graph_result: { ok: true, content: "prefetched graph" },
     deadline: new Date(Date.now() + 60000).toISOString(),
+    ...overrides,
   });
   return { requestPath, responsePath, progressPath, cancelPath, cancelToken, requestId };
 }

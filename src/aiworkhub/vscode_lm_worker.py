@@ -18,6 +18,7 @@ from typing import Any, cast
 
 from . import semantic_edit
 from .platform_io import current_user_uid
+from .runtime_adapters import EDITOR_REQUESTED_MODEL_RE
 from .vscode_lm_bridge import (
     EDIT_RESPONSE_SCHEMA_ID,
     EDIT_RESPONSE_SCHEMA_ID_V1,
@@ -923,6 +924,187 @@ def _read_progress_with_retry(
     raise AssertionError("unreachable")
 
 
+REASONING_CONTEXT_ATTEMPT_SCHEMA_ID = "aiworkhub.reasoning_context_attempt.v1"
+_ATTEMPT_MAX_BYTES = 4096
+_ATTEMPT_MAX_SEND_TURNS = 64
+# The host reports capacity as a JavaScript number, so it is bounded to a safe integer.
+_ATTEMPT_MAX_CAPACITY_TOKENS = 2**53 - 1
+_ATTEMPT_IDENTITY_RE = re.compile(r"[ -~]{1,128}")
+_ATTEMPT_LABEL_RE = re.compile(r"[ -~]{0,128}")
+_ATTEMPT_OPTION_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:+/ -]{0,63}")
+_ATTEMPT_FIELDS = (
+    "schema_id",
+    "request_id",
+    "repo_id",
+    "requested_model",
+    "host_model",
+    "requested_profile",
+    "send_state",
+    "send_turn_count",
+    "provider_request_acknowledged",
+    "option_status",
+    "option_key",
+    "option_value",
+    "context_capacity_tokens",
+    "context_capacity_source",
+    "provider_internal_state",
+    "unknown_reason",
+)
+_ATTEMPT_HOST_MODEL_FIELDS = ("id", "family", "name", "vendor", "version")
+_ATTEMPT_VOCABULARY_FIELDS = (
+    "requested_profile",
+    "send_state",
+    "option_status",
+    "context_capacity_source",
+    "provider_internal_state",
+)
+_ATTEMPT_PROFILES = frozenset({"canonical_medium_high", "canonical_high", "canonical_maximum"})
+_ATTEMPT_SEND_STATES = frozenset({"sent", "not_sent"})
+_ATTEMPT_OPTION_STATUSES = frozenset({
+    "applied",
+    "unsupported",
+    "provider_default",
+    "unverifiable",
+    "capability_ceiling",
+    "unknown",
+    "not_sent",
+})
+_ATTEMPT_CAPACITY_SOURCES = frozenset({"model.maxInputTokens", "request.model_context", "unknown"})
+_ATTEMPT_HOST_UNKNOWN_REASONS = frozenset({
+    "option_shape_unrecognized",
+    "sent_option_disagrees_with_effort_status",
+    "option_changed_between_turns",
+    "send_turn_count_out_of_bounds",
+    "receipt_recorder_error",
+})
+_ATTEMPT_WORKER_UNKNOWN_REASONS = frozenset({
+    "receipt_absent",
+    "receipt_malformed",
+    "receipt_oversized",
+    "receipt_schema_mismatch",
+    "receipt_identity_mismatch",
+    "receipt_vocabulary_invalid",
+    "receipt_bounds_invalid",
+    "receipt_inconsistent",
+})
+
+
+def _attempt_text(value: object, pattern: re.Pattern[str]) -> str | None:
+    if isinstance(value, str) and pattern.fullmatch(value):
+        return value
+    return None
+
+
+def _attempt_unknown(spec: dict[str, Any], reason: str) -> dict[str, Any]:
+    """Worker-authored receipt that claims only the identity pinned in the spec."""
+    return {
+        "schema_id": REASONING_CONTEXT_ATTEMPT_SCHEMA_ID,
+        "request_id": _attempt_text(spec.get("request_id"), _ATTEMPT_IDENTITY_RE),
+        "repo_id": _attempt_text(spec.get("repo_id"), _ATTEMPT_IDENTITY_RE),
+        "requested_model": _attempt_text(spec.get("model"), EDITOR_REQUESTED_MODEL_RE),
+        "host_model": None,
+        "requested_profile": None,
+        "send_state": "unknown",
+        "send_turn_count": None,
+        "provider_request_acknowledged": None,
+        "option_status": "unknown",
+        "option_key": None,
+        "option_value": None,
+        "context_capacity_tokens": None,
+        "context_capacity_source": "unknown",
+        "provider_internal_state": "unknown",
+        "unknown_reason": reason,
+    }
+
+
+def _attempt_refusal(raw: object, spec: dict[str, Any]) -> str | None:
+    """Typed reason a host receipt must not be surfaced as evidence, else None."""
+    if not isinstance(raw, dict):
+        return "receipt_malformed"
+    try:
+        encoded = json.dumps(raw, ensure_ascii=True, separators=(",", ":"))
+    except (TypeError, ValueError, RecursionError):
+        return "receipt_malformed"
+    if len(encoded) > _ATTEMPT_MAX_BYTES:
+        return "receipt_oversized"
+    if "schema_id" in raw and raw["schema_id"] != REASONING_CONTEXT_ATTEMPT_SCHEMA_ID:
+        return "receipt_schema_mismatch"
+    host_model = raw.get("host_model")
+    if set(raw) != set(_ATTEMPT_FIELDS) or not isinstance(host_model, dict):
+        return "receipt_malformed"
+    unknown_reason = raw["unknown_reason"]
+    if (
+        set(host_model) != set(_ATTEMPT_HOST_MODEL_FIELDS)
+        or any(value is not None and not isinstance(value, str) for value in host_model.values())
+        or not all(isinstance(raw[key], str) for key in _ATTEMPT_VOCABULARY_FIELDS)
+        or not isinstance(raw["provider_request_acknowledged"], bool)
+        or not (unknown_reason is None or isinstance(unknown_reason, str))
+    ):
+        return "receipt_malformed"
+    pinned = {
+        "request_id": _attempt_text(spec.get("request_id"), _ATTEMPT_IDENTITY_RE),
+        "repo_id": _attempt_text(spec.get("repo_id"), _ATTEMPT_IDENTITY_RE),
+        "requested_model": _attempt_text(spec.get("model"), EDITOR_REQUESTED_MODEL_RE),
+    }
+    if any(value is None or raw[key] != value for key, value in pinned.items()):
+        return "receipt_identity_mismatch"
+    if (
+        raw["requested_profile"] not in _ATTEMPT_PROFILES
+        or raw["send_state"] not in _ATTEMPT_SEND_STATES
+        or raw["option_status"] not in _ATTEMPT_OPTION_STATUSES
+        or raw["context_capacity_source"] not in _ATTEMPT_CAPACITY_SOURCES
+        or raw["provider_internal_state"] != "unknown"
+        or (unknown_reason is not None and unknown_reason not in _ATTEMPT_HOST_UNKNOWN_REASONS)
+    ):
+        return "receipt_vocabulary_invalid"
+    count = raw["send_turn_count"]
+    tokens = raw["context_capacity_tokens"]
+    if (
+        type(count) is not int
+        or not 0 <= count <= _ATTEMPT_MAX_SEND_TURNS
+        or (
+            tokens is not None
+            and (type(tokens) is not int or not 1 <= tokens <= _ATTEMPT_MAX_CAPACITY_TOKENS)
+        )
+        or any(
+            value is not None and _attempt_text(value, _ATTEMPT_OPTION_TOKEN_RE) is None
+            for value in (raw["option_key"], raw["option_value"])
+        )
+        or any(
+            value is not None and _attempt_text(value, _ATTEMPT_LABEL_RE) is None
+            for value in host_model.values()
+        )
+    ):
+        return "receipt_bounds_invalid"
+    # run() only reaches this on success, which proves an acknowledged send happened.
+    applied = raw["option_status"] == "applied"
+    if (
+        raw["send_state"] != "sent"
+        or count < 1
+        or raw["provider_request_acknowledged"] is not True
+        or raw["option_status"] == "not_sent"
+        or (raw["option_key"] is not None) != applied
+        or (raw["option_value"] is not None) != applied
+        or (raw["option_status"] == "unknown") != (unknown_reason is not None)
+        or (tokens is None) != (raw["context_capacity_source"] == "unknown")
+    ):
+        return "receipt_inconsistent"
+    return None
+
+
+def _reasoning_context_attempt_result(
+    response: dict[str, Any], spec: dict[str, Any],
+) -> dict[str, Any]:
+    """Verified host receipt rebuilt from scalars, or a typed unknown; never raises."""
+    raw = response.get("reasoning_context_attempt")
+    reason = "receipt_absent" if raw is None else _attempt_refusal(raw, spec)
+    if reason is not None:
+        return _attempt_unknown(spec, reason)
+    verified = {key: raw[key] for key in _ATTEMPT_FIELDS}
+    verified["host_model"] = {key: raw["host_model"][key] for key in _ATTEMPT_HOST_MODEL_FIELDS}
+    return verified
+
+
 def run(spec_path: Path) -> dict[str, Any]:
     spec = _load_json(spec_path)
     if spec.get("schema_id") != "aiworkhub.vscode_lm.worker_spec.v1":
@@ -1116,6 +1298,7 @@ def run(spec_path: Path) -> dict[str, Any]:
         "edit_protocol": str(edit.get("schema_id") or ""),
         "semantic_edit_metrics": semantic_metrics,
         "project_context_receipt": str(spec.get("project_context_receipt") or ""),
+        "reasoning_context_attempt": _reasoning_context_attempt_result(response, spec),
     }
 
 

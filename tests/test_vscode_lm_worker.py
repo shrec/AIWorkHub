@@ -771,6 +771,9 @@ class TestRunSpecPathIntegration:
         entries: list[dict[str, object]],
         request_id: str,
         allowed_writes: list[str],
+        *,
+        spec_extra: dict[str, object] | None = None,
+        response_extra: dict[str, object] | None = None,
     ) -> tuple[Path, Path]:
         """Pre-write workspace, response JSON, and spec JSON."""
         import json
@@ -802,6 +805,7 @@ class TestRunSpecPathIntegration:
             "schema_id": vscode_lm_worker.RESPONSE_SCHEMA_ID,
             "request_id": request_id,
             "text": json.dumps(edit_payload),
+            **(response_extra or {}),
         }
         response_path = tmp_path / "response.json"
         response_path.write_text(
@@ -813,6 +817,7 @@ class TestRunSpecPathIntegration:
             "response_path": str(response_path),
             "request_id": request_id,
             "allowed_writes": allowed_writes,
+            **(spec_extra or {}),
         }
         spec_path = tmp_path / "spec.json"
         spec_path.write_text(
@@ -945,6 +950,390 @@ class TestRunSpecPathIntegration:
             vscode_lm_worker.run(spec_path)
 
         assert target.read_text(encoding="utf-8") == original
+
+    _ATTEMPT_ABSENT = object()
+    _ATTEMPT_REQUEST_ID = "req-attempt"
+    _ATTEMPT_REPO_ID = "repo_" + "7" * 32
+    _ATTEMPT_MODEL = "glm-5.2"
+
+    @classmethod
+    def _host_receipt(cls, **overrides: object) -> dict[str, object]:
+        receipt: dict[str, object] = {
+            "schema_id": vscode_lm_worker.REASONING_CONTEXT_ATTEMPT_SCHEMA_ID,
+            "request_id": cls._ATTEMPT_REQUEST_ID,
+            "repo_id": cls._ATTEMPT_REPO_ID,
+            "requested_model": cls._ATTEMPT_MODEL,
+            "host_model": {
+                "id": "glm-5.2",
+                "family": "glm-5.2",
+                "name": "GLM-5.2",
+                "vendor": "customendpoint",
+                "version": "1.0.0",
+            },
+            "requested_profile": "canonical_high",
+            "send_state": "sent",
+            "send_turn_count": 2,
+            "provider_request_acknowledged": True,
+            "option_status": "applied",
+            "option_key": "reasoningEffort",
+            "option_value": "high",
+            "context_capacity_tokens": 128000,
+            "context_capacity_source": "model.maxInputTokens",
+            "provider_internal_state": "unknown",
+            "unknown_reason": None,
+        }
+        receipt.update(overrides)
+        return receipt
+
+    @staticmethod
+    def _unexpected_write(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("receipt handling must not depend on writing files")
+
+    def _attempt_spec(self) -> dict[str, object]:
+        return {
+            "request_id": self._ATTEMPT_REQUEST_ID,
+            "repo_id": self._ATTEMPT_REPO_ID,
+            "model": self._ATTEMPT_MODEL,
+        }
+
+    def _run_attempt(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        receipt: object = _ATTEMPT_ABSENT,
+        spec_extra: dict[str, object] | None = None,
+        response_extra: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        response_fields = dict(response_extra or {})
+        if receipt is not self._ATTEMPT_ABSENT:
+            response_fields["reasoning_context_attempt"] = receipt
+        spec_path, _target = self._make_spec_and_response(
+            tmp_path,
+            "line1\nline2\nline3\n",
+            "src/mod.py",
+            [{"ranges": [{"start_line": 2, "end_line": 2, "new": "line2\n"}]}],
+            self._ATTEMPT_REQUEST_ID,
+            ["src/*.py"],
+            spec_extra=(
+                self._attempt_spec() if spec_extra is None else spec_extra
+            ),
+            response_extra=response_fields,
+        )
+        monkeypatch.setattr(vscode_lm_worker, "_write_atomic", self._unexpected_write)
+        result = vscode_lm_worker.run(spec_path)
+        assert result["is_error"] is False
+        assert result["changed_paths"] == []
+        return result
+
+    def _assert_typed_unknown(self, attempt: object, reason: str) -> None:
+        assert isinstance(attempt, dict)
+        assert attempt["schema_id"] == vscode_lm_worker.REASONING_CONTEXT_ATTEMPT_SCHEMA_ID
+        assert attempt["send_state"] == "unknown"
+        assert attempt["option_status"] == "unknown"
+        assert attempt["unknown_reason"] == reason
+        assert reason in vscode_lm_worker._ATTEMPT_WORKER_UNKNOWN_REASONS
+        assert attempt["option_key"] is None
+        assert attempt["option_value"] is None
+        assert attempt["provider_internal_state"] == "unknown"
+        assert attempt["request_id"] == self._ATTEMPT_REQUEST_ID
+        assert attempt["repo_id"] == self._ATTEMPT_REPO_ID
+        assert attempt["requested_model"] == self._ATTEMPT_MODEL
+
+    def test_run_forwards_well_formed_host_receipt(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        receipt = self._host_receipt()
+
+        result = self._run_attempt(tmp_path, monkeypatch, receipt=receipt)
+
+        assert result["reasoning_context_attempt"] == receipt
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"option_status": "unsupported", "option_key": None, "option_value": None},
+            {"option_status": "provider_default", "option_key": None, "option_value": None},
+            {"option_status": "unverifiable", "option_key": None, "option_value": None},
+            {"option_status": "capability_ceiling", "option_key": None, "option_value": None},
+            {
+                "option_status": "unknown",
+                "option_key": None,
+                "option_value": None,
+                "unknown_reason": "option_changed_between_turns",
+            },
+            {"context_capacity_tokens": None, "context_capacity_source": "unknown"},
+            {"context_capacity_source": "request.model_context"},
+            {"host_model": {"id": None, "family": None, "name": None, "vendor": None, "version": None}},
+            {"requested_profile": "canonical_maximum"},
+            {"requested_profile": "canonical_medium_high"},
+            {"send_turn_count": 64},
+            {
+                "option_status": "unknown",
+                "option_key": None,
+                "option_value": None,
+                "unknown_reason": "option_shape_unrecognized",
+            },
+            {
+                "option_status": "unknown",
+                "option_key": None,
+                "option_value": None,
+                "unknown_reason": "sent_option_disagrees_with_effort_status",
+            },
+            {
+                "option_status": "unknown",
+                "option_key": None,
+                "option_value": None,
+                "send_turn_count": 64,
+                "unknown_reason": "send_turn_count_out_of_bounds",
+            },
+            {
+                "option_status": "unknown",
+                "option_key": None,
+                "option_value": None,
+                "unknown_reason": "receipt_recorder_error",
+            },
+        ],
+    )
+    def test_run_forwards_host_typed_states_without_upgrading_them(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, overrides: dict[str, object],
+    ) -> None:
+        receipt = self._host_receipt(**overrides)
+
+        result = self._run_attempt(tmp_path, monkeypatch, receipt=receipt)
+
+        assert result["reasoning_context_attempt"] == receipt
+
+    def test_run_marks_absent_receipt_as_typed_unknown(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        result = self._run_attempt(tmp_path, monkeypatch)
+
+        self._assert_typed_unknown(result["reasoning_context_attempt"], "receipt_absent")
+
+    def test_run_marks_null_receipt_as_typed_unknown(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        result = self._run_attempt(tmp_path, monkeypatch, receipt=None)
+
+        self._assert_typed_unknown(result["reasoning_context_attempt"], "receipt_absent")
+
+    def test_run_never_verifies_a_receipt_against_an_unpinned_spec(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        result = self._run_attempt(
+            tmp_path,
+            monkeypatch,
+            receipt=self._host_receipt(),
+            spec_extra={"repo_id": self._ATTEMPT_REPO_ID},
+        )
+
+        attempt = result["reasoning_context_attempt"]
+        assert isinstance(attempt, dict)
+        assert attempt["send_state"] == "unknown"
+        assert attempt["unknown_reason"] == "receipt_identity_mismatch"
+        assert attempt["requested_model"] is None
+
+    def test_run_receipt_with_non_finite_capacity_is_typed_unknown(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        result = self._run_attempt(
+            tmp_path,
+            monkeypatch,
+            receipt=self._host_receipt(context_capacity_tokens=float("nan")),
+        )
+
+        self._assert_typed_unknown(result["reasoning_context_attempt"], "receipt_bounds_invalid")
+
+    def test_run_receipt_for_a_foreign_request_is_typed_unknown(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        foreign = self._host_receipt(request_id="req-stale")
+
+        result = self._run_attempt(tmp_path, monkeypatch, receipt=foreign)
+
+        self._assert_typed_unknown(
+            result["reasoning_context_attempt"], "receipt_identity_mismatch",
+        )
+        assert "req-stale" not in json.dumps(result["reasoning_context_attempt"])
+
+    def test_run_terminal_error_still_raises_without_leaking_the_receipt(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        spec_path, _target = self._make_spec_and_response(
+            tmp_path,
+            "line1\nline2\nline3\n",
+            "src/mod.py",
+            [{"ranges": [{"start_line": 2, "end_line": 2, "new": "line2\n"}]}],
+            self._ATTEMPT_REQUEST_ID,
+            ["src/*.py"],
+            spec_extra=self._attempt_spec(),
+            response_extra={
+                "error": "provider_boom",
+                "reasoning_context_attempt": self._host_receipt(
+                    provider_request_acknowledged=False,
+                ),
+            },
+        )
+        monkeypatch.setattr(vscode_lm_worker, "_write_atomic", self._unexpected_write)
+
+        with pytest.raises(RuntimeError) as failure:
+            vscode_lm_worker.run(spec_path)
+
+        assert str(failure.value) == "vscode_lm_request_failed:provider_boom"
+
+    @pytest.mark.parametrize(
+        ("overrides", "reason"),
+        [
+            ({"schema_id": "aiworkhub.reasoning_context_attempt.v0"}, "receipt_schema_mismatch"),
+            ({"request_id": "req-other"}, "receipt_identity_mismatch"),
+            ({"repo_id": "repo_" + "8" * 32}, "receipt_identity_mismatch"),
+            ({"requested_model": "deepseek-v4-pro"}, "receipt_identity_mismatch"),
+            ({"requested_model": None}, "receipt_identity_mismatch"),
+            ({"send_state": "acknowledged"}, "receipt_vocabulary_invalid"),
+            ({"option_status": "honored"}, "receipt_vocabulary_invalid"),
+            ({"requested_profile": "ultra"}, "receipt_vocabulary_invalid"),
+            ({"context_capacity_source": "token_budget"}, "receipt_vocabulary_invalid"),
+            ({"provider_internal_state": "high"}, "receipt_vocabulary_invalid"),
+            (
+                {
+                    "option_status": "unknown",
+                    "option_key": None,
+                    "option_value": None,
+                    "unknown_reason": "because",
+                },
+                "receipt_vocabulary_invalid",
+            ),
+            ({"context_capacity_tokens": -1}, "receipt_bounds_invalid"),
+            ({"context_capacity_tokens": 0}, "receipt_bounds_invalid"),
+            ({"context_capacity_tokens": float("nan")}, "receipt_bounds_invalid"),
+            ({"context_capacity_tokens": float("inf")}, "receipt_bounds_invalid"),
+            ({"context_capacity_tokens": 128000.5}, "receipt_bounds_invalid"),
+            ({"context_capacity_tokens": True}, "receipt_bounds_invalid"),
+            ({"context_capacity_tokens": 2**60}, "receipt_bounds_invalid"),
+            ({"send_turn_count": -1}, "receipt_bounds_invalid"),
+            ({"send_turn_count": True}, "receipt_bounds_invalid"),
+            ({"send_turn_count": 2.0}, "receipt_bounds_invalid"),
+            ({"send_turn_count": 65}, "receipt_bounds_invalid"),
+            ({"option_value": "h" * 65}, "receipt_bounds_invalid"),
+            ({"option_key": "reasoning\nEffort"}, "receipt_bounds_invalid"),
+            ({"option_value": 5}, "receipt_bounds_invalid"),
+            (
+                {
+                    "host_model": {
+                        "id": "glm-5.2",
+                        "family": "glm-5.2",
+                        "name": "n" * 129,
+                        "vendor": "customendpoint",
+                        "version": "1.0.0",
+                    },
+                },
+                "receipt_bounds_invalid",
+            ),
+            (
+                {
+                    "host_model": {
+                        "id": "glm-5.2",
+                        "family": 42,
+                        "name": "GLM-5.2",
+                        "vendor": "customendpoint",
+                        "version": "1.0.0",
+                    },
+                },
+                "receipt_malformed",
+            ),
+            ({"host_model": {"id": "glm-5.2"}}, "receipt_malformed"),
+            ({"host_model": "glm-5.2"}, "receipt_malformed"),
+            ({"provider_request_acknowledged": "yes"}, "receipt_malformed"),
+            ({"option_value": "h" * 10_000}, "receipt_oversized"),
+            ({"option_key": None, "option_value": None}, "receipt_inconsistent"),
+            ({"option_value": None}, "receipt_inconsistent"),
+            ({"option_status": "unsupported"}, "receipt_inconsistent"),
+            ({"option_status": "provider_default"}, "receipt_inconsistent"),
+            ({"send_turn_count": 0}, "receipt_inconsistent"),
+            ({"provider_request_acknowledged": False}, "receipt_inconsistent"),
+            (
+                {"option_status": "unknown", "option_key": None, "option_value": None},
+                "receipt_inconsistent",
+            ),
+            ({"unknown_reason": "option_changed_between_turns"}, "receipt_inconsistent"),
+            # A success response proves a send happened, so a not_sent receipt contradicts it.
+            (
+                {
+                    "send_state": "not_sent",
+                    "send_turn_count": 0,
+                    "provider_request_acknowledged": False,
+                    "option_status": "not_sent",
+                    "option_key": None,
+                    "option_value": None,
+                },
+                "receipt_inconsistent",
+            ),
+            (
+                {"send_state": "not_sent", "send_turn_count": 0, "provider_request_acknowledged": False},
+                "receipt_inconsistent",
+            ),
+            ({"option_status": "not_sent"}, "receipt_inconsistent"),
+            ({"context_capacity_tokens": None}, "receipt_inconsistent"),
+            ({"context_capacity_source": "unknown"}, "receipt_inconsistent"),
+            ({"send_state": ["sent"]}, "receipt_malformed"),
+            ({"option_status": None}, "receipt_malformed"),
+            ({"unknown_reason": ["option_changed_between_turns"]}, "receipt_malformed"),
+            ({"schema_id": None}, "receipt_schema_mismatch"),
+            ({"unknown_reason": "u" * 5000}, "receipt_oversized"),
+        ],
+    )
+    def test_invalid_host_receipt_is_never_forwarded_as_applied(
+        self, overrides: dict[str, object], reason: str,
+    ) -> None:
+        receipt = self._host_receipt(**overrides)
+
+        attempt = vscode_lm_worker._reasoning_context_attempt_result(
+            {"reasoning_context_attempt": receipt}, self._attempt_spec(),
+        )
+
+        self._assert_typed_unknown(attempt, reason)
+
+    @pytest.mark.parametrize(
+        ("receipt", "reason"),
+        [
+            ("applied", "receipt_malformed"),
+            ([], "receipt_malformed"),
+            (7, "receipt_malformed"),
+            ({}, "receipt_malformed"),
+            ({"schema_id": vscode_lm_worker.REASONING_CONTEXT_ATTEMPT_SCHEMA_ID}, "receipt_malformed"),
+        ],
+    )
+    def test_non_object_or_partial_receipt_is_typed_unknown(
+        self, receipt: object, reason: str,
+    ) -> None:
+        attempt = vscode_lm_worker._reasoning_context_attempt_result(
+            {"reasoning_context_attempt": receipt}, self._attempt_spec(),
+        )
+
+        self._assert_typed_unknown(attempt, reason)
+
+    def test_receipt_with_an_unknown_extra_key_is_typed_unknown(self) -> None:
+        receipt = self._host_receipt()
+        receipt["provider_text"] = "arbitrary model prose"
+
+        attempt = vscode_lm_worker._reasoning_context_attempt_result(
+            {"reasoning_context_attempt": receipt}, self._attempt_spec(),
+        )
+
+        self._assert_typed_unknown(attempt, "receipt_malformed")
+        assert "arbitrary model prose" not in json.dumps(attempt)
+
+    def test_verified_receipt_is_rebuilt_from_validated_scalars(self) -> None:
+        receipt = self._host_receipt()
+
+        attempt = vscode_lm_worker._reasoning_context_attempt_result(
+            {"reasoning_context_attempt": receipt}, self._attempt_spec(),
+        )
+
+        assert attempt == receipt
+        assert attempt is not receipt
+        assert attempt["host_model"] is not receipt["host_model"]
 
 
 class TestV3UnsupportedTopLevel:

@@ -855,6 +855,166 @@ def test_worker_applies_only_fully_validated_allowed_outputs(tmp_path: Path, mon
         assert (workspace / "out" / "result.txt").stat().st_mode & 0o077 == 0
 
 
+def _attempt_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request_id: str,
+) -> vscode_lm_bridge.BridgeRequest:
+    monkeypatch.setenv(vscode_lm_bridge.BRIDGE_ROOT_ENV, str(tmp_path / "bridge"))
+    workspace = tmp_path / request_id / "worktree"
+    home = tmp_path / request_id / "home"
+    workspace.mkdir(parents=True)
+    home.mkdir(mode=0o700)
+    return vscode_lm_bridge.create_request(
+        repo=_repo(tmp_path),
+        request_id=request_id,
+        workspace_path=workspace,
+        workspace_home=home,
+        prompt="Use Source Graph and implement the bounded output.",
+        model="glm-5.2",
+        allowed_writes=["out/*.txt"],
+        timeout_seconds=30,
+    )
+
+
+def _attempt_receipt(
+    request: vscode_lm_bridge.BridgeRequest, **overrides: object,
+) -> dict[str, object]:
+    receipt: dict[str, object] = {
+        "schema_id": vscode_lm_worker.REASONING_CONTEXT_ATTEMPT_SCHEMA_ID,
+        "request_id": request.request_id,
+        "repo_id": request.repo_id,
+        "requested_model": "glm-5.2",
+        "host_model": {
+            "id": "glm-5.2",
+            "family": "glm-5.2",
+            "name": "GLM-5.2",
+            "vendor": "customendpoint",
+            "version": "1.0.0",
+        },
+        "requested_profile": "canonical_high",
+        "send_state": "sent",
+        "send_turn_count": 2,
+        "provider_request_acknowledged": True,
+        "option_status": "applied",
+        "option_key": "reasoningEffort",
+        "option_value": "high",
+        "context_capacity_tokens": 128000,
+        "context_capacity_source": "model.maxInputTokens",
+        "provider_internal_state": "unknown",
+        "unknown_reason": None,
+    }
+    receipt.update(overrides)
+    return receipt
+
+
+def _publish_attempt_response(
+    request: vscode_lm_bridge.BridgeRequest, **extra: object,
+) -> None:
+    response = {
+        "schema_id": vscode_lm_bridge.RESPONSE_SCHEMA_ID,
+        "request_id": request.request_id,
+        "model": {"id": "glm-5.2"},
+        "text": json.dumps(
+            {
+                "schema_id": vscode_lm_bridge.EDIT_RESPONSE_SCHEMA_ID,
+                "summary": "implemented",
+                "creates": [{"path": "out/result.txt", "content": "ok\n"}],
+                "edits": [],
+            }
+        ),
+        "error": "",
+        **_response_decision(request),
+        **extra,
+    }
+    vscode_lm_bridge._atomic_json(request.response_path, response)  # noqa: SLF001
+
+
+def test_create_request_pins_requested_model_in_private_worker_spec(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = _attempt_request(tmp_path, monkeypatch, "d" * 32)
+
+    published = json.loads(request.request_path.read_text(encoding="utf-8"))
+    spec = json.loads(request.worker_spec_path.read_text(encoding="utf-8"))
+
+    assert spec["model"] == "glm-5.2"
+    assert spec["model"] == published["model"]
+    assert spec["request_id"] == request.request_id
+    assert spec["repo_id"] == request.repo_id
+
+
+def test_worker_forwards_host_attempt_receipt_bound_to_the_real_request_spec(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = _attempt_request(tmp_path, monkeypatch, "c" * 32)
+    receipt = _attempt_receipt(request)
+    _publish_attempt_response(request, reasoning_context_attempt=receipt)
+
+    result = vscode_lm_worker.run(request.worker_spec_path)
+
+    assert result["is_error"] is False
+    assert result["changed_paths"] == ["out/result.txt"]
+    assert result["reasoning_context_attempt"] == receipt
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"request_id": "b" * 32},
+        {"repo_id": "repo_" + "0" * 32},
+        {"requested_model": "deepseek-v4-pro"},
+    ],
+)
+def test_worker_refuses_host_attempt_receipt_for_another_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, overrides: dict[str, object],
+) -> None:
+    request = _attempt_request(tmp_path, monkeypatch, "c" * 32)
+    _publish_attempt_response(
+        request, reasoning_context_attempt=_attempt_receipt(request, **overrides),
+    )
+
+    result = vscode_lm_worker.run(request.worker_spec_path)
+
+    attempt = result["reasoning_context_attempt"]
+    assert result["is_error"] is False
+    assert attempt["send_state"] == "unknown"
+    assert attempt["option_status"] == "unknown"
+    assert attempt["unknown_reason"] == "receipt_identity_mismatch"
+    assert attempt["request_id"] == request.request_id
+    assert attempt["repo_id"] == request.repo_id
+    assert attempt["requested_model"] == "glm-5.2"
+
+
+def test_worker_result_without_a_host_attempt_receipt_stays_successful_and_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = _attempt_request(tmp_path, monkeypatch, "c" * 32)
+    _publish_attempt_response(request)
+
+    result = vscode_lm_worker.run(request.worker_spec_path)
+
+    assert result["is_error"] is False
+    assert result["changed_paths"] == ["out/result.txt"]
+    assert result["reasoning_context_attempt"]["unknown_reason"] == "receipt_absent"
+
+
+def test_worker_terminal_error_keeps_its_failure_and_does_not_surface_the_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = _attempt_request(tmp_path, monkeypatch, "c" * 32)
+    _publish_attempt_response(
+        request,
+        error="provider_send_failed",
+        reasoning_context_attempt=_attempt_receipt(
+            request, provider_request_acknowledged=False,
+        ),
+    )
+
+    with pytest.raises(RuntimeError) as failure:
+        vscode_lm_worker.run(request.worker_spec_path)
+
+    assert str(failure.value) == "vscode_lm_request_failed:provider_send_failed"
+
+
 def test_quality_review_request_kind_is_explicit_and_validated(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

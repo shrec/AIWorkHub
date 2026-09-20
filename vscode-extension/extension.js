@@ -4887,6 +4887,152 @@ function vscodeLmModelContextReceipt(model, request) {
   };
 }
 
+const VSCODE_LM_REASONING_CONTEXT_ATTEMPT_SCHEMA = "aiworkhub.reasoning_context_attempt.v1";
+const VSCODE_LM_ATTEMPT_MAX_SEND_TURNS = 64;
+const VSCODE_LM_ATTEMPT_LABEL_RE = /^[\x20-\x7E]{0,128}$/;
+const VSCODE_LM_ATTEMPT_OPTION_TOKEN_RE = /^[A-Za-z0-9][A-Za-z0-9._:+\/ -]{0,63}$/;
+
+function vscodeLmAttemptLabel(value) {
+  return typeof value === "string" && VSCODE_LM_ATTEMPT_LABEL_RE.test(value) ? value : null;
+}
+
+function vscodeLmAttemptRequestedModel(value) {
+  return typeof value === "string" && VSCODE_LM_REQUESTED_MODEL_RE.test(value) ? value : null;
+}
+
+function vscodeLmAttemptModelIdentity(model) {
+  return {
+    id: vscodeLmAttemptLabel(model && model.id),
+    family: vscodeLmAttemptLabel(model && model.family),
+    name: vscodeLmAttemptLabel(model && model.name),
+    vendor: vscodeLmAttemptLabel(model && model.vendor),
+    version: vscodeLmAttemptLabel(model && model.version),
+  };
+}
+
+// Context capacity only: a model window is never a token budget or spend cap.
+function vscodeLmAttemptContext(model, request) {
+  const context = vscodeLmModelContextReceipt(model, request);
+  const tokens = context.capacity_tokens;
+  if (!Number.isSafeInteger(tokens) || tokens < 1) return { tokens: null, source: "unknown" };
+  return { tokens, source: context.capacity_source };
+}
+
+// Reads what `options.modelOptions` actually carried into one sendRequest
+// call; null means the shape is not a single bounded string option.
+function vscodeLmSentEffortOption(options) {
+  const sent = options && typeof options === "object" ? options.modelOptions : undefined;
+  if (sent === undefined || sent === null) return { key: null, value: null };
+  if (typeof sent !== "object" || Array.isArray(sent)) return null;
+  const keys = Object.keys(sent);
+  if (keys.length === 0) return { key: null, value: null };
+  if (keys.length !== 1) return null;
+  const key = keys[0];
+  const value = sent[key];
+  if (typeof value !== "string" ||
+      !VSCODE_LM_ATTEMPT_OPTION_TOKEN_RE.test(key) || !VSCODE_LM_ATTEMPT_OPTION_TOKEN_RE.test(value)) {
+    return null;
+  }
+  return { key, value };
+}
+
+// Request-local evidence of what the host handed to model.sendRequest. A sent
+// option is never proof of provider-internal reasoning, so that state is
+// always "unknown"; recorder methods never throw into the send path.
+function createVscodeLmSendReceiptRecorder(request, model, identity = {}) {
+  const state = {
+    model,
+    sendTurnCount: 0,
+    acknowledgedCount: 0,
+    failed: false,
+    first: null,
+    unknownReason: "",
+    corrupt: false,
+  };
+  const flag = (reason) => { if (!state.unknownReason) state.unknownReason = reason; };
+  const scalar = (value) => (typeof value === "string" ? value : null);
+  return {
+    recordSend(sendModel, options) {
+      state.sendTurnCount += 1;
+      try {
+        state.model = sendModel || state.model;
+        const expected = vscodeLmReasoningEffortReceipt(sendModel, request);
+        const sent = vscodeLmSentEffortOption(options);
+        const observed = { status: expected.status, key: null, value: null };
+        if (sent === null) {
+          flag("option_shape_unrecognized");
+        } else {
+          observed.key = sent.key;
+          observed.value = sent.value;
+          const expectedKey = expected.applied ? expected.option_key : null;
+          const expectedValue = expected.applied ? expected.applied_key : null;
+          if (sent.key !== expectedKey || sent.value !== expectedValue) {
+            flag("sent_option_disagrees_with_effort_status");
+          }
+        }
+        if (state.first === null) {
+          state.first = observed;
+        } else if (
+          state.first.status !== observed.status ||
+          state.first.key !== observed.key ||
+          state.first.value !== observed.value
+        ) {
+          flag("option_changed_between_turns");
+        }
+      } catch (_err) {
+        state.corrupt = true;
+      }
+    },
+    recordAcknowledged() { state.acknowledgedCount += 1; },
+    recordFailure() { state.failed = true; },
+    snapshot() {
+      const count = state.sendTurnCount;
+      const sent = count > 0;
+      let unknownReason = state.corrupt ? "receipt_recorder_error" : state.unknownReason;
+      if (!unknownReason && count > VSCODE_LM_ATTEMPT_MAX_SEND_TURNS) unknownReason = "send_turn_count_out_of_bounds";
+      if (!unknownReason && sent && state.first === null) unknownReason = "receipt_recorder_error";
+      let optionStatus = "not_sent";
+      let optionKey = null;
+      let optionValue = null;
+      if (sent && unknownReason) {
+        optionStatus = "unknown";
+      } else if (sent) {
+        optionStatus = state.first.status;
+        optionKey = state.first.key;
+        optionValue = state.first.value;
+      }
+      const context = vscodeLmAttemptContext(state.model, request);
+      return {
+        schema_id: VSCODE_LM_REASONING_CONTEXT_ATTEMPT_SCHEMA,
+        request_id: scalar(identity.requestId),
+        repo_id: scalar(identity.repoId),
+        requested_model: scalar(identity.requestedModel),
+        host_model: vscodeLmAttemptModelIdentity(state.model),
+        requested_profile: vscodeLmCanonicalProfile(request),
+        send_state: sent ? "sent" : "not_sent",
+        send_turn_count: Math.min(count, VSCODE_LM_ATTEMPT_MAX_SEND_TURNS),
+        provider_request_acknowledged: sent && !state.failed && state.acknowledgedCount === count,
+        option_status: optionStatus,
+        option_key: optionKey,
+        option_value: optionValue,
+        context_capacity_tokens: context.tokens,
+        context_capacity_source: context.source,
+        provider_internal_state: "unknown",
+        unknown_reason: optionStatus === "unknown" ? unknownReason : null,
+      };
+    },
+  };
+}
+
+// Evidence is advisory: a recorder fault must never block terminal publication.
+function vscodeLmAttemptSnapshotOrNull(sendReceipt) {
+  try {
+    return sendReceipt ? sendReceipt.snapshot() : null;
+  } catch (_err) {
+    return null;
+  }
+}
+
 function vscodeLmLanguageModelRequestOptions(model, request, extra) {
   const effort = vscodeLmReasoningEffortReceipt(model, request);
   const options = {
@@ -4920,7 +5066,7 @@ function canonicalizeVscodeLmOptions(options) {
   }
 }
 
-function dedupeVscodeLmSendRequest(model, messages, options, cancellationToken, requestId, turn) {
+function dedupeVscodeLmSendRequest(model, messages, options, cancellationToken, requestId, turn, sendReceipt = null) {
   const modelKey = (model && (model.id || model.family || model.name)) || "model";
   const canonical = canonicalizeVscodeLmMessages(messages);
   // NF389 sealed correction: single-flight equivalence includes the canonical
@@ -4932,7 +5078,17 @@ function dedupeVscodeLmSendRequest(model, messages, options, cancellationToken, 
   const existing = vscodeLmInFlightCalls.get(key);
   if (existing) return existing;
   const providerCallId = synthesizeVscodeLmProviderCallId(requestId, turn, canonical, modelKey, canonicalOptions);
-  const promise = model.sendRequest(messages, options, cancellationToken);
+  // The single real send boundary: the attempt receipt captures the options
+  // handed to this exact invocation, never a replayed single-flight entry.
+  if (sendReceipt) sendReceipt.recordSend(model, options);
+  let promise;
+  try {
+    promise = model.sendRequest(messages, options, cancellationToken);
+  } catch (err) {
+    if (sendReceipt) sendReceipt.recordFailure();
+    throw err;
+  }
+  if (sendReceipt) promise.then(() => sendReceipt.recordAcknowledged(), () => sendReceipt.recordFailure());
   // The provider-call id is returned alongside the promise so callers consume
   // it and forward it into the authenticated worker audit identity; it is not
   // left dangling as an unused Promise property.
@@ -4969,6 +5125,7 @@ async function runVscodeLmTextProtocol(
   onToolTurn = null,
   onProviderPart = null,
   assertActive = null,
+  sendReceipt = null,
 ) {
   const assertRequestActive = () => {
     if (typeof assertActive === "function") assertActive();
@@ -5153,6 +5310,7 @@ async function runVscodeLmTextProtocol(
       cancellationToken,
       request.requestId,
       turn,
+      sendReceipt,
     );
     const turnProviderCallId = sendRequest.providerCallId || "";
     const response = await raceVscodeLmCancellation(sendRequest.promise, cancellationToken);
@@ -5620,11 +5778,12 @@ async function runVscodeLmAgent(
   onToolTurn = null,
   onProviderPart = null,
   assertActive = null,
+  sendReceipt = null,
 ) {
   if (!model) throw new Error("vscode_lm_model_not_visible");
   if (!model.capabilities || !model.capabilities.toolCalling) {
     return runVscodeLmTextProtocol(
-      model, request, cancellationToken, invokeTool, onToolTurn, onProviderPart, assertActive,
+      model, request, cancellationToken, invokeTool, onToolTurn, onProviderPart, assertActive, sendReceipt,
     );
   }
   const assertRequestActive = () => {
@@ -5767,7 +5926,7 @@ async function runVscodeLmAgent(
     }
     assertRequestActive();
     const sendRequest = dedupeVscodeLmSendRequest(
-      model, messages, options, cancellationToken, request.requestId, turn,
+      model, messages, options, cancellationToken, request.requestId, turn, sendReceipt,
     );
     const turnProviderCallId = sendRequest.providerCallId || "";
     const response = await raceVscodeLmCancellation(sendRequest.promise, cancellationToken);
@@ -6501,6 +6660,11 @@ class VscodeLmBridgeHost {
       let text = "";
       let error = "";
       let diagnostics = null;
+      const sendReceipt = createVscodeLmSendReceiptRecorder(request, model, {
+        requestId: request.requestId,
+        repoId: repoInfo.repoId,
+        requestedModel: vscodeLmAttemptRequestedModel(payload.model),
+      });
       try {
         text = await runVscodeLmAgent(
           model,
@@ -6515,6 +6679,7 @@ class VscodeLmBridgeHost {
               throw new Error("vscode_lm_request_cancelled");
             }
           },
+          sendReceipt,
         );
         writeProgress("final_edit");
       }
@@ -6562,6 +6727,7 @@ class VscodeLmBridgeHost {
         text,
         error,
         diagnostics,
+        reasoning_context_attempt: vscodeLmAttemptSnapshotOrNull(sendReceipt),
         decision: { action: "response", cancel_token: request.cancelToken },
         completed_at: new Date().toISOString(),
       };
@@ -11771,6 +11937,7 @@ module.exports = {
     vscodeLmLanguageModelRequestOptions,
     synthesizeVscodeLmProviderCallId,
     dedupeVscodeLmSendRequest,
+    createVscodeLmSendReceiptRecorder,
     vscodeLmInFlightCallsSize: () => vscodeLmInFlightCalls.size,
     clearVscodeLmInFlightCalls: () => vscodeLmInFlightCalls.clear(),
     constants: {
@@ -11802,6 +11969,8 @@ module.exports = {
       VSCODE_LM_PROGRESS_PHASES,
       VSCODE_LM_CANCEL_DECISION_SCHEMA,
       VSCODE_LM_CANCEL_POLL_MS,
+      VSCODE_LM_REASONING_CONTEXT_ATTEMPT_SCHEMA,
+      VSCODE_LM_ATTEMPT_MAX_SEND_TURNS,
       WINDOW_SCOPE_ID,
       DEBUG_TRACE_MAX_FILE_BYTES,
       DEBUG_TRACE_FLUSH_MS,
