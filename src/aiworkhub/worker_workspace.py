@@ -11982,7 +11982,7 @@ def _run_appcontainer_validation(
     cwd: str | Path,
     env: Mapping[str, str],
     timeout_seconds: int,
-) -> subprocess.CompletedProcess:
+) -> subprocess.CompletedProcess[str]:
     """Run one validation command inside this request's own AppContainer.
 
     Answers in ``subprocess.run``'s exact shapes so ``run_validations`` needs
