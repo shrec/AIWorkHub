@@ -598,6 +598,90 @@ def test_pinned_base_tampering_fails_closed(
         source_graph.connect(partition, read_only=True)
 
 
+class _ClosingProbe:
+    """Delegate to a real connection while recording ``close``."""
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+        self.closed = False
+
+    def execute(self, *args: object) -> sqlite3.Cursor:
+        return self._conn.execute(*args)
+
+    def close(self) -> None:
+        self.closed = True
+        self._conn.close()
+
+
+def _record_readonly_connects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[tuple[Path, _ClosingProbe]]:
+    calls: list[tuple[Path, _ClosingProbe]] = []
+    real = sgp.sqlite_readonly.connect_readonly
+
+    def recording(path: Path, **kwargs: float) -> _ClosingProbe:
+        probe = _ClosingProbe(real(path, **kwargs))
+        calls.append((Path(path), probe))
+        return probe
+
+    monkeypatch.setattr(sgp.sqlite_readonly, "connect_readonly", recording)
+    return calls
+
+
+def test_pin_verification_uses_readonly_helper_and_closes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """NF-2026-00948: pin verification opens via the shared read-only helper."""
+
+    _repo, _base_db, partition, _before = _pinned_partition(tmp_path)
+    (pin,) = _pins(partition.parent)
+    calls = _record_readonly_connects(monkeypatch)
+
+    sgp._verify_pinned_generation(pin)
+
+    assert [path for path, _probe in calls] == [pin]
+    probe = calls[0][1]
+    assert probe.closed
+    assert sgp.sqlite_readonly.DEFAULT_TIMEOUT == 5.0
+
+
+def test_pin_verification_closes_helper_connection_on_schema_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _repo, _base_db, partition, _before = _pinned_partition(tmp_path)
+    (pin,) = _pins(partition.parent)
+    calls = _record_readonly_connects(monkeypatch)
+    monkeypatch.setattr(
+        sgp,
+        "_BASE_PIN_REQUIRED_TABLES",
+        sgp._BASE_PIN_REQUIRED_TABLES | {"missing_table"},
+    )
+
+    with pytest.raises(
+        sgp.PartitionBasePinError, match="composed_base_pin_schema_incomplete"
+    ):
+        sgp._verify_pinned_generation(pin)
+
+    assert len(calls) == 1 and calls[0][1].closed
+
+
+def test_pin_verification_types_helper_open_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _repo, _base_db, partition, _before = _pinned_partition(tmp_path)
+    (pin,) = _pins(partition.parent)
+
+    def failing(path: Path, **kwargs: float) -> sqlite3.Connection:
+        raise sqlite3.OperationalError("unable to open database file")
+
+    monkeypatch.setattr(sgp.sqlite_readonly, "connect_readonly", failing)
+
+    with pytest.raises(
+        sgp.PartitionBasePinError, match="composed_base_pin_unreadable"
+    ):
+        sgp._verify_pinned_generation(pin)
+
+
 def test_pin_refuses_symlinked_missing_or_unverified_base(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()

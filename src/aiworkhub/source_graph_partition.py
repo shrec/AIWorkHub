@@ -69,6 +69,7 @@ from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 
 from . import source_graph as sg
+from . import sqlite_readonly
 
 COMPOSED_VIEW_META_KEY = "composed_view"
 COMPOSED_VIEW_SCHEMA_ID = "aiworkhub.source_graph.composed_view.v1"
@@ -413,7 +414,7 @@ def _verify_pinned_generation(pin_path: Path) -> None:
     """
 
     try:
-        conn = sqlite3.connect(f"{pin_path.as_uri()}?mode=ro", uri=True)
+        conn = sqlite_readonly.connect_readonly(pin_path)
         try:
             tables = {
                 str(row[0])
