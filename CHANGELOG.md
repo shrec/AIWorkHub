@@ -8,39 +8,39 @@ noted by package/extension version and release tag.
 
 ## [0.11.56] - 2026-09-21
 
+### Changed
+
+- The sealed-delta verifier that rework materialization already used is now the
+  write-free `verify_rework_delta_artifact`, which authenticates a sealed delta
+  and returns its exact plan; `materialize_rework_delta_artifact` delegates to
+  it. Recovery therefore authenticates a collected candidate with the same
+  verifier a successor materializes through.
+
 ### Fixed
 
-- Windows: native CLI workers (`claude_cli`, `codex_cli`, `opencode_cli`) now
-  reach `CreateProcess` inside their AppContainer. Two stacked defects stopped
-  every such card before the model ran, although preflight reported the route
-  launchable and the sandbox enforceable. First, `select_sandbox_backend()`
-  produced `windows_appcontainer` while `provision_worker_mcp_runtime`,
-  `sandbox_argv` and `run_validations` each refused it, so cards died as
-  `launch_failed:unsupported_sandbox_backend:windows_appcontainer`. Second,
-  `CreateProcessW` then failed with `ERROR_ENVVAR_NOT_FOUND` (203): AppContainer
-  process creation needs `LOCALAPPDATA` in the child's environment block, and
-  the sanitized worker and validation environments drop it.
-  `launch_appcontainer` now supplies it at the one chokepoint every
-  AppContainer launch shares.
-- Windows: validation commands run inside the worker's own AppContainer
-  through the existing container API, instead of being refused.
-- VS Code LM workers can read the files their card declared writable after
-  forced semantic-edit staging begins, not only the next required output. A
-  worker whose next edit had to call into another declared file was refused
-  and failed as `vscode_lm_semantic_edit_stage_required` (NF-2026-00023).
-  Reads stay read-only, exact, two per file and four in total.
-- `tests/test_worker_workspace.py` collects and runs on Windows instead of
-  aborting on `os.fchmod` and `os.O_CLOEXEC`.
+- Explicit manager recovery of a blocked task (`recover_blocked_rework`) can now
+  recover a timed-out candidate whose worktree retention already collected,
+  from the delta sealed when the attempt terminated (NF-2026-00594). Only a
+  truly absent worktree lets that delta stand in for it, and only when its
+  descriptor binds this exact repository, task, request and claim epoch to an
+  intact, non-symlinked artifact directly beneath the runtime's `rework_deltas`
+  directory whose packet holds exactly the terminal's hash-pinned changed
+  paths. Recovery then pins the descriptor on the successor's rework
+  predecessor, so the existing materializer restores the sealed bytes instead
+  of regenerating them. A present, dangling, symlinked or foreign worktree path
+  keeps every retained-worktree check; a tampered, missing, foreign or
+  mismatched delta fails closed with a typed `retained_terminal_candidate_*`
+  reason and leaves the task unchanged; and the clean-root escape refuses
+  (`clean_root_rework_sealed_delta_available`) rather than discard authenticated
+  sealed bytes.
 
-### Known issues
+### Not in this release
 
-- Windows native CLI workers still cannot run a task: inside the AppContainer
-  the provider CLI's own install is unreadable ("Access is denied.") because
-  nothing grants the container access to it, or to the worktree (NF-2026-00025).
-  Until that lands, the VS Code LM route is the only Windows worker route.
-- `aiworkhub_task_recover_blocked_rework` fails on Windows with `[WinError 87]`.
-- One pre-existing Windows byte-exactness gap remains in the npm-prefix seeding
-  test (NF-2026-00024).
+- LSP index integration, the OpenCode manager callback, provider-neutral
+  completion of the stage-gated Playbook, Muse worker qualification, and
+  portable `.aiworkhub` data are pending and not shipped here. Inferred
+  successor progression and causal reasoning-quality measurement also remain
+  incomplete.
 
 ## [0.11.55] - 2026-09-21
 

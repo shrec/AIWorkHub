@@ -64,17 +64,16 @@ structured findings into NeedFix with provenance.
 
 ## What's new in 0.11.56
 
-- Windows native CLI workers now reach `CreateProcess` inside their
-  AppContainer: the `windows_appcontainer` backend is accepted by every
-  consumer, and `LOCALAPPDATA` is supplied to the child environment block that
-  AppContainer creation requires.
-- Windows validation commands run inside the worker's own AppContainer.
-- VS Code LM workers can still read files their card declared writable after
-  forced semantic-edit staging begins (NF-2026-00023).
-- Known issues: native CLI workers still cannot run a Windows task until the
-  container is granted access to the provider install and worktree
-  (NF-2026-00025); blocked-card rework recovery fails on Windows with
-  `[WinError 87]`.
+- Explicit manager recovery of a blocked task can now recover a timed-out
+  candidate whose worktree retention already collected, from the delta sealed
+  when the attempt terminated. The sealed delta is accepted only when it
+  authenticates against the exact repository, task, request, claim epoch and
+  hash-pinned changed paths; anything else fails closed with a typed reason and
+  leaves the task unchanged, and the clean-root escape refuses rather than
+  discard the sealed bytes (NF-2026-00594).
+- LSP index integration, the OpenCode manager callback, provider-neutral
+  Playbook completion, Muse worker qualification and portable `.aiworkhub` data
+  are not part of this release and remain pending.
 
 ## What's new in 0.11.55
 

@@ -16,14 +16,15 @@ port, expose a LAN service or require an AIWorkHub cloud account.
 
 ## What's new in 0.11.56
 
-- Windows: bundled native CLI workers reach `CreateProcess` inside their
-  AppContainer, and bundled validation commands run inside it.
-- The VS Code LM bridge lets a worker read files its card declared writable
-  after forced semantic-edit staging begins (NF-2026-00023).
-- Known issues: native CLI workers still cannot run a Windows task until the
-  container is granted access to the provider install and worktree
-  (NF-2026-00025); blocked-card rework recovery fails on Windows with
-  `[WinError 87]`.
+- The bundled runtime's explicit manager recovery of a blocked task can now
+  recover a timed-out candidate whose worktree retention already collected,
+  from the delta sealed when the attempt terminated. The delta is accepted only
+  when it authenticates against the exact repository, task, request, claim epoch
+  and hash-pinned changed paths; anything else fails closed and leaves the task
+  unchanged (NF-2026-00594).
+- LSP index integration, the OpenCode manager callback, provider-neutral
+  Playbook completion, Muse worker qualification and portable `.aiworkhub` data
+  are not part of this release and remain pending.
 
 ## What's new in 0.11.55
 
