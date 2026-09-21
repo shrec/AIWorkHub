@@ -9121,3 +9121,636 @@ def test_landlock_still_grants_a_present_allowed_write_file_and_its_parent(
         worker_workspace._landlock_supported_mutations(3)
     ]
     assert _granted_rights(granted, workspace) == [], "root stays unwritable"
+
+
+# ---- NF-2026-00551 / NF919: literal repository assets named by a test --------
+#
+# A declared pytest module can depend on a repository-owned file without ever
+# importing or requiring it: ``tests/test_opencode_workforce_integration.py``
+# computes the path to ``vscode-extension/extension.js`` and runs Node against
+# it. The card cannot list that asset as an allowed write -- the task never
+# edits it -- so the Python and JS closures both looked straight past it and the
+# sparse workspace shipped without the file the declared command needs.
+#
+# Recognizing a literal reads authority out of repository content, so the tests
+# below pin both directions: extension.js is seeded, while a path naming the
+# private ``.aiworkhub`` store or an untracked file beside a tracked one is
+# refused. Only git-tracked, non-dot paths cross into a provider-visible tree.
+
+_DECLARED_ASSET_MODULE = (
+    "from pathlib import Path\n"
+    "\n"
+    "_EXTENSION_JS_PATH = (\n"
+    "    Path(__file__).resolve().parents[1]\n"
+    '    / "vscode-extension"\n'
+    '    / "extension.js"\n'
+    ")\n"
+    "\n"
+    "\n"
+    "def test_extension_asset_is_readable() -> None:\n"
+    "    assert _EXTENSION_JS_PATH.is_file()\n"
+)
+
+_COMPUTED_ASSET_MODULE = (
+    "from pathlib import Path\n"
+    "\n"
+    'NAME = "extension.js"\n'
+    "_ROOT = Path(__file__).resolve().parents[1]\n"
+    '_VIA_ALIAS = _ROOT / "vscode-extension" / NAME\n'
+    "_VIA_VARIABLE = (\n"
+    "    Path(__file__).resolve().parents[1]\n"
+    '    / "vscode-extension"\n'
+    "    / NAME\n"
+    ")\n"
+    "_ABSENT = (\n"
+    "    Path(__file__).resolve().parents[1]\n"
+    '    / "vscode-extension"\n'
+    '    / "absent.js"\n'
+    ")\n"
+    "\n"
+    "\n"
+    "def test_computed() -> None:\n"
+    "    assert _VIA_ALIAS.name == _VIA_VARIABLE.name\n"
+    "    assert not _ABSENT.exists()\n"
+)
+
+_TWO_ASSET_MODULE = (
+    "from pathlib import Path\n"
+    "\n"
+    "_FIRST = (\n"
+    "    Path(__file__).resolve().parents[1]\n"
+    '    / "vscode-extension"\n'
+    '    / "extension.js"\n'
+    ")\n"
+    "_SECOND = (\n"
+    "    Path(__file__).resolve().parents[1]\n"
+    '    / "vscode-extension"\n'
+    '    / "package.json"\n'
+    ")\n"
+    "\n"
+    "\n"
+    "def test_two() -> None:\n"
+    "    assert _FIRST.is_file() and _SECOND.is_file()\n"
+)
+
+_OUTSIDE_ROOT_ASSET_MODULE = (
+    "from pathlib import Path\n"
+    "\n"
+    '_OUTSIDE = Path(__file__).resolve().parents[2] / "outside.js"\n'
+    "\n"
+    "\n"
+    "def test_outside() -> None:\n"
+    "    assert _OUTSIDE.is_file()\n"
+)
+
+_PRIVATE_STORE_ASSET_MODULE = (
+    "from pathlib import Path\n"
+    "\n"
+    "_PROJECT = (\n"
+    "    Path(__file__).resolve().parents[1]\n"
+    '    / ".aiworkhub"\n'
+    '    / "project.json"\n'
+    ")\n"
+    "\n"
+    "\n"
+    "def test_private() -> None:\n"
+    "    assert _PROJECT.is_file()\n"
+)
+
+_UNTRACKED_ASSET_MODULE = (
+    "from pathlib import Path\n"
+    "\n"
+    "_SECRET = (\n"
+    "    Path(__file__).resolve().parents[1]\n"
+    '    / "vscode-extension"\n'
+    '    / "local-secret.js"\n'
+    ")\n"
+    "\n"
+    "\n"
+    "def test_secret() -> None:\n"
+    "    assert _SECRET.is_file()\n"
+)
+
+_IMPOSSIBLE_CLIMB_ASSET_MODULE = (
+    "from pathlib import Path\n"
+    "\n"
+    "_ABOVE_ROOT = (\n"
+    "    Path(__file__).resolve().parents[1000000000000]\n"
+    '    / "vscode-extension"\n'
+    '    / "extension.js"\n'
+    ")\n"
+    "\n"
+    "\n"
+    "def test_above_root() -> None:\n"
+    "    assert _ABOVE_ROOT.is_file()\n"
+)
+
+# Far past the anchor step cap and past the interpreter's recursion limit, so
+# the chain separates a bounded walk from a recursive one.
+_DEEP_PARENT_CHAIN_DEPTH = 2_000
+
+
+def _deep_parent_chain_module() -> str:
+    """A static anchor climbed one ``.parent`` at a time, thousands deep."""
+    anchor = "Path(__file__)" + ".parent" * _DEEP_PARENT_CHAIN_DEPTH
+    return (
+        "from pathlib import Path\n"
+        "\n"
+        f'_DEEP = {anchor} / "extension.js"\n'
+        "\n"
+        "\n"
+        "def test_deep() -> None:\n"
+        "    assert _DEEP.name\n"
+    )
+
+
+def _track(repo: Path, *relatives: str) -> None:
+    """Stage fixture paths so git reports them as repository-owned source."""
+    assert _git(repo, "add", *relatives).returncode == 0
+
+
+def _write_declared_asset_module(repo: Path, source: str) -> str:
+    """Write the declared pytest module whose literal paths name assets."""
+    module = repo / "tests" / "test_extension_bridge.py"
+    module.parent.mkdir(parents=True, exist_ok=True)
+    module.write_text(source, encoding="utf-8")
+    return "tests/test_extension_bridge.py"
+
+
+def _write_extension_asset(repo: Path, name: str = "extension.js") -> Path:
+    asset = repo / "vscode-extension" / name
+    asset.parent.mkdir(parents=True, exist_ok=True)
+    asset.write_text("module.exports = { activate() {} };\n", encoding="utf-8")
+    # The closure seeds only what git tracks, so a fixture asset has to be
+    # repository-owned the same way the real ``vscode-extension/extension.js``
+    # is -- otherwise the positive case would pass for the wrong reason.
+    _track(repo, f"vscode-extension/{name}")
+    return asset
+
+
+def _literal_asset_card() -> dict[str, object]:
+    return {
+        "allowed_writes": ["src/aiworkhub/worker_workspace.py"],
+        "read_first": ["src/aiworkhub/worker_workspace.py"],
+        "validation": ["python3 -m pytest -q tests/test_extension_bridge.py"],
+    }
+
+
+def test_pytest_validation_seeds_literal_repository_asset(repo: Path) -> None:
+    """NF-2026-00551/NF919, reproduced at the provisioning boundary.
+
+    The declared pytest module names an exact repository-owned asset and hands
+    it to a child process, so neither the Python import closure nor the JS
+    require closure can reach it, and the card cannot declare it as an allowed
+    write. The literal path is recognized statically -- read out of the module's
+    AST, never by executing it -- and seeded read-only before provider launch.
+    """
+    _commit_validation_worker_package(repo)
+    _write_extension_asset(repo)
+    _write_declared_asset_module(repo, _DECLARED_ASSET_MODULE)
+
+    live_seeded, support_seeded, seeded = (
+        worker_workspace._declared_workspace_seed_closure(
+            repo, _literal_asset_card(), ("src/aiworkhub/worker_workspace.py",)
+        )
+    )
+
+    assert "vscode-extension/extension.js" in support_seeded
+    assert "vscode-extension/extension.js" in seeded
+    # Read-only support, never a live writable seed: the card never declares it.
+    assert "vscode-extension/extension.js" not in live_seeded
+
+
+def test_pytest_validation_seeds_literal_repository_asset_refuses_a_symlink(
+    repo: Path,
+) -> None:
+    """A literal asset reached through a link is refused, never skipped.
+
+    The seed copier rejects symlinks, so quietly dropping this case would
+    provision a workspace whose declared command fails on an unexplained
+    missing file instead of naming the link that caused it.
+    """
+    _write_extension_asset(repo, "real-extension.js")
+    os.symlink(
+        repo / "vscode-extension" / "real-extension.js",
+        repo / "vscode-extension" / "extension.js",
+    )
+    module = _write_declared_asset_module(repo, _DECLARED_ASSET_MODULE)
+
+    with pytest.raises(worker_workspace.WorkspaceError) as excinfo:
+        worker_workspace._resolve_literal_repository_assets(repo, (module,))
+    assert "symlink" in str(excinfo.value)
+
+
+def test_pytest_validation_seeds_literal_repository_asset_refuses_outside_root(
+    repo: Path,
+) -> None:
+    """A literal path that leaves the repository is refused.
+
+    Such a file can never be provisioned into a sparse worktree, so failing
+    closed names the mis-declared dependency rather than producing a workspace
+    that cannot pass.
+    """
+    (repo.parent / "outside.js").write_text("module.exports = {};\n", encoding="utf-8")
+    module = _write_declared_asset_module(repo, _OUTSIDE_ROOT_ASSET_MODULE)
+
+    with pytest.raises(worker_workspace.WorkspaceError) as excinfo:
+        worker_workspace._resolve_literal_repository_assets(repo, (module,))
+    assert "path_escapes_workspace" in str(excinfo.value)
+
+
+def test_pytest_validation_seeds_literal_repository_asset_never_guesses(
+    repo: Path,
+) -> None:
+    """Only fully literal paths are recognized.
+
+    A component that comes from a variable is left alone even though the file
+    it would name exists, and a literal path with no regular file behind it is
+    simply not seeded.
+    """
+    _write_extension_asset(repo)
+    module = _write_declared_asset_module(repo, _COMPUTED_ASSET_MODULE)
+
+    assert worker_workspace._resolve_literal_repository_assets(repo, (module,)) == ()
+
+
+def test_pytest_validation_seeds_literal_repository_asset_respects_seed_limit(
+    monkeypatch: pytest.MonkeyPatch,
+    repo: Path,
+) -> None:
+    """Asset recognition accumulates under ``MAX_SEED_FILES`` like every other
+    closure, so a module naming many paths cannot widen the workspace without
+    bound."""
+    _write_extension_asset(repo)
+    (repo / "vscode-extension" / "package.json").write_text(
+        '{"name": "fixture"}\n', encoding="utf-8"
+    )
+    _track(repo, "vscode-extension/package.json")
+    module = _write_declared_asset_module(repo, _TWO_ASSET_MODULE)
+
+    assert worker_workspace._resolve_literal_repository_assets(repo, (module,)) == (
+        "vscode-extension/extension.js",
+        "vscode-extension/package.json",
+    )
+
+    monkeypatch.setattr(worker_workspace, "MAX_SEED_FILES", 1)
+    with pytest.raises(worker_workspace.WorkspaceError) as excinfo:
+        worker_workspace._resolve_literal_repository_assets(repo, (module,))
+    assert "seed_file_limit_exceeded" in str(excinfo.value)
+
+
+def test_pytest_validation_seeds_literal_repository_asset_refuses_private(
+    repo: Path,
+) -> None:
+    """A literal ``.aiworkhub`` path never becomes a seed.
+
+    The coordinator's private store lives inside the repository and holds task
+    state, runtime credentials and the nested worktrees themselves.  A declared
+    pytest module is repository content -- on a card that may write tests, the
+    candidate's own content -- so resolving any literal it names would let that
+    module nominate those bytes for copying into the provider-visible sparse
+    worktree, widening workspace authority from declared inputs to arbitrary
+    private files.
+    """
+    _commit_validation_worker_package(repo)
+    private = repo / ".aiworkhub" / "project.json"
+    private.parent.mkdir(parents=True, exist_ok=True)
+    private.write_text('{"token": "do-not-disclose"}\n', encoding="utf-8")
+    # Tracked deliberately: the refusal is categorical, not a side effect of
+    # this path happening to be ignored in some particular checkout.
+    _track(repo, ".aiworkhub/project.json")
+    module = _write_declared_asset_module(repo, _PRIVATE_STORE_ASSET_MODULE)
+
+    assert worker_workspace._resolve_literal_repository_assets(repo, (module,)) == ()
+
+    _live, support_seeded, seeded = worker_workspace._declared_workspace_seed_closure(
+        repo, _literal_asset_card(), ("src/aiworkhub/worker_workspace.py",)
+    )
+
+    # ``create_workspace`` copies every support seed out of the canonical repo,
+    # so absence here is what keeps the bytes out of the worker's reach.
+    assert ".aiworkhub/project.json" not in support_seeded
+    assert ".aiworkhub/project.json" not in seeded
+
+
+def test_pytest_validation_seeds_literal_repository_asset_refuses_untracked(
+    repo: Path,
+) -> None:
+    """An untracked file beside a tracked asset is local state, not source.
+
+    ``vscode-extension/`` is a legitimate source directory, so a path-shape rule
+    alone would happily copy anything dropped inside it.  Git's index is what
+    separates repository-owned source from a developer's scratch file, and only
+    the tracked one is allowed across into the workspace.
+    """
+    _write_extension_asset(repo)
+    secret = repo / "vscode-extension" / "local-secret.js"
+    secret.write_text(
+        "module.exports = { token: 'do-not-disclose' };\n", encoding="utf-8"
+    )
+    module = _write_declared_asset_module(repo, _UNTRACKED_ASSET_MODULE)
+
+    # A regular file, inside a source directory, reachable and readable: the
+    # only thing that disqualifies it is that the repository does not own it.
+    assert secret.is_file()
+    assert worker_workspace._resolve_literal_repository_assets(repo, (module,)) == ()
+
+
+def test_pytest_validation_seeds_literal_repository_asset_refuses_impossible_climb(
+    repo: Path,
+) -> None:
+    """An anchor climbing above the repository is refused on arithmetic.
+
+    ``parents[1000000000000]`` is one static integer in the module's AST, and
+    walking it a parent at a time to discover that it left the repository would
+    hold coordinator provisioning for hours before the beneath-root guard could
+    say so.  The declaring module is only two components deep, so a climb past
+    that is impossible before any path is touched -- and the elapsed-time bound
+    below is what makes the refusal cheap rather than merely correct.
+    """
+    _write_extension_asset(repo)
+    module = _write_declared_asset_module(repo, _IMPOSSIBLE_CLIMB_ASSET_MODULE)
+
+    started = time.monotonic()
+    with pytest.raises(worker_workspace.WorkspaceError) as excinfo:
+        worker_workspace._resolve_literal_repository_assets(repo, (module,))
+    elapsed = time.monotonic() - started
+
+    assert "path_escapes_workspace" in str(excinfo.value)
+    # Slack enough that this measures the cap and not the machine, while still
+    # separating an O(1) refusal from a trillion-step climb by a wide margin.
+    assert elapsed < 10.0
+
+
+def test_pytest_validation_seeds_literal_repository_asset_bounds_deep_parent_chain(
+    repo: Path,
+) -> None:
+    """A deeply chained ``.parent`` anchor resolves nothing and never crashes.
+
+    ``ast.parse`` builds this chain without recursing, so recognizing the anchor
+    was the only step that could not survive it: one recursive call per
+    ``.parent`` raised RecursionError straight out of provisioning, an untyped
+    crash on a path that only reads repository content.  Past the step cap the
+    expression is simply not an anchor, which is the same answer any other
+    unrecognized expression gets.
+    """
+    _write_extension_asset(repo)
+    module = _write_declared_asset_module(repo, _deep_parent_chain_module())
+
+    started = time.monotonic()
+    assert worker_workspace._resolve_literal_repository_assets(repo, (module,)) == ()
+    assert time.monotonic() - started < 10.0
+
+
+# A literal asset was nominated by a declared test module, not by the card, so
+# whatever its local requires reach was nominated by that same content and may
+# cross only under the asset's own rules: tracked by git, no dot component. The
+# card's own JS roots keep the ungated walk in ``_resolve_local_js_requires``.
+
+
+def _write_requiring_extension(repo: Path, *targets: str) -> None:
+    """Track an ``extension.js`` whose local requires name exactly ``targets``."""
+    asset = repo / "vscode-extension" / "extension.js"
+    asset.parent.mkdir(parents=True, exist_ok=True)
+    asset.write_text(
+        "".join(f"require('{target}');\n" for target in targets)
+        + "module.exports = { activate() {} };\n",
+        encoding="utf-8",
+    )
+    _track(repo, "vscode-extension/extension.js")
+
+
+def _write_tracked_runtime(repo: Path, name: str, source: str) -> str:
+    relative = f"vscode-extension/{name}"
+    (repo / relative).write_text(source, encoding="utf-8")
+    _track(repo, relative)
+    return relative
+
+
+def test_pytest_validation_seeds_literal_repository_asset_require_chain(
+    repo: Path,
+) -> None:
+    """A literal asset still brings its tracked ``./runtime-*`` require chain.
+
+    The gate on what a literal asset requires admits repository-owned source, so
+    the measured shape -- ``extension.js`` -> ``./runtime-retention`` ->
+    ``./runtime-provider-boundary`` -- still arrives whole, as read-only support.
+    """
+    _commit_validation_worker_package(repo)
+    _write_requiring_extension(repo, "./runtime-retention")
+    chain = (
+        "vscode-extension/extension.js",
+        _write_tracked_runtime(
+            repo,
+            "runtime-retention.js",
+            "module.exports = require('./runtime-provider-boundary');\n",
+        ),
+        _write_tracked_runtime(
+            repo, "runtime-provider-boundary.js", "module.exports = {};\n"
+        ),
+    )
+    _write_declared_asset_module(repo, _DECLARED_ASSET_MODULE)
+
+    live_seeded, support_seeded, _seeded = (
+        worker_workspace._declared_workspace_seed_closure(
+            repo, _literal_asset_card(), ("src/aiworkhub/worker_workspace.py",)
+        )
+    )
+
+    assert set(chain) <= set(support_seeded)
+    assert not set(chain) & set(live_seeded)
+
+
+def test_pytest_validation_seeds_literal_repository_asset_requires_only_source(
+    repo: Path,
+) -> None:
+    """A literal asset's requires never carry private or untracked bytes across.
+
+    The asset itself passes both literal rules, but what its requires reach was
+    nominated by the same declared module, so it has to pass them too: a tracked
+    ``.aiworkhub/project.json`` and an untracked sibling are both refused, while
+    the tracked sibling beside them still seeds -- the gate filters the walk, it
+    does not stop it.
+    """
+    _commit_validation_worker_package(repo)
+    _write_requiring_extension(
+        repo, "./runtime-retention", "../.aiworkhub/project.json", "./local-secret.js"
+    )
+    _write_tracked_runtime(repo, "runtime-retention.js", "module.exports = {};\n")
+    private = repo / ".aiworkhub" / "project.json"
+    private.parent.mkdir(parents=True, exist_ok=True)
+    private.write_text('{"token": "do-not-disclose"}\n', encoding="utf-8")
+    # Tracked deliberately, as for the direct literal: the refusal is
+    # categorical, not a side effect of an ignore rule in this checkout.
+    _track(repo, ".aiworkhub/project.json")
+    (repo / "vscode-extension" / "local-secret.js").write_text(
+        "module.exports = { token: 'do-not-disclose' };\n", encoding="utf-8"
+    )
+    _write_declared_asset_module(repo, _DECLARED_ASSET_MODULE)
+
+    _live, support_seeded, seeded = worker_workspace._declared_workspace_seed_closure(
+        repo, _literal_asset_card(), ("src/aiworkhub/worker_workspace.py",)
+    )
+
+    assert "vscode-extension/runtime-retention.js" in support_seeded
+    # ``create_workspace`` copies every seed out of the canonical repository, so
+    # absence here is what keeps these bytes out of the provider's reach.
+    assert ".aiworkhub/project.json" not in seeded
+    assert "vscode-extension/local-secret.js" not in seeded
+
+
+def test_pytest_validation_seeds_literal_repository_asset_require_skips_nul(
+    repo: Path,
+) -> None:
+    """A NUL inside a literal asset's require target is skipped, never raised.
+
+    The target comes out of the asset's own bytes, and ``os`` raises an untyped
+    ValueError on a NUL rather than answering for it; it names no file, so
+    nothing is seeded for it and provisioning carries on.
+    """
+    _write_requiring_extension(repo, "./runtime\x00.js")
+
+    assert worker_workspace._resolve_literal_asset_requires(
+        repo, ("vscode-extension/extension.js",), ()
+    ) == ("vscode-extension/extension.js",)
+
+
+# CPython refuses int-to-str conversion past this many digits; 0 disables it.
+_INT_STR_DIGITS = sys.get_int_max_str_digits() or 4300
+
+
+@pytest.mark.parametrize(
+    "index",
+    ["0x" + "f" * (_INT_STR_DIGITS + 1), "9" * _INT_STR_DIGITS],
+    ids=["hex-past-the-limit", "decimal-at-the-limit"],
+)
+def test_pytest_validation_seeds_literal_repository_asset_bounds_huge_parents_index(
+    repo: Path, index: str
+) -> None:
+    """A ``parents[...]`` literal too long to format still fails closed, typed.
+
+    A hex literal parses at any length, and the parser accepts a decimal one of
+    exactly the digit limit -- the climb then adds one level and passes it.
+    Interpolating either total into the refusal raised CPython's untyped
+    ValueError out of provisioning instead of the WorkspaceError every other
+    impossible climb gets.
+    """
+    _write_extension_asset(repo)
+    module = _write_declared_asset_module(
+        repo,
+        "from pathlib import Path\n"
+        "\n"
+        f'_HUGE = Path(__file__).resolve().parents[{index}] / "extension.js"\n',
+    )
+
+    with pytest.raises(worker_workspace.WorkspaceError) as excinfo:
+        worker_workspace._resolve_literal_repository_assets(repo, (module,))
+    assert "path_escapes_workspace" in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    "components",
+    [
+        '"vscode-extension" / "extension.js\\x00"',
+        '"vscode-extension\\x00" / "extension.js"',
+    ],
+    ids=["nul-in-file-name", "nul-in-directory"],
+)
+def test_pytest_validation_seeds_literal_repository_asset_skips_nul_component(
+    repo: Path, components: str
+) -> None:
+    """A literal component carrying NUL names no file, so it seeds nothing.
+
+    No POSIX path can hold a NUL, and ``os`` raises an untyped ValueError rather
+    than answering for one, so the component is refused before any filesystem
+    call instead of crashing provisioning. The real asset stays tracked and
+    readable beside it, so only the NUL explains the empty result.
+    """
+    _write_extension_asset(repo)
+    module = _write_declared_asset_module(
+        repo,
+        "from pathlib import Path\n"
+        "\n"
+        f"_NUL = Path(__file__).resolve().parents[1] / {components}\n",
+    )
+
+    assert worker_workspace._resolve_literal_repository_assets(repo, (module,)) == ()
+
+
+@pytest.mark.parametrize(
+    "components",
+    [
+        '"vscode-extension" / "extension.js\\ud800"',
+        f'"vscode-extension" / "{"x" * 256}.js"',
+        f'"{"x/" * 2048}vscode-extension" / "extension.js"',
+    ],
+    ids=["lone-surrogate", "component-past-name-max", "path-past-path-max"],
+)
+def test_pytest_validation_seeds_literal_repository_asset_skips_unrepresentable_path(
+    repo: Path, components: str
+) -> None:
+    """A literal no OS path can hold seeds nothing, exactly as a NUL does.
+
+    ``os`` cannot encode a lone surrogate, and the kernel refuses a component
+    past NAME_MAX or a whole path past PATH_MAX before any lookup, so each one
+    raised an untyped UnicodeEncodeError or ENAMETOOLONG out of provisioning.
+    None of them names a file, so each is refused before any filesystem call.
+    """
+    _write_extension_asset(repo)
+    module = _write_declared_asset_module(
+        repo,
+        "from pathlib import Path\n"
+        "\n"
+        f"_ASSET = Path(__file__).resolve().parents[1] / {components}\n",
+    )
+
+    assert worker_workspace._resolve_literal_repository_assets(repo, (module,)) == ()
+
+
+def test_pytest_validation_seeds_literal_repository_asset_windows_components() -> None:
+    """A deep Windows path is judged per component, never as one long name.
+
+    Splitting the encoded bytes on ``/`` alone saw a nested ``PureWindowsPath``
+    (stringified with ``\\``) as a single 285-byte component and refused a valid
+    tracked asset; Linux PATH_MAX is not Windows semantics either.
+    """
+    from pathlib import PurePosixPath, PureWindowsPath
+
+    deep = PureWindowsPath("C:/" + "/".join(["short"] * 45) + "/extension.js")
+    assert len(str(deep)) > 255
+    assert not worker_workspace._is_unrepresentable_path(deep)
+    too_deep = PureWindowsPath("C:/" + "/".join(["short"] * 800) + "/extension.js")
+    assert not worker_workspace._is_unrepresentable_path(too_deep)
+    assert worker_workspace._is_unrepresentable_path(
+        PureWindowsPath("C:/repo/" + "x" * 256 + "/extension.js")
+    )
+    assert worker_workspace._is_unrepresentable_path(PureWindowsPath("C:/a\x00b"))
+    posix_deep = PurePosixPath("/" + "/".join(["short"] * 45) + "/extension.js")
+    assert not worker_workspace._is_unrepresentable_path(posix_deep)
+    assert worker_workspace._is_unrepresentable_path(
+        PurePosixPath("/repo/" + "x" * 256 + "/extension.js")
+    )
+
+
+@pytest.mark.parametrize(
+    "target",
+    ["./" + "x" * 256, "./" + "x" * 252],
+    ids=["target-past-name-max", "derived-name-past-name-max"],
+)
+def test_pytest_validation_seeds_literal_repository_asset_require_overlong_is_typed(
+    repo: Path, target: str
+) -> None:
+    """A literal asset's require past NAME_MAX fails closed typed, not as OSError.
+
+    The kernel refuses such a name before any lookup, whether it is the target
+    itself or only the ``.json`` sibling derived from it, and that ENAMETOOLONG
+    escaped provisioning untyped. A name no OS path can hold is never tried, so
+    the require is unresolved like any other and gets the same typed refusal.
+    """
+    _write_requiring_extension(repo, target)
+
+    with pytest.raises(worker_workspace.WorkspaceError) as excinfo:
+        worker_workspace._resolve_literal_asset_requires(
+            repo, ("vscode-extension/extension.js",), ()
+        )
+    assert "validation_js_require_unresolved" in str(excinfo.value)

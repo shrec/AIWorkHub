@@ -38,7 +38,7 @@ from collections import OrderedDict
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 from typing import TYPE_CHECKING, Any, Callable, Iterable
 
 if TYPE_CHECKING:
@@ -1783,7 +1783,10 @@ def _resolve_one_local_js_require(
     ``<target>/index.js``, then ``<target>/index.json``, mirroring Node's own
     file-before-directory order. Every candidate still passes through
     ``_require_beneath`` (beneath + symlink enforcement), so this only widens
-    which filenames are considered -- never where they may resolve.
+    which filenames are considered -- never where they may resolve.  A derived
+    name no OS path can hold (:func:`_is_unrepresentable_path`) names no file,
+    so it is never tried: a target past ``NAME_MAX`` is left unresolved, to fail
+    closed typed, instead of raising ENAMETOOLONG out of provisioning.
     """
     base = including_dir / PurePosixPath(target)
     if base.suffix in (".js", ".json"):
@@ -1796,6 +1799,8 @@ def _resolve_one_local_js_require(
             base / "index.json",
         )
     for candidate in candidates:
+        if _is_unrepresentable_path(candidate):
+            continue
         resolved = _require_beneath(repo, candidate)
         if resolved.is_symlink():
             raise WorkspaceError(
@@ -1848,6 +1853,362 @@ def _resolve_local_js_requires(repo: Path, seeded: Iterable[str]) -> tuple[str, 
                 pending.append(candidate_relative)
                 if len(rows) > MAX_SEED_FILES:
                     raise WorkspaceError(f"seed_file_limit_exceeded:{len(rows)}")
+    return tuple(sorted(rows))
+
+
+# NF-2026-00551 (NF919): a declared pytest module can depend on a repository
+# file it never imports or requires. ``tests/test_opencode_workforce_
+# integration.py`` computes ``Path(__file__).resolve().parents[1] /
+# "vscode-extension" / "extension.js"`` and runs Node against it, so both
+# closures above look straight past it, and the card cannot list it as an
+# allowed write because the task never edits it. Recognition is static -- the
+# path is read out of the module's AST, never by executing the module -- and
+# deliberately narrow: a repository-root anchor derived from the module's own
+# location, then string-literal components only. A component that is not a
+# literal is left alone rather than guessed, so a computed name can never widen
+# the seed set. Following a module-level alias (``_ROOT = Path(__file__)...``)
+# is the next widening a measured case may ask for; no measured case needs it
+# yet, so it is not carried speculatively.
+_ASSET_ANCHOR_NORMALIZERS = frozenset({"resolve", "absolute"})
+
+
+# A module is free to write ``Path(__file__)`` followed by ten thousand
+# ``.parent`` attributes, and recursing once per attribute would raise
+# RecursionError out of a provisioning walk that only reads repository content.
+# The walk below is iterative and step-capped instead: past the cap the
+# expression is simply not an anchor, which gives up nothing real -- no anchor
+# naming a file inside this repository is written 64 steps deep.
+_MAX_ASSET_ANCHOR_STEPS = 64
+
+
+def _literal_asset_anchor_levels(node: ast.AST) -> int | None:
+    """Levels above the declaring module for a static ``__file__`` anchor.
+
+    ``Path(__file__)`` is level 0 -- the module file itself -- and ``.parent``
+    and ``.parents[n]`` climb from there. ``None`` means the expression is not a
+    static module-relative anchor and must therefore not be resolved at all.
+    """
+    levels = 0
+    cursor: ast.AST = node
+    for _ in range(_MAX_ASSET_ANCHOR_STEPS):
+        if isinstance(cursor, ast.Call):
+            func = cursor.func
+            called = (
+                func.id if isinstance(func, ast.Name) else getattr(func, "attr", "")
+            )
+            if called == "Path":
+                argument = cursor.args[0] if len(cursor.args) == 1 else None
+                if isinstance(argument, ast.Name) and argument.id == "__file__":
+                    # Saturated: no module lies ``sys.maxsize`` deep, so the
+                    # caller's depth comparison is unchanged, while a
+                    # ``parents[...]`` literal as long as the source file never
+                    # reaches int-to-str formatting, which CPython refuses past
+                    # 4300 digits with an untyped ValueError.
+                    return min(levels, sys.maxsize)
+                return None
+            if (
+                isinstance(func, ast.Attribute)
+                and called in _ASSET_ANCHOR_NORMALIZERS
+                and not cursor.args
+            ):
+                cursor = func.value
+                continue
+            return None
+        if isinstance(cursor, ast.Attribute) and cursor.attr == "parent":
+            levels += 1
+            cursor = cursor.value
+            continue
+        if isinstance(cursor, ast.Subscript):
+            parents = cursor.value
+            index = cursor.slice
+            if (
+                isinstance(parents, ast.Attribute)
+                and parents.attr == "parents"
+                and isinstance(index, ast.Constant)
+                and isinstance(index.value, int)
+                and not isinstance(index.value, bool)
+                and index.value >= 0
+            ):
+                # ``index.value`` may be any size here; the total saturates on
+                # return, and the caller refuses an impossible one before any
+                # path is walked.
+                levels += index.value + 1
+                cursor = parents.value
+                continue
+        return None
+    return None
+
+
+def _literal_asset_path_parts(node: ast.BinOp) -> tuple[int, tuple[str, ...]] | None:
+    """Flatten ``<anchor> / "a" / "b"`` into anchor levels and literal parts."""
+    parts: list[str] = []
+    cursor: ast.AST = node
+    while isinstance(cursor, ast.BinOp) and isinstance(cursor.op, ast.Div):
+        right = cursor.right
+        if not (isinstance(right, ast.Constant) and isinstance(right.value, str)):
+            return None
+        parts.insert(0, right.value)
+        cursor = cursor.left
+    levels = _literal_asset_anchor_levels(cursor)
+    # Level 0 is the module file itself, and joining path components onto a file
+    # names nothing this can resolve, so only a directory anchor is accepted.
+    if levels is None or levels < 1 or not parts:
+        return None
+    return levels, tuple(parts)
+
+
+_LITERAL_ASSET_TRACKED_TIMEOUT_SECONDS = 30.0
+
+
+def _is_private_repository_path(relative: str) -> bool:
+    """True when a repo-relative path names private state rather than source.
+
+    Every dot-prefixed component is refused: ``.git`` metadata, the
+    ``.aiworkhub`` coordinator store (project state, runtime credentials and the
+    nested worktrees beneath it) and dot-directories generally.  The module-level
+    ``_VALIDATION_QUALITY_SUPPORT`` map may still name a ``.aiworkhub`` file
+    because *this source* chose it; what matters is authorship, not the path --
+    a literal read out of repository content was chosen by that content, so it
+    is given no comparable reach.
+    """
+    return any(part.startswith(".") for part in PurePosixPath(relative).parts)
+
+
+# Linux NAME_MAX, and PATH_MAX counting its terminating NUL: the kernel refuses a
+# longer component or path with ENAMETOOLONG before it looks anything up.
+_OS_NAME_MAX = 255
+_OS_PATH_MAX = 4096
+# Win32 caps each component at 255 UTF-16 code units; the whole-path cap there
+# depends on long-path configuration, so no Linux byte PATH_MAX is imposed.
+_WINDOWS_NAME_MAX = 255
+
+
+def _is_unrepresentable_path(path: PurePath) -> bool:
+    """True when ``os`` would raise on ``path`` instead of answering for it.
+
+    A NUL, a lone surrogate the filesystem encoding cannot carry, a component
+    past ``NAME_MAX`` or a path past ``PATH_MAX`` names no file at all, yet any
+    ``os`` call raises an untyped ValueError, UnicodeEncodeError or OSError on
+    one.  A path read out of repository content is checked here before any
+    filesystem call, so it is declined as naming nothing instead.  Components
+    come from the path flavour's own ``parts``, so a Windows separator is never
+    mistaken for part of one long component.
+    """
+    if "\x00" in str(path):
+        return True
+    if isinstance(path, PureWindowsPath):
+        try:
+            return any(
+                len(part.encode("utf-16-le")) // 2 > _WINDOWS_NAME_MAX
+                for part in path.parts
+            )
+        except UnicodeEncodeError:
+            return True
+    try:
+        encoded_parts = [os.fsencode(part) for part in path.parts]
+        encoded = os.fsencode(str(path))
+    except UnicodeEncodeError:
+        return True
+    return len(encoded) >= _OS_PATH_MAX or any(
+        len(part) > _OS_NAME_MAX for part in encoded_parts
+    )
+
+
+def _tracked_repository_paths(repo: Path, candidates: Iterable[str]) -> set[str]:
+    """Return the subset of ``candidates`` that git reports as tracked.
+
+    The index is the only authority for "repository-owned source": an untracked
+    or ignored file sitting beside a tracked one is local private state -- a
+    scratch credential, a build artifact, a developer's notes -- and copying it
+    into a provider-visible worktree would disclose it.  ``--literal-pathspecs``
+    stops a ``*`` or ``[`` inside a declared path from being read as a glob that
+    widens the answer, and ``--full-name`` anchors the reply to the repository
+    root so any disagreement denies rather than mis-resolves.  Every git failure
+    yields the empty set, which seeds nothing.
+    """
+    paths = tuple(candidates)
+    if not paths:
+        return set()
+    try:
+        completed = _run(
+            [
+                "git",
+                "--literal-pathspecs",
+                "ls-files",
+                "-z",
+                "--full-name",
+                "--",
+                *paths,
+            ],
+            cwd=repo,
+            timeout=_LITERAL_ASSET_TRACKED_TIMEOUT_SECONDS,
+            phase="workspace_provision",
+        )
+    except (GitCommandTimeout, subprocess.SubprocessError, OSError, ValueError):
+        return set()
+    if completed.returncode != 0:
+        return set()
+    return {row for row in completed.stdout.split("\x00") if row}
+
+
+def _resolve_literal_repository_assets(
+    repo: Path, test_files: Iterable[str]
+) -> tuple[str, ...]:
+    """Return the bounded literal-asset closure for declared pytest modules.
+
+    Only the outermost ``/`` chain of an expression is resolved, so the
+    directory prefix of a chain whose last component is computed is never seeded
+    on its own. Each resolved asset passes the same beneath-root and symlink-
+    component guards as every other closure -- a literal that escapes the
+    repository or hides behind a link fails closed rather than being dropped in
+    silence -- and only a regular file is seeded, so a literal naming a
+    directory or naming nothing at all simply contributes no seed.
+
+    A declared module is repository *content*, and on a card that may write
+    tests it is content the candidate itself controls, so recognizing a literal
+    must not hand that module authority over which canonical bytes reach the
+    provider.  Two categorical rules bound that reach, and a path failing either
+    one is refused rather than copied: no dot-prefixed component
+    (:func:`_is_private_repository_path`), and git must report the path as
+    tracked (:func:`_tracked_repository_paths`).  Neither refusal opens the
+    file it declines.
+    """
+    repo = repo.resolve()
+    rows: set[str] = set()
+    for relative in sorted({_relative_repo_path(value) for value in test_files}):
+        module_path = repo / relative
+        if module_path.is_symlink() or not module_path.is_file():
+            continue
+        try:
+            tree = ast.parse(module_path.read_text(encoding="utf-8", errors="replace"))
+        except (OSError, RecursionError, SyntaxError, ValueError):
+            # A module this walk cannot parse -- including one nested deeply
+            # enough to exhaust the parser's own recursion budget -- contributes
+            # no seeds, rather than raising out of a provisioning path that only
+            # reads repository content.
+            continue
+        module_parts = PurePosixPath(relative).parts
+        nested_chains = {
+            id(node.left)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.BinOp)
+            and isinstance(node.op, ast.Div)
+            and isinstance(node.left, ast.BinOp)
+            and isinstance(node.left.op, ast.Div)
+        }
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.BinOp) or not isinstance(node.op, ast.Div):
+                continue
+            if id(node) in nested_chains:
+                continue
+            flattened = _literal_asset_path_parts(node)
+            if flattened is None:
+                continue
+            levels, parts = flattened
+            if any(part.startswith(".") for part in parts):
+                # Refused before the filesystem is touched at all, so a literal
+                # naming ``.aiworkhub/project.json`` is never even stat-ed.
+                continue
+            if levels > len(module_parts):
+                # A climb past the repository root can never name an in-repo
+                # asset, and ``parents[1000000000000]`` would otherwise walk a
+                # trillion parents before the guard below could say so. Refuse
+                # on arithmetic, with the same fail-closed error the resolved
+                # path would have raised.
+                raise WorkspaceError(f"path_escapes_workspace:{relative}^{levels}")
+            anchor = repo.joinpath(*module_parts[: len(module_parts) - levels])
+            candidate = anchor.joinpath(*parts)
+            if _is_unrepresentable_path(candidate):
+                # Equally before any ``os`` call: a NUL, an unencodable code
+                # point or an overlong name names no file, so it seeds nothing
+                # rather than raising an untyped error out of provisioning.
+                continue
+            resolved = _require_beneath(repo, candidate)
+            if not resolved.is_file():
+                continue
+            asset = _relative_repo_path(resolved.relative_to(repo).as_posix())
+            # The climb above can land on a dot-directory the literal parts
+            # never named, so the resolved path is re-checked in full.
+            if _is_private_repository_path(asset) or asset in rows:
+                continue
+            rows.add(asset)
+            if len(rows) > MAX_SEED_FILES:
+                raise WorkspaceError(f"seed_file_limit_exceeded:{len(rows)}")
+    # Bound the scan first (above), then authenticate what survived: the limit
+    # constrains how much a module may make this walk resolve, not just how much
+    # of it turns out to be tracked.
+    return tuple(sorted(rows & _tracked_repository_paths(repo, sorted(rows))))
+
+
+def _resolve_literal_asset_requires(
+    repo: Path, assets: Iterable[str], seeded: Iterable[str]
+) -> tuple[str, ...]:
+    """Follow literal assets' local ``require`` edges, admitting only source.
+
+    A literal asset was nominated by repository content rather than by the
+    card, so whatever its requires reach was nominated by that content too and
+    crosses into the provider-visible worktree only under the asset's own two
+    rules: no dot-prefixed component and a git-tracked path.  A require failing
+    either rule is neither seeded nor followed -- ``extension.js`` still brings
+    its tracked ``./runtime-*`` siblings, while ``../.aiworkhub/project.json``
+    is refused before it is even stat-ed and an untracked ``./local-secret.js``
+    stays behind.  A target carrying NUL names no file and is skipped before
+    ``os`` could raise an untyped ValueError on it.
+
+    The card's own roots keep the ungated walk of
+    :func:`_resolve_local_js_requires`, and everything ``seeded`` holds was
+    walked there, so it is not walked again.  Links, escapes and unresolved
+    requires fail closed exactly as in that walk, and ``MAX_SEED_FILES`` bounds
+    each layer's scan before git authenticates what the layer found.
+    """
+    repo = repo.resolve()
+    rows = set(seeded)
+    frontier = set(assets) - rows
+    while frontier:
+        rows |= frontier
+        if len(rows) > MAX_SEED_FILES:
+            raise WorkspaceError(f"seed_file_limit_exceeded:{len(rows)}")
+        discovered: set[str] = set()
+        for relative in sorted(frontier):
+            source_path = repo / relative
+            if (
+                not relative.endswith(".js")
+                or source_path.is_symlink()
+                or not source_path.is_file()
+            ):
+                continue
+            try:
+                text = source_path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            including_dir = source_path.parent
+            for match in _JS_LOCAL_REQUIRE_RE.finditer(text):
+                target = match.group(1)
+                if "\x00" in target:
+                    continue
+                lexical = Path(os.path.abspath(including_dir / target))
+                if repo in lexical.parents and _is_private_repository_path(
+                    lexical.relative_to(repo).as_posix()
+                ):
+                    continue
+                candidate = _resolve_one_local_js_require(repo, including_dir, target)
+                if candidate is None:
+                    raise WorkspaceError(
+                        f"validation_js_require_unresolved:{relative}:{target}"
+                    )
+                candidate_relative = candidate.relative_to(repo).as_posix()
+                # Re-checked once resolved: an extensionless target is tried
+                # under derived names the lexical check above never saw.
+                if candidate_relative in rows or _is_private_repository_path(
+                    candidate_relative
+                ):
+                    continue
+                discovered.add(candidate_relative)
+                if len(rows) + len(discovered) > MAX_SEED_FILES:
+                    raise WorkspaceError(
+                        f"seed_file_limit_exceeded:{len(rows) + len(discovered)}"
+                    )
+        frontier = discovered & _tracked_repository_paths(repo, sorted(discovered))
     return tuple(sorted(rows))
 
 
@@ -4075,6 +4436,13 @@ def _declared_workspace_seed_closure(
                     }
                 )
             )
+        # A declared test may depend on a repository asset it never imports.
+        # Repository content nominated that asset, not the card, so it stays
+        # out of the ungated closures below and is followed only through its
+        # own tracked, non-dot requires (extension.js -> ./runtime-*). A literal
+        # ``.py`` asset is seeded alone: the import closure has no such gate,
+        # and a package root the asset contributed would widen every import.
+        asset_seeded = _resolve_literal_repository_assets(source_root, test_files)
         seeds_for_python_closure = (*live_seeded, *support_seeded, *test_files)
         python_seeded = _resolve_local_python_imports(
             source_root, seeds_for_python_closure
@@ -4087,6 +4455,12 @@ def _declared_workspace_seed_closure(
         )
         support_seeded = tuple(
             sorted(set(support_seeded) | (set(js_seeded) - set(live_seeded)))
+        )
+        asset_closure = _resolve_literal_asset_requires(
+            source_root, asset_seeded, (*live_seeded, *support_seeded)
+        )
+        support_seeded = tuple(
+            sorted(set(support_seeded) | (set(asset_closure) - set(live_seeded)))
         )
     npm_support_seeded = tuple(
         relative
