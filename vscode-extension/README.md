@@ -14,6 +14,17 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.11.58
+
+- Windows: bundled native `claude_cli` workers now run inside their
+  AppContainer with their worker tools. The worker MCP server runs on the host,
+  behind a per-request pipe.
+- Semantic edits cannot be redirected through a junction planted in the
+  worktree.
+- AppContainer validation runs Python read-only and offline. Python installed
+  in an admin-owned directory needs a one-time elevated
+  `icacls <python dir> /grant "*S-1-15-2-1:(OI)(CI)(RX)" /T`.
+
 ## What's new in 0.11.57
 
 - Windows: bundled native CLI workers now start inside their AppContainer.

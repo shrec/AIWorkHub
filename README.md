@@ -62,6 +62,19 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
+## What's new in 0.11.58
+
+- Windows native `claude_cli` workers now run inside their AppContainer with
+  their worker tools.
+  - The worker MCP server runs on the host, behind a per-request pipe that only
+    this container can open.
+  - It never trusts a file, path or import root that the container can write.
+- Semantic edits cannot be redirected through a junction planted in the
+  worktree.
+- AppContainer validation runs Python read-only and offline, from the canonical
+  venv. If Python is installed in an admin-owned directory, run a one-time
+  elevated `icacls <python dir> /grant "*S-1-15-2-1:(OI)(CI)(RX)" /T` first.
+
 ## What's new in 0.11.57
 
 - Windows native CLI workers (`claude_cli`, `opencode_cli`) now start inside

@@ -1,5 +1,27 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.58 — 2026-09-22
+
+### Fixed
+
+- Bundled runtime, Windows: native `claude_cli` workers now run inside their
+  AppContainer with their worker tools (NF-2026-00034).
+  - The worker MCP server runs on the host. It is reached only through a
+    per-request pipe that this container's SID can open.
+  - It starts from a directory the container cannot write, with a checked
+    `sys.path`.
+  - Its authority files are withheld from the container.
+- Bundled runtime: grants reach protected directories inside a request's
+  directories. Semantic edits cannot be redirected through a planted junction.
+- Bundled runtime: AppContainer validation runs Python read-only and offline,
+  from the canonical venv.
+
+### Known issues
+
+- Python in an admin-owned directory needs a one-time elevated
+  `icacls <python dir> /grant "*S-1-15-2-1:(OI)(CI)(RX)" /T` before
+  validation can run inside the container.
+
 ## 0.11.57 — 2026-09-21
 
 ### Fixed

@@ -6,6 +6,53 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.58] - 2026-09-22
+
+### Fixed
+
+- Windows: native `claude_cli` workers now run inside their AppContainer with
+  their worker tools (NF-2026-00034).
+  - The worker MCP server (the `aiworkhub_worker_*` tools) runs on the host,
+    outside the container. It is reached through a per-request named pipe that
+    only this container's SID can open, and it serves only a process in this
+    launch's own job. Inside the container, the MCP config starts a System32
+    PowerShell shim that relays stdio to the pipe.
+  - The host server starts from a directory the container cannot write. It runs
+    with `-P -s` and `PYTHONSAFEPATH`, and inherits no `PYTHON*` variables.
+  - Before the server starts, a probe checks its `sys.path`. If any entry is a
+    directory the container can write, the server does not start.
+  - Every file the server reads for authority lives in a directory withheld
+    from the container: the contract packet, the audit key and ledger, and the
+    review and rework packets.
+- Windows AppContainer grants now also reach the protected directories that
+  AIWorkHub creates inside a request's worktree, home and temp, and they are
+  revoked the same way. Reparse points are never followed, and the walk is
+  bounded.
+- Semantic edits hold the whole directory chain open while they read and write,
+  so a junction planted in the worktree cannot redirect an edit outside it.
+- Windows AppContainer validation now runs Python read-only and offline, from
+  the canonical repository's venv.
+  - An interpreter or `pyvenv.cfg` that the container can write is refused, not
+    granted.
+  - A persistent read grant counts as satisfied when an ALL APPLICATION
+    PACKAGES allow ACE already covers it, with deny ACEs honored in order.
+    AIWorkHub never adds that ACE itself.
+- For a contained worker, the host-side worker MCP server refuses
+  `aiworkhub_worker_validation_run`, because running candidate code there would
+  bypass the sandbox. Post-exit validation still runs inside the container.
+  NF-2026-00035 tracks mid-turn validation inside the container.
+
+### Known issues
+
+- Python validation inside the AppContainer needs the base interpreter to be
+  readable by ALL APPLICATION PACKAGES. If Python is installed in an
+  admin-owned directory such as `C:\Python312`, run this once from an elevated
+  shell: `icacls C:\Python312 /grant "*S-1-15-2-1:(OI)(CI)(RX)" /T`.
+- Host-side reads of worktree files outside semantic edit are checked for
+  containment only when the path is resolved. Hard links are not yet refused
+  (NF-2026-00036).
+- `codex_cli` and the Copilot CLI adapters are not yet bridged.
+
 ## [0.11.57] - 2026-09-21
 
 ### Fixed
