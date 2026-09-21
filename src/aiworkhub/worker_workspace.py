@@ -12097,10 +12097,25 @@ def _run_appcontainer_validation(
         appcontainer_worker_kind,
         launch_appcontainer,
         native_handle,
+        python_read_grants,
         request_scoped_grants,
     )
 
     repo_id = inspect_repository(workspace.repo).manifest.repo_id
+    # NF-2026-00025: the worktree root (never the cd subdir a candidate could
+    # have made a junction) read-only, as on every other backend; HOME and
+    # temp modify; all revoked.  NF-2026-00034: plus, read-only and
+    # persistent (shared install roots), the interpreter a ``python -m ...``
+    # command runs and its import roots.
+    request_grants = [
+        ContainerGrant(str(workspace.path), "read_execute"),
+        *request_scoped_grants(env),
+    ]
+    request_grants += python_read_grants(
+        str(argv[0]) if argv else "",
+        str(env.get("PYTHONPATH") or ""),
+        covered=[grant.path for grant in request_grants],
+    )
 
     stdout_read, stdout_write = os.pipe()
     stderr_read, stderr_write = os.pipe()
@@ -12136,13 +12151,7 @@ def _run_appcontainer_validation(
                     stderr_handle=native_handle(stderr_write),
                     # NF-2026-00033: no capability_sids.  This runs untrusted
                     # candidate code, and offline is the stronger guarantee.
-                    # NF-2026-00025: the worktree root (never the cd subdir a
-                    # candidate could have made a junction) read-only, as on
-                    # every other backend; HOME and temp modify; all revoked.
-                    filesystem_grants=[
-                        ContainerGrant(str(workspace.path), "read_execute"),
-                        *request_scoped_grants(env),
-                    ],
+                    filesystem_grants=request_grants,
                 )
             )
         except AppContainerError as exc:

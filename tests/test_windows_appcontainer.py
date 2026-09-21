@@ -2630,6 +2630,71 @@ def test_a_withheld_directory_that_would_not_stay_closed_fails_closed(tmp_path, 
     assert _grant_events(fake) == []
 
 
+# -- the validation interpreter's read set (NF-2026-00034) ---------------------
+
+
+def _venv(tmp_path):
+    base = tmp_path / "Python312"
+    (base / "Lib").mkdir(parents=True)
+    (base / "python.exe").write_bytes(b"MZ")
+    venv = tmp_path / "repo" / ".venv"
+    (venv / "Scripts").mkdir(parents=True)
+    (venv / "Lib" / "site-packages").mkdir(parents=True)
+    (venv / "Scripts" / "python.exe").write_bytes(b"MZ")
+    (venv / "pyvenv.cfg").write_text(
+        f"home = {base}\ninclude-system-site-packages = false\n", encoding="utf-8"
+    )
+    return base, venv
+
+
+def test_a_venv_interpreter_needs_its_launcher_config_site_packages_and_base(tmp_path):
+    base, venv = _venv(tmp_path)
+    worktree, runtime = tmp_path / "wt", tmp_path / "runtime"
+    (worktree / "src").mkdir(parents=True)
+    runtime.mkdir()
+    grants = wac.python_read_grants(
+        str(venv / "Scripts" / "python.exe"),
+        os.pathsep.join([str(runtime), str(worktree / "src"), "src", str(tmp_path / "gone")]),
+        covered=[str(worktree)],
+    )
+    assert grants == [
+        ContainerGrant(str(venv / "Scripts" / "python.exe"), "read_execute", persistent=True),
+        ContainerGrant(str(venv / "pyvenv.cfg"), "read_execute", persistent=True),
+        ContainerGrant(str(venv / "Lib" / "site-packages"), "read_execute", persistent=True),
+        ContainerGrant(str(base), "read_execute", persistent=True),
+        # An absolute import root outside the request; the worktree's own
+        # (already granted), relative and missing entries add nothing.
+        ContainerGrant(str(runtime), "read_execute", persistent=True),
+    ]
+
+
+def test_a_plain_interpreter_needs_its_install_root_and_anything_else_nothing(tmp_path):
+    base, _venv_dir = _venv(tmp_path)
+    assert wac.python_read_grants(str(base / "python.exe")) == [
+        ContainerGrant(str(base), "read_execute", persistent=True)
+    ]
+    assert wac.python_read_grants("pytest") == []
+    assert wac.python_read_grants(str(tmp_path / "ruff.exe")) == []
+
+
+def test_the_python_read_set_passes_grant_validation(tmp_path):
+    base, venv = _venv(tmp_path)
+    fake = FakeWin32Api()
+    launch_appcontainer(
+        make_request(
+            filesystem_grants=wac.python_read_grants(str(venv / "Scripts" / "python.exe"))
+        ),
+        api=fake,
+    )
+    assert _grant_events(fake) == [
+        f"grant:read_execute:{path}"
+        for path in (
+            venv / "Scripts" / "python.exe", venv / "pyvenv.cfg",
+            venv / "Lib" / "site-packages", base,
+        )
+    ]
+
+
 # -- worker MCP bridge pipe (NF-2026-00034) ------------------------------------
 
 

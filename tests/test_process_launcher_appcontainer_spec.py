@@ -1315,6 +1315,58 @@ def test_appcontainer_validation_gets_grants_but_no_network(
     assert not any(g.persistent for g in request.filesystem_grants)
 
 
+def test_appcontainer_validation_python_gets_its_interpreter_read_only_and_no_network(
+    tmp_path: Path, monkeypatch, identity_osfhandle
+) -> None:
+    """NF-2026-00034: ``python -m pytest`` needs the interpreter it runs."""
+    launches: list[_FakeValidationLaunch] = []
+    _stub_repo_id(monkeypatch)
+    _install_fake_launch(
+        monkeypatch,
+        stdout=b"",
+        stderr=b"",
+        outcome=windows_appcontainer.AppContainerLifecycleResult(
+            windows_appcontainer.AppContainerLifecycleState.EXITED, exit_code=0
+        ),
+        sink=launches,
+    )
+    base = tmp_path / "Python312"
+    base.mkdir()
+    venv = tmp_path / ".venv"
+    (venv / "Scripts").mkdir(parents=True)
+    (venv / "Lib" / "site-packages").mkdir(parents=True)
+    python = venv / "Scripts" / "python.exe"
+    python.write_bytes(b"MZ")
+    (venv / "pyvenv.cfg").write_text(f"home = {base}\n", encoding="utf-8")
+    worktree, home, scratch = (tmp_path / n for n in ("wt", "home", "scratch"))
+    env = {
+        "HOME": str(home), "USERPROFILE": str(home), "TMP": str(scratch),
+        "TEMP": str(scratch), "PYTHONPATH": os.pathsep.join([str(worktree), "."]),
+    }
+
+    worker_workspace._run_appcontainer_validation(
+        [str(python), "-m", "pytest", "-q"],
+        workspace=SimpleNamespace(repo=tmp_path, path=worktree, home=home),
+        adapter_id="claude_cli",
+        cwd=worktree,
+        env=env,
+        timeout_seconds=30,
+    )
+
+    request = launches[0].request
+    assert tuple(request.capability_sids) == ()
+    grant = windows_appcontainer.ContainerGrant
+    assert list(request.filesystem_grants) == [
+        grant(str(worktree), "read_execute"),
+        grant(str(home), "modify"),
+        grant(str(scratch), "modify"),
+        grant(str(python), "read_execute", persistent=True),
+        grant(str(venv / "pyvenv.cfg"), "read_execute", persistent=True),
+        grant(str(venv / "Lib" / "site-packages"), "read_execute", persistent=True),
+        grant(str(base), "read_execute", persistent=True),
+    ]
+
+
 def test_appcontainer_validation_timeout_carries_partial_output(
     tmp_path: Path, monkeypatch, identity_osfhandle
 ) -> None:

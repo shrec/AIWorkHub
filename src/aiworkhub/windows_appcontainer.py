@@ -34,6 +34,7 @@ import threading
 from ctypes import wintypes
 from dataclasses import dataclass, field, replace
 from functools import partial
+from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol, Sequence, cast
 
 try:
@@ -215,6 +216,45 @@ def request_scoped_grants(
         if key and key not in seen:
             seen.add(key)
             grants.append(ContainerGrant(value, "modify"))
+    return grants
+
+
+def python_read_grants(
+    executable: str, pythonpath: str = "", *, covered: Sequence[str] = ()
+) -> list[ContainerGrant]:
+    """Persistent read/execute on what a Python ``executable`` needs to run in
+    a container; ``[]`` when it is no ``python*.exe``.
+
+    A venv launcher needs itself, its ``pyvenv.cfg`` and ``Lib\\site-packages``,
+    and the base interpreter's home that ``pyvenv.cfg`` names -- the launcher
+    re-executes that interpreter, which loads its DLLs and standard library
+    from there.  A plain interpreter needs its own install root.  Each
+    absolute ``pythonpath`` entry is an import root too.  Paths inside
+    ``covered`` (what the request already grants) are skipped.  These are
+    shared install roots, hence persistent (see :func:`launch_appcontainer`);
+    one ALL APPLICATION PACKAGES can already read costs no write.
+    """
+    exe = Path(executable)
+    if not (exe.name.lower().startswith("python") and exe.suffix.lower() == ".exe"):
+        return []
+    config = exe.parent.parent / "pyvenv.cfg"
+    roots: list[Path] = []
+    if config.is_file():
+        roots += [exe, config, exe.parent.parent / "Lib" / "site-packages"]
+        for line in config.read_text(encoding="utf-8", errors="replace").splitlines():
+            key, _, value = line.partition("=")
+            if key.strip().lower() == "home" and value.strip():
+                roots.append(Path(value.strip()))
+    else:
+        roots.append(exe.parent)
+    roots += [Path(part) for part in pythonpath.split(os.pathsep) if os.path.isabs(part)]
+    skip = [os.path.normcase(os.path.normpath(path)) for path in covered]
+    grants: list[ContainerGrant] = []
+    for root in roots:
+        key = os.path.normcase(os.path.normpath(str(root)))
+        if root.exists() and not any(_within(key, other) for other in skip):
+            skip.append(key)
+            grants.append(ContainerGrant(str(root), "read_execute", persistent=True))
     return grants
 
 
