@@ -842,15 +842,29 @@ def launch_isolated(
                 adapter_id,
                 repo=self.repo,
                 request_id=request_id,
+                # AppContainer, like landlock, grants the container the real
+                # isolated workspace.home, so HOME must literally be that path.
+                # None would seed the user's REAL profile, which the supervisor
+                # would then have to grant modify on.
                 home=(
                     workspace.home
-                    if sandbox_backend in {"landlock", VSCODE_LM_IN_PROCESS_BACKEND}
+                    if sandbox_backend
+                    in {"landlock", VSCODE_LM_IN_PROCESS_BACKEND, "windows_appcontainer"}
                     else None
                 ),
                 isolated_task_queue_db=True,
                 provider_env=provider_env,
                 sandbox_backend=sandbox_backend,
             )
+            if sandbox_backend == "windows_appcontainer" and os.environ.get(
+                "LOCALAPPDATA"
+            ):
+                # Measured: with USERPROFILE isolated, the supervisor's
+                # known-folder fallback expands inside the isolated home and
+                # fails, so the child gets no LOCALAPPDATA and CreateProcessW
+                # refuses it with ERROR_ENVVAR_NOT_FOUND (203).  Hand the real
+                # path over like HOME and TMP; it names a path, grants nothing.
+                launch_env["LOCALAPPDATA"] = os.environ["LOCALAPPDATA"]
             worker_argv = sandbox_argv(
                 workspace,
                 adapter_id,

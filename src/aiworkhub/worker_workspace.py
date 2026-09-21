@@ -7358,26 +7358,35 @@ def windows_confinement_report(
     # What a native CLI worker is actually held by on Windows RIGHT NOW: a
     # function of the three facts just measured, never a constant.  When they
     # agree, the supervisor launches through a repo-scoped AppContainer profile
-    # SID that bounds filesystem, registry and network access, inside the
-    # kill-on-close Job Object that owns the process tree.  Otherwise the
+    # SID that bounds filesystem and registry access and splits network access
+    # by launch (below), inside the kill-on-close Job Object that owns the
+    # process tree.  Otherwise the
     # supervisor takes its plain-subprocess branch, where that Job Object bounds
     # the tree's lifetime and nothing else.  Stated only for Windows: on Linux
     # the active boundary is landlock/bubblewrap and this report does not
     # describe it.
+    network_egress: dict[str, str] = {}
     if not platform_is_windows:
         active_confinement = "not_applicable"
         active_contains: tuple[str, ...] = ()
         active_does_not_contain: tuple[str, ...] = ()
     elif available:
         active_confinement = "appcontainer_profile_and_job_object"
+        # Network is split by launch, not blanket (NF-2026-00033).  A worker
+        # holds internetClient only -- outbound internet to reach its provider,
+        # no listening socket, no LAN.  A validation launch runs untrusted
+        # candidate code and holds no network capability at all.
         active_contains = (
             "worker_process_tree_lifetime",
             "filesystem",
             "registry",
-            "network",
+            "inbound_network",
+            "private_network",
+            "validation_launch_network",
             "other_processes_of_the_same_user",
         )
-        active_does_not_contain = ()
+        active_does_not_contain = ("worker_launch_internet_egress",)
+        network_egress = {"worker_launch": "internet_client", "validation_launch": "none"}
     else:
         active_confinement = "job_object_lifetime_only"
         active_contains = ("worker_process_tree_lifetime",)
@@ -7400,6 +7409,7 @@ def windows_confinement_report(
         "active_confinement": active_confinement,
         "active_contains": active_contains,
         "active_does_not_contain": active_does_not_contain,
+        "network_egress": network_egress,
     }
 
 
@@ -12042,8 +12052,6 @@ def _run_appcontainer_validation(
     on the process handle.  Draining after the wait would deadlock the child
     the moment either stream exceeded one pipe buffer.
     """
-    import msvcrt
-
     # Spelled ``from .<module> import <name>`` rather than ``from . import
     # <module>``: only the first form is a seedable edge for the declared
     # validation closure, so this shape is what guarantees both siblings
@@ -12053,8 +12061,11 @@ def _run_appcontainer_validation(
         AppContainerError,
         AppContainerLifecycleState,
         AppContainerRequest,
+        ContainerGrant,
         appcontainer_worker_kind,
         launch_appcontainer,
+        native_handle,
+        request_scoped_grants,
     )
 
     repo_id = inspect_repository(workspace.repo).manifest.repo_id
@@ -12089,8 +12100,17 @@ def _run_appcontainer_validation(
                     worker_kind=appcontainer_worker_kind(adapter_id),
                     working_directory=str(cwd),
                     environment=dict(env),
-                    stdout_handle=msvcrt.get_osfhandle(stdout_write),
-                    stderr_handle=msvcrt.get_osfhandle(stderr_write),
+                    stdout_handle=native_handle(stdout_write),
+                    stderr_handle=native_handle(stderr_write),
+                    # NF-2026-00033: no capability_sids.  This runs untrusted
+                    # candidate code, and offline is the stronger guarantee.
+                    # NF-2026-00025: the worktree root (never the cd subdir a
+                    # candidate could have made a junction) read-only, as on
+                    # every other backend; HOME and temp modify; all revoked.
+                    filesystem_grants=[
+                        ContainerGrant(str(workspace.path), "read_execute"),
+                        *request_scoped_grants(env),
+                    ],
                 )
             )
         except AppContainerError as exc:
@@ -12255,9 +12275,12 @@ def run_validations(
             [],
             restriction=restriction,
         ) from exc
+    # Only bubblewrap mounts the scratch at the sandbox alias; AppContainer runs
+    # on real host paths and is granted this exact directory.
     scratch_env_value = (
         str(scratch_dir)
-        if selected_backend in {"landlock", VSCODE_LM_IN_PROCESS_BACKEND}
+        if selected_backend
+        in {"landlock", VSCODE_LM_IN_PROCESS_BACKEND, WINDOWS_APPCONTAINER_BACKEND}
         else SANDBOX_VALIDATION_EXEC_SCRATCH
     )
     # NF430 (rework): every validation invocation routes TMPDIR/TMP/TEMP at its

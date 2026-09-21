@@ -26,9 +26,11 @@ import ctypes
 import enum
 import hashlib
 import os
+import stat
 from ctypes import wintypes
 from dataclasses import dataclass, field, replace
-from typing import Any, Callable, Mapping, Protocol, Sequence
+from functools import partial
+from typing import Any, Callable, Mapping, Protocol, Sequence, cast
 
 try:
     from .windows_job_structures import JOBOBJECT_EXTENDED_LIMIT_INFORMATION
@@ -46,6 +48,7 @@ __all__ = [
     "AclAce",
     "AclSnapshot",
     "AclSnapshotError",
+    "ContainerGrant",
     "DaclState",
     "Win32Api",
     "build_command_line",
@@ -84,12 +87,14 @@ class AppContainerReason(str, enum.Enum):
     ACCESS_DENIED = "access_denied"
     PROCESS_LAUNCH_FAILED = "process_launch_failed"
     LAUNCH_FAILED = "launch_failed"
+    FILESYSTEM_GRANT_FAILED = "filesystem_grant_failed"
 
 
 # Maps a low-level Win32 operation name to its structured reason.  The
 # operation names are also the boundary method call-sites, which keeps the
 # taxonomy in exactly one place.
 _OPERATION_REASON: dict[str, AppContainerReason] = {
+    "grant_path_access": AppContainerReason.FILESYSTEM_GRANT_FAILED,
     "create_appcontainer_profile": AppContainerReason.PROFILE_CREATION_FAILED,
     "derive_appcontainer_sid": AppContainerReason.CAPABILITY_DERIVATION_FAILED,
     "derive_capability_sids": AppContainerReason.CAPABILITY_DERIVATION_FAILED,
@@ -165,6 +170,50 @@ def _map_reason(operation: str | None, win_error: int | None) -> AppContainerRea
 # ---------------------------------------------------------------------------
 
 
+# Access masks written into the container's ACE.  "read_execute" is icacls RX
+# (FILE_GENERIC_READ | FILE_GENERIC_EXECUTE); "modify" is icacls M, which adds
+# FILE_GENERIC_WRITE and DELETE but never WRITE_DAC or WRITE_OWNER, so the
+# container can use a granted tree and never re-permission it.
+_GRANT_ACCESS_MASKS: dict[str, int] = {
+    "read_execute": 0x001200A9,
+    "modify": 0x001301BF,
+}
+
+
+@dataclass(frozen=True)
+class ContainerGrant:
+    """One filesystem path this launch's own container SID may use.
+
+    ``access`` is ``"read_execute"`` or ``"modify"``.  A grant is revoked --
+    the path's DACL restored from the snapshot taken before it was changed --
+    when the launch closes or fails, unless ``persistent`` is set; see
+    :func:`launch_appcontainer` for when that is the right choice.
+    """
+
+    path: str
+    access: str
+    persistent: bool = False
+
+
+# Where a launcher names a request's isolated HOME and its request temp.
+_REQUEST_SCOPED_ENV_KEYS = ("HOME", "USERPROFILE", "TMP", "TEMP", "TMPDIR")
+
+
+def request_scoped_grants(
+    environment: Mapping[str, str], *paths: str
+) -> list[ContainerGrant]:
+    """Revocable modify grants on ``paths`` and on the HOME / temp directories
+    ``environment`` names -- one per distinct path, in that order."""
+    grants: list[ContainerGrant] = []
+    seen: set[str] = set()
+    for value in (*paths, *(environment.get(k, "") for k in _REQUEST_SCOPED_ENV_KEYS)):
+        key = os.path.normcase(os.path.normpath(value)) if value else ""
+        if key and key not in seen:
+            seen.add(key)
+            grants.append(ContainerGrant(value, "modify"))
+    return grants
+
+
 @dataclass(frozen=True)
 class AppContainerRequest:
     """A fully specified, shell-free AppContainer launch request."""
@@ -180,6 +229,7 @@ class AppContainerRequest:
     stderr_handle: int | None = None
     capability_sids: Sequence[str] = ()
     create_no_window: bool = True
+    filesystem_grants: Sequence[ContainerGrant] = ()
 
 
 @dataclass(frozen=True)
@@ -235,6 +285,12 @@ class AppContainerLaunch:
     api: "Win32Api" = field(repr=False)
     job: Any = field(repr=False)
     creation: "_ProcessCreation" = field(repr=False)
+    # Revocable filesystem grants still in force, in the order applied.
+    grants: list["_PathGrant"] = field(default_factory=list, repr=False)
+    # Grants whose DACL restore failed on close: (path, win_error).
+    grant_revoke_failures: list[tuple[str, int]] = field(
+        default_factory=list, repr=False
+    )
     closed: bool = field(default=False, repr=False)
     _process_handle_owned: bool = field(default=True, init=False, repr=False)
     _job_handle_owned: bool = field(default=True, init=False, repr=False)
@@ -331,7 +387,8 @@ class AppContainerLaunch:
         return result
 
     def close(self) -> None:
-        """Release the process and job handles.  Idempotent."""
+        """Release the process and job handles, then revoke the filesystem
+        grants.  Idempotent."""
         if self.closed:
             return
         first_error: Exception | None = None
@@ -348,6 +405,17 @@ class AppContainerLaunch:
             except Exception as exc:
                 if first_error is None:
                     first_error = exc
+        # Revoked even when a handle close failed: narrowing a possibly live
+        # tree's access is always the safer direction.  Popping in reverse
+        # order restores nested paths LIFO and makes a second close a no-op.
+        while self.grants:
+            grant = self.grants.pop()
+            try:
+                self.api.revoke_path_access(grant)
+            except Exception:
+                pass  # the boundary contract is never to raise; belt and braces
+            if grant.revoke_error is not None:
+                self.grant_revoke_failures.append((grant.path, grant.revoke_error))
         self.closed = not self._process_handle_owned and not self._job_handle_owned
         if first_error is not None:
             raise first_error
@@ -362,6 +430,11 @@ class AppContainerLaunch:
             "container_name": self.container_name,
             "container_sid": self.container_sid,
             "closed": self.closed,
+            "outstanding_grants": [grant.path for grant in self.grants],
+            "grant_revoke_failures": [
+                {"path": path, "win_error": error}
+                for path, error in self.grant_revoke_failures
+            ],
         }
 
 
@@ -401,6 +474,17 @@ class _ProcessCreation:
 
 
 @dataclass
+class _PathGrant:
+    """One applied filesystem grant.  ``restore`` is the boundary's opaque
+    undo state; ``None`` means there is nothing (left) to undo."""
+
+    path: str
+    access: str
+    restore: Any = None
+    revoke_error: int | None = None
+
+
+@dataclass
 class _ProcessSpec:
     executable: str | None
     command_line: str
@@ -424,8 +508,8 @@ class Win32Api(Protocol):
 
     Every mutating call raises :class:`_Win32Failure` on error carrying the
     ``GetLastError``/``HRESULT`` value and the operation name.  Cleanup calls
-    (``free_*``, ``delete_*``, ``close_*``, ``terminate_*``) must be tolerant
-    of being invoked during unwind and must not raise.
+    (``free_*``, ``delete_*``, ``close_*``, ``terminate_*``, ``revoke_*``) must
+    be tolerant of being invoked during unwind and must not raise.
     """
 
     def derive_identity(
@@ -433,6 +517,17 @@ class Win32Api(Protocol):
     ) -> _Identity: ...
 
     def free_identity(self, identity: _Identity) -> None: ...
+
+    def grant_path_access(
+        self,
+        identity: _Identity,
+        path: str,
+        access: str,
+        *,
+        persistent: bool = False,
+    ) -> _PathGrant: ...
+
+    def revoke_path_access(self, grant: _PathGrant) -> None: ...
 
     def build_security_capabilities(
         self, identity: _Identity, capability_sids: Sequence[str]
@@ -568,6 +663,37 @@ class _PROCESS_INFORMATION(ctypes.Structure):
         ("dwProcessId", wintypes.DWORD),
         ("dwThreadId", wintypes.DWORD),
     ]
+
+
+class _TRUSTEE_W(ctypes.Structure):
+    _fields_ = [
+        ("pMultipleTrustee", wintypes.LPVOID),
+        ("MultipleTrusteeOperation", ctypes.c_int),
+        ("TrusteeForm", ctypes.c_int),
+        ("TrusteeType", ctypes.c_int),
+        ("ptstrName", wintypes.LPVOID),
+    ]
+
+
+class _EXPLICIT_ACCESS_W(ctypes.Structure):
+    _fields_ = [
+        ("grfAccessPermissions", wintypes.DWORD),
+        ("grfAccessMode", ctypes.c_int),
+        ("grfInheritance", wintypes.DWORD),
+        ("Trustee", _TRUSTEE_W),
+    ]
+
+
+_GRANT_ACCESS = 1  # ACCESS_MODE.GRANT_ACCESS
+_TRUSTEE_IS_SID = 0
+_SUB_CONTAINERS_AND_OBJECTS_INHERIT = 0x3  # OBJECT_INHERIT | CONTAINER_INHERIT
+_SE_DACL_PROTECTED = 0x1000
+_PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000
+_UNPROTECTED_DACL_SECURITY_INFORMATION = 0x20000000
+_ACCESS_ALLOWED_ACE_TYPE = 0
+# OI | CI | NO_PROPAGATE | INHERIT_ONLY | INHERITED: an explicit, fully
+# propagating ACE of ours has exactly the requested inheritance bits set here.
+_ACE_INHERITANCE_FLAGS = 0x1F
 
 
 
@@ -965,6 +1091,45 @@ def launch_appcontainer(
         )
         cleanup.push_always(lambda: api.free_identity(identity))
 
+        # Grants go to exactly this launch's container SID -- never to ALL
+        # APPLICATION PACKAGES -- and are in force before the child exists.
+        # A revocable grant is undone on any failure below (LIFO, so nested
+        # paths restore correctly) and otherwise by AppContainerLaunch.close.
+        #
+        # Persistent vs revoked, measured on Windows 11 26200 (inheritable
+        # grant, then byte-exact DACL restore, 3 runs each):
+        #   whole npm global dir, 210 entries ...... grant ~33 ms, revoke ~32 ms
+        #   @anthropic-ai\claude-code, 15 entries .. grant ~3 ms,  revoke ~3 ms
+        #   claude.cmd shim (file) ................. grant <1 ms,  revoke <1 ms
+        #   worktree-sized tree, 1364 entries ...... grant ~170 ms, revoke ~175 ms
+        # Cost alone never justifies persistence.  Sharing does: every worker
+        # of one repo+kind uses the same SID and the same install root, so a
+        # revocable grant there would let the first launch to close restore a
+        # DACL that pulls the ACE from under a still-running sibling, and the
+        # last to close restore a snapshot that still holds it.  Provider
+        # install roots (read-only, public code) are therefore granted
+        # persistent + idempotent; the per-request worktree, HOME and temp --
+        # used by exactly one launch at a time -- are always revoked.
+        # ponytail: two *different* SIDs persistently granting the same root in
+        # the same ~3 ms window can lose one ACE (read-modify-write DACL); that
+        # launch fails closed with access denied and the next one re-grants.
+        # Serialize grants behind a machine-wide mutex if that is ever seen.
+        grants: list[_PathGrant] = []
+        for grant in request.filesystem_grants:
+            applied: _PathGrant = _step(
+                "grant_path_access",
+                partial(
+                    api.grant_path_access,
+                    identity,
+                    grant.path,
+                    grant.access,
+                    persistent=grant.persistent,
+                ),
+            )
+            if not grant.persistent:
+                grants.append(applied)
+                cleanup.push_on_failure(partial(api.revoke_path_access, applied))
+
         sec_caps = _step(
             "build_security_capabilities",
             lambda: api.build_security_capabilities(
@@ -1042,6 +1207,7 @@ def launch_appcontainer(
         api=api,
         job=job,
         creation=creation,
+        grants=grants,
     )
 
 
@@ -1090,6 +1256,73 @@ def _validate_request(request: AppContainerRequest) -> None:
         )
     if request.environment is not None:
         _validate_environment(request.environment)
+    _validate_grants(request.filesystem_grants)
+
+
+def _validate_grants(grants: Sequence[ContainerGrant]) -> None:
+    """Refuse any grant that could land somewhere other than the path it names.
+
+    Runs before any Win32 call.  SetNamedSecurityInfoW follows reparse points,
+    so a symlink or junction -- at the leaf, or in an ancestor, which is what
+    comparing against ``realpath`` exposes -- would re-permission a target the
+    caller never named.  A modify grant containing the user's LocalAppData
+    would hand the container the whole profile, so that is refused as well.
+    """
+    local_appdata: str | None = None
+    for grant in grants:
+        if not isinstance(grant, ContainerGrant) or not isinstance(grant.path, str):
+            raise AppContainerError(
+                AppContainerReason.INVALID_REQUEST,
+                detail="filesystem grants must be ContainerGrant(path: str, ...).",
+            )
+        path = grant.path
+        if grant.access not in _GRANT_ACCESS_MASKS:
+            raise AppContainerError(
+                AppContainerReason.INVALID_REQUEST,
+                detail=f"unknown grant access {grant.access!r} for {path!r}.",
+            )
+        if grant.persistent and grant.access == "modify":
+            # Only read access to shared install roots may outlive a launch.
+            raise AppContainerError(
+                AppContainerReason.INVALID_REQUEST,
+                detail=f"a modify grant is always revoked, never persistent: {path!r}.",
+            )
+        if not path or "\x00" in path or not os.path.isabs(path):
+            raise AppContainerError(
+                AppContainerReason.INVALID_REQUEST,
+                detail=f"grant path must be absolute: {path!r}.",
+            )
+        try:
+            info = os.lstat(path)
+        except OSError:
+            raise AppContainerError(
+                AppContainerReason.INVALID_REQUEST,
+                detail=f"grant path does not exist: {path!r}.",
+            ) from None
+        reparse = getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+        canonical = os.path.normcase(os.path.normpath(path))
+        if (
+            stat.S_ISLNK(info.st_mode)
+            or reparse
+            or os.path.normcase(os.path.realpath(path)) != canonical
+        ):
+            raise AppContainerError(
+                AppContainerReason.INVALID_REQUEST,
+                detail=f"grant path is or passes through a reparse point: {path!r}.",
+            )
+        if grant.access == "modify":
+            if local_appdata is None:
+                resolved = resolve_local_appdata()
+                local_appdata = (
+                    os.path.normcase(os.path.normpath(resolved)) if resolved else ""
+                )
+            if local_appdata and (local_appdata + os.sep).startswith(
+                canonical.rstrip(os.sep) + os.sep
+            ):
+                raise AppContainerError(
+                    AppContainerReason.INVALID_REQUEST,
+                    detail=f"modify grant would contain the user profile: {path!r}.",
+                )
 
 
 def _validate_environment(environment: Mapping[str, str]) -> None:
@@ -1146,6 +1379,16 @@ def _creation_flags(request: AppContainerRequest) -> int:
     if request.environment is not None:
         flags |= CREATE_UNICODE_ENVIRONMENT
     return flags
+
+
+def native_handle(fd: int) -> int:
+    """The Win32 HANDLE behind CRT descriptor ``fd``, for the std-handle
+    fields of an :class:`AppContainerRequest`.  It lives here, inside the
+    sanctioned OS-dependency boundary, so callers never import ``msvcrt``."""
+    import msvcrt
+
+    get_osfhandle = cast(Callable[[int], int], getattr(msvcrt, "get_osfhandle"))
+    return int(get_osfhandle(fd))
 
 
 def _creation_identity(name: str, creation: _ProcessCreation) -> str:
@@ -1391,6 +1634,34 @@ class _CtypesWin32Api:
             wintypes.DWORD,
         ]
 
+        # Filesystem grants reuse the snapshot boundary's security-info
+        # signatures (GetNamedSecurityInfoW, GetLengthSid, LocalFree) and add
+        # only the write side.
+        _NativeAclSnapshotApi._configure_signatures(a, k)
+        a.GetSecurityDescriptorControl.restype = wintypes.BOOL
+        a.GetSecurityDescriptorControl.argtypes = [
+            wintypes.LPVOID,
+            ctypes.POINTER(wintypes.WORD),
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        a.SetEntriesInAclW.restype = wintypes.DWORD
+        a.SetEntriesInAclW.argtypes = [
+            wintypes.ULONG,
+            ctypes.POINTER(_EXPLICIT_ACCESS_W),
+            wintypes.LPVOID,
+            ctypes.POINTER(wintypes.LPVOID),
+        ]
+        a.SetNamedSecurityInfoW.restype = wintypes.DWORD
+        a.SetNamedSecurityInfoW.argtypes = [
+            wintypes.LPWSTR,
+            ctypes.c_int,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.LPVOID,
+            wintypes.LPVOID,
+            wintypes.LPVOID,
+        ]
+
     # -- identity -----------------------------------------------------------
 
     def derive_identity(
@@ -1435,6 +1706,118 @@ class _CtypesWin32Api:
             return out.value or ""
         finally:
             self._kernel32.LocalFree(out)
+
+    # -- filesystem grants --------------------------------------------------
+
+    def grant_path_access(
+        self,
+        identity: _Identity,
+        path: str,
+        access: str,
+        *,
+        persistent: bool = False,
+    ) -> _PathGrant:
+        """Merge one GRANT_ACCESS ACE for exactly the container SID.
+
+        The original security descriptor is kept for a revocable grant so
+        :meth:`revoke_path_access` can put the DACL back byte for byte; a
+        persistent grant frees it at once.  An identical explicit ACE already
+        present makes this a no-op that rewrites nothing.
+        """
+        mask = _GRANT_ACCESS_MASKS[access]
+        inherit = _SUB_CONTAINERS_AND_OBJECTS_INHERIT if os.path.isdir(path) else 0
+        if self._explicit_grant_present(identity, path, mask, inherit):
+            return _PathGrant(path, access)
+        a = self._advapi32
+        descriptor = wintypes.LPVOID()
+        dacl = wintypes.LPVOID()
+        status = a.GetNamedSecurityInfoW(
+            path, _SE_FILE_OBJECT, _DACL_SECURITY_INFORMATION,
+            None, None, ctypes.byref(dacl), None, ctypes.byref(descriptor),
+        )
+        if status or not descriptor.value:
+            raise _Win32Failure(int(status), "grant_path_access", f"read DACL {path}")
+        restore: tuple[int, int, int] | None = None
+        try:
+            if not dacl.value:
+                # A NULL DACL already admits everyone; merging an entry into
+                # it would REPLACE it with a one-entry DACL and lock others out.
+                return _PathGrant(path, access)
+            control = wintypes.WORD()
+            revision = wintypes.DWORD()
+            if not a.GetSecurityDescriptorControl(
+                descriptor, ctypes.byref(control), ctypes.byref(revision)
+            ):
+                raise _Win32Failure(
+                    _last_win_error(), "grant_path_access", f"read control {path}"
+                )
+            # Name the current protection explicitly on both the grant and the
+            # restore so neither can flip whether the DACL inherits.
+            info = _DACL_SECURITY_INFORMATION | (
+                _PROTECTED_DACL_SECURITY_INFORMATION
+                if control.value & _SE_DACL_PROTECTED
+                else _UNPROTECTED_DACL_SECURITY_INFORMATION
+            )
+            entry = _EXPLICIT_ACCESS_W()
+            entry.grfAccessPermissions = mask
+            entry.grfAccessMode = _GRANT_ACCESS
+            entry.grfInheritance = inherit
+            entry.Trustee.TrusteeForm = _TRUSTEE_IS_SID
+            entry.Trustee.ptstrName = identity.sid_token
+            merged = wintypes.LPVOID()
+            status = a.SetEntriesInAclW(1, ctypes.byref(entry), dacl, ctypes.byref(merged))
+            if status:
+                raise _Win32Failure(int(status), "grant_path_access", f"merge ACE {path}")
+            try:
+                status = a.SetNamedSecurityInfoW(
+                    path, _SE_FILE_OBJECT, info, None, None, merged, None
+                )
+            finally:
+                self._kernel32.LocalFree(merged)
+            if status:
+                raise _Win32Failure(int(status), "grant_path_access", f"write DACL {path}")
+            if not persistent:
+                restore = (int(descriptor.value), int(dacl.value), info)
+            return _PathGrant(path, access, restore)
+        finally:
+            if restore is None:
+                self._kernel32.LocalFree(descriptor)
+
+    def revoke_path_access(self, grant: _PathGrant) -> None:
+        """Restore the snapshotted DACL and free it.  Idempotent; never raises;
+        a failed restore is recorded on ``grant.revoke_error``."""
+        if grant.restore is None:
+            return
+        descriptor, dacl, info = grant.restore
+        grant.restore = None
+        try:
+            status = self._advapi32.SetNamedSecurityInfoW(
+                grant.path, _SE_FILE_OBJECT, info, None, None, dacl, None
+            )
+            if status:
+                grant.revoke_error = int(status)
+        except Exception:
+            grant.revoke_error = -1
+        finally:
+            self._kernel32.LocalFree(descriptor)
+
+    def _explicit_grant_present(
+        self, identity: _Identity, path: str, mask: int, inherit: int
+    ) -> bool:
+        sid = ctypes.string_at(
+            identity.sid_token, self._advapi32.GetLengthSid(identity.sid_token)
+        )
+        try:
+            snapshot = snapshot_filesystem_acl(path)
+        except AclSnapshotError:
+            return False  # an ACL we cannot parse is simply re-granted
+        return any(
+            ace.ace_type == _ACCESS_ALLOWED_ACE_TYPE
+            and ace.sid == sid
+            and ace.mask & mask == mask
+            and ace.flags & _ACE_INHERITANCE_FLAGS == inherit
+            for ace in snapshot.aces
+        )
 
     # -- security capabilities ---------------------------------------------
 

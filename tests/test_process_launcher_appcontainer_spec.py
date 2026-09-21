@@ -568,6 +568,157 @@ def test_supervisor_appcontainer_spec_launches_through_the_broker(
     assert launch.close_count == 1
 
 
+def _npm_shim(tmp_path, name, package):
+    """A copy of the real npm cmd-shim layout: shim + the package it runs."""
+    npm = tmp_path / "npm"
+    package_dir = npm / "node_modules" / package
+    (package_dir / "bin").mkdir(parents=True)
+    shim = npm / f"{name}.cmd"
+    shim.write_text(
+        "@ECHO off\nGOTO start\n:find_dp0\nSET dp0=%~dp0\nEXIT /b\n:start\n"
+        "SETLOCAL\nCALL :find_dp0\n"
+        f'"%dp0%\\node_modules\\{package}\\bin\\{name}.exe"   %*\n',
+        encoding="utf-8",
+    )
+    return shim, package_dir
+
+
+@pytest.mark.parametrize(
+    ("name", "package"),
+    [("claude", "@anthropic-ai\\claude-code"), ("opencode", "opencode-ai")],
+)
+def test_supervisor_worker_launch_gets_grants_and_only_internet_client(
+    monkeypatch, tmp_path, name, package
+) -> None:
+    """NF-2026-00025 / NF-2026-00033, the worker half of the split."""
+    shim, package_dir = _npm_shim(tmp_path, name, package)
+    worktree, home, temp = (tmp_path / n for n in ("worktree", "home", "tmp"))
+    for directory in (worktree, home, temp):
+        directory.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    for key in ("TMP", "TEMP", "TMPDIR"):
+        monkeypatch.setenv(key, str(temp))
+    launches: list[windows_appcontainer.AppContainerRequest] = []
+
+    def _fake_launch(request):
+        launches.append(request)
+        return _FakeAppContainerLaunch(exit_code=0)
+
+    _patch_supervisor_seams(monkeypatch)
+    monkeypatch.setattr(
+        worker_supervisor.windows_appcontainer, "launch_appcontainer", _fake_launch
+    )
+    spec = _supervisor_spec(
+        tmp_path,
+        execution_backend="windows_appcontainer",
+        repo_id=CANONICAL_REPO_ID,
+        worker_kind=f"{name}_cli",
+        argv=[str(shim), "--version"],
+        cwd=str(worktree),
+    )
+
+    assert worker_supervisor.supervise(spec) == 0
+
+    request = launches[0]
+    # cmd.exe cannot run a batch file inside the container, so the shim's own
+    # native target runs, with the worker's arguments untouched.
+    assert list(request.argv) == [str(package_dir / "bin" / f"{name}.exe"), "--version"]
+    # Outbound internet only: never inbound listening, never the LAN.
+    assert tuple(request.capability_sids) == ("internetClient",)
+    grant = windows_appcontainer.ContainerGrant
+    assert list(request.filesystem_grants) == [
+        # The shim and the one package it runs -- not the whole npm dir.
+        grant(str(shim), "read_execute", persistent=True),
+        grant(str(package_dir), "read_execute", persistent=True),
+        grant(str(worktree), "modify"),
+        grant(str(home), "modify"),
+        grant(str(temp), "modify"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        # Codex's own shim resolves its exe at run time: not an npm shim.
+        '"%CODEX_BIN%" %*',
+        # A target that escapes the shim's node_modules is never trusted.
+        '"%dp0%\\node_modules\\..\\..\\evil.exe" %*',
+        '"%dp0%\\node_modules\\@scope\\..\\x.exe" %*',
+        # A bare package with no file under it.
+        '"%dp0%\\node_modules\\pkg" %*',
+    ],
+)
+def test_non_npm_or_escaping_shims_are_neither_unwrapped_nor_followed(
+    tmp_path, line
+) -> None:
+    shim = tmp_path / "tool.cmd"
+    shim.write_text(f"@echo off\n{line}\n", encoding="utf-8")
+    assert worker_supervisor._resolve_npm_shim(str(shim)) is None
+    assert worker_supervisor._native_worker_argv([str(shim), "-x"]) == [str(shim), "-x"]
+    assert worker_supervisor._provider_install_grants(str(shim)) == [
+        windows_appcontainer.ContainerGrant(
+            str(shim.parent), "read_execute", persistent=True
+        )
+    ]
+
+
+def test_supervisor_native_executable_grants_its_own_directory(tmp_path) -> None:
+    exe = tmp_path / "bin" / "kilo.exe"
+    exe.parent.mkdir()
+    exe.write_bytes(b"MZ")
+    assert worker_supervisor._provider_install_grants(str(exe)) == [
+        windows_appcontainer.ContainerGrant(
+            str(exe.parent), "read_execute", persistent=True
+        )
+    ]
+
+
+def test_launch_isolated_gives_the_appcontainer_worker_its_isolated_home(
+    monkeypatch, tmp_path
+) -> None:
+    """HOME=None would seed the user's REAL profile, which the supervisor
+    would then grant the container modify access to.  With HOME isolated, the
+    supervisor also needs the real LOCALAPPDATA handed over (CreateProcessW
+    error 203 otherwise)."""
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setenv("LOCALAPPDATA", r"C:\Users\u\AppData\Local")
+    _patch_launch_seams(
+        monkeypatch,
+        tmp_path,
+        sandbox_backend="windows_appcontainer",
+        canonical_repo_id=CANONICAL_REPO_ID,
+    )
+    env_kwargs: list[dict] = []
+    monkeypatch.setattr(
+        process_launcher,
+        "worker_launch_env",
+        lambda adapter_id, **kwargs: env_kwargs.append(kwargs) or {},
+    )
+    monkeypatch.setattr(process_launcher, "write_json_0600", lambda *_a: None)
+    spawned: list[dict] = []
+
+    class _Manager(_FakeManager):
+        def _popen(self, *_args, **kwargs):
+            spawned.append(kwargs)
+            return super()._popen()
+
+    result = module.launch_isolated(
+        _Manager(tmp_path, repo="repo_self_unused"),
+        task_id="task-1",
+        runner="runner-1",
+        topic="topic-1",
+        adapter_id="claude_cli",
+        model=None,
+        owner_prompt="do the thing",
+        timeout_seconds=60,
+    )
+
+    assert result["ok"] is True, result
+    assert env_kwargs[0]["home"] == tmp_path / "workspace-home"
+    assert spawned[0]["env"]["LOCALAPPDATA"] == r"C:\Users\u\AppData\Local"
+
+
 def test_supervisor_appcontainer_setup_failure_never_falls_back_to_popen(
     monkeypatch, tmp_path
 ) -> None:
@@ -885,6 +1036,52 @@ def test_appcontainer_validation_returns_a_completed_process(
         "claude_cli"
     )
     assert launches[0].closed
+
+
+def test_appcontainer_validation_gets_grants_but_no_network(
+    tmp_path: Path, monkeypatch, identity_osfhandle
+) -> None:
+    """NF-2026-00033, the validation half of the split: candidate code runs
+    offline.  NF-2026-00025: the worktree root read-only, HOME/temp modify."""
+    launches: list[_FakeValidationLaunch] = []
+    _stub_repo_id(monkeypatch)
+    _install_fake_launch(
+        monkeypatch,
+        stdout=b"",
+        stderr=b"",
+        outcome=windows_appcontainer.AppContainerLifecycleResult(
+            windows_appcontainer.AppContainerLifecycleState.EXITED, exit_code=0
+        ),
+        sink=launches,
+    )
+    worktree, home, scratch = (tmp_path / n for n in ("wt", "home", "scratch"))
+    env = {
+        "HOME": str(home),
+        "USERPROFILE": str(home),
+        "TMP": str(scratch),
+        "TEMP": str(scratch),
+        "PATH": "x",
+    }
+
+    worker_workspace._run_appcontainer_validation(
+        ["pytest", "-q"],
+        workspace=SimpleNamespace(repo=tmp_path, path=worktree, home=home),
+        adapter_id="claude_cli",
+        cwd=worktree / "pkg",
+        env=env,
+        timeout_seconds=30,
+    )
+
+    request = launches[0].request
+    assert tuple(request.capability_sids) == ()
+    grant = windows_appcontainer.ContainerGrant
+    assert list(request.filesystem_grants) == [
+        # The root, never the cd subdir a candidate could have made a junction.
+        grant(str(worktree), "read_execute"),
+        grant(str(home), "modify"),
+        grant(str(scratch), "modify"),
+    ]
+    assert not any(g.persistent for g in request.filesystem_grants)
 
 
 def test_appcontainer_validation_timeout_carries_partial_output(

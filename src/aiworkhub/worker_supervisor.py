@@ -6,6 +6,7 @@ import argparse
 import ctypes
 import json
 import os
+import re
 import signal
 import stat
 import subprocess
@@ -252,6 +253,83 @@ def _native_handle(fd: int) -> int:
     return int(get_osfhandle(fd))
 
 
+# NF-2026-00033: a worker reaches its provider API and nothing else --
+# outbound internet only.  Never internetClientServer (inbound listening) or
+# privateNetworkClientServer (LAN).  Validation launches request no capability
+# at all (worker_workspace._run_appcontainer_validation).
+WORKER_NETWORK_CAPABILITIES = ("internetClient",)
+_NPM_SHIM_TARGET = re.compile(r'"%dp0%\\node_modules\\([^"]+)"')
+
+
+def _resolve_npm_shim(executable: str) -> tuple[Path, Path] | None:
+    """``(target, package_root)`` of an npm cmd-shim, or None.
+
+    The shim runs ``"%dp0%\\node_modules\\<package>\\...\\<file>"``; the target
+    is accepted only strictly inside the shim's own ``node_modules``.
+    """
+    path = Path(executable)
+    if path.suffix.lower() not in {".cmd", ".bat"}:
+        return None
+    try:
+        with open(path, encoding="utf-8", errors="replace") as shim:
+            match = _NPM_SHIM_TARGET.search(shim.read(65536))
+    except OSError:
+        return None
+    parts = match.group(1).split("\\") if match else []
+    depth = 2 if parts and parts[0].startswith("@") else 1
+    if len(parts) <= depth or any(part in {"", ".", ".."} for part in parts):
+        return None
+    root = path.parent / "node_modules"
+    return root.joinpath(*parts), root.joinpath(*parts[:depth])
+
+
+def _native_worker_argv(argv: list[str]) -> list[str]:
+    """Run an npm shim's native ``.exe`` directly instead of through cmd.exe.
+
+    Measured on Windows 11 26200: cmd.exe inside the container fails EVERY
+    batch file -- even one in its fully granted cwd -- with "Access is
+    denied.", because it canonicalizes the script path through each ancestor
+    and an AppContainer cannot list ``C:\\`` or ``C:\\Users`` (which the user
+    cannot re-permission either).  The shim does nothing but run
+    ``<target>.exe %*``, so this is the same program with the same arguments,
+    minus cmd.exe re-parsing the worker's arguments for metacharacters.
+    """
+    resolved = _resolve_npm_shim(argv[0])
+    if resolved is None or resolved[0].suffix.lower() != ".exe":
+        return argv
+    return [str(resolved[0]), *argv[1:]]
+
+
+def _provider_install_grants(
+    executable: str,
+) -> list[windows_appcontainer.ContainerGrant]:
+    """Read/execute on exactly what the provider CLI needs to start.
+
+    For an npm shim: the shim and the one package it runs -- not the whole
+    npm directory the other CLIs live in.  Any other executable: its own
+    directory.  Persistent: see the rationale in ``launch_appcontainer``.
+    """
+    path = Path(executable)
+    resolved = _resolve_npm_shim(executable)
+    roots = [path, resolved[1]] if resolved else [path.parent]
+    return [
+        windows_appcontainer.ContainerGrant(str(root), "read_execute", persistent=True)
+        for root in roots
+    ]
+
+
+def _worker_filesystem_grants(
+    argv: list[str], cwd: str, env: dict[str, str]
+) -> list[windows_appcontainer.ContainerGrant]:
+    """NF-2026-00025: the container SID starts with no access to anything the
+    worker needs.  Grant the provider install (read) plus the per-request
+    worktree, isolated HOME and request temp (modify, revoked on close)."""
+    return [
+        *_provider_install_grants(argv[0]),
+        *windows_appcontainer.request_scoped_grants(env, cwd),
+    ]
+
+
 def _launch_appcontainer_process(
     argv: list[str], cwd: str, spec: dict[str, Any]
 ) -> _AppContainerProcess:
@@ -276,15 +354,18 @@ def _launch_appcontainer_process(
     try:
         os.set_inheritable(stdout_write, True)
         os.set_inheritable(stderr_write, True)
+        environment = os.environ.copy()
         request = windows_appcontainer.AppContainerRequest(
-            argv=argv,
+            argv=_native_worker_argv(argv),
             repo_id=repo_id,
             worker_kind=worker_kind,
             working_directory=cwd,
-            environment=os.environ.copy(),
+            environment=environment,
             stdin_handle=_native_handle(stdin_fd),
             stdout_handle=_native_handle(stdout_write),
             stderr_handle=_native_handle(stderr_write),
+            capability_sids=WORKER_NETWORK_CAPABILITIES,
+            filesystem_grants=_worker_filesystem_grants(argv, cwd, environment),
         )
         launch = windows_appcontainer.launch_appcontainer(request)
         os.close(stdout_write)

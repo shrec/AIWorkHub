@@ -589,8 +589,18 @@ def test_confinement_report_describes_the_boundary_that_is_actually_applied(
     # report must not keep understating that as a lifetime bound.
     assert applied["active_confinement"] == "appcontainer_profile_and_job_object"
     assert "filesystem" in applied["active_contains"]
-    assert "network" in applied["active_contains"]
-    assert applied["active_does_not_contain"] == ()
+    # NF-2026-00033: network is split by launch, never a blanket claim.  A
+    # worker has outbound internet (internetClient) and nothing inbound or on
+    # the LAN; a validation launch has no network at all.
+    assert "network" not in applied["active_contains"]
+    assert {"inbound_network", "private_network", "validation_launch_network"} <= set(
+        applied["active_contains"]
+    )
+    assert applied["active_does_not_contain"] == ("worker_launch_internet_egress",)
+    assert applied["network_egress"] == {
+        "worker_launch": "internet_client",
+        "validation_launch": "none",
+    }
 
     # A host that cannot build one falls back to the supervisor's plain
     # subprocess branch, where the Job Object bounds lifetime and nothing else.

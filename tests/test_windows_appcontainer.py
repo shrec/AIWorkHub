@@ -11,6 +11,8 @@ without ever leaving a child running outside the job.
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 import aiworkhub.windows_appcontainer as wac
@@ -19,13 +21,16 @@ from aiworkhub.windows_appcontainer import (
     AppContainerLifecycleState,
     AppContainerReason,
     AppContainerRequest,
+    ContainerGrant,
     _AttributeList,
     _Identity,
+    _PathGrant,
     _ProcessCreation,
     _SecurityCapabilities,
     _Win32Failure,
     build_command_line,
     launch_appcontainer,
+    request_scoped_grants,
 )
 
 
@@ -92,6 +97,23 @@ class FakeWin32Api:
     def free_identity(self, identity):
         self.events.append("free_identity")
         self.identity_freed = True
+
+    # -- filesystem grants --------------------------------------------------
+
+    fail_grant_attempt: int | None = None
+    grant_attempts = 0
+
+    def grant_path_access(self, identity, path, access, *, persistent=False):
+        self.grant_attempts += 1
+        if self.grant_attempts == self.fail_grant_attempt:
+            raise _Win32Failure(5, "grant_path_access", f"forced-grant {path}")
+        assert identity is self.identity, "grant must target this launch's SID"
+        self.events.append(f"grant:{access}:{path}")
+        return _PathGrant(path, access, None if persistent else ("dacl", path))
+
+    def revoke_path_access(self, grant):
+        self.events.append(f"revoke:{grant.path}")
+        grant.restore = None
 
     def build_security_capabilities(self, identity, capability_sids):
         self._maybe_fail("build_security_capabilities")
@@ -1900,3 +1922,331 @@ def test_launch_refuses_hostile_keys_before_supplying_localappdata(monkeypatch):
             make_request(environment={"A=B": "value"}), api=FakeWin32Api()
         )
     assert excinfo.value.reason is AppContainerReason.INVALID_ENVIRONMENT
+
+
+# ---------------------------------------------------------------------------
+# Filesystem grants (NF-2026-00025)
+# ---------------------------------------------------------------------------
+
+
+def _grant_dirs(tmp_path):
+    paths = []
+    for name in ("worktree", "home", "provider"):
+        path = tmp_path / name
+        path.mkdir()
+        paths.append(str(path))
+    worktree, home, provider = paths
+    return [
+        ContainerGrant(worktree, "modify"),
+        ContainerGrant(home, "modify"),
+        ContainerGrant(provider, "read_execute", persistent=True),
+    ]
+
+
+def _grant_events(fake):
+    return [e for e in fake.events if e.startswith(("grant:", "revoke:"))]
+
+
+def test_grants_apply_in_order_for_this_sid_before_create_process(tmp_path):
+    grants = _grant_dirs(tmp_path)
+    fake = FakeWin32Api()
+    launch = launch_appcontainer(make_request(filesystem_grants=grants), api=fake)
+
+    expected = [f"grant:{g.access}:{g.path}" for g in grants]
+    assert _grant_events(fake) == expected
+    first_grant = fake.events.index(expected[0])
+    assert fake.events.index("derive_appcontainer_sid") < first_grant
+    assert fake.events.index(expected[-1]) < fake.events.index("create_process")
+    # Only the revocable grants are owned by the launch; nothing revoked yet.
+    assert [g.path for g in launch.grants] == [grants[0].path, grants[1].path]
+
+
+def test_create_process_failure_revokes_every_applied_grant_lifo(tmp_path):
+    grants = _grant_dirs(tmp_path)
+    fake = FakeWin32Api(fail_at="create_process")
+    with pytest.raises(AppContainerError):
+        launch_appcontainer(make_request(filesystem_grants=grants), api=fake)
+
+    revokes = [e for e in _grant_events(fake) if e.startswith("revoke:")]
+    # Reverse order, and the persistent provider grant is never revoked.
+    assert revokes == [f"revoke:{grants[1].path}", f"revoke:{grants[0].path}"]
+    assert_no_leak(fake)
+
+
+def test_second_grant_failure_revokes_the_first_and_never_launches(tmp_path):
+    grants = _grant_dirs(tmp_path)
+    fake = FakeWin32Api()
+    fake.fail_grant_attempt = 2
+    with pytest.raises(AppContainerError) as excinfo:
+        launch_appcontainer(make_request(filesystem_grants=grants), api=fake)
+
+    assert excinfo.value.reason is AppContainerReason.FILESYSTEM_GRANT_FAILED
+    assert excinfo.value.operation == "grant_path_access"
+    assert _grant_events(fake) == [
+        f"grant:modify:{grants[0].path}",
+        f"revoke:{grants[0].path}",
+    ]
+    assert "create_process" not in fake.events
+    assert fake.identity_freed
+
+
+def test_close_revokes_grants_once_and_second_close_is_a_noop(tmp_path):
+    grants = _grant_dirs(tmp_path)
+    fake = FakeWin32Api()
+    launch = launch_appcontainer(make_request(filesystem_grants=grants), api=fake)
+    fake.events.clear()
+
+    launch.close()
+    assert _grant_events(fake) == [
+        f"revoke:{grants[1].path}",
+        f"revoke:{grants[0].path}",
+    ]
+    assert launch.grants == []
+    assert launch.cleanup_evidence()["outstanding_grants"] == []
+
+    fake.events.clear()
+    launch.close()
+    assert fake.events == []
+
+
+def test_terminate_also_revokes_grants(tmp_path):
+    grants = _grant_dirs(tmp_path)
+    fake = FakeWin32Api()
+    fake.wait_results = [True]
+    launch = launch_appcontainer(make_request(filesystem_grants=grants), api=fake)
+
+    launch.terminate()
+    assert [e for e in fake.events if e.startswith("revoke:")] == [
+        f"revoke:{grants[1].path}",
+        f"revoke:{grants[0].path}",
+    ]
+
+
+def test_request_without_grants_touches_no_grant_api():
+    fake = FakeWin32Api()
+    launch = launch_appcontainer(make_request(), api=fake)
+    launch.close()
+    assert fake.grant_attempts == 0
+    assert _grant_events(fake) == []
+    assert launch.grants == []
+
+
+def _make_link(target, link):
+    """A symlink where permitted, else (Windows) a junction: both reparse."""
+    try:
+        os.symlink(target, link, target_is_directory=True)
+    except OSError:
+        if os.name != "nt":
+            raise
+        import _winapi
+
+        _winapi.CreateJunction(str(target), str(link))
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "relative",
+        "missing",
+        "leaf_link",
+        "ancestor_link",
+        "access",
+        "nul",
+        "persistent_modify",
+    ],
+)
+def test_invalid_grant_is_refused_before_any_win32_call(tmp_path, case):
+    real = tmp_path / "real"
+    (real / "child").mkdir(parents=True)
+    path, access, persistent = str(real), "modify", case == "persistent_modify"
+    if case == "relative":
+        path = os.path.join("relative", "dir")
+    elif case == "missing":
+        path = str(tmp_path / "absent")
+    elif case in {"leaf_link", "ancestor_link"}:
+        _make_link(real, tmp_path / "link")
+        path = str(tmp_path / "link")
+        if case == "ancestor_link":
+            path = str(tmp_path / "link" / "child")
+    elif case == "access":
+        access = "full_control"
+    elif case == "nul":
+        path = str(real) + "\x00"
+    fake = FakeWin32Api()
+    with pytest.raises(AppContainerError) as excinfo:
+        launch_appcontainer(
+            make_request(
+                filesystem_grants=[ContainerGrant(path, access, persistent)]
+            ),
+            api=fake,
+        )
+    assert excinfo.value.reason is AppContainerReason.INVALID_REQUEST
+    assert fake.events == []
+
+
+def test_modify_grant_containing_the_user_profile_is_refused(tmp_path, monkeypatch):
+    profile = tmp_path / "profile"
+    local = profile / "AppData" / "Local"
+    local.mkdir(parents=True)
+    monkeypatch.setattr(wac, "resolve_local_appdata", lambda: str(local))
+    fake = FakeWin32Api()
+    for path in (profile, local):
+        with pytest.raises(AppContainerError) as excinfo:
+            launch_appcontainer(
+                make_request(filesystem_grants=[ContainerGrant(str(path), "modify")]),
+                api=fake,
+            )
+        assert "user profile" in excinfo.value.detail
+    assert fake.events == []
+    # A request directory *inside* the profile is fine, and read access to
+    # the profile itself is not what this guard is about.
+    inside = local / "request"
+    inside.mkdir()
+    launch_appcontainer(
+        make_request(
+            filesystem_grants=[
+                ContainerGrant(str(inside), "modify"),
+                ContainerGrant(str(profile), "read_execute"),
+            ]
+        ),
+        api=fake,
+    )
+
+
+def test_request_scoped_grants_dedupe_and_skip_unset(tmp_path):
+    cwd, home, temp = (str(tmp_path / n) for n in ("wt", "home", "tmp"))
+    env = {"HOME": home, "USERPROFILE": home, "TMP": temp, "TEMP": temp, "PATH": "x"}
+    assert request_scoped_grants(env, cwd) == [
+        ContainerGrant(cwd, "modify"),
+        ContainerGrant(home, "modify"),
+        ContainerGrant(temp, "modify"),
+    ]
+    assert request_scoped_grants({}) == []
+
+
+# -- real ctypes boundary against recording advapi32/kernel32 doubles --------
+
+
+class FakeSecurityLib:
+    """Stands in for both advapi32 and kernel32 in the grant/revoke path."""
+
+    def __init__(self, *, dacl=222, protected=False, set_status=0):
+        self.dacl = dacl
+        self.protected = protected
+        self.set_status = set_status
+        self.entries = []
+        self.set_calls = []
+        self.freed = []
+
+    def GetNamedSecurityInfoW(self, path, obj, info, owner, group, dacl, sacl, sd):
+        sd._obj.value = 111
+        dacl._obj.value = self.dacl
+        return 0
+
+    def GetSecurityDescriptorControl(self, descriptor, control, revision):
+        control._obj.value = 0x1000 if self.protected else 0
+        return 1
+
+    def SetEntriesInAclW(self, count, entry, old_acl, new_acl):
+        e = entry._obj
+        self.entries.append(
+            (count, e.grfAccessPermissions, e.grfAccessMode, e.grfInheritance,
+             e.Trustee.TrusteeForm, e.Trustee.ptstrName, old_acl.value)
+        )
+        new_acl._obj.value = 333
+        return 0
+
+    def SetNamedSecurityInfoW(self, path, obj, info, owner, group, dacl, sacl):
+        self.set_calls.append((path, info, getattr(dacl, "value", dacl)))
+        return self.set_status
+
+    def LocalFree(self, ptr):
+        self.freed.append(getattr(ptr, "value", ptr))
+
+
+def _security_api(lib, monkeypatch):
+    api = make_ctypes_api(lib)
+    api._advapi32 = lib
+    monkeypatch.setattr(api, "_explicit_grant_present", lambda *a: False)
+    return api
+
+
+@pytest.mark.parametrize("protected", [False, True])
+def test_ctypes_grant_merges_one_ace_for_exactly_the_container_sid(
+    tmp_path, monkeypatch, protected
+):
+    lib = FakeSecurityLib(protected=protected)
+    api = _security_api(lib, monkeypatch)
+    identity = _Identity("n", "d", "S-1-15-2-9", 0xABC, False)
+
+    grant = api.grant_path_access(identity, str(tmp_path), "modify")
+
+    # One GRANT_ACCESS entry whose trustee is the container SID itself,
+    # inheritable to files and subdirectories, merged into the DACL just read.
+    assert lib.entries == [(1, 0x1301BF, 1, 0x3, 0, 0xABC, 222)]
+    info = 0x4 | (0x80000000 if protected else 0x20000000)
+    assert lib.set_calls == [(str(tmp_path), info, 333)]
+    # The merged ACL is freed at once; the snapshot is kept for the restore.
+    assert lib.freed == [333]
+    assert grant.restore == (111, 222, info)
+
+    api.revoke_path_access(grant)
+    assert lib.set_calls[-1] == (str(tmp_path), info, 222)
+    assert lib.freed == [333, 111]
+    api.revoke_path_access(grant)
+    assert len(lib.set_calls) == 2 and lib.freed == [333, 111]
+
+
+def test_ctypes_file_grant_is_not_inheritable_and_persistent_frees_snapshot(
+    tmp_path, monkeypatch
+):
+    target = tmp_path / "claude.cmd"
+    target.write_text("@echo off\n", encoding="utf-8")
+    lib = FakeSecurityLib()
+    api = _security_api(lib, monkeypatch)
+    identity = _Identity("n", "d", "S-1-15-2-9", 0xABC, False)
+
+    grant = api.grant_path_access(
+        identity, str(target), "read_execute", persistent=True
+    )
+
+    assert lib.entries[0][1:4] == (0x1200A9, 1, 0)
+    assert grant.restore is None
+    assert sorted(lib.freed) == [111, 333]
+    api.revoke_path_access(grant)
+    assert len(lib.set_calls) == 1
+
+
+def test_ctypes_grant_leaves_a_null_dacl_alone(tmp_path, monkeypatch):
+    lib = FakeSecurityLib(dacl=None)
+    api = _security_api(lib, monkeypatch)
+    grant = api.grant_path_access(
+        _Identity("n", "d", "S-1-15-2-9", 0xABC, False), str(tmp_path), "modify"
+    )
+    assert lib.entries == [] and lib.set_calls == []
+    assert grant.restore is None
+    assert lib.freed == [111]
+
+
+def test_ctypes_failed_restore_is_recorded_not_raised(monkeypatch):
+    lib = FakeSecurityLib(set_status=5)
+    api = _security_api(lib, monkeypatch)
+    grant = _PathGrant("C:\\w", "modify", (111, 222, 0x20000004))
+    api.revoke_path_access(grant)
+    assert grant.revoke_error == 5
+    assert lib.freed == [111]
+
+
+def test_launch_close_surfaces_a_failed_revoke(tmp_path):
+    class RevokeFails(FakeWin32Api):
+        def revoke_path_access(self, grant):
+            super().revoke_path_access(grant)
+            grant.revoke_error = 1307
+
+    fake = RevokeFails()
+    grant = ContainerGrant(str(tmp_path), "modify")
+    launch = launch_appcontainer(make_request(filesystem_grants=[grant]), api=fake)
+    launch.close()
+    assert launch.cleanup_evidence()["grant_revoke_failures"] == [
+        {"path": str(tmp_path), "win_error": 1307}
+    ]
