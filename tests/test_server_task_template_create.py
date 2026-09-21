@@ -625,3 +625,72 @@ def test_task_template_show_documents_deterministic_creation(
     assert "behavioral roles" in guidance["validation"]
     assert "uncapped by default" in guidance["token_budget"]
     assert task_templates.AUDITED_CUSTOM_ESCAPE in guidance["exception"]
+
+
+_WAVE_BINDING = {
+    "roadmap_id": "RM-2026-00066",
+    "goal_id": "lsp",
+    "predecessor_task_id": "LSP_V1",
+}
+
+
+def test_template_create_forwards_wave_goal_binding_only_when_declared(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _ready_repo(tmp_path, monkeypatch)
+    calls: list[dict[str, object]] = []
+
+    def create(**kwargs: object) -> dict[str, object]:
+        calls.append(kwargs)
+        return {"ok": False, "returncode": 2, "stderr": "stop"}
+
+    monkeypatch.setattr(core, "create_task", create)
+    kwargs = _from_template_kwargs(
+        task_id="TASK_WAVE_TEMPLATE",
+        # Prose that names a wave must never be read as a binding.
+        title="Wave successor for RM-2026-00066 lsp after LSP_V1",
+    )
+    binding = dict(_WAVE_BINDING)
+
+    server.aiworkhub_task_create_from_template(**kwargs)  # type: ignore[arg-type]
+    server.aiworkhub_task_create_from_template(  # type: ignore[arg-type]
+        **kwargs, wave_goal_binding=binding
+    )
+
+    # An old template caller reaches core with exactly the call it made
+    # before the field existed; a declared binding is forwarded unchanged.
+    assert "wave_goal_binding" not in calls[0]
+    forwarded = calls[1].pop("wave_goal_binding")
+    assert forwarded is binding
+    assert forwarded == _WAVE_BINDING
+    assert calls[1] == calls[0]
+
+
+@pytest.mark.parametrize(
+    ("binding", "code"),
+    [
+        ({"roadmap_id": "RM-2026-00066", "goal_id": "lsp"}, "keys"),
+        ({**_WAVE_BINDING, "extra": "x"}, "keys"),
+        ("RM-2026-00066/lsp/LSP_V1", "keys"),
+        ({**_WAVE_BINDING, "roadmap_id": "not a roadmap"}, "roadmap_id"),
+        ({**_WAVE_BINDING, "predecessor_task_id": 7}, "predecessor_task_id"),
+        (
+            {**_WAVE_BINDING, "predecessor_task_id": "TASK_WAVE_BAD"},
+            "self_succession",
+        ),
+    ],
+)
+def test_template_create_malformed_wave_goal_binding_fails_closed_in_core(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    binding: object,
+    code: str,
+) -> None:
+    repo = _ready_repo(tmp_path, monkeypatch)
+    result = server.aiworkhub_task_create_from_template(  # type: ignore[arg-type]
+        **_from_template_kwargs(task_id="TASK_WAVE_BAD"),
+        wave_goal_binding=binding,
+    )
+    assert result["ok"] is False
+    assert f"invalid_wave_goal_binding:{code}" in json.dumps(result)
+    assert task_store.get_task(repo, "TASK_WAVE_BAD") is None

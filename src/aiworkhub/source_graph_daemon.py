@@ -1382,10 +1382,11 @@ class SourceGraphDaemon:
             "repo_root": str(self.repo_root),
             "owner_token": owner_token,
             "owner_pid": os.getpid(),
-            "state": "running",
             "started_at": _utcnow(),
             "identity_kind": identity_kind,
             **(kernel_identity or {"pid": process.pid, "pgid": 0, "session_id": 0, "start_ticks": 0}),
+            # The kernel's one-letter process state is not our build state.
+            "state": "running",
         }
         # Retain the owning handle before durable publication. If publication
         # fails, this is the only strong authority available for safely
@@ -1420,6 +1421,18 @@ class SourceGraphDaemon:
                     self._build_process = None
                     self._build_pgid = None
                 self._build_owner_token = None
+            retained = _read_build_identity(self.repo_root)
+            # A verified POSIX owner is normal cross-instance contention.
+            # Windows PID liveness alone cannot authenticate identity, so an
+            # unproven owner remains a fail-closed error.
+            if (
+                not platform_io.is_windows()
+                and retained is not None
+                and retained.get("repo_root") == _registry_key(self.repo_root)
+                and retained.get("state") == "running"
+                and _identity_matches(retained)
+            ):
+                return {"kind": "standby"}
             return {"kind": "error", "error": "index_subprocess:identity_slot_owned"}
         if gate_write is not None:
             try:

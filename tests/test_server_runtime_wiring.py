@@ -14,7 +14,14 @@ _SRC = Path(__file__).resolve().parents[1] / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from aiworkhub import core, process_launcher, server, task_engine, task_store  # noqa: E402
+from aiworkhub import (  # noqa: E402
+    core,
+    process_launcher,
+    roadmap_store,
+    server,
+    task_engine,
+    task_store,
+)
 
 _NOW = "2026-07-20T00:00:00+00:00"
 
@@ -1108,3 +1115,185 @@ def test_source_graph_retrieval_eval_same_task_tampered_field_stays_refused(
     )
     assert report["accepted_outcome_coverage"] == 0.0
     assert report["accepted_outcome_measurement_pending"] is False
+
+
+# --- Exact wave-goal successor binding at task creation ---------------------
+
+_WAVE_SESSION_ID = "019f5097-6dbe-7172-870a-945afc5f3bfa"
+
+
+def test_task_create_forwards_wave_goal_binding_only_when_declared(monkeypatch):
+    calls = []
+
+    def create(**kwargs):
+        calls.append(kwargs)
+        return {"ok": False, "returncode": 2, "stderr": "stop"}
+
+    monkeypatch.setattr(core, "create_task", create)
+    binding = {
+        "roadmap_id": "RM-2026-00066",
+        "goal_id": "lsp",
+        "predecessor_task_id": "LSP_V1",
+    }
+    common = {
+        "task_id": "T_WAVE",
+        "title": "Wave successor",
+        "runner": "claude_wave",
+        "topic": "task_mcp",
+        "objective": "Bind exactly.",
+        "acceptance": ["Bound."],
+        "allowed_writes": ["src/wave.py"],
+    }
+
+    server.aiworkhub_task_create(**common)
+    server.aiworkhub_task_create(**common, wave_goal_binding=binding)
+
+    # An old caller reaches core with exactly the call it made before the field.
+    assert "wave_goal_binding" not in calls[0]
+    assert calls[1].pop("wave_goal_binding") == binding
+    assert calls[1] == calls[0]
+
+
+def _wave_manager_repo(tmp_path: Path, monkeypatch) -> Path:
+    root = _init_lifecycle_repo(tmp_path)
+    monkeypatch.setenv("AIWORKHUB_REPO", str(root))
+    monkeypatch.setenv("AIWORKHUB_ALLOW_WRITES", "1")
+    monkeypatch.setattr(core, "_claude_manager_identity", lambda: None)
+    monkeypatch.setattr(core, "_codex_manager_identity", lambda: {
+        "provider": "codex",
+        "session_id": _WAVE_SESSION_ID,
+        "thread_id": _WAVE_SESSION_ID,
+    })
+    monkeypatch.setattr(core, "_verify_coordinator_capability", lambda runner: (True, "ok"))
+    _insert_lifecycle_task(root, "LSP_V1", "claude_wave_binding", "task_mcp")
+    return root
+
+
+def _active_wave(root: Path) -> dict:
+    wave = roadmap_store.add_item(
+        root,
+        title="Wave",
+        outcome="Deliver the wave",
+        milestone="0.11.51",
+        acceptance=["LSP index integrated"],
+        provenance={"wave_goals": [{"id": "lsp", "label": "LSP", "task_ids": ["LSP_V1"]}]},
+    )
+    roadmap_store.link_task(root, wave["id"], "LSP_V1")
+    roadmap_store.transition_item(root, wave["id"], "approved", reason="planned")
+    return roadmap_store.transition_item(root, wave["id"], "in_progress", reason="started")
+
+
+def _create_wave_card(task_id: str, binding: dict | None = None) -> dict:
+    output = f"research/{task_id.lower()}.json"
+    return server.aiworkhub_task_create(
+        task_id=task_id,
+        title=f"LSP index integration {task_id}",
+        runner="claude_wave_binding",
+        topic="task_mcp",
+        objective="Become the LSP goal's current task only through an explicit binding.",
+        acceptance=["The wave goal names this exact task."],
+        allowed_writes=[output],
+        required_outputs=[output],
+        validation=[f"python3 -m json.tool {output}"],
+        custom_template_escape="audited_custom_unclassified",
+        **({"wave_goal_binding": binding} if binding is not None else {}),
+    )
+
+
+def _lsp_goal(root: Path, roadmap_id: str) -> list[str]:
+    wave = roadmap_store.get_item(root, roadmap_id)
+    return wave["provenance"]["wave_goals"][0]["task_ids"]
+
+
+def _successor_events(root: Path, roadmap_id: str) -> list[dict]:
+    return [
+        event["detail"]
+        for event in roadmap_store.list_events(root, roadmap_id)
+        if event["event"] == roadmap_store.WAVE_GOAL_SUCCESSOR_EVENT
+    ]
+
+
+def test_task_create_binds_only_the_exact_declared_successor(tmp_path, monkeypatch):
+    root = _wave_manager_repo(tmp_path, monkeypatch)
+    wave = _active_wave(root)
+    binding = {"roadmap_id": wave["id"], "goal_id": "lsp", "predecessor_task_id": "LSP_V1"}
+
+    by_name = _create_wave_card("LSP_V2_BY_NAME")
+    extra_key = _create_wave_card("LSP_V2_EXTRA", {**binding, "title_hint": "V2"})
+    foreign = _create_wave_card(
+        "LSP_V2_FOREIGN", {**binding, "predecessor_task_id": "OTHER_REPO_V1"}
+    )
+    created = _create_wave_card("LSP_V2", binding)
+    retried = _create_wave_card("LSP_V2", binding)
+    rival = _create_wave_card("LSP_V2_RIVAL", binding)
+    rebound = _create_wave_card("LSP_V2", {**binding, "goal_id": "playbook"})
+
+    # A card that declares nothing is never bound, whatever its name says.
+    assert by_name["ok"] is True, by_name
+    assert "wave_goal_binding" not in by_name
+    assert "wave_goal_binding" not in task_store.get_task(root, "LSP_V2_BY_NAME")
+    assert extra_key["stderr"] == "invalid_wave_goal_binding:keys"
+    assert foreign["stderr"] == "wave_goal_binding_refused:predecessor_not_in_repository"
+    assert created["ok"] is True, created
+    assert created["wave_goal_binding"]["state"] == "applied"
+    assert task_store.get_task(root, "LSP_V2")["wave_goal_binding"] == binding
+    assert (retried["receipt_state"], retried["wave_goal_binding"]["state"]) == (
+        "existing_identical", "applied",
+    )
+    assert rival["stderr"] == "wave_goal_binding_refused:predecessor_not_current"
+    assert "wave_goal_binding" in rebound["conflict_fields"]
+    for refused in ("LSP_V2_EXTRA", "LSP_V2_FOREIGN", "LSP_V2_RIVAL"):
+        assert task_store.get_task(root, refused) is None
+    assert _lsp_goal(root, wave["id"]) == ["LSP_V2"]
+    assert roadmap_store.get_item(root, wave["id"])["task_ids"] == ["LSP_V1", "LSP_V2"]
+    assert _successor_events(root, wave["id"]) == [
+        {"goal_id": "lsp", "from": "LSP_V1", "to": "LSP_V2"}
+    ]
+
+
+def test_task_create_leaves_an_unapplied_binding_pending_for_the_reconciler(
+    tmp_path, monkeypatch
+):
+    root = _wave_manager_repo(tmp_path, monkeypatch)
+    wave = _active_wave(root)
+    binding = {"roadmap_id": wave["id"], "goal_id": "lsp", "predecessor_task_id": "LSP_V1"}
+    real_bind = roadmap_store.bind_goal_successor
+
+    def locked(*_args, **_kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(roadmap_store, "bind_goal_successor", locked)
+    pending = _create_wave_card("LSP_V2", binding)
+    monkeypatch.setattr(roadmap_store, "bind_goal_successor", real_bind)
+
+    assert pending["ok"] is True, pending
+    assert pending["wave_goal_binding"]["state"] == "pending"
+    assert pending["wave_goal_binding"]["reason"] == "roadmap_unavailable:OperationalError"
+    assert task_store.get_task(root, "LSP_V2")["wave_goal_binding"] == binding
+    assert _lsp_goal(root, wave["id"]) == ["LSP_V1"]
+
+    monkeypatch.setenv("AIWORKHUB_ALLOW_WRITES", "0")
+    blocked_create = _create_wave_card(
+        "LSP_V3", {**binding, "predecessor_task_id": "LSP_V2"}
+    )
+    snapshot = core.roadmap_snapshot()
+    gated = server.task_reconciler._scan_wave_goal_bindings(root)
+
+    assert blocked_create["returncode"] == 126
+    assert task_store.get_task(root, "LSP_V3") is None
+    # Reads never repair, and the gated pass only reports what is pending.
+    assert snapshot["items"][0]["provenance"]["wave_goals"][0]["task_ids"] == ["LSP_V1"]
+    assert (gated["reason"], gated["task_ids"]) == ("writes_disabled", ["LSP_V2"])
+    assert _lsp_goal(root, wave["id"]) == ["LSP_V1"]
+    assert _successor_events(root, wave["id"]) == []
+
+    monkeypatch.setenv("AIWORKHUB_ALLOW_WRITES", "1")
+    repaired = server.task_reconciler._scan_wave_goal_bindings(root)
+    retried = _create_wave_card("LSP_V2", binding)
+
+    assert repaired["outcomes"] == [{"task_id": "LSP_V2", "state": "applied", "reason": ""}]
+    assert retried["wave_goal_binding"]["state"] == "applied"
+    assert _lsp_goal(root, wave["id"]) == ["LSP_V2"]
+    assert _successor_events(root, wave["id"]) == [
+        {"goal_id": "lsp", "from": "LSP_V1", "to": "LSP_V2"}
+    ]

@@ -2028,12 +2028,18 @@ def test_standby_builder_cannot_replace_or_clear_live_writer_identity(
             break
         time.sleep(0.01)
     assert retained is not None
+    assert source_graph_daemon._identity_matches(retained), (
+        retained, source_graph_daemon._proc_identity(int(retained["pid"]))
+    )
 
     standby_outcome = standby._run_build_subprocess(incremental=False)
-    assert standby_outcome == {
-        "kind": "error", "error": "index_subprocess:identity_slot_owned"
-    }
-    assert source_graph_daemon._read_build_identity(root) == retained
+    after = source_graph_daemon._read_build_identity(root)
+    assert after == retained, (after, retained)
+    assert not source_graph_daemon.platform_io.is_windows()
+    assert after["repo_root"] == source_graph_daemon._registry_key(root)
+    assert after["state"] == "running"
+    assert source_graph_daemon._identity_matches(after), after
+    assert standby_outcome == {"kind": "standby"}
 
     assert source_graph_daemon.stop_daemon(root)
     writer_thread.join(5)

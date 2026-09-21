@@ -45,6 +45,7 @@ from aiworkhub import (
     task_store,
     terminal_log_retention,
     vscode_lm_bridge,
+    wave_roadmap,
     workforce_catalog,
 )
 
@@ -3042,6 +3043,7 @@ def roadmap_list_view(
             "total": int(snapshot.get("total") or 0),
             "status_counts": dict(snapshot.get("status_counts") or {}),
             "truncated": bool(snapshot.get("truncated")),
+            "current_wave": wave_roadmap.project_snapshot_wave(snapshot, __version__),
         }
     except (roadmap_store.RoadmapError, OSError, sqlite3.Error, TypeError, ValueError) as exc:
         response = {"ok": False, "error": str(exc)[:240], "entries": []}
@@ -3067,6 +3069,7 @@ def roadmap_detail_view(roadmap_id: str, event_limit: int = 50) -> dict[str, Any
         response = {
             "ok": True,
             "item": _bounded_roadmap_row(row, include_detail=True),
+            "current_wave": wave_roadmap.project_snapshot_wave(snapshot, __version__),
             "events": [
                 dict(list(event.items())[:24])
                 for event in core.roadmap_events(

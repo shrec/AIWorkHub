@@ -52,6 +52,7 @@ const state = {
   roadmapEntries: [],
   roadmapDetail: null,
   waveMiniRoadmapEntries: [],
+  waveMiniRoadmapCurrent: null,
   waveMiniRoadmapDetail: null,
   waveMiniRoadmapWaitingFor: null,
   waveMiniRoadmapRequested: false,
@@ -811,49 +812,44 @@ function renderManagerIdentity(snapshot) {
 // Pure, self-contained helpers for the identity-alert Wave Mini-Roadmap popup.
 // No DOM, no storage, no vscode access: wave-mini-roadmap.test.js extracts this
 // block verbatim and evaluates it in isolation to pin wave selection/counting.
-function waveVersionCompare(a, b) {
-  return (a.major - b.major) || (a.minor - b.minor) || (a.patch - b.patch);
+
+// The dashboard server's current_wave projection is the only wave authority: the
+// popup never ranks Roadmap outcomes by version itself. A ready projection names
+// one exact wave id; anything else is a typed UNKNOWN with the server's reason.
+const WAVE_SELECTION_REASONS = {
+  truncated_roadmap: "Roadmap list is truncated; wave selection is incomplete",
+  invalid_installed_version: "The installed AIWorkHub version is not verifiable",
+  invalid_wave_version: "An active wave has no verifiable target version",
+  no_active_wave: "No active wave with declared goals is available",
+  ambiguous_active_wave: "Wave selection is ambiguous: several active waves share the highest target",
+  missing_goal_data: "The current wave's goals are missing or malformed",
+  malformed_roadmap_row: "A Roadmap row is malformed; wave selection is unavailable",
+};
+
+function waveCurrentReady(current) {
+  return Boolean(current) && typeof current === "object" && current.state === "ready"
+    && typeof current.wave_id === "string" && current.wave_id.trim() !== "";
 }
 
-function waveSemver(milestone) {
-  if (typeof milestone !== "string") return null;
-  const match = String(milestone).trim().match(/^v?(\d+)\.(\d+)\.(\d+)(?:[-+][0-9A-Za-z.-]+)?$/);
-  if (!match) return null;
-  return { major: Number(match[1]), minor: Number(match[2]), patch: Number(match[3]) };
+function waveCurrentReason(current) {
+  if (!current || typeof current !== "object") return "The server reported no current-wave projection";
+  const reason = typeof current.selection_reason === "string" ? current.selection_reason.slice(0, 64) : "";
+  const text = Object.prototype.hasOwnProperty.call(WAVE_SELECTION_REASONS, reason)
+    ? WAVE_SELECTION_REASONS[reason]
+    : "The server current-wave projection is not ready";
+  return reason ? `${text} (${reason})` : text;
 }
 
-// Only canonical current/active Roadmap statuses may supply the active wave.
-// A newer proposed/completed/archived milestone must never displace the wave
-// that is actually in progress.
-const WAVE_ACTIVE_STATUSES = new Set(["in_progress", "current", "active"]);
-
-function waveIsActive(entry) {
-  if (!entry || typeof entry !== "object") return false;
-  const status = entry.status === undefined || entry.status === null
-    ? ""
-    : String(entry.status).trim().toLowerCase();
-  return WAVE_ACTIVE_STATUSES.has(status);
+// List rows carrying the server-selected wave id exactly; more than one is ambiguous.
+function waveCurrentEntries(current, entries) {
+  if (!waveCurrentReady(current)) return [];
+  return (Array.isArray(entries) ? entries : [])
+    .filter((entry) => entry && typeof entry === "object" && entry.id === current.wave_id);
 }
 
-function waveSelectActive(entries) {
-  const rows = Array.isArray(entries) ? entries : [];
-  let best = null;
-  let bestVersion = null;
-  let ambiguous = false;
-  for (const entry of rows) {
-    if (!entry || typeof entry !== "object") continue;
-    if (!waveIsActive(entry)) continue;
-    const version = waveSemver(entry.milestone);
-    if (!version) continue;
-    if (bestVersion === null || waveVersionCompare(version, bestVersion) > 0) {
-      best = entry;
-      bestVersion = version;
-      ambiguous = false;
-    } else if (waveVersionCompare(version, bestVersion) === 0) {
-      ambiguous = true;
-    }
-  }
-  return best && !ambiguous ? best : null;
+// Installed and target versions are separate server fields; neither is derived from the other.
+function waveVersionText(value) {
+  return typeof value === "string" && value.trim() !== "" ? value.trim().slice(0, 64) : "UNKNOWN";
 }
 
 const WAVE_COMPLETE_STATUSES = new Set(["finished", "accepted"]);
@@ -904,7 +900,8 @@ function waveTaskRowsById(taskRows) {
   return byId;
 }
 
-// Missing, duplicated, statusless or unreadable rows are unresolved; a duplicate that also holds a blocked row is unresolved_blocked.
+// Missing, duplicated, statusless, stale or unreadable rows are unresolved; a duplicate that also holds a blocked row is unresolved_blocked.
+// An archived row is history, never completion, whatever status it kept.
 function waveTaskEvidence(rowsById, taskId) {
   const rows = rowsById.get(taskId) || [];
   if (rows.length !== 1) {
@@ -912,9 +909,10 @@ function waveTaskEvidence(rowsById, taskId) {
   }
   const row = rows[0];
   const status = waveRowStatus(row);
-  if (status === "" || WAVE_UNRESOLVED_STATUSES.has(status)) return "unresolved";
-  if (WAVE_COMPLETE_STATUSES.has(status)) return "complete";
+  if (status === "" || WAVE_UNRESOLVED_STATUSES.has(status) || row.stale === true) return "unresolved";
   const canonical = canonicalStatus(row);
+  if (canonical === "archived") return "open";
+  if (WAVE_COMPLETE_STATUSES.has(status)) return "complete";
   if (canonical === "finished") return "complete";
   if (canonical === "blocked") return "blocked";
   return "open";
@@ -958,6 +956,35 @@ function waveGoalChecklist(goals, taskRows) {
   return { items, blockedTasks };
 }
 
+// The server projection holds the only goal verdict. The local join may keep a goal
+// open or UNKNOWN and flag blockers, but never checks a goal the server did not.
+// A goal missing on either side, or matched ambiguously by id, is UNKNOWN.
+function waveServerGoalGate(goals, items, serverGoals) {
+  const goalKey = (goal) => (goal && typeof goal.id === "string" ? goal.id.trim() : "");
+  const byId = new Map();
+  for (const goal of Array.isArray(serverGoals) ? serverGoals : []) {
+    byId.set(goalKey(goal), (byId.get(goalKey(goal)) || []).concat([goal]));
+  }
+  const referenced = new Set();
+  const gated = items.map((item, index) => {
+    const id = goalKey(goals[index]);
+    const match = id ? byId.get(id) || [] : [];
+    if (id) referenced.add(id);
+    if (match.length !== 1) return Object.assign({}, item, { state: "unknown", unresolved: true });
+    if (match[0].state === "checked") return item;
+    if (match[0].state === "open") return Object.assign({}, item, { state: "open" });
+    return Object.assign({}, item, { state: "unknown", unresolved: true });
+  });
+  for (const [id, match] of byId) {
+    if (referenced.has(id)) continue;
+    for (const goal of match) {
+      const label = goal && typeof goal.label === "string" && goal.label.trim() ? goal.label.trim() : "Unlabelled goal";
+      gated.push({ label, state: "unknown", unresolved: true, blocked: false });
+    }
+  }
+  return gated;
+}
+
 // build_snapshot() ships task rows for active statuses only; these reach the webview solely as exact status_counts totals.
 const WAVE_ROWLESS_STATUSES = ["blocked", "superseded", "finished", "archived"];
 
@@ -975,18 +1002,20 @@ function waveTaskStates(snapshot, tasks) {
   return { rows, totals };
 }
 
-// Task ids the active wave depends on; null while no active wave is known.
-function waveWatchedTaskIds(entries, detail) {
-  const wave = waveSelectActive(entries);
-  if (!wave) return null;
+// Task ids the server-selected wave depends on; null while no current wave is known.
+function waveWatchedTaskIds(current, entries, detail) {
+  if (!waveCurrentReady(current)) return null;
   const ids = new Set();
   const add = (list) => {
     for (const id of Array.isArray(list) ? list : []) {
       if (typeof id === "string") ids.add(id);
     }
   };
-  add(wave.task_ids);
-  if (detail && String(detail.id || "") === String(wave.id || "")) {
+  for (const entry of waveCurrentEntries(current, entries)) add(entry.task_ids);
+  for (const goal of Array.isArray(current.goals) ? current.goals : []) {
+    add((goal && Array.isArray(goal.tasks) ? goal.tasks : []).map((task) => task && task.task_id));
+  }
+  if (detail && detail.id === current.wave_id) {
     add(detail.task_ids);
     for (const goal of waveGoalsFromDetail(detail) || []) add(goal && goal.task_ids);
   }
@@ -1026,33 +1055,41 @@ function renderWaveMiniRoadmap(snapshot) {
     );
     return;
   }
-  const listEntry = waveSelectActive(state.waveMiniRoadmapEntries);
-  if (!listEntry) {
-    renderWaveMiniRoadmapState(
-      content,
-      "UNKNOWN",
-      "No active versioned wave is available, or wave selection is ambiguous",
-    );
+  // Only the server's exact current_wave receipt selects the wave; the popup never ranks versions.
+  const current = state.waveMiniRoadmapCurrent;
+  if (!waveCurrentReady(current)) {
+    renderWaveMiniRoadmapState(content, "UNKNOWN", waveCurrentReason(current));
+    return;
+  }
+  const listed = waveCurrentEntries(current, state.waveMiniRoadmapEntries);
+  if (listed.length > 1) {
+    renderWaveMiniRoadmapState(content, "UNKNOWN", "The server-selected wave id matches more than one Roadmap row");
     return;
   }
   const detail = state.waveMiniRoadmapDetail && typeof state.waveMiniRoadmapDetail === "object"
     ? state.waveMiniRoadmapDetail
     : null;
-  if (!detail || String(detail.id || "") !== String(listEntry.id || "")) {
+  if (!detail || detail.id !== current.wave_id) {
     renderWaveMiniRoadmapState(
       content,
       "UNKNOWN",
-      "Wave detail is unavailable for the active wave; goal status is unavailable",
+      "Wave detail is unavailable for the server-selected wave; goal status is unavailable",
     );
+    return;
+  }
+  const target = waveVersionText(current.target_milestone);
+  if (target === "UNKNOWN" || waveVersionText(detail.milestone) !== target) {
+    renderWaveMiniRoadmapState(content, "UNKNOWN", "Wave detail disagrees with the server's target version; evidence is stale");
     return;
   }
   const goals = waveGoalsFromDetail(detail);
   if (!goals || goals.length === 0) {
-    renderWaveMiniRoadmapState(content, "UNKNOWN", "Wave goals are not recorded for the active wave");
+    renderWaveMiniRoadmapState(content, "UNKNOWN", "Wave goals are not recorded for the current wave");
     return;
   }
-  const wave = Object.assign({}, listEntry, detail);
-  const { items, blockedTasks } = waveGoalChecklist(goals, detail.tasks);
+  const wave = Object.assign({}, listed[0] || {}, detail);
+  const { items: joined, blockedTasks } = waveGoalChecklist(goals, detail.tasks);
+  const items = waveServerGoalGate(goals, joined, current.goals);
   const done = items.filter((item) => item.state === "checked").length;
   const unknown = items.filter((item) => item.unresolved).length;
   const summary = [`${done}/${items.length} goal${items.length === 1 ? "" : "s"} done`];
@@ -1066,11 +1103,22 @@ function renderWaveMiniRoadmap(snapshot) {
   if (items.length > goalCap) {
     list.appendChild(createElement("div", "wave-mini-roadmap-more", `...${items.length - goalCap} more`));
   }
+  // Installed runtime and wave target are separate facts; a passed target stays the target, marked overdue.
+  const installed = `Installed ${waveVersionText(current.installed_version)}`;
+  const overdue = current.overdue === true ? " (overdue)" : "";
+  const versions = createElement("div", "wave-mini-roadmap-milestone");
+  versions.title = `${installed} · Target ${target}${overdue}`;
+  versions.append(
+    createElement("span", "wave-mini-roadmap-installed", installed),
+    createElement("span", "wave-mini-roadmap-separator", " · "),
+    createElement("span", "wave-mini-roadmap-target", `Target ${target}`),
+  );
+  if (overdue) versions.appendChild(createElement("span", "wave-mini-roadmap-overdue", overdue));
   const fragment = document.createDocumentFragment();
   fragment.append(
     createElement("strong", "", "Wave mini-roadmap"),
     createElement("div", "wave-mini-roadmap-title", String(wave.title || wave.roadmap_id || wave.id || "Untitled wave")),
-    createElement("div", "wave-mini-roadmap-milestone", String(wave.milestone || "No milestone")),
+    versions,
     createElement("div", "wave-mini-roadmap-count", summary.join(" · ")),
     list,
   );
@@ -3246,7 +3294,7 @@ function refreshWaveMiniRoadmapOnTaskChange() {
     state.waveMiniRoadmapTaskStates = current;
     return;
   }
-  const watched = waveWatchedTaskIds(state.waveMiniRoadmapEntries, state.waveMiniRoadmapDetail);
+  const watched = waveWatchedTaskIds(state.waveMiniRoadmapCurrent, state.waveMiniRoadmapEntries, state.waveMiniRoadmapDetail);
   if (watched && waveTaskStatesChanged(baseline, current, watched)) requestWaveMiniRoadmap();
 }
 
@@ -3262,6 +3310,7 @@ function renderWaveMiniRoadmapList(payload, correlation) {
   if (!waveCycleCurrent(correlation)) return;
   if (!payload || payload.ok === false) {
     state.waveMiniRoadmapEntries = [];
+    state.waveMiniRoadmapCurrent = null;
     state.waveMiniRoadmapDetail = null;
     state.waveMiniRoadmapWaitingFor = null;
     state.waveMiniRoadmapRequested = false;
@@ -3269,13 +3318,17 @@ function renderWaveMiniRoadmapList(payload, correlation) {
     return;
   }
   state.waveMiniRoadmapEntries = asArray(payload.entries);
+  state.waveMiniRoadmapCurrent = payload.current_wave && typeof payload.current_wave === "object"
+    ? payload.current_wave
+    : null;
   reconcileWaveMiniRoadmap();
 }
 
+// Detail is fetched for the server's exact current_wave.wave_id only, never a locally ranked row.
 function reconcileWaveMiniRoadmap() {
   if (!state.waveMiniRoadmapRequested) return;
-  const wave = waveSelectActive(state.waveMiniRoadmapEntries);
-  if (!wave || !wave.id) {
+  const current = state.waveMiniRoadmapCurrent;
+  if (!waveCurrentReady(current) || waveCurrentEntries(current, state.waveMiniRoadmapEntries).length > 1) {
     state.waveMiniRoadmapDetail = null;
     state.waveMiniRoadmapWaitingFor = null;
     state.waveMiniRoadmapRequested = false;
@@ -3283,10 +3336,10 @@ function reconcileWaveMiniRoadmap() {
     return;
   }
   if (state.waveMiniRoadmapWaitingFor !== null) return;
-  state.waveMiniRoadmapWaitingFor = String(wave.id);
+  state.waveMiniRoadmapWaitingFor = current.wave_id;
   vscode.postMessage({
     type: "requestRoadmapDetail",
-    roadmapId: wave.id,
+    roadmapId: current.wave_id,
     purpose: "waveMiniRoadmap",
     waveGeneration: state.waveMiniRoadmapGeneration,
   });
@@ -3375,6 +3428,13 @@ function renderWaveMiniRoadmapDetail(payload, correlation) {
     return;
   }
   state.waveMiniRoadmapDetail = payload.item;
+  // The detail's projection is the newer server verdict; if the current wave moved
+  // mid-cycle it no longer names this detail and the popup renders UNKNOWN.
+  if (Object.prototype.hasOwnProperty.call(payload, "current_wave")) {
+    state.waveMiniRoadmapCurrent = payload.current_wave && typeof payload.current_wave === "object"
+      ? payload.current_wave
+      : null;
+  }
   state.waveMiniRoadmapWaitingFor = null;
   state.waveMiniRoadmapRequested = false;
   renderWaveMiniRoadmap(state.snapshot);
