@@ -3042,3 +3042,106 @@ def test_a_failed_overlay_verification_is_still_reportable_as_a_process_limit_fi
     (finding,) = findings
     assert finding["disposition"] == "process_limit"
     assert finding["actionable"] is False
+
+
+def _overlay_query_packet(omitted_path: str) -> dict:
+    """One path with an omitted hunk and a sealed digest, one inline path."""
+
+    source = "changed code"
+    digest = hashlib.sha256(source.encode("utf-8")).hexdigest()
+    segment = {
+        "kind": "replace",
+        "candidate_start_line": 12,
+        "candidate_end_line": 14,
+        "changed_start_line": 12,
+        "changed_end_line": 14,
+        "baseline_start_line": 12,
+        "baseline_end_line": 14,
+        "excerpt_bytes": len(source),
+        "truncated": False,
+    }
+    omitted_segment = dict(
+        segment,
+        candidate_start_line=30,
+        candidate_end_line=33,
+        changed_start_line=30,
+        changed_end_line=33,
+        baseline_start_line=30,
+        baseline_end_line=33,
+        truncated=True,
+    )
+    inner = {
+        "task_id": "task1",
+        "review_lens": {"lens_kind": "security"},
+        "changed_paths": [{"path": omitted_path}, {"path": "src/inline.py"}],
+        "known_unknowns": [],
+    }
+    audit = {
+        "schema_id": "aiworkhub.scoped_audit.v1",
+        "fingerprint": _canonical_digest(inner),
+        "known_unknowns": [],
+        "packet": inner,
+    }
+    return quality_reviewer.build_review_packet(
+        request_id="req1",
+        task_id="task1",
+        claim_epoch=1,
+        worker_provider="adapter-a",
+        changed_path_hashes={omitted_path: digest, "src/inline.py": digest},
+        source_evidence={
+            omitted_path: {
+                "candidate_sha256": digest,
+                "excerpt": source,
+                "excerpt_bytes": len(source),
+                "source_bytes": 4 * len(source),
+                "truncated": True,
+                "diff_complete": False,
+                "segments": [segment, omitted_segment],
+                "omission_reason": "changed_hunks_omitted:1",
+            },
+            "src/inline.py": {
+                "candidate_sha256": digest,
+                "excerpt": source,
+                "excerpt_bytes": len(source),
+                "source_bytes": len(source),
+                "truncated": False,
+                "diff_complete": True,
+                "segments": [segment],
+            },
+        },
+        scoped_audits={"security": audit},
+    )
+
+
+@pytest.mark.parametrize("omitted_path", ["src/mod.py", 'src/we"ird dir/módulo.py'])
+def test_omitted_hunk_instruction_emits_exact_path_bound_query_nf947(omitted_path):
+    """NF947: the reviewer is shown a copyable query whose target is the real
+    changed path -- never ``candidate_overlay`` -- and the digest gate stays."""
+
+    packet = _overlay_query_packet(omitted_path)
+
+    prompt = quality_reviewer.build_review_prompt(packet, lens="security")
+
+    marker = "  source_graph_query "
+    examples = [
+        json.loads(line[len(marker):])
+        for line in prompt.splitlines()
+        if line.startswith(marker)
+    ]
+    assert examples == [
+        {"mode": "file", "query": omitted_path, "target": omitted_path}
+    ]
+    assert all(example["target"] != "candidate_overlay" for example in examples)
+    assert '"target": "candidate_overlay"' not in prompt
+    assert "never pass target candidate_overlay" in prompt
+    assert (
+        "authority_source candidate_overlay is reply metadata the server binds "
+        "to this packet automatically; it is never an argument"
+    ) in prompt
+    digest = packet["candidate"]["changed_paths"][0]["sha256"]
+    listed = f"- {json.dumps(omitted_path, ensure_ascii=False)}: candidate_sha256 {digest}"
+    assert listed in prompt
+    # The verification gate and the focused-read rule survive the projection.
+    assert f"packet_sha256 {packet['packet_sha256']}" in prompt
+    assert "equal to the candidate_sha256 above with freshness.state fresh" in prompt
+    assert "No whole-file read, no repository scan" in prompt

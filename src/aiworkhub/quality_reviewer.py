@@ -710,6 +710,11 @@ _OVERLAY_INSPECTION_HEADER = (
 )
 _OVERLAY_INSPECTION_STEPS = (
     "Inspect these hunks; do not escalate them unread.\n"
+    "0. Open each path with source_graph_query using exactly the JSON shown "
+    "under it. target is the file/symbol selector and must be that exact "
+    "relative path; never pass target candidate_overlay. authority_source "
+    "candidate_overlay is reply metadata the server binds to this packet "
+    "automatically; it is never an argument.\n"
     "1. Verify first: an overlay reply must show authority_source "
     "candidate_overlay and packet_sha256 {packet_digest}, and for the listed "
     "path a source hash (freshness.indexed_source_hash, or file.source_hash) "
@@ -756,10 +761,18 @@ def _omitted_hunk_overlay_instruction(
             unreadable.add(row["path"])
     if not readable:
         return ""
+    # NF947: each readable path carries its own copyable query, bound to that
+    # exact path, so a reviewer never guesses target=candidate_overlay.
     listed = "".join(
         f"- {json.dumps(row['path'], ensure_ascii=False)}: candidate_sha256 "
         f"{row['candidate_sha256']}, {row['omitted_hunks']} omitted "
         f"hunk{'' if row['omitted_hunks'] == 1 else 's'}\n"
+        "  source_graph_query "
+        + json.dumps(
+            {"mode": "file", "query": row["path"], "target": row["path"]},
+            ensure_ascii=False,
+        )
+        + "\n"
         for row in readable[:MAX_OVERLAY_INSTRUCTION_PATHS]
     )
     if len(readable) > MAX_OVERLAY_INSTRUCTION_PATHS:
