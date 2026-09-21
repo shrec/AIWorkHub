@@ -10686,6 +10686,22 @@ def dispatcher_health() -> dict[str, Any]:
         start_error = str(health.get("last_start_error") or "")
         if start_error:
             problems.append(f"start_error:{start_error}")
+    backlog: dict[str, Any] = {}
+    if dispatch_expected and manager_inbox and not running:
+        # NF-2026-00029: a manager inbox is a mailbox, not a wake-up. No
+        # dispatcher runs and there is no live-subscriber registry (an
+        # in-flight callback_wait is invisible here, so it counts as absent):
+        # pending callbacks sit until the manager asks. Report that once
+        # something waits; a quiet inbox stays clean. Only the watchdog, the
+        # dashboard and the health tool read this result -- no launch,
+        # preflight or bootstrap gate does -- so it is visible, never blocking.
+        try:
+            stats = task_store.callback_bridge_health(root)
+            backlog = {key: stats[key] for key in ("backlog_count", "oldest_pending_at")}
+            if backlog["backlog_count"] > 0:
+                problems.append("manager_inbox_no_live_delivery")
+        except Exception as exc:  # noqa: BLE001 -- health must never raise
+            problems.append(f"callback_backlog_unavailable:{type(exc).__name__}")
     healthy = not problems
     status = "manager_inbox" if manager_inbox else ("running" if running else "stopped")
     return {
@@ -10700,6 +10716,7 @@ def dispatcher_health() -> dict[str, Any]:
         "dispatch_expected": dispatch_expected,
         "recoverable": bool(problems),
         "problems": problems,
+        **backlog,
     }
 
 

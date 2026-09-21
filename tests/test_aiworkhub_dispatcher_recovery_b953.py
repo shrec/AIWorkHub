@@ -31,6 +31,9 @@ if str(_SRC) not in sys.path:
 from aiworkhub import callback_store, core  # noqa: E402
 
 
+_OLDEST = "2026-09-21T00:00:00Z"
+
+
 def _readiness(ready: bool = True, repo_id: str = "repo_canon", reason: str = ""):
     return types.SimpleNamespace(ready=ready, repo_id=repo_id, reason=reason)
 
@@ -38,9 +41,13 @@ def _readiness(ready: bool = True, repo_id: str = "repo_canon", reason: str = ""
 def _patch_core(
     monkeypatch, *, readiness, bridge_health,
     provider: str = "codex", claude_identity=None, window_id: str = "", transport: str = "",
+    backlog: int = 0,
 ) -> None:
     monkeypatch.setattr(core, "repo_root", lambda: Path("/tmp/aiworkhub-b953-repo"))
     monkeypatch.setattr(core.task_store, "storage_readiness", lambda root: readiness)
+    oldest = _OLDEST if backlog else ""
+    monkeypatch.setattr(core.task_store, "callback_bridge_health",
+                        lambda root: {"backlog_count": backlog, "oldest_pending_at": oldest})
     fake_bridge = types.SimpleNamespace(dispatcher_health=lambda root: dict(bridge_health))
     monkeypatch.setattr(core, "_callback_bridge_module", lambda: fake_bridge)
     monkeypatch.setattr(core, "read_selected_coordinator_target", lambda root=None: {"selected_provider": provider})
@@ -125,6 +132,58 @@ def test_native_codex_manager_inbox_is_healthy_without_sideband(monkeypatch):
     assert h["status"] == "manager_inbox"
     assert h["dispatch_expected"] is True
     assert h["ok"] is True and h["healthy"] is True and h["problems"] == []
+    assert h["backlog_count"] == 0 and h["oldest_pending_at"] == ""
+
+
+# --- NF-2026-00029: a manager inbox with waiting callbacks is not green ------
+
+def test_claude_manager_inbox_with_backlog_reports_no_live_delivery(monkeypatch):
+    identity = {"provider": "claude", "session_id": str(uuid.uuid4()), "window_id": "claude_vscode_1"}
+    _patch_core(monkeypatch, readiness=_readiness(), bridge_health=_UNREGISTERED,
+                provider="claude", claude_identity=identity, backlog=7)
+    h = core.dispatcher_health()
+    assert h["status"] == "manager_inbox" and h["dispatch_expected"] is True
+    assert h["ok"] is False and h["healthy"] is False
+    assert h["problems"] == ["manager_inbox_no_live_delivery"]
+    assert h["backlog_count"] == 7 and h["oldest_pending_at"] == _OLDEST
+
+
+def test_native_codex_manager_inbox_with_backlog_reports_no_live_delivery(monkeypatch):
+    _patch_core(monkeypatch, readiness=_readiness(), bridge_health=_UNREGISTERED,
+                window_id="window_native_codex", transport="manager_inbox", backlog=2)
+    h = core.dispatcher_health()
+    assert h["status"] == "manager_inbox"
+    assert h["problems"] == ["manager_inbox_no_live_delivery"]
+    assert h["backlog_count"] == 2
+
+
+def test_manager_inbox_backlog_read_failure_is_reported(monkeypatch):
+    identity = {"provider": "claude", "session_id": str(uuid.uuid4()), "window_id": "claude_vscode_1"}
+    _patch_core(monkeypatch, readiness=_readiness(), bridge_health=_UNREGISTERED,
+                provider="claude", claude_identity=identity)
+
+    def broken(root):
+        raise RuntimeError("db unavailable")
+
+    monkeypatch.setattr(core.task_store, "callback_bridge_health", broken)
+    h = core.dispatcher_health()
+    assert h["healthy"] is False
+    assert h["problems"] == ["callback_backlog_unavailable:RuntimeError"]
+    assert "backlog_count" not in h
+
+
+def test_dispatcher_route_never_reads_backlog(monkeypatch):
+    # A running dispatcher (and a headless child) keep their exact prior shape.
+    for window_id, bridge_health in (("win1", _RUNNING), ("", _UNREGISTERED)):
+        _patch_core(monkeypatch, readiness=_readiness(), bridge_health=bridge_health, window_id=window_id)
+
+        def unexpected(root):
+            raise AssertionError("backlog must not be read outside a manager inbox")
+
+        monkeypatch.setattr(core.task_store, "callback_bridge_health", unexpected)
+        h = core.dispatcher_health()
+        assert h["ok"] is True and h["problems"] == []
+        assert "backlog_count" not in h and "oldest_pending_at" not in h
 
 
 def test_uninitialized_is_non_degraded(monkeypatch):

@@ -31,7 +31,7 @@ _SRC = Path(__file__).resolve().parents[1] / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from aiworkhub import app_server_mux, core, repository_state, task_store  # noqa: E402
+from aiworkhub import app_server_mux, callback_store, core, repository_state, task_store  # noqa: E402
 
 _CLAUDE_IDENTITY = {
     "provider": "claude",
@@ -127,6 +127,38 @@ def test_dispatcher_health_manager_inbox_for_verified_claude_with_stale_codex_co
     assert health["healthy"] is True
     assert health["problems"] == []
     assert "dispatcher_unregistered" not in health["problems"]
+    assert health["backlog_count"] == 0
+
+
+def test_dispatcher_health_manager_inbox_reports_real_pending_backlog(tmp_path, monkeypatch):
+    """NF-2026-00029: nothing drains a Claude inbox between turns, so an
+    undelivered callback in the real outbox must turn health non-green."""
+    root = _init_repo(tmp_path)
+    conn = callback_store.open_db(callback_store.resolve_db_path(root))
+    try:
+        assert callback_store.enqueue_callback(
+            conn, "TASK_NF29", _CLAUDE_IDENTITY["session_id"], "review_ready", provider="claude",
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    monkeypatch.setattr(core, "repo_root", lambda: root)
+    monkeypatch.setattr(core, "_claude_manager_identity", lambda: dict(_CLAUDE_IDENTITY))
+    monkeypatch.setattr(core, "_callback_bridge_module", lambda: types.SimpleNamespace(
+        dispatcher_health=lambda root: {
+            "dispatcher_running": False, "registered": False, "repo_id": "", "last_start_error": "",
+        },
+    ))
+    monkeypatch.setenv("AIWORKHUB_WINDOW_ID", "")
+    monkeypatch.setenv("AIWORKHUB_CALLBACK_TRANSPORT", "")
+
+    health = core.dispatcher_health()
+
+    assert health["status"] == "manager_inbox"
+    assert health["healthy"] is False
+    assert health["problems"] == ["manager_inbox_no_live_delivery"]
+    assert health["backlog_count"] == 1
+    assert health["oldest_pending_at"]
 
 
 # ---------------------------------------------------------------------------
