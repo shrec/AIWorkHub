@@ -16,11 +16,15 @@ these tests only ever construct, persist, read back and project them.
 
 from __future__ import annotations
 
+import gc
 import hashlib
 import importlib
 import importlib.util
 import json
+import os
 import sqlite3
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -1698,6 +1702,42 @@ def test_the_operator_modules_resolve_the_repository_they_are_run_in(
 
     monkeypatch.setattr(Path, "is_dir", bounded_is_dir)
     assert _common.resolve_repo_root(outside) == outside.resolve()
+
+
+@pytest.mark.parametrize("platform_io_importable", [True, False])
+def test_pid_is_alive_observes_without_signalling(monkeypatch, platform_io_importable):
+    """The recipes' liveness answer never signals the pid on Windows.
+
+    Its import-failure fallback used ``os.kill(pid, 0)``: on Windows that is
+    GenerateConsoleCtrlEvent, or with no console TerminateProcess(pid, 0). With
+    the package it measures live/exited; without it the answer is ``None``
+    (unmeasurable), never a signal.
+    """
+    from aiworkhub.recipes import _common
+
+    if not platform_io_importable:
+        for module in ("aiworkhub.platform_io", "aiworkhub._platform_process"):
+            monkeypatch.setitem(sys.modules, module, None)
+    if os.name == "nt":
+        def _signal_sent(*_args):
+            raise AssertionError("os.kill must not probe liveness on Windows")
+
+        monkeypatch.setattr(os, "kill", _signal_sent)
+    measurable = platform_io_importable
+
+    exited = subprocess.Popen([sys.executable, "-c", "pass"])
+    exited.wait()
+    exited_pid = exited.pid
+    del exited
+    gc.collect()  # Windows keeps a pid valid while a handle to it is open.
+    live = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        assert _common.pid_is_alive(live.pid) is (True if measurable else None)
+        assert _common.pid_is_alive(exited_pid) is (False if measurable else None)
+        assert live.poll() is None
+    finally:
+        live.kill()
+        live.wait()
 
 
 def test_usage_counts_two_versions_of_one_recipe_separately(probe, manager):

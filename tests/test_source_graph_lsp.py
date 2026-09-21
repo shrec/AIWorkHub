@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import gc
 import hashlib
 import json
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -563,6 +565,37 @@ def test_tiny_max_input_bytes_fails_closed(tmp_path: Path) -> None:
     for pid in outcome.child_pids:
         with pytest.raises(OSError):
             os.kill(pid, 0)
+
+
+def test_pid_alive_observes_without_signalling(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``_pid_alive`` answers live/exited without ever signalling the pid.
+
+    It used ``os.kill(pid, 0)``: on Windows that is GenerateConsoleCtrlEvent,
+    which reads any still-open child as alive, and in a console-less MCP server
+    it falls through to TerminateProcess(pid, 0) on the LSP server it checks.
+    """
+    import aiworkhub.source_graph_lsp as lsp
+
+    if os.name == "nt":
+        def _signal_sent(*_args: object) -> None:
+            raise AssertionError("os.kill must not probe liveness on Windows")
+
+        monkeypatch.setattr(os, "kill", _signal_sent)
+
+    exited = subprocess.Popen([sys.executable, "-c", "pass"])
+    exited.wait()
+    exited_pid = exited.pid
+    del exited
+    gc.collect()  # Windows keeps a pid valid while a handle to it is open.
+    live = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        assert lsp._pid_alive(live.pid) is True
+        assert lsp._pid_alive(exited_pid) is False
+        assert lsp._pid_alive(None) is False
+        assert live.poll() is None
+    finally:
+        live.kill()
+        live.wait()
 
 
 def test_windows_stdio_timeout_cancel_and_cleanup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

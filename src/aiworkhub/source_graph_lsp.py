@@ -26,6 +26,8 @@ from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 from typing import Any
 from urllib.parse import unquote, urlparse
 
+from .platform_io import process_is_alive
+
 INPUT_COLUMN_UNIT = "utf8_byte"
 DEFAULT_POSITION_ENCODING = "utf-16"
 SUPPORTED_POSITION_ENCODINGS = ("utf-16", "utf-8", "utf-32")
@@ -1111,11 +1113,10 @@ def _start_session(
 def _pid_alive(pid: int | None) -> bool:
     if pid is None:
         return False
-    try:
-        os.kill(pid, 0)
-    except OSError:
-        return False
-    return True
+    # Never os.kill(pid, 0): on Windows it is GenerateConsoleCtrlEvent, which
+    # reports any still-open child as alive, and in a console-less MCP server it
+    # falls through to TerminateProcess(pid, 0) on the server it is checking.
+    return process_is_alive(pid)
 
 
 @dataclass(frozen=True)

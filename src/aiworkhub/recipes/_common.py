@@ -215,20 +215,14 @@ def pid_is_alive(pid: Any) -> bool | None:
     """
     if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
         return None
+    # Lazy, so the stdlib-only fast path stays import-safe. The fallback is
+    # "unmeasurable", never os.kill(pid, 0): on Windows that is
+    # GenerateConsoleCtrlEvent, or with no console TerminateProcess(pid, 0), and
+    # a POSIX-only os.kill branch would need the os.name check the OS boundary
+    # rule keeps inside platform_io -- the very module that failed to load here.
     try:
-        from aiworkhub._platform_process import process_is_alive
+        from aiworkhub.platform_io import process_is_alive
 
         return bool(process_is_alive(pid))
     except Exception:  # noqa: BLE001 - a script must work without the package
-        pass
-    try:
-        import os
-
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except (OSError, AttributeError):
         return None
-    return True
