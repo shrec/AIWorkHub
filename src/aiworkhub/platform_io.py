@@ -7,6 +7,7 @@ repository-local locking contract on Linux, macOS, and Windows.
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import errno
 import importlib
@@ -21,7 +22,7 @@ import subprocess
 import sys
 import time
 import unicodedata
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any, Protocol, TypedDict, cast
 
@@ -2758,3 +2759,71 @@ def unlock_fd(fd: int) -> None:
     import fcntl
 
     fcntl.flock(fd, fcntl.LOCK_UN)
+
+
+class ReparsePointRefused(OSError):
+    """A path held by :func:`pinned_paths` is, or passes through, a link."""
+
+
+@contextlib.contextmanager
+def pinned_paths(paths: "list[Path]") -> "Iterator[None]":
+    """Hold ``paths`` -- ancestors first -- so that, until the block exits,
+    none of them is a reparse point and none can be renamed, deleted or
+    swapped for one (NF-2026-00034).
+
+    A host process that edits a tree a sandboxed worker can write must not
+    have a path redirected under it: a worker with modify rights can replace
+    ``src\\pkg`` with a junction to anywhere between a check and a write.  On
+    Windows each path is opened with FILE_FLAG_OPEN_REPARSE_POINT (so a link
+    is seen, not followed), refused if it carries the reparse attribute, and
+    held open WITHOUT FILE_SHARE_DELETE -- so no other process can open it for
+    the DELETE that renaming or removing it takes.  Entries can still be
+    created inside a held directory.  Because each path is held before the
+    next one is opened, a path used inside the block resolves only through
+    held, verified directories.  POSIX: an lstat check per path; there the
+    worker's own sandbox is what keeps the tree honest.
+    """
+
+    if not is_windows():
+        for path in paths:
+            if stat.S_ISLNK(os.lstat(path).st_mode):
+                raise ReparsePointRefused(errno.ELOOP, "symlink refused", str(path))
+        yield
+        return
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+    ]
+    kernel32.GetFileInformationByHandle.restype = wintypes.BOOL
+    kernel32.GetFileInformationByHandle.argtypes = [wintypes.HANDLE, wintypes.LPVOID]
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    invalid = wintypes.HANDLE(-1).value
+    handles: list[Any] = []
+    try:
+        for path in paths:
+            handle = kernel32.CreateFileW(
+                str(path),
+                0x0001 | 0x0080,  # FILE_READ_DATA (joins share checks) | FILE_READ_ATTRIBUTES
+                0x0001 | 0x0002,  # FILE_SHARE_READ | FILE_SHARE_WRITE, never DELETE
+                None,
+                3,  # OPEN_EXISTING
+                0x02000000 | 0x00200000,  # BACKUP_SEMANTICS | OPEN_REPARSE_POINT
+                None,
+            )
+            if not handle or handle == invalid:
+                error = ctypes.get_last_error()  # type: ignore[attr-defined]
+                raise OSError(errno.EACCES, f"cannot hold path (winerror {error})", str(path))
+            handles.append(handle)
+            info = (wintypes.DWORD * 13)()  # BY_HANDLE_FILE_INFORMATION
+            if not kernel32.GetFileInformationByHandle(handle, info):
+                raise OSError(errno.EIO, "cannot read path attributes", str(path))
+            if info[0] & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+                raise ReparsePointRefused(errno.ELOOP, "reparse point refused", str(path))
+        yield
+    finally:
+        for handle in reversed(handles):
+            kernel32.CloseHandle(handle)

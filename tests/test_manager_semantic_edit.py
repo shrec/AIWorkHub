@@ -539,3 +539,94 @@ def test_the_fallback_record_is_readable_from_the_authenticated_ledger(
     )
     assert declarations[0]["exception"] == "spans_most_of_file"
     assert verification["entries_tampered"] == 0
+
+
+# -- a tree someone else can write (NF-2026-00034) ----------------------------
+# The worker MCP server now edits a contained worker's worktree from the host,
+# with the user's full rights, and the worker has modify on that tree: it can
+# swap a directory for a junction (no privilege needed) between a check and a
+# write.  Every read and write therefore runs with the directory chain held.
+
+
+def _junction(target: Path, link: Path) -> None:
+    import _winapi
+
+    _winapi.CreateJunction(str(target), str(link))
+
+
+def _tree(tmp_path: Path) -> tuple[Path, Path]:
+    root = tmp_path / "worktree"
+    (root / "src" / "pkg").mkdir(parents=True)
+    (root / "src" / "pkg" / "mod.py").write_text("a\nb\n", encoding="utf-8", newline="")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "mod.py").write_text("secret\n", encoding="utf-8", newline="")
+    return root, outside
+
+
+@pytest.mark.skipif(os.name != "nt", reason="directory junctions are Windows")
+@pytest.mark.parametrize("target", ["outside", "inside"])
+def test_a_junction_in_the_path_is_refused_at_prepare(tmp_path, target):
+    root, outside = _tree(tmp_path)
+    moved = root / "src" / "real"
+    (root / "src" / "pkg").rename(moved)
+    _junction(outside if target == "outside" else moved, root / "src" / "pkg")
+    with pytest.raises(semantic_edit.SemanticEditError) as excinfo:
+        semantic_edit.prepare_line_target(
+            root, path="src/pkg/mod.py", start_line=1, end_line=1,
+            allowed_writes=["src/pkg/mod.py"],
+        )
+    # Escaping the tree was always refused; a junction that stays inside is
+    # refused too, because a held chain may contain no link at all.
+    assert (
+        "semantic_edit_target_invalid" in str(excinfo.value)
+        or "semantic_edit_symlink_forbidden" in str(excinfo.value)
+    )
+    assert (outside / "mod.py").read_text(encoding="utf-8") == "secret\n"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="directory junctions are Windows")
+def test_a_directory_swapped_for_a_junction_after_prepare_is_refused_at_apply(tmp_path):
+    root, outside = _tree(tmp_path)
+    prepared = semantic_edit.prepare_line_target(
+        root, path="src/pkg/mod.py", start_line=1, end_line=1,
+        allowed_writes=["src/pkg/mod.py"],
+    )
+    (root / "src" / "pkg").rename(root / "src" / "real")
+    shutil_copy = (outside / "mod.py").read_bytes()
+    (outside / "mod.py").write_bytes(b"a\nb\n")  # same bytes: the hashes match
+    _junction(outside, root / "src" / "pkg")
+    with pytest.raises(semantic_edit.SemanticEditError):
+        semantic_edit_applier.replace_prepared_range(
+            root, prepared, "changed\n", allowed_writes=["src/pkg/mod.py"]
+        )
+    assert (outside / "mod.py").read_bytes() == b"a\nb\n" != shutil_copy
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the hold is a Windows share mode")
+def test_the_chain_cannot_be_swapped_while_an_apply_holds_it(tmp_path, monkeypatch):
+    """The race itself: a writer tries to move the directory away (the first
+    step of swapping in a junction) while the edit is between its checks
+    and its write.  The hold refuses the move; the edit lands in place."""
+    root, _outside = _tree(tmp_path)
+    prepared = semantic_edit.prepare_line_target(
+        root, path="src/pkg/mod.py", start_line=1, end_line=1,
+        allowed_writes=["src/pkg/mod.py"],
+    )
+    attempts: list[str] = []
+    real_apply = semantic_edit.apply_line_ranges
+
+    def _race(text, ranges):
+        try:
+            os.rename(root / "src" / "pkg", root / "src" / "moved")
+            attempts.append("moved")
+        except PermissionError as exc:
+            attempts.append(f"refused:{exc.winerror}")
+        return real_apply(text, ranges)
+
+    monkeypatch.setattr(semantic_edit, "apply_line_ranges", _race)
+    semantic_edit_applier.replace_prepared_range(
+        root, prepared, "changed\n", allowed_writes=["src/pkg/mod.py"]
+    )
+    assert attempts == ["refused:32"]  # ERROR_SHARING_VIOLATION
+    assert (root / "src" / "pkg" / "mod.py").read_text(encoding="utf-8") == "changed\nb\n"

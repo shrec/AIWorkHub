@@ -45,57 +45,69 @@ def replace_prepared_range(
 
     Raises ``SemanticEditError`` or ``OSError``; the caller decides how a
     refusal is reported.
+
+    The whole read-verify-write runs with ``root`` and every directory down
+    to the file held (:func:`semantic_edit.held_path`), and the file itself
+    held while it is read: a writer of the tree cannot swap any of them for
+    a junction or link after the checks, so the write lands where the
+    checks looked.  The file is released only for the replace, which swaps
+    the directory entry and never follows a link.
     """
 
-    current = semantic_edit.prepare_line_target(
-        root,
-        path=target.path,
-        start_line=target.start_line,
-        end_line=target.end_line,
-        allowed_writes=allowed_writes,
-    )
-    if current.current_sha256 != target.current_sha256:
-        raise semantic_edit.SemanticEditError(
-            f"semantic_edit_stale_file:{target.path}"
-        )
-    if current.fragment_sha256 != target.fragment_sha256:
-        raise semantic_edit.SemanticEditError(
-            f"semantic_edit_stale_fragment:{target.path}"
-        )
+    relative = semantic_edit.normalize_relative_path(target.path)
+    if not semantic_edit.path_is_allowed(relative, allowed_writes):
+        raise semantic_edit.SemanticEditError(f"semantic_edit_path_not_allowed:{relative}")
+    with semantic_edit.held_path(root, relative, include_file=False):
+        with semantic_edit.held_path(root, relative):
+            current = semantic_edit.prepare_line_target(
+                root,
+                path=target.path,
+                start_line=target.start_line,
+                end_line=target.end_line,
+                allowed_writes=allowed_writes,
+            )
+            if current.current_sha256 != target.current_sha256:
+                raise semantic_edit.SemanticEditError(
+                    f"semantic_edit_stale_file:{target.path}"
+                )
+            if current.fragment_sha256 != target.fragment_sha256:
+                raise semantic_edit.SemanticEditError(
+                    f"semantic_edit_stale_fragment:{target.path}"
+                )
 
-    file_path = semantic_edit.resolve_existing_file(root, target.path)
-    original_mode = os.stat(file_path).st_mode & 0o7777
-    _data, current_text = semantic_edit.read_utf8_file(file_path, target.path)
-    next_text, metrics = semantic_edit.apply_line_ranges(
-        current_text,
-        [{
-            "start_line": target.start_line,
-            "end_line": target.end_line,
-            "new": new,
-            "fragment_sha256": target.fragment_sha256,
-        }],
-    )
-    fd, temp_name = tempfile.mkstemp(
-        prefix=f".{file_path.name}.aiworkhub-", dir=file_path.parent
-    )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="", closefd=False) as handle:
-            handle.write(next_text)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.close(fd)
-        fd = -1
-        if original_mode != 0o600:
-            try:
-                os.chmod(temp_name, original_mode)
-            except OSError:
-                pass
-        os.replace(temp_name, file_path)
-    finally:
-        if fd >= 0:
-            os.close(fd)
+            file_path = semantic_edit.resolve_existing_file(root, target.path)
+            original_mode = os.stat(file_path).st_mode & 0o7777
+            _data, current_text = semantic_edit.read_utf8_file(file_path, target.path)
+        next_text, metrics = semantic_edit.apply_line_ranges(
+            current_text,
+            [{
+                "start_line": target.start_line,
+                "end_line": target.end_line,
+                "new": new,
+                "fragment_sha256": target.fragment_sha256,
+            }],
+        )
+        fd, temp_name = tempfile.mkstemp(
+            prefix=f".{file_path.name}.aiworkhub-", dir=file_path.parent
+        )
         try:
-            os.unlink(temp_name)
-        except FileNotFoundError:
-            pass
+            with os.fdopen(fd, "w", encoding="utf-8", newline="", closefd=False) as handle:
+                handle.write(next_text)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.close(fd)
+            fd = -1
+            if original_mode != 0o600:
+                try:
+                    os.chmod(temp_name, original_mode)
+                except OSError:
+                    pass
+            os.replace(temp_name, file_path)
+        finally:
+            if fd >= 0:
+                os.close(fd)
+            try:
+                os.unlink(temp_name)
+            except FileNotFoundError:
+                pass
     return next_text, metrics

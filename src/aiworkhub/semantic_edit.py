@@ -19,9 +19,12 @@ from __future__ import annotations
 
 import fnmatch
 import hashlib
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
+
+from .platform_io import ReparsePointRefused, pinned_paths
 
 
 MAX_FILE_BYTES = 16 * 1024 * 1024
@@ -122,6 +125,47 @@ def resolve_existing_file(root: Path, relative: str) -> Path:
     return target
 
 
+@contextmanager
+def held_path(
+    root: Path,
+    relative: str,
+    *,
+    include_file: bool = True,
+    create_directories: bool = False,
+) -> Iterator[Path]:
+    """Hold ``root``, every directory down to ``relative`` and -- with
+    ``include_file`` -- the file itself for the duration of the block
+    (:func:`platform_io.pinned_paths`), and yield the file's path.
+
+    Checking a path and then using it is a race whenever someone else can
+    write the tree -- on Windows a worker with modify rights can swap a
+    directory for a junction between the two.  Held, no component is or can
+    become a link, or be renamed or removed, so a path used inside the block
+    lands where it was checked.  ``create_directories`` makes each missing
+    directory before holding it.  A file must be released before it is
+    replaced, so a writer holds the directories only.
+    """
+
+    root = root.resolve()
+    parts = PurePosixPath(relative).parts
+    with ExitStack() as stack:
+        directory = root
+        try:
+            stack.enter_context(pinned_paths([root]))
+            for part in parts[:-1]:
+                directory = directory / part
+                if create_directories:
+                    directory.mkdir(exist_ok=True)
+                stack.enter_context(pinned_paths([directory]))
+            if include_file:
+                stack.enter_context(pinned_paths([directory / parts[-1]]))
+        except ReparsePointRefused as exc:
+            raise SemanticEditError(f"semantic_edit_symlink_forbidden:{relative}") from exc
+        except OSError as exc:
+            raise SemanticEditError(f"semantic_edit_target_missing:{relative}") from exc
+        yield directory / parts[-1]
+
+
 def read_utf8_file(target: Path, relative: str) -> tuple[bytes, str]:
     data = target.read_bytes()
     if len(data) > MAX_FILE_BYTES:
@@ -169,8 +213,10 @@ def prepare_line_target(
     relative = normalize_relative_path(path)
     if not path_is_allowed(relative, allowed_writes):
         raise SemanticEditError(f"semantic_edit_path_not_allowed:{relative}")
-    target = resolve_existing_file(root, relative)
-    data, text = read_utf8_file(target, relative)
+    resolve_existing_file(root, relative)
+    with held_path(root, relative):
+        target = resolve_existing_file(root, relative)
+        data, text = read_utf8_file(target, relative)
     _lines, fragment = _line_slice(text, start_line, end_line)
     fragment_data = fragment.encode("utf-8")
     if len(fragment_data) > MAX_FRAGMENT_BYTES:
