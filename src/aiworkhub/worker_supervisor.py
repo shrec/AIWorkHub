@@ -261,11 +261,25 @@ WORKER_NETWORK_CAPABILITIES = ("internetClient",)
 _NPM_SHIM_TARGET = re.compile(r'"%dp0%\\node_modules\\([^"]+)"')
 
 
-def _resolve_npm_shim(executable: str) -> tuple[Path, Path] | None:
-    """``(target, package_root)`` of an npm cmd-shim, or None.
+def _strictly_beneath(child: str, parent: str) -> bool:
+    child, parent = (os.path.normcase(os.path.normpath(p)) for p in (child, parent))
+    try:
+        return child != parent and os.path.commonpath([child, parent]) == parent
+    except ValueError:  # different drives
+        return False
 
-    The shim runs ``"%dp0%\\node_modules\\<package>\\...\\<file>"``; the target
-    is accepted only strictly inside the shim's own ``node_modules``.
+
+def _resolve_npm_shim(executable: str) -> tuple[Path, Path] | None:
+    """``(target, package_root)`` of an npm cmd-shim; None if it is not one.
+
+    The shim runs ``"%dp0%\\node_modules\\<package>\\...\\<file>"``, and that
+    target decides both what runs and what the container may read, so a shim
+    naming anything but a path strictly inside its own ``node_modules`` is
+    REFUSED (ValueError) -- never followed, never fallen back from.  Both
+    separators split segments, as Win32 does; ``:`` (drive-relative paths,
+    alternate data streams), empty/dot segments and trailing dots or spaces
+    (which Win32 silently strips) are refused outright; and containment is
+    then asserted on the Win32-canonical path, not inferred from segments.
     """
     path = Path(executable)
     if path.suffix.lower() not in {".cmd", ".bat"}:
@@ -275,12 +289,25 @@ def _resolve_npm_shim(executable: str) -> tuple[Path, Path] | None:
             match = _NPM_SHIM_TARGET.search(shim.read(65536))
     except OSError:
         return None
-    parts = match.group(1).split("\\") if match else []
-    depth = 2 if parts and parts[0].startswith("@") else 1
-    if len(parts) <= depth or any(part in {"", ".", ".."} for part in parts):
+    if not match:
         return None
-    root = path.parent / "node_modules"
-    return root.joinpath(*parts), root.joinpath(*parts[:depth])
+    relative = match.group(1)
+    parts = re.split(r"[\\/]", relative)
+    depth = 2 if parts[0].startswith("@") else 1
+    refusal = ValueError(f"appcontainer_npm_shim_target_outside_node_modules:{relative!r}")
+    if (
+        ":" in relative
+        or "\x00" in relative
+        or len(parts) <= depth
+        or any(not part or part != part.rstrip(". ") for part in parts)
+    ):
+        raise refusal
+    root = os.path.abspath(path.parent / "node_modules")
+    target = os.path.abspath(os.path.join(root, *parts))
+    package = os.path.abspath(os.path.join(root, *parts[:depth]))
+    if not (_strictly_beneath(target, root) and _strictly_beneath(package, root)):
+        raise refusal
+    return Path(target), Path(package)
 
 
 def _native_worker_argv(argv: list[str]) -> list[str]:
@@ -306,12 +333,13 @@ def _provider_install_grants(
     """Read/execute on exactly what the provider CLI needs to start.
 
     For an npm shim: the shim and the one package it runs -- not the whole
-    npm directory the other CLIs live in.  Any other executable: its own
-    directory.  Persistent: see the rationale in ``launch_appcontainer``.
+    npm directory the other CLIs live in.  Any other executable: that file
+    alone, never its directory, which may be a shared root.  Persistent: see
+    the rationale in ``launch_appcontainer``.
     """
     path = Path(executable)
     resolved = _resolve_npm_shim(executable)
-    roots = [path, resolved[1]] if resolved else [path.parent]
+    roots = [path, resolved[1]] if resolved else [path]
     return [
         windows_appcontainer.ContainerGrant(str(root), "read_execute", persistent=True)
         for root in roots

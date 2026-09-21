@@ -571,7 +571,7 @@ def test_supervisor_appcontainer_spec_launches_through_the_broker(
 def _npm_shim(tmp_path, name, package):
     """A copy of the real npm cmd-shim layout: shim + the package it runs."""
     npm = tmp_path / "npm"
-    package_dir = npm / "node_modules" / package
+    package_dir = npm / "node_modules" / Path(*package.split("\\"))
     (package_dir / "bin").mkdir(parents=True)
     shim = npm / f"{name}.cmd"
     shim.write_text(
@@ -637,40 +637,102 @@ def test_supervisor_worker_launch_gets_grants_and_only_internet_client(
     ]
 
 
-@pytest.mark.parametrize(
-    "line",
-    [
-        # Codex's own shim resolves its exe at run time: not an npm shim.
-        '"%CODEX_BIN%" %*',
-        # A target that escapes the shim's node_modules is never trusted.
-        '"%dp0%\\node_modules\\..\\..\\evil.exe" %*',
-        '"%dp0%\\node_modules\\@scope\\..\\x.exe" %*',
-        # A bare package with no file under it.
-        '"%dp0%\\node_modules\\pkg" %*',
-    ],
-)
-def test_non_npm_or_escaping_shims_are_neither_unwrapped_nor_followed(
-    tmp_path, line
-) -> None:
-    shim = tmp_path / "tool.cmd"
-    shim.write_text(f"@echo off\n{line}\n", encoding="utf-8")
+def test_a_non_npm_shim_is_run_as_is_and_granted_only_itself(tmp_path) -> None:
+    # Codex's own shim resolves its exe at run time: not an npm shim.
+    shim = tmp_path / "codex.cmd"
+    shim.write_text('@echo off\n"%CODEX_BIN%" %*\n', encoding="utf-8")
     assert worker_supervisor._resolve_npm_shim(str(shim)) is None
     assert worker_supervisor._native_worker_argv([str(shim), "-x"]) == [str(shim), "-x"]
     assert worker_supervisor._provider_install_grants(str(shim)) == [
-        windows_appcontainer.ContainerGrant(
-            str(shim.parent), "read_execute", persistent=True
-        )
+        windows_appcontainer.ContainerGrant(str(shim), "read_execute", persistent=True)
     ]
 
 
-def test_supervisor_native_executable_grants_its_own_directory(tmp_path) -> None:
+ESCAPING_SHIM_TARGETS = [
+    # Literal parent segments.
+    "..\\..\\evil.exe",
+    "@scope\\..\\x.exe",
+    # '/' inside the PACKAGE segment: "a/../../../../.." is no ".." segment
+    # when split on '\\' alone, yet Win32 walks it out of node_modules.
+    "a/../../../../..\\x",
+    # '/' inside the tail.
+    "pkg\\bin/../../../../Windows/System32/cmd.exe",
+    # Mixed separators.
+    "pkg/..\\..\\x.exe",
+    "@scope/pkg\\../../../x.exe",
+    # ':' -- a drive-relative path or an alternate data stream.
+    "C:x.exe",
+    "pkg\\x.exe:stream",
+    # Trailing dots/spaces, which Win32 strips.
+    "pkg\\.. \\..\\x.exe",
+    "pkg\\bin.\\x.exe",
+    # A bare package with no file under it.
+    "pkg",
+]
+
+
+@pytest.mark.parametrize("relative", ESCAPING_SHIM_TARGETS)
+def test_an_escaping_npm_shim_is_refused_not_followed(tmp_path, relative) -> None:
+    shim = tmp_path / "npm" / "tool.cmd"
+    shim.parent.mkdir()
+    shim.write_text(f'@echo off\n"%dp0%\\node_modules\\{relative}" %*\n', encoding="utf-8")
+    for probe in (
+        lambda: worker_supervisor._resolve_npm_shim(str(shim)),
+        lambda: worker_supervisor._native_worker_argv([str(shim), "-x"]),
+        lambda: worker_supervisor._provider_install_grants(str(shim)),
+    ):
+        with pytest.raises(ValueError, match="npm_shim_target_outside_node_modules"):
+            probe()
+
+
+def test_a_forward_slash_that_stays_inside_the_package_is_accepted(tmp_path) -> None:
+    shim, package_dir = _npm_shim(tmp_path, "tool", "@scope\\tool")
+    shim.write_text(
+        '@echo off\n"%dp0%\\node_modules\\@scope/tool\\bin/tool.exe" %*\n',
+        encoding="utf-8",
+    )
+    target, package = worker_supervisor._resolve_npm_shim(str(shim))
+    assert package == package_dir
+    assert target == package_dir / "bin" / "tool.exe"
+
+
+def test_supervisor_refuses_an_escaping_shim_before_any_grant_or_launch(
+    monkeypatch, tmp_path
+) -> None:
+    shim = tmp_path / "npm" / "claude.cmd"
+    shim.parent.mkdir()
+    shim.write_text(
+        '@echo off\n"%dp0%\\node_modules\\a/../../../../..\\x" %*\n', encoding="utf-8"
+    )
+    statuses, popen_calls = _patch_supervisor_seams(monkeypatch)
+    monkeypatch.setattr(
+        worker_supervisor.windows_appcontainer,
+        "launch_appcontainer",
+        lambda _request: pytest.fail("an escaping shim must never be launched"),
+    )
+
+    code = worker_supervisor.supervise(
+        _supervisor_spec(
+            tmp_path,
+            execution_backend="windows_appcontainer",
+            repo_id=CANONICAL_REPO_ID,
+            worker_kind="claude_cli",
+            argv=[str(shim), "--version"],
+        )
+    )
+
+    assert code == 126
+    assert popen_calls == []
+    assert statuses[-1]["state"] == "spawn_failed"
+    assert "npm_shim_target_outside_node_modules" in statuses[-1]["error"]
+
+
+def test_supervisor_native_executable_grants_only_the_file(tmp_path) -> None:
     exe = tmp_path / "bin" / "kilo.exe"
     exe.parent.mkdir()
     exe.write_bytes(b"MZ")
     assert worker_supervisor._provider_install_grants(str(exe)) == [
-        windows_appcontainer.ContainerGrant(
-            str(exe.parent), "read_execute", persistent=True
-        )
+        windows_appcontainer.ContainerGrant(str(exe), "read_execute", persistent=True)
     ]
 
 

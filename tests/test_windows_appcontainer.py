@@ -11,6 +11,7 @@ without ever leaving a child running outside the job.
 
 from __future__ import annotations
 
+import ctypes
 import os
 
 import pytest
@@ -2084,33 +2085,79 @@ def test_invalid_grant_is_refused_before_any_win32_call(tmp_path, case):
     assert fake.events == []
 
 
-def test_modify_grant_containing_the_user_profile_is_refused(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    ("access", "persistent"),
+    [("read_execute", True), ("read_execute", False), ("modify", False)],
+)
+def test_no_grant_may_equal_or_contain_a_protected_tree(
+    tmp_path, monkeypatch, access, persistent
+):
     profile = tmp_path / "profile"
-    local = profile / "AppData" / "Local"
-    local.mkdir(parents=True)
-    monkeypatch.setattr(wac, "resolve_local_appdata", lambda: str(local))
+    temp = profile / "AppData" / "Local" / "Temp"
+    temp.mkdir(parents=True)
+    protected = [os.path.normcase(str(p)) for p in (profile, temp)]
+    monkeypatch.setattr(wac, "_sensitive_roots", lambda: protected)
     fake = FakeWin32Api()
-    for path in (profile, local):
+    # Equal to a protected tree, or an ancestor of one -- at any access level.
+    for path in (profile, temp, profile / "AppData", tmp_path):
         with pytest.raises(AppContainerError) as excinfo:
             launch_appcontainer(
-                make_request(filesystem_grants=[ContainerGrant(str(path), "modify")]),
+                make_request(
+                    filesystem_grants=[ContainerGrant(str(path), access, persistent)]
+                ),
                 api=fake,
             )
-        assert "user profile" in excinfo.value.detail
+        assert excinfo.value.reason is AppContainerReason.INVALID_REQUEST
+        assert "protected tree" in excinfo.value.detail
     assert fake.events == []
-    # A request directory *inside* the profile is fine, and read access to
-    # the profile itself is not what this guard is about.
-    inside = local / "request"
+    # A request directory *inside* one is what grants are for.
+    inside = temp / "request"
     inside.mkdir()
     launch_appcontainer(
-        make_request(
-            filesystem_grants=[
-                ContainerGrant(str(inside), "modify"),
-                ContainerGrant(str(profile), "read_execute"),
-            ]
-        ),
+        make_request(filesystem_grants=[ContainerGrant(str(inside), access, persistent)]),
         api=fake,
     )
+
+
+def test_a_filesystem_root_is_never_granted(tmp_path):
+    fake = FakeWin32Api()
+    with pytest.raises(AppContainerError) as excinfo:
+        launch_appcontainer(
+            make_request(
+                filesystem_grants=[ContainerGrant(tmp_path.anchor, "read_execute")]
+            ),
+            api=fake,
+        )
+    assert "protected tree" in excinfo.value.detail
+    assert fake.events == []
+
+
+@pytest.mark.skipif(os.name != "nt", reason="resolves real Windows locations")
+def test_protected_trees_come_from_the_token_not_the_request_env(
+    tmp_path, monkeypatch
+):
+    real_profile_path = os.environ["USERPROFILE"]
+    real_profile = os.path.normcase(real_profile_path)
+    # A launcher points USERPROFILE/TEMP at the request's own directories,
+    # and then the env-expanding known-folder lookups fail (measured).  Never
+    # call the real one with a bogus USERPROFILE here: shell32 caches the
+    # failure for the rest of the process.
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.setenv("TEMP", str(tmp_path))
+    monkeypatch.setattr(wac, "_known_folder_path", lambda _folder: "")
+    roots = wac._sensitive_roots()
+    assert real_profile in roots
+    assert os.path.join(real_profile, "appdata", "local", "temp") in roots
+    assert os.path.join(real_profile, "appdata", "roaming") in roots
+    assert os.path.normcase(os.environ["SYSTEMROOT"]) in roots
+    assert os.path.normcase(str(tmp_path)) not in roots
+    # The reviewer's repro: persistent read access to the whole profile.
+    fake = FakeWin32Api()
+    grant = ContainerGrant(real_profile_path, "read_execute", persistent=True)
+    with pytest.raises(AppContainerError) as excinfo:
+        launch_appcontainer(make_request(filesystem_grants=[grant]), api=fake)
+    assert "protected tree" in excinfo.value.detail
+    assert fake.events == []
 
 
 def test_request_scoped_grants_dedupe_and_skip_unset(tmp_path):
@@ -2127,6 +2174,16 @@ def test_request_scoped_grants_dedupe_and_skip_unset(tmp_path):
 # -- real ctypes boundary against recording advapi32/kernel32 doubles --------
 
 
+# A real, readable SID (S-1-15-2) so the boundary's string_at is safe.
+_SID = b"\x01\x01\x00\x00\x00\x00\x00\x0f\x02\x00\x00\x00"
+_SID_BUFFER = ctypes.create_string_buffer(_SID, len(_SID))
+_GRANT, _REVOKE = 1, 4
+
+
+def _identity():
+    return _Identity("n", "d", "S-1-15-2", ctypes.addressof(_SID_BUFFER), False)
+
+
 class FakeSecurityLib:
     """Stands in for both advapi32 and kernel32 in the grant/revoke path."""
 
@@ -2137,6 +2194,9 @@ class FakeSecurityLib:
         self.entries = []
         self.set_calls = []
         self.freed = []
+
+    def GetLengthSid(self, sid):
+        return len(_SID)
 
     def GetNamedSecurityInfoW(self, path, obj, info, owner, group, dacl, sacl, sd):
         sd._obj.value = 111
@@ -2149,9 +2209,10 @@ class FakeSecurityLib:
 
     def SetEntriesInAclW(self, count, entry, old_acl, new_acl):
         e = entry._obj
+        trustee = ctypes.string_at(e.Trustee.ptstrName, len(_SID))
         self.entries.append(
             (count, e.grfAccessPermissions, e.grfAccessMode, e.grfInheritance,
-             e.Trustee.TrusteeForm, e.Trustee.ptstrName, old_acl.value)
+             e.Trustee.TrusteeForm, trustee, old_acl.value)
         )
         new_acl._obj.value = 333
         return 0
@@ -2164,55 +2225,74 @@ class FakeSecurityLib:
         self.freed.append(getattr(ptr, "value", ptr))
 
 
-def _security_api(lib, monkeypatch):
+def _security_api(lib, monkeypatch, *, present=None):
     api = make_ctypes_api(lib)
     api._advapi32 = lib
-    monkeypatch.setattr(api, "_explicit_grant_present", lambda *a: False)
+
+    def _present(*_args):
+        if present is None:
+            pytest.fail("a revocable grant must never take the already-present path")
+        return present
+
+    monkeypatch.setattr(api, "_explicit_grant_present", _present)
     return api
 
 
 @pytest.mark.parametrize("protected", [False, True])
-def test_ctypes_grant_merges_one_ace_for_exactly_the_container_sid(
+def test_ctypes_revocable_grant_writes_and_revoke_removes_only_this_sid(
     tmp_path, monkeypatch, protected
 ):
     lib = FakeSecurityLib(protected=protected)
-    api = _security_api(lib, monkeypatch)
-    identity = _Identity("n", "d", "S-1-15-2-9", 0xABC, False)
+    api = _security_api(lib, monkeypatch)  # present=None: must not be consulted
 
-    grant = api.grant_path_access(identity, str(tmp_path), "modify")
+    grant = api.grant_path_access(_identity(), str(tmp_path), "modify")
 
     # One GRANT_ACCESS entry whose trustee is the container SID itself,
     # inheritable to files and subdirectories, merged into the DACL just read.
-    assert lib.entries == [(1, 0x1301BF, 1, 0x3, 0, 0xABC, 222)]
+    assert lib.entries == [(1, 0x1301BF, _GRANT, 0x3, 0, _SID, 222)]
     info = 0x4 | (0x80000000 if protected else 0x20000000)
     assert lib.set_calls == [(str(tmp_path), info, 333)]
-    # The merged ACL is freed at once; the snapshot is kept for the restore.
-    assert lib.freed == [333]
-    assert grant.restore == (111, 222, info)
+    assert lib.freed == [333, 111]  # merged ACL, then the descriptor
+    assert grant.restore == _SID  # what a revoke needs, even after free_identity
 
     api.revoke_path_access(grant)
-    assert lib.set_calls[-1] == (str(tmp_path), info, 222)
-    assert lib.freed == [333, 111]
+    # Revoke re-reads the CURRENT DACL and drops only this SID's ACEs, so a
+    # concurrent edit by anyone else survives, and so does nothing of ours.
+    assert lib.entries[-1] == (1, 0, _REVOKE, 0, 0, _SID, 222)
+    assert lib.set_calls[-1] == (str(tmp_path), info, 333)
+    assert lib.freed == [333, 111, 333, 111]
+    assert grant.revoke_error is None
     api.revoke_path_access(grant)
-    assert len(lib.set_calls) == 2 and lib.freed == [333, 111]
+    assert len(lib.set_calls) == 2
 
 
-def test_ctypes_file_grant_is_not_inheritable_and_persistent_frees_snapshot(
+def test_ctypes_persistent_grant_already_present_rewrites_nothing(
+    tmp_path, monkeypatch
+):
+    lib = FakeSecurityLib()
+    api = _security_api(lib, monkeypatch, present=True)
+    grant = api.grant_path_access(
+        _identity(), str(tmp_path), "read_execute", persistent=True
+    )
+    assert lib.entries == [] and lib.set_calls == [] and lib.freed == []
+    assert grant.restore is None
+
+
+def test_ctypes_persistent_file_grant_is_not_inheritable_and_never_revoked(
     tmp_path, monkeypatch
 ):
     target = tmp_path / "claude.cmd"
     target.write_text("@echo off\n", encoding="utf-8")
     lib = FakeSecurityLib()
-    api = _security_api(lib, monkeypatch)
-    identity = _Identity("n", "d", "S-1-15-2-9", 0xABC, False)
+    api = _security_api(lib, monkeypatch, present=False)
 
     grant = api.grant_path_access(
-        identity, str(target), "read_execute", persistent=True
+        _identity(), str(target), "read_execute", persistent=True
     )
 
-    assert lib.entries[0][1:4] == (0x1200A9, 1, 0)
+    assert lib.entries[0][1:4] == (0x1200A9, _GRANT, 0)
     assert grant.restore is None
-    assert sorted(lib.freed) == [111, 333]
+    assert lib.freed == [333, 111]
     api.revoke_path_access(grant)
     assert len(lib.set_calls) == 1
 
@@ -2220,21 +2300,19 @@ def test_ctypes_file_grant_is_not_inheritable_and_persistent_frees_snapshot(
 def test_ctypes_grant_leaves_a_null_dacl_alone(tmp_path, monkeypatch):
     lib = FakeSecurityLib(dacl=None)
     api = _security_api(lib, monkeypatch)
-    grant = api.grant_path_access(
-        _Identity("n", "d", "S-1-15-2-9", 0xABC, False), str(tmp_path), "modify"
-    )
+    grant = api.grant_path_access(_identity(), str(tmp_path), "modify")
     assert lib.entries == [] and lib.set_calls == []
     assert grant.restore is None
     assert lib.freed == [111]
 
 
-def test_ctypes_failed_restore_is_recorded_not_raised(monkeypatch):
+def test_ctypes_failed_revoke_is_recorded_not_raised(tmp_path, monkeypatch):
     lib = FakeSecurityLib(set_status=5)
     api = _security_api(lib, monkeypatch)
-    grant = _PathGrant("C:\\w", "modify", (111, 222, 0x20000004))
+    grant = _PathGrant(str(tmp_path), "modify", _SID)
     api.revoke_path_access(grant)
     assert grant.revoke_error == 5
-    assert lib.freed == [111]
+    assert lib.freed == [333, 111]
 
 
 def test_launch_close_surfaces_a_failed_revoke(tmp_path):
