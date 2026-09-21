@@ -57,6 +57,18 @@ noted by package/extension version and release tag.
   and gates nothing (NF-2026-00029).
 - The reconciler backs off standby lock retries from 0.25 s to a 5 s cap
   instead of spinning for hours (NF-2026-00028).
+- Quality-reviewer prewarm can no longer wedge the launch queue until the MCP
+  server restarts (NF-2026-00027).
+  - Cause: a started prewarm row counted as live for the whole life of its owner
+    process, so a hung or crashed build held a launch slot indefinitely.
+  - A started row now expires after the preparation stall ceiling (180 s by
+    default, `AIWORKHUB_PREPARATION_STALL_SECONDS`).
+  - A build that fails with any exception publishes a terminal phase.
+  - Concurrent prewarms queue for a bounded time behind a capacity derived from
+    the core count, and time out with `reviewer_prewarm_capacity_exhausted`.
+- Windows: a reviewer terminal intent could settle twice. A reader holding the
+  intent file open blocked its deletion, and the second settler then
+  re-processed it. Intent reads now open files with delete sharing.
 - VS Code LM workers:
   - After forced semantic-edit staging begins, a worker can read the files its
     card declared writable, not only its next required output (NF-2026-00023).

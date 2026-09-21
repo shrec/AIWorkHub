@@ -78,6 +78,9 @@ structured findings into NeedFix with provenance.
   terminated the process.
 - Dispatcher health reports manager-inbox callbacks that nothing delivers. The
   reconciler no longer spins in standby.
+- Reviewer prewarm can no longer wedge the launch queue until a server restart.
+  Prewarm now expires after a stall ceiling and queues behind a capacity derived
+  from the core count.
 - VS Code LM workers get one correction for a tool name that is not allowlisted,
   and can read their declared files during forced staging.
 - Known issue: a full native CLI worker run on Windows is not yet proven end to

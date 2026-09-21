@@ -56,8 +56,9 @@ def prewarm_outlived(event: Mapping[str, Any], ceiling: float) -> bool:
     and keeps the previous (live) reading.
     """
 
+    heartbeat: Any = event.get("preparation_heartbeat_epoch")
     try:
-        return time.time() - float(event.get("preparation_heartbeat_epoch")) > ceiling
+        return time.time() - float(heartbeat) > ceiling
     except (TypeError, ValueError):
         return False
 

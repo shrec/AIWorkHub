@@ -24,6 +24,7 @@ port, expose a LAN service or require an AIWorkHub cloud account.
   `cmake`/`ctest` are trusted validation tools.
 - Blocked-card rework recovery works on Windows, and dispatcher health reports
   undelivered manager-inbox callbacks.
+- Reviewer prewarm can no longer wedge the launch queue until a server restart.
 - The VS Code LM bridge gives one correction for a tool name that is not
   allowlisted, instead of failing the request.
 - Known issue: a full native CLI worker run on Windows is not yet proven end to

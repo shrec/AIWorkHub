@@ -25,6 +25,11 @@
 - Bundled runtime: dispatcher health reports undelivered manager-inbox
   callbacks (NF-2026-00029). The reconciler backs off standby lock retries to a
   5 s cap (NF-2026-00028).
+- Bundled runtime: reviewer prewarm can no longer wedge the launch queue.
+  - A started prewarm expires after the stall ceiling.
+  - Concurrent prewarms queue behind a capacity derived from the core count.
+  - On Windows, a terminal intent can no longer settle twice.
+  - (NF-2026-00027.)
 - VS Code LM bridge:
   - Declared writable files stay readable during forced staging
     (NF-2026-00023).
