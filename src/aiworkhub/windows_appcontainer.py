@@ -31,6 +31,7 @@ import re
 import secrets
 import stat
 import threading
+import time
 from ctypes import wintypes
 from dataclasses import dataclass, field, replace
 from functools import partial
@@ -229,14 +230,25 @@ def python_read_grants(
     and the base interpreter's home that ``pyvenv.cfg`` names -- the launcher
     re-executes that interpreter, which loads its DLLs and standard library
     from there.  A plain interpreter needs its own install root.  Each
-    absolute ``pythonpath`` entry is an import root too.  Paths inside
-    ``covered`` (what the request already grants) are skipped.  These are
-    shared install roots, hence persistent (see :func:`launch_appcontainer`);
-    one ALL APPLICATION PACKAGES can already read costs no write.
+    absolute ``pythonpath`` entry is an import root too.  These are shared
+    install roots, hence persistent (see :func:`launch_appcontainer`); one
+    ALL APPLICATION PACKAGES can already read costs no write.
+
+    ``covered`` names what the request already grants -- the worktree, HOME
+    and temp, all writable by the container.  An import root inside them is
+    already reachable and is skipped.  But an interpreter or ``pyvenv.cfg``
+    there, or a ``home`` it names there, is refused: a worker could plant
+    them, and ``home`` would then steer a PERSISTENT grant anywhere.
     """
     exe = Path(executable)
     if not (exe.name.lower().startswith("python") and exe.suffix.lower() == ".exe"):
         return []
+    writable = [os.path.normcase(os.path.normpath(path)) for path in covered]
+
+    def planted(path: Path) -> bool:
+        key = os.path.normcase(os.path.normpath(os.path.abspath(path)))
+        return any(_within(key, root) for root in writable)
+
     config = exe.parent.parent / "pyvenv.cfg"
     roots: list[Path] = []
     if config.is_file():
@@ -247,8 +259,13 @@ def python_read_grants(
                 roots.append(Path(value.strip()))
     else:
         roots.append(exe.parent)
+    if any(planted(root) for root in roots):
+        raise AppContainerError(
+            AppContainerReason.INVALID_REQUEST,
+            detail=f"an interpreter the container can write is never granted: {executable!r}.",
+        )
     roots += [Path(part) for part in pythonpath.split(os.pathsep) if os.path.isabs(part)]
-    skip = [os.path.normcase(os.path.normpath(path)) for path in covered]
+    skip = list(writable)
     grants: list[ContainerGrant] = []
     for root in roots:
         key = os.path.normcase(os.path.normpath(str(root)))
@@ -753,6 +770,7 @@ _ACCESS_ALLOWED_ACE_TYPE = 0
 # OI | CI | NO_PROPAGATE | INHERIT_ONLY | INHERITED: an explicit, fully
 # propagating ACE of ours has exactly the requested inheritance bits set here.
 _ACE_INHERITANCE_FLAGS = 0x1F
+_ACCESS_DENIED_ACE_TYPE = 1
 _NO_PROPAGATE_INHERIT_ACE = 0x04
 _INHERIT_ONLY_ACE = 0x08
 # S-1-15-2-1, APPLICATION PACKAGE AUTHORITY\ALL APPLICATION PACKAGES.
@@ -767,9 +785,17 @@ def _satisfying_trustee(
     APPLICATION PACKAGES ACE, explicit or inherited, that is not inherit-only
     and propagates at least as far as ``inherit`` asks), or ``""``.
 
-    Like the explicit-ACE check it extends, this reads allow ACEs only.
+    ACEs are read in stored order, as the kernel evaluates them: a deny ACE
+    for this SID or for ALL APPLICATION PACKAGES that overlaps ``mask`` and
+    comes before a satisfying allow means not satisfied.
     """
     for ace in aces:
+        if (
+            ace.ace_type == _ACCESS_DENIED_ACE_TYPE
+            and ace.sid in (sid, _ALL_APPLICATION_PACKAGES_SID)
+            and ace.mask & mask
+        ):
+            return ""
         if ace.ace_type != _ACCESS_ALLOWED_ACE_TYPE or ace.mask & mask != mask:
             continue
         if ace.sid == sid and ace.flags & _ACE_INHERITANCE_FLAGS == inherit:
@@ -3048,6 +3074,8 @@ def _pipe_libraries() -> tuple[Any, Any]:
     k.GetOverlappedResult.argtypes = [handle, overlapped, ctypes.POINTER(dword), bool_]
     k.CancelIoEx.restype = bool_
     k.CancelIoEx.argtypes = [handle, overlapped]
+    k.WaitForSingleObject.restype = dword
+    k.WaitForSingleObject.argtypes = [handle, dword]
     k.GetNamedPipeClientProcessId.restype = bool_
     k.GetNamedPipeClientProcessId.argtypes = [handle, ctypes.POINTER(wintypes.ULONG)]
     k.OpenProcess.restype = handle
@@ -3144,10 +3172,13 @@ class WorkerPipe:
         self._shut = False
         self._pending = 0
 
-    def _io(self, start: Callable[[Any], bool], operation: str) -> int:
+    def _io(
+        self, start: Callable[[Any], bool], operation: str, deadline: float | None = None
+    ) -> int:
         """One overlapped call, to completion: the byte count, or -1 when the
-        pipe is gone or shut down.  Issued under the lock that shutdown
-        takes, so nothing can start after CancelIoEx and wait forever."""
+        pipe is gone, shut down, or ``deadline`` (monotonic) passed first.
+        Issued under the lock that shutdown takes, so nothing can start after
+        CancelIoEx and wait forever."""
         event = self._k.CreateEventW(None, True, False, None)
         if not event:
             raise _Win32Failure(_last_win_error(), operation, "CreateEventW")
@@ -3170,6 +3201,12 @@ class WorkerPipe:
                     return -1
                 if error not in (0, _ERROR_IO_PENDING):
                     raise _Win32Failure(error, operation)
+                if deadline is not None:
+                    wait_ms = max(0, int((deadline - time.monotonic()) * 1000))
+                    if self._k.WaitForSingleObject(event, wait_ms) != _WAIT_OBJECT_0:
+                        # Cancel it; GetOverlappedResult below then reports the
+                        # abort once the operation has really stopped.
+                        self._k.CancelIoEx(self._handle, ctypes.byref(overlapped))
                 done = wintypes.DWORD()
                 if not self._k.GetOverlappedResult(
                     self._handle, ctypes.byref(overlapped), ctypes.byref(done), True
@@ -3186,10 +3223,23 @@ class WorkerPipe:
         finally:
             self._k.CloseHandle(event)
 
-    def accept(self, job: Any) -> bool:
-        """Wait for a client of ``job``; False once shut down."""
+    def accept(self, job: Any, timeout: float | None = None) -> bool:
+        """Wait for a client of ``job``; False once shut down or ``timeout``
+        seconds have passed.
+
+        A process of a sibling request (same SID, other job) that keeps
+        reconnecting is dropped each time but can hold the only instance for
+        a moment each round, delaying our own client until ``timeout``: a
+        denial of service against that one request, never access to it.
+        """
+        deadline = None if timeout is None else time.monotonic() + timeout
         while True:
-            if self._io(lambda ov: self._k.ConnectNamedPipe(self._handle, ov), "connect_worker_pipe") < 0:
+            connected = self._io(
+                lambda ov: self._k.ConnectNamedPipe(self._handle, ov),
+                "connect_worker_pipe",
+                deadline,
+            )
+            if connected < 0:
                 return False
             if self._client_in_job(job):
                 return True

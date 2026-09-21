@@ -145,23 +145,47 @@ def test_the_contained_marker_is_bound_from_the_environment(tmp_path: Path) -> N
     assert w.load_context_from_env(env).contained_worker == "windows_appcontainer"
 
 
-@pytest.mark.skipif(os.name != "nt", reason="the shim is Windows PowerShell")
-def test_appcontainer_bridge_moves_the_real_server_to_the_host(tmp_path: Path) -> None:
+def _generated_runtime(tmp_path: Path, **extra):
     home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    contract = home / "task_mcp_worker_contract.json"
+    contract.write_text('{"validation": ["pytest"]}', encoding="utf-8")
     runtime = w.generate_worker_mcp_runtime(
         home=home, request_id="req1", task_id="T", runner="r", topic="t",
         repo=tmp_path, authority_repo=tmp_path, source_graph_targets=[],
         session_topic="s", package_import_root=tmp_path, python_executable="py.exe",
+        contract_packet_path=contract, **extra,
     )
+    return home, contract, runtime
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the shim is Windows PowerShell")
+def test_appcontainer_bridge_moves_the_real_server_to_the_host(tmp_path: Path) -> None:
+    home, contract, runtime = _generated_runtime(tmp_path)
     config_path, bridge = w.appcontainer_mcp_bridge(
         runtime, request_id="req1", home=home, stderr_path=tmp_path / "mcp.err"
     )
     real = json.loads(runtime.claude_mcp_config_path.read_text(encoding="utf-8"))
     server = real["mcpServers"][w.SERVER_NAME]
-    # The supervisor runs exactly the server the generated config named ...
+    runtime_dir = runtime.audit_ledger_path.parent.resolve()
+    # The supervisor runs exactly the server the generated config named, from
+    # the private runtime directory ...
     assert bridge["command"] == server["command"] == "py.exe"
     assert bridge["args"] == server["args"]
-    assert bridge["env"] == {**server["env"], w.ENV_CONTAINED_WORKER: "windows_appcontainer"}
+    assert bridge["cwd"] == str(runtime_dir)
+    # ... bound to a PRIVATE copy of the exit contract the container could
+    # otherwise rewrite in HOME, and to nothing else outside that directory.
+    private_contract = Path(bridge["env"][w.ENV_CONTRACT_PACKET_PATH])
+    assert private_contract.parent == runtime_dir
+    assert private_contract.read_bytes() == contract.read_bytes()
+    assert bridge["env"] == {
+        **server["env"],
+        w.ENV_CONTAINED_WORKER: "windows_appcontainer",
+        w.ENV_CONTRACT_PACKET_PATH: str(private_contract),
+    }
+    for key in w.APPCONTAINER_BRIDGE_AUTHORITY_FILES:
+        if key in bridge["env"]:
+            assert Path(bridge["env"][key]).resolve().parent == runtime_dir, key
     # ... the contained CLI gets only the pipe shim, outside the runtime dir,
     # with no environment -- the audit key path included -- at all ...
     assert config_path == home / w.APPCONTAINER_BRIDGE_CONFIG_NAME
@@ -170,8 +194,74 @@ def test_appcontainer_bridge_moves_the_real_server_to_the_host(tmp_path: Path) -
     assert "env" not in shim
     assert bridge["pipe"].startswith("\\\\.\\pipe\\aiworkhub-worker-req1-")
     # ... and the directory holding the key and ledger stays closed to it.
-    assert bridge["withheld_directories"] == [str(runtime.audit_ledger_path.parent)]
+    assert bridge["withheld_directories"] == [str(runtime_dir)]
     assert runtime.audit_hmac_key_path.parent == runtime.audit_ledger_path.parent
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the shim is Windows PowerShell")
+def test_appcontainer_bridge_refuses_an_authority_file_the_container_could_write(
+    tmp_path: Path,
+) -> None:
+    home, _contract, _runtime = _generated_runtime(tmp_path)
+    overlay = home / "rework_overlay.json"  # HOME root: container-writable
+    overlay.write_text("{}", encoding="utf-8")
+    _home, _contract, runtime = _generated_runtime(tmp_path, rework_overlay_path=overlay)
+    with pytest.raises(w.WorkerToolError, match="authority_file_not_private"):
+        w.appcontainer_mcp_bridge(
+            runtime, request_id="req1", home=home, stderr_path=tmp_path / "mcp.err"
+        )
+
+
+def _overlay_packet(relative: str, content: bytes) -> dict:
+    import base64
+
+    return {"files": [{
+        "path": relative,
+        "sha256": hashlib.sha256(content).hexdigest(),
+        "content_base64": base64.b64encode(content).decode("ascii"),
+    }]}
+
+
+def test_rework_overlay_materializes_into_new_directories(tmp_path: Path) -> None:
+    worktree = _worktree(tmp_path)
+    packet = _overlay_packet("src/new/deep/mod.py", b"x = 1\n")
+    assert w.materialize_rework_overlay_sealed_files(worktree, packet) == ["src/new/deep/mod.py"]
+    assert (worktree / "src" / "new" / "deep" / "mod.py").read_bytes() == b"x = 1\n"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="directory junctions are Windows")
+@pytest.mark.parametrize("target", ["outside", "inside"])
+def test_rework_overlay_never_writes_through_a_junction(tmp_path: Path, target: str) -> None:
+    import _winapi
+
+    worktree = _worktree(tmp_path)
+    (worktree / "src" / "real").mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    _winapi.CreateJunction(
+        str(outside if target == "outside" else worktree / "src" / "real"),
+        str(worktree / "src" / "pkg"),
+    )
+    with pytest.raises(w.WorkerToolError, match="rework_overlay_path_(escapes|unsafe)"):
+        w.materialize_rework_overlay_sealed_files(
+            worktree, _overlay_packet("src/pkg/mod.py", b"x = 1\n")
+        )
+    assert list(outside.iterdir()) == [] and list((worktree / "src" / "real").iterdir()) == []
+
+
+@pytest.mark.skipif(os.name != "nt", reason="reads a real Windows DACL")
+def test_the_runtime_directory_the_bridge_withholds_is_really_protected(
+    tmp_path: Path,
+) -> None:
+    """The withheld check fails closed on an unprotected directory; this pins
+    that the production provisioning keeps creating a protected one (Python
+    3.12.4+ gives mkdir(mode=0o700) an owner-only, protected DACL)."""
+    from aiworkhub import windows_appcontainer
+
+    _home, _contract, runtime = _generated_runtime(tmp_path)
+    assert windows_appcontainer._load_win32().dacl_protected(
+        str(runtime.audit_ledger_path.parent)
+    )
 
 
 # ---------------------------------------------------------------------------

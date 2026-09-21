@@ -157,45 +157,116 @@ def _open_0600(path: Path) -> BinaryIO:
     return os.fdopen(fd, "a+b", buffering=0)
 
 
+# How long a bridge waits for its worker's MCP client; claude connects during
+# its own startup, seconds after launch.
+_BRIDGE_ACCEPT_SECONDS = 120.0
+# The server's actual import path, printed by the same interpreter, flags,
+# environment and working directory the server itself gets.
+_SYS_PATH_PROBE = "import json,sys;sys.stdout.write(json.dumps(sys.path))"
+
+
+def _within_any(path: str, roots: Any) -> bool:
+    key = os.path.normcase(os.path.normpath(os.path.abspath(path)))
+    return any(
+        (key + os.sep).startswith(os.path.normcase(os.path.normpath(root)).rstrip(os.sep) + os.sep)
+        for root in roots
+    )
+
+
 class _WorkerMcpBridge:
     """The host side of an AppContainer worker's MCP connection (NF-2026-00034).
 
     The worker MCP server holds the request's audit key, reads canonical
     repository state and applies edits under its own authority checks, so it
-    runs here -- the supervisor's own child, outside the container -- with
-    exactly the command, arguments and environment its generated config
-    names.  The contained worker reaches it only through ``pipe``: one
-    connection, from a process of this launch's ``job``, relayed byte for
-    byte.  The server gets its own kill-on-close job, so neither close() nor
-    a killed supervisor can leave it behind.
+    runs here -- the supervisor's own child, outside the container -- with the
+    command, arguments and binding environment its generated config names.
+    The contained worker reaches it only through ``pipe``: one connection,
+    from a process of this launch's ``job``, relayed byte for byte.  The
+    server gets its own kill-on-close job, so neither close() nor a killed
+    supervisor can leave it behind.
+
+    Nothing the container can write may decide what this host process runs,
+    because the model writes there first and connects second.  So the server
+    runs from a directory the container cannot write (``bridge["cwd"]``), as
+    ``python -P -s`` with PYTHONSAFEPATH and PYTHONNOUSERSITE, no inherited
+    PYTHON* variable, and no inherited variable naming a container-writable
+    path; HOME and the temp variables point at that private directory.  Its
+    real ``sys.path`` is probed before it starts, and a server that would
+    import from anywhere the container can write is never started.
     """
 
     def __init__(
         self,
         pipe: Any,
-        job: Any,
         bridge: dict[str, Any],
-        cwd: str,
+        writable_roots: Any,
         *,
         popen: Callable[..., Any] = subprocess.Popen,
         server_job: Callable[[], Any] = _WindowsKillOnCloseJob,
+        run: Callable[..., Any] = subprocess.run,
     ) -> None:
+        withheld = [str(p) for p in bridge.get("withheld_directories") or ()]
+        writable = [str(p) for p in writable_roots]
+
+        def private(path: str) -> bool:
+            return not _within_any(path, writable) or _within_any(path, withheld)
+
+        self._private = private
+        command = str(bridge["command"])
+        self._cwd = str(bridge["cwd"])
+        config_env = {str(k): str(v) for k, v in (bridge.get("env") or {}).items()}
+        pythonpath = [p for p in config_env.get("PYTHONPATH", "").split(os.pathsep) if p]
+        for path in (command, self._cwd, *pythonpath):
+            if not os.path.isabs(path) or not private(path):
+                raise ValueError(f"worker_mcp_bridge_input_container_writable:{path}")
+        env: dict[str, str] = {}
+        for key, value in os.environ.items():
+            if key.upper().startswith("PYTHON") or key.upper() in ("HOMEDRIVE", "HOMEPATH"):
+                continue
+            kept = [
+                part for part in value.split(os.pathsep)
+                if not (os.path.isabs(part) and not private(part))
+            ]
+            if kept:
+                env[key] = os.pathsep.join(kept)
+        for key in ("HOME", "USERPROFILE", "TMP", "TEMP", "TMPDIR"):
+            env[key] = self._cwd
+        env.update(config_env)
+        env.update(PYTHONSAFEPATH="1", PYTHONNOUSERSITE="1", PYTHONUNBUFFERED="1")
+        self._env = env
+        self._command = command
+        self._argv = [command, "-P", "-s", *(str(a) for a in bridge.get("args") or ())]
         self._pipe = pipe
-        self._job = job
-        self._argv = [str(bridge["command"]), *(str(a) for a in bridge.get("args") or ())]
-        self._env = {**os.environ, **{str(k): str(v) for k, v in (bridge.get("env") or {}).items()}}
-        self._cwd = cwd
+        self._job: Any = None
         self._stderr_path = Path(str(bridge["stderr_path"]))
         self._popen = popen
+        self._run = run
         self._server_job_factory = server_job
         self._lock = threading.Lock()
         self._closed = False
         self._threads: list[threading.Thread] = []
         self.server: Any = None
         self._server_job: Any = None
+        self.sys_path: list[str] = []
         self.error = ""
 
-    def start(self) -> None:
+    def host_sys_path(self) -> list[str]:
+        """The import path the server would run with; raises if any entry is
+        a directory the container can write."""
+        probe = self._run(
+            [self._command, "-P", "-s", "-c", _SYS_PATH_PROBE],
+            cwd=self._cwd, env=self._env, shell=False, stdin=subprocess.DEVNULL,
+            capture_output=True, timeout=60, check=True,
+        )
+        entries = [str(entry) for entry in json.loads(probe.stdout)]
+        exposed = [entry for entry in entries if entry and not self._private(entry)]
+        if exposed or "" in entries:
+            raise ValueError(f"worker_mcp_server_sys_path_container_writable:{exposed or ['']}")
+        return entries
+
+    def start(self, job: Any) -> None:
+        """Serve the first client of ``job``, the worker's own job object."""
+        self._job = job
         self._thread(self._serve)
 
     def _thread(self, target: Callable[..., None], *args: Any) -> None:
@@ -206,12 +277,17 @@ class _WorkerMcpBridge:
     def _serve(self) -> None:
         server = None
         try:
-            if not self._pipe.accept(self._job):
+            if not self._pipe.accept(self._job, timeout=_BRIDGE_ACCEPT_SECONDS):
                 return
             with self._lock:
                 if self._closed:
                     return
+                self.sys_path = self.host_sys_path()
                 with _open_0600(self._stderr_path) as stderr:
+                    stderr.write(
+                        ("aiworkhub_worker_mcp_bridge host_sys_path="
+                         + json.dumps(self.sys_path) + "\n").encode("utf-8")
+                    )
                     server = self._popen(
                         self._argv, cwd=self._cwd, env=self._env, shell=False,
                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr,
@@ -513,11 +589,17 @@ def _launch_appcontainer_process(
         os.set_inheritable(stdout_write, True)
         os.set_inheritable(stderr_write, True)
         environment = os.environ.copy()
+        grants = _worker_filesystem_grants(argv, cwd, environment)
         if bridge_spec is not None:
             # The pipe exists before the worker does, so its MCP shim finds it.
             pipe = windows_appcontainer.WorkerPipe(
                 str(bridge_spec["pipe"]),
                 windows_appcontainer.container_sid(repo_id, worker_kind),
+            )
+            # Checked before the worker exists: every input the host server
+            # starts from must lie outside what the container can write.
+            bridge = _WorkerMcpBridge(
+                pipe, bridge_spec, [g.path for g in grants if g.access == "modify"]
             )
         request = windows_appcontainer.AppContainerRequest(
             argv=_native_worker_argv(argv),
@@ -529,15 +611,14 @@ def _launch_appcontainer_process(
             stdout_handle=_native_handle(stdout_write),
             stderr_handle=_native_handle(stderr_write),
             capability_sids=WORKER_NETWORK_CAPABILITIES,
-            filesystem_grants=_worker_filesystem_grants(argv, cwd, environment),
+            filesystem_grants=grants,
             withheld_directories=tuple(
                 str(path) for path in (bridge_spec or {}).get("withheld_directories") or ()
             ),
         )
         launch = windows_appcontainer.launch_appcontainer(request)
-        if pipe is not None:
-            bridge = _WorkerMcpBridge(pipe, launch.job, bridge_spec or {}, cwd)
-            bridge.start()
+        if bridge is not None:
+            bridge.start(launch.job)
         os.close(stdout_write)
         os.close(stderr_write)
         return _AppContainerProcess(

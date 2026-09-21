@@ -7763,8 +7763,11 @@ def _interpreter_authority_receipt(
 
 
 def _normalize_validation_interpreter_argv(
-    workspace: WorkerWorkspace, argv: list[str]
+    workspace: WorkerWorkspace, argv: list[str], *, workspace_local: bool = True
 ) -> tuple[list[str], dict[str, Any] | None]:
+    """``workspace_local=False`` (the AppContainer lane, NF-2026-00034) never
+    resolves the interpreter inside the worktree the worker could write: the
+    container's persistent grants follow that interpreter's pyvenv.cfg."""
     if not argv:
         return [], None
     spelling = _recognized_venv_python_spelling(argv[0])
@@ -7772,7 +7775,7 @@ def _normalize_validation_interpreter_argv(
         return list(argv), None
     relative = Path(*PurePosixPath(spelling).parts)
     local = workspace.path / relative
-    if local.exists() or local.is_symlink():
+    if workspace_local and (local.exists() or local.is_symlink()):
         endpoint = _verify_validation_interpreter(local, workspace.path)
         return [str(endpoint), *argv[1:]], _interpreter_authority_receipt(
             declared=argv[0],
@@ -12111,11 +12114,14 @@ def _run_appcontainer_validation(
         ContainerGrant(str(workspace.path), "read_execute"),
         *request_scoped_grants(env),
     ]
-    request_grants += python_read_grants(
-        str(argv[0]) if argv else "",
-        str(env.get("PYTHONPATH") or ""),
-        covered=[grant.path for grant in request_grants],
-    )
+    try:
+        request_grants += python_read_grants(
+            str(argv[0]) if argv else "",
+            str(env.get("PYTHONPATH") or ""),
+            covered=[grant.path for grant in request_grants],
+        )
+    except AppContainerError as exc:
+        raise OSError(f"windows_appcontainer_validation_launch_failed:{exc}") from exc
 
     stdout_read, stdout_write = os.pipe()
     stderr_read, stderr_write = os.pipe()
@@ -12352,9 +12358,14 @@ def run_validations(
                 cd_relative,
             ) = _parse_validation_command_detailed(command)
             declared_argv = list(tokens)
-            tokens, interpreter_authority = _normalize_validation_interpreter_argv(
-                workspace, tokens
-            )
+            if selected_backend == WINDOWS_APPCONTAINER_BACKEND:
+                tokens, interpreter_authority = _normalize_validation_interpreter_argv(
+                    workspace, tokens, workspace_local=False
+                )
+            else:
+                tokens, interpreter_authority = _normalize_validation_interpreter_argv(
+                    workspace, tokens
+                )
             candidate_authority = python_candidate_authority(workspace)
             effective_components = pythonpath_components
             if _is_candidate_pytest_wrapper_command(tokens):

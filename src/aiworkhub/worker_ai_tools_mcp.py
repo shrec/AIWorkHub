@@ -3348,23 +3348,31 @@ def materialize_rework_overlay_sealed_files(
         if candidate.exists() and not candidate.is_file():
             raise WorkerToolError(f"rework_overlay_path_not_file:{relative}")
         expected = str(entry["sha256"])
-        if candidate.is_file():
-            observed = hashlib.sha256(candidate.read_bytes()).hexdigest()
-            _admit_rework_overlay_observation(
-                relative=relative,
-                expected_hash=expected,
-                observed_hash=observed,
-                has_sealed=True,
-                allowed_writes=allowed_writes,
-            )
-            continue
-        candidate.parent.mkdir(parents=True, exist_ok=True)
-        tmp = candidate.parent / f".{candidate.name}.{secrets.token_hex(8)}.tmp"
+        # Held (semantic_edit.held_path): this may run on the host for a
+        # contained worker, whose tree could otherwise redirect the write.
         try:
-            tmp.write_bytes(content)
-            os.replace(tmp, candidate)
-        finally:
-            tmp.unlink(missing_ok=True)
+            with semantic_edit.held_path(
+                repo_root, relative, include_file=False, create_directories=True
+            ) as held:
+                if held.is_file():
+                    with semantic_edit.held_path(repo_root, relative):
+                        observed = hashlib.sha256(held.read_bytes()).hexdigest()
+                    _admit_rework_overlay_observation(
+                        relative=relative,
+                        expected_hash=expected,
+                        observed_hash=observed,
+                        has_sealed=True,
+                        allowed_writes=allowed_writes,
+                    )
+                    continue
+                tmp = held.parent / f".{held.name}.{secrets.token_hex(8)}.tmp"
+                try:
+                    tmp.write_bytes(content)
+                    os.replace(tmp, held)
+                finally:
+                    tmp.unlink(missing_ok=True)
+        except semantic_edit.SemanticEditError as exc:
+            raise WorkerToolError(f"rework_overlay_path_unsafe:{relative}:{exc}") from exc
         written.append(relative)
     return written
 
@@ -8221,6 +8229,14 @@ def generate_worker_mcp_runtime(
 
 
 APPCONTAINER_BRIDGE_CONFIG_NAME = "worker_mcp_bridge.json"
+# Every binding that names a file the server reads or writes for authority.
+APPCONTAINER_BRIDGE_AUTHORITY_FILES: tuple[str, ...] = (
+    ENV_AUDIT_LEDGER_PATH,
+    ENV_AUDIT_HMAC_KEY_PATH,
+    ENV_CONTRACT_PACKET_PATH,
+    ENV_QUALITY_REVIEW_PACKET_PATH,
+    ENV_REWORK_OVERLAY_PATH,
+)
 
 
 def appcontainer_mcp_bridge(
@@ -8236,12 +8252,31 @@ def appcontainer_mcp_bridge(
     now starts on the host, marked contained so it executes nothing.  The
     runtime directory, which holds the audit key and ledger the worker never
     needs once the server lives outside, is withheld from the container.
+
+    Every file the host server reads for authority must be one the container
+    cannot alter, so each lives in that withheld directory: the audit key and
+    ledger, the review packet and the rework overlay already do, and the
+    exit-contract packet -- sealed into the container-writable HOME root --
+    is copied there now, before the worker exists, and the server bound to
+    the copy.  Any other placement fails closed.  The server also runs FROM
+    that directory (``cwd``), never from the worker's worktree.
     """
 
     from . import windows_appcontainer
 
+    runtime_dir = runtime.audit_ledger_path.parent.resolve()
     real = json.loads(runtime.claude_mcp_config_path.read_text(encoding="utf-8"))
     server = real["mcpServers"][SERVER_NAME]
+    env = {**server["env"], ENV_CONTAINED_WORKER: "windows_appcontainer"}
+    sealed = env.get(ENV_CONTRACT_PACKET_PATH)
+    if sealed:
+        private_copy = runtime_dir / Path(sealed).name
+        private_copy.write_bytes(Path(sealed).read_bytes())
+        env[ENV_CONTRACT_PACKET_PATH] = str(private_copy)
+    for key in APPCONTAINER_BRIDGE_AUTHORITY_FILES:
+        value = env.get(key)
+        if value and Path(value).resolve().parent != runtime_dir:
+            raise WorkerToolError(f"appcontainer_bridge_authority_file_not_private:{key}")
     pipe = windows_appcontainer.new_worker_pipe_name(request_id)
     shim = windows_appcontainer.worker_pipe_shim_argv(pipe)
     config_path = home / APPCONTAINER_BRIDGE_CONFIG_NAME
@@ -8252,9 +8287,10 @@ def appcontainer_mcp_bridge(
         "pipe": pipe,
         "command": str(server["command"]),
         "args": [str(arg) for arg in server["args"]],
-        "env": {**server["env"], ENV_CONTAINED_WORKER: "windows_appcontainer"},
+        "env": env,
+        "cwd": str(runtime_dir),
         "stderr_path": str(stderr_path),
-        "withheld_directories": [str(runtime.audit_ledger_path.parent)],
+        "withheld_directories": [str(runtime_dir)],
     }
 
 

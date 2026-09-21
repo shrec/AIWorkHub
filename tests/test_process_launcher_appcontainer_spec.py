@@ -866,11 +866,14 @@ def _patch_bridge_seams(monkeypatch):
     bridges: list[dict] = []
 
     class _RecordingBridge:
-        def __init__(self, pipe, job, spec, cwd) -> None:
-            self.record = {"pipe": pipe, "job": job, "spec": spec, "cwd": cwd, "events": []}
+        def __init__(self, pipe, spec, writable_roots) -> None:
+            self.record = {
+                "pipe": pipe, "spec": spec, "writable": list(writable_roots), "events": [],
+            }
             bridges.append(self.record)
 
-        def start(self) -> None:
+        def start(self, job) -> None:
+            self.record["job"] = job
             self.record["events"].append("start")
 
         def close(self) -> None:
@@ -930,6 +933,10 @@ def test_supervisor_bridges_the_worker_mcp_and_ends_it_with_the_worker(
     (bridge,) = bridges
     assert bridge["pipe"] is pipe and bridge["job"] == "the-launch-job"
     assert bridge["events"] == ["start", "close"]
+    # What the container can write: exactly the request's modify grants.
+    assert bridge["writable"] == [
+        g.path for g in launches[0].filesystem_grants if g.access == "modify"
+    ]
     assert launch.close_count == 1
 
 
@@ -952,8 +959,9 @@ def test_supervisor_removes_the_pipe_when_the_launch_fails(monkeypatch, tmp_path
     )
     assert code == 126
     assert statuses[-1]["state"] == "spawn_failed"
-    assert [pipe.closed for pipe in _RecordingPipe.instances] == [1]
-    assert bridges == []
+    # The bridge owns the pipe from construction; it is closed, never started.
+    (bridge,) = bridges
+    assert bridge["events"] == ["close"]
 
 
 def test_supervisor_without_a_bridge_spec_opens_no_pipe(monkeypatch, tmp_path) -> None:
@@ -1365,6 +1373,84 @@ def test_appcontainer_validation_python_gets_its_interpreter_read_only_and_no_ne
         grant(str(venv / "Lib" / "site-packages"), "read_execute", persistent=True),
         grant(str(base), "read_execute", persistent=True),
     ]
+
+
+def _planted_and_canonical_venvs(tmp_path: Path):
+    """The review's steering attack, laid out: the worker planted
+    ``<worktree>\\.venv`` whose ``home =`` names a sibling request's worktree;
+    the canonical repository has its own venv."""
+    worktree, repo = tmp_path / "wt", tmp_path / "repo"
+    target = tmp_path / "sibling_request_worktree"
+    target.mkdir()
+    for root, home in ((worktree, target), (repo, tmp_path / "Python312")):
+        (root / ".venv" / "Scripts").mkdir(parents=True)
+        (root / ".venv" / "Scripts" / "python.exe").write_bytes(b"MZ")
+        (root / ".venv" / "pyvenv.cfg").write_text(f"home = {home}\n", encoding="utf-8")
+    return worktree, repo, target
+
+
+def test_the_appcontainer_lane_never_resolves_the_worktree_interpreter(tmp_path: Path) -> None:
+    worktree, repo, _target = _planted_and_canonical_venvs(tmp_path)
+    workspace = SimpleNamespace(path=worktree, repo=repo)
+    declared = [".venv/Scripts/python.exe", "-m", "pytest"]
+
+    local, _ = worker_workspace._normalize_validation_interpreter_argv(workspace, declared)
+    assert Path(local[0]).parent.parent.parent == worktree.resolve()  # other lanes: unchanged
+    contained, receipt = worker_workspace._normalize_validation_interpreter_argv(
+        workspace, declared, workspace_local=False
+    )
+    assert Path(contained[0]) == (repo / ".venv" / "Scripts" / "python.exe").absolute()
+    assert receipt["source"] == "canonical_repository"
+
+
+def test_run_validations_resolves_appcontainer_interpreters_outside_the_worktree(
+    tmp_path: Path, monkeypatch
+) -> None:
+    seen: list[dict] = []
+
+    class _Stop(Exception):
+        pass
+
+    def _record(workspace, argv, **kwargs):
+        seen.append(kwargs)
+        raise _Stop
+
+    monkeypatch.setattr(worker_workspace, "_normalize_validation_interpreter_argv", _record)
+    monkeypatch.setattr(worker_workspace, "provision_validation_exec_scratch", lambda _ws: tmp_path)
+    workspace = SimpleNamespace(path=tmp_path, repo=tmp_path, home=tmp_path)
+    with pytest.raises(_Stop):
+        worker_workspace.run_validations(
+            workspace, [".venv/Scripts/python.exe -m pytest -q"],
+            backend="windows_appcontainer", adapter_id="claude_cli",
+        )
+    assert seen == [{"workspace_local": False}]
+
+
+def test_a_planted_venv_steers_no_persistent_grant(
+    tmp_path: Path, monkeypatch, identity_osfhandle
+) -> None:
+    """Belt and braces: even handed the planted interpreter, the lane refuses
+    before any grant or launch."""
+    worktree, _repo, _target = _planted_and_canonical_venvs(tmp_path)
+    launches: list[_FakeValidationLaunch] = []
+    _stub_repo_id(monkeypatch)
+    _install_fake_launch(
+        monkeypatch, stdout=b"", stderr=b"",
+        outcome=windows_appcontainer.AppContainerLifecycleResult(
+            windows_appcontainer.AppContainerLifecycleState.EXITED, exit_code=0
+        ),
+        sink=launches,
+    )
+    with pytest.raises(OSError, match="windows_appcontainer_validation_launch_failed"):
+        worker_workspace._run_appcontainer_validation(
+            [str(worktree / ".venv" / "Scripts" / "python.exe"), "-m", "pytest"],
+            workspace=SimpleNamespace(repo=tmp_path, path=worktree, home=tmp_path / "home"),
+            adapter_id="claude_cli",
+            cwd=worktree,
+            env={"TMP": str(tmp_path / "scratch")},
+            timeout_seconds=30,
+        )
+    assert launches == []
 
 
 def test_appcontainer_validation_timeout_carries_partial_output(

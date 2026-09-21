@@ -2677,6 +2677,32 @@ def test_a_plain_interpreter_needs_its_install_root_and_anything_else_nothing(tm
     assert wac.python_read_grants(str(tmp_path / "ruff.exe")) == []
 
 
+@pytest.mark.parametrize("planted", ["venv", "home", "plain"])
+def test_an_interpreter_the_container_can_write_is_never_granted(tmp_path, planted):
+    """The review's steering attack: a worker plants ``.venv`` in its own
+    worktree with ``home =`` naming a directory it wants a PERSISTENT grant
+    on (another repo, a sibling request's worktree)."""
+    worktree, target = tmp_path / "wt", tmp_path / "sibling_request_worktree"
+    worktree.mkdir()
+    target.mkdir()
+    base, venv = _venv(tmp_path)
+    if planted == "venv":
+        venv = worktree / ".venv"
+        (venv / "Scripts").mkdir(parents=True)
+        (venv / "Scripts" / "python.exe").write_bytes(b"MZ")
+        (venv / "pyvenv.cfg").write_text(f"home = {target}\n", encoding="utf-8")
+        executable = venv / "Scripts" / "python.exe"
+    elif planted == "home":
+        (venv / "pyvenv.cfg").write_text(f"home = {worktree}\n", encoding="utf-8")
+        executable = venv / "Scripts" / "python.exe"
+    else:
+        (worktree / "python.exe").write_bytes(b"MZ")
+        executable = worktree / "python.exe"
+    with pytest.raises(AppContainerError) as excinfo:
+        wac.python_read_grants(str(executable), covered=[str(worktree)])
+    assert excinfo.value.reason is AppContainerReason.INVALID_REQUEST
+
+
 def test_the_python_read_set_passes_grant_validation(tmp_path):
     base, venv = _venv(tmp_path)
     fake = FakeWin32Api()
@@ -2809,6 +2835,17 @@ def test_worker_pipe_serves_only_a_client_of_the_job_and_leaves_nothing(tmp_path
 
 
 @pytest.mark.skipif(os.name != "nt", reason="real named pipe")
+def test_worker_pipe_accept_gives_up_at_its_timeout():
+    import time
+
+    pipe = wac.WorkerPipe(wac.new_worker_pipe_name("pytest"), _CONTAINER)
+    started = time.monotonic()
+    assert pipe.accept(0, timeout=0.3) is False
+    assert 0.2 < time.monotonic() - started < 5
+    assert pipe.close()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="real named pipe")
 def test_worker_pipe_shutdown_releases_a_waiting_accept():
     import threading
 
@@ -2860,6 +2897,16 @@ def _ace(sid, flags, mask=_RX, ace_type=0):
         ([_ace(_AAP, 0x03, ace_type=1)], 0x3, ""),  # a deny ACE grants nothing
         ([_ace(_SID, 0x13)], 0x3, ""),  # this SID's ACE, but only inherited
         ([], 0x3, ""),
+        # Stored order decides, as in the kernel: a deny first wins ...
+        ([_ace(_SID, 0x03, mask=0x1, ace_type=1), _ace(_AAP, 0x03)], 0x3, ""),
+        ([_ace(_AAP, 0x13, mask=0x20, ace_type=1), _ace(_AAP, 0x03)], 0x3, ""),
+        # ... an allow before it has already granted the bits ...
+        ([_ace(_AAP, 0x03), _ace(_SID, 0x03, ace_type=1)], 0x3, "all_application_packages"),
+        # ... and a deny for someone else, or for other bits, is not relevant.
+        ([_ace(b"\x01\x01" + b"\x00" * 10, 0x03, ace_type=1), _ace(_AAP, 0x03)], 0x3,
+         "all_application_packages"),
+        ([_ace(_SID, 0x03, mask=0x40000, ace_type=1), _ace(_AAP, 0x03)], 0x3,
+         "all_application_packages"),
     ],
 )
 def test_satisfying_trustee(aces, inherit, expected):

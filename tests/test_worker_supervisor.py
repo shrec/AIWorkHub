@@ -779,8 +779,9 @@ class _FakePipe:
         self.shut = False
         self.closed = 0
 
-    def accept(self, job):
+    def accept(self, job, timeout=None):
         self.accepted.append(job)
+        self.accept_timeout = timeout
         while not self._accept and not self.shut:
             time.sleep(0.01)
         return self._accept and not self.shut
@@ -836,11 +837,14 @@ _ECHO_SERVER = (
 )
 
 
-def _bridge(tmp_path: Path, pipe: _FakePipe, jobs: list, **bridge):
+def _bridge(tmp_path: Path, pipe: _FakePipe, jobs: list, *, writable=(), **bridge):
+    private = tmp_path / "private"
+    private.mkdir(exist_ok=True)
     spec = {
         "command": sys.executable,
         "args": ["-c", _ECHO_SERVER],
         "env": {"BRIDGE_PROBE": "bound-env"},
+        "cwd": str(private),
         "stderr_path": str(tmp_path / "worker-mcp.stderr.log"),
         **bridge,
     }
@@ -849,9 +853,7 @@ def _bridge(tmp_path: Path, pipe: _FakePipe, jobs: list, **bridge):
         jobs.append(_FakeServerJob())
         return jobs[-1]
 
-    return worker_supervisor._WorkerMcpBridge(
-        pipe, "launch-job", spec, str(tmp_path), server_job=_job
-    )
+    return worker_supervisor._WorkerMcpBridge(pipe, spec, list(writable), server_job=_job)
 
 
 def _wait_until(predicate, timeout: float = 20.0) -> None:
@@ -866,7 +868,7 @@ def test_bridge_serves_one_client_of_the_job_and_tears_everything_down(
 ) -> None:
     pipe, jobs = _FakePipe(), []
     bridge = _bridge(tmp_path, pipe, jobs)
-    bridge.start()
+    bridge.start("launch-job")
     pipe.feed(b'{"jsonrpc":"2.0","id":1,"method":"initialize"}\n')
     _wait_until(lambda: b'"id":1' in pipe.written)
 
@@ -888,7 +890,7 @@ def test_bridge_serves_one_client_of_the_job_and_tears_everything_down(
 def test_bridge_client_eof_lets_the_server_exit_and_closes_the_pipe(tmp_path: Path) -> None:
     pipe, jobs = _FakePipe(), []
     bridge = _bridge(tmp_path, pipe, jobs)
-    bridge.start()
+    bridge.start("launch-job")
     _wait_until(lambda: bridge.server is not None)
     pipe.feed(b"")  # the contained client hung up
     _wait_until(lambda: bridge.server.poll() is not None and pipe.closed >= 1)
@@ -899,22 +901,134 @@ def test_bridge_client_eof_lets_the_server_exit_and_closes_the_pipe(tmp_path: Pa
 def test_bridge_that_is_never_connected_starts_no_server(tmp_path: Path) -> None:
     pipe, jobs = _FakePipe(accept=False), []
     bridge = _bridge(tmp_path, pipe, jobs)
-    bridge.start()
+    bridge.start("launch-job")
     time.sleep(0.1)
     bridge.close()
     assert bridge.server is None and jobs == []
     assert pipe.closed >= 1
 
 
+def test_a_bridge_closed_before_it_starts_removes_its_pipe(tmp_path: Path) -> None:
+    pipe = _FakePipe()
+    _bridge(tmp_path, pipe, []).close()
+    assert pipe.closed == 1 and pipe.accepted == []
+
+
 def test_bridge_server_that_cannot_start_leaves_nothing_behind(tmp_path: Path) -> None:
     pipe, jobs = _FakePipe(), []
     bridge = _bridge(tmp_path, pipe, jobs, command=str(tmp_path / "missing.exe"))
-    bridge.start()
+    bridge.start("launch-job")
     # The waiting client is let go at once instead of at worker exit.
     _wait_until(lambda: bridge.error != "" and pipe.closed >= 1)
     bridge.close()
     assert bridge.server is None and jobs == []
     assert "FileNotFoundError" in bridge.error or "OSError" in bridge.error
+
+
+_PLANT_PROBE = (
+    "import sys\n"
+    "try:\n"
+    "    import aiworkhub_planted\n"
+    "    print('PLANTED', flush=True)\n"
+    "except ImportError:\n"
+    "    print('clean', flush=True)\n"
+    "print(repr(sys.path), flush=True)\n"
+)
+
+
+def test_the_host_server_never_imports_what_the_container_can_write(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The review's attack: the model writes a module into its worktree,
+    then connects -- the host server must not import it, whether through
+    the working directory, PYTHONPATH, PYTHONSTARTUP or the user site."""
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    (worktree / "aiworkhub_planted.py").write_text("print('ran')\n", encoding="utf-8")
+    (worktree / "startup.py").write_text("import aiworkhub_planted\n", encoding="utf-8")
+    monkeypatch.chdir(worktree)  # the supervisor's own cwd is the worktree
+    for key, value in {
+        "PYTHONPATH": str(worktree), "PYTHONSTARTUP": str(worktree / "startup.py"),
+        "PYTHONHOME": str(worktree), "HOME": str(worktree), "USERPROFILE": str(worktree),
+        "APPDATA": str(worktree), "TMP": str(worktree), "TEMP": str(worktree),
+    }.items():
+        monkeypatch.setenv(key, value)
+    pipe, jobs = _FakePipe(), []
+    bridge = _bridge(
+        tmp_path, pipe, jobs, writable=[str(worktree)], args=["-c", _PLANT_PROBE], env={}
+    )
+    private = str(tmp_path / "private")
+
+    # The environment is rebuilt, not inherited.
+    assert bridge._argv[1:3] == ["-P", "-s"]
+    assert {k: bridge._env[k] for k in ("PYTHONSAFEPATH", "PYTHONNOUSERSITE")} == {
+        "PYTHONSAFEPATH": "1", "PYTHONNOUSERSITE": "1",
+    }
+    assert not {"PYTHONPATH", "PYTHONSTARTUP", "PYTHONHOME", "APPDATA"} & set(bridge._env)
+    assert all(bridge._env[k] == private for k in ("HOME", "USERPROFILE", "TMP", "TEMP"))
+    # The real import path has nothing the container can write ...
+    assert not any(
+        str(entry).lower().startswith(str(worktree).lower()) for entry in bridge.host_sys_path()
+    )
+    # ... and the server itself, started for real, does not import the plant.
+    bridge.start("launch-job")
+    _wait_until(lambda: pipe.written.count(b"\n") >= 2)
+    bridge.close()
+    assert pipe.written.startswith(b"clean")
+    assert str(worktree).encode() not in bytes(pipe.written)
+
+
+@pytest.mark.parametrize("field", ["command", "cwd", "pythonpath"])
+def test_a_bridge_input_the_container_can_write_is_refused(tmp_path: Path, field: str) -> None:
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    planted = str(worktree / "x")
+    overrides = {
+        "command": {"command": planted},
+        "cwd": {"cwd": str(worktree)},
+        "pythonpath": {"env": {"PYTHONPATH": planted}},
+    }[field]
+    with pytest.raises(ValueError, match="container_writable"):
+        _bridge(tmp_path, _FakePipe(), [], writable=[str(worktree)], **overrides)
+
+
+def test_the_withheld_directory_is_private_although_inside_home(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    runtime = home / "task_mcp_worker_runtime"
+    runtime.mkdir(parents=True)
+    bridge = _bridge(
+        tmp_path, _FakePipe(), [], writable=[str(home)],
+        cwd=str(runtime), withheld_directories=[str(runtime)],
+    )
+    assert bridge._env["TMP"] == str(runtime)
+
+
+def test_a_server_whose_import_path_reaches_the_container_never_starts(
+    tmp_path: Path,
+) -> None:
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+
+    def _run(*_args, **_kwargs):
+        return subprocess.CompletedProcess([], 0, json.dumps([str(worktree), "C:\\ok"]), "")
+
+    pipe, jobs = _FakePipe(), []
+    private = tmp_path / "private"
+    private.mkdir()
+    bridge = worker_supervisor._WorkerMcpBridge(
+        pipe,
+        {"command": sys.executable, "args": [], "env": {}, "cwd": str(private),
+         "stderr_path": str(tmp_path / "e.log")},
+        [str(worktree)],
+        server_job=lambda: jobs.append(_FakeServerJob()) or jobs[-1],
+        run=_run,
+    )
+    bridge.start("launch-job")
+    _wait_until(lambda: bridge.error != "")
+    bridge.close()
+    assert "sys_path_container_writable" in bridge.error
+    assert bridge.server is None and jobs == []
+    assert pipe.closed >= 1
 
 
 def test_appcontainer_process_close_ends_the_bridge_before_the_launch(tmp_path: Path) -> None:
