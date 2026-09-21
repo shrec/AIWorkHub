@@ -2096,7 +2096,7 @@ def test_no_grant_may_equal_or_contain_a_protected_tree(
     temp = profile / "AppData" / "Local" / "Temp"
     temp.mkdir(parents=True)
     protected = [os.path.normcase(str(p)) for p in (profile, temp)]
-    monkeypatch.setattr(wac, "_sensitive_roots", lambda: protected)
+    monkeypatch.setattr(wac, "_sensitive_roots", lambda: (protected, []))
     fake = FakeWin32Api()
     # Equal to a protected tree, or an ancestor of one -- at any access level.
     for path in (profile, temp, profile / "AppData", tmp_path):
@@ -2117,6 +2117,102 @@ def test_no_grant_may_equal_or_contain_a_protected_tree(
         make_request(filesystem_grants=[ContainerGrant(str(inside), access, persistent)]),
         api=fake,
     )
+
+
+def _refused(grants, fake):
+    with pytest.raises(AppContainerError) as excinfo:
+        launch_appcontainer(make_request(filesystem_grants=grants), api=fake)
+    assert excinfo.value.reason is AppContainerReason.INVALID_REQUEST
+    assert fake.events == []
+    return excinfo.value.detail
+
+
+ALIASES = {
+    "long_path": lambda p: "\\\\?\\" + p,
+    "device": lambda p: "\\\\.\\" + p,
+    "admin_share": lambda p: "\\\\localhost\\" + p.replace(":", "$", 1),
+    "admin_share_slashes": lambda p: "//localhost/"
+    + p.replace(":", "$", 1).replace("\\", "/"),
+}
+
+
+@pytest.mark.parametrize("alias", sorted(ALIASES))
+@pytest.mark.parametrize(("access", "persistent"), [("read_execute", True), ("modify", False)])
+def test_unc_device_and_long_path_aliases_are_refused(tmp_path, alias, access, persistent):
+    # \\?\C:\Users\x and \\localhost\C$\Users\x alias local trees past every
+    # string comparison against the protected roots.
+    path = ALIASES[alias](str(tmp_path))
+    detail = _refused([ContainerGrant(path, access, persistent)], FakeWin32Api())
+    if os.path.isabs(path):  # off Windows, "\\?\..." is refused as relative
+        assert "UNC, device" in detail
+
+
+@pytest.mark.parametrize(
+    ("relative", "access", "persistent"),
+    [
+        (("System32",), "read_execute", True),
+        (("System32", "drivers", "etc"), "modify", False),
+        ((), "read_execute", False),
+    ],
+)
+def test_nothing_inside_a_system_tree_is_granted(
+    tmp_path, monkeypatch, relative, access, persistent
+):
+    windows = tmp_path / "Windows"
+    target = windows.joinpath(*relative)
+    target.mkdir(parents=True, exist_ok=True)
+    profile = tmp_path / "profile"
+    (profile / "npm").mkdir(parents=True)
+    monkeypatch.setattr(
+        wac,
+        "_sensitive_roots",
+        lambda: ([os.path.normcase(str(profile))], [os.path.normcase(str(windows))]),
+    )
+    fake = FakeWin32Api()
+    detail = _refused([ContainerGrant(str(target), access, persistent)], fake)
+    assert "Windows or Program Files" in detail
+    # The descendant rule is for system trees only: the npm install and the
+    # per-request directories legitimately live inside the profile.
+    launch_appcontainer(
+        make_request(
+            filesystem_grants=[
+                ContainerGrant(str(profile / "npm"), "read_execute", persistent=True)
+            ]
+        ),
+        api=fake,
+    )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="resolves real Windows locations")
+def test_real_system32_and_its_subtrees_are_refused():
+    system32 = os.path.join(os.environ["SYSTEMROOT"], "System32")
+    etc = os.path.join(system32, "drivers", "etc")
+    _refused([ContainerGrant(system32, "read_execute", persistent=True)], FakeWin32Api())
+    _refused([ContainerGrant(etc, "modify")], FakeWin32Api())
+
+
+@pytest.mark.parametrize(
+    ("revocable", "persistent"),
+    [
+        (("npm",), ("npm",)),  # equal
+        (("npm", "pkg"), ("npm",)),  # revocable inside persistent
+        ((), ("npm",)),  # revocable contains persistent
+    ],
+)
+def test_revocable_and_persistent_grants_must_not_overlap(tmp_path, revocable, persistent):
+    base = tmp_path / "root"
+    (base / "npm" / "pkg").mkdir(parents=True)
+    grants = [
+        ContainerGrant(str(base.joinpath(*persistent)), "read_execute", persistent=True),
+        ContainerGrant(str(base.joinpath(*revocable)), "modify"),
+    ]
+    detail = _refused(grants, FakeWin32Api())
+    assert "overlaps a persistent grant" in detail
+
+
+def test_disjoint_revocable_and_persistent_grants_are_fine(tmp_path):
+    grants = _grant_dirs(tmp_path)  # sibling worktree, home and provider dirs
+    launch_appcontainer(make_request(filesystem_grants=grants), api=FakeWin32Api())
 
 
 def test_a_filesystem_root_is_never_granted(tmp_path):
@@ -2145,12 +2241,12 @@ def test_protected_trees_come_from_the_token_not_the_request_env(
     monkeypatch.setenv("USERPROFILE", str(tmp_path))
     monkeypatch.setenv("TEMP", str(tmp_path))
     monkeypatch.setattr(wac, "_known_folder_path", lambda _folder: "")
-    roots = wac._sensitive_roots()
-    assert real_profile in roots
-    assert os.path.join(real_profile, "appdata", "local", "temp") in roots
-    assert os.path.join(real_profile, "appdata", "roaming") in roots
-    assert os.path.normcase(os.environ["SYSTEMROOT"]) in roots
-    assert os.path.normcase(str(tmp_path)) not in roots
+    protected, system = wac._sensitive_roots()
+    assert real_profile in protected
+    assert os.path.join(real_profile, "appdata", "local", "temp") in protected
+    assert os.path.join(real_profile, "appdata", "roaming") in protected
+    assert os.path.normcase(os.environ["SYSTEMROOT"]) in system
+    assert os.path.normcase(str(tmp_path)) not in protected + system
     # The reviewer's repro: persistent read access to the whole profile.
     fake = FakeWin32Api()
     grant = ContainerGrant(real_profile_path, "read_execute", persistent=True)

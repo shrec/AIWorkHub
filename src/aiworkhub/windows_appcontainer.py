@@ -909,28 +909,32 @@ def _system_windows_directory() -> str:
 _TOKEN_QUERY = 0x0008
 
 
-def _sensitive_roots() -> list[str]:
-    """Trees no grant, at any access level, may equal or contain (normcased).
+def _sensitive_roots() -> tuple[list[str], list[str]]:
+    """``(protected, system)`` trees guarding every grant (normcased).
+
+    No grant, at any access level, may equal or contain a protected tree:
+    the real profile root, its default AppData\\Local (+ Temp) and
+    AppData\\Roaming, and whatever LocalAppData / RoamingAppData actually
+    resolve to.  Grants INSIDE those stay legal -- the npm install and the
+    per-request directories live there.  A system tree -- %SystemRoot% and
+    the Program Files roots -- may not be touched at all: the container
+    already reads it through ALL APPLICATION PACKAGES, and a user without
+    WRITE_DAC there could not grant anyway.
 
     Anchored on the process token and the system, never on USERPROFILE or
-    TEMP, which a launcher points at the request's own directories: the real
-    profile root, its default AppData\\Local (+ Temp) and AppData\\Roaming,
-    whatever LocalAppData / RoamingAppData actually resolve to, %SystemRoot%
-    and the Program Files roots.  Fails closed if the profile is unknown.
+    TEMP, which a launcher points at the request's own directories.  Fails
+    closed if the profile is unknown.
     """
     if os.name != "nt":
-        return []
+        return [], []
     try:
         profile = _token_profile_directory()
-        extra = [
-            _known_folder_path(folder)
-            for folder in (
-                _FOLDERID_ROAMING_APPDATA,
-                _FOLDERID_PROGRAM_FILES,
-                _FOLDERID_PROGRAM_FILES_X86,
-            )
+        roaming = _known_folder_path(_FOLDERID_ROAMING_APPDATA)
+        system = [
+            _known_folder_path(_FOLDERID_PROGRAM_FILES),
+            _known_folder_path(_FOLDERID_PROGRAM_FILES_X86),
+            _system_windows_directory(),
         ]
-        extra.append(_system_windows_directory())
     except (OSError, AttributeError, ValueError) as exc:
         raise AppContainerError(
             AppContainerReason.INVALID_REQUEST,
@@ -948,11 +952,15 @@ def _sensitive_roots() -> list[str]:
         local,
         os.path.join(local, "Temp"),
         os.path.join(profile, "AppData", "Roaming"),
-        *extra,
+        roaming,
     ]
     if local_appdata:
         roots += [local_appdata, os.path.join(local_appdata, "Temp")]
-    return sorted({os.path.normcase(os.path.normpath(root)) for root in roots if root})
+
+    def _normalized(paths: list[str]) -> list[str]:
+        return sorted({os.path.normcase(os.path.normpath(p)) for p in paths if p})
+
+    return _normalized(roots), _normalized(system)
 
 
 def appcontainer_child_environment(
@@ -1387,11 +1395,18 @@ def _validate_grants(grants: Sequence[ContainerGrant]) -> None:
     Runs before any grant or launch call.  SetNamedSecurityInfoW follows
     reparse points, so a symlink or junction -- at the leaf, or in an ancestor,
     which is what comparing against ``realpath`` exposes -- would re-permission
-    a target the caller never named.  And no grant, read or modify, persistent
-    or not, may equal or contain a protected tree (:func:`_sensitive_roots`):
-    a read grant on the profile is as much a leak as a write grant.
+    a target the caller never named.  UNC, ``\\\\?\\``, ``\\\\.\\`` and
+    admin-share spellings are refused outright: they alias local trees past
+    every string comparison below, and AIWorkHub never needs one.  No grant,
+    read or modify, persistent or not, may equal or contain a protected tree,
+    nor lie anywhere inside a system tree (:func:`_sensitive_roots`): a read
+    grant on the profile is as much a leak as a write grant.  Finally, a
+    revocable grant may not overlap a persistent one, because its revoke
+    removes every explicit ACE of the SID on its path.
     """
-    sensitive: list[str] | None = None
+    protected: list[str] | None = None
+    system: list[str] = []
+    checked: list[tuple[str, bool]] = []
     for grant in grants:
         if not isinstance(grant, ContainerGrant) or not isinstance(grant.path, str):
             raise AppContainerError(
@@ -1415,6 +1430,12 @@ def _validate_grants(grants: Sequence[ContainerGrant]) -> None:
                 AppContainerReason.INVALID_REQUEST,
                 detail=f"grant path must be absolute: {path!r}.",
             )
+        if path.startswith(("\\\\", "//")):
+            # Checked before lstat so an admin share is never even touched.
+            raise AppContainerError(
+                AppContainerReason.INVALID_REQUEST,
+                detail=f"UNC, device and \\\\?\\ paths are never granted: {path!r}.",
+            )
         try:
             info = os.lstat(path)
         except OSError:
@@ -1433,20 +1454,36 @@ def _validate_grants(grants: Sequence[ContainerGrant]) -> None:
                 AppContainerReason.INVALID_REQUEST,
                 detail=f"grant path is or passes through a reparse point: {path!r}.",
             )
-        if sensitive is None:
-            sensitive = _sensitive_roots()
-        prefix = canonical.rstrip(os.sep) + os.sep
-        if os.path.dirname(canonical) == canonical or any(
-            (root.rstrip(os.sep) + os.sep).startswith(prefix) for root in sensitive
+        if protected is None:
+            protected, system = _sensitive_roots()
+        if (
+            os.path.dirname(canonical) == canonical
+            or any(_within(root, canonical) for root in (*protected, *system))
+            or any(_within(canonical, root) for root in system)
         ):
             raise AppContainerError(
                 AppContainerReason.INVALID_REQUEST,
                 detail=(
                     "grant would equal or contain a protected tree (drive root, "
-                    "user profile, AppData, user temp, Windows or Program Files): "
-                    f"{path!r}."
+                    "user profile, AppData, user temp) or touch the Windows or "
+                    f"Program Files trees: {path!r}."
                 ),
             )
+        checked.append((canonical, grant.persistent))
+    for path, persistent in checked:
+        if not persistent and any(
+            other_persistent and (_within(path, other) or _within(other, path))
+            for other, other_persistent in checked
+        ):
+            raise AppContainerError(
+                AppContainerReason.INVALID_REQUEST,
+                detail=f"revocable grant overlaps a persistent grant: {path!r}.",
+            )
+
+
+def _within(child: str, parent: str) -> bool:
+    """``child`` equals ``parent`` or lies beneath it (both normcased)."""
+    return (child.rstrip(os.sep) + os.sep).startswith(parent.rstrip(os.sep) + os.sep)
 
 
 def _validate_environment(environment: Mapping[str, str]) -> None:
