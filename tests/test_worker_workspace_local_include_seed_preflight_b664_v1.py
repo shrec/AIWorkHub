@@ -642,3 +642,158 @@ def test_symlink_escape_include_under_declared_root_fails_closed_with_evidence(
         worker_workspace._resolve_local_quoted_includes(
             repo, ["src/main.c"], include_roots=("include",)
         )
+
+
+# ---------------------------------------------------------------------------
+# Conventional repository include roots (include/ and src/).
+# ---------------------------------------------------------------------------
+def _cmake_layout_repo(tmp_path: Path, *extra: tuple[str, str]) -> Path:
+    """A CMake project: public headers under include/, sources under src/."""
+    repo = tmp_path / "parent"
+    repo.mkdir()
+    assert _git(repo, "init", "-q").returncode == 0
+    assert _git(repo, "config", "user.email", "b664@example.invalid").returncode == 0
+    assert _git(repo, "config", "user.name", "B664").returncode == 0
+    files = {
+        "include/pkg/core/types.hpp": "#pragma once\n",
+        "include/pkg/core/audit.hpp": '#include "pkg/core/types.hpp"\n',
+        "src/detail/impl.hpp": "#pragma once\n",
+        "src/audit.cpp": '#include "pkg/core/audit.hpp"\n',
+        "tests/test_audit.cpp": (
+            '#include "pkg/core/audit.hpp"\n#include "detail/impl.hpp"\n'
+        ),
+        "out/result.txt": "baseline\n",
+        **dict(extra),
+    }
+    for relative, text in files.items():
+        (repo / relative).parent.mkdir(parents=True, exist_ok=True)
+        (repo / relative).write_text(text, encoding="utf-8")
+    assert _git(repo, "add", ".").returncode == 0
+    assert _git(repo, "commit", "-qm", "cmake-layout-fixture").returncode == 0
+    return repo
+
+
+def test_conventional_include_roots_seed_transitive_closure_from_src(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """src/ and tests/ files resolve "pkg/..." under include/ and "detail/..."
+    under src/, and the header-to-header closure follows the same roots."""
+    repo = _cmake_layout_repo(tmp_path)
+    assert worker_workspace._repository_include_roots(repo) == ("include", "src")
+    monkeypatch.setenv(
+        worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "worktrees")
+    )
+    workspace = worker_workspace.create_workspace(
+        repo,
+        "cmake-layout",
+        {
+            "allowed_writes": ["out/result.txt"],
+            "read_first": ["src/audit.cpp", "tests/test_audit.cpp"],
+        },
+        "validation",
+    )
+    try:
+        ws = workspace.path
+        assert (ws / "include/pkg/core/audit.hpp").is_file()
+        # Reached only through audit.hpp -> "pkg/core/types.hpp".
+        assert (ws / "include/pkg/core/types.hpp").is_file()
+        assert (ws / "src/detail/impl.hpp").is_file()
+    finally:
+        worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
+
+
+def test_conventional_include_roots_still_fail_closed_on_absent_header(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    repo = _cmake_layout_repo(
+        tmp_path, ("src/broken.cpp", '#include "pkg/core/absent.hpp"\n')
+    )
+    monkeypatch.setenv(
+        worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "worktrees")
+    )
+    with pytest.raises(
+        worker_workspace.WorkspaceError,
+        match=(
+            r"^local_quoted_include_unresolved:"
+            r"pkg/core/absent\.hpp \(from src/broken\.cpp\)$"
+        ),
+    ):
+        worker_workspace.create_workspace(
+            repo,
+            "cmake-layout-absent",
+            {
+                "allowed_writes": ["out/result.txt"],
+                "read_first": ["src/audit.cpp", "src/broken.cpp"],
+            },
+            "validation",
+        )
+
+
+def test_conventional_include_root_closure_respects_max_seed_files(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    repo = _cmake_layout_repo(tmp_path)
+    monkeypatch.setenv(
+        worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "worktrees")
+    )
+    monkeypatch.setattr(worker_workspace, "MAX_SEED_FILES", 3)
+    # out/result.txt + src/audit.cpp + audit.hpp + types.hpp = 4 > 3.
+    with pytest.raises(
+        worker_workspace.WorkspaceError, match=r"seed_file_limit_exceeded:4"
+    ):
+        worker_workspace.create_workspace(
+            repo,
+            "cmake-layout-limit",
+            {"allowed_writes": ["out/result.txt"], "read_first": ["src/audit.cpp"]},
+            "validation",
+        )
+
+
+@pytest.mark.parametrize("kind", ["symlink", "junction"])
+def test_symlinked_or_reparse_include_root_is_never_searched(
+    kind: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """An include/ that is a link is not a root: the header it would supply
+    stays unresolved, so the launch is refused rather than widened."""
+    repo = tmp_path / "parent"
+    repo.mkdir()
+    assert _git(repo, "init", "-q").returncode == 0
+    assert _git(repo, "config", "user.email", "b664@example.invalid").returncode == 0
+    assert _git(repo, "config", "user.name", "B664").returncode == 0
+    real = repo / "real_headers"
+    (real / "pkg").mkdir(parents=True)
+    (real / "pkg" / "x.hpp").write_text("#pragma once\n", encoding="utf-8")
+    (repo / "src").mkdir()
+    (repo / "src" / "main.cpp").write_text('#include "pkg/x.hpp"\n', encoding="utf-8")
+    (repo / "out").mkdir()
+    (repo / "out" / "result.txt").write_text("baseline\n", encoding="utf-8")
+    try:
+        if kind == "symlink":
+            (repo / "include").symlink_to(real, target_is_directory=True)
+        else:
+            if sys.platform != "win32":
+                pytest.skip("directory junctions are a Windows reparse point")
+            import _winapi
+
+            _winapi.CreateJunction(str(real), str(repo / "include"))
+    except OSError as exc:
+        pytest.skip(f"cannot create {kind} on this host: {exc}")
+    assert _git(
+        repo, "add", "real_headers/pkg/x.hpp", "src/main.cpp", "out/result.txt"
+    ).returncode == 0
+    assert _git(repo, "commit", "-qm", f"{kind}-include-root").returncode == 0
+
+    assert worker_workspace._repository_include_roots(repo) == ("src",)
+    monkeypatch.setenv(
+        worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "worktrees")
+    )
+    with pytest.raises(
+        worker_workspace.WorkspaceError,
+        match=r"^local_quoted_include_unresolved:pkg/x\.hpp \(from src/main\.cpp\)$",
+    ):
+        worker_workspace.create_workspace(
+            repo,
+            f"{kind}-include-root",
+            {"allowed_writes": ["out/result.txt"], "read_first": ["src/main.cpp"]},
+            "validation",
+        )

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -961,6 +962,92 @@ def test_node_capability_preflight_uses_the_same_system_authority(
         tmp_path,
         {"allowed_writes": [], "validation": ["node test/check.js"]},
     ) == ()
+
+
+@pytest.mark.parametrize(
+    ("tool", "command"),
+    [
+        ("cmake", "cmake --build --preset windows-llvm-debug"),
+        ("ctest", "ctest --preset windows-llvm-debug"),
+    ],
+)
+def test_cmake_family_uses_the_trusted_system_tool_authority(
+    tool: str, command: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    system_tool = _executable(tmp_path.parent / "system" / tool)
+    monkeypatch.setattr(
+        worker_workspace.shutil,
+        "which",
+        lambda name: str(system_tool) if name == tool else None,
+    )
+    monkeypatch.setattr(
+        worker_workspace,
+        "_declared_workspace_seed_closure",
+        lambda *args: ((), (), ()),
+    )
+
+    normalized, roots = (
+        worker_workspace._normalize_trusted_validation_executable_argv_with_roots(
+            command.split(), tmp_path
+        )
+    )
+    assert normalized == [str(system_tool.resolve()), *command.split()[1:]]
+    assert roots == ()
+    assert worker_workspace.preflight_validation_capabilities(
+        tmp_path, {"allowed_writes": [], "validation": [command]}
+    ) == ()
+
+
+def test_cmake_capability_preflight_refuses_when_unresolvable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(worker_workspace.shutil, "which", lambda name: None)
+    monkeypatch.setattr(
+        worker_workspace,
+        "_declared_workspace_seed_closure",
+        lambda *args: ((), (), ()),
+    )
+
+    missing = worker_workspace.preflight_validation_capabilities(
+        tmp_path,
+        {"allowed_writes": [], "validation": ["cmake --build out/build"]},
+    )
+
+    assert missing == ("executable:validation_executable_unavailable:cmake",)
+
+
+def test_cmake_system_tool_authority_rejects_repository_owned_binary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo_cmake = _executable(tmp_path / "tools" / "cmake")
+    monkeypatch.setattr(worker_workspace.shutil, "which", lambda name: str(repo_cmake))
+
+    with pytest.raises(
+        worker_workspace.WorkspaceError,
+        match="validation_executable_repository_owned",
+    ):
+        worker_workspace._normalize_trusted_validation_executable_argv_with_roots(
+            ["cmake", "--build", "out/build"], tmp_path
+        )
+
+
+@pytest.mark.parametrize("tool", ["cmake", "ctest"])
+def test_installed_cmake_family_is_trusted_and_version_verified(
+    tool: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    discovered = shutil.which(tool)
+    if discovered is None:
+        pytest.skip(f"{tool} is not installed on this host")
+    normalized, _roots = (
+        worker_workspace._normalize_trusted_validation_executable_argv_with_roots(
+            [tool, "--version"], tmp_path
+        )
+    )
+    assert normalized[0] == str(Path(discovered).resolve())
+    # The coordinator-side probe the toolchain authority records as the fact.
+    _no_secure_lane(monkeypatch)
+    version = worker_workspace.trusted_validation_executable_version(normalized[0])
+    assert version.startswith(f"{tool} version ")
 
 
 def test_git_system_tool_authority_rejects_repository_owned_binary(

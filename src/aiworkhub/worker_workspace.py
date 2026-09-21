@@ -2329,6 +2329,11 @@ _HEADER_FILE_SUFFIXES = frozenset(
 )
 _QUOTED_INCLUDE_RE = re.compile(r'^\s*#\s*include\s+"([^"]+)"')
 _DEFAULT_INCLUDE_ROOTS: tuple[str, ...] = (".",)
+# The two Pitchfork-layout public-header roots: ``include/`` (separate header
+# placement, CMake's ``target_include_directories(<t> PUBLIC include)``) and
+# ``src/`` (merged placement).  Resolving only against "." refused every card of
+# a CMake repository whose src/ files include "pkg/core/x.hpp" from include/.
+_CONVENTIONAL_INCLUDE_ROOTS: tuple[str, ...] = ("include", "src")
 _INCLUDE_ROOT_CARD_KEYS = (
     "include_roots",
     "local_include_roots",
@@ -2454,6 +2459,29 @@ def _include_roots_from_card(card: Mapping[str, Any]) -> tuple[str, ...]:
             continue
         if isinstance(value, Iterable):
             roots.extend(root for root in value if isinstance(root, str))
+    return tuple(roots)
+
+
+def _repository_include_roots(repo: Path) -> tuple[str, ...]:
+    """Conventional include roots that exist in *repo* as real directories.
+
+    Unlike a card-declared root, which fails loudly when it is not a directory,
+    a symlinked or reparse-point (junction) candidate is skipped without being
+    followed: a header reachable only through it stays unresolved and still
+    raises ``local_quoted_include_unresolved``.  The survivors pass through
+    ``_normalize_include_roots`` like any declared root.
+    """
+    reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    roots: list[str] = []
+    for name in _CONVENTIONAL_INCLUDE_ROOTS:
+        try:
+            info = os.lstat(repo / name)
+        except OSError:
+            continue
+        if stat.S_ISDIR(info.st_mode) and not (
+            getattr(info, "st_file_attributes", 0) & reparse
+        ):
+            roots.append(name)
     return tuple(roots)
 
 
@@ -4412,7 +4440,9 @@ def _declared_workspace_seed_closure(
     live_seeded = _resolve_local_quoted_includes(
         source_root,
         live_seeded,
-        include_roots=_include_roots_from_card(card),
+        include_roots=(
+            _include_roots_from_card(card) + _repository_include_roots(source_root)
+        ),
     )
     validation_rows = tuple(
         row
@@ -7413,7 +7443,18 @@ _TRUSTED_VALIDATION_BARE_EXECUTABLES = frozenset({"pytest", "ruff", "mypy"})
 # that runs ``npm --prefix <dir> test`` is exactly as launch-capable as one
 # that runs ``node`` directly once that family is trusted (NF-2026-00625 M2).
 _NODE_FAMILY_SYSTEM_EXECUTABLES = frozenset({"node", "npm", "npx"})
-_TRUSTED_VALIDATION_SYSTEM_EXECUTABLES = frozenset({"git"}) | _NODE_FAMILY_SYSTEM_EXECUTABLES
+# cmake and ctest are the same kind of family: one installer places both in
+# one ``bin`` directory, and a card gating on ``cmake --build`` + ``ctest`` was
+# refused as ``executable:cmake`` on a host where both are installed.  They take
+# the git/node path unchanged: ``shutil.which``, repository-owned rejection,
+# ``--version`` fact.  cpack is left out: it packages rather than validates, and
+# the bare name can resolve to Chocolatey's legacy ``cpack`` shim instead.
+_CMAKE_FAMILY_SYSTEM_EXECUTABLES = frozenset({"cmake", "ctest"})
+_TRUSTED_VALIDATION_SYSTEM_EXECUTABLES = (
+    frozenset({"git"})
+    | _NODE_FAMILY_SYSTEM_EXECUTABLES
+    | _CMAKE_FAMILY_SYSTEM_EXECUTABLES
+)
 SANDBOX_VALIDATION_EXECUTABLE_ROOT = "/validation-executable-root"
 
 
