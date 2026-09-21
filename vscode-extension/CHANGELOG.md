@@ -1,5 +1,75 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.58 — 2026-09-21
+
+### Changed
+
+- Bundled runtime: an SDLC case stage can no longer be recorded `ready` on a
+  caller's say-so (NF-2026-00945). `ready` for Plan, Design, Build and Test is
+  accepted only when the runtime proves it, read-only and bounded, from the
+  repository's own canonical receipts (the bound task and its falsifiable
+  contract, a `review_ready` candidate sealed by the current claim against that
+  contract, the sealed validation evidence, and the coordinator's
+  accepted-outcome receipt for that candidate), and the resolved evidence is
+  stored with the stage receipt. The payload supplies only the Plan and Design
+  content and, for Build and Test, exact `task_id`, `request_id` and
+  `claim_epoch` pointers; verdict-shaped keys such as `passed`, `verdict` or
+  `sha256` are refused, and whatever cannot be proven is refused with a typed
+  `stage_evidence_refused:<stage>:<code>` reason and a next action.
+- Bundled runtime: a recorded `ready` receipt is re-proven on every read. A
+  receipt written before this gate, one whose stored evidence no longer hashes
+  or re-derives, and one whose predecessor stage is no longer proven stay
+  visible for audit but read as `unknown` with a reason. A case's `cycle` is
+  `complete` only when all six stages are proven now.
+- Bundled runtime: Deploy and Maintain remain explicit refusals rather than
+  evidence gates. The SDLC Deploy and Maintain gates do not yet consume
+  canonical deploy target allowlist, release/build provenance receipt, install
+  receipt, rollback receipt, deploy approval policy, deployed release identity,
+  observed outcome metrics or control-limit policy, so `ready` for either stage
+  is refused with each missing producer named and is never inferred, and a
+  case's `cycle` cannot report `complete`. `not_applicable` is refused the same
+  way until a canonical policy registry exists.
+
+### Fixed
+
+- Bundled runtime: the isolated launch now puts the OpenCode worker's
+  request-local `awh` MCP config into the worker's own process environment
+  (NF-2026-00919). It is derived from the worker MCP runtime already generated
+  for the request, spelled for the selected sandbox (mount aliases under
+  bubblewrap, real host paths under Landlock and Windows AppContainer), and set
+  as `OPENCODE_CONFIG_CONTENT` with project-level OpenCode config disabled;
+  nothing is written to disk and no global OpenCode config is touched. The
+  contract fails closed: a config that does not meet it refuses the launch
+  before any supervisor or worker process spawns and records the launch failure
+  with a typed `opencode_worker_mcp_config_<cause>` reason, an infrastructure
+  fault rather than a model-quality failure. The config must be exactly the
+  `awh` server plus the worker permission contract (deny by default, only the
+  `awh` worker tools allowed); its `environment` may carry only the request's
+  own binding variables, never a provider credential or another inherited
+  variable; it is bounded to 16 KiB of ASCII JSON; and the generated source it
+  is read from must be a regular, non-symlinked, current-user-owned file beneath
+  the request HOME whose request, repository and audit paths match the launch.
+  This is launch wiring only: whether a live OpenCode/Muse worker then connects
+  to `awh` is not measured in this release (below).
+
+### Not in this release
+
+- Live OpenCode/Muse worker qualification and Windows runtime qualification.
+  The launch wiring is covered by unit and integration tests that run the real
+  launcher with the task store, git and the supervisor spawn replaced by
+  stand-ins; the Windows AppContainer cases fake the host platform, the Win32
+  probe and the Win32 API. No live OpenCode/Muse worker was run against the
+  delivered config and nothing was run on a real Windows host, so both remain
+  unmeasured.
+- Evidence gates for Deploy and Maintain: the SDLC gates do not yet consume the
+  canonical deploy, release and outcome proof those stages would need, so only
+  the first four SDLC stages are gated.
+- LSP index integration, the OpenCode manager callback, the full stage-gated
+  Playbook lifecycle, and portable `.aiworkhub` data are pending and not shipped
+  here. No reasoning-quality improvement is claimed: causal reasoning-quality
+  measurement remains incomplete, and inferred successor progression is still
+  pending.
+
 ## 0.11.57 — 2026-09-21
 
 ### Fixed

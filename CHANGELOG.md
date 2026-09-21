@@ -6,6 +6,89 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.58] - 2026-09-21
+
+### Changed
+
+- An SDLC case stage can no longer be recorded `ready` on a caller's say-so
+  (NF-2026-00945). `ready` for Plan, Design, Build and Test is accepted only
+  when the server proves it, read-only and bounded, from this repository's own
+  canonical receipts, and the resolved evidence is stored with the stage
+  receipt. Plan needs the case's bound task to exist, not be withdrawn and carry
+  an objective. Design needs that task's contract to be falsifiable
+  (acceptance criteria, validation commands and, unless read-only, a write
+  scope); the task's content identity becomes the versioned design. Build needs
+  a `review_ready` candidate sealed by the current claim against exactly that
+  design, with its attempt bundle, terminal process event, semantic-edit ledger
+  and effort/context receipt verifying or verifiably not owed. Test needs the
+  sealed validation evidence to re-derive to the stored passing verdict and the
+  coordinator's accepted-outcome receipt for that same candidate to validate and
+  re-hash its promoted paths. The payload supplies only the Plan and Design
+  content and, for Build and Test, `task_id`, `request_id` and `claim_epoch`
+  pointers that must equal what the stores say; verdict-shaped keys such as
+  `passed`, `verdict` or `sha256` are refused. Whatever the server cannot prove
+  is refused with a typed `stage_evidence_refused:<stage>:<code>` reason and a
+  next action.
+- A recorded `ready` receipt is re-proven on every read. A receipt written
+  before this gate, one whose stored evidence no longer hashes or re-derives,
+  and one whose predecessor stage is no longer proven stay visible for audit but
+  read as `unknown` with a reason. A case's `cycle` is `complete` only when all
+  six stages are proven now.
+- Deploy and Maintain remain explicit refusals rather than evidence gates. The
+  SDLC Deploy and Maintain gates do not yet consume canonical deploy target
+  allowlist, release/build provenance receipt, install receipt, rollback
+  receipt, deploy approval policy, deployed release identity, observed outcome
+  metrics or control-limit policy, so `ready` for either stage is refused with
+  each missing producer named and is never inferred. `not_applicable` is
+  refused the same way until a canonical policy registry exists, and a
+  previously recorded `not_applicable` receipt reads as `unknown`. Until the
+  gates consume that proof a case's `cycle` cannot report `complete`.
+
+### Fixed
+
+- The isolated launch now puts the OpenCode worker's request-local `awh` MCP
+  config into the worker's own process environment (NF-2026-00919).
+  `launch_isolated` derives it from the worker MCP runtime already generated for
+  the request, spells it for the selected sandbox (mount aliases under
+  bubblewrap, real host paths under Landlock and Windows AppContainer) and sets
+  it as `OPENCODE_CONFIG_CONTENT`, with project-level OpenCode config disabled
+  (`OPENCODE_DISABLE_PROJECT_CONFIG=1`); nothing is written to disk and no
+  global OpenCode config is touched. The contract fails closed: a config that
+  does not meet it refuses the launch before any supervisor or worker process
+  spawns and records the launch failure with a typed
+  `opencode_worker_mcp_config_<cause>` reason, an infrastructure fault rather
+  than a model-quality failure. The config must be exactly the `awh` server plus
+  the worker permission contract (deny by default, only the `awh` worker tools
+  allowed); its `environment` may carry only the request's own binding
+  variables, never a provider credential or another inherited variable; it is
+  bounded to 16 KiB of ASCII JSON; and the generated source it is read from must
+  be a regular, non-symlinked, current-user-owned file beneath the request HOME
+  whose request, repository and audit paths match the launch. Under AppContainer
+  the launch argv passes through only when the confinement is reported available
+  (otherwise the launch is refused, never run unconfined), and a
+  validation-shaped request is refused there. This is launch wiring only:
+  whether a live OpenCode/Muse worker then connects to `awh` is not measured in
+  this release (below).
+
+### Not in this release
+
+- Live OpenCode/Muse worker qualification and Windows runtime qualification.
+  The launch wiring above is covered by unit and integration tests that run the
+  real `launch_isolated`, worker config provisioner and `sandbox_argv`, with the
+  task store, git and the supervisor spawn replaced by stand-ins. The Windows
+  AppContainer cases fake the host platform and the Win32 probe, and a fake
+  Win32 API checks that the AppContainer launcher passes the environment to the
+  child unchanged. No live OpenCode/Muse worker was run against the delivered
+  config and nothing was run on a real Windows host, so both remain unmeasured.
+- Evidence gates for Deploy and Maintain: the SDLC gates do not yet consume the
+  canonical deploy, release and outcome proof those stages would need, so only
+  the first four SDLC stages are gated.
+- LSP index integration, the OpenCode manager callback, the full stage-gated
+  Playbook lifecycle, and portable `.aiworkhub` data are pending and not shipped
+  here. No reasoning-quality improvement is claimed: causal reasoning-quality
+  measurement remains incomplete, and inferred successor progression is still
+  pending.
+
 ## [0.11.57] - 2026-09-21
 
 ### Fixed

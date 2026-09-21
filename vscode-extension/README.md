@@ -14,6 +14,30 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.11.58
+
+- The bundled runtime's first four SDLC case stages are gated on server-proven
+  evidence (NF-2026-00945): Plan, Design, Build and Test can be recorded
+  `ready` only when the runtime proves them from the repository's own canonical
+  receipts, a caller can no longer self-declare a verdict, and a `ready` receipt
+  is re-proven on every read. Receipts recorded before this gate stay visible
+  for audit but no longer count as proof.
+- Deploy and Maintain remain explicit refusals that name each missing producer:
+  the SDLC Deploy and Maintain gates do not yet consume canonical deploy and
+  release receipts, outcome metrics or policy, so a case's six-stage cycle
+  cannot report complete; `not_applicable` is refused until a canonical policy
+  registry exists.
+- The bundled runtime's isolated launch now puts an OpenCode worker's
+  request-local `awh` MCP config into the worker's own environment on the Linux
+  (Landlock, bubblewrap) and Windows AppContainer paths, and refuses the launch
+  before any process spawns when the config contract is not met
+  (NF-2026-00919). This is launch wiring covered by unit and integration tests
+  only: live OpenCode/Muse worker qualification and Windows runtime
+  qualification remain unmeasured.
+- LSP index integration, the OpenCode manager callback, the full stage-gated
+  Playbook lifecycle and reasoning-quality measurement are not part of this
+  release and remain pending; no reasoning-quality improvement is claimed.
+
 ## What's new in 0.11.57
 
 - The bundled runtime's reviewer and rework Source Graph overlays now pin the

@@ -62,6 +62,31 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
+## What's new in 0.11.58
+
+- The first four SDLC case stages are now gated on server-proven evidence
+  (NF-2026-00945). Plan, Design, Build and Test can be recorded `ready` only
+  when the server proves them from the repository's own canonical receipts (the
+  bound task and its contract, the sealed candidate, the validation evidence and
+  the coordinator's accepted outcome); a caller can no longer self-declare a
+  verdict, and a `ready` receipt is re-proven on every read. Receipts recorded
+  before this gate stay visible for audit but no longer count as proof.
+- Deploy and Maintain remain explicit refusals that name each missing producer:
+  the SDLC Deploy and Maintain gates do not yet consume canonical deploy target
+  allowlist, release/install/rollback receipts and approval policy, or deployed
+  release identity, outcome metrics and control-limit policy, so a case's
+  six-stage cycle cannot report complete. `not_applicable` is refused until a
+  canonical policy registry exists.
+- The isolated launch now puts the OpenCode worker's request-local `awh` MCP
+  config into the worker's own environment on the Linux (Landlock, bubblewrap)
+  and Windows AppContainer paths, and refuses the launch before any process
+  spawns when the config contract is not met (NF-2026-00919). This is launch
+  wiring covered by unit and integration tests only: live OpenCode/Muse worker
+  qualification and Windows runtime qualification remain unmeasured.
+- LSP index integration, the OpenCode manager callback, the full stage-gated
+  Playbook lifecycle and reasoning-quality measurement are not part of this
+  release and remain pending; no reasoning-quality improvement is claimed.
+
 ## What's new in 0.11.57
 
 - Reviewer and rework Source Graph overlays now pin the exact base index
