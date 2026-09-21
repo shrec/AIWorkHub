@@ -303,3 +303,57 @@ def test_mcp_snapshot_passes_previous_snapshot_contract(monkeypatch):
     assert calls == [{"summary_only": True, "previous": previous}]
     assert result["snapshot_mode"] == "summary"
     assert "manager_identity" in result
+
+
+_QUARANTINE_HISTORY = {
+    "quarantine_batches": ("storage", "created_at"),
+    "terminal_log_quarantine_batches": ("terminal", "created_at"),
+    "task_retention_batches": ("task", "quarantined_at"),
+}
+
+
+def _batch_rows(prefix: str, stamp_field: str) -> list[dict[str, Any]]:
+    return [
+        {
+            "batch_id": f"{prefix}-{index:03d}",
+            stamp_field: f"2026-07-{1 + index // 24:02d}T{index % 24:02d}:00:00+00:00",
+            "bytes": 4096 + index,
+        }
+        for index in range(100)
+    ]
+
+
+def test_mcp_default_snapshot_bounds_quarantine_rows_from_the_real_builder(monkeypatch):
+    _patch_secondary_reads(monkeypatch)
+    storage_usage: dict[str, Any] = {"scan_status": "ready", "quarantine_bytes": 409_600}
+    for array, (prefix, stamp_field) in _QUARANTINE_HISTORY.items():
+        storage_usage[array] = _batch_rows(prefix, stamp_field)
+    monkeypatch.setattr(dashboard.storage_observability, "snapshot", lambda _root: storage_usage)
+    provider = CountingProvider(limit=37)
+    real_build_snapshot = dashboard.build_snapshot
+    monkeypatch.setattr(
+        dashboard,
+        "build_snapshot",
+        lambda **kwargs: real_build_snapshot(provider, **kwargs),
+    )
+    monkeypatch.setattr(dashboard_mcp_app.core, "manager_bootstrap", lambda: {})
+    monkeypatch.setattr(dashboard_mcp_app.core, "dispatcher_health", lambda: {"status": "running"})
+    monkeypatch.setattr(dashboard_mcp_app.shared_router, "list_known_repositories", lambda **_kwargs: {})
+    monkeypatch.setattr(dashboard_mcp_app.core, "repo_root", lambda: Path("/"))
+    monkeypatch.setattr(dashboard_mcp_app.core, "read_selected_coordinator_target", lambda _root: {})
+
+    result = dashboard_mcp_app.snapshot_view()
+
+    assert result["snapshot_mode"] == "summary"
+    assert result["status_counts"]["pending"] == 2000
+    bounded = result["storage_usage"]
+    assert bounded["quarantine_bytes"] == 409_600
+    for array, (prefix, _stamp_field) in _QUARANTINE_HISTORY.items():
+        assert bounded[array]["total_count"] == 100
+        assert bounded[array]["returned_count"] == 5
+        assert bounded[array]["truncated"] is True
+        assert [row["batch_id"] for row in bounded[array]["rows"]] == [
+            f"{prefix}-{index:03d}" for index in range(99, 94, -1)
+        ]
+        assert len(storage_usage[array]) == 100
+    assert len(json.dumps(bounded)) < len(json.dumps(storage_usage)) / 4

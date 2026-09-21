@@ -93,6 +93,19 @@ _COMPACT_SNAPSHOT_FIELDS: tuple[str, ...] = (
     "authority_flags",
 )
 
+# Each retention provider lists up to its newest 100 batches; the summary keeps a few.
+MAX_SNAPSHOT_QUARANTINE_ROWS = 5
+_SNAPSHOT_QUARANTINE_ARRAYS: tuple[str, ...] = (
+    "quarantine_batches",
+    "terminal_log_quarantine_batches",
+    "task_retention_batches",
+)
+_CONTRACT_RECALL = (
+    "aiworkhub_dashboard_snapshot without known_contract_sha256 (or "
+    "aiworkhub_manager_bootstrap(include_contract=true)) re-delivers the "
+    "contract prose; it is unchanged while contract_sha256 is unchanged."
+)
+
 # Detail fields trimmed, largest first, only if the single-task payload is
 # still over budget (a huge validation_output/result blob on one card).
 _DETAIL_TRIM_FIELDS: tuple[str, ...] = (
@@ -2039,7 +2052,79 @@ def _bound_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
     return result
 
 
-def _compact_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
+def _epoch_seconds(stamp: Any) -> float:
+    """Instant of an ISO-8601 stamp; a missing or unparseable one ranks oldest."""
+    text = str(stamp or "").strip()
+    if text.endswith("Z"):
+        text = f"{text[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
+    except (ValueError, OverflowError):
+        return float("-inf")
+
+
+def _quarantine_recency(row: Any) -> tuple[float, str, str]:
+    """Total order key, newest greatest: instant, then stamp text, then batch id."""
+    if not isinstance(row, Mapping):
+        return (float("-inf"), "", "")
+    stamp = row.get("quarantined_at") or row.get("created_at") or ""
+    return (_epoch_seconds(stamp), str(stamp), str(row.get("batch_id") or ""))
+
+
+def _bounded_quarantine_rows(rows: list[Any] | tuple[Any, ...]) -> dict[str, Any]:
+    """The newest rows within the bound, with the full count and truncation truth."""
+    newest = sorted(rows, key=_quarantine_recency, reverse=True)[:MAX_SNAPSHOT_QUARANTINE_ROWS]
+    return {
+        "total_count": len(rows),
+        "returned_count": len(newest),
+        "truncated": len(newest) < len(rows),
+        "ranked_by": "newest_instant_then_batch_id",
+        "rows": newest,
+    }
+
+
+def _bounded_storage_usage(usage: Any) -> Any:
+    """Copy of ``usage`` with each quarantine array bounded; the input is never mutated."""
+    if not isinstance(usage, Mapping):
+        return usage
+    bounded = dict(usage)
+    for field in _SNAPSHOT_QUARANTINE_ARRAYS:
+        rows = usage.get(field)
+        if isinstance(rows, (list, tuple)):
+            bounded[field] = _bounded_quarantine_rows(rows)
+    return bounded
+
+
+def _known_contract_identity(identity: Any, known_contract_sha256: Any) -> Any:
+    """Drop the contract prose from ``identity`` when the caller proves it holds it."""
+    known = str(known_contract_sha256 or "").strip().lower()
+    current = (
+        str(identity.get("contract_sha256") or "").strip().lower()
+        if isinstance(identity, Mapping)
+        else ""
+    )
+    if not known or not current:
+        return identity
+    if known != current:
+        return {**identity, "contract_delivery_reason": "contract_sha_changed"}
+    omitted = sorted(key for key in core.MANAGER_CONTRACT if key in identity)
+    if not omitted:
+        return identity
+    return {
+        **{key: value for key, value in identity.items() if key not in omitted},
+        "contract_delivered": False,
+        "contract_delivery_reason": "caller_holds_current_contract",
+        "contract_omitted_fields": omitted,
+        "contract_recall": _CONTRACT_RECALL,
+    }
+
+
+def _compact_snapshot(
+    snapshot: Mapping[str, Any], known_contract_sha256: str = ""
+) -> dict[str, Any]:
     """Return the bounded manager-facing operational snapshot.
 
     The native Webview explicitly requests the full shape. Model callers get
@@ -2053,6 +2138,12 @@ def _compact_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
         for key in _COMPACT_SNAPSHOT_FIELDS
         if key in snapshot
     }
+    if "storage_usage" in result:
+        result["storage_usage"] = _bounded_storage_usage(result["storage_usage"])
+    if "manager_identity" in result:
+        result["manager_identity"] = _known_contract_identity(
+            result["manager_identity"], known_contract_sha256
+        )
     omitted = sorted(key for key in snapshot if key not in result)
     result.update({
         "snapshot_mode": "summary",
@@ -2085,6 +2176,7 @@ def snapshot_view(
     full: bool = False,
     previous: Mapping[str, Any] | None = None,
     previous_snapshot: Mapping[str, Any] | None = None,
+    known_contract_sha256: str = "",
 ) -> dict[str, Any]:
     """READ-ONLY: canonical dashboard snapshot for the native Webview.
 
@@ -2095,6 +2187,13 @@ def snapshot_view(
     dashboard.js already renders when ``full=true``. The default manager call
     is a bounded operational summary; the native Webview requests full mode
     explicitly. Adds no second SQLite/taskctl read.
+
+    The summary keeps the newest rows of each ``storage_usage`` quarantine
+    array, each with its ``total_count``/``returned_count``/``truncated``;
+    ``full=true`` returns every row. Pass the ``contract_sha256`` of the
+    ``manager_identity`` you already hold as ``known_contract_sha256`` to leave
+    the unchanged contract prose out of the summary: a stale digest gets the
+    prose back and no digest keeps it. ``full=true`` ignores the digest.
     """
     started = time.perf_counter()
     _debug_trace("snapshot.begin")
@@ -2218,7 +2317,7 @@ def snapshot_view(
     else:
         result = _debug_stage(
             "compact_snapshot",
-            lambda: _bound_snapshot(_compact_snapshot(snapshot)),
+            lambda: _bound_snapshot(_compact_snapshot(snapshot, known_contract_sha256)),
         )
     _debug_trace(
         "snapshot.end",

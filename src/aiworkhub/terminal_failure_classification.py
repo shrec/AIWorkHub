@@ -62,6 +62,7 @@ _FINALIZER_OUTCOME_STATES = frozenset({
 _UNCLASSIFIED = "unclassified"
 
 _PROVIDER_TIMEOUT = "provider_timeout"
+_RATE_LIMITED = "rate_limited"
 # The VS Code LM bridge's machine-generated timeout reason (see process_launcher).
 _BRIDGE_TIMEOUT_REASON = "vscode_lm_response_timeout"
 # Timeout EVENT phrases only: a bare "timeout" also matches timeout_ms/timeout_phase fields.
@@ -94,7 +95,7 @@ _SIGNATURES: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"cause_not_distinguished", re.I), "auth_cause_not_distinguished"),
     (re.compile(r"unauthoriz", re.I), "auth_unauthorized"),
     (re.compile(r"forbidden|permission denied", re.I), "auth_forbidden"),
-    (re.compile(r"rate.?limit|too many requests|\bquota\b", re.I), "rate_limited"),
+    (re.compile(r"rate.?limit|too many requests|\bquota\b", re.I), _RATE_LIMITED),
     (re.compile(r"out of memory|\boom\b", re.I), "resource_exhausted"),
     (re.compile(r"missing required output artifact", re.I), "missing_output_artifact"),
     (
@@ -424,10 +425,39 @@ def _provider_timeout_evidence(text: str, *, prose: bool) -> bool:
     return False
 
 
+_RATE_LIMIT_EVENT = "rate_limit_event"
+# A granted quota poll is telemetry; any other status, or none, is not exempt.
+_RATE_LIMIT_HEADROOM_STATUSES = frozenset({"allowed", "allowed_warning"})
+
+
+def _reports_rate_limit_headroom(line: str) -> bool:
+    """A typed ``rate_limit_event`` whose own status says the request was allowed."""
+    if _RATE_LIMIT_EVENT not in line:
+        return False
+    event = _json_event(line)
+    if event is None or str(event.get("type") or "").strip().lower() != _RATE_LIMIT_EVENT:
+        return False
+    info = event.get("rate_limit_info")
+    status = (info if isinstance(info, dict) else event).get("status")
+    return isinstance(status, str) and status.strip().lower() in _RATE_LIMIT_HEADROOM_STATUSES
+
+
+def _rate_limit_evidence(pattern: re.Pattern[str], text: str) -> bool:
+    """A rate-limit phrase on any line except typed quota telemetry that reports headroom."""
+    return any(
+        pattern.search(line)
+        for line in text.splitlines()
+        if not _reports_rate_limit_headroom(line)
+    )
+
+
 def _signature_code(text: str, *, timeout_prose: bool = True) -> str | None:
     for pattern, code in _SIGNATURES:
         if code == _PROVIDER_TIMEOUT:
             if _provider_timeout_evidence(text, prose=timeout_prose):
+                return code
+        elif code == _RATE_LIMITED:
+            if _rate_limit_evidence(pattern, text):
                 return code
         elif pattern.search(text):
             return code

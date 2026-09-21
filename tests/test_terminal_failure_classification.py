@@ -2658,3 +2658,248 @@ def test_the_legacy_failure_disposition_shape_is_unchanged_and_typed_on_top():
     assert verdict["cause"] == "provider_capacity"
     assert verdict["action"] == tfc.ACTION_CAPACITY_HOLD
     assert verdict["provider_launched"] is False
+
+
+# NF-2026-00927: a rate_limit_event line is quota telemetry; only a refused status proves quota.
+def _rate_limit_event(status: str, index: int = 0, **info: object) -> str:
+    return json.dumps(
+        {
+            "type": "rate_limit_event",
+            "rate_limit_info": {
+                "status": status,
+                "resetsAt": 1758625200 + index,
+                "rateLimitType": "five_hour",
+                **info,
+            },
+            "uuid": f"00000000-0000-4000-8000-{index:012d}",
+            "session_id": "11111111-1111-4111-8111-111111111111",
+        },
+        separators=(",", ":"),
+    )
+
+
+def _rate_limit_stream(status: str = "allowed", count: int = 17, **info: object) -> str:
+    return "".join(_rate_limit_event(status, index, **info) + "\n" for index in range(count))
+
+
+_HEADROOM_LINES = {
+    "allowed": _rate_limit_event("allowed"),
+    "allowed_warning": _rate_limit_event("allowed_warning", utilization=0.91),
+    "padded_mixed_case": _rate_limit_event(" Allowed "),
+    "overage_disabled": _rate_limit_event(
+        "allowed", overageStatus="rejected", overageDisabledReason="org_level_disabled",
+        isUsingOverage=False,
+    ),
+    "flat_status": '{"type":"rate_limit_event","status":"allowed"}',
+    "sse_framed": "data: " + _rate_limit_event("allowed"),
+}
+_UNPROVEN_HEADROOM_LINES = {
+    "no_status": '{"type":"rate_limit_event","rate_limit_info":{"rateLimitType":"five_hour"}}',
+    "unrecognised_status": _rate_limit_event("throttled"),
+}
+_GENUINE_RATE_LIMIT_TAILS = [
+    "429 Too Many Requests: rate limit exceeded",
+    "HTTP 429 Too Many Requests",
+    "Error: quota exceeded for this billing period",
+    '{"type":"error","status":429,"error":{"type":"rate_limit_error","message":"Slow down"}}',
+    '{"type":"result","is_error":true,"api_error_status":429,"error":"rate_limit_error"}',
+]
+_LIVENESS_ERROR = "liveness_lost:heartbeat_lease_and_recovery_grace_exceeded:rc=None"
+
+
+@pytest.mark.parametrize(
+    ("stream", "log"), [("stdout_tail", "stdout_path"), ("stderr_tail", "stderr_path")],
+)
+def test_allowed_rate_limit_event_does_not_prove_quota(
+    stream: str, log: str, tmp_path: Path,
+) -> None:
+    """17 allowed quota polls and no refusal: the timeout stays a timeout, never quota."""
+    tail = _rate_limit_stream("allowed", 17)
+    events = [json.loads(line) for line in tail.splitlines()]
+    assert [event["type"] for event in events] == ["rate_limit_event"] * 17
+    assert [event["rate_limit_info"]["status"] for event in events] == ["allowed"] * 17
+    assert "rejected" not in tail and "denied" not in tail
+    assert len(tail.encode("utf-8")) < MAX_TAIL_READ_BYTES
+
+    classified = classify_terminal_failure(
+        state="timed_out", exit_code=137, error=None, **{stream: tail},
+    )
+    path = tmp_path / "provider.log"
+    path.write_text(tail, encoding="utf-8")
+    authority = terminal_event_authority(
+        state="timed_out", exit_code=137, error=None, **{log: path},
+    )
+    assert classified["failure_kind"] == authority["failure_kind"] == "timeout_stall"
+    assert classified["diagnostic"] == "timeout_stall:unclassified:exit_code=137"
+    assert authority["diagnostic"] == authority["error"] == classified["diagnostic"]
+
+
+@pytest.mark.parametrize(
+    ("state", "exit_code", "error", "extra", "kind", "code"),
+    [
+        ("timed_out", 137, None, "", "timeout_stall", "unclassified"),
+        ("stalled", -9, None, "", "timeout_stall", "unclassified"),
+        ("liveness_lost", -9, _LIVENESS_ERROR, "", "timeout_stall", "liveness_lost"),
+        (
+            "timed_out", 137, None, _BRIDGE_TIMEOUT_ENVELOPE + "\n",
+            "timeout_stall", "provider_timeout",
+        ),
+        (
+            "worker_failed", 1, _WORKER_FAILED_WRAPPER, _BRIDGE_TIMEOUT_ENVELOPE + "\n",
+            "worker_failed", "provider_timeout",
+        ),
+        ("worker_failed", 1, _WORKER_FAILED_WRAPPER, "", "worker_failed", "unclassified"),
+    ],
+)
+def test_allowed_rate_limit_event_does_not_prove_quota_or_mask_the_real_cause(
+    state: str, exit_code: int, error: str | None, extra: str, kind: str, code: str,
+) -> None:
+    tail = _rate_limit_stream("allowed", 17) + extra
+    result = classify_terminal_failure(
+        state=state, exit_code=exit_code, error=error, stdout_tail=tail,
+    )
+    assert result["failure_kind"] == kind
+    assert result["diagnostic"] == f"{kind}:{code}:exit_code={exit_code}"
+
+
+def _route_circuit(tmp_path: Path, state: str, terminal: dict[str, object], count: int = 2):
+    from datetime import datetime, timedelta, timezone
+
+    from aiworkhub import workforce_catalog
+
+    now = datetime.now(timezone.utc)
+    observations = [
+        {
+            "adapter_id": "deepseek_vscode_lm",
+            "model": "deepseek-v4-pro",
+            "state": state,
+            "error": terminal["error"],
+            "finished_at": (now - timedelta(seconds=10 * (index + 1))).isoformat(),
+        }
+        for index in range(count)
+    ]
+    return workforce_catalog.route_circuit_for(
+        tmp_path, "deepseek_vscode_lm", "deepseek-v4-pro", observations=observations,
+    )
+
+
+def test_allowed_rate_limit_event_does_not_prove_quota_to_route_health(tmp_path: Path) -> None:
+    telemetry = _rate_limit_stream("allowed", 17)
+    stalled_log = tmp_path / "stalled.log"
+    stalled_log.write_text(telemetry, encoding="utf-8")
+    timeout_log = tmp_path / "timeout.log"
+    timeout_log.write_text(telemetry + _BRIDGE_TIMEOUT_ENVELOPE + "\n", encoding="utf-8")
+    assert timeout_log.stat().st_size < MAX_TAIL_READ_BYTES
+
+    stalled = terminal_event_authority(
+        state="timed_out", exit_code=137, error=None, stdout_path=stalled_log,
+    )
+    timed_out = terminal_event_authority(
+        state="worker_failed", exit_code=1, error=_WORKER_FAILED_WRAPPER, stdout_path=timeout_log,
+    )
+    crashed = terminal_event_authority(
+        state="worker_failed", exit_code=1, error=_WORKER_FAILED_WRAPPER, stdout_path=stalled_log,
+    )
+    assert stalled["error"] == "timeout_stall:unclassified:exit_code=137"
+    assert timed_out["error"] == "worker_failed:provider_timeout:exit_code=1"
+    assert crashed["error"] == "worker_failed:unclassified:exit_code=1"
+
+    stalled_circuit = _route_circuit(tmp_path, "timed_out", stalled)
+    timeout_circuit = _route_circuit(tmp_path, "worker_failed", timed_out)
+    crashed_circuit = _route_circuit(tmp_path, "worker_failed", crashed)
+    assert (stalled_circuit["state"], stalled_circuit["failure_kind"]) == ("open", "transient")
+    assert (timeout_circuit["state"], timeout_circuit["failure_kind"]) == ("open", "transient")
+    assert (crashed_circuit["state"], crashed_circuit["failure_kind"]) == ("closed", "")
+
+    for state, error in (("timed_out", None), ("worker_failed", _WORKER_FAILED_WRAPPER)):
+        disposition = tfc.failure_disposition_from_paths(
+            state=state, error=error, stdout_path=stalled_log,
+        )
+        assert disposition["cause"] != tfc.CAUSE_PROVIDER_CAPACITY
+        assert disposition["action"] == tfc.ACTION_MANAGER_JUDGMENT_UNKNOWN
+        assert disposition["provider_launched"] is False
+        assert not tfc.same_route_retry_allowed(disposition=disposition, circuit_allows=True)
+        assert not tfc.distinct_route_retry_allowed(disposition=disposition, attempts_made=1)
+
+
+@pytest.mark.parametrize("status", ["rejected", "denied"])
+@pytest.mark.parametrize("position", ["first", "last", "only"])
+@pytest.mark.parametrize(
+    ("state", "exit_code", "kind"),
+    [("worker_failed", 1, "worker_failed"), ("timed_out", 137, "timeout_stall")],
+)
+def test_a_rejected_rate_limit_event_still_classifies_as_rate_limited(
+    status: str, position: str, state: str, exit_code: int, kind: str,
+) -> None:
+    allowed = _rate_limit_stream("allowed", 16)
+    refused = _rate_limit_event(status, 16) + "\n"
+    tail = {"first": refused + allowed, "last": allowed + refused, "only": refused}[position]
+    result = classify_terminal_failure(
+        state=state, exit_code=exit_code, error=None, stdout_tail=tail,
+    )
+    assert result["diagnostic"] == f"{kind}:rate_limited:exit_code={exit_code}"
+
+
+@pytest.mark.parametrize("line", list(_HEADROOM_LINES.values()), ids=list(_HEADROOM_LINES))
+def test_a_rate_limit_event_that_reports_headroom_is_not_quota_evidence(line: str) -> None:
+    result = classify_terminal_failure(
+        state="worker_failed", exit_code=1, error=_WORKER_FAILED_WRAPPER, stdout_tail=line + "\n",
+    )
+    assert result["diagnostic"] == "worker_failed:unclassified:exit_code=1"
+
+
+@pytest.mark.parametrize(
+    "line", list(_UNPROVEN_HEADROOM_LINES.values()), ids=list(_UNPROVEN_HEADROOM_LINES),
+)
+def test_a_rate_limit_event_that_does_not_report_headroom_still_reads_as_rate_limited(
+    line: str,
+) -> None:
+    result = classify_terminal_failure(
+        state="worker_failed", exit_code=1, error=_WORKER_FAILED_WRAPPER, stdout_tail=line + "\n",
+    )
+    assert result["diagnostic"] == "worker_failed:rate_limited:exit_code=1"
+
+
+@pytest.mark.parametrize("stream", _TAIL_STREAMS)
+@pytest.mark.parametrize("tail", _GENUINE_RATE_LIMIT_TAILS)
+def test_genuine_429_and_too_many_requests_still_classify_as_rate_limited(
+    tail: str, stream: str,
+) -> None:
+    for telemetry in ("", _rate_limit_stream("allowed", 17)):
+        result = classify_terminal_failure(
+            state="worker_failed", exit_code=1, error=_WORKER_FAILED_WRAPPER,
+            **{stream: telemetry + tail + "\n"},
+        )
+        assert result["diagnostic"] == "worker_failed:rate_limited:exit_code=1"
+
+
+def test_a_named_http_429_refusal_keeps_its_status_beside_allowed_telemetry() -> None:
+    result = classify_terminal_failure(
+        state="worker_failed",
+        exit_code=1,
+        error="provider_refused_rate_limited_recoverable_after_reported_window:http_status=429",
+        stdout_tail=_rate_limit_stream("allowed", 17),
+    )
+    assert result["diagnostic"] == "worker_failed:rate_limited:http_status=429:exit_code=1"
+
+
+@pytest.mark.parametrize("payload", _SECRET_PAYLOADS)
+@pytest.mark.parametrize("status", ["allowed", "rejected"])
+def test_rate_limit_event_fields_never_reach_a_durable_diagnostic(
+    status: str, payload: str, tmp_path: Path,
+) -> None:
+    tail = _rate_limit_stream(status, 3, overageDisabledReason=payload)
+    path = tmp_path / "provider.log"
+    path.write_text(tail, encoding="utf-8")
+    classified = classify_terminal_failure(
+        state="worker_failed", exit_code=1, error=None, stdout_tail=tail,
+    )
+    authority = terminal_event_authority(
+        state="worker_failed", exit_code=1, error=None, stdout_path=path,
+    )
+    for text in (classified["diagnostic"], authority["diagnostic"], authority["error"]):
+        assert payload not in text
+        assert "hunter2plain" not in text and "SECRETKEYMATERIAL" not in text
+        assert len(text) <= MAX_DIAGNOSTIC_CHARS
+        assert _ALLOWLISTED_DIAGNOSTIC.match(text), text
+        assert ("rate_limited" in text) is (status == "rejected")

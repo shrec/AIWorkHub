@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import copy
+import inspect
+import json
+import random
 import sys
 import threading
 import time
@@ -227,6 +231,331 @@ def test_snapshot_view_never_exceeds_response_bound_even_when_everything_is_huge
     assert truncated == list(dashboard_mcp_app._SNAPSHOT_TRIM_ORDER[: len(truncated)])
     for field in truncated:
         assert result[field] == {"transport_truncated": True}
+
+
+# ---------------------------------------------------------------------------
+# snapshot_view: bounded quarantine history and known-contract suppression
+# ---------------------------------------------------------------------------
+
+_QUARANTINE_ARRAYS = (
+    "quarantine_batches",
+    "terminal_log_quarantine_batches",
+    "task_retention_batches",
+)
+# Every retention provider lists at most its newest 100 batches, so a mature
+# repository hands the snapshot 100 rows in each of the three arrays.
+_PROVIDER_BATCH_CAP = 100
+
+
+def _quarantine_stamp(index: int) -> str:
+    return f"2026-07-{1 + index // 24:02d}T{index % 24:02d}:30:00+00:00"
+
+
+def _quarantine_row(array: str, index: int) -> dict[str, Any]:
+    """One batch row in the shape the array's retention provider lists."""
+
+    batch_id = f"{array[:4]}-{index:04d}"
+    deadline = "2026-08-20T00:00:00+00:00"
+    if array == "task_retention_batches":
+        return {
+            "batch_id": batch_id,
+            "task_count": 7,
+            "bytes": 41_000 + index,
+            "quarantined_at": _quarantine_stamp(index),
+            "restore_deadline": deadline,
+            "restored": False,
+            "purge_eligible": False,
+        }
+    row: dict[str, Any] = {
+        "batch_id": batch_id,
+        "created_at": _quarantine_stamp(index),
+        "restore_deadline": deadline,
+        "status": "quarantined",
+        "quarantined_count": 3,
+        "restored_count": 0,
+        "bytes": 1_048_576 + index,
+        "purge_eligible": False,
+        "reapable_empty": False,
+    }
+    if array == "terminal_log_quarantine_batches":
+        row.update(
+            {
+                "recorded_bytes": 1_048_576 + index,
+                "on_disk_bytes": 1_048_576 + index,
+                "unclaimed": False,
+            }
+        )
+    return row
+
+
+def _storage_usage(rows: int = _PROVIDER_BATCH_CAP, *, reverse: bool = False) -> dict[str, Any]:
+    """A storage_observability.snapshot() payload whose batch arrays are unsorted."""
+
+    usage: dict[str, Any] = {
+        "schema_version": 1,
+        "readonly": True,
+        "disk_total_bytes": 512_000_000_000,
+        "disk_free_bytes": 200_000_000_000,
+        "scan_status": "ready",
+        "repo_data_bytes": 9_100_000_000,
+        "quarantine_bytes": 123_456_789,
+        "managed_total_bytes": 19_900_000_000,
+        "task_retention": {"ok": True, "candidate_count": 4, "archived_total": 812},
+        "storage_bounds": {"terminal_unclaimed_count": 0},
+        "errors": [],
+    }
+    for array in _QUARANTINE_ARRAYS:
+        order = list(range(rows))
+        random.Random(857).shuffle(order)
+        if reverse:
+            order.reverse()
+        usage[array] = [_quarantine_row(array, index) for index in order]
+    return usage
+
+
+def _manager_reply() -> dict[str, Any]:
+    """A manager_bootstrap route-gate reply: identity facts plus the contract prose."""
+
+    reply: dict[str, Any] = {
+        "ok": True,
+        "role": "manager",
+        "provider": "codex",
+        "repo_id": "repo_canon",
+        "storage_ready": True,
+        "manager_verified": True,
+        "manager_route": {"thread_id": "019f5097-6dbe-7172-870a-945afc5f3bfa"},
+        "task_health": {"pending": 1, "processing": 1},
+        "contract_version": core.MANAGER_CONTRACT_VERSION,
+        "contract_sha256": core.MANAGER_CONTRACT_SHA256,
+        "contract_delivered": True,
+        "contract_delivery_reason": "route_gate_call",
+    }
+    reply.update(copy.deepcopy(core.MANAGER_CONTRACT))
+    return reply
+
+
+def _stub_snapshot_sources(
+    monkeypatch,
+    *,
+    storage_usage: dict[str, Any] | None = None,
+    manager: dict[str, Any] | None = None,
+) -> None:
+    """Serve one hermetic snapshot: no SQLite, repository scan or router read."""
+
+    snapshot = dict(FAKE_SNAPSHOT)
+    if storage_usage is not None:
+        snapshot["storage_usage"] = storage_usage
+    monkeypatch.setattr(dashboard, "build_snapshot", lambda **_kwargs: dict(snapshot))
+    monkeypatch.setattr(core, "manager_bootstrap", lambda: copy.deepcopy(manager or {}))
+    monkeypatch.setattr(core, "dispatcher_health", lambda: {"ok": True, "status": "running"})
+    monkeypatch.setattr(core, "repo_root", lambda: Path("/"))
+    monkeypatch.setattr(core, "read_selected_coordinator_target", lambda _root: {})
+    monkeypatch.setattr(
+        dashboard_mcp_app.shared_router, "list_known_repositories", lambda **_kwargs: {}
+    )
+    monkeypatch.setattr(dashboard_mcp_app.storage_observability, "snapshot", lambda _root: {})
+
+
+def test_snapshot_default_bounds_quarantine_rows_and_states_the_full_count(monkeypatch):
+    usage = _storage_usage()
+    _stub_snapshot_sources(monkeypatch, storage_usage=usage)
+
+    bounded = dashboard_mcp_app.snapshot_view()["storage_usage"]
+
+    assert dashboard_mcp_app.MAX_SNAPSHOT_QUARANTINE_ROWS == 5
+    for array in _QUARANTINE_ARRAYS:
+        assert bounded[array]["total_count"] == 100
+        assert bounded[array]["returned_count"] == 5
+        assert bounded[array]["truncated"] is True
+        assert bounded[array]["rows"] == [
+            _quarantine_row(array, index) for index in range(99, 94, -1)
+        ]
+    # Only the three history arrays change; every other storage fact stays whole.
+    assert set(bounded) == set(usage)
+    for key in set(usage) - set(_QUARANTINE_ARRAYS):
+        assert bounded[key] == usage[key]
+    # The builder's cached arrays are read, never consumed by the projection.
+    assert all(len(usage[array]) == 100 for array in _QUARANTINE_ARRAYS)
+
+
+def test_snapshot_default_quarantine_rows_do_not_depend_on_input_order(monkeypatch):
+    payloads = []
+    for reverse in (False, True):
+        _stub_snapshot_sources(monkeypatch, storage_usage=_storage_usage(reverse=reverse))
+        payloads.append(json.dumps(dashboard_mcp_app.snapshot_view()["storage_usage"]))
+
+    assert payloads[0] == payloads[1]
+
+
+def test_snapshot_default_quarantine_recency_is_the_newest_instant_then_batch_id(monkeypatch):
+    rows = [
+        {"batch_id": "offset-older", "created_at": "2026-07-10T12:00:00+05:00"},
+        {"batch_id": "utc-newer", "created_at": "2026-07-10T08:00:00+00:00"},
+        {"batch_id": "tie-a", "created_at": "2026-07-09T00:00:00+00:00"},
+        {"batch_id": "tie-c", "created_at": "2026-07-09T00:00:00Z"},
+        {"batch_id": "tie-b", "created_at": "2026-07-09T00:00:00+00:00"},
+        {"batch_id": "undated"},
+        {"batch_id": "garbled", "created_at": "not-a-time"},
+    ]
+    _stub_snapshot_sources(monkeypatch, storage_usage={"quarantine_batches": rows})
+
+    bound = dashboard_mcp_app.snapshot_view()["storage_usage"]["quarantine_batches"]
+
+    # 12:00+05:00 is 07:00Z: an hour older than 08:00Z although it sorts after it as text.
+    assert [row["batch_id"] for row in bound["rows"]] == [
+        "utc-newer",
+        "offset-older",
+        "tie-c",
+        "tie-b",
+        "tie-a",
+    ]
+    assert (bound["total_count"], bound["returned_count"], bound["truncated"]) == (7, 5, True)
+
+
+@pytest.mark.parametrize("count", [0, 3, 5, 6])
+def test_snapshot_default_quarantine_counts_are_true_at_the_bound_edges(monkeypatch, count):
+    _stub_snapshot_sources(monkeypatch, storage_usage=_storage_usage(rows=count))
+
+    bounded = dashboard_mcp_app.snapshot_view()["storage_usage"]
+
+    for array in _QUARANTINE_ARRAYS:
+        assert bounded[array]["total_count"] == count
+        assert bounded[array]["returned_count"] == min(count, 5) == len(bounded[array]["rows"])
+        assert bounded[array]["truncated"] is (count > 5)
+
+
+def test_snapshot_default_leaves_absent_or_unexpected_storage_shapes_alone(monkeypatch):
+    usage = {
+        "scan_status": "scanning",
+        "quarantine_batches": None,
+        "task_retention_batches": {"unexpected": True},
+    }
+    _stub_snapshot_sources(monkeypatch, storage_usage=usage)
+
+    bounded = dashboard_mcp_app.snapshot_view()["storage_usage"]
+
+    assert bounded == usage
+    assert "terminal_log_quarantine_batches" not in bounded
+
+
+def test_snapshot_full_keeps_every_quarantine_row_and_the_whole_contract(monkeypatch):
+    usage = _storage_usage()
+    manager = _manager_reply()
+    _stub_snapshot_sources(monkeypatch, storage_usage=usage, manager=manager)
+
+    # Neither the row bound nor the contract digest applies to the Webview's full shape.
+    result = dashboard_mcp_app.snapshot_view(
+        full=True, known_contract_sha256=core.MANAGER_CONTRACT_SHA256
+    )
+
+    assert result["snapshot_mode"] == "full"
+    assert result["storage_usage"] == usage
+    assert all(isinstance(result["storage_usage"][array], list) for array in _QUARANTINE_ARRAYS)
+    assert result["manager_identity"] == manager
+    assert result["tasks"] == FAKE_SNAPSHOT["tasks"]
+    assert set(result) == set(FAKE_SNAPSHOT) | {
+        "storage_usage",
+        "manager_identity",
+        "callback_delivery",
+        "known_repositories",
+        "manager_identity_target",
+        "server_tool",
+        "authority_flags",
+        "snapshot_mode",
+    }
+
+
+@pytest.mark.parametrize("digest", [None, "", "   "])
+def test_snapshot_default_without_a_digest_keeps_the_whole_contract(monkeypatch, digest):
+    manager = _manager_reply()
+    _stub_snapshot_sources(monkeypatch, manager=manager)
+
+    assert dashboard_mcp_app.snapshot_view()["manager_identity"] == manager
+    result = dashboard_mcp_app.snapshot_view(known_contract_sha256=digest)
+    assert result["manager_identity"] == manager
+
+
+@pytest.mark.parametrize(
+    "spell",
+    [str, str.upper, lambda digest: f"  {digest}\n"],
+    ids=["exact", "uppercase", "padded"],
+)
+def test_snapshot_default_known_contract_digest_suppresses_the_unchanged_prose(monkeypatch, spell):
+    manager = _manager_reply()
+    _stub_snapshot_sources(monkeypatch, manager=manager)
+
+    identity = dashboard_mcp_app.snapshot_view(
+        known_contract_sha256=spell(core.MANAGER_CONTRACT_SHA256)
+    )["manager_identity"]
+
+    assert not set(core.MANAGER_CONTRACT) & set(identity)
+    assert identity["contract_omitted_fields"] == sorted(core.MANAGER_CONTRACT)
+    assert identity["contract_sha256"] == core.MANAGER_CONTRACT_SHA256
+    assert identity["contract_delivered"] is False
+    assert identity["contract_delivery_reason"] == "caller_holds_current_contract"
+    assert "known_contract_sha256" in identity["contract_recall"]
+    delivery_facts = {"contract_delivered", "contract_delivery_reason"}
+    for key, value in manager.items():
+        if key not in core.MANAGER_CONTRACT and key not in delivery_facts:
+            assert identity[key] == value
+
+
+@pytest.mark.parametrize("stale", ["0" * 64, "deadbeef", "not a digest"])
+def test_snapshot_default_stale_contract_digest_returns_the_contract(monkeypatch, stale):
+    _stub_snapshot_sources(monkeypatch, manager=_manager_reply())
+
+    identity = dashboard_mcp_app.snapshot_view(known_contract_sha256=stale)["manager_identity"]
+
+    for key, value in core.MANAGER_CONTRACT.items():
+        assert identity[key] == value
+    assert identity["contract_sha256"] == core.MANAGER_CONTRACT_SHA256
+    assert identity["contract_delivered"] is True
+    assert identity["contract_delivery_reason"] == "contract_sha_changed"
+    assert "contract_omitted_fields" not in identity
+
+
+def test_snapshot_default_digest_cannot_suppress_a_reply_that_holds_no_contract(monkeypatch):
+    _stub_snapshot_sources(monkeypatch)
+
+    def failing_bootstrap():
+        raise RuntimeError("bootstrap unavailable")
+
+    monkeypatch.setattr(core, "manager_bootstrap", failing_bootstrap)
+
+    identity = dashboard_mcp_app.snapshot_view(
+        known_contract_sha256=core.MANAGER_CONTRACT_SHA256
+    )["manager_identity"]
+
+    assert identity["ok"] is False
+    assert identity["reason"] == "manager_bootstrap_failed:RuntimeError"
+    assert "contract_omitted_fields" not in identity
+    assert "contract_delivered" not in identity
+
+
+def test_snapshot_default_payload_is_materially_smaller_on_a_mature_repository(monkeypatch):
+    usage = _storage_usage()
+    manager = _manager_reply()
+    _stub_snapshot_sources(monkeypatch, storage_usage=usage, manager=manager)
+
+    bounded = dashboard_mcp_app.snapshot_view()
+    known = dashboard_mcp_app.snapshot_view(known_contract_sha256=core.MANAGER_CONTRACT_SHA256)
+    # The same default response before the bound: raw provider arrays, whole reply.
+    legacy = {**bounded, "storage_usage": usage, "manager_identity": manager}
+    legacy_bytes = dashboard_mcp_app._byte_len(legacy)
+    bounded_bytes = dashboard_mcp_app._byte_len(bounded)
+    contract_bytes = dashboard_mcp_app._byte_len(core.MANAGER_CONTRACT)
+
+    assert legacy_bytes > 70_000
+    assert bounded_bytes < legacy_bytes * 0.25
+    assert bounded_bytes < 20_000
+    assert bounded_bytes - dashboard_mcp_app._byte_len(known) > contract_bytes * 0.8
+
+
+def test_snapshot_tool_signature_gains_only_the_optional_contract_digest():
+    parameters = inspect.signature(dashboard_mcp_app.snapshot_view).parameters
+
+    assert list(parameters) == ["full", "previous", "previous_snapshot", "known_contract_sha256"]
+    assert parameters["known_contract_sha256"].default == ""
 
 
 # ---------------------------------------------------------------------------
