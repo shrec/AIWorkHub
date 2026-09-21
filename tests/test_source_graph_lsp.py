@@ -608,7 +608,7 @@ def test_windows_stdio_timeout_cancel_and_cleanup(tmp_path: Path, monkeypatch: p
         raise AttributeError("killpg")
 
     monkeypatch.setattr(lsp.select, "select", _windows_select)
-    monkeypatch.setattr(lsp.os, "killpg", _missing_killpg)
+    monkeypatch.setattr(lsp.os, "killpg", _missing_killpg, raising=False)
 
     source = b"def foo():\n    return foo()\n"
     repo, workspace, hashes = _workspace(tmp_path, [("src/mod.py", source)])
@@ -691,7 +691,7 @@ def test_windows_didopen_write_respects_deadline_when_server_stops_reading(
         raise AttributeError("killpg")
 
     monkeypatch.setattr(lsp.select, "select", _windows_select)
-    monkeypatch.setattr(lsp.os, "killpg", _missing_killpg)
+    monkeypatch.setattr(lsp.os, "killpg", _missing_killpg, raising=False)
     _stalled_large_didopen(tmp_path)
 
 
