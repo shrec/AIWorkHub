@@ -2208,6 +2208,42 @@ def test_rework_delta_artifact_round_trips_changed_and_deleted_files(
     assert not (worktree / "src" / "deleted.txt").exists()
 
 
+def test_rework_delta_artifact_verifies_without_touching_a_worktree(
+    tmp_path: Path,
+) -> None:
+    """Recovery authenticates a collected candidate with the same verifier the
+    successor materializes through, without writing a single candidate byte."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    content = b"sealed candidate\n"
+    expected = {"out/result.txt": hashlib.sha256(content).hexdigest()}
+    descriptor = worker_workspace.seal_rework_delta_artifact(
+        repo,
+        "task-1",
+        "request-1",
+        1,
+        [("out/result.txt", content)],
+        tmp_path / "artifacts",
+    )
+
+    assert worker_workspace.verify_rework_delta_artifact(
+        descriptor, repo, "request-1", "task-1", 1, expected, ("out/result.txt",)
+    ) == [("out/result.txt", content)]
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["artifacts", "repo"]
+    with pytest.raises(
+        worker_workspace.WorkspaceError, match="rework_predecessor_hash_mismatch"
+    ):
+        worker_workspace.verify_rework_delta_artifact(
+            descriptor,
+            repo,
+            "request-1",
+            "task-1",
+            1,
+            {"out/result.txt": "0" * 64},
+            ("out/result.txt",),
+        )
+
+
 def test_rework_delta_artifact_rejects_tampered_bytes(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     worktree = tmp_path / "worktree"

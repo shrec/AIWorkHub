@@ -1,15 +1,17 @@
 from __future__ import annotations
 
+import base64
 import copy
 import hashlib
 import json
 import os
+import shutil
 import sqlite3
 from pathlib import Path
 
 import pytest
 
-from aiworkhub import task_store
+from aiworkhub import task_store, worker_workspace
 
 
 _TERMINAL_REVIEW_EVIDENCE = {
@@ -2447,3 +2449,395 @@ def test_timed_out_sealed_delta_supersedes_earlier_predecessor(
     assert "recovery_mode" not in recovered
     for path, original in before_bytes.items():
         assert (late_workspace / path).read_bytes() == original
+
+
+_NF919_PATHS = tuple(
+    f"src/aiworkhub/nf919_{name}.py" for name in ("a", "b", "c", "d", "e", "f", "g")
+)
+_NF919_FEEDBACK = "NeedFix: finish NF919 from its sealed epoch-6 candidate"
+
+
+def _seal_nf919_delta(
+    repo: Path, task_id: str, request_id: str, entries: dict[str, bytes], artifact_dir: Path,
+) -> dict[str, str]:
+    """Write the byte-identical packet ``seal_rework_delta_artifact`` seals for
+    this epoch-6 candidate, minus its 0700/0600 mode hardening, which is not
+    under test and which chmod-denying validation sandboxes refuse."""
+    payload = {
+        "schema_id": worker_workspace.REWORK_DELTA_ARTIFACT_SCHEMA_ID,
+        "authority_repo": str(repo.resolve(strict=False)),
+        "task_id": task_id,
+        "request_id": request_id,
+        "claim_epoch": 6,
+        "files": [
+            {
+                "path": path,
+                "sha256": hashlib.sha256(data).hexdigest(),
+                "content_base64": base64.b64encode(data).decode("ascii"),
+            }
+            for path, data in sorted(entries.items())
+        ],
+    }
+    packet = {
+        **payload,
+        "canonical_digest": worker_workspace._rework_delta_canonical_digest(payload),
+    }
+    encoded = json.dumps(packet, indent=2, ensure_ascii=True).encode("utf-8")
+    digest = hashlib.sha256(encoded).hexdigest()
+    artifact_path = artifact_dir.resolve(strict=False) / f"{digest}.json"
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    artifact_path.write_bytes(encoded)
+    return {"path": str(artifact_path), "digest": digest}
+
+
+def _nf919_timed_out_gc_fixture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Path, str, dict[str, bytes], dict[str, object]]:
+    """NF-2026-00594: NF919 timed out at claim epoch 6 after sealing its
+    seven-path candidate over an epoch-5 predecessor, then retention collected
+    the whole request directory; only the sealed delta still holds the bytes."""
+    monkeypatch.delenv(worker_workspace.RUNTIME_ROOT_ENV, raising=False)
+    monkeypatch.delenv(worker_workspace.WORKTREE_ROOT_ENV, raising=False)
+    repo = _setup_repo(tmp_path).resolve()
+    task_id = "needfix-NF-2026-00919"
+    runner = "codex_worker_test"
+    topic = "aiworkhub_blocked_rework_recovery"
+    request_id = "6" * 32
+    request_root = repo / ".aiworkhub" / "runtime" / "worktrees" / request_id
+    worktree = request_root / "worktree"
+    parent_baseline: dict[str, str | None] = {}
+    sealed: dict[str, bytes] = {}
+    for path in _NF919_PATHS:
+        if path.endswith("_g.py"):
+            parent_baseline[path] = None  # the candidate adds this file
+        else:
+            baseline = repo / path
+            baseline.parent.mkdir(parents=True, exist_ok=True)
+            baseline.write_bytes(f"canonical {path}\n".encode())
+            parent_baseline[path] = (
+                "file:664:" + hashlib.sha256(baseline.read_bytes()).hexdigest()
+            )
+        sealed[path] = f"epoch 6 timed-out candidate {path}\n".encode()
+        (worktree / path).parent.mkdir(parents=True, exist_ok=True)
+        (worktree / path).write_bytes(sealed[path])
+    hashes = {path: hashlib.sha256(data).hexdigest() for path, data in sealed.items()}
+    authority = {
+        "schema_id": "aiworkhub.python_candidate_authority.v1",
+        "sources": [
+            {
+                "path": path,
+                "state": "added" if parent_baseline[path] is None else "modified",
+                "bytes_sha256": hashes[path],
+            }
+            for path in sorted(hashes)
+        ],
+    }
+    workspace = worker_workspace.WorkerWorkspace(
+        request_id=request_id,
+        repo=repo,
+        path=worktree,
+        home=request_root / "home",
+        allowed_writes=_NF919_PATHS,
+        parent_baseline=dict(parent_baseline),
+        workspace_baseline=dict(parent_baseline),
+        base_oid="b" * 40,
+    ).as_metadata()
+    workspace["python_candidate_authority"] = dict(authority)
+    artifact = _seal_nf919_delta(
+        repo,
+        task_id,
+        request_id,
+        sealed,
+        worker_workspace.configured_runtime_root(repo) / "rework_deltas",
+    )
+    descriptor: dict[str, object] = {
+        "schema_id": "aiworkhub.rework_delta_descriptor.v1",
+        "sealed": True,
+        "authority_repo": str(repo),
+        "task_id": task_id,
+        "request_id": request_id,
+        "claim_epoch": 6,
+        "artifact_path": artifact["path"],
+        "artifact_sha256": artifact["digest"],
+    }
+    evidence = {
+        "request_id": request_id,
+        "adapter_id": "codex_cli",
+        "failure_class": "timeout",
+        "error": "timed_out: worker exceeded its hard deadline",
+        "claim_state": "claimed",
+        "changed_paths": list(_NF919_PATHS),
+        "changed_path_hashes": hashes,
+        "python_candidate_authority": authority,
+        "workspace": workspace,
+        "request_identity": {
+            "request_id": request_id,
+            "task_id": task_id,
+            "runner": runner,
+            "topic": topic,
+            "repo": str(repo),
+            "claim_epoch": 6,
+            "allowed_writes": list(_NF919_PATHS),
+            "base_oid": "b" * 40,
+            "parent_baseline": dict(parent_baseline),
+        },
+        "rework_delta": descriptor,
+    }
+    stale_request_id = "5" * 32
+    stale_hashes = {
+        path: hashlib.sha256(f"epoch 5 {path}\n".encode()).hexdigest()
+        for path in _NF919_PATHS[:3]
+    }
+    card = {
+        "task_id": task_id,
+        "runner": runner,
+        "topic": topic,
+        "allowed_writes": list(_NF919_PATHS),
+        "required_outputs": [],
+        "claim_epoch": 6,
+        "launch_request_id": request_id,
+        "rework_predecessor": {
+            "schema_id": "aiworkhub.rework_predecessor.v1",
+            "request_id": stale_request_id,
+            "task_id": task_id,
+            "repo": str(repo),
+            "claim_epoch": 5,
+            "allowed_writes": list(_NF919_PATHS),
+            "changed_paths": sorted(stale_hashes),
+            "changed_path_hashes": stale_hashes,
+        },
+    }
+    now = "2026-09-20T00:00:00+00:00"
+    _readiness, db_path = task_store._require_ready(repo)
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO tasks(task_id, runner, topic, status, worker_status, priority, "
+            "objective, card_json, created_at, updated_at, claimed_by, claimed_at, "
+            "started_at) VALUES (?, ?, ?, 'processing', 'in_progress', '', '', ?, ?, ?, ?, ?, ?)",
+            (task_id, runner, topic, json.dumps(card), now, now, runner, now, now),
+        )
+        conn.execute(
+            "INSERT INTO task_events(task_id, event, runner, payload_json, created_at) "
+            "VALUES (?, 'terminal_failure', ?, ?, ?)",
+            (
+                task_id,
+                runner,
+                json.dumps(
+                    {"substatus": "timed_out", "claim_epoch": 5, "request_id": stale_request_id}
+                ),
+                now,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    assert task_store.mark_terminal_failure(
+        repo,
+        task_id,
+        runner=runner,
+        substatus="timed_out",
+        evidence=evidence,
+        request_id=request_id,
+        claim_epoch=6,
+    ) == (True, "blocked")
+    shutil.rmtree(request_root)  # retention collected both worktree and home
+    return repo, task_id, sealed, descriptor
+
+
+def _nf919_state(repo: Path, task_id: str) -> tuple[object, ...]:
+    _readiness, db_path = task_store._require_ready(repo)
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT status, worker_status, claimed_by, card_json FROM tasks WHERE task_id=?",
+            (task_id,),
+        ).fetchone()
+        events = conn.execute(
+            "SELECT event, payload_json FROM task_events WHERE task_id=? ORDER BY rowid",
+            (task_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+    return tuple(row), tuple(events)
+
+
+def _rewrite_nf919_delta(
+    repo: Path, task_id: str, descriptor: dict[str, object] | None,
+) -> None:
+    """Replace the delta claim identically on the card and its exact event."""
+    _readiness, db_path = task_store._require_ready(repo)
+    conn = sqlite3.connect(db_path)
+    try:
+        card = json.loads(
+            conn.execute(
+                "SELECT card_json FROM tasks WHERE task_id=?", (task_id,)
+            ).fetchone()[0]
+        )
+        failure = card["terminal_failure"]
+        if descriptor is None:
+            failure["evidence"].pop("rework_delta")
+        else:
+            failure["evidence"]["rework_delta"] = descriptor
+        conn.execute(
+            "UPDATE tasks SET card_json=? WHERE task_id=?", (json.dumps(card), task_id)
+        )
+        conn.execute(
+            "UPDATE task_events SET payload_json=? WHERE rowid=(SELECT MAX(rowid) "
+            "FROM task_events WHERE task_id=? AND event='terminal_failure')",
+            (json.dumps(failure), task_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_nf594_timed_out_gc_recovers_from_authenticated_sealed_delta(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, task_id, sealed, descriptor = _nf919_timed_out_gc_fixture(tmp_path, monkeypatch)
+    blocked = _get_card(repo, task_id)
+    hashes = {path: hashlib.sha256(data).hexdigest() for path, data in sealed.items()}
+
+    assert task_store.recover_blocked_rework(
+        repo, task_id, actor="coordinator", feedback_reason=_NF919_FEEDBACK,
+    ) == (True, "recovered")
+
+    recovered = _get_card(repo, task_id)
+    assert recovered["status"] == "pending"
+    assert recovered["claim_epoch"] == 7
+    assert recovered["allowed_writes"] == list(_NF919_PATHS)
+    # The sealed epoch-6 candidate supersedes the stale epoch-5 predecessor
+    # with its exact task/request/claim/scope/baseline/hash identity.
+    predecessor = recovered["rework_predecessor"]
+    assert predecessor["request_id"] == descriptor["request_id"]
+    assert predecessor["task_id"] == task_id
+    assert predecessor["claim_epoch"] == 6
+    assert predecessor["allowed_writes"] == list(_NF919_PATHS)
+    assert predecessor["changed_path_hashes"] == hashes
+    assert predecessor["workspace"] == blocked["terminal_failure"]["evidence"]["workspace"]
+    assert predecessor["rework_delta"] == descriptor
+    assert predecessor["delta_artifact"] == {
+        "path": descriptor["artifact_path"],
+        "digest": descriptor["artifact_sha256"],
+    }
+    assert recovered["recovery_predecessor"]["changed_path_hashes"] == hashes
+    assert "clean_root_recovery_authorization" not in recovered
+    assert "recovery_mode" not in recovered
+    assert task_store.recover_blocked_rework(
+        repo, task_id, actor="coordinator", feedback_reason=_NF919_FEEDBACK,
+    ) == (True, "already_recovered")
+
+    # The successor inherits the exact sealed bytes through the existing delta
+    # materializer: nothing is regenerated and the collected worktree stays gone.
+    successor = tmp_path / "successor"
+    successor.mkdir()
+    assert worker_workspace._materialize_rework_predecessor(
+        repo, successor, recovered, tuple(recovered["allowed_writes"])
+    ) == sorted(_NF919_PATHS)
+    for path, data in sealed.items():
+        assert (successor / path).read_bytes() == data
+    assert not (
+        repo / ".aiworkhub" / "runtime" / "worktrees" / str(descriptor["request_id"])
+    ).exists()
+
+
+@pytest.mark.parametrize(
+    ("tamper", "reason"),
+    [
+        ("artifact_bytes", "retained_terminal_candidate_delta_unverified"),
+        ("artifact_missing", "retained_terminal_candidate_delta_unverified"),
+        ("artifact_symlink", "retained_terminal_candidate_delta_unverified"),
+        ("delta_dir_symlink", "retained_terminal_candidate_delta_unverified"),
+        ("descriptor_repo", "retained_terminal_candidate_delta_unverified"),
+        ("descriptor_request", "retained_terminal_candidate_delta_unverified"),
+        ("descriptor_claim", "retained_terminal_candidate_delta_unverified"),
+        ("descriptor_unsealed", "retained_terminal_candidate_delta_unverified"),
+        ("packet_path", "retained_terminal_candidate_delta_mismatch"),
+        ("packet_hash", "retained_terminal_candidate_delta_mismatch"),
+        ("descriptor_missing", "retained_terminal_candidate_workspace_invalid"),
+        ("worktree_symlink", "retained_terminal_candidate_workspace_invalid"),
+    ],
+)
+def test_nf594_gc_sealed_delta_fails_closed_without_task_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tamper: str, reason: str,
+) -> None:
+    repo, task_id, sealed, descriptor = _nf919_timed_out_gc_fixture(tmp_path, monkeypatch)
+    artifact = Path(str(descriptor["artifact_path"]))
+    request_id = str(descriptor["request_id"])
+    if tamper == "artifact_bytes":
+        artifact.write_bytes(artifact.read_bytes() + b"\n")
+    elif tamper == "artifact_missing":
+        artifact.unlink()
+    elif tamper == "artifact_symlink":
+        moved = tmp_path / "outside-delta.json"
+        artifact.rename(moved)
+        artifact.symlink_to(moved)
+    elif tamper == "delta_dir_symlink":
+        moved = tmp_path / "outside-deltas"
+        artifact.parent.rename(moved)
+        artifact.parent.symlink_to(moved, target_is_directory=True)
+    elif tamper.startswith("descriptor_"):
+        changed: dict[str, object] | None = dict(descriptor)
+        if tamper == "descriptor_repo":
+            changed["authority_repo"] = str(tmp_path / "other-repo")
+        elif tamper == "descriptor_request":
+            changed["request_id"] = "0" * 32
+        elif tamper == "descriptor_claim":
+            changed["claim_epoch"] = 5
+        elif tamper == "descriptor_unsealed":
+            changed = {
+                "schema_id": "aiworkhub.rework_delta_seal.v1",
+                "sealed": False,
+                "reason": "rework_delta_seal_failed:disk full",
+            }
+        else:
+            changed = None
+        _rewrite_nf919_delta(repo, task_id, changed)
+    elif tamper.startswith("packet_"):
+        # A well-formed, correctly addressed artifact that does not hold the
+        # terminal's exact changed paths and hashes.
+        entries = dict(sealed)
+        if tamper == "packet_path":
+            entries["src/aiworkhub/nf919_h.py"] = entries.pop(_NF919_PATHS[-1])
+        else:
+            entries[_NF919_PATHS[0]] = b"regenerated bytes\n"
+        resealed = _seal_nf919_delta(repo, task_id, request_id, entries, artifact.parent)
+        _rewrite_nf919_delta(repo, task_id, {
+            **descriptor,
+            "artifact_path": resealed["path"],
+            "artifact_sha256": resealed["digest"],
+        })
+    else:
+        # Identical bytes behind a symlinked worktree are still not retained.
+        target = tmp_path / "outside-worktree"
+        for path, data in sealed.items():
+            (target / path).parent.mkdir(parents=True, exist_ok=True)
+            (target / path).write_bytes(data)
+        worktree = repo / ".aiworkhub" / "runtime" / "worktrees" / request_id / "worktree"
+        worktree.parent.mkdir(parents=True)
+        worktree.symlink_to(target, target_is_directory=True)
+    before = _nf919_state(repo, task_id)
+
+    assert task_store.recover_blocked_rework(
+        repo, task_id, actor="coordinator", feedback_reason=_NF919_FEEDBACK,
+    ) == (False, reason)
+
+    assert _nf919_state(repo, task_id) == before
+
+
+def test_nf594_clean_root_never_discards_authenticated_sealed_delta(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, task_id, _sealed, _descriptor = _nf919_timed_out_gc_fixture(tmp_path, monkeypatch)
+    before = _nf919_state(repo, task_id)
+
+    assert task_store.recover_blocked_rework(
+        repo,
+        task_id,
+        actor="coordinator",
+        feedback_reason=_NF919_FEEDBACK,
+        clean_root_if_predecessor_missing=True,
+    ) == (False, "clean_root_rework_sealed_delta_available")
+
+    assert _nf919_state(repo, task_id) == before

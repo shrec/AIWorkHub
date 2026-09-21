@@ -2911,17 +2911,24 @@ def verified_rework_delta_file_hashes(
     return hashes
 
 
-def materialize_rework_delta_artifact(
+def verify_rework_delta_artifact(
     artifact: Any,
     authority_repo: Path,
     request_id: str,
     task_id: str,
     claim_epoch: int,
-    worktree: Path,
     expected_path_hashes: dict[str, Any],
     allowed_writes: tuple[str, ...],
-) -> list[str]:
-    """Verify and materialize one sealed changed/deleted-file delta."""
+    *,
+    worktree: Path | None = None,
+) -> list[tuple[str, bytes | None]]:
+    """Verify one sealed changed/deleted-file delta and return its exact plan.
+
+    Materialization passes its destination ``worktree`` so every planned path
+    is also proven beneath it.  Blocked-rework recovery omits it to
+    authenticate a collected candidate with this same verifier, writing
+    nothing.
+    """
     if not isinstance(artifact, dict):
         raise WorkspaceError("rework_delta_artifact_invalid")
     raw_path = str(artifact.get("path") or "")
@@ -2986,7 +2993,8 @@ def materialize_rework_delta_artifact(
             raise WorkspaceError(f"rework_predecessor_hash_invalid:{relative}")
         if not _matches(relative, allowed_writes):
             raise WorkspaceError(f"rework_predecessor_outside_scope:{relative}")
-        _require_beneath(worktree, worktree / relative)
+        if worktree is not None:
+            _require_beneath(worktree, worktree / relative)
         if entry.get("deleted") is True:
             if (
                 raw_expected is not None
@@ -3016,6 +3024,30 @@ def materialize_rework_delta_artifact(
         planned.append((relative, content))
     if seen_paths != set(expected):
         raise WorkspaceError("rework_delta_artifact_incomplete")
+    return planned
+
+
+def materialize_rework_delta_artifact(
+    artifact: Any,
+    authority_repo: Path,
+    request_id: str,
+    task_id: str,
+    claim_epoch: int,
+    worktree: Path,
+    expected_path_hashes: dict[str, Any],
+    allowed_writes: tuple[str, ...],
+) -> list[str]:
+    """Verify and materialize one sealed changed/deleted-file delta."""
+    planned = verify_rework_delta_artifact(
+        artifact,
+        authority_repo,
+        request_id,
+        task_id,
+        claim_epoch,
+        expected_path_hashes,
+        allowed_writes,
+        worktree=worktree,
+    )
     seeded: list[str] = []
     for relative, content in planned:
         destination = worktree / relative

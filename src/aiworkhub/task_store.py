@@ -4432,6 +4432,72 @@ def _terminal_failure_supersedes_predecessor(
     )
 
 
+def _collected_terminal_rework_delta(
+    repo: Path,
+    task_id: str,
+    request_id: str,
+    claim_epoch: int,
+    descriptor: object,
+    changed_hashes: dict[str, Any],
+    allowed_writes: list[str],
+) -> tuple[dict[str, Any] | None, str]:
+    """Authenticate the sealed delta standing in for a collected candidate.
+
+    NF-2026-00594: once retention removes a timed-out candidate's worktree,
+    the content-addressed delta sealed at termination is its only copy.  The
+    descriptor must bind this exact repo, task, request and claim epoch to an
+    intact, non-symlinked artifact directly beneath the runtime's
+    ``rework_deltas`` directory, and the packet must hold exactly the
+    terminal's hash-pinned changed paths.  The verifier is the one the
+    successor materializes through, so recovery never accepts bytes the
+    successor would refuse; any mismatch fails closed before the card moves.
+    """
+    from . import worker_workspace
+
+    if not isinstance(descriptor, dict):
+        return None, "retained_terminal_candidate_delta_invalid"
+    fields = {
+        "rework_delta": dict(descriptor),
+        "delta_artifact": {
+            "path": descriptor.get("artifact_path"),
+            "digest": descriptor.get("artifact_sha256"),
+        },
+    }
+    try:
+        artifact_dir = worker_workspace.configured_runtime_root(repo) / "rework_deltas"
+        verified = (
+            type(descriptor.get("claim_epoch")) is int
+            and not artifact_dir.is_symlink()
+            and Path(str(descriptor.get("artifact_path") or "")).parent == artifact_dir
+            and worker_workspace.has_verified_rework_delta(
+                {
+                    "request_id": request_id,
+                    "task_id": task_id,
+                    "claim_epoch": claim_epoch,
+                    **fields,
+                },
+                authority_repo=repo,
+            )
+        )
+    except (OSError, ValueError, worker_workspace.WorkspaceError):
+        verified = False
+    if not verified:
+        return None, "retained_terminal_candidate_delta_unverified"
+    try:
+        worker_workspace.verify_rework_delta_artifact(
+            fields["delta_artifact"],
+            repo,
+            request_id,
+            task_id,
+            claim_epoch,
+            changed_hashes,
+            tuple(allowed_writes),
+        )
+    except (OSError, ValueError, worker_workspace.WorkspaceError):
+        return None, "retained_terminal_candidate_delta_mismatch"
+    return fields, ""
+
+
 def recover_blocked_rework(
     root: str | Path,
     task_id: str,
@@ -4472,6 +4538,11 @@ def recover_blocked_rework(
     removes only the stale materialization authority, and records a clean-root
     authorization.  It is incompatible with validation-only replay, which
     requires the original bytes.
+
+    A timed-out candidate whose worktree retention collected is not missing
+    when the delta sealed at termination authenticates (NF-2026-00594):
+    ordinary recovery pins that exact delta for the successor to materialize,
+    and the clean-root escape fails closed rather than discard its bytes.
 
     Idempotent: returns ``(True, "already_recovered")`` when a prior recovery
     already re-queued the same task, without duplicating audit history.  A
@@ -5543,7 +5614,17 @@ def recover_blocked_rework(
                 authority_repo = Path(str(workspace.get("repo") or "")).resolve(strict=True)
                 expected_repo = Path(root).resolve(strict=True)
                 workspace_path = Path(str(workspace.get("path") or ""))
-                resolved_workspace = workspace_path.resolve(strict=True)
+                # NF-2026-00594: retention may collect the exact worktree of a
+                # timed-out candidate once its bytes are sealed.  Only a truly
+                # absent worktree lets the claimed delta, authenticated below,
+                # stand in for it; a present, dangling or foreign path keeps
+                # every retained-worktree check.
+                collected = evidence.get("rework_delta") is not None and not (
+                    os.path.lexists(workspace_path)
+                )
+                resolved_workspace = (
+                    workspace_path if collected else workspace_path.resolve(strict=True)
+                )
             except (OSError, RuntimeError, ValueError):
                 return False, "retained_terminal_candidate_workspace_invalid"
             runtime_parts = (".aiworkhub", "runtime", "worktrees", request_id, "worktree")
@@ -5551,7 +5632,7 @@ def recover_blocked_rework(
                 authority_repo != expected_repo
                 or not workspace_path.is_absolute()
                 or workspace_path.is_symlink()
-                or not resolved_workspace.is_dir()
+                or not (collected or resolved_workspace.is_dir())
                 or tuple(resolved_workspace.parts[-5:]) != runtime_parts
                 or resolved_workspace
                 != expected_repo / ".aiworkhub" / "runtime" / "worktrees" / request_id / "worktree"
@@ -5561,33 +5642,53 @@ def recover_blocked_rework(
                 )
             ):
                 return False, "retained_terminal_candidate_workspace_invalid"
+            sealed_delta: dict[str, Any] | None = None
+            if collected:
+                sealed_delta, delta_error = _collected_terminal_rework_delta(
+                    expected_repo,
+                    task_id,
+                    request_id,
+                    terminal_claim_epoch,
+                    evidence["rework_delta"],
+                    changed_hashes,
+                    allowed_writes,
+                )
+                if sealed_delta is None:
+                    return False, delta_error
+                if clean_root_if_predecessor_missing:
+                    # The candidate is not missing: its authenticated bytes are
+                    # sealed, and a clean root would silently discard them.
+                    return False, "clean_root_rework_sealed_delta_available"
             for path in changed_paths:
-                candidate = resolved_workspace.joinpath(*path.split("/"))
                 baseline_candidate = expected_repo.joinpath(*path.split("/"))
-                expected_hash = changed_hashes.get(path)
-                try:
-                    candidate_stat = candidate.lstat()
-                    resolved_candidate = candidate.resolve(strict=True)
-                except OSError:
-                    return False, "retained_terminal_candidate_bytes_invalid"
-                if (
-                    candidate.is_symlink()
-                    or expected_hash is None
-                    or not candidate.is_file()
-                    or candidate_stat.st_nlink != 1
-                    or not resolved_candidate.is_relative_to(resolved_workspace)
-                    or any(
-                        resolved_workspace.joinpath(*path.split("/")[:index]).is_symlink()
-                        for index in range(1, len(path.split("/")))
-                    )
-                ):
-                    return False, "retained_terminal_candidate_bytes_invalid"
-                if (
-                    not isinstance(expected_hash, str)
-                    or len(expected_hash) != 64
-                    or hashlib.sha256(candidate.read_bytes()).hexdigest() != expected_hash
-                ):
-                    return False, "retained_terminal_candidate_hash_mismatch"
+                # An authenticated delta already bound every sealed path to its
+                # exact hash; only a retained worktree is read here.
+                if sealed_delta is None:
+                    candidate = resolved_workspace.joinpath(*path.split("/"))
+                    expected_hash = changed_hashes.get(path)
+                    try:
+                        candidate_stat = candidate.lstat()
+                        resolved_candidate = candidate.resolve(strict=True)
+                    except OSError:
+                        return False, "retained_terminal_candidate_bytes_invalid"
+                    if (
+                        candidate.is_symlink()
+                        or expected_hash is None
+                        or not candidate.is_file()
+                        or candidate_stat.st_nlink != 1
+                        or not resolved_candidate.is_relative_to(resolved_workspace)
+                        or any(
+                            resolved_workspace.joinpath(*path.split("/")[:index]).is_symlink()
+                            for index in range(1, len(path.split("/")))
+                        )
+                    ):
+                        return False, "retained_terminal_candidate_bytes_invalid"
+                    if (
+                        not isinstance(expected_hash, str)
+                        or len(expected_hash) != 64
+                        or hashlib.sha256(candidate.read_bytes()).hexdigest() != expected_hash
+                    ):
+                        return False, "retained_terminal_candidate_hash_mismatch"
                 try:
                     baseline_hash = (
                         hashlib.sha256(baseline_candidate.read_bytes()).hexdigest()
@@ -5623,6 +5724,9 @@ def recover_blocked_rework(
                 "changed_paths": list(changed_paths),
                 "changed_path_hashes": dict(changed_hashes),
                 "workspace": dict(workspace),
+                # The successor materializes a collected candidate from this
+                # exact descriptor, as it would a reviewer-pinned delta.
+                **(sealed_delta or {}),
             }
             card["rework_predecessor"] = retained_predecessor
 
