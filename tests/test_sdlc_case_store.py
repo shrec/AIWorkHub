@@ -12,8 +12,10 @@ import pytest
 from aiworkhub.repository_state import bootstrap_repository
 from aiworkhub.sdlc_case_store import (
     CASES_DB_REL,
+    STAGES,
     SdlcCaseConflict,
     SdlcCaseValidationError,
+    SdlcStageEvidenceRefusal,
     append_stage,
     case_for_task,
     create_case,
@@ -22,7 +24,53 @@ from aiworkhub.sdlc_case_store import (
 )
 from aiworkhub import task_store
 
-PLAN_PAYLOAD = {"intent": "x", "evidence_refs": ["file:README.md"]}
+# Structured Plan content; its approval is the bound canonical task, never this.
+PLAN_PAYLOAD = {
+    "intent": "x",
+    "problem": "an observed gap",
+    "owner": "manager",
+    "expected_outcome": "the gap is closed",
+    "risk": "low",
+    "evidence_refs": ["file:README.md"],
+}
+DESIGN_PAYLOAD = {
+    "acceptance_criteria": ["the gap stays closed"],
+    "constraints": [],
+    "affected_contracts": ["sdlc_case_store"],
+    "alternatives": [],
+}
+BUILD_POINTERS = {"task_id": "T-CASE", "request_id": "req-T-CASE", "claim_epoch": 1}
+
+
+def _insert_contract_task(root, task_id):
+    """Seed a claimed canonical card with a falsifiable contract and no candidate."""
+    card = {
+        "task_id": task_id,
+        "runner": "worker",
+        "topic": "sdlc",
+        "objective": "Close the observed gap.",
+        "acceptance": ["the gap stays closed"],
+        "validation": ["python3 -m pytest -q"],
+        "allowed_writes": ["src/gap.py"],
+        "claim_epoch": 1,
+    }
+    conn = sqlite3.connect(str(task_store.canonical_db_path(root)))
+    try:
+        conn.execute(
+            "INSERT INTO tasks (task_id, runner, topic, status, worker_status, objective, "
+            "card_json, created_at, updated_at, claimed_by) "
+            "VALUES (?, 'worker', 'sdlc', 'processing', 'claimed', ?, ?, ?, ?, 'worker')",
+            (
+                task_id,
+                card["objective"],
+                json.dumps(card),
+                "2026-09-20T00:00:00+00:00",
+                "2026-09-20T00:00:00+00:00",
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 @pytest.fixture
@@ -33,7 +81,8 @@ def case_repo(tmp_path):
         task_store.initialize_repository(tmp_path)
         readiness = task_store.storage_readiness(tmp_path)
     assert readiness.ready
-    create_case(tmp_path, readiness.repo_id, "C1", "R-create", {})
+    _insert_contract_task(tmp_path, "T-CASE")
+    create_case(tmp_path, readiness.repo_id, "C1", "R-create", {"task_id": "T-CASE"})
     return SimpleNamespace(root=tmp_path, repo_id=readiness.repo_id)
 
 
@@ -80,6 +129,7 @@ def test_append_stage_records_digest(case_repo):
         case_repo.root, case_repo.repo_id, "C1", "plan", "ready", PLAN_PAYLOAD, "R1"
     )
     assert len(first["receipt_sha256"]) == 64
+    assert len(first["evidence_sha256"]) == 64
     assert first["idempotent"] is False
 
 
@@ -91,6 +141,7 @@ def test_same_request_replay_is_idempotent(case_repo):
         case_repo.root, case_repo.repo_id, "C1", "plan", "ready", PLAN_PAYLOAD, "R1"
     )
     assert second["receipt_sha256"] == first["receipt_sha256"]
+    assert second["evidence_sha256"] == first["evidence_sha256"]
     assert second["idempotent"] is True
 
 
@@ -111,10 +162,12 @@ def test_changed_request_bytes_conflict(case_repo):
 
 
 def test_create_case_replay_is_idempotent(case_repo):
-    first = create_case(case_repo.root, case_repo.repo_id, "C1", "R-create", {})
+    first = create_case(
+        case_repo.root, case_repo.repo_id, "C1", "R-create", {"task_id": "T-CASE"}
+    )
     assert first["idempotent"] is True
     with pytest.raises(SdlcCaseConflict):
-        create_case(case_repo.root, case_repo.repo_id, "C1", "R-create", {"task_id": "T1"})
+        create_case(case_repo.root, case_repo.repo_id, "C1", "R-create", {})
 
 
 def test_cross_repository_case_is_refused(case_repo):
@@ -132,18 +185,12 @@ def test_cross_repository_append_is_refused(case_repo):
     assert after == before
 
 
-def test_deploy_requires_test_predecessor(case_repo):
-    for stage in ("plan", "design", "build"):
-        append_stage(
-            case_repo.root,
-            case_repo.repo_id,
-            "C1",
-            stage,
-            "ready",
-            {"evidence_refs": ["file:README.md"]},
-            "R-" + stage,
-        )
-    with pytest.raises(SdlcCaseValidationError, match="test"):
+def test_deploy_requires_every_predecessor(case_repo):
+    append_stage(case_repo.root, case_repo.repo_id, "C1", "plan", "ready", PLAN_PAYLOAD, "R-plan")
+    append_stage(
+        case_repo.root, case_repo.repo_id, "C1", "design", "ready", DESIGN_PAYLOAD, "R-design"
+    )
+    with pytest.raises(SdlcCaseValidationError, match="missing ready predecessor: build"):
         append_stage(
             case_repo.root,
             case_repo.repo_id,
@@ -156,34 +203,19 @@ def test_deploy_requires_test_predecessor(case_repo):
 
 
 def test_unknown_does_not_count_as_ready(case_repo):
-    for stage in ("plan", "design", "build"):
-        append_stage(
-            case_repo.root,
-            case_repo.repo_id,
-            "C1",
-            stage,
-            "ready",
-            {"evidence_refs": ["file:README.md"]},
-            "R-" + stage,
-        )
+    append_stage(case_repo.root, case_repo.repo_id, "C1", "plan", "ready", PLAN_PAYLOAD, "R-plan")
     append_stage(
         case_repo.root,
         case_repo.repo_id,
         "C1",
-        "test",
+        "design",
         "unknown",
         {"evidence_refs": ["file:README.md"]},
-        "R-test",
+        "R-design",
     )
-    with pytest.raises(SdlcCaseValidationError, match="test"):
+    with pytest.raises(SdlcCaseValidationError, match=r"predecessor: design \(unknown\)"):
         append_stage(
-            case_repo.root,
-            case_repo.repo_id,
-            "C1",
-            "deploy",
-            "ready",
-            {"target": "staging"},
-            "R-deploy",
+            case_repo.root, case_repo.repo_id, "C1", "build", "ready", BUILD_POINTERS, "R-build"
         )
 
 
@@ -217,7 +249,10 @@ def test_stage_packet_unknown_when_missing(case_repo):
     packet = stage_packet(case_repo.root, case_repo.repo_id, "C1", "plan")
     assert packet["state"] == "unknown"
     assert packet["stage"] == "plan"
+    assert packet["reason"] == "no_stage_receipt"
     assert not packet.get("receipt_sha256")
+    missing = stage_packet(case_repo.root, case_repo.repo_id, "C-missing", "plan")
+    assert (missing["state"], missing["reason"]) == ("unknown", "case_not_found")
 
 
 def test_read_packets_are_bounded_and_source_linked(case_repo):
@@ -241,7 +276,7 @@ def test_two_processes_same_request_id_one_receipt(case_repo):
         "from aiworkhub.sdlc_case_store import append_stage\n"
         f"root = Path({str(case_repo.root)!r})\n"
         f"repo_id = {case_repo.repo_id!r}\n"
-        "payload = {'intent': 'x', 'evidence_refs': ['file:README.md']}\n"
+        f"payload = {PLAN_PAYLOAD!r}\n"
         "try:\n"
         "    result = append_stage(root, repo_id, 'C1', 'plan', 'ready', payload, 'R-race')\n"
         "    print(json.dumps({'ok': True, 'receipt_sha256': result['receipt_sha256'],"
@@ -278,125 +313,87 @@ def test_two_processes_same_request_id_one_receipt(case_repo):
         conn.close()
 
 
+def _count_rows(case_repo, stage, state=None):
+    conn = sqlite3.connect(str(case_repo.root.joinpath(*CASES_DB_REL)))
+    try:
+        if state is None:
+            return conn.execute(
+                "SELECT COUNT(*) FROM stage_receipts WHERE case_id=? AND stage=?",
+                ("C1", stage),
+            ).fetchone()[0]
+        return conn.execute(
+            "SELECT COUNT(*) FROM stage_receipts WHERE case_id=? AND stage=? AND state=?",
+            ("C1", stage, state),
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+
 def test_downstream_ready_stales_after_predecessor_regression(case_repo):
-    for stage in ("plan", "design", "build", "test", "deploy"):
-        append_stage(
-            case_repo.root,
-            case_repo.repo_id,
-            "C1",
-            stage,
-            "ready",
-            {"evidence_refs": ["file:README.md"]},
-            "R-" + stage,
-        )
+    for stage, payload in (("plan", PLAN_PAYLOAD), ("design", DESIGN_PAYLOAD)):
+        append_stage(case_repo.root, case_repo.repo_id, "C1", stage, "ready", payload, "R-" + stage)
     append_stage(
         case_repo.root,
         case_repo.repo_id,
         "C1",
-        "test",
+        "plan",
         "blocked",
         {"reason": "failed", "evidence_refs": ["file:README.md"]},
-        "R-test-blocked",
+        "R-plan-blocked",
     )
-    test_packet = stage_packet(case_repo.root, case_repo.repo_id, "C1", "test")
-    assert test_packet["state"] == "blocked"
-    deploy_packet = stage_packet(case_repo.root, case_repo.repo_id, "C1", "deploy")
-    assert deploy_packet["state"] != "ready"
-    assert deploy_packet["state"] in {"unknown", "blocked"}
-    assert deploy_packet["reason"] == "stale_predecessor"
-    assert deploy_packet["stale_predecessor"] == "test"
+    plan_packet = stage_packet(case_repo.root, case_repo.repo_id, "C1", "plan")
+    assert plan_packet["state"] == "blocked"
+    design_packet = stage_packet(case_repo.root, case_repo.repo_id, "C1", "design")
+    assert design_packet["state"] == "unknown"
+    assert design_packet["recorded_state"] == "ready"
+    assert design_packet["reason"] == "stale_predecessor"
+    assert design_packet["stale_predecessor"] == "plan"
     case = read_case(case_repo.root, case_repo.repo_id, "C1")
-    assert case["stages"]["test"]["state"] == "blocked"
-    assert case["stages"]["deploy"]["state"] != "ready"
-    assert case["stages"]["deploy"]["reason"] == "stale_predecessor"
-    db = case_repo.root.joinpath(*CASES_DB_REL)
-    conn = sqlite3.connect(str(db))
-    try:
-        deploy_ready = conn.execute(
-            "SELECT COUNT(*) FROM stage_receipts WHERE case_id=? AND stage=? AND state=?",
-            ("C1", "deploy", "ready"),
-        ).fetchone()[0]
-        test_rows = conn.execute(
-            "SELECT COUNT(*) FROM stage_receipts WHERE case_id=? AND stage=?",
-            ("C1", "test"),
-        ).fetchone()[0]
-        assert deploy_ready == 1
-        assert test_rows == 2
-    finally:
-        conn.close()
+    assert case["stages"]["plan"]["state"] == "blocked"
+    assert case["stages"]["design"]["reason"] == "stale_predecessor"
+    assert _count_rows(case_repo, "design", "ready") == 1
+    assert _count_rows(case_repo, "plan") == 2
 
 
-def test_new_ready_predecessor_does_not_revive_old_deploy(case_repo):
-    for stage in ("plan", "design", "build", "test", "deploy"):
-        append_stage(
-            case_repo.root,
-            case_repo.repo_id,
-            "C1",
-            stage,
-            "ready",
-            {"evidence_refs": ["file:README.md"]},
-            "R-" + stage,
-        )
-    old_deploy = stage_packet(case_repo.root, case_repo.repo_id, "C1", "deploy")
-    old_sha = old_deploy["receipt_sha256"]
+def test_new_ready_predecessor_does_not_revive_old_design(case_repo):
+    for stage, payload in (("plan", PLAN_PAYLOAD), ("design", DESIGN_PAYLOAD)):
+        append_stage(case_repo.root, case_repo.repo_id, "C1", stage, "ready", payload, "R-" + stage)
+    old_sha = stage_packet(case_repo.root, case_repo.repo_id, "C1", "design")["receipt_sha256"]
     append_stage(
         case_repo.root,
         case_repo.repo_id,
         "C1",
-        "test",
+        "plan",
         "blocked",
-        {"reason": "failed", "evidence_refs": ["file:README.md"]},
-        "R-test-blocked",
+        {"reason": "owner withdrew", "evidence_refs": ["file:README.md"]},
+        "R-plan-blocked",
     )
     append_stage(
         case_repo.root,
         case_repo.repo_id,
         "C1",
-        "test",
+        "plan",
         "ready",
-        {"evidence_refs": ["file:tests/test_sdlc_case_store.py"]},
-        "R-test-ready-2",
+        {**PLAN_PAYLOAD, "risk": "re-approved"},
+        "R-plan-ready-2",
     )
-    deploy_packet = stage_packet(case_repo.root, case_repo.repo_id, "C1", "deploy")
-    assert deploy_packet["state"] == "unknown"
-    assert deploy_packet["reason"] == "stale_predecessor"
-    assert deploy_packet["stale_predecessor"] == "test"
-    assert deploy_packet["receipt_sha256"] == old_sha
+    design_packet = stage_packet(case_repo.root, case_repo.repo_id, "C1", "design")
+    assert design_packet["state"] == "unknown"
+    assert design_packet["reason"] == "stale_predecessor"
+    assert design_packet["stale_predecessor"] == "plan"
+    assert design_packet["receipt_sha256"] == old_sha
     case = read_case(case_repo.root, case_repo.repo_id, "C1")
-    assert case["stages"]["test"]["state"] == "ready"
-    assert case["stages"]["deploy"]["state"] == "unknown"
-    assert case["stages"]["deploy"]["receipt_sha256"] == old_sha
-    new_deploy = append_stage(
-        case_repo.root,
-        case_repo.repo_id,
-        "C1",
-        "deploy",
-        "ready",
-        {"evidence_refs": ["file:README.md", "file:deploy"]},
-        "R-deploy-2",
+    assert case["stages"]["plan"]["state"] == "ready"
+    assert case["stages"]["design"]["state"] == "unknown"
+    new_design = append_stage(
+        case_repo.root, case_repo.repo_id, "C1", "design", "ready", DESIGN_PAYLOAD, "R-design-2"
     )
-    refreshed = stage_packet(case_repo.root, case_repo.repo_id, "C1", "deploy")
+    refreshed = stage_packet(case_repo.root, case_repo.repo_id, "C1", "design")
     assert refreshed["state"] == "ready"
-    assert refreshed["receipt_sha256"] == new_deploy["receipt_sha256"]
+    assert refreshed["receipt_sha256"] == new_design["receipt_sha256"]
     assert refreshed["receipt_sha256"] != old_sha
-    case = read_case(case_repo.root, case_repo.repo_id, "C1")
-    assert case["stages"]["deploy"]["state"] == "ready"
-    assert case["stages"]["deploy"]["receipt_sha256"] != old_sha
-    db = case_repo.root.joinpath(*CASES_DB_REL)
-    conn = sqlite3.connect(str(db))
-    try:
-        deploy_ready = conn.execute(
-            "SELECT COUNT(*) FROM stage_receipts WHERE case_id=? AND stage=? AND state=?",
-            ("C1", "deploy", "ready"),
-        ).fetchone()[0]
-        test_rows = conn.execute(
-            "SELECT COUNT(*) FROM stage_receipts WHERE case_id=? AND stage=?",
-            ("C1", "test"),
-        ).fetchone()[0]
-        assert deploy_ready == 2
-        assert test_rows == 3
-    finally:
-        conn.close()
+    assert _count_rows(case_repo, "design", "ready") == 2
+    assert _count_rows(case_repo, "plan") == 3
 
 
 def test_oversized_links_are_refused(case_repo):
@@ -414,7 +411,7 @@ def test_read_case_uses_latest_receipt_per_stage(case_repo):
             "C1",
             "plan",
             "ready",
-            {"intent": f"rev-{i}", "evidence_refs": ["file:README.md"]},
+            {**PLAN_PAYLOAD, "intent": f"rev-{i}"},
             f"R-plan-{i}",
         )
     case = read_case(case_repo.root, case_repo.repo_id, "C1")
@@ -435,202 +432,75 @@ def test_read_case_uses_latest_receipt_per_stage(case_repo):
         conn.close()
 
 
-def test_plan_change_refuses_test_until_predecessors_refresh(case_repo):
-    evidence = {"evidence_refs": ["file:README.md"]}
-    for stage in ("plan", "design", "build"):
-        append_stage(
-            case_repo.root,
-            case_repo.repo_id,
-            "C1",
-            stage,
-            "ready",
-            evidence,
-            "R-" + stage,
-        )
+def test_plan_change_refuses_build_until_design_refreshes(case_repo):
+    for stage, payload in (("plan", PLAN_PAYLOAD), ("design", DESIGN_PAYLOAD)):
+        append_stage(case_repo.root, case_repo.repo_id, "C1", stage, "ready", payload, "R-" + stage)
     append_stage(
         case_repo.root,
         case_repo.repo_id,
         "C1",
         "plan",
         "ready",
-        {"intent": "changed", "evidence_refs": ["file:README.md"]},
+        {**PLAN_PAYLOAD, "intent": "changed"},
         "R-plan-2",
     )
     design_packet = stage_packet(case_repo.root, case_repo.repo_id, "C1", "design")
-    build_packet = stage_packet(case_repo.root, case_repo.repo_id, "C1", "build")
     assert design_packet["state"] == "unknown"
-    assert build_packet["state"] == "unknown"
-    with pytest.raises(SdlcCaseValidationError, match="predecessor"):
+    assert design_packet["reason"] == "stale_predecessor"
+    with pytest.raises(
+        SdlcCaseValidationError, match=r"predecessor: design \(stale_predecessor\)"
+    ):
         append_stage(
-            case_repo.root,
-            case_repo.repo_id,
-            "C1",
-            "test",
-            "ready",
-            evidence,
-            "R-test",
-        )
-    test_packet = stage_packet(case_repo.root, case_repo.repo_id, "C1", "test")
-    assert test_packet["state"] != "ready"
-    append_stage(
-        case_repo.root,
-        case_repo.repo_id,
-        "C1",
-        "design",
-        "ready",
-        evidence,
-        "R-design-2",
-    )
-    with pytest.raises(SdlcCaseValidationError, match="predecessor"):
-        append_stage(
-            case_repo.root,
-            case_repo.repo_id,
-            "C1",
-            "test",
-            "ready",
-            evidence,
-            "R-test",
+            case_repo.root, case_repo.repo_id, "C1", "build", "ready", BUILD_POINTERS, "R-build"
         )
     append_stage(
-        case_repo.root,
-        case_repo.repo_id,
-        "C1",
-        "build",
-        "ready",
-        evidence,
-        "R-build-2",
+        case_repo.root, case_repo.repo_id, "C1", "design", "ready", DESIGN_PAYLOAD, "R-design-2"
     )
-    ready_test = append_stage(
-        case_repo.root,
-        case_repo.repo_id,
-        "C1",
-        "test",
-        "ready",
-        evidence,
-        "R-test",
-    )
-    refreshed = stage_packet(case_repo.root, case_repo.repo_id, "C1", "test")
-    assert refreshed["state"] == "ready"
-    assert refreshed["receipt_sha256"] == ready_test["receipt_sha256"]
+    assert stage_packet(case_repo.root, case_repo.repo_id, "C1", "design")["state"] == "ready"
+    # Fresh predecessors are necessary, never sufficient: no candidate is sealed.
+    with pytest.raises(SdlcStageEvidenceRefusal) as refused:
+        append_stage(
+            case_repo.root, case_repo.repo_id, "C1", "build", "ready", BUILD_POINTERS, "R-build"
+        )
+    assert refused.value.decision.code == "candidate_not_sealed:none"
     replay = append_stage(
-        case_repo.root,
-        case_repo.repo_id,
-        "C1",
-        "test",
-        "ready",
-        evidence,
-        "R-test",
+        case_repo.root, case_repo.repo_id, "C1", "design", "ready", DESIGN_PAYLOAD, "R-design-2"
     )
     assert replay["idempotent"] is True
-    assert replay["receipt_sha256"] == ready_test["receipt_sha256"]
     case = read_case(case_repo.root, case_repo.repo_id, "C1")
-    assert case["stages"]["test"]["state"] == "ready"
-    assert "file:README.md" in case["stages"]["test"]["source_refs"]
+    assert case["stages"]["build"]["state"] == "unknown"
+    assert case["cycle"]["blocking_stage"] == "build"
 
 
-def test_blocked_retest_redeploy_requires_fresh_predecessors(case_repo):
-    evidence = {"evidence_refs": ["file:README.md"]}
-    for stage in ("plan", "design", "build", "test", "deploy"):
-        append_stage(
-            case_repo.root,
-            case_repo.repo_id,
-            "C1",
-            stage,
-            "ready",
-            evidence,
-            "R-" + stage,
-        )
-    old_deploy = stage_packet(case_repo.root, case_repo.repo_id, "C1", "deploy")
-    old_sha = old_deploy["receipt_sha256"]
+def test_blocked_design_requires_a_fresh_ready_design(case_repo):
+    append_stage(case_repo.root, case_repo.repo_id, "C1", "plan", "ready", PLAN_PAYLOAD, "R-plan")
     append_stage(
-        case_repo.root,
-        case_repo.repo_id,
-        "C1",
-        "test",
-        "blocked",
-        {"reason": "failed", "evidence_refs": ["file:README.md"]},
-        "R-test-blocked",
+        case_repo.root, case_repo.repo_id, "C1", "design", "ready", DESIGN_PAYLOAD, "R-design"
     )
-    assert stage_packet(case_repo.root, case_repo.repo_id, "C1", "deploy")["state"] != "ready"
-    append_stage(
-        case_repo.root,
-        case_repo.repo_id,
-        "C1",
-        "plan",
-        "ready",
-        {"intent": "changed", "evidence_refs": ["file:README.md"]},
-        "R-plan-2",
-    )
-    assert stage_packet(case_repo.root, case_repo.repo_id, "C1", "design")["state"] == "unknown"
-    assert stage_packet(case_repo.root, case_repo.repo_id, "C1", "build")["state"] == "unknown"
-    with pytest.raises(SdlcCaseValidationError, match="predecessor"):
-        append_stage(
-            case_repo.root,
-            case_repo.repo_id,
-            "C1",
-            "test",
-            "ready",
-            evidence,
-            "R-test-2",
-        )
-    with pytest.raises(SdlcCaseValidationError, match="predecessor"):
-        append_stage(
-            case_repo.root,
-            case_repo.repo_id,
-            "C1",
-            "deploy",
-            "ready",
-            evidence,
-            "R-deploy-2",
-        )
+    old_design = stage_packet(case_repo.root, case_repo.repo_id, "C1", "design")
     append_stage(
         case_repo.root,
         case_repo.repo_id,
         "C1",
         "design",
-        "ready",
-        evidence,
-        "R-design-2",
+        "blocked",
+        {"reason": "review found a gap", "evidence_refs": ["file:README.md"]},
+        "R-design-blocked",
     )
-    append_stage(
-        case_repo.root,
-        case_repo.repo_id,
-        "C1",
-        "build",
-        "ready",
-        evidence,
-        "R-build-2",
+    assert stage_packet(case_repo.root, case_repo.repo_id, "C1", "design")["state"] == "blocked"
+    with pytest.raises(SdlcCaseValidationError, match=r"predecessor: design \(blocked\)"):
+        append_stage(
+            case_repo.root, case_repo.repo_id, "C1", "build", "ready", BUILD_POINTERS, "R-build"
+        )
+    fresh = append_stage(
+        case_repo.root, case_repo.repo_id, "C1", "design", "ready", DESIGN_PAYLOAD, "R-design-2"
     )
-    append_stage(
-        case_repo.root,
-        case_repo.repo_id,
-        "C1",
-        "test",
-        "ready",
-        evidence,
-        "R-test-2",
-    )
-    deploy_packet = stage_packet(case_repo.root, case_repo.repo_id, "C1", "deploy")
-    assert deploy_packet["state"] == "unknown"
-    assert deploy_packet["reason"] == "stale_predecessor"
-    assert deploy_packet["receipt_sha256"] == old_sha
-    new_deploy = append_stage(
-        case_repo.root,
-        case_repo.repo_id,
-        "C1",
-        "deploy",
-        "ready",
-        evidence,
-        "R-deploy-2",
-    )
-    refreshed = stage_packet(case_repo.root, case_repo.repo_id, "C1", "deploy")
+    refreshed = stage_packet(case_repo.root, case_repo.repo_id, "C1", "design")
     assert refreshed["state"] == "ready"
-    assert refreshed["receipt_sha256"] == new_deploy["receipt_sha256"]
-    assert refreshed["receipt_sha256"] != old_sha
-    case = read_case(case_repo.root, case_repo.repo_id, "C1")
-    assert case["stages"]["test"]["state"] == "ready"
-    assert case["stages"]["deploy"]["state"] == "ready"
-    assert "file:README.md" in case["stages"]["deploy"]["source_refs"]
+    assert refreshed["receipt_sha256"] == fresh["receipt_sha256"]
+    assert refreshed["receipt_sha256"] != old_design["receipt_sha256"]
+    # The proof is drawn from the unchanged canonical contract, not the request.
+    assert refreshed["evidence_sha256"] == old_design["evidence_sha256"]
 
 
 def test_case_for_task_unknown_for_absent_link(case_repo):
@@ -847,3 +717,58 @@ def test_create_case_initializes_schema_on_existing_schemaless_file(bare_repo):
     )
     assert replay["idempotent"] is True
     assert replay["receipt_sha256"] == created["receipt_sha256"]
+
+
+def test_pre_gate_ready_receipts_survive_migration_but_prove_nothing(bare_repo):
+    _insert_contract_task(bare_repo.root, "T-OLD")
+    create_case(bare_repo.root, bare_repo.repo_id, "C-OLD", "R-old", {"task_id": "T-OLD"})
+    db = bare_repo.root.joinpath(*CASES_DB_REL)
+    conn = sqlite3.connect(str(db))
+    try:
+        # Rebuild the receipts table exactly as the pre-gate store created it,
+        # holding the six unproven ready rows the old gate accepted.
+        conn.execute("DROP TABLE stage_receipts")
+        conn.execute(
+            "CREATE TABLE stage_receipts ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, case_id TEXT NOT NULL,"
+            "repo_id TEXT NOT NULL, request_id TEXT NOT NULL, stage TEXT NOT NULL,"
+            "state TEXT NOT NULL, payload_json TEXT NOT NULL,"
+            "receipt_sha256 TEXT NOT NULL, created_at TEXT NOT NULL,"
+            "UNIQUE(case_id, request_id),"
+            "FOREIGN KEY(case_id) REFERENCES cases(case_id))"
+        )
+        for stage in STAGES:
+            conn.execute(
+                "INSERT INTO stage_receipts (case_id, repo_id, request_id, stage, state,"
+                " payload_json, receipt_sha256, created_at) VALUES (?, ?, ?, ?, 'ready', '{}', ?, ?)",
+                ("C-OLD", bare_repo.repo_id, "R-" + stage, stage, "0" * 64,
+                 "2026-09-20T00:00:00+00:00"),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    before = read_case(bare_repo.root, bare_repo.repo_id, "C-OLD")
+    assert {packet["reason"] for packet in before["stages"].values()} == {"legacy_unverified"}
+
+    # Creating an unrelated case migrates the receipts schema in place.
+    create_case(bare_repo.root, bare_repo.repo_id, "C-NEW", "R-new", {})
+    conn = sqlite3.connect(str(db))
+    try:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(stage_receipts)")}
+        assert {"evidence_json", "evidence_sha256"} <= columns
+        unproven = conn.execute(
+            "SELECT COUNT(*) FROM stage_receipts WHERE evidence_json IS NULL"
+        ).fetchone()[0]
+        assert unproven == len(STAGES)
+    finally:
+        conn.close()
+
+    after = read_case(bare_repo.root, bare_repo.repo_id, "C-OLD")
+    for stage in STAGES:
+        packet = after["stages"][stage]
+        assert packet["state"] == "unknown"
+        assert packet["recorded_state"] == "ready"
+        assert packet["reason"] == "legacy_unverified"
+        assert packet["receipt_sha256"] == "0" * 64
+    assert after["cycle"]["state"] == "incomplete"

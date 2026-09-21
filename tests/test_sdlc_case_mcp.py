@@ -1,15 +1,44 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
+import json
 import sqlite3
 from types import SimpleNamespace
 
-from aiworkhub import core, server, task_store
+from aiworkhub import (
+    attempt_artifacts,
+    core,
+    process_event_ledger,
+    process_launcher,
+    process_launcher_acceptance,
+    server,
+    task_engine,
+    task_store,
+)
 from aiworkhub.repository_state import bootstrap_repository
 from aiworkhub.sdlc_case_store import CASES_DB_REL, STAGES
 
-PLAN_PAYLOAD = {"intent": "x", "evidence_refs": ["file:README.md"]}
+RUNNER = "worker"
+TOPIC = "sdlc"
+PROMOTED = "src/feature.py"
+# Structured Plan content; its approval is the bound canonical task, never this.
+PLAN_PAYLOAD = {
+    "intent": "x",
+    "problem": "an observed gap",
+    "owner": "manager",
+    "expected_outcome": "the gap is closed",
+    "risk": "low",
+    "evidence_refs": ["file:README.md"],
+}
+DESIGN_PAYLOAD = {
+    "acceptance_criteria": ["an unproven ready request is refused"],
+    "constraints": [],
+    "affected_contracts": ["aiworkhub_manager_sdlc_stage_record"],
+    "alternatives": [],
+}
+SELF_ATTESTED = {"passed": True, "verified": True, "sha256": "a" * 64}
 CASE_TOOLS = (
     "aiworkhub_manager_sdlc_case_create",
     "aiworkhub_manager_sdlc_stage_record",
@@ -47,6 +76,8 @@ def _bootstrap_repo(root, name):
 def case_repo(tmp_path, monkeypatch):
     repo = _bootstrap_repo(tmp_path, "sdlc-case-mcp-test")
     monkeypatch.setattr(core, "repo_root", lambda: tmp_path)
+    monkeypatch.delenv(process_launcher.PROCESS_LOG_ENV, raising=False)
+    monkeypatch.delenv(process_launcher.PROCESS_DIR_ENV, raising=False)
     return repo
 
 
@@ -61,6 +92,151 @@ def _seed_task(root, task_id):
         conn.commit()
     finally:
         conn.close()
+
+
+def _seed_contract_task(root, task_id):
+    """Seed a claimed canonical card with a falsifiable contract and no candidate."""
+    card = {
+        "task_id": task_id,
+        "runner": RUNNER,
+        "topic": TOPIC,
+        "objective": "Record only SDLC stages the server can prove.",
+        "acceptance": ["An unproven ready request is refused."],
+        "validation": ["python3 -m pytest -q tests/test_sdlc_case_mcp.py"],
+        "allowed_writes": [PROMOTED],
+        "claim_epoch": 1,
+    }
+    conn = sqlite3.connect(str(task_store.canonical_db_path(root)))
+    try:
+        conn.execute(
+            "INSERT INTO tasks (task_id, runner, topic, status, worker_status, objective, "
+            "card_json, created_at, updated_at, claimed_by) "
+            "VALUES (?, ?, ?, 'processing', 'claimed', ?, ?, ?, ?, ?)",
+            (
+                task_id, RUNNER, TOPIC, card["objective"], json.dumps(card),
+                "2026-09-20T00:00:00+00:00", "2026-09-20T00:00:00+00:00", RUNNER,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _native_attempt(root, task_id, request_id, digest, validation, required_outputs):
+    """Seal one attempt's bundle and terminal event through the launcher's producers."""
+    gate = {
+        "gated": True,
+        "task_type": "code",
+        "satisfied": True,
+        "verification": {
+            "ok": True,
+            "semantic_edit_apply_receipts": [{
+                "path_sha256": process_launcher.semantic_edit_path_identifier(PROMOTED),
+                "range_count": 1,
+            }],
+        },
+    }
+    manifest = attempt_artifacts.persist_json_bundle(
+        root / process_launcher.PROCESS_DIR_DEFAULT_REL / "attempt-artifacts" / request_id,
+        attempt_id=request_id,
+        payloads={
+            "metadata": {
+                "schema_id": "aiworkhub.attempt_metadata.v1",
+                "request_identity": {
+                    "request_id": request_id, "task_id": task_id, "runner": RUNNER, "topic": TOPIC,
+                },
+                "adapter_id": "codex_exec",
+                "model": "gpt-sdlc-test",
+            },
+            "diff": {
+                "schema_id": "aiworkhub.attempt_diff_index.v1",
+                "changed_paths": [PROMOTED],
+                "changed_path_hashes": {PROMOTED: digest},
+                "required_outputs": required_outputs,
+            },
+            "validation": {
+                "schema_id": "aiworkhub.attempt_validation.v1",
+                "checks": validation,
+                "worker_mcp_gate": gate,
+            },
+            "usage": {"schema_id": "aiworkhub.attempt_usage.v1"},
+            "review": {"schema_id": "aiworkhub.attempt_review.v1", "target_state": "review_ready"},
+        },
+    )
+    semantic_edit = process_launcher._semantic_edit_evidence_from_output(
+        root / "absent-stdout.jsonl", worker_mcp_gate=gate
+    )
+    process_event_ledger.append_event(
+        root / process_launcher.PROCESS_LOG_DEFAULT_REL,
+        {
+            "schema_id": "aiworkhub.task_mcp.process_event.v1",
+            "request_id": request_id,
+            "task_id": task_id,
+            "runner": RUNNER,
+            "adapter_id": "codex_exec",
+            "state": "review_ready",
+            "attempt_artifact_manifest": manifest,
+            "worker_mcp_gate": gate,
+            "semantic_edit": semantic_edit,
+            "semantic_edit_coverage": process_launcher._semantic_edit_coverage(
+                [PROMOTED], worker_mcp_gate=gate, runtime_evidence=semantic_edit
+            ),
+        },
+    )
+    return manifest, gate
+
+
+def _seal_and_accept(root, task_id):
+    """Drive the real terminal-review and acceptance producers for one candidate."""
+    request_id = f"req-{task_id}"
+    content = b"proven\n"
+    (root / PROMOTED).parent.mkdir(parents=True, exist_ok=True)
+    (root / PROMOTED).write_bytes(content)
+    digest = hashlib.sha256(content).hexdigest()
+    validation = [{"command": "python3 -m pytest -q", "returncode": 0}]
+    required_outputs = [{"path": PROMOTED, "sha256": digest, "bytes": len(content)}]
+    manifest, gate = _native_attempt(
+        root, task_id, request_id, digest, validation, required_outputs
+    )
+    ok, state = task_store.mark_terminal_review(
+        root,
+        task_id,
+        runner=RUNNER,
+        substatus="review_ready",
+        evidence={
+            "request_id": request_id,
+            "request_identity": {"request_id": request_id},
+            "validation": validation,
+            "required_outputs": required_outputs,
+            "changed_paths": [PROMOTED],
+            "changed_path_hashes": {PROMOTED: digest},
+            "worker_mcp_gate": gate,
+            "attempt_artifact_manifest": manifest,
+            "workspace": {"base_oid": "base-oid"},
+        },
+    )
+    assert (ok, state) == (True, "review")
+    receipt = process_launcher_acceptance.accepted_outcome_receipt(
+        root,
+        task_id=task_id,
+        request_id=request_id,
+        claim_epoch=1,
+        base_oid="base-oid",
+        promoted_paths=[PROMOTED],
+        changed_path_hashes={PROMOTED: digest},
+        attempt_artifact_manifest=manifest,
+    )
+    accepted = task_engine.accept_review(
+        root,
+        task_id,
+        runner=RUNNER,
+        topic=TOPIC,
+        request_id=request_id,
+        evidence={"promoted_paths": [PROMOTED]},
+        accepted_outcome_receipt=receipt,
+    )
+    assert accepted["ok"] is True, accepted
+    return receipt
 
 
 def test_manager_case_write_respects_write_gate(monkeypatch, tmp_path):
@@ -113,8 +289,9 @@ def test_cross_repo_authority_refused_before_mutation(monkeypatch, tmp_path):
 
 def test_authenticated_create_and_plan_round_trip_digest(monkeypatch, tmp_path):
     repo = case_repo(tmp_path, monkeypatch)
+    _seed_contract_task(repo.root, "T1")
     _authorize_manager(monkeypatch)
-    created = server.aiworkhub_manager_sdlc_case_create("C1", "R-create", {})
+    created = server.aiworkhub_manager_sdlc_case_create("C1", "R-create", {"task_id": "T1"})
     assert created["ok"] is True
     assert created["repo_id"] == repo.repo_id
     recorded = server.aiworkhub_manager_sdlc_stage_record(
@@ -125,6 +302,7 @@ def test_authenticated_create_and_plan_round_trip_digest(monkeypatch, tmp_path):
     packet = server.aiworkhub_manager_sdlc_stage_packet("C1", "plan")
     assert packet["receipt_sha256"] == digest
     assert packet["state"] == "ready"
+    assert packet["evidence_sha256"] == recorded["evidence_sha256"]
     assert packet["repo_id"] == repo.repo_id
     case = server.aiworkhub_manager_sdlc_case_get("C1")
     assert case["stages"]["plan"]["receipt_sha256"] == digest
@@ -203,7 +381,7 @@ def test_task_case_create_is_deterministic_and_replay_idempotent(monkeypatch, tm
 
 def test_task_bound_stages_stay_unknown_until_recorded(monkeypatch, tmp_path):
     repo = case_repo(tmp_path, monkeypatch)
-    _seed_task(repo.root, "T1")
+    _seed_contract_task(repo.root, "T1")
     _authorize_manager(monkeypatch)
     created = server.aiworkhub_manager_sdlc_case_create_for_task("T1", "R-bind")
     bound = server.aiworkhub_manager_sdlc_case_for_task("T1")
@@ -352,3 +530,98 @@ def test_task_case_tools_refuse_cross_repository_authority_before_mutation(monke
         assert result["ok"] is False
         assert result["reason"] == "cross_repository"
     assert not _cases_db(repo).exists()
+
+
+def test_six_stage_ready_bypass_is_refused_through_mcp(monkeypatch, tmp_path):
+    repo = case_repo(tmp_path, monkeypatch)
+    _seed_contract_task(repo.root, "T1")
+    _authorize_manager(monkeypatch)
+    created = server.aiworkhub_manager_sdlc_case_create_for_task("T1", "R-bind")
+    assert created["ok"] is True
+    case_id = created["case_id"]
+    for label, payload in (("empty", {}), ("asserted", SELF_ATTESTED)):
+        for stage in STAGES:
+            recorded = server.aiworkhub_manager_sdlc_stage_record(
+                case_id, stage, "ready", payload, f"R-{label}-{stage}"
+            )
+            assert recorded["ok"] is False, recorded
+            assert recorded["reason"].startswith(
+                ("stage_evidence_refused:", "missing ready predecessor:")
+            ), recorded
+            if label == "asserted":
+                assert recorded["reason"].startswith(
+                    f"stage_evidence_refused:{stage}:self_attested_verdict:passed"
+                )
+            assert "receipt_sha256" not in recorded
+    skipped = server.aiworkhub_manager_sdlc_stage_record(
+        case_id,
+        "deploy",
+        "not_applicable",
+        {"reason": "nothing to ship", "policy_ref": "policy:any"},
+        "R-skip-deploy",
+    )
+    assert skipped["ok"] is False
+    assert skipped["reason"].startswith(
+        "stage_evidence_refused:deploy:not_applicable_policy_unverifiable"
+    )
+    conn = sqlite3.connect(str(_cases_db(repo)))
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM stage_receipts").fetchone()[0] == 0
+    finally:
+        conn.close()
+    bound = server.aiworkhub_manager_sdlc_case_for_task("T1")
+    assert {packet["state"] for packet in bound["stages"].values()} == {"unknown"}
+    assert bound["cycle"]["state"] == "incomplete"
+
+
+def test_real_linked_candidate_passes_supported_stages_through_mcp(monkeypatch, tmp_path):
+    repo = case_repo(tmp_path, monkeypatch)
+    _seed_contract_task(repo.root, "T1")
+    receipt = _seal_and_accept(repo.root, "T1")
+    _authorize_manager(monkeypatch)
+    case_id = server.aiworkhub_manager_sdlc_case_create_for_task("T1", "R-bind")["case_id"]
+    pointers = {"task_id": "T1", "request_id": "req-T1", "claim_epoch": 1}
+    payloads = {
+        "plan": PLAN_PAYLOAD,
+        "design": DESIGN_PAYLOAD,
+        "build": pointers,
+        "test": pointers,
+    }
+    for stage, payload in payloads.items():
+        recorded = server.aiworkhub_manager_sdlc_stage_record(
+            case_id, stage, "ready", payload, f"R-{stage}"
+        )
+        assert recorded["ok"] is True, recorded
+        assert len(recorded["evidence_sha256"]) == 64
+    deploy = server.aiworkhub_manager_sdlc_stage_record(
+        case_id, "deploy", "ready", {"target": "production"}, "R-deploy"
+    )
+    assert deploy["ok"] is False
+    assert deploy["reason"].startswith("stage_evidence_refused:deploy:deploy_target_unknown")
+    maintain = server.aiworkhub_manager_sdlc_stage_record(
+        case_id, "maintain", "ready", {}, "R-maintain"
+    )
+    assert maintain["ok"] is False
+    assert maintain["reason"].startswith("missing ready predecessor: deploy")
+    bound = server.aiworkhub_manager_sdlc_case_for_task("T1")
+    assert [bound["stages"][stage]["state"] for stage in STAGES] == (
+        ["ready"] * 4 + ["unknown"] * 2
+    )
+    assert bound["stages"]["test"]["evidence"]["accepted_outcome_receipt_id"] == (
+        receipt["receipt_id"]
+    )
+    build = bound["stages"]["build"]["evidence"]
+    assert build["route"]["adapter_id"] == "codex_exec"
+    assert build["semantic_edit"]["state"] == "verified"
+    assert build["semantic_edit"]["apply_receipts_joined"] == 1
+    assert build["effective_effort_context"]["state"] == "not_applicable"
+    assert bound["cycle"] == {
+        "state": "incomplete",
+        "blocking_stage": "deploy",
+        "reason": "no_stage_receipt",
+    }
+    packet = server.aiworkhub_manager_sdlc_stage_packet(case_id, "test")
+    assert packet["state"] == "ready"
+    assert packet["evidence"]["candidate_sha256"] == (
+        bound["stages"]["build"]["evidence"]["candidate_sha256"]
+    )
