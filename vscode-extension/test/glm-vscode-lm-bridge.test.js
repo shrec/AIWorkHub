@@ -5608,9 +5608,105 @@ async function nf202600023DeclaredDependencyReadDuringForcedStaging() {
     "the fifth forced-stage read must be refused by the total cap, unexecuted");
 }
 
+// NF-2026-00032: outside forced staging glm-5.3 named a response-schema id as a
+// tool, and that first slip killed the request with an empty trace. The first
+// unknown name must get exactly one corrective, non-executing tool_result that
+// names the allowlist, and the run must continue; any second violation (here a
+// different, wrong-role name) fails structurally with the trace and preview kept.
+async function nf202600032UnknownToolOutsideForcedStaging() {
+  const schemaIdName = "aiworkhub.vscode_lm.semantic_edit_response_placeholder";
+  const request = {
+    requestId: "5".repeat(32),
+    request_kind: "worker",
+    prompt: "Fix src/app.py.",
+    allowedWrites: ["src/app.py"],
+    path_contracts: {
+      "src/app.py": { action: "edit", current_sha256: "a".repeat(64), line_count: 2, parent_existed: true },
+    },
+    initial_source_graph_result: { ok: true, content: "prefetched graph" },
+  };
+  const toolRequest = (name, input) => JSON.stringify({
+    schema_id: internals.constants.VSCODE_LM_TOOL_REQUEST_SCHEMA, name, input,
+  });
+  const discover = () => toolRequest("aiworkhub_worker_source_graph_query", {
+    mode: "focus", query: "orientation", workflow_stage: "implementation",
+  });
+  const unknown = toolRequest(schemaIdName, { summary: "placeholder" });
+  const finalEdit = JSON.stringify({
+    schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+    summary: "fixed",
+    edits: [{ path: "src/app.py", ranges: [{ start_line: 2, end_line: 2, new: "fixed" }] }],
+    creates: [],
+  });
+  const scripted = (plan, correctives) => ({
+    capabilities: { toolCalling: false },
+    sendRequest: async (messages) => {
+      const last = messages[messages.length - 1];
+      let parsed = null;
+      try { parsed = JSON.parse(String(last && last.content)); } catch (_err) { /* not a tool result */ }
+      if (parsed && parsed.result && parsed.result.corrective === true) correctives.push(parsed);
+      const value = plan.shift();
+      return { stream: (async function* stream() { yield { value }; }()) };
+    },
+  });
+
+  // Scenario 1: one slip is corrected without executing it, and the run completes.
+  const invoked = [];
+  const correctives = [];
+  const final = JSON.parse(await internals.runVscodeLmTextProtocol(
+    scripted([discover(), discover(), unknown, discover(), finalEdit], correctives),
+    request, undefined, async (call) => {
+      invoked.push(call.name);
+      return { ok: true, content: "bounded graph" };
+    },
+  ));
+  assert.deepStrictEqual(final.edits.map((edit) => edit.path), ["src/app.py"]);
+  assert.deepStrictEqual(invoked, [
+    "aiworkhub_worker_source_graph_query",
+    "aiworkhub_worker_source_graph_query",
+    "aiworkhub_worker_source_graph_query",
+  ], "the unknown name must never execute; the run must continue after the correction");
+  assert.strictEqual(correctives.length, 1, "exactly one corrective result");
+  assert.strictEqual(correctives[0].schema_id, internals.constants.VSCODE_LM_TOOL_RESULT_SCHEMA);
+  assert.strictEqual(correctives[0].name, schemaIdName);
+  assert.deepStrictEqual(correctives[0].result,
+    { ok: false, error: "vscode_lm_tool_not_allowed", corrective: true });
+  assert.ok(correctives[0].instruction.includes("aiworkhub_worker_source_graph_query"),
+    "the corrective result must name the allowlisted tools");
+
+  // Scenario 2: a second violation, whatever its name, fails structurally.
+  const repeatInvoked = [];
+  const repeatCorrectives = [];
+  const error = await internals.runVscodeLmTextProtocol(
+    scripted([discover(), unknown, discover(),
+      toolRequest("aiworkhub_manager_source_graph_query", { mode: "focus", query: "wrong role" }),
+      finalEdit], repeatCorrectives),
+    { ...request, requestId: "6".repeat(32) }, undefined, async (call) => {
+      repeatInvoked.push(call.name);
+      return { ok: true, content: "bounded graph" };
+    },
+  ).then(() => assert.fail("a second tool-name violation must fail"), (err) => err);
+  assert.match(String(error.message), /^vscode_lm_tool_not_allowed:aiworkhub_manager_source_graph_query$/);
+  assert.strictEqual(repeatCorrectives.length, 1, "only the first violation is corrected");
+  assert.deepStrictEqual(repeatInvoked, [
+    "aiworkhub_worker_source_graph_query",
+    "aiworkhub_worker_source_graph_query",
+  ], "neither rejected name may execute");
+  assert.ok(Array.isArray(error.protocolTrace) && error.protocolTrace.length > 0, "turn trace must be kept");
+  assert.deepStrictEqual(
+    error.protocolTrace.filter((entry) => entry.outcome === "tool_not_allowed").map((entry) => entry.rejectedTool),
+    [schemaIdName, "aiworkhub_manager_source_graph_query"],
+  );
+  // The preview is the (redacted) offending response; long tool-name tokens are
+  // redacted by the shared preview sanitizer, so assert on its query text.
+  assert.ok(error.protocolPreview.includes("wrong role"),
+    "the protocol preview must carry the offending response");
+}
+
 async function main() {
   await nf651StageContextReadForNextRequiredFile();
   await nf202600023DeclaredDependencyReadDuringForcedStaging();
+  await nf202600032UnknownToolOutsideForcedStaging();
   await nf897EffortContextChecks();
   await nf831DirectFinalSubsetChecks();
   const schema = internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA;

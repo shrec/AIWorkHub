@@ -5224,6 +5224,7 @@ async function runVscodeLmTextProtocol(
   let forceFinalViolations = 0;
   let reviewSubmitForced = false;
   let reviewSubmitViolations = 0;
+  let toolNotAllowedViolations = 0;
   let forceStagedEdit = false;
   let stagedEditInstructionSent = false;
   let stagedEditMissingPathSent = "";
@@ -5607,7 +5608,31 @@ async function runVscodeLmTextProtocol(
         ));
         continue;
       }
-      throw new Error(`vscode_lm_tool_not_allowed:${String(envelope.name || "")}`);
+      // NF-2026-00032: outside forced staging an unknown or non-allowlisted name
+      // (glm-5.3 once named a response schema id as a tool) is a protocol slip,
+      // not an authority grant. It is never executed. The first one gets one
+      // corrective, non-executing tool_result naming the allowlist, as the native
+      // authority gate does; any second one in this request, whatever its name,
+      // fails with the turn trace and the offending response kept.
+      const rejectedTool = String(envelope.name || "").slice(0, 120);
+      lastProtocolPreview = text;
+      protocolTrace.push({ turn, phase: "authority_gate", outcome: "tool_not_allowed", rejectedTool });
+      if (toolNotAllowedViolations >= 1) {
+        throw vscodeLmProtocolFailure(
+          `vscode_lm_tool_not_allowed:${rejectedTool}`, protocolTrace, lastProtocolPreview,
+        );
+      }
+      toolNotAllowedViolations += 1;
+      messages.push(vscode.LanguageModelChatMessage.Assistant([languageModelTextPart(text)]));
+      messages.push(vscode.LanguageModelChatMessage.User(JSON.stringify({
+        schema_id: VSCODE_LM_TOOL_RESULT_SCHEMA,
+        name: rejectedTool,
+        result: { ok: false, error: "vscode_lm_tool_not_allowed", corrective: true },
+        instruction: `${JSON.stringify(rejectedTool)} is not an allowed tool and was not executed. ` +
+          `Allowed tool names: ${JSON.stringify(availableTools.map((tool) => tool.name))}. Output ONLY one strict ` +
+          `${sourceGraphAcknowledged ? `${VSCODE_LM_EDIT_RESPONSE_SCHEMA} final object or allowlisted ${VSCODE_LM_TOOL_REQUEST_SCHEMA} request` : `${VSCODE_LM_TOOL_REQUEST_SCHEMA} Source Graph request`} with no prose.`,
+      })));
+      continue;
     }
     // NF-2026-00229: quality-review forced-submit boundary — after the initial
     // Source Graph work turns, a non-submit tool request receives one corrective,
