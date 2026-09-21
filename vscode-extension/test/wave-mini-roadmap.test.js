@@ -31,69 +31,57 @@ const sandbox = {};
 vm.createContext(sandbox);
 vm.runInContext(helperBlock, sandbox);
 for (const name of [
-  "waveSelectActive", "waveSemver", "waveIsActive", "waveGoalsFromDetail", "waveTaskRowsById",
-  "waveTaskEvidence", "waveGoalState", "waveGoalChecklist", "waveTaskStates",
-  "waveWatchedTaskIds", "waveTaskStatesChanged",
+  "waveCurrentReady", "waveCurrentReason", "waveCurrentEntries", "waveVersionText",
+  "waveGoalsFromDetail", "waveTaskRowsById", "waveTaskEvidence", "waveGoalState", "waveGoalChecklist",
+  "waveServerGoalGate", "waveTaskStates", "waveWatchedTaskIds", "waveTaskStatesChanged",
 ]) {
   assert.strictEqual(typeof sandbox[name], "function", `${name} must be extractable`);
 }
+for (const name of ["waveSelectActive", "waveSemver", "waveIsActive", "waveVersionCompare"]) {
+  assert.strictEqual(typeof sandbox[name], "undefined", `${name}: the popup must not rank waves locally`);
+}
 
-// Latest active versioned wave wins by semver order, never by hard-coded ID.
-const picked = sandbox.waveSelectActive([
-  { id: "A", milestone: "0.11.49", title: "older", status: "in_progress" },
-  { id: "B", milestone: "0.11.50", title: "current", status: "in_progress" },
-  { id: "C", milestone: "v0.11.48", title: "older", status: "current" },
-  { id: "D", milestone: "next-wave", title: "unversioned", status: "in_progress" },
-]);
-assert.strictEqual(picked && picked.id, "B", "Latest semver milestone wave must be selected");
+// Only a ready server projection naming one non-blank wave id selects a wave.
+assert.strictEqual(sandbox.waveCurrentReady({ state: "ready", wave_id: "RM-1" }), true);
+for (const current of [
+  null, undefined, "ready", {}, { state: "ready" }, { state: "ready", wave_id: "" }, { state: "ready", wave_id: " " },
+  { state: "ready", wave_id: 7 }, { state: "READY", wave_id: "RM-1" }, { state: "UNKNOWN", wave_id: "RM-1" },
+]) {
+  assert.strictEqual(sandbox.waveCurrentReady(current), false, `${JSON.stringify(current)} must not select a wave`);
+}
 
-const parsed = sandbox.waveSemver("v1.2.3");
-assert.strictEqual(parsed.major, 1);
-assert.strictEqual(parsed.minor, 2);
-assert.strictEqual(parsed.patch, 3);
-const parsedSuffix = sandbox.waveSemver("1.2.3-alpha.1");
-assert.strictEqual(parsedSuffix.major, 1);
-assert.strictEqual(parsedSuffix.minor, 2);
-assert.strictEqual(parsedSuffix.patch, 3);
-assert.strictEqual(sandbox.waveSemver("soon"), null);
-assert.strictEqual(sandbox.waveSemver(undefined), null);
-
-// Only canonical active/current waves are eligible. A higher-version
-// proposed/completed/archived milestone must never displace the in_progress wave.
-const activePicked = sandbox.waveSelectActive([
-  { id: "proposed-next", milestone: "0.11.60", status: "proposed" },
-  { id: "completed-next", milestone: "0.11.70", status: "completed" },
-  { id: "archived-next", milestone: "0.11.80", status: "archived" },
-  { id: "current", milestone: "0.11.50", status: "in_progress" },
-  { id: "old", milestone: "0.11.49", status: "in_progress" },
-]);
+// UNKNOWN keeps the server's typed reason visible.
 assert.strictEqual(
-  activePicked && activePicked.id,
-  "current",
-  "A newer proposed/completed/archived wave must not displace the current in_progress wave",
+  sandbox.waveCurrentReason({ state: "UNKNOWN", selection_reason: "ambiguous_active_wave" }),
+  "Wave selection is ambiguous: several active waves share the highest target (ambiguous_active_wave)",
 );
-assert.strictEqual(sandbox.waveIsActive({ status: "in_progress" }), true);
-assert.strictEqual(sandbox.waveIsActive({ status: "current" }), true);
-assert.strictEqual(sandbox.waveIsActive({ status: "active" }), true);
-assert.strictEqual(sandbox.waveIsActive({ status: "proposed" }), false);
-assert.strictEqual(sandbox.waveIsActive({ status: "completed" }), false);
-assert.strictEqual(sandbox.waveIsActive({ status: "archived" }), false);
-assert.strictEqual(sandbox.waveIsActive({ status: "In_Progress" }), true, "Status matching is case-insensitive");
-assert.strictEqual(sandbox.waveIsActive(null), false);
-
-// Fail-closed: no versioned milestone or an empty list → null (UNKNOWN), never
-// an empty-green state.
-assert.strictEqual(sandbox.waveSelectActive([{ milestone: "next", status: "in_progress" }]), null);
-assert.strictEqual(sandbox.waveSelectActive([]), null);
-assert.strictEqual(sandbox.waveSelectActive(null), null);
-// Fail-closed: ambiguous tie at the top → null (UNKNOWN).
+assert.strictEqual(sandbox.waveCurrentReason(null), "The server reported no current-wave projection");
+assert.strictEqual(sandbox.waveCurrentReason({ state: "UNKNOWN" }), "The server current-wave projection is not ready");
 assert.strictEqual(
-  sandbox.waveSelectActive([
-    { milestone: "0.11.50", status: "in_progress" },
-    { milestone: "0.11.50", status: "in_progress" },
-  ]),
-  null,
+  sandbox.waveCurrentReason({ state: "UNKNOWN", selection_reason: "toString" }),
+  "The server current-wave projection is not ready (toString)",
+  "Only own reason keys may map to text",
 );
+
+// The server's exact wave id picks list rows; version order plays no part.
+const projectedRows = [
+  { id: "RM-0000-00051", milestone: "0.11.51", status: "in_progress" },
+  { id: "RM-0000-00050", milestone: "0.11.50", status: "in_progress" },
+];
+const plainRows = (rows) => Array.from(rows, (row) => row.id);
+assert.deepStrictEqual(
+  plainRows(sandbox.waveCurrentEntries({ state: "ready", wave_id: "RM-0000-00050" }, projectedRows)),
+  ["RM-0000-00050"],
+  "The server-selected id wins over a higher-version active row",
+);
+assert.deepStrictEqual(plainRows(sandbox.waveCurrentEntries({ state: "ready", wave_id: "RM-0000-0005" }, projectedRows)), [], "Ids match exactly, never by prefix");
+assert.deepStrictEqual(plainRows(sandbox.waveCurrentEntries({ state: "UNKNOWN", wave_id: "RM-0000-00050" }, projectedRows)), []);
+assert.deepStrictEqual(plainRows(sandbox.waveCurrentEntries({ state: "ready", wave_id: "RM-0000-00050" }, null)), []);
+
+assert.strictEqual(sandbox.waveVersionText(" 0.11.53 "), "0.11.53");
+for (const value of [null, undefined, "", "  ", 53]) {
+  assert.strictEqual(sandbox.waveVersionText(value), "UNKNOWN", `${JSON.stringify(value)} is not a version`);
+}
 
 // Goal checklist: a goal is checked only when every listed task has exactly one
 // canonical finished/accepted row; everything else stays unchecked or UNKNOWN.
@@ -284,28 +272,42 @@ const watchedDetail = {
   task_ids: ["t2"],
   provenance: { wave_goals: [goalOf(["t3", "t1"]), null] },
 };
+const watchedCurrent = {
+  state: "ready",
+  wave_id: "RM-1",
+  goals: [{ id: "g", label: "G", state: "open", tasks: [{ task_id: "t4", status: "pending" }, null] }],
+};
 assert.deepStrictEqual(
-  Array.from(sandbox.waveWatchedTaskIds(watchedEntries, null)).sort(),
-  ["t1"],
-  "Only the newest active wave's tasks are watched",
+  Array.from(sandbox.waveWatchedTaskIds(watchedCurrent, watchedEntries, null)).sort(),
+  ["t1", "t4"],
+  "The server-selected wave's list row and projected goal tasks are watched",
 );
 assert.deepStrictEqual(
-  Array.from(sandbox.waveWatchedTaskIds(watchedEntries, watchedDetail)).sort(),
-  ["t1", "t2", "t3"],
+  Array.from(sandbox.waveWatchedTaskIds(watchedCurrent, watchedEntries, watchedDetail)).sort(),
+  ["t1", "t2", "t3", "t4"],
   "The detail's task ids and goal task ids join the watch list",
 );
 assert.deepStrictEqual(
-  Array.from(sandbox.waveWatchedTaskIds(watchedEntries, Object.assign({}, watchedDetail, { id: "RM-0" }))).sort(),
-  ["t1"],
+  Array.from(sandbox.waveWatchedTaskIds(watchedCurrent, watchedEntries, Object.assign({}, watchedDetail, { id: "RM-0" }))).sort(),
+  ["t1", "t4"],
   "A detail for another wave adds nothing",
 );
-assert.strictEqual(sandbox.waveWatchedTaskIds([], null), null, "No active wave means nothing to watch");
+assert.deepStrictEqual(
+  Array.from(sandbox.waveWatchedTaskIds({ state: "ready", wave_id: "RM-0" }, watchedEntries, null)).sort(),
+  ["old"],
+  "The server's wave is watched even when a higher-version active row exists",
+);
+assert.strictEqual(sandbox.waveWatchedTaskIds(null, watchedEntries, null), null, "No projection means nothing to watch");
+assert.strictEqual(sandbox.waveWatchedTaskIds(unknownCurrent("no_active_wave"), watchedEntries, null), null, "An UNKNOWN projection means nothing to watch");
 
 // ── 3. Refresh/reload reconciles canonical list/detail state; no shadow checklist ──
 assert.ok(app.includes("function renderWaveMiniRoadmap(snapshot)"), "Wave renderer must exist");
 assert.ok(app.includes("renderWaveMiniRoadmap(snapshot);"), "Wave renderer must run on every snapshot refresh");
-assert.ok(app.includes("waveSelectActive(state.waveMiniRoadmapEntries)"), "Wave selection must read the popup's isolated list state, never snapshot.roadmap.items");
-assert.ok(!app.includes("waveSelectActive(state.roadmapEntries)"), "Popup must never select from the Roadmap dialog's shared list");
+assert.ok(app.includes("waveCurrentEntries(current, state.waveMiniRoadmapEntries)"), "Wave rows must come from the popup's isolated list state, never snapshot.roadmap.items");
+assert.ok(!app.includes("waveCurrentEntries(current, state.roadmapEntries)"), "Popup must never select from the Roadmap dialog's shared list");
+assert.ok(app.includes("payload.current_wave"), "The popup must consume the server's current_wave projection");
+assert.ok(app.includes("roadmapId: current.wave_id"), "Detail must be requested for the server's exact wave id");
+assert.ok(!/function (waveSelectActive|waveSemver|waveVersionCompare)\b/.test(app), "No local highest-semver wave selection may remain");
 assert.ok(app.includes("state.waveMiniRoadmapDetail"), "Wave acceptance/tasks must come from canonical detail state");
 assert.ok(app.includes('type: "requestRoadmap"'), "Popup must reuse the list bridge");
 assert.ok(app.includes('type: "requestRoadmapDetail"'), "Popup must reuse the detail bridge");
@@ -558,22 +560,71 @@ function withGoals(goals, rows) {
   return Object.assign({}, detailItem, { provenance: { wave_goals: goals }, tasks: rows });
 }
 
-function renderDetail(detail) {
+// The server's ready current_wave projection (wave_roadmap.project_current_wave) for one detail.
+// Every goal it lists is server-checked, so the local join alone decides these
+// fixtures; the server-gate tests below lower individual goals explicitly.
+function currentFor(detail, overrides) {
+  const declared = detail && detail.provenance && Array.isArray(detail.provenance.wave_goals) ? detail.provenance.wave_goals : [];
+  const goals = declared
+    .filter((goal) => goal && typeof goal === "object" && typeof goal.id === "string")
+    .map((goal) => ({
+      id: goal.id,
+      label: goal.label,
+      state: "checked",
+      tasks: (Array.isArray(goal.task_ids) ? goal.task_ids : []).map((task_id) => ({ task_id, status: "finished" })),
+    }));
+  return Object.assign({
+    state: "ready",
+    selection_reason: "unique_highest_active_wave",
+    wave_id: detail.id,
+    installed_version: "0.11.51",
+    target_milestone: detail.milestone,
+    overdue: false,
+    goals,
+  }, overrides);
+}
+
+// The server's typed UNKNOWN projection.
+function unknownCurrent(reason) {
+  return {
+    state: "UNKNOWN",
+    selection_reason: reason,
+    wave_id: null,
+    installed_version: "0.11.53",
+    target_milestone: null,
+    overdue: null,
+    goals: [],
+  };
+}
+
+function listPayload(entries = listEntries, current = currentFor(detailItem)) {
+  return { ok: true, entries, current_wave: current };
+}
+
+function targetOf(content) {
+  const target = findByClass(content, "wave-mini-roadmap-target");
+  return target && target.textContent;
+}
+
+function renderDetail(detail, current = currentFor(detail && typeof detail === "object" ? detail : detailItem), entries = listEntries) {
   const { sandbox: isb, content } = buildIntegrationSandbox();
-  isb.state.waveMiniRoadmapEntries = listEntries;
+  isb.state.waveMiniRoadmapEntries = entries;
+  isb.state.waveMiniRoadmapCurrent = current;
   isb.state.waveMiniRoadmapDetail = detail;
   isb.renderSnapshot(summaryOnlySnapshot);
   return content;
 }
 
-// Initial canonical state: the newest active wave 0.11.51, one goal checked and one held open by a blocked task.
+// Initial canonical state: the server-selected wave 0.11.51, one goal checked and one held open by a blocked task.
 {
   const { sandbox: isb, content } = buildIntegrationSandbox();
   isb.state.waveMiniRoadmapEntries = listEntries;
+  isb.state.waveMiniRoadmapCurrent = currentFor(detailItem);
   isb.state.waveMiniRoadmapDetail = detailItem;
   isb.renderSnapshot(summaryOnlySnapshot);
-  const milestone = findByClass(content, "wave-mini-roadmap-milestone");
-  assert.strictEqual(milestone && milestone.textContent, "0.11.51", "Initial wave must render the newest active 0.11.51");
+  assert.strictEqual(targetOf(content), "Target 0.11.51", "Initial wave must render the server-selected 0.11.51 target");
+  assert.strictEqual(findByClass(content, "wave-mini-roadmap-installed").textContent, "Installed 0.11.51");
+  assert.strictEqual(findByClass(content, "wave-mini-roadmap-overdue"), null, "An on-time wave is not overdue");
   const title = findByClass(content, "wave-mini-roadmap-title");
   assert.strictEqual(title && title.textContent, "Wave 0.11.51");
   assert.strictEqual(goalCount(content), "1/2 goals done · 1 blocked task", "The summary must count goals, not tasks");
@@ -726,16 +777,24 @@ for (const [name, provenance] of [
   assert.ok(findByClass(content, "wave-mini-roadmap-unknown"), "Missing detail must fail closed to UNKNOWN");
 }
 
-// Detail for a different wave → UNKNOWN (fail closed).
+// Detail for a different wave than the server selected → UNKNOWN (fail closed).
 {
-  const content = renderDetail(Object.assign({}, detailItem, { id: "RM-0000-00049" }));
+  const content = renderDetail(Object.assign({}, detailItem, { id: "RM-0000-00049" }), currentFor(detailItem));
   assert.ok(findByClass(content, "wave-mini-roadmap-unknown"), "Mismatched detail must fail closed to UNKNOWN");
+}
+
+// A detail whose target disagrees with the projection is stale evidence → UNKNOWN.
+for (const target of ["0.11.52", null, ""]) {
+  const content = renderDetail(detailItem, currentFor(detailItem, { target_milestone: target }));
+  assert.ok(findByClass(content, "wave-mini-roadmap-unknown"), `Target ${target} must fail closed to UNKNOWN`);
+  assert.strictEqual(findByClass(content, "wave-mini-roadmap-goals"), null, `Target ${target} must not render a checklist`);
 }
 
 // Truncated or unavailable roadmap → UNKNOWN (fail closed).
 {
   const { sandbox: isb, content } = buildIntegrationSandbox();
   isb.state.waveMiniRoadmapEntries = listEntries;
+  isb.state.waveMiniRoadmapCurrent = currentFor(detailItem);
   isb.state.waveMiniRoadmapDetail = detailItem;
   isb.renderSnapshot({ roadmap: { available: true, error: null, active: 1, total: 2, truncated: true } });
   assert.ok(findByClass(content, "wave-mini-roadmap-unknown"), "Truncated roadmap must fail closed to UNKNOWN");
@@ -744,34 +803,137 @@ for (const [name, provenance] of [
   assert.strictEqual(reason && reason.textContent, "Roadmap offline", "An unavailable roadmap must say why");
 }
 
-// No active wave, or an ambiguous tie, keeps the popup on UNKNOWN with its reason and no checklist.
-for (const [name, entries] of [
-  ["an empty list", []],
-  ["only completed waves", [Object.assign({}, newWaveEntry, { status: "completed" })]],
-  ["two active waves on one version", [newWaveEntry, Object.assign({}, newWaveEntry, { id: "RM-0000-00099" })]],
+// Every non-ready server projection is a typed UNKNOWN with its reason and no checklist,
+// even while the list and a detail look complete.
+for (const reason of [
+  "no_active_wave", "ambiguous_active_wave", "invalid_wave_version", "invalid_installed_version",
+  "truncated_roadmap", "missing_goal_data", "malformed_roadmap_row",
 ]) {
-  const { sandbox: isb, content } = buildIntegrationSandbox();
-  isb.state.waveMiniRoadmapEntries = entries;
-  isb.state.waveMiniRoadmapDetail = detailItem;
-  isb.renderSnapshot(summaryOnlySnapshot);
-  const reason = findByClass(content, "wave-mini-roadmap-reason");
-  assert.ok(reason && reason.textContent.startsWith("No active versioned wave"), `${name} must report no active wave`);
+  const content = renderDetail(detailItem, unknownCurrent(reason));
+  const unknown = findByClass(content, "wave-mini-roadmap-unknown");
+  assert.strictEqual(unknown && unknown.textContent, "UNKNOWN", `${reason} must render UNKNOWN`);
+  const shown = findByClass(content, "wave-mini-roadmap-reason");
+  assert.ok(shown && shown.textContent.endsWith(`(${reason})`), `${reason} must be named`);
+  assert.strictEqual(findByClass(content, "wave-mini-roadmap-goals"), null, `${reason} must not render a checklist`);
+}
+for (const [name, current] of [
+  ["no projection", null],
+  ["a non-object projection", "ready"],
+  ["a ready projection without a wave id", currentFor(detailItem, { wave_id: null })],
+  ["a blank wave id", currentFor(detailItem, { wave_id: "  " })],
+  ["a differently cased state", currentFor(detailItem, { state: "READY" })],
+  ["an unrecognised reason", { state: "UNKNOWN", selection_reason: "odd_reason" }],
+]) {
+  const content = renderDetail(detailItem, current);
+  assert.ok(findByClass(content, "wave-mini-roadmap-unknown"), `${name} must render UNKNOWN`);
   assert.strictEqual(findByClass(content, "wave-mini-roadmap-goals"), null, `${name} must not render a checklist`);
 }
 
-// Higher proposed/completed waves must not displace the in_progress wave.
+// Two list rows carrying the server's exact wave id are ambiguous → UNKNOWN.
 {
-  const { sandbox: isb, content } = buildIntegrationSandbox();
-  isb.state.waveMiniRoadmapEntries = [
+  const content = renderDetail(detailItem, currentFor(detailItem), [newWaveEntry, Object.assign({}, newWaveEntry)]);
+  assert.ok(findByClass(content, "wave-mini-roadmap-unknown"), "A duplicated wave id must fail closed to UNKNOWN");
+}
+
+// The server, never a local highest-semver ranking, selects the wave: higher active rows cannot displace it.
+{
+  const content = renderDetail(oldWaveDetail, currentFor(oldWaveDetail), [
     oldWaveEntry,
-    { id: "RM-0000-00060", title: "Wave 0.11.60", status: "proposed", milestone: "0.11.60", task_ids: [] },
-    { id: "RM-0000-00070", title: "Wave 0.11.70", status: "completed", milestone: "0.11.70", task_ids: [] },
-  ];
-  isb.state.waveMiniRoadmapDetail = oldWaveDetail;
-  isb.renderSnapshot(summaryOnlySnapshot);
-  const milestone = findByClass(content, "wave-mini-roadmap-milestone");
-  assert.strictEqual(milestone && milestone.textContent, "0.11.50", "Proposed/completed higher waves must not displace in_progress");
+    newWaveEntry,
+    { id: "RM-0000-00060", title: "Wave 0.11.60", status: "in_progress", milestone: "0.11.60", task_ids: [] },
+  ]);
+  assert.strictEqual(targetOf(content), "Target 0.11.50", "Higher active rows must not displace the server's wave");
   assert.strictEqual(goalCount(content), "1/1 goal done");
+}
+
+// A server-selected wave outside the bounded list still renders from its exact detail.
+{
+  const content = renderDetail(detailItem, currentFor(detailItem), []);
+  assert.strictEqual(targetOf(content), "Target 0.11.51");
+  assert.strictEqual(findByClass(content, "wave-mini-roadmap-title").textContent, "Wave 0.11.51");
+}
+
+// Installed runtime and wave target are distinct: 0.11.53 installed, 0.11.51 target overdue.
+// Overdue neither retargets the wave nor completes a goal.
+{
+  const current = currentFor(detailItem, { installed_version: "0.11.53", overdue: true });
+  current.goals[1].state = "open";
+  const content = renderDetail(detailItem, current);
+  assert.strictEqual(findByClass(content, "wave-mini-roadmap-installed").textContent, "Installed 0.11.53");
+  assert.strictEqual(targetOf(content), "Target 0.11.51", "The target must stay the wave's own milestone");
+  assert.strictEqual(findByClass(content, "wave-mini-roadmap-overdue").textContent, " (overdue)");
+  assert.strictEqual(findByClass(content, "wave-mini-roadmap-milestone").title, "Installed 0.11.53 · Target 0.11.51 (overdue)");
+  assert.ok(!targetOf(content).includes("0.11.53"), "The target must never be derived from the installed version");
+  assert.ok(!findByClass(content, "wave-mini-roadmap-title").textContent.includes("0.11.53"), "The wave must not be called an installed-version wave");
+  assert.strictEqual(goalCount(content), "1/2 goals done · 1 blocked task", "Overdue must not complete a goal");
+  assert.deepStrictEqual(goalViews(content).map((view) => view.state), ["wave-goal-checked", "wave-goal-open"]);
+}
+for (const overdue of [false, null, "true", 1, undefined]) {
+  const content = renderDetail(detailItem, currentFor(detailItem, { installed_version: "0.11.53", overdue }));
+  assert.strictEqual(findByClass(content, "wave-mini-roadmap-overdue"), null, `overdue=${overdue} must not render overdue`);
+}
+for (const installed of [null, "", 53]) {
+  const content = renderDetail(detailItem, currentFor(detailItem, { installed_version: installed }));
+  assert.strictEqual(findByClass(content, "wave-mini-roadmap-installed").textContent, "Installed UNKNOWN");
+}
+
+// The server holds the goal verdict: locally finished evidence never checks a goal the server left open or UNKNOWN.
+for (const [serverState, state, flags] of [
+  ["open", "wave-goal-open", []],
+  ["UNKNOWN", "wave-goal-unknown", ["UNKNOWN"]],
+  ["checked ", "wave-goal-unknown", ["UNKNOWN"]],
+  [undefined, "wave-goal-unknown", ["UNKNOWN"]],
+]) {
+  const current = currentFor(detailItem);
+  current.goals[1].state = serverState;
+  const content = renderDetail(withTasks(allFinished), current);
+  assert.deepStrictEqual(
+    goalViews(content).map((view) => [view.state, view.flags]),
+    [["wave-goal-checked", []], [state, flags]],
+    `A server ${serverState} goal must never render checked`,
+  );
+  assertAccessibleRows(content, `Server ${serverState}`);
+}
+{
+  const missing = currentFor(detailItem);
+  missing.goals.pop();
+  const doubled = currentFor(detailItem);
+  doubled.goals.push(Object.assign({}, doubled.goals[1]));
+  for (const [name, current] of [["missing on the server", missing], ["duplicated on the server", doubled]]) {
+    const content = renderDetail(withTasks(allFinished), current);
+    assert.deepStrictEqual(
+      goalViews(content).map((view) => [view.state, view.flags]),
+      [["wave-goal-checked", []], ["wave-goal-unknown", ["UNKNOWN"]]],
+      `A goal ${name} must be UNKNOWN`,
+    );
+  }
+  const extra = currentFor(detailItem);
+  extra.goals.push({ id: "goal-server-only", label: "Only the server knows", state: "checked", tasks: [] });
+  const content = renderDetail(withTasks(allFinished), extra);
+  assert.deepStrictEqual(
+    goalViews(content).map((view) => [view.label, view.state]),
+    [
+      ["Popover shows a short goal checklist", "wave-goal-checked"],
+      ["Open popover updates when a task finishes", "wave-goal-checked"],
+      ["Only the server knows", "wave-goal-unknown"],
+    ],
+    "A goal only the server lists must render UNKNOWN",
+  );
+  assert.strictEqual(goalCount(content), "2/3 goals done · 1 UNKNOWN");
+}
+
+// An archived predecessor with an unbound pending successor never checks its goal; a stale row is UNKNOWN.
+{
+  const goals = [{ id: "goal-lsp", label: "LSP index integration", task_ids: ["task-lsp-v1"] }];
+  const archived = withGoals(goals, [
+    { task_id: "task-lsp-v1", status: "finished", archived_at: "2026-09-20T10:00:00Z" },
+    { task_id: "task-lsp-v2", status: "pending" },
+  ]);
+  const archivedView = renderDetail(archived, currentFor(archived));
+  assert.deepStrictEqual(goalViews(archivedView).map((view) => [view.state, view.flags]), [["wave-goal-open", []]], "An archived predecessor must keep its goal open");
+  const stale = withGoals(goals, [{ task_id: "task-lsp-v1", status: "finished", stale: true }]);
+  const staleView = renderDetail(stale, currentFor(stale));
+  assert.deepStrictEqual(goalViews(staleView).map((view) => [view.state, view.flags]), [["wave-goal-unknown", ["UNKNOWN"]]], "Stale evidence must be UNKNOWN");
 }
 
 // Compact rendering: at most 20 rows, long labels are cut with the full text on hover, and goals past the cap still count.
@@ -800,10 +962,10 @@ for (const [name, entries] of [
 {
   const { sandbox: isb, content } = buildIntegrationSandbox();
   isb.state.waveMiniRoadmapEntries = listEntries;
+  isb.state.waveMiniRoadmapCurrent = currentFor(detailItem);
   isb.state.waveMiniRoadmapDetail = detailItem;
   isb.renderSnapshot(summaryOnlySnapshot);
-  const milestone = findByClass(content, "wave-mini-roadmap-milestone");
-  assert.strictEqual(milestone && milestone.textContent, "0.11.51", "Isolation: wave must render 0.11.51 before dialog list changes");
+  assert.strictEqual(targetOf(content), "Target 0.11.51", "Isolation: wave must render 0.11.51 before dialog list changes");
   assert.strictEqual(goalCount(content), "1/2 goals done · 1 blocked task", "Isolation: initial goals must be 1/2 done");
 
   // Simulate the Roadmap dialog filtering to a different wave, then failing its
@@ -811,12 +973,10 @@ for (const [name, entries] of [
   // popup's isolated projection must remain intact.
   isb.state.roadmapEntries = [listEntries[0]];
   isb.renderSnapshot(summaryOnlySnapshot);
-  const afterFilter = findByClass(content, "wave-mini-roadmap-milestone");
-  assert.strictEqual(afterFilter && afterFilter.textContent, "0.11.51", "Isolation: dialog filter must not change the popup wave");
+  assert.strictEqual(targetOf(content), "Target 0.11.51", "Isolation: dialog filter must not change the popup wave");
   isb.state.roadmapEntries = [];
   isb.renderSnapshot(summaryOnlySnapshot);
-  const afterFail = findByClass(content, "wave-mini-roadmap-milestone");
-  assert.strictEqual(afterFail && afterFail.textContent, "0.11.51", "Isolation: dialog list failure must not change the popup wave");
+  assert.strictEqual(targetOf(content), "Target 0.11.51", "Isolation: dialog list failure must not change the popup wave");
   assert.strictEqual(goalCount(content), "1/2 goals done · 1 blocked task", "Isolation: dialog list failure must not alter popup goals");
 
   // The popup's own list response failing/unavailable must clear its isolated
@@ -921,7 +1081,7 @@ function buildRefreshSandbox() {
   assert.strictEqual(listReq && listReq.waveGeneration, 1, "Wave list request must carry its generation");
 
   // Canonical list response selects the active wave and requests its detail.
-  rs.renderWaveMiniRoadmapList({ ok: true, entries: listEntries }, listReq.waveGeneration);
+  rs.renderWaveMiniRoadmapList(listPayload(), listReq.waveGeneration);
   const detailReq = messages.find((m) => m.type === "requestRoadmapDetail");
   assert.strictEqual(detailReq && detailReq.roadmapId, "RM-0000-00051", "List response must request the newest active wave's detail");
   assert.strictEqual(detailReq && detailReq.purpose, "waveMiniRoadmap", "Wave detail request must tag its purpose so the response routes to the isolated handler");
@@ -1016,6 +1176,7 @@ function buildDetailRoutingSandbox() {
   const dialogDetail = { id: "RM-0000-00001", title: "Existing dialog detail" };
   ds.state.roadmapDetail = dialogDetail;
   ds.state.waveMiniRoadmapEntries = listEntries;
+  ds.state.waveMiniRoadmapCurrent = currentFor(detailItem);
   ds.state.waveMiniRoadmapWaitingFor = "RM-0000-00050";
   ds.state.waveMiniRoadmapRequested = true;
   ds.renderWaveMiniRoadmapDetail({ ok: true, item: withTasks(allFinished) });
@@ -1089,7 +1250,7 @@ function buildPopoverSandbox() {
   rs.requestWaveMiniRoadmap();
   const listA = messages.find((m) => m.type === "requestRoadmap" && m.purpose === "waveMiniRoadmap");
   assert.strictEqual(listA && listA.waveGeneration, 1, "Cycle A list must carry generation 1");
-  rs.renderWaveMiniRoadmapList({ ok: true, entries: listEntries }, listA.waveGeneration);
+  rs.renderWaveMiniRoadmapList(listPayload(), listA.waveGeneration);
   const detailA = messages.find((m) => m.type === "requestRoadmapDetail" && m.purpose === "waveMiniRoadmap");
   assert.strictEqual(detailA && detailA.roadmapId, "RM-0000-00051", "Cycle A must request active wave detail");
   assert.strictEqual(detailA && detailA.waveGeneration, 1, "Cycle A detail must carry generation 1");
@@ -1105,7 +1266,7 @@ function buildPopoverSandbox() {
   assert.strictEqual(rs.state.waveMiniRoadmapWaitingFor, null, "Stale detail A before list B must not clear the wait marker");
 
   // List B arrives: cycle B must now request its own fresh detail.
-  rs.renderWaveMiniRoadmapList({ ok: true, entries: listEntries }, listB.waveGeneration);
+  rs.renderWaveMiniRoadmapList(listPayload(), listB.waveGeneration);
   const detailB = messages.filter((m) => m.type === "requestRoadmapDetail" && m.purpose === "waveMiniRoadmap").pop();
   assert.strictEqual(detailB && detailB.waveGeneration, 2, "Cycle B must request a fresh detail after stale detail A");
   assert.strictEqual(detailB && detailB.roadmapId, "RM-0000-00051", "Cycle B detail must target the active wave");
@@ -1124,12 +1285,12 @@ function buildPopoverSandbox() {
   // Cycle A.
   rs.requestWaveMiniRoadmap();
   const genA = messages.find((m) => m.type === "requestRoadmap" && m.purpose === "waveMiniRoadmap").waveGeneration;
-  rs.renderWaveMiniRoadmapList({ ok: true, entries: listEntries }, genA);
+  rs.renderWaveMiniRoadmapList(listPayload(), genA);
 
   // Cycle B checks every goal.
   rs.requestWaveMiniRoadmap();
   const genB = messages.filter((m) => m.type === "requestRoadmap" && m.purpose === "waveMiniRoadmap").pop().waveGeneration;
-  rs.renderWaveMiniRoadmapList({ ok: true, entries: listEntries }, genB);
+  rs.renderWaveMiniRoadmapList(listPayload(), genB);
   rs.renderWaveMiniRoadmapDetail({ ok: true, item: withTasks(allFinished) }, genB);
   let count = findByClass(content, "wave-mini-roadmap-count");
   assert.strictEqual(count && count.textContent, "2/2 goals done", "Cycle B must render every goal checked first");
@@ -1147,7 +1308,7 @@ function buildPopoverSandbox() {
 
   rs.requestWaveMiniRoadmap(); // cycle A (generation 1)
   rs.requestWaveMiniRoadmap(); // cycle B (generation 2)
-  rs.renderWaveMiniRoadmapList({ ok: true, entries: listEntries }, 2);
+  rs.renderWaveMiniRoadmapList(listPayload(), 2);
   const detailB = messages.filter((m) => m.type === "requestRoadmapDetail" && m.purpose === "waveMiniRoadmap").pop();
   assert.strictEqual(detailB && detailB.waveGeneration, 2, "Cycle B must request detail");
 
@@ -1182,7 +1343,7 @@ function waveDetailRequests(messages) {
   return messages.filter((m) => m.type === "requestRoadmapDetail" && m.purpose === "waveMiniRoadmap");
 }
 
-// Opening fetches the list, then the detail of the newest active wave; a popover
+// Opening fetches the list, then the detail of the server-selected wave; a popover
 // that is not open fetches nothing.
 {
   const { sandbox: ts, content, messages } = buildRefreshSandbox();
@@ -1204,33 +1365,31 @@ function waveDetailRequests(messages) {
   const listReq = waveListRequests(messages)[0];
   assert.strictEqual(listReq.status, "", "Opening must not narrow the list by status");
   assert.strictEqual(listReq.includeArchived, false, "Opening must not pull archived waves");
-  ts.renderWaveMiniRoadmapList({ ok: true, entries: listEntries }, listReq.waveGeneration);
+  ts.renderWaveMiniRoadmapList(listPayload(), listReq.waveGeneration);
   assert.strictEqual(waveDetailRequests(messages).length, 1, "The list response must request exactly one detail");
-  assert.strictEqual(waveDetailRequests(messages)[0].roadmapId, "RM-0000-00051", "Opening must fetch the newest active-version wave, not 0.11.50");
+  assert.strictEqual(waveDetailRequests(messages)[0].roadmapId, "RM-0000-00051", "Opening must fetch the server's current_wave.wave_id");
   ts.renderWaveMiniRoadmapDetail({ ok: true, item: detailItem }, listReq.waveGeneration);
   assert.strictEqual(goalCount(content), "1/2 goals done · 1 blocked task", "Opening must render the fetched checklist");
 }
 
-// 0.11.50 stays current until 0.11.51 becomes active; each open shows the newest active wave.
+// 0.11.50 stays current until the server selects 0.11.51; each open shows the server's wave.
 {
   const { sandbox: rs, content, messages } = buildRefreshSandbox();
 
   rs.requestWaveMiniRoadmap();
-  rs.renderWaveMiniRoadmapList({ ok: true, entries: [oldWaveEntry, Object.assign({}, newWaveEntry, { status: "proposed" })] }, 1);
-  assert.strictEqual(waveDetailRequests(messages).pop().roadmapId, "RM-0000-00050", "While 0.11.51 is only proposed, 0.11.50 is the current wave");
+  rs.renderWaveMiniRoadmapList(listPayload([oldWaveEntry, Object.assign({}, newWaveEntry, { status: "proposed" })], currentFor(oldWaveDetail)), 1);
+  assert.strictEqual(waveDetailRequests(messages).pop().roadmapId, "RM-0000-00050", "While the server selects 0.11.50, it is the current wave");
   rs.renderWaveMiniRoadmapDetail({ ok: true, item: oldWaveDetail }, 1);
-  let milestone = findByClass(content, "wave-mini-roadmap-milestone");
-  assert.strictEqual(milestone && milestone.textContent, "0.11.50", "The old wave must render while it is the newest active one");
+  assert.strictEqual(targetOf(content), "Target 0.11.50", "The old wave must render while the server selects it");
   assert.ok(textOf(content).includes("Ship the 0.11.50 release"), "The old wave's own goal must render");
   assert.strictEqual(goalCount(content), "1/1 goal done", "A single goal must be counted in the singular");
 
-  // 0.11.51 becomes active; the next open must switch to it.
+  // The server selects 0.11.51; the next open must switch to it.
   rs.requestWaveMiniRoadmap();
-  rs.renderWaveMiniRoadmapList({ ok: true, entries: listEntries }, 2);
+  rs.renderWaveMiniRoadmapList(listPayload(), 2);
   assert.strictEqual(waveDetailRequests(messages).pop().roadmapId, "RM-0000-00051", "The next open must request the new wave's detail");
   rs.renderWaveMiniRoadmapDetail({ ok: true, item: detailItem }, 2);
-  milestone = findByClass(content, "wave-mini-roadmap-milestone");
-  assert.strictEqual(milestone && milestone.textContent, "0.11.51", "The new wave must replace the old one");
+  assert.strictEqual(targetOf(content), "Target 0.11.51", "The new wave must replace the old one");
   const text = textOf(content);
   assert.ok(text.includes("Popover shows a short goal checklist"), "The new wave's goals must render");
   assert.ok(!text.includes("Ship the 0.11.50 release"), "The old wave's goals must not linger");
@@ -1264,7 +1423,7 @@ function settledPopover(first) {
   post({ type: "snapshot", payload: first });
   ps.elements.waveMiniRoadmap.open = true;
   ps.requestWaveMiniRoadmap();
-  ps.renderWaveMiniRoadmapList({ ok: true, entries: listEntries }, 1);
+  ps.renderWaveMiniRoadmapList(listPayload(), 1);
   ps.renderWaveMiniRoadmapDetail({ ok: true, item: detailItem }, 1);
   assert.strictEqual(waveListRequests(messages).length, 1, "Settling costs one list request");
   assert.strictEqual(waveDetailRequests(messages).length, 1, "Settling costs one detail request");
@@ -1304,7 +1463,7 @@ function settledPopover(first) {
   assert.strictEqual(watchedRows().length, 0, "A production snapshot carries no row for the blocked or finished tasks");
   rs.elements.waveMiniRoadmap.open = true;
   rs.requestWaveMiniRoadmap();
-  rs.renderWaveMiniRoadmapList({ ok: true, entries: listEntries }, 1);
+  rs.renderWaveMiniRoadmapList(listPayload(), 1);
   rs.renderWaveMiniRoadmapDetail({ ok: true, item: detailItem }, 1);
   assert.strictEqual(goalCount(content), "1/2 goals done · 1 blocked task", "The blocked task must keep its goal open");
   const settled = messages.length;
@@ -1327,7 +1486,7 @@ function settledPopover(first) {
 
   // A late generation-1 detail is ignored; the generation-2 detail checks the goal.
   rs.renderWaveMiniRoadmapDetail({ ok: true, item: detailItem }, 1);
-  rs.renderWaveMiniRoadmapList({ ok: true, entries: listEntries }, 2);
+  rs.renderWaveMiniRoadmapList(listPayload(), 2);
   assert.strictEqual(waveDetailRequests(messages).pop().waveGeneration, 2, "The refresh cycle must request its own detail");
   rs.renderWaveMiniRoadmapDetail({ ok: true, item: withTasks(allFinished) }, 2);
   assert.strictEqual(goalCount(content), "2/2 goals done", "The refreshed canonical detail must check the goal");
@@ -1337,9 +1496,9 @@ function settledPopover(first) {
   arrive(unblockedSnapshot);
   assert.strictEqual(waveListRequests(messages).pop().waveGeneration, 4, "Each change must take the next generation");
   const detailsBefore = waveDetailRequests(messages).length;
-  rs.renderWaveMiniRoadmapList({ ok: true, entries: listEntries }, 3);
+  rs.renderWaveMiniRoadmapList(listPayload(), 3);
   assert.strictEqual(waveDetailRequests(messages).length, detailsBefore, "A superseded list must not request a detail");
-  rs.renderWaveMiniRoadmapList({ ok: true, entries: listEntries }, 4);
+  rs.renderWaveMiniRoadmapList(listPayload(), 4);
   assert.strictEqual(waveDetailRequests(messages).length, detailsBefore + 1, "Only the newest cycle requests its detail");
   rs.renderWaveMiniRoadmapDetail({ ok: true, item: detailItem }, 3);
   assert.strictEqual(goalCount(content), "2/2 goals done", "A superseded detail must not regress the popup");
@@ -1397,7 +1556,7 @@ for (const status of ["blocked", "superseded", "finished", "archived"]) {
   rs.state.snapshot = null;
   rs.requestWaveMiniRoadmap();
   assert.strictEqual(rs.state.waveMiniRoadmapTaskStates, null, "No snapshot yet means no baseline");
-  rs.renderWaveMiniRoadmapList({ ok: true, entries: listEntries }, 1);
+  rs.renderWaveMiniRoadmapList(listPayload(), 1);
   post({ type: "snapshot", payload: blockedSnapshot });
   assert.strictEqual(waveListRequests(messages).length, 1, "The first snapshot must not request a second cycle");
   assert.strictEqual(
@@ -1417,6 +1576,49 @@ for (const status of ["blocked", "superseded", "finished", "archived"]) {
   post({ type: "snapshot", payload: blockedSnapshot });
   post({ type: "snapshot", payload: unblockedSnapshot });
   assert.strictEqual(messages.length, requested, "No active wave means no refresh on task changes");
+}
+
+// ── 11. The server's exact current_wave id is the only selection receipt ──
+// A projection naming the lower 0.11.50 wave fetches that wave although a
+// higher active 0.11.51 row sits in the same list.
+{
+  const { sandbox: rs, content, messages } = buildRefreshSandbox();
+  rs.requestWaveMiniRoadmap();
+  rs.renderWaveMiniRoadmapList(listPayload(listEntries, currentFor(oldWaveDetail)), 1);
+  assert.strictEqual(waveDetailRequests(messages).pop().roadmapId, "RM-0000-00050", "Detail must follow the server's wave id, never the highest local semver");
+  rs.renderWaveMiniRoadmapDetail({ ok: true, item: oldWaveDetail, current_wave: currentFor(oldWaveDetail) }, 1);
+  assert.strictEqual(targetOf(content), "Target 0.11.50");
+  assert.strictEqual(goalCount(content), "1/1 goal done");
+}
+
+// No projection, or a non-ready one, requests no detail and renders the typed UNKNOWN.
+for (const [name, extra, reason] of [
+  ["a list without current_wave", {}, "The server reported no current-wave projection"],
+  ["a null current_wave", { current_wave: null }, "The server reported no current-wave projection"],
+  ["an ambiguous projection", { current_wave: unknownCurrent("ambiguous_active_wave") }, "(ambiguous_active_wave)"],
+]) {
+  const { sandbox: rs, content, messages } = buildRefreshSandbox();
+  rs.requestWaveMiniRoadmap();
+  rs.renderWaveMiniRoadmapList(Object.assign({ ok: true, entries: listEntries }, extra), 1);
+  assert.strictEqual(waveDetailRequests(messages).length, 0, `${name} must not request a detail`);
+  assert.strictEqual(rs.state.waveMiniRoadmapRequested, false, `${name} must settle the cycle`);
+  const shown = findByClass(content, "wave-mini-roadmap-reason");
+  assert.ok(shown && shown.textContent.includes(reason), `${name} must say why`);
+  assert.strictEqual(findByClass(content, "wave-mini-roadmap-goals"), null, `${name} must not render a checklist`);
+}
+
+// A detail whose own projection now names another wave is stale: UNKNOWN, never the old checklist.
+{
+  const { sandbox: rs, content } = buildRefreshSandbox();
+  rs.requestWaveMiniRoadmap();
+  rs.renderWaveMiniRoadmapList(listPayload(), 1);
+  rs.renderWaveMiniRoadmapDetail({ ok: true, item: withTasks(allFinished), current_wave: currentFor(oldWaveDetail) }, 1);
+  assert.ok(findByClass(content, "wave-mini-roadmap-unknown"), "A current wave that moved mid-cycle must fail closed");
+  assert.strictEqual(findByClass(content, "wave-mini-roadmap-goals"), null, "A stale detail must not render its checklist");
+
+  rs.requestWaveMiniRoadmap();
+  rs.renderWaveMiniRoadmapList({ ok: false, error: "list boom" }, 2);
+  assert.strictEqual(rs.state.waveMiniRoadmapCurrent, null, "A failed list must drop the previous projection");
 }
 
 console.log("Wave mini-roadmap contract verified");

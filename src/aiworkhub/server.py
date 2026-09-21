@@ -2113,6 +2113,7 @@ def aiworkhub_task_create_from_template(
     skill_applicability: list[str] | None = None,
     skill_path_scope: str | None = None,
     echo_card: bool = False,
+    wave_goal_binding: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """MANAGER WRITE: create one task from an authenticated template.
 
@@ -2139,6 +2140,10 @@ def aiworkhub_task_create_from_template(
     ``skill_stage``, ``skill_triggers`` and ``skill_applicability`` describe
     the occasion rather than the template genre, so no template can supply
     them and a card that omits them selects no skill at all.
+    ``wave_goal_binding`` (optional) is exactly ``{roadmap_id, goal_id,
+    predecessor_task_id}`` and is forwarded to ``core.create_task`` unchanged,
+    exactly as ``aiworkhub_task_create`` does; it is never inferred from the
+    template, title or prose, and core refuses a malformed binding.
     """
     try:
         card = task_templates.expand_template(
@@ -2233,6 +2238,14 @@ def aiworkhub_task_create_from_template(
         skill_applicability=skill_applicability,
         skill_path_scope=skill_path_scope,
         template_provenance=provenance,
+        # Forwarded unchanged and only when declared, so every existing
+        # template caller reaches core with exactly the call it made before
+        # this field existed; core alone validates the binding.
+        **(
+            {"wave_goal_binding": wave_goal_binding}
+            if wave_goal_binding is not None
+            else {}
+        ),
     )
     if echo_card:
         return {
