@@ -62,6 +62,27 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
+## What's new in 0.11.55
+
+- Roadmap views now carry a server-side current-wave projection that names the
+  one active wave, checks a goal only when all of its exact tasks are finished,
+  and returns a typed `UNKNOWN` reason when the evidence is ambiguous, truncated
+  or malformed. The dashboard wave mini-roadmap renders that projection instead
+  of ranking Roadmap rows itself and shows the installed version and the wave's
+  target separately.
+- Task creation, including from a template, accepts an optional exact
+  `wave_goal_binding` that replaces a named predecessor as one wave goal's
+  current task. It is applied once, repaired by the reconciler if interrupted,
+  and never inferred from titles or prose.
+- The reconciler completes a wave only when every acceptance criterion maps to
+  a goal whose exact tasks are all canonically accepted with verifier receipts;
+  pending or unresolved evidence leaves it open, and no version bump can close
+  it.
+- Worker validation sandboxes seed the tracked repository assets a declared test
+  locates by a literal `Path(__file__)`-relative path (NF-2026-00551).
+- Inferred successor progression, the full stage-gated Playbook, LSP index
+  integration and Muse/OpenCode worker qualification remain incomplete.
+
 ## What's new in 0.11.54
 
 - Source Graph's authenticated concurrent builder now appears as standby, not a

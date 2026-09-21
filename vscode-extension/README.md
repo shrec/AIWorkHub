@@ -14,6 +14,26 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.11.55
+
+- The wave mini-roadmap popup now follows the bundled runtime's current-wave
+  projection instead of ranking Roadmap rows itself: it shows the installed
+  version and the wave's target separately, marks a passed target overdue, and
+  never checks a goal the runtime did not or counts an archived or stale task
+  as done. Ambiguous, truncated or malformed evidence shows a typed UNKNOWN
+  reason.
+- Task creation, including from a template, accepts an optional exact
+  `wave_goal_binding` that replaces a named predecessor as one wave goal's
+  current task. It is applied once and never inferred from titles or prose.
+- The bundled runtime's reconciler completes a wave only when every acceptance
+  criterion maps to a goal whose exact tasks are all canonically accepted with
+  verifier receipts; pending or unresolved evidence leaves it open, and no
+  version bump can close it.
+- Worker validation sandboxes in the bundled runtime seed the tracked repository
+  assets a declared test locates by a literal path (NF-2026-00551).
+- Inferred successor progression, the full stage-gated Playbook, LSP index
+  integration and Muse/OpenCode worker qualification remain incomplete.
+
 ## What's new in 0.11.54
 
 - The bundled Source Graph runtime treats authenticated concurrent index builds

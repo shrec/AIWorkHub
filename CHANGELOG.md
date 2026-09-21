@@ -6,6 +6,60 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.55] - 2026-09-21
+
+### Added
+
+- The Roadmap list and detail dashboard views carry a server-side `current_wave`
+  projection: the one in-progress wave with declared goals and the highest
+  target version, with each goal checked only when all of its exact tasks are
+  finished. Truncated, ambiguous, unversioned, goal-less or malformed Roadmap
+  evidence yields a typed `UNKNOWN` with its reason instead of a guess, and the
+  projection flags a wave whose target the installed version has passed while
+  goals are still unchecked.
+- `aiworkhub_task_create` and `aiworkhub_task_create_from_template` accept an
+  optional exact `wave_goal_binding` (`roadmap_id`, `goal_id`,
+  `predecessor_task_id`) that makes the new card that goal's current task in
+  place of its predecessor. The binding is stored on the card, refused up front
+  when it cannot apply, applied to the Roadmap once, and repaired by the
+  reconciler when writes are enabled and the Roadmap write was interrupted. It
+  is never inferred from a title, topic, version suffix or prose.
+- The reconciler completes an in-progress wave only when every numbered
+  acceptance criterion is mapped to a goal and every exact current task of
+  every goal is canonically accepted with its own verifier receipt. Pending
+  work leaves the wave in progress; missing, archived, blocked, superseded or
+  unverified evidence yields a typed `unknown`. The single transition is
+  write-gated, refused if the wave's goals or criteria changed after the
+  verdict, records the accepted receipts, and never reads an installed or
+  released version.
+
+### Changed
+
+- The dashboard wave mini-roadmap popup takes its wave, target and per-goal
+  verdict from the server's `current_wave` projection instead of ranking
+  Roadmap rows itself. It shows the installed version and the wave's target
+  separately (marking a passed target overdue), never checks a goal the server
+  did not, and never counts an archived or stale task row as completion.
+
+### Fixed
+
+- Worker validation sandboxes now seed a repository file that a declared pytest
+  module locates by a literal `Path(__file__)`-relative path without importing
+  it, plus a JavaScript asset's tracked local `require` targets, so such a test
+  no longer fails on a missing asset in a sparse worktree (NF-2026-00551). Only
+  git-tracked, non-dot-prefixed files inside the repository are seeded, as
+  validation support rather than allowed writes: private state and untracked
+  files stay out, a path that escapes the repository or crosses a link fails
+  closed, and paths no filesystem can hold are declined instead of raising an
+  untyped OS error.
+
+### Not in this release
+
+- Inferred successor progression (a successor takes a predecessor's place in a
+  wave goal only through an exact binding that a task declares), the full
+  stage-gated Playbook, LSP index integration, causal reasoning-quality
+  measurement, and Muse/OpenCode worker qualification remain incomplete.
+
 ## [0.11.54] - 2026-09-21
 
 ### Fixed
