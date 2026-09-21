@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import copy
+import json
 import os
 import sys
 from pathlib import Path
@@ -12,7 +14,7 @@ _SRC = Path(__file__).resolve().parents[1] / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from aiworkhub import runtime_adapters  # noqa: E402
+from aiworkhub import runtime_adapters, worker_ai_tools_mcp  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -440,3 +442,125 @@ def test_opencode_worker_mcp_tool_names_fit_muse_limit() -> None:
     for mcp_tool in runtime_adapters.OPENCODE_WORKER_MCP_TOOLS:
         assert runtime_adapters.opencode_tool_is_allowed(f"{old_alias}_{mcp_tool}") is False
         assert "manager" not in mcp_tool
+
+
+def _worker_env() -> dict[str, str]:
+    return {
+        "AIWORKHUB_WORKER_MCP_TASK_ID": "T-1",
+        "AIWORKHUB_WORKER_MCP_REQUEST_ID": "R-1",
+        "AIWORKHUB_WORKER_MCP_REPO": "/work/R-1/worktree",
+        "PYTHONPATH": "/pkg/src",
+    }
+
+
+def _worker_config() -> dict[str, object]:
+    return runtime_adapters.build_opencode_worker_mcp_config(
+        ("/usr/bin/python3", "-m", "aiworkhub.worker_ai_tools_mcp"),
+        environment=_worker_env(),
+    )
+
+
+def test_opencode_worker_mcp_config_binds_request_environment_from_allowlist_only() -> None:
+    config = _worker_config()
+    assert config["mcp"]["awh"]["environment"] == _worker_env()
+    assert runtime_adapters.validate_opencode_worker_config(config) == config
+    for environment in (
+        {"OPENAI_API_KEY": "sk-secret"},
+        {"AIWORKHUB_WORKER_MCP_TASK_ID": "a\x00b"},
+        {"AIWORKHUB_WORKER_MCP_TASK_ID": 7},
+        {},
+    ):
+        with pytest.raises(ValueError, match="opencode_mcp_environment_invalid"):
+            runtime_adapters.build_opencode_worker_mcp_config(
+                ("/usr/bin/python3",), environment=environment
+            )
+
+
+def test_opencode_worker_mcp_environment_allowlist_is_the_generated_binding() -> None:
+    # Drift in either direction fails closed at launch, so pin it here: the
+    # allowlist is exactly what generate_worker_mcp_runtime can emit.
+    mcp = worker_ai_tools_mcp
+    assert runtime_adapters.OPENCODE_WORKER_MCP_ENVIRONMENT_KEYS == {
+        mcp.ENV_TASK_ID,
+        mcp.ENV_RUNNER,
+        mcp.ENV_TOPIC,
+        mcp.ENV_REQUEST_ID,
+        mcp.ENV_REPO,
+        mcp.ENV_AUTHORITY_REPO,
+        mcp.ENV_SOURCE_GRAPH_TARGETS,
+        mcp.ENV_ALLOWED_WRITES,
+        mcp.ENV_SESSION_TOPIC,
+        mcp.ENV_AUDIT_LEDGER_PATH,
+        mcp.ENV_AUDIT_HMAC_KEY_PATH,
+        mcp.ENV_QUALITY_REVIEW_PACKET_PATH,
+        mcp.ENV_CONTRACT_PACKET_PATH,
+        mcp.ENV_REWORK_OVERLAY_PATH,
+        mcp.ENV_PROVIDER_CALL_ID,
+        mcp.ENV_PROVENANCE,
+        mcp.ENV_PYTHONPATH,
+    }
+
+
+@pytest.mark.parametrize(
+    ("mutate", "cause"),
+    [
+        (lambda c: c.update(model="anthropic/claude-sonnet-4"), "malformed"),
+        (lambda c: c["permission"].update(bash="allow"), "permission_contract_mismatch"),
+        (
+            lambda c: c["permission"].update(awh_aiworkhub_manager_bootstrap="allow"),
+            "permission_contract_mismatch",
+        ),
+        (lambda c: c["permission"].update({"*": "allow"}), "permission_contract_mismatch"),
+        (
+            lambda c: c["mcp"].update(
+                aiworkhub={"type": "local", "command": ["x"], "enabled": True}
+            ),
+            "malformed",
+        ),
+        (lambda c: c["mcp"]["awh"].update(enabled=False), "malformed"),
+        (lambda c: c["mcp"]["awh"].update(type="remote"), "malformed"),
+        (
+            lambda c: c["mcp"]["awh"].update(headers={"Authorization": "Bearer x"}),
+            "malformed",
+        ),
+        (
+            lambda c: c["mcp"]["awh"]["environment"].update(OPENAI_API_KEY="sk-x"),
+            "malformed",
+        ),
+    ],
+)
+def test_opencode_worker_config_validator_refuses_anything_but_the_worker_contract(
+    mutate, cause: str
+) -> None:
+    config = copy.deepcopy(_worker_config())
+    mutate(config)
+    with pytest.raises(runtime_adapters.OpenCodeWorkerConfigError) as excinfo:
+        runtime_adapters.validate_opencode_worker_config(config)
+    assert excinfo.value.cause == cause
+    assert isinstance(excinfo.value, ValueError)
+    assert str(excinfo.value).startswith(f"opencode_worker_mcp_config_{cause}")
+
+
+def test_opencode_worker_config_validator_enforces_the_64_char_name_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for alias, cause in (("a" * 40, "tool_name_too_long"), ("a" * 65, "alias_too_long")):
+        monkeypatch.setattr(runtime_adapters, "OPENCODE_WORKER_MCP_SERVER", alias)
+        with pytest.raises(runtime_adapters.OpenCodeWorkerConfigError) as excinfo:
+            runtime_adapters.validate_opencode_worker_config(_worker_config())
+        assert excinfo.value.cause == cause
+
+
+def test_opencode_worker_config_serializes_to_bounded_ascii_json() -> None:
+    config = _worker_config()
+    text = runtime_adapters.serialize_opencode_worker_config(config)
+    assert text.isascii() and "\n" not in text
+    assert json.loads(text) == config
+    assert next(iter(json.loads(text)["permission"])) == "*"
+    oversized = copy.deepcopy(config)
+    oversized["mcp"]["awh"]["environment"]["AIWORKHUB_WORKER_MCP_TASK_ID"] = "x" * (
+        runtime_adapters.OPENCODE_WORKER_CONFIG_MAX_BYTES
+    )
+    with pytest.raises(runtime_adapters.OpenCodeWorkerConfigError) as excinfo:
+        runtime_adapters.serialize_opencode_worker_config(oversized)
+    assert excinfo.value.cause == "oversized"

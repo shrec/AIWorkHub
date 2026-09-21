@@ -189,6 +189,7 @@ from .worker_workspace import (
     enforce_scope,
     materialize_rework_overlay,
     promote,
+    provision_opencode_worker_config,
     provision_worker_mcp_runtime,
     run_validations,
     sandbox_argv,

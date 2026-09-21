@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import sys
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+from types import SimpleNamespace
 
 import pytest
 
@@ -18,6 +20,8 @@ from aiworkhub import (  # noqa: E402
     repo_policy,
     runtime_adapters,
     task_store,
+    worker_ai_tools_mcp,
+    worker_workspace,
     workforce_catalog,
     workforce_router,
 )
@@ -724,3 +728,387 @@ def test_opencode_registration_leaves_codex_and_claude_repair_helpers_untouched(
     )
     assert "repairOpencodeConfigJsonObject" in result
     assert "repairClaudeMcpConfigObject" in result
+
+
+# ---------------------------------------------------------------------------
+# Request-local awh worker MCP config: the generated runtime -> OpenCode launch.
+# The generator itself needs ``chmod``, so most cases below write a
+# generator-shaped runtime directly; one case drives the real generator.
+# ---------------------------------------------------------------------------
+
+_MCP = worker_ai_tools_mcp
+_OC_ENV = runtime_adapters.OPENCODE_WORKER_CONFIG_ENV
+_OC_NO_PROJECT = runtime_adapters.OPENCODE_DISABLE_PROJECT_CONFIG_ENV
+_OC_BACKENDS = ("landlock", "bubblewrap", "windows_appcontainer")
+
+
+def _opencode_request(
+    tmp_path: Path,
+    backend: str = "landlock",
+    *,
+    request_id: str = "R-oc-1",
+    command: str | None = None,
+) -> tuple[worker_workspace.WorkerWorkspace, SimpleNamespace, Path]:
+    base = tmp_path.resolve()
+    authority = base / "authority"
+    root = base / request_id
+    workspace = worker_workspace.WorkerWorkspace(
+        request_id=request_id,
+        repo=authority,
+        path=root / "worktree",
+        home=root / "home",
+        allowed_writes=("src/a.py",),
+        parent_baseline={},
+        workspace_baseline={},
+    )
+    runtime_dir = workspace.home / "task_mcp_worker_runtime"
+    for directory in (authority, workspace.path, runtime_dir):
+        directory.mkdir(parents=True)
+    ledger = runtime_dir / "audit_ledger.jsonl"
+    key = runtime_dir / "audit_hmac.key"
+    ledger.write_bytes(b"")
+    key.write_bytes(b"k" * 32)
+    aliased = backend == "bubblewrap"
+    env = {
+        _MCP.ENV_TASK_ID: "T-1",
+        _MCP.ENV_RUNNER: "opencode-go",
+        _MCP.ENV_TOPIC: "topic",
+        _MCP.ENV_REQUEST_ID: request_id,
+        _MCP.ENV_REPO: (
+            worker_workspace.SANDBOX_WORKSPACE if aliased else str(workspace.path)
+        ),
+        _MCP.ENV_AUTHORITY_REPO: (
+            worker_workspace.SANDBOX_AUTHORITY_REPO if aliased else str(authority)
+        ),
+        _MCP.ENV_SOURCE_GRAPH_TARGETS: json.dumps(["src/a.py"]),
+        _MCP.ENV_ALLOWED_WRITES: json.dumps(["src/a.py"]),
+        _MCP.ENV_SESSION_TOPIC: "topic",
+        _MCP.ENV_AUDIT_LEDGER_PATH: str(ledger),
+        _MCP.ENV_AUDIT_HMAC_KEY_PATH: str(key),
+        _MCP.ENV_PYTHONPATH: (
+            worker_workspace.SANDBOX_PACKAGE_IMPORT_ROOT
+            if aliased
+            else str(_MCP.resolve_host_package_import_root())
+        ),
+    }
+    python = command or ("/usr/bin/env" if aliased else sys.executable)
+    source = runtime_dir / "claude_mcp_config.json"
+    source.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    _MCP.SERVER_NAME: {
+                        "command": python,
+                        "args": ["-m", "aiworkhub.worker_ai_tools_mcp"],
+                        "env": env,
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    runtime = SimpleNamespace(
+        server_name=_MCP.SERVER_NAME,
+        env=env,
+        claude_mcp_config_path=source,
+        audit_ledger_path=ledger,
+        audit_hmac_key_path=key,
+    )
+    return workspace, runtime, authority
+
+
+def _provision_opencode(
+    workspace: worker_workspace.WorkerWorkspace,
+    runtime: SimpleNamespace,
+    authority: Path,
+    backend: str = "landlock",
+) -> dict[str, str]:
+    return worker_workspace.provision_opencode_worker_config(
+        workspace, runtime, backend=backend, authority_repo=authority
+    )
+
+
+@pytest.mark.parametrize("backend", _OC_BACKENDS)
+def test_opencode_request_config_binds_the_exact_request_for_every_sandbox(
+    tmp_path: Path, backend: str
+) -> None:
+    if backend == "bubblewrap" and os.name == "nt":
+        pytest.skip("bubblewrap is a Linux sandbox")
+    workspace, runtime, authority = _opencode_request(tmp_path, backend)
+    before = sorted(str(path) for path in tmp_path.rglob("*"))
+
+    delivered = _provision_opencode(workspace, runtime, authority, backend)
+
+    # Environment only: two variables, and not one file written anywhere.
+    assert set(delivered) == {_OC_ENV, _OC_NO_PROJECT}
+    assert delivered[_OC_NO_PROJECT] == "1"
+    assert sorted(str(path) for path in tmp_path.rglob("*")) == before
+    config = json.loads(delivered[_OC_ENV])
+    assert list(config["mcp"]) == ["awh"]
+    server = config["mcp"]["awh"]
+    assert server["type"] == "local" and server["enabled"] is True
+    source = json.loads(Path(runtime.claude_mcp_config_path).read_text(encoding="utf-8"))
+    generated = source["mcpServers"][_MCP.SERVER_NAME]
+    assert server["command"] == [generated["command"], *generated["args"]]
+    expected = dict(runtime.env)
+    if backend == "bubblewrap":
+        alias = PurePosixPath(worker_workspace.bubblewrap_home_env_value())
+        expected[_MCP.ENV_AUDIT_LEDGER_PATH] = str(
+            alias / "task_mcp_worker_runtime" / "audit_ledger.jsonl"
+        )
+        expected[_MCP.ENV_AUDIT_HMAC_KEY_PATH] = str(
+            alias / "task_mcp_worker_runtime" / "audit_hmac.key"
+        )
+    assert server["environment"] == expected
+    assert server["environment"][_MCP.ENV_REQUEST_ID] == workspace.request_id
+    permission = config["permission"]
+    assert permission["*"] == runtime_adapters.OPENCODE_PERMISSION_DENY
+    allowed = {
+        name
+        for name, action in permission.items()
+        if action == runtime_adapters.OPENCODE_PERMISSION_ALLOW
+    }
+    assert allowed == {
+        runtime_adapters.opencode_mcp_tool_name(tool)
+        for tool in runtime_adapters.OPENCODE_WORKER_MCP_TOOLS
+    }
+    assert all(len(name) <= 64 for name in allowed) and len("awh") <= 64
+    for denied in ("bash", "edit", "read", "awh_aiworkhub_manager_bootstrap", "unknown"):
+        assert permission.get(denied, permission["*"]) == "deny"
+    assert "model" not in config and "provider" not in config
+
+
+def test_opencode_request_configs_never_cross_repositories(tmp_path: Path) -> None:
+    first = _opencode_request(tmp_path / "repo-a", request_id="R-a")
+    second = _opencode_request(tmp_path / "repo-b", request_id="R-b")
+    texts = [
+        _provision_opencode(workspace, runtime, authority)[_OC_ENV]
+        for workspace, runtime, authority in (first, second)
+    ]
+    assert texts[0] != texts[1]
+    assert str(tmp_path.resolve() / "repo-b") not in texts[0]
+    assert str(tmp_path.resolve() / "repo-a") not in texts[1]
+    for text, request_id in zip(texts, ("R-a", "R-b"), strict=True):
+        environment = json.loads(text)["mcp"]["awh"]["environment"]
+        assert environment[_MCP.ENV_REQUEST_ID] == request_id
+        for identity_key in ("AIWORKHUB_REPO_ROOT", "AIWORKHUB_REPO", "AIWORKHUB_REPO_ID"):
+            assert identity_key not in environment
+
+
+def _rewrite_generated_entry(runtime: SimpleNamespace, mutate) -> None:
+    path = Path(runtime.claude_mcp_config_path)
+    document = json.loads(path.read_text(encoding="utf-8"))
+    mutate(document["mcpServers"][_MCP.SERVER_NAME])
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+
+def _tamper_missing(workspace, runtime, tmp_path, monkeypatch) -> None:
+    Path(runtime.claude_mcp_config_path).unlink()
+
+
+def _tamper_symlink(workspace, runtime, tmp_path, monkeypatch) -> None:
+    if os.name == "nt":
+        pytest.skip("symlink creation needs a privilege on Windows")
+    source = Path(runtime.claude_mcp_config_path)
+    real = tmp_path / "real_config.json"
+    source.replace(real)
+    source.symlink_to(real)
+
+
+def _tamper_not_regular(workspace, runtime, tmp_path, monkeypatch) -> None:
+    source = Path(runtime.claude_mcp_config_path)
+    source.unlink()
+    source.mkdir()
+
+
+def _tamper_text(text: str):
+    def _write(workspace, runtime, tmp_path, monkeypatch) -> None:
+        Path(runtime.claude_mcp_config_path).write_text(text, encoding="utf-8")
+
+    return _write
+
+
+def _tamper_oversized(workspace, runtime, tmp_path, monkeypatch) -> None:
+    Path(runtime.claude_mcp_config_path).write_bytes(b" " * 300_000)
+
+
+def _tamper_unreadable(workspace, runtime, tmp_path, monkeypatch) -> None:
+    source = Path(runtime.claude_mcp_config_path)
+    real_open = os.open
+
+    def _denied(path, *args, **kwargs):
+        if os.path.basename(os.fspath(path)) == source.name:
+            raise PermissionError(13, "denied", os.fspath(path))
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", _denied)
+
+
+def _tamper_foreign_owner(workspace, runtime, tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        worker_workspace, "stat_owned_by_current_user", lambda *_a, **_k: False
+    )
+
+
+def _tamper_outside_home(workspace, runtime, tmp_path, monkeypatch) -> None:
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    moved = elsewhere / "claude_mcp_config.json"
+    Path(runtime.claude_mcp_config_path).replace(moved)
+    runtime.claude_mcp_config_path = moved
+
+
+def _tamper_env(key: str, value):
+    def _set(workspace, runtime, tmp_path, monkeypatch) -> None:
+        _rewrite_generated_entry(runtime, lambda entry: entry["env"].__setitem__(key, value))
+
+    return _set
+
+
+def _tamper_entry(key: str, value):
+    def _set(workspace, runtime, tmp_path, monkeypatch) -> None:
+        _rewrite_generated_entry(runtime, lambda entry: entry.__setitem__(key, value))
+
+    return _set
+
+
+def _tamper_audit_key_gone(workspace, runtime, tmp_path, monkeypatch) -> None:
+    Path(runtime.audit_hmac_key_path).unlink()
+
+
+def _tamper_repo_elsewhere(workspace, runtime, tmp_path, monkeypatch) -> None:
+    other = tmp_path / "other-worktree"
+    other.mkdir()
+    _tamper_env(_MCP.ENV_REPO, str(other))(workspace, runtime, tmp_path, monkeypatch)
+
+
+def _tamper_ledger_elsewhere(workspace, runtime, tmp_path, monkeypatch) -> None:
+    _tamper_env(_MCP.ENV_AUDIT_LEDGER_PATH, str(tmp_path / "elsewhere" / "ledger"))(
+        workspace, runtime, tmp_path, monkeypatch
+    )
+
+
+def _tamper_command_not_executable(workspace, runtime, tmp_path, monkeypatch) -> None:
+    if os.name == "nt":
+        pytest.skip("Windows has no execute permission bit")
+    plain = tmp_path / "plain-python"
+    plain.write_text("not a program\n", encoding="utf-8")
+    if os.access(plain, os.X_OK):
+        pytest.skip("this host marks new files executable")
+    _tamper_entry("command", str(plain))(workspace, runtime, tmp_path, monkeypatch)
+
+
+_OPENCODE_REFUSALS = (
+    ("missing", _tamper_missing),
+    ("symlink", _tamper_symlink),
+    ("not_regular", _tamper_not_regular),
+    ("malformed", _tamper_text("{not json")),
+    ("malformed", _tamper_text("[]")),
+    ("malformed", _tamper_text(json.dumps({"mcpServers": {}}))),
+    ("malformed", _tamper_env(_MCP.ENV_TOPIC, 7)),
+    ("malformed", _tamper_env("OPENAI_API_KEY", "sk-inherited")),
+    ("malformed", _tamper_entry("args", ["-c", "print(1)"])),
+    ("oversized", _tamper_oversized),
+    ("unreadable", _tamper_unreadable),
+    ("untrusted_owner", _tamper_foreign_owner),
+    ("outside_home", _tamper_outside_home),
+    ("outside_home", _tamper_ledger_elsewhere),
+    ("binding_mismatch", _tamper_env(_MCP.ENV_REQUEST_ID, "R-other")),
+    ("binding_mismatch", _tamper_repo_elsewhere),
+    ("audit_binding_missing", _tamper_audit_key_gone),
+    ("command_missing", _tamper_entry("command", "/nonexistent/aiworkhub-python")),
+    ("command_not_executable", _tamper_command_not_executable),
+)
+
+
+@pytest.mark.parametrize(
+    ("cause", "tamper"),
+    _OPENCODE_REFUSALS,
+    ids=[f"{cause}-{index}" for index, (cause, _) in enumerate(_OPENCODE_REFUSALS)],
+)
+def test_opencode_request_config_refuses_with_a_typed_cause_before_transport(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cause: str, tamper
+) -> None:
+    workspace, runtime, authority = _opencode_request(tmp_path)
+    tamper(workspace, runtime, tmp_path, monkeypatch)
+
+    with pytest.raises(runtime_adapters.OpenCodeWorkerConfigError) as excinfo:
+        _provision_opencode(workspace, runtime, authority)
+
+    assert excinfo.value.cause == cause
+    assert str(excinfo.value).startswith(f"opencode_worker_mcp_config_{cause}")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="bubblewrap is a Linux sandbox")
+def test_opencode_request_config_refuses_paths_the_bubblewrap_mount_cannot_show(
+    tmp_path: Path,
+) -> None:
+    workspace, runtime, authority = _opencode_request(
+        tmp_path, "bubblewrap", command="/home/nobody/.venv/bin/python"
+    )
+    with pytest.raises(runtime_adapters.OpenCodeWorkerConfigError) as excinfo:
+        _provision_opencode(workspace, runtime, authority, "bubblewrap")
+    assert excinfo.value.cause == "command_not_visible"
+
+    workspace, runtime, authority = _opencode_request(
+        tmp_path / "second", "bubblewrap", request_id="R-oc-2"
+    )
+    host_packet = workspace.home / "task_mcp_worker_runtime" / "quality_review_packet.json"
+    _tamper_env(_MCP.ENV_QUALITY_REVIEW_PACKET_PATH, str(host_packet))(
+        workspace, runtime, tmp_path, None
+    )
+    with pytest.raises(runtime_adapters.OpenCodeWorkerConfigError) as excinfo:
+        _provision_opencode(workspace, runtime, authority, "bubblewrap")
+    assert excinfo.value.cause == "outside_sandbox"
+
+
+def test_opencode_request_config_refuses_an_unsupported_sandbox_backend(
+    tmp_path: Path,
+) -> None:
+    workspace, runtime, authority = _opencode_request(tmp_path)
+    with pytest.raises(runtime_adapters.OpenCodeWorkerConfigError) as excinfo:
+        _provision_opencode(
+            workspace, runtime, authority, worker_workspace.VSCODE_LM_IN_PROCESS_BACKEND
+        )
+    assert excinfo.value.cause == "backend_unsupported"
+
+
+def test_generated_worker_runtime_feeds_the_request_local_opencode_config(
+    tmp_path: Path,
+) -> None:
+    base = tmp_path.resolve()
+    authority = base / "authority"
+    workspace = worker_workspace.WorkerWorkspace(
+        request_id="R-gen-1",
+        repo=authority,
+        path=base / "R-gen-1" / "worktree",
+        home=base / "R-gen-1" / "home",
+        allowed_writes=("src/a.py",),
+        parent_baseline={},
+        workspace_baseline={},
+    )
+    for directory in (authority, workspace.path, workspace.home):
+        directory.mkdir(parents=True)
+    try:
+        runtime = worker_workspace.provision_worker_mcp_runtime(
+            workspace,
+            request_id=workspace.request_id,
+            task_id="T-1",
+            runner="opencode-go",
+            topic="topic",
+            backend="landlock",
+            source_graph_targets=["src/a.py"],
+            session_topic="topic",
+            allowed_writes=["src/a.py"],
+        )
+    except PermissionError as exc:
+        pytest.skip(f"validation_unsupported_in_sandbox: chmod denied ({exc.filename})")
+
+    delivered = _provision_opencode(workspace, runtime, authority)
+
+    server = json.loads(delivered[_OC_ENV])["mcp"]["awh"]
+    assert server["command"][1:] == ["-m", "aiworkhub.worker_ai_tools_mcp"]
+    assert server["command"][0] == sys.executable
+    assert server["environment"] == runtime.env
+    assert server["environment"][_MCP.ENV_REQUEST_ID] == "R-gen-1"
+    assert Path(server["environment"][_MCP.ENV_AUDIT_HMAC_KEY_PATH]).is_file()

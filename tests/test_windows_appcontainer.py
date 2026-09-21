@@ -11,9 +11,12 @@ without ever leaving a child running outside the job.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 import aiworkhub.windows_appcontainer as wac
+from aiworkhub import runtime_adapters
 from aiworkhub.windows_appcontainer import (
     AppContainerError,
     AppContainerLifecycleState,
@@ -296,6 +299,43 @@ def test_environment_sets_unicode_environment_flag():
     fake = FakeWin32Api()
     launch_appcontainer(make_request(environment={"A": "B"}), api=fake)
     assert fake.spec.creation_flags & wac.CREATE_UNICODE_ENVIRONMENT
+
+
+def test_request_local_opencode_config_and_home_reach_the_child_unchanged():
+    """The supervisor hands its whole environment to the AppContainer child.
+
+    For an OpenCode worker that environment carries the request HOME and the
+    request-local ``awh`` config spelled with real Windows paths; both must
+    reach CreateProcess exactly, never a trimmed or re-derived copy.
+    """
+    home = "C:\\aiworkhub\\worktrees\\R-1\\home"
+    key = home + "\\task_mcp_worker_runtime\\audit_hmac.key"
+    config = runtime_adapters.build_opencode_worker_mcp_config(
+        ["C:\\Python312\\python.exe", "-m", "aiworkhub.worker_ai_tools_mcp"],
+        environment={
+            "AIWORKHUB_WORKER_MCP_REQUEST_ID": "R-1",
+            "AIWORKHUB_WORKER_MCP_AUDIT_HMAC_KEY_PATH": key,
+        },
+    )
+    environment = {
+        "HOME": home,
+        "USERPROFILE": home,
+        runtime_adapters.OPENCODE_WORKER_CONFIG_ENV: (
+            runtime_adapters.serialize_opencode_worker_config(config)
+        ),
+        runtime_adapters.OPENCODE_DISABLE_PROJECT_CONFIG_ENV: "1",
+    }
+    fake = FakeWin32Api()
+
+    launch_appcontainer(make_request(environment=dict(environment)), api=fake)
+
+    assert dict(fake.spec.environment) == environment
+    delivered = json.loads(
+        fake.spec.environment[runtime_adapters.OPENCODE_WORKER_CONFIG_ENV]
+    )
+    server = delivered["mcp"]["awh"]
+    assert server["command"][0] == "C:\\Python312\\python.exe"
+    assert server["environment"]["AIWORKHUB_WORKER_MCP_AUDIT_HMAC_KEY_PATH"] == key
 
 
 def test_unicode_and_quoted_argv_preserved_in_command_line():

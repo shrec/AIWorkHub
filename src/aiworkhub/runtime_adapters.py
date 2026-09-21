@@ -2,13 +2,15 @@
 
 The plans produced here are inert data.  They contain an argument vector and
 working directory for a launcher to use.  This module never accepts or returns
-an environment mapping, and it starts a child process only inside the bounded
-release probe :func:`probe_release`, which is version detection -- not a task
-launch -- and drains its streams deterministically.
+a process environment mapping (the OpenCode worker config's ``environment`` is
+inert config data for its own MCP server), and it starts a child process only
+inside the bounded release probe :func:`probe_release`, which is version
+detection -- not a task launch -- and drains its streams deterministically.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -102,6 +104,14 @@ OPENCODE_SNAP_FAIL_CLOSED = "opencode_snap_launcher_fail_closed"
 OPENCODE_WORKER_MCP_SERVER = "awh"
 OPENCODE_PERMISSION_ALLOW = "allow"
 OPENCODE_PERMISSION_DENY = "deny"
+# The two environment variable NAMES a launcher sets for one OpenCode worker:
+# the request-local ``awh`` config inline, and the switch that stops OpenCode
+# merging a project-level config over it.  Names only -- consistent with this
+# module's contract, the mapping itself is built by ``worker_workspace``.
+OPENCODE_WORKER_CONFIG_ENV = "OPENCODE_CONFIG_CONTENT"
+OPENCODE_DISABLE_PROJECT_CONFIG_ENV = "OPENCODE_DISABLE_PROJECT_CONFIG"
+OPENCODE_WORKER_CONFIG_MAX_BYTES = 16384
+OPENCODE_NAME_MAX_CHARS = 64
 VSCODE_LM_ADAPTER = "vscode_lm"
 WINDOWS_NATIVE_CLI_REQUIRES_APPCONTAINER = "windows_native_cli_requires_appcontainer_sandbox"
 # The single spelling of the Windows confinement backend.  This exact string is
@@ -1505,7 +1515,48 @@ def opencode_tool_is_allowed(tool_name: str) -> bool:
     return opencode_permission_action(tool_name) == OPENCODE_PERMISSION_ALLOW
 
 
-def build_opencode_worker_mcp_config(mcp_command: Sequence[str]) -> dict[str, Any]:
+OPENCODE_CONFIG_SCHEMA_URL = "https://opencode.ai/config.json"
+# The only keys the ``awh`` server's ``environment`` may carry: exactly the
+# request binding ``worker_ai_tools_mcp.generate_worker_mcp_runtime`` emits.
+# A provider credential or any other inherited variable is refused.
+OPENCODE_WORKER_MCP_ENVIRONMENT_KEYS: frozenset[str] = frozenset(
+    {
+        "AIWORKHUB_WORKER_MCP_TASK_ID",
+        "AIWORKHUB_WORKER_MCP_RUNNER",
+        "AIWORKHUB_WORKER_MCP_TOPIC",
+        "AIWORKHUB_WORKER_MCP_REQUEST_ID",
+        "AIWORKHUB_WORKER_MCP_REPO",
+        "AIWORKHUB_WORKER_MCP_AUTHORITY_REPO",
+        "AIWORKHUB_WORKER_MCP_SOURCE_GRAPH_TARGETS",
+        "AIWORKHUB_WORKER_MCP_ALLOWED_WRITES",
+        "AIWORKHUB_WORKER_MCP_SESSION_TOPIC",
+        "AIWORKHUB_WORKER_MCP_AUDIT_LEDGER_PATH",
+        "AIWORKHUB_WORKER_MCP_AUDIT_HMAC_KEY_PATH",
+        "AIWORKHUB_WORKER_MCP_QUALITY_REVIEW_PACKET_PATH",
+        "AIWORKHUB_WORKER_MCP_CONTRACT_PACKET_PATH",
+        "AIWORKHUB_REWORK_OVERLAY_PATH",
+        "AIWORKHUB_WORKER_MCP_PROVIDER_CALL_ID",
+        "AIWORKHUB_WORKER_MCP_PROVENANCE",
+        "PYTHONPATH",
+    }
+)
+
+
+class OpenCodeWorkerConfigError(ValueError):
+    """A request-local OpenCode worker config that must refuse the launch.
+
+    ``cause`` is the stable typed reason; the message starts with
+    ``opencode_worker_mcp_config_<cause>`` so a receipt names an infrastructure
+    fault, never a model-quality failure.
+    """
+
+    def __init__(self, cause: str, detail: str = "") -> None:
+        self.cause = cause
+        message = f"opencode_worker_mcp_config_{cause}"
+        super().__init__(f"{message}:{detail}" if detail else message)
+
+
+def _opencode_command_argv(mcp_command: Sequence[str]) -> list[str]:
     if isinstance(mcp_command, (str, bytes)) or not isinstance(mcp_command, Sequence):
         raise ValueError("opencode_mcp_command_must_be_argv")
     command: list[str] = []
@@ -1515,17 +1566,95 @@ def build_opencode_worker_mcp_config(mcp_command: Sequence[str]) -> dict[str, An
         command.append(token)
     if not command:
         raise ValueError("opencode_mcp_command_empty")
-    return {
-        "$schema": "https://opencode.ai/config.json",
-        "permission": opencode_worker_permission_contract(),
-        "mcp": {
-            OPENCODE_WORKER_MCP_SERVER: {
-                "type": "local",
-                "command": command,
-                "enabled": True,
-            }
-        },
+    return command
+
+
+def _opencode_mcp_environment(environment: Mapping[str, str]) -> dict[str, str]:
+    if not isinstance(environment, Mapping) or not environment:
+        raise ValueError("opencode_mcp_environment_invalid")
+    checked: dict[str, str] = {}
+    for key, value in environment.items():
+        if (
+            key not in OPENCODE_WORKER_MCP_ENVIRONMENT_KEYS
+            or not isinstance(value, str)
+            or "\x00" in value
+        ):
+            raise ValueError("opencode_mcp_environment_invalid")
+        checked[key] = value
+    return checked
+
+
+def build_opencode_worker_mcp_config(
+    mcp_command: Sequence[str], *, environment: Mapping[str, str] | None = None
+) -> dict[str, Any]:
+    """Inert OpenCode config data: the ``awh`` server and the worker permissions.
+
+    ``environment`` is the MCP server's own request binding inside the config,
+    never the launcher's process environment.
+    """
+    server: dict[str, Any] = {
+        "type": "local",
+        "command": _opencode_command_argv(mcp_command),
+        "enabled": True,
     }
+    if environment is not None:
+        server["environment"] = _opencode_mcp_environment(environment)
+    return {
+        "$schema": OPENCODE_CONFIG_SCHEMA_URL,
+        "permission": opencode_worker_permission_contract(),
+        "mcp": {OPENCODE_WORKER_MCP_SERVER: server},
+    }
+
+
+def validate_opencode_worker_config(config: Any) -> Any:
+    """Refuse any OpenCode config that is not exactly the worker contract."""
+    if (
+        not isinstance(config, dict)
+        or set(config) != {"$schema", "permission", "mcp"}
+        or config["$schema"] != OPENCODE_CONFIG_SCHEMA_URL
+    ):
+        raise OpenCodeWorkerConfigError("malformed", "top_level")
+    alias = OPENCODE_WORKER_MCP_SERVER
+    if len(alias) > OPENCODE_NAME_MAX_CHARS:
+        raise OpenCodeWorkerConfigError("alias_too_long", str(len(alias)))
+    servers = config["mcp"]
+    server = servers.get(alias) if isinstance(servers, dict) else None
+    if not isinstance(server, dict) or list(servers) != [alias]:
+        raise OpenCodeWorkerConfigError("malformed", "mcp_servers")
+    if (
+        not {"type", "command", "enabled"}
+        <= set(server)
+        <= {"type", "command", "enabled", "environment"}
+        or server["type"] != "local"
+        or server["enabled"] is not True
+    ):
+        raise OpenCodeWorkerConfigError("malformed", "mcp_server")
+    try:
+        _opencode_command_argv(server["command"])
+        if "environment" in server:
+            _opencode_mcp_environment(server["environment"])
+    except ValueError as exc:
+        raise OpenCodeWorkerConfigError("malformed", str(exc)) from exc
+    permission = config["permission"]
+    if not isinstance(permission, dict) or list(permission.items()) != list(
+        opencode_worker_permission_contract().items()
+    ):
+        raise OpenCodeWorkerConfigError("permission_contract_mismatch")
+    for name, action in permission.items():
+        if action == OPENCODE_PERMISSION_ALLOW and len(name) > OPENCODE_NAME_MAX_CHARS:
+            raise OpenCodeWorkerConfigError("tool_name_too_long", name)
+    return config
+
+
+def serialize_opencode_worker_config(config: Any) -> str:
+    """The validated config as one bounded ASCII JSON line for the child env."""
+    validate_opencode_worker_config(config)
+    text = json.dumps(config, ensure_ascii=True, separators=(",", ":"), allow_nan=False)
+    if len(text) > OPENCODE_WORKER_CONFIG_MAX_BYTES:
+        raise OpenCodeWorkerConfigError(
+            "oversized", f"{len(text)}>{OPENCODE_WORKER_CONFIG_MAX_BYTES}"
+        )
+    return text
 
 
 def build_runtime_command(

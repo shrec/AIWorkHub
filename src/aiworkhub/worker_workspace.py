@@ -3643,7 +3643,13 @@ def provision_worker_mcp_runtime(
     other's repository-layout assumptions.
     """
 
-    if backend not in ("landlock", "bubblewrap", VSCODE_LM_IN_PROCESS_BACKEND):
+    # AppContainer has no mount namespace: like Landlock it sees real host paths.
+    if backend not in (
+        "landlock",
+        "bubblewrap",
+        WINDOWS_APPCONTAINER_BACKEND,
+        VSCODE_LM_IN_PROCESS_BACKEND,
+    ):
         raise WorkspaceError(f"unsupported_sandbox_backend:{backend}")
     if not workspace.repo.is_dir():
         raise WorkspaceError(f"authority_repo_not_directory:{workspace.repo}")
@@ -3740,6 +3746,232 @@ def provision_worker_mcp_runtime(
         # WorkspaceError is already in process_launcher's caught-and-rejected
         # exception tuple, WorkerToolError is not.
         raise WorkspaceError(f"worker_mcp_runtime_provisioning_failed:{exc}") from exc
+
+
+_OPENCODE_CONFIG_SOURCE_MAX_BYTES = 65536
+# The host paths ``sandbox_argv``'s bubblewrap branch mounts at the same path:
+# ``/usr`` and ``/etc`` read-only, with ``/bin``, ``/sbin``, ``/lib`` and
+# ``/lib64`` as symlinks into ``/usr``.
+_BUBBLEWRAP_SYSTEM_ROOTS = ("/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc")
+
+
+def _opencode_path_beneath_home(
+    workspace: "WorkerWorkspace", path: Path, error: type[Exception]
+) -> Path:
+    try:
+        return _require_beneath(workspace.home, path)
+    except WorkspaceError as exc:
+        symlinked = str(exc).startswith("symlink_path_component_forbidden")
+        raise error("symlink" if symlinked else "outside_home", path.name) from exc
+
+
+def _read_generated_opencode_entry(
+    workspace: "WorkerWorkspace", runtime: Any, error: type[Exception]
+) -> dict[str, Any]:
+    """The generated worker server entry, read as bounded bytes from the request HOME."""
+    source = Path(runtime.claude_mcp_config_path)
+    _opencode_path_beneath_home(workspace, source, error)
+    try:
+        before = os.lstat(source)
+    except FileNotFoundError as exc:
+        raise error("missing", source.name) from exc
+    except OSError as exc:
+        raise error("unreadable", type(exc).__name__) from exc
+    if stat.S_ISLNK(before.st_mode):
+        raise error("symlink", source.name)
+    if not stat.S_ISREG(before.st_mode):
+        raise error("not_regular", source.name)
+    if before.st_size > _OPENCODE_CONFIG_SOURCE_MAX_BYTES:
+        raise error("oversized", str(before.st_size))
+    # O_NONBLOCK: a FIFO swapped in after the lstat must not block the launcher.
+    flags = os.O_RDONLY
+    for optional in ("O_NOFOLLOW", "O_NONBLOCK", "O_BINARY"):
+        flags |= getattr(os, optional, 0)
+    try:
+        fd = os.open(source, flags)
+    except OSError as exc:
+        raise error("unreadable", type(exc).__name__) from exc
+    chunks: list[bytes] = []
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode):
+            raise error("not_regular", source.name)
+        if not stat_owned_by_current_user(opened):
+            raise error("untrusted_owner", source.name)
+        remaining = _OPENCODE_CONFIG_SOURCE_MAX_BYTES + 1
+        while remaining > 0:
+            chunk = os.read(fd, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+    except OSError as exc:
+        raise error("unreadable", type(exc).__name__) from exc
+    finally:
+        os.close(fd)
+    data = b"".join(chunks)
+    if len(data) > _OPENCODE_CONFIG_SOURCE_MAX_BYTES:
+        raise error("oversized", "grew_while_reading")
+    try:
+        document = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, RecursionError) as exc:
+        raise error("malformed", "json") from exc
+    servers = document.get("mcpServers") if isinstance(document, dict) else None
+    entry = servers.get(runtime.server_name) if isinstance(servers, dict) else None
+    if not isinstance(entry, dict) or set(entry) != {"command", "args", "env"}:
+        raise error("malformed", "server_entry")
+    return entry
+
+
+def _bubblewrap_host_path(
+    text: str, roots: tuple[tuple[str, Path], ...]
+) -> Path | None:
+    """The host path behind a bubblewrap-spelled path, or None if the mount namespace hides it."""
+    candidate = PurePosixPath(text)
+    if not candidate.is_absolute() or ".." in candidate.parts:
+        return None
+    for alias, host_root in roots:
+        alias_path = PurePosixPath(alias)
+        if candidate == alias_path or alias_path in candidate.parents:
+            return host_root.joinpath(*candidate.relative_to(alias_path).parts)
+    for system_root in _BUBBLEWRAP_SYSTEM_ROOTS:
+        root_path = PurePosixPath(system_root)
+        if candidate == root_path or root_path in candidate.parents:
+            return Path(text)
+    return None
+
+
+def _bubblewrap_mounts_resolved(host: Path, roots: tuple[tuple[str, Path], ...]) -> bool:
+    """Whether ``host``, symlinks resolved, still lands inside a bubblewrap mount."""
+    try:
+        resolved = host.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return False
+    mounted = [root.resolve() for _alias, root in roots]
+    mounted += [Path(root).resolve() for root in _BUBBLEWRAP_SYSTEM_ROOTS]
+    return any(resolved == root or root in resolved.parents for root in mounted)
+
+
+def provision_opencode_worker_config(
+    workspace: "WorkerWorkspace",
+    runtime: Any,
+    *,
+    backend: str,
+    authority_repo: Path,
+) -> dict[str, str]:
+    """The request-local OpenCode environment for one exact launch, or a typed refusal.
+
+    Derived from the runtime ``provision_worker_mcp_runtime`` already generated
+    (never a second MCP implementation) and spelled for the selected sandbox:
+    bubblewrap sees only its mount aliases, while Landlock and AppContainer see
+    the real host paths (AppContainer's own ACL boundary is not re-derived
+    here).  The ``awh`` config reaches the worker through its process
+    environment only -- nothing is written to disk and no global OpenCode
+    config is touched -- and project-level OpenCode config is switched off, so
+    nothing inherited can widen the exact worker allowlist.  Every refusal
+    raises ``OpenCodeWorkerConfigError`` before a provider spawns.
+    """
+    from . import runtime_adapters
+    from . import worker_ai_tools_mcp as mcp
+
+    error = runtime_adapters.OpenCodeWorkerConfigError
+    if backend not in ("landlock", "bubblewrap", WINDOWS_APPCONTAINER_BACKEND):
+        raise error("backend_unsupported", str(backend))
+    aliased = backend == "bubblewrap"
+    entry = _read_generated_opencode_entry(workspace, runtime, error)
+    command, args, env = entry["command"], entry["args"], entry["env"]
+    required = (
+        mcp.ENV_TASK_ID, mcp.ENV_RUNNER, mcp.ENV_TOPIC, mcp.ENV_REQUEST_ID,
+        mcp.ENV_REPO, mcp.ENV_AUTHORITY_REPO, mcp.ENV_SOURCE_GRAPH_TARGETS,
+        mcp.ENV_ALLOWED_WRITES, mcp.ENV_SESSION_TOPIC, mcp.ENV_AUDIT_LEDGER_PATH,
+        mcp.ENV_AUDIT_HMAC_KEY_PATH, mcp.ENV_PYTHONPATH,
+    )
+    if (
+        not isinstance(command, str)
+        or args != ["-m", mcp.__name__]
+        or not isinstance(env, dict)
+        or not all(isinstance(k, str) and isinstance(v, str) for k, v in env.items())
+        or any(key not in env for key in required)
+    ):
+        raise error("malformed", "server_entry")
+
+    def same(actual: str, expected: str) -> bool:
+        if aliased:
+            return actual == expected
+        return os.path.normcase(os.path.normpath(actual)) == os.path.normcase(
+            os.path.normpath(expected)
+        )
+
+    if (
+        env[mcp.ENV_REQUEST_ID] != workspace.request_id
+        or not same(
+            env[mcp.ENV_REPO], SANDBOX_WORKSPACE if aliased else str(workspace.path)
+        )
+        or not same(
+            env[mcp.ENV_AUTHORITY_REPO],
+            SANDBOX_AUTHORITY_REPO if aliased else str(authority_repo),
+        )
+    ):
+        raise error("binding_mismatch", workspace.request_id)
+
+    home_alias = PurePosixPath(bubblewrap_home_env_value())
+    projected = dict(env)
+    for key, declared in (
+        (mcp.ENV_AUDIT_LEDGER_PATH, runtime.audit_ledger_path),
+        (mcp.ENV_AUDIT_HMAC_KEY_PATH, runtime.audit_hmac_key_path),
+    ):
+        resolved = _opencode_path_beneath_home(workspace, Path(env[key]), error)
+        if not same(env[key], str(declared)):
+            raise error("binding_mismatch", key)
+        if not resolved.is_file():
+            raise error("audit_binding_missing", key)
+        if aliased:
+            relative = resolved.relative_to(workspace.home.resolve())
+            projected[key] = str(home_alias / PurePosixPath(*relative.parts))
+
+    if aliased:
+        # Exactly the binds ``sandbox_argv`` gives this request's namespace.
+        roots = (
+            (SANDBOX_WORKSPACE, workspace.path),
+            (SANDBOX_AUTHORITY_REPO, workspace.repo),
+            (SANDBOX_PACKAGE_IMPORT_ROOT, mcp.resolve_host_package_import_root()),
+            (str(home_alias), workspace.home),
+        )
+        command_host = _bubblewrap_host_path(command, roots)
+        if (
+            command_host is None
+            or not command_host.is_file()
+            or not _bubblewrap_mounts_resolved(command_host, roots)
+        ):
+            raise error("command_not_visible", command)
+        for key in (
+            mcp.ENV_PYTHONPATH,
+            mcp.ENV_QUALITY_REVIEW_PACKET_PATH,
+            mcp.ENV_REWORK_OVERLAY_PATH,
+            mcp.ENV_CONTRACT_PACKET_PATH,
+        ):
+            if key not in projected:
+                continue
+            host = _bubblewrap_host_path(projected[key], roots)
+            if host is None or not host.exists():
+                raise error("outside_sandbox", key)
+    elif not os.path.isfile(command):
+        raise error("command_missing", command)
+    elif not os.access(command, os.X_OK):
+        raise error("command_not_executable", command)
+
+    try:
+        config = runtime_adapters.build_opencode_worker_mcp_config(
+            [command, *args], environment=projected
+        )
+    except ValueError as exc:
+        raise error("malformed", str(exc)) from exc
+    return {
+        runtime_adapters.OPENCODE_WORKER_CONFIG_ENV: (
+            runtime_adapters.serialize_opencode_worker_config(config)
+        ),
+        runtime_adapters.OPENCODE_DISABLE_PROJECT_CONFIG_ENV: "1",
+    }
 
 
 def configured_runtime_root(repo: Path | None = None) -> Path:
@@ -8614,6 +8846,29 @@ def sandbox_argv(
         if adapter_id not in _VSCODE_LM_IN_PROCESS_ADAPTERS:
             raise WorkspaceError(
                 f"vscode_lm_in_process_adapter_forbidden:{adapter_id}"
+            )
+        return list(adapter_argv)
+    if selected == WINDOWS_APPCONTAINER_BACKEND:
+        # AppContainer has no argv wrapper: the supervisor launches exactly
+        # this argv inside the repo-scoped AppContainer profile its spec's
+        # ``execution_backend`` names.  Passing it through is only sound when
+        # that confinement is measured available here and now -- otherwise the
+        # supervisor would be the sole boundary, so this refuses instead.
+        # Validation never runs under AppContainer, so a validation-shaped
+        # request cannot be honoured and is refused rather than dropped.
+        if (
+            validation_readonly_dirs
+            or validation_exec_scratch is not None
+            or validation_cwd is not None
+            or validation_executable_roots
+            or validation_python_runtime_identity_root is not None
+            or outer_validation_authority
+        ):
+            raise WorkspaceError("windows_appcontainer_validation_argv_unsupported")
+        report = windows_confinement_report()
+        if not report["available"]:
+            raise WorkspaceError(
+                f"windows_appcontainer_sandbox_unavailable:{report['reason']}"
             )
         return list(adapter_argv)
     # B892: resolve the validated ``cd`` prefix target once, against the real
