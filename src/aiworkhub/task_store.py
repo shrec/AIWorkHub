@@ -24,6 +24,7 @@ Two responsibilities live here:
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import os
@@ -31,6 +32,7 @@ import sqlite3
 import tempfile
 import threading
 import time
+import traceback
 from collections import OrderedDict
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
@@ -56,6 +58,7 @@ from .storage_registry import (
     resolve_database_path,
 )
 from .provider_tool_guards import ProviderGuardError, apply_repository_guards
+from .platform_io import process_is_alive
 from . import db_writer
 from . import review_lifecycle
 from . import task_fsm
@@ -4232,13 +4235,10 @@ def _clean_root_no_candidate_failure_authority(
         raw_pid = evidence.get(pid_key)
         if type(raw_pid) is not int or raw_pid <= 0:
             continue
-        try:
-            os.kill(raw_pid, 0)
-        except ProcessLookupError:
-            pass
-        except PermissionError:
-            return False, "retained_terminal_candidate_process_live", {}
-        else:
+        # NF-2026-00031: never os.kill(pid, 0). On Windows it is
+        # GenerateConsoleCtrlEvent(CTRL_C_EVENT, pid): WinError 87 for an exited
+        # pid, and with no console it falls through to TerminateProcess(pid, 0).
+        if process_is_alive(raw_pid):
             return False, "retained_terminal_candidate_process_live", {}
 
     try:
@@ -4432,6 +4432,36 @@ def _terminal_failure_supersedes_predecessor(
     )
 
 
+def _os_failure_names_its_operation(function: Callable[..., Any]) -> Callable[..., Any]:
+    """Re-raise an escaping ``OSError`` as a ``TaskStoreError`` naming what failed.
+
+    NF-2026-00031: recovery once answered only ``[WinError 87] The parameter is
+    incorrect``, which names none of its many filesystem and process calls.
+    The innermost frame in this package names the operation, the error's own
+    ``filename`` the path; the original stays chained as ``__cause__``.
+    """
+
+    @functools.wraps(function)
+    def wrapped(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return function(*args, **kwargs)
+        except OSError as exc:
+            package = Path(__file__).parent
+            frame = [
+                entry
+                for entry in traceback.extract_tb(exc.__traceback__)
+                if Path(entry.filename).parent == package
+            ][-1]
+            raise TaskStoreError(
+                f"{function.__name__}_os_error:"
+                f"operation={frame.name}:{frame.lineno}:{(frame.line or '').strip()};"
+                f"path={exc.filename!r};error={exc}"
+            ) from exc
+
+    return wrapped
+
+
+@_os_failure_names_its_operation
 def recover_blocked_rework(
     root: str | Path,
     task_id: str,
@@ -5439,15 +5469,8 @@ def recover_blocked_rework(
             evidence = terminal_review.get("evidence")
             for pid_key in ("pid", "provider_pid", "supervisor_pid", "stall_supervisor_pid"):
                 raw_pid = evidence.get(pid_key) if isinstance(evidence, dict) else None
-                if type(raw_pid) is int and raw_pid > 0:
-                    try:
-                        os.kill(raw_pid, 0)
-                    except ProcessLookupError:
-                        pass
-                    except PermissionError:
-                        return False, "retained_terminal_candidate_process_live"
-                    else:
-                        return False, "retained_terminal_candidate_process_live"
+                if type(raw_pid) is int and raw_pid > 0 and process_is_alive(raw_pid):
+                    return False, "retained_terminal_candidate_process_live"
             identity = evidence.get("request_identity") if isinstance(evidence, dict) else None
             workspace = evidence.get("workspace") if isinstance(evidence, dict) else None
             changed_paths = evidence.get("changed_paths") if isinstance(evidence, dict) else None

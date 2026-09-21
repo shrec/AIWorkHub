@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import copy
+import errno
+import gc
 import hashlib
 import json
 import os
 import sqlite3
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -301,6 +305,131 @@ def test_clean_root_no_candidate_recovery_fails_closed(
         feedback_reason="Retry provider failure from the canonical root",
         clean_root_if_predecessor_missing=True,
     ) == (False, expected)
+    assert _get_card(repo, task_id)["status"] == "blocked"
+
+
+_EVIDENCE_PID_KEYS = ("pid", "provider_pid", "supervisor_pid", "stall_supervisor_pid")
+
+
+def _exited_pid() -> int:
+    """A pid whose process has exited and whose last handle is closed.
+
+    Windows keeps a pid valid while any handle to the process is open, so the
+    ``Popen`` handle is released before the pid is used.
+    """
+
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    child.wait()
+    pid = child.pid
+    del child
+    gc.collect()
+    return pid
+
+
+@pytest.mark.parametrize(
+    ("clean_root", "expected"),
+    [
+        (False, (False, "retained_terminal_candidate_identity_invalid")),
+        (True, (True, "recovered")),
+    ],
+)
+def test_nf00031_exited_worker_pids_never_break_recovery(
+    tmp_path: Path, clean_root: bool, expected: tuple[bool, str],
+) -> None:
+    """NF-2026-00031: the measured Windows shape -- a worker_failed card whose
+    worker wrote no output and left no worktree, with its exited pids recorded.
+
+    ``os.kill(pid, 0)`` is ``GenerateConsoleCtrlEvent(CTRL_C_EVENT, pid)`` on
+    Windows, which fails with ``[WinError 87]`` for a pid that no longer exists,
+    so recovery raised instead of answering, with and without clean root.
+    """
+
+    repo, task_id, _request_id = _no_candidate_terminal_failure_fixture(tmp_path)
+    gone = _exited_pid()
+    _rewrite_no_candidate_failure(
+        repo,
+        task_id,
+        lambda _card, failure: failure["evidence"].update(
+            dict.fromkeys(_EVIDENCE_PID_KEYS, gone)
+        ),
+    )
+
+    assert task_store.recover_blocked_rework(
+        repo,
+        task_id,
+        actor="coordinator",
+        feedback_reason="Retry with corrective feedback",
+        clean_root_if_predecessor_missing=clean_root,
+    ) == expected
+    assert _get_card(repo, task_id)["status"] == ("pending" if expected[0] else "blocked")
+
+
+def test_nf00031_live_worker_pid_refuses_recovery_without_signalling_it(
+    tmp_path: Path,
+) -> None:
+    """A live recorded pid refuses recovery and is only observed, never signalled.
+
+    On a console-less Windows server ``os.kill(pid, 0)`` falls through to
+    ``TerminateProcess(handle, 0)`` and kills the process it meant to probe.
+    """
+
+    repo, task_id, _request_id = _no_candidate_terminal_failure_fixture(tmp_path)
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        _rewrite_no_candidate_failure(
+            repo,
+            task_id,
+            lambda _card, failure: failure["evidence"].update(pid=child.pid),
+        )
+        assert task_store.recover_blocked_rework(
+            repo,
+            task_id,
+            actor="coordinator",
+            feedback_reason="Retry with corrective feedback",
+            clean_root_if_predecessor_missing=True,
+        ) == (False, "retained_terminal_candidate_process_live")
+        assert child.poll() is None
+    finally:
+        child.kill()
+        child.wait()
+
+
+def test_nf00031_os_failure_names_the_operation_and_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An OSError escaping recovery is a TaskStoreError naming what failed.
+
+    A bare ``[WinError 87] The parameter is incorrect`` names no call and no
+    path; the original error stays chained and the card stays blocked.
+    """
+
+    repo, task_id, _request_id = _no_candidate_terminal_failure_fixture(tmp_path)
+    _rewrite_no_candidate_failure(
+        repo, task_id, lambda _card, failure: failure["evidence"].update(pid=4242),
+    )
+    failure = OSError(errno.EINVAL, "The parameter is incorrect", "probe-target")
+
+    def refuse(_pid: int) -> bool:
+        raise failure
+
+    monkeypatch.setattr(task_store, "process_is_alive", refuse)
+
+    with pytest.raises(task_store.TaskStoreError) as raised:
+        task_store.recover_blocked_rework(
+            repo,
+            task_id,
+            actor="coordinator",
+            feedback_reason="Retry with corrective feedback",
+            clean_root_if_predecessor_missing=True,
+        )
+
+    message = str(raised.value)
+    assert message.startswith("recover_blocked_rework_os_error:")
+    assert "_clean_root_no_candidate_failure_authority" in message
+    assert "process_is_alive(raw_pid)" in message
+    assert "path='probe-target'" in message
+    assert "The parameter is incorrect" in message
+    assert raised.value.__cause__ is failure
     assert _get_card(repo, task_id)["status"] == "blocked"
 
 
