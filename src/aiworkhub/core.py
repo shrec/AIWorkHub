@@ -4781,6 +4781,21 @@ def create_task(
                 )
     except task_templates.TaskTemplateError as exc:
         return _lifecycle_error(str(exc), 2)
+    # NF-2026-00806: a writable card's authoritative minimality contract is part
+    # of the expansion the receipt above authenticates, so persist it as a real
+    # card field. Launch re-binds that embedded contract to the PERSISTED fields,
+    # and omitting it rejected a genuine empty-required-outputs writable card as
+    # ``required_outputs_invalid``. Mirror what the receipt actually hashed
+    # rather than asserting a canonical value it never carried; a read-only
+    # expansion hashes none, so inventing one would change its own digest.
+    embedded_contract = bound_provenance.get("expanded_contract")
+    embedded_minimality = (
+        embedded_contract.get("minimality_contract")
+        if isinstance(embedded_contract, Mapping)
+        else None
+    )
+    if not read_only and isinstance(embedded_minimality, str) and embedded_minimality:
+        card["minimality_contract"] = embedded_minimality
     card["template_provenance"] = bound_provenance
     requested_payload["template_provenance"] = bound_provenance
 

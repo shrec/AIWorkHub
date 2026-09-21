@@ -13173,3 +13173,219 @@ def test_request_events_replay_the_ledger_after_a_rotation(
     # canonical replay rather than extending stale folded rows.
     assert [row["seq"] for row in manager._request_events("r")] == [0, 1]
     assert replays["count"] == 2
+
+
+def _implementation_template_expansion(
+    production: tuple[str, ...] = ("src/mod.py",),
+    tests: tuple[str, ...] = ("tests/test_mod.py",),
+    mandatory: tuple[str, ...] = (),
+) -> dict:
+    return task_templates.expand_template(
+        "implementation_with_tests",
+        production_paths=list(production),
+        test_paths=list(tests),
+        mandatory_changed_outputs=list(mandatory),
+    )
+
+
+def _persisted_empty_output_card(
+    provenance_source: dict | None = None,
+    expansion: dict | None = None,
+) -> dict:
+    """One authenticated writable card whose mandatory-change set is empty."""
+
+    expansion = expansion or _implementation_template_expansion()
+    receipt = task_templates.template_provenance_payload(
+        provenance_source or expansion, classification_reason="explicit_template"
+    )
+    return {
+        "task_id": "empty-output-card",
+        "runner": "codex_worker",
+        "topic": "coding",
+        "read_only": expansion["read_only"],
+        "allowed_writes": list(expansion["allowed_writes"]),
+        "read_first": list(expansion["read_first"]),
+        "required_outputs": list(expansion["required_outputs"]),
+        "validation": list(expansion["validation"]),
+        "validation_roles": list(expansion["validation_roles"]),
+        "work_kind": expansion["work_kind"],
+        "minimality_contract": expansion["minimality_contract"],
+        # A persisted card carries a plain JSON receipt, never the in-memory
+        # bound object that still remembers the card it was expanded from.
+        "template_provenance": json.loads(json.dumps(receipt)),
+    }
+
+
+def _rejects_empty_required_outputs(card: dict) -> None:
+    with pytest.raises(process_launcher.LaunchRejected) as excinfo:
+        process_launcher._validate_required_outputs_contract(card)
+    assert str(excinfo.value) == "required_outputs_invalid"
+
+
+def test_empty_required_outputs_accepts_authenticated_writable_card() -> None:
+    card = _persisted_empty_output_card()
+
+    assert card["required_outputs"] == []
+    assert process_launcher._validate_required_outputs_contract(card) is None
+
+
+def test_empty_required_outputs_accepts_card_without_top_level_minimality() -> None:
+    # NF-2026-00806: cards persisted through 0.11.52 hashed the canonical
+    # minimality contract into their receipt but never stored the field, so
+    # launch rejected a genuine empty-output card as required_outputs_invalid.
+    # They authenticate by reconstructing exactly that canonical value.
+    card = _persisted_empty_output_card()
+    card.pop("minimality_contract")
+
+    assert process_launcher._validate_required_outputs_contract(card) is None
+
+
+def test_empty_required_outputs_rejects_arbitrary_writable_card() -> None:
+    card = _persisted_empty_output_card()
+    card.pop("minimality_contract")
+    card.pop("template_provenance")
+
+    _rejects_empty_required_outputs(card)
+
+
+@pytest.mark.parametrize("forged", ["", None, "change whatever you like"])
+def test_empty_required_outputs_rejects_changed_embedded_minimality(forged) -> None:
+    card = _persisted_empty_output_card()
+    card.pop("minimality_contract")
+    card["template_provenance"]["expanded_contract"]["minimality_contract"] = forged
+
+    _rejects_empty_required_outputs(card)
+
+
+def test_empty_required_outputs_rejects_foreign_template_provenance() -> None:
+    foreign = _implementation_template_expansion(
+        production=("src/other.py",), tests=("tests/test_other.py",)
+    )
+    card = _persisted_empty_output_card(provenance_source=foreign)
+    card.pop("minimality_contract")
+
+    _rejects_empty_required_outputs(card)
+
+
+def test_empty_required_outputs_rejects_stale_registry_version() -> None:
+    card = _persisted_empty_output_card()
+    card.pop("minimality_contract")
+    receipt = card["template_provenance"]
+    stale = task_templates.REGISTRY_VERSION + 1
+    receipt["registry_version"] = stale
+    receipt["template_full_id"] = (
+        f"{receipt['template_name']}@v{stale}:{receipt['definition_digest']}"
+    )
+
+    _rejects_empty_required_outputs(card)
+
+
+def test_empty_required_outputs_rejects_widened_scope_without_minimality() -> None:
+    card = _persisted_empty_output_card()
+    card.pop("minimality_contract")
+    card["allowed_writes"] = [*card["allowed_writes"], "src/evil.py"]
+
+    _rejects_empty_required_outputs(card)
+
+
+def test_empty_required_outputs_still_accepts_read_only_card() -> None:
+    card = {"read_only": True, "allowed_writes": [], "required_outputs": []}
+
+    assert process_launcher._validate_required_outputs_contract(card) is None
+
+
+def _custom_escape_empty_output_card() -> dict:
+    """One audited-custom-escape writable card with no mandatory outputs."""
+
+    card = {
+        "task_id": "custom-escape-empty-output",
+        "runner": "codex_worker",
+        "topic": "coding",
+        "read_only": False,
+        "allowed_writes": ["src/a.py"],
+        "read_first": ["src/a.py"],
+        "required_outputs": [],
+        "validation": ["python3 -m pytest -q tests/test_a.py"],
+        "validation_roles": ["tests"],
+        "work_kind": "generic",
+        "minimality_contract": task_templates.CANONICAL_MINIMALITY_CONTRACT,
+    }
+    receipt = task_templates._custom_escape_provenance(card)
+    card["template_provenance"] = json.loads(json.dumps(receipt))
+    return card
+
+
+def test_empty_required_outputs_rejects_custom_escape_without_minimality() -> None:
+    # NF-2026-00806: reconstructing the missing top-level contract is a HISTORY
+    # path for built-in families whose expansion permits an empty mandatory set.
+    # The audited custom escape is not one of them -- card creation refuses this
+    # exact card -- so launch must keep refusing it rather than authenticate a
+    # receipt that only matches once the launcher supplies the missing field.
+    card = _custom_escape_empty_output_card()
+    with pytest.raises(
+        task_templates.TaskTemplateError,
+        match="custom_escape_writable_requires_required_outputs",
+    ):
+        task_templates.classify_task_card(
+            allowed_writes=card["allowed_writes"],
+            required_outputs=card["required_outputs"],
+            validation=card["validation"],
+            validation_roles=card["validation_roles"],
+            work_kind=card["work_kind"],
+            read_only=card["read_only"],
+            read_first=card["read_first"],
+            custom_escape=task_templates.AUDITED_CUSTOM_ESCAPE,
+        )
+    card.pop("minimality_contract")
+
+    _rejects_empty_required_outputs(card)
+
+
+def test_empty_required_outputs_rejects_output_bearing_family() -> None:
+    # ``test_only`` defaults its mandatory set to the test paths, so it never
+    # needs the historical reconstruction; an explicitly emptied one stays
+    # rejected exactly as it is on the canonical base.
+    expansion = task_templates.expand_template(
+        "test_only",
+        test_paths=["tests/test_mod.py"],
+        mandatory_changed_outputs=[],
+    )
+    card = _persisted_empty_output_card(expansion=expansion)
+    card.pop("minimality_contract")
+
+    _rejects_empty_required_outputs(card)
+
+
+def test_empty_output_template_families_match_the_registry_defaults() -> None:
+    # The launcher's family set duplicates registry knowledge, so pin it to the
+    # writable built-ins whose default expansion requires nothing to change: a
+    # family that starts demanding mandatory outputs must lose the exemption.
+    paths = {
+        "read_only_analysis": {"production_paths": ["src/a.py"]},
+        "bugfix_with_regression": {
+            "production_paths": ["src/a.py"],
+            "test_paths": ["tests/test_a.py"],
+        },
+        "implementation_with_tests": {
+            "production_paths": ["src/mod.py"],
+            "test_paths": ["tests/test_mod.py"],
+        },
+        "test_only": {"test_paths": ["tests/test_a.py"]},
+        "docs_change": {"production_paths": ["docs/guide.md"]},
+        "validation_replay": {
+            "production_paths": ["src/a.py"],
+            "test_paths": ["tests/test_a.py"],
+        },
+        "cross_boundary_bugfix": {
+            "production_paths": ["src/a.py", "src/a.js"],
+            "test_paths": ["tests/test_a.py", "tests/a.test.js"],
+        },
+    }
+    assert set(paths) == set(task_templates.TEMPLATE_IDS)
+    permits_empty = set()
+    for name in task_templates.TEMPLATE_IDS:
+        expansion = task_templates.expand_template(name, **paths[name])
+        if not expansion["read_only"] and not expansion["required_outputs"]:
+            permits_empty.add(name)
+
+    assert permits_empty == process_launcher._EMPTY_OUTPUT_TEMPLATE_FAMILIES

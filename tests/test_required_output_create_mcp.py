@@ -5,14 +5,16 @@ import json
 
 import pytest
 
-from aiworkhub import core, server, skill_registry
+from aiworkhub import core, process_launcher, server, skill_registry
 from aiworkhub.task_templates import (
+    CANONICAL_MINIMALITY_CONTRACT,
     PROVENANCE_SCHEMA_ID,
     REGISTRY_VERSION,
     SCHEMA_ID,
     TEMPLATE_IDS,
     TEMPLATE_SPECS,
     TaskTemplateError,
+    _custom_escape_provenance,
     skill_task_family,
     expand_template,
     template_provenance_payload,
@@ -781,3 +783,141 @@ def test_create_from_template_rejects_leading_hyphen_paths_before_create(
     assert test_path["ok"] is False
     assert test_path["stderr"] == "invalid_test_path_leading_hyphen"
     assert calls == []
+
+
+_EMPTY_OUTPUT_PATHS = {
+    "production_paths": ["src/mod.py"],
+    "test_paths": ["tests/test_mod.py"],
+}
+
+
+def _create_empty_output_template_card(monkeypatch, tmp_path, task_id):
+    _enable_real_core_create(monkeypatch, tmp_path)
+    return server.aiworkhub_task_create_from_template(
+        task_id=task_id,
+        title="Empty-output implementation card",
+        runner="codex_worker",
+        topic="coding",
+        objective="Prove an authenticated empty mandatory-change set.",
+        acceptance=["Nothing is mandatory to change."],
+        template_id="implementation_with_tests",
+        mandatory_changed_outputs=[],
+        echo_card=True,
+        **_EMPTY_OUTPUT_PATHS,
+    )
+
+
+def test_real_core_persists_canonical_minimality_for_empty_output_card(
+    monkeypatch, tmp_path
+):
+    # NF-2026-00806: create hashed the writable card's authoritative minimality
+    # contract into the receipt but never persisted the field, so launch --
+    # which re-binds that receipt to the PERSISTED card -- refused a genuine
+    # empty-required-outputs card as required_outputs_invalid.
+    result = _create_empty_output_template_card(
+        monkeypatch, tmp_path, "TASK_EMPTY_OUTPUT_MINIMALITY"
+    )
+
+    assert result.get("ok") is True, result
+    assert result.get("created") is True, result
+    stored = json.loads(result["stdout"])
+    expansion = expand_template(
+        "implementation_with_tests",
+        mandatory_changed_outputs=[],
+        **_EMPTY_OUTPUT_PATHS,
+    )
+    # The required-output contract itself is untouched.
+    assert stored["required_outputs"] == []
+    assert stored["allowed_writes"] == expansion["allowed_writes"]
+    assert stored["minimality_contract"] == CANONICAL_MINIMALITY_CONTRACT
+    assert process_launcher._validate_required_outputs_contract(stored) is None
+
+
+def test_real_core_persists_minimality_for_non_empty_output_card(
+    monkeypatch, tmp_path
+):
+    _enable_real_core_create(monkeypatch, tmp_path)
+    result = server.aiworkhub_task_create_from_template(
+        task_id="TASK_NON_EMPTY_OUTPUT_MINIMALITY",
+        title="Mandatory-output implementation card",
+        runner="codex_worker",
+        topic="coding",
+        objective="Keep the declared mandatory outputs.",
+        acceptance=["Both declared paths change."],
+        template_id="implementation_with_tests",
+        mandatory_changed_outputs=["src/mod.py", "tests/test_mod.py"],
+        echo_card=True,
+        **_EMPTY_OUTPUT_PATHS,
+    )
+
+    assert result.get("ok") is True, result
+    stored = json.loads(result["stdout"])
+    assert stored["required_outputs"] == ["src/mod.py", "tests/test_mod.py"]
+    assert stored["minimality_contract"] == CANONICAL_MINIMALITY_CONTRACT
+    assert process_launcher._validate_required_outputs_contract(stored) is None
+
+
+def test_real_core_keeps_read_only_template_cards_free_of_minimality(
+    monkeypatch, tmp_path
+):
+    _enable_real_core_create(monkeypatch, tmp_path)
+    result = server.aiworkhub_task_create_from_template(
+        task_id="TASK_READ_ONLY_MINIMALITY",
+        title="Read-only analysis card",
+        runner="codex_worker",
+        topic="coding",
+        objective="Read without writing.",
+        acceptance=["Nothing is written."],
+        template_id="read_only_analysis",
+        production_paths=["src/a.py"],
+        echo_card=True,
+    )
+
+    assert result.get("ok") is True, result
+    stored = json.loads(result["stdout"])
+    assert stored["read_only"] is True
+    # A read-only card has no write scope to keep minimal, and its expansion
+    # never hashed a minimality contract; inventing one would change its digest.
+    assert "minimality_contract" not in stored
+    assert process_launcher._validate_required_outputs_contract(stored) is None
+
+
+def test_created_empty_output_card_rejects_custom_escape_provenance_swap(
+    monkeypatch, tmp_path
+):
+    # NF-2026-00806: the same really-created, really-persisted empty-output card
+    # must not launch once its authenticated built-in receipt is replaced by an
+    # audited custom-escape one over the identical fields. Card creation refuses
+    # a writable custom-escape card with no required outputs, so reconstructing
+    # its dropped top-level minimality contract at launch would accept exactly
+    # what creation fails closed on.
+    result = _create_empty_output_template_card(
+        monkeypatch, tmp_path, "TASK_EMPTY_OUTPUT_CUSTOM_SWAP"
+    )
+    stored = json.loads(result["stdout"])
+    assert process_launcher._validate_required_outputs_contract(stored) is None
+
+    swapped = dict(stored)
+    swapped["template_provenance"] = json.loads(
+        json.dumps(_custom_escape_provenance(stored))
+    )
+    swapped.pop("minimality_contract")
+
+    with pytest.raises(process_launcher.LaunchRejected) as excinfo:
+        process_launcher._validate_required_outputs_contract(swapped)
+    assert str(excinfo.value) == "required_outputs_invalid"
+
+
+def test_created_empty_output_card_launches_without_top_level_minimality(
+    monkeypatch, tmp_path
+):
+    # The historical 0.11.52 row: exactly this created card, minus the field it
+    # never stored. Its built-in receipt still authenticates by reconstructing
+    # the canonical contract, so the pending card can launch unchanged.
+    result = _create_empty_output_template_card(
+        monkeypatch, tmp_path, "TASK_EMPTY_OUTPUT_HISTORICAL"
+    )
+    historical = json.loads(result["stdout"])
+    assert historical.pop("minimality_contract") == CANONICAL_MINIMALITY_CONTRACT
+
+    assert process_launcher._validate_required_outputs_contract(historical) is None

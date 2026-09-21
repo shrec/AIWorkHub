@@ -3313,6 +3313,31 @@ def _validate_scope(repo: Path, card: dict[str, Any]) -> None:
             raise LaunchRejected(f"allowed_write_outside_repo:{raw}")
 
 
+# NF-2026-00806: the built-in template families whose own canonical expansion
+# DEFAULTS to an empty mandatory-change set, so a genuine writable card of one
+# can authenticate with ``required_outputs == []``. ``bugfix_with_regression``,
+# ``test_only`` and ``docs_change`` each default to a non-empty set, and the
+# audited custom escape refuses a writable card with no required outputs at all
+# (``custom_escape_writable_requires_required_outputs``), so none of them ever
+# earns the historical missing-minimality reconstruction below.
+_EMPTY_OUTPUT_TEMPLATE_FAMILIES = frozenset(
+    {"implementation_with_tests", "cross_boundary_bugfix"}
+)
+
+
+def _claims_empty_output_template_family(card: dict[str, Any]) -> bool:
+    """Whether the card CLAIMS a built-in family that permits empty outputs.
+
+    Only the claim: the receipt itself still has to authenticate against the
+    exact card fields, so a forged, stale or foreign one fails closed there.
+    """
+    provenance = card.get("template_provenance")
+    if not isinstance(provenance, dict):
+        return False
+    name = provenance.get("template_name")
+    return isinstance(name, str) and name in _EMPTY_OUTPUT_TEMPLATE_FAMILIES
+
+
 def _validate_required_outputs_contract(card: dict[str, Any]) -> None:
     raw = card.get("required_outputs")
     if raw is None:
@@ -3334,16 +3359,39 @@ def _validate_required_outputs_contract(card: dict[str, Any]) -> None:
         # empty mandatory-change set. Accept that only when canonical template
         # provenance authenticates the exact expanded contract; arbitrary
         # writable cards cannot smuggle an accidental empty list to launch.
-        try:
-            provenance = task_templates.validate_template_provenance(
-                card.get("template_provenance"), expanded_card=card
+        views: list[dict[str, Any]] = [card]
+        if (
+            not card.get("read_only")
+            and "minimality_contract" not in card
+            and _claims_empty_output_template_family(card)
+        ):
+            # NF-2026-00806: a card persisted before the minimality contract
+            # became a real card field carries it only inside the receipt that
+            # hashed it. Reconstruct exactly that canonical value -- never a
+            # caller-supplied one -- and let the unchanged checks below decide.
+            # A card that declares its own contract, or whose receipt hashed a
+            # different one, still authenticates as written and fails closed.
+            views.append(
+                {
+                    **card,
+                    "minimality_contract": (
+                        task_templates.CANONICAL_MINIMALITY_CONTRACT
+                    ),
+                }
             )
-            expected_digest = task_templates.expanded_contract_digest(card)
-        except task_templates.TaskTemplateError as exc:
-            raise LaunchRejected("required_outputs_invalid") from exc
-        if provenance["expanded_contract_digest"] != expected_digest:
-            raise LaunchRejected("required_outputs_invalid")
-        return
+        rejection: task_templates.TaskTemplateError | None = None
+        for view in views:
+            try:
+                provenance = task_templates.validate_template_provenance(
+                    card.get("template_provenance"), expanded_card=view
+                )
+                expected_digest = task_templates.expanded_contract_digest(view)
+            except task_templates.TaskTemplateError as exc:
+                rejection = exc
+                continue
+            if provenance["expanded_contract_digest"] == expected_digest:
+                return
+        raise LaunchRejected("required_outputs_invalid") from rejection
     allowed = card.get("allowed_writes") or []
     if not isinstance(allowed, list):
         raise LaunchRejected("allowed_writes_invalid")
