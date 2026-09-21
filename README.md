@@ -62,6 +62,19 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
+## What's new in 0.11.56
+
+- Explicit manager recovery of a blocked task can now recover a timed-out
+  candidate whose worktree retention already collected, from the delta sealed
+  when the attempt terminated. The sealed delta is accepted only when it
+  authenticates against the exact repository, task, request, claim epoch and
+  hash-pinned changed paths; anything else fails closed with a typed reason and
+  leaves the task unchanged, and the clean-root escape refuses rather than
+  discard the sealed bytes (NF-2026-00594).
+- LSP index integration, the OpenCode manager callback, provider-neutral
+  Playbook completion, Muse worker qualification and portable `.aiworkhub` data
+  are not part of this release and remain pending.
+
 ## What's new in 0.11.55
 
 - Roadmap views now carry a server-side current-wave projection that names the

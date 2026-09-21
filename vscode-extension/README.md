@@ -14,6 +14,18 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.11.56
+
+- The bundled runtime's explicit manager recovery of a blocked task can now
+  recover a timed-out candidate whose worktree retention already collected,
+  from the delta sealed when the attempt terminated. The delta is accepted only
+  when it authenticates against the exact repository, task, request, claim epoch
+  and hash-pinned changed paths; anything else fails closed and leaves the task
+  unchanged (NF-2026-00594).
+- LSP index integration, the OpenCode manager callback, provider-neutral
+  Playbook completion, Muse worker qualification and portable `.aiworkhub` data
+  are not part of this release and remain pending.
+
 ## What's new in 0.11.55
 
 - The wave mini-roadmap popup now follows the bundled runtime's current-wave

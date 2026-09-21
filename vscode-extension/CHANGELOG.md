@@ -1,5 +1,41 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.56 — 2026-09-21
+
+### Changed
+
+- Bundled runtime: the sealed-delta verifier that rework materialization already
+  used is now the write-free `verify_rework_delta_artifact`, which authenticates
+  a sealed delta and returns its exact plan; `materialize_rework_delta_artifact`
+  delegates to it. Recovery therefore authenticates a collected candidate with
+  the same verifier a successor materializes through.
+
+### Fixed
+
+- Bundled runtime: explicit manager recovery of a blocked task
+  (`recover_blocked_rework`) can now recover a timed-out candidate whose
+  worktree retention already collected, from the delta sealed when the attempt
+  terminated (NF-2026-00594). Only a truly absent worktree lets that delta stand
+  in for it, and only when its descriptor binds this exact repository, task,
+  request and claim epoch to an intact, non-symlinked artifact directly beneath
+  the runtime's `rework_deltas` directory whose packet holds exactly the
+  terminal's hash-pinned changed paths. Recovery then pins the descriptor on the
+  successor's rework predecessor, so the existing materializer restores the
+  sealed bytes instead of regenerating them. A present, dangling, symlinked or
+  foreign worktree path keeps every retained-worktree check; a tampered,
+  missing, foreign or mismatched delta fails closed with a typed
+  `retained_terminal_candidate_*` reason and leaves the task unchanged; and the
+  clean-root escape refuses (`clean_root_rework_sealed_delta_available`) rather
+  than discard authenticated sealed bytes.
+
+### Not in this release
+
+- LSP index integration, the OpenCode manager callback, provider-neutral
+  completion of the stage-gated Playbook, Muse worker qualification, and
+  portable `.aiworkhub` data are pending and not shipped here. Inferred
+  successor progression and causal reasoning-quality measurement also remain
+  incomplete.
+
 ## 0.11.55 — 2026-09-21
 
 ### Added
