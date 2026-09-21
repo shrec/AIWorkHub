@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import inspect
+import json
+import sqlite3
 import threading
 from pathlib import Path
 
@@ -515,3 +518,381 @@ def test_goal_successor_preflight_is_read_only(
     assert missing == {"state": "refused", "reason": "roadmap_not_found"}
     assert not (fresh / ".aiworkhub").exists()
     assert _roadmap_state(repo) == before
+
+
+# --- Evidence-gated automatic wave completion ------------------------------
+
+
+_RECEIPT_ID = "sha256:" + "a" * 64
+
+
+def _accepted(task_id: str) -> dict:
+    request_id = f"req-{task_id}"
+    # The identity fields ``task_engine.accept_review`` seals into its receipt.
+    receipt = {
+        "schema_id": "aiworkhub.accepted_outcome_receipt.v1",
+        "receipt_id": _RECEIPT_ID,
+        "task_id": task_id,
+        "request_id": request_id,
+    }
+    return {
+        "task_id": task_id,
+        "status": "finished",
+        "worker_status": "done",
+        "accepted_request_id": request_id,
+        "accepted_by": "codex",
+        "accepted_at": "2026-09-21T00:00:00+00:00",
+        "accept_evidence": {"accepted_outcome_receipt": receipt},
+    }
+
+
+def _mapped_goals() -> list[dict]:
+    return [
+        {"id": "lsp", "label": "LSP", "task_ids": ["LSP_V2"], "acceptance_indices": [1]},
+        {"id": "docs", "label": "Docs", "task_ids": ["DOCS_V1"], "acceptance_indices": [2]},
+    ]
+
+
+def _mapped_wave(repo: Path, goals: list[dict] | None = None) -> dict:
+    wave = roadmap_store.add_item(
+        repo,
+        title="Wave",
+        outcome="Deliver the wave",
+        milestone="0.11.51",
+        acceptance=["LSP integrated", "Docs published"],
+        provenance={"wave_goals": _mapped_goals() if goals is None else goals},
+    )
+    for task_id in ("LSP_V1", "LSP_V2", "DOCS_V1"):
+        roadmap_store.link_task(repo, wave["id"], task_id)
+    roadmap_store.transition_item(repo, wave["id"], "approved", reason="planned")
+    roadmap_store.transition_item(repo, wave["id"], "in_progress", reason="started")
+    return roadmap_store.get_item(repo, wave["id"])
+
+
+def _accepted_cards() -> dict[str, dict | None]:
+    return {
+        # The archived predecessor stays in history; only current tasks decide.
+        "LSP_V1": {"task_id": "LSP_V1", "status": "finished", "archived_at": "2026-09-20"},
+        "LSP_V2": _accepted("LSP_V2"),
+        "DOCS_V1": _accepted("DOCS_V1"),
+    }
+
+
+def _completions(repo: Path, roadmap_id: str) -> list[dict]:
+    return [
+        event["detail"]
+        for event in roadmap_store.list_events(repo, roadmap_id)
+        if event["event"] == "transitioned" and event["detail"].get("to") == "completed"
+    ]
+
+
+def test_accepted_mapped_evidence_completes_the_wave_exactly_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from aiworkhub import wave_roadmap
+
+    repo = tmp_path / "repo"
+    wave = _mapped_wave(repo)
+    _use_task_cards(monkeypatch, {repo: _accepted_cards()})
+
+    first = roadmap_store.reconcile_wave_completion(repo, wave["id"])
+    again = roadmap_store.reconcile_wave_completion(repo, wave["id"])
+
+    assert (first["state"], first["reason"]) == ("completed", "all_mapped_goals_accepted")
+    assert first["wave"]["status"] == "completed"
+    # Completion never moves the target or rewrites the task history.
+    assert first["wave"]["milestone"] == "0.11.51"
+    assert first["wave"]["task_ids"] == wave["task_ids"]
+    assert (again["state"], again["reason"]) == ("completed", "already_completed")
+    [completion] = _completions(repo, wave["id"])
+    assert completion["from"] == "in_progress"
+    assert completion["evidence"] == {
+        "schema_id": roadmap_store.WAVE_COMPLETION_EVIDENCE_SCHEMA,
+        "criteria": 2,
+        "goals": [
+            {
+                "id": "lsp",
+                "acceptance_indices": [1],
+                "accepted": {"LSP_V2": {"request_id": "req-LSP_V2", "receipt_id": _RECEIPT_ID}},
+            },
+            {
+                "id": "docs",
+                "acceptance_indices": [2],
+                "accepted": {"DOCS_V1": {"request_id": "req-DOCS_V1", "receipt_id": _RECEIPT_ID}},
+            },
+        ],
+    }
+    projected = wave_roadmap.project_current_wave(roadmap_store.list_items(repo), "0.11.53")
+    assert projected["selection_reason"] == wave_roadmap.REASON_NO_ACTIVE_WAVE
+
+
+@pytest.mark.parametrize(
+    ("cards", "goals", "expected"),
+    [
+        (
+            {"LSP_V2": {**_accepted("LSP_V2"), "archived_at": "2026-09-21"}},
+            None,
+            ("unknown", "task_evidence_unresolved"),
+        ),
+        ({"LSP_V2": None}, None, ("unknown", "task_evidence_unresolved")),
+        (
+            {"LSP_V2": {"task_id": "LSP_V2", "status": "blocked"}},
+            None,
+            ("unknown", "task_evidence_unresolved"),
+        ),
+        (
+            {"LSP_V2": {"task_id": "LSP_V2", "status": "finished"}},
+            None,
+            ("unknown", "task_evidence_unresolved"),
+        ),
+        (
+            {"LSP_V2": {"task_id": "LSP_V2", "status": "processing"}},
+            None,
+            ("pending_evidence", "task_evidence_pending"),
+        ),
+        # Another task's genuine receipt copied onto this card verifies nothing.
+        (
+            {"LSP_V2": {**_accepted("LSP_V2"), "accept_evidence": _accepted("DOCS_V1")["accept_evidence"]}},
+            None,
+            ("unknown", "task_evidence_unresolved"),
+        ),
+        ({}, [], ("unknown", "goals_missing")),
+        ({}, _mapped_goals()[:1], ("unknown", "acceptance_unmapped")),
+    ],
+    ids=[
+        "archived", "missing", "blocked", "unverified", "unfinished", "foreign_receipt",
+        "no_goals", "unmapped_criterion",
+    ],
+)
+def test_unresolved_or_unmapped_evidence_leaves_the_wave_in_progress(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cards: dict,
+    goals: list[dict] | None,
+    expected: tuple[str, str],
+) -> None:
+    repo = tmp_path / "repo"
+    wave = _mapped_wave(repo, goals)
+    _use_task_cards(monkeypatch, {repo: {**_accepted_cards(), **cards}})
+    before = _roadmap_state(repo)
+
+    result = roadmap_store.reconcile_wave_completion(repo, wave["id"])
+
+    assert (result["state"], result["reason"]) == expected
+    assert "wave" not in result
+    assert _roadmap_state(repo) == before
+
+
+def test_a_release_alone_never_closes_or_retargets_a_wave(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # No version is an input: the only evidence is the exact current tasks.
+    assert list(inspect.signature(roadmap_store.reconcile_wave_completion).parameters) == [
+        "repo_root", "wave_id",
+    ]
+    repo = tmp_path / "repo"
+    wave = _mapped_wave(repo)
+    _use_task_cards(monkeypatch, {repo: {
+        "LSP_V2": {"task_id": "LSP_V2", "status": "pending"},
+        "DOCS_V1": {"task_id": "DOCS_V1", "status": "review"},
+    }})
+    before = _roadmap_state(repo)
+
+    results = [roadmap_store.reconcile_wave_completion(repo, wave["id"]) for _ in range(3)]
+
+    assert {result["state"] for result in results} == {"pending_evidence"}
+    assert _roadmap_state(repo) == before
+
+
+def test_concurrent_reconciles_complete_the_wave_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    wave = _mapped_wave(repo)
+    _use_task_cards(monkeypatch, {repo: _accepted_cards()})
+    barrier = threading.Barrier(6)
+    results: list[dict] = []
+
+    def reconcile() -> None:
+        barrier.wait(timeout=30)
+        results.append(roadmap_store.reconcile_wave_completion(repo, wave["id"]))
+
+    threads = [threading.Thread(target=reconcile) for _ in range(6)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=60)
+
+    assert len(results) == 6
+    assert {result["state"] for result in results} == {"completed"}
+    assert len(_completions(repo, wave["id"])) == 1
+
+
+def test_a_goal_rebound_after_the_verdict_refuses_the_stale_completion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    wave = _mapped_wave(repo)
+    stale = roadmap_store.item_revision(wave)
+    binding = _binding(wave["id"], "lsp", "LSP_V2")
+    _use_task_cards(monkeypatch, {repo: {
+        **_accepted_cards(),
+        "LSP_V3": {"task_id": "LSP_V3", "status": "pending", "wave_goal_binding": binding},
+    }})
+    assert _bind(repo, "LSP_V3", binding)["state"] == "applied"
+
+    with pytest.raises(roadmap_store.RoadmapConflictError, match="roadmap_revision_changed"):
+        roadmap_store.transition_item(
+            repo, wave["id"], "completed", reason="stale verdict", expected_revision=stale
+        )
+    result = roadmap_store.reconcile_wave_completion(repo, wave["id"])
+
+    assert roadmap_store.get_item(repo, wave["id"])["status"] == "in_progress"
+    assert (result["state"], result["task_ids"]) == ("pending_evidence", ["LSP_V3"])
+    assert _completions(repo, wave["id"]) == []
+
+
+def test_unreadable_or_absent_evidence_sources_are_unknown_without_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    fresh = tmp_path / "fresh"
+    fresh.mkdir()
+    wave = _mapped_wave(repo)
+
+    def unreadable(_root, _task_id):
+        raise RuntimeError("task store locked")
+
+    monkeypatch.setattr(task_store, "get_task", unreadable)
+    before = _roadmap_state(repo)
+
+    locked = roadmap_store.reconcile_wave_completion(repo, wave["id"])
+    ghost = roadmap_store.reconcile_wave_completion(repo, "RM-2026-00099")
+    no_store = roadmap_store.reconcile_wave_completion(fresh, "RM-2026-00001")
+    malformed = roadmap_store.reconcile_wave_completion(repo, "../escape")
+
+    assert (locked["state"], locked["reason"]) == (
+        "unknown", "task_store_unavailable:RuntimeError"
+    )
+    assert (ghost["state"], ghost["reason"]) == ("unknown", "roadmap_not_found")
+    assert (no_store["state"], no_store["reason"]) == ("unknown", "roadmap_not_found")
+    assert (malformed["state"], malformed["reason"]) == ("unknown", "malformed_roadmap_id")
+    assert _roadmap_state(repo) == before
+    assert not (fresh / ".aiworkhub").exists()
+
+
+def test_active_wave_ids_is_bounded_and_read_only(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    fresh = tmp_path / "fresh"
+    fresh.mkdir()
+    first = _mapped_wave(repo)
+    plain = _add(repo, "Plain")
+    roadmap_store.transition_item(repo, plain["id"], "approved", reason="planned")
+    roadmap_store.transition_item(repo, plain["id"], "in_progress", reason="started")
+    _add(repo, "Planned wave", provenance={"wave_goals": _mapped_goals()})
+    second = _mapped_wave(repo)
+    before = _roadmap_state(repo)
+
+    assert roadmap_store.active_wave_ids(repo) == {
+        "wave_ids": [first["id"], second["id"]], "truncated": False,
+    }
+    assert roadmap_store.active_wave_ids(repo, limit=1) == {
+        "wave_ids": [first["id"]], "truncated": True,
+    }
+    assert roadmap_store.active_wave_ids(fresh) == {"wave_ids": [], "truncated": False}
+    assert not (fresh / ".aiworkhub").exists()
+    assert _roadmap_state(repo) == before
+
+
+def _canonically_accept(repo: Path, task_id: str) -> dict:
+    """Drive one review-ready card through the REAL ``task_engine.accept_review``."""
+    from aiworkhub import task_engine
+
+    request_id = f"req-{task_id}"
+    promoted = f"{task_id}.txt"
+    (repo / promoted).write_bytes(b"accepted\n")
+    hashes = {promoted: hashlib.sha256(b"accepted\n").hexdigest()}
+    manifest = {"schema_id": "aiworkhub.attempt_artifact_manifest.v1", "entries": []}
+    card = {
+        "task_id": task_id,
+        "runner": "worker",
+        "topic": "wave",
+        "claim_epoch": 1,
+        "terminal_review": {
+            "substatus": "review_ready",
+            "evidence": {
+                "request_identity": {"request_id": request_id},
+                "changed_paths": [promoted],
+                "changed_path_hashes": hashes,
+                "attempt_artifact_manifest": manifest,
+                "workspace": {"base_oid": "base-oid"},
+            },
+        },
+    }
+    now = "2026-09-21T00:00:00+00:00"
+    _readiness, db_path = task_store._require_ready(repo)
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO tasks(task_id, runner, topic, status, worker_status, priority, "
+            "objective, card_json, created_at, updated_at, claimed_by, claimed_at, "
+            "started_at, origin_thread_id) "
+            "VALUES (?, 'worker', 'wave', 'review', 'review', '', '', ?, ?, ?, 'worker', ?, ?, '')",
+            (task_id, json.dumps(card), now, now, now, now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    unsigned = {
+        "schema_id": task_engine.ACCEPTED_OUTCOME_RECEIPT_SCHEMA,
+        "task_id": task_id,
+        "request_id": request_id,
+        "claim_epoch": 1,
+        "base_oid": "base-oid",
+        "promoted_paths": [promoted],
+        "changed_path_hashes": hashes,
+        "attempt_artifact_manifest_id": task_engine._canonical_json_hash(manifest),
+        "repository_revision": "sha256:"
+        + task_engine._canonical_json_hash({"base_oid": "base-oid", "changed_path_hashes": hashes}),
+    }
+    receipt = {**unsigned, "receipt_id": "sha256:" + task_engine._canonical_json_hash(unsigned)}
+    accepted = task_engine.accept_review(
+        repo,
+        task_id,
+        runner="worker",
+        topic="wave",
+        request_id=request_id,
+        evidence={"promoted_paths": [promoted]},
+        accepted_outcome_receipt=receipt,
+    )
+    assert accepted["ok"] is True, accepted
+    return receipt
+
+
+def test_the_real_accept_transaction_is_the_evidence_that_completes_a_wave(
+    tmp_path: Path,
+) -> None:
+    # No stand-in store: the cards are the bytes the canonical accept wrote.
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    task_store.initialize_repository(repo)
+    wave = _mapped_wave(repo)
+    receipt = _canonically_accept(repo, "LSP_V2")
+
+    # One goal accepted, the other goal's exact task not in the store at all.
+    partial = roadmap_store.reconcile_wave_completion(repo, wave["id"])
+    assert (partial["state"], partial["reason"]) == ("unknown", "task_evidence_unresolved")
+    assert partial["task_ids"] == ["DOCS_V1"]
+    assert roadmap_store.get_item(repo, wave["id"])["status"] == "in_progress"
+
+    receipts = {"LSP_V2": receipt, "DOCS_V1": _canonically_accept(repo, "DOCS_V1")}
+    completed = roadmap_store.reconcile_wave_completion(repo, wave["id"])
+
+    assert (completed["state"], completed["wave"]["status"]) == ("completed", "completed")
+    [completion] = _completions(repo, wave["id"])
+    assert [goal["accepted"] for goal in completion["evidence"]["goals"]] == [
+        {
+            task_id: {"request_id": f"req-{task_id}", "receipt_id": receipts[task_id]["receipt_id"]}
+        }
+        for task_id in ("LSP_V2", "DOCS_V1")
+    ]

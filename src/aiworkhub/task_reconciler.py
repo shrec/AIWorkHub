@@ -45,6 +45,7 @@ from . import core
 from . import process_launcher
 from . import review_lifecycle
 from . import review_orchestrator
+from . import roadmap_store
 from .platform_io import (
     DIRECTORY_DESCRIPTOR_BACKEND_NONE,
     chmod_fd,
@@ -518,6 +519,8 @@ def run_scan(
     # Bounded to cards whose durable exact binding has no verdict yet; a pass
     # with nothing pending reads one index range and writes nothing.
     wave_goal_bindings = _scan_wave_goal_bindings(Path(mgr.repo).resolve())
+    # After binding repair, so completion is decided on current goal pointers.
+    wave_completion = _scan_wave_completion(Path(mgr.repo).resolve())
     return {
         "ok": True,
         "scanned_at": _utcnow(),
@@ -527,6 +530,7 @@ def run_scan(
         **result,
         "review_recovery": review_recovery,
         "wave_goal_bindings": wave_goal_bindings,
+        "wave_completion": wave_completion,
     }
 
 
@@ -716,49 +720,98 @@ def _scan_review_ready_recovery(manager: Any) -> dict[str, Any]:
 WAVE_GOAL_BINDING_REPAIR_LIMIT = 16
 
 
-def _scan_wave_goal_bindings(repo: Path) -> dict[str, Any]:
-    """Converge only cards whose durable exact wave-goal binding has no verdict.
+def _write_gated_repair(
+    candidates: Any,
+    repair: Any,
+    *,
+    id_key: str,
+    count_key: str,
+    failure_state: str,
+) -> dict[str, Any]:
+    """One bounded, write-gated Roadmap repair pass; the single owner of its shape.
 
-    Candidates come from ``core.pending_wave_goal_bindings``, an index-bounded
-    read of unresolved binding events, so no unrelated historical card is ever
-    loaded. Nothing is written unless ``AIWORKHUB_ALLOW_WRITES=1``: with writes
-    disabled the pending cards are reported and left untouched. A repeated or
-    concurrent pass converges on the Roadmap's ``already_applied`` and adds no
-    second event.
+    ``candidates()`` is a bounded read returning ``{"<id_key>s": [...],
+    "truncated": bool}``; ``repair(id)`` decides one candidate. Nothing is
+    repaired unless ``AIWORKHUB_ALLOW_WRITES=1``: with writes disabled the
+    candidates are reported and left untouched. A failure to list skips the
+    pass and a failure on one candidate is recorded as ``failure_state``, so
+    neither ever blocks worker reconcile or the other candidates.
     """
 
     try:
-        pending = core.pending_wave_goal_bindings(
-            repo, limit=WAVE_GOAL_BINDING_REPAIR_LIMIT
-        )
+        found = candidates()
     except Exception as exc:  # noqa: BLE001 -- never block worker reconcile
-        return {"state": "skipped", "reason": f"{type(exc).__name__}"[:80], "pending": 0}
-    task_ids = [str(task_id) for task_id in pending.get("task_ids") or []]
+        return {"state": "skipped", "reason": f"{type(exc).__name__}"[:80], count_key: 0}
+    ids = [str(value) for value in found.get(f"{id_key}s") or []]
     receipt: dict[str, Any] = {
-        "pending": len(task_ids),
-        "truncated": bool(pending.get("truncated")),
+        count_key: len(ids),
+        "truncated": bool(found.get("truncated")),
     }
-    if not task_ids:
+    if not ids:
         return {"state": "skipped", "reason": "no_work", **receipt}
     if not core.writes_allowed():
         return {
             "state": "skipped",
             "reason": "writes_disabled",
             **receipt,
-            "task_ids": task_ids,
+            f"{id_key}s": ids,
         }
     outcomes: list[dict[str, str]] = []
-    for task_id in task_ids:
+    for value in ids:
         try:
-            outcome = core.apply_wave_goal_binding(repo, task_id)
-        except Exception as exc:  # noqa: BLE001 -- one card never blocks the rest
-            outcome = {"state": "pending", "reason": f"{type(exc).__name__}"[:80]}
+            outcome = repair(value)
+        except Exception as exc:  # noqa: BLE001 -- one candidate never blocks the rest
+            outcome = {"state": failure_state, "reason": f"{type(exc).__name__}"[:80]}
         outcomes.append({
-            "task_id": task_id,
+            id_key: value,
             "state": str(outcome.get("state") or ""),
             "reason": str(outcome.get("reason") or ""),
         })
     return {"state": "ok", **receipt, "outcomes": outcomes}
+
+
+def _scan_wave_goal_bindings(repo: Path) -> dict[str, Any]:
+    """Converge only cards whose durable exact wave-goal binding has no verdict.
+
+    Candidates come from ``core.pending_wave_goal_bindings``, an index-bounded
+    read of unresolved binding events, so no unrelated historical card is ever
+    loaded. A repeated or concurrent pass converges on the Roadmap's
+    ``already_applied`` and adds no second event.
+    """
+
+    return _write_gated_repair(
+        lambda: core.pending_wave_goal_bindings(
+            repo, limit=WAVE_GOAL_BINDING_REPAIR_LIMIT
+        ),
+        lambda task_id: core.apply_wave_goal_binding(repo, task_id),
+        id_key="task_id",
+        count_key="pending",
+        failure_state="pending",
+    )
+
+
+# Only in-progress outcomes that declare wave goals are candidates; normally
+# exactly one is active, so the bound is headroom rather than throughput.
+WAVE_COMPLETION_SCAN_LIMIT = 8
+
+
+def _scan_wave_completion(repo: Path) -> dict[str, Any]:
+    """Close active waves whose every mapped goal has accepted exact evidence.
+
+    Candidates come from ``roadmap_store.active_wave_ids``, a read-only bounded
+    read that never creates a Roadmap store. Each verdict is
+    ``roadmap_store.reconcile_wave_completion``: pending or unknown evidence
+    leaves the wave in progress, and a repeated or concurrent pass finds a
+    completed wave no longer active and writes no second event.
+    """
+
+    return _write_gated_repair(
+        lambda: roadmap_store.active_wave_ids(repo, limit=WAVE_COMPLETION_SCAN_LIMIT),
+        lambda wave_id: roadmap_store.reconcile_wave_completion(repo, wave_id),
+        id_key="wave_id",
+        count_key="active",
+        failure_state="unknown",
+    )
 
 
 class ReconcilerService:

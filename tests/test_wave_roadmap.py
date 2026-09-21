@@ -557,3 +557,285 @@ def test_snapshot_adapter_reads_items_and_the_truncated_flag() -> None:
     assert empty["selection_reason"] == wave_roadmap.REASON_NO_ACTIVE_WAVE
     malformed = wave_roadmap.project_snapshot_wave({"items": {"a": 1}}, "0.11.53")
     assert malformed["selection_reason"] == wave_roadmap.REASON_MALFORMED_ROW
+
+
+# --- Evidence-gated completion verdict ---------------------------------------
+
+verdict = wave_roadmap.wave_completion_verdict
+_ALL_TASKS = ("LSP_V2", "DOCS_V1", "DOCS_V2")
+
+
+def _accepted_card(task_id: str) -> dict[str, Any]:
+    request_id = f"req-{task_id}"
+    # The identity fields ``task_engine.accept_review`` seals into its receipt.
+    receipt = {
+        "schema_id": "aiworkhub.accepted_outcome_receipt.v1",
+        "receipt_id": "sha256:" + "a" * 64,
+        "task_id": task_id,
+        "request_id": request_id,
+    }
+    return {
+        "task_id": task_id,
+        "status": "finished",
+        "accepted_request_id": request_id,
+        "accepted_by": "codex",
+        "accepted_at": "2026-09-21T00:00:00+00:00",
+        "accept_evidence": {"accepted_outcome_receipt": receipt},
+    }
+
+
+def _mapped_goal(goal_id: str, indices: Any, *task_ids: str) -> dict[str, Any]:
+    return {**_goal(goal_id, *task_ids), "acceptance_indices": indices}
+
+
+def _mapped_wave(
+    goals: Any = None,
+    *,
+    acceptance: Any = ("LSP integrated", "Docs published"),
+    status: str = "in_progress",
+    milestone: Any = "0.11.51",
+) -> dict[str, Any]:
+    if goals is None:
+        goals = [
+            _mapped_goal("lsp", [1], "LSP_V2"),
+            _mapped_goal("docs", [2], "DOCS_V1", "DOCS_V2"),
+        ]
+    return {
+        "id": "RM-2026-00066",
+        "status": status,
+        "milestone": milestone,
+        "acceptance": list(acceptance) if isinstance(acceptance, tuple) else acceptance,
+        "provenance": {"wave_goals": goals},
+    }
+
+
+def _evidence(default: str = wave_roadmap.TASK_ACCEPTED, **overrides: str) -> dict[str, str]:
+    return {**{task_id: default for task_id in _ALL_TASKS}, **overrides}
+
+
+def _with_receipt(**overrides: Any) -> dict[str, Any]:
+    card = _accepted_card("T")
+    receipt = {**card["accept_evidence"]["accepted_outcome_receipt"], **overrides}
+    return {**card, "accept_evidence": {"accepted_outcome_receipt": receipt}}
+
+
+@pytest.mark.parametrize(
+    ("card", "status", "expected"),
+    [
+        (_accepted_card("T"), "finished", "accepted"),
+        (None, None, "missing"),
+        ("T", None, "missing"),
+        (_accepted_card("OTHER"), "finished", "ambiguous"),
+        (_accepted_card("T"), "archived", "archived"),
+        (_accepted_card("T"), "blocked", "blocked"),
+        (_accepted_card("T"), "superseded", "superseded"),
+        (_accepted_card("T"), "pending", "unfinished"),
+        (_accepted_card("T"), "processing", "unfinished"),
+        (_accepted_card("T"), "review", "unfinished"),
+        # A status no canonical lifecycle produces is not work in flight.
+        (_accepted_card("T"), "odd", "ambiguous"),
+        (_accepted_card("T"), None, "ambiguous"),
+        ({"task_id": "T", "status": "finished"}, "finished", "unverified"),
+        ({**_accepted_card("T"), "accept_evidence": {}}, "finished", "unverified"),
+        ({**_accepted_card("T"), "accept_evidence": "yes"}, "finished", "unverified"),
+        (
+            {**_accepted_card("T"), "accept_evidence": {"accepted_outcome_receipt": {}}},
+            "finished",
+            "unverified",
+        ),
+        ({**_accepted_card("T"), "accepted_by": "  "}, "finished", "unverified"),
+        ({**_accepted_card("T"), "accepted_at": None}, "finished", "unverified"),
+        ({**_accepted_card("T"), "accepted_request_id": ""}, "finished", "unverified"),
+        # The receipt must be this card's own: same task, same accepting request.
+        (_with_receipt(task_id="OTHER"), "finished", "unverified"),
+        (_with_receipt(request_id="req-OTHER"), "finished", "unverified"),
+        ({**_accepted_card("T"), "accepted_request_id": "req-OTHER"}, "finished", "unverified"),
+        (_with_receipt(schema_id="aiworkhub.other_receipt.v1"), "finished", "unverified"),
+        (_with_receipt(receipt_id="a" * 64), "finished", "unverified"),
+        (_with_receipt(receipt_id="sha256:" + "A" * 64), "finished", "unverified"),
+        (_with_receipt(receipt_id=None), "finished", "unverified"),
+    ],
+)
+def test_only_a_finished_card_with_its_verifier_receipt_is_accepted(
+    card: Any, status: Any, expected: str
+) -> None:
+    assert wave_roadmap.task_evidence("T", card, status) == expected
+
+
+def test_the_receipt_identity_is_bound_to_the_exact_task_and_accepting_request() -> None:
+    card = _accepted_card("T")
+    before = copy.deepcopy(card)
+
+    assert wave_roadmap.accepted_receipt("T", card) == {
+        "request_id": "req-T",
+        "receipt_id": "sha256:" + "a" * 64,
+    }
+    # The same card read as another task's evidence verifies nothing.
+    assert wave_roadmap.accepted_receipt("U", card) is None
+    assert wave_roadmap.accepted_receipt("T", None) is None
+    overlong = "r" * 129
+    assert wave_roadmap.accepted_receipt(
+        "T", {**_with_receipt(request_id=overlong), "accepted_request_id": overlong}
+    ) is None
+    assert card == before
+
+
+def test_every_mapped_goal_accepted_completes_the_wave() -> None:
+    wave = _mapped_wave()
+    before = copy.deepcopy(wave)
+
+    result = verdict(wave, _evidence())
+
+    assert result["state"] == wave_roadmap.COMPLETION_COMPLETED
+    assert result["reason"] == "all_mapped_goals_accepted"
+    assert result["criteria"] == 2
+    assert result["task_ids"] == []
+    assert result["goals"] == [
+        {
+            "id": "lsp",
+            "acceptance_indices": [1],
+            "tasks": [{"task_id": "LSP_V2", "evidence": "accepted"}],
+        },
+        {
+            "id": "docs",
+            "acceptance_indices": [2],
+            "tasks": [
+                {"task_id": "DOCS_V1", "evidence": "accepted"},
+                {"task_id": "DOCS_V2", "evidence": "accepted"},
+            ],
+        },
+    ]
+    assert wave == before
+    assert json.loads(json.dumps(result)) == result
+
+
+@pytest.mark.parametrize(
+    ("wave", "reason"),
+    [
+        (_mapped_wave([]), "goals_missing"),
+        ({**_mapped_wave(), "provenance": {}}, "goals_missing"),
+        ({**_mapped_wave(), "provenance": None}, "goals_missing"),
+        (_mapped_wave(acceptance=()), "acceptance_missing"),
+        (_mapped_wave(acceptance=None), "acceptance_missing"),
+        (_mapped_wave(acceptance=("A", " ")), "acceptance_missing"),
+        # A criterion no goal claims: the wave cannot complete.
+        (_mapped_wave([_mapped_goal("lsp", [1], *_ALL_TASKS)]), "acceptance_unmapped"),
+        (
+            _mapped_wave(acceptance=("A", "B", "C")),
+            "acceptance_unmapped",
+        ),
+        (_mapped_wave([_mapped_goal("lsp", [1, 3], *_ALL_TASKS)]), "acceptance_index_invalid"),
+        (_mapped_wave([_mapped_goal("lsp", [0, 1, 2], *_ALL_TASKS)]), "acceptance_index_invalid"),
+        (_mapped_wave([_mapped_goal("lsp", [-1, 1, 2], *_ALL_TASKS)]), "acceptance_index_invalid"),
+        (_mapped_wave([_mapped_goal("lsp", [True, 2], *_ALL_TASKS)]), "goals_malformed"),
+        (_mapped_wave([_mapped_goal("lsp", ["1", 2], *_ALL_TASKS)]), "goals_malformed"),
+        (_mapped_wave([_mapped_goal("lsp", [1, 1, 2], *_ALL_TASKS)]), "goals_malformed"),
+        (_mapped_wave([_mapped_goal("lsp", [1.0, 2], *_ALL_TASKS)]), "goals_malformed"),
+        (
+            _mapped_wave([_goal("lsp", *_ALL_TASKS)]),
+            "acceptance_unmapped_goal",
+        ),
+        (
+            _mapped_wave([_mapped_goal("lsp", [1, 2], "LSP_V2"), _mapped_goal("docs", [], "DOCS_V1")]),
+            "acceptance_unmapped_goal",
+        ),
+        (_mapped_wave([_mapped_goal("lsp", [1, 2])]), "goals_malformed"),
+        (_mapped_wave([_mapped_goal("lsp", [1, 2], "LSP_V2", "LSP_V2")]), "goals_malformed"),
+        (_mapped_wave([_mapped_goal("lsp", [1, 2], "LSP_V2 ")]), "goals_malformed"),
+        (_mapped_wave([{**_mapped_goal("lsp", [1, 2]), "task_ids": "LSP_V2"}]), "goals_malformed"),
+        (
+            _mapped_wave([_mapped_goal("lsp", [1], "LSP_V2"), _mapped_goal("lsp", [2], "DOCS_V1")]),
+            "goals_malformed",
+        ),
+        (_mapped_wave([None]), "goals_malformed"),
+        (
+            _mapped_wave(
+                [_mapped_goal(f"g{index}", [1, 2], "LSP_V2") for index in range(wave_roadmap.MAX_GOALS + 1)]
+            ),
+            "goals_malformed",
+        ),
+    ],
+)
+def test_missing_or_ambiguous_criterion_mapping_is_unknown_even_with_accepted_tasks(
+    wave: dict[str, Any], reason: str
+) -> None:
+    result = verdict(wave, _evidence())
+
+    assert result["state"] == wave_roadmap.COMPLETION_UNKNOWN
+    assert result["reason"] == reason
+    assert result["goals"] == []
+
+
+@pytest.mark.parametrize(
+    "unresolved", ["missing", "ambiguous", "archived", "blocked", "superseded", "unverified", "odd"]
+)
+def test_unresolved_task_evidence_is_unknown_and_outranks_pending_work(unresolved: str) -> None:
+    alone = verdict(_mapped_wave(), _evidence(DOCS_V2=unresolved))
+    beside_pending = verdict(
+        _mapped_wave(), _evidence(DOCS_V2=unresolved, LSP_V2=wave_roadmap.TASK_UNFINISHED)
+    )
+
+    for result in (alone, beside_pending):
+        assert result["state"] == wave_roadmap.COMPLETION_UNKNOWN
+        assert result["reason"] == "task_evidence_unresolved"
+        assert result["task_ids"] == ["DOCS_V2"]
+
+
+def test_absent_evidence_for_a_current_task_is_unknown() -> None:
+    evidence = _evidence()
+    del evidence["LSP_V2"]
+
+    result = verdict(_mapped_wave(), evidence)
+
+    assert (result["state"], result["task_ids"]) == ("unknown", ["LSP_V2"])
+    assert result["goals"][0]["tasks"] == [{"task_id": "LSP_V2", "evidence": "missing"}]
+
+
+def test_unfinished_exact_task_leaves_the_wave_pending_evidence() -> None:
+    result = verdict(_mapped_wave(), _evidence(DOCS_V1=wave_roadmap.TASK_UNFINISHED))
+
+    assert result["state"] == wave_roadmap.COMPLETION_PENDING
+    assert result["reason"] == "task_evidence_pending"
+    assert result["task_ids"] == ["DOCS_V1"]
+
+
+@pytest.mark.parametrize(
+    ("status", "state", "reason"),
+    [
+        ("completed", "completed", "already_completed"),
+        ("proposed", "unknown", "wave_not_active"),
+        ("approved", "unknown", "wave_not_active"),
+        ("blocked", "unknown", "wave_not_active"),
+        ("archived", "unknown", "wave_not_active"),
+        (None, "unknown", "wave_not_active"),
+    ],
+)
+def test_only_an_in_progress_wave_can_be_decided(status: Any, state: str, reason: str) -> None:
+    result = verdict(_mapped_wave(status=status), _evidence())
+
+    assert (result["state"], result["reason"]) == (state, reason)
+
+
+@pytest.mark.parametrize("milestone", ["0.11.51", "0.11.53", "9.0.0", "soon", None])
+def test_a_release_version_never_decides_completion(milestone: Any) -> None:
+    import inspect
+
+    assert list(inspect.signature(verdict).parameters) == ["wave", "evidence"]
+    pending = verdict(
+        _mapped_wave(milestone=milestone), _evidence(default=wave_roadmap.TASK_UNFINISHED)
+    )
+    accepted = verdict(_mapped_wave(milestone=milestone), _evidence())
+
+    assert pending["state"] == wave_roadmap.COMPLETION_PENDING
+    assert accepted["state"] == wave_roadmap.COMPLETION_COMPLETED
+
+
+def test_a_completed_wave_is_no_longer_selected_as_active() -> None:
+    finished = _wave(
+        "RM-2026-00066", "0.11.51", [_goal("a", "T")], [_task("T", "finished")], status="completed"
+    )
+
+    result = project([finished], "0.11.53")
+
+    assert result["state"] == "UNKNOWN"
+    assert result["selection_reason"] == wave_roadmap.REASON_NO_ACTIVE_WAVE

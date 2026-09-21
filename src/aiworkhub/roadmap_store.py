@@ -8,6 +8,7 @@ worker or mutates task lifecycle.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
@@ -365,13 +366,30 @@ def count_items_by_status(
         conn.close()
 
 
+def item_revision(item: Mapping[str, Any]) -> str:
+    """Digest of the Roadmap fields a completion verdict was decided from."""
+    payload = {
+        key: item.get(key) for key in ("id", "status", "acceptance", "provenance")
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
 def transition_item(
     repo_root: str | Path,
     roadmap_id: str,
     target_status: str,
     *,
     reason: str,
+    expected_revision: str | None = None,
+    evidence: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
+    """Transition one item atomically; an already-reached target writes nothing.
+
+    ``expected_revision`` refuses the move when the item's goals, acceptance or
+    status changed after the caller decided it (see :func:`item_revision`).
+    ``evidence`` is recorded in the same durable ``transitioned`` event.
+    """
     reason = str(reason or "").strip()
     if not reason or len(reason.encode()) > 4000:
         raise RoadmapValidationError("bounded transition reason is required")
@@ -384,6 +402,8 @@ def transition_item(
         if current["status"] == target_status:
             conn.commit()
             return current
+        if expected_revision is not None and item_revision(current) != expected_revision:
+            raise RoadmapConflictError("roadmap_revision_changed")
         allowed = VALID_TRANSITIONS[current["status"]]
         if target_status not in allowed:
             raise RoadmapConflictError(
@@ -416,12 +436,12 @@ def transition_item(
         )
         if cursor.rowcount != 1:
             raise RoadmapConflictError("roadmap transition lost atomic status race")
-        _event(
-            conn,
-            roadmap_id,
-            "transitioned",
-            {"from": current["status"], "to": target_status, "reason": reason},
-        )
+        detail: dict[str, Any] = {
+            "from": current["status"], "to": target_status, "reason": reason,
+        }
+        if evidence is not None:
+            detail["evidence"] = dict(evidence)
+        _event(conn, roadmap_id, "transitioned", detail)
         result = get_item(repo_root, roadmap_id, _connection=conn)
         conn.commit()
         return result
@@ -684,6 +704,128 @@ def bind_goal_successor(
         raise
     finally:
         conn.close()
+
+
+# --- Evidence-gated automatic wave completion --------------------------------
+#
+# The verdict is ``wave_roadmap.wave_completion_verdict`` (pure). This store
+# only gathers each exact current task's canonical evidence and, for a
+# ``completed`` verdict, performs the one guarded transition. No installed or
+# released version is consulted anywhere on this path.
+
+WAVE_COMPLETION_EVIDENCE_SCHEMA = "aiworkhub.wave_completion_evidence.v1"
+_ACTIVE_WAVE_SQL = (
+    "SELECT id FROM roadmap_items WHERE status='in_progress' AND "
+    "CASE WHEN json_valid(provenance_json) THEN "
+    "json_type(provenance_json, '$.wave_goals') IS NOT NULL ELSE 0 END "
+    "ORDER BY id LIMIT ?"
+)
+
+
+def active_wave_ids(repo_root: str | Path, *, limit: int = 8) -> dict[str, Any]:
+    """Bounded ids of in-progress outcomes declaring wave goals; read-only.
+
+    A repository without a Roadmap store has no waves, and this read never
+    creates one.
+    """
+    path = _db_path(repo_root)
+    if not path.is_file():
+        return {"wave_ids": [], "truncated": False}
+    bound = max(1, min(int(limit), MAX_LIST_LIMIT))
+    conn = sqlite_readonly.connect_readonly(path)
+    try:
+        rows = conn.execute(_ACTIVE_WAVE_SQL, (bound + 1,)).fetchall()
+    finally:
+        conn.close()
+    ids = [str(row[0]) for row in rows]
+    return {"wave_ids": ids[:bound], "truncated": len(ids) > bound}
+
+
+def _unknown_completion(wave_id: object, reason: str) -> dict[str, Any]:
+    return {
+        "wave_id": str(wave_id or "")[:32],
+        "criteria": 0,
+        "goals": [],
+        "task_ids": [],
+        "state": "unknown",
+        "reason": reason,
+    }
+
+
+def reconcile_wave_completion(repo_root: str | Path, wave_id: str) -> dict[str, Any]:
+    """Complete one wave only from mapped, canonically accepted exact evidence.
+
+    Returns the verdict -- ``completed``, ``pending_evidence`` or ``unknown``
+    with a typed reason. Only a ``completed`` verdict on an in-progress wave
+    writes, through one ``transition_item`` guarded by the revision the verdict
+    was decided from, so a goal rebound or a criterion edited meanwhile refuses
+    the move. A repeated or concurrent call finds the wave already completed
+    and writes no second event.
+    """
+
+    from . import task_store, wave_roadmap
+
+    if not ROADMAP_ID_RE.fullmatch(str(wave_id or "")):
+        return _unknown_completion(wave_id, "malformed_roadmap_id")
+    if not _db_path(repo_root).is_file():
+        return _unknown_completion(wave_id, "roadmap_not_found")
+    try:
+        wave = get_item(repo_root, wave_id)
+    except RoadmapNotFoundError:
+        return _unknown_completion(wave_id, "roadmap_not_found")
+    goals, _reason = wave_roadmap.completion_goals(wave)
+    evidence: dict[str, str] = {}
+    receipts: dict[str, dict[str, str]] = {}
+    task_ids = dict.fromkeys(task_id for goal in goals for task_id in goal["task_ids"])
+    for task_id in task_ids if wave["status"] == "in_progress" else ():
+        try:
+            card = task_store.get_task(repo_root, task_id)
+        except Exception as exc:  # noqa: BLE001 -- an unreadable store is never acceptance
+            return _unknown_completion(
+                wave_id, f"task_store_unavailable:{type(exc).__name__}"[:80]
+            )
+        status = task_store.canonical_status(card) if isinstance(card, Mapping) else None
+        evidence[task_id] = wave_roadmap.task_evidence(task_id, card, status)
+        receipt = wave_roadmap.accepted_receipt(task_id, card)
+        if evidence[task_id] == wave_roadmap.TASK_ACCEPTED and receipt is not None:
+            receipts[task_id] = receipt
+    verdict = wave_roadmap.wave_completion_verdict(wave, evidence)
+    if (
+        verdict["state"] != wave_roadmap.COMPLETION_COMPLETED
+        or wave["status"] != "in_progress"
+    ):
+        return verdict
+    record = {
+        "schema_id": WAVE_COMPLETION_EVIDENCE_SCHEMA,
+        "criteria": verdict["criteria"],
+        "goals": [
+            {
+                "id": goal["id"],
+                "acceptance_indices": goal["acceptance_indices"],
+                "accepted": {
+                    task["task_id"]: receipts[task["task_id"]] for task in goal["tasks"]
+                },
+            }
+            for goal in verdict["goals"]
+        ],
+    }
+    reason = (
+        f"wave evidence complete: {verdict['criteria']} acceptance criteria mapped to "
+        f"{len(verdict['goals'])} goals; {len(receipts)} exact tasks accepted "
+        "with verifier receipts"
+    )
+    try:
+        completed = transition_item(
+            repo_root,
+            wave_id,
+            "completed",
+            reason=reason,
+            expected_revision=item_revision(wave),
+            evidence=record,
+        )
+    except RoadmapConflictError as exc:
+        return {**verdict, "state": "unknown", "reason": f"transition_refused:{exc}"[:200]}
+    return {**verdict, "wave": completed}
 
 
 def list_events(

@@ -681,3 +681,122 @@ def test_a_pending_marker_without_a_card_binding_is_refused_once(monkeypatch, tm
     }]
     assert second["reason"] == "no_work"
     assert not (root / ".aiworkhub" / "tasking" / "roadmap.sqlite").exists()
+
+
+# --- Evidence-gated wave completion -----------------------------------------
+
+
+def test_run_scan_reports_the_completion_pass_without_creating_a_roadmap(
+    monkeypatch, tmp_path
+):
+    mgr = _Mgr(tmp_path)
+    monkeypatch.setattr(
+        task_reconciler.review_orchestrator, "canonical_review_db", lambda _mgr: None
+    )
+
+    result = task_reconciler.run_scan(mgr, include_gc=False)
+
+    assert result["finalized"] == 3
+    assert result["wave_completion"] == {
+        "state": "skipped", "reason": "no_work", "active": 0, "truncated": False,
+    }
+    assert not (tmp_path / ".aiworkhub" / "tasking" / "roadmap.sqlite").exists()
+
+
+def test_completion_pass_honours_the_write_gate_and_isolates_failures(
+    monkeypatch, tmp_path
+):
+    decided: list[str] = []
+
+    def active(repo, *, limit):
+        assert limit == task_reconciler.WAVE_COMPLETION_SCAN_LIMIT
+        return {"wave_ids": ["RM-2026-00001", "RM-2026-00002"], "truncated": False}
+
+    def reconcile(repo, wave_id):
+        decided.append(wave_id)
+        if wave_id == "RM-2026-00001":
+            raise RuntimeError("roadmap locked")
+        return {"state": "pending_evidence", "reason": "task_evidence_pending"}
+
+    monkeypatch.setattr(task_reconciler.roadmap_store, "active_wave_ids", active)
+    monkeypatch.setattr(task_reconciler.roadmap_store, "reconcile_wave_completion", reconcile)
+    monkeypatch.setattr(task_reconciler.core, "writes_allowed", lambda: False)
+
+    blocked = task_reconciler._scan_wave_completion(tmp_path)
+
+    assert blocked == {
+        "state": "skipped",
+        "reason": "writes_disabled",
+        "active": 2,
+        "truncated": False,
+        "wave_ids": ["RM-2026-00001", "RM-2026-00002"],
+    }
+    assert decided == []
+
+    monkeypatch.setattr(task_reconciler.core, "writes_allowed", lambda: True)
+    scanned = task_reconciler._scan_wave_completion(tmp_path)
+
+    assert scanned["outcomes"] == [
+        {"wave_id": "RM-2026-00001", "state": "unknown", "reason": "RuntimeError"},
+        {
+            "wave_id": "RM-2026-00002",
+            "state": "pending_evidence",
+            "reason": "task_evidence_pending",
+        },
+    ]
+
+
+def test_completion_pass_closes_an_accepted_wave_once_under_the_write_gate(
+    monkeypatch, tmp_path
+):
+    root = tmp_path / "repo"
+    root.mkdir()
+    wave = roadmap_store.add_item(
+        root,
+        title="Wave",
+        outcome="Deliver the wave",
+        milestone="0.11.51",
+        acceptance=["LSP index integrated"],
+        provenance={"wave_goals": [
+            {"id": "lsp", "label": "LSP", "task_ids": ["V2"], "acceptance_indices": [1]},
+        ]},
+    )
+    roadmap_store.transition_item(root, wave["id"], "approved", reason="planned")
+    roadmap_store.transition_item(root, wave["id"], "in_progress", reason="started")
+    cards = {
+        "V2": {
+            "task_id": "V2",
+            "status": "finished",
+            "accepted_request_id": "req-v2",
+            "accepted_by": "codex",
+            "accepted_at": _CREATED_AT,
+            "accept_evidence": {"accepted_outcome_receipt": {
+                "schema_id": "aiworkhub.accepted_outcome_receipt.v1",
+                "receipt_id": "sha256:" + "b" * 64,
+                "task_id": "V2",
+                "request_id": "req-v2",
+            }},
+        },
+    }
+    monkeypatch.setattr(task_store, "get_task", lambda _root, task_id: cards.get(task_id))
+
+    monkeypatch.delenv("AIWORKHUB_ALLOW_WRITES", raising=False)
+    gated = task_reconciler._scan_wave_completion(root)
+    assert (gated["reason"], gated["wave_ids"]) == ("writes_disabled", [wave["id"]])
+    assert roadmap_store.get_item(root, wave["id"])["status"] == "in_progress"
+
+    monkeypatch.setenv("AIWORKHUB_ALLOW_WRITES", "1")
+    closed = task_reconciler._scan_wave_completion(root)
+    rescanned = task_reconciler._scan_wave_completion(root)
+
+    assert closed["outcomes"] == [
+        {"wave_id": wave["id"], "state": "completed", "reason": "all_mapped_goals_accepted"}
+    ]
+    assert rescanned["reason"] == "no_work"
+    final = roadmap_store.get_item(root, wave["id"])
+    assert (final["status"], final["milestone"]) == ("completed", "0.11.51")
+    assert [
+        event["detail"]["to"]
+        for event in roadmap_store.list_events(root, wave["id"])
+        if event["event"] == "transitioned"
+    ].count("completed") == 1
