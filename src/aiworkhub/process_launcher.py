@@ -155,6 +155,7 @@ from .quality_review_receipt import (
     _verified_quality_review_receipt,
 )
 from . import quality_reviewer
+from . import reviewer_prewarm_capacity
 from . import reviewer_reservation_recovery
 from . import terminal_authority
 from . import vscode_lm_bridge
@@ -7191,11 +7192,11 @@ class ProcessManager:
     # its own bounded owner.  A launch that outlives the ceiling with no live
     # owned Source Graph prewarm (e.g. a stalled MCP callback) is truthfully
     # terminalized as a pid-null ``quality_review_launch_timeout``.  A live
-    # owned ``reviewer_source_graph_prewarm`` keeps extending the owner ceiling
-    # so it is never expired by elapsed time; the stale owner becomes
-    # ownership-aware and aborts before spawning, so no provider is ever
-    # time-limited or killed by elapsed time.  Liveness of a real provider still
-    # follows exact process evidence only.
+    # owned ``reviewer_source_graph_prewarm`` extends the owner ceiling only
+    # until it outlives ``preparation_stall_seconds`` (NF-2026-00027); the stale
+    # owner becomes ownership-aware and aborts before spawning, so no provider
+    # is ever time-limited or killed by elapsed time.  Liveness of a real
+    # provider still follows exact process evidence only.
     _QUALITY_REVIEW_LAUNCH_OWNER_SECONDS = 300.0
     # The source-evidence budget is sized from the measured change rather than
     # a fixed excerpt.  2026-09-08 reviewer audit over 38 surviving packets:
@@ -8797,15 +8798,17 @@ class ProcessManager:
         """True when one event is a live, exact-owned Source Graph prewarm.
 
         A prewarm is live only when its reservation is still ``starting``, its
-        latest preparation phase is the started prewarm phase, and its exact
-        owner process identity still matches.  Dead, missing, mismatched, or
-        unknown-identity owners fail closed, so reconciliation still
-        terminalizes them.
+        latest phase is the started prewarm phase, that phase has not outlived
+        ``preparation_stall_seconds`` (NF-2026-00027), and its exact owner
+        identity still matches.  Dead, missing, mismatched, or unknown-identity
+        owners fail closed, so reconciliation still terminalizes them.
         """
 
         if event.get("state") != "starting":
             return False
         if event.get("preparation_phase") != "reviewer_source_graph_prewarm_started":
+            return False
+        if reviewer_prewarm_capacity.prewarm_outlived(event, preparation_stall_seconds()):
             return False
         owner_pid, owner_pid_ambiguous = _parse_durable_pid(event.get("owner_pid"))
         if owner_pid_ambiguous:
@@ -8840,9 +8843,9 @@ class ProcessManager:
         Returns ``"completed"`` when the launcher thread finished (its result is
         ready), ``"provider_committed"`` when a real provider process already
         exists (never time-limited), or ``"timeout"`` when the still-live owner
-        should be terminalized.  A live owned Source Graph prewarm keeps
-        extending the owner ceiling: it is never terminalized purely because
-        wall time elapsed.
+        should be terminalized.  A live owned Source Graph prewarm extends the
+        owner ceiling, but only until it outlives the preparation stall ceiling,
+        so a hung build can no longer hold its owner forever.
         """
 
         while launcher.is_alive():

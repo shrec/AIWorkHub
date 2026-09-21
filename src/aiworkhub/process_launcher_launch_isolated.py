@@ -97,9 +97,11 @@ LAUNCH_ISOLATED_SEAM_NAMES: tuple[str, ...] = (
     "launch_gates_open",
     "nullcontext",
     "os",
+    "preparation_stall_seconds",
     "process_group_launch_kwargs",
     "project_context",
     "quality_review",
+    "reviewer_prewarm_capacity",
     "runtime_adapters",
     "sandbox_argv",
     "subprocess",
@@ -231,9 +233,11 @@ def launch_isolated(
     launch_gates_open = _pl.launch_gates_open
     nullcontext = _pl.nullcontext
     os = _pl.os
+    preparation_stall_seconds = _pl.preparation_stall_seconds
     process_group_launch_kwargs = _pl.process_group_launch_kwargs
     project_context = _pl.project_context
     quality_review = _pl.quality_review
+    reviewer_prewarm_capacity = _pl.reviewer_prewarm_capacity
     runtime_adapters = _pl.runtime_adapters
     sandbox_argv = _pl.sandbox_argv
     subprocess = _pl.subprocess
@@ -492,7 +496,17 @@ def launch_isolated(
                         + str(exc)[:240]
                     ) from exc
                 if prewarm_progress is not None:
-                    prewarm_progress("reviewer_source_graph_prewarm_started")
+                    # Launch-side prewarm bound (NF-2026-00027): queue for a
+                    # slot, bounded, and fail with a named reason past it.
+                    refused = reviewer_prewarm_capacity.wait_for_slot(
+                        self,
+                        reserved_request_id,
+                        prewarm_progress,
+                        ceiling=preparation_stall_seconds(),
+                        owner_ticks=_pid_start_ticks(os.getpid()),
+                    )
+                    if refused is not None:
+                        raise LaunchRejected(refused)
                 try:
                     worker_ai_tools_mcp.prewarm_quality_review_source_graph(
                         review_packet_path,
@@ -529,6 +543,13 @@ def launch_isolated(
                             "reviewer_source_graph_prewarm_skipped_excluded",
                             skip["reason"],
                         )
+                except BaseException:
+                    # Any other exit (a non-WorkerToolError bug, an interrupt)
+                    # must still retire the durable started phase; left behind,
+                    # the reservation reads as a live prewarm (NF-2026-00027).
+                    if prewarm_progress is not None:
+                        prewarm_progress("reviewer_source_graph_prewarm_failed")
+                    raise
                 else:
                     if prewarm_progress is not None:
                         prewarm_progress(
