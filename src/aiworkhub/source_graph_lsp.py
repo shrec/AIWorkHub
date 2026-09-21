@@ -155,6 +155,9 @@ class LspDefinitionResult:
     server_version: str
     config_digest: str
     classification: str
+    # Non-empty only when no well-formed answer arrived (crash, timeout,
+    # malformed frame, missing server). A valid null definition leaves it "".
+    failure: str = ""
 
 
 @dataclass(frozen=True)
@@ -686,6 +689,7 @@ def classify_definition_payload(
         classification: str,
         uri: str | None = None,
         span: tuple[int, int, int, int] | None = None,
+        failure: str = "",
     ) -> LspDefinitionResult:
         if unbounded or classification not in CLASSIFICATIONS:
             classification = UNRESOLVED
@@ -698,6 +702,7 @@ def classify_definition_payload(
             target_uri=uri,
             target_range=span,
             classification=classification,
+            failure=failure,
             **base,
         )
 
@@ -712,7 +717,11 @@ def classify_definition_payload(
 
     locations = _unique_targets(_normalize_locations(payload))
     if not locations:
-        return finish(UNRESOLVED)
+        if payload is None or payload == []:
+            return finish(UNRESOLVED)
+        # A well-framed answer whose payload is no Location list is not a
+        # server that answered "no definition": callers must never cache it.
+        return finish(UNRESOLVED, failure="malformed_result")
     if len(locations) > 1:
         return finish(AMBIGUOUS)
 
@@ -760,6 +769,8 @@ def _result_for_status(
     spec: LspServerSpec,
     digest: str,
     classification: str,
+    *,
+    failure: str = "",
 ) -> LspDefinitionResult:
     return LspDefinitionResult(
         source_path=query.file_path,
@@ -772,6 +783,7 @@ def _result_for_status(
         server_version=spec.version,
         config_digest=digest,
         classification=classification,
+        failure=failure,
     )
 
 
@@ -1280,40 +1292,46 @@ def _run_session(
                 inflight.append((query, None, source_bytes))
                 continue
             inflight.append((query, ident, source_bytes))
+        # Every branch that did not receive a well-formed answer names its
+        # ``failure``: a crash, timeout or malformed frame is not a server that
+        # answered "no definition", and callers must never cache it as one.
         for query, ident, source_bytes in inflight:
             if ident is None or failed is not None:
-                results.append(_result_for_status(query, spec, digest, UNRESOLVED))
+                results.append(_result_for_status(
+                    query, spec, digest, UNRESOLVED,
+                    failure="not_sent" if failed is None else f"aborted_{failed}",
+                ))
                 continue
             try:
                 response = session._wait_response(ident)
             except LspCancelled:
-                failed = UNRESOLVED
-                results.append(_result_for_status(query, spec, digest, UNRESOLVED))
+                failed = "cancelled"
+                results.append(_result_for_status(
+                    query, spec, digest, UNRESOLVED, failure=failed,
+                ))
                 continue
             except LspTimeout:
-                failed = UNRESOLVED
-                results.append(_result_for_status(query, spec, digest, UNRESOLVED))
+                failed = "timeout"
+                results.append(_result_for_status(
+                    query, spec, digest, UNRESOLVED, failure=failed,
+                ))
                 continue
             except LspUnbounded:
-                failed = UNRESOLVED
-                results.append(classify_definition_payload(
-                    None,
-                    query=query,
-                    repo_root=repo_root,
-                    workspace=workspace,
-                    indexed_hashes=hashes,
-                    source_bytes=source_bytes,
-                    server_spec=spec,
-                    config_digest_value=digest,
-                    unbounded=True,
+                failed = "unbounded"
+                results.append(_result_for_status(
+                    query, spec, digest, UNRESOLVED, failure=failed,
                 ))
                 continue
             except LspMalformed:
-                failed = UNRESOLVED
-                results.append(_result_for_status(query, spec, digest, UNRESOLVED))
+                failed = "malformed"
+                results.append(_result_for_status(
+                    query, spec, digest, UNRESOLVED, failure=failed,
+                ))
                 continue
             if response.get("id") != ident or "error" in response:
-                results.append(_result_for_status(query, spec, digest, UNRESOLVED))
+                results.append(_result_for_status(
+                    query, spec, digest, UNRESOLVED, failure="server_error",
+                ))
                 continue
             results.append(classify_definition_payload(
                 response.get("result"),
@@ -1336,7 +1354,9 @@ def _run_session(
                 failed = UNRESOLVED
     except LspTransportError:
         for query in ordered[len(results):]:
-            results.append(_result_for_status(query, spec, digest, UNRESOLVED))
+            results.append(_result_for_status(
+                query, spec, digest, UNRESOLVED, failure="transport",
+            ))
     finally:
         if session is not None:
             session.close(kill=True)
@@ -1400,7 +1420,10 @@ def resolve_definitions(
     ))
     if not server_command_available(spec.command):
         results = [
-            _result_for_status(query, spec, base_digest, SERVER_UNAVAILABLE)
+            _result_for_status(
+                query, spec, base_digest, SERVER_UNAVAILABLE,
+                failure=SERVER_UNAVAILABLE,
+            )
             for query in ordered_queries
         ]
         return LspBatchOutcome(
@@ -1439,7 +1462,9 @@ def resolve_definitions(
             # unresolved rather than failing the whole batch.
             per_shard[index] = _SessionOutcome(
                 results=tuple(
-                    _result_for_status(query, spec, base_digest, UNRESOLVED)
+                    _result_for_status(
+                        query, spec, base_digest, UNRESOLVED, failure="worker_error",
+                    )
                     for query in shard
                 ),
                 pids=(),
