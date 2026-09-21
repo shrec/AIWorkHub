@@ -5506,8 +5506,111 @@ async function nf651StageContextReadForNextRequiredFile() {
   assert.strictEqual(repeatedExactReads, 2, "exact next-output reads must be bounded per output");
 }
 
+// NF-2026-00023: glm-5.3 reached forced staging needing the API of a file it had
+// to call (declared writable, but not the next required output), was refused,
+// and died as vscode_lm_semantic_edit_stage_required. A declared dependency must
+// be readable while staging; an undeclared file must still be refused unexecuted;
+// and the total read cap must still bound the request.
+async function nf202600023DeclaredDependencyReadDuringForcedStaging() {
+  const first = "src/first.js";
+  const second = "src/second.js";
+  const dep = "src/dep.js";
+  const outside = "src/outside.js";
+  const request = {
+    requestId: "3".repeat(32),
+    request_kind: "worker",
+    prompt: "Edit both required files; src/first.js calls into src/dep.js.",
+    allowedWrites: [first, second, dep],
+    required_outputs: [first, second],
+    path_contracts: {
+      [first]: { action: "edit", current_sha256: "a".repeat(64), line_count: 1, parent_existed: true },
+      [second]: { action: "edit", current_sha256: "b".repeat(64), line_count: 1, parent_existed: true },
+      [dep]: { action: "edit", current_sha256: "c".repeat(64), line_count: 1, parent_existed: true },
+    },
+    initial_source_graph_result: { ok: true, content: "prefetched graph" },
+  };
+  const toolRequest = (name, input) => JSON.stringify({
+    schema_id: internals.constants.VSCODE_LM_TOOL_REQUEST_SCHEMA, name, input,
+  });
+  const readFile = (path) => toolRequest("aiworkhub_worker_source_graph_query", {
+    mode: "file", query: path, target: path, workflow_stage: "implementation",
+  });
+  const stage = (path, text) => toolRequest("aiworkhub_manager_semantic_edit_stage", {
+    operation: "replace_range", file_path: path, start_line: 1, end_line: 1, new: text,
+  });
+  const discover = () => toolRequest("aiworkhub_worker_source_graph_query", {
+    mode: "focus", query: "orientation", workflow_stage: "implementation",
+  });
+
+  // Scenario 1: undeclared read refused, declared dependency read executed.
+  const executed = [];
+  const stageInstructions = [];
+  let plan = null;
+  const model = {
+    capabilities: { toolCalling: false },
+    sendRequest: async (messages) => {
+      const last = messages[messages.length - 1];
+      const instruction = last && last.role === "user" ? String(last.content) : "";
+      // Forced staging is active only once the stage instruction arrives as its
+      // own user message. The same words appear earlier inside a tool result as
+      // a heads-up, while reads are still ordinary discovery and must execute.
+      const forcedStage = instruction.startsWith("Required output ");
+      if (forcedStage) stageInstructions.push(instruction);
+      if (!plan && forcedStage && instruction.startsWith("Required output " + first)) {
+        plan = [readFile(outside), readFile(dep), stage(first, "const first = dep();\n"),
+          stage(second, "const second = 2;\n")];
+      }
+      const value = plan && plan.length ? plan.shift() : discover();
+      return { stream: (async function* stream() { yield { value }; }()) };
+    },
+  };
+  const final = JSON.parse(await internals.runVscodeLmTextProtocol(
+    model, request, undefined, async (call) => {
+      if (call.name === "aiworkhub_worker_source_graph_query" && call.input.mode === "file") {
+        executed.push(call.input.target);
+      }
+      return { ok: true, content: "bounded graph" };
+    },
+  ));
+  assert.deepStrictEqual(final.edits.map((edit) => edit.path), [first, second]);
+  assert.deepStrictEqual(executed, [dep],
+    "the declared dependency must be read; the undeclared file must never execute");
+  assert.ok(stageInstructions.length > 0);
+  assert.ok(stageInstructions.every((text) => text.includes("read-only Source Graph lookup")),
+    "the text-protocol stage instruction must tell the worker declared reads remain available");
+
+  // Scenario 2: the total cap holds even when every target is declared.
+  const cappedExecuted = [];
+  let cappedPlan = null;
+  const cappedModel = {
+    capabilities: { toolCalling: false },
+    sendRequest: async (messages) => {
+      const last = messages[messages.length - 1];
+      const instruction = last && last.role === "user" ? String(last.content) : "";
+      if (!cappedPlan && instruction.startsWith("Required output " + first)) {
+        cappedPlan = [readFile(dep), readFile(dep), readFile(second), readFile(second),
+          readFile(first), stage(first, "const first = 1;\n"), stage(second, "const second = 2;\n")];
+      }
+      const value = cappedPlan && cappedPlan.length ? cappedPlan.shift() : discover();
+      return { stream: (async function* stream() { yield { value }; }()) };
+    },
+  };
+  const cappedFinal = JSON.parse(await internals.runVscodeLmTextProtocol(
+    cappedModel, { ...request, requestId: "4".repeat(32) }, undefined, async (call) => {
+      if (call.name === "aiworkhub_worker_source_graph_query" && call.input.mode === "file") {
+        cappedExecuted.push(call.input.target);
+      }
+      return { ok: true, content: "bounded graph" };
+    },
+  ));
+  assert.deepStrictEqual(cappedFinal.edits.map((edit) => edit.path), [first, second]);
+  assert.deepStrictEqual(cappedExecuted, [dep, dep, second, second],
+    "the fifth forced-stage read must be refused by the total cap, unexecuted");
+}
+
 async function main() {
   await nf651StageContextReadForNextRequiredFile();
+  await nf202600023DeclaredDependencyReadDuringForcedStaging();
   await nf897EffortContextChecks();
   await nf831DirectFinalSubsetChecks();
   const schema = internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA;

@@ -492,6 +492,10 @@ const VSCODE_LM_MAX_REQUEST_BYTES = 8 * 1024 * 1024;
 const VSCODE_LM_MAX_AGENT_TURNS = 24;
 const VSCODE_LM_MAX_TOOL_TURNS = 16;
 const VSCODE_LM_MAX_POST_SOURCE_TURNS = 12;
+// Once forced staging starts, a worker may still read declared files, but at
+// most this many times in total -- two per target -- so the 24-turn loop guard
+// still bounds the whole request (NF-2026-00023).
+const VSCODE_LM_MAX_FORCED_STAGE_READS = 4;
 const VSCODE_LM_MAX_FINALIZATION_TURNS = 4;
 // A reviewer has one bounded job: submit one authenticated receipt. Three
 // turns allow an optional Source Graph lookup and one transient submit retry
@@ -4294,19 +4298,35 @@ function vscodeLmShouldKeepStagedEdit(writableTask, stagedEdits) {
   return Boolean(writableTask) && !vscodeLmStagedOutputsReady(stagedEdits);
 }
 
+// Exact (non-glob) paths this request declared writable. During forced staging
+// a worker may still read these, because a later required edit often has to
+// call into one of them (NF-2026-00023).
+function vscodeLmExactAllowedWrites(request) {
+  const declared = request && Array.isArray(request.allowedWrites) ? request.allowedWrites : [];
+  return new Set(declared.filter((entry) => typeof entry === "string" && entry && !/[*?[\]]/.test(entry)));
+}
+
+// Appended only to the text-protocol variant: that path honours bounded
+// declared-file reads while staging; the native tool-call path does not.
+const VSCODE_LM_FORCED_STAGE_READ_HINT =
+  " If you must first see the exact current content of a file this task may write, " +
+  "you may instead request one read-only Source Graph lookup with mode \"file\" and " +
+  "query and target both set to that exact path; such reads are strictly limited.";
+
 function vscodeLmMissingRequiredStageInstruction(nextMissing, native = false) {
   const stageNow = native
     ? `Call ${VSCODE_LM_STAGE_EDIT_TOOL} now`
     : `Output ONLY one ${VSCODE_LM_TOOL_REQUEST_SCHEMA} request for ${VSCODE_LM_STAGE_EDIT_TOOL}`;
+  const readHint = native ? "" : VSCODE_LM_FORCED_STAGE_READ_HINT;
   if (!nextMissing || !nextMissing.path || !nextMissing.action) {
     return `The bounded discovery phase is complete. Do not regenerate a full file or final edit envelope. ` +
       (native
         ? `${stageNow} with only the smallest required replacement/create.`
-        : `${stageNow}.`);
+        : `${stageNow}.`) + readHint;
   }
   const action = nextMissing.action === "create" ? "v3_create" : nextMissing.action;
   return `Required output ${nextMissing.path} is still missing. Do not emit a final edit envelope. ` +
-    `${stageNow} with operation ${nextMissing.action} (action ${action}) for ${nextMissing.path}.`;
+    `${stageNow} with operation ${nextMissing.action} (action ${action}) for ${nextMissing.path}.` + readHint;
 }
 
 function vscodeLmForcedStageMissingKey(nextMissing) {
@@ -5208,7 +5228,8 @@ async function runVscodeLmTextProtocol(
   let stagedEditInstructionSent = false;
   let stagedEditMissingPathSent = "";
   const stagedEditFailure = { key: "", count: 0 };
-  const stageContextReads = new Map(); // At most two exact reads for each next required edit path.
+  const stageContextReads = new Map(); // At most two exact reads per declared target during forced staging.
+  let forcedStageReadsTotal = 0; // ...and at most VSCODE_LM_MAX_FORCED_STAGE_READS across all targets.
   let lastMissingCreateRejectionIdentity = "";
   const protocolTrace = [];
   let lastProtocolPreview = "";
@@ -5543,17 +5564,31 @@ async function runVscodeLmTextProtocol(
     const nextRequired = forceStagedEdit ? vscodeLmNextMissingRequiredOutput(stagedEdits) : null;
     const stageInput = envelope.input && typeof envelope.input === "object" &&
       !Array.isArray(envelope.input) ? envelope.input : null;
-    // Forced staging still needs bounded context for a later required edit file.
-    // Permit only exact, read-only Source Graph access to that next file.
+    // Forced staging still needs bounded context. NF-651 allowed exact reads of
+    // the next required edit file only; NF-2026-00023 measured that this starves
+    // a worker which must read a *dependency* it has to call (glm-5.3 needed the
+    // windows_appcontainer API to write the helper that calls it, was refused,
+    // and died as vscode_lm_semantic_edit_stage_required). Any exact path this
+    // request itself declared writable is therefore readable too. Everything
+    // else is unchanged: read-only Source Graph only, exact file/body lookups,
+    // two reads per target, and a total cap so the discovery loop guard holds.
     const stageTarget = nextRequired && nextRequired.path;
-    const stageRead = !permitted && nextRequired && nextRequired.action === "replace_range" &&
-      envelope.name === expectedSgTool && stageInput && stageInput.target === stageTarget &&
-      ((stageInput.mode === "file" && stageInput.query === stageTarget) ||
+    const stageReadTarget = stageInput && typeof stageInput.target === "string"
+      ? stageInput.target : "";
+    const stageReadDeclared = Boolean(stageReadTarget) && (
+      stageReadTarget === stageTarget
+        ? nextRequired.action === "replace_range"
+        : vscodeLmExactAllowedWrites(request).has(stageReadTarget)
+    );
+    const stageRead = !permitted && Boolean(nextRequired) && stageReadDeclared &&
+      envelope.name === expectedSgTool &&
+      ((stageInput.mode === "file" && stageInput.query === stageReadTarget) ||
         (stageInput.mode === "body" && typeof stageInput.query === "string" &&
           stageInput.query.trim() && stageInput.query.length <= 512)) &&
       (stageInput.budget === undefined ||
         (Number.isInteger(stageInput.budget) && stageInput.budget > 0 && stageInput.budget <= 160)) &&
-      (stageContextReads.get(stageTarget) || 0) < 2;
+      (stageContextReads.get(stageReadTarget) || 0) < 2 &&
+      forcedStageReadsTotal < VSCODE_LM_MAX_FORCED_STAGE_READS;
     if (!permitted && !stageRead) {
       // A non-stage tool request during forced staging is a phase violation, not
       // an authority violation. Correct it once without invoking MCP; a repeated
@@ -5642,7 +5677,8 @@ async function runVscodeLmTextProtocol(
       });
     }
     if (stageRead && !toolInputTooLarge) {
-      stageContextReads.set(stageTarget, (stageContextReads.get(stageTarget) || 0) + 1);
+      stageContextReads.set(stageReadTarget, (stageContextReads.get(stageReadTarget) || 0) + 1);
+      forcedStageReadsTotal += 1;
     }
     let result;
     let toolFailureReported = false;
