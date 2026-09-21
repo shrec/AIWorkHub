@@ -62,6 +62,22 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
+## What's new in 0.11.57
+
+- Reviewer and rework Source Graph overlays now pin the exact base index
+  generation they were built against, so an ordinary canonical index
+  publication no longer breaks an in-flight review, a newer generation never
+  leaks into a sealed review, and a replaced or mutated pin fails closed
+  (NF-2026-00946).
+- A manager can reroute a retained candidate after a zero-delta launch failure
+  (for example a provider authentication failure) that blocked-rework recovery
+  already returned to pending. The reroute is authorized only by the canonical
+  claim, launch-failure and recovery chain plus the process ledger, and only
+  once (NF-2026-00778).
+- LSP index integration, OpenCode/Muse worker qualification, the full
+  stage-gated Playbook lifecycle and reasoning-quality measurement are not part
+  of this release and remain pending.
+
 ## What's new in 0.11.56
 
 - Explicit manager recovery of a blocked task can now recover a timed-out

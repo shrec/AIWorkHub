@@ -6,6 +6,44 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.57] - 2026-09-21
+
+### Fixed
+
+- A reviewer or rework Source Graph overlay partition now pins the exact base
+  index generation it was built against (NF-2026-00946). The canonical base is
+  published by atomic replacement, so a marker that named only the canonical
+  path let every ordinary publication break every in-flight reviewer/rework
+  overlay. The marker now records the base generation's device, inode, size and
+  `mtime_ns` and pins that generation by hard link beside the partition (never
+  a copy or a content hash); reads compose with the pinned generation and verify
+  its identity, so a newer canonical generation never leaks into a sealed
+  review and a replaced or mutated pin fails closed. Where hard links are
+  unsupported the marker records that, and a later base shift fails with an
+  explicit `composed_base_shifted_unpinned` reason. Pins no partition
+  references any more are pruned on the next marker write, and the partition
+  build report carries `base_pin` and `pin_seconds`.
+- A manager can reroute a retained candidate after a zero-delta launch failure
+  that `recover_blocked_rework` already moved back to pending (NF-2026-00778).
+  In that shape (a rejected sealed candidate, then a claim that failed at
+  launch, e.g. on provider authentication, before any model work) the recovery
+  drops the launch reservation and writes no transient retry, so the
+  authenticated reroute was previously lost. Authority is the newest task-bound
+  canonical `claim_start -> launch_failed -> blocked_rework_recovery` chain,
+  matched field for field against the card's recovery and retained-predecessor
+  identity, plus the process ledger proving the failed request ended
+  `launch_failed` with zero changed paths on this runner. Card fields alone are
+  never authority, and any later lineage event, including the reroute itself,
+  makes the authorization stale, so it is one-shot.
+
+### Not in this release
+
+- LSP index integration, OpenCode manager callback and OpenCode/Muse worker
+  qualification, the full stage-gated Playbook lifecycle, and portable
+  `.aiworkhub` data are pending and not shipped here. No reasoning-quality
+  improvement is claimed: causal reasoning-quality measurement remains
+  incomplete, and inferred successor progression is still pending.
+
 ## [0.11.56] - 2026-09-21
 
 ### Changed

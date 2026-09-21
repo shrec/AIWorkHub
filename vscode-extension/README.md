@@ -14,6 +14,20 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.11.57
+
+- The bundled runtime's reviewer and rework Source Graph overlays now pin the
+  exact base index generation they were built against, so an ordinary
+  canonical index publication no longer breaks an in-flight review and a
+  replaced or mutated pin fails closed (NF-2026-00946).
+- The bundled runtime lets a manager reroute a retained candidate after a
+  zero-delta launch failure (for example a provider authentication failure)
+  that blocked-rework recovery already returned to pending, authorized once by
+  the canonical claim, launch-failure and recovery chain (NF-2026-00778).
+- LSP index integration, OpenCode/Muse worker qualification, the full
+  stage-gated Playbook lifecycle and reasoning-quality measurement are not part
+  of this release and remain pending.
+
 ## What's new in 0.11.56
 
 - The bundled runtime's explicit manager recovery of a blocked task can now
