@@ -14,6 +14,13 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.11.54
+
+- The bundled Source Graph runtime treats authenticated concurrent index builds
+  as healthy standby instead of blocking code tasks on a fresh index.
+- Automatic mini-roadmap progression and the full Playbook/LSP work remain in
+  progress.
+
 ## What's new in 0.11.53
 
 - The bundled semantic reviewer requests hash-matched candidate overlays for

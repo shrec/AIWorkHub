@@ -6,6 +6,21 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.54] - 2026-09-21
+
+### Fixed
+
+- Authenticated concurrent Source Graph builders now leave the second MCP
+  process in standby instead of degrading a fresh canonical index. Retained
+  build records preserve the semantic `running` state rather than Linux's
+  one-letter process state (NF-2026-00933).
+
+### Not in this release
+
+- Automatic mini-roadmap progression, full Playbook stage gates, LSP index
+  integration, causal reasoning-quality measurement, and Muse/OpenCode worker
+  qualification remain incomplete.
+
 ## [0.11.53] - 2026-09-21
 
 ### Added

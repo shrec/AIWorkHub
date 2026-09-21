@@ -1,5 +1,19 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.54 — 2026-09-21
+
+### Fixed
+
+- The bundled Source Graph reader stays in standby when another authenticated
+  MCP process owns the index build; a fresh canonical index no longer appears
+  degraded solely from normal builder contention (NF-2026-00933).
+
+### Not in this release
+
+- Automatic mini-roadmap progression, full Playbook stage gates, LSP index
+  integration, causal reasoning-quality measurement, and Muse/OpenCode worker
+  qualification remain incomplete.
+
 ## 0.11.53 — 2026-09-21
 
 ### Added

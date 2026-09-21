@@ -62,6 +62,13 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
+## What's new in 0.11.54
+
+- Source Graph's authenticated concurrent builder now appears as standby, not a
+  false degraded preflight against a fresh canonical index (NF-2026-00933).
+- Automatic mini-roadmap progression and the full Playbook/LSP work remain in
+  progress; this is a task-system unblock, not a completion claim.
+
 ## What's new in 0.11.53
 
 - Semantic-review prompts now request hash-matched candidate overlays for
