@@ -13389,3 +13389,389 @@ def test_empty_output_template_families_match_the_registry_defaults() -> None:
             permits_empty.add(name)
 
     assert permits_empty == process_launcher._EMPTY_OUTPUT_TEMPLATE_FAMILIES
+
+
+_ATTEMPT_REQUEST_ID = "c" * 32
+_ATTEMPT_REPO_ID = "repo_" + "a" * 32
+_ATTEMPT_SCHEMA_ID = "aiworkhub.reasoning_context_attempt.v1"
+
+
+def _vscode_attempt_metadata(**overrides) -> dict:
+    return {
+        "adapter_id": "glm_vscode_lm",
+        "task_id": "TASK_B1",
+        "model": "glm-5.2",
+        "claim_epoch": 4,
+        "vscode_lm_bridge": {"repo_id": _ATTEMPT_REPO_ID},
+        **overrides,
+    }
+
+
+def _vscode_attempt_receipt(**overrides) -> dict:
+    receipt = {
+        "schema_id": _ATTEMPT_SCHEMA_ID,
+        "request_id": _ATTEMPT_REQUEST_ID,
+        "repo_id": _ATTEMPT_REPO_ID,
+        "requested_model": "glm-5.2",
+        "host_model": {
+            "id": "glm-5.2",
+            "family": "glm-5.2",
+            "name": "GLM-5.2",
+            "vendor": "customendpoint",
+            "version": "1.0.0",
+        },
+        "requested_profile": "canonical_high",
+        "send_state": "sent",
+        "send_turn_count": 2,
+        "provider_request_acknowledged": True,
+        "option_status": "applied",
+        "option_key": "reasoningEffort",
+        "option_value": "high",
+        "context_capacity_tokens": 128000,
+        "context_capacity_source": "model.maxInputTokens",
+        "provider_internal_state": "unknown",
+        "unknown_reason": None,
+    }
+    receipt.update(overrides)
+    return receipt
+
+
+def _vscode_worker_result(**fields) -> dict:
+    return {
+        "type": "result",
+        "subtype": "success",
+        "is_error": False,
+        "result": "implemented",
+        "changed_paths": ["out/result.txt"],
+        **fields,
+    }
+
+
+def _bound_attempt(tmp_path: Path, *lines: object, **metadata) -> dict:
+    log = tmp_path / "worker.stdout.log"
+    log.write_text(
+        "".join((ln if isinstance(ln, str) else json.dumps(ln)) + "\n" for ln in lines),
+        encoding="utf-8",
+    )
+    record = process_launcher._reasoning_context_attempt_from_output(
+        log, _vscode_attempt_metadata(**metadata), _ATTEMPT_REQUEST_ID
+    )
+    assert record is not None
+    return record
+
+
+def _assert_typed_unknown(record: dict, reason: str) -> None:
+    receipt = record["receipt"]
+    assert receipt["schema_id"] == _ATTEMPT_SCHEMA_ID
+    assert receipt["unknown_reason"] == reason
+    assert (receipt["send_state"], receipt["option_status"]) == ("unknown", "unknown")
+    assert receipt["option_key"] is None and receipt["option_value"] is None
+    assert receipt["provider_internal_state"] == "unknown"
+
+
+def test_vscode_lm_attempt_receipt_is_bound_to_the_launcher_identity(tmp_path):
+    receipt = _vscode_attempt_receipt()
+
+    record = _bound_attempt(
+        tmp_path,
+        {"type": "aiworkhub_progress", "sequence": 1, "phase": "waiting_for_host"},
+        'PROJECT_CONTEXT_RECEIPT: {"schema_id": "x"}',
+        _vscode_worker_result(reasoning_context_attempt=receipt),
+    )
+
+    assert record == {
+        "schema_id": "aiworkhub.reasoning_context_attempt_event.v1",
+        "identity": {
+            "repo_id": _ATTEMPT_REPO_ID,
+            "task_id": "TASK_B1",
+            "request_id": _ATTEMPT_REQUEST_ID,
+            "adapter_id": "glm_vscode_lm",
+            "model": "glm-5.2",
+            "claim_epoch": 4,
+        },
+        "receipt": receipt,
+    }
+
+
+@pytest.mark.parametrize(
+    "adapter_id", sorted(process_launcher._VSCODE_LM_IN_PROCESS_ADAPTERS)
+)
+def test_every_vscode_lm_adapter_binds_its_own_adapter_identity(tmp_path, adapter_id):
+    receipt = _vscode_attempt_receipt()
+
+    record = _bound_attempt(
+        tmp_path,
+        _vscode_worker_result(reasoning_context_attempt=receipt),
+        adapter_id=adapter_id,
+    )
+
+    assert record["identity"]["adapter_id"] == adapter_id
+    assert record["receipt"] == receipt
+
+
+@pytest.mark.parametrize("adapter_id", ["claude_cli", "codex_cli", "opencode_cli", ""])
+def test_non_vscode_worker_output_never_yields_an_attempt_receipt(tmp_path, adapter_id):
+    log = tmp_path / "worker.stdout.log"
+    log.write_text(
+        json.dumps(
+            _vscode_worker_result(reasoning_context_attempt=_vscode_attempt_receipt())
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert process_launcher._reasoning_context_attempt_from_output(
+        log, _vscode_attempt_metadata(adapter_id=adapter_id), _ATTEMPT_REQUEST_ID
+    ) is None
+
+
+@pytest.mark.parametrize(
+    ("overrides", "reason"),
+    [
+        ({"request_id": "b" * 32}, "receipt_identity_mismatch"),
+        ({"repo_id": "repo_" + "0" * 32}, "receipt_identity_mismatch"),
+        ({"requested_model": "deepseek-v4-pro"}, "receipt_identity_mismatch"),
+        ({"schema_id": _ATTEMPT_SCHEMA_ID + ".next"}, "receipt_schema_mismatch"),
+        ({"option_status": "maximum"}, "receipt_vocabulary_invalid"),
+        ({"send_turn_count": True}, "receipt_bounds_invalid"),
+        (
+            {
+                "send_state": "not_sent",
+                "option_status": "not_sent",
+                "option_key": None,
+                "option_value": None,
+            },
+            "receipt_inconsistent",
+        ),
+        ({"option_key": None}, "receipt_inconsistent"),
+        ({"option_value": "x" * 5000}, "receipt_oversized"),
+    ],
+)
+def test_foreign_or_invalid_attempt_receipt_is_a_typed_unknown_never_applied(
+    tmp_path, overrides, reason
+):
+    record = _bound_attempt(
+        tmp_path,
+        _vscode_worker_result(reasoning_context_attempt=_vscode_attempt_receipt(**overrides)),
+    )
+
+    _assert_typed_unknown(record, reason)
+    receipt = record["receipt"]
+    # Nothing the refused receipt claimed is persisted: identity is launcher-owned.
+    assert (receipt["request_id"], receipt["repo_id"], receipt["requested_model"]) == (
+        _ATTEMPT_REQUEST_ID,
+        _ATTEMPT_REPO_ID,
+        "glm-5.2",
+    )
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        ["receipt"],
+        "receipt",
+        7,
+        0,
+        False,
+        {},
+        {**_vscode_attempt_receipt(), "extra": 1},
+        {k: v for k, v in _vscode_attempt_receipt().items() if k != "unknown_reason"},
+        _vscode_attempt_receipt(host_model="glm-5.2"),
+    ],
+)
+def test_reshaped_attempt_receipt_is_malformed_not_absent(tmp_path, raw):
+    record = _bound_attempt(tmp_path, _vscode_worker_result(reasoning_context_attempt=raw))
+
+    _assert_typed_unknown(record, "receipt_malformed")
+
+
+@pytest.mark.parametrize(
+    "lines",
+    [
+        (),
+        ("not json at all",),
+        (_vscode_worker_result(),),
+        (_vscode_worker_result(reasoning_context_attempt=None),),
+        (
+            {
+                "type": "result",
+                "subtype": "error",
+                "is_error": True,
+                "error": "vscode_lm_request_failed:provider_send_failed",
+                "reasoning_context_attempt": _vscode_attempt_receipt(),
+            },
+        ),
+    ],
+    ids=["empty-log", "no-result-line", "no-receipt-key", "null-receipt", "error-result"],
+)
+def test_missing_attempt_receipt_is_typed_absent(tmp_path, lines):
+    _assert_typed_unknown(_bound_attempt(tmp_path, *lines), "receipt_absent")
+
+
+def test_absent_worker_log_is_typed_absent(tmp_path):
+    record = process_launcher._reasoning_context_attempt_from_output(
+        tmp_path / "missing.stdout.log", _vscode_attempt_metadata(), _ATTEMPT_REQUEST_ID
+    )
+
+    _assert_typed_unknown(record, "receipt_absent")
+
+
+def test_attempt_receipt_refuses_a_symlinked_worker_log(tmp_path):
+    real = tmp_path / "real.stdout.log"
+    real.write_text(
+        json.dumps(
+            _vscode_worker_result(reasoning_context_attempt=_vscode_attempt_receipt())
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    link = tmp_path / "worker.stdout.log"
+    link.symlink_to(real)
+
+    record = process_launcher._reasoning_context_attempt_from_output(
+        link, _vscode_attempt_metadata(), _ATTEMPT_REQUEST_ID
+    )
+
+    _assert_typed_unknown(record, "receipt_absent")
+
+
+def test_worker_authored_unknown_keeps_its_own_reason(tmp_path):
+    from aiworkhub import vscode_lm_worker
+
+    spec = {
+        "request_id": _ATTEMPT_REQUEST_ID,
+        "repo_id": _ATTEMPT_REPO_ID,
+        "model": "glm-5.2",
+    }
+    for reason in sorted(vscode_lm_worker._ATTEMPT_WORKER_UNKNOWN_REASONS):  # noqa: SLF001
+        worker_unknown = vscode_lm_worker._attempt_unknown(spec, reason)  # noqa: SLF001
+
+        record = _bound_attempt(
+            tmp_path, _vscode_worker_result(reasoning_context_attempt=worker_unknown)
+        )
+
+        assert record["receipt"] == worker_unknown
+        _assert_typed_unknown(record, reason)
+
+
+@pytest.mark.parametrize(
+    ("unknown_reason", "expected"),
+    [
+        ("receipt_absent", "receipt_absent"),
+        ("operator says fine", "receipt_malformed"),
+        ("option_shape_unrecognized", "receipt_malformed"),
+        (["receipt_absent"], "receipt_malformed"),
+        (None, "receipt_malformed"),
+    ],
+)
+def test_forged_unknown_receipt_keeps_at_most_a_worker_reason(
+    tmp_path, unknown_reason, expected
+):
+    forged = _vscode_attempt_receipt(
+        request_id="b" * 32, send_state="unknown", unknown_reason=unknown_reason
+    )
+
+    record = _bound_attempt(tmp_path, _vscode_worker_result(reasoning_context_attempt=forged))
+
+    # The forged record still claims ``applied``, a foreign request and a key/value.
+    _assert_typed_unknown(record, expected)
+    assert record["receipt"]["request_id"] == _ATTEMPT_REQUEST_ID
+
+
+@pytest.mark.parametrize("bridge", [None, {}, {"repo_id": ""}, "repo"])
+def test_attempt_receipt_cannot_bind_without_a_launcher_repo_identity(tmp_path, bridge):
+    record = _bound_attempt(
+        tmp_path,
+        _vscode_worker_result(reasoning_context_attempt=_vscode_attempt_receipt()),
+        vscode_lm_bridge=bridge,
+    )
+
+    _assert_typed_unknown(record, "receipt_identity_mismatch")
+    assert record["identity"]["repo_id"] == ""
+
+
+def test_attempt_receipt_binds_the_default_model_when_the_launch_pinned_none(tmp_path):
+    receipt = _vscode_attempt_receipt()
+
+    record = _bound_attempt(
+        tmp_path, _vscode_worker_result(reasoning_context_attempt=receipt), model=None
+    )
+
+    assert record["identity"]["model"] == process_launcher.runtime_adapters.GLM_DEFAULT_MODEL
+    assert record["receipt"] == receipt
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"option_status": "unsupported", "option_key": None, "option_value": None},
+        {"option_status": "provider_default", "option_key": None, "option_value": None},
+        {"option_status": "unverifiable", "option_key": None, "option_value": None},
+        {"option_status": "capability_ceiling", "option_key": None, "option_value": None},
+        {
+            "option_status": "unknown",
+            "option_key": None,
+            "option_value": None,
+            "unknown_reason": "option_shape_unrecognized",
+        },
+    ],
+    ids=["unsupported", "provider-default", "unverifiable", "ceiling", "host-unknown"],
+)
+def test_distinct_send_option_states_survive_unchanged(tmp_path, overrides):
+    receipt = _vscode_attempt_receipt(**overrides)
+
+    record = _bound_attempt(tmp_path, _vscode_worker_result(reasoning_context_attempt=receipt))
+
+    assert record["receipt"] == receipt
+    assert record["receipt"]["send_state"] == "sent"
+    assert record["receipt"]["option_key"] is None
+
+
+def test_last_worker_result_line_is_the_only_attempt_authority(tmp_path):
+    receipt = _vscode_attempt_receipt()
+
+    stale = _bound_attempt(
+        tmp_path,
+        _vscode_worker_result(reasoning_context_attempt=receipt),
+        _vscode_worker_result(),
+    )
+    forged_first = _bound_attempt(
+        tmp_path,
+        _vscode_worker_result(
+            reasoning_context_attempt=_vscode_attempt_receipt(request_id="b" * 32)
+        ),
+        _vscode_worker_result(reasoning_context_attempt=receipt),
+    )
+
+    _assert_typed_unknown(stale, "receipt_absent")
+    assert forged_first["receipt"] == receipt
+
+
+def test_attempt_receipt_scan_is_a_bounded_tail_and_survives_hostile_bytes(tmp_path):
+    receipt = _vscode_attempt_receipt()
+    filler = json.dumps({"type": "aiworkhub_progress", "sequence": 1, "phase": "x" * 900})
+    window_lines = process_launcher.MAX_RECEIPT_SCAN_BYTES // len(filler) + 2
+
+    recent = _bound_attempt(
+        tmp_path,
+        *([filler] * window_lines),
+        _vscode_worker_result(reasoning_context_attempt=receipt),
+    )
+    outside_window = _bound_attempt(
+        tmp_path,
+        _vscode_worker_result(reasoning_context_attempt=receipt),
+        *([filler] * window_lines),
+    )
+    hostile = tmp_path / "hostile.stdout.log"
+    hostile.write_bytes(
+        b"\xff\xfe\x00 not json\n"
+        + b"[" * 200_000
+        + b'\n{"type": "result", "reasoning_context_attempt": {"schema_id": \n'
+    )
+    hostile_record = process_launcher._reasoning_context_attempt_from_output(
+        hostile, _vscode_attempt_metadata(), _ATTEMPT_REQUEST_ID
+    )
+
+    assert recent["receipt"] == receipt
+    _assert_typed_unknown(outside_window, "receipt_absent")
+    _assert_typed_unknown(hostile_record, "receipt_absent")

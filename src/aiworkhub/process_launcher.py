@@ -158,6 +158,7 @@ from . import quality_reviewer
 from . import reviewer_reservation_recovery
 from . import terminal_authority
 from . import vscode_lm_bridge
+from . import vscode_lm_worker
 from . import worker_ai_tools_mcp
 # NF389: bounded, authenticated provider-call identity and provenance. These
 # re-exports give the ProcessManager (and the completion gate) the exact same
@@ -2480,6 +2481,75 @@ def _project_context_receipt_from_output(
                 "reason": reason,
             }
     return result
+
+
+REASONING_CONTEXT_ATTEMPT_EVENT_SCHEMA_ID = "aiworkhub.reasoning_context_attempt_event.v1"
+
+
+def _worker_result_line(path: Path) -> dict[str, Any]:
+    """Last complete ``result`` object in the bounded stdout tail, else ``{}``."""
+    try:
+        info = path.lstat()
+    except OSError:
+        return {}
+    if not stat.S_ISREG(info.st_mode):
+        return {}
+    start = max(0, info.st_size - MAX_RECEIPT_SCAN_BYTES)
+    lines = _read_byte_range(path, start, MAX_RECEIPT_SCAN_BYTES).splitlines()
+    # A window opened mid-file begins inside a line, so that fragment is never parsed.
+    for line in reversed(lines[1:] if start else lines):
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except (ValueError, RecursionError):
+            continue
+        if isinstance(event, dict) and event.get("type") == "result":
+            return event
+    return {}
+
+
+def _reasoning_context_attempt_from_output(
+    path: Path, metadata: Mapping[str, Any], request_id: str
+) -> dict[str, Any] | None:
+    """Re-verify the worker's send receipt against launcher-owned identity; ``None`` off VS Code LM."""
+    adapter_id = str(metadata.get("adapter_id") or "")
+    if adapter_id not in _VSCODE_LM_IN_PROCESS_ADAPTERS:
+        return None
+    bridge = metadata.get("vscode_lm_bridge")
+    spec = {
+        "request_id": request_id,
+        "repo_id": str(bridge.get("repo_id") or "") if isinstance(bridge, dict) else "",
+        "model": str(metadata.get("model") or runtime_adapters.GLM_DEFAULT_MODEL),
+    }
+    result = _worker_result_line(path)
+    if result.get("subtype") != "success" or result.get("is_error") is not False:
+        result = {}
+    raw = result.get("reasoning_context_attempt")
+    if isinstance(raw, dict) and raw.get("send_state") == "unknown":
+        reason = raw.get("unknown_reason")
+        receipt = vscode_lm_worker._attempt_unknown(
+            spec,
+            reason
+            if isinstance(reason, str)
+            and reason in vscode_lm_worker._ATTEMPT_WORKER_UNKNOWN_REASONS
+            else "receipt_malformed",
+        )
+    else:
+        receipt = vscode_lm_worker._reasoning_context_attempt_result(result, spec)
+    claim_epoch = metadata.get("claim_epoch")
+    return {
+        "schema_id": REASONING_CONTEXT_ATTEMPT_EVENT_SCHEMA_ID,
+        "identity": {
+            "repo_id": spec["repo_id"],
+            "task_id": str(metadata.get("task_id") or ""),
+            "request_id": request_id,
+            "adapter_id": adapter_id,
+            "model": spec["model"],
+            "claim_epoch": claim_epoch if type(claim_epoch) is int else None,
+        },
+        "receipt": receipt,
+    }
 
 
 def _readonly_research_contract(
@@ -12615,6 +12685,9 @@ class ProcessManager:
                     (metadata.get("project_context") or {}).get("bundle_sha256") or ""
                 ),
             )
+            attempt_evidence = _reasoning_context_attempt_from_output(
+                stdout_path, metadata, request_id
+            )
             provider_tool_denials = _provider_tool_denials_from_output(stdout_path)
             provider_read_efficiency = _provider_read_efficiency_from_output(stdout_path)
             semantic_edit_evidence = _semantic_edit_evidence_from_output(
@@ -12743,6 +12816,7 @@ class ProcessManager:
                 "prompt_budget": metadata.get("prompt_budget"),
                 "token_budget": supervisor_status.get("token_budget"),
                 "project_context_acknowledgement": context_ack,
+                **({"reasoning_context_attempt": attempt_evidence} if attempt_evidence else {}),
                 "provider_tool_denials": provider_tool_denials,
                 "read_efficiency": provider_read_efficiency,
                 "semantic_edit": semantic_edit_evidence,

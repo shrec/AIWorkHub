@@ -1208,6 +1208,237 @@ def test_vscode_lm_structured_response_timeout_is_not_authoritative(
     assert workspace.path.exists()
 
 
+_ATTEMPT_REPO_ID = "repo_" + "a" * 32
+
+
+def _host_attempt_receipt(request_id: str, **overrides: object) -> dict:
+    receipt: dict = {
+        "schema_id": "aiworkhub.reasoning_context_attempt.v1",
+        "request_id": request_id,
+        "repo_id": _ATTEMPT_REPO_ID,
+        "requested_model": "glm-5.2",
+        "host_model": {
+            "id": "glm-5.2",
+            "family": "glm-5.2",
+            "name": "GLM-5.2",
+            "vendor": "customendpoint",
+            "version": "1.0.0",
+        },
+        "requested_profile": "canonical_high",
+        "send_state": "sent",
+        "send_turn_count": 2,
+        "provider_request_acknowledged": True,
+        "option_status": "applied",
+        "option_key": "reasoningEffort",
+        "option_value": "high",
+        "context_capacity_tokens": 128000,
+        "context_capacity_source": "model.maxInputTokens",
+        "provider_internal_state": "unknown",
+        "unknown_reason": None,
+    }
+    receipt.update(overrides)
+    return receipt
+
+
+def _worker_success_result(**fields: object) -> dict:
+    return {
+        "type": "result",
+        "subtype": "success",
+        "is_error": False,
+        "result": "implemented",
+        "changed_paths": ["out/result.txt"],
+        **fields,
+    }
+
+
+def _finalize_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    repo: Path,
+    result: dict,
+    *,
+    exit_code: int,
+    adapter_id: str = "glm_vscode_lm",
+) -> tuple[process_launcher.ProcessManager, str, dict, list[tuple[str, str]]]:
+    """Finalize one persisted request whose worker stdout ends in ``result``."""
+    monkeypatch.setenv(process_launcher.ALLOW_WRITES_ENV, "1")
+    monkeypatch.setenv(worker_workspace.SANDBOX_BACKEND_ENV, "landlock")
+    card = _card()
+    card.update({
+        "status": "processing",
+        "worker_status": "in_progress",
+        "claimed_by": card["runner"],
+    })
+    manager, _workspace, request_id = _persisted_request(
+        monkeypatch, tmp_path, repo, card, status={"state": "exited", "exit_code": exit_code}
+    )
+    process_dir = tmp_path / "processes"
+    metadata_path = process_dir / f"{request_id}.request.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata.update({
+        "adapter_id": adapter_id,
+        "model": "glm-5.2",
+        "vscode_lm_bridge": {"repo_id": _ATTEMPT_REPO_ID},
+    })
+    worker_workspace.write_json_0600(metadata_path, metadata)
+    (process_dir / f"{request_id}.stdout.log").write_text(
+        json.dumps(result) + "\n", encoding="utf-8"
+    )
+    transitions: list[tuple[str, str]] = []
+
+    def review(repo_root, task_id, runner, substatus, *, evidence=None) -> dict:
+        transitions.append(("review", substatus))
+        return {"ok": True}
+
+    def failure(
+        repo_root, task_id, runner, substatus, *, evidence=None, request_id=""
+    ) -> dict:
+        transitions.append(("failure", substatus))
+        return {"ok": True}
+
+    monkeypatch.setattr(process_launcher.task_engine, "mark_terminal_review", review)
+    monkeypatch.setattr(process_launcher.task_engine, "mark_terminal_failure", failure)
+    # Bridge terminal-decision publication has its own coverage; this seam is the
+    # worker result the launcher reads after the host has already answered.
+    monkeypatch.setattr(
+        manager, "_publish_bridge_cancellation_before_finalization", lambda *_a, **_k: ""
+    )
+    event = manager._finalize_isolated_request(request_id, supervisor_returncode=exit_code)
+    assert event is not None
+    return manager, request_id, event, transitions
+
+
+def _attempt_identity(request_id: str) -> dict:
+    return {
+        "repo_id": _ATTEMPT_REPO_ID,
+        "task_id": "TASK_B1",
+        "request_id": request_id,
+        "adapter_id": "glm_vscode_lm",
+        "model": "glm-5.2",
+        "claim_epoch": 1,
+    }
+
+
+@pytest.mark.skipif(os.name == "nt", reason="review finalization needs the POSIX sandbox")
+def test_vscode_lm_terminal_event_persists_the_verified_attempt_receipt(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    repo: Path,
+) -> None:
+    receipt = _host_attempt_receipt("persisted-request")
+
+    manager, request_id, event, transitions = _finalize_attempt(
+        monkeypatch,
+        tmp_path,
+        repo,
+        _worker_success_result(reasoning_context_attempt=receipt),
+        exit_code=0,
+    )
+
+    expected = {
+        "schema_id": "aiworkhub.reasoning_context_attempt_event.v1",
+        "identity": _attempt_identity(request_id),
+        "receipt": receipt,
+    }
+    assert event["state"] == "review_ready"
+    assert (event["task_id"], event["adapter_id"], event["model"]) == (
+        "TASK_B1",
+        "glm_vscode_lm",
+        "glm-5.2",
+    )
+    assert event["reasoning_context_attempt"] == expected
+    assert manager._latest_by_request()[request_id]["reasoning_context_attempt"] == expected
+    assert transitions == [("review", "review_ready")]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="review finalization needs the POSIX sandbox")
+@pytest.mark.parametrize(
+    ("result_fields", "reason"),
+    [
+        (
+            {"reasoning_context_attempt": _host_attempt_receipt("b" * 32)},
+            "receipt_identity_mismatch",
+        ),
+        ({"reasoning_context_attempt": ["malformed"]}, "receipt_malformed"),
+        ({}, "receipt_absent"),
+    ],
+    ids=["foreign", "malformed", "absent"],
+)
+def test_unverifiable_attempt_receipt_is_unknown_and_leaves_disposition_alone(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    repo: Path,
+    result_fields: dict,
+    reason: str,
+) -> None:
+    _manager, request_id, event, transitions = _finalize_attempt(
+        monkeypatch,
+        tmp_path,
+        repo,
+        _worker_success_result(**result_fields),
+        exit_code=0,
+    )
+
+    attempt = event["reasoning_context_attempt"]
+    assert attempt["identity"] == _attempt_identity(request_id)
+    assert attempt["receipt"]["unknown_reason"] == reason
+    assert (attempt["receipt"]["send_state"], attempt["receipt"]["option_status"]) == (
+        "unknown",
+        "unknown",
+    )
+    assert attempt["receipt"]["option_key"] is None
+    assert event["state"] == "review_ready"
+    assert transitions == [("review", "review_ready")]
+
+
+def test_vscode_lm_worker_failure_records_a_typed_unknown_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    repo: Path,
+) -> None:
+    _manager, request_id, event, transitions = _finalize_attempt(
+        monkeypatch,
+        tmp_path,
+        repo,
+        {
+            "type": "result",
+            "subtype": "error",
+            "is_error": True,
+            "error": "vscode_lm_response_timeout",
+        },
+        exit_code=1,
+    )
+
+    attempt = event["reasoning_context_attempt"]
+    assert attempt["identity"] == _attempt_identity(request_id)
+    assert attempt["receipt"]["unknown_reason"] == "receipt_absent"
+    assert attempt["receipt"]["send_state"] == "unknown"
+    assert event["state"] == "worker_failed"
+    assert transitions == [("failure", "worker_failed")]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="review finalization needs the POSIX sandbox")
+def test_non_vscode_terminal_event_carries_no_attempt_receipt(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    repo: Path,
+) -> None:
+    _manager, _request_id, event, transitions = _finalize_attempt(
+        monkeypatch,
+        tmp_path,
+        repo,
+        _worker_success_result(
+            reasoning_context_attempt=_host_attempt_receipt("persisted-request")
+        ),
+        exit_code=0,
+        adapter_id="claude_cli",
+    )
+
+    assert event["state"] == "review_ready"
+    assert "reasoning_context_attempt" not in event
+    assert transitions == [("review", "review_ready")]
+
+
 def test_provider_timeout_evidence_rejects_unstructured_timeout_prose(tmp_path: Path) -> None:
     output = tmp_path / "provider.jsonl"
     output.write_text(
