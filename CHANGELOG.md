@@ -6,6 +6,30 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.53] - 2026-09-21
+
+### Added
+
+- Verified worker-attempt receipts now persist the selected reasoning option and
+  reported model context capacity. They do not establish provider-internal
+  reasoning effort or a causal quality improvement.
+
+### Fixed
+
+- Truncated semantic-review packets tell reviewers to inspect hash-matched
+  candidate overlays for omitted hunks, without treating a genuine missing or
+  stale overlay as verified evidence (NF-2026-00931).
+- Required-output contracts are checked at task creation; terminal failures
+  distinguish validation failure from provider timeout, and rate limits have
+  a typed event.
+- Dashboard snapshots bound their quarantine detail instead of returning
+  an unbounded list.
+
+### Not in this release
+
+- The full stage-gated Playbook, LSP index integration, causal reasoning-quality
+  measurement, and Muse/OpenCode worker qualification remain incomplete.
+
 ## [0.11.52] - 2026-09-20
 
 ### Added

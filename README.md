@@ -62,6 +62,18 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
+## What's new in 0.11.53
+
+- Semantic-review prompts now request hash-matched candidate overlays for
+  omitted hunks in truncated packets, while missing or stale evidence still
+  fails closed (NF-2026-00931).
+- Required-output checks, terminal-failure classification and bounded dashboard
+  snapshots reduce avoidable task and operator churn.
+- Worker-attempt reasoning/context receipts are durable, but provider-internal
+  effort and quality impact are not yet proven.
+- Full Playbook stage gates, LSP index integration and Muse/OpenCode worker
+  qualification remain in progress.
+
 ## What's new in 0.11.52
 
 - Semantic review is now bounded to a candidate's exact changed segments and

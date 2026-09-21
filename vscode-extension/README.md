@@ -14,6 +14,17 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.11.53
+
+- The bundled semantic reviewer requests hash-matched candidate overlays for
+  omitted hunks and still fails closed on missing or stale evidence.
+- Bundled task creation checks required outputs; terminal events distinguish
+  validation failures from provider timeouts and bound dashboard snapshots.
+- Worker-attempt reasoning/context receipts are durable, not proof of
+  provider-internal effort or improved quality.
+- Full Playbook stage gates, LSP index integration and Muse/OpenCode worker
+  qualification remain in progress.
+
 ## What's new in 0.11.52
 
 - The wave mini-roadmap now shows the current wave's goals as a live checklist

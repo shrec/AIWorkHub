@@ -1,5 +1,26 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.53 — 2026-09-21
+
+### Added
+
+- Bundled worker-attempt receipts persist the selected reasoning option and
+  reported model context capacity, without claiming provider-internal effort.
+
+### Fixed
+
+- Bundled semantic-review prompts request hash-matched candidate overlays for
+  omitted hunks in truncated packets and still fail closed on missing or stale
+  overlay evidence (NF-2026-00931).
+- Bundled task creation checks required outputs; terminal events distinguish
+  validation failure from provider timeout and record typed rate limits.
+- Dashboard snapshot quarantine detail is bounded.
+
+### Not in this release
+
+- Full Playbook stage gates, LSP index integration, causal reasoning-quality
+  measurement, and Muse/OpenCode worker qualification remain incomplete.
+
 ## 0.11.52 — 2026-09-20
 
 ### Added
