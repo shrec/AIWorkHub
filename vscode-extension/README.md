@@ -14,6 +14,21 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.11.57
+
+- Windows: bundled native CLI workers now start inside their AppContainer.
+  - The container is granted the provider install (read) and the per-request
+    worktree, home and temp (modify, revoked on close).
+  - Worker launches get outbound internet only. Validation launches get none.
+- C/C++ repositories: CMake-style `include/` headers resolve, and
+  `cmake`/`ctest` are trusted validation tools.
+- Blocked-card rework recovery works on Windows, and dispatcher health reports
+  undelivered manager-inbox callbacks.
+- The VS Code LM bridge gives one correction for a tool name that is not
+  allowlisted, instead of failing the request.
+- Known issue: a full native CLI worker run on Windows is not yet proven end to
+  end.
+
 ## What's new in 0.11.56
 
 - The bundled runtime's explicit manager recovery of a blocked task can now

@@ -1,5 +1,42 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.57 — 2026-09-21
+
+### Fixed
+
+- Bundled runtime, Windows: native CLI workers now start inside their
+  repo-scoped AppContainer.
+  - The container SID is granted read/execute on the provider CLI install, and
+    modify on the per-request worktree, isolated home and temp; the modify
+    grants are revoked on close.
+  - Grants are refused for UNC or device paths, reparse points, profile and
+    AppData roots, the user temp directory, and system trees.
+  - Worker launches get outbound internet only (`internetClient`). Validation
+    launches get no network.
+  - `LOCALAPPDATA` is supplied to the child environment block, which
+    AppContainer process creation requires.
+  - (NF-2026-00025, NF-2026-00033.)
+- Bundled runtime: C/C++ quoted includes resolve against the conventional
+  `include/` and `src/` roots, and `cmake`/`ctest` are trusted validation
+  executables.
+- Bundled runtime: blocked-card rework recovery works on Windows. Worker pids
+  are probed without `os.kill(pid, 0)`, which on Windows raised `[WinError 87]`
+  or terminated the process (NF-2026-00031).
+- Bundled runtime: dispatcher health reports undelivered manager-inbox
+  callbacks (NF-2026-00029). The reconciler backs off standby lock retries to a
+  5 s cap (NF-2026-00028).
+- VS Code LM bridge:
+  - Declared writable files stay readable during forced staging
+    (NF-2026-00023).
+  - A tool name that is not allowlisted gets one correction instead of failing
+    the request (NF-2026-00032).
+
+### Known issues
+
+- A full native CLI worker run on Windows is not yet proven end to end. The
+  worker MCP server's interpreter and package, and git access to the canonical
+  `.git`, are not yet granted to the container.
+
 ## 0.11.56 — 2026-09-21
 
 ### Changed

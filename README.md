@@ -62,6 +62,28 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
+## What's new in 0.11.57
+
+- Windows native CLI workers (`claude_cli`, `opencode_cli`) now start inside
+  their AppContainer, and validation commands run inside it too.
+  - The container is granted exactly the paths it needs: read on the provider
+    install; modify on the per-request worktree, home and temp, revoked on
+    close.
+  - Worker launches get outbound internet only. Validation launches get no
+    network.
+- C/C++ repositories: CMake-style `include/` headers resolve, and
+  `cmake`/`ctest` are trusted validation tools.
+- Blocked-card rework recovery works on Windows. Worker liveness is probed
+  without `os.kill(pid, 0)`, which on Windows raised `[WinError 87]` or
+  terminated the process.
+- Dispatcher health reports manager-inbox callbacks that nothing delivers. The
+  reconciler no longer spins in standby.
+- VS Code LM workers get one correction for a tool name that is not allowlisted,
+  and can read their declared files during forced staging.
+- Known issue: a full native CLI worker run on Windows is not yet proven end to
+  end; the worker MCP server runtime and the canonical `.git` are not yet
+  granted to the container.
+
 ## What's new in 0.11.56
 
 - Explicit manager recovery of a blocked task can now recover a timed-out

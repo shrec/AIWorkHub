@@ -6,6 +6,77 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.57] - 2026-09-21
+
+### Fixed
+
+- Windows: native CLI workers (`claude_cli`, `opencode_cli`) now start inside
+  their repo-scoped AppContainer. Three stacked defects stopped every such card
+  before the model ran, although preflight reported the route launchable:
+  - the `provision_worker_mcp_runtime`, `sandbox_argv` and `run_validations`
+    consumers all refused the `windows_appcontainer` backend;
+  - `CreateProcessW` failed with `ERROR_ENVVAR_NOT_FOUND` (203) because the
+    sanitized child environment lacked `LOCALAPPDATA`;
+  - the container SID was granted nothing, so the provider CLI could not read
+    its own install (NF-2026-00025).
+- Windows AppContainer launches now grant filesystem access to the container
+  SID and to nothing else.
+  - The provider CLI install gets read/execute. This grant is persistent and
+    idempotent.
+  - The per-request worktree, isolated home and temp get modify. Each is revoked
+    on close by removing only this SID's entries.
+  - A grant is refused for UNC or device paths, reparse points, drive roots, the
+    user profile and AppData roots, the user temp directory, and anything inside
+    the Windows or Program Files trees.
+  - An npm `.cmd` shim runs through its native `.exe` target, which must lie
+    strictly inside the shim's `node_modules`.
+- Windows: worker launches get outbound internet so that a provider CLI can
+  reach its API. They get `internetClient` only: no inbound listening and no
+  private network. Validation launches run untrusted candidate code and get no
+  network capability. `windows_confinement_report()` states this split instead
+  of a blanket "network" (NF-2026-00033).
+- Windows: validation commands run inside the worker's own AppContainer instead
+  of being refused.
+- C/C++ repositories: quoted includes now resolve against the conventional
+  `include/` and `src/` roots. A CMake project whose sources include
+  `"pkg/x.hpp"` from `include/` is no longer refused as
+  `local_quoted_include_unresolved`. A header that is genuinely missing still
+  fails closed, and symlinked or junction roots are skipped. `cmake` and `ctest`
+  are now trusted validation executables, resolved through the same path as
+  `git` and `node`.
+- `aiworkhub_task_recover_blocked_rework` now works on Windows.
+  - Cause: it probed recorded worker pids with `os.kill(pid, 0)`. On Windows
+    that call is `GenerateConsoleCtrlEvent`, which raises `[WinError 87]` for an
+    exited pid, and without a console it is `TerminateProcess`.
+  - Recovery, the Source Graph LSP child check and the recipe helper now use the
+    shared liveness probe, which sends no signal.
+  - An OS error from recovery now names its operation and path (NF-2026-00031).
+- `aiworkhub_dispatcher_health` no longer reports healthy when callbacks wait in
+  a manager inbox that nothing delivers. It reports
+  `manager_inbox_no_live_delivery` with `backlog_count` and `oldest_pending_at`,
+  and gates nothing (NF-2026-00029).
+- The reconciler backs off standby lock retries from 0.25 s to a 5 s cap
+  instead of spinning for hours (NF-2026-00028).
+- VS Code LM workers:
+  - After forced semantic-edit staging begins, a worker can read the files its
+    card declared writable, not only its next required output (NF-2026-00023).
+  - Outside forced staging, a tool name that is not allowlisted gets one
+    correction that names the allowed tools and executes nothing, instead of
+    failing the request. A second violation fails, and the turn trace is kept
+    (NF-2026-00032).
+- `tests/test_worker_workspace.py` and the Source Graph LSP tests now collect
+  and run on Windows.
+
+### Known issues
+
+- A full native CLI worker run on Windows is not yet proven end to end. The
+  container is not yet granted the worker MCP server's interpreter and package,
+  or git access to the canonical `.git` from a linked worktree. `codex_cli`'s
+  shim is not an npm shim, so it still runs through `cmd.exe`, which is denied
+  inside the container.
+- One Windows byte-exactness gap remains in the npm-prefix seeding test
+  (NF-2026-00024).
+
 ## [0.11.56] - 2026-09-21
 
 ### Changed
