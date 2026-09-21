@@ -2758,3 +2758,287 @@ def test_supplemental_inspection_refuses_a_lens_the_packet_was_not_sealed_for():
     assert quality_reviewer.plan_supplemental_inspection(
         lens="not_a_lens", packet=packet
     )["reason"] == "reviewer_lens_invalid"
+
+
+# ---------------------------------------------------------------------------
+# NF-2026-00931: omitted hunks the packet seals to a candidate digest are
+# INSPECTED through the candidate overlay, never escalated unread.
+#
+# NF-2026-00930's claim-7 packet had diff_complete=false on both changed paths
+# (omitted hunks 2 + 1) and a candidate_sha256 equal to the sealed digest, so
+# ``candidate_hunk_inspection_coverage`` called every hunk reachable.  The
+# reviewer prompt nonetheless said that missing changed-segment evidence for any
+# changed path "must be escalated as a process_limit finding".  Both reviewers
+# read the exact candidate files, filed process_limit, and accept_review failed
+# reviewer_could_not_inspect on a candidate nobody had judged.
+# ---------------------------------------------------------------------------
+
+_NF931_LENSES = ("correctness", "security", "code_quality")
+_NF931_ALPHA = "src/aiworkhub/alpha_review.py"
+_NF931_BETA = "src/aiworkhub/beta_review.py"
+_NF931_DEFAULT_CLAUSE = (
+    "Fail closed on unknowns: a non-empty known_unknowns list, or missing or "
+    "stale changed-segment evidence for any changed path, must be escalated as "
+    "a process_limit finding and can never support a clean result.\n"
+)
+
+
+def _nf931_digest(path: str) -> str:
+    return hashlib.sha256(f"candidate bytes of {path}".encode("utf-8")).hexdigest()
+
+
+def _nf931_row(digest: str, *, inline_hunks: int, omitted: int) -> dict:
+    segments = _segments(inline_hunks + omitted)
+    for segment in segments[inline_hunks:]:
+        segment["truncated"] = True
+    excerpt = "@@ replace @@\n+kept\n"
+    return {
+        "candidate_sha256": digest,
+        "excerpt": excerpt,
+        "excerpt_bytes": len(excerpt),
+        "source_bytes": 8192,
+        "truncated": True,
+        "diff_complete": False,
+        "segments": segments,
+        "omission_reason": f"changed_hunks_omitted:{omitted}",
+    }
+
+
+def _nf931_scoped_audit(lens: str, paths: list[str], known_unknowns: list[str]) -> dict:
+    inner = {
+        "task_id": "T-NF930",
+        "review_lens": {"lens_kind": lens},
+        "changed_paths": [{"path": path} for path in paths],
+        "known_unknowns": known_unknowns,
+    }
+    return {
+        "schema_id": "aiworkhub.scoped_audit.v1",
+        "fingerprint": _canonical_digest(inner),
+        "known_unknowns": inner["known_unknowns"],
+        "packet": inner,
+    }
+
+
+def _nf931_packet(
+    omitted: dict[str, int] | None = None, *, known_unknowns: tuple[str, ...] = ()
+) -> dict:
+    """The NF-2026-00930 claim-7 shape: diff_complete=false, omissions 2 + 1."""
+
+    omitted = omitted or {_NF931_ALPHA: 2, _NF931_BETA: 1}
+    paths = sorted(omitted)
+    return quality_reviewer.build_review_packet(
+        request_id="R-NF930",
+        task_id="T-NF930",
+        claim_epoch=7,
+        worker_provider="codex_cli",
+        changed_path_hashes={path: _nf931_digest(path) for path in paths},
+        source_evidence={
+            path: _nf931_row(_nf931_digest(path), inline_hunks=1, omitted=omitted[path])
+            for path in paths
+        },
+        scoped_audits={
+            lens: _nf931_scoped_audit(lens, paths, list(known_unknowns))
+            for lens in _NF931_LENSES
+        },
+    )
+
+
+def _nf931_resealed(packet: dict) -> dict:
+    body = {key: value for key, value in packet.items() if key != "packet_sha256"}
+    return {**body, "packet_sha256": _canonical_digest(body)}
+
+
+def _nf931_line(path: str, omitted: int) -> str:
+    noun = "hunk" if omitted == 1 else "hunks"
+    return f'- "{path}": candidate_sha256 {_nf931_digest(path)}, {omitted} omitted {noun}\n'
+
+
+def test_nf930_truncated_inline_diff_is_inspected_through_the_overlay_not_escalated():
+    """The exact NF-2026-00930 packet no longer forces process_limit."""
+
+    packet = quality_reviewer.build_lens_packet(_nf931_packet(), lens="correctness")
+    rows = packet["candidate"]["source_evidence"]
+    assert [row["diff_complete"] for row in rows] == [False, False]
+    assert [row["omission_reason"] for row in rows] == [
+        "changed_hunks_omitted:2",
+        "changed_hunks_omitted:1",
+    ]
+    coverage = quality_reviewer.candidate_hunk_inspection_coverage(packet)
+    assert coverage["complete"] is True and coverage["unreachable"] == []
+
+    prompt = quality_reviewer.build_review_prompt(packet, lens="correctness")
+
+    # A path the coverage plan proves overlay-readable is not "missing evidence".
+    assert _NF931_DEFAULT_CLAUSE not in prompt
+    assert "missing or stale changed-segment evidence for any changed path" not in prompt
+    assert "OMITTED CHANGED HUNKS." in prompt
+    assert _nf931_line(_NF931_ALPHA, 2) in prompt
+    assert _nf931_line(_NF931_BETA, 1) in prompt
+    assert "diff_complete false alone is never a reason to file process_limit" in prompt
+    # process_limit stays available for what genuinely cannot be read.
+    assert "File process_limit only when" in prompt
+    assert "must be escalated as a process_limit finding" in prompt
+
+
+def test_overlay_instruction_verifies_path_and_digest_before_reading_and_stays_exact():
+    packet = quality_reviewer.build_lens_packet(_nf931_packet(), lens="correctness")
+
+    prompt = quality_reviewer.build_review_prompt(packet, lens="correctness")
+
+    start = prompt.index("OMITTED CHANGED HUNKS.")
+    block = prompt[start : prompt.index("The packet is deterministic evidence", start)]
+    assert block.index("1. Verify first:") < block.index("2. Then read only each omitted hunk")
+    assert "authority_source candidate_overlay" in block
+    assert f"packet_sha256 {packet['packet_sha256']}" in block
+    assert "freshness.indexed_source_hash" in block
+    assert "never run a hashing command" in block
+    assert "candidate_start_line to candidate_end_line" in block
+    assert "No whole-file read, no repository scan, no path outside this list" in block
+    assert block.count("\n- ") == 2
+    # A stale, missing or unverifiable overlay is exactly what process_limit is for.
+    assert (
+        "File process_limit only when a listed path's overlay is unreachable, "
+        "missing, stale or fails step 1"
+    ) in block
+
+
+def test_known_unknowns_still_escalate_beside_the_overlay_instruction():
+    packet = quality_reviewer.build_lens_packet(
+        _nf931_packet(known_unknowns=("dynamic dispatch is unresolved",)),
+        lens="correctness",
+    )
+
+    prompt = quality_reviewer.build_review_prompt(packet, lens="correctness")
+
+    assert "OMITTED CHANGED HUNKS." in prompt
+    assert "Fail closed on unknowns: a non-empty known_unknowns list" in prompt
+    assert "must be escalated as a process_limit finding" in prompt
+    assert "can never support a clean result" in prompt
+    assert "dynamic dispatch is unresolved" in prompt
+
+
+def _nf931_mismatched_digest(packet: dict) -> dict:
+    for row in packet["candidate"]["source_evidence"]:
+        row["candidate_sha256"] = "f" * 64
+    return packet
+
+
+def _nf931_missing_digest(packet: dict) -> dict:
+    for row in packet["candidate"]["source_evidence"]:
+        row["candidate_sha256"] = None
+    return packet
+
+
+def _nf931_unsealed_changed_path(packet: dict) -> dict:
+    for row in packet["candidate"]["changed_paths"]:
+        row["sha256"] = None
+    return packet
+
+
+def _nf931_out_of_delta_path(packet: dict) -> dict:
+    packet["candidate"]["source_evidence"].append(
+        {
+            "path": "src/aiworkhub/secret.py",
+            "candidate_sha256": _nf931_digest("src/aiworkhub/secret.py"),
+            "excerpt": "x",
+            "diff_complete": True,
+            "segments": [],
+        }
+    )
+    return packet
+
+
+def _nf931_absent_source_evidence(packet: dict) -> dict:
+    del packet["candidate"]["source_evidence"]
+    return packet
+
+
+def _nf931_unparseable_omission(packet: dict) -> dict:
+    packet["candidate"]["source_evidence"][0]["omission_reason"] = "changed_hunks_omitted:many"
+    return packet
+
+
+@pytest.mark.parametrize(
+    ("tamper", "reason"),
+    [
+        (_nf931_mismatched_digest, "candidate_hunks_unreachable"),
+        (_nf931_missing_digest, "candidate_hunks_unreachable"),
+        (_nf931_unsealed_changed_path, "candidate_hunks_unreachable"),
+        (_nf931_out_of_delta_path, "candidate_source_evidence_path_mismatch"),
+        (_nf931_absent_source_evidence, "candidate_source_evidence_missing"),
+        (_nf931_unparseable_omission, "candidate_source_evidence_invalid"),
+    ],
+    ids=[
+        "mismatched-digest",
+        "missing-digest",
+        "unsealed-changed-path",
+        "out-of-delta-path",
+        "absent-source-evidence",
+        "unparseable-omission",
+    ],
+)
+def test_overlay_instruction_is_never_granted_without_a_proven_route(tamper, reason):
+    """Each of these keeps the ordinary fail-closed prompt, byte for byte."""
+
+    packet = _nf931_resealed(tamper(_nf931_packet()))
+
+    coverage = quality_reviewer.candidate_hunk_inspection_coverage(packet)
+    prompt = quality_reviewer.build_review_prompt(packet, lens="correctness")
+
+    assert coverage["complete"] is False and coverage["reason"] == reason
+    assert "OMITTED CHANGED HUNKS." not in prompt
+    assert _NF931_DEFAULT_CLAUSE in prompt
+
+
+def test_a_path_without_a_sealed_digest_stays_escalated_beside_a_readable_one():
+    packet = _nf931_packet()
+    for row in packet["candidate"]["source_evidence"]:
+        if row["path"] == _NF931_BETA:
+            row["candidate_sha256"] = "f" * 64
+
+    prompt = quality_reviewer.build_review_prompt(_nf931_resealed(packet), lens="correctness")
+
+    assert _nf931_line(_NF931_ALPHA, 2) in prompt
+    assert _nf931_line(_NF931_BETA, 1) not in prompt
+    (unreadable,) = [
+        line for line in prompt.splitlines() if "cannot be read through the overlay" in line
+    ]
+    assert f'"{_NF931_BETA}"' in unreadable and _NF931_ALPHA not in unreadable
+    assert "Escalate them as process_limit findings" in unreadable
+
+
+def test_overlay_instruction_names_a_bounded_number_of_paths():
+    omitted = {f"src/aiworkhub/bulk_{index:02d}.py": 1 for index in range(30)}
+    packet = quality_reviewer.build_lens_packet(_nf931_packet(omitted), lens="correctness")
+
+    prompt = quality_reviewer.build_review_prompt(packet, lens="correctness")
+
+    limit = quality_reviewer.MAX_OVERLAY_INSTRUCTION_PATHS
+    assert prompt.count('\n- "src/aiworkhub/bulk_') == limit
+    assert f"and {30 - limit} more paths" in prompt
+
+
+def test_a_failed_overlay_verification_is_still_reportable_as_a_process_limit_finding():
+    """The fix narrows when process_limit is asked for; it stays representable."""
+
+    packet = quality_reviewer.build_lens_packet(_nf931_packet(), lens="correctness")
+
+    findings = quality_reviewer.normalize_packet_findings(
+        packet,
+        lens="correctness",
+        findings=[
+            {
+                "severity": "low",
+                "disposition": "process_limit",
+                "summary": "overlay hash does not match the sealed candidate digest",
+                "evidence": (
+                    f"{_NF931_ALPHA} overlay freshness.state stale; "
+                    "its omitted hunks could not be read"
+                ),
+            }
+        ],
+    )
+
+    (finding,) = findings
+    assert finding["disposition"] == "process_limit"
+    assert finding["actionable"] is False

@@ -690,6 +690,107 @@ _SCHEMA_REPAIR_HEADER = (
 )
 
 
+# NF-2026-00931.  A path whose inline diff was cut short is not a path with
+# missing evidence when the packet sealed its candidate digest: the reviewer's
+# packet-bound ``candidate_overlay`` index resolves exactly those bytes, so the
+# omitted hunks are READ, not escalated unread.  The block below names every
+# such path with the digest the reviewer must see before it reads, and keeps
+# ``process_limit`` for what genuinely cannot be read -- an overlay that is
+# unreachable, stale or does not verify, a path with no sealed digest, or a real
+# known unknown.  The gate is untouched: a report that files only process_limit
+# is still ``reviewer_could_not_inspect``.
+MAX_OVERLAY_INSTRUCTION_PATHS = 20
+_OVERLAY_INSPECTION_HEADER = (
+    "OMITTED CHANGED HUNKS. For the paths below candidate.source_evidence "
+    "carries only part of the diff (diff_complete is false): the hunks marked "
+    "truncated in its segments, counted by omission_reason, are cut short or "
+    "absent in that excerpt. The packet sealed each path's candidate digest, "
+    "so the packet-bound candidate_overlay Source Graph index resolves "
+    "exactly those bytes:\n"
+)
+_OVERLAY_INSPECTION_STEPS = (
+    "Inspect these hunks; do not escalate them unread.\n"
+    "1. Verify first: an overlay reply must show authority_source "
+    "candidate_overlay and packet_sha256 {packet_digest}, and for the listed "
+    "path a source hash (freshness.indexed_source_hash, or file.source_hash) "
+    "equal to the candidate_sha256 above with freshness.state fresh. Compare "
+    "the strings; never run a hashing command.\n"
+    "2. Then read only each omitted hunk, at the candidate_start_line to "
+    "candidate_end_line of its segments row in that exact path, and after "
+    "that only the graph-connected callers and tests of those hunks. No "
+    "whole-file read, no repository scan, no path outside this list.\n"
+    "3. Judge what you read like any inline hunk: report a defect as a defect "
+    "finding; a hunk you read and found sound needs no finding. diff_complete "
+    "false alone is never a reason to file process_limit.\n"
+    "File process_limit only when a listed path's overlay is unreachable, "
+    "missing, stale or fails step 1 (name the path and the failed check), or "
+    "for a real unknown the packet names in known_unknowns; never in place of "
+    "a read you could do.\n"
+)
+
+
+def _omitted_hunk_overlay_instruction(
+    packet: Mapping[str, Any], *, packet_digest: str
+) -> str:
+    """Render how to READ the changed hunks the packet's inline diff omits.
+
+    A path is named only when ``candidate_hunk_inspection_coverage`` proves the
+    route: its row is not ``diff_complete``, it itemizes an omitted hunk, and
+    its candidate digest equals the digest the packet sealed for that path.
+    Every other path that is not inline -- no sealed digest, a mismatched one,
+    no itemized hunk -- is named as unreadable and stays a process_limit, and a
+    record that is invalid as a whole (a path outside the declared delta, absent
+    or unparseable evidence) names nothing.  ``""`` when no path qualifies, so
+    a packet with nothing to read keeps its ordinary prompt byte for byte.
+    """
+
+    coverage = candidate_hunk_inspection_coverage(packet)
+    readable: list[dict[str, Any]] = []
+    unreadable: set[str] = set(coverage["unreachable"])
+    for row in coverage["paths"]:
+        if row["inline"]:
+            continue
+        if row["overlay_reachable"] and row["omitted_hunks"] > 0:
+            readable.append(row)
+        else:
+            unreadable.add(row["path"])
+    if not readable:
+        return ""
+    listed = "".join(
+        f"- {json.dumps(row['path'], ensure_ascii=False)}: candidate_sha256 "
+        f"{row['candidate_sha256']}, {row['omitted_hunks']} omitted "
+        f"hunk{'' if row['omitted_hunks'] == 1 else 's'}\n"
+        for row in readable[:MAX_OVERLAY_INSTRUCTION_PATHS]
+    )
+    if len(readable) > MAX_OVERLAY_INSTRUCTION_PATHS:
+        listed += (
+            f"- and {len(readable) - MAX_OVERLAY_INSTRUCTION_PATHS} more paths "
+            "under the same rule: each candidate.source_evidence row with "
+            "diff_complete false, an omitted hunk in omission_reason and a "
+            "candidate_sha256 equal to its candidate.changed_paths sha256\n"
+        )
+    unreadable_line = ""
+    if unreadable:
+        ordered = sorted(unreadable)
+        named = ", ".join(
+            json.dumps(path, ensure_ascii=False)
+            for path in ordered[:MAX_OVERLAY_INSTRUCTION_PATHS]
+        )
+        if len(ordered) > MAX_OVERLAY_INSTRUCTION_PATHS:
+            named += f" and {len(ordered) - MAX_OVERLAY_INSTRUCTION_PATHS} more"
+        unreadable_line = (
+            "The omitted hunks of these paths cannot be read through the overlay "
+            "(no sealed candidate digest matches, or no omitted hunk is itemized): "
+            f"{named}. Escalate them as process_limit findings.\n"
+        )
+    return (
+        _OVERLAY_INSPECTION_HEADER
+        + listed
+        + _OVERLAY_INSPECTION_STEPS.format(packet_digest=packet_digest)
+        + unreadable_line
+    )
+
+
 def build_review_prompt(
     packet: Mapping[str, Any],
     *,
@@ -764,6 +865,15 @@ def build_review_prompt(
         if unchanged_paths
         else ""
     )
+    overlay_instruction = _omitted_hunk_overlay_instruction(
+        packet, packet_digest=packet_digest
+    )
+    unread_evidence = (
+        "changed-segment evidence for any changed path that is still missing "
+        "or stale after the omitted-hunk inspection below"
+        if overlay_instruction
+        else "missing or stale changed-segment evidence for any changed path"
+    )
     scope_instruction = (
         f"candidate.scoped_audits.{lens} is the graph-scoped audit for this "
         "lens: use it as the primary behavior boundary and treat its "
@@ -773,10 +883,9 @@ def build_review_prompt(
         "affected callers and tests the scoped audit lists; then its explicit "
         "known_unknowns. Review exactly that bounded delta: do not re-read "
         "whole files and do not scan the whole repository.\n"
-        "Fail closed on unknowns: a non-empty known_unknowns list, or missing "
-        "or stale changed-segment evidence for any changed path, must be "
-        "escalated as a process_limit finding and can never support a clean "
-        f"result.\n{unchanged_instruction}"
+        "Fail closed on unknowns: a non-empty known_unknowns list, or "
+        f"{unread_evidence}, must be escalated as a process_limit finding and "
+        f"can never support a clean result.\n{unchanged_instruction}"
         if active_scope is not None
         else ""
     )
@@ -832,6 +941,7 @@ def build_review_prompt(
         "You are intentionally not given the worker's rationale, self-verdict, or final answer. "
         "Do not write, edit, format, or delete repository files.\n"
         f"{scope_instruction}"
+        f"{overlay_instruction}"
         f"{_ALREADY_ESTABLISHED_MECHANICALLY}"
         "Report only concrete items supported by file/line or check evidence. "
         f"{QUALITY_REVIEW_FINDING_SCHEMA_DOC}\n"

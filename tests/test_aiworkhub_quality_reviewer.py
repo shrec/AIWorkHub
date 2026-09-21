@@ -549,3 +549,98 @@ def test_candidate_delta_must_cover_exactly_the_changed_paths():
                                          "predecessor_sha256": "not-a-digest"}},
             }
         )
+
+
+def _truncated_evidence():
+    """A cut-short diff: one hunk inline, one omitted, candidate digest sealed."""
+
+    return _evidence(
+        excerpt="@@ replace @@\n+kept\n",
+        excerpt_bytes=20,
+        truncated=True,
+        diff_complete=False,
+        segments=[_segment(12, 14), {**_segment(30, 33), "truncated": True}],
+        omission_reason="changed_hunks_omitted:1",
+    )
+
+
+def test_truncated_diff_with_a_sealed_digest_is_read_through_the_overlay_not_escalated():
+    """NF-2026-00931: diff_complete=false plus a matching sealed digest is a read."""
+
+    packet = _packet(
+        source_evidence=_truncated_evidence(),
+        scoped_audits=_scoped_audits("correctness"),
+    )
+
+    prompt = quality_reviewer.build_review_prompt(packet, lens="correctness")
+
+    assert "OMITTED CHANGED HUNKS." in prompt
+    assert f'- "src/mod.py": candidate_sha256 {DIGEST}, 1 omitted hunk\n' in prompt
+    assert "or missing or stale changed-segment evidence for any changed path" not in prompt
+    # The fixture's scope names a known unknown, so that escalation must survive
+    # beside the overlay instruction.
+    assert "escalated as a process_limit finding" in prompt
+    assert "can never support a clean result" in prompt
+
+
+@pytest.mark.parametrize("lens", ["correctness", "security", "code_quality"])
+def test_every_lens_prompt_binds_the_overlay_instruction_to_its_own_sealed_packet(lens):
+    shared = _packet(
+        source_evidence=_truncated_evidence(),
+        scoped_audits=_scoped_audits("correctness", "security", "code_quality"),
+    )
+    packet = quality_reviewer.build_lens_packet(shared, lens=lens)
+
+    prompt = quality_reviewer.build_review_prompt(packet, lens=lens)
+
+    assert f'- "src/mod.py": candidate_sha256 {DIGEST}, 1 omitted hunk\n' in prompt
+    assert f"packet_sha256 {packet['packet_sha256']}" in prompt
+    assert shared["packet_sha256"] not in prompt
+
+
+def test_deleted_candidate_path_keeps_the_ordinary_fail_closed_prompt():
+    """A deleted path has no sealed digest, so no overlay can resolve it."""
+
+    inner = {
+        "task_id": "task1",
+        "review_lens": {"lens_kind": "correctness"},
+        "changed_paths": [{"path": "src/deleted.py"}],
+        "known_unknowns": [],
+    }
+    audit = {
+        "schema_id": "aiworkhub.scoped_audit.v1",
+        "fingerprint": hashlib.sha256(
+            json.dumps(
+                inner, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+            ).encode("utf-8")
+        ).hexdigest(),
+        "known_unknowns": [],
+        "packet": inner,
+    }
+    packet = quality_reviewer.build_review_packet(
+        request_id="req1",
+        task_id="task1",
+        claim_epoch=1,
+        worker_provider="adapter-a",
+        changed_path_hashes={"src/deleted.py": None},
+        source_evidence={
+            "src/deleted.py": {
+                "candidate_sha256": None,
+                "excerpt": "",
+                "excerpt_bytes": 0,
+                "source_bytes": 0,
+                "truncated": False,
+                "segments": [],
+                "omission_reason": "candidate_deleted_or_non_file",
+            }
+        },
+        scoped_audits={"correctness": audit},
+    )
+
+    prompt = quality_reviewer.build_review_prompt(packet, lens="correctness")
+
+    assert "OMITTED CHANGED HUNKS." not in prompt
+    assert (
+        "or missing or stale changed-segment evidence for any changed path, must be "
+        "escalated as a process_limit finding"
+    ) in prompt

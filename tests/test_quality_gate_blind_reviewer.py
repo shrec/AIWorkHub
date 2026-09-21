@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import hashlib
+
 import pytest
 
 from aiworkhub import quality_evidence as qe
+from aiworkhub import quality_reviewer
 
 
 def _check(
@@ -259,3 +262,181 @@ def test_helper_nonzero_usage_false() -> None:
 
 def test_helper_non_mapping_usage_is_not_blind() -> None:
     assert qe.reviewer_report_could_not_inspect({"usage": "n/a"}) is False
+
+
+# ---------------------------------------------------------------------------
+# NF-2026-00931: the gate is unchanged.  A reviewer that read the omitted hunks
+# through the digest-bound candidate overlay and judged them satisfies its lens;
+# a report that files only process_limit -- or a lens whose hunks are not
+# provably reachable -- still blocks as reviewer_could_not_inspect.  The packet
+# proves that a read was POSSIBLE; it never turns a blind report into a clean one.
+# ---------------------------------------------------------------------------
+
+_ALPHA = "src/aiworkhub/alpha_review.py"
+_SOUND_HUNK_OBSERVATION = {
+    "id": "obs-overlay",
+    "severity": qe.SEVERITY_LOW,
+    "disposition": "observation",
+    "summary": "omitted hunk read through the candidate overlay and found sound",
+    "evidence": f"{_ALPHA}:11",
+}
+
+
+def _digest(path: str) -> str:
+    return hashlib.sha256(f"candidate bytes of {path}".encode("utf-8")).hexdigest()
+
+
+def _truncated_diff_packet() -> dict:
+    """NF-2026-00930: diff_complete=false, candidate digest sealed, one hunk omitted."""
+
+    segments = [
+        {
+            "kind": "replace",
+            "candidate_start_line": start,
+            "candidate_end_line": start + 3,
+            "changed_start_line": start,
+            "changed_end_line": start + 3,
+            "baseline_start_line": start,
+            "baseline_end_line": start + 3,
+            "excerpt_bytes": 40,
+            "truncated": truncated,
+        }
+        for start, truncated in ((1, False), (11, True))
+    ]
+    excerpt = "@@ replace @@\n+kept\n"
+    return quality_reviewer.build_review_packet(
+        request_id="R-NF930",
+        task_id="T-NF930",
+        claim_epoch=7,
+        worker_provider="codex_cli",
+        changed_path_hashes={_ALPHA: _digest(_ALPHA)},
+        source_evidence={
+            _ALPHA: {
+                "candidate_sha256": _digest(_ALPHA),
+                "excerpt": excerpt,
+                "excerpt_bytes": len(excerpt),
+                "source_bytes": 8192,
+                "truncated": True,
+                "diff_complete": False,
+                "segments": segments,
+                "omission_reason": "changed_hunks_omitted:1",
+            }
+        },
+    )
+
+
+def _resealed(packet: dict) -> dict:
+    body = {key: value for key, value in packet.items() if key != "packet_sha256"}
+    return {**body, "packet_sha256": quality_reviewer._canonical_digest(body)}
+
+
+def _verdict_over(packet: dict, reports: list[dict[str, object]]) -> dict[str, object]:
+    return qe.fold_quality_verdict(
+        [],
+        risk_profile=qe.resolve_risk_profile(qe.RISK_MEDIUM),
+        reviewer_reports=reports,
+        combined_tree_checks=[_check("union-tests")],
+        review_packets={qe.LENS_CORRECTNESS: packet},
+    )
+
+
+@pytest.mark.parametrize(
+    "findings",
+    [[], [_SOUND_HUNK_OBSERVATION]],
+    ids=["clean", "sound-hunk-observation"],
+)
+def test_reviewer_that_read_the_omitted_hunks_through_the_overlay_satisfies_the_lens(
+    findings: list[dict[str, str]],
+) -> None:
+    packet = _truncated_diff_packet()
+    assert quality_reviewer.candidate_hunk_inspection_coverage(packet)["complete"] is True
+    # The reviewer is told to read those hunks, not to escalate them unread.
+    prompt = quality_reviewer.build_review_prompt(packet, lens=qe.LENS_CORRECTNESS)
+    assert "OMITTED CHANGED HUNKS." in prompt
+    usage = {"usage_observed": True, "input_tokens": 4200, "output_tokens": 310}
+
+    verdict = _verdict_over(
+        packet, [_report(qe.LENS_CORRECTNESS, findings=findings, usage=usage)]
+    )
+
+    assert verdict["passed"] is True
+    assert "reviewer_could_not_inspect:correctness" not in verdict["blocking_evidence"]
+    assert _lens_row(verdict, qe.LENS_CORRECTNESS)["status"] == qe.STATUS_PASSED
+    assert verdict["supplemental_inspection"] == []
+
+
+def test_process_limit_only_report_over_a_readable_overlay_still_blocks() -> None:
+    verdict = _verdict_over(
+        _truncated_diff_packet(), [_report(qe.LENS_CORRECTNESS, findings=[_finding()])]
+    )
+
+    assert verdict["passed"] is False
+    assert "reviewer_could_not_inspect:correctness" in verdict["blocking_evidence"]
+    assert (
+        _lens_row(verdict, qe.LENS_CORRECTNESS)["status"]
+        == qe.STATUS_REVIEWER_COULD_NOT_INSPECT
+    )
+    (plan,) = verdict["supplemental_inspection"]
+    assert plan["eligible"] is True
+    assert plan["reason"] == ""
+    (target,) = plan["inspection_targets"]
+    assert target["path"] == _ALPHA
+    assert target["authority_source"] == "candidate_overlay"
+
+
+def test_zero_activity_report_over_a_readable_overlay_is_still_blind() -> None:
+    usage = {"usage_observed": False, "input_tokens": 0, "output_tokens": 0}
+
+    verdict = _verdict_over(
+        _truncated_diff_packet(), [_report(qe.LENS_CORRECTNESS, usage=usage)]
+    )
+
+    assert verdict["passed"] is False
+    assert "reviewer_could_not_inspect:correctness" in verdict["blocking_evidence"]
+
+
+def _mismatched_digest(packet: dict) -> None:
+    packet["candidate"]["source_evidence"][0]["candidate_sha256"] = "f" * 64
+
+
+def _missing_digest(packet: dict) -> None:
+    packet["candidate"]["source_evidence"][0]["candidate_sha256"] = None
+
+
+def _out_of_delta_path(packet: dict) -> None:
+    packet["candidate"]["source_evidence"].append(
+        {
+            "path": "src/aiworkhub/secret.py",
+            "candidate_sha256": None,
+            "excerpt": "x",
+            "diff_complete": True,
+            "segments": [],
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    ("tamper", "reason", "unreachable"),
+    [
+        (_mismatched_digest, "candidate_hunks_unreachable", [_ALPHA]),
+        (_missing_digest, "candidate_hunks_unreachable", [_ALPHA]),
+        (_out_of_delta_path, "candidate_source_evidence_path_mismatch", []),
+    ],
+    ids=["mismatched-digest", "missing-digest", "out-of-delta-path"],
+)
+def test_blind_lens_over_an_unproven_overlay_is_refused_a_reread(
+    tamper, reason: str, unreachable: list[str]
+) -> None:
+    packet = _truncated_diff_packet()
+    tamper(packet)
+
+    verdict = _verdict_over(
+        _resealed(packet), [_report(qe.LENS_CORRECTNESS, findings=[_finding()])]
+    )
+
+    assert verdict["passed"] is False
+    assert "reviewer_could_not_inspect:correctness" in verdict["blocking_evidence"]
+    (plan,) = verdict["supplemental_inspection"]
+    assert plan["eligible"] is False
+    assert plan["reason"] == reason
+    assert plan["coverage"]["unreachable"] == unreachable
