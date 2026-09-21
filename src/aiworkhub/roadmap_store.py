@@ -15,11 +15,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from . import sqlite_readonly
+
 SCHEMA_ID = "aiworkhub.roadmap_store.v1"
 ROADMAP_DB_REL = (".aiworkhub", "tasking", "roadmap.sqlite")
 ROADMAP_ID_RE = re.compile(r"^RM-\d{4}-\d{5}$")
 NEEDFIX_ID_RE = re.compile(r"^NF-\d{4}-\d{5}$")
 TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$")
+WAVE_GOAL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+WAVE_GOAL_SUCCESSOR_EVENT = "wave_goal_successor_bound"
 MAX_LIST_LIMIT = 500
 
 STATUSES = (
@@ -448,6 +452,232 @@ def link_task(
         result = get_item(repo_root, roadmap_id, _connection=conn)
         conn.commit()
         return result
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+# --- Exact wave-goal successor binding ---------------------------------------
+#
+# A wave outcome's ``provenance.wave_goals[{id,label,task_ids}]`` names each
+# goal's CURRENT tasks. A successor never takes a predecessor's place by title,
+# topic, version suffix or prose: only a successor card that declares the exact
+# ``{roadmap_id, goal_id, predecessor_task_id}`` binding can, and only while the
+# predecessor is that goal's single current occurrence.
+
+_SUCCESSOR_EVENT_SQL = (
+    "SELECT seq FROM roadmap_events WHERE roadmap_id=? AND event=? AND "
+    "CASE WHEN json_valid(detail_json) THEN "
+    "json_extract(detail_json, '$.goal_id')=? AND json_extract(detail_json, '$.from')=? "
+    "AND json_extract(detail_json, '$.to')=? ELSE 0 END LIMIT 1"
+)
+
+
+def _successor_event_detail(
+    binding: Mapping[str, str], successor_task_id: str
+) -> dict[str, str]:
+    return {
+        "goal_id": binding["goal_id"],
+        "from": binding["predecessor_task_id"],
+        "to": successor_task_id,
+    }
+
+
+def _binding_identity_refusal(
+    repo_root: str | Path,
+    binding: Mapping[str, Any],
+    successor_task_id: str,
+    *,
+    successor_exists: bool,
+) -> str:
+    """Name the first malformed or foreign identity of one exact binding."""
+
+    identities = (
+        binding.get("roadmap_id"),
+        binding.get("goal_id"),
+        binding.get("predecessor_task_id"),
+        successor_task_id,
+    )
+    patterns = (ROADMAP_ID_RE, WAVE_GOAL_ID_RE, TASK_ID_RE, TASK_ID_RE)
+    if not all(
+        isinstance(value, str) and pattern.fullmatch(value)
+        for value, pattern in zip(identities, patterns)
+    ):
+        return "malformed_binding"
+    if binding["predecessor_task_id"] == successor_task_id:
+        return "self_succession"
+    # The same repository root as this Roadmap store: a task of any other
+    # repository is simply not found here.
+    from . import task_store
+
+    if task_store.get_task(repo_root, binding["predecessor_task_id"]) is None:
+        return "predecessor_not_in_repository"
+    if not successor_exists:
+        return ""
+    successor = task_store.get_task(repo_root, successor_task_id)
+    if successor is None:
+        return "successor_not_in_repository"
+    if successor.get("wave_goal_binding") != dict(binding):
+        return "successor_binding_mismatch"
+    return ""
+
+
+def _successor_verdict(
+    conn: sqlite3.Connection,
+    repo_root: str | Path,
+    binding: Mapping[str, str],
+    successor_task_id: str,
+) -> tuple[str, str, dict[str, Any] | None, dict[str, Any] | None]:
+    """Decide one exact binding as ``(state, reason, wave, goal)``; never writes.
+
+    The exact prior event is consulted first, so a retry converges to
+    ``already_applied`` even after the goal moved on or the wave closed.
+    """
+
+    try:
+        wave = get_item(repo_root, binding["roadmap_id"], _connection=conn)
+    except RoadmapNotFoundError:
+        return "refused", "roadmap_not_found", None, None
+    detail = _successor_event_detail(binding, successor_task_id)
+    if conn.execute(
+        _SUCCESSOR_EVENT_SQL,
+        (wave["id"], WAVE_GOAL_SUCCESSOR_EVENT, detail["goal_id"], detail["from"], detail["to"]),
+    ).fetchone():
+        return "already_applied", "", wave, None
+    if wave["status"] != "in_progress":
+        return "refused", f"wave_not_active:{wave['status']}", wave, None
+    provenance = wave["provenance"]
+    goals = provenance.get("wave_goals") if isinstance(provenance, dict) else None
+    matching = [
+        goal
+        for goal in (goals if isinstance(goals, list) else [])
+        if isinstance(goal, dict) and goal.get("id") == binding["goal_id"]
+    ]
+    if len(matching) != 1:
+        return "refused", "goal_ambiguous" if matching else "goal_missing", wave, None
+    current = matching[0].get("task_ids")
+    if not isinstance(current, list) or not all(isinstance(value, str) for value in current):
+        return "refused", "goal_task_ids_malformed", wave, None
+    occurrences = current.count(binding["predecessor_task_id"])
+    if occurrences != 1:
+        reason = "predecessor_ambiguous" if occurrences else "predecessor_not_current"
+        return "refused", reason, wave, None
+    if successor_task_id in current:
+        return "refused", "successor_already_current", wave, None
+    return "ready", "", wave, matching[0]
+
+
+def goal_successor_preflight(
+    repo_root: str | Path,
+    *,
+    roadmap_id: str,
+    goal_id: str,
+    predecessor_task_id: str,
+    successor_task_id: str,
+) -> dict[str, Any]:
+    """Read-only verdict for a binding whose successor card is not written yet.
+
+    Returns ``ready``, ``already_applied`` or ``refused`` with a typed reason.
+    The Roadmap store is opened read-only and is never created by this check.
+    """
+
+    binding = {
+        "roadmap_id": roadmap_id,
+        "goal_id": goal_id,
+        "predecessor_task_id": predecessor_task_id,
+    }
+    reason = _binding_identity_refusal(
+        repo_root, binding, successor_task_id, successor_exists=False
+    )
+    if reason:
+        return {"state": "refused", "reason": reason}
+    path = _db_path(repo_root)
+    if not path.is_file():
+        return {"state": "refused", "reason": "roadmap_not_found"}
+    try:
+        conn = sqlite_readonly.connect_readonly(path)
+    except sqlite3.Error as exc:
+        return {"state": "refused", "reason": f"roadmap_unreadable:{type(exc).__name__}"}
+    try:
+        conn.row_factory = sqlite3.Row
+        state, reason, _wave, _goal = _successor_verdict(
+            conn, repo_root, binding, successor_task_id
+        )
+    except sqlite3.Error as exc:
+        state, reason = "refused", f"roadmap_unreadable:{type(exc).__name__}"
+    finally:
+        conn.close()
+    return {"state": state, "reason": reason}
+
+
+def bind_goal_successor(
+    repo_root: str | Path,
+    *,
+    roadmap_id: str,
+    goal_id: str,
+    predecessor_task_id: str,
+    successor_task_id: str,
+) -> dict[str, Any]:
+    """Move one active wave goal's current task to its exact declared successor.
+
+    Both tasks must be records of this repository's task store, the
+    successor's canonical card must declare exactly this binding, and the
+    predecessor must be the named goal's single current task. Only that one
+    occurrence is replaced; the goal's other tasks, every other goal, and the
+    target milestone are untouched, and the outcome-wide ``task_ids`` history
+    keeps the predecessor. The goal update and one durable
+    ``wave_goal_successor_bound`` event commit in one transaction. The same
+    binding again is ``already_applied`` and writes nothing; every other
+    verdict is ``refused`` with a typed reason and writes nothing.
+    """
+
+    binding = {
+        "roadmap_id": roadmap_id,
+        "goal_id": goal_id,
+        "predecessor_task_id": predecessor_task_id,
+    }
+    receipt: dict[str, Any] = {**binding, "successor_task_id": successor_task_id}
+    reason = _binding_identity_refusal(
+        repo_root, binding, successor_task_id, successor_exists=True
+    )
+    if reason:
+        return {**receipt, "state": "refused", "reason": reason}
+    if not _db_path(repo_root).is_file():
+        return {**receipt, "state": "refused", "reason": "roadmap_not_found"}
+    conn = _connect(repo_root)
+    try:
+        conn.executescript(_SCHEMA_SQL)
+        conn.execute("BEGIN IMMEDIATE")
+        state, reason, wave, goal = _successor_verdict(
+            conn, repo_root, binding, successor_task_id
+        )
+        if wave is None or goal is None:
+            conn.rollback()
+            return {**receipt, "state": state, "reason": reason, "wave": wave}
+        goal["task_ids"] = [
+            successor_task_id if value == predecessor_task_id else value
+            for value in goal["task_ids"]
+        ]
+        history = list(
+            dict.fromkeys([*wave["task_ids"], predecessor_task_id, successor_task_id])
+        )
+        conn.execute(
+            "UPDATE roadmap_items SET provenance_json=?,task_ids_json=?,updated_at=? "
+            "WHERE id=?",
+            (json.dumps(wave["provenance"]), json.dumps(history), _utcnow(), roadmap_id),
+        )
+        _event(
+            conn,
+            roadmap_id,
+            WAVE_GOAL_SUCCESSOR_EVENT,
+            _successor_event_detail(binding, successor_task_id),
+        )
+        result = get_item(repo_root, roadmap_id, _connection=conn)
+        conn.commit()
+        return {**receipt, "state": "applied", "reason": "", "wave": result}
     except Exception:
         if conn.in_transaction:
             conn.rollback()

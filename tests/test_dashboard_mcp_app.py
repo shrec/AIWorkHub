@@ -2954,3 +2954,267 @@ def test_the_skills_tool_is_registered_on_the_readonly_surface() -> None:
     assert dashboard_mcp_app.SKILLS_TOOL_NAME == "aiworkhub_dashboard_skills"
     assert dashboard_mcp_app.SKILLS_TOOL_NAME in recorded
     assert dashboard_mcp_app.SKILLS_TOOL_NAME in names
+
+
+# ---------------------------------------------------------------------------
+# roadmap current-wave projection
+# ---------------------------------------------------------------------------
+
+_WAVE_GOALS = [
+    {"id": "playbook", "label": "Playbook stage gates", "task_ids": ["TASK_PLAYBOOK_V1"]},
+    {"id": "lsp", "label": "LSP index integration", "task_ids": ["TASK_LSP_V3"]},
+    {"id": "delta-review", "label": "Delta review", "task_ids": ["TASK_DELTA_V2"]},
+]
+_WAVE_TASK_CARDS = {
+    "TASK_PLAYBOOK_V1": {"task_id": "TASK_PLAYBOOK_V1", "status": "in_progress"},
+    "TASK_LSP_V3": {"task_id": "TASK_LSP_V3", "status": "pending"},
+    "TASK_DELTA_V2": {"task_id": "TASK_DELTA_V2", "status": "blocked_on_review"},
+}
+
+
+def _wave_repo(tmp_path, monkeypatch, cards=None):
+    repo = tmp_path / "wave-repo"
+    repo.mkdir()
+    known = _WAVE_TASK_CARDS if cards is None else cards
+    monkeypatch.setattr(dashboard_mcp_app.core, "repo_root", lambda: repo)
+    monkeypatch.setattr(
+        dashboard_mcp_app.task_store, "get_task", lambda _root, task_id: known.get(task_id)
+    )
+    return repo
+
+
+def _add_wave(repo, milestone, goals, *, activate=True, title="Wave outcome"):
+    store = dashboard_mcp_app.roadmap_store
+    item = store.add_item(
+        repo,
+        title=title,
+        outcome="Outcome text",
+        milestone=milestone,
+        acceptance=["criterion"],
+        provenance={"wave_goals": goals},
+    )
+    if activate:
+        store.transition_item(repo, item["id"], "approved", reason="approve")
+        store.transition_item(repo, item["id"], "in_progress", reason="start")
+    for goal in goals:
+        for task_id in goal["task_ids"]:
+            store.link_task(repo, item["id"], task_id)
+    return item["id"]
+
+
+def _roadmap_state(repo):
+    store = dashboard_mcp_app.roadmap_store
+    items = store.list_items(repo, include_archived=True, limit=500)
+    return {
+        "items": items,
+        "events": {item["id"]: store.list_events(repo, item["id"], limit=500) for item in items},
+    }
+
+
+def _forbid_roadmap_writes(monkeypatch):
+    def boom(*_args, **_kwargs):
+        raise AssertionError("a dashboard Roadmap read must never write")
+
+    for name in ("initialize_repository", "add_item", "transition_item", "link_task"):
+        monkeypatch.setattr(dashboard_mcp_app.roadmap_store, name, boom)
+
+
+def test_roadmap_views_project_the_current_wave_and_never_write(tmp_path, monkeypatch) -> None:
+    repo = _wave_repo(tmp_path, monkeypatch)
+    wave_id = _add_wave(repo, "0.11.51", _WAVE_GOALS)
+    future_id = _add_wave(repo, "0.11.60", _WAVE_GOALS[:1], activate=False, title="Future wave")
+    monkeypatch.setattr(dashboard_mcp_app, "__version__", "0.11.53")
+    before = _roadmap_state(repo)
+    _forbid_roadmap_writes(monkeypatch)
+
+    listed = dashboard_mcp_app.roadmap_list_view(limit=200)
+    detail = dashboard_mcp_app.roadmap_detail_view(wave_id)
+
+    expected = {
+        "state": "ready",
+        "selection_reason": "unique_highest_active_wave",
+        "wave_id": wave_id,
+        "installed_version": "0.11.53",
+        "target_milestone": "0.11.51",
+        "overdue": True,
+        "goals": [
+            {
+                "id": "playbook",
+                "label": "Playbook stage gates",
+                "state": "open",
+                "tasks": [{"task_id": "TASK_PLAYBOOK_V1", "status": "processing"}],
+            },
+            {
+                "id": "lsp",
+                "label": "LSP index integration",
+                "state": "open",
+                "tasks": [{"task_id": "TASK_LSP_V3", "status": "pending"}],
+            },
+            {
+                "id": "delta-review",
+                "label": "Delta review",
+                "state": "open",
+                "tasks": [{"task_id": "TASK_DELTA_V2", "status": "blocked"}],
+            },
+        ],
+    }
+    assert listed["current_wave"] == expected
+    assert detail["current_wave"] == expected
+    assert _roadmap_state(repo) == before
+
+    assert listed["ok"] is True
+    assert listed["authority"] == "readonly"
+    assert listed["server_tool"] == "aiworkhub_dashboard_roadmap_list"
+    assert {entry["id"]: entry["status"] for entry in listed["entries"]} == {
+        wave_id: "in_progress",
+        future_id: "proposed",
+    }
+    assert all("provenance" not in entry for entry in listed["entries"])
+    assert listed["count"] == 2
+    assert listed["truncated"] is False
+    assert listed["status_counts"]["in_progress"] == 1
+    assert listed["status_counts"]["proposed"] == 1
+    assert detail["ok"] is True
+    assert detail["authority"] == "readonly"
+    assert detail["item"]["id"] == wave_id
+    assert detail["item"]["status"] == "in_progress"
+    assert detail["item"]["milestone"] == "0.11.51"
+
+
+def test_current_wave_ignores_list_filters_but_a_truncated_list_is_unknown(
+    tmp_path, monkeypatch
+) -> None:
+    repo = _wave_repo(tmp_path, monkeypatch)
+    wave_id = _add_wave(repo, "0.11.51", _WAVE_GOALS)
+    future_id = _add_wave(repo, "0.11.60", _WAVE_GOALS[:1], activate=False, title="Future wave")
+    monkeypatch.setattr(dashboard_mcp_app, "__version__", "0.11.53")
+
+    filtered = dashboard_mcp_app.roadmap_list_view(status="proposed", limit=200)
+    assert [entry["id"] for entry in filtered["entries"]] == [future_id]
+    assert filtered["current_wave"]["state"] == "ready"
+    assert filtered["current_wave"]["wave_id"] == wave_id
+
+    paged = dashboard_mcp_app.roadmap_list_view(limit=200, offset=2)
+    assert paged["entries"] == []
+    assert paged["current_wave"]["wave_id"] == wave_id
+
+    cut = dashboard_mcp_app.roadmap_list_view(limit=1)
+    assert cut["truncated"] is True
+    assert cut["current_wave"]["state"] == "UNKNOWN"
+    assert cut["current_wave"]["selection_reason"] == "truncated_roadmap"
+    assert cut["current_wave"]["installed_version"] == "0.11.53"
+
+    other = dashboard_mcp_app.roadmap_detail_view(future_id)
+    assert other["item"]["id"] == future_id
+    assert other["current_wave"] == dashboard_mcp_app.roadmap_list_view(limit=200)["current_wave"]
+    assert other["current_wave"]["wave_id"] == wave_id
+
+
+def test_roadmap_views_report_unknown_for_ambiguous_or_unverifiable_waves(
+    tmp_path, monkeypatch
+) -> None:
+    repo = _wave_repo(tmp_path, monkeypatch)
+    first = _add_wave(repo, "0.11.51", _WAVE_GOALS)
+    second = _add_wave(repo, "0.11.51", _WAVE_GOALS[:1], title="Second wave")
+    monkeypatch.setattr(dashboard_mcp_app, "__version__", "0.11.53")
+
+    listed = dashboard_mcp_app.roadmap_list_view(limit=200)
+    detail = dashboard_mcp_app.roadmap_detail_view(first)
+    for view in (listed, detail):
+        assert view["current_wave"]["state"] == "UNKNOWN"
+        assert view["current_wave"]["selection_reason"] == "ambiguous_active_wave"
+        assert view["current_wave"]["wave_id"] is None
+    assert {entry["id"] for entry in listed["entries"]} == {first, second}
+
+    monkeypatch.setattr(dashboard_mcp_app, "__version__", "not-a-version")
+    unverifiable = dashboard_mcp_app.roadmap_list_view(limit=200)
+    assert unverifiable["ok"] is True
+    assert len(unverifiable["entries"]) == 2
+    assert unverifiable["current_wave"]["state"] == "UNKNOWN"
+    assert unverifiable["current_wave"]["selection_reason"] == "invalid_installed_version"
+
+
+def test_roadmap_views_report_unknown_when_an_active_wave_has_an_invalid_milestone(
+    tmp_path, monkeypatch
+) -> None:
+    repo = _wave_repo(tmp_path, monkeypatch)
+    valid = _add_wave(repo, "0.11.54", _WAVE_GOALS)
+    unversioned = _add_wave(repo, "not-a-version", _WAVE_GOALS[:1], title="Unversioned wave")
+    monkeypatch.setattr(dashboard_mcp_app, "__version__", "0.11.53")
+    before = _roadmap_state(repo)
+    _forbid_roadmap_writes(monkeypatch)
+
+    listed = dashboard_mcp_app.roadmap_list_view(limit=200)
+    detail = dashboard_mcp_app.roadmap_detail_view(valid)
+
+    for view in (listed, detail):
+        assert view["ok"] is True
+        assert view["current_wave"] == {
+            "state": "UNKNOWN",
+            "selection_reason": "invalid_wave_version",
+            "wave_id": None,
+            "installed_version": "0.11.53",
+            "target_milestone": None,
+            "overdue": None,
+            "goals": [],
+        }
+    assert {entry["id"]: entry["status"] for entry in listed["entries"]} == {
+        valid: "in_progress",
+        unversioned: "in_progress",
+    }
+    assert detail["item"]["id"] == valid
+    assert detail["item"]["status"] == "in_progress"
+    assert _roadmap_state(repo) == before
+
+
+def test_current_wave_goal_states_follow_canonical_task_status(tmp_path, monkeypatch) -> None:
+    cards = {
+        "TASK_PLAYBOOK_V1": {"task_id": "TASK_PLAYBOOK_V1", "status": "finished"},
+        "TASK_LSP_V3": {
+            "task_id": "TASK_LSP_V3",
+            "status": "finished",
+            "archived_at": "2026-09-01T00:00:00+00:00",
+        },
+        "TASK_DELTA_V2": {"task_id": "TASK_DELTA_V2", "status": "blocked_on_review"},
+    }
+    repo = _wave_repo(tmp_path, monkeypatch, cards=cards)
+    _add_wave(repo, "0.11.51", _WAVE_GOALS)
+    monkeypatch.setattr(dashboard_mcp_app, "__version__", "0.11.53")
+
+    wave = dashboard_mcp_app.roadmap_list_view(limit=200)["current_wave"]
+
+    assert {goal["id"]: goal["state"] for goal in wave["goals"]} == {
+        "playbook": "checked",
+        "lsp": "open",
+        "delta-review": "open",
+    }
+    assert {
+        task["task_id"]: task["status"] for goal in wave["goals"] for task in goal["tasks"]
+    } == {"TASK_PLAYBOOK_V1": "finished", "TASK_LSP_V3": "archived", "TASK_DELTA_V2": "blocked"}
+    assert wave["overdue"] is True
+
+
+def test_current_wave_uses_the_runtime_version_and_missing_task_cards_stay_unknown(
+    tmp_path, monkeypatch
+) -> None:
+    import aiworkhub
+
+    repo = _wave_repo(tmp_path, monkeypatch, cards={})
+    _add_wave(repo, "0.0.1", _WAVE_GOALS)
+
+    wave = dashboard_mcp_app.roadmap_list_view(limit=200)["current_wave"]
+
+    assert wave["state"] == "ready"
+    assert wave["installed_version"] == aiworkhub.__version__
+    assert wave["target_milestone"] == "0.0.1"
+    assert wave["overdue"] is True
+    assert {goal["state"] for goal in wave["goals"]} == {"UNKNOWN"}
+    assert {task["status"] for goal in wave["goals"] for task in goal["tasks"]} == {"missing"}
+
+
+def test_roadmap_detail_invalid_id_keeps_its_error_shape() -> None:
+    result = dashboard_mcp_app.roadmap_detail_view("not-a-roadmap-id")
+
+    assert result["ok"] is False
+    assert result["error"] == "invalid_roadmap_id"
+    assert result["authority"] == "readonly"

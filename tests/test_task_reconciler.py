@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import sqlite3
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -9,7 +11,7 @@ _SRC = Path(__file__).resolve().parents[1] / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from aiworkhub import task_reconciler  # noqa: E402
+from aiworkhub import core, roadmap_store, task_reconciler, task_store  # noqa: E402
 
 NOW = datetime(2026, 8, 29, 18, 0, tzinfo=timezone.utc)
 
@@ -484,3 +486,198 @@ def test_world_readable_status_is_still_discarded(tmp_path: Path) -> None:
         os.chmod(target, stat_module.S_IRUSR | stat_module.S_IWUSR | stat_module.S_IROTH)
 
     assert task_reconciler.read_status(tmp_path) == {}
+
+
+# --- Pending exact wave-goal bindings --------------------------------------
+
+
+def test_run_scan_reports_the_binding_pass_without_blocking_worker_reconcile(
+    monkeypatch, tmp_path
+):
+    mgr = _Mgr(tmp_path)
+    monkeypatch.setattr(
+        task_reconciler.review_orchestrator, "canonical_review_db", lambda _mgr: None
+    )
+
+    result = task_reconciler.run_scan(mgr, include_gc=False)
+
+    # tmp_path is no AIWorkHub repository: the pass says so and reconcile runs.
+    assert result["finalized"] == 3
+    assert result["wave_goal_bindings"]["state"] == "skipped"
+    assert result["wave_goal_bindings"]["pending"] == 0
+
+
+def test_binding_repair_reads_only_pending_cards_and_honours_the_write_gate(
+    monkeypatch, tmp_path
+):
+    requested: list[int] = []
+    applied: list[tuple[Path, str]] = []
+
+    def pending(repo, *, limit):
+        requested.append(limit)
+        return {"task_ids": ["T_PENDING"], "truncated": False}
+
+    def apply(repo, task_id):
+        applied.append((repo, task_id))
+        return {"task_id": task_id, "state": "applied", "reason": ""}
+
+    monkeypatch.setattr(task_reconciler.core, "pending_wave_goal_bindings", pending)
+    monkeypatch.setattr(task_reconciler.core, "apply_wave_goal_binding", apply)
+    monkeypatch.setattr(task_reconciler.core, "writes_allowed", lambda: False)
+
+    blocked = task_reconciler._scan_wave_goal_bindings(tmp_path)
+
+    assert blocked == {
+        "state": "skipped",
+        "reason": "writes_disabled",
+        "pending": 1,
+        "truncated": False,
+        "task_ids": ["T_PENDING"],
+    }
+    assert applied == []
+
+    monkeypatch.setattr(task_reconciler.core, "writes_allowed", lambda: True)
+    repaired = task_reconciler._scan_wave_goal_bindings(tmp_path)
+
+    assert repaired["outcomes"] == [
+        {"task_id": "T_PENDING", "state": "applied", "reason": ""}
+    ]
+    assert applied == [(tmp_path, "T_PENDING")]
+    assert requested == [task_reconciler.WAVE_GOAL_BINDING_REPAIR_LIMIT] * 2
+
+
+_CREATED_AT = NOW.isoformat()
+
+
+def _insert_card(
+    root: Path, task_id: str, card: dict, *, pending: dict | None = None
+) -> None:
+    """Persist a card exactly as an interrupted create left it."""
+    conn = sqlite3.connect(task_store.storage_readiness(root).canonical_db)
+    try:
+        conn.execute(
+            "INSERT INTO tasks (task_id, runner, topic, status, worker_status, "
+            "card_json, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)",
+            (
+                task_id, "claude_wave", "wave", "pending", "unclaimed",
+                json.dumps({"task_id": task_id, **card}), _CREATED_AT, _CREATED_AT,
+            ),
+        )
+        if pending is not None:
+            conn.execute(
+                "INSERT INTO task_events (task_id, event, runner, payload_json, "
+                "created_at) VALUES (?,?,?,?,?)",
+                (
+                    task_id, core._WAVE_GOAL_BINDING_PENDING_EVENT, "codex",
+                    json.dumps(pending), _CREATED_AT,
+                ),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _task_events(root: Path, event: str) -> list[str]:
+    conn = sqlite3.connect(task_store.storage_readiness(root).canonical_db)
+    try:
+        rows = conn.execute(
+            "SELECT task_id FROM task_events WHERE event=? ORDER BY event_id", (event,)
+        ).fetchall()
+    finally:
+        conn.close()
+    return [row[0] for row in rows]
+
+
+def _successor_events(root: Path, roadmap_id: str) -> list[dict]:
+    return [
+        event["detail"]
+        for event in roadmap_store.list_events(root, roadmap_id)
+        if event["event"] == roadmap_store.WAVE_GOAL_SUCCESSOR_EVENT
+    ]
+
+
+def test_interrupted_binding_converges_from_the_durable_card_binding(
+    monkeypatch, tmp_path
+):
+    root = tmp_path / "repo"
+    root.mkdir()
+    assert task_store.initialize_repository(root)["ok"]
+    wave = roadmap_store.add_item(
+        root,
+        title="Wave",
+        outcome="Deliver the wave",
+        milestone="0.11.51",
+        acceptance=["LSP index integrated"],
+        provenance={"wave_goals": [{"id": "lsp", "label": "LSP", "task_ids": ["V1"]}]},
+    )
+    roadmap_store.link_task(root, wave["id"], "V1")
+    roadmap_store.transition_item(root, wave["id"], "approved", reason="planned")
+    roadmap_store.transition_item(root, wave["id"], "in_progress", reason="started")
+    first = {"roadmap_id": wave["id"], "goal_id": "lsp", "predecessor_task_id": "V1"}
+    _insert_card(root, "V1", {})
+    _insert_card(root, "V2", {"wave_goal_binding": first}, pending=first)
+    # Named like a successor, but it declared nothing: never a candidate.
+    _insert_card(root, "V1_SUCCESSOR_V3", {"title": "LSP index integration V3"})
+
+    monkeypatch.delenv("AIWORKHUB_ALLOW_WRITES", raising=False)
+    untouched = roadmap_store.get_item(root, wave["id"])
+    assert core.pending_wave_goal_bindings(root) == {
+        "task_ids": ["V2"], "truncated": False,
+    }
+    blocked = task_reconciler._scan_wave_goal_bindings(root)
+    assert (blocked["reason"], blocked["task_ids"]) == ("writes_disabled", ["V2"])
+    assert core.apply_wave_goal_binding(root, "V2")["state"] == "pending"
+    # Neither the pending read nor the gated pass touched the Roadmap.
+    assert roadmap_store.get_item(root, wave["id"]) == untouched
+    assert _successor_events(root, wave["id"]) == []
+
+    monkeypatch.setenv("AIWORKHUB_ALLOW_WRITES", "1")
+    repaired = task_reconciler._scan_wave_goal_bindings(root)
+    rescanned = task_reconciler._scan_wave_goal_bindings(root)
+
+    assert repaired["outcomes"] == [{"task_id": "V2", "state": "applied", "reason": ""}]
+    assert rescanned["reason"] == "no_work"
+    bound = roadmap_store.get_item(root, wave["id"])
+    assert bound["provenance"]["wave_goals"][0]["task_ids"] == ["V2"]
+    assert bound["task_ids"] == ["V1", "V2"]
+
+    # The Roadmap write committed but its process died before the verdict was
+    # recorded: the durable card binding is still pending, and the repair
+    # converges on already_applied instead of writing a second event.
+    second = {"roadmap_id": wave["id"], "goal_id": "lsp", "predecessor_task_id": "V2"}
+    _insert_card(root, "V3", {"wave_goal_binding": second}, pending=second)
+    assert roadmap_store.bind_goal_successor(
+        root, successor_task_id="V3", **second
+    )["state"] == "applied"
+    converged = task_reconciler._scan_wave_goal_bindings(root)
+
+    assert converged["outcomes"] == [{"task_id": "V3", "state": "applied", "reason": ""}]
+    assert core.apply_wave_goal_binding(root, "V3")["roadmap_state"] == "already_applied"
+    assert _successor_events(root, wave["id"]) == [
+        {"goal_id": "lsp", "from": "V2", "to": "V3"},
+        {"goal_id": "lsp", "from": "V1", "to": "V2"},
+    ]
+    assert _task_events(root, "wave_goal_binding_applied") == ["V2", "V3"]
+    assert roadmap_store.get_item(root, wave["id"])["task_ids"] == ["V1", "V2", "V3"]
+
+
+def test_a_pending_marker_without_a_card_binding_is_refused_once(monkeypatch, tmp_path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    assert task_store.initialize_repository(root)["ok"]
+    marker = {"roadmap_id": "RM-2026-00001", "goal_id": "lsp", "predecessor_task_id": "V1"}
+    _insert_card(root, "STRAY", {"title": "LSP index integration V2"}, pending=marker)
+    monkeypatch.setenv("AIWORKHUB_ALLOW_WRITES", "1")
+
+    first = task_reconciler._scan_wave_goal_bindings(root)
+    second = task_reconciler._scan_wave_goal_bindings(root)
+
+    # The marker alone is not a binding: nothing is inferred from it or the
+    # title, it is refused once, and the next pass has no work at all.
+    assert first["outcomes"] == [{
+        "task_id": "STRAY",
+        "state": "refused",
+        "reason": "invalid_wave_goal_binding:absent",
+    }]
+    assert second["reason"] == "no_work"
+    assert not (root / ".aiworkhub" / "tasking" / "roadmap.sqlite").exists()

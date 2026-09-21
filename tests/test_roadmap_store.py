@@ -1,11 +1,19 @@
 from __future__ import annotations
 
 import inspect
+import threading
 from pathlib import Path
 
 import pytest
 
-from aiworkhub import core, dashboard_mcp_app, needfix_store, roadmap_store, server
+from aiworkhub import (
+    core,
+    dashboard_mcp_app,
+    needfix_store,
+    roadmap_store,
+    server,
+    task_store,
+)
 
 
 def _add(repo: Path, title: str = "Outcome", **kwargs):
@@ -270,3 +278,240 @@ def test_public_mcp_surface_exposes_roadmap_contract() -> None:
         "aiworkhub_dashboard_roadmap_list",
         "aiworkhub_dashboard_roadmap_detail",
     }
+
+
+# --- Exact wave-goal successor binding -------------------------------------
+
+
+def _wave(
+    repo: Path,
+    goals: list[dict],
+    *,
+    history: tuple[str, ...] = ("V1",),
+    active: bool = True,
+) -> dict:
+    wave = _add(repo, "Wave", milestone="0.11.51", provenance={"wave_goals": goals})
+    for task_id in history:
+        roadmap_store.link_task(repo, wave["id"], task_id)
+    roadmap_store.transition_item(repo, wave["id"], "approved", reason="planned")
+    if active:
+        roadmap_store.transition_item(repo, wave["id"], "in_progress", reason="started")
+    return roadmap_store.get_item(repo, wave["id"])
+
+
+def _binding(roadmap_id: str, goal_id: str = "lsp", predecessor: str = "V1") -> dict:
+    return {
+        "roadmap_id": roadmap_id,
+        "goal_id": goal_id,
+        "predecessor_task_id": predecessor,
+    }
+
+
+def _use_task_cards(
+    monkeypatch: pytest.MonkeyPatch, cards_by_root: dict[Path, dict[str, dict]]
+) -> None:
+    """Stand in for each repository's OWN canonical task store."""
+    monkeypatch.setattr(
+        task_store,
+        "get_task",
+        lambda root, task_id: cards_by_root.get(Path(root), {}).get(task_id),
+    )
+
+
+def _bind(repo: Path, successor: str, binding: dict) -> dict:
+    return roadmap_store.bind_goal_successor(
+        repo, successor_task_id=successor, **binding
+    )
+
+
+def _roadmap_state(repo: Path) -> tuple[list[dict], dict[str, list[dict]]]:
+    items = roadmap_store.list_items(repo, include_archived=True)
+    return items, {
+        item["id"]: roadmap_store.list_events(repo, item["id"]) for item in items
+    }
+
+
+def _successor_events(repo: Path, roadmap_id: str) -> list[dict]:
+    return [
+        event["detail"]
+        for event in roadmap_store.list_events(repo, roadmap_id)
+        if event["event"] == roadmap_store.WAVE_GOAL_SUCCESSOR_EVENT
+    ]
+
+
+def test_exact_successor_replaces_one_goal_pointer_and_keeps_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    wave = _wave(
+        repo,
+        [
+            {"id": "lsp", "label": "LSP index", "task_ids": ["V1", "LSP_DOCS"]},
+            {"id": "playbook", "label": "Playbook", "task_ids": ["V1"]},
+        ],
+        history=("V1", "LSP_DOCS"),
+    )
+    binding = _binding(wave["id"])
+    _use_task_cards(monkeypatch, {repo: {
+        "V1": {"status": "archived"},
+        "LSP_DOCS": {"status": "finished"},
+        "V2": {"status": "pending", "wave_goal_binding": dict(binding)},
+    }})
+
+    applied = _bind(repo, "V2", binding)
+    repeated = _bind(repo, "V2", binding)
+
+    assert applied["state"] == "applied", applied
+    goals = {
+        goal["id"]: goal["task_ids"]
+        for goal in applied["wave"]["provenance"]["wave_goals"]
+    }
+    # Only the named goal's single predecessor occurrence moves: that goal's
+    # other prerequisite and the other goal sharing V1 are untouched.
+    assert goals == {"lsp": ["V2", "LSP_DOCS"], "playbook": ["V1"]}
+    # The predecessor stays in the outcome-wide history; the target does not move.
+    assert applied["wave"]["task_ids"] == ["V1", "LSP_DOCS", "V2"]
+    assert applied["wave"]["milestone"] == "0.11.51"
+    assert applied["wave"]["status"] == "in_progress"
+    assert repeated["state"] == "already_applied"
+    assert repeated["wave"] == applied["wave"]
+    assert _successor_events(repo, wave["id"]) == [
+        {"goal_id": "lsp", "from": "V1", "to": "V2"}
+    ]
+
+
+def test_foreign_missing_ambiguous_or_undeclared_claims_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    other = tmp_path / "other"
+    active = _wave(repo, [
+        {"id": "lsp", "label": "LSP", "task_ids": ["V1"]},
+        {"id": "docs", "label": "Docs", "task_ids": ["DOCS_V1"]},
+        {"id": "twice", "label": "Twice", "task_ids": ["V1", "V1"]},
+        {"id": "dup", "label": "Dup A", "task_ids": ["V1"]},
+        {"id": "dup", "label": "Dup B", "task_ids": ["V1"]},
+    ])
+    planned = _wave(repo, [{"id": "lsp", "label": "LSP", "task_ids": ["V1"]}], active=False)
+    cards: dict[Path, dict[str, dict]] = {
+        repo: {"V1": {}, "DOCS_V1": {}},
+        other: {"V1": {}, "OTHER_V1": {}},
+    }
+    _use_task_cards(monkeypatch, cards)
+
+    def refused(successor: str, binding: dict, *, root: Path = repo) -> str:
+        cards[root][successor] = {"wave_goal_binding": dict(binding)}
+        result = roadmap_store.bind_goal_successor(
+            root, successor_task_id=successor, **binding
+        )
+        assert result["state"] == "refused", result
+        return result["reason"]
+
+    before = _roadmap_state(repo)
+    reasons = {
+        "foreign_predecessor": refused("S1", _binding(active["id"], predecessor="OTHER_V1")),
+        "missing_predecessor": refused("S2", _binding(active["id"], predecessor="GHOST_V1")),
+        "foreign_wave": refused("S3", _binding(active["id"]), root=other),
+        "missing_goal": refused("S4", _binding(active["id"], "delta")),
+        "wrong_goal": refused("S5", _binding(active["id"], "docs")),
+        "duplicate_predecessor": refused("S6", _binding(active["id"], "twice")),
+        "duplicate_goal": refused("S7", _binding(active["id"], "dup")),
+        "inactive_wave": refused("S8", _binding(planned["id"])),
+        "self_succession": refused("V1", _binding(active["id"])),
+        "malformed": refused("S9", {**_binding(active["id"]), "roadmap_id": "../escape"}),
+    }
+    # A successor by name alone, and one that declared a different goal, are
+    # never bound: only the card's own exact declaration counts.
+    cards[repo]["V2"] = {"title": "LSP index integration V2"}
+    by_name = _bind(repo, "V2", _binding(active["id"]))
+    cards[repo]["V2_DOCS"] = {"wave_goal_binding": _binding(active["id"], "docs")}
+    other_goal = _bind(repo, "V2_DOCS", _binding(active["id"]))
+
+    assert reasons == {
+        "foreign_predecessor": "predecessor_not_in_repository",
+        "missing_predecessor": "predecessor_not_in_repository",
+        "foreign_wave": "roadmap_not_found",
+        "missing_goal": "goal_missing",
+        "wrong_goal": "predecessor_not_current",
+        "duplicate_predecessor": "predecessor_ambiguous",
+        "duplicate_goal": "goal_ambiguous",
+        "inactive_wave": "wave_not_active:approved",
+        "self_succession": "self_succession",
+        "malformed": "malformed_binding",
+    }
+    assert (by_name["state"], by_name["reason"]) == (
+        "refused", "successor_binding_mismatch"
+    )
+    assert (other_goal["state"], other_goal["reason"]) == (
+        "refused", "successor_binding_mismatch"
+    )
+    assert _roadmap_state(repo) == before
+    assert not (other / ".aiworkhub").exists()
+
+
+def test_concurrent_successor_claims_bind_exactly_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    wave = _wave(repo, [{"id": "lsp", "label": "LSP", "task_ids": ["V1"]}])
+    binding = _binding(wave["id"])
+    _use_task_cards(monkeypatch, {repo: {
+        "V1": {},
+        "V2_A": {"wave_goal_binding": dict(binding)},
+        "V2_B": {"wave_goal_binding": dict(binding)},
+    }})
+    claims = ["V2_A", "V2_B"] * 3
+    barrier = threading.Barrier(len(claims))
+    results: list[dict] = []
+
+    def claim(successor: str) -> None:
+        barrier.wait(timeout=30)
+        results.append(_bind(repo, successor, binding))
+
+    threads = [threading.Thread(target=claim, args=(name,)) for name in claims]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=60)
+
+    assert len(results) == len(claims)
+    applied = [result for result in results if result["state"] == "applied"]
+    assert len(applied) == 1
+    winner = applied[0]["successor_task_id"]
+    loser = "V2_B" if winner == "V2_A" else "V2_A"
+    assert sorted(
+        (result["successor_task_id"], result["state"], result["reason"])
+        for result in results
+        if result is not applied[0]
+    ) == sorted(
+        [(winner, "already_applied", "")] * 2
+        + [(loser, "refused", "predecessor_not_current")] * 3
+    )
+    final = roadmap_store.get_item(repo, wave["id"])
+    assert final["provenance"]["wave_goals"][0]["task_ids"] == [winner]
+    assert _successor_events(repo, wave["id"]) == [
+        {"goal_id": "lsp", "from": "V1", "to": winner}
+    ]
+
+
+def test_goal_successor_preflight_is_read_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    fresh = tmp_path / "fresh"
+    fresh.mkdir()
+    wave = _wave(repo, [{"id": "lsp", "label": "LSP", "task_ids": ["V1"]}])
+    _use_task_cards(monkeypatch, {repo: {"V1": {}}, fresh: {"V1": {}}})
+    before = _roadmap_state(repo)
+
+    ready = roadmap_store.goal_successor_preflight(
+        repo, successor_task_id="V2", **_binding(wave["id"])
+    )
+    missing = roadmap_store.goal_successor_preflight(
+        fresh, successor_task_id="V2", **_binding(wave["id"])
+    )
+
+    assert ready == {"state": "ready", "reason": ""}
+    assert missing == {"state": "refused", "reason": "roadmap_not_found"}
+    assert not (fresh / ".aiworkhub").exists()
+    assert _roadmap_state(repo) == before

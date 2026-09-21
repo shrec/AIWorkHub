@@ -3934,6 +3934,7 @@ def create_task(
     custom_template_escape: str | None = None,
     validation_exemption: str | None = None,
     apply_contract_patch: str | None = None,
+    wave_goal_binding: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Create one new canonical task card for the verified manager chat.
 
@@ -3957,6 +3958,15 @@ def create_task(
     manager names the digest, and the resolved list then passes exactly the
     same ``validate_required_output_exceptions`` checks a typed list passes.
     Naming both a digest and an explicit list is refused rather than merged.
+
+    ``wave_goal_binding`` (optional) is exactly ``{roadmap_id, goal_id,
+    predecessor_task_id}``: this card replaces that predecessor as the named
+    active wave goal's current task. It is stored on the card before the
+    Roadmap is touched, is part of the idempotent create payload, and is
+    never inferred when omitted. A foreign, missing or non-current predecessor
+    refuses the create; the reply's ``wave_goal_binding.state`` is
+    ``applied``, ``refused`` (a concurrent successor won) or ``pending`` (the
+    reconciler repairs it from the durable card binding).
     """
     identity = _claude_manager_identity() or _codex_manager_identity()
     if identity is None:
@@ -4076,6 +4086,11 @@ def create_task(
             "field": "max_live_tokens",
             "limit": 100_000_000,
         })
+    wave_binding, wave_binding_error = _normalize_wave_goal_binding(
+        wave_goal_binding, task_id
+    )
+    if wave_binding_error:
+        violations.append({"code": wave_binding_error, "field": "wave_goal_binding"})
     if violations:
         result = _lifecycle_error(str(violations[0]["code"]), 2)
         result.update(violation_extra)
@@ -4651,6 +4666,9 @@ def create_task(
         ),
         **({"skill_path_scope": skill_path_scope2} if skill_path_scope2 else {}),
         "depends_on": depends_on2,
+        # The exact successor binding, stored before any Roadmap write and
+        # never derived from this card's own title, topic or prose.
+        **({"wave_goal_binding": wave_binding} if wave_binding is not None else {}),
         "token_budget": (
             {
                 "schema_id": "aiworkhub.task_token_budget.v1",
@@ -4711,6 +4729,9 @@ def create_task(
         "read_first": read_first2,
         "immutable_inputs": immutable_inputs2,
         "max_live_tokens": max_live_tokens,
+        # None for every caller that declares no binding, exactly as a card
+        # written before this field existed reads back.
+        "wave_goal_binding": wave_binding,
     }
 
     try:
@@ -4912,6 +4933,7 @@ def create_task(
                 else None
             ),
             "template_provenance": existing_card.get("template_provenance"),
+            "wave_goal_binding": existing_card.get("wave_goal_binding"),
         }
         if existing_payload == requested_payload:
             result = _canonical_result(
@@ -4925,6 +4947,12 @@ def create_task(
                 "reconciled": True,
                 "receipt_state": "existing_identical",
             })
+            if wave_binding is not None:
+                # A retry after an interrupted cross-store write converges on
+                # the same verdict; an applied binding is never applied twice.
+                result["wave_goal_binding"] = apply_wave_goal_binding(
+                    repo_root(), task_id
+                )
             return result
         differing_fields = sorted(
             key for key, value in requested_payload.items()
@@ -4944,6 +4972,13 @@ def create_task(
         })
         return result
 
+    # Read-only and before any write: a binding that cannot apply refuses the
+    # create instead of persisting a card whose goal pointer never moves.
+    wave_binding_refusal = (
+        _wave_goal_binding_preflight_refusal(wave_binding, task_id)
+        if wave_binding is not None
+        else None
+    )
     command = ["add-card", task_id]
     try:
         conn = _canonical_connect()
@@ -4974,6 +5009,11 @@ def create_task(
                 ),
             })
             return result
+        if wave_binding_refusal is not None:
+            # Decided only for a NEW card: an identical retry of an existing
+            # card reconciled above and reports its own recorded verdict.
+            conn.rollback()
+            return wave_binding_refusal
         if depends_on2:
             existing_cards: dict[str, dict[str, Any]] = {}
             for row in conn.execute(
@@ -5013,6 +5053,16 @@ def create_task(
                 json.dumps({"provider": provider, "topic": topic}, ensure_ascii=False), now,
             ),
         )
+        if wave_binding is not None:
+            # Same transaction as the card: the durable, index-backed marker
+            # the reconciler repairs from if the Roadmap projection fails.
+            conn.execute(
+                "INSERT INTO task_events(task_id,event,runner,payload_json,created_at) VALUES(?,?,?,?,?)",
+                (
+                    task_id, _WAVE_GOAL_BINDING_PENDING_EVENT, CODEX_RUNNER,
+                    json.dumps(wave_binding, ensure_ascii=False, sort_keys=True), now,
+                ),
+            )
         conn.commit()
     except sqlite3.IntegrityError:
         conn.rollback()
@@ -5066,6 +5116,10 @@ def create_task(
     runner_route_warnings = create_time_runner_route_warnings(runner)
     if runner_route_warnings:
         result["runner_route_warnings"] = runner_route_warnings
+    if wave_binding is not None:
+        # The card and its pending binding are already durable, so this
+        # projection can only ever be repaired later, never lost or guessed.
+        result["wave_goal_binding"] = apply_wave_goal_binding(repo_root(), task_id)
     return result
 
 
@@ -11484,3 +11538,209 @@ def roadmap_snapshot(
         "items": rows,
         "truncated": total > len(rows),
     }
+
+
+# --- Exact wave-goal successor bindings (card-authoritative, write-gated) ---
+#
+# ``create_task`` stores the caller's exact ``wave_goal_binding`` on the card,
+# plus one ``wave_goal_binding_pending`` task event, in the SAME transaction as
+# the card and before any Roadmap write. The Roadmap projection then runs only
+# through ``roadmap_store.bind_goal_successor``, and its verdict is appended
+# exactly once as ``wave_goal_binding_applied`` / ``_refused``. A failure in
+# between leaves the durable card binding pending; the reconciler repairs only
+# those cards, found through the task-event index rather than a card scan.
+
+_WAVE_GOAL_BINDING_KEYS = ("roadmap_id", "goal_id", "predecessor_task_id")
+_WAVE_GOAL_BINDING_PENDING_EVENT = "wave_goal_binding_pending"
+_WAVE_GOAL_BINDING_VERDICT_EVENTS = (
+    "wave_goal_binding_applied",
+    "wave_goal_binding_refused",
+)
+
+
+def _normalize_wave_goal_binding(
+    value: Any, successor_task_id: str
+) -> tuple[dict[str, str] | None, str]:
+    """Return the exact optional binding, or the refusal code for it.
+
+    The three identities are taken byte-for-byte: an extra, missing or
+    non-string field is refused rather than ignored, coerced or guessed.
+    """
+
+    if value is None:
+        return None, ""
+    if not isinstance(value, Mapping) or set(value) != set(_WAVE_GOAL_BINDING_KEYS):
+        return None, "invalid_wave_goal_binding:keys"
+    roadmap_ns = _roadmap_store_module()
+    patterns = (roadmap_ns.ROADMAP_ID_RE, roadmap_ns.WAVE_GOAL_ID_RE, _TASK_ID_RE)
+    binding: dict[str, str] = {}
+    for key, pattern in zip(_WAVE_GOAL_BINDING_KEYS, patterns):
+        raw = value[key]
+        if not isinstance(raw, str) or not pattern.fullmatch(raw):
+            return None, f"invalid_wave_goal_binding:{key}"
+        binding[key] = raw
+    if binding["predecessor_task_id"] == successor_task_id:
+        return None, "invalid_wave_goal_binding:self_succession"
+    return binding, ""
+
+
+def _wave_goal_binding_preflight_refusal(
+    binding: Mapping[str, str], successor_task_id: str
+) -> dict[str, Any] | None:
+    """The create refusal for a binding that cannot apply, decided before writing."""
+
+    try:
+        verdict = _roadmap_store_module().goal_successor_preflight(
+            repo_root(), successor_task_id=successor_task_id, **binding
+        )
+    except Exception as exc:  # noqa: BLE001 -- an unverifiable binding fails closed
+        verdict = {"state": "refused", "reason": f"unverifiable:{type(exc).__name__}"}
+    if verdict.get("state") != "refused":
+        return None
+    reason = str(verdict.get("reason") or "refused")
+    result = _lifecycle_error(f"wave_goal_binding_refused:{reason}", 2)
+    result["wave_goal_binding"] = {**binding, "state": "refused", "reason": reason}
+    result["contract_hint"] = (
+        "wave_goal_binding names an in_progress Roadmap wave of this repository, "
+        "one of its goal ids, and that goal's single current task in this "
+        "repository's task store; nothing is inferred from titles or prose"
+    )
+    return result
+
+
+def _wave_goal_binding_verdict(
+    conn: sqlite3.Connection, task_id: str
+) -> dict[str, str] | None:
+    """The one recorded verdict for a card's binding, or None while pending."""
+
+    row = conn.execute(
+        "SELECT event, payload_json FROM task_events WHERE task_id=? "
+        "AND event IN (?,?) ORDER BY event_id LIMIT 1",
+        (task_id, *_WAVE_GOAL_BINDING_VERDICT_EVENTS),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        payload = json.loads(row["payload_json"] or "{}")
+    except (TypeError, json.JSONDecodeError):
+        payload = {}
+    recorded = payload if isinstance(payload, dict) else {}
+    return {
+        "state": str(row["event"]).rsplit("_", 1)[-1],
+        "reason": str(recorded.get("reason") or ""),
+        "roadmap_state": str(recorded.get("roadmap_state") or ""),
+    }
+
+
+def pending_wave_goal_bindings(root: str | Path, *, limit: int = 16) -> dict[str, Any]:
+    """Side-effect-free, index-bounded ids of cards whose binding has no verdict.
+
+    Only a card that durably declared a binding carries the pending event, so
+    answering never loads an unrelated historical card.
+    """
+
+    bounded = max(1, min(int(limit), 100))
+    conn = sqlite_readonly.connect_readonly(callback_store.resolve_db_path(Path(root)))
+    try:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT pending.task_id FROM task_events AS pending WHERE pending.event=? "
+            "AND EXISTS (SELECT 1 FROM tasks WHERE tasks.task_id=pending.task_id) "
+            "AND NOT EXISTS (SELECT 1 FROM task_events AS verdict "
+            "WHERE verdict.task_id=pending.task_id AND verdict.event IN (?,?)) "
+            "ORDER BY pending.event_id LIMIT ?",
+            (
+                _WAVE_GOAL_BINDING_PENDING_EVENT,
+                *_WAVE_GOAL_BINDING_VERDICT_EVENTS,
+                bounded + 1,
+            ),
+        ).fetchall()
+    finally:
+        conn.close()
+    task_ids = list(dict.fromkeys(str(row["task_id"]) for row in rows))
+    return {"task_ids": task_ids[:bounded], "truncated": len(task_ids) > bounded}
+
+
+def apply_wave_goal_binding(root: str | Path, task_id: str) -> dict[str, Any]:
+    """Project one card's durable exact binding onto its Roadmap wave goal.
+
+    The canonical card is the only authority and its stored binding is applied
+    as written. The verdict is appended once as a task event and never written
+    back into ``card_json``, so no lifecycle compare-and-set is disturbed. A
+    Roadmap or store failure records nothing: the binding stays ``pending`` for
+    the next pass, and a retry of an applied binding converges on the Roadmap's
+    ``already_applied`` without a second Roadmap event. Every write stays behind
+    ``AIWORKHUB_ALLOW_WRITES=1``.
+    """
+
+    root = Path(root)
+    receipt: dict[str, Any] = {"task_id": task_id}
+    try:
+        card = task_store.get_task(root, task_id)
+        if card is None:
+            return {**receipt, "state": "absent"}
+        binding, error = _normalize_wave_goal_binding(
+            card.get("wave_goal_binding"), task_id
+        )
+        if binding is None and not error:
+            # Only a pending marker without the durable card field gets here;
+            # it can never apply, so it is refused once instead of rescanned.
+            error = "invalid_wave_goal_binding:absent"
+        receipt.update(binding or {})
+        db_path = callback_store.resolve_db_path(root)
+        reader = sqlite_readonly.connect_readonly(db_path)
+        try:
+            reader.row_factory = sqlite3.Row
+            recorded = _wave_goal_binding_verdict(reader, task_id)
+        finally:
+            reader.close()
+    except Exception as exc:  # noqa: BLE001 -- an unreadable store is not a verdict
+        reason = f"task_store_unavailable:{type(exc).__name__}"
+        return {**receipt, "state": "pending", "reason": reason}
+    if recorded is not None:
+        return {**receipt, **recorded}
+    if not writes_allowed():
+        return {**receipt, "state": "pending", "reason": "writes_disabled"}
+    outcome: Mapping[str, Any] = {"state": "refused", "reason": error}
+    if binding is not None:
+        try:
+            outcome = _roadmap_store_module().bind_goal_successor(
+                root, successor_task_id=task_id, **binding
+            )
+        except Exception as exc:  # noqa: BLE001 -- the durable card binding is the retry authority
+            reason = f"roadmap_unavailable:{type(exc).__name__}"
+            return {**receipt, "state": "pending", "reason": reason}
+    roadmap_state = str(outcome.get("state") or "")
+    verdict = {
+        "state": "applied" if roadmap_state in {"applied", "already_applied"} else "refused",
+        "reason": str(outcome.get("reason") or ""),
+        "roadmap_state": roadmap_state,
+    }
+    try:
+        conn = callback_store.open_db(db_path)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            prior = _wave_goal_binding_verdict(conn, task_id)
+            if prior is None:
+                conn.execute(
+                    "INSERT INTO task_events(task_id,event,runner,payload_json,created_at) "
+                    "VALUES(?,?,?,?,?)",
+                    (
+                        task_id,
+                        f"wave_goal_binding_{verdict['state']}",
+                        CODEX_RUNNER,
+                        json.dumps({**receipt, **verdict}, ensure_ascii=False, sort_keys=True),
+                        datetime.now(timezone.utc).isoformat(),
+                    ),
+                )
+            conn.commit()
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+        finally:
+            conn.close()
+    except Exception as exc:  # noqa: BLE001 -- a retry converges on already_applied
+        reason = f"verdict_unrecorded:{type(exc).__name__}"
+        return {**receipt, "state": "pending", "reason": reason, "roadmap_state": roadmap_state}
+    return {**receipt, **(prior or verdict)}

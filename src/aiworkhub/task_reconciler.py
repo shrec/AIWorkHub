@@ -515,6 +515,9 @@ def run_scan(
         except Exception as exc:  # noqa: BLE001 -- see above
             task_hygiene = {"state": "skipped", "reason": f"{type(exc).__name__}"[:80]}
     review_recovery = _scan_review_ready_recovery(mgr)
+    # Bounded to cards whose durable exact binding has no verdict yet; a pass
+    # with nothing pending reads one index range and writes nothing.
+    wave_goal_bindings = _scan_wave_goal_bindings(Path(mgr.repo).resolve())
     return {
         "ok": True,
         "scanned_at": _utcnow(),
@@ -523,6 +526,7 @@ def run_scan(
         "task_hygiene": task_hygiene,
         **result,
         "review_recovery": review_recovery,
+        "wave_goal_bindings": wave_goal_bindings,
     }
 
 
@@ -704,6 +708,57 @@ def _scan_review_ready_recovery(manager: Any) -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001 -- never block worker reconcile
         empty["reason"] = f"{type(exc).__name__}"[:80]
         return empty
+
+
+# A card's own create normally applies its wave-goal binding in the same call,
+# so this pass only ever sees bindings whose Roadmap write was interrupted. The
+# bound is headroom for a burst of those, not a throughput target.
+WAVE_GOAL_BINDING_REPAIR_LIMIT = 16
+
+
+def _scan_wave_goal_bindings(repo: Path) -> dict[str, Any]:
+    """Converge only cards whose durable exact wave-goal binding has no verdict.
+
+    Candidates come from ``core.pending_wave_goal_bindings``, an index-bounded
+    read of unresolved binding events, so no unrelated historical card is ever
+    loaded. Nothing is written unless ``AIWORKHUB_ALLOW_WRITES=1``: with writes
+    disabled the pending cards are reported and left untouched. A repeated or
+    concurrent pass converges on the Roadmap's ``already_applied`` and adds no
+    second event.
+    """
+
+    try:
+        pending = core.pending_wave_goal_bindings(
+            repo, limit=WAVE_GOAL_BINDING_REPAIR_LIMIT
+        )
+    except Exception as exc:  # noqa: BLE001 -- never block worker reconcile
+        return {"state": "skipped", "reason": f"{type(exc).__name__}"[:80], "pending": 0}
+    task_ids = [str(task_id) for task_id in pending.get("task_ids") or []]
+    receipt: dict[str, Any] = {
+        "pending": len(task_ids),
+        "truncated": bool(pending.get("truncated")),
+    }
+    if not task_ids:
+        return {"state": "skipped", "reason": "no_work", **receipt}
+    if not core.writes_allowed():
+        return {
+            "state": "skipped",
+            "reason": "writes_disabled",
+            **receipt,
+            "task_ids": task_ids,
+        }
+    outcomes: list[dict[str, str]] = []
+    for task_id in task_ids:
+        try:
+            outcome = core.apply_wave_goal_binding(repo, task_id)
+        except Exception as exc:  # noqa: BLE001 -- one card never blocks the rest
+            outcome = {"state": "pending", "reason": f"{type(exc).__name__}"[:80]}
+        outcomes.append({
+            "task_id": task_id,
+            "state": str(outcome.get("state") or ""),
+            "reason": str(outcome.get("reason") or ""),
+        })
+    return {"state": "ok", **receipt, "outcomes": outcomes}
 
 
 class ReconcilerService:
