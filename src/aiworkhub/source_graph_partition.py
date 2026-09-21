@@ -40,12 +40,28 @@ Immutability and identity: a :class:`ComposedView` is a frozen value bound to
 fingerprint (size + mtime). :meth:`ComposedView.verify_binding` refuses a view
 whose identity does not match a caller's packet, and every open re-checks that
 the base has not shifted underneath the view (:class:`PartitionBaseShiftError`).
+
+Base generation pinning (NF-2026-00946): the canonical base is published by
+atomic replacement, so a marker that named only the mutable canonical path made
+every ordinary publication break every in-flight reviewer/rework overlay. A
+marked partition therefore pins the exact base generation it was built against
+as a hard link (same inode, O(1), never a copy or a hash) next to the partition
+file; reads compose with that pinned inode and verify its identity (device,
+inode, size, mtime_ns), so a newer canonical generation never leaks into a
+sealed review and a replaced or mutated pin fails closed. Where hard links are
+unsupported the marker records that fact and a later shift fails with an
+explicit ``composed_base_shifted_unpinned`` reason. Pins no partition in their
+directory references any more are pruned on the next marker write.
 """
 
 from __future__ import annotations
 
+import errno
 import json
+import os
+import re
 import sqlite3
+import stat as stat_mod
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -56,8 +72,23 @@ from . import source_graph as sg
 
 COMPOSED_VIEW_META_KEY = "composed_view"
 COMPOSED_VIEW_SCHEMA_ID = "aiworkhub.source_graph.composed_view.v1"
+BASE_PIN_SCHEMA_ID = "aiworkhub.source_graph.base_pin.v1"
 _SCOPE_TABLE = "_partition_scope"
 _COMPOSED_TABLES: tuple[str, ...] = ("files", "entities", "edges")
+_BASE_PIN_NAME = re.compile(r"\.sg-base-pin\.[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\.sqlite")
+_BASE_PIN_REQUIRED_TABLES = frozenset(
+    {"meta", "files", "entities", "edges", "entities_fts"}
+)
+# ``link`` errnos meaning "this filesystem/platform/sandbox cannot pin", as
+# opposed to a genuine I/O failure that must propagate.
+_BASE_PIN_UNSUPPORTED_ERRNOS = frozenset(
+    getattr(errno, name)
+    for name in (
+        "EXDEV", "EPERM", "EACCES", "EROFS", "EMLINK", "ENOSYS", "ENOTSUP",
+        "EOPNOTSUPP",
+    )
+    if hasattr(errno, name)
+)
 
 
 class PartitionError(RuntimeError):
@@ -72,6 +103,10 @@ class PartitionBaseShiftError(PartitionError):
     """The base index changed underneath an open (or opening) composed view."""
 
 
+class PartitionBasePinError(PartitionBaseShiftError):
+    """The pinned base generation is missing, forged, replaced or unverifiable."""
+
+
 # ---------------------------------------------------------------------------
 # Partition build -- scope-only, never touches the base index
 # ---------------------------------------------------------------------------
@@ -82,7 +117,10 @@ class PartitionBuildReport:
 
     ``bytes_written`` and ``wall_seconds`` are the cost of preparing the
     partition; both scale with ``scope`` (the changed files), never with the
-    base index size, because the base is never read here.
+    base index size, because the base is never read here. ``base_pin`` is the
+    pin status (``pinned``, ``unsupported:<reason>`` or ``none``) and
+    ``pin_seconds`` the measured cost of recording the marker and pinning the
+    base generation -- a hard link plus a stat, not a copy.
     """
 
     partition_db_path: str
@@ -94,6 +132,8 @@ class PartitionBuildReport:
     edges: int
     bytes_written: int
     wall_seconds: float
+    base_pin: str = "none"
+    pin_seconds: float = 0.0
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -106,6 +146,8 @@ class PartitionBuildReport:
             "edges": self.edges,
             "bytes_written": self.bytes_written,
             "wall_seconds": self.wall_seconds,
+            "base_pin": self.base_pin,
+            "pin_seconds": self.pin_seconds,
         }
 
 
@@ -163,13 +205,15 @@ def build_partition(
         :func:`source_graph.remove_file` so the partition carries no row for
         it, while its scope entry still hides the base row at query time.
 
-    The database is created fresh and empty; the base index is NEVER read,
-    copied, or opened here. When ``base_db_path`` is given, a composed-view
-    marker (base fingerprint + full declared scope) is written so a later
-    read-only open composes the two indexes; without it the partition stands
-    alone. The base fingerprint is size + mtime_ns only, with no content hash
-    (see :func:`_base_fingerprint`): an in-place base replacement preserving
-    both is a documented, accepted blind spot, not a detected shift. Source
+    The database is created fresh and empty; the base index is NEVER copied or
+    content-hashed here. When ``base_db_path`` is given, a composed-view
+    marker (base generation + full declared scope) is written and that exact
+    base generation is pinned by hard link beside the partition (see
+    :func:`write_composed_marker`), so a later read-only open composes the two
+    indexes even after the canonical base is atomically republished; without
+    it the partition stands alone. The generation identity is device + inode +
+    size + mtime_ns, with no content hash: an in-place rewrite preserving all
+    four is a documented, accepted blind spot, not a detected shift. Source
     Graph contract failures (hash mismatch, unreadable file) propagate unchanged
     as :class:`source_graph.SourceGraphError`; path-safety violations raise
     :class:`PartitionError`.
@@ -225,7 +269,15 @@ def build_partition(
                 sg.remove_file(repo_root, relative)
                 files_deleted += 1
 
-    write_composed_marker(partition_db_path, base_db_path, scope)
+    pin_started = time.monotonic()
+    pin = write_composed_marker(partition_db_path, base_db_path, scope)
+    pin_seconds = max(0.0, time.monotonic() - pin_started)
+    if pin is None:
+        base_pin = "none"
+    elif pin.get("status") == "pinned":
+        base_pin = "pinned"
+    else:
+        base_pin = f"unsupported:{pin.get('reason') or 'unknown'}"
     try:
         bytes_written = int(partition_db_path.stat().st_size)
     except OSError:
@@ -240,6 +292,8 @@ def build_partition(
         edges=edges,
         bytes_written=bytes_written,
         wall_seconds=max(0.0, time.monotonic() - started),
+        base_pin=base_pin,
+        pin_seconds=pin_seconds,
     )
 
 
@@ -268,23 +322,29 @@ def _base_fingerprint(base_db_path: Path) -> dict[str, Any]:
     }
 
 
-def write_composed_marker(
-    partition_db_path: Path,
-    base_db_path: Path | None,
-    scope: Sequence[str],
-) -> None:
-    """Persist the base fingerprint and full declared scope in partition meta.
+def _generation(observed: os.stat_result) -> dict[str, int]:
+    """Identity of one base generation: device + inode + size + mtime_ns."""
 
-    ``base_db_path`` of ``None`` records a standalone partition (no base to
-    compose); a later read-only open then serves partition rows only.
-    """
-
-    base_info = _base_fingerprint(base_db_path) if base_db_path is not None else None
-    payload = {
-        "schema_id": COMPOSED_VIEW_SCHEMA_ID,
-        "base": base_info,
-        "scope": list(dict.fromkeys(str(item) for item in scope)),
+    return {
+        "dev": int(observed.st_dev),
+        "ino": int(observed.st_ino),
+        "size": int(observed.st_size),
+        "mtime_ns": int(observed.st_mtime_ns),
     }
+
+
+def _pin_generation_from(base: Mapping[str, Any]) -> dict[str, int]:
+    return {key: int(base.get(key)) for key in ("dev", "ino", "size", "mtime_ns")}
+
+
+def _pin_name(generation: Mapping[str, int]) -> str:
+    return (
+        f".sg-base-pin.{generation['dev']}.{generation['ino']}."
+        f"{generation['size']}.{generation['mtime_ns']}.sqlite"
+    )
+
+
+def _store_marker(partition_db_path: Path, payload: Mapping[str, Any]) -> None:
     conn = sqlite3.connect(str(partition_db_path), timeout=30.0)
     try:
         conn.execute(
@@ -298,6 +358,210 @@ def write_composed_marker(
         conn.commit()
     finally:
         conn.close()
+
+
+def _link_base_pin(
+    source: Path, pin_path: Path, generation: Mapping[str, int]
+) -> str | None:
+    """Hard-link ``source`` to ``pin_path``; ``None`` on success.
+
+    Returns an errno name when the filesystem, platform or sandbox cannot hard
+    link (the caller records that honestly instead of pretending to pin).
+    ``link`` follows the canonical PATH, so if the base was republished after
+    ``generation`` was taken the new link names an unverified inode and is
+    refused as ``composed_base_pin_raced``; a stale or forged entry squatting
+    the canonical pin name is replaced once.
+    """
+
+    for _attempt in range(2):
+        created = False
+        try:
+            os.link(source, pin_path)
+            created = True
+        except FileExistsError:
+            pass
+        except NotImplementedError:
+            return "link_unsupported"
+        except OSError as exc:
+            code = errno.errorcode.get(exc.errno or 0, str(exc.errno))
+            if exc.errno in _BASE_PIN_UNSUPPORTED_ERRNOS:
+                return code
+            raise PartitionBasePinError(f"composed_base_pin_failed:{code}") from exc
+        try:
+            observed = os.stat(pin_path, follow_symlinks=False)
+        except OSError as exc:
+            raise PartitionBasePinError(
+                f"composed_base_pin_missing:{pin_path.name}"
+            ) from exc
+        if stat_mod.S_ISREG(observed.st_mode) and _generation(observed) == generation:
+            return None
+        if stat_mod.S_ISDIR(observed.st_mode):
+            raise PartitionBasePinError(f"composed_base_pin_not_file:{pin_path.name}")
+        pin_path.unlink(missing_ok=True)
+        if created:
+            raise PartitionBasePinError(f"composed_base_pin_raced:{pin_path.name}")
+    raise PartitionBasePinError(f"composed_base_pin_raced:{pin_path.name}")
+
+
+def _verify_pinned_generation(pin_path: Path) -> None:
+    """Re-verify the exact pinned inode as a complete Source Graph generation.
+
+    The caller verified the canonical path just before this build and the pin
+    is taken afterwards, so the inode it now holds is re-checked for the Source
+    Graph schema and this runtime's recorded build revision before any review
+    may compose with it -- a few metadata pages, never the index body.
+    """
+
+    try:
+        conn = sqlite3.connect(f"{pin_path.as_uri()}?mode=ro", uri=True)
+        try:
+            tables = {
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type IN ('table','view')"
+                )
+            }
+            if not _BASE_PIN_REQUIRED_TABLES.issubset(tables):
+                raise PartitionBasePinError(
+                    f"composed_base_pin_schema_incomplete:{pin_path.name}"
+                )
+            row = conn.execute(
+                "SELECT value FROM meta WHERE key='last_build'"
+            ).fetchone()
+        finally:
+            conn.close()
+    except (OSError, sqlite3.Error) as exc:
+        raise PartitionBasePinError(
+            f"composed_base_pin_unreadable:{pin_path.name}"
+        ) from exc
+    if row is None:
+        return
+    try:
+        recorded = json.loads(str(row[0]))
+    except (json.JSONDecodeError, TypeError):
+        recorded = None
+    revision = recorded.get("build_revision") if isinstance(recorded, dict) else ""
+    if revision != sg.BUILD_REVISION:
+        raise PartitionBasePinError(
+            f"composed_base_pin_wrong_revision:{str(revision)[:96]}"
+        )
+
+
+def _prune_base_pins(pin_dir: Path, *, keep: str) -> int:
+    """Remove pins in ``pin_dir`` that no partition there still references.
+
+    Retention is bounded by the partitions themselves: a surviving pin is named
+    by the marker of a live ``*.sqlite`` partition or an in-flight ``*.tmp``
+    build in the same directory (markers are written BEFORE the link, so an
+    in-flight build is never pruned), and the directory owner's cleanup removes
+    both together. Best effort: a pin that cannot be removed now is retried on
+    the next marker write. Returns the number of pins removed.
+    """
+
+    try:
+        entries = list(os.scandir(pin_dir))
+    except OSError:
+        return 0
+    referenced = {keep}
+    pins: list[os.DirEntry[str]] = []
+    for entry in entries:
+        if _BASE_PIN_NAME.fullmatch(entry.name):
+            pins.append(entry)
+            continue
+        if not entry.name.endswith((".sqlite", ".tmp")):
+            continue
+        try:
+            if entry.is_symlink() or not entry.is_file(follow_symlinks=False):
+                continue
+        except OSError:
+            continue
+        marker = read_composed_marker(Path(entry.path))
+        base = (marker or {}).get("base")
+        pin = base.get("pin") if isinstance(base, dict) else None
+        if isinstance(pin, dict) and isinstance(pin.get("name"), str):
+            referenced.add(pin["name"])
+    removed = 0
+    for entry in pins:
+        if entry.name in referenced:
+            continue
+        try:
+            if entry.is_dir(follow_symlinks=False):
+                continue
+            os.unlink(entry.path)
+            removed += 1
+        except OSError:
+            continue
+    return removed
+
+
+def write_composed_marker(
+    partition_db_path: Path,
+    base_db_path: Path | None,
+    scope: Sequence[str],
+) -> dict[str, Any] | None:
+    """Persist the base generation and full declared scope; pin that base.
+
+    ``base_db_path`` of ``None`` records a standalone partition (no base to
+    compose); a later read-only open then serves partition rows only and this
+    returns ``None``. Otherwise the base generation is hard-linked beside the
+    partition (constant cost, independent of base size) and re-verified, and
+    the returned pin record says ``pinned`` or ``unsupported`` with the errno
+    reason. A symlinked, missing, empty or raced base fails closed.
+    """
+
+    partition_db_path = Path(partition_db_path)
+    scope_list = list(dict.fromkeys(str(item) for item in scope))
+    if base_db_path is None:
+        _store_marker(
+            partition_db_path,
+            {"schema_id": COMPOSED_VIEW_SCHEMA_ID, "base": None, "scope": scope_list},
+        )
+        return None
+    raw_base = Path(base_db_path)
+    if raw_base.is_symlink():
+        raise PartitionBasePinError(f"composed_base_symlink:{raw_base}")
+    resolved = raw_base.resolve()
+    try:
+        observed = os.stat(resolved, follow_symlinks=False)
+    except OSError as exc:
+        raise PartitionBaseShiftError(f"composed_base_missing:{resolved}") from exc
+    if not stat_mod.S_ISREG(observed.st_mode) or observed.st_size <= 0:
+        raise PartitionBasePinError(f"composed_base_not_file:{resolved}")
+    generation = _generation(observed)
+    name = _pin_name(generation)
+    pin: dict[str, Any] = {
+        "schema_id": BASE_PIN_SCHEMA_ID,
+        "status": "pinned",
+        "name": name,
+    }
+    base_info: dict[str, Any] = {"db_path": str(resolved), **generation, "pin": pin}
+    payload = {
+        "schema_id": COMPOSED_VIEW_SCHEMA_ID,
+        "base": base_info,
+        "scope": scope_list,
+    }
+    # Record the reference before linking so a concurrent prune in the same
+    # directory always sees this pin as referenced.
+    _store_marker(partition_db_path, payload)
+    pin_dir = partition_db_path.resolve().parent
+    pin_path = pin_dir / name
+    unsupported = _link_base_pin(resolved, pin_path, generation)
+    if unsupported is None:
+        try:
+            _verify_pinned_generation(pin_path)
+        except PartitionBasePinError:
+            pin_path.unlink(missing_ok=True)
+            raise
+    else:
+        pin = {
+            "schema_id": BASE_PIN_SCHEMA_ID,
+            "status": "unsupported",
+            "reason": unsupported,
+        }
+        base_info["pin"] = pin
+        _store_marker(partition_db_path, payload)
+    _prune_base_pins(pin_dir, keep=name)
+    return pin
 
 
 def read_composed_marker(db_path: Path) -> dict[str, Any] | None:
@@ -337,6 +601,54 @@ def _verify_base_unshifted(base: Mapping[str, Any]) -> Path:
     ) != int(base.get("mtime_ns", -1)):
         raise PartitionBaseShiftError(f"composed_base_shifted:{base_path}")
     return base_path
+
+
+def _resolve_pinned_base(base: Mapping[str, Any], partition_db_path: Path) -> Path:
+    """Return the base generation a marked partition must compose with.
+
+    A legacy marker (no ``pin`` record) keeps the original fingerprint check
+    against the canonical path. A pinned marker resolves ONLY to the pin file
+    beside the partition, whose name must be the exact canonical form of the
+    recorded generation and whose live identity (regular file, device, inode,
+    size, mtime_ns) must still match -- a forged name, an escaping or symlinked
+    pin, or a replaced/mutated pinned generation fails closed with a typed
+    :class:`PartitionBasePinError`. An ``unsupported`` pin keeps the canonical
+    fingerprint check but names why pinning was unavailable when it shifts.
+    """
+
+    pin = base.get("pin")
+    if pin is None:
+        return _verify_base_unshifted(base)
+    if not isinstance(pin, dict) or pin.get("schema_id") != BASE_PIN_SCHEMA_ID:
+        raise PartitionBasePinError("composed_base_pin_invalid:schema")
+    status = pin.get("status")
+    if status == "unsupported":
+        try:
+            return _verify_base_unshifted(base)
+        except PartitionBaseShiftError as exc:
+            reason = str(pin.get("reason") or "unknown")[:80]
+            raise PartitionBasePinError(
+                f"composed_base_shifted_unpinned:{reason}:{base.get('db_path')}"
+            ) from exc
+    if status != "pinned":
+        raise PartitionBasePinError("composed_base_pin_invalid:status")
+    name = str(pin.get("name") or "")
+    try:
+        expected = _pin_generation_from(base)
+    except (TypeError, ValueError) as exc:
+        raise PartitionBasePinError("composed_base_pin_invalid:generation") from exc
+    if not _BASE_PIN_NAME.fullmatch(name) or name != _pin_name(expected):
+        raise PartitionBasePinError(f"composed_base_pin_invalid:{name[:96]}")
+    pin_path = Path(partition_db_path).resolve().parent / name
+    try:
+        observed = os.stat(pin_path, follow_symlinks=False)
+    except OSError as exc:
+        raise PartitionBasePinError(f"composed_base_pin_missing:{name}") from exc
+    if not stat_mod.S_ISREG(observed.st_mode):
+        raise PartitionBasePinError(f"composed_base_pin_not_file:{name}")
+    if _generation(observed) != expected:
+        raise PartitionBasePinError(f"composed_base_pin_shifted:{name}")
+    return pin_path
 
 
 # ---------------------------------------------------------------------------
@@ -396,10 +708,13 @@ def attach_composed_base_if_marked(
 
     Called from :func:`source_graph.connect` for every read-only open. A DB
     without the composed marker (every ordinary Source Graph database) is left
-    untouched and this returns ``False``. A marked DB attaches its base
-    read-only and installs the precedence views; a missing or shifted base
-    fails closed with :class:`PartitionBaseShiftError` rather than silently
-    serving partition rows alone.
+    untouched and this returns ``False``. A marked DB attaches its PINNED base
+    generation read-only (see :func:`_resolve_pinned_base`) and installs the
+    precedence views, so an atomic canonical publication after the build never
+    breaks the overlay nor leaks the newer generation into it; a missing,
+    forged, replaced or shifted base fails closed with
+    :class:`PartitionBaseShiftError` rather than silently serving partition
+    rows alone.
     """
 
     try:
@@ -417,7 +732,7 @@ def attach_composed_base_if_marked(
     base = marker.get("base") if isinstance(marker, dict) else None
     if not isinstance(base, dict):
         return False
-    base_path = _verify_base_unshifted(base)
+    base_path = _resolve_pinned_base(base, db_path)
     scope = [str(item) for item in (marker.get("scope") or [])]
     # The partition IS this connection's own ``main`` schema.
     _install_composed_schema(conn, base_path, ["main"], scope)
@@ -793,10 +1108,12 @@ class ComposedView:
 
 
 __all__ = [
+    "BASE_PIN_SCHEMA_ID",
     "COMPOSED_VIEW_META_KEY",
     "COMPOSED_VIEW_SCHEMA_ID",
     "ComposedView",
     "PartitionBaseShiftError",
+    "PartitionBasePinError",
     "PartitionBindingError",
     "PartitionBuildReport",
     "PartitionError",

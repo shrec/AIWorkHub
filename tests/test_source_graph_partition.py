@@ -10,8 +10,11 @@ full-index copy ever made.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
+import os
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -475,3 +478,282 @@ def test_disjoint_scope_required_across_partitions(tmp_path: Path) -> None:
     sgp.build_partition(repo, _changed(repo, ["m.py"]), p2, base_db_path=base_db)
     with pytest.raises(sgp.PartitionError):
         sgp.ComposedView.bind(base_db, [p1, p2])
+
+
+# ---------------------------------------------------------------------------
+# NF-2026-00946: the base generation is pinned for the overlay's lifetime
+# ---------------------------------------------------------------------------
+
+def _publish(repo: Path, files: dict[str, str]) -> None:
+    """Ordinary canonical publication: a real full rebuild of the base."""
+
+    for rel, text in files.items():
+        (repo / rel).write_text(text, encoding="utf-8")
+    source_graph.build_index(repo, incremental=False)
+
+
+def _pins(directory: Path) -> list[Path]:
+    return sorted(directory.glob(".sg-base-pin.*.sqlite"))
+
+
+def _pinned_partition(tmp_path: Path) -> tuple[Path, Path, Path, os.stat_result]:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    base_db = _build_base(
+        repo,
+        {
+            "keep.py": "def keep_symbol():\n    return 1\n",
+            "change.py": "def original_symbol():\n    return 2\n",
+        },
+    )
+    before = os.stat(base_db)
+    (repo / "change.py").write_text(
+        "def changed_symbol():\n    return 3\n", encoding="utf-8"
+    )
+    partition_dir = tmp_path / "overlay"
+    partition_dir.mkdir()
+    partition = partition_dir / "partition.sqlite"
+    report = sgp.build_partition(
+        repo, _changed(repo, ["change.py"]), partition, base_db_path=base_db,
+    )
+    assert report.base_pin == "pinned"
+    return repo, base_db, partition, before
+
+
+def _names(partition: Path, table: str, column: str) -> set[str]:
+    conn = source_graph.connect(partition, read_only=True)
+    try:
+        return {str(row[0]) for row in conn.execute(f"SELECT {column} FROM {table}")}
+    finally:
+        conn.close()
+
+
+def test_pinned_base_survives_atomic_canonical_publication(tmp_path: Path) -> None:
+    repo, base_db, partition, before = _pinned_partition(tmp_path)
+    (pin,) = _pins(partition.parent)
+    # The pin IS the base generation's inode: a hard link, never a copy.
+    assert (os.stat(pin).st_ino, os.stat(pin).st_dev) == (before.st_ino, before.st_dev)
+
+    _publish(repo, {"keep.py": "def keep_symbol():\n    return 1\n\n"
+                               "def published_later():\n    return 4\n"})
+    after = os.stat(base_db)
+    assert after.st_ino != before.st_ino, "publication did not replace the base"
+
+    names = _names(partition, "entities", "name")
+    assert "changed_symbol" in names  # from the partition
+    assert "keep_symbol" in names  # unchanged base, from the pinned generation
+    assert "original_symbol" not in names  # hidden base row for the changed file
+    assert "published_later" not in names  # newer generation never leaks in
+
+
+@pytest.mark.parametrize(
+    "tamper, reason",
+    [
+        ("pin_missing", "composed_base_pin_missing"),
+        ("pin_replaced", "composed_base_pin_shifted"),
+        ("pin_mutated", "composed_base_pin_shifted"),
+        ("pin_symlink", "composed_base_pin_not_file"),
+        ("marker_escape", "composed_base_pin_invalid"),
+        ("marker_forged_generation", "composed_base_pin_invalid"),
+        ("marker_forged_schema", "composed_base_pin_invalid:schema"),
+    ],
+)
+def test_pinned_base_tampering_fails_closed(
+    tmp_path: Path, tamper: str, reason: str
+) -> None:
+    _repo, _base_db, partition, _before = _pinned_partition(tmp_path)
+    (pin,) = _pins(partition.parent)
+    if tamper == "pin_missing":
+        pin.unlink()
+    elif tamper == "pin_replaced":
+        replacement = pin.with_name("replacement.bin")
+        replacement.write_bytes(pin.read_bytes())
+        os.replace(replacement, pin)
+    elif tamper == "pin_mutated":
+        with pin.open("ab") as handle:
+            handle.write(b"\x00")
+    elif tamper == "pin_symlink":
+        target = pin.with_name("elsewhere.bin")
+        pin.rename(target)
+        pin.symlink_to(target)
+    else:
+        marker = sgp.read_composed_marker(partition)
+        assert marker is not None
+        if tamper == "marker_escape":
+            marker["base"]["pin"]["name"] = "../" + pin.name
+        elif tamper == "marker_forged_generation":
+            marker["base"]["ino"] = int(marker["base"]["ino"]) + 1
+        else:
+            marker["base"]["pin"]["schema_id"] = "forged"
+        conn = sqlite3.connect(partition)
+        try:
+            conn.execute(
+                "UPDATE meta SET value=? WHERE key=?",
+                (json.dumps(marker), sgp.COMPOSED_VIEW_META_KEY),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    with pytest.raises(sgp.PartitionBasePinError, match=reason):
+        source_graph.connect(partition, read_only=True)
+
+
+def test_pin_refuses_symlinked_missing_or_unverified_base(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    base_db = _build_base(repo, {"m.py": "def s():\n    return 1\n"})
+    changed = _changed(repo, ["m.py"])
+    link = tmp_path / "base_link.sqlite"
+    link.symlink_to(base_db)
+    with pytest.raises(sgp.PartitionBasePinError, match="composed_base_symlink"):
+        sgp.build_partition(repo, changed, tmp_path / "a.sqlite", base_db_path=link)
+    with pytest.raises(sgp.PartitionBaseShiftError, match="composed_base_missing"):
+        sgp.build_partition(
+            repo, changed, tmp_path / "b.sqlite",
+            base_db_path=tmp_path / "absent.sqlite",
+        )
+    conn = sqlite3.connect(base_db)
+    try:
+        row = conn.execute("SELECT value FROM meta WHERE key='last_build'").fetchone()
+        payload = json.loads(row[0])
+        payload["build_revision"] = "aiworkhub.source_graph.forged.v0"
+        conn.execute(
+            "UPDATE meta SET value=? WHERE key='last_build'", (json.dumps(payload),)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    forged_dir = tmp_path / "forged"
+    forged_dir.mkdir()
+    with pytest.raises(sgp.PartitionBasePinError, match="composed_base_pin_wrong_revision"):
+        sgp.build_partition(
+            repo, changed, forged_dir / "c.sqlite", base_db_path=base_db,
+        )
+    assert _pins(forged_dir) == [], "an unverified generation stayed pinned"
+
+
+def test_pin_refuses_generation_republished_during_link(
+    tmp_path: Path, monkeypatch
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    base_db = _build_base(repo, {"m.py": "def s():\n    return 1\n"})
+    (repo / "m.py").write_text("def s2():\n    return 2\n", encoding="utf-8")
+    real_link = os.link
+    newer = tmp_path / "newer.sqlite"
+    newer.write_bytes(base_db.read_bytes() + b"\x00" * 512)
+
+    def racing_link(src, dst, *args, **kwargs):
+        # The canonical path is atomically republished between the generation
+        # stat and the link: the link now names an unverified generation.
+        os.replace(newer, base_db)
+        return real_link(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(sgp.os, "link", racing_link)
+    overlay = tmp_path / "overlay"
+    overlay.mkdir()
+    with pytest.raises(sgp.PartitionBasePinError, match="composed_base_pin_raced"):
+        sgp.build_partition(
+            repo, _changed(repo, ["m.py"]), overlay / "p.sqlite", base_db_path=base_db,
+        )
+    assert _pins(overlay) == []
+
+
+def test_pin_unsupported_filesystem_is_recorded_and_fails_explicitly(
+    tmp_path: Path, monkeypatch
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    base_db = _build_base(repo, {"keep.py": "def keep_symbol():\n    return 1\n",
+                                 "m.py": "def s():\n    return 1\n"})
+    (repo / "m.py").write_text("def s2():\n    return 2\n", encoding="utf-8")
+
+    def cross_device_link(*_args, **_kwargs):
+        raise OSError(errno.EXDEV, "Invalid cross-device link")
+
+    monkeypatch.setattr(sgp.os, "link", cross_device_link)
+    partition = tmp_path / "p.sqlite"
+    report = sgp.build_partition(
+        repo, _changed(repo, ["m.py"]), partition, base_db_path=base_db,
+    )
+    assert report.base_pin == "unsupported:EXDEV"
+    assert _pins(tmp_path) == []
+    # Still composes while the canonical generation is unchanged ...
+    assert "keep_symbol" in _names(partition, "entities", "name")
+    # ... and names the missing pin when publication shifts the base.
+    _publish(repo, {"keep.py": "def keep_symbol():\n    return 5\n"})
+    with pytest.raises(
+        sgp.PartitionBasePinError, match="composed_base_shifted_unpinned:EXDEV"
+    ):
+        source_graph.connect(partition, read_only=True)
+
+
+def test_pin_retention_is_bounded_by_live_partitions(tmp_path: Path) -> None:
+    repo, base_db, partition, _before = _pinned_partition(tmp_path)
+    overlay = partition.parent
+    sibling = overlay / "sibling.sqlite"
+    sgp.build_partition(
+        repo, _changed(repo, ["change.py"]), sibling, base_db_path=base_db,
+    )
+    (first_pin,) = _pins(overlay)  # one shared pin per generation
+
+    _publish(repo, {"keep.py": "def keep_symbol():\n    return 6\n"})
+    # A rebuild publishes through temp + atomic replace, exactly as callers do.
+    temporary = overlay / ".partition.sqlite.abc.tmp"
+    sgp.build_partition(
+        repo, _changed(repo, ["change.py"]), temporary, base_db_path=base_db,
+    )
+    os.replace(temporary, partition)
+    pins = _pins(overlay)
+    # The sibling still references the first generation, so it is retained.
+    assert first_pin in pins and len(pins) == 2
+
+    sibling.unlink()
+    _publish(repo, {"keep.py": "def keep_symbol():\n    return 7\n"})
+    temporary = overlay / ".partition.sqlite.def.tmp"
+    sgp.build_partition(
+        repo, _changed(repo, ["change.py"]), temporary, base_db_path=base_db,
+    )
+    os.replace(temporary, partition)
+    pins = _pins(overlay)
+    # The unreferenced first generation is gone; the one the partition named
+    # until its replace is retained at most until the next marker write.
+    assert first_pin not in pins and len(pins) == 2
+    sgp.build_partition(
+        repo, _changed(repo, ["change.py"]), sibling, base_db_path=base_db,
+    )
+    # Only the generation a live partition references survives.
+    (only_pin,) = _pins(overlay)
+    assert os.stat(only_pin).st_ino == os.stat(base_db).st_ino
+    assert "keep_symbol" in _names(partition, "entities", "name")
+
+
+def test_pin_setup_cost_is_constant_not_base_sized(tmp_path: Path, capsys) -> None:
+    measurements: dict[str, dict[str, float]] = {}
+    for label, count in (("small", 20), ("large", 200)):
+        repo = tmp_path / label
+        repo.mkdir()
+        base_db = _make_large_base(repo, count)
+        (repo / "target.py").write_text(
+            "def target_symbol():\n    return 1\n", encoding="utf-8"
+        )
+        overlay = tmp_path / f"{label}_overlay"
+        overlay.mkdir()
+        report = sgp.build_partition(
+            repo, _changed(repo, ["target.py"]), overlay / "p.sqlite",
+            base_db_path=base_db,
+        )
+        (pin,) = _pins(overlay)
+        # No copy: the pin shares the base inode, so it adds no bytes.
+        assert os.stat(pin).st_ino == os.stat(base_db).st_ino
+        assert os.stat(base_db).st_nlink >= 2
+        measurements[label] = {
+            "base_bytes": os.stat(base_db).st_size,
+            "partition_bytes": report.bytes_written,
+            "pin_seconds": round(report.pin_seconds, 5),
+        }
+    assert measurements["large"]["base_bytes"] > measurements["small"]["base_bytes"] * 3
+    # Generous bound: a link + stat + metadata check, never proportional work.
+    assert measurements["large"]["pin_seconds"] < 1.0
+    print("BASE_PIN_COST " + json.dumps(measurements, sort_keys=True))
+    assert "BASE_PIN_COST" in capsys.readouterr().out

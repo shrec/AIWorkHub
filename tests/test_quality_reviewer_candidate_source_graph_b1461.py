@@ -1082,3 +1082,100 @@ def test_quality_review_prewarm_all_concurrent_callers_observe_wrapped_data_fail
         assert str(exc).startswith(
             "quality_review_candidate_source_graph_prewarm_error:SourceGraphError:"
         )
+
+
+def test_candidate_overlay_survives_canonical_atomic_publication_nf946(
+    tmp_path: Path,
+) -> None:
+    """NF-2026-00946: a sealed reviewer overlay must stay readable across an
+    ordinary atomic canonical Source Graph publication.
+
+    Real prewarm builds the packet-bound partition over the verified canonical
+    base; a real full rebuild then atomically publishes a NEW canonical
+    generation. Before the fix every reviewer query failed closed with
+    ``composed_base_shifted`` because the overlay pointed at the mutable
+    canonical path. The overlay must now keep answering from the exact base
+    generation it was sealed against: the changed symbol from the candidate,
+    the unchanged base symbol from the pinned base, and never content that only
+    exists in the newer, unreviewed canonical generation.
+    """
+
+    canonical = tmp_path / "canonical"
+    candidate = tmp_path / "candidate"
+    canonical.mkdir()
+    candidate.mkdir()
+    (canonical / "module.py").write_text(
+        "def canonical_only():\n    return 1\n", encoding="utf-8"
+    )
+    stable = canonical / "stable.py"
+    stable.write_text("def base_unchanged_symbol():\n    return 7\n", encoding="utf-8")
+    _bootstrap_canonical_repo(canonical)
+    candidate_file = candidate / "module.py"
+    candidate_file.write_text(
+        "def canonical_only():\n    return 1\n\n"
+        "def candidate_only_symbol():\n    return 2\n",
+        encoding="utf-8",
+    )
+    candidate_bytes = candidate_file.read_bytes()
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    packet = quality_reviewer.build_review_packet(
+        request_id="target-request-946",
+        task_id="TARGET_TASK_946",
+        claim_epoch=1,
+        worker_provider="codex_cli",
+        changed_path_hashes={"module.py": hashlib.sha256(candidate_bytes).hexdigest()},
+    )
+    packet_path = runtime / "quality_review_packet.json"
+    packet_path.write_text(json.dumps(packet), encoding="utf-8")
+    prewarm = worker_tools.prewarm_quality_review_source_graph(
+        packet_path, repo=candidate, authority_repo=canonical,
+    )
+    assert prewarm["ok"] is True and prewarm["built"] is True
+    base_db = worker_tools.verify_quality_review_prewarm_authority(canonical).db_path
+    before = base_db.stat()
+
+    # Ordinary canonical publication: a real full rebuild publishes a new
+    # generation over the canonical path while the review is in flight.
+    stable.write_text(
+        "def base_unchanged_symbol():\n    return 7\n\n"
+        "def post_publication_symbol():\n    return 8\n",
+        encoding="utf-8",
+    )
+    source_graph.build_index(canonical, incremental=False)
+    after = base_db.stat()
+    assert (after.st_ino, after.st_size, after.st_mtime_ns) != (
+        before.st_ino, before.st_size, before.st_mtime_ns,
+    ), "canonical generation was not republished"
+    worker_tools.verify_quality_review_prewarm_authority(canonical)
+
+    ctx = _ctx(runtime, repo=candidate, authority_repo=canonical, packet_path=packet_path)
+
+    def query(name: str) -> dict:
+        worker_tools._CACHE.clear()
+        return worker_tools.source_graph_query(
+            ctx, mode="function", query=name, budget=16,
+        )
+
+    changed = query("candidate_only_symbol")
+    assert changed["ok"] is True, changed
+    assert changed["hit_count"] > 0
+    assert "candidate_only_symbol" in changed["content"]
+    assert changed["authority_source"] == "candidate_overlay"
+    assert changed["packet_sha256"] == packet["packet_sha256"]
+    assert changed["target_request_id"] == "target-request-946"
+    assert changed["target_task_id"] == "TARGET_TASK_946"
+
+    unchanged = query("base_unchanged_symbol")
+    assert unchanged["ok"] is True, unchanged
+    assert unchanged["hit_count"] > 0
+    assert "stable.py" in unchanged["content"]
+    assert unchanged["authority_source"] == "candidate_overlay"
+    assert unchanged["packet_sha256"] == packet["packet_sha256"]
+
+    # The newer canonical generation was never reviewed against this packet;
+    # none of its content may enter the sealed review.
+    unreviewed = query("post_publication_symbol")
+    assert unreviewed["ok"] is True, unreviewed
+    assert unreviewed["hit_count"] == 0
+    assert candidate_file.read_bytes() == candidate_bytes
