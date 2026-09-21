@@ -14,6 +14,17 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.11.56
+
+- Windows: bundled native CLI workers reach `CreateProcess` inside their
+  AppContainer, and bundled validation commands run inside it.
+- The VS Code LM bridge lets a worker read files its card declared writable
+  after forced semantic-edit staging begins (NF-2026-00023).
+- Known issues: native CLI workers still cannot run a Windows task until the
+  container is granted access to the provider install and worktree
+  (NF-2026-00025); blocked-card rework recovery fails on Windows with
+  `[WinError 87]`.
+
 ## What's new in 0.11.55
 
 - The wave mini-roadmap popup now follows the bundled runtime's current-wave

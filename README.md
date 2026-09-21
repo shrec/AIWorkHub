@@ -62,6 +62,20 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
+## What's new in 0.11.56
+
+- Windows native CLI workers now reach `CreateProcess` inside their
+  AppContainer: the `windows_appcontainer` backend is accepted by every
+  consumer, and `LOCALAPPDATA` is supplied to the child environment block that
+  AppContainer creation requires.
+- Windows validation commands run inside the worker's own AppContainer.
+- VS Code LM workers can still read files their card declared writable after
+  forced semantic-edit staging begins (NF-2026-00023).
+- Known issues: native CLI workers still cannot run a Windows task until the
+  container is granted access to the provider install and worktree
+  (NF-2026-00025); blocked-card rework recovery fails on Windows with
+  `[WinError 87]`.
+
 ## What's new in 0.11.55
 
 - Roadmap views now carry a server-side current-wave projection that names the

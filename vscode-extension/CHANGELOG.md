@@ -1,5 +1,27 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.56 — 2026-09-21
+
+### Fixed
+
+- Windows: bundled native CLI workers reach `CreateProcess` inside their
+  AppContainer. The bundled runtime resolved the `windows_appcontainer` backend
+  and then refused it in three places, and once past that, process creation
+  failed with `ERROR_ENVVAR_NOT_FOUND` because the sanitized environment dropped
+  `LOCALAPPDATA`, which AppContainer creation requires in the child's block.
+- Windows: bundled validation commands run inside the worker's own AppContainer.
+- The VS Code LM bridge lets a worker read the files its card declared writable
+  after forced semantic-edit staging begins, so a worker whose next edit calls
+  into another declared file is no longer stranded (NF-2026-00023). Reads stay
+  read-only, exact, two per file and four in total.
+
+### Known issues
+
+- Windows native CLI workers still cannot run a task: the container is never
+  granted access to the provider CLI's install or the worktree (NF-2026-00025).
+  The VS Code LM route is the only Windows worker route until that lands.
+- Blocked-card rework recovery fails on Windows with `[WinError 87]`.
+
 ## 0.11.55 — 2026-09-21
 
 ### Added

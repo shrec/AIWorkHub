@@ -6,6 +6,42 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.56] - 2026-09-21
+
+### Fixed
+
+- Windows: native CLI workers (`claude_cli`, `codex_cli`, `opencode_cli`) now
+  reach `CreateProcess` inside their AppContainer. Two stacked defects stopped
+  every such card before the model ran, although preflight reported the route
+  launchable and the sandbox enforceable. First, `select_sandbox_backend()`
+  produced `windows_appcontainer` while `provision_worker_mcp_runtime`,
+  `sandbox_argv` and `run_validations` each refused it, so cards died as
+  `launch_failed:unsupported_sandbox_backend:windows_appcontainer`. Second,
+  `CreateProcessW` then failed with `ERROR_ENVVAR_NOT_FOUND` (203): AppContainer
+  process creation needs `LOCALAPPDATA` in the child's environment block, and
+  the sanitized worker and validation environments drop it.
+  `launch_appcontainer` now supplies it at the one chokepoint every
+  AppContainer launch shares.
+- Windows: validation commands run inside the worker's own AppContainer
+  through the existing container API, instead of being refused.
+- VS Code LM workers can read the files their card declared writable after
+  forced semantic-edit staging begins, not only the next required output. A
+  worker whose next edit had to call into another declared file was refused
+  and failed as `vscode_lm_semantic_edit_stage_required` (NF-2026-00023).
+  Reads stay read-only, exact, two per file and four in total.
+- `tests/test_worker_workspace.py` collects and runs on Windows instead of
+  aborting on `os.fchmod` and `os.O_CLOEXEC`.
+
+### Known issues
+
+- Windows native CLI workers still cannot run a task: inside the AppContainer
+  the provider CLI's own install is unreadable ("Access is denied.") because
+  nothing grants the container access to it, or to the worktree (NF-2026-00025).
+  Until that lands, the VS Code LM route is the only Windows worker route.
+- `aiworkhub_task_recover_blocked_rework` fails on Windows with `[WinError 87]`.
+- One pre-existing Windows byte-exactness gap remains in the npm-prefix seeding
+  test (NF-2026-00024).
+
 ## [0.11.55] - 2026-09-21
 
 ### Added
