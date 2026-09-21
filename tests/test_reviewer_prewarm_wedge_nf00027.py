@@ -21,6 +21,12 @@ import time
 from aiworkhub import process_launcher, reviewer_prewarm_capacity, worker_ai_tools_mcp
 
 from test_process_launcher import _card, _manager, _reviewer_launch_setup, _show
+from test_quality_reviewer_launch_reservation import (
+    _TerminalSpy,
+    _capture_callbacks,
+    _committed,
+    _manager as _reservation_manager,
+)
 
 _PREWARM_STARTED = "reviewer_source_graph_prewarm_started"
 
@@ -271,3 +277,53 @@ def test_unexpected_prewarm_exception_retires_started_phase(tmp_path, monkeypatc
 
     assert result.get("ok") is False
     assert phases[-2:] == [_PREWARM_STARTED, "reviewer_source_graph_prewarm_failed"]
+
+
+def test_an_open_intent_reader_cannot_make_the_intent_settle_twice(tmp_path, monkeypatch):
+    # Found while validating this card: under load one settler's pre-lock read
+    # still held the terminal intent open when the lock holder retired it.  On
+    # Windows a plain ``os.open`` handle refuses deletion, ``unlink_if_regular``
+    # swallowed the sharing violation, and the queued settler then re-read a
+    # live ticket and settled it a second time.  Pause one reader exactly there.
+    manager = _reservation_manager(tmp_path)
+    manager._append_event(_committed(
+        request_id="review-conc-1",
+        task_id="REVIEWER_CONC_1",
+        reviewer_claim_epoch=2,
+        provider_pid=os.getpid(),
+        provider_pid_start_ticks=1,
+    ))
+    assert manager._reconcile_expired_starting_reservations() == 1
+    spy = _TerminalSpy()
+    monkeypatch.setattr(process_launcher.task_store, "mark_terminal_failure", spy)
+    callbacks = _capture_callbacks(monkeypatch)
+    holding, winner_done = threading.Event(), threading.Event()
+    real_fstat = os.fstat
+
+    def fstat(fd):
+        # ``_read_regular_intent`` fstats the descriptor it just opened.
+        if threading.current_thread().name == "paused-reader" and not holding.is_set():
+            holding.set()
+            assert winner_done.wait(timeout=10)
+        return real_fstat(fd)
+
+    monkeypatch.setattr(process_launcher.os, "fstat", fstat)
+    settled: dict[str, int] = {}
+    reader = threading.Thread(
+        target=lambda: settled.__setitem__(
+            "reader", manager._settle_reviewer_terminal_intents()
+        ),
+        name="paused-reader",
+    )
+    reader.start()
+    try:
+        assert holding.wait(timeout=10)
+        settled["winner"] = manager._settle_reviewer_terminal_intents()
+    finally:
+        winner_done.set()
+        reader.join(timeout=10)
+
+    assert not reader.is_alive()
+    assert settled == {"winner": 1, "reader": 0}
+    assert len(spy.calls) == 1
+    assert len(callbacks) == 1

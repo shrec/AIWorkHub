@@ -2586,6 +2586,48 @@ def _open_windows_lock_file(path: Path) -> int:
     return msvcrt.open_osfhandle(handle, os.O_RDWR | getattr(os, "O_BINARY", 0))
 
 
+def open_readonly_shared(path: Path, flags: int) -> int:
+    """Open an existing file for reading without ever blocking its deletion.
+
+    POSIX ``os.open`` never stands in the way of an ``unlink``, so ``flags``
+    pass straight through there.  On Windows the CRT open behind ``os.open``
+    shares only READ | WRITE, so while any such handle is open a concurrent
+    ``os.unlink`` of the same path fails with a sharing violation.  A reader of
+    a claim ticket must never veto the lock holder that retires it: measured,
+    one settler's unlocked read of a reviewer terminal intent made the winner's
+    retire fail silently, and a queued settler then settled the same intent a
+    second time.  So Windows opens through ``CreateFileW`` with
+    FILE_SHARE_DELETE, exactly as :func:`open_lock_file` does; the descriptor
+    reads the same bytes in the same CRT mode ``os.open(path, O_RDONLY)`` gave.
+    """
+
+    if not is_windows():
+        return os.open(str(path), flags)
+    from ctypes import wintypes
+
+    GENERIC_READ = 0x80000000
+    kernel32 = _windows_dll_loader()("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+    handle = create_file(
+        str(path), GENERIC_READ, _FILE_SHARE_ALL, None, _OPEN_EXISTING, 0, None
+    )
+    if handle in (None, 0, _INVALID_HANDLE_VALUE):
+        raise _windows_error(ctypes.get_last_error())
+    import msvcrt
+
+    return msvcrt.open_osfhandle(handle, os.O_RDONLY)
+
+
 def _prepare_windows_lock_byte(fd: int) -> None:
     """Ensure byte zero exists and select it for ``msvcrt.locking``.
 

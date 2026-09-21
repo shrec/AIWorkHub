@@ -55,6 +55,7 @@ from .platform_io import (
     chmod_path,
     is_windows,
     lock_fd,
+    open_readonly_shared,
     probe_process_group,
     process_group_launch_kwargs,
     process_is_alive,
@@ -6122,7 +6123,8 @@ class ProcessManager:
                 reparse and getattr(link_identity, "st_file_attributes", 0) & reparse
             ):
                 raise OSError("terminal intent is a reparse point")
-        fd = os.open(path, flags)
+        # Share delete: this read must never block the settler that retires it.
+        fd = open_readonly_shared(path, flags)
         try:
             opened = os.fstat(fd)
             if not stat.S_ISREG(opened.st_mode):
