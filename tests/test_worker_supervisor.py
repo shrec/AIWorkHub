@@ -763,6 +763,184 @@ def test_appcontainer_terminate_then_wait_does_not_bypass_native_result(
     assert launch.close_calls == 1
 
 
+# -- worker MCP bridge (NF-2026-00034) ---------------------------------------
+
+
+class _FakePipe:
+    """Stands in for windows_appcontainer.WorkerPipe: scripted client bytes."""
+
+    def __init__(self, *, accept: bool = True) -> None:
+        import queue
+
+        self._inbound: queue.Queue[bytes] = queue.Queue()
+        self._accept = accept
+        self.accepted: list[object] = []
+        self.written = bytearray()
+        self.shut = False
+        self.closed = 0
+
+    def accept(self, job):
+        self.accepted.append(job)
+        while not self._accept and not self.shut:
+            time.sleep(0.01)
+        return self._accept and not self.shut
+
+    def feed(self, data: bytes) -> None:
+        self._inbound.put(data)
+
+    def read(self) -> bytes:
+        import queue
+
+        while not self.shut:
+            try:
+                return self._inbound.get(timeout=0.02)
+            except queue.Empty:
+                continue
+        return b""
+
+    def write(self, data: bytes) -> None:
+        if self.shut:
+            raise BrokenPipeError("shut")
+        self.written += data
+
+    def shutdown(self) -> None:
+        self.shut = True
+
+    def close(self, timeout: float = 5.0) -> bool:
+        self.shut = True
+        self.closed += 1
+        return True
+
+
+class _FakeServerJob:
+    def __init__(self) -> None:
+        self.assigned: list[object] = []
+        self.closed = False
+
+    def assign(self, process) -> None:
+        self.assigned.append(process)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+# Echoes its bound environment once, then every stdin line: an MCP server's
+# stdio shape without its content.
+_ECHO_SERVER = (
+    "import os,sys\n"
+    "sys.stdout.buffer.write(os.environ['BRIDGE_PROBE'].encode()+b'\\n')\n"
+    "sys.stdout.buffer.flush()\n"
+    "for line in sys.stdin.buffer:\n"
+    "    sys.stdout.buffer.write(line)\n"
+    "    sys.stdout.buffer.flush()\n"
+)
+
+
+def _bridge(tmp_path: Path, pipe: _FakePipe, jobs: list, **bridge):
+    spec = {
+        "command": sys.executable,
+        "args": ["-c", _ECHO_SERVER],
+        "env": {"BRIDGE_PROBE": "bound-env"},
+        "stderr_path": str(tmp_path / "worker-mcp.stderr.log"),
+        **bridge,
+    }
+
+    def _job():
+        jobs.append(_FakeServerJob())
+        return jobs[-1]
+
+    return worker_supervisor._WorkerMcpBridge(
+        pipe, "launch-job", spec, str(tmp_path), server_job=_job
+    )
+
+
+def _wait_until(predicate, timeout: float = 20.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        assert time.monotonic() < deadline, "timed out"
+        time.sleep(0.02)
+
+
+def test_bridge_serves_one_client_of_the_job_and_tears_everything_down(
+    tmp_path: Path,
+) -> None:
+    pipe, jobs = _FakePipe(), []
+    bridge = _bridge(tmp_path, pipe, jobs)
+    bridge.start()
+    pipe.feed(b'{"jsonrpc":"2.0","id":1,"method":"initialize"}\n')
+    _wait_until(lambda: b'"id":1' in pipe.written)
+
+    # One accept, against this launch's job; the server started with the
+    # config's own environment and was put in its own kill-on-close job.
+    assert pipe.accepted == ["launch-job"]
+    assert bytes(pipe.written).startswith(b"bound-env\n")
+    server = bridge.server
+    assert jobs[0].assigned == [server]
+
+    bridge.close()
+    assert server.poll() is not None  # no orphan server
+    assert jobs[0].closed
+    assert pipe.shut and pipe.closed >= 1  # no leftover pipe
+    assert bridge.error == ""
+    bridge.close()  # idempotent
+
+
+def test_bridge_client_eof_lets_the_server_exit_and_closes_the_pipe(tmp_path: Path) -> None:
+    pipe, jobs = _FakePipe(), []
+    bridge = _bridge(tmp_path, pipe, jobs)
+    bridge.start()
+    _wait_until(lambda: bridge.server is not None)
+    pipe.feed(b"")  # the contained client hung up
+    _wait_until(lambda: bridge.server.poll() is not None and pipe.closed >= 1)
+    bridge.close()
+    assert bridge.error == ""
+
+
+def test_bridge_that_is_never_connected_starts_no_server(tmp_path: Path) -> None:
+    pipe, jobs = _FakePipe(accept=False), []
+    bridge = _bridge(tmp_path, pipe, jobs)
+    bridge.start()
+    time.sleep(0.1)
+    bridge.close()
+    assert bridge.server is None and jobs == []
+    assert pipe.closed >= 1
+
+
+def test_bridge_server_that_cannot_start_leaves_nothing_behind(tmp_path: Path) -> None:
+    pipe, jobs = _FakePipe(), []
+    bridge = _bridge(tmp_path, pipe, jobs, command=str(tmp_path / "missing.exe"))
+    bridge.start()
+    # The waiting client is let go at once instead of at worker exit.
+    _wait_until(lambda: bridge.error != "" and pipe.closed >= 1)
+    bridge.close()
+    assert bridge.server is None and jobs == []
+    assert "FileNotFoundError" in bridge.error or "OSError" in bridge.error
+
+
+def test_appcontainer_process_close_ends_the_bridge_before_the_launch(tmp_path: Path) -> None:
+    order: list[str] = []
+
+    class FakeLaunch:
+        pid = 41
+        command_line = "worker.exe"
+
+        def close(self) -> None:
+            order.append("launch")
+
+    class FakeBridge:
+        def close(self) -> None:
+            order.append("bridge")
+
+    stdout = (tmp_path / "stdout").open("w+b")
+    stderr = (tmp_path / "stderr").open("w+b")
+    process = worker_supervisor._AppContainerProcess(
+        FakeLaunch(), stdout, stderr, (), FakeBridge()
+    )
+    process.close()
+    process.close()
+    assert order == ["bridge", "launch"]
+
+
 def test_posix_worker_spawn_kwargs_are_platform_specific() -> None:
     linux = worker_supervisor._posix_worker_spawn_kwargs("linux")
     macos = worker_supervisor._posix_worker_spawn_kwargs("darwin")

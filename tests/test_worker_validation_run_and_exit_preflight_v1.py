@@ -108,6 +108,73 @@ def _ctx(tmp_path: Path, packet_path: Path, worktree: Path) -> w.WorkerToolConte
 
 
 # ---------------------------------------------------------------------------
+# NF-2026-00034: a server bridged to a contained worker never executes for it.
+# ---------------------------------------------------------------------------
+
+
+def test_a_server_outside_the_worker_sandbox_runs_no_validation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import dataclasses
+
+    _mute_chmod(monkeypatch)
+    worktree = _worktree(tmp_path)
+    marker = tmp_path / "ran"
+    (worktree / "touch.py").write_text(
+        f"open({str(marker)!r}, 'w').close()\n", encoding="utf-8"
+    )
+    packet = _packet(tmp_path, validation=["python3 touch.py"])
+    ctx = dataclasses.replace(
+        _ctx(tmp_path, packet, worktree), contained_worker="windows_appcontainer"
+    )
+
+    result = w.validation_run(ctx, index="all")
+
+    assert result["ok"] is False
+    assert result["reason"] == "validation_run_unavailable_outside_the_worker_sandbox"
+    assert not marker.exists()
+
+
+def test_the_contained_marker_is_bound_from_the_environment(tmp_path: Path) -> None:
+    env = {
+        w.ENV_TASK_ID: "T", w.ENV_RUNNER: "r", w.ENV_TOPIC: "t",
+        w.ENV_REPO: str(tmp_path), w.ENV_AUTHORITY_REPO: str(tmp_path),
+    }
+    assert w.load_context_from_env(env).contained_worker == ""
+    env[w.ENV_CONTAINED_WORKER] = "windows_appcontainer"
+    assert w.load_context_from_env(env).contained_worker == "windows_appcontainer"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the shim is Windows PowerShell")
+def test_appcontainer_bridge_moves_the_real_server_to_the_host(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    runtime = w.generate_worker_mcp_runtime(
+        home=home, request_id="req1", task_id="T", runner="r", topic="t",
+        repo=tmp_path, authority_repo=tmp_path, source_graph_targets=[],
+        session_topic="s", package_import_root=tmp_path, python_executable="py.exe",
+    )
+    config_path, bridge = w.appcontainer_mcp_bridge(
+        runtime, request_id="req1", home=home, stderr_path=tmp_path / "mcp.err"
+    )
+    real = json.loads(runtime.claude_mcp_config_path.read_text(encoding="utf-8"))
+    server = real["mcpServers"][w.SERVER_NAME]
+    # The supervisor runs exactly the server the generated config named ...
+    assert bridge["command"] == server["command"] == "py.exe"
+    assert bridge["args"] == server["args"]
+    assert bridge["env"] == {**server["env"], w.ENV_CONTAINED_WORKER: "windows_appcontainer"}
+    # ... the contained CLI gets only the pipe shim, outside the runtime dir,
+    # with no environment -- the audit key path included -- at all ...
+    assert config_path == home / w.APPCONTAINER_BRIDGE_CONFIG_NAME
+    shim = json.loads(config_path.read_text(encoding="utf-8"))["mcpServers"][w.SERVER_NAME]
+    assert shim["command"].lower().endswith("powershell.exe")
+    assert "env" not in shim
+    assert bridge["pipe"].startswith("\\\\.\\pipe\\aiworkhub-worker-req1-")
+    # ... and the directory holding the key and ledger stays closed to it.
+    assert bridge["withheld_directories"] == [str(runtime.audit_ledger_path.parent)]
+    assert runtime.audit_hmac_key_path.parent == runtime.audit_ledger_path.parent
+
+
+# ---------------------------------------------------------------------------
 # The bounded digest: the log lands on disk, the model gets the record.
 # ---------------------------------------------------------------------------
 

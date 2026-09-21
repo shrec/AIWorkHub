@@ -22,11 +22,15 @@ gate; it will be wired in only after independent acceptance.
 
 from __future__ import annotations
 
+import base64
 import ctypes
 import enum
 import hashlib
 import os
+import re
+import secrets
 import stat
+import threading
 from ctypes import wintypes
 from dataclasses import dataclass, field, replace
 from functools import partial
@@ -230,6 +234,9 @@ class AppContainerRequest:
     capability_sids: Sequence[str] = ()
     create_no_window: bool = True
     filesystem_grants: Sequence[ContainerGrant] = ()
+    # Protected directories beneath a revocable grant that stay closed to the
+    # container: never granted, never walked (see _with_protected_descendants).
+    withheld_directories: Sequence[str] = ()
 
 
 @dataclass(frozen=True)
@@ -291,6 +298,8 @@ class AppContainerLaunch:
     grant_revoke_failures: list[tuple[str, int]] = field(
         default_factory=list, repr=False
     )
+    # Persistent grants as applied: (path, satisfied_by or "granted").
+    persistent_grants: list[tuple[str, str]] = field(default_factory=list, repr=False)
     closed: bool = field(default=False, repr=False)
     _process_handle_owned: bool = field(default=True, init=False, repr=False)
     _job_handle_owned: bool = field(default=True, init=False, repr=False)
@@ -435,6 +444,9 @@ class AppContainerLaunch:
                 {"path": path, "win_error": error}
                 for path, error in self.grant_revoke_failures
             ],
+            "persistent_grants": [
+                {"path": path, "satisfied_by": how} for path, how in self.persistent_grants
+            ],
         }
 
 
@@ -483,6 +495,9 @@ class _PathGrant:
     access: str
     restore: Any = None
     revoke_error: int | None = None
+    # A persistent grant the DACL already satisfied (nothing was written):
+    # "container_sid" or "all_application_packages".  See _satisfying_trustee.
+    satisfied_by: str = ""
 
 
 @dataclass
@@ -698,6 +713,34 @@ _ACCESS_ALLOWED_ACE_TYPE = 0
 # OI | CI | NO_PROPAGATE | INHERIT_ONLY | INHERITED: an explicit, fully
 # propagating ACE of ours has exactly the requested inheritance bits set here.
 _ACE_INHERITANCE_FLAGS = 0x1F
+_NO_PROPAGATE_INHERIT_ACE = 0x04
+_INHERIT_ONLY_ACE = 0x08
+# S-1-15-2-1, APPLICATION PACKAGE AUTHORITY\ALL APPLICATION PACKAGES.
+_ALL_APPLICATION_PACKAGES_SID = b"\x01\x02\x00\x00\x00\x00\x00\x0f\x02\x00\x00\x00\x01\x00\x00\x00"
+
+
+def _satisfying_trustee(
+    aces: Sequence["AclAce"], sid: bytes, mask: int, inherit: int
+) -> str:
+    """Who already allows ``mask`` with ``inherit`` on this DACL: ``"container_sid"``
+    (this SID's own explicit ACE), ``"all_application_packages"`` (an ALL
+    APPLICATION PACKAGES ACE, explicit or inherited, that is not inherit-only
+    and propagates at least as far as ``inherit`` asks), or ``""``.
+
+    Like the explicit-ACE check it extends, this reads allow ACEs only.
+    """
+    for ace in aces:
+        if ace.ace_type != _ACCESS_ALLOWED_ACE_TYPE or ace.mask & mask != mask:
+            continue
+        if ace.sid == sid and ace.flags & _ACE_INHERITANCE_FLAGS == inherit:
+            return "container_sid"
+        if (
+            ace.sid == _ALL_APPLICATION_PACKAGES_SID
+            and not ace.flags & (_INHERIT_ONLY_ACE | _NO_PROPAGATE_INHERIT_ACE)
+            and ace.flags & inherit == inherit
+        ):
+            return "all_application_packages"
+    return ""
 
 
 
@@ -1199,7 +1242,9 @@ def launch_appcontainer(
                 detail="AppContainer launch requires Windows (os.name=='nt').",
             )
         api = _load_win32()
-    grant_plan = _with_protected_descendants(request.filesystem_grants, api)
+    grant_plan = _with_protected_descendants(
+        request.filesystem_grants, api, request.withheld_directories
+    )
 
     name, display_name, description = derive_container_identity(
         request.repo_id, request.worker_kind
@@ -1254,6 +1299,7 @@ def launch_appcontainer(
         # grant through this same loop, so failure unwind and close() revoke
         # them exactly like the directory they came from.
         grants: list[_PathGrant] = []
+        persistent_grants: list[tuple[str, str]] = []
         for grant in grant_plan:
             applied: _PathGrant = _step(
                 "grant_path_access",
@@ -1265,7 +1311,9 @@ def launch_appcontainer(
                     persistent=grant.persistent,
                 ),
             )
-            if not grant.persistent:
+            if grant.persistent:
+                persistent_grants.append((grant.path, applied.satisfied_by or "granted"))
+            else:
                 grants.append(applied)
                 cleanup.push_on_failure(partial(api.revoke_path_access, applied))
 
@@ -1347,6 +1395,7 @@ def launch_appcontainer(
         job=job,
         creation=creation,
         grants=grants,
+        persistent_grants=persistent_grants,
     )
 
 
@@ -1511,11 +1560,16 @@ def _plain_directory(entry: os.DirEntry[str]) -> bool:
     return not attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT
 
 
-def _protected_descendants(root: str, is_protected: Callable[[str], bool]) -> list[str]:
+def _protected_descendants(
+    root: str,
+    is_protected: Callable[[str], bool],
+    withheld: frozenset[str] = frozenset(),
+) -> list[str]:
     """Directories beneath ``root`` whose DACL is protected, parents first.
 
-    Reparse points are neither returned nor entered.  More than
-    ``_DESCENDANT_WALK_LIMIT`` directories raises ``OSError``.
+    Reparse points and ``withheld`` (normcased) directories are neither
+    returned nor entered.  More than ``_DESCENDANT_WALK_LIMIT`` directories
+    raises ``OSError``.
     """
     found: list[str] = []
     pending = [root]
@@ -1523,7 +1577,9 @@ def _protected_descendants(root: str, is_protected: Callable[[str], bool]) -> li
     while pending:
         with os.scandir(pending.pop()) as entries:
             for entry in entries:
-                if not _plain_directory(entry):
+                if not _plain_directory(entry) or (
+                    os.path.normcase(os.path.normpath(entry.path)) in withheld
+                ):
                     continue
                 visited += 1
                 if visited > _DESCENDANT_WALK_LIMIT:
@@ -1537,7 +1593,9 @@ def _protected_descendants(root: str, is_protected: Callable[[str], bool]) -> li
 
 
 def _with_protected_descendants(
-    grants: Sequence[ContainerGrant], api: Win32Api
+    grants: Sequence[ContainerGrant],
+    api: Win32Api,
+    withheld_directories: Sequence[str] = (),
 ) -> list[ContainerGrant]:
     """``grants``, each revocable directory followed by the protected
     directories beneath it, granted the same access.
@@ -1551,8 +1609,22 @@ def _with_protected_descendants(
     directories, while a persistent grant names a shared install root, whose
     protected corners are not the container's business.  Every added path
     passes :func:`_validate_grants` like the rest.
+
+    ``withheld_directories`` stay closed: that same protection is what keeps
+    them out of an inheritable grant above them, so each must be an existing,
+    protected directory nobody asked to grant, or the launch fails closed.
     """
     seen = {os.path.normcase(os.path.normpath(grant.path)) for grant in grants}
+    withheld = frozenset(os.path.normcase(os.path.normpath(p)) for p in withheld_directories)
+    for path in withheld_directories:
+        key = os.path.normcase(os.path.normpath(path))
+        if key in seen or not os.path.isdir(path) or not _step(
+            "grant_path_access", partial(api.dacl_protected, path)
+        ):
+            raise AppContainerError(
+                AppContainerReason.INVALID_REQUEST,
+                detail=f"a withheld directory must exist, be protected and not be granted: {path!r}.",
+            )
     plan: list[ContainerGrant] = []
     for grant in grants:
         plan.append(grant)
@@ -1561,7 +1633,7 @@ def _with_protected_descendants(
         try:
             descendants: list[str] = _step(
                 "grant_path_access",
-                partial(_protected_descendants, grant.path, api.dacl_protected),
+                partial(_protected_descendants, grant.path, api.dacl_protected, withheld),
             )
         except OSError as exc:
             raise AppContainerError(
@@ -1973,19 +2045,25 @@ class _CtypesWin32Api:
     ) -> _PathGrant:
         """Merge one GRANT_ACCESS ACE for exactly the container SID.
 
-        A persistent grant whose identical explicit ACE is already there
-        rewrites nothing.  A revocable grant always writes and keeps a copy of
-        the SID: :meth:`revoke_path_access` then removes this SID's explicit
-        ACEs -- including one a crashed launch left behind -- instead of
-        restoring a snapshot that would clobber a concurrent DACL edit.
+        A persistent grant the DACL already satisfies rewrites nothing and
+        records who satisfies it (:func:`_satisfying_trustee`) -- this SID's
+        own explicit ACE, or ALL APPLICATION PACKAGES, which an administrator
+        may have granted an install root the user cannot re-permission.  An
+        ALL APPLICATION PACKAGES ACE is only ever read here, never written.
+        A revocable grant always writes and keeps a copy of the SID:
+        :meth:`revoke_path_access` then removes this SID's explicit ACEs --
+        including one a crashed launch left behind -- instead of restoring a
+        snapshot that would clobber a concurrent DACL edit.
         """
         mask = _GRANT_ACCESS_MASKS[access]
         inherit = _SUB_CONTAINERS_AND_OBJECTS_INHERIT if os.path.isdir(path) else 0
         sid = ctypes.string_at(
             identity.sid_token, self._advapi32.GetLengthSid(identity.sid_token)
         )
-        if persistent and self._explicit_grant_present(sid, path, mask, inherit):
-            return _PathGrant(path, access)
+        if persistent:
+            satisfied_by = self._grant_already_satisfied(sid, path, mask, inherit)
+            if satisfied_by:
+                return _PathGrant(path, access, satisfied_by=satisfied_by)
         changed = self._set_sid_entry(
             path, sid, _GRANT_ACCESS, mask, inherit, "grant_path_access"
         )
@@ -2084,20 +2162,14 @@ class _CtypesWin32Api:
         finally:
             self._kernel32.LocalFree(descriptor)
 
-    def _explicit_grant_present(
+    def _grant_already_satisfied(
         self, sid: bytes, path: str, mask: int, inherit: int
-    ) -> bool:
+    ) -> str:
         try:
             snapshot = snapshot_filesystem_acl(path)
         except AclSnapshotError:
-            return False  # an ACL we cannot parse is simply re-granted
-        return any(
-            ace.ace_type == _ACCESS_ALLOWED_ACE_TYPE
-            and ace.sid == sid
-            and ace.mask & mask == mask
-            and ace.flags & _ACE_INHERITANCE_FLAGS == inherit
-            for ace in snapshot.aces
-        )
+            return ""  # an ACL we cannot parse is simply re-granted
+        return _satisfying_trustee(snapshot.aces, sid, mask, inherit)
 
     # -- security capabilities ---------------------------------------------
 
@@ -2773,3 +2845,369 @@ def snapshot_filesystem_acl(path: str, *, api: _AclSnapshotApi | None = None) ->
                 primary.args = (f"{primary}; cleanup failed: {cleanup}",)
             else:
                 primary.add_note(f"LocalFree failed: {cleanup}")
+
+
+# ---------------------------------------------------------------------------
+# Worker MCP bridge pipe (NF-2026-00034)
+# ---------------------------------------------------------------------------
+#
+# The worker MCP server holds the request's audit key, reads canonical state
+# and applies edits under its own authority checks, so it runs on the host
+# and the contained worker reaches it through one named pipe.  Measured on
+# Windows 11 26200 from a repo-scoped container with internetClient only:
+#   * a host pipe whose DACL names the owner user and the container SID is
+#     opened read/write from inside; with the container ACE removed the open
+#     fails EPERM.  No mandatory label is needed (Low-IL clients connected
+#     with and without S:(ML;;NW;;;LW)), so none is set.
+#   * ``\\.\pipe\`` is LISTABLE from inside a container, and every request of
+#     one repo + adapter shares one container SID -- so neither the name nor
+#     the DACL keeps a sibling request out.  WorkerPipe.accept admits only a
+#     client process inside this launch's own job.
+
+_PIPE_ACCESS_DUPLEX = 0x00000003
+_FILE_FLAG_FIRST_PIPE_INSTANCE = 0x00080000
+_FILE_FLAG_OVERLAPPED = 0x40000000
+_PIPE_REJECT_REMOTE_CLIENTS = 0x00000008
+_PIPE_BUFFER_BYTES = 65536
+_ERROR_BROKEN_PIPE = 109
+_ERROR_NO_DATA = 232
+_ERROR_PIPE_NOT_CONNECTED = 233
+_ERROR_PIPE_CONNECTED = 535
+_ERROR_OPERATION_ABORTED = 995
+_ERROR_IO_PENDING = 997
+_PIPE_GONE = frozenset(
+    (_ERROR_BROKEN_PIPE, _ERROR_NO_DATA, _ERROR_PIPE_NOT_CONNECTED, _ERROR_OPERATION_ABORTED)
+)
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_TOKEN_USER_CLASS = 1
+_WORKER_PIPE_PREFIX = "\\\\.\\pipe\\aiworkhub-worker-"
+# Only these characters ever reach a pipe name, so the name is safe to embed
+# in the shim's quoted script and in a JSON config verbatim.
+_WORKER_PIPE_NAME = re.compile(
+    r"\\\\\.\\pipe\\aiworkhub-worker-[A-Za-z0-9_-]{1,128}-[0-9a-f]{32}\Z"
+)
+_SID_STRING = re.compile(r"S-1-(?:\d+-){1,15}\d+\Z")
+
+
+def new_worker_pipe_name(request_id: str) -> str:
+    """A fresh, per-request pipe name.  Unguessable, but NOT secret -- see
+    the section note: access rests on the DACL and the job check."""
+    name = f"{_WORKER_PIPE_PREFIX}{request_id}-{secrets.token_hex(16)}"
+    if not _WORKER_PIPE_NAME.match(name):
+        raise ValueError(f"request_id cannot name a worker pipe: {request_id!r}")
+    return name
+
+
+# The contained end: the program the worker's MCP config starts, relaying its
+# stdio to the pipe.  Measured from inside a container: node.exe under
+# Program Files cannot be started there (its DACL has no ALL APPLICATION
+# PACKAGES ACE; opening it fails EPERM, though a HOST-created top-level
+# process of the same image runs), claude.exe has no script mode, and
+# System32's Windows PowerShell 5.1 is readable by every AppContainer and
+# starts as a child of a contained process in about 0.5 s.  The name reaches
+# the script only through _WORKER_PIPE_NAME's alphabet, and -EncodedCommand
+# keeps the script out of command-line quoting altogether.
+#   No cmdlet is used: auto-loading one printed a CLIXML progress record on
+# stderr ("Preparing modules for first use"), and .NET alone needs no module.
+_PIPE_SHIM_SCRIPT = (
+    "$ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue';"
+    "$p=[IO.Pipes.NamedPipeClientStream]::new('.','{name}',"
+    "[IO.Pipes.PipeDirection]::InOut,[IO.Pipes.PipeOptions]::Asynchronous);"
+    "$p.Connect(30000);"
+    "$i=[Console]::OpenStandardInput();$o=[Console]::OpenStandardOutput();"
+    "$up=$i.CopyToAsync($p);$down=$p.CopyToAsync($o);"
+    "[void][Threading.Tasks.Task]::WaitAny(@($up,$down));$o.Flush()"
+)
+
+
+def worker_pipe_shim_argv(pipe_name: str) -> list[str]:
+    """The contained stdio<->pipe shim for ``pipe_name`` (see above)."""
+    if not _WORKER_PIPE_NAME.match(pipe_name):
+        raise ValueError(f"not a worker pipe name: {pipe_name!r}")
+    windows = _system_windows_directory() if os.name == "nt" else ""
+    if not windows:
+        raise AppContainerError(
+            AppContainerReason.PLATFORM_UNSUPPORTED,
+            detail="the worker MCP pipe shim needs the Windows directory.",
+        )
+    script = _PIPE_SHIM_SCRIPT.replace("{name}", pipe_name[len("\\\\.\\pipe\\"):])
+    return [
+        os.path.join(windows, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
+        "-NoLogo", "-NoProfile", "-NonInteractive",
+        "-EncodedCommand", base64.b64encode(script.encode("utf-16-le")).decode("ascii"),
+    ]
+
+
+def worker_pipe_sddl(owner_sid: str, container_sid: str) -> str:
+    """The pipe's security descriptor: a protected DACL allowing the owner
+    user everything and exactly one container SID read/write -- nothing for
+    ALL APPLICATION PACKAGES, Everyone, or anyone else."""
+    for sid in (owner_sid, container_sid):
+        if not _SID_STRING.match(sid):
+            raise ValueError(f"not a SID string: {sid!r}")
+    return f"D:P(A;;GA;;;{owner_sid})(A;;GRGW;;;{container_sid})"
+
+
+def container_sid(repo_id: str, worker_kind: str, *, api: Win32Api | None = None) -> str:
+    """The SID :func:`launch_appcontainer` confines ``(repo_id, worker_kind)``
+    to -- the same derivation, creating the profile if it is missing."""
+    boundary = api if api is not None else _load_win32()
+    identity: _Identity = _step(
+        "derive_appcontainer_sid",
+        lambda: boundary.derive_identity(*derive_container_identity(repo_id, worker_kind)),
+    )
+    try:
+        return identity.sid_string
+    finally:
+        boundary.free_identity(identity)
+
+
+class _OVERLAPPED(ctypes.Structure):
+    _fields_ = [
+        ("Internal", ctypes.c_size_t),
+        ("InternalHigh", ctypes.c_size_t),
+        ("Offset", wintypes.DWORD),
+        ("OffsetHigh", wintypes.DWORD),
+        ("hEvent", wintypes.HANDLE),
+    ]
+
+
+class _SECURITY_ATTRIBUTES(ctypes.Structure):
+    _fields_ = [
+        ("nLength", wintypes.DWORD),
+        ("lpSecurityDescriptor", wintypes.LPVOID),
+        ("bInheritHandle", wintypes.BOOL),
+    ]
+
+
+class _TOKEN_USER(ctypes.Structure):
+    _fields_ = [("User", _SID_AND_ATTRIBUTES)]
+
+
+def _pipe_libraries() -> tuple[Any, Any]:
+    k = _load_windows_dll("kernel32")
+    a = _load_windows_dll("advapi32")
+    handle, dword, bool_ = wintypes.HANDLE, wintypes.DWORD, wintypes.BOOL
+    overlapped = ctypes.POINTER(_OVERLAPPED)
+    k.CreateNamedPipeW.restype = handle
+    k.CreateNamedPipeW.argtypes = [
+        wintypes.LPCWSTR, dword, dword, dword, dword, dword, dword,
+        ctypes.POINTER(_SECURITY_ATTRIBUTES),
+    ]
+    k.CreateEventW.restype = handle
+    k.CreateEventW.argtypes = [wintypes.LPVOID, bool_, bool_, wintypes.LPCWSTR]
+    k.ConnectNamedPipe.restype = bool_
+    k.ConnectNamedPipe.argtypes = [handle, overlapped]
+    k.DisconnectNamedPipe.restype = bool_
+    k.DisconnectNamedPipe.argtypes = [handle]
+    k.ReadFile.restype = bool_
+    k.ReadFile.argtypes = [handle, wintypes.LPVOID, dword, wintypes.LPVOID, overlapped]
+    k.WriteFile.restype = bool_
+    k.WriteFile.argtypes = [handle, wintypes.LPCVOID, dword, wintypes.LPVOID, overlapped]
+    k.GetOverlappedResult.restype = bool_
+    k.GetOverlappedResult.argtypes = [handle, overlapped, ctypes.POINTER(dword), bool_]
+    k.CancelIoEx.restype = bool_
+    k.CancelIoEx.argtypes = [handle, overlapped]
+    k.GetNamedPipeClientProcessId.restype = bool_
+    k.GetNamedPipeClientProcessId.argtypes = [handle, ctypes.POINTER(wintypes.ULONG)]
+    k.OpenProcess.restype = handle
+    k.OpenProcess.argtypes = [dword, bool_, dword]
+    k.IsProcessInJob.restype = bool_
+    k.IsProcessInJob.argtypes = [handle, handle, ctypes.POINTER(bool_)]
+    k.GetCurrentProcess.restype = handle
+    k.CloseHandle.restype = bool_
+    k.CloseHandle.argtypes = [handle]
+    k.LocalFree.restype = wintypes.HLOCAL
+    k.LocalFree.argtypes = [wintypes.HLOCAL]
+    a.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = bool_
+    a.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
+        wintypes.LPCWSTR, dword, ctypes.POINTER(wintypes.LPVOID), wintypes.LPVOID,
+    ]
+    a.OpenProcessToken.restype = bool_
+    a.OpenProcessToken.argtypes = [handle, dword, ctypes.POINTER(handle)]
+    a.GetTokenInformation.restype = bool_
+    a.GetTokenInformation.argtypes = [handle, ctypes.c_int, wintypes.LPVOID, dword, ctypes.POINTER(dword)]
+    a.ConvertSidToStringSidW.restype = bool_
+    a.ConvertSidToStringSidW.argtypes = [wintypes.LPVOID, ctypes.POINTER(wintypes.LPWSTR)]
+    return k, a
+
+
+def _token_user_sid(k: Any, a: Any) -> str:
+    """This process's user SID as a string, from its token."""
+    token = wintypes.HANDLE()
+    if not a.OpenProcessToken(k.GetCurrentProcess(), _TOKEN_QUERY, ctypes.byref(token)):
+        raise _Win32Failure(_last_win_error(), "create_worker_pipe", "OpenProcessToken")
+    try:
+        size = wintypes.DWORD(0)
+        a.GetTokenInformation(token, _TOKEN_USER_CLASS, None, 0, ctypes.byref(size))
+        buffer = ctypes.create_string_buffer(max(size.value, ctypes.sizeof(_TOKEN_USER)))
+        if not a.GetTokenInformation(
+            token, _TOKEN_USER_CLASS, buffer, len(buffer), ctypes.byref(size)
+        ):
+            raise _Win32Failure(_last_win_error(), "create_worker_pipe", "GetTokenInformation")
+        text = wintypes.LPWSTR()
+        user = _TOKEN_USER.from_buffer(buffer)
+        if not a.ConvertSidToStringSidW(user.User.Sid, ctypes.byref(text)):
+            raise _Win32Failure(_last_win_error(), "create_worker_pipe", "ConvertSidToStringSidW")
+        try:
+            return text.value or ""
+        finally:
+            k.LocalFree(text)
+    finally:
+        k.CloseHandle(token)
+
+
+class WorkerPipe:
+    """Host end of one request's worker MCP pipe.
+
+    One instance (``FILE_FLAG_FIRST_PIPE_INSTANCE``: a squatter makes creation
+    fail), local clients only, overlapped so a read and a write can be in
+    flight at once, DACL from :func:`worker_pipe_sddl`.  :meth:`accept` serves
+    the first client whose process is in the given job and disconnects anyone
+    else.  :meth:`shutdown` cancels every pending operation and makes later
+    ones fail fast; :meth:`close` then releases the handle, which removes the
+    pipe.  Reads return ``b""`` and writes raise ``BrokenPipeError`` once the
+    pipe is gone or shut down.
+    """
+
+    def __init__(self, name: str, container_sid: str) -> None:
+        if not _WORKER_PIPE_NAME.match(name):
+            raise ValueError(f"not a worker pipe name: {name!r}")
+        self.name = name
+        self._k, a = _pipe_libraries()
+        sddl = worker_pipe_sddl(_token_user_sid(self._k, a), container_sid)
+        descriptor = wintypes.LPVOID()
+        if not a.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl, 1, ctypes.byref(descriptor), None
+        ):
+            raise _Win32Failure(_last_win_error(), "create_worker_pipe", "security descriptor")
+        try:
+            attributes = _SECURITY_ATTRIBUTES(
+                ctypes.sizeof(_SECURITY_ATTRIBUTES), descriptor, False
+            )
+            handle = self._k.CreateNamedPipeW(
+                name,
+                _PIPE_ACCESS_DUPLEX | _FILE_FLAG_FIRST_PIPE_INSTANCE | _FILE_FLAG_OVERLAPPED,
+                _PIPE_REJECT_REMOTE_CLIENTS,  # byte type, byte read mode, blocking
+                1,
+                _PIPE_BUFFER_BYTES,
+                _PIPE_BUFFER_BYTES,
+                0,
+                ctypes.byref(attributes),
+            )
+        finally:
+            self._k.LocalFree(descriptor)
+        if not handle or handle == wintypes.HANDLE(-1).value:
+            raise _Win32Failure(_last_win_error(), "create_worker_pipe", name)
+        self._handle: Any = handle
+        self._lock = threading.Condition()
+        self._shut = False
+        self._pending = 0
+
+    def _io(self, start: Callable[[Any], bool], operation: str) -> int:
+        """One overlapped call, to completion: the byte count, or -1 when the
+        pipe is gone or shut down.  Issued under the lock that shutdown
+        takes, so nothing can start after CancelIoEx and wait forever."""
+        event = self._k.CreateEventW(None, True, False, None)
+        if not event:
+            raise _Win32Failure(_last_win_error(), operation, "CreateEventW")
+        overlapped = _OVERLAPPED()
+        overlapped.hEvent = event
+        try:
+            with self._lock:
+                if self._shut:
+                    return -1
+                self._pending += 1
+                try:
+                    error = 0 if start(ctypes.byref(overlapped)) else _last_win_error()
+                except BaseException:
+                    self._pending -= 1
+                    raise
+            try:
+                if error == _ERROR_PIPE_CONNECTED:
+                    return 0
+                if error in _PIPE_GONE:
+                    return -1
+                if error not in (0, _ERROR_IO_PENDING):
+                    raise _Win32Failure(error, operation)
+                done = wintypes.DWORD()
+                if not self._k.GetOverlappedResult(
+                    self._handle, ctypes.byref(overlapped), ctypes.byref(done), True
+                ):
+                    error = _last_win_error()
+                    if error in _PIPE_GONE:
+                        return -1
+                    raise _Win32Failure(error, operation)
+                return int(done.value)
+            finally:
+                with self._lock:
+                    self._pending -= 1
+                    self._lock.notify_all()
+        finally:
+            self._k.CloseHandle(event)
+
+    def accept(self, job: Any) -> bool:
+        """Wait for a client of ``job``; False once shut down."""
+        while True:
+            if self._io(lambda ov: self._k.ConnectNamedPipe(self._handle, ov), "connect_worker_pipe") < 0:
+                return False
+            if self._client_in_job(job):
+                return True
+            self._k.DisconnectNamedPipe(self._handle)  # not ours: never served
+
+    def _client_in_job(self, job: Any) -> bool:
+        pid = wintypes.ULONG()
+        if not self._k.GetNamedPipeClientProcessId(self._handle, ctypes.byref(pid)):
+            return False
+        process = self._k.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value)
+        if not process:
+            return False
+        try:
+            inside = wintypes.BOOL()
+            return bool(self._k.IsProcessInJob(process, job, ctypes.byref(inside))) and bool(
+                inside.value
+            )
+        finally:
+            self._k.CloseHandle(process)
+
+    def read(self) -> bytes:
+        buffer = ctypes.create_string_buffer(_PIPE_BUFFER_BYTES)
+        count = self._io(
+            lambda ov: self._k.ReadFile(self._handle, buffer, _PIPE_BUFFER_BYTES, None, ov),
+            "read_worker_pipe",
+        )
+        return buffer.raw[:count] if count > 0 else b""
+
+    def write(self, data: bytes) -> None:
+        view = memoryview(data)
+        while view:
+            chunk = bytes(view[:_PIPE_BUFFER_BYTES])
+            count = self._io(
+                lambda ov: self._k.WriteFile(self._handle, chunk, len(chunk), None, ov),
+                "write_worker_pipe",
+            )
+            if count <= 0:
+                raise BrokenPipeError(self.name)
+            view = view[count:]
+
+    def shutdown(self) -> None:
+        """Cancel every pending operation; later ones return at once."""
+        with self._lock:
+            if not self._shut:
+                self._shut = True
+                if self._handle is not None:
+                    self._k.CancelIoEx(self._handle, None)
+
+    def close(self, timeout: float = 5.0) -> bool:
+        """shutdown(), then release the handle once no operation still uses
+        it.  False leaves the handle to process exit rather than free it
+        under a caller that has not returned yet."""
+        self.shutdown()
+        with self._lock:
+            if self._handle is None:
+                return True
+            if not self._lock.wait_for(lambda: self._pending == 0, timeout):
+                return False
+            self._k.CloseHandle(self._handle)
+            self._handle = None
+            return True

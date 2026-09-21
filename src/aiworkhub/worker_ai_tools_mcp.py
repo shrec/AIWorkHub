@@ -146,6 +146,9 @@ ENV_CONTRACT_PACKET_PATH = "AIWORKHUB_WORKER_MCP_CONTRACT_PACKET_PATH"
 ENV_REWORK_OVERLAY_PATH = "AIWORKHUB_REWORK_OVERLAY_PATH"
 ENV_PROVIDER_CALL_ID = "AIWORKHUB_WORKER_MCP_PROVIDER_CALL_ID"
 ENV_PROVENANCE = "AIWORKHUB_WORKER_MCP_PROVENANCE"
+# Names the sandbox the worker itself is confined by when this server runs
+# OUTSIDE it, bridged to the worker (NF-2026-00034: "windows_appcontainer").
+ENV_CONTAINED_WORKER = "AIWORKHUB_WORKER_MCP_CONTAINED_WORKER"
 # The interpreter's own import-path variable (never an AIWORKHUB_* identity
 # binding) -- carries the portable ".../src" import root so `python -m
 # aiworkhub.worker_ai_tools_mcp` resolves regardless of the launcher's cwd.
@@ -377,6 +380,9 @@ class WorkerToolContext:
     contract_packet_path: Path | None = None
     provider_call_id: str = ""
     provenance: str = ""
+    # Set when this server runs on the host for a worker confined elsewhere
+    # (ENV_CONTAINED_WORKER, NF-2026-00034): nothing may be EXECUTED for it here.
+    contained_worker: str = ""
     _supervisor_owned: bool = False
 
 
@@ -479,6 +485,7 @@ def load_context_from_env(env: Any = None) -> WorkerToolContext:
         ),
         provider_call_id=provider_call_id,
         provenance=provenance,
+        contained_worker=str(source.get(ENV_CONTAINED_WORKER) or ""),
     )
 
 
@@ -7362,8 +7369,25 @@ def validation_run(
     ``index`` is an integer position in ``card.validation`` or the literal
     ``"all"``.  The worker never retypes a command, so the 51-61% of ad-hoc
     spellings measured in the audit cannot occur here.
+
+    A server bridged to a contained worker (``ctx.contained_worker``) runs on
+    the host, outside that worker's sandbox, and a validation command runs
+    the worker's candidate code -- so here it refuses, and the coordinator's
+    post-exit validation, which runs inside the sandbox, stays the only run.
     """
 
+    if ctx.contained_worker:
+        return {
+            "ok": False,
+            "tool": "validation_run",
+            "reason": "validation_run_unavailable_outside_the_worker_sandbox",
+            "detail": (
+                f"this server runs outside the worker's {ctx.contained_worker} "
+                "sandbox, so it never executes candidate code; the coordinator "
+                "runs the card's validation inside the sandbox after you exit"
+            ),
+            "advisory_only": True,
+        }
     packet = _contract_packet(ctx)
     commands = [str(v) for v in (packet.get("validation") or [])]
     if not commands:
@@ -8194,6 +8218,44 @@ def generate_worker_mcp_runtime(
         codex_tool_names=codex_tool_names,
         package_import_root=package_import_root,
     )
+
+
+APPCONTAINER_BRIDGE_CONFIG_NAME = "worker_mcp_bridge.json"
+
+
+def appcontainer_mcp_bridge(
+    runtime: WorkerMcpRuntime, *, request_id: str, home: Path, stderr_path: Path
+) -> tuple[Path, dict[str, Any]]:
+    """Split one Windows AppContainer worker's MCP runtime across the
+    container boundary (NF-2026-00034).
+
+    Returns the MCP config the contained CLI loads -- the stdio<->pipe shim of
+    :func:`windows_appcontainer.worker_pipe_shim_argv`, written to the
+    request's HOME root -- and the supervisor's ``worker_mcp_bridge`` spec:
+    the exact server the generated Claude config names, which the supervisor
+    now starts on the host, marked contained so it executes nothing.  The
+    runtime directory, which holds the audit key and ledger the worker never
+    needs once the server lives outside, is withheld from the container.
+    """
+
+    from . import windows_appcontainer
+
+    real = json.loads(runtime.claude_mcp_config_path.read_text(encoding="utf-8"))
+    server = real["mcpServers"][SERVER_NAME]
+    pipe = windows_appcontainer.new_worker_pipe_name(request_id)
+    shim = windows_appcontainer.worker_pipe_shim_argv(pipe)
+    config_path = home / APPCONTAINER_BRIDGE_CONFIG_NAME
+    _write_json_0600(
+        config_path, {"mcpServers": {SERVER_NAME: {"command": shim[0], "args": shim[1:]}}}
+    )
+    return config_path, {
+        "pipe": pipe,
+        "command": str(server["command"]),
+        "args": [str(arg) for arg in server["args"]],
+        "env": {**server["env"], ENV_CONTAINED_WORKER: "windows_appcontainer"},
+        "stderr_path": str(stderr_path),
+        "withheld_directories": [str(runtime.audit_ledger_path.parent)],
+    }
 
 
 # ---------------------------------------------------------------------------

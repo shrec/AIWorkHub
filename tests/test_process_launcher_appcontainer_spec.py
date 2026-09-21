@@ -155,6 +155,15 @@ def _patch_launch_seams(monkeypatch, tmp_path, *, sandbox_backend, canonical_rep
             package_import_root=tmp_path,
         ),
     )
+    monkeypatch.setattr(
+        process_launcher.worker_ai_tools_mcp,
+        "appcontainer_mcp_bridge",
+        lambda runtime, *, request_id, home, stderr_path: (
+            tmp_path / "bridge.json",
+            {"pipe": f"pipe-{request_id}", "stderr_path": str(stderr_path)},
+        ),
+        raising=True,
+    )
     _set("_launch_source_graph_request", lambda card, binding: None)
     _set("build_worker_prompt", lambda **_kwargs: "prompt-text")
     _set(
@@ -358,6 +367,38 @@ def test_launch_isolated_editor_hosted_spec_omits_identity_keys_on_windows(
     assert "execution_backend" not in spec
     assert "repo_id" not in spec
     assert "worker_kind" not in spec
+
+
+def test_launch_isolated_bridges_the_contained_claude_worker_mcp(
+    monkeypatch, tmp_path
+) -> None:
+    """NF-2026-00034: the supervisor gets the host-side server to run."""
+    monkeypatch.setattr(sys, "platform", "win32")
+    spec = _run_launch_isolated(
+        monkeypatch, tmp_path, adapter_id="claude_cli", sandbox_backend="windows_appcontainer"
+    )
+    bridge = spec["worker_mcp_bridge"]
+    assert bridge["pipe"].startswith("pipe-")
+    assert bridge["stderr_path"].endswith(".worker-mcp.stderr.log")
+
+
+@pytest.mark.parametrize(
+    ("platform", "adapter_id", "sandbox_backend"),
+    [
+        ("linux", "claude_cli", "landlock"),
+        ("linux", "claude_cli", "bubblewrap"),
+        ("win32", "GLM-53 Native", "windows_appcontainer"),
+    ],
+)
+def test_launch_isolated_bridges_nothing_else(
+    monkeypatch, tmp_path, platform, adapter_id, sandbox_backend
+) -> None:
+    """The Linux routes, and every other adapter, keep their spec exactly."""
+    monkeypatch.setattr(sys, "platform", platform)
+    spec = _run_launch_isolated(
+        monkeypatch, tmp_path, adapter_id=adapter_id, sandbox_backend=sandbox_backend
+    )
+    assert "worker_mcp_bridge" not in spec
 
 
 # ── Fail-closed launcher identity ──────────────────────────────────────────
@@ -806,6 +847,134 @@ def test_supervisor_appcontainer_setup_failure_never_falls_back_to_popen(
     assert statuses[-1]["state"] == "spawn_failed"
     assert statuses[-1]["spawn_phase"] == "child_spawn"
     assert "appcontainer_create_profile_failed" in statuses[-1]["error"]
+
+
+class _RecordingPipe:
+    instances: list["_RecordingPipe"] = []
+
+    def __init__(self, name, sid) -> None:
+        self.name, self.sid, self.closed = name, sid, 0
+        _RecordingPipe.instances.append(self)
+
+    def close(self) -> bool:
+        self.closed += 1
+        return True
+
+
+def _patch_bridge_seams(monkeypatch):
+    _RecordingPipe.instances = []
+    bridges: list[dict] = []
+
+    class _RecordingBridge:
+        def __init__(self, pipe, job, spec, cwd) -> None:
+            self.record = {"pipe": pipe, "job": job, "spec": spec, "cwd": cwd, "events": []}
+            bridges.append(self.record)
+
+        def start(self) -> None:
+            self.record["events"].append("start")
+
+        def close(self) -> None:
+            self.record["events"].append("close")
+
+    monkeypatch.setattr(worker_supervisor.windows_appcontainer, "WorkerPipe", _RecordingPipe)
+    monkeypatch.setattr(
+        worker_supervisor.windows_appcontainer,
+        "container_sid",
+        lambda repo_id, worker_kind: f"S-1-15-2-{len(repo_id)}-{len(worker_kind)}",
+    )
+    monkeypatch.setattr(worker_supervisor, "_WorkerMcpBridge", _RecordingBridge)
+    return bridges
+
+
+_BRIDGE_SPEC = {
+    "pipe": "\\\\.\\pipe\\aiworkhub-worker-r-" + "a" * 32,
+    "command": "python.exe",
+    "args": ["-m", "aiworkhub.worker_ai_tools_mcp"],
+    "env": {},
+    "stderr_path": "unused",
+    "withheld_directories": ["C:\\home\\task_mcp_worker_runtime"],
+}
+
+
+def test_supervisor_bridges_the_worker_mcp_and_ends_it_with_the_worker(
+    monkeypatch, tmp_path
+) -> None:
+    bridges = _patch_bridge_seams(monkeypatch)
+    launches: list[windows_appcontainer.AppContainerRequest] = []
+    launch = _FakeAppContainerLaunch(exit_code=0)
+    launch.job = "the-launch-job"
+
+    def _fake_launch(request):
+        # The pipe already exists when the worker starts.
+        assert len(_RecordingPipe.instances) == 1
+        launches.append(request)
+        return launch
+
+    _patch_supervisor_seams(monkeypatch)
+    monkeypatch.setattr(worker_supervisor.windows_appcontainer, "launch_appcontainer", _fake_launch)
+    code = worker_supervisor.supervise(
+        _supervisor_spec(
+            tmp_path,
+            execution_backend="windows_appcontainer",
+            repo_id=CANONICAL_REPO_ID,
+            worker_kind="claude_cli",
+            worker_mcp_bridge=_BRIDGE_SPEC,
+        )
+    )
+
+    assert code == 0
+    pipe = _RecordingPipe.instances[0]
+    assert pipe.name == _BRIDGE_SPEC["pipe"]
+    assert pipe.sid == f"S-1-15-2-{len(CANONICAL_REPO_ID)}-{len('claude_cli')}"
+    assert tuple(launches[0].withheld_directories) == ("C:\\home\\task_mcp_worker_runtime",)
+    (bridge,) = bridges
+    assert bridge["pipe"] is pipe and bridge["job"] == "the-launch-job"
+    assert bridge["events"] == ["start", "close"]
+    assert launch.close_count == 1
+
+
+def test_supervisor_removes_the_pipe_when_the_launch_fails(monkeypatch, tmp_path) -> None:
+    bridges = _patch_bridge_seams(monkeypatch)
+
+    def _fail(_request):
+        raise OSError("appcontainer_create_profile_failed:5")
+
+    statuses, _ = _patch_supervisor_seams(monkeypatch)
+    monkeypatch.setattr(worker_supervisor.windows_appcontainer, "launch_appcontainer", _fail)
+    code = worker_supervisor.supervise(
+        _supervisor_spec(
+            tmp_path,
+            execution_backend="windows_appcontainer",
+            repo_id=CANONICAL_REPO_ID,
+            worker_kind="claude_cli",
+            worker_mcp_bridge=_BRIDGE_SPEC,
+        )
+    )
+    assert code == 126
+    assert statuses[-1]["state"] == "spawn_failed"
+    assert [pipe.closed for pipe in _RecordingPipe.instances] == [1]
+    assert bridges == []
+
+
+def test_supervisor_without_a_bridge_spec_opens_no_pipe(monkeypatch, tmp_path) -> None:
+    bridges = _patch_bridge_seams(monkeypatch)
+    _patch_supervisor_seams(monkeypatch)
+    requests: list = []
+    monkeypatch.setattr(
+        worker_supervisor.windows_appcontainer,
+        "launch_appcontainer",
+        lambda request: requests.append(request) or _FakeAppContainerLaunch(),
+    )
+    assert worker_supervisor.supervise(
+        _supervisor_spec(
+            tmp_path,
+            execution_backend="windows_appcontainer",
+            repo_id=CANONICAL_REPO_ID,
+            worker_kind="glm53_native",
+        )
+    ) == 0
+    assert _RecordingPipe.instances == [] and bridges == []
+    assert tuple(requests[0].withheld_directories) == ()
 
 
 @pytest.mark.parametrize(

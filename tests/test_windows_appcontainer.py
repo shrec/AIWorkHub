@@ -2336,9 +2336,9 @@ def _security_api(lib, monkeypatch, *, present=None):
     def _present(*_args):
         if present is None:
             pytest.fail("a revocable grant must never take the already-present path")
-        return present
+        return "container_sid" if present else ""
 
-    monkeypatch.setattr(api, "_explicit_grant_present", _present)
+    monkeypatch.setattr(api, "_grant_already_satisfied", _present)
     return api
 
 
@@ -2591,6 +2591,175 @@ def test_a_descendant_already_requested_is_granted_once(tmp_path):
     assert _grant_events(fake) == [f"grant:modify:{home}", f"grant:modify:{runtime}"]
 
 
+def test_a_withheld_protected_directory_is_never_granted_or_walked(tmp_path):
+    home, _ = _request_tree(tmp_path)
+    runtime = home / "task_mcp_worker_runtime"
+    (runtime / "validation_runs").mkdir()
+    fake = FakeWin32Api()
+    _protect(fake, runtime, runtime / "validation_runs", home / ".config")
+    launch_appcontainer(
+        make_request(
+            filesystem_grants=[ContainerGrant(str(home), "modify")],
+            withheld_directories=[str(runtime)],
+        ),
+        api=fake,
+    )
+    granted = _grant_events(fake)
+    assert f"grant:modify:{home / '.config'}" in granted
+    assert not any("task_mcp_worker_runtime" in event for event in granted)
+    assert not any(str(runtime) + os.sep in query for query in fake.dacl_queries)
+
+
+@pytest.mark.parametrize("case", ["unprotected", "missing", "also_granted"])
+def test_a_withheld_directory_that_would_not_stay_closed_fails_closed(tmp_path, case):
+    home, _ = _request_tree(tmp_path)
+    runtime = home / "task_mcp_worker_runtime"
+    fake = FakeWin32Api()
+    if case != "unprotected":
+        _protect(fake, runtime)
+    withheld = str(home / "absent") if case == "missing" else str(runtime)
+    grants = [ContainerGrant(str(home), "modify")]
+    if case == "also_granted":
+        grants.append(ContainerGrant(str(runtime), "modify"))
+    with pytest.raises(AppContainerError) as excinfo:
+        launch_appcontainer(
+            make_request(filesystem_grants=grants, withheld_directories=[withheld]), api=fake
+        )
+    assert excinfo.value.reason is AppContainerReason.INVALID_REQUEST
+    assert "withheld" in excinfo.value.detail
+    assert _grant_events(fake) == []
+
+
+# -- worker MCP bridge pipe (NF-2026-00034) ------------------------------------
+
+
+_OWNER = "S-1-5-21-389243392-615521012-1854199069-1001"
+_CONTAINER = "S-1-15-2-2390138238-917833039-2980490063-148298555-1665516221-1143707983-1249757738"
+
+
+def test_worker_pipe_sddl_names_the_owner_and_one_container_only():
+    sddl = wac.worker_pipe_sddl(_OWNER, _CONTAINER)
+    assert sddl == f"D:P(A;;GA;;;{_OWNER})(A;;GRGW;;;{_CONTAINER})"
+    # Protected, two ACEs, and no ALL APPLICATION PACKAGES / Everyone / label.
+    assert "S-1-15-2-1)" not in sddl and ";WD)" not in sddl and "S:" not in sddl
+    for bad in ("WD", "S-1-15-2-1)(A;;GA;;;WD", "", "S-1-15"):
+        with pytest.raises(ValueError):
+            wac.worker_pipe_sddl(_OWNER, bad)
+
+
+def test_worker_pipe_names_are_per_request_unguessable_and_quote_safe():
+    first = wac.new_worker_pipe_name("3a2b" * 8)
+    second = wac.new_worker_pipe_name("3a2b" * 8)
+    assert first != second
+    assert first.startswith("\\\\.\\pipe\\aiworkhub-worker-" + "3a2b" * 8 + "-")
+    for hostile in ("a'b", "a b", "..\\x", "", "a" * 200):
+        with pytest.raises(ValueError):
+            wac.new_worker_pipe_name(hostile)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="resolves the real Windows directory")
+def test_worker_pipe_shim_is_system32_powershell_with_the_name_encoded():
+    import base64
+
+    name = wac.new_worker_pipe_name("req")
+    argv = wac.worker_pipe_shim_argv(name)
+    assert os.path.normcase(argv[0]) == os.path.normcase(
+        os.path.join(os.environ["SYSTEMROOT"], "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
+    )
+    assert argv[1:5] == ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand"]
+    script = base64.b64decode(argv[5]).decode("utf-16-le")
+    assert f"NamedPipeClientStream]::new('.','{name[9:]}'," in script
+    with pytest.raises(ValueError):
+        wac.worker_pipe_shim_argv("\\\\.\\pipe\\someone-else")
+
+
+_PIPE_CLIENT = (
+    "import sys\n"
+    "sys.stdin.readline()\n"
+    "try:\n"
+    "    f=open(sys.argv[1],'r+b',buffering=0)\n"
+    "    f.write(b'ping')\n"
+    "    print('got',f.read(64),flush=True)\n"
+    "except OSError as e:\n"
+    "    print('refused',type(e).__name__,flush=True)\n"
+)
+
+
+def _pipe_sddl(pipe):
+    from ctypes import wintypes
+
+    a = ctypes.WinDLL("advapi32", use_last_error=True)
+    a.GetSecurityInfo.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.DWORD] + [
+        ctypes.POINTER(wintypes.LPVOID)
+    ] * 5
+    a.ConvertSecurityDescriptorToStringSecurityDescriptorW.argtypes = [
+        wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD,
+        ctypes.POINTER(wintypes.LPWSTR), wintypes.LPVOID,
+    ]
+    descriptor, text = wintypes.LPVOID(), wintypes.LPWSTR()
+    assert a.GetSecurityInfo(pipe._handle, 6, 4, None, None, None, None, ctypes.byref(descriptor)) == 0
+    assert a.ConvertSecurityDescriptorToStringSecurityDescriptorW(descriptor, 1, 4, ctypes.byref(text), None)
+    return text.value
+
+
+@pytest.mark.skipif(os.name != "nt", reason="real named pipe and job object")
+def test_worker_pipe_serves_only_a_client_of_the_job_and_leaves_nothing(tmp_path):
+    import subprocess
+    import sys
+    import threading
+
+    from aiworkhub.worker_supervisor import _WindowsKillOnCloseJob
+
+    name = wac.new_worker_pipe_name("pytest")
+    pipe = wac.WorkerPipe(name, _CONTAINER)
+    owner = wac._token_user_sid(*wac._pipe_libraries())
+    # FA/0x12019f are GA and GRGW mapped onto a pipe: owner + one container.
+    assert _pipe_sddl(pipe) == f"D:P(A;;FA;;;{owner})(A;;0x12019f;;;{_CONTAINER})"
+    with pytest.raises(wac._Win32Failure):
+        wac.WorkerPipe(name, _CONTAINER)  # first instance only: no squatting
+
+    job = _WindowsKillOnCloseJob()
+    client = [sys.executable, "-c", _PIPE_CLIENT, name]
+    stranger = subprocess.Popen(client, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    ours = subprocess.Popen(client, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    job.assign(ours)
+    accepted = {}
+    server = threading.Thread(target=lambda: accepted.setdefault("ok", pipe.accept(job._handle)))
+    server.start()
+    try:
+        stranger.communicate(b"go\n", timeout=20)  # connected, then disconnected unserved
+        ours.stdin.write(b"go\n")
+        ours.stdin.flush()
+        server.join(20)
+        assert accepted == {"ok": True}
+        assert pipe.read() == b"ping"
+        pipe.write(b"pong")
+        assert b"got b'pong'" in ours.communicate(timeout=20)[0]
+        assert pipe.read() == b""  # client gone
+    finally:
+        assert pipe.close()
+        job.close()
+    with pytest.raises(FileNotFoundError):
+        open(name, "r+b", buffering=0)  # no leftover pipe
+
+
+@pytest.mark.skipif(os.name != "nt", reason="real named pipe")
+def test_worker_pipe_shutdown_releases_a_waiting_accept():
+    import threading
+
+    pipe = wac.WorkerPipe(wac.new_worker_pipe_name("pytest"), _CONTAINER)
+    result = {}
+    waiter = threading.Thread(target=lambda: result.setdefault("ok", pipe.accept(0)))
+    waiter.start()
+    pipe.shutdown()
+    waiter.join(10)
+    assert result == {"ok": False}
+    assert pipe.read() == b""
+    with pytest.raises(BrokenPipeError):
+        pipe.write(b"x")
+    assert pipe.close() and pipe.close()
+
+
 @pytest.mark.parametrize("protected", [False, True])
 def test_ctypes_dacl_protected_only_reads(tmp_path, monkeypatch, protected):
     lib = FakeSecurityLib(protected=protected)
@@ -2598,3 +2767,100 @@ def test_ctypes_dacl_protected_only_reads(tmp_path, monkeypatch, protected):
     assert api.dacl_protected(str(tmp_path)) is protected
     assert lib.entries == [] and lib.set_calls == []
     assert lib.freed == [111]
+
+
+# -- ALL APPLICATION PACKAGES satisfies a persistent read grant (NF-2026-00034) --
+
+
+_AAP = wac._ALL_APPLICATION_PACKAGES_SID
+_RX = 0x1200A9
+
+
+def _ace(sid, flags, mask=_RX, ace_type=0):
+    return wac.AclAce(ace_type, flags, mask, sid, b"")
+
+
+@pytest.mark.parametrize(
+    ("aces", "inherit", "expected"),
+    [
+        # icacls C:\Python312 /grant *S-1-15-2-1:(OI)(CI)(RX): the owner's command.
+        ([_ace(_AAP, 0x03)], 0x3, "all_application_packages"),
+        ([_ace(_AAP, 0x13)], 0x3, "all_application_packages"),  # inherited
+        ([_ace(_AAP, 0x10)], 0x0, "all_application_packages"),  # file, inherited
+        ([_ace(_SID, 0x03)], 0x3, "container_sid"),
+        ([_ace(_AAP, 0x0B)], 0x3, ""),  # inherit-only: not this directory
+        ([_ace(_AAP, 0x07)], 0x3, ""),  # no-propagate: stops below children
+        ([_ace(_AAP, 0x00)], 0x3, ""),  # this directory only
+        ([_ace(_AAP, 0x03, mask=0x120089)], 0x3, ""),  # read without execute
+        ([_ace(_AAP, 0x03, ace_type=1)], 0x3, ""),  # a deny ACE grants nothing
+        ([_ace(_SID, 0x13)], 0x3, ""),  # this SID's ACE, but only inherited
+        ([], 0x3, ""),
+    ],
+)
+def test_satisfying_trustee(aces, inherit, expected):
+    assert wac._satisfying_trustee(aces, _SID, _RX, inherit) == expected
+
+
+def _aap_snapshot(monkeypatch, *aces):
+    snapshot = wac.AclSnapshot("x", wac.DaclState.PRESENT, False, tuple(aces), b"\x02" * 8)
+    monkeypatch.setattr(wac, "snapshot_filesystem_acl", lambda _path: snapshot)
+
+
+def _real_check_api(lib):
+    api = make_ctypes_api(lib)
+    api._advapi32 = lib
+    return api
+
+
+def test_ctypes_persistent_grant_satisfied_by_all_packages_writes_nothing(
+    tmp_path, monkeypatch
+):
+    _aap_snapshot(monkeypatch, _ace(_AAP, 0x03))
+    lib = FakeSecurityLib()
+    grant = _real_check_api(lib).grant_path_access(
+        _identity(), str(tmp_path), "read_execute", persistent=True
+    )
+    assert grant.satisfied_by == "all_application_packages"
+    assert grant.restore is None
+    assert lib.entries == [] and lib.set_calls == []
+
+
+def test_ctypes_unsatisfied_persistent_grant_writes_this_sid_never_all_packages(
+    tmp_path, monkeypatch
+):
+    _aap_snapshot(monkeypatch, _ace(_AAP, 0x0B))  # inherit-only: not enough
+    lib = FakeSecurityLib()
+    grant = _real_check_api(lib).grant_path_access(
+        _identity(), str(tmp_path), "read_execute", persistent=True
+    )
+    assert grant.satisfied_by == ""
+    assert [entry[5] for entry in lib.entries] == [_SID]
+    assert len(lib.set_calls) == 1
+
+
+def test_launch_records_how_each_persistent_grant_was_satisfied(tmp_path):
+    root, written = tmp_path / "python", tmp_path / "npm"
+    root.mkdir()
+    written.mkdir()
+
+    class SatisfiedApi(FakeWin32Api):
+        def grant_path_access(self, identity, path, access, *, persistent=False):
+            applied = super().grant_path_access(identity, path, access, persistent=persistent)
+            if path == str(root):
+                applied.satisfied_by = "all_application_packages"
+            return applied
+
+    launch = launch_appcontainer(
+        make_request(
+            filesystem_grants=[
+                ContainerGrant(str(root), "read_execute", persistent=True),
+                ContainerGrant(str(written), "read_execute", persistent=True),
+            ]
+        ),
+        api=SatisfiedApi(),
+    )
+    assert launch.cleanup_evidence()["persistent_grants"] == [
+        {"path": str(root), "satisfied_by": "all_application_packages"},
+        {"path": str(written), "satisfied_by": "granted"},
+    ]
+    assert launch.grants == []

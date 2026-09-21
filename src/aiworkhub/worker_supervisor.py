@@ -157,6 +157,124 @@ def _open_0600(path: Path) -> BinaryIO:
     return os.fdopen(fd, "a+b", buffering=0)
 
 
+class _WorkerMcpBridge:
+    """The host side of an AppContainer worker's MCP connection (NF-2026-00034).
+
+    The worker MCP server holds the request's audit key, reads canonical
+    repository state and applies edits under its own authority checks, so it
+    runs here -- the supervisor's own child, outside the container -- with
+    exactly the command, arguments and environment its generated config
+    names.  The contained worker reaches it only through ``pipe``: one
+    connection, from a process of this launch's ``job``, relayed byte for
+    byte.  The server gets its own kill-on-close job, so neither close() nor
+    a killed supervisor can leave it behind.
+    """
+
+    def __init__(
+        self,
+        pipe: Any,
+        job: Any,
+        bridge: dict[str, Any],
+        cwd: str,
+        *,
+        popen: Callable[..., Any] = subprocess.Popen,
+        server_job: Callable[[], Any] = _WindowsKillOnCloseJob,
+    ) -> None:
+        self._pipe = pipe
+        self._job = job
+        self._argv = [str(bridge["command"]), *(str(a) for a in bridge.get("args") or ())]
+        self._env = {**os.environ, **{str(k): str(v) for k, v in (bridge.get("env") or {}).items()}}
+        self._cwd = cwd
+        self._stderr_path = Path(str(bridge["stderr_path"]))
+        self._popen = popen
+        self._server_job_factory = server_job
+        self._lock = threading.Lock()
+        self._closed = False
+        self._threads: list[threading.Thread] = []
+        self.server: Any = None
+        self._server_job: Any = None
+        self.error = ""
+
+    def start(self) -> None:
+        self._thread(self._serve)
+
+    def _thread(self, target: Callable[..., None], *args: Any) -> None:
+        thread = threading.Thread(target=target, args=args, daemon=True)
+        self._threads.append(thread)
+        thread.start()
+
+    def _serve(self) -> None:
+        server = None
+        try:
+            if not self._pipe.accept(self._job):
+                return
+            with self._lock:
+                if self._closed:
+                    return
+                with _open_0600(self._stderr_path) as stderr:
+                    server = self._popen(
+                        self._argv, cwd=self._cwd, env=self._env, shell=False,
+                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr,
+                    )
+                self.server = server
+                self._server_job = self._server_job_factory()
+                self._server_job.assign(server)
+            self._thread(self._server_to_pipe, server.stdout)
+            while chunk := self._pipe.read():
+                server.stdin.write(chunk)
+                server.stdin.flush()
+        except Exception as exc:
+            self.error = self.error or f"{type(exc).__name__}:{exc}"[:500]
+        finally:
+            if server is None:
+                self._pipe.close()  # nothing to serve: let a waiting client go
+            else:
+                try:
+                    server.stdin.close()  # client gone: the server sees EOF
+                except OSError:
+                    pass
+
+    def _server_to_pipe(self, stream: BinaryIO) -> None:
+        try:
+            while chunk := stream.read1(65536):  # type: ignore[attr-defined]
+                self._pipe.write(chunk)
+        except Exception as exc:
+            self.error = self.error or f"{type(exc).__name__}:{exc}"[:500]
+        finally:
+            self._pipe.close()  # server gone: the client sees the pipe close
+
+    def close(self, grace: float = KILL_GRACE_SECONDS) -> None:
+        """Stop serving, let the server exit on EOF, kill whatever is left
+        with its job, and remove the pipe.  Idempotent."""
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+        self._pipe.shutdown()
+        server = self.server
+        if server is not None:
+            try:
+                server.stdin.close()
+            except OSError:
+                pass
+            try:
+                server.wait(timeout=grace)
+            except subprocess.TimeoutExpired:
+                pass
+        if self._server_job is not None:
+            self._server_job.close()
+        if server is not None and server.poll() is None:
+            server.kill()
+            try:
+                server.wait(timeout=grace)
+            except subprocess.TimeoutExpired:
+                self.error = self.error or "worker_mcp_server_survived_kill"
+        for thread in self._threads:
+            thread.join(grace)
+        if not self._pipe.close():
+            self.error = self.error or "worker_pipe_still_in_use_at_close"
+
+
 class _AppContainerProcess:
     """Popen-shaped owner for one authenticated AppContainer launch."""
 
@@ -166,6 +284,7 @@ class _AppContainerProcess:
         stdout: BinaryIO,
         stderr: BinaryIO,
         owned_fds: tuple[int, ...] = (),
+        bridge: _WorkerMcpBridge | None = None,
     ) -> None:
         self._launch = launch
         self.stdout = stdout
@@ -173,6 +292,7 @@ class _AppContainerProcess:
         self.pid = launch.pid
         self.returncode: int | None = None
         self._owned_fds = owned_fds
+        self._bridge = bridge
         self._closed = False
 
     def _observe(self, timeout_ms: int) -> int | None:
@@ -227,10 +347,15 @@ class _AppContainerProcess:
         if self._closed:
             return
         first_error: Exception | None = None
+        if self._bridge is not None:
+            try:
+                self._bridge.close()
+            except Exception as exc:
+                first_error = exc
         try:
             self._launch.close()
         except Exception as exc:
-            first_error = exc
+            first_error = first_error or exc
         for fd in self._owned_fds:
             try:
                 os.close(fd)
@@ -374,7 +499,12 @@ def _launch_appcontainer_process(
         raise ValueError("appcontainer_spec_missing_repo_id")
     if not worker_kind:
         raise ValueError("appcontainer_spec_missing_worker_kind")
+    bridge_spec = spec.get("worker_mcp_bridge")
+    if bridge_spec is not None and not isinstance(bridge_spec, dict):
+        raise ValueError("invalid_worker_mcp_bridge")
     launch: windows_appcontainer.AppContainerLaunch | None = None
+    pipe: Any = None
+    bridge: _WorkerMcpBridge | None = None
     stdin_fd = os.open(os.devnull, os.O_RDONLY)
     stdout_read, stdout_write = os.pipe()
     stderr_read, stderr_write = os.pipe()
@@ -383,6 +513,12 @@ def _launch_appcontainer_process(
         os.set_inheritable(stdout_write, True)
         os.set_inheritable(stderr_write, True)
         environment = os.environ.copy()
+        if bridge_spec is not None:
+            # The pipe exists before the worker does, so its MCP shim finds it.
+            pipe = windows_appcontainer.WorkerPipe(
+                str(bridge_spec["pipe"]),
+                windows_appcontainer.container_sid(repo_id, worker_kind),
+            )
         request = windows_appcontainer.AppContainerRequest(
             argv=_native_worker_argv(argv),
             repo_id=repo_id,
@@ -394,8 +530,14 @@ def _launch_appcontainer_process(
             stderr_handle=_native_handle(stderr_write),
             capability_sids=WORKER_NETWORK_CAPABILITIES,
             filesystem_grants=_worker_filesystem_grants(argv, cwd, environment),
+            withheld_directories=tuple(
+                str(path) for path in (bridge_spec or {}).get("withheld_directories") or ()
+            ),
         )
         launch = windows_appcontainer.launch_appcontainer(request)
+        if pipe is not None:
+            bridge = _WorkerMcpBridge(pipe, launch.job, bridge_spec or {}, cwd)
+            bridge.start()
         os.close(stdout_write)
         os.close(stderr_write)
         return _AppContainerProcess(
@@ -403,8 +545,16 @@ def _launch_appcontainer_process(
             os.fdopen(stdout_read, "rb", buffering=0),
             os.fdopen(stderr_read, "rb", buffering=0),
             (stdin_fd,),
+            bridge,
         )
     except Exception:
+        try:
+            if bridge is not None:
+                bridge.close()
+            elif pipe is not None:
+                pipe.close()
+        except Exception:
+            pass
         if launch is not None:
             try:
                 launch.close()

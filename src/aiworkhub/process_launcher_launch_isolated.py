@@ -831,9 +831,22 @@ def launch_isolated(
             if not getattr(plan, "launchable", False):
                 reason = getattr(plan, "reason", "adapter_not_launchable")
                 raise LaunchRejected(reason or "adapter_not_launchable")
+            worker_mcp_bridge: dict[str, Any] | None = None
+            claude_mcp_config_path = worker_mcp_runtime.claude_mcp_config_path
+            if sandbox_backend == "windows_appcontainer" and adapter_id == "claude_cli":
+                # NF-2026-00034: the worker MCP server runs on the host, under
+                # the supervisor; the contained CLI gets a pipe shim instead.
+                claude_mcp_config_path, worker_mcp_bridge = (
+                    worker_ai_tools_mcp.appcontainer_mcp_bridge(
+                        worker_mcp_runtime,
+                        request_id=request_id,
+                        home=workspace.home,
+                        stderr_path=self.process_dir / f"{request_id}.worker-mcp.stderr.log",
+                    )
+                )
             if isinstance(plan, runtime_adapters.RuntimeAdapterPlan):
                 worker_mcp_config_path = {
-                    "claude_cli": worker_mcp_runtime.claude_mcp_config_path,
+                    "claude_cli": claude_mcp_config_path,
                     runtime_adapters.DEEPSEEK_COPILOT_ADAPTER: worker_mcp_runtime.copilot_mcp_config_path,
                     runtime_adapters.GLM_COPILOT_ADAPTER: worker_mcp_runtime.copilot_mcp_config_path,
                 }.get(adapter_id)
@@ -1188,6 +1201,7 @@ def launch_isolated(
                 "adapter_id": adapter_id,
                 "token_budget": metadata.get("token_budget"),
                 **appcontainer_identity_fields,
+                **({"worker_mcp_bridge": worker_mcp_bridge} if worker_mcp_bridge else {}),
             })
 
             supervisor = _worker_supervisor_script()
