@@ -27,7 +27,7 @@ import enum
 import hashlib
 import os
 from ctypes import wintypes
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
 try:
@@ -636,6 +636,118 @@ _MONIKER_PREFIX = "aiworkhub."
 _MONIKER_DIGEST_LENGTH = 20
 
 
+def appcontainer_worker_kind(adapter_id: str) -> str:
+    """Normalize an adapter id the way the supervisor does before deriving a SID.
+
+    ``process_launcher_launch_isolated._appcontainer_supervisor_identity``
+    applies exactly this transform to ``adapter_id`` and passes the result on
+    as ``worker_kind``.  :func:`derive_container_identity` digests the *raw*
+    string it is handed, so anything that has to land inside the worker's own
+    AppContainer -- a validation command, say -- must normalize identically
+    rather than pass an adapter id that merely happens to already be in normal
+    form.  ``tests/test_process_launcher_appcontainer_spec.py`` pins the two
+    against each other so they cannot drift apart silently.
+    """
+    return "_".join(adapter_id.lower().replace("-", "").split())
+
+
+_LOCAL_APPDATA_ENV = "LOCALAPPDATA"
+
+
+class _KnownFolderId(ctypes.Structure):
+    _fields_ = [
+        ("Data1", wintypes.DWORD),
+        ("Data2", wintypes.WORD),
+        ("Data3", wintypes.WORD),
+        ("Data4", ctypes.c_ubyte * 8),
+    ]
+
+
+def _known_folder_local_appdata() -> str:
+    """Resolve FOLDERID_LocalAppData without consulting the environment."""
+    folder = _KnownFolderId(
+        0xF1B32785,
+        0x6FBA,
+        0x4FCF,
+        (ctypes.c_ubyte * 8)(0x9D, 0x55, 0x7B, 0x8E, 0x7F, 0x15, 0x70, 0x91),
+    )
+    shell32 = _load_windows_dll("shell32")
+    ole32 = _load_windows_dll("ole32")
+    get_path = shell32.SHGetKnownFolderPath
+    get_path.argtypes = [
+        ctypes.POINTER(_KnownFolderId),
+        wintypes.DWORD,
+        wintypes.HANDLE,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    get_path.restype = ctypes.c_long
+    free = ole32.CoTaskMemFree
+    free.argtypes = [ctypes.c_void_p]
+    free.restype = None
+    raw = ctypes.c_void_p()
+    status = get_path(ctypes.byref(folder), 0, None, ctypes.byref(raw))
+    try:
+        if status != 0 or not raw.value:
+            return ""
+        return ctypes.wstring_at(raw.value)
+    finally:
+        if raw.value:
+            free(raw)
+
+
+def resolve_local_appdata() -> str:
+    """Return this user's LocalAppData directory, or ``""`` if unresolvable.
+
+    The process environment is preferred; the known-folder API is the fallback
+    so that a caller running under a sanitized allowlist environment -- the
+    worker supervisor is exactly that -- still resolves the real directory.
+    """
+    value = os.environ.get(_LOCAL_APPDATA_ENV, "").strip()
+    if value:
+        return value
+    if os.name != "nt":
+        return ""
+    try:
+        return _known_folder_local_appdata()
+    except (OSError, AttributeError, ValueError):
+        return ""
+
+
+def appcontainer_child_environment(
+    environment: Mapping[str, str] | None,
+    *,
+    local_appdata: str | None = None,
+) -> Mapping[str, str] | None:
+    """Return ``environment`` guaranteed to carry ``LOCALAPPDATA``.
+
+    Measured on Windows 11: ``CreateProcessW`` for an AppContainer token fails
+    with ``ERROR_ENVVAR_NOT_FOUND`` (203) when the *child's* environment block
+    lacks ``LOCALAPPDATA`` -- the caller's own environment does not matter.
+    The system maps the container's private storage beneath
+    ``%LOCALAPPDATA%\\Packages\\<moniker>``, so the variable is load-bearing
+    for process creation itself.  Sanitized worker and validation environments
+    drop it, which made every AppContainer launch from them fail at
+    ``create_process`` while the identical request succeeded from a full
+    interactive environment.
+
+    Supplying the real path discloses nothing new -- ``USERPROFILE`` already
+    names the same profile -- and grants no access: the container still reaches
+    only what its ACLs allow.  ``None`` (inherit the caller's environment) and
+    an environment that already carries the key are returned unchanged, as is
+    one for which no value can be resolved.
+    """
+    if environment is None:
+        return None
+    if any(key.upper() == _LOCAL_APPDATA_ENV for key in environment):
+        return environment
+    value = resolve_local_appdata() if local_appdata is None else local_appdata
+    if not value:
+        return environment
+    merged = dict(environment)
+    merged[_LOCAL_APPDATA_ENV] = value
+    return merged
+
+
 def derive_container_identity(
     repo_id: str, worker_kind: str
 ) -> tuple[str, str, str]:
@@ -820,6 +932,13 @@ def launch_appcontainer(
     real ctypes-backed boundary is loaded lazily (Windows only).
     """
     _validate_request(request)
+    # Every AppContainer launch -- worker supervisor, validation lane, anything
+    # later -- passes through here, so the LOCALAPPDATA requirement is met once
+    # at the chokepoint instead of being remembered by each caller.  It runs
+    # after validation so hostile keys are still refused first.
+    child_environment = appcontainer_child_environment(request.environment)
+    if child_environment is not request.environment:
+        request = replace(request, environment=child_environment)
 
     if api is None:
         if not platform_supported():

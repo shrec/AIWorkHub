@@ -45,6 +45,12 @@ def _fchmod_permitted() -> bool:
         # environment cannot exercise the branch either way.
         return False
 
+    # os.fchmod does not exist on Windows at all, so calling it there raises
+    # AttributeError -- which "except OSError" does not catch, and which fails
+    # the whole module at collection rather than answering "not permitted".
+    if not hasattr(os, "fchmod"):
+        return False
+
     import tempfile
 
     descriptor, name = tempfile.mkstemp()
@@ -536,6 +542,13 @@ def _commit_validation_worker_package(repo: Path) -> None:
         "windows_file_structures.py",
         "toolchain_authority.py",
         "validation_runner.py",
+        # worker_workspace's AppContainer validation helper imports these two
+        # siblings by name, so the declared seed closure resolves them and this
+        # fixture repository has to track them and their own closure.
+        "repository_state.py",
+        "storage_registry.py",
+        "windows_appcontainer.py",
+        "windows_job_structures.py",
         "worker_workspace.py",
     ):
         shutil.copyfile(source_package / name, destination_package / name)
@@ -8977,7 +8990,13 @@ def _stub_landlock_syscalls(
         def syscall(self, number: int, *args: object) -> int:
             if number == worker_workspace._LANDLOCK_CREATE_RULESET:
                 # A real descriptor: the production ``finally`` closes it.
-                return os.open(os.devnull, os.O_RDONLY | os.O_CLOEXEC)
+                # os.O_CLOEXEC does not exist on Windows; these cases exercise
+                # the platform-independent ruleset builder through a fake API,
+                # so the flag is a no-op there rather than a reason the whole
+                # case cannot run.
+                return os.open(
+                    os.devnull, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+                )
             return 0
 
         def prctl(self, *args: object) -> int:

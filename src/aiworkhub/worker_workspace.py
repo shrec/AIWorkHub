@@ -3250,7 +3250,19 @@ def provision_worker_mcp_runtime(
     other's repository-layout assumptions.
     """
 
-    if backend not in ("landlock", "bubblewrap", VSCODE_LM_IN_PROCESS_BACKEND):
+    # AppContainer is a real-path backend: it confines through the container
+    # profile and job object rather than a mount namespace, so it takes the
+    # same branch bubblewrap does NOT below and the worker MCP runtime is
+    # spelled with the true host paths.  Omitting it here is what made every
+    # native-CLI card on Windows die as
+    # ``launch_failed:unsupported_sandbox_backend:windows_appcontainer``
+    # before the model was ever called.
+    if backend not in (
+        "landlock",
+        "bubblewrap",
+        VSCODE_LM_IN_PROCESS_BACKEND,
+        WINDOWS_APPCONTAINER_BACKEND,
+    ):
         raise WorkspaceError(f"unsupported_sandbox_backend:{backend}")
     if not workspace.repo.is_dir():
         raise WorkspaceError(f"authority_repo_not_directory:{workspace.repo}")
@@ -8207,6 +8219,14 @@ def sandbox_argv(
                 f"vscode_lm_in_process_adapter_forbidden:{adapter_id}"
             )
         return list(adapter_argv)
+    if selected == WINDOWS_APPCONTAINER_BACKEND:
+        # AppContainer confinement is established by the container profile and
+        # the kill-on-close job object at CreateProcess time, not by an argv
+        # wrapper: there is no bwrap binary to prefix and no mount namespace to
+        # remap paths into, so the real host argv is exactly what must run.
+        # The working directory travels on the AppContainerRequest instead of a
+        # ``cd`` prefix, which is why no validation_cwd handling belongs here.
+        return list(adapter_argv)
     # B892: resolve the validated ``cd`` prefix target once, against the real
     # workspace filesystem, before either backend's argv is built -- so
     # Landlock and bubblewrap bind/chdir into the exact same
@@ -11570,6 +11590,170 @@ def _validation_unsupported_in_sandbox_error(restriction: str) -> WorkspaceError
     return WorkspaceError(f"{VALIDATION_UNSUPPORTED_IN_SANDBOX}:{restriction}")
 
 
+# ``AppContainerLaunch.wait`` rejects anything outside this native range, and a
+# drain thread that has already seen EOF joins immediately -- the bound only
+# stops a wedged reader from holding finalization open.
+_MAX_APPCONTAINER_WAIT_MS = 4_294_967_294
+_APPCONTAINER_DRAIN_JOIN_SECONDS = 30.0
+
+
+def _run_appcontainer_validation(
+    argv: list[str],
+    *,
+    workspace: WorkerWorkspace,
+    adapter_id: str,
+    cwd: str | Path,
+    env: Mapping[str, str],
+    timeout_seconds: int,
+) -> subprocess.CompletedProcess:
+    """Run one validation command inside this request's own AppContainer.
+
+    Answers in ``subprocess.run``'s exact shapes so ``run_validations`` needs
+    no other change: a :class:`subprocess.CompletedProcess` with decoded text
+    streams, a :class:`subprocess.TimeoutExpired` carrying whatever output was
+    captured before the deadline, or an :class:`OSError` for any launch-level
+    failure.  ``AppContainerError`` never escapes as itself.
+
+    ``worker_kind`` is the adapter id because
+    ``process_launcher_launch_isolated._appcontainer_supervisor_identity``
+    derives the worker's own container SID from ``(repo_id, adapter_id)``.  Any
+    other worker_kind would produce a different SID with no access to the
+    retained worktree this command has to read.
+
+    Both pipes are drained on their own threads *while* the main thread waits
+    on the process handle.  Draining after the wait would deadlock the child
+    the moment either stream exceeded one pipe buffer.
+    """
+    import msvcrt
+
+    # Spelled ``from .<module> import <name>`` rather than ``from . import
+    # <module>``: only the first form is a seedable edge for the declared
+    # validation closure, so this shape is what guarantees both siblings
+    # actually land in a sparse worker worktree that has to run this helper.
+    from .repository_state import inspect_repository
+    from .windows_appcontainer import (
+        AppContainerError,
+        AppContainerLifecycleState,
+        AppContainerRequest,
+        appcontainer_worker_kind,
+        launch_appcontainer,
+    )
+
+    repo_id = inspect_repository(workspace.repo).manifest.repo_id
+
+    stdout_read, stdout_write = os.pipe()
+    stderr_read, stderr_write = os.pipe()
+    captured: dict[str, bytes] = {"stdout": b"", "stderr": b""}
+
+    def _drain(fd: int, key: str) -> None:
+        chunks: list[bytes] = []
+        try:
+            while True:
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+        except OSError:
+            pass
+        finally:
+            captured[key] = b"".join(chunks)
+
+    launch = None
+    write_ends_open = True
+    try:
+        os.set_inheritable(stdout_write, True)
+        os.set_inheritable(stderr_write, True)
+        try:
+            launch = launch_appcontainer(
+                AppContainerRequest(
+                    argv=list(argv),
+                    repo_id=repo_id,
+                    worker_kind=appcontainer_worker_kind(adapter_id),
+                    working_directory=str(cwd),
+                    environment=dict(env),
+                    stdout_handle=msvcrt.get_osfhandle(stdout_write),
+                    stderr_handle=msvcrt.get_osfhandle(stderr_write),
+                )
+            )
+        except AppContainerError as exc:
+            raise OSError(
+                f"windows_appcontainer_validation_launch_failed:{exc}"
+            ) from exc
+        # The child holds its own duplicates of both write ends now.  Releasing
+        # ours is what lets each drain thread observe EOF when the child exits.
+        os.close(stdout_write)
+        os.close(stderr_write)
+        write_ends_open = False
+
+        drains = [
+            threading.Thread(
+                target=_drain, args=(stdout_read, "stdout"), daemon=True
+            ),
+            threading.Thread(
+                target=_drain, args=(stderr_read, "stderr"), daemon=True
+            ),
+        ]
+        for thread in drains:
+            thread.start()
+
+        timeout_ms = max(
+            0, min(int(timeout_seconds * 1000), _MAX_APPCONTAINER_WAIT_MS)
+        )
+        try:
+            outcome = launch.wait(timeout_ms)
+        except AppContainerError as exc:
+            raise OSError(
+                f"windows_appcontainer_validation_wait_failed:{exc}"
+            ) from exc
+
+        if outcome.state is not AppContainerLifecycleState.EXITED:
+            try:
+                launch.terminate()
+            except AppContainerError:
+                pass
+            for thread in drains:
+                thread.join(_APPCONTAINER_DRAIN_JOIN_SECONDS)
+            partial_stdout = captured["stdout"].decode("utf-8", errors="replace")
+            partial_stderr = captured["stderr"].decode("utf-8", errors="replace")
+            if outcome.state is AppContainerLifecycleState.TIMEOUT:
+                raise subprocess.TimeoutExpired(
+                    list(argv),
+                    timeout_seconds,
+                    output=partial_stdout,
+                    stderr=partial_stderr,
+                )
+            raise OSError(
+                "windows_appcontainer_validation_not_exited:"
+                f"{outcome.state.value}:win_error={outcome.win_error}"
+            )
+
+        for thread in drains:
+            thread.join(_APPCONTAINER_DRAIN_JOIN_SECONDS)
+        return subprocess.CompletedProcess(
+            list(argv),
+            outcome.exit_code if outcome.exit_code is not None else 1,
+            captured["stdout"].decode("utf-8", errors="replace"),
+            captured["stderr"].decode("utf-8", errors="replace"),
+        )
+    finally:
+        if write_ends_open:
+            for fd in (stdout_write, stderr_write):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        for fd in (stdout_read, stderr_read):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if launch is not None:
+            try:
+                launch.close()
+            except Exception:
+                pass
+
+
 def run_validations(
     workspace: WorkerWorkspace,
     commands: Iterable[str],
@@ -11603,6 +11787,7 @@ def run_validations(
         "landlock",
         "bubblewrap",
         VSCODE_LM_IN_PROCESS_BACKEND,
+        WINDOWS_APPCONTAINER_BACKEND,
     }:
         raise _validation_unsupported_in_sandbox_error(
             f"unsupported_sandbox_backend:{selected_backend}"
@@ -11619,9 +11804,13 @@ def run_validations(
         workspace.repo,
         toolchain_authority_card or {"validation": rows},
     )
+    # Only bubblewrap rewrites HOME into a sandbox alias; every real-path
+    # backend -- landlock, the editor-hosted route and AppContainer -- keeps
+    # the request's own isolated host HOME.
     validation_home = (
         workspace.home
-        if selected_backend in {"landlock", VSCODE_LM_IN_PROCESS_BACKEND}
+        if selected_backend
+        in {"landlock", VSCODE_LM_IN_PROCESS_BACKEND, WINDOWS_APPCONTAINER_BACKEND}
         else None
     )
     bounded_timeout = max(1, min(timeout_seconds, MAX_VALIDATION_SECONDS))
@@ -11778,6 +11967,24 @@ def run_validations(
                     else workspace.path
                 )
                 execution_boundary = "trusted_manager_shell_free_validation"
+            elif selected_backend == WINDOWS_APPCONTAINER_BACKEND:
+                # AppContainer runs the real host argv inside a container
+                # profile plus a kill-on-close job object: there is no mount
+                # namespace to remap into and no bwrap-style argv prefix, so
+                # the working directory travels on the launch request exactly
+                # the way it does for the editor-hosted branch above.
+                wrapped = list(tokens)
+                appcontainer_cwd = (
+                    _resolve_validation_cwd(workspace, cd_relative)
+                    if cd_relative is not None
+                    else ""
+                )
+                subprocess_cwd = (
+                    workspace.path / Path(*PurePosixPath(appcontainer_cwd).parts)
+                    if appcontainer_cwd
+                    else workspace.path
+                )
+                execution_boundary = WINDOWS_APPCONTAINER_BACKEND
             else:
                 wrapped = sandbox_argv(
                     workspace,
@@ -11970,19 +12177,35 @@ def run_validations(
                 broker_read_fd, broker_write_fd = os.pipe()
                 env[_METADATA_BROKER_EVIDENCE_ENV] = str(broker_write_fd)
             try:
-                result = subprocess.run(
-                    wrapped,
-                    cwd=subprocess_cwd,
-                    env=env,
-                    text=True,
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    timeout=bounded_timeout,
-                    check=False,
-                    shell=False,
-                    pass_fds=(broker_write_fd,) if broker_write_fd is not None else (),
-                )
+                if selected_backend == WINDOWS_APPCONTAINER_BACKEND:
+                    # AppContainer confinement is established by the container
+                    # profile and the kill-on-close job object at CreateProcess
+                    # time, so this command cannot go through subprocess.run at
+                    # all.  The helper answers in subprocess.run's exact shapes
+                    # (CompletedProcess, TimeoutExpired, OSError) so every
+                    # branch below this call stays byte-identical.
+                    result = _run_appcontainer_validation(
+                        wrapped,
+                        workspace=workspace,
+                        adapter_id=adapter_id,
+                        cwd=subprocess_cwd,
+                        env=env,
+                        timeout_seconds=bounded_timeout,
+                    )
+                else:
+                    result = subprocess.run(
+                        wrapped,
+                        cwd=subprocess_cwd,
+                        env=env,
+                        text=True,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        timeout=bounded_timeout,
+                        check=False,
+                        shell=False,
+                        pass_fds=(broker_write_fd,) if broker_write_fd is not None else (),
+                    )
             except subprocess.TimeoutExpired as exc:
                 stdout = (
                     exc.stdout.decode("utf-8", errors="replace")

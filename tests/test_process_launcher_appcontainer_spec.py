@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import contextlib
+import os
+import subprocess
 import sys
 import threading
 from pathlib import Path
@@ -12,8 +14,10 @@ import pytest
 
 import aiworkhub.process_launcher as process_launcher
 import aiworkhub.process_launcher_launch_isolated as module
+import aiworkhub.repository_state as repository_state
 import aiworkhub.windows_appcontainer as windows_appcontainer
 import aiworkhub.worker_supervisor as worker_supervisor
+import aiworkhub.worker_workspace as worker_workspace
 
 CANONICAL_REPO_ID = "repo_57de971f505d4a50a7729a99c32615de"
 
@@ -682,3 +686,261 @@ def test_supervisor_cancellation_terminates_the_appcontainer_tree(
     assert statuses[-1]["state"] == "cancelled"
     # The cancel sentinel is consumed so a later request cannot inherit it.
     assert not Path(spec["cancel_path"]).exists()
+
+
+# ---------------------------------------------------------------------------
+# windows_appcontainer as a first-class backend in all three consumer sites
+#
+# select_sandbox_backend() returns WINDOWS_APPCONTAINER_BACKEND on a capable
+# Windows host, but provision_worker_mcp_runtime, sandbox_argv and
+# run_validations each used to refuse that exact token -- so every native-CLI
+# card died as launch_failed:unsupported_sandbox_backend:windows_appcontainer
+# before the model was ever called.
+# ---------------------------------------------------------------------------
+
+
+APPCONTAINER = worker_workspace.WINDOWS_APPCONTAINER_BACKEND
+
+
+@pytest.mark.parametrize(
+    "adapter_id",
+    [
+        "claude_cli",
+        "codex_cli",
+        "glm_vscode_lm",
+        "deepseek_vscode_lm",
+        "opencode_cli",
+        "grok_kilo_cli",
+        "GLM-53 Native",
+        "Codex CLI",
+    ],
+)
+def test_validation_worker_kind_matches_the_supervisor_container_identity(
+    adapter_id: str,
+) -> None:
+    """A validation command has to land in the worker's own container SID.
+
+    ``derive_container_identity`` digests the *raw* ``worker_kind`` it is
+    handed, so the validation lane must normalize an adapter id exactly the way
+    the supervisor already does rather than pass one that merely happens to be
+    in normal form today.
+    """
+    assert windows_appcontainer.appcontainer_worker_kind(
+        adapter_id
+    ) == module._appcontainer_supervisor_identity(
+        repo_id=CANONICAL_REPO_ID,
+        worker_kind=adapter_id,
+        platform="win32",
+    )["worker_kind"]
+
+
+def test_sandbox_argv_returns_the_real_argv_unchanged_under_appcontainer() -> None:
+    argv = [r"C:\Python\python.exe", "-m", "pytest", "-q"]
+    wrapped = worker_workspace.sandbox_argv(
+        SimpleNamespace(), "validation", argv, backend=APPCONTAINER
+    )
+    # Confinement comes from the container profile and job object, so there is
+    # no bwrap-style prefix and no namespace remapping to apply here.
+    assert wrapped == argv
+    assert wrapped is not argv
+
+
+def test_sandbox_argv_still_refuses_a_backend_nobody_implements() -> None:
+    with pytest.raises(
+        worker_workspace.WorkspaceError,
+        match="unsupported_sandbox_backend:made_up",
+    ):
+        worker_workspace.sandbox_argv(
+            SimpleNamespace(), "validation", ["x"], backend="made_up"
+        )
+
+
+def test_provision_worker_mcp_runtime_accepts_the_appcontainer_backend(
+    tmp_path: Path,
+) -> None:
+    """The launch-time guard must let the token through to the next check."""
+    not_a_directory = tmp_path / "authority-repo"
+    not_a_directory.write_text("", encoding="utf-8")
+    workspace = SimpleNamespace(
+        repo=not_a_directory, path=tmp_path, home=tmp_path
+    )
+    with pytest.raises(worker_workspace.WorkspaceError) as excinfo:
+        worker_workspace.provision_worker_mcp_runtime(
+            workspace,
+            request_id="request",
+            task_id="task",
+            runner="runner",
+            topic="topic",
+            backend=APPCONTAINER,
+            source_graph_targets=(),
+            session_topic="topic",
+        )
+    assert "unsupported_sandbox_backend" not in str(excinfo.value)
+    assert str(excinfo.value).startswith("authority_repo_not_directory")
+
+
+class _FakeValidationLaunch:
+    """Deterministic stand-in for one job-owned AppContainer child."""
+
+    def __init__(
+        self,
+        request,
+        *,
+        stdout: bytes,
+        stderr: bytes,
+        outcome,
+    ) -> None:
+        self.request = request
+        self._outcome = outcome
+        self.terminated = False
+        self.closed = False
+        self.waited_ms: list[int] = []
+        # get_osfhandle is patched to identity in these tests, so the request
+        # carries the production side's own inheritable write descriptors.
+        os.write(request.stdout_handle, stdout)
+        os.write(request.stderr_handle, stderr)
+
+    def wait(self, timeout_ms: int, **_kwargs):
+        self.waited_ms.append(timeout_ms)
+        return self._outcome
+
+    def terminate(self, exit_code: int = 1):
+        self.terminated = True
+        self.closed = True
+        return self._outcome
+
+    def close(self) -> None:
+        self.closed = True
+
+
+@pytest.fixture
+def identity_osfhandle(monkeypatch):
+    """Make ``msvcrt.get_osfhandle`` hand back the descriptor itself.
+
+    The production helper passes real Win32 handles; treating the descriptor as
+    the handle lets the fake child write through the exact same pipe the
+    production side created and then closes, so EOF still arrives naturally.
+    """
+    msvcrt = pytest.importorskip("msvcrt")
+    monkeypatch.setattr(msvcrt, "get_osfhandle", lambda fd: fd)
+    return msvcrt
+
+
+def _install_fake_launch(monkeypatch, *, stdout, stderr, outcome, sink):
+    def _fake_launch_appcontainer(request):
+        launch = _FakeValidationLaunch(
+            request, stdout=stdout, stderr=stderr, outcome=outcome
+        )
+        sink.append(launch)
+        return launch
+
+    monkeypatch.setattr(
+        windows_appcontainer, "launch_appcontainer", _fake_launch_appcontainer
+    )
+
+
+def _stub_repo_id(monkeypatch):
+    monkeypatch.setattr(
+        repository_state,
+        "inspect_repository",
+        lambda repo, **_kwargs: SimpleNamespace(
+            manifest=SimpleNamespace(repo_id=CANONICAL_REPO_ID)
+        ),
+    )
+
+
+def test_appcontainer_validation_returns_a_completed_process(
+    tmp_path: Path, monkeypatch, identity_osfhandle
+) -> None:
+    launches: list[_FakeValidationLaunch] = []
+    _stub_repo_id(monkeypatch)
+    _install_fake_launch(
+        monkeypatch,
+        stdout=b"7 passed\n",
+        stderr=b"",
+        outcome=windows_appcontainer.AppContainerLifecycleResult(
+            windows_appcontainer.AppContainerLifecycleState.EXITED, exit_code=0
+        ),
+        sink=launches,
+    )
+
+    result = worker_workspace._run_appcontainer_validation(
+        ["pytest", "-q"],
+        workspace=SimpleNamespace(repo=tmp_path, path=tmp_path, home=tmp_path),
+        adapter_id="claude_cli",
+        cwd=tmp_path,
+        env={"PATH": "x"},
+        timeout_seconds=30,
+    )
+
+    assert isinstance(result, subprocess.CompletedProcess)
+    assert result.returncode == 0
+    assert result.stdout == "7 passed\n"
+    assert result.stderr == ""
+    assert result.args == ["pytest", "-q"]
+    request = launches[0].request
+    assert list(request.argv) == ["pytest", "-q"]
+    assert request.repo_id == CANONICAL_REPO_ID
+    assert request.worker_kind == windows_appcontainer.appcontainer_worker_kind(
+        "claude_cli"
+    )
+    assert launches[0].closed
+
+
+def test_appcontainer_validation_timeout_carries_partial_output(
+    tmp_path: Path, monkeypatch, identity_osfhandle
+) -> None:
+    launches: list[_FakeValidationLaunch] = []
+    _stub_repo_id(monkeypatch)
+    _install_fake_launch(
+        monkeypatch,
+        stdout=b"collected 2 items\n",
+        stderr=b"slow\n",
+        outcome=windows_appcontainer.AppContainerLifecycleResult(
+            windows_appcontainer.AppContainerLifecycleState.TIMEOUT
+        ),
+        sink=launches,
+    )
+
+    with pytest.raises(subprocess.TimeoutExpired) as excinfo:
+        worker_workspace._run_appcontainer_validation(
+            ["pytest", "-q"],
+            workspace=SimpleNamespace(repo=tmp_path, path=tmp_path, home=tmp_path),
+            adapter_id="claude_cli",
+            cwd=tmp_path,
+            env={},
+            timeout_seconds=5,
+        )
+
+    assert excinfo.value.timeout == 5
+    assert excinfo.value.output == "collected 2 items\n"
+    assert excinfo.value.stderr == "slow\n"
+    assert launches[0].terminated
+    assert launches[0].closed
+
+
+def test_appcontainer_validation_never_lets_appcontainer_error_escape(
+    tmp_path: Path, monkeypatch, identity_osfhandle
+) -> None:
+    _stub_repo_id(monkeypatch)
+
+    def _refuse(request):
+        raise windows_appcontainer.AppContainerError(
+            windows_appcontainer.AppContainerReason.LAUNCH_FAILED,
+            detail="create_process refused",
+        )
+
+    monkeypatch.setattr(windows_appcontainer, "launch_appcontainer", _refuse)
+
+    with pytest.raises(OSError) as excinfo:
+        worker_workspace._run_appcontainer_validation(
+            ["pytest", "-q"],
+            workspace=SimpleNamespace(repo=tmp_path, path=tmp_path, home=tmp_path),
+            adapter_id="claude_cli",
+            cwd=tmp_path,
+            env={},
+            timeout_seconds=5,
+        )
+
+    assert not isinstance(excinfo.value, windows_appcontainer.AppContainerError)
+    assert "windows_appcontainer_validation_launch_failed" in str(excinfo.value)

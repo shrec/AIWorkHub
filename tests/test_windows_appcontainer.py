@@ -1806,3 +1806,97 @@ def test_acl_snapshot_windows_native_canary_is_structurally_valid():
     else:
         assert snapshot.raw_acl is reacquired.raw_acl is None
         assert snapshot.aces == reacquired.aces == ()
+
+
+# ---------------------------------------------------------------------------
+# LOCALAPPDATA is load-bearing for AppContainer process creation
+#
+# Measured on Windows 11: CreateProcessW for an AppContainer token answers
+# ERROR_ENVVAR_NOT_FOUND (203) when the CHILD's environment block lacks
+# LOCALAPPDATA.  The sanitized worker and validation environments drop it, so
+# every launch from them failed at create_process -- including a bare
+# ``cmd.exe /c echo`` -- while the identical request succeeded from a full
+# interactive environment.  The caller's own environment was proven not to
+# matter; only the block handed to the child does.
+# ---------------------------------------------------------------------------
+
+
+def test_child_environment_none_still_inherits_the_caller():
+    assert wac.appcontainer_child_environment(None, local_appdata=r"C:\L") is None
+
+
+@pytest.mark.parametrize("key", ["LOCALAPPDATA", "LocalAppData", "localappdata"])
+def test_child_environment_keeps_an_existing_value_in_any_case(key):
+    env = {key: r"C:\Original", "A": "B"}
+    assert wac.appcontainer_child_environment(env, local_appdata=r"C:\Other") is env
+
+
+def test_child_environment_adds_the_value_without_mutating_the_input():
+    env = {"A": "B"}
+    merged = wac.appcontainer_child_environment(
+        env, local_appdata=r"C:\Users\u\AppData\Local"
+    )
+    assert merged == {"A": "B", "LOCALAPPDATA": r"C:\Users\u\AppData\Local"}
+    assert env == {"A": "B"}
+
+
+def test_child_environment_is_left_alone_when_nothing_resolves():
+    env = {"A": "B"}
+    assert wac.appcontainer_child_environment(env, local_appdata="") is env
+
+
+def test_resolve_local_appdata_prefers_the_process_environment(monkeypatch):
+    monkeypatch.setenv("LOCALAPPDATA", r"C:\FromEnv")
+    monkeypatch.setattr(
+        wac,
+        "_known_folder_local_appdata",
+        lambda: pytest.fail("known-folder lookup must not run when env has it"),
+    )
+    assert wac.resolve_local_appdata() == r"C:\FromEnv"
+
+
+def test_resolve_local_appdata_falls_back_when_the_env_was_sanitized(monkeypatch):
+    """The worker supervisor runs under an allowlist env without LOCALAPPDATA."""
+    monkeypatch.delenv("LOCALAPPDATA", raising=False)
+    monkeypatch.setattr(wac.os, "name", "nt")
+    monkeypatch.setattr(
+        wac, "_known_folder_local_appdata", lambda: r"C:\FromKnownFolder"
+    )
+    assert wac.resolve_local_appdata() == r"C:\FromKnownFolder"
+
+
+def test_resolve_local_appdata_fails_soft_when_the_lookup_breaks(monkeypatch):
+    monkeypatch.delenv("LOCALAPPDATA", raising=False)
+    monkeypatch.setattr(wac.os, "name", "nt")
+
+    def _broken():
+        raise OSError("shell32 unavailable")
+
+    monkeypatch.setattr(wac, "_known_folder_local_appdata", _broken)
+    assert wac.resolve_local_appdata() == ""
+
+
+def test_launch_hands_a_sanitized_child_environment_localappdata(monkeypatch):
+    monkeypatch.setattr(
+        wac, "resolve_local_appdata", lambda: r"C:\Users\u\AppData\Local"
+    )
+    fake = FakeWin32Api()
+    launch_appcontainer(make_request(environment={"A": "B"}), api=fake)
+    assert fake.spec.environment["LOCALAPPDATA"] == r"C:\Users\u\AppData\Local"
+    assert fake.spec.environment["A"] == "B"
+
+
+def test_launch_leaves_an_inherited_environment_inherited(monkeypatch):
+    monkeypatch.setattr(wac, "resolve_local_appdata", lambda: r"C:\L")
+    fake = FakeWin32Api()
+    launch_appcontainer(make_request(environment=None), api=fake)
+    assert fake.spec.environment is None
+
+
+def test_launch_refuses_hostile_keys_before_supplying_localappdata(monkeypatch):
+    monkeypatch.setattr(wac, "resolve_local_appdata", lambda: r"C:\L")
+    with pytest.raises(AppContainerError) as excinfo:
+        launch_appcontainer(
+            make_request(environment={"A=B": "value"}), api=FakeWin32Api()
+        )
+    assert excinfo.value.reason is AppContainerReason.INVALID_ENVIRONMENT
