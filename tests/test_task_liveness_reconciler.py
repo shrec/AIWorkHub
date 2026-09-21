@@ -2345,7 +2345,7 @@ def test_a_deterministic_acquisition_failure_backs_off_instead_of_spinning(
 def test_backoff_is_bounded_and_a_contended_lock_keeps_the_fast_retry(
     tmp_path, monkeypatch
 ):
-    """A live holder may exit at any moment, so a takeover must stay fast."""
+    """Standby retries stay fast at first, then back off to a bounded cap."""
 
     repo = tmp_path / "repo_held"
     lock_path = repo / task_reconciler.LOCK_REL_PATH
@@ -2362,6 +2362,64 @@ def test_backoff_is_bounded_and_a_contended_lock_keeps_the_fast_retry(
 
     def _record(seconds):
         waits.append(seconds)
+        if len(waits) >= 7:
+            service._stop_event.set()
+            return True
+        return False
+
+    monkeypatch.setattr(service._stop_event, "wait", _record)
+    service._loop()
+
+    retry = task_reconciler.AUTHORITY_RETRY_SECONDS
+    factor = task_reconciler.AUTHORITY_BACKOFF_FACTOR
+    cap = task_reconciler.AUTHORITY_STANDBY_MAX_SECONDS
+    # [0.25, 0.5, 1.0, 2.0, 4.0] then pinned at the cap: consecutive held
+    # results double the standby wait, and only acquisition or an unsafe
+    # outcome resets the ladder to AUTHORITY_RETRY_SECONDS.
+    expected = [
+        retry,
+        retry * factor,
+        retry * factor**2,
+        retry * factor**3,
+        retry * factor**4,
+        cap,
+        cap,
+    ]
+    assert waits == expected
+    assert service.health()["authority_state"] == "standby"
+    assert service.health()["acquisition_backoff_seconds"] == waits[-1]
+
+
+def test_standby_backoff_resets_after_acquisition(tmp_path, monkeypatch):
+    """A successful acquisition restarts the standby ladder."""
+
+    repo = tmp_path / "repo_acquire_reset"
+    lock_path = repo / task_reconciler.LOCK_REL_PATH
+    lock_path.parent.mkdir(parents=True)
+    service = task_reconciler.ReconcilerService(repo, scan_interval_seconds=5)
+    calls: list[int] = []
+
+    class _Authority:
+        def __enter__(self):
+            return {"pid": 4242}
+
+        def __exit__(self, *_exc):
+            return False
+
+    def _lock(_path):
+        calls.append(len(calls) + 1)
+        if len(calls) == 3:
+            return _Authority()
+        raise task_reconciler.ReconcilerLockHeld(
+            f"reconciler_lock_held:{lock_path}"
+        )
+
+    monkeypatch.setattr(task_reconciler, "single_instance_lock", _lock)
+    monkeypatch.setattr(service, "_run_as_owner", lambda: None)
+    waits: list[float] = []
+
+    def _record(seconds):
+        waits.append(seconds)
         if len(waits) >= 4:
             service._stop_event.set()
             return True
@@ -2370,8 +2428,46 @@ def test_backoff_is_bounded_and_a_contended_lock_keeps_the_fast_retry(
     monkeypatch.setattr(service._stop_event, "wait", _record)
     service._loop()
 
-    assert waits == [task_reconciler.AUTHORITY_RETRY_SECONDS] * 4
-    assert service.health()["authority_state"] == "standby"
+    retry = task_reconciler.AUTHORITY_RETRY_SECONDS
+    factor = task_reconciler.AUTHORITY_BACKOFF_FACTOR
+    assert waits == [retry, retry * factor, retry, retry * factor]
+
+
+def test_standby_backoff_resets_after_unsafe_outcome(tmp_path, monkeypatch):
+    """Any ReconcilerLockUnsafe outcome restarts the standby ladder."""
+
+    repo = tmp_path / "repo_unsafe_reset"
+    lock_path = repo / task_reconciler.LOCK_REL_PATH
+    lock_path.parent.mkdir(parents=True)
+    service = task_reconciler.ReconcilerService(repo, scan_interval_seconds=5)
+    calls: list[int] = []
+
+    def _lock(_path):
+        calls.append(len(calls) + 1)
+        if len(calls) == 3:
+            raise task_reconciler.ReconcilerLockUnsafe(
+                f"reconciler_lock_unsafe:{lock_path}"
+            )
+        raise task_reconciler.ReconcilerLockHeld(
+            f"reconciler_lock_held:{lock_path}"
+        )
+
+    monkeypatch.setattr(task_reconciler, "single_instance_lock", _lock)
+    waits: list[float] = []
+
+    def _record(seconds):
+        waits.append(seconds)
+        if len(waits) >= 4:
+            service._stop_event.set()
+            return True
+        return False
+
+    monkeypatch.setattr(service._stop_event, "wait", _record)
+    service._loop()
+
+    retry = task_reconciler.AUTHORITY_RETRY_SECONDS
+    factor = task_reconciler.AUTHORITY_BACKOFF_FACTOR
+    assert waits == [retry, retry * factor, retry, retry]
 
 
 def test_lock_failure_classification_reads_the_raising_code_not_the_name():

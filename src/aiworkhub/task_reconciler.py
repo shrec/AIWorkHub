@@ -112,6 +112,8 @@ AUTHORITY_RETRY_SECONDS = 0.25
 DETERMINISTIC_LOCK_FAILURE_REASONS = frozenset({"reconciler_lock_unsafe"})
 AUTHORITY_BACKOFF_FACTOR = 2.0
 AUTHORITY_BACKOFF_MAX_SECONDS = 60.0
+# Held-lock standby retries back off to this cap instead of spinning at the fast retry rate.
+AUTHORITY_STANDBY_MAX_SECONDS = 5.0
 
 
 def _utcnow() -> str:
@@ -849,6 +851,7 @@ class ReconcilerService:
         # reset by acquisition or by any transient outcome, so a real takeover
         # is never delayed by a stale penalty.
         backoff_seconds = AUTHORITY_RETRY_SECONDS
+        standby_seconds = AUTHORITY_RETRY_SECONDS
         while not self._stop_event.is_set():
             with self._state_lock:
                 self._authority_state = "acquiring"
@@ -857,6 +860,7 @@ class ReconcilerService:
                 authority = single_instance_lock(lock_path)
                 with authority as identity:
                     backoff_seconds = AUTHORITY_RETRY_SECONDS
+                    standby_seconds = AUTHORITY_RETRY_SECONDS
                     with self._state_lock:
                         self._authority_state = "active_owner"
                         self._authority_identity = dict(identity)
@@ -867,13 +871,18 @@ class ReconcilerService:
                 # Another live owner is the one transient cause: it may exit at
                 # any moment, so a takeover attempt must stay fast.
                 backoff_seconds = AUTHORITY_RETRY_SECONDS
+                wait_seconds = standby_seconds
                 with self._state_lock:
                     self._authority_state = "standby"
                     self._authority_identity = {}
                     self._last_acquisition_error = str(exc)
-                    self._acquisition_backoff_seconds = AUTHORITY_RETRY_SECONDS
-                self._stop_event.wait(AUTHORITY_RETRY_SECONDS)
+                    self._acquisition_backoff_seconds = wait_seconds
+                self._stop_event.wait(wait_seconds)
+                standby_seconds = min(
+                    standby_seconds * AUTHORITY_BACKOFF_FACTOR, AUTHORITY_STANDBY_MAX_SECONDS
+                )
             except ReconcilerLockUnsafe as exc:
+                standby_seconds = AUTHORITY_RETRY_SECONDS
                 deterministic = classify_lock_failure(exc) == "deterministic"
                 wait_seconds = backoff_seconds if deterministic else AUTHORITY_RETRY_SECONDS
                 backoff_seconds = (
