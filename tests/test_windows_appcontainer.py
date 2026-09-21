@@ -76,6 +76,7 @@ class FakeWin32Api:
         self.wait_results: list[bool] = [False]
         self.exit_code = 0
         self.lifecycle_creations: list[_ProcessCreation] = []
+        self.dacl_queries: list[str] = []
 
     def _token(self) -> int:
         self._counter += 1
@@ -115,6 +116,13 @@ class FakeWin32Api:
     def revoke_path_access(self, grant):
         self.events.append(f"revoke:{grant.path}")
         grant.restore = None
+
+    # Normcased directories whose DACL the fake reports as protected.
+    protected_paths: frozenset[str] = frozenset()
+
+    def dacl_protected(self, path):
+        self.dacl_queries.append(path)
+        return os.path.normcase(path) in self.protected_paths
 
     def build_security_capabilities(self, identity, capability_sids):
         self._maybe_fail("build_security_capabilities")
@@ -2424,3 +2432,169 @@ def test_launch_close_surfaces_a_failed_revoke(tmp_path):
     assert launch.cleanup_evidence()["grant_revoke_failures"] == [
         {"path": str(tmp_path), "win_error": 1307}
     ]
+
+
+# -- protected descendants (NF-2026-00034) -----------------------------------
+
+
+def _request_tree(tmp_path):
+    """Two per-request directories laid out the way AIWorkHub makes them."""
+    worktrees = tmp_path / ".aiworkhub" / "runtime" / "worktrees"
+    home = worktrees / "req_a" / "home"
+    for relative in ("task_mcp_worker_runtime", ".config/kilo", "plain/deep"):
+        (home / relative).mkdir(parents=True)
+    other = worktrees / "req_b" / "home" / "task_mcp_worker_runtime"
+    other.mkdir(parents=True)
+    return home, other
+
+
+def _protect(fake, *paths):
+    fake.protected_paths = frozenset(os.path.normcase(str(p)) for p in paths)
+
+
+def test_protected_descendants_are_granted_and_revoked_with_their_directory(tmp_path):
+    home, _ = _request_tree(tmp_path)
+    runtime, config, kilo = (
+        home / "task_mcp_worker_runtime", home / ".config", home / ".config" / "kilo"
+    )
+    fake = FakeWin32Api()
+    _protect(fake, runtime, config, kilo)
+    launch = launch_appcontainer(
+        make_request(filesystem_grants=[ContainerGrant(str(home), "modify")]), api=fake
+    )
+
+    granted = _grant_events(fake)
+    # HOME first, then each protected directory with HOME's access -- a
+    # protected parent before its protected child; plain/ and plain/deep
+    # inherit HOME's ACE and get none of their own.
+    assert granted[0] == f"grant:modify:{home}"
+    assert sorted(granted[1:]) == sorted(
+        f"grant:modify:{path}" for path in (runtime, config, kilo)
+    )
+    assert granted.index(f"grant:modify:{config}") < granted.index(f"grant:modify:{kilo}")
+    assert len(launch.grants) == 4
+
+    fake.events.clear()
+    launch.close()
+    assert _grant_events(fake) == [
+        event.replace("grant:modify:", "revoke:") for event in reversed(granted)
+    ]
+
+
+def test_failure_unwind_revokes_the_protected_descendants_too(tmp_path):
+    home, _ = _request_tree(tmp_path)
+    runtime = home / "task_mcp_worker_runtime"
+    fake = FakeWin32Api(fail_at="create_process")
+    _protect(fake, runtime)
+    with pytest.raises(AppContainerError):
+        launch_appcontainer(
+            make_request(filesystem_grants=[ContainerGrant(str(home), "modify")]),
+            api=fake,
+        )
+    assert _grant_events(fake) == [
+        f"grant:modify:{home}",
+        f"grant:modify:{runtime}",
+        f"revoke:{runtime}",
+        f"revoke:{home}",
+    ]
+    assert_no_leak(fake)
+
+
+def test_a_reparse_point_is_never_followed_out_of_the_request_directory(tmp_path):
+    home, other = _request_tree(tmp_path)
+    # A link inside req_a's HOME into req_b's HOME: were it followed, req_b's
+    # protected runtime directory -- another request's files -- would be
+    # granted to this container.
+    _make_link(other.parent, home / "link")
+    fake = FakeWin32Api()
+    _protect(fake, home / "link", home / "link" / "task_mcp_worker_runtime", other)
+    launch_appcontainer(
+        make_request(filesystem_grants=[ContainerGrant(str(home), "modify")]), api=fake
+    )
+
+    assert _grant_events(fake) == [f"grant:modify:{home}"]
+    assert not any("link" in path or "req_b" in path for path in fake.dacl_queries)
+    request_dir = os.path.normcase(str(home.parent))
+    for event in _grant_events(fake):
+        path = os.path.normcase(event.split(":", 2)[2])
+        assert wac._within(path, request_dir), event
+
+
+def test_a_descendant_swapped_for_a_link_after_the_walk_is_refused(tmp_path):
+    home, other = _request_tree(tmp_path)
+    runtime = home / "task_mcp_worker_runtime"
+
+    class SwapsAfterWalk(FakeWin32Api):
+        def dacl_protected(self, path):
+            protected = super().dacl_protected(path)
+            if protected:  # swap it for a link between the walk and the grant
+                runtime.rmdir()
+                _make_link(other, runtime)
+            return protected
+
+    fake = SwapsAfterWalk()
+    _protect(fake, runtime)
+    with pytest.raises(AppContainerError) as excinfo:
+        launch_appcontainer(
+            make_request(filesystem_grants=[ContainerGrant(str(home), "modify")]),
+            api=fake,
+        )
+    # _validate_grants re-runs over the expanded plan before any Win32 call.
+    assert excinfo.value.reason is AppContainerReason.INVALID_REQUEST
+    assert "reparse point" in excinfo.value.detail
+    assert fake.events == []
+
+
+def test_persistent_grants_are_never_walked(tmp_path):
+    provider = tmp_path / "npm"
+    (provider / "pkg").mkdir(parents=True)
+    fake = FakeWin32Api()
+    _protect(fake, provider / "pkg")
+    launch_appcontainer(
+        make_request(
+            filesystem_grants=[ContainerGrant(str(provider), "read_execute", persistent=True)]
+        ),
+        api=fake,
+    )
+    assert fake.dacl_queries == []
+    assert _grant_events(fake) == [f"grant:read_execute:{provider}"]
+
+
+def test_the_walk_is_bounded_and_fails_closed_before_any_grant(tmp_path, monkeypatch):
+    home, _ = _request_tree(tmp_path)  # five directories beneath HOME
+    monkeypatch.setattr(wac, "_DESCENDANT_WALK_LIMIT", 4)
+    fake = FakeWin32Api()
+    with pytest.raises(AppContainerError) as excinfo:
+        launch_appcontainer(
+            make_request(filesystem_grants=[ContainerGrant(str(home), "modify")]),
+            api=fake,
+        )
+    assert excinfo.value.reason is AppContainerReason.FILESYSTEM_GRANT_FAILED
+    assert "more than 4 directories" in excinfo.value.detail
+    assert fake.events == []
+
+
+def test_a_descendant_already_requested_is_granted_once(tmp_path):
+    home, _ = _request_tree(tmp_path)
+    runtime = home / "task_mcp_worker_runtime"
+    fake = FakeWin32Api()
+    _protect(fake, runtime)
+    launch_appcontainer(
+        make_request(
+            filesystem_grants=[
+                ContainerGrant(str(home), "modify"),
+                ContainerGrant(str(runtime), "modify"),
+            ]
+        ),
+        api=fake,
+    )
+    assert _grant_events(fake) == [f"grant:modify:{home}", f"grant:modify:{runtime}"]
+
+
+@pytest.mark.parametrize("protected", [False, True])
+def test_ctypes_dacl_protected_only_reads(tmp_path, monkeypatch, protected):
+    lib = FakeSecurityLib(protected=protected)
+    api = _security_api(lib, monkeypatch)
+    assert api.dacl_protected(str(tmp_path)) is protected
+    assert lib.entries == [] and lib.set_calls == []
+    assert lib.freed == [111]

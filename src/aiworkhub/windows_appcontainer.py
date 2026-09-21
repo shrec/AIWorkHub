@@ -530,6 +530,8 @@ class Win32Api(Protocol):
 
     def revoke_path_access(self, grant: _PathGrant) -> None: ...
 
+    def dacl_protected(self, path: str) -> bool: ...
+
     def build_security_capabilities(
         self, identity: _Identity, capability_sids: Sequence[str]
     ) -> _SecurityCapabilities: ...
@@ -1197,6 +1199,7 @@ def launch_appcontainer(
                 detail="AppContainer launch requires Windows (os.name=='nt').",
             )
         api = _load_win32()
+    grant_plan = _with_protected_descendants(request.filesystem_grants, api)
 
     name, display_name, description = derive_container_identity(
         request.repo_id, request.worker_kind
@@ -1244,8 +1247,14 @@ def launch_appcontainer(
         # within the same few ms can lose one ACE (read-modify-write DACL); that
         # launch fails closed with access denied and the next one re-grants.
         # Serialize grants behind a machine-wide mutex if that is ever seen.
+        #
+        # ``grant_plan`` is the request's grants plus, after each revocable
+        # directory, the protected directories beneath it
+        # (:func:`_with_protected_descendants`): each is one more revocable
+        # grant through this same loop, so failure unwind and close() revoke
+        # them exactly like the directory they came from.
         grants: list[_PathGrant] = []
-        for grant in request.filesystem_grants:
+        for grant in grant_plan:
             applied: _PathGrant = _step(
                 "grant_path_access",
                 partial(
@@ -1484,6 +1493,90 @@ def _validate_grants(grants: Sequence[ContainerGrant]) -> None:
 def _within(child: str, parent: str) -> bool:
     """``child`` equals ``parent`` or lies beneath it (both normcased)."""
     return (child.rstrip(os.sep) + os.sep).startswith(parent.rstrip(os.sep) + os.sep)
+
+
+# Directories a protected-descendant walk may visit before it fails closed.
+# Measured on Windows 11 26200 (scandir + one DACL read per directory): a
+# request HOME, 6 dirs, 0.3 ms; a sparse request worktree, 6 dirs, 1.1 ms; a
+# full source checkout, 55 dirs, 5.4 ms -- about 0.1 ms per directory, so the
+# bound caps a pathological tree near two seconds.
+_DESCENDANT_WALK_LIMIT = 20_000
+
+
+def _plain_directory(entry: os.DirEntry[str]) -> bool:
+    """A real directory: never a symlink, junction or other reparse point."""
+    if entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
+        return False
+    attributes = getattr(entry.stat(follow_symlinks=False), "st_file_attributes", 0)
+    return not attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT
+
+
+def _protected_descendants(root: str, is_protected: Callable[[str], bool]) -> list[str]:
+    """Directories beneath ``root`` whose DACL is protected, parents first.
+
+    Reparse points are neither returned nor entered.  More than
+    ``_DESCENDANT_WALK_LIMIT`` directories raises ``OSError``.
+    """
+    found: list[str] = []
+    pending = [root]
+    visited = 0
+    while pending:
+        with os.scandir(pending.pop()) as entries:
+            for entry in entries:
+                if not _plain_directory(entry):
+                    continue
+                visited += 1
+                if visited > _DESCENDANT_WALK_LIMIT:
+                    raise OSError(
+                        f"more than {_DESCENDANT_WALK_LIMIT} directories beneath {root!r}"
+                    )
+                if is_protected(entry.path):
+                    found.append(entry.path)
+                pending.append(entry.path)
+    return found
+
+
+def _with_protected_descendants(
+    grants: Sequence[ContainerGrant], api: Win32Api
+) -> list[ContainerGrant]:
+    """``grants``, each revocable directory followed by the protected
+    directories beneath it, granted the same access.
+
+    A directory grant is one inheritable ACE, and a protected DACL stops
+    inheritance.  AIWorkHub creates owner-private subdirectories inside its
+    per-request directories -- measured: ``home\\task_mcp_worker_runtime``
+    kept the container out of ``claude_mcp_config.json`` (EPERM) although
+    HOME itself was granted -- so each protected directory gets its own ACE.
+    Only revocable grants are walked: they name one request's own
+    directories, while a persistent grant names a shared install root, whose
+    protected corners are not the container's business.  Every added path
+    passes :func:`_validate_grants` like the rest.
+    """
+    seen = {os.path.normcase(os.path.normpath(grant.path)) for grant in grants}
+    plan: list[ContainerGrant] = []
+    for grant in grants:
+        plan.append(grant)
+        if grant.persistent or not os.path.isdir(grant.path):
+            continue
+        try:
+            descendants: list[str] = _step(
+                "grant_path_access",
+                partial(_protected_descendants, grant.path, api.dacl_protected),
+            )
+        except OSError as exc:
+            raise AppContainerError(
+                AppContainerReason.FILESYSTEM_GRANT_FAILED,
+                detail=f"cannot walk {grant.path!r} for protected directories: {exc}",
+                operation="grant_path_access",
+            ) from exc
+        for path in descendants:
+            key = os.path.normcase(os.path.normpath(path))
+            if key not in seen:
+                seen.add(key)
+                plan.append(ContainerGrant(path, grant.access))
+    if len(plan) > len(grants):
+        _validate_grants(plan)
+    return plan
 
 
 def _validate_environment(environment: Mapping[str, str]) -> None:
@@ -1911,6 +2004,30 @@ class _CtypesWin32Api:
             grant.revoke_error = exc.win_error or -1
         except Exception:
             grant.revoke_error = -1
+
+    def dacl_protected(self, path: str) -> bool:
+        """Whether ``path``'s DACL is protected from inheritance (read only)."""
+        a = self._advapi32
+        descriptor = wintypes.LPVOID()
+        dacl = wintypes.LPVOID()
+        status = a.GetNamedSecurityInfoW(
+            path, _SE_FILE_OBJECT, _DACL_SECURITY_INFORMATION,
+            None, None, ctypes.byref(dacl), None, ctypes.byref(descriptor),
+        )
+        if status or not descriptor.value:
+            raise _Win32Failure(int(status), "grant_path_access", f"read DACL {path}")
+        try:
+            control = wintypes.WORD()
+            revision = wintypes.DWORD()
+            if not a.GetSecurityDescriptorControl(
+                descriptor, ctypes.byref(control), ctypes.byref(revision)
+            ):
+                raise _Win32Failure(
+                    _last_win_error(), "grant_path_access", f"read control {path}"
+                )
+            return bool(control.value & _SE_DACL_PROTECTED)
+        finally:
+            self._kernel32.LocalFree(descriptor)
 
     def _set_sid_entry(
         self, path: str, sid: bytes, mode: int, mask: int, inherit: int, operation: str
