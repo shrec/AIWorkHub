@@ -5935,7 +5935,10 @@ def create_combined_validation_workspace(
         raise WorkspaceError(f"combined_tree_path_limit_exceeded:{len(union_allowed)}")
     union_card = dict(card)
     union_card["allowed_writes"] = union_allowed
-    request_id = f"union_{source_workspace.request_id[:70]}_{uuid.uuid4().hex[:16]}"
+    source_digest = hashlib.sha256(
+        source_workspace.request_id.encode("utf-8")
+    ).hexdigest()[:32]
+    request_id = f"union2_{source_digest}_{uuid.uuid4().hex[:16]}"
     combined = create_workspace(repo, request_id, union_card, "validation")
     try:
         # ``create_workspace`` seeds only the sparse candidate/import closure, so

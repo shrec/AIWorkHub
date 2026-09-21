@@ -311,6 +311,43 @@ def _protected_attempt_ids(
     return protected, True, pinned_by, terminal_tasks
 
 
+def _is_live_combined_validation(
+    worktree_id: str, protected_ids: Mapping[str, str]
+) -> bool:
+    # The current union name binds a digest of the FULL source ID. The legacy
+    # name carried only its first 70 characters; retain that conservative
+    # fallback while old MCP processes may still create in-flight unions.
+    if worktree_id.startswith("union2_"):
+        source_digest, separator, nonce = worktree_id[7:].rpartition("_")
+        if not (
+            separator
+            and len(source_digest) == 32
+            and all(char in "0123456789abcdef" for char in source_digest)
+            and len(nonce) == 16
+            and all(char in "0123456789abcdef" for char in nonce)
+        ):
+            return False
+        return any(
+            reason == "live_worker"
+            and hashlib.sha256(source_id.encode("utf-8")).hexdigest()[:32]
+            == source_digest
+            for source_id, reason in protected_ids.items()
+        )
+    if not worktree_id.startswith("union_"):
+        return False
+    source_prefix, separator, nonce = worktree_id[6:].rpartition("_")
+    if not (
+        separator
+        and len(nonce) == 16
+        and all(char in "0123456789abcdef" for char in nonce)
+    ):
+        return False
+    return any(
+        reason == "live_worker" and source_id[:70] == source_prefix
+        for source_id, reason in protected_ids.items()
+    )
+
+
 def plan_worktree_reclaim(
     repo_root: Path | str,
     scan: Mapping[str, Any],
@@ -358,6 +395,12 @@ def plan_worktree_reclaim(
     protection_reasons: dict[str, str] = {}
     for wt in scan.get("worktrees") or []:
         wt_id = str(wt.get("id") or "")
+        # The request ledger names only the source attempt; the union is an
+        # ephemeral child that must survive until that attempt leaves review.
+        if _is_live_combined_validation(wt_id, protected_ids):
+            would_keep.append(wt)
+            protection_reasons[wt_id] = "live_combined_validation"
+            continue
         terminal_needfix_orphan = (
             needfix_lineage_verified
             and wt.get("ownership_source") == "request_ledger"
@@ -867,7 +910,7 @@ class _PreviewProgress:
         self._lock = threading.Lock()
         self._configured = False
         self._repo_common_dir = ""
-        self._protected_ids: frozenset[str] = frozenset()
+        self._protected_ids: dict[str, str] = {}
         self._lineage_verified = False
         self._min_age_seconds = 0
         self._now: float | None = None
@@ -886,7 +929,7 @@ class _PreviewProgress:
     ) -> None:
         with self._lock:
             self._repo_common_dir = repo_common_dir or ""
-            self._protected_ids = frozenset(protected_ids or ())
+            self._protected_ids = dict(protected_ids or {})
             self._lineage_verified = bool(lineage_verified)
             self._min_age_seconds = max(0, min(int(min_age_days), 3650)) * 86400
             self._now = time.time() if now is None else float(now)
@@ -917,7 +960,9 @@ class _PreviewProgress:
                 return
             if worktree.get("class") == worktree_storage.CLASS_ORPHANED:
                 return
-            if wt_id in self._protected_ids:
+            if wt_id in self._protected_ids or _is_live_combined_validation(
+                wt_id, self._protected_ids
+            ):
                 return
             eligible_class = worktree.get("class") == worktree_storage.CLASS_REMOVABLE_SAFE
             if not (eligible_class or self._lineage_verified):
