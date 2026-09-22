@@ -219,7 +219,7 @@ def resume_argv(backend_id: str, argv: Sequence[str], conversation_id: str) -> l
     return tokens[:index] + [flag, conversation_id] + tokens[index:]
 
 
-def _spawn_cli(argv: Sequence[str], cwd: str | None) -> Any:
+def _spawn_cli(argv: Sequence[str], cwd: str | None, stdin_text: str | None = None) -> Any:
     """Start one non-interactive CLI turn in its own process group; argv list, no shell."""
     grouping: dict[str, Any] = (
         {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
@@ -228,10 +228,10 @@ def _spawn_cli(argv: Sequence[str], cwd: str | None) -> Any:
     )
     # The argv list comes from build_runtime_command; shell=False is the default
     # and is never overridden, so no provider text is ever interpreted as a command.
-    return subprocess.Popen(
+    process = subprocess.Popen(
         list(argv),
         cwd=cwd,
-        stdin=subprocess.DEVNULL,
+        stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -240,6 +240,21 @@ def _spawn_cli(argv: Sequence[str], cwd: str | None) -> Any:
         bufsize=1,
         **grouping,
     )
+    if stdin_text is not None:
+
+        def _feed() -> None:
+            try:
+                process.stdin.write(stdin_text)
+            except (OSError, ValueError):
+                pass
+            finally:
+                try:
+                    process.stdin.close()
+                except OSError:
+                    pass
+
+        threading.Thread(target=_feed, daemon=True).start()
+    return process
 
 
 def _decode(raw: str) -> Mapping[str, Any] | None:
@@ -329,7 +344,7 @@ class CliManagerBackend:
         mcp_config_path: Path | str | None = None,
         timeout_seconds: float = DEFAULT_TURN_TIMEOUT_SECONDS,
         plan_builder: Callable[..., Any] = runtime_adapters.build_manager_command,
-        spawn: Callable[[Sequence[str], str | None], Any] = _spawn_cli,
+        spawn: Callable[[Sequence[str], str | None, str | None], Any] = _spawn_cli,
     ) -> None:
         if backend_id not in MANAGER_BACKEND_IDS:
             raise ManagerLoopError(f"manager_backend_unsupported:{backend_id}")
@@ -391,7 +406,9 @@ class CliManagerBackend:
             yield _turn_error("launch_plan", plan.validation_reason or "plan_not_launchable")
             return
         try:
-            process = self._spawn(self.argv_for(plan), plan.cwd)
+            process = self._spawn(
+                self.argv_for(plan), plan.cwd, getattr(plan, "stdin_text", None)
+            )
         except OSError as exc:
             yield _turn_error("spawn", f"{type(exc).__name__}: {exc}")
             return

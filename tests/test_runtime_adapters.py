@@ -52,7 +52,6 @@ def test_claude_argv_is_current_noninteractive_shape(monkeypatch, tmp_path):
     assert plan.argv == [
         str(executable),
         "-p",
-        "Implement the focused change",
         "--output-format",
         "stream-json",
         "--verbose",
@@ -66,6 +65,7 @@ def test_claude_argv_is_current_noninteractive_shape(monkeypatch, tmp_path):
         "--model",
         "claude-sonnet-current",
     ]
+    assert plan.stdin_text == "Implement the focused change"
 
 
 def test_claude_partial_stream_is_opt_in_for_explicit_live_budget(
@@ -106,7 +106,6 @@ def test_claude_omits_model_when_not_requested(monkeypatch, tmp_path):
     assert plan.argv == [
         str(executable),
         "-p",
-        "Prompt",
         "--output-format",
         "stream-json",
         "--verbose",
@@ -118,6 +117,7 @@ def test_claude_omits_model_when_not_requested(monkeypatch, tmp_path):
         "--disallowedTools",
         *runtime_adapters.claude_disallowed_tools(read_only=False),
     ]
+    assert plan.stdin_text == "Prompt"
 
 
 def test_a_read_only_role_gets_a_read_only_argv(monkeypatch, tmp_path):
@@ -243,9 +243,10 @@ def test_codex_argv_preserves_spaces_and_unicode(monkeypatch, tmp_path):
         str(repo.resolve()),
         "--model",
         "gpt model Ω",
-        prompt,
+        "-",
     ]
-    assert plan.argv[-1] == prompt
+    assert plan.argv[-1] == "-"
+    assert plan.stdin_text == prompt
     assert plan.cwd == str(repo.resolve())
     assert plan.launchable is True
 

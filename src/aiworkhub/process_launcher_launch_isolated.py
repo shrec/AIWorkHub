@@ -1240,16 +1240,31 @@ def launch_isolated(
             ):
                 raise _ReviewerReservationTerminalized(reserved_request_id)
             launch_phase = "supervisor_spawn"
+            stdin_text = getattr(plan, "stdin_text", None)
             process = self._popen(
                 [sys.executable, str(supervisor), "--spec", str(spec_path)],
                 cwd=launch_cwd,
                 env=launch_env,
-                stdin=subprocess.DEVNULL,
+                stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 shell=False,
                 **process_group_launch_kwargs(os.name),
             )
+            if stdin_text is not None:
+
+                def _feed_supervisor_stdin() -> None:
+                    try:
+                        process.stdin.write(stdin_text.encode("utf-8"))
+                    except (OSError, ValueError):
+                        pass
+                    finally:
+                        try:
+                            process.stdin.close()
+                        except OSError:
+                            pass
+
+                threading.Thread(target=_feed_supervisor_stdin, daemon=True).start()
             started_at = _utcnow()
             launch_phase = "supervisor_pid_identity"
             start_ticks = _pid_start_ticks(process.pid)

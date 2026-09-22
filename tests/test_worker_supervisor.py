@@ -1343,7 +1343,7 @@ def test_fake_clock_simulated_appcontainer_hard_deadline(
     monkeypatch.setattr(
         worker_supervisor,
         "_launch_appcontainer_process",
-        lambda argv, cwd, launched_spec: process,
+        lambda argv, cwd, launched_spec, **_kwargs: process,
     )
     started_mono = clock.mono
     code = worker_supervisor.supervise(spec)

@@ -687,6 +687,7 @@ class RuntimeAdapterPlan:
     validation_reason: str
     reasoning_decision: reasoning_policy.ReasoningDecision | None = None
     context_capacity: int | None = None
+    stdin_text: str | None = None
 
     @property
     def reason(self) -> str:
@@ -1764,11 +1765,11 @@ def build_runtime_command(
         if route_effort.applied and route_effort.applied_key is not None:
             effort_tokens = _effort_flag_tokens(adapter_id, route_effort.applied_key)
 
+    stdin_text: str | None = None
     if adapter_id == "claude_cli":
         argv = [
             executable,
             "-p",
-            prompt,
             "--output-format",
             "stream-json",
             "--verbose",
@@ -1790,6 +1791,7 @@ def build_runtime_command(
         if model is not None:
             argv.extend(("--model", model))
         argv.extend(effort_tokens)
+        stdin_text = prompt
     elif adapter_id == "codex_cli":
         if outer_sandbox_backend in {"landlock", "bubblewrap"}:
             codex_sandbox_mode = "danger-full-access"
@@ -1817,7 +1819,8 @@ def build_runtime_command(
         if model is not None:
             argv.extend(("--model", model))
         argv.extend(effort_tokens)
-        argv.append(prompt)
+        argv.append("-")
+        stdin_text = prompt
     elif adapter_id == GROK_KILO_ADAPTER:
         resolved_model, model_error = resolve_grok_kilo_model(model)
         if model_error:
@@ -1902,6 +1905,7 @@ def build_runtime_command(
         validation_reason="",
         reasoning_decision=reasoning_decision,
         context_capacity=context_capacity,
+        stdin_text=stdin_text,
     )
 
 
@@ -1980,6 +1984,7 @@ def inject_worker_mcp_config(
         validation_reason=plan.validation_reason,
         reasoning_decision=plan.reasoning_decision,
         context_capacity=plan.context_capacity,
+        stdin_text=plan.stdin_text,
     )
 
 

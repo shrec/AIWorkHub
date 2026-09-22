@@ -95,14 +95,16 @@ class FakeCli:
         )
         self.prompts: list[str] = []
         self.argv_calls: list[list[str]] = []
+        self.stdin_texts: list[str | None] = []
         self.children: list[Any] = []
 
     def plan_builder(self, backend_id: str, prompt: str, repo: Any, *, model: str = "") -> Any:
         self.prompts.append(prompt)
         return SimplePlan(_ADAPTER_SHAPES[backend_id](prompt, model), str(repo))
 
-    def spawn(self, argv: Any, cwd: str | None) -> Any:
+    def spawn(self, argv: Any, cwd: str | None, stdin_text: str | None = None) -> Any:
         self.argv_calls.append(list(argv))
+        self.stdin_texts.append(stdin_text)
         child = subprocess.Popen(
             [sys.executable, str(self.script), str(self.config)],
             cwd=cwd,
@@ -123,9 +125,10 @@ class FakeCli:
 class SimplePlan:
     """The launchable subset of RuntimeAdapterPlan this backend reads."""
 
-    def __init__(self, argv: list[str], cwd: str) -> None:
+    def __init__(self, argv: list[str], cwd: str, stdin_text: str | None = None) -> None:
         self.argv = argv
         self.cwd = cwd
+        self.stdin_text = stdin_text
         self.launchable = True
         self.validation_reason = ""
 
@@ -360,6 +363,26 @@ def test_an_unlaunchable_plan_is_one_error_event_rather_than_a_launch(tmp_path: 
     assert events[0]["payload"]["error"], "the refusal must name its reason"
     cli.close()
 
+
+def test_cli_manager_backend_feeds_stdin_text_to_spawn(tmp_path: Path):
+    """NF-2026-00042: a plan's stdin_text reaches the spawn seam, not the argv."""
+    fake = FakeCli(tmp_path, [[{"type": "result"}]])
+
+    def plan_builder(backend_id: str, prompt: str, repo: Any, *, model: str = "") -> Any:
+        return SimplePlan(["claude", "-p"], str(repo), stdin_text=prompt)
+
+    cli = mlb.CliManagerBackend(
+        "claude_cli",
+        "fixture-model",
+        fake.root,
+        plan_builder=plan_builder,
+        spawn=fake.spawn,
+    )
+    cli.start("brief")
+    drain(cli.send("go"))
+    cli.close()
+
+    assert fake.stdin_texts == ["brief\n\ngo"]
 
 def test_the_production_spawn_and_kill_path_runs_for_real():
     """``_spawn_cli`` and ``_end_process`` are what ships, so they are exercised here."""

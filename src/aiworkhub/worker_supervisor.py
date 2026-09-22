@@ -561,8 +561,25 @@ def _worker_filesystem_grants(
     ]
 
 
+def _feed_and_close_stdin(stream: BinaryIO, text: str) -> None:
+    """Write text to stream and close it from a thread, so a non-reading child cannot block the caller."""
+
+    def _write() -> None:
+        try:
+            stream.write(text.encode("utf-8"))
+        except (OSError, ValueError):
+            pass
+        finally:
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+    threading.Thread(target=_write, daemon=True).start()
+
+
 def _launch_appcontainer_process(
-    argv: list[str], cwd: str, spec: dict[str, Any]
+    argv: list[str], cwd: str, spec: dict[str, Any], *, stdin_text: str | None = None
 ) -> _AppContainerProcess:
     # Identity is checked before a single handle is opened.  A blank or absent
     # repo_id/worker_kind cannot name the repo-scoped AppContainer profile this
@@ -583,10 +600,17 @@ def _launch_appcontainer_process(
     launch: windows_appcontainer.AppContainerLaunch | None = None
     pipe: Any = None
     bridge: _WorkerMcpBridge | None = None
-    stdin_fd = os.open(os.devnull, os.O_RDONLY)
+    stdin_write_fd: int | None = None
+    if stdin_text is None:
+        stdin_fd = os.open(os.devnull, os.O_RDONLY)
+    else:
+        stdin_fd, stdin_write_fd = os.pipe()
+        os.set_inheritable(stdin_fd, True)
     stdout_read, stdout_write = os.pipe()
     stderr_read, stderr_write = os.pipe()
-    fds = (stdin_fd, stdout_read, stdout_write, stderr_read, stderr_write)
+    fds = (stdin_fd, stdout_read, stdout_write, stderr_read, stderr_write) + (
+        (stdin_write_fd,) if stdin_write_fd is not None else ()
+    )
     try:
         os.set_inheritable(stdout_write, True)
         os.set_inheritable(stderr_write, True)
@@ -623,6 +647,8 @@ def _launch_appcontainer_process(
             bridge.start(launch.job)
         os.close(stdout_write)
         os.close(stderr_write)
+        if stdin_write_fd is not None:
+            _feed_and_close_stdin(os.fdopen(stdin_write_fd, "wb"), stdin_text)
         return _AppContainerProcess(
             launch,
             os.fdopen(stdout_read, "rb", buffering=0),
@@ -913,7 +939,7 @@ class _BoundedTailWriter:
                 pass
 
 
-def supervise(spec: dict[str, Any]) -> int:
+def supervise(spec: dict[str, Any], *, stdin_text: str | None = None) -> int:
     argv = _validated_argv(spec.get("argv"))
     cwd = str(spec["cwd"])
     timeout = int(spec["timeout_seconds"])
@@ -985,7 +1011,7 @@ def supervise(spec: dict[str, Any]) -> int:
         spawn_phase = "child_spawn"
         try:
             if execution_backend == "windows_appcontainer":
-                child = _launch_appcontainer_process(argv, cwd, spec)
+                child = _launch_appcontainer_process(argv, cwd, spec, stdin_text=stdin_text)
             elif execution_backend not in (None, ""):
                 # A spec that names a backend gets that backend or nothing.
                 # Silently falling through to the plain-subprocess branch on a
@@ -999,7 +1025,7 @@ def supervise(spec: dict[str, Any]) -> int:
                 popen_kwargs: dict[str, Any] = {
                     "cwd": cwd,
                     "env": os.environ.copy(),
-                    "stdin": subprocess.DEVNULL,
+                    "stdin": subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
                     "stdout": subprocess.PIPE,
                     "stderr": subprocess.PIPE,
                     "shell": False,
@@ -1010,6 +1036,8 @@ def supervise(spec: dict[str, Any]) -> int:
                 else:
                     popen_kwargs.update(_posix_worker_spawn_kwargs())
                 child = subprocess.Popen(argv, **popen_kwargs)
+                if stdin_text is not None:
+                    _feed_and_close_stdin(child.stdin, stdin_text)
                 if windows_job is not None:
                     spawn_phase = "job_assignment"
                     windows_job.assign(child)
@@ -1382,6 +1410,10 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--spec", required=True)
     args = parser.parse_args()
+    # The prompt (NF-2026-00042) arrives on our own stdin, never in the spec
+    # file: a plain-subprocess DEVNULL launch reads back empty bytes here.
+    raw_stdin = sys.stdin.buffer.read()
+    stdin_text = raw_stdin.decode("utf-8") if raw_stdin else None
     spec_path = Path(args.spec)
     try:
         spec = _load_spec(spec_path)
@@ -1391,7 +1423,7 @@ def main() -> None:
     finally:
         _unlink_if_regular(spec_path)
     try:
-        code = supervise(spec)
+        code = supervise(spec, stdin_text=stdin_text)
     except Exception as exc:
         status_raw = spec.get("status_path")
         if status_raw:

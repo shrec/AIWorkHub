@@ -61,6 +61,8 @@ def test_worker_and_manager_argv_are_equal_off_windows(tmp_path, monkeypatch):
     )
     assert "claude-opus-5" in manager_plan.argv
     assert manager_plan.argv == worker_plan.argv
+    assert worker_plan.stdin_text == "p"
+    assert manager_plan.stdin_text == "p"
 
 
 def test_manager_command_refuses_an_unknown_adapter(tmp_path):
