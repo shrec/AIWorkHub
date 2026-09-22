@@ -1740,6 +1740,7 @@ def test_host_git_refuses_everything_but_the_hardened_allowlist(tmp_path, monkey
     git = str(tmp_path / "bin" / "git.exe")
     for argv in (
         [git, "diff", "--check"],  # never unhardened
+        ["git", *_HARDENED_DIFF_CHECK],  # never a PATH search
         [git, "status"],
         [git, *_HARDENED_DIFF_CHECK, "HEAD"],
         [str(tmp_path / "bin" / "sh.exe"), *_HARDENED_DIFF_CHECK],

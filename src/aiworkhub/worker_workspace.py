@@ -12311,9 +12311,10 @@ _APPCONTAINER_DRAIN_JOIN_SECONDS = 30.0
 
 # NF-40: git cannot run inside the validation AppContainer.  Measured on
 # Windows 11 26200, git 2.45.2: it dies at startup with "Unable to read current
-# working directory" (its getcwd normalizes the path with
-# GetFinalPathNameByHandleW, denied even with the request directory and its
-# parent readable), and a linked worktree needs the canonical common .git,
+# working directory" -- its getcwd asks GetFinalPathNameByHandleW for the DOS
+# volume name, which no container may query (the NT and volume-less names
+# work; no file grant changes that) -- and a linked worktree needs the
+# canonical common .git,
 # whose .git, objects, objects\pack, refs, packed-refs and info are owned by
 # BUILTIN\Administrators with no WRITE_DAC for the user, so they cannot be
 # granted at all.  These exact read-only checks therefore run on the host with
@@ -12365,6 +12366,7 @@ def _run_host_readonly_git(
     git = Path(argv[0])
     if (
         git.stem.lower() != "git"
+        or not git.is_absolute()
         or tuple(argv[1:]) not in _HOST_READONLY_GIT_COMMANDS.values()
         or any(git.is_relative_to(root) for root in writable)
     ):
