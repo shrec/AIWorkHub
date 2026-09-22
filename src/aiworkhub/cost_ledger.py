@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from aiworkhub import core, launch_queue_persist, task_store
+from aiworkhub import claude_code_usage, core, launch_queue_persist, task_store
 
 
 USAGE_LINE_RE = re.compile(
@@ -902,7 +902,7 @@ def build_cost_ledger(
         usage_rows, manager_decisions, cards
     )
 
-    return {
+    result = {
         "tool": "aiworkhub_task_cost_ledger",
         "contract": "B288_v1_readonly_cost_ledger",
         "readonly": True,
@@ -981,3 +981,8 @@ def build_cost_ledger(
             "launch_log_ok": bool(launch_summary.get("ok")),
         },
     }
+    if repo_root is not None:
+        # Read-only surfacing of Claude Code's own transcript usage; never
+        # touches usage_rows/aggregates above, so existing attribution holds.
+        result["claude_code_sessions"] = claude_code_usage.collect_claude_code_usage(repo_root)
+    return result

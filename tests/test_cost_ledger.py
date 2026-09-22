@@ -1,3 +1,5 @@
+import json
+
 from aiworkhub import cost_ledger
 
 
@@ -686,3 +688,80 @@ def test_process_event_index_retains_telemetry_across_later_lifecycle_event(
     assert row["usage_observed"] is True
     assert event["status"] == "completed"
     assert event["finished_at"] == "2026-09-01T01:02:03+00:00"
+
+
+def test_build_cost_ledger_claude_code_sessions_not_found_when_config_dir_missing(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setattr(
+        cost_ledger.task_store, "list_usage_events", lambda _root, limit=10_000: []
+    )
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude_home_missing"))
+
+    result = cost_ledger.build_cost_ledger(repo_root=tmp_path)
+
+    section = result["claude_code_sessions"]
+    assert section["status"] == "not_found"
+    assert section["sessions"] == []
+    assert section["total_count"] == 0
+    assert section["returned_count"] == 0
+    assert section["truncated"] is False
+    assert result["counts"] == {"usage_rows": 0, "launch_rows": 0, "union_rows": 0}
+
+
+def test_build_cost_ledger_surfaces_measured_claude_code_sessions_without_changing_existing_aggregates(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setattr(
+        cost_ledger.task_store,
+        "list_usage_events",
+        lambda _root, limit=10_000: [{
+            "task_id": "T1",
+            "runner": "codex_runner",
+            "topic": "code",
+            "model": "gpt-5.5",
+            "provider": "openai",
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "total_tokens": 120,
+            "cost_usd": 0.0,
+            "created_at": "2026-08-03T01:02:03+00:00",
+        }],
+    )
+
+    config_dir = tmp_path / "claude_home"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir))
+    slug = cost_ledger.claude_code_usage._slugify(tmp_path)
+    project_dir = config_dir / "projects" / slug
+    project_dir.mkdir(parents=True)
+    (project_dir / "session-a.jsonl").write_text(
+        json.dumps({
+            "type": "assistant",
+            "timestamp": "2026-08-03T01:02:03.000Z",
+            "message": {
+                "id": "msg_1",
+                "role": "assistant",
+                "model": "claude-sonnet-5",
+                "content": [{"type": "text", "text": "hi"}],
+                "usage": {
+                    "input_tokens": 50,
+                    "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                    "output_tokens": 5,
+                },
+            },
+        }) + "\n",
+        encoding="utf-8",
+    )
+
+    result = cost_ledger.build_cost_ledger(repo_root=tmp_path, include_tasks=True)
+
+    section = result["claude_code_sessions"]
+    assert section["status"] == "measured"
+    assert section["total_count"] == 1
+    assert section["sessions"][0]["input_tokens"] == 50
+
+    # Existing attribution is untouched by the new section.
+    assert result["counts"] == {"usage_rows": 1, "launch_rows": 0, "union_rows": 1}
+    assert result["tasks"][0]["model"] == "gpt-5.5"
+    assert result["aggregates"]["by_model"]["gpt-5.5"]["total_tokens"] == 120
