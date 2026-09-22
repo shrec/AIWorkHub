@@ -1,0 +1,32 @@
+{
+  "providers": {
+    "allowed_adapters": [
+      "vscode_lm",
+      "claude_cli",
+      "codex_cli",
+      "deepseek_copilot_cli",
+      "deepseek_vscode_lm",
+      "glm_copilot_cli",
+      "glm_vscode_lm"
+    ]
+  },
+  "retention": {
+    "logs_days": 7,
+    "source_graph_generations": 3,
+    "terminal_runs_days": 30
+  },
+  "schema_id": "aiworkhub.repo_policy.v1",
+  "tools": {
+    "raw_discovery_forbidden": [
+      "grep",
+      "rg",
+      "find",
+      "tree"
+    ],
+    "session_memory_kb_required_for_nontrivial": true,
+    "source_graph_required_for_code": true
+  },
+  "validation": {
+    "required_check_ids": []
+  }
+}

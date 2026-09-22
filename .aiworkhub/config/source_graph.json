@@ -1,0 +1,14 @@
+{
+  "disabled_languages": [
+    "php"
+  ],
+  "exclude_dirs": [],
+  "exclude_globs": [
+    "eval/*.json",
+    "eval/**/*.json",
+    "eval/*.jsonl",
+    "eval/**/*.jsonl"
+  ],
+  "revision": 1,
+  "schema_id": "aiworkhub.source_graph.policy.v2"
+}

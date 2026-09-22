@@ -1,0 +1,470 @@
+{
+  "revision": 27,
+  "schema_id": "aiworkhub.workforce_catalog.v1",
+  "workers": [
+    {
+      "adapter_id": "claude_cli",
+      "enabled": true,
+      "implementation_worker": true,
+      "manager": true,
+      "manager_score_adjustment": 0.0,
+      "max_context_tokens": 200000,
+      "max_risk": "medium",
+      "model": "haiku",
+      "provider": "anthropic",
+      "quality_ceiling": 0.85,
+      "reviewer": false,
+      "supports": [
+        "mechanical",
+        "code",
+        "review"
+      ],
+      "tools": [
+        "filesystem",
+        "source-graph",
+        "session-manager",
+        "ai-memory",
+        "kb",
+        "semantic-edit"
+      ],
+      "worker_id": "claude-haiku"
+    },
+    {
+      "adapter_id": "claude_cli",
+      "enabled": true,
+      "implementation_worker": true,
+      "manager": true,
+      "manager_score_adjustment": 0.0,
+      "max_context_tokens": 1000000,
+      "max_risk": "high",
+      "model": "sonnet",
+      "provider": "anthropic",
+      "quality_ceiling": 0.97,
+      "reviewer": true,
+      "supports": [
+        "mechanical",
+        "code",
+        "research",
+        "linguistic",
+        "review"
+      ],
+      "tools": [
+        "filesystem",
+        "source-graph",
+        "session-manager",
+        "ai-memory",
+        "kb",
+        "semantic-edit"
+      ],
+      "worker_id": "claude-sonnet-5"
+    },
+    {
+      "adapter_id": "claude_cli",
+      "enabled": true,
+      "implementation_worker": true,
+      "manager": true,
+      "manager_score_adjustment": 0.0,
+      "max_context_tokens": 1000000,
+      "max_risk": "critical",
+      "model": "opus",
+      "provider": "anthropic",
+      "quality_ceiling": 1.0,
+      "reviewer": false,
+      "supports": [
+        "code",
+        "research",
+        "linguistic",
+        "review"
+      ],
+      "tools": [
+        "filesystem",
+        "source-graph",
+        "session-manager",
+        "ai-memory",
+        "kb",
+        "semantic-edit"
+      ],
+      "worker_id": "claude-opus-5"
+    },
+    {
+      "adapter_id": "codex_cli",
+      "enabled": false,
+      "implementation_worker": false,
+      "manager": true,
+      "manager_score_adjustment": 0.0,
+      "max_context_tokens": 921000,
+      "max_risk": "critical",
+      "model": "gpt-5.5",
+      "provider": "openai",
+      "quality_ceiling": 1.0,
+      "reviewer": false,
+      "supports": [
+        "mechanical",
+        "code",
+        "research",
+        "review"
+      ],
+      "tools": [
+        "filesystem",
+        "source-graph",
+        "session-manager",
+        "ai-memory",
+        "kb",
+        "semantic-edit"
+      ],
+      "worker_id": "gpt-5.5"
+    },
+    {
+      "adapter_id": "codex_cli",
+      "enabled": false,
+      "implementation_worker": false,
+      "manager": true,
+      "manager_score_adjustment": 0.0,
+      "max_context_tokens": 272000,
+      "max_risk": "high",
+      "model": "gpt-5.3-codex",
+      "provider": "openai",
+      "quality_ceiling": 0.96,
+      "reviewer": false,
+      "supports": [
+        "mechanical",
+        "code",
+        "review"
+      ],
+      "tools": [
+        "filesystem",
+        "source-graph"
+      ],
+      "worker_id": "gpt-5.3-codex"
+    },
+    {
+      "adapter_id": "codex_cli",
+      "enabled": false,
+      "implementation_worker": false,
+      "manager": true,
+      "manager_score_adjustment": 0.0,
+      "max_context_tokens": 272000,
+      "max_risk": "medium",
+      "model": "gpt-5.3-codex-spark",
+      "provider": "openai",
+      "quality_ceiling": 0.88,
+      "reviewer": false,
+      "supports": [
+        "mechanical",
+        "code"
+      ],
+      "tools": [
+        "filesystem",
+        "source-graph"
+      ],
+      "worker_id": "gpt-5.3-codex-spark"
+    },
+    {
+      "adapter_id": "deepseek_vscode_lm",
+      "enabled": true,
+      "implementation_worker": true,
+      "manager": true,
+      "manager_score_adjustment": 0.0,
+      "max_context_tokens": 128000,
+      "max_risk": "high",
+      "model": "deepseek-v4-pro",
+      "provider": "deepseek",
+      "quality_ceiling": 0.95,
+      "reviewer": true,
+      "supports": [
+        "mechanical",
+        "code",
+        "research",
+        "review"
+      ],
+      "tools": [
+        "filesystem",
+        "source-graph",
+        "session-manager",
+        "ai-memory",
+        "kb",
+        "semantic-edit"
+      ],
+      "worker_id": "deepseek-v4-pro"
+    },
+    {
+      "adapter_id": "deepseek_vscode_lm",
+      "enabled": true,
+      "implementation_worker": true,
+      "manager": true,
+      "manager_score_adjustment": 0.0,
+      "max_context_tokens": 1000000,
+      "max_risk": "medium",
+      "model": "deepseek-v4-flash",
+      "provider": "deepseek",
+      "quality_ceiling": 0.86,
+      "reviewer": false,
+      "supports": [
+        "mechanical",
+        "code"
+      ],
+      "tools": [
+        "filesystem",
+        "source-graph",
+        "session-manager",
+        "ai-memory",
+        "kb",
+        "semantic-edit"
+      ],
+      "worker_id": "deepseek-v4-flash"
+    },
+    {
+      "adapter_id": "glm_vscode_lm",
+      "enabled": true,
+      "implementation_worker": true,
+      "manager": true,
+      "manager_score_adjustment": 0.0,
+      "max_context_tokens": 1000000,
+      "max_risk": "high",
+      "model": "glm-5.2",
+      "provider": "zhipu",
+      "quality_ceiling": 0.95,
+      "reviewer": true,
+      "supports": [
+        "mechanical",
+        "code",
+        "research",
+        "review"
+      ],
+      "tools": [
+        "filesystem",
+        "source-graph",
+        "session-manager",
+        "ai-memory",
+        "kb",
+        "semantic-edit"
+      ],
+      "worker_id": "glm-5.2"
+    },
+    {
+      "adapter_id": "grok_kilo_cli",
+      "enabled": true,
+      "implementation_worker": true,
+      "manager": true,
+      "manager_score_adjustment": 0.0,
+      "max_context_tokens": 256000,
+      "max_risk": "high",
+      "model": "xai/grok-4.6",
+      "provider": "xai",
+      "quality_ceiling": 0.97,
+      "reviewer": false,
+      "supports": [
+        "mechanical",
+        "code",
+        "research",
+        "review"
+      ],
+      "tools": [
+        "filesystem",
+        "source-graph",
+        "session-manager",
+        "ai-memory",
+        "kb",
+        "semantic-edit"
+      ],
+      "worker_id": "grok-4.6"
+    },
+    {
+      "adapter_id": "codex_cli",
+      "enabled": false,
+      "implementation_worker": false,
+      "manager": true,
+      "manager_score_adjustment": 0.0,
+      "max_context_tokens": 1000000,
+      "max_risk": "critical",
+      "model": "gpt-5.6-sol",
+      "provider": "openai",
+      "quality_ceiling": 1.0,
+      "reviewer": false,
+      "supports": [
+        "mechanical",
+        "code",
+        "research",
+        "review"
+      ],
+      "tools": [
+        "filesystem",
+        "source-graph",
+        "session-manager",
+        "ai-memory",
+        "kb",
+        "semantic-edit"
+      ],
+      "worker_id": "codex-gpt-5.6-sol"
+    },
+    {
+      "adapter_id": "vscode_lm",
+      "enabled": true,
+      "implementation_worker": true,
+      "manager": true,
+      "manager_score_adjustment": 0.0,
+      "max_context_tokens": 1000000,
+      "max_risk": "critical",
+      "model": "claude-opus-4.8",
+      "provider": "copilot",
+      "quality_ceiling": 1.0,
+      "reviewer": false,
+      "supports": [
+        "mechanical",
+        "code",
+        "research",
+        "review"
+      ],
+      "tools": [
+        "filesystem",
+        "source-graph",
+        "session-manager",
+        "ai-memory",
+        "kb",
+        "semantic-edit"
+      ],
+      "worker_id": "claude-opus-4.8"
+    },
+    {
+      "adapter_id": "vscode_lm",
+      "enabled": true,
+      "implementation_worker": true,
+      "manager": true,
+      "manager_score_adjustment": 0.0,
+      "max_context_tokens": 128000,
+      "max_risk": "medium",
+      "model": "kimi-k3",
+      "provider": "copilot",
+      "quality_ceiling": 0.9,
+      "reviewer": true,
+      "supports": [
+        "mechanical",
+        "code",
+        "research",
+        "review"
+      ],
+      "tools": [
+        "filesystem",
+        "source-graph",
+        "session-manager",
+        "ai-memory",
+        "kb",
+        "semantic-edit"
+      ],
+      "worker_id": "kimi-k3"
+    },
+    {
+      "adapter_id": "vscode_lm",
+      "enabled": true,
+      "implementation_worker": true,
+      "manager": true,
+      "manager_score_adjustment": 0.0,
+      "max_context_tokens": 1000000,
+      "max_risk": "high",
+      "model": "claude-sonnet-5",
+      "provider": "copilot",
+      "quality_ceiling": 0.97,
+      "reviewer": true,
+      "supports": [
+        "mechanical",
+        "code",
+        "research",
+        "linguistic",
+        "review"
+      ],
+      "tools": [
+        "filesystem",
+        "source-graph",
+        "session-manager",
+        "ai-memory",
+        "kb",
+        "semantic-edit"
+      ],
+      "worker_id": "copilot-claude-sonnet-5"
+    },
+    {
+      "adapter_id": "vscode_lm",
+      "enabled": true,
+      "implementation_worker": true,
+      "manager": true,
+      "manager_score_adjustment": 0.0,
+      "max_context_tokens": 200000,
+      "max_risk": "high",
+      "model": "claude-opus-5",
+      "provider": "copilot",
+      "quality_ceiling": 0.98,
+      "reviewer": false,
+      "supports": [
+        "code",
+        "research",
+        "linguistic",
+        "review"
+      ],
+      "tools": [
+        "filesystem",
+        "source-graph",
+        "session-manager",
+        "ai-memory",
+        "kb",
+        "semantic-edit"
+      ],
+      "worker_id": "copilot-claude-opus-5"
+    },
+    {
+      "adapter_id": "vscode_lm",
+      "enabled": true,
+      "implementation_worker": true,
+      "manager": true,
+      "manager_score_adjustment": 0.0,
+      "max_context_tokens": 0,
+      "max_risk": "high",
+      "model": "gpt-5.6-sol",
+      "provider": "copilot",
+      "quality_ceiling": 0.98,
+      "reviewer": true,
+      "supports": [
+        "mechanical",
+        "code",
+        "research",
+        "review"
+      ],
+      "tools": [
+        "filesystem",
+        "source-graph",
+        "session-manager",
+        "ai-memory",
+        "kb",
+        "semantic-edit"
+      ],
+      "worker_id": "copilot-gpt-5.6-sol"
+    },
+    {
+      "adapter_id": "deepseek_copilot_cli",
+      "enabled": true,
+      "implementation_worker": true,
+      "manager": true,
+      "manager_score_adjustment": 0.0,
+      "max_context_tokens": 128000,
+      "max_risk": "high",
+      "model": "deepseek-v4-pro",
+      "provider": "deepseek",
+      "quality_ceiling": 0.95,
+      "reviewer": false,
+      "supports": [
+        "mechanical",
+        "code",
+        "research",
+        "review"
+      ],
+      "tools": [
+        "filesystem",
+        "source-graph",
+        "session-manager",
+        "ai-memory",
+        "kb",
+        "semantic-edit"
+      ],
+      "worker_id": "deepseek-native-v4-pro"
+    }
+  ]
+}

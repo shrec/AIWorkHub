@@ -24,9 +24,30 @@ node_modules/
 /.bitnn/
 /.claude/settings.local.json
 .aiworkhub/*
+# Shared development assets: roadmap, recipes, skills, dev rules, KB, memory.
+# Everything else under .aiworkhub is host runtime state, secrets, or a rebuildable
+# index and stays local (runtime/, sessions/, source_graph/, spill/, temp/,
+# worktrees/, toolchain-authority/, task_queue.sqlite, per-host routing).
 !.aiworkhub/config/
 .aiworkhub/config/*
 !.aiworkhub/config/development_rules.json
+!.aiworkhub/config/features.json
+!.aiworkhub/config/models.json
+!.aiworkhub/config/policy.json
+!.aiworkhub/config/source_graph.json
+!.aiworkhub/config/workforce.json
+!.aiworkhub/kb/
+.aiworkhub/kb/*
+!.aiworkhub/kb/knowledge.sqlite
+!.aiworkhub/memory/
+.aiworkhub/memory/*
+!.aiworkhub/memory/memory.sqlite
+!.aiworkhub/tasking/
+.aiworkhub/tasking/*
+!.aiworkhub/tasking/roadmap.sqlite
+!.aiworkhub/tasking/tool_recipes.sqlite
+!.aiworkhub/tasking/skills.sqlite
+!.aiworkhub/tasking/needfix.sqlite
 !.aiworkhub/quality.json
 !.aiworkhub/eval-artifacts.json
 !.aiworkhub/source-graph-retrieval-eval.json

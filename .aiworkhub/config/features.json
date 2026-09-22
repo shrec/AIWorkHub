@@ -1,0 +1,12 @@
+{
+  "features": {
+    "ai_memory": true,
+    "context_graph": true,
+    "knowledge_base": true,
+    "session_manager": true,
+    "source_graph": true
+  },
+  "revision": 3,
+  "schema_id": "aiworkhub.feature_settings.v1",
+  "updated_at": "2026-09-19T12:39:58.241761+00:00"
+}
