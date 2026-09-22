@@ -152,7 +152,12 @@ class PartitionBuildReport:
         }
 
 
-def _admits(policy: sg.SourceGraphIgnorePolicy, relative: str) -> bool:
+def _admits(
+    policy: sg.SourceGraphIgnorePolicy,
+    relative: str,
+    *,
+    repo_root: Path | None = None,
+) -> bool:
     """Mirror the canonical :func:`source_graph.iter_source_files` admission.
 
     The base index admits a file only when the repository policy admits it, so
@@ -165,7 +170,8 @@ def _admits(policy: sg.SourceGraphIgnorePolicy, relative: str) -> bool:
     directory and file level. A path the policy rejects is skipped, exactly as a
     non-indexable ``.txt`` is -- never a build failure. Chosen over admitting a
     declared path unconditionally so the partition can never diverge from the
-    base's contents.
+    base's contents. When ``repo_root`` is given, a parent directory that is a
+    nested linked git worktree is refused exactly as the walk prunes it.
     """
 
     posix = Path(relative).as_posix()
@@ -174,6 +180,10 @@ def _admits(policy: sg.SourceGraphIgnorePolicy, relative: str) -> bool:
     parts = posix.split("/")
     for depth, name in enumerate(parts[:-1]):
         if name in policy.exclude_dirs or name.endswith(".egg-info"):
+            return False
+        if repo_root is not None and sg._is_nested_linked_worktree_dir(
+            repo_root, repo_root.joinpath(*parts[: depth + 1])
+        ):
             return False
         if sg._glob_ignored(
             "/".join(parts[: depth + 1]), policy.exclude_globs, is_dir=True
@@ -255,7 +265,7 @@ def build_partition(
                     f"quality_review_candidate_path_symlink:{relative}"
                 )
             if candidate.is_file():
-                if not _admits(policy, relative):
+                if not _admits(policy, relative, repo_root=repo_root):
                     files_skipped += 1
                     continue
                 result = sg.index_file(repo_root, relative, expected_hash)

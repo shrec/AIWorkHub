@@ -825,6 +825,40 @@ def _is_repository_root_generated_data_jsonl(relative_path: str) -> bool:
     return rel.startswith("data/") and rel.casefold().endswith(".jsonl")
 
 
+def _is_nested_linked_worktree_dir(repo_root: Path, directory: Path) -> bool:
+    """True when ``directory`` is a linked git worktree below ``repo_root``.
+
+    A linked worktree checkout carries a ``.git`` FILE whose ``gitdir:`` line
+    points at ``<main>/.git/worktrees/<name>``: only that shape is refused, so
+    the repository root itself, a submodule whose gitdir lives under
+    ``.git/modules/`` and a repository merely stored inside a folder named
+    ``worktrees`` all stay indexed. A malformed or unreadable ``.git`` file
+    never raises.
+    """
+    try:
+        if directory == repo_root:
+            return False
+        directory.relative_to(repo_root)
+    except ValueError:
+        return False
+    git_link = directory / ".git"
+    try:
+        if not git_link.is_file():
+            return False
+        text = git_link.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("gitdir:"):
+            continue
+        target = stripped[len("gitdir:") :].strip()
+        segments = Path(target).parts
+        if len(segments) >= 2 and segments[-2] == "worktrees":
+            return True
+    return False
+
+
 def iter_source_files(repo_root: Path) -> list[Path]:
     repo_root = repo_root.resolve()
     policy = load_ignore_policy(repo_root)
@@ -853,6 +887,8 @@ def iter_source_files(repo_root: Path) -> list[Path]:
             candidate = current_path / dirname
             rel = candidate.relative_to(repo_root).as_posix()
             if dirname in policy.exclude_dirs or dirname.endswith(".egg-info"):
+                continue
+            if _is_nested_linked_worktree_dir(repo_root, candidate):
                 continue
             if _glob_ignored(rel, policy.exclude_globs, is_dir=True):
                 continue
@@ -6041,11 +6077,18 @@ def _validate_single_file_path(repo_root: Path, path: str) -> Path:
     # Check exclude dirs and globs.
     policy = load_ignore_policy(repo_root)
     rel_posix = rel.as_posix()
-    # Check if any parent directory is excluded.
+    # Check if any parent directory is excluded, including a parent that is a
+    # nested linked git worktree the discovery walk would prune.
+    ancestor = ""
     for part in rel_posix.split("/")[:-1]:
+        ancestor = f"{ancestor}/{part}" if ancestor else part
         if part in policy.exclude_dirs or part.endswith(".egg-info"):
             raise SourceGraphError(
                 f"source_graph_single_file_excluded_dir:{part}"
+            )
+        if _is_nested_linked_worktree_dir(repo_root, repo_root / ancestor):
+            raise SourceGraphError(
+                f"source_graph_single_file_excluded_dir:{ancestor}"
             )
     if _glob_ignored(rel_posix, policy.exclude_globs):
         raise SourceGraphError(
