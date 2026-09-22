@@ -12445,11 +12445,18 @@ def _run_host_readonly_git(
             check=False,
             shell=False,
         )
+
     # "path:line: message." stays; the "+<line>" echo of the file is dropped.
-    echo_free = "".join(
-        line for line in result.stdout.splitlines(keepends=True) if not line.startswith("+")
+    # stdout is where git echoes content today. stderr is filtered the same way
+    # so that an unforeseen git error path cannot become a content channel.
+    def echo_free(text: str) -> str:
+        return "".join(
+            line for line in text.splitlines(keepends=True) if not line.startswith("+")
+        )
+
+    return subprocess.CompletedProcess(
+        result.args, result.returncode, echo_free(result.stdout), echo_free(result.stderr)
     )
-    return subprocess.CompletedProcess(result.args, result.returncode, echo_free, result.stderr)
 
 
 class _HostGitRefused(Exception):
