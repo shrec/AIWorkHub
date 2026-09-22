@@ -12455,11 +12455,13 @@ def _run_appcontainer_validation(
     # actually land in a sparse worker worktree that has to run this helper.
     from .repository_state import inspect_repository
     from .windows_appcontainer import (
+        APPCONTAINER_ANCESTORS_ENV,
         APPCONTAINER_PYTHON_SITE,
         AppContainerError,
         AppContainerLifecycleState,
         AppContainerRequest,
         ContainerGrant,
+        ancestor_stat_facts,
         appcontainer_worker_kind,
         is_python_executable,
         launch_appcontainer,
@@ -12470,6 +12472,7 @@ def _run_appcontainer_validation(
 
     repo_id = inspect_repository(workspace.repo).manifest.repo_id
     executable = str(argv[0]) if argv else ""
+    request_root = _appcontainer_request_root(workspace)
     if is_python_executable(executable):
         # NF-40: first on PYTHONPATH, ahead of every candidate component, so
         # no candidate module can shadow it; granted below like any other
@@ -12479,6 +12482,7 @@ def _run_appcontainer_validation(
             "PYTHONPATH": os.pathsep.join(
                 part for part in (APPCONTAINER_PYTHON_SITE, env.get("PYTHONPATH")) if part
             ),
+            APPCONTAINER_ANCESTORS_ENV: ancestor_stat_facts(str(request_root)),
         }
     # NF-2026-00025: the request's directories, read-only (never the cd subdir
     # a candidate could have made a junction), as on every other backend; HOME
@@ -12489,7 +12493,7 @@ def _run_appcontainer_validation(
     # ...`` command runs and its import roots.
     request_grants = [
         *request_scoped_grants(env),
-        ContainerGrant(str(_appcontainer_request_root(workspace)), "read_execute"),
+        ContainerGrant(str(request_root), "read_execute"),
     ]
     try:
         request_grants += python_read_grants(

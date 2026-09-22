@@ -1385,8 +1385,9 @@ def test_appcontainer_validation_gets_grants_but_no_network(
         grant(str(worktree), "read_execute"),
     ]
     assert not any(g.persistent for g in request.filesystem_grants)
-    # Not a Python: no PYTHONPATH appears.
+    # Not a Python: no PYTHONPATH, and no shim facts, appear.
     assert "PYTHONPATH" not in request.environment
+    assert windows_appcontainer.APPCONTAINER_ANCESTORS_ENV not in request.environment
 
 
 def test_appcontainer_validation_python_gets_its_interpreter_read_only_and_no_network(
@@ -1688,6 +1689,14 @@ def test_a_candidate_pythonpath_cannot_shadow_the_container_shim(
     request = launches[0].request
     assert request.environment["PYTHONPATH"].split(os.pathsep) == [
         windows_appcontainer.APPCONTAINER_PYTHON_SITE, str(workspace.path / "src")
+    ]
+    # The host's own lstat of exactly the directories above the request root:
+    # nothing the container can write, and nothing inside the request.
+    import json
+
+    ancestors = json.loads(request.environment[windows_appcontainer.APPCONTAINER_ANCESTORS_ENV])
+    assert list(ancestors) == [
+        os.path.normcase(str(parent)) for parent in workspace.path.parent.parents
     ]
     persistent = [g.path for g in request.filesystem_grants if g.persistent]
     assert windows_appcontainer.APPCONTAINER_PYTHON_SITE in persistent

@@ -3244,3 +3244,56 @@ def test_the_shim_final_path_never_names_a_different_file(tmp_path, monkeypatch)
         site._getfinalpathname(str(tmp_path / "missing.txt"))
     with pytest.raises(PermissionError):
         site._getfinalpathname("\\?\\" + str(tmp_path / "a.txt"))
+
+
+def test_ancestor_stat_facts_are_the_hosts_lstat_of_each_parent(tmp_path):
+    target = tmp_path / "worktrees" / "request"
+    target.mkdir(parents=True)
+    facts = json.loads(wac.ancestor_stat_facts(str(target)))
+    assert list(facts) == [os.path.normcase(str(parent)) for parent in target.parents]
+    fields = facts[os.path.normcase(str(tmp_path))]
+    real = os.lstat(tmp_path)
+    assert fields[:3] == [real.st_mode, real.st_ino, real.st_dev]
+    assert os.path.normcase(str(target)) not in facts  # never the request itself
+
+
+@windows_only
+def test_the_shim_reads_the_facts_the_lane_writes():
+    assert _appcontainer_site()._ANCESTORS_ENV == wac.APPCONTAINER_ANCESTORS_ENV
+
+
+@windows_only
+def test_the_shim_answers_a_denied_stat_only_for_a_brokered_directory(tmp_path):
+    import stat
+
+    site = _appcontainer_site()
+    target = tmp_path / "worktrees" / "request"
+    target.mkdir(parents=True)
+    facts = site._ancestor_facts(wac.ancestor_stat_facts(str(target)))
+    rebuilt = facts[os.path.normcase(str(tmp_path))]
+    assert os.path.samestat(rebuilt, os.lstat(tmp_path))
+    assert stat.S_ISDIR(rebuilt.st_mode) and not stat.S_ISLNK(rebuilt.st_mode)
+    assert rebuilt.st_file_attributes == os.lstat(tmp_path).st_file_attributes
+
+    calls = []
+
+    def _denied(path, *args, **kwargs):
+        calls.append(path)
+        raise PermissionError(5, "Access is denied", str(path))
+
+    brokered = site._brokered(_denied, facts)
+    assert brokered(tmp_path) is rebuilt
+    assert brokered(str(tmp_path).upper(), follow_symlinks=False) is rebuilt
+    for denied in (target, tmp_path / "other", os.fsencode(str(tmp_path)), 3):
+        with pytest.raises(PermissionError):
+            brokered(denied)
+    with pytest.raises(PermissionError):
+        brokered(tmp_path, dir_fd=3)
+
+    def _missing(path, *args, **kwargs):
+        raise FileNotFoundError(2, "missing", str(path))
+
+    with pytest.raises(FileNotFoundError):  # only a denial is ever answered
+        site._brokered(_missing, facts)(tmp_path)
+    real = site._brokered(os.lstat, facts)(target)
+    assert os.path.samestat(real, os.lstat(target))  # a granted path asks the OS

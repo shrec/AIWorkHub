@@ -1,10 +1,10 @@
 """Loaded first by every Python the Windows AppContainer validation lane runs.
 
-Two CPython calls do not work inside an AppContainer; this module gives each
+Three CPython calls do not work inside an AppContainer; this module gives each
 the host's result, only there.  The lane puts this directory first on
 PYTHONPATH for Windows AppContainer children only
 (``windows_appcontainer.APPCONTAINER_PYTHON_SITE``); nothing else imports it.
-Both measured in the validation container on Windows 11 26200, CPython 3.12.4.
+All measured in the validation container on Windows 11 26200, CPython 3.12.4.
 
 ``os.mkdir(path, 0o700)``: since 3.12.4 (CVE-2024-4030) it applies an
 explicit, protected DACL -- SYSTEM, Administrators, OWNER RIGHTS -- that names
@@ -28,15 +28,28 @@ letter needs the mount manager, which a container cannot query, while the
 the path is rebuilt from the input's drive letter and the object's
 ``VOLUME_NAME_NONE`` name, and returned only if it names the very same file
 (same volume serial and file index); otherwise the original error stands.
+
+And ``os.stat`` / ``os.lstat`` of the directories above the request's own
+directory: the container can stat none of them (WinError 5 on ``D:\\``,
+``D:\\Dev`` ...), and no grant can open a drive root, so code that walks a
+path from its drive root -- ``repository_state``'s symlink check -- refused
+every path.  When such a call is denied, the answer is the host's own
+``lstat`` of that exact directory, which the lane passes in
+``AIWORKHUB_APPCONTAINER_ANCESTORS`` (``windows_appcontainer.
+ancestor_stat_facts``).  Only those directories, only on a denial.
 """
 
 import ctypes
+import json
 import ntpath
 import os
 from ctypes import wintypes
 
 _mkdir = os.mkdir
+_stat = os.stat
+_lstat = os.lstat
 _getfinalpathname_host = ntpath._getfinalpathname
+_ANCESTORS_ENV = "AIWORKHUB_APPCONTAINER_ANCESTORS"
 
 _OPEN_EXISTING = 3
 _FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
@@ -86,7 +99,7 @@ def _getfinalpathname(path):
         relative = _volume_relative_name(path) if len(drive) == 2 else ""
         candidate = "\\\\?\\" + drive.upper() + relative
         try:
-            same = relative and ntpath.samestat(os.stat(candidate), os.stat(path))
+            same = relative and ntpath.samestat(_stat(candidate), _stat(path))
         except OSError:
             same = False
         if not same:
@@ -94,6 +107,35 @@ def _getfinalpathname(path):
         return candidate
 
 
+def _ancestor_facts(raw):
+    """``{normcased path: os.stat_result}`` from the lane's JSON."""
+    facts = {}
+    for key, fields in json.loads(raw or "{}").items():
+        facts[key] = os.stat_result(
+            fields[:10], {"st_file_attributes": fields[10], "st_reparse_tag": fields[11]}
+        )
+    return facts
+
+
+def _brokered(real, facts):
+    def call(path, *args, **kwargs):
+        try:
+            return real(path, *args, **kwargs)
+        except PermissionError:
+            try:
+                key = ntpath.normcase(ntpath.abspath(os.fspath(path)))
+            except TypeError:
+                key = None
+            if key not in facts or args or kwargs.get("dir_fd") is not None:
+                raise
+            return facts[key]
+
+    return call
+
+
 if __name__ == "sitecustomize":
     os.mkdir = _mkdir_inheriting
     ntpath._getfinalpathname = _getfinalpathname
+    _facts = _ancestor_facts(os.environ.get(_ANCESTORS_ENV))
+    os.stat = _brokered(_stat, _facts)
+    os.lstat = _brokered(_lstat, _facts)
