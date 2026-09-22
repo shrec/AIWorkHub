@@ -1670,6 +1670,7 @@ def build_runtime_command(
     read_only: bool = False,
     reasoning_decision: reasoning_policy.ReasoningDecision | None = None,
     context_capacity: int | None = None,
+    _manager_host: bool = False,
 ) -> RuntimeAdapterPlan:
     """Build a validated argv/cwd plan for one supported adapter.
 
@@ -1748,6 +1749,7 @@ def build_runtime_command(
         )
     if (
         _is_windows_host()
+        and not _manager_host
         and outer_sandbox_backend != WINDOWS_APPCONTAINER_SANDBOX_BACKEND
     ):
         return _invalid_plan(
@@ -1900,6 +1902,29 @@ def build_runtime_command(
         validation_reason="",
         reasoning_decision=reasoning_decision,
         context_capacity=context_capacity,
+    )
+
+
+def build_manager_command(
+    adapter_id: str,
+    prompt: str,
+    repo: PathValue,
+    *,
+    model: str | None = None,
+    executable_overrides: ExecutableOverrides | None = None,
+) -> RuntimeAdapterPlan:
+    """The owner's host-side manager seat, never a worker.
+
+    Returns build_runtime_command's plan without its Windows worker-confinement
+    refusal. Only manager_loop_backends may call it.
+    """
+    return build_runtime_command(
+        adapter_id,
+        prompt,
+        repo,
+        model=model,
+        executable_overrides=executable_overrides,
+        _manager_host=True,
     )
 
 

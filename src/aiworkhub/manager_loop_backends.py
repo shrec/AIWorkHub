@@ -39,10 +39,9 @@ Deliberately NOT reused, with the reason:
   provisions a sandbox and a worker MCP runtime around every launch. A manager
   turn is none of those, so this module spawns its own child directly.
 
-A line the translator does not recognize is skipped, never fatal. On a Windows
-host :func:`build_runtime_command` refuses a native CLI outside the
-AppContainer backend, so ``send`` there yields exactly one ``error`` event
-naming that refusal instead of launching unconfined.
+A line the translator does not recognize is skipped, never fatal. Each turn is
+planned by :func:`runtime_adapters.build_manager_command`, the host-side plan:
+a worker is confined, the owner's manager seat is not.
 """
 
 from __future__ import annotations
@@ -329,7 +328,7 @@ class CliManagerBackend:
         *,
         mcp_config_path: Path | str | None = None,
         timeout_seconds: float = DEFAULT_TURN_TIMEOUT_SECONDS,
-        plan_builder: Callable[..., Any] = runtime_adapters.build_runtime_command,
+        plan_builder: Callable[..., Any] = runtime_adapters.build_manager_command,
         spawn: Callable[[Sequence[str], str | None], Any] = _spawn_cli,
     ) -> None:
         if backend_id not in MANAGER_BACKEND_IDS:

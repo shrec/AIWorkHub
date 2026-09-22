@@ -420,7 +420,7 @@ def test_the_factory_refuses_a_backend_the_registry_does_not_declare(tmp_path: P
 def test_production_defaults_are_the_existing_repository_helpers():
     """The reuse this card is for, pinned: a respelling here would be caught."""
     signature = inspect.signature(mlb.CliManagerBackend.__init__)
-    assert signature.parameters["plan_builder"].default is runtime_adapters.build_runtime_command
+    assert signature.parameters["plan_builder"].default is runtime_adapters.build_manager_command
     assert signature.parameters["spawn"].default is mlb._spawn_cli
     factory_signature = inspect.signature(mlb.manager_backend_factory)
     assert (
