@@ -1,5 +1,26 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.60 — 2026-09-22
+
+### Added
+
+- Bundled runtime: the provider-neutral core of the AIWorkHub manager agent
+  loop. A manager session is persisted with a bounded event log, rehydrated
+  from a bounded brief (handoff, open cards, state, context, role rules), and
+  rotated with a handoff the next session starts from, so the managing model
+  can be changed without losing state. The chat panel and the server surface
+  that use it are the next releases.
+
+### Fixed
+
+- A validation-only replay grant is honoured from any verified manager route,
+  not only `codex`, so a Claude manager can recover a blocked card.
+
+### Changed
+
+- The shared development assets — roadmap, NeedFix backlog, tool recipes,
+  skills, KB, AI memory and the repository config — now travel with a clone.
+
 ## 0.11.59 — 2026-09-22
 
 ### Fixed

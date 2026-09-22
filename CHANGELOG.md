@@ -6,6 +6,39 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.60] - 2026-09-22
+
+### Added
+
+- **Manager agent loop core** (`src/aiworkhub/manager_loop.py`), the
+  provider-neutral half of the AIWorkHub-owned manager loop: a persisted
+  `ManagerSession` with a bounded JSONL event log, the `ManagerBackend`
+  protocol a provider adapter implements, a bounded and deterministic
+  rehydration `BriefBuilder` (handoff, open cards, state, context, rules), and
+  a `ManagerOrchestrator` that keeps one active session per repository and runs
+  one turn at a time — both refused with a named error, never queued. Rotation
+  asks the model for a handoff and falls back to a mechanical one built from
+  the event log; the backend and model may change between sessions because all
+  state lives in the stores. Nothing imports the module yet: the server
+  surface, callback consumption and the dashboard chat panel are the next
+  cards.
+
+### Fixed
+
+- A validation-only replay grant is now honoured from **any** verified manager
+  route, not only `codex`. `launch_replay_guard`, `process_launcher` and
+  `task_engine` share `core.VERIFIED_MANAGER_ACTORS`, so a Claude manager's
+  recovery of a blocked card no longer fails with
+  `validation_only_replay_actor_mismatch`.
+
+### Changed
+
+- The shared development assets — roadmap, NeedFix backlog, tool recipes,
+  skills, KB, AI memory and the repository config — are tracked in git, so a
+  clone carries them. Because each install allocates ids independently, a host
+  that already has records merges them row by row (colliding ids are
+  renumbered) instead of checking the databases out over its live ones.
+
 ## [0.11.59] - 2026-09-22
 
 ### Fixed

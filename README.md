@@ -62,6 +62,19 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
+## What's new in 0.11.60
+
+- The provider-neutral core of the AIWorkHub manager agent loop: one manager
+  session per repository, a bounded rehydration brief built from the durable
+  stores, one turn at a time, and rotation through a handoff — so the model
+  that manages a repository can be switched without losing state. The server
+  surface, callback wake-up and the dashboard chat panel follow.
+- A validation-only replay grant is honoured from any verified manager route,
+  not only `codex`.
+- The shared development assets — roadmap, NeedFix backlog, tool recipes,
+  skills, KB and AI memory — are tracked in git, so a clone carries the
+  project's own history.
+
 ## What's new in 0.11.59
 
 - Windows native `claude_cli` workers now run inside their AppContainer with

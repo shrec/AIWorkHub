@@ -14,6 +14,17 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.11.60
+
+- The provider-neutral core of the AIWorkHub manager agent loop: one manager
+  session per repository, a bounded rehydration brief, one turn at a time and
+  rotation through a handoff, so the managing model can be switched without
+  losing state.
+- A validation-only replay grant is honoured from any verified manager route,
+  not only `codex`.
+- Roadmap, NeedFix backlog, recipes, skills, KB and AI memory travel with a
+  clone.
+
 ## What's new in 0.11.59
 
 - Windows: bundled native `claude_cli` workers now run inside their
