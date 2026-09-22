@@ -836,6 +836,24 @@ def _isolated_worktree_base_oid(repo: Path, path: Path) -> str:
     worktree pointer, its round-trip backlink, ``commondir`` and detached HEAD
     encode the same facts without another process or an unbounded wait.
     """
+    admin_dir = _verified_worktree_admin_dir(repo, path)
+    head = _read_git_control_file(admin_dir / "HEAD", label="worktree_head")
+    if head.startswith("ref:"):
+        raise WorkspaceError("worktree_is_not_detached_and_isolated")
+    if re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", head) is None:
+        raise WorkspaceError("worktree_base_oid_unavailable")
+    return head
+
+
+def _verified_worktree_admin_dir(repo: Path, path: Path) -> Path:
+    """The ``<common>/worktrees/<id>`` record of linked worktree ``path``.
+
+    The worktree's ``.git`` pointer only nominates it: the record must lie in
+    ``repo``'s own common directory, its ``gitdir`` backlink must name this
+    very pointer, and its ``commondir`` must lead back to that common
+    directory.  The record is written by the host and never granted to a
+    container, so a pointer the worker rewrote can name no other record.
+    """
     marker = path / ".git"
     if marker.is_symlink() or not marker.is_file():
         raise WorkspaceError("worktree_is_not_detached_and_isolated")
@@ -869,13 +887,7 @@ def _isolated_worktree_base_oid(repo: Path, path: Path) -> str:
         raise WorkspaceError("worktree_commondir_unavailable") from exc
     if os.path.normcase(str(linked_common)) != os.path.normcase(str(common_dir)):
         raise WorkspaceError("worktree_repository_identity_mismatch")
-
-    head = _read_git_control_file(admin_dir / "HEAD", label="worktree_head")
-    if head.startswith("ref:"):
-        raise WorkspaceError("worktree_is_not_detached_and_isolated")
-    if re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", head) is None:
-        raise WorkspaceError("worktree_base_oid_unavailable")
-    return head
+    return admin_dir
 
 
 def _read_packed_ref_oid(git_dir: Path, ref: str) -> str:
@@ -12297,6 +12309,119 @@ _MAX_APPCONTAINER_WAIT_MS = 4_294_967_294
 _APPCONTAINER_DRAIN_JOIN_SECONDS = 30.0
 
 
+# NF-40: git cannot run inside the validation AppContainer.  Measured on
+# Windows 11 26200, git 2.45.2: it dies at startup with "Unable to read current
+# working directory" (its getcwd normalizes the path with
+# GetFinalPathNameByHandleW, denied even with the request directory and its
+# parent readable), and a linked worktree needs the canonical common .git,
+# whose .git, objects, objects\pack, refs, packed-refs and info are owned by
+# BUILTIN\Administrators with no WRITE_DAC for the user, so they cannot be
+# granted at all.  These exact read-only checks therefore run on the host with
+# the trusted git, hardened so that nothing the candidate controls is executed:
+# the admin record is proven, never taken from the worktree's .git pointer;
+# config is only what the candidate cannot write -- the repository's own and
+# git's install-wide system config, never a global one (the request HOME is
+# candidate-writable).  The system config stays because it carries
+# core.autocrlf: measured, without it every file checked out CRLF reads as
+# "trailing whitespace".  Attributes come from HEAD, not from candidate
+# .gitattributes, so no candidate path can select a filter or diff driver or
+# relax the whitespace rules; no external diff, textconv, pager, fsmonitor,
+# hooks, credential helper, transport or lazy fetch; optional locks are off,
+# so nothing is written.  Any other git command in this lane is refused with a
+# typed reason.
+HOST_READONLY_GIT_BOUNDARY = "host_readonly_git"
+_HOST_READONLY_GIT_OPTIONS = (
+    "--no-pager", "--attr-source=HEAD",
+    "-c", "core.fsmonitor=false", "-c", f"core.hooksPath={os.devnull}",
+    "-c", "credential.helper=", "-c", "protocol.allow=never",
+)
+_HOST_READONLY_GIT_COMMANDS = {
+    ("diff", "--check"): (
+        *_HOST_READONLY_GIT_OPTIONS,
+        "diff", "--check", "--no-ext-diff", "--no-textconv", "--ignore-submodules=all",
+    ),
+}
+
+
+def _host_readonly_git_argv(argv: list[str], cd_relative: str | None) -> list[str]:
+    """``argv`` hardened for :func:`_run_host_readonly_git`, or unchanged when
+    it is no allowlisted check run from the worktree root."""
+    hardened = _HOST_READONLY_GIT_COMMANDS.get(tuple(argv[1:]))
+    if hardened is None or cd_relative is not None:
+        return list(argv)
+    return [argv[0], *hardened]
+
+
+def _run_host_readonly_git(
+    argv: list[str],
+    *,
+    workspace: WorkerWorkspace,
+    writable: tuple[Path, ...],
+    timeout_seconds: int,
+) -> subprocess.CompletedProcess[str]:
+    """Run one hardened read-only git check against the candidate worktree on
+    the host, in ``subprocess.run``'s shapes; ``OSError`` for anything not
+    allowlisted."""
+    git = Path(argv[0])
+    if (
+        git.stem.lower() != "git"
+        or tuple(argv[1:]) not in _HOST_READONLY_GIT_COMMANDS.values()
+        or any(git.is_relative_to(root) for root in writable)
+    ):
+        raise OSError(
+            "windows_host_git_not_allowlisted:only `git diff --check` from the "
+            f"worktree root runs in this lane:{argv}"
+        )
+    try:
+        admin_dir = _verified_worktree_admin_dir(Path(workspace.repo), Path(workspace.path))
+    except WorkspaceError as exc:
+        raise OSError(f"windows_host_git_worktree_unverified:{exc}") from exc
+    env = _git_environment()
+    env.update(
+        GIT_DIR=str(admin_dir),
+        GIT_WORK_TREE=str(workspace.path),
+        GIT_CONFIG_GLOBAL=os.devnull,
+        GIT_NO_LAZY_FETCH="1",
+    )
+    # cwd is the host-only admin record, never a candidate directory: nothing
+    # git loads at startup can come from the worktree.
+    return subprocess.run(
+        list(argv),
+        cwd=admin_dir,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout_seconds,
+        check=False,
+        shell=False,
+    )
+
+
+def _appcontainer_request_root(workspace: WorkerWorkspace) -> Path:
+    """The ``<root>/<request_id>`` directory :func:`create_workspace` made for
+    this request when it holds nothing but the request's ``worktree`` and
+    ``home``; otherwise the worktree itself.
+
+    NF-40, measured: pytest stats the parent of its rootdir before collecting
+    (``Session._collect_path`` -> ``gethookproxy(rootdir.parent)``), and the
+    container could not -- ``<request_id>`` is created 0o700 -- so every
+    ``pytest`` validation failed with WinError 5 on that directory.  Reading
+    it exposes only its two children, which the lane already grants.
+    """
+    path, home = Path(workspace.path), Path(workspace.home)
+    root = path.parent
+    if (
+        path.name == "worktree"
+        and home == root / "home"
+        and root.name == getattr(workspace, "request_id", None)
+        and set(os.listdir(root)) <= {"worktree", "home"}
+    ):
+        return root
+    return path
+
+
 def _run_appcontainer_validation(
     argv: list[str],
     *,
@@ -12330,11 +12455,13 @@ def _run_appcontainer_validation(
     # actually land in a sparse worker worktree that has to run this helper.
     from .repository_state import inspect_repository
     from .windows_appcontainer import (
+        APPCONTAINER_PYTHON_SITE,
         AppContainerError,
         AppContainerLifecycleState,
         AppContainerRequest,
         ContainerGrant,
         appcontainer_worker_kind,
+        is_python_executable,
         launch_appcontainer,
         native_handle,
         python_read_grants,
@@ -12342,18 +12469,31 @@ def _run_appcontainer_validation(
     )
 
     repo_id = inspect_repository(workspace.repo).manifest.repo_id
-    # NF-2026-00025: the worktree root (never the cd subdir a candidate could
-    # have made a junction) read-only, as on every other backend; HOME and
-    # temp modify; all revoked.  NF-2026-00034: plus, read-only and
-    # persistent (shared install roots), the interpreter a ``python -m ...``
-    # command runs and its import roots.
+    executable = str(argv[0]) if argv else ""
+    if is_python_executable(executable):
+        # NF-40: first on PYTHONPATH, ahead of every candidate component, so
+        # no candidate module can shadow it; granted below like any other
+        # absolute import root.  See appcontainer_site/sitecustomize.py.
+        env = {
+            **env,
+            "PYTHONPATH": os.pathsep.join(
+                part for part in (APPCONTAINER_PYTHON_SITE, env.get("PYTHONPATH")) if part
+            ),
+        }
+    # NF-2026-00025: the request's directories, read-only (never the cd subdir
+    # a candidate could have made a junction), as on every other backend; HOME
+    # and temp modify; all revoked.  HOME and temp come first: the protected
+    # directories beneath each revocable grant inherit that grant's access, and
+    # the read-only root below also walks HOME.  NF-2026-00034: plus, read-only
+    # and persistent (shared install roots), the interpreter a ``python -m
+    # ...`` command runs and its import roots.
     request_grants = [
-        ContainerGrant(str(workspace.path), "read_execute"),
         *request_scoped_grants(env),
+        ContainerGrant(str(_appcontainer_request_root(workspace)), "read_execute"),
     ]
     try:
         request_grants += python_read_grants(
-            str(argv[0]) if argv else "",
+            executable,
             str(env.get("PYTHONPATH") or ""),
             covered=[grant.path for grant in request_grants],
         )
@@ -12703,6 +12843,12 @@ def run_validations(
                 # namespace to remap into and no bwrap-style argv prefix, so
                 # the working directory travels on the launch request exactly
                 # the way it does for the editor-hosted branch above.
+                execution_boundary = WINDOWS_APPCONTAINER_BACKEND
+                if Path(tokens[0]).stem.lower() == "git":
+                    # NF-40: never inside the container; see
+                    # HOST_READONLY_GIT_BOUNDARY.
+                    tokens = _host_readonly_git_argv(tokens, cd_relative)
+                    execution_boundary = HOST_READONLY_GIT_BOUNDARY
                 wrapped = list(tokens)
                 appcontainer_cwd = (
                     _resolve_validation_cwd(workspace, cd_relative)
@@ -12714,7 +12860,6 @@ def run_validations(
                     if appcontainer_cwd
                     else workspace.path
                 )
-                execution_boundary = WINDOWS_APPCONTAINER_BACKEND
             else:
                 wrapped = sandbox_argv(
                     workspace,
@@ -12907,7 +13052,14 @@ def run_validations(
                 broker_read_fd, broker_write_fd = os.pipe()
                 env[_METADATA_BROKER_EVIDENCE_ENV] = str(broker_write_fd)
             try:
-                if selected_backend == WINDOWS_APPCONTAINER_BACKEND:
+                if execution_boundary == HOST_READONLY_GIT_BOUNDARY:
+                    result = _run_host_readonly_git(
+                        wrapped,
+                        workspace=workspace,
+                        writable=(workspace.path, workspace.home, scratch_dir),
+                        timeout_seconds=bounded_timeout,
+                    )
+                elif selected_backend == WINDOWS_APPCONTAINER_BACKEND:
                     # AppContainer confinement is established by the container
                     # profile and the kill-on-close job object at CreateProcess
                     # time, so this command cannot go through subprocess.run at

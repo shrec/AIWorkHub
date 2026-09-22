@@ -1379,12 +1379,14 @@ def test_appcontainer_validation_gets_grants_but_no_network(
     assert tuple(request.capability_sids) == ()
     grant = windows_appcontainer.ContainerGrant
     assert list(request.filesystem_grants) == [
-        # The root, never the cd subdir a candidate could have made a junction.
-        grant(str(worktree), "read_execute"),
         grant(str(home), "modify"),
         grant(str(scratch), "modify"),
+        # The root, never the cd subdir a candidate could have made a junction.
+        grant(str(worktree), "read_execute"),
     ]
     assert not any(g.persistent for g in request.filesystem_grants)
+    # Not a Python: no PYTHONPATH appears.
+    assert "PYTHONPATH" not in request.environment
 
 
 def test_appcontainer_validation_python_gets_its_interpreter_read_only_and_no_network(
@@ -1429,13 +1431,18 @@ def test_appcontainer_validation_python_gets_its_interpreter_read_only_and_no_ne
     assert tuple(request.capability_sids) == ()
     grant = windows_appcontainer.ContainerGrant
     assert list(request.filesystem_grants) == [
-        grant(str(worktree), "read_execute"),
         grant(str(home), "modify"),
         grant(str(scratch), "modify"),
-        grant(str(python), "read_execute", persistent=True),
+        grant(str(worktree), "read_execute"),
+        grant(str(venv / "Scripts"), "read_execute", persistent=True),
         grant(str(venv / "pyvenv.cfg"), "read_execute", persistent=True),
         grant(str(venv / "Lib" / "site-packages"), "read_execute", persistent=True),
         grant(str(base), "read_execute", persistent=True),
+        grant(windows_appcontainer.APPCONTAINER_PYTHON_SITE, "read_execute", persistent=True),
+    ]
+    # NF-40: the mkdir/realpath shim first, ahead of every candidate component.
+    assert request.environment["PYTHONPATH"].split(os.pathsep) == [
+        windows_appcontainer.APPCONTAINER_PYTHON_SITE, str(worktree), "."
     ]
 
 
@@ -1574,3 +1581,374 @@ def test_appcontainer_validation_never_lets_appcontainer_error_escape(
 
     assert not isinstance(excinfo.value, windows_appcontainer.AppContainerError)
     assert "windows_appcontainer_validation_launch_failed" in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# NF-40: the request root, and git outside the container
+# ---------------------------------------------------------------------------
+
+
+def _request_layout(tmp_path: Path, request_id: str = "a" * 32):
+    """``create_workspace``'s shape: <root>/<request_id>/{worktree,home}."""
+    request_root = tmp_path / "worktrees" / request_id
+    worktree, home = request_root / "worktree", request_root / "home"
+    worktree.mkdir(parents=True)
+    home.mkdir()
+    scratch = home / f"aiworkhub_validation_exec_{request_id}"
+    scratch.mkdir()
+    workspace = SimpleNamespace(
+        repo=tmp_path, path=worktree, home=home, request_id=request_id
+    )
+    return workspace, request_root, scratch
+
+
+def test_the_request_root_is_read_when_it_holds_only_the_worktree_and_home(tmp_path):
+    """pytest stats the parent of its rootdir before it collects anything."""
+    workspace, request_root, _scratch = _request_layout(tmp_path)
+    assert worker_workspace._appcontainer_request_root(workspace) == request_root
+
+    (request_root / "unexpected").mkdir()
+    assert worker_workspace._appcontainer_request_root(workspace) == workspace.path
+
+
+@pytest.mark.parametrize("change", ["request_id", "home", "name"])
+def test_any_other_workspace_shape_reads_only_the_worktree(tmp_path, change):
+    workspace, _request_root, _scratch = _request_layout(tmp_path)
+    if change == "request_id":
+        workspace.request_id = "b" * 32
+    elif change == "home":
+        workspace.home = tmp_path / "elsewhere"
+    else:
+        renamed = workspace.path.with_name("wt")
+        workspace.path.rename(renamed)
+        workspace.path = renamed
+    assert worker_workspace._appcontainer_request_root(workspace) == workspace.path
+
+
+def test_appcontainer_validation_grants_the_request_root_read_only_after_home_and_temp(
+    tmp_path: Path, monkeypatch, identity_osfhandle
+) -> None:
+    """HOME and temp come first so the protected directories beneath them keep
+    their modify access; the root, walked after, can only add read."""
+    launches: list[_FakeValidationLaunch] = []
+    _stub_repo_id(monkeypatch)
+    _install_fake_launch(
+        monkeypatch, stdout=b"", stderr=b"",
+        outcome=windows_appcontainer.AppContainerLifecycleResult(
+            windows_appcontainer.AppContainerLifecycleState.EXITED, exit_code=0
+        ),
+        sink=launches,
+    )
+    workspace, request_root, scratch = _request_layout(tmp_path)
+    env = {"HOME": str(workspace.home), "TMPDIR": str(scratch), "TMP": str(scratch)}
+
+    worker_workspace._run_appcontainer_validation(
+        ["node", "--version"], workspace=workspace, adapter_id="claude_cli",
+        cwd=workspace.path, env=env, timeout_seconds=30,
+    )
+
+    grant = windows_appcontainer.ContainerGrant
+    request = launches[0].request
+    assert list(request.filesystem_grants) == [
+        grant(str(workspace.home), "modify"),
+        grant(str(scratch), "modify"),
+        grant(str(request_root), "read_execute"),
+    ]
+    assert tuple(request.capability_sids) == ()  # offline
+
+
+def test_a_candidate_pythonpath_cannot_shadow_the_container_shim(
+    tmp_path: Path, monkeypatch, identity_osfhandle
+) -> None:
+    """The shim is first; a candidate ``sitecustomize`` on its own PYTHONPATH
+    component is never the one Python imports."""
+    launches: list[_FakeValidationLaunch] = []
+    _stub_repo_id(monkeypatch)
+    _install_fake_launch(
+        monkeypatch, stdout=b"", stderr=b"",
+        outcome=windows_appcontainer.AppContainerLifecycleResult(
+            windows_appcontainer.AppContainerLifecycleState.EXITED, exit_code=0
+        ),
+        sink=launches,
+    )
+    workspace, _request_root, scratch = _request_layout(tmp_path)
+    (workspace.path / "src").mkdir()
+    (workspace.path / "src" / "sitecustomize.py").write_text("raise SystemExit\n", encoding="utf-8")
+    python = tmp_path / "Python312" / "python.exe"
+    python.parent.mkdir()
+    python.write_bytes(b"MZ")
+
+    worker_workspace._run_appcontainer_validation(
+        [str(python), "-P", "-m", "pytest"], workspace=workspace, adapter_id="claude_cli",
+        cwd=workspace.path,
+        env={"TMPDIR": str(scratch), "PYTHONPATH": str(workspace.path / "src")},
+        timeout_seconds=30,
+    )
+
+    request = launches[0].request
+    assert request.environment["PYTHONPATH"].split(os.pathsep) == [
+        windows_appcontainer.APPCONTAINER_PYTHON_SITE, str(workspace.path / "src")
+    ]
+    persistent = [g.path for g in request.filesystem_grants if g.persistent]
+    assert windows_appcontainer.APPCONTAINER_PYTHON_SITE in persistent
+    for path in persistent:  # nothing persistent under a container-writable root
+        assert not Path(path).is_relative_to(workspace.path.parent)
+
+
+_HARDENED_DIFF_CHECK = worker_workspace._HOST_READONLY_GIT_COMMANDS[("diff", "--check")]
+
+
+def test_only_an_exact_diff_check_from_the_worktree_root_is_hardened() -> None:
+    git = r"C:\Program Files\Git\mingw64\bin\git.exe"
+    assert worker_workspace._host_readonly_git_argv([git, "diff", "--check"], None) == [
+        git, *_HARDENED_DIFF_CHECK
+    ]
+    for argv, cd in (
+        ([git, "diff", "--check"], "sub"),
+        ([git, "status"], None),
+        ([git, "diff", "--check", "HEAD"], None),
+        ([git, "-c", "core.fsmonitor=x", "diff", "--check"], None),
+    ):
+        assert worker_workspace._host_readonly_git_argv(argv, cd) == argv
+    for flag in (
+        "--no-pager", "--attr-source=HEAD", "core.fsmonitor=false", "credential.helper=",
+        "protocol.allow=never", "--no-ext-diff", "--no-textconv", "--ignore-submodules=all",
+    ):
+        assert flag in _HARDENED_DIFF_CHECK
+    assert f"core.hooksPath={os.devnull}" in _HARDENED_DIFF_CHECK
+
+
+def _no_subprocess(monkeypatch):
+    def _refuse(*_args, **_kwargs):
+        raise AssertionError("no git may run")
+
+    monkeypatch.setattr(worker_workspace.subprocess, "run", _refuse)
+
+
+def test_host_git_refuses_everything_but_the_hardened_allowlist(tmp_path, monkeypatch) -> None:
+    _no_subprocess(monkeypatch)
+    workspace, _request_root, scratch = _request_layout(tmp_path)
+    git = str(tmp_path / "bin" / "git.exe")
+    for argv in (
+        [git, "diff", "--check"],  # never unhardened
+        [git, "status"],
+        [git, *_HARDENED_DIFF_CHECK, "HEAD"],
+        [str(tmp_path / "bin" / "sh.exe"), *_HARDENED_DIFF_CHECK],
+        # a git the container could have written is never run on the host
+        [str(scratch / "git.exe"), *_HARDENED_DIFF_CHECK],
+        [str(workspace.path / "git.exe"), *_HARDENED_DIFF_CHECK],
+    ):
+        with pytest.raises(OSError, match="windows_host_git_not_allowlisted"):
+            worker_workspace._run_host_readonly_git(
+                argv, workspace=workspace,
+                writable=(workspace.path, workspace.home, scratch), timeout_seconds=5,
+            )
+
+
+def _git_available():
+    import shutil
+
+    git = shutil.which("git")
+    if git is None:
+        pytest.skip("git is not installed")
+    return git
+
+
+def _linked_worktree(tmp_path: Path):
+    """A canonical repository with one commit and a detached linked worktree."""
+    git = _git_available()
+    repo, worktree = tmp_path / "repo", tmp_path / "wt"
+    repo.mkdir()
+    ident = ["-c", "user.name=t", "-c", "user.email=t@example.invalid"]
+    subprocess.run([git, "init", "-q"], cwd=repo, check=True, capture_output=True)
+    (repo / "a.txt").write_bytes(b"clean\n")
+    for argv in (["add", "a.txt"], ["commit", "-q", "-m", "base"]):
+        subprocess.run([git, *ident, *argv], cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        [git, "worktree", "add", "-q", "--detach", str(worktree)],
+        cwd=repo, check=True, capture_output=True,
+    )
+    workspace = SimpleNamespace(repo=repo, path=worktree, home=tmp_path / "home")
+    return workspace, git
+
+
+def _host_diff_check(workspace, git):
+    return worker_workspace._run_host_readonly_git(
+        [git, *_HARDENED_DIFF_CHECK], workspace=workspace, writable=(), timeout_seconds=60,
+    )
+
+
+def test_host_git_checks_the_candidate_with_attributes_from_head(tmp_path) -> None:
+    """A candidate ``.gitattributes`` cannot switch the whitespace check off --
+    plain ``git diff --check`` would honour it and pass."""
+    workspace, git = _linked_worktree(tmp_path)
+    assert _host_diff_check(workspace, git).returncode == 0
+
+    (workspace.path / "a.txt").write_bytes(b"clean\ntrailing   \n")
+    (workspace.path / ".gitattributes").write_bytes(b"* -whitespace\n")
+    plain = subprocess.run([git, "diff", "--check"], cwd=workspace.path, capture_output=True)
+    assert plain.returncode == 0  # the bypass is real
+
+    result = _host_diff_check(workspace, git)
+    assert result.returncode == 2
+    assert "a.txt:2: trailing whitespace." in result.stdout
+
+
+def test_host_git_executes_nothing_the_candidate_configured(tmp_path, monkeypatch) -> None:
+    """The candidate can write its HOME and its worktree, never the canonical
+    .git.  Config in HOME (global) and attributes in the worktree name drivers,
+    an external diff and an fsmonitor hook; none of them may run on the host."""
+    workspace, git = _linked_worktree(tmp_path)
+    sentinel = tmp_path / "executed"
+    probe = tmp_path / "probe.py"
+    probe.write_text(
+        f"import pathlib, sys\npathlib.Path({str(sentinel)!r}).write_text('x')\n"
+        "sys.stdout.write(sys.stdin.read())\n",
+        encoding="utf-8",
+    )
+    command = f'"{Path(sys.executable).as_posix()}" "{probe.as_posix()}"'
+    home = tmp_path / "home"
+    home.mkdir()
+    config = home / ".gitconfig"
+    config.write_text(
+        f"[core]\n\tfsmonitor = {command}\n"
+        f"[diff]\n\texternal = {command}\n"
+        f'[diff "evil"]\n\tcommand = {command}\n\ttextconv = {command}\n'
+        f'[filter "evil"]\n\tclean = {command}\n',
+        encoding="utf-8",
+    )
+    (workspace.path / ".gitattributes").write_bytes(b"* filter=evil diff=evil\n")
+    (workspace.path / "a.txt").write_bytes(b"changed\n")
+    for key in ("HOME", "USERPROFILE", "XDG_CONFIG_HOME"):
+        monkeypatch.setenv(key, str(home))
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(config))
+
+    subprocess.run([git, "diff"], cwd=workspace.path, capture_output=True, stdin=subprocess.DEVNULL)
+    if not sentinel.exists():
+        pytest.skip("this host's git ran none of the planted commands; nothing to disprove")
+    sentinel.unlink()
+
+    result = _host_diff_check(workspace, git)
+    assert result.returncode == 0, result.stderr
+    assert not sentinel.exists()
+
+
+def test_host_git_never_follows_a_rewritten_git_pointer(tmp_path, monkeypatch) -> None:
+    """The worktree's .git file is candidate-writable: pointing it at a git dir
+    the candidate built (with its own config) is refused before git starts."""
+    workspace, git = _linked_worktree(tmp_path)
+    evil = tmp_path / "evil_gitdir"
+    evil.mkdir()
+    (evil / "gitdir").write_text(str(workspace.path / ".git") + "\n", encoding="utf-8")
+    (evil / "commondir").write_text(str(workspace.repo / ".git") + "\n", encoding="utf-8")
+    (evil / "HEAD").write_text("0" * 40 + "\n", encoding="utf-8")
+    (evil / "config.worktree").write_text("[core]\n\tfsmonitor = evil\n", encoding="utf-8")
+    # Git hides the pointer, and Windows refuses to truncate a hidden file by
+    # recreating it; rewrite it in place, as a worker would.
+    with open(workspace.path / ".git", "r+", encoding="utf-8") as pointer:
+        pointer.truncate(0)
+        pointer.write(f"gitdir: {evil}\n")
+    _no_subprocess(monkeypatch)
+
+    with pytest.raises(OSError, match="windows_host_git_worktree_unverified"):
+        _host_diff_check(workspace, git)
+
+
+def test_host_git_runs_from_the_proven_record_with_only_canonical_config(
+    tmp_path, monkeypatch
+) -> None:
+    workspace, git = _linked_worktree(tmp_path)
+    seen: dict = {}
+
+    def _record(argv, **kwargs):
+        seen.update(kwargs, argv=argv)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setenv("GIT_EXTERNAL_DIFF", "evil")
+    monkeypatch.setenv("GIT_CONFIG_PARAMETERS", "'core.fsmonitor'='evil'")
+    monkeypatch.setattr(worker_workspace.subprocess, "run", _record)
+    _host_diff_check(workspace, git)
+
+    admin = worker_workspace._verified_worktree_admin_dir(workspace.repo, workspace.path)
+    assert admin.parent == (workspace.repo / ".git" / "worktrees").resolve()
+    env = seen["env"]
+    assert seen["cwd"] == admin
+    assert (env["GIT_DIR"], env["GIT_WORK_TREE"]) == (str(admin), str(workspace.path))
+    # No global config: the request HOME is candidate-writable.  The system
+    # config is the install's own (and carries core.autocrlf), so it stays.
+    assert env["GIT_CONFIG_GLOBAL"] == os.devnull
+    assert "GIT_CONFIG_NOSYSTEM" not in env
+    assert env["GIT_NO_LAZY_FETCH"] == "1"  # offline, with protocol.allow=never
+    assert env["GIT_OPTIONAL_LOCKS"] == "0"  # writes nothing
+    assert "GIT_EXTERNAL_DIFF" not in env and "GIT_CONFIG_PARAMETERS" not in env
+    assert seen["argv"] == [git, *_HARDENED_DIFF_CHECK]
+    assert seen["shell"] is False
+
+
+def _routing_stubs(monkeypatch, tmp_path, git: str):
+    workspace, _request_root, scratch = _request_layout(tmp_path)
+    container: list[list[str]] = []
+    monkeypatch.setattr(worker_workspace, "provision_validation_exec_scratch", lambda _ws: scratch)
+    monkeypatch.setattr(worker_workspace, "cleanup_validation_exec_scratch", lambda _path: None)
+    monkeypatch.setattr(worker_workspace, "python_candidate_authority", lambda _ws: {"digest": ""})
+    monkeypatch.setattr(
+        worker_workspace, "_normalize_validation_interpreter_argv",
+        lambda _ws, tokens, **_kwargs: (list(tokens), None),
+    )
+    monkeypatch.setattr(
+        worker_workspace, "_normalize_trusted_validation_executable_argv_with_authority",
+        lambda tokens, _repo: ([git if tokens[0] == "git" else tokens[0], *tokens[1:]], (), None),
+    )
+
+    def _container(argv, **kwargs):
+        container.append(list(argv))
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(worker_workspace, "_run_appcontainer_validation", _container)
+    return workspace, container
+
+
+def test_run_validations_runs_diff_check_on_the_host_and_everything_else_contained(
+    tmp_path, monkeypatch
+) -> None:
+    git = str(tmp_path / "bin" / "git.exe")
+    workspace, container = _routing_stubs(monkeypatch, tmp_path, git)
+    host: list[list[str]] = []
+
+    def _host(argv, **kwargs):
+        host.append(list(argv))
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(worker_workspace, "_run_host_readonly_git", _host)
+    rows = worker_workspace.run_validations(
+        workspace, ["git diff --check", "node --version"],
+        backend="windows_appcontainer", adapter_id="claude_cli",
+    )
+
+    assert host == [[git, *_HARDENED_DIFF_CHECK]]
+    assert container == [["node", "--version"]]
+    assert [row["execution_boundary"] for row in rows] == [
+        worker_workspace.HOST_READONLY_GIT_BOUNDARY, "windows_appcontainer"
+    ]
+    assert rows[0]["executed_argv"] == [git, *_HARDENED_DIFF_CHECK]
+    assert rows[0]["declared_argv"] == ["git", "diff", "--check"]
+
+
+def test_run_validations_never_runs_any_other_git_command_anywhere(tmp_path, monkeypatch) -> None:
+    """Not in the container, where git cannot start, and not on the host: a
+    typed environment block, not a candidate failure."""
+    git = str(tmp_path / "bin" / "git.exe")
+    workspace, container = _routing_stubs(monkeypatch, tmp_path, git)
+    (workspace.path / "src").mkdir()
+    _no_subprocess(monkeypatch)
+
+    with pytest.raises(worker_workspace.ValidationEnvironmentBlocked) as excinfo:
+        worker_workspace.run_validations(
+            workspace, ["git status", "cd src && git diff --check"],
+            backend="windows_appcontainer", adapter_id="claude_cli",
+        )
+
+    assert container == []
+    rows = excinfo.value.results
+    assert all(row["returncode"] is None for row in rows)
+    assert all("windows_host_git_not_allowlisted" in row["launch_error_message"] for row in rows)

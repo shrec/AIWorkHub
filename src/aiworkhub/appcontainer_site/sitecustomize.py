@@ -1,0 +1,99 @@
+"""Loaded first by every Python the Windows AppContainer validation lane runs.
+
+Two CPython calls do not work inside an AppContainer; this module gives each
+the host's result, only there.  The lane puts this directory first on
+PYTHONPATH for Windows AppContainer children only
+(``windows_appcontainer.APPCONTAINER_PYTHON_SITE``); nothing else imports it.
+Both measured in the validation container on Windows 11 26200, CPython 3.12.4.
+
+``os.mkdir(path, 0o700)``: since 3.12.4 (CVE-2024-4030) it applies an
+explicit, protected DACL -- SYSTEM, Administrators, OWNER RIGHTS -- that names
+no AppContainer SID, so the container cannot use a directory it just made
+(python/cpython#134587, open).  Inside the request's private exec scratch the
+mkdir fails outright with WinError 5; in an ordinary granted directory it
+succeeds and the next ``listdir`` is denied.  pytest makes its basetemp and
+every ``tmp_path`` that way; so does ``tempfile.mkdtemp``.  Here ``0o700``
+gets the pre-3.12.4 Windows behaviour: the mode is ignored and the directory
+inherits its parent's DACL.  The container can only create directories inside
+the request's own granted directories, and the exec scratch pytest's temp
+lives in is itself owner-private plus this container's SID, so what a new
+directory inherits there is just as private.  CPython ignores every other
+mode on Windows already.
+
+``nt._getfinalpathname``: ``GetFinalPathNameByHandleW(VOLUME_NAME_DOS)`` is
+denied (WinError 5) for every path -- mapping the volume device to its drive
+letter needs the mount manager, which a container cannot query, while the
+``VOLUME_NAME_NT`` / ``VOLUME_NAME_NONE`` forms succeed.  So
+``Path.resolve(strict=True)`` raised for every existing path.  On that denial
+the path is rebuilt from the input's drive letter and the object's
+``VOLUME_NAME_NONE`` name, and returned only if it names the very same file
+(same volume serial and file index); otherwise the original error stands.
+"""
+
+import ctypes
+import ntpath
+import os
+from ctypes import wintypes
+
+_mkdir = os.mkdir
+_getfinalpathname_host = ntpath._getfinalpathname
+
+_OPEN_EXISTING = 3
+_FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+_VOLUME_NAME_NONE = 0x4
+_SHARE_ALL = 0x7
+_INVALID_HANDLE = wintypes.HANDLE(-1).value
+
+_kernel32 = getattr(ctypes, "WinDLL")("kernel32", use_last_error=True)
+_kernel32.CreateFileW.restype = wintypes.HANDLE
+_kernel32.CreateFileW.argtypes = [
+    wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+    wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+]
+_kernel32.GetFinalPathNameByHandleW.restype = wintypes.DWORD
+_kernel32.GetFinalPathNameByHandleW.argtypes = [
+    wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD,
+]
+_kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+
+def _mkdir_inheriting(path, mode=0o777, *, dir_fd=None):
+    return _mkdir(path, dir_fd=dir_fd)
+
+
+def _volume_relative_name(path):
+    """``path``'s final name without its volume (``\\Dev\\x``), or ``""``."""
+    handle = _kernel32.CreateFileW(
+        path, 0, _SHARE_ALL, None, _OPEN_EXISTING, _FILE_FLAG_BACKUP_SEMANTICS, None
+    )
+    if handle in (None, _INVALID_HANDLE):
+        return ""
+    try:
+        buffer = ctypes.create_unicode_buffer(32768)
+        length = _kernel32.GetFinalPathNameByHandleW(
+            handle, buffer, len(buffer), _VOLUME_NAME_NONE
+        )
+        return buffer.value if 0 < length < len(buffer) else ""
+    finally:
+        _kernel32.CloseHandle(handle)
+
+
+def _getfinalpathname(path):
+    try:
+        return _getfinalpathname_host(path)
+    except PermissionError:
+        drive = ntpath.splitdrive(path)[0] if isinstance(path, str) else ""
+        relative = _volume_relative_name(path) if len(drive) == 2 else ""
+        candidate = "\\\\?\\" + drive.upper() + relative
+        try:
+            same = relative and ntpath.samestat(os.stat(candidate), os.stat(path))
+        except OSError:
+            same = False
+        if not same:
+            raise
+        return candidate
+
+
+if __name__ == "sitecustomize":
+    os.mkdir = _mkdir_inheriting
+    ntpath._getfinalpathname = _getfinalpathname

@@ -2703,7 +2703,9 @@ def test_a_venv_interpreter_needs_its_launcher_config_site_packages_and_base(tmp
         covered=[str(worktree)],
     )
     assert grants == [
-        ContainerGrant(str(venv / "Scripts" / "python.exe"), "read_execute", persistent=True),
+        # Its Scripts directory, not just the launcher: ``python -m ruff`` execs
+        # Scripts/ruff.exe (NF-40).
+        ContainerGrant(str(venv / "Scripts"), "read_execute", persistent=True),
         ContainerGrant(str(venv / "pyvenv.cfg"), "read_execute", persistent=True),
         ContainerGrant(str(venv / "Lib" / "site-packages"), "read_execute", persistent=True),
         ContainerGrant(str(base), "read_execute", persistent=True),
@@ -2760,7 +2762,7 @@ def test_the_python_read_set_passes_grant_validation(tmp_path):
     assert _grant_events(fake) == [
         f"grant:read_execute:{path}"
         for path in (
-            venv / "Scripts" / "python.exe", venv / "pyvenv.cfg",
+            venv / "Scripts", venv / "pyvenv.cfg",
             venv / "Lib" / "site-packages", base,
         )
     ]
@@ -2795,7 +2797,7 @@ def test_a_venv_on_a_program_files_python_grants_all_but_the_base(tmp_path, monk
     (venv / "pyvenv.cfg").write_text(f"home = {home}\n", encoding="utf-8")
 
     grants = wac.python_read_grants(str(venv / "Scripts" / "python.exe"))
-    expected = [venv / "Scripts" / "python.exe", venv / "pyvenv.cfg", venv / "Lib" / "site-packages"]
+    expected = [venv / "Scripts", venv / "pyvenv.cfg", venv / "Lib" / "site-packages"]
     assert grants == [
         ContainerGrant(str(path), "read_execute", persistent=True) for path in expected
     ]
@@ -3135,3 +3137,110 @@ def test_launch_records_how_each_persistent_grant_was_satisfied(tmp_path):
         {"path": str(written), "satisfied_by": "granted"},
     ]
     assert launch.grants == []
+
+
+# ---------------------------------------------------------------------------
+# NF-40: the sitecustomize every Python in the validation container loads
+# ---------------------------------------------------------------------------
+
+
+def _appcontainer_site(name="aiworkhub_appcontainer_site_under_test"):
+    """The shim, loaded under a name other than ``sitecustomize``: its
+    functions, without it patching this test process."""
+    import importlib.util
+
+    path = os.path.join(wac.APPCONTAINER_PYTHON_SITE, "sitecustomize.py")
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_the_site_directory_holds_only_the_shim():
+    """Everything in it is imported by every validation Python: keep it one file."""
+    assert sorted(
+        entry for entry in os.listdir(wac.APPCONTAINER_PYTHON_SITE) if entry != "__pycache__"
+    ) == ["sitecustomize.py"]
+
+
+def test_is_python_executable():
+    assert wac.is_python_executable(r"C:\venv\Scripts\python.exe")
+    assert wac.is_python_executable(r"C:\Python312\python3.12.EXE")
+    assert not wac.is_python_executable(r"C:\venv\Scripts\ruff.exe")
+    assert not wac.is_python_executable("python")
+    assert not wac.is_python_executable(r"C:\Program Files\Git\mingw64\bin\git.exe")
+
+
+windows_only = pytest.mark.skipif(os.name != "nt", reason="exercises the real Win32 path APIs")
+
+
+@windows_only
+def test_the_shim_patches_nothing_unless_it_is_sitecustomize():
+    import ntpath
+
+    mkdir, final = os.mkdir, ntpath._getfinalpathname
+    _appcontainer_site()
+    assert os.mkdir is mkdir
+    assert ntpath._getfinalpathname is final
+
+
+@windows_only
+def test_the_shim_mkdir_0o700_inherits_the_parent_dacl(tmp_path):
+    """CPython >= 3.12.4 makes a 0o700 directory with a protected DACL that no
+    container SID is on; the shim's directory inherits its parent's instead."""
+    site = _appcontainer_site()
+    inherited = 0x10  # INHERITED_ACE
+
+    os.mkdir(tmp_path / "host", 0o700)
+    host = wac.snapshot_filesystem_acl(str(tmp_path / "host"))
+    site._mkdir_inheriting(tmp_path / "shim", 0o700)
+    shim = wac.snapshot_filesystem_acl(str(tmp_path / "shim"))
+
+    assert host.aces and not any(ace.flags & inherited for ace in host.aces)
+    assert shim.aces and all(ace.flags & inherited for ace in shim.aces)
+
+
+@windows_only
+def test_the_shim_final_path_matches_the_host_when_the_volume_lookup_is_denied(
+    tmp_path, monkeypatch
+):
+    """In the container GetFinalPathNameByHandleW(VOLUME_NAME_DOS) is denied for
+    every path; the rebuilt name must equal what the host call returns."""
+    import ntpath
+
+    site = _appcontainer_site()
+    (tmp_path / "Dir").mkdir()
+    (tmp_path / "Dir" / "File.txt").write_text("x", encoding="utf-8")
+    paths = [str(tmp_path / "Dir"), str(tmp_path / "dir" / "file.TXT")]
+    expected = [ntpath._getfinalpathname(path) for path in paths]
+
+    def _denied(path):
+        raise PermissionError(5, "Access is denied", path)
+
+    monkeypatch.setattr(site, "_getfinalpathname_host", _denied)
+    assert [site._getfinalpathname(path) for path in paths] == expected
+
+
+@windows_only
+def test_the_shim_final_path_never_names_a_different_file(tmp_path, monkeypatch):
+    """The rebuilt path is returned only if it is the very same file; otherwise
+    the container's original error stands."""
+    site = _appcontainer_site()
+    (tmp_path / "a.txt").write_text("a", encoding="utf-8")
+    (tmp_path / "b.txt").write_text("b", encoding="utf-8")
+    other = site._volume_relative_name(str(tmp_path / "b.txt"))
+
+    def _denied(path):
+        raise PermissionError(5, "Access is denied", path)
+
+    monkeypatch.setattr(site, "_getfinalpathname_host", _denied)
+    monkeypatch.setattr(site, "_volume_relative_name", lambda _path: other)
+    with pytest.raises(PermissionError):
+        site._getfinalpathname(str(tmp_path / "a.txt"))
+    # Nothing to rebuild from: a missing path, and a path without a drive letter.
+    monkeypatch.undo()
+    monkeypatch.setattr(site, "_getfinalpathname_host", _denied)
+    with pytest.raises(PermissionError):
+        site._getfinalpathname(str(tmp_path / "missing.txt"))
+    with pytest.raises(PermissionError):
+        site._getfinalpathname("\\?\\" + str(tmp_path / "a.txt"))

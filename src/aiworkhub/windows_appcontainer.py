@@ -242,14 +242,28 @@ def outside_system_trees(grants: list[ContainerGrant]) -> list[ContainerGrant]:
     ]
 
 
+# A directory holding only a ``sitecustomize`` that makes ``os.mkdir(path,
+# 0o700)`` usable inside an AppContainer; a lane puts it first on a Python
+# child's PYTHONPATH.  Why, and what it changes: appcontainer_site/sitecustomize.py.
+APPCONTAINER_PYTHON_SITE = str(Path(__file__).absolute().with_name("appcontainer_site"))
+
+
+def is_python_executable(executable: str) -> bool:
+    """A ``python*.exe`` -- the executables :func:`python_read_grants` serves."""
+    exe = Path(executable)
+    return exe.name.lower().startswith("python") and exe.suffix.lower() == ".exe"
+
+
 def python_read_grants(
     executable: str, pythonpath: str = "", *, covered: Sequence[str] = ()
 ) -> list[ContainerGrant]:
     """Persistent read/execute on what a Python ``executable`` needs to run in
     a container; ``[]`` when it is no ``python*.exe``.
 
-    A venv launcher needs itself, its ``pyvenv.cfg`` and ``Lib\\site-packages``,
-    and the base interpreter's home that ``pyvenv.cfg`` names -- the launcher
+    A venv launcher needs its ``Scripts`` directory (itself, and the console
+    scripts a ``-m`` tool runs: ``python -m ruff`` execs ``Scripts\\ruff.exe``),
+    its ``pyvenv.cfg`` and ``Lib\\site-packages``, and the base interpreter's
+    home that ``pyvenv.cfg`` names -- the launcher
     re-executes that interpreter, which loads its DLLs and standard library
     from there.  A plain interpreter needs its own install root.  Each
     absolute ``pythonpath`` entry is an import root too.  These are shared
@@ -265,7 +279,7 @@ def python_read_grants(
     them, and ``home`` would then steer a PERSISTENT grant anywhere.
     """
     exe = Path(executable)
-    if not (exe.name.lower().startswith("python") and exe.suffix.lower() == ".exe"):
+    if not is_python_executable(executable):
         return []
     writable = [os.path.normcase(os.path.normpath(path)) for path in covered]
 
@@ -276,7 +290,7 @@ def python_read_grants(
     config = exe.parent.parent / "pyvenv.cfg"
     roots: list[Path] = []
     if config.is_file():
-        roots += [exe, config, exe.parent.parent / "Lib" / "site-packages"]
+        roots += [exe.parent, config, exe.parent.parent / "Lib" / "site-packages"]
         for line in config.read_text(encoding="utf-8", errors="replace").splitlines():
             key, _, value = line.partition("=")
             if key.strip().lower() == "home" and value.strip():
