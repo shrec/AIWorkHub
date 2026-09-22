@@ -62,6 +62,27 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
+## What's new in 0.11.59
+
+- Windows native `claude_cli` workers now run inside their AppContainer with
+  their worker tools, measured on a real Windows 11 host.
+  - The container is granted exactly the paths it needs.
+  - Worker launches get outbound internet only. Validation launches get no
+    network.
+  - The worker MCP server runs on the host, behind a per-request pipe, and never
+    trusts what the container can write.
+- Semantic edits cannot be redirected through a junction planted in the
+  worktree.
+- C/C++ repositories: CMake-style `include/` headers resolve, and
+  `cmake`/`ctest` are trusted validation tools.
+- Blocked-card rework recovery works on Windows. Reviewer prewarm can no longer
+  wedge the launch queue. Dispatcher health reports undelivered manager-inbox
+  callbacks.
+- VS Code LM workers get one correction for a tool name that is not allowlisted.
+- Python installed in an admin-owned directory needs a one-time elevated
+  `icacls <python dir> /grant "*S-1-15-2-1:(OI)(CI)(RX)" /T` before validation
+  can run inside the container.
+
 ## What's new in 0.11.58
 
 - The first four SDLC case stages are now gated on server-proven evidence

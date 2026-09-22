@@ -1,5 +1,38 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.59 — 2026-09-22
+
+### Fixed
+
+- Bundled runtime, Windows: native `claude_cli` workers now run inside their
+  repo-scoped AppContainer with their worker tools (NF-2026-00025,
+  NF-2026-00033, NF-2026-00034).
+  - The container SID is granted only the provider install (read) and the
+    per-request worktree, home and temp (modify, revoked on close).
+  - Worker launches get outbound internet only. Validation launches get no
+    network.
+  - The worker MCP server runs on the host, behind a per-request pipe. It
+    trusts no file, path or import root that the container can write.
+- Bundled runtime: semantic edits cannot be redirected through a planted
+  junction. C/C++ `include/` headers resolve, and `cmake`/`ctest` are trusted.
+  Blocked-card rework recovery works on Windows (NF-2026-00031).
+- Bundled runtime: reviewer prewarm can no longer wedge the launch queue
+  (NF-2026-00027). Dispatcher health reports undelivered manager-inbox callbacks
+  (NF-2026-00029).
+- VS Code LM bridge:
+  - Declared writable files stay readable during forced staging
+    (NF-2026-00023).
+  - A tool name that is not allowlisted gets one correction instead of failing
+    the request (NF-2026-00032).
+
+### Known issues
+
+- Python in an admin-owned directory needs a one-time elevated
+  `icacls <python dir> /grant "*S-1-15-2-1:(OI)(CI)(RX)" /T` before
+  validation can run inside the container.
+- Only `claude_cli` is bridged so far. OpenCode, Codex and the Copilot CLIs are
+  not.
+
 ## 0.11.58 — 2026-09-21
 
 ### Changed

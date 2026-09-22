@@ -14,6 +14,19 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.11.59
+
+- Windows: bundled native `claude_cli` workers now run inside their
+  AppContainer with their worker tools. The worker MCP server runs on the host,
+  behind a per-request pipe. Worker launches get outbound internet only.
+- Semantic edits cannot be redirected through a junction planted in the
+  worktree.
+- CMake `include/` headers resolve, and `cmake`/`ctest` are trusted.
+  Blocked-card rework recovery works on Windows. Reviewer prewarm can no longer
+  wedge the launch queue.
+- Python installed in an admin-owned directory needs a one-time elevated
+  `icacls <python dir> /grant "*S-1-15-2-1:(OI)(CI)(RX)" /T`.
+
 ## What's new in 0.11.58
 
 - The bundled runtime's first four SDLC case stages are gated on server-proven

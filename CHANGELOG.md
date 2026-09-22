@@ -6,6 +6,98 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.59] - 2026-09-22
+
+### Fixed
+
+- Windows: native `claude_cli` workers now run inside their repo-scoped
+  AppContainer with their worker tools, measured on a real Windows 11 host
+  (NF-2026-00025, NF-2026-00033, NF-2026-00034).
+  - **Process creation.** `CreateProcessW` failed with `ERROR_ENVVAR_NOT_FOUND`
+    (203), because the sanitized child environment had no `LOCALAPPDATA`.
+    `launch_appcontainer` now supplies it at the one chokepoint that every
+    AppContainer launch shares.
+  - **Filesystem access.** The container SID gets explicit grants and nothing
+    broader:
+    - read/execute on the provider CLI install, as a persistent and idempotent
+      grant;
+    - modify on the per-request worktree, home and temp, including the
+      protected directories AIWorkHub creates inside them. These are revoked on
+      close by removing only this SID's entries.
+    - A grant is refused for UNC or device paths, reparse points, drive roots,
+      the user profile and AppData roots, the user temp directory, and anything
+      inside the Windows or Program Files trees.
+    - An npm `.cmd` shim runs through its native `.exe` target, which must lie
+      strictly inside the shim's `node_modules`.
+  - **Network.** Worker launches get outbound internet only (`internetClient`),
+    with no inbound listening and no private network. Validation launches get
+    no network. `windows_confinement_report()` states this split.
+  - **Worker tools.** The worker MCP server runs on the host, reached through a
+    per-request named pipe:
+    - Only this container's SID can open the pipe, and it serves only a process
+      in this launch's own job.
+    - Inside the container, a System32 PowerShell shim relays stdio to the pipe.
+    - The host server starts from a directory the container cannot write. It
+      runs with `-P -s` and `PYTHONSAFEPATH`, inherits no `PYTHON*` variables,
+      and is refused if a probe finds a container-writable directory on its
+      `sys.path`.
+    - Every file it reads for authority lives in a directory withheld from the
+      container.
+  - **Validation.** Validation commands run inside the container, read-only and
+    offline, with Python from the canonical repository's venv. An interpreter
+    or `pyvenv.cfg` the container can write is refused. A persistent read grant
+    counts as satisfied when an ALL APPLICATION PACKAGES allow ACE already
+    covers it, with deny ACEs honored in order. AIWorkHub never adds that ACE.
+  - **Mid-turn validation.** For a contained worker, the host-side server
+    refuses `aiworkhub_worker_validation_run`, because running candidate code
+    there would bypass the sandbox. Post-exit validation still runs inside the
+    container (NF-2026-00035).
+- Semantic edits hold the whole directory chain open while they read and write,
+  so a junction planted in the worktree cannot redirect an edit outside it.
+- C/C++ repositories: quoted includes resolve against the conventional
+  `include/` and `src/` roots. A header that is genuinely missing still fails
+  closed. `cmake` and `ctest` are trusted validation executables.
+- `aiworkhub_task_recover_blocked_rework` works on Windows.
+  - It used to probe worker pids with `os.kill(pid, 0)`. On Windows that raises
+    `[WinError 87]` for an exited pid, and without a console it terminates the
+    process.
+  - Recovery, the Source Graph LSP child check and the recipe helper now use the
+    shared liveness probe, which sends no signal.
+  - An OS error from recovery now names its operation and path
+    (NF-2026-00031).
+- Quality-reviewer prewarm can no longer wedge the launch queue until a server
+  restart (NF-2026-00027).
+  - A started prewarm expires after the preparation stall ceiling.
+  - A failed build always publishes a terminal phase.
+  - Concurrent prewarms queue behind a capacity derived from the core count.
+  - On Windows, a reviewer terminal intent can no longer settle twice.
+- `aiworkhub_dispatcher_health` reports `manager_inbox_no_live_delivery`, with
+  the backlog count, when callbacks wait in a manager inbox that nothing
+  delivers. It gates nothing (NF-2026-00029).
+- The reconciler backs off standby lock retries to a 5 s cap (NF-2026-00028).
+- VS Code LM workers:
+  - A worker can read its declared writable files during forced staging
+    (NF-2026-00023).
+  - A tool name that is not allowlisted gets one correction instead of failing
+    the request (NF-2026-00032).
+
+### Known issues
+
+- Python validation inside the AppContainer needs the base interpreter to be
+  readable by ALL APPLICATION PACKAGES. If Python is installed in an
+  admin-owned directory such as `C:\Python312`, run this once from an elevated
+  shell: `icacls C:\Python312 /grant "*S-1-15-2-1:(OI)(CI)(RX)" /T`.
+- Only `claude_cli` is bridged. `opencode_cli`, `codex_cli` and the Copilot CLI
+  adapters still start their worker MCP server inside the container, where it
+  cannot read the state it needs.
+- Host-side reads of worktree files outside semantic edit are checked for
+  containment only when the path is resolved. Hard links are not yet refused
+  (NF-2026-00036).
+- On Windows, two `test_source_graph_lsp_integration.py` concurrency tests fail
+  with `PermissionError` (NF-2026-00038). The npm-prefix seeding test
+  (NF-2026-00024) and the preflight cooldown test (NF-2026-00037, timing) are
+  also known Windows gaps.
+
 ## [0.11.58] - 2026-09-21
 
 ### Changed
