@@ -2766,6 +2766,120 @@ def test_the_python_read_set_passes_grant_validation(tmp_path):
     ]
 
 
+def _mock_system_tree(tmp_path, monkeypatch):
+    """``tmp_path/Program Files`` as the system tree, ``tmp_path/profile`` as
+    the protected profile."""
+    program_files, profile = tmp_path / "Program Files", tmp_path / "profile"
+    program_files.mkdir()
+    profile.mkdir()
+    monkeypatch.setattr(
+        wac,
+        "_sensitive_roots",
+        lambda: ([os.path.normcase(str(profile))], [os.path.normcase(str(program_files))]),
+    )
+    return program_files, profile
+
+
+def _interpreter(home):
+    home.mkdir(parents=True)
+    (home / "python.exe").write_bytes(b"MZ")
+    return home / "python.exe"
+
+
+def test_a_venv_on_a_program_files_python_grants_all_but_the_base(tmp_path, monkeypatch):
+    """Python.org's "Install for all users" home is C:\\Program Files\\Python3xx:
+    ALL APPLICATION PACKAGES already reads it, so it gets no grant at all."""
+    program_files, _profile = _mock_system_tree(tmp_path, monkeypatch)
+    _base, venv = _venv(tmp_path)
+    home = _interpreter(program_files / "Python312").parent
+    (venv / "pyvenv.cfg").write_text(f"home = {home}\n", encoding="utf-8")
+
+    grants = wac.python_read_grants(str(venv / "Scripts" / "python.exe"))
+    expected = [venv / "Scripts" / "python.exe", venv / "pyvenv.cfg", venv / "Lib" / "site-packages"]
+    assert grants == [
+        ContainerGrant(str(path), "read_execute", persistent=True) for path in expected
+    ]
+    fake = FakeWin32Api()
+    launch_appcontainer(make_request(filesystem_grants=grants), api=fake)
+    assert _grant_events(fake) == [f"grant:read_execute:{path}" for path in expected]
+    assert fake.resumed
+    # Omitted, never allowed: a request naming it is still refused.
+    detail = _refused([ContainerGrant(str(home), "read_execute", persistent=True)], FakeWin32Api())
+    assert "Windows or Program Files" in detail
+
+
+def test_a_plain_program_files_interpreter_gets_no_grant(tmp_path, monkeypatch):
+    program_files, _profile = _mock_system_tree(tmp_path, monkeypatch)
+    executable = _interpreter(program_files / "Python312")
+    assert wac.python_read_grants(str(executable)) == []
+
+
+def test_a_per_user_interpreter_is_still_granted(tmp_path, monkeypatch):
+    _program_files, profile = _mock_system_tree(tmp_path, monkeypatch)
+    executable = _interpreter(profile / "AppData" / "Local" / "Programs" / "Python312")
+    grants = wac.python_read_grants(str(executable))
+    assert grants == [ContainerGrant(str(executable.parent), "read_execute", persistent=True)]
+    fake = FakeWin32Api()
+    launch_appcontainer(make_request(filesystem_grants=grants), api=fake)
+    assert _grant_events(fake) == [f"grant:read_execute:{executable.parent}"]
+
+
+@pytest.mark.parametrize("kind", ["directory", "file"])
+def test_ctypes_denied_persistent_grant_names_the_one_time_command(
+    tmp_path, monkeypatch, kind
+):
+    target = tmp_path / "Admin Owned Tools"
+    target.mkdir()
+    requested = str(target) + os.sep  # a trailing \ would escape the closing quote
+    command = f'icacls "{target}" /grant "*S-1-15-2-1:(OI)(CI)(RX)" /T'
+    if kind == "file":
+        target = target / "tool.exe"
+        target.write_bytes(b"MZ")
+        requested = str(target)
+        # Measured: icacls drops an (OI)(CI) ACE on a file yet reports success.
+        command = f'icacls "{target}" /grant "*S-1-15-2-1:(RX)"'
+    api = _security_api(FakeSecurityLib(set_status=5), monkeypatch, present=False)
+    with pytest.raises(_Win32Failure) as excinfo:
+        api.grant_path_access(_identity(), requested, "read_execute", persistent=True)
+
+    failure = excinfo.value
+    assert (failure.win_error, failure.operation) == (5, "grant_path_access")
+
+    def _raise():
+        raise failure
+
+    with pytest.raises(AppContainerError) as surfaced:
+        wac._step("grant_path_access", _raise)
+    assert surfaced.value.reason is AppContainerReason.FILESYSTEM_GRANT_FAILED
+    assert str(surfaced.value) == (
+        f"filesystem_grant_failed: cannot add AppContainer read access to {target}: "
+        "this user lacks WRITE_DAC there (win_error 5). Run once from an elevated "
+        f"shell: {command}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("status", "access", "persistent"),
+    [(1307, "read_execute", True), (5, "modify", False)],
+)
+def test_ctypes_other_grant_failures_keep_the_plain_detail(
+    tmp_path, monkeypatch, status, access, persistent
+):
+    api = _security_api(
+        FakeSecurityLib(set_status=status), monkeypatch, present=False if persistent else None
+    )
+    with pytest.raises(_Win32Failure) as excinfo:
+        api.grant_path_access(_identity(), str(tmp_path), access, persistent=persistent)
+    assert excinfo.value.detail == f"write DACL {tmp_path}"
+
+
+def test_the_grant_hint_is_bounded_and_keeps_the_command_whole():
+    path = "C:\\" + "d" * 200
+    hint = wac._all_packages_grant_hint(path)
+    assert hint == f'icacls "{path}" /grant "*S-1-15-2-1:(RX)"'
+    assert len(hint) <= wac._GRANT_HINT_MAX_CHARS
+
+
 # -- worker MCP bridge pipe (NF-2026-00034) ------------------------------------
 
 

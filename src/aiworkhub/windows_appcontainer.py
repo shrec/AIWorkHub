@@ -220,6 +220,28 @@ def request_scoped_grants(
     return grants
 
 
+def outside_system_trees(grants: list[ContainerGrant]) -> list[ContainerGrant]:
+    """``grants`` minus each one equal to or inside a system tree
+    (%SystemRoot%, the Program Files roots -- :func:`_sensitive_roots`).
+
+    Windows gives ALL APPLICATION PACKAGES read/execute there by default so
+    that every AppContainer can load from them, and :func:`_validate_grants`
+    refuses to touch them.  Omitting such a grant only ever withholds access,
+    never widens it: on a hardened host without that default the child fails
+    with access denied, which is fail-closed.
+    """
+    if not grants:
+        return grants
+    system = _sensitive_roots()[1]
+    return [
+        grant
+        for grant in grants
+        if not any(
+            _within(os.path.normcase(os.path.normpath(grant.path)), root) for root in system
+        )
+    ]
+
+
 def python_read_grants(
     executable: str, pythonpath: str = "", *, covered: Sequence[str] = ()
 ) -> list[ContainerGrant]:
@@ -232,7 +254,9 @@ def python_read_grants(
     from there.  A plain interpreter needs its own install root.  Each
     absolute ``pythonpath`` entry is an import root too.  These are shared
     install roots, hence persistent (see :func:`launch_appcontainer`); one
-    ALL APPLICATION PACKAGES can already read costs no write.
+    ALL APPLICATION PACKAGES can already read costs no write, and one in a
+    system tree -- a Program Files install -- is omitted
+    (:func:`outside_system_trees`).
 
     ``covered`` names what the request already grants -- the worktree, HOME
     and temp, all writable by the container.  An import root inside them is
@@ -272,7 +296,7 @@ def python_read_grants(
         if root.exists() and not any(_within(key, other) for other in skip):
             skip.append(key)
             grants.append(ContainerGrant(str(root), "read_execute", persistent=True))
-    return grants
+    return outside_system_trees(grants)
 
 
 @dataclass(frozen=True)
@@ -807,6 +831,28 @@ def _satisfying_trustee(
         ):
             return "all_application_packages"
     return ""
+
+
+# The supervisor keeps 500 chars of "AppContainerError:filesystem_grant_failed:
+# <detail>"; a hint this long survives that with room to spare.
+_GRANT_HINT_MAX_CHARS = 400
+
+
+def _all_packages_grant_hint(path: str) -> str:
+    """The failure detail when this user lacks WRITE_DAC on a persistent read
+    grant's install root: the one-time command an administrator runs so ALL
+    APPLICATION PACKAGES can read it, after which the grant is satisfied and
+    writes nothing.  Past the bound only the command itself is kept."""
+    target = os.path.normpath(path)  # a trailing \ would escape the closing quote
+    if os.path.isdir(target):
+        command = f'icacls "{target}" /grant "*S-1-15-2-1:(OI)(CI)(RX)" /T'
+    else:  # measured: on a file icacls drops an (OI)(CI) ACE yet reports success
+        command = f'icacls "{target}" /grant "*S-1-15-2-1:(RX)"'
+    detail = (
+        f"cannot add AppContainer read access to {target}: this user lacks WRITE_DAC "
+        f"there (win_error 5). Run once from an elevated shell: {command}"
+    )
+    return detail if len(detail) <= _GRANT_HINT_MAX_CHARS else command
 
 
 
@@ -2131,7 +2177,12 @@ class _CtypesWin32Api:
             if satisfied_by:
                 return _PathGrant(path, access, satisfied_by=satisfied_by)
         changed = self._set_sid_entry(
-            path, sid, _GRANT_ACCESS, mask, inherit, "grant_path_access"
+            path, sid, _GRANT_ACCESS, mask, inherit, "grant_path_access",
+            denied_detail=(
+                _all_packages_grant_hint(path)
+                if persistent and access == "read_execute"
+                else ""
+            ),
         )
         return _PathGrant(path, access, sid if changed and not persistent else None)
 
@@ -2174,12 +2225,15 @@ class _CtypesWin32Api:
             self._kernel32.LocalFree(descriptor)
 
     def _set_sid_entry(
-        self, path: str, sid: bytes, mode: int, mask: int, inherit: int, operation: str
+        self, path: str, sid: bytes, mode: int, mask: int, inherit: int, operation: str,
+        *, denied_detail: str = "",
     ) -> bool:
         """Read ``path``'s DACL, apply one EXPLICIT_ACCESS entry for ``sid``,
         write it back.  False (nothing written) for a NULL DACL: it already
         admits everyone, and merging into it would REPLACE it with a one-entry
-        DACL that locks everyone else out."""
+        DACL that locks everyone else out.  ``denied_detail``, when given,
+        replaces the failure detail if the write is refused with
+        ERROR_ACCESS_DENIED (no WRITE_DAC)."""
         a = self._advapi32
         descriptor = wintypes.LPVOID()
         dacl = wintypes.LPVOID()
@@ -2223,7 +2277,12 @@ class _CtypesWin32Api:
             finally:
                 self._kernel32.LocalFree(merged)
             if status:
-                raise _Win32Failure(int(status), operation, f"write DACL {path}")
+                detail = (
+                    denied_detail
+                    if denied_detail and status == _ERROR_ACCESS_DENIED
+                    else f"write DACL {path}"
+                )
+                raise _Win32Failure(int(status), operation, detail)
             return True
         finally:
             self._kernel32.LocalFree(descriptor)

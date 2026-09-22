@@ -536,15 +536,17 @@ def _provider_install_grants(
     For an npm shim: the shim and the one package it runs -- not the whole
     npm directory the other CLIs live in.  Any other executable: that file
     alone, never its directory, which may be a shared root.  Persistent: see
-    the rationale in ``launch_appcontainer``.
+    the rationale in ``launch_appcontainer``.  Nothing in a system tree: the
+    container already reads Program Files and %SystemRoot%
+    (``windows_appcontainer.outside_system_trees``).
     """
     path = Path(executable)
     resolved = _resolve_npm_shim(executable)
     roots = [path, resolved[1]] if resolved else [path]
-    return [
+    return windows_appcontainer.outside_system_trees([
         windows_appcontainer.ContainerGrant(str(root), "read_execute", persistent=True)
         for root in roots
-    ]
+    ])
 
 
 def _worker_filesystem_grants(

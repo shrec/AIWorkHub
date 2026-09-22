@@ -777,6 +777,70 @@ def test_supervisor_native_executable_grants_only_the_file(tmp_path) -> None:
     ]
 
 
+def test_supervisor_grants_no_provider_inside_a_system_tree(monkeypatch, tmp_path) -> None:
+    """ALL APPLICATION PACKAGES already reads Program Files and %SystemRoot%."""
+    program_files, windows, profile = (
+        tmp_path / n for n in ("Program Files", "Windows", "profile")
+    )
+    node = program_files / "nodejs" / "node.exe"
+    system_exe = windows / "System32" / "tool.exe"
+    for exe in (node, system_exe):
+        exe.parent.mkdir(parents=True)
+        exe.write_bytes(b"MZ")
+    shim, package_dir = _npm_shim(profile / "AppData" / "Roaming", "claude", "@anthropic-ai\\claude-code")
+    monkeypatch.setattr(
+        windows_appcontainer,
+        "_sensitive_roots",
+        lambda: (
+            [os.path.normcase(str(profile))],
+            [os.path.normcase(str(program_files)), os.path.normcase(str(windows))],
+        ),
+    )
+    assert worker_supervisor._provider_install_grants(str(node)) == []
+    assert worker_supervisor._provider_install_grants(str(system_exe)) == []
+    # A per-user npm install is granted exactly as before.
+    grant = windows_appcontainer.ContainerGrant
+    assert worker_supervisor._provider_install_grants(str(shim)) == [
+        grant(str(shim), "read_execute", persistent=True),
+        grant(str(package_dir), "read_execute", persistent=True),
+    ]
+
+
+@pytest.mark.parametrize("name", ["Admin Owned Tools", "d" * 200])
+def test_supervisor_status_keeps_the_one_time_grant_command_whole(
+    monkeypatch, tmp_path, name
+) -> None:
+    detail = windows_appcontainer._all_packages_grant_hint(str(tmp_path / name))
+    command = detail[detail.index("icacls "):]
+
+    def _denied(_request):
+        raise windows_appcontainer.AppContainerError(
+            windows_appcontainer.AppContainerReason.FILESYSTEM_GRANT_FAILED,
+            detail=detail,
+            operation="grant_path_access",
+            win_error=5,
+        )
+
+    statuses, popen_calls = _patch_supervisor_seams(monkeypatch)
+    monkeypatch.setattr(worker_supervisor.windows_appcontainer, "launch_appcontainer", _denied)
+
+    code = worker_supervisor.supervise(
+        _supervisor_spec(
+            tmp_path,
+            execution_backend="windows_appcontainer",
+            repo_id=CANONICAL_REPO_ID,
+            worker_kind="glm53_native",
+        )
+    )
+
+    assert code == 126
+    assert popen_calls == []
+    assert statuses[-1]["state"] == "spawn_failed"
+    # The status keeps 500 chars; the whole detail, command last, fits.
+    assert statuses[-1]["error"] == f"AppContainerError:filesystem_grant_failed: {detail}"
+    assert statuses[-1]["error"].endswith(command)
+
+
 def test_launch_isolated_gives_the_appcontainer_worker_its_isolated_home(
     monkeypatch, tmp_path
 ) -> None:
