@@ -59,6 +59,7 @@ __all__ = [
     "DaclState",
     "Win32Api",
     "build_command_line",
+    "current_process_is_appcontainer",
     "derive_container_identity",
     "launch_appcontainer",
     "platform_supported",
@@ -124,7 +125,10 @@ class AppContainerError(RuntimeError):
 
     Carries the structured :class:`AppContainerReason`, the offending Win32
     operation, and the underlying ``GetLastError``/``HRESULT`` value when one
-    is available.
+    is available.  A launch-path failure additionally carries enough context
+    to diagnose it -- the resolved executable, the command-line / argument /
+    environment SIZES, and the working directory -- but never an argument,
+    command-line or environment VALUE, which carry the prompt and credentials.
     """
 
     def __init__(
@@ -134,13 +138,60 @@ class AppContainerError(RuntimeError):
         detail: str = "",
         operation: str | None = None,
         win_error: int | None = None,
+        executable: str | None = None,
+        command_line_length: int | None = None,
+        argument_count: int | None = None,
+        environment_length: int | None = None,
+        working_directory: str | None = None,
     ) -> None:
         self.reason = reason
         self.detail = detail
         self.operation = operation
         self.win_error = win_error
+        self.win_error_name = (
+            _WIN_ERROR_NAMES.get(win_error) if win_error is not None else None
+        )
+        self.executable = executable
+        self.command_line_length = command_line_length
+        self.argument_count = argument_count
+        self.environment_length = environment_length
+        self.working_directory = working_directory
         message = reason.value if not detail else f"{reason.value}: {detail}"
+        if executable is not None:
+            # Only present for a launch-path failure (see _LaunchErrorContext):
+            # gated on it so an unrelated AppContainerError's text is unchanged.
+            named = f" {self.win_error_name}" if self.win_error_name else ""
+            win_error_text = f" win_error={win_error}{named}" if win_error is not None else ""
+            message = (
+                f"{message}{win_error_text} executable={executable!r} "
+                f"command_line_length={command_line_length} "
+                f"argument_count={argument_count} "
+                f"environment_length={environment_length} "
+                f"working_directory={working_directory!r}"
+            )
         super().__init__(message)
+
+
+_WIN_ERROR_NAMES: dict[int, str] = {
+    87: "ERROR_INVALID_PARAMETER",
+    203: "ERROR_ENVVAR_NOT_FOUND",
+    206: "ERROR_FILENAME_EXCED_RANGE",
+}
+
+
+@dataclass(frozen=True)
+class _LaunchErrorContext:
+    """Non-secret context attached to a launch-path :class:`AppContainerError`.
+
+    Deliberately holds only sizes and paths -- never argv, the command line or
+    environment values, which carry the prompt and credentials.
+    """
+
+    executable: str
+    command_line_length: int
+    argument_count: int
+    environment_length: int
+    working_directory: str | None
 
 
 class _Win32Failure(Exception):
@@ -931,12 +982,17 @@ def _all_packages_grant_hint(path: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+_MAX_COMMAND_LINE_LENGTH = 32766
+
+
 def build_command_line(argv: Sequence[str]) -> str:
     """Build a Windows command line that round-trips ``argv`` verbatim.
 
     Uses the MSVCRT / ``CommandLineToArgvW`` quoting rules so the child process
     observes exactly ``argv`` with no shell interpretation.  Raises
-    :class:`ValueError` for an empty argv.
+    :class:`ValueError` for an empty argv.  ``CreateProcessW`` accepts at most
+    32767 characters including the terminating NUL, so a result longer than
+    32766 characters is refused outright rather than silently truncated.
     """
     if not argv:
         raise ValueError("argv must contain at least the executable")
@@ -945,7 +1001,10 @@ def build_command_line(argv: Sequence[str]) -> str:
         # boundary, silently dropping trailing arguments.  Reject it here too so
         # the public helper never emits a truncatable command line.
         raise ValueError("argv elements must not contain embedded NUL")
-    return " ".join(_quote_argument(str(arg)) for arg in argv)
+    command_line = " ".join(_quote_argument(str(arg)) for arg in argv)
+    if len(command_line) > _MAX_COMMAND_LINE_LENGTH:
+        raise ValueError(f"command_line_too_long:{len(command_line)}")
+    return command_line
 
 
 def _quote_argument(arg: str) -> str:
@@ -1435,6 +1494,14 @@ def launch_appcontainer(
     executable = request.executable or str(request.argv[0])
     std_handles = _std_handle_list(request)
     creation_flags = _creation_flags(request)
+    environment_text = _environment_block_text(request.environment)
+    launch_context = _LaunchErrorContext(
+        executable=executable,
+        command_line_length=len(command_line),
+        argument_count=len(request.argv),
+        environment_length=0 if environment_text is None else len(environment_text),
+        working_directory=request.working_directory,
+    )
 
     cleanup = _CleanupStack()
     creation: _ProcessCreation | None = None
@@ -1511,23 +1578,34 @@ def launch_appcontainer(
         # and during unwind on any failure path.
         cleanup.push_always(lambda: api.free_security_capabilities(sec_caps))
 
-        job = _step("create_job_object", lambda: api.create_job_object(name))
+        job = _step(
+            "create_job_object",
+            lambda: api.create_job_object(name),
+            context=launch_context,
+        )
         cleanup.push_on_failure(lambda: api.close_job(job))
-        _step("configure_job_object", lambda: api.configure_job_object(job))
+        _step(
+            "configure_job_object",
+            lambda: api.configure_job_object(job),
+            context=launch_context,
+        )
 
         attrs = _step(
             "init_attribute_list",
             lambda: api.init_attribute_list(_attribute_count(std_handles)),
+            context=launch_context,
         )
         cleanup.push_always(lambda: api.delete_attribute_list(attrs))
         _step(
             "set_security_capabilities",
             lambda: api.set_security_capabilities(attrs, sec_caps),
+            context=launch_context,
         )
         if std_handles:
             _step(
                 "set_inherited_handles",
                 lambda: api.set_inherited_handles(attrs, std_handles),
+                context=launch_context,
             )
 
         spec = _ProcessSpec(
@@ -1542,7 +1620,11 @@ def launch_appcontainer(
             creation_flags=creation_flags,
             inherit_handles=bool(std_handles),
         )
-        creation = _step("create_process", lambda: api.create_process(spec))
+        creation = _step(
+            "create_process",
+            lambda: api.create_process(spec),
+            context=launch_context,
+        )
         # Bind for the closures below without tripping "possibly unbound".
         launched = creation
         cleanup.push_on_failure(lambda: api.terminate_process(launched))
@@ -1553,8 +1635,13 @@ def launch_appcontainer(
         _step(
             "assign_process_to_job",
             lambda: api.assign_process_to_job(job, launched),
+            context=launch_context,
         )
-        _step("resume_thread", lambda: api.resume_thread(launched))
+        _step(
+            "resume_thread",
+            lambda: api.resume_thread(launched),
+            context=launch_context,
+        )
     except AppContainerError:
         cleanup.run_failure()
         raise
@@ -1581,7 +1668,12 @@ def launch_appcontainer(
     )
 
 
-def _step(operation: str, thunk: Callable[[], Any]) -> Any:
+def _step(
+    operation: str,
+    thunk: Callable[[], Any],
+    *,
+    context: _LaunchErrorContext | None = None,
+) -> Any:
     try:
         return thunk()
     except _Win32Failure as exc:
@@ -1590,11 +1682,21 @@ def _step(operation: str, thunk: Callable[[], Any]) -> Any:
         # coarse orchestration step so the taxonomy stays exact; fall back to
         # the step name only when the boundary supplied none.
         failed = exc.operation or operation
+        extra: dict[str, Any] = {}
+        if context is not None:
+            extra = {
+                "executable": context.executable,
+                "command_line_length": context.command_line_length,
+                "argument_count": context.argument_count,
+                "environment_length": context.environment_length,
+                "working_directory": context.working_directory,
+            }
         raise AppContainerError(
             _map_reason(failed, exc.win_error),
             detail=exc.detail or failed,
             operation=failed,
             win_error=exc.win_error,
+            **extra,
         ) from exc
 
 
@@ -1978,6 +2080,62 @@ def _last_win_error() -> int:
     """
     getter = getattr(ctypes, "get_last_error", None)
     return int(getter()) if getter is not None else 0
+
+
+_TOKEN_IS_APP_CONTAINER_CLASS = 29
+
+
+def current_process_is_appcontainer() -> bool:
+    """Whether this process's own token is an AppContainer token.
+
+    Lets a validation lane detect that it is itself running inside an
+    AppContainer, where a handful of tests need host-only Win32 privileges
+    they cannot have there.  Fails closed to ``False``: off Windows, or on
+    any failure to read the token, this can only under-report containment,
+    never claim it falsely.
+    """
+    if os.name != "nt":
+        return False
+    try:
+        kernel32 = _load_windows_dll("kernel32")
+        advapi32 = _load_windows_dll("advapi32")
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        advapi32.OpenProcessToken.argtypes = [
+            wintypes.HANDLE,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.HANDLE),
+        ]
+        advapi32.OpenProcessToken.restype = wintypes.BOOL
+        advapi32.GetTokenInformation.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        advapi32.GetTokenInformation.restype = wintypes.BOOL
+        token = wintypes.HANDLE()
+        if not advapi32.OpenProcessToken(
+            kernel32.GetCurrentProcess(), _TOKEN_QUERY, ctypes.byref(token)
+        ):
+            return False
+        try:
+            value = wintypes.DWORD(0)
+            size = wintypes.DWORD(0)
+            if not advapi32.GetTokenInformation(
+                token,
+                _TOKEN_IS_APP_CONTAINER_CLASS,
+                ctypes.byref(value),
+                ctypes.sizeof(value),
+                ctypes.byref(size),
+            ):
+                return False
+            return bool(value.value)
+        finally:
+            kernel32.CloseHandle(token)
+    except (OSError, AttributeError, ValueError):
+        return False
 
 
 def _load_win32() -> Win32Api:
@@ -2685,7 +2843,7 @@ class _CtypesWin32Api:
         return int(exit_code.value)
 
 
-def _environment_block(environment: Mapping[str, str] | None) -> Any:
+def _environment_block_text(environment: Mapping[str, str] | None) -> str | None:
     if environment is None:
         return None
     parts: list[str] = []
@@ -2698,8 +2856,12 @@ def _environment_block(environment: Mapping[str, str] | None) -> Any:
                 "environment keys and values must not contain embedded NUL"
             )
         parts.append(f"{key}={value}")
-    block = "\x00".join(parts) + "\x00\x00"
-    return ctypes.create_unicode_buffer(block)
+    return "\x00".join(parts) + "\x00\x00"
+
+
+def _environment_block(environment: Mapping[str, str] | None) -> Any:
+    text = _environment_block_text(environment)
+    return None if text is None else ctypes.create_unicode_buffer(text)
 
 
 # ---------------------------------------------------------------------------

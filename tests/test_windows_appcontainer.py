@@ -42,6 +42,17 @@ from aiworkhub.windows_appcontainer import (
 # ---------------------------------------------------------------------------
 
 
+# NF-2026-00964: the seven tests carrying this marker need real host Win32
+# privileges (the actual process token, a real named pipe, a real job
+# object) that the AppContainer validation lane does not have when it runs
+# this suite inside a container.  On a host -- and on any non-Windows CI
+# runner, where the detector is always False -- they run and must pass.
+requires_host_win32_privileges = pytest.mark.skipif(
+    wac.current_process_is_appcontainer(),
+    reason="requires host Win32 privileges; not available inside an AppContainer",
+)
+
+
 class FakeWin32Api:
     """A recording, fail-injectable stand-in for the real Win32 boundary.
 
@@ -2281,6 +2292,7 @@ def test_a_filesystem_root_is_never_granted(tmp_path):
     assert fake.events == []
 
 
+@requires_host_win32_privileges
 @pytest.mark.skipif(os.name != "nt", reason="resolves real Windows locations")
 def test_protected_trees_come_from_the_token_not_the_request_env(
     tmp_path, monkeypatch
@@ -2826,6 +2838,7 @@ def test_a_per_user_interpreter_is_still_granted(tmp_path, monkeypatch):
     assert _grant_events(fake) == [f"grant:read_execute:{executable.parent}"]
 
 
+@requires_host_win32_privileges
 @pytest.mark.parametrize("kind", ["directory", "file"])
 def test_ctypes_denied_persistent_grant_names_the_one_time_command(
     tmp_path, monkeypatch, kind
@@ -2954,6 +2967,7 @@ def _pipe_sddl(pipe):
     return text.value
 
 
+@requires_host_win32_privileges
 @pytest.mark.skipif(os.name != "nt", reason="real named pipe and job object")
 def test_worker_pipe_serves_only_a_client_of_the_job_and_leaves_nothing(tmp_path):
     import subprocess
@@ -2995,6 +3009,7 @@ def test_worker_pipe_serves_only_a_client_of_the_job_and_leaves_nothing(tmp_path
         open(name, "r+b", buffering=0)  # no leftover pipe
 
 
+@requires_host_win32_privileges
 @pytest.mark.skipif(os.name != "nt", reason="real named pipe")
 def test_worker_pipe_accept_gives_up_at_its_timeout():
     import time
@@ -3006,6 +3021,7 @@ def test_worker_pipe_accept_gives_up_at_its_timeout():
     assert pipe.close()
 
 
+@requires_host_win32_privileges
 @pytest.mark.skipif(os.name != "nt", reason="real named pipe")
 def test_worker_pipe_shutdown_releases_a_waiting_accept():
     import threading
@@ -3184,6 +3200,7 @@ def test_the_shim_patches_nothing_unless_it_is_sitecustomize():
     assert ntpath._getfinalpathname is final
 
 
+@requires_host_win32_privileges
 @windows_only
 def test_the_shim_mkdir_0o700_inherits_the_parent_dacl(tmp_path):
     """CPython >= 3.12.4 makes a 0o700 directory with a protected DACL that no
@@ -3297,3 +3314,179 @@ def test_the_shim_answers_a_denied_stat_only_for_a_brokered_directory(tmp_path):
         site._brokered(_missing, facts)(tmp_path)
     real = site._brokered(os.lstat, facts)(target)
     assert os.path.samestat(real, os.lstat(target))  # a granted path asks the OS
+
+
+# ---------------------------------------------------------------------------
+# NF-2026-00042: legible launch failures / NF-2026-00964: truthful lane skips
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("win_error", "name"),
+    [
+        (87, "ERROR_INVALID_PARAMETER"),
+        (203, "ERROR_ENVVAR_NOT_FOUND"),
+        (206, "ERROR_FILENAME_EXCED_RANGE"),
+    ],
+)
+def test_launch_error_names_the_win32_code_and_its_symbol(win_error, name):
+    fake = FakeWin32Api(fail_at="create_process", fail_error=win_error)
+    with pytest.raises(AppContainerError) as excinfo:
+        launch_appcontainer(make_request(), api=fake)
+
+    error = excinfo.value
+    assert error.win_error == win_error
+    assert error.win_error_name == name
+    text = str(error)
+    assert f"win_error={win_error}" in text
+    assert name in text
+
+
+def test_launch_error_carries_sizes_and_paths_as_text_and_attributes():
+    request = make_request(
+        argv=["C:\\tools\\claude.exe", "--flag", "value with space"],
+        working_directory="C:\\work\\dir",
+        environment={"FOO": "bar"},
+    )
+    fake = FakeWin32Api(fail_at="create_process", fail_error=87)
+    with pytest.raises(AppContainerError) as excinfo:
+        launch_appcontainer(request, api=fake)
+
+    error = excinfo.value
+    assert error.executable == "C:\\tools\\claude.exe"
+    assert error.command_line_length == len(build_command_line(request.argv))
+    assert error.argument_count == len(request.argv)
+    # The launch measures the block it actually hands CreateProcessW, which is
+    # the request environment after the LOCALAPPDATA chokepoint adds to it.
+    launched_environment = wac.appcontainer_child_environment(request.environment)
+    assert error.environment_length == len(wac._environment_block_text(launched_environment))
+    assert error.working_directory == "C:\\work\\dir"
+
+    text = str(error)
+    assert repr(error.executable) in text
+    assert f"command_line_length={error.command_line_length}" in text
+    assert f"argument_count={error.argument_count}" in text
+    assert f"environment_length={error.environment_length}" in text
+    assert repr(error.working_directory) in text
+
+
+def test_launch_error_never_leaks_an_argument_command_line_or_environment_value():
+    sentinel_arg = "SENTINEL-ARG-VALUE-zzz"
+    sentinel_env_value = "SENTINEL-ENV-VALUE-zzz"
+    request = make_request(
+        argv=["C:\\tools\\claude.exe", sentinel_arg],
+        environment={"SENTINEL_ENV_KEY": sentinel_env_value},
+    )
+    command_line = build_command_line(request.argv)
+    fake = FakeWin32Api(fail_at="create_process", fail_error=87)
+    with pytest.raises(AppContainerError) as excinfo:
+        launch_appcontainer(request, api=fake)
+
+    text = str(excinfo.value)
+    assert sentinel_arg not in text
+    assert sentinel_env_value not in text
+    assert command_line not in text
+    values = repr(vars(excinfo.value))
+    assert sentinel_arg not in values
+    assert sentinel_env_value not in values
+    assert command_line not in values
+
+
+def test_build_command_line_accepts_32766_and_refuses_32767_characters():
+    accepted = build_command_line(["x" * 32766])
+    assert len(accepted) == 32766
+
+    with pytest.raises(ValueError) as excinfo:
+        build_command_line(["x" * 32767])
+    assert str(excinfo.value) == "command_line_too_long:32767"
+
+
+class _FakeTokenDll:
+    """kernel32/advapi32 stand-in for a faked TokenIsAppContainer query.
+
+    Methods are plain closures assigned per-instance (never ``def`` class
+    methods): a bound method cannot take the ``.argtypes``/``.restype``
+    attribute assignments the production code performs on every DLL function
+    it calls, real or faked.
+    """
+
+    def __init__(self, *, is_appcontainer=False, open_ok=True, query_ok=True):
+        def _open_process_token(process, access, token_ref):
+            if not open_ok:
+                return False
+            token_ref._obj.value = 99
+            return True
+
+        def _get_token_information(token, info_class, value_ref, size, size_ref):
+            if not query_ok:
+                return False
+            value_ref._obj.value = int(is_appcontainer)
+            size_ref._obj.value = size
+            return True
+
+        self.GetCurrentProcess = lambda: 7
+        self.CloseHandle = lambda token: True
+        self.OpenProcessToken = _open_process_token
+        self.GetTokenInformation = _get_token_information
+
+
+def test_current_process_is_appcontainer_reflects_a_faked_token_query(monkeypatch):
+    monkeypatch.setattr(wac.os, "name", "nt")
+
+    monkeypatch.setattr(
+        wac, "_load_windows_dll", lambda name: _FakeTokenDll(is_appcontainer=True)
+    )
+    assert wac.current_process_is_appcontainer() is True
+
+    monkeypatch.setattr(
+        wac, "_load_windows_dll", lambda name: _FakeTokenDll(is_appcontainer=False)
+    )
+    assert wac.current_process_is_appcontainer() is False
+
+
+def test_current_process_is_appcontainer_is_false_when_the_token_cannot_be_read(
+    monkeypatch,
+):
+    monkeypatch.setattr(wac.os, "name", "nt")
+
+    monkeypatch.setattr(wac, "_load_windows_dll", lambda name: _FakeTokenDll(open_ok=False))
+    assert wac.current_process_is_appcontainer() is False
+
+    monkeypatch.setattr(wac, "_load_windows_dll", lambda name: _FakeTokenDll(query_ok=False))
+    assert wac.current_process_is_appcontainer() is False
+
+
+def test_current_process_is_appcontainer_is_false_off_windows(monkeypatch):
+    monkeypatch.setattr(wac.os, "name", "posix")
+    assert wac.current_process_is_appcontainer() is False
+
+
+_PRIVILEGED_LANE_SKIP_TEST_NAMES = {
+    "test_protected_trees_come_from_the_token_not_the_request_env",
+    "test_ctypes_denied_persistent_grant_names_the_one_time_command",
+    "test_worker_pipe_serves_only_a_client_of_the_job_and_leaves_nothing",
+    "test_worker_pipe_accept_gives_up_at_its_timeout",
+    "test_worker_pipe_shutdown_releases_a_waiting_accept",
+    "test_the_shim_mkdir_0o700_inherits_the_parent_dacl",
+}
+
+
+def test_the_appcontainer_lane_skip_marks_exactly_the_seven_privileged_tests():
+    import sys
+
+    module = sys.modules[__name__]
+    marked = {
+        name
+        for name, obj in vars(module).items()
+        if name.startswith("test_")
+        and callable(obj)
+        and requires_host_win32_privileges.mark in getattr(obj, "pytestmark", [])
+    }
+    assert marked == _PRIVILEGED_LANE_SKIP_TEST_NAMES
+
+    # One of the six is parametrized with two cases, making seven collected
+    # items in total -- the exact seven the objective names.
+    parametrized = module.test_ctypes_denied_persistent_grant_names_the_one_time_command
+    parametrize_marks = [m for m in parametrized.pytestmark if m.name == "parametrize"]
+    assert len(parametrize_marks) == 1
+    assert list(parametrize_marks[0].args[1]) == ["directory", "file"]
