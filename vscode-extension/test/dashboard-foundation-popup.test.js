@@ -224,10 +224,20 @@ assert.doesNotMatch(appSource, /openCodingFoundationHeaderDialog/);
 assert.doesNotMatch(appSource, /codingFoundationDialog\.addEventListener\("click"/);
 assert.strictEqual((generated.match(/card\.addEventListener\("click"/g) || []).length, 1);
 
-const skillsBody = css.match(/#header-skills,\s*\n#header-tool-recipes,\s*\n#header-semantic-edit-coverage \{([^}]*max-height:[^}]*)\}/);
-assert.ok(skillsBody, "popup header cards must share a containment rule");
-assert.match(skillsBody[1], /max-height:\s*58px/);
-assert.match(skillsBody[1], /overflow:\s*hidden/);
+// The popup cards are contained by the rule every header tile shares: a fixed
+// label / value / two-line caption grid, with the caption clamped. The old
+// containment -- max-height: 58px + overflow: hidden on these three cards
+// only -- is what made them shorter than their row and cut their captions off
+// (owner report), so it must not come back.
+assert.doesNotMatch(css, /#header-skills,\s*\n#header-tool-recipes,\s*\n#header-semantic-edit-coverage \{[^}]*max-height:/,
+  "the popup cards must not be clipped to a max-height again");
+const tileBody = css.match(/\.header-insight-card \{([^}]*)\}/);
+assert.ok(tileBody, "header tiles must share a containment rule");
+assert.match(tileBody[1], /grid-template-rows:\s*auto auto calc\(/, "every tile reserves the same label / value / caption rows");
+const captionBody = css.match(/\.header-insight-card > :last-child \{([^}]*)\}/);
+assert.ok(captionBody, "tile captions must share a clamp rule");
+assert.match(captionBody[1], /-webkit-line-clamp:\s*2/);
+assert.match(captionBody[1], /overflow:\s*hidden/);
 const dialogBody = css.match(/\.coding-foundation-dialog-body \{([^}]*)\}/);
 assert.ok(dialogBody, "popup body rule missing");
 assert.match(dialogBody[1], /overflow:\s*auto/);

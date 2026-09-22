@@ -460,7 +460,7 @@ const SNAPSHOT_SIBLING_RENDERERS = [
   "renderFilterOptions", "renderTaskTable", "renderStats", "renderKpis",
   "renderUsage", "renderPlanDag", "renderWorkforce", "renderToolUse",
   "renderStorage", "renderSystemLogs", "renderReturns", "renderRuns",
-  "renderWarnings", "applyHistorySnapshot", "clearTaskDetail",
+  "renderWarnings", "applyHistorySnapshot", "renderHeaderSignals", "clearTaskDetail",
 ];
 
 function stubSnapshotSiblings(target) {

@@ -4,7 +4,10 @@
   --surface-subtle: var(--vscode-editorWidget-background, var(--vscode-editor-background));
   --ink: var(--vscode-editor-foreground, var(--vscode-foreground));
   --ink-soft: var(--vscode-descriptionForeground);
-  --muted: var(--vscode-disabledForeground, var(--vscode-descriptionForeground));
+  /* Secondary TEXT, so it must clear AA. disabledForeground is a 50%-alpha
+     colour meant for disabled controls: as label ink it measured about 2:1 on
+     the light panel and 4:1 on the dark one, under 4.5:1 in both. */
+  --muted: var(--vscode-descriptionForeground);
   --line: var(--vscode-widget-border, var(--vscode-panel-border));
   --line-strong: var(--vscode-panel-border);
   --accent: var(--vscode-focusBorder, var(--vscode-textLink-foreground));
@@ -21,6 +24,17 @@
   --stale-soft: color-mix(in srgb, var(--stale) 18%, var(--canvas));
   --archived: var(--vscode-charts-purple, #9b8fc0);
   --archived-soft: color-mix(in srgb, var(--archived) 18%, var(--canvas));
+  /* The same hues as TEXT. A chart hue is a fill colour: as text on its own
+     soft tint, charts-yellow/-blue/-green measured 2.7-3.6:1 on the light
+     theme. 40% hue into the theme ink keeps the hue and measured 4.9:1 or
+     better on both the dark and the light theme; it follows the theme ink, so
+     it darkens on a light theme and lightens on a dark one. */
+  --pending-ink: color-mix(in srgb, var(--pending) 40%, var(--ink));
+  --processing-ink: color-mix(in srgb, var(--processing) 40%, var(--ink));
+  --review-ink: color-mix(in srgb, var(--review) 40%, var(--ink));
+  --blocked-ink: color-mix(in srgb, var(--blocked) 40%, var(--ink));
+  --stale-ink: color-mix(in srgb, var(--stale) 40%, var(--ink));
+  --archived-ink: color-mix(in srgb, var(--archived) 40%, var(--ink));
   --shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
 
   /* Terminal-outcome chart palette.
@@ -298,7 +312,12 @@ summary:focus-visible,
      scrollbar to the whole window (measured: 39px of page overflow at 380px). */
   contain: paint;
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(min(100%, 132px), 1fr));
+  /* 168px keeps the longest real caption (Preflight, about 250px of text) to
+     two lines, and gives 7 columns at 1200px, 5 at 870-900px. */
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 168px), 1fr));
+  /* One height for every tile in every row: fr rows in an auto-height grid
+     all resolve to the tallest tile. */
+  grid-auto-rows: 1fr;
   gap: 1px;
   padding: 0;
   background: var(--surface-subtle);
@@ -346,6 +365,21 @@ summary:focus-visible,
   font-size: var(--fs-xs);
 }
 
+/* The repository name is what the operator reads; the id is for matching
+   logs, so it is set smaller and muted, shortened, with the full id in its
+   tooltip. */
+.repo-label .repo-name {
+  color: var(--ink);
+  font-weight: 600;
+}
+
+.repo-label .repo-id {
+  margin-left: 2px;
+  color: var(--muted);
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: var(--fs-2xs);
+}
+
 .readonly-badge {
   flex: 0 0 auto;
   padding: 2px 6px;
@@ -375,16 +409,24 @@ summary:focus-visible,
   gap: 8px;
 }
 
+/* A fixed three-part tile: status label, value, and a caption that always
+   reserves exactly two lines. Every tile is therefore the same height whatever
+   it says, and a caption longer than two lines ends in an ellipsis (full text
+   in a tooltip, see syncInsightLayout in app.js) instead of being cut
+   mid-glyph. The old max-height + nowrap on the Skills / Tool Recipes /
+   Semantic Edit tiles is what cut "Measured" and "No evidence" off. */
 .header-insight-card {
-  display: flex;
-  flex-direction: column;
+  --tile-dot: var(--muted);
+  display: grid;
+  /* Set by syncInsightLayout so the last row's tiles fill it. */
+  grid-column: span var(--tile-span, 1);
+  grid-template-rows: auto auto calc(var(--fs-2xs) * 2.6);
   width: 100%;
   min-width: 0;
-  min-height: 52px;
   align-items: center;
-  justify-content: center;
-  gap: 1px;
-  padding: 7px 10px;
+  justify-items: center;
+  row-gap: 1px;
+  padding: 5px 8px;
   color: var(--ink);
   background: var(--surface-subtle);
   border: 0;
@@ -392,6 +434,27 @@ summary:focus-visible,
   box-shadow: 1px 0 0 var(--line), 0 1px 0 var(--line);
   text-align: center;
 }
+
+/* The ring sits inside the tile: the strip clips its paint, so an outer ring
+   on an edge tile would be cut in half. */
+.header-insight-card:focus-visible {
+  outline-offset: -2px;
+}
+
+/* State from the data the tile prints (app.js setTileHealth): a dot for every
+   tile, and a left rule plus a tinted value only for a real problem. The
+   value text always names the state, so colour is never the only signal. */
+.header-insight-card[data-health="ok"] { --tile-dot: var(--vscode-testing-iconPassed, var(--review)); }
+.header-insight-card[data-health="warn"] { --tile-dot: var(--vscode-editorWarning-foreground, var(--pending)); }
+.header-insight-card[data-health="error"] { --tile-dot: var(--vscode-testing-iconFailed, var(--blocked)); }
+
+.header-insight-card[data-health="warn"],
+.header-insight-card[data-health="error"] {
+  box-shadow: inset 2px 0 0 var(--tile-dot), 1px 0 0 var(--line), 0 1px 0 var(--line);
+}
+
+.header-insight-card[data-health="warn"] strong { color: var(--pending-ink); }
+.header-insight-card[data-health="error"] strong { color: var(--blocked-ink); }
 
 .header-storage,
 .header-tool-use,
@@ -411,23 +474,7 @@ summary:focus-visible,
 #header-skills:hover,
 #header-tool-recipes:hover,
 #header-semantic-edit-coverage:hover {
-  border-color: var(--accent);
-  background: var(--review-soft);
-}
-
-#header-skills,
-#header-tool-recipes,
-#header-semantic-edit-coverage {
-  max-height: 58px;
-  overflow: hidden;
-}
-
-#header-skills .header-insight-detail,
-#header-tool-recipes .header-insight-detail,
-#header-semantic-edit-coverage .header-insight-detail {
-  max-width: 100%;
-  overflow: hidden;
-  white-space: nowrap;
+  background: var(--vscode-list-hoverBackground, var(--accent-soft));
 }
 
 .telemetry-section-title {
@@ -771,15 +818,15 @@ th {
 
 .kpi-disclosure.warning { border-left-color: var(--pending); }
 
-.header-tool-use {
-  text-align: center;
-}
-
-.header-tool-use strong,
 .header-insight-card strong {
+  max-width: 100%;
+  overflow: hidden;
   font-size: var(--fs-sm);
   font-variant-numeric: tabular-nums;
-  line-height: 1.2;
+  font-weight: 600;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .telemetry-note {
@@ -922,30 +969,49 @@ th {
   padding: 6px 8px;
 }
 
-#header-source-graph-detail,
-.header-insight-detail {
+/* The caption is every tile's last child (.header-insight-detail, or the
+   Storage / Source Graph detail spans). Two lines exactly -- the row above
+   reserves them -- and an ellipsis past that, never a hard cut. */
+.header-insight-card > :last-child {
+  display: -webkit-box;
+  align-self: start;
+  max-width: 100%;
+  overflow: hidden;
   color: var(--muted);
   font-size: var(--fs-2xs);
   font-variant-numeric: tabular-nums;
-  line-height: 1.2;
+  line-height: 1.3;
+  overflow-wrap: anywhere;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
 }
 
 .header-storage-label {
+  display: inline-flex;
+  max-width: 100%;
+  align-items: center;
+  gap: 5px;
   color: var(--muted);
   font-size: var(--fs-2xs);
   font-weight: 400;
+  line-height: 1.3;
+  white-space: nowrap;
 }
 
-.header-storage strong {
-  font-size: var(--fs-sm);
-  font-variant-numeric: tabular-nums;
+.header-insight-card .header-storage-label::before {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 7px;
+  content: "";
+  background: var(--tile-dot);
+  border-radius: 50%;
 }
 
-#header-storage-free {
-  color: var(--muted);
-  font-size: var(--fs-2xs);
-  font-variant-numeric: tabular-nums;
-  line-height: 1.2;
+/* Loading, or not rendered yet: a hollow ring, not a filled grey dot. */
+.header-insight-card[data-health="loading"] .header-storage-label::before,
+.header-insight-card:not([data-health]) .header-storage-label::before {
+  background: transparent;
+  box-shadow: inset 0 0 0 1px var(--muted);
 }
 
 .connection-state {
@@ -1068,30 +1134,49 @@ main {
   width: 100%;
 }
 
+/* Two labelled rows -- what is moving now, and what has already landed -- so
+   the grouping reads without putting a card around each. The label column is
+   one fixed width so the two rows' counters stay in the same columns. */
+.summary-group {
+  display: grid;
+  grid-template-columns: calc(var(--fs-2xs) * 7) minmax(0, 1fr);
+  background: var(--surface);
+  border-bottom: 1px solid var(--line);
+}
+
+.summary-group-label {
+  display: flex;
+  align-items: center;
+  padding: 0 8px 0 14px;
+  color: var(--muted);
+  font-size: var(--fs-2xs);
+  border-right: 1px solid var(--line);
+}
+
 /* Intrinsic, replacing the 560px breakpoint that used to re-column it. */
 .summary-strip {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(min(100%, 116px), 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 100px), 1fr));
   background: var(--surface);
-  border-bottom: 1px solid var(--line);
 }
 
 .summary-item {
   position: relative;
   min-width: 0;
-  min-height: 62px;
-  padding: 10px 12px 8px;
+  padding: 7px 12px 6px;
   border-right: 1px solid var(--line);
 }
 
+/* No rule by default: a coloured bar on all twelve counters meant none of them
+   said anything. It appears only on an attention counter that is non-zero. */
 .summary-item::before {
   position: absolute;
   top: 0;
   right: 0;
   left: 0;
-  height: 3px;
+  height: 2px;
   content: "";
-  background: var(--muted);
+  background: transparent;
 }
 
 .summary-item:last-child {
@@ -1101,13 +1186,23 @@ main {
 .summary-item strong {
   display: block;
   overflow: hidden;
-  margin-top: 3px;
-  font-size: var(--fs-xl);
+  margin-top: 1px;
+  font-size: var(--fs-lg);
   font-variant-numeric: tabular-nums;
-  line-height: 1.1;
+  line-height: 1.15;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+/* Zero recedes; Review / Blocked / Stale speak up only when they are not zero
+   (app.js markCounters). The label always names the counter. */
+.summary-item.is-zero strong { color: var(--muted); }
+.summary-item.status-review.is-attention::before { background: var(--review); }
+.summary-item.status-blocked.is-attention::before { background: var(--blocked); }
+.summary-item.status-stale.is-attention::before { background: var(--stale); }
+.summary-item.status-review.is-attention strong { color: var(--review-ink); }
+.summary-item.status-blocked.is-attention strong { color: var(--blocked-ink); }
+.summary-item.status-stale.is-attention strong { color: var(--stale-ink); }
 
 .summary-label,
 .summary-note {
@@ -1119,16 +1214,9 @@ main {
 .summary-note {
   position: absolute;
   right: 12px;
-  bottom: 9px;
+  bottom: 7px;
   font-variant-numeric: tabular-nums;
 }
-
-.status-pending::before { background: var(--pending); }
-.status-processing::before { background: var(--processing); }
-.status-review::before { background: var(--review); }
-.status-blocked::before { background: var(--blocked); }
-.status-stale::before { background: var(--stale); }
-.usage-total::before { background: var(--processing); }
 
 .source-alert {
   display: flex;
@@ -1136,26 +1224,26 @@ main {
   align-items: baseline;
   gap: 8px;
   padding: 7px 14px;
-  color: var(--stale);
+  color: var(--stale-ink);
   background: var(--stale-soft);
   border-bottom: 1px solid var(--stale);
   font-size: var(--fs-sm);
 }
 
 .source-alert.offline-alert {
-  color: var(--blocked);
+  color: var(--blocked-ink);
   background: var(--blocked-soft);
   border-bottom-color: var(--blocked);
 }
 
 .source-alert.identity-alert.identity-ok {
-  color: var(--review);
+  color: var(--review-ink);
   background: var(--review-soft);
   border-bottom-color: var(--review);
 }
 
 .source-alert.identity-alert.identity-warn {
-  color: var(--pending);
+  color: var(--pending-ink);
   background: var(--pending-soft);
   border-bottom-color: var(--pending);
 }
@@ -1186,13 +1274,18 @@ main {
   white-space: nowrap;
 }
 
+/* A verified check is the healthy case, so it recedes to ink with a green
+   rule; the tick carries the state. Green-on-green measured under AA on the
+   light theme. */
 .identity-check-ok {
-  color: var(--review);
+  color: var(--ink);
+  border-color: var(--review);
   background: color-mix(in srgb, var(--review) 12%, transparent);
 }
 
 .identity-check-warn {
-  color: var(--pending);
+  color: var(--pending-ink);
+  border-color: var(--pending);
   background: color-mix(in srgb, var(--pending) 12%, transparent);
 }
 
@@ -1427,20 +1520,28 @@ main {
   margin-left: auto;
 }
 
+/* Routing and the known-repository router are low-signal context, so they
+   share one compact line instead of a full-width row each. */
+.context-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 24px;
+  padding: 4px 14px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--line);
+  font-size: var(--fs-xs);
+}
+
 .target-selector {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   gap: 8px;
-  padding: 8px 14px;
-  background: var(--surface);
-  border-bottom: 1px solid var(--line);
-  font-size: var(--fs-sm);
 }
 
 .target-selector span {
   color: var(--muted);
-  font-weight: 600;
 }
 
 .target-selector button {
@@ -1459,10 +1560,9 @@ main {
 }
 
 .target-selector strong {
-  min-width: 160px;
-  color: var(--ink-soft);
-  font-size: var(--fs-sm);
-  font-weight: 600;
+  color: var(--ink);
+  font-size: var(--fs-xs);
+  font-weight: 400;
 }
 
 .repo-router {
@@ -1470,15 +1570,10 @@ main {
   flex-wrap: wrap;
   align-items: center;
   gap: 8px;
-  padding: 7px 14px;
-  background: var(--surface);
-  border-bottom: 1px solid var(--line);
-  font-size: var(--fs-sm);
 }
 
 .repo-router > span {
   color: var(--muted);
-  font-weight: 600;
 }
 
 #repo-router-list {
@@ -1492,21 +1587,23 @@ main {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  padding: 3px 7px;
+  padding: 1px 7px;
   color: var(--ink-soft);
   background: var(--surface-subtle);
   border: 1px solid var(--line);
   border-radius: 999px;
 }
 
+/* Ink on a green rule, not green on green: the "live" pill measured under AA
+   on the light theme. */
 .repo-route.current {
-  color: var(--review);
+  color: var(--ink);
   border-color: var(--review);
   background: var(--review-soft);
 }
 
 .repo-route.stale {
-  color: var(--stale);
+  color: var(--stale-ink);
   border-color: var(--stale);
   background: var(--stale-soft);
 }
@@ -1636,11 +1733,12 @@ main {
   position: relative;
 }
 
+/* Sized to its rows, up to the cap: a fixed 240px floor left a blank band
+   under a short queue. The loading / empty states carry their own height. */
 .table-shell {
   contain: paint;
   position: relative;
   width: 100%;
-  min-height: 240px;
   max-height: 60vh;
   overflow: auto;
   overscroll-behavior: contain;
@@ -1721,12 +1819,12 @@ tbody tr.is-selected td:first-child {
   white-space: nowrap;
 }
 
-.status-badge.pending { color: var(--pending); background: var(--pending-soft); border-color: var(--pending); }
-.status-badge.processing { color: var(--processing); background: var(--processing-soft); border-color: var(--processing); }
-.status-badge.review { color: var(--review); background: var(--review-soft); border-color: var(--review); }
-.status-badge.blocked { color: var(--blocked); background: var(--blocked-soft); border-color: var(--blocked); }
-.status-badge.stale, .signal-badge.stale { color: var(--stale); background: var(--stale-soft); border-color: var(--stale); }
-.status-badge.archived { color: var(--archived); background: var(--archived-soft); border-color: var(--archived); }
+.status-badge.pending { color: var(--pending-ink); background: var(--pending-soft); border-color: var(--pending); }
+.status-badge.processing { color: var(--processing-ink); background: var(--processing-soft); border-color: var(--processing); }
+.status-badge.review { color: var(--review-ink); background: var(--review-soft); border-color: var(--review); }
+.status-badge.blocked { color: var(--blocked-ink); background: var(--blocked-soft); border-color: var(--blocked); }
+.status-badge.stale, .signal-badge.stale { color: var(--stale-ink); background: var(--stale-soft); border-color: var(--stale); }
+.status-badge.archived { color: var(--archived-ink); background: var(--archived-soft); border-color: var(--archived); }
 
 .task-link {
   display: block;
@@ -1787,13 +1885,13 @@ tbody tr.is-selected td:first-child {
   border-color: var(--line);
 }
 
-.signal-badge.fail { color: var(--blocked); background: var(--blocked-soft); border-color: var(--blocked); }
-.signal-badge.pass { color: var(--review); background: var(--review-soft); border-color: var(--review); }
+.signal-badge.fail { color: var(--blocked-ink); background: var(--blocked-soft); border-color: var(--blocked); }
+.signal-badge.pass { color: var(--review-ink); background: var(--review-soft); border-color: var(--review); }
 
 .table-empty,
 .table-loading {
   display: grid;
-  min-height: 220px;
+  min-height: 120px;
   place-items: center;
   color: var(--muted);
   font-size: var(--fs-sm);
@@ -2298,6 +2396,9 @@ tbody tr.is-selected td:first-child {
 }
 
 .activity-peek {
+  /* Its own width decides when the viewer buttons drop to icons, so the last
+     log message is not squeezed to "N..." at 870-900px. */
+  container-type: inline-size;
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) auto;
   min-height: 31px;
@@ -2327,7 +2428,11 @@ tbody tr.is-selected td:first-child {
 .callback-observability > span:last-child { border-right: 0; }
 .callback-observability small { color: var(--muted); font-size: var(--fs-2xs); }
 .callback-observability strong { overflow: hidden; font-size: var(--fs-xs); text-overflow: ellipsis; white-space: nowrap; }
-.callback-observability.is-degraded strong:last-child { color: var(--blocked); }
+/* Colour only a value that is actually bad. This used to be
+   `.is-degraded strong:last-child`, and every value is the last child of its
+   own cell, so a degraded route painted "Retries 0" red as well. */
+.callback-observability.is-degraded #callback-degraded { color: var(--blocked-ink); }
+.callback-observability strong.is-warn { color: var(--pending-ink); }
 
 .return-toolbar {
   position: sticky;
@@ -2420,6 +2525,13 @@ tbody tr.is-selected td:first-child {
   stroke-width: 1.7;
   stroke-linecap: round;
   stroke-linejoin: round;
+}
+
+/* After the button rules so the padding wins. Every viewer button keeps its
+   title and aria-label, so icon-only loses no name. */
+@container (max-width: 1000px) {
+  .activity-peek .diagnostic-icon-button span { display: none; }
+  .activity-peek .diagnostic-icon-button { padding: 4px; }
 }
 
 .diagnostic-dialog {

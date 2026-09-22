@@ -10776,6 +10776,8 @@ function getHtmlForWebview(webview, extensionUri) {
 
   <main>
     <section aria-label="Live tasks">
+    <div class="summary-group">
+    <span class="summary-group-label" aria-hidden="true">Pipeline</span>
     <div class="summary-strip" aria-label="Live task counts">
       <div class="summary-item status-all">
         <span class="summary-label">Active</span>
@@ -10802,9 +10804,12 @@ function getHtmlForWebview(webview, extensionUri) {
         <strong id="metric-stale">0</strong>
       </div>
     </div>
+    </div>
     </section>
 
     <section aria-label="Task outcomes">
+    <div class="summary-group">
+    <span class="summary-group-label" aria-hidden="true">Outcomes</span>
     <div class="summary-strip" aria-label="Task outcome counts">
       <div class="summary-item"><span class="summary-label">Accepted</span><strong id="metric-accepted">0</strong></div>
       <div class="summary-item"><span class="summary-label">Rejected</span><strong id="metric-rejected">0</strong></div>
@@ -10816,6 +10821,7 @@ function getHtmlForWebview(webview, extensionUri) {
         <strong id="metric-tokens">0</strong>
         <span class="summary-note" id="metric-cost">$0.00</span>
       </div>
+    </div>
     </div>
     </section>
 
@@ -10915,6 +10921,7 @@ function getHtmlForWebview(webview, extensionUri) {
       </span>
     </section>
 
+    <div class="context-meta">
     <section class="target-selector" aria-label="Coordinator routing">
       <span>Coordinator routing</span>
       <strong id="target-state">Automatic by originating chat</strong>
@@ -10924,6 +10931,7 @@ function getHtmlForWebview(webview, extensionUri) {
       <span>Known repos</span>
       <div id="repo-router-list"></div>
     </section>
+    </div>
 
     <div class="workspace">
       <section class="task-workspace" aria-labelledby="task-heading">

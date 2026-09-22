@@ -535,6 +535,13 @@ function setConnection(mode, label) {
   elements.connectionLabel.textContent = label;
 }
 
+// A header tile's status dot: ok | warn | error | neutral | loading. Always
+// derived from the same fields the tile prints, so the dot and the text can
+// never disagree, and never from anything the tile does not show.
+function setTileHealth(card, health) {
+  if (card && card.dataset) card.dataset.health = health;
+}
+
 function renderSummary(snapshot) {
   const counts = snapshot.status_counts || {};
   for (const metric of ["active", "pending", "processing", "review", "blocked", "stale"]) {
@@ -562,6 +569,7 @@ function renderSummary(snapshot) {
   elements.headerStorageFree.textContent = storage
     ? `Free ${formatBytes(storage.disk_free_bytes)}`
     : "Free —";
+  setTileHealth(elements.headerStorage, !storage ? "neutral" : storage.scan_status === "scanning" ? "loading" : "ok");
   const sourceGraph = snapshot && snapshot.source_graph_telemetry
     && typeof snapshot.source_graph_telemetry === "object"
     ? snapshot.source_graph_telemetry
@@ -582,6 +590,9 @@ function renderSummary(snapshot) {
     elements.headerSourceGraphDetail.textContent = gated
       ? `${live}/${gated} live · ${resolvability}`
       : resolvability;
+    // From the printed live/gated figures only; contract violations live in
+    // the tooltip, and a red dot beside "100.0% live" would contradict the tile.
+    setTileHealth(elements.headerSourceGraph, !gated ? "neutral" : live < gated ? "warn" : "ok");
     const quality = sourceGraphHealth && sourceGraphHealth.index_quality;
     const edgeRatio = quality && quality.edges && Number.isFinite(Number(quality.edges.resolved_ratio))
       ? `${(Number(quality.edges.resolved_ratio) * 100).toFixed(1)}% resolved edges`
@@ -618,6 +629,8 @@ function renderSummary(snapshot) {
     if (card) card.title = telemetry
       ? `${formatCount(requested)} requested · ${formatCount(executed)} executed · ${formatCount(hits)} context matches · ${formatBytes(bytes)} returned · ${degraded} degraded`
       : "Context telemetry unavailable";
+    // "0/0 runs" is not a health signal, so it stays neutral rather than green.
+    setTileHealth(card, !requested ? "neutral" : degraded || executed < requested ? "warn" : "ok");
   }
   const needfix = snapshot && snapshot.needfix && typeof snapshot.needfix === "object"
     ? snapshot.needfix
@@ -630,6 +643,7 @@ function renderSummary(snapshot) {
       elements.headerNeedfixValue.textContent = `${formatCount(needfix.open)} open`;
       elements.headerNeedfixDetail.textContent = `${formatCount(needfix.total)} stored${needfix.truncated ? " · partial" : ""}`;
     }
+    setTileHealth(elements.headerNeedfix, !needfix ? "neutral" : needfix.available === false ? "error" : "ok");
     if (elements.headerNeedfix) {
       elements.headerNeedfix.title = needfix && needfix.available !== false
         ? `${numberValue(needfix.open)} open NeedFix entries · ${numberValue(needfix.total)} visible`
@@ -647,6 +661,7 @@ function renderSummary(snapshot) {
       elements.headerRoadmapValue.textContent = `${formatCount(roadmap.active)} active`;
       elements.headerRoadmapDetail.textContent = `${formatCount(roadmap.total)} outcomes${roadmap.truncated ? " · partial" : ""}`;
     }
+    setTileHealth(elements.headerRoadmap, !roadmap ? "neutral" : roadmap.available === false ? "error" : "ok");
     if (elements.headerRoadmap) {
       elements.headerRoadmap.title = roadmap && roadmap.available !== false
         ? `${numberValue(roadmap.active)} active Roadmap outcomes · ${numberValue(roadmap.total)} visible`
@@ -680,6 +695,7 @@ function renderSummary(snapshot) {
     elements.headerPreflightValue.textContent = preflight
       ? (!preflight.ok ? "Blocked" : (coverageStatus === "degraded" ? "Degraded" : "Ready"))
       : "Unavailable";
+    setTileHealth(elements.headerPreflight, !preflight ? "neutral" : !preflight.ok ? "error" : coverageStatus === "degraded" ? "warn" : "ok");
     elements.headerPreflightDetail.textContent = preflight
       ? (brokerModels.length
         ? `${brokerModels.length} editor models · ${readyProviders}/${eligibleRouteCount} secure routes · ${unavailableRoutes.length} unavailable${excludedRoutes.length ? ` · ${excludedRoutes.length} platform/policy excluded` : ""}`
@@ -729,11 +745,13 @@ function renderSummaryProjection(snapshot) {
       ? "Calculating"
       : formatBytes(storage.managed_total_bytes);
     elements.headerStorageFree.textContent = `Free ${formatBytes(storage.disk_free_bytes)}`;
+    setTileHealth(elements.headerStorage, storage.scan_status === "scanning" ? "loading" : "ok");
   }
   // The summary deliberately omits history_series. Telling the History page
   // so is what keeps it saying "loading" instead of asserting an
   // unavailability that was never measured.
   applyHistorySnapshot(snapshot);
+  renderHeaderSignals();
 }
 
 function renderSourceHealth(snapshot) {
@@ -1174,6 +1192,9 @@ function renderCallbackObservability(snapshot) {
   elements.callbackDelivery.title = lastDelivery || "No delivered callback recorded";
   elements.callbackRetries.textContent = formatCount(retries);
   elements.callbackRetries.title = `max attempts=${numberValue(health.max_attempts)}`;
+  // Amber only when the number is actually bad; a zero stays plain ink.
+  elements.callbackBacklog.classList.toggle("is-warn", backlog > 0);
+  elements.callbackRetries.classList.toggle("is-warn", retries > 0);
   elements.callbackDegraded.textContent = currentlyDegraded
     ? degradedReason
     : deadLetters
@@ -1270,6 +1291,19 @@ function validationClass(value) {
   return "";
 }
 
+// The row's second line: the card's human title when it carries one, else its
+// objective. Worker cards open the objective with a fixed "WORKER: use only
+// aiworkhub_worker_* tools..." contract line, identical on every card, so the
+// first line that is not that preamble is what tells two rows apart. The full
+// objective stays in the tooltip.
+function taskSummaryLine(task) {
+  const title = String(task.title || "").trim();
+  if (title) return title;
+  const objective = String(task.objective || "").trim();
+  const lines = objective.split(/\n+/).map((line) => line.trim()).filter(Boolean);
+  return lines.find((line) => !/^WORKER:/i.test(line)) || objective;
+}
+
 function renderTaskTable() {
   const tasks = filteredTasks();
   const fragment = document.createDocumentFragment();
@@ -1291,9 +1325,10 @@ function renderTaskTable() {
     taskButton.dataset.taskId = taskId;
     taskButton.title = taskId;
     taskCell.appendChild(taskButton);
-    if (task.objective) {
-      const objective = createElement("span", "cell-secondary", task.objective);
-      objective.title = String(task.objective);
+    const summary = taskSummaryLine(task);
+    if (summary) {
+      const objective = createElement("span", "cell-secondary", summary);
+      objective.title = String(task.objective || summary);
       taskCell.appendChild(objective);
     }
     row.appendChild(taskCell);
@@ -3678,6 +3713,8 @@ function renderSnapshot(snapshot) {
   // strings. The twelve panels are built only when the page is open, so the
   // snapshot render never waits on the charts page.
   applyHistorySnapshot(snapshot);
+  // Last: it reads what every renderer above wrote, history included.
+  renderHeaderSignals();
   if (state.selectedTaskId && !state.tasks.some((task) => String(task.task_id) === state.selectedTaskId)) {
     clearTaskDetail();
   }
@@ -6753,6 +6790,96 @@ function updateHistoryHeader() {
 }
 // ═══ HISTORY_PAGE_END ═════════════════════════════════════════════════════
 
+// ── Header signals ────────────────────────────────────────────────────────
+// These read what the renderers above already wrote, after every snapshot or
+// summary message -- by then the coding-foundation script, which loads before
+// this one, has also updated its four tiles.
+
+const ATTENTION_COUNTERS = new Set(["review", "blocked", "stale"]);
+const COUNTER_METRICS = [
+  "active", "pending", "processing", "review", "blocked", "stale",
+  "accepted", "rejected", "archived", "superseded", "finished", "tokens",
+];
+
+// Zero recedes; Review / Blocked / Stale light up only when not zero. The
+// exact count is the value's title (renderSummary writes it), not its compact
+// text.
+function markCounters() {
+  for (const metric of COUNTER_METRICS) {
+    const value = document.querySelector(`#metric-${metric}`);
+    const item = value && value.parentElement;
+    if (!item || !item.classList) continue;
+    const count = numberValue(String(value.title || "").split(" ")[0]);
+    item.classList.toggle("is-zero", count === 0);
+    item.classList.toggle("is-attention", count > 0 && ATTENTION_COUNTERS.has(metric));
+  }
+}
+
+const FOUNDATION_TILE_HEALTH = { pending: "loading", unavailable: "error", invalid: "error" };
+
+// History keeps its state in `state`; the four coding-foundation tiles keep
+// theirs in data-state. A measured zero ("0 skills") is neutral, not green.
+function markDerivedTiles() {
+  const series = state.historySeries || {};
+  setTileHealth(elements.headerHistory, state.historyState === "pending"
+    ? "loading"
+    : state.historyState === "absent" || series.measured === false ? "neutral" : "ok");
+  for (const id of ["development-rules", "skills", "tool-recipes", "semantic-edit-coverage"]) {
+    const card = document.querySelector(`#header-${id}`);
+    const value = document.querySelector(`#header-${id}-value`);
+    if (!card || typeof card.getAttribute !== "function") continue;
+    const cardState = String(card.getAttribute("data-state") || "pending");
+    const zero = /^0\s/.test(String((value && value.textContent) || "").trim());
+    setTileHealth(card, FOUNDATION_TILE_HEALTH[cardState] || (cardState === "measured" && !zero ? "ok" : "neutral"));
+  }
+}
+
+// Fourteen tiles rarely divide the column count, so the last row would end in
+// a hole. Widen the last row's tiles by whole columns, so the columns above
+// still line up, until the row is full. A caption the two-line clamp had to
+// shorten gets its full text as a tooltip. Layout only: no tile, value or
+// order changes.
+function syncInsightLayout() {
+  const grid = document.querySelector(".header-insights");
+  if (!grid || typeof window.getComputedStyle !== "function") return;
+  const cards = Array.from(grid.children);
+  for (const card of cards) card.style.removeProperty("--tile-span");
+  const columns = window.getComputedStyle(grid).gridTemplateColumns
+    .split(" ")
+    .filter((track) => parseFloat(track) > 0).length;
+  const tail = columns > 1 ? cards.length % columns : 0;
+  cards.slice(cards.length - tail).forEach((card, index) => {
+    card.style.setProperty("--tile-span", String(Math.floor(columns / tail) + (index < columns % tail ? 1 : 0)));
+  });
+  for (const card of cards) {
+    const caption = card.lastElementChild;
+    if (!caption) continue;
+    if (caption.scrollHeight > caption.clientHeight + 1) caption.title = caption.textContent;
+    else caption.removeAttribute("title");
+  }
+}
+
+function renderHeaderSignals() {
+  markCounters();
+  markDerivedTiles();
+  syncInsightLayout();
+}
+
+if (typeof ResizeObserver === "function") {
+  const insightGrid = document.querySelector(".header-insights");
+  let insightWidth = -1;
+  if (insightGrid) {
+    new ResizeObserver((entries) => {
+      // Spans change the strip's height, never its width: re-run on width only.
+      const width = Math.round(entries[0].contentRect.width);
+      if (width === insightWidth) return;
+      insightWidth = width;
+      syncInsightLayout();
+    }).observe(insightGrid);
+  }
+}
+renderHeaderSignals();
+
 // ── Fixed-enum inbound message handling from the extension host ───────────
 window.addEventListener("message", (event) => {
   const message = event.data;
@@ -6788,7 +6915,12 @@ window.addEventListener("message", (event) => {
         // Identity only -- the authoritative storage-ready verdict comes
         // from each snapshot's "storage" field (see renderStorageState),
         // never from this identity-only message.
-        repoEl.textContent = `${repoName} | ${repoId}`;
+        // Name first; the id shortened to its ends ("repo_be72…d4bd"),
+        // which is how it is matched by eye, with the full id on hover.
+        const shortId = repoId.length > 16 ? `${repoId.slice(0, 9)}…${repoId.slice(-4)}` : repoId;
+        const idEl = createElement("span", "repo-id", shortId);
+        idEl.title = repoId;
+        repoEl.replaceChildren(createElement("span", "repo-name", repoName), document.createTextNode(" "), idEl);
       }
       renderRuntimeInfo({
         extensionVersion: message.extensionVersion,
