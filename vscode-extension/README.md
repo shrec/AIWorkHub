@@ -16,30 +16,41 @@ port, expose a LAN service or require an AIWorkHub cloud account.
 
 ## What's new in 0.11.58
 
-- Windows: bundled native `claude_cli` workers now run inside their
-  AppContainer with their worker tools. The worker MCP server runs on the host,
-  behind a per-request pipe.
-- Semantic edits cannot be redirected through a junction planted in the
-  worktree.
-- AppContainer validation runs Python read-only and offline. Python installed
-  in an admin-owned directory needs a one-time elevated
-  `icacls <python dir> /grant "*S-1-15-2-1:(OI)(CI)(RX)" /T`.
+- The bundled runtime's first four SDLC case stages are gated on server-proven
+  evidence (NF-2026-00945): Plan, Design, Build and Test can be recorded
+  `ready` only when the runtime proves them from the repository's own canonical
+  receipts, a caller can no longer self-declare a verdict, and a `ready` receipt
+  is re-proven on every read. Receipts recorded before this gate stay visible
+  for audit but no longer count as proof.
+- Deploy and Maintain remain explicit refusals that name each missing producer:
+  the SDLC Deploy and Maintain gates do not yet consume canonical deploy and
+  release receipts, outcome metrics or policy, so a case's six-stage cycle
+  cannot report complete; `not_applicable` is refused until a canonical policy
+  registry exists.
+- The bundled runtime's isolated launch now puts an OpenCode worker's
+  request-local `awh` MCP config into the worker's own environment on the Linux
+  (Landlock, bubblewrap) and Windows AppContainer paths, and refuses the launch
+  before any process spawns when the config contract is not met
+  (NF-2026-00919). This is launch wiring covered by unit and integration tests
+  only: live OpenCode/Muse worker qualification and Windows runtime
+  qualification remain unmeasured.
+- LSP index integration, the OpenCode manager callback, the full stage-gated
+  Playbook lifecycle and reasoning-quality measurement are not part of this
+  release and remain pending; no reasoning-quality improvement is claimed.
 
 ## What's new in 0.11.57
 
-- Windows: bundled native CLI workers now start inside their AppContainer.
-  - The container is granted the provider install (read) and the per-request
-    worktree, home and temp (modify, revoked on close).
-  - Worker launches get outbound internet only. Validation launches get none.
-- C/C++ repositories: CMake-style `include/` headers resolve, and
-  `cmake`/`ctest` are trusted validation tools.
-- Blocked-card rework recovery works on Windows, and dispatcher health reports
-  undelivered manager-inbox callbacks.
-- Reviewer prewarm can no longer wedge the launch queue until a server restart.
-- The VS Code LM bridge gives one correction for a tool name that is not
-  allowlisted, instead of failing the request.
-- Known issue: a full native CLI worker run on Windows is not yet proven end to
-  end.
+- The bundled runtime's reviewer and rework Source Graph overlays now pin the
+  exact base index generation they were built against, so an ordinary
+  canonical index publication no longer breaks an in-flight review and a
+  replaced or mutated pin fails closed (NF-2026-00946).
+- The bundled runtime lets a manager reroute a retained candidate after a
+  zero-delta launch failure (for example a provider authentication failure)
+  that blocked-rework recovery already returned to pending, authorized once by
+  the canonical claim, launch-failure and recovery chain (NF-2026-00778).
+- LSP index integration, OpenCode/Muse worker qualification, the full
+  stage-gated Playbook lifecycle and reasoning-quality measurement are not part
+  of this release and remain pending.
 
 ## What's new in 0.11.56
 

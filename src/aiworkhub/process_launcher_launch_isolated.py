@@ -100,6 +100,7 @@ LAUNCH_ISOLATED_SEAM_NAMES: tuple[str, ...] = (
     "preparation_stall_seconds",
     "process_group_launch_kwargs",
     "project_context",
+    "provision_opencode_worker_config",
     "quality_review",
     "reviewer_prewarm_capacity",
     "runtime_adapters",
@@ -236,6 +237,7 @@ def launch_isolated(
     preparation_stall_seconds = _pl.preparation_stall_seconds
     process_group_launch_kwargs = _pl.process_group_launch_kwargs
     project_context = _pl.project_context
+    provision_opencode_worker_config = _pl.provision_opencode_worker_config
     quality_review = _pl.quality_review
     reviewer_prewarm_capacity = _pl.reviewer_prewarm_capacity
     runtime_adapters = _pl.runtime_adapters
@@ -867,6 +869,19 @@ def launch_isolated(
                 if probe.get("ok"):
                     release = probe.get("release")
                     claude_cli_release = str(release) if release else None
+            if adapter_id == runtime_adapters.OPENCODE_CLI_ADAPTER:
+                # The generated request-local ``awh`` MCP config reaches the
+                # worker only through its own environment.  Any refusal is
+                # raised here, before the claim and before a supervisor spawns.
+                provider_env = {
+                    **(provider_env or {}),
+                    **provision_opencode_worker_config(
+                        workspace,
+                        worker_mcp_runtime,
+                        backend=sandbox_backend,
+                        authority_repo=authority_repo,
+                    ),
+                }
             # Provision the request-owned temp authority before composing
             # the Landlock command.  sandbox_argv deliberately grants
             # --worker-temp only for an already-provisioned directory;
@@ -876,14 +891,12 @@ def launch_isolated(
                 adapter_id,
                 repo=self.repo,
                 request_id=request_id,
-                # AppContainer, like landlock, grants the container the real
-                # isolated workspace.home, so HOME must literally be that path.
-                # None would seed the user's REAL profile, which the supervisor
-                # would then have to grant modify on.
+                # Only bubblewrap remounts the request HOME under an alias;
+                # Landlock and AppContainer see the real directory.
                 home=(
                     workspace.home
                     if sandbox_backend
-                    in {"landlock", VSCODE_LM_IN_PROCESS_BACKEND, "windows_appcontainer"}
+                    in {"landlock", "windows_appcontainer", VSCODE_LM_IN_PROCESS_BACKEND}
                     else None
                 ),
                 isolated_task_queue_db=True,

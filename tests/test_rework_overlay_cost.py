@@ -348,3 +348,47 @@ def test_rework_overlay_cost_report(tmp_path, monkeypatch, capsys):
     print("REWORK_OVERLAY_COST_REPORT " + json.dumps(report, indent=2))
     captured = capsys.readouterr()
     assert "REWORK_OVERLAY_COST_REPORT" in captured.out
+
+
+def test_rework_overlay_reuse_survives_canonical_publication(tmp_path, monkeypatch):
+    """NF-2026-00946: a ready rework overlay is reused across an ordinary atomic
+    canonical publication through the same pinned-base lifetime as reviewer
+    overlays -- no rebuild, no stale-shift failure, and no content from the
+    newer, unbound canonical generation."""
+
+    fx = _setup(tmp_path, retained=3, base_filler=10)
+    ctx = _ctx(fx)
+    first = _rework_source_graph_binding(ctx)
+    base_db = _base_db(fx.canonical)
+    before = base_db.stat().st_ino
+
+    (fx.canonical / "filler_0000.py").write_text(
+        _module_source(10_000) + "\ndef published_after_rework():\n    return 1\n",
+        encoding="utf-8",
+    )
+    source_graph.build_index(fx.canonical, incremental=False)
+    assert base_db.stat().st_ino != before, "publication did not replace the base"
+
+    monkeypatch.setattr(source_graph, "build_index", _forbid_build_index)
+    calls = {"n": 0}
+    real_index_file = source_graph.index_file
+
+    def counting_index_file(repo_root, path, expected_hash):
+        calls["n"] += 1
+        return real_index_file(repo_root, path, expected_hash)
+
+    monkeypatch.setattr(source_graph, "index_file", counting_index_file)
+
+    second = _rework_source_graph_binding(ctx)
+    assert second.db_path == first.db_path
+    assert second.packet_sha256 == first.packet_sha256
+    assert calls["n"] == 0, "ready overlay was rebuilt after publication"
+
+    conn = source_graph.connect(second.db_path, read_only=True)
+    try:
+        names = {str(row[0]) for row in conn.execute("SELECT name FROM entities")}
+    finally:
+        conn.close()
+    assert "retained_0000" in names  # retained candidate bytes
+    assert "symbol_10001" in names  # unchanged base, pinned generation
+    assert "published_after_rework" not in names  # newer generation never leaks

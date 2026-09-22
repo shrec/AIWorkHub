@@ -1929,3 +1929,741 @@ def test_reroute_preserves_unsealed_validation_replay_candidate(
     card = json.loads(row["card_json"])
     assert card["identity_reroute"]["retained_candidate_preserved"] is True
     assert card["identity_reroute"]["validation_replay_authorization"]
+
+
+# NF-2026-00778 / NF551.  Both fixtures are projected field for field from live
+# canonical cards, task events and process-ledger rows, not from the intended
+# schema.  The manager rejected sealed candidate N, claim N+1 failed at launch
+# on Claude subscription auth before any model work, and recover_blocked_rework
+# moved the card to pending at claim N+2.  That recovery drops
+# launch_request_id, no transient_retry exists, the launch_failed task event
+# carries neither claim epoch nor substatus, the inline terminal_failure and
+# terminal_retry are stale projections of older episodes, and the recovery
+# predecessor still names the rejected candidate N.  Only the retained bytes
+# are local: the live worktrees were garbage-collected, so each candidate is a
+# sealed delta built here.
+_NF778_AUTH_ERROR = "claude_subscription_session_refresh_required"
+_NF778_LIVE_CASES: dict[str, dict] = {
+    "nf551_claim_8_9_10": {
+        "task_id": "AIWORKHUB_01152_NF551_TEST_ASSET_SEED_V1_SONNET5",
+        "topic": "validation-transitive-test-assets",
+        "allowed_writes": [
+            "src/aiworkhub/worker_workspace.py",
+            "tests/test_worker_workspace.py",
+        ],
+        "changed_paths": [
+            "src/aiworkhub/worker_workspace.py",
+            "tests/test_worker_workspace.py",
+        ],
+        "rejected_request": "f696d895a64a43b1b2406fd0bdcc3946",
+        "rejected_epoch": 8,
+        "rejected_claimed_at": "2026-09-21T07:15:44.869163+00:00",
+        "rejected_terminal_at": "2026-09-21T07:30:52.093961+00:00",
+        "rejected_at": "2026-09-21T07:42:37.329338+00:00",
+        "failed_request": "578ab8bb17284a0b9855467e2592de04",
+        "failed_claimed_at": "2026-09-21T07:43:57.345735+00:00",
+        "failed_at": "2026-09-21T07:50:37.828969+00:00",
+        "recovered_at": "2026-09-21T07:58:15.370065+00:00",
+        "prior_reroute_from": "claude_sonnet-5",
+        "prior_rerouted_at": "2026-09-21T00:53:13.908122+00:00",
+        "stale_terminal_failure": {
+            "adapter_id": "claude_cli",
+            "claim_epoch": 6,
+            "error_hash": "7420f357ba8e0409",
+            "evidence": {
+                "adapter_id": "claude_cli",
+                "error": "timeout_stall:runtime_error:exit_code=143",
+                "exit_code": 143,
+                "request_id": "4b6a29089e2241808b1b09ab008ea9ad",
+            },
+            "recorded_at": "2026-09-21T03:07:48.492834+00:00",
+            "request_id": "4b6a29089e2241808b1b09ab008ea9ad",
+            "runner": "claude_opus-5",
+            "substatus": "timed_out",
+        },
+        "stale_terminal_retry": {
+            "claim_epoch": 1,
+            "reason": "Claude Sonnet5 timed out; exact workspace clean.",
+            "request_id": "a7d5d987cc94472e9b53fe4f3f895913",
+            "retried_at": "2026-09-21T00:53:03.502852+00:00",
+            "runner": "claude_sonnet-5",
+            "schema_id": "aiworkhub.terminal_retry.v1",
+            "task_id": "AIWORKHUB_01152_NF551_TEST_ASSET_SEED_V1_SONNET5",
+            "terminal_substatus": "timed_out",
+        },
+    },
+    "lsp_claim_16_17_18": {
+        "task_id": "AIWORKHUB_01151_LSP_INDEX_INTEGRATION_V3_GLM53_RECOVERED",
+        "topic": "source-graph-lsp-index",
+        "allowed_writes": [
+            "src/aiworkhub/source_graph.py",
+            "src/aiworkhub/source_graph_lsp.py",
+            "tests/test_source_graph_lsp_integration.py",
+            "tests/test_source_graph.py",
+            "tests/test_aiworkhub_source_graph_b849.py",
+            "tests/test_source_graph_single_file_index.py",
+        ],
+        "changed_paths": [
+            "src/aiworkhub/source_graph.py",
+            "src/aiworkhub/source_graph_lsp.py",
+            "tests/test_source_graph_lsp_integration.py",
+        ],
+        "rejected_request": "6a4965d1d56341d68f0de257d247c867",
+        "rejected_epoch": 16,
+        "rejected_claimed_at": "2026-09-21T16:11:23.396831+00:00",
+        "rejected_terminal_at": "2026-09-21T16:53:02.404067+00:00",
+        "rejected_at": "2026-09-21T17:18:11.184682+00:00",
+        "failed_request": "c59d48f611b745b58f0874d8d3d900ca",
+        "failed_claimed_at": "2026-09-21T17:19:29.912892+00:00",
+        "failed_at": "2026-09-21T17:19:42.723526+00:00",
+        "recovered_at": "2026-09-21T17:20:43.610106+00:00",
+        "prior_reroute_from": "glm_5.3",
+        "prior_rerouted_at": "2026-09-21T00:21:28.914913+00:00",
+        "stale_terminal_failure": {
+            "adapter_id": "",
+            "claim_epoch": 13,
+            "error_hash": "cb3a1aee162f351b",
+            "evidence": {
+                "adapter_id": None,
+                "error": "workspace_manifest_scan_failed",
+                "exit_code": None,
+                "request_id": "4fe3ff54d1124957ac6aaf1153a79007",
+            },
+            "recorded_at": "2026-09-21T13:29:24.055539+00:00",
+            "request_id": "4fe3ff54d1124957ac6aaf1153a79007",
+            "runner": "claude_opus-5",
+            "substatus": "finalize_failed",
+        },
+        "stale_terminal_retry": {
+            "claim_epoch": 8,
+            "reason": "Exact Opus claim 8 timed_out while editing the retained candidate.",
+            "request_id": "76a72e12ed6c4627afe34fba4b413fad",
+            "retried_at": "2026-09-21T02:53:00.931522+00:00",
+            "runner": "claude_opus-5",
+            "schema_id": "aiworkhub.terminal_retry.v1",
+            "task_id": "AIWORKHUB_01151_LSP_INDEX_INTEGRATION_V3_GLM53_RECOVERED",
+            "terminal_substatus": "timed_out",
+        },
+    },
+}
+_NF778_ROUTES = {
+    "glm_5.3": ("glm_vscode_lm", "glm-5.3"),
+    "deepseek_v4-pro": ("deepseek_vscode_lm", "deepseek-v4-pro"),
+}
+
+
+def _nf778_event(name: str, runner: str, created_at: str, payload: object) -> dict:
+    return {"event": name, "runner": runner, "created_at": created_at, "payload": payload}
+
+
+def _nf778_live_state(repo: Path, case: dict, *, seal: bool = True) -> dict:
+    """The live card at claim N+2 plus its task events and process-ledger rows."""
+    task_id = case["task_id"]
+    rejected = case["rejected_request"]
+    rejected_epoch = case["rejected_epoch"]
+    failed = case["failed_request"]
+    files = [
+        (path, f"retained candidate {rejected}:{path}\n".encode("utf-8"))
+        for path in case["changed_paths"]
+    ]
+    hashes = {path: hashlib.sha256(content).hexdigest() for path, content in files}
+    artifact_dir = worker_workspace.configured_runtime_root(repo) / "rework_deltas"
+    if seal:
+        artifact = worker_workspace.seal_rework_delta_artifact(
+            authority_repo=repo,
+            task_id=task_id,
+            request_id=rejected,
+            claim_epoch=rejected_epoch,
+            file_entries=files,
+            artifact_dir=artifact_dir,
+        )
+    else:
+        # Sealing chmods the artifact; callers that stub retained-byte
+        # verification get a descriptor naming an artifact that is never read.
+        artifact = {"path": str(artifact_dir / f"{'0' * 64}.json"), "digest": "0" * 64}
+    # Neither the worktree nor the home directory is created: GC removed both.
+    workspace_root = worker_workspace.configured_worktree_root(repo) / rejected
+    instruction = f"Correctness rework required before canonical accept of {rejected}."
+    reason_identity = {
+        "bytes": len(instruction.encode("utf-8")),
+        "sha256": hashlib.sha256(instruction.encode("utf-8")).hexdigest(),
+        "truncated": False,
+    }
+    recovery_predecessor = {
+        "changed_path_hashes": dict(hashes),
+        "request_id": rejected,
+        "terminal_claim_epoch": rejected_epoch,
+        "terminal_recorded_at": case["rejected_terminal_at"],
+        "terminal_runner": "claude_opus-5",
+        "terminal_substatus": "review_ready",
+    }
+    recovery_feedback = (
+        f"Prior claim {failed} failed before model work with "
+        f"{_NF778_AUTH_ERROR}; no changed paths."
+    )
+    card = {
+        "allowed_writes": list(case["allowed_writes"]),
+        "claim_epoch": rejected_epoch + 2,
+        "identity_reroute": {
+            "schema_id": "aiworkhub.identity_reroute.v1",
+            "from_runner": case["prior_reroute_from"],
+            "to_runner": "claude_opus-5",
+            "to_adapter_id": "claude_cli",
+            "to_model": "claude-opus-5",
+            "reason": "measured route repair",
+            "rerouted_at": case["prior_rerouted_at"],
+        },
+        "recovered_by": "codex",
+        "recovered_from_blocked_at": case["recovered_at"],
+        "recovery_epoch": rejected_epoch + 2,
+        "recovery_feedback": recovery_feedback,
+        "recovery_predecessor": recovery_predecessor,
+        "rejection_disposition": {
+            "failure_category": "candidate_code",
+            "failure_category_source": "terminal_evidence",
+            "pinned_at": case["rejected_at"],
+            "request_id": rejected,
+            "schema_id": "aiworkhub.rejection_disposition.v1",
+            "to": "pending",
+        },
+        "review_feedback": {
+            "schema_id": "aiworkhub.rework_feedback_delta.v1",
+            "instruction": instruction,
+            "reason_identity": reason_identity,
+            "predecessor_request_id": rejected,
+            "predecessor_changed_paths": sorted(hashes),
+            "residual_identities": [],
+        },
+        "rework_predecessor": {
+            "schema_id": "aiworkhub.rework_predecessor.v1",
+            "task_id": task_id,
+            "request_id": rejected,
+            "claim_epoch": rejected_epoch,
+            "pinned_at": case["rejected_at"],
+            "changed_path_hashes": dict(hashes),
+            "residual_identities": [],
+            "workspace": {
+                "request_id": rejected,
+                "repo": str(repo),
+                "path": str(workspace_root / "worktree"),
+                "home": str(workspace_root / "home"),
+                "allowed_writes": list(case["allowed_writes"]),
+                "parent_baseline": {},
+                "workspace_baseline": {},
+                "base_oid": "b" * 40,
+            },
+            "rework_delta": {
+                "schema_id": "aiworkhub.rework_delta_descriptor.v1",
+                "sealed": True,
+                "authority_repo": str(repo.resolve()),
+                "task_id": task_id,
+                "request_id": rejected,
+                "claim_epoch": rejected_epoch,
+                "artifact_path": artifact["path"],
+                "artifact_sha256": artifact["digest"],
+            },
+            "delta_artifact": artifact,
+        },
+        "terminal_failure": copy.deepcopy(case["stale_terminal_failure"]),
+        "terminal_substatus": "review_ready",
+    }
+    stale = case["stale_terminal_failure"]
+    history = [
+        _nf778_event("reroute_launch_identity", "codex", case["prior_rerouted_at"], {
+            "from_runner": case["prior_reroute_from"],
+            "to_adapter_id": "claude_cli",
+            "to_model": "claude-opus-5",
+            "to_runner": "claude_opus-5",
+            "topic": case["topic"],
+        }),
+        _nf778_event(
+            "terminal_failure", "claude_opus-5", stale["recorded_at"], copy.deepcopy(stale)
+        ),
+        _nf778_event("claim_start", "claude_opus-5", case["rejected_claimed_at"], {
+            "claim_epoch": rejected_epoch,
+            "prior_episode": {},
+            "request_id": rejected,
+            "runner": "claude_opus-5",
+            "topic": case["topic"],
+        }),
+        _nf778_event("terminal_review", "claude_opus-5", case["rejected_terminal_at"], {
+            "claim_epoch": rejected_epoch,
+            "recorded_at": case["rejected_terminal_at"],
+            "request_id": rejected,
+            "runner": "claude_opus-5",
+            "substatus": "review_ready",
+        }),
+        _nf778_event("manager_ready", "system", case["rejected_at"], {
+            "claim_epoch": str(rejected_epoch),
+            "request_id": rejected,
+        }),
+        _nf778_event("reject_review", "codex", case["rejected_at"], {
+            "failure_category_source": "terminal_evidence",
+            "prior_episode": {"terminal_substatus": "review_ready"},
+            "reason": instruction,
+            "reason_identity": reason_identity,
+            "rework_delta_reuse_error": None,
+            "terminal_disposition": "candidate_code",
+            "to": "pending",
+            "topic": case["topic"],
+        }),
+    ]
+    chain = [
+        _nf778_event("claim_start", "claude_opus-5", case["failed_claimed_at"], {
+            "claim_epoch": rejected_epoch + 1,
+            "prior_episode": {},
+            "request_id": failed,
+            "runner": "claude_opus-5",
+            "topic": case["topic"],
+        }),
+        _nf778_event("launch_failed", "claude_opus-5", case["failed_at"], {
+            "reason": _NF778_AUTH_ERROR,
+            "recorded_at": case["failed_at"],
+            "request_id": failed,
+            "runner": "claude_opus-5",
+            "transition": "processing->blocked",
+            "worker_status": "launch_failed",
+        }),
+        _nf778_event("callback_enqueued", "", case["failed_at"], {
+            "episode_id": f"{task_id}:{failed}",
+            "provider": "claude",
+            "transition": "launch_failed",
+        }),
+        _nf778_event("usage_record", "claude_opus-5", case["failed_at"], {
+            "claim_epoch": rejected_epoch + 1,
+            "request_id": failed,
+            "runner": "claude_opus-5",
+        }),
+        _nf778_event("blocked_rework_recovery", "codex", case["recovered_at"], {
+            "actor": "codex",
+            "claim_epoch": rejected_epoch + 2,
+            "feedback": recovery_feedback,
+            "predecessor": copy.deepcopy(recovery_predecessor),
+            "prior_episode": {
+                "blocker_reason": _NF778_AUTH_ERROR,
+                "launch_error": _NF778_AUTH_ERROR,
+                "terminal_substatus": "launch_failed",
+            },
+            "recorded_at": case["recovered_at"],
+            "terminal_substatus": "review_ready",
+            "transition": "blocked->pending",
+            "validation_only_replay": False,
+        }),
+    ]
+    ledger = [
+        {
+            "request_id": rejected,
+            "task_id": task_id,
+            "runner": "claude_opus-5",
+            "adapter_id": "claude_cli",
+            "model": "claude-opus-5",
+            "state": "review_ready",
+            "exit_code": 0,
+            "changed_paths": list(case["changed_paths"]),
+        },
+        {
+            "request_id": failed,
+            "task_id": task_id,
+            "runner": "claude_opus-5",
+            "adapter_id": "claude_cli",
+            "model": "claude-opus-5",
+            "state": "starting",
+        },
+        {
+            "request_id": failed,
+            "state": "launch_failed",
+            "failure_kind": "launch_failed",
+            "error": _NF778_AUTH_ERROR,
+            "exit_code": 1,
+            "changed_paths": [],
+            "provider_launched": True,
+            "workspace_retained": False,
+            "workspace_disposition": "removed",
+        },
+    ]
+    return {
+        "card": card,
+        "terminal_retry": copy.deepcopy(case["stale_terminal_retry"]),
+        "history": history,
+        "chain": chain,
+        "later": [],
+        "ledger": ledger,
+    }
+
+
+def _nf778_install(
+    repo: Path, monkeypatch: pytest.MonkeyPatch, case: dict, state: dict
+) -> None:
+    monkeypatch.setattr(core, "_verified_manager_actor", lambda: "codex")
+    monkeypatch.setattr(
+        workforce_catalog,
+        "build_catalog",
+        lambda _repo: {
+            "workers": [
+                {
+                    "execution_runner": runner,
+                    "effective_adapter_id": adapter,
+                    "model": model,
+                    "enabled": True,
+                    "launch_eligible": True,
+                    "available": True,
+                    "max_risk": "critical",
+                }
+                for runner, (adapter, model) in _NF778_ROUTES.items()
+            ]
+        },
+    )
+    # Plain JSONL rows, folded per request by the real latest_events reader.
+    ledger_path = repo.parent / "process_events.jsonl"
+    ledger_path.write_text(
+        "".join(json.dumps(row, sort_keys=True) + "\n" for row in state["ledger"]),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(process_launcher.PROCESS_LOG_ENV, str(ledger_path))
+    _insert_pending_reroutable(
+        repo,
+        task_id=case["task_id"],
+        runner="claude_opus-5",
+        topic=case["topic"],
+        terminal_retry=state["terminal_retry"],
+        risk_tier="high",
+        card_overrides=state["card"],
+    )
+    readiness = task_store.storage_readiness(repo)
+    conn = sqlite3.connect(readiness.canonical_db)
+    try:
+        for event in state["history"] + state["chain"] + state["later"]:
+            conn.execute(
+                "INSERT INTO task_events(task_id,event,runner,payload_json,created_at) "
+                "VALUES (?,?,?,?,?)",
+                (
+                    case["task_id"],
+                    event["event"],
+                    event["runner"],
+                    json.dumps(event["payload"], ensure_ascii=False, sort_keys=True),
+                    event["created_at"],
+                ),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _nf778_reroute(
+    case: dict, *, from_runner: str = "claude_opus-5", to_runner: str = "glm_5.3"
+) -> dict:
+    to_adapter_id, to_model = _NF778_ROUTES[to_runner]
+    return core.reroute_launch_identity(
+        case["task_id"],
+        from_runner=from_runner,
+        to_runner=to_runner,
+        to_adapter_id=to_adapter_id,
+        to_model=to_model,
+        reason="Claude auth failed before model work; move the retained candidate",
+        topic=case["topic"],
+    )
+
+
+@pytest.mark.parametrize("case_id", sorted(_NF778_LIVE_CASES))
+def test_nf778_recovered_auth_launch_failure_authorizes_one_shot_glm_reroute(
+    coordinator_repo: Path, monkeypatch: pytest.MonkeyPatch, case_id: str,
+) -> None:
+    case = _NF778_LIVE_CASES[case_id]
+    state = _nf778_live_state(coordinator_repo, case)
+    _nf778_install(coordinator_repo, monkeypatch, case, state)
+
+    result = _nf778_reroute(case)
+
+    assert result["ok"] is True, result
+    row = _row(coordinator_repo, case["task_id"])
+    assert row["runner"] == "glm_5.3"
+    card = json.loads(row["card_json"])
+    assert card["rework_predecessor"] == state["card"]["rework_predecessor"]
+    assert card["recovery_predecessor"] == state["card"]["recovery_predecessor"]
+    assert card["terminal_failure"] == case["stale_terminal_failure"]
+    assert card["terminal_retry"] == case["stale_terminal_retry"]
+    assert card["identity_reroute"]["retained_candidate_preserved"] is True
+    authorization = card["identity_reroute"]["manager_rejection_authorization"]
+    assert result["manager_rejection_authorization"] == authorization
+    assert authorization["request_id"] == case["rejected_request"]
+    assert authorization["claim_epoch"] == case["rejected_epoch"]
+    # Neither stale projection nor an absent transient retry authorized this.
+    for other in ("recovery_rebind", "terminal_retry_rebind", "pending_launch_failure_rebind"):
+        assert other not in authorization
+    rebind = authorization["recovered_launch_failure_rebind"]
+    assert rebind["schema_id"] == "aiworkhub.recovered_launch_failure_reroute.v1"
+    assert rebind["task_id"] == case["task_id"]
+    assert rebind["request_id"] == case["failed_request"]
+    assert rebind["runner"] == "claude_opus-5"
+    assert rebind["retained_request_id"] == case["rejected_request"]
+    assert rebind["failed_claim_epoch"] == case["rejected_epoch"] + 1
+    assert rebind["recovery_epoch"] == case["rejected_epoch"] + 2
+    assert rebind["recovery_predecessor_sha256"] == core._canonical_receipt_digest(
+        state["card"]["recovery_predecessor"]
+    )
+    for digest in (
+        "claim_event_sha256",
+        "launch_failed_event_sha256",
+        "recovery_event_sha256",
+        "process_event_sha256",
+    ):
+        assert len(rebind[digest]) == 64
+
+    # One-shot: the completed reroute is itself a newer lineage event, so the
+    # same recovered launch failure can never authorize a second route change.
+    again = _nf778_reroute(case, from_runner="glm_5.3", to_runner="deepseek_v4-pro")
+    assert again["ok"] is False
+    assert "reroute_manager_rejection_identity_mismatch" in again["stderr"]
+    assert _row(coordinator_repo, case["task_id"])["runner"] == "glm_5.3"
+
+
+def _nf778_mutate(state: dict, case: dict, mutation: str) -> None:
+    card = state["card"]
+    claim, failure, _callback, _usage, recovery = state["chain"]
+    failed_ledger = state["ledger"][-1]
+    first_path = case["changed_paths"][0]
+    later_at = "2026-09-21T23:00:00+00:00"
+    if mutation == "stale_projections_only":
+        state["chain"] = []
+    elif mutation == "recovery_event_missing":
+        state["chain"].remove(recovery)
+    elif mutation == "launch_failed_event_missing":
+        state["chain"].remove(failure)
+    elif mutation == "claim_start_missing":
+        state["chain"].remove(claim)
+    elif mutation == "claim_start_cross_request":
+        claim["payload"]["request_id"] = "e" * 32
+    elif mutation == "claim_start_other_runner":
+        claim["runner"] = claim["payload"]["runner"] = "claude_sonnet-5"
+    elif mutation == "launch_failed_cross_task":
+        failure["payload"]["task_id"] = "OTHER_TASK"
+    elif mutation == "launch_failed_other_runner":
+        failure["runner"] = failure["payload"]["runner"] = "claude_sonnet-5"
+    elif mutation == "launch_failed_claims_other_epoch":
+        failure["payload"]["claim_epoch"] = case["rejected_epoch"]
+    elif mutation == "launch_failed_row_timestamp":
+        failure["created_at"] = later_at
+    elif mutation == "recovery_stale_epoch":
+        recovery["payload"]["claim_epoch"] = case["rejected_epoch"] + 1
+    elif mutation == "recovery_forged_predecessor_hash":
+        recovery["payload"]["predecessor"]["changed_path_hashes"][first_path] = "9" * 64
+    elif mutation == "recovery_forged_actor":
+        recovery["payload"]["actor"] = "mallory"
+    elif mutation == "recovery_row_runner":
+        recovery["runner"] = "mallory"
+    elif mutation == "recovery_recorded_at_mismatch":
+        recovery["payload"]["recorded_at"] = recovery["created_at"] = later_at
+    elif mutation == "recovery_prior_episode_not_launch_failed":
+        recovery["payload"]["prior_episode"]["terminal_substatus"] = "worker_failed"
+    elif mutation == "recovery_launch_error_mismatch":
+        recovery["payload"]["prior_episode"]["launch_error"] = "claude_cli_nonzero_exit"
+    elif mutation == "recovery_validation_only_replay":
+        recovery["payload"]["validation_only_replay"] = True
+    elif mutation == "recovery_feedback_mismatch":
+        recovery["payload"]["feedback"] = "forged recovery feedback"
+    elif mutation == "card_recovery_hash_tamper":
+        card["recovery_predecessor"]["changed_path_hashes"][first_path] = "9" * 64
+    elif mutation == "card_changed_candidate":
+        card["rework_predecessor"]["changed_path_hashes"][first_path] = "9" * 64
+    elif mutation == "card_terminal_failure_claims_failed_epoch":
+        card["terminal_failure"]["claim_epoch"] = case["rejected_epoch"] + 1
+    elif mutation == "card_terminal_retry_claims_failed_epoch":
+        state["terminal_retry"]["claim_epoch"] = case["rejected_epoch"] + 1
+    elif mutation == "later_claim_after_recovery":
+        later = copy.deepcopy(claim)
+        later["payload"].update(claim_epoch=case["rejected_epoch"] + 2, request_id="d" * 32)
+        later["created_at"] = later_at
+        state["later"].append(later)
+    elif mutation == "later_reroute_after_recovery":
+        state["later"].append(_nf778_event("reroute_launch_identity", "codex", later_at, {
+            "from_runner": "claude_opus-5",
+            "to_runner": "glm_5.3",
+            "topic": case["topic"],
+        }))
+    elif mutation == "later_launch_failed_after_recovery":
+        later = copy.deepcopy(failure)
+        later["created_at"] = later["payload"]["recorded_at"] = later_at
+        state["later"].append(later)
+    elif mutation == "malformed_later_lineage_event":
+        state["later"].append(
+            _nf778_event("terminal_review", "claude_opus-5", later_at, "{broken")
+        )
+    elif mutation == "non_sequential_epochs":
+        claim["payload"]["claim_epoch"] = case["rejected_epoch"] + 2
+        recovery["payload"]["claim_epoch"] = case["rejected_epoch"] + 3
+        card["claim_epoch"] = card["recovery_epoch"] = case["rejected_epoch"] + 3
+    elif mutation == "ledger_missing":
+        state["ledger"] = [
+            row for row in state["ledger"] if row["request_id"] != case["failed_request"]
+        ]
+    elif mutation == "ledger_cross_request":
+        for row in state["ledger"]:
+            if row["request_id"] == case["failed_request"]:
+                row["request_id"] = "e" * 32
+    elif mutation == "ledger_cross_task":
+        failed_ledger["task_id"] = "OTHER_TASK"
+    elif mutation == "ledger_other_runner":
+        failed_ledger["runner"] = "claude_sonnet-5"
+    elif mutation == "ledger_error_mismatch":
+        failed_ledger["error"] = "claude_cli_nonzero_exit"
+    elif mutation == "ledger_nonzero_delta":
+        failed_ledger["changed_paths"] = [first_path]
+    elif mutation == "ledger_not_launch_failed":
+        failed_ledger["state"] = failed_ledger["failure_kind"] = "worker_failed"
+    elif mutation == "prior_reroute_route_mismatch":
+        card["identity_reroute"]["to_model"] = "claude-sonnet-5"
+    else:  # pragma: no cover - a typo must not silently test the happy path
+        raise AssertionError(f"unknown mutation {mutation}")
+
+
+_NF778_FAIL_CLOSED_MUTATIONS = (
+    "stale_projections_only",
+    "recovery_event_missing",
+    "launch_failed_event_missing",
+    "claim_start_missing",
+    "claim_start_cross_request",
+    "claim_start_other_runner",
+    "launch_failed_cross_task",
+    "launch_failed_other_runner",
+    "launch_failed_claims_other_epoch",
+    "launch_failed_row_timestamp",
+    "recovery_stale_epoch",
+    "recovery_forged_predecessor_hash",
+    "recovery_forged_actor",
+    "recovery_row_runner",
+    "recovery_recorded_at_mismatch",
+    "recovery_prior_episode_not_launch_failed",
+    "recovery_launch_error_mismatch",
+    "recovery_validation_only_replay",
+    "recovery_feedback_mismatch",
+    "card_recovery_hash_tamper",
+    "card_changed_candidate",
+    "card_terminal_failure_claims_failed_epoch",
+    "card_terminal_retry_claims_failed_epoch",
+    "later_claim_after_recovery",
+    "later_reroute_after_recovery",
+    "later_launch_failed_after_recovery",
+    "malformed_later_lineage_event",
+    "non_sequential_epochs",
+    "ledger_missing",
+    "ledger_cross_request",
+    "ledger_cross_task",
+    "ledger_other_runner",
+    "ledger_error_mismatch",
+    "ledger_nonzero_delta",
+    "ledger_not_launch_failed",
+    "prior_reroute_route_mismatch",
+)
+
+
+def _nf778_authorize_live_card(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: dict, mutation: str | None,
+) -> tuple[dict, tuple]:
+    """Run only the manager-rejection authorization over the live projection.
+
+    Real canonical store, task-event rows and process ledger, but neither the
+    coordinator token (its fixture chmods) nor a sealed artifact (sealing
+    chmods): retained-byte verification is stubbed here and exercised end to
+    end by the coordinator_repo reroute tests.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    assert task_store.initialize_repository(repo)["ok"]
+    monkeypatch.setenv("AIWORKHUB_REPO", str(repo))
+    state = _nf778_live_state(repo, case, seal=False)
+    if mutation is not None:
+        _nf778_mutate(state, case, mutation)
+    _nf778_install(repo, monkeypatch, case, state)
+    monkeypatch.setattr(
+        core,
+        "_verified_retained_predecessor_receipt",
+        lambda _card, *, task_id: ({"retained_predecessor_sha256": "d" * 64}, None),
+    )
+    card = task_store.get_task(repo, case["task_id"])
+    assert card is not None
+    return state, core._verified_manager_rejection_receipt(card, task_id=case["task_id"])
+
+
+@pytest.mark.parametrize("case_id", sorted(_NF778_LIVE_CASES))
+def test_nf778_live_card_authorization_binds_recovered_launch_failure_chain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case_id: str,
+) -> None:
+    case = _NF778_LIVE_CASES[case_id]
+
+    state, (receipt, error) = _nf778_authorize_live_card(
+        tmp_path, monkeypatch, case, None
+    )
+
+    assert error is None, error
+    assert receipt is not None
+    assert receipt["request_id"] == case["rejected_request"]
+    assert receipt["claim_epoch"] == case["rejected_epoch"]
+    for other in ("recovery_rebind", "terminal_retry_rebind", "pending_launch_failure_rebind"):
+        assert other not in receipt
+    rebind = receipt["recovered_launch_failure_rebind"]
+    assert rebind["request_id"] == case["failed_request"]
+    assert rebind["failed_claim_epoch"] == case["rejected_epoch"] + 1
+    assert rebind["recovery_epoch"] == case["rejected_epoch"] + 2
+    claim, failure, _callback, _usage, recovery = state["chain"]
+    for key, event in (
+        ("claim_event_sha256", claim),
+        ("launch_failed_event_sha256", failure),
+        ("recovery_event_sha256", recovery),
+    ):
+        assert rebind[key] == core._canonical_receipt_digest(event)
+    assert rebind["process_event_sha256"] == core._canonical_receipt_digest({
+        "request_id": case["failed_request"],
+        "task_id": case["task_id"],
+        "runner": "claude_opus-5",
+        "adapter_id": "claude_cli",
+        "model": "claude-opus-5",
+        "state": "launch_failed",
+        "failure_kind": "launch_failed",
+        "error": _NF778_AUTH_ERROR,
+        "exit_code": 1,
+        "changed_paths": [],
+    })
+
+
+@pytest.mark.parametrize("mutation", _NF778_FAIL_CLOSED_MUTATIONS)
+def test_nf778_live_card_authorization_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str,
+) -> None:
+    case = _NF778_LIVE_CASES["nf551_claim_8_9_10"]
+
+    _state, (receipt, error) = _nf778_authorize_live_card(
+        tmp_path, monkeypatch, case, mutation
+    )
+
+    assert receipt is None
+    assert error == "reroute_manager_rejection_identity_mismatch"
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "stale_projections_only",
+        "claim_start_cross_request",
+        "recovery_forged_predecessor_hash",
+        "card_changed_candidate",
+        "later_reroute_after_recovery",
+        "ledger_cross_task",
+        "ledger_nonzero_delta",
+    ],
+)
+def test_nf778_recovered_launch_failure_reroute_fails_closed(
+    coordinator_repo: Path, monkeypatch: pytest.MonkeyPatch, mutation: str,
+) -> None:
+    case = _NF778_LIVE_CASES["nf551_claim_8_9_10"]
+    state = _nf778_live_state(coordinator_repo, case)
+    _nf778_mutate(state, case, mutation)
+    _nf778_install(coordinator_repo, monkeypatch, case, state)
+
+    result = _nf778_reroute(case)
+
+    assert result["ok"] is False, result
+    assert "reroute_manager_rejection_identity_mismatch" in result["stderr"]
+    row = _row(coordinator_repo, case["task_id"])
+    assert row["runner"] == "claude_opus-5"
+    card = json.loads(row["card_json"])
+    assert card["identity_reroute"] == state["card"]["identity_reroute"]

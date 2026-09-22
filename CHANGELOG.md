@@ -6,135 +6,126 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
-## [0.11.58] - 2026-09-22
+## [0.11.58] - 2026-09-21
+
+### Changed
+
+- An SDLC case stage can no longer be recorded `ready` on a caller's say-so
+  (NF-2026-00945). `ready` for Plan, Design, Build and Test is accepted only
+  when the server proves it, read-only and bounded, from this repository's own
+  canonical receipts, and the resolved evidence is stored with the stage
+  receipt. Plan needs the case's bound task to exist, not be withdrawn and carry
+  an objective. Design needs that task's contract to be falsifiable
+  (acceptance criteria, validation commands and, unless read-only, a write
+  scope); the task's content identity becomes the versioned design. Build needs
+  a `review_ready` candidate sealed by the current claim against exactly that
+  design, with its attempt bundle, terminal process event, semantic-edit ledger
+  and effort/context receipt verifying or verifiably not owed. Test needs the
+  sealed validation evidence to re-derive to the stored passing verdict and the
+  coordinator's accepted-outcome receipt for that same candidate to validate and
+  re-hash its promoted paths. The payload supplies only the Plan and Design
+  content and, for Build and Test, `task_id`, `request_id` and `claim_epoch`
+  pointers that must equal what the stores say; verdict-shaped keys such as
+  `passed`, `verdict` or `sha256` are refused. Whatever the server cannot prove
+  is refused with a typed `stage_evidence_refused:<stage>:<code>` reason and a
+  next action.
+- A recorded `ready` receipt is re-proven on every read. A receipt written
+  before this gate, one whose stored evidence no longer hashes or re-derives,
+  and one whose predecessor stage is no longer proven stay visible for audit but
+  read as `unknown` with a reason. A case's `cycle` is `complete` only when all
+  six stages are proven now.
+- Deploy and Maintain remain explicit refusals rather than evidence gates. The
+  SDLC Deploy and Maintain gates do not yet consume canonical deploy target
+  allowlist, release/build provenance receipt, install receipt, rollback
+  receipt, deploy approval policy, deployed release identity, observed outcome
+  metrics or control-limit policy, so `ready` for either stage is refused with
+  each missing producer named and is never inferred. `not_applicable` is
+  refused the same way until a canonical policy registry exists, and a
+  previously recorded `not_applicable` receipt reads as `unknown`. Until the
+  gates consume that proof a case's `cycle` cannot report `complete`.
 
 ### Fixed
 
-- Windows: native `claude_cli` workers now run inside their AppContainer with
-  their worker tools (NF-2026-00034).
-  - The worker MCP server (the `aiworkhub_worker_*` tools) runs on the host,
-    outside the container. It is reached through a per-request named pipe that
-    only this container's SID can open, and it serves only a process in this
-    launch's own job. Inside the container, the MCP config starts a System32
-    PowerShell shim that relays stdio to the pipe.
-  - The host server starts from a directory the container cannot write. It runs
-    with `-P -s` and `PYTHONSAFEPATH`, and inherits no `PYTHON*` variables.
-  - Before the server starts, a probe checks its `sys.path`. If any entry is a
-    directory the container can write, the server does not start.
-  - Every file the server reads for authority lives in a directory withheld
-    from the container: the contract packet, the audit key and ledger, and the
-    review and rework packets.
-- Windows AppContainer grants now also reach the protected directories that
-  AIWorkHub creates inside a request's worktree, home and temp, and they are
-  revoked the same way. Reparse points are never followed, and the walk is
-  bounded.
-- Semantic edits hold the whole directory chain open while they read and write,
-  so a junction planted in the worktree cannot redirect an edit outside it.
-- Windows AppContainer validation now runs Python read-only and offline, from
-  the canonical repository's venv.
-  - An interpreter or `pyvenv.cfg` that the container can write is refused, not
-    granted.
-  - A persistent read grant counts as satisfied when an ALL APPLICATION
-    PACKAGES allow ACE already covers it, with deny ACEs honored in order.
-    AIWorkHub never adds that ACE itself.
-- For a contained worker, the host-side worker MCP server refuses
-  `aiworkhub_worker_validation_run`, because running candidate code there would
-  bypass the sandbox. Post-exit validation still runs inside the container.
-  NF-2026-00035 tracks mid-turn validation inside the container.
+- The isolated launch now puts the OpenCode worker's request-local `awh` MCP
+  config into the worker's own process environment (NF-2026-00919).
+  `launch_isolated` derives it from the worker MCP runtime already generated for
+  the request, spells it for the selected sandbox (mount aliases under
+  bubblewrap, real host paths under Landlock and Windows AppContainer) and sets
+  it as `OPENCODE_CONFIG_CONTENT`, with project-level OpenCode config disabled
+  (`OPENCODE_DISABLE_PROJECT_CONFIG=1`); nothing is written to disk and no
+  global OpenCode config is touched. The contract fails closed: a config that
+  does not meet it refuses the launch before any supervisor or worker process
+  spawns and records the launch failure with a typed
+  `opencode_worker_mcp_config_<cause>` reason, an infrastructure fault rather
+  than a model-quality failure. The config must be exactly the `awh` server plus
+  the worker permission contract (deny by default, only the `awh` worker tools
+  allowed); its `environment` may carry only the request's own binding
+  variables, never a provider credential or another inherited variable; it is
+  bounded to 16 KiB of ASCII JSON; and the generated source it is read from must
+  be a regular, non-symlinked, current-user-owned file beneath the request HOME
+  whose request, repository and audit paths match the launch. Under AppContainer
+  the launch argv passes through only when the confinement is reported available
+  (otherwise the launch is refused, never run unconfined), and a
+  validation-shaped request is refused there. This is launch wiring only:
+  whether a live OpenCode/Muse worker then connects to `awh` is not measured in
+  this release (below).
 
-### Known issues
+### Not in this release
 
-- Python validation inside the AppContainer needs the base interpreter to be
-  readable by ALL APPLICATION PACKAGES. If Python is installed in an
-  admin-owned directory such as `C:\Python312`, run this once from an elevated
-  shell: `icacls C:\Python312 /grant "*S-1-15-2-1:(OI)(CI)(RX)" /T`.
-- Host-side reads of worktree files outside semantic edit are checked for
-  containment only when the path is resolved. Hard links are not yet refused
-  (NF-2026-00036).
-- `codex_cli` and the Copilot CLI adapters are not yet bridged.
+- Live OpenCode/Muse worker qualification and Windows runtime qualification.
+  The launch wiring above is covered by unit and integration tests that run the
+  real `launch_isolated`, worker config provisioner and `sandbox_argv`, with the
+  task store, git and the supervisor spawn replaced by stand-ins. The Windows
+  AppContainer cases fake the host platform and the Win32 probe, and a fake
+  Win32 API checks that the AppContainer launcher passes the environment to the
+  child unchanged. No live OpenCode/Muse worker was run against the delivered
+  config and nothing was run on a real Windows host, so both remain unmeasured.
+- Evidence gates for Deploy and Maintain: the SDLC gates do not yet consume the
+  canonical deploy, release and outcome proof those stages would need, so only
+  the first four SDLC stages are gated.
+- LSP index integration, the OpenCode manager callback, the full stage-gated
+  Playbook lifecycle, and portable `.aiworkhub` data are pending and not shipped
+  here. No reasoning-quality improvement is claimed: causal reasoning-quality
+  measurement remains incomplete, and inferred successor progression is still
+  pending.
 
 ## [0.11.57] - 2026-09-21
 
 ### Fixed
 
-- Windows: native CLI workers (`claude_cli`, `opencode_cli`) now start inside
-  their repo-scoped AppContainer. Three stacked defects stopped every such card
-  before the model ran, although preflight reported the route launchable:
-  - the `provision_worker_mcp_runtime`, `sandbox_argv` and `run_validations`
-    consumers all refused the `windows_appcontainer` backend;
-  - `CreateProcessW` failed with `ERROR_ENVVAR_NOT_FOUND` (203) because the
-    sanitized child environment lacked `LOCALAPPDATA`;
-  - the container SID was granted nothing, so the provider CLI could not read
-    its own install (NF-2026-00025).
-- Windows AppContainer launches now grant filesystem access to the container
-  SID and to nothing else.
-  - The provider CLI install gets read/execute. This grant is persistent and
-    idempotent.
-  - The per-request worktree, isolated home and temp get modify. Each is revoked
-    on close by removing only this SID's entries.
-  - A grant is refused for UNC or device paths, reparse points, drive roots, the
-    user profile and AppData roots, the user temp directory, and anything inside
-    the Windows or Program Files trees.
-  - An npm `.cmd` shim runs through its native `.exe` target, which must lie
-    strictly inside the shim's `node_modules`.
-- Windows: worker launches get outbound internet so that a provider CLI can
-  reach its API. They get `internetClient` only: no inbound listening and no
-  private network. Validation launches run untrusted candidate code and get no
-  network capability. `windows_confinement_report()` states this split instead
-  of a blanket "network" (NF-2026-00033).
-- Windows: validation commands run inside the worker's own AppContainer instead
-  of being refused.
-- C/C++ repositories: quoted includes now resolve against the conventional
-  `include/` and `src/` roots. A CMake project whose sources include
-  `"pkg/x.hpp"` from `include/` is no longer refused as
-  `local_quoted_include_unresolved`. A header that is genuinely missing still
-  fails closed, and symlinked or junction roots are skipped. `cmake` and `ctest`
-  are now trusted validation executables, resolved through the same path as
-  `git` and `node`.
-- `aiworkhub_task_recover_blocked_rework` now works on Windows.
-  - Cause: it probed recorded worker pids with `os.kill(pid, 0)`. On Windows
-    that call is `GenerateConsoleCtrlEvent`, which raises `[WinError 87]` for an
-    exited pid, and without a console it is `TerminateProcess`.
-  - Recovery, the Source Graph LSP child check and the recipe helper now use the
-    shared liveness probe, which sends no signal.
-  - An OS error from recovery now names its operation and path (NF-2026-00031).
-- `aiworkhub_dispatcher_health` no longer reports healthy when callbacks wait in
-  a manager inbox that nothing delivers. It reports
-  `manager_inbox_no_live_delivery` with `backlog_count` and `oldest_pending_at`,
-  and gates nothing (NF-2026-00029).
-- The reconciler backs off standby lock retries from 0.25 s to a 5 s cap
-  instead of spinning for hours (NF-2026-00028).
-- Quality-reviewer prewarm can no longer wedge the launch queue until the MCP
-  server restarts (NF-2026-00027).
-  - Cause: a started prewarm row counted as live for the whole life of its owner
-    process, so a hung or crashed build held a launch slot indefinitely.
-  - A started row now expires after the preparation stall ceiling (180 s by
-    default, `AIWORKHUB_PREPARATION_STALL_SECONDS`).
-  - A build that fails with any exception publishes a terminal phase.
-  - Concurrent prewarms queue for a bounded time behind a capacity derived from
-    the core count, and time out with `reviewer_prewarm_capacity_exhausted`.
-- Windows: a reviewer terminal intent could settle twice. A reader holding the
-  intent file open blocked its deletion, and the second settler then
-  re-processed it. Intent reads now open files with delete sharing.
-- VS Code LM workers:
-  - After forced semantic-edit staging begins, a worker can read the files its
-    card declared writable, not only its next required output (NF-2026-00023).
-  - Outside forced staging, a tool name that is not allowlisted gets one
-    correction that names the allowed tools and executes nothing, instead of
-    failing the request. A second violation fails, and the turn trace is kept
-    (NF-2026-00032).
-- `tests/test_worker_workspace.py` and the Source Graph LSP tests now collect
-  and run on Windows.
+- A reviewer or rework Source Graph overlay partition now pins the exact base
+  index generation it was built against (NF-2026-00946). The canonical base is
+  published by atomic replacement, so a marker that named only the canonical
+  path let every ordinary publication break every in-flight reviewer/rework
+  overlay. The marker now records the base generation's device, inode, size and
+  `mtime_ns` and pins that generation by hard link beside the partition (never
+  a copy or a content hash); reads compose with the pinned generation and verify
+  its identity, so a newer canonical generation never leaks into a sealed
+  review and a replaced or mutated pin fails closed. Where hard links are
+  unsupported the marker records that, and a later base shift fails with an
+  explicit `composed_base_shifted_unpinned` reason. Pins no partition
+  references any more are pruned on the next marker write, and the partition
+  build report carries `base_pin` and `pin_seconds`.
+- A manager can reroute a retained candidate after a zero-delta launch failure
+  that `recover_blocked_rework` already moved back to pending (NF-2026-00778).
+  In that shape (a rejected sealed candidate, then a claim that failed at
+  launch, e.g. on provider authentication, before any model work) the recovery
+  drops the launch reservation and writes no transient retry, so the
+  authenticated reroute was previously lost. Authority is the newest task-bound
+  canonical `claim_start -> launch_failed -> blocked_rework_recovery` chain,
+  matched field for field against the card's recovery and retained-predecessor
+  identity, plus the process ledger proving the failed request ended
+  `launch_failed` with zero changed paths on this runner. Card fields alone are
+  never authority, and any later lineage event, including the reroute itself,
+  makes the authorization stale, so it is one-shot.
 
-### Known issues
+### Not in this release
 
-- A full native CLI worker run on Windows is not yet proven end to end. The
-  container is not yet granted the worker MCP server's interpreter and package,
-  or git access to the canonical `.git` from a linked worktree. `codex_cli`'s
-  shim is not an npm shim, so it still runs through `cmd.exe`, which is denied
-  inside the container.
-- One Windows byte-exactness gap remains in the npm-prefix seeding test
-  (NF-2026-00024).
+- LSP index integration, OpenCode manager callback and OpenCode/Muse worker
+  qualification, the full stage-gated Playbook lifecycle, and portable
+  `.aiworkhub` data are pending and not shipped here. No reasoning-quality
+  improvement is claimed: causal reasoning-quality measurement remains
+  incomplete, and inferred successor progression is still pending.
 
 ## [0.11.56] - 2026-09-21
 

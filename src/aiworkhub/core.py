@@ -7525,39 +7525,16 @@ def _canonical_receipt_digest(value: Any) -> str:
     ).hexdigest()
 
 
-def _verified_pending_launch_failure_reroute_receipt(
-    card: Mapping[str, Any], *, task_id: str
+def _verified_zero_delta_launch_failure_event(
+    card: Mapping[str, Any], *, task_id: str, request_id: str, runner: str, reason: str
 ) -> dict[str, Any] | None:
-    """Authenticate a zero-delta launch failure that intentionally stayed pending.
+    """Return the process-ledger identity of one exact zero-delta launch failure.
 
-    Recoverable provider refusals use the transient retry scheduler and therefore
-    do not pass through the blocked terminal-retry transition.  A manager must
-    still be able to move the retained candidate off that exact failed route.
-    The card projection alone is insufficient authority, so bind it to the
-    canonical process-event ledger and fail closed on any identity or delta.
+    The canonical process ledger, not the card, proves that ``request_id``
+    ended ``launch_failed`` for this task and runner with exactly ``reason``
+    and no changed paths, on the adapter and model a prior reroute selected.
     """
     from . import process_event_ledger, process_launcher
-
-    current_claim_epoch = card.get("claim_epoch")
-    request_id = str(card.get("launch_request_id") or "").strip()
-    runner = str(card.get("runner") or "").strip()
-    transient_retry = card.get("transient_retry")
-    if (
-        type(current_claim_epoch) is not int
-        or re.fullmatch(r"[0-9a-f]{32}", request_id) is None
-        or not runner
-        or not isinstance(transient_retry, dict)
-        or transient_retry.get("schema_id") != "aiworkhub.transient_retry.v1"
-        or str(transient_retry.get("request_id") or "").strip() != request_id
-        or type(transient_retry.get("attempts")) is not int
-        or type(transient_retry.get("budget")) is not int
-        or not (1 <= transient_retry["attempts"] <= transient_retry["budget"])
-        or not str(transient_retry.get("recorded_at") or "").strip()
-    ):
-        return None
-    reason = str(transient_retry.get("reason") or "").strip()
-    if not reason or len(reason.encode("utf-8")) > 500:
-        return None
 
     process_log = Path(
         os.environ.get(
@@ -7593,7 +7570,7 @@ def _verified_pending_launch_failure_reroute_receipt(
     ):
         return None
 
-    event_identity = {
+    return {
         key: event.get(key)
         for key in (
             "request_id",
@@ -7608,6 +7585,45 @@ def _verified_pending_launch_failure_reroute_receipt(
             "changed_paths",
         )
     }
+
+
+def _verified_pending_launch_failure_reroute_receipt(
+    card: Mapping[str, Any], *, task_id: str
+) -> dict[str, Any] | None:
+    """Authenticate a zero-delta launch failure that intentionally stayed pending.
+
+    Recoverable provider refusals use the transient retry scheduler and therefore
+    do not pass through the blocked terminal-retry transition.  A manager must
+    still be able to move the retained candidate off that exact failed route.
+    The card projection alone is insufficient authority, so bind it to the
+    canonical process-event ledger and fail closed on any identity or delta.
+    """
+    current_claim_epoch = card.get("claim_epoch")
+    request_id = str(card.get("launch_request_id") or "").strip()
+    runner = str(card.get("runner") or "").strip()
+    transient_retry = card.get("transient_retry")
+    if (
+        type(current_claim_epoch) is not int
+        or re.fullmatch(r"[0-9a-f]{32}", request_id) is None
+        or not runner
+        or not isinstance(transient_retry, dict)
+        or transient_retry.get("schema_id") != "aiworkhub.transient_retry.v1"
+        or str(transient_retry.get("request_id") or "").strip() != request_id
+        or type(transient_retry.get("attempts")) is not int
+        or type(transient_retry.get("budget")) is not int
+        or not (1 <= transient_retry["attempts"] <= transient_retry["budget"])
+        or not str(transient_retry.get("recorded_at") or "").strip()
+    ):
+        return None
+    reason = str(transient_retry.get("reason") or "").strip()
+    if not reason or len(reason.encode("utf-8")) > 500:
+        return None
+
+    event_identity = _verified_zero_delta_launch_failure_event(
+        card, task_id=task_id, request_id=request_id, runner=runner, reason=reason
+    )
+    if event_identity is None:
+        return None
     return {
         "schema_id": "aiworkhub.pending_launch_failure_reroute.v1",
         "task_id": task_id,
@@ -7616,6 +7632,226 @@ def _verified_pending_launch_failure_reroute_receipt(
         "claim_epoch": current_claim_epoch,
         "transient_retry_sha256": _canonical_receipt_digest(transient_retry),
         "process_event_sha256": _canonical_receipt_digest(event_identity),
+    }
+
+
+# Task events that end or replace a ``claim_start -> launch_failed ->
+# blocked_rework_recovery`` chain: any of them newer than the recovery, or
+# interposed inside the chain, means it is not the card's latest episode.
+# Bookkeeping rows (usage, callbacks, launch-guard refusals, reviewer notices)
+# never move the claim, candidate or runner and are skipped.
+_RECOVERED_LAUNCH_FAILURE_LINEAGE_EVENTS: frozenset[str] = (
+    _RETRYABLE_OPERATIONAL_TERMINAL_SUBSTATUSES
+    | frozenset(
+        {
+            "accept_review",
+            "archive_inconsistency_repaired",
+            "archived",
+            "blocked_rework_clean_root_authorized",
+            "blocked_rework_recovery",
+            "blocked_rework_validation_replay_authorization_consumed",
+            "blocked_rework_validation_replay_reauthorized",
+            "claim_start",
+            "dead_process_reconciled",
+            "finalization_retry_started",
+            "launch_attach",
+            "reject_review",
+            "reroute_launch_identity",
+            "restored",
+            "retry_terminal",
+            "superseded",
+            "terminal_failure",
+            "terminal_review",
+            "transient_retry",
+        }
+    )
+)
+
+
+def _verified_recovered_launch_failure_reroute_receipt(
+    card: Mapping[str, Any], *, task_id: str
+) -> dict[str, Any] | None:
+    """Authenticate a zero-delta launch failure the manager recovered (NF778).
+
+    Live NF551 shape: the manager rejected sealed candidate N, claim N+1
+    failed at launch (Claude auth) before any model work, and
+    ``recover_blocked_rework`` moved the card to pending at claim N+2.  That
+    recovery drops ``launch_request_id`` and writes no ``transient_retry``;
+    the ``launch_failed`` task event carries neither claim epoch nor
+    substatus; the inline ``terminal_failure``/``terminal_retry`` describe
+    older episodes; and the recovery predecessor still names candidate N.
+    None of those card fields is authority.  Authority is the newest,
+    task-bound canonical chain ``claim_start(N+1, R) -> launch_failed(R) ->
+    blocked_rework_recovery(N+2)`` matched field for field against the card's
+    recovery and retained-predecessor identity, plus the process ledger
+    proving R ended ``launch_failed`` with zero changed paths on this runner.
+    Any later lineage event -- including the reroute this receipt authorizes
+    -- makes the chain stale, so the authorization is one-shot.
+    """
+    runner = str(card.get("runner") or "").strip()
+    current_claim_epoch = card.get("claim_epoch")
+    recovery = card.get("recovery_predecessor")
+    predecessor = card.get("rework_predecessor")
+    rejection = card.get("rejection_disposition")
+    recovered_at = str(card.get("recovered_from_blocked_at") or "").strip()
+    if (
+        not runner
+        or type(current_claim_epoch) is not int
+        or type(card.get("recovery_epoch")) is not int
+        or card.get("recovery_epoch") != current_claim_epoch
+        # A live reservation is a later launch, never this recovered episode.
+        or str(card.get("launch_request_id") or "").strip()
+        or not isinstance(recovery, dict)
+        or not isinstance(predecessor, dict)
+        or not isinstance(rejection, dict)
+        or not recovered_at
+    ):
+        return None
+    manager = _verified_manager_actor()
+    retained_request_id = str(predecessor.get("request_id") or "").strip()
+    retained_epoch = predecessor.get("claim_epoch")
+    retained_hashes = predecessor.get("changed_path_hashes")
+    failed_epoch = current_claim_epoch - 1
+    if (
+        str(card.get("recovered_by") or "").strip() != manager
+        or re.fullmatch(r"[0-9a-f]{32}", retained_request_id) is None
+        or str(rejection.get("request_id") or "").strip() != retained_request_id
+        or str(recovery.get("request_id") or "").strip() != retained_request_id
+        or str(recovery.get("task_id") or task_id) != task_id
+        or type(retained_epoch) is not int
+        or type(recovery.get("terminal_claim_epoch")) is not int
+        or recovery["terminal_claim_epoch"] != retained_epoch
+        # Exactly: rejected candidate N, failed launch N+1, recovery N+2.
+        or failed_epoch != retained_epoch + 1
+        or not isinstance(retained_hashes, dict)
+        or not retained_hashes
+        or recovery.get("changed_path_hashes") != retained_hashes
+        or not isinstance(recovery.get("terminal_substatus"), str)
+        or not recovery["terminal_substatus"].strip()
+    ):
+        return None
+    # Stale inline projections are history, never authority; one that claims
+    # the failed or recovered episode contradicts the canonical chain.
+    for stale in (card.get("terminal_failure"), card.get("terminal_retry")):
+        if (
+            isinstance(stale, dict)
+            and type(stale.get("claim_epoch")) is int
+            and stale["claim_epoch"] >= failed_epoch
+        ):
+            return None
+
+    try:
+        events = task_store.get_task_events(repo_root(), task_id, limit=200)
+    except Exception:  # noqa: BLE001 - unreadable canonical history fails closed
+        return None
+    # get_task_events is newest-first: the recovery must be the newest lineage
+    # event, then the launch failure it recovered, then the claim that
+    # reserved exactly that launch request.
+    expected = ("blocked_rework_recovery", "launch_failed", "claim_start")
+    chain: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for event in events:
+        if not isinstance(event, dict):
+            return None
+        name = str(event.get("event") or "").strip()
+        if name not in _RECOVERED_LAUNCH_FAILURE_LINEAGE_EVENTS:
+            continue
+        raw_payload = event.get("payload")
+        try:
+            payload = (
+                json.loads(raw_payload) if isinstance(raw_payload, str) else raw_payload
+            )
+        except json.JSONDecodeError:
+            return None
+        if (
+            name != expected[len(chain)]
+            or not isinstance(payload, dict)
+            or event.get("task_id", task_id) != task_id
+            or payload.get("task_id", task_id) != task_id
+        ):
+            return None
+        chain.append((event, payload))
+        if len(chain) == len(expected):
+            break
+    if len(chain) != len(expected):
+        return None
+    (recovery_event, recovered), (failure_event, failed), (claim_event, claimed) = chain
+
+    request_id = str(failed.get("request_id") or "").strip()
+    reason = str(failed.get("reason") or "").strip()
+    prior_episode = recovered.get("prior_episode")
+    if (
+        # The manager recovery exactly as recover_blocked_rework recorded it.
+        recovered.get("transition") != "blocked->pending"
+        or type(recovered.get("claim_epoch")) is not int
+        or recovered["claim_epoch"] != current_claim_epoch
+        or recovered.get("predecessor") != recovery
+        or recovered.get("feedback") != card.get("recovery_feedback")
+        or recovered.get("terminal_substatus") != recovery["terminal_substatus"]
+        or recovered.get("validation_only_replay") is not False
+        or "successful_rework_delta" in recovered
+        or recovered.get("actor") != manager
+        or recovered.get("recorded_at") != recovered_at
+        or recovery_event.get("runner") != manager
+        or recovery_event.get("created_at") != recovered_at
+        or not isinstance(prior_episode, dict)
+        or prior_episode.get("terminal_substatus") != "launch_failed"
+        or str(prior_episode.get("launch_error") or "").strip() != reason
+        # The launch failure of the latest reservation, on this runner.
+        or re.fullmatch(r"[0-9a-f]{32}", request_id) is None
+        or request_id == retained_request_id
+        or not reason
+        or len(reason.encode("utf-8")) > 500
+        or failed.get("worker_status") != "launch_failed"
+        or failed.get("transition") != "processing->blocked"
+        or failed.get("runner") != runner
+        or failure_event.get("runner") != runner
+        or not str(failed.get("recorded_at") or "").strip()
+        or failure_event.get("created_at") != failed.get("recorded_at")
+        or (
+            "claim_epoch" in failed
+            and (
+                type(failed["claim_epoch"]) is not int
+                or failed["claim_epoch"] != failed_epoch
+            )
+        )
+        # The claim that reserved exactly that request.
+        or type(claimed.get("claim_epoch")) is not int
+        or claimed["claim_epoch"] != failed_epoch
+        or str(claimed.get("request_id") or "").strip() != request_id
+        or claimed.get("runner") != runner
+        or claim_event.get("runner") != runner
+    ):
+        return None
+
+    process_identity = _verified_zero_delta_launch_failure_event(
+        card, task_id=task_id, request_id=request_id, runner=runner, reason=reason
+    )
+    if process_identity is None:
+        return None
+    event_sha256 = [
+        _canonical_receipt_digest(
+            {
+                "event": event.get("event"),
+                "runner": event.get("runner"),
+                "created_at": event.get("created_at"),
+                "payload": payload,
+            }
+        )
+        for event, payload in chain
+    ]
+    return {
+        "schema_id": "aiworkhub.recovered_launch_failure_reroute.v1",
+        "task_id": task_id,
+        "request_id": request_id,
+        "runner": runner,
+        "failed_claim_epoch": failed_epoch,
+        "recovery_epoch": current_claim_epoch,
+        "retained_request_id": retained_request_id,
+        "recovery_predecessor_sha256": _canonical_receipt_digest(recovery),
+        "recovery_event_sha256": event_sha256[0],
+        "launch_failed_event_sha256": event_sha256[1],
+        "claim_event_sha256": event_sha256[2],
+        "process_event_sha256": _canonical_receipt_digest(process_identity),
     }
 
 
@@ -7752,6 +7988,7 @@ def _verified_manager_rejection_receipt(
         and terminal_retry.get("claim_epoch") == current_claim_epoch
     )
     pending_launch_failure_rebind: dict[str, Any] | None = None
+    recovered_launch_failure_rebind: dict[str, Any] | None = None
     if (
         type(claim_epoch) is int
         and type(current_claim_epoch) is int
@@ -7762,6 +7999,12 @@ def _verified_manager_rejection_receipt(
         pending_launch_failure_rebind = (
             _verified_pending_launch_failure_reroute_receipt(card, task_id=task_id)
         )
+        if pending_launch_failure_rebind is None:
+            # NF778: the same zero-delta launch failure, blocked and then
+            # recovered by the manager instead of staying pending.
+            recovered_launch_failure_rebind = (
+                _verified_recovered_launch_failure_reroute_receipt(card, task_id=task_id)
+            )
     if (
         rejection.get("schema_id") != "aiworkhub.rejection_disposition.v1"
         or rejection.get("to") != "pending"
@@ -7778,6 +8021,7 @@ def _verified_manager_rejection_receipt(
             and not recovery_rebind
             and not terminal_retry_rebind
             and pending_launch_failure_rebind is None
+            and recovered_launch_failure_rebind is None
         )
     ):
         return None, "reroute_manager_rejection_identity_mismatch"
@@ -7840,6 +8084,8 @@ def _verified_manager_rejection_receipt(
         }
     if pending_launch_failure_rebind is not None:
         receipt["pending_launch_failure_rebind"] = pending_launch_failure_rebind
+    if recovered_launch_failure_rebind is not None:
+        receipt["recovered_launch_failure_rebind"] = recovered_launch_failure_rebind
     return receipt, None
 
 

@@ -64,41 +64,44 @@ structured findings into NeedFix with provenance.
 
 ## What's new in 0.11.58
 
-- Windows native `claude_cli` workers now run inside their AppContainer with
-  their worker tools.
-  - The worker MCP server runs on the host, behind a per-request pipe that only
-    this container can open.
-  - It never trusts a file, path or import root that the container can write.
-- Semantic edits cannot be redirected through a junction planted in the
-  worktree.
-- AppContainer validation runs Python read-only and offline, from the canonical
-  venv. If Python is installed in an admin-owned directory, run a one-time
-  elevated `icacls <python dir> /grant "*S-1-15-2-1:(OI)(CI)(RX)" /T` first.
+- The first four SDLC case stages are now gated on server-proven evidence
+  (NF-2026-00945). Plan, Design, Build and Test can be recorded `ready` only
+  when the server proves them from the repository's own canonical receipts (the
+  bound task and its contract, the sealed candidate, the validation evidence and
+  the coordinator's accepted outcome); a caller can no longer self-declare a
+  verdict, and a `ready` receipt is re-proven on every read. Receipts recorded
+  before this gate stay visible for audit but no longer count as proof.
+- Deploy and Maintain remain explicit refusals that name each missing producer:
+  the SDLC Deploy and Maintain gates do not yet consume canonical deploy target
+  allowlist, release/install/rollback receipts and approval policy, or deployed
+  release identity, outcome metrics and control-limit policy, so a case's
+  six-stage cycle cannot report complete. `not_applicable` is refused until a
+  canonical policy registry exists.
+- The isolated launch now puts the OpenCode worker's request-local `awh` MCP
+  config into the worker's own environment on the Linux (Landlock, bubblewrap)
+  and Windows AppContainer paths, and refuses the launch before any process
+  spawns when the config contract is not met (NF-2026-00919). This is launch
+  wiring covered by unit and integration tests only: live OpenCode/Muse worker
+  qualification and Windows runtime qualification remain unmeasured.
+- LSP index integration, the OpenCode manager callback, the full stage-gated
+  Playbook lifecycle and reasoning-quality measurement are not part of this
+  release and remain pending; no reasoning-quality improvement is claimed.
 
 ## What's new in 0.11.57
 
-- Windows native CLI workers (`claude_cli`, `opencode_cli`) now start inside
-  their AppContainer, and validation commands run inside it too.
-  - The container is granted exactly the paths it needs: read on the provider
-    install; modify on the per-request worktree, home and temp, revoked on
-    close.
-  - Worker launches get outbound internet only. Validation launches get no
-    network.
-- C/C++ repositories: CMake-style `include/` headers resolve, and
-  `cmake`/`ctest` are trusted validation tools.
-- Blocked-card rework recovery works on Windows. Worker liveness is probed
-  without `os.kill(pid, 0)`, which on Windows raised `[WinError 87]` or
-  terminated the process.
-- Dispatcher health reports manager-inbox callbacks that nothing delivers. The
-  reconciler no longer spins in standby.
-- Reviewer prewarm can no longer wedge the launch queue until a server restart.
-  Prewarm now expires after a stall ceiling and queues behind a capacity derived
-  from the core count.
-- VS Code LM workers get one correction for a tool name that is not allowlisted,
-  and can read their declared files during forced staging.
-- Known issue: a full native CLI worker run on Windows is not yet proven end to
-  end; the worker MCP server runtime and the canonical `.git` are not yet
-  granted to the container.
+- Reviewer and rework Source Graph overlays now pin the exact base index
+  generation they were built against, so an ordinary canonical index
+  publication no longer breaks an in-flight review, a newer generation never
+  leaks into a sealed review, and a replaced or mutated pin fails closed
+  (NF-2026-00946).
+- A manager can reroute a retained candidate after a zero-delta launch failure
+  (for example a provider authentication failure) that blocked-rework recovery
+  already returned to pending. The reroute is authorized only by the canonical
+  claim, launch-failure and recovery chain plus the process ledger, and only
+  once (NF-2026-00778).
+- LSP index integration, OpenCode/Muse worker qualification, the full
+  stage-gated Playbook lifecycle and reasoning-quality measurement are not part
+  of this release and remain pending.
 
 ## What's new in 0.11.56
 

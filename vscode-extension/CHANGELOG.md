@@ -1,68 +1,106 @@
 # AIWorkHub for VS Code — Changelog
 
-## 0.11.58 — 2026-09-22
+## 0.11.58 — 2026-09-21
+
+### Changed
+
+- Bundled runtime: an SDLC case stage can no longer be recorded `ready` on a
+  caller's say-so (NF-2026-00945). `ready` for Plan, Design, Build and Test is
+  accepted only when the runtime proves it, read-only and bounded, from the
+  repository's own canonical receipts (the bound task and its falsifiable
+  contract, a `review_ready` candidate sealed by the current claim against that
+  contract, the sealed validation evidence, and the coordinator's
+  accepted-outcome receipt for that candidate), and the resolved evidence is
+  stored with the stage receipt. The payload supplies only the Plan and Design
+  content and, for Build and Test, exact `task_id`, `request_id` and
+  `claim_epoch` pointers; verdict-shaped keys such as `passed`, `verdict` or
+  `sha256` are refused, and whatever cannot be proven is refused with a typed
+  `stage_evidence_refused:<stage>:<code>` reason and a next action.
+- Bundled runtime: a recorded `ready` receipt is re-proven on every read. A
+  receipt written before this gate, one whose stored evidence no longer hashes
+  or re-derives, and one whose predecessor stage is no longer proven stay
+  visible for audit but read as `unknown` with a reason. A case's `cycle` is
+  `complete` only when all six stages are proven now.
+- Bundled runtime: Deploy and Maintain remain explicit refusals rather than
+  evidence gates. The SDLC Deploy and Maintain gates do not yet consume
+  canonical deploy target allowlist, release/build provenance receipt, install
+  receipt, rollback receipt, deploy approval policy, deployed release identity,
+  observed outcome metrics or control-limit policy, so `ready` for either stage
+  is refused with each missing producer named and is never inferred, and a
+  case's `cycle` cannot report `complete`. `not_applicable` is refused the same
+  way until a canonical policy registry exists.
 
 ### Fixed
 
-- Bundled runtime, Windows: native `claude_cli` workers now run inside their
-  AppContainer with their worker tools (NF-2026-00034).
-  - The worker MCP server runs on the host. It is reached only through a
-    per-request pipe that this container's SID can open.
-  - It starts from a directory the container cannot write, with a checked
-    `sys.path`.
-  - Its authority files are withheld from the container.
-- Bundled runtime: grants reach protected directories inside a request's
-  directories. Semantic edits cannot be redirected through a planted junction.
-- Bundled runtime: AppContainer validation runs Python read-only and offline,
-  from the canonical venv.
+- Bundled runtime: the isolated launch now puts the OpenCode worker's
+  request-local `awh` MCP config into the worker's own process environment
+  (NF-2026-00919). It is derived from the worker MCP runtime already generated
+  for the request, spelled for the selected sandbox (mount aliases under
+  bubblewrap, real host paths under Landlock and Windows AppContainer), and set
+  as `OPENCODE_CONFIG_CONTENT` with project-level OpenCode config disabled;
+  nothing is written to disk and no global OpenCode config is touched. The
+  contract fails closed: a config that does not meet it refuses the launch
+  before any supervisor or worker process spawns and records the launch failure
+  with a typed `opencode_worker_mcp_config_<cause>` reason, an infrastructure
+  fault rather than a model-quality failure. The config must be exactly the
+  `awh` server plus the worker permission contract (deny by default, only the
+  `awh` worker tools allowed); its `environment` may carry only the request's
+  own binding variables, never a provider credential or another inherited
+  variable; it is bounded to 16 KiB of ASCII JSON; and the generated source it
+  is read from must be a regular, non-symlinked, current-user-owned file beneath
+  the request HOME whose request, repository and audit paths match the launch.
+  This is launch wiring only: whether a live OpenCode/Muse worker then connects
+  to `awh` is not measured in this release (below).
 
-### Known issues
+### Not in this release
 
-- Python in an admin-owned directory needs a one-time elevated
-  `icacls <python dir> /grant "*S-1-15-2-1:(OI)(CI)(RX)" /T` before
-  validation can run inside the container.
+- Live OpenCode/Muse worker qualification and Windows runtime qualification.
+  The launch wiring is covered by unit and integration tests that run the real
+  launcher with the task store, git and the supervisor spawn replaced by
+  stand-ins; the Windows AppContainer cases fake the host platform, the Win32
+  probe and the Win32 API. No live OpenCode/Muse worker was run against the
+  delivered config and nothing was run on a real Windows host, so both remain
+  unmeasured.
+- Evidence gates for Deploy and Maintain: the SDLC gates do not yet consume the
+  canonical deploy, release and outcome proof those stages would need, so only
+  the first four SDLC stages are gated.
+- LSP index integration, the OpenCode manager callback, the full stage-gated
+  Playbook lifecycle, and portable `.aiworkhub` data are pending and not shipped
+  here. No reasoning-quality improvement is claimed: causal reasoning-quality
+  measurement remains incomplete, and inferred successor progression is still
+  pending.
 
 ## 0.11.57 — 2026-09-21
 
 ### Fixed
 
-- Bundled runtime, Windows: native CLI workers now start inside their
-  repo-scoped AppContainer.
-  - The container SID is granted read/execute on the provider CLI install, and
-    modify on the per-request worktree, isolated home and temp; the modify
-    grants are revoked on close.
-  - Grants are refused for UNC or device paths, reparse points, profile and
-    AppData roots, the user temp directory, and system trees.
-  - Worker launches get outbound internet only (`internetClient`). Validation
-    launches get no network.
-  - `LOCALAPPDATA` is supplied to the child environment block, which
-    AppContainer process creation requires.
-  - (NF-2026-00025, NF-2026-00033.)
-- Bundled runtime: C/C++ quoted includes resolve against the conventional
-  `include/` and `src/` roots, and `cmake`/`ctest` are trusted validation
-  executables.
-- Bundled runtime: blocked-card rework recovery works on Windows. Worker pids
-  are probed without `os.kill(pid, 0)`, which on Windows raised `[WinError 87]`
-  or terminated the process (NF-2026-00031).
-- Bundled runtime: dispatcher health reports undelivered manager-inbox
-  callbacks (NF-2026-00029). The reconciler backs off standby lock retries to a
-  5 s cap (NF-2026-00028).
-- Bundled runtime: reviewer prewarm can no longer wedge the launch queue.
-  - A started prewarm expires after the stall ceiling.
-  - Concurrent prewarms queue behind a capacity derived from the core count.
-  - On Windows, a terminal intent can no longer settle twice.
-  - (NF-2026-00027.)
-- VS Code LM bridge:
-  - Declared writable files stay readable during forced staging
-    (NF-2026-00023).
-  - A tool name that is not allowlisted gets one correction instead of failing
-    the request (NF-2026-00032).
+- Bundled runtime: a reviewer or rework Source Graph overlay partition now pins
+  the exact base index generation it was built against (NF-2026-00946). The
+  canonical base is published by atomic replacement, so a marker that named
+  only the canonical path let every ordinary publication break every in-flight
+  reviewer/rework overlay. The marker now records the base generation's device,
+  inode, size and `mtime_ns` and pins that generation by hard link beside the
+  partition (never a copy or a content hash); reads compose with the pinned
+  generation and verify its identity, so a newer canonical generation never
+  leaks into a sealed review and a replaced or mutated pin fails closed. Where
+  hard links are unsupported the marker records that, and a later base shift
+  fails with an explicit `composed_base_shifted_unpinned` reason.
+- Bundled runtime: a manager can reroute a retained candidate after a
+  zero-delta launch failure that `recover_blocked_rework` already moved back to
+  pending (NF-2026-00778), e.g. a claim that failed on provider authentication
+  before any model work. Authority is the newest task-bound canonical
+  `claim_start -> launch_failed -> blocked_rework_recovery` chain matched against
+  the card's recovery and retained-predecessor identity, plus the process ledger
+  proving zero changed paths on this runner; card fields alone are never
+  authority, and the authorization is one-shot.
 
-### Known issues
+### Not in this release
 
-- A full native CLI worker run on Windows is not yet proven end to end. The
-  worker MCP server's interpreter and package, and git access to the canonical
-  `.git`, are not yet granted to the container.
+- LSP index integration, OpenCode manager callback and OpenCode/Muse worker
+  qualification, the full stage-gated Playbook lifecycle, and portable
+  `.aiworkhub` data are pending and not shipped here. No reasoning-quality
+  improvement is claimed: causal reasoning-quality measurement remains
+  incomplete, and inferred successor progression is still pending.
 
 ## 0.11.56 — 2026-09-21
 

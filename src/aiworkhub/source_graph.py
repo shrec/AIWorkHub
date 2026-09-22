@@ -41,6 +41,7 @@ import os
 import functools
 import re
 import secrets
+import shlex
 import shutil
 import sqlite3
 import stat
@@ -63,6 +64,7 @@ from . import source_graph_ast as sgast
 from . import source_graph_analytics as sganalytics
 from . import source_graph_insights as sginsights
 from . import source_graph_languages as sglanguages
+from . import source_graph_lsp as sglsp
 from .sqlite_readonly import connect_readonly
 from .repository_state import HUB_DIRNAME, RepositoryStateError, inspect_repository
 from .storage_registry import (
@@ -239,6 +241,58 @@ CREATE TABLE IF NOT EXISTS index_quality_history (
     build_revision TEXT NOT NULL,
     payload TEXT NOT NULL
 );
+
+-- Task 3: durable per-edge LSP provenance. Migration-safe by construction --
+-- ``connect`` runs this script on every write open, so a generation
+-- published before the feature existed gains the tables the first time a
+-- writer touches it, and read-only callers check for them before querying.
+-- ``prior_evidence_label``/``prior_confidence`` record what lexical
+-- extraction produced, so revoking a binding restores the edge exactly.
+-- ``edge_identity`` names the one edge at the position a binding owns (see
+-- ``_lsp_edge_identity``). ``connect`` adds it to an older table, whose rows
+-- keep it empty: legacy provenance that recorded only a position.
+CREATE TABLE IF NOT EXISTS lsp_edge_provenance (
+    source_path TEXT NOT NULL,
+    source_line INTEGER NOT NULL,
+    source_column INTEGER NOT NULL,
+    source_hash TEXT NOT NULL,
+    edge_identity TEXT NOT NULL DEFAULT '',
+    target_path TEXT NOT NULL,
+    target_hash TEXT NOT NULL,
+    target_qualname TEXT NOT NULL,
+    target_name TEXT NOT NULL,
+    target_line_start INTEGER NOT NULL,
+    target_range TEXT NOT NULL,
+    prior_evidence_label TEXT NOT NULL DEFAULT '',
+    prior_confidence REAL NOT NULL DEFAULT 0.0,
+    server_command TEXT NOT NULL,
+    server_version TEXT NOT NULL,
+    config_digest TEXT NOT NULL,
+    result_config_digest TEXT NOT NULL DEFAULT '',
+    classification TEXT NOT NULL,
+    latency_ms INTEGER NOT NULL DEFAULT -1,
+    resolved_at TEXT NOT NULL,
+    schema_id TEXT NOT NULL,
+    PRIMARY KEY(source_path, source_line, source_column)
+);
+CREATE INDEX IF NOT EXISTS idx_lsp_provenance_target
+    ON lsp_edge_provenance(target_path);
+
+CREATE TABLE IF NOT EXISTS lsp_file_receipt (
+    source_path TEXT PRIMARY KEY,
+    source_hash TEXT NOT NULL,
+    language TEXT NOT NULL,
+    server_command TEXT NOT NULL,
+    server_version TEXT NOT NULL,
+    config_digest TEXT NOT NULL,
+    edge_count INTEGER NOT NULL DEFAULT 0,
+    -- 1 only when every position was asked and every answer arrived; an
+    -- incomplete receipt keeps its verified bindings but is never reused.
+    complete INTEGER NOT NULL DEFAULT 0,
+    latency_ms INTEGER NOT NULL DEFAULT -1,
+    resolved_at TEXT NOT NULL,
+    schema_id TEXT NOT NULL
+);
 """
 
 
@@ -404,6 +458,15 @@ def connect(db_path: Path, *, read_only: bool = False) -> sqlite3.Connection:
         if "receiver_name" not in edge_columns:
             conn.execute(
                 "ALTER TABLE edges ADD COLUMN receiver_name TEXT NOT NULL DEFAULT ''"
+            )
+        provenance_columns = {
+            str(row[1])
+            for row in conn.execute("PRAGMA table_info(lsp_edge_provenance)")
+        }
+        if "edge_identity" not in provenance_columns:
+            conn.execute(
+                "ALTER TABLE lsp_edge_provenance "
+                "ADD COLUMN edge_identity TEXT NOT NULL DEFAULT ''"
             )
     conn.execute("PRAGMA busy_timeout=30000")
     conn.row_factory = sqlite3.Row
@@ -2958,6 +3021,10 @@ def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, increme
             phase_seconds["merge"] = max(0.0, time.monotonic() - merge_started)
             resolution_started = time.monotonic()
             if changed or removed:
+                # Revoke before the resolvers run, while every surviving
+                # binding's edge still carries what it wrote: they may clear or
+                # re-resolve that destination (see ``_lsp_reconcile_generation``).
+                _lsp_reconcile_generation(conn)
                 _resolve_cpp_cross_file_edges(conn)
                 if python_changed_paths:
                     _resolve_python_imported_references(
@@ -2978,6 +3045,11 @@ def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, increme
                         affected_names=affected_python_names,
                     )
                 _resolve_javascript_import_bindings(conn)
+            # Task 3: revoke LSP evidence for every changed/deleted source or
+            # target, and re-attach bindings re-extraction or a resolver
+            # dropped, inside this merge -- plain SQL, so it holds even when no
+            # server is configured or the post-publish enrichment lease is busy.
+            _lsp_reconcile_generation(conn)
             phase_seconds["resolution"] = max(
                 0.0, time.monotonic() - resolution_started
             )
@@ -3407,7 +3479,17 @@ def build_index(repo_root: Path, *, db_path: Path | None = None, incremental: bo
             _publish_staged_generation(
                 staging_path, canonical_path, expected_report=report
             )
-            return replace(report, db_path=str(canonical_path))
+            published = replace(report, db_path=str(canonical_path))
+    # Task 3 (LSP batch resolution): the full build's enrichment pass runs
+    # here -- after the generation is published AND the writer lease released
+    # -- so no language server is ever spawned inside the merge transaction.
+    # It batches every unresolved edge per server group, takes a short lease
+    # of its own to publish what it verified, and never fails the build that
+    # produced it.
+    _lsp_enrich_after_publish(
+        repo_root, restrict=None, languages=_lsp_configured_languages()
+    )
+    return published
 
 
 def _fts_phrase(term: str) -> str:
@@ -6283,6 +6365,1779 @@ def _open_authenticated_regular_file_snapshot(
     return _open_authenticated_regular_file_snapshot_lstat_walk(repo_root, rel_path)
 
 
+# ---------------------------------------------------------------------------
+# Task 3: bounded LSP enrichment, run outside the SQLite merge transaction
+# ---------------------------------------------------------------------------
+#
+# Coordinate convention -- one conversion, in one place, and it is not here:
+#   * ``DefinitionQuery.line`` and ``LspDefinitionResult.source_line`` carry
+#     1-based graph lines, the same numbers ``edges.line`` stores.
+#     ``sglsp.graph_line_to_lsp`` is the single 1-based -> 0-based conversion
+#     and it lives at the wire boundary inside the transport. Nothing in this
+#     module shifts a source line, so a first-line edge is queryable and a
+#     binding lands on exactly the edge that asked for it.
+#   * ``DefinitionQuery.column`` and ``source_column`` are 0-based UTF-8 byte
+#     offsets. ``edges.source_col`` is -1 where an extractor records no
+#     column, so the wire column is ``max(source_col, 0)`` and binding matches
+#     on that same expression -- the mapping stays one-to-one either way.
+#   * ``target_range`` stays in LSP 0-based coordinates, counted in the
+#     negotiated position encoding. ``entities.line_start`` is 1-based, so
+#     ``target_range[0] + 1`` is the one target-side shift.
+#
+# Receipt/provenance lifecycle -- one invariant every writer keeps:
+#   * a file's ``lsp_edge_provenance`` rows are exactly the bindings its
+#     ``edges`` carry, and its receipt (when present) counts exactly them;
+#   * a binding owns exactly one edge -- the one its ``edge_identity`` names
+#     -- and only that edge is ever carried, re-attached or restored. Another
+#     edge on the same token, resolved lexically to the binding's target or
+#     to any other, is never touched (see ``_lsp_owned_edge``);
+#   * a file with provenance always has a receipt; a receipt is reusable only
+#     when ``complete`` -- every position was asked and every answer arrived;
+#   * ``_lsp_reconcile_generation`` restores that invariant in plain SQL
+#     inside every merge (full build, ``index_file``, ``remove_file``), so a
+#     changed/deleted source or target is revoked with no server running.
+#
+# Publication -- the canonical generation is never written in place:
+#   * a pass publishes at most one staged generation, and only when evidence
+#     changes; a refresh that reused every receipt stays read-only;
+#   * a pass that raised is written into health (``failed_passes``) by a
+#     staged publication of its own, so no earlier green can outlive it;
+#   * a receipt binds the observed identity of the server's bytes, so a
+#     server replaced at the same path is never mistaken for the old one.
+
+LSP_ENRICHMENT_SCHEMA_ID = "aiworkhub.source_graph.lsp_enrichment.v4"
+LSP_HEALTH_META_KEY = "lsp_health"
+LSP_PROVENANCE_TABLE = "lsp_edge_provenance"
+LSP_RECEIPT_TABLE = "lsp_file_receipt"
+LSP_SERVER_VERSION_ENV = "AIWORKHUB_LSP_SERVER_VERSION"
+# Task 3 never discovers a language server: enrichment runs only where the
+# environment names one, so an unconfigured repository indexes exactly as it
+# did before this feature existed.  Live server qualification is Task 4.
+# Each group is (spec language, environment override, indexed languages). The
+# languages in a group share one server AND one bounded workspace, because a
+# TypeScript server resolving a ``.js`` caller needs the ``.ts`` declaration
+# in the same workspace to resolve it to.
+LSP_SERVER_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    ("python", "AIWORKHUB_LSP_PYTHON_SERVER", ("python",)),
+    ("typescript", "AIWORKHUB_LSP_TYPESCRIPT_SERVER", ("javascript", "typescript")),
+)
+# Edge units (one per definition position). Every attempted position lands in
+# exactly one classification, so ``attempted`` always equals their sum.
+# ``unpositioned`` counts unresolved edges an extractor recorded no exact
+# call-site coordinate for: they are never asked at a guessed one.
+LSP_EDGE_CLASSIFICATIONS: tuple[str, ...] = (
+    "internal", "external", "ambiguous", "unresolved", "stale", "unavailable",
+)
+LSP_EDGE_COUNTERS: tuple[str, ...] = (
+    "attempted", "skipped", "unpositioned", "enriched", "reused", "revoked",
+    "discarded",
+) + LSP_EDGE_CLASSIFICATIONS
+# File units (one per caller file considered by a batch).
+LSP_FILE_COUNTERS: tuple[str, ...] = (
+    "files_attempted", "files_skipped", "files_reused", "files_revoked",
+    "files_deferred", "files_incomplete",
+)
+LSP_SUM_COUNTERS: tuple[str, ...] = (
+    LSP_EDGE_COUNTERS + LSP_FILE_COUNTERS
+    # Pass units: ``failed_passes`` counts passes that raised after publish.
+    + ("batches", "latency_ms_total", "failed_passes")
+)
+LSP_MAX_COUNTERS: tuple[str, ...] = ("latency_ms_max",)
+LSP_HEALTH_COUNTERS: tuple[str, ...] = LSP_SUM_COUNTERS + LSP_MAX_COUNTERS
+LSP_MAX_QUERIES_PER_FILE = 256
+LSP_MAX_FILES_PER_BATCH = 512
+LSP_REQUEST_TIMEOUT_S = sglsp.DEFAULT_REQUEST_TIMEOUT_S
+LSP_BATCH_TIMEOUT_S = sglsp.DEFAULT_BATCH_TIMEOUT_S
+# How long a pass waits out another writer's merge before it publishes.
+LSP_LEASE_WAIT_S = 15.0
+LSP_LEASE_POLL_S = 0.05
+# Server identity: how far above an executed file its package manifest may
+# sit, how long a file must sit unchanged before its digest may be cached,
+# and how many digests one process keeps.
+LSP_MANIFEST_SEARCH_DEPTH = 3
+LSP_DIGEST_SETTLE_S = 2.0
+LSP_MAX_EXECUTABLE_DIGEST_ENTRIES = 64
+_LSP_EXECUTABLE_DIGEST_CACHE: dict[tuple[Any, ...], str] = {}
+# A module/import row can start on the same line as the declaration a server
+# pointed at, so neither may ever stand in for a canonical definition.
+LSP_NON_DECLARATION_KINDS: frozenset[str] = frozenset({"module", "import"})
+
+
+@dataclass(frozen=True)
+class _LspBinding:
+    """One verified caller edge -> canonical declaration, with its evidence."""
+
+    source_path: str
+    source_line: int
+    source_column: int
+    source_hash: str
+    target_path: str
+    target_hash: str
+    target_qualname: str
+    target_name: str
+    target_line_start: int
+    target_range: tuple[int, ...]
+    classification: str
+    result_config_digest: str
+    prior_evidence_label: str = ""
+    prior_confidence: float = 0.0
+    # Which edge at the position the binding owns (``_lsp_edge_identity``);
+    # a verified answer has none until ``_lsp_bind_edge`` picks its edge.
+    edge_identity: str = ""
+
+
+@dataclass(frozen=True)
+class _LspFilePlan:
+    """One file whose positions need a language server this run."""
+
+    rel: str
+    source_hash: str
+    queries: tuple[sglsp.DefinitionQuery, ...]
+    had_evidence: bool
+    complete: bool
+
+
+@dataclass(frozen=True)
+class _LspFileOutcome:
+    """What the commit step should publish for one file.
+
+    ``action`` is ``"publish"`` (replace the file's evidence with
+    ``bindings``) or ``"clear"`` (revoke everything, keep no receipt).
+    """
+
+    rel: str
+    source_hash: str
+    action: str
+    bindings: tuple[_LspBinding, ...] = ()
+    complete: bool = False
+    latency_ms: int = -1
+
+
+@dataclass
+class _LspGroupRun:
+    """One server group's pass: resolved with no lease held, not yet published."""
+
+    label: str
+    languages: tuple[str, ...]
+    spec: sglsp.LspServerSpec
+    counters: dict[str, int] = field(
+        default_factory=lambda: dict.fromkeys(LSP_HEALTH_COUNTERS, 0)
+    )
+    outcomes: dict[str, _LspFileOutcome] = field(default_factory=dict)
+    digest: str = ""
+    status: str = "skipped"
+    reason: str = ""
+    files: int = 0
+    latency_ms: int = -1
+
+    def summary(self) -> dict[str, Any]:
+        status = self.status
+        if status == "skipped" and self.counters["files_reused"]:
+            status = "reused"
+        return _lsp_summary(
+            status,
+            self.label,
+            reason=self.reason,
+            counters=self.counters,
+            files=self.files,
+            latency_ms=self.latency_ms,
+        )
+
+
+def _lsp_group_for_language(
+    language: str,
+) -> tuple[str, str, tuple[str, ...]] | None:
+    """The server group that indexes ``language``; ``None`` when unsupported."""
+
+    for group in LSP_SERVER_GROUPS:
+        if language in group[2]:
+            return group
+    return None
+
+
+def _lsp_file_digest(path: str) -> str | None:
+    """sha256 of one regular file's bytes, or ``None`` when it cannot be read.
+
+    Hashing the same large server binary on every refresh would be wasted
+    work, so a digest is cached under the exact stat identity of the
+    descriptor that was read: device, inode, size and both timestamps. A file
+    replaced or rewritten at the same path presents a new identity and is
+    hashed again. Timestamps only move once per clock tick, so a file changed
+    moments ago is never cached -- a second write inside the same tick could
+    otherwise present an identical stat and be served the first one's digest.
+    """
+
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError:
+        return None
+    try:
+        status = os.fstat(descriptor)
+        if not stat.S_ISREG(status.st_mode):
+            return None
+        key = (
+            path, status.st_dev, status.st_ino, status.st_size,
+            status.st_mtime_ns, status.st_ctime_ns,
+        )
+        cached = _LSP_EXECUTABLE_DIGEST_CACHE.get(key)
+        if cached is not None:
+            return cached
+        digest = hashlib.sha256()
+        while chunk := os.read(descriptor, 1 << 20):
+            digest.update(chunk)
+    except OSError:
+        return None
+    finally:
+        os.close(descriptor)
+    value = digest.hexdigest()
+    if time.time() - max(status.st_mtime, status.st_ctime) > LSP_DIGEST_SETTLE_S:
+        if len(_LSP_EXECUTABLE_DIGEST_CACHE) >= LSP_MAX_EXECUTABLE_DIGEST_ENTRIES:
+            _LSP_EXECUTABLE_DIGEST_CACHE.clear()
+        _LSP_EXECUTABLE_DIGEST_CACHE[key] = value
+    return value
+
+
+def _lsp_package_manifest(real_path: str) -> str:
+    """The nearest ``package.json`` a few directories above a file, or ``""``."""
+
+    directory = os.path.dirname(real_path)
+    for _depth in range(LSP_MANIFEST_SEARCH_DEPTH):
+        candidate = os.path.join(directory, "package.json")
+        if os.path.isfile(candidate):
+            return candidate
+        parent = os.path.dirname(directory)
+        if parent == directory:
+            break
+        directory = parent
+    return ""
+
+
+def _lsp_server_identity(command: tuple[str, ...]) -> str:
+    """Immutable identity of the exact bytes a server command runs.
+
+    The declared ``AIWORKHUB_LSP_SERVER_VERSION`` is optional, so it can never
+    be what revokes a receipt when the executable behind an unchanged command
+    is replaced. This binds what the command resolves to: the executable
+    (``PATH`` lookup and symlinks followed, as ``exec`` follows them), every
+    absolute-path file argument (the script an interpreter runs), and the
+    nearest ``package.json`` above each -- the manifest an npm upgrade
+    rewrites even when the entry shim it installs is byte-identical. Anything
+    else a server loads is what the declared version is for. A file that
+    cannot be read identifies nothing, so that run gets a nonce no stored
+    receipt can ever match: it is re-asked every time and never reused.
+    """
+
+    executable = command[0] if command else ""
+    if executable and os.sep not in executable and not (
+        os.altsep and os.altsep in executable
+    ):
+        executable = shutil.which(executable) or ""
+    members = [executable, *(
+        argument for argument in command[1:]
+        if os.path.isabs(argument) and os.path.isfile(argument)
+    )]
+    paths: list[str] = []
+    for member in members:
+        real = os.path.realpath(member) if member else ""
+        paths.append(real)
+        manifest = _lsp_package_manifest(real) if real else ""
+        if manifest:
+            paths.append(manifest)
+    fingerprint: list[str] = []
+    for path in paths:
+        digest = _lsp_file_digest(path) if path else None
+        if digest is None:
+            return f"unidentified:{secrets.token_hex(16)}"
+        fingerprint.append(f"{path}\0{digest}")
+    joined = "\n".join(fingerprint).encode("utf-8", "surrogateescape")
+    return "sha256:" + hashlib.sha256(joined).hexdigest()
+
+
+def _lsp_server_spec(
+    group: tuple[str, str, tuple[str, ...]],
+) -> sglsp.LspServerSpec | None:
+    """Resolve the configured server for ``group``; ``None`` when unset.
+
+    ``version`` is the observed identity of the bytes the command runs,
+    after the declared ``AIWORKHUB_LSP_SERVER_VERSION`` when one is set.
+    Receipts and provenance record it and the config digest covers it, so a
+    server replaced at the same path -- with nothing declared -- revokes
+    every receipt its predecessor's answers earned.
+    """
+
+    name, env_name, _languages = group
+    try:
+        command = tuple(shlex.split(os.environ.get(env_name, "")))
+    except ValueError:
+        return None
+    if not command:
+        return None
+    declared = os.environ.get(LSP_SERVER_VERSION_ENV, "").strip()
+    identity = _lsp_server_identity(command)
+    return sglsp.LspServerSpec(
+        command=command,
+        version=f"{declared}+{identity}" if declared else identity,
+        language=name,
+    )
+
+
+def _lsp_server_installed(command: tuple[str, ...]) -> bool:
+    """Is the configured server present on this host at all?
+
+    Executability, spawn failures and protocol errors stay the transport's
+    fail-closed business -- they arrive as results carrying ``failure``.
+    This bounded existence check only avoids materialising a workspace for a
+    server that is not installed.
+    """
+
+    executable = command[0] if command else ""
+    if not executable:
+        return False
+    if os.sep in executable or (os.altsep and os.altsep in executable):
+        return Path(executable).is_file()
+    return shutil.which(executable) is not None
+
+
+def _lsp_summary(
+    status: str,
+    language: str,
+    *,
+    reason: str = "",
+    counters: dict[str, int] | None = None,
+    files: int = 0,
+    latency_ms: int = -1,
+) -> dict[str, Any]:
+    """The typed enrichment outcome ``index_file``/``build_index`` return."""
+
+    counts = counters or {}
+    return {
+        "schema_id": LSP_ENRICHMENT_SCHEMA_ID,
+        "status": status,
+        "reason": reason,
+        "language": language,
+        "attempted": int(counts.get("attempted", 0)),
+        "enriched": int(counts.get("enriched", 0)),
+        "reused": int(counts.get("reused", 0)),
+        "revoked": int(counts.get("revoked", 0)),
+        "skipped": int(counts.get("skipped", 0)),
+        "unavailable": int(counts.get("unavailable", 0)),
+        "files_deferred": int(counts.get("files_deferred", 0)),
+        "files": int(files),
+        "latency_ms": int(latency_ms),
+    }
+
+
+def _lsp_meta_document(conn: sqlite3.Connection, key: str) -> dict[str, Any]:
+    row = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+    if row is None:
+        return {}
+    try:
+        document = json.loads(str(row["value"]))
+    except (TypeError, ValueError):
+        return {}
+    return document if isinstance(document, dict) else {}
+
+
+def _lsp_store_meta_document(
+    conn: sqlite3.Connection, key: str, document: dict[str, Any]
+) -> None:
+    conn.execute(
+        "INSERT INTO meta(key, value) VALUES(?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (key, json.dumps(document, sort_keys=True)),
+    )
+
+
+def _lsp_tables_present(conn: sqlite3.Connection) -> bool:
+    """Do this generation's provenance tables exist?
+
+    ``connect`` creates them through ``SCHEMA`` on every write open, so a
+    generation published before this feature existed migrates the first time
+    a writer touches it. Read-only callers must tolerate their absence rather
+    than raise on an older database.
+    """
+
+    rows = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' "
+        "AND name IN ('lsp_edge_provenance', 'lsp_file_receipt')"
+    ).fetchall()
+    return len(rows) == 2
+
+
+def _lsp_indexed_language(conn: sqlite3.Connection, rel: str) -> str:
+    row = conn.execute(
+        "SELECT language FROM files WHERE file_path=?", (rel,)
+    ).fetchone()
+    return str(row["language"]) if row is not None else ""
+
+
+def _lsp_indexed_hash(conn: sqlite3.Connection, rel: str) -> str:
+    row = conn.execute(
+        "SELECT source_hash FROM files WHERE file_path=?", (rel,)
+    ).fetchone()
+    return str(row["source_hash"]) if row is not None else ""
+
+
+def _lsp_indexed_sources(
+    conn: sqlite3.Connection, languages: tuple[str, ...]
+) -> tuple[sglsp.IndexedSource, ...]:
+    """The bounded workspace this server group is allowed to see."""
+
+    placeholders = ",".join("?" for _ in languages)
+    return tuple(
+        sglsp.IndexedSource(
+            relative_path=str(row["file_path"]),
+            source_hash=str(row["source_hash"]),
+        )
+        for row in conn.execute(
+            "SELECT file_path, source_hash FROM files "
+            f"WHERE language IN ({placeholders}) ORDER BY file_path",
+            languages,
+        )
+    )
+
+
+def _lsp_group_files(
+    conn: sqlite3.Connection,
+    languages: tuple[str, ...],
+    restrict: frozenset[str] | None,
+) -> tuple[tuple[str, str], ...]:
+    """Every candidate caller file; the file cap applies to *asked* files."""
+
+    return tuple(
+        (item.relative_path, item.source_hash)
+        for item in _lsp_indexed_sources(conn, languages)
+        if restrict is None or item.relative_path in restrict
+    )
+
+
+def _lsp_config_digest(
+    spec: sglsp.LspServerSpec, sources: tuple[sglsp.IndexedSource, ...]
+) -> str:
+    """Digest the exact enrichment inputs: server, version and bounded tree.
+
+    The tree is every workspace member's path AND indexed content hash, so a
+    receipt is reusable only for a true no-op. Changing, adding or deleting
+    any member -- including a file a null answer never named, which may now
+    declare what the caller asked for -- or the server identity changes this
+    digest. That is what revokes a receipt taken under the old tree, and what
+    refuses a batch whose tree moved while the server was running.
+    """
+
+    return sglsp.config_digest(
+        command=spec.command,
+        version=spec.version,
+        include=tuple(
+            f"{item.source_hash} {item.relative_path}" for item in sources
+        ),
+        exclude=sglsp.PYRIGHT_EXCLUDE,
+        position_encoding="",
+    )
+
+
+def _lsp_query_positions(
+    conn: sqlite3.Connection, rel: str
+) -> tuple[list[tuple[int, int]], int]:
+    """Every exact position a non-reusable file must (re-)ask, in order.
+
+    That is each unresolved edge AND each position the file's existing
+    bindings sit on: publishing replaces the file's evidence wholesale, so a
+    bound position that was not re-asked would silently lose its binding.
+    Resolved lexical edges are never asked, so enrichment can only ever add
+    to what extraction already proved. An unresolved edge with no recorded
+    line or column has no exact call-site coordinate: it is counted (the
+    second value) and never asked at a guessed one.
+    """
+
+    positions: set[tuple[int, int]] = set()
+    unpositioned = 0
+    for row in conn.execute(
+        "SELECT line, source_col FROM edges WHERE file_path=? "
+        "AND dst_qualname IS NULL",
+        (rel,),
+    ):
+        line = int(row["line"] or 0)
+        column = row["source_col"]
+        if line <= 0 or column is None or int(column) < 0:
+            unpositioned += 1
+            continue
+        positions.add((line, int(column)))
+    for binding in _lsp_stored_bindings(conn, rel):
+        positions.add((binding.source_line, binding.source_column))
+    return sorted(positions), unpositioned
+
+
+def _lsp_terminal_name(name: str) -> str:
+    """The last identifier of a dotted/scoped/path-like reference name."""
+
+    parts = [part for part in re.split(r"[^\w$]+", str(name)) if part]
+    return parts[-1] if parts else ""
+
+
+def _lsp_position_name(
+    conn: sqlite3.Connection, rel: str, line: int, column: int
+) -> str | None:
+    """The single reference name recorded at one caller position."""
+
+    names = {
+        str(row["dst_name"])
+        for row in conn.execute(
+            "SELECT dst_name FROM edges WHERE file_path=? AND line=? "
+            "AND max(source_col, 0)=?",
+            (rel, int(line), int(column)),
+        )
+    }
+    return names.pop() if len(names) == 1 else None
+
+
+def _lsp_char_units(char: str, encoding: str) -> int:
+    """How many code units of the negotiated encoding one character takes."""
+
+    if encoding == "utf-8":
+        return len(char.encode("utf-8"))
+    if encoding == "utf-32":
+        return 1
+    return 2 if ord(char) > 0xFFFF else 1
+
+
+def _lsp_span_text(
+    raw: bytes, target_range: tuple[int, ...], encoding: str
+) -> str | None:
+    """The declaration identifier a definition range covers, exactly.
+
+    The range must cover one whole identifier on one line, and that token
+    must be the first occurrence of its name on the line -- where a
+    declaration's own name sits (``def name(``, ``class Name``, ``function
+    name``, ``name = ...``). A parameter or local sharing both the line and
+    the name, as in ``def thing(thing=None):``, therefore never stands in for
+    the declaration; anything else fails closed.
+    """
+
+    if len(target_range) != 4:
+        return None
+    start_line, start_char, end_line, end_char = (int(v) for v in target_range)
+    if start_line < 0 or start_line != end_line or not 0 <= start_char < end_char:
+        return None
+    lines = raw.split(b"\n")
+    if start_line >= len(lines):
+        return None
+    try:
+        text = lines[start_line].decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    # Map code-unit offsets onto character indexes; an offset that lands
+    # inside one character names no identifier at all.
+    boundaries: dict[int, int] = {}
+    units = 0
+    for index, char in enumerate(text):
+        boundaries[units] = index
+        units += _lsp_char_units(char, encoding)
+    boundaries[units] = len(text)
+    start = boundaries.get(start_char)
+    end = boundaries.get(end_char)
+    if start is None or end is None:
+        return None
+    identifier = text[start:end]
+    if not re.fullmatch(r"[\w$]+", identifier):
+        return None
+    first = re.search(rf"(?<![\w$]){re.escape(identifier)}(?![\w$])", text)
+    return identifier if first is not None and first.start() == start else None
+
+
+def _lsp_canonical_declaration(
+    conn: sqlite3.Connection, target_rel: str, line_start: int, name: str
+) -> sqlite3.Row | None:
+    """Exactly one canonical declaration named ``name`` starts on the line."""
+
+    if line_start <= 0 or not name:
+        return None
+    rows = [
+        row
+        for row in conn.execute(
+            "SELECT name, qualname, kind FROM entities "
+            "WHERE file_path=? AND line_start=? AND name=? ORDER BY qualname",
+            (target_rel, int(line_start), name),
+        )
+        if str(row["kind"]) not in LSP_NON_DECLARATION_KINDS
+    ]
+    return rows[0] if len(rows) == 1 else None
+
+
+def _lsp_canonical_relpath(
+    repo_root: Path, workspace_root: Path, uri: str
+) -> str | None:
+    """Map one definition URI back to a canonical repository-relative path.
+
+    A bounded private workspace is what the server actually sees, so a real
+    repo-internal definition comes back under the workspace root and never
+    under the repository. Remap that case first; the workspace copy was
+    written only from repository bytes whose hash matched the index, and the
+    caller re-authenticates the repository file before trusting it.
+
+    The repository branch stays lexical on purpose: resolving it would follow
+    a symlinked target straight past the checks that exist to refuse one.
+    """
+
+    # Reuse the transport's own URI decoding rather than re-deriving it here.
+    target = sglsp._uri_to_path(uri)
+    if target is None or not target.is_absolute():
+        return None
+    lexical = Path(os.path.abspath(os.fspath(target)))
+    roots = (
+        Path(os.path.abspath(os.fspath(workspace_root))),
+        Path(os.path.abspath(os.fspath(repo_root))),
+    )
+    for root in roots:
+        try:
+            relative = lexical.relative_to(root)
+        except ValueError:
+            continue
+        rel = relative.as_posix()
+        return rel if rel and rel != "." else None
+    return None
+
+
+def _lsp_verify_result(
+    repo_root: Path,
+    workspace_root: Path,
+    conn: sqlite3.Connection,
+    result: sglsp.LspDefinitionResult,
+    encoding: str,
+) -> tuple[_LspBinding | None, str]:
+    """Verify one definition against the canonical index; name its outcome.
+
+    Only an exact in-repo canonical declaration enriches an edge: the range
+    must cover exactly that declaration's identifier in the authenticated
+    target bytes, and the caller's reference name must name it. A parameter,
+    a local or any other token on a declaration's line never stands in for
+    the declaration. External, ambiguous, symlinked, missing, hash-shifted
+    and failed answers each fail closed into their own health counter.
+    """
+
+    if getattr(result, "failure", "") or (
+        result.classification == sglsp.SERVER_UNAVAILABLE
+    ):
+        return None, "unavailable"
+    classification = str(result.classification)
+    if classification in {sglsp.EXTERNAL_STDLIB, sglsp.EXTERNAL_DEPENDENCY}:
+        return None, "external"
+    if classification == sglsp.AMBIGUOUS:
+        return None, "ambiguous"
+    if classification != sglsp.REPO_INTERNAL:
+        return None, "unresolved"
+    target_range = result.target_range
+    if not result.target_uri or not target_range:
+        return None, "unresolved"
+    target_rel = _lsp_canonical_relpath(
+        repo_root, workspace_root, str(result.target_uri)
+    )
+    if target_rel is None:
+        return None, "external"
+    try:
+        _validate_single_file_path(repo_root, target_rel)
+        snapshot = _open_authenticated_regular_file_snapshot(
+            repo_root, Path(target_rel)
+        )
+    except SourceGraphError:
+        # Symlinked, excluded, escaping or non-regular targets never enrich.
+        return None, "external"
+    if _lsp_indexed_hash(conn, target_rel) != snapshot.source_hash:
+        return None, "stale"
+    span = tuple(int(value) for value in target_range)
+    identifier = _lsp_span_text(snapshot.raw, span, encoding)
+    line_start = span[0] + 1
+    declaration = _lsp_canonical_declaration(
+        conn, target_rel, line_start, identifier or ""
+    )
+    if declaration is None:
+        return None, "ambiguous"
+    caller_name = _lsp_position_name(
+        conn, str(result.source_path), int(result.source_line),
+        int(result.source_column),
+    )
+    if caller_name is None or (
+        _lsp_terminal_name(caller_name) != str(declaration["name"])
+    ):
+        return None, "ambiguous"
+    return _LspBinding(
+        source_path=str(result.source_path),
+        source_line=int(result.source_line),
+        source_column=int(result.source_column),
+        source_hash=str(result.source_hash),
+        target_path=target_rel,
+        target_hash=snapshot.source_hash,
+        target_qualname=str(declaration["qualname"]),
+        target_name=str(declaration["name"]),
+        target_line_start=line_start,
+        target_range=span,
+        classification=classification,
+        result_config_digest=str(result.config_digest),
+    ), "internal"
+
+
+def _lsp_binding_from_row(row: sqlite3.Row) -> _LspBinding:
+    """Rebuild one durable binding from its provenance row."""
+
+    try:
+        target_range = tuple(int(value) for value in json.loads(str(row["target_range"])))
+    except (TypeError, ValueError):
+        target_range = ()
+    return _LspBinding(
+        source_path=str(row["source_path"]),
+        source_line=int(row["source_line"]),
+        source_column=int(row["source_column"]),
+        source_hash=str(row["source_hash"]),
+        target_path=str(row["target_path"]),
+        target_hash=str(row["target_hash"]),
+        target_qualname=str(row["target_qualname"]),
+        target_name=str(row["target_name"]),
+        target_line_start=int(row["target_line_start"]),
+        target_range=target_range,
+        classification=str(row["classification"]),
+        result_config_digest=str(row["result_config_digest"]),
+        prior_evidence_label=str(row["prior_evidence_label"]),
+        prior_confidence=float(row["prior_confidence"]),
+        # A read-only open of a table ``connect`` has not migrated yet reads
+        # exactly what its rows are: legacy provenance with no identity.
+        edge_identity=(
+            str(row["edge_identity"] or "") if "edge_identity" in row.keys() else ""
+        ),
+    )
+
+
+def _lsp_stored_bindings(
+    conn: sqlite3.Connection, rel: str
+) -> tuple[_LspBinding, ...]:
+    if not _lsp_tables_present(conn):
+        return ()
+    return tuple(
+        _lsp_binding_from_row(row)
+        for row in conn.execute(
+            "SELECT * FROM lsp_edge_provenance WHERE source_path=? "
+            "ORDER BY source_line, source_column",
+            (rel,),
+        )
+    )
+
+
+def _lsp_stored_receipt(
+    conn: sqlite3.Connection, rel: str
+) -> dict[str, Any] | None:
+    if not _lsp_tables_present(conn):
+        return None
+    row = conn.execute(
+        "SELECT * FROM lsp_file_receipt WHERE source_path=?", (rel,)
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def _lsp_binding_supported(
+    conn: sqlite3.Connection, binding: _LspBinding
+) -> bool:
+    """Does this generation still carry the evidence the binding names?"""
+
+    if _lsp_indexed_hash(conn, binding.target_path) != binding.target_hash:
+        return False
+    declaration = _lsp_canonical_declaration(
+        conn, binding.target_path, binding.target_line_start, binding.target_name
+    )
+    return (
+        declaration is not None
+        and str(declaration["qualname"]) == binding.target_qualname
+    )
+
+
+# Every edge column ownership and restoration read, in one place.
+_LSP_EDGE_COLUMNS = (
+    "id, kind, src_qualname, dst_name, receiver_name, extractor, "
+    "dst_qualname, evidence_label, confidence"
+)
+
+
+def _lsp_edge_identity(row: sqlite3.Row) -> str:
+    """Name one edge at its position by exactly what extraction wrote.
+
+    Resolvers and bindings only ever rewrite ``dst_qualname``,
+    ``evidence_label`` and ``confidence``, and re-extracting identical bytes
+    reproduces every other field. With the binding's position this therefore
+    names the same edge across extraction, resolution and binding -- and
+    never another edge on the same token, such as the ``references`` edge
+    extraction records beside an attribute call's ``calls`` edge.
+    """
+
+    return json.dumps(
+        [
+            str(row["kind"]), str(row["src_qualname"]), str(row["dst_name"]),
+            str(row["receiver_name"]), str(row["extractor"]),
+        ],
+        separators=(",", ":"),
+    )
+
+
+def _lsp_owned_edge(
+    conn: sqlite3.Connection, binding: _LspBinding
+) -> sqlite3.Row | None:
+    """The one edge at the binding's position that the binding owns.
+
+    A binding owns the single edge carrying its ``edge_identity``. Legacy
+    provenance recorded only a position, so it owns an edge only where
+    exactly one edge there names its target: while the caller's bytes are
+    unchanged, that one is the edge it bound. Anything else -- a vanished or
+    duplicated identity, or a legacy position shared by same-named siblings
+    -- is ambiguous and owns nothing, and every caller fails closed on it
+    rather than guess which edge the server's answer was written to.
+    """
+
+    rows = conn.execute(
+        f"SELECT {_LSP_EDGE_COLUMNS} FROM edges "
+        "WHERE file_path=? AND line=? AND max(source_col, 0)=?",
+        (binding.source_path, binding.source_line, binding.source_column),
+    ).fetchall()
+    if binding.edge_identity:
+        owned = [
+            row for row in rows
+            if _lsp_edge_identity(row) == binding.edge_identity
+        ]
+    else:
+        owned = [
+            row for row in rows
+            if _lsp_terminal_name(str(row["dst_name"])) == binding.target_name
+        ]
+    return owned[0] if len(owned) == 1 else None
+
+
+def _lsp_binding_carried(
+    conn: sqlite3.Connection, binding: _LspBinding
+) -> bool:
+    """Does the edge this binding owns carry its target right now?
+
+    Another edge on the same token that lexical resolution sent to the same
+    target is evidence of its own: it never stands in for the binding's edge.
+    """
+
+    owned = _lsp_owned_edge(conn, binding)
+    return owned is not None and owned["dst_qualname"] == binding.target_qualname
+
+
+def _lsp_receipt_reusable(
+    conn: sqlite3.Connection,
+    receipt: dict[str, Any] | None,
+    bindings: tuple[_LspBinding, ...],
+    source_hash: str,
+    spec: sglsp.LspServerSpec,
+    digest: str,
+) -> bool:
+    """Is a stored receipt a complete, current answer for these exact inputs?"""
+
+    if not receipt or int(receipt.get("complete", 0) or 0) != 1:
+        return False
+    return (
+        str(receipt.get("source_hash", "")) == source_hash
+        and str(receipt.get("server_command", "")) == json.dumps(list(spec.command))
+        and str(receipt.get("server_version", "")) == spec.version
+        and str(receipt.get("config_digest", "")) == digest
+        and int(receipt.get("edge_count", -1)) == len(bindings)
+        and all(
+            binding.source_hash == source_hash
+            and _lsp_binding_supported(conn, binding)
+            and _lsp_binding_carried(conn, binding)
+            for binding in bindings
+        )
+    )
+
+
+def _lsp_restore_edge(conn: sqlite3.Connection, binding: _LspBinding) -> int:
+    """Take one binding's server evidence off the one edge it owns.
+
+    Only the owned edge is touched (``_lsp_owned_edge``): another edge on the
+    same token keeps its destination, label and confidence whatever it
+    resolved to, and ambiguous legacy provenance restores nothing rather than
+    guess. The owned edge is found by identity, not by its destination: a
+    lexical resolver that ran earlier in the same merge may already have
+    cleared or re-resolved the destination this binding wrote. Still naming
+    the binding's target, it returns to exactly what extraction left it (no
+    destination, the recorded prior label and confidence). Cleared or
+    re-resolved, it keeps that lexical destination -- a fresh lexical
+    resolution is evidence of its own -- and sheds only the label and
+    confidence the server's answer put there.
+    """
+
+    owned = _lsp_owned_edge(conn, binding)
+    if owned is None:
+        return 0
+    prior = (
+        binding.prior_evidence_label or sgast.AMBIGUOUS,
+        binding.prior_confidence,
+    )
+    if owned["dst_qualname"] == binding.target_qualname:
+        conn.execute(
+            "UPDATE edges SET dst_qualname=NULL, evidence_label=?, confidence=? "
+            "WHERE id=?",
+            (*prior, int(owned["id"])),
+        )
+        return 1
+    if (
+        str(owned["evidence_label"]) == sgast.EXTRACTED
+        and float(owned["confidence"]) == 1.0
+    ):
+        conn.execute(
+            "UPDATE edges SET evidence_label=?, confidence=? WHERE id=?",
+            (*prior, int(owned["id"])),
+        )
+        return 1
+    return 0
+
+
+def _lsp_unresolved_edge_at(
+    conn: sqlite3.Connection, binding: _LspBinding
+) -> sqlite3.Row | None:
+    """The single unresolved edge at the position whose name names the target."""
+
+    rows = conn.execute(
+        f"SELECT {_LSP_EDGE_COLUMNS} FROM edges "
+        "WHERE file_path=? AND line=? AND dst_qualname IS NULL "
+        "AND max(source_col, 0)=?",
+        (binding.source_path, binding.source_line, binding.source_column),
+    ).fetchall()
+    if len(rows) != 1:
+        return None
+    if _lsp_terminal_name(str(rows[0]["dst_name"])) != binding.target_name:
+        return None
+    return rows[0]
+
+
+def _lsp_bind_edge(
+    conn: sqlite3.Connection,
+    binding: _LspBinding,
+    spec: sglsp.LspServerSpec,
+    digest: str,
+    latency_ms: int,
+) -> int:
+    """Bind exactly one unresolved edge to a verified canonical declaration.
+
+    Exactly one unresolved edge naming the target may sit at the reported
+    position, so ``callers``/``impact`` read verified canonical targets and
+    nothing else. Its identity is persisted with the binding and must be
+    unique at the position, so every later writer carries, re-attaches or
+    restores exactly this edge and never a sibling on the same token. The
+    edge's lexical label and confidence are recorded before they are
+    overwritten, so revocation restores exactly what extraction produced.
+    """
+
+    row = _lsp_unresolved_edge_at(conn, binding)
+    if row is None:
+        return 0
+    binding = replace(binding, edge_identity=_lsp_edge_identity(row))
+    if _lsp_owned_edge(conn, binding) is None:
+        # Another edge at the position shares this identity, so no later
+        # writer could tell which of them the answer was written to.
+        return 0
+    conn.execute(
+        "UPDATE edges SET dst_qualname=?, evidence_label=?, confidence=1.0 "
+        "WHERE id=?",
+        (binding.target_qualname, sgast.EXTRACTED, int(row["id"])),
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO lsp_edge_provenance("
+        "source_path, source_line, source_column, source_hash, edge_identity, "
+        "target_path, target_hash, target_qualname, target_name, "
+        "target_line_start, target_range, prior_evidence_label, "
+        "prior_confidence, server_command, server_version, config_digest, "
+        "result_config_digest, classification, latency_ms, resolved_at, "
+        "schema_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            binding.source_path,
+            binding.source_line,
+            binding.source_column,
+            binding.source_hash,
+            binding.edge_identity,
+            binding.target_path,
+            binding.target_hash,
+            binding.target_qualname,
+            binding.target_name,
+            binding.target_line_start,
+            json.dumps(list(binding.target_range)),
+            str(row["evidence_label"]),
+            float(row["confidence"]),
+            json.dumps(list(spec.command)),
+            spec.version,
+            digest,
+            binding.result_config_digest,
+            binding.classification,
+            int(latency_ms),
+            _now_iso(),
+            LSP_ENRICHMENT_SCHEMA_ID,
+        ),
+    )
+    return 1
+
+
+def _lsp_rebind_edge(conn: sqlite3.Connection, binding: _LspBinding) -> bool:
+    """Re-attach one preserved binding to the freshly extracted edge it owns.
+
+    Only the owned edge is re-attached, and only while it is unresolved: a
+    sibling on the same token, unresolved or not, never inherits the binding.
+    The provenance row is left exactly as the server's answer wrote it, so
+    this only restores edge state re-extraction dropped and can never invent
+    evidence no language server produced.
+    """
+
+    owned = _lsp_owned_edge(conn, binding)
+    if owned is None or owned["dst_qualname"] is not None:
+        return False
+    conn.execute(
+        "UPDATE edges SET dst_qualname=?, evidence_label=?, confidence=1.0 "
+        "WHERE id=?",
+        (binding.target_qualname, sgast.EXTRACTED, int(owned["id"])),
+    )
+    return True
+
+
+def _lsp_delete_file_evidence(conn: sqlite3.Connection, rel: str) -> None:
+    conn.execute("DELETE FROM lsp_edge_provenance WHERE source_path=?", (rel,))
+    conn.execute("DELETE FROM lsp_file_receipt WHERE source_path=?", (rel,))
+
+
+def _lsp_clear_file(conn: sqlite3.Connection, rel: str) -> tuple[int, bool]:
+    """Revoke every binding this file owns, restore its edges, drop its receipt.
+
+    Returns ``(bindings revoked, receipt existed)``.
+    """
+
+    if not _lsp_tables_present(conn):
+        return 0, False
+    bindings = _lsp_stored_bindings(conn, rel)
+    had_receipt = _lsp_stored_receipt(conn, rel) is not None
+    for binding in bindings:
+        _lsp_restore_edge(conn, binding)
+    _lsp_delete_file_evidence(conn, rel)
+    return len(bindings), had_receipt
+
+
+def _lsp_reconcile_source(
+    conn: sqlite3.Connection, rel: str, counters: dict[str, int]
+) -> None:
+    """Make one caller file's evidence true of this generation again."""
+
+    indexed = _lsp_indexed_hash(conn, rel)
+    receipt = _lsp_stored_receipt(conn, rel)
+    bindings = _lsp_stored_bindings(conn, rel)
+    if (
+        not indexed
+        or (receipt is not None and str(receipt["source_hash"]) != indexed)
+        or any(binding.source_hash != indexed for binding in bindings)
+    ):
+        # The bytes this evidence described are gone or changed, and the
+        # merge already re-extracted (or deleted) the file's edges: there is
+        # nothing to restore, only evidence to drop -- receipt AND provenance,
+        # whether or not a receipt survived.
+        _lsp_delete_file_evidence(conn, rel)
+        counters["revoked"] += len(bindings)
+        counters["files_revoked"] += int(receipt is not None)
+        return
+    kept = 0
+    for binding in bindings:
+        if _lsp_binding_supported(conn, binding) and (
+            _lsp_binding_carried(conn, binding) or _lsp_rebind_edge(conn, binding)
+        ):
+            kept += 1
+            continue
+        _lsp_restore_edge(conn, binding)
+        conn.execute(
+            "DELETE FROM lsp_edge_provenance WHERE source_path=? "
+            "AND source_line=? AND source_column=?",
+            (binding.source_path, binding.source_line, binding.source_column),
+        )
+        counters["revoked"] += 1
+    if receipt is None:
+        if kept:
+            # Provenance with no receipt is a state no writer may publish.
+            revoked, _had = _lsp_clear_file(conn, rel)
+            counters["revoked"] += revoked
+        return
+    if kept == len(bindings) and int(receipt.get("edge_count", -1)) == kept:
+        return
+    if kept == 0:
+        conn.execute("DELETE FROM lsp_file_receipt WHERE source_path=?", (rel,))
+        counters["files_revoked"] += 1
+        return
+    # Surviving bindings stay verified and carried, but the receipt no longer
+    # describes a complete answer: keep it consistent and never reusable, so
+    # the next batch re-asks every position of this file.
+    conn.execute(
+        "UPDATE lsp_file_receipt SET edge_count=?, complete=0 WHERE source_path=?",
+        (kept, rel),
+    )
+
+
+def _lsp_reconcile_generation(conn: sqlite3.Connection) -> None:
+    """Revoke/re-attach LSP evidence inside a merge, in plain SQL.
+
+    Runs inside every writer that mutates the graph -- full build, single
+    file index and removal -- whether or not a server is configured or the
+    enrichment lease is free, so a changed or deleted source or target never
+    leaves a binding naming bytes this generation does not index.
+
+    A writer that re-runs lexical resolution calls it twice. First before
+    the resolvers, while every surviving binding's edge still carries exactly
+    what that binding wrote: a revoked edge returns to what extraction left
+    it, so the resolvers see the edge they would have seen had no server ever
+    answered, and whatever they resolve it to stands. Then after them, to
+    re-attach supported bindings a resolver cleared and to revoke any it
+    re-resolved elsewhere. Both calls are idempotent.
+    """
+
+    if not _lsp_tables_present(conn):
+        return
+    counters: dict[str, int] = dict.fromkeys(LSP_HEALTH_COUNTERS, 0)
+    sources = sorted({
+        str(row[0])
+        for row in conn.execute(
+            "SELECT source_path FROM lsp_edge_provenance "
+            "UNION SELECT source_path FROM lsp_file_receipt"
+        )
+    })
+    for rel in sources:
+        _lsp_reconcile_source(conn, rel, counters)
+    if any(counters.values()):
+        _lsp_merge_health(conn, counters)
+
+
+def _lsp_write_receipt(
+    conn: sqlite3.Connection,
+    rel: str,
+    spec: sglsp.LspServerSpec,
+    digest: str,
+    edge_count: int,
+    latency_ms: int,
+    source_hash: str,
+    complete: bool,
+) -> None:
+    conn.execute(
+        "INSERT OR REPLACE INTO lsp_file_receipt("
+        "source_path, source_hash, language, server_command, server_version, "
+        "config_digest, edge_count, complete, latency_ms, resolved_at, "
+        "schema_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            rel,
+            source_hash,
+            _lsp_indexed_language(conn, rel),
+            json.dumps(list(spec.command)),
+            spec.version,
+            digest,
+            int(edge_count),
+            1 if complete else 0,
+            int(latency_ms),
+            _now_iso(),
+            LSP_ENRICHMENT_SCHEMA_ID,
+        ),
+    )
+
+
+def _lsp_merge_health(
+    conn: sqlite3.Connection, counters: dict[str, int]
+) -> None:
+    health = _lsp_meta_document(conn, LSP_HEALTH_META_KEY)
+    for name in LSP_SUM_COUNTERS:
+        health[name] = int(health.get(name, 0) or 0) + int(counters.get(name, 0))
+    for name in LSP_MAX_COUNTERS:
+        health[name] = max(
+            int(health.get(name, 0) or 0), int(counters.get(name, 0))
+        )
+    health["schema_id"] = LSP_ENRICHMENT_SCHEMA_ID
+    health["updated_at"] = _now_iso()
+    _lsp_store_meta_document(conn, LSP_HEALTH_META_KEY, health)
+
+
+def _lsp_resolve_batch(
+    repo_root: Path,
+    spec: sglsp.LspServerSpec,
+    sources: tuple[sglsp.IndexedSource, ...],
+    queries: tuple[sglsp.DefinitionQuery, ...],
+) -> tuple[tuple[sglsp.LspDefinitionResult, ...], Path, int, str]:
+    """Run the bounded transport against a private, disposable workspace.
+
+    Returns the results, the workspace root the server answered from, the
+    wall-clock cost of the batch and the negotiated position encoding.
+    """
+
+    workspace_root = (
+        resolve_db_path(repo_root).parent / "lsp" / secrets.token_hex(8)
+    )
+    started = time.monotonic()
+    try:
+        workspace = sglsp.build_bounded_workspace(
+            repo_root, sources, workspace_root, server_spec=spec,
+        )
+        outcome = sglsp.resolve_definitions(
+            repo_root=repo_root,
+            workspace=workspace,
+            spec=spec,
+            queries=queries,
+            indexed_hashes={
+                item.relative_path: item.source_hash for item in sources
+            },
+            request_timeout_s=LSP_REQUEST_TIMEOUT_S,
+            batch_timeout_s=LSP_BATCH_TIMEOUT_S,
+        )
+        latency_ms = int((time.monotonic() - started) * 1000)
+        return (
+            tuple(outcome.results), workspace.root, latency_ms,
+            str(outcome.position_encoding or sglsp.DEFAULT_POSITION_ENCODING),
+        )
+    finally:
+        shutil.rmtree(workspace_root, ignore_errors=True)
+
+
+def _lsp_plan_group(
+    conn: sqlite3.Connection,
+    candidates: tuple[tuple[str, str], ...],
+    spec: sglsp.LspServerSpec,
+    digest: str,
+    counters: dict[str, int],
+) -> tuple[list[_LspFilePlan], dict[str, _LspFileOutcome]]:
+    """Decide per file: reuse the receipt, revoke it, or ask the server.
+
+    Reused files never occupy the per-batch file cap. Files with no evidence
+    yet are asked first; every position a cap leaves unasked is counted as
+    ``skipped`` and its file never receives a reusable receipt.
+    """
+
+    plans: list[_LspFilePlan] = []
+    outcomes: dict[str, _LspFileOutcome] = {}
+    per_file = max(int(LSP_MAX_QUERIES_PER_FILE), 1)
+    for rel, source_hash in candidates:
+        receipt = _lsp_stored_receipt(conn, rel)
+        stored = _lsp_stored_bindings(conn, rel)
+        if _lsp_receipt_reusable(conn, receipt, stored, source_hash, spec, digest):
+            # A no-op refresh keeps the receipt's bindings without spawning a
+            # server: same bytes, same targets, same server, same workspace.
+            counters["files_reused"] += 1
+            counters["reused"] += len(stored)
+            continue
+        positions, unpositioned = _lsp_query_positions(conn, rel)
+        counters["unpositioned"] += unpositioned
+        if not positions:
+            counters["files_skipped"] += 1
+            if receipt is not None:
+                # A receipt this generation can no longer honour, on a file
+                # with nothing left to ask: revoke it and fail closed.
+                outcomes[rel] = _LspFileOutcome(rel, source_hash, "clear")
+            continue
+        asked = positions[:per_file]
+        counters["skipped"] += len(positions) - len(asked)
+        plans.append(_LspFilePlan(
+            rel,
+            source_hash,
+            tuple(
+                sglsp.DefinitionQuery(
+                    file_path=rel, source_hash=source_hash,
+                    line=line, column=column,
+                )
+                for line, column in asked
+            ),
+            receipt is not None or bool(stored),
+            len(asked) == len(positions),
+        ))
+    plans.sort(key=lambda plan: (plan.had_evidence, plan.rel))
+    budget = max(int(LSP_MAX_FILES_PER_BATCH), 1)
+    for plan in plans[budget:]:
+        counters["files_deferred"] += 1
+        counters["skipped"] += len(plan.queries)
+        if plan.had_evidence:
+            # Its evidence is not reusable and will not be re-asked this run.
+            outcomes[plan.rel] = _LspFileOutcome(plan.rel, plan.source_hash, "clear")
+    return plans[:budget], outcomes
+
+
+def _lsp_apply_outcomes(
+    conn: sqlite3.Connection,
+    languages: tuple[str, ...],
+    spec: sglsp.LspServerSpec,
+    digest: str,
+    outcomes: dict[str, _LspFileOutcome],
+    counters: dict[str, int],
+) -> None:
+    """Re-verify every binding against the generation about to be published.
+
+    The language server ran with no write lease held, so nothing decided
+    before it is trusted here. The bounded workspace digest, each caller's
+    indexed hash, and each target's hash and declaration are all rechecked
+    inside this exclusive write. A batch computed against generation N can
+    therefore never bind itself into generation N+1.
+    """
+
+    current = _lsp_config_digest(spec, _lsp_indexed_sources(conn, languages))
+    workspace_moved = current != digest
+    for rel in sorted(outcomes):
+        outcome = outcomes[rel]
+        if _lsp_indexed_hash(conn, rel) != outcome.source_hash:
+            # Another writer re-indexed (and reconciled) this caller while
+            # the server ran; its evidence is that writer's business now.
+            counters["discarded"] += len(outcome.bindings)
+            continue
+        previous = {
+            (binding.source_line, binding.source_column, binding.target_qualname)
+            for binding in _lsp_stored_bindings(conn, rel)
+        }
+        revoked, had_receipt = _lsp_clear_file(conn, rel)
+        if outcome.action == "clear" or workspace_moved:
+            counters["revoked"] += revoked
+            counters["files_revoked"] += int(had_receipt)
+            counters["discarded"] += len(outcome.bindings)
+            continue
+        bound: set[tuple[int, int, str]] = set()
+        for binding in outcome.bindings:
+            if _lsp_binding_supported(conn, binding) and _lsp_bind_edge(
+                conn, binding, spec, digest, outcome.latency_ms
+            ):
+                bound.add((
+                    binding.source_line, binding.source_column,
+                    binding.target_qualname,
+                ))
+            else:
+                counters["discarded"] += 1
+        counters["enriched"] += len(bound)
+        counters["revoked"] += len(previous - bound)
+        if not outcome.complete:
+            counters["files_incomplete"] += 1
+        if outcome.complete or bound:
+            # An incomplete answer keeps what it verified, under a receipt
+            # that can never be reused; a complete one is reusable.
+            _lsp_write_receipt(
+                conn, rel, spec, digest, len(bound), outcome.latency_ms,
+                outcome.source_hash, outcome.complete,
+            )
+        elif had_receipt:
+            counters["files_revoked"] += 1
+
+
+@contextmanager
+def _lsp_staged_write(repo_root: Path):
+    """Yield one exclusive transaction on a staged copy; publish it on success.
+
+    The lease is taken only here -- after the index published and released
+    its own, and after every server has exited -- so no LSP subprocess ever
+    runs inside a SQLite merge transaction while durable evidence still lands
+    atomically. The canonical generation is never written in place: writers
+    raw-copy it under this lease, so an in-place commit a crash tore would be
+    cloned into the next generation. Another writer's short merge is waited
+    out rather than failed into; a full build is not, and the pass it runs
+    after publishing supersedes this one.
+    """
+
+    deadline = time.monotonic() + LSP_LEASE_WAIT_S
+    while True:
+        with index_write_lease(repo_root) as acquired:
+            if acquired:
+                canonical_path = resolve_db_path(repo_root)
+                _cleanup_abandoned_staging(canonical_path)
+                with _staged_generation(
+                    canonical_path, copy_existing=True
+                ) as staging_path:
+                    conn = connect(staging_path)
+                    try:
+                        conn.execute("BEGIN EXCLUSIVE")
+                        yield conn
+                        _ensure_single_file_generation_metadata(conn)
+                        conn.commit()
+                    finally:
+                        conn.close()
+                    _publish_staged_generation(staging_path, canonical_path)
+                return
+        if time.monotonic() >= deadline:
+            raise SourceGraphBuildInProgressError(
+                f"source_graph_build_in_progress:{repo_root}"
+            )
+        time.sleep(LSP_LEASE_POLL_S)
+
+
+def _lsp_commit_runs(repo_root: Path, runs: list[_LspGroupRun]) -> None:
+    """Publish one pass's verified evidence and every group's denominators."""
+
+    with _lsp_staged_write(repo_root) as conn:
+        for run in runs:
+            if run.outcomes:
+                _lsp_apply_outcomes(
+                    conn, run.languages, run.spec, run.digest, run.outcomes,
+                    run.counters,
+                )
+            _lsp_merge_health(conn, run.counters)
+        # Bindings decide what ``calls``/``impact`` answer, so the generation
+        # identity query caches key on must move past this commit -- a cache
+        # may not keep serving a binding it revoked.
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES('single_file_last_mutation', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (json.dumps({
+                "finished_at": _now_iso(),
+                "file_path": "",
+                "operation": "lsp_enrich",
+                "build_revision": BUILD_REVISION,
+            }),),
+        )
+
+
+def _lsp_record_failure(repo_root: Path, reason: str) -> None:
+    """Put a pass that raised on the durable record, so green cannot survive it.
+
+    The one publication that carries no new evidence, and it happens only
+    when a pass has already failed.
+    """
+
+    with _lsp_staged_write(repo_root) as conn:
+        _lsp_merge_health(conn, {"failed_passes": 1})
+        health = _lsp_meta_document(conn, LSP_HEALTH_META_KEY)
+        health["last_failure"] = {"reason": reason, "at": _now_iso()}
+        _lsp_store_meta_document(conn, LSP_HEALTH_META_KEY, health)
+
+
+def _lsp_classify_batch(
+    repo_root: Path,
+    workspace_root: Path,
+    conn: sqlite3.Connection,
+    plans: list[_LspFilePlan],
+    results: tuple[sglsp.LspDefinitionResult, ...],
+    encoding: str,
+    counters: dict[str, int],
+) -> tuple[dict[str, list[_LspBinding]], set[str]]:
+    """Classify exactly one outcome per asked position.
+
+    A position with no result, or whose result carries a transport
+    ``failure``, is ``unavailable`` and marks its file incomplete: a crash or
+    timeout must never be cached as a server that answered "nothing".
+    """
+
+    by_position: dict[tuple[str, int, int], sglsp.LspDefinitionResult] = {}
+    for result in results:
+        key = (str(result.source_path), int(result.source_line), int(result.source_column))
+        by_position.setdefault(key, result)
+    verified: dict[str, list[_LspBinding]] = {}
+    failed: set[str] = set()
+    for plan in plans:
+        for query in plan.queries:
+            result = by_position.get((plan.rel, query.line, query.column))
+            if result is None:
+                binding, outcome = None, "unavailable"
+            else:
+                binding, outcome = _lsp_verify_result(
+                    repo_root, workspace_root, conn, result, encoding
+                )
+            counters[outcome] += 1
+            if outcome == "unavailable":
+                failed.add(plan.rel)
+            if binding is not None:
+                verified.setdefault(plan.rel, []).append(binding)
+    return verified, failed
+
+
+def _lsp_enrich_group(
+    repo_root: Path,
+    group: tuple[str, str, tuple[str, ...]],
+    spec: sglsp.LspServerSpec,
+    restrict: frozenset[str] | None,
+    label: str,
+) -> _LspGroupRun:
+    """Plan and resolve one server group's positions; publish nothing.
+
+    Planning reads a published generation and the server runs with no lease
+    held. What the group verified waits in the returned run for
+    ``_lsp_commit_runs``, which re-verifies all of it inside its own lease.
+    """
+
+    _name, _env_name, languages = group
+    run = _LspGroupRun(label, languages, spec)
+    counters = run.counters
+    db_path = resolve_db_path(repo_root)
+    if not db_path.is_file():
+        run.reason = "no_index"
+        return run
+    status = "skipped"
+    reason = ""
+    latency_ms = -1
+    conn = connect(db_path, read_only=True)
+    try:
+        candidates = _lsp_group_files(conn, languages, restrict)
+        if not candidates:
+            run.reason = "no_files"
+            return run
+        sources = _lsp_indexed_sources(conn, languages)
+        digest = _lsp_config_digest(spec, sources)
+        plans, outcomes = _lsp_plan_group(
+            conn, candidates, spec, digest, counters
+        )
+        queries = tuple(query for plan in plans for query in plan.queries)
+        counters["files_attempted"] += len(plans)
+        counters["attempted"] += len(queries)
+        if plans and not _lsp_server_installed(spec.command):
+            counters["unavailable"] += len(queries)
+            status, reason = "unavailable", "server_missing"
+            for plan in plans:
+                outcomes[plan.rel] = _LspFileOutcome(plan.rel, plan.source_hash, "clear")
+        elif plans:
+            counters["batches"] += 1
+            try:
+                results, workspace_root, latency_ms, encoding = _lsp_resolve_batch(
+                    repo_root, spec, sources, queries
+                )
+            except (sglsp.LspTransportError, OSError, ValueError):
+                counters["unavailable"] += len(queries)
+                status, reason = "unavailable", "transport"
+                for plan in plans:
+                    outcomes[plan.rel] = _LspFileOutcome(
+                        plan.rel, plan.source_hash, "clear"
+                    )
+            else:
+                counters["latency_ms_total"] += max(latency_ms, 0)
+                counters["latency_ms_max"] = max(latency_ms, 0)
+                verified, failed = _lsp_classify_batch(
+                    repo_root, workspace_root, conn, plans, results, encoding,
+                    counters,
+                )
+                status = "enriched"
+                if counters["unavailable"] == len(queries):
+                    status, reason = "unavailable", "transport"
+                elif failed:
+                    reason = "partial"
+                for plan in plans:
+                    outcomes[plan.rel] = _LspFileOutcome(
+                        plan.rel,
+                        plan.source_hash,
+                        "publish",
+                        tuple(verified.get(plan.rel, ())),
+                        plan.complete and plan.rel not in failed,
+                        latency_ms,
+                    )
+        if not plans and not counters["files_reused"]:
+            status = "skipped"
+            reason = reason or (
+                "deferred" if counters["files_deferred"] else "no_unresolved"
+            )
+    finally:
+        conn.close()
+    run.digest, run.outcomes = digest, outcomes
+    run.status, run.reason = status, reason
+    run.files, run.latency_ms = len(candidates), latency_ms
+    return run
+
+
+def _lsp_aggregate_summary(
+    summaries: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Fold per-group summaries into the one a full build reports."""
+
+    merged = _lsp_summary("skipped", "")
+    for name in (
+        "attempted", "enriched", "reused", "revoked", "skipped", "unavailable",
+        "files_deferred", "files",
+    ):
+        merged[name] = sum(int(item[name]) for item in summaries)
+    merged["latency_ms"] = max(
+        (int(item["latency_ms"]) for item in summaries), default=-1
+    )
+    statuses = {str(item["status"]) for item in summaries}
+    for status in ("error", "unavailable", "enriched", "reused"):
+        if status in statuses:
+            merged["status"] = status
+            break
+    merged["languages"] = sorted(
+        {str(item["language"]) for item in summaries if item["language"]}
+    )
+    return merged
+
+
+def _lsp_enrich_paths(
+    repo_root: Path,
+    restrict: frozenset[str] | None,
+    languages: tuple[str, ...],
+) -> dict[str, Any]:
+    """Enrich the requested languages' unresolved edges, one batch each.
+
+    Every group is resolved before anything is published, and the pass then
+    publishes at most one generation -- only when some group has evidence to
+    change. A refresh that reused every receipt, or had nothing to ask, stays
+    read-only: it never copies the canonical database to say so.
+    """
+
+    groups: list[tuple[str, str, tuple[str, ...]]] = []
+    for language in languages:
+        group = _lsp_group_for_language(language)
+        if group is not None and group not in groups:
+            groups.append(group)
+    label = languages[0] if len(languages) == 1 else ""
+    configured = [
+        (group, spec)
+        for group, spec in ((item, _lsp_server_spec(item)) for item in groups)
+        if spec is not None
+    ]
+    if not configured:
+        # C++ and every other language without a configured server keep their
+        # lexical edges untouched and write nothing at all.
+        return _lsp_summary(
+            "skipped", label, reason="server" if groups else "language",
+        )
+    runs = [
+        _lsp_enrich_group(repo_root, group, spec, restrict, label)
+        for group, spec in configured
+    ]
+    if any(run.outcomes for run in runs):
+        _lsp_commit_runs(repo_root, runs)
+    summaries = [run.summary() for run in runs]
+    if len(summaries) == 1:
+        return summaries[0]
+    return _lsp_aggregate_summary(summaries)
+
+
+def _lsp_configured_languages() -> tuple[str, ...]:
+    """Every language a configured server group can currently enrich."""
+
+    return tuple(
+        language
+        for group in LSP_SERVER_GROUPS
+        if _lsp_server_spec(group) is not None
+        for language in group[2]
+    )
+
+
+def _lsp_enrich_after_publish(
+    repo_root: Path,
+    *,
+    restrict: frozenset[str] | None,
+    languages: tuple[str, ...],
+) -> dict[str, Any]:
+    """Enrich a published generation's unresolved edges, never raising.
+
+    Indexing has already succeeded by the time this runs; a language server,
+    a workspace or a receipt that misbehaves must degrade into typed health
+    rather than fail the index that produced it. Degrading is not forgetting:
+    a pass that raised is written into health before this returns, so the
+    green an earlier pass earned can never outlive it.
+    """
+
+    if not languages:
+        return _lsp_summary("skipped", "", reason="language")
+    try:
+        return _lsp_enrich_paths(repo_root, restrict, languages)
+    except Exception as exc:  # enrichment never breaks a published index
+        reason = type(exc).__name__
+    try:
+        _lsp_record_failure(repo_root, reason)
+    except Exception as exc:  # recording the failure may not break it either
+        reason = f"{reason}:failure_unrecorded:{type(exc).__name__}"
+    return _lsp_summary("error", "", reason=reason)
+
+
+def lsp_health(repo_root: Path) -> dict[str, Any]:
+    """Typed LSP enrichment health with explicit denominators and latency.
+
+    Edge-unit counters (``attempted`` and its classifications, ``skipped``,
+    ``unpositioned``, ``enriched``, ``reused``, ``revoked``, ``discarded``)
+    count edges; ``files_*`` counters count caller files. ``unpositioned``
+    edges had no exact call-site coordinate and were never asked, so they are
+    never part of ``attempted``, which always equals the sum of its
+    classifications (``classified``). Zero attempted
+    coverage is never green, and neither is coverage a cap left partial or a
+    server that failed to answer. Nor is coverage that never landed: an
+    ``internal`` answer is counted before commit, and a moved workspace, a
+    concurrent writer or a later revocation can discard it, so green requires
+    ``bound_edges`` -- bindings the published generation actually carries.
+    Latency carries its own denominator (``batches``) so an average can never
+    be mistaken for a measurement nobody took.
+
+    The counters accumulate what enrichment published; a refresh that reused
+    every receipt changed no evidence and publishes nothing. A pass that
+    raised is on the record as ``failed_passes`` (with ``last_failure``) and,
+    exactly like ``unavailable``, it keeps health non-green until a full
+    rebuild starts a new record: a later pass that succeeds does not launder
+    one that did not.
+    """
+
+    health: dict[str, Any] = {name: 0 for name in LSP_HEALTH_COUNTERS}
+    stored: dict[str, Any] = {}
+    bound_edges = 0
+    db_path = resolve_db_path(repo_root)
+    if db_path.is_file():
+        conn = connect(db_path, read_only=True)
+        try:
+            stored = _lsp_meta_document(conn, LSP_HEALTH_META_KEY)
+            if _lsp_tables_present(conn):
+                bound_edges = int(conn.execute(
+                    "SELECT COUNT(*) FROM lsp_edge_provenance"
+                ).fetchone()[0])
+        finally:
+            conn.close()
+        for name in LSP_HEALTH_COUNTERS:
+            health[name] = int(stored.get(name, 0) or 0)
+    batches = int(health["batches"])
+    health["bound_edges"] = bound_edges
+    health["classified"] = sum(
+        int(health[name]) for name in LSP_EDGE_CLASSIFICATIONS
+    )
+    health["units"] = {
+        "edges": list(LSP_EDGE_COUNTERS),
+        "files": list(LSP_FILE_COUNTERS),
+    }
+    health["latency_ms_avg"] = (
+        int(health["latency_ms_total"]) // batches if batches > 0 else -1
+    )
+    last_failure = stored.get("last_failure")
+    health["last_failure"] = last_failure if isinstance(last_failure, dict) else {}
+    health["schema_id"] = LSP_ENRICHMENT_SCHEMA_ID
+    # Green measures committed, usable coverage: ``internal`` is counted
+    # before commit, so it can never stand in for a binding that landed.
+    health["green"] = bool(
+        health["attempted"] > 0
+        and bound_edges > 0
+        and health["unavailable"] == 0
+        and health["skipped"] == 0
+        and health["files_deferred"] == 0
+        and health["failed_passes"] == 0
+    )
+    return health
+
+
+def lsp_provenance(
+    repo_root: Path, *, source_path: str = ""
+) -> tuple[dict[str, Any], ...]:
+    """Durable per-edge provenance for every verified canonical binding."""
+
+    db_path = resolve_db_path(repo_root)
+    if not db_path.is_file():
+        return ()
+    conn = connect(db_path, read_only=True)
+    try:
+        if not _lsp_tables_present(conn):
+            return ()
+        if source_path:
+            rows = conn.execute(
+                "SELECT * FROM lsp_edge_provenance WHERE source_path=? "
+                "ORDER BY source_line, source_column",
+                (source_path,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM lsp_edge_provenance "
+                "ORDER BY source_path, source_line, source_column"
+            ).fetchall()
+    finally:
+        conn.close()
+    return tuple(dict(row) for row in rows)
+
+
+def lsp_receipt(repo_root: Path, source_path: str) -> dict[str, Any] | None:
+    """One file's durable enrichment receipt, or ``None`` when it has none."""
+
+    db_path = resolve_db_path(repo_root)
+    if not db_path.is_file():
+        return None
+    conn = connect(db_path, read_only=True)
+    try:
+        return _lsp_stored_receipt(conn, source_path)
+    finally:
+        conn.close()
+
+
 def index_file(repo_root: Path, path: str, expected_hash: str) -> dict[str, Any]:
     """Index exactly one file into the canonical Source Graph.
 
@@ -6293,7 +8148,7 @@ def index_file(repo_root: Path, path: str, expected_hash: str) -> dict[str, Any]
     and the generation authority are preserved unchanged.
 
     Returns a summary dict with ``ok``, ``file_path``, ``source_hash``,
-    ``language``, ``status``, ``entities``, and ``edges``.
+    ``language``, ``status``, ``entities``, ``edges``, and ``lsp``.
     """
     repo_root = repo_root.resolve()
     resolved = _validate_single_file_path(repo_root, path)
@@ -6375,6 +8230,15 @@ def index_file(repo_root: Path, path: str, expected_hash: str) -> dict[str, Any]
                     file_size=snapshot.file_size,
                     mtime_ns=snapshot.mtime_ns,
                 )
+                # Re-indexing this file also makes it a new *target*. Its own
+                # receipt dies with its old bytes, and every caller binding this
+                # generation no longer supports is revoked now, rather than
+                # waiting for each caller to be re-indexed -- and before the
+                # resolvers below may clear or re-resolve the destination it
+                # wrote (see ``_lsp_reconcile_generation``). A receipt kept for
+                # identical bytes describes edges just re-extracted as
+                # unresolved, so they are re-attached here too.
+                _lsp_reconcile_generation(conn)
                 # Re-run cross-file edge resolution exactly as a full build's
                 # tail does. Re-extracting one file drops its own edges back to
                 # unresolved and can invalidate edges other files aimed at it; a
@@ -6409,6 +8273,11 @@ def index_file(repo_root: Path, path: str, expected_hash: str) -> dict[str, Any]
                         },
                     )
                 _resolve_javascript_import_bindings(conn)
+                # A binding that still verifies but whose edge the resolvers
+                # above just cleared is re-attached here: the post-publish pass
+                # never runs when no server is configured. All of it is plain
+                # SQL -- no language server runs inside this transaction.
+                _lsp_reconcile_generation(conn)
                 _ensure_single_file_generation_metadata(conn)
                 conn.execute(
                     "INSERT INTO meta(key, value) VALUES('single_file_last_mutation', ?) "
@@ -6425,6 +8294,15 @@ def index_file(repo_root: Path, path: str, expected_hash: str) -> dict[str, Any]
             finally:
                 conn.close()
             _publish_staged_generation(staging_path, canonical_path)
+    # Task 3 (LSP batch resolution): run enrichment only after the staged
+    # generation has been published and the write lease released, so no LSP
+    # subprocess is ever spawned inside the SQLite merge transaction. The
+    # helper fails closed into typed health counters and never raises here.
+    lsp_summary = _lsp_enrich_after_publish(
+        repo_root,
+        restrict=frozenset({rel}),
+        languages=(extraction.language,),
+    )
     return {
         "ok": True,
         "file_path": rel,
@@ -6433,6 +8311,7 @@ def index_file(repo_root: Path, path: str, expected_hash: str) -> dict[str, Any]
         "status": extraction.status,
         "entities": inserted_entities,
         "edges": inserted_edges,
+        "lsp": lsp_summary,
     }
 
 
@@ -6466,6 +8345,11 @@ def remove_file(repo_root: Path, path: str) -> dict[str, Any]:
                     "SELECT COUNT(*) FROM entities WHERE file_path=?", (rel,)
                 ).fetchone()[0]
                 _invalidate_file(conn, rel)
+                # A deleted source revokes its own receipt and, in this same
+                # generation, every caller binding that named it as a target.
+                # Waiting for each caller to be re-indexed would leave those
+                # callers pointing at a declaration that no longer exists.
+                _lsp_reconcile_generation(conn)
                 _ensure_single_file_generation_metadata(conn)
                 conn.execute(
                     "INSERT INTO meta(key, value) VALUES('single_file_last_mutation', ?) "
@@ -6510,6 +8394,10 @@ __all__ = [
     "BUILD_REVISION",
     "INDEXED_EXTENSIONS",
     "LANGUAGE_CAPABILITIES",
+    "LSP_ENRICHMENT_SCHEMA_ID",
+    "LSP_HEALTH_META_KEY",
+    "LSP_PROVENANCE_TABLE",
+    "LSP_RECEIPT_TABLE",
     "POLICY_SCHEMA_ID",
     "BuildReport",
     "MAX_BUDGET_ROWS",
@@ -6546,6 +8434,9 @@ __all__ = [
     "func",
     "impact",
     "index_file",
+    "lsp_health",
+    "lsp_provenance",
+    "lsp_receipt",
     "remove_file",
     "slice_",
     "struct",
