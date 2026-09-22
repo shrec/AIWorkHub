@@ -6,6 +6,37 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.61] - 2026-09-23
+
+### Added
+
+- **The manager seat can launch on Windows.** `runtime_adapters.build_manager_command`
+  is the host-side launch plan for the owner's own manager seat: the same argv,
+  model and stream format as a worker's plan, without the Windows refusal that
+  keeps a worker's native CLI inside AppContainer. The manager CLI backend
+  plans every turn through it, and an AST test pins it to that one caller so no
+  worker path can reach it (NF-2026-00963).
+
+### Fixed
+
+- Windows: an AppContainer launch failure now names its cause. The error
+  carries the Win32 code and its symbolic name (for example
+  `ERROR_INVALID_PARAMETER`), the executable, the command-line and
+  environment-block lengths, the argument count and the working directory — as
+  text and as attributes, and never an argument or environment value, which
+  carry the prompt and credentials. A command line longer than the 32767
+  characters `CreateProcessW` accepts is refused as `command_line_too_long:<n>`
+  instead of failing opaquely (NF-2026-00042, diagnosis step).
+- Windows: the AppContainer validation lane no longer fails every card that
+  runs `tests/test_windows_appcontainer.py`. Seven tests need host Win32
+  privileges the container does not have; they now skip there with a named
+  reason, detected from the process token (`TokenIsAppContainer`), and stay
+  mandatory on a host run (NF-2026-00964).
+- Source Graph no longer indexes nested linked git worktrees (a directory whose
+  `.git` file points at `…/worktrees/<name>`) as source, which had doubled every
+  result in a repository holding another tool's worktree. Submodules, and a
+  root that is itself a linked worktree, stay indexed.
+
 ## [0.11.60] - 2026-09-22
 
 ### Added

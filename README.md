@@ -62,6 +62,19 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
+## What's new in 0.11.61
+
+- The manager seat can launch on Windows: a host-side launch plan for the
+  owner's own manager, while every worker's native CLI stays inside
+  AppContainer.
+- Windows AppContainer launch failures name their Win32 cause, the executable
+  and the command-line and environment sizes — never an argument or
+  environment value.
+- The AppContainer validation lane skips the tests that need host privileges,
+  with a named reason, instead of failing every card that runs them.
+- Source Graph skips nested linked git worktrees, which had doubled results in a
+  repository that holds another tool's worktree.
+
 ## What's new in 0.11.60
 
 - The provider-neutral core of the AIWorkHub manager agent loop: one manager

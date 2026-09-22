@@ -1,5 +1,22 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.61 — 2026-09-23
+
+### Added
+
+- Bundled runtime: a host-side launch plan for the manager seat, so the
+  manager CLI backend can run a turn on Windows. Workers stay confined.
+
+### Fixed
+
+- Bundled runtime, Windows: an AppContainer launch failure names its Win32
+  cause, the executable and the command-line and environment sizes, never their
+  values; an over-long command line is refused by name.
+- Bundled runtime, Windows: the validation lane skips the seven host-privileged
+  AppContainer tests with a named reason instead of failing every card that runs
+  them.
+- Bundled runtime: Source Graph no longer indexes nested linked git worktrees.
+
 ## 0.11.60 — 2026-09-22
 
 ### Added

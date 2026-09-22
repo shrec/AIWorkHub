@@ -14,6 +14,16 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.11.61
+
+- The manager seat has a host-side launch plan, so the manager CLI backend can
+  run on Windows; workers stay inside AppContainer.
+- Windows AppContainer launch failures name their Win32 cause and sizes, never
+  their values.
+- The validation lane skips host-privileged AppContainer tests by name instead
+  of failing on them.
+- Source Graph skips nested linked git worktrees.
+
 ## What's new in 0.11.60
 
 - The provider-neutral core of the AIWorkHub manager agent loop: one manager
