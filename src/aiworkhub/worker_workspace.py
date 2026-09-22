@@ -6727,6 +6727,7 @@ def validate_required_outputs(
     replay_claim_epoch: int | None = None,
     rework_predecessor: dict[str, Any] | None = None,
     strict_rework_inheritance: bool = False,
+    validation_only_replay: bool = False,
 ) -> list[dict[str, Any]]:
     """Validate every declared required output exists, is non-empty, and changed.
 
@@ -6756,12 +6757,40 @@ def validate_required_outputs(
     direct-call fallback onto workspace-derived inherited rework paths when no
     sealed predecessor authority is claimed, so strict coordinator finalization
     fails closed instead.
+
+    ``validation_only_replay`` marks a coordinator validation-only-replay
+    finalization. When set and no sealed delta is claimed, the
+    inherited-change evidence comes from ``rework_predecessor``'s own
+    ``changed_path_hashes`` instead of the strict sealed-delta requirement
+    above: those digests were already hash-pinned and verified against the
+    predecessor's retained worktree while seeding this workspace.
+    ``differs_from_parent`` still gates it, so a path byte-equal to the
+    canonical base can never pass as changed.
     """
     required_patterns = [_relative_repo_path(raw) for raw in required_outputs]
     sealed_inherited_hashes = verified_rework_delta_file_hashes(
         rework_predecessor,
         authority_repo=workspace.repo,
     )
+    if sealed_inherited_hashes is None and validation_only_replay:
+        # A validation-only replay reruns validation on the successor's own
+        # seeded bytes, byte-identical to the predecessor's by construction
+        # (no provider ran). Its ``changed_path_hashes`` were already
+        # hash-pinned and verified against the predecessor's retained
+        # worktree while seeding this workspace (see
+        # ``_materialize_rework_predecessor``), so they are trustworthy
+        # inherited-change evidence even without a sealed delta artifact.
+        candidate_hashes = (
+            rework_predecessor.get("changed_path_hashes")
+            if isinstance(rework_predecessor, dict)
+            else None
+        )
+        if isinstance(candidate_hashes, dict):
+            sealed_inherited_hashes = {
+                str(k): str(v)
+                for k, v in candidate_hashes.items()
+                if isinstance(v, str)
+            }
     if sealed_inherited_hashes is None and strict_rework_inheritance:
         # Strict coordinator finalization: absent or unauthenticated
         # predecessor authority never falls back to workspace-derived

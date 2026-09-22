@@ -12229,6 +12229,10 @@ class ProcessManager:
                                 predecessor if isinstance(predecessor, dict) else None
                             ),
                             strict_rework_inheritance=True,
+                            validation_only_replay=(
+                                metadata.get("execution_mode")
+                                == "validation_only_replay"
+                            ),
                         )
                         validated_required_paths = {
                             rec["path"]
