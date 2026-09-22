@@ -79,9 +79,11 @@ structured findings into NeedFix with provenance.
   wedge the launch queue. Dispatcher health reports undelivered manager-inbox
   callbacks.
 - VS Code LM workers get one correction for a tool name that is not allowlisted.
-- Python installed in an admin-owned directory needs a one-time elevated
-  `icacls <python dir> /grant "*S-1-15-2-1:(OI)(CI)(RX)" /T` before validation
-  can run inside the container.
+- Python for validation inside the container needs no setup for per-user,
+  Program Files or Microsoft Store installs. Only an admin-owned directory
+  outside Program Files, such as `C:\Python312`, needs a one-time elevated
+  `icacls "<python dir>" /grant "*S-1-15-2-1:(OI)(CI)(RX)" /T`. The launch
+  error names that exact command.
 
 ## What's new in 0.11.58
 

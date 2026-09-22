@@ -24,8 +24,10 @@ port, expose a LAN service or require an AIWorkHub cloud account.
 - CMake `include/` headers resolve, and `cmake`/`ctest` are trusted.
   Blocked-card rework recovery works on Windows. Reviewer prewarm can no longer
   wedge the launch queue.
-- Python installed in an admin-owned directory needs a one-time elevated
-  `icacls <python dir> /grant "*S-1-15-2-1:(OI)(CI)(RX)" /T`.
+- Python in an admin-owned directory outside Program Files needs a one-time
+  elevated `icacls "<python dir>" /grant "*S-1-15-2-1:(OI)(CI)(RX)" /T`. The
+  launch error names it. Per-user, Program Files and Store installs need
+  nothing.
 
 ## What's new in 0.11.58
 

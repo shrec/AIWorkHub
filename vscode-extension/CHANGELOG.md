@@ -27,9 +27,10 @@
 
 ### Known issues
 
-- Python in an admin-owned directory needs a one-time elevated
-  `icacls <python dir> /grant "*S-1-15-2-1:(OI)(CI)(RX)" /T` before
-  validation can run inside the container.
+- Python in an admin-owned directory outside Program Files, such as
+  `C:\Python312`, needs a one-time elevated
+  `icacls "<python dir>" /grant "*S-1-15-2-1:(OI)(CI)(RX)" /T`. The launch error
+  names it. Per-user, Program Files and Store installs need nothing.
 - Only `claude_cli` is bridged so far. OpenCode, Codex and the Copilot CLIs are
   not.
 

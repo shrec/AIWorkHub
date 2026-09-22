@@ -84,9 +84,16 @@ noted by package/extension version and release tag.
 ### Known issues
 
 - Python validation inside the AppContainer needs the base interpreter to be
-  readable by ALL APPLICATION PACKAGES. If Python is installed in an
-  admin-owned directory such as `C:\Python312`, run this once from an elevated
-  shell: `icacls C:\Python312 /grant "*S-1-15-2-1:(OI)(CI)(RX)" /T`.
+  readable by ALL APPLICATION PACKAGES. Most installs need nothing:
+  - A per-user install, uv, pyenv-win or conda under the profile is granted
+    automatically.
+  - An install under Program Files, including the Microsoft Store Python, is
+    readable by default and gets no grant at all.
+  - Only an admin-owned directory outside Program Files, such as
+    `C:\Python312`, needs a one-time elevated
+    `icacls "C:\Python312" /grant "*S-1-15-2-1:(OI)(CI)(RX)" /T`. The launch
+    error now names that exact command. A card still shows only
+    `worker_failed`, though (NF-2026-00039).
 - Only `claude_cli` is bridged. `opencode_cli`, `codex_cli` and the Copilot CLI
   adapters still start their worker MCP server inside the container, where it
   cannot read the state it needs.
