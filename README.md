@@ -62,6 +62,13 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
+## What's new in 0.11.62
+
+- Windows: a card sent back for rework runs again. The worker prompt reached
+  the CLI on the command line, which Windows caps at 32767 characters, so every
+  rework prompt was refused before the model ran; `claude_cli` and `codex_cli`
+  now read it from stdin.
+
 ## What's new in 0.11.61
 
 - The manager seat can launch on Windows: a host-side launch plan for the

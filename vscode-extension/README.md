@@ -14,6 +14,11 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.11.62
+
+- Windows: a card sent back for rework runs again. The worker prompt reaches
+  the CLI through stdin instead of the length-capped command line.
+
 ## What's new in 0.11.61
 
 - The manager seat has a host-side launch plan, so the manager CLI backend can

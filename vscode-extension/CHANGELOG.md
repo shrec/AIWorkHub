@@ -1,5 +1,14 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.62 — 2026-09-23
+
+### Fixed
+
+- Bundled runtime, Windows: rework launches no longer die before the model
+  runs. The worker prompt now reaches `claude_cli` and `codex_cli` through
+  stdin instead of the command line, which `CreateProcessW` caps at 32767
+  characters (NF-2026-00042).
+
 ## 0.11.61 — 2026-09-23
 
 ### Added

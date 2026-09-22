@@ -6,6 +6,22 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.62] - 2026-09-23
+
+### Fixed
+
+- **Rework launches work again on Windows** (NF-2026-00042). The worker prompt
+  rode the command line (`claude -p <prompt>`, a trailing positional prompt for
+  `codex exec`), and `CreateProcessW` accepts at most 32767 characters. Initial
+  prompts fit; a rework prompt, which adds the review feedback and crash-retry
+  evidence, did not, so every rework died before the model ran — measured as
+  `command_line_too_long:41773`. `claude_cli` and `codex_cli` now read the
+  prompt from stdin: the launcher hands it to the supervisor on the
+  supervisor's own stdin, never through a file or a metadata record, and the
+  supervisor writes it to the worker and closes it. A 40,000-character prompt
+  now needs a 1,491-character command line. The manager CLI backend delivers
+  its turns the same way.
+
 ## [0.11.61] - 2026-09-23
 
 ### Added
