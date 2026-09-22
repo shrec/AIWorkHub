@@ -330,9 +330,89 @@ def test_unified_preflight_is_portable_and_truthful_about_unobserved_access(
     assert report["sandbox"]["route_aware"] is True
     assert report["source_graph"]["ready_for_code"] is True
     assert report["callback"]["backlog_count"] == 0
+    # NF-2026-00030: the declared/resolved split rides the same portability
+    # guard as every other field in this report -- one basename each, never a
+    # host path.  Every route here resolved to /private/host/bin/model.
+    for item in report["provider_observability"]["adapters"]:
+        declared = runtime_adapters.ADAPTER_EXECUTABLES.get(item["adapter_id"]) or ""
+        assert item["install_declared"] == Path(declared).name
+        assert item["install_resolved"] == "model"
+        assert item["install_evidence"] == "binary_resolved:model"
+        for name in (item["install_declared"], item["install_resolved"]):
+            assert "/" not in name and "\\" not in name
     serialized = json.dumps(report, sort_keys=True)
     assert "/private/host" not in serialized
     assert "executable" not in serialized
+
+
+def test_provider_observability_reports_declared_and_resolved_basenames_apart(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # NF-2026-00030: on Linux ``claude`` is a symlink into its npm package, so
+    # the resolved basename is ``claude.exe`` while the declared command is
+    # ``claude``.  Reading ".exe" off the resolved name as "Windows" is wrong
+    # there, so each field must carry its own value.
+    root = _initialized_root(tmp_path)
+    resolved = (
+        "/private/host/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe"
+    )
+    monkeypatch.setattr(
+        repo_policy.runtime_adapters,
+        "resolve_executable",
+        lambda adapter_id: runtime_adapters.ExecutableResolution(
+            adapter_id, resolved, True, ""
+        ),
+    )
+    monkeypatch.setattr(
+        repo_policy.claude_auth, "auth_status", lambda executable=None: {}
+    )
+
+    report = repo_policy.describe_provider_observability(root, "claude_cli")
+
+    assert report["installed"] is True
+    assert report["install_declared"] == "claude"
+    assert report["install_resolved"] == "claude.exe"
+    # The compatibility field is unchanged: it still names the resolved target.
+    assert report["install_evidence"] == "binary_resolved:claude.exe"
+    serialized = json.dumps(report, sort_keys=True)
+    assert "/private/host" not in serialized
+    assert "executable" not in serialized
+
+    # The declared name is read from runtime_adapters' own declaration, so a
+    # renamed declaration is reported as-is rather than from a copied list.
+    monkeypatch.setattr(
+        repo_policy.runtime_adapters,
+        "ADAPTER_EXECUTABLES",
+        {**runtime_adapters.ADAPTER_EXECUTABLES, "claude_cli": "claude-canary"},
+    )
+    renamed = repo_policy.describe_provider_observability(root, "claude_cli")
+    assert renamed["install_declared"] == "claude-canary"
+    assert renamed["install_resolved"] == "claude.exe"
+
+
+@pytest.mark.parametrize("adapter_id", ["claude_cli", "codex_cli", "opencode_cli"])
+def test_provider_observability_names_the_declared_command_when_not_installed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, adapter_id: str
+) -> None:
+    # Nothing resolved, so there is no resolved basename -- but the command
+    # this route declares is still known, and is still reported.
+    root = _initialized_root(tmp_path)
+    monkeypatch.setattr(
+        repo_policy.runtime_adapters,
+        "resolve_executable",
+        lambda requested: runtime_adapters.ExecutableResolution(
+            requested, None, False, "not found on PATH"
+        ),
+    )
+
+    report = repo_policy.describe_provider_observability(root, adapter_id)
+
+    declared = runtime_adapters.ADAPTER_EXECUTABLES[adapter_id]
+    assert declared
+    assert report["installed"] is False
+    assert report["install_declared"] == declared
+    assert report["install_resolved"] == ""
+    assert report["install_evidence"] == "not_installed:not found on PATH"
 
 
 def test_preflight_filters_disabled_observed_models_without_hiding_reachability(

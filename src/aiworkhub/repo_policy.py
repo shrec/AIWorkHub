@@ -1779,8 +1779,22 @@ def describe_provider_observability(
     # basename.  The guard is deliberately stronger than "no host paths":
     # keeping it that way is cheaper than re-deciding it every time a new
     # field is added to this report.
+    # NF-2026-00030: the resolved target is not the declared command.  On
+    # Linux ``claude`` is a symlink into its npm package and resolves to
+    # ``claude.exe`` -- a package bin name, not a fact about the host, so
+    # nothing may read a platform off it.  The report therefore carries both
+    # basenames apart: ``install_declared`` is the command runtime_adapters
+    # declares and resolves (still named when nothing resolved), and
+    # ``install_resolved`` is what it resolved to ("" when not installed).
+    # ``install_evidence`` keeps its historical resolved-basename value.
+    install_declared = Path(
+        str(runtime_adapters.ADAPTER_EXECUTABLES.get(adapter_id) or "")
+    ).name[:200]
+    install_resolved = (
+        Path(str(resolution.executable)).name[:200] if installed else ""
+    )
     install_evidence = (
-        f"binary_resolved:{Path(str(resolution.executable)).name}"
+        f"binary_resolved:{install_resolved}"
         if installed
         else f"not_installed:{resolution.reason}"
     )[:200]
@@ -1902,6 +1916,8 @@ def describe_provider_observability(
         "route_family": family,
         "installed": installed,
         "install_evidence": install_evidence,
+        "install_declared": install_declared,
+        "install_resolved": install_resolved,
         "reachable": bool(reachable),
         "reachability_evidence": str(reachability_evidence)[:200],
         "access_observed": bool(access_observed),
