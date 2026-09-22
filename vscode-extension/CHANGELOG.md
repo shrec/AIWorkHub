@@ -13,6 +13,16 @@
     network.
   - The worker MCP server runs on the host, behind a per-request pipe. It
     trusts no file, path or import root that the container can write.
+- Bundled runtime, Windows: AppContainer validation runs pytest and ruff inside
+  the container. `git diff --check` runs on the host, hardened, with a guard
+  that refuses any junction, symlink or hard link in the candidate worktree
+  (NF-2026-00040).
+- Dashboard:
+  - The header strip is compact, with uniform tiles and clamped captions.
+  - Each tile shows a status dot.
+  - Only attention counters (Blocked, Review, Stale) are coloured.
+  - Light-theme contrast now meets WCAG AA.
+  - Rows show the task title rather than worker boilerplate.
 - Bundled runtime: semantic edits cannot be redirected through a planted
   junction. C/C++ `include/` headers resolve, and `cmake`/`ctest` are trusted.
   Blocked-card rework recovery works on Windows (NF-2026-00031).

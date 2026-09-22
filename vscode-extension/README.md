@@ -19,6 +19,10 @@ port, expose a LAN service or require an AIWorkHub cloud account.
 - Windows: bundled native `claude_cli` workers now run inside their
   AppContainer with their worker tools. The worker MCP server runs on the host,
   behind a per-request pipe. Worker launches get outbound internet only.
+- Windows AppContainer validation runs pytest, ruff and a hardened host
+  `git diff --check`.
+- Dashboard: a compact header strip with status dots, quieter counters and
+  readable light-theme contrast.
 - Semantic edits cannot be redirected through a junction planted in the
   worktree.
 - CMake `include/` headers resolve, and `cmake`/`ctest` are trusted.

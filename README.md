@@ -71,6 +71,14 @@ structured findings into NeedFix with provenance.
     network.
   - The worker MCP server runs on the host, behind a per-request pipe, and never
     trusts what the container can write.
+- Windows AppContainer validation runs a card's declared commands. pytest and
+  ruff run inside the container. `git diff --check` runs on the host, hardened,
+  and refuses any link planted in the candidate worktree.
+- Dashboard:
+  - A compact, uniform header strip with status dots.
+  - Only attention counters are coloured.
+  - Readable light-theme contrast.
+  - Task titles in rows.
 - Semantic edits cannot be redirected through a junction planted in the
   worktree.
 - C/C++ repositories: CMake-style `include/` headers resolve, and

@@ -52,6 +52,20 @@ noted by package/extension version and release tag.
     refuses `aiworkhub_worker_validation_run`, because running candidate code
     there would bypass the sandbox. Post-exit validation still runs inside the
     container (NF-2026-00035).
+- Windows AppContainer validation now runs a card's declared commands
+  (NF-2026-00040). On the first real `claude_cli` card, every validation had
+  failed inside the container.
+  - A lane-derived `sitecustomize` answers the container's denied stats, and
+    the `0o700` mkdir that CPython 3.12.4 creates with a protected DACL.
+  - The lane grants the venv's `Scripts` directory read-only, so tools such as
+    ruff resolve.
+  - `git diff --check` runs on the host, from a verified worktree admin record,
+    with every execution path disabled: no hooks, fsmonitor, textconv,
+    ext-diff, global config or pager, and attributes read from `HEAD`.
+  - Before git starts, the host holds and walks the candidate worktree and
+    refuses any junction, symlink or hard link, so the candidate cannot
+    redirect git to read outside it. File-content echo is dropped from git's
+    output.
 - Semantic edits hold the whole directory chain open while they read and write,
   so a junction planted in the worktree cannot redirect an edit outside it.
 - C/C++ repositories: quoted includes resolve against the conventional
