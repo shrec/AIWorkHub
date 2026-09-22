@@ -205,7 +205,7 @@ def _claim_start_exact_once(
                     not isinstance(replay, dict)
                     or not isinstance(predecessor, dict)
                     or replay.get("task_id") != task_id
-                    or replay.get("actor") != core.CODEX_RUNNER
+                    or replay.get("actor") not in core.VERIFIED_MANAGER_ACTORS
                     or replay.get("one_episode_binding") is not True
                     or type(replay.get("next_claim_epoch")) is not int
                     or replay["next_claim_epoch"] != claim_epoch - 1

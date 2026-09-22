@@ -6727,7 +6727,7 @@ class ProcessManager:
                 and predecessor_metadata.get("provider_launched") is False
                 and isinstance(metadata_authorization, dict)
                 and metadata_authorization.get("task_id") == task_id
-                and metadata_authorization.get("actor") == core.CODEX_RUNNER
+                and metadata_authorization.get("actor") in core.VERIFIED_MANAGER_ACTORS
                 and metadata_authorization.get("one_episode_binding") is True
                 and metadata_authorization.get("request_id")
                 == predecessor_request_id

@@ -89,7 +89,11 @@ def validation_only_replay_authorization(
         raise ValueError("validation_only_replay_episode_binding_missing")
     if str(raw.get("task_id") or "") != task_id:
         raise ValueError("validation_only_replay_task_mismatch")
-    if str(raw.get("actor") or "") != core.CODEX_RUNNER:
+    # The grant is minted only by a verified coordinator's recover action, and
+    # NF-2026-00244 attributes that actor to the verified manager route:
+    # ``codex`` or ``claude``. Accepting only ``codex`` here refused every replay
+    # a Claude manager authorized.
+    if str(raw.get("actor") or "") not in core.VERIFIED_MANAGER_ACTORS:
         raise ValueError("validation_only_replay_actor_mismatch")
 
     predecessor = card.get("rework_predecessor")

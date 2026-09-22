@@ -1080,6 +1080,10 @@ from .runner_topic_policy import (
 # manager route was Claude, so the audit trail said codex did work a Claude
 # manager actually did.
 CLAUDE_MANAGER_RUNNER = "claude"
+# The actors _verified_manager_actor can return. A grant minted by a verified
+# coordinator action (for example validation-only replay) carries one of these,
+# so every check of such a grant must accept either, not only ``codex``.
+VERIFIED_MANAGER_ACTORS = (CODEX_RUNNER, CLAUDE_MANAGER_RUNNER)
 
 
 def _verified_manager_actor() -> str:
