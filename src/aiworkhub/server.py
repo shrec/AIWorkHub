@@ -500,6 +500,7 @@ validate_provenance = worker_ai_tools_mcp.validate_provenance
 from . import dependency_autolaunch
 from . import quality_evidence
 from . import quality_calibration
+from . import mcp_summary_folds
 from . import repo_policy
 from . import shared_router
 from . import task_templates
@@ -1226,10 +1227,23 @@ def aiworkhub_manager_workforce_rank(
     context_tokens: int = 0,
     tool_needs: list[str] | None = None,
     quality_floor: float = 0.0,
+    detail: StatusDetail = "summary",
 ) -> dict[str, Any]:
-    """MANAGER READ: explainable cheapest-capable routing from current evidence."""
+    """MANAGER READ: explainable cheapest-capable routing from current evidence.
 
-    return manager_ai_tools.workforce_rank(
+    ``detail="summary"`` (default) keeps every top-level selection field
+    (selected_*, economic_advisory, etc.) exact; the selected compatible
+    candidate and the next two keep their full row, every other compatible
+    candidate is reduced to worker_id/adapter_id/model/score; excluded
+    candidates are reduced to a count per exclusion reason plus the first
+    10 as worker_id/adapter_id/model. ``detail="evidence"`` behaves like
+    ``"full"``: both return today's payload exactly.
+    """
+
+    refusal = _detail_refusal(detail)
+    if refusal is not None:
+        return refusal
+    result = manager_ai_tools.workforce_rank(
         task_id=task_id,
         kinds=kinds,
         risk=risk,
@@ -1237,6 +1251,14 @@ def aiworkhub_manager_workforce_rank(
         tool_needs=tool_needs,
         quality_floor=quality_floor,
     )
+    if detail != "summary" or not isinstance(result, dict) or not isinstance(result.get("candidates"), list):
+        return result
+    folded = mcp_summary_folds.fold_workforce_rank_summary(result)
+    folded["detail"] = detail
+    folded["detail_request"] = {
+        "full": {"tool": "aiworkhub_manager_workforce_rank", "task_id": task_id, "detail": "full"},
+    }
+    return folded
 
 
 @mcp.tool()
@@ -2455,9 +2477,13 @@ def aiworkhub_task_show(
     quality_review_receipt, worker_mcp_gate, workspace} and
     accept_evidence.{validation, quality_gate}) are folded to
     {summarized, bytes, sha256, verdict/status, failed_count, first_failure}.
-    ``detail="evidence"`` keeps the evidence blobs exact (baselines still
-    folded); ``detail="full"`` or ``full=True`` returns the exact stored card.
-    Summary/evidence renders are compact JSON; ``full`` keeps the indented one.
+    ``terminal_failure`` and ``rework_predecessor`` are folded to the facts a
+    reviewer reads (substatus/reason/category/first_error and
+    task_id/request_id/outcome/reason); ``template_provenance.expanded_contract``
+    is folded to identity only. ``detail="evidence"`` keeps all of the above
+    exact (baselines still folded); ``detail="full"`` or ``full=True`` returns
+    the exact stored card. Summary/evidence renders are compact JSON; ``full``
+    keeps the indented one.
     """
 
     refusal = _detail_refusal(detail)
@@ -2471,6 +2497,7 @@ def aiworkhub_task_show(
         return result
     if detail == "summary":
         card = core.summarize_evidence(card)
+        card = mcp_summary_folds.fold_task_card_facts(card)
     rendered = dict(result)
     rendered["stdout"] = json.dumps(card, ensure_ascii=False, default=str, separators=(",", ":"))
     rendered["detail"] = detail
@@ -3963,10 +3990,15 @@ def aiworkhub_agent_task_status(
     """READ-ONLY: inspect one launched process and its authoritative task card.
 
     ``detail="summary"`` (default) folds the card's baseline hash maps and
-    evidence blobs and the latest event's validation/quality_gate/
-    worker_mcp_gate/token_budget/project_context to
-    {summarized, bytes, sha256, verdict/status, failed_count, first_failure};
-    ``"evidence"`` keeps the evidence exact (baselines still folded);
+    evidence blobs, its ``terminal_failure``/``rework_predecessor``/
+    ``template_provenance.expanded_contract``, and its static contract text
+    (objective/acceptance/validation/read_first/template_provenance/
+    project_context/forbidden/required_outputs/mandatory_changed_outputs) to
+    {summarized, bytes, sha256} -- identity and lifecycle fields (task_id,
+    title, status, substatus, runner, topic, request ids, allowed_writes
+    count) stay exact. The latest event's validation/quality_gate/
+    worker_mcp_gate/token_budget/project_context fold the same way;
+    ``"evidence"`` keeps all of the above exact (baselines still folded);
     ``"full"`` returns the raw status payload.
     """
 
@@ -3982,12 +4014,14 @@ def aiworkhub_agent_task_status(
         card = core.summarize_card_baselines(card)
         if detail == "summary":
             card = core.summarize_evidence(card)
+            card = mcp_summary_folds.fold_task_card_for_process_status(card)
         folded["task_card"] = card
     latest = folded.get("latest_event")
     if isinstance(latest, dict):
         latest = core.summarize_card_baselines(latest)
         if detail == "summary":
             latest = core.summarize_evidence(latest, paths=core.EVENT_EVIDENCE_PATHS)
+            latest = mcp_summary_folds.fold_latest_event_for_process_status(latest)
         folded["latest_event"] = latest
     folded["detail"] = detail
     folded["detail_request"] = {
@@ -4628,15 +4662,44 @@ def aiworkhub_quality_calibration_report() -> dict[str, Any]:
 
 
 @mcp.tool()
-def aiworkhub_environment_preflight(adapter_id: str | None = None) -> dict[str, Any]:
+def aiworkhub_environment_preflight(
+    adapter_id: str | None = None, detail: StatusDetail = "summary"
+) -> dict[str, Any]:
     """READ-ONLY: unified repository/policy/Source Graph/provider readiness.
 
     Provider access is reported as observed only when an adapter-specific
     bridge or credential readiness source proves it; installed CLI binaries
     alone remain ``installed_unverified_access``.
+
+    ``detail="summary"`` (default) folds Source Graph's refresh-job report to
+    identity plus state, ``providers`` to a flat ``{adapter_id: status}``
+    map, ``provider_route_contracts.route_families`` to one
+    ``{family, status, count}`` row each, ``policy`` to its verdict fields,
+    ``worker_finalization`` to its state fields, and each of
+    ``provider_summary``'s route/capability lists and its
+    ``route_status_questions`` block to a count plus a short id preview (or
+    identity); with ``adapter_id`` given, ``providers`` and
+    ``provider_observability.adapters``/``providers`` are filtered to that
+    adapter. ``detail="evidence"`` behaves like ``"full"``: both return
+    ``repo_policy.build_preflight`` exactly.
     """
 
-    return repo_policy.build_preflight(core.repo_root(), adapter_id=adapter_id)
+    refusal = _detail_refusal(detail)
+    if refusal is not None:
+        return refusal
+    report = repo_policy.build_preflight(core.repo_root(), adapter_id=adapter_id)
+    if detail != "summary":
+        return report
+    folded = mcp_summary_folds.fold_preflight_summary(report, adapter_id=adapter_id)
+    folded["detail"] = detail
+    folded["detail_request"] = {
+        "full": {
+            "tool": "aiworkhub_environment_preflight",
+            "adapter_id": adapter_id,
+            "detail": "full",
+        },
+    }
+    return folded
 
 
 @mcp.tool()
