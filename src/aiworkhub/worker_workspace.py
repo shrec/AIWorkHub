@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import contextlib
 import copy
 import ctypes
 import errno
@@ -12342,6 +12343,38 @@ _HOST_READONLY_GIT_COMMANDS = {
         "diff", "--check", "--no-ext-diff", "--no-textconv", "--ignore-submodules=all",
     ),
 }
+# NF-40 security review: host git runs unconfined, so a link in the candidate
+# worktree makes it read -- and print -- whatever the link names.  Reproduced:
+# tracked pkg/leak.py, pkg replaced by a junction (no privilege needed) to an
+# outside directory, and the hardened `git diff --check` printed the outside
+# file's line.  So before git starts, the worktree is walked without following
+# anything and refused as a failed gate on any reparse point (junction,
+# symlink, mount point, any tag) or any file with more than one link, and every
+# directory stays held until git exits (_hold_plain_worktree).
+#
+# Why hold and not only scan.  Nothing of THIS request can still write the
+# worktree: the supervisor closes the worker's kill-on-close job the moment
+# its process exits (_AppContainerProcess._observe, and its finally on every
+# other path), and AppContainerLaunch.close revokes the modify grant only after
+# the job is closed -- _run_host_readonly_git checks that no package SID still
+# holds a write ACE on the worktree -- while the lane's own containers only
+# ever read it, one command at a time, each closed before the next.  But the
+# container SID is per repository and adapter, not per request: a sibling
+# worker of the same repository and adapter running concurrently is that same
+# SID, could open this worktree while this request's grant was live, and keeps
+# what it opened after the revoke.  A live writer cannot be ruled out, so a scan
+# alone would race it.  The hold (platform_io.pinned_paths: never a reparse
+# point, never renamed, deleted or swapped) closes that for every directory
+# scanned.  It cannot stop such a writer adding a new entry inside a held
+# directory, or turning a held directory it emptied into a junction, while git
+# runs; for that residue git's echo of each offending line -- the only file
+# content that ever leaves _run_host_readonly_git -- is dropped from stdout.
+#
+# Bound: 20,000 entries.  Measured, whole guard (walk, lstat, hold), median
+# of 7: the NF-30 card's sparse lane worktree, 3 directories and 137 files,
+# 5.2 ms; a full checkout of this repository, 61 directories and 1,440 files,
+# 33 ms.
+_HOST_GIT_WALK_LIMIT = 20_000
 
 
 def _host_readonly_git_argv(argv: list[str], cd_relative: str | None) -> list[str]:
@@ -12374,10 +12407,17 @@ def _run_host_readonly_git(
             "windows_host_git_not_allowlisted:only `git diff --check` from the "
             f"worktree root runs in this lane:{argv}"
         )
+    from .windows_appcontainer import appcontainer_writers
+
     try:
         admin_dir = _verified_worktree_admin_dir(Path(workspace.repo), Path(workspace.path))
     except WorkspaceError as exc:
         raise OSError(f"windows_host_git_worktree_unverified:{exc}") from exc
+    # The first half of the race argument above, checked rather than assumed:
+    # the worker's modify grant goes only after its job is closed.
+    writers = appcontainer_writers(str(workspace.path))
+    if writers:
+        raise OSError(f"host_git_worktree_still_container_writable:{','.join(writers)}")
     env = _git_environment()
     env.update(
         GIT_DIR=str(admin_dir),
@@ -12385,20 +12425,85 @@ def _run_host_readonly_git(
         GIT_CONFIG_GLOBAL=os.devnull,
         GIT_NO_LAZY_FETCH="1",
     )
-    # cwd is the host-only admin record, never a candidate directory: nothing
-    # git loads at startup can come from the worktree.
-    return subprocess.run(
-        list(argv),
-        cwd=admin_dir,
-        env=env,
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=timeout_seconds,
-        check=False,
-        shell=False,
+    with contextlib.ExitStack() as held:
+        try:
+            _hold_plain_worktree(held, workspace)
+        except _HostGitRefused as exc:
+            # A link the candidate made fails its gate; git never runs.
+            return subprocess.CompletedProcess(list(argv), 1, "", str(exc))
+        # cwd is the host-only admin record, never a candidate directory:
+        # nothing git loads at startup can come from the worktree.
+        result = subprocess.run(
+            list(argv),
+            cwd=admin_dir,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout_seconds,
+            check=False,
+            shell=False,
+        )
+    # "path:line: message." stays; the "+<line>" echo of the file is dropped.
+    echo_free = "".join(
+        line for line in result.stdout.splitlines(keepends=True) if not line.startswith("+")
     )
+    return subprocess.CompletedProcess(result.args, result.returncode, echo_free, result.stderr)
+
+
+class _HostGitRefused(Exception):
+    """The candidate worktree holds a link host git must not follow."""
+
+
+def _hold_plain_worktree(held: contextlib.ExitStack, workspace: WorkerWorkspace) -> None:
+    """Hold the request root, the worktree and every directory beneath it in
+    ``held`` -- each held before it is listed, parents first -- and lstat
+    every entry, never following one.
+
+    Raises :class:`_HostGitRefused` naming the first reparse point (junction,
+    symlink, mount point, any tag) or file with more than one link, and
+    ``OSError`` past ``_HOST_GIT_WALK_LIMIT`` entries or when a directory
+    cannot be held.
+    """
+    from .platform_io import ReparsePointRefused, pinned_paths
+
+    worktree = Path(workspace.path)
+
+    def refused(kind: str, path: Path) -> _HostGitRefused:
+        relative = Path(os.path.relpath(path, worktree)).as_posix()
+        return _HostGitRefused(f"host_git_worktree_{kind}_refused:{relative}")
+
+    def hold(path: Path) -> None:
+        try:
+            held.enter_context(pinned_paths([path]))
+        except ReparsePointRefused as exc:
+            raise refused("reparse_point", path) from exc
+
+    request_root = _appcontainer_request_root(workspace)
+    if request_root != worktree:
+        hold(request_root)
+    hold(worktree)
+    pending, seen = [worktree], 0
+    while pending:
+        with os.scandir(pending.pop()) as entries:
+            for entry in entries:
+                seen += 1
+                if seen > _HOST_GIT_WALK_LIMIT:
+                    raise OSError(
+                        f"host_git_worktree_walk_limit_exceeded:{_HOST_GIT_WALK_LIMIT}"
+                    )
+                path = Path(entry.path)
+                info = os.lstat(path)
+                if stat.S_ISLNK(info.st_mode) or (
+                    getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+                ):
+                    raise refused("reparse_point", path)
+                if stat.S_ISDIR(info.st_mode):
+                    hold(path)
+                    pending.append(path)
+                elif info.st_nlink > 1:
+                    raise refused("hard_link", path)
 
 
 def _appcontainer_request_root(workspace: WorkerWorkspace) -> Path:

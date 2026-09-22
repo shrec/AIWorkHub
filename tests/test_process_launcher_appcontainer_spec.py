@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import subprocess
 import sys
@@ -1764,15 +1765,17 @@ def _git_available():
     return git
 
 
-def _linked_worktree(tmp_path: Path):
+def _linked_worktree(tmp_path: Path, files: dict[str, bytes] | None = None):
     """A canonical repository with one commit and a detached linked worktree."""
     git = _git_available()
     repo, worktree = tmp_path / "repo", tmp_path / "wt"
     repo.mkdir()
     ident = ["-c", "user.name=t", "-c", "user.email=t@example.invalid"]
     subprocess.run([git, "init", "-q"], cwd=repo, check=True, capture_output=True)
-    (repo / "a.txt").write_bytes(b"clean\n")
-    for argv in (["add", "a.txt"], ["commit", "-q", "-m", "base"]):
+    for relative, content in (files or {"a.txt": b"clean\n"}).items():
+        (repo / relative).parent.mkdir(parents=True, exist_ok=True)
+        (repo / relative).write_bytes(content)
+    for argv in (["add", "-A"], ["commit", "-q", "-m", "base"]):
         subprocess.run([git, *ident, *argv], cwd=repo, check=True, capture_output=True)
     subprocess.run(
         [git, "worktree", "add", "-q", "--detach", str(worktree)],
@@ -1802,6 +1805,8 @@ def test_host_git_checks_the_candidate_with_attributes_from_head(tmp_path) -> No
     result = _host_diff_check(workspace, git)
     assert result.returncode == 2
     assert "a.txt:2: trailing whitespace." in result.stdout
+    # The location stays; git's echo of the line -- file content -- does not.
+    assert "trailing   " not in result.stdout
 
 
 def test_host_git_executes_nothing_the_candidate_configured(tmp_path, monkeypatch) -> None:
@@ -1962,3 +1967,232 @@ def test_run_validations_never_runs_any_other_git_command_anywhere(tmp_path, mon
     rows = excinfo.value.results
     assert all(row["returncode"] is None for row in rows)
     assert all("windows_host_git_not_allowlisted" in row["launch_error_message"] for row in rows)
+
+
+# ---------------------------------------------------------------------------
+# NF-40 security review: host git never follows a link the candidate planted
+# ---------------------------------------------------------------------------
+
+windows_only = pytest.mark.skipif(os.name != "nt", reason="needs NTFS junctions")
+_SECRET = b"SECRET_CONTENT_LINE_WITH_TRAILING_SPACE   \n"
+
+
+def _junction(link: Path, target: Path) -> None:
+    """A directory junction, which needs no privilege -- as the reviewer made it."""
+    import _winapi
+
+    _winapi.CreateJunction(str(target), str(link))
+
+
+def _git_spy(monkeypatch):
+    """Count every subprocess the code under test starts from here on."""
+    started: list[list[str]] = []
+    real = worker_workspace.subprocess.run
+
+    def _spy(argv, *args, **kwargs):
+        started.append(list(argv))
+        return real(argv, *args, **kwargs)
+
+    monkeypatch.setattr(worker_workspace.subprocess, "run", _spy)
+    return started
+
+
+def _leak_setup(tmp_path: Path):
+    workspace, git = _linked_worktree(
+        tmp_path, {"a.txt": b"clean\n", "pkg/leak.py": b"x = 1\n"}
+    )
+    outside = tmp_path / "outside_secret"
+    outside.mkdir()
+    (outside / "leak.py").write_bytes(_SECRET)
+    return workspace, git, outside
+
+
+@windows_only
+def test_host_git_refuses_a_planted_junction_and_never_runs_git(tmp_path, monkeypatch):
+    """The review's reproduction, live: without the guard, the hardened
+    command prints the outside file; with it, git never starts."""
+    workspace, git, outside = _leak_setup(tmp_path)
+    import shutil
+
+    shutil.rmtree(workspace.path / "pkg")
+    _junction(workspace.path / "pkg", outside)
+    plain = subprocess.run(
+        [git, *_HARDENED_DIFF_CHECK], cwd=workspace.path, capture_output=True, text=True
+    )
+    assert "SECRET_CONTENT_LINE" in plain.stdout  # the leak is real
+
+    started = _git_spy(monkeypatch)
+    result = _host_diff_check(workspace, git)
+
+    assert started == []
+    assert result.returncode == 1
+    assert result.stderr == "host_git_worktree_reparse_point_refused:pkg"
+    assert "SECRET" not in result.stdout + result.stderr
+
+
+@windows_only
+def test_host_git_refuses_a_nested_junction(tmp_path, monkeypatch):
+    workspace, git, outside = _leak_setup(tmp_path)
+    (workspace.path / "pkg" / "deeper").mkdir()
+    _junction(workspace.path / "pkg" / "deeper" / "j", outside)
+    started = _git_spy(monkeypatch)
+
+    result = _host_diff_check(workspace, git)
+
+    assert started == []
+    assert result.stderr == "host_git_worktree_reparse_point_refused:pkg/deeper/j"
+
+
+@windows_only
+def test_host_git_refuses_a_junction_above_the_worktree(tmp_path, monkeypatch):
+    """The worktree root itself, or anything up to the request root."""
+    workspace, git, outside = _leak_setup(tmp_path)
+    started = _git_spy(monkeypatch)
+    moved = tmp_path / "moved"
+    workspace.path.rename(moved)
+    _junction(workspace.path, moved)
+
+    result = _host_diff_check(workspace, git)
+
+    assert started == []
+    assert result.stderr == "host_git_worktree_reparse_point_refused:."
+
+
+@pytest.mark.parametrize("kind", ["directory", "file"])
+def test_host_git_refuses_a_symlink(tmp_path, monkeypatch, kind):
+    workspace, git, outside = _leak_setup(tmp_path)
+    link = workspace.path / ("pkg2" if kind == "directory" else "a_link.py")
+    target = outside if kind == "directory" else outside / "leak.py"
+    try:
+        os.symlink(target, link, target_is_directory=kind == "directory")
+    except OSError:
+        pytest.skip("this host cannot create symlinks without privilege")
+    started = _git_spy(monkeypatch)
+
+    result = _host_diff_check(workspace, git)
+
+    assert started == []
+    assert result.stderr == f"host_git_worktree_reparse_point_refused:{link.name}"
+
+
+def test_host_git_refuses_any_file_level_reparse_point(tmp_path, monkeypatch):
+    """Any tag -- not only links: a file whose attributes carry the reparse bit
+    (fake Win32 lstat, so it is deterministic on every platform)."""
+    workspace, git, _outside = _leak_setup(tmp_path)
+    tagged = workspace.path / "pkg" / "leak.py"
+    real_lstat = os.lstat
+
+    def _lstat(path, *args, **kwargs):
+        info = real_lstat(path, *args, **kwargs)
+        if Path(path) == tagged:
+            return SimpleNamespace(
+                st_mode=info.st_mode, st_nlink=1,
+                st_file_attributes=0x400,  # FILE_ATTRIBUTE_REPARSE_POINT
+            )
+        return info
+
+    started = _git_spy(monkeypatch)
+    monkeypatch.setattr(worker_workspace.os, "lstat", _lstat)
+    result = _host_diff_check(workspace, git)
+
+    assert started == []
+    assert result.stderr == "host_git_worktree_reparse_point_refused:pkg/leak.py"
+
+
+def test_host_git_refuses_a_hard_linked_file(tmp_path, monkeypatch):
+    workspace, git, outside = _leak_setup(tmp_path)
+    (workspace.path / "pkg" / "leak.py").unlink()
+    os.link(outside / "leak.py", workspace.path / "pkg" / "leak.py")
+    started = _git_spy(monkeypatch)
+
+    result = _host_diff_check(workspace, git)
+
+    assert started == []
+    assert result.stderr == "host_git_worktree_hard_link_refused:pkg/leak.py"
+    assert "SECRET" not in result.stdout + result.stderr
+
+
+def test_host_git_still_runs_on_a_clean_worktree(tmp_path, monkeypatch):
+    workspace, git, _outside = _leak_setup(tmp_path)
+    started = _git_spy(monkeypatch)
+
+    result = _host_diff_check(workspace, git)
+
+    assert result.returncode == 0, result.stderr
+    assert started == [[git, *_HARDENED_DIFF_CHECK]]
+
+
+def test_host_git_fails_closed_past_the_walk_bound(tmp_path, monkeypatch):
+    workspace, git, _outside = _leak_setup(tmp_path)
+    monkeypatch.setattr(worker_workspace, "_HOST_GIT_WALK_LIMIT", 2)
+    started = _git_spy(monkeypatch)
+
+    with pytest.raises(OSError, match="host_git_worktree_walk_limit_exceeded:2"):
+        _host_diff_check(workspace, git)
+    assert started == []
+
+
+def test_host_git_refuses_while_a_container_can_still_write_the_worktree(
+    tmp_path, monkeypatch
+):
+    """Its own worker's modify grant goes only after that worker's job is
+    closed; while one is present, host git does not run at all."""
+    workspace, git, _outside = _leak_setup(tmp_path)
+    seen: list[str] = []
+
+    def _writers(path):
+        seen.append(path)
+        return ["S-1-15-2-1-2-3"]
+
+    monkeypatch.setattr(windows_appcontainer, "appcontainer_writers", _writers)
+    started = _git_spy(monkeypatch)
+
+    with pytest.raises(OSError, match="host_git_worktree_still_container_writable:S-1-15-2-1-2-3"):
+        _host_diff_check(workspace, git)
+    assert started == [] and seen == [str(workspace.path)]
+
+
+@windows_only
+def test_appcontainer_writers_names_a_package_sid_with_any_write_right(tmp_path):
+    root = tmp_path / "root"
+    (root / "child").mkdir(parents=True)
+    assert windows_appcontainer.appcontainer_writers(str(root)) == []
+
+    def _icacls(*args):
+        subprocess.run(["icacls", str(root), *args], check=True, capture_output=True)
+
+    _icacls("/grant", "*S-1-15-2-1:(OI)(CI)(RX)")
+    assert windows_appcontainer.appcontainer_writers(str(root)) == []  # read only
+    _icacls("/grant", "*S-1-15-2-1:(OI)(CI)(M)")
+    assert windows_appcontainer.appcontainer_writers(str(root)) == ["S-1-15-2-1"]
+    # Inherited counts too: the child is just as writable.
+    assert windows_appcontainer.appcontainer_writers(str(root / "child")) == ["S-1-15-2-1"]
+
+
+@windows_only
+def test_run_validations_fails_the_gate_on_a_planted_junction(tmp_path, monkeypatch):
+    """A candidate-made link is a failed gate (validation_failed), not an
+    environment block, and nothing of the target reaches the record."""
+    git = str(tmp_path / "bin" / "git.exe")
+    workspace, container = _routing_stubs(monkeypatch, tmp_path, git)
+    outside = tmp_path / "outside_secret"
+    outside.mkdir()
+    (outside / "leak.py").write_bytes(_SECRET)
+    _junction(workspace.path / "pkg", outside)
+    admin = tmp_path / "admin"
+    admin.mkdir()
+    monkeypatch.setattr(worker_workspace, "_verified_worktree_admin_dir", lambda _r, _p: admin)
+    _no_subprocess(monkeypatch)
+
+    with pytest.raises(worker_workspace.ValidationRunError) as excinfo:
+        worker_workspace.run_validations(
+            workspace, ["git diff --check"], backend="windows_appcontainer",
+            adapter_id="claude_cli",
+        )
+
+    assert not isinstance(excinfo.value, worker_workspace.ValidationEnvironmentBlocked)
+    (row,) = excinfo.value.results
+    assert row["returncode"] == 1 and "launch_error" not in row
+    assert row["stderr_tail"] == "host_git_worktree_reparse_point_refused:pkg"
+    assert "SECRET" not in json.dumps(row)
+    assert container == []

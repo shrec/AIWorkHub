@@ -840,6 +840,37 @@ _INHERIT_ONLY_ACE = 0x08
 _ALL_APPLICATION_PACKAGES_SID = b"\x01\x02\x00\x00\x00\x00\x00\x0f\x02\x00\x00\x00\x01\x00\x00\x00"
 
 
+# Rights that let a holder change what a path is or what it holds: write and
+# append data, write EA and attributes, delete child, DELETE, WRITE_DAC,
+# WRITE_OWNER, GENERIC_ALL and GENERIC_WRITE.
+_ANY_WRITE_RIGHTS = 0x2 | 0x4 | 0x10 | 0x40 | 0x100 | 0x10000 | 0x40000 | 0x80000 | 0x50000000
+_PACKAGE_SID_PREFIX = b"\x00\x00\x00\x00\x00\x0f\x02\x00\x00\x00"  # S-1-15-2-*
+
+
+def appcontainer_writers(path: str) -> list[str]:
+    """The package SIDs -- an AppContainer, or ALL APPLICATION PACKAGES
+    (S-1-15-2-*) -- that an allow ACE on ``path``, explicit or inherited,
+    inherit-only or not, gives any right to change it or what it holds.
+    ``[]`` off Windows.  A launch's revocable modify grant is exactly such an
+    ACE until :meth:`AppContainerLaunch.close` -- which first closes the
+    kill-on-close job -- revokes it."""
+    if os.name != "nt":
+        return []
+    writers = []
+    for ace in snapshot_filesystem_acl(path).aces:
+        sid = ace.sid
+        if (
+            ace.ace_type == _ACCESS_ALLOWED_ACE_TYPE
+            and ace.mask & _ANY_WRITE_RIGHTS
+            and sid[2:12] == _PACKAGE_SID_PREFIX
+        ):
+            subauthorities = (
+                int.from_bytes(sid[8 + 4 * i: 12 + 4 * i], "little") for i in range(sid[1])
+            )
+            writers.append("S-1-15-" + "-".join(map(str, subauthorities)))
+    return writers
+
+
 def _satisfying_trustee(
     aces: Sequence["AclAce"], sid: bytes, mask: int, inherit: int
 ) -> str:
