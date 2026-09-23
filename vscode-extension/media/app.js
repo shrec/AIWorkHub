@@ -25,6 +25,12 @@ const LIVE_OUTPUT_MAX_CLIENT_CHARS = 64 * 1024;
 const LIVE_OUTPUT_POLL_MS = 4000;
 const READY_RETRY_MS = 1000;
 const READY_MAX_ATTEMPTS = 30;
+// Bounded poll cadence for the Manager transcript while a session is active --
+// independent of the dashboard-wide snapshot refresh, and only running while
+// the Manager dialog is open with a session (see startManagerChatPolling /
+// stopManagerChatPolling).
+const MANAGER_CHAT_POLL_MS = 1500;
+const MANAGER_CHAT_BACKENDS = new Set(["claude_cli", "codex_cli", "opencode_cli"]);
 
 const persisted = vscode.getState() || {};
 
@@ -74,6 +80,13 @@ const state = {
   // sentences and the page prints different words for them (NF-2026-00675).
   historySeries: null,
   historyState: "pending",
+  managerChatSession: null,
+  managerChatBackend: null,
+  managerChatModel: null,
+  managerChatRunning: false,
+  managerChatEvents: [],
+  managerChatLastSeq: 0,
+  managerChatPollTimer: null,
 };
 
 let readyRetryTimer = null;
@@ -309,6 +322,26 @@ const elements = {
   repoRouter: document.querySelector("#repo-router"),
   repoRouterList: document.querySelector("#repo-router-list"),
   targetButtons: Array.from(document.querySelectorAll("[data-provider]")),
+  headerManagerChat: document.querySelector("#header-manager-chat"),
+  headerManagerChatValue: document.querySelector("#header-manager-chat-value"),
+  headerManagerChatDetail: document.querySelector("#header-manager-chat-detail"),
+  managerChatDialog: document.querySelector("#manager-chat-dialog"),
+  managerChatSummary: document.querySelector("#manager-chat-summary"),
+  managerChatBackendSelect: document.querySelector("#manager-chat-backend"),
+  managerChatModelInput: document.querySelector("#manager-chat-model"),
+  managerChatStart: document.querySelector("#manager-chat-start"),
+  managerChatRotate: document.querySelector("#manager-chat-rotate"),
+  managerChatClose: document.querySelector("#manager-chat-close"),
+  managerChatStatus: document.querySelector("#manager-chat-status"),
+  managerChatStatusLabel: document.querySelector("#manager-chat-status-label"),
+  managerChatSessionLine: document.querySelector("#manager-chat-session-line"),
+  managerChatSessionId: document.querySelector("#manager-chat-session-id"),
+  managerChatSessionBackend: document.querySelector("#manager-chat-session-backend"),
+  managerChatTranscript: document.querySelector("#manager-chat-transcript"),
+  managerChatNotice: document.querySelector("#manager-chat-notice"),
+  managerChatComposer: document.querySelector("#manager-chat-composer"),
+  managerChatInput: document.querySelector("#manager-chat-input"),
+  managerChatSend: document.querySelector("#manager-chat-send"),
 };
 
 function createElement(tag, className, text) {
@@ -6880,6 +6913,190 @@ if (typeof ResizeObserver === "function") {
 }
 renderHeaderSignals();
 
+// ── Manager chat: event-to-DOM mapping and the bounded after_seq poll loop
+// while a session is active. Every event payload is untrusted model/tool
+// output, so every string below is written through createElement's textContent
+// assignment or document.createTextNode -- never innerHTML (see createElement).
+function managerChatEventNode(event) {
+  const type = String((event && event.type) || "");
+  const payload = event && event.payload && typeof event.payload === "object" ? event.payload : {};
+  if (type === "assistant_text" || type === "user_message") {
+    const bubble = createElement("div", `manager-chat-bubble role-${type === "user_message" ? "user" : "assistant"}`);
+    bubble.appendChild(createElement("span", "manager-chat-bubble-label", type === "user_message" ? "You" : "Manager"));
+    bubble.appendChild(document.createTextNode(String(payload.text || "")));
+    return bubble;
+  }
+  if (type === "tool_call" || type === "tool_result") {
+    const name = String(payload.name || payload.tool || "tool");
+    const rest = Object.assign({}, payload);
+    delete rest.name;
+    delete rest.tool;
+    const row = createElement("details", "manager-chat-tool-row");
+    row.appendChild(createElement("summary", "", `${type === "tool_call" ? "Tool call" : "Tool result"}: ${name}`));
+    row.appendChild(createElement("div", "manager-chat-tool-row-body", limitText(JSON.stringify(rest), 200)));
+    return row;
+  }
+  if (type === "callback") {
+    return createElement("div", "manager-chat-marker", `Automatic wake-up${payload.text ? `: ${limitText(payload.text, 120)}` : ""}`);
+  }
+  if (type === "error") {
+    return createElement("div", "manager-chat-error", String(payload.error || payload.message || "Manager error"));
+  }
+  if (type === "session_start") {
+    return createElement("div", "manager-chat-marker", "Session started");
+  }
+  if (type === "handoff_request") {
+    return createElement("div", "manager-chat-marker", `Handoff requested${payload.reason ? `: ${limitText(payload.reason, 120)}` : ""}`);
+  }
+  if (type === "session_close") {
+    return createElement("div", "manager-chat-marker", `Session closed${payload.reason ? `: ${limitText(payload.reason, 120)}` : ""}`);
+  }
+  return null;
+}
+
+function renderManagerChatEvents() {
+  if (!elements.managerChatTranscript) return;
+  const rows = [];
+  for (const event of state.managerChatEvents) {
+    const node = managerChatEventNode(event);
+    if (node) rows.push(node);
+  }
+  if (rows.length === 0) {
+    elements.managerChatTranscript.replaceChildren(
+      createElement("div", "panel-list-empty compact", state.managerChatSession ? "No events yet" : "Start a session to begin"),
+    );
+    return;
+  }
+  const fragment = document.createDocumentFragment();
+  for (const row of rows) fragment.appendChild(row);
+  elements.managerChatTranscript.replaceChildren(fragment);
+  elements.managerChatTranscript.scrollTop = elements.managerChatTranscript.scrollHeight;
+}
+
+function showManagerChatNotice(message) {
+  if (!elements.managerChatNotice) return;
+  if (!message) {
+    elements.managerChatNotice.hidden = true;
+    elements.managerChatNotice.textContent = "";
+    return;
+  }
+  elements.managerChatNotice.hidden = false;
+  elements.managerChatNotice.textContent = message;
+}
+
+function applyManagerChatComposerState() {
+  const canSend = Boolean(state.managerChatSession) && !state.managerChatRunning;
+  elements.managerChatInput.disabled = !canSend;
+  elements.managerChatSend.disabled = !canSend;
+}
+
+function applyManagerChatSessionUi() {
+  const hasSession = Boolean(state.managerChatSession);
+  elements.managerChatStart.disabled = hasSession;
+  elements.managerChatBackendSelect.disabled = hasSession;
+  elements.managerChatModelInput.disabled = hasSession;
+  elements.managerChatRotate.disabled = !hasSession || state.managerChatRunning;
+  elements.managerChatClose.disabled = !hasSession || state.managerChatRunning;
+  elements.managerChatStatus.classList.toggle("is-live", state.managerChatRunning);
+  elements.managerChatStatusLabel.textContent = state.managerChatRunning ? "Running" : hasSession ? "Idle" : "Not started";
+  elements.managerChatSessionLine.hidden = !hasSession;
+  elements.managerChatSessionId.textContent = hasSession ? state.managerChatSession : "";
+  elements.managerChatSessionBackend.textContent = hasSession
+    ? `${state.managerChatBackend || ""} / ${state.managerChatModel || ""}`
+    : "";
+  elements.managerChatSummary.textContent = hasSession
+    ? `${state.managerChatRunning ? "Running" : "Idle"} · ${state.managerChatBackend || ""}`
+    : "No active session";
+  if (elements.headerManagerChatValue) {
+    elements.headerManagerChatValue.textContent = state.managerChatRunning ? "Running" : hasSession ? "Idle" : "—";
+  }
+  if (elements.headerManagerChatDetail) {
+    elements.headerManagerChatDetail.textContent = hasSession ? String(state.managerChatBackend || "") : "No session";
+  }
+  applyManagerChatComposerState();
+}
+
+function stopManagerChatPolling() {
+  if (state.managerChatPollTimer !== null) {
+    window.clearTimeout(state.managerChatPollTimer);
+    state.managerChatPollTimer = null;
+  }
+}
+
+function requestManagerChatEvents() {
+  if (!state.managerChatSession) return;
+  vscode.postMessage({ type: "managerLoopEvents", sessionId: state.managerChatSession, afterSeq: state.managerChatLastSeq });
+}
+
+function scheduleManagerChatPoll() {
+  stopManagerChatPolling();
+  state.managerChatPollTimer = window.setTimeout(() => {
+    state.managerChatPollTimer = null;
+    if (state.managerChatSession && elements.managerChatDialog.open) {
+      requestManagerChatEvents();
+    }
+  }, MANAGER_CHAT_POLL_MS);
+}
+
+function renderManagerChatStatus(payload) {
+  if (!payload || payload.ok === false) {
+    stopManagerChatPolling();
+    showManagerChatNotice(payload && payload.error ? `Manager error: ${payload.error}` : "Manager status unavailable");
+    return;
+  }
+  const session = payload.session && typeof payload.session === "object" ? payload.session : null;
+  const nextSessionId = session ? String(session.session_id || "") || null : null;
+  const sessionChanged = nextSessionId !== state.managerChatSession;
+  state.managerChatSession = nextSessionId;
+  state.managerChatBackend = session ? String(session.backend_id || "") : null;
+  state.managerChatModel = session ? String(session.model || "") : null;
+  state.managerChatRunning = Boolean(payload.running);
+  applyManagerChatSessionUi();
+  if (!state.managerChatSession) {
+    stopManagerChatPolling();
+    state.managerChatEvents = [];
+    state.managerChatLastSeq = 0;
+    renderManagerChatEvents();
+    return;
+  }
+  if (sessionChanged) {
+    state.managerChatEvents = [];
+    state.managerChatLastSeq = 0;
+    renderManagerChatEvents();
+  }
+  if (elements.managerChatDialog.open) {
+    requestManagerChatEvents();
+  }
+}
+
+function renderManagerChatEventsResponse(payload) {
+  if (!payload || payload.ok === false) {
+    showManagerChatNotice(payload && payload.error ? `Manager error: ${payload.error}` : "Manager events unavailable");
+  } else {
+    const events = asArray(payload.events);
+    if (events.length > 0) {
+      state.managerChatEvents = state.managerChatEvents.concat(events);
+      state.managerChatLastSeq = events.reduce((max, event) => Math.max(max, numberValue(event.seq)), state.managerChatLastSeq);
+      renderManagerChatEvents();
+    }
+  }
+  if (state.managerChatSession && elements.managerChatDialog.open) {
+    scheduleManagerChatPoll();
+  }
+}
+
+function renderManagerChatAction(_action, payload) {
+  if (payload && payload.ok === false) {
+    showManagerChatNotice(
+      payload.error === "manager_turn_in_progress"
+        ? "A manager turn is already running."
+        : `Manager error: ${payload.error || "unknown"}`,
+    );
+    return;
+  }
+  showManagerChatNotice(null);
+}
+
 // ── Fixed-enum inbound message handling from the extension host ───────────
 window.addEventListener("message", (event) => {
   const message = event.data;
@@ -6981,6 +7198,15 @@ window.addEventListener("message", (event) => {
       renderLiveOutput(message.payload);
       break;
     }
+    case "managerLoopStatus":
+      renderManagerChatStatus(message.payload);
+      break;
+    case "managerLoopEvents":
+      renderManagerChatEventsResponse(message.payload);
+      break;
+    case "managerLoopAction":
+      renderManagerChatAction(message.action, message.payload);
+      break;
     default:
       break;
   }
@@ -7389,6 +7615,60 @@ elements.roadmapIncludeArchived.addEventListener("change", requestRoadmapList);
 elements.roadmapList.addEventListener("click", (event) => {
   const target = event.target.closest("[data-roadmap-id]");
   if (target) vscode.postMessage({ type: "requestRoadmapDetail", roadmapId: target.dataset.roadmapId });
+});
+
+function openManagerChatDialog() {
+  if (!elements.managerChatDialog.open) elements.managerChatDialog.showModal();
+  showManagerChatNotice(null);
+  vscode.postMessage({ type: "managerLoopStatus" });
+}
+
+elements.headerManagerChat.addEventListener("click", openManagerChatDialog);
+
+// <dialog> fires "close" for every dismissal path (the Close button's
+// .close() call, Escape, or a future form method=dialog submit) so this is
+// the one place that needs to stop the after_seq poll chain.
+elements.managerChatDialog.addEventListener("close", () => {
+  stopManagerChatPolling();
+});
+
+elements.managerChatStart.addEventListener("click", () => {
+  const backendId = elements.managerChatBackendSelect.value;
+  const model = String(elements.managerChatModelInput.value || "").trim();
+  if (!MANAGER_CHAT_BACKENDS.has(backendId) || !model) {
+    showManagerChatNotice("Choose a backend and enter a model before starting.");
+    return;
+  }
+  showManagerChatNotice(null);
+  vscode.postMessage({ type: "managerLoopStart", backendId, model });
+});
+
+elements.managerChatRotate.addEventListener("click", () => {
+  const reason = String(window.prompt("Rotation reason", "") || "").trim();
+  if (!reason) return;
+  vscode.postMessage({ type: "managerLoopRotate", reason });
+});
+
+elements.managerChatClose.addEventListener("click", () => {
+  if (!window.confirm("Close the manager session?")) return;
+  vscode.postMessage({ type: "managerLoopClose" });
+});
+
+elements.managerChatComposer.addEventListener("submit", (event) => {
+  event.preventDefault();
+  if (elements.managerChatSend.disabled) return;
+  const text = String(elements.managerChatInput.value || "").trim();
+  if (!text) return;
+  vscode.postMessage({ type: "managerLoopSend", text });
+  elements.managerChatInput.value = "";
+  // Optimistic: the round trip to a fresh managerLoopStatus reply is what
+  // authoritatively confirms "running", but disabling Send immediately closes
+  // the window where a fast double-click could reach the host before that
+  // reply lands. A concurrent send is refused server-side either way (see
+  // renderManagerChatAction's manager_turn_in_progress notice), so this only
+  // ever narrows -- never replaces -- that guarantee.
+  state.managerChatRunning = true;
+  applyManagerChatSessionUi();
 });
 
 function closeIdentityInfoPopover() {

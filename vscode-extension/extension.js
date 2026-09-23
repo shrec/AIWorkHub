@@ -396,6 +396,12 @@ const ALLOWED_INBOUND_MESSAGE_TYPES = new Set([
   "requestRuntimeCleanup",
   "requestRuntimeRestore",
   "requestRuntimePurge",
+  "managerLoopStart",
+  "managerLoopSend",
+  "managerLoopRotate",
+  "managerLoopClose",
+  "managerLoopStatus",
+  "managerLoopEvents",
 ]);
 
 // Outbound message types the extension host posts into the Webview.
@@ -423,6 +429,9 @@ const OUTBOUND_TYPES = Object.freeze({
   waveMiniRoadmap: "waveMiniRoadmap",
   waveMiniRoadmapDetail: "waveMiniRoadmapDetail",
   settings: "settings",
+  managerLoopStatus: "managerLoopStatus",
+  managerLoopEvents: "managerLoopEvents",
+  managerLoopAction: "managerLoopAction",
 });
 
 const TASK_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$/;
@@ -567,6 +576,23 @@ const TASK_RETENTION_TOOLS = Object.freeze({
   restoreBatch: "aiworkhub_dashboard_task_quarantine_restore",
   purgeBatch: "aiworkhub_dashboard_task_quarantine_purge",
 });
+const MANAGER_LOOP_TOOLS = Object.freeze({
+  start: "aiworkhub_manager_loop_start",
+  send: "aiworkhub_manager_loop_send",
+  rotate: "aiworkhub_manager_loop_rotate",
+  status: "aiworkhub_manager_loop_status",
+  events: "aiworkhub_manager_loop_events",
+  close: "aiworkhub_manager_loop_close",
+});
+// The dashboard's Manager chat panel offers exactly these three CLI backends.
+// MANAGER_LOOP_TOOLS is deliberately never folded into EXPECTED_DASHBOARD_TOOL_NAMES:
+// these six tools are mutating and session-scoped, not the read-only dashboard
+// contract that check verifies (see pushRuntimeInfo).
+const MANAGER_LOOP_BACKENDS = new Set(["claude_cli", "codex_cli", "opencode_cli"]);
+// Matches manager_loop._SESSION_ID_RE -- production ids look like
+// "mls-<32 hex>", but the bounded opaque shape is the contract, not the prefix.
+const MANAGER_SESSION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{7,63}$/;
+
 // Callback delivery is a separate background service from Source Graph.
 // Both are repo-bound and both must converge after the MCP handshake; neither
 // may replace the other in the extension lifecycle.
@@ -9277,6 +9303,56 @@ async function runNeedfixAction(view, action, args) {
   }
 }
 
+async function pushManagerLoopStatus(view) {
+  try {
+    const client = getMcpClient();
+    view.bindClient(client);
+    const payload = await client.callTool(MANAGER_LOOP_TOOLS.status, {});
+    if (view.stillBoundTo(client)) {
+      view.postMessage({ type: OUTBOUND_TYPES.managerLoopStatus, payload: sanitizeWebviewPayload(payload) });
+    }
+  } catch (err) {
+    view.postMessage({ type: OUTBOUND_TYPES.managerLoopStatus, payload: { ok: false, error: sanitizeErrorMessage(err) } });
+  }
+}
+
+async function pushManagerLoopEvents(view, sessionId, afterSeq) {
+  try {
+    const client = getMcpClient();
+    view.bindClient(client);
+    const payload = await client.callTool(MANAGER_LOOP_TOOLS.events, { session_id: sessionId, after_seq: afterSeq });
+    if (view.stillBoundTo(client)) {
+      view.postMessage({ type: OUTBOUND_TYPES.managerLoopEvents, payload: sanitizeWebviewPayload(payload) });
+    }
+  } catch (err) {
+    view.postMessage({ type: OUTBOUND_TYPES.managerLoopEvents, payload: { ok: false, error: sanitizeErrorMessage(err) } });
+  }
+}
+
+// The six aiworkhub_manager_loop_* tools all answer {ok, ...}: start/rotate/
+// send's OWN reply is forwarded as-is (so a manager_turn_in_progress refusal
+// carries its reason code), and a status refresh always follows so the panel's
+// session/running state comes from one authoritative source regardless of
+// which of the four differently-shaped mutating replies just arrived.
+async function runManagerLoopAction(view, action, args) {
+  const tool = MANAGER_LOOP_TOOLS[action];
+  if (!tool) return;
+  try {
+    const client = getMcpClient();
+    view.bindClient(client);
+    const payload = await client.callTool(tool, args);
+    if (!view.stillBoundTo(client)) return;
+    view.postMessage({ type: OUTBOUND_TYPES.managerLoopAction, action, payload: sanitizeWebviewPayload(payload) });
+    await pushManagerLoopStatus(view);
+  } catch (err) {
+    view.postMessage({
+      type: OUTBOUND_TYPES.managerLoopAction,
+      action,
+      payload: { ok: false, error: sanitizeErrorMessage(err) },
+    });
+  }
+}
+
 async function pushSettings(view) {
   try {
     const options = arguments.length > 1 && arguments[1] ? arguments[1] : {};
@@ -10237,6 +10313,42 @@ function handleInboundMessage(view, message) {
       if (STORAGE_BATCH_ID_RE.test(batchId)) runRuntimePurge(view, batchId);
       break;
     }
+    case "managerLoopStart": {
+      const backendId = String(message.backendId || "");
+      if (!MANAGER_LOOP_BACKENDS.has(backendId)) {
+        view.postMessage({ type: OUTBOUND_TYPES.error, message: "invalid_backend_id" });
+        return;
+      }
+      const model = String(message.model || "").trim();
+      if (!model) {
+        view.postMessage({ type: OUTBOUND_TYPES.error, message: "invalid_model" });
+        return;
+      }
+      runManagerLoopAction(view, "start", { backend_id: backendId, model });
+      break;
+    }
+    case "managerLoopSend": {
+      const text = String(message.text || "");
+      if (!text.trim()) return;
+      runManagerLoopAction(view, "send", { text });
+      break;
+    }
+    case "managerLoopRotate":
+      runManagerLoopAction(view, "rotate", { reason: String(message.reason || "").slice(0, 1000) });
+      break;
+    case "managerLoopClose":
+      runManagerLoopAction(view, "close", {});
+      break;
+    case "managerLoopStatus":
+      pushManagerLoopStatus(view);
+      break;
+    case "managerLoopEvents": {
+      const sessionId = String(message.sessionId || "");
+      if (!MANAGER_SESSION_ID_RE.test(sessionId)) return;
+      const afterSeq = Number(message.afterSeq);
+      pushManagerLoopEvents(view, sessionId, Number.isFinite(afterSeq) && afterSeq >= 0 ? afterSeq : 0);
+      break;
+    }
     default:
       break;
   }
@@ -10770,6 +10882,12 @@ function getHtmlForWebview(webview, extensionUri) {
         <span class="header-insight-detail" id="header-roadmap-detail">No outcomes</span>
       </button>
 
+      <button class="header-insight-card" id="header-manager-chat" type="button" title="Open the Manager chat loop">
+        <span class="header-storage-label">Manager</span>
+        <strong id="header-manager-chat-value">—</strong>
+        <span class="header-insight-detail" id="header-manager-chat-detail">No session</span>
+      </button>
+
       <div class="header-insight-card" id="header-preflight" title="Unified repository, policy, Source Graph and provider preflight">
         <span class="header-storage-label">Preflight</span>
         <strong id="header-preflight-value">Checking</strong>
@@ -11248,6 +11366,42 @@ function getHtmlForWebview(webview, extensionUri) {
       <section class="needfix-detail" id="roadmap-detail-panel" aria-live="polite">
         <div class="panel-list-empty">Select a Roadmap outcome</div>
       </section>
+    </div>
+  </dialog>
+
+  <dialog class="diagnostic-dialog manager-chat-dialog" id="manager-chat-dialog">
+    <div class="manager-chat-frame">
+      <div class="dialog-heading">
+        <div><h2>Manager</h2><span id="manager-chat-summary">No active session</span></div>
+        <button type="button" class="dialog-close" data-close-dialog="manager-chat-dialog">Close</button>
+      </div>
+      <div class="needfix-toolbar">
+        <select id="manager-chat-backend" class="compact-select" aria-label="Manager backend">
+          <option value="claude_cli">claude_cli</option>
+          <option value="codex_cli">codex_cli</option>
+          <option value="opencode_cli">opencode_cli</option>
+        </select>
+        <input id="manager-chat-model" type="text" maxlength="200" placeholder="Model" aria-label="Manager model">
+        <button type="button" class="primary-button" id="manager-chat-start">Start</button>
+        <button type="button" id="manager-chat-rotate" disabled>Rotate</button>
+        <button type="button" id="manager-chat-close" disabled>Close</button>
+        <span class="connection-state" id="manager-chat-status" role="status" aria-live="polite">
+          <span class="connection-dot" aria-hidden="true"></span>
+          <span id="manager-chat-status-label">Idle</span>
+        </span>
+      </div>
+      <div class="manager-chat-session-line" id="manager-chat-session-line" hidden>
+        <span id="manager-chat-session-id"></span>
+        <span id="manager-chat-session-backend"></span>
+      </div>
+      <div class="manager-chat-transcript" id="manager-chat-transcript" aria-live="polite">
+        <div class="panel-list-empty compact" id="manager-chat-empty">Start a session to begin</div>
+      </div>
+      <div class="manager-chat-notice" id="manager-chat-notice" hidden></div>
+      <form class="manager-chat-composer" id="manager-chat-composer">
+        <textarea id="manager-chat-input" rows="2" placeholder="Message the manager" aria-label="Message the manager" disabled></textarea>
+        <button type="submit" class="primary-button" id="manager-chat-send" disabled>Send</button>
+      </form>
     </div>
   </dialog>
 

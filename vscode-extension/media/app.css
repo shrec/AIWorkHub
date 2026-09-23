@@ -3016,6 +3016,156 @@ tbody tr.is-selected td:first-child {
   color: var(--ink);
 }
 
+/* Manager chat: reuses .needfix-toolbar (controls row), .primary-button,
+   .compact-select, .connection-state/.connection-dot (running indicator),
+   .dialog-heading, .diagnostic-dialog and .panel-list-empty. Every colour
+   below is one of the existing custom properties declared at the top of this
+   file -- nothing new is introduced. */
+.manager-chat-frame {
+  display: flex;
+  height: 100%;
+  min-height: 0;
+  flex-direction: column;
+}
+
+.manager-chat-frame > .dialog-heading,
+.manager-chat-frame > .needfix-toolbar,
+.manager-chat-frame > .manager-chat-session-line,
+.manager-chat-frame > .manager-chat-notice,
+.manager-chat-frame > .manager-chat-composer {
+  flex: 0 0 auto;
+}
+
+.manager-chat-frame > .manager-chat-transcript {
+  flex: 1 1 auto;
+}
+
+#manager-chat-dialog .needfix-toolbar {
+  grid-template-columns: auto minmax(140px, 1fr) auto auto auto auto;
+}
+
+.manager-chat-session-line {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  padding: 6px 10px;
+  color: var(--muted);
+  font-size: var(--fs-2xs);
+  border-bottom: 1px solid var(--line);
+}
+
+.manager-chat-transcript {
+  contain: paint;
+  min-height: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+  padding: 10px;
+}
+
+.manager-chat-bubble {
+  max-width: 85%;
+  margin: 0 0 8px;
+  padding: 7px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface-subtle);
+  color: var(--ink);
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.manager-chat-bubble.role-user {
+  margin-left: auto;
+  background: var(--accent-soft);
+  border-color: var(--accent);
+}
+
+.manager-chat-bubble-label {
+  display: block;
+  margin-bottom: 3px;
+  color: var(--muted);
+  font-size: var(--fs-2xs);
+  font-weight: 600;
+}
+
+.manager-chat-tool-row {
+  margin-bottom: 8px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--surface-subtle);
+}
+
+.manager-chat-tool-row > summary {
+  padding: 6px 9px;
+  color: var(--ink-soft);
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: var(--fs-2xs);
+  cursor: pointer;
+}
+
+.manager-chat-tool-row-body {
+  margin: 0;
+  padding: 0 9px 8px;
+  color: var(--muted);
+  font-size: var(--fs-2xs);
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.manager-chat-marker {
+  margin: 6px 0;
+  color: var(--muted);
+  font-size: var(--fs-2xs);
+  text-align: center;
+}
+
+.manager-chat-error {
+  margin-bottom: 8px;
+  padding: 7px 10px;
+  border: 1px solid var(--blocked);
+  border-radius: 4px;
+  background: var(--blocked-soft);
+  color: var(--ink);
+  font-size: var(--fs-2xs);
+  overflow-wrap: anywhere;
+}
+
+.manager-chat-notice {
+  margin: 0 10px 8px;
+  padding: 6px 9px;
+  border: 1px solid var(--stale);
+  border-radius: 4px;
+  background: var(--stale-soft);
+  color: var(--ink);
+  font-size: var(--fs-2xs);
+}
+
+.manager-chat-composer {
+  display: flex;
+  gap: 8px;
+  padding: 8px 10px;
+  border-top: 1px solid var(--line);
+}
+
+.manager-chat-composer textarea {
+  box-sizing: border-box;
+  flex: 1 1 auto;
+  min-height: 46px;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  background: var(--surface-subtle);
+  color: var(--ink);
+  font: inherit;
+  resize: vertical;
+}
+
+.manager-chat-composer .primary-button {
+  flex: 0 0 auto;
+  align-self: flex-end;
+}
+
 @media (max-width: 820px) {
   .needfix-capture-form,
   .needfix-toolbar,
@@ -3226,6 +3376,14 @@ tbody tr.is-selected td:first-child {
   .settings-footnote { overflow-wrap: anywhere; }
   .settings-metric-grid,
   .settings-language-grid { grid-template-columns: 1fr; }
+  .diagnostic-dialog.manager-chat-dialog {
+    width: calc(100vw - 24px);
+    min-width: 0;
+    height: min(650px, calc(100vh - 24px));
+    max-height: calc(100vh - 24px);
+  }
+  #manager-chat-dialog .needfix-toolbar { grid-template-columns: 1fr 1fr; }
+  .manager-chat-bubble { max-width: 100%; }
 }
 
 .settings-group-heading {
