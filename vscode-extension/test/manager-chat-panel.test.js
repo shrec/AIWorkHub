@@ -456,6 +456,21 @@ test("polling requests the next batch using the after_seq of the last rendered e
   });
 });
 
+test("an events reply that overlaps one already rendered appends nothing twice", () => {
+  const harness = loadWebviewSlice();
+  harness.state.managerChatSession = "mls-aaaa1111bbbb2222";
+  const reply = {
+    ok: true,
+    events: [{ seq: 1, type: "user_message", turn: 1, payload: { text: "hello" } }],
+  };
+
+  harness.api.renderManagerChatEventsResponse(reply);
+  harness.api.renderManagerChatEventsResponse(reply);
+
+  assert.equal(harness.state.managerChatEvents.length, 1);
+  assert.equal(harness.elements.managerChatTranscript.children.length, 1);
+});
+
 test("a manager_turn_in_progress reply shows a notice and sends nothing else", () => {
   const harness = loadWebviewSlice();
 

@@ -7119,7 +7119,9 @@ function renderManagerChatEventsResponse(payload) {
   if (!payload || payload.ok === false) {
     showManagerChatNotice(payload && payload.error ? `Manager error: ${payload.error}` : "Manager events unavailable");
   } else {
-    const events = asArray(payload.events);
+    // Two events requests can be in flight with the same after_seq (the status
+    // reply and the poll timer); keep only events newer than the last one seen.
+    const events = asArray(payload.events).filter((event) => numberValue(event.seq) > state.managerChatLastSeq);
     if (events.length > 0) {
       state.managerChatEvents = state.managerChatEvents.concat(events);
       state.managerChatLastSeq = events.reduce((max, event) => Math.max(max, numberValue(event.seq)), state.managerChatLastSeq);
