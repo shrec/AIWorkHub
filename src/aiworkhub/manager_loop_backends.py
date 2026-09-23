@@ -70,8 +70,10 @@ _CONVERSATION_KEYS = ("session_id", "sessionID", "thread_id", "threadId", "conve
 # Claude's worker argv forbids session persistence, which is exactly what a
 # multi-turn manager conversation needs, so this one token is dropped.
 _CLAUDE_NO_PERSIST = "--no-session-persistence"
+# Codex's ``--ephemeral`` likewise keeps no session, so ``exec resume`` would
+# find nothing to resume (measured, Codex CLI 0.156.1).
 _DROPPED_TOKENS: Mapping[str, frozenset[str]] = MappingProxyType(
-    {"claude_cli": frozenset({_CLAUDE_NO_PERSIST})}
+    {"claude_cli": frozenset({_CLAUDE_NO_PERSIST}), "codex_cli": frozenset({"--ephemeral"})}
 )
 # Where each CLI's grammar allows its resume tokens: after the executable for
 # Claude, after the ``exec``/``run`` subcommand for Codex and OpenCode.
@@ -234,7 +236,26 @@ def resume_argv(backend_id: str, argv: Sequence[str], conversation_id: str) -> l
     if not conversation_id or backend_id not in _RESUME_GRAMMAR:
         return tokens
     index, flag = _RESUME_GRAMMAR[backend_id]
+    if backend_id == "codex_cli":
+        tokens = _codex_resume_options(tokens)
     return tokens[:index] + [flag, conversation_id] + tokens[index:]
+
+
+def _codex_resume_options(tokens: list[str]) -> list[str]:
+    """``codex exec resume`` refuses ``-s`` and ``-C`` (measured, 0.156.1):
+    the sandbox moves to its ``-c sandbox_mode=`` spelling, and ``-C`` is
+    dropped because the turn already runs with the plan's cwd."""
+
+    out: list[str] = []
+    rest = iter(tokens)
+    for token in rest:
+        if token == "-s":
+            out.extend(("-c", f'sandbox_mode="{next(rest, "")}"'))
+        elif token == "-C":
+            next(rest, None)
+        else:
+            out.append(token)
+    return out
 
 
 def _spawn_cli(argv: Sequence[str], cwd: str | None, stdin_text: str | None = None) -> Any:
@@ -466,6 +487,20 @@ class CliManagerBackend:
             )
 
 
+def cli_discovers_model(repo: Path | str, backend_id: str, model: str) -> bool:
+    """Whether the CLI itself offers ``model`` (see :mod:`cli_model_discovery`).
+
+    The Manager picker lists these discovered models, so a start the static
+    workforce registry does not declare is still a model the CLI can run.
+    """
+
+    if backend_id == "codex_cli":
+        return any(entry["model"] == model for entry in cli_model_discovery.codex_models())
+    if backend_id == "claude_cli":
+        return any(entry["model"] == model for entry in cli_model_discovery.claude_models(repo))
+    return False
+
+
 def manager_backend_factory(
     repo: Path | str,
     *,
@@ -486,7 +521,9 @@ def manager_backend_factory(
     def build(backend_id: str, model: str) -> CliManagerBackend:
         if backend_id not in MANAGER_BACKEND_IDS:
             raise ManagerLoopError(f"manager_backend_unsupported:{backend_id}")
-        if not declares_route(root, backend_id, model):
+        if not declares_route(root, backend_id, model) and not cli_discovers_model(
+            root, backend_id, model
+        ):
             raise ManagerLoopError(f"manager_backend_unavailable:{backend_id}:{model}")
         return CliManagerBackend(
             backend_id, model, root, mcp_config_path=mcp_config_path, **options

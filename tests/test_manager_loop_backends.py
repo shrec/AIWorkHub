@@ -558,3 +558,34 @@ def test_the_orchestrator_drives_the_cli_backend_end_to_end(tmp_path: Path):
     assert len(fake.argv_calls) == 3, "start, two turns and the handoff ran one CLI turn each"
     assert all(child.poll() is not None for child in fake.children), "no turn leaked a child"
     orchestrator.close()
+
+
+def test_the_factory_accepts_a_model_the_cli_itself_discovers(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(
+        mlb.cli_model_discovery,
+        "codex_models",
+        lambda: [{"model": "gpt-6-astra", "label": "GPT-6-Astra", "priority": 1}],
+    )
+    build = mlb.manager_backend_factory(tmp_path, declares_route=lambda *_a: False)
+
+    assert build("codex_cli", "gpt-6-astra").model == "gpt-6-astra"
+    assert build("claude_cli", "fable").model == "fable"
+    with pytest.raises(mlb.ManagerLoopError, match="manager_backend_unavailable:codex_cli:gpt-0"):
+        build("codex_cli", "gpt-0")
+
+
+def test_codex_resume_argv_uses_only_the_flags_exec_resume_accepts():
+    first = ["codex", "exec", "--json", "-s", "workspace-write", "-C", "D:\repo", "--model", "m", "-"]
+
+    assert mlb.resume_argv("codex_cli", first, "") == first
+    assert mlb.resume_argv("codex_cli", first, "tid-1") == [
+        "codex", "exec", "resume", "tid-1", "--json",
+        "-c", 'sandbox_mode="workspace-write"', "--model", "m", "-",
+    ]
+
+
+def test_a_codex_manager_turn_keeps_its_session_for_resume(tmp_path: Path):
+    backend = mlb.CliManagerBackend("codex_cli", "m", tmp_path)
+    plan = type("Plan", (), {"argv": ["codex", "exec", "--json", "--ephemeral", "-"]})()
+
+    assert "--ephemeral" not in backend.argv_for(plan)
