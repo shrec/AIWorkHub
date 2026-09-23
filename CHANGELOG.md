@@ -6,6 +6,18 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.65] - 2026-09-23
+
+### Fixed
+
+- The Manager panel's claude_cli session can use the AIWorkHub manager tools.
+  It was refused `aiworkhub_manager_bootstrap` ("permission denied: don't ask
+  mode") because the manager seat reused the worker's tool allowlist; it now
+  allows Read, Bash and the AIWorkHub MCP server and keeps the raw-discovery
+  and raw-editor denies (RM-2026-00067).
+- The Manager transcript no longer shows a message twice when the status reply
+  and the poll timer fetch the same events.
+
 ## [0.11.64] - 2026-09-23
 
 ### Added

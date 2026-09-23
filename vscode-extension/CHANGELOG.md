@@ -1,5 +1,12 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.65 — 2026-09-23
+
+### Fixed
+
+- Manager panel: the Claude session can call the AIWorkHub manager tools, and
+  a message is no longer shown twice in the transcript.
+
 ## 0.11.64 — 2026-09-23
 
 ### Added

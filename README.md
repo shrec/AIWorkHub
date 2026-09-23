@@ -62,6 +62,11 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
+## What's new in 0.11.65
+
+- The Manager panel's Claude session holds the AIWorkHub manager tools, so it
+  bootstraps and manages cards instead of stopping at a permission denial.
+
 ## What's new in 0.11.64
 
 - The Manager panel's loop runs in its own write- and launch-enabled MCP child,
