@@ -1400,6 +1400,17 @@ CLAUDE_WORKER_RAW_EDITOR_DENIES: tuple[str, ...] = (
     "NotebookEdit",
 )
 
+# The owner's host-side manager seat (build_manager_command) holds the
+# repository's AIWorkHub manager MCP server, registered as "AIWorkHub" in the
+# project .mcp.json; a server-name entry allows every tool on that server.
+# It keeps Read and Bash (reviews run the card's gates) and stays denied raw
+# discovery and the raw file editor, like a build worker.
+CLAUDE_MANAGER_ALLOWED_TOOLS: tuple[str, ...] = ("Read", "Bash", "mcp__AIWorkHub")
+CLAUDE_MANAGER_DISALLOWED_TOOLS: tuple[str, ...] = (
+    *CLAUDE_RAW_DISCOVERY_DENIES,
+    *CLAUDE_WORKER_RAW_EDITOR_DENIES,
+)
+
 
 def claude_allowed_tools(*, read_only: bool) -> tuple[str, ...]:
     """Tools this role can actually use -- never the union of every role.
@@ -1776,10 +1787,18 @@ def build_runtime_command(
             "--permission-mode",
             "dontAsk",
             "--allowedTools",
-            *claude_allowed_tools(read_only=read_only),
+            *(
+                CLAUDE_MANAGER_ALLOWED_TOOLS
+                if _manager_host
+                else claude_allowed_tools(read_only=read_only)
+            ),
             "--no-session-persistence",
             "--disallowedTools",
-            *claude_disallowed_tools(read_only=read_only),
+            *(
+                CLAUDE_MANAGER_DISALLOWED_TOOLS
+                if _manager_host
+                else claude_disallowed_tools(read_only=read_only)
+            ),
         ]
         # Partial-message mode emits a JSON event for nearly every provider
         # delta and can turn a small task into a multi-megabyte stdout log.

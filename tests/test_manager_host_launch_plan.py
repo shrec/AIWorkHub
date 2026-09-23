@@ -42,7 +42,9 @@ def test_manager_command_is_launchable_on_windows(tmp_path, monkeypatch):
     assert plan.argv
 
 
-def test_worker_and_manager_argv_are_equal_off_windows(tmp_path, monkeypatch):
+def test_manager_argv_differs_from_the_worker_only_in_its_tool_lists(
+    tmp_path, monkeypatch
+):
     monkeypatch.setattr(runtime_adapters, "_is_windows_host", lambda: False)
     # The same model on both sides: a manager plan that dropped it would differ.
     worker_plan = runtime_adapters.build_runtime_command(
@@ -60,7 +62,23 @@ def test_worker_and_manager_argv_are_equal_off_windows(tmp_path, monkeypatch):
         executable_overrides={"claude_cli": sys.executable},
     )
     assert "claude-opus-5" in manager_plan.argv
-    assert manager_plan.argv == worker_plan.argv
+    assert "mcp__AIWorkHub" in manager_plan.argv
+    assert not any(
+        token.startswith("mcp__aiworkhub_worker_ai_tools__")
+        for token in manager_plan.argv
+    )
+    assert "Grep" in manager_plan.argv
+    assert "Edit" in manager_plan.argv
+    assert "--permission-mode" in manager_plan.argv
+    assert "dontAsk" in manager_plan.argv
+    assert any(
+        token.startswith("mcp__aiworkhub_worker_ai_tools__")
+        for token in worker_plan.argv
+    )
+    assert "mcp__AIWorkHub" not in worker_plan.argv
+    manager_tools = manager_plan.argv.index("--allowedTools")
+    worker_tools = worker_plan.argv.index("--allowedTools")
+    assert manager_plan.argv[:manager_tools] == worker_plan.argv[:worker_tools]
     assert worker_plan.stdin_text == "p"
     assert manager_plan.stdin_text == "p"
 
