@@ -14,6 +14,10 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.11.66
+
+- Model lists follow the CLIs and show versions.
+
 ## What's new in 0.11.65
 
 - Manager panel: the Claude session now holds the AIWorkHub manager tools.

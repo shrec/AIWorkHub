@@ -1,5 +1,12 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.66 — 2026-09-23
+
+### Changed
+
+- Manager panel and model catalog: Codex and Claude model lists are
+  discovered from the CLIs themselves and show model versions.
+
 ## 0.11.65 — 2026-09-23
 
 ### Fixed

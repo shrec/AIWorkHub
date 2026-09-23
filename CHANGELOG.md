@@ -6,6 +6,22 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.66] - 2026-09-23
+
+### Changed
+
+- CLI model lists are discovered instead of hardcoded. Codex models come from
+  the Codex CLI's own model cache, so a model Codex adds appears by itself.
+  Claude models are the CLI's own aliases (opus, sonnet, haiku, fable),
+  labelled with the exact version each alias ran on last, while the alias
+  itself stays the launched value so a CLI update moves to the newest model
+  on its own. The Manager panel shows these labels (RM-2026-00067).
+
+### Fixed
+
+- The manager-loop gate tests no longer start a real manager CLI session when
+  the suite runs under a verified manager identity.
+
 ## [0.11.65] - 2026-09-23
 
 ### Fixed

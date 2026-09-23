@@ -62,6 +62,11 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
+## What's new in 0.11.66
+
+- Model lists follow the CLIs: Codex models come from Codex's own cache, and
+  Claude aliases show the exact version they run.
+
 ## What's new in 0.11.65
 
 - The Manager panel's Claude session holds the AIWorkHub manager tools, so it
