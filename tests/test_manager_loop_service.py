@@ -94,8 +94,16 @@ def _install_fakes(monkeypatch: Any) -> list[FakeManagerBackend]:
 
         return build
 
+    def no_wake_source(**_kwargs: Any) -> tuple[Callable[[], Any], Callable[[str, str], bool]]:
+        return (lambda: None, lambda batch_id, lease_id: True)
+
     monkeypatch.setattr(manager_loop_service, "ManagerOrchestrator", _FakeOrchestratorFactory)
     monkeypatch.setattr(manager_loop_service, "manager_backend_factory", factory)
+    # Every start() now also launches a wake consumer; keep it off the real
+    # callback outbox and fast so it never touches a database in a test.
+    monkeypatch.setattr(manager_loop_service, "default_callback_source", no_wake_source)
+    monkeypatch.setattr(manager_loop_service, "WAKE_IDLE_POLL_SECONDS", 0.05)
+    monkeypatch.setattr(manager_loop_service, "WAKE_RETRY_POLL_SECONDS", 0.05)
     return backends
 
 

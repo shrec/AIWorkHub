@@ -19,13 +19,18 @@ from __future__ import annotations
 import dataclasses
 import threading
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from .manager_loop import ManagerLoopError, ManagerOrchestrator
 from .manager_loop_backends import manager_backend_factory
+from . import manager_loop_wake
 
 _REGISTRY_LOCK = threading.Lock()
 _ENTRIES: dict[str, "_Entry"] = {}
+
+WAKE_IDLE_POLL_SECONDS = manager_loop_wake.DEFAULT_IDLE_POLL_SECONDS
+WAKE_RETRY_POLL_SECONDS = manager_loop_wake.DEFAULT_RETRY_POLL_SECONDS
+default_callback_source = manager_loop_wake.default_callback_source
 
 
 @dataclasses.dataclass
@@ -43,6 +48,9 @@ class _Entry:
     turn_lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
     thread: threading.Thread | None = None
     last_turn: dict[str, Any] | None = None
+    wake: manager_loop_wake.WakeConsumer | None = None
+    wake_lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
+    wake_cap_per_hour: int = manager_loop_wake.DEFAULT_CAP_PER_HOUR
 
 
 def _entry_for(repo: str | Path) -> _Entry:
@@ -103,6 +111,8 @@ def _dispatch_turn(
                 entry.last_turn = {"turn": turn, "ok": False, "errors": [detail], "reply": ""}
         finally:
             entry.turn_lock.release()
+            if entry.orchestrator.session is None:
+                _stop_wake(entry)
 
     thread = threading.Thread(target=run, daemon=True)
     entry.thread = thread
@@ -110,7 +120,13 @@ def _dispatch_turn(
     return {"ok": True, "session_id": session_id, "turn": turn, "state": "running"}
 
 
-def start(repo: str | Path, backend_id: str, model: str) -> dict[str, Any]:
+def start(
+    repo: str | Path,
+    backend_id: str,
+    model: str,
+    *,
+    wake_cap_per_hour: int = manager_loop_wake.DEFAULT_CAP_PER_HOUR,
+) -> dict[str, Any]:
     """Open the repository's one active session; synchronous, not backgrounded."""
 
     entry, err = _entry_or_error(repo)
@@ -124,6 +140,8 @@ def start(repo: str | Path, backend_id: str, model: str) -> dict[str, Any]:
         return _error(exc)
     finally:
         entry.turn_lock.release()
+    entry.wake_cap_per_hour = max(0, int(wake_cap_per_hour))
+    _ensure_wake_started(entry, repo)
     return {"ok": True, "session": session.to_json()}
 
 
@@ -161,6 +179,7 @@ def status(repo: str | Path) -> dict[str, Any]:
         "session": session.to_json() if session is not None else None,
         "running": entry.turn_lock.locked(),
         "last_turn": entry.last_turn,
+        "wake": _wake_status(entry),
     }
 
 
@@ -199,6 +218,7 @@ def close(repo: str | Path) -> dict[str, Any]:
         return _error(exc)
     finally:
         entry.turn_lock.release()
+    _stop_wake(entry)
     return {"ok": True}
 
 
@@ -216,3 +236,53 @@ def wait_for_idle(repo: str | Path, timeout: float | None = None) -> bool:
         return True
     thread.join(timeout)
     return not thread.is_alive()
+
+
+def _wake_dispatch(repo: str | Path, member: Mapping[str, Any]) -> bool:
+    """Start one callback's turn through the SAME non-blocking lock ``send`` uses."""
+
+    result = _dispatch_turn(
+        repo, lambda orchestrator: orchestrator.wake(member), record_last_turn=True
+    )
+    return bool(result.get("ok"))
+
+
+def _ensure_wake_started(entry: _Entry, repo: str | Path) -> None:
+    """Start this repository's one wake consumer; a second call is a no-op."""
+
+    with entry.wake_lock:
+        if entry.wake is None:
+            session_id = entry.orchestrator.session.session_id
+            claim, ack = default_callback_source(session_id=session_id)
+            entry.wake = manager_loop_wake.WakeConsumer(
+                claim=claim,
+                ack=ack,
+                dispatch=lambda member: _wake_dispatch(repo, member),
+                cap_per_hour=entry.wake_cap_per_hour,
+                idle_poll_seconds=WAKE_IDLE_POLL_SECONDS,
+                retry_poll_seconds=WAKE_RETRY_POLL_SECONDS,
+            )
+        wake = entry.wake
+    wake.start()
+
+
+def _stop_wake(entry: _Entry) -> None:
+    """Stop and forget this repository's wake consumer, if any."""
+
+    with entry.wake_lock:
+        wake, entry.wake = entry.wake, None
+    if wake is not None:
+        wake.stop()
+
+
+def _wake_status(entry: _Entry) -> dict[str, Any]:
+    with entry.wake_lock:
+        wake = entry.wake
+    if wake is None:
+        return {
+            "running": False,
+            "queued": 0,
+            "turns_this_hour": 0,
+            "cap": entry.wake_cap_per_hour,
+        }
+    return wake.status()
