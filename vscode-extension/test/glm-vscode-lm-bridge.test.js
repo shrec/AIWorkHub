@@ -3639,6 +3639,121 @@ async function nf202600229QualityReviewSubmitBoundaryChecks() {
   assert.strictEqual(nativeGlmAttempt, 2);
 }
 
+async function nf968InvalidJsonOneCorrectionChecks() {
+  const reviewRequest = (requestId) => ({
+    requestId,
+    request_kind: "quality_review",
+    prompt: "bounded review",
+    allowedWrites: [],
+    path_contracts: {},
+  });
+  const submitRequestText = () => JSON.stringify({
+    schema_id: internals.constants.VSCODE_LM_TOOL_REQUEST_SCHEMA,
+    name: "aiworkhub_worker_quality_review_submit",
+    input: { packet_sha256: "e".repeat(64), lens: "correctness", findings: [] },
+  });
+  const sealedReview = (submissionId) => ({
+    schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+    summary: `quality review submitted:${submissionId}`,
+    edits: [],
+    creates: [],
+  });
+  const lastUserText = (messages) => {
+    const last = messages[messages.length - 1];
+    return last && last.role === "user" && typeof last.content === "string" ? last.content : "";
+  };
+  const proseReply = (n) =>
+    `I'm a read-only quality reviewer for the correctness lens. Let me analyze the candidate code, attempt ${n}.`;
+
+  // NF-2026-00968: a prose-only reply with no JSON object at all gets one
+  // corrective turn restating the same envelope text this phase already
+  // uses below for a supported-transport violation; a valid submit on the
+  // next turn then completes normally.
+  let onceTurn = 0;
+  let onceSecondMessages = null;
+  const onceModel = {
+    capabilities: { toolCalling: false },
+    sendRequest: async (messages) => {
+      onceTurn += 1;
+      if (onceTurn === 1) {
+        return { stream: (async function* stream() { yield { value: proseReply(1) }; }()) };
+      }
+      onceSecondMessages = messages;
+      return { stream: (async function* stream() { yield { value: submitRequestText() }; }()) };
+    },
+  };
+  const onceResult = await internals.runVscodeLmTextProtocol(
+    onceModel,
+    reviewRequest("j".repeat(32)),
+    undefined,
+    async (call) => (call.name === "aiworkhub_worker_quality_review_submit"
+      ? { ok: true, durable: true, submission_id: "c".repeat(64) }
+      : { ok: true, content: "graph" }),
+  );
+  assert.deepStrictEqual(JSON.parse(onceResult), sealedReview("c".repeat(64)));
+  assert.strictEqual(onceTurn, 2);
+  const correctiveText = lastUserText(onceSecondMessages);
+  assert.ok(correctiveText.includes("not a supported transport envelope"));
+  assert.ok(correctiveText.includes(internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA));
+  assert.ok(correctiveText.includes(internals.constants.VSCODE_LM_TOOL_REQUEST_SCHEMA));
+
+  // A second consecutive invalid-JSON reply still fails exactly as before:
+  // one correction only, recorded in the turn trace, then the same
+  // structured vscode_lm_quality_review_submit_required failure and preview.
+  let twiceTurn = 0;
+  const twiceModel = {
+    capabilities: { toolCalling: false },
+    sendRequest: async () => {
+      twiceTurn += 1;
+      const value = proseReply(twiceTurn);
+      return { stream: (async function* stream() { yield { value }; }()) };
+    },
+  };
+  let twiceError = null;
+  try {
+    await internals.runVscodeLmTextProtocol(
+      twiceModel,
+      reviewRequest("k".repeat(32)),
+      undefined,
+      async () => ({ ok: true, content: "graph" }),
+    );
+  } catch (err) {
+    twiceError = err;
+  }
+  assert.ok(twiceError, "expected runVscodeLmTextProtocol to reject");
+  assert.ok(/vscode_lm_quality_review_submit_required/.test(String(twiceError.message)));
+  assert.ok(twiceError.protocolPreview && twiceError.protocolPreview.length > 0);
+  assert.ok(Array.isArray(twiceError.protocolTrace));
+  assert.strictEqual(
+    twiceError.protocolTrace.filter((entry) => entry.outcome === "invalid_json_corrected").length,
+    1,
+  );
+  assert.strictEqual(
+    twiceError.protocolTrace.filter((entry) => entry.outcome === "vscode_lm_text_protocol_invalid_json").length,
+    2,
+  );
+  assert.strictEqual(twiceTurn, 2);
+
+  // Ambiguous JSON is a different failure than "no JSON object at all", and
+  // this fix never touches the parser: two distinct final-shaped candidates
+  // with no single winner still throw the unrelated ambiguous_json error.
+  const ambiguousText = `First option ${JSON.stringify({
+    schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+    summary: "first candidate",
+    edits: [],
+    creates: [],
+  })} or second option ${JSON.stringify({
+    schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+    summary: "second candidate",
+    edits: [],
+    creates: [],
+  })}`;
+  assert.throws(
+    () => internals.parseVscodeLmJsonEnvelope(ambiguousText, { preferFinal: false }),
+    /vscode_lm_text_protocol_ambiguous_json/,
+  );
+}
+
 async function nf179ForcedStageRecoveryChecks() {
   const request = {
     requestId: "7".repeat(32),
@@ -5774,6 +5889,7 @@ async function main() {
   await nf202600229QualityReviewSubmitBoundaryChecks();
   await nf179ForcedStageRecoveryChecks();
   await nf723StagedFinalizationCompletenessChecks();
+  await nf968InvalidJsonOneCorrectionChecks();
 }
 async function cancellationToolBoundaryChecks() {
   const toolEnvelope = JSON.stringify({

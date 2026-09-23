@@ -5225,6 +5225,7 @@ async function runVscodeLmTextProtocol(
   let reviewSubmitForced = false;
   let reviewSubmitViolations = 0;
   let toolNotAllowedViolations = 0;
+  let invalidJsonCorrected = false;
   let forceStagedEdit = false;
   let stagedEditInstructionSent = false;
   let stagedEditMissingPathSent = "";
@@ -5382,11 +5383,21 @@ async function runVscodeLmTextProtocol(
       lastProtocolPreview = String((err && err.protocolPreview) || text || "");
       protocolTrace.push({ turn, phase: forceFinal ? "final" : "work", outcome: sanitizeErrorMessage(err) });
       if (request.request_kind === "quality_review") {
-        throw vscodeLmProtocolFailure(
-          "vscode_lm_quality_review_submit_required",
-          protocolTrace,
-          lastProtocolPreview,
-        );
+        // NF-2026-00968: a readable-prose reply with no JSON object at all
+        // gets one corrective turn restating the review-submit envelope;
+        // a second invalid-JSON reply in the same run still fails here.
+        const correctInvalidJson = !invalidJsonCorrected &&
+          String((err && err.message) || err) === "vscode_lm_text_protocol_invalid_json";
+        if (correctInvalidJson) {
+          invalidJsonCorrected = true;
+          protocolTrace.push({ turn, phase: "review_submit", outcome: "invalid_json_corrected" });
+        } else {
+          throw vscodeLmProtocolFailure(
+            "vscode_lm_quality_review_submit_required",
+            protocolTrace,
+            lastProtocolPreview,
+          );
+        }
       }
       messages.push(vscode.LanguageModelChatMessage.Assistant([languageModelTextPart(text)]));
       if (forceStagedEdit) {
