@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+
+import pytest
 
 from aiworkhub import cli_model_discovery
 
@@ -95,3 +98,57 @@ def test_claude_models_is_the_bare_alias_list_for_a_corrupt_resolutions_file(tmp
     models = cli_model_discovery.claude_models(tmp_path)
 
     assert models == [{"model": alias, "label": alias} for alias in cli_model_discovery.CLAUDE_CLI_ALIASES]
+
+
+def _symlink_or_skip(link: Path, target: Path) -> None:
+    """Point ``link`` at ``target``, or skip naming why this host cannot.
+
+    Creating a symlink needs SeCreateSymbolicLinkPrivilege (or developer mode) on
+    Windows, and this host does not hold it (NF-2026-00971). That is a fact about
+    the host and not about the guard under test, so the case is skipped with the
+    reason on record and never reported as a failure.
+    """
+
+    try:
+        os.symlink(target, link)
+    except (OSError, NotImplementedError) as error:
+        pytest.skip(
+            "host cannot create a symlink "
+            f"(SeCreateSymbolicLinkPrivilege not held, NF-2026-00971): {error}"
+        )
+
+
+def test_codex_models_is_empty_for_a_symlinked_cache(tmp_path: Path):
+    # The cache sits in a directory the user controls, so without the guard a
+    # link there would redirect this read to any file the process can open.
+    real_home = tmp_path / "real-codex-home"
+    _write_cache(real_home, {"models": [{"slug": "gpt-6-astra", "visibility": "list"}]})
+    linked_home = tmp_path / "linked-codex-home"
+    linked_home.mkdir()
+    _symlink_or_skip(linked_home / "models_cache.json", real_home / "models_cache.json")
+
+    # The link's target is a perfectly good cache, so an empty answer through the
+    # link can only be the guard refusing it.
+    assert [entry["model"] for entry in cli_model_discovery.codex_models(home=real_home)] == [
+        "gpt-6-astra"
+    ]
+    assert cli_model_discovery.codex_models(home=linked_home) == []
+
+
+def test_claude_models_is_the_bare_alias_list_for_a_symlinked_resolutions_file(tmp_path: Path):
+    real_repo = tmp_path / "real-repo"
+    cli_model_discovery.record_claude_resolution(real_repo, "opus", "claude-opus-5")
+    linked_repo = tmp_path / "linked-repo"
+    # Both paths come from the module rather than being spelled out here, so
+    # this cannot pass vacuously against a directory the reader never looks in.
+    link = cli_model_discovery._resolutions_path(linked_repo)
+    link.parent.mkdir(parents=True)
+    _symlink_or_skip(link, cli_model_discovery._resolutions_path(real_repo))
+
+    # The target is a real resolutions file, so the bare aliases below can only
+    # be the guard refusing the link.
+    resolved = {entry["model"]: entry["label"] for entry in cli_model_discovery.claude_models(real_repo)}
+    assert resolved["opus"] == "claude-opus-5 (opus)"
+    assert cli_model_discovery.claude_models(linked_repo) == [
+        {"model": alias, "label": alias} for alias in cli_model_discovery.CLAUDE_CLI_ALIASES
+    ]

@@ -19,6 +19,11 @@ if str(_SRC) not in sys.path:
 
 from aiworkhub import core, dashboard, dashboard_mcp_app, task_store  # noqa: E402
 
+# The autouse fixture below stubs ``codex_models`` for every test; a case that
+# reads a real cache file opts back in with this reference, taken at import
+# before any fixture has run.
+_REAL_CODEX_MODELS = dashboard_mcp_app.cli_model_discovery.codex_models
+
 
 FAKE_SNAPSHOT: dict[str, Any] = {
     "schema_version": 1,
@@ -1177,6 +1182,13 @@ def test_codex_cli_discovered_rows_enrich_and_add_without_duplicating(monkeypatc
     assert astra["discovered_from_cli"] is True
     assert astra["label"] == "GPT-6 Astra"
     assert astra["effective_enabled"] is True
+    # Both listed identities are counted as this source's own -- the one that
+    # enriched a configured row and the one that was added -- and nothing was cut.
+    assert catalog["codex_discovered_model_count"] == 2
+    assert catalog["claude_discovered_model_count"] == 0
+    assert catalog["discovered_model_count"] == 2
+    assert catalog["codex_source"]["total"] == catalog["codex_source"]["returned"] == 2
+    assert catalog["codex_source"]["truncated"] is False
 
 
 def test_claude_cli_alias_rows_are_labelled_and_governed_by_policy(monkeypatch):
@@ -1219,6 +1231,249 @@ def test_claude_cli_alias_rows_are_labelled_and_governed_by_policy(monkeypatch):
     fable = next(row for row in workers if row["model"] == "fable")
     assert fable["inventory_only"] is True
     assert fable["effective_enabled"] is False, "the model-policy toggle still governs a discovered row"
+    # The four aliases can never reach the source bound, but the list is still an
+    # ingestion source and reports its own count and truth like the others.
+    assert catalog["claude_discovered_model_count"] == 4
+    assert catalog["codex_discovered_model_count"] == 0
+    claude_source = catalog["claude_source"]
+    assert claude_source["total"] == claude_source["returned"] == 4
+    assert claude_source["truncated"] is False
+    assert claude_source["total_is_lower_bound"] is False
+    assert claude_source["ingestion_loss"] == []
+
+
+def _codex_cache_models(count: int, *, display_names: bool = False) -> list[dict[str, Any]]:
+    """``count`` listed Codex CLI cache entries, in the order the cache lists them.
+
+    Minimal by default -- a slug and its visibility -- because the byte cap on
+    reading the cache is what a very large one runs into. ``display_names`` adds
+    the label a discovered row is drawn with.
+    """
+
+    models: list[dict[str, Any]] = []
+    for index in range(count):
+        entry: dict[str, Any] = {"slug": f"codex-{index:05d}", "visibility": "list"}
+        if display_names:
+            entry["display_name"] = f"Codex Model {index}"
+            entry["priority"] = index
+        models.append(entry)
+    return models
+
+
+def _use_codex_cache(monkeypatch, home: Path, models: list[dict[str, Any]]) -> Path:
+    """Write a real ``models_cache.json`` and point discovery at it.
+
+    The reader is the real one on purpose. The autouse fixture stubs it out for
+    every other test, and what these cases assert is the whole path from a file
+    the CLI wrote to the payload -- including the byte cap it is read under.
+    """
+
+    home.mkdir(parents=True, exist_ok=True)
+    cache = home / "models_cache.json"
+    cache.write_text(json.dumps({"models": models}, separators=(",", ":")), encoding="utf-8")
+    monkeypatch.setattr(
+        dashboard_mcp_app.cli_model_discovery,
+        "codex_models",
+        lambda **_kwargs: _REAL_CODEX_MODELS(home=home),
+    )
+    return cache
+
+
+@pytest.mark.parametrize(
+    "cache_rows",
+    [
+        pytest.param(dashboard_mcp_app.MAX_MODEL_POLICY_SOURCE_ROWS + 1, id="one-past-the-cap"),
+        # Tens of thousands of minimal entries fit under the cache's byte cap, and
+        # used to become tens of thousands of rows in the payload.
+        pytest.param(40_000, id="byte-cap-scale"),
+    ],
+)
+def test_codex_cache_past_the_source_cap_is_bounded_and_says_so(
+    monkeypatch, tmp_path, cache_rows
+):
+    # ``codex_models`` returns every listed model in a cache the CLI wrote, and
+    # the only ceiling on that file was its byte cap. Ingested as it arrived the
+    # file sized the payload and published no truncation; it now goes through the
+    # same bound the other discovery sources do.
+    limit = dashboard_mcp_app.MAX_MODEL_POLICY_SOURCE_ROWS
+    dropped = cache_rows - limit
+    monkeypatch.setattr(
+        dashboard_mcp_app.model_settings, "load", lambda _root: _fake_model_settings()
+    )
+    _stub_model_policy_sources(monkeypatch, catalog_rows=[])
+    cache = _use_codex_cache(monkeypatch, tmp_path, _codex_cache_models(cache_rows))
+    # A cache past the byte cap reads as no rows at all, which would pass every
+    # assertion below for the wrong reason.
+    assert cache.stat().st_size <= dashboard_mcp_app.cli_model_discovery._MAX_CACHE_BYTES
+
+    catalog = dashboard_mcp_app._model_policy_view(Path("/repo"))["catalog"]
+    source = catalog["codex_source"]
+
+    # The row count is capped at the declared source bound, which nothing raised
+    # or bypassed: the cache's size never reaches the payload.
+    assert catalog["worker_count"] == limit
+    assert catalog["inventory_only_model_count"] == limit
+    assert (
+        catalog["returned_worker_count"]
+        <= dashboard_mcp_app.MAX_MODEL_POLICY_CATALOG_ROWS
+    )
+    # The per-source discovered count describes the identities that became rows,
+    # and the source's own total is the separate number beside it -- the two used
+    # to be one figure, which is how the loss stayed invisible.
+    assert catalog["codex_discovered_model_count"] == limit
+    assert catalog["claude_discovered_model_count"] == 0
+    assert catalog["discovered_model_count"] == limit
+    # And the cap is stated rather than silent.
+    assert source["total"] == cache_rows
+    assert source["delivered"] == cache_rows
+    assert source["returned"] == limit
+    assert source["truncated"] is True
+    # The cache is read whole or not at all, so nothing above the bound cut it:
+    # the total is a measurement and not a floor.
+    assert source["total_is_lower_bound"] is False
+    assert source["upstream_refused"] == 0
+    assert source["row_limit"] == limit
+    assert source["row_limit_honoured"] == limit
+    assert (
+        source["row_limit_ceiling"]
+        == dashboard_mcp_app.MAX_MODEL_POLICY_SOURCE_ROW_CEILING
+    )
+    assert source["pinned_routes_refused"] == 0
+    assert source["ingestion_loss"] == [
+        {
+            "provider": "openai",
+            "total": cache_rows,
+            "ingested": limit,
+            "dropped": dropped,
+            # No other source describes these routes, so every refusal is also a
+            # row the tree is missing, and no producer above the bound cut any.
+            "absent_routes": dropped,
+            "upstream_absent_routes": 0,
+            "vendor_providers": ["openai"],
+        }
+    ]
+    # The configured catalog lost nothing, so the CLI's loss is reported under
+    # its own source and never filed under the catalog's.
+    assert catalog["source_ingestion_loss"] == []
+    # What the bound cost is folded into the provider's own size, so the tree
+    # cannot draw a truncated provider as complete.
+    counts = {entry["provider"]: entry for entry in catalog["provider_counts"]}
+    assert counts["openai"]["total"] == cache_rows
+    assert counts["openai"]["ingested"] == limit
+    assert counts["openai"]["truncated"] is True
+    assert catalog["truncated"] is True
+
+
+def test_codex_cache_at_the_source_cap_is_not_reported_as_truncated(monkeypatch, tmp_path):
+    # The control for the test above: the bound may say so only when it cut
+    # something, and a cache exactly the size of the cap loses nothing.
+    limit = dashboard_mcp_app.MAX_MODEL_POLICY_SOURCE_ROWS
+    monkeypatch.setattr(
+        dashboard_mcp_app.model_settings, "load", lambda _root: _fake_model_settings()
+    )
+    _stub_model_policy_sources(monkeypatch, catalog_rows=[])
+    _use_codex_cache(monkeypatch, tmp_path, _codex_cache_models(limit))
+
+    catalog = dashboard_mcp_app._model_policy_view(Path("/repo"))["catalog"]
+    source = catalog["codex_source"]
+    counts = {entry["provider"]: entry for entry in catalog["provider_counts"]}
+
+    assert catalog["worker_count"] == limit
+    assert source["total"] == source["returned"] == limit
+    assert source["truncated"] is False
+    assert source["ingestion_loss"] == []
+    assert counts["openai"]["total"] == counts["openai"]["ingested"] == limit
+
+
+@pytest.mark.parametrize("owner_decision", [True, False])
+def test_explicit_codex_route_past_the_source_cap_is_still_ingested(
+    monkeypatch, tmp_path, owner_decision
+):
+    # A named decision must outrank its own position in the CLI's list, or the
+    # bound reintroduces the defect every other discovery source was fixed for:
+    # a route the owner configured, with no control left to switch it back.
+    limit = dashboard_mcp_app.MAX_MODEL_POLICY_SOURCE_ROWS
+    cache_rows = limit + 88
+    pinned = f"codex-{cache_rows - 1:05d}"
+    neighbour = f"codex-{cache_rows - 2:05d}"
+    monkeypatch.setattr(
+        dashboard_mcp_app.model_settings,
+        "load",
+        lambda _root: _fake_model_settings(
+            {"openai": {"codex_cli": {pinned: owner_decision}}}
+        ),
+    )
+    _stub_model_policy_sources(monkeypatch, catalog_rows=[])
+    _use_codex_cache(
+        monkeypatch, tmp_path, _codex_cache_models(cache_rows, display_names=True)
+    )
+
+    catalog = dashboard_mcp_app._model_policy_view(Path("/repo"))["catalog"]
+    models = {row["model"] for row in catalog["workers"]}
+    source = catalog["codex_source"]
+
+    assert pinned in models
+    # Its unconfigured neighbour, one place earlier in the list, did not survive
+    # the bound -- so it was the pin that carried the route, not a widened cap.
+    assert neighbour not in models
+    assert source["returned"] == limit
+    assert source["row_limit_honoured"] == limit
+    assert source["pinned_routes_refused"] == 0
+    assert source["ingestion_loss"][0]["dropped"] == cache_rows - limit
+    row = next(row for row in catalog["workers"] if row["model"] == pinned)
+    # Drawn with a live control, the label the CLI gave it and the decision the
+    # launcher will apply -- the toggle on a discovered row is unchanged.
+    assert row["provider"] == "openai"
+    assert row["adapter"] == "codex_cli"
+    assert row["inventory_only"] is True
+    assert row["discovered_from_cli"] is True
+    assert row["label"] == f"Codex Model {cache_rows - 1}"
+    assert row["catalog_enabled"] is True
+    assert row["effective_enabled"] is owner_decision
+
+
+def test_codex_route_the_source_ceiling_refuses_is_still_drawn_as_discovered(
+    monkeypatch, tmp_path
+):
+    # The ceiling is the number a declaration cannot lift the bound past. With it
+    # lowered to three, five explicitly configured Codex routes cannot all be
+    # ingested and two are refused -- but a refusal is not an absence. The CLI did
+    # list them, so they come back from their declaration as discovered routes
+    # whose source was cut, never as ``declared_only``, which would claim that no
+    # source offered them.
+    monkeypatch.setattr(dashboard_mcp_app, "MAX_MODEL_POLICY_SOURCE_ROW_CEILING", 3)
+    pins = {
+        "openai": {
+            "codex_cli": {f"codex-{index:05d}": True for index in range(5, 10)}
+        }
+    }
+    monkeypatch.setattr(
+        dashboard_mcp_app.model_settings,
+        "load",
+        lambda _root: _fake_model_settings(pins),
+    )
+    _stub_model_policy_sources(monkeypatch, catalog_rows=[])
+    _use_codex_cache(
+        monkeypatch, tmp_path, _codex_cache_models(10, display_names=True)
+    )
+
+    catalog = dashboard_mcp_app._model_policy_view(Path("/repo"))["catalog"]
+    rows = {row["model"]: row for row in catalog["workers"]}
+    source = catalog["codex_source"]
+
+    # The premise, asserted rather than assumed: the ceiling really did refuse
+    # two of the five pins, and the honoured bound is the ceiling itself.
+    assert source["row_limit_ceiling"] == 3
+    assert source["row_limit_honoured"] == 3
+    assert source["returned"] == 3
+    assert source["pinned_routes_refused"] == 2
+    for model in ("codex-00008", "codex-00009"):
+        assert rows[model]["discovered_from_cli"] is True
+        assert rows[model]["source_truncated"] is True
+        assert "declared_only" not in rows[model]
+        assert rows[model]["effective_enabled"] is True
+    assert catalog["source_truncated_model_count"] == 2
+    assert catalog["declared_only_model_count"] == 0
 
 
 @pytest.mark.parametrize(

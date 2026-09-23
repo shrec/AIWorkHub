@@ -1033,6 +1033,84 @@ def _bounded_observed_models(
     )
 
 
+def _bounded_cli_models(
+    listing: list[dict[str, Any]],
+    *,
+    vendor: str,
+    adapter: str,
+    limit: int,
+    ceiling: int,
+    pinned: set[tuple[str, str, str]],
+) -> dict[str, Any]:
+    """Bound one CLI-owned model list the way the other discovery sources are.
+
+    ``cli_model_discovery.codex_models`` hands over every model the Codex CLI
+    lists in a cache file it wrote itself, and the only ceiling on that list is
+    the byte cap on reading the file: a couple of megabytes of minimal entries
+    is tens of thousands of rows. Ingested as it arrived, that file sized the
+    payload -- with no dropped route, no truncation flag and no slot held for a
+    route the owner had explicitly configured, which then had no control to
+    switch it back.
+
+    Every identity here is one ``vendor``/``adapter`` route, so vendor fairness
+    has a single group to be fair between and the bound's real work is the
+    editor bridge's: reserving pinned routes and stating the count. It is the
+    same ``_bounded_identity_ingestion`` at the same limit and ceiling, not a
+    second accounting scheme.
+
+    Unlike the OpenCode probe and the editor bridge, no producer cap sits above
+    this list -- the cache is read whole or not at all -- so the total is a
+    measurement and ``total_is_lower_bound`` is always False.
+
+    The shared ingestion carries identities only, and a discovered row is drawn
+    with its display label, so the ingested identities' labels are returned
+    beside the result under ``labels``. An identity the CLI lists twice is one
+    route and takes one slot; its first listing names it.
+    """
+
+    entries: list[tuple[str, str]] = []
+    labels: dict[str, str] = {}
+    for item in listing:
+        model = str(item.get("model") or "")[:128]
+        if not model or model in labels:
+            continue
+        labels[model] = str(item.get("label") or model)[:128]
+        entries.append((model, vendor))
+    source = _bounded_identity_ingestion(
+        entries,
+        adapter=adapter,
+        limit=limit,
+        ceiling=ceiling,
+        pinned=pinned,
+    )
+    source["labels"] = {model: labels[model] for model in source["identities"]}
+    return source
+
+
+def _cli_source_view(source: Mapping[str, Any]) -> dict[str, Any]:
+    """One bounded CLI source as the payload publishes it, keyed like its siblings.
+
+    ``opencode_source`` and ``editor_source`` share this shape, so a reader can
+    walk every discovery source alike. ``upstream_ceiling`` is None because no
+    producer cap sits above a CLI list.
+    """
+
+    return {
+        "total": source["total"],
+        "delivered": source["delivered"],
+        "upstream_refused": source["upstream_refused"],
+        "upstream_ceiling": None,
+        "returned": source["returned"],
+        "truncated": source["truncated"] or source["total_is_lower_bound"],
+        "total_is_lower_bound": source["total_is_lower_bound"],
+        "row_limit": MAX_MODEL_POLICY_SOURCE_ROWS,
+        "row_limit_honoured": source["row_limit_honoured"],
+        "row_limit_ceiling": MAX_MODEL_POLICY_SOURCE_ROW_CEILING,
+        "pinned_routes_refused": source["pinned_routes_refused"],
+        "ingestion_loss": source["ingestion_loss"],
+    }
+
+
 def _bounded_catalog_rows(
     workers: list[dict[str, Any]],
     *,
@@ -1473,26 +1551,43 @@ def _model_policy_view(
                 "discovered_from_opencode": True,
             }
         )
-    # CLI-owned model lists (see cli_model_discovery): a discovered model that
-    # a declared row already names only labels that row.
-    cli_discovered = (
-        ("openai", "codex_cli", cli_model_discovery.codex_models()),
-        ("anthropic", "claude_cli", cli_model_discovery.claude_models(root)),
-    )
-    for vendor, cli_adapter, entries in cli_discovered:
+    # CLI-owned model lists (see cli_model_discovery) are ingestion sources like
+    # the three above and get the same pin-aware bound. ``codex_models`` returns
+    # every model in a cache file the CLI wrote, and the only ceiling on that is
+    # the byte cap on reading it -- tens of thousands of minimal entries -- so
+    # ingested unbounded the file sized the payload and a truncation could not
+    # be stated. Each list counts its own discovered identities and publishes its
+    # own source truth like its siblings; ``claude_models`` is always the four
+    # aliases and can never bind, but is counted and reported the same way.
+    #
+    # A discovered model that a declared row already names only labels that row.
+    cli_sources: dict[str, dict[str, Any]] = {}
+    cli_discovered_counts = {"codex": 0, "claude": 0}
+    for source_name, vendor, cli_adapter, listing in (
+        ("codex", "openai", "codex_cli", cli_model_discovery.codex_models()),
+        ("claude", "anthropic", "claude_cli", cli_model_discovery.claude_models(root)),
+    ):
         cli_provider, route_adapter = workforce_catalog.policy_route_identity(vendor, cli_adapter)
-        for entry in entries:
-            model = str(entry.get("model") or "")[:128]
-            if not model:
-                continue
-            label = str(entry.get("label") or model)[:128]
+        cli_source = _bounded_cli_models(
+            listing,
+            vendor=vendor,
+            adapter=cli_adapter,
+            limit=MAX_MODEL_POLICY_SOURCE_ROWS,
+            ceiling=MAX_MODEL_POLICY_SOURCE_ROW_CEILING,
+            pinned=pinned_routes,
+        )
+        cli_sources[source_name] = cli_source
+        for model in cli_source["identities"]:
+            label = cli_source["labels"][model]
             key = (cli_provider, route_adapter, model)
+            cli_discovered_counts[source_name] += 1
             discovered_count += 1
             if key in existing:
                 for worker in workers:
                     if (worker["provider"], worker["adapter"], worker["model"]) == key:
                         worker["discovered_from_cli"] = True
                         worker["label"] = label
+                        break
                 continue
             inventory_only_count += 1
             existing.add(key)
@@ -1518,12 +1613,14 @@ def _model_policy_view(
                     "label": label,
                 }
             )
-    # Every ingestion source above can arrive already truncated, and none of
-    # them says so on its own. ``parse_opencode_models_output`` stops at its own
+    # Both discovery probes above can arrive already truncated, and neither
+    # says so on its own. ``parse_opencode_models_output`` stops at its own
     # 64-row cap before ``opencode_identities_from_preflight`` returns, and the
     # editor bridge head-slices ``observed_models`` at 128 -- both before this
     # module reads a single identity, so MAX_MODEL_POLICY_SOURCE_ROWS cannot
-    # bind on a discovery source and the pin reservation has nothing to reserve.
+    # bind on either and the pin reservation has nothing to reserve. The CLI
+    # lists have no producer cap above them, so their own bound is the one that
+    # binds and their loss is stated by it.
     # A route the owner explicitly named can therefore be absent from every list
     # this view can see, and an absent route has no checkbox to switch it on.
     #
@@ -1564,6 +1661,11 @@ def _model_policy_view(
         refused_probe.setdefault(dropped_key, "editor")
     for dropped_key in opencode_source["dropped_routes"]:
         refused_probe.setdefault(dropped_key, "opencode")
+    # A route the CLI's own list offered and its bound refused is a discovered
+    # one too, and would otherwise be rebuilt below as ``declared_only``.
+    for cli_source in cli_sources.values():
+        for dropped_key in cli_source["dropped_routes"]:
+            refused_probe.setdefault(dropped_key, "cli")
     declared_only_count = 0
     source_truncated_count = 0
     # A producer that cut and cannot say by how much makes "absent from what
@@ -1667,9 +1769,11 @@ def _model_policy_view(
                 "source_truncated": True,
             }
             probe_row[
-                "discovered_from_opencode"
-                if probe == "opencode"
-                else "discovered_from_editor"
+                {
+                    "editor": "discovered_from_editor",
+                    "opencode": "discovered_from_opencode",
+                    "cli": "discovered_from_cli",
+                }[probe]
             ] = True
             inventory_only_count += 1
             source_truncated_count += 1
@@ -1725,7 +1829,7 @@ def _model_policy_view(
         )
     )
     total_rows = len(workers)
-    # All three ingestion sources are bounded before the render bound sees a
+    # Every ingestion source is bounded before the render bound sees a
     # single row, so a provider's own size is what survived plus what those caps
     # cost it. That second part is a count of *distinct launch routes*, never a
     # sum of each source's raw drop count: the configured catalog and the
@@ -1758,6 +1862,16 @@ def _model_policy_view(
                 opencode_source["dropped_routes"],
                 opencode_source["ingestion_loss"],
                 set(opencode_source["upstream_dropped_routes"]),
+            ),
+            # The CLI-owned lists have no producer above them either, so their
+            # upstream sets are empty rather than absent.
+            *(
+                (
+                    cli_source["dropped_routes"],
+                    cli_source["ingestion_loss"],
+                    set(cli_source["upstream_dropped_routes"]),
+                )
+                for cli_source in cli_sources.values()
             ),
         ],
         rendered_routes=rendered_routes,
@@ -1799,6 +1913,12 @@ def _model_policy_view(
             "configured_worker_count": len(source_rows),
             "discovered_model_count": discovered_count,
             "opencode_discovered_model_count": opencode_discovered_count,
+            # The CLI-owned lists count their own discovered identities the same
+            # way. The aggregate above cannot say which source a row came from,
+            # and neither figure is the source's total -- that, and what its
+            # bound refused, is ``codex_source`` / ``claude_source`` below.
+            "codex_discovered_model_count": cli_discovered_counts["codex"],
+            "claude_discovered_model_count": cli_discovered_counts["claude"],
             "inventory_only_model_count": inventory_only_count,
             # The subset of those inventory-only rows that no source observed:
             # routes built from the owner's declaration because every discovery
@@ -1934,6 +2054,18 @@ def _model_policy_view(
                 "pinned_routes_refused": editor_source["pinned_routes_refused"],
                 "ingestion_loss": editor_source["ingestion_loss"],
             },
+            # The CLI-owned model lists are the last two ingestion sources and
+            # report the same way for the same reason: the discovered counts
+            # above are of identities that became rows, so a cache listing more
+            # models than the bound admits had no way to say so.
+            #
+            # Neither has a producer cap above it -- the Codex cache is read
+            # whole or not at all, and the Claude list is always its four
+            # aliases -- so ``total`` is a measurement and not a floor,
+            # ``total_is_lower_bound`` stays False and ``upstream_ceiling`` has
+            # no number to carry.
+            "codex_source": _cli_source_view(cli_sources["codex"]),
+            "claude_source": _cli_source_view(cli_sources["claude"]),
             # The owner's own declarations are bounded too. models.json is read
             # up to declared_leaf_limit, and a file larger than that has leaves
             # this view never saw -- so it also has pins it never reserved. That
@@ -1942,8 +2074,8 @@ def _model_policy_view(
             "declared_leaf_count": declared_leaf_total,
             "declared_leaf_limit": MAX_MODEL_POLICY_DECLARED_LEAVES,
             "declared_leaves_truncated": declared_leaves_truncated,
-            # Rows were lost to the render bound or to any of the three
-            # ingestion caps before it, models.json itself was read short, or a
+            # Rows were lost to the render bound or to any of the ingestion
+            # caps before it, models.json itself was read short, or a
             # producer cut above this module without saying by how much; any of
             # them means the row list is not the whole catalog.
             "truncated": len(workers) < total_rows
