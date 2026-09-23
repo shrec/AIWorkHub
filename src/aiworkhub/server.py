@@ -1757,7 +1757,9 @@ def aiworkhub_manager_skill_retirement_report(
     return manager_skill_tools.retirement_report(min_anchors=min_anchors)
 
 
-def _manager_loop_repo_root() -> tuple[Path | None, dict[str, Any] | None]:
+def _manager_loop_repo_root(
+    *, launching: bool = False
+) -> tuple[Path | None, dict[str, Any] | None]:
     """The manager route gate every manager loop tool below shares.
 
     ``core.manager_bootstrap()`` is the route gate for every manager AI/
@@ -1767,6 +1769,10 @@ def _manager_loop_repo_root() -> tuple[Path | None, dict[str, Any] | None]:
     carrying a non-empty session identity -- so a worker or unverified route,
     or a manager route missing its session id, is refused here before
     ``manager_loop_service`` ever sees it.
+
+    ``launching`` tools (start/send/rotate) spawn the host CLI and write the
+    loop's context, so they also need both process gates -- checked after the
+    identity, so an unverified caller learns nothing about them.
     """
 
     route = core.manager_bootstrap()
@@ -1780,6 +1786,10 @@ def _manager_loop_repo_root() -> tuple[Path | None, dict[str, Any] | None]:
     session_id = str(identity.get("thread_id") or identity.get("session_id") or "").strip()
     if not session_id:
         return None, {"ok": False, "error": "manager_session_identity_missing"}
+    if launching and os.environ.get("AIWORKHUB_ALLOW_LAUNCH") != "1":
+        return None, {"ok": False, "error": "launch_gate_closed"}
+    if launching and not core.writes_allowed():
+        return None, {"ok": False, "error": "write_gate_closed"}
     return Path(str(route.get("repo") or core.repo_root())).resolve(), None
 
 
@@ -1787,13 +1797,9 @@ def _manager_loop_repo_root() -> tuple[Path | None, dict[str, Any] | None]:
 def aiworkhub_manager_loop_start(backend_id: str, model: str) -> dict[str, Any]:
     """MANAGER WRITE: open the repository's one manager agent loop session."""
 
-    root, refusal = _manager_loop_repo_root()
+    root, refusal = _manager_loop_repo_root(launching=True)
     if refusal is not None:
         return refusal
-    if os.environ.get("AIWORKHUB_ALLOW_LAUNCH") != "1":
-        return {"ok": False, "error": "launch_gate_closed"}
-    if not core.writes_allowed():
-        return {"ok": False, "error": "write_gate_closed"}
     return manager_loop_service.start(root, backend_id, model)
 
 
@@ -1807,13 +1813,9 @@ def aiworkhub_manager_loop_send(text: str) -> dict[str, Any]:
     ``aiworkhub_manager_loop_events`` for the outcome.
     """
 
-    root, refusal = _manager_loop_repo_root()
+    root, refusal = _manager_loop_repo_root(launching=True)
     if refusal is not None:
         return refusal
-    if os.environ.get("AIWORKHUB_ALLOW_LAUNCH") != "1":
-        return {"ok": False, "error": "launch_gate_closed"}
-    if not core.writes_allowed():
-        return {"ok": False, "error": "write_gate_closed"}
     return manager_loop_service.send(root, text)
 
 
@@ -1827,13 +1829,9 @@ def aiworkhub_manager_loop_rotate(reason: str) -> dict[str, Any]:
     rehydrated from the handoff.
     """
 
-    root, refusal = _manager_loop_repo_root()
+    root, refusal = _manager_loop_repo_root(launching=True)
     if refusal is not None:
         return refusal
-    if os.environ.get("AIWORKHUB_ALLOW_LAUNCH") != "1":
-        return {"ok": False, "error": "launch_gate_closed"}
-    if not core.writes_allowed():
-        return {"ok": False, "error": "write_gate_closed"}
     return manager_loop_service.rotate(root, reason)
 
 
