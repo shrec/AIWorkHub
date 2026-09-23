@@ -178,6 +178,7 @@ function makeFakeElement(tag) {
     open: false,
     attrs: {},
     children: [],
+    listeners: {},
     classList: { toggle() {} },
     scrollTop: 0,
     scrollHeight: 0,
@@ -198,7 +199,18 @@ function makeFakeElement(tag) {
         this.children = nodes;
       }
     },
+    addEventListener(type, handler) {
+      (this.listeners[type] = this.listeners[type] || []).push(handler);
+    },
   };
+}
+
+// Simulates a DOM event dispatch against the fake element harness: runs every
+// handler registered via addEventListener(type, ...), in registration order.
+function trigger(element, type, eventOverrides = {}) {
+  const handlers = element.listeners[type] || [];
+  const event = { preventDefault() {}, target: element, ...eventOverrides };
+  for (const handler of handlers) handler(event);
 }
 
 function flattenNodes(node, out) {
@@ -228,29 +240,44 @@ function loadWebviewSlice() {
       "return `${text.slice(0, Math.max(0, maxLength - 1)).trimEnd()}...`;\n}",
       "limitText",
     );
+  const constants = extractSlice(
+    appSource,
+    "const MANAGER_CHAT_BACKENDS = new Set([",
+    "]);",
+    "MANAGER_CHAT_BACKENDS",
+  );
   const managerChat = extractSlice(
     appSource,
     "function managerChatEventNode(event) {",
     "  showManagerChatNotice(null);\n}",
     "manager chat render/poll functions",
   );
+  const managerChatWiring = extractSlice(
+    appSource,
+    "function openManagerChatDialog() {",
+    "  state.managerChatRunning = true;\n  applyManagerChatSessionUi();\n});",
+    "manager chat dialog wiring",
+  );
 
   const state = {
+    featureSettings: null,
     managerChatSession: null,
     managerChatBackend: null,
     managerChatModel: null,
+    managerChatModelByBackend: {},
     managerChatRunning: false,
     managerChatEvents: [],
     managerChatLastSeq: 0,
     managerChatPollTimer: null,
   };
   const elements = {
+    headerManagerChat: makeFakeElement("button"),
     managerChatDialog: Object.assign(makeFakeElement("dialog"), { open: true }),
     managerChatTranscript: makeFakeElement("div"),
     managerChatNotice: makeFakeElement("div"),
     managerChatSummary: makeFakeElement("span"),
     managerChatBackendSelect: makeFakeElement("select"),
-    managerChatModelInput: makeFakeElement("input"),
+    managerChatModelInput: makeFakeElement("select"),
     managerChatStart: makeFakeElement("button"),
     managerChatRotate: makeFakeElement("button"),
     managerChatClose: makeFakeElement("button"),
@@ -259,6 +286,7 @@ function loadWebviewSlice() {
     managerChatSessionLine: makeFakeElement("div"),
     managerChatSessionId: makeFakeElement("span"),
     managerChatSessionBackend: makeFakeElement("span"),
+    managerChatComposer: makeFakeElement("form"),
     managerChatInput: makeFakeElement("textarea"),
     managerChatSend: makeFakeElement("button"),
     headerManagerChatValue: makeFakeElement("strong"),
@@ -277,6 +305,8 @@ function loadWebviewSlice() {
       const index = timers.findIndex((timer) => timer.id === id);
       if (index !== -1) timers.splice(index, 1);
     },
+    prompt: () => "",
+    confirm: () => true,
   };
 
   const context = {
@@ -293,9 +323,10 @@ function loadWebviewSlice() {
   };
   vm.createContext(context);
   vm.runInContext(
-    `"use strict";\n${utilities}\n${managerChat}\n` +
+    `"use strict";\n${utilities}\n${constants}\n${managerChat}\n${managerChatWiring}\n` +
       "this.api = { managerChatEventNode, renderManagerChatEvents, renderManagerChatEventsResponse, " +
-      "renderManagerChatAction, requestManagerChatEvents, scheduleManagerChatPoll };",
+      "renderManagerChatAction, requestManagerChatEvents, scheduleManagerChatPoll, " +
+      "applyManagerChatSessionUi, managerChatEnabledModels, populateManagerChatModelOptions, openManagerChatDialog };",
     context,
   );
   return { api: context.api, state, elements, posts, timers };
@@ -361,6 +392,120 @@ test("a manager_turn_in_progress reply shows a notice and sends nothing else", (
   assert.equal(harness.elements.managerChatNotice.hidden, false);
   assert.match(harness.elements.managerChatNotice.textContent, /already running/i);
   assert.equal(harness.posts.length, 0, "the busy reply must never trigger a resend");
+});
+
+// ── media/app.js: model picker sourced from the repository's enabled models ─
+
+const MANAGER_CHAT_MODEL_POLICY_PAYLOAD = {
+  ok: true,
+  revision: 3,
+  model_policy: {
+    ok: true,
+    revision: 3,
+    catalog: {
+      workers: [
+        { provider: "anthropic", adapter: "claude_cli", model: "claude-opus-4-1", worker_id: "w1", effective_enabled: true, catalog_enabled: true },
+        { provider: "anthropic", adapter: "claude_cli", model: "claude-sonnet-5", worker_id: "w2", effective_enabled: true, catalog_enabled: true },
+        { provider: "anthropic", adapter: "claude_cli", model: "claude-haiku-4-5", worker_id: "w3", effective_enabled: false, catalog_enabled: true },
+        { provider: "openai", adapter: "codex_cli", model: "gpt-5-codex", worker_id: "w4", effective_enabled: true, catalog_enabled: true },
+      ],
+    },
+    providers: {},
+  },
+};
+
+test("the model select is filled from the settings payload's enabled models for the chosen backend", () => {
+  const harness = loadWebviewSlice();
+  harness.state.featureSettings = MANAGER_CHAT_MODEL_POLICY_PAYLOAD;
+  harness.elements.managerChatBackendSelect.value = "claude_cli";
+
+  harness.api.populateManagerChatModelOptions();
+
+  const options = harness.elements.managerChatModelInput.children;
+  assert.deepEqual(options.map((option) => option.value), ["claude-opus-4-1", "claude-sonnet-5"]);
+  assert.equal(harness.elements.managerChatModelInput.value, "claude-opus-4-1", "the first enabled model is preselected");
+  assert.equal(harness.elements.managerChatStart.disabled, false);
+});
+
+test("switching backend repopulates the options and remembers the owner's last choice per backend for the session", () => {
+  const harness = loadWebviewSlice();
+  harness.state.featureSettings = MANAGER_CHAT_MODEL_POLICY_PAYLOAD;
+  harness.elements.managerChatBackendSelect.value = "claude_cli";
+  harness.api.populateManagerChatModelOptions();
+  harness.elements.managerChatModelInput.value = "claude-sonnet-5";
+  trigger(harness.elements.managerChatModelInput, "change");
+
+  harness.elements.managerChatBackendSelect.value = "codex_cli";
+  trigger(harness.elements.managerChatBackendSelect, "change");
+
+  assert.deepEqual(harness.elements.managerChatModelInput.children.map((option) => option.value), ["gpt-5-codex"]);
+  assert.equal(harness.elements.managerChatModelInput.value, "gpt-5-codex");
+
+  harness.elements.managerChatBackendSelect.value = "claude_cli";
+  trigger(harness.elements.managerChatBackendSelect, "change");
+
+  assert.equal(
+    harness.elements.managerChatModelInput.value,
+    "claude-sonnet-5",
+    "the owner's earlier pick for claude_cli is remembered for the webview session",
+  );
+});
+
+test("a backend with no enabled models shows a disabled hint option and disables Start", () => {
+  const harness = loadWebviewSlice();
+  harness.state.featureSettings = MANAGER_CHAT_MODEL_POLICY_PAYLOAD;
+  harness.elements.managerChatBackendSelect.value = "opencode_cli";
+
+  harness.api.populateManagerChatModelOptions();
+
+  const options = harness.elements.managerChatModelInput.children;
+  assert.equal(options.length, 1);
+  assert.equal(options[0].disabled, true);
+  assert.match(options[0].textContent, /No enabled models/);
+  assert.equal(harness.elements.managerChatStart.disabled, true);
+});
+
+test("Start sends the exact backend and model chosen in the picker", () => {
+  const harness = loadWebviewSlice();
+  harness.state.featureSettings = MANAGER_CHAT_MODEL_POLICY_PAYLOAD;
+  harness.elements.managerChatBackendSelect.value = "claude_cli";
+  harness.api.populateManagerChatModelOptions();
+  harness.elements.managerChatModelInput.value = "claude-sonnet-5";
+
+  trigger(harness.elements.managerChatStart, "click");
+
+  assert.deepEqual(plain(harness.posts.at(-1)), {
+    type: "managerLoopStart",
+    backendId: "claude_cli",
+    model: "claude-sonnet-5",
+  });
+});
+
+test("Start is refused when the current backend has no enabled models", () => {
+  const harness = loadWebviewSlice();
+  harness.state.featureSettings = MANAGER_CHAT_MODEL_POLICY_PAYLOAD;
+  harness.elements.managerChatBackendSelect.value = "opencode_cli";
+  harness.api.populateManagerChatModelOptions();
+
+  trigger(harness.elements.managerChatStart, "click");
+
+  assert.equal(harness.posts.length, 0, "no managerLoopStart message is ever sent without a real model");
+  assert.equal(harness.elements.managerChatNotice.hidden, false);
+});
+
+test("opening the Manager dialog populates the model picker for the already-selected backend", () => {
+  const harness = loadWebviewSlice();
+  harness.state.featureSettings = MANAGER_CHAT_MODEL_POLICY_PAYLOAD;
+  harness.elements.managerChatBackendSelect.value = "codex_cli";
+
+  harness.api.openManagerChatDialog();
+
+  assert.deepEqual(harness.elements.managerChatModelInput.children.map((option) => option.value), ["gpt-5-codex"]);
+});
+
+test("the model field is a <select>, not a free-text input", () => {
+  assert.match(extensionSource, /<select id="manager-chat-model" class="compact-select" aria-label="Manager model"><\/select>/);
+  assert.doesNotMatch(extensionSource, /<input id="manager-chat-model"/);
 });
 
 // ── Structural reuse: existing dialog/theme classes, no new colour literals ──

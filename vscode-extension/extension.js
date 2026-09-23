@@ -11381,7 +11381,7 @@ function getHtmlForWebview(webview, extensionUri) {
           <option value="codex_cli">codex_cli</option>
           <option value="opencode_cli">opencode_cli</option>
         </select>
-        <input id="manager-chat-model" type="text" maxlength="200" placeholder="Model" aria-label="Manager model">
+        <select id="manager-chat-model" class="compact-select" aria-label="Manager model"></select>
         <button type="button" class="primary-button" id="manager-chat-start">Start</button>
         <button type="button" id="manager-chat-rotate" disabled>Rotate</button>
         <button type="button" id="manager-chat-close" disabled>Close</button>

@@ -83,6 +83,7 @@ const state = {
   managerChatSession: null,
   managerChatBackend: null,
   managerChatModel: null,
+  managerChatModelByBackend: {},
   managerChatRunning: false,
   managerChatEvents: [],
   managerChatLastSeq: 0,
@@ -5258,6 +5259,9 @@ function renderSettings(payload, options = {}) {
     return;
   }
   state.featureSettings = payload;
+  if (elements.managerChatDialog && elements.managerChatDialog.open) {
+    populateManagerChatModelOptions();
+  }
   if (!preservePending) {
     setSettingsPending(null, false);
   }
@@ -6990,11 +6994,53 @@ function applyManagerChatComposerState() {
   elements.managerChatSend.disabled = !canSend;
 }
 
+function managerChatEnabledModels(backendId) {
+  const modelPolicy = state.featureSettings && state.featureSettings.model_policy && state.featureSettings.model_policy.ok === true
+    ? state.featureSettings.model_policy
+    : null;
+  const workers = modelPolicy && Array.isArray(modelPolicy.catalog?.workers) ? modelPolicy.catalog.workers : [];
+  const models = [];
+  for (const row of workers) {
+    if (!row || String(row.adapter || "") !== backendId || !row.effective_enabled) continue;
+    const model = String(row.model || row.worker_id || "");
+    if (model && !models.includes(model)) models.push(model);
+  }
+  return models;
+}
+
+function populateManagerChatModelOptions() {
+  const select = elements.managerChatModelInput;
+  if (!select) return;
+  const backendId = elements.managerChatBackendSelect.value;
+  const models = managerChatEnabledModels(backendId);
+  if (models.length === 0) {
+    const hint = createElement("option", "", "No enabled models — enable one in Settings");
+    hint.value = "";
+    hint.disabled = true;
+    select.replaceChildren(hint);
+    select.value = "";
+  } else {
+    const remembered = state.managerChatModelByBackend[backendId];
+    const initial = remembered && models.includes(remembered) ? remembered : models[0];
+    const fragment = document.createDocumentFragment();
+    for (const model of models) {
+      const option = createElement("option", "", model);
+      option.value = model;
+      fragment.appendChild(option);
+    }
+    select.replaceChildren(fragment);
+    select.value = initial;
+    state.managerChatModelByBackend[backendId] = initial;
+  }
+  applyManagerChatSessionUi();
+}
+
 function applyManagerChatSessionUi() {
   const hasSession = Boolean(state.managerChatSession);
-  elements.managerChatStart.disabled = hasSession;
+  const hasModelChoice = managerChatEnabledModels(elements.managerChatBackendSelect.value).length > 0;
+  elements.managerChatStart.disabled = hasSession || !hasModelChoice;
   elements.managerChatBackendSelect.disabled = hasSession;
-  elements.managerChatModelInput.disabled = hasSession;
+  elements.managerChatModelInput.disabled = hasSession || !hasModelChoice;
   elements.managerChatRotate.disabled = !hasSession || state.managerChatRunning;
   elements.managerChatClose.disabled = !hasSession || state.managerChatRunning;
   elements.managerChatStatus.classList.toggle("is-live", state.managerChatRunning);
@@ -7620,6 +7666,10 @@ elements.roadmapList.addEventListener("click", (event) => {
 function openManagerChatDialog() {
   if (!elements.managerChatDialog.open) elements.managerChatDialog.showModal();
   showManagerChatNotice(null);
+  populateManagerChatModelOptions();
+  if (!state.featureSettings) {
+    vscode.postMessage({ type: "requestSettings" });
+  }
   vscode.postMessage({ type: "managerLoopStatus" });
 }
 
@@ -7630,6 +7680,16 @@ elements.headerManagerChat.addEventListener("click", openManagerChatDialog);
 // the one place that needs to stop the after_seq poll chain.
 elements.managerChatDialog.addEventListener("close", () => {
   stopManagerChatPolling();
+});
+
+elements.managerChatBackendSelect.addEventListener("change", () => {
+  populateManagerChatModelOptions();
+});
+
+elements.managerChatModelInput.addEventListener("change", () => {
+  const backendId = elements.managerChatBackendSelect.value;
+  const model = elements.managerChatModelInput.value;
+  if (model) state.managerChatModelByBackend[backendId] = model;
 });
 
 elements.managerChatStart.addEventListener("click", () => {
