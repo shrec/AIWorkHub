@@ -134,6 +134,74 @@ def test_manager_archive_and_supersede_use_verified_manager_actor(
     assert calls == expected_calls
 
 
+def test_manager_loop_tools_refuse_a_non_manager_route(monkeypatch) -> None:
+    monkeypatch.setattr(
+        server.core,
+        "manager_bootstrap",
+        lambda: {"ok": True, "role": "worker_or_unverified_client", "manager_route": {}},
+    )
+    refusal = {"ok": False, "error": "verified_manager_identity_required"}
+
+    assert server.aiworkhub_manager_loop_start("fake", "model-a") == refusal
+    assert server.aiworkhub_manager_loop_send("hello") == refusal
+    assert server.aiworkhub_manager_loop_rotate("because") == refusal
+    assert server.aiworkhub_manager_loop_status() == refusal
+    assert server.aiworkhub_manager_loop_events("any-session-id") == refusal
+    assert server.aiworkhub_manager_loop_close() == refusal
+
+
+def test_manager_loop_tools_forward_to_the_service_with_the_verified_repo_root(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(
+        server.core,
+        "manager_bootstrap",
+        lambda: {"role": "manager", "repo": str(tmp_path), "manager_route": {"thread_id": "t1"}},
+    )
+    captured: dict = {}
+
+    def fake_start(repo, backend_id, model):
+        captured.update(repo=repo, backend_id=backend_id, model=model)
+        return {"ok": True, "session": {"session_id": "s1"}}
+
+    monkeypatch.setattr(server.manager_loop_service, "start", fake_start)
+
+    result = server.aiworkhub_manager_loop_start("fake", "model-a")
+
+    assert result == {"ok": True, "session": {"session_id": "s1"}}
+    assert captured == {"repo": tmp_path.resolve(), "backend_id": "fake", "model": "model-a"}
+
+
+def test_manager_loop_tools_refuse_a_manager_route_with_no_session_identity(monkeypatch) -> None:
+    monkeypatch.setattr(
+        server.core,
+        "manager_bootstrap",
+        lambda: {"ok": True, "role": "manager", "manager_route": None},
+    )
+    missing_route_refusal = {"ok": False, "error": "verified_manager_identity_required"}
+
+    assert server.aiworkhub_manager_loop_start("fake", "model-a") == missing_route_refusal
+    assert server.aiworkhub_manager_loop_send("hello") == missing_route_refusal
+    assert server.aiworkhub_manager_loop_rotate("because") == missing_route_refusal
+    assert server.aiworkhub_manager_loop_status() == missing_route_refusal
+    assert server.aiworkhub_manager_loop_events("any-session-id") == missing_route_refusal
+    assert server.aiworkhub_manager_loop_close() == missing_route_refusal
+
+    monkeypatch.setattr(
+        server.core,
+        "manager_bootstrap",
+        lambda: {"ok": True, "role": "manager", "manager_route": {}},
+    )
+    no_identity_refusal = {"ok": False, "error": "manager_session_identity_missing"}
+
+    assert server.aiworkhub_manager_loop_start("fake", "model-a") == no_identity_refusal
+    assert server.aiworkhub_manager_loop_send("hello") == no_identity_refusal
+    assert server.aiworkhub_manager_loop_rotate("because") == no_identity_refusal
+    assert server.aiworkhub_manager_loop_status() == no_identity_refusal
+    assert server.aiworkhub_manager_loop_events("any-session-id") == no_identity_refusal
+    assert server.aiworkhub_manager_loop_close() == no_identity_refusal
+
+
 def test_fallback_stdio_writer_is_binary_utf8_and_transport_safe() -> None:
     """Exercise the real fallback writer without replacing live modules."""
     import uuid

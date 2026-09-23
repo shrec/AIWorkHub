@@ -481,6 +481,7 @@ from . import launch_queue_persist
 from . import known_bug_scanner
 from . import learning_commit_store
 from . import manager_ai_tools
+from . import manager_loop_service
 from . import manager_recipe_tools
 from . import manager_skill_tools
 from . import process_launcher
@@ -1754,6 +1755,109 @@ def aiworkhub_manager_skill_retirement_report(
     """
 
     return manager_skill_tools.retirement_report(min_anchors=min_anchors)
+
+
+def _manager_loop_repo_root() -> tuple[Path | None, dict[str, Any] | None]:
+    """The manager route gate every manager loop tool below shares.
+
+    ``core.manager_bootstrap()`` is the route gate for every manager AI/
+    recipe/skill tool (see its docstring); this mirrors ``manager_recipe_tools.
+    _manager_context`` and ``manager_skill_tools._manager_context`` field for
+    field -- a verified ``manager`` role AND a ``manager_route`` mapping
+    carrying a non-empty session identity -- so a worker or unverified route,
+    or a manager route missing its session id, is refused here before
+    ``manager_loop_service`` ever sees it.
+    """
+
+    route = core.manager_bootstrap()
+    identity = route.get("manager_route") if isinstance(route, dict) else None
+    if (
+        not isinstance(route, dict)
+        or route.get("role") != "manager"
+        or not isinstance(identity, dict)
+    ):
+        return None, {"ok": False, "error": "verified_manager_identity_required"}
+    session_id = str(identity.get("thread_id") or identity.get("session_id") or "").strip()
+    if not session_id:
+        return None, {"ok": False, "error": "manager_session_identity_missing"}
+    return Path(str(route.get("repo") or core.repo_root())).resolve(), None
+
+
+@mcp.tool()
+def aiworkhub_manager_loop_start(backend_id: str, model: str) -> dict[str, Any]:
+    """MANAGER WRITE: open the repository's one manager agent loop session."""
+
+    root, refusal = _manager_loop_repo_root()
+    if refusal is not None:
+        return refusal
+    return manager_loop_service.start(root, backend_id, model)
+
+
+@mcp.tool()
+def aiworkhub_manager_loop_send(text: str) -> dict[str, Any]:
+    """MANAGER WRITE: run one manager turn in the background.
+
+    Returns at once with ``state: "running"``; a call while a turn is already
+    running is refused with ``manager_turn_in_progress`` and nothing is
+    queued. Poll ``aiworkhub_manager_loop_status`` or
+    ``aiworkhub_manager_loop_events`` for the outcome.
+    """
+
+    root, refusal = _manager_loop_repo_root()
+    if refusal is not None:
+        return refusal
+    return manager_loop_service.send(root, text)
+
+
+@mcp.tool()
+def aiworkhub_manager_loop_rotate(reason: str) -> dict[str, Any]:
+    """MANAGER WRITE: close the session with a handoff, in the background.
+
+    Returns at once with ``state: "running"``; a call while a turn is already
+    running is refused with ``manager_turn_in_progress`` and nothing is
+    queued. The next ``aiworkhub_manager_loop_start`` opens a successor
+    rehydrated from the handoff.
+    """
+
+    root, refusal = _manager_loop_repo_root()
+    if refusal is not None:
+        return refusal
+    return manager_loop_service.rotate(root, reason)
+
+
+@mcp.tool()
+def aiworkhub_manager_loop_status() -> dict[str, Any]:
+    """MANAGER READ: the active session, whether a turn is running, and the last turn's outcome."""
+
+    root, refusal = _manager_loop_repo_root()
+    if refusal is not None:
+        return refusal
+    return manager_loop_service.status(root)
+
+
+@mcp.tool()
+def aiworkhub_manager_loop_events(
+    session_id: str, after_seq: int = 0, limit: int = 200
+) -> dict[str, Any]:
+    """MANAGER READ: bounded session events, for incremental client polling.
+
+    Events with seq greater than after_seq, bounded to limit.
+    """
+
+    root, refusal = _manager_loop_repo_root()
+    if refusal is not None:
+        return refusal
+    return manager_loop_service.events(root, session_id, after_seq=after_seq, limit=limit)
+
+
+@mcp.tool()
+def aiworkhub_manager_loop_close() -> dict[str, Any]:
+    """MANAGER WRITE: release the backend and lock at shutdown, without a model turn."""
+
+    root, refusal = _manager_loop_repo_root()
+    if refusal is not None:
+        return refusal
+    return manager_loop_service.close(root)
 
 
 @mcp.tool()
