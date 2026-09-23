@@ -14,6 +14,11 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.11.64
+
+- Manager panel: a model list that fills itself, and a loop that can write and
+  launch in its own MCP child while the dashboard stays read-only.
+
 ## What's new in 0.11.63
 
 - A Manager chat panel in the dashboard: pick a model, talk to the manager,

@@ -6,6 +6,23 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.64] - 2026-09-23
+
+### Added
+
+- The Manager panel's model list fills itself from the repository's enabled
+  models for the chosen backend; pick one instead of typing it.
+
+### Fixed
+
+- The Manager panel's loop can now write and launch. The dashboard's MCP child
+  is read-only by design, so every loop write (Context Graph turn event,
+  rotation handoff) failed with `write_gate_closed`. The loop now runs in its
+  own MCP child with both gates enabled, spawned only when the owner presses
+  Start and stopped on Close; the dashboard child stays read-only.
+  `aiworkhub_manager_loop_start/send/rotate` refuse without the launch and
+  write gates (RM-2026-00067).
+
 ## [0.11.63] - 2026-09-23
 
 ### Added

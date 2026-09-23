@@ -1,5 +1,17 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.64 — 2026-09-23
+
+### Added
+
+- Manager panel: the model list fills itself from the enabled models of the
+  chosen backend.
+
+### Fixed
+
+- Manager panel: the loop's writes no longer fail with `write_gate_closed`;
+  it runs in its own gated MCP child started by Start and stopped by Close.
+
 ## 0.11.63 — 2026-09-23
 
 ### Added

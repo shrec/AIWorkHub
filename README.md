@@ -62,6 +62,12 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
+## What's new in 0.11.64
+
+- The Manager panel's loop runs in its own write- and launch-enabled MCP child,
+  started only when you press Start; the dashboard itself stays read-only.
+- The Manager panel's model list fills itself from the enabled models.
+
 ## What's new in 0.11.63
 
 - A Manager chat panel in the dashboard, on AIWorkHub's own manager agent
