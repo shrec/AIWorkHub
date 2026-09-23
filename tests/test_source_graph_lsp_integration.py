@@ -653,6 +653,11 @@ def test_same_named_parameter_on_a_declaration_line_never_binds_it(
 
 
 # --- concurrency -------------------------------------------------------------
+# Every race below is forced with plain marker-file polling (``_Lsp.hold``,
+# ``_await``): touching a file and waiting for another one to exist. Nothing
+# here holds a POSIX-only handle open across the race, so a Windows-only
+# failure in this section names a bug in the code under test, not in this
+# harness -- see ``_lsp_readonly_snapshot_connection`` in source_graph.py.
 
 
 def test_concurrent_target_write_is_never_bound_into_the_new_generation(
@@ -719,6 +724,52 @@ def test_concurrent_workspace_change_revokes_the_whole_batch(tmp_path, monkeypat
     # health may not report green on ``internal`` alone.
     assert health["bound_edges"] == 0
     assert health["green"] is False
+
+
+def test_lsp_connection_closes_before_the_server_runs(tmp_path, monkeypatch):
+    """No connection to the index stays open while the language server runs."""
+    fixture = _Lsp(tmp_path, monkeypatch, "connection_closed_during_round_trip")
+    _python_pair(fixture)
+    ready, release = fixture.hold()
+    fixture.index("b.py")
+
+    events: list[str] = []
+    real_connection = sg._lsp_readonly_snapshot_connection
+
+    @contextlib.contextmanager
+    def spy(db_path):
+        events.append("open")
+        try:
+            with real_connection(db_path) as conn:
+                yield conn
+        finally:
+            events.append("closed")
+
+    monkeypatch.setattr(sg, "_lsp_readonly_snapshot_connection", spy)
+
+    box: dict = {}
+    worker = threading.Thread(target=lambda: box.update(result=fixture.index("a.py")))
+    worker.start()
+    try:
+        _await(ready)
+        # The server is blocked on ``release``; whatever connection planned
+        # this batch must already have closed before it could get here.
+        assert events[-1] == "closed"
+    finally:
+        release.write_text("go", encoding="utf-8")
+        worker.join(timeout=60.0)
+
+    assert not worker.is_alive()
+    assert box["result"]["lsp"]["status"] == "enriched"
+    assert events[0] == "open" and events[-1] == "closed"
+    assert len(events) % 2 == 0
+    assert all(
+        (opened, closed) == ("open", "closed")
+        for opened, closed in zip(events[0::2], events[1::2])
+    )
+    # Planning opens one connection and closes it; verifying the server's
+    # answer opens a second, separate one -- neither spans the round trip.
+    assert events.count("open") >= 2
 
 
 def test_reader_sees_the_published_generation_while_the_server_runs(

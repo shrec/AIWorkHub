@@ -7729,6 +7729,12 @@ def _lsp_apply_outcomes(
             counters["revoked"] += revoked
             counters["files_revoked"] += int(had_receipt)
             counters["discarded"] += len(outcome.bindings)
+            if workspace_moved:
+                # The round trip verified this against generation N, but N+1
+                # published before commit: the same outcome the old
+                # in-connection check named ``stale`` (_lsp_verify_result),
+                # just discovered one step later.
+                counters["stale"] += len(outcome.bindings)
             continue
         bound: set[tuple[int, int, str]] = set()
         for binding in outcome.bindings:
@@ -7875,6 +7881,28 @@ def _lsp_classify_batch(
     return verified, failed
 
 
+@contextmanager
+def _lsp_readonly_snapshot_connection(db_path: Path):
+    """Open ``db_path`` read-only for one bounded, local-reads-only phase.
+
+    Callers open one of these to do DB-only reads and close it *before*
+    starting a language-server round trip, then open a fresh one afterward
+    if they need to read again. SQLite's own file open carries no Windows
+    FILE_SHARE_DELETE, so holding a connection open across that round trip
+    would block a concurrent ``atomic_replace`` publishing the next
+    generation for however long the server takes to answer; never holding
+    one open past a local read keeps that window short on every platform,
+    so no platform branch -- and no private copy of the index -- is needed
+    here.
+    """
+
+    conn = connect(db_path, read_only=True)
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
 def _lsp_enrich_group(
     repo_root: Path,
     group: tuple[str, str, tuple[str, ...]],
@@ -7899,8 +7927,7 @@ def _lsp_enrich_group(
     status = "skipped"
     reason = ""
     latency_ms = -1
-    conn = connect(db_path, read_only=True)
-    try:
+    with _lsp_readonly_snapshot_connection(db_path) as conn:
         candidates = _lsp_group_files(conn, languages, restrict)
         if not candidates:
             run.reason = "no_files"
@@ -7910,55 +7937,60 @@ def _lsp_enrich_group(
         plans, outcomes = _lsp_plan_group(
             conn, candidates, spec, digest, counters
         )
-        queries = tuple(query for plan in plans for query in plan.queries)
-        counters["files_attempted"] += len(plans)
-        counters["attempted"] += len(queries)
-        if plans and not _lsp_server_installed(spec.command):
-            counters["unavailable"] += len(queries)
-            status, reason = "unavailable", "server_missing"
-            for plan in plans:
-                outcomes[plan.rel] = _LspFileOutcome(plan.rel, plan.source_hash, "clear")
-        elif plans:
-            counters["batches"] += 1
-            try:
-                results, workspace_root, latency_ms, encoding = _lsp_resolve_batch(
-                    repo_root, spec, sources, queries
-                )
-            except (sglsp.LspTransportError, OSError, ValueError):
-                counters["unavailable"] += len(queries)
-                status, reason = "unavailable", "transport"
-                for plan in plans:
-                    outcomes[plan.rel] = _LspFileOutcome(
-                        plan.rel, plan.source_hash, "clear"
-                    )
-            else:
-                counters["latency_ms_total"] += max(latency_ms, 0)
-                counters["latency_ms_max"] = max(latency_ms, 0)
-                verified, failed = _lsp_classify_batch(
-                    repo_root, workspace_root, conn, plans, results, encoding,
-                    counters,
-                )
-                status = "enriched"
-                if counters["unavailable"] == len(queries):
-                    status, reason = "unavailable", "transport"
-                elif failed:
-                    reason = "partial"
-                for plan in plans:
-                    outcomes[plan.rel] = _LspFileOutcome(
-                        plan.rel,
-                        plan.source_hash,
-                        "publish",
-                        tuple(verified.get(plan.rel, ())),
-                        plan.complete and plan.rel not in failed,
-                        latency_ms,
-                    )
-        if not plans and not counters["files_reused"]:
-            status = "skipped"
-            reason = reason or (
-                "deferred" if counters["files_deferred"] else "no_unresolved"
+    # The connection above is already closed here: nothing below may hold
+    # ``db_path`` open while the language-server round trip runs.
+    queries = tuple(query for plan in plans for query in plan.queries)
+    counters["files_attempted"] += len(plans)
+    counters["attempted"] += len(queries)
+    if plans and not _lsp_server_installed(spec.command):
+        counters["unavailable"] += len(queries)
+        status, reason = "unavailable", "server_missing"
+        for plan in plans:
+            outcomes[plan.rel] = _LspFileOutcome(plan.rel, plan.source_hash, "clear")
+    elif plans:
+        counters["batches"] += 1
+        try:
+            results, workspace_root, latency_ms, encoding = _lsp_resolve_batch(
+                repo_root, spec, sources, queries
             )
-    finally:
-        conn.close()
+        except (sglsp.LspTransportError, OSError, ValueError):
+            counters["unavailable"] += len(queries)
+            status, reason = "unavailable", "transport"
+            for plan in plans:
+                outcomes[plan.rel] = _LspFileOutcome(
+                    plan.rel, plan.source_hash, "clear"
+                )
+        else:
+            counters["latency_ms_total"] += max(latency_ms, 0)
+            counters["latency_ms_max"] = max(latency_ms, 0)
+            # A fresh connection, opened only now that the round trip is
+            # done: it may see a generation newer than ``digest``, but that
+            # is exactly what ``_lsp_apply_outcomes`` re-verifies under its
+            # own write lease before anything is allowed to bind.
+            with _lsp_readonly_snapshot_connection(db_path) as verify_conn:
+                verified, failed = _lsp_classify_batch(
+                    repo_root, workspace_root, verify_conn, plans, results,
+                    encoding, counters,
+                )
+            status = "enriched"
+            if counters["unavailable"] == len(queries):
+                status, reason = "unavailable", "transport"
+            elif failed:
+                reason = "partial"
+            for plan in plans:
+                outcomes[plan.rel] = _LspFileOutcome(
+                    plan.rel,
+                    plan.source_hash,
+                    "publish",
+                    tuple(verified.get(plan.rel, ())),
+                    plan.complete and plan.rel not in failed,
+                    latency_ms,
+                )
+    if not plans and not counters["files_reused"]:
+        status = "skipped"
+        reason = reason or (
+            "deferred" if counters["files_deferred"] else "no_unresolved"
+        )
     run.digest, run.outcomes = digest, outcomes
     run.status, run.reason = status, reason
     run.files, run.latency_ms = len(candidates), latency_ms
