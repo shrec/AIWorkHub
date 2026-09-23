@@ -1,5 +1,12 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.67 — 2026-09-23
+
+### Fixed
+
+- Manager panel: Codex sessions start with the discovered models and keep
+  their conversation across messages.
+
 ## 0.11.66 — 2026-09-23
 
 ### Changed

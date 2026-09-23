@@ -62,6 +62,11 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
+## What's new in 0.11.67
+
+- The Manager panel works on Codex: it starts with any model Codex offers and
+  keeps the conversation across messages.
+
 ## What's new in 0.11.66
 
 - Model lists follow the CLIs: Codex models come from Codex's own cache, and

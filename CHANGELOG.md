@@ -6,6 +6,17 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.67] - 2026-09-23
+
+### Fixed
+
+- The Manager panel runs on Codex. Start refused every model the picker
+  discovers from the Codex CLI; a second message could not resume the
+  conversation (`--ephemeral` kept no session, and `codex exec resume` refuses
+  `-s` and `-C`). A model the CLI itself offers is accepted, the session is
+  kept, and the resume command uses only the flags `resume` accepts
+  (RM-2026-00067).
+
 ## [0.11.66] - 2026-09-23
 
 ### Changed
