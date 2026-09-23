@@ -11,6 +11,7 @@ if str(_SRC) not in sys.path:
 
 from aiworkhub import manager_loop as ml  # noqa: E402
 from aiworkhub import manager_loop_service  # noqa: E402
+from aiworkhub import server  # noqa: E402
 
 
 class FakeManagerBackend:
@@ -270,3 +271,63 @@ def test_a_non_manager_loop_error_building_the_entry_surfaces_as_ok_false(
     result = manager_loop_service.start(tmp_path, "fake", "model-a")
 
     assert result == {"ok": False, "error": "manager_loop_unavailable:RuntimeError"}
+
+
+def test_start_send_rotate_refuse_without_the_launch_gate(monkeypatch: Any) -> None:
+    monkeypatch.delenv("AIWORKHUB_ALLOW_LAUNCH", raising=False)
+    monkeypatch.setenv("AIWORKHUB_ALLOW_WRITES", "1")
+
+    assert server.aiworkhub_manager_loop_start("claude_cli", "opus") == {
+        "ok": False,
+        "error": "launch_gate_closed",
+    }
+    assert server.aiworkhub_manager_loop_send("hello") == {
+        "ok": False,
+        "error": "launch_gate_closed",
+    }
+    assert server.aiworkhub_manager_loop_rotate("handoff") == {
+        "ok": False,
+        "error": "launch_gate_closed",
+    }
+
+
+def test_start_send_rotate_refuse_without_the_write_gate(monkeypatch: Any) -> None:
+    monkeypatch.setenv("AIWORKHUB_ALLOW_LAUNCH", "1")
+    monkeypatch.delenv("AIWORKHUB_ALLOW_WRITES", raising=False)
+
+    assert server.aiworkhub_manager_loop_start("claude_cli", "opus") == {
+        "ok": False,
+        "error": "write_gate_closed",
+    }
+    assert server.aiworkhub_manager_loop_send("hello") == {
+        "ok": False,
+        "error": "write_gate_closed",
+    }
+    assert server.aiworkhub_manager_loop_rotate("handoff") == {
+        "ok": False,
+        "error": "write_gate_closed",
+    }
+
+
+def test_start_send_rotate_proceed_past_the_gates_once_both_are_open(monkeypatch: Any) -> None:
+    monkeypatch.setenv("AIWORKHUB_ALLOW_LAUNCH", "1")
+    monkeypatch.setenv("AIWORKHUB_ALLOW_WRITES", "1")
+
+    for result in (
+        server.aiworkhub_manager_loop_start("claude_cli", "opus"),
+        server.aiworkhub_manager_loop_send("hello"),
+        server.aiworkhub_manager_loop_rotate("handoff"),
+    ):
+        assert result.get("error") not in ("launch_gate_closed", "write_gate_closed")
+
+
+def test_status_events_close_do_not_require_the_launch_or_write_gate(monkeypatch: Any) -> None:
+    monkeypatch.delenv("AIWORKHUB_ALLOW_LAUNCH", raising=False)
+    monkeypatch.delenv("AIWORKHUB_ALLOW_WRITES", raising=False)
+
+    for result in (
+        server.aiworkhub_manager_loop_status(),
+        server.aiworkhub_manager_loop_events("mls-aaaa1111bbbb2222"),
+        server.aiworkhub_manager_loop_close(),
+    ):
+        assert result.get("error") not in ("launch_gate_closed", "write_gate_closed")

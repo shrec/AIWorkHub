@@ -165,6 +165,8 @@ def test_manager_loop_tools_forward_to_the_service_with_the_verified_repo_root(
         return {"ok": True, "session": {"session_id": "s1"}}
 
     monkeypatch.setattr(server.manager_loop_service, "start", fake_start)
+    monkeypatch.setenv("AIWORKHUB_ALLOW_LAUNCH", "1")
+    monkeypatch.setattr(server.core, "writes_allowed", lambda: True)
 
     result = server.aiworkhub_manager_loop_start("fake", "model-a")
 

@@ -1790,6 +1790,10 @@ def aiworkhub_manager_loop_start(backend_id: str, model: str) -> dict[str, Any]:
     root, refusal = _manager_loop_repo_root()
     if refusal is not None:
         return refusal
+    if os.environ.get("AIWORKHUB_ALLOW_LAUNCH") != "1":
+        return {"ok": False, "error": "launch_gate_closed"}
+    if not core.writes_allowed():
+        return {"ok": False, "error": "write_gate_closed"}
     return manager_loop_service.start(root, backend_id, model)
 
 
@@ -1806,6 +1810,10 @@ def aiworkhub_manager_loop_send(text: str) -> dict[str, Any]:
     root, refusal = _manager_loop_repo_root()
     if refusal is not None:
         return refusal
+    if os.environ.get("AIWORKHUB_ALLOW_LAUNCH") != "1":
+        return {"ok": False, "error": "launch_gate_closed"}
+    if not core.writes_allowed():
+        return {"ok": False, "error": "write_gate_closed"}
     return manager_loop_service.send(root, text)
 
 
@@ -1822,6 +1830,10 @@ def aiworkhub_manager_loop_rotate(reason: str) -> dict[str, Any]:
     root, refusal = _manager_loop_repo_root()
     if refusal is not None:
         return refusal
+    if os.environ.get("AIWORKHUB_ALLOW_LAUNCH") != "1":
+        return {"ok": False, "error": "launch_gate_closed"}
+    if not core.writes_allowed():
+        return {"ok": False, "error": "write_gate_closed"}
     return manager_loop_service.rotate(root, reason)
 
 

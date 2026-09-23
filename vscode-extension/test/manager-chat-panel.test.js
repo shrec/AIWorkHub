@@ -77,6 +77,12 @@ function loadHostSlice() {
     "const MANAGER_SESSION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{7,63}$/;",
     "MANAGER_LOOP_TOOLS/MANAGER_LOOP_BACKENDS/MANAGER_SESSION_ID_RE",
   );
+  const managerLoopClient = extractSlice(
+    extensionSource,
+    "let managerLoopMcpClient = null;",
+    "    // Best-effort shutdown -- the reference above is already cleared.\n  }\n}",
+    "getManagerLoopMcpClient/disposeManagerLoopMcpClient",
+  );
   const helpers = extractSlice(
     extensionSource,
     "async function pushManagerLoopStatus(view) {",
@@ -91,35 +97,63 @@ function loadHostSlice() {
   );
 
   let currentClient = null;
+  // Every gated child this test run spawns, in creation order -- lets tests
+  // assert lazy creation, reuse and re-creation-after-dispose by identity.
+  const managerLoopClientInstances = [];
+
+  class FakeMcpStdioClient {
+    constructor(repositoryRoot, outputChannel, repositoryIdentity, claimEpisode, options) {
+      this.repositoryRoot = repositoryRoot;
+      this.outputChannel = outputChannel;
+      this.repositoryIdentity = repositoryIdentity;
+      this.claimEpisode = claimEpisode;
+      this.options = options || {};
+      this.calls = [];
+      this.terminated = false;
+      managerLoopClientInstances.push(this);
+    }
+    async callTool(name, args) {
+      this.calls.push({ name, args });
+      return { ok: true };
+    }
+    async stopDispatcherThenTerminate() {
+      this.terminated = true;
+    }
+  }
+
   const context = {
     getMcpClient: () => currentClient,
+    outputChannel: { appendLine: () => {} },
+    McpStdioClient: FakeMcpStdioClient,
     sanitizeWebviewPayload: (value) => value,
     sanitizeErrorMessage: (err) => String((err && err.message) || "mcp_unavailable"),
   };
   vm.createContext(context);
   vm.runInContext(
-    `"use strict";\n${allowed}\n${outbound}\n${tools}\n${helpers}\n${handler}\n` +
-      "this.api = { handleInboundMessage, OUTBOUND_TYPES, MANAGER_LOOP_TOOLS, MANAGER_LOOP_BACKENDS };",
+    `"use strict";\n${allowed}\n${outbound}\n${tools}\n${managerLoopClient}\n${helpers}\n${handler}\n` +
+      "this.api = { handleInboundMessage, OUTBOUND_TYPES, MANAGER_LOOP_TOOLS, MANAGER_LOOP_BACKENDS, getManagerLoopMcpClient, disposeManagerLoopMcpClient };",
     context,
   );
   return {
     api: context.api,
+    managerLoopClientInstances,
     setClient(client) {
       currentClient = client;
     },
   };
 }
 
-test("extension.js routes the six manager loop message types to their exact MCP tools", async () => {
+test("managerLoopStart/Send/Rotate/Status/Events reach one lazily-created client spawned with both gates set, and never the gate-free client", async () => {
   const harness = loadHostSlice();
-  const client = makeClient(() => ({ ok: true, session: null, running: false, last_turn: null, events: [] }));
+  const client = makeClient();
   harness.setClient(client);
   const view = makeView();
+
+  assert.equal(harness.managerLoopClientInstances.length, 0);
 
   harness.api.handleInboundMessage(view, { type: "managerLoopStart", backendId: "claude_cli", model: "opus" });
   harness.api.handleInboundMessage(view, { type: "managerLoopSend", text: "hello manager" });
   harness.api.handleInboundMessage(view, { type: "managerLoopRotate", reason: "context threshold" });
-  harness.api.handleInboundMessage(view, { type: "managerLoopClose" });
   harness.api.handleInboundMessage(view, { type: "managerLoopStatus" });
   harness.api.handleInboundMessage(view, {
     type: "managerLoopEvents",
@@ -128,15 +162,53 @@ test("extension.js routes the six manager loop message types to their exact MCP 
   });
   await flush();
 
-  const find = (name) => client.calls.find((call) => call.name === name);
+  // One gated child spawned lazily on the first managerLoop* message, then
+  // reused -- never re-created -- for every message after it.
+  assert.equal(harness.managerLoopClientInstances.length, 1);
+  const gatedClient = harness.managerLoopClientInstances[0];
+  assert.equal(gatedClient.options.grantManagerLoopGates, true);
+
+  const find = (name) => gatedClient.calls.find((call) => call.name === name);
   assert.deepEqual(plain(find("aiworkhub_manager_loop_start").args), { backend_id: "claude_cli", model: "opus" });
   assert.deepEqual(plain(find("aiworkhub_manager_loop_send").args), { text: "hello manager" });
   assert.deepEqual(plain(find("aiworkhub_manager_loop_rotate").args), { reason: "context threshold" });
-  assert.deepEqual(plain(find("aiworkhub_manager_loop_close").args), {});
   assert.deepEqual(plain(find("aiworkhub_manager_loop_events").args), { session_id: "mls-aaaa1111bbbb2222", after_seq: 5 });
   // Status is called both explicitly and as the authoritative refresh after
   // every mutating action, so it must have been reached at least once.
-  assert.ok(client.calls.some((call) => call.name === "aiworkhub_manager_loop_status"));
+  assert.ok(gatedClient.calls.some((call) => call.name === "aiworkhub_manager_loop_status"));
+
+  // None of the six tools ever reach the dashboard's own read-only client.
+  assert.equal(client.calls.length, 0);
+});
+
+test("managerLoopClose disposes the gated client; the next managerLoopStart spawns a fresh one", async () => {
+  const harness = loadHostSlice();
+  harness.setClient(makeClient());
+  const view = makeView();
+
+  harness.api.handleInboundMessage(view, { type: "managerLoopStart", backendId: "claude_cli", model: "opus" });
+  await flush();
+  assert.equal(harness.managerLoopClientInstances.length, 1);
+  const firstClient = harness.managerLoopClientInstances[0];
+  assert.equal(firstClient.terminated, false);
+
+  harness.api.handleInboundMessage(view, { type: "managerLoopClose" });
+  await flush();
+  assert.equal(firstClient.terminated, true);
+
+  harness.api.handleInboundMessage(view, { type: "managerLoopStart", backendId: "claude_cli", model: "opus" });
+  await flush();
+  assert.equal(harness.managerLoopClientInstances.length, 2);
+  assert.notEqual(harness.managerLoopClientInstances[1], firstClient);
+});
+
+test("the gated manager loop client is torn down from all three required call sites", () => {
+  // 1 definition (async function disposeManagerLoopMcpClient() {) plus 3
+  // call sites: runManagerLoopAction's close branch, ViewState.dispose(),
+  // and deactivate(). A regression dropping any of the three call sites
+  // changes this count.
+  const occurrences = extensionSource.split("disposeManagerLoopMcpClient()").length - 1;
+  assert.equal(occurrences, 4);
 });
 
 test("managerLoopStart refuses an unlisted backend without ever calling an MCP tool", async () => {

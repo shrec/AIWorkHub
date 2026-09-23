@@ -1889,11 +1889,15 @@ function sanitizeWebviewPayload(value) {
 // JSON-RPC 2.0 over stdio) so this extension has no npm dependency to bundle
 // or install offline.
 class McpStdioClient {
-  constructor(repositoryRoot, outputChannel, repositoryIdentity, claimEpisode) {
+  constructor(repositoryRoot, outputChannel, repositoryIdentity, claimEpisode, options = {}) {
     this.repositoryRoot = repositoryRoot;
     this.outputChannel = outputChannel;
     this.repositoryIdentity = repositoryIdentity;
     this.claimEpisode = claimEpisode;
+    // The manager loop's own child opts in here (see getManagerLoopMcpClient());
+    // every other McpStdioClient -- the dashboard's -- leaves this false and
+    // _start() keeps deleting both gates from the child's environment.
+    this.grantManagerLoopGates = Boolean(options.grantManagerLoopGates);
     this.child = null;
     this.lifecycleChild = null;
     this.lifecyclePid = null;
@@ -2179,9 +2183,17 @@ class McpStdioClient {
       env.PYTHONPATH = [runtimeDir, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter);
     }
     // Defense in depth: this extension never enables the write gate or the
-    // launch gate, regardless of the ambient extension-host environment.
-    delete env.AIWORKHUB_ALLOW_WRITES;
-    delete env.AIWORKHUB_ALLOW_LAUNCH;
+    // launch gate for the dashboard's own read-only child, regardless of the
+    // ambient extension-host environment. The one exception is the manager
+    // loop's own child (see getManagerLoopMcpClient()), which opts in via
+    // grantManagerLoopGates because the owner explicitly started it.
+    if (this.grantManagerLoopGates) {
+      env.AIWORKHUB_ALLOW_WRITES = "1";
+      env.AIWORKHUB_ALLOW_LAUNCH = "1";
+    } else {
+      delete env.AIWORKHUB_ALLOW_WRITES;
+      delete env.AIWORKHUB_ALLOW_LAUNCH;
+    }
     // Never inherit a stale coordinator secret from the extension host.
     // Load the current owner-only file into this private child environment;
     // package init scrubs it before any submodule can copy the environment.
@@ -8651,6 +8663,43 @@ function getMcpClient(context) {
   return mcpClient;
 }
 
+let managerLoopMcpClient = null;
+
+// The manager loop is the one caller in this extension explicitly allowed to
+// write and launch: the owner opted in by clicking Start in the Manager
+// dialog. It gets its own child -- bound to the same repository identity the
+// dashboard's read-only child already resolved -- so every other dashboard
+// message keeps talking to a child that can do neither. Only the six
+// managerLoop* handlers (pushManagerLoopStatus, pushManagerLoopEvents,
+// runManagerLoopAction) ever call this; everything else keeps using
+// getMcpClient().
+function getManagerLoopMcpClient() {
+  if (!managerLoopMcpClient) {
+    const dashboardClient = getMcpClient();
+    managerLoopMcpClient = new McpStdioClient(
+      dashboardClient.repositoryRoot,
+      outputChannel,
+      dashboardClient.repositoryIdentity,
+      dashboardClient.claimEpisode,
+      { grantManagerLoopGates: true },
+    );
+  }
+  return managerLoopMcpClient;
+}
+
+async function disposeManagerLoopMcpClient() {
+  if (!managerLoopMcpClient) {
+    return;
+  }
+  const client = managerLoopMcpClient;
+  managerLoopMcpClient = null;
+  try {
+    await client.stopDispatcherThenTerminate({ restart: false });
+  } catch (_err) {
+    // Best-effort shutdown -- the reference above is already cleared.
+  }
+}
+
 /** Push the active repository label into a Webview without exposing the
  *  host-absolute path. Called on initial connect and after every repo switch.
  */
@@ -8911,6 +8960,10 @@ class ViewState {
       clearInterval(this.timer);
     }
     this.timer = null;
+    // Belt and suspenders: any dashboard surface closing tears down the
+    // manager loop's write+launch-capable child too, even if a different
+    // surface created it. Re-opening the Manager dialog spawns a fresh one.
+    disposeManagerLoopMcpClient();
   }
 }
 
@@ -9305,7 +9358,9 @@ async function runNeedfixAction(view, action, args) {
 
 async function pushManagerLoopStatus(view) {
   try {
-    const client = getMcpClient();
+    // Read-only: before the owner presses Start there is no loop child and
+    // no session, so the read-only dashboard child answers.
+    const client = managerLoopMcpClient || getMcpClient();
     view.bindClient(client);
     const payload = await client.callTool(MANAGER_LOOP_TOOLS.status, {});
     if (view.stillBoundTo(client)) {
@@ -9318,7 +9373,9 @@ async function pushManagerLoopStatus(view) {
 
 async function pushManagerLoopEvents(view, sessionId, afterSeq) {
   try {
-    const client = getMcpClient();
+    // Read-only: before the owner presses Start there is no loop child and
+    // no session, so the read-only dashboard child answers.
+    const client = managerLoopMcpClient || getMcpClient();
     view.bindClient(client);
     const payload = await client.callTool(MANAGER_LOOP_TOOLS.events, { session_id: sessionId, after_seq: afterSeq });
     if (view.stillBoundTo(client)) {
@@ -9338,12 +9395,19 @@ async function runManagerLoopAction(view, action, args) {
   const tool = MANAGER_LOOP_TOOLS[action];
   if (!tool) return;
   try {
-    const client = getMcpClient();
+    const client = getManagerLoopMcpClient();
     view.bindClient(client);
     const payload = await client.callTool(tool, args);
-    if (!view.stillBoundTo(client)) return;
-    view.postMessage({ type: OUTBOUND_TYPES.managerLoopAction, action, payload: sanitizeWebviewPayload(payload) });
-    await pushManagerLoopStatus(view);
+    if (view.stillBoundTo(client)) {
+      view.postMessage({ type: OUTBOUND_TYPES.managerLoopAction, action, payload: sanitizeWebviewPayload(payload) });
+      await pushManagerLoopStatus(view);
+    }
+    if (action === "close") {
+      // The owner ended the session: tear down the write+launch-capable
+      // child now instead of leaving it idle. The next managerLoopStart
+      // lazily spawns a fresh one.
+      await disposeManagerLoopMcpClient();
+    }
   } catch (err) {
     view.postMessage({
       type: OUTBOUND_TYPES.managerLoopAction,
@@ -12003,6 +12067,7 @@ async function deactivate() {
     // Stop dispatcher before child termination to prevent reload orphans.
     await oldClient.stopDispatcherThenTerminate({ restart: false });
   }
+  await disposeManagerLoopMcpClient();
   flushSystemLogs();
   // The trace writer buffers; a reload cycle must not lose the tail that
   // explains why this window was reloaded.
