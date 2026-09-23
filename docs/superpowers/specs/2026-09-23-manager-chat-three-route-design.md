@@ -4,13 +4,13 @@
 
 The owner wants Manager Chat to be a usable project-bound conversation, not a
 manual CLI launcher. Opening the panel must attach to or create the repository's
-manager conversation without a Start button. An enabled GLM 5.3 route, an
-enabled Claude route, and OpenCode's exact
-`opencode/muse-spark-1.3-contributor-free` route must each complete a manager
-turn and display its result. The provider starts only when a turn is sent.
+manager conversation without a Start button. Enabled GLM 5.3, Claude, and
+Codex manager routes must each complete a manager turn and display its result.
+The provider starts only when a turn is sent.
 The architecture must admit further policy-enabled models without a hardcoded
-three-backend picker. OpenCode's paid/unknown-cost identities are never enabled
-as a side effect of this work.
+three-backend picker. OpenCode Muse 1.3 is a Task MCP implementation worker,
+not a Manager Chat acceptance route; its activation is specified separately
+in `2026-09-23-opencode-muse-worker-activation-design.md`.
 
 This is the first vertical slice of a larger agent-loop effort. It covers the
 session, model route, safe provider invocation, turn event, and visible-result
@@ -29,15 +29,9 @@ and context compaction. No code or implementation text is copied from
   the manager backend factory supports only those three CLIs
   (`manager_loop.py`, `manager_loop_backends.py`). GLM 5.3 is available through
   `vscode_lm`, but there is no Manager Chat adapter for that host route.
-- On 2026-09-23, canonical settings expose two enabled Muse 1.3 identities.
-  The free identity is observed in OpenCode preflight, and `opencode --version`
-  succeeds in a non-elevated Windows session. Nevertheless, the current factory
-  raises `manager_backend_unavailable:opencode_cli:opencode/muse-spark-1.3-contributor-free`
-  before provider launch. `catalog_declares_route` is false for that dynamic
-  model, and `cli_discovers_model` handles Codex/Claude but not OpenCode.
-- OpenCode workers have a default-deny, exact-name MCP permission config.
-  Manager Chat's OpenCode host launch has no equivalent verified manager
-  permission config. Enabling the model without closing this boundary is unsafe.
+- The current factory supports CLI manager backends but does not yet make
+  `vscode_lm` GLM 5.3 a Manager Chat route. OpenCode's separate worker path
+  must not be changed or promoted to manager eligibility to solve this.
 - Source tree release is 0.11.68 while the connected MCP server reports 0.11.66.
   Source-level tests do not prove installed-runtime behavior until a matching
   package is installed and checked.
@@ -93,14 +87,10 @@ The three acceptance routes are:
 2. An enabled `claude_cli` model: retain its existing streaming adapter and
    conversation resume behavior, but feed it the same route/turn event
    contract and explicit manager tool authority.
-3. `opencode_cli` / `opencode/muse-spark-1.3-contributor-free`: accept the exact
-   preflight-observed identity only when repository policy allows it; do not
-   use a prefix, static seed, or a similarly named paid route as fallback.
-   Supply a request-local, default-deny OpenCode manager config with only
-   exact role-scoped AIWorkHub MCP tool names. Deny raw filesystem/shell edits
-   and undeclared same-prefix tools. Keep names within OpenCode/Muse's measured
-   limit. Do not require Windows elevation or alter machine-wide ACLs without
-   a separately measured need.
+3. An enabled `codex_cli` model: retain its existing CLI adapter and
+   conversation resume behavior, subject to the same route/turn event
+   contract and explicit manager tool authority. An unavailable subscription
+   or route remains unavailable; it is not silently replaced with a worker.
 
 Any adapter unable to provide the safe manager tool boundary must fail closed
 with a precise route/phase reason. Provider listing alone is not proof that a
@@ -129,15 +119,14 @@ stale response from a prior repository/session cannot repaint the current one.
 
 Focused tests must cover auto-ensure/reopen, repository and window isolation,
 write-gate refusal, per-turn route switching, exact policy rejection, the
-three provider adapters, OpenCode's previously failing Muse factory case,
-default-deny manager permissions, terminal status refresh, duplicate/out-of-
-order events, inert rendering, send failure draft retention, and provider
-errors without a stuck session. A source-only adapter test is insufficient:
-after worker implementation and independent manager review, build/install a
-matching VSIX, verify the live MCP version, and run one bounded read-only
-round trip on each of GLM 5.3, Claude, and free Muse 1.3. Record observed
-access/cost/usage truth; do not label a route fully working from preflight or
-unit tests alone.
+three provider adapters, role-scoped manager permissions, terminal status
+refresh, duplicate/out-of-order events, inert rendering, send failure draft
+retention, and provider errors without a stuck session. A source-only adapter
+test is insufficient: after implementation and independent manager review,
+build/install a matching VSIX, verify the live MCP version, and run one bounded
+read-only round trip on each of GLM 5.3, Claude, and Codex when each exact route
+is available. Record observed access/cost/usage truth; do not label a route
+fully working from preflight or unit tests alone.
 
 The manager delegates implementation through canonical Task MCP cards in
 English, each with production call sites and contract tests in its allowed
