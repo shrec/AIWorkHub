@@ -62,6 +62,11 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
+## What's new in 0.11.68
+
+- C/C++ cards launch regardless of the include layout: a header AIWorkHub
+  cannot place is left to the compiler instead of refusing the card.
+
 ## What's new in 0.11.67
 
 - The Manager panel works on Codex: it starts with any model Codex offers and

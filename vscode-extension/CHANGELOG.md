@@ -1,5 +1,12 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.68 — 2026-09-23
+
+### Fixed
+
+- Bundled runtime: C/C++ cards are no longer refused over quoted includes the
+  seeding preflight cannot place.
+
 ## 0.11.67 — 2026-09-23
 
 ### Fixed

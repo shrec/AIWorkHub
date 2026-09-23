@@ -6,6 +6,19 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.68] - 2026-09-23
+
+### Fixed
+
+- A quoted `#include` never refuses a C/C++ card launch. The seeding preflight
+  refused every card whose headers live under a nested include root (for
+  example `src/cpu/include`) with `local_quoted_include_unresolved`, although
+  the compiler resolves those includes itself. Headers are now found through
+  the repository's tracked files at `<dir>/<target>`, and an include that
+  resolves nowhere (generated, system or build-provided) is skipped;
+  untracked files, absolute and `..` targets and symlinks are still never
+  seeded.
+
 ## [0.11.67] - 2026-09-23
 
 ### Fixed

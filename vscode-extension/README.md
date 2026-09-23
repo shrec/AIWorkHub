@@ -14,6 +14,10 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.11.68
+
+- C/C++ cards launch regardless of the include layout.
+
 ## What's new in 0.11.67
 
 - Manager panel: Codex sessions start and keep their conversation.
