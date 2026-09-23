@@ -29,9 +29,12 @@ and context compaction. No code or implementation text is copied from
   the manager backend factory supports only those three CLIs
   (`manager_loop.py`, `manager_loop_backends.py`). GLM 5.3 is available through
   `vscode_lm`, but there is no Manager Chat adapter for that host route.
-- The current factory supports CLI manager backends but does not yet make
-  `vscode_lm` GLM 5.3 a Manager Chat route. OpenCode's separate worker path
-  must not be changed or promoted to manager eligibility to solve this.
+  OpenCode's separate worker path must not be promoted to manager eligibility
+  to solve this.
+- The current focused Python baseline passes 70/70 tests and the webview
+  baseline passes 19/19 tests. These tests do not prove the requested UX:
+  webview cases explicitly require Start and a backend picker, while no
+  auto-ensure, per-turn route, or live end-to-end test exists in that set.
 - Source tree release is 0.11.68 while the connected MCP server reports 0.11.66.
   Source-level tests do not prove installed-runtime behavior until a matching
   package is installed and checked.

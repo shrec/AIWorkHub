@@ -24,6 +24,10 @@ route is implemented or enabled as a side effect of this work.
   round trip. The workforce catalog marks the existing `grok_kilo_cli`
   `xai/grok-4.6` row as manager and implementation worker, launch-eligible,
   but with unknown round-trip truth.
+- The owner reports a successful direct Kilo conversation with Grok 4.7.
+  This is evidence of account-side access, not an AIWorkHub Manager Chat or
+  Task MCP round trip; the exact Kilo model ID and OAuth lifecycle remain
+  to be verified within AIWorkHub.
 - Current source accepts only `xai/grok-4.6` in
   `runtime_adapters.GROK_KILO_SUPPORTED_MODELS`, and its tests explicitly
   reject other model IDs. The Manager Chat backend factory supports only its
