@@ -6,6 +6,42 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.63] - 2026-09-23
+
+### Added
+
+- **Manager chat panel.** The dashboard has a Manager panel: pick a backend
+  (`claude_cli`, `codex_cli`, `opencode_cli`) and a model, start a session and
+  talk to the manager; the transcript streams assistant text, tool calls,
+  callback wake-ups and errors, rendered as text only. It runs on six new
+  verified-manager MCP tools (`aiworkhub_manager_loop_start/send/rotate/status/events/close`);
+  a turn runs in the background and a second message while one runs is
+  refused, never queued (RM-2026-00067).
+- **Callbacks wake the manager by themselves.** While a manager loop session
+  is active it becomes the repository's callback consumer: each review or
+  terminal callback starts a turn through the same lease/ack outbox, acked
+  only after the turn has started, with an hourly cap on automatic turns.
+- The cost ledger reports Claude Code's own manager and subagent usage from
+  its transcripts (usage numbers only, never message content), in a bounded
+  `claude_code_sessions` section.
+- Compact defaults for `environment_preflight`, `task_show`,
+  `agent_task_status` and `manager_workforce_rank`: on this repository the
+  preflight summary went from 37.5 KB to 7.3 KB and the workforce rank from
+  192 KB to 10.7 KB; the exact payload stays one `detail=` call away.
+
+### Fixed
+
+- A validation-only replay now judges mandatory outputs by the predecessor's
+  verified hashes, so a card whose validation failed only for an environment
+  reason can be recovered without re-running the model (NF-2026-00966).
+- Source Graph's LSP enrichment no longer holds the index open across a
+  language-server round trip, which blocked publishing the next generation on
+  Windows (NF-2026-00038).
+- A GLM reviewer that answers in prose gets one corrective turn instead of
+  failing the required correctness review outright (NF-2026-00968).
+- Preflight reports the declared and the resolved provider binary apart
+  (NF-2026-00030).
+
 ## [0.11.62] - 2026-09-23
 
 ### Fixed

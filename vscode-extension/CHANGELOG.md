@@ -1,5 +1,21 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.63 — 2026-09-23
+
+### Added
+
+- Dashboard: a Manager chat panel. Start a manager session on claude_cli,
+  codex_cli or opencode_cli, talk to it, and watch its replies, tool calls
+  and automatic callback wake-ups stream in.
+- Bundled runtime: task callbacks wake an active manager session by
+  themselves; Claude Code usage appears in the cost ledger; manager tools
+  return compact summaries by default.
+
+### Fixed
+
+- Bundled runtime: validation-only replay, Windows LSP enrichment and GLM
+  reviewer prose replies no longer block the task system.
+
 ## 0.11.62 — 2026-09-23
 
 ### Fixed

@@ -62,6 +62,15 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
+## What's new in 0.11.63
+
+- A Manager chat panel in the dashboard, on AIWorkHub's own manager agent
+  loop: any of claude_cli, codex_cli or opencode_cli can hold the manager
+  seat, task callbacks wake it by themselves, and sessions rotate through a
+  handoff so the model can change without losing state.
+- Manager tools return compact summaries by default, and the cost ledger
+  finally sees Claude Code's own manager and subagent usage.
+
 ## What's new in 0.11.62
 
 - Windows: a card sent back for rework runs again. The worker prompt reached

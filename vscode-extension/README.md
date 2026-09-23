@@ -14,6 +14,12 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.11.63
+
+- A Manager chat panel in the dashboard: pick a model, talk to the manager,
+  and see task callbacks wake it by themselves.
+- Compact manager tool summaries and Claude Code usage in the cost ledger.
+
 ## What's new in 0.11.62
 
 - Windows: a card sent back for rework runs again. The worker prompt reaches
