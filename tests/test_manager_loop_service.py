@@ -273,52 +273,59 @@ def test_a_non_manager_loop_error_building_the_entry_surfaces_as_ok_false(
     assert result == {"ok": False, "error": "manager_loop_unavailable:RuntimeError"}
 
 
-def test_start_send_rotate_refuse_without_the_launch_gate(monkeypatch: Any) -> None:
+def _verified_manager(monkeypatch: Any, root: Path) -> list[str]:
+    """A verified manager route and a service that records calls instead of
+    spawning a CLI, so no gate test ever depends on -- or launches with --
+    the ambient identity of the process running the suite."""
+
+    monkeypatch.setattr(
+        server.core,
+        "manager_bootstrap",
+        lambda: {"role": "manager", "repo": str(root), "manager_route": {"thread_id": "t1"}},
+    )
+    calls: list[str] = []
+    for name in ("start", "send", "rotate"):
+        monkeypatch.setattr(
+            manager_loop_service, name, lambda *_a, _n=name: calls.append(_n) or {"ok": True}
+        )
+    return calls
+
+
+def test_start_send_rotate_refuse_without_the_launch_gate(monkeypatch: Any, tmp_path: Path) -> None:
+    calls = _verified_manager(monkeypatch, tmp_path)
     monkeypatch.delenv("AIWORKHUB_ALLOW_LAUNCH", raising=False)
     monkeypatch.setenv("AIWORKHUB_ALLOW_WRITES", "1")
 
-    assert server.aiworkhub_manager_loop_start("claude_cli", "opus") == {
-        "ok": False,
-        "error": "launch_gate_closed",
-    }
-    assert server.aiworkhub_manager_loop_send("hello") == {
-        "ok": False,
-        "error": "launch_gate_closed",
-    }
-    assert server.aiworkhub_manager_loop_rotate("handoff") == {
-        "ok": False,
-        "error": "launch_gate_closed",
-    }
+    refusal = {"ok": False, "error": "launch_gate_closed"}
+    assert server.aiworkhub_manager_loop_start("claude_cli", "opus") == refusal
+    assert server.aiworkhub_manager_loop_send("hello") == refusal
+    assert server.aiworkhub_manager_loop_rotate("handoff") == refusal
+    assert calls == []
 
 
-def test_start_send_rotate_refuse_without_the_write_gate(monkeypatch: Any) -> None:
+def test_start_send_rotate_refuse_without_the_write_gate(monkeypatch: Any, tmp_path: Path) -> None:
+    calls = _verified_manager(monkeypatch, tmp_path)
     monkeypatch.setenv("AIWORKHUB_ALLOW_LAUNCH", "1")
     monkeypatch.delenv("AIWORKHUB_ALLOW_WRITES", raising=False)
 
-    assert server.aiworkhub_manager_loop_start("claude_cli", "opus") == {
-        "ok": False,
-        "error": "write_gate_closed",
-    }
-    assert server.aiworkhub_manager_loop_send("hello") == {
-        "ok": False,
-        "error": "write_gate_closed",
-    }
-    assert server.aiworkhub_manager_loop_rotate("handoff") == {
-        "ok": False,
-        "error": "write_gate_closed",
-    }
+    refusal = {"ok": False, "error": "write_gate_closed"}
+    assert server.aiworkhub_manager_loop_start("claude_cli", "opus") == refusal
+    assert server.aiworkhub_manager_loop_send("hello") == refusal
+    assert server.aiworkhub_manager_loop_rotate("handoff") == refusal
+    assert calls == []
 
 
-def test_start_send_rotate_proceed_past_the_gates_once_both_are_open(monkeypatch: Any) -> None:
+def test_start_send_rotate_proceed_past_the_gates_once_both_are_open(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    calls = _verified_manager(monkeypatch, tmp_path)
     monkeypatch.setenv("AIWORKHUB_ALLOW_LAUNCH", "1")
     monkeypatch.setenv("AIWORKHUB_ALLOW_WRITES", "1")
 
-    for result in (
-        server.aiworkhub_manager_loop_start("claude_cli", "opus"),
-        server.aiworkhub_manager_loop_send("hello"),
-        server.aiworkhub_manager_loop_rotate("handoff"),
-    ):
-        assert result.get("error") not in ("launch_gate_closed", "write_gate_closed")
+    assert server.aiworkhub_manager_loop_start("claude_cli", "opus") == {"ok": True}
+    assert server.aiworkhub_manager_loop_send("hello") == {"ok": True}
+    assert server.aiworkhub_manager_loop_rotate("handoff") == {"ok": True}
+    assert calls == ["start", "send", "rotate"]
 
 
 def test_status_events_close_do_not_require_the_launch_or_write_gate(monkeypatch: Any) -> None:
