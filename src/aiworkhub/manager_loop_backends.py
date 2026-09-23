@@ -53,7 +53,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
-from . import context_capture, platform_io, runtime_adapters, workforce_catalog
+from . import cli_model_discovery, context_capture, platform_io, runtime_adapters, workforce_catalog
 from .manager_loop import ManagerLoopError
 
 MANAGER_BACKEND_IDS: tuple[str, ...] = ("claude_cli", "codex_cli", "opencode_cli")
@@ -208,6 +208,24 @@ def conversation_id_of(event: Mapping[str, Any]) -> str:
         if isinstance(value, str) and value.strip():
             return value.strip()
     return ""
+
+
+def _maybe_record_claude_resolution(
+    backend_id: str, model: str, repo: Path, event: Mapping[str, Any]
+) -> None:
+    """Best effort: a resolved alias is worth recording, never worth failing a turn for."""
+
+    if backend_id != "claude_cli" or model not in cli_model_discovery.CLAUDE_CLI_ALIASES:
+        return
+    if event.get("type") != "system" or event.get("subtype") != "init":
+        return
+    resolved = str(event.get("model") or "").strip()
+    if not resolved:
+        return
+    try:
+        cli_model_discovery.record_claude_resolution(repo, model, resolved)
+    except Exception:  # noqa: BLE001 -- recording is observability, never a turn failure
+        pass
 
 
 def resume_argv(backend_id: str, argv: Sequence[str], conversation_id: str) -> list[str]:
@@ -429,6 +447,7 @@ class CliManagerBackend:
                 if event is None:
                     continue
                 self._conversation_id = self._conversation_id or conversation_id_of(event)
+                _maybe_record_claude_resolution(self.backend_id, self.model, self.repo, event)
                 yield from translate(self.backend_id, event)
         finally:
             watchdog.cancel()

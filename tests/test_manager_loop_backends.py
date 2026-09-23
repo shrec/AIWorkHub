@@ -177,6 +177,54 @@ def test_the_first_turn_carries_the_brief_and_the_next_resumes_the_captured_id(t
     cli.close()
 
 
+def test_a_claude_cli_turns_system_init_event_records_the_aliass_resolution(tmp_path: Path, monkeypatch):
+    fake = FakeCli(
+        tmp_path,
+        [[
+            {"type": "system", "subtype": "init", "session_id": "conv-1", "model": "claude-opus-5"},
+            {"type": "result", "usage": {}},
+        ]],
+    )
+    cli = mlb.CliManagerBackend(
+        "claude_cli", "opus", fake.root, plan_builder=fake.plan_builder, spawn=fake.spawn,
+    )
+    recorded: list[tuple[Any, str, str]] = []
+    monkeypatch.setattr(
+        mlb.cli_model_discovery,
+        "record_claude_resolution",
+        lambda repo, alias, resolved: recorded.append((repo, alias, resolved)),
+    )
+    cli.start("brief")
+    drain(cli.send("go"))
+
+    assert recorded == [(fake.root, "opus", "claude-opus-5")]
+    cli.close()
+
+
+def test_a_record_claude_resolution_failure_never_fails_the_turn(tmp_path: Path, monkeypatch):
+    fake = FakeCli(
+        tmp_path,
+        [[
+            {"type": "system", "subtype": "init", "session_id": "conv-2", "model": "claude-opus-5"},
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": "hi"}]}},
+            {"type": "result", "usage": {}},
+        ]],
+    )
+    cli = mlb.CliManagerBackend(
+        "claude_cli", "opus", fake.root, plan_builder=fake.plan_builder, spawn=fake.spawn,
+    )
+
+    def _boom(*_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(mlb.cli_model_discovery, "record_claude_resolution", _boom)
+    cli.start("brief")
+    events = drain(cli.send("go"))
+
+    assert kinds(events) == ["assistant_text", "turn_end"]
+    cli.close()
+
+
 @pytest.mark.parametrize(
     ("backend_id", "argv", "expected"),
     [

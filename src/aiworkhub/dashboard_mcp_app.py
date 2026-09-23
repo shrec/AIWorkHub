@@ -24,6 +24,7 @@ from typing import Any, Mapping
 
 from aiworkhub import (
     __version__,
+    cli_model_discovery,
     core,
     context_graph,
     dashboard,
@@ -1472,6 +1473,51 @@ def _model_policy_view(
                 "discovered_from_opencode": True,
             }
         )
+    # CLI-owned model lists (see cli_model_discovery): a discovered model that
+    # a declared row already names only labels that row.
+    cli_discovered = (
+        ("openai", "codex_cli", cli_model_discovery.codex_models()),
+        ("anthropic", "claude_cli", cli_model_discovery.claude_models(root)),
+    )
+    for vendor, cli_adapter, entries in cli_discovered:
+        cli_provider, route_adapter = workforce_catalog.policy_route_identity(vendor, cli_adapter)
+        for entry in entries:
+            model = str(entry.get("model") or "")[:128]
+            if not model:
+                continue
+            label = str(entry.get("label") or model)[:128]
+            key = (cli_provider, route_adapter, model)
+            discovered_count += 1
+            if key in existing:
+                for worker in workers:
+                    if (worker["provider"], worker["adapter"], worker["model"]) == key:
+                        worker["discovered_from_cli"] = True
+                        worker["label"] = label
+                continue
+            inventory_only_count += 1
+            existing.add(key)
+            workers.append(
+                {
+                    "worker_id": "",
+                    "provider": cli_provider[:128],
+                    "adapter": route_adapter[:128],
+                    "model": model,
+                    "vendor_provider": vendor,
+                    "declared_adapter": cli_adapter,
+                    "catalog_enabled": True,
+                    "effective_enabled": _route_policy_enabled(
+                        policy,
+                        provider=cli_provider,
+                        adapter=route_adapter,
+                        model=model,
+                        vendor_provider=vendor,
+                        declared_adapter=cli_adapter,
+                    ),
+                    "inventory_only": True,
+                    "discovered_from_cli": True,
+                    "label": label,
+                }
+            )
     # Every ingestion source above can arrive already truncated, and none of
     # them says so on its own. ``parse_opencode_models_output`` stops at its own
     # 64-row cap before ``opencode_identities_from_preflight`` returns, and the

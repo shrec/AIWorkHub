@@ -77,6 +77,11 @@ def _isolate_dashboard(monkeypatch):
     monkeypatch.setattr(dashboard, "build_snapshot", _boom)
     monkeypatch.setattr(dashboard, "build_task_detail", _boom)
     monkeypatch.setattr(core, "health", _boom)
+    # Discovery reads real provider-owned state (a home-directory Codex cache,
+    # a repo-scoped Claude resolutions file); a test that wants either must
+    # opt in explicitly rather than see whatever happens to sit on this host.
+    monkeypatch.setattr(dashboard_mcp_app.cli_model_discovery, "codex_models", lambda **_kwargs: [])
+    monkeypatch.setattr(dashboard_mcp_app.cli_model_discovery, "claude_models", lambda _root: [])
     yield
 
 
@@ -1137,6 +1142,83 @@ def _stub_model_policy_sources(
         "opencode_identities_from_preflight",
         lambda _preflight: list(identities),
     )
+
+
+def test_codex_cli_discovered_rows_enrich_and_add_without_duplicating(monkeypatch):
+    # A discovered slug equal to a configured row's model must enrich that row
+    # with a label rather than appear a second time; a slug the catalog has
+    # never heard of is the whole point of discovery and must appear on its
+    # own, governed by the same model-policy toggle every other route uses.
+    catalog_rows = [
+        {"worker_id": "gpt-5.5", "adapter_id": "codex_cli", "model": "gpt-5.5", "provider": "openai", "enabled": True},
+    ]
+    _stub_model_policy_sources(monkeypatch, catalog_rows=catalog_rows)
+    monkeypatch.setattr(
+        dashboard_mcp_app.cli_model_discovery,
+        "codex_models",
+        lambda **_kwargs: [
+            {"model": "gpt-5.5", "label": "GPT-5.5", "priority": 1},
+            {"model": "gpt-6-astra", "label": "GPT-6 Astra", "priority": 0},
+        ],
+    )
+
+    catalog = dashboard_mcp_app._model_policy_view(Path("/repo"))["catalog"]
+    workers = catalog["workers"]
+
+    matches = [row for row in workers if row["model"] == "gpt-5.5"]
+    assert len(matches) == 1, "the discovered slug enriches the configured row instead of duplicating it"
+    assert matches[0]["label"] == "GPT-5.5"
+    assert matches[0]["inventory_only"] is False
+
+    astra = next(row for row in workers if row["model"] == "gpt-6-astra")
+    assert astra["provider"] == "openai"
+    assert astra["adapter"] == "codex_cli"
+    assert astra["inventory_only"] is True
+    assert astra["discovered_from_cli"] is True
+    assert astra["label"] == "GPT-6 Astra"
+    assert astra["effective_enabled"] is True
+
+
+def test_claude_cli_alias_rows_are_labelled_and_governed_by_policy(monkeypatch):
+    # The alias itself is what a manager turn launches, so it must stay the
+    # row's model even once a real run has resolved it to a concrete id; the
+    # resolved id only ever becomes the label.
+    catalog_rows = [
+        {"worker_id": "claude-opus-5", "adapter_id": "claude_cli", "model": "opus", "provider": "anthropic", "enabled": True},
+    ]
+    _stub_model_policy_sources(monkeypatch, catalog_rows=catalog_rows)
+    monkeypatch.setattr(
+        dashboard_mcp_app.model_settings,
+        "load",
+        lambda _root: _fake_model_settings({"anthropic": {"claude_cli": {"fable": False}}}),
+    )
+    monkeypatch.setattr(
+        dashboard_mcp_app.cli_model_discovery,
+        "claude_models",
+        lambda _root: [
+            {"model": "opus", "label": "claude-opus-5 (opus)"},
+            {"model": "sonnet", "label": "sonnet"},
+            {"model": "haiku", "label": "haiku"},
+            {"model": "fable", "label": "fable"},
+        ],
+    )
+
+    catalog = dashboard_mcp_app._model_policy_view(Path("/repo"))["catalog"]
+    workers = catalog["workers"]
+
+    opus_rows = [row for row in workers if row["model"] == "opus"]
+    assert len(opus_rows) == 1, "the resolved alias enriches the configured row instead of duplicating it"
+    assert opus_rows[0]["label"] == "claude-opus-5 (opus)"
+    assert opus_rows[0]["model"] == "opus", "the launched alias is never replaced by the resolved id"
+
+    sonnet = next(row for row in workers if row["model"] == "sonnet")
+    assert sonnet["inventory_only"] is True
+    assert sonnet["discovered_from_cli"] is True
+    assert sonnet["effective_enabled"] is True
+
+    fable = next(row for row in workers if row["model"] == "fable")
+    assert fable["inventory_only"] is True
+    assert fable["effective_enabled"] is False, "the model-policy toggle still governs a discovered row"
 
 
 @pytest.mark.parametrize(

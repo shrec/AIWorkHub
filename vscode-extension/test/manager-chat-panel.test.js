@@ -514,6 +514,41 @@ test("the model select is filled from the settings payload's enabled models for 
   assert.equal(harness.elements.managerChatStart.disabled, false);
 });
 
+test("a discovered row's label is shown as the option text while the value stays the model that gets launched", () => {
+  const harness = loadWebviewSlice();
+  harness.state.featureSettings = {
+    ok: true,
+    revision: 1,
+    model_policy: {
+      ok: true,
+      revision: 1,
+      catalog: {
+        workers: [
+          { provider: "anthropic", adapter: "claude_cli", model: "opus", worker_id: "claude-opus-5", effective_enabled: true, catalog_enabled: true, label: "claude-opus-5 (opus)" },
+          { provider: "anthropic", adapter: "claude_cli", model: "fable", worker_id: "", effective_enabled: true, catalog_enabled: true, inventory_only: true, discovered_from_cli: true, label: "fable" },
+        ],
+      },
+      providers: {},
+    },
+  };
+  harness.elements.managerChatBackendSelect.value = "claude_cli";
+
+  harness.api.populateManagerChatModelOptions();
+
+  const options = harness.elements.managerChatModelInput.children;
+  assert.deepEqual(options.map((option) => option.value), ["opus", "fable"], "the value sent on Start is always the launched alias");
+  assert.equal(options[0].textContent, "claude-opus-5 (opus)", "the option shows the resolved version, not the bare alias");
+  assert.equal(options[1].textContent, "fable", "a row with no resolved version yet falls back to its bare name");
+  assert.equal(harness.elements.managerChatModelInput.value, "opus");
+
+  trigger(harness.elements.managerChatStart, "click");
+  assert.deepEqual(plain(harness.posts.at(-1)), {
+    type: "managerLoopStart",
+    backendId: "claude_cli",
+    model: "opus",
+  });
+});
+
 test("switching backend repopulates the options and remembers the owner's last choice per backend for the session", () => {
   const harness = loadWebviewSlice();
   harness.state.featureSettings = MANAGER_CHAT_MODEL_POLICY_PAYLOAD;

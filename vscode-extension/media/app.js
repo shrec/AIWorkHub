@@ -7000,10 +7000,13 @@ function managerChatEnabledModels(backendId) {
     : null;
   const workers = modelPolicy && Array.isArray(modelPolicy.catalog?.workers) ? modelPolicy.catalog.workers : [];
   const models = [];
+  const seen = new Set();
   for (const row of workers) {
     if (!row || String(row.adapter || "") !== backendId || !row.effective_enabled) continue;
     const model = String(row.model || row.worker_id || "");
-    if (model && !models.includes(model)) models.push(model);
+    if (!model || seen.has(model)) continue;
+    seen.add(model);
+    models.push({ model, label: row.label ? String(row.label) : "" });
   }
   return models;
 }
@@ -7020,12 +7023,13 @@ function populateManagerChatModelOptions() {
     select.replaceChildren(hint);
     select.value = "";
   } else {
+    const modelValues = models.map((entry) => entry.model);
     const remembered = state.managerChatModelByBackend[backendId];
-    const initial = remembered && models.includes(remembered) ? remembered : models[0];
+    const initial = remembered && modelValues.includes(remembered) ? remembered : modelValues[0];
     const fragment = document.createDocumentFragment();
-    for (const model of models) {
-      const option = createElement("option", "", model);
-      option.value = model;
+    for (const entry of models) {
+      const option = createElement("option", "", entry.label || entry.model);
+      option.value = entry.model;
       fragment.appendChild(option);
     }
     select.replaceChildren(fragment);
