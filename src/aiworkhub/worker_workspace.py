@@ -2366,11 +2366,14 @@ def _resolve_local_quoted_includes(
     followed), resolve each quoted path using compiler-style rules (current-file
     directory first, then each configured repository include root), and
     recursively collect the transitive closure of real regular files reachable
-    from the declared inputs.
+    from the declared inputs.  A target neither rule finds is looked up among
+    the repository's tracked files at ``<dir>/<target>`` -- the compiler's view
+    with the project's own ``-I<dir>``, whatever build system declares it.
 
-    Unresolvable quoted includes are *fail-closed*: the function raises
-    ``WorkspaceError`` with an exact, bounded missing-dependency list so the
-    coordinator can reject launch before a worker model spends tokens.
+    This only seeds headers the worker may want to read; the compiler resolves
+    includes itself.  An include that still resolves nowhere (a generated,
+    system or build-provided header) is skipped, never a launch refusal, and
+    an escaping target (absolute, ``..``, symlink) is never seeded.
 
     Returns the augmented, sorted, deduplicated seed list.  Callers must still
     respect ``MAX_SEED_FILES``, symlink rejection, and beneath-root checks.
@@ -2381,9 +2384,9 @@ def _resolve_local_quoted_includes(
     normalized_roots = _normalize_include_roots(repo, include_roots)
 
     resolved: dict[str, str] = {}  # repo-relative path -> including relative (provenance)
-    missing: dict[str, str] = {}    # unresolved include string -> first including relative
     pending: list[str] = list(seeded)
     seen: set[str] = set()
+    tracked: list[str] | None = None  # loaded on the first include the roots miss
 
     while pending:
         relative = pending.pop()
@@ -2413,26 +2416,20 @@ def _resolve_local_quoted_includes(
             candidate = _resolve_one_quoted_include(
                 repo, including_dir, include_target, normalized_roots
             )
-            if candidate is None:
-                if include_target not in missing:
-                    missing[include_target] = relative
-                continue
-            candidate_relative = candidate.relative_to(repo).as_posix()
-            if candidate.is_symlink():
-                continue
-            if not candidate.is_file():
-                if include_target not in missing:
-                    missing[include_target] = relative
-                continue
-            if candidate_relative not in resolved:
-                resolved[candidate_relative] = relative
-                if candidate_relative not in seen:
-                    pending.append(candidate_relative)
-
-    if missing:
-        items = sorted(missing.items(), key=lambda kv: kv[0])[:32]
-        detail = "; ".join(f"{inc} (from {src})" for inc, src in items)
-        raise WorkspaceError(f"local_quoted_include_unresolved:{detail}")
+            if candidate is not None:
+                matches = [candidate.relative_to(repo).as_posix()]
+            else:
+                if tracked is None:
+                    tracked = _tracked_repository_files(repo)
+                matches = _tracked_include_matches(tracked, include_target)
+            for match_relative in matches:
+                match_path = repo / match_relative
+                if match_path.is_symlink() or not match_path.is_file():
+                    continue
+                if match_relative not in resolved:
+                    resolved[match_relative] = relative
+                    if match_relative not in seen:
+                        pending.append(match_relative)
 
     augmented = sorted(set(seeded) | set(resolved.keys()))
     if len(augmented) > MAX_SEED_FILES:
@@ -2524,6 +2521,34 @@ def _resolve_one_quoted_include(
             return candidate
 
     return None
+
+
+_MAX_TRACKED_INCLUDE_MATCHES = 8
+
+
+def _tracked_repository_files(repo: Path) -> list[str]:
+    """Every git-tracked file, repo-relative; any git failure yields []."""
+    try:
+        completed = _run(
+            ["git", "ls-files", "-z", "--full-name"],
+            cwd=repo,
+            timeout=_LITERAL_ASSET_TRACKED_TIMEOUT_SECONDS,
+            phase="workspace_provision",
+        )
+    except (GitCommandTimeout, subprocess.SubprocessError, OSError, ValueError):
+        return []
+    if completed.returncode != 0:
+        return []
+    return [row for row in completed.stdout.split("\x00") if row]
+
+
+def _tracked_include_matches(tracked: list[str], target: str) -> list[str]:
+    """Tracked files at ``<dir>/<target>``: only tracked, never ``..`` or absolute."""
+    norm = target.replace("\\", "/")
+    if not norm or norm.startswith("/") or ":" in norm or ".." in norm.split("/"):
+        return []
+    suffix = "/" + norm
+    return sorted(row for row in tracked if row.endswith(suffix))[:_MAX_TRACKED_INCLUDE_MATCHES]
 
 
 def _safe_include_candidate(repo: Path, base: Path, target: str) -> Path | None:

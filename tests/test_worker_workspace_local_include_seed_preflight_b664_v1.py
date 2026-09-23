@@ -157,26 +157,28 @@ def _unresolvable_repo(tmp_path: Path) -> Path:
     return repo
 
 
-def test_unresolvable_quoted_include_fails_closed(
+def test_unresolvable_quoted_include_is_skipped_not_refused(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
+    """The compiler resolves includes itself; a header found nowhere (generated,
+    system, build-provided) is simply not seeded and never refuses a launch."""
     repo = _unresolvable_repo(tmp_path)
     monkeypatch.setenv(
         worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "worktrees")
     )
-    with pytest.raises(
-        worker_workspace.WorkspaceError,
-        match=r"local_quoted_include_unresolved:.*nonexistent_local_header_v99",
-    ):
-        worker_workspace.create_workspace(
-            repo,
-            "unresolvable",
-            {
-                "allowed_writes": ["out/result.txt"],
-                "read_first": ["read/broken.h"],
-            },
-            "validation",
-        )
+    workspace = worker_workspace.create_workspace(
+        repo,
+        "unresolvable",
+        {
+            "allowed_writes": ["out/result.txt"],
+            "read_first": ["read/broken.h"],
+        },
+        "validation",
+    )
+    try:
+        assert (workspace.path / "read/broken.h").is_file()
+    finally:
+        worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
 
 
 # ---------------------------------------------------------------------------
@@ -607,13 +609,10 @@ def test_absolute_and_traversal_escape_includes_fail_closed_with_evidence(
     assert _git(repo, "add", ".").returncode == 0
     assert _git(repo, "commit", "-qm", "escape-fixture").returncode == 0
 
-    with pytest.raises(
-        worker_workspace.WorkspaceError,
-        match=rf"local_quoted_include_unresolved:.*{re.escape(needle)}",
-    ):
-        worker_workspace._resolve_local_quoted_includes(
-            repo, ["src/nested/escape.c"], include_roots=(".",)
-        )
+    assert needle
+    assert worker_workspace._resolve_local_quoted_includes(
+        repo, ["src/nested/escape.c"], include_roots=(".",)
+    ) == ["src/nested/escape.c"]
 
 
 def test_symlink_escape_include_under_declared_root_fails_closed_with_evidence(
@@ -635,13 +634,9 @@ def test_symlink_escape_include_under_declared_root_fails_closed_with_evidence(
     assert _git(repo, "add", ".").returncode == 0
     assert _git(repo, "commit", "-qm", "symlink-escape-fixture").returncode == 0
 
-    with pytest.raises(
-        worker_workspace.WorkspaceError,
-        match=r"local_quoted_include_unresolved:.*ufsecp/escape.h",
-    ):
-        worker_workspace._resolve_local_quoted_includes(
-            repo, ["src/main.c"], include_roots=("include",)
-        )
+    assert worker_workspace._resolve_local_quoted_includes(
+        repo, ["src/main.c"], include_roots=("include",)
+    ) == ["src/main.c"]
 
 
 # ---------------------------------------------------------------------------
@@ -702,7 +697,7 @@ def test_conventional_include_roots_seed_transitive_closure_from_src(
         worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
 
 
-def test_conventional_include_roots_still_fail_closed_on_absent_header(
+def test_conventional_include_roots_skip_an_absent_header(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
     repo = _cmake_layout_repo(
@@ -711,22 +706,20 @@ def test_conventional_include_roots_still_fail_closed_on_absent_header(
     monkeypatch.setenv(
         worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "worktrees")
     )
-    with pytest.raises(
-        worker_workspace.WorkspaceError,
-        match=(
-            r"^local_quoted_include_unresolved:"
-            r"pkg/core/absent\.hpp \(from src/broken\.cpp\)$"
-        ),
-    ):
-        worker_workspace.create_workspace(
-            repo,
-            "cmake-layout-absent",
-            {
-                "allowed_writes": ["out/result.txt"],
-                "read_first": ["src/audit.cpp", "src/broken.cpp"],
-            },
-            "validation",
-        )
+    workspace = worker_workspace.create_workspace(
+        repo,
+        "cmake-layout-absent",
+        {
+            "allowed_writes": ["out/result.txt"],
+            "read_first": ["src/audit.cpp", "src/broken.cpp"],
+        },
+        "validation",
+    )
+    try:
+        assert (workspace.path / "src/broken.cpp").is_file()
+        assert not (workspace.path / "include/pkg/core/absent.hpp").exists()
+    finally:
+        worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
 
 
 def test_conventional_include_root_closure_respects_max_seed_files(
@@ -753,8 +746,8 @@ def test_conventional_include_root_closure_respects_max_seed_files(
 def test_symlinked_or_reparse_include_root_is_never_searched(
     kind: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
-    """An include/ that is a link is not a root: the header it would supply
-    stays unresolved, so the launch is refused rather than widened."""
+    """An include/ that is a link is never searched: the header resolves only
+    to its real tracked path, never through the link."""
     repo = tmp_path / "parent"
     repo.mkdir()
     assert _git(repo, "init", "-q").returncode == 0
@@ -784,16 +777,47 @@ def test_symlinked_or_reparse_include_root_is_never_searched(
     assert _git(repo, "commit", "-qm", f"{kind}-include-root").returncode == 0
 
     assert worker_workspace._repository_include_roots(repo) == ("src",)
-    monkeypatch.setenv(
-        worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "worktrees")
-    )
-    with pytest.raises(
-        worker_workspace.WorkspaceError,
-        match=r"^local_quoted_include_unresolved:pkg/x\.hpp \(from src/main\.cpp\)$",
-    ):
-        worker_workspace.create_workspace(
-            repo,
-            f"{kind}-include-root",
-            {"allowed_writes": ["out/result.txt"], "read_first": ["src/main.cpp"]},
-            "validation",
-        )
+    assert worker_workspace._resolve_local_quoted_includes(
+        repo, ["src/main.cpp"], include_roots=(".", "src")
+    ) == ["real_headers/pkg/x.hpp", "src/main.cpp"]
+
+
+# ---------------------------------------------------------------------------
+# Nested include roots (e.g. src/cpu/include) resolve through tracked files.
+# ---------------------------------------------------------------------------
+def _nested_root_repo(tmp_path: Path, *, track_header: bool) -> Path:
+    repo = tmp_path / "parent"
+    repo.mkdir()
+    assert _git(repo, "init", "-q").returncode == 0
+    assert _git(repo, "config", "user.email", "b664@example.invalid").returncode == 0
+    assert _git(repo, "config", "user.name", "B664").returncode == 0
+    header = repo / "src/cpu/include/secp256k1/detail/batch_pool.hpp"
+    header.parent.mkdir(parents=True)
+    header.write_text("#pragma once\n", encoding="utf-8")
+    source = repo / "src/cpu/src/pool.cpp"
+    source.parent.mkdir(parents=True)
+    source.write_text('#include "secp256k1/detail/batch_pool.hpp"\n', encoding="utf-8")
+    assert _git(repo, "add", "src/cpu/src/pool.cpp").returncode == 0
+    if track_header:
+        assert _git(repo, "add", header.relative_to(repo).as_posix()).returncode == 0
+    assert _git(repo, "commit", "-qm", "nested-root").returncode == 0
+    return repo
+
+
+def test_a_nested_include_root_resolves_through_tracked_files(tmp_path: Path) -> None:
+    repo = _nested_root_repo(tmp_path, track_header=True)
+
+    assert worker_workspace._resolve_local_quoted_includes(
+        repo, ["src/cpu/src/pool.cpp"], include_roots=(".", "src")
+    ) == [
+        "src/cpu/include/secp256k1/detail/batch_pool.hpp",
+        "src/cpu/src/pool.cpp",
+    ]
+
+
+def test_an_untracked_header_is_never_seeded_by_the_fallback(tmp_path: Path) -> None:
+    repo = _nested_root_repo(tmp_path, track_header=False)
+
+    assert worker_workspace._resolve_local_quoted_includes(
+        repo, ["src/cpu/src/pool.cpp"], include_roots=(".", "src")
+    ) == ["src/cpu/src/pool.cpp"]
