@@ -107,8 +107,9 @@ _PYTHON_SUFFIXES: frozenset[str] = frozenset({".py", ".pyi"})
 # possibly-None shapes below (``with sqlite3.connect``, an unclosed ``open``/
 # socket handle, an unchecked ``.get``/``re.match`` result, an ``or 0``/``or {}``
 # coercion) are all lexically present in Python and were found by hand in this
-# repo.  ``crashes`` (division / explicit termination) is likewise meaningful in
-# Python once guard and operand handling are language-aware.
+# repo.  ``crashes`` still runs on Python lexically, but the recorded
+# adjudication corpus is TP=0, FP=2, precision=0.0, so those hits are
+# uncalibrated advisory evidence and must not be confirmed, blocking, or gating.
 #
 # ``rawptrs``, ``casts`` and ``looprisks`` stay C-only on purpose: their shapes
 # have no Python analogue — Python has no raw pointer declarations, no
@@ -128,6 +129,12 @@ _RISK_MODE_LANGUAGES: dict[str, frozenset[str]] = {
     "nullrisks": _C_AND_PYTHON,
     "crashes": _C_AND_PYTHON,
 }
+# Recorded risk-mode adjudication: crashes/python precision is 0.0 (TP=0, FP=2).
+# C++ crashes, nullrisks and rawptrs are not in this set and stay trusted.
+# Do not promote this pair until a recorded corpus proves nonzero precision.
+_UNCALIBRATED_RISK_LENSES: frozenset[tuple[str, str]] = frozenset({
+    ("crashes", "python"),
+})
 
 _BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/", re.S)
 _TRIPLE_STRING_RE = re.compile(
@@ -887,6 +894,8 @@ def _risk_views(
     budget: int,
 ) -> dict[str, Any]:
     findings: list[dict[str, Any]] = []
+    advisory_findings: list[dict[str, Any]] = []
+    python_crashes_in_scope = False
     duplicate_groups: defaultdict[str, list[dict[str, Any]]] = defaultdict(list)
     applicable_languages = _RISK_MODE_LANGUAGES.get(mode)
     scanned = 0
@@ -908,6 +917,8 @@ def _risk_views(
             skipped_by_language[language] += 1
             continue
         applicable_candidates += 1
+        if mode == "crashes" and language == "python":
+            python_crashes_in_scope = True
         source = _symbol_source(repo_root, row)
         if not source:
             continue
@@ -941,6 +952,8 @@ def _risk_views(
                         reasons.append(f"unguarded_pointer_dereference:{name}")
                         break
         elif mode == "crashes":
+            # Same lexical shapes for both languages. Python results are
+            # demoted at record time; this branch itself is not a calibration.
             divisors = set(_DIVISION_RE.findall(masked))
             for name in sorted(divisors):
                 if not _is_guarded(masked, name):
@@ -970,14 +983,32 @@ def _risk_views(
             ).strip()
             if len(normalized) >= 80:
                 duplicate_groups[hashlib.sha256(normalized.encode()).hexdigest()].append(row)
-        if reasons and len(findings) < budget:
-            findings.append({
+        if reasons:
+            record = {
                 "file_path": row.get("file_path"),
                 "qualname": row.get("qualname"),
                 "line_start": row.get("line_start"),
                 "reasons": reasons,
                 "evidence_class": "bounded_lexical_candidate_not_proven_defect",
-            })
+            }
+            if (mode, language) in _UNCALIBRATED_RISK_LENSES:
+                # Zero-precision Python crashes must not enter the trusted
+                # findings list that callers count as review evidence.
+                if len(advisory_findings) < budget:
+                    record["evidence_class"] = (
+                        "uncalibrated_advisory_not_confirmed_or_blocking"
+                    )
+                    record["authority"] = "uncalibrated"
+                    record["advisory"] = True
+                    record["trusted"] = False
+                    record["gating"] = False
+                    record["confirmed"] = False
+                    record["blocking"] = False
+                    record["blocks_acceptance"] = False
+                    record["triggers_rework"] = False
+                    advisory_findings.append(record)
+            elif len(findings) < budget:
+                findings.append(record)
     if mode == "duplicates":
         findings = [
             {
@@ -1031,6 +1062,27 @@ def _risk_views(
             "limitation": (
                 "no_incoming_edge_is_unresolved_static_reachability_not_runtime_proof"
             ),
+        }
+    if python_crashes_in_scope:
+        # Recorded crashes/python precision is 0.0. These hits stay visible as
+        # advisory evidence, but they are not confirmed, blocking, or gating.
+        advisory = advisory_findings[:budget]
+        result["advisory_findings"] = advisory
+        result["confirmed_findings"] = []
+        result["blocking_findings"] = []
+        result["confirmed_finding_count"] = 0
+        result["blocking_finding_count"] = 0
+        result["python_crashes"] = {
+            "authority": "uncalibrated",
+            "advisory": True,
+            "trusted": False,
+            "gating": False,
+            "confirmed": False,
+            "blocking": False,
+            "blocks_acceptance": False,
+            "triggers_rework": False,
+            "finding_count": len(advisory),
+            "reason": "measured_precision_zero_not_a_calibrated_lens",
         }
     return result
 

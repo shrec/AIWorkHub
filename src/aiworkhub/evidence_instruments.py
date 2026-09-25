@@ -700,6 +700,16 @@ def session_token_profile(repo_root: Path | str, *, task_id: str | None = None) 
     }
 
 
+def _risk_precision_lens_uncalibrated(mode: str, language: str) -> bool:
+    """True when a measured lens must not gate or count as trusted evidence.
+
+    crashes/python is the recorded zero-precision lens (TP=0, FP=2). Calibrated
+    C++ lenses are not listed here and keep their measured buckets unchanged.
+    """
+
+    return mode == "crashes" and language.strip().lower() in {"python", "py"}
+
+
 def risk_mode_precision_bench(
     repo_root: Path | str,
     *,
@@ -719,20 +729,42 @@ def risk_mode_precision_bench(
         key = (str(row.get("mode") or "unknown"), str(row.get("language") or "unknown"))
         buckets[key]["adjudicated"] += 1
         buckets[key]["tp" if row.get("correct") is True else "fp"] += 1
-    results = []
+    trusted: list[dict[str, Any]] = []
+    advisory: list[dict[str, Any]] = []
     for (mode, language), counts in sorted(buckets.items()):
         denominator = counts["tp"] + counts["fp"]
-        results.append({
+        bucket = {
             "mode": mode,
             "language": language,
             **counts,
             "precision": round(counts["tp"] / denominator, 6) if denominator else None,
-        })
+        }
+        if _risk_precision_lens_uncalibrated(mode, language):
+            # Keep the measured precision visible, but do not let a zero-precision
+            # Python crashes bucket gate acceptance or trigger rework.
+            advisory.append({
+                **bucket,
+                "authority": "uncalibrated",
+                "advisory": True,
+                "trusted": False,
+                "gating": False,
+                "confirmed": False,
+                "blocking": False,
+                "blocks_acceptance": False,
+                "triggers_rework": False,
+                "reason": "measured_precision_zero_not_a_calibrated_lens",
+            })
+        else:
+            trusted.append(bucket)
     return {
         "schema_id": "aiworkhub.risk_mode_precision.v1",
-        "status": "measured" if results else "inconclusive",
-        "measured": bool(results),
-        "buckets": results,
+        "status": "measured" if trusted or advisory else "inconclusive",
+        "measured": bool(trusted or advisory),
+        "buckets": trusted,
+        "advisory_buckets": advisory,
+        "gating_buckets": trusted,
+        "blocks_acceptance": False,
+        "triggers_rework": False,
         "cap_policy_changed": False,
     }
 

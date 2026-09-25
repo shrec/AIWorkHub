@@ -208,12 +208,17 @@ def test_crashes_ignores_path_separators_inside_string_literals(tmp_path: Path) 
         rows = _entities(conn, "pkg/service.py")
         service = [r for r in rows if r["name"] == "routing_service"]
         analysis = _analysis(conn, repo, "crashes", service)
-        reasons = [r for finding in analysis["findings"] for r in finding["reasons"]]
+        reasons = [
+            reason
+            for finding in analysis["findings"] + analysis.get("advisory_findings", [])
+            for reason in finding["reasons"]
+        ]
         # Before: "src/aiworkhub/service" produced unchecked_divisor:service,
         # :READY, :predecessor, :KeyboardInterrupt. After: the string is masked.
         for ghost in ("service", "READY", "predecessor", "KeyboardInterrupt"):
             assert f"unchecked_divisor:{ghost}" not in reasons, ghost
         assert analysis["findings"] == []
+        assert analysis.get("advisory_findings", []) == []
     finally:
         conn.close()
 
@@ -231,6 +236,9 @@ def test_python_colon_guard_on_divisor_produces_no_crash_finding(tmp_path: Path)
         # ``if divisor:`` immediately precedes ``total / divisor``.
         assert analysis["status"] == "available"
         assert analysis["findings"] == []
+        assert analysis.get("advisory_findings", []) == []
+        assert analysis["confirmed_finding_count"] == 0
+        assert analysis["blocking_finding_count"] == 0
     finally:
         conn.close()
 
@@ -251,9 +259,49 @@ def test_crashes_detects_unguarded_and_floor_division_on_python(tmp_path: Path) 
         for name in ("unguarded_divide", "floor_divide"):
             symbol = [r for r in rows if r["name"] == name]
             analysis = _analysis(conn, repo, "crashes", symbol)
-            reasons = [r for finding in analysis["findings"] for r in finding["reasons"]]
-            # crashes is applicable to Python and ``//`` floor division counts.
+            # Lexical hits remain visible, but a precision-zero lens cannot be
+            # a confirmed or blocking finding and cannot gate acceptance.
+            assert analysis["findings"] == [], name
+            assert analysis["confirmed_findings"] == [], name
+            assert analysis["blocking_findings"] == [], name
+            assert analysis["confirmed_finding_count"] == 0, name
+            assert analysis["blocking_finding_count"] == 0, name
+            assert analysis["blocking"] is False, name
+            authority = analysis["python_crashes"]
+            assert authority["authority"] == "uncalibrated", name
+            assert authority["advisory"] is True, name
+            assert authority["trusted"] is False, name
+            assert authority["gating"] is False, name
+            assert authority["confirmed"] is False, name
+            assert authority["blocking"] is False, name
+            assert authority["blocks_acceptance"] is False, name
+            assert authority["triggers_rework"] is False, name
+            advisory = analysis["advisory_findings"]
+            assert advisory, name
+            assert all(
+                row["confirmed"] is False and row["blocking"] is False
+                for row in advisory
+            ), name
+            reasons = [r for finding in advisory for r in finding["reasons"]]
             assert "unchecked_divisor:divisor" in reasons, name
+    finally:
+        conn.close()
+
+
+def test_cpp_crashes_stay_trusted_findings(tmp_path: Path) -> None:
+    repo, conn = _indexed(tmp_path, "native/engine.cpp", _C_CORPUS)
+    try:
+        rows = _entities(conn, "native/engine.cpp")
+        symbol = [r for r in rows if r["name"] == "cprobe_crashy"]
+        analysis = _analysis(conn, repo, "crashes", symbol)
+        reasons = [r for finding in analysis["findings"] for r in finding["reasons"]]
+        assert "unchecked_divisor:divisor" in reasons
+        assert analysis["findings"][0]["evidence_class"] == (
+            "bounded_lexical_candidate_not_proven_defect"
+        )
+        assert "advisory_findings" not in analysis
+        assert "python_crashes" not in analysis
+        assert analysis["blocking"] is False
     finally:
         conn.close()
 
@@ -272,7 +320,13 @@ _DETERMINISM_SCRIPT = (
     "         'line_start': 1, 'line_end': 3, 'signature': '', 'confidence': 1.0}]\n"
     "analysis = analytics._risk_views(sqlite3.connect(':memory:'), Path(sys.argv[1]),\n"
     "                                 'crashes', rows, budget=20)\n"
-    "reasons = [r for f in analysis['findings'] for r in f['reasons']]\n"
+    "assert analysis['findings'] == []\n"
+    "assert analysis['confirmed_finding_count'] == 0\n"
+    "assert analysis['blocking_finding_count'] == 0\n"
+    "assert analysis['blocking'] is False\n"
+    "advisory = analysis['advisory_findings']\n"
+    "assert advisory and all(row.get('confirmed') is False and row.get('blocking') is False for row in advisory)\n"
+    "reasons = [r for f in advisory for r in f['reasons']]\n"
     # The child prints which aiworkhub it loaded first, then the reported name,
     # so the parent can prove it measured the candidate tree, not a stray one.
     "print(aiworkhub.__file__)\n"

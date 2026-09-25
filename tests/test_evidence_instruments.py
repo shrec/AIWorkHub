@@ -710,6 +710,51 @@ def test_risk_mode_precision_uses_only_explicit_adjudicated_predictions(
             "precision": 0.5,
         }
     ]
+    assert report["advisory_buckets"] == []
+    assert report["gating_buckets"] == report["buckets"]
+    assert report["blocks_acceptance"] is False
+    assert report["triggers_rework"] is False
+
+
+def test_python_crashes_precision_zero_is_advisory_not_gating(tmp_path: Path) -> None:
+    path = tmp_path / ".aiworkhub/risk-mode-adjudication.jsonl"
+    path.parent.mkdir()
+    rows = [
+        {"mode": "crashes", "language": "cpp", "predicted": True, "adjudicated": True, "correct": True},
+        {"mode": "nullrisks", "language": "cpp", "predicted": True, "adjudicated": True, "correct": True},
+        {"mode": "rawptrs", "language": "cpp", "predicted": True, "adjudicated": True, "correct": True},
+        {"mode": "crashes", "language": "python", "predicted": True, "adjudicated": True, "correct": False},
+        {"mode": "crashes", "language": "python", "predicted": True, "adjudicated": True, "correct": False},
+    ]
+    path.write_text("\n".join(json.dumps(row, sort_keys=True) for row in rows) + "\n", encoding="utf-8")
+
+    report = evidence.risk_mode_precision_bench(tmp_path)
+
+    python_buckets = report["advisory_buckets"]
+    assert len(python_buckets) == 1
+    python = python_buckets[0]
+    assert python["mode"] == "crashes"
+    assert python["language"] == "python"
+    assert python["tp"] == 0
+    assert python["fp"] == 2
+    assert python["precision"] == 0.0
+    assert python["authority"] == "uncalibrated"
+    assert python["advisory"] is True
+    assert python["trusted"] is False
+    assert python["gating"] is False
+    assert python["confirmed"] is False
+    assert python["blocking"] is False
+    assert python["blocks_acceptance"] is False
+    assert python["triggers_rework"] is False
+    assert all(bucket["mode"] != "crashes" or bucket["language"] != "python" for bucket in report["buckets"])
+    assert all(bucket["mode"] != "crashes" or bucket["language"] != "python" for bucket in report["gating_buckets"])
+    trusted = {(bucket["mode"], bucket["language"]): bucket for bucket in report["buckets"]}
+    assert trusted[("crashes", "cpp")]["precision"] == 1.0
+    assert trusted[("nullrisks", "cpp")]["precision"] == 1.0
+    assert trusted[("rawptrs", "cpp")]["precision"] == 1.0
+    assert "authority" not in trusted[("crashes", "cpp")]
+    assert report["blocks_acceptance"] is False
+    assert report["triggers_rework"] is False
 
 
 def test_quality_ratchet_and_coverage_projection(tmp_path: Path) -> None:
