@@ -1402,6 +1402,61 @@ def appcontainer_child_environment(
     return merged
 
 
+def _path_entry_is_git_bash(entry: str) -> bool:
+    parts = [part for part in entry.replace("/", "\\").lower().split("\\") if part]
+    if len(parts) >= 2 and parts[-2] == "git" and parts[-1] in {"bin", "cmd"}:
+        return True
+    return (
+        len(parts) >= 3
+        and parts[-3] == "git"
+        and parts[-2] in {"usr", "mingw64", "mingw32"}
+        and parts[-1] == "bin"
+    )
+
+
+def _powershell_executable() -> str:
+    windows = _system_windows_directory() if os.name == "nt" else ""
+    if not windows:
+        return ""
+    candidate = os.path.join(
+        windows, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"
+    )
+    return candidate if os.path.isfile(candidate) else ""
+
+
+def appcontainer_shell_environment(
+    environment: Mapping[str, str] | None,
+) -> Mapping[str, str] | None:
+    if environment is None or os.name != "nt":
+        return environment
+    powershell = _powershell_executable()
+    rewritten = dict(environment)
+    changed = False
+    for key, value in list(rewritten.items()):
+        if key.upper() != "PATH":
+            continue
+        kept = [
+            entry for entry in value.split(os.pathsep)
+            if entry and not _path_entry_is_git_bash(entry)
+        ]
+        joined = os.pathsep.join(kept)
+        if joined != value:
+            rewritten[key] = joined
+            changed = True
+    if powershell and rewritten.get("COMSPEC") != powershell:
+        rewritten["COMSPEC"] = powershell
+        changed = True
+    if rewritten.get("AIWORKHUB_APPCONTAINER_SHELL") != "powershell":
+        rewritten["AIWORKHUB_APPCONTAINER_SHELL"] = "powershell"
+        changed = True
+    for key in list(rewritten):
+        if key.upper() == "CLAUDE_CODE_GIT_BASH_PATH":
+            del rewritten[key]
+            changed = True
+    return rewritten if changed else environment
+
+
+
 def derive_container_identity(
     repo_id: str, worker_kind: str
 ) -> tuple[str, str, str]:
@@ -1861,7 +1916,9 @@ def _launch_prepared_appcontainer(
     # later -- passes through here, so the LOCALAPPDATA requirement is met once
     # at the chokepoint instead of being remembered by each caller.  It runs
     # after validation so hostile keys are still refused first.
-    child_environment = appcontainer_child_environment(request.environment)
+    child_environment = appcontainer_shell_environment(
+        appcontainer_child_environment(request.environment)
+    )
     if child_environment is not request.environment:
         request = replace(request, environment=child_environment)
 

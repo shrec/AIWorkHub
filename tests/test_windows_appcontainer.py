@@ -4169,3 +4169,28 @@ def test_helper_temp_plan_fails_closed_when_no_short_private_temp_fits(monkeypat
     assert excinfo.value.reason is AppContainerReason.INVALID_REQUEST
     assert "no shorter private temp" in excinfo.value.detail
     assert tuple(request.filesystem_grants) == ()
+
+
+def test_appcontainer_shell_drops_git_bash_and_uses_powershell(monkeypatch):
+    monkeypatch.setattr(wac.os, "name", "nt")
+    monkeypatch.setattr(
+        wac, "_powershell_executable", lambda: r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+    )
+    env = {
+        "PATH": os.pathsep.join([
+            r"C:\Program Files\Git\bin",
+            r"C:\Program Files\Git\usr\bin",
+            r"C:\Windows\System32",
+        ]),
+        "COMSPEC": r"C:\Windows\System32\cmd.exe",
+        "CLAUDE_CODE_GIT_BASH_PATH": r"C:\Program Files\Git\bin\bash.exe",
+    }
+    rewritten = wac.appcontainer_shell_environment(env)
+    assert rewritten is not env
+    assert r"Git\bin" not in rewritten["PATH"]
+    assert r"Git\usr\bin" not in rewritten["PATH"]
+    assert rewritten["PATH"].endswith(r"C:\Windows\System32")
+    assert rewritten["COMSPEC"].endswith("powershell.exe")
+    assert rewritten["AIWORKHUB_APPCONTAINER_SHELL"] == "powershell"
+    assert "CLAUDE_CODE_GIT_BASH_PATH" not in rewritten
+    assert wac.appcontainer_shell_environment(None) is None
