@@ -11170,6 +11170,8 @@ function getHtmlForWebview(webview, extensionUri) {
 <body>
   <a class="skip-link" href="#task-table">Skip to task table</a>
 
+  <div class="dashboard-shell" id="dashboard-shell">
+    <div class="dashboard-column" id="dashboard-column">
   <header class="app-header">
     <div class="header-main">
       <div class="brand-block">
@@ -11254,7 +11256,7 @@ function getHtmlForWebview(webview, extensionUri) {
         <span class="header-insight-detail" id="header-roadmap-detail">No outcomes</span>
       </button>
 
-      <button class="header-insight-card" id="header-manager-chat" type="button" title="Open the Manager chat loop">
+      <button class="header-insight-card" id="header-manager-chat" type="button" title="Collapse or expand Manager chat" aria-controls="manager-chat-sidebar" aria-expanded="true">
         <span class="header-storage-label">Manager</span>
         <strong id="header-manager-chat-value">—</strong>
         <span class="header-insight-detail" id="header-manager-chat-detail">No session</span>
@@ -11632,6 +11634,43 @@ function getHtmlForWebview(webview, extensionUri) {
       </aside>
     </div>
   </main>
+    </div>
+    <aside class="manager-chat-sidebar" id="manager-chat-sidebar" aria-label="Manager chat">
+      <div class="manager-chat-frame">
+        <div class="dialog-heading">
+          <div><h2>Manager</h2><span id="manager-chat-summary">No active session</span></div>
+          <button type="button" class="dialog-close" id="manager-chat-collapse" aria-controls="manager-chat-sidebar" aria-expanded="true">Collapse</button>
+        </div>
+        <div class="needfix-toolbar">
+          <select id="manager-chat-backend" class="compact-select" aria-label="Manager backend">
+            <option value="claude_cli">claude_cli</option>
+            <option value="codex_cli">codex_cli</option>
+            <option value="opencode_cli">opencode_cli</option>
+          </select>
+          <select id="manager-chat-model" class="compact-select" aria-label="Manager model"></select>
+          <button type="button" class="primary-button" id="manager-chat-start">Start</button>
+          <button type="button" id="manager-chat-rotate" disabled>Rotate</button>
+          <button type="button" id="manager-chat-close" disabled>Close</button>
+          <span class="connection-state" id="manager-chat-status" role="status" aria-live="polite">
+            <span class="connection-dot" aria-hidden="true"></span>
+            <span id="manager-chat-status-label">Idle</span>
+          </span>
+        </div>
+        <div class="manager-chat-session-line" id="manager-chat-session-line" hidden>
+          <span id="manager-chat-session-id"></span>
+          <span id="manager-chat-session-backend"></span>
+        </div>
+        <div class="manager-chat-transcript" id="manager-chat-transcript" aria-live="polite">
+          <div class="panel-list-empty compact" id="manager-chat-empty">Start a session to begin</div>
+        </div>
+        <div class="manager-chat-notice" id="manager-chat-notice" hidden></div>
+        <form class="manager-chat-composer" id="manager-chat-composer">
+          <textarea id="manager-chat-input" rows="2" placeholder="Message the manager" aria-label="Message the manager" disabled></textarea>
+          <button type="submit" class="primary-button" id="manager-chat-send" disabled>Send</button>
+        </form>
+      </div>
+    </aside>
+  </div>
 
   <dialog class="diagnostic-dialog history-dialog" id="history-dialog">
     <section class="history-frame" aria-labelledby="history-heading">
@@ -11738,42 +11777,6 @@ function getHtmlForWebview(webview, extensionUri) {
       <section class="needfix-detail" id="roadmap-detail-panel" aria-live="polite">
         <div class="panel-list-empty">Select a Roadmap outcome</div>
       </section>
-    </div>
-  </dialog>
-
-  <dialog class="diagnostic-dialog manager-chat-dialog" id="manager-chat-dialog">
-    <div class="manager-chat-frame">
-      <div class="dialog-heading">
-        <div><h2>Manager</h2><span id="manager-chat-summary">No active session</span></div>
-        <button type="button" class="dialog-close" data-close-dialog="manager-chat-dialog">Close</button>
-      </div>
-      <div class="needfix-toolbar">
-        <select id="manager-chat-backend" class="compact-select" aria-label="Manager backend">
-          <option value="claude_cli">claude_cli</option>
-          <option value="codex_cli">codex_cli</option>
-          <option value="opencode_cli">opencode_cli</option>
-        </select>
-        <select id="manager-chat-model" class="compact-select" aria-label="Manager model"></select>
-        <button type="button" class="primary-button" id="manager-chat-start">Start</button>
-        <button type="button" id="manager-chat-rotate" disabled>Rotate</button>
-        <button type="button" id="manager-chat-close" disabled>Close</button>
-        <span class="connection-state" id="manager-chat-status" role="status" aria-live="polite">
-          <span class="connection-dot" aria-hidden="true"></span>
-          <span id="manager-chat-status-label">Idle</span>
-        </span>
-      </div>
-      <div class="manager-chat-session-line" id="manager-chat-session-line" hidden>
-        <span id="manager-chat-session-id"></span>
-        <span id="manager-chat-session-backend"></span>
-      </div>
-      <div class="manager-chat-transcript" id="manager-chat-transcript" aria-live="polite">
-        <div class="panel-list-empty compact" id="manager-chat-empty">Start a session to begin</div>
-      </div>
-      <div class="manager-chat-notice" id="manager-chat-notice" hidden></div>
-      <form class="manager-chat-composer" id="manager-chat-composer">
-        <textarea id="manager-chat-input" rows="2" placeholder="Message the manager" aria-label="Message the manager" disabled></textarea>
-        <button type="submit" class="primary-button" id="manager-chat-send" disabled>Send</button>
-      </form>
     </div>
   </dialog>
 

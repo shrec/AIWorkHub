@@ -3018,9 +3018,9 @@ tbody tr.is-selected td:first-child {
 
 /* Manager chat: reuses .needfix-toolbar (controls row), .primary-button,
    .compact-select, .connection-state/.connection-dot (running indicator),
-   .dialog-heading, .diagnostic-dialog and .panel-list-empty. Every colour
-   below is one of the existing custom properties declared at the top of this
-   file -- nothing new is introduced. */
+   .dialog-heading and .panel-list-empty. The sidebar is not a dialog.
+   Every colour below is one of the existing custom properties declared at
+   the top of this file -- nothing new is introduced. */
 .manager-chat-frame {
   display: flex;
   height: 100%;
@@ -3041,14 +3041,14 @@ tbody tr.is-selected td:first-child {
   flex: 1 1 auto;
 }
 
-#manager-chat-dialog .needfix-toolbar {
+#manager-chat-sidebar .needfix-toolbar {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   gap: 6px;
 }
 
-#manager-chat-dialog .needfix-toolbar select,
+#manager-chat-sidebar .needfix-toolbar select,
 #manager-chat-model {
   width: auto;
   max-width: 100%;
@@ -3058,38 +3058,125 @@ tbody tr.is-selected td:first-child {
   text-overflow: clip;
 }
 
-/* Manager Chat docks as the dashboard's right panel. The element stays a
-<dialog> so every existing ID, handler and `.open` gate keeps working, but
-it opens modeless (.show(), never .showModal()) and pins to the viewport's
-right edge instead of floating centered and modal. Colours reuse the file's
-existing custom properties; the toast (z-40) stays on top. */
-.diagnostic-dialog.manager-chat-dialog {
-  position: fixed;
+/* Persistent sidebar beside the dashboard column. Not a dialog and not
+   position:fixed, so the dashboard reflows instead of being covered.
+   Collapsed is a narrow rail. At <=900px the sidebar stacks below, never
+   as an overlay. Colours reuse existing custom properties. The toast stays
+   off the composer. */
+.dashboard-shell {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) clamp(320px, 30vw, 520px);
+  align-items: start;
+  min-width: 0;
+  min-height: 100vh;
+}
+
+.dashboard-column {
+  min-width: 0;
+  min-height: 0;
+}
+
+#manager-chat-sidebar {
+  position: sticky;
   top: 0;
-  right: 0;
-  bottom: 0;
-  left: auto;
-  width: min(430px, 94vw);
-  max-width: none;
+  align-self: start;
+  display: flex;
+  flex-direction: column;
+  width: 100%;
   height: 100vh;
-  max-height: none;
-  margin: 0;
-  padding: 0;
-  border: 0;
+  max-height: 100vh;
+  min-width: 0;
+  overflow: hidden;
   border-left: 1px solid var(--line);
-  border-radius: 0;
-  box-shadow: none;
   background: var(--surface);
   color: var(--ink);
-  z-index: 30;
 }
-.diagnostic-dialog.manager-chat-dialog[open] {
-  display: flex;
-}
-.diagnostic-dialog.manager-chat-dialog > .manager-chat-frame {
+
+#manager-chat-sidebar > .manager-chat-frame {
   flex: 1 1 auto;
   min-height: 0;
   min-width: 0;
+}
+
+#manager-chat-collapse {
+  flex: 0 0 auto;
+  padding: 4px 8px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  color: var(--ink-soft);
+  background: transparent;
+  cursor: pointer;
+}
+
+.dashboard-shell.is-collapsed {
+  grid-template-columns: minmax(0, 1fr) 44px;
+}
+
+#manager-chat-sidebar.is-collapsed .manager-chat-frame > :not(.dialog-heading) {
+  display: none;
+}
+
+#manager-chat-sidebar.is-collapsed .dialog-heading {
+  min-height: 0;
+  height: 100%;
+  flex-direction: column;
+  justify-content: flex-start;
+  gap: 0;
+  padding: 8px 4px;
+  border-bottom: 0;
+}
+
+#manager-chat-sidebar.is-collapsed .dialog-heading > div {
+  display: none;
+}
+
+#manager-chat-sidebar.is-collapsed #manager-chat-collapse {
+  writing-mode: vertical-rl;
+}
+
+@media (min-width: 901px) {
+  .dashboard-shell:not(.is-collapsed) ~ .toast {
+    right: calc(clamp(320px, 30vw, 520px) + 14px);
+  }
+}
+
+@media (max-width: 900px) {
+  .dashboard-shell,
+  .dashboard-shell.is-collapsed {
+    display: flex;
+    flex-direction: column;
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  #manager-chat-sidebar,
+  #manager-chat-sidebar.is-collapsed {
+    position: static;
+    top: auto;
+    width: 100%;
+    height: auto;
+    max-height: min(50vh, 420px);
+    border-left: 0;
+    border-top: 1px solid var(--line);
+  }
+
+  #manager-chat-sidebar.is-collapsed {
+    max-height: 44px;
+  }
+
+  #manager-chat-sidebar.is-collapsed .dialog-heading {
+    height: auto;
+    flex-direction: row;
+    padding: 6px 8px;
+  }
+
+  #manager-chat-sidebar.is-collapsed #manager-chat-collapse {
+    writing-mode: horizontal-tb;
+  }
+
+  .dashboard-shell ~ .toast {
+    top: 14px;
+    bottom: auto;
+  }
 }
 
 .manager-chat-session-line {
@@ -3470,13 +3557,7 @@ existing custom properties; the toast (z-40) stays on top. */
   .settings-footnote { overflow-wrap: anywhere; }
   .settings-metric-grid,
   .settings-language-grid { grid-template-columns: 1fr; }
-  .diagnostic-dialog.manager-chat-dialog {
-    width: calc(100vw - 24px);
-    min-width: 0;
-    height: min(650px, calc(100vh - 24px));
-    max-height: calc(100vh - 24px);
-  }
-  #manager-chat-dialog .needfix-toolbar { grid-template-columns: 1fr 1fr; }
+  #manager-chat-sidebar .needfix-toolbar { grid-template-columns: 1fr 1fr; }
   .manager-chat-bubble { max-width: 100%; }
 }
 

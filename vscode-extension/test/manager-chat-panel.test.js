@@ -365,9 +365,9 @@ function loadWebviewSlice() {
   );
   const managerChatWiring = extractSlice(
     appSource,
-    "function openManagerChatDialog() {",
+    "function applyManagerChatCollapsed(collapsed) {",
     "  state.managerChatRunning = true;\n  applyManagerChatSessionUi();\n});",
-    "manager chat dialog wiring",
+    "manager chat sidebar wiring",
   );
 
   const state = {
@@ -437,7 +437,7 @@ function loadWebviewSlice() {
     `"use strict";\n${utilities}\n${constants}\n${managerChat}\n${managerChatWiring}\n` +
       "this.api = { managerChatEventNode, renderManagerChatEvents, renderManagerChatEventsResponse, " +
       "renderManagerChatAction, renderManagerChatStatus, requestManagerChatEvents, scheduleManagerChatPoll, " +
-      "applyManagerChatSessionUi, applyManagerChatComposerState, managerChatEnabledModels, populateManagerChatModelOptions, openManagerChatDialog };",
+      "applyManagerChatSessionUi, applyManagerChatComposerState, managerChatEnabledModels, populateManagerChatModelOptions, applyManagerChatCollapsed, toggleManagerChatSidebar, startManagerChatSidebar, openManagerChatDialog };",
     context,
   );
   return { api: context.api, state, elements, posts, timers };
@@ -991,48 +991,51 @@ test("Start is refused when the current backend has no enabled models", () => {
   assert.equal(harness.elements.managerChatNotice.hidden, false);
 });
 
-test("opening the Manager dialog populates the model picker for the already-selected backend", () => {
+test("loading the sidebar populates the model picker without opening a dialog", () => {
   const harness = loadWebviewSlice();
   harness.state.featureSettings = MANAGER_CHAT_MODEL_POLICY_PAYLOAD;
   harness.elements.managerChatBackendSelect.value = "codex_cli";
-  harness.elements.managerChatDialog.open = false;
 
-  harness.api.openManagerChatDialog();
+  harness.api.startManagerChatSidebar();
 
   assert.deepEqual(harness.elements.managerChatModelInput.children.map((option) => option.value), ["gpt-5-codex"]);
+  assert.equal(harness.elements.managerChatDialog.showModalCalled, 0, "sidebar load never opens a modal dialog");
 });
 
-test("opening the Manager dialog ensures the passive conversation when there is no session yet", () => {
+test("loading the sidebar ensures and requests status when there is no session", () => {
   const harness = loadWebviewSlice();
   assert.equal(harness.state.managerChatSession, null);
-  harness.elements.managerChatDialog.open = false;
 
-  harness.api.openManagerChatDialog();
+  harness.api.startManagerChatSidebar();
 
   assert.deepEqual(plain(harness.posts.find((post) => post.type === "managerLoopEnsure")), { type: "managerLoopEnsure" });
+  assert.deepEqual(plain(harness.posts.find((post) => post.type === "managerLoopStatus")), { type: "managerLoopStatus" });
+  assert.equal(harness.elements.managerChatDialog.showModalCalled, 0);
 });
 
-test("reopening the Manager dialog with a session does not re-ensure", () => {
+test("a sidebar start with a session does not re-ensure", () => {
   const harness = loadWebviewSlice();
   harness.state.managerChatSession = "mls-aaaa1111bbbb2222";
 
-  harness.api.openManagerChatDialog();
+  harness.api.startManagerChatSidebar();
 
   assert.equal(harness.posts.some((post) => post.type === "managerLoopEnsure"), false);
+  assert.equal(harness.posts.some((post) => post.type === "managerLoopStatus"), true);
 });
 
-test("the Manager panel docks modeless and toggles on repeat open", () => {
+test("the collapse toggle flips sidebar state and never opens a dialog", () => {
   const harness = loadWebviewSlice();
-  harness.elements.managerChatDialog.open = false;
+  harness.state.managerChatCollapsed = false;
 
-  harness.api.openManagerChatDialog();
+  harness.api.toggleManagerChatSidebar();
 
-  assert.equal(harness.elements.managerChatDialog.open, true);
+  assert.equal(harness.state.managerChatCollapsed, true);
   assert.equal(harness.elements.managerChatDialog.showModalCalled, 0, "never modal: the dashboard stays usable");
 
-  harness.api.openManagerChatDialog();
+  harness.api.toggleManagerChatSidebar();
 
-  assert.equal(harness.elements.managerChatDialog.open, false);
+  assert.equal(harness.state.managerChatCollapsed, false);
+  assert.equal(harness.elements.managerChatDialog.open, true, "collapse does not drive dialog.open");
 });
 
 test("the model field is a <select>, not a free-text input", () => {
@@ -1040,18 +1043,52 @@ test("the model field is a <select>, not a free-text input", () => {
   assert.doesNotMatch(extensionSource, /<input id="manager-chat-model"/);
 });
 
-// ── Structural reuse: existing dialog/theme classes, no new colour literals ──
+// ── Structural reuse: sidebar beside the dashboard, no covering dialog ──
 
-test("the Manager panel reuses the dashboard's existing dialog chrome and theme tokens", () => {
-  assert.match(extensionSource, /id="header-manager-chat"[^>]+title="Open the Manager chat loop"/);
-  assert.match(extensionSource, /<dialog class="diagnostic-dialog manager-chat-dialog" id="manager-chat-dialog">/);
+test("the Manager panel is a persistent sidebar and reuses existing theme tokens", () => {
+  assert.match(extensionSource, /id="header-manager-chat"[^>]+title="Collapse or expand Manager chat"/);
+  assert.match(extensionSource, /<div class="dashboard-shell" id="dashboard-shell">/);
+  assert.match(extensionSource, /<div class="dashboard-column" id="dashboard-column">/);
+  assert.match(extensionSource, /<aside class="manager-chat-sidebar" id="manager-chat-sidebar" aria-label="Manager chat">/);
+  assert.match(extensionSource, /id="manager-chat-collapse"/);
+  assert.doesNotMatch(extensionSource, /<dialog[^>]+id="manager-chat-dialog"/);
+  assert.doesNotMatch(extensionSource, /data-close-dialog="manager-chat-dialog"/);
   assert.match(extensionSource, /<div class="needfix-toolbar">\s*<select id="manager-chat-backend"/);
-  assert.match(appSource, /elements\.managerChatDialog\.show\(\)/);
-  assert.doesNotMatch(appSource, /managerChatDialog\.showModal\(\)/, "the dock opens modeless, never modal");
-  assert.match(appSource, /elements\.managerChatDialog\.addEventListener\("close"/);
-  assert.match(cssSource, /#manager-chat-dialog \.needfix-toolbar/);
-  assert.match(cssSource, /\.diagnostic-dialog\.manager-chat-dialog\s*\{[^}]*position:\s*fixed/);
-  assert.match(cssSource, /\.diagnostic-dialog\.manager-chat-dialog\[open\]\s*\{[^}]*display:\s*flex/);
+  for (const id of [
+    "manager-chat-summary",
+    "manager-chat-backend",
+    "manager-chat-model",
+    "manager-chat-start",
+    "manager-chat-rotate",
+    "manager-chat-close",
+    "manager-chat-status",
+    "manager-chat-transcript",
+    "manager-chat-notice",
+    "manager-chat-composer",
+    "manager-chat-input",
+    "manager-chat-send",
+  ]) {
+    assert.match(extensionSource, new RegExp(`id="${id}"`), `${id} must stay`);
+  }
+  const shellAt = extensionSource.indexOf('id="dashboard-shell"');
+  const columnAt = extensionSource.indexOf('id="dashboard-column"');
+  const mainEnd = extensionSource.indexOf("</main>");
+  const asideAt = extensionSource.indexOf('id="manager-chat-sidebar"');
+  assert.ok(shellAt !== -1 && shellAt < columnAt && columnAt < mainEnd && mainEnd < asideAt, "sidebar sits beside the dashboard column");
+  assert.doesNotMatch(appSource, /managerChatDialog\.show\(/);
+  assert.doesNotMatch(appSource, /managerChatDialog\.showModal\(/, "the sidebar never opens a modal dialog");
+  assert.match(appSource, /function startManagerChatSidebar\(/);
+  assert.match(appSource, /function toggleManagerChatSidebar\(/);
+  assert.match(cssSource, /\.dashboard-shell\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)\s*clamp\(320px,\s*30vw,\s*520px\)/);
+  assert.match(cssSource, /#manager-chat-sidebar\s*\{[^}]*position:\s*sticky/);
+  assert.doesNotMatch(cssSource, /#manager-chat-sidebar\s*\{[^}]*position:\s*fixed/);
+  assert.doesNotMatch(cssSource, /manager-chat-dialog/);
+  assert.doesNotMatch(cssSource, /\.diagnostic-dialog\.manager-chat-dialog\s*\{[^}]*position:\s*fixed/);
+  const stackStart = cssSource.indexOf("@media (max-width: 900px)");
+  const stack = cssSource.slice(stackStart, stackStart + 900);
+  assert.match(stack, /position:\s*static/);
+  assert.match(stack, /flex-direction:\s*column/);
+  assert.doesNotMatch(stack, /position:\s*fixed/);
 
   const managerCss = extractSlice(
     cssSource,

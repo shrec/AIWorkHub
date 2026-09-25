@@ -26,9 +26,8 @@ const LIVE_OUTPUT_POLL_MS = 4000;
 const READY_RETRY_MS = 1000;
 const READY_MAX_ATTEMPTS = 30;
 // Bounded poll cadence for the Manager transcript while a session is active --
-// independent of the dashboard-wide snapshot refresh, and only running while
-// the Manager dialog is open with a session (see startManagerChatPolling /
-// stopManagerChatPolling).
+// independent of the dashboard-wide snapshot refresh. Polling follows the
+// session, including while the sidebar is collapsed.
 const MANAGER_CHAT_POLL_MS = 1500;
 const MANAGER_CHAT_BACKENDS = new Set(["claude_cli", "codex_cli", "opencode_cli"]);
 
@@ -88,6 +87,7 @@ const state = {
   managerChatEvents: [],
   managerChatLastSeq: 0,
   managerChatPollTimer: null,
+  managerChatCollapsed: Boolean(persisted.managerChatCollapsed),
 };
 
 let readyRetryTimer = null;
@@ -100,6 +100,7 @@ function persistState() {
     status: state.status,
     sort: state.sort,
     planScope: state.planScope,
+    managerChatCollapsed: Boolean(state.managerChatCollapsed),
   });
 }
 
@@ -326,7 +327,9 @@ const elements = {
   headerManagerChat: document.querySelector("#header-manager-chat"),
   headerManagerChatValue: document.querySelector("#header-manager-chat-value"),
   headerManagerChatDetail: document.querySelector("#header-manager-chat-detail"),
-  managerChatDialog: document.querySelector("#manager-chat-dialog"),
+  managerChatSidebar: document.querySelector("#manager-chat-sidebar"),
+  managerChatShell: document.querySelector("#dashboard-shell"),
+  managerChatCollapse: document.querySelector("#manager-chat-collapse"),
   managerChatSummary: document.querySelector("#manager-chat-summary"),
   managerChatBackendSelect: document.querySelector("#manager-chat-backend"),
   managerChatModelInput: document.querySelector("#manager-chat-model"),
@@ -5259,7 +5262,7 @@ function renderSettings(payload, options = {}) {
     return;
   }
   state.featureSettings = payload;
-  if (elements.managerChatDialog && elements.managerChatDialog.open) {
+  if (elements.managerChatModelInput) {
     populateManagerChatModelOptions();
   }
   if (!preservePending) {
@@ -7829,34 +7832,49 @@ elements.roadmapList.addEventListener("click", (event) => {
   if (target) vscode.postMessage({ type: "requestRoadmapDetail", roadmapId: target.dataset.roadmapId });
 });
 
-function openManagerChatDialog() {
-  // The panel docks modeless on the dashboard's right edge: toggle it, and
-  // open with .show(), never .showModal(), so the dashboard stays usable.
-  if (elements.managerChatDialog.open) {
-    elements.managerChatDialog.close();
-    return;
+function applyManagerChatCollapsed(collapsed) {
+  state.managerChatCollapsed = Boolean(collapsed);
+  const sidebar = elements.managerChatSidebar;
+  const shell = elements.managerChatShell;
+  const toggle = elements.managerChatCollapse;
+  if (sidebar && sidebar.classList) sidebar.classList.toggle("is-collapsed", state.managerChatCollapsed);
+  if (shell && shell.classList) shell.classList.toggle("is-collapsed", state.managerChatCollapsed);
+  if (toggle && typeof toggle.setAttribute === "function") {
+    toggle.setAttribute("aria-expanded", String(!state.managerChatCollapsed));
+    toggle.textContent = state.managerChatCollapsed ? "Expand" : "Collapse";
   }
-  elements.managerChatDialog.show();
-  populateManagerChatModelOptions();
+  if (elements.headerManagerChat && typeof elements.headerManagerChat.setAttribute === "function") {
+    elements.headerManagerChat.setAttribute("aria-expanded", String(!state.managerChatCollapsed));
+  }
+  if (typeof persistState === "function") persistState();
+}
+
+function toggleManagerChatSidebar() {
+  applyManagerChatCollapsed(!state.managerChatCollapsed);
+}
+
+function openManagerChatDialog() {
+  // Header card toggles the persistent sidebar. It does not open a dialog.
+  toggleManagerChatSidebar();
+}
+
+function startManagerChatSidebar() {
+  applyManagerChatCollapsed(Boolean(state.managerChatCollapsed));
+  if (typeof populateManagerChatModelOptions === "function") populateManagerChatModelOptions();
   if (!state.featureSettings) {
     vscode.postMessage({ type: "requestSettings" });
   }
-  // Attach the repository's passive conversation on open: the panel works
-  // without Start, and the first Send pins the policy route server-side.
-  // ensure() is idempotent, so reopening never duplicates the conversation.
   if (!state.managerChatSession) {
     vscode.postMessage({ type: "managerLoopEnsure" });
   }
   vscode.postMessage({ type: "managerLoopStatus" });
+  if (state.managerChatSession) scheduleManagerChatPoll();
 }
 
 elements.headerManagerChat.addEventListener("click", openManagerChatDialog);
-
-// Closing the dock must not stop polling. The after_seq chain follows the
-// session, so a sidebar and a closed dialog keep receiving events.
-elements.managerChatDialog.addEventListener("close", () => {
-  if (state.managerChatSession) scheduleManagerChatPoll();
-});
+if (elements.managerChatCollapse && typeof elements.managerChatCollapse.addEventListener === "function") {
+  elements.managerChatCollapse.addEventListener("click", toggleManagerChatSidebar);
+}
 
 elements.managerChatBackendSelect.addEventListener("change", () => {
   populateManagerChatModelOptions();
@@ -7913,6 +7931,7 @@ elements.managerChatComposer.addEventListener("submit", (event) => {
 // The shipped markup starts the composer disabled. A sidebar must not wait
 // for a dialog open before the owner can type, including during a turn.
 applyManagerChatComposerState();
+startManagerChatSidebar();
 
 function closeIdentityInfoPopover() {
   if (elements.identityInfo && elements.identityInfo.open) elements.identityInfo.open = false;
