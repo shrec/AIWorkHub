@@ -8438,6 +8438,135 @@ def _verified_retained_predecessor_receipt(
     }, None
 
 
+def _is_review_rejection_reroute(card: Mapping[str, Any]) -> bool:
+    """True only for a review rejection that must keep its receipt.
+
+    ``reject_review --to pending`` writes ``review_feedback``. A pending
+    disposition, or a ``candidate_code`` rejection, is that path even when the
+    feedback is missing: the receipt then fails closed. A blocked
+    infrastructure rejection (``to=blocked``, ``validation_environment``) is
+    not. Recovery writes ``recovery_feedback`` and never ``review_feedback``.
+    """
+    feedback = card.get("review_feedback")
+    predecessor = card.get("rework_predecessor")
+    if (
+        isinstance(feedback, dict)
+        and feedback.get("schema_id") == "aiworkhub.rework_feedback_delta.v1"
+        and bool(str(feedback.get("predecessor_request_id") or "").strip())
+        and isinstance(predecessor, dict)
+        and _has_retained_candidate_delta(card)
+    ):
+        return True
+    rejection = card.get("rejection_disposition")
+    if (
+        not isinstance(rejection, dict)
+        or rejection.get("schema_id") != "aiworkhub.rejection_disposition.v1"
+    ):
+        return False
+    if rejection.get("to") == "pending":
+        return True
+    return rejection.get("failure_category") == "candidate_code"
+
+
+def _manager_recovery_reroute_episode(card: Mapping[str, Any]) -> bool:
+    """The latest episode is a manager ``recover_blocked_rework``, not a stale one."""
+    recovery = card.get("recovery_predecessor")
+    feedback = card.get("recovery_feedback")
+    recovered_by = str(card.get("recovered_by") or "").strip()
+    recovered_at = str(card.get("recovered_from_blocked_at") or "").strip()
+    recovery_epoch = card.get("recovery_epoch")
+    claim_epoch = card.get("claim_epoch")
+    return (
+        isinstance(recovery, dict)
+        and isinstance(feedback, str)
+        and bool(feedback.strip())
+        and recovered_by in VERIFIED_MANAGER_ACTORS
+        and bool(recovered_at)
+        and type(recovery_epoch) is int
+        and type(claim_epoch) is int
+        and recovery_epoch == claim_epoch
+    )
+
+
+def _provider_runtime_or_cancellation_retry(card: Mapping[str, Any]) -> bool:
+    """A ``retry_terminal`` of a provider-runtime or cancellation outcome."""
+    retry = card.get("terminal_retry")
+    if not isinstance(retry, dict):
+        return False
+    request_id = str(retry.get("request_id") or "").strip()
+    substatus = str(retry.get("terminal_substatus") or "").strip()
+    return (
+        retry.get("schema_id") == "aiworkhub.terminal_retry.v1"
+        and bool(request_id)
+        and len(request_id) <= 120
+        and substatus in _RETRYABLE_OPERATIONAL_TERMINAL_SUBSTATUSES
+    )
+
+
+def _operational_provider_reroute_authorization(
+    card: Mapping[str, Any],
+    *,
+    from_runner: str,
+    to_runner: str,
+    to_adapter_id: str,
+    to_model: str,
+    reason: str,
+) -> dict[str, Any] | None:
+    """Authorize a manager reroute that is not a review rejection.
+
+    Consumed only by ``reroute_launch_identity``, which still requires the
+    coordinator write gate. A worker cannot reroute itself through this
+    receipt: the gate refuses the write, and a review rejection never reaches
+    here.
+    """
+    if not all(
+        str(value or "").strip()
+        for value in (from_runner, to_runner, to_adapter_id, to_model, reason)
+    ):
+        return None
+    if _is_review_rejection_reroute(card):
+        return None
+    # Validation-only replay has its own event-bound receipt. A reason must
+    # not replace that check.
+    if (
+        card.get("validation_only_replay_lineage") is not None
+        or card.get("validation_only_replay_authorization") is not None
+    ):
+        return None
+    recovery = _manager_recovery_reroute_episode(card)
+    retry = _provider_runtime_or_cancellation_retry(card)
+    if not recovery and not retry:
+        return None
+    if recovery and retry:
+        authority = "manager_recovery_and_operational_retry"
+    elif recovery:
+        authority = "manager_recovery"
+    else:
+        authority = "provider_runtime_or_cancellation"
+    receipt: dict[str, Any] = {
+        "schema_id": "aiworkhub.operational_provider_reroute.v1",
+        "authority": authority,
+        "reason": str(reason).strip()[:500],
+        "from_runner": str(from_runner).strip(),
+        "to_runner": str(to_runner).strip(),
+        "to_adapter_id": str(to_adapter_id).strip(),
+        "to_model": str(to_model).strip(),
+    }
+    if recovery:
+        receipt["recovery_epoch"] = card.get("recovery_epoch")
+        receipt["recovered_by"] = str(card.get("recovered_by") or "").strip()
+    if retry:
+        terminal_retry = card.get("terminal_retry")
+        if isinstance(terminal_retry, dict):
+            receipt["terminal_substatus"] = str(
+                terminal_retry.get("terminal_substatus") or ""
+            ).strip()
+            receipt["retry_request_id"] = str(
+                terminal_retry.get("request_id") or ""
+            ).strip()
+    return receipt
+
+
 def reroute_launch_identity(
     task_id: str,
     *,
@@ -8451,17 +8580,21 @@ def reroute_launch_identity(
     """Atomically reroute one pending/unclaimed card's invalid pinned runner
     to an enabled, available, risk-capable canonical workforce tuple.
 
-    Permitted only for a card that carries either an exact operational
-    ``terminal_retry`` receipt (see ``retry_terminal_task``) or an authenticated
-    manager rejection bound to a verified sealed candidate. Preserves task
-    ID, topic, scope, template provenance, history and any hash-pinned retained
-    candidate -- mutates only ``runner`` plus a bounded audited old/new
-    identity receipt. Retained bytes are still reverified against their exact
-    hashes and allowed-write scope by workspace materialization before the new
-    provider can start. Fails closed for a claimed or non-pending task, an
-    arbitrary/ambiguous target identity, a disabled, unavailable or
-    risk-incapable canonical route, and a compare-and-swap race against a
-    concurrent claim or mutation.
+    Permitted for an exact operational ``terminal_retry`` receipt, an
+    authenticated manager review rejection bound to a verified sealed
+    candidate, or — when the manager supplies ``from_runner``, ``to_runner``,
+    ``to_adapter_id``, ``to_model`` and a reason — a pending card after a
+    manager blocked-rework recovery or a provider-runtime/cancellation retry.
+    A review rejection still requires that rejection receipt. A worker cannot
+    reroute itself: this remains the coordinator write-gate path. Preserves
+    task ID, topic, scope, template provenance, history and any hash-pinned
+    retained candidate -- mutates only ``runner`` plus a bounded audited
+    old/new identity receipt. Retained bytes are still reverified against
+    their exact hashes and allowed-write scope by workspace materialization
+    before the new provider can start. Fails closed for a claimed or
+    non-pending task, an arbitrary/ambiguous target identity, a disabled,
+    unavailable or risk-incapable canonical route, and a compare-and-swap
+    race against a concurrent claim or mutation.
     """
     from . import process_launcher  # local import: cycle-safe (see _reconcile_retained_workspaces)
     from . import launch_replay_guard  # local import: cycle-safe (it imports core)
@@ -8507,14 +8640,22 @@ def reroute_launch_identity(
         and len(retry_request_id) <= 120
         and retry_substatus in _RETRYABLE_OPERATIONAL_TERMINAL_SUBSTATUSES
     )
-    feedback = card.get("review_feedback")
     predecessor = card.get("rework_predecessor")
-    has_manager_rework_evidence = "rejection_disposition" in card or (
-        isinstance(feedback, dict)
-        and feedback.get("schema_id") == "aiworkhub.rework_feedback_delta.v1"
-        and bool(str(feedback.get("predecessor_request_id") or "").strip())
-        and isinstance(predecessor, dict)
-        and _has_retained_candidate_delta(card)
+    # A blocked infrastructure rejection is not a review rejection. Treating
+    # every ``rejection_disposition`` as one demanded ``review_feedback`` that
+    # recovery never writes, and stranded a cancelled or provider-failed card.
+    review_rejection = _is_review_rejection_reroute(card)
+    operational_authorization = (
+        None
+        if review_rejection
+        else _operational_provider_reroute_authorization(
+            card,
+            from_runner=from_runner,
+            to_runner=to_runner,
+            to_adapter_id=to_adapter_id,
+            to_model=to_model,
+            reason=bounded_reason,
+        )
     )
     manager_rejection_receipt: dict[str, Any] = {}
     identical_outcome_receipt: dict[str, Any] = {}
@@ -8527,7 +8668,7 @@ def reroute_launch_identity(
                 _verified_validation_replay_reroute_receipt(card, task_id=task_id)
                 or {}
             )
-    if has_manager_rework_evidence:
+    if review_rejection:
         manager_rejection, manager_rejection_error = (
             _verified_manager_rejection_receipt(card, task_id=task_id)
         )
@@ -8537,7 +8678,11 @@ def reroute_launch_identity(
                 or "reroute_manager_rejection_provenance_invalid"
             )
         manager_rejection_receipt = manager_rejection
-    elif not valid_terminal_retry and not validation_replay_receipt:
+    elif (
+        not valid_terminal_retry
+        and not validation_replay_receipt
+        and not operational_authorization
+    ):
         # A semantic terminal (``validation_failed``) is not an operational
         # retry and never will be: an unattended retry must not re-run a
         # finding about the work.  But a card the launch guard has REFUSED on
@@ -8557,7 +8702,14 @@ def reroute_launch_identity(
         identical_outcome_receipt = live_refusal
 
     retained_candidate_receipt: dict[str, Any] = {}
-    if _has_retained_candidate_delta(card):
+    # Recovery and cancellation retries often retain an unsealed predecessor
+    # that never received task_id/claim_epoch. That missing review receipt is
+    # not authority to discard the candidate, and it must not block the
+    # coordinator move. Launch materialization still rechecks the bytes.
+    # Review rejection and validation-only replay keep the sealed check.
+    if _has_retained_candidate_delta(card) and not (
+        operational_authorization and not validation_replay_receipt
+    ):
         retained_candidate_receipt, retained_error = (
             _verified_retained_predecessor_receipt(
                 card, task_id=task_id,
@@ -8678,6 +8830,10 @@ def reroute_launch_identity(
         semantic_card["identity_reroute"]["manager_rejection_authorization"] = (
             manager_rejection_receipt
         )
+    if operational_authorization:
+        semantic_card["identity_reroute"]["operational_provider_authorization"] = (
+            operational_authorization
+        )
     if validation_replay_receipt:
         semantic_card["identity_reroute"]["validation_replay_authorization"] = (
             validation_replay_receipt
@@ -8737,6 +8893,7 @@ def reroute_launch_identity(
                         "reason": bounded_reason,
                         "identical_outcome_refusal": identical_outcome_receipt,
                         "manager_rejection_authorization": manager_rejection_receipt,
+                        "operational_provider_authorization": operational_authorization or {},
                     },
                     ensure_ascii=False,
                     sort_keys=True,
@@ -8759,6 +8916,10 @@ def reroute_launch_identity(
     if manager_rejection_receipt:
         result["manager_rejection_authorization"] = dict(
             manager_rejection_receipt
+        )
+    if operational_authorization:
+        result["operational_provider_authorization"] = dict(
+            operational_authorization
         )
     return _reconcile_retained_workspaces(result)
 

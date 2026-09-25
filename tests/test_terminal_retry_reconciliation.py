@@ -2667,3 +2667,209 @@ def test_nf778_recovered_launch_failure_reroute_fails_closed(
     assert row["runner"] == "claude_opus-5"
     card = json.loads(row["card_json"])
     assert card["identity_reroute"] == state["card"]["identity_reroute"]
+
+
+def _nf01013_unsealed_predecessor() -> dict:
+    """Blocked-rejection predecessor: hashes, no sealed task_id or claim_epoch."""
+    return {
+        "schema_id": "aiworkhub.rework_predecessor.v1",
+        "request_id": "a" * 32,
+        "pinned_at": "2026-09-25T02:58:54+00:00",
+        "changed_path_hashes": {"out/result.json": "b" * 64},
+        "residual_identities": [],
+    }
+
+
+def _nf01013_blocked_rejection() -> dict:
+    return {
+        "schema_id": "aiworkhub.rejection_disposition.v1",
+        "failure_category": "validation_environment",
+        "failure_category_source": "manager_explicit_infrastructure",
+        "request_id": "a" * 32,
+        "to": "blocked",
+        "pinned_at": "2026-09-25T02:58:54+00:00",
+    }
+
+
+def _nf01013_recovery_fields() -> dict:
+    return {
+        "claim_epoch": 7,
+        "recovered_by": "codex",
+        "recovered_from_blocked_at": "2026-09-25T19:09:18+00:00",
+        "recovery_epoch": 7,
+        "recovery_feedback": "provider runtime, not candidate_code; move the route",
+        "recovery_predecessor": {
+            "request_id": "a" * 32,
+            "terminal_claim_epoch": 3,
+            "terminal_substatus": "validation_failed",
+        },
+    }
+
+
+def _nf01013_cancelled_retry(task_id: str) -> dict:
+    return {
+        "schema_id": "aiworkhub.terminal_retry.v1",
+        "task_id": task_id,
+        "request_id": "c" * 32,
+        "runner": "claude_sonnet-4.6",
+        "claim_epoch": 5,
+        "terminal_substatus": "cancelled",
+        "reason": "provider quota exhausted",
+        "retried_at": "2026-09-25T13:38:04+00:00",
+    }
+
+
+def _nf01013_reroute(task_id: str, *, reason: str = "") -> dict:
+    return core.reroute_launch_identity(
+        task_id,
+        from_runner="claude_sonnet-4.6",
+        to_runner="claude_sonnet-5",
+        to_adapter_id="claude_cli",
+        to_model="sonnet",
+        reason=reason,
+    )
+
+
+def test_reroute_allows_recovered_or_cancelled_card_without_review_feedback(
+    coordinator_repo: Path,
+) -> None:
+    """NF-2026-01013: recovery or an operational retry is enough with a reason."""
+    recovered = "REROUTE_NF01013_RECOVERED_CANCELLED"
+    _insert_pending_reroutable(
+        coordinator_repo,
+        task_id=recovered,
+        terminal_retry=_nf01013_cancelled_retry(recovered),
+        rework_predecessor=_nf01013_unsealed_predecessor(),
+        card_overrides={
+            **_nf01013_recovery_fields(),
+            "rejection_disposition": _nf01013_blocked_rejection(),
+        },
+    )
+
+    result = _nf01013_reroute(recovered, reason="claude quota exhausted")
+
+    assert result["ok"] is True, result
+    assert result["operational_provider_authorization"]["authority"] == (
+        "manager_recovery_and_operational_retry"
+    )
+    row = _row(coordinator_repo, recovered)
+    assert row["runner"] == "claude_sonnet-5"
+    card = json.loads(row["card_json"])
+    assert "review_feedback" not in card
+    assert card["rejection_disposition"]["to"] == "blocked"
+    assert card["identity_reroute"]["operational_provider_authorization"]["reason"] == (
+        "claude quota exhausted"
+    )
+
+    cancelled = "REROUTE_NF01013_CANCELLED_ONLY"
+    _insert_pending_reroutable(
+        coordinator_repo,
+        task_id=cancelled,
+        terminal_retry=_nf01013_cancelled_retry(cancelled),
+        rework_predecessor=_nf01013_unsealed_predecessor(),
+        card_overrides={"rejection_disposition": _nf01013_blocked_rejection()},
+    )
+    cancelled_result = _nf01013_reroute(cancelled, reason="cancelled launch")
+    assert cancelled_result["ok"] is True, cancelled_result
+    assert (
+        cancelled_result["operational_provider_authorization"]["authority"]
+        == "provider_runtime_or_cancellation"
+    )
+
+    recovered_only = "REROUTE_NF01013_RECOVERY_ONLY"
+    _insert_pending_reroutable(
+        coordinator_repo,
+        task_id=recovered_only,
+        terminal_retry=None,
+        rework_predecessor=_nf01013_unsealed_predecessor(),
+        card_overrides={
+            **_nf01013_recovery_fields(),
+            "rejection_disposition": _nf01013_blocked_rejection(),
+        },
+    )
+    recovery_result = _nf01013_reroute(recovered_only, reason="recovered provider failure")
+    assert recovery_result["ok"] is True, recovery_result
+    assert (
+        recovery_result["operational_provider_authorization"]["authority"]
+        == "manager_recovery"
+    )
+
+
+def test_reroute_operational_provider_move_stays_fail_closed(
+    coordinator_repo: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review rejection, a bare reason, and a worker gate still refuse."""
+    missing_reason = "REROUTE_NF01013_NO_REASON"
+    _insert_pending_reroutable(
+        coordinator_repo,
+        task_id=missing_reason,
+        terminal_retry=_nf01013_cancelled_retry(missing_reason),
+        rework_predecessor=_nf01013_unsealed_predecessor(),
+        card_overrides={
+            **_nf01013_recovery_fields(),
+            "rejection_disposition": _nf01013_blocked_rejection(),
+        },
+    )
+    refused = _nf01013_reroute(missing_reason)
+    assert refused["ok"] is False
+    assert "reroute_retained_candidate_identity_mismatch" in refused["stderr"]
+    assert _row(coordinator_repo, missing_reason)["runner"] == "claude_sonnet-4.6"
+
+    reason_only = "REROUTE_NF01013_REASON_ONLY"
+    _insert_pending_reroutable(
+        coordinator_repo,
+        task_id=reason_only,
+        terminal_retry=None,
+    )
+    bare = _nf01013_reroute(reason_only, reason="please move this")
+    assert bare["ok"] is False
+    assert "reroute_requires_terminal_retry_provenance" in bare["stderr"]
+
+    review = "REROUTE_NF01013_REVIEW_REJECTION"
+    _insert_pending_reroutable(
+        coordinator_repo,
+        task_id=review,
+        terminal_retry=_nf01013_cancelled_retry(review),
+        rework_predecessor=_nf01013_unsealed_predecessor(),
+        card_overrides={
+            **_nf01013_recovery_fields(),
+            "rejection_disposition": {
+                "schema_id": "aiworkhub.rejection_disposition.v1",
+                "failure_category": "candidate_code",
+                "request_id": "a" * 32,
+                "to": "pending",
+                "pinned_at": "2026-09-25T02:58:54+00:00",
+            },
+        },
+    )
+    review_result = _nf01013_reroute(review, reason="still a review rejection")
+    assert review_result["ok"] is False
+    assert "reroute_manager_rejection_provenance_missing" in review_result["stderr"]
+    assert _row(coordinator_repo, review)["runner"] == "claude_sonnet-4.6"
+
+    gated = "REROUTE_NF01013_WORKER_GATE"
+    _insert_pending_reroutable(
+        coordinator_repo,
+        task_id=gated,
+        terminal_retry=_nf01013_cancelled_retry(gated),
+        rework_predecessor=_nf01013_unsealed_predecessor(),
+        card_overrides={
+            **_nf01013_recovery_fields(),
+            "rejection_disposition": _nf01013_blocked_rejection(),
+        },
+    )
+    monkeypatch.setattr(
+        core,
+        "_canonical_write_gate",
+        lambda *args, **kwargs: {
+            "ok": False,
+            "returncode": 126,
+            "command": [],
+            "stdout": "",
+            "stderr": "coordinator_capability_denied:worker_self_reroute",
+        },
+    )
+    denied = _nf01013_reroute(gated, reason="worker must not reroute itself")
+    assert denied["ok"] is False
+    assert "coordinator_capability_denied" in denied["stderr"]
+    assert _row(coordinator_repo, gated)["runner"] == "claude_sonnet-4.6"
