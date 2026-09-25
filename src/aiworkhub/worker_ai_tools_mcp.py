@@ -2984,9 +2984,11 @@ _CONTINUATION_CURSOR_NEXT_CALL: dict[str, str] = {
         "continuation_cursor=null. Re-issue the query to start over."
     ),
     "cursor_not_supported_for_mode": (
-        "cursor is only accepted by analytic modes (tags, hotspots, coverage, "
-        "churn, testmap, ...). For a paged reply of this mode pass the "
-        "continuation_cursor from the previous page instead."
+        "cursor is accepted by analytic modes (tags, hotspots, coverage, "
+        "churn, testmap, ...) and by bodygrep, which resumes a truncated "
+        "scan from the previous page's next_cursor. For a paged reply of "
+        "every other mode pass the continuation_cursor from the previous "
+        "page instead."
     ),
 }
 
@@ -4781,12 +4783,16 @@ def source_graph_query(
     the engine is the sole authority for which rows are in scope and which
     page is returned, so this wrapper never re-filters or re-paginates an
     analytic payload on top of what the engine already decided. ``cursor``
-    is rejected for every non-analytic mode rather than silently ignored.
+    is also the bodygrep scan-resume token: pass the previous page's
+    ``next_cursor`` back unchanged and the scan continues from the first
+    unscanned file. It is rejected for every other non-analytic mode rather
+    than silently ignored.
 
     ``continuation_cursor`` is the signed outer-pagination cursor minted by a
     previous page of THIS call: it reassembles the exact canonical response
     bytes when the response exceeded the mode's outer output cap, and is
-    orthogonal to the engine-level analytic ``cursor`` above.
+    orthogonal to the engine-level ``cursor`` above. A bodygrep scan cursor
+    is not a continuation cursor and must not be passed as one.
     """
 
     tool = "source_graph"
@@ -4818,17 +4824,26 @@ def source_graph_query(
         return _violation(ctx, tool, "invalid_budget")
 
     is_analytic_mode = mode in SOURCE_GRAPH_ANALYTIC_MODES
+    # bodygrep's next_cursor is an engine scan cursor (hex path, line, digest),
+    # not an analytic offset and not the signed outer-pagination token. Accept
+    # it on cursor so a truncated scan resumes from the first unscanned file.
+    bodygrep_scan_cursor = mode == "bodygrep"
     # Set by the symbol-selector engine dispatch below when ``target`` resolved
     # to an indexed symbol; drives the selector-vs-path decision in the filter.
     selector_resolved = False
     if cursor is not None:
-        if not is_analytic_mode:
+        if not is_analytic_mode and not bodygrep_scan_cursor:
             return _violation(
                 ctx, tool, "cursor_not_supported_for_mode",
                 valid_next_call=_CONTINUATION_CURSOR_NEXT_CALL["cursor_not_supported_for_mode"],
                 analytic_modes=sorted(SOURCE_GRAPH_ANALYTIC_MODES),
             )
-        bounded_cursor = _bounded_query(cursor, max_bytes=64)
+        # Analytic cursors are short offset:digest tokens (64 bytes). A bodygrep
+        # scan cursor hex-encodes the resume path, so it needs a larger bound.
+        # The bound only rejects unbounded input; the engine still checks the
+        # digest, the path, and the line field.
+        cursor_max_bytes = 4096 if bodygrep_scan_cursor else 64
+        bounded_cursor = _bounded_query(cursor, max_bytes=cursor_max_bytes)
         if bounded_cursor is None:
             return _violation(ctx, tool, "invalid_cursor")
         cursor = bounded_cursor
@@ -5022,7 +5037,7 @@ def source_graph_query(
                 )
             elif mode == "bodygrep":
                 payload = _source_graph_mod.bodygrep_query(
-                    query_repo, bounded_query, budget, target=scope,
+                    query_repo, bounded_query, budget, target=scope, cursor=cursor,
                 )
             elif mode == "impact":
                 payload = _source_graph_mod.impact(query_repo, bounded_query, budget)
@@ -5158,6 +5173,10 @@ def source_graph_query(
         and not overlay_applied
         and isinstance(payload, dict)
         and _json_hit_count(payload) == 0
+        # A resumed bodygrep page must keep its scan cursor. Replacing a
+        # zero-hit page with a from-scratch fallback would restart at the
+        # alphabetical beginning and drop the files this page has not reached.
+        and not (mode == "bodygrep" and cursor)
     ):
         fallback = _source_graph_zero_hit_fallback(
             ctx, _source_graph_mod, query_repo,
@@ -5285,6 +5304,15 @@ def source_graph_query(
     internal_truncated = _payload_internal_truncation(payload)
     full_content_sha256 = hashlib.sha256(canonical_bytes).hexdigest()
     meta["internal_truncated"] = internal_truncated
+    if mode == "bodygrep" and isinstance(payload, dict):
+        # hit_count is this page only. A truncated scan is not a complete
+        # answer: keep truncated=true, and surface the same next_cursor the
+        # payload already returns so it can be passed back unchanged as cursor.
+        if payload.get("scan_truncated"):
+            meta["scan_truncated"] = True
+        scan_cursor = payload.get("next_cursor")
+        if isinstance(scan_cursor, str) and scan_cursor:
+            meta["next_cursor"] = scan_cursor
     ledger_meta: dict[str, Any] = {
         "authority_source": authority_source,
         "authority_state": authority_state,

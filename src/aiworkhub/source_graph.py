@@ -3957,8 +3957,11 @@ def bodygrep_query(
         # one in-budget file is always scanned per page, so the cursor moves.
         if files_scanned > 0 and bytes_scanned + file_size > scan_byte_cap:
             scan_truncated = True
+            # Name the first file not yet scanned, at line 0, so resume includes
+            # it instead of skipping it or restarting at the alphabetical start.
+            # Bind the digest to cursor_term, the same tuple the decoder checks.
             next_cursor = _encode_bodygrep_cursor(
-                file_path, 0, term=term, target=normalized_target, budget=budget,
+                file_path, 0, term=cursor_term, target=normalized_target, budget=budget,
             )
             break
         try:

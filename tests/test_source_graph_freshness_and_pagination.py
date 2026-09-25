@@ -32,7 +32,9 @@ from pathlib import Path
 
 import pytest
 
+from aiworkhub import manager_ai_tools
 from aiworkhub import source_graph as sg
+from aiworkhub import worker_ai_tools_mcp as worker_tools
 from aiworkhub.source_graph import _analytics_result_row_count
 from aiworkhub.repository_state import bootstrap_repository
 
@@ -433,6 +435,111 @@ def test_bodygrep_rejects_foreign_cursor(tmp_path):
         # A cursor bound to a different term must not be honoured.
         with pytest.raises(sg.SourceGraphError):
             sg.bodygrep_query(repo, "other_term", budget=1, cursor=cursor)
+
+
+def test_truncated_unscoped_bodygrep_cursor_resumes_past_the_cap(tmp_path, monkeypatch):
+    """NF-2026-00863: a truncated bodygrep scan cursor must resume.
+
+    The manager query path delegates to the worker wrapper, which refused
+    ``cursor`` for bodygrep and told the caller to pass ``continuation_cursor``.
+    That token is a different HMAC page cursor, so no accepted parameter could
+    continue the scan. The page's own ``next_cursor``, passed back unchanged,
+    must continue from the file it names and reach a hit the first page dropped.
+    """
+
+    term = "LATE_BODYGREP_HIT_NF00863"
+    repo = _new_repo(tmp_path, "grepresume")
+    _write(repo / "src" / "a_early.py", f"def early():\n    return {term!r}\n")
+    pad = "# " + ("x" * 2000) + "\n"
+    for index in range(40):
+        _write(repo / "src" / f"f{index:02d}.py", "def s():\n" + pad * 30)
+    _write(repo / "src" / "z_late.py", f"def late():\n    return {term!r}\n")
+    sg.build_index(repo, incremental=False)
+
+    ctx = worker_tools.WorkerToolContext(
+        task_id="T-NF00863",
+        runner="test",
+        topic="bodygrep-resume",
+        request_id="req-nf00863",
+        repo=repo,
+        authority_repo=repo,
+        source_graph_targets=(),
+        session_topic="bodygrep-resume",
+        audit_ledger_path=None,
+        audit_hmac_key_path=None,
+    )
+
+    def _manager_context(*, topic="management", target=None):
+        return ctx, {"provider": "test", "session_id": "nf00863", "repo": str(repo)}
+
+    monkeypatch.setattr(manager_ai_tools, "_manager_context", _manager_context)
+
+    def ask(**kwargs):
+        return manager_ai_tools.source_graph_query(
+            mode="bodygrep", query=term, budget=8, **kwargs,
+        )
+
+    first = ask()
+    assert first["ok"] is True
+    assert first["surface"] == "manager_mcp"
+    assert first["truncated"] is True
+    assert first["scan_truncated"] is True
+    payload = json.loads(first["content"])
+    assert payload["truncated"] is True
+    assert payload["scan_truncated"] is True
+    cursor = payload["next_cursor"]
+    assert isinstance(cursor, str) and cursor
+    # Envelope and payload carry the same resume token.
+    assert first["next_cursor"] == cursor
+    assert any(row["file_path"] == "src/a_early.py" for row in payload["matches"])
+    assert all(row["file_path"] != "src/z_late.py" for row in payload["matches"])
+
+    af_hex, after_line, _digest = cursor.split("-")
+    named_file = bytes.fromhex(af_hex).decode("utf-8")
+    assert after_line == "0"
+    assert named_file < "src/z_late.py"
+    for row in payload["matches"]:
+        assert row["file_path"] < named_file
+
+    # The signed outer-page token must still reject a scan cursor.
+    refused = ask(continuation_cursor=cursor)
+    assert refused["ok"] is False
+    assert refused["reason"] == "invalid_continuation_cursor"
+
+    forged = cursor[:-1] + ("0" if cursor[-1] != "0" else "1")
+    bad = ask(cursor=forged)
+    assert bad["ok"] is False
+    assert bad["reason"] == "invalid_cursor"
+
+    # The named file has not been scanned. Plant the term and require the next
+    # page to include it, so resume cannot skip that file or restart.
+    resume_path = repo / named_file
+    resume_path.write_text(
+        resume_path.read_text(encoding="utf-8") + "\n" + term + "\n",
+        encoding="utf-8",
+    )
+
+    page_cursor = cursor
+    found_named = False
+    found_late = False
+    for _page in range(8):
+        page = ask(cursor=page_cursor)
+        assert page["ok"] is True, page
+        page_payload = json.loads(page["content"])
+        assert page_payload.get("cursor") == page_cursor
+        page_resume = bytes.fromhex(page_cursor.split("-", 1)[0]).decode("utf-8")
+        for row in page_payload["matches"]:
+            assert row["file_path"] >= page_resume
+            if row["file_path"] == named_file:
+                found_named = True
+            if row["file_path"] == "src/z_late.py":
+                found_late = True
+        if found_named and found_late:
+            break
+        page_cursor = page_payload.get("next_cursor")
+        assert page_cursor and page_cursor != page_payload["cursor"]
+    assert found_named
+    assert found_late
 
 
 # ---------------------------------------------------------------------------
