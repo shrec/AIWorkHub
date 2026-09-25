@@ -14,6 +14,46 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.11.75
+
+- VS Code LM workers stop a Source Graph loop that never edits, even when
+  each query is different.
+
+## What's new in 0.11.74
+
+- VS Code LM workers fail closed on repeated line-1 edit pins and invalid JSON
+  instead of looping until the turn limit.
+
+## What's new in 0.11.73
+
+- `node` and `node --test` validations run inside the Windows AppContainer
+  instead of hanging on child-process pipes or failing on protected ancestors.
+
+## What's new in 0.11.72
+
+- Bundled Kilo/Grok workers receive a safe request-local XDG state directory.
+- Windows AppContainer traversal grants stay below trusted user Temp and reject
+  protected-root or pre-creation reparse-point escapes.
+
+## What's new in 0.11.71
+
+- Editor-hosted workers terminate repeated unchanged Source Graph discovery
+  early, while legitimate query-boundary changes remain available.
+
+## What's new in 0.11.70
+
+- Native OpenCode 2 workers route Bun temporary files to their request-local
+  AppContainer temp directory.
+- The runtime module-size invariant passes at the existing threshold.
+
+## What's new in 0.11.69
+
+- Manager Chat starts automatically on first send using an allowed configured
+  route.
+- LSP-backed Source Graph and focused delta review are included.
+- Windows workers provision Kilo's request-local XDG state path.
+- Development Rules shows applicable-rule counts honestly.
+
 ## What's new in 0.11.68
 
 - C/C++ cards launch regardless of the include layout.

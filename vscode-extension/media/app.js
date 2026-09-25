@@ -6937,7 +6937,11 @@ function managerChatEventNode(event) {
     delete rest.tool;
     const row = createElement("details", "manager-chat-tool-row");
     row.appendChild(createElement("summary", "", `${type === "tool_call" ? "Tool call" : "Tool result"}: ${name}`));
-    row.appendChild(createElement("div", "manager-chat-tool-row-body", limitText(JSON.stringify(rest), 200)));
+    // Model/tool payloads are untrusted and must stay literal, but they must
+    // not be clipped: the transcript scrolls instead of truncating.
+    const body = createElement("div", "manager-chat-tool-row-body");
+    body.appendChild(document.createTextNode(JSON.stringify(rest)));
+    row.appendChild(body);
     return row;
   }
   if (type === "callback") {
@@ -6955,19 +6959,81 @@ function managerChatEventNode(event) {
   if (type === "session_close") {
     return createElement("div", "manager-chat-marker", `Session closed${payload.reason ? `: ${limitText(payload.reason, 120)}` : ""}`);
   }
+  if (type === "reasoning") {
+    const row = createElement("details", "manager-chat-tool-row");
+    row.appendChild(createElement("summary", "", "Model reasoning"));
+    const body = createElement("div", "manager-chat-tool-row-body");
+    body.appendChild(document.createTextNode(String(payload.text || "")));
+    row.appendChild(body);
+    return row;
+  }
+  if (type === "turn_end") {
+    return managerChatTurnEndNode(payload, event);
+  }
   return null;
+}
+
+function managerChatTurnCallCount(turn) {
+  if (!Array.isArray(state.managerChatEvents)) return 0;
+  return state.managerChatEvents.filter((item) => item && item.type === "tool_call" && item.turn === turn).length;
+}
+
+function managerChatTurnEndNode(payload, event) {
+  const usage = payload && payload.usage;
+  const counts = [];
+  if (usage && typeof usage === "object" && !Array.isArray(usage)) {
+    const fields = [
+      ["input_tokens", "in"],
+      ["output_tokens", "out"],
+      ["total_tokens", "total"],
+      ["cache_read_input_tokens", "cache read"],
+      ["cache_creation_input_tokens", "cache write"]
+    ];
+    for (const field of fields) {
+      const value = usage[field[0]];
+      if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
+        counts.push(`${field[1]} ${value.toLocaleString("en-US")}`);
+      }
+    }
+  }
+  const turn = event && Number.isFinite(event.turn) ? ` ${event.turn}` : "";
+  const calls = managerChatTurnCallCount(event && event.turn);
+  const head = `Turn${turn} completed · ${calls} tool call${calls === 1 ? "" : "s"}`;
+  const text = counts.length > 0 ? `${head} (Tokens: ${counts.join(", ")})` : head;
+  return createElement("div", "manager-chat-marker", text);
 }
 
 function renderManagerChatEvents() {
   if (!elements.managerChatTranscript) return;
   const rows = [];
+  let lastTurnEndTurn = null;
+  const pending = [];
+  const flushPendingTurnEnd = () => {
+    if (pending.length > 0) {
+      const node = managerChatEventNode(pending[pending.length - 1]);
+      if (node) rows.push(node);
+      pending.length = 0;
+    }
+    lastTurnEndTurn = null;
+  };
   for (const event of state.managerChatEvents) {
+    // Opencode closes every agent step with step_finish, which the backend
+    // records as turn_end: collapse consecutive same-turn markers so one
+    // turn renders one completion row (the last, with final usage).
+    if (event && event.type === "turn_end") {
+      if (lastTurnEndTurn !== null && lastTurnEndTurn !== event.turn) flushPendingTurnEnd();
+      lastTurnEndTurn = event.turn;
+      pending.push(event);
+      continue;
+    }
+    flushPendingTurnEnd();
     const node = managerChatEventNode(event);
     if (node) rows.push(node);
   }
+  flushPendingTurnEnd();
   if (rows.length === 0) {
     elements.managerChatTranscript.replaceChildren(
-      createElement("div", "panel-list-empty compact", state.managerChatSession ? "No events yet" : "Start a session to begin"),
+      createElement("div", "panel-list-empty compact", state.managerChatSession ? "No events yet" : "Send a message to begin — no Start needed"),
     );
     return;
   }
@@ -6989,9 +7055,13 @@ function showManagerChatNotice(message) {
 }
 
 function applyManagerChatComposerState() {
-  const canSend = Boolean(state.managerChatSession) && !state.managerChatRunning;
-  elements.managerChatInput.disabled = !canSend;
-  elements.managerChatSend.disabled = !canSend;
+  // A running turn does not lock the composer. The owner can send again;
+  // those sends render from status.send_queue and disappear when drained.
+  // Typed refusals (no_manager_route_available, manager_session_already_active,
+  // manager_turn_in_progress) still arrive as action replies and surface as notices.
+  if (!elements.managerChatInput || !elements.managerChatSend) return;
+  elements.managerChatInput.disabled = false;
+  elements.managerChatSend.disabled = false;
 }
 
 function managerChatEnabledModels(backendId) {
@@ -7039,12 +7109,39 @@ function populateManagerChatModelOptions() {
   applyManagerChatSessionUi();
 }
 
+function syncManagerChatPickerToSession() {
+  // The picker mirrors the running route, so Send always carries what the
+  // owner sees. A backend/model the catalog no longer lists is left alone
+  // rather than clobbered -- the server refuses it by name on Send.
+  const backendId = String(state.managerChatBackend || "");
+  const model = String(state.managerChatModel || "");
+  if (!backendId) return;
+  const backendOptions = Array.from(elements.managerChatBackendSelect.children || [])
+    .map((option) => option.value);
+  if (elements.managerChatBackendSelect.value !== backendId && backendOptions.includes(backendId)) {
+    elements.managerChatBackendSelect.value = backendId;
+    populateManagerChatModelOptions();
+  }
+  if (!model) return;
+  const modelOptions = Array.from(elements.managerChatModelInput.children || [])
+    .map((option) => option.value);
+  if (modelOptions.includes(model)) {
+    elements.managerChatModelInput.value = model;
+    state.managerChatModelByBackend[backendId] = model;
+  }
+}
+
 function applyManagerChatSessionUi() {
   const hasSession = Boolean(state.managerChatSession);
+  // The picker stays live during a session: changing it and pressing Send
+  // rebinds that turn (same route is a no-op). Only Start is one-shot.
+  if (hasSession && state.managerChatBackend) {
+    syncManagerChatPickerToSession();
+  }
   const hasModelChoice = managerChatEnabledModels(elements.managerChatBackendSelect.value).length > 0;
   elements.managerChatStart.disabled = hasSession || !hasModelChoice;
-  elements.managerChatBackendSelect.disabled = hasSession;
-  elements.managerChatModelInput.disabled = hasSession || !hasModelChoice;
+  elements.managerChatBackendSelect.disabled = false;
+  elements.managerChatModelInput.disabled = !hasModelChoice;
   elements.managerChatRotate.disabled = !hasSession || state.managerChatRunning;
   elements.managerChatClose.disabled = !hasSession || state.managerChatRunning;
   elements.managerChatStatus.classList.toggle("is-live", state.managerChatRunning);
@@ -7082,10 +7179,64 @@ function scheduleManagerChatPoll() {
   stopManagerChatPolling();
   state.managerChatPollTimer = window.setTimeout(() => {
     state.managerChatPollTimer = null;
-    if (state.managerChatSession && elements.managerChatDialog.open) {
+    // Polling follows the session, not whether a dialog is open.
+    if (state.managerChatSession) {
       requestManagerChatEvents();
     }
   }, MANAGER_CHAT_POLL_MS);
+}
+
+function managerChatQueueText(item) {
+  if (typeof item === "string" || typeof item === "number") return String(item);
+  if (!item || typeof item !== "object" || Array.isArray(item)) return "";
+  const text = item.text !== undefined ? item.text : item.message;
+  if (typeof text === "string" || typeof text === "number") return String(text);
+  return "";
+}
+
+function ensureManagerChatQueueHost() {
+  if (elements.managerChatQueue) return elements.managerChatQueue;
+  const host = createElement("ol", "manager-chat-send-queue");
+  host.id = "manager-chat-send-queue";
+  host.hidden = true;
+  host.setAttribute("aria-label", "Queued sends");
+  const composer = elements.managerChatComposer;
+  const parent = composer && composer.parentNode;
+  if (parent && typeof parent.insertBefore === "function") {
+    parent.insertBefore(host, composer);
+  }
+  elements.managerChatQueue = host;
+  return host;
+}
+
+function renderManagerChatSendQueue(payload) {
+  const host = ensureManagerChatQueueHost();
+  const items = asArray(payload && payload.send_queue);
+  const rows = [];
+  for (const item of items) {
+    const text = managerChatQueueText(item);
+    if (!text) continue;
+    const row = createElement("li", "manager-chat-queued-send");
+    row.appendChild(createElement("span", "manager-chat-bubble-label", "Queued"));
+    // Queue text is untrusted. textContent/createTextNode keeps hostile HTML literal.
+    row.appendChild(document.createTextNode(text));
+    const model = item && typeof item === "object" && !Array.isArray(item) ? item.model : "";
+    if (typeof model === "string" && model) {
+      const modelNode = createElement("span", "manager-chat-queued-model");
+      modelNode.appendChild(document.createTextNode(model));
+      row.appendChild(modelNode);
+    }
+    rows.push(row);
+  }
+  if (rows.length === 0) {
+    host.hidden = true;
+    host.replaceChildren();
+    return;
+  }
+  host.hidden = false;
+  const fragment = document.createDocumentFragment();
+  for (const row of rows) fragment.appendChild(row);
+  host.replaceChildren(fragment);
 }
 
 function renderManagerChatStatus(payload) {
@@ -7102,6 +7253,8 @@ function renderManagerChatStatus(payload) {
   state.managerChatModel = session ? String(session.model || "") : null;
   state.managerChatRunning = Boolean(payload.running);
   applyManagerChatSessionUi();
+  // Latest successful status is authoritative: an empty or missing send_queue drains the list.
+  renderManagerChatSendQueue(payload);
   if (!state.managerChatSession) {
     stopManagerChatPolling();
     state.managerChatEvents = [];
@@ -7114,9 +7267,7 @@ function renderManagerChatStatus(payload) {
     state.managerChatLastSeq = 0;
     renderManagerChatEvents();
   }
-  if (elements.managerChatDialog.open) {
-    requestManagerChatEvents();
-  }
+  requestManagerChatEvents();
 }
 
 function renderManagerChatEventsResponse(payload) {
@@ -7130,9 +7281,18 @@ function renderManagerChatEventsResponse(payload) {
       state.managerChatEvents = state.managerChatEvents.concat(events);
       state.managerChatLastSeq = events.reduce((max, event) => Math.max(max, numberValue(event.seq)), state.managerChatLastSeq);
       renderManagerChatEvents();
+      // A finished turn still needs one status pull: running and send_queue
+      // are authoritative only on status, and nothing else refreshes them
+      // after a background turn ends. The composer stays enabled either way.
+      // Failed turns carry `error` with no `turn_end`.
+      if (state.managerChatRunning && events.some((event) => event && (event.type === "turn_end" || event.type === "error"))) {
+        state.managerChatRunning = false;
+        applyManagerChatSessionUi();
+        vscode.postMessage({ type: "managerLoopStatus" });
+      }
     }
   }
-  if (state.managerChatSession && elements.managerChatDialog.open) {
+  if (state.managerChatSession) {
     scheduleManagerChatPoll();
   }
 }
@@ -7670,22 +7830,32 @@ elements.roadmapList.addEventListener("click", (event) => {
 });
 
 function openManagerChatDialog() {
-  if (!elements.managerChatDialog.open) elements.managerChatDialog.showModal();
-  showManagerChatNotice(null);
+  // The panel docks modeless on the dashboard's right edge: toggle it, and
+  // open with .show(), never .showModal(), so the dashboard stays usable.
+  if (elements.managerChatDialog.open) {
+    elements.managerChatDialog.close();
+    return;
+  }
+  elements.managerChatDialog.show();
   populateManagerChatModelOptions();
   if (!state.featureSettings) {
     vscode.postMessage({ type: "requestSettings" });
+  }
+  // Attach the repository's passive conversation on open: the panel works
+  // without Start, and the first Send pins the policy route server-side.
+  // ensure() is idempotent, so reopening never duplicates the conversation.
+  if (!state.managerChatSession) {
+    vscode.postMessage({ type: "managerLoopEnsure" });
   }
   vscode.postMessage({ type: "managerLoopStatus" });
 }
 
 elements.headerManagerChat.addEventListener("click", openManagerChatDialog);
 
-// <dialog> fires "close" for every dismissal path (the Close button's
-// .close() call, Escape, or a future form method=dialog submit) so this is
-// the one place that needs to stop the after_seq poll chain.
+// Closing the dock must not stop polling. The after_seq chain follows the
+// session, so a sidebar and a closed dialog keep receiving events.
 elements.managerChatDialog.addEventListener("close", () => {
-  stopManagerChatPolling();
+  if (state.managerChatSession) scheduleManagerChatPoll();
 });
 
 elements.managerChatBackendSelect.addEventListener("change", () => {
@@ -7725,17 +7895,24 @@ elements.managerChatComposer.addEventListener("submit", (event) => {
   if (elements.managerChatSend.disabled) return;
   const text = String(elements.managerChatInput.value || "").trim();
   if (!text) return;
-  vscode.postMessage({ type: "managerLoopSend", text });
+  // The picker route travels with the turn; the server binds it (same route
+  // is a no-op, a switch re-opens with a mechanical handoff) or refuses it
+  // by name before anything spawns.
+  vscode.postMessage({
+    type: "managerLoopSend",
+    text,
+    backendId: String(elements.managerChatBackendSelect.value || ""),
+    model: String(elements.managerChatModelInput.value || "").trim(),
+  });
   elements.managerChatInput.value = "";
-  // Optimistic: the round trip to a fresh managerLoopStatus reply is what
-  // authoritatively confirms "running", but disabling Send immediately closes
-  // the window where a fast double-click could reach the host before that
-  // reply lands. A concurrent send is refused server-side either way (see
-  // renderManagerChatAction's manager_turn_in_progress notice), so this only
-  // ever narrows -- never replaces -- that guarantee.
+  // Optimistic Running label only. The composer stays enabled so the next
+  // send can be queued; status.send_queue is what renders that queue.
   state.managerChatRunning = true;
   applyManagerChatSessionUi();
 });
+// The shipped markup starts the composer disabled. A sidebar must not wait
+// for a dialog open before the owner can type, including during a turn.
+applyManagerChatComposerState();
 
 function closeIdentityInfoPopover() {
   if (elements.identityInfo && elements.identityInfo.open) elements.identityInfo.open = false;

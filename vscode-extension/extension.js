@@ -11,7 +11,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.11.68";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.11.75";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 // NF-2026-00643: this globalStorage trace directory was measured holding 1,102
 // files and 2,235,024,325 bytes (2.24 GB), largest single file 44,626,825 bytes
@@ -397,6 +397,7 @@ const ALLOWED_INBOUND_MESSAGE_TYPES = new Set([
   "requestRuntimeRestore",
   "requestRuntimePurge",
   "managerLoopStart",
+  "managerLoopEnsure",
   "managerLoopSend",
   "managerLoopRotate",
   "managerLoopClose",
@@ -578,6 +579,7 @@ const TASK_RETENTION_TOOLS = Object.freeze({
 });
 const MANAGER_LOOP_TOOLS = Object.freeze({
   start: "aiworkhub_manager_loop_start",
+  ensure: "aiworkhub_manager_loop_ensure",
   send: "aiworkhub_manager_loop_send",
   rotate: "aiworkhub_manager_loop_rotate",
   status: "aiworkhub_manager_loop_status",
@@ -586,7 +588,7 @@ const MANAGER_LOOP_TOOLS = Object.freeze({
 });
 // The dashboard's Manager chat panel offers exactly these three CLI backends.
 // MANAGER_LOOP_TOOLS is deliberately never folded into EXPECTED_DASHBOARD_TOOL_NAMES:
-// these six tools are mutating and session-scoped, not the read-only dashboard
+// these seven tools are mutating and session-scoped, not the read-only dashboard
 // contract that check verifies (see pushRuntimeInfo).
 const MANAGER_LOOP_BACKENDS = new Set(["claude_cli", "codex_cli", "opencode_cli"]);
 // Matches manager_loop._SESSION_ID_RE -- production ids look like
@@ -1306,6 +1308,23 @@ async function findPythonCommandForLaunch(root) {
     argsPrefix: ["-3"],
     preflightDiagnostic: _buildPreflightDiagnostic(diagnostics),
   };
+}
+
+function resolveWorkerWorktreeRootEnv(
+  root,
+  inheritedEnv = process.env,
+  platform = process.platform,
+  tempRoot = os.tmpdir(),
+) {
+  const explicit = String(inheritedEnv.AIWORKHUB_WORKTREE_ROOT || "").trim();
+  if (explicit || platform !== "win32") return explicit;
+  const normalizedRepo = path.win32.normalize(String(root)).toLowerCase();
+  const namespace = crypto
+    .createHash("sha256")
+    .update(normalizedRepo, "utf8")
+    .digest("hex")
+    .slice(0, 16);
+  return path.win32.join(tempRoot, "aiworkhub-worktrees", namespace);
 }
 
 function ensureRepositoryCoordinatorCapability(root) {
@@ -2139,6 +2158,32 @@ class McpStdioClient {
   }
 
   async _start() {
+    // A VSIX can be reinstalled in place without reactivating this extension
+    // host. Converge its packaged bytes and current pointer before any owned
+    // MCP child starts; the existing materializer publishes atomically.
+    if (extensionContext && extensionContext.globalStorageUri && extensionContext.globalStorageUri.fsPath) {
+      const sourceRuntime = resolveExtensionRuntimeDir(extensionContext.extensionUri.fsPath);
+      const packagedFingerprint = _runtimeTreeFingerprint(sourceRuntime);
+      const currentPath = path.join(extensionContext.globalStorageUri.fsPath, "runtime", "current.json");
+      let currentRuntime = null;
+      try {
+        currentRuntime = JSON.parse(fs.readFileSync(currentPath, "utf8"));
+      } catch (_err) {
+        // A missing or incomplete pointer is repaired by materialization.
+      }
+      if (
+        !stableRuntimeInfo
+        || stableRuntimeInfo.fingerprint !== packagedFingerprint
+        || !currentRuntime
+        || currentRuntime.fingerprint !== packagedFingerprint
+        || currentRuntime.runtime_dir !== stableRuntimeInfo.runtimeDir
+      ) {
+        const stableRuntime = materializeStableRuntimeGeneration(extensionContext);
+        extensionRuntimeDir = stableRuntime.runtimeDir;
+        startStableRuntimeLease(stableRuntime);
+        this.outputChannel.appendLine(`[runtime] using immutable generation ${path.basename(stableRuntime.generationRoot)}`);
+      }
+    }
     const previousChild = this.child;
     const previouslyOwnedChild = this.lifecycleChild;
     if (previousChild && !previousChild.killed) {
@@ -2166,6 +2211,13 @@ class McpStdioClient {
       // the cooperative manager inbox and report direct wake as unavailable.
       AIWORKHUB_CALLBACK_TRANSPORT: "manager_inbox",
     };
+    const workerWorktreeRoot = resolveWorkerWorktreeRootEnv(root);
+    if (workerWorktreeRoot) {
+      // Keep an explicit worker-root override, but do not let an ambient
+      // repo-local runtime root drag Windows AppContainer worktrees onto a
+      // protected repository volume.
+      env.AIWORKHUB_WORKTREE_ROOT = workerWorktreeRoot;
+    }
     if (mcpDebugTraceFile) {
       env.AIWORKHUB_DEBUG_TRACE_FILE = mcpDebugTraceFile;
     }
@@ -2232,6 +2284,10 @@ class McpStdioClient {
     });
     this.child = child;
     this.lifecycleChild = child;
+    trackStableRuntimeChild(child, runtimeDir);
+    child.once("exit", () => releaseStableRuntimeChild(child));
+    // A failed spawn has no process to protect and may emit error without exit.
+    child.once("error", () => { if (!child.pid) releaseStableRuntimeChild(child); });
     this.lifecyclePid = child.pid;
     debugTrace("mcp.spawn.end", { child_pid: child.pid || null });
 
@@ -2792,35 +2848,55 @@ let activeClaimEpisode = `episode_${crypto.randomBytes(12).toString("hex")}`;
 let extensionRuntimeDir = null;
 let vscodeLmBridgeHost = null;
 let stableRuntimeInfo = null;
-let stableRuntimeLease = null;
-let stableRuntimeLeaseTimer = null;
+const stableRuntimeLeases = new Map();
 let runtimeRetentionCache = null;
 
+function retireUnusedStableRuntimeLeases() {
+  for (const [generationRoot, record] of stableRuntimeLeases) {
+    if (generationRoot === (stableRuntimeInfo && stableRuntimeInfo.generationRoot) || record.children.size) continue;
+    clearInterval(record.timer);
+    record.lease.dispose();
+    stableRuntimeLeases.delete(generationRoot);
+  }
+}
+
 function stopStableRuntimeLease() {
-  if (stableRuntimeLeaseTimer) clearInterval(stableRuntimeLeaseTimer);
-  stableRuntimeLeaseTimer = null;
-  if (stableRuntimeLease) stableRuntimeLease.dispose();
-  stableRuntimeLease = null;
+  stableRuntimeInfo = null;
+  retireUnusedStableRuntimeLeases();
 }
 
 function startStableRuntimeLease(runtimeInfo) {
-  stopStableRuntimeLease();
+  if (runtimeInfo && runtimeInfo.storageRoot && runtimeInfo.generationRoot
+      && !stableRuntimeLeases.has(runtimeInfo.generationRoot)) {
+    const lease = runtimeRetention.acquireLease({
+      generationRoot: runtimeInfo.generationRoot,
+      windowId: WINDOW_SCOPE_ID,
+      pid: process.pid,
+    });
+    const timer = setInterval(() => {
+      try {
+        lease.heartbeat();
+      } catch (err) {
+        if (outputChannel) outputChannel.appendLine(`[runtime] lease heartbeat failed: ${sanitizeErrorMessage(err)}`);
+      }
+    }, 2 * 60 * 1000);
+    if (typeof timer.unref === "function") timer.unref();
+    stableRuntimeLeases.set(runtimeInfo.generationRoot, { lease, timer, children: new Set() });
+  }
   stableRuntimeInfo = runtimeInfo;
   runtimeRetentionCache = null;
-  if (!runtimeInfo || !runtimeInfo.storageRoot || !runtimeInfo.generationRoot) return;
-  stableRuntimeLease = runtimeRetention.acquireLease({
-    generationRoot: runtimeInfo.generationRoot,
-    windowId: WINDOW_SCOPE_ID,
-    pid: process.pid,
-  });
-  stableRuntimeLeaseTimer = setInterval(() => {
-    try {
-      stableRuntimeLease.heartbeat();
-    } catch (err) {
-      if (outputChannel) outputChannel.appendLine(`[runtime] lease heartbeat failed: ${sanitizeErrorMessage(err)}`);
-    }
-  }, 2 * 60 * 1000);
-  if (typeof stableRuntimeLeaseTimer.unref === "function") stableRuntimeLeaseTimer.unref();
+  retireUnusedStableRuntimeLeases();
+}
+
+function trackStableRuntimeChild(child, runtimeDir) {
+  if (!stableRuntimeInfo || stableRuntimeInfo.runtimeDir !== runtimeDir) return;
+  const record = stableRuntimeLeases.get(stableRuntimeInfo.generationRoot);
+  if (record) record.children.add(child);
+}
+
+function releaseStableRuntimeChild(child) {
+  for (const record of stableRuntimeLeases.values()) record.children.delete(child);
+  retireUnusedStableRuntimeLeases();
 }
 
 function runtimeRetentionSnapshot({ force = false } = {}) {
@@ -3295,6 +3371,35 @@ const VSCODE_LM_PRIVATE_TOOLS = Object.freeze([
     },
   },
   {
+    name: "aiworkhub_worker_semantic_edit_prepare",
+    description: "Worker editor: bind one Source Graph-selected line range. Do not use the manager semantic-edit tools.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["file_path", "start_line", "end_line"],
+      properties: {
+        file_path: { type: "string", minLength: 1, maxLength: 512 },
+        start_line: { type: "integer", minimum: 1 },
+        end_line: { type: "integer", minimum: 1 },
+        include_fragment: { type: "boolean" },
+      },
+    },
+  },
+  {
+    name: "aiworkhub_worker_semantic_edit_apply",
+    description: "Worker editor: apply replacement-only code to one prepared target.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["target_id", "new", "idempotency_key"],
+      properties: {
+        target_id: { type: "string", minLength: 1, maxLength: 128 },
+        new: { type: "string" },
+        idempotency_key: { type: "string", minLength: 1, maxLength: 256 },
+      },
+    },
+  },
+  {
     name: VSCODE_LM_STAGE_EDIT_TOOL,
     description: "Stage one small hash-bound line replacement or one complete new file. The bridge validates and retains it; no workspace write occurs until the final envelope is accepted.",
     inputSchema: {
@@ -3749,9 +3854,13 @@ async function invokeVscodeLmPrivateTool(call, requestId = "", providerCallId = 
   if (!VSCODE_LM_REQUEST_ID_RE.test(String(requestId || ""))) {
     throw new Error("vscode_lm_worker_request_id_invalid");
   }
-  // NF134: normalize worker-scoped tool names to manager-scoped for the MCP
-  // backend which uses the canonical manager tool namespace.
-  const normalizedName = toolName.startsWith(VSCODE_LM_WORKER_PREFIX) && toolName !== "aiworkhub_worker_quality_review_submit"
+  // NF134 rewrites worker tool names onto the manager namespace. Semantic edit
+  // is the exception: workers have their own prepare/apply and must not be
+  // redirected onto the manager editor.
+  const workerSemanticEdit = toolName.startsWith("aiworkhub_worker_semantic_edit_");
+  const normalizedName = toolName.startsWith(VSCODE_LM_WORKER_PREFIX)
+      && toolName !== "aiworkhub_worker_quality_review_submit"
+      && !workerSemanticEdit
     ? VSCODE_LM_MANAGER_PREFIX + toolName.slice(VSCODE_LM_WORKER_PREFIX.length)
     : toolName;
   const toolInput = { ...(call.input || {}) };
@@ -3778,7 +3887,8 @@ function glmAgentProtocolPrompt(prompt, allowedWrites, pathContracts = {}) {
     `- Preferred delivery: after body discovery call ${VSCODE_LM_STAGE_EDIT_TOOL} once per smallest replacement or complete new file. The bridge performs hash-bound prepare internally and retains the fragment without writing it.\n` +
     `- After every intended fragment is staged, call ${VSCODE_LM_FINALIZE_EDIT_TOOL} with only a short truthful summary. Do not resend staged code; the bridge assembles the final envelope offline.\n` +
     `- Canonical offline create stage request: {"schema_id":"${VSCODE_LM_TOOL_REQUEST_SCHEMA}","name":"${VSCODE_LM_STAGE_EDIT_TOOL}","input":{"operation":"create","file_path":"<allowed-path>","content":"<full file content>"}}\n` +
-    `- Canonical offline replace-range stage request: {"schema_id":"${VSCODE_LM_TOOL_REQUEST_SCHEMA}","name":"${VSCODE_LM_STAGE_EDIT_TOOL}","input":{"operation":"replace_range","file_path":"<allowed-path>","start_line":1,"end_line":1,"new":"<replacement code>"}}\n` +
+    `- Canonical offline replace-range stage request uses the exact Source Graph range. A one-line pin of line 1 is not a complete replacement: {"schema_id":"${VSCODE_LM_TOOL_REQUEST_SCHEMA}","name":"${VSCODE_LM_STAGE_EDIT_TOOL}","input":{"operation":"replace_range","file_path":"<allowed-path>","start_line":"<source-graph-start>","end_line":"<source-graph-end>","new":"<complete replacement for that range>"}}\n` +
+    `- A worker edits an existing file with aiworkhub_worker_semantic_edit_prepare then aiworkhub_worker_semantic_edit_apply. Do not call manager semantic-edit tools.\n` +
     `- Canonical offline finalize request: {"schema_id":"${VSCODE_LM_TOOL_REQUEST_SCHEMA}","name":"${VSCODE_LM_FINALIZE_EDIT_TOOL}","input":{"summary":"<short applied summary>"}}\n` +
     `- Semantic-edit prepare is an internal bridge primitive and is not provider-callable. Stage each replacement with file_path, start_line, end_line, and new; the bridge resolves and binds current_sha256 internally.\n` +
     `- Semantic edits must name an allowed path and use non-overlapping 1-based inclusive start_line/end_line values from Source Graph evidence.\n` +
@@ -4367,11 +4477,26 @@ function vscodeLmMissingRequiredStageInstruction(nextMissing, native = false) {
     `${stageNow} with operation ${nextMissing.action} (action ${action}) for ${nextMissing.path}.` + readHint;
 }
 
+function vscodeLmForcedStageCorrection(nextMissing) {
+  return {
+    ok: false,
+    error: "vscode_lm_semantic_edit_stage_required",
+    corrective: true,
+    allowed_tool: VSCODE_LM_STAGE_EDIT_TOOL,
+    ...(nextMissing && nextMissing.path ? { next_missing_path: nextMissing.path } : {}),
+    ...(nextMissing && nextMissing.action ? { next_missing_action: nextMissing.action } : {}),
+  };
+}
+
 function vscodeLmForcedStageMissingKey(nextMissing) {
   return nextMissing && nextMissing.action && nextMissing.path
     ? `${nextMissing.action}:${nextMissing.path}`
     : "";
 }
+
+const VSCODE_LM_MAX_FORCED_STAGE_CORRECTIONS = 2;
+const VSCODE_LM_MAX_LINE_ONE_PINS = 2;
+const VSCODE_LM_MAX_INVALID_JSON = 2;
 
 function vscodeLmNoteForcedStageFailure(counter, nextMissing, protocolTrace, lastProtocolPreview) {
   const key = vscodeLmForcedStageMissingKey(nextMissing);
@@ -4379,7 +4504,10 @@ function vscodeLmNoteForcedStageFailure(counter, nextMissing, protocolTrace, las
     counter.key = key;
     counter.count = 0;
   }
-  if (counter.count >= 1) {
+  // Live GLM runs use the first correction to acknowledge the phase boundary
+  // in prose, then comply on the next turn. Keep both corrections bounded per
+  // missing output; a third violation still terminalizes deterministically.
+  if (counter.count >= VSCODE_LM_MAX_FORCED_STAGE_CORRECTIONS) {
     throw vscodeLmProtocolFailure(
       "vscode_lm_semantic_edit_stage_required", protocolTrace, lastProtocolPreview,
     );
@@ -4387,7 +4515,34 @@ function vscodeLmNoteForcedStageFailure(counter, nextMissing, protocolTrace, las
   counter.count += 1;
 }
 
+function vscodeLmIsLineOnePin(input) {
+  return Boolean(input)
+    && input.operation === "replace_range"
+    && Number(input.start_line) === 1
+    && Number(input.end_line) === 1;
+}
+
+function vscodeLmNoteLineOnePin(counter, input, protocolTrace, lastProtocolPreview) {
+  if (!vscodeLmIsLineOnePin(input)) return;
+  counter.count = (counter.count || 0) + 1;
+  if (counter.count > VSCODE_LM_MAX_LINE_ONE_PINS) {
+    throw vscodeLmProtocolFailure(
+      "vscode_lm_semantic_edit_no_progress", protocolTrace, lastProtocolPreview,
+    );
+  }
+}
+
+function vscodeLmNoteInvalidJson(counter, protocolTrace, lastProtocolPreview) {
+  counter.count = (counter.count || 0) + 1;
+  if (counter.count >= VSCODE_LM_MAX_INVALID_JSON) {
+    throw vscodeLmProtocolFailure(
+      "vscode_lm_text_protocol_invalid_json", protocolTrace, lastProtocolPreview,
+    );
+  }
+}
+
 const VSCODE_LM_WORKER_SOURCE_GRAPH_TOOL = "aiworkhub_worker_source_graph_query";
+const VSCODE_LM_SOURCE_GRAPH_DUPLICATE_SCHEMA = "aiworkhub.vscode_lm.source_graph_duplicate.v1";
 const VSCODE_LM_WORKER_SOURCE_GRAPH_READY_TIMEOUT_MS = 2000;
 const VSCODE_LM_WORKER_SOURCE_GRAPH_READY_POLL_MS = 20;
 let vscodeLmWorkerSourceGraphReadyTimeoutMs = VSCODE_LM_WORKER_SOURCE_GRAPH_READY_TIMEOUT_MS;
@@ -4463,18 +4618,85 @@ async function awaitVscodeLmWorkerSourceGraphReadinessOnce() {
   throw new Error("vscode_lm_mcp_unavailable");
 }
 
-async function invokeVscodeLmProtocolTool(call, requestId, invokeTool, stagedEdits, providerCallId = "") {
+const VSCODE_LM_MAX_SOURCE_GRAPH_WITHOUT_EDIT = 6;
+
+function createVscodeLmSourceGraphGuard() {
+  let lastIdentity = "";
+  let duplicates = 0;
+  let callsSinceEdit = 0;
+  const raw = (value) => String(value == null ? "" : value);
+  const normalize = (value) => raw(value).trim();
+  const identityFor = (call) => {
+    const name = String(call.name || "").trim();
+    if (name !== "aiworkhub_manager_source_graph_query" &&
+        name !== VSCODE_LM_WORKER_SOURCE_GRAPH_TOOL) return "";
+    const input = call.input || {};
+    const mode = normalize(input.mode).toLowerCase();
+    return JSON.stringify([
+      name, mode, mode === "bodygrep" ? raw(input.query) : normalize(input.query),
+      normalize(input.target).replace(/\\/g, "/"), normalize(input.workflow_stage).toLowerCase(),
+      normalize(input.bundle_type).toLowerCase(),
+    ]);
+  };
+  return {
+    isDuplicate(call) {
+      const identity = identityFor(call);
+      return Boolean(identity) && identity === lastIdentity;
+    },
+    before(call) {
+      const identity = identityFor(call);
+      if (!identity) return null;
+      callsSinceEdit += 1;
+      if (callsSinceEdit > VSCODE_LM_MAX_SOURCE_GRAPH_WITHOUT_EDIT) {
+        throw new Error("vscode_lm_source_graph_no_progress");
+      }
+      if (identity !== lastIdentity) {
+        lastIdentity = identity;
+        duplicates = 0;
+        return null;
+      }
+      duplicates += 1;
+      if (duplicates >= 2) throw new Error("vscode_lm_source_graph_no_progress");
+      return {
+        ok: false,
+        schema_id: VSCODE_LM_SOURCE_GRAPH_DUPLICATE_SCHEMA,
+        duplicate: true,
+        error: "vscode_lm_source_graph_duplicate",
+        corrective: true,
+      };
+    },
+    staged(result) {
+      if (result && result.ok === true && result.idempotent_replay !== true) {
+        lastIdentity = "";
+        duplicates = 0;
+        callsSinceEdit = 0;
+      }
+    },
+  };
+}
+
+async function invokeVscodeLmProtocolTool(call, requestId, invokeTool, stagedEdits, providerCallId = "", sourceGraphGuard = null) {
   const toolName = String(call && call.name || "").trim();
   if (toolName === VSCODE_LM_STAGE_EDIT_TOOL) {
-    return stagedEdits.stage(call.input);
+    const result = await stagedEdits.stage(call.input);
+    if (sourceGraphGuard) sourceGraphGuard.staged(result);
+    return result;
   }
   if (toolName === VSCODE_LM_FINALIZE_EDIT_TOOL) {
     return stagedEdits.finalize(call.input && call.input.summary);
   }
+  if (sourceGraphGuard) {
+    const duplicate = sourceGraphGuard.before(call);
+    if (duplicate) return duplicate;
+  }
   if (toolName === VSCODE_LM_WORKER_SOURCE_GRAPH_TOOL) {
     await awaitVscodeLmWorkerSourceGraphReadinessOnce();
   }
-  return invokeTool({ ...call, name: toolName }, requestId, providerCallId);
+  const result = await invokeTool({ ...call, name: toolName }, requestId, providerCallId);
+  if (sourceGraphGuard && toolName.startsWith("aiworkhub_worker_semantic_edit_")) {
+    sourceGraphGuard.staged(result);
+  }
+  return result;
 }
 
 function vscodeLmProtocolToolTransport(toolName) {
@@ -4510,7 +4732,8 @@ function glmTextToolProtocolPrompt(prompt, allowedWrites, sourceGraphPrefetched 
     (qualityReview
       ? `- The only successful terminal action is an authenticated aiworkhub_worker_quality_review_submit request.\n`
       : `- After each tool result, either request another allowlisted tool or output the final ${VSCODE_LM_EDIT_RESPONSE_SCHEMA} object.\n` +
-        `- Canonical stage request (replace_range): {"schema_id":"${VSCODE_LM_TOOL_REQUEST_SCHEMA}","name":"${editStageName}","input":{"operation":"replace_range","file_path":"<allowed-path>","start_line":1,"end_line":1,"new":"<replacement code>"}}\n` +
+        `- Canonical stage request (replace_range) uses the exact Source Graph range. A one-line pin of line 1 is not a complete replacement: {"schema_id":"${VSCODE_LM_TOOL_REQUEST_SCHEMA}","name":"${editStageName}","input":{"operation":"replace_range","file_path":"<allowed-path>","start_line":"<source-graph-start>","end_line":"<source-graph-end>","new":"<complete replacement for that range>"}}\n` +
+        `- A worker edits an existing file with aiworkhub_worker_semantic_edit_prepare then aiworkhub_worker_semantic_edit_apply. Do not call manager semantic-edit tools.\n` +
         `- Canonical stage request (create): {"schema_id":"${VSCODE_LM_TOOL_REQUEST_SCHEMA}","name":"${editStageName}","input":{"operation":"create","file_path":"<allowed-path>","content":"<full file content>"}}\n` +
         `- Canonical finalize request: {"schema_id":"${VSCODE_LM_TOOL_REQUEST_SCHEMA}","name":"${editFinalizeName}","input":{"summary":"<short applied summary>"}}\n`) +
     `- Allowed tool names: ${JSON.stringify(toolNames)}.\n` +
@@ -5264,6 +5487,8 @@ async function runVscodeLmTextProtocol(
   let reviewSubmitViolations = 0;
   let toolNotAllowedViolations = 0;
   let invalidJsonCorrected = false;
+  const invalidJsonCount = { count: 0 };
+  const lineOnePins = { count: 0 };
   let forceStagedEdit = false;
   let stagedEditInstructionSent = false;
   let stagedEditMissingPathSent = "";
@@ -5274,6 +5499,7 @@ async function runVscodeLmTextProtocol(
   const protocolTrace = [];
   let lastProtocolPreview = "";
   const stagedEdits = createVscodeLmStagedEditCollector(request);
+  const sourceGraphGuard = createVscodeLmSourceGraphGuard();
   const writableTask = request.request_kind !== "quality_review" &&
     Array.isArray(request.allowedWrites) && request.allowedWrites.length > 0;
   for (let turn = 0; turn < VSCODE_LM_MAX_AGENT_TURNS; turn += 1) {
@@ -5284,8 +5510,8 @@ async function runVscodeLmTextProtocol(
     }
     if (request.request_kind !== "quality_review" &&
         sourceGraphAcknowledged && postSourceTurns >= VSCODE_LM_MAX_POST_SOURCE_TURNS) {
-      if (vscodeLmShouldKeepStagedEdit(writableTask, stagedEdits)) forceStagedEdit = true;
-      else forceFinal = true;
+      if (stagedEdits.hasChanges() && vscodeLmShouldKeepStagedEdit(writableTask, stagedEdits)) forceStagedEdit = true;
+      else if (!writableTask || (stagedEdits && stagedEdits.hasChanges())) forceFinal = true;
     }
     if (vscodeLmStagedOutputsReady(stagedEdits) && (
         forceStagedEdit
@@ -5436,6 +5662,8 @@ async function runVscodeLmTextProtocol(
             lastProtocolPreview,
           );
         }
+      } else if (String((err && err.message) || err) === "vscode_lm_text_protocol_invalid_json") {
+        vscodeLmNoteInvalidJson(invalidJsonCount, protocolTrace, lastProtocolPreview);
       }
       messages.push(vscode.LanguageModelChatMessage.Assistant([languageModelTextPart(text)]));
       if (forceStagedEdit) {
@@ -5637,24 +5865,30 @@ async function runVscodeLmTextProtocol(
           stageInput.query.trim() && stageInput.query.length <= 512)) &&
       (stageInput.budget === undefined ||
         (Number.isInteger(stageInput.budget) && stageInput.budget > 0 && stageInput.budget <= 160)) &&
-      (stageContextReads.get(stageReadTarget) || 0) < 2 &&
-      forcedStageReadsTotal < VSCODE_LM_MAX_FORCED_STAGE_READS;
+      (sourceGraphGuard.isDuplicate({ name: envelope.name, input: stageInput }) || (
+        (stageContextReads.get(stageReadTarget) || 0) < 2 &&
+        forcedStageReadsTotal < VSCODE_LM_MAX_FORCED_STAGE_READS
+      ));
     if (!permitted && !stageRead) {
       // A non-stage tool request during forced staging is a phase violation, not
       // an authority violation. Correct it once without invoking MCP; a repeated
       // request fails with one bounded structured error.
       if (forceStagedEdit) {
+        const nextMissing = vscodeLmNextMissingRequiredOutput(stagedEdits);
         protocolTrace.push({ turn, phase: "semantic_edit_stage", outcome: "non_stage_tool_rejected" });
         vscodeLmNoteForcedStageFailure(
           stagedEditFailure,
-          vscodeLmNextMissingRequiredOutput(stagedEdits),
+          nextMissing,
           protocolTrace,
           lastProtocolPreview,
         );
         messages.push(vscode.LanguageModelChatMessage.Assistant([languageModelTextPart(text)]));
-        messages.push(vscode.LanguageModelChatMessage.User(
-          vscodeLmMissingRequiredStageInstruction(vscodeLmNextMissingRequiredOutput(stagedEdits), false),
-        ));
+        messages.push(vscode.LanguageModelChatMessage.User(JSON.stringify({
+          schema_id: VSCODE_LM_TOOL_RESULT_SCHEMA,
+          name: envelope.name,
+          result: vscodeLmForcedStageCorrection(nextMissing),
+          instruction: vscodeLmMissingRequiredStageInstruction(nextMissing, false),
+        })));
         continue;
       }
       // NF-2026-00032: outside forced staging an unknown or non-allowlisted name
@@ -5750,10 +5984,6 @@ async function runVscodeLmTextProtocol(
         max_bytes: VSCODE_LM_MAX_EMULATED_TOOL_INPUT_BYTES,
       });
     }
-    if (stageRead && !toolInputTooLarge) {
-      stageContextReads.set(stageReadTarget, (stageContextReads.get(stageReadTarget) || 0) + 1);
-      forcedStageReadsTotal += 1;
-    }
     let result;
     let toolFailureReported = false;
     const toolStartedAt = Date.now();
@@ -5770,6 +6000,9 @@ async function runVscodeLmTextProtocol(
           max_bytes: VSCODE_LM_MAX_EMULATED_TOOL_INPUT_BYTES,
         };
       } else {
+        if (envelope.name === VSCODE_LM_STAGE_EDIT_TOOL) {
+          vscodeLmNoteLineOnePin(lineOnePins, envelope.input, protocolTrace, lastProtocolPreview);
+        }
         result = await raceVscodeLmCancellation(
           invokeVscodeLmProtocolTool(
             { name: envelope.name, input: envelope.input },
@@ -5777,13 +6010,27 @@ async function runVscodeLmTextProtocol(
             invokeTool,
             stagedEdits,
             turnProviderCallId,
+            sourceGraphGuard,
           ),
           cancellationToken,
         );
       }
       assertRequestActive();
+      if (stageRead && !toolInputTooLarge &&
+          !(result && result.schema_id === VSCODE_LM_SOURCE_GRAPH_DUPLICATE_SCHEMA)) {
+        stageContextReads.set(stageReadTarget, (stageContextReads.get(stageReadTarget) || 0) + 1);
+        forcedStageReadsTotal += 1;
+      }
     } catch (err) {
       if (String(err && err.message || err) === "vscode_lm_request_cancelled") throw err;
+      if (String(err && err.message || err) === "vscode_lm_source_graph_no_progress") {
+        protocolTrace.push({ turn, phase: "source_graph", outcome: "duplicate_no_progress" });
+        throw vscodeLmProtocolFailure("vscode_lm_source_graph_no_progress", protocolTrace, lastProtocolPreview);
+      }
+      if (stageRead && !toolInputTooLarge) {
+        stageContextReads.set(stageReadTarget, (stageContextReads.get(stageReadTarget) || 0) + 1);
+        forcedStageReadsTotal += 1;
+      }
       result = {
         ok: false,
         error: isQualityReviewSubmitTool(envelope.name)
@@ -5840,7 +6087,8 @@ async function runVscodeLmTextProtocol(
     if (result && result.ok === true && result.__finalEnvelope) {
       return JSON.stringify(result.__finalEnvelope);
     }
-    if (forceStagedEdit && result && result.ok === false) {
+    if (forceStagedEdit && result && result.ok === false &&
+        result.schema_id !== VSCODE_LM_SOURCE_GRAPH_DUPLICATE_SCHEMA) {
       protocolTrace.push({ turn, phase: "semantic_edit_stage", outcome: "stage_rejected" });
       vscodeLmNoteForcedStageFailure(
         stagedEditFailure,
@@ -5928,10 +6176,12 @@ async function runVscodeLmAgent(
   let stagedEditInstructionSent = false;
   let stagedEditMissingPathSent = "";
   const stagedEditFailure = { key: "", count: 0 };
+  const lineOnePins = { count: 0 };
   let lastMissingCreateRejectionIdentity = "";
   const protocolTrace = [];
   let lastProtocolPreview = "";
   const stagedEdits = createVscodeLmStagedEditCollector(request);
+  const sourceGraphGuard = createVscodeLmSourceGraphGuard();
   const writableTask = !qualityReview && Array.isArray(request.allowedWrites) &&
     request.allowedWrites.length > 0;
   let wrongToolViolations = 0;
@@ -5945,7 +6195,7 @@ async function runVscodeLmAgent(
         !forceFinal) {
       if (vscodeLmShouldKeepStagedEdit(writableTask, stagedEdits)) {
         forceStagedEdit = true;
-      } else {
+      } else if (!writableTask || (stagedEdits && stagedEdits.hasChanges())) {
         forceFinal = true;
       }
     }
@@ -6062,16 +6312,23 @@ async function runVscodeLmAgent(
     }
     if (startedWithSourceGraph) postSourceTurns += 1;
     if (forceStagedEdit && calls.some((call) => call.name !== VSCODE_LM_STAGE_EDIT_TOOL)) {
+      const nextMissing = vscodeLmNextMissingRequiredOutput(stagedEdits);
       protocolTrace.push({ turn, phase: "semantic_edit_stage", outcome: "non_stage_tool_rejected" });
       vscodeLmNoteForcedStageFailure(
         stagedEditFailure,
-        vscodeLmNextMissingRequiredOutput(stagedEdits),
+        nextMissing,
         protocolTrace,
         lastProtocolPreview,
       );
-      messages.push(vscode.LanguageModelChatMessage.Assistant(filterOutToolCallParts(assistantParts)));
+      messages.push(vscode.LanguageModelChatMessage.Assistant(assistantParts));
       messages.push(vscode.LanguageModelChatMessage.User(
-        vscodeLmMissingRequiredStageInstruction(vscodeLmNextMissingRequiredOutput(stagedEdits), true),
+        calls.map((call) => languageModelToolResultPart(
+          call.callId,
+          vscodeLmForcedStageCorrection(nextMissing),
+        )),
+      ));
+      messages.push(vscode.LanguageModelChatMessage.User(
+        vscodeLmMissingRequiredStageInstruction(nextMissing, true),
       ));
       continue;
     }
@@ -6335,12 +6592,19 @@ async function runVscodeLmAgent(
       }
       try {
         assertRequestActive();
+        if (call.name === VSCODE_LM_STAGE_EDIT_TOOL) {
+          vscodeLmNoteLineOnePin(lineOnePins, call.input, protocolTrace, lastProtocolPreview);
+        }
         result = await raceVscodeLmCancellation(
-          invokeVscodeLmProtocolTool(call, request.requestId, invokeTool, stagedEdits, turnProviderCallId), cancellationToken,
+          invokeVscodeLmProtocolTool(call, request.requestId, invokeTool, stagedEdits, turnProviderCallId, sourceGraphGuard), cancellationToken,
         );
         assertRequestActive();
       } catch (err) {
         if (String(err && err.message || err) === "vscode_lm_request_cancelled") throw err;
+        if (String(err && err.message || err) === "vscode_lm_source_graph_no_progress") {
+          protocolTrace.push({ turn, phase: "source_graph", outcome: "duplicate_no_progress" });
+          throw vscodeLmProtocolFailure("vscode_lm_source_graph_no_progress", protocolTrace, lastProtocolPreview);
+        }
         result = {
           ok: false,
           error: isQualityReviewSubmitTool(call.name)
@@ -7528,6 +7792,23 @@ raise SystemExit(main())
   return launcher;
 }
 
+// Liveness gate for a materialized launcher: `<storageRoot>/bin/<launcher>`
+// must resolve to a live `<storageRoot>/runtime/current.json` whose runtime
+// holds aiworkhub/server.py. A Temp-fallback layout has no runtime dir, so
+// pinning it would write a dead command into every consumer config
+// (measured: opencode awh entry crashing on missing current.json). Callers
+// log and skip the write instead -- activation itself never throws.
+function stableMcpLauncherLayoutOk(launcherPath) {
+  const storageRoot = path.dirname(path.dirname(String(launcherPath || "")));
+  try {
+    const current = JSON.parse(fs.readFileSync(path.join(storageRoot, "runtime", "current.json"), "utf8"));
+    return Boolean(current && typeof current.runtime_dir === "string"
+      && fs.existsSync(path.join(current.runtime_dir, "aiworkhub", "server.py")));
+  } catch (_err) {
+    return false;
+  }
+}
+
 function ensureCodexStableMcpRegistered(context) {
   const configPath = resolveCodexConfigTomlPath(process.env);
   let original = "";
@@ -7540,6 +7821,10 @@ function ensureCodexStableMcpRegistered(context) {
     }
   }
   const launcher = materializeStableMcpLauncher(context);
+  if (!stableMcpLauncherLayoutOk(launcher)) {
+    outputChannel.appendLine("[codex] stable launcher layout unverifiable; registration left untouched");
+    return false;
+  }
   const python = findPythonCommand(os.homedir(), { preflight: false });
   const result = ensureCodexStableMcpRegistrationTomlText(original, launcher, python);
   if (!result.changed || result.text === original) return false;
@@ -7848,7 +8133,9 @@ const CANONICAL_OPENCODE_MCP_SERVER_NAME = "awh";
  * repository-identity keys from every AIWorkHub-owned entry, and disable the
  * legacy "aiworkhub" alias only when it duplicates the enabled "awh" launcher.
  * Other MCP entries, top-level keys, and unrelated environment keys are
- * preserved. An operator-disabled canonical entry remains disabled. */
+ * preserved. A disabled canonical entry is re-enabled (reported via
+ * `reenabled`, never silently): a disabled manager plane serves no tools.
+ */
 function repairOpencodeConfigJsonObject(document, launcherArgs) {
   let changed = false;
   if (!document || typeof document !== "object" || Array.isArray(document)) {
@@ -7891,18 +8178,22 @@ function repairOpencodeConfigJsonObject(document, launcherArgs) {
   if (!Object.prototype.hasOwnProperty.call(nextEnvironment, "AIWORKHUB_ALLOW_LAUNCH")) {
     nextEnvironment.AIWORKHUB_ALLOW_LAUNCH = "1";
   }
+  // Owner policy: the canonical entry is always enabled. A disabled
+  // registration never serves tools, and a silently-disabled manager plane
+  // is worse than an explicitly re-enabled one -- the re-enable is logged
+  // by the caller via `reenabled`, never silent.
+  const reenabled = Boolean(existing && existing.enabled === false);
   const next = {
     ...(existing && typeof existing === "object" ? existing : {}),
     type: "local",
     command: launcherArgs,
     environment: nextEnvironment,
-    enabled: existing && typeof existing.enabled === "boolean" ? existing.enabled : true,
+    enabled: true,
   };
   if (JSON.stringify(next) !== JSON.stringify(existing)) {
     servers[name] = next;
     changed = true;
   }
-  // The legacy name and the short canonical alias publish the same tool set.
   // Retire only the measured duplicate; MAX_PROCESSES changes capacity, not
   // server identity, while permission/backend differences preserve separate use.
   const legacy = servers.aiworkhub;
@@ -7924,7 +8215,7 @@ function repairOpencodeConfigJsonObject(document, launcherArgs) {
     legacy.enabled = false;
     changed = true;
   }
-  return { document, changed };
+  return { document, changed, reenabled };
 }
 
 /** Read and parse an existing opencode.json/opencode.jsonc document.
@@ -8018,13 +8309,17 @@ function ensureOpencodeMcpRegistered(context) {
     return false;
   }
   const launcher = materializeStableMcpLauncher(context);
+  if (!stableMcpLauncherLayoutOk(launcher)) {
+    if (outputChannel) outputChannel.appendLine("[opencode] stable launcher layout unverifiable; registration left untouched");
+    return false;
+  }
   const python = findPythonCommand(os.homedir(), { preflight: false });
   const launcherArgs = [python.command, ...(Array.isArray(python.argsPrefix) ? python.argsPrefix : []), launcher];
   const result = repairOpencodeConfigJsonObject(read.document, launcherArgs);
   if (!result.changed) return false;
   try {
     atomicWriteJsonPreservingMode(configPath, result.document);
-    if (outputChannel) outputChannel.appendLine("[opencode] registered the AIWorkHub MCP host-stable launcher");
+    if (outputChannel) outputChannel.appendLine("[opencode] registered the AIWorkHub MCP host-stable launcher" + (result.reenabled ? " (re-enabled a disabled entry)" : ""));
     return true;
   } catch (err) {
     if (outputChannel) outputChannel.appendLine(`[opencode] failed to register AIWorkHub MCP: ${sanitizeErrorMessage(err)}`);
@@ -10391,10 +10686,23 @@ function handleInboundMessage(view, message) {
       runManagerLoopAction(view, "start", { backend_id: backendId, model });
       break;
     }
+    case "managerLoopEnsure": {
+      runManagerLoopAction(view, "ensure", {});
+      break;
+    }
     case "managerLoopSend": {
       const text = String(message.text || "");
       if (!text.trim()) return;
-      runManagerLoopAction(view, "send", { text });
+      // The picker route travels with the turn; blank means "no selection"
+      // and the server keeps the legacy policy-default pin behavior. An
+      // unlisted backend is refused here, like Start, before any MCP call.
+      const sendBackendId = String(message.backendId || "");
+      const sendModel = String(message.model || "").trim();
+      if (sendBackendId && !MANAGER_LOOP_BACKENDS.has(sendBackendId)) {
+        view.postMessage({ type: OUTBOUND_TYPES.error, message: "invalid_backend_id" });
+        return;
+      }
+      runManagerLoopAction(view, "send", { text, backend_id: sendBackendId, model: sendModel });
       break;
     }
     case "managerLoopRotate":
@@ -10519,7 +10827,7 @@ function codingFoundationCardModel(kind, projection) {
       : null;
     const version = typeof projection.version === "string" ? codingFoundationBoundText(projection.version, 16) : "";
     const detail = codingFoundationJoinParts([
-      resolved == null ? "" : resolved + " resolved",
+      resolved == null ? "" : resolved + " applicable",
       violations == null ? "" : violations + " viol",
       version,
     ]) || "Measured";
@@ -12101,6 +12409,7 @@ module.exports = {
     runBackgroundTask,
     findPythonCommand,
     findPythonCommandForLaunch,
+    resolveWorkerWorktreeRootEnv,
     _preflightPythonCandidate,
     _preflightPythonCandidateAsync,
     _buildPreflightDiagnostic,
@@ -12139,6 +12448,7 @@ module.exports = {
     ensureCodexMcpRegistered,
     ensureCodexStableMcpRegistrationTomlText,
     materializeStableMcpLauncher,
+    stableMcpLauncherLayoutOk,
     ensureCodexStableMcpRegistered,
     resolveOpencodeConfigJsonPath,
     opencodeConfigJsonPath,
@@ -12192,7 +12502,11 @@ module.exports = {
     validateVscodeLmFinalEnvelope,
     createVscodeLmStagedEditCollector,
     invokeVscodeLmProtocolTool,
+    createVscodeLmSourceGraphGuard,
     invokeVscodeLmPrivateTool,
+    vscodeLmIsLineOnePin,
+    vscodeLmNoteLineOnePin,
+    vscodeLmNoteInvalidJson,
     armVscodeLmProviderBridgeReadiness,
     bindVscodeLmProviderBridgeForTest,
     resetVscodeLmWorkerSourceGraphReadinessForTest,

@@ -3032,6 +3032,7 @@ tbody tr.is-selected td:first-child {
 .manager-chat-frame > .needfix-toolbar,
 .manager-chat-frame > .manager-chat-session-line,
 .manager-chat-frame > .manager-chat-notice,
+.manager-chat-frame > .manager-chat-send-queue,
 .manager-chat-frame > .manager-chat-composer {
   flex: 0 0 auto;
 }
@@ -3041,7 +3042,54 @@ tbody tr.is-selected td:first-child {
 }
 
 #manager-chat-dialog .needfix-toolbar {
-  grid-template-columns: auto minmax(140px, 1fr) auto auto auto auto;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+#manager-chat-dialog .needfix-toolbar select,
+#manager-chat-model {
+  width: auto;
+  max-width: 100%;
+  flex: 1 1 auto;
+  field-sizing: content;
+  overflow: visible;
+  text-overflow: clip;
+}
+
+/* Manager Chat docks as the dashboard's right panel. The element stays a
+<dialog> so every existing ID, handler and `.open` gate keeps working, but
+it opens modeless (.show(), never .showModal()) and pins to the viewport's
+right edge instead of floating centered and modal. Colours reuse the file's
+existing custom properties; the toast (z-40) stays on top. */
+.diagnostic-dialog.manager-chat-dialog {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: auto;
+  width: min(430px, 94vw);
+  max-width: none;
+  height: 100vh;
+  max-height: none;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-left: 1px solid var(--line);
+  border-radius: 0;
+  box-shadow: none;
+  background: var(--surface);
+  color: var(--ink);
+  z-index: 30;
+}
+.diagnostic-dialog.manager-chat-dialog[open] {
+  display: flex;
+}
+.diagnostic-dialog.manager-chat-dialog > .manager-chat-frame {
+  flex: 1 1 auto;
+  min-height: 0;
+  min-width: 0;
 }
 
 .manager-chat-session-line {
@@ -3052,6 +3100,10 @@ tbody tr.is-selected td:first-child {
   color: var(--muted);
   font-size: var(--fs-2xs);
   border-bottom: 1px solid var(--line);
+  min-width: 0;
+  overflow: visible;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
 }
 
 .manager-chat-transcript {
@@ -3102,6 +3154,10 @@ tbody tr.is-selected td:first-child {
   font-family: var(--vscode-editor-font-family, monospace);
   font-size: var(--fs-2xs);
   cursor: pointer;
+  overflow: visible;
+  text-overflow: clip;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .manager-chat-tool-row-body {
@@ -3109,6 +3165,9 @@ tbody tr.is-selected td:first-child {
   padding: 0 9px 8px;
   color: var(--muted);
   font-size: var(--fs-2xs);
+  max-height: none;
+  overflow: visible;
+  text-overflow: clip;
   overflow-wrap: anywhere;
   white-space: pre-wrap;
 }
@@ -3138,6 +3197,41 @@ tbody tr.is-selected td:first-child {
   border-radius: 4px;
   background: var(--stale-soft);
   color: var(--ink);
+  font-size: var(--fs-2xs);
+}
+
+.manager-chat-send-queue {
+  margin: 0;
+  padding: 6px 10px 0;
+  list-style: none;
+  min-width: 0;
+}
+
+.manager-chat-send-queue[hidden] {
+  display: none;
+}
+
+.manager-chat-queued-send,
+.manager-chat-queued-model {
+  overflow: visible;
+  text-overflow: clip;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.manager-chat-queued-send {
+  margin: 0 0 6px;
+  padding: 6px 8px;
+  border: 1px dashed var(--line);
+  border-radius: 4px;
+  color: var(--ink);
+  background: var(--surface-subtle);
+}
+
+.manager-chat-queued-model {
+  display: block;
+  margin-top: 3px;
+  color: var(--muted);
   font-size: var(--fs-2xs);
 }
 

@@ -6,6 +6,78 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.75] - 2026-09-26
+
+### Fixed
+
+- VS Code LM workers fail closed after six Source Graph queries without an
+  edit, even when each query is different. A successful worker semantic edit
+  resets that budget.
+
+## [0.11.74] - 2026-09-25
+
+### Fixed
+
+- VS Code LM workers no longer burn the full agent turn budget on repeated
+  line-1 semantic-edit pins or invalid JSON. A third line-1 pin, or a second
+  invalid JSON reply, fails closed. Worker semantic edit prepare/apply stays
+  on the worker editor and is not rewritten onto the manager tools.
+
+
+### Fixed
+
+- Node validations inside the Windows AppContainer no longer hang or fail on
+  ancestor access: every `node` command gets `--preserve-symlinks
+  --preserve-symlinks-main` (realpath otherwise lstat's `C:\Users` and fails
+  EPERM), and `node --test` runs in-process (`--test-isolation=none` on
+  >=23.6, `--experimental-test-isolation=none` on 22.8-23.5) because libuv
+  spins forever when `CreateNamedPipe` is denied (NF-2026-01009).
+
+## [0.11.72] - 2026-09-25
+
+### Fixed
+
+- Kilo/Grok AppContainer launches provision the request-local XDG state leaf
+  before startup and grant only bounded, revocable access below the trusted
+  user-temp authority.
+- Request-scoped AppContainer traversal no longer reaches repository, profile,
+  drive-root, or other protected ancestors, and symlink/junction escapes are
+  rejected before directory creation.
+
+## [0.11.71] - 2026-09-24
+
+### Fixed
+
+- VS Code LM workers stop repeated unchanged Source Graph discovery before the
+  broad turn limit, reuse one compact typed duplicate receipt, and reset only
+  after a real edit or material query-boundary change.
+
+## [0.11.70] - 2026-09-24
+
+### Fixed
+
+- Native OpenCode 2 workers route Bun temporary files into the request-local
+  AppContainer temp authority, avoiding package-temp `lstat EPERM` failures.
+- The canonical module-size invariant passes at its existing threshold.
+
+## [0.11.69] - 2026-09-24
+
+### Added
+
+- Manager Chat starts on first send by selecting one configured, policy-authorized
+  manager route; explicit Start remains authoritative and concurrent sends stay
+  single-flight.
+- Source Graph's canonical LSP acceptance path and focused delta review are
+  wired into the reviewed runtime.
+
+### Fixed
+
+- Windows AppContainer workers use request-local user temp worktrees and Kilo's
+  exact XDG state leaf is created and granted before launch, removing the
+  pre-provider `EPERM realpath` failure.
+- Development Rules reports context-applicable rules as applicable instead of
+  mislabeling them as resolved work.
+
 ## [0.11.68] - 2026-09-23
 
 ### Fixed

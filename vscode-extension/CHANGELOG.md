@@ -1,5 +1,63 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.75 — 2026-09-26
+
+### Fixed
+
+- VS Code LM workers stop after six Source Graph queries without an edit,
+  instead of varying the query until the turn limit.
+
+## 0.11.74 — 2026-09-25
+
+### Fixed
+
+- VS Code LM workers fail closed on repeated line-1 edit pins and invalid JSON
+  instead of looping until the agent turn limit. Worker semantic edit stays on
+  the worker editor.
+
+## 0.11.73 — 2026-09-25
+
+### Fixed
+
+- `node` and `node --test` validations run inside the Windows AppContainer
+  instead of hanging on child-process pipes or failing on protected ancestors.
+
+## 0.11.72 — 2026-09-25
+
+### Fixed
+
+- Bundled Kilo/Grok workers receive a safe request-local XDG state directory.
+- Windows AppContainer traversal grants stop at trusted user Temp and reject
+  protected-root or pre-creation reparse-point escapes.
+
+## 0.11.71 — 2026-09-24
+
+### Fixed
+
+- Editor-hosted workers stop repeated unchanged Source Graph loops before the
+  broad agent-turn limit while preserving legitimate boundary changes.
+
+## 0.11.70 — 2026-09-24
+
+### Fixed
+
+- Native OpenCode 2 workers route Bun temporary files to the request-local
+  AppContainer temp directory instead of the package-private temp fallback.
+- The Python runtime satisfies the existing module-size ratchet again.
+
+## 0.11.69 — 2026-09-24
+
+### Added
+
+- Manager Chat chooses an allowed configured route and starts on first send.
+- The bundled runtime includes the accepted LSP-backed Source Graph and focused
+  delta-review paths.
+
+### Fixed
+
+- Windows AppContainer launch provisions Kilo's request-local XDG state leaf.
+- Development Rules labels context-matching rules as applicable, not resolved.
+
 ## 0.11.68 — 2026-09-23
 
 ### Fixed

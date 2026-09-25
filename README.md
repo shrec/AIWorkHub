@@ -62,6 +62,47 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
+## What's new in 0.11.75
+
+- VS Code LM workers fail closed after six Source Graph queries without an
+  edit, so a varied discovery loop cannot burn the turn budget.
+
+## What's new in 0.11.74
+
+- VS Code LM workers stop repeated line-1 edit pins and invalid JSON before
+  the agent turn limit, and worker semantic edit is no longer rewritten onto
+  the manager editor.
+
+## What's new in 0.11.73
+
+- `node` and `node --test` validations run inside the Windows AppContainer:
+  symlink-preserving resolution avoids the protected `C:\Users` ancestor, and
+  in-process test isolation avoids libuv's denied named-pipe spin.
+
+## What's new in 0.11.72
+
+- Kilo/Grok workers now start with a safe request-local XDG state directory.
+- AppContainer request grants stay below trusted user Temp and reject drive-root,
+  profile, repository and reparse-point escapes.
+
+## What's new in 0.11.71
+
+- Repeated unchanged Source Graph calls are bounded before they can consume the
+  full worker turn budget; real edits and material boundary changes reset the guard.
+
+## What's new in 0.11.70
+
+- Native OpenCode 2 workers keep Bun's temporary files inside the request-local
+  AppContainer temp authority, preventing package-temp `lstat EPERM` failures.
+- The canonical module-size invariant is restored without weakening its ratchet.
+
+## What's new in 0.11.69
+
+- Manager Chat automatically selects an allowed route on first send.
+- LSP-backed Source Graph and focused delta review are wired into the runtime.
+- Windows worker isolation now provisions Kilo's request-local XDG state path.
+- Development Rules uses the honest label `applicable`, not `resolved`.
+
 ## What's new in 0.11.68
 
 - C/C++ cards launch regardless of the include layout: a header AIWorkHub

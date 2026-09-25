@@ -92,6 +92,23 @@ assert.ok(internals.VSCODE_LM_PRIVATE_TOOLS.some((tool) => tool.name === "aiwork
 assert.ok(internals.VSCODE_LM_PRIVATE_TOOLS.some((tool) => tool.name === "aiworkhub_manager_semantic_edit_prepare"));
 assert.ok(internals.VSCODE_LM_PRIVATE_TOOLS.some((tool) => tool.name === "aiworkhub_manager_semantic_edit_stage"));
 assert.ok(internals.VSCODE_LM_PRIVATE_TOOLS.some((tool) => tool.name === "aiworkhub_manager_semantic_edit_finalize"));
+assert.ok(internals.VSCODE_LM_PRIVATE_TOOLS.some((tool) => tool.name === "aiworkhub_worker_semantic_edit_prepare"));
+assert.ok(internals.VSCODE_LM_PRIVATE_TOOLS.some((tool) => tool.name === "aiworkhub_worker_semantic_edit_apply"));
+{
+  const pins = { count: 0 };
+  internals.vscodeLmNoteLineOnePin(pins, { operation: "replace_range", start_line: 1, end_line: 1 }, [], "");
+  internals.vscodeLmNoteLineOnePin(pins, { operation: "replace_range", start_line: 1, end_line: 1 }, [], "");
+  assert.throws(
+    () => internals.vscodeLmNoteLineOnePin(pins, { operation: "replace_range", start_line: 1, end_line: 1 }, [], ""),
+    /vscode_lm_semantic_edit_no_progress/,
+  );
+  const invalid = { count: 0 };
+  internals.vscodeLmNoteInvalidJson(invalid, [], "");
+  assert.throws(
+    () => internals.vscodeLmNoteInvalidJson(invalid, [], ""),
+    /vscode_lm_text_protocol_invalid_json/,
+  );
+}
 const stageTool = internals.VSCODE_LM_PRIVATE_TOOLS.find((tool) => tool.name === "aiworkhub_manager_semantic_edit_stage");
 assert.ok(Array.isArray(stageTool.inputSchema && stageTool.inputSchema.oneOf), "stage tool schema must be oneOf");
 assert.strictEqual(stageTool.inputSchema.oneOf.length, 2);
@@ -1875,10 +1892,11 @@ async function nativeProtocolChecks() {
     creates: [{ path: "out/result.json", content: "{}\n" }],
   });
 
-  // NF164: one bounded corrective turn for a non-stage call, then the exact stage
-  // tool is accepted; the rejected call must never reach MCP.
+  // NF988: after bounded discovery, the first wrong non-stage call receives a
+  // call-ID-paired structured correction, never reaches MCP, and can recover by staging.
   let correctiveTurns = 0;
   let correctiveNonStageSent = false;
+  let correctiveRetryMessages = null;
   const correctiveExecutedCalls = [];
   const correctiveModel = {
     capabilities: { toolCalling: true },
@@ -1890,19 +1908,28 @@ async function nativeProtocolChecks() {
       const lastMessage = _messages[_messages.length - 1];
       const lastUserText = lastMessage && lastMessage.role === "user" &&
         typeof lastMessage.content === "string" ? lastMessage.content : "";
-      if (lastUserText.includes("The bounded discovery phase is complete")
-          || lastUserText.includes("is still missing")) {
-        if (correctiveNonStageSent) {
-          return {
-            stream: (async function* stream() {
-              yield {
-                callId: "stage-after-correction",
-                name: "aiworkhub_manager_semantic_edit_stage",
-                input: { operation: "create", file_path: "out/result.json", content: "{}\n" },
-              };
-            }()),
-          };
-        }
+      const correctiveResultMessage = [..._messages].reverse().find(
+        (message) => message && message.role === "user" && Array.isArray(message.content) &&
+          message.content.some((part) => part.callId === "forbidden-non-stage"),
+      );
+      const correctiveToolResult = correctiveResultMessage
+        ? correctiveResultMessage.content.find((part) => part.callId === "forbidden-non-stage")
+        : null;
+      const forcedStagePrompt = lastUserText.includes("The bounded discovery phase is complete")
+        || lastUserText.includes("is still missing");
+      if (correctiveNonStageSent && correctiveToolResult && forcedStagePrompt) {
+        correctiveRetryMessages = _messages.slice();
+        return {
+          stream: (async function* stream() {
+            yield {
+              callId: "stage-after-correction",
+              name: "aiworkhub_manager_semantic_edit_stage",
+              input: { operation: "create", file_path: "out/result.json", content: "{}\n" },
+            };
+          }()),
+        };
+      }
+      if (forcedStagePrompt) {
         correctiveNonStageSent = true;
         return {
           stream: (async function* stream() {
@@ -1931,6 +1958,7 @@ async function nativeProtocolChecks() {
       requestId: "e".repeat(32),
       prompt: "bounded",
       allowedWrites: ["out/result.json"],
+      required_outputs: ["out/result.json"],
       path_contracts: {
         "out/result.json": {
           action: "create",
@@ -1954,6 +1982,29 @@ async function nativeProtocolChecks() {
   });
   assert.strictEqual(correctiveTurns, 15);
   assert.ok(!correctiveExecutedCalls.some((entry) => entry.includes("forbidden-non-stage")));
+  assert.ok(correctiveRetryMessages);
+  const correctiveAssistantIndex = correctiveRetryMessages.findIndex(
+    (message) => message.role === "assistant" && Array.isArray(message.content) &&
+      message.content.some((part) => part.callId === "forbidden-non-stage"),
+  );
+  assert.ok(correctiveAssistantIndex >= 0);
+  const correctiveUserMessage = correctiveRetryMessages[correctiveAssistantIndex + 1];
+  const correctivePromptMessage = correctiveRetryMessages[correctiveAssistantIndex + 2];
+  const pairedCorrection = correctiveUserMessage.content.find(
+    (part) => part.callId === "forbidden-non-stage",
+  );
+  assert.ok(pairedCorrection);
+  assert.deepStrictEqual(JSON.parse(pairedCorrection.content[0].value), {
+    ok: false,
+    error: "vscode_lm_semantic_edit_stage_required",
+    corrective: true,
+    allowed_tool: "aiworkhub_manager_semantic_edit_stage",
+    next_missing_path: "out/result.json",
+    next_missing_action: "create",
+  });
+  assert.strictEqual(correctivePromptMessage.role, "user");
+  assert.ok(correctivePromptMessage.content.includes("is still missing"));
+  assert.ok(correctivePromptMessage.content.includes("aiworkhub_manager_semantic_edit_stage"));
 
   // NF164: a repeated non-stage call fails structurally with
   // vscode_lm_semantic_edit_stage_required after one bounded corrective turn.
@@ -2815,7 +2866,7 @@ async function nf169ContextlessWorkerNative() {
           yield {
             callId: `ctxless-native-${nativeTurns}`,
             name: "aiworkhub_worker_source_graph_query",
-            input: { mode: "focus", query: "contextless-native", budget: 48, workflow_stage: "orientation" },
+            input: { mode: "focus", query: `contextless-native-${nativeTurns}`, budget: 48, workflow_stage: "orientation" },
           };
         }()),
       };
@@ -2977,11 +3028,6 @@ async function nf168ForceFinalTextProtocol() {
   });
   // Model always returns tool requests (never finalizes) to trigger force-final.
   const toolName = "aiworkhub_worker_source_graph_query";
-  const toolEnvelope = JSON.stringify({
-    schema_id: internals.constants.VSCODE_LM_TOOL_REQUEST_SCHEMA,
-    name: toolName,
-    input: { mode: "focus", query: "fv-text", budget: 48 },
-  });
   const model = {
     capabilities: { toolCalling: false },
     sendRequest: async (_messages) => {
@@ -2994,7 +3040,11 @@ async function nf168ForceFinalTextProtocol() {
       }
       return {
         stream: (async function* stream() {
-          yield { value: toolEnvelope };
+          yield { value: JSON.stringify({
+            schema_id: internals.constants.VSCODE_LM_TOOL_REQUEST_SCHEMA,
+            name: toolName,
+            input: { mode: "focus", query: `fv-text-${textTurns}`, budget: 48 },
+          }) };
         }()),
       };
     },
@@ -3780,31 +3830,49 @@ async function nf179ForcedStageRecoveryChecks() {
     return last && last.role === "user" && typeof last.content === "string" ? last.content : "";
   };
 
+  const textRequest = {
+    ...request,
+    allowedWrites: ["out/first.json", "out/result.json"],
+    required_outputs: ["out/first.json", "out/result.json"],
+    path_contracts: {
+      "out/first.json": {
+        action: "create",
+        current_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        line_count: 0,
+        parent_existed: false,
+      },
+      ...request.path_contracts,
+    },
+  };
+  let textTurns = 0;
+  let textFirstStaged = false;
   let textNonStageSent = false;
   const textInvocations = [];
   const textModel = {
     capabilities: { toolCalling: false },
-    sendRequest: async (messages) => {
-      const instruction = lastUserText(messages);
+    sendRequest: async () => {
+      textTurns += 1;
       let value;
-      if (instruction.includes("The bounded discovery phase is complete")
-          || instruction.includes("is still missing")) {
-        if (textNonStageSent) {
-          value = toolRequest("aiworkhub_manager_semantic_edit_stage", {
-            operation: "create", file_path: "out/result.json", content: "{}\n",
-          });
-        } else {
-          textNonStageSent = true;
-          value = toolRequest("aiworkhub_worker_session_current_state", {
-            mode: "focus",
-            query: "forced-stage-corrective",
-            workflow_stage: "implementation",
-          });
-        }
+      if (!textFirstStaged && textTurns >= 13) {
+        textFirstStaged = true;
+        value = toolRequest("aiworkhub_manager_semantic_edit_stage", {
+          operation: "create", file_path: "out/first.json", content: "{}\n",
+        });
+      } else if (textFirstStaged && !textNonStageSent) {
+        textNonStageSent = true;
+        value = toolRequest("aiworkhub_worker_session_current_state", {
+          mode: "focus",
+          query: "forced-stage-corrective",
+          workflow_stage: "implementation",
+        });
+      } else if (textFirstStaged) {
+        value = toolRequest("aiworkhub_manager_semantic_edit_stage", {
+          operation: "create", file_path: "out/result.json", content: "{}\n",
+        });
       } else {
         value = toolRequest("aiworkhub_worker_source_graph_query", {
           mode: "focus",
-          query: "work",
+          query: `work-${textTurns}`,
           workflow_stage: "implementation",
         });
       }
@@ -3813,7 +3881,7 @@ async function nf179ForcedStageRecoveryChecks() {
   };
   const textResult = await internals.runVscodeLmTextProtocol(
     textModel,
-    request,
+    textRequest,
     undefined,
     async (call) => {
       textInvocations.push(call);
@@ -3821,7 +3889,7 @@ async function nf179ForcedStageRecoveryChecks() {
       return { ok: true, content: "graph" };
     },
   );
-  assert.strictEqual(JSON.parse(textResult).creates[0].path, "out/result.json");
+  assert.ok(JSON.parse(textResult).creates.some((entry) => entry.path === "out/result.json"));
   assert.ok(!textInvocations.some((call) => call.name === "aiworkhub_worker_session_current_state"));
   assert.ok(!textInvocations.some((call) => call.input && call.input.query === "forced-stage-corrective"));
 
@@ -3843,13 +3911,15 @@ async function nf179ForcedStageRecoveryChecks() {
     internals.runVscodeLmTextProtocol(
       repeatedModel, request, undefined, async () => ({ ok: true, content: "graph" }),
     ),
-    /vscode_lm_semantic_edit_stage_required/,
+    /vscode_lm_agent_turn_limit/,
   );
 
   let nativeWrongNonStageSent = false;
+  let nativeWrongTurn = 0;
   const nativeWrongStageModel = {
     capabilities: { toolCalling: true },
     sendRequest: async (messages, options) => {
+      nativeWrongTurn += 1;
       const instruction = lastUserText(messages);
       if (!Object.prototype.hasOwnProperty.call(options, "tools")) {
         return { stream: (async function* stream() { yield { value: finalResponse }; }()) };
@@ -3866,7 +3936,7 @@ async function nf179ForcedStageRecoveryChecks() {
         }()) };
       }
       return { stream: (async function* stream() {
-        yield { callId: "nf179-native-source", name: "aiworkhub_worker_source_graph_query", input: { mode: "focus", query: "work", workflow_stage: "implementation" } };
+        yield { callId: "nf179-native-source", name: "aiworkhub_worker_source_graph_query", input: { mode: "focus", query: `work-${nativeWrongTurn}`, workflow_stage: "implementation" } };
       }()) };
     },
   };
@@ -3916,7 +3986,7 @@ async function nf179ForcedStageRecoveryChecks() {
         yield {
           callId: `nf179-work-${nativeInvocations.length}`,
           name: "aiworkhub_worker_source_graph_query",
-          input: { mode: "focus", query: "work", workflow_stage: "implementation" },
+          input: { mode: "focus", query: `work-${nativeInvocations.length}`, workflow_stage: "implementation" },
         };
       }()) };
     },
@@ -4060,8 +4130,7 @@ async function nf723StagedFinalizationCompletenessChecks() {
     sendRequest: async (messages) => {
       const instruction = lastUserText(messages);
       let value;
-      if (!forcedEditStaged && !instruction.startsWith("{") &&
-          instruction.includes(`Required output ${editPath} is still missing`)) {
+      if (!forcedEditStaged && forcedTurn >= 12) {
         forcedEditStaged = true;
         value = toolRequest(stageName, {
           operation: "replace_range", file_path: editPath,
@@ -4170,7 +4239,7 @@ async function nf723StagedFinalizationCompletenessChecks() {
         yield {
           callId: `nf723-sg-${nativeTurns.length}`,
           name: "aiworkhub_worker_source_graph_query",
-          input: { mode: "focus", query: "work", workflow_stage: "implementation" },
+          input: { mode: "focus", query: `work-${nativeTurns.length}`, workflow_stage: "implementation" },
         };
       }()) };
     },
@@ -4306,52 +4375,40 @@ async function nf723StagedFinalizationCompletenessChecks() {
   assert.strictEqual(nativeEarlyResult.creates[0].path, createPath);
   assert.strictEqual(nativeEarlyCount, 2);
 
-  const forcedStageUser = (instruction) =>
-    instruction.includes("is still missing") && !instruction.includes("schema_id");
-  let textForceStage = false;
+  let textProgressTurns = 0;
   let textProgressEdit = false;
   let textProgressCreate = false;
-  let textProgressRefusedEdit = false;
   let textProgressRefusedCreate = false;
-  let textProgressEditCorrection = "";
   let textProgressCreateCorrection = "";
   const textProgress = {
     capabilities: { toolCalling: false },
     sendRequest: async (messages) => {
+      textProgressTurns += 1;
       const instruction = lastUserText(messages);
-      if (forcedStageUser(instruction)) textForceStage = true;
       let value;
-      if (!textForceStage) {
-        value = toolRequest("aiworkhub_worker_source_graph_query", {
-          mode: "focus", query: "progress", workflow_stage: "implementation",
-        });
-      } else if (textProgressEdit || instruction.includes("operation create")) {
-        if (!textProgressRefusedCreate) {
-          textProgressRefusedCreate = true;
-          value = toolRequest("aiworkhub_worker_source_graph_query", {
-            mode: "focus", query: "refuse-create", workflow_stage: "implementation",
-          });
-        } else {
-          textProgressCreate = true;
-          textProgressCreateCorrection = instruction;
-          value = toolRequest(stageName, {
-            operation: "create", file_path: createPath, content: "module.exports = {};\n",
-          });
-        }
-      } else if (!textProgressRefusedEdit) {
-        textProgressRefusedEdit = true;
-        value = toolRequest("aiworkhub_worker_source_graph_query", {
-          mode: "focus", query: "refuse-edit", workflow_stage: "implementation",
-        });
-      } else {
+      if (!textProgressEdit && textProgressTurns >= 13) {
         textProgressEdit = true;
-        textProgressEditCorrection = instruction;
         value = toolRequest(stageName, {
           operation: "replace_range",
           file_path: editPath,
           start_line: 1,
           end_line: 1,
           new: "const edited = true;\n",
+        });
+      } else if (textProgressEdit && !textProgressRefusedCreate) {
+        textProgressRefusedCreate = true;
+        value = toolRequest("aiworkhub_worker_source_graph_query", {
+          mode: "focus", query: "refuse-create", workflow_stage: "implementation",
+        });
+      } else if (textProgressEdit) {
+        textProgressCreate = true;
+        textProgressCreateCorrection = instruction;
+        value = toolRequest(stageName, {
+          operation: "create", file_path: createPath, content: "module.exports = {};\n",
+        });
+      } else {
+        value = toolRequest("aiworkhub_worker_source_graph_query", {
+          mode: "focus", query: `progress-${textProgressTurns}`, workflow_stage: "implementation",
         });
       }
       return { stream: (async function* stream() { yield { value }; }()) };
@@ -4360,12 +4417,25 @@ async function nf723StagedFinalizationCompletenessChecks() {
   const textProgressResult = JSON.parse(await runText(textProgress));
   assert.strictEqual(textProgressResult.edits[0].path, editPath);
   assert.strictEqual(textProgressResult.creates[0].path, createPath);
-  assert.ok(textProgressRefusedEdit && textProgressEdit);
+  assert.ok(textProgressEdit);
   assert.ok(textProgressRefusedCreate && textProgressCreate);
-  assert.ok(textProgressEditCorrection.includes(editPath));
-  assert.ok(textProgressEditCorrection.includes("operation replace_range"));
-  assert.ok(textProgressCreateCorrection.includes(createPath));
-  assert.ok(textProgressCreateCorrection.includes("operation create"));
+  assert.deepStrictEqual(JSON.parse(textProgressCreateCorrection), {
+    schema_id: internals.constants.VSCODE_LM_TOOL_RESULT_SCHEMA,
+    name: "aiworkhub_worker_source_graph_query",
+    result: {
+      ok: false,
+      error: "vscode_lm_semantic_edit_stage_required",
+      corrective: true,
+      allowed_tool: "aiworkhub_manager_semantic_edit_stage",
+      next_missing_path: createPath,
+      next_missing_action: "create",
+    },
+    instruction: `Required output ${createPath} is still missing. Do not emit a final edit envelope. ` +
+      `Output ONLY one ${internals.constants.VSCODE_LM_TOOL_REQUEST_SCHEMA} request for ${stageName} ` +
+      `with operation create (action v3_create) for ${createPath}. If you must first see the exact current ` +
+      `content of a file this task may write, you may instead request one read-only Source Graph lookup with ` +
+      `mode "file" and query and target both set to that exact path; such reads are strictly limited.`,
+  });
 
   let nativeProgressTurns = 0;
   let nativeProgressEdit = false;
@@ -4433,7 +4503,7 @@ async function nf723StagedFinalizationCompletenessChecks() {
         yield {
           callId: `nf723-progress-sg-${nativeProgressTurns}`,
           name: "aiworkhub_worker_source_graph_query",
-          input: { mode: "focus", query: "progress", workflow_stage: "implementation" },
+          input: { mode: "focus", query: `progress-${nativeProgressTurns}`, workflow_stage: "implementation" },
         };
       }()) };
     },
@@ -4472,9 +4542,11 @@ async function nf723StagedFinalizationCompletenessChecks() {
 
   let textEmptyEditStaged = false;
   let textEmptyFailedOnce = false;
+  let textEmptyTurns = 0;
   const textEmptyMalformed = {
     capabilities: { toolCalling: false },
     sendRequest: async (messages) => {
+      textEmptyTurns += 1;
       const instruction = lastUserText(messages);
       if (shouldStageEdit(instruction, textEmptyEditStaged)) {
         textEmptyEditStaged = true;
@@ -4489,7 +4561,7 @@ async function nf723StagedFinalizationCompletenessChecks() {
       }
       return { stream: (async function* stream() {
         yield { value: toolRequest("aiworkhub_worker_source_graph_query", {
-          mode: "focus", query: "empty", workflow_stage: "implementation",
+          mode: "focus", query: `empty-${textEmptyTurns}`, workflow_stage: "implementation",
         }) };
       }()) };
     },
@@ -4497,9 +4569,11 @@ async function nf723StagedFinalizationCompletenessChecks() {
   await assert.rejects(runText(textEmptyMalformed), assertStageRequired);
 
   let textRejectEditStaged = false;
+  let textRejectTurns = 0;
   const textRejectedStage = {
     capabilities: { toolCalling: false },
     sendRequest: async (messages) => {
+      textRejectTurns += 1;
       const instruction = lastUserText(messages);
       let value;
       if (shouldStageEdit(instruction, textRejectEditStaged)) {
@@ -4509,7 +4583,7 @@ async function nf723StagedFinalizationCompletenessChecks() {
         value = rejectedCreate();
       } else {
         value = toolRequest("aiworkhub_worker_source_graph_query", {
-          mode: "focus", query: "reject", workflow_stage: "implementation",
+          mode: "focus", query: `reject-${textRejectTurns}`, workflow_stage: "implementation",
         });
       }
       return { stream: (async function* stream() { yield { value }; }()) };
@@ -4579,7 +4653,7 @@ async function nf723StagedFinalizationCompletenessChecks() {
         yield {
           callId: `nf723-reject-sg-${nativeRejectTurns}`,
           name: "aiworkhub_worker_source_graph_query",
-          input: { mode: "focus", query: "reject", workflow_stage: "implementation" },
+          input: { mode: "focus", query: `reject-${nativeRejectTurns}`, workflow_stage: "implementation" },
         };
       }()) };
     },
@@ -4678,7 +4752,7 @@ async function nf723StagedFinalizationCompletenessChecks() {
         yield {
           callId: `nf723-nonstage-sg-${nativeNonStageTurns}`,
           name: "aiworkhub_worker_source_graph_query",
-          input: { mode: "focus", query: "work", workflow_stage: "implementation" },
+          input: { mode: "focus", query: `work-${nativeNonStageTurns}`, workflow_stage: "implementation" },
         };
       }()) };
     },
@@ -5525,6 +5599,62 @@ async function nf925ReasoningContextAttemptChecks() {
   }
 }
 
+async function nf988DiscoveryDoesNotImplicitlyEnterSemanticStage() {
+  const file = "src/target.js";
+  const request = {
+    requestId: "8".repeat(32),
+    request_kind: "worker",
+    prompt: "Inspect the graph thoroughly, then edit the required file.",
+    allowedWrites: [file],
+    required_outputs: [file],
+    path_contracts: {
+      [file]: { action: "edit", current_sha256: "a".repeat(64), line_count: 1, parent_existed: true },
+    },
+    initial_source_graph_result: { ok: true, content: "prefetched graph" },
+  };
+  const toolRequest = (name, input) => JSON.stringify({
+    schema_id: internals.constants.VSCODE_LM_TOOL_REQUEST_SCHEMA, name, input,
+  });
+  let modelTurns = 0;
+  let sourceGraphCalls = 0;
+  const model = {
+    capabilities: { toolCalling: false },
+    sendRequest: async () => {
+      modelTurns += 1;
+      const value = modelTurns <= 15
+        ? toolRequest("aiworkhub_worker_source_graph_query", {
+          mode: "focus",
+          query: `discovery-${modelTurns}`,
+          workflow_stage: "implementation",
+        })
+        : toolRequest("aiworkhub_manager_semantic_edit_stage", {
+          operation: "replace_range",
+          file_path: file,
+          start_line: 1,
+          end_line: 1,
+          new: "const fixed = true;\n",
+        });
+      return { stream: (async function* stream() { yield { value }; }()) };
+    },
+  };
+
+  const final = JSON.parse(await internals.runVscodeLmTextProtocol(
+    model,
+    request,
+    undefined,
+    async (call) => {
+      assert.strictEqual(call.name, "aiworkhub_worker_source_graph_query");
+      sourceGraphCalls += 1;
+      return { ok: true, content: "bounded graph" };
+    },
+  ));
+
+  assert.strictEqual(sourceGraphCalls, 15,
+    "valid discovery calls remain available until the first authenticated staged edit");
+  assert.deepStrictEqual(final.edits.map((edit) => edit.path), [file]);
+  assert.strictEqual(modelTurns, 16);
+}
+
 async function nf651StageContextReadForNextRequiredFile() {
   const first = "src/first.js";
   const second = "src/second.js";
@@ -5553,7 +5683,7 @@ async function nf651StageContextReadForNextRequiredFile() {
       const last = messages[messages.length - 1];
       const instruction = last && last.role === "user" ? String(last.content) : "";
       let value;
-      if (!stagedFirst && modelTurns >= 13 && instruction.includes("Required output " + first)) {
+      if (!stagedFirst && modelTurns >= 13) {
         stagedFirst = true;
         value = toolRequest("aiworkhub_manager_semantic_edit_stage", {
           operation: "replace_range", file_path: first, start_line: 1, end_line: 1, new: "const first = 1;\n",
@@ -5568,7 +5698,7 @@ async function nf651StageContextReadForNextRequiredFile() {
         });
       } else {
         value = toolRequest("aiworkhub_worker_source_graph_query", {
-          mode: "focus", query: "orientation", workflow_stage: "implementation",
+          mode: "focus", query: `orientation-${modelTurns}`, workflow_stage: "implementation",
         });
       }
       return { stream: (async function* stream() { yield { value }; }()) };
@@ -5593,7 +5723,7 @@ async function nf651StageContextReadForNextRequiredFile() {
       const last = messages[messages.length - 1];
       const instruction = last && last.role === "user" ? String(last.content) : "";
       let value;
-      if (!repeatedStage && repeatedTurns >= 13 && instruction.includes("Required output " + first)) {
+      if (!repeatedStage && repeatedTurns >= 13) {
         repeatedStage = true;
         value = toolRequest("aiworkhub_manager_semantic_edit_stage", {
           operation: "replace_range", file_path: first, start_line: 1, end_line: 1, new: "const first = 1;\n",
@@ -5604,7 +5734,7 @@ async function nf651StageContextReadForNextRequiredFile() {
         });
       } else {
         value = toolRequest("aiworkhub_worker_source_graph_query", {
-          mode: "focus", query: "orientation", workflow_stage: "implementation",
+          mode: "focus", query: `orientation-${repeatedTurns}`, workflow_stage: "implementation",
         });
       }
       return { stream: (async function* stream() { yield { value }; }()) };
@@ -5616,9 +5746,9 @@ async function nf651StageContextReadForNextRequiredFile() {
         if (call.name === "aiworkhub_worker_source_graph_query" && call.input.target === second) repeatedExactReads += 1;
         return { ok: true, content: "bounded graph" };
       }),
-    /vscode_lm_semantic_edit_stage_required/,
+    /vscode_lm_source_graph_no_progress/,
   );
-  assert.strictEqual(repeatedExactReads, 2, "exact next-output reads must be bounded per output");
+  assert.strictEqual(repeatedExactReads, 1, "duplicate exact reads stop before a second live lookup");
 }
 
 // NF-2026-00023: glm-5.3 reached forced staging needing the API of a file it had
@@ -5650,32 +5780,44 @@ async function nf202600023DeclaredDependencyReadDuringForcedStaging() {
   const readFile = (path) => toolRequest("aiworkhub_worker_source_graph_query", {
     mode: "file", query: path, target: path, workflow_stage: "implementation",
   });
+  const readBody = (path, symbol) => toolRequest("aiworkhub_worker_source_graph_query", {
+    mode: "body", query: symbol, target: path, workflow_stage: "implementation",
+  });
   const stage = (path, text) => toolRequest("aiworkhub_manager_semantic_edit_stage", {
     operation: "replace_range", file_path: path, start_line: 1, end_line: 1, new: text,
   });
+  let discoveryNumber = 0;
   const discover = () => toolRequest("aiworkhub_worker_source_graph_query", {
-    mode: "focus", query: "orientation", workflow_stage: "implementation",
+    mode: "focus", query: `orientation-${++discoveryNumber}`, workflow_stage: "implementation",
   });
 
-  // Scenario 1: undeclared read refused, declared dependency read executed.
+  // Scenario 1: an explicit first edit enters forced staging; undeclared reads
+  // are refused while a declared dependency read still executes.
   const executed = [];
   const stageInstructions = [];
+  let discoveryTurns = 0;
+  let stagedFirst = false;
   let plan = null;
   const model = {
     capabilities: { toolCalling: false },
     sendRequest: async (messages) => {
+      discoveryTurns += 1;
       const last = messages[messages.length - 1];
       const instruction = last && last.role === "user" ? String(last.content) : "";
-      // Forced staging is active only once the stage instruction arrives as its
-      // own user message. The same words appear earlier inside a tool result as
-      // a heads-up, while reads are still ordinary discovery and must execute.
       const forcedStage = instruction.startsWith("Required output ");
-      if (forcedStage) stageInstructions.push(instruction);
-      if (!plan && forcedStage && instruction.startsWith("Required output " + first)) {
-        plan = [readFile(outside), readFile(dep), stage(first, "const first = dep();\n"),
-          stage(second, "const second = 2;\n")];
+      const nextStageInstruction = stagedFirst &&
+        instruction.includes("Required output " + second);
+      if (forcedStage || nextStageInstruction) stageInstructions.push(instruction);
+      let value;
+      if (!stagedFirst && discoveryTurns >= 13) {
+        stagedFirst = true;
+        value = stage(first, "const first = dep();\n");
+      } else {
+        if (!plan && nextStageInstruction) {
+          plan = [readFile(dep), readFile(outside), stage(second, "const second = 2;\n")];
+        }
+        value = plan && plan.length ? plan.shift() : discover();
       }
-      const value = plan && plan.length ? plan.shift() : discover();
       return { stream: (async function* stream() { yield { value }; }()) };
     },
   };
@@ -5696,23 +5838,34 @@ async function nf202600023DeclaredDependencyReadDuringForcedStaging() {
 
   // Scenario 2: the total cap holds even when every target is declared.
   const cappedExecuted = [];
+  let cappedTurns = 0;
+  let cappedFirst = false;
   let cappedPlan = null;
   const cappedModel = {
     capabilities: { toolCalling: false },
     sendRequest: async (messages) => {
+      cappedTurns += 1;
       const last = messages[messages.length - 1];
       const instruction = last && last.role === "user" ? String(last.content) : "";
-      if (!cappedPlan && instruction.startsWith("Required output " + first)) {
-        cappedPlan = [readFile(dep), readFile(dep), readFile(second), readFile(second),
-          readFile(first), stage(first, "const first = 1;\n"), stage(second, "const second = 2;\n")];
+      let value;
+      if (!cappedFirst && cappedTurns >= 13) {
+        cappedFirst = true;
+        value = stage(first, "const first = 1;\n");
+      } else {
+        if (!cappedPlan && cappedFirst && instruction.includes("Required output " + second)) {
+          cappedPlan = [readFile(dep), readFile(dep), readBody(dep, "depSymbol"),
+            readFile(second), readBody(second, "secondSymbol"),
+            readFile(first), stage(second, "const second = 2;\n")];
+        }
+        value = cappedPlan && cappedPlan.length ? cappedPlan.shift() : discover();
       }
-      const value = cappedPlan && cappedPlan.length ? cappedPlan.shift() : discover();
       return { stream: (async function* stream() { yield { value }; }()) };
     },
   };
   const cappedFinal = JSON.parse(await internals.runVscodeLmTextProtocol(
     cappedModel, { ...request, requestId: "4".repeat(32) }, undefined, async (call) => {
-      if (call.name === "aiworkhub_worker_source_graph_query" && call.input.mode === "file") {
+      if (call.name === "aiworkhub_worker_source_graph_query" &&
+          (call.input.mode === "file" || call.input.mode === "body")) {
         cappedExecuted.push(call.input.target);
       }
       return { ok: true, content: "bounded graph" };
@@ -5720,7 +5873,93 @@ async function nf202600023DeclaredDependencyReadDuringForcedStaging() {
   ));
   assert.deepStrictEqual(cappedFinal.edits.map((edit) => edit.path), [first, second]);
   assert.deepStrictEqual(cappedExecuted, [dep, dep, second, second],
-    "the fifth forced-stage read must be refused by the total cap, unexecuted");
+    "the duplicate consumes no slot, but the fifth distinct forced-stage read is refused");
+}
+
+// NF988 live failures: after forced staging rejects one non-stage request, GLM
+// can spend the corrective turn on explanatory prose before it emits the exact
+// required stage request. Permit that second bounded correction, then prove a
+// third violation for the same missing output still terminalizes.
+async function nf988TwoBoundedCorrectionsDuringForcedStaging() {
+  const first = "src/first.js";
+  const second = "src/second.js";
+  const request = {
+    requestId: "9".repeat(32),
+    request_kind: "worker",
+    prompt: "Edit both required files.",
+    allowedWrites: [first, second],
+    required_outputs: [first, second],
+    path_contracts: {
+      [first]: { action: "edit", current_sha256: "a".repeat(64), line_count: 1, parent_existed: true },
+      [second]: { action: "edit", current_sha256: "b".repeat(64), line_count: 1, parent_existed: true },
+    },
+    initial_source_graph_result: { ok: true, content: "prefetched graph" },
+  };
+  const toolRequest = (name, input) => JSON.stringify({
+    schema_id: internals.constants.VSCODE_LM_TOOL_REQUEST_SCHEMA, name, input,
+  });
+  const discover = (index) => toolRequest("aiworkhub_worker_source_graph_query", {
+    mode: "focus", query: `orientation-${index}`, workflow_stage: "implementation",
+  });
+  const stage = (path, value) => toolRequest("aiworkhub_manager_semantic_edit_stage", {
+    operation: "replace_range", file_path: path, start_line: 1, end_line: 1, new: value,
+  });
+  const rejected = toolRequest("aiworkhub_manager_source_graph_query", {
+    mode: "file", query: second, target: second, workflow_stage: "implementation",
+  });
+  const scripted = (plan) => ({
+    capabilities: { toolCalling: false },
+    sendRequest: async () => {
+      const value = plan.shift();
+      return { stream: (async function* stream() { yield { value }; }()) };
+    },
+  });
+
+  const invoked = [];
+  const discovery = Array.from({ length: 12 }, (_, index) => discover(index));
+  const recovered = JSON.parse(await internals.runVscodeLmTextProtocol(
+    scripted([
+      ...discovery,
+      stage(first, "const first = 1;\n"),
+      rejected,
+      "I understand the correction and will stage the required output next.",
+      stage(second, "const second = 2;\n"),
+    ]),
+    request,
+    undefined,
+    async (call) => {
+      invoked.push(call.name);
+      return { ok: true, content: "bounded graph" };
+    },
+  ));
+  assert.deepStrictEqual(recovered.edits.map((edit) => edit.path), [first, second]);
+  assert.deepStrictEqual(invoked, Array.from({ length: 12 }, () => "aiworkhub_worker_source_graph_query"),
+    "the rejected non-stage request must not execute while two corrective turns remain bounded");
+
+  let failureInvocations = 0;
+  const failure = await internals.runVscodeLmTextProtocol(
+    scripted([
+      ...discovery,
+      stage(first, "const first = 1;\n"),
+      rejected,
+      "First explanatory response.",
+      "Second explanatory response.",
+    ]),
+    { ...request, requestId: "a".repeat(32) },
+    undefined,
+    async (call) => {
+      assert.strictEqual(call.name, "aiworkhub_worker_source_graph_query",
+        "a rejected non-stage request must never execute");
+      failureInvocations += 1;
+      return { ok: true, content: "bounded graph" };
+    },
+  ).then(() => assert.fail("a third forced-stage violation must fail"), (err) => err);
+  assert.strictEqual(failureInvocations, 12);
+  assert.match(String(failure.message), /vscode_lm_semantic_edit_stage_required/);
+  assert.deepStrictEqual(
+    failure.protocolTrace.slice(-3).map((entry) => entry.outcome),
+    ["non_stage_tool_rejected", "vscode_lm_text_protocol_invalid_json", "vscode_lm_text_protocol_invalid_json"],
+  );
 }
 
 // NF-2026-00032: outside forced staging glm-5.3 named a response-schema id as a
@@ -5743,8 +5982,9 @@ async function nf202600032UnknownToolOutsideForcedStaging() {
   const toolRequest = (name, input) => JSON.stringify({
     schema_id: internals.constants.VSCODE_LM_TOOL_REQUEST_SCHEMA, name, input,
   });
+  let discoveryNumber = 0;
   const discover = () => toolRequest("aiworkhub_worker_source_graph_query", {
-    mode: "focus", query: "orientation", workflow_stage: "implementation",
+    mode: "focus", query: `orientation-${++discoveryNumber}`, workflow_stage: "implementation",
   });
   const unknown = toolRequest(schemaIdName, { summary: "placeholder" });
   const finalEdit = JSON.stringify({
@@ -5818,9 +6058,332 @@ async function nf202600032UnknownToolOutsideForcedStaging() {
     "the protocol preview must carry the offending response");
 }
 
+async function nf998TextSourceGraphDuplicateStopsLiveLoop() {
+  const graph = "aiworkhub_worker_source_graph_query";
+  const request = {
+    requestId: "d".repeat(32), request_kind: "worker", prompt: "Inspect graph.", allowedWrites: [],
+  };
+  const toolRequest = (query) => JSON.stringify({
+    schema_id: internals.constants.VSCODE_LM_TOOL_REQUEST_SCHEMA,
+    name: graph,
+    input: { mode: "focus", query, target: null, workflow_stage: "implementation" },
+  });
+  const outputs = [toolRequest("src/app.py"), toolRequest("  src/app.py  "), toolRequest("src/app.py")];
+  const receipts = [];
+  const model = {
+    capabilities: { toolCalling: false },
+    sendRequest: async (messages) => {
+      const last = messages[messages.length - 1];
+      try {
+        const receipt = JSON.parse(String(last && last.content));
+        if (receipt.schema_id === internals.constants.VSCODE_LM_TOOL_RESULT_SCHEMA) receipts.push(receipt);
+      } catch (_err) { /* initial prompt */ }
+      const value = outputs.shift();
+      return { stream: (async function* stream() { yield { value }; }()) };
+    },
+  };
+  let liveCalls = 0;
+  const failure = await internals.runVscodeLmTextProtocol(model, request, undefined, async () => {
+    liveCalls += 1;
+    return { ok: true, content: "indexed graph" };
+  }).then(() => assert.fail("a repeated duplicate must stop"), (error) => error);
+  assert.strictEqual(liveCalls, 1, "identical Source Graph requests must not execute twice");
+  assert.strictEqual(receipts[1].result.schema_id, "aiworkhub.vscode_lm.source_graph_duplicate.v1");
+  assert.strictEqual(receipts[1].result.duplicate, true);
+  assert.strictEqual(failure.message, "vscode_lm_source_graph_no_progress");
+  let nextTurn = 0;
+  let nextLiveCalls = 0;
+  const nextModel = {
+    capabilities: { toolCalling: false },
+    sendRequest: async () => {
+      const value = nextTurn++ === 0 ? toolRequest("src/app.py") : JSON.stringify({
+        schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+        summary: "inspected", edits: [], creates: [],
+      });
+      return { stream: (async function* stream() { yield { value }; }()) };
+    },
+  };
+  await internals.runVscodeLmTextProtocol(nextModel, request, undefined, async () => {
+    nextLiveCalls += 1;
+    return { ok: true, content: "indexed graph" };
+  });
+  assert.strictEqual(nextLiveCalls, 1, "a new run cannot inherit the previous request's guard");
+}
+
+async function nf998SourceGraphBoundaryAndStageReset() {
+  const graph = "aiworkhub_worker_source_graph_query";
+  const toolRequest = (name, input) => JSON.stringify({
+    schema_id: internals.constants.VSCODE_LM_TOOL_REQUEST_SCHEMA, name, input,
+  });
+  const focus = (query) => toolRequest(graph, {
+    mode: "focus", query, target: null, workflow_stage: "implementation",
+  });
+  const final = JSON.stringify({
+    schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+    summary: "inspected", edits: [], creates: [],
+  });
+  const scripted = (outputs, receipts) => ({
+    capabilities: { toolCalling: false },
+    sendRequest: async (messages) => {
+      const last = messages[messages.length - 1];
+      try {
+        const receipt = JSON.parse(String(last && last.content));
+        if (receipt.schema_id === internals.constants.VSCODE_LM_TOOL_RESULT_SCHEMA) receipts.push(receipt);
+      } catch (_err) { /* prompt or stage instruction */ }
+      const value = outputs.shift();
+      return { stream: (async function* stream() { yield { value }; }()) };
+    },
+  });
+  const receipts = [];
+  const invoked = [];
+  const result = await internals.runVscodeLmTextProtocol(scripted([
+    focus("alpha"), focus("alpha"),
+    toolRequest(graph, { mode: "body", query: "alpha", target: "src/app.py", workflow_stage: "implementation" }),
+    focus("alpha"),
+    focus("beta"),
+    toolRequest(graph, { mode: "focus", query: "beta", target: null, workflow_stage: "validation" }),
+    toolRequest("aiworkhub_worker_session_current_state", {}),
+    final,
+  ], receipts), {
+    requestId: "e".repeat(32), request_kind: "worker", prompt: "Inspect graph.", allowedWrites: [],
+  }, undefined, async (call) => {
+    invoked.push(call.name);
+    return { ok: true, content: "tool data" };
+  });
+  assert.strictEqual(result, final);
+  assert.deepStrictEqual(invoked, [graph, graph, graph, graph, graph,
+    "aiworkhub_worker_session_current_state"],
+  "mode, query, and stage transitions execute; the duplicate and unrelated tool do not affect each other");
+  assert.strictEqual(receipts[1].result.schema_id, "aiworkhub.vscode_lm.source_graph_duplicate.v1");
+
+  const stageReceipts = [];
+  const stageCalls = [];
+  const stageResult = JSON.parse(await internals.runVscodeLmTextProtocol(scripted([
+    focus("alpha"), focus("alpha"),
+    toolRequest("aiworkhub_manager_semantic_edit_stage", {
+      operation: "replace_range", file_path: "src/app.js", start_line: 1, end_line: 1,
+      new: "const fixed = true;\n",
+    }),
+    focus("alpha"),
+    toolRequest("aiworkhub_manager_semantic_edit_finalize", { summary: "fixed" }),
+  ], stageReceipts), {
+    requestId: "f".repeat(32), request_kind: "worker", prompt: "Fix src/app.js.",
+    allowedWrites: ["src/app.js"],
+    path_contracts: {
+      "src/app.js": { action: "edit", current_sha256: "a".repeat(64), line_count: 1, parent_existed: true },
+    },
+    initial_source_graph_result: { ok: true, content: "prefetched graph" },
+  }, undefined, async (call) => {
+    stageCalls.push(call.name);
+    return { ok: true, content: "graph" };
+  }));
+  assert.deepStrictEqual(stageCalls, [graph, graph], "successful staging resets the duplicate guard");
+  assert.deepStrictEqual(stageResult.edits.map((edit) => edit.path), ["src/app.js"]);
+  assert.strictEqual(stageReceipts[1].result.duplicate, true);
+  assert.strictEqual(stageReceipts[2].result.idempotent_replay, false);
+}
+
+async function nf998NativeSourceGraphDuplicateStopsLiveLoop() {
+  const graph = "aiworkhub_worker_source_graph_query";
+  let turn = 0;
+  const pairedResults = [];
+  const model = {
+    capabilities: { toolCalling: true },
+    sendRequest: async (messages) => {
+      turn += 1;
+      for (const part of messages[messages.length - 1].content || []) {
+        if (part && part.content && part.content[0] && part.content[0].value) {
+          pairedResults.push({ callId: part.callId, result: JSON.parse(part.content[0].value) });
+        }
+      }
+      return { stream: (async function* stream() {
+        yield {
+          callId: `duplicate-${turn}`, name: graph,
+          input: { mode: "focus", query: turn === 2 ? "  alpha  " : "alpha", workflow_stage: "implementation" },
+        };
+      }()) };
+    },
+  };
+  let liveCalls = 0;
+  const failure = await internals.runVscodeLmAgent(model, {
+    requestId: "1".repeat(32), request_kind: "worker", prompt: "Inspect graph.", allowedWrites: [],
+  }, undefined, async () => {
+    liveCalls += 1;
+    return { ok: true, content: "graph" };
+  }).then(() => assert.fail("native duplicate loop must stop"), (error) => error);
+  assert.strictEqual(liveCalls, 1);
+  assert.deepStrictEqual(pairedResults.map((part) => part.callId), ["duplicate-1", "duplicate-2"],
+    "native tool results must pair with their provider call IDs");
+  assert.deepStrictEqual(pairedResults[0].result, { ok: true, content: "graph" });
+  assert.strictEqual(pairedResults[1].result.schema_id, "aiworkhub.vscode_lm.source_graph_duplicate.v1");
+  assert.strictEqual(failure.message, "vscode_lm_source_graph_no_progress");
+  assert.ok(turn < 24, "the guard fails before the general agent turn limit");
+}
+
+async function nf998ForcedStageDuplicateAfterReadCap() {
+  const graph = "aiworkhub_worker_source_graph_query";
+  const first = "src/first.js";
+  const second = "src/second.js";
+  const dependency = "src/dep.js";
+  const toolRequest = (name, input) => JSON.stringify({
+    schema_id: internals.constants.VSCODE_LM_TOOL_REQUEST_SCHEMA, name, input,
+  });
+  const bodyRead = toolRequest(graph, {
+    mode: "body", query: "depSymbol", target: dependency, workflow_stage: "implementation",
+  });
+  const outputs = [
+    ...Array.from({ length: 12 }, (_, index) => toolRequest(graph, {
+      mode: "focus", query: `orientation-${index}`, workflow_stage: "implementation",
+    })),
+    toolRequest("aiworkhub_manager_semantic_edit_stage", {
+      operation: "replace_range", file_path: first, start_line: 1, end_line: 1,
+      new: "const first = 1;\n",
+    }),
+    toolRequest(graph, {
+      mode: "file", query: dependency, target: dependency, workflow_stage: "implementation",
+    }),
+    bodyRead,
+    toolRequest(graph, {
+      mode: "body", query: "differentSymbol", target: dependency, workflow_stage: "implementation",
+    }),
+    bodyRead, bodyRead,
+  ];
+  const receipts = [];
+  const model = {
+    capabilities: { toolCalling: false },
+    sendRequest: async (messages) => {
+      const last = messages[messages.length - 1];
+      try {
+        const receipt = JSON.parse(String(last && last.content));
+        if (receipt.schema_id === internals.constants.VSCODE_LM_TOOL_RESULT_SCHEMA) receipts.push(receipt);
+      } catch (_err) { /* prompt or stage instruction */ }
+      const value = outputs.shift();
+      return { stream: (async function* stream() { yield { value }; }()) };
+    },
+  };
+  const liveDependencyReads = [];
+  const failure = await internals.runVscodeLmTextProtocol(model, {
+    requestId: "2".repeat(32), request_kind: "worker", prompt: "Edit two files.",
+    allowedWrites: [first, second, dependency], required_outputs: [first, second],
+    path_contracts: {
+      [first]: { action: "edit", current_sha256: "a".repeat(64), line_count: 1, parent_existed: true },
+      [second]: { action: "edit", current_sha256: "b".repeat(64), line_count: 1, parent_existed: true },
+      [dependency]: { action: "edit", current_sha256: "c".repeat(64), line_count: 1, parent_existed: true },
+    },
+    initial_source_graph_result: { ok: true, content: "prefetched graph" },
+  }, undefined, async (call) => {
+    if (call.name === graph && call.input.target === dependency) liveDependencyReads.push(call.input.mode);
+    return { ok: true, content: "bounded graph" };
+  }).then(() => assert.fail("a capped duplicate must stop before the general turn limit"), (error) => error);
+  assert.deepStrictEqual(liveDependencyReads, ["file", "body"]);
+  assert.strictEqual(receipts[15].result.error, "vscode_lm_semantic_edit_stage_required",
+    "a new query remains subject to the two-read cap");
+  assert.strictEqual(receipts[16].result.schema_id, "aiworkhub.vscode_lm.source_graph_duplicate.v1",
+    "the first duplicate after the read cap gets the typed receipt");
+  assert.strictEqual(failure.message, "vscode_lm_source_graph_no_progress");
+}
+
+async function nf998BundleTypeChangesSourceGraphBoundary() {
+  const graph = "aiworkhub_worker_source_graph_query";
+  const bundle = (bundleType) => JSON.stringify({
+    schema_id: internals.constants.VSCODE_LM_TOOL_REQUEST_SCHEMA,
+    name: graph,
+    input: { mode: "bundle", query: "src/app.js", bundle_type: bundleType, workflow_stage: "implementation" },
+  });
+  const final = JSON.stringify({
+    schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+    summary: "inspected bundles", edits: [], creates: [],
+  });
+  const outputs = [bundle("bugfix"), bundle("audit"), bundle("audit"), final];
+  const receipts = [];
+  const model = {
+    capabilities: { toolCalling: false },
+    sendRequest: async (messages) => {
+      const last = messages[messages.length - 1];
+      try {
+        const receipt = JSON.parse(String(last && last.content));
+        if (receipt.schema_id === internals.constants.VSCODE_LM_TOOL_RESULT_SCHEMA) receipts.push(receipt);
+      } catch (_err) { /* initial prompt */ }
+      const value = outputs.shift();
+      return { stream: (async function* stream() { yield { value }; }()) };
+    },
+  };
+  const liveBundleTypes = [];
+  const result = await internals.runVscodeLmTextProtocol(model, {
+    requestId: "3".repeat(32), request_kind: "worker", prompt: "Compare bundles.", allowedWrites: [],
+  }, undefined, async (call) => {
+    liveBundleTypes.push(call.input.bundle_type);
+    return { ok: true, content: "bundle" };
+  });
+  assert.strictEqual(result, final);
+  assert.deepStrictEqual(liveBundleTypes, ["bugfix", "audit"],
+    "a changed bundle type is live, but repeating that type is duplicate");
+  assert.strictEqual(receipts[2].result.schema_id, "aiworkhub.vscode_lm.source_graph_duplicate.v1");
+}
+
+async function nf998LiteralWhitespaceDoesNotCollide() {
+  const graph = "aiworkhub_worker_source_graph_query";
+  const final = JSON.stringify({
+    schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+    summary: "inspected literals", edits: [], creates: [],
+  });
+  const run = async (inputs, requestId) => {
+    const outputs = inputs.map((input) => JSON.stringify({
+      schema_id: internals.constants.VSCODE_LM_TOOL_REQUEST_SCHEMA, name: graph, input,
+    }));
+    outputs.push(final);
+    const receipts = [];
+    const live = [];
+    const model = {
+      capabilities: { toolCalling: false },
+      sendRequest: async (messages) => {
+        const last = messages[messages.length - 1];
+        try {
+          const receipt = JSON.parse(String(last && last.content));
+          if (receipt.schema_id === internals.constants.VSCODE_LM_TOOL_RESULT_SCHEMA) receipts.push(receipt);
+        } catch (_err) { /* initial prompt */ }
+        const value = outputs.shift();
+        return { stream: (async function* stream() { yield { value }; }()) };
+      },
+    };
+    const result = await internals.runVscodeLmTextProtocol(model, {
+      requestId, request_kind: "worker", prompt: "Inspect exact literals.", allowedWrites: [],
+    }, undefined, async (call) => {
+      live.push(call.input);
+      return { ok: true, content: "indexed literal" };
+    });
+    assert.strictEqual(result, final);
+    assert.strictEqual(receipts[2].result.schema_id, "aiworkhub.vscode_lm.source_graph_duplicate.v1");
+    return live;
+  };
+  const file = (target) => ({ mode: "file", query: target, target, workflow_stage: "implementation" });
+  const pathCalls = await run([
+    file("src/a  b.js"), file("src/a b.js"), file("src/a b.js"),
+  ], "4".repeat(32));
+  assert.deepStrictEqual(pathCalls.map((call) => call.target), ["src/a  b.js", "src/a b.js"],
+    "internal path whitespace distinguishes indexed files");
+
+  const bodygrep = (query) => ({
+    mode: "bodygrep", query, target: "src/app.js", workflow_stage: "implementation",
+  });
+  const literalCalls = await run([
+    bodygrep("hello  world"), bodygrep("hello world"), bodygrep("hello world"),
+  ], "5".repeat(32));
+  assert.deepStrictEqual(literalCalls.map((call) => call.query), ["hello  world", "hello world"],
+    "internal bodygrep whitespace distinguishes literal searches");
+}
+
 async function main() {
+  await nf998LiteralWhitespaceDoesNotCollide();
+  await nf998BundleTypeChangesSourceGraphBoundary();
+  await nf998TextSourceGraphDuplicateStopsLiveLoop();
+  await nf998SourceGraphBoundaryAndStageReset();
+  await nf998NativeSourceGraphDuplicateStopsLiveLoop();
+  await nf998ForcedStageDuplicateAfterReadCap();
+  await nf988DiscoveryDoesNotImplicitlyEnterSemanticStage();
   await nf651StageContextReadForNextRequiredFile();
   await nf202600023DeclaredDependencyReadDuringForcedStaging();
+  await nf988TwoBoundedCorrectionsDuringForcedStaging();
   await nf202600032UnknownToolOutsideForcedStaging();
   await nf897EffortContextChecks();
   await nf831DirectFinalSubsetChecks();
