@@ -847,6 +847,46 @@ def _strict_retained_workspace(
     }
 
 
+def _configured_retained_workspace(
+    coord: Path,
+    task_id: str,
+    request_id: str,
+    allowed_writes: list[str],
+) -> dict:
+    """Predecessor workspace under configured_worktree_root.
+
+    On Windows that root is the repository-namespaced temp directory, not
+    ``<repo>/.aiworkhub/runtime/worktrees``.  Zero-diff tests keep the
+    runtime-root helper because core still binds those scans there.
+    """
+    del task_id
+    path = (
+        worker_workspace.configured_worktree_root(coord)
+        / request_id
+        / "worktree"
+    )
+    path.mkdir(parents=True, exist_ok=True)
+    return {
+        "request_id": request_id,
+        "repo": str(Path(coord).resolve()),
+        "path": str(path),
+        "home": str(path.parent / "home"),
+        "allowed_writes": allowed_writes,
+        "parent_baseline": {},
+        "workspace_baseline": {},
+    }
+
+
+def _remove_configured_request(coord: Path, request_id: str) -> None:
+    import shutil
+
+    request_root = worker_workspace.configured_worktree_root(coord) / request_id
+    if request_root.is_symlink():
+        request_root.unlink()
+        return
+    shutil.rmtree(request_root, ignore_errors=True)
+
+
 def _strict_delta_descriptor(
     coord: Path,
     task_id: str,
@@ -2017,6 +2057,254 @@ def test_reviewer_transport_recovery_rejects_workspace_repository_mismatch(tmp_p
     assert task_store.get_task(root, task_id)["status"] == "blocked"
 
 
+def _bind_blocked_reviewer_transport(root, task_id, request_id, workspace, hashes):
+    card = task_store.get_task(root, task_id)
+    assert card is not None
+    card["rework_predecessor"] = {
+        "request_id": request_id,
+        "task_id": task_id,
+        "changed_path_hashes": hashes,
+        "workspace": workspace,
+    }
+    expected_repo = str(Path(root).resolve())
+    terminal = {
+        "substatus": "validation_failed",
+        "runner": "codex",
+        "request_id": request_id,
+        "task_id": task_id,
+        "evidence": {
+            "request_id": request_id,
+            "changed_path_hashes": hashes,
+            "request_identity": {
+                "request_id": request_id,
+                "task_id": task_id,
+                "repo": expected_repo,
+            },
+            "workspace": {
+                "request_id": request_id,
+                "repo": expected_repo,
+                "path": workspace["path"],
+            },
+        },
+    }
+    _readiness, db_path = task_store._require_ready(root)
+    conn = task_store._connect(db_path)
+    try:
+        conn.execute(
+            "UPDATE tasks SET card_json=? WHERE task_id=?",
+            (
+                json.dumps(
+                    task_store.persistable_card_payload(card),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                task_id,
+            ),
+        )
+        updated = conn.execute(
+            "UPDATE task_events SET payload_json=? "
+            "WHERE task_id=? AND event='terminal_review'",
+            (json.dumps(terminal, ensure_ascii=False, sort_keys=True), task_id),
+        )
+        assert updated.rowcount == 1
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_recover_blocked_rework_validation_only_replay_accepts_configured_worktree_root(
+    tmp_path,
+):
+    """The predecessor at configured_worktree_root is replayable on Windows."""
+    root = tmp_path
+    task_store.initialize_repository(root)
+    request_id = "c" * 32
+    task_id = "nf-01012-configured-root"
+    relative = "src/example.py"
+    content = b"configured-root predecessor\n"
+    path_hash = hashlib.sha256(content).hexdigest()
+    try:
+        workspace = _configured_retained_workspace(
+            root, task_id, request_id, [relative]
+        )
+        target = Path(workspace["path"]) / "src" / "example.py"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+        _make_blocked_rework_task_with_terminal_review(
+            root,
+            task_id=task_id,
+            request_id=request_id,
+            changed_path_hashes={relative: path_hash},
+        )
+        _bind_blocked_reviewer_transport(
+            root,
+            task_id,
+            request_id,
+            workspace,
+            {relative: path_hash},
+        )
+        ok, state = task_store.recover_blocked_rework(
+            root,
+            task_id,
+            actor="coordinator",
+            feedback_reason="replay configured root",
+            validation_only_replay=True,
+        )
+        assert (ok, state) == (True, "recovered"), (ok, state)
+        recovered = task_store.get_task(root, task_id)
+        assert recovered["status"] == "pending"
+        assert (
+            recovered["validation_only_replay_authorization"][
+                "predecessor_request_id"
+            ]
+            == request_id
+        )
+    finally:
+        _remove_configured_request(root, request_id)
+
+
+def test_recover_blocked_rework_validation_only_replay_rejects_workspace_outside_configured_root(
+    tmp_path,
+):
+    """A real worktree outside configured_worktree_root still fails closed."""
+    root = tmp_path
+    task_store.initialize_repository(root)
+    request_id = "d" * 32
+    task_id = "nf-01012-outside-root"
+    relative = "src/example.py"
+    content = b"outside configured root\n"
+    path_hash = hashlib.sha256(content).hexdigest()
+    outside = tmp_path / "outside-worktree"
+    outside.mkdir()
+    (outside / "src").mkdir()
+    (outside / relative).write_bytes(content)
+    workspace = {
+        "request_id": request_id,
+        "repo": str(Path(root).resolve()),
+        "path": str(outside),
+        "allowed_writes": [relative],
+    }
+    _make_blocked_rework_task_with_terminal_review(
+        root,
+        task_id=task_id,
+        request_id=request_id,
+        changed_path_hashes={relative: path_hash},
+    )
+    _bind_blocked_reviewer_transport(
+        root, task_id, request_id, workspace, {relative: path_hash}
+    )
+    ok, state = task_store.recover_blocked_rework(
+        root,
+        task_id,
+        actor="coordinator",
+        feedback_reason="reject outside root",
+        validation_only_replay=True,
+    )
+    assert (ok, state) == (False, "validation_only_replay_workspace_invalid")
+    assert task_store.get_task(root, task_id)["status"] == "blocked"
+
+
+def test_recover_blocked_rework_validation_only_replay_rejects_historical_layout_on_windows(
+    tmp_path,
+):
+    """The pre-temp repo-local worktree is not a valid root on Windows."""
+    if os.name != "nt":
+        pytest.skip("historical layout is the configured root off Windows")
+    root = tmp_path
+    task_store.initialize_repository(root)
+    request_id = "e" * 32
+    task_id = "nf-01012-historical-layout"
+    relative = "src/example.py"
+    content = b"historical layout predecessor\n"
+    path_hash = hashlib.sha256(content).hexdigest()
+    historical = (
+        root / ".aiworkhub" / "runtime" / "worktrees" / request_id / "worktree"
+    )
+    historical.mkdir(parents=True)
+    (historical / "src").mkdir()
+    (historical / relative).write_bytes(content)
+    workspace = {
+        "request_id": request_id,
+        "repo": str(Path(root).resolve()),
+        "path": str(historical),
+        "allowed_writes": [relative],
+    }
+    _make_blocked_rework_task_with_terminal_review(
+        root,
+        task_id=task_id,
+        request_id=request_id,
+        changed_path_hashes={relative: path_hash},
+    )
+    _bind_blocked_reviewer_transport(
+        root, task_id, request_id, workspace, {relative: path_hash}
+    )
+    ok, state = task_store.recover_blocked_rework(
+        root,
+        task_id,
+        actor="coordinator",
+        feedback_reason="reject historical layout",
+        validation_only_replay=True,
+    )
+    assert (ok, state) == (False, "validation_only_replay_workspace_invalid")
+    assert task_store.get_task(root, task_id)["status"] == "blocked"
+
+
+def test_recover_blocked_rework_validation_only_replay_rejects_symlink_under_configured_root(
+    tmp_path,
+):
+    """A symlink component under the configured root fails closed."""
+    root = tmp_path
+    task_store.initialize_repository(root)
+    request_id = "f" * 32
+    task_id = "nf-01012-symlink-component"
+    relative = "src/example.py"
+    content = b"symlink component predecessor\n"
+    path_hash = hashlib.sha256(content).hexdigest()
+    configured = worker_workspace.configured_worktree_root(root)
+    request_root = configured / request_id
+    real = configured / (request_id + "-real")
+    try:
+        real.mkdir(parents=True)
+        worktree = real / "worktree"
+        (worktree / "src").mkdir(parents=True)
+        (worktree / relative).write_bytes(content)
+        try:
+            request_root.symlink_to(real, target_is_directory=True)
+        except OSError as exc:
+            pytest.skip(f"symlink unavailable: {exc}")
+        workspace_path = request_root / "worktree"
+        assert request_root.is_symlink()
+        assert not workspace_path.is_symlink()
+        workspace = {
+            "request_id": request_id,
+            "repo": str(Path(root).resolve()),
+            "path": str(workspace_path),
+            "allowed_writes": [relative],
+        }
+        _make_blocked_rework_task_with_terminal_review(
+            root,
+            task_id=task_id,
+            request_id=request_id,
+            changed_path_hashes={relative: path_hash},
+        )
+        _bind_blocked_reviewer_transport(
+            root, task_id, request_id, workspace, {relative: path_hash}
+        )
+        ok, state = task_store.recover_blocked_rework(
+            root,
+            task_id,
+            actor="coordinator",
+            feedback_reason="reject symlink component",
+            validation_only_replay=True,
+        )
+        assert (ok, state) == (False, "validation_only_replay_workspace_invalid")
+        assert task_store.get_task(root, task_id)["status"] == "blocked"
+    finally:
+        if request_root.is_symlink():
+            request_root.unlink()
+        _remove_configured_request(root, request_id + "-real")
+
+
 def test_recover_blocked_rework_validation_only_replay_no_terminal_failure_rejected(tmp_path):
     root = tmp_path
     task_store.initialize_repository(root)
@@ -2113,7 +2401,7 @@ def test_pending_rework_rebinds_validation_only_replay_to_latest_episode(tmp_pat
     assert card is not None
     card.pop("validation_only_replay_authorization")
     card["claim_epoch"] = 3
-    workspace = _strict_retained_workspace(
+    workspace = _configured_retained_workspace(
         root, task_id, second_request, ["a.py", "b.py"]
     )
     Path(workspace["path"], "a.py").write_bytes(first_content)
@@ -2174,6 +2462,7 @@ def test_pending_rework_rebinds_validation_only_replay_to_latest_episode(tmp_pat
         event["event"] == "blocked_rework_validation_replay_reauthorized"
         for event in events
     ) == 1
+    _remove_configured_request(root, second_request)
 
 
 def test_pending_replay_recovery_preserves_authenticated_lineage(
@@ -2228,7 +2517,7 @@ def test_pending_replay_recovery_preserves_authenticated_lineage(
     latest_path = paths[-1]
     contents[latest_path] = b"generation-two-latest-delta\n"
     latest_hash = hashlib.sha256(contents[latest_path]).hexdigest()
-    workspace = _strict_retained_workspace(root, task_id, latest_request, paths)
+    workspace = _configured_retained_workspace(root, task_id, latest_request, paths)
     assert "task_id" not in workspace
     workspace_path = Path(workspace["path"])
     for path, content in contents.items():
@@ -2356,6 +2645,7 @@ def test_pending_replay_recovery_preserves_authenticated_lineage(
         feedback_reason="must fail closed",
         validation_only_replay=True,
     ) == (False, "validation_only_replay_hash_mismatch")
+    _remove_configured_request(root, latest_request)
 
 
 def test_pending_replay_recovery_rejects_missing_predecessor_workspace(tmp_path):
@@ -2897,7 +3187,7 @@ def test_second_block_ordinary_recovery_fences_claim_epoch_and_launch(
     )
     assert after == ["provider"]
 
-    retained_workspace = _strict_retained_workspace(
+    retained_workspace = _configured_retained_workspace(
         root, task_id, request_id, ["src/example.py"]
     )
     retained_path = Path(retained_workspace["path"]) / "src" / "example.py"
@@ -2962,3 +3252,4 @@ def test_second_block_ordinary_recovery_fences_claim_epoch_and_launch(
     assert after_clean_root is not None
     assert after_clean_root["claim_epoch"] == 3
     assert _consume_event_count(root, task_id) == 1
+    _remove_configured_request(root, request_id)

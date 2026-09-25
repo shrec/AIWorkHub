@@ -4527,6 +4527,90 @@ def _collected_terminal_rework_delta(
     return fields, ""
 
 
+def _replay_configured_root_has_symlink_component(
+    expected_repo: Path,
+    configured_root: Path,
+    request_id: str,
+) -> bool:
+    """True when the configured worktree root or a component under it is a symlink.
+
+    Checks walk that root, not the historical repo-local worktrees chain.
+    An in-repo root still checks each component from the repository down to
+    the root, so a symlink on that path fails closed.
+    """
+    components: list[Path] = []
+    try:
+        relative = configured_root.relative_to(expected_repo)
+    except ValueError:
+        relative = None
+    if relative is not None:
+        cursor = expected_repo
+        for part in relative.parts:
+            cursor = cursor / part
+            components.append(cursor)
+    else:
+        components.append(configured_root)
+    cursor = configured_root
+    for part in (request_id, "worktree"):
+        cursor = cursor / part
+        components.append(cursor)
+    for component in components:
+        try:
+            if component.is_symlink():
+                return True
+        except OSError:
+            return True
+    return False
+
+
+def _validation_only_replay_configured_workspace_rejected(
+    expected_repo: Path,
+    request_id: str,
+    resolved_workspace: Path,
+) -> bool:
+    """True unless the predecessor is exactly the configured isolated worktree.
+
+    configured_worktree_root is the only accepted root.  On Windows that root
+    is the repository-namespaced temp directory, so the historical
+    repo/.aiworkhub/runtime/worktrees/<request_id>/worktree path is not valid
+    there.  A workspace outside the configured root fails closed.
+    """
+    from . import worker_workspace
+
+    if (
+        not request_id
+        or request_id in {".", ".."}
+        or "/" in request_id
+        or "\\" in request_id
+    ):
+        return True
+    try:
+        configured_root = worker_workspace.configured_worktree_root(expected_repo)
+        expected_workspace = configured_root / request_id / "worktree"
+        if expected_workspace.relative_to(configured_root).parts != (
+            request_id,
+            "worktree",
+        ):
+            return True
+        expected_resolved = expected_workspace.resolve(strict=False)
+    except (OSError, RuntimeError, ValueError, worker_workspace.WorkspaceError):
+        return True
+    if (
+        resolved_workspace != expected_workspace
+        and resolved_workspace != expected_resolved
+    ):
+        return True
+    try:
+        observed = resolved_workspace.relative_to(configured_root)
+    except ValueError:
+        return True
+    if observed.parts != (request_id, "worktree"):
+        return True
+    return _replay_configured_root_has_symlink_component(
+        expected_repo, configured_root, request_id
+    )
+
+
 @_os_failure_names_its_operation
 def recover_blocked_rework(
     root: str | Path,
@@ -4895,33 +4979,10 @@ def recover_blocked_rework(
                             or not workspace_path.is_absolute()
                             or workspace_path.is_symlink()
                             or not resolved_workspace.is_dir()
-                            or resolved_workspace
-                            != expected_repo
-                            / ".aiworkhub"
-                            / "runtime"
-                            / "worktrees"
-                            / predecessor_request_id
-                            / "worktree"
-                            or any(
-                                (expected_repo.joinpath(*parts)).is_symlink()
-                                for parts in (
-                                    (".aiworkhub",),
-                                    (".aiworkhub", "runtime"),
-                                    (".aiworkhub", "runtime", "worktrees"),
-                                    (
-                                        ".aiworkhub",
-                                        "runtime",
-                                        "worktrees",
-                                        predecessor_request_id,
-                                    ),
-                                    (
-                                        ".aiworkhub",
-                                        "runtime",
-                                        "worktrees",
-                                        predecessor_request_id,
-                                        "worktree",
-                                    ),
-                                )
+                            or _validation_only_replay_configured_workspace_rejected(
+                                expected_repo,
+                                predecessor_request_id,
+                                resolved_workspace,
                             )
                         ):
                             return False, "validation_only_replay_predecessor_invalid"
@@ -5259,28 +5320,10 @@ def recover_blocked_rework(
                 or not workspace_path.is_absolute()
                 or workspace_path.is_symlink()
                 or not resolved_workspace.is_dir()
-                or resolved_workspace
-                != expected_repo
-                / ".aiworkhub"
-                / "runtime"
-                / "worktrees"
-                / predecessor_request_id
-                / "worktree"
-                or any(
-                    (expected_repo.joinpath(*parts)).is_symlink()
-                    for parts in (
-                        (".aiworkhub",),
-                        (".aiworkhub", "runtime"),
-                        (".aiworkhub", "runtime", "worktrees"),
-                        (".aiworkhub", "runtime", "worktrees", predecessor_request_id),
-                        (
-                            ".aiworkhub",
-                            "runtime",
-                            "worktrees",
-                            predecessor_request_id,
-                            "worktree",
-                        ),
-                    )
+                or _validation_only_replay_configured_workspace_rejected(
+                    expected_repo,
+                    predecessor_request_id,
+                    resolved_workspace,
                 )
             ):
                 return False, "validation_only_replay_workspace_invalid"
