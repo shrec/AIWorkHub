@@ -272,7 +272,7 @@ jobs:
           python -m venv .venv-ci
           . .venv-ci/bin/activate
           python -m pip install --upgrade pip setuptools wheel
-          python -m pip install -e .
+          python -m pip install -e ".[source-graph-semantic]"
           python -m pip install "pytest>=8,<10" "pytest-xdist>=3.5,<4"
 
       - name: Run Python tests
