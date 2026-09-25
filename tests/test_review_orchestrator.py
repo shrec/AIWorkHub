@@ -211,6 +211,100 @@ def test_round_rollover_duplicate_does_not_starve_later_chain(
     assert len(manager.launches) == 1
 
 
+def test_production_multichain_rollover_releases_duplicate_and_continues(
+    tmp_path: Path,
+) -> None:
+    """A deferred high-watermark must not end a 33-chain drain.
+
+    Production measured max_actions=64 against 33 reservable rows and got one
+    deferred action: reserving the old round's high-water mark rolled the
+    cursor to 0 and immediately re-reserved that same row. Breaking on the
+    duplicate starved every later ready chain. Releasing that reservation and
+    continuing must launch later chains, stay inside max_actions, and leave a
+    row another worker holds untouched.
+    """
+    manager = _Manager(tmp_path)
+    manager.status_results["waiting-request"] = _target_status(
+        state="processing",
+        task_id="WAITING",
+        request_id="waiting-request",
+        candidate_sha256="b" * 64,
+        workspace_identity="workspace-waiting",
+    )
+    db_path = tmp_path / "review.sqlite"
+    driver = review_orchestrator.ReviewOrchestrator(
+        manager, db_path=db_path, route_selector=_route
+    )
+    driver.ensure_chain(
+        target_task_id="WAITING", target_request_id="waiting-request", claim_epoch=1,
+        packet_sha256="a" * 64, candidate_sha256="b" * 64, now=NOW,
+    )
+    first_action_id = review_lifecycle.rows_for_test(db_path)[0]["action_id"]
+
+    def set_round(cursor: int, watermark: int) -> None:
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO review_reservation_state "
+                "(id, last_pending_action_id, round_high_watermark) VALUES (1, 0, 0)"
+            )
+            conn.execute(
+                "UPDATE review_reservation_state SET last_pending_action_id=?, "
+                "round_high_watermark=? WHERE id=1",
+                (int(cursor), int(watermark)),
+            )
+            conn.commit()
+
+    set_round(0, first_action_id)
+    for index in range(32):
+        request_id = f"ready-request-{index}"
+        candidate = hashlib.sha256(f"ready-{index}".encode()).hexdigest()
+        manager.status_results[request_id] = _target_status(
+            task_id=f"READY{index}",
+            request_id=request_id,
+            candidate_sha256=candidate,
+            workspace_identity=f"workspace-ready-{index}",
+        )
+        driver.ensure_chain(
+            target_task_id=f"READY{index}", target_request_id=request_id,
+            claim_epoch=1, packet_sha256="a" * 64, candidate_sha256=candidate,
+            now=NOW,
+        )
+    first_actions = [
+        row for row in review_lifecycle.rows_for_test(db_path)
+        if row["action_index"] == 0
+    ]
+    assert len(first_actions) == 33
+    assert {row["state"] for row in first_actions} == {"pending"}
+    held_before = next(
+        row for row in first_actions if row["target_task_id"] == "READY2"
+    )
+    set_round(int(held_before["action_id"]) - 1, int(held_before["action_id"]))
+    held = review_lifecycle.reserve_next_action(
+        db_path, owner="other-worker", lease_token="other-lease", now=NOW,
+    )
+    assert held is not None and held.action_id == held_before["action_id"]
+    set_round(0, first_action_id)
+
+    result = driver.drain(max_actions=64, now=NOW)
+
+    launched = {call["target_task_id"] for call in manager.launches}
+    assert result.failed == 0
+    assert 1 < result.attempted <= 64
+    assert result.completed >= 2
+    assert "WAITING" not in launched
+    assert "READY2" not in launched
+    assert {"READY0", "READY1"} <= launched
+    after = review_lifecycle.rows_for_test(db_path)
+    waiting = next(row for row in after if row["action_id"] == first_action_id)
+    assert waiting["state"] == "pending"
+    assert waiting["owner"] == ""
+    assert waiting["lease_token"] == ""
+    held_after = next(row for row in after if row["action_id"] == held.action_id)
+    assert held_after["state"] == "reserved"
+    assert held_after["owner"] == "other-worker"
+    assert held_after["lease_token"] == "other-lease"
+
+
 def test_initial_route_unavailable_defers_without_terminalizing_chain(
     tmp_path: Path,
 ) -> None:
