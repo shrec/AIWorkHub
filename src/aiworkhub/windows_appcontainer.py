@@ -1557,6 +1557,87 @@ class _CleanupStack:
 # ---------------------------------------------------------------------------
 
 
+def _well_known_users_directory() -> str:
+    return os.path.normcase(os.path.normpath(r"C:\Users"))
+
+
+def _canonical_grant_path(path: str) -> str:
+    """Normcased path, with a ``\\\\?\\`` prefix stripped for the omit check."""
+    text = path[4:] if path.startswith("\\\\?\\") else path
+    return os.path.normcase(os.path.normpath(text))
+
+
+def _windows_volume_root(canonical: str) -> bool:
+    """``c:\\`` after normcase. Not a POSIX root."""
+    return len(canonical) == 3 and canonical[1:] == ":\\"
+
+
+def _dacl_write_omit_keys() -> frozenset[str]:
+    """Normcased paths launch must not hand to ``grant_path_access``.
+
+    ``C:\\Users`` and any other ancestor of a protected tree that sits outside
+    the user profile. Writing a DACL there fails (measured:
+    ``filesystem_grant_failed: write DACL C:\\Users``) and aborts the launch
+    before the child exists. The volume root is not in this set: a standalone
+    root write is refused by :func:`_validate_grants`, and a traverse tied to
+    a temp leaf stays in the application loop. The real boundary still refuses
+    SetNamedSecurityInfo on that root.
+    """
+    keys = {_well_known_users_directory()}
+    if os.name != "nt":
+        return frozenset(keys)
+    try:
+        profile_raw = _token_profile_directory()
+    except (OSError, AttributeError, ValueError):
+        profile_raw = ""
+    profile = os.path.normcase(os.path.normpath(profile_raw)) if profile_raw else ""
+    if profile:
+        parent = os.path.dirname(os.path.normpath(profile_raw))
+        if parent and not _windows_volume_root(os.path.normcase(parent)):
+            keys.add(os.path.normcase(parent))
+    try:
+        protected, _system = _sensitive_roots()
+    except (OSError, AttributeError, ValueError, AppContainerError):
+        return frozenset(keys)
+    for root in protected:
+        current = os.path.dirname(root)
+        while current and not _windows_volume_root(os.path.normcase(current)):
+            canonical = os.path.normcase(current)
+            if profile and (canonical == profile or _within(canonical, profile)):
+                current = os.path.dirname(current)
+                continue
+            keys.add(canonical)
+            current = os.path.dirname(current)
+    return frozenset(keys)
+
+
+def _launch_omits_dacl_write(
+    path: str, omit_keys: frozenset[str] | None = None
+) -> bool:
+    """True when launch must not call ``grant_path_access`` for ``path``."""
+    if not isinstance(path, str) or not path:
+        return False
+    keys = _dacl_write_omit_keys() if omit_keys is None else omit_keys
+    return _canonical_grant_path(path) in keys
+
+
+def _boundary_omits_dacl_write(path: str) -> bool:
+    """True when SetNamedSecurityInfo must not run for ``path``.
+
+    Includes everything :func:`_launch_omits_dacl_write` omits, plus a Windows
+    volume root. A tied root traverse may still be passed to the boundary; the
+    boundary must not turn that into a DACL write that aborts launch. A
+    standalone root write never reaches here: :func:`_validate_grants` refuses
+    it.
+    """
+    if not isinstance(path, str) or not path:
+        return False
+    canonical = _canonical_grant_path(path)
+    if os.name == "nt" and _windows_volume_root(canonical):
+        return True
+    return canonical in _dacl_write_omit_keys()
+
+
 def launch_appcontainer(
     request: AppContainerRequest, *, api: Win32Api | None = None
 ) -> AppContainerLaunch:
@@ -1653,7 +1734,14 @@ def launch_appcontainer(
         # them exactly like the directory they came from.
         grants: list[_PathGrant] = []
         persistent_grants: list[tuple[str, str]] = []
+        # NF-2026-01015: a tied traverse may still name C:\Users. Writing a
+        # DACL there fails and aborts the launch before the child exists.
+        # Omit that write (and any protected ancestor outside the profile).
+        # The grant stays revocable and non-persistent in the plan.
+        omit_dacl = _dacl_write_omit_keys()
         for grant in grant_plan:
+            if _launch_omits_dacl_write(grant.path, omit_dacl):
+                continue
             applied: _PathGrant = _step(
                 "grant_path_access",
                 partial(
@@ -1880,7 +1968,10 @@ def _validate_grants(grants: Sequence[ContainerGrant]) -> None:
     below trusted user Temp. A standalone or unrelated root traverse grant has
     no such leaf and stays refused. A traverse ancestor this process cannot
     stat is that same chain, not a missing path: the validation AppContainer
-    cannot open the profile above its granted subtree.
+    cannot open the profile above its granted subtree. Admitting that
+    traverse does not authorize a DACL write on ``C:\\Users`` or any protected
+    ancestor outside the profile: application omits those writes so launch is
+    not aborted by SetNamedSecurityInfo.
     """
     protected: list[str] | None = None
     system: list[str] = []
@@ -2567,7 +2658,13 @@ class _CtypesWin32Api:
         :meth:`revoke_path_access` then removes this SID's explicit ACEs --
         including one a crashed launch left behind -- instead of restoring a
         snapshot that would clobber a concurrent DACL edit.
+
+        ``C:\\Users``, any protected ancestor outside the profile, and a
+        Windows volume root are not written. The call returns a grant with
+        nothing to revoke so launch is not aborted by SetNamedSecurityInfo.
         """
+        if _boundary_omits_dacl_write(path):
+            return _PathGrant(path, access, None)
         mask = _GRANT_ACCESS_MASKS[access]
         inherit = (
             0
@@ -2596,6 +2693,9 @@ class _CtypesWin32Api:
         Idempotent; never raises; a failure is recorded on
         ``grant.revoke_error``."""
         if grant.restore is None:
+            return
+        if _boundary_omits_dacl_write(grant.path):
+            grant.restore = None
             return
         sid, grant.restore = grant.restore, None
         try:
@@ -2638,7 +2738,11 @@ class _CtypesWin32Api:
         admits everyone, and merging into it would REPLACE it with a one-entry
         DACL that locks everyone else out.  ``denied_detail``, when given,
         replaces the failure detail if the write is refused with
-        ERROR_ACCESS_DENIED (no WRITE_DAC)."""
+        ERROR_ACCESS_DENIED (no WRITE_DAC). Never calls SetNamedSecurityInfo
+        on ``C:\\Users``, a protected ancestor outside the profile, or a
+        Windows volume root."""
+        if _boundary_omits_dacl_write(path):
+            return False
         a = self._advapi32
         descriptor = wintypes.LPVOID()
         dacl = wintypes.LPVOID()

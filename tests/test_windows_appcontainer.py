@@ -2616,17 +2616,26 @@ def test_the_derived_ancestor_chain_launches_and_revokes_lifo(tmp_path, monkeypa
     )
     grants = request_scoped_grants({"XDG_STATE_HOME": str(state)}, str(worktree))
     assert _key(profile.anchor) in _keyed(grants)
+    # The plan still names C:\Users as a revocable traverse. Launch must not
+    # write a DACL there (NF-2026-01015); every other chain entry is applied.
+    omitted = [grant for grant in grants if wac._launch_omits_dacl_write(grant.path)]
+    applied = [grant for grant in grants if grant not in omitted]
+    if os.name == "nt":
+        assert any(_key(grant.path) == _key(r"C:\Users") for grant in omitted)
+        assert all(grant.access == "traverse" and not grant.persistent for grant in omitted)
 
     fake = FakeWin32Api()
     launch = launch_appcontainer(make_request(filesystem_grants=grants), api=fake)
 
-    assert _grant_events(fake) == [f"grant:{g.access}:{g.path}" for g in grants]
-    assert [g.path for g in launch.grants] == [g.path for g in grants]
+    assert _grant_events(fake) == [f"grant:{g.access}:{g.path}" for g in applied]
+    assert [g.path for g in launch.grants] == [g.path for g in applied]
+    assert not any(wac._launch_omits_dacl_write(event.split(":", 2)[-1]) for event in _grant_events(fake))
     fake.events.clear()
 
     launch.close()
-    # LIFO: the volume root is released first and each leaf last.
-    assert _grant_events(fake) == [f"revoke:{g.path}" for g in reversed(grants)]
+    # LIFO: the volume root is released first and each leaf last. Omitted
+    # ancestors were never written, so they are not revoked.
+    assert _grant_events(fake) == [f"revoke:{g.path}" for g in reversed(applied)]
     assert launch.grants == []
     assert launch.cleanup_evidence()["outstanding_grants"] == []
 
@@ -2662,14 +2671,96 @@ def test_unstatable_tied_traverse_ancestors_still_launch(tmp_path, monkeypatch):
     fake = FakeWin32Api()
     launch = launch_appcontainer(make_request(filesystem_grants=grants), api=fake)
     launch.close()
+    applied = [grant for grant in grants if not wac._launch_omits_dacl_write(grant.path)]
     assert _key(profile.anchor) in {
         _key(event.removeprefix("grant:traverse:"))
         for event in fake.events
         if event.startswith("grant:traverse:")
     }
-    assert _grant_events(fake)[-len(grants) :] == [
-        f"revoke:{g.path}" for g in reversed(grants)
+    assert not any(
+        wac._launch_omits_dacl_write(event.split(":", 2)[-1]) for event in _grant_events(fake)
+    )
+    assert _grant_events(fake)[-len(applied) :] == [
+        f"revoke:{g.path}" for g in reversed(applied)
     ]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="C:\\Users DACL grant is a Windows failure")
+def test_users_directory_dacl_write_is_omitted_and_does_not_abort_launch(tmp_path):
+    """NF-2026-01015: do not SetNamedSecurityInfo on C:\\Users.
+
+    A tied traverse may still name that protected ancestor, and it stays
+    revocable and non-persistent. Applying it must omit the write instead of
+    aborting with filesystem_grant_failed. A standalone volume-root write is
+    rejected before any DACL call. A volume-root traverse tied to a temp leaf
+    stays in the plan; the real boundary still does not write that DACL.
+    """
+    leaf = tmp_path / "request"
+    leaf.mkdir()
+    users = r"C:\Users"
+    root = str(Path(users).anchor)
+
+    plan = request_scoped_grants({}, str(leaf))
+    users_grant = _keyed(plan).get(_key(users))
+    assert users_grant is not None
+    assert users_grant.access == "traverse"
+    assert users_grant.persistent is False
+    assert _keyed(plan)[_key(root)].access == "traverse"
+    assert _keyed(plan)[_key(root)].persistent is False
+
+    # Standalone writes: fail closed, no grant API, no DACL write.
+    for path, access in ((users, "modify"), (root, "modify"), (root, "read_execute")):
+        fake = FakeWin32Api()
+        with pytest.raises(AppContainerError) as excinfo:
+            launch_appcontainer(
+                make_request(filesystem_grants=[ContainerGrant(path, access)]),
+                api=fake,
+            )
+        assert excinfo.value.reason is AppContainerReason.INVALID_REQUEST
+        assert fake.events == []
+        assert fake.grant_attempts == 0
+
+    # The production plan includes C:\Users. Launch omits that write and still
+    # starts the child. The fake boundary is what launch calls; not calling it
+    # for C:\Users is what keeps SetNamedSecurityInfo off that path.
+    fake = FakeWin32Api()
+    launch = launch_appcontainer(make_request(filesystem_grants=plan), api=fake)
+    try:
+        granted_paths = [
+            event.split(":", 2)[-1]
+            for event in fake.events
+            if event.startswith("grant:")
+        ]
+        assert _key(users) not in {_key(path) for path in granted_paths}
+        assert not any(wac._launch_omits_dacl_write(path) for path in granted_paths)
+        assert f"grant:modify:{leaf}" in fake.events
+        assert f"grant:traverse:{root}" in fake.events or any(
+            event.startswith("grant:traverse:") and _key(event.split(":", 2)[-1]) == _key(root)
+            for event in fake.events
+        )
+        assert "create_process" in fake.events
+    finally:
+        launch.close()
+
+    lib = FakeSecurityLib()
+    api = make_ctypes_api(lib)
+    api._advapi32 = lib
+    api._kernel32 = lib
+    omitted = api.grant_path_access(_identity(), users, "traverse")
+    assert omitted.restore is None
+    assert lib.set_calls == []
+    assert lib.entries == []
+    root_grant = api.grant_path_access(_identity(), root, "traverse")
+    assert root_grant.restore is None
+    assert lib.set_calls == []
+    # A descendant leaf under trusted temp is still written.
+    written = api.grant_path_access(_identity(), str(leaf), "modify")
+    assert written.restore == _SID
+    assert len(lib.set_calls) == 1
+    assert lib.set_calls[0][0] == str(leaf)
+    api.revoke_path_access(omitted)
+    api.revoke_path_access(root_grant)
+    assert len(lib.set_calls) == 1
 
 
 def test_the_traverse_mask_carries_no_list_read_write_or_delete_right():
