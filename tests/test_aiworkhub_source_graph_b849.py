@@ -7083,3 +7083,102 @@ def test_the_fit_drops_focus_restating_sections_before_any_match_row():
     assert fitted["matches"]
     assert fitted["matches"][0]["qualname"] == "s0"
     assert len(json.dumps(fitted, ensure_ascii=False).encode("utf-8")) <= 4096
+
+
+def test_impact_keeps_recorded_symbol_callers_when_the_file_sample_is_full(tmp_path):
+    """A symbol with recorded callers must not report inbound_call_edges=0.
+
+    impact's file-level sample is capped at budget*2 and ordered by confidence
+    then path.  An earlier file that also matches the query fills that cap,
+    which used to drop callers the index had already recorded
+    (NF-2026-00862, review_feedback_identity).  An unresolved caller is
+    returned still unresolved.
+    """
+
+    repo = _new_repo(tmp_path, "impact_symbol_callers")
+    noise = "\n".join(
+        f"def noise_{index}():\n    return noise_{index + 1}()\n"
+        for index in range(16)
+    )
+    noise += (
+        "\ndef noise_16():\n    return 1\n\n"
+        "def review_feedback_identity_noise():\n"
+        "    return noise_0()\n"
+    )
+    _write(repo / "pkg" / "aaa_noise.py", noise)
+    _write(
+        repo / "pkg" / "target.py",
+        "def review_feedback_identity(card):\n"
+        "    return card\n\n"
+        "def real_caller(card):\n"
+        "    return review_feedback_identity(card)\n",
+    )
+    _write(
+        repo / "pkg" / "zzz_unresolved.py",
+        "def outside_caller(card):\n"
+        "    return review_feedback_identity(card)\n",
+    )
+    sg.build_index(repo, incremental=False)
+
+    conn = sg.connect(sg.resolve_db_path(repo), read_only=True)
+    try:
+        same_file = conn.execute(
+            "SELECT dst_qualname, evidence_label FROM edges "
+            "WHERE kind='calls' AND dst_name=? AND file_path=?",
+            ("review_feedback_identity", "pkg/target.py"),
+        ).fetchone()
+        outside = conn.execute(
+            "SELECT dst_qualname, evidence_label FROM edges "
+            "WHERE kind='calls' AND dst_name=? AND file_path=?",
+            ("review_feedback_identity", "pkg/zzz_unresolved.py"),
+        ).fetchone()
+        noise_edges = conn.execute(
+            "SELECT COUNT(*) FROM edges WHERE kind='calls' AND file_path=?",
+            ("pkg/aaa_noise.py",),
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert same_file is not None and same_file["dst_qualname"]
+    assert outside is not None
+    assert outside["dst_qualname"] is None
+    assert noise_edges > 8
+
+    impacted = sg.impact(repo, "review_feedback_identity", budget=4)
+    target = next(
+        row for row in impacted["impacted_files"]
+        if row["file_path"] == "pkg/target.py"
+    )
+    assert target["inbound_call_edges"] > 0
+    callers = [
+        edge for edge in impacted["incoming_calls"]
+        if edge.get("callee_symbol") == "review_feedback_identity"
+    ]
+    assert any(edge.get("caller_file") == "pkg/target.py" for edge in callers)
+    outside_returned = [
+        edge for edge in callers
+        if edge.get("caller_file") == "pkg/zzz_unresolved.py"
+    ]
+    assert outside_returned
+    assert all(edge.get("dst_qualname") is None for edge in outside_returned)
+    affected = next(
+        row for row in impacted["affected_files"]
+        if row["file_path"] == "pkg/target.py"
+    )
+    assert int(affected["score"]) > 0
+    assert int(affected["inbound"]) > 0
+
+    scoped = w._filter_by_scope(impacted, "pkg/target.py")
+    scoped_target = next(
+        row for row in scoped["impacted_files"]
+        if row["file_path"] == "pkg/target.py"
+    )
+    assert scoped_target["inbound_call_edges"] > 0
+    assert any(
+        edge.get("caller_file") == "pkg/target.py"
+        for edge in scoped.get("incoming_calls") or []
+    )
+    scoped_affected = next(
+        row for row in scoped["affected_files"]
+        if row["file_path"] == "pkg/target.py"
+    )
+    assert int(scoped_affected["score"]) > 0

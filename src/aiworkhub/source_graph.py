@@ -5014,6 +5014,156 @@ def trace(repo_root: Path, query: str, budget: int = 64) -> dict[str, Any]:
         conn.close()
 
 
+def _merge_impact_call_edges(
+    sampled: list[dict[str, Any]],
+    symbol_edges: list[dict[str, Any]],
+    *,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Keep the query symbol's recorded edges ahead of the file-level sample.
+
+    The file sample is ordered by confidence then path and capped.  An earlier
+    candidate file can fill that cap and drop callers the index already recorded
+    for the symbol being asked about.  Edges are copied as stored: a null
+    ``dst_qualname`` stays null.
+    """
+
+    merged: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+    cap = max(1, int(limit))
+    for edge in (*symbol_edges, *sampled):
+        copied = dict(edge)
+        key = _calls_edge_key(copied)
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(copied)
+        if len(merged) >= cap:
+            break
+    return merged
+
+
+def _impact_symbol_call_edges(
+    conn: sqlite3.Connection, query: str, *, limit: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str]:
+    """Call edges of the one symbol ``query`` names, or nothing if it is not one.
+
+    Same rule as ``calls``: only an exact definition is bound.  An ambiguous
+    name is not guessed, and an unresolved edge is not given a target.
+    """
+
+    candidates, resolution = _resolve_calls_query_symbol(conn, query, "")
+    if resolution != "exact_symbol_match":
+        return [], [], ""
+    symbol = candidates[0]
+    outgoing, incoming = _calls_edges_for_symbol(conn, symbol, limit=limit)
+    return outgoing, incoming, str(symbol.get("file_path") or "")
+
+
+def _impact_inbound_count(
+    path: str,
+    incoming: list[dict[str, Any]],
+    symbol_incoming: list[dict[str, Any]],
+    symbol_file: str,
+) -> int:
+    """Count recorded callers of ``path`, including unbound callers of its symbol.
+
+    An unresolved caller has no ``callee_file``.  It still names this symbol, and
+    ``_calls_edges_for_symbol`` only attaches that name when the repository has
+    exactly one definition.  Counting it does not write a target onto the edge.
+    """
+
+    count = sum(1 for edge in incoming if edge.get("callee_file") == path)
+    if not symbol_file or path != symbol_file:
+        return count
+    seen = {
+        _calls_edge_key(edge)
+        for edge in incoming
+        if edge.get("callee_file") == path
+    }
+    for edge in symbol_incoming:
+        key = _calls_edge_key(edge)
+        if key in seen:
+            continue
+        if edge.get("callee_file") not in (None, ""):
+            continue
+        count += 1
+        seen.add(key)
+    return count
+
+
+def _fold_missed_symbol_edges_into_affected(
+    affected: Any,
+    *,
+    symbol_file: str,
+    symbol_incoming: list[dict[str, Any]],
+    symbol_outgoing: list[dict[str, Any]],
+    sampled_incoming: list[dict[str, Any]],
+    sampled_outgoing: list[dict[str, Any]],
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Add symbol edges the file-level sample never reached.
+
+    ``impact_insights`` scores the same capped file sample, so a symbol whose
+    callers were crowded out stays at score 0.  Unresolved callers are charged
+    to the symbol's file without inventing ``callee_file`` or ``dst_qualname``.
+    """
+
+    rows = [
+        dict(row) for row in affected
+        if isinstance(row, dict) and row.get("file_path")
+    ] if isinstance(affected, list) else []
+    if not symbol_incoming and not symbol_outgoing:
+        return rows[: max(1, limit)] if rows else rows
+    by_path = {str(row["file_path"]): row for row in rows}
+
+    def ensure(path: str) -> dict[str, Any]:
+        row = by_path.get(path)
+        if row is None:
+            row = {"file_path": path, "inbound": 0, "outbound": 0, "score": 0}
+            by_path[path] = row
+            rows.append(row)
+        return row
+
+    sampled_in = {_calls_edge_key(edge) for edge in sampled_incoming}
+    sampled_out = {_calls_edge_key(edge) for edge in sampled_outgoing}
+    if symbol_file:
+        ensure(symbol_file)
+    for edge in symbol_incoming:
+        if _calls_edge_key(edge) in sampled_in:
+            continue
+        callee = str(edge.get("callee_file") or symbol_file or "")
+        if not callee:
+            continue
+        row = ensure(callee)
+        row["inbound"] = int(row.get("inbound") or 0) + 1
+        row["score"] = int(row.get("score") or 0) + 4
+        caller = str(edge.get("caller_file") or "")
+        if caller and caller not in by_path:
+            extra = {"file_path": caller, "inbound": 0, "outbound": 1, "score": 2}
+            by_path[caller] = extra
+            rows.append(extra)
+    for edge in symbol_outgoing:
+        if _calls_edge_key(edge) in sampled_out:
+            continue
+        caller = str(edge.get("caller_file") or symbol_file or "")
+        if not caller:
+            continue
+        row = ensure(caller)
+        row["outbound"] = int(row.get("outbound") or 0) + 1
+        row["score"] = int(row.get("score") or 0) + 2
+        callee = str(edge.get("callee_file") or "")
+        if callee and callee not in by_path:
+            extra = {"file_path": callee, "inbound": 1, "outbound": 0, "score": 4}
+            by_path[callee] = extra
+            rows.append(extra)
+    ranked = sorted(
+        by_path.values(),
+        key=lambda row: (-int(row.get("score") or 0), str(row["file_path"])),
+    )
+    return ranked[: max(1, limit)]
+
+
 def impact(repo_root: Path, query: str, budget: int = 64) -> dict[str, Any]:
     """Rank likely affected files from symbols and bidirectional call edges."""
 
@@ -5022,13 +5172,29 @@ def impact(repo_root: Path, query: str, budget: int = 64) -> dict[str, Any]:
     try:
         matches = find(conn, query, limit=budget)
         files = _candidate_files(matches, limit=min(24, budget))
-        outgoing, incoming = _call_edges_for_files(conn, files, limit=budget * 2)
+        edge_limit = max(1, budget * 2)
+        sampled_outgoing, sampled_incoming = _call_edges_for_files(
+            conn, files, limit=edge_limit,
+        )
+        symbol_outgoing, symbol_incoming, symbol_file = _impact_symbol_call_edges(
+            conn, query, limit=edge_limit,
+        )
+        if symbol_file and symbol_file not in files:
+            files.append(symbol_file)
+        outgoing = _merge_impact_call_edges(
+            sampled_outgoing, symbol_outgoing, limit=edge_limit,
+        )
+        incoming = _merge_impact_call_edges(
+            sampled_incoming, symbol_incoming, limit=edge_limit,
+        )
         rows: list[dict[str, Any]] = []
         for path in files:
             entity_count = int(conn.execute(
                 "SELECT COUNT(*) FROM entities WHERE file_path=?", (path,)
             ).fetchone()[0])
-            callers = sum(1 for edge in incoming if edge.get("callee_file") == path)
+            callers = _impact_inbound_count(
+                path, incoming, symbol_incoming, symbol_file,
+            )
             callees = sum(1 for edge in outgoing if edge.get("caller_file") == path)
             stem = Path(path).stem
             test_rows = conn.execute(
@@ -5047,11 +5213,21 @@ def impact(repo_root: Path, query: str, budget: int = 64) -> dict[str, Any]:
         insights = sginsights.impact_insights(
             conn, repo_root, matches, budget=budget,
         )
+        affected = _fold_missed_symbol_edges_into_affected(
+            insights.get("affected_files"),
+            symbol_file=symbol_file,
+            symbol_incoming=symbol_incoming,
+            symbol_outgoing=symbol_outgoing,
+            sampled_incoming=sampled_incoming,
+            sampled_outgoing=sampled_outgoing,
+            limit=budget,
+        )
         return _fit_payload_bytes({
             "mode": "impact", "query": query, "budget": budget,
             "impacted_files": rows[:budget],
             "incoming_calls": incoming[:budget],
             **insights,
+            "affected_files": affected,
             "truncated": len(rows) > budget or len(incoming) > budget,
         }, max(512, budget * 768))
     finally:
