@@ -746,11 +746,19 @@ def test_pin_refuses_generation_republished_during_link(
 def test_pin_unsupported_filesystem_is_recorded_and_fails_explicitly(
     tmp_path: Path, monkeypatch
 ) -> None:
+    """EXDEV cannot hard-link, so the pin is a verified copy of that generation.
+
+    A later canonical republish must not raise composed_base_shifted_unpinned.
+    connect() keeps using the pinned copy, not the new canonical inode.
+    """
+
     repo = tmp_path / "repo"
     repo.mkdir()
     base_db = _build_base(repo, {"keep.py": "def keep_symbol():\n    return 1\n",
                                  "m.py": "def s():\n    return 1\n"})
     (repo / "m.py").write_text("def s2():\n    return 2\n", encoding="utf-8")
+    source_before = os.stat(base_db)
+    source_bytes = base_db.read_bytes()
 
     def cross_device_link(*_args, **_kwargs):
         raise OSError(errno.EXDEV, "Invalid cross-device link")
@@ -760,14 +768,102 @@ def test_pin_unsupported_filesystem_is_recorded_and_fails_explicitly(
     report = sgp.build_partition(
         repo, _changed(repo, ["m.py"]), partition, base_db_path=base_db,
     )
-    assert report.base_pin == "unsupported:EXDEV"
+    assert report.base_pin == "pinned"
+    (pin,) = _pins(tmp_path)
+    pin_stat = os.stat(pin, follow_symlinks=False)
+    assert not pin.is_symlink()
+    assert pin.is_file()
+    assert pin_stat.st_size == source_before.st_size
+    assert pin.read_bytes() == source_bytes
+    # A copy, not a hard link: the recorded generation is the pin file's.
+    assert (pin_stat.st_dev, pin_stat.st_ino) != (
+        source_before.st_dev,
+        source_before.st_ino,
+    )
+    marker = sgp.read_composed_marker(partition)
+    assert marker is not None
+    assert marker["base"]["dev"] == pin_stat.st_dev
+    assert marker["base"]["ino"] == pin_stat.st_ino
+    assert marker["base"]["size"] == pin_stat.st_size
+    assert marker["base"]["mtime_ns"] == pin_stat.st_mtime_ns
+    assert marker["base"]["pin"]["status"] == "pinned"
+    assert marker["base"]["pin"]["name"] == pin.name
+    assert marker["base"]["ino"] != source_before.st_ino
+
+    _publish(repo, {"keep.py": "def keep_symbol():\n    return 1\n\n"
+                               "def published_later():\n    return 4\n"})
+    assert os.stat(base_db).st_ino != source_before.st_ino
+    assert pin.read_bytes() == source_bytes
+    conn = source_graph.connect(partition, read_only=True)
+    try:
+        listed = {
+            str(row[1]): str(row[2])
+            for row in conn.execute("PRAGMA database_list")
+        }
+        names = {str(row[0]) for row in conn.execute("SELECT name FROM entities")}
+    finally:
+        conn.close()
+    assert "base" in listed
+    assert pin.name in listed["base"]
+    assert "keep_symbol" in names
+    assert "published_later" not in names
+    assert "s2" in names
+
+
+def test_pin_exdev_copy_failure_fails_closed(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A failed EXDEV copy is a typed pin error, not an unsupported success."""
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    base_db = _build_base(repo, {"keep.py": "def keep_symbol():\n    return 1\n",
+                                 "m.py": "def s():\n    return 1\n"})
+    (repo / "m.py").write_text("def s2():\n    return 2\n", encoding="utf-8")
+
+    def cross_device_link(*_args, **_kwargs):
+        raise OSError(errno.EXDEV, "Invalid cross-device link")
+
+    def failing_copy(*_args, **_kwargs):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(sgp.os, "link", cross_device_link)
+    monkeypatch.setattr(sgp, "_write_pin_copy", failing_copy)
+    with pytest.raises(
+        sgp.PartitionBasePinError, match="composed_base_pin_failed:ENOSPC"
+    ):
+        sgp.build_partition(
+            repo, _changed(repo, ["m.py"]), tmp_path / "p.sqlite",
+            base_db_path=base_db,
+        )
     assert _pins(tmp_path) == []
-    # Still composes while the canonical generation is unchanged ...
-    assert "keep_symbol" in _names(partition, "entities", "name")
-    # ... and names the missing pin when publication shifts the base.
+    assert list(tmp_path.glob(".sg-base-copy.*.tmp")) == []
+
+
+def test_pin_non_exdev_unsupported_is_still_recorded(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """EPERM is not the cross-device case and must not be copied away."""
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    base_db = _build_base(repo, {"keep.py": "def keep_symbol():\n    return 1\n",
+                                 "m.py": "def s():\n    return 1\n"})
+    (repo / "m.py").write_text("def s2():\n    return 2\n", encoding="utf-8")
+
+    def denied(*_args, **_kwargs):
+        raise OSError(errno.EPERM, "Operation not permitted")
+
+    monkeypatch.setattr(sgp.os, "link", denied)
+    partition = tmp_path / "p.sqlite"
+    report = sgp.build_partition(
+        repo, _changed(repo, ["m.py"]), partition, base_db_path=base_db,
+    )
+    assert report.base_pin == "unsupported:EPERM"
+    assert _pins(tmp_path) == []
     _publish(repo, {"keep.py": "def keep_symbol():\n    return 5\n"})
     with pytest.raises(
-        sgp.PartitionBasePinError, match="composed_base_shifted_unpinned:EXDEV"
+        sgp.PartitionBasePinError, match="composed_base_shifted_unpinned:EPERM"
     ):
         source_graph.connect(partition, read_only=True)
 

@@ -41,17 +41,19 @@ fingerprint (size + mtime). :meth:`ComposedView.verify_binding` refuses a view
 whose identity does not match a caller's packet, and every open re-checks that
 the base has not shifted underneath the view (:class:`PartitionBaseShiftError`).
 
-Base generation pinning (NF-2026-00946): the canonical base is published by
-atomic replacement, so a marker that named only the mutable canonical path made
-every ordinary publication break every in-flight reviewer/rework overlay. A
-marked partition therefore pins the exact base generation it was built against
-as a hard link (same inode, O(1), never a copy or a hash) next to the partition
-file; reads compose with that pinned inode and verify its identity (device,
-inode, size, mtime_ns), so a newer canonical generation never leaks into a
-sealed review and a replaced or mutated pin fails closed. Where hard links are
-unsupported the marker records that fact and a later shift fails with an
-explicit ``composed_base_shifted_unpinned`` reason. Pins no partition in their
-directory references any more are pruned on the next marker write.
+    Base generation pinning (NF-2026-00946): the canonical base is published by
+    atomic replacement, so a marker that named only the mutable canonical path made
+    every ordinary publication break every in-flight reviewer/rework overlay. A
+    marked partition therefore pins the exact base generation it was built against
+    as a hard link (same inode, O(1)) next to the partition file. A cross-device
+    link (``EXDEV`` only, NF-2026-01011) falls back to a verified byte copy whose
+    recorded generation is the pin file's own identity, not the source inode;
+    other unsupported link errors are recorded and a later shift fails with an
+    explicit ``composed_base_shifted_unpinned`` reason. Reads compose with that
+    pinned generation and verify its identity (device, inode, size, mtime_ns), so
+    a newer canonical generation never leaks into a sealed review and a replaced
+    or mutated pin fails closed. Pins no partition in their directory references
+    any more are pruned on the next marker write.
 """
 
 from __future__ import annotations
@@ -80,8 +82,9 @@ _BASE_PIN_NAME = re.compile(r"\.sg-base-pin\.[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\.sql
 _BASE_PIN_REQUIRED_TABLES = frozenset(
     {"meta", "files", "entities", "edges", "entities_fts"}
 )
-# ``link`` errnos meaning "this filesystem/platform/sandbox cannot pin", as
-# opposed to a genuine I/O failure that must propagate.
+# ``link`` errnos meaning "this filesystem/platform/sandbox cannot hard-link",
+# as opposed to a genuine I/O failure that must propagate. ``EXDEV`` is the
+# only member recovered by a verified byte copy; the rest stay unsupported.
 _BASE_PIN_UNSUPPORTED_ERRNOS = frozenset(
     getattr(errno, name)
     for name in (
@@ -121,7 +124,7 @@ class PartitionBuildReport:
     base index size, because the base is never read here. ``base_pin`` is the
     pin status (``pinned``, ``unsupported:<reason>`` or ``none``) and
     ``pin_seconds`` the measured cost of recording the marker and pinning the
-    base generation -- a hard link plus a stat, not a copy.
+    base generation -- a hard link plus a stat, or an ``EXDEV`` byte copy.
     """
 
     partition_db_path: str
@@ -377,11 +380,12 @@ def _link_base_pin(
     """Hard-link ``source`` to ``pin_path``; ``None`` on success.
 
     Returns an errno name when the filesystem, platform or sandbox cannot hard
-    link (the caller records that honestly instead of pretending to pin).
-    ``link`` follows the canonical PATH, so if the base was republished after
-    ``generation`` was taken the new link names an unverified inode and is
-    refused as ``composed_base_pin_raced``; a stale or forged entry squatting
-    the canonical pin name is replaced once.
+    link. ``EXDEV`` is returned so the caller can fall back to a verified byte
+    copy; every other unsupported errno is recorded as unsupported rather than
+    pretending to pin. ``link`` follows the canonical PATH, so if the base was
+    republished after ``generation`` was taken the new link names an unverified
+    inode and is refused as ``composed_base_pin_raced``; a stale or forged entry
+    squatting the canonical pin name is replaced once.
     """
 
     for _attempt in range(2):
@@ -412,6 +416,114 @@ def _link_base_pin(
         if created:
             raise PartitionBasePinError(f"composed_base_pin_raced:{pin_path.name}")
     raise PartitionBasePinError(f"composed_base_pin_raced:{pin_path.name}")
+
+
+def _write_pin_copy(source: Path, dest: Path) -> None:
+    """Copy ``source`` bytes to a new file at ``dest``. Raises ``OSError``."""
+
+    with source.open("rb") as src, dest.open("xb") as dst:
+        while True:
+            chunk = src.read(1024 * 1024)
+            if not chunk:
+                break
+            dst.write(chunk)
+        dst.flush()
+        os.fsync(dst.fileno())
+
+
+def _discard_uncommitted_pin(path: Path | None) -> None:
+    """Best-effort removal of a pin attempt that must not be left behind."""
+
+    if path is None:
+        return
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        return
+
+
+def _copy_base_pin(source: Path, pin_dir: Path) -> tuple[Path, dict[str, int]]:
+    """Byte-copy ``source`` to a pin named for the copy's own generation.
+
+    EXDEV-only fallback. The returned generation is taken from the pin file
+    after the copy, never from the source inode. The copy must be a regular
+    file whose size matches the source size captured at copy time. A failed
+    copy raises :class:`PartitionBasePinError` and leaves no pin file.
+    """
+
+    try:
+        before = os.stat(source, follow_symlinks=False)
+    except OSError as exc:
+        code = errno.errorcode.get(exc.errno or 0, str(exc.errno))
+        raise PartitionBasePinError(f"composed_base_pin_failed:{code}") from exc
+    if stat_mod.S_ISLNK(before.st_mode):
+        raise PartitionBasePinError(f"composed_base_symlink:{source}")
+    if not stat_mod.S_ISREG(before.st_mode) or before.st_size <= 0:
+        raise PartitionBasePinError(f"composed_base_not_file:{source}")
+    source_size = int(before.st_size)
+    tmp_path = pin_dir / f".sg-base-copy.{os.getpid()}.{time.time_ns()}.tmp"
+    final_path: Path | None = None
+    replaced = False
+    committed = False
+    try:
+        _write_pin_copy(source, tmp_path)
+        observed = os.stat(tmp_path, follow_symlinks=False)
+        if not stat_mod.S_ISREG(observed.st_mode):
+            raise PartitionBasePinError(
+                f"composed_base_pin_not_file:{tmp_path.name}"
+            )
+        if int(observed.st_size) != source_size:
+            raise PartitionBasePinError("composed_base_pin_failed:size")
+        try:
+            after = os.stat(source, follow_symlinks=False)
+        except OSError as exc:
+            code = errno.errorcode.get(exc.errno or 0, str(exc.errno))
+            raise PartitionBasePinError(
+                f"composed_base_pin_failed:{code}"
+            ) from exc
+        if (
+            not stat_mod.S_ISREG(after.st_mode)
+            or int(after.st_size) != source_size
+            or after.st_dev != before.st_dev
+            or after.st_ino != before.st_ino
+            or after.st_mtime_ns != before.st_mtime_ns
+        ):
+            raise PartitionBasePinError(f"composed_base_pin_raced:{source.name}")
+        generation = _generation(observed)
+        final_path = pin_dir / _pin_name(generation)
+        try:
+            os.lstat(final_path)
+        except FileNotFoundError:
+            pass
+        else:
+            raise PartitionBasePinError(
+                f"composed_base_pin_raced:{final_path.name}"
+            )
+        os.replace(tmp_path, final_path)
+        replaced = True
+        confirmed = os.stat(final_path, follow_symlinks=False)
+        if (
+            not stat_mod.S_ISREG(confirmed.st_mode)
+            or _generation(confirmed) != generation
+            or int(confirmed.st_size) != source_size
+            or final_path.name != _pin_name(generation)
+        ):
+            raise PartitionBasePinError(
+                f"composed_base_pin_raced:{final_path.name}"
+            )
+        committed = True
+        return final_path, generation
+    except PartitionBasePinError:
+        raise
+    except OSError as exc:
+        code = errno.errorcode.get(exc.errno or 0, str(exc.errno))
+        raise PartitionBasePinError(f"composed_base_pin_failed:{code}") from exc
+    finally:
+        if not committed:
+            if replaced:
+                _discard_uncommitted_pin(final_path)
+            else:
+                _discard_uncommitted_pin(tmp_path)
 
 
 def _verify_pinned_generation(pin_path: Path) -> None:
@@ -515,9 +627,12 @@ def write_composed_marker(
     ``base_db_path`` of ``None`` records a standalone partition (no base to
     compose); a later read-only open then serves partition rows only and this
     returns ``None``. Otherwise the base generation is hard-linked beside the
-    partition (constant cost, independent of base size) and re-verified, and
-    the returned pin record says ``pinned`` or ``unsupported`` with the errno
-    reason. A symlinked, missing, empty or raced base fails closed.
+    partition (constant cost, independent of base size) and re-verified. An
+    ``EXDEV`` link falls back to a verified byte copy; the marker says
+    ``pinned`` only after that copy passes the schema/revision check, and the
+    recorded generation is the pin file's, not the source inode. Any other
+    unsupported link errno is recorded with that reason. A symlinked, missing,
+    empty or raced base fails closed.
     """
 
     partition_db_path = Path(partition_db_path)
@@ -563,6 +678,51 @@ def write_composed_marker(
         except PartitionBasePinError:
             pin_path.unlink(missing_ok=True)
             raise
+    elif unsupported == "EXDEV":
+        # Cross-device only. EPERM, EACCES and the other unsupported link
+        # errnos are not copyable: this fallback is the measured EXDEV case,
+        # and a failed copy raises instead of being recorded as unsupported.
+        copied_path, copied_generation = _copy_base_pin(resolved, pin_dir)
+        name = copied_path.name
+        # Keep the copy referenced during verification, but do not claim
+        # pinned until the schema/revision check has passed.
+        base_info["pin"] = {
+            "schema_id": BASE_PIN_SCHEMA_ID,
+            "status": "copy",
+            "name": name,
+        }
+        _store_marker(partition_db_path, payload)
+        try:
+            _verify_pinned_generation(copied_path)
+            confirmed = os.stat(copied_path, follow_symlinks=False)
+        except PartitionBasePinError:
+            copied_path.unlink(missing_ok=True)
+            raise
+        except OSError as exc:
+            copied_path.unlink(missing_ok=True)
+            code = errno.errorcode.get(exc.errno or 0, str(exc.errno))
+            raise PartitionBasePinError(
+                f"composed_base_pin_failed:{code}"
+            ) from exc
+        if (
+            not stat_mod.S_ISREG(confirmed.st_mode)
+            or _generation(confirmed) != copied_generation
+            or name != _pin_name(copied_generation)
+            or int(confirmed.st_size) != int(copied_generation["size"])
+        ):
+            copied_path.unlink(missing_ok=True)
+            raise PartitionBasePinError(f"composed_base_pin_raced:{name}")
+        pin = {
+            "schema_id": BASE_PIN_SCHEMA_ID,
+            "status": "pinned",
+            "name": name,
+        }
+        base_info.clear()
+        base_info.update(
+            {"db_path": str(resolved), **copied_generation, "pin": pin}
+        )
+        payload["base"] = base_info
+        _store_marker(partition_db_path, payload)
     else:
         pin = {
             "schema_id": BASE_PIN_SCHEMA_ID,
