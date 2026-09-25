@@ -488,3 +488,127 @@ def test_v1_full_file_response_remains_accepted(tmp_path: Path) -> None:
     assert (workspace / "out" / "result.txt").read_text(encoding="utf-8") == (
         "legacy\n"
     )
+
+
+def test_staged_action_and_string_lines_apply_when_hash_matches(tmp_path: Path) -> None:
+    current = "alpha\nbeta\ngamma\n"
+    digest = hashlib.sha256(current.encode()).hexdigest()
+    spec, workspace = _request(
+        tmp_path,
+        {
+            "schema_id": "aiworkhub.vscode_lm.tool_request.v1",
+            "name": "aiworkhub_manager_semantic_edit_stage",
+            "input": {
+                "action": "edit",
+                "file_path": "src/app.py",
+                "start_line": "2",
+                "end_line": "2",
+                "new": "BETA\n",
+                "current_sha256": digest,
+            },
+        },
+    )
+    target = workspace / "src" / "app.py"
+    target.parent.mkdir()
+    target.write_bytes(current.encode("utf-8"))
+
+    result = vscode_lm_worker.run(spec)
+
+    assert target.read_text(encoding="utf-8") == "alpha\nBETA\ngamma\n"
+    assert result["edit_protocol"] == vscode_lm_bridge.EDIT_RESPONSE_SCHEMA_ID
+    assert "final_edit_invalid" not in json.dumps(result)
+
+
+def test_flat_stage_inside_v3_edits_is_not_final_edit_invalid(tmp_path: Path) -> None:
+    current = "alpha\nbeta\ngamma\n"
+    digest = hashlib.sha256(current.encode()).hexdigest()
+    spec, workspace = _request(
+        tmp_path,
+        {
+            "schema_id": vscode_lm_bridge.EDIT_RESPONSE_SCHEMA_ID,
+            "summary": "one line",
+            "edits": [{
+                "action": "replace_range",
+                "file_path": "src/app.py",
+                "start_line": "2",
+                "end_line": "2",
+                "new": "BETA\n",
+                "current_sha256": digest,
+            }],
+            "creates": [],
+        },
+    )
+    target = workspace / "src" / "app.py"
+    target.parent.mkdir()
+    target.write_bytes(current.encode("utf-8"))
+
+    result = vscode_lm_worker.run(spec)
+
+    assert target.read_text(encoding="utf-8") == "alpha\nBETA\ngamma\n"
+    assert "final_edit_invalid" not in json.dumps(result)
+
+
+def test_string_line_stage_still_rejects_overlap_stale_hash_and_bounds(
+    tmp_path: Path,
+) -> None:
+    current = "one\ntwo\nthree\n"
+    digest = hashlib.sha256(current.encode()).hexdigest()
+    overlap, workspace = _request(
+        tmp_path / "overlap",
+        _v3(edits=[{
+            "action": "replace_range",
+            "file_path": "src/app.py",
+            "current_sha256": digest,
+            "ranges": [
+                {"start_line": "1", "end_line": "2", "new": "x"},
+                {"start_line": "2", "end_line": "2", "new": "y"},
+            ],
+        }]),
+    )
+    target = workspace / "src" / "app.py"
+    target.parent.mkdir()
+    target.write_bytes(current.encode("utf-8"))
+    with pytest.raises(RuntimeError, match="ranges_overlap"):
+        vscode_lm_worker.run(overlap)
+    assert target.read_text(encoding="utf-8") == current
+
+    stale, stale_workspace = _request(
+        tmp_path / "stale",
+        {
+            "schema_id": vscode_lm_bridge.EDIT_RESPONSE_SCHEMA_ID,
+            "summary": "stale stage",
+            "edits": [{
+                "operation": "replace_range",
+                "file_path": "src/app.py",
+                "start_line": "1",
+                "end_line": "1",
+                "new": "x\n",
+                "current_sha256": "0" * 64,
+            }],
+            "creates": [],
+        },
+    )
+    stale_target = stale_workspace / "src" / "app.py"
+    stale_target.parent.mkdir()
+    stale_target.write_bytes(current.encode("utf-8"))
+    with pytest.raises(RuntimeError, match="stale_hash"):
+        vscode_lm_worker.run(stale)
+    assert stale_target.read_text(encoding="utf-8") == current
+
+    bounds, bounds_workspace = _request(
+        tmp_path / "bounds",
+        {
+            "action": "v3_range",
+            "file_path": "src/app.py",
+            "start_line": "9",
+            "end_line": "9",
+            "new": "nope\n",
+            "current_sha256": digest,
+        },
+    )
+    bounds_target = bounds_workspace / "src" / "app.py"
+    bounds_target.parent.mkdir()
+    bounds_target.write_bytes(current.encode("utf-8"))
+    with pytest.raises(RuntimeError, match="out_of_bounds"):
+        vscode_lm_worker.run(bounds)
+    assert bounds_target.read_text(encoding="utf-8") == current

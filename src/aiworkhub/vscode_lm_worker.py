@@ -1105,6 +1105,205 @@ def _reasoning_context_attempt_result(
     return verified
 
 
+_TOOL_REQUEST_SCHEMA_ID = "aiworkhub.vscode_lm.tool_request.v1"
+_RANGE_PROTOCOL_VERBS = frozenset({"replace_range", "edit", "v3_range"})
+_CREATE_PROTOCOL_VERBS = frozenset({"create", "v3_create"})
+_STAGE_TOOL_NAMES = frozenset({
+    "aiworkhub_manager_semantic_edit_stage",
+    "aiworkhub_worker_semantic_edit_stage",
+})
+
+
+def _decimal_protocol_line(value: Any) -> Any:
+    """Coerce a JSON string line number; leave bools and junk unchanged."""
+
+    if isinstance(value, bool) or isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if text.isdigit():
+            return int(text)
+    return value
+
+
+def _protocol_kind(item: dict[str, Any]) -> str:
+    """Map operation/action aliases onto range or create, or a conflict."""
+
+    kinds: list[str] = []
+    for key in ("operation", "action"):
+        raw = item.get(key)
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        verb = raw.strip()
+        if verb in _RANGE_PROTOCOL_VERBS:
+            kinds.append("range")
+        elif verb in _CREATE_PROTOCOL_VERBS:
+            kinds.append("create")
+        else:
+            return "unknown"
+    if not kinds:
+        return ""
+    if len(set(kinds)) != 1:
+        return "conflict"
+    return kinds[0]
+
+
+def _protocol_path(item: dict[str, Any]) -> str | None:
+    for key in ("path", "file_path"):
+        raw = item.get(key)
+        if isinstance(raw, str) and raw.strip():
+            return raw
+    return None
+
+
+def _coerce_protocol_range(item: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(item)
+    if "start_line" in normalized:
+        normalized["start_line"] = _decimal_protocol_line(normalized.get("start_line"))
+    if "end_line" in normalized:
+        normalized["end_line"] = _decimal_protocol_line(normalized.get("end_line"))
+    return normalized
+
+
+def _flat_protocol_range(item: dict[str, Any]) -> dict[str, Any] | None:
+    if "start_line" not in item or "end_line" not in item:
+        return None
+    if not isinstance(item.get("new"), str):
+        return None
+    range_item: dict[str, Any] = {
+        "start_line": _decimal_protocol_line(item.get("start_line")),
+        "end_line": _decimal_protocol_line(item.get("end_line")),
+        "new": item["new"],
+    }
+    if "preserve_trailing_newline" in item:
+        range_item["preserve_trailing_newline"] = item["preserve_trailing_newline"]
+    if isinstance(item.get("fragment_sha256"), str):
+        range_item["fragment_sha256"] = item["fragment_sha256"]
+    return range_item
+
+
+def _normalize_protocol_edit_item(item: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    """Turn one staged edit into a v3 edit or create entry.
+
+    ``action`` and ``operation`` are the same verb.  ``file_path`` is ``path``.
+    A flat ``start_line``/``end_line``/``new`` stage becomes ``ranges``.  The
+    caller still verifies the file hash; this function never invents one.
+    """
+
+    kind = _protocol_kind(item)
+    path = _protocol_path(item)
+    ranges = item.get("ranges")
+    if isinstance(ranges, list) and kind != "create":
+        edit = dict(item)
+        if path is not None:
+            edit["path"] = path
+        edit["ranges"] = [
+            _coerce_protocol_range(range_item) if isinstance(range_item, dict) else range_item
+            for range_item in ranges
+        ]
+        return "edit", edit
+    if kind == "create" and path is not None:
+        content = item.get("content")
+        if not isinstance(content, str):
+            content = item.get("new")
+        if isinstance(content, str):
+            return "create", {"path": path, "content": content}
+    if kind in {"", "range"} and path is not None:
+        flat = _flat_protocol_range(item)
+        if flat is not None:
+            edit: dict[str, Any] = {"path": path, "ranges": [flat]}
+            if "current_sha256" in item:
+                edit["current_sha256"] = item["current_sha256"]
+            return "edit", edit
+    edit = dict(item)
+    if path is not None:
+        edit["path"] = path
+    return "edit", edit
+
+
+def _looks_like_flat_stage(item: dict[str, Any]) -> bool:
+    if item.get("replacements") is not None or item.get("files") is not None:
+        return False
+    if isinstance(item.get("ranges"), list):
+        return False
+    kind, entry = _normalize_protocol_edit_item(item)
+    if kind == "create":
+        return True
+    return isinstance(entry.get("ranges"), list) and bool(entry["ranges"])
+
+
+def _normalize_staged_final_envelope(edit: dict[str, Any]) -> dict[str, Any]:
+    """Make a valid staged edit a v3 final envelope.
+
+    Text-protocol workers send ``action`` where the final schema wants
+    ``operation``-shaped ranges, and line numbers as strings.  That mismatch
+    is not a hash failure: hashes, out-of-file ranges, and overlaps stay
+    fail-closed after this shape normalization.  A valid stage must not die
+    as ``final_edit_invalid``.
+    """
+
+    if not isinstance(edit, dict):
+        return edit
+    payload = edit
+    if edit.get("schema_id") == _TOOL_REQUEST_SCHEMA_ID:
+        inner = edit.get("input")
+        name = edit.get("name")
+        if not isinstance(inner, dict):
+            return edit
+        named_stage = isinstance(name, str) and name in _STAGE_TOOL_NAMES
+        if not named_stage and not _looks_like_flat_stage(inner):
+            return edit
+        payload = dict(inner)
+        if not isinstance(payload.get("summary"), str) and isinstance(edit.get("summary"), str):
+            payload["summary"] = edit["summary"]
+    schema = payload.get("schema_id")
+    if schema in {EDIT_RESPONSE_SCHEMA_ID_V1, EDIT_RESPONSE_SCHEMA_ID_V2}:
+        return payload
+    edits = payload.get("edits")
+    if not isinstance(edits, list):
+        if not _looks_like_flat_stage(payload):
+            return payload
+        kind, entry = _normalize_protocol_edit_item(payload)
+        summary = payload.get("summary") if isinstance(payload.get("summary"), str) else "staged semantic edit"
+        if kind == "create":
+            return {
+                "schema_id": EDIT_RESPONSE_SCHEMA_ID,
+                "summary": summary,
+                "edits": [],
+                "creates": [entry],
+            }
+        return {
+            "schema_id": EDIT_RESPONSE_SCHEMA_ID,
+            "summary": summary,
+            "edits": [entry],
+            "creates": [],
+        }
+    next_edits: list[Any] = []
+    extra_creates: list[dict[str, Any]] = []
+    for item in edits:
+        if not isinstance(item, dict):
+            next_edits.append(item)
+            continue
+        kind, entry = _normalize_protocol_edit_item(item)
+        if kind == "create":
+            extra_creates.append(entry)
+            continue
+        next_edits.append(entry)
+    creates = payload.get("creates")
+    next_creates = list(creates) if isinstance(creates, list) else []
+    next_creates.extend(extra_creates)
+    normalized = dict(payload)
+    normalized["edits"] = next_edits
+    normalized["creates"] = next_creates
+    if normalized.get("schema_id") not in {
+        EDIT_RESPONSE_SCHEMA_ID,
+        EDIT_RESPONSE_SCHEMA_ID_V1,
+        EDIT_RESPONSE_SCHEMA_ID_V2,
+    }:
+        normalized["schema_id"] = EDIT_RESPONSE_SCHEMA_ID
+    return normalized
+
+
 def run(spec_path: Path) -> dict[str, Any]:
     spec = _load_json(spec_path)
     if spec.get("schema_id") != "aiworkhub.vscode_lm.worker_spec.v1":
@@ -1216,6 +1415,8 @@ def run(spec_path: Path) -> dict[str, Any]:
         edit = json.loads(_strip_fence(raw_text))
     except json.JSONDecodeError as exc:
         raise RuntimeError("vscode_lm_edit_response_invalid_json") from exc
+    if isinstance(edit, dict):
+        edit = _normalize_staged_final_envelope(edit)
     if not isinstance(edit, dict) or edit.get("schema_id") not in {
         EDIT_RESPONSE_SCHEMA_ID,
         EDIT_RESPONSE_SCHEMA_ID_V2,

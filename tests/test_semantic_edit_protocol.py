@@ -427,3 +427,79 @@ def test_a_source_graph_body_reply_counts_as_a_delivery(tmp_path: Path) -> None:
         "content_encoding": "base64",
         "content": json.dumps(payload, sort_keys=True),
     }) == 0
+
+
+def test_one_line_prepare_accepts_equal_bounds_and_decimal_strings(tmp_path: Path) -> None:
+    target = tmp_path / "src" / "module.py"
+    target.parent.mkdir()
+    target.write_bytes(b"alpha\nbeta\ngamma\n")
+
+    prepared = semantic_edit.prepare_line_target(
+        tmp_path,
+        path="src/module.py",
+        start_line=2,
+        end_line=2,
+        allowed_writes=("src/*.py",),
+    )
+    assert prepared.start_line == 2
+    assert prepared.end_line == 2
+    assert prepared.fragment == "beta\n"
+
+    string_prepared = semantic_edit.prepare_line_target(
+        tmp_path,
+        path="src/module.py",
+        start_line="2",
+        end_line="2",
+        allowed_writes=("src/*.py",),
+    )
+    assert string_prepared.fragment == "beta\n"
+    assert string_prepared.start_line == 2
+    assert string_prepared.fragment_sha256 == prepared.fragment_sha256
+
+    with pytest.raises(semantic_edit.SemanticEditError, match="line_range_invalid"):
+        semantic_edit.prepare_line_target(
+            tmp_path,
+            path="src/module.py",
+            start_line="2",
+            end_line="1",
+            allowed_writes=("src/*.py",),
+        )
+    with pytest.raises(semantic_edit.SemanticEditError, match="out_of_bounds"):
+        semantic_edit.prepare_line_target(
+            tmp_path,
+            path="src/module.py",
+            start_line="9",
+            end_line="9",
+            allowed_writes=("src/*.py",),
+        )
+
+    next_text, metrics = semantic_edit.apply_line_ranges(
+        "alpha\nbeta\ngamma\n",
+        [{
+            "start_line": "2",
+            "end_line": "2",
+            "new": "BETA\n",
+            "fragment_sha256": prepared.fragment_sha256,
+        }],
+    )
+    assert next_text == "alpha\nBETA\ngamma\n"
+    assert metrics["preimage_verified"] is True
+
+    with pytest.raises(semantic_edit.SemanticEditError, match="fragment_hash_mismatch"):
+        semantic_edit.apply_line_ranges(
+            "alpha\nbeta\ngamma\n",
+            [{
+                "start_line": "2",
+                "end_line": "2",
+                "new": "BETA\n",
+                "fragment_sha256": "0" * 64,
+            }],
+        )
+    with pytest.raises(semantic_edit.SemanticEditError, match="ranges_overlap"):
+        semantic_edit.apply_line_ranges(
+            "alpha\nbeta\ngamma\n",
+            [
+                {"start_line": "1", "end_line": "2", "new": "x\n"},
+                {"start_line": "2", "end_line": "2", "new": "y\n"},
+            ],
+        )

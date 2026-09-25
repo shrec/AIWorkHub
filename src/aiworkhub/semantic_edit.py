@@ -176,16 +176,47 @@ def read_utf8_file(target: Path, relative: str) -> tuple[bytes, str]:
         raise SemanticEditError(f"semantic_edit_utf8_required:{relative}") from exc
 
 
-def _line_slice(text: str, start_line: int, end_line: int) -> tuple[list[str], str]:
+def _coerce_protocol_line(value: object) -> object:
+    """Return an int for a decimal line number, otherwise the original value.
+
+    Text-protocol bridges emit Source Graph line numbers as JSON strings
+    (``"55"``).  A boolean is an int subclass and must stay a boolean so the
+    fail-closed check below still rejects it.  Non-decimal text is left
+    unchanged and rejected as ``semantic_edit_line_range_invalid``.
+    """
+
+    if isinstance(value, bool) or isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if text.isdigit():
+            return int(text)
+    return value
+
+
+def _validated_line_bounds(start_line: object, end_line: object) -> tuple[int, int]:
+    """Accept an inclusive 1-line range (``start_line == end_line``).
+
+    ``end_line < start_line`` is invalid.  Equality is one existing line,
+    ``lines[start - 1:end]``, not an empty exclusive span.
+    """
+
+    start = _coerce_protocol_line(start_line)
+    end = _coerce_protocol_line(end_line)
     if (
-        not isinstance(start_line, int)
-        or isinstance(start_line, bool)
-        or not isinstance(end_line, int)
-        or isinstance(end_line, bool)
-        or start_line < 1
-        or end_line < start_line
+        not isinstance(start, int)
+        or isinstance(start, bool)
+        or not isinstance(end, int)
+        or isinstance(end, bool)
+        or start < 1
+        or end < start
     ):
         raise SemanticEditError("semantic_edit_line_range_invalid")
+    return start, end
+
+
+def _line_slice(text: str, start_line: object, end_line: object) -> tuple[list[str], str]:
+    start_line, end_line = _validated_line_bounds(start_line, end_line)
     lines = text.splitlines(keepends=True)
     # An existing zero-byte file has one deterministic virtual insertion
     # point.  VS Code LM workers receive such files as trusted placeholders
@@ -213,6 +244,7 @@ def prepare_line_target(
     relative = normalize_relative_path(path)
     if not path_is_allowed(relative, allowed_writes):
         raise SemanticEditError(f"semantic_edit_path_not_allowed:{relative}")
+    start_line, end_line = _validated_line_bounds(start_line, end_line)
     resolve_existing_file(root, relative)
     with held_path(root, relative):
         target = resolve_existing_file(root, relative)
@@ -262,8 +294,9 @@ def apply_line_ranges(
     for index, item in enumerate(ranges):
         if not isinstance(item, dict):
             raise SemanticEditError(f"semantic_edit_range_invalid:{index}")
-        start = item.get("start_line")
-        end = item.get("end_line")
+        start, end = _validated_line_bounds(
+            item.get("start_line"), item.get("end_line")
+        )
         replacement = item.get("new")
         if not isinstance(replacement, str):
             raise SemanticEditError(f"semantic_edit_replacement_invalid:{index}")
