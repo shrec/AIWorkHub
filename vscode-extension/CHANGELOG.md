@@ -1,5 +1,11 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.77 — 2026-09-26
+
+### Fixed
+
+- VS Code LM staging accepts string line numbers and `action`/`path` aliases. A one-line edit is no longer rejected as `range_invalid` before the worker sees it.
+
 ## 0.11.76 — 2026-09-26
 
 ### Fixed

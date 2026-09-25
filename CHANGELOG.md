@@ -6,6 +6,12 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.77] - 2026-09-26
+
+### Fixed
+
+- The VS Code LM edit bridge accepts a one-line range given as a decimal string, and `action`/`path` aliases, instead of rejecting the stage as `range_invalid` before the worker runs.
+
 ## [0.11.76] - 2026-09-26
 
 ### Fixed

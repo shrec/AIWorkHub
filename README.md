@@ -62,6 +62,10 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
+## What's new in 0.11.77
+
+- The VS Code LM bridge accepts string line numbers when staging an edit, so a one-line pin is no longer rejected before the worker runs.
+
 ## What's new in 0.11.76
 
 - Manager Chat is a persistent sidebar. Semantic edit accepts one-line ranges.

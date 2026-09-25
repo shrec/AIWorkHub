@@ -14,6 +14,10 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.11.77
+
+- Editor-hosted workers can stage a one-line edit with a string line number. The bridge no longer rejects that shape as `range_invalid`.
+
 ## What's new in 0.11.76
 
 - Manager Chat stays beside the dashboard. Source Graph bodygrep can resume a
