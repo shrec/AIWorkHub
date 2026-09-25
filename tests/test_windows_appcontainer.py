@@ -14,6 +14,8 @@ from __future__ import annotations
 import ctypes
 import json
 import os
+import tempfile
+from pathlib import Path
 
 import pytest
 
@@ -2055,6 +2057,31 @@ def test_second_grant_failure_revokes_the_first_and_never_launches(tmp_path):
     assert fake.identity_freed
 
 
+def test_ancestor_grant_failure_unwinds_leaf_and_applied_parent_lifo(tmp_path):
+    leaf = tmp_path / "worker" / "home"
+    leaf.mkdir(parents=True)
+    grants = request_scoped_grants({}, str(leaf))
+    assert grants[:2] == [
+        ContainerGrant(str(leaf), "modify"),
+        ContainerGrant(str(leaf.parent), "traverse"),
+    ]
+
+    fake = FakeWin32Api()
+    fake.fail_grant_attempt = 3
+    with pytest.raises(AppContainerError) as excinfo:
+        launch_appcontainer(make_request(filesystem_grants=grants), api=fake)
+
+    assert excinfo.value.reason is AppContainerReason.FILESYSTEM_GRANT_FAILED
+    assert _grant_events(fake) == [
+        f"grant:modify:{leaf}",
+        f"grant:traverse:{leaf.parent}",
+        f"revoke:{leaf.parent}",
+        f"revoke:{leaf}",
+    ]
+    assert "create_process" not in fake.events
+    assert fake.identity_freed
+
+
 def test_close_revokes_grants_once_and_second_close_is_a_noop(tmp_path):
     grants = _grant_dirs(tmp_path)
     fake = FakeWin32Api()
@@ -2151,7 +2178,12 @@ def test_invalid_grant_is_refused_before_any_win32_call(tmp_path, case):
 
 @pytest.mark.parametrize(
     ("access", "persistent"),
-    [("read_execute", True), ("read_execute", False), ("modify", False)],
+    [
+        ("read_execute", True),
+        ("read_execute", False),
+        ("modify", False),
+        ("traverse", False),
+    ],
 )
 def test_no_grant_may_equal_or_contain_a_protected_tree(
     tmp_path, monkeypatch, access, persistent
@@ -2279,12 +2311,13 @@ def test_disjoint_revocable_and_persistent_grants_are_fine(tmp_path):
     launch_appcontainer(make_request(filesystem_grants=grants), api=FakeWin32Api())
 
 
-def test_a_filesystem_root_is_never_granted(tmp_path):
+@pytest.mark.parametrize("access", ["read_execute", "traverse"])
+def test_a_filesystem_root_is_never_granted(tmp_path, access):
     fake = FakeWin32Api()
     with pytest.raises(AppContainerError) as excinfo:
         launch_appcontainer(
             make_request(
-                filesystem_grants=[ContainerGrant(tmp_path.anchor, "read_execute")]
+                filesystem_grants=[ContainerGrant(tmp_path.anchor, access)]
             ),
             api=fake,
         )
@@ -2322,14 +2355,339 @@ def test_protected_trees_come_from_the_token_not_the_request_env(
 
 
 def test_request_scoped_grants_dedupe_and_skip_unset(tmp_path):
-    cwd, home, temp = (str(tmp_path / n) for n in ("wt", "home", "tmp"))
-    env = {"HOME": home, "USERPROFILE": home, "TMP": temp, "TEMP": temp, "PATH": "x"}
-    assert request_scoped_grants(env, cwd) == [
+    paths = [tmp_path / n for n in ("wt", "home", "tmp", "state", "codex")]
+    for path in paths:
+        path.mkdir()
+    cwd, home, temp, state, codex_home = (str(path) for path in paths)
+    env = {
+        "HOME": home,
+        "USERPROFILE": home,
+        "TMP": temp,
+        "TEMP": temp,
+        "XDG_STATE_HOME": state,
+        "CODEX_HOME": codex_home,
+        "PATH": "x",
+    }
+
+    grants = request_scoped_grants(env, cwd)
+    leaf_paths = [cwd, home, temp, state, codex_home]
+    assert grants[:5] == [
         ContainerGrant(cwd, "modify"),
         ContainerGrant(home, "modify"),
         ContainerGrant(temp, "modify"),
+        ContainerGrant(state, "modify"),
+        ContainerGrant(codex_home, "modify"),
     ]
+
+    # NF-2026-01004: the ancestor walk follows Path.parents through the volume
+    # root. It does not stop at trusted Temp, and it does not drop a parent
+    # this process cannot stat.
+    expected_ancestors: list[str] = []
+    seen = {os.path.normcase(os.path.normpath(path)) for path in leaf_paths}
+    for leaf in leaf_paths:
+        for parent in Path(os.path.normpath(leaf)).parents:
+            parent_text = os.path.normpath(str(parent))
+            key = os.path.normcase(parent_text)
+            if key not in seen:
+                seen.add(key)
+                expected_ancestors.append(parent_text)
+
+    assert grants[5:] == [
+        ContainerGrant(path, "traverse") for path in expected_ancestors
+    ]
+    keys = [os.path.normcase(os.path.normpath(grant.path)) for grant in grants]
+    assert os.path.normcase(os.path.normpath(Path(cwd).anchor)) in keys
+    for leaf in leaf_paths:
+        chain = [os.path.normcase(str(parent)) for parent in Path(os.path.normpath(leaf)).parents]
+        assert [key for key in keys if key in set(chain)] == chain
+    assert len(set(keys)) == len(grants)
+    assert not any(grant.persistent for grant in grants)
     assert request_scoped_grants({}) == []
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows drive traversal")
+def test_request_scoped_grants_rejects_dev_path_outside_user_temp():
+    with pytest.raises(AppContainerError) as excinfo:
+        request_scoped_grants({}, r"D:\Dev\AIWorkHub")
+
+    assert excinfo.value.reason is AppContainerReason.INVALID_REQUEST
+    assert "user temp" in excinfo.value.detail
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows profile boundary")
+def test_request_scoped_grants_omits_ambient_profile_outside_user_temp(tmp_path):
+    leaf = tmp_path / "request"
+    leaf.mkdir()
+
+    grants = request_scoped_grants(
+        {"USERPROFILE": os.environ["USERPROFILE"]}, str(leaf)
+    )
+
+    assert grants[0] == ContainerGrant(str(leaf), "modify")
+    # The ambient value earns no leaf of its own. It may still appear as a
+    # derived non-inheritable traverse ancestor of the trusted leaf.
+    profile = os.path.normcase(os.path.normpath(os.environ["USERPROFILE"]))
+    assert {
+        grant.access
+        for grant in grants
+        if os.path.normcase(os.path.normpath(grant.path)) == profile
+    } <= {"traverse"}
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows known-folder boundary")
+def test_request_scoped_grants_rejects_untrusted_temp_fallback(tmp_path, monkeypatch):
+    leaf = tmp_path / "request"
+    leaf.mkdir()
+    monkeypatch.setattr(wac, "_known_folder_local_appdata", lambda: "")
+    monkeypatch.delenv("LOCALAPPDATA", raising=False)
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
+
+    with pytest.raises(AppContainerError) as excinfo:
+        request_scoped_grants({}, str(leaf))
+
+    assert excinfo.value.reason is AppContainerReason.INVALID_REQUEST
+    assert "user temp" in excinfo.value.detail
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows known-folder boundary")
+def test_request_scoped_grants_ignore_request_temp_override_for_user_boundary(
+    tmp_path, monkeypatch
+):
+    user_local = tmp_path / "user-local"
+    user_temp = user_local / "Temp"
+    worktree = user_temp / "aiworkhub-worktrees" / "repo" / "request" / "worktree"
+    worktree.mkdir(parents=True)
+    isolated_temp = user_temp / "runtime" / "worker" / "tmp"
+    isolated_temp.mkdir(parents=True)
+
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setattr(wac, "_known_folder_local_appdata", lambda: "")
+    monkeypatch.setenv("LOCALAPPDATA", str(user_local))
+
+    grants = request_scoped_grants(
+        {"TEMP": str(isolated_temp), "TMP": str(isolated_temp)}, str(worktree)
+    )
+    by_path = {
+        os.path.normcase(os.path.normpath(grant.path)): grant.access for grant in grants
+    }
+
+    assert by_path[os.path.normcase(os.path.normpath(str(worktree)))] == "modify"
+    assert by_path[os.path.normcase(os.path.normpath(str(worktree.parent)))] == "traverse"
+    # The request TEMP override cannot move the trusted boundary, but the
+    # trusted Temp directory and its parents are traversed through the volume
+    # root. The container has to walk them to open the leaf.
+    assert by_path[os.path.normcase(os.path.normpath(str(user_temp)))] == "traverse"
+    assert by_path[os.path.normcase(os.path.normpath(str(user_local)))] == "traverse"
+    assert by_path[os.path.normcase(os.path.normpath(user_local.anchor))] == "traverse"
+
+
+def _trusted_temp_topology(tmp_path, monkeypatch):
+    """The live NF-2026-01004 shape, on disk and trusted.
+
+    A profile whose AppData/Local/Temp is what _real_user_temp_root resolves
+    to, holding the request worktree and the HOME/.local/state directory
+    Grok/Kilo's Bun runtime realpath()s. The base is realpath'd first so the
+    spelled leaf and the resolved leaf are the same path on every host.
+
+    Returns (profile, local, temp, worktree, state).
+    """
+    base = Path(os.path.realpath(str(tmp_path)))
+    profile = base / "Users" / "shrek"
+    local = profile / "AppData" / "Local"
+    temp = local / "Temp"
+    worktree = temp / "aiworkhub-worktrees" / "a0a0c3ab" / "247cd5b6" / "worktree"
+    state = temp / "aiworkhub-runtime" / "247cd5b6" / "home" / ".local" / "state"
+    worktree.mkdir(parents=True)
+    state.mkdir(parents=True)
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(temp))
+    monkeypatch.setattr(wac, "_known_folder_local_appdata", lambda: "")
+    monkeypatch.setenv("LOCALAPPDATA", str(local))
+    return profile, local, temp, worktree, state
+
+
+def _keyed(grants):
+    return {os.path.normcase(os.path.normpath(g.path)): g for g in grants}
+
+
+def _key(path):
+    return os.path.normcase(os.path.normpath(str(path)))
+
+
+def test_request_scoped_grants_reach_the_volume_root_for_realpath(tmp_path, monkeypatch):
+    """NF-2026-01004, request 2567bb500f874a8694e4f265560a0336.
+
+    Grok/Kilo failed EPERM realpath on HOME/.local/state while the exact
+    AppContainer SID already had a minimal traverse ACE on AppData/Local/Temp:
+    the plan stopped at the trusted temp boundary, so the volume root, Users
+    and the profile above it had no ACE, and Bun opens every component.
+    """
+    profile, local, temp, worktree, state = _trusted_temp_topology(tmp_path, monkeypatch)
+    home = state.parents[1]
+
+    grants = request_scoped_grants(
+        {"HOME": str(home), "XDG_STATE_HOME": str(state)}, str(worktree)
+    )
+
+    by_path = _keyed(grants)
+    assert len(by_path) == len(grants), "the chain is deduplicated across leaves"
+    for leaf in (worktree, home, state):
+        assert by_path[_key(leaf)].access == "modify"
+    for ancestor in (temp, local, local.parent, profile, profile.parent, profile.anchor):
+        entry = by_path[_key(ancestor)]
+        assert entry.access == "traverse"
+        assert entry.persistent is False
+    order = [_key(grant.path) for grant in grants]
+    leaf_keys = [_key(leaf) for leaf in (worktree, home, state)]
+    assert order[: len(leaf_keys)] == leaf_keys, "every leaf is reserved first"
+    # Complete, and nearest-first for the first leaf walked -- nothing above it
+    # has been seen yet, so its entries are the whole chain in walk order.
+    chain = [_key(parent) for parent in Path(os.path.normpath(str(worktree))).parents]
+    assert [key for key in order if key in set(chain)] == chain
+    for leaf in (home, state):
+        parents = {_key(parent) for parent in Path(os.path.normpath(str(leaf))).parents}
+        assert parents <= set(order), "a later leaf's chain is complete too"
+    # Deduplication may hoist a shared ancestor, but never above every leaf it
+    # sits over: each entry follows one, so LIFO teardown releases an ancestor
+    # before the leaf that justified it.
+    for index, key in enumerate(order[len(leaf_keys) :], start=len(leaf_keys)):
+        assert any(
+            wac._within(leaf, key) for leaf in order[:index] if leaf in set(leaf_keys)
+        )
+    assert {grant.access for grant in grants} == {"modify", "traverse"}
+
+
+def test_request_scoped_grants_chain_only_follows_trusted_temp_leaves(
+    tmp_path, monkeypatch
+):
+    profile, _local, _temp, worktree, _state = _trusted_temp_topology(
+        tmp_path, monkeypatch
+    )
+    outside = profile / "Dev" / "AIWorkHub"
+    outside.mkdir(parents=True)
+
+    grants = request_scoped_grants({"CODEX_HOME": str(outside)}, str(worktree))
+
+    keys = set(_keyed(grants))
+    assert _key(outside) not in keys
+    assert _key(outside.parent) not in keys
+    assert _key(profile) in keys
+    with pytest.raises(AppContainerError) as excinfo:
+        request_scoped_grants({}, str(outside))
+    assert excinfo.value.reason is AppContainerReason.INVALID_REQUEST
+    assert "user temp" in excinfo.value.detail
+
+
+@pytest.mark.parametrize("case", ["standalone", "unrelated_leaf", "persistent_leaf"])
+def test_a_root_traverse_grant_needs_a_revocable_trusted_leaf(
+    tmp_path, monkeypatch, case
+):
+    """Only a chain tied to something this launch revokes may touch the root."""
+    profile, _local, _temp, worktree, _state = _trusted_temp_topology(
+        tmp_path, monkeypatch
+    )
+    grants = [ContainerGrant(profile.anchor, "traverse")]
+    if case == "unrelated_leaf":
+        unrelated = profile / "Dev"
+        unrelated.mkdir(parents=True)
+        grants.append(ContainerGrant(str(unrelated), "modify"))
+    elif case == "persistent_leaf":
+        grants.append(ContainerGrant(str(worktree), "read_execute", persistent=True))
+
+    fake = FakeWin32Api()
+    assert "protected tree" in _refused(grants, fake)
+
+
+def test_a_traverse_ancestor_may_never_be_persistent(tmp_path, monkeypatch):
+    profile, _local, _temp, worktree, _state = _trusted_temp_topology(
+        tmp_path, monkeypatch
+    )
+    grants = [
+        ContainerGrant(str(worktree), "modify"),
+        ContainerGrant(profile.anchor, "traverse", persistent=True),
+    ]
+
+    detail = _refused(grants, FakeWin32Api())
+    assert "must be revoked" in detail
+
+
+def test_the_derived_ancestor_chain_launches_and_revokes_lifo(tmp_path, monkeypatch):
+    profile, _local, _temp, worktree, state = _trusted_temp_topology(
+        tmp_path, monkeypatch
+    )
+    grants = request_scoped_grants({"XDG_STATE_HOME": str(state)}, str(worktree))
+    assert _key(profile.anchor) in _keyed(grants)
+
+    fake = FakeWin32Api()
+    launch = launch_appcontainer(make_request(filesystem_grants=grants), api=fake)
+
+    assert _grant_events(fake) == [f"grant:{g.access}:{g.path}" for g in grants]
+    assert [g.path for g in launch.grants] == [g.path for g in grants]
+    fake.events.clear()
+
+    launch.close()
+    # LIFO: the volume root is released first and each leaf last.
+    assert _grant_events(fake) == [f"revoke:{g.path}" for g in reversed(grants)]
+    assert launch.grants == []
+    assert launch.cleanup_evidence()["outstanding_grants"] == []
+
+
+def test_unstatable_tied_traverse_ancestors_still_launch(tmp_path, monkeypatch):
+    """The validation AppContainer cannot stat the profile above its subtree.
+
+    That is the live failure, not proof those directories are missing. A tied
+    non-persistent traverse ancestor must still be admitted.
+    """
+    profile, local, temp, worktree, state = _trusted_temp_topology(
+        tmp_path, monkeypatch
+    )
+    grants = request_scoped_grants({"XDG_STATE_HOME": str(state)}, str(worktree))
+    blocked = {
+        _key(temp),
+        _key(local),
+        _key(local.parent),
+        _key(profile),
+        _key(profile.parent),
+        _key(profile.anchor),
+    }
+    real_lstat = os.lstat
+
+    def denied(path, *args, **kwargs):
+        if _key(path) in blocked:
+            err = PermissionError(13, "Access is denied")
+            err.winerror = 5
+            raise err
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "lstat", denied)
+    fake = FakeWin32Api()
+    launch = launch_appcontainer(make_request(filesystem_grants=grants), api=fake)
+    launch.close()
+    assert _key(profile.anchor) in {
+        _key(event.removeprefix("grant:traverse:"))
+        for event in fake.events
+        if event.startswith("grant:traverse:")
+    }
+    assert _grant_events(fake)[-len(grants) :] == [
+        f"revoke:{g.path}" for g in reversed(grants)
+    ]
+
+
+def test_the_traverse_mask_carries_no_list_read_write_or_delete_right():
+    """NF-2026-01004 widened where a traverse ACE may be written, not what it is."""
+    traverse = wac._GRANT_ACCESS_MASKS["traverse"]
+    assert traverse == 0x00020000 | 0x0080 | 0x0020 == 0x000200A0
+    forbidden = (
+        0x0001  # FILE_LIST_DIRECTORY / FILE_READ_DATA
+        | 0x0002  # FILE_WRITE_DATA / FILE_ADD_FILE
+        | 0x0004  # FILE_APPEND_DATA / FILE_ADD_SUBDIRECTORY
+        | 0x0010  # FILE_WRITE_EA
+        | 0x0100  # FILE_WRITE_ATTRIBUTES
+        | 0x00010000  # DELETE
+        | 0x00040000  # WRITE_DAC
+        | 0x00080000  # WRITE_OWNER
+    )
+    assert traverse & forbidden == 0
+    assert traverse & wac._GRANT_ACCESS_MASKS["modify"] == traverse
 
 
 # -- real ctypes boundary against recording advapi32/kernel32 doubles --------
@@ -2425,6 +2783,25 @@ def test_ctypes_revocable_grant_writes_and_revoke_removes_only_this_sid(
     assert grant.revoke_error is None
     api.revoke_path_access(grant)
     assert len(lib.set_calls) == 2
+
+
+def test_ctypes_traverse_grant_is_minimal_and_non_inheritable(
+    tmp_path, monkeypatch
+):
+    lib = FakeSecurityLib()
+    api = _security_api(lib, monkeypatch)
+
+    grant = api.grant_path_access(_identity(), str(tmp_path), "traverse")
+
+    # READ_CONTROL | FILE_READ_ATTRIBUTES | FILE_TRAVERSE only.  Inheritance
+    # must stay zero so an ancestor grant cannot expose unrelated descendants.
+    assert lib.entries == [(1, 0x000200A0, _GRANT, 0, 0, _SID, 222)]
+    assert lib.set_calls == [(str(tmp_path), 0x4 | 0x20000000, 333)]
+    assert grant.restore == _SID
+
+    api.revoke_path_access(grant)
+    assert lib.entries[-1] == (1, 0, _REVOKE, 0, 0, _SID, 222)
+    assert grant.revoke_error is None
 
 
 def test_ctypes_persistent_grant_already_present_rewrites_nothing(

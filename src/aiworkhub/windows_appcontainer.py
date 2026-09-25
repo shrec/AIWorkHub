@@ -31,6 +31,7 @@ import os
 import re
 import secrets
 import stat
+import tempfile
 import threading
 import time
 from ctypes import wintypes
@@ -230,11 +231,13 @@ def _map_reason(operation: str | None, win_error: int | None) -> AppContainerRea
 
 # Access masks written into the container's ACE.  "read_execute" is icacls RX
 # (FILE_GENERIC_READ | FILE_GENERIC_EXECUTE); "modify" is icacls M, which adds
-# FILE_GENERIC_WRITE and DELETE but never WRITE_DAC or WRITE_OWNER, so the
-# container can use a granted tree and never re-permission it.
+# FILE_GENERIC_WRITE and DELETE but never WRITE_DAC or WRITE_OWNER.  "traverse"
+# is the non-inheritable minimum for an existing ancestor: READ_CONTROL,
+# FILE_READ_ATTRIBUTES and FILE_TRAVERSE only.
 _GRANT_ACCESS_MASKS: dict[str, int] = {
     "read_execute": 0x001200A9,
     "modify": 0x001301BF,
+    "traverse": 0x000200A0,
 }
 
 
@@ -242,10 +245,10 @@ _GRANT_ACCESS_MASKS: dict[str, int] = {
 class ContainerGrant:
     """One filesystem path this launch's own container SID may use.
 
-    ``access`` is ``"read_execute"`` or ``"modify"``.  A grant is revoked --
-    this container SID's explicit ACEs removed from the path again -- when the
-    launch closes or fails, unless ``persistent`` is set (read only; see
-    :func:`launch_appcontainer` for when that is the right choice).
+    ``access`` is ``"read_execute"``, ``"modify"`` or ``"traverse"``.
+    A grant is revoked -- this container SID's explicit ACEs removed from the
+    path again -- when the launch closes or fails, unless ``persistent`` is
+    set (read_execute only; see :func:`launch_appcontainer`).
     """
 
     path: str
@@ -253,22 +256,123 @@ class ContainerGrant:
     persistent: bool = False
 
 
-# Where a launcher names a request's isolated HOME and its request temp.
-_REQUEST_SCOPED_ENV_KEYS = ("HOME", "USERPROFILE", "TMP", "TEMP", "TMPDIR")
+# Where a launcher names a request's isolated HOME, provider state, and temp.
+_REQUEST_SCOPED_ENV_KEYS = (
+    "HOME",
+    "USERPROFILE",
+    "TMP",
+    "TEMP",
+    "TMPDIR",
+    "XDG_STATE_HOME",
+    "CODEX_HOME",
+)
+
+
+def _real_user_temp_root() -> str:
+    """Resolve the user's OS temp boundary independently of request TEMP/TMP."""
+
+    if os.name == "nt":
+        local_appdata = ""
+        try:
+            local_appdata = _known_folder_local_appdata()
+        except (AppContainerError, OSError, ValueError):
+            pass
+        # SHGetKnownFolderPath can return no path after USERPROFILE is replaced
+        # with the request-local HOME. LOCALAPPDATA is preserved separately by
+        # the trusted launcher for CreateProcess and still names the host user.
+        local_appdata = local_appdata or os.environ.get("LOCALAPPDATA", "").strip()
+        if local_appdata:
+            candidate = Path(local_appdata) / "Temp"
+            try:
+                return os.path.normcase(
+                    os.path.normpath(str(candidate.resolve(strict=True)))
+                )
+            except (OSError, ValueError):
+                # The validation AppContainer cannot open the host Temp it is
+                # already running under. The lexical path is still the boundary
+                # that decides which leaves earn a chain.
+                lexical = os.path.normcase(os.path.normpath(str(candidate)))
+                if lexical and os.path.isabs(lexical):
+                    return lexical
+        return ""
+    return os.path.normcase(
+        os.path.normpath(str(Path(tempfile.gettempdir()).resolve(strict=True)))
+    )
+
+
+def _request_traversal_anchor(value: str) -> str:
+    """Return trusted real user Temp when ``value`` resolves strictly inside it.
+
+    That boundary decides which leaves earn a request-scoped chain. It is not
+    where the chain stops: a container that cannot traverse a component cannot
+    open anything below it, so ancestors continue through the volume root.
+    Paths outside the boundary have no safe request-scoped grant plan.
+    """
+    if not value:
+        return ""
+    try:
+        candidate = os.path.normcase(os.path.normpath(str(Path(value).resolve())))
+        temp_root = _real_user_temp_root()
+        if os.path.commonpath((candidate, temp_root)) == temp_root:
+            return temp_root
+    except (OSError, ValueError):
+        pass
+    return ""
 
 
 def request_scoped_grants(
     environment: Mapping[str, str], *paths: str
 ) -> list[ContainerGrant]:
-    """Revocable modify grants on ``paths`` and on the HOME / temp directories
-    ``environment`` names -- one per distinct path, in that order."""
+    """Build the revocable request-path grant plan.
+
+    Each distinct requested leaf receives modify access. Every directory above
+    a leaf already proven strictly below trusted real user Temp receives only
+    non-inheritable traverse access, nearest-first in ``Path.parents`` order
+    through the volume root. An explicit path outside that boundary is refused;
+    an ambient environment path outside it is omitted and does not drag its own
+    siblings into the plan.
+    """
+    candidates = (
+        *((value, True) for value in paths),
+        *((environment.get(key, ""), False) for key in _REQUEST_SCOPED_ENV_KEYS),
+    )
+    values: list[str] = []
+    for value, explicit in candidates:
+        if not value:
+            continue
+        anchor = _request_traversal_anchor(value)
+        if not anchor or os.path.normcase(os.path.normpath(value)) == anchor:
+            if explicit:
+                raise AppContainerError(
+                    AppContainerReason.INVALID_REQUEST,
+                    detail=f"request path outside user temp boundary: {value!r}.",
+                )
+            continue
+        values.append(value)
     grants: list[ContainerGrant] = []
     seen: set[str] = set()
-    for value in (*paths, *(environment.get(k, "") for k in _REQUEST_SCOPED_ENV_KEYS)):
-        key = os.path.normcase(os.path.normpath(value)) if value else ""
-        if key and key not in seen:
+
+    # Reserve every leaf first so a path explicitly requested for modification
+    # can never be downgraded when it is also another leaf's ancestor.
+    for value in values:
+        key = os.path.normcase(os.path.normpath(value))
+        if key not in seen:
             seen.add(key)
             grants.append(ContainerGrant(value, "modify"))
+
+    # Path.parents order, nearest-first through the volume root. Do not stop at
+    # trusted Temp and do not skip a parent this process cannot stat: the
+    # validation AppContainer can see its granted subtree and the volume root
+    # but not the profile ancestors between them, and dropping those emits the
+    # volume root where the first leaf's chain still has the real Temp directory.
+    for value in values:
+        for parent in Path(os.path.normpath(value)).parents:
+            parent_text = os.path.normpath(str(parent))
+            key = os.path.normcase(parent_text)
+            if key in seen:
+                continue
+            seen.add(key)
+            grants.append(ContainerGrant(parent_text, "traverse"))
     return grants
 
 
@@ -1731,24 +1835,72 @@ def _validate_request(request: AppContainerRequest) -> None:
     _validate_grants(request.filesystem_grants)
 
 
+def _permission_denied(exc: OSError) -> bool:
+    """True for the Win32 access-denied failures a container sees as absence."""
+
+    winerror = getattr(exc, "winerror", None)
+    return isinstance(exc, PermissionError) or winerror in (5, 65)
+
+
+def _revocable_temp_leaves(grants: Sequence[ContainerGrant]) -> frozenset[str]:
+    """Normcased revocable leaves of ``grants`` strictly below trusted Temp.
+
+    A leaf here is a per-request directory this launch revokes: modify or
+    read_execute, not persistent, and proven by
+    :func:`_request_traversal_anchor` to resolve strictly inside the real user
+    temporary directory. Only those leaves may justify a traverse ACE on a
+    protected ancestor, because revoking the leaf bounds the chain above it.
+    """
+    leaves: set[str] = set()
+    for grant in grants:
+        if (
+            not isinstance(grant, ContainerGrant)
+            or not isinstance(grant.path, str)
+            or grant.persistent
+            or grant.access == "traverse"
+        ):
+            continue
+        anchor = _request_traversal_anchor(grant.path)
+        canonical = os.path.normcase(os.path.normpath(grant.path))
+        if anchor and canonical != anchor:
+            leaves.add(canonical)
+    return frozenset(leaves)
+
+
 def _validate_grants(grants: Sequence[ContainerGrant]) -> None:
     """Refuse any grant that could land somewhere other than the path it names.
 
-    Runs before any grant or launch call.  SetNamedSecurityInfoW follows
+    Runs before any grant or launch call. SetNamedSecurityInfoW follows
     reparse points, so a symlink or junction -- at the leaf, or in an ancestor,
-    which is what comparing against ``realpath`` exposes -- would re-permission
-    a target the caller never named.  UNC, ``\\\\?\\``, ``\\\\.\\`` and
-    admin-share spellings are refused outright: they alias local trees past
-    every string comparison below, and AIWorkHub never needs one.  No grant,
-    read or modify, persistent or not, may equal or contain a protected tree,
-    nor lie anywhere inside a system tree (:func:`_sensitive_roots`): a read
-    grant on the profile is as much a leak as a write grant.  Finally, a
-    revocable grant may not overlap a persistent one, because its revoke
-    removes every explicit ACE of the SID on its path.
+    which is what comparing against realpath exposes -- would re-permission a
+    target the caller never named. UNC, device and admin-share spellings are
+    refused outright. No grant may expose a protected tree, and none may touch
+    a system tree at all. The single exception is a non-persistent traverse
+    entry on a protected tree or the volume root, tied to a revocable leaf
+    below trusted user Temp. A standalone or unrelated root traverse grant has
+    no such leaf and stays refused. A traverse ancestor this process cannot
+    stat is that same chain, not a missing path: the validation AppContainer
+    cannot open the profile above its granted subtree.
     """
     protected: list[str] | None = None
     system: list[str] = []
-    checked: list[tuple[str, bool]] = []
+    leaves: frozenset[str] | None = None
+    checked: list[tuple[str, bool, str]] = []
+
+    def tied(canonical: str) -> bool:
+        nonlocal leaves
+        if leaves is None:
+            leaves = _revocable_temp_leaves(grants)
+        return any(leaf != canonical and _within(leaf, canonical) for leaf in leaves)
+
+    def protected_detail(path: str) -> str:
+        return (
+            "grant would equal or contain a protected tree (drive root, "
+            "user profile, AppData, user temp) with no revocable leaf below "
+            "trusted user temp to tie it to, or touch the Windows or "
+            f"Program Files trees: {path!r}."
+        )
+
     for grant in grants:
         if not isinstance(grant, ContainerGrant) or not isinstance(grant.path, str):
             raise AppContainerError(
@@ -1761,11 +1913,13 @@ def _validate_grants(grants: Sequence[ContainerGrant]) -> None:
                 AppContainerReason.INVALID_REQUEST,
                 detail=f"unknown grant access {grant.access!r} for {path!r}.",
             )
-        if grant.persistent and grant.access == "modify":
-            # Only read access to shared install roots may outlive a launch.
+        if grant.persistent and grant.access != "read_execute":
             raise AppContainerError(
                 AppContainerReason.INVALID_REQUEST,
-                detail=f"a modify grant is always revoked, never persistent: {path!r}.",
+                detail=(
+                    "only read_execute grants may be persistent; "
+                    f"{grant.access!r} must be revoked: {path!r}."
+                ),
             )
         if not path or "\x00" in path or not os.path.isabs(path):
             raise AppContainerError(
@@ -1776,17 +1930,32 @@ def _validate_grants(grants: Sequence[ContainerGrant]) -> None:
             # Checked before lstat so an admin share is never even touched.
             raise AppContainerError(
                 AppContainerReason.INVALID_REQUEST,
-                detail=f"UNC, device and \\\\?\\ paths are never granted: {path!r}.",
+                detail=f"UNC, device and admin-share paths are never granted: {path!r}.",
             )
+        canonical = os.path.normcase(os.path.normpath(path))
         try:
             info = os.lstat(path)
-        except OSError:
+        except OSError as exc:
+            if (
+                _permission_denied(exc)
+                and grant.access == "traverse"
+                and not grant.persistent
+                and tied(canonical)
+            ):
+                if protected is None:
+                    protected, system = _sensitive_roots()
+                if any(_within(canonical, root) for root in system):
+                    raise AppContainerError(
+                        AppContainerReason.INVALID_REQUEST,
+                        detail=protected_detail(path),
+                    )
+                checked.append((canonical, grant.persistent, grant.access))
+                continue
             raise AppContainerError(
                 AppContainerReason.INVALID_REQUEST,
                 detail=f"grant path does not exist: {path!r}.",
             ) from None
         reparse = getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
-        canonical = os.path.normcase(os.path.normpath(path))
         if (
             stat.S_ISLNK(info.st_mode)
             or reparse
@@ -1798,30 +1967,33 @@ def _validate_grants(grants: Sequence[ContainerGrant]) -> None:
             )
         if protected is None:
             protected, system = _sensitive_roots()
-        if (
-            os.path.dirname(canonical) == canonical
-            or any(_within(root, canonical) for root in (*protected, *system))
-            or any(_within(canonical, root) for root in system)
-        ):
+        exposes = os.path.dirname(canonical) == canonical or any(
+            _within(root, canonical) for root in (*protected, *system)
+        )
+        if exposes and grant.access == "traverse" and not grant.persistent:
+            exposes = not tied(canonical)
+        if exposes or any(_within(canonical, root) for root in system):
             raise AppContainerError(
                 AppContainerReason.INVALID_REQUEST,
-                detail=(
-                    "grant would equal or contain a protected tree (drive root, "
-                    "user profile, AppData, user temp) or touch the Windows or "
-                    f"Program Files trees: {path!r}."
-                ),
+                detail=protected_detail(path),
             )
-        checked.append((canonical, grant.persistent))
-    for path, persistent in checked:
+        checked.append((canonical, grant.persistent, grant.access))
+    for path, persistent, access in checked:
         if not persistent and any(
-            other_persistent and (_within(path, other) or _within(other, path))
-            for other, other_persistent in checked
+            other_persistent
+            and (
+                path == other
+                or (
+                    access != "traverse"
+                    and (_within(path, other) or _within(other, path))
+                )
+            )
+            for other, other_persistent, _other_access in checked
         ):
             raise AppContainerError(
                 AppContainerReason.INVALID_REQUEST,
                 detail=f"revocable grant overlaps a persistent grant: {path!r}.",
             )
-
 
 def _within(child: str, parent: str) -> bool:
     """``child`` equals ``parent`` or lies beneath it (both normcased)."""
@@ -1881,18 +2053,15 @@ def _with_protected_descendants(
     api: Win32Api,
     withheld_directories: Sequence[str] = (),
 ) -> list[ContainerGrant]:
-    """``grants``, each revocable directory followed by the protected
-    directories beneath it, granted the same access.
+    """Expand inheritable revocable grants to protected descendants.
 
     A directory grant is one inheritable ACE, and a protected DACL stops
     inheritance.  AIWorkHub creates owner-private subdirectories inside its
     per-request directories -- measured: ``home\\task_mcp_worker_runtime``
     kept the container out of ``claude_mcp_config.json`` (EPERM) although
     HOME itself was granted -- so each protected directory gets its own ACE.
-    Only revocable grants are walked: they name one request's own
-    directories, while a persistent grant names a shared install root, whose
-    protected corners are not the container's business.  Every added path
-    passes :func:`_validate_grants` like the rest.
+    Persistent install-root grants and non-inheritable ancestor traverse grants
+    are never walked.  Every added path passes :func:`_validate_grants`.
 
     ``withheld_directories`` stay closed: that same protection is what keeps
     them out of an inheritable grant above them, so each must be an existing,
@@ -1912,7 +2081,11 @@ def _with_protected_descendants(
     plan: list[ContainerGrant] = []
     for grant in grants:
         plan.append(grant)
-        if grant.persistent or not os.path.isdir(grant.path):
+        if (
+            grant.persistent
+            or grant.access == "traverse"
+            or not os.path.isdir(grant.path)
+        ):
             continue
         try:
             descendants: list[str] = _step(
@@ -2396,7 +2569,11 @@ class _CtypesWin32Api:
         snapshot that would clobber a concurrent DACL edit.
         """
         mask = _GRANT_ACCESS_MASKS[access]
-        inherit = _SUB_CONTAINERS_AND_OBJECTS_INHERIT if os.path.isdir(path) else 0
+        inherit = (
+            0
+            if access == "traverse"
+            else _SUB_CONTAINERS_AND_OBJECTS_INHERIT if os.path.isdir(path) else 0
+        )
         sid = ctypes.string_at(
             identity.sid_token, self._advapi32.GetLengthSid(identity.sid_token)
         )
