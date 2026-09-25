@@ -12,8 +12,12 @@ without ever leaving a child running outside the job.
 from __future__ import annotations
 
 import ctypes
+import getpass
 import json
 import os
+import shutil
+import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -3958,3 +3962,210 @@ def test_the_appcontainer_lane_skip_marks_exactly_the_seven_privileged_tests():
     parametrize_marks = [m for m in parametrized.pytestmark if m.name == "parametrize"]
     assert len(parametrize_marks) == 1
     assert list(parametrize_marks[0].args[1]) == ["directory", "file"]
+
+
+def test_nested_lsp_helper_cwd_budget_names_the_measured_winerror_267_limit():
+    """The CreateProcess cwd limit that turned lsp.status into unavailable.
+
+    Measured: an existing cwd of 258 characters spawns; 259 and above raise
+    NotADirectoryError WinError 267. A live AppContainer saw the same error
+    on an existing 299-character cwd and spawned a 49-character cwd. This
+    test locks the budget those measurements imply. It does not itself launch
+    an AppContainer.
+    """
+
+    from aiworkhub.validation_runner import (
+        CREATEPROCESS_CWD_MAX_CHARS,
+        projected_nested_lsp_cwd_length,
+        temp_root_blocks_nested_lsp_helper,
+    )
+
+    assert CREATEPROCESS_CWD_MAX_CHARS == 258
+    assert temp_root_blocks_nested_lsp_helper("x" * 190, "shrek")
+    assert projected_nested_lsp_cwd_length("x" * 190, "shrek") > 258
+    assert not temp_root_blocks_nested_lsp_helper("x" * 46, "shrek")
+    assert projected_nested_lsp_cwd_length("x" * 46, "shrek") <= 258
+
+
+def test_helper_temp_plan_does_not_grant_a_workspace_outside_user_temp():
+    """A workspace or scratch outside trusted user Temp is not aliased or granted."""
+
+    outside = os.path.abspath(os.path.join(os.sep, "outside-nf980", "workspace"))
+    outside = outside + ("x" * 160)
+    env = {
+        "TMPDIR": outside,
+        "TEMP": outside,
+        "TMP": outside,
+        wac._VALIDATION_SCRATCH_ENV: outside,
+    }
+    request = make_request(
+        environment=env,
+        working_directory=outside,
+        filesystem_grants=(),
+    )
+    rewritten, disposable = wac.bind_validation_helper_temp(
+        request, username="shrek"
+    )
+    assert disposable is None
+    assert tuple(rewritten.filesystem_grants) == ()
+    assert rewritten.environment["TEMP"] == outside
+    assert rewritten.working_directory == outside
+
+
+def test_helper_temp_plan_leaves_a_non_validation_launch_unchanged():
+    long_temp = "T" * 220
+    request = make_request(
+        environment={"TEMP": long_temp, "TMP": long_temp, "TMPDIR": long_temp},
+        filesystem_grants=(),
+    )
+    rewritten, disposable = wac.bind_validation_helper_temp(
+        request, username="shrek"
+    )
+    assert disposable is None
+    assert rewritten.environment["TEMP"] == long_temp
+    assert tuple(rewritten.filesystem_grants) == ()
+
+
+@windows_only
+def test_validation_helper_temp_grant_plan_spawns_under_the_winerror_267_limit():
+    """The short private temp is the only new modify grant, and a helper cwd fits.
+
+    Live AppContainer validation of the LSP suite is not run here. The grant
+    plan is applied through the fake Win32 boundary; the Popen checks are host
+    CreateProcess calls at the planned length and at the measured denial length.
+    """
+
+    from aiworkhub.validation_runner import projected_nested_lsp_cwd_length
+
+    anchor = wac._real_user_temp_root()
+    if not anchor:
+        pytest.skip("trusted user temp is not resolvable")
+    probe = Path(anchor) / f"nf980-write-{os.getpid()}"
+    try:
+        probe.mkdir()
+    except OSError as exc:
+        pytest.skip(f"cannot create a private temp under the trusted root: {exc}")
+    else:
+        probe.rmdir()
+
+    user = getpass.getuser() or "unknown"
+    long_scratch = Path(anchor) / ("n" * 160)
+    denial_root = Path(anchor) / f"nf980-denial-{os.getpid()}"
+    launch = None
+    short = ""
+    try:
+        long_scratch.mkdir()
+        from aiworkhub.validation_runner import temp_root_blocks_nested_lsp_helper
+
+        assert temp_root_blocks_nested_lsp_helper(str(long_scratch), user)
+        outside = os.path.abspath(os.path.join(os.sep, "outside-nf980-root"))
+        env = {
+            "TMPDIR": str(long_scratch),
+            "TEMP": str(long_scratch),
+            "TMP": str(long_scratch),
+            wac._VALIDATION_SCRATCH_ENV: str(long_scratch),
+            "RUFF_CACHE_DIR": str(long_scratch),
+            "MYPY_CACHE_DIR": str(long_scratch),
+            "SYSTEMROOT": os.environ.get("SYSTEMROOT", r"C:\Windows"),
+        }
+        request = make_request(
+            environment=env,
+            working_directory=outside,
+            filesystem_grants=(),
+        )
+        fake = FakeWin32Api()
+        launch = launch_appcontainer(request, api=fake)
+        child_env = fake.spec.environment
+        short = child_env["TEMP"]
+        assert child_env["TMPDIR"] == short
+        assert child_env["TMP"] == short
+        assert child_env[wac._VALIDATION_SCRATCH_ENV] == short
+        assert child_env["RUFF_CACHE_DIR"] == short
+        assert child_env["MYPY_CACHE_DIR"] == short
+        assert fake.spec.working_directory == outside
+        assert projected_nested_lsp_cwd_length(short, user) <= 258
+        assert len(short) < len(str(long_scratch))
+
+        modify = [
+            event.split(":", 2)[2]
+            for event in fake.events
+            if event.startswith("grant:modify:")
+        ]
+        traverse = [
+            event.split(":", 2)[2]
+            for event in fake.events
+            if event.startswith("grant:traverse:")
+        ]
+        assert modify == [short]
+        assert outside not in modify
+        assert outside not in traverse
+        assert str(long_scratch) not in modify
+        short_key = os.path.normcase(os.path.normpath(short))
+        assert all(
+            wac._within(short_key, os.path.normcase(os.path.normpath(path)))
+            for path in traverse
+        )
+        assert not any(event.startswith("grant:read_execute:") for event in fake.events)
+        assert (
+            wac._GRANT_ACCESS_MASKS["modify"] & wac._GRANT_ACCESS_MASKS["read_execute"]
+            == wac._GRANT_ACCESS_MASKS["read_execute"]
+        )
+
+        projected = projected_nested_lsp_cwd_length(short, user)
+        nested = Path(short) / ("h" * (projected - len(short) - 1))
+        nested.mkdir()
+        assert len(str(nested)) == projected
+        assert len(str(nested)) <= 258
+        spawned = subprocess.Popen(
+            [sys.executable, "-c", "import os; raise SystemExit(len(os.getcwd()))"],
+            cwd=str(nested),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        _stdout, err = spawned.communicate(timeout=30)
+        assert spawned.returncode == projected, err
+
+        denial_root.mkdir()
+        remain = 259 - len(str(denial_root)) - 1
+        too_long = denial_root / ("d" * remain)
+        too_long.mkdir()
+        assert len(str(too_long)) == 259
+        assert too_long.is_dir()
+        with pytest.raises(NotADirectoryError) as excinfo:
+            subprocess.Popen(
+                [sys.executable, "-c", "print(1)"],
+                cwd=str(too_long),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        assert excinfo.value.winerror == 267
+    finally:
+        if launch is not None:
+            launch.close()
+        long_scratch.rmdir() if long_scratch.exists() else None
+        shutil.rmtree(denial_root, ignore_errors=True)
+    if short:
+        assert not Path(short).exists()
+
+
+def test_helper_temp_plan_fails_closed_when_no_short_private_temp_fits(monkeypatch):
+    """A too-long scratch is not granted, and neither is any path outside it."""
+
+    long = os.path.abspath(os.path.join(os.sep, "Users", "shrek", "Temp")) + ("n" * 160)
+    monkeypatch.setattr(wac.os, "name", "nt")
+    monkeypatch.setattr(
+        wac, "_request_traversal_anchor", lambda _value: os.path.dirname(long)
+    )
+    monkeypatch.setattr(wac, "_create_short_helper_temp", lambda _anchor, _user: None)
+    env = {
+        "TMPDIR": long,
+        "TEMP": long,
+        "TMP": long,
+        wac._VALIDATION_SCRATCH_ENV: long,
+    }
+    request = make_request(environment=env, filesystem_grants=(), working_directory=long)
+    with pytest.raises(AppContainerError) as excinfo:
+        wac.bind_validation_helper_temp(request, username="shrek")
+    assert excinfo.value.reason is AppContainerReason.INVALID_REQUEST
+    assert "no shorter private temp" in excinfo.value.detail
+    assert tuple(request.filesystem_grants) == ()

@@ -1094,8 +1094,58 @@ def assert_card_validation_sandbox_runnable(
         if reason is not None:
             raise error_type(f"validation_command_unrunnable_in_sandbox:{reason}")
 
+# NF-2026-00980: CreateProcessW's lpCurrentDirectory limit, measured on this
+# host (Windows 11, CPython 3.12). An existing directory of 258 characters is
+# a valid subprocess cwd. 259 and above raise NotADirectoryError errno 20
+# WinError 267 ("The directory name is invalid") even though the directory
+# exists. The \\?\ prefix does not lift the limit. The same existing
+# 299-character directory failed inside a live AppContainer with that exact
+# WinError, while a 49-character cwd in that same container spawned. WinError
+# 5 (access denied) was not observed: the container could stat the long
+# directory. Nested Source Graph LSP helper cwd is
+# <repo>/.aiworkhub/source_graph/lsp/<16 hex> under pytest's tmp_path.
+CREATEPROCESS_CWD_MAX_CHARS = 258
+LSP_PRIVATE_CWD_SUFFIX = "/.aiworkhub/source_graph/lsp/" + ("0" * 16)
+
+
+def nested_lsp_helper_cwd_overhead(username: str) -> int:
+    """Characters pytest and the private LSP workspace add under a temp root.
+
+    pytest 9 places tmp_path at
+    ``{temp}/pytest-of-{user}/pytest-{n}/{name[:30]}{n}/``. The transport
+    then adds ``<fixture>/.aiworkhub/source_graph/lsp/<16 hex>``. Reserves
+    cover a five-digit session number, the 30-character pytest node cap, and a
+    48-character fixture leaf (the integration suite's longest is 35).
+    """
+
+    user = username or "unknown"
+    session = "pytest-99999"
+    test_dir = "n" * 30 + "9999"
+    fixture = "f" * 48
+    relative = (
+        f"pytest-of-{user}/{session}/{test_dir}/{fixture}{LSP_PRIVATE_CWD_SUFFIX}"
+    )
+    return len(relative)
+
+
+def projected_nested_lsp_cwd_length(temp_root: str, username: str) -> int:
+    """Length of the nested LSP helper cwd if pytest uses ``temp_root``."""
+
+    return len(temp_root.rstrip("\\/")) + 1 + nested_lsp_helper_cwd_overhead(username)
+
+
+def temp_root_blocks_nested_lsp_helper(temp_root: str, username: str) -> bool:
+    """True when a helper Popen cwd under ``temp_root`` would hit WinError 267."""
+
+    return (
+        projected_nested_lsp_cwd_length(temp_root, username)
+        > CREATEPROCESS_CWD_MAX_CHARS
+    )
+
 
 __all__ = [
+    "CREATEPROCESS_CWD_MAX_CHARS",
+    "LSP_PRIVATE_CWD_SUFFIX",
     "RESTRICTION_ABSENT_INTERPRETER",
     "RESTRICTION_FORBIDDEN_SPAWN",
     "RESTRICTION_FULL_REPOSITORY_SUITE",
@@ -1119,10 +1169,13 @@ __all__ = [
     "dash_m_validator_modules",
     "decode_trusted_semlock_exit",
     "exec_scratch_denied_restriction",
+    "nested_lsp_helper_cwd_overhead",
     "preflight_semlock_capability",
     "probe_multiprocessing_semlock",
+    "projected_nested_lsp_cwd_length",
     "row_restriction",
     "sandbox_can_grant_semlock",
     "sandbox_unrunnable_reason",
+    "temp_root_blocks_nested_lsp_helper",
     "trusted_semlock_probe_argv",
 ]

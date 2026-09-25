@@ -30,6 +30,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import stat
 import tempfile
 import threading
@@ -41,8 +42,10 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol, Sequence, cast
 
 try:
+    from .validation_runner import temp_root_blocks_nested_lsp_helper
     from .windows_job_structures import JOBOBJECT_EXTENDED_LIMIT_INFORMATION
 except ImportError:  # direct-script entrypoint
+    from validation_runner import temp_root_blocks_nested_lsp_helper
     from windows_job_structures import JOBOBJECT_EXTENDED_LIMIT_INFORMATION
 
 __all__ = [
@@ -575,6 +578,9 @@ class AppContainerLaunch:
     )
     # Persistent grants as applied: (path, satisfied_by or "granted").
     persistent_grants: list[tuple[str, str]] = field(default_factory=list, repr=False)
+    # Short private temp created so a nested LSP helper cwd fits CreateProcess.
+    # Removed after grants are revoked. Not a grant on any other path.
+    disposable_temp: str | None = field(default=None, repr=False)
     closed: bool = field(default=False, repr=False)
     _process_handle_owned: bool = field(default=True, init=False, repr=False)
     _job_handle_owned: bool = field(default=True, init=False, repr=False)
@@ -673,36 +679,44 @@ class AppContainerLaunch:
     def close(self) -> None:
         """Release the process and job handles, then revoke the filesystem
         grants.  Idempotent."""
-        if self.closed:
-            return
-        first_error: Exception | None = None
-        if self._process_handle_owned:
-            try:
-                self.api.close_process_handle(self.creation)
-                self._process_handle_owned = False
-            except Exception as exc:
-                first_error = exc
-        if self._job_handle_owned:
-            try:
-                self.api.close_job(self.job)
-                self._job_handle_owned = False
-            except Exception as exc:
-                if first_error is None:
+        temp = self.disposable_temp
+        self.disposable_temp = None
+        try:
+            if self.closed:
+                return
+            first_error: Exception | None = None
+            if self._process_handle_owned:
+                try:
+                    self.api.close_process_handle(self.creation)
+                    self._process_handle_owned = False
+                except Exception as exc:
                     first_error = exc
-        # Revoked even when a handle close failed: narrowing a possibly live
-        # tree's access is always the safer direction.  Popping in reverse
-        # order restores nested paths LIFO and makes a second close a no-op.
-        while self.grants:
-            grant = self.grants.pop()
-            try:
-                self.api.revoke_path_access(grant)
-            except Exception:
-                pass  # the boundary contract is never to raise; belt and braces
-            if grant.revoke_error is not None:
-                self.grant_revoke_failures.append((grant.path, grant.revoke_error))
-        self.closed = not self._process_handle_owned and not self._job_handle_owned
-        if first_error is not None:
-            raise first_error
+            if self._job_handle_owned:
+                try:
+                    self.api.close_job(self.job)
+                    self._job_handle_owned = False
+                except Exception as exc:
+                    if first_error is None:
+                        first_error = exc
+            # Revoked even when a handle close failed: narrowing a possibly live
+            # tree's access is always the safer direction.  Popping in reverse
+            # order restores nested paths LIFO and makes a second close a no-op.
+            while self.grants:
+                grant = self.grants.pop()
+                try:
+                    self.api.revoke_path_access(grant)
+                except Exception:
+                    pass  # the boundary contract is never to raise; belt and braces
+                if grant.revoke_error is not None:
+                    self.grant_revoke_failures.append((grant.path, grant.revoke_error))
+            self.closed = not self._process_handle_owned and not self._job_handle_owned
+            if first_error is not None:
+                raise first_error
+        finally:
+            # After the ACE is gone. Never follow a reparse point out of the
+            # private leaf this launch created.
+            if temp:
+                _discard_helper_temp(temp)
 
     def cleanup_evidence(self) -> dict[str, object]:
         """Structured, serializable evidence about the owned resources."""
@@ -1638,6 +1652,172 @@ def _boundary_omits_dacl_write(path: str) -> bool:
     return canonical in _dacl_write_omit_keys()
 
 
+
+
+_VALIDATION_SCRATCH_ENV = "AIWORKHUB_VALIDATION_EXEC_SCRATCH_ROOT"
+_HELPER_TEMP_ENV_KEYS = ("TMPDIR", "TEMP", "TMP")
+_HELPER_TEMP_ALIAS_KEYS = (
+    _VALIDATION_SCRATCH_ENV,
+    "RUFF_CACHE_DIR",
+    "MYPY_CACHE_DIR",
+)
+_HELPER_TEMP_PARENT = "awh"
+
+
+def _pytest_username() -> str:
+    """The name pytest uses for ``pytest-of-{user}``, or ``unknown``."""
+
+    try:
+        import getpass
+
+        return getpass.getuser() or "unknown"
+    except (ImportError, OSError, KeyError):
+        return "unknown"
+
+
+def _same_path(left: str, right: str) -> bool:
+    if not left or not right:
+        return False
+    return os.path.normcase(os.path.normpath(left)) == os.path.normcase(
+        os.path.normpath(right)
+    )
+
+
+def _effective_temp(environment: Mapping[str, str]) -> str:
+    """The temp Python's ``tempfile`` consults first: TMPDIR, then TEMP, then TMP."""
+
+    for key in _HELPER_TEMP_ENV_KEYS:
+        value = environment.get(key, "")
+        if value:
+            return value
+    return ""
+
+
+def _discard_helper_temp(path: str) -> None:
+    """Remove one short helper leaf. Never follow a reparse point."""
+
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return
+    reparse = getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+    if stat.S_ISLNK(info.st_mode) or reparse or not stat.S_ISDIR(info.st_mode):
+        return
+    if os.path.normcase(Path(path).parent.name) != os.path.normcase(_HELPER_TEMP_PARENT):
+        return
+    shutil.rmtree(path, ignore_errors=True)
+
+
+def _create_short_helper_temp(anchor: str, username: str) -> Path | None:
+    """A real directory under trusted Temp, short enough for the nested helper cwd."""
+
+    parent = Path(anchor) / _HELPER_TEMP_PARENT
+    try:
+        parent.mkdir(exist_ok=True)
+    except OSError:
+        return None
+    if parent.is_symlink() or not parent.is_dir():
+        return None
+    for _attempt in range(8):
+        leaf = parent / secrets.token_hex(4)
+        try:
+            leaf.mkdir()
+        except FileExistsError:
+            continue
+        except OSError:
+            return None
+        if temp_root_blocks_nested_lsp_helper(str(leaf), username):
+            _discard_helper_temp(str(leaf))
+            return None
+        return leaf
+    return None
+
+
+def bind_validation_helper_temp(
+    request: AppContainerRequest,
+    *,
+    username: str | None = None,
+) -> tuple[AppContainerRequest, str | None]:
+    """Rebind a too-long validation scratch to one short private temp.
+
+    NF-2026-00980. The measured denial is CreateProcessW rejecting the nested
+    LSP helper cwd with WinError 267, not a missing execute ACE and not a
+    generic spawn ban. Only a validation launch whose scratch is the temp
+    pytest will use, and only when that scratch resolves strictly inside
+    trusted user Temp, is rewritten. The added grants are that short leaf
+    (modify, which includes execute, so a helper created under it is
+    executable) and the traverse ancestors :func:`request_scoped_grants`
+    already emits for a path inside the boundary. A scratch or workspace
+    outside that boundary is not aliased and not granted. A launch without
+    the validation scratch env is left unchanged.
+    """
+
+    if os.name != "nt" or request.environment is None:
+        return request, None
+    environment = dict(request.environment)
+    scratch = environment.get(_VALIDATION_SCRATCH_ENV, "")
+    effective = _effective_temp(environment)
+    if not scratch or not _same_path(scratch, effective):
+        return request, None
+    user = username if username is not None else _pytest_username()
+    if not temp_root_blocks_nested_lsp_helper(effective, user):
+        return request, None
+    anchor = _request_traversal_anchor(effective)
+    if not anchor:
+        return request, None
+    leaf = _create_short_helper_temp(anchor, user)
+    if leaf is None:
+        raise AppContainerError(
+            AppContainerReason.INVALID_REQUEST,
+            detail=(
+                "validation temp is too long for the nested LSP helper cwd "
+                f"and no shorter private temp fits under {anchor!r}."
+            ),
+        )
+    short = str(leaf)
+    try:
+        extra = request_scoped_grants({}, short)
+    except Exception:
+        _discard_helper_temp(short)
+        raise
+    grants = list(request.filesystem_grants)
+    seen = {
+        (
+            os.path.normcase(os.path.normpath(grant.path)),
+            grant.access,
+            grant.persistent,
+        )
+        for grant in grants
+        if isinstance(grant, ContainerGrant)
+    }
+    for grant in extra:
+        key = (
+            os.path.normcase(os.path.normpath(grant.path)),
+            grant.access,
+            grant.persistent,
+        )
+        if key not in seen:
+            seen.add(key)
+            grants.append(grant)
+    rewritten = dict(environment)
+    for key in (*_HELPER_TEMP_ENV_KEYS, *_HELPER_TEMP_ALIAS_KEYS):
+        current = rewritten.get(key, "")
+        if current and _same_path(current, effective):
+            rewritten[key] = short
+    cwd = request.working_directory
+    if cwd and _same_path(cwd, effective):
+        cwd = short
+    return (
+        replace(
+            request,
+            environment=rewritten,
+            filesystem_grants=tuple(grants),
+            working_directory=cwd,
+        ),
+        short,
+    )
+
+
 def launch_appcontainer(
     request: AppContainerRequest, *, api: Win32Api | None = None
 ) -> AppContainerLaunch:
@@ -1651,7 +1831,31 @@ def launch_appcontainer(
 
     ``api`` may be supplied to inject a mocked Windows boundary; when omitted a
     real ctypes-backed boundary is loaded lazily (Windows only).
+
+    A validation scratch whose nested LSP helper cwd would exceed CreateProcess's
+    measured limit is rebound to a short private temp before the child exists.
+    See :func:`bind_validation_helper_temp`.
     """
+
+    request, helper_temp = bind_validation_helper_temp(request)
+    try:
+        return _launch_prepared_appcontainer(
+            request, api=api, helper_temp=helper_temp
+        )
+    except BaseException:
+        if helper_temp:
+            _discard_helper_temp(helper_temp)
+        raise
+
+
+def _launch_prepared_appcontainer(
+    request: AppContainerRequest,
+    *,
+    api: Win32Api | None = None,
+    helper_temp: str | None = None,
+) -> AppContainerLaunch:
+    """Launch body for :func:`launch_appcontainer` after helper-temp binding."""
+
     _validate_request(request)
     # Every AppContainer launch -- worker supervisor, validation lane, anything
     # later -- passes through here, so the LOCALAPPDATA requirement is met once
@@ -1857,6 +2061,7 @@ def launch_appcontainer(
         creation=creation,
         grants=grants,
         persistent_grants=persistent_grants,
+        disposable_temp=helper_temp,
     )
 
 
