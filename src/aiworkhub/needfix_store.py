@@ -2346,15 +2346,31 @@ def list_events(
         conn.close()
 
 
+def _signed_task_plan(card: Mapping[str, Any]) -> dict[str, Any]:
+    """Project an executable conversion card onto fields convert accepts.
+
+    ``task_id`` is system-minted and is not a signed plan field, so it must
+    not be inside the reusable ``task_plan``. Convert regenerates it before
+    hashing the executable card; that digest stays stable for the same plan
+    body.
+    """
+    return {
+        key: value
+        for key, value in card.items()
+        if key in _TASK_PLAN_ALLOWED_FIELDS
+    }
+
+
 def preview_convert(
     repo_root: str | Path, needfix_id: str, task_plan: Mapping[str, Any] | None = None
 ) -> dict[str, Any]:
     """Read-only preview of what conversion would do. Never mutates state.
 
-    When claimable, returns the exact normalized executable card conversion
-    would submit (``task_plan``) plus its deterministic ``plan_digest`` so a
-    manager can bind a subsequent ``convert_needfix`` commit to precisely
-    what was previewed.
+    Returns a commit-compatible ``task_plan`` containing exactly the fields
+    ``validate_task_plan`` accepts, plus the deterministic ``plan_digest`` of
+    the executable card conversion will submit. A caller passes that pair to
+    convert with no rewrite. ``task_id`` is returned beside the plan when
+    minted; convert regenerates it before the digest check.
     """
 
     row = get_needfix(repo_root, needfix_id)
@@ -2373,16 +2389,21 @@ def preview_convert(
         }
     claimable = row["status"] in CLAIMABLE_STATUSES
     card = normalize_task_plan(row, task_plan)
-    return {
+    signed = _signed_task_plan(card)
+    preview: dict[str, Any] = {
         "needfix_id": needfix_id,
         "already_converted": False,
         "claimable": claimable,
         "current_status": row["status"],
         "unverified": row["status"] in ("captured",),
         "triaged": row["status"] == "triaged",
-        "task_plan": card,
+        "task_plan": signed,
         "plan_digest": plan_digest(card),
     }
+    minted_task_id = card.get("task_id")
+    if isinstance(minted_task_id, str) and minted_task_id.strip():
+        preview["task_id"] = minted_task_id
+    return preview
 
 
 def default_task_card(needfix_snapshot: Mapping[str, Any]) -> dict[str, Any]:

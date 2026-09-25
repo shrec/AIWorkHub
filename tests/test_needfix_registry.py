@@ -635,7 +635,58 @@ class TestNeedFixConversionPublicPlanContract:
         assert pv["claimable"] is True
         assert pv["task_plan"]["allowed_writes"] == ["src/aiworkhub/foo.py"]
         assert pv["task_plan"]["required_outputs"] == ["src/aiworkhub/foo.py"]
-        assert pv["plan_digest"] == needfix_store.plan_digest(pv["task_plan"])
+        assert "task_id" not in pv["task_plan"]
+        snapshot = needfix_store.get_needfix(init_store, r["id"])
+        assert pv["plan_digest"] == needfix_store.plan_digest(
+            needfix_store.normalize_task_plan(snapshot, pv["task_plan"])
+        )
+
+    def test_preview_output_commits_unchanged(self, init_store: Path, monkeypatch):
+        """NF-2026-00787: returned task_plan and plan_digest commit with no rewrite.
+
+        The signed plan contains only fields convert accepts. ``task_id`` is
+        minted beside the plan and regenerated before the digest check, so the
+        digest of the same plan body is unchanged.
+        """
+        from aiworkhub import core
+
+        r = self._accepted_with_scope(init_store, ["src/aiworkhub/foo.py"])
+        plan = {
+            "runner": "codex",
+            "topic": "needfix_fix",
+            "required_outputs": ["src/aiworkhub/foo.py"],
+        }
+        pv = needfix_store.preview_convert(init_store, r["id"], plan)
+        returned = pv["task_plan"]
+        assert "task_id" not in returned
+        assert set(returned) <= needfix_store._TASK_PLAN_ALLOWED_FIELDS
+        assert pv["task_id"] == f"needfix-{r['id']}"
+        # Field check: the exact returned plan is accepted.
+        needfix_store.validate_task_plan(returned)
+        snapshot = needfix_store.get_needfix(init_store, r["id"])
+        # Digest check: convert regenerates the executable card from the
+        # returned plan and binds the same digest. No field stripping.
+        regenerated = needfix_store.normalize_task_plan(snapshot, returned)
+        assert needfix_store.plan_digest(regenerated) == pv["plan_digest"]
+        original_card = needfix_store.normalize_task_plan(snapshot, plan)
+        assert needfix_store.plan_digest(original_card) == pv["plan_digest"]
+        assert regenerated == original_card
+
+        captured = {}
+
+        def fake_create_task(**kwargs):
+            captured.update(kwargs)
+            return {"ok": True, "task_id": kwargs["task_id"]}
+
+        monkeypatch.setattr(core, "repo_root", lambda: init_store)
+        monkeypatch.setattr(core, "create_task", fake_create_task)
+        result = core.needfix_convert(
+            r["id"],
+            task_plan=returned,
+            plan_digest=pv["plan_digest"],
+        )
+        assert result["converted_task_id"] == f"needfix-{r['id']}"
+        assert captured["task_id"] == f"needfix-{r['id']}"
 
     def test_writable_preview_without_required_outputs_fails_before_task_creation(
         self, init_store: Path
@@ -688,7 +739,9 @@ class TestNeedFixConversionPublicPlanContract:
         card = needfix_store.normalize_task_plan(
             needfix_store.get_needfix(init_store, r["id"]), plan
         )
-        assert card == pv["task_plan"]
+        assert needfix_store._signed_task_plan(card) == pv["task_plan"]
+        assert "task_id" not in pv["task_plan"]
+        assert pv["task_id"] == card["task_id"] == f"needfix-{r['id']}"
         needfix_store.convert_needfix(
             init_store,
             r["id"],
@@ -1541,7 +1594,9 @@ class TestReopenGenerationLifecycle:
         p1 = needfix_store.preview_convert(init_store, r["id"], plan)
         p2 = needfix_store.preview_convert(init_store, r["id"], plan)
 
-        assert p1["task_plan"]["task_id"] == f"needfix-{r['id']}-r1"
+        assert "task_id" not in p1["task_plan"]
+        assert p1["task_id"] == f"needfix-{r['id']}-r1"
+        assert p1["task_plan"] == p2["task_plan"]
         assert p1["plan_digest"] == p2["plan_digest"]
 
     def test_convert_is_exactly_once_and_reconciles_lost_ack(self, init_store: Path):
