@@ -1,5 +1,19 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.76 — 2026-09-26
+
+### Fixed
+
+- Manager Chat is a persistent sidebar beside the dashboard.
+- Semantic edit accepts a one-line range and a string line number.
+- Windows validation-only replay uses the configured temp worktree.
+- AppContainer launch no longer writes a DACL on C:\Users.
+- Recovered cards can be rerouted without a review-rejection receipt.
+- Truncated Source Graph bodygrep resumes from the returned cursor.
+- Impact no longer drops a symbol's recorded callers when the file sample is full.
+- Python crashes findings with zero precision stay advisory.
+- A too-long validation temp is rebound so the nested LSP helper cwd can start.
+
 ## 0.11.75 — 2026-09-26
 
 ### Fixed

@@ -62,6 +62,12 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
+## What's new in 0.11.76
+
+- Manager Chat is a persistent sidebar. Semantic edit accepts one-line ranges.
+  Windows replay, AppContainer DACL, bodygrep resume, impact callers, and the
+  nested LSP helper cwd limit are fixed in this build.
+
 ## What's new in 0.11.75
 
 - VS Code LM workers fail closed after six Source Graph queries without an

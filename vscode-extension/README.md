@@ -14,6 +14,12 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.11.76
+
+- Manager Chat stays beside the dashboard. Source Graph bodygrep can resume a
+  truncated scan, and a too-long validation temp no longer blocks the nested
+  LSP helper.
+
 ## What's new in 0.11.75
 
 - VS Code LM workers stop a Source Graph loop that never edits, even when

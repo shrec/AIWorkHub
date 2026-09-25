@@ -6,6 +6,20 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.76] - 2026-09-26
+
+### Fixed
+
+- Manager Chat ships as a persistent sidebar beside the dashboard.
+- One-line semantic-edit ranges and decimal string line numbers are accepted.
+- Windows validation-only replay accepts the configured temp worktree root.
+- AppContainer launch does not write a DACL on C:\Users.
+- A recovered pending card can be rerouted without a review-rejection receipt.
+- A truncated bodygrep resumes from its own next_cursor.
+- Impact keeps a symbol's recorded callers when the file sample is full.
+- Zero-precision Python crashes findings stay advisory and cannot gate acceptance.
+- A too-long validation temp is rebound so the nested LSP helper cwd fits CreateProcess.
+
 ## [0.11.75] - 2026-09-26
 
 ### Fixed
