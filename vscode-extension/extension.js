@@ -4249,8 +4249,29 @@ function createVscodeLmStagedEditCollector(request) {
     ...requiredProgress(),
   });
 
-  const stage = async (input) => {
-    if (!input || typeof input !== "object" || Array.isArray(input)) return reject("input_invalid");
+  const decimalProtocolLine = (value) => {
+    if (typeof value === "boolean" || typeof value === "number") return value;
+    if (typeof value === "string" && /^[0-9]+$/.test(value.trim())) {
+      const parsed = Number(value.trim());
+      if (Number.isSafeInteger(parsed)) return parsed;
+    }
+    return value;
+  };
+  const stage = async (rawInput) => {
+    if (!rawInput || typeof rawInput !== "object" || Array.isArray(rawInput)) return reject("input_invalid");
+    const input = { ...rawInput };
+    if (typeof input.action === "string" && input.action.trim()) {
+      if (input.operation && input.operation !== input.action) return reject("operation_conflict");
+      input.operation = input.action;
+    }
+    if (typeof input.path === "string" && input.path.trim()) {
+      if (input.file_path && input.file_path !== input.path) return reject("path_conflict");
+      input.file_path = input.path;
+    }
+    delete input.action;
+    delete input.path;
+    if ("start_line" in input) input.start_line = decimalProtocolLine(input.start_line);
+    if ("end_line" in input) input.end_line = decimalProtocolLine(input.end_line);
     const operation = String(input.operation || "");
     const filePath = vscodeLmNormalizedPath(input.file_path);
     if (!filePath || !allowedWrites.some((pattern) => vscodeLmPathMatchesPattern(filePath, pattern))) {

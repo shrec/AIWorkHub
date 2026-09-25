@@ -1012,6 +1012,27 @@ async function textProtocolChecks() {
     end_line: 2,
     new: "return 10",
   })).ok, true);
+  const stringLineCollector = internals.createVscodeLmStagedEditCollector({
+    allowedWrites: ["src/app.py"],
+    path_contracts: editContract,
+  });
+  const stringLine = await stringLineCollector.stage({
+    action: "replace_range",
+    path: "src/app.py",
+    start_line: "2",
+    end_line: "2",
+    new: "return 10",
+  });
+  assert.strictEqual(stringLine.ok, true);
+  const fractionalLine = await stringLineCollector.stage({
+    operation: "replace_range",
+    file_path: "src/app.py",
+    start_line: "2.5",
+    end_line: "2",
+    new: "no",
+  });
+  assert.strictEqual(fractionalLine.ok, false);
+  assert.match(fractionalLine.reason, /range_invalid/);
   assert.strictEqual((await mixedCollector.stage({
     operation: "create",
     file_path: "tests/created.py",
