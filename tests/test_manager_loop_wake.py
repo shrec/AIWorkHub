@@ -4,6 +4,7 @@ import json
 import sqlite3
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -445,4 +446,62 @@ def test_a_real_callback_with_an_arbitrary_origin_thread_id_is_claimed_and_woken
     assert status["last_turn"]["ok"] is True
     assert status["wake"]["turns_this_hour"] == 1
 
+    assert manager_loop_service.close(tmp_path)["ok"] is True
+
+
+def test_wake_claims_callbacks_from_every_provider_family_not_just_claude(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    """A worker terminal under another family (e.g. codex) must still wake
+    an opencode/claude seat: the default source iterates every pending
+    family instead of assuming one provider."""
+    backends = _install_fakes(monkeypatch)
+    monkeypatch.setattr(
+        manager_loop_service, "default_callback_source", manager_loop_wake.default_callback_source
+    )
+    monkeypatch.setattr(manager_loop_service, "WAKE_IDLE_POLL_SECONDS", 0.02)
+    monkeypatch.setattr(manager_loop_service, "WAKE_RETRY_POLL_SECONDS", 0.02)
+
+    db_path = tmp_path / "task_queue.sqlite"
+
+    def fake_canonical_connect(*, readonly: bool = False) -> sqlite3.Connection:
+        conn = sqlite3.connect(str(db_path), isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    monkeypatch.setattr(aiworkhub_core, "_canonical_connect", fake_canonical_connect)
+
+    conn = fake_canonical_connect()
+    try:
+        callback_store.init_db(conn)
+        for card, family in (("CARD_C", "claude"), ("CARD_X", "codex")):
+            conn.execute(
+                "INSERT INTO tasks (task_id, status, card_json, created_at, updated_at) "
+                "VALUES (?, 'review', ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+                (card, json.dumps({"claim_epoch": 0})),
+            )
+            assert callback_store.enqueue_callback(
+                conn,
+                card,
+                "some-other-route-thread-id",
+                "review_ready",
+                provider=family,
+                episode_id="0",
+            )
+        assert sorted(callback_store.pending_callback_providers(conn)) == ["claude", "codex"]
+    finally:
+        conn.close()
+
+    assert manager_loop_service.start(tmp_path, "fake", "model-a")["ok"] is True
+
+    assert backends[0].entered.wait(timeout=10)
+    deadline = time.monotonic() + 15
+    while len(backends[0].messages) < 2 and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert manager_loop_service.wait_for_idle(tmp_path, timeout=10) is True
+
+    assert sorted(backends[0].messages) == [
+        "callback: CARD_C -> review_ready",
+        "callback: CARD_X -> review_ready",
+    ]
     assert manager_loop_service.close(tmp_path)["ok"] is True

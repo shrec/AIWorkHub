@@ -202,23 +202,31 @@ class WakeConsumer:
 
 
 def default_callback_source(
-    *, session_id: str, provider: str = "claude", lease_seconds: int = 120
+    *, session_id: str, provider: str | None = None, lease_seconds: int = 120
 ) -> tuple[ClaimFn, AckFn]:
     """The real claim/ack wiring: the same lease API behind the legacy MCP poll tools.
 
     A fresh callback's ``origin_thread_id`` is whoever created the task --
     never this manager loop session's own id -- so claiming scoped to
     ``session_id`` alone would never see it. Before every claim, this rebinds
-    the repository's durable pending callbacks for ``provider`` onto
-    ``session_id``, exactly the way the bootstrap dispatcher hands a
-    repository's callbacks to whichever route is its current verified
-    manager (``callback_store.rebind_pending_callbacks`` -- see ``core.py``'s
-    ``manager_inbox`` bootstrap): every callback for this repository and
-    provider, never just one prior origin thread. Once rebound, the claim
-    below -- scoped to ``session_id`` exactly like the verified Claude
-    manager route scopes its own claims -- picks it up, and no other route
-    can claim or be handed the same row out from under it.
+    the repository's durable pending callbacks onto ``session_id``, exactly
+    the way the bootstrap dispatcher hands a repository's callbacks to
+    whichever route is its current verified manager
+    (``callback_store.rebind_pending_callbacks`` -- see ``core.py``'s
+    ``manager_inbox`` bootstrap). ``provider=None`` (the Manager Chat wake
+    consumer) covers every pending family -- a seat on any backend sees
+    worker terminals launched under any other; an explicit provider keeps
+    the legacy single-family scope. The ack resolves each batch's own
+    provider/origin from its row, so mixed-family batches settle correctly.
     """
+
+    def _families(conn: Any) -> list[str]:
+        from . import callback_store as _store
+
+        if provider is not None:
+            name = str(provider).strip().lower()
+            return [name] if name else []
+        return _store.pending_callback_providers(conn)
 
     def claim() -> Optional[Mapping[str, Any]]:
         from . import callback_store
@@ -226,15 +234,22 @@ def default_callback_source(
 
         conn = _canonical_connect()
         try:
-            callback_store.rebind_pending_callbacks(
-                conn, provider=provider, origin_thread_id=session_id,
-            )
-            batch = callback_store.claim_pending_callback_batch(
-                conn,
-                lease_seconds=lease_seconds,
-                provider=provider,
-                origin_thread_id=session_id,
-            )
+            families = _families(conn)
+            batch = None
+            claimed_family = ""
+            for family in families:
+                callback_store.rebind_pending_callbacks(
+                    conn, provider=family, origin_thread_id=session_id,
+                )
+                batch = callback_store.claim_pending_callback_batch(
+                    conn,
+                    lease_seconds=lease_seconds,
+                    provider=family,
+                    origin_thread_id=session_id,
+                )
+                if batch:
+                    claimed_family = family
+                    break
         finally:
             conn.close()
         if not batch:
@@ -243,8 +258,10 @@ def default_callback_source(
         # column is delivery lifecycle ('inflight' at claim time), never the
         # task outcome ``ManagerOrchestrator.wake`` words the turn with. Use
         # the row's ``transition`` (the actual outcome) as the member's state.
+        # ``_wake_provider`` routes the later ack to this batch's own family.
         return {
             **batch,
+            "_wake_provider": claimed_family,
             "members": [
                 {**member, "state": member.get("transition", "")}
                 for member in (batch.get("members") or [])
@@ -257,8 +274,21 @@ def default_callback_source(
 
         conn = _canonical_connect()
         try:
+            # The batch carries its own family: a mixed-family consumer must
+            # ack with the row's provider/origin, not the closure's, or the
+            # lease match fails and the batch redelivers forever.
+            row = conn.execute(
+                "SELECT provider, origin_thread_id FROM callback_batches WHERE batch_id=?",
+                (str(batch_id or ""),),
+            ).fetchone()
+            if row is None:
+                return False
             return callback_store.acknowledge_callback_batch(
-                conn, batch_id, lease_id, provider=provider, origin_thread_id=session_id,
+                conn,
+                batch_id,
+                lease_id,
+                provider=str(row["provider"] or ""),
+                origin_thread_id=str(row["origin_thread_id"] or ""),
             )
         finally:
             conn.close()

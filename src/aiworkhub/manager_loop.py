@@ -8,10 +8,16 @@ active session per repository and runs one turn at a time. Server wiring, the
 MCP tool inventory, callback consumption and the dashboard panel are later
 cards; nothing here launches a CLI or calls a model.
 
+A conversation belongs to the repository, not to a provider: ``ensure`` attaches
+to it, persisting a passive record with no backend or model when none exists,
+while ``start`` still pins a route to a session. A pinned record left by an
+older loop stays readable and is retired through its handoff, never reinterpreted.
+
 Concurrency is refused, never queued: a second ``start`` while another session
 holds the repository lock, and any operation while a turn is running, raise a
 named :class:`ManagerLoopError`. The caller owns the retry, so a turn is never
-silently parked behind another one.
+silently parked behind another one. The one exception is ``ensure``, whose
+concurrent callers wait for the one that persists the conversation and share it.
 """
 
 from __future__ import annotations
@@ -31,10 +37,13 @@ from typing import Any, Callable, Iterable, Iterator, Mapping, Protocol, runtime
 from . import platform_io, repository_state
 
 
-SCHEMA_ID = "aiworkhub.manager_loop.v1"
+# v1 records pin a route to the session and carry no successor link; they stay readable
+# and are rewritten as v2 whenever their session is next saved.
+SCHEMA_ID = "aiworkhub.manager_loop.v2"
+LEGACY_SCHEMA_ID = "aiworkhub.manager_loop.v1"
 STATE_DIRNAME = "manager_loop"
 SESSION_STATUSES = frozenset({"active", "closed"})
-EVENT_TYPES = frozenset({"assistant_text", "tool_call", "tool_result", "turn_end", "error"})
+EVENT_TYPES = frozenset({"assistant_text", "reasoning", "tool_call", "tool_result", "turn_end", "error"})
 OPEN_CARD_STATUSES = ("pending", "processing", "review", "blocked")
 DEFAULT_BRIEF_BYTES = 12 * 1024
 MIN_BRIEF_BYTES = 256
@@ -74,7 +83,12 @@ class ManagerLoopBusy(ManagerLoopError):
 
 @dataclasses.dataclass(frozen=True)
 class ManagerSession:
-    """One manager conversation, on one backend and model."""
+    """One repository manager conversation.
+
+    A legacy session is pinned to the ``backend_id`` and ``model`` it started on; a
+    passive one leaves both empty, because its route belongs to each turn.
+    ``previous_session_id`` names the closed session whose handoff a session continues.
+    """
 
     session_id: str
     repo_id: str
@@ -86,19 +100,29 @@ class ManagerSession:
     turn_count: int = 0
     context_estimate_bytes: int = 0
     handoff_ref: str | None = None
+    previous_session_id: str | None = None
+
+    @property
+    def passive(self) -> bool:
+        """True while no backend or model is pinned to the conversation."""
+        return not self.backend_id and not self.model
 
     def to_json(self) -> dict[str, Any]:
         return {"schema_id": SCHEMA_ID, **dataclasses.asdict(self)}
 
     @classmethod
     def from_json(cls, payload: Mapping[str, Any]) -> ManagerSession:
-        names = [field.name for field in dataclasses.fields(cls)]
-        missing = [name for name in names if name not in payload]
-        if missing or payload.get("schema_id") != SCHEMA_ID:
+        fields = dataclasses.fields(cls)
+        missing = [
+            field.name for field in fields
+            if field.default is dataclasses.MISSING and field.name not in payload
+        ]
+        if missing or payload.get("schema_id") not in (SCHEMA_ID, LEGACY_SCHEMA_ID):
             raise ManagerLoopError(f"session_record_invalid:{','.join(missing) or 'schema_id'}")
         if payload.get("status") not in SESSION_STATUSES:
             raise ManagerLoopError("session_record_invalid:status")
-        return cls(**{name: payload[name] for name in names})
+        known = {field.name: payload[field.name] for field in fields if field.name in payload}
+        return cls(**known)
 
 
 @runtime_checkable
@@ -190,9 +214,11 @@ class SessionStore:
 
     Everything lives under the repository's existing runtime state directory
     (``.aiworkhub/runtime/manager_loop``): ``sessions/<id>.json``,
-    ``events/<id>.jsonl``, ``handoffs/<id>.md``, and the ``active.lock`` an
-    orchestrator holds for the life of a session. Every file is replaced whole
-    through :func:`platform_io.atomic_replace`, so a reader never sees a torn
+    ``events/<id>.jsonl``, ``handoffs/<id>.md``, the ``active.lock`` an
+    orchestrator holds for the life of a pinned session (and only while it
+    persists a passive one), and the ``ensure.lock`` that queues concurrent
+    ``ensure`` calls. Every file is replaced whole through
+    :func:`platform_io.atomic_replace`, so a reader never sees a torn
     record. A log only appends and keeps its newest ``max_events`` lines, and
     ``seq`` keeps counting, so a first ``seq`` above 1 says how much was
     dropped. Closed sessions beyond ``keep_closed`` are pruned oldest first.
@@ -223,6 +249,10 @@ class SessionStore:
     @property
     def lock_path(self) -> Path:
         return self.root / "active.lock"
+
+    @property
+    def ensure_lock_path(self) -> Path:
+        return self.root / "ensure.lock"
 
     def _path(self, kind: str, session_id: str) -> Path:
         if not _SESSION_ID_RE.fullmatch(session_id):
@@ -402,7 +432,10 @@ class BriefBuilder:
 
 
 class ManagerOrchestrator:
-    """One repository's manager loop: ``start``, ``send``, ``wake`` and ``rotate``.
+    """One repository's manager loop: ``ensure``, ``start``, ``send``, ``wake`` and ``rotate``.
+
+    ``ensure`` attaches to the repository's one conversation, persisting a passive
+    one -- no backend, no model, no provider call -- when none exists.
 
     ``start`` takes the repository's session lock and holds it until the session
     is rotated or closed, so a second session -- from this process or another --
@@ -469,8 +502,52 @@ class ManagerOrchestrator:
         """The active session, or ``None`` between sessions."""
         return self._session
 
+    def ensure(self) -> ManagerSession:
+        """Attach to the repository's one active conversation, persisting a passive one if none.
+
+        Provider-free and idempotent: no backend is built, started or closed, and every call,
+        from this orchestrator, another one or another process, returns the same record.
+        Concurrent callers queue for the moment persisting takes, so all of them get that one
+        conversation. A session this orchestrator drives is returned as is, even mid-turn.
+        Otherwise the session lock proves no owner is live: a pinned record a dead owner left
+        active is retired through its mechanical handoff, which the passive successor is
+        attached to, and its provider conversation id is never carried over. A live owner
+        elsewhere refuses with ``manager_session_already_active``.
+        """
+        session, backend = self._session, self._backend
+        if session is not None and backend is not None:
+            return session
+        with self._queued(), self._exclusive():
+            return self._ensure()
+
     def start(self, backend_id: str, model: str) -> ManagerSession:
         """Open the repository's one active session, from the latest handoff."""
+        with self._exclusive():
+            return self._open(backend_id, model)
+
+    def ensure_route(self, backend_id: str, model: str) -> ManagerSession:
+        """Bind this turn to the exact selected route (panel picker).
+
+        A session already bound to that route is returned unchanged, so
+        same-route sends never rotate. Any other state -- none, passive,
+        or active on a different route -- opens the selected route: the
+        displaced record is retired through the same mechanical handoff a
+        crashed session gets, and the successor rehydrates from it.
+        Callers hold the service turn lock across this call.
+        """
+        if not backend_id.strip() or not model.strip():
+            raise ValueError("backend_id and model are required")
+        session, backend = self._session, self._backend
+        if (
+            session is not None
+            and backend is not None
+            and not session.passive
+            and session.backend_id == backend_id
+            and session.model == model
+        ):
+            return session
+        if backend is not None:
+            self.close()
         with self._exclusive():
             return self._open(backend_id, model)
 
@@ -498,8 +575,9 @@ class ManagerOrchestrator:
     def close(self) -> None:
         """Release the backend and the lock at shutdown, without a model turn.
 
-        The record stays ``active`` and the next ``start`` retires it with a
-        mechanical handoff, exactly as it would after a crash.
+        The record stays ``active``: the next ``start`` retires it with a mechanical
+        handoff, exactly as it would after a crash, while the next ``ensure`` simply
+        attaches a passive one again.
         """
         with self._exclusive():
             backend, self._backend, self._session = self._backend, None, None
@@ -524,6 +602,26 @@ class ManagerOrchestrator:
         finally:
             self._slot.release()
 
+    @contextlib.contextmanager
+    def _queued(self) -> Iterator[None]:
+        """Queue behind other ``ensure`` calls, here or in another process, on ``ensure.lock``.
+
+        Waiting is bounded and safe because ``ensure`` holds this lock only while it persists.
+        The session lock stays a non-blocking probe: a live pinned owner holds it for its life.
+        """
+        fd = platform_io.open_lock_file(self.store.ensure_lock_path)
+        try:
+            try:
+                platform_io.lock_fd(fd, blocking=True)
+            except TimeoutError as exc:
+                raise ManagerLoopError("manager_ensure_timeout") from exc
+            try:
+                yield
+            finally:
+                platform_io.unlock_fd(fd)
+        finally:
+            os.close(fd)
+
     def _active(self) -> tuple[ManagerSession, ManagerBackend]:
         if self._session is None or self._backend is None:
             raise ManagerLoopError("no_active_manager_session")
@@ -545,13 +643,14 @@ class ManagerOrchestrator:
         return dict(result) if isinstance(result, Mapping) else {"ok": False, "error": "not_a_mapping"}
 
     def _open(self, backend_id: str, model: str) -> ManagerSession:
-        if self._session is not None:
+        if self._backend is not None:
             raise ManagerLoopError("manager_session_already_active")
         if not backend_id.strip() or not model.strip():
             raise ValueError("backend_id and model are required")
         self._acquire_lock()
         backend: ManagerBackend | None = None
         try:
+            self._session = None  # an attached passive conversation is retired just below
             self._retire_stale()
             previous = self.store.latest_closed()
             handoff = self.store.read_handoff(previous.session_id) if previous else ""
@@ -566,6 +665,7 @@ class ManagerOrchestrator:
                 status="active",
                 created_at=self._clock(),
                 context_estimate_bytes=len(brief.encode("utf-8")),
+                previous_session_id=previous.session_id if previous else None,
             )
             self.store.save(session)
             self._record(session, 0, "session_start", {
@@ -583,12 +683,55 @@ class ManagerOrchestrator:
         self._session, self._backend = session, backend
         return session
 
-    def _retire_stale(self) -> None:
-        """Close what a dead owner left active: holding the lock proves none is live."""
-        for stale in [item for item in self.store.sessions() if item.status == "active"]:
+    def _retire_stale(self, *, keep_passive: bool = False) -> ManagerSession | None:
+        """Close what a dead owner left active: holding the lock proves none is live.
+
+        ``keep_passive`` spares, and returns, the oldest passive conversation: it has no
+        owner that could be dead, so it is not stale.
+        """
+        active = [item for item in self.store.sessions() if item.status == "active"]
+        kept = next((item for item in active if keep_passive and item.passive), None)
+        for stale in [item for item in active if item is not kept]:
             reason = "stale_active_session"
             handoff = self._mechanical_handoff(stale, reason, "its owner exited without rotating")
             self._finish(stale, handoff, reason, mechanical=True)
+        return kept
+
+    def _ensure(self) -> ManagerSession:
+        """Under the session lock: keep the oldest passive conversation or persist a new one.
+
+        Holding the lock proves no pinned owner is live, so a pinned record left active is
+        retired through the same mechanical handoff a crashed session gets. The lock is held
+        only while persisting: a passive conversation has no owner to hold it for.
+        """
+        self._acquire_lock()
+        try:
+            session = self._retire_stale(keep_passive=True) or self._create_passive()
+        finally:
+            self._release_lock()
+        self._session = session
+        return session
+
+    def _create_passive(self) -> ManagerSession:
+        """Persist a route-less conversation attached to the latest handoff; no provider runs."""
+        previous = self.store.latest_closed()
+        session = ManagerSession(
+            session_id=self._new_id(),
+            repo_id=self.store.repo_id,
+            backend_id="",
+            model="",
+            status="active",
+            created_at=self._clock(),
+            previous_session_id=previous.session_id if previous else None,
+        )
+        self.store.save(session)
+        self._record(session, 0, "session_start", {
+            "passive": True,
+            "provider_ref": None,
+            "previous_session_id": session.previous_session_id,
+            "handoff_ref": previous.handoff_ref if previous else None,
+        })
+        return session
 
     def _turn(self, message: str, inbound: str, task_id: str) -> dict[str, Any]:
         session, _ = self._active()
@@ -729,9 +872,37 @@ class ManagerOrchestrator:
             session, status="closed", closed_at=self._clock(), handoff_ref=ref
         )
         self.store.save(closed)
+        if mechanical:
+            self._mark_interrupted_turns(session, reason)
         ended = {"reason": reason, "mechanical": mechanical, "handoff_ref": ref}
         self._record(closed, closed.turn_count, "session_close", ended)
         return closed, written
+
+    def _mark_interrupted_turns(self, session: ManagerSession, reason: str) -> None:
+        """One terminal marker per turn its dead owner never closed.
+
+        Resume decision (reference: claude-code-main conversationRecovery):
+        an inbound turn (user_message/callback) with no later turn_end/error
+        must never read as possibly-run to the successor. Only a mechanical
+        retire writes this; a normally finished turn already has its marker.
+        """
+        terminal = {"turn_end", "error"}
+        inbound = {"user_message", "callback"}
+        orphaned: list[int] = []
+        for event in self.store.events(session.session_id):
+            turn = event["turn"]
+            if event["type"] in inbound:
+                if turn not in orphaned:
+                    orphaned.append(turn)
+            elif event["type"] in terminal:
+                orphaned = [t for t in orphaned if t != turn]
+        for turn in orphaned:
+            self._record(
+                session,
+                turn,
+                "error",
+                {"source": "manager_turn_interrupted", "error": f"manager_turn_interrupted:{reason}"},
+            )
 
     def _mechanical_handoff(self, session: ManagerSession, reason: str, cause: str) -> str:
         """The handoff written from the event log alone, when no model can write it."""
@@ -744,8 +915,9 @@ class ManagerOrchestrator:
             str(event["payload"].get("text", ""))
             for event in events if event["type"] == "assistant_text"
         ]
+        route = "no route" if session.passive else f"{session.backend_id}/{session.model}"
         return "\n".join([
-            f"Mechanical handoff for {session.session_id} ({session.backend_id}/{session.model}), "
+            f"Mechanical handoff for {session.session_id} ({route}), "
             f"rotated for {reason} after {session.turn_count} turns: {cause}",
             "done:",
             *([f"- handled: {_clip(text, 300)}" for text in handled[-5:]] or ["- no turns ran"]),

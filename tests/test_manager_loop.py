@@ -9,6 +9,7 @@ existing functions they must call.
 from __future__ import annotations
 
 import json
+import os
 import re
 import threading
 from collections import deque
@@ -97,6 +98,8 @@ class Harness:
     ) -> None:
         self.prefix = prefix
         self.issued = 0
+        self.id_gate: threading.Event | None = None
+        self.id_entered = threading.Event()
         self.backends: list[FakeBackend] = []
         self.graph_events: list[dict[str, Any]] = []
         self.session_writes: list[dict[str, Any]] = []
@@ -125,8 +128,16 @@ class Harness:
         self.backends.append(FakeBackend(backend_id, model))
         return self.backends[-1]
 
+    @property
+    def started(self) -> list[str]:
+        """Every brief a provider session was started from; empty while none was touched."""
+        return [brief for backend in self.backends for brief in backend.briefs]
+
     def next_id(self) -> str:
         self.issued += 1
+        if self.id_gate is not None:
+            self.id_entered.set()
+            assert self.id_gate.wait(timeout=10)
         return f"{self.prefix}-session-{self.issued:04d}"
 
     def graph_write(self, **fields: Any) -> Any:
@@ -586,3 +597,346 @@ def test_production_defaults_call_the_existing_functions(tmp_path: Path, monkeyp
     assert calls[1][1] == {"query": ml.CONTEXT_QUERY, "limit": 8}
     assert calls[3][1]["action"] == "handoff"
     assert rotation["session"].handoff_ref == "session_document:7"
+
+
+LEGACY_ID = "legacy-pinned-0001"
+LEGACY_PROVIDER_REF = "claude-conversation-7f3a91"
+
+
+def _legacy_pinned_record(**changes: Any) -> dict[str, Any]:
+    """A session record exactly as the v1 loop wrote it: a pinned route, no successor link."""
+    return {
+        "schema_id": "aiworkhub.manager_loop.v1",
+        "session_id": LEGACY_ID,
+        "repo_id": REPO_ID,
+        "backend_id": "claude_cli",
+        "model": "opus",
+        "status": "active",
+        "created_at": _EPOCH.isoformat(),
+        "closed_at": None,
+        "turn_count": 1,
+        "context_estimate_bytes": 900,
+        "handoff_ref": None,
+        **changes,
+    }
+
+
+def _write_legacy_pinned_session(root: Path) -> None:
+    """Leave a v1 pinned session active on disk, its provider conversation id in its log."""
+    state = root / "manager_loop"
+    (state / "sessions").mkdir(parents=True)
+    (state / "events").mkdir()
+    record = json.dumps(_legacy_pinned_record(), indent=2, sort_keys=True)
+    (state / "sessions" / f"{LEGACY_ID}.json").write_text(record + "\n", encoding="utf-8")
+    payloads = [
+        ("session_start", {"provider_ref": LEGACY_PROVIDER_REF, "previous_session_id": None}),
+        ("user_message", {"text": "triage CARD_LEGACY"}),
+        ("assistant_text", {"text": "triaged CARD_LEGACY"}),
+        ("turn_end", {}),
+    ]
+    lines = [
+        json.dumps({
+            "at": _EPOCH.isoformat(),
+            "turn": 0 if kind == "session_start" else 1,
+            "seq": seq,
+            "type": kind,
+            "payload": payload,
+        })
+        for seq, (kind, payload) in enumerate(payloads, start=1)
+    ]
+    (state / "events" / f"{LEGACY_ID}.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _passive_record(session_id: str, created_at: str, repo_id: str = REPO_ID) -> ml.ManagerSession:
+    return ml.ManagerSession(
+        session_id=session_id,
+        repo_id=repo_id,
+        backend_id="",
+        model="",
+        status="active",
+        created_at=created_at,
+    )
+
+
+def test_session_records_read_v1_and_write_v2() -> None:
+    legacy = ml.ManagerSession.from_json(_legacy_pinned_record())
+
+    assert (legacy.backend_id, legacy.model, legacy.previous_session_id) == (
+        "claude_cli", "opus", None,
+    )
+    assert not legacy.passive and legacy.status == "active"
+    written = legacy.to_json()
+    assert written["schema_id"] == ml.SCHEMA_ID != "aiworkhub.manager_loop.v1"
+    assert ml.ManagerSession.from_json(written) == legacy
+    with pytest.raises(ml.ManagerLoopError, match="session_record_invalid:schema_id"):
+        ml.ManagerSession.from_json(_legacy_pinned_record(schema_id="aiworkhub.manager_loop.v0"))
+
+
+def test_ensure_persists_one_passive_conversation_without_a_provider(make, tmp_path: Path) -> None:
+    harness = make()
+
+    first = harness.orch.ensure()
+    second = harness.orch.ensure()
+
+    assert first == second == harness.orch.session
+    assert (first.status, first.turn_count, first.repo_id) == ("active", 0, REPO_ID)
+    assert first.passive and (first.backend_id, first.model) == ("", "")
+    assert (first.previous_session_id, first.handoff_ref) == (None, None)
+    assert harness.store.sessions() == [first]
+    assert (tmp_path / "manager_loop" / "sessions" / f"{first.session_id}.json").is_file()
+    (opened,) = harness.store.events(first.session_id)
+    assert (opened["seq"], opened["type"]) == (1, "session_start")
+    assert opened["payload"] == {
+        "passive": True, "provider_ref": None, "previous_session_id": None, "handoff_ref": None,
+    }
+    assert harness.issued == 1
+    assert harness.started == [] and harness.backends == []
+    assert harness.graph_events == [] and harness.session_writes == []
+
+
+def test_a_reconstructed_orchestrator_attaches_to_the_same_conversation(make) -> None:
+    ticker = Ticker()
+    first = make(prefix="a", ticker=ticker)
+    created = first.orch.ensure()
+    first.orch.close()
+
+    second = make(prefix="b", ticker=ticker)
+    attached = second.orch.ensure()
+    assert attached == created and second.orch.session == created
+    assert second.issued == 0 and second.backends == []
+    assert [item.session_id for item in second.store.sessions()] == [created.session_id]
+    assert [event["type"] for event in second.store.events(created.session_id)] == ["session_start"]
+
+
+def test_mechanical_retire_marks_the_turn_its_dead_owner_never_closed(make) -> None:
+    first = make(prefix="a")
+    session = first.orch.start("fake", "model-a")
+    first.orch._record(session, 1, "user_message", {"text": "hello"})
+    first.orch.close()  # owner exits without rotating; the record stays active
+
+    second = make(prefix="b")
+    attached = second.orch.ensure()
+
+    assert attached.passive and attached.session_id != session.session_id
+    events = second.store.events(session.session_id)
+    kinds = [(event["turn"], event["type"]) for event in events]
+    assert (1, "error") in kinds
+    marker = next(e for e in events if e["type"] == "error" and e["turn"] == 1)
+    assert marker["payload"]["source"] == "manager_turn_interrupted"
+    assert "turn_end" not in [event["type"] for event in events]
+    assert kinds[-1] == (0, "session_close")
+
+@pytest.mark.parametrize("shared", [False, True], ids=["two_orchestrators", "one_orchestrator"])
+def test_concurrent_ensure_calls_share_one_conversation(make, shared: bool) -> None:
+    ticker = Ticker()
+    creator = make(prefix="a", ticker=ticker)
+    waiter = creator if shared else make(prefix="b", ticker=ticker)
+    creator.id_gate = threading.Event()
+    seen: dict[str, ml.ManagerSession] = {}
+    creating = threading.Thread(
+        target=lambda: seen.update(creator=creator.orch.ensure()), daemon=True
+    )
+    waiting = threading.Thread(
+        target=lambda: seen.update(waiter=waiter.orch.ensure()), daemon=True
+    )
+    creating.start()
+    try:
+        assert creator.id_entered.wait(timeout=10)
+        waiting.start()
+        waiting.join(timeout=0.5)
+        assert waiting.is_alive()
+    finally:
+        creator.id_gate.set()
+        for thread in (creating, waiting):
+            if thread.ident is not None:
+                thread.join(timeout=10)
+
+    assert not creating.is_alive() and not waiting.is_alive()
+    assert seen["creator"] == seen["waiter"]
+    assert [item.session_id for item in creator.store.sessions()] == ["a-session-0001"]
+    assert creator.issued + (0 if waiter is creator else waiter.issued) == 1
+    assert creator.backends == [] and waiter.backends == []
+
+
+def test_a_legacy_pinned_session_migrates_through_its_handoff(make, tmp_path: Path) -> None:
+    _write_legacy_pinned_session(tmp_path)
+    harness = make()
+    (legacy,) = harness.store.sessions()
+    assert (legacy.session_id, legacy.status, legacy.backend_id) == (
+        LEGACY_ID, "active", "claude_cli",
+    )
+    assert not legacy.passive
+
+    successor = harness.orch.ensure()
+
+    retired, current = harness.store.sessions()
+    assert (retired.session_id, retired.status) == (LEGACY_ID, "closed") and retired.closed_at
+    assert (retired.backend_id, retired.model) == ("claude_cli", "opus")
+    assert retired.handoff_ref == "session_document:1"
+    handoff = harness.store.read_handoff(LEGACY_ID)
+    assert handoff.startswith("Mechanical handoff") and "- handled: triage CARD_LEGACY" in handoff
+    assert harness.session_writes[-1]["action"] == "handoff"
+    assert harness.session_writes[-1]["content"] == handoff
+    assert current == successor == harness.orch.session and successor.passive
+    assert successor.previous_session_id == LEGACY_ID
+    (opened,) = harness.store.events(successor.session_id)
+    assert opened["payload"]["previous_session_id"] == LEGACY_ID
+    assert opened["payload"]["handoff_ref"] == retired.handoff_ref
+    assert opened["payload"]["provider_ref"] is None
+    assert LEGACY_PROVIDER_REF not in json.dumps([successor.to_json(), opened]) + handoff
+    assert harness.backends == [] and harness.graph_events == []
+
+
+@pytest.mark.parametrize("fault", ["foreign_repository", "renamed_record"])
+def test_ensure_refuses_a_record_bound_to_another_identity(make, tmp_path: Path, fault: str) -> None:
+    harness = make()
+    directory = tmp_path / "manager_loop" / "sessions"
+    repo_id = "repo_someone_else" if fault == "foreign_repository" else REPO_ID
+    harness.store.save(_passive_record("stray-session-01", _EPOCH.isoformat(), repo_id))
+    if fault == "renamed_record":
+        (directory / "stray-session-01.json").rename(directory / "other-session-02.json")
+
+    with pytest.raises(ml.ManagerLoopError, match="session_record_mismatch"):
+        harness.orch.ensure()
+
+    assert harness.orch.session is None and harness.issued == 0 and harness.backends == []
+    stray = list(directory.iterdir())
+    assert len(stray) == 1
+    stray[0].unlink()
+    assert harness.orch.ensure().session_id == "a-session-0001"
+
+
+def test_ensure_keeps_the_oldest_passive_conversation_when_duplicates_exist(make) -> None:
+    ticker = Ticker()
+    harness = make(ticker=ticker)
+    older = _passive_record("older-passive-01", ticker())
+    newer = _passive_record("newer-passive-02", ticker())
+    harness.store.save(newer)
+    harness.store.save(older)
+
+    kept = harness.orch.ensure()
+
+    assert kept == older
+    assert [(item.session_id, item.status) for item in harness.store.sessions()] == [
+        ("older-passive-01", "active"), ("newer-passive-02", "closed"),
+    ]
+
+
+def test_a_stuck_ensure_holder_is_a_named_refusal_not_a_hang(make, monkeypatch) -> None:
+    from aiworkhub import platform_io
+
+    harness = make()
+    holder = platform_io.open_lock_file(harness.store.ensure_lock_path)
+    platform_io.lock_fd(holder, blocking=False)
+    monkeypatch.setattr(platform_io, "ADVISORY_LOCK_MAX_WAIT_SECONDS", 0.1)
+    try:
+        with pytest.raises(ml.ManagerLoopError, match="manager_ensure_timeout"):
+            harness.orch.ensure()
+
+        assert harness.store.sessions() == [] and harness.issued == 0
+    finally:
+        platform_io.unlock_fd(holder)
+        os.close(holder)
+
+    assert harness.orch.ensure().passive
+
+
+def test_start_retires_a_passive_conversation_and_pins_a_route(make) -> None:
+    ticker = Ticker()
+    passive_owner = make(prefix="a", ticker=ticker)
+    passive = passive_owner.orch.ensure()
+    pinned = make(prefix="b", ticker=ticker)
+
+    started = pinned.orch.start("fake", "model-a")
+
+    retired, current = pinned.store.sessions()
+    assert (retired.session_id, retired.status) == (passive.session_id, "closed")
+    assert current == started and not started.passive
+    assert started.previous_session_id == passive.session_id
+    handoff = pinned.store.read_handoff(passive.session_id)
+    assert "(no route)" in handoff
+    assert pinned.backends[0].briefs[0].startswith(f"## handoff\n{handoff}\n")
+    assert passive_owner.backends == []
+
+
+def test_start_and_ensure_agree_inside_one_orchestrator(make) -> None:
+    harness = make()
+    passive = harness.orch.ensure()
+
+    started = harness.orch.start("fake", "model-a")
+
+    assert harness.orch.session == started and not started.passive
+    assert [(item.session_id, item.status) for item in harness.store.sessions()] == [
+        (passive.session_id, "closed"), (started.session_id, "active"),
+    ]
+    assert harness.orch.ensure() == started
+    assert len(harness.backends) == 1 and len(harness.backends[0].briefs) == 1
+    with pytest.raises(ml.ManagerLoopError, match="manager_session_already_active"):
+        harness.orch.start("fake", "model-b")
+
+
+def test_ensure_route_binds_the_selected_route_from_any_state(make) -> None:
+    harness = make()
+    passive = harness.orch.ensure()
+
+    bound = harness.orch.ensure_route("fake", "model-a")
+
+    assert not bound.passive and (bound.backend_id, bound.model) == ("fake", "model-a")
+    assert bound.previous_session_id == passive.session_id
+    assert len(harness.backends) == 1
+
+    same = harness.orch.ensure_route("fake", "model-a")
+    assert same == bound and len(harness.backends) == 1
+
+    switched = harness.orch.ensure_route("fake", "model-b")
+    assert (switched.backend_id, switched.model) == ("fake", "model-b")
+    assert switched.session_id != bound.session_id
+    assert switched.previous_session_id == bound.session_id
+    assert len(harness.backends) == 2
+    retired = {item.session_id: item for item in harness.store.sessions()}[bound.session_id]
+    assert retired.status == "closed"
+    assert "stale_active_session" in harness.store.read_handoff(bound.session_id)
+    with pytest.raises(ValueError, match="backend_id and model are required"):
+        harness.orch.ensure_route("", "")
+
+
+def test_ensure_leaves_a_live_pinned_session_alone_and_follows_its_rotation(make) -> None:
+    ticker = Ticker()
+    driver = make(prefix="a", ticker=ticker)
+    other = make(prefix="b", ticker=ticker)
+    live = driver.orch.start("fake", "model-a")
+
+    with pytest.raises(ml.ManagerLoopError, match="manager_session_already_active"):
+        other.orch.ensure()
+
+    assert other.orch.session is None and other.issued == 0 and other.backends == []
+    assert driver.store.sessions() == [live]
+    assert driver.orch.ensure() == live
+
+    rotation = driver.orch.rotate("operator_request")
+    successor = other.orch.ensure()
+
+    assert successor.passive and successor.previous_session_id == live.session_id
+    (opened,) = other.store.events(successor.session_id)
+    handed_over = rotation["session"].handoff_ref
+    assert opened["payload"]["handoff_ref"] == handed_over == "session_document:1"
+    assert len(driver.backends) == 1 and other.backends == []
+
+
+def test_ensure_binds_the_verified_repository_identity(tmp_path: Path) -> None:
+    from aiworkhub import repository_state
+
+    state = repository_state.bootstrap_repository(tmp_path)
+    built: list[str] = []
+
+    def factory(backend_id: str, model: str) -> FakeBackend:
+        built.append(backend_id)
+        return FakeBackend(backend_id, model)
+
+    with ml.ManagerOrchestrator.for_repository(tmp_path, factory) as first:
+        session = first.ensure()
+    with ml.ManagerOrchestrator.for_repository(tmp_path, factory) as reopened:
+        assert reopened.ensure() == session
+
+    assert session.repo_id == state.manifest.repo_id and session.passive
+    assert built == []

@@ -288,6 +288,23 @@ def test_codex_and_opencode_streams_map_to_the_same_loop_events():
     assert mlb.conversation_id_of(opencode[0]) == "ses_1"
 
 
+def test_model_reasoning_is_captured_not_dropped():
+    claude = {
+        "type": "assistant",
+        "message": {"content": [{"type": "thinking", "thinking": "considering two options"}]},
+    }
+    assert mlb.translate("claude_cli", claude) == [
+        {"type": "reasoning", "payload": {"text": "considering two options"}}
+    ]
+    assert mlb.translate("claude_cli", {
+        "type": "assistant", "message": {"content": [{"type": "thinking", "thinking": "  "}]},
+    }) == [], "blank thinking records nothing"
+    opencode = {"type": "reasoning", "part": {"text": "weighing the trade-off"}}
+    assert mlb.translate("opencode_cli", opencode) == [
+        {"type": "reasoning", "payload": {"text": "weighing the trade-off"}}
+    ]
+
+
 def test_a_provider_error_line_becomes_one_error_event():
     reported = {"type": "error", "error": {"name": "APIError", "data": {"statusCode": 429}}}
     assert mlb.translate("opencode_cli", reported) == [
@@ -574,6 +591,25 @@ def test_the_factory_accepts_a_model_the_cli_itself_discovers(tmp_path: Path, mo
         build("codex_cli", "gpt-0")
 
 
+def test_the_factory_accepts_an_opencode_model_the_cli_itself_lists(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(
+        mlb, "_opencode_discovered_models", lambda: ["opencode-go/muse-spark-1.3-contributor"]
+    )
+    build = mlb.manager_backend_factory(tmp_path, declares_route=lambda *_a: False)
+
+    assert build("opencode_cli", "opencode-go/muse-spark-1.3-contributor").model == \
+        "opencode-go/muse-spark-1.3-contributor"
+    with pytest.raises(mlb.ManagerLoopError, match="manager_backend_unavailable:opencode_cli:x/y"):
+        build("opencode_cli", "x/y")
+
+
+def test_opencode_discovery_failure_refuses_by_name_not_silently(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(mlb, "_opencode_discovered_models", lambda: [])
+    build = mlb.manager_backend_factory(tmp_path, declares_route=lambda *_a: False)
+
+    with pytest.raises(mlb.ManagerLoopError, match="manager_backend_unavailable:opencode_cli"):
+        build("opencode_cli", "opencode-go/muse-spark-1.3-contributor")
+
 def test_codex_resume_argv_uses_only_the_flags_exec_resume_accepts():
     first = ["codex", "exec", "--json", "-s", "workspace-write", "-C", "D:\repo", "--model", "m", "-"]
 
@@ -589,3 +625,140 @@ def test_a_codex_manager_turn_keeps_its_session_for_resume(tmp_path: Path):
     plan = type("Plan", (), {"argv": ["codex", "exec", "--json", "--ephemeral", "-"]})()
 
     assert "--ephemeral" not in backend.argv_for(plan)
+
+
+def test_provision_manager_seat_env_writes_a_0600_codex_home(tmp_path: Path):
+    env = mlb.provision_manager_seat_env(
+        tmp_path, "codex_cli",
+        python_executable=sys.executable,
+        package_import_root=tmp_path,
+    )
+
+    assert set(env) == {"CODEX_HOME"}
+    config_path = Path(env["CODEX_HOME"]) / "config.toml"
+    assert config_path.is_file()
+    if sys.platform != "win32":
+        assert (config_path.stat().st_mode & 0o777) == 0o600
+    text = config_path.read_text(encoding="utf-8")
+    assert "[mcp_servers.AIWorkHub]" in text
+    assert "aiworkhub_task_create" in text
+    assert "aiworkhub_agent_launch_task" not in text
+
+
+def test_provision_manager_seat_env_binds_opencode_through_child_env(tmp_path: Path):
+    from aiworkhub import runtime_adapters as ra
+
+    env = mlb.provision_manager_seat_env(
+        tmp_path, "opencode_cli",
+        python_executable=sys.executable,
+        package_import_root=tmp_path,
+    )
+
+    assert env[ra.OPENCODE_DISABLE_PROJECT_CONFIG_ENV] == "1"
+    config = json.loads(env[ra.OPENCODE_WORKER_CONFIG_ENV])
+    assert ra.validate_opencode_manager_config(config) is config
+
+
+def test_provision_manager_seat_env_needs_nothing_for_claude(tmp_path: Path):
+    assert mlb.provision_manager_seat_env(
+        tmp_path, "claude_cli",
+        python_executable=sys.executable,
+        package_import_root=tmp_path,
+    ) == {}
+    with pytest.raises(mlb.ManagerLoopError, match="manager_backend_unsupported"):
+        mlb.provision_manager_seat_env(
+            tmp_path, "nope_cli",
+            python_executable=sys.executable,
+            package_import_root=tmp_path,
+        )
+
+
+def test_factory_provisions_seat_env_per_backend_at_build_time(tmp_path: Path):
+    seen: list[tuple[str, str]] = []
+
+    def provider(backend_id: str, model: str) -> dict[str, str]:
+        seen.append((backend_id, model))
+        return {"SEAT_BINDING": f"{backend_id}/{model}"}
+
+    build = mlb.manager_backend_factory(
+        tmp_path,
+        declares_route=lambda *_a: True,
+        seat_env_provider=provider,
+    )
+    backend = build("codex_cli", "m")
+
+    assert seen == [("codex_cli", "m")]
+    assert backend._extra_env == {"SEAT_BINDING": "codex_cli/m"}
+
+
+def test_turn_without_seat_env_spawns_exactly_as_before(tmp_path: Path):
+    fake = FakeCli(
+        tmp_path,
+        [[
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": "hi"}]}},
+            {"type": "result", "usage": {}},
+        ]],
+    )
+    backend = mlb.CliManagerBackend(
+        "claude_cli", "m", tmp_path, plan_builder=fake.plan_builder, spawn=fake.spawn
+    )
+    fake.open_gate()
+
+    assert backend._extra_env is None
+    assert [event["type"] for event in backend.send("hi")] == ["assistant_text", "turn_end"]
+    assert fake.argv_calls and fake.stdin_texts == [None]
+
+
+def test_empty_seat_env_inherits_instead_of_spawning_blank(tmp_path: Path):
+    # Regression: provision returns {} for claude (no bindings needed); a bare
+    # env kills the child in milliseconds with no provider signal, recorded as
+    # worker_process_failure_no_provider_refusal_signal.
+    backend = mlb.CliManagerBackend("claude_cli", "m", tmp_path, extra_env={})
+    assert backend._extra_env is None
+
+    build = mlb.manager_backend_factory(
+        tmp_path,
+        declares_route=lambda *_a: True,
+        seat_env_provider=lambda _b, _m: {},
+    )
+    assert build("claude_cli", "m")._extra_env is None
+
+
+def test_seat_env_merges_over_inherited_environment(tmp_path: Path, monkeypatch: Any) -> None:
+    # Regression: a wholesale env replace drops SystemRoot/PATH and Bun dies
+    # in ~0.1s with no provider signal (worker_process_failure). Seat bindings
+    # must merge over inheritance.
+    monkeypatch.setenv("SEAT_INHERIT_PROBE", "kept")
+    process = mlb._spawn_cli(
+        [sys.executable, "-c", "import os,sys;sys.exit(0 if os.environ.get('SEAT_X') == '1' and os.environ.get('SEAT_INHERIT_PROBE') == 'kept' else 3)"],
+        str(tmp_path),
+        None,
+        {"SEAT_X": "1"},
+    )
+    try:
+        assert process.wait(timeout=30) == 0
+    finally:
+        for stream in (process.stdout, process.stderr):
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+
+def test_seat_turn_passes_merged_env_to_spawn(tmp_path: Path) -> None:
+    seen: dict[str, Any] = {}
+
+    def spawn(argv: Any, cwd: Any, stdin_text: Any = None, env: Any = None) -> Any:
+        seen.update(env=env)
+        raise OSError("stop-here")
+
+    backend = mlb.CliManagerBackend(
+        "codex_cli", "m", tmp_path,
+        plan_builder=lambda *a, **k: SimplePlan(["codex"], str(tmp_path)),
+        spawn=spawn,
+        extra_env={"SEAT_BINDING": "x"},
+    )
+    assert [event["type"] for event in backend.send("hi")] == ["error"]
+    # The backend forwards seat bindings untouched; _spawn_cli merges them
+    # over the inherited environment (SystemRoot/PATH) at spawn time.
+    assert seen["env"] == {"SEAT_BINDING": "x"}

@@ -7,11 +7,16 @@ session incrementally. Every :class:`~aiworkhub.manager_loop.ManagerLoopError`
 becomes ``{"ok": False, "error": <reason code>}`` here -- nothing raises
 across this module's boundary.
 
-This module resolves no manager route and reads no repository default: every
-function takes the repository root explicitly, so it is directly testable
-with a fake backend factory and a ``tmp_path`` repo. The six
-``aiworkhub_manager_loop_*`` MCP tools in ``server.py`` resolve the caller's
-repository through the shared manager route gate and pass it in.
+Apart from the first ``send`` to a passive conversation, this module resolves no
+manager route and reads no repository default: every function takes the
+repository root explicitly, so it is directly testable with a fake backend
+factory and a ``tmp_path`` repo. That first ``send`` resolves the repository's one
+configured, policy-authorized manager route under the turn lock, pins it and
+starts the turn, so no explicit ``start`` is needed; with no such route it is
+refused as ``no_manager_route_available`` and the conversation stays passive. An
+explicit ``start`` stays authoritative and a pinned session is never re-routed.
+The six ``aiworkhub_manager_loop_*`` MCP tools in ``server.py`` resolve the
+caller's repository through the shared manager route gate and pass it in.
 """
 
 from __future__ import annotations
@@ -21,9 +26,9 @@ import threading
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-from .manager_loop import ManagerLoopError, ManagerOrchestrator
-from .manager_loop_backends import manager_backend_factory
-from . import manager_loop_wake
+from .manager_loop import ManagerLoopError, ManagerOrchestrator, ManagerSession
+from .manager_loop_backends import MANAGER_BACKEND_IDS, cli_discovers_model, manager_backend_factory
+from . import manager_loop_wake, model_settings, workforce_catalog
 
 _REGISTRY_LOCK = threading.Lock()
 _ENTRIES: dict[str, "_Entry"] = {}
@@ -31,6 +36,12 @@ _ENTRIES: dict[str, "_Entry"] = {}
 WAKE_IDLE_POLL_SECONDS = manager_loop_wake.DEFAULT_IDLE_POLL_SECONDS
 WAKE_RETRY_POLL_SECONDS = manager_loop_wake.DEFAULT_RETRY_POLL_SECONDS
 default_callback_source = manager_loop_wake.default_callback_source
+
+NO_MANAGER_ROUTE_ERROR = "no_manager_route_available"
+NO_MANAGER_ROUTE_HINT = (
+    "enable a manager-capable route in the repository model policy or workforce catalog, "
+    "or start one explicitly"
+)
 
 
 @dataclasses.dataclass
@@ -53,16 +64,41 @@ class _Entry:
     wake_cap_per_hour: int = manager_loop_wake.DEFAULT_CAP_PER_HOUR
 
 
+def _seat_env_provider(repo_key: str) -> Callable[[str, str], Mapping[str, str]]:
+    """Seat MCP bindings per backend, provisioned at backend build time.
+
+    Runs inside start/pin (both launching-gated); provisioning writes only
+    the seat's own 0600 configs under ``.aiworkhub/runtime/manager-seat``.
+    Identity is never minted here -- it inherits from the gated child.
+    """
+
+    def provide(backend_id: str, model: str) -> Mapping[str, str]:
+        import sys
+
+        from . import manager_loop_backends, worker_ai_tools_mcp
+
+        return manager_loop_backends.provision_manager_seat_env(
+            repo_key,
+            backend_id,
+            python_executable=sys.executable,
+            package_import_root=worker_ai_tools_mcp.resolve_host_package_import_root(),
+        )
+
+    return provide
+
+
 def _entry_for(repo: str | Path) -> _Entry:
     key = str(Path(repo).resolve())
     with _REGISTRY_LOCK:
         entry = _ENTRIES.get(key)
         if entry is None:
-            orchestrator = ManagerOrchestrator.for_repository(repo, manager_backend_factory(repo))
+            orchestrator = ManagerOrchestrator.for_repository(
+                repo,
+                manager_backend_factory(repo, seat_env_provider=_seat_env_provider(key)),
+            )
             entry = _Entry(orchestrator=orchestrator)
             _ENTRIES[key] = entry
         return entry
-
 
 def _error(exc: ManagerLoopError) -> dict[str, Any]:
     return {"ok": False, "error": str(exc)}
@@ -77,11 +113,125 @@ def _entry_or_error(repo: str | Path) -> tuple[_Entry | None, dict[str, Any] | N
         return None, {"ok": False, "error": f"manager_loop_unavailable:{type(exc).__name__}"}
 
 
+def _route_authorized(policy: Mapping[str, Any], worker: Mapping[str, Any]) -> bool:
+    provider, adapter, model = worker["provider"], worker["adapter_id"], worker["model"]
+    owner, transport = workforce_catalog.policy_route_identity(provider, adapter)
+    return model_settings.evaluate_state(
+        policy, provider=owner, adapter=transport, model=model
+    ) and model_settings.evaluate_state(policy, provider=provider, adapter=adapter, model=model)
+
+
+def _eligible_manager_routes(
+    repo: str | Path,
+    *,
+    load_catalog: Callable[[str | Path], Mapping[str, Any]] = workforce_catalog.load_catalog,
+    load_policy: Callable[[str | Path], Mapping[str, Any]] = model_settings.load,
+) -> list[dict[str, Any]]:
+    """Every enabled, policy-authorized manager route, catalog order kept."""
+
+    policy = load_policy(repo)
+    return [
+        worker
+        for worker in load_catalog(repo)["workers"]
+        if worker["manager"]
+        and worker["enabled"]
+        and worker["adapter_id"] in MANAGER_BACKEND_IDS
+        and _route_authorized(policy, worker)
+    ]
+
+
+def resolve_manager_route(
+    repo: str | Path,
+    *,
+    load_catalog: Callable[[str | Path], Mapping[str, Any]] = workforce_catalog.load_catalog,
+    load_policy: Callable[[str | Path], Mapping[str, Any]] = model_settings.load,
+) -> tuple[str, str] | None:
+    """The highest-quality enabled, policy-authorized manager route (catalog order on ties)."""
+
+    eligible = _eligible_manager_routes(repo, load_catalog=load_catalog, load_policy=load_policy)
+    if not eligible:
+        return None
+    best = max(eligible, key=lambda worker: worker["quality_ceiling"])
+    return best["adapter_id"], best["model"]
+
+
+def authorize_selected_route(
+    repo: str | Path,
+    backend_id: str,
+    model: str,
+    *,
+    load_catalog: Callable[[str | Path], Mapping[str, Any]] = workforce_catalog.load_catalog,
+    load_policy: Callable[[str | Path], Mapping[str, Any]] = model_settings.load,
+) -> tuple[str, str] | None:
+    """The exact picker route when this repository may run it, else ``None``.
+
+    A catalog-declared, policy-authorized route is accepted. A route the
+    catalog does not declare is accepted only when the CLI itself lists it
+    and repository model policy still enables that identity. A declared
+    route that policy disabled is never re-authorized through CLI discovery.
+    """
+
+    for worker in _eligible_manager_routes(repo, load_catalog=load_catalog, load_policy=load_policy):
+        if worker["adapter_id"] == backend_id and worker["model"] == model:
+            return backend_id, model
+    if any(
+        worker["adapter_id"] == backend_id and worker["model"] == model
+        for worker in load_catalog(repo)["workers"]
+    ):
+        return None
+    if backend_id not in MANAGER_BACKEND_IDS or not cli_discovers_model(repo, backend_id, model):
+        return None
+    try:
+        provider, adapter = model_settings.policy_identity_for_adapter(backend_id)
+        allowed = model_settings.evaluate_state(
+            load_policy(repo), provider=provider, adapter=adapter, model=model
+        )
+    except model_settings.ModelSettingsError:
+        return None
+    if not allowed:
+        return None
+    return backend_id, model
+
+
+def _no_manager_route(detail: str = "") -> dict[str, Any]:
+    refusal: dict[str, Any] = {
+        "ok": False,
+        "error": NO_MANAGER_ROUTE_ERROR,
+        "hint": NO_MANAGER_ROUTE_HINT,
+    }
+    if detail:
+        refusal["detail"] = detail
+    return refusal
+
+
+def _pin_first_route(
+    entry: _Entry, repo: str | Path
+) -> tuple[ManagerSession | None, dict[str, Any] | None]:
+    """Pin the passive conversation to the resolved route; the caller holds ``turn_lock``."""
+
+    try:
+        route = resolve_manager_route(repo)
+    except Exception as exc:  # noqa: BLE001 - an unreadable catalog or policy authorizes nothing
+        return None, _no_manager_route(f"{type(exc).__name__}: {exc}"[:240])
+    if route is None:
+        return None, _no_manager_route()
+    try:
+        session = entry.orchestrator.start(*route)
+        _ensure_wake_started(entry, repo)
+    except ManagerLoopError as exc:
+        return None, _error(exc)
+    except Exception as exc:  # noqa: BLE001 - pinning must never cross the MCP boundary
+        return None, {"ok": False, "error": f"manager_loop_unavailable:{type(exc).__name__}"}
+    return session, None
+
+
 def _dispatch_turn(
     repo: str | Path,
     action: Callable[[ManagerOrchestrator], dict[str, Any]],
     *,
     record_last_turn: bool,
+    pin_passive_route: bool = False,
+    route: tuple[str, str] | None = None,
 ) -> dict[str, Any]:
     entry, err = _entry_or_error(repo)
     if err is not None:
@@ -89,6 +239,35 @@ def _dispatch_turn(
     if not entry.turn_lock.acquire(blocking=False):
         return {"ok": False, "error": "manager_turn_in_progress"}
     session = entry.orchestrator.session
+    if pin_passive_route and session is None:
+        # First-ever send: attach the repository's one passive conversation
+        # before pinning, so no explicit start is needed. ensure() is
+        # provider-free and idempotent; a live owner elsewhere stays a typed
+        # manager_session_already_active refusal.
+        try:
+            session = entry.orchestrator.ensure()
+        except ManagerLoopError as exc:
+            entry.turn_lock.release()
+            return _error(exc)
+        except Exception as exc:  # noqa: BLE001 - ensure must never cross the MCP boundary
+            entry.turn_lock.release()
+            return {"ok": False, "error": f"manager_loop_unavailable:{type(exc).__name__}"}
+    if route is not None:
+        # Picker-selected route: bind this turn to it (same route is a no-op,
+        # any other state re-opens the selection with a mechanical handoff).
+        try:
+            session = entry.orchestrator.ensure_route(*route)
+        except ManagerLoopError as exc:
+            entry.turn_lock.release()
+            return _error(exc)
+        except Exception as exc:  # noqa: BLE001 - route binding must never cross the MCP boundary
+            entry.turn_lock.release()
+            return {"ok": False, "error": f"manager_loop_unavailable:{type(exc).__name__}"}
+    elif pin_passive_route and session is not None and session.passive:
+        session, err = _pin_first_route(entry, repo)
+        if err is not None:
+            entry.turn_lock.release()
+            return err
     if session is None:
         entry.turn_lock.release()
         return {"ok": False, "error": "no_active_manager_session"}
@@ -119,7 +298,6 @@ def _dispatch_turn(
     thread.start()
     return {"ok": True, "session_id": session_id, "turn": turn, "state": "running"}
 
-
 def start(
     repo: str | Path,
     backend_id: str,
@@ -129,6 +307,10 @@ def start(
 ) -> dict[str, Any]:
     """Open the repository's one active session; synchronous, not backgrounded."""
 
+    try:
+        cap = max(0, int(wake_cap_per_hour))
+    except Exception as exc:  # noqa: BLE001 - a bad cap must not take the turn lock or cross the MCP boundary
+        return {"ok": False, "error": f"manager_loop_unavailable:{type(exc).__name__}"}
     entry, err = _entry_or_error(repo)
     if err is not None:
         return err
@@ -140,19 +322,58 @@ def start(
         return _error(exc)
     finally:
         entry.turn_lock.release()
-    entry.wake_cap_per_hour = max(0, int(wake_cap_per_hour))
+    entry.wake_cap_per_hour = cap
     _ensure_wake_started(entry, repo)
     return {"ok": True, "session": session.to_json()}
 
 
-def send(repo: str | Path, text: str) -> dict[str, Any]:
+def ensure(repo: str | Path) -> dict[str, Any]:
+    """Attach to the repository's one passive conversation; synchronous, provider-free."""
+
+    entry, err = _entry_or_error(repo)
+    if err is not None:
+        return err
+    try:
+        session = entry.orchestrator.ensure()
+    except ManagerLoopError as exc:
+        return _error(exc)
+    except Exception as exc:  # noqa: BLE001 - ensure must never cross the MCP boundary
+        return {"ok": False, "error": f"manager_loop_unavailable:{type(exc).__name__}"}
+    return {"ok": True, "session": session.to_json(), "running": entry.turn_lock.locked()}
+
+
+def send(
+    repo: str | Path,
+    text: str,
+    backend_id: str | None = None,
+    model: str | None = None,
+) -> dict[str, Any]:
     """Run one manager turn on a background thread.
 
     Refused with ``manager_turn_in_progress``, not queued, while one runs.
+    With an explicit picker route the turn binds to it (same route is a
+    no-op, any other state re-opens the selection with a mechanical
+    handoff); without one, the first send to a passive conversation pins
+    the one route :func:`resolve_manager_route` names. A named-but-unrunnable
+    route is refused before anything spawns.
     """
 
+    route: tuple[str, str] | None = None
+    if backend_id is not None or model is not None:
+        if not (backend_id or "").strip() or not (model or "").strip():
+            return {"ok": False, "error": "manager_route_selection_incomplete"}
+        route = authorize_selected_route(repo, backend_id.strip(), model.strip())
+        if route is None:
+            return {
+                "ok": False,
+                "error": f"manager_backend_unavailable:{backend_id.strip()}:{model.strip()}",
+            }
     return _dispatch_turn(
-        repo, lambda orchestrator: orchestrator.send(text), record_last_turn=True
+        repo,
+        lambda orchestrator: orchestrator.send(text),
+        record_last_turn=True,
+        pin_passive_route=bool(text.strip()),
+        route=route,
     )
 
 

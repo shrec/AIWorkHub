@@ -47,6 +47,8 @@ a worker is confined, the owner's manager seat is not.
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import subprocess
 import threading
 from pathlib import Path
@@ -104,6 +106,12 @@ def _assistant_text(value: Any) -> list[dict[str, Any]]:
     return [{"type": "assistant_text", "payload": {"text": text}}] if text else []
 
 
+def _reasoning(value: Any) -> list[dict[str, Any]]:
+    """One bounded model-reasoning event; thinking is evidence, not a secret."""
+    text = str(value or "").strip()
+    return [{"type": "reasoning", "payload": {"text": text}}] if text else []
+
+
 def _mapping(value: Any) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
 
@@ -130,6 +138,8 @@ def _claude_events(event: Mapping[str, Any]) -> list[dict[str, Any]]:
                     "output": block.get("content"),
                 },
             })
+        elif block.get("type") == "thinking":
+            events.extend(_reasoning(block.get("thinking")))
     return events
 
 
@@ -155,13 +165,15 @@ def _codex_events(event: Mapping[str, Any]) -> list[dict[str, Any]]:
 
 
 def _opencode_events(event: Mapping[str, Any]) -> list[dict[str, Any]]:
-    """OpenCode ``run --format json``: text and tool parts, then ``step_finish``."""
+    """OpenCode ``run --format json``: text, reasoning and tool parts, then ``step_finish``."""
     kind = str(event.get("type") or "")
     if kind == "step_finish":
         return [_turn_end(event.get("tokens"))]
     part = _mapping(event.get("part"))
     if kind == "text":
         return _assistant_text(part.get("text"))
+    if kind == "reasoning":
+        return _reasoning(part.get("text"))
     if kind != "tool":
         return []
     state = _mapping(part.get("state"))
@@ -258,8 +270,20 @@ def _codex_resume_options(tokens: list[str]) -> list[str]:
     return out
 
 
-def _spawn_cli(argv: Sequence[str], cwd: str | None, stdin_text: str | None = None) -> Any:
-    """Start one non-interactive CLI turn in its own process group; argv list, no shell."""
+def _spawn_cli(
+    argv: Sequence[str],
+    cwd: str | None,
+    stdin_text: str | None = None,
+    env: Mapping[str, str] | None = None,
+) -> Any:
+    """Start one non-interactive CLI turn in its own process group; argv list, no shell.
+
+    ``env`` seat bindings MERGE over the inherited environment; ``None``
+    inherits unchanged. A wholesale replace kills the child in milliseconds
+    (measured: Bun/opencode dies on missing SystemRoot with no provider
+    signal) -- the seat is the owner's own, so inheritance matches the
+    claude seat; scoping lives in the MCP allowlists, not env scrubbing.
+    """
     grouping: dict[str, Any] = (
         {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
         if platform_io.is_windows()
@@ -267,9 +291,11 @@ def _spawn_cli(argv: Sequence[str], cwd: str | None, stdin_text: str | None = No
     )
     # The argv list comes from build_runtime_command; shell=False is the default
     # and is never overridden, so no provider text is ever interpreted as a command.
+    child_env = dict(os.environ, **dict(env)) if env is not None else None
     process = subprocess.Popen(
         list(argv),
         cwd=cwd,
+        env=child_env,
         stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -294,7 +320,6 @@ def _spawn_cli(argv: Sequence[str], cwd: str | None, stdin_text: str | None = No
 
         threading.Thread(target=_feed, daemon=True).start()
     return process
-
 
 def _decode(raw: str) -> Mapping[str, Any] | None:
     """One stdout line as a JSON object; anything else is skipped, never fatal."""
@@ -383,7 +408,8 @@ class CliManagerBackend:
         mcp_config_path: Path | str | None = None,
         timeout_seconds: float = DEFAULT_TURN_TIMEOUT_SECONDS,
         plan_builder: Callable[..., Any] = runtime_adapters.build_manager_command,
-        spawn: Callable[[Sequence[str], str | None, str | None], Any] = _spawn_cli,
+        spawn: Callable[..., Any] = _spawn_cli,
+        extra_env: Mapping[str, str] | None = None,
     ) -> None:
         if backend_id not in MANAGER_BACKEND_IDS:
             raise ManagerLoopError(f"manager_backend_unsupported:{backend_id}")
@@ -398,11 +424,14 @@ class CliManagerBackend:
         self.timeout_seconds = float(timeout_seconds)
         self._plan_builder = plan_builder
         self._spawn = spawn
+        # An empty mapping means "no seat bindings": inherit, never spawn
+        # with a blank environment (a bare env kills the child in milliseconds
+        # with no provider signal -- measured as worker_process_failure).
+        self._extra_env = dict(extra_env) if extra_env else None
         self._brief = ""
         self._conversation_id = ""
         self._process: Any = None
         self._slot = threading.Lock()
-
     @property
     def conversation_id(self) -> str:
         """The provider conversation later turns resume, or ``""`` before the first turn."""
@@ -445,9 +474,13 @@ class CliManagerBackend:
             yield _turn_error("launch_plan", plan.validation_reason or "plan_not_launchable")
             return
         try:
-            process = self._spawn(
-                self.argv_for(plan), plan.cwd, getattr(plan, "stdin_text", None)
-            )
+            argv = self.argv_for(plan)
+            cwd = plan.cwd
+            stdin_text = getattr(plan, "stdin_text", None)
+            if self._extra_env is None:
+                process = self._spawn(argv, cwd, stdin_text)
+            else:
+                process = self._spawn(argv, cwd, stdin_text, dict(self._extra_env))
         except OSError as exc:
             yield _turn_error("spawn", f"{type(exc).__name__}: {exc}")
             return
@@ -487,6 +520,33 @@ class CliManagerBackend:
             )
 
 
+def _opencode_discovered_models() -> list[str]:
+    """Bound ``opencode models`` probe; [] on any failure.
+
+    Lives here, not in :mod:`cli_model_discovery`, because that module never
+    spawns a process by contract -- every function there reads a file a CLI
+    already wrote. Bounds mirror ``repo_policy._list_opencode_models``.
+    """
+    executable = shutil.which("opencode")
+    if not executable:
+        return []
+    try:
+        completed = subprocess.run(
+            [executable, "models"],
+            check=False,
+            capture_output=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return []
+    payload = completed.stdout or b""
+    if not payload:
+        payload = completed.stderr or b""
+    if len(payload) > 64 * 1024:
+        return []
+    return workforce_catalog.parse_opencode_models_output(payload)
+
+
 def cli_discovers_model(repo: Path | str, backend_id: str, model: str) -> bool:
     """Whether the CLI itself offers ``model`` (see :mod:`cli_model_discovery`).
 
@@ -498,14 +558,15 @@ def cli_discovers_model(repo: Path | str, backend_id: str, model: str) -> bool:
         return any(entry["model"] == model for entry in cli_model_discovery.codex_models())
     if backend_id == "claude_cli":
         return any(entry["model"] == model for entry in cli_model_discovery.claude_models(repo))
+    if backend_id == "opencode_cli":
+        return model in _opencode_discovered_models()
     return False
-
-
 def manager_backend_factory(
     repo: Path | str,
     *,
     mcp_config_path: Path | str | None = None,
     declares_route: Callable[..., bool] = workforce_catalog.catalog_declares_route,
+    seat_env_provider: Callable[[str, str], Mapping[str, str] | None] | None = None,
     **options: Any,
 ) -> Callable[[str, str], CliManagerBackend]:
     """The ``backend_factory`` :class:`~aiworkhub.manager_loop.ManagerOrchestrator` takes.
@@ -514,6 +575,11 @@ def manager_backend_factory(
     the repository's existing workforce registry, so a backend the catalog does
     not declare for this model is refused rather than launched. Every refusal is
     a named :class:`~aiworkhub.manager_loop.ManagerLoopError`.
+
+    ``seat_env_provider``, when given, is called as
+    ``provider(backend_id, model)`` at build time and its mapping becomes the
+    seat's child-process environment (seat MCP bindings); ``None`` inherits,
+    preserving the pre-seat behavior exactly.
     """
 
     root = Path(repo)
@@ -525,8 +591,81 @@ def manager_backend_factory(
             root, backend_id, model
         ):
             raise ManagerLoopError(f"manager_backend_unavailable:{backend_id}:{model}")
+        extra_env = seat_env_provider(backend_id, model) if seat_env_provider is not None else None
         return CliManagerBackend(
-            backend_id, model, root, mcp_config_path=mcp_config_path, **options
+            backend_id, model, root, mcp_config_path=mcp_config_path, extra_env=extra_env, **options
         )
 
     return build
+
+
+MANAGER_SEAT_RUNTIME_DIRNAME = "manager-seat"
+
+
+def _write_0600(path: Path, data: bytes) -> None:
+    """Write ``data`` owner-only, refusing symlinks (worker MCP writer shape)."""
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(path.parent, 0o700)
+    flags = os.O_CREAT | os.O_TRUNC | os.O_WRONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags, 0o600)
+    try:
+        os.write(fd, data)
+    finally:
+        os.close(fd)
+    os.chmod(path, 0o600)
+
+
+def provision_manager_seat_env(
+    repo: Path | str,
+    backend_id: str,
+    *,
+    python_executable: str,
+    package_import_root: Path | str,
+) -> dict[str, str]:
+    """Seat MCP bindings for one manager backend: config files plus child env.
+
+    ``claude_cli`` needs nothing: it loads the project's ``.mcp.json``
+    ``AIWorkHub`` server with ``cwd=repo``. ``codex_cli`` gets an isolated
+    ``CODEX_HOME`` holding a manager ``config.toml`` (0600). ``opencode_cli``
+    gets the manager config through its config-content env (project config
+    disabled). The embedded server env carries the repo binding plus the
+    write gate (create needs it); launch is deliberately absent. Identity
+    (thread/episode) is never written here: it flows from the launching
+    gated child through process env inheritance, and forgery fails closed.
+    """
+    if backend_id not in MANAGER_BACKEND_IDS:
+        raise ManagerLoopError(f"manager_backend_unsupported:{backend_id}")
+    root = Path(repo).resolve()
+    server_env = {
+        "AIWORKHUB_REPO": str(root),
+        "AIWORKHUB_REPO_ROOT": str(root),
+        "AIWORKHUB_ALLOW_WRITES": "1",
+        "PYTHONPATH": str(package_import_root),
+    }
+    if backend_id == "claude_cli":
+        return {}
+    seat_dir = root / ".aiworkhub" / "runtime" / MANAGER_SEAT_RUNTIME_DIRNAME
+    if backend_id == "codex_cli":
+        codex_home = seat_dir / "codex-home"
+        config_path = codex_home / "config.toml"
+        toml_text = runtime_adapters.build_manager_codex_config_toml(
+            python_executable=python_executable,
+            launch_args=[],
+            environment=server_env,
+        )
+        _write_0600(config_path, toml_text.encode("utf-8"))
+        return {"CODEX_HOME": str(codex_home)}
+    if backend_id == "opencode_cli":
+        config = runtime_adapters.build_opencode_manager_mcp_config(
+            [python_executable, "-m", "aiworkhub.server"],
+            environment=server_env,
+        )
+        return {
+            runtime_adapters.OPENCODE_WORKER_CONFIG_ENV: (
+                runtime_adapters.serialize_opencode_manager_config(config)
+            ),
+            runtime_adapters.OPENCODE_DISABLE_PROJECT_CONFIG_ENV: "1",
+        }
+    raise ManagerLoopError(f"manager_seat_mcp_unsupported:{backend_id}")

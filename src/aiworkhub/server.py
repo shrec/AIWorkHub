@@ -1804,19 +1804,44 @@ def aiworkhub_manager_loop_start(backend_id: str, model: str) -> dict[str, Any]:
 
 
 @mcp.tool()
-def aiworkhub_manager_loop_send(text: str) -> dict[str, Any]:
+def aiworkhub_manager_loop_ensure() -> dict[str, Any]:
+    """MANAGER WRITE: attach to the repository's one passive manager conversation.
+
+    Synchronous and provider-free: no backend is built and no model is
+    called. Takes the launching gate like ``start`` because it persists the
+    conversation record. The panel calls this on open instead of Start; the
+    first ``send`` then pins the policy route and runs the turn.
+    """
+
+    root, refusal = _manager_loop_repo_root(launching=True)
+    if refusal is not None:
+        return refusal
+    return manager_loop_service.ensure(root)
+
+
+@mcp.tool()
+def aiworkhub_manager_loop_send(
+    text: str, backend_id: str = "", model: str = ""
+) -> dict[str, Any]:
     """MANAGER WRITE: run one manager turn in the background.
 
     Returns at once with ``state: "running"``; a call while a turn is already
     running is refused with ``manager_turn_in_progress`` and nothing is
     queued. Poll ``aiworkhub_manager_loop_status`` or
     ``aiworkhub_manager_loop_events`` for the outcome.
+
+    ``backend_id``/``model`` carry the panel picker selection: the turn binds
+    to that exact route (same route is a no-op, a switch re-opens with a
+    mechanical handoff). Blank means "no selection" and keeps the legacy
+    policy-default pin behavior.
     """
 
     root, refusal = _manager_loop_repo_root(launching=True)
     if refusal is not None:
         return refusal
-    return manager_loop_service.send(root, text)
+    return manager_loop_service.send(
+        root, text, backend_id or None, model or None
+    )
 
 
 @mcp.tool()
