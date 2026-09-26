@@ -2583,7 +2583,9 @@ def _copy_one(source: Path, destination: Path) -> None:
     if not stat.S_ISREG(source_lstat.st_mode):
         raise WorkspaceError(f"non_regular_seed_forbidden:{source}")
 
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    # Windows CRT text mode translates CRLF and treats 0x1A as EOF.
+    # NF-2026-00970: the seed copy must be raw bytes.
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
     try:
         source_fd = os.open(source, flags)
     except OSError as exc:
@@ -2605,6 +2607,9 @@ def _copy_one(source: Path, destination: Path) -> None:
         destination.parent.mkdir(parents=True, exist_ok=True)
 
         temp_fd, temp_path = tempfile.mkstemp(dir=str(destination.parent))
+        if hasattr(os, "setmode"):
+            os.setmode(source_fd, os.O_BINARY)
+            os.setmode(temp_fd, os.O_BINARY)
 
         # Copy all bytes with explicit complete-write loop
         while True:
