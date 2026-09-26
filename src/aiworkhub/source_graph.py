@@ -1441,7 +1441,20 @@ def _index_quality_scorecard(
                 ),
                 "guidance": "use_exact_symbols_and_bounded_file_context",
             })
-
+    python_edges = int((by_language.get("python") or {}).get("edges") or 0)
+    javascript_edges = int((by_language.get("javascript") or {}).get("edges") or 0)
+    if python_edges and javascript_edges and not cross_language_edges:
+        thin_language_guidance.append({
+            "family": "python_javascript",
+            "files": (
+                int((by_language.get("python") or {}).get("files") or 0)
+                + int((by_language.get("javascript") or {}).get("files") or 0)
+            ),
+            "edges": python_edges + javascript_edges,
+            "resolved_edges": 0,
+            "resolved_edge_ratio": 0.0,
+            "guidance": "cross_language_call_boundary_unresolved",
+        })
     return {
         "schema_id": "aiworkhub.source_graph.index_quality.v1",
         "build_revision": BUILD_REVISION,

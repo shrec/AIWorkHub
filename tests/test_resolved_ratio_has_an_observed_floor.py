@@ -120,3 +120,22 @@ def test_a_real_build_carries_the_mark_and_flags_a_fall_below_it(tmp_path):
     degraded = sg._resolved_ratio_high_water_mark({"edges": edges}, 0.0)
     assert degraded == best
     assert 0.0 < best - sg._RESOLVED_RATIO_FLOOR_TOLERANCE
+
+
+def test_python_javascript_boundary_with_no_edges_is_guidance_not_healthy_silence(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    bootstrap_repository(repo)
+    (repo / "pkg").mkdir()
+    (repo / "pkg" / "service.py").write_text(
+        "def caller():\n    helper()\n", encoding="utf-8"
+    )
+    (repo / "web").mkdir()
+    (repo / "web" / "app.js").write_text(
+        "function caller() { helper(); }\n", encoding="utf-8"
+    )
+    quality = sg.build_index(repo, incremental=False).index_quality
+    families = {row["family"] for row in quality["thin_language_guidance"]}
+    assert quality["edges"]["cross_language"] == 0
+    assert "python_javascript" in families
+    assert quality["degraded"] is False
