@@ -415,6 +415,40 @@ def test_provider_observability_names_the_declared_command_when_not_installed(
     assert report["install_evidence"] == "not_installed:not found on PATH"
 
 
+def test_resolved_exe_basename_does_not_select_platform_or_route_family(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """NF-2026-00030: claude.exe is a package bin name, not the host OS."""
+    root = _initialized_root(tmp_path)
+    resolved = "/private/host/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe"
+    monkeypatch.setattr(
+        repo_policy.runtime_adapters,
+        "resolve_executable",
+        lambda adapter_id: runtime_adapters.ExecutableResolution(adapter_id, resolved, True, ""),
+    )
+    monkeypatch.setattr(repo_policy, "_is_windows_host", lambda: False)
+    monkeypatch.setattr(repo_policy.claude_auth, "auth_status", lambda executable=None: {})
+    report = repo_policy.describe_provider_observability(root, "claude_cli")
+    status = repo_policy._provider_status(
+        root, "claude_cli", repo_policy.load_policy(root), "bubblewrap", "",
+    )
+    assert report["install_resolved"] == "claude.exe"
+    assert report["install_evidence"] == "binary_resolved:claude.exe"
+    assert report["route_family"] == runtime_adapters.route_family("claude_cli")
+    assert "windows" not in report["route_family"]
+    assert status["platform_excluded"] is False
+    needles = ("install_resolved", "install_evidence")
+    readers = []
+    for base in (Path("src"), Path("vscode-extension")):
+        for path in base.rglob("*"):
+            if path.suffix not in {".py", ".js", ".mjs"}:
+                continue
+            text = path.read_text(encoding="utf-8")
+            if any(needle in text for needle in needles):
+                readers.append(path.as_posix())
+    assert readers == ["src/aiworkhub/repo_policy.py"]
+
+
 def test_preflight_filters_disabled_observed_models_without_hiding_reachability(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
