@@ -787,6 +787,10 @@ class _PathGrant:
     # A persistent grant the DACL already satisfied (nothing was written):
     # "container_sid" or "all_application_packages".  See _satisfying_trustee.
     satisfied_by: str = ""
+    # Whether the ACE that was written is inheritable.  A revoke has to reach
+    # every descendant that inherited it, and only then; a traverse ACE never
+    # reached one, so its revoke writes one object (NF-2026-01020).
+    inheritable: bool = True
 
 
 @dataclass
@@ -991,10 +995,28 @@ class _EXPLICIT_ACCESS_W(ctypes.Structure):
     ]
 
 
+class _SECURITY_DESCRIPTOR(ctypes.Structure):
+    """An absolute SECURITY_DESCRIPTOR: what SetFileSecurityW is handed when a
+    non-inheritable ACE is written to one object only (NF-2026-01020)."""
+
+    _fields_ = [
+        ("Revision", ctypes.c_ubyte),
+        ("Sbz1", ctypes.c_ubyte),
+        ("Control", wintypes.WORD),
+        ("Owner", wintypes.LPVOID),
+        ("Group", wintypes.LPVOID),
+        ("Sacl", wintypes.LPVOID),
+        ("Dacl", wintypes.LPVOID),
+    ]
+
+
+_SECURITY_DESCRIPTOR_REVISION = 1
 _GRANT_ACCESS = 1  # ACCESS_MODE.GRANT_ACCESS
 _REVOKE_ACCESS = 4  # ACCESS_MODE.REVOKE_ACCESS: drop the trustee's allow ACEs
 _TRUSTEE_IS_SID = 0
 _SUB_CONTAINERS_AND_OBJECTS_INHERIT = 0x3  # OBJECT_INHERIT | CONTAINER_INHERIT
+_SE_DACL_AUTO_INHERIT_REQ = 0x0100
+_SE_DACL_AUTO_INHERITED = 0x0400
 _SE_DACL_PROTECTED = 0x1000
 _PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000
 _UNPROTECTED_DACL_SECURITY_INFORMATION = 0x20000000
@@ -2853,6 +2875,33 @@ class _CtypesWin32Api:
             wintypes.LPVOID,
             wintypes.LPVOID,
         ]
+        # The object-only write a non-inheritable ACE takes instead
+        # (NF-2026-01020): build an absolute descriptor carrying the merged
+        # DACL and its control bits and hand it to this one file or directory.
+        a.InitializeSecurityDescriptor.restype = wintypes.BOOL
+        a.InitializeSecurityDescriptor.argtypes = [
+            wintypes.LPVOID,
+            wintypes.DWORD,
+        ]
+        a.SetSecurityDescriptorDacl.restype = wintypes.BOOL
+        a.SetSecurityDescriptorDacl.argtypes = [
+            wintypes.LPVOID,
+            wintypes.BOOL,
+            wintypes.LPVOID,
+            wintypes.BOOL,
+        ]
+        a.SetSecurityDescriptorControl.restype = wintypes.BOOL
+        a.SetSecurityDescriptorControl.argtypes = [
+            wintypes.LPVOID,
+            wintypes.WORD,
+            wintypes.WORD,
+        ]
+        a.SetFileSecurityW.restype = wintypes.BOOL
+        a.SetFileSecurityW.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+        ]
 
     # -- identity -----------------------------------------------------------
 
@@ -2942,13 +2991,21 @@ class _CtypesWin32Api:
                 return _PathGrant(path, access, satisfied_by=satisfied_by)
         changed = self._set_sid_entry(
             path, sid, _GRANT_ACCESS, mask, inherit, "grant_path_access",
+            # Only an inheritable ACE needs the propagating write; the ancestor
+            # traverse chain reaches no descendant (NF-2026-01020).
+            propagates=bool(inherit),
             denied_detail=(
                 _all_packages_grant_hint(path)
                 if persistent and access == "read_execute"
                 else ""
             ),
         )
-        return _PathGrant(path, access, sid if changed and not persistent else None)
+        return _PathGrant(
+            path,
+            access,
+            sid if changed and not persistent else None,
+            inheritable=bool(inherit),
+        )
 
     def revoke_path_access(self, grant: _PathGrant) -> None:
         """Remove this container SID's explicit ACEs from ``grant.path``.
@@ -2961,7 +3018,13 @@ class _CtypesWin32Api:
             return
         sid, grant.restore = grant.restore, None
         try:
-            self._set_sid_entry(grant.path, sid, _REVOKE_ACCESS, 0, 0, "revoke_path_access")
+            self._set_sid_entry(
+                grant.path, sid, _REVOKE_ACCESS, 0, 0, "revoke_path_access",
+                # What was granted decides how it is withdrawn: an inheritable
+                # ACE has to be taken back off the descendants that inherited
+                # it, a traverse ACE never reached one (NF-2026-01020).
+                propagates=grant.inheritable,
+            )
         except _Win32Failure as exc:
             grant.revoke_error = exc.win_error or -1
         except Exception:
@@ -2993,7 +3056,7 @@ class _CtypesWin32Api:
 
     def _set_sid_entry(
         self, path: str, sid: bytes, mode: int, mask: int, inherit: int, operation: str,
-        *, denied_detail: str = "",
+        *, propagates: bool, denied_detail: str = "",
     ) -> bool:
         """Read ``path``'s DACL, apply one EXPLICIT_ACCESS entry for ``sid``,
         write it back.  False (nothing written) for a NULL DACL: it already
@@ -3002,7 +3065,16 @@ class _CtypesWin32Api:
         replaces the failure detail if the write is refused with
         ERROR_ACCESS_DENIED (no WRITE_DAC). Never calls SetNamedSecurityInfo
         on ``C:\\Users``, a protected ancestor outside the profile, or a
-        Windows volume root."""
+        Windows volume root.
+
+        ``propagates`` says whether the ACE being applied or removed is
+        inheritable.  Only then is the merged DACL written with
+        SetNamedSecurityInfoW, which re-propagates inheritance so every
+        existing descendant gains (or loses) its inherited copy.  A
+        non-inheritable ACE -- the ancestor traverse chain and its revokes --
+        has no descendant to reach, so it goes to this one object through
+        :meth:`_write_object_dacl` (NF-2026-01020).
+        """
         if _boundary_omits_dacl_write(path):
             return False
         a = self._advapi32
@@ -3042,8 +3114,12 @@ class _CtypesWin32Api:
             if status:
                 raise _Win32Failure(int(status), operation, f"merge ACE {path}")
             try:
-                status = a.SetNamedSecurityInfoW(
-                    path, _SE_FILE_OBJECT, info, None, None, merged, None
+                status = (
+                    a.SetNamedSecurityInfoW(
+                        path, _SE_FILE_OBJECT, info, None, None, merged, None
+                    )
+                    if propagates
+                    else self._write_object_dacl(path, info, merged, control.value)
                 )
             finally:
                 self._kernel32.LocalFree(merged)
@@ -3057,6 +3133,45 @@ class _CtypesWin32Api:
             return True
         finally:
             self._kernel32.LocalFree(descriptor)
+
+    def _write_object_dacl(self, path: str, info: int, dacl: Any, control: int) -> int:
+        """Write ``dacl`` to ``path``'s own security descriptor and nothing else.
+
+        NF-2026-01020: SetNamedSecurityInfo re-propagates inheritance into every
+        existing child object, so one traverse ACE on ``C:\\Users\\<user>`` or on
+        an AppData ancestor walks the whole user profile -- twice per launch,
+        once to grant and once to revoke on close.  SetFileSecurityW writes this
+        object alone.  A fresh descriptor carries no control bits, and written
+        bare it drops the DACL's auto-inherited flag and, on a protected DACL,
+        its protection (measured: the explicit ACEs come back as inherited), so
+        ``control`` -- the bits read with the DACL -- is copied onto it:
+        SE_DACL_PROTECTED as read, SE_DACL_AUTO_INHERITED together with the
+        SE_DACL_AUTO_INHERIT_REQ it needs to survive the write.  Returns a Win32
+        status, ``0`` on success, so the caller's failure handling is unchanged;
+        a refusal that reports no error code still reports one, never success.
+        """
+        a = self._advapi32
+        descriptor = _SECURITY_DESCRIPTOR()
+        if not a.InitializeSecurityDescriptor(
+            ctypes.byref(descriptor), _SECURITY_DESCRIPTOR_REVISION
+        ):
+            return _last_win_error() or -1
+        if not a.SetSecurityDescriptorDacl(
+            ctypes.byref(descriptor), True, dacl, False
+        ):
+            return _last_win_error() or -1
+        bits = control & (_SE_DACL_AUTO_INHERITED | _SE_DACL_PROTECTED)
+        if bits & _SE_DACL_AUTO_INHERITED:
+            bits |= _SE_DACL_AUTO_INHERIT_REQ
+        if not a.SetSecurityDescriptorControl(
+            ctypes.byref(descriptor),
+            _SE_DACL_AUTO_INHERIT_REQ | _SE_DACL_AUTO_INHERITED | _SE_DACL_PROTECTED,
+            bits,
+        ):
+            return _last_win_error() or -1
+        if not a.SetFileSecurityW(path, info, ctypes.byref(descriptor)):
+            return _last_win_error() or -1
+        return 0
 
     def _grant_already_satisfied(
         self, sid: bytes, path: str, mask: int, inherit: int

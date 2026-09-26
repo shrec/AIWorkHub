@@ -2753,10 +2753,12 @@ def test_users_directory_dacl_write_is_omitted_and_does_not_abort_launch(tmp_pat
     omitted = api.grant_path_access(_identity(), users, "traverse")
     assert omitted.restore is None
     assert lib.set_calls == []
+    assert lib.object_calls == []  # NF-2026-01020 opens no second write path
     assert lib.entries == []
     root_grant = api.grant_path_access(_identity(), root, "traverse")
     assert root_grant.restore is None
     assert lib.set_calls == []
+    assert lib.object_calls == []
     # A descendant leaf under trusted temp is still written.
     written = api.grant_path_access(_identity(), str(leaf), "modify")
     assert written.restore == _SID
@@ -2765,6 +2767,7 @@ def test_users_directory_dacl_write_is_omitted_and_does_not_abort_launch(tmp_pat
     api.revoke_path_access(omitted)
     api.revoke_path_access(root_grant)
     assert len(lib.set_calls) == 1
+    assert lib.object_calls == []
 
 
 def test_the_traverse_mask_carries_no_list_read_write_or_delete_right():
@@ -2799,7 +2802,12 @@ def _identity():
 
 
 class FakeSecurityLib:
-    """Stands in for both advapi32 and kernel32 in the grant/revoke path."""
+    """Stands in for both advapi32 and kernel32 in the grant/revoke path.
+
+    ``set_calls`` records the propagating write (SetNamedSecurityInfoW, which
+    walks every existing descendant) and ``object_calls`` the object-only one
+    (SetFileSecurityW), so a test can say which API touched which path.
+    """
 
     def __init__(self, *, dacl=222, protected=False, set_status=0):
         self.dacl = dacl
@@ -2807,6 +2815,7 @@ class FakeSecurityLib:
         self.set_status = set_status
         self.entries = []
         self.set_calls = []
+        self.object_calls = []
         self.freed = []
 
     def GetLengthSid(self, sid):
@@ -2835,6 +2844,31 @@ class FakeSecurityLib:
         self.set_calls.append((path, info, getattr(dacl, "value", dacl)))
         return self.set_status
 
+    # -- the object-only write (NF-2026-01020) ------------------------------
+
+    def InitializeSecurityDescriptor(self, descriptor, revision):
+        descriptor._obj.Revision = revision
+        descriptor._obj.Control = 0
+        descriptor._obj.Dacl = None
+        return 1
+
+    def SetSecurityDescriptorDacl(self, descriptor, present, dacl, defaulted):
+        if not present or defaulted:
+            return 0
+        descriptor._obj.Dacl = getattr(dacl, "value", dacl)
+        return 1
+
+    def SetSecurityDescriptorControl(self, descriptor, interest, bits):
+        if interest & ~0x3F00:  # only the auto-inherit/protected bits are settable
+            return 0
+        sd = descriptor._obj
+        sd.Control = (sd.Control & ~interest) | (bits & interest)
+        return 1
+
+    def SetFileSecurityW(self, path, info, descriptor):
+        self.object_calls.append((path, info, descriptor._obj.Dacl))
+        return 0 if self.set_status else 1
+
     def LocalFree(self, ptr):
         self.freed.append(getattr(ptr, "value", ptr))
 
@@ -2849,6 +2883,9 @@ def _security_api(lib, monkeypatch, *, present=None):
         return "container_sid" if present else ""
 
     monkeypatch.setattr(api, "_grant_already_satisfied", _present)
+    # SetFileSecurityW reports failure through GetLastError, not a status
+    # return, so the double's ``set_status`` has to reach it the same way.
+    monkeypatch.setattr(wac, "_last_win_error", lambda: lib.set_status)
     return api
 
 
@@ -2891,11 +2928,19 @@ def test_ctypes_traverse_grant_is_minimal_and_non_inheritable(
     # READ_CONTROL | FILE_READ_ATTRIBUTES | FILE_TRAVERSE only.  Inheritance
     # must stay zero so an ancestor grant cannot expose unrelated descendants.
     assert lib.entries == [(1, 0x000200A0, _GRANT, 0, 0, _SID, 222)]
-    assert lib.set_calls == [(str(tmp_path), 0x4 | 0x20000000, 333)]
+    # NF-2026-01020: because nothing inherits it, the merged DACL goes to this
+    # one object.  SetNamedSecurityInfo would instead re-propagate inheritance
+    # through every existing descendant of each granted profile ancestor.
+    assert lib.set_calls == []
+    assert lib.object_calls == [(str(tmp_path), 0x4 | 0x20000000, 333)]
     assert grant.restore == _SID
+    assert grant.inheritable is False
 
     api.revoke_path_access(grant)
     assert lib.entries[-1] == (1, 0, _REVOKE, 0, 0, _SID, 222)
+    assert lib.set_calls == []
+    assert lib.object_calls[-1] == (str(tmp_path), 0x4 | 0x20000000, 333)
+    assert len(lib.object_calls) == 2
     assert grant.revoke_error is None
 
 
@@ -2926,8 +2971,13 @@ def test_ctypes_persistent_file_grant_is_not_inheritable_and_never_revoked(
     assert lib.entries[0][1:4] == (0x1200A9, _GRANT, 0)
     assert grant.restore is None
     assert lib.freed == [333, 111]
+    # NF-2026-01020: a file has no child to inherit this ACE, so the merged
+    # DACL is written to that one object and never re-propagated.
+    assert lib.set_calls == []
+    assert len(lib.object_calls) == 1
     api.revoke_path_access(grant)
-    assert len(lib.set_calls) == 1
+    assert lib.set_calls == []
+    assert len(lib.object_calls) == 1
 
 
 def test_ctypes_grant_leaves_a_null_dacl_alone(tmp_path, monkeypatch):
