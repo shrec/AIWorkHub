@@ -14,6 +14,10 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.11.80
+
+- MCP tool calls from the extension bind to their Python handlers. Member calls such as document.createElement do not.
+
 ## What's new in 0.11.79
 
 - Source Graph health no longer stays silent when Python and JavaScript never call across the boundary.

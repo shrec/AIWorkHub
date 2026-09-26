@@ -6,6 +6,13 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.80] - 2026-09-26
+
+### Fixed
+
+- JavaScript member calls such as document.createElement no longer bind to a same-file helper just because the name matches.
+- A JavaScript callTool of an exact aiworkhub_ tool name binds to the one Python function that tool registry names.
+
 ## [0.11.79] - 2026-09-26
 
 ### Fixed

@@ -1,5 +1,11 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.80 — 2026-09-26
+
+### Fixed
+
+- Source Graph no longer treats document.createElement as a local helper, and it binds an exact MCP tool call to its Python handler.
+
 ## 0.11.79 — 2026-09-26
 
 ### Fixed
