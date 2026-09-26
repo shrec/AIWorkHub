@@ -2580,6 +2580,148 @@ def test_timed_out_sealed_delta_supersedes_earlier_predecessor(
         assert (late_workspace / path).read_bytes() == original
 
 
+def test_later_timed_out_delta_supersedes_predecessor_that_has_workspace(
+    tmp_path: Path,
+) -> None:
+    """NF-2026-00930: a reviewer workspace must not hide a later sealed timeout."""
+    repo = _setup_repo(tmp_path)
+    task_id = "NF2026_00930_WORKSPACE_SUPERSEDES"
+    runner = "codex_worker_test"
+    topic = "aiworkhub_blocked_rework_recovery"
+    now = "2026-08-06T00:00:00+00:00"
+    path = "src/aiworkhub/a.py"
+    early_request_id = "a" * 32
+    late_request_id = "b" * 32
+    baseline = repo / path
+    baseline.parent.mkdir(parents=True, exist_ok=True)
+    baseline.write_bytes(b"baseline\n")
+
+    def seal(request_id: str, claim_epoch: int, body: bytes) -> tuple[dict, str]:
+        workspace = repo / ".aiworkhub" / "runtime" / "worktrees" / request_id / "worktree"
+        candidate = workspace / path
+        candidate.parent.mkdir(parents=True, exist_ok=True)
+        candidate.write_bytes(body)
+        digest = hashlib.sha256(body).hexdigest()
+        authority = {
+            "schema_id": "aiworkhub.python_candidate_authority.v1",
+            "sources": [{"path": path, "state": "modified", "bytes_sha256": digest}],
+        }
+        parent_baseline = {
+            path: "file:664:" + hashlib.sha256(b"baseline\n").hexdigest()
+        }
+        evidence = {
+            "changed_paths": [path],
+            "changed_path_hashes": {path: digest},
+            "request_identity": {
+                "request_id": request_id,
+                "task_id": task_id,
+                "runner": runner,
+                "topic": topic,
+                "repo": str(repo),
+                "claim_epoch": claim_epoch,
+                "allowed_writes": [path],
+                "parent_baseline": dict(parent_baseline),
+                "base_oid": "b" * 40,
+            },
+            "workspace": {
+                "request_id": request_id,
+                "repo": str(repo),
+                "path": str(workspace),
+                "allowed_writes": [path],
+                "parent_baseline": dict(parent_baseline),
+                "base_oid": "b" * 40,
+                "python_candidate_authority": authority,
+            },
+            "python_candidate_authority": authority,
+        }
+        return evidence, digest
+
+    early_evidence, early_hash = seal(early_request_id, 1, b"early\n")
+    late_evidence, late_hash = seal(late_request_id, 2, b"late\n")
+    early_predecessor = {
+        "schema_id": "aiworkhub.rework_predecessor.v1",
+        "request_id": early_request_id,
+        "task_id": task_id,
+        "repo": str(repo),
+        "claim_epoch": 1,
+        "allowed_writes": [path],
+        "changed_paths": [path],
+        "changed_path_hashes": {path: early_hash},
+        "workspace": early_evidence["workspace"],
+    }
+    late_terminal = {
+        "substatus": "timed_out",
+        "claim_epoch": 2,
+        "request_id": late_request_id,
+        "evidence": late_evidence,
+    }
+    card = {
+        "task_id": task_id,
+        "runner": runner,
+        "topic": topic,
+        "allowed_writes": [path],
+        "required_outputs": [],
+        "claim_epoch": 2,
+        "launch_request_id": late_request_id,
+        "status": "blocked",
+        "worker_status": "timed_out",
+        "terminal_substatus": "timed_out",
+        "terminal_failure": late_terminal,
+        "rework_predecessor": early_predecessor,
+        "blocker_reason": "timed_out: worker timed out",
+        "blocked_at": now,
+        "blocked_by": runner,
+    }
+    _readiness, db_path = task_store._require_ready(repo)
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO tasks(task_id, runner, topic, status, worker_status, "
+            "priority, objective, card_json, created_at, updated_at, claimed_by, "
+            "claimed_at, started_at, completed_at) "
+            "VALUES (?, ?, ?, 'blocked', 'timed_out', '', '', ?, ?, ?, '', '', '', ?)",
+            (task_id, runner, topic, json.dumps(card), now, now, now),
+        )
+        conn.execute(
+            "INSERT INTO task_events(task_id, event, runner, payload_json, created_at) "
+            "VALUES (?, 'terminal_review', ?, ?, ?)",
+            (
+                task_id,
+                runner,
+                json.dumps({
+                    "substatus": "review_ready",
+                    "claim_epoch": 1,
+                    "request_id": early_request_id,
+                    "evidence": early_evidence,
+                }),
+                "2026-08-06T00:00:01+00:00",
+            ),
+        )
+        conn.execute(
+            "INSERT INTO task_events(task_id, event, runner, payload_json, created_at) "
+            "VALUES (?, 'terminal_failure', ?, ?, ?)",
+            (
+                task_id,
+                runner,
+                json.dumps(late_terminal),
+                "2026-08-06T00:00:02+00:00",
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    assert task_store.recover_blocked_rework(
+        repo,
+        task_id,
+        actor="coordinator",
+        feedback_reason="NeedFix: keep the later timeout",
+    ) == (True, "recovered")
+    pred = _get_card(repo, task_id)["rework_predecessor"]
+    assert pred["request_id"] == late_request_id
+    assert pred["claim_epoch"] == 2
+    assert pred["changed_path_hashes"] == {path: late_hash}
+
 _NF919_PATHS = tuple(
     f"src/aiworkhub/nf919_{name}.py" for name in ("a", "b", "c", "d", "e", "f", "g")
 )

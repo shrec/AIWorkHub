@@ -5256,36 +5256,55 @@ def recover_blocked_rework(
         # rework may reuse its exact retained candidate, but must not replace
         # any review evidence or pinned predecessor with failure history.
         # A later terminal failure (a re-run that timed out after an earlier
-        # pinned predecessor) supersedes that stale predecessor, so bind the
-        # newest failure and re-derive the predecessor from its sealed delta
-        # instead of inheriting the earlier one (NF-2026-00515).
-        if terminal_row is None:
-            newest_terminal_failure = conn.execute(
-                "SELECT runner, payload_json, created_at FROM task_events "
-                "WHERE task_id=? AND event='terminal_failure' ORDER BY rowid DESC LIMIT 1",
-                (task_id,),
-            ).fetchone()
-            newest_failure_payload: dict[str, object] = {}
-            if newest_terminal_failure is not None:
-                try:
-                    parsed_failure = json.loads(
-                        str(newest_terminal_failure["payload_json"] or "{}")
-                    )
-                    if isinstance(parsed_failure, dict):
-                        newest_failure_payload = parsed_failure
-                except json.JSONDecodeError:
-                    newest_failure_payload = {}
-            if newest_terminal_failure is not None and (
-                not retained_predecessor
-                or (
-                    not validation_only_replay
-                    and _terminal_failure_supersedes_predecessor(
-                        newest_failure_payload, retained_predecessor
-                    )
+        # pinned predecessor) supersedes that stale predecessor, including when
+        # the predecessor still carries a reviewer workspace. Bind the newest
+        # failure and re-derive the predecessor from its sealed delta instead
+        # of inheriting the earlier one (NF-2026-00515, NF-2026-00930).
+        # validation_only_replay keeps the reviewer workspace; this pass must
+        # not rewrite that authorization.
+        newest_terminal_failure = conn.execute(
+            "SELECT runner, payload_json, created_at FROM task_events "
+            "WHERE task_id=? AND event='terminal_failure' ORDER BY rowid DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        newest_failure_payload: dict[str, object] = {}
+        if newest_terminal_failure is not None:
+            try:
+                parsed_failure = json.loads(
+                    str(newest_terminal_failure["payload_json"] or "{}")
                 )
-            ):
-                terminal_event = "terminal_failure"
-                terminal_row = newest_terminal_failure
+                if isinstance(parsed_failure, dict):
+                    newest_failure_payload = parsed_failure
+            except json.JSONDecodeError:
+                newest_failure_payload = {}
+        failure_epoch = newest_failure_payload.get("claim_epoch")
+        review_epoch = None
+        if terminal_row is not None:
+            try:
+                parsed_review = json.loads(str(terminal_row["payload_json"] or "{}"))
+                if isinstance(parsed_review, dict):
+                    review_epoch = parsed_review.get("claim_epoch")
+            except json.JSONDecodeError:
+                review_epoch = None
+        failure_is_later_than_review = terminal_row is None or (
+            type(review_epoch) is int
+            and type(failure_epoch) is int
+            and failure_epoch > review_epoch
+        )
+        if newest_terminal_failure is not None and failure_is_later_than_review and (
+            (
+                terminal_row is None
+                and not retained_predecessor
+            )
+            or (
+                not validation_only_replay
+                and _terminal_failure_supersedes_predecessor(
+                    newest_failure_payload, retained_predecessor
+                )
+            )
+        ):
+            terminal_event = "terminal_failure"
+            terminal_row = newest_terminal_failure
 
         if validation_only_replay and has_reviewer_transport and not successful_preparation:
             predecessor_request_id = str(
