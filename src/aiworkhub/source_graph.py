@@ -2873,6 +2873,267 @@ def _resolve_javascript_imported_calls(
     return resolved
 
 
+_MCP_TOOL_PROTOCOL_EXTRACTOR = "aiworkhub.source_graph.mcp_tool_protocol.v1"
+_PYTHON_TOOL_CONST = re.compile(
+    r'''^([A-Z][A-Z0-9_]*)\s*(?::\s*str\s*)?=\s*["'](aiworkhub_[A-Za-z0-9_]+)["']'''
+)
+_PYTHON_TOOLS_DICT_START = re.compile(
+    r"^[A-Za-z_][A-Za-z0-9_]*TOOLS(?:\s*:\s*[^=]+)?\s*=\s*\{(.*)$"
+)
+_PYTHON_STRING_ENTRY = re.compile(
+    r'''["'](aiworkhub_[A-Za-z0-9_]+)["']\s*:\s*([A-Za-z_][A-Za-z0-9_]*)'''
+)
+_PYTHON_CONST_ENTRY = re.compile(
+    r"\b([A-Z][A-Z0-9_]*)\s*:\s*([A-Za-z_][A-Za-z0-9_]*)\b"
+)
+_JS_STRING_CONST = re.compile(
+    r'''(?:const|let|var)\s+([A-Z][A-Z0-9_]*)\s*=\s*["'](aiworkhub_[A-Za-z0-9_]+)["']'''
+)
+_JS_OBJECT_START = re.compile(
+    r"(?:const|let|var)\s+([A-Z][A-Z0-9_]*)\s*=\s*(?:Object\.freeze\()?\s*\{"
+)
+_JS_PROP_STRING = re.compile(
+    r'''([A-Za-z_][A-Za-z0-9_]*)\s*:\s*["'](aiworkhub_[A-Za-z0-9_]+)["']'''
+)
+_JS_CALL_ARG = re.compile(r"(?:callTool|_callToolRaw)\s*\(\s*([^,)\n]+)")
+_JS_NAME_FIELD = re.compile(r"\bname\s*:\s*([^,}\n]+)")
+_JS_QUOTED = re.compile(r'''^["'](aiworkhub_[A-Za-z0-9_]+)["']$''')
+_JS_CALL_OPEN = re.compile(r"(?:callTool|_callToolRaw)\s*\(\s*$")
+
+
+def _python_mcp_tool_targets(text: str) -> list[tuple[str, str]]:
+    """Exact *_TOOLS entries: a literal tool name and the function it names."""
+
+    constants: dict[str, str] = {}
+    for raw_line in text.splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        match = _PYTHON_TOOL_CONST.match(line)
+        if match:
+            constants[match.group(1)] = match.group(2)
+    targets: list[tuple[str, str]] = []
+    in_dict = False
+    for raw_line in text.splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        if not in_dict:
+            start = _PYTHON_TOOLS_DICT_START.match(line)
+            if start is None:
+                continue
+            body = start.group(1)
+            in_dict = not line.endswith("}")
+        else:
+            if line.startswith("}"):
+                in_dict = False
+                continue
+            body = line
+        for match in _PYTHON_STRING_ENTRY.finditer(body):
+            targets.append((match.group(1), match.group(2)))
+        for match in _PYTHON_CONST_ENTRY.finditer(body):
+            tool_name = constants.get(match.group(1))
+            if tool_name:
+                targets.append((tool_name, match.group(2)))
+        if line.endswith("}") or line.endswith("},"):
+            in_dict = False
+    return targets
+
+
+def _javascript_tool_aliases(text: str) -> dict[str, str]:
+    """Same-file const and object property aliases for an aiworkhub_ tool name."""
+
+    aliases: dict[str, str] = {}
+    object_name = ""
+    for raw_line in text.splitlines():
+        code = raw_line.split("//", 1)[0]
+        const = _JS_STRING_CONST.search(code)
+        if const:
+            aliases[const.group(1)] = const.group(2)
+        if object_name:
+            for prop in _JS_PROP_STRING.finditer(code):
+                aliases[object_name + "." + prop.group(1)] = prop.group(2)
+            if "})" in code or code.strip().startswith("}"):
+                object_name = ""
+            continue
+        start = _JS_OBJECT_START.search(code)
+        if start is None:
+            continue
+        object_name = start.group(1)
+        for prop in _JS_PROP_STRING.finditer(code):
+            aliases[object_name + "." + prop.group(1)] = prop.group(2)
+        if "})" in code:
+            object_name = ""
+    return aliases
+
+
+def _tool_name_from_argument(argument: str, aliases: dict[str, str]) -> str:
+    argument = argument.strip().rstrip(",").strip()
+    quoted = _JS_QUOTED.match(argument)
+    if quoted:
+        return quoted.group(1)
+    return aliases.get(argument, "")
+
+
+def _javascript_mcp_tool_calls(
+    lines: list[str], aliases: dict[str, str]
+) -> list[tuple[int, str, int]]:
+    found: list[tuple[int, str, int]] = []
+    pending = False
+    for index, raw_line in enumerate(lines):
+        code = raw_line.split("//", 1)[0]
+        if pending:
+            name = _tool_name_from_argument(code, aliases)
+            if name:
+                column = code.find(name)
+                found.append((index + 1, name, column if column >= 0 else -1))
+            pending = False
+            continue
+        for match in _JS_CALL_ARG.finditer(code):
+            name = _tool_name_from_argument(match.group(1), aliases)
+            if name:
+                found.append((index + 1, name, match.start(1)))
+        if "tools/call" in code:
+            for match in _JS_NAME_FIELD.finditer(code):
+                name = _tool_name_from_argument(match.group(1), aliases)
+                if name:
+                    found.append((index + 1, name, match.start(1)))
+        if _JS_CALL_OPEN.search(code):
+            pending = True
+    return found
+
+
+def _mcp_tool_refresh_needed(repo_root: Path, changed_files: set[str]) -> bool:
+    """True when this refresh can change a tool registry or a JS call site.
+
+    An unrelated Python edit must not reread the rest of the repository.
+    """
+
+    for path in sorted(changed_files):
+        language = sglanguages.language_for_path(Path(path))
+        if language in {"javascript", "typescript"}:
+            return True
+        if language != "python":
+            continue
+        try:
+            text = (repo_root / path).read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            continue
+        if "_TOOLS" in text:
+            return True
+    return False
+
+
+def _resolve_javascript_mcp_tool_calls(
+    conn: sqlite3.Connection,
+    repo_root: Path,
+    *,
+    changed_files: set[str] | None = None,
+) -> int:
+    """Bind a JS callTool name to the one Python function that registry names.
+
+    The tool name is a literal aiworkhub_ string, or a same-file const that
+    holds that string. The Python side is a *_TOOLS entry whose value is the
+    one function of that name in that file. Two functions for one tool name
+    stay unbound. This is not repo-wide name uniqueness.
+
+    The registry is one merged map, so a refresh that can change it stays
+    sequential: an ambiguity is only known after every registry file is read.
+    A refresh that cannot change it does not read unrelated Python files.
+    """
+
+    if changed_files is not None and not _mcp_tool_refresh_needed(
+        repo_root, changed_files
+    ):
+        return 0
+    conn.execute(
+        "DELETE FROM edges WHERE extractor=?",
+        (_MCP_TOOL_PROTOCOL_EXTRACTOR,),
+    )
+    candidates: dict[str, set[str]] = {}
+    python_files = [
+        str(row["file_path"])
+        for row in conn.execute(
+            "SELECT file_path FROM files WHERE language='python' ORDER BY file_path"
+        )
+    ]
+    for file_path in python_files:
+        try:
+            text = (repo_root / file_path).read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            continue
+        pairs = _python_mcp_tool_targets(text)
+        if not pairs:
+            continue
+        functions: dict[str, list[str]] = {}
+        for row in conn.execute(
+            "SELECT name, qualname FROM entities WHERE file_path=? "
+            "AND kind IN ('function', 'method')",
+            (file_path,),
+        ):
+            functions.setdefault(str(row["name"]), []).append(str(row["qualname"]))
+        for tool_name, function_name in pairs:
+            qualnames = functions.get(function_name, [])
+            if len(qualnames) == 1:
+                candidates.setdefault(tool_name, set()).add(qualnames[0])
+    registry = {
+        name: next(iter(qualnames))
+        for name, qualnames in candidates.items()
+        if len(qualnames) == 1
+    }
+    if not registry:
+        return 0
+    resolved = 0
+    for file_row in conn.execute(
+        "SELECT file_path, source_hash, build_revision FROM files "
+        "WHERE language IN ('javascript', 'typescript') ORDER BY file_path"
+    ):
+        file_path = str(file_row["file_path"])
+        try:
+            lines = (repo_root / file_path).read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeError):
+            continue
+        aliases = _javascript_tool_aliases("\n".join(lines))
+        calls = _javascript_mcp_tool_calls(lines, aliases)
+        if not calls:
+            continue
+        owners = conn.execute(
+            "SELECT qualname, line_start, line_end FROM entities "
+            "WHERE file_path=? AND kind IN ('function', 'method')",
+            (file_path,),
+        ).fetchall()
+        seen: set[tuple[int, str, str]] = set()
+        for line_no, tool_name, column in calls:
+            qualname = registry.get(tool_name)
+            if not qualname:
+                continue
+            identity = (line_no, tool_name, qualname)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            covering = [
+                row for row in owners
+                if int(row["line_start"]) <= line_no <= int(row["line_end"])
+            ]
+            src = (
+                str(min(
+                    covering,
+                    key=lambda row: int(row["line_end"]) - int(row["line_start"]),
+                )["qualname"])
+                if covering else file_path
+            )
+            conn.execute(
+                "INSERT INTO edges(file_path, kind, src_qualname, dst_name, "
+                "dst_qualname, line, evidence_label, extractor, confidence, "
+                "source_hash, build_revision, source_col, receiver_name) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    file_path, "calls", src, tool_name, qualname, line_no,
+                    sgast.EXTRACTED, _MCP_TOOL_PROTOCOL_EXTRACTOR, 1.0,
+                    str(file_row["source_hash"]), str(file_row["build_revision"]),
+                    int(column), "",
+                ),
+            )
+            resolved += 1
+    return resolved
+
+
 def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, incremental: bool = True) -> BuildReport:
     build_started = time.monotonic()
     repo_root = repo_root.resolve()
@@ -3272,6 +3533,9 @@ def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, increme
                 _resolve_javascript_import_bindings(conn)
                 _resolve_javascript_same_file_calls(conn, repo_root)
                 _resolve_javascript_imported_calls(conn, repo_root)
+                _resolve_javascript_mcp_tool_calls(
+                    conn, repo_root, changed_files=resolver_changed_paths,
+                )
             # Task 3: revoke LSP evidence for every changed/deleted source or
             # target, and re-attach bindings re-extraction or a resolver
             # dropped, inside this merge -- plain SQL, so it holds even when no
@@ -8720,6 +8984,9 @@ def index_file(repo_root: Path, path: str, expected_hash: str) -> dict[str, Any]
                 _resolve_javascript_import_bindings(conn)
                 _resolve_javascript_same_file_calls(conn, repo_root)
                 _resolve_javascript_imported_calls(conn, repo_root)
+                _resolve_javascript_mcp_tool_calls(
+                    conn, repo_root, changed_files={rel},
+                )
                 # A binding that still verifies but whose edge the resolvers
                 # above just cleared is re-attached here: the post-publish pass
                 # never runs when no server is configured. All of it is plain
