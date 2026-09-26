@@ -2777,6 +2777,89 @@ def _resolve_python_import_edges(conn: sqlite3.Connection) -> int:
     return resolved
 
 
+def _resolve_python_annotation_edges(conn: sqlite3.Connection) -> int:
+    """Bind an annotation to one same-file type or one imported symbol.
+
+    A local class or function shadows an import. ``Path`` stays unbound when
+    this file neither defines it nor imports it from one indexed module.
+    Repo-wide uniqueness is not evidence, and this pass does not read files.
+    """
+
+    rows = conn.execute(
+        "SELECT e.id, e.file_path, e.dst_name FROM edges e "
+        "JOIN files f ON f.file_path=e.file_path "
+        "WHERE e.kind='annotates' AND f.language='python' AND e.dst_qualname IS NULL "
+        "ORDER BY e.id"
+    ).fetchall()
+    if not rows:
+        return 0
+    local: dict[tuple[str, str], list[str]] = {}
+    for row in conn.execute(
+        "SELECT file_path, name, qualname FROM entities "
+        "WHERE kind IN ('class', 'function')"
+    ):
+        local.setdefault((str(row["file_path"]), str(row["name"])), []).append(
+            str(row["qualname"])
+        )
+    imported: dict[tuple[str, str], list[str]] = {}
+    for row in conn.execute(
+        "SELECT file_path, name, signature FROM entities WHERE kind='import'"
+    ):
+        imported.setdefault((str(row["file_path"]), str(row["name"])), []).append(
+            str(row["signature"])
+        )
+    modules = [
+        str(row["file_path"])
+        for row in conn.execute(
+            "SELECT file_path FROM entities WHERE kind='module' ORDER BY file_path"
+        )
+    ]
+    module_qualnames = {
+        str(row["file_path"]): str(row["qualname"])
+        for row in conn.execute(
+            "SELECT file_path, qualname FROM entities WHERE kind='module'"
+        )
+    }
+    symbols: dict[tuple[str, str], list[str]] = {}
+    for row in conn.execute(
+        "SELECT file_path, name, qualname FROM entities "
+        "WHERE kind IN ('function', 'class', 'method')"
+    ):
+        symbols.setdefault((str(row["file_path"]), str(row["name"])), []).append(
+            str(row["qualname"])
+        )
+    resolved = 0
+    for edge in rows:
+        file_path = str(edge["file_path"])
+        name = str(edge["dst_name"] or "")
+        if not name or "." in name:
+            continue
+        local_hits = local.get((file_path, name), [])
+        if len(local_hits) > 1:
+            continue
+        import_hits: list[str] = []
+        for destination in imported.get((file_path, name), []):
+            qualname = _python_import_destination(
+                file_path, destination, modules, module_qualnames, symbols,
+            )
+            if qualname and qualname not in import_hits:
+                import_hits.append(qualname)
+        chosen = None
+        if len(local_hits) == 1:
+            chosen = local_hits[0]
+        elif len(import_hits) == 1:
+            chosen = import_hits[0]
+        if not chosen:
+            continue
+        cur = conn.execute(
+            "UPDATE edges SET dst_qualname=?, evidence_label=? "
+            "WHERE id=? AND dst_qualname IS NULL",
+            (chosen, sgast.EXTRACTED, edge["id"]),
+        )
+        resolved += int(cur.rowcount or 0)
+    return resolved
+
+
 def _resolve_javascript_import_bindings(conn: sqlite3.Connection) -> int:
     """Bind each JS/TS ``imports`` edge to the one indexed module it names.
 
@@ -3660,6 +3743,7 @@ def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, increme
                     )
                 _resolve_javascript_import_bindings(conn)
                 _resolve_python_import_edges(conn)
+                _resolve_python_annotation_edges(conn)
                 _resolve_javascript_same_file_calls(conn, repo_root)
                 _resolve_javascript_imported_calls(conn, repo_root)
                 _resolve_javascript_mcp_tool_calls(
@@ -9112,6 +9196,7 @@ def index_file(repo_root: Path, path: str, expected_hash: str) -> dict[str, Any]
                     )
                 _resolve_javascript_import_bindings(conn)
                 _resolve_python_import_edges(conn)
+                _resolve_python_annotation_edges(conn)
                 _resolve_javascript_same_file_calls(conn, repo_root)
                 _resolve_javascript_imported_calls(conn, repo_root)
                 _resolve_javascript_mcp_tool_calls(
