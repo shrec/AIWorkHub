@@ -1,5 +1,12 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.78 — 2026-09-26
+
+### Fixed
+
+- Source Graph overlays stay open when a cross-device hardlink fails.
+- AppContainer workers use PowerShell instead of Git bash.
+
 ## 0.11.77 — 2026-09-26
 
 ### Fixed

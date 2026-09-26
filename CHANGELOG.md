@@ -6,6 +6,13 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.78] - 2026-09-26
+
+### Fixed
+
+- An AppContainer overlay base is copy-pinned when a hardlink fails with EXDEV, so a later canonical republish does not kill the overlay.
+- AppContainer launches drop Git bash from PATH and set the shell to PowerShell, because msys cannot create objects in \\BaseNamedObjects.
+
 ## [0.11.77] - 2026-09-26
 
 ### Fixed

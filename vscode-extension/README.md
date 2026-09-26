@@ -14,6 +14,10 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.11.78
+
+- AppContainer workers use PowerShell. Source Graph overlays no longer die on a cross-device hardlink.
+
 ## What's new in 0.11.77
 
 - Editor-hosted workers can stage a one-line edit with a string line number. The bridge no longer rejects that shape as `range_invalid`.
