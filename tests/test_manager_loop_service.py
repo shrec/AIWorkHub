@@ -242,7 +242,7 @@ def test_a_non_manager_loop_error_during_a_turn_is_recorded_and_never_raises(
     _install_fakes(monkeypatch)
     manager_loop_service.start(tmp_path, "fake", "model-a")
 
-    def boom(message: str) -> Any:
+    def boom(message: str, **_: Any) -> Any:
         raise OSError("disk exploded")
 
     entry = manager_loop_service._entry_for(tmp_path)
@@ -303,6 +303,8 @@ def test_start_send_rotate_refuse_without_the_launch_gate(monkeypatch: Any, tmp_
 
     refusal = {"ok": False, "error": "launch_gate_closed"}
     assert server.aiworkhub_manager_loop_start("claude_cli", "opus") == refusal
+    assert server.aiworkhub_manager_loop_continue("mls-aaaa1111bbbb2222") == refusal
+    assert server.aiworkhub_manager_loop_new() == refusal
     assert server.aiworkhub_manager_loop_send("hello") == refusal
     assert server.aiworkhub_manager_loop_rotate("handoff") == refusal
     assert calls == []
@@ -315,6 +317,8 @@ def test_start_send_rotate_refuse_without_the_write_gate(monkeypatch: Any, tmp_p
 
     refusal = {"ok": False, "error": "write_gate_closed"}
     assert server.aiworkhub_manager_loop_start("claude_cli", "opus") == refusal
+    assert server.aiworkhub_manager_loop_continue("mls-aaaa1111bbbb2222") == refusal
+    assert server.aiworkhub_manager_loop_new() == refusal
     assert server.aiworkhub_manager_loop_send("hello") == refusal
     assert server.aiworkhub_manager_loop_rotate("handoff") == refusal
     assert calls == []
@@ -695,6 +699,44 @@ def test_racing_first_sends_pin_one_route_and_every_other_call_is_refused(
     }
     assert manager_loop_service.status(tmp_path)["session"]["session_id"] == winner["session_id"]
     assert manager_loop_service.close(tmp_path) == {"ok": True}
+
+
+def test_status_lists_saved_sessions_and_continue_attaches_one(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    _install_fakes(monkeypatch)
+    first = manager_loop_service.ensure(tmp_path)
+    assert first["ok"] is True
+    first_id = first["session"]["session_id"]
+    entry = manager_loop_service._entry_for(tmp_path)
+    second = ml.ManagerSession(
+        session_id="saved-session-02",
+        repo_id=entry.orchestrator.store.repo_id,
+        backend_id="",
+        model="",
+        status="closed",
+        created_at="2026-09-26T00:00:00+00:00",
+        closed_at="2026-09-26T00:01:00+00:00",
+    )
+    entry.orchestrator.store.save(second)
+
+    listed = manager_loop_service.status(tmp_path)
+    assert listed["ok"] is True
+    assert {row["session_id"] for row in listed["sessions"]} >= {first_id, "saved-session-02"}
+
+    continued = manager_loop_service.continue_session(tmp_path, "saved-session-02")
+    assert continued["ok"] is True
+    assert continued["session"]["session_id"] == "saved-session-02"
+    assert continued["session"]["status"] == "active"
+    assert manager_loop_service.status(tmp_path)["session"]["session_id"] == "saved-session-02"
+
+    fresh = manager_loop_service.begin_new(tmp_path)
+    assert fresh["ok"] is True
+    assert fresh["session"]["session_id"] not in {first_id, "saved-session-02"}
+    assert manager_loop_service.continue_session(tmp_path, "missing-session-01") == {
+        "ok": False,
+        "error": "session_not_found",
+    }
 
 
 def _catalog_row(adapter_id: str, model: str, **fields: Any) -> dict[str, Any]:

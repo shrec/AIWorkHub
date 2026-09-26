@@ -22,9 +22,13 @@ import subprocess
 import sys
 import time
 import unicodedata
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
-from typing import Any, Protocol, TypedDict, cast
+from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, TypedDict, cast
+
+if TYPE_CHECKING:
+    from .windows_appcontainer import AppContainerProbe
+    from .windows_mxc import MxcReadiness
 
 
 class BackgroundProcessLaunchKwargs(TypedDict, total=False):
@@ -959,6 +963,155 @@ def background_process_launch_kwargs(
     """Return only the headless process flags supported by this platform."""
 
     return _platform_process_backend.background_process_launch_kwargs(platform_name)
+
+
+# Windows sandbox policy.  windows_mxc discovers the pinned MXC runtime and
+# windows_appcontainer owns AppContainer capability and child-environment
+# policy; this facade only decides whether the platform may use them and folds
+# their answers into typed, fail-closed records.  Both are imported on first
+# use, never at module import, so a host that never sandboxes on Windows keeps
+# the import graph and behaviour it had before.
+WINDOWS_SANDBOX_CAUSE_PLATFORM_NOT_WINDOWS = "platform_not_windows"
+WINDOWS_SANDBOX_CAUSE_APPCONTAINER_UNAVAILABLE = "win32_appcontainer_unavailable"
+WINDOWS_SANDBOX_CAUSE_MXC_NOT_READY = "mxc_runtime_not_ready"
+
+_SANDBOX_PROBE_ERRORS = (
+    ImportError,
+    AttributeError,
+    OSError,
+    RuntimeError,
+    TypeError,
+    ValueError,
+)
+
+
+class WindowsSandboxReadiness(NamedTuple):
+    """Fail-closed verdict on whether a Windows sandbox launch may start here.
+
+    ``ready`` needs BOTH the AppContainer host probe and the pinned MXC runtime.
+    ``causes`` names every reason it is not (empty when ready).  ``appcontainer``
+    and ``mxc`` are the primitives' own evidence, ``None`` when that primitive
+    was not consulted or could not run.
+    """
+
+    ready: bool
+    causes: tuple[str, ...]
+    appcontainer: AppContainerProbe | None
+    mxc: MxcReadiness | None
+
+    @property
+    def runtime_path(self) -> Path | None:
+        """The architecture-correct MXC executable, only once the whole stack is ready."""
+
+        return self.mxc.runtime_path if self.ready and self.mxc is not None else None
+
+
+class WindowsSandboxLaunchDecision(NamedTuple):
+    """Typed answer to whether a launch may use the Windows sandbox, and with what.
+
+    ``allowed`` guarantees ``executable`` is the resolved MXC runtime and
+    ``environment`` is the child environment the AppContainer needs.  A denial
+    carries no executable and hands back the caller's ``environment`` untouched.
+    """
+
+    allowed: bool
+    causes: tuple[str, ...]
+    executable: Path | None
+    environment: Mapping[str, str] | None
+    readiness: WindowsSandboxReadiness
+
+
+def _appcontainer_module() -> Any:
+    try:
+        from . import windows_appcontainer
+    except ImportError:  # direct-script entrypoint
+        import windows_appcontainer  # type: ignore[no-redef]
+    return windows_appcontainer
+
+
+def _mxc_module() -> Any:
+    try:
+        from . import windows_mxc
+    except ImportError:  # direct-script entrypoint
+        import windows_mxc  # type: ignore[no-redef]
+    return windows_mxc
+
+
+def windows_sandbox_readiness(
+    package_root: str | os.PathLike[str],
+    *,
+    platform_name: str | None = None,
+    host_machine: str | None = None,
+) -> WindowsSandboxReadiness:
+    """Probe the Windows sandbox stack; anything short of fully ready is refused.
+
+    Off Windows nothing is imported, called or read.  On Windows the AppContainer
+    host probe and the pinned MXC runtime probe both run, and a primitive that
+    cannot load or that raises counts as not ready.
+    """
+
+    if not is_windows(platform_name):
+        return WindowsSandboxReadiness(
+            False, (WINDOWS_SANDBOX_CAUSE_PLATFORM_NOT_WINDOWS,), None, None
+        )
+    try:
+        appcontainer = _appcontainer_module().probe()
+    except _SANDBOX_PROBE_ERRORS:
+        appcontainer = None
+    try:
+        mxc = _mxc_module().probe_mxc_runtime(package_root, host_machine)
+    except _SANDBOX_PROBE_ERRORS:
+        mxc = None
+    causes: list[str] = []
+    if getattr(appcontainer, "available", False) is not True:
+        causes.append(WINDOWS_SANDBOX_CAUSE_APPCONTAINER_UNAVAILABLE)
+    if getattr(mxc, "ready", False) is not True or getattr(mxc, "wxc_path", None) is None:
+        causes.append(WINDOWS_SANDBOX_CAUSE_MXC_NOT_READY)
+    return WindowsSandboxReadiness(not causes, tuple(causes), appcontainer, mxc)
+
+
+def windows_sandbox_environment(
+    environment: Mapping[str, str] | None, *, platform_name: str | None = None
+) -> Mapping[str, str] | None:
+    """Return the child environment a sandboxed launch needs on this platform.
+
+    Windows delegates to the AppContainer policy, which decides what the child
+    block must carry; a failure there raises rather than falling back to the
+    unadjusted environment.  Every other platform gets the caller's mapping back.
+    """
+
+    if not is_windows(platform_name):
+        return environment
+    return _appcontainer_module().appcontainer_child_environment(environment)
+
+
+def windows_sandbox_launch_decision(
+    package_root: str | os.PathLike[str],
+    environment: Mapping[str, str] | None = None,
+    *,
+    platform_name: str | None = None,
+    host_machine: str | None = None,
+) -> WindowsSandboxLaunchDecision:
+    """Decide whether a launch may use the Windows sandbox, and with what.
+
+    Allowed only when :func:`windows_sandbox_readiness` is ready.  The executable
+    and the child environment are resolved solely in that case, so a denial can
+    never leak either.
+    """
+
+    readiness = windows_sandbox_readiness(
+        package_root, platform_name=platform_name, host_machine=host_machine
+    )
+    if not readiness.ready:
+        return WindowsSandboxLaunchDecision(
+            False, readiness.causes, None, environment, readiness
+        )
+    child_environment = windows_sandbox_environment(
+        environment, platform_name=platform_name
+    )
+    return WindowsSandboxLaunchDecision(
+        True, (), readiness.runtime_path, child_environment, readiness
+    )
 
 
 _INVALID_HANDLE_VALUE = cast(int, ctypes.c_void_p(-1).value)

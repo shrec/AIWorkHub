@@ -1003,6 +1003,77 @@ def _authenticate_classic_snap_opencode(adapter_id: str) -> ExecutableResolution
     return ExecutableResolution(adapter_id, str(executable), True, "")
 
 
+def _resolve_codex_windows_stable_shim(
+    executable: Path,
+) -> tuple[bool, Path | None]:
+    """Resolve the trusted Codex desktop shim to the exact native CLI.
+
+    cmd.exe cannot execute batch files from a user-profile install inside the
+    AppContainer. Recognize only the stable launcher under LocalAppData and
+    reproduce its newest-directory selection. A false recognized flag means
+    callers must preserve the arbitrary shim unchanged.
+    """
+    if not _is_windows_host() or executable.name.lower() != "codex.cmd":
+        return False, None
+    local_app_data = os.environ.get("LOCALAPPDATA", "")
+    if not local_app_data:
+        return False, None
+    expected_shim = Path(local_app_data) / "OpenAI" / "Codex" / "shim" / "codex.cmd"
+    try:
+        expected_resolved = expected_shim.resolve(strict=True)
+        if os.path.normcase(str(executable)) != os.path.normcase(
+            str(expected_resolved)
+        ):
+            return False, None
+        with open(executable, encoding="utf-8", errors="replace") as stream:
+            source = stream.read(65537)
+    except (OSError, RuntimeError, ValueError):
+        return False, None
+    if len(source) > 65536 or "\x00" in source:
+        return False, None
+
+    commands = tuple(
+        line.strip()
+        for line in source.splitlines()
+        if line.strip() and not line.lstrip().lower().startswith("rem ")
+    )
+    expected_commands = (
+        "@echo off",
+        "setlocal",
+        'set "CODEX_ROOT=%LOCALAPPDATA%\\OpenAI\\Codex\\bin"',
+        'set "CODEX_BIN="',
+        'for /f "delims=" %%i in (\'dir /b /a:d /o:-d "%CODEX_ROOT%" '
+        "2^>nul\') do (",
+        'if not defined CODEX_BIN if exist "%CODEX_ROOT%\\%%i\\codex.exe" '
+        'set "CODEX_BIN=%CODEX_ROOT%\\%%i\\codex.exe"',
+        ")",
+        "if not defined CODEX_BIN (",
+        'echo [codex shim] codex.exe not found under "%CODEX_ROOT%" 1>&2',
+        "exit /b 9009",
+        ")",
+        '"%CODEX_BIN%" %*',
+    )
+    if commands != expected_commands:
+        return False, None
+
+    bin_root = expected_shim.parent.parent / "bin"
+    try:
+        candidates = [
+            (entry.stat().st_mtime_ns, entry / "codex.exe")
+            for entry in bin_root.iterdir()
+            if entry.is_dir() and (entry / "codex.exe").is_file()
+        ]
+        if not candidates:
+            return True, None
+        selected = max(candidates, key=lambda item: item[0])[1].resolve(strict=True)
+        selected.relative_to(bin_root.resolve(strict=True))
+        if not selected.is_file() or not os.access(selected, os.X_OK):
+            return True, None
+    except (OSError, RuntimeError, ValueError):
+        return True, None
+    return True, selected
+
+
 def resolve_executable(
     adapter_id: str,
     executable_overrides: ExecutableOverrides | None = None,
@@ -1073,6 +1144,18 @@ def resolve_executable(
         return ExecutableResolution(
             adapter_id, None, False, f"discovered executable is not executable: {binary}"
         )
+
+    if adapter_id == "codex_cli":
+        recognized, native = _resolve_codex_windows_stable_shim(resolved)
+        if recognized:
+            if native is None:
+                return ExecutableResolution(
+                    adapter_id,
+                    None,
+                    False,
+                    "Codex stable launcher target not found",
+                )
+            resolved = native
 
     if adapter_id == OPENCODE_CLI_ADAPTER and _is_snap_launcher(resolved):
         return _authenticate_classic_snap_opencode(adapter_id)
@@ -1669,6 +1752,227 @@ def serialize_opencode_worker_config(config: Any) -> str:
     return text
 
 
+# ---------------------------------------------------------------------------
+# Manager seat MCP surface (Manager Chat acting as manager).
+#
+# A manager seat drafts Task MCP cards and reads the control plane; it never
+# launches workers, never finalizes review, and never edits the tree. The
+# allowlist below is the ONLY manager/world boundary each new transport must
+# enforce: every entry is an exact ``aiworkhub.server`` tool name, verified
+# against the server surface. Deliberately excluded: agent launch/finalize
+# (``aiworkhub_agent_launch_task``, ``aiworkhub_task_mark_done``,
+# ``aiworkhub_task_reject_review``), semantic edit apply, all write-intent
+# and learning/commit surfaces, and the loop's own start/send/rotate/close
+# (a seat must never drive itself recursively).
+MANAGER_SEAT_MCP_SERVER = "AIWorkHub"
+
+
+def _manager_toml_str(value: str) -> str:
+    """One TOML basic string (same spelling as the worker codex writer)."""
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _manager_toml_array(values: tuple[str, ...] | list[str]) -> str:
+    return "[" + ", ".join(_manager_toml_str(v) for v in values) + "]"
+
+MANAGER_SEAT_MCP_TOOLS: tuple[str, ...] = (
+    # Identity and orientation.
+    "aiworkhub_manager_bootstrap",
+    "aiworkhub_repo_current",
+    # Code discovery (read-only).
+    "aiworkhub_manager_source_graph_query",
+    # Durable context reads.
+    "aiworkhub_manager_session_current_state",
+    "aiworkhub_manager_ai_memory_search",
+    "aiworkhub_manager_ai_memory_get",
+    "aiworkhub_manager_ai_memory_related",
+    "aiworkhub_manager_kb_search",
+    "aiworkhub_manager_kb_get",
+    "aiworkhub_manager_kb_related",
+    "aiworkhub_manager_context_graph_search",
+    "aiworkhub_manager_context_graph_range",
+    "aiworkhub_manager_context_graph_related",
+    # Routing and planning reads.
+    "aiworkhub_manager_workforce_catalog",
+    "aiworkhub_manager_workforce_rank",
+    "aiworkhub_manager_task_decomposition_preview",
+    # Own-loop observation only (never start/send/rotate/close/ensure).
+    "aiworkhub_manager_loop_status",
+    "aiworkhub_manager_loop_events",
+    # Opening task cards (pending only; launch/finalize stay out).
+    "aiworkhub_task_create",
+    "aiworkhub_task_create_from_template",
+    # Task-plane reads.
+    "aiworkhub_task_plan_snapshot",
+    "aiworkhub_task_health",
+    "aiworkhub_task_review_queue",
+    "aiworkhub_task_list",
+    "aiworkhub_task_show",
+    "aiworkhub_task_pending_for_runner",
+    "aiworkhub_task_auto_pickup_dryrun",
+    "aiworkhub_task_collision_guard",
+    "aiworkhub_completion_inbox",
+    "aiworkhub_task_cost_ledger",
+    "aiworkhub_task_usage_report",
+)
+
+# Tools without which a seat cannot stand as manager at all: identity,
+# discovery, and opening a card.
+MANAGER_SEAT_REQUIRED_TOOLS: tuple[str, ...] = (
+    "aiworkhub_manager_bootstrap",
+    "aiworkhub_manager_source_graph_query",
+    "aiworkhub_task_create",
+    "aiworkhub_task_create_from_template",
+)
+
+
+def require_manager_seat_tool_contract(
+    tool_names: tuple[str, ...] | list[str],
+) -> tuple[str, ...]:
+    """Fail closed when the manager seat contract is incomplete."""
+    names = tuple(tool_names)
+    missing = [n for n in MANAGER_SEAT_REQUIRED_TOOLS if n not in names]
+    if missing:
+        raise OpenCodeWorkerConfigError(
+            "manager_seat_tool_contract_incomplete", ",".join(missing)
+        )
+    return names
+
+
+def resolve_manager_seat_codex_tools() -> tuple[str, ...]:
+    """The exact ``enabled_tools`` list for the seat's Codex config.toml."""
+    return require_manager_seat_tool_contract(MANAGER_SEAT_MCP_TOOLS)
+def _manager_seat_mcp_environment(environment: Mapping[str, str]) -> dict[str, str]:
+    """Checked seat env: only the server binding keys, never worker bindings."""
+    allowed = frozenset(
+        {
+            "AIWORKHUB_REPO",
+            "AIWORKHUB_REPO_ROOT",
+            "AIWORKHUB_ALLOW_WRITES",
+            "AIWORKHUB_ALLOW_LAUNCH",
+            "AIWORKHUB_MCP_STDIO_BACKEND",
+            "PYTHONPATH",
+        }
+    )
+    if not isinstance(environment, Mapping) or not environment:
+        raise ValueError("manager_seat_mcp_environment_invalid")
+    checked: dict[str, str] = {}
+    for key, value in environment.items():
+        if key not in allowed or not isinstance(value, str) or "\x00" in value:
+            raise ValueError("manager_seat_mcp_environment_invalid")
+    checked = dict(environment)
+    return checked
+
+
+def build_manager_codex_config_toml(
+    *,
+    python_executable: str,
+    launch_args: Sequence[str],
+    environment: Mapping[str, str],
+) -> str:
+    """The seat's isolated ``CODEX_HOME/config.toml`` text (0600 at rest).
+
+    Mirrors the worker shape (``worker_ai_tools_mcp`` codex block): one
+    ``[mcp_servers.AIWorkHub]`` server launching ``python -m aiworkhub.server``
+    with the seat env embedded, plus the contract-checked ``enabled_tools``.
+    """
+    checked_env = _manager_seat_mcp_environment(environment)
+    lines = [
+        f"[mcp_servers.{MANAGER_SEAT_MCP_SERVER}]",
+        f"args = [{', '.join(_manager_toml_str(a) for a in ['-m', 'aiworkhub.server', *launch_args])}]",
+        f"enabled_tools = {_manager_toml_array(resolve_manager_seat_codex_tools())}",
+        "",
+        f"[mcp_servers.{MANAGER_SEAT_MCP_SERVER}.env]",
+    ]
+    for name, value in checked_env.items():
+        lines.append(f"{name} = {_manager_toml_str(value)}")
+    return "\n".join(lines) + "\n"
+
+
+def opencode_manager_permission_contract() -> dict[str, str]:
+    """``"*": deny`` plus an allow per manager seat MCP tool.
+
+    Tool names are namespaced exactly like the worker contract
+    (``opencode_mcp_tool_name`` with the seat server alias); builtin tools
+    stay denied, mirroring ``OPENCODE_DENIED_BUILTIN_TOOLS``.
+    """
+    permission: dict[str, str] = {"*": OPENCODE_PERMISSION_DENY}
+    for tool in OPENCODE_DENIED_BUILTIN_TOOLS:
+        permission[tool] = OPENCODE_PERMISSION_DENY
+    for mcp_tool in require_manager_seat_tool_contract(MANAGER_SEAT_MCP_TOOLS):
+        permission[f"{OPENCODE_WORKER_MCP_SERVER}_{mcp_tool}"] = OPENCODE_PERMISSION_ALLOW
+    return permission
+
+
+def build_opencode_manager_mcp_config(
+    mcp_command: Sequence[str], *, environment: Mapping[str, str] | None = None
+) -> dict[str, Any]:
+    """Inert OpenCode config data: the seat server and the manager permissions."""
+    server: dict[str, Any] = {
+        "type": "local",
+        "command": _opencode_command_argv(mcp_command),
+        "enabled": True,
+    }
+    if environment is not None:
+        server["environment"] = _manager_seat_mcp_environment(environment)
+    return {
+        "$schema": OPENCODE_CONFIG_SCHEMA_URL,
+        "permission": opencode_manager_permission_contract(),
+        "mcp": {OPENCODE_WORKER_MCP_SERVER: server},
+    }
+
+
+def validate_opencode_manager_config(config: Any) -> Any:
+    """Refuse any OpenCode config that is not exactly the manager contract."""
+    if (
+        not isinstance(config, dict)
+        or set(config) != {"$schema", "permission", "mcp"}
+        or config["$schema"] != OPENCODE_CONFIG_SCHEMA_URL
+    ):
+        raise OpenCodeWorkerConfigError("malformed", "top_level")
+    alias = OPENCODE_WORKER_MCP_SERVER
+    if len(alias) > OPENCODE_NAME_MAX_CHARS:
+        raise OpenCodeWorkerConfigError("alias_too_long", str(len(alias)))
+    servers = config["mcp"]
+    server = servers.get(alias) if isinstance(servers, dict) else None
+    if not isinstance(server, dict) or list(servers) != [alias]:
+        raise OpenCodeWorkerConfigError("malformed", "mcp_servers")
+    if (
+        not {"type", "command", "enabled"}
+        <= set(server)
+        <= {"type", "command", "enabled", "environment"}
+        or server["type"] != "local"
+        or server["enabled"] is not True
+    ):
+        raise OpenCodeWorkerConfigError("malformed", "mcp_server")
+    try:
+        _opencode_command_argv(server["command"])
+        if "environment" in server:
+            _manager_seat_mcp_environment(server["environment"])
+    except ValueError as exc:
+        raise OpenCodeWorkerConfigError("malformed", str(exc)) from exc
+    permission = config["permission"]
+    if not isinstance(permission, dict) or list(permission.items()) != list(
+        opencode_manager_permission_contract().items()
+    ):
+        raise OpenCodeWorkerConfigError("permission_contract_mismatch")
+    for name, action in permission.items():
+        if action == OPENCODE_PERMISSION_ALLOW and len(name) > OPENCODE_NAME_MAX_CHARS:
+            raise OpenCodeWorkerConfigError("tool_name_too_long", name)
+    return config
+
+
+def serialize_opencode_manager_config(config: Any) -> str:
+    """The validated manager config as one bounded ASCII JSON line for the child env."""
+    validate_opencode_manager_config(config)
+    text = json.dumps(config, ensure_ascii=True, separators=(",", ":"), allow_nan=False)
+    if len(text) > OPENCODE_WORKER_CONFIG_MAX_BYTES:
+        raise OpenCodeWorkerConfigError(
+            "oversized", f"{len(text)}>{OPENCODE_WORKER_CONFIG_MAX_BYTES}"
+        )
+    return text
+
+
 def build_runtime_command(
     adapter_id: str,
     prompt: str,
@@ -2162,6 +2466,9 @@ _CREDENTIAL_TOKENS: tuple[str, ...] = (
     "expired credential",
     "credential expired",
     "token expired",
+    "oauth session expired",
+    "oauth expired",
+    "session expired",
     "revoked",
 )
 _UNAVAILABLE_TOKENS: tuple[str, ...] = (

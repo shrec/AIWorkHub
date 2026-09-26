@@ -195,6 +195,7 @@ function installSpawnFake(generationsByRoot) {
       shell: options.shell,
       windowsHide: options.windowsHide,
       repoRoot: options.env.AIWORKHUB_REPO_ROOT,
+      cwd: options.cwd,
       repoId: options.env.AIWORKHUB_REPO_ID,
       windowId: options.env.AIWORKHUB_WINDOW_ID,
       requests: [],
@@ -225,6 +226,121 @@ function makeView(host) {
   const messages = [];
   const view = new host.extension.__testInternals.ViewState((m) => messages.push(m));
   return { view, messages };
+}
+
+async function testSameVersionPackagedRuntimeDriftReplacesOwnedChild(tmp) {
+  const repoRoot = path.join(tmp, "same-version-runtime");
+  fs.mkdirSync(repoRoot);
+  writeRepo(repoRoot, "repo_sameversionruntime00000000000001", "same-version-runtime");
+  const installedRoot = path.join(tmp, "installed-extension");
+  const packageRoot = path.join(installedRoot, "runtime", "aiworkhub");
+  const storageRoot = path.join(tmp, "global-storage");
+  fs.mkdirSync(packageRoot, { recursive: true });
+  fs.writeFileSync(path.join(packageRoot, "__init__.py"), "# same package version\n");
+  const serverPath = path.join(packageRoot, "server.py");
+  fs.writeFileSync(serverPath, "# installed runtime before reinstall\n");
+
+  const fake = installSpawnFake(new Map([[repoRoot, [
+    { version: EXPECTED_VERSION, missingTools: [], dieBeforeInitialize: false },
+    { version: EXPECTED_VERSION, missingTools: [], dieBeforeInitialize: false },
+  ]]]));
+  try {
+    const host = loadExtensionHost(repoRoot);
+    host.context.extensionUri = { fsPath: installedRoot };
+    host.context.globalStorageUri = { fsPath: storageRoot };
+    await host.extension.activate(host.context);
+    const client = host.extension.__testInternals.getMcpClient(host.context);
+    await client.ensureStarted();
+    const firstChild = client.lifecycleChild;
+    const currentPath = path.join(storageRoot, "runtime", "current.json");
+    const before = JSON.parse(fs.readFileSync(currentPath, "utf8"));
+    assert.strictEqual(before.version, EXPECTED_VERSION);
+    assert.strictEqual(fake.spawns[0].cwd, before.runtime_dir);
+
+    fs.writeFileSync(serverPath, "# installed runtime after same-version reinstall\n");
+    await client.replaceForExplicitRecovery();
+
+    const after = JSON.parse(fs.readFileSync(currentPath, "utf8"));
+    assert.strictEqual(after.version, EXPECTED_VERSION, "the extension version must remain unchanged");
+    assert.notStrictEqual(after.generation, before.generation, "same-version content drift must advance current.json");
+    assert.notStrictEqual(after.runtime_dir, before.runtime_dir);
+    assert.strictEqual(
+      fs.readFileSync(path.join(after.runtime_dir, "aiworkhub", "server.py"), "utf8"),
+      "# installed runtime after same-version reinstall\n",
+    );
+    assert.strictEqual(fake.spawns.length, 2, "only the owned child should be replaced");
+    assert.strictEqual(firstChild.killed, true);
+    assert.strictEqual(fake.spawns[1].cwd, after.runtime_dir);
+    assert.strictEqual(fake.spawns[1].env.PYTHONPATH.split(path.delimiter)[0], after.runtime_dir);
+    await host.extension.deactivate();
+  } finally {
+    fake.restore();
+  }
+}
+
+async function testCoexistingOwnedChildrenKeepOldGenerationLeased(tmp) {
+  const repoRoot = path.join(tmp, "coexisting-owned-children");
+  fs.mkdirSync(repoRoot);
+  writeRepo(repoRoot, "repo_sameversionruntime00000000000002", "coexisting-owned-children");
+  const installedRoot = path.join(tmp, "coexisting-installed-extension");
+  const packageRoot = path.join(installedRoot, "runtime", "aiworkhub");
+  const storageRoot = path.join(tmp, "coexisting-global-storage");
+  fs.mkdirSync(packageRoot, { recursive: true });
+  fs.writeFileSync(path.join(packageRoot, "__init__.py"), "# same package version\n");
+  const serverPath = path.join(packageRoot, "server.py");
+  fs.writeFileSync(serverPath, "# generation A\n");
+
+  const fake = installSpawnFake(new Map([[repoRoot, [
+    { version: EXPECTED_VERSION, missingTools: [], dieBeforeInitialize: false },
+    { version: EXPECTED_VERSION, missingTools: [], dieBeforeInitialize: false },
+    { version: EXPECTED_VERSION, missingTools: [], dieBeforeInitialize: false },
+  ]]]));
+  try {
+    const host = loadExtensionHost(repoRoot);
+    host.context.extensionUri = { fsPath: installedRoot };
+    host.context.globalStorageUri = { fsPath: storageRoot };
+    await host.extension.activate(host.context);
+    const dashboardClient = host.extension.__testInternals.getMcpClient(host.context);
+    await dashboardClient.ensureStarted();
+    const managerClient = new host.extension.__testInternals.McpStdioClient(
+      dashboardClient.repositoryRoot,
+      dashboardClient.outputChannel,
+      dashboardClient.repositoryIdentity,
+      dashboardClient.claimEpisode,
+      { grantManagerLoopGates: true },
+    );
+    await managerClient.ensureStarted();
+    const managerChild = managerClient.lifecycleChild;
+    const currentPath = path.join(storageRoot, "runtime", "current.json");
+    const before = JSON.parse(fs.readFileSync(currentPath, "utf8"));
+    const oldLeasePath = path.join(
+      path.dirname(before.runtime_dir), "leases", `${fake.spawns[0].windowId}.json`,
+    );
+    assert.strictEqual(fake.spawns[1].cwd, before.runtime_dir);
+    assert.strictEqual(fake.spawns[1].env.AIWORKHUB_ALLOW_WRITES, "1");
+    assert.strictEqual(fs.existsSync(oldLeasePath), true);
+
+    fs.writeFileSync(serverPath, "# generation B, same extension version\n");
+    await dashboardClient.replaceForExplicitRecovery();
+    const after = JSON.parse(fs.readFileSync(currentPath, "utf8"));
+    assert.notStrictEqual(after.generation, before.generation);
+    assert.strictEqual(fake.spawns.length, 3);
+    assert.strictEqual(managerClient.lifecycleChild, managerChild);
+    assert.strictEqual(managerChild.killed, false, "the manager-loop child must not be replaced");
+    assert.strictEqual(fs.existsSync(oldLeasePath), true, "generation A must remain leased while its manager-loop child runs");
+
+    managerClient.stop();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.strictEqual(fs.existsSync(oldLeasePath), false, "generation A lease should retire after its last owned child exits");
+    assert.strictEqual(
+      fs.existsSync(path.join(path.dirname(after.runtime_dir), "leases", `${fake.spawns[2].windowId}.json`)),
+      true,
+      "generation B remains leased for the dashboard child",
+    );
+    await host.extension.deactivate();
+  } finally {
+    fake.restore();
+  }
 }
 
 async function testSelfHealsAndReconnectsWithoutReload(tmp) {
@@ -775,8 +891,39 @@ async function testLivePoisonedInvalidParamsShapeRepairsOnce(tmp) {
   assert.strictEqual(replacements, 1, "detailed caller errors must not poison transport");
 }
 
+function testWindowsWorkerRootIsolationPreservesExplicitOverride(tmp) {
+  const repoRoot = path.win32.join("D:\\", "Dev", "AIWorkHub");
+  const tempRoot = path.win32.join("C:\\", "Users", "worker", "AppData", "Local", "Temp");
+  const host = loadExtensionHost(tmp);
+  const resolveWorkerWorktreeRootEnv = host.extension.__testInternals.resolveWorkerWorktreeRootEnv;
+
+  const isolated = resolveWorkerWorktreeRootEnv(
+    repoRoot,
+    { AIWORKHUB_RUNTIME_ROOT: path.win32.join(repoRoot, ".aiworkhub", "runtime") },
+    "win32",
+    tempRoot,
+  );
+  assert.ok(isolated.startsWith(`${tempRoot}\\`));
+  assert.strictEqual(path.win32.basename(path.win32.dirname(isolated)), "aiworkhub-worktrees");
+  assert.strictEqual(path.win32.basename(isolated).length, 16);
+
+  const explicit = path.win32.join("C:\\", "custom", "worktrees");
+  assert.strictEqual(
+    resolveWorkerWorktreeRootEnv(
+      repoRoot,
+      { AIWORKHUB_RUNTIME_ROOT: "poisoned", AIWORKHUB_WORKTREE_ROOT: explicit },
+      "win32",
+      tempRoot,
+    ),
+    explicit,
+  );
+  assert.strictEqual(resolveWorkerWorktreeRootEnv(repoRoot, {}, "linux", "/tmp"), "");
+}
+
 (async () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aiworkhub-reloadless-"));
+  await testSameVersionPackagedRuntimeDriftReplacesOwnedChild(tmp);
+  await testCoexistingOwnedChildrenKeepOldGenerationLeased(tmp);
   await testSelfHealsAndReconnectsWithoutReload(tmp);
   await testRuntimeInfoReusesHandshakeEvidenceDuringBackgroundConvergence(tmp);
   await testExplicitRetryAlwaysReplacesWindowOwnedChild(tmp);
@@ -789,6 +936,7 @@ async function testLivePoisonedInvalidParamsShapeRepairsOnce(tmp) {
   await testPoisonedInvalidParamsRepairsOnlyOwnedChild(tmp);
   await testLivePoisonedInvalidParamsShapeRepairsOnce(tmp);
   testPlatformPythonResolution(tmp);
+  testWindowsWorkerRootIsolationPreservesExplicitOverride(tmp);
   console.log("AIWorkHub reloadless runtime-repair regression passed");
 })().catch((err) => {
   console.error(err);

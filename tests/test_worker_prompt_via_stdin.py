@@ -164,25 +164,63 @@ def test_appcontainer_branch_uses_a_pipe_for_stdin_text_and_the_null_device_othe
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     requests: list[Any] = []
+    null_reads: list[bytes] = []
+    prompts: list[str] = []
 
     class _FakeLaunch:
         job = object()
         pid = 4242
 
     def fake_launch_appcontainer(request: Any) -> Any:
+        if not requests:
+            null_reads.append(_read_native_handle(request.stdin_handle))
         requests.append(request)
         return _FakeLaunch()
+
+    def fake_feed(stream: Any, text: str) -> None:
+        prompts.append(text)
+        stream.close()
 
     monkeypatch.setattr(
         worker_supervisor.windows_appcontainer, "launch_appcontainer", fake_launch_appcontainer
     )
+    monkeypatch.setattr(worker_supervisor, "_feed_and_close_stdin", fake_feed)
     spec = {"repo_id": "repo-test", "worker_kind": "claude_cli"}
     argv = [sys.executable, "-c", "pass"]
 
     worker_supervisor._launch_appcontainer_process(argv, str(tmp_path), spec)
-    assert _read_native_handle(requests[0].stdin_handle) == b""
+    assert null_reads == [b""]
 
     worker_supervisor._launch_appcontainer_process(
         argv, str(tmp_path), spec, stdin_text="the prompt"
     )
-    assert _read_native_handle(requests[1].stdin_handle) == b"the prompt"
+    assert prompts == ["the prompt"]
+
+
+def test_appcontainer_does_not_retain_the_parent_stdin_reader_after_launch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class _FakeLaunch:
+        job = object()
+        pid = 4242
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(
+        worker_supervisor.windows_appcontainer,
+        "launch_appcontainer",
+        lambda _request: _FakeLaunch(),
+    )
+
+    process = worker_supervisor._launch_appcontainer_process(
+        [sys.executable, "-c", "pass"],
+        str(tmp_path),
+        {"repo_id": "repo-test", "worker_kind": "codex_cli"},
+    )
+    try:
+        assert process._owned_fds == ()
+    finally:
+        process.stdout.close()
+        process.stderr.close()
+        process.close()

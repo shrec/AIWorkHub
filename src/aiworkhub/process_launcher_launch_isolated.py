@@ -903,6 +903,14 @@ def launch_isolated(
                 provider_env=provider_env,
                 sandbox_backend=sandbox_backend,
             )
+            if (
+                adapter_id == "codex_cli"
+                and sandbox_backend == "windows_appcontainer"
+            ):
+                # Codex does not reliably resolve HOME through Windows
+                # known-folder APIs inside AppContainer.  Bind it to the
+                # request-local config provisioned above.
+                launch_env["CODEX_HOME"] = str(workspace.home / ".codex")
             if sandbox_backend == "windows_appcontainer" and os.environ.get(
                 "LOCALAPPDATA"
             ):

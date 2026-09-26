@@ -53,6 +53,7 @@ def _init_git_base(repo: Path) -> str:
     _git(repo, "config", "user.email", "fixture@example.com")
     _git(repo, "config", "user.name", "Fixture")
     _git(repo, "config", "commit.gpgsign", "false")
+    _git(repo, "config", "core.autocrlf", "false")
     (repo / ".keep").write_text("base\n", encoding="utf-8")
     _git(repo, "add", ".keep")
     _git(repo, "commit", "-m", "base")

@@ -11,7 +11,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.11.81";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.11.92";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 // NF-2026-00643: this globalStorage trace directory was measured holding 1,102
 // files and 2,235,024,325 bytes (2.24 GB), largest single file 44,626,825 bytes
@@ -398,6 +398,11 @@ const ALLOWED_INBOUND_MESSAGE_TYPES = new Set([
   "requestRuntimePurge",
   "managerLoopStart",
   "managerLoopEnsure",
+  "managerLoopRestore",
+  "managerLoopContinue",
+  "managerLoopRename",
+  "managerLoopDelete",
+  "managerLoopNew",
   "managerLoopSend",
   "managerLoopRotate",
   "managerLoopClose",
@@ -580,6 +585,11 @@ const TASK_RETENTION_TOOLS = Object.freeze({
 const MANAGER_LOOP_TOOLS = Object.freeze({
   start: "aiworkhub_manager_loop_start",
   ensure: "aiworkhub_manager_loop_ensure",
+  restore: "aiworkhub_manager_loop_restore",
+  continue: "aiworkhub_manager_loop_continue",
+  rename: "aiworkhub_manager_loop_rename",
+  discard: "aiworkhub_manager_loop_discard",
+  new: "aiworkhub_manager_loop_new",
   send: "aiworkhub_manager_loop_send",
   rotate: "aiworkhub_manager_loop_rotate",
   status: "aiworkhub_manager_loop_status",
@@ -588,7 +598,7 @@ const MANAGER_LOOP_TOOLS = Object.freeze({
 });
 // The dashboard's Manager chat panel offers exactly these three CLI backends.
 // MANAGER_LOOP_TOOLS is deliberately never folded into EXPECTED_DASHBOARD_TOOL_NAMES:
-// these seven tools are mutating and session-scoped, not the read-only dashboard
+// these tools are mutating and session-scoped, not the read-only dashboard
 // contract that check verifies (see pushRuntimeInfo).
 const MANAGER_LOOP_BACKENDS = new Set(["claude_cli", "codex_cli", "opencode_cli"]);
 // Matches manager_loop._SESSION_ID_RE -- production ids look like
@@ -10711,6 +10721,33 @@ function handleInboundMessage(view, message) {
       runManagerLoopAction(view, "ensure", {});
       break;
     }
+    case "managerLoopRestore": {
+      runManagerLoopAction(view, "restore", {});
+      break;
+    }
+    case "managerLoopRename": {
+      const renameId = String(message.sessionId || "");
+      const title = String(message.title || "").trim().slice(0, 80);
+      if (!MANAGER_SESSION_ID_RE.test(renameId) || !title) return;
+      runManagerLoopAction(view, "rename", { session_id: renameId, title });
+      break;
+    }
+    case "managerLoopDelete": {
+      const deleteId = String(message.sessionId || "");
+      if (!MANAGER_SESSION_ID_RE.test(deleteId)) return;
+      runManagerLoopAction(view, "discard", { session_id: deleteId });
+      break;
+    }
+    case "managerLoopContinue": {
+      const sessionId = String(message.sessionId || "");
+      if (!MANAGER_SESSION_ID_RE.test(sessionId)) return;
+      runManagerLoopAction(view, "continue", { session_id: sessionId });
+      break;
+    }
+    case "managerLoopNew": {
+      runManagerLoopAction(view, "new", {});
+      break;
+    }
     case "managerLoopSend": {
       const text = String(message.text || "");
       if (!text.trim()) return;
@@ -10719,11 +10756,16 @@ function handleInboundMessage(view, message) {
       // unlisted backend is refused here, like Start, before any MCP call.
       const sendBackendId = String(message.backendId || "");
       const sendModel = String(message.model || "").trim();
+      const sendReasoning = String(message.reasoning || "").trim().toLowerCase();
       if (sendBackendId && !MANAGER_LOOP_BACKENDS.has(sendBackendId)) {
         view.postMessage({ type: OUTBOUND_TYPES.error, message: "invalid_backend_id" });
         return;
       }
-      runManagerLoopAction(view, "send", { text, backend_id: sendBackendId, model: sendModel });
+      if (sendReasoning && !["low", "medium", "high", "xhigh", "max"].includes(sendReasoning)) {
+        view.postMessage({ type: OUTBOUND_TYPES.error, message: "invalid_reasoning_level" });
+        return;
+      }
+      runManagerLoopAction(view, "send", { text, backend_id: sendBackendId, model: sendModel, reasoning: sendReasoning });
       break;
     }
     case "managerLoopRotate":
@@ -11663,31 +11705,43 @@ function getHtmlForWebview(webview, extensionUri) {
           <button type="button" class="dialog-close" id="manager-chat-collapse" aria-controls="manager-chat-sidebar" aria-expanded="true">Collapse</button>
         </div>
         <div class="needfix-toolbar">
-          <select id="manager-chat-backend" class="compact-select" aria-label="Manager backend">
+          <select id="manager-chat-backend" class="compact-select" aria-label="Manager backend" hidden>
             <option value="claude_cli">claude_cli</option>
             <option value="codex_cli">codex_cli</option>
             <option value="opencode_cli">opencode_cli</option>
           </select>
-          <select id="manager-chat-model" class="compact-select" aria-label="Manager model"></select>
-          <button type="button" class="primary-button" id="manager-chat-start">Start</button>
+          <select id="manager-chat-model" class="compact-select" aria-label="Model for this session"></select>
+          <select id="manager-chat-reasoning" class="compact-select" aria-label="Reasoning depth">
+            <option value="">Default</option>
+            <option value="low">Low</option>
+            <option value="medium">Medium</option>
+            <option value="high">High</option>
+            <option value="xhigh">Extra high</option>
+            <option value="max">Max</option>
+          </select>
           <button type="button" id="manager-chat-rotate" disabled>Rotate</button>
-          <button type="button" id="manager-chat-close" disabled>Close</button>
           <span class="connection-state" id="manager-chat-status" role="status" aria-live="polite">
             <span class="connection-dot" aria-hidden="true"></span>
             <span id="manager-chat-status-label">Idle</span>
           </span>
         </div>
-        <div class="manager-chat-session-line" id="manager-chat-session-line" hidden>
-          <span id="manager-chat-session-id"></span>
-          <span id="manager-chat-session-backend"></span>
+        <div class="manager-chat-session-line" id="manager-chat-session-line">
+          <select id="manager-chat-session" class="compact-select" aria-label="Manager session">
+            <option value="">Saved sessions</option>
+          </select>
+          <button type="button" id="manager-chat-rename-session">Rename</button>
+          <button type="button" id="manager-chat-delete-session">Delete</button>
+          <button type="button" id="manager-chat-new-session">New</button>
+          <span id="manager-chat-session-id" hidden></span>
+          <span id="manager-chat-session-backend" hidden></span>
         </div>
         <div class="manager-chat-transcript" id="manager-chat-transcript" aria-live="polite">
-          <div class="panel-list-empty compact" id="manager-chat-empty">Start a session to begin</div>
+          <div class="panel-list-empty compact" id="manager-chat-empty">Write on the selected model to open the first session</div>
         </div>
         <div class="manager-chat-notice" id="manager-chat-notice" hidden></div>
         <form class="manager-chat-composer" id="manager-chat-composer">
-          <textarea id="manager-chat-input" rows="2" placeholder="Message the manager" aria-label="Message the manager" disabled></textarea>
-          <button type="submit" class="primary-button" id="manager-chat-send" disabled>Send</button>
+          <textarea id="manager-chat-input" rows="2" placeholder="Message the manager" aria-label="Message the manager"></textarea>
+          <button type="submit" class="primary-button" id="manager-chat-send">Send</button>
         </form>
       </div>
     </aside>

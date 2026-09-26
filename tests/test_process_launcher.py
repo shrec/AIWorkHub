@@ -517,15 +517,70 @@ def test_grok_kilo_text_part_extraction_is_structurally_exact() -> None:
     ) == "vscode"
 
 
-def test_grok_kilo_child_env_is_request_local_and_secret_free(tmp_path) -> None:
+def test_grok_kilo_worker_launch_env_is_request_local_and_secret_free(
+    tmp_path,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
     home = tmp_path / "isolated-home"
-    env = process_launcher.sanitized_env("grok_kilo_cli", home=home)
+    env = process_launcher.worker_launch_env(
+        "grok_kilo_cli",
+        repo=repo,
+        request_id="req-kilo-state",
+        home=home,
+        sandbox_backend="windows_appcontainer",
+    )
 
     assert env["HOME"] == str(home.resolve())
     assert env["XDG_DATA_HOME"] == str(home.resolve() / ".local" / "share")
     assert env["XDG_CONFIG_HOME"] == str(home.resolve() / ".config")
     assert env["XDG_CACHE_HOME"] == str(home.resolve() / ".cache")
+    assert env["XDG_STATE_HOME"] == str(home.resolve() / ".local" / "state")
+    assert Path(env["XDG_STATE_HOME"]).is_dir()
     assert not any("TOKEN" in key or "API_KEY" in key for key in env)
+
+
+def test_grok_kilo_appcontainer_rejects_state_ancestor_link_before_mkdir(
+    tmp_path,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    home = tmp_path / "isolated-home"
+    home.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    try:
+        (home / ".local").symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks unavailable: {exc}")
+
+    with pytest.raises(process_launcher.WorkspaceError):
+        process_launcher.worker_launch_env(
+            "grok_kilo_cli",
+            repo=repo,
+            request_id="req-kilo-state-link",
+            home=home,
+            sandbox_backend="windows_appcontainer",
+        )
+
+    assert not (outside / "state").exists()
+
+
+def test_non_kilo_worker_launch_env_omits_kilo_xdg_paths(tmp_path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    home = tmp_path / "home"
+    env = process_launcher.worker_launch_env(
+        "claude_cli",
+        repo=repo,
+        request_id="req-non-kilo",
+        home=home,
+        sandbox_backend="windows_appcontainer",
+    )
+
+    assert not any(key.startswith("XDG_") for key in env)
+    assert env["TMPDIR"] == str(home.resolve() / "tmp")
+    assert "BUN_TMPDIR" not in env
 
 
 def test_grok_kilo_launch_projects_auth_before_worker_runtime_registration(

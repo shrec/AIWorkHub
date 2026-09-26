@@ -101,6 +101,7 @@ class ManagerSession:
     context_estimate_bytes: int = 0
     handoff_ref: str | None = None
     previous_session_id: str | None = None
+    title: str = ""
 
     @property
     def passive(self) -> bool:
@@ -254,6 +255,37 @@ class SessionStore:
     def ensure_lock_path(self) -> Path:
         return self.root / "ensure.lock"
 
+    @property
+    def selection_path(self) -> Path:
+        return self.root / "selected.json"
+
+    def read_selection(self) -> str | None:
+        """The session the panel chose to continue, or None when unset or unreadable."""
+        path = self.selection_path
+        if not path.is_file():
+            return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        session_id = str(payload.get("session_id") or "")
+        if not _SESSION_ID_RE.fullmatch(session_id):
+            return None
+        return session_id
+
+    def write_selection(self, session_id: str) -> None:
+        if not _SESSION_ID_RE.fullmatch(session_id):
+            raise ManagerLoopError("session_id_invalid")
+        _publish(
+            self.selection_path,
+            json.dumps({"session_id": session_id}, sort_keys=True) + "\n",
+        )
+
+    def clear_selection(self) -> None:
+        self.selection_path.unlink(missing_ok=True)
+
     def _path(self, kind: str, session_id: str) -> Path:
         if not _SESSION_ID_RE.fullmatch(session_id):
             raise ManagerLoopError("session_id_invalid")
@@ -308,9 +340,17 @@ class SessionStore:
         )
         doomed = [item.session_id for item in closed[: -self.keep_closed]]
         for session_id in doomed:
-            for kind in ("events", "handoffs", "sessions"):
-                self._path(kind, session_id).unlink(missing_ok=True)
+            self.delete_session(session_id)
         return doomed
+
+    def delete_session(self, session_id: str) -> None:
+        """Remove one conversation's record, events and handoff."""
+        if not _SESSION_ID_RE.fullmatch(session_id):
+            raise ManagerLoopError("session_id_invalid")
+        for kind in ("events", "handoffs", "sessions"):
+            self._path(kind, session_id).unlink(missing_ok=True)
+        if self.read_selection() == session_id:
+            self.clear_selection()
 
 
 # The production brief sources and writers below import on first use. The loop
@@ -353,10 +393,53 @@ def _manager_rules() -> str:
     rules = agent_tool_instructions.POLICY.role
     return "\n".join(["Manager role:", *(f"- {rule}" for rule in rules)])
 
-
 def _manager_event_write(**fields: Any) -> Mapping[str, Any]:
-    from . import manager_ai_tools
+    """Bind this turn to the manager-chat thread, the way Codex binds its own.
 
+    The audit turn stays one event. The user text and assistant reply are also
+    ``chat_message`` rows on ``thread_id`` = the manager session id, so Context
+    Graph lists that conversation beside Codex threads instead of folding it
+    into the MCP manager episode.
+    """
+    from . import context_graph, manager_ai_tools
+
+    thread_id = str(fields.pop("thread_id", "") or "")
+    session_id = str(fields.pop("session_id", "") or "") or thread_id
+    provider = str(fields.pop("provider", "") or "") or "manager_chat"
+    user_text = str(fields.pop("user_text", "") or "")
+    assistant_text = str(fields.pop("assistant_text", "") or "")
+    written = manager_ai_tools.context_graph_event_write(
+        thread_id=thread_id,
+        session_id=session_id,
+        provider=provider,
+        **fields,
+    )
+    if not thread_id or not written.get("ok"):
+        return written
+    context, _manager = manager_ai_tools._manager_context()
+    if context is None:
+        return written
+    turn_key = str(fields.get("idempotency_key") or thread_id)
+    pairs = (("user", user_text), ("assistant", assistant_text))
+    for role, text in pairs:
+        if not text.strip():
+            continue
+        try:
+            context_graph.append_event(
+                context.authority_repo,
+                thread_id=thread_id,
+                session_id=session_id,
+                provider=provider,
+                role=role,
+                event_type="chat_message",
+                content=text,
+                source_ref=f"manager_chat:{thread_id}:{role}",
+                idempotency_key=f"{turn_key}-{role}",
+                metadata={"manager_only": True, "surface": "manager_chat"},
+            )
+        except (context_graph.ContextGraphError, OSError):
+            continue
+    return written
     return manager_ai_tools.context_graph_event_write(**fields)
 
 
@@ -507,12 +590,14 @@ class ManagerOrchestrator:
 
         Provider-free and idempotent: no backend is built, started or closed, and every call,
         from this orchestrator, another one or another process, returns the same record.
-        Concurrent callers queue for the moment persisting takes, so all of them get that one
-        conversation. A session this orchestrator drives is returned as is, even mid-turn.
-        Otherwise the session lock proves no owner is live: a pinned record a dead owner left
-        active is retired through its mechanical handoff, which the passive successor is
-        attached to, and its provider conversation id is never carried over. A live owner
-        elsewhere refuses with ``manager_session_already_active``.
+        That record is the persisted picker selection when one names a saved session;
+        otherwise it is the oldest passive conversation. Concurrent callers queue for the
+        moment persisting takes, so all of them get that one conversation. A session this
+        orchestrator drives is returned as is, even mid-turn. Otherwise the session lock
+        proves no owner is live: a pinned record a dead owner left active is retired through
+        its mechanical handoff, unless it is the persisted selection, and its provider
+        conversation id is never carried over. A live owner elsewhere refuses with
+        ``manager_session_already_active``.
         """
         session, backend = self._session, self._backend
         if session is not None and backend is not None:
@@ -551,10 +636,12 @@ class ManagerOrchestrator:
         with self._exclusive():
             return self._open(backend_id, model)
 
-    def send(self, text: str) -> dict[str, Any]:
+    def send(self, text: str, *, reasoning: str = "") -> dict[str, Any]:
         """Run one turn; refused, not queued, while another turn is running."""
         if not text.strip():
             raise ValueError("the message is empty")
+        if self._backend is not None:
+            self._backend.reasoning_level = str(reasoning or "").strip().lower()
         with self._exclusive():
             return self._turn(text, "user_message", "")
 
@@ -586,6 +673,234 @@ class ManagerOrchestrator:
                     backend.close()
             finally:
                 self._release_lock()
+
+    def attach(self, session_id: str) -> ManagerSession:
+        """Continue one saved conversation. No provider call and no Start.
+
+        The chosen record becomes the repository's active session and the
+        persisted selection, so a later ``ensure`` -- including from another
+        process -- returns it instead of the oldest passive conversation.
+        A closed record is reopened in place so its event log continues.
+        Any other active record is closed through a mechanical handoff.
+        Refused while this orchestrator is already inside a turn.
+        """
+        if not _SESSION_ID_RE.fullmatch(session_id):
+            raise ManagerLoopError("session_id_invalid")
+        with self._queued(), self._exclusive():
+            return self._attach(session_id)
+
+    def begin_new(self) -> ManagerSession:
+        """Close the current conversation and open a fresh passive one.
+
+        Provider-free. The displaced record gets a mechanical handoff, and
+        the selection pointer is cleared so ``ensure`` does not reopen it.
+        """
+        with self._queued(), self._exclusive():
+            return self._begin_new()
+
+    def restore_latest(self) -> ManagerSession | None:
+        """Attach the last conversation. None when the repository has no sessions.
+
+        Provider-free and does not create a session. An explicit selection wins;
+        otherwise the newest active record, or the newest record if all are closed.
+        """
+        if self._session is not None:
+            return self._session
+        with self._queued(), self._exclusive():
+            return self._restore_latest()
+
+    def rename(self, session_id: str, title: str) -> ManagerSession:
+        """Set the display name of one saved conversation. No provider call."""
+        if not _SESSION_ID_RE.fullmatch(session_id):
+            raise ManagerLoopError("session_id_invalid")
+        cleaned = " ".join(str(title).split())[:80]
+        with self._exclusive():
+            chosen = next(
+                (item for item in self.store.sessions() if item.session_id == session_id),
+                None,
+            )
+            if chosen is None:
+                raise ManagerLoopError("session_not_found")
+            renamed = dataclasses.replace(chosen, title=cleaned)
+            self.store.save(renamed)
+            if self._session is not None and self._session.session_id == renamed.session_id:
+                self._session = renamed
+            return renamed
+
+    def discard(self, session_id: str) -> None:
+        """Delete one saved conversation. No provider call.
+
+        If it is the loaded session, the backend and lock are released first.
+        """
+        if not _SESSION_ID_RE.fullmatch(session_id):
+            raise ManagerLoopError("session_id_invalid")
+        with self._exclusive():
+            if not any(item.session_id == session_id for item in self.store.sessions()):
+                raise ManagerLoopError("session_not_found")
+            if self._session is not None and self._session.session_id == session_id:
+                self._drop_backend()
+            self.store.delete_session(session_id)
+
+    def continue_on_route(self, backend_id: str, model: str) -> ManagerSession:
+        """Attach the selected model to this conversation, or open the first one.
+
+        The session belongs to the owner. The model is only the route for this
+        turn. A different model rebinds this same session and does not open another.
+        """
+        if not backend_id.strip() or not model.strip():
+            raise ValueError("backend_id and model are required")
+        session, backend = self._session, self._backend
+        if (
+            session is not None
+            and backend is not None
+            and session.backend_id == backend_id
+            and session.model == model
+        ):
+            self.store.write_selection(session.session_id)
+            return session
+        if backend is not None:
+            self._backend = None
+            try:
+                backend.close()
+            finally:
+                self._release_lock()
+        with self._exclusive():
+            if self._session is None:
+                opened = self._open(backend_id, model)
+                self.store.write_selection(opened.session_id)
+                return opened
+            return self._bind_existing(backend_id, model)
+
+    def _attach(self, session_id: str) -> ManagerSession:
+        chosen = next(
+            (item for item in self.store.sessions() if item.session_id == session_id),
+            None,
+        )
+        if chosen is None:
+            raise ManagerLoopError("session_not_found")
+        if (
+            self._session is not None
+            and self._backend is not None
+            and self._session.session_id == chosen.session_id
+            and chosen.status == "active"
+        ):
+            self._activate_selected(chosen)
+            self.store.write_selection(chosen.session_id)
+            return self._session
+        self._drop_backend()
+        chosen = self._activate_selected(chosen)
+        self.store.write_selection(chosen.session_id)
+        self._session = chosen
+        return chosen
+
+    def _begin_new(self) -> ManagerSession:
+        self._drop_backend()
+        for current in [item for item in self.store.sessions() if item.status == "active"]:
+            handoff = self._mechanical_handoff(
+                current, "new_session", "the owner started another conversation"
+            )
+            self._finish(current, handoff, "new_session", mechanical=True)
+        self.store.clear_selection()
+        return self._ensure()
+
+    def _latest_session(self) -> ManagerSession | None:
+        rows = self.store.sessions()
+        if not rows:
+            return None
+        active = [item for item in rows if item.status == "active"]
+        pool = active or rows
+        return max(pool, key=lambda item: (item.created_at, item.session_id))
+
+    def _restore_latest(self) -> ManagerSession | None:
+        self._acquire_lock()
+        session: ManagerSession | None = None
+        try:
+            chosen = self._selected_session() or self._latest_session()
+            if chosen is None:
+                return None
+            session = self._activate_selected(chosen)
+            self.store.write_selection(session.session_id)
+        finally:
+            self._release_lock()
+        self._session = session
+        return session
+
+    def _bind_existing(self, backend_id: str, model: str) -> ManagerSession:
+        """Start the selected route on the loaded session. The session id does not change."""
+        session = self._session
+        if session is None:
+            raise ManagerLoopError("no_active_manager_session")
+        self._acquire_lock()
+        backend: ManagerBackend | None = None
+        try:
+            previous = self.store.latest_closed()
+            handoff = self.store.read_handoff(previous.session_id) if previous else ""
+            brief = self.brief_builder.build(handoff)
+            backend = self._backend_factory(backend_id, model)
+            provider_ref = backend.start(brief)
+            if session.passive or (session.backend_id, session.model) != (backend_id, model):
+                session = dataclasses.replace(
+                    session,
+                    backend_id=backend_id,
+                    model=model,
+                    status="active",
+                    closed_at=None,
+                    context_estimate_bytes=session.context_estimate_bytes + len(brief.encode("utf-8")),
+                )
+            self.store.save(session)
+            if not any(event.get("type") == "session_start" for event in self.store.events(session.session_id)):
+                self._record(session, session.turn_count, "session_start", {
+                    "provider_ref": str(provider_ref),
+                    "bound_existing": True,
+                    "backend_id": backend_id,
+                    "model": model,
+                })
+        except BaseException:
+            try:
+                if backend is not None:
+                    backend.close()
+            finally:
+                self._release_lock()
+            raise
+        self._session, self._backend = session, backend
+        self.store.write_selection(session.session_id)
+        return session
+
+    def _drop_backend(self) -> None:
+        backend = self._backend
+        self._backend = None
+        self._session = None
+        try:
+            if backend is not None:
+                backend.close()
+        finally:
+            self._release_lock()
+
+    def _selected_session(self) -> ManagerSession | None:
+        session_id = self.store.read_selection()
+        if not session_id:
+            return None
+        chosen = next(
+            (item for item in self.store.sessions() if item.session_id == session_id),
+            None,
+        )
+        if chosen is None:
+            self.store.clear_selection()
+        return chosen
+
+    def _activate_selected(self, selected: ManagerSession) -> ManagerSession:
+        """Reopen ``selected`` if needed and retire every other active record."""
+        if selected.status != "active":
+            selected = dataclasses.replace(selected, status="active", closed_at=None)
+            self.store.save(selected)
+        for other in self.store.sessions():
+            if other.session_id == selected.session_id or other.status != "active":
+                continue
+            handoff = self._mechanical_handoff(
+                other, "session_switch", "the owner continued another saved conversation"
+            )
+            self._finish(other, handoff, "session_switch", mechanical=True)
+        return selected
 
     def __enter__(self) -> ManagerOrchestrator:
         return self
@@ -681,6 +996,11 @@ class ManagerOrchestrator:
                 self._release_lock()
             raise
         self._session, self._backend = session, backend
+        # Follow an explicit picker selection onto this successor. Writing a
+        # selection here when none existed would pin a dead owner and skip
+        # the mechanical retire the next ensure owes that crash.
+        if self.store.read_selection():
+            self.store.write_selection(session.session_id)
         return session
 
     def _retire_stale(self, *, keep_passive: bool = False) -> ManagerSession | None:
@@ -698,15 +1018,22 @@ class ManagerOrchestrator:
         return kept
 
     def _ensure(self) -> ManagerSession:
-        """Under the session lock: keep the oldest passive conversation or persist a new one.
+        """Under the session lock: continue the selected conversation, or the oldest passive.
 
         Holding the lock proves no pinned owner is live, so a pinned record left active is
-        retired through the same mechanical handoff a crashed session gets. The lock is held
+        retired through the same mechanical handoff a crashed session gets -- unless the
+        owner explicitly selected that record. A selection is the panel's continue target
+        and survives a later ``ensure``, including from another process. With no selection
+        the oldest passive conversation is kept, or a new one is persisted. The lock is held
         only while persisting: a passive conversation has no owner to hold it for.
         """
         self._acquire_lock()
         try:
-            session = self._retire_stale(keep_passive=True) or self._create_passive()
+            selected = self._selected_session()
+            if selected is not None:
+                session = self._activate_selected(selected)
+            else:
+                session = self._retire_stale(keep_passive=True) or self._create_passive()
         finally:
             self._release_lock()
         self._session = session
@@ -748,6 +1075,11 @@ class ManagerOrchestrator:
             source_ref=f"manager_loop:{session.session_id}:turn:{turn}",
             idempotency_key=f"manager-loop-{session.session_id}-turn-{turn}",
             task_id=task_id,
+            thread_id=session.session_id,
+            session_id=session.session_id,
+            provider=session.backend_id or "manager_chat",
+            user_text=message,
+            assistant_text=reply,
             metadata={"backend_id": session.backend_id, "model": session.model, "errors": len(errors)},
         )
         if not written.get("ok"):

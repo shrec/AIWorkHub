@@ -363,6 +363,18 @@ def update(
         }
         if model is not None:
             models.setdefault(provider, {}).setdefault(adapter, {})[model] = enabled
+            # An OpenCode model toggle writes the canonical leaf. The launcher
+            # also requires the vendor spelling of that same transport. A stored
+            # vendor-adapter false is not a switch this toggle can show, so an
+            # explicit enable lifts that one gate in the same revision. A
+            # disable writes only the leaf and leaves the group switch alone.
+            if enabled and provider == "opencode" and adapter == "opencode_cli":
+                vendor, sep, _remainder = model.partition("/")
+                vendor = vendor.lower()
+                if sep and vendor and vendor != "opencode":
+                    vendor_adapters = adapters.setdefault(vendor, {})
+                    if vendor_adapters.get("opencode_cli") is False:
+                        vendor_adapters["opencode_cli"] = True
         elif adapter is not None:
             adapters.setdefault(provider, {})[adapter] = enabled
         else:

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import ast
 import errno
 import io
 import importlib.util
+import json
 import os
 import stat
 import threading
@@ -13,7 +15,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from aiworkhub import _platform_process, platform_io
+from aiworkhub import _platform_process, platform_io, windows_appcontainer, windows_mxc
 
 
 def test_current_user_uid_never_probes_posix_uid_on_windows(monkeypatch):
@@ -1890,3 +1892,423 @@ def test_owned_windows_handle_detach_transfers_once():
     assert owned.closed and closes == []
     with pytest.raises(ValueError):
         owned.detach()
+
+
+# ---------------------------------------------------------------------------
+# Windows sandbox policy facade.  platform_io owns the typed decisions;
+# windows_mxc and windows_appcontainer own the probing.  Every Windows path
+# below stubs the primitives or builds a real package tree for windows_mxc, so
+# a Windows host and a Linux host give the same answer.
+# ---------------------------------------------------------------------------
+
+_NOT_WINDOWS = "platform_not_windows"
+_APPCONTAINER_UNAVAILABLE = "win32_appcontainer_unavailable"
+_MXC_NOT_READY = "mxc_runtime_not_ready"
+_READINESS_CASES = [
+    pytest.param(False, True, (_APPCONTAINER_UNAVAILABLE,), id="appcontainer-unavailable"),
+    pytest.param(True, False, (_MXC_NOT_READY,), id="mxc-not-ready"),
+    pytest.param(False, False, (_APPCONTAINER_UNAVAILABLE, _MXC_NOT_READY), id="both-missing"),
+]
+
+
+def _appcontainer_probe(available):
+    reason = None if available else windows_appcontainer.AppContainerReason.PLATFORM_UNSUPPORTED
+    return windows_appcontainer.AppContainerProbe(
+        available=available, reason=reason, detail="stubbed host probe"
+    )
+
+
+def _mxc_readiness(root, runtime, *, ready=None):
+    return windows_mxc.MxcReadiness(
+        ready=runtime is not None if ready is None else ready,
+        package_root=root,
+        pinned_sdk_name=windows_mxc.PINNED_MXC_SDK_NAME,
+        pinned_sdk_version=windows_mxc.PINNED_MXC_SDK_VERSION,
+        sdk_name=windows_mxc.PINNED_MXC_SDK_NAME,
+        sdk_version=windows_mxc.PINNED_MXC_SDK_VERSION,
+        architecture="win32-x64",
+        wxc_path=runtime,
+        host_prep_path=None,
+        failures=() if runtime is not None else ("stubbed runtime is not ready",),
+        evidence=(),
+    )
+
+
+def _stub_primitives(monkeypatch, appcontainer, mxc):
+    calls = []
+
+    def probe():
+        calls.append(("appcontainer",))
+        return appcontainer
+
+    def probe_mxc_runtime(package_root, host_machine=None, **_kwargs):
+        calls.append(("mxc", package_root, host_machine))
+        return mxc
+
+    monkeypatch.setattr(windows_appcontainer, "probe", probe)
+    monkeypatch.setattr(windows_mxc, "probe_mxc_runtime", probe_mxc_runtime)
+    return calls
+
+
+def _forbid_child_environment(monkeypatch):
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("no child environment may be built for this decision")
+
+    monkeypatch.setattr(windows_appcontainer, "appcontainer_child_environment", forbidden)
+
+
+def _write_mxc_package(root, *, version=None, architecture_directory="x64"):
+    binary = root / "bin" / architecture_directory / windows_mxc.WXC_EXEC_BINARY_NAME
+    binary.parent.mkdir(parents=True)
+    binary.write_bytes(b"MZ" + bytes(62))
+    metadata = {
+        "name": windows_mxc.PINNED_MXC_SDK_NAME,
+        "version": version or windows_mxc.PINNED_MXC_SDK_VERSION,
+    }
+    (root / "package.json").write_text(json.dumps(metadata), encoding="utf-8")
+    return root
+
+
+@pytest.mark.parametrize("platform_name", ["linux", "macos", "freebsd"])
+def test_windows_sandbox_readiness_off_windows_fails_closed_without_probing(
+    monkeypatch, tmp_path, platform_name
+):
+    runtime = tmp_path / windows_mxc.WXC_EXEC_BINARY_NAME
+    calls = _stub_primitives(
+        monkeypatch, _appcontainer_probe(True), _mxc_readiness(tmp_path, runtime)
+    )
+
+    readiness = platform_io.windows_sandbox_readiness(
+        tmp_path / "missing-sdk", platform_name=platform_name
+    )
+
+    assert calls == []
+    assert readiness.ready is False
+    assert readiness.causes == (_NOT_WINDOWS,)
+    assert readiness.appcontainer is None
+    assert readiness.mxc is None
+    assert readiness.runtime_path is None
+
+
+def test_windows_sandbox_readiness_delegates_to_both_primitives(monkeypatch, tmp_path):
+    runtime = tmp_path / "bin" / "x64" / windows_mxc.WXC_EXEC_BINARY_NAME
+    appcontainer = _appcontainer_probe(True)
+    mxc = _mxc_readiness(tmp_path, runtime)
+    calls = _stub_primitives(monkeypatch, appcontainer, mxc)
+    sdk_root = tmp_path / "sdk"
+
+    readiness = platform_io.windows_sandbox_readiness(
+        sdk_root, platform_name="windows", host_machine="ARM64"
+    )
+
+    assert calls == [("appcontainer",), ("mxc", sdk_root, "ARM64")]
+    assert readiness.ready is True
+    assert readiness.causes == ()
+    assert readiness.appcontainer is appcontainer
+    assert readiness.mxc is mxc
+    assert readiness.runtime_path == runtime
+
+
+@pytest.mark.parametrize(("appcontainer_available", "mxc_ready", "causes"), _READINESS_CASES)
+def test_windows_sandbox_readiness_needs_appcontainer_and_mxc_together(
+    monkeypatch, tmp_path, appcontainer_available, mxc_ready, causes
+):
+    runtime = tmp_path / windows_mxc.WXC_EXEC_BINARY_NAME if mxc_ready else None
+    _stub_primitives(
+        monkeypatch,
+        _appcontainer_probe(appcontainer_available),
+        _mxc_readiness(tmp_path, runtime),
+    )
+
+    readiness = platform_io.windows_sandbox_readiness(tmp_path, platform_name="windows")
+
+    assert readiness.ready is False
+    assert readiness.causes == causes
+    assert readiness.runtime_path is None
+
+
+def test_windows_sandbox_readiness_rejects_a_ready_mxc_result_without_a_runtime_path(
+    monkeypatch, tmp_path
+):
+    _stub_primitives(
+        monkeypatch, _appcontainer_probe(True), _mxc_readiness(tmp_path, None, ready=True)
+    )
+
+    readiness = platform_io.windows_sandbox_readiness(tmp_path, platform_name="windows")
+
+    assert readiness.ready is False
+    assert readiness.causes == (_MXC_NOT_READY,)
+    assert readiness.runtime_path is None
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ImportError("primitive missing"),
+        OSError(errno.EIO, "probe io"),
+        RuntimeError("probe broke"),
+        TypeError("probe misused"),
+        ValueError("probe rejected"),
+        AttributeError("probe api drift"),
+    ],
+    ids=lambda error: type(error).__name__,
+)
+def test_windows_sandbox_readiness_treats_a_raising_primitive_as_not_ready(
+    monkeypatch, tmp_path, error
+):
+    def raising(*_args, **_kwargs):
+        raise error
+
+    monkeypatch.setattr(windows_appcontainer, "probe", raising)
+    monkeypatch.setattr(windows_mxc, "probe_mxc_runtime", raising)
+
+    readiness = platform_io.windows_sandbox_readiness(tmp_path, platform_name="windows")
+
+    assert readiness.ready is False
+    assert readiness.causes == (_APPCONTAINER_UNAVAILABLE, _MXC_NOT_READY)
+    assert readiness.appcontainer is None
+    assert readiness.mxc is None
+
+
+def test_windows_sandbox_readiness_probes_each_primitive_independently(monkeypatch, tmp_path):
+    mxc = _mxc_readiness(tmp_path, tmp_path / windows_mxc.WXC_EXEC_BINARY_NAME)
+    _stub_primitives(monkeypatch, _appcontainer_probe(True), mxc)
+
+    def raising():
+        raise OSError(errno.EIO, "probe io")
+
+    monkeypatch.setattr(windows_appcontainer, "probe", raising)
+
+    readiness = platform_io.windows_sandbox_readiness(tmp_path, platform_name="windows")
+
+    assert readiness.ready is False
+    assert readiness.causes == (_APPCONTAINER_UNAVAILABLE,)
+    assert readiness.appcontainer is None
+    assert readiness.mxc is mxc
+    assert readiness.runtime_path is None
+
+
+def test_windows_sandbox_readiness_reports_the_real_pinned_mxc_runtime(monkeypatch, tmp_path):
+    monkeypatch.setattr(windows_appcontainer, "probe", lambda: _appcontainer_probe(True))
+    root = _write_mxc_package(tmp_path / "sdk")
+
+    readiness = platform_io.windows_sandbox_readiness(
+        root, platform_name="windows", host_machine="AMD64"
+    )
+
+    expected = (root / "bin" / "x64" / windows_mxc.WXC_EXEC_BINARY_NAME).resolve()
+    assert readiness.ready is True
+    assert readiness.mxc == windows_mxc.probe_mxc_runtime(root, "AMD64")
+    assert readiness.runtime_path == expected
+
+
+@pytest.mark.parametrize(
+    ("version", "architecture_directory", "host_machine", "failure"),
+    [
+        pytest.param("0.6.0", "x64", "AMD64", "pinned SDK version mismatch", id="sdk-version"),
+        pytest.param(
+            None, "x64", "ARM64", "exists only for architecture win32-x64", id="architecture"
+        ),
+        pytest.param(None, "x64", "x86", "unsupported host architecture", id="unsupported-host"),
+    ],
+)
+def test_windows_sandbox_readiness_fails_closed_on_real_mxc_mismatches(
+    monkeypatch, tmp_path, version, architecture_directory, host_machine, failure
+):
+    monkeypatch.setattr(windows_appcontainer, "probe", lambda: _appcontainer_probe(True))
+    root = _write_mxc_package(
+        tmp_path / "sdk", version=version, architecture_directory=architecture_directory
+    )
+
+    readiness = platform_io.windows_sandbox_readiness(
+        root, platform_name="windows", host_machine=host_machine
+    )
+
+    assert readiness.ready is False
+    assert readiness.causes == (_MXC_NOT_READY,)
+    assert readiness.runtime_path is None
+    assert any(failure in reported for reported in readiness.mxc.failures)
+
+
+@pytest.mark.parametrize(
+    ("relative_root", "failure"),
+    [
+        pytest.param("", "package root is not configured", id="unconfigured"),
+        pytest.param("absent-sdk", "missing SDK package metadata", id="absent"),
+    ],
+)
+def test_windows_sandbox_readiness_fails_closed_without_an_installed_sdk(
+    monkeypatch, tmp_path, relative_root, failure
+):
+    monkeypatch.setattr(windows_appcontainer, "probe", lambda: _appcontainer_probe(True))
+    package_root = tmp_path / relative_root if relative_root else relative_root
+
+    readiness = platform_io.windows_sandbox_readiness(
+        package_root, platform_name="windows", host_machine="AMD64"
+    )
+
+    assert readiness.ready is False
+    assert readiness.causes == (_MXC_NOT_READY,)
+    assert any(failure in reported for reported in readiness.mxc.failures)
+
+
+def test_windows_sandbox_environment_delegates_to_appcontainer_policy(monkeypatch):
+    seen = []
+    adjusted = {"PATH": "p", "LOCALAPPDATA": "L"}
+
+    def child_environment(environment, **_kwargs):
+        seen.append(environment)
+        return adjusted
+
+    monkeypatch.setattr(windows_appcontainer, "appcontainer_child_environment", child_environment)
+    supplied = {"PATH": "p"}
+
+    assert platform_io.windows_sandbox_environment(supplied, platform_name="windows") is adjusted
+    assert platform_io.windows_sandbox_environment(None, platform_name="windows") is adjusted
+    assert seen == [supplied, None]
+
+
+@pytest.mark.parametrize("platform_name", ["linux", "macos"])
+def test_windows_sandbox_environment_is_untouched_off_windows(monkeypatch, platform_name):
+    _forbid_child_environment(monkeypatch)
+    supplied = {"PATH": "/usr/bin"}
+
+    assert platform_io.windows_sandbox_environment(supplied, platform_name=platform_name) is supplied
+    assert supplied == {"PATH": "/usr/bin"}
+    assert platform_io.windows_sandbox_environment(None, platform_name=platform_name) is None
+
+
+def test_windows_sandbox_environment_never_falls_back_to_the_unadjusted_environment(monkeypatch):
+    def failing(*_args, **_kwargs):
+        raise OSError(errno.EIO, "child environment unavailable")
+
+    monkeypatch.setattr(windows_appcontainer, "appcontainer_child_environment", failing)
+
+    with pytest.raises(OSError, match="child environment unavailable"):
+        platform_io.windows_sandbox_environment({"PATH": "p"}, platform_name="windows")
+
+
+def test_windows_sandbox_launch_decision_allows_a_ready_windows_stack(monkeypatch, tmp_path):
+    runtime = tmp_path / "bin" / "x64" / windows_mxc.WXC_EXEC_BINARY_NAME
+    _stub_primitives(monkeypatch, _appcontainer_probe(True), _mxc_readiness(tmp_path, runtime))
+    adjusted = {"PATH": "p", "LOCALAPPDATA": "L"}
+    monkeypatch.setattr(
+        windows_appcontainer, "appcontainer_child_environment", lambda environment, **_kw: adjusted
+    )
+
+    decision = platform_io.windows_sandbox_launch_decision(
+        tmp_path / "sdk", {"PATH": "p"}, platform_name="windows"
+    )
+
+    assert decision.allowed is True
+    assert decision.causes == ()
+    assert decision.executable == runtime
+    assert decision.environment is adjusted
+    assert decision.readiness.ready is True
+
+
+@pytest.mark.parametrize(("appcontainer_available", "mxc_ready", "causes"), _READINESS_CASES)
+def test_windows_sandbox_launch_decision_denies_without_side_effects_when_not_ready(
+    monkeypatch, tmp_path, appcontainer_available, mxc_ready, causes
+):
+    runtime = tmp_path / windows_mxc.WXC_EXEC_BINARY_NAME if mxc_ready else None
+    _stub_primitives(
+        monkeypatch,
+        _appcontainer_probe(appcontainer_available),
+        _mxc_readiness(tmp_path, runtime),
+    )
+    _forbid_child_environment(monkeypatch)
+    supplied = {"PATH": "p"}
+
+    decision = platform_io.windows_sandbox_launch_decision(
+        tmp_path, supplied, platform_name="windows"
+    )
+
+    assert decision.allowed is False
+    assert decision.causes == causes
+    assert decision.executable is None
+    assert decision.environment is supplied
+    assert decision.readiness.ready is False
+
+
+@pytest.mark.parametrize("platform_name", ["linux", "macos"])
+def test_windows_sandbox_launch_decision_leaves_off_windows_launches_alone(
+    monkeypatch, tmp_path, platform_name
+):
+    runtime = tmp_path / windows_mxc.WXC_EXEC_BINARY_NAME
+    calls = _stub_primitives(
+        monkeypatch, _appcontainer_probe(True), _mxc_readiness(tmp_path, runtime)
+    )
+    _forbid_child_environment(monkeypatch)
+    supplied = {"PATH": "/usr/bin"}
+
+    decision = platform_io.windows_sandbox_launch_decision(
+        tmp_path, supplied, platform_name=platform_name
+    )
+
+    assert calls == []
+    assert decision.allowed is False
+    assert decision.causes == (_NOT_WINDOWS,)
+    assert decision.executable is None
+    assert decision.environment is supplied
+    assert supplied == {"PATH": "/usr/bin"}
+
+
+def test_windows_sandbox_records_are_typed_and_immutable(tmp_path):
+    assert platform_io.WINDOWS_SANDBOX_CAUSE_PLATFORM_NOT_WINDOWS == _NOT_WINDOWS
+    assert platform_io.WINDOWS_SANDBOX_CAUSE_APPCONTAINER_UNAVAILABLE == _APPCONTAINER_UNAVAILABLE
+    assert platform_io.WINDOWS_SANDBOX_CAUSE_MXC_NOT_READY == _MXC_NOT_READY
+    readiness = platform_io.windows_sandbox_readiness(tmp_path, platform_name="linux")
+    decision = platform_io.windows_sandbox_launch_decision(tmp_path, None, platform_name="linux")
+
+    assert isinstance(readiness, platform_io.WindowsSandboxReadiness)
+    assert isinstance(decision, platform_io.WindowsSandboxLaunchDecision)
+    with pytest.raises(AttributeError):
+        readiness.ready = True
+    with pytest.raises(AttributeError):
+        decision.allowed = True
+
+
+def _import_time_imports(tree):
+    names = set()
+    pending = list(tree.body)
+    while pending:
+        node = pending.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if (
+            isinstance(node, ast.If)
+            and isinstance(node.test, ast.Name)
+            and node.test.id == "TYPE_CHECKING"
+        ):
+            pending.extend(node.orelse)
+            continue
+        if isinstance(node, ast.Import):
+            names.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            names.add(node.module or "")
+            names.update(alias.name for alias in node.names)
+        pending.extend(ast.iter_child_nodes(node))
+    return names
+
+
+def test_windows_primitives_load_lazily_so_off_windows_imports_are_unchanged():
+    tree = ast.parse(Path(platform_io.__file__).read_text(encoding="utf-8"))
+
+    eager = {name.rsplit(".", 1)[-1] for name in _import_time_imports(tree)}
+
+    assert not eager & {"windows_appcontainer", "windows_mxc"}
+
+
+def test_platform_io_delegates_to_the_primitives_instead_of_restating_their_policy():
+    source = Path(platform_io.__file__).read_text(encoding="utf-8")
+
+    for delegated in ("probe_mxc_runtime", "appcontainer_child_environment"):
+        assert delegated in source
+    for owned_by_a_primitive in (
+        "mxcRuntime",
+        "package.json",
+        "@microsoft/mxc-sdk",
+        "CreateAppContainerProfile",
+    ):
+        assert owned_by_a_primitive not in source

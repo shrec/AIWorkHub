@@ -15,6 +15,8 @@ class FakeElement {
     this._textContent = "";
     this._innerHTML = "";
     this.value = "";
+    // app.js now starts the manager chat sidebar at load, which toggles classes.
+    this.classList = { add() {}, remove() {}, toggle() {}, contains() { return false; } };
   }
 
   append(...nodes) {

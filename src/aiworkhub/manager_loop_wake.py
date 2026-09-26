@@ -202,54 +202,59 @@ class WakeConsumer:
 
 
 def default_callback_source(
-    *, session_id: str, provider: str | None = None, lease_seconds: int = 120
+    *, session_id: str | Callable[[], str], provider: str | None = None, lease_seconds: int = 120
 ) -> tuple[ClaimFn, AckFn]:
     """The real claim/ack wiring: the same lease API behind the legacy MCP poll tools.
 
-    A fresh callback's ``origin_thread_id`` is whoever created the task --
-    never this manager loop session's own id -- so claiming scoped to
-    ``session_id`` alone would never see it. Before every claim, this rebinds
-    the repository's durable pending callbacks onto ``session_id``, exactly
-    the way the bootstrap dispatcher hands a repository's callbacks to
-    whichever route is its current verified manager
-    (``callback_store.rebind_pending_callbacks`` -- see ``core.py``'s
-    ``manager_inbox`` bootstrap). ``provider=None`` (the Manager Chat wake
-    consumer) covers every pending family -- a seat on any backend sees
-    worker terminals launched under any other; an explicit provider keeps
-    the legacy single-family scope. The ack resolves each batch's own
-    provider/origin from its row, so mixed-family batches settle correctly.
+    ``provider=None`` is the Manager Chat seat. It copies still-pending
+    Codex/Claude rows onto the active session and claims only that copy.
+    It does not rebind those original rows, so the existing mux can still
+    deliver them. An explicit provider keeps the older single-family claim.
+    The ack resolves each batch's own provider/origin from its row.
     """
 
-    def _families(conn: Any) -> list[str]:
-        from . import callback_store as _store
-
-        if provider is not None:
-            name = str(provider).strip().lower()
-            return [name] if name else []
-        return _store.pending_callback_providers(conn)
+    def origin() -> str:
+        current = session_id() if callable(session_id) else session_id
+        return str(current or "").strip()
 
     def claim() -> Optional[Mapping[str, Any]]:
         from . import callback_store
         from .core import _canonical_connect
 
+        active_id = origin()
+        if not active_id:
+            return None
         conn = _canonical_connect()
         try:
-            families = _families(conn)
-            batch = None
-            claimed_family = ""
-            for family in families:
+            if provider is None:
+                callback_store.mirror_pending_to_manager_chat(conn, active_id)
+                family = callback_store.MANAGER_CHAT_PROVIDER
                 callback_store.rebind_pending_callbacks(
-                    conn, provider=family, origin_thread_id=session_id,
+                    conn, provider=family, origin_thread_id=active_id,
                 )
                 batch = callback_store.claim_pending_callback_batch(
                     conn,
                     lease_seconds=lease_seconds,
                     provider=family,
-                    origin_thread_id=session_id,
+                    origin_thread_id=active_id,
                 )
-                if batch:
-                    claimed_family = family
-                    break
+                claimed_family = family if batch else ""
+            else:
+                family = str(provider).strip().lower()
+                claimed_family = ""
+                batch = None
+                if family:
+                    callback_store.rebind_pending_callbacks(
+                        conn, provider=family, origin_thread_id=active_id,
+                    )
+                    batch = callback_store.claim_pending_callback_batch(
+                        conn,
+                        lease_seconds=lease_seconds,
+                        provider=family,
+                        origin_thread_id=active_id,
+                    )
+                    if batch:
+                        claimed_family = family
         finally:
             conn.close()
         if not batch:

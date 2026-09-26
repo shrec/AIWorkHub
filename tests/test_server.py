@@ -144,6 +144,8 @@ def test_manager_loop_tools_refuse_a_non_manager_route(monkeypatch) -> None:
 
     assert server.aiworkhub_manager_loop_start("fake", "model-a") == refusal
     assert server.aiworkhub_manager_loop_ensure() == refusal
+    assert server.aiworkhub_manager_loop_continue("mls-aaaa1111bbbb2222") == refusal
+    assert server.aiworkhub_manager_loop_new() == refusal
     assert server.aiworkhub_manager_loop_send("hello") == refusal
     assert server.aiworkhub_manager_loop_rotate("because") == refusal
     assert server.aiworkhub_manager_loop_status() == refusal
@@ -209,20 +211,24 @@ def test_manager_loop_send_forwards_the_picker_route_to_the_service(
     )
     captured: dict = {}
 
-    def fake_send(repo, text, backend_id=None, model=None):
-        captured.update(repo=repo, text=text, backend_id=backend_id, model=model)
+    def fake_send(repo, text, backend_id=None, model=None, reasoning=None):
+        captured.update(
+            repo=repo, text=text, backend_id=backend_id, model=model, reasoning=reasoning
+        )
         return {"ok": True}
 
     monkeypatch.setattr(server.manager_loop_service, "send", fake_send)
     monkeypatch.setenv("AIWORKHUB_ALLOW_LAUNCH", "1")
     monkeypatch.setattr(server.core, "writes_allowed", lambda: True)
 
-    assert server.aiworkhub_manager_loop_send("hi", "codex_cli", "gpt-x") == {"ok": True}
+    assert server.aiworkhub_manager_loop_send("hi", "codex_cli", "gpt-x", "high") == {"ok": True}
     assert captured == {
         "repo": tmp_path.resolve(), "text": "hi", "backend_id": "codex_cli", "model": "gpt-x",
+        "reasoning": "high",
     }
     assert server.aiworkhub_manager_loop_send("hi") == {"ok": True}
     assert captured["backend_id"] is None and captured["model"] is None
+    assert captured["reasoning"] is None
 
 def test_manager_loop_tools_refuse_a_manager_route_with_no_session_identity(monkeypatch) -> None:
     monkeypatch.setattr(
@@ -234,6 +240,8 @@ def test_manager_loop_tools_refuse_a_manager_route_with_no_session_identity(monk
 
     assert server.aiworkhub_manager_loop_start("fake", "model-a") == missing_route_refusal
     assert server.aiworkhub_manager_loop_ensure() == missing_route_refusal
+    assert server.aiworkhub_manager_loop_continue("mls-aaaa1111bbbb2222") == missing_route_refusal
+    assert server.aiworkhub_manager_loop_new() == missing_route_refusal
     assert server.aiworkhub_manager_loop_send("hello") == missing_route_refusal
     assert server.aiworkhub_manager_loop_rotate("because") == missing_route_refusal
     assert server.aiworkhub_manager_loop_status() == missing_route_refusal
@@ -249,6 +257,8 @@ def test_manager_loop_tools_refuse_a_manager_route_with_no_session_identity(monk
 
     assert server.aiworkhub_manager_loop_start("fake", "model-a") == no_identity_refusal
     assert server.aiworkhub_manager_loop_ensure() == no_identity_refusal
+    assert server.aiworkhub_manager_loop_continue("mls-aaaa1111bbbb2222") == no_identity_refusal
+    assert server.aiworkhub_manager_loop_new() == no_identity_refusal
     assert server.aiworkhub_manager_loop_send("hello") == no_identity_refusal
     assert server.aiworkhub_manager_loop_rotate("because") == no_identity_refusal
     assert server.aiworkhub_manager_loop_status() == no_identity_refusal

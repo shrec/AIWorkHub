@@ -40,10 +40,13 @@ SCHEMA_ID = "aiworkhub.callback_store.v1"
 # separate turns/dead letters).
 DEFAULT_CALLBACK_BATCH_MAX_MEMBERS = 25
 
-# Canonical callback delivery classes eligible for enqueue/delivery. Unknown
-# values remain ineligible. Owned by ``task_fsm``; imported here rather than
-# restated (NF-2026-00339).
 CALLBACK_ELIGIBLE_TRANSITIONS: frozenset[str] = task_fsm.TERMINAL_CALLBACK_CLASSES
+
+# Codex and Claude keep their own outbox rows. Manager Chat is a second
+# destination, not a replacement, until that mux is removed.
+MANAGER_CHAT_PROVIDER = "manager_chat"
+_CALLBACK_PROVIDERS = frozenset({"", "codex", "claude", "copilot", MANAGER_CHAT_PROVIDER})
+_MANAGER_CHAT_SESSION_RE = re.compile(r"^mls-[0-9a-f]{32}$", re.I)
 
 CALLBACK_OUTBOX_STATES: tuple[str, ...] = (
     "pending", "inflight", "delivered", "dead_letter", "superseded",
@@ -425,6 +428,148 @@ def _dead_letter_malformed_outbox_row(
         raise
 
 
+def _row_value(row: Any, key: str, index: int) -> str:
+    if row is None:
+        return ""
+    if isinstance(row, sqlite3.Row):
+        return str(row[key] or "")
+    try:
+        return str(row[key] or "")
+    except (KeyError, TypeError, IndexError):
+        return str(row[index] or "")
+
+
+def _main_database_file(conn: sqlite3.Connection) -> str:
+    try:
+        rows = conn.execute("PRAGMA database_list").fetchall()
+    except sqlite3.Error:
+        return ""
+    for row in rows:
+        name = _row_value(row, "name", 1)
+        file = _row_value(row, "file", 2)
+        if name == "main" and file:
+            return file
+    return ""
+
+
+def _active_manager_chat_session_from_conn(conn: sqlite3.Connection) -> str:
+    """The selected active Manager Chat session for this connection's repo.
+
+    Derived from the database file, never from an ambient repo env, so a
+    test database cannot inherit the owner's live session.
+    """
+
+    db_file = _main_database_file(conn)
+    if not db_file:
+        return ""
+    path = Path(db_file)
+    if path.parent.name != "tasking" or path.parent.parent.name != ".aiworkhub":
+        return ""
+    selected_path = path.parent.parent / "runtime" / "manager_loop" / "selected.json"
+    try:
+        payload = json.loads(selected_path.read_text(encoding="utf-8"))
+        session_id = str(payload.get("session_id") or "").strip() if isinstance(payload, dict) else ""
+        if not _MANAGER_CHAT_SESSION_RE.fullmatch(session_id):
+            return ""
+        record = json.loads((selected_path.parent / "sessions" / f"{session_id}.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return ""
+    if not isinstance(record, dict):
+        return ""
+    if str(record.get("session_id") or "") != session_id:
+        return ""
+    if str(record.get("status") or "") != "active":
+        return ""
+    return session_id
+
+
+def _callback_manager_chat_session(conn: sqlite3.Connection, task_id: str) -> str:
+    """Where this task's Manager Chat copy should land.
+
+    The card's stamped session wins. Otherwise the active selected session.
+    Window ids and episode ids are not sessions.
+    """
+
+    try:
+        row = conn.execute(
+            "SELECT card_json, origin_thread_id FROM tasks WHERE task_id=?",
+            (task_id,),
+        ).fetchone()
+    except sqlite3.Error:
+        row = None
+    if row is not None:
+        raw = _row_value(row, "card_json", 0)
+        try:
+            card = json.loads(raw) if raw else {}
+        except (TypeError, json.JSONDecodeError):
+            card = {}
+        if isinstance(card, dict):
+            stamped = str(card.get("manager_chat_session_id") or "").strip()
+            if _MANAGER_CHAT_SESSION_RE.fullmatch(stamped):
+                return stamped
+            origin = str(card.get("origin_thread_id") or _row_value(row, "origin_thread_id", 1) or "").strip()
+            if _MANAGER_CHAT_SESSION_RE.fullmatch(origin):
+                return origin
+    return _active_manager_chat_session_from_conn(conn)
+
+
+def mirror_pending_to_manager_chat(conn: sqlite3.Connection, session_id: str) -> int:
+    """Copy still-pending Codex/Claude/Copilot rows onto one Manager Chat session.
+
+    The original row stays pending so the existing mux can still deliver it.
+    This is a copy, not a rebind.
+    """
+
+    session_id = str(session_id or "").strip()
+    if not _MANAGER_CHAT_SESSION_RE.fullmatch(session_id):
+        return 0
+    _ensure_callback_outbox_table(conn)
+    try:
+        rows = conn.execute(
+            "SELECT task_id, transition, episode_id, event_id, request_id "
+            "FROM callback_outbox WHERE state='pending' AND provider IN ('codex', 'claude', 'copilot')"
+        ).fetchall()
+    except sqlite3.Error:
+        return 0
+    copied = 0
+    for row in rows:
+        if enqueue_callback(
+            conn,
+            _row_value(row, "task_id", 0),
+            session_id,
+            _row_value(row, "transition", 1),
+            provider=MANAGER_CHAT_PROVIDER,
+            episode_id=_row_value(row, "episode_id", 2),
+            event_id=_row_value(row, "event_id", 3),
+            request_id=_row_value(row, "request_id", 4),
+        ):
+            copied += 1
+    return copied
+
+
+def _mirror_callback_to_manager_chat(
+    conn: sqlite3.Connection,
+    task_id: str,
+    transition: str,
+    episode_id: str,
+    event_id: str,
+    request_id: str,
+) -> bool:
+    session_id = _callback_manager_chat_session(conn, task_id)
+    if not session_id:
+        return False
+    return enqueue_callback(
+        conn,
+        task_id,
+        session_id,
+        transition,
+        provider=MANAGER_CHAT_PROVIDER,
+        episode_id=episode_id,
+        event_id=event_id,
+        request_id=request_id,
+    )
+
+
 def enqueue_callback(
     conn: sqlite3.Connection,
     task_id: str,
@@ -446,7 +591,10 @@ def enqueue_callback(
         return False
     validated_thread = str(origin_thread_id or "").strip()
     validated_provider = str(provider or "").strip().lower()
-    if validated_provider not in ("", "codex", "claude", "copilot"):
+    # An mls- id is a Manager Chat session, never a Codex/Claude thread.
+    if _MANAGER_CHAT_SESSION_RE.fullmatch(validated_thread):
+        validated_provider = MANAGER_CHAT_PROVIDER
+    if validated_provider not in _CALLBACK_PROVIDERS:
         return False
     if not validated_thread:
         return False
@@ -503,6 +651,20 @@ def enqueue_callback(
         conn.rollback()
         raise
     append_event(conn, task_id, "callback_enqueued", "", {"transition": transition, "episode_id": resolved_episode, "provider": validated_provider})
+    if validated_provider != MANAGER_CHAT_PROVIDER:
+        try:
+            _mirror_callback_to_manager_chat(
+                conn,
+                task_id,
+                transition,
+                str(resolved_episode),
+                event_id,
+                request_id,
+            )
+        except sqlite3.Error:
+            # The Codex/Claude row is already durable. A chat copy failure
+            # must not look like the original enqueue failed.
+            pass
     return True
 
 
@@ -1338,6 +1500,31 @@ def rebind_pending_callbacks(
 
 
 STALE_PENDING_PRUNE_REASON = "stale_pending_pruned"
+
+
+def pending_callback_providers(conn: sqlite3.Connection) -> list[str]:
+    """Every provider family with undelivered work, sorted, never empty strings.
+
+    The Manager Chat wake consumer owns callbacks from every family (a seat
+    on any backend must see worker terminals launched under any other), so
+    it iterates this list instead of assuming one provider.
+    """
+    _ensure_callback_outbox_table(conn)
+    _ensure_callback_batches_table(conn)
+    families: set[str] = set()
+    for row in conn.execute(
+        "SELECT DISTINCT provider FROM callback_outbox WHERE state='pending'"
+    ).fetchall():
+        name = str(row["provider"] or "").strip().lower()
+        if name:
+            families.add(name)
+    for row in conn.execute(
+        "SELECT DISTINCT provider FROM callback_batches WHERE state='pending'"
+    ).fetchall():
+        name = str(row["provider"] or "").strip().lower()
+        if name:
+            families.add(name)
+    return sorted(families)
 
 
 def prune_stale_pending_callbacks(

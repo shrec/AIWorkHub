@@ -523,6 +523,97 @@ def test_grok_kilo_preserves_windows_appcontainer_gate(monkeypatch, tmp_path):
     assert allowed.launchable is True
 
 
+def test_codex_windows_stable_shim_resolves_newest_native_executable(
+    monkeypatch, tmp_path
+):
+    local_app_data = tmp_path / "Local"
+    codex_root = local_app_data / "OpenAI" / "Codex"
+    shim = codex_root / "shim" / "codex.cmd"
+    shim.parent.mkdir(parents=True)
+    shim.write_text(
+        """@echo off
+rem Stable launcher for Codex CLI.
+setlocal
+set "CODEX_ROOT=%LOCALAPPDATA%\\OpenAI\\Codex\\bin"
+set "CODEX_BIN="
+for /f "delims=" %%i in ('dir /b /a:d /o:-d "%CODEX_ROOT%" 2^>nul') do (
+  if not defined CODEX_BIN if exist "%CODEX_ROOT%\\%%i\\codex.exe" set "CODEX_BIN=%CODEX_ROOT%\\%%i\\codex.exe"
+)
+if not defined CODEX_BIN (
+  echo [codex shim] codex.exe not found under "%CODEX_ROOT%" 1>&2
+  exit /b 9009
+)
+"%CODEX_BIN%" %*
+""",
+        encoding="utf-8",
+    )
+    older_dir = codex_root / "bin" / "old"
+    newer_dir = codex_root / "bin" / "new"
+    older_dir.mkdir(parents=True)
+    newer_dir.mkdir(parents=True)
+    older = _executable(older_dir, "codex.exe")
+    newer = _executable(newer_dir, "codex.exe")
+    os.utime(older.parent, (100, 100))
+    os.utime(newer.parent, (200, 200))
+    monkeypatch.setenv("LOCALAPPDATA", str(local_app_data))
+    monkeypatch.setattr(runtime_adapters, "_is_windows_host", lambda: True)
+    monkeypatch.setattr(
+        runtime_adapters.shutil,
+        "which",
+        lambda binary: str(shim) if binary == "codex" else None,
+    )
+
+    resolution = runtime_adapters.resolve_executable("codex_cli")
+
+    assert resolution == runtime_adapters.ExecutableResolution(
+        "codex_cli", str(newer), True, ""
+    )
+
+
+def test_codex_windows_arbitrary_cmd_discovery_is_preserved(monkeypatch, tmp_path):
+    shim = _executable(tmp_path, "codex.cmd")
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "Local"))
+    monkeypatch.setattr(runtime_adapters, "_is_windows_host", lambda: True)
+    monkeypatch.setattr(runtime_adapters.shutil, "which", lambda _: str(shim))
+
+    resolution = runtime_adapters.resolve_executable("codex_cli")
+
+    assert resolution.executable == str(shim)
+
+
+def test_codex_windows_stable_path_requires_the_expected_shim_shape(
+    monkeypatch, tmp_path
+):
+    local_app_data = tmp_path / "Local"
+    shim = local_app_data / "OpenAI" / "Codex" / "shim" / "codex.cmd"
+    shim.parent.mkdir(parents=True)
+    shim.write_text("@echo off\necho replacement shim\n", encoding="utf-8")
+    shim.chmod(0o755)
+    monkeypatch.setenv("LOCALAPPDATA", str(local_app_data))
+    monkeypatch.setattr(runtime_adapters, "_is_windows_host", lambda: True)
+    monkeypatch.setattr(runtime_adapters.shutil, "which", lambda _: str(shim))
+
+    resolution = runtime_adapters.resolve_executable("codex_cli")
+
+    assert resolution.executable == str(shim)
+
+
+def test_codex_windows_executable_override_is_not_rewritten(monkeypatch, tmp_path):
+    override = _executable(tmp_path, "codex.cmd")
+    monkeypatch.setattr(runtime_adapters, "_is_windows_host", lambda: True)
+    monkeypatch.setattr(
+        runtime_adapters.shutil,
+        "which",
+        lambda _: pytest.fail("an explicit override must bypass PATH discovery"),
+    )
+
+    resolution = runtime_adapters.resolve_executable(
+        "codex_cli", {"codex_cli": override}
+    )
+
+    assert resolution.executable == str(override)
+
+
 @pytest.mark.parametrize(
     "adapter_id", ["claude_cli", "codex_cli", "grok_kilo_cli"]
 )

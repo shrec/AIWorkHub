@@ -15,7 +15,7 @@ configured, policy-authorized manager route under the turn lock, pins it and
 starts the turn, so no explicit ``start`` is needed; with no such route it is
 refused as ``no_manager_route_available`` and the conversation stays passive. An
 explicit ``start`` stays authoritative and a pinned session is never re-routed.
-The six ``aiworkhub_manager_loop_*`` MCP tools in ``server.py`` resolve the
+The ``aiworkhub_manager_loop_*`` MCP tools in ``server.py`` resolve the
 caller's repository through the shared manager route gate and pass it in.
 """
 
@@ -239,11 +239,19 @@ def _dispatch_turn(
     if not entry.turn_lock.acquire(blocking=False):
         return {"ok": False, "error": "manager_turn_in_progress"}
     session = entry.orchestrator.session
-    if pin_passive_route and session is None:
-        # First-ever send: attach the repository's one passive conversation
-        # before pinning, so no explicit start is needed. ensure() is
-        # provider-free and idempotent; a live owner elsewhere stays a typed
-        # manager_session_already_active refusal.
+    if route is not None:
+        # Selected model: no session yet opens the first one. A loaded
+        # session stays that session; the model is only rebound onto it.
+        try:
+            session = entry.orchestrator.continue_on_route(*route)
+            _ensure_wake_started(entry, repo)
+        except ManagerLoopError as exc:
+            entry.turn_lock.release()
+            return _error(exc)
+        except Exception as exc:  # noqa: BLE001 - route binding must never cross the MCP boundary
+            entry.turn_lock.release()
+            return {"ok": False, "error": f"manager_loop_unavailable:{type(exc).__name__}"}
+    elif pin_passive_route and session is None:
         try:
             session = entry.orchestrator.ensure()
         except ManagerLoopError as exc:
@@ -252,18 +260,7 @@ def _dispatch_turn(
         except Exception as exc:  # noqa: BLE001 - ensure must never cross the MCP boundary
             entry.turn_lock.release()
             return {"ok": False, "error": f"manager_loop_unavailable:{type(exc).__name__}"}
-    if route is not None:
-        # Picker-selected route: bind this turn to it (same route is a no-op,
-        # any other state re-opens the selection with a mechanical handoff).
-        try:
-            session = entry.orchestrator.ensure_route(*route)
-        except ManagerLoopError as exc:
-            entry.turn_lock.release()
-            return _error(exc)
-        except Exception as exc:  # noqa: BLE001 - route binding must never cross the MCP boundary
-            entry.turn_lock.release()
-            return {"ok": False, "error": f"manager_loop_unavailable:{type(exc).__name__}"}
-    elif pin_passive_route and session is not None and session.passive:
+    if route is None and pin_passive_route and session is not None and session.passive:
         session, err = _pin_first_route(entry, repo)
         if err is not None:
             entry.turn_lock.release()
@@ -342,11 +339,72 @@ def ensure(repo: str | Path) -> dict[str, Any]:
     return {"ok": True, "session": session.to_json(), "running": entry.turn_lock.locked()}
 
 
+def restore(repo: str | Path) -> dict[str, Any]:
+    """Attach the last saved conversation. Does not create one."""
+
+    entry, err = _entry_or_error(repo)
+    if err is not None:
+        return err
+    try:
+        session = entry.orchestrator.restore_latest()
+    except ManagerLoopError as exc:
+        return _error(exc)
+    except Exception as exc:  # noqa: BLE001 - restore must never cross the MCP boundary
+        return {"ok": False, "error": f"manager_loop_unavailable:{type(exc).__name__}"}
+    if session is not None:
+        _ensure_wake_started(entry, repo)
+    return {
+        "ok": True,
+        "session": session.to_json() if session is not None else None,
+        "running": entry.turn_lock.locked(),
+    }
+
+
+def rename_session(repo: str | Path, session_id: str, title: str) -> dict[str, Any]:
+    """Rename one saved conversation. Refused while a turn runs."""
+
+    entry, err = _entry_or_error(repo)
+    if err is not None:
+        return err
+    if not entry.turn_lock.acquire(blocking=False):
+        return {"ok": False, "error": "manager_turn_in_progress"}
+    try:
+        session = entry.orchestrator.rename(session_id, title)
+    except ManagerLoopError as exc:
+        return _error(exc)
+    except Exception as exc:  # noqa: BLE001 - rename must never cross the MCP boundary
+        return {"ok": False, "error": f"manager_loop_unavailable:{type(exc).__name__}"}
+    finally:
+        entry.turn_lock.release()
+    return {"ok": True, "session": session.to_json()}
+
+
+def discard_session(repo: str | Path, session_id: str) -> dict[str, Any]:
+    """Delete one saved conversation. Refused while a turn runs."""
+
+    entry, err = _entry_or_error(repo)
+    if err is not None:
+        return err
+    if not entry.turn_lock.acquire(blocking=False):
+        return {"ok": False, "error": "manager_turn_in_progress"}
+    try:
+        entry.orchestrator.discard(session_id)
+    except ManagerLoopError as exc:
+        return _error(exc)
+    except Exception as exc:  # noqa: BLE001 - discard must never cross the MCP boundary
+        return {"ok": False, "error": f"manager_loop_unavailable:{type(exc).__name__}"}
+    finally:
+        entry.turn_lock.release()
+    session = entry.orchestrator.session
+    return {"ok": True, "session": session.to_json() if session is not None else None}
+
+
 def send(
     repo: str | Path,
     text: str,
     backend_id: str | None = None,
     model: str | None = None,
+    reasoning: str | None = None,
 ) -> dict[str, Any]:
     """Run one manager turn on a background thread.
 
@@ -355,7 +413,8 @@ def send(
     no-op, any other state re-opens the selection with a mechanical
     handoff); without one, the first send to a passive conversation pins
     the one route :func:`resolve_manager_route` names. A named-but-unrunnable
-    route is refused before anything spawns.
+    route is refused before anything spawns. ``reasoning`` is the owner's
+    depth choice for this turn; blank keeps the provider default.
     """
 
     route: tuple[str, str] | None = None
@@ -368,9 +427,10 @@ def send(
                 "ok": False,
                 "error": f"manager_backend_unavailable:{backend_id.strip()}:{model.strip()}",
             }
+    level = str(reasoning or "").strip().lower()
     return _dispatch_turn(
         repo,
-        lambda orchestrator: orchestrator.send(text),
+        lambda orchestrator: orchestrator.send(text, reasoning=level),
         record_last_turn=True,
         pin_passive_route=bool(text.strip()),
         route=route,
@@ -388,6 +448,30 @@ def rotate(repo: str | Path, reason: str) -> dict[str, Any]:
     )
 
 
+def _session_catalog(store: Any) -> list[dict[str, Any]]:
+    """Newest saved conversations first, bounded, for the panel picker."""
+
+    try:
+        rows = store.sessions()
+    except ManagerLoopError:
+        return []
+    catalog: list[dict[str, Any]] = []
+    for session in reversed(rows):
+        catalog.append({
+            "session_id": session.session_id,
+            "title": session.title,
+            "status": session.status,
+            "backend_id": session.backend_id,
+            "model": session.model,
+            "created_at": session.created_at,
+            "turn_count": session.turn_count,
+            "passive": session.passive,
+        })
+        if len(catalog) >= 24:
+            break
+    return catalog
+
+
 def status(repo: str | Path) -> dict[str, Any]:
     """The active session, whether a turn is running, and the last turn's outcome."""
 
@@ -398,10 +482,49 @@ def status(repo: str | Path) -> dict[str, Any]:
     return {
         "ok": True,
         "session": session.to_json() if session is not None else None,
+        "sessions": _session_catalog(entry.orchestrator.store),
         "running": entry.turn_lock.locked(),
         "last_turn": entry.last_turn,
         "wake": _wake_status(entry),
     }
+
+
+def continue_session(repo: str | Path, session_id: str) -> dict[str, Any]:
+    """Attach the panel to one saved conversation. Refused while a turn runs."""
+
+    entry, err = _entry_or_error(repo)
+    if err is not None:
+        return err
+    if not entry.turn_lock.acquire(blocking=False):
+        return {"ok": False, "error": "manager_turn_in_progress"}
+    try:
+        session = entry.orchestrator.attach(session_id)
+    except ManagerLoopError as exc:
+        return _error(exc)
+    except Exception as exc:  # noqa: BLE001 - continue must never cross the MCP boundary
+        return {"ok": False, "error": f"manager_loop_unavailable:{type(exc).__name__}"}
+    finally:
+        entry.turn_lock.release()
+    return {"ok": True, "session": session.to_json()}
+
+
+def begin_new(repo: str | Path) -> dict[str, Any]:
+    """Close the current conversation and open a fresh passive one."""
+
+    entry, err = _entry_or_error(repo)
+    if err is not None:
+        return err
+    if not entry.turn_lock.acquire(blocking=False):
+        return {"ok": False, "error": "manager_turn_in_progress"}
+    try:
+        session = entry.orchestrator.begin_new()
+    except ManagerLoopError as exc:
+        return _error(exc)
+    except Exception as exc:  # noqa: BLE001 - a new session must never cross the MCP boundary
+        return {"ok": False, "error": f"manager_loop_unavailable:{type(exc).__name__}"}
+    finally:
+        entry.turn_lock.release()
+    return {"ok": True, "session": session.to_json()}
 
 
 def events(
@@ -469,12 +592,19 @@ def _wake_dispatch(repo: str | Path, member: Mapping[str, Any]) -> bool:
 
 
 def _ensure_wake_started(entry: _Entry, repo: str | Path) -> None:
-    """Start this repository's one wake consumer; a second call is a no-op."""
+    """Start this repository's one wake consumer; a second call is a no-op.
+
+    The claim origin is read at claim time, so a session switch rebinds
+    pending callbacks onto whichever conversation is active.
+    """
 
     with entry.wake_lock:
         if entry.wake is None:
-            session_id = entry.orchestrator.session.session_id
-            claim, ack = default_callback_source(session_id=session_id)
+            def active_session_id() -> str:
+                session = entry.orchestrator.session
+                return session.session_id if session is not None else ""
+
+            claim, ack = default_callback_source(session_id=active_session_id)
             entry.wake = manager_loop_wake.WakeConsumer(
                 claim=claim,
                 ack=ack,

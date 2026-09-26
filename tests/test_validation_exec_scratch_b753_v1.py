@@ -23,10 +23,22 @@ from pathlib import Path
 
 import pytest
 
-pytestmark = pytest.mark.skipif(
-    os.name == "nt" or os.environ.get("GITHUB_ACTIONS") == "true",
-    reason="requires a POSIX Landlock/seccomp validation sandbox",
-)
+_WINDOWS_SCRATCH_TEST_PREFIX = "test_windows_"
+
+
+@pytest.fixture(autouse=True)
+def _posix_sandbox_gate(request: pytest.FixtureRequest) -> None:
+    """Skip the POSIX Landlock/seccomp suite on Windows and hosted CI.
+
+    The NF-980 Windows scratch-topology regressions are the exception:
+    their names start with ``test_windows_`` and must execute on Windows,
+    where the previous module-level ``pytestmark`` skip silenced the whole
+    file and left the Windows default scratch path untested.
+    """
+    if request.node.name.startswith(_WINDOWS_SCRATCH_TEST_PREFIX):
+        return
+    if os.name == "nt" or os.environ.get("GITHUB_ACTIONS") == "true":
+        pytest.skip("requires a POSIX Landlock/seccomp validation sandbox")
 
 _SRC = Path(__file__).resolve().parents[1] / "src"
 if str(_SRC) not in sys.path:
@@ -609,3 +621,107 @@ def test_run_validations_pins_request_local_scratch_root(
         assert worker_workspace._EXEC_SCRATCH_NAME_PREFIX in Path(scratch).name
     finally:
         worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
+
+
+def test_windows_default_scratch_uses_short_request_local_leaf(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    request_id = "b753a1c9d2e3f405162738495a6b7c8d"
+    monkeypatch.setattr(worker_workspace.sys, "platform", "win32")
+    monkeypatch.delenv(worker_workspace.VALIDATION_EXEC_SCRATCH_ROOT_ENV, raising=False)
+    # Topology-only test: pin both capability probes to deterministic
+    # success so the assertions measure the scratch path shape, not the
+    # ambient (AppContainer) exec lane.
+    monkeypatch.setattr(
+        worker_workspace, "_probe_exec_capable_dir", lambda path: True
+    )
+    monkeypatch.setattr(
+        worker_workspace, "_probe_metadata_capable_dir", lambda path: True
+    )
+    if os.name != "nt":
+        fake_comspec = tmp_path / "fake_comspec.sh"
+        fake_comspec.write_text("#!/bin/sh\nexit 0\n")
+        monkeypatch.setenv("COMSPEC", str(fake_comspec))
+    _repo, workspace = _manual_workspace(tmp_path, request_id)
+    scratch = worker_workspace.provision_validation_exec_scratch(workspace)
+    boundary = workspace.home.parent.resolve()
+    assert scratch.parent == boundary
+    assert scratch.is_relative_to((tmp_path / "worktrees" / request_id).resolve())
+    leaf = scratch.name
+    assert leaf.startswith("vx_")
+    assert len(leaf) <= 16
+    assert request_id not in leaf
+    assert worker_workspace._EXEC_SCRATCH_NAME_PREFIX not in leaf
+    legacy = workspace.home.resolve() / (
+        f"{worker_workspace._EXEC_SCRATCH_NAME_PREFIX}{request_id}"
+    )
+    assert len(str(scratch)) + 40 <= len(str(legacy))
+
+
+def test_windows_explicit_scratch_root_override_stays_authoritative(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    request_id = "c964d8e2f0a1b2c3d4e5f60718293a4b0"
+    override_root = tmp_path / "pinned_scratch_root"
+    override_root.mkdir(mode=0o700)
+    monkeypatch.setattr(worker_workspace.sys, "platform", "win32")
+    monkeypatch.setenv(
+        worker_workspace.VALIDATION_EXEC_SCRATCH_ROOT_ENV, str(override_root)
+    )
+    if os.name != "nt":
+        fake_comspec = tmp_path / "fake_comspec.sh"
+        fake_comspec.write_text("#!/bin/sh\nexit 0\n")
+        monkeypatch.setenv("COMSPEC", str(fake_comspec))
+    # Deterministic probes keep the override-authority assertion independent
+    # of spawning a real probe executable inside the pinned root.
+    monkeypatch.setattr(
+        worker_workspace, "_probe_exec_capable_dir", lambda directory: True
+    )
+    monkeypatch.setattr(
+        worker_workspace, "_probe_metadata_capable_dir", lambda directory: True
+    )
+    _repo, workspace = _manual_workspace(tmp_path, request_id)
+    scratch = worker_workspace.provision_validation_exec_scratch(workspace)
+    assert scratch.parent == override_root.resolve()
+    assert scratch.name == (
+        f"{worker_workspace._EXEC_SCRATCH_NAME_PREFIX}{request_id}"
+    )
+    assert workspace.home.parent.resolve() not in scratch.parents
+
+
+def test_windows_preexisting_default_scratch_directory_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    request_id = "d070e9f3a1b2c3d4e5f60718293a4b5c1"
+    monkeypatch.setattr(worker_workspace.sys, "platform", "win32")
+    monkeypatch.delenv(worker_workspace.VALIDATION_EXEC_SCRATCH_ROOT_ENV, raising=False)
+    _repo, workspace = _manual_workspace(tmp_path, request_id)
+    squatter = workspace.home.parent / f"vx_{request_id[-12:]}"
+    squatter.mkdir(mode=0o700)
+    with pytest.raises(worker_workspace.WorkspaceError) as excinfo:
+        worker_workspace.provision_validation_exec_scratch(workspace)
+    assert "validation_exec_scratch_already_exists" in str(excinfo.value)
+    assert squatter.is_dir()
+
+
+def test_windows_symlink_at_default_scratch_path_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    request_id = "e181f0a4b2c3d4e5f60718293a4b5c6d2"
+    monkeypatch.setattr(worker_workspace.sys, "platform", "win32")
+    monkeypatch.delenv(worker_workspace.VALIDATION_EXEC_SCRATCH_ROOT_ENV, raising=False)
+    _repo, workspace = _manual_workspace(tmp_path, request_id)
+    outside = tmp_path / "outside_request_boundary"
+    outside.mkdir(mode=0o700)
+    attacked = workspace.home.parent / f"vx_{request_id[-12:]}"
+    try:
+        os.symlink(outside, attacked, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlink creation unavailable here: {exc}")
+    try:
+        with pytest.raises(worker_workspace.WorkspaceError) as excinfo:
+            worker_workspace.provision_validation_exec_scratch(workspace)
+        assert "validation_exec_scratch_symlink_forbidden" in str(excinfo.value)
+        assert attacked.is_symlink()
+    finally:
+        attacked.unlink(missing_ok=True)

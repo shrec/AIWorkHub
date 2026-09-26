@@ -50,6 +50,17 @@ def test_expired_credential_is_a_refusal_not_recoverable_by_waiting() -> None:
     assert outcome["reset_reported"] is False
 
 
+def test_oauth_session_expiry_is_a_credential_refusal_not_a_worker_crash() -> None:
+    """Claude's `OAuth session expired` names a concrete credential defect."""
+    outcome = runtime_adapters.classify_provider_outcome(
+        exit_code=1, stderr="OAuth session expired and could not be refreshed"
+    )
+    assert outcome["outcome"] == runtime_adapters.OUTCOME_PROVIDER_REFUSED
+    assert outcome["refusal_kind"] == runtime_adapters.REFUSAL_CREDENTIAL_REJECTED
+    assert outcome["recoverable"] is False
+    assert "worker_failed" not in outcome["reason"]
+
+
 def test_rate_limit_with_retry_after_seconds_is_recoverable() -> None:
     outcome = runtime_adapters.classify_provider_outcome(
         exit_code=1, message="429 Too Many Requests. retry-after: 30"

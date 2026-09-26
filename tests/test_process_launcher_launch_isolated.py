@@ -1431,6 +1431,19 @@ def test_opencode_appcontainer_launch_uses_real_provisioning_and_sandbox_argv(
     assert ledger.is_file()
     assert workspace.home.resolve() in ledger.resolve().parents
 
+    grants = windows_appcontainer.request_scoped_grants(env, str(workspace.path))
+    traverse_paths = {
+        str(Path(grant.path).resolve())
+        for grant in grants
+        if grant.access == "traverse"
+    }
+    assert str(workspace.path.parent.resolve()) in traverse_paths
+    # NF-2026-01004: Bun realpath opens every component, including the volume
+    # root. Omitting that traverse ACE is the EPERM this grant chain exists to
+    # prevent. The ACE stays non-persistent.
+    assert str(workspace.path.anchor) in traverse_paths
+    assert all(not grant.persistent for grant in grants if grant.access == "traverse")
+
 
 @pytest.mark.parametrize(
     ("windows_host", "probe_available", "cause"),

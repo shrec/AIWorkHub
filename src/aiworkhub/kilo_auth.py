@@ -188,7 +188,7 @@ def _prepare_isolated_home(home: Path) -> Path:
 
 
 def _prepare_kilo_data_dir(home: Path) -> Path:
-    """Create Kilo's request-local data directory without following symlinks."""
+    """Create Kilo's request-local runtime directories without following symlinks."""
     current = home
     for component in KILO_AUTH_RELATIVE_PATH.parts[:-1]:
         current = current / component
@@ -217,6 +217,33 @@ def _prepare_kilo_data_dir(home: Path) -> Path:
                 raise KiloAuthDestinationError(
                     "Kilo data directory permissions cannot be restricted", current
                 ) from None
+
+    state_dir = home / ".local" / "state"
+    try:
+        os.mkdir(state_dir, mode=0o700)
+        state_info = os.lstat(state_dir)
+    except FileExistsError:
+        try:
+            state_info = os.lstat(state_dir)
+        except OSError:
+            raise KiloAuthDestinationError(
+                "Kilo state directory cannot be verified", state_dir
+            ) from None
+    except OSError:
+        raise KiloAuthDestinationError(
+            "Kilo state directory cannot be created", state_dir
+        ) from None
+    if stat.S_ISLNK(state_info.st_mode) or not stat.S_ISDIR(state_info.st_mode):
+        raise KiloAuthDestinationError(
+            "Kilo state path must be a non-symlink directory", state_dir
+        )
+    if os.name == "posix":
+        try:
+            os.chmod(state_dir, 0o700)
+        except OSError:
+            raise KiloAuthDestinationError(
+                "Kilo state directory permissions cannot be restricted", state_dir
+            ) from None
     return current
 
 

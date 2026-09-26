@@ -37,6 +37,43 @@ def _write_settings(root: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
+def test_enabling_opencode_model_lifts_only_the_blocking_vendor_adapter(tmp_path: Path) -> None:
+    root = _repo(tmp_path, "vendor-gate")
+    model_settings.update(
+        root, provider="xai", adapter="opencode_cli", enabled=False, expected_revision=0
+    )
+    model_settings.update(
+        root,
+        provider="opencode",
+        adapter="opencode_cli",
+        model="xai/grok-4.7",
+        enabled=True,
+        expected_revision=1,
+    )
+
+    loaded = model_settings.load(root)
+    assert loaded["adapters"]["xai"]["opencode_cli"] is True
+    assert loaded["models"]["opencode"]["opencode_cli"]["xai/grok-4.7"] is True
+    assert model_settings.evaluate(
+        root, provider="opencode", adapter="opencode_cli", model="xai/grok-4.7"
+    ) is True
+    assert model_settings.evaluate(
+        root, provider="xai", adapter="opencode_cli", model="xai/grok-4.7"
+    ) is True
+
+    model_settings.update(
+        root,
+        provider="opencode",
+        adapter="opencode_cli",
+        model="xai/grok-4.7",
+        enabled=False,
+        expected_revision=2,
+    )
+    disabled = model_settings.load(root)
+    assert disabled["adapters"]["xai"]["opencode_cli"] is True
+    assert disabled["models"]["opencode"]["opencode_cli"]["xai/grok-4.7"] is False
+
+
 def test_absent_settings_enable_arbitrary_routes_without_writing(
     tmp_path: Path,
 ) -> None:

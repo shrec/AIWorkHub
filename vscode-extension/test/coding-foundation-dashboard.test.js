@@ -219,7 +219,7 @@ internals.renderCodingFoundationCards({
   },
 }, elements);
 assert.strictEqual(elements.development_rules.value.textContent, "4 rules");
-assert.match(elements.development_rules.detail.textContent, /3 resolved/);
+assert.match(elements.development_rules.detail.textContent, /3 applicable/);
 assert.match(elements.development_rules.detail.textContent, /1 viol/);
 assert.strictEqual(elements.development_rules.card.attrs["data-state"], "measured");
 assert.strictEqual(elements.skills.value.textContent, "6 skills");

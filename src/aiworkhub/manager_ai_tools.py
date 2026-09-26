@@ -227,18 +227,22 @@ def context_graph_related(*, node_id: str, limit: int = 20) -> dict[str, Any]:
 def context_graph_event_write(
     *, role: str, event_type: str, content: str, source_ref: str,
     idempotency_key: str, task_id: str = "", metadata: dict[str, Any] | None = None,
+    thread_id: str = "", session_id: str = "", provider: str = "",
 ) -> dict[str, Any]:
     context, manager = _manager_context()
     if context is None:
         return manager
     if not core.writes_allowed():
         return {"ok": False, "error": "write_gate_closed", "manager": manager, "surface": "manager_mcp"}
+    bound_thread = thread_id.strip() or str(manager["session_id"])
+    bound_session = session_id.strip() or bound_thread
+    bound_provider = provider.strip() or str(manager["provider"])
     try:
         result = context_graph.append_event(
             context.authority_repo,
-            thread_id=manager["session_id"],
-            session_id=manager["session_id"],
-            provider=manager["provider"],
+            thread_id=bound_thread,
+            session_id=bound_session,
+            provider=bound_provider,
             role=role,
             event_type=event_type,
             content=content,

@@ -645,15 +645,26 @@ def _launch_appcontainer_process(
         launch = windows_appcontainer.launch_appcontainer(request)
         if bridge is not None:
             bridge.start(launch.job)
+        # CreateProcess has duplicated every inherited handle into the child.
+        # Close the parent's copies immediately. In particular, retaining the
+        # stdin reader prevents a fast-exiting child from breaking the prompt
+        # writer's pipe and can starve this supervisor before it records
+        # child_pid/running state.
+        os.close(stdin_fd)
+        fds = tuple(fd for fd in fds if fd != stdin_fd)
         os.close(stdout_write)
+        fds = tuple(fd for fd in fds if fd != stdout_write)
         os.close(stderr_write)
+        fds = tuple(fd for fd in fds if fd != stderr_write)
         if stdin_write_fd is not None:
-            _feed_and_close_stdin(os.fdopen(stdin_write_fd, "wb"), stdin_text)
+            stdin_stream = os.fdopen(stdin_write_fd, "wb")
+            fds = tuple(fd for fd in fds if fd != stdin_write_fd)
+            _feed_and_close_stdin(stdin_stream, stdin_text)
         return _AppContainerProcess(
             launch,
             os.fdopen(stdout_read, "rb", buffering=0),
             os.fdopen(stderr_read, "rb", buffering=0),
-            (stdin_fd,),
+            (),
             bridge,
         )
     except Exception:

@@ -504,6 +504,7 @@ def sanitized_env(
                 "XDG_DATA_HOME": str(isolated_home / ".local" / "share"),
                 "XDG_CONFIG_HOME": str(isolated_home / ".config"),
                 "XDG_CACHE_HOME": str(isolated_home / ".cache"),
+                "XDG_STATE_HOME": str(isolated_home / ".local" / "state"),
             }
         )
     if provider_env:
@@ -521,22 +522,7 @@ def worker_launch_env(
     provider_env: dict[str, str] | None = None,
     sandbox_backend: str | None = None,
 ) -> dict[str, str]:
-    """Build the sanitized worker env, then route TMPDIR/TMP/TEMP at the exact
-    request-owned repository-local temp authority (NF430).
-
-    Both real ProcessManager launch paths -- the isolated supervisor spawn and
-    the direct native launch -- call this before spawning a child, so a
-    worker-run pytest/tempfile lands in
-    ``<repo>/.aiworkhub/temp/worker/<request_id>/tmp`` (provisioned 0700 and
-    owner-stamped here) rather than the shared system temp or inside the
-    candidate worktree.  The sanitized allowlist, the request-scoped HOME, and
-    the explicit BYOK provider env are exactly as ``sanitized_env`` built
-    them; the three temp keys are overlaid from the single declaration in
-    ``runtime_adapters.WORKER_TEMP_ENV_VARS``, and the read-only validation
-    affordances (canonical interpreter and tool paths spelled for
-    ``sandbox_backend``, tool caches routed into the worker temp) are added by
-    ``worker_validation_affordance_env``.
-    """
+    """Build the sanitized worker environment with request-local temp paths."""
     env = sanitized_env(
         adapter_id,
         home=home,
@@ -544,8 +530,30 @@ def worker_launch_env(
         provider_env=provider_env,
     )
     temp_env = worker_temp_environment(repo, request_id)
+    if sandbox_backend == "windows_appcontainer" and home is not None:
+        # AppContainer request paths must share the user-local workspace
+        # boundary. A repository-local TEMP would force traversal ACL writes
+        # on the repository volume before the worker can even start.
+        home_root = Path(home).resolve()
+        if adapter_id == runtime_adapters.GROK_KILO_ADAPTER:
+            state_home = home_root / ".local" / "state"
+            if Path(home).absolute() != home_root or state_home.resolve() != state_home:
+                raise WorkspaceError("appcontainer_xdg_state_escaped_isolated_home")
+            state_home.mkdir(mode=0o700, parents=True, exist_ok=True)
+            resolved_state_home = state_home.resolve(strict=True)
+            if resolved_state_home != state_home:
+                raise WorkspaceError("appcontainer_xdg_state_escaped_isolated_home")
+            env["XDG_STATE_HOME"] = str(resolved_state_home)
+        appcontainer_tmp = home_root / "tmp"
+        appcontainer_tmp.mkdir(mode=0o700, parents=True, exist_ok=True)
+        resolved_tmp = appcontainer_tmp.resolve(strict=True)
+        if resolved_tmp.parent != home_root:
+            raise WorkspaceError("appcontainer_temp_escaped_isolated_home")
+        temp_env = dict.fromkeys(runtime_adapters.WORKER_TEMP_ENV_VARS, str(resolved_tmp))
     for key in runtime_adapters.WORKER_TEMP_ENV_VARS:
         env[key] = temp_env[key]
+    if adapter_id == runtime_adapters.OPENCODE_CLI_ADAPTER and sandbox_backend == "windows_appcontainer":
+        env["BUN_TMPDIR"] = env["TMPDIR"]
     env.update(
         worker_validation_affordance_env(
             repo,

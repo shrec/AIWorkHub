@@ -669,7 +669,8 @@ def test_supervisor_worker_launch_gets_grants_and_only_internet_client(
     # Outbound internet only: never inbound listening, never the LAN.
     assert tuple(request.capability_sids) == ("internetClient",)
     grant = windows_appcontainer.ContainerGrant
-    assert list(request.filesystem_grants) == [
+    grants = list(request.filesystem_grants)
+    assert [item for item in grants if item.access != "traverse"] == [
         # The shim and the one package it runs -- not the whole npm dir.
         grant(str(shim), "read_execute", persistent=True),
         grant(str(package_dir), "read_execute", persistent=True),
@@ -677,6 +678,9 @@ def test_supervisor_worker_launch_gets_grants_and_only_internet_client(
         grant(str(home), "modify"),
         grant(str(temp), "modify"),
     ]
+    assert grant(str(worktree.parent), "traverse") in grants
+    # NF-2026-01004: Bun realpath needs a non-persistent traverse ACE on the volume root.
+    assert grant(str(worktree.anchor), "traverse") in grants
 
 
 def test_a_non_npm_shim_is_run_as_is_and_granted_only_itself(tmp_path) -> None:
@@ -885,6 +889,88 @@ def test_launch_isolated_gives_the_appcontainer_worker_its_isolated_home(
     assert result["ok"] is True, result
     assert env_kwargs[0]["home"] == tmp_path / "workspace-home"
     assert spawned[0]["env"]["LOCALAPPDATA"] == r"C:\Users\u\AppData\Local"
+    assert "CODEX_HOME" not in spawned[0]["env"]
+
+
+def test_appcontainer_launch_env_routes_temp_inside_isolated_home(
+    monkeypatch, tmp_path
+) -> None:
+    repository_temp = tmp_path / "repo-runtime" / "worker" / "request-1" / "tmp"
+    isolated_home = tmp_path / "worktrees" / "request-1" / "home"
+    monkeypatch.setattr(
+        process_launcher,
+        "sanitized_env",
+        lambda *_args, **_kwargs: {},
+    )
+    monkeypatch.setattr(
+        process_launcher,
+        "worker_temp_environment",
+        lambda *_args, **_kwargs: {
+            "TMPDIR": str(repository_temp),
+            "TMP": str(repository_temp),
+            "TEMP": str(repository_temp),
+        },
+    )
+    monkeypatch.setattr(
+        process_launcher,
+        "worker_validation_affordance_env",
+        lambda *_args, **_kwargs: {},
+    )
+
+    env = process_launcher.worker_launch_env(
+        "opencode_cli",
+        repo=tmp_path / "repo",
+        request_id="request-1",
+        home=isolated_home,
+        sandbox_backend="windows_appcontainer",
+    )
+
+    expected = str(isolated_home / "tmp")
+    assert {env[key] for key in ("TMPDIR", "TMP", "TEMP")} == {expected}
+    assert env["BUN_TMPDIR"] == expected
+    assert (isolated_home / "tmp").is_dir()
+
+
+def test_windows_codex_worker_uses_its_request_local_codex_home(
+    monkeypatch, tmp_path
+) -> None:
+    """Codex must not infer its config home from Windows known-folder APIs."""
+    monkeypatch.setattr(sys, "platform", "win32")
+    _patch_launch_seams(
+        monkeypatch,
+        tmp_path,
+        sandbox_backend="windows_appcontainer",
+        canonical_repo_id=CANONICAL_REPO_ID,
+    )
+    monkeypatch.setattr(
+        process_launcher,
+        "worker_launch_env",
+        lambda adapter_id, **kwargs: {"HOME": str(kwargs["home"])},
+    )
+    monkeypatch.setattr(process_launcher, "write_json_0600", lambda *_a: None)
+    spawned: list[dict] = []
+
+    class _Manager(_FakeManager):
+        def _popen(self, *_args, **kwargs):
+            spawned.append(kwargs)
+            return super()._popen()
+
+    result = module.launch_isolated(
+        _Manager(tmp_path, repo="repo_self_unused"),
+        task_id="task-1",
+        runner="runner-1",
+        topic="topic-1",
+        adapter_id="codex_cli",
+        model=None,
+        owner_prompt="do the thing",
+        timeout_seconds=60,
+    )
+
+    assert result["ok"] is True, result
+    assert spawned[0]["env"]["HOME"] == str(tmp_path / "workspace-home")
+    assert spawned[0]["env"]["CODEX_HOME"] == str(
+        tmp_path / "workspace-home" / ".codex"
+    )
 
 
 def test_supervisor_appcontainer_setup_failure_never_falls_back_to_popen(
@@ -1379,13 +1465,17 @@ def test_appcontainer_validation_gets_grants_but_no_network(
     request = launches[0].request
     assert tuple(request.capability_sids) == ()
     grant = windows_appcontainer.ContainerGrant
-    assert list(request.filesystem_grants) == [
+    grants = list(request.filesystem_grants)
+    assert [item for item in grants if item.access != "traverse"] == [
         grant(str(home), "modify"),
         grant(str(scratch), "modify"),
         # The root, never the cd subdir a candidate could have made a junction.
         grant(str(worktree), "read_execute"),
     ]
-    assert not any(g.persistent for g in request.filesystem_grants)
+    assert grant(str(worktree.parent), "traverse") in grants
+    # NF-2026-01004: Bun realpath needs a non-persistent traverse ACE on the volume root.
+    assert grant(str(worktree.anchor), "traverse") in grants
+    assert not any(g.persistent for g in grants)
     # Not a Python: no PYTHONPATH, and no shim facts, appear.
     assert "PYTHONPATH" not in request.environment
     assert windows_appcontainer.APPCONTAINER_ANCESTORS_ENV not in request.environment
@@ -1432,7 +1522,8 @@ def test_appcontainer_validation_python_gets_its_interpreter_read_only_and_no_ne
     request = launches[0].request
     assert tuple(request.capability_sids) == ()
     grant = windows_appcontainer.ContainerGrant
-    assert list(request.filesystem_grants) == [
+    grants = list(request.filesystem_grants)
+    assert [item for item in grants if item.access != "traverse"] == [
         grant(str(home), "modify"),
         grant(str(scratch), "modify"),
         grant(str(worktree), "read_execute"),
@@ -1442,6 +1533,9 @@ def test_appcontainer_validation_python_gets_its_interpreter_read_only_and_no_ne
         grant(str(base), "read_execute", persistent=True),
         grant(windows_appcontainer.APPCONTAINER_PYTHON_SITE, "read_execute", persistent=True),
     ]
+    assert grant(str(worktree.parent), "traverse") in grants
+    # NF-2026-01004: Bun realpath needs a non-persistent traverse ACE on the volume root.
+    assert grant(str(worktree.anchor), "traverse") in grants
     # NF-40: the mkdir/realpath shim first, ahead of every candidate component.
     assert request.environment["PYTHONPATH"].split(os.pathsep) == [
         windows_appcontainer.APPCONTAINER_PYTHON_SITE, str(worktree), "."
@@ -1651,11 +1745,15 @@ def test_appcontainer_validation_grants_the_request_root_read_only_after_home_an
 
     grant = windows_appcontainer.ContainerGrant
     request = launches[0].request
-    assert list(request.filesystem_grants) == [
+    grants = list(request.filesystem_grants)
+    assert [item for item in grants if item.access != "traverse"] == [
         grant(str(workspace.home), "modify"),
         grant(str(scratch), "modify"),
         grant(str(request_root), "read_execute"),
     ]
+    assert grant(str(request_root.parent), "traverse") in grants
+    # NF-2026-01004: Bun realpath needs a non-persistent traverse ACE on the volume root.
+    assert grant(str(request_root.anchor), "traverse") in grants
     assert tuple(request.capability_sids) == ()  # offline
 
 
@@ -2196,3 +2294,363 @@ def test_run_validations_fails_the_gate_on_a_planted_junction(tmp_path, monkeypa
     assert row["stderr_tail"] == "host_git_worktree_reparse_point_refused:pkg"
     assert "SECRET" not in json.dumps(row)
     assert container == []
+
+
+# NF-2026-01009: the command the NeedFix reproduced, and the exact form
+# measured working inside the container on Node v22.16.0.
+_NODE_TEST_ARGV = ["node", "--test", "vscode-extension/test/x.test.js"]
+_NODE_TEST_FILE = "vscode-extension/test/x.test.js"
+
+
+def _run_node_lane_validation(
+    tmp_path: Path,
+    monkeypatch,
+    argv: list[str],
+    *,
+    node_version: str,
+    state=None,
+):
+    """Drive ``_run_appcontainer_validation`` with no AppContainer and no node.
+
+    ``native_handle`` is patched rather than ``msvcrt.get_osfhandle`` (what
+    ``identity_osfhandle`` does) so this proof runs wherever the suite runs --
+    the point of keeping the argv rewrite pure and the probe injectable.
+    """
+    launches: list[_FakeValidationLaunch] = []
+    probed: list[str] = []
+    _stub_repo_id(monkeypatch)
+    monkeypatch.setattr(windows_appcontainer, "native_handle", lambda fd: fd)
+    _install_fake_launch(
+        monkeypatch,
+        stdout=b"",
+        stderr=b"",
+        outcome=windows_appcontainer.AppContainerLifecycleResult(
+            state or windows_appcontainer.AppContainerLifecycleState.EXITED,
+            exit_code=None if state else 0,
+        ),
+        sink=launches,
+    )
+
+    def _fake_probe(executable: str) -> str:
+        probed.append(executable)
+        return node_version
+
+    monkeypatch.setattr(
+        worker_workspace, "_appcontainer_node_version", _fake_probe
+    )
+    worktree = tmp_path / "wt"
+    worktree.mkdir(exist_ok=True)
+    workspace = SimpleNamespace(
+        repo=tmp_path, path=worktree, home=tmp_path / "home"
+    )
+    result = worker_workspace._run_appcontainer_validation(
+        argv,
+        workspace=workspace,
+        adapter_id="claude_cli",
+        cwd=worktree,
+        env={"PATH": "x"},
+        timeout_seconds=30,
+    )
+    return result, launches, probed
+
+
+def test_node_validation_argv_inserts_preserve_symlinks_idempotently() -> None:
+    """The measured working form, and rewriting it again is a no-op."""
+    once = worker_workspace._appcontainer_node_validation_argv(
+        _NODE_TEST_ARGV, "v22.16.0"
+    )
+    assert once == [
+        "node",
+        "--preserve-symlinks",
+        "--preserve-symlinks-main",
+        "--test",
+        "--experimental-test-isolation=none",
+        _NODE_TEST_FILE,
+    ]
+    assert (
+        worker_workspace._appcontainer_node_validation_argv(once, "v22.16.0")
+        == once
+    )
+    # Already carrying one half is not a reason to add it twice.
+    half = ["node", "--preserve-symlinks-main", "--test", _NODE_TEST_FILE]
+    rewritten = worker_workspace._appcontainer_node_validation_argv(
+        half, "v22.16.0"
+    )
+    assert rewritten.count("--preserve-symlinks") == 1
+    assert rewritten.count("--preserve-symlinks-main") == 1
+
+
+def test_node_validation_argv_preserves_symlinks_without_test() -> None:
+    """The EPERM-lstat half applies to every node command; isolation does not."""
+    assert worker_workspace._appcontainer_node_validation_argv(
+        ["node.exe", "scripts/build.js"], "v22.16.0"
+    ) == [
+        "node.exe",
+        "--preserve-symlinks",
+        "--preserve-symlinks-main",
+        "scripts/build.js",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("node_version", "expected"),
+    [
+        ("v24.1.0", "--test-isolation=none"),
+        ("v23.6.0", "--test-isolation=none"),
+        ("v23.5.0", "--experimental-test-isolation=none"),
+        ("v22.16.0", "--experimental-test-isolation=none"),
+        ("v22.8.0", "--experimental-test-isolation=none"),
+        ("v22.7.1", None),
+        ("v20.11.0", None),
+        ("", None),
+        ("not a version", None),
+    ],
+)
+def test_node_validation_argv_isolation_flag_follows_the_node_version(
+    node_version: str, expected: str | None
+) -> None:
+    """22.8 experimental, >=23.6 stable, older or unknown left alone."""
+    rewritten = worker_workspace._appcontainer_node_validation_argv(
+        _NODE_TEST_ARGV, node_version
+    )
+    isolation = [part for part in rewritten if "test-isolation" in part]
+    assert isolation == ([expected] if expected else [])
+    # The preserve-symlinks half never depends on the version.
+    assert rewritten[1:3] == ["--preserve-symlinks", "--preserve-symlinks-main"]
+
+
+@pytest.mark.parametrize(
+    "declared",
+    [
+        ["--test-isolation=process"],
+        ["--test-isolation", "process"],
+        ["--experimental-test-isolation=process"],
+        ["--experimental-test-isolation", "process"],
+    ],
+)
+def test_node_validation_argv_never_overrides_a_declared_isolation(
+    declared: list[str],
+) -> None:
+    """A card that asked for child isolation keeps it, in either flag form."""
+    argv = ["node", "--test", *declared, _NODE_TEST_FILE]
+    assert worker_workspace._appcontainer_node_validation_argv(
+        argv, "v22.16.0"
+    ) == [
+        "node",
+        "--preserve-symlinks",
+        "--preserve-symlinks-main",
+        "--test",
+        *declared,
+        _NODE_TEST_FILE,
+    ]
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        [],
+        ["python.exe", "-m", "pytest", "-q"],
+        ["pytest", "-q"],
+        ["git", "diff", "--check"],
+        ["npm", "--test", "run", "test"],
+        ["nodemon", "--test", _NODE_TEST_FILE],
+    ],
+)
+def test_node_validation_argv_leaves_every_non_node_command_alone(
+    argv: list[str],
+) -> None:
+    """Only a ``node``/``node.exe`` basename is rewritten -- nothing near it."""
+    assert (
+        worker_workspace._appcontainer_node_validation_argv(argv, "v22.16.0")
+        == argv
+    )
+
+
+@pytest.mark.parametrize(
+    "executable",
+    ["NODE.EXE", "Node", os.path.join("tools", "nodejs", "node.exe")],
+)
+def test_node_validation_argv_matches_the_node_basename_case_insensitively(
+    executable: str,
+) -> None:
+    assert worker_workspace._appcontainer_node_validation_argv(
+        [executable, "--test", _NODE_TEST_FILE], "v23.6.0"
+    ) == [
+        executable,
+        "--preserve-symlinks",
+        "--preserve-symlinks-main",
+        "--test",
+        "--test-isolation=none",
+        _NODE_TEST_FILE,
+    ]
+
+
+def test_appcontainer_validation_launches_the_rewritten_node_argv(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """What the container runs is the rewrite, and the evidence records it."""
+    result, launches, probed = _run_node_lane_validation(
+        tmp_path, monkeypatch, list(_NODE_TEST_ARGV), node_version="v22.16.0"
+    )
+
+    expected = [
+        "node",
+        "--preserve-symlinks",
+        "--preserve-symlinks-main",
+        "--test",
+        "--experimental-test-isolation=none",
+        _NODE_TEST_FILE,
+    ]
+    assert list(launches[0].request.argv) == expected
+    assert result.args == expected
+    assert probed == ["node"]
+
+
+def test_appcontainer_validation_timeout_reports_the_rewritten_node_argv(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A timeout's ``cmd`` must be what actually ran, not what was declared."""
+    with pytest.raises(subprocess.TimeoutExpired) as excinfo:
+        _run_node_lane_validation(
+            tmp_path,
+            monkeypatch,
+            list(_NODE_TEST_ARGV),
+            node_version="v23.6.0",
+            state=windows_appcontainer.AppContainerLifecycleState.TIMEOUT,
+        )
+
+    assert list(excinfo.value.cmd) == [
+        "node",
+        "--preserve-symlinks",
+        "--preserve-symlinks-main",
+        "--test",
+        "--test-isolation=none",
+        _NODE_TEST_FILE,
+    ]
+
+
+def test_appcontainer_validation_node_lane_leaves_a_python_argv_unchanged(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The Python adaptation still owns the Python lane: env, never argv."""
+    base = tmp_path / "Python312"
+    base.mkdir()
+    venv = tmp_path / ".venv"
+    (venv / "Scripts").mkdir(parents=True)
+    (venv / "Lib" / "site-packages").mkdir(parents=True)
+    python = venv / "Scripts" / "python.exe"
+    python.write_bytes(b"MZ")
+    (venv / "pyvenv.cfg").write_text(f"home = {base}\n", encoding="utf-8")
+    argv = [str(python), "-m", "pytest", "-q"]
+
+    result, launches, probed = _run_node_lane_validation(
+        tmp_path, monkeypatch, list(argv), node_version="v22.16.0"
+    )
+
+    assert list(launches[0].request.argv) == argv
+    assert result.args == argv
+    # No node argv, so the version probe is never even reached.
+    assert probed == []
+    pythonpath = launches[0].request.environment["PYTHONPATH"]
+    assert pythonpath.split(os.pathsep)[0] == (
+        windows_appcontainer.APPCONTAINER_PYTHON_SITE
+    )
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [["pytest", "-q"], ["git", "diff", "--check"], ["npm", "--test", "run"]],
+)
+def test_appcontainer_validation_node_lane_leaves_other_commands_unchanged(
+    tmp_path: Path, monkeypatch, argv: list[str]
+) -> None:
+    """Every other boundary command reaches the container byte for byte."""
+    result, launches, probed = _run_node_lane_validation(
+        tmp_path, monkeypatch, list(argv), node_version="v22.16.0"
+    )
+
+    assert list(launches[0].request.argv) == argv
+    assert result.args == argv
+    assert probed == []
+
+
+def test_node_version_probe_is_bounded_shell_free_and_cached(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """One host call per resolved node, no shell, and a real timeout."""
+    monkeypatch.setattr(worker_workspace, "_APPCONTAINER_NODE_VERSION_CACHE", {})
+    calls: list[dict] = []
+
+    def _fake_run(argv, **kwargs):
+        calls.append({"argv": list(argv), **kwargs})
+        return subprocess.CompletedProcess(list(argv), 0, "v22.16.0\n", "")
+
+    monkeypatch.setattr(worker_workspace.subprocess, "run", _fake_run)
+    node = tmp_path / "node.exe"
+    node.write_bytes(b"MZ")
+
+    assert worker_workspace._appcontainer_node_version(str(node)) == "v22.16.0"
+    assert worker_workspace._appcontainer_node_version(str(node)) == "v22.16.0"
+
+    assert len(calls) == 1
+    assert calls[0]["argv"] == [str(node.resolve()), "--version"]
+    assert calls[0]["shell"] is False
+    assert calls[0]["capture_output"] is True
+    assert 0 < calls[0]["timeout"] <= 10
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        OSError("node is not executable"),
+        subprocess.TimeoutExpired(["node", "--version"], 10),
+        subprocess.CompletedProcess(["node", "--version"], 1, "", "boom"),
+        subprocess.CompletedProcess(["node", "--version"], 0, "", ""),
+    ],
+)
+def test_node_version_probe_reports_unknown_for_every_failure(
+    tmp_path: Path, monkeypatch, outcome
+) -> None:
+    """Any failure is an unknown version, and unknown adds no isolation flag."""
+    monkeypatch.setattr(worker_workspace, "_APPCONTAINER_NODE_VERSION_CACHE", {})
+    calls: list[int] = []
+
+    def _fake_run(argv, **_kwargs):
+        calls.append(1)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(worker_workspace.subprocess, "run", _fake_run)
+    node = tmp_path / "node.exe"
+    node.write_bytes(b"MZ")
+
+    assert worker_workspace._appcontainer_node_version(str(node)) == ""
+    assert worker_workspace._appcontainer_node_validation_argv(
+        _NODE_TEST_ARGV, ""
+    ) == [
+        "node",
+        "--preserve-symlinks",
+        "--preserve-symlinks-main",
+        "--test",
+        _NODE_TEST_FILE,
+    ]
+    # A failed probe is cached too: a card declaring several node commands must
+    # not pay the probe timeout again for each one.
+    assert worker_workspace._appcontainer_node_version(str(node)) == ""
+    assert len(calls) == 1
+
+
+def test_node_version_probe_reports_unknown_for_an_unresolvable_executable(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(worker_workspace, "_APPCONTAINER_NODE_VERSION_CACHE", {})
+
+    def _never(*_args, **_kwargs):
+        raise AssertionError("an unresolvable node is never launched")
+
+    monkeypatch.setattr(worker_workspace.subprocess, "run", _never)
+
+    assert worker_workspace._appcontainer_node_version(
+        str(tmp_path / "missing" / "node.exe")
+    ) == ""

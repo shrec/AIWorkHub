@@ -76,6 +76,7 @@ def test_projects_only_the_exact_xai_record(tmp_path):
     for secret in FOREIGN_TOKENS.values():
         assert secret.encode() not in raw
     assert [entry.name for entry in home.iterdir()] == [".local"]
+    assert (home / ".local" / "state").is_dir()
     assert Path(receipt.destination) == home / KILO_AUTH_RELATIVE_PATH
     assert receipt.provider == "xai"
 

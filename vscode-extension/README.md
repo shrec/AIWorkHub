@@ -14,6 +14,50 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.11.92
+
+- The route panel names the open Manager Chat session instead of a pending Codex thread.
+
+## What's new in 0.11.91
+
+- A callback reaches both the Codex or Claude thread and Manager Chat. An active manager session can own the task without a Codex thread.
+
+## What's new in 0.11.90
+
+- Thinking and tool calls appear during a manager turn. Reasoning depth is a control next to the model.
+
+## What's new in 0.11.89
+
+- Callback tasks can be created from the active Manager Chat session.
+
+## What's new in 0.11.88
+
+- Turning an OpenCode model on stays on. Settings no longer redraw that switch from an older snapshot.
+
+## What's new in 0.11.87
+
+- A chosen model uses its own CLI. The transcript stays empty until you open a saved session or send.
+
+## What's new in 0.11.86
+
+- Pick a model, not a provider. The session binds to the CLI that runs that model.
+
+## What's new in 0.11.85
+
+- Provider and model dropdowns keep the selection you click.
+
+## What's new in 0.11.84
+
+- Sessions are yours. Changing the model continues the same session instead of hiding or splitting the list by provider.
+
+## What's new in 0.11.83
+
+- The chat no longer lists dashboard tasks. Sessions follow the selected backend, and Delete removes one you do not want.
+
+## What's new in 0.11.82
+
+- Manager chat loads the last session, opens the first one on the selected model, and writes that session to Context Graph. Callbacks follow the active session.
+
 ## What's new in 0.11.81
 
 - Dotted Python imports and exact type annotations now resolve. Stdlib names stay unresolved.

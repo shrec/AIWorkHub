@@ -1114,6 +1114,145 @@ def test_task_create_callback_required_waits_for_real_origin_thread(tmp_path, mo
     assert result["stderr"] == "callback_route_pending:codex_thread_id_not_observed"
 
 
+def test_task_create_uses_active_manager_chat_session_as_callback_origin(tmp_path, monkeypatch):
+    root = tmp_path / "repo"
+    root.mkdir()
+    assert task_store.initialize_repository(root)["ok"]
+    session_id = "mls-" + "ab" * 16
+    session_dir = root / ".aiworkhub" / "runtime" / "manager_loop" / "sessions"
+    session_dir.mkdir(parents=True)
+    (root / ".aiworkhub" / "runtime" / "manager_loop" / "selected.json").write_text(
+        json.dumps({"session_id": session_id}), encoding="utf-8"
+    )
+    (session_dir / f"{session_id}.json").write_text(
+        json.dumps({"session_id": session_id, "status": "active"}), encoding="utf-8"
+    )
+    monkeypatch.setenv("AIWORKHUB_REPO", str(root))
+    monkeypatch.setenv("AIWORKHUB_ALLOW_WRITES", "1")
+    monkeypatch.setattr(core, "_claude_manager_identity", lambda: None)
+    monkeypatch.setattr(core, "_codex_manager_identity", lambda: {
+        "provider": "codex",
+        "session_id": "episode_pending",
+        "thread_id": "",
+        "window_id": "window_extension_owned",
+        "callback_supported": "false",
+        "route_state": "route_pending",
+    })
+    monkeypatch.setattr(core, "_verify_coordinator_capability", lambda runner: (True, "ok"))
+
+    result = core.create_task(
+        task_id="TASK_MANAGER_CHAT_ORIGIN",
+        title="Manager chat owns the callback",
+        runner="manager_chat_canary",
+        topic="task_mcp",
+        objective="Create a callback-required card against the active manager chat session.",
+        acceptance=["Card stores the manager session."],
+        allowed_writes=[],
+        read_only=True,
+        callback_required=True,
+    )
+
+    assert result["ok"] is True
+    card = json.loads(result["stdout"])
+    assert card["origin_thread_id"] == session_id
+    assert card["manager_chat_session_id"] == session_id
+    assert card["callback_required"] is True
+    assert card["callback_supported"] is True
+    assert card["callback_supported"] is True
+
+
+def test_task_create_keeps_codex_thread_and_manager_chat_session(tmp_path, monkeypatch):
+    root = tmp_path / "repo"
+    root.mkdir()
+    assert task_store.initialize_repository(root)["ok"]
+    session_id = "mls-" + "cd" * 16
+    thread_id = "11111111-1111-4111-8111-111111111111"
+    session_dir = root / ".aiworkhub" / "runtime" / "manager_loop" / "sessions"
+    session_dir.mkdir(parents=True)
+    (root / ".aiworkhub" / "runtime" / "manager_loop" / "selected.json").write_text(
+        json.dumps({"session_id": session_id}), encoding="utf-8"
+    )
+    (session_dir / f"{session_id}.json").write_text(
+        json.dumps({"session_id": session_id, "status": "active"}), encoding="utf-8"
+    )
+    monkeypatch.setenv("AIWORKHUB_REPO", str(root))
+    monkeypatch.setenv("AIWORKHUB_ALLOW_WRITES", "1")
+    monkeypatch.setattr(core, "_claude_manager_identity", lambda: None)
+    monkeypatch.setattr(core, "_codex_manager_identity", lambda: {
+        "provider": "codex",
+        "session_id": "episode_pending",
+        "thread_id": thread_id,
+        "window_id": "window_extension_owned",
+        "callback_supported": "true",
+        "route_state": "ready",
+    })
+    monkeypatch.setattr(core, "_verify_coordinator_capability", lambda runner: (True, "ok"))
+
+    result = core.create_task(
+        task_id="TASK_BOTH_CALLBACK_ROUTES",
+        title="Both callback seats",
+        runner="manager_chat_canary",
+        topic="task_mcp",
+        objective="Keep the Codex thread and also stamp the manager chat session.",
+        acceptance=["Card stores both destinations."],
+        allowed_writes=[],
+        read_only=True,
+        callback_required=True,
+    )
+
+    assert result["ok"] is True
+    card = json.loads(result["stdout"])
+    assert card["origin_thread_id"] == thread_id
+    assert card["manager_chat_session_id"] == session_id
+    assert card["callback_supported"] is True
+    assert card["callback_supported"] is True
+
+
+def test_manager_bootstrap_reports_the_active_manager_chat_seat(tmp_path, monkeypatch):
+    root = tmp_path / "repo"
+    root.mkdir()
+    session_id = "mls-" + "ab" * 16
+    session_dir = root / ".aiworkhub" / "runtime" / "manager_loop" / "sessions"
+    session_dir.mkdir(parents=True)
+    (session_dir.parent / "selected.json").write_text(
+        json.dumps({"session_id": session_id}), encoding="utf-8"
+    )
+    (session_dir / f"{session_id}.json").write_text(
+        json.dumps({
+            "session_id": session_id,
+            "status": "active",
+            "backend_id": "opencode_cli",
+            "model": "xai/grok-4.7",
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(core, "repo_root", lambda: root)
+    monkeypatch.setattr(core, "_claude_manager_identity", lambda: None)
+    monkeypatch.setattr(core, "_codex_manager_identity", lambda: {
+        "provider": "codex",
+        "session_id": "episode_pending",
+        "thread_id": "",
+        "window_id": "window_old",
+        "route_state": "route_pending",
+        "callback_supported": "false",
+    })
+    monkeypatch.setattr(core, "_CONTRACT_DELIVERIES", {})
+
+    contract = core.manager_bootstrap()
+
+    assert contract["provider"] == "manager_chat"
+    assert contract["manager_verified"] is True
+    route = contract["manager_route"]
+    assert route["session_id"] == session_id
+    assert route["route_state"] == "ready"
+    assert route["callback_supported"] == "true"
+    assert route["model"] == "xai/grok-4.7"
+    assert route["backend_id"] == "opencode_cli"
+    assert route["manager_chat"]["session_id"] == session_id
+    assert contract["codex_route"]["session_id"] == "episode_pending"
+    assert contract["reason"] == ""
+
+
 def test_task_create_polling_only_succeeds_while_route_is_pending(tmp_path, monkeypatch):
     root = tmp_path / "repo"
     root.mkdir()

@@ -6,6 +6,72 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.92] - 2026-09-26
+
+### Fixed
+
+- The manager route panel shows the active Manager Chat session, model and backend instead of a pending Codex thread.
+
+## [0.11.91] - 2026-09-26
+
+### Fixed
+
+- Callbacks are delivered to both the Codex or Claude thread and the active Manager Chat session. A chat session alone can own a callback task.
+
+## [0.11.90] - 2026-09-26
+
+### Added
+
+- Manager chat shows thinking and tool calls while a turn is running, and has a reasoning-depth control.
+
+## [0.11.89] - 2026-09-26
+
+### Fixed
+
+- A callback-required task can be created from Manager Chat when an active mls- session is selected. A Codex thread UUID is no longer required for that seat.
+
+## [0.11.88] - 2026-09-26
+
+### Fixed
+
+- Enabling an OpenCode model lifts the hidden vendor-adapter gate that snapped the toggle back off. A late settings snapshot no longer redraws a newer toggle.
+
+## [0.11.87] - 2026-09-26
+
+### Fixed
+
+- Manager chat binds the selected model to its own CLI. Opening the chat no longer attaches an old session.
+
+## [0.11.86] - 2026-09-26
+
+### Changed
+
+- Manager chat lists models, not providers. Choosing a model binds that session to the CLI that can run it.
+
+## [0.11.85] - 2026-09-26
+
+### Fixed
+
+- Manager chat provider and model selection is no longer overwritten by the active session.
+
+## [0.11.84] - 2026-09-26
+
+### Changed
+
+- Manager sessions are not owned by a provider. Any selected model attaches to the same session.
+
+## [0.11.83] - 2026-09-26
+
+### Changed
+
+- Manager chat drops the in-chat task board. Sessions are filtered to the selected backend, and an unwanted session can be deleted.
+
+## [0.11.82] - 2026-09-26
+
+### Added
+
+- Manager chat restores the last session, starts the first session from the selected model, and keeps callbacks and Context Graph turns on the active session.
+
 ## [0.11.81] - 2026-09-26
 
 ### Fixed

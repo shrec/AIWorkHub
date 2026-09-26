@@ -1820,8 +1820,70 @@ def aiworkhub_manager_loop_ensure() -> dict[str, Any]:
 
 
 @mcp.tool()
+def aiworkhub_manager_loop_restore() -> dict[str, Any]:
+    """MANAGER WRITE: load the last manager conversation. Does not create one.
+
+    Synchronous and provider-free. The panel calls this on open. The first
+    ``send`` on a selected model opens the first session when none exists.
+    """
+
+    root, refusal = _manager_loop_repo_root(launching=True)
+    if refusal is not None:
+        return refusal
+    return manager_loop_service.restore(root)
+
+
+@mcp.tool()
+def aiworkhub_manager_loop_rename(session_id: str, title: str) -> dict[str, Any]:
+    """MANAGER WRITE: rename one saved manager conversation."""
+
+    root, refusal = _manager_loop_repo_root(launching=True)
+    if refusal is not None:
+        return refusal
+    return manager_loop_service.rename_session(root, session_id, title)
+
+
+@mcp.tool()
+def aiworkhub_manager_loop_discard(session_id: str) -> dict[str, Any]:
+    """MANAGER WRITE: delete one saved manager conversation."""
+
+    root, refusal = _manager_loop_repo_root(launching=True)
+    if refusal is not None:
+        return refusal
+    return manager_loop_service.discard_session(root, session_id)
+
+
+@mcp.tool()
+def aiworkhub_manager_loop_continue(session_id: str) -> dict[str, Any]:
+    """MANAGER WRITE: continue one saved manager conversation.
+
+    Synchronous and provider-free. The chosen record becomes the active
+    session and the persisted selection. Refused while a turn is running.
+    """
+
+    root, refusal = _manager_loop_repo_root(launching=True)
+    if refusal is not None:
+        return refusal
+    return manager_loop_service.continue_session(root, session_id)
+
+
+@mcp.tool()
+def aiworkhub_manager_loop_new() -> dict[str, Any]:
+    """MANAGER WRITE: close the current conversation and open a fresh passive one.
+
+    Synchronous and provider-free. The displaced record gets a mechanical
+    handoff. Refused while a turn is running.
+    """
+
+    root, refusal = _manager_loop_repo_root(launching=True)
+    if refusal is not None:
+        return refusal
+    return manager_loop_service.begin_new(root)
+
+
+@mcp.tool()
 def aiworkhub_manager_loop_send(
-    text: str, backend_id: str = "", model: str = ""
+    text: str, backend_id: str = "", model: str = "", reasoning: str = ""
 ) -> dict[str, Any]:
     """MANAGER WRITE: run one manager turn in the background.
 
@@ -1833,14 +1895,14 @@ def aiworkhub_manager_loop_send(
     ``backend_id``/``model`` carry the panel picker selection: the turn binds
     to that exact route (same route is a no-op, a switch re-opens with a
     mechanical handoff). Blank means "no selection" and keeps the legacy
-    policy-default pin behavior.
+    policy-default pin behavior. ``reasoning`` is the owner's depth choice.
     """
 
     root, refusal = _manager_loop_repo_root(launching=True)
     if refusal is not None:
         return refusal
     return manager_loop_service.send(
-        root, text, backend_id or None, model or None
+        root, text, backend_id or None, model or None, reasoning or None
     )
 
 

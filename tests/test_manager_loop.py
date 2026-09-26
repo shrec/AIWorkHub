@@ -822,6 +822,153 @@ def test_ensure_keeps_the_oldest_passive_conversation_when_duplicates_exist(make
     ]
 
 
+def test_attach_continues_the_chosen_session_and_a_later_ensure_keeps_it(make) -> None:
+    ticker = Ticker()
+    harness = make(ticker=ticker)
+    older = _passive_record("older-passive-01", ticker())
+    newer = _passive_record("newer-passive-02", ticker())
+    harness.store.save(older)
+    harness.store.save(newer)
+
+    attached = harness.orch.attach("newer-passive-02")
+
+    assert attached.session_id == "newer-passive-02" and attached.status == "active"
+    assert harness.orch.session == attached
+    assert harness.store.read_selection() == "newer-passive-02"
+    assert [(item.session_id, item.status) for item in harness.store.sessions()] == [
+        ("older-passive-01", "closed"), ("newer-passive-02", "active"),
+    ]
+    assert "session_switch" in harness.store.read_handoff("older-passive-01")
+    assert harness.backends == []
+
+    harness.orch.close()
+    other = make(prefix="b", ticker=ticker)
+    assert other.orch.ensure().session_id == "newer-passive-02"
+    assert other.backends == []
+
+
+def test_attach_reopens_a_closed_session_without_calling_a_provider(make) -> None:
+    ticker = Ticker()
+    harness = make(ticker=ticker)
+    created = ticker()
+    closed = ml.ManagerSession(
+        session_id="closed-session-01",
+        repo_id=REPO_ID,
+        backend_id="",
+        model="",
+        status="closed",
+        created_at=created,
+        closed_at=ticker(),
+    )
+    current = _passive_record("current-passive1", ticker())
+    harness.store.save(closed)
+    harness.store.save(current)
+
+    reopened = harness.orch.attach("closed-session-01")
+
+    assert (reopened.session_id, reopened.status, reopened.closed_at) == (
+        "closed-session-01", "active", None,
+    )
+    assert harness.store.read_selection() == "closed-session-01"
+    stored = {item.session_id: item for item in harness.store.sessions()}
+    assert stored["current-passive1"].status == "closed"
+    assert harness.backends == []
+    with pytest.raises(ml.ManagerLoopError, match="session_not_found"):
+        harness.orch.attach("missing-session-01")
+    with pytest.raises(ml.ManagerLoopError, match="session_id_invalid"):
+        harness.orch.attach("nope")
+
+
+def test_begin_new_closes_the_current_conversation_and_opens_another(make) -> None:
+    harness = make()
+    first = harness.orch.ensure()
+
+    second = harness.orch.begin_new()
+
+    assert second.passive and second.session_id != first.session_id
+    assert harness.orch.session == second
+    assert harness.store.read_selection() is None
+    stored = {item.session_id: item for item in harness.store.sessions()}
+    assert stored[first.session_id].status == "closed"
+    assert "new_session" in harness.store.read_handoff(first.session_id)
+    assert harness.backends == []
+
+
+def test_restore_loads_the_last_session_and_does_not_create_one(make) -> None:
+    ticker = Ticker()
+    empty = make(prefix="empty", ticker=ticker)
+    assert empty.orch.restore_latest() is None
+    assert empty.store.sessions() == []
+
+    older = _passive_record("older-passive-01", ticker())
+    newer = _passive_record("newer-passive-02", ticker())
+    empty.store.save(older)
+    empty.store.save(newer)
+    restored = empty.orch.restore_latest()
+    assert restored is not None and restored.session_id == "newer-passive-02"
+    assert empty.store.read_selection() == "newer-passive-02"
+    assert empty.backends == []
+
+
+def test_rename_sets_the_display_name_without_a_provider(make) -> None:
+    harness = make()
+    session = harness.orch.ensure()
+    renamed = harness.orch.rename(session.session_id, "  Morning   review  ")
+    assert renamed.title == "Morning review"
+    assert harness.orch.session is not None and harness.orch.session.title == "Morning review"
+    assert harness.backends == []
+    legacy = ml.ManagerSession.from_json(session.to_json())
+    assert legacy.title == ""
+
+
+def test_discard_removes_a_saved_session_and_its_log(make) -> None:
+    harness = make()
+    kept = harness.orch.ensure()
+    other = _passive_record("other-session-01", "2026-09-26T00:00:00+00:00")
+    harness.store.save(other)
+    harness.store.save_handoff(other.session_id, "old handoff")
+
+    harness.orch.discard(other.session_id)
+
+    assert [item.session_id for item in harness.store.sessions()] == [kept.session_id]
+    assert not (harness.store.root / "handoffs" / f"{other.session_id}.md").is_file()
+    assert harness.orch.session == kept
+    with pytest.raises(ml.ManagerLoopError, match="session_not_found"):
+        harness.orch.discard(other.session_id)
+
+
+def test_the_first_message_on_a_route_opens_one_session_and_a_loaded_one_stays(make) -> None:
+    harness = make()
+    opened = harness.orch.continue_on_route("fake", "model-a")
+    assert opened.session_id and not opened.passive
+    assert len(harness.store.sessions()) == 1
+    harness.orch.close()
+    again = make(prefix="b")
+    loaded = again.orch.restore_latest()
+    assert loaded is not None and loaded.session_id == opened.session_id
+    bound = again.orch.continue_on_route("fake", "model-a")
+    assert bound.session_id == opened.session_id
+    switched = again.orch.continue_on_route("other", "model-b")
+    assert switched.session_id == opened.session_id
+    assert (switched.backend_id, switched.model) == ("other", "model-b")
+    assert len(again.store.sessions()) == 1
+
+
+def test_a_picker_selection_follows_the_route_successor(make) -> None:
+    ticker = Ticker()
+    harness = make(ticker=ticker)
+    passive = harness.orch.ensure()
+    harness.orch.attach(passive.session_id)
+
+    successor = harness.orch.ensure_route("fake", "model-a")
+
+    assert successor.session_id != passive.session_id
+    assert harness.store.read_selection() == successor.session_id
+    harness.orch.close()
+    other = make(prefix="b", ticker=ticker)
+    assert other.orch.ensure().session_id == successor.session_id
+
+
 def test_a_stuck_ensure_holder_is_a_named_refusal_not_a_hang(make, monkeypatch) -> None:
     from aiworkhub import platform_io
 

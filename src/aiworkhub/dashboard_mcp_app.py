@@ -2446,6 +2446,14 @@ def snapshot_view(
             "capability_state": selected_target.get("capability_state") if isinstance(selected_target, dict) else "",
             "reason": wake.get("reason") or wake.get("action") if isinstance(wake, dict) else "",
         }
+        chat_route = manager.get("manager_route") if isinstance(manager, dict) else {}
+        chat = chat_route.get("manager_chat") if isinstance(chat_route, dict) else None
+        if isinstance(chat, dict) and chat.get("session_id"):
+            snapshot["manager_identity_target"] = {
+                "selected_provider": "manager_chat",
+                "capability_state": "ready",
+                "reason": "",
+            }
     except Exception:  # noqa: BLE001 -- route diagnostics are optional
         snapshot["manager_identity_target"] = {}
     snapshot["server_tool"] = "aiworkhub_dashboard_snapshot"

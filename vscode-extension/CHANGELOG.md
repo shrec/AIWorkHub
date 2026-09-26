@@ -1,5 +1,71 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.92 — 2026-09-26
+
+### Fixed
+
+- Manager route details show the active Manager Chat session, model and backend.
+
+## 0.11.91 — 2026-09-26
+
+### Fixed
+
+- Callbacks are sent to both the existing Codex or Claude thread and the active Manager Chat session.
+
+## 0.11.90 — 2026-09-26
+
+### Added
+
+- Manager chat shows thinking and tool calls during the turn. A Reasoning depth control sets Claude and Codex effort.
+
+## 0.11.89 — 2026-09-26
+
+### Fixed
+
+- Manager Chat can create a callback task against its active session without a Codex thread UUID.
+
+## 0.11.88 — 2026-09-26
+
+### Fixed
+
+- An OpenCode model switch stays on. A stale settings refresh no longer redraws the toggles.
+
+## 0.11.87 — 2026-09-26
+
+### Fixed
+
+- Choosing a model sends that model's CLI, not the hidden default. The chat stays empty until you continue a saved session or send.
+
+## 0.11.86 — 2026-09-26
+
+### Changed
+
+- The provider combo is gone. Pick a model; that session binds to the CLI that runs it.
+
+## 0.11.85 — 2026-09-26
+
+### Fixed
+
+- The provider and model combos keep the click. A status refresh no longer snaps them back to the session's last route.
+
+## 0.11.84 — 2026-09-26
+
+### Changed
+
+- A manager session is the owner's conversation. The session list is not split by provider, and the selected model rebinds that same session.
+
+## 0.11.83 — 2026-09-26
+
+### Changed
+
+- Manager chat no longer repeats the dashboard task list. The session list follows the selected backend, and Delete removes a session you do not want to keep.
+
+## 0.11.82 — 2026-09-26
+
+### Added
+
+- Manager chat loads the last session, opens the first session on the selected model, and renames the active session. Callbacks follow that session, and its turns are written to Context Graph.
+
 ## 0.11.81 — 2026-09-26
 
 ### Fixed

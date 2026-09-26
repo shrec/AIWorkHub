@@ -62,6 +62,50 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
+## What's new in 0.11.92
+
+- Manager route details follow the open Manager Chat session, not a missing Codex thread.
+
+## What's new in 0.11.91
+
+- Callbacks go to the Codex or Claude thread and to Manager Chat. Creating a callback task no longer requires a Codex thread when a manager session is active.
+
+## What's new in 0.11.90
+
+- Manager chat shows thinking and tool calls while the turn runs, and can set reasoning depth.
+
+## What's new in 0.11.89
+
+- Manager Chat can own callback tasks through its active session.
+
+## What's new in 0.11.88
+
+- OpenCode model toggles stay on. A stale settings refresh no longer snaps them back.
+
+## What's new in 0.11.87
+
+- The selected model binds to its own CLI. Opening Manager chat no longer restores an old transcript.
+
+## What's new in 0.11.86
+
+- Manager chat lists models. The chosen model binds the session to its CLI.
+
+## What's new in 0.11.85
+
+- Manager chat dropdowns no longer snap back to the session's last model.
+
+## What's new in 0.11.84
+
+- A manager session is not bound to a provider. The selected model attaches to that session.
+
+## What's new in 0.11.83
+
+- Manager chat no longer repeats the task board. Delete removes a session, and the list follows the selected backend.
+
+## What's new in 0.11.82
+
+- Manager chat restores the last session and binds its turns to Context Graph. The active session receives callbacks.
+
 ## What's new in 0.11.81
 
 - Source Graph binds dotted Python imports and exact annotations. It does not guess os, ast, or Path.

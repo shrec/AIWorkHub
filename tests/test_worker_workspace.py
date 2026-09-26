@@ -11,6 +11,7 @@ import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -549,6 +550,9 @@ def _commit_validation_worker_package(repo: Path) -> None:
         "storage_registry.py",
         "windows_appcontainer.py",
         "windows_job_structures.py",
+        # platform_io's relative import of windows_mxc is repository-local.
+        # The seed closure fails closed when the sibling is absent.
+        "windows_mxc.py",
         "worker_workspace.py",
     ):
         shutil.copyfile(source_package / name, destination_package / name)
@@ -1844,7 +1848,7 @@ def test_nonblocking_preflight_caches_failure_for_bounded_cooldown(
     assert calls == 2
 
 
-def test_default_workspace_root_is_repo_local_runtime_boundary(
+def test_default_workspace_root_is_platform_safe_runtime_boundary(
     monkeypatch: pytest.MonkeyPatch,
     repo: Path,
 ) -> None:
@@ -1854,18 +1858,29 @@ def test_default_workspace_root_is_repo_local_runtime_boundary(
     assert worker_workspace.configured_runtime_root(repo) == (
         repo / ".aiworkhub" / "runtime"
     ).resolve()
-    assert worker_workspace.configured_worktree_root(repo) == (
-        repo / ".aiworkhub" / "runtime" / "worktrees"
-    ).resolve()
+    if os.name == "nt":
+        namespace = hashlib.sha256(
+            os.path.normcase(str(repo.resolve())).encode("utf-8")
+        ).hexdigest()[:16]
+        expected = (
+            Path(tempfile.gettempdir()) / "aiworkhub-worktrees" / namespace
+        ).resolve()
+        assert worker_workspace.configured_worktree_root(repo) == expected
+        assert repo not in expected.parents
+    else:
+        assert worker_workspace.configured_worktree_root(repo) == (
+            repo / ".aiworkhub" / "runtime" / "worktrees"
+        ).resolve()
 
 
-def test_workspace_can_use_exact_repo_local_runtime_root(
+def test_workspace_uses_configured_platform_safe_runtime_root(
     monkeypatch: pytest.MonkeyPatch,
     repo: Path,
 ) -> None:
     monkeypatch.delenv(worker_workspace.WORKTREE_ROOT_ENV, raising=False)
     monkeypatch.delenv(worker_workspace.RUNTIME_ROOT_ENV, raising=False)
 
+    root = worker_workspace.configured_worktree_root(repo)
     workspace = worker_workspace.create_workspace(
         repo,
         "repo-local-runtime",
@@ -1874,17 +1889,76 @@ def test_workspace_can_use_exact_repo_local_runtime_root(
     )
     try:
         assert workspace.path == (
-            repo
-            / ".aiworkhub"
-            / "runtime"
-            / "worktrees"
-            / "repo-local-runtime"
-            / "worktree"
+            root / "repo-local-runtime" / "worktree"
         ).resolve()
-        assert repo in workspace.path.parents
+        assert (repo not in workspace.path.parents) is (os.name == "nt")
         assert worker_workspace.enforce_scope(workspace) == []
     finally:
         worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
+
+
+def test_default_worktree_root_separates_repository_namespaces(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    repo: Path,
+) -> None:
+    monkeypatch.delenv(worker_workspace.WORKTREE_ROOT_ENV, raising=False)
+    monkeypatch.delenv(worker_workspace.RUNTIME_ROOT_ENV, raising=False)
+    sibling = tmp_path / "sibling-repo"
+    sibling.mkdir()
+
+    mine = worker_workspace.configured_worktree_root(repo)
+    theirs = worker_workspace.configured_worktree_root(sibling)
+
+    assert mine != theirs
+    assert mine not in theirs.parents
+    assert theirs not in mine.parents
+    assert worker_workspace.configured_worktree_root(repo / "read" / "..") == mine
+    assert worker_workspace.configured_worktree_root(repo) == mine
+
+    if os.name == "nt":
+        shared_parent = (
+            Path(tempfile.gettempdir()) / "aiworkhub-worktrees"
+        ).resolve()
+        assert mine.parent == shared_parent
+        assert theirs.parent == shared_parent
+        for name in (mine.name, theirs.name):
+            assert len(name) == 16
+            assert set(name) <= set("0123456789abcdef")
+    else:
+        assert mine == (repo / ".aiworkhub" / "runtime" / "worktrees").resolve()
+        assert theirs == (
+            sibling / ".aiworkhub" / "runtime" / "worktrees"
+        ).resolve()
+
+
+def test_explicit_roots_outrank_the_namespaced_worktree_default(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    repo: Path,
+) -> None:
+    monkeypatch.delenv(worker_workspace.WORKTREE_ROOT_ENV, raising=False)
+    monkeypatch.delenv(worker_workspace.RUNTIME_ROOT_ENV, raising=False)
+    default_root = worker_workspace.configured_worktree_root(repo)
+    runtime_root = tmp_path / "explicit-runtime"
+    runtime_root.mkdir()
+    worktree_root = tmp_path / "explicit-worktrees"
+    worktree_root.mkdir()
+
+    monkeypatch.setenv(worker_workspace.RUNTIME_ROOT_ENV, str(runtime_root))
+    assert worker_workspace.configured_runtime_root(repo) == runtime_root.resolve()
+    assert (
+        worker_workspace.configured_worktree_root(repo)
+        == (runtime_root / "worktrees").resolve()
+    )
+
+    monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(worktree_root))
+    assert worker_workspace.configured_worktree_root(repo) == worktree_root.resolve()
+    assert worker_workspace.configured_runtime_root(repo) == runtime_root.resolve()
+
+    monkeypatch.delenv(worker_workspace.RUNTIME_ROOT_ENV, raising=False)
+    assert worker_workspace.configured_worktree_root(repo) == worktree_root.resolve()
+    assert worktree_root.resolve() != default_root
 
 
 def test_workspace_rejects_noncanonical_root_inside_parent_repo(

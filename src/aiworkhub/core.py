@@ -823,6 +823,53 @@ def _valid_origin_thread_id(value: str) -> bool:
     return bool(_UUID_RE.fullmatch(value))
 
 
+_MANAGER_CHAT_SESSION_RE = re.compile(r"^mls-[0-9a-f]{32}$", re.I)
+
+
+def _active_manager_chat_record() -> dict[str, str] | None:
+    """The selected Manager Chat session, when it is still active.
+
+    Window ids and episode ids are not sessions. A closed session is not
+    the seat, even if its file is still on disk.
+    """
+
+    try:
+        root = repo_root()
+        selected_path = root / ".aiworkhub" / "runtime" / "manager_loop" / "selected.json"
+        payload = json.loads(selected_path.read_text(encoding="utf-8"))
+        session_id = str(payload.get("session_id") or "").strip() if isinstance(payload, dict) else ""
+        if not _MANAGER_CHAT_SESSION_RE.fullmatch(session_id):
+            return None
+        record = json.loads((selected_path.parent / "sessions" / f"{session_id}.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return None
+    if not isinstance(record, dict):
+        return None
+    if str(record.get("session_id") or "") != session_id:
+        return None
+    if str(record.get("status") or "") != "active":
+        return None
+    return {
+        "session_id": session_id,
+        "backend_id": str(record.get("backend_id") or "").strip(),
+        "model": str(record.get("model") or "").strip(),
+        "status": "active",
+    }
+
+
+def _manager_chat_session_origin() -> str:
+    """The active Manager Chat session, when that seat can own callbacks.
+
+    A Codex or Claude UUID is still the origin when one has been observed.
+    This is only the fallback for the owner seat: an ``mls-`` conversation
+    that is selected and still active. Window ids and episode ids stay
+    refused.
+    """
+
+    record = _active_manager_chat_record()
+    return str(record.get("session_id") or "") if record else ""
+
+
 WINDOW_ROUTE_DIR_REL = Path("config") / "routing" / "windows"
 
 
@@ -3283,6 +3330,29 @@ def manager_bootstrap(
             "aiworkhub_manager_bootstrap(include_contract=true) re-delivers the "
             "contract prose; it is unchanged while contract_sha256 is unchanged."
         )
+    chat = _active_manager_chat_record()
+    if chat:
+        # The owner seat is the open Manager Chat session. Codex may still
+        # deliver on its own thread, but this reply must not look route-pending
+        # just because that thread was never observed.
+        previous = reply.get("manager_route") if isinstance(reply.get("manager_route"), dict) else {}
+        if previous:
+            reply["codex_route"] = dict(previous)
+        reply["provider"] = "manager_chat"
+        reply["role"] = "manager"
+        reply["manager_verified"] = True
+        reply["manager_route"] = {
+            "provider": "manager_chat",
+            "session_id": chat["session_id"],
+            "thread_id": "",
+            "window_id": str(previous.get("window_id") or ""),
+            "route_state": "ready",
+            "callback_supported": "true",
+            "model": chat["model"],
+            "backend_id": chat["backend_id"],
+            "manager_chat": chat,
+        }
+        reply["reason"] = ""
     return reply
 
 
@@ -4573,11 +4643,15 @@ def create_task(
     candidate_origin_thread_id = str(
         identity.get("thread_id") or identity.get("session_id") or ""
     ).strip()
-    origin_thread_id = (
+    uuid_origin = (
         candidate_origin_thread_id
         if _valid_origin_thread_id(candidate_origin_thread_id)
         else ""
     )
+    chat_origin = _manager_chat_session_origin()
+    # Keep the Codex/Claude thread when one was observed. Manager Chat is a
+    # second destination, not a replacement, until that mux is removed.
+    origin_thread_id = uuid_origin or chat_origin
     if callback_required and not origin_thread_id:
         provider_name = str(identity.get("provider") or "manager").strip().lower()
         missing_route = (
@@ -4616,6 +4690,7 @@ def create_task(
         "worker_status": "unclaimed",
         "objective": objective,
         "origin_thread_id": origin_thread_id,
+        "manager_chat_session_id": chat_origin,
         "coordinator_provider": provider,
         "callback_required": bool(callback_required),
         "callback_supported": bool(origin_thread_id),

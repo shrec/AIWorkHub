@@ -170,7 +170,7 @@ test("managerLoopStart/Send/Rotate/Status/Events reach one lazily-created client
 
   const find = (name) => gatedClient.calls.find((call) => call.name === name);
   assert.deepEqual(plain(find("aiworkhub_manager_loop_start").args), { backend_id: "claude_cli", model: "opus" });
-  assert.deepEqual(plain(find("aiworkhub_manager_loop_send").args), { text: "hello manager", backend_id: "codex_cli", model: "gpt-x" });
+  assert.deepEqual(plain(find("aiworkhub_manager_loop_send").args), { text: "hello manager", backend_id: "codex_cli", model: "gpt-x", reasoning: "" });
   assert.deepEqual(plain(find("aiworkhub_manager_loop_rotate").args), { reason: "context threshold" });
   assert.deepEqual(plain(find("aiworkhub_manager_loop_events").args), { session_id: "mls-aaaa1111bbbb2222", after_seq: 5 });
   // Status is called both explicitly and as the authoritative refresh after
@@ -204,6 +204,45 @@ test("managerLoopEnsure reaches the gated client as aiworkhub_manager_loop_ensur
   assert.equal(harness.managerLoopClientInstances.length, 1);
   const gatedClient = harness.managerLoopClientInstances[0];
   assert.deepEqual(plain(gatedClient.calls.find((call) => call.name === "aiworkhub_manager_loop_ensure").args), {});
+});
+
+test("managerLoopContinue and managerLoopNew reach the gated client; a short id does not", async () => {
+  const harness = loadHostSlice();
+  harness.setClient(makeClient());
+  const view = makeView();
+
+  harness.api.handleInboundMessage(view, { type: "managerLoopContinue", sessionId: "mls-aaaa1111bbbb2222" });
+  harness.api.handleInboundMessage(view, { type: "managerLoopNew" });
+  harness.api.handleInboundMessage(view, { type: "managerLoopContinue", sessionId: "nope" });
+  await flush();
+
+  assert.equal(harness.managerLoopClientInstances.length, 1);
+  const gatedClient = harness.managerLoopClientInstances[0];
+  assert.deepEqual(
+    plain(gatedClient.calls.find((call) => call.name === "aiworkhub_manager_loop_continue").args),
+    { session_id: "mls-aaaa1111bbbb2222" },
+  );
+  assert.deepEqual(plain(gatedClient.calls.find((call) => call.name === "aiworkhub_manager_loop_new").args), {});
+  assert.equal(gatedClient.calls.filter((call) => call.name === "aiworkhub_manager_loop_continue").length, 1);
+});
+
+test("managerLoopRestore and managerLoopRename reach the gated client", async () => {
+  const harness = loadHostSlice();
+  harness.setClient(makeClient());
+  const view = makeView();
+
+  harness.api.handleInboundMessage(view, { type: "managerLoopRestore" });
+  harness.api.handleInboundMessage(view, { type: "managerLoopRename", sessionId: "mls-aaaa1111bbbb2222", title: "Morning" });
+  harness.api.handleInboundMessage(view, { type: "managerLoopRename", sessionId: "nope", title: "Morning" });
+  await flush();
+
+  const gatedClient = harness.managerLoopClientInstances[0];
+  assert.deepEqual(plain(gatedClient.calls.find((call) => call.name === "aiworkhub_manager_loop_restore").args), {});
+  assert.deepEqual(plain(gatedClient.calls.find((call) => call.name === "aiworkhub_manager_loop_rename").args), {
+    session_id: "mls-aaaa1111bbbb2222",
+    title: "Morning",
+  });
+  assert.equal(gatedClient.calls.filter((call) => call.name === "aiworkhub_manager_loop_rename").length, 1);
 });
 
 test("managerLoopClose disposes the gated client; the next managerLoopStart spawns a fresh one", async () => {
@@ -395,9 +434,15 @@ function loadWebviewSlice() {
     managerChatStatus: makeFakeElement("span"),
     managerChatStatusLabel: makeFakeElement("span"),
     managerChatSessionLine: makeFakeElement("div"),
+    managerChatSessionSelect: makeFakeElement("select"),
+    managerChatRenameSession: makeFakeElement("button"),
+    managerChatNewSession: makeFakeElement("button"),
     managerChatSessionId: makeFakeElement("span"),
     managerChatSessionBackend: makeFakeElement("span"),
     managerChatComposer: makeFakeElement("form"),
+    managerChatTasksHead: makeFakeElement("div"),
+    managerChatTasksList: makeFakeElement("div"),
+    managerChatTaskFilter: Object.assign(makeFakeElement("select"), { value: "open" }),
     managerChatInput: makeFakeElement("textarea"),
     managerChatSend: makeFakeElement("button"),
     headerManagerChatValue: makeFakeElement("strong"),
@@ -437,7 +482,7 @@ function loadWebviewSlice() {
     `"use strict";\n${utilities}\n${constants}\n${managerChat}\n${managerChatWiring}\n` +
       "this.api = { managerChatEventNode, renderManagerChatEvents, renderManagerChatEventsResponse, " +
       "renderManagerChatAction, renderManagerChatStatus, requestManagerChatEvents, scheduleManagerChatPoll, " +
-      "applyManagerChatSessionUi, applyManagerChatComposerState, managerChatEnabledModels, populateManagerChatModelOptions, applyManagerChatCollapsed, toggleManagerChatSidebar, startManagerChatSidebar, openManagerChatDialog };",
+      "applyManagerChatSessionUi, applyManagerChatComposerState, managerChatEnabledModels, managerChatSelectedRoute, populateManagerChatModelOptions, applyManagerChatCollapsed, toggleManagerChatSidebar, startManagerChatSidebar, openManagerChatDialog, renderManagerChatTaskBoard, driveManagerChatTask };",
     context,
   );
   return { api: context.api, state, elements, posts, timers };
@@ -697,6 +742,7 @@ test("submitting the composer posts the picker route with the text", () => {
     text: "hello",
     backendId: "codex_cli",
     model: "gpt-x",
+    reasoning: "",
   });
 });
 
@@ -709,12 +755,12 @@ test("submitting while a turn is running still sends and leaves the composer ena
   harness.elements.managerChatInput.value = "next";
 
   trigger(harness.elements.managerChatComposer, "submit");
-
   assert.deepEqual(plain(harness.posts.at(-1)), {
     type: "managerLoopSend",
     text: "next",
     backendId: "codex_cli",
     model: "gpt-x",
+    reasoning: "",
   });
   assert.equal(harness.elements.managerChatInput.disabled, false);
   assert.equal(harness.elements.managerChatSend.disabled, false);
@@ -781,6 +827,41 @@ test("manager chat tool and reasoning text is not clipped and hostile HTML stays
   assert.ok(reasonNodes.some((item) => item.nodeType === 3 && String(item.textContent || "").includes("<img")));
 });
 
+test("a running turn names the latest streamed action on the status line", () => {
+  const harness = loadWebviewSlice();
+  harness.state.managerChatSession = "mls-aaaa1111bbbb2222";
+  harness.state.managerChatRunning = true;
+  harness.state.managerChatEvents = [
+    { seq: 1, type: "tool_call", payload: { name: "read" } },
+  ];
+
+  harness.api.applyManagerChatSessionUi();
+
+  assert.match(harness.elements.managerChatStatusLabel.textContent, /Running · read/);
+});
+
+test("tool calls render as fields for every model, not as a JSON blob", () => {
+  const harness = loadWebviewSlice();
+  const node = harness.api.managerChatEventNode({
+    type: "tool_call",
+    payload: { name: "read_file", input: { path: "a.py" } },
+  });
+  const text = flattenNodes(node, []).map((part) => String(part.textContent || "")).join("\n");
+  assert.match(text, /read_file/);
+  assert.match(text, /a\\.py/);
+  assert.equal(text.includes('{\"input\"'), false);
+});
+
+test("a running turn shows a thinking timer for any model", () => {
+  const harness = loadWebviewSlice();
+  harness.state.managerChatSession = "mls-aaaa1111bbbb2222";
+  harness.state.managerChatRunning = true;
+  harness.state.managerChatEvents = [];
+  harness.api.renderManagerChatEvents();
+  const text = flattenNodes(harness.elements.managerChatTranscript, []).map((part) => String(part.textContent || "")).join("");
+  assert.match(text, /Thinking/);
+});
+
 test("polling continues when the manager dialog is closed", () => {
   const harness = loadWebviewSlice();
   harness.state.managerChatSession = "mls-aaaa1111bbbb2222";
@@ -837,7 +918,7 @@ test("closing the manager dialog does not stop session polling", () => {
   });
 });
 
-test("the picker stays live during a session and syncs to the running route", () => {
+test("the picker stays on the owner's choice and is not overwritten by the session route", () => {
   const harness = loadWebviewSlice();
   harness.state.featureSettings = MANAGER_CHAT_MODEL_POLICY_PAYLOAD;
   harness.state.managerChatSession = "mls-aaaa1111bbbb2222";
@@ -847,14 +928,14 @@ test("the picker stays live during a session and syncs to the running route", ()
     harness.elements.managerChatBackendSelect.appendChild({ value: backend, textContent: backend });
   }
   harness.elements.managerChatBackendSelect.value = "claude_cli";
+  harness.elements.managerChatModelInput.value = "claude-sonnet-5";
 
   harness.api.applyManagerChatSessionUi();
 
-  assert.equal(harness.elements.managerChatStart.disabled, true);
   assert.equal(harness.elements.managerChatBackendSelect.disabled, false);
   assert.equal(harness.elements.managerChatModelInput.disabled, false);
-  assert.equal(harness.elements.managerChatBackendSelect.value, "codex_cli");
-  assert.equal(harness.elements.managerChatModelInput.value, "gpt-5-codex");
+  assert.equal(harness.elements.managerChatBackendSelect.value, "claude_cli");
+  assert.equal(harness.elements.managerChatModelInput.value, "claude-sonnet-5");
 });
 
 // ── media/app.js: model picker sourced from the repository's enabled models ─
@@ -877,17 +958,16 @@ const MANAGER_CHAT_MODEL_POLICY_PAYLOAD = {
   },
 };
 
-test("the model select is filled from the settings payload's enabled models for the chosen backend", () => {
+test("the model select lists every enabled model and remembers which transport reaches it", () => {
   const harness = loadWebviewSlice();
   harness.state.featureSettings = MANAGER_CHAT_MODEL_POLICY_PAYLOAD;
-  harness.elements.managerChatBackendSelect.value = "claude_cli";
 
   harness.api.populateManagerChatModelOptions();
 
   const options = harness.elements.managerChatModelInput.children;
-  assert.deepEqual(options.map((option) => option.value), ["claude-opus-4-1", "claude-sonnet-5"]);
-  assert.equal(harness.elements.managerChatModelInput.value, "claude-opus-4-1", "the first enabled model is preselected");
-  assert.equal(harness.elements.managerChatStart.disabled, false);
+  assert.deepEqual(options.map((option) => option.value), ["claude-opus-4-1", "claude-sonnet-5", "gpt-5-codex"]);
+  assert.equal(options.find((option) => option.value === "gpt-5-codex").dataset.backendId, "codex_cli");
+  assert.equal(harness.elements.managerChatModelInput.value, "claude-opus-4-1");
 });
 
 test("a discovered row's label is shown as the option text while the value stays the model that gets launched", () => {
@@ -912,47 +992,44 @@ test("a discovered row's label is shown as the option text while the value stays
   harness.api.populateManagerChatModelOptions();
 
   const options = harness.elements.managerChatModelInput.children;
-  assert.deepEqual(options.map((option) => option.value), ["opus", "fable"], "the value sent on Start is always the launched alias");
+  assert.deepEqual(options.map((option) => option.value), ["opus", "fable"], "the value sent on Send is always the launched alias");
   assert.equal(options[0].textContent, "claude-opus-5 (opus)", "the option shows the resolved version, not the bare alias");
   assert.equal(options[1].textContent, "fable", "a row with no resolved version yet falls back to its bare name");
   assert.equal(harness.elements.managerChatModelInput.value, "opus");
-
-  trigger(harness.elements.managerChatStart, "click");
+  harness.elements.managerChatInput.value = "continue";
+  trigger(harness.elements.managerChatComposer, "submit");
   assert.deepEqual(plain(harness.posts.at(-1)), {
-    type: "managerLoopStart",
+    type: "managerLoopSend",
+    text: "continue",
     backendId: "claude_cli",
     model: "opus",
+    reasoning: "",
   });
 });
 
-test("switching backend repopulates the options and remembers the owner's last choice per backend for the session", () => {
+test("choosing a model keeps the full list and resolves that model's transport", () => {
   const harness = loadWebviewSlice();
   harness.state.featureSettings = MANAGER_CHAT_MODEL_POLICY_PAYLOAD;
-  harness.elements.managerChatBackendSelect.value = "claude_cli";
   harness.api.populateManagerChatModelOptions();
-  harness.elements.managerChatModelInput.value = "claude-sonnet-5";
-  trigger(harness.elements.managerChatModelInput, "change");
+  harness.elements.managerChatModelInput.value = "gpt-5-codex";
 
-  harness.elements.managerChatBackendSelect.value = "codex_cli";
-  trigger(harness.elements.managerChatBackendSelect, "change");
+  const route = harness.api.managerChatSelectedRoute();
 
-  assert.deepEqual(harness.elements.managerChatModelInput.children.map((option) => option.value), ["gpt-5-codex"]);
-  assert.equal(harness.elements.managerChatModelInput.value, "gpt-5-codex");
-
-  harness.elements.managerChatBackendSelect.value = "claude_cli";
-  trigger(harness.elements.managerChatBackendSelect, "change");
-
-  assert.equal(
-    harness.elements.managerChatModelInput.value,
+  assert.deepEqual(harness.elements.managerChatModelInput.children.map((option) => option.value), [
+    "claude-opus-4-1",
     "claude-sonnet-5",
-    "the owner's earlier pick for claude_cli is remembered for the webview session",
-  );
+    "gpt-5-codex",
+  ]);
+  assert.equal(route.backendId, "codex_cli");
+  assert.equal(route.model, "gpt-5-codex");
 });
 
-test("a backend with no enabled models shows a disabled hint option and disables Start", () => {
+test("no enabled models shows a disabled hint and disables the model combo", () => {
   const harness = loadWebviewSlice();
-  harness.state.featureSettings = MANAGER_CHAT_MODEL_POLICY_PAYLOAD;
-  harness.elements.managerChatBackendSelect.value = "opencode_cli";
+  harness.state.featureSettings = {
+    ok: true,
+    model_policy: { ok: true, catalog: { workers: [] } },
+  };
 
   harness.api.populateManagerChatModelOptions();
 
@@ -960,67 +1037,93 @@ test("a backend with no enabled models shows a disabled hint option and disables
   assert.equal(options.length, 1);
   assert.equal(options[0].disabled, true);
   assert.match(options[0].textContent, /No enabled models/);
-  assert.equal(harness.elements.managerChatStart.disabled, true);
+  assert.equal(harness.elements.managerChatModelInput.disabled, true);
 });
 
-test("Start sends the exact backend and model chosen in the picker", () => {
+test("Send continues the saved session with the exact backend and model chosen in the picker", () => {
   const harness = loadWebviewSlice();
   harness.state.featureSettings = MANAGER_CHAT_MODEL_POLICY_PAYLOAD;
   harness.elements.managerChatBackendSelect.value = "claude_cli";
   harness.api.populateManagerChatModelOptions();
   harness.elements.managerChatModelInput.value = "claude-sonnet-5";
+  harness.elements.managerChatInput.value = "continue";
+  harness.elements.managerChatInput.value = "continue";
 
-  trigger(harness.elements.managerChatStart, "click");
+  trigger(harness.elements.managerChatComposer, "submit");
 
   assert.deepEqual(plain(harness.posts.at(-1)), {
-    type: "managerLoopStart",
+    type: "managerLoopSend",
+    text: "continue",
     backendId: "claude_cli",
     model: "claude-sonnet-5",
+    reasoning: "",
   });
 });
-
-test("Start is refused when the current backend has no enabled models", () => {
+test("Send is refused when no model is available", () => {
   const harness = loadWebviewSlice();
-  harness.state.featureSettings = MANAGER_CHAT_MODEL_POLICY_PAYLOAD;
-  harness.elements.managerChatBackendSelect.value = "opencode_cli";
+  harness.state.featureSettings = {
+    ok: true,
+    model_policy: { ok: true, catalog: { workers: [] } },
+  };
   harness.api.populateManagerChatModelOptions();
+  harness.elements.managerChatInput.value = "continue";
 
-  trigger(harness.elements.managerChatStart, "click");
+  trigger(harness.elements.managerChatComposer, "submit");
 
-  assert.equal(harness.posts.length, 0, "no managerLoopStart message is ever sent without a real model");
+  assert.equal(harness.posts.some((post) => post.type === "managerLoopSend"), false, "no send is posted without a real model");
   assert.equal(harness.elements.managerChatNotice.hidden, false);
 });
 
-test("loading the sidebar populates the model picker without opening a dialog", () => {
+test("loading the sidebar lists every enabled model without opening a dialog", () => {
   const harness = loadWebviewSlice();
   harness.state.featureSettings = MANAGER_CHAT_MODEL_POLICY_PAYLOAD;
-  harness.elements.managerChatBackendSelect.value = "codex_cli";
 
   harness.api.startManagerChatSidebar();
 
-  assert.deepEqual(harness.elements.managerChatModelInput.children.map((option) => option.value), ["gpt-5-codex"]);
+  assert.deepEqual(harness.elements.managerChatModelInput.children.map((option) => option.value), [
+    "claude-opus-4-1",
+    "claude-sonnet-5",
+    "gpt-5-codex",
+  ]);
   assert.equal(harness.elements.managerChatDialog.showModalCalled, 0, "sidebar load never opens a modal dialog");
 });
 
-test("loading the sidebar ensures and requests status when there is no session", () => {
+test("opening the chat does not attach a saved session or create one", () => {
   const harness = loadWebviewSlice();
-  assert.equal(harness.state.managerChatSession, null);
+  harness.state.managerChatSession = "mls-aaaa1111bbbb2222";
+  harness.state.managerChatEvents = [{ seq: 2, type: "user_message", payload: { text: "old" } }];
 
   harness.api.startManagerChatSidebar();
 
-  assert.deepEqual(plain(harness.posts.find((post) => post.type === "managerLoopEnsure")), { type: "managerLoopEnsure" });
+  assert.equal(harness.posts.some((post) => post.type === "managerLoopRestore"), false);
+  assert.equal(harness.posts.some((post) => post.type === "managerLoopEnsure"), false);
   assert.deepEqual(plain(harness.posts.find((post) => post.type === "managerLoopStatus")), { type: "managerLoopStatus" });
+  assert.equal(harness.state.managerChatSession, null);
+  assert.equal(harness.state.managerChatEvents.length, 0);
   assert.equal(harness.elements.managerChatDialog.showModalCalled, 0);
 });
 
-test("a sidebar start with a session does not re-ensure", () => {
+test("a non-array option list still binds the selected model to its transport", () => {
   const harness = loadWebviewSlice();
-  harness.state.managerChatSession = "mls-aaaa1111bbbb2222";
+  harness.state.featureSettings = MANAGER_CHAT_MODEL_POLICY_PAYLOAD;
+  harness.api.populateManagerChatModelOptions();
+  const select = harness.elements.managerChatModelInput;
+  const listed = select.children.slice();
+  const collection = { length: listed.length };
+  listed.forEach((option, index) => {
+    collection[index] = option;
+  });
+  select.children = collection;
+  select.options = collection;
+  select.selectedOptions = undefined;
+  select.value = "gpt-5-codex";
+  harness.elements.managerChatBackendSelect.value = "claude_cli";
 
-  harness.api.startManagerChatSidebar();
+  const route = harness.api.managerChatSelectedRoute();
 
-  assert.equal(harness.posts.some((post) => post.type === "managerLoopEnsure"), false);
-  assert.equal(harness.posts.some((post) => post.type === "managerLoopStatus"), true);
+  assert.equal(Array.isArray(select.children), false);
+  assert.equal(route.backendId, "codex_cli");
+  assert.equal(route.model, "gpt-5-codex");
 });
 
 test("the collapse toggle flips sidebar state and never opens a dialog", () => {
@@ -1031,15 +1134,103 @@ test("the collapse toggle flips sidebar state and never opens a dialog", () => {
 
   assert.equal(harness.state.managerChatCollapsed, true);
   assert.equal(harness.elements.managerChatDialog.showModalCalled, 0, "never modal: the dashboard stays usable");
-
   harness.api.toggleManagerChatSidebar();
 
   assert.equal(harness.state.managerChatCollapsed, false);
   assert.equal(harness.elements.managerChatDialog.open, true, "collapse does not drive dialog.open");
 });
 
+test("the manager session shows canonical tasks and drives one from the chosen model", () => {
+  const harness = loadWebviewSlice();
+  harness.state.featureSettings = MANAGER_CHAT_MODEL_POLICY_PAYLOAD;
+  harness.api.populateManagerChatModelOptions();
+  harness.elements.managerChatModelInput.value = "gpt-5-codex";
+  harness.state.tasks = [
+    { task_id: "TASK_PENDING", status: "pending", objective: "wait" },
+    { task_id: "TASK_RUN", status: "processing", title: "ship <img src=x>" },
+  ];
+
+  harness.api.renderManagerChatTaskBoard();
+
+  const buttons = harness.elements.managerChatTasksList.children.filter((node) => node.tag === "button");
+  assert.deepEqual(buttons.map((button) => button.dataset.taskId), ["TASK_RUN", "TASK_PENDING"]);
+  const text = flattenNodes(harness.elements.managerChatTasksList, []).map((node) => String(node.textContent || "")).join("");
+  assert.match(harness.elements.managerChatTasksHead.textContent, /2 · 1 running/);
+  assert.ok(text.includes("<img"), "task text stays literal");
+  assert.ok(!flattenNodes(harness.elements.managerChatTasksList, []).some((node) => node.tag === "img"));
+
+  harness.api.driveManagerChatTask("TASK_RUN");
+
+  assert.equal(harness.posts.at(-1).type, "managerLoopSend");
+  assert.equal(harness.posts.at(-1).backendId, "codex_cli");
+  assert.equal(harness.posts.at(-1).model, "gpt-5-codex");
+  assert.match(harness.posts.at(-1).text, /TASK_RUN \(processing\)/);
+});
+
+test("the task filter hides closed cards and slash commands stay on this session", () => {
+  const harness = loadWebviewSlice();
+  harness.state.featureSettings = MANAGER_CHAT_MODEL_POLICY_PAYLOAD;
+  harness.elements.managerChatBackendSelect.value = "codex_cli";
+  harness.api.populateManagerChatModelOptions();
+  harness.state.tasks = [
+    { task_id: "TASK_RUN", status: "processing", title: "ship" },
+    { task_id: "TASK_DONE", status: "accepted", title: "landed" },
+  ];
+
+  harness.api.renderManagerChatTaskBoard();
+  let buttons = harness.elements.managerChatTasksList.children.filter((node) => node.tag === "button");
+  assert.deepEqual(buttons.map((button) => button.dataset.taskId), ["TASK_RUN"]);
+  assert.equal(buttons[0].children[0].textContent, "inspect");
+
+  harness.elements.managerChatTaskFilter.value = "all";
+  trigger(harness.elements.managerChatTaskFilter, "change");
+  buttons = harness.elements.managerChatTasksList.children.filter((node) => node.tag === "button");
+  assert.deepEqual(buttons.map((button) => button.dataset.taskId), ["TASK_RUN", "TASK_DONE"]);
+
+  harness.elements.managerChatInput.value = "/task TASK_DONE";
+  trigger(harness.elements.managerChatComposer, "submit");
+  assert.match(harness.posts.at(-1).text, /drive canonical task TASK_DONE \(accepted\)/);
+  assert.equal(harness.elements.managerChatInput.value, "");
+
+  harness.elements.managerChatInput.value = "/new";
+  trigger(harness.elements.managerChatComposer, "submit");
+  assert.deepEqual(plain(harness.posts.at(-1)), { type: "managerLoopNew" });
+});
+
+test("the session picker lists saved conversations and continue/new stay on this session", () => {
+  const harness = loadWebviewSlice();
+  const hostile = "<img src=x onerror=alert(1)>";
+  harness.api.renderManagerChatStatus({
+    ok: true,
+    running: false,
+    session: { session_id: "mls-aaaa1111bbbb2222", backend_id: "codex_cli", model: "gpt-5-codex" },
+    sessions: [
+      { session_id: "mls-aaaa1111bbbb2222", status: "active", backend_id: "codex_cli", model: "gpt-5-codex", turn_count: 2 },
+      { session_id: hostile, status: "closed", backend_id: "", model: "", turn_count: 1 },
+      { session_id: "mls-bbbb2222cccc3333", status: "closed", backend_id: "", model: "", turn_count: 4 },
+    ],
+  });
+
+  const select = harness.elements.managerChatSessionSelect;
+  assert.equal(select.value, "mls-aaaa1111bbbb2222");
+  assert.equal(harness.elements.managerChatSessionLine.hidden, false);
+  const labels = select.children.map((option) => option.textContent).join("");
+  assert.ok(labels.includes("<img"), "a long hostile id stays literal text, not an element");
+  assert.ok(!select.children.some((option) => option.tag === "img"));
+
+  select.value = "mls-bbbb2222cccc3333";
+  trigger(select, "change");
+  assert.deepEqual(plain(harness.posts.at(-1)), {
+    type: "managerLoopContinue",
+    sessionId: "mls-bbbb2222cccc3333",
+  });
+
+  trigger(harness.elements.managerChatNewSession, "click");
+  assert.deepEqual(plain(harness.posts.at(-1)), { type: "managerLoopNew" });
+});
+
 test("the model field is a <select>, not a free-text input", () => {
-  assert.match(extensionSource, /<select id="manager-chat-model" class="compact-select" aria-label="Manager model"><\/select>/);
+  assert.match(extensionSource, /<select id="manager-chat-model" class="compact-select" aria-label="Model for this session"><\/select>/);
   assert.doesNotMatch(extensionSource, /<input id="manager-chat-model"/);
 });
 
@@ -1056,12 +1247,15 @@ test("the Manager panel is a persistent sidebar and reuses existing theme tokens
   assert.match(extensionSource, /<div class="needfix-toolbar">\s*<select id="manager-chat-backend"/);
   for (const id of [
     "manager-chat-summary",
+    "manager-chat-session",
+    "manager-chat-rename-session",
+    "manager-chat-delete-session",
+    "manager-chat-new-session",
     "manager-chat-backend",
     "manager-chat-model",
-    "manager-chat-start",
     "manager-chat-rotate",
-    "manager-chat-close",
     "manager-chat-status",
+    "manager-chat-transcript",
     "manager-chat-transcript",
     "manager-chat-notice",
     "manager-chat-composer",
@@ -1070,12 +1264,16 @@ test("the Manager panel is a persistent sidebar and reuses existing theme tokens
   ]) {
     assert.match(extensionSource, new RegExp(`id="${id}"`), `${id} must stay`);
   }
+  assert.doesNotMatch(extensionSource, /id="manager-chat-tasks"/);
+  assert.doesNotMatch(extensionSource, /id="manager-chat-task-filter"/);
   const shellAt = extensionSource.indexOf('id="dashboard-shell"');
   const columnAt = extensionSource.indexOf('id="dashboard-column"');
   const mainEnd = extensionSource.indexOf("</main>");
   const asideAt = extensionSource.indexOf('id="manager-chat-sidebar"');
   assert.ok(shellAt !== -1 && shellAt < columnAt && columnAt < mainEnd && mainEnd < asideAt, "sidebar sits beside the dashboard column");
   assert.doesNotMatch(appSource, /managerChatDialog\.show\(/);
+  assert.doesNotMatch(extensionSource, /id="manager-chat-start"/);
+  assert.doesNotMatch(extensionSource, /id="manager-chat-close"/);
   assert.doesNotMatch(appSource, /managerChatDialog\.showModal\(/, "the sidebar never opens a modal dialog");
   assert.match(appSource, /function startManagerChatSidebar\(/);
   assert.match(appSource, /function toggleManagerChatSidebar\(/);

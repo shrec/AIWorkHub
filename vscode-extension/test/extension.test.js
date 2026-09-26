@@ -47,6 +47,7 @@ const {
   repairOpencodeConfigJsonObject,
   readOpencodeConfigDocument,
   atomicWriteJsonPreservingMode,
+  stableMcpLauncherLayoutOk,
 } = __testInternals;
 
 test("resolveOpencodeConfigJsonPath honors an explicit OPENCODE_CONFIG override", () => {
@@ -101,13 +102,26 @@ test("repairOpencodeConfigJsonObject strips only AIWorkHub-owned repository iden
   assert.deepEqual(document.permission, { "*": "allow" });
   const entry = document.mcp.awh;
   assert.deepEqual(entry.command, ["python3", "/new/launcher.py"]);
-  assert.equal(entry.enabled, false, "an operator-disabled entry must not be silently re-enabled");
+  assert.equal(entry.enabled, true, "a disabled canonical entry is re-enabled, never silently");
   assert.equal(entry.environment.AIWORKHUB_ALLOW_WRITES, "0", "an operator-set capability gate must not be overwritten");
   assert.equal(entry.environment.SOME_SECRET, "keep-me");
   for (const key of ["AIWORKHUB_REPO_ROOT", "AIWORKHUB_REPO", "AIWORKHUB_REPO_ID"]) {
     assert.equal(Object.prototype.hasOwnProperty.call(entry.environment, key), false);
   }
   assert.deepEqual(document.mcp["unrelated-server"].environment, { AIWORKHUB_REPO_ROOT: "/should/not/be/touched" });
+});
+
+test("repairOpencodeConfigJsonObject reports reenabled only when flipping a disabled entry", () => {
+  const flipped = repairOpencodeConfigJsonObject(
+    { mcp: { awh: { type: "local", command: ["python3", "/launcher.py"], enabled: false, environment: {} } } },
+    ["python3", "/launcher.py"],
+  );
+  assert.equal(flipped.document.mcp.awh.enabled, true);
+  assert.equal(flipped.reenabled, true);
+  assert.equal(flipped.changed, true);
+  const steady = repairOpencodeConfigJsonObject(flipped.document, ["python3", "/launcher.py"]);
+  assert.equal(steady.reenabled, false);
+  assert.equal(steady.changed, false);
 });
 
 test("repairOpencodeConfigJsonObject repairs every AIWorkHub-owned entry, not just the first", () => {
@@ -193,6 +207,31 @@ test("repairOpencodeConfigJsonObject keeps an existing aiworkhub entry while add
   assert.deepEqual(Object.keys(document.mcp).sort(), ["aiworkhub", "awh"]);
   assert.deepEqual(document.mcp.aiworkhub, legacy);
   assert.deepEqual(document.mcp.awh.command, ["python3", "/new/launcher.py"]);
+});
+
+test("stableMcpLauncherLayoutOk accepts a live layout and rejects a Temp fallback", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "aiworkhub-layout-test-"));
+  try {
+    const liveBin = path.join(dir, "live", "bin", "aiworkhub-mcp-server.py");
+    fs.mkdirSync(path.dirname(liveBin), { recursive: true });
+    fs.writeFileSync(liveBin, "# launcher", "utf8");
+    const runtimeDir = path.join(dir, "live", "runtime", "gen", "runtime");
+    fs.mkdirSync(path.join(runtimeDir, "aiworkhub"), { recursive: true });
+    fs.writeFileSync(path.join(runtimeDir, "aiworkhub", "server.py"), "# server", "utf8");
+    fs.writeFileSync(
+      path.join(dir, "live", "runtime", "current.json"),
+      JSON.stringify({ runtime_dir: runtimeDir }),
+      "utf8",
+    );
+    assert.equal(stableMcpLauncherLayoutOk(liveBin), true);
+    const deadBin = path.join(dir, "dead", "bin", "aiworkhub-mcp-server.py");
+    fs.mkdirSync(path.dirname(deadBin), { recursive: true });
+    fs.writeFileSync(deadBin, "# launcher", "utf8");
+    assert.equal(stableMcpLauncherLayoutOk(deadBin), false, "a Temp layout without runtime/current.json must fail");
+    assert.equal(stableMcpLauncherLayoutOk(path.join(dir, "missing", "launcher.py")), false);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("repairOpencodeConfigJsonObject is idempotent once repaired", () => {

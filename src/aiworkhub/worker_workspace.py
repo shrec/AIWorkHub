@@ -4080,7 +4080,13 @@ def configured_runtime_root(repo: Path | None = None) -> Path:
 
 
 def configured_worktree_root(repo: Path | None = None) -> Path:
-    """Return the single configured root for isolated worker workspaces."""
+    """Return the single configured root for isolated worker workspaces.
+
+    Windows defaults to a repository-namespaced directory beneath the current
+    user's real temporary root.  That boundary is reachable by AppContainer
+    workers without requiring WRITE_DAC on a repository volume's ancestors.
+    Explicit worktree and runtime overrides retain their existing precedence.
+    """
     authorized_scratch = _nested_landlock_exec_scratch_for_repo(repo)
     override = os.environ.get(WORKTREE_ROOT_ENV, "").strip()
     if override:
@@ -4090,19 +4096,39 @@ def configured_worktree_root(repo: Path | None = None) -> Path:
         ):
             return resolved
         return (authorized_scratch / "nested-worktrees").resolve()
-    if repo is None and not os.environ.get(RUNTIME_ROOT_ENV, "").strip():
+
+    runtime_override = os.environ.get(RUNTIME_ROOT_ENV, "").strip()
+    selected_repo = Path(repo).resolve() if repo is not None else None
+    if selected_repo is None and not runtime_override:
         env_repo = (
             os.environ.get("AIWORKHUB_REPO_ROOT", "").strip()
             or os.environ.get("AIWORKHUB_REPO", "").strip()
         )
-        if not env_repo and not (Path.cwd() / ".aiworkhub" / "project.json").is_file():
-            fallback = (Path(tempfile.gettempdir()) / "aiworkhub-worktrees").resolve()
-            if authorized_scratch is None or _path_is_relative_to(
-                fallback, authorized_scratch
-            ):
-                return fallback
-            return (authorized_scratch / "nested-worktrees").resolve()
-    default = (configured_runtime_root(repo) / "worktrees").resolve()
+        if env_repo:
+            selected_repo = Path(env_repo).expanduser().resolve()
+        else:
+            candidate = Path.cwd().resolve()
+            if (candidate / ".aiworkhub" / "project.json").is_file():
+                selected_repo = candidate
+            else:
+                fallback = (
+                    Path(tempfile.gettempdir()) / "aiworkhub-worktrees"
+                ).resolve()
+                if authorized_scratch is None or _path_is_relative_to(
+                    fallback, authorized_scratch
+                ):
+                    return fallback
+                return (authorized_scratch / "nested-worktrees").resolve()
+
+    if os.name == "nt" and not runtime_override and selected_repo is not None:
+        namespace = hashlib.sha256(
+            os.path.normcase(str(selected_repo)).encode("utf-8")
+        ).hexdigest()[:16]
+        default = (
+            Path(tempfile.gettempdir()) / "aiworkhub-worktrees" / namespace
+        ).resolve()
+    else:
+        default = (configured_runtime_root(repo) / "worktrees").resolve()
     if authorized_scratch is None or _path_is_relative_to(default, authorized_scratch):
         return default
     return (authorized_scratch / "nested-worktrees").resolve()
@@ -6128,10 +6154,14 @@ def finalization_preflight_probe_nonblocking(
     now = time.monotonic()
     with _FINALIZATION_PROBE_LOCK:
         cached = _FINALIZATION_PROBE_CACHE.get(key)
-        if cached and now - cached[0] <= cache_seconds:
+        if cached and cache_seconds > 0 and now - cached[0] <= cache_seconds:
             return {**cached[1], "cache_hit": True, "background": True}
         failed = _FINALIZATION_PROBE_FAILURES.get(key)
-        if failed and now - failed[0] <= failure_cache_seconds:
+        if (
+            failed
+            and failure_cache_seconds > 0
+            and now - failed[0] <= failure_cache_seconds
+        ):
             return {**failed[1], "cache_hit": True, "background": True}
         active = _FINALIZATION_PROBE_ACTIVE.get(key)
         if active and active[1].is_alive():
@@ -7155,6 +7185,98 @@ def _verify_owner_private_directory(path: Path, label: str) -> Path:
     return path.resolve(strict=True)
 
 
+_TREE_SITTER_CACHE_ROOT_ENV = "TREE_SITTER_LANGUAGE_PACK_CACHE_DIR"
+_TREE_SITTER_CACHE_DIRECTORY = "tree-sitter-language-pack"
+_TREE_SITTER_GRAMMAR_SUFFIXES = frozenset({".dll", ".so", ".dylib"})
+_TREE_SITTER_REQUIRED_GRAMMARS = frozenset({"javascript", "typescript"})
+
+
+def _trusted_tree_sitter_cache_root() -> Path | None:
+    """Return a bounded, parser-complete cache root without exposing HOME.
+
+    tree-sitter-language-pack derives its cache from USERPROFILE on Windows.
+    Validation deliberately replaces that profile, so an already installed
+    grammar otherwise becomes a network download attempt and the Source Graph
+    silently falls back to positionless lexical extraction. The package's own
+    cache-root variable is narrower than restoring any user profile variable.
+    Only a real, parser-complete cache is forwarded.
+    """
+
+    candidates: list[Path] = []
+    explicit = os.environ.get(_TREE_SITTER_CACHE_ROOT_ENV, "").strip()
+    if explicit:
+        candidates.append(Path(explicit))
+    if os.name == "nt":
+        local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
+        if local_app_data and local_app_data != explicit:
+            candidates.append(Path(local_app_data))
+
+    reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+
+    def _real_directory(path: Path) -> bool:
+        try:
+            info = os.lstat(path)
+        except OSError:
+            return False
+        return stat.S_ISDIR(info.st_mode) and not (
+            getattr(info, "st_file_attributes", 0) & reparse
+        )
+
+    for candidate in candidates[:2]:
+        if not _real_directory(candidate):
+            continue
+        pack = candidate / _TREE_SITTER_CACHE_DIRECTORY
+        if not _real_directory(pack):
+            continue
+        grammars: set[str] = set()
+        try:
+            with os.scandir(pack) as versions:
+                for version_index, version in enumerate(versions):
+                    if version_index >= 32:
+                        grammars.clear()
+                        break
+                    try:
+                        version_info = version.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    if not stat.S_ISDIR(version_info.st_mode) or (
+                        getattr(version_info, "st_file_attributes", 0) & reparse
+                    ):
+                        continue
+                    libs = Path(version.path) / "libs"
+                    if not _real_directory(libs):
+                        continue
+                    with os.scandir(libs) as libraries:
+                        for library_index, library in enumerate(libraries):
+                            if library_index >= 128:
+                                grammars.clear()
+                                break
+                            try:
+                                library_info = library.stat(follow_symlinks=False)
+                            except OSError:
+                                continue
+                            if (
+                                not stat.S_ISREG(library_info.st_mode)
+                                or getattr(library_info, "st_file_attributes", 0)
+                                & reparse
+                                or library_info.st_size <= 0
+                                or Path(library.name).suffix.casefold()
+                                not in _TREE_SITTER_GRAMMAR_SUFFIXES
+                            ):
+                                continue
+                            lowered = library.name.casefold()
+                            grammars.update(
+                                grammar
+                                for grammar in _TREE_SITTER_REQUIRED_GRAMMARS
+                                if grammar in lowered
+                            )
+                    if _TREE_SITTER_REQUIRED_GRAMMARS <= grammars:
+                        return candidate.resolve(strict=True)
+        except OSError:
+            continue
+    return None
+
+
 def sanitized_env(
     adapter_id: str,
     *,
@@ -7229,6 +7351,10 @@ def sanitized_env(
         # never the worktree-local path taskdb.py's own DEFAULT_DB fallback
         # would otherwise resolve to (see TASK_QUEUE_ISOLATED_RELATIVE doc).
         safe["BITNN_TASK_QUEUE_DB"] = str(selected_home / TASK_QUEUE_ISOLATED_RELATIVE)
+    if adapter_id == "validation":
+        tree_sitter_cache_root = _trusted_tree_sitter_cache_root()
+        if tree_sitter_cache_root is not None:
+            safe[_TREE_SITTER_CACHE_ROOT_ENV] = str(tree_sitter_cache_root)
     passthrough = {
         "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
         "http_proxy", "https_proxy", "all_proxy", "no_proxy",
@@ -7412,6 +7538,37 @@ def provision_validation_exec_scratch(workspace: WorkerWorkspace) -> Path:
     only ever creates one new 0700 subdirectory it fully owns.
     """
     name = f"{_EXEC_SCRATCH_NAME_PREFIX}{workspace.request_id}"
+    windows_default_scratch = (
+        sys.platform == "win32"
+        and not os.environ.get(VALIDATION_EXEC_SCRATCH_ROOT_ENV, "").strip()
+    )
+    windows_short_leaf = name
+    windows_short_leaf_roots: set[Path] = set()
+    request_boundary: Path | None = None
+    if windows_default_scratch:
+        # NF-980: the legacy Windows default repeats the full request id
+        # under ``workspace.home`` and pushes nested private cwds past
+        # MAX_PATH. The short leaf is allowed only on the authenticated
+        # per-request directory that owns both ``home`` and ``worktree``.
+        # A bare home whose parent is a shared temp is not that boundary.
+        home = workspace.home
+        parent = home.parent
+        if (
+            home.name == "home"
+            and parent.name == workspace.request_id
+            and workspace.path.name == "worktree"
+            and workspace.path.parent == parent
+            and parent.parent != parent
+        ):
+            request_boundary = parent
+        request_id_tail = workspace.request_id[-12:]
+        if request_boundary is not None and len(request_id_tail) < len(workspace.request_id):
+            windows_short_leaf = f"vx_{request_id_tail}"
+            try:
+                windows_short_leaf_roots.add(request_boundary.resolve(strict=True))
+            except OSError:
+                request_boundary = None
+                windows_short_leaf = name
     tried: list[str] = []
     candidate_roots = list(_exec_scratch_candidate_roots())
     workspace_repo = getattr(workspace, "repo", None)
@@ -7435,16 +7592,13 @@ def provision_validation_exec_scratch(workspace: WorkerWorkspace) -> Path:
             candidate_roots.insert(0, repo_temp_validation)
         except (OSError, RuntimeError):
             repo_temp_validation = None
-    if (
-        sys.platform == "win32"
-        and not os.environ.get(VALIDATION_EXEC_SCRATCH_ROOT_ENV, "").strip()
-    ):
-        # The request-private HOME is already inside AIWorkHub's retained
-        # workspace boundary. Prefer it on Windows: unlike POSIX, Windows has
-        # no mount-level executable bit to gain from /dev/shm, and global
-        # TEMP may be denied by enterprise policy even when the repo-owned
-        # runtime is usable.
+    if windows_default_scratch:
+        # Prefer the request directory when it is authenticated, then home.
+        # Unlike POSIX, Windows has no mount-level executable bit to gain
+        # from a global temp, and that temp may be denied by policy.
         candidate_roots.insert(0, workspace.home)
+        if request_boundary is not None:
+            candidate_roots.insert(0, request_boundary)
     for raw_root in candidate_roots:
         root = raw_root.expanduser()
         try:
@@ -7455,7 +7609,13 @@ def provision_validation_exec_scratch(workspace: WorkerWorkspace) -> Path:
         if resolved_root.is_symlink() or not resolved_root.is_dir():
             tried.append(f"{root}:not_a_directory")
             continue
-        scratch_dir = resolved_root / name
+        leaf = (
+            windows_short_leaf
+            if windows_default_scratch
+            and resolved_root in windows_short_leaf_roots
+            else name
+        )
+        scratch_dir = resolved_root / leaf
         if scratch_dir.is_symlink():
             raise WorkspaceError(f"validation_exec_scratch_symlink_forbidden:{scratch_dir}")
         if scratch_dir.exists():
@@ -12595,6 +12755,148 @@ def _appcontainer_request_root(workspace: WorkerWorkspace) -> Path:
     return path
 
 
+# NF-2026-01009: node grew ``--experimental-test-isolation`` in v22.8.0 and
+# renamed it ``--test-isolation`` in v23.6.0.  Below 22.8 neither spelling
+# exists, and offering the wrong one makes node exit on a bad option -- a worse
+# failure than the hang this rewrite removes -- so those builds get no flag.
+_APPCONTAINER_NODE_EXPERIMENTAL_ISOLATION_RELEASE = (22, 8)
+_APPCONTAINER_NODE_STABLE_ISOLATION_RELEASE = (23, 6)
+_APPCONTAINER_NODE_PRESERVE_SYMLINK_FLAGS = (
+    "--preserve-symlinks",
+    "--preserve-symlinks-main",
+)
+_APPCONTAINER_NODE_ISOLATION_FLAGS = (
+    "--test-isolation",
+    "--experimental-test-isolation",
+)
+_APPCONTAINER_NODE_VERSION_PROBE_SECONDS = 10
+_APPCONTAINER_NODE_VERSION_CACHE_MAX_ENTRIES = 32
+_APPCONTAINER_NODE_VERSION_CACHE: dict[str, str] = {}
+_APPCONTAINER_NODE_VERSION_LOCK = threading.Lock()
+
+
+def _is_appcontainer_node_executable(executable: str) -> bool:
+    """A bare ``node``/``node.exe`` -- the argv[0] the node rewrite serves."""
+    return Path(executable).name.lower() in {"node", "node.exe"}
+
+
+def _appcontainer_node_isolation_flag(node_version: str) -> str:
+    """The ``=none`` isolation flag ``node_version`` accepts, else ``""``.
+
+    ``node_version`` is whatever the probe read (``v22.16.0``); anything that
+    does not parse as ``<major>.<minor>`` is an unknown version, which is the
+    same answer as too old: no flag.
+    """
+    release = re.match(r"v?(\d+)\.(\d+)", node_version.strip())
+    if release is None:
+        return ""
+    measured = (int(release.group(1)), int(release.group(2)))
+    if measured >= _APPCONTAINER_NODE_STABLE_ISOLATION_RELEASE:
+        return "--test-isolation=none"
+    if measured >= _APPCONTAINER_NODE_EXPERIMENTAL_ISOLATION_RELEASE:
+        return "--experimental-test-isolation=none"
+    return ""
+
+
+def _appcontainer_node_version(executable: str) -> str:
+    """``<node> --version``, once per resolved executable, failure-tolerant.
+
+    Which isolation flag exists is a property of the installed node build, so
+    the rewrite has to ask.  ``--version`` on a host-installed binary runs no
+    candidate code, needs no shell and no repository cwd, so one bounded call
+    is the honest reading -- and the answer is only ever an improvement, so
+    every failure returns the empty fact, which
+    :func:`_appcontainer_node_validation_argv` reads as "leave isolation
+    alone".
+
+    A failed probe is cached exactly like a successful one: a card may declare
+    several node commands, and re-running a probe that already timed out would
+    spend ``_APPCONTAINER_NODE_VERSION_PROBE_SECONDS`` again per command.
+    """
+    try:
+        resolved = str(Path(executable).resolve(strict=True))
+    except OSError:
+        return ""
+    key = os.path.normcase(resolved)
+    with _APPCONTAINER_NODE_VERSION_LOCK:
+        cached = _APPCONTAINER_NODE_VERSION_CACHE.get(key)
+    if cached is not None:
+        return cached
+    version = ""
+    try:
+        probe = subprocess.run(
+            [resolved, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=_APPCONTAINER_NODE_VERSION_PROBE_SECONDS,
+            check=False,
+            shell=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        version = ""
+    else:
+        reported = (probe.stdout or "").strip().splitlines()
+        if probe.returncode == 0 and reported:
+            version = reported[0].strip()[:64]
+    with _APPCONTAINER_NODE_VERSION_LOCK:
+        while (
+            len(_APPCONTAINER_NODE_VERSION_CACHE)
+            >= _APPCONTAINER_NODE_VERSION_CACHE_MAX_ENTRIES
+        ):
+            _APPCONTAINER_NODE_VERSION_CACHE.pop(
+                next(iter(_APPCONTAINER_NODE_VERSION_CACHE))
+            )
+        _APPCONTAINER_NODE_VERSION_CACHE[key] = version
+    return version
+
+
+def _appcontainer_node_validation_argv(
+    argv: Iterable[str], node_version: str
+) -> list[str]:
+    r"""The argv a node validation can actually pass inside the AppContainer.
+
+    NF-2026-01009, both halves measured through ``launch_appcontainer`` with no
+    capability SIDs:
+
+    * node's ESM/CJS resolver calls ``realpathSync`` on its entry point, which
+      ``lstat``s every ancestor and fails ``EPERM lstat 'C:\Users'`` because the
+      Windows worktree root lives under ``%TEMP%``.  ``--preserve-symlinks``
+      and ``--preserve-symlinks-main`` skip that walk, so both go in for every
+      node command, not just ``--test``.
+    * ``node --test`` defaults to one child process per file with piped stdio,
+      and libuv's ``uv__pipe_server`` reads ``ERROR_ACCESS_DENIED`` from
+      ``CreateNamedPipe(\\.\pipe\uv\...)`` as a name collision it retries
+      forever: 100% CPU until the validation timeout.  In-process isolation
+      spawns no child, and measured 50/50 in 0.2 s on v22.16.0.
+
+    Pure, so the whole rewrite is provable off Windows.  Every insertion is
+    idempotent, an explicit isolation flag on the declared command wins (a card
+    that asked for child isolation keeps it, hang included), and an argv that
+    is not a node argv comes back unchanged.
+    """
+    rewritten = [str(part) for part in argv]
+    if not rewritten or not _is_appcontainer_node_executable(rewritten[0]):
+        return rewritten
+    for flag in reversed(_APPCONTAINER_NODE_PRESERVE_SYMLINK_FLAGS):
+        if flag not in rewritten[1:]:
+            rewritten.insert(1, flag)
+    if "--test" not in rewritten[1:]:
+        return rewritten
+    if any(
+        part == flag or part.startswith(f"{flag}=")
+        for part in rewritten[1:]
+        for flag in _APPCONTAINER_NODE_ISOLATION_FLAGS
+    ):
+        return rewritten
+    isolation = _appcontainer_node_isolation_flag(node_version)
+    if isolation:
+        # Directly after ``--test``, the form measured working on v22.16.0 --
+        # and never appended, where node would read it as one more test file
+        # pattern rather than an option.
+        rewritten.insert(rewritten.index("--test", 1) + 1, isolation)
+    return rewritten
+
+
 def _run_appcontainer_validation(
     argv: list[str],
     *,
@@ -12645,6 +12947,7 @@ def _run_appcontainer_validation(
 
     repo_id = inspect_repository(workspace.repo).manifest.repo_id
     executable = str(argv[0]) if argv else ""
+    effective_argv = list(argv)
     request_root = _appcontainer_request_root(workspace)
     if is_python_executable(executable):
         # NF-40: first on PYTHONPATH, ahead of every candidate component, so
@@ -12657,6 +12960,16 @@ def _run_appcontainer_validation(
             ),
             APPCONTAINER_ANCESTORS_ENV: ancestor_stat_facts(str(request_root)),
         }
+    if _is_appcontainer_node_executable(executable):
+        # NF-2026-01009: the node counterpart of the Python adaptation above.
+        # This one rewrites argv rather than env, because what a node
+        # validation needs inside the container is different flags, not a shim
+        # on the import path.  The version probe is the only host call this
+        # adds, and every other command still reaches launch_appcontainer with
+        # the argv the card declared, byte for byte.
+        effective_argv = _appcontainer_node_validation_argv(
+            effective_argv, _appcontainer_node_version(executable)
+        )
     # NF-2026-00025: the request's directories, read-only (never the cd subdir
     # a candidate could have made a junction), as on every other backend; HOME
     # and temp modify; all revoked.  HOME and temp come first: the protected
@@ -12664,15 +12977,25 @@ def _run_appcontainer_validation(
     # the read-only root below also walks HOME.  NF-2026-00034: plus, read-only
     # and persistent (shared install roots), the interpreter a ``python -m
     # ...`` command runs and its import roots.
+    request_root_key = os.path.normcase(os.path.normpath(request_root))
     request_grants = [
-        *request_scoped_grants(env),
+        *(
+            grant
+            for grant in request_scoped_grants(env)
+            if not (
+                grant.access == "traverse"
+                and os.path.normcase(os.path.normpath(grant.path)) == request_root_key
+            )
+        ),
         ContainerGrant(str(request_root), "read_execute"),
     ]
     try:
         request_grants += python_read_grants(
             executable,
             str(env.get("PYTHONPATH") or ""),
-            covered=[grant.path for grant in request_grants],
+            covered=[
+                grant.path for grant in request_grants if grant.access != "traverse"
+            ],
         )
     except AppContainerError as exc:
         raise OSError(f"windows_appcontainer_validation_launch_failed:{exc}") from exc
@@ -12702,7 +13025,7 @@ def _run_appcontainer_validation(
         try:
             launch = launch_appcontainer(
                 AppContainerRequest(
-                    argv=list(argv),
+                    argv=list(effective_argv),
                     repo_id=repo_id,
                     worker_kind=appcontainer_worker_kind(adapter_id),
                     working_directory=str(cwd),
@@ -12756,7 +13079,7 @@ def _run_appcontainer_validation(
             partial_stderr = captured["stderr"].decode("utf-8", errors="replace")
             if outcome.state is AppContainerLifecycleState.TIMEOUT:
                 raise subprocess.TimeoutExpired(
-                    list(argv),
+                    list(effective_argv),
                     timeout_seconds,
                     output=partial_stdout,
                     stderr=partial_stderr,
@@ -12769,7 +13092,7 @@ def _run_appcontainer_validation(
         for thread in drains:
             thread.join(_APPCONTAINER_DRAIN_JOIN_SECONDS)
         return subprocess.CompletedProcess(
-            list(argv),
+            list(effective_argv),
             outcome.exit_code if outcome.exit_code is not None else 1,
             captured["stdout"].decode("utf-8", errors="replace"),
             captured["stderr"].decode("utf-8", errors="replace"),

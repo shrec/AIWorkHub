@@ -333,14 +333,21 @@ const elements = {
   managerChatSummary: document.querySelector("#manager-chat-summary"),
   managerChatBackendSelect: document.querySelector("#manager-chat-backend"),
   managerChatModelInput: document.querySelector("#manager-chat-model"),
-  managerChatStart: document.querySelector("#manager-chat-start"),
+  managerChatReasoningSelect: document.querySelector("#manager-chat-reasoning"),
   managerChatRotate: document.querySelector("#manager-chat-rotate"),
   managerChatClose: document.querySelector("#manager-chat-close"),
   managerChatStatus: document.querySelector("#manager-chat-status"),
   managerChatStatusLabel: document.querySelector("#manager-chat-status-label"),
   managerChatSessionLine: document.querySelector("#manager-chat-session-line"),
+  managerChatSessionSelect: document.querySelector("#manager-chat-session"),
+  managerChatRenameSession: document.querySelector("#manager-chat-rename-session"),
+  managerChatDeleteSession: document.querySelector("#manager-chat-delete-session"),
+  managerChatNewSession: document.querySelector("#manager-chat-new-session"),
   managerChatSessionId: document.querySelector("#manager-chat-session-id"),
   managerChatSessionBackend: document.querySelector("#manager-chat-session-backend"),
+  managerChatTasksHead: document.querySelector("#manager-chat-tasks-head"),
+  managerChatTasksList: document.querySelector("#manager-chat-tasks-list"),
+  managerChatTaskFilter: document.querySelector("#manager-chat-task-filter"),
   managerChatTranscript: document.querySelector("#manager-chat-transcript"),
   managerChatNotice: document.querySelector("#manager-chat-notice"),
   managerChatComposer: document.querySelector("#manager-chat-composer"),
@@ -824,7 +831,10 @@ function renderManagerIdentity(snapshot) {
   }
   const role = String(identity.role || "unknown");
   const route = identity.manager_route && typeof identity.manager_route === "object" ? identity.manager_route : {};
-  const isManager = role === "manager" && Boolean(route.session_id || route.thread_id);
+  const chat = route.manager_chat && typeof route.manager_chat === "object" ? route.manager_chat : null;
+  const chatSession = String((chat && chat.session_id) || "");
+  const chatActive = /^mls-[0-9a-f]{32}$/i.test(chatSession);
+  const isManager = role === "manager" && Boolean(chatActive || route.session_id || route.thread_id);
   const delivery = snapshot && typeof snapshot.callback_delivery === "object" ? snapshot.callback_delivery : {};
   const managerInboxReady = delivery.status === "manager_inbox" && delivery.healthy === true;
   const dispatcherReady = (
@@ -835,13 +845,15 @@ function renderManagerIdentity(snapshot) {
     && Boolean(delivery.repo_id)
     && delivery.repo_id === delivery.dispatcher_repo_id
   );
-  const callbackReady = managerInboxReady || dispatcherReady;
+  const callbackReady = chatActive || managerInboxReady || dispatcherReady;
   const target = snapshot && snapshot.manager_identity_target && typeof snapshot.manager_identity_target === "object"
     ? snapshot.manager_identity_target
     : {};
-  const routeState = String(target.capability_state || route.route_state || "unknown").toLowerCase();
-  const routeReason = String(target.reason || "");
-  const routeReady = ["available", "ready"].includes(routeState);
+  const routeState = chatActive
+    ? "ready"
+    : String(target.capability_state || route.route_state || "unknown").toLowerCase();
+  const routeReason = chatActive ? "" : String(target.reason || "");
+  const routeReady = chatActive || ["available", "ready"].includes(routeState);
   const fullyReady = isManager && routeReady && callbackReady;
   elements.identityAlert.hidden = false;
   elements.identityAlert.classList.toggle("identity-ok", fullyReady);
@@ -851,16 +863,33 @@ function renderManagerIdentity(snapshot) {
   setIdentityCheck(elements.identityRouteCheck, routeReady, "Route");
   setIdentityCheck(elements.identityCallbackCheck, callbackReady, "Callback");
   elements.identityRoleBadge.textContent = `role: ${role}`;
-  elements.identityProviderBadge.textContent = `provider: ${String(identity.provider || "unknown")}`;
+  const providerLabel = chatActive
+    ? String(chat.backend_id || identity.provider || "manager_chat")
+    : String(identity.provider || "unknown");
+  elements.identityProviderBadge.textContent = `provider: ${providerLabel}`;
   const deliveryProblems = Array.isArray(delivery.problems) ? delivery.problems.filter(Boolean) : [];
-  elements.identityWindowId.textContent = String(route.window_id || "Not available");
-  elements.identityThreadId.textContent = String(route.thread_id || "Not available");
-  elements.identitySessionId.textContent = String(route.session_id || "Not available");
+  setIdentityDetailLabel(elements.identityWindowId, chatActive ? "Session" : "Window ID");
+  setIdentityDetailLabel(elements.identityThreadId, chatActive ? "Model" : "Thread ID");
+  setIdentityDetailLabel(elements.identitySessionId, chatActive ? "Backend" : "Session ID");
+  elements.identityWindowId.textContent = chatActive
+    ? chatSession
+    : String(route.window_id || "Not available");
+  elements.identityThreadId.textContent = chatActive
+    ? String(chat.model || "Not available")
+    : String(route.thread_id || "Not available");
+  elements.identitySessionId.textContent = chatActive
+    ? String(chat.backend_id || "manager_chat")
+    : String(route.session_id || "Not available");
   elements.identityRouteState.textContent = routeState;
-  elements.identityCallbackState.textContent = String(delivery.status || "unknown");
+  elements.identityCallbackState.textContent = chatActive ? "manager_chat" : String(delivery.status || "unknown");
   elements.identityRepoId.textContent = String(delivery.repo_id || identity.repo_id || "Not available");
-  const diagnostics = [identity.reason, routeReason, ...deliveryProblems].filter(Boolean);
+  const diagnostics = [identity.reason, routeReason, ...deliveryProblems].filter((item) => item && !(chatActive && item === "codex_thread_id_not_observed"));
   elements.identityDiagnostics.textContent = diagnostics.length ? diagnostics.join(" · ") : "none";
+}
+
+function setIdentityDetailLabel(valueNode, label) {
+  const term = valueNode && valueNode.previousElementSibling;
+  if (term) term.textContent = label;
 }
 
 // ── wave-mini-roadmap-helpers-begin ─────────────────────────────────────────
@@ -3734,6 +3763,7 @@ function renderSnapshot(snapshot) {
   }
   renderFilterOptions();
   renderTaskTable();
+  if (typeof renderManagerChatTaskBoard === "function") renderManagerChatTaskBoard();
   renderStats(elements.topicStats, snapshot.summaries && snapshot.summaries.topics);
   renderStats(elements.runnerStats, snapshot.summaries && snapshot.summaries.runners);
   renderKpis(snapshot);
@@ -5092,8 +5122,10 @@ function renderSettingsPlaceholder(message, className = "panel-state settings-st
   elements.settingsList.replaceChildren(fragment);
 }
 
-function setSettingsPending(identity, pending) {
+function setSettingsPending(identity, pending, revision, kind) {
   state.settingsPendingIdentity = pending ? identity : null;
+  state.settingsPendingRevision = pending ? Number(revision || 0) : 0;
+  state.settingsPendingKind = pending ? String(kind || "") : "";
   elements.settingsList.setAttribute("aria-busy", String(Boolean(pending)));
 }
 
@@ -5219,6 +5251,23 @@ function routeTruthSummary(route) {
 }
 
 function renderSettings(payload, options = {}) {
+  const policyRevision = (value) => {
+    const policy = value && value.model_policy;
+    if (!policy || policy.ok === false) return 0;
+    return Number(policy.revision || 0);
+  };
+  const incomingRevision = policyRevision(payload);
+  const shownRevision = policyRevision(state.featureSettings);
+  // A late settings snapshot must not repaint toggles the owner already moved.
+  if (shownRevision && incomingRevision && incomingRevision < shownRevision) return;
+  if (
+    state.settingsPendingKind === "model"
+    && state.settingsPendingIdentity
+    && incomingRevision
+    && incomingRevision <= Number(state.settingsPendingRevision || 0)
+  ) {
+    return;
+  }
   const preservePending = Boolean(options.preservePending && state.settingsPendingIdentity);
   const activeControl = elements.settingsList.contains(document.activeElement)
     ? document.activeElement
@@ -6935,15 +6984,16 @@ function managerChatEventNode(event) {
   }
   if (type === "tool_call" || type === "tool_result") {
     const name = String(payload.name || payload.tool || "tool");
+    const hint = managerChatToolHint(payload);
+    const row = createElement("details", "manager-chat-tool-row " + (type === "tool_result" ? "is-result" : "is-call"));
+    row.open = type === "tool_call";
+    const summary = type === "tool_result" ? name + " result" : name;
+    row.appendChild(createElement("summary", "", hint ? summary + " · " + hint : summary));
+    const body = createElement("div", "manager-chat-tool-row-body");
     const rest = Object.assign({}, payload);
     delete rest.name;
     delete rest.tool;
-    const row = createElement("details", "manager-chat-tool-row");
-    row.appendChild(createElement("summary", "", `${type === "tool_call" ? "Tool call" : "Tool result"}: ${name}`));
-    // Model/tool payloads are untrusted and must stay literal, but they must
-    // not be clipped: the transcript scrolls instead of truncating.
-    const body = createElement("div", "manager-chat-tool-row-body");
-    body.appendChild(document.createTextNode(JSON.stringify(rest)));
+    appendManagerChatToolFields(body, rest, 0);
     row.appendChild(body);
     return row;
   }
@@ -6963,8 +7013,9 @@ function managerChatEventNode(event) {
     return createElement("div", "manager-chat-marker", `Session closed${payload.reason ? `: ${limitText(payload.reason, 120)}` : ""}`);
   }
   if (type === "reasoning") {
-    const row = createElement("details", "manager-chat-tool-row");
-    row.appendChild(createElement("summary", "", "Model reasoning"));
+    const row = createElement("details", "manager-chat-thinking-block");
+    row.open = true;
+    row.appendChild(createElement("summary", "", managerChatThoughtSummary(event)));
     const body = createElement("div", "manager-chat-tool-row-body");
     body.appendChild(document.createTextNode(String(payload.text || "")));
     row.appendChild(body);
@@ -6974,6 +7025,82 @@ function managerChatEventNode(event) {
     return managerChatTurnEndNode(payload, event);
   }
   return null;
+}
+
+function managerChatFormatDuration(ms) {
+  const seconds = Math.max(0, Math.round(Number(ms) / 1000));
+  if (seconds < 60) return seconds + "s";
+  return Math.floor(seconds / 60) + "m " + (seconds % 60) + "s";
+}
+
+function managerChatEventTime(event) {
+  const parsed = Date.parse(event && event.at || "");
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function managerChatThoughtSummary(event) {
+  const events = Array.isArray(state.managerChatEvents) ? state.managerChatEvents : [];
+  const start = managerChatEventTime(event);
+  let end = 0;
+  const index = events.indexOf(event);
+  if (index >= 0) {
+    for (let cursor = index + 1; cursor < events.length; cursor += 1) {
+      if (events[cursor] && events[cursor].type !== "reasoning") {
+        end = managerChatEventTime(events[cursor]);
+        break;
+      }
+    }
+  }
+  if (start && end >= start && end) return "Thought for " + managerChatFormatDuration(end - start);
+  if (state.managerChatRunning && start) return "Thinking · " + managerChatFormatDuration(Date.now() - start);
+  if (state.managerChatLastThoughtMs) return "Thought for " + managerChatFormatDuration(state.managerChatLastThoughtMs);
+  return state.managerChatRunning ? "Thinking" : "Thought";
+}
+
+function managerChatToolHint(payload) {
+  const input = payload && payload.input && typeof payload.input === "object" ? payload.input : {};
+  const candidates = [input.path, input.file_path, input.file, input.command, input.cmd, input.query, input.url, input.pattern, payload.path, payload.command];
+  for (const item of candidates) {
+    if (typeof item === "string" && item.trim()) return item.trim();
+  }
+  return "";
+}
+
+function appendManagerChatToolFields(parent, value, depth) {
+  if (!parent || depth > 4) return;
+  if (value == null || typeof value !== "object") {
+    const text = createElement("div", "manager-chat-tool-value");
+    text.appendChild(document.createTextNode(value == null ? "" : String(value)));
+    parent.appendChild(text);
+    return;
+  }
+  const entries = Array.isArray(value) ? value.map((item, index) => [String(index), item]) : Object.keys(value).map((key) => [key, value[key]]);
+  for (const pair of entries) {
+    const field = createElement("div", "manager-chat-tool-field");
+    field.appendChild(createElement("span", "manager-chat-tool-label", pair[0]));
+    if (pair[1] && typeof pair[1] === "object") appendManagerChatToolFields(field, pair[1], depth + 1);
+    else {
+      const text = createElement("div", "manager-chat-tool-value");
+      text.appendChild(document.createTextNode(pair[1] == null ? "" : String(pair[1])));
+      field.appendChild(text);
+    }
+    parent.appendChild(field);
+  }
+}
+
+function managerChatLiveThinkingNode() {
+  const elapsed = state.managerChatThinkingSince ? Date.now() - state.managerChatThinkingSince : 0;
+  const row = createElement("div", "manager-chat-thinking is-live");
+  const dots = createElement("span", "manager-chat-thinking-dots");
+  dots.setAttribute("aria-hidden", "true");
+  dots.appendChild(createElement("span", ""));
+  dots.appendChild(createElement("span", ""));
+  dots.appendChild(createElement("span", ""));
+  row.appendChild(dots);
+  const label = createElement("span", "manager-chat-thinking-label", "Thinking · " + managerChatFormatDuration(elapsed));
+  label.id = "manager-chat-thinking-elapsed";
+  row.appendChild(label);
+  return row;
 }
 
 function managerChatTurnCallCount(turn) {
@@ -7006,6 +7133,115 @@ function managerChatTurnEndNode(payload, event) {
   return createElement("div", "manager-chat-marker", text);
 }
 
+function managerChatTaskStatus(task) {
+  return String((task && (task.status || task.worker_status)) || "unknown");
+}
+
+function managerChatTaskRank(status) {
+  const order = ["processing", "review", "review_ready", "blocked", "pending"];
+  const index = order.indexOf(status);
+  return index === -1 ? order.length : index;
+}
+
+const MANAGER_CHAT_TASK_CLOSED = new Set([
+  "accepted", "rejected", "superseded", "cancelled", "canceled", "done", "completed", "archived"
+]);
+const MANAGER_CHAT_TASK_LIMIT = 40;
+
+function managerChatTaskFilterValue() {
+  const select = elements.managerChatTaskFilter;
+  const value = select && select.value ? String(select.value) : "open";
+  return value || "open";
+}
+
+function managerChatTaskVisible(status, filter) {
+  if (filter === "all") return true;
+  if (filter === "review") return status === "review" || status === "review_ready";
+  if (filter === "open") return !MANAGER_CHAT_TASK_CLOSED.has(status);
+  return status === filter;
+}
+
+function managerChatTaskVerb(status) {
+  if (status === "pending") return "launch";
+  if (status === "review" || status === "review_ready") return "review";
+  if (status === "blocked") return "recover";
+  if (status === "processing") return "inspect";
+  return "drive";
+}
+
+function renderManagerChatTaskBoard() {
+  const list = elements.managerChatTasksList;
+  const head = elements.managerChatTasksHead;
+  if (!list) return;
+  const tasks = Array.isArray(state.tasks) ? state.tasks : [];
+  const filter = managerChatTaskFilterValue();
+  const counts = {};
+  for (const task of tasks) {
+    const status = managerChatTaskStatus(task);
+    counts[status] = (counts[status] || 0) + 1;
+  }
+  const matched = tasks.filter((task) => managerChatTaskVisible(managerChatTaskStatus(task), filter));
+  if (head) {
+    const review = (counts.review || 0) + (counts.review_ready || 0);
+    const extra = matched.length > MANAGER_CHAT_TASK_LIMIT ? " · showing " + MANAGER_CHAT_TASK_LIMIT + " of " + matched.length : "";
+    head.textContent = "Tasks · " + tasks.length + " · " + (counts.processing || 0) + " running · " + review + " review · " + (counts.pending || 0) + " pending" + extra;
+  }
+  const shown = matched
+    .slice()
+    .sort((left, right) => managerChatTaskRank(managerChatTaskStatus(left)) - managerChatTaskRank(managerChatTaskStatus(right)))
+    .slice(0, MANAGER_CHAT_TASK_LIMIT);
+  if (shown.length === 0) {
+    list.replaceChildren(createElement("div", "panel-list-empty compact", tasks.length === 0 ? "No canonical tasks yet" : "No tasks in this filter"));
+    return;
+  }
+  const fragment = document.createDocumentFragment();
+  for (const task of shown) {
+    const taskId = String(task.task_id || "");
+    if (!taskId) continue;
+    const status = managerChatTaskStatus(task);
+    const button = createElement("button", "manager-chat-task");
+    button.type = "button";
+    if (!button.dataset) button.dataset = {};
+    button.dataset.taskId = taskId;
+    button.setAttribute("data-task-id", taskId);
+    button.appendChild(createElement("span", "manager-chat-task-verb", managerChatTaskVerb(status)));
+    button.appendChild(document.createTextNode(" "));
+    button.appendChild(createElement("span", "manager-chat-task-status", status));
+    button.appendChild(document.createTextNode(" "));
+    button.appendChild(createElement("span", "manager-chat-task-id", taskId));
+    const title = String(task.title || task.objective || task.topic || "");
+    if (title) {
+      button.appendChild(document.createTextNode(" "));
+      button.appendChild(createElement("span", "manager-chat-task-title", title));
+    }
+    fragment.appendChild(button);
+  }
+  list.replaceChildren(fragment);
+}
+
+function driveManagerChatTask(taskId) {
+  const id = String(taskId || "").trim();
+  if (!id) return;
+  const tasks = Array.isArray(state.tasks) ? state.tasks : [];
+  const task = tasks.find((item) => String(item && item.task_id || "") === id);
+  const status = task ? managerChatTaskStatus(task) : "unknown";
+  const verb = managerChatTaskVerb(status);
+  const route = managerChatSelectedRoute();
+  const backendId = route.backendId;
+  const model = route.model;
+  if (!MANAGER_CHAT_BACKENDS.has(backendId) || !model) {
+    showManagerChatNotice("Choose a model. This saved session will drive the task.");
+    return;
+  }
+  vscode.postMessage({
+    type: "managerLoopSend",
+    text: verb + " canonical task " + id + " (" + status + ") from this manager session. Inspect it, then launch, review, or recover it. Do not open a second session.",
+    backendId,
+    model,
+    reasoning: String(elements.managerChatReasoningSelect && elements.managerChatReasoningSelect.value || ""),
+  });
+}
+
 function renderManagerChatEvents() {
   if (!elements.managerChatTranscript) return;
   const rows = [];
@@ -7034,9 +7270,15 @@ function renderManagerChatEvents() {
     if (node) rows.push(node);
   }
   flushPendingTurnEnd();
+  if (state.managerChatRunning) {
+    if (!state.managerChatThinkingSince) state.managerChatThinkingSince = Date.now();
+    rows.push(managerChatLiveThinkingNode());
+  } else if (state.managerChatLastThoughtMs && !state.managerChatEvents.some((item) => item && item.type === "reasoning")) {
+    rows.push(createElement("div", "manager-chat-thinking", "Thought for " + managerChatFormatDuration(state.managerChatLastThoughtMs)));
+  }
   if (rows.length === 0) {
     elements.managerChatTranscript.replaceChildren(
-      createElement("div", "panel-list-empty compact", state.managerChatSession ? "No events yet" : "Send a message to begin — no Start needed"),
+      createElement("div", "panel-list-empty compact", state.managerChatSession ? "No events yet" : "No open session"),
     );
     return;
   }
@@ -7067,28 +7309,59 @@ function applyManagerChatComposerState() {
   elements.managerChatSend.disabled = false;
 }
 
-function managerChatEnabledModels(backendId) {
+function managerChatCatalogWorkers() {
   const modelPolicy = state.featureSettings && state.featureSettings.model_policy && state.featureSettings.model_policy.ok === true
     ? state.featureSettings.model_policy
     : null;
-  const workers = modelPolicy && Array.isArray(modelPolicy.catalog?.workers) ? modelPolicy.catalog.workers : [];
+  return modelPolicy && Array.isArray(modelPolicy.catalog?.workers) ? modelPolicy.catalog.workers : [];
+}
+
+function managerChatEnabledModels(backendId) {
+  return managerChatAvailableModels().filter((entry) => !backendId || entry.backendId === backendId);
+}
+
+function managerChatAvailableModels() {
   const models = [];
   const seen = new Set();
-  for (const row of workers) {
-    if (!row || String(row.adapter || "") !== backendId || !row.effective_enabled) continue;
+  for (const row of managerChatCatalogWorkers()) {
+    const backendId = String(row && row.adapter || "");
+    if (!row || !MANAGER_CHAT_BACKENDS.has(backendId) || !row.effective_enabled) continue;
     const model = String(row.model || row.worker_id || "");
-    if (!model || seen.has(model)) continue;
-    seen.add(model);
-    models.push({ model, label: row.label ? String(row.label) : "" });
+    const key = backendId + "\0" + model;
+    if (!model || seen.has(key)) continue;
+    seen.add(key);
+    models.push({ model, backendId, label: row.label ? String(row.label) : model });
   }
   return models;
+}
+
+function managerChatSelectedOption(select) {
+  if (!select) return null;
+  const picked = select.selectedOptions;
+  if (picked && typeof picked.length === "number" && picked.length > 0 && picked[0]) return picked[0];
+  const options = select.options || select.children;
+  if (!options || typeof options.length !== "number") return null;
+  const value = String(select.value || "");
+  for (let index = 0; index < options.length; index += 1) {
+    const option = options[index];
+    if (option && option.value === value) return option;
+  }
+  return null;
+}
+
+function managerChatSelectedRoute() {
+  const modelSelect = elements.managerChatModelInput;
+  const selected = managerChatSelectedOption(modelSelect);
+  const fromOption = selected && selected.dataset ? String(selected.dataset.backendId || "") : "";
+  const model = String((selected && selected.value) || (modelSelect && modelSelect.value) || "").trim();
+  const backendId = fromOption || String(elements.managerChatBackendSelect && elements.managerChatBackendSelect.value || "");
+  return { backendId, model };
 }
 
 function populateManagerChatModelOptions() {
   const select = elements.managerChatModelInput;
   if (!select) return;
-  const backendId = elements.managerChatBackendSelect.value;
-  const models = managerChatEnabledModels(backendId);
+  const models = managerChatAvailableModels();
   if (models.length === 0) {
     const hint = createElement("option", "", "No enabled models — enable one in Settings");
     hint.value = "";
@@ -7096,18 +7369,22 @@ function populateManagerChatModelOptions() {
     select.replaceChildren(hint);
     select.value = "";
   } else {
-    const modelValues = models.map((entry) => entry.model);
-    const remembered = state.managerChatModelByBackend[backendId];
-    const initial = remembered && modelValues.includes(remembered) ? remembered : modelValues[0];
+    const current = String(select.value || "");
     const fragment = document.createDocumentFragment();
     for (const entry of models) {
       const option = createElement("option", "", entry.label || entry.model);
       option.value = entry.model;
+      if (!option.dataset) option.dataset = {};
+      option.dataset.backendId = entry.backendId;
       fragment.appendChild(option);
     }
     select.replaceChildren(fragment);
-    select.value = initial;
-    state.managerChatModelByBackend[backendId] = initial;
+    const stillThere = models.some((entry) => entry.model === current);
+    select.value = stillThere ? current : models[0].model;
+    const chosen = managerChatSelectedOption(select);
+    if (chosen && chosen.dataset && chosen.dataset.backendId && elements.managerChatBackendSelect) {
+      elements.managerChatBackendSelect.value = chosen.dataset.backendId;
+    }
   }
   applyManagerChatSessionUi();
 }
@@ -7134,34 +7411,59 @@ function syncManagerChatPickerToSession() {
   }
 }
 
+function managerChatLiveActivity() {
+  if (!state.managerChatRunning) return "";
+  const events = Array.isArray(state.managerChatEvents) ? state.managerChatEvents : [];
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    if (!event || event.type === "user_message" || event.type === "turn_end") continue;
+    const payload = event.payload && typeof event.payload === "object" ? event.payload : {};
+    if (event.type === "tool_call") return " · " + String(payload.name || "tool");
+    if (event.type === "tool_result") return " · " + String(payload.name || "tool") + " done";
+    if (event.type === "reasoning") return " · thinking";
+    if (event.type === "assistant_text") return " · writing";
+    if (event.type === "error") return " · error";
+  }
+  return " · waiting for stream";
+}
+
 function applyManagerChatSessionUi() {
   const hasSession = Boolean(state.managerChatSession);
-  // The picker stays live during a session: changing it and pressing Send
-  // rebinds that turn (same route is a no-op). Only Start is one-shot.
-  if (hasSession && state.managerChatBackend) {
-    syncManagerChatPickerToSession();
-  }
-  const hasModelChoice = managerChatEnabledModels(elements.managerChatBackendSelect.value).length > 0;
-  elements.managerChatStart.disabled = hasSession || !hasModelChoice;
+  // The provider and model combos are the owner's choice. A status refresh
+  // must not write them back to the session's last route, or a click in the
+  // dropdown is undone before it can stick.
+  const hasModelChoice = managerChatAvailableModels().length > 0;
   elements.managerChatBackendSelect.disabled = false;
   elements.managerChatModelInput.disabled = !hasModelChoice;
-  elements.managerChatRotate.disabled = !hasSession || state.managerChatRunning;
-  elements.managerChatClose.disabled = !hasSession || state.managerChatRunning;
+  if (elements.managerChatRotate) {
+    elements.managerChatRotate.disabled = !hasSession || state.managerChatRunning;
+  }
+  if (elements.managerChatNewSession) {
+    elements.managerChatNewSession.disabled = state.managerChatRunning;
+  }
+  if (elements.managerChatRenameSession) {
+    elements.managerChatRenameSession.disabled = !hasSession || state.managerChatRunning;
+  }
+  if (elements.managerChatDeleteSession) {
+    const selected = String(elements.managerChatSessionSelect && elements.managerChatSessionSelect.value || "");
+    elements.managerChatDeleteSession.disabled = state.managerChatRunning || (!hasSession && !selected);
+  }
   elements.managerChatStatus.classList.toggle("is-live", state.managerChatRunning);
-  elements.managerChatStatusLabel.textContent = state.managerChatRunning ? "Running" : hasSession ? "Idle" : "Not started";
-  elements.managerChatSessionLine.hidden = !hasSession;
-  elements.managerChatSessionId.textContent = hasSession ? state.managerChatSession : "";
+  elements.managerChatStatusLabel.textContent = state.managerChatRunning ? "Running" + managerChatLiveActivity() : hasSession ? "Idle" : "No session";
+  elements.managerChatSessionLine.hidden = false;
+  const activeName = String(state.managerChatTitle || state.managerChatSession || "");
+  elements.managerChatSessionId.textContent = hasSession ? activeName : "";
   elements.managerChatSessionBackend.textContent = hasSession
-    ? `${state.managerChatBackend || ""} / ${state.managerChatModel || ""}`
+    ? (state.managerChatBackend || "") + " / " + (state.managerChatModel || "")
     : "";
   elements.managerChatSummary.textContent = hasSession
-    ? `${state.managerChatRunning ? "Running" : "Idle"} · ${state.managerChatBackend || ""}`
-    : "No active session";
+    ? (state.managerChatRunning ? "Running" : "Active") + " · " + activeName
+    : "No session";
   if (elements.headerManagerChatValue) {
-    elements.headerManagerChatValue.textContent = state.managerChatRunning ? "Running" : hasSession ? "Idle" : "—";
+    elements.headerManagerChatValue.textContent = state.managerChatRunning ? "Running" : hasSession ? activeName : "—";
   }
   if (elements.headerManagerChatDetail) {
-    elements.headerManagerChatDetail.textContent = hasSession ? String(state.managerChatBackend || "") : "No session";
+    elements.headerManagerChatDetail.textContent = hasSession ? activeName : "No session";
   }
   applyManagerChatComposerState();
 }
@@ -7180,13 +7482,13 @@ function requestManagerChatEvents() {
 
 function scheduleManagerChatPoll() {
   stopManagerChatPolling();
+  const delay = state.managerChatRunning ? 400 : MANAGER_CHAT_POLL_MS;
   state.managerChatPollTimer = window.setTimeout(() => {
     state.managerChatPollTimer = null;
-    // Polling follows the session, not whether a dialog is open.
     if (state.managerChatSession) {
       requestManagerChatEvents();
     }
-  }, MANAGER_CHAT_POLL_MS);
+  }, delay);
 }
 
 function managerChatQueueText(item) {
@@ -7242,6 +7544,50 @@ function renderManagerChatSendQueue(payload) {
   host.replaceChildren(fragment);
 }
 
+function managerChatSessionLabel(row, activeId) {
+  const id = String(row.session_id || "");
+  const title = String(row.title || "").trim();
+  const short = title || (id.length > 16 ? id.slice(0, 12) + "…" : id);
+  const hint = String(row.model || "").trim();
+  const mark = id && id === activeId ? "● " : "";
+  return hint ? mark + short + " · " + hint : mark + short;
+}
+
+function renderManagerChatSessionPicker(payload) {
+  const select = elements.managerChatSessionSelect;
+  if (!select || typeof select.replaceChildren !== "function") return;
+  const sessions = asArray(payload && payload.sessions);
+  state.managerChatSessions = sessions;
+  const current = state.managerChatSession || "";
+  const fragment = document.createDocumentFragment();
+  let matched = false;
+  let saved = 0;
+  if (!current) {
+    const none = createElement("option", "", "No open session");
+    none.value = "";
+    fragment.appendChild(none);
+  }
+  for (const row of sessions) {
+    if (!row || typeof row !== "object" || Array.isArray(row)) continue;
+    const id = String(row.session_id || "");
+    if (!id) continue;
+    saved += 1;
+    const option = createElement("option", "", managerChatSessionLabel(row, current));
+    option.value = id;
+    if (id === current) matched = true;
+    fragment.appendChild(option);
+  }
+  if (saved === 0 && current) {
+    const empty = createElement("option", "", "No saved sessions");
+    empty.value = "";
+    fragment.appendChild(empty);
+  }
+  state.managerChatSessionPickerSync = true;
+  select.replaceChildren(fragment);
+  select.value = matched ? current : "";
+  state.managerChatSessionPickerSync = false;
+}
+
 function renderManagerChatStatus(payload) {
   if (!payload || payload.ok === false) {
     stopManagerChatPolling();
@@ -7254,8 +7600,10 @@ function renderManagerChatStatus(payload) {
   state.managerChatSession = nextSessionId;
   state.managerChatBackend = session ? String(session.backend_id || "") : null;
   state.managerChatModel = session ? String(session.model || "") : null;
+  state.managerChatTitle = session ? String(session.title || "").trim() : "";
   state.managerChatRunning = Boolean(payload.running);
   applyManagerChatSessionUi();
+  renderManagerChatSessionPicker(payload);
   // Latest successful status is authoritative: an empty or missing send_queue drains the list.
   renderManagerChatSendQueue(payload);
   if (!state.managerChatSession) {
@@ -7271,6 +7619,7 @@ function renderManagerChatStatus(payload) {
     renderManagerChatEvents();
   }
   requestManagerChatEvents();
+  scheduleManagerChatPoll();
 }
 
 function renderManagerChatEventsResponse(payload) {
@@ -7284,12 +7633,18 @@ function renderManagerChatEventsResponse(payload) {
       state.managerChatEvents = state.managerChatEvents.concat(events);
       state.managerChatLastSeq = events.reduce((max, event) => Math.max(max, numberValue(event.seq)), state.managerChatLastSeq);
       renderManagerChatEvents();
+      if (state.managerChatRunning) applyManagerChatSessionUi();
       // A finished turn still needs one status pull: running and send_queue
       // are authoritative only on status, and nothing else refreshes them
       // after a background turn ends. The composer stays enabled either way.
       // Failed turns carry `error` with no `turn_end`.
       if (state.managerChatRunning && events.some((event) => event && (event.type === "turn_end" || event.type === "error"))) {
+        if (state.managerChatThinkingSince) {
+          state.managerChatLastThoughtMs = Date.now() - state.managerChatThinkingSince;
+          state.managerChatThinkingSince = 0;
+        }
         state.managerChatRunning = false;
+        renderManagerChatEvents();
         applyManagerChatSessionUi();
         vscode.postMessage({ type: "managerLoopStatus" });
       }
@@ -7308,6 +7663,19 @@ function renderManagerChatAction(_action, payload) {
         : `Manager error: ${payload.error || "unknown"}`,
     );
     return;
+    return;
+  }
+  const sessionId = String(payload && payload.session_id || "");
+  if (/^mls-[0-9a-f]{32}$/i.test(sessionId)) {
+    if (state.managerChatSession !== sessionId) {
+      state.managerChatSession = sessionId;
+      state.managerChatEvents = [];
+      state.managerChatLastSeq = 0;
+    }
+    state.managerChatRunning = true;
+    applyManagerChatSessionUi();
+    requestManagerChatEvents();
+    scheduleManagerChatPoll();
   }
   showManagerChatNotice(null);
 }
@@ -7338,6 +7706,9 @@ window.addEventListener("message", (event) => {
       break;
     case "error":
       showToast(message.message || "Request failed");
+      if (state.settingsPendingIdentity && /model_setting/.test(String(message.message || ""))) {
+        setSettingsPending(null, false);
+      }
       break;
     case "repositoryInfo": {
       const repoEl = document.querySelector("#repo-label");
@@ -7864,63 +8235,103 @@ function startManagerChatSidebar() {
   if (!state.featureSettings) {
     vscode.postMessage({ type: "requestSettings" });
   }
-  if (!state.managerChatSession) {
-    vscode.postMessage({ type: "managerLoopEnsure" });
-  }
+  // Opening the chat does not attach a saved session and does not create one.
+  // Status fills the list. The owner continues one, or the first message on
+  // the selected model opens the first session.
+  state.managerChatSession = null;
+  state.managerChatEvents = [];
+  state.managerChatLastSeq = 0;
+  state.managerChatRunning = false;
+  renderManagerChatEvents();
+  applyManagerChatSessionUi();
   vscode.postMessage({ type: "managerLoopStatus" });
-  if (state.managerChatSession) scheduleManagerChatPoll();
+  renderManagerChatTaskBoard();
 }
 
 elements.headerManagerChat.addEventListener("click", openManagerChatDialog);
 if (elements.managerChatCollapse && typeof elements.managerChatCollapse.addEventListener === "function") {
   elements.managerChatCollapse.addEventListener("click", toggleManagerChatSidebar);
 }
-
 elements.managerChatBackendSelect.addEventListener("change", () => {
   populateManagerChatModelOptions();
 });
 
 elements.managerChatModelInput.addEventListener("change", () => {
-  const backendId = elements.managerChatBackendSelect.value;
-  const model = elements.managerChatModelInput.value;
-  if (model) state.managerChatModelByBackend[backendId] = model;
-});
-
-elements.managerChatStart.addEventListener("click", () => {
-  const backendId = elements.managerChatBackendSelect.value;
-  const model = String(elements.managerChatModelInput.value || "").trim();
-  if (!MANAGER_CHAT_BACKENDS.has(backendId) || !model) {
-    showManagerChatNotice("Choose a backend and enter a model before starting.");
-    return;
+  const route = managerChatSelectedRoute();
+  if (route.backendId && elements.managerChatBackendSelect) {
+    elements.managerChatBackendSelect.value = route.backendId;
   }
-  showManagerChatNotice(null);
-  vscode.postMessage({ type: "managerLoopStart", backendId, model });
+  if (route.model && route.backendId) state.managerChatModelByBackend[route.backendId] = route.model;
 });
 
-elements.managerChatRotate.addEventListener("click", () => {
-  const reason = String(window.prompt("Rotation reason", "") || "").trim();
-  if (!reason) return;
-  vscode.postMessage({ type: "managerLoopRotate", reason });
-});
+if (elements.managerChatSessionSelect && typeof elements.managerChatSessionSelect.addEventListener === "function") {
+  elements.managerChatSessionSelect.addEventListener("change", () => {
+    if (state.managerChatSessionPickerSync) return;
+    const sessionId = String(elements.managerChatSessionSelect.value || "");
+    if (!sessionId || sessionId === state.managerChatSession) return;
+    vscode.postMessage({ type: "managerLoopContinue", sessionId });
+  });
+}
 
-elements.managerChatClose.addEventListener("click", () => {
-  if (!window.confirm("Close the manager session?")) return;
-  vscode.postMessage({ type: "managerLoopClose" });
-});
+if (elements.managerChatRenameSession && typeof elements.managerChatRenameSession.addEventListener === "function") {
+  elements.managerChatRenameSession.addEventListener("click", () => {
+    if (elements.managerChatRenameSession.disabled || !state.managerChatSession) return;
+    const title = String(window.prompt("Session name", state.managerChatTitle || "") || "").trim();
+    if (!title) return;
+    vscode.postMessage({ type: "managerLoopRename", sessionId: state.managerChatSession, title });
+  });
+}
 
+if (elements.managerChatDeleteSession && typeof elements.managerChatDeleteSession.addEventListener === "function") {
+  elements.managerChatDeleteSession.addEventListener("click", () => {
+    const selected = String(elements.managerChatSessionSelect && elements.managerChatSessionSelect.value || "");
+    const sessionId = selected || state.managerChatSession || "";
+    if (!sessionId) return;
+    if (!window.confirm("Delete this session?")) return;
+    vscode.postMessage({ type: "managerLoopDelete", sessionId });
+  });
+}
+
+if (elements.managerChatNewSession && typeof elements.managerChatNewSession.addEventListener === "function") {
+  elements.managerChatNewSession.addEventListener("click", () => {
+    if (elements.managerChatNewSession.disabled) return;
+    vscode.postMessage({ type: "managerLoopNew" });
+  });
+}
+if (elements.managerChatTaskFilter && typeof elements.managerChatTaskFilter.addEventListener === "function") {
+  elements.managerChatTaskFilter.addEventListener("change", () => {
+    renderManagerChatTaskBoard();
+  });
+}
 elements.managerChatComposer.addEventListener("submit", (event) => {
   event.preventDefault();
   if (elements.managerChatSend.disabled) return;
   const text = String(elements.managerChatInput.value || "").trim();
+  const route = managerChatSelectedRoute();
+  const backendId = route.backendId;
+  const model = route.model;
   if (!text) return;
-  // The picker route travels with the turn; the server binds it (same route
-  // is a no-op, a switch re-opens with a mechanical handoff) or refuses it
-  // by name before anything spawns.
+  if (text === "/new") {
+    vscode.postMessage({ type: "managerLoopNew" });
+    elements.managerChatInput.value = "";
+    return;
+  }
+  const taskCommand = text.match(/^\/task\s+(\S+)$/);
+  if (taskCommand) {
+    driveManagerChatTask(taskCommand[1]);
+    elements.managerChatInput.value = "";
+    return;
+  }
+  if (!MANAGER_CHAT_BACKENDS.has(backendId) || !model) {
+    showManagerChatNotice("Choose a model. This session continues on that model.");
+    return;
+  }
   vscode.postMessage({
     type: "managerLoopSend",
     text,
-    backendId: String(elements.managerChatBackendSelect.value || ""),
-    model: String(elements.managerChatModelInput.value || "").trim(),
+    backendId,
+    model,
+    reasoning: String(elements.managerChatReasoningSelect && elements.managerChatReasoningSelect.value || ""),
   });
   elements.managerChatInput.value = "";
   // Optimistic Running label only. The composer stays enabled so the next
@@ -7928,6 +8339,15 @@ elements.managerChatComposer.addEventListener("submit", (event) => {
   state.managerChatRunning = true;
   applyManagerChatSessionUi();
 });
+
+if (elements.managerChatTasksList && typeof elements.managerChatTasksList.addEventListener === "function") {
+  elements.managerChatTasksList.addEventListener("click", (event) => {
+    const target = event.target;
+    const button = target && typeof target.closest === "function" ? target.closest("[data-task-id]") : target;
+    const taskId = button && button.dataset ? button.dataset.taskId : "";
+    if (taskId) driveManagerChatTask(taskId);
+  });
+}
 // The shipped markup starts the composer disabled. A sidebar must not wait
 // for a dialog open before the owner can type, including during a turn.
 applyManagerChatComposerState();
@@ -7996,7 +8416,7 @@ elements.openSettings.addEventListener("click", () => {
 elements.settingsList.addEventListener("change", (event) => {
   const modelInput = event.target.closest("[data-model-provider]");
   if (modelInput && state.featureSettings) {
-    setSettingsPending(settingsControlIdentity(modelInput), true);
+    setSettingsPending(settingsControlIdentity(modelInput), true, modelInput.dataset.modelRevision, "model");
     modelInput.disabled = true;
     modelInput.dataset.settingsPending = "true";
     vscode.postMessage({

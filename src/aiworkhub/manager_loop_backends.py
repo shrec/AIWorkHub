@@ -165,22 +165,64 @@ def _codex_events(event: Mapping[str, Any]) -> list[dict[str, Any]]:
 
 
 def _opencode_events(event: Mapping[str, Any]) -> list[dict[str, Any]]:
-    """OpenCode ``run --format json``: text, reasoning and tool parts, then ``step_finish``."""
-    kind = str(event.get("type") or "")
-    if kind == "step_finish":
-        return [_turn_end(event.get("tokens"))]
+    """OpenCode ``run --format json`` and part updates: text, thinking, tools, then step finish."""
+    kind = str(event.get("type") or "").strip().lower()
     part = _mapping(event.get("part"))
+    part_type = str(part.get("type") or "").strip().lower().replace("-", "_")
+    if kind.endswith("part.updated") or kind.endswith("part_updated"):
+        kind = part_type
+    elif part_type and kind not in ("text", "reasoning", "tool", "step_finish", "step_start"):
+        kind = part_type
+    if kind in ("step_finish", "stepfinish"):
+        return [_turn_end(part.get("tokens") or event.get("tokens"))]
     if kind == "text":
-        return _assistant_text(part.get("text"))
-    if kind == "reasoning":
-        return _reasoning(part.get("text"))
+        return _assistant_text(part.get("text") or event.get("text"))
+    if kind in ("reasoning", "thinking"):
+        return _reasoning(part.get("text") or part.get("thinking") or event.get("text"))
     if kind != "tool":
         return []
     state = _mapping(part.get("state"))
-    name = str(part.get("tool") or "")
+    name = str(part.get("tool") or part.get("name") or state.get("title") or "tool")
     if str(state.get("status") or "") in ("completed", "error"):
         return [{"type": "tool_result", "payload": {"name": name, "output": state.get("output")}}]
-    return [{"type": "tool_call", "payload": {"name": name, "input": state.get("input")}}]
+    return [{"type": "tool_call", "payload": {"name": name, "input": state.get("input") or part.get("input")}}]
+
+
+REASONING_LEVELS = frozenset({"low", "medium", "high", "xhigh", "max"})
+
+
+def manager_stream_tokens(backend_id: str, level: str = "") -> list[str]:
+    """Flags that make a manager turn show thinking and honor a chosen depth.
+
+    OpenCode hides thinking blocks unless ``--thinking`` is set. Claude's
+    stream stays dark until partial messages are requested. Effort tokens are
+    added only for a level the CLI documents.
+    """
+
+    cleaned = str(level or "").strip().lower()
+    if cleaned not in REASONING_LEVELS:
+        cleaned = ""
+    if backend_id == "opencode_cli":
+        return ["--thinking"]
+    if backend_id == "claude_cli":
+        tokens = ["--include-partial-messages"]
+        if cleaned:
+            tokens.extend(("--effort", cleaned))
+        return tokens
+    if backend_id == "codex_cli" and cleaned:
+        return ["-c", f'model_reasoning_effort="{cleaned}"']
+    return []
+
+
+def apply_manager_stream_tokens(backend_id: str, argv: list[str], level: str = "") -> list[str]:
+    tokens = manager_stream_tokens(backend_id, level)
+    if not tokens:
+        return list(argv)
+    if backend_id == "opencode_cli" and argv:
+        return [*argv[:-1], *tokens, argv[-1]]
+    if backend_id == "codex_cli" and argv and argv[-1] == "-":
+        return [*argv[:-1], *tokens, "-"]
+    return [*argv, *tokens]
 
 
 _TRANSLATORS: Mapping[str, Callable[[Mapping[str, Any]], list[dict[str, Any]]]] = MappingProxyType(
@@ -430,6 +472,7 @@ class CliManagerBackend:
         self._extra_env = dict(extra_env) if extra_env else None
         self._brief = ""
         self._conversation_id = ""
+        self.reasoning_level = ""
         self._process: Any = None
         self._slot = threading.Lock()
     @property
@@ -474,7 +517,7 @@ class CliManagerBackend:
             yield _turn_error("launch_plan", plan.validation_reason or "plan_not_launchable")
             return
         try:
-            argv = self.argv_for(plan)
+            argv = apply_manager_stream_tokens(self.backend_id, self.argv_for(plan), self.reasoning_level)
             cwd = plan.cwd
             stdin_text = getattr(plan, "stdin_text", None)
             if self._extra_env is None:
