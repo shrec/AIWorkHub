@@ -1,5 +1,11 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.93 — 2026-09-27
+
+### Fixed
+
+- Windows AppContainer workers start and finish without walking the whole user profile: parent-folder traverse permissions are written to one folder only.
+
 ## 0.11.92 — 2026-09-26
 
 ### Fixed

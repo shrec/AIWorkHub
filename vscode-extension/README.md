@@ -14,6 +14,10 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.11.93
+
+- Windows AppContainer workers no longer spend minutes to hours walking the user profile at launch and close.
+
 ## What's new in 0.11.92
 
 - The route panel names the open Manager Chat session instead of a pending Codex thread.

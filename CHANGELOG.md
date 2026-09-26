@@ -6,6 +6,12 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.93] - 2026-09-27
+
+### Fixed
+
+- A Windows AppContainer worker launch and close no longer walk the whole user profile. The traverse permission on each parent folder is written to that folder alone and keeps its protection and inheritance state, so a close takes milliseconds instead of minutes to hours.
+
 ## [0.11.92] - 2026-09-26
 
 ### Fixed
