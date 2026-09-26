@@ -1,5 +1,11 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.81 — 2026-09-26
+
+### Fixed
+
+- Source Graph binds dotted Python imports and same-file or imported annotations. Bare stdlib names stay unbound.
+
 ## 0.11.80 — 2026-09-26
 
 ### Fixed

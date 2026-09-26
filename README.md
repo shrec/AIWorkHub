@@ -62,6 +62,10 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
+## What's new in 0.11.81
+
+- Source Graph binds dotted Python imports and exact annotations. It does not guess os, ast, or Path.
+
 ## What's new in 0.11.80
 
 - Source Graph binds exact JavaScript MCP tool calls to their Python handlers, and no longer binds member calls by name.

@@ -6,6 +6,13 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.81] - 2026-09-26
+
+### Fixed
+
+- A dotted or relative Python import binds to the one indexed module or symbol it names. Bare imports such as os and ast stay unbound.
+- A Python annotation binds to the one same-file type or the one imported symbol of that name. Builtin names such as str stay unbound.
+
 ## [0.11.80] - 2026-09-26
 
 ### Fixed
