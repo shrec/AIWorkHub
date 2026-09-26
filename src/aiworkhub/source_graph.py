@@ -2649,6 +2649,134 @@ def _import_target_matches_file(target: str, file_path: str) -> bool:
     )
 
 
+def _python_import_suffix_files(modules: list[str], suffix: str) -> list[str]:
+    """Files whose path ends at ``suffix``, never a bare stem.
+
+    ``import ast`` must not match ``source_graph_ast.py``. A suffix without a
+    directory component is not evidence.
+    """
+
+    if not suffix or "/" not in suffix:
+        return []
+    folded = suffix.casefold()
+    needle = "/" + folded
+    hits: list[str] = []
+    for path in modules:
+        stem = path.replace("\\", "/").casefold()
+        if stem.endswith(".py"):
+            stem = stem[:-3]
+        if (
+            stem == folded
+            or stem.endswith(needle)
+            or stem == folded + "/__init__"
+            or stem.endswith(needle + "/__init__")
+        ):
+            hits.append(path)
+    return hits
+
+
+def _python_import_destination(
+    importer: str,
+    target: str,
+    modules: list[str],
+    module_qualnames: dict[str, str],
+    symbols: dict[tuple[str, str], list[str]],
+) -> str | None:
+    """The one module or symbol a dotted or relative Python import names."""
+
+    raw = target.strip()
+    if not raw:
+        return None
+    level = len(raw) - len(raw.lstrip("."))
+    body = raw[level:].strip(".")
+    if level:
+        parts = Path(importer).with_suffix("").parts
+        keep = len(parts) - level
+        if keep < 0:
+            return None
+        base = "/".join(parts[:keep]).replace("/", ".")
+        dotted = f"{base}.{body}" if body and base else body or base
+    else:
+        if "." not in raw:
+            return None
+        dotted = raw
+    hits = _python_import_suffix_files(modules, dotted.replace(".", "/"))
+    if len(hits) == 1:
+        return module_qualnames.get(hits[0])
+    if "." not in dotted:
+        return None
+    module_name, symbol = dotted.rsplit(".", 1)
+    hits = _python_import_suffix_files(modules, module_name.replace(".", "/"))
+    if len(hits) != 1:
+        return None
+    qualnames = symbols.get((hits[0], symbol), [])
+    if len(qualnames) == 1:
+        return qualnames[0]
+    return None
+
+
+def _resolve_python_import_edges(conn: sqlite3.Connection) -> int:
+    """Bind a Python import whose dotted path names one indexed module.
+
+    Bare names such as ``import os`` and ``import ast`` stay unbound. A stem
+    collision is not a module identity. A relative import is resolved from the
+    importing file. This pass does not read source files.
+    """
+
+    conn.execute(
+        "UPDATE edges SET dst_qualname=NULL "
+        "WHERE kind='imports' AND dst_qualname IS NOT NULL "
+        "AND file_path IN (SELECT file_path FROM files WHERE language='python') "
+        "AND NOT EXISTS (SELECT 1 FROM entities en WHERE en.qualname=edges.dst_qualname)"
+    )
+    rows = conn.execute(
+        "SELECT e.id, e.file_path, e.dst_name FROM edges e "
+        "JOIN files f ON f.file_path=e.file_path "
+        "WHERE e.kind='imports' AND f.language='python' AND e.dst_qualname IS NULL "
+        "ORDER BY e.id"
+    ).fetchall()
+    if not rows:
+        return 0
+    modules = [
+        str(row["file_path"])
+        for row in conn.execute(
+            "SELECT file_path FROM entities WHERE kind='module' ORDER BY file_path"
+        )
+    ]
+    module_qualnames = {
+        str(row["file_path"]): str(row["qualname"])
+        for row in conn.execute(
+            "SELECT file_path, qualname FROM entities WHERE kind='module'"
+        )
+    }
+    symbols: dict[tuple[str, str], list[str]] = {}
+    for row in conn.execute(
+        "SELECT file_path, name, qualname FROM entities "
+        "WHERE kind IN ('function', 'class', 'method')"
+    ):
+        symbols.setdefault((str(row["file_path"]), str(row["name"])), []).append(
+            str(row["qualname"])
+        )
+    resolved = 0
+    for edge in rows:
+        qualname = _python_import_destination(
+            str(edge["file_path"]),
+            str(edge["dst_name"] or ""),
+            modules,
+            module_qualnames,
+            symbols,
+        )
+        if not qualname:
+            continue
+        cur = conn.execute(
+            "UPDATE edges SET dst_qualname=?, evidence_label=? "
+            "WHERE id=? AND dst_qualname IS NULL",
+            (qualname, sgast.EXTRACTED, edge["id"]),
+        )
+        resolved += int(cur.rowcount or 0)
+    return resolved
+
+
 def _resolve_javascript_import_bindings(conn: sqlite3.Connection) -> int:
     """Bind each JS/TS ``imports`` edge to the one indexed module it names.
 
@@ -3531,6 +3659,7 @@ def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, increme
                         affected_names=affected_python_names,
                     )
                 _resolve_javascript_import_bindings(conn)
+                _resolve_python_import_edges(conn)
                 _resolve_javascript_same_file_calls(conn, repo_root)
                 _resolve_javascript_imported_calls(conn, repo_root)
                 _resolve_javascript_mcp_tool_calls(
@@ -8982,6 +9111,7 @@ def index_file(repo_root: Path, path: str, expected_hash: str) -> dict[str, Any]
                         },
                     )
                 _resolve_javascript_import_bindings(conn)
+                _resolve_python_import_edges(conn)
                 _resolve_javascript_same_file_calls(conn, repo_root)
                 _resolve_javascript_imported_calls(conn, repo_root)
                 _resolve_javascript_mcp_tool_calls(
