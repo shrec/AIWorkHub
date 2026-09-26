@@ -6,6 +6,12 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.79] - 2026-09-26
+
+### Fixed
+
+- Source Graph health names a Python/JavaScript call boundary that has edges on both sides and none between them, instead of reporting that gap as healthy silence.
+
 ## [0.11.78] - 2026-09-26
 
 ### Fixed

@@ -62,6 +62,10 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
+## What's new in 0.11.79
+
+- Source Graph health names a Python/JavaScript boundary that has no cross-language call edges.
+
 ## What's new in 0.11.78
 
 - Overlay bases are copy-pinned across volumes, and AppContainer launches use PowerShell instead of Git bash.

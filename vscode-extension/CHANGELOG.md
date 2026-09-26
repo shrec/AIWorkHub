@@ -1,5 +1,11 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.79 — 2026-09-26
+
+### Fixed
+
+- Source Graph health flags a missing Python/JavaScript call boundary instead of staying silent.
+
 ## 0.11.78 — 2026-09-26
 
 ### Fixed
