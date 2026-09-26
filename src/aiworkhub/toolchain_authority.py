@@ -719,6 +719,33 @@ def _executable_fact(
     )
 
 
+def _git_index_identity(repo: Path) -> str:
+    """Index mtime and size, so intent-to-add cannot reuse a tracked-path decision.
+
+    NF-2026-01002: ``git add -N`` changes which paths ``git ls-files`` returns,
+    but the authority cache previously ignored the index. A worktree's ``.git``
+    file is followed to that worktree's own index. Missing git is an empty
+    identity, not a refusal.
+    """
+
+    git_path = repo / ".git"
+    try:
+        if git_path.is_file():
+            line = git_path.read_text(encoding="utf-8").splitlines()[0].strip()
+            if not line.lower().startswith("gitdir:"):
+                return ""
+            git_dir = Path(line.split(":", 1)[1].strip())
+            if not git_dir.is_absolute():
+                git_dir = repo / git_dir
+            index = git_dir / "index"
+        else:
+            index = git_path / "index"
+        info = index.stat()
+    except (OSError, IndexError, ValueError):
+        return ""
+    return f"{info.st_mtime_ns}:{info.st_size}"
+
+
 class ToolchainAuthority:
     """Build and cache immutable snapshots for one canonical repository."""
 
@@ -768,6 +795,7 @@ class ToolchainAuthority:
         identity_payload = {
             "schema_id": SCHEMA_ID,
             "dynamic_requirements": self._dynamic_requirements_digest(card),
+            "git_index": _git_index_identity(self.repo),
             "metadata": metadata,
             "path": _path_fingerprint(),
             "platform": _platform_fingerprint(),

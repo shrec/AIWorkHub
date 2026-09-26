@@ -373,3 +373,39 @@ def test_declared_dash_m_module_reads_only_the_interpreter_option() -> None:
     )
     assert toolchain_authority._declared_dash_m_module(["python", "-m"]) == ""
     assert toolchain_authority._declared_dash_m_module(["python", "-m", "-q"]) == ""
+
+
+def test_git_index_change_drops_stale_tracked_path_decision(tmp_path: Path) -> None:
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+    target = tmp_path / "tests" / "new_case.py"
+    target.parent.mkdir()
+    target.write_text("def test_new():\n    pass\n", encoding="utf-8")
+    tracked = {"paths": frozenset({"README.md"})}
+    original = toolchain_authority.repository_tracked_paths
+    toolchain_authority.repository_tracked_paths = lambda _repo: tracked["paths"]
+    try:
+        authority = _authority(tmp_path)
+        card = {"validation": [f"{sys.executable} -m pytest -q tests/new_case.py"]}
+        first = authority.evaluate(card)
+        assert any(
+            item.kind == "worker_workspace" and "tests/new_case.py" in item.value
+            for item in first.missing
+        )
+        index = tmp_path / ".git" / "index"
+        if not index.exists():
+            subprocess.run(
+                ["git", "add", "-N", "tests/new_case.py"],
+                cwd=tmp_path,
+                check=True,
+                capture_output=True,
+            )
+        else:
+            index.write_bytes(index.read_bytes() + b"x")
+        tracked["paths"] = frozenset({"README.md", "tests/new_case.py"})
+        second = authority.evaluate(card)
+    finally:
+        toolchain_authority.repository_tracked_paths = original
+    assert not any(
+        item.kind == "worker_workspace" and "tests/new_case.py" in item.value
+        for item in second.missing
+    )
