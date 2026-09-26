@@ -343,11 +343,16 @@ def extract_javascript_typescript(
         if function is None:
             continue
         exact_binding = False
+        bind_locally = False
         name_node = None
         if function.type in {"identifier", "type_identifier"}:
             observed_name = _text(raw, function)
             called = aliases.get(observed_name, observed_name)
             exact_binding = observed_name in aliases or called in local_targets
+            # Only a bare identifier may take a same-file target. A member
+            # call such as document.createElement shares the property name
+            # and must not bind to a local helper.
+            bind_locally = True
             name_node = function
         elif function.type in {"member_expression", "subscript_expression"}:
             property_node = function.child_by_field_name("property")
@@ -372,7 +377,7 @@ def extract_javascript_typescript(
         if identity in observed_calls:
             continue
         observed_calls.add(identity)
-        targets = local_targets.get(called, [])
+        targets = local_targets.get(called, []) if bind_locally else []
         dst_qualname = targets[0] if len(targets) == 1 else None
         label = "EXTRACTED" if dst_qualname is not None or exact_binding else "INFERRED"
         edges.append({

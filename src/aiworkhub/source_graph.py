@@ -1661,6 +1661,11 @@ def _resolve_cpp_cross_file_edges(conn: sqlite3.Connection) -> int:
     multiple candidates remain visibly unresolved. Recomputing after every
     build also clears targets made stale by a rename/delete during an
     incremental refresh.
+
+    JavaScript and TypeScript calls are excluded. A member call such as
+    ``document.createElement`` shares ``dst_name`` with a helper, so a
+    repo-wide unique name would fabricate that edge. The extractor and
+    ``_resolve_javascript_same_file_calls`` own those calls.
     """
 
     resolvable_extractors = (
@@ -1669,9 +1674,13 @@ def _resolve_cpp_cross_file_edges(conn: sqlite3.Connection) -> int:
         sgast.TREE_SITTER_JS_TS_EXTRACTOR_ID,
     )
     placeholders = ",".join("?" for _ in resolvable_extractors)
+    js_calls = (
+        "AND NOT (kind='calls' AND file_path IN ("
+        "SELECT file_path FROM files WHERE language IN ('javascript', 'typescript'))) "
+    )
     conn.execute(
         f"UPDATE edges SET dst_qualname=NULL WHERE extractor IN ({placeholders}) "
-        "AND kind IN ('calls','inherits')",
+        f"AND kind IN ('calls','inherits') {js_calls}",
         resolvable_extractors,
     )
     resolved = 0
@@ -1680,6 +1689,7 @@ def _resolve_cpp_cross_file_edges(conn: sqlite3.Connection) -> int:
         "JOIN files f ON f.file_path=e.file_path "
         f"WHERE e.extractor IN ({placeholders}) "
         "AND e.kind IN ('calls','inherits') AND e.dst_qualname IS NULL "
+        "AND NOT (e.kind='calls' AND f.language IN ('javascript', 'typescript')) "
         "ORDER BY e.id",
         resolvable_extractors,
     ).fetchall()
@@ -1719,6 +1729,7 @@ def _resolve_cpp_cross_file_edges(conn: sqlite3.Connection) -> int:
         "JOIN files f ON f.file_path=e.file_path "
         f"WHERE e.extractor IN ({placeholders}) "
         "AND e.kind IN ('calls','inherits') AND e.dst_qualname IS NULL "
+        "AND NOT (e.kind='calls' AND f.language IN ('javascript', 'typescript')) "
         "ORDER BY id",
         resolvable_extractors,
     ).fetchall()
@@ -2697,6 +2708,171 @@ def _resolve_javascript_import_bindings(conn: sqlite3.Connection) -> int:
     return resolved
 
 
+def _javascript_bare_call(line: str, name: str, column: int = -1) -> bool:
+    """True when ``name`` is a bare call, not ``receiver.name(``.
+
+    ``column`` is the callee's source column when the extractor recorded one.
+    Without it, a line that also contains a member call stays unbound: a
+    line-wide search would bind ``document.createElement`` because a bare
+    ``createElement(`` shares that line.
+    """
+
+    if not re.fullmatch(r"[A-Za-z_$][A-Za-z0-9_$]*", name):
+        return False
+    bare = re.compile(rf"(?<![\w$.]){re.escape(name)}\s*\(")
+    if column >= 0:
+        return bare.match(line, column) is not None
+    if re.search(rf"(?:\.\s*|->\s*|::\s*){re.escape(name)}\s*\(", line):
+
+        return False
+
+    return bare.search(line) is not None
+
+
+def _resolve_javascript_same_file_calls(
+    conn: sqlite3.Connection, repo_root: Path,
+) -> int:
+    """Bind a bare JS/TS call to the one function defined in that same file.
+
+    Repo-wide uniqueness is not evidence: ``createElement`` is defined in
+    several files, and ``document.createElement`` must not bind to a local
+    helper. The source column must be a bare ``name(`` call, and the file must
+    contain exactly one ``function`` entity with that name.
+    """
+
+    rows = conn.execute(
+        "SELECT e.id, e.file_path, e.line, e.dst_name, e.source_col FROM edges e "
+        "JOIN files f ON f.file_path=e.file_path "
+        "WHERE e.kind='calls' AND e.dst_qualname IS NULL "
+        "AND e.evidence_label=? "
+        "AND (e.receiver_name IS NULL OR e.receiver_name='') "
+        "AND f.language IN ('javascript', 'typescript') "
+        "ORDER BY e.file_path, e.id",
+        (sgast.EXTRACTED,),
+    ).fetchall()
+    if not rows:
+        return 0
+    functions: dict[tuple[str, str], list[str]] = {}
+    for row in conn.execute(
+        "SELECT en.file_path, en.name, en.qualname FROM entities en "
+        "JOIN files f ON f.file_path=en.file_path "
+        "WHERE en.kind='function' AND f.language IN ('javascript', 'typescript')"
+    ):
+        functions.setdefault((str(row["file_path"]), str(row["name"])), []).append(
+            str(row["qualname"])
+        )
+    lines_by_file: dict[str, list[str]] = {}
+    resolved = 0
+    for edge in rows:
+        file_path = str(edge["file_path"])
+        name = str(edge["dst_name"] or "")
+        candidates = functions.get((file_path, name), [])
+        if len(candidates) != 1:
+            continue
+        if file_path not in lines_by_file:
+            try:
+                text = (repo_root / file_path).read_text(encoding="utf-8")
+            except (OSError, UnicodeError):
+                lines_by_file[file_path] = []
+            else:
+                lines_by_file[file_path] = text.splitlines()
+        line_no = int(edge["line"] or 0)
+        file_lines = lines_by_file[file_path]
+        if line_no < 1 or line_no > len(file_lines):
+            continue
+        column = int(edge["source_col"] if edge["source_col"] is not None else -1)
+        if not _javascript_bare_call(file_lines[line_no - 1], name, column):
+            continue
+        cur = conn.execute(
+            "UPDATE edges SET dst_qualname=? WHERE id=? AND dst_qualname IS NULL",
+            (candidates[0], edge["id"]),
+        )
+        resolved += int(cur.rowcount or 0)
+    return resolved
+
+
+def _resolve_javascript_imported_calls(
+    conn: sqlite3.Connection, repo_root: Path,
+) -> int:
+    """Bind a bare JS/TS call to the one imported file that defines that name.
+
+    Repository-wide uniqueness is not evidence. An import specifier that
+    matches exactly one indexed file defining the callee is. A member call
+    such as ``document.helper`` stays unbound even when that import exists.
+    """
+
+    rows = conn.execute(
+        "SELECT e.id, e.file_path, e.line, e.dst_name, e.source_col FROM edges e "
+        "JOIN files f ON f.file_path=e.file_path "
+        "WHERE e.kind='calls' AND e.dst_qualname IS NULL "
+        "AND (e.receiver_name IS NULL OR e.receiver_name='') "
+        "AND f.language IN ('javascript', 'typescript') "
+        "ORDER BY e.file_path, e.id"
+    ).fetchall()
+    if not rows:
+        return 0
+    imports_by_file: dict[str, list[str]] = {}
+    candidates_by_name: dict[str, list[sqlite3.Row]] = {}
+    lines_by_file: dict[str, list[str]] = {}
+    resolved = 0
+    for edge in rows:
+        file_path = str(edge["file_path"])
+        imports = imports_by_file.get(file_path)
+        if imports is None:
+            imports = [
+                str(row["dst_name"])
+                for row in conn.execute(
+                    "SELECT dst_name FROM edges WHERE file_path=? AND kind='imports' "
+                    "ORDER BY id",
+                    (file_path,),
+                )
+            ]
+            imports_by_file[file_path] = imports
+        if not imports:
+            continue
+        name = str(edge["dst_name"] or "")
+        if file_path not in lines_by_file:
+            try:
+                text = (repo_root / file_path).read_text(encoding="utf-8")
+            except (OSError, UnicodeError):
+                lines_by_file[file_path] = []
+            else:
+                lines_by_file[file_path] = text.splitlines()
+        line_no = int(edge["line"] or 0)
+        file_lines = lines_by_file[file_path]
+        if line_no < 1 or line_no > len(file_lines):
+            continue
+        column = int(edge["source_col"] if edge["source_col"] is not None else -1)
+        if not _javascript_bare_call(file_lines[line_no - 1], name, column):
+            continue
+        candidates = candidates_by_name.get(name)
+        if candidates is None:
+            candidates = conn.execute(
+                "SELECT en.file_path, en.qualname FROM entities en "
+                "JOIN files f ON f.file_path=en.file_path "
+                "WHERE en.name=? AND en.kind IN ('function', 'class') "
+                "AND f.language IN ('javascript', 'typescript') "
+                "ORDER BY en.file_path, en.qualname",
+                (name,),
+            ).fetchall()
+            candidates_by_name[name] = candidates
+        matched = [
+            row for row in candidates
+            if any(
+                _import_target_matches_file(target, str(row["file_path"]))
+                for target in imports
+            )
+        ]
+        if len(matched) != 1:
+            continue
+        cur = conn.execute(
+            "UPDATE edges SET dst_qualname=? WHERE id=? AND dst_qualname IS NULL",
+            (str(matched[0]["qualname"]), edge["id"]),
+        )
+        resolved += int(cur.rowcount or 0)
+    return resolved
+
+
 def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, incremental: bool = True) -> BuildReport:
     build_started = time.monotonic()
     repo_root = repo_root.resolve()
@@ -3094,6 +3270,8 @@ def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, increme
                         affected_names=affected_python_names,
                     )
                 _resolve_javascript_import_bindings(conn)
+                _resolve_javascript_same_file_calls(conn, repo_root)
+                _resolve_javascript_imported_calls(conn, repo_root)
             # Task 3: revoke LSP evidence for every changed/deleted source or
             # target, and re-attach bindings re-extraction or a resolver
             # dropped, inside this merge -- plain SQL, so it holds even when no
@@ -8540,6 +8718,8 @@ def index_file(repo_root: Path, path: str, expected_hash: str) -> dict[str, Any]
                         },
                     )
                 _resolve_javascript_import_bindings(conn)
+                _resolve_javascript_same_file_calls(conn, repo_root)
+                _resolve_javascript_imported_calls(conn, repo_root)
                 # A binding that still verifies but whose edge the resolvers
                 # above just cleared is re-attached here: the post-publish pass
                 # never runs when no server is configured. All of it is plain

@@ -1227,14 +1227,17 @@ def _extract_polyglot_lexical(
             source_hash=source_hash, build_revision=build_revision,
         ))
 
+    # The member pattern is recorded, but its property name is not a local
+    # binding: document.createElement must not resolve to a same-file helper.
     call_patterns = (
-        re.compile(r"(?:\.|->|::)\s*([$A-Za-z_]\w*)\s*[!(]?\s*\("),
-        re.compile(r"\b([$A-Za-z_]\w*)\s*[!(]?\s*\("),
+        (re.compile(r"(?:\.|->|::)\s*([$A-Za-z_]\w*)\s*[!(]?\s*\("), False),
+        (re.compile(r"\b([$A-Za-z_]\w*)\s*[!(]?\s*\("), True),
+
     )
     for opening, ending, function_name, qualname in function_ranges:
         body_text = masked[opening + 1:ending]
         observed: set[tuple[str, int]] = set()
-        for pattern in call_patterns:
+        for pattern, bind_locally in call_patterns:
             for call in pattern.finditer(body_text):
                 called = call.group(1)
                 if called in _POLYGLOT_CONTROL_NAMES or called == function_name:
@@ -1244,7 +1247,7 @@ def _extract_polyglot_lexical(
                 if key in observed:
                     continue
                 observed.add(key)
-                targets = local_targets.get(called, [])
+                targets = local_targets.get(called, []) if bind_locally else []
                 edges.append(Edge(
                     kind="calls", src_qualname=qualname, dst_name=called,
                     dst_qualname=targets[0] if len(targets) == 1 else None,
