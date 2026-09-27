@@ -14,6 +14,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -67,6 +68,28 @@ def _fchmod_permitted() -> bool:
 
 _FCHMOD_PERMITTED = _fchmod_permitted()
 _FCHMOD_DENIED_REASON = "fchmod is denied here (worker sandbox seccomp policy)"
+
+
+def _host_prefix_lstat_permitted() -> bool:
+    """Whether this token can read attributes of the host interpreter prefix.
+
+    run_validations walks the ancestors of the approved pythonpath site, which
+    lstats ``sys.prefix``. An AppContainer token cannot, so those cases fail
+    with PermissionError regardless of the code under test (NF-2026-01067).
+    Only PermissionError answers "not permitted"; anything else propagates.
+    """
+
+    try:
+        os.lstat(Path(sys.prefix))
+    except PermissionError:
+        return False
+    return True
+
+
+_REQUIRES_HOST_PREFIX_LSTAT = pytest.mark.skipif(
+    not _host_prefix_lstat_permitted(),
+    reason="host interpreter prefix is not readable from this token (NF-2026-01067)",
+)
 
 
 def _git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -272,6 +295,7 @@ def test_claude_credential_projection_refresh_is_narrow_atomic_and_private(
 def test_claude_credential_projection_rejects_destination_symlink(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    make_symlink: Callable[[Path, Path], None],
 ) -> None:
     source_home = tmp_path / "source-home"
     source_claude = source_home / ".claude"
@@ -281,8 +305,8 @@ def test_claude_credential_projection_rejects_destination_symlink(
     home.mkdir(mode=0o700)
     destination_dir = home / ".claude"
     destination_dir.mkdir(mode=0o700)
-    (destination_dir / ".credentials.json").symlink_to(
-        tmp_path / "outside-credential"
+    make_symlink(
+        tmp_path / "outside-credential", destination_dir / ".credentials.json"
     )
     monkeypatch.setenv("HOME", str(source_home))
 
@@ -647,6 +671,7 @@ def _commit_declared_invariant_quality_fixture(repo: Path) -> None:
     assert _git(repo, "commit", "-qm", "declared quality fixture").returncode == 0
 
 
+@_REQUIRES_HOST_PREFIX_LSTAT
 @pytest.mark.parametrize("allowed_writes", [[], ["out/result.txt"]])
 def test_selected_declared_invariants_seed_exact_quality_support(
     monkeypatch: pytest.MonkeyPatch,
@@ -852,12 +877,97 @@ def test_validation_workspace_seeds_exact_worker_package_support_and_imports_can
         assert "False" in result["stdout_head"]
         assert "candidate-worktree" in result["stdout_head"]
         assert expected_authority["digest"] in result["stdout_head"]
-        assert result["python_candidate_authority"] == expected_authority
+        assert result["python_candidate_authority"] == {
+            "schema_id": "aiworkhub.python_candidate_authority_ref.v1",
+            "digest": expected_authority["digest"],
+            "source_count": len(expected_authority["sources"]),
+        }
+        assert "sources" not in result["python_candidate_authority"]
+        assert worker_workspace.python_candidate_authority(workspace) == expected_authority
         assert worker_workspace.changed_paths(workspace) == [
             "src/aiworkhub/worker_workspace.py"
         ]
     finally:
         worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
+
+
+def test_validation_records_carry_bounded_python_candidate_authority_reference(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, repo: Path
+) -> None:
+    workspace = _workspace(monkeypatch, tmp_path, repo, "authority-reference")
+    try:
+        (workspace.path / "out").mkdir(exist_ok=True)
+        for index in range(40):
+            (workspace.path / "out" / f"candidate_{index:03d}.py").write_text(
+                f"VALUE = {index}\n", encoding="utf-8"
+            )
+        authority = worker_workspace.python_candidate_authority(workspace)
+        assert len(authority["sources"]) == 40
+        assert len(json.dumps(authority, sort_keys=True)) > 512
+
+        scratch = tmp_path / "authority-scratch"
+        scratch.mkdir()
+        monkeypatch.setattr(worker_workspace, "select_sandbox_backend", lambda: "landlock")
+        monkeypatch.setattr(
+            worker_workspace, "provision_validation_exec_scratch", lambda _workspace: scratch
+        )
+        monkeypatch.setattr(
+            worker_workspace, "cleanup_validation_exec_scratch", lambda _path: None
+        )
+        monkeypatch.setattr(
+            worker_workspace,
+            "sandbox_argv",
+            lambda _workspace, _adapter, argv, **_kwargs: list(argv),
+        )
+        monkeypatch.setattr(worker_workspace, "sanitized_env", lambda *_args, **_kwargs: {})
+        outcomes = iter(
+            [
+                subprocess.CompletedProcess([], 0, "ok", ""),
+                subprocess.TimeoutExpired(["python3"], 1, output="late", stderr=""),
+                OSError("launch refused"),
+            ]
+        )
+
+        def _run(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            outcome = next(outcomes)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return outcome
+
+        monkeypatch.setattr(worker_workspace.subprocess, "run", _run)
+        commands = [
+            "python3 -c 'raise SystemExit(0)'",
+            "python3 -c 'raise SystemExit(1)'",
+            "python3 -c 'raise SystemExit(2)'",
+        ]
+        with pytest.raises(worker_workspace.ValidationRunError) as caught:
+            worker_workspace.run_validations(workspace, commands)
+
+        rows = caught.value.results
+        assert [row["command"] for row in rows] == commands
+        assert rows[0]["returncode"] == 0
+        assert rows[1]["timed_out"] is True
+        assert rows[2]["launch_error"] == "OSError"
+        expected_ref = {
+            "schema_id": "aiworkhub.python_candidate_authority_ref.v1",
+            "digest": authority["digest"],
+            "source_count": 40,
+        }
+        for row in rows:
+            record_authority = row["python_candidate_authority"]
+            assert record_authority == expected_ref
+            assert "sources" not in record_authority
+            assert len(json.dumps(record_authority, sort_keys=True).encode("utf-8")) < 512
+    finally:
+        worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
+
+
+def test_python_candidate_authority_ref_tolerates_mapping_without_sources() -> None:
+    assert worker_workspace.python_candidate_authority_ref({"digest": ""}) == {
+        "schema_id": "aiworkhub.python_candidate_authority_ref.v1",
+        "digest": "",
+        "source_count": 0,
+    }
 
 
 def test_validation_workspace_package_support_preserves_single_aiworkhub_module_identity(
@@ -1105,6 +1215,7 @@ def test_python_validation_imports_new_sparse_candidate_module_without_pythonpat
         worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
 
 
+@_REQUIRES_HOST_PREFIX_LSTAT
 def test_pytest_validation_resolves_sparse_candidate_config_inside_worktree(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1149,7 +1260,14 @@ def test_pytest_validation_resolves_sparse_candidate_config_inside_worktree(
 
         assert result["returncode"] == 0
         assert "1 passed" in result["stdout_head"]
-        assert result["python_candidate_authority"]["sources"] == [
+        authority = worker_workspace.python_candidate_authority(workspace)
+        assert result["python_candidate_authority"] == {
+            "schema_id": "aiworkhub.python_candidate_authority_ref.v1",
+            "digest": authority["digest"],
+            "source_count": 1,
+        }
+        assert "sources" not in result["python_candidate_authority"]
+        assert authority["sources"] == [
             {
                 "path": "src/aiworkhub/new_candidate_module.py",
                 # Workspace provisioning creates a bounded empty placeholder
@@ -3253,6 +3371,7 @@ def test_bubblewrap_home_string_is_single_sourced_for_env_and_bind_mount(
 
 def test_unlink_if_regular_removes_files_but_never_follows_symlinks(
     tmp_path: Path,
+    make_symlink: Callable[[Path, Path], None],
 ) -> None:
     """B314_F007 regression: the spec/cancel-marker cleanup helper must
     remove a plain regular file, but must never act through a symlink --
@@ -3269,7 +3388,7 @@ def test_unlink_if_regular_removes_files_but_never_follows_symlinks(
     target = tmp_path / "sensitive_target.txt"
     target.write_text("do-not-delete", encoding="utf-8")
     link = tmp_path / "spec_symlink.json"
-    link.symlink_to(target)
+    make_symlink(target, link)
 
     worker_workspace.unlink_if_regular(link)
 
@@ -3394,6 +3513,7 @@ def test_promotion_includes_validated_required_output_not_in_changed_paths(
 def test_required_output_symlink_rejected(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    make_symlink: Callable[[Path, Path], None],
 ) -> None:
     """B561 guard: a required output that is a symlink must be rejected."""
     repo = _repo_with_gitignore(tmp_path)
@@ -3405,7 +3525,7 @@ def test_required_output_symlink_rejected(
         target = workspace.path / "out" / "real.bin"
         target.write_bytes(b"\x01")
         link = workspace.path / "out" / "link.bin"
-        link.symlink_to(target)
+        make_symlink(target, link)
 
         with pytest.raises(worker_workspace.WorkspaceError, match="required_output_symlink"):
             worker_workspace.validate_required_outputs(workspace, ["out/link.bin"])
@@ -3916,13 +4036,16 @@ def test_validation_cd_prefix_rejects_unsafe_forms(command: str, match: str) -> 
 
 
 def test_validation_cd_prefix_rejects_symlink_escape_at_sandbox_argv_time(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, repo: Path
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    repo: Path,
+    make_symlink: Callable[[Path, Path], None],
 ) -> None:
     workspace = _workspace(monkeypatch, tmp_path, repo, "cd-symlink")
     try:
         outside = tmp_path / "outside"
         outside.mkdir()
-        (workspace.path / "escape-link").symlink_to(outside, target_is_directory=True)
+        make_symlink(outside, workspace.path / "escape-link")
         with pytest.raises(worker_workspace.WorkspaceError, match="symlink_path_component_forbidden"):
             worker_workspace.sandbox_argv(
                 workspace,
@@ -4632,24 +4755,28 @@ class TestCopyOne:
         assert link.read_bytes() == b"initial"
 
     @staticmethod
-    def test_source_symlink_fails(tmp_path: Path) -> None:
+    def test_source_symlink_fails(
+        tmp_path: Path, make_symlink: Callable[[Path, Path], None]
+    ) -> None:
         if not hasattr(os, "symlink"):
             pytest.skip("os.symlink not available")
         src = tmp_path / "src"
         src.write_bytes(b"x")
         sym = tmp_path / "sym"
-        os.symlink(src, sym)
+        make_symlink(src, sym)
         with pytest.raises(worker_workspace.WorkspaceError, match="symlink_seed_forbidden"):
             worker_workspace._copy_one(sym, tmp_path / "dst")
 
     @staticmethod
-    def test_destination_symlink_fails(tmp_path: Path) -> None:
+    def test_destination_symlink_fails(
+        tmp_path: Path, make_symlink: Callable[[Path, Path], None]
+    ) -> None:
         if not hasattr(os, "symlink"):
             pytest.skip("os.symlink not available")
         src = tmp_path / "src"
         src.write_bytes(b"x")
         dst = tmp_path / "dst"
-        os.symlink(src, dst)
+        make_symlink(src, dst)
         with pytest.raises(worker_workspace.WorkspaceError, match="destination_symlink_forbidden"):
             worker_workspace._copy_one(src, dst)
 
@@ -4801,7 +4928,9 @@ class TestResolveCandidatePytestWrapper:
 
     @staticmethod
     def test_symlink_wrapper_rejected(
-        tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        make_symlink: Callable[[Path, Path], None],
     ) -> None:
         if not hasattr(os, "symlink"):
             pytest.skip("os.symlink not available")
@@ -4810,7 +4939,7 @@ class TestResolveCandidatePytestWrapper:
         real_wrapper = tmp_path / "real_candidate_pytest.py"
         real_wrapper.write_text("# real wrapper\n", encoding="utf-8")
         symlink_wrapper = tools_dir / "candidate_pytest.py"
-        os.symlink(real_wrapper, symlink_wrapper)
+        make_symlink(real_wrapper, symlink_wrapper)
         with pytest.raises(
             worker_workspace.WorkspaceError,
             match="candidate_pytest_wrapper_symlink_forbidden",
@@ -6537,6 +6666,7 @@ def _forge_nested_locator(locator: Path, anchor: Path, forge) -> None:
 def test_nested_landlock_locator_rejects_owner_mode_symlink_hmac_escape_copy(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    make_symlink: Callable[[Path, Path], None],
 ) -> None:
     _planted, locator, nested, scratch = _plant_nested_landlock_layout(tmp_path)
     _deny_landlock_sibling_writes(monkeypatch)
@@ -6587,7 +6717,7 @@ def test_nested_landlock_locator_rejects_owner_mode_symlink_hmac_escape_copy(
 
     real = locator.with_name(locator.name + ".real")
     locator.rename(real)
-    locator.symlink_to(real)
+    make_symlink(real, locator)
     assert worker_workspace.authenticated_outer_validation_context() is None
     locator.unlink()
     real.rename(locator)
@@ -7809,6 +7939,7 @@ def test_open_broker_scratch_root_rejects_symlinked_root(tmp_path: Path) -> None
         worker_workspace._open_broker_scratch_root(link)
 
 
+@_REQUIRES_HOST_PREFIX_LSTAT
 def test_pytest_validation_seeds_transitive_local_test_import_closure(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -7874,6 +8005,7 @@ def test_pytest_validation_seeds_transitive_local_test_import_closure(
         worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
 
 
+@_REQUIRES_HOST_PREFIX_LSTAT
 def test_pytest_validation_with_direct_pytest_command_seeds_test_closure(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -7926,6 +8058,7 @@ def test_pytest_validation_with_direct_pytest_command_seeds_test_closure(
         worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
 
 
+@_REQUIRES_HOST_PREFIX_LSTAT
 def test_pytest_validation_seeds_closure_with_pytest_flags(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -9272,6 +9405,7 @@ def test_landlock_never_grants_the_workspace_root_for_a_deleted_top_level_leaf(
 def test_landlock_still_fails_closed_on_non_regular_allowed_write_targets(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    make_symlink: Callable[[Path, Path], None],
     kind: str,
     marker: str,
 ) -> None:
@@ -9289,9 +9423,9 @@ def test_landlock_still_fails_closed_on_non_regular_allowed_write_targets(
     if kind == "directory":
         target.mkdir()
     elif kind == "symlink":
-        target.symlink_to(outside)
+        make_symlink(outside, target)
     else:
-        target.symlink_to(tmp_path.resolve() / "never_created.txt")
+        make_symlink(tmp_path.resolve() / "never_created.txt", target)
 
     granted = _stub_landlock_syscalls(monkeypatch)
     with pytest.raises(worker_workspace.WorkspaceError) as excinfo:
@@ -9527,6 +9661,7 @@ def test_pytest_validation_seeds_literal_repository_asset(repo: Path) -> None:
 
 def test_pytest_validation_seeds_literal_repository_asset_refuses_a_symlink(
     repo: Path,
+    make_symlink: Callable[[Path, Path], None],
 ) -> None:
     """A literal asset reached through a link is refused, never skipped.
 
@@ -9535,7 +9670,7 @@ def test_pytest_validation_seeds_literal_repository_asset_refuses_a_symlink(
     missing file instead of naming the link that caused it.
     """
     _write_extension_asset(repo, "real-extension.js")
-    os.symlink(
+    make_symlink(
         repo / "vscode-extension" / "real-extension.js",
         repo / "vscode-extension" / "extension.js",
     )

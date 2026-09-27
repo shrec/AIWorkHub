@@ -1190,6 +1190,20 @@ def python_candidate_authority(workspace: WorkerWorkspace) -> dict[str, Any]:
     }
 
 
+def python_candidate_authority_ref(authority: Mapping[str, Any]) -> dict[str, Any]:
+    """Return a bounded reference to a Python candidate authority mapping.
+
+    Validation records carry this reference instead of the full ``sources``
+    rows; the rows stay reachable through ``python_candidate_authority``.
+    """
+    sources = authority.get("sources")
+    return {
+        "schema_id": "aiworkhub.python_candidate_authority_ref.v1",
+        "digest": str(authority.get("digest") or ""),
+        "source_count": len(sources) if isinstance(sources, (list, tuple)) else 0,
+    }
+
+
 def _expand_declared(repo: Path, declared: Iterable[str]) -> list[str]:
     """Expand declared paths from the live parent filesystem.
 
@@ -13355,6 +13369,7 @@ def run_validations(
                     workspace, tokens
                 )
             candidate_authority = python_candidate_authority(workspace)
+            candidate_authority_ref = python_candidate_authority_ref(candidate_authority)
             effective_components = pythonpath_components
             if _is_candidate_pytest_wrapper_command(tokens):
                 # NF128: the exact candidate wrapper gets declared
@@ -13722,7 +13737,7 @@ def run_validations(
                         "env_override": env_override_evidence,
                         "sandbox_backend": selected_backend,
                         "execution_boundary": execution_boundary,
-                        "python_candidate_authority": candidate_authority,
+                        "python_candidate_authority": candidate_authority_ref,
                         "interpreter_authority": interpreter_authority,
                         "toolchain_authority_receipt": dict(receipt_fact or {}),
                         "returncode": None,
@@ -13758,7 +13773,7 @@ def run_validations(
                     "env_override": env_override_evidence,
                     "sandbox_backend": selected_backend,
                     "execution_boundary": execution_boundary,
-                    "python_candidate_authority": candidate_authority,
+                    "python_candidate_authority": candidate_authority_ref,
                     "interpreter_authority": interpreter_authority,
                     "toolchain_authority_receipt": dict(receipt_fact or {}),
                     "returncode": None,
@@ -13806,7 +13821,7 @@ def run_validations(
                 "env_override": env_override_evidence,
                 "sandbox_backend": selected_backend,
                 "execution_boundary": execution_boundary,
-                "python_candidate_authority": candidate_authority,
+                "python_candidate_authority": candidate_authority_ref,
                 "interpreter_authority": interpreter_authority,
                 "toolchain_authority_receipt": dict(receipt_fact or {}),
                 "returncode": result.returncode,
