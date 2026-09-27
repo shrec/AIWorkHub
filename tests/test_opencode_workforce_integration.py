@@ -565,10 +565,12 @@ def test_opencode_global_mcp_repair_sanitizes_both_owned_entries_and_picks_the_c
         "/old/ultrafast-launcher.py",
     ]
 
-    # Secrets, capability gates and an operator-disabled flag survive repair.
+    # Secrets and capability gates survive repair; a disabled canonical entry
+    # is re-enabled by owner policy and the re-enable is reported via `reenabled`.
     assert servers["awh"]["environment"]["SOME_SECRET"] == "keep-me"
     assert servers["awh"]["environment"]["AIWORKHUB_ALLOW_WRITES"] == "0"
-    assert servers["awh"]["enabled"] is False
+    assert servers["awh"]["enabled"] is True
+    assert result["reenabled"] is True
     assert servers["aiworkhub_ultrafast"]["environment"]["KEEP_ME"] == "ultrafast-flag"
 
     # An unrelated MCP registration is never rewritten, not even its env.
