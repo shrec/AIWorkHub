@@ -892,9 +892,23 @@ def normalize_review_findings(
     return normalized_report, record, kept_indices
 
 
+def canonical_symbol_resolver(root: Path | str | None) -> Any:
+    """Resolver over the canonical repository's index, or None to fail closed.
+
+    ``root`` must be the canonical repository whose Source Graph index is
+    authoritative, never a worker or reviewer worktree.  A missing root binds
+    nothing, so an index-proven overbuild finding stays refused.
+    """
+    from . import quality_reviewer
+
+    if root is None or str(root).strip() in {"", "."} or not Path(root).is_dir():
+        return None
+    return quality_reviewer.canonical_index_symbol_resolver(Path(root))
+
+
 def _packet_findings_dropping_invalid(
     packet: Mapping[str, Any], *, lens: str, findings: list[dict[str, Any]],
-    positions: list[int], record: list[dict[str, Any]],
+    positions: list[int], record: list[dict[str, Any]], symbol_resolver: Any = None,
 ) -> list[dict[str, Any]]:
     """Validate every finding, dropping only the ones the canonical rules refuse.
 
@@ -911,7 +925,7 @@ def _packet_findings_dropping_invalid(
     while True:
         try:
             return quality_reviewer.normalize_packet_findings(
-                packet, lens=lens, findings=remaining
+                packet, lens=lens, findings=remaining, symbol_resolver=symbol_resolver
             )
         except quality_reviewer.ReviewerEvidenceError as exc:
             reason = str(exc)
@@ -972,6 +986,7 @@ def supervisor_ingest(
                 packet, lens=expected_lens,
                 findings=list(normalized_report.get("findings") or []),
                 positions=positions, record=record,
+                symbol_resolver=canonical_symbol_resolver(getattr(workspace, "repo", None)),
             )
         except quality_reviewer.ReviewerEvidenceError as exc:
             raise ReviewProtocolError(f"structured_report_invalid:{exc}") from exc

@@ -6509,10 +6509,12 @@ def quality_review_submit(
         else:
             decoded_findings.append(raw_finding)
     try:
+        from .quality_review_ingest import canonical_symbol_resolver
         normalized_findings = quality_reviewer.normalize_packet_findings(
             packet,
             lens=lens,
             findings=decoded_findings,
+            symbol_resolver=canonical_symbol_resolver(ctx.authority_repo),
         )
         # Recompute the digest instead of trusting the file's digest field.
         quality_reviewer.verify_reviewer_receipt(

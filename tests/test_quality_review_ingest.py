@@ -414,7 +414,7 @@ class _Workspace:
         self.repo = repo
 
 
-def _accept_all_findings(packet, *, lens, findings):
+def _accept_all_findings(packet, *, lens, findings, symbol_resolver=None):
     """Stand in for the canonical validator when every finding is usable."""
     return [dict(finding) for finding in findings]
 
@@ -423,7 +423,7 @@ def _refusing_validator(*refused_summaries):
     """Refuse the named findings the way ``normalize_packet_findings`` does."""
     from aiworkhub import quality_reviewer
 
-    def normalize_packet_findings(packet, *, lens, findings):
+    def normalize_packet_findings(packet, *, lens, findings, symbol_resolver=None):
         for index, finding in enumerate(findings):
             if finding.get("summary") in refused_summaries:
                 raise quality_reviewer.ReviewerEvidenceError(
@@ -570,7 +570,7 @@ def test_stripped_keys_are_filtered_against_the_canonical_ingress_allowlist():
 def test_a_stripped_key_never_reaches_the_canonical_validator(tmp_path, monkeypatch):
     seen = []
 
-    def validator(packet, *, lens, findings):
+    def validator(packet, *, lens, findings, symbol_resolver=None):
         seen.extend(dict(finding) for finding in findings)
         return [dict(finding) for finding in findings]
 
@@ -712,7 +712,7 @@ def test_a_reviewer_error_without_a_finding_index_is_never_swallowed(
 ):
     from aiworkhub import quality_reviewer
 
-    def validator(packet, *, lens, findings):
+    def validator(packet, *, lens, findings, symbol_resolver=None):
         raise quality_reviewer.ReviewerEvidenceError("review_findings_overflow")
 
     with pytest.raises(ingest.ReviewProtocolError, match="review_findings_overflow"):
@@ -735,7 +735,7 @@ def test_a_report_of_only_non_actionable_observations_survives_repairable_schema
     """
     from aiworkhub import quality_reviewer
 
-    def validator(packet, *, lens, findings):
+    def validator(packet, *, lens, findings, symbol_resolver=None):
         if findings:
             raise quality_reviewer.ReviewerEvidenceError(
                 "review_finding_0_overbuild_removable_surface_unbound"
