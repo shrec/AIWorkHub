@@ -1,5 +1,15 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.97 — 2026-09-27
+
+### Fixed
+
+- A VS Code LM credit-limit refusal opens that route's circuit until its reset, so unpinned launches stop re-picking an exhausted route (NF-2026-01036).
+- Accept review's seam guard is green again: `_accept_manager_identity` is declared as an accept-review local name.
+- A template card created with a validation override keeps the repository package gate (NF-2026-01041).
+- Provider-output failure classifiers move out of `process_launcher` into their own module; the module size ratchet is back to 14148 (NF-2026-01041).
+- Test suites follow their contracts: AppContainer sandbox-root grants (NF-2026-01039), the paged review packet, the codex stdin prompt, and LSP symlink tests that skip only when the symlink privilege is missing (NF-2026-01042).
+
 ## 0.11.96 — 2026-09-27
 
 ### Fixed

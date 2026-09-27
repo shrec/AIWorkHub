@@ -62,6 +62,11 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
+## What's new in 0.11.97
+
+- A worker route that runs out of monthly credit is skipped automatically until it resets.
+- Cards made from templates keep the repository's safety checks even when validation is overridden.
+
 ## What's new in 0.11.96
 
 - Validation inside the Windows sandbox can run `git` again, so correct worker changes stop landing as validation failures.

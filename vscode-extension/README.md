@@ -14,6 +14,11 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.11.97
+
+- A worker route that runs out of monthly credit is skipped automatically until it resets.
+- Cards made from templates keep the repository's safety checks even when validation is overridden.
+
 ## What's new in 0.11.96
 
 - Validation inside the Windows sandbox can run `git` again, so correct worker changes stop landing as validation failures.
