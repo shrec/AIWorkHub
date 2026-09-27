@@ -1,8 +1,9 @@
 """NF-2026-01020: a non-inheritable ACE must be written to one object only.
 
-``request_scoped_grants`` gives every directory above every request leaf --
-the volume root, ``C:\\Users``, the profile, ``AppData``, ``AppData\\Local``,
-``Temp`` -- a NON-inheritable traverse ACE, and revokes it again at close.
+``request_scoped_grants`` then gave every directory above every request leaf
+-- the volume root, ``C:\\Users``, the profile, ``AppData``,
+``AppData\\Local``, ``Temp`` -- a NON-inheritable traverse ACE, and revoked
+it again at close (NF-2026-01027 now stops that chain at the sandbox root).
 Writing those through ``SetNamedSecurityInfoW`` makes Windows re-propagate
 inheritance into every existing child object, so each of those writes walks
 the whole user profile, twice per launch.  Measured on installed 0.11.92:
@@ -22,6 +23,8 @@ kernel32 double and assert which API wrote which path.
 from __future__ import annotations
 
 import ctypes
+import os
+from pathlib import Path
 
 import pytest
 
@@ -397,8 +400,9 @@ def test_no_traverse_in_a_request_plan_reaches_set_named_security_info(
     """Applying and revoking a whole request plan: the ancestor chain -- the
     part that walked the user profile -- touches the propagating API zero
     times, while the request leaf still does."""
-    leaf = tmp_path / "request"
-    leaf.mkdir()
+    root = Path(os.path.realpath(str(tmp_path))) / ".aiworkhub" / "runtime" / "worktrees"
+    leaf = root / "request" / "worktree"
+    leaf.mkdir(parents=True)
     plan = request_scoped_grants({}, str(leaf))
     traverse = [grant.path for grant in plan if grant.access == "traverse"]
     assert traverse, "the ancestor chain is what NF-2026-01020 is about"

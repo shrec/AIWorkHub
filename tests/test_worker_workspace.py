@@ -1858,19 +1858,10 @@ def test_default_workspace_root_is_platform_safe_runtime_boundary(
     assert worker_workspace.configured_runtime_root(repo) == (
         repo / ".aiworkhub" / "runtime"
     ).resolve()
-    if os.name == "nt":
-        namespace = hashlib.sha256(
-            os.path.normcase(str(repo.resolve())).encode("utf-8")
-        ).hexdigest()[:16]
-        expected = (
-            Path(tempfile.gettempdir()) / "aiworkhub-worktrees" / namespace
-        ).resolve()
-        assert worker_workspace.configured_worktree_root(repo) == expected
-        assert repo not in expected.parents
-    else:
-        assert worker_workspace.configured_worktree_root(repo) == (
-            repo / ".aiworkhub" / "runtime" / "worktrees"
-        ).resolve()
+    # NF-2026-01027: every OS, Windows included (the AppContainer sandbox root).
+    assert worker_workspace.configured_worktree_root(repo) == (
+        repo / ".aiworkhub" / "runtime" / "worktrees"
+    ).resolve()
 
 
 def test_workspace_uses_configured_platform_safe_runtime_root(
@@ -1891,7 +1882,7 @@ def test_workspace_uses_configured_platform_safe_runtime_root(
         assert workspace.path == (
             root / "repo-local-runtime" / "worktree"
         ).resolve()
-        assert (repo not in workspace.path.parents) is (os.name == "nt")
+        assert repo.resolve() in workspace.path.parents
         assert worker_workspace.enforce_scope(workspace) == []
     finally:
         worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
@@ -1916,20 +1907,8 @@ def test_default_worktree_root_separates_repository_namespaces(
     assert worker_workspace.configured_worktree_root(repo / "read" / "..") == mine
     assert worker_workspace.configured_worktree_root(repo) == mine
 
-    if os.name == "nt":
-        shared_parent = (
-            Path(tempfile.gettempdir()) / "aiworkhub-worktrees"
-        ).resolve()
-        assert mine.parent == shared_parent
-        assert theirs.parent == shared_parent
-        for name in (mine.name, theirs.name):
-            assert len(name) == 16
-            assert set(name) <= set("0123456789abcdef")
-    else:
-        assert mine == (repo / ".aiworkhub" / "runtime" / "worktrees").resolve()
-        assert theirs == (
-            sibling / ".aiworkhub" / "runtime" / "worktrees"
-        ).resolve()
+    assert mine == (repo / ".aiworkhub" / "runtime" / "worktrees").resolve()
+    assert theirs == (sibling / ".aiworkhub" / "runtime" / "worktrees").resolve()
 
 
 def test_explicit_roots_outrank_the_namespaced_worktree_default(

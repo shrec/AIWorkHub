@@ -1075,7 +1075,8 @@ def _prepare_opencode_launch(
 ) -> SimpleNamespace:
     base = tmp_path.resolve()
     authority = base / "authority"
-    root = base / _OPENCODE_REQUEST_ID
+    # The worker layout: ``<sandbox root>/<request>/{worktree,home}``.
+    root = base / ".aiworkhub" / "runtime" / "worktrees" / _OPENCODE_REQUEST_ID
     workspace = worker_workspace.WorkerWorkspace(
         request_id=_OPENCODE_REQUEST_ID,
         repo=authority,
@@ -1432,17 +1433,15 @@ def test_opencode_appcontainer_launch_uses_real_provisioning_and_sandbox_argv(
     assert workspace.home.resolve() in ledger.resolve().parents
 
     grants = windows_appcontainer.request_scoped_grants(env, str(workspace.path))
-    traverse_paths = {
-        str(Path(grant.path).resolve())
+    traverse = {
+        Path(grant.path).resolve(): grant.persistent
         for grant in grants
         if grant.access == "traverse"
     }
-    assert str(workspace.path.parent.resolve()) in traverse_paths
-    # NF-2026-01004: Bun realpath opens every component, including the volume
-    # root. Omitting that traverse ACE is the EPERM this grant chain exists to
-    # prevent. The ACE stays non-persistent.
-    assert str(workspace.path.anchor) in traverse_paths
-    assert all(not grant.persistent for grant in grants if grant.access == "traverse")
+    # NF-2026-01027: the chain stops at the sandbox root, which the child sees
+    # as a drive letter; only that shared root's traverse is persistent.
+    sandbox_root = workspace.path.parent.parent.resolve()
+    assert traverse == {workspace.path.parent.resolve(): False, sandbox_root: True}
 
 
 @pytest.mark.parametrize(

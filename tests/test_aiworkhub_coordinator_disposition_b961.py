@@ -2204,51 +2204,6 @@ def test_recover_blocked_rework_validation_only_replay_rejects_workspace_outside
     assert task_store.get_task(root, task_id)["status"] == "blocked"
 
 
-def test_recover_blocked_rework_validation_only_replay_rejects_historical_layout_on_windows(
-    tmp_path,
-):
-    """The pre-temp repo-local worktree is not a valid root on Windows."""
-    if os.name != "nt":
-        pytest.skip("historical layout is the configured root off Windows")
-    root = tmp_path
-    task_store.initialize_repository(root)
-    request_id = "e" * 32
-    task_id = "nf-01012-historical-layout"
-    relative = "src/example.py"
-    content = b"historical layout predecessor\n"
-    path_hash = hashlib.sha256(content).hexdigest()
-    historical = (
-        root / ".aiworkhub" / "runtime" / "worktrees" / request_id / "worktree"
-    )
-    historical.mkdir(parents=True)
-    (historical / "src").mkdir()
-    (historical / relative).write_bytes(content)
-    workspace = {
-        "request_id": request_id,
-        "repo": str(Path(root).resolve()),
-        "path": str(historical),
-        "allowed_writes": [relative],
-    }
-    _make_blocked_rework_task_with_terminal_review(
-        root,
-        task_id=task_id,
-        request_id=request_id,
-        changed_path_hashes={relative: path_hash},
-    )
-    _bind_blocked_reviewer_transport(
-        root, task_id, request_id, workspace, {relative: path_hash}
-    )
-    ok, state = task_store.recover_blocked_rework(
-        root,
-        task_id,
-        actor="coordinator",
-        feedback_reason="reject historical layout",
-        validation_only_replay=True,
-    )
-    assert (ok, state) == (False, "validation_only_replay_workspace_invalid")
-    assert task_store.get_task(root, task_id)["status"] == "blocked"
-
-
 def test_recover_blocked_rework_validation_only_replay_rejects_symlink_under_configured_root(
     tmp_path,
 ):

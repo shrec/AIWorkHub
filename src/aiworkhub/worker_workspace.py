@@ -4082,10 +4082,11 @@ def configured_runtime_root(repo: Path | None = None) -> Path:
 def configured_worktree_root(repo: Path | None = None) -> Path:
     """Return the single configured root for isolated worker workspaces.
 
-    Windows defaults to a repository-namespaced directory beneath the current
-    user's real temporary root.  That boundary is reachable by AppContainer
-    workers without requiring WRITE_DAC on a repository volume's ancestors.
-    Explicit worktree and runtime overrides retain their existing precedence.
+    Every OS defaults to the repository-owned ``.aiworkhub/runtime/worktrees``.
+    On Windows that directory is an AppContainer sandbox root: the child sees
+    it as a per-logon-session drive letter, so no ACE is ever written above it
+    (NF-2026-01027).  Explicit worktree and runtime overrides retain their
+    existing precedence.
     """
     authorized_scratch = _nested_landlock_exec_scratch_for_repo(repo)
     override = os.environ.get(WORKTREE_ROOT_ENV, "").strip()
@@ -4120,15 +4121,7 @@ def configured_worktree_root(repo: Path | None = None) -> Path:
                     return fallback
                 return (authorized_scratch / "nested-worktrees").resolve()
 
-    if os.name == "nt" and not runtime_override and selected_repo is not None:
-        namespace = hashlib.sha256(
-            os.path.normcase(str(selected_repo)).encode("utf-8")
-        ).hexdigest()[:16]
-        default = (
-            Path(tempfile.gettempdir()) / "aiworkhub-worktrees" / namespace
-        ).resolve()
-    else:
-        default = (configured_runtime_root(repo) / "worktrees").resolve()
+    default = (configured_runtime_root(repo) / "worktrees").resolve()
     if authorized_scratch is None or _path_is_relative_to(default, authorized_scratch):
         return default
     return (authorized_scratch / "nested-worktrees").resolve()
