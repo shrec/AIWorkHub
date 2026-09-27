@@ -1094,6 +1094,169 @@ class TestLinkExistingTask:
         with pytest.raises(needfix_store.NeedFixConflictError):
             needfix_store.link_existing_task(init_store, r["id"], "task-2", get_task_fn, status_fn)
 
+    # NF-2026-01062: integrated_commit is never silently dropped.
+
+    def _linked_needfix(self, init_store: Path):
+        r = self._accepted_needfix(init_store)
+        get_task_fn, status_fn = self._tasks(**{"task-1": {"status": "finished"}})
+        needfix_store.link_existing_task(init_store, r["id"], "task-1", get_task_fn, status_fn)
+        assert needfix_store.get_needfix(init_store, r["id"])["status"] == "task_created"
+        return r, get_task_fn, status_fn
+
+    def test_link_retry_with_verified_commit_resolves(self, init_store: Path):
+        r, get_task_fn, status_fn = self._linked_needfix(init_store)
+        verified_oid = "b" * 40
+
+        result = needfix_store.link_existing_task(
+            init_store, r["id"], "task-1", get_task_fn, status_fn,
+            integrated_commit="f6ffccc",
+            verify_commit_fn=lambda commit: verified_oid if commit == "f6ffccc" else None,
+        )
+
+        assert result == {
+            "needfix_id": r["id"],
+            "converted_task_id": "task-1",
+            "already_converted": True,
+            "resolved": True,
+            "integrated_commit": verified_oid,
+        }
+        nr = needfix_store.get_needfix(init_store, r["id"])
+        assert nr["status"] == "resolved"
+        assert nr["resolved_at"] is not None
+        assert nr["evidence_refs"].count(f"git:{verified_oid}") == 1
+        events = needfix_store.list_events(init_store, r["id"])
+        resolved = [e for e in events if e["event"] == "integrated_commit_resolved"]
+        assert len(resolved) == 1
+        assert resolved[0]["detail"] == {
+            "converted_task_id": "task-1",
+            "integrated_commit": verified_oid,
+            "via": "link_retry",
+        }
+
+        # A further identical retry takes the unchanged resolved branch.
+        again = needfix_store.link_existing_task(
+            init_store, r["id"], "task-1", get_task_fn, status_fn,
+            integrated_commit="f6ffccc",
+            verify_commit_fn=lambda commit: verified_oid,
+        )
+        assert again["resolved"] is True
+        assert needfix_store.list_events(init_store, r["id"]) == events
+
+    @pytest.mark.parametrize(
+        "verify_commit_fn",
+        [None, lambda commit: None, lambda commit: "abc1234"],
+        ids=["no_verifier", "verifier_none", "short_oid"],
+    )
+    def test_link_retry_with_unverified_commit_raises(self, init_store: Path, verify_commit_fn):
+        r, get_task_fn, status_fn = self._linked_needfix(init_store)
+        before = needfix_store.get_needfix(init_store, r["id"])
+        events_before = needfix_store.list_events(init_store, r["id"])
+
+        with pytest.raises(needfix_store.NeedFixValidationError, match="not verified"):
+            needfix_store.link_existing_task(
+                init_store, r["id"], "task-1", get_task_fn, status_fn,
+                integrated_commit="abc1234", verify_commit_fn=verify_commit_fn,
+            )
+
+        assert needfix_store.get_needfix(init_store, r["id"]) == before
+        assert needfix_store.list_events(init_store, r["id"]) == events_before
+
+    def test_link_retry_without_commit_is_unchanged(self, init_store: Path):
+        r, get_task_fn, status_fn = self._linked_needfix(init_store)
+        events_before = needfix_store.list_events(init_store, r["id"])
+
+        retry = needfix_store.link_existing_task(
+            init_store, r["id"], "task-1", get_task_fn, status_fn,
+            verify_commit_fn=lambda commit: "c" * 40,
+        )
+
+        assert retry == {
+            "needfix_id": r["id"],
+            "converted_task_id": "task-1",
+            "already_converted": True,
+        }
+        assert needfix_store.get_needfix(init_store, r["id"])["status"] == "task_created"
+        assert needfix_store.list_events(init_store, r["id"]) == events_before
+
+    def test_link_retry_different_task_with_commit_still_conflicts(self, init_store: Path):
+        r, _get, _status = self._linked_needfix(init_store)
+        get_task_fn, status_fn = self._tasks(
+            **{"task-1": {"status": "finished"}, "task-2": {"status": "finished"}}
+        )
+        with pytest.raises(needfix_store.NeedFixConflictError):
+            needfix_store.link_existing_task(
+                init_store, r["id"], "task-2", get_task_fn, status_fn,
+                integrated_commit="abc1234", verify_commit_fn=lambda commit: "d" * 40,
+            )
+        assert needfix_store.get_needfix(init_store, r["id"])["status"] == "task_created"
+
+    def test_first_link_linkable_with_verified_commit_resolves(self, init_store: Path):
+        r = self._accepted_needfix(init_store)
+        get_task_fn, status_fn = self._tasks(**{"task-1": {"status": "finished"}})
+        verified_oid = "e" * 40
+
+        result = needfix_store.link_existing_task(
+            init_store, r["id"], "task-1", get_task_fn, status_fn,
+            integrated_commit="abc1234",
+            verify_commit_fn=lambda commit: verified_oid if commit == "abc1234" else None,
+        )
+
+        assert result["already_converted"] is False
+        assert result["resolved"] is True
+        assert result["integrated_commit"] == verified_oid
+        nr = needfix_store.get_needfix(init_store, r["id"])
+        assert nr["status"] == "resolved"
+        assert nr["resolved_at"] is not None
+        assert nr["converted_task_id"] == "task-1"
+        assert f"git:{verified_oid}" in nr["evidence_refs"]
+        events = {e["event"] for e in needfix_store.list_events(init_store, r["id"])}
+        assert "integrated_commit_resolved" in events
+
+    @pytest.mark.parametrize(
+        "verify_commit_fn",
+        [None, lambda commit: None, lambda commit: "abc1234"],
+        ids=["no_verifier", "verifier_none", "short_oid"],
+    )
+    def test_first_link_linkable_with_unverified_commit_refuses(
+        self, init_store: Path, verify_commit_fn
+    ):
+        r = self._accepted_needfix(init_store)
+        get_task_fn, status_fn = self._tasks(**{"task-1": {"status": "finished"}})
+
+        with pytest.raises(needfix_store.NeedFixConflictError, match="not verified"):
+            needfix_store.link_existing_task(
+                init_store, r["id"], "task-1", get_task_fn, status_fn,
+                integrated_commit="abc1234", verify_commit_fn=verify_commit_fn,
+            )
+
+        nr = needfix_store.get_needfix(init_store, r["id"])
+        assert nr["status"] == "accepted"
+        assert nr["converted_task_id"] is None
+
+    def test_first_link_linkable_recheck_unverified_compensates_claim(self, init_store: Path):
+        r = self._accepted_needfix(init_store)
+        get_task_fn, status_fn = self._tasks(**{"task-1": {"status": "finished"}})
+        calls = {"n": 0}
+
+        def verify_commit_fn(commit):
+            calls["n"] += 1
+            return "f" * 40 if calls["n"] == 1 else None
+
+        with pytest.raises(needfix_store.NeedFixConflictError):
+            needfix_store.link_existing_task(
+                init_store, r["id"], "task-1", get_task_fn, status_fn,
+                integrated_commit="abc1234", verify_commit_fn=verify_commit_fn,
+            )
+
+        assert calls["n"] == 2
+        nr = needfix_store.get_needfix(init_store, r["id"])
+        assert nr["status"] == "accepted"
+        assert nr["converted_task_id"] is None
+        events = {e["event"] for e in needfix_store.list_events(init_store, r["id"])}
+        assert "existing_task_link_claimed" in events
+        assert "integrated_commit_resolved" not in events
+        assert "conversion_committed" not in events
+
     def test_link_existing_task_missing_fails_closed(self, init_store: Path):
         r = self._accepted_needfix(init_store)
         get_task_fn, status_fn = self._tasks()

@@ -3222,6 +3222,18 @@ def _append_superseded_hint(message: str, task_status: str) -> str:
     )
 
 
+def _verified_commit_oid(
+    integrated_commit: str, verify_commit_fn: Callable[[str], str | None] | None,
+) -> str | None:
+    """Return the full oid ``verify_commit_fn`` confirms, else ``None``."""
+    if not integrated_commit or verify_commit_fn is None:
+        return None
+    verified_oid = verify_commit_fn(integrated_commit)
+    if verified_oid and _FULL_COMMIT_OID_RE.match(verified_oid):
+        return verified_oid
+    return None
+
+
 def _link_verdict(
     task: Mapping[str, Any],
     task_status: str,
@@ -3236,20 +3248,24 @@ def _link_verdict(
     field ``reopen_superseded_task_link`` reads) and the caller proves the
     fix already landed by supplying a commit ``verify_commit_fn`` confirms is
     a real, HEAD-reachable oid. Every other archived case (ordinary archive,
-    no verifier, an unverifiable commit) stays refused. Used identically at
+    no verifier, an unverifiable commit) stays refused. A linkable status
+    with a supplied ``integrated_commit`` must also verify it: the verified
+    oid is returned so the link ends ``resolved``, and an unverifiable commit
+    refuses instead of being silently dropped. Used identically at
     the initial check and the last-point re-check, so a verifier that flips
     to ``None`` between them refuses at the re-check too.
     """
     if task_status in LINKABLE_CARD_STATUSES:
-        return True, None
+        if not integrated_commit:
+            return True, None
+        verified_oid = _verified_commit_oid(integrated_commit, verify_commit_fn)
+        return (True, verified_oid) if verified_oid else (False, None)
     if (
         task_status == "archived"
         and str(task.get("archive_operation") or "") == "superseded"
-        and integrated_commit
-        and verify_commit_fn is not None
     ):
-        verified_oid = verify_commit_fn(integrated_commit)
-        if verified_oid and _FULL_COMMIT_OID_RE.match(verified_oid):
+        verified_oid = _verified_commit_oid(integrated_commit, verify_commit_fn)
+        if verified_oid:
             return True, verified_oid
     return False, None
 
@@ -3297,6 +3313,14 @@ def link_existing_task(
       without a real linked task.
     - On success, atomically records ``task_created`` + ``converted_task_id``
       plus audited provenance of the link.
+    - ``integrated_commit`` is never silently dropped. A first link to a
+      ``LINKABLE_CARD_STATUSES`` card with a commit ``verify_commit_fn``
+      confirms ends ``resolved`` in the same call; an unverifiable commit
+      refuses the link. An identical retry on a ``task_created`` NeedFix that
+      supplies a verified commit resolves it in one transaction (event
+      ``integrated_commit_resolved``, ``git:<oid>`` evidence, receipt with
+      ``resolved=True``); an unverifiable commit raises
+      ``NeedFixValidationError`` and leaves the row unchanged.
     """
 
     existing_task_id = str(existing_task_id or "").strip()
@@ -3311,16 +3335,57 @@ def link_existing_task(
             raise NeedFixNotFoundError(needfix_id)
 
         if row["status"] == "task_created":
-            if row["converted_task_id"] == existing_task_id:
+            if row["converted_task_id"] != existing_task_id:
+                raise NeedFixConflictError(
+                    f"needfix {needfix_id} is already linked to "
+                    f"{row['converted_task_id']!r}, not {existing_task_id!r}"
+                )
+            if not integrated_commit:
                 return {
                     "needfix_id": needfix_id,
                     "converted_task_id": row["converted_task_id"],
                     "already_converted": True,
                 }
-            raise NeedFixConflictError(
-                f"needfix {needfix_id} is already linked to "
-                f"{row['converted_task_id']!r}, not {existing_task_id!r}"
-            )
+            oid = _verified_commit_oid(integrated_commit, verify_commit_fn)
+            if not oid:
+                raise NeedFixValidationError(
+                    f"integrated_commit {integrated_commit!r} was not verified as a "
+                    f"reachable commit; needfix {needfix_id} stays task_created"
+                )
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                current = conn.execute(
+                    "SELECT evidence_refs_json FROM needfix WHERE id = ?", (needfix_id,)
+                ).fetchone()
+                evidence_refs = json.loads(current["evidence_refs_json"] or "[]")
+                if f"git:{oid}" not in evidence_refs:
+                    evidence_refs.append(f"git:{oid}")
+                now = _utcnow_iso()
+                cur = conn.execute(
+                    "UPDATE needfix SET status = 'resolved', resolved_at = ?, updated_at = ?, "
+                    "evidence_refs_json = ? WHERE id = ? AND status = 'task_created' "
+                    "AND converted_task_id = ?",
+                    (now, now, json.dumps(evidence_refs), needfix_id, existing_task_id),
+                )
+                if cur.rowcount != 1:
+                    raise NeedFixConflictError(
+                        f"needfix {needfix_id} changed before the link retry could resolve it"
+                    )
+                _record_event(conn, needfix_id, "integrated_commit_resolved", {
+                    "converted_task_id": existing_task_id, "integrated_commit": oid,
+                    "via": "link_retry",
+                })
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            return {
+                "needfix_id": needfix_id,
+                "converted_task_id": existing_task_id,
+                "already_converted": True,
+                "resolved": True,
+                "integrated_commit": oid,
+            }
 
         if row["status"] == "resolved":
             if row["converted_task_id"] == existing_task_id:
@@ -3349,6 +3414,11 @@ def link_existing_task(
             integrated_commit=integrated_commit, verify_commit_fn=verify_commit_fn,
         )
         if not linkable:
+            if task_status in LINKABLE_CARD_STATUSES:
+                raise NeedFixConflictError(
+                    f"existing task {existing_task_id!r} is linkable but integrated_commit "
+                    f"{integrated_commit!r} was not verified as a reachable commit"
+                )
             linkable_statuses = ", ".join(sorted(LINKABLE_CARD_STATUSES))
             raise NeedFixConflictError(
                 _append_superseded_hint(
