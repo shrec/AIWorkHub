@@ -4196,8 +4196,13 @@ def aiworkhub_quality_reviewer_launch(
         lens=lens,
         model=model,
         timeout_seconds=timeout_seconds,
+        # One live reviewer per target+lens, decided by the launcher under its
+        # cross-process registry lock; the refusal is returned unchanged.
+        refuse_live_lens=True,
     )
-    if isinstance(result, dict):
+    if isinstance(result, dict) and (
+        result.get("error") != "quality_review_lens_already_running"
+    ):
         result["timeout_seconds"] = timeout_seconds
         result["timeout_enforced"] = False
     return result

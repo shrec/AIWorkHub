@@ -61,6 +61,7 @@ ACCEPT_BLOCKER_KINDS = (
     "refinement_required",
     "explicit_human_approval_missing",       # 5 of 159
     "destructive_diff_requires_manager_confirmation",
+    "reviewer_state_unknown",  # ledger unreadable: neither running nor missing
 )
 
 
@@ -220,17 +221,47 @@ def reviewer_evidence(
     two conditions the accept surface has always conflated and which need
     different answers from a manager.
 
+    ``running`` is liveness, never a state string: it comes only from the
+    launcher's per-event rule (``_live_lens_reviewers``) over attempts sealed
+    to this exact parent.  A live reviewer whose card carries no binding yet is
+    listed from its topic ``quality_review`` ledger event alone (NF-2026-01058).
+
     Total by construction: a ledger read failure leaves every reviewer with an
-    empty request id and ``usable`` False, which blocks acceptance rather than
-    granting it.
+    empty request id, ``usable`` False and ``state_unknown`` True -- never a
+    ``running`` False dressed up as knowledge -- which blocks acceptance.
     """
     rows = bound_reviewer_rows(self.repo, parent_task_id, parent_request_id)
-    if not rows:
-        return []
+    live_lens_reviewers = getattr(self, "_live_lens_reviewers", None)
     try:
         latest = self._latest_by_request()
-    except Exception:  # noqa: BLE001 -- a ledger read failure names no reviewer
-        latest = {}
+        live = (
+            live_lens_reviewers(latest, parent_task_id, parent_request_id)
+            if live_lens_reviewers is not None
+            else []
+        )
+    except Exception:  # noqa: BLE001 -- unknown is neither running nor missing
+        unknown = {
+            "request_id": "", "state": "", "usable": False, "attempt_count": 0,
+            "running": False, "running_request_id": "", "state_unknown": True,
+        }
+        return [{**row, **unknown} for row in rows] or [{
+            "task_id": "", "lens": "", "packet_sha256": "",
+            "terminal_substatus": "", "receipt": None, **unknown,
+        }]
+    live_by_task: dict[str, tuple[str, Mapping[str, Any]]] = {}
+    for live_request_id, live_event in live:
+        live_by_task.setdefault(
+            str(live_event.get("task_id") or ""), (live_request_id, live_event)
+        )
+    bound_task_ids = {row["task_id"] for row in rows}
+    for live_task_id, (_live_request_id, live_event) in live_by_task.items():
+        if live_task_id and live_task_id not in bound_task_ids:
+            # A running reviewer's binding exists only in its ledger event.
+            attempt = live_event.get("quality_review_attempt") or {}
+            rows.append({
+                "task_id": live_task_id, "lens": str(attempt.get("lens") or ""),
+                "packet_sha256": "", "terminal_substatus": "", "receipt": None,
+            })
     attempts: dict[str, list[dict[str, Any]]] = {}
     for request_id, event in latest.items():
         if not isinstance(event, dict):
@@ -258,6 +289,7 @@ def reviewer_evidence(
             key=lambda attempt: (attempt["finished_at"], attempt["request_id"]),
             default=None,
         )
+        running = live_by_task.get(row["task_id"])
         resolved.append(
             {
                 **row,
@@ -265,6 +297,9 @@ def reviewer_evidence(
                 "state": str((chosen or {}).get("state") or ""),
                 "usable": bool(usable) and chosen is not None,
                 "attempt_count": len(candidates),
+                "running": running is not None,
+                "running_request_id": running[0] if running else "",
+                "state_unknown": False,
             }
         )
     return sorted(resolved, key=lambda entry: (entry["lens"], entry["task_id"]))
@@ -677,18 +712,33 @@ def fold_accept_blockers(
     # say a lens is missing. The accept fold still can, and does.
     lens_census_complete = not unresolved and all(row["lens"] for row in chosen)
     usable_lenses = {row["lens"] for row in chosen if row["usable"]}
-    running_lenses = {row["lens"] for row in reviewers if not row["usable"]}
+    # Running is the launcher's liveness verdict (``running``), never a state
+    # string; an unreadable ledger is ``state_unknown``, never "not running".
+    running_rows = {
+        row["lens"]: row for row in reviewers if row.get("running") and not row["usable"]
+    }
+    state_unknown = any(row.get("state_unknown") for row in reviewers)
     if lens_census_complete:
         for lens in required:
             if lens in usable_lenses:
                 continue
+            if state_unknown:
+                blockers.append(_blocker("reviewer_state_unknown", lens, lens=lens))
+                continue
+            live = running_rows.get(lens)
             blockers.append(
                 _blocker(
                     "required_reviewer_missing", lens,
                     lens=lens,
                     # The difference between "launch one" and "wait for the one
                     # already running" -- the manager's next action, named.
-                    reviewer_running=lens in running_lenses,
+                    reviewer_running=live is not None,
+                    **({
+                        "reviewer_task_id": live["task_id"],
+                        "reviewer_request_id": (
+                            live.get("running_request_id") or live["request_id"]
+                        ),
+                    } if live is not None else {}),
                 )
             )
     blockers.extend(_refinement_blockers([row for row in chosen if row["usable"]]))
@@ -720,6 +770,7 @@ def fold_accept_blockers(
                     "request_id": row["request_id"],
                     "state": row["state"],
                     "usable": row["usable"],
+                    "running": bool(row.get("running")),
                     "required": row["lens"] in required,
                     "selected": any(
                         chosen_row is row for chosen_row in chosen

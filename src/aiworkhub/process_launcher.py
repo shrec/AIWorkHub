@@ -7885,73 +7885,103 @@ class ProcessManager:
             if live.task_id == reviewer_task_id and live.process.poll() is None:
                 return _admit(live.request_id)
         for request_id, event in latest.items():
-            if event.get("task_id") != reviewer_task_id:
-                continue
-            state = event.get("state")
-            if state == "provider_spawn_committed":
-                provider_pid, provider_pid_ambiguous = _parse_durable_pid(
-                    event.get("provider_pid")
-                )
-                if provider_pid_ambiguous:
-                    return _admit(request_id)
-                if provider_pid and _pid_identity_evidence(
-                    provider_pid, event.get("provider_pid_start_ticks")
-                ).verdict is not PidIdentityVerdict.MISMATCH:
-                    return _admit(request_id)
-                owner_pid, owner_pid_ambiguous = _parse_durable_pid(event.get("owner_pid"))
-                if owner_pid_ambiguous:
-                    return _admit(request_id)
-                if owner_pid and _pid_identity_evidence(
-                    owner_pid, event.get("owner_pid_start_ticks")
-                ).verdict is not PidIdentityVerdict.MISMATCH:
-                    return _admit(request_id)
-                continue
-            if state not in ACTIVE_PROCESS_STATES:
-                continue
-            pid, pid_ambiguous = _parse_durable_pid(event.get("pid"))
-            if pid_ambiguous:
-                return _admit(request_id)
-            if state == "starting" and not pid:
-                owner_pid, owner_pid_ambiguous = _parse_durable_pid(event.get("owner_pid"))
-                if owner_pid_ambiguous:
-                    return _admit(request_id)
-                owner_identity = (
-                    _pid_identity_evidence(
-                        owner_pid, event.get("owner_pid_start_ticks")
-                    ).verdict
-                    if owner_pid > 0
-                    else None
-                )
-                if (
-                    owner_pid > 0
-                    and owner_identity is not PidIdentityVerdict.MISMATCH
-                ):
-                    return _admit(request_id)
-                if self._reviewer_source_graph_prewarm_live_event(event):
-                    return _admit(request_id)
-                try:
-                    reservation_deadline = float(
-                        event.get("reservation_expires_at_epoch") or 0.0
-                    )
-                except (TypeError, ValueError, OverflowError):
-                    # A malformed lease is ambiguous evidence.  Admission must
-                    # preserve the reservation instead of raising and allowing
-                    # a retry to mint a second provider.
-                    return _admit(request_id)
-                if not math.isfinite(reservation_deadline):
-                    return _admit(request_id)
-                if reservation_deadline > time.time():
-                    return _admit(request_id)
-                continue
-            if (
-                pid
-                and _pid_identity_evidence(
-                    pid, event.get("pid_start_ticks")
-                ).verdict
-                is not PidIdentityVerdict.MISMATCH
+            if event.get("task_id") == reviewer_task_id and self._reviewer_event_live(
+                event
             ):
                 return _admit(request_id)
         return None
+
+    def _reviewer_event_live(self, event: Mapping[str, Any]) -> bool:
+        """Whether one reviewer ledger event proves, or cannot rule out, a live attempt.
+
+        The one per-event rule behind duplicate admission, lens exclusivity and
+        accept-preview visibility: a spawn-committed provider or owner pid, or an
+        active pid, that is not a proven identity MISMATCH; a pid-null
+        ``starting`` reservation with a live owner, a live prewarm or an
+        unexpired lease.  Ambiguous evidence is live; elapsed or quiet time
+        against a live provider never is evidence of death.
+        """
+
+        state = event.get("state")
+        if state == "provider_spawn_committed":
+            for key in ("provider_pid", "owner_pid"):
+                pid, ambiguous = _parse_durable_pid(event.get(key))
+                if ambiguous or (pid and _pid_identity_evidence(
+                    pid, event.get(f"{key}_start_ticks")
+                ).verdict is not PidIdentityVerdict.MISMATCH):
+                    return True
+            return False
+        if state not in ACTIVE_PROCESS_STATES:
+            return False
+        pid, pid_ambiguous = _parse_durable_pid(event.get("pid"))
+        if pid_ambiguous:
+            return True
+        if state == "starting" and not pid:
+            owner_pid, owner_pid_ambiguous = _parse_durable_pid(event.get("owner_pid"))
+            if owner_pid_ambiguous or (owner_pid > 0 and _pid_identity_evidence(
+                owner_pid, event.get("owner_pid_start_ticks")
+            ).verdict is not PidIdentityVerdict.MISMATCH):
+                return True
+            if self._reviewer_source_graph_prewarm_live_event(event):
+                return True
+            try:
+                deadline = float(event.get("reservation_expires_at_epoch") or 0.0)
+            except (TypeError, ValueError, OverflowError):
+                # A malformed lease is ambiguous evidence.  Admission must
+                # preserve the reservation instead of raising and allowing
+                # a retry to mint a second provider.
+                return True
+            return not math.isfinite(deadline) or deadline > time.time()
+        return bool(pid) and _pid_identity_evidence(
+            pid, event.get("pid_start_ticks")
+        ).verdict is not PidIdentityVerdict.MISMATCH
+
+    def _live_lens_reviewers(
+        self,
+        latest: Mapping[str, Mapping[str, Any]],
+        target_task_id: str,
+        target_request_id: str,
+        lens: str | None = None,
+    ) -> list[tuple[str, Mapping[str, Any]]]:
+        """Every live reviewer attempt sealed to this exact target (and lens).
+
+        Only ``quality_review`` events whose sealed ``quality_review_attempt``
+        matches exactly count.  Liveness is :meth:`_reviewer_event_live`, or a
+        tracked child of this process that has not exited.  A terminal attempt
+        is never live, so supplemental rounds are never blocked by one.
+        """
+
+        running = {
+            live.request_id for live in self._live.values() if live.process.poll() is None
+        }
+        hits: list[tuple[str, Mapping[str, Any]]] = []
+        for request_id, event in latest.items():
+            attempt = event.get("quality_review_attempt") if isinstance(
+                event, Mapping
+            ) else None
+            if not isinstance(attempt, Mapping) or event.get("topic") != "quality_review":
+                continue
+            if (
+                str(attempt.get("target_task_id") or "") != target_task_id
+                or str(attempt.get("target_request_id") or "") != target_request_id
+                or (lens is not None and str(attempt.get("lens") or "") != lens)
+            ):
+                continue
+            if request_id in running or self._reviewer_event_live(event):
+                hits.append((str(request_id), event))
+        return hits
+
+    def live_reviewer_for_lens(
+        self, target_task_id: str, target_request_id: str, lens: str
+    ) -> dict[str, str] | None:
+        """``{task_id, request_id}`` of the live reviewer on this exact lens, else None."""
+
+        hits = self._live_lens_reviewers(
+            self._latest_by_request(), target_task_id, target_request_id, lens
+        )
+        if not hits:
+            return None
+        return {"task_id": str(hits[0][1].get("task_id") or ""), "request_id": hits[0][0]}
 
     def _reserve_quality_reviewer_attempt(
         self,
@@ -7964,6 +7994,7 @@ class ProcessManager:
         lens: str,
         model: str | None,
         timeout_seconds: int,
+        refuse_live_lens: bool = False,
     ) -> dict[str, Any]:
         """Atomically reserve one exact reviewer attempt before any preparation.
 
@@ -8010,6 +8041,19 @@ class ProcessManager:
                 )
                 if existing is not None:
                     return existing
+                # Lens exclusivity is decided from the SAME proven snapshot under
+                # the cross-process registry lock, so two servers cannot both pass.
+                rival = next((
+                    hit for hit in self._live_lens_reviewers(
+                        latest, target_task_id, target_request_id, lens
+                    ) if str(hit[1].get("task_id") or "") != reviewer_task_id
+                ), None) if refuse_live_lens else None
+                if rival is not None:
+                    return {
+                        "ok": False, "error": "quality_review_lens_already_running",
+                        "reviewer_task_id": str(rival[1].get("task_id") or ""),
+                        "reviewer_request_id": rival[0], "lens": lens,
+                    }
                 if self._active_count(latest) >= _configured_limit():
                     return {"ok": False, "error": "concurrency_limit_reached"}
                 request_id = uuid.uuid4().hex
@@ -8886,6 +8930,7 @@ class ProcessManager:
         lens: str,
         model: str | None = None,
         timeout_seconds: int = 1800,
+        refuse_live_lens: bool = False,
     ) -> dict[str, Any]:
         """Create and launch one independent packet-bound reviewer task.
 
@@ -8956,6 +9001,7 @@ class ProcessManager:
             lens=lens,
             model=model,
             timeout_seconds=timeout_seconds,
+            refuse_live_lens=refuse_live_lens,
         )
         if reservation.get("ok") is not True:
             return reservation
@@ -11563,6 +11609,8 @@ class ProcessManager:
                         time.monotonic() - phase_started
                     ) * 1000.0
 
+            # Read on finalize_failed: never mask a non-exited root cause (NF-2026-01069).
+            claim_state = ""
             try:
                 if terminal_state != "exited":
                     # A worker that timed out, crashed, or was cancelled produced

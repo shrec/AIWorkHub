@@ -1068,6 +1068,7 @@ def test_missing_supervisor_status_releases_on_restart_and_retries_failed_releas
     repo: Path,
 ) -> None:
     monkeypatch.setenv(process_launcher.ALLOW_WRITES_ENV, "1")
+    monkeypatch.setenv("AIWORKHUB_TOOLCHAIN_AUTHORITY_HMAC_KEY", "hex:" + "11" * 32)
     card = _card()
     card.update({
         "status": "processing",
@@ -1111,7 +1112,7 @@ def test_missing_supervisor_status_releases_on_restart_and_retries_failed_releas
 
     release_enabled = True
     result = restarted.status(request_id)
-    assert result["state"] == "worker_failed"
+    assert result["state"] == "worker_failed", result.get("error")
     assert len(release_calls) == 2
     assert all(call[:2] == (card["task_id"], card["runner"]) for call in release_calls)
     # Terminal-failure evidence is retained for diagnosis without inflating
@@ -1166,6 +1167,7 @@ def test_vscode_lm_structured_response_timeout_is_not_authoritative(
     repo: Path,
 ) -> None:
     monkeypatch.setenv(process_launcher.ALLOW_WRITES_ENV, "1")
+    monkeypatch.setenv("AIWORKHUB_TOOLCHAIN_AUTHORITY_HMAC_KEY", "hex:" + "11" * 32)
     card = _card()
     card.update({
         "status": "processing",
@@ -1201,7 +1203,7 @@ def test_vscode_lm_structured_response_timeout_is_not_authoritative(
 
     event = manager._finalize_isolated_request(request_id, supervisor_returncode=1)
 
-    assert event["state"] == "worker_failed"
+    assert event["state"] == "worker_failed", event.get("error")
     assert event["state"] != "timed_out"
     assert "source=vscode_lm_response_timeout" not in str(event.get("error") or "")
     assert releases == [(card["task_id"], card["runner"], "worker_failed")]
@@ -1396,6 +1398,7 @@ def test_vscode_lm_worker_failure_records_a_typed_unknown_attempt(
     tmp_path: Path,
     repo: Path,
 ) -> None:
+    monkeypatch.setenv("AIWORKHUB_TOOLCHAIN_AUTHORITY_HMAC_KEY", "hex:" + "11" * 32)
     _manager, request_id, event, transitions = _finalize_attempt(
         monkeypatch,
         tmp_path,
@@ -1413,8 +1416,49 @@ def test_vscode_lm_worker_failure_records_a_typed_unknown_attempt(
     assert attempt["identity"] == _attempt_identity(request_id)
     assert attempt["receipt"]["unknown_reason"] == "receipt_absent"
     assert attempt["receipt"]["send_state"] == "unknown"
-    assert event["state"] == "worker_failed"
+    assert event["state"] == "worker_failed", event.get("error")
     assert transitions == [("failure", "worker_failed")]
+
+
+def test_non_exited_finalization_failure_keeps_its_root_cause(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    repo: Path,
+) -> None:
+    # NF-2026-01069: the finalize_failed handler read ``claim_state`` before any
+    # non-exited path bound it, so an UnboundLocalError masked the real error.
+    monkeypatch.setenv("AIWORKHUB_TOOLCHAIN_AUTHORITY_HMAC_KEY", "hex:" + "11" * 32)
+
+    # The terminal transition at the end of the non-exited branch runs inside
+    # the finalization try, so raising there reaches the finalize_failed handler.
+    recorded: list[tuple[str, dict]] = []
+    original = process_launcher.ProcessManager._terminal_failure_exact
+
+    def raise_then_capture(self, metadata, terminal_state, **kwargs):
+        if terminal_state != "finalize_failed":
+            raise RuntimeError("nf1069-root-cause")
+        recorded.append((terminal_state, dict(kwargs.get("evidence") or {})))
+        return original(self, metadata, terminal_state, **kwargs)
+
+    monkeypatch.setattr(
+        process_launcher.ProcessManager, "_terminal_failure_exact", raise_then_capture
+    )
+    _manager, _request_id, event, _transitions = _finalize_attempt(
+        monkeypatch,
+        tmp_path,
+        repo,
+        {
+            "type": "result",
+            "subtype": "error",
+            "is_error": True,
+            "error": "vscode_lm_response_timeout",
+        },
+        exit_code=1,
+    )
+
+    assert event["state"] == "finalize_failed", event.get("error")
+    assert [state for state, _evidence in recorded] == ["finalize_failed"]
+    assert "nf1069-root-cause" in recorded[0][1]["error"]
 
 
 @pytest.mark.skipif(os.name == "nt", reason="review finalization needs the POSIX sandbox")
@@ -2276,6 +2320,7 @@ def test_monitor_does_not_enforce_legacy_provider_timeout(
 def test_quality_reviewer_preflight_rejects_foreign_launch_request_id(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setenv("AIWORKHUB_TOOLCHAIN_AUTHORITY_HMAC_KEY", "hex:" + "11" * 32)
     reserved = "a" * 32
     foreign = "b" * 32
     card = {

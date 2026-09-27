@@ -24,6 +24,7 @@ import ast
 import builtins
 import contextlib
 import inspect
+import os
 from pathlib import Path
 
 import pytest
@@ -374,7 +375,16 @@ def _store_with_reviewers(tmp_path: Path, cards: list[dict]) -> Path:
 
 
 class _ReviewerManager:
-    """The three collaborators the reviewer-resolution path actually uses."""
+    """The collaborators the reviewer-resolution path actually uses.
+
+    Liveness is the launcher's own rule, borrowed unchanged, so a test here
+    proves the accept surface and the launcher cannot disagree about it.
+    """
+
+    _live: dict = {}
+    _live_lens_reviewers = process_launcher.ProcessManager._live_lens_reviewers
+    _reviewer_event_live = process_launcher.ProcessManager._reviewer_event_live
+    _reviewer_source_graph_prewarm_live_event = staticmethod(lambda _event: False)
 
     def __init__(self, repo: Path, events: dict[str, dict] | None = None) -> None:
         self.repo = repo
@@ -477,7 +487,8 @@ def test_fold_defaults_to_the_server_bound_reviewers_and_names_what_is_left():
         {"task_id": "QR-C", "lens": "correctness", "request_id": "rq-c",
          "state": "review_ready", "usable": True, "receipt": None},
         {"task_id": "QR-S", "lens": "security", "request_id": "rq-s",
-         "state": "running", "usable": False, "receipt": None},
+         "state": "running", "usable": False, "receipt": None,
+         "running": True, "running_request_id": "rq-s"},
     ]
     fold = process_launcher_accept_review.fold_accept_blockers(
         reviewers=reviewers,
@@ -494,6 +505,140 @@ def test_fold_defaults_to_the_server_bound_reviewers_and_names_what_is_left():
     ]
     # "wait" and "launch" are different next actions and the fold says which.
     assert fold["blockers"][0]["reviewer_running"] is True
+    assert fold["blockers"][0]["reviewer_task_id"] == "QR-S"
+    assert fold["blockers"][0]["reviewer_request_id"] == "rq-s"
+
+
+def test_fold_never_reads_running_from_a_state_string():
+    """NF-2026-01058: a reviewer that died without a terminal event keeps its
+    ``running`` state string forever; only launcher liveness says running."""
+    reviewers = [
+        {"task_id": "QR-S", "lens": "security", "request_id": "rq-s",
+         "state": "running", "usable": False, "receipt": None, "running": False},
+    ]
+    fold = process_launcher_accept_review.fold_accept_blockers(
+        reviewers=reviewers,
+        reviewer_request_ids=None,
+        risk_profile=_profile("high"),
+        terminal_substatus="review_ready",
+        confirm_high_risk=True,
+    )
+    missing = [row for row in fold["blockers"] if row["lens"] == "security"]
+    assert missing[0]["kind"] == "required_reviewer_missing"
+    assert missing[0]["reviewer_running"] is False
+    assert "reviewer_task_id" not in missing[0]
+
+
+_PARENT = {"target_task_id": "T-1", "target_request_id": "R-1"}
+
+
+def _reviewer_event(task_id: str, lens: str, **fields) -> dict:
+    event = {
+        "task_id": task_id,
+        "topic": "quality_review",
+        "state": "running",
+        "pid": os.getpid(),
+        "pid_start_ticks": process_launcher._pid_start_ticks(os.getpid()),
+        "quality_review_attempt": {**_PARENT, "lens": lens},
+    }
+    event.update(fields)
+    return event
+
+
+def _preview(tmp_path: Path, events: dict[str, dict]) -> dict:
+    repo = _store_with_reviewers(tmp_path, [])
+    manager = _ReviewerManager(repo, events)
+    card = {
+        "task_id": "T-1",
+        "risk_tier": "high",
+        "terminal_review": {
+            "substatus": "review_ready",
+            "evidence": {"changed_paths": ["src/aiworkhub/process_launcher.py"]},
+        },
+    }
+    manager._show_task = lambda task_id: {"returncode": 0, "stdout": json.dumps(card)}
+    return process_launcher_accept_review.accept_preview(manager, "R-1", "T-1")
+
+
+def _correctness_blocker(preview: dict) -> dict:
+    return next(
+        row for row in preview["blockers"]
+        if row["kind"] in {"required_reviewer_missing", "reviewer_state_unknown"}
+        and row["lens"] == "correctness"
+    )
+
+
+def test_accept_preview_names_a_live_ledger_only_reviewer_running(tmp_path: Path):
+    """The 01205 regression: the running reviewer's binding exists only in its
+    ledger event, so the preview said ``reviewer_running=false`` and a second
+    reviewer was launched for the same lens."""
+    preview = _preview(tmp_path, {"rq-live": _reviewer_event("QR-LIVE", "correctness")})
+
+    blocker = _correctness_blocker(preview)
+    assert blocker["kind"] == "required_reviewer_missing"
+    assert blocker["reviewer_running"] is True
+    assert blocker["reviewer_task_id"] == "QR-LIVE"
+    assert blocker["reviewer_request_id"] == "rq-live"
+    row = next(row for row in preview["per_lens"] if row["task_id"] == "QR-LIVE")
+    assert row["usable"] is False and row["running"] is True
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        # Ledger says running, but the pid identity is a proven MISMATCH.
+        _reviewer_event("QR-DEAD", "correctness", pid_start_ticks=1),
+        # Pid-null reservation, lease expired, owner proven dead (this pid
+        # with the wrong creation ticks is a proven identity MISMATCH).
+        _reviewer_event(
+            "QR-DEAD", "correctness", state="starting", pid=0,
+            reservation_expires_at_epoch=1.0,
+            owner_pid=os.getpid(), owner_pid_start_ticks=1,
+        ),
+        # A terminal reviewer never blocks (supplemental rounds).
+        _reviewer_event("QR-DEAD", "correctness", state="blocked"),
+        # Bound to a different parent request.
+        _reviewer_event(
+            "QR-DEAD", "correctness",
+            quality_review_attempt={**_PARENT, "target_request_id": "R-OTHER",
+                                    "lens": "correctness"},
+        ),
+    ],
+    ids=["pid_mismatch", "expired_dead_reservation", "terminal", "other_request"],
+)
+def test_accept_preview_never_reports_a_dead_or_foreign_reviewer_running(
+    tmp_path: Path, event: dict
+):
+    preview = _preview(tmp_path, {"rq-dead": event})
+
+    blocker = _correctness_blocker(preview)
+    assert blocker["kind"] == "required_reviewer_missing"
+    assert blocker["reviewer_running"] is False
+
+
+def test_accept_preview_fails_closed_on_an_unreadable_ledger(tmp_path: Path):
+    """Unknown is neither running nor missing: a read failure must never be
+    reported as ``reviewer_running=false`` (a duplicate-launch instruction)."""
+
+    class _Unreadable(_ReviewerManager):
+        def _latest_by_request(self) -> dict[str, dict]:
+            raise OSError("ledger unreadable")
+
+    repo = _store_with_reviewers(tmp_path, [])
+    rows = process_launcher_accept_review.reviewer_evidence(
+        _Unreadable(repo), "T-1", "R-1"
+    )
+    assert rows and all(row["state_unknown"] and not row["usable"] for row in rows)
+    fold = process_launcher_accept_review.fold_accept_blockers(
+        reviewers=rows,
+        reviewer_request_ids=None,
+        risk_profile=_profile("high"),
+        terminal_substatus="review_ready",
+        confirm_high_risk=True,
+    )
+    kinds = {row["kind"] for row in fold["blockers"]}
+    assert kinds == {"reviewer_state_unknown"}
+    assert "reviewer_state_unknown" in process_launcher_accept_review.ACCEPT_BLOCKER_KINDS
 
 
 def test_fold_never_invents_a_refusal_for_a_reviewer_it_cannot_see():
@@ -608,8 +753,9 @@ def test_accept_preview_is_read_only_and_answers_before_any_materialization(
     or a validation run -- the three things 49 of 159 failed attempts paid for
     before being told a parameter was wrong."""
     repo = _store_with_reviewers(tmp_path, [_reviewer_card("QR-C", "correctness")])
+    # Running means launcher liveness (a live pid), not the state string.
     manager = _ReviewerManager(
-        repo, {"rq-c": {"task_id": "QR-C", "state": "running"}}
+        repo, {"rq-c": _reviewer_event("QR-C", "correctness")}
     )
     card = {
         "task_id": "T-1",

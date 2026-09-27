@@ -2769,7 +2769,9 @@ def _ledger_diagnostics(manager: process_launcher.ProcessManager) -> list[dict]:
     ]
 
 
-def test_standing_unprovable_ledger_generation_stops_replaying(tmp_path, monkeypatch):
+def test_standing_unprovable_ledger_generation_stops_replaying(
+    tmp_path, monkeypatch, make_symlink
+):
     # ``_ledger_generation`` refuses a segment that is a symlink or not a
     # regular file, and that refusal does not go away by asking again.  The
     # stable snapshot used to spend its whole ``_LEDGER_SNAPSHOT_MAX_ATTEMPTS``
@@ -2790,7 +2792,7 @@ def test_standing_unprovable_ledger_generation_stops_replaying(tmp_path, monkeyp
     elsewhere.mkdir()
     real = elsewhere / segment.name
     segment.rename(real)
-    segment.symlink_to(real)
+    make_symlink(real, segment)
 
     # ``ledger_paths`` drops a symlinked archive on the floor, so hand the
     # segment straight to ``_ledger_generation`` -- the way a segment swapped
@@ -3155,3 +3157,214 @@ def test_claimed_pre_provider_exception_uses_exact_reserved_request(tmp_path, mo
         manager.repo, "TARGET_TASK", reason="terminal launch failure"
     )
     assert archived is True, archive_reason
+
+
+# ---------------------------------------------------------------------------
+# NF-2026-01058: one live reviewer per target task + target request + lens.
+#
+# Exclusivity is decided inside ``_reserve_quality_reviewer_attempt`` under the
+# cross-process registry lock from ONE proven snapshot, with the launcher's own
+# pid/reservation liveness -- never the event's state string, which a reviewer
+# that died without a terminal event keeps forever.
+# ---------------------------------------------------------------------------
+
+
+_LENS_BINDING = {
+    "target_request_id": "target-req",
+    "target_task_id": "TARGET_TASK",
+    "lens": "correctness",
+}
+
+
+def _lens_refusal(task_id: str, request_id: str) -> dict:
+    return {
+        "ok": False,
+        "error": "quality_review_lens_already_running",
+        "reviewer_task_id": task_id,
+        "reviewer_request_id": request_id,
+        "lens": "correctness",
+    }
+
+
+def _reserve_lens(
+    manager: process_launcher.ProcessManager,
+    reviewer_task_id: str,
+    *,
+    refuse: bool = True,
+    **binding: str,
+) -> dict:
+    target = {**_LENS_BINDING, **binding}
+    return manager._reserve_quality_reviewer_attempt(
+        reviewer_task_id=reviewer_task_id,
+        runner=RUNNER,
+        adapter_id=ADAPTER,
+        target_request_id=target["target_request_id"],
+        target_task_id=target["target_task_id"],
+        lens=target["lens"],
+        model=None,
+        timeout_seconds=1800,
+        refuse_live_lens=refuse,
+    )
+
+
+def test_two_managers_sharing_one_ledger_admit_one_reviewer_per_lens(tmp_path):
+    first, second = _manager(tmp_path), _manager(tmp_path)
+    barrier = threading.Barrier(2)
+    results: dict[str, dict] = {}
+
+    def reserve(manager: process_launcher.ProcessManager, task_id: str) -> None:
+        barrier.wait(timeout=10)
+        results[task_id] = _reserve_lens(manager, task_id)
+
+    threads = [
+        threading.Thread(target=reserve, args=(first, "REVIEWER_A")),
+        threading.Thread(target=reserve, args=(second, "REVIEWER_B")),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=15)
+        assert not thread.is_alive()
+
+    admitted = [task for task, receipt in results.items() if receipt.get("ok") is True]
+    refused = [task for task, receipt in results.items() if receipt.get("ok") is not True]
+    assert len(admitted) == 1 and len(refused) == 1
+    winner = admitted[0]
+    assert results[refused[0]] == _lens_refusal(winner, results[winner]["request_id"])
+    reservations = [
+        event for event in first._events() if event.get("state") == "starting"
+    ]
+    assert [event["task_id"] for event in reservations] == [winner]
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        # Ledger still says running, but the pid identity is a proven MISMATCH.
+        {
+            "request_id": "dead-run", "task_id": "REVIEWER_DEAD", "runner": RUNNER,
+            "topic": TOPIC, "adapter_id": ADAPTER, "state": "running",
+            "pid": os.getpid(), "pid_start_ticks": 1,
+            "quality_review_attempt": dict(_LENS_BINDING),
+        },
+        # Pid-null reservation whose lease expired and whose owner is dead.
+        {
+            **_starting(
+                request_id="dead-start", task_id="REVIEWER_DEAD",
+                expires_at=time.time() - 1.0,
+            ),
+            "owner_pid": os.getpid(), "owner_pid_start_ticks": 1,
+        },
+        # A terminal reviewer never blocks, so supplemental rounds still work.
+        {
+            "request_id": "done", "task_id": "REVIEWER_DEAD", "runner": RUNNER,
+            "topic": TOPIC, "adapter_id": ADAPTER, "state": "review_ready",
+            "quality_review_attempt": dict(_LENS_BINDING),
+        },
+    ],
+    ids=["pid_mismatch", "expired_dead_owner_reservation", "terminal"],
+)
+def test_dead_or_terminal_reviewer_never_blocks_its_lens(tmp_path, event):
+    manager = _manager(tmp_path, initialize_task_queue=True)
+    manager._append_event(event)
+
+    assert manager.live_reviewer_for_lens(
+        "TARGET_TASK", "target-req", "correctness"
+    ) is None
+    receipt = _reserve_lens(manager, "REVIEWER_NEW")
+    assert receipt["ok"] is True
+    assert receipt["already_reserved"] is False
+
+
+def test_live_lens_reviewer_blocks_only_its_exact_target_and_lens(tmp_path):
+    manager = _manager(tmp_path)
+    manager._append_event(
+        _starting(
+            request_id="live-a", task_id="REVIEWER_A", expires_at=time.time() + 120.0,
+        )
+    )
+
+    assert manager.live_reviewer_for_lens(
+        "TARGET_TASK", "target-req", "correctness"
+    ) == {"task_id": "REVIEWER_A", "request_id": "live-a"}
+    assert _reserve_lens(manager, "REVIEWER_B") == _lens_refusal("REVIEWER_A", "live-a")
+
+    # The same reviewer task relaunching keeps its idempotent reconcile.
+    same = _reserve_lens(manager, "REVIEWER_A")
+    assert same["ok"] is True
+    assert same["already_reserved"] is True
+    assert same["request_id"] == "live-a"
+
+    # A different lens, target request or target task is never blocked.
+    for index, binding in enumerate((
+        {"lens": "security"},
+        {"target_request_id": "other-req"},
+        {"target_task_id": "TARGET_B"},
+    )):
+        receipt = _reserve_lens(manager, f"REVIEWER_OTHER_{index}", **binding)
+        assert receipt["ok"] is True, binding
+        assert receipt["already_reserved"] is False
+
+
+def test_lens_exclusivity_is_opt_in_for_the_orchestrator_path(tmp_path):
+    manager = _manager(tmp_path)
+    manager._append_event(
+        _starting(
+            request_id="live-a", task_id="REVIEWER_A", expires_at=time.time() + 120.0,
+        )
+    )
+
+    receipt = _reserve_lens(manager, "REVIEWER_B", refuse=False)
+    assert receipt["ok"] is True
+    assert receipt["already_reserved"] is False
+
+
+def test_launch_with_refuse_live_lens_returns_refusal_and_appends_nothing(
+    tmp_path, monkeypatch,
+):
+    manager = _manager(tmp_path)
+    manager._append_event(
+        _starting(
+            request_id="live-a", task_id="REVIEWER_A", expires_at=time.time() + 120.0,
+        )
+    )
+    monkeypatch.setattr(
+        manager,
+        "_prepared_quality_review",
+        lambda *_args, **_kwargs: pytest.fail("a refused lens must not prepare"),
+    )
+    before = len(manager._events())
+
+    receipt = manager.launch_quality_reviewer(
+        target_request_id="target-req",
+        target_task_id="TARGET_TASK",
+        reviewer_task_id="REVIEWER_B",
+        runner=RUNNER,
+        adapter_id=ADAPTER,
+        lens="correctness",
+        refuse_live_lens=True,
+    )
+
+    assert receipt == _lens_refusal("REVIEWER_A", "live-a")
+    assert len(manager._events()) == before
+
+
+def test_server_reviewer_launch_refuses_live_lens_through_the_launcher(monkeypatch):
+    from aiworkhub import server
+
+    seen: dict = {}
+    refusal = _lens_refusal("REVIEWER_A", "live-a")
+
+    class FakeManager:
+        def launch_quality_reviewer(self, **kwargs):
+            seen.update(kwargs)
+            return dict(refusal)
+
+    monkeypatch.setattr(server.process_launcher, "default_manager", FakeManager)
+
+    result = server.aiworkhub_quality_reviewer_launch(
+        "target-req", "TARGET_TASK", "REVIEWER_B", RUNNER, ADAPTER, "correctness",
+    )
+
+    assert seen["refuse_live_lens"] is True
+    assert result == refusal
