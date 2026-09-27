@@ -160,6 +160,37 @@ def test_worker_semantic_edit_rejects_stale_and_out_of_scope(tmp_path: Path) -> 
     assert target.read_text(encoding="utf-8") == "changed\ntwo\n"
 
 
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "Z:foo",
+        "Z:\\foo",
+        "Z:/foo",
+        "\\\\server\\share\\x",
+        "//server/share/x",
+        "\\foo",
+    ],
+)
+def test_normalize_relative_path_refuses_windows_drive_and_anchor_forms(raw: str) -> None:
+    with pytest.raises(semantic_edit.SemanticEditError) as excinfo:
+        semantic_edit.normalize_relative_path(raw)
+    assert str(excinfo.value).startswith("semantic_edit_path_escape:")
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("src/pkg/mod.py", "src/pkg/mod.py"),
+        ("a\\b.txt", "a/b.txt"),
+        ("docs/x:y.md", "docs/x:y.md"),
+    ],
+)
+def test_normalize_relative_path_accepts_ordinary_relative_paths(
+    raw: str, expected: str
+) -> None:
+    assert semantic_edit.normalize_relative_path(raw) == expected
+
+
 def test_terminal_semantic_edit_evidence_is_bounded_and_byte_only(tmp_path: Path) -> None:
     stdout = tmp_path / "stdout.jsonl"
     stdout.write_text(

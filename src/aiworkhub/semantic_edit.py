@@ -21,7 +21,7 @@ import fnmatch
 import hashlib
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Iterable, Iterator
 
 from .platform_io import ReparsePointRefused, pinned_paths
@@ -85,6 +85,9 @@ def normalize_relative_path(raw: Any) -> str:
     if not isinstance(raw, str) or not raw.strip() or "\x00" in raw:
         raise SemanticEditError("semantic_edit_path_invalid")
     value = raw.strip().replace("\\", "/")
+    windows = PureWindowsPath(raw.strip())
+    if windows.drive or windows.anchor:
+        raise SemanticEditError(f"semantic_edit_path_escape:{value}")
     path = PurePosixPath(value)
     if (
         path.is_absolute()
