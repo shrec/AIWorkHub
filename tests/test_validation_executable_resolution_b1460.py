@@ -8,7 +8,12 @@ from pathlib import Path
 
 import pytest
 
-from aiworkhub import toolchain_authority, worker_workspace
+from aiworkhub import (
+    source_graph_languages,
+    toolchain_authority,
+    validation_toolchains,
+    worker_workspace,
+)
 
 
 def _workspace(tmp_path: Path) -> worker_workspace.WorkerWorkspace:
@@ -996,6 +1001,100 @@ def test_cmake_family_uses_the_trusted_system_tool_authority(
     assert worker_workspace.preflight_validation_capabilities(
         tmp_path, {"allowed_writes": [], "validation": [command]}
     ) == ()
+
+
+def test_every_source_graph_language_has_a_trusted_validation_executable() -> None:
+    by_language = validation_toolchains.VALIDATION_EXECUTABLES_BY_LANGUAGE
+    assert set(by_language) == set(source_graph_languages.LANGUAGE_BY_ID)
+    runnable = (
+        worker_workspace._TRUSTED_VALIDATION_SYSTEM_EXECUTABLES
+        | worker_workspace._TRUSTED_VALIDATION_BARE_EXECUTABLES
+    )
+    for language_id in source_graph_languages.LANGUAGE_BY_ID:
+        assert by_language[language_id], language_id
+        assert by_language[language_id] <= runnable, language_id
+    assert (
+        worker_workspace._TRUSTED_VALIDATION_SYSTEM_EXECUTABLES
+        == validation_toolchains.SYSTEM_VALIDATION_EXECUTABLES
+    )
+    assert {"git", "node", "npm", "npx", "cmake", "ctest"} <= (
+        validation_toolchains.SYSTEM_VALIDATION_EXECUTABLES
+    )
+    assert not (
+        validation_toolchains.SYSTEM_VALIDATION_EXECUTABLES
+        & worker_workspace._TRUSTED_VALIDATION_BARE_EXECUTABLES
+    )
+
+
+_LANGUAGE_TOOL_COMMANDS = [
+    ("php", "php vendor/bin/phpunit"),
+    ("phpunit", "phpunit --testdox"),
+    ("go", "go test ./..."),
+    ("cargo", "cargo test --locked"),
+    ("dotnet", "dotnet test"),
+    ("node", "node test/check.js"),
+]
+
+
+@pytest.mark.parametrize(("tool", "command"), _LANGUAGE_TOOL_COMMANDS)
+def test_language_toolchain_head_outside_repo_is_trusted(
+    tool: str, command: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    system_tool = _executable(tmp_path / "system" / tool)
+    monkeypatch.setattr(
+        worker_workspace.shutil,
+        "which",
+        lambda name: str(system_tool) if name == tool else None,
+    )
+
+    normalized, roots = (
+        worker_workspace._normalize_trusted_validation_executable_argv_with_roots(
+            command.split(), repo
+        )
+    )
+    assert normalized == [str(system_tool.resolve()), *command.split()[1:]]
+    assert roots == ()
+
+
+@pytest.mark.parametrize("owned_dir", ["bin", ".aiworkhub/worktrees/w1/bin"])
+@pytest.mark.parametrize(("tool", "command"), _LANGUAGE_TOOL_COMMANDS)
+def test_language_toolchain_head_inside_repo_or_worktree_is_refused(
+    tool: str,
+    command: str,
+    owned_dir: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = tmp_path / "repo"
+    repo_tool = _executable(repo / owned_dir / tool)
+    monkeypatch.setattr(worker_workspace.shutil, "which", lambda name: str(repo_tool))
+
+    with pytest.raises(
+        worker_workspace.WorkspaceError,
+        match="validation_executable_repository_owned",
+    ):
+        worker_workspace._normalize_trusted_validation_executable_argv_with_roots(
+            command.split(), repo
+        )
+
+
+def test_unlisted_bare_head_is_still_not_resolved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        worker_workspace.shutil,
+        "which",
+        lambda name: pytest.fail(f"unexpected which({name})"),
+    )
+    assert worker_workspace._normalize_trusted_validation_executable_argv_with_roots(
+        ["cpack", "-G", "ZIP"], tmp_path
+    ) == (["cpack", "-G", "ZIP"], ())
+    with pytest.raises(
+        worker_workspace.WorkspaceError, match="validation_executable_not_approved"
+    ):
+        worker_workspace._resolve_trusted_system_validation_executable("cpack", tmp_path)
 
 
 def test_cmake_capability_preflight_refuses_when_unresolvable(

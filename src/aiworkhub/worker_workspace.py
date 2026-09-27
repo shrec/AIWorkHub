@@ -8051,23 +8051,19 @@ def select_sandbox_backend() -> str:
 # a packaged server therefore reported ``module:pytest`` and rejected otherwise
 # runnable cards before launch.
 _TRUSTED_VALIDATION_BARE_EXECUTABLES = frozenset({"pytest", "ruff", "mypy"})
-# node, npm and npx are one trusted system-tool family: an nvm install places
-# all three beneath the same ``versions/node/vX.Y.Z/bin`` root, and a card
-# that runs ``npm --prefix <dir> test`` is exactly as launch-capable as one
-# that runs ``node`` directly once that family is trusted (NF-2026-00625 M2).
-_NODE_FAMILY_SYSTEM_EXECUTABLES = frozenset({"node", "npm", "npx"})
-# cmake and ctest are the same kind of family: one installer places both in
-# one ``bin`` directory, and a card gating on ``cmake --build`` + ``ctest`` was
-# refused as ``executable:cmake`` on a host where both are installed.  They take
-# the git/node path unchanged: ``shutil.which``, repository-owned rejection,
-# ``--version`` fact.  cpack is left out: it packages rather than validates, and
-# the bare name can resolve to Chocolatey's legacy ``cpack`` shim instead.
-_CMAKE_FAMILY_SYSTEM_EXECUTABLES = frozenset({"cmake", "ctest"})
-_TRUSTED_VALIDATION_SYSTEM_EXECUTABLES = (
-    frozenset({"git"})
-    | _NODE_FAMILY_SYSTEM_EXECUTABLES
-    | _CMAKE_FAMILY_SYSTEM_EXECUTABLES
-)
+# Every Source Graph language family's host tools (git, node/cmake families,
+# php, go, cargo, ...) live in validation_toolchains and take the one
+# ``shutil.which`` + repository-owned-rejection path below.  A bare-script
+# Landlock wrapper has no package context and trusts no host tool (fail closed).
+if __package__:
+    from .validation_toolchains import (
+        CMAKE_FAMILY_SYSTEM_EXECUTABLES as _CMAKE_FAMILY_SYSTEM_EXECUTABLES,
+        NODE_FAMILY_SYSTEM_EXECUTABLES as _NODE_FAMILY_SYSTEM_EXECUTABLES,
+        SYSTEM_VALIDATION_EXECUTABLES as _TRUSTED_VALIDATION_SYSTEM_EXECUTABLES,
+    )
+else:
+    _CMAKE_FAMILY_SYSTEM_EXECUTABLES = _NODE_FAMILY_SYSTEM_EXECUTABLES = frozenset()
+    _TRUSTED_VALIDATION_SYSTEM_EXECUTABLES = frozenset()
 SANDBOX_VALIDATION_EXECUTABLE_ROOT = "/validation-executable-root"
 
 
