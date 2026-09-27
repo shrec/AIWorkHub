@@ -90,7 +90,230 @@ _PROVIDER_TIMEOUT_PROSE = re.compile(
 # because it is built exclusively from these code words plus small
 # system-owned numeric metadata (exit_code, an http status pulled from a
 # launcher-owned ``http_status=NNN`` token) -- never a copied substring.
-_SIGNATURES: tuple[tuple[re.Pattern[str], str], ...] = (
+
+# WHOLE-TOKEN MATCHING is the one recognition primitive every closed vocabulary
+# in this module shares. A literal this repository MINTED is recognised only when
+# it is delimited by the separators these strings are actually built from (``:``
+# ``|`` ``=`` whitespace) or by a string boundary, and what is returned is always
+# the module's own element rather than a slice of the scanned text. Case-exact on
+# purpose: a near-miss (``NOT_PROCESSING``, ``xnot_processing``,
+# ``not_processing_soon``) must match nothing at all.
+def _whole_token_pattern(token: str) -> re.Pattern[str]:
+    return re.compile(r"(?:\A|[^0-9A-Za-z_])" + re.escape(token) + r"(?:\Z|[^0-9A-Za-z_])")
+
+
+# --------------------------------------------------------------------------- #
+# LAUNCHER-OWNED VS CODE LM TURN-FAILURE CODES (NF-2026-01018, audit B1).
+#
+# WHAT WAS MEASURED. Of all 141 non-zero worker exits recorded under
+# ``.aiworkhub/runtime/process_logs/processes`` on 2026-09-26, 64 -- the single
+# largest bucket -- were VS Code LM turn failures. Every one of them reached
+# this module as ``vscode_lm_request_failed:<code>:diagnostics={...}``, the
+# ``RuntimeError`` ``vscode_lm_worker.py`` raises from the bridge response's own
+# ``error`` field, and every one of them was durably filed as ``runtime_error``
+# because the catch-all below matches the bare word ``error`` and fires on the
+# exception NAME. 24 ``semantic_edit_stage_required``, 11 ``agent_turn_limit``,
+# 5 ``quality_review_submit_required``, 4 ``finalization_limit``, 3
+# ``tool_not_allowed``, 2 ``text_response_too_large``, 1 each
+# ``request_cancelled`` / ``text_protocol_invalid_json`` -- eight distinct,
+# fully actionable diagnoses, recorded as "something threw".
+#
+# WHY THESE BELONG IN A VOCABULARY AND NOT IN A HEURISTIC. These are not
+# provider prose. Each is a program constant minted by AIWorkHub's own VS Code
+# extension (``vscode-extension/extension.js``, through its single
+# ``vscodeLmProtocolFailure`` mint plus its corrective tool results) or by its
+# own worker (``src/aiworkhub/vscode_lm_worker.py``'s edit-response and
+# terminal-decision refusals). The list below is taken from those literals
+# rather than from the measured tail, so a code that has simply not failed yet
+# is recognised the first time it does.
+#
+# WHY THIS IS STILL SECRET-SAFE. Identical to ``_CONTROL_PLANE_REASONS`` below:
+# recognition is a whole-token match against a fixed literal, and the value that
+# travels is the tuple's own element. A token can be selected from caller text,
+# never synthesised out of it, so the no-copy invariant documented above is
+# unchanged -- and the ``diagnostics={...}`` blob the wrapper carries (paths,
+# counts, protocol trace) is scanned transiently and never copied.
+#
+# ORDER IS PRIORITY, AND THE WRAPPER IS LAST. ``vscode_lm_request_failed`` is
+# the envelope; the code it wraps is the diagnosis. Listing the wrapper strictly
+# after every code is what makes the specific cause win, exactly as
+# ``finalizer_retries_exhausted`` is ordered last in the control-plane tuple.
+#
+# HONEST CAVEAT, recorded for the same reason the control-plane note records
+# its own: this sink cannot tell a code AIWorkHub minted from one a worker
+# echoed into its stdout. The consequence of a spoof here is the conservative
+# one -- candidate rework, no relaunch, no credential hold -- and closing it
+# belongs at the mint site, not here.
+_VSCODE_LM_CODE_PREFIX = "vscode_lm_"
+
+# THE MODEL'S OWN TURN BEHAVIOUR was refused: it skipped the mandated semantic
+# edit stage, burned its turn or finalization budget without progress, called a
+# tool it was not allowed, answered outside the text protocol, or returned an
+# edit response the worker could not apply. These are the codes this card
+# places as candidate defects.
+_VSCODE_LM_BEHAVIOUR_CODES: tuple[str, ...] = (
+    # vscode-extension/extension.js -- ``vscodeLmProtocolFailure`` and the
+    # corrective ``{ ok: false, error: ... }`` tool results.
+    "vscode_lm_semantic_edit_stage_required",
+    "vscode_lm_semantic_edit_no_progress",
+    "vscode_lm_source_graph_no_progress",
+    "vscode_lm_source_graph_not_acknowledged",
+    "vscode_lm_source_graph_duplicate",
+    "vscode_lm_agent_turn_limit",
+    "vscode_lm_finalization_limit",
+    "vscode_lm_finalization_nonprogress",
+    "vscode_lm_finalization_tool_violation",
+    "vscode_lm_authority_gate_violation",
+    "vscode_lm_quality_review_submit_required",
+    "vscode_lm_tool_not_allowed",
+    "vscode_lm_tool_input_invalid",
+    "vscode_lm_tool_input_too_large",
+    "vscode_lm_text_protocol_invalid_json",
+    "vscode_lm_text_protocol_ambiguous_json",
+    "vscode_lm_text_protocol_invalid_object",
+    "vscode_lm_text_protocol_schema_mismatch",
+    "vscode_lm_text_response_too_large",
+    # src/aiworkhub/vscode_lm_worker.py -- the edit response the model returned
+    # could not be applied to the worktree.
+    "vscode_lm_edit_fidelity_rejected",
+    "vscode_lm_edit_response_create_exists",
+    "vscode_lm_edit_response_create_invalid",
+    "vscode_lm_edit_response_duplicate_path",
+    "vscode_lm_edit_response_edit_invalid",
+    "vscode_lm_edit_response_edit_target_invalid",
+    "vscode_lm_edit_response_files_invalid",
+    "vscode_lm_edit_response_file_invalid",
+    "vscode_lm_edit_response_file_too_large",
+    "vscode_lm_edit_response_hash_invalid",
+    "vscode_lm_edit_response_invalid_json",
+    "vscode_lm_edit_response_replacements_invalid",
+    "vscode_lm_edit_response_schema_mismatch",
+    "vscode_lm_edit_response_stale_hash",
+    "vscode_lm_edit_response_unsupported_top_level",
+    "vscode_lm_edit_response_v2_path_count_exceeded",
+    "vscode_lm_edit_response_v2_shape_invalid",
+    "vscode_lm_output_out_of_scope",
+    "vscode_lm_semantic_edit_invalid",
+    "vscode_lm_semantic_edit_ranges_invalid",
+    "vscode_lm_semantic_edit_rejected",
+)
+
+# THE TRANSPORT OR THE HOST failed, or the request itself was refused before the
+# model's behaviour was ever in question: a cancellation, an unavailable MCP
+# host, a request/response identity or schema mismatch, an expired deadline.
+# Recognised so the diagnosis survives, and deliberately left UNPLACED by the
+# disposition taxonomy below -- none of them says whether the work was wrong.
+#
+# ``vscode_lm_response_timeout`` is deliberately absent: it is
+# ``_BRIDGE_TIMEOUT_REASON`` above and already classifies as ``provider_timeout``
+# off its typed envelope, which is the stronger statement.
+_VSCODE_LM_TRANSPORT_CODES: tuple[str, ...] = (
+    "vscode_lm_request_cancelled",
+    "vscode_lm_mcp_unavailable",
+    "vscode_lm_quality_review_submit_runtime_unavailable",
+    "vscode_lm_request_expired",
+    "vscode_lm_request_schema_mismatch",
+    "vscode_lm_request_id_invalid",
+    "vscode_lm_request_kind_invalid",
+    "vscode_lm_response_schema_mismatch",
+    "vscode_lm_response_identity_mismatch",
+    "vscode_lm_response_repo_identity_mismatch",
+    "vscode_lm_response_path_invalid",
+    "vscode_lm_response_too_large",
+    "vscode_lm_progress_path_invalid",
+    "vscode_lm_repo_id_mismatch",
+    "vscode_lm_repo_root_mismatch",
+    "vscode_lm_target_window_id_invalid",
+    "vscode_lm_target_window_mismatch",
+    "vscode_lm_model_mismatch",
+    "vscode_lm_prompt_missing",
+    "vscode_lm_workspace_shape_invalid",
+    "vscode_lm_workspace_request_mismatch",
+    "vscode_lm_allowed_writes_invalid",
+    "vscode_lm_cancel_token_invalid",
+    "vscode_lm_cancel_path_invalid",
+    "vscode_lm_cancel_decision_identity_changed",
+    "vscode_lm_cancel_decision_identity_mismatch",
+    "vscode_lm_cancel_decision_contract_mismatch",
+    "vscode_lm_cancel_decision_persistent_invalid_json",
+    "vscode_lm_initial_source_graph_request_invalid",
+    "vscode_lm_initial_source_graph_result_invalid",
+    "vscode_lm_terminal_decision_missing",
+    "vscode_lm_terminal_decision_path_mismatch",
+    "vscode_lm_terminal_decision_action_invalid",
+)
+
+# ``vscode_lm_worker.py:1412``: ``f"vscode_lm_request_failed:{response['error']}"``.
+# The wrapper names only "the bridge turn failed"; what it wraps names why.
+_VSCODE_LM_REQUEST_FAILED = "vscode_lm_request_failed"
+
+_VSCODE_LM_CODES: tuple[str, ...] = (
+    _VSCODE_LM_BEHAVIOUR_CODES
+    + _VSCODE_LM_TRANSPORT_CODES
+    + (_VSCODE_LM_REQUEST_FAILED,)
+)
+
+# --------------------------------------------------------------------------- #
+# SANDBOX FILESYSTEM DENIAL (NF-2026-01018, audit B1). The second and third
+# measured buckets, 49 of the 141 non-zero exits between them:
+#
+#   * 22 Bun stderr ``EPERM: operation not permitted, realpath <home>\.local\state``
+#     (grok/kilo running inside an AppContainer), and 14 Windows
+#     ``Access is denied. (os error 5)`` (codex canonicalising a ``CODEX_HOME``
+#     whose directory the container cannot reach). An OS refused a filesystem
+#     operation. ``sandbox_filesystem_denied``.
+#   * 13 supervisor ``AppContainerError:filesystem_grant_failed: write DACL <path>``
+#     (11 with ``exit_code=126``, spawn phase ``child_spawn``) -- the launcher's
+#     own abort, minted as ``windows_appcontainer.AppContainerReason``'s
+#     ``FILESYSTEM_GRANT_FAILED`` and named (not imported) here for the same
+#     reason ``_PROVIDER_REFUSAL_REASONS`` is. ``sandbox_filesystem_grant_failed``.
+#
+# BOTH SIT AHEAD OF ``auth_forbidden``, which is where they used to land or,
+# worse, fall through to ``runtime_error``. Neither is a credential fact, and
+# calling a container misconfiguration an authorization refusal points every
+# reader at the wrong system.
+#
+# THE TWO ARE NOT THE SAME KIND OF EVIDENCE, and only one of them may place a
+# card. ``sandbox_filesystem_grant_failed`` is a whole-token match on a literal
+# THE LAUNCHER MINTED about its own abort, so it is an assertion by this
+# repository. ``sandbox_filesystem_denied`` is a PROSE match over
+# worker-controlled stderr, so it is a description and nothing more: it is
+# recognised, and deliberately absent from ``REASON_DISPOSITION`` and
+# ``_REASON_CAUSE``. See the note beside ``_SANDBOX_REASONS`` for what placing it
+# would have cost.
+#
+# BARE ``permission denied`` IS DELIBERATELY NOT HERE. It is also the strerror
+# an HTTP/provider refusal prints, ``auth_forbidden`` has owned it since
+# NF-2026-00326, and ``test_ordinary_permission_denied_stays_auth_forbidden``
+# pins that. Every phrase admitted below names an errno, a Python exception
+# type, or a Windows error NUMBER -- forms provider prose does not use.
+_SANDBOX_FILESYSTEM_GRANT_FAILED = "sandbox_filesystem_grant_failed"
+_SANDBOX_FILESYSTEM_DENIED = "sandbox_filesystem_denied"
+# The RECOGNISED sandbox vocabulary: both codes, because both deserve a name
+# instead of ``runtime_error``. The PLACED subset is ``_SANDBOX_REASONS`` further
+# down, and it is deliberately the smaller of the two.
+_SANDBOX_CODES: tuple[str, ...] = (
+    _SANDBOX_FILESYSTEM_GRANT_FAILED,
+    _SANDBOX_FILESYSTEM_DENIED,
+)
+
+# ``windows_appcontainer.AppContainerReason.FILESYSTEM_GRANT_FAILED``, reached
+# here inside the launcher-minted ``AppContainerError:<reason>: <detail>``.
+_FILESYSTEM_GRANT_FAILED_REASON = "filesystem_grant_failed"
+
+_OS_FILESYSTEM_DENIAL = re.compile(
+    r"(?<![A-Za-z0-9_])(?:eperm|eacces|permissionerror)(?![A-Za-z0-9_])"
+    r"|operation not permitted"
+    r"|\[errno 13\]"
+    r"|(?<![A-Za-z0-9_])os error 5(?![0-9])",
+    re.I,
+)
+
+_SIGNATURES: tuple[tuple[re.Pattern[str], str], ...] = tuple(
+    (_whole_token_pattern(code), code) for code in _VSCODE_LM_CODES
+) + (
+    (_whole_token_pattern(_FILESYSTEM_GRANT_FAILED_REASON), _SANDBOX_FILESYSTEM_GRANT_FAILED),
+    (_OS_FILESYSTEM_DENIAL, _SANDBOX_FILESYSTEM_DENIED),
     (re.compile(r"invalid credential|re-?authenticat", re.I), "auth_invalid_credential"),
     (re.compile(r"cause_not_distinguished", re.I), "auth_cause_not_distinguished"),
     (re.compile(r"unauthoriz", re.I), "auth_unauthorized"),
@@ -107,6 +330,10 @@ _SIGNATURES: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"provider[ _]refused", re.I), "provider_refused"),
     (re.compile(r"traceback|exception|error|fatal", re.I), "runtime_error"),
 )
+
+# The VS Code LM block is the leading run of ``_SIGNATURES``; see
+# ``_signature_code`` for why its length is the one number that block needs.
+_VSCODE_LM_SIGNATURE_COUNT = len(_VSCODE_LM_CODES)
 
 # The closed vocabulary of DETERMINISTIC CONTROL-PLANE REASONS: reason tokens
 # minted by AIWorkHub's own code to state why the control plane refused or
@@ -292,13 +519,14 @@ _CONTROL_PLANE_REASONS: tuple[str, ...] = (
 # reason travels and the paths do not: a missing detail is a bug, a copied byte
 # is a breach.
 
-# Whole-token match only: a reason must be delimited by the separators these
-# control-plane strings are actually built from (``:`` ``|`` ``=`` whitespace)
-# or by a string boundary, so ``not_claimed`` can never be matched inside a
-# longer unrelated word. Compiled once, in priority order.
+# Whole-token match only, through the one primitive defined above: a reason must
+# be delimited by the separators these control-plane strings are actually built
+# from (``:`` ``|`` ``=`` whitespace) or by a string boundary, so ``not_claimed``
+# can never be matched inside a longer unrelated word. Compiled once, in priority
+# order. Two hand-rolled copies of that expression are how the VS Code LM and
+# sandbox vocabularies would have drifted from this one (NF-2026-01018).
 _CONTROL_PLANE_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = tuple(
-    (re.compile(r"(?:\A|[^0-9A-Za-z_])" + re.escape(t) + r"(?:\Z|[^0-9A-Za-z_])"), t)
-    for t in _CONTROL_PLANE_REASONS
+    (_whole_token_pattern(t), t) for t in _CONTROL_PLANE_REASONS
 )
 
 
@@ -452,7 +680,16 @@ def _rate_limit_evidence(pattern: re.Pattern[str], text: str) -> bool:
 
 
 def _signature_code(text: str, *, timeout_prose: bool = True) -> str | None:
-    for pattern, code in _SIGNATURES:
+    # Every VS Code LM code shares ``vscode_lm_``, so a text that does not
+    # contain that prefix cannot match any pattern in that leading block:
+    # skipping it is exactly equivalent to scanning it, and keeps the cost of
+    # the common case -- a provider tail holding no launcher code at all -- at
+    # what it was before the vocabulary was added (NF-2026-01018).
+    entries = (
+        _SIGNATURES if _VSCODE_LM_CODE_PREFIX in text
+        else _SIGNATURES[_VSCODE_LM_SIGNATURE_COUNT:]
+    )
+    for pattern, code in entries:
         if code == _PROVIDER_TIMEOUT:
             if _provider_timeout_evidence(text, prose=timeout_prose):
                 return code
@@ -1221,11 +1458,27 @@ def terminal_event_authority(
 # repository ASSERTED: a typed field in the provider's own terminal envelope, an
 # HTTP status it returned, a refusal kind ``runtime_adapters`` already named, or
 # a control-plane constant AIWorkHub minted about its own refusal. Nothing here
-# matches prose. ``_SIGNATURES`` above is deliberately NOT an input: it is a
-# heuristic scan whose last entry matches the bare word ``error``, and a
+# matches prose. The PROSE HEURISTICS in ``_SIGNATURES`` above are deliberately
+# NOT an input -- that table's last entry matches the bare word ``error``, and a
 # heuristic that can call a defect "transient" retries a broken card until its
 # budget is spent. Where the evidence names no class the answer is ``unknown``,
 # which behaves exactly as today.
+#
+# NF-2026-01018 draws the line one step more precisely, because ``_SIGNATURES``
+# is no longer a single species. Some of its entries are WHOLE-TOKEN matches
+# against literals this repository mints -- the VS Code LM turn-failure codes and
+# ``sandbox_filesystem_grant_failed`` -- and those are the same kind of asserted
+# constant as a control-plane reason, not prose. They are admitted, and only
+# they: a code recognised by whole-token match against an AIWorkHub-minted
+# literal may place a card, while every regex that matches free prose (``error``,
+# ``forbidden``, ``out of memory``, a timeout phrase) still may not.
+#
+# ``sandbox_filesystem_denied`` IS ON THE PROSE SIDE OF THAT LINE, however exact
+# its name reads, and is therefore NOT placed: ``_OS_FILESYSTEM_DENIAL`` scans
+# worker-controlled stderr, where a candidate's own ``PermissionError`` or
+# ``EACCES`` mints it. Calling that ``transient`` would requeue a real defect for
+# its whole retry budget -- precisely the failure this section forbids. Worker
+# text may DESCRIBE a failure here; it may never select the response to one.
 #
 # FAIL-CLOSED, PER CLASS -- the direction is NOT the same for all three, because
 # the cost of being wrong is not the same:
@@ -1448,11 +1701,40 @@ def _provider_refused_disposition() -> dict[str, str]:
     return placed
 
 
+# NF-2026-01018: the LAUNCHER-MINTED sandbox abort is INFRASTRUCTURE. The
+# supervisor could not write the DACL the child needed and said so itself, in its
+# own ``AppContainerError:filesystem_grant_failed``. Nothing about that is a
+# statement about the work, and no diff the candidate writes next time changes
+# it, which is exactly ``CAUSE_SANDBOX_UNSUPPORTED``'s hold-until-remediation
+# shape rather than a retry.
+#
+# ONLY THAT ONE CODE IS PLACED (rework round 1). ``sandbox_filesystem_denied``
+# is recognised -- it names the measured Bun/codex denials far better than
+# ``runtime_error`` ever did -- but it stays out of this set and out of
+# ``_REASON_CAUSE``, because ``_OS_FILESYSTEM_DENIAL`` reads WORKER-CONTROLLED
+# stderr: a candidate whose own tests raise ``PermissionError: [WinError 32]``,
+# or whose Node build prints ``EACCES``, mints it just as readily as a container
+# that was never granted a path. Placed as ``transient`` it would have the
+# launcher requeue that card through ``task_store.mark_transient_retry`` until
+# the retry budget was spent, instead of reworking a real defect. Unplaced, it
+# falls into ``_DISCLAIMED_REASONS`` below and the card reaches a manager.
+_SANDBOX_REASONS: frozenset[str] = frozenset({_SANDBOX_FILESYSTEM_GRANT_FAILED})
+
 REASON_DISPOSITION: dict[str, str] = {
     **{reason: FAILURE_CLASS_DEFECT for reason in _DEFECT_REASONS},
     **{reason: FAILURE_CLASS_TRANSIENT for reason in _TRANSIENT_REASONS},
     **{reason: FAILURE_CLASS_CREDENTIAL for reason in _CREDENTIAL_REASONS},
     **_provider_refused_disposition(),
+    # NF-2026-01018: the VS Code LM launcher refused THIS WORKER'S OWN TURN after
+    # inspecting it -- no staged semantic edit, a spent turn or finalization
+    # budget with no progress, a tool outside its allowlist, an answer outside
+    # the text protocol, an edit response that could not be applied. That is the
+    # same species of evidence as the mandatory-output validator's refusal: this
+    # repository's own finding about the attempt, which is the only thing allowed
+    # to earn ``defect``. The transport/host codes beside them are NOT placed --
+    # a cancellation or an unavailable MCP host says nothing about the work.
+    **{code: FAILURE_CLASS_DEFECT for code in _VSCODE_LM_BEHAVIOUR_CODES},
+    **{reason: FAILURE_CLASS_TRANSIENT for reason in _SANDBOX_REASONS},
 }
 
 # Reasons deliberately left unplaced, and why they cannot be placed:
@@ -1463,8 +1745,16 @@ REASON_DISPOSITION: dict[str, str] = {
 #     them says anything about the work or about the provider.
 #   * every terminal STATE name is an envelope label. ``worker_failed`` is the
 #     exact string this whole card exists because it means nothing.
-#   * every ``_SIGNATURES`` code is a heuristic over untrusted prose -- see the
-#     section header for why none of them may place a card.
+#   * every PROSE ``_SIGNATURES`` code is a heuristic over untrusted text -- see
+#     the section header for why none of those may place a card. The whole-token
+#     launcher-minted codes in that same table are the named exception
+#     (NF-2026-01018) and are placed above; the transport/host half of the VS
+#     Code LM vocabulary, and the ``vscode_lm_request_failed`` wrapper that names
+#     only "the bridge turn failed", are recognised and land here.
+#   * ``sandbox_filesystem_denied`` lands here for the same reason, even though
+#     its name is precise: its pattern is prose over WORKER-CONTROLLED stderr,
+#     not a literal AIWorkHub minted, so it may describe the failure and must
+#     not choose the response to it.
 #   * ``provider_refused`` and ``cause_not_distinguished_by_response`` are the
 #     classifier's own admissions that the cause was NOT distinguished.
 _DISCLAIMED_REASONS: frozenset[str] = (
@@ -2421,6 +2711,15 @@ _REASON_CAUSE: dict[str, str] = {
             "_recoverable_but_reset_window_unreported",
         )
     },
+    # NF-2026-01018, the measured causes the ``runtime_error`` catch-all used to
+    # swallow. Both spreads read the SAME sets ``REASON_DISPOSITION`` above does,
+    # so a reader of the class and a reader of the cause can never disagree: a VS
+    # Code LM turn the launcher refused on the worker's own behaviour is candidate
+    # rework, and the launcher's own filesystem-grant abort is a dependency hold
+    # nothing the candidate does can clear. ``sandbox_filesystem_denied`` is
+    # absent from both, for the reason recorded beside ``_SANDBOX_REASONS``.
+    **{code: CAUSE_CANDIDATE_CODE for code in _VSCODE_LM_BEHAVIOUR_CODES},
+    **{reason: CAUSE_SANDBOX_UNSUPPORTED for reason in _SANDBOX_REASONS},
 }
 
 # An authenticated manager may state one of exactly these dispositions when it

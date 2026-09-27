@@ -35,8 +35,12 @@ from aiworkhub.terminal_failure_classification import (
 # shape excludes braces, quotes, and whitespace by construction, so no secret
 # representation (labelled, quoted JSON, Python repr, or an unknown shape
 # entirely) can pass it regardless of what the caller-supplied text contained.
+#
+# The code class admits digits (NF-2026-01018): the closed vocabulary is
+# versioned, e.g. ``vscode_lm_edit_response_v2_shape_invalid``. The punctuation a
+# path or a JSON blob would need is still excluded, which is the whole point.
 _ALLOWLISTED_DIAGNOSTIC = re.compile(
-    r"^[a-z_]+:[a-z_]+(?::http_status=\d{3})?(?::exit_code=-?\d+)?$"
+    r"^[a-z0-9_]+:[a-z0-9_]+(?::http_status=\d{3})?(?::exit_code=-?\d+)?$"
 )
 
 _SECRET_PAYLOADS = [
@@ -61,6 +65,15 @@ def test_worker_failed_persists_stable_failure_kind_and_bounded_diagnostic() -> 
     assert result["failure_kind"] == "worker_failed"
     assert _ALLOWLISTED_DIAGNOSTIC.match(result["diagnostic"])
     assert len(result["diagnostic"]) <= MAX_DIAGNOSTIC_CHARS
+    # STRENGTHENED, not relaxed (NF-2026-01018). This error is a launcher-owned
+    # VS Code LM code, so the code it now reduces to is the code itself rather
+    # than the ``runtime_error`` the catch-all used to claim off ``_response_``.
+    # The shape contract this test exists for is unchanged and still asserted
+    # above; ``tests/test_terminal_failure_measured_classes.py`` pins the code.
+    assert result["diagnostic"] == (
+        "worker_failed:vscode_lm_edit_response_stale_hash:exit_code=1"
+    )
+    assert "src/app.py" not in result["diagnostic"]
 
 
 def test_timed_out_persists_timeout_stall() -> None:
