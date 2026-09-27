@@ -176,8 +176,12 @@ def read_utf8_file(target: Path, relative: str) -> tuple[bytes, str]:
         raise SemanticEditError(f"semantic_edit_utf8_required:{relative}") from exc
 
 
-def _coerce_protocol_line(value: object) -> object:
+def coerce_protocol_line(value: object) -> object:
     """Return an int for a decimal line number, otherwise the original value.
+
+    The package's single owner for this coercion: the VS Code LM worker's
+    patch-protocol normaliser imports this name rather than restating the body
+    (NF-2026-01022), so a bridge and the editor agree on what ``"55"`` means.
 
     Text-protocol bridges emit Source Graph line numbers as JSON strings
     (``"55"``).  A boolean is an int subclass and must stay a boolean so the
@@ -201,8 +205,8 @@ def _validated_line_bounds(start_line: object, end_line: object) -> tuple[int, i
     ``lines[start - 1:end]``, not an empty exclusive span.
     """
 
-    start = _coerce_protocol_line(start_line)
-    end = _coerce_protocol_line(end_line)
+    start = coerce_protocol_line(start_line)
+    end = coerce_protocol_line(end_line)
     if (
         not isinstance(start, int)
         or isinstance(start, bool)

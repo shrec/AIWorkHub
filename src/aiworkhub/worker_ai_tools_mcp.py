@@ -118,6 +118,11 @@ from . import output_spill_store
 from . import quality_reviewer
 from . import semantic_edit
 from . import semantic_edit_applier
+# The codex ``config.toml`` block below quotes with the package's single TOML
+# basic-string owner rather than a copy of it.  ``runtime_adapters`` is a pure
+# planner whose own package imports are ``platform_io`` and
+# ``reasoning_policy``, so this edge cannot close a cycle (NF-2026-01022).
+from .runtime_adapters import toml_basic_string, toml_string_array
 from .sqlite_readonly import connect_readonly
 
 
@@ -8017,13 +8022,6 @@ def resolve_host_package_import_root() -> Path:
     """
     return Path(__file__).resolve().parent.parent
 
-def _toml_str(value: str) -> str:
-    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
-
-
-def _toml_array(values: tuple[str, ...] | list[str]) -> str:
-    return "[" + ", ".join(_toml_str(v) for v in values) + "]"
-
 
 _CODEX_CODE_WORKER_REQUIRED_TOOLS: tuple[str, ...] = (
     "aiworkhub_worker_source_graph_query",
@@ -8222,14 +8220,14 @@ def generate_worker_mcp_runtime(
     codex_config_path = codex_home / "config.toml"
     lines = [
         f"[mcp_servers.{SERVER_NAME}]",
-        f"command = {_toml_str(py)}",
-        f"args = [{', '.join(_toml_str(a) for a in launch_args)}]",
-        f"enabled_tools = {_toml_array(codex_tool_names)}",
+        f"command = {toml_basic_string(py)}",
+        f"args = [{', '.join(toml_basic_string(a) for a in launch_args)}]",
+        f"enabled_tools = {toml_string_array(codex_tool_names)}",
         "",
         f"[mcp_servers.{SERVER_NAME}.env]",
     ]
     for name, value in env.items():
-        lines.append(f"{name} = {_toml_str(value)}")
+        lines.append(f"{name} = {toml_basic_string(value)}")
     toml_text = "\n".join(lines) + "\n"
     flags = os.O_CREAT | os.O_TRUNC | os.O_WRONLY
     if hasattr(os, "O_NOFOLLOW"):

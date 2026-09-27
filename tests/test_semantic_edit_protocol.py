@@ -503,3 +503,14 @@ def test_one_line_prepare_accepts_equal_bounds_and_decimal_strings(tmp_path: Pat
                 {"start_line": "2", "end_line": "2", "new": "y\n"},
             ],
         )
+
+
+def test_the_package_has_one_protocol_line_coercion() -> None:
+    """NF-2026-01022: the VS Code LM bridge binds the owner, not a copy of it."""
+
+    from aiworkhub import vscode_lm_worker
+
+    assert vscode_lm_worker.coerce_protocol_line is semantic_edit.coerce_protocol_line
+    for raw, expected in (("55", 55), (" 55 ", 55), (55, 55), (True, True), ("x", "x")):
+        assert semantic_edit.coerce_protocol_line(raw) == expected
+        assert isinstance(semantic_edit.coerce_protocol_line(raw), type(expected))

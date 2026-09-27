@@ -564,3 +564,88 @@ def test_opencode_worker_config_serializes_to_bounded_ascii_json() -> None:
     with pytest.raises(runtime_adapters.OpenCodeWorkerConfigError) as excinfo:
         runtime_adapters.serialize_opencode_worker_config(oversized)
     assert excinfo.value.cause == "oversized"
+
+
+def _manager_env() -> dict[str, str]:
+    return {"AIWORKHUB_REPO": "D:\\r", "AIWORKHUB_ALLOW_WRITES": "1"}
+
+
+def _expected_config_text(permission: dict[str, str], environment: dict[str, str]) -> str:
+    command = ["/usr/bin/python3", "-m", "aiworkhub.worker_ai_tools_mcp"]
+    return json.dumps(
+        {
+            "$schema": runtime_adapters.OPENCODE_CONFIG_SCHEMA_URL,
+            "permission": permission,
+            "mcp": {
+                runtime_adapters.OPENCODE_WORKER_MCP_SERVER: {
+                    "type": "local",
+                    "command": command,
+                    "enabled": True,
+                    "environment": environment,
+                }
+            },
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+
+
+def test_worker_and_manager_opencode_configs_are_one_contract_with_two_roles() -> None:
+    """NF-2026-01022 regression: consolidating the builder/validator/serializer
+    onto one role-parameterised implementation must not move a single byte of
+    either seat's output, and must not let either role's config pass the other
+    role's validator.
+    """
+
+    command = ("/usr/bin/python3", "-m", "aiworkhub.worker_ai_tools_mcp")
+    worker = runtime_adapters.build_opencode_worker_mcp_config(
+        command, environment=_worker_env()
+    )
+    manager = runtime_adapters.build_opencode_manager_mcp_config(
+        command, environment=_manager_env()
+    )
+
+    assert runtime_adapters.serialize_opencode_worker_config(worker) == _expected_config_text(
+        runtime_adapters.opencode_worker_permission_contract(), _worker_env()
+    )
+    assert runtime_adapters.serialize_opencode_manager_config(manager) == _expected_config_text(
+        runtime_adapters.opencode_manager_permission_contract(), _manager_env()
+    )
+    assert runtime_adapters.validate_opencode_worker_config(worker) is worker
+    assert runtime_adapters.validate_opencode_manager_config(manager) is manager
+
+    # The two roles share the schema and the single server alias, and differ in
+    # exactly one thing: the permission contract they are allowed to carry.
+    assert worker["$schema"] == manager["$schema"]
+    assert list(worker["mcp"]) == list(manager["mcp"]) == ["awh"]
+    assert worker["permission"] != manager["permission"]
+
+    bare_worker = runtime_adapters.build_opencode_worker_mcp_config(command)
+    bare_manager = runtime_adapters.build_opencode_manager_mcp_config(command)
+    for config, validate in (
+        (bare_worker, runtime_adapters.validate_opencode_manager_config),
+        (bare_manager, runtime_adapters.validate_opencode_worker_config),
+    ):
+        with pytest.raises(runtime_adapters.OpenCodeWorkerConfigError) as excinfo:
+            validate(config)
+        assert excinfo.value.cause == "permission_contract_mismatch"
+
+
+def test_worker_and_manager_seats_reject_each_others_mcp_environment() -> None:
+    """Each role keeps its own environment allowlist after the consolidation."""
+
+    command = ("/usr/bin/python3", "-m", "aiworkhub.worker_ai_tools_mcp")
+    with pytest.raises(ValueError, match="opencode_mcp_environment_invalid"):
+        runtime_adapters.build_opencode_worker_mcp_config(command, environment=_manager_env())
+    with pytest.raises(ValueError, match="manager_seat_mcp_environment_invalid"):
+        runtime_adapters.build_opencode_manager_mcp_config(command, environment=_worker_env())
+
+
+def test_the_package_has_one_toml_string_quoter_and_one_array_writer() -> None:
+    """The worker codex writer imports the owners instead of copying them."""
+
+    assert worker_ai_tools_mcp.toml_basic_string is runtime_adapters.toml_basic_string
+    assert worker_ai_tools_mcp.toml_string_array is runtime_adapters.toml_string_array
+    assert runtime_adapters.toml_basic_string('a"b\\c') == '"a\\"b\\\\c"'
+    assert runtime_adapters.toml_string_array(("a", 'b"c')) == '["a", "b\\"c"]'

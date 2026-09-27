@@ -16,7 +16,7 @@ import re
 import shutil
 import stat
 import sys
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -1679,30 +1679,46 @@ def _opencode_mcp_environment(environment: Mapping[str, str]) -> dict[str, str]:
     return checked
 
 
-def build_opencode_worker_mcp_config(
-    mcp_command: Sequence[str], *, environment: Mapping[str, str] | None = None
-) -> dict[str, Any]:
-    """Inert OpenCode config data: the ``awh`` server and the worker permissions.
+# The OpenCode config contract is ONE implementation with two roles. A worker
+# seat and a manager seat differ in exactly two things: which environment
+# binding the ``awh`` server may carry, and which permission contract the
+# config must equal. Everything else -- the schema URL, the single server
+# alias, the argv check, the 64-character name bound, the byte bound and every
+# refusal cause -- has one definition below, so the two public surfaces cannot
+# drift. Each public name delegates; none of them restates the contract.
+OPENCODE_WORKER_ROLE = "worker"
+OPENCODE_MANAGER_ROLE = "manager"
 
-    ``environment`` is the MCP server's own request binding inside the config,
-    never the launcher's process environment.
-    """
+
+def _opencode_role_contract(
+    role: str,
+) -> tuple[Callable[[Mapping[str, str]], dict[str, str]], Callable[[], dict[str, str]]]:
+    """The (environment checker, permission contract) pair one role declares."""
+    if role == OPENCODE_MANAGER_ROLE:
+        return _manager_seat_mcp_environment, opencode_manager_permission_contract
+    return _opencode_mcp_environment, opencode_worker_permission_contract
+
+
+def _build_opencode_mcp_config(
+    mcp_command: Sequence[str], *, environment: Mapping[str, str] | None, role: str
+) -> dict[str, Any]:
+    check_environment, permission_contract = _opencode_role_contract(role)
     server: dict[str, Any] = {
         "type": "local",
         "command": _opencode_command_argv(mcp_command),
         "enabled": True,
     }
     if environment is not None:
-        server["environment"] = _opencode_mcp_environment(environment)
+        server["environment"] = check_environment(environment)
     return {
         "$schema": OPENCODE_CONFIG_SCHEMA_URL,
-        "permission": opencode_worker_permission_contract(),
+        "permission": permission_contract(),
         "mcp": {OPENCODE_WORKER_MCP_SERVER: server},
     }
 
 
-def validate_opencode_worker_config(config: Any) -> Any:
-    """Refuse any OpenCode config that is not exactly the worker contract."""
+def _validate_opencode_config(config: Any, *, role: str) -> Any:
+    check_environment, permission_contract = _opencode_role_contract(role)
     if (
         not isinstance(config, dict)
         or set(config) != {"$schema", "permission", "mcp"}
@@ -1727,12 +1743,12 @@ def validate_opencode_worker_config(config: Any) -> Any:
     try:
         _opencode_command_argv(server["command"])
         if "environment" in server:
-            _opencode_mcp_environment(server["environment"])
+            check_environment(server["environment"])
     except ValueError as exc:
         raise OpenCodeWorkerConfigError("malformed", str(exc)) from exc
     permission = config["permission"]
     if not isinstance(permission, dict) or list(permission.items()) != list(
-        opencode_worker_permission_contract().items()
+        permission_contract().items()
     ):
         raise OpenCodeWorkerConfigError("permission_contract_mismatch")
     for name, action in permission.items():
@@ -1741,15 +1757,37 @@ def validate_opencode_worker_config(config: Any) -> Any:
     return config
 
 
-def serialize_opencode_worker_config(config: Any) -> str:
-    """The validated config as one bounded ASCII JSON line for the child env."""
-    validate_opencode_worker_config(config)
+def _serialize_opencode_config(config: Any, *, role: str) -> str:
+    _validate_opencode_config(config, role=role)
     text = json.dumps(config, ensure_ascii=True, separators=(",", ":"), allow_nan=False)
     if len(text) > OPENCODE_WORKER_CONFIG_MAX_BYTES:
         raise OpenCodeWorkerConfigError(
             "oversized", f"{len(text)}>{OPENCODE_WORKER_CONFIG_MAX_BYTES}"
         )
     return text
+
+
+def build_opencode_worker_mcp_config(
+    mcp_command: Sequence[str], *, environment: Mapping[str, str] | None = None
+) -> dict[str, Any]:
+    """Inert OpenCode config data: the ``awh`` server and the worker permissions.
+
+    ``environment`` is the MCP server's own request binding inside the config,
+    never the launcher's process environment.
+    """
+    return _build_opencode_mcp_config(
+        mcp_command, environment=environment, role=OPENCODE_WORKER_ROLE
+    )
+
+
+def validate_opencode_worker_config(config: Any) -> Any:
+    """Refuse any OpenCode config that is not exactly the worker contract."""
+    return _validate_opencode_config(config, role=OPENCODE_WORKER_ROLE)
+
+
+def serialize_opencode_worker_config(config: Any) -> str:
+    """The validated config as one bounded ASCII JSON line for the child env."""
+    return _serialize_opencode_config(config, role=OPENCODE_WORKER_ROLE)
 
 
 # ---------------------------------------------------------------------------
@@ -1767,13 +1805,20 @@ def serialize_opencode_worker_config(config: Any) -> str:
 MANAGER_SEAT_MCP_SERVER = "AIWorkHub"
 
 
-def _manager_toml_str(value: str) -> str:
-    """One TOML basic string (same spelling as the worker codex writer)."""
+def toml_basic_string(value: str) -> str:
+    """One TOML basic string: the package's single owner for this quoting.
+
+    Both codex ``config.toml`` writers quote with it -- the manager seat block
+    below, and ``worker_ai_tools_mcp``'s worker block, which imports this name
+    instead of restating the body (NF-2026-01022).
+    """
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def _manager_toml_array(values: tuple[str, ...] | list[str]) -> str:
-    return "[" + ", ".join(_manager_toml_str(v) for v in values) + "]"
+def toml_string_array(values: tuple[str, ...] | list[str]) -> str:
+    """One TOML array of basic strings, shared by both codex writers."""
+    return "[" + ", ".join(toml_basic_string(v) for v in values) + "]"
+
 
 MANAGER_SEAT_MCP_TOOLS: tuple[str, ...] = (
     # Identity and orientation.
@@ -1879,13 +1924,13 @@ def build_manager_codex_config_toml(
     checked_env = _manager_seat_mcp_environment(environment)
     lines = [
         f"[mcp_servers.{MANAGER_SEAT_MCP_SERVER}]",
-        f"args = [{', '.join(_manager_toml_str(a) for a in ['-m', 'aiworkhub.server', *launch_args])}]",
-        f"enabled_tools = {_manager_toml_array(resolve_manager_seat_codex_tools())}",
+        f"args = [{', '.join(toml_basic_string(a) for a in ['-m', 'aiworkhub.server', *launch_args])}]",
+        f"enabled_tools = {toml_string_array(resolve_manager_seat_codex_tools())}",
         "",
         f"[mcp_servers.{MANAGER_SEAT_MCP_SERVER}.env]",
     ]
     for name, value in checked_env.items():
-        lines.append(f"{name} = {_manager_toml_str(value)}")
+        lines.append(f"{name} = {toml_basic_string(value)}")
     return "\n".join(lines) + "\n"
 
 
@@ -1908,69 +1953,19 @@ def build_opencode_manager_mcp_config(
     mcp_command: Sequence[str], *, environment: Mapping[str, str] | None = None
 ) -> dict[str, Any]:
     """Inert OpenCode config data: the seat server and the manager permissions."""
-    server: dict[str, Any] = {
-        "type": "local",
-        "command": _opencode_command_argv(mcp_command),
-        "enabled": True,
-    }
-    if environment is not None:
-        server["environment"] = _manager_seat_mcp_environment(environment)
-    return {
-        "$schema": OPENCODE_CONFIG_SCHEMA_URL,
-        "permission": opencode_manager_permission_contract(),
-        "mcp": {OPENCODE_WORKER_MCP_SERVER: server},
-    }
+    return _build_opencode_mcp_config(
+        mcp_command, environment=environment, role=OPENCODE_MANAGER_ROLE
+    )
 
 
 def validate_opencode_manager_config(config: Any) -> Any:
     """Refuse any OpenCode config that is not exactly the manager contract."""
-    if (
-        not isinstance(config, dict)
-        or set(config) != {"$schema", "permission", "mcp"}
-        or config["$schema"] != OPENCODE_CONFIG_SCHEMA_URL
-    ):
-        raise OpenCodeWorkerConfigError("malformed", "top_level")
-    alias = OPENCODE_WORKER_MCP_SERVER
-    if len(alias) > OPENCODE_NAME_MAX_CHARS:
-        raise OpenCodeWorkerConfigError("alias_too_long", str(len(alias)))
-    servers = config["mcp"]
-    server = servers.get(alias) if isinstance(servers, dict) else None
-    if not isinstance(server, dict) or list(servers) != [alias]:
-        raise OpenCodeWorkerConfigError("malformed", "mcp_servers")
-    if (
-        not {"type", "command", "enabled"}
-        <= set(server)
-        <= {"type", "command", "enabled", "environment"}
-        or server["type"] != "local"
-        or server["enabled"] is not True
-    ):
-        raise OpenCodeWorkerConfigError("malformed", "mcp_server")
-    try:
-        _opencode_command_argv(server["command"])
-        if "environment" in server:
-            _manager_seat_mcp_environment(server["environment"])
-    except ValueError as exc:
-        raise OpenCodeWorkerConfigError("malformed", str(exc)) from exc
-    permission = config["permission"]
-    if not isinstance(permission, dict) or list(permission.items()) != list(
-        opencode_manager_permission_contract().items()
-    ):
-        raise OpenCodeWorkerConfigError("permission_contract_mismatch")
-    for name, action in permission.items():
-        if action == OPENCODE_PERMISSION_ALLOW and len(name) > OPENCODE_NAME_MAX_CHARS:
-            raise OpenCodeWorkerConfigError("tool_name_too_long", name)
-    return config
+    return _validate_opencode_config(config, role=OPENCODE_MANAGER_ROLE)
 
 
 def serialize_opencode_manager_config(config: Any) -> str:
     """The validated manager config as one bounded ASCII JSON line for the child env."""
-    validate_opencode_manager_config(config)
-    text = json.dumps(config, ensure_ascii=True, separators=(",", ":"), allow_nan=False)
-    if len(text) > OPENCODE_WORKER_CONFIG_MAX_BYTES:
-        raise OpenCodeWorkerConfigError(
-            "oversized", f"{len(text)}>{OPENCODE_WORKER_CONFIG_MAX_BYTES}"
-        )
-    return text
+    return _serialize_opencode_config(config, role=OPENCODE_MANAGER_ROLE)
 
 
 def build_runtime_command(

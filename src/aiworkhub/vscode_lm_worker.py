@@ -19,6 +19,7 @@ from typing import Any, cast
 from . import semantic_edit
 from .platform_io import current_user_uid
 from .runtime_adapters import EDITOR_REQUESTED_MODEL_RE
+from .semantic_edit import coerce_protocol_line
 from .vscode_lm_bridge import (
     EDIT_RESPONSE_SCHEMA_ID,
     EDIT_RESPONSE_SCHEMA_ID_V1,
@@ -1114,18 +1115,6 @@ _STAGE_TOOL_NAMES = frozenset({
 })
 
 
-def _decimal_protocol_line(value: Any) -> Any:
-    """Coerce a JSON string line number; leave bools and junk unchanged."""
-
-    if isinstance(value, bool) or isinstance(value, int):
-        return value
-    if isinstance(value, str):
-        text = value.strip()
-        if text.isdigit():
-            return int(text)
-    return value
-
-
 def _protocol_kind(item: dict[str, Any]) -> str:
     """Map operation/action aliases onto range or create, or a conflict."""
 
@@ -1159,9 +1148,9 @@ def _protocol_path(item: dict[str, Any]) -> str | None:
 def _coerce_protocol_range(item: dict[str, Any]) -> dict[str, Any]:
     normalized = dict(item)
     if "start_line" in normalized:
-        normalized["start_line"] = _decimal_protocol_line(normalized.get("start_line"))
+        normalized["start_line"] = coerce_protocol_line(normalized.get("start_line"))
     if "end_line" in normalized:
-        normalized["end_line"] = _decimal_protocol_line(normalized.get("end_line"))
+        normalized["end_line"] = coerce_protocol_line(normalized.get("end_line"))
     return normalized
 
 
@@ -1171,8 +1160,8 @@ def _flat_protocol_range(item: dict[str, Any]) -> dict[str, Any] | None:
     if not isinstance(item.get("new"), str):
         return None
     range_item: dict[str, Any] = {
-        "start_line": _decimal_protocol_line(item.get("start_line")),
-        "end_line": _decimal_protocol_line(item.get("end_line")),
+        "start_line": coerce_protocol_line(item.get("start_line")),
+        "end_line": coerce_protocol_line(item.get("end_line")),
         "new": item["new"],
     }
     if "preserve_trailing_newline" in item:
