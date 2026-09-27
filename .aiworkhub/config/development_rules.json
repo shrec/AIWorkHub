@@ -1060,7 +1060,7 @@
       {
         "path": "src/aiworkhub/dashboard_mcp_app.py",
         "pattern": "parallel_implementation",
-        "count": 11
+        "count": 9
       },
       {
         "path": "src/aiworkhub/deepseek_credentials.py",
@@ -1286,8 +1286,8 @@
     "measurement": {
       "reference_commit": "a86934dbfcca6389595c5e0fa5cbbf74e9537fb4",
       "reference_total": 119,
-      "current_total": 113,
-      "accepted_predecessor_delta": -6
+      "current_total": 111,
+      "accepted_predecessor_delta": -8
     }
   }
 }
