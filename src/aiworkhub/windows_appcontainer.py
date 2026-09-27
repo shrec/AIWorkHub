@@ -245,8 +245,9 @@ _GRANT_ACCESS_MASKS: dict[str, int] = {
 # NF-2026-01027, measured: GetLongPathNameW looks an 8.3-shaped component
 # (``worktree``, ``home``) up with FindFirstFileW in its parent, and git's
 # getcwd() needs that lookup. So a traverse of a request's own directory inside
-# a sandbox root also lists it; the shared root and ``awh`` never do, since
-# that would name every sibling request. FindFirstFileW opens the directory
+# a sandbox root also lists it; the shared root and ``awh-helper`` never do,
+# since that would name every sibling request (their helper-temp components are
+# non-8.3 instead, NF-2026-01053). FindFirstFileW opens the directory
 # for synchronous I/O, so it needs SYNCHRONIZE as well.
 _LIST_REQUEST_DIRECTORY = 0x00100001  # SYNCHRONIZE | FILE_LIST_DIRECTORY
 
@@ -298,7 +299,7 @@ def _sandbox_root_of(path: str) -> str:
 
 
 def _shared_sandbox_directory(path: str) -> bool:
-    """``path`` is a sandbox root or its shared helper-temp parent ``awh``.
+    """``path`` is a sandbox root or its shared helper parent ``awh-helper``.
 
     Every launch of one container SID traverses these at the same time, and a
     revoke removes all of that SID's explicit ACEs on a path, so the first
@@ -342,8 +343,8 @@ def request_scoped_grants(
     Each distinct requested leaf receives modify access. Every directory from
     a leaf's parent up to and including its sandbox root receives only
     non-inheritable traverse access, nearest-first in ``Path.parents`` order,
-    and the chain stops there. The root and its shared ``awh`` helper parent
-    are persistent (:func:`_shared_sandbox_directory`); every other entry is
+    and the chain stops there. The root and its shared ``awh-helper`` helper
+    parent are persistent (:func:`_shared_sandbox_directory`); every other entry is
     revoked with the launch. An explicit path that does not resolve strictly
     inside a sandbox root is refused; an ambient environment path outside one
     is omitted and does not drag its own siblings into the plan.
@@ -1791,7 +1792,19 @@ _HELPER_TEMP_ALIAS_KEYS = (
     "RUFF_CACHE_DIR",
     "MYPY_CACHE_DIR",
 )
-_HELPER_TEMP_PARENT = "awh"
+# NF-2026-01053: neither helper component may be 8.3-shaped, or git's getcwd
+# needs list-directory on the traverse-only root and parent (NF-2026-01027).
+_HELPER_TEMP_PARENT = "awh-helper"
+_HELPER_TEMP_LEAF_BYTES = 5
+
+
+def _is_8dot3_shaped(name: str) -> bool:
+    """``name`` fits 8.3: a 1-8 character base and at most a 3-character extension."""
+
+    base, dot, extension = name.partition(".")
+    if not base or len(base) > 8:
+        return False
+    return not dot or (len(extension) <= 3 and "." not in extension)
 
 
 def _pytest_username() -> str:
@@ -1839,7 +1852,11 @@ def _discard_helper_temp(path: str) -> None:
 
 
 def _create_short_helper_temp(anchor: str, username: str) -> Path | None:
-    """``<sandbox root>\\awh\\<hex>``, short enough for the nested helper cwd."""
+    """``<sandbox root>\\awh-helper\\<10 hex>``, short for the nested helper cwd.
+
+    Neither component is 8.3-shaped (:func:`_is_8dot3_shaped`), so git's
+    getcwd never needs to list the traverse-only root or parent (NF-2026-01053).
+    """
 
     parent = Path(anchor) / _HELPER_TEMP_PARENT
     try:
@@ -1849,7 +1866,7 @@ def _create_short_helper_temp(anchor: str, username: str) -> Path | None:
     if parent.is_symlink() or not parent.is_dir():
         return None
     for _attempt in range(8):
-        leaf = parent / secrets.token_hex(4)
+        leaf = parent / secrets.token_hex(_HELPER_TEMP_LEAF_BYTES)
         try:
             leaf.mkdir()
         except FileExistsError:
@@ -1874,11 +1891,11 @@ def bind_validation_helper_temp(
     LSP helper cwd with WinError 267, not a missing execute ACE and not a
     generic spawn ban. Only a validation launch whose scratch is the temp
     pytest will use, and only when that scratch resolves strictly inside a
-    sandbox root, is rewritten, to ``<sandbox root>\\awh\\<hex>``. The added
-    grants are that short leaf (modify, which includes execute, so a helper
-    created under it is executable) and the traverse chain
-    :func:`request_scoped_grants` emits for it: ``awh`` and the root, both
-    persistent. A scratch or workspace outside a sandbox root is not aliased
+    sandbox root, is rewritten, to ``<sandbox root>\\awh-helper\\<hex>``. The
+    added grants are that short leaf (modify, which includes execute, so a
+    helper created under it is executable) and the traverse chain
+    :func:`request_scoped_grants` emits for it: ``awh-helper`` and the root,
+    both persistent. A scratch or workspace outside a sandbox root is not aliased
     and not granted. A launch without the validation scratch env is left
     unchanged. The length check reads the real path; the child later sees
     the shorter drive spelling (:func:`_on_sandbox_drive`).

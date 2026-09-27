@@ -2543,19 +2543,21 @@ def test_a_persistent_traverse_is_only_the_shared_sandbox_directories(tmp_path, 
 
 def test_the_sandbox_root_and_helper_parent_may_carry_a_persistent_traverse(tmp_path):
     root, request = _sandbox(tmp_path)
-    (root / "awh").mkdir()
+    (root / wac._HELPER_TEMP_PARENT).mkdir()
     assert "must be revoked" in _refused(
         [ContainerGrant(str(root), "modify", persistent=True)], FakeWin32Api()
     )
     grants = [
         ContainerGrant(str(request), "modify"),
-        ContainerGrant(str(root / "awh"), "traverse", persistent=True),
+        ContainerGrant(
+            str(root / wac._HELPER_TEMP_PARENT), "traverse", persistent=True
+        ),
         ContainerGrant(str(root), "traverse", persistent=True),
     ]
     fake = FakeWin32Api()
     launch = launch_appcontainer(make_request(filesystem_grants=grants), api=fake)
     assert [path for path, _how in launch.persistent_grants] == [
-        str(root / "awh"),
+        str(root / wac._HELPER_TEMP_PARENT),
         str(root),
     ]
     fake.events.clear()
@@ -3027,9 +3029,10 @@ def test_ctypes_traverse_grant_is_minimal_and_non_inheritable(
 
 def test_ctypes_traverse_lists_only_a_request_directory(tmp_path, monkeypatch):
     """NF-2026-01027: git's getcwd() (GetLongPathNameW) lists the parent of the
-    8.3-shaped ``worktree``; the shared root and ``awh`` must not name siblings."""
+    8.3-shaped ``worktree``; the shared root and helper parent must not name
+    siblings."""
     root, request = _sandbox(tmp_path)
-    awh = root / "awh"
+    awh = root / wac._HELPER_TEMP_PARENT
     awh.mkdir()
     lib = FakeSecurityLib()
     api = _security_api(lib, monkeypatch, present=False)
@@ -4175,6 +4178,87 @@ def test_nested_lsp_helper_cwd_budget_names_the_measured_winerror_267_limit():
     assert projected_nested_lsp_cwd_length("x" * 190, "shrek") > 258
     assert not temp_root_blocks_nested_lsp_helper("x" * 46, "shrek")
     assert projected_nested_lsp_cwd_length("x" * 46, "shrek") <= 258
+
+
+_NEUTRAL_USER = "worker"
+_NEUTRAL_ROOT = r"D:\repo\project\.aiworkhub\runtime\worktrees"
+
+
+@pytest.mark.parametrize(
+    ("name", "shaped"),
+    [
+        ("awh", True),
+        ("a04f8b02", True),
+        ("pytest-0", True),
+        ("worktree", True),
+        ("readme.txt", True),
+        ("0123456789abcdef0123456789abcdef", False),
+        ("awh-helper", False),
+        ("a04f8b02c1", False),
+        ("worktrees", False),
+        ("readme.text", False),
+        ("a.b.c", False),
+        (".aiworkhub", False),
+    ],
+)
+def test_is_8dot3_shaped(name, shaped):
+    assert wac._is_8dot3_shaped(name) is shaped
+
+
+def test_helper_temp_components_are_never_8dot3_shaped(tmp_path, monkeypatch):
+    """NF-2026-01053: git's getcwd lists the parent of an 8.3-shaped component,
+    and the root and helper parent are traverse-only, so neither may be one."""
+    root = tmp_path / ".aiworkhub" / "runtime" / "worktrees"
+    root.mkdir(parents=True)
+    monkeypatch.setattr(
+        wac, "temp_root_blocks_nested_lsp_helper", lambda *_args: False
+    )
+    leaf = wac._create_short_helper_temp(str(root), _NEUTRAL_USER)
+    assert leaf is not None and leaf.is_dir()
+    created = leaf.relative_to(root).parts
+    assert len(created) == 2
+    assert created[0] == wac._HELPER_TEMP_PARENT
+    assert len(created[1]) == 2 * wac._HELPER_TEMP_LEAF_BYTES
+    assert not any(wac._is_8dot3_shaped(part) for part in created)
+
+
+def test_new_helper_temp_layout_fits_the_nested_lsp_helper():
+    from aiworkhub.validation_runner import temp_root_blocks_nested_lsp_helper
+
+    hex_leaf = "f" * (2 * wac._HELPER_TEMP_LEAF_BYTES)
+    leaf = "\\".join((_NEUTRAL_ROOT, wac._HELPER_TEMP_PARENT, hex_leaf))
+    assert not temp_root_blocks_nested_lsp_helper(leaf, _NEUTRAL_USER)
+
+
+def test_renamed_helper_parent_is_the_persistent_shared_traverse(tmp_path):
+    root = tmp_path / ".aiworkhub" / "runtime" / "worktrees"
+    parent = root / wac._HELPER_TEMP_PARENT
+    assert wac._shared_sandbox_directory(str(root))
+    assert wac._shared_sandbox_directory(str(parent))
+    assert not wac._shared_sandbox_directory(str(parent / "0a1b2c3d4e"))
+    assert not wac._shared_sandbox_directory(str(root / "awh"))
+
+
+def test_discard_helper_temp_only_removes_a_leaf_under_the_renamed_parent(tmp_path):
+    root = tmp_path / ".aiworkhub" / "runtime" / "worktrees"
+    inside = root / wac._HELPER_TEMP_PARENT / "0a1b2c3d4e"
+    outside = root / "elsewhere" / "0a1b2c3d4e"
+    legacy = root / "awh" / "0a1b2c3d"
+    for path in (inside, outside, legacy):
+        path.mkdir(parents=True)
+        wac._discard_helper_temp(str(path))
+    assert not inside.exists()
+    assert outside.is_dir()
+    assert legacy.is_dir()
+
+
+def test_helper_temp_rename_widens_no_grant_mask():
+    assert wac._GRANT_ACCESS_MASKS == {
+        "read_execute": 0x001200A9,
+        "modify": 0x001301BF,
+        "traverse": 0x000200A0,
+    }
+    assert wac._LIST_REQUEST_DIRECTORY == 0x00100001
 
 
 def test_helper_temp_plan_does_not_grant_a_workspace_outside_a_sandbox():
