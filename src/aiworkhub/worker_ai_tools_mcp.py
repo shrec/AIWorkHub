@@ -330,6 +330,13 @@ SOURCE_GRAPH_CONTINUATION_MAX_BYTES = 8 * 1024 * 1024
 MAX_DECLARED_INPUT_PREVIEW_BYTES = 12 * 1024
 MAX_DECLARED_INPUT_HASH_BYTES = 8 * 1024 * 1024
 MAX_QUALITY_REVIEW_PACKET_BYTES = 256 * 1024
+# NF-2026-01029: a whole packet came back as one result, the host said it
+# exceeded its inline limit and spilled it to a file, and because the evidence
+# strings carry escaped newlines that file was a single ~26.6k-token line no
+# paged read could walk. The packet is delivered one part at a time instead,
+# each part's serialized result bounded by this cap -- well under the host's
+# inline limit, so nothing is ever spilled.
+QUALITY_REVIEW_PACKET_PART_BYTES = 48 * 1024
 MAX_REWORK_OVERLAY_PACKET_BYTES = 12 * 1024 * 1024
 MAX_REWORK_OVERLAY_FILES = 512
 MAX_QUALITY_REVIEW_FINDINGS = 50
@@ -6717,8 +6724,64 @@ def quality_review_submit(
     )
 
 
-def quality_review_packet_read(ctx: WorkerToolContext) -> dict[str, Any]:
-    """Return only the exact coordinator-bound, canonically verified packet."""
+def _json_escaped_width(character: str) -> int:
+    """Bytes ``json.dumps`` spends on one character inside a string value.
+
+    Measured against ``ensure_ascii=True``, the default the host and the tests
+    serialize with, which also makes it an upper bound for an
+    ``ensure_ascii=False`` encoder: a BMP character costs 6 here and at most 3
+    UTF-8 bytes there.
+    """
+
+    code = ord(character)
+    if character in '"\\':
+        return 2
+    if code in (0x08, 0x09, 0x0A, 0x0C, 0x0D):
+        return 2
+    if 0x20 <= code <= 0x7E:
+        return 1
+    return 12 if code > 0xFFFF else 6
+
+
+def _quality_review_packet_parts(text: str, *, envelope_bytes: int) -> list[str]:
+    """Split packet text into consecutive slices that rejoin to exactly it.
+
+    The cap is on the SERIALIZED result rather than on the raw text, so each
+    character is charged the width it occupies once escaped.  A packet whose
+    evidence strings are mostly escapes would otherwise pass a raw-length check
+    and still come back as one oversized line -- which is how NF-2026-01029
+    produced a single ~26.6k-token result the host spilled to a file that could
+    not be paged.
+    """
+
+    budget = max(1, QUALITY_REVIEW_PACKET_PART_BYTES - envelope_bytes)
+    parts: list[str] = []
+    start = 0
+    width = 0
+    for index, character in enumerate(text):
+        cost = _json_escaped_width(character)
+        if width + cost > budget and index > start:
+            parts.append(text[start:index])
+            start = index
+            width = 0
+        width += cost
+    parts.append(text[start:])
+    return parts
+
+
+def quality_review_packet_read(
+    ctx: WorkerToolContext,
+    part: int = 0,
+) -> dict[str, Any]:
+    """Return one bounded part of the coordinator-bound, verified packet.
+
+    Every verification below is the one the single-result version ran, in the
+    same order and with the same typed refusals; only the delivery is paged.
+    The parts are consecutive character slices of the canonical packet text --
+    the exact bytes ``packet_sha256`` is the digest of -- so joining part 0
+    through ``part_count - 1`` reproduces that text, and re-hashing the join
+    re-authenticates it against the digest returned with every part.
+    """
 
     tool = "quality_review_packet_read"
     path = ctx.quality_review_packet_path
@@ -6745,11 +6808,41 @@ def quality_review_packet_read(ctx: WorkerToolContext) -> dict[str, Any]:
         return _violation(ctx, tool, "quality_review_packet_unreadable")
     if not isinstance(packet, dict):
         return _violation(ctx, tool, "quality_review_packet_schema_mismatch")
+    packet_sha256 = verified["packet_sha256"]
+    text = json.dumps(
+        {key: value for key, value in packet.items() if key != "packet_sha256"},
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    # A part holds at least one character, so ``len(text)`` is the widest either
+    # integer can print: the envelope reserved here is measured, never guessed.
+    envelope = {
+        "ok": True,
+        "tool": tool,
+        "packet_sha256": packet_sha256,
+        "part": len(text),
+        "part_count": len(text),
+        "text": "",
+    }
+    parts = _quality_review_packet_parts(
+        text,
+        envelope_bytes=len(json.dumps(envelope).encode("utf-8")),
+    )
+    valid_part = (
+        isinstance(part, int)
+        and not isinstance(part, bool)
+        and 0 <= part < len(parts)
+    )
+    if not valid_part:
+        return _violation(ctx, tool, "quality_review_packet_part_invalid")
     result = {
         "ok": True,
         "tool": tool,
-        "packet_sha256": verified["packet_sha256"],
-        "packet": packet,
+        "packet_sha256": packet_sha256,
+        "part": part,
+        "part_count": len(parts),
+        "text": parts[part],
     }
     audit_configured = (
         ctx.audit_ledger_path is not None and ctx.audit_hmac_key_path is not None
@@ -6766,9 +6859,11 @@ def quality_review_packet_read(ctx: WorkerToolContext) -> dict[str, Any]:
         authority_source="candidate_packet",
         authority_state="quality_review_readonly",
         payload={
-            "packet_sha256": verified["packet_sha256"],
+            "packet_sha256": packet_sha256,
             "target_request_id": verified["target_request_id"],
             "target_task_id": verified["target_task_id"],
+            "part": part,
+            "part_count": len(parts),
         },
     )
     if audit_configured and not appended:
@@ -8498,13 +8593,16 @@ def register_tools(mcp: Any, ctx: WorkerToolContext) -> tuple[str, ...]:
     @mcp.tool(
         name="aiworkhub_worker_quality_review_packet_read",
         description=(
-            "Read the exact coordinator-bound sealed quality-review packet. "
-            "Reviewer-only and accepts no arguments."
+            "Read the exact coordinator-bound sealed quality-review packet, "
+            "one bounded part at a time. Reviewer-only; part (int, default 0) "
+            "is the only argument -- never a path or an identity. Call it with "
+            "no arguments for part 0, then once per remaining part up to "
+            "part_count-1, and join every returned text."
         ),
     )
-    def _quality_review_packet_read() -> dict[str, Any]:
-        """Read the exact bound packet after canonical candidate verification."""
-        return quality_review_packet_read(ctx)
+    def _quality_review_packet_read(part: int = 0) -> dict[str, Any]:
+        """Read one bounded packet part after canonical candidate verification."""
+        return quality_review_packet_read(ctx, part=part)
 
     @mcp.tool(
         name="aiworkhub_worker_quality_review_submit",

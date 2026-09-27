@@ -913,10 +913,12 @@ def build_review_prompt(
         f"QUALITY_REVIEW_PACKET_FILE: {packet_file}\n"
         f"PACKET_SHA256: {packet_digest}\n"
         "The packet file has been written with the canonical serialized packet "
-        "whose packet_sha256 is shown above. Call "
-        "aiworkhub_worker_quality_review_packet_read with no arguments before "
-        "reviewing; the returned packet is the authoritative evidence for this "
-        "review. Do not supply a path or identity to that tool.\n"
+        "whose packet_sha256 is shown above. The packet is delivered in bounded "
+        "parts: call aiworkhub_worker_quality_review_packet_read with part=0 "
+        "before reviewing, then once for each remaining part up to "
+        "part_count-1, and treat the concatenated text of every part as the "
+        "authoritative evidence for this review -- its sha256 is the "
+        "packet_sha256 above. Do not supply a path or identity to that tool.\n"
         if use_file_transport
         else f"QUALITY_REVIEW_PACKET: {encoded}\n"
     )

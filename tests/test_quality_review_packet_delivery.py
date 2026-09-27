@@ -92,6 +92,61 @@ def _sealed_packet(tmp_path: Path) -> tuple[Path, dict[str, object], Path]:
     return packet_path, packet, candidate
 
 
+def _canonical_packet_text(packet: dict[str, object]) -> str:
+    """The exact bytes ``packet_sha256`` is the digest of, as text."""
+    return json.dumps(
+        {key: value for key, value in packet.items() if key != "packet_sha256"},
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _read_every_part(ctx: worker_mcp.WorkerToolContext) -> list[dict]:
+    """Part 0 -- the bare call a reviewer makes first -- then the rest, in order."""
+    results = [worker_mcp.quality_review_packet_read(ctx)]
+    for index in range(1, int(results[0]["part_count"])):
+        results.append(worker_mcp.quality_review_packet_read(ctx, part=index))
+    return results
+
+
+def _paging_packet(tmp_path: Path) -> tuple[Path, dict[str, object]]:
+    """A sealed packet whose evidence holds a >200 KB multi-line string.
+
+    This is the NF-2026-01029 shape: the newlines are escaped on the way into
+    JSON, so the whole packet serializes as ONE line and a host that spills an
+    oversized result leaves the reviewer a file no paged read can walk.
+    """
+    candidate = tmp_path / CANDIDATE_PATH
+    candidate.parent.mkdir(parents=True, exist_ok=True)
+    candidate.write_bytes(b"candidate-bytes")
+    body = {key: value for key, value in _packet().items() if key != "packet_sha256"}
+    section = dict(body["candidate"])  # type: ignore[arg-type]
+    transcript = "".join(
+        f"{index:06d} | evidence line with enough width to be worth paging\n"
+        for index in range(3500)
+    )
+    assert len(transcript) > 200 * 1024
+    section["source_evidence"] = [
+        {"path": CANDIDATE_PATH, "excerpt": transcript, "truncated": False}
+    ]
+    body["candidate"] = section
+    encoded = json.dumps(
+        body, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    )
+    packet = {
+        **body,
+        "packet_sha256": hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
+    }
+    packet_path = tmp_path / "paged-review-packet.json"
+    packet_path.write_text(
+        json.dumps(packet, ensure_ascii=False, separators=(",", ":"), sort_keys=True),
+        encoding="utf-8",
+    )
+    assert packet_path.stat().st_size <= worker_mcp.MAX_QUALITY_REVIEW_PACKET_BYTES
+    return packet_path, packet
+
+
 def test_reviewer_packet_read_returns_exact_bound_packet(tmp_path: Path) -> None:
     packet_path, packet, _candidate = _sealed_packet(tmp_path)
     ctx = _review_ctx(tmp_path, packet_path)
@@ -100,7 +155,9 @@ def test_reviewer_packet_read_returns_exact_bound_packet(tmp_path: Path) -> None
         "ok": True,
         "tool": "quality_review_packet_read",
         "packet_sha256": packet["packet_sha256"],
-        "packet": packet,
+        "part": 0,
+        "part_count": 1,
+        "text": _canonical_packet_text(packet),
     }
     assert ctx.audit_ledger_path is not None
     assert ctx.audit_hmac_key_path is not None
@@ -128,7 +185,86 @@ def test_reviewer_packet_read_returns_exact_bound_packet(tmp_path: Path) -> None
         "packet_sha256": packet["packet_sha256"],
         "target_request_id": target["request_id"],
         "target_task_id": target["task_id"],
+        "part": 0,
+        "part_count": 1,
     }
+
+
+def test_a_small_packet_is_one_part_of_unchanged_packet_text(tmp_path: Path) -> None:
+    """Paging must not chop, re-order or re-encode a packet that already fits."""
+    packet_path, packet, _candidate = _sealed_packet(tmp_path)
+    result = worker_mcp.quality_review_packet_read(_review_ctx(tmp_path, packet_path))
+    assert result["part_count"] == 1
+    assert result["part"] == 0
+    assert result["text"] == _canonical_packet_text(packet)
+    assert (
+        hashlib.sha256(str(result["text"]).encode("utf-8")).hexdigest()
+        == packet["packet_sha256"]
+    )
+
+
+def test_a_packet_the_host_would_spill_is_paged_under_the_part_cap(
+    tmp_path: Path,
+) -> None:
+    """NF-2026-01029. 8 minutes were lost to an unpageable 26.6k-token line.
+
+    Every part has to be small enough that the host never spills it, and the
+    parts have to rejoin to exactly the bytes the digest authenticates -- a
+    bound that only holds if each character is charged its ESCAPED width, which
+    is what >200 KB of escaped newlines is here to prove.
+    """
+    packet_path, packet = _paging_packet(tmp_path)
+    ctx = _review_ctx(tmp_path, packet_path)
+    results = _read_every_part(ctx)
+
+    assert len(results) > 1
+    assert [row["part"] for row in results] == list(range(len(results)))
+    assert {row["part_count"] for row in results} == {len(results)}
+    assert {row["packet_sha256"] for row in results} == {packet["packet_sha256"]}
+    for row in results:
+        serialized = len(json.dumps(row).encode("utf-8"))
+        assert serialized <= worker_mcp.QUALITY_REVIEW_PACKET_PART_BYTES
+
+    joined = "".join(str(row["text"]) for row in results)
+    assert hashlib.sha256(joined.encode("utf-8")).hexdigest() == packet["packet_sha256"]
+    assert json.loads(joined) == {
+        key: value for key, value in packet.items() if key != "packet_sha256"
+    }
+
+    assert ctx.audit_ledger_path is not None
+    assert ctx.audit_hmac_key_path is not None
+    verification = worker_mcp.verify_audit_ledger(
+        ctx.audit_ledger_path,
+        ctx.audit_hmac_key_path,
+        task_id=ctx.task_id,
+        runner=ctx.runner,
+        topic=ctx.topic,
+        request_id=ctx.request_id,
+    )
+    assert verification["ok"] is True
+    assert verification["entries_tampered"] == 0
+    assert (
+        verification["successful_call_count_by_tool"]["quality_review_packet_read"]
+        == len(results)
+    )
+    payloads = [
+        json.loads(line)["payload"]
+        for line in ctx.audit_ledger_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert [row["part"] for row in payloads] == list(range(len(results)))
+    assert {row["part_count"] for row in payloads} == {len(results)}
+
+
+# ``part`` is the ONLY argument, so the typed refusal is the whole guard: a
+# small packet has exactly one part, which makes 1 the first out-of-range index.
+@pytest.mark.parametrize("part", [-1, 1, "0", 1.5, True])
+def test_an_invalid_part_is_a_typed_violation(tmp_path: Path, part: object) -> None:
+    packet_path, _packet_body, _candidate = _sealed_packet(tmp_path)
+    result = worker_mcp.quality_review_packet_read(
+        _review_ctx(tmp_path, packet_path), part=part  # type: ignore[arg-type]
+    )
+    assert result["ok"] is False
+    assert result["reason"] == "quality_review_packet_part_invalid"
 
 
 def test_reviewer_packet_read_is_inert_without_bound_packet(tmp_path: Path) -> None:
@@ -169,7 +305,8 @@ def test_reviewer_packet_read_rejects_symlink(tmp_path: Path) -> None:
     assert result["reason"] == "quality_review_packet_invalid"
 
 
-def test_file_transport_prompt_names_no_argument_packet_tool(tmp_path: Path) -> None:
+def test_file_transport_prompt_names_the_paged_packet_tool(tmp_path: Path) -> None:
+    """NF-2026-01029: the prompt has to name the paging, or nobody pages."""
     packet = _packet()
     packet_path = tmp_path / "packet.json"
     packet_path.write_text(json.dumps(packet), encoding="utf-8")
@@ -181,7 +318,10 @@ def test_file_transport_prompt_names_no_argument_packet_tool(tmp_path: Path) -> 
         max_inline_bytes=0,
     )
     assert "aiworkhub_worker_quality_review_packet_read" in prompt
-    assert "with no arguments" in prompt
+    assert "part=0" in prompt
+    assert "part_count-1" in prompt
+    # Paging adds an index argument and nothing else: the tool still refuses to
+    # be pointed at a file or an identity, and the prompt still says so.
     assert "Do not supply a path or identity" in prompt
 
 
@@ -249,13 +389,17 @@ def test_sighted_bound_packet_stays_file_ref_just_below_inline_cap(
     assert json.loads(packet_path.read_text(encoding="utf-8")) == packet
 
     ctx = _review_ctx(tmp_path, packet_path)
-    result = worker_mcp.quality_review_packet_read(ctx)
-    assert result == {
+    results = _read_every_part(ctx)
+    canonical = _canonical_packet_text(packet)
+    assert results[0] == {
         "ok": True,
         "tool": "quality_review_packet_read",
         "packet_sha256": packet["packet_sha256"],
-        "packet": packet,
+        "part": 0,
+        "part_count": len(results),
+        "text": canonical[: len(str(results[0]["text"]))],
     }
+    assert "".join(str(row["text"]) for row in results) == canonical
     assert ctx.audit_ledger_path is not None
     assert ctx.audit_hmac_key_path is not None
     verification = worker_mcp.verify_audit_ledger(
@@ -268,10 +412,13 @@ def test_sighted_bound_packet_stays_file_ref_just_below_inline_cap(
     )
     assert verification["ok"] is True
     assert verification["entries_tampered"] == 0
-    assert verification["call_count_by_tool"]["quality_review_packet_read"] == 1
+    # One authenticated read per part, and every one of them succeeded: paging
+    # splits the delivery, never the verification or the audit behind it.
+    reads = len(results)
+    assert verification["call_count_by_tool"]["quality_review_packet_read"] == reads
     assert (
         verification["successful_call_count_by_tool"]["quality_review_packet_read"]
-        == 1
+        == reads
     )
 
 

@@ -1754,15 +1754,21 @@ def test_register_tools_exposes_exactly_the_worker_safe_tool_set(monkeypatch: py
     assert set(fake_mcp.registered) == set(w.MCP_TOOL_NAMES)
 
 
-def test_registered_quality_review_packet_read_accepts_no_arguments(
+def test_registered_quality_review_packet_read_takes_only_an_optional_part(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    """NF-2026-01029: paging is one int, and calling it bare still means part 0."""
     _mute_chmod(monkeypatch)
     repo = _fake_repo(tmp_path)
     fake_mcp = _FakeMcp()
     w.register_tools(fake_mcp, _ctx(repo, home=tmp_path / "home"))
     tool = fake_mcp.registered["aiworkhub_worker_quality_review_packet_read"]
-    assert not inspect.signature(tool).parameters
+    parameters = inspect.signature(tool).parameters
+    assert list(parameters) == ["part"]
+    # The module defers annotations, so the declared type arrives as its source
+    # text; either form proves the host is told part is an int, not a string.
+    assert parameters["part"].annotation in (int, "int")
+    assert parameters["part"].default == 0
 
 
 def test_registered_tool_signatures_never_accept_repo_or_task_identity(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
