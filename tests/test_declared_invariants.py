@@ -21,7 +21,6 @@ and "checked and clean" must never look the same.
 from __future__ import annotations
 import ast
 import json
-import json
 import sys
 from pathlib import Path
 
@@ -36,9 +35,52 @@ from aiworkhub import declared_invariants as di  # noqa: E402
 _PACKAGE = _SRC / "aiworkhub"
 
 
-def test_the_current_tree_holds_every_declared_invariant():
+@pytest.fixture(scope="module")
+def canonical_report() -> dict:
+    """One di.check(_PACKAGE) result, shared by every test that only reads it.
+
+    Parsing every module under src/aiworkhub costs several seconds; a dozen
+    tests here call di.check(_PACKAGE) with no monkeypatch and no repo_root,
+    so computing it once instead of once per test is the point of
+    NF-2026-01052.
+    """
+
+    return di.check(_PACKAGE)
+
+
+@pytest.fixture(scope="module")
+def package_scan() -> list:
+    """One real di._scan_modules(_PACKAGE), computed once for this module.
+
+    Every di.check(_PACKAGE) otherwise starts a fresh process pool over the
+    whole package -- seconds on the host, far more in the AppContainer -- for
+    tests whose subject is the learning, store or manifest rows, not the scan.
+    """
+
+    return di._scan_modules(_PACKAGE)
+
+
+@pytest.fixture
+def cached_package_scan(monkeypatch, package_scan) -> None:
+    """Serve the cached scan for _PACKAGE; any other root scans for real.
+
+    The cached list is exactly what the real call returned, so the report a
+    test reads is identical. Tests about the scan itself do not use this.
+    """
+
+    real_scan_modules = di._scan_modules
+
+    def _scan_modules(src_root: Path):
+        if Path(src_root) == _PACKAGE:
+            return list(package_scan)
+        return real_scan_modules(src_root)
+
+    monkeypatch.setattr(di, "_scan_modules", _scan_modules)
+
+
+def test_the_current_tree_holds_every_declared_invariant(canonical_report):
     """The canonical tree is the baseline: it must be clean, not merely better."""
-    report = di.check(_PACKAGE)
+    report = canonical_report
     assert report["passed"], report["violations"]
     assert report["violation_count"] == 0
     assert {row["invariant"] for row in report["invariants"]} == set(di.INVARIANT_NAMES)
@@ -129,6 +171,7 @@ def test_one_policy_is_decided_by_one_predicate():
     assert di.one_policy_one_predicate() == []
 
 
+@pytest.mark.usefixtures("cached_package_scan")
 def test_an_unevaluable_invariant_reports_itself_rather_than_passing(monkeypatch):
     """'Could not check' must never be indistinguishable from 'clean'."""
 
@@ -143,6 +186,7 @@ def test_an_unevaluable_invariant_reports_itself_rather_than_passing(monkeypatch
     assert any("could not be evaluated" in v["detail"] for v in report["violations"])
 
 
+@pytest.mark.usefixtures("cached_package_scan")
 def test_exception_with_broken_string_still_fails_closed(monkeypatch, capsys, tmp_path):
     class UnformattableError(Exception):
         def __str__(self) -> str:
@@ -166,6 +210,7 @@ def test_exception_with_broken_string_still_fails_closed(monkeypatch, capsys, tm
     assert cli_report["violations"][0]["detail"].endswith("UnformattableError")
 
 
+@pytest.mark.usefixtures("cached_package_scan")
 def test_an_unevaluable_tree_invariant_is_json_and_nonzero(monkeypatch, capsys, tmp_path):
     def _explode(_root: Path) -> list[di.Violation]:
         raise RuntimeError("tree index unavailable")
@@ -395,9 +440,8 @@ def test_the_checker_refuses_to_run_as_a_script_rather_than_report_a_broken_tree
     assert "python -m aiworkhub.declared_invariants" in captured.err
 
 @pytest.mark.parametrize("name", di.INVARIANT_NAMES)
-def test_every_invariant_is_named_in_the_report(name):
-    report = di.check(_PACKAGE)
-    assert name in {row["invariant"] for row in report["invariants"]}
+def test_every_invariant_is_named_in_the_report(name, canonical_report):
+    assert name in {row["invariant"] for row in canonical_report["invariants"]}
 
 
 # --------------------------------------------------------------------------- #
@@ -439,6 +483,7 @@ def _learning_row(report: dict) -> dict:
     return rows[0]
 
 
+@pytest.mark.usefixtures("cached_package_scan")
 def test_a_run_of_decisions_recording_no_lesson_is_a_violation(tmp_path: Path):
     root = _repo(tmp_path)
     _decided(root, di.MAX_DECISIONS_WITHOUT_A_LESSON + 1, lessons=[])
@@ -459,6 +504,7 @@ def test_a_run_of_decisions_recording_no_lesson_is_a_violation(tmp_path: Path):
     assert _learning_row(report)["evaluated"] is True
 
 
+@pytest.mark.usefixtures("cached_package_scan")
 def test_one_lesson_for_the_newest_decision_clears_the_run(tmp_path: Path):
     """Reachability is the whole design: a gate nobody can clear is a wedge."""
     root = _repo(tmp_path)
@@ -469,6 +515,7 @@ def test_one_lesson_for_the_newest_decision_clears_the_run(tmp_path: Path):
     assert report["passed"], report["violations"]
 
 
+@pytest.mark.usefixtures("cached_package_scan")
 def test_a_skip_inside_the_limit_is_not_accused(tmp_path: Path):
     """1 and 2 are what a deliberate skip measured like; 6 and up are not."""
     root = _repo(tmp_path)
@@ -479,6 +526,7 @@ def test_a_skip_inside_the_limit_is_not_accused(tmp_path: Path):
     assert report["passed"], report["violations"]
 
 
+@pytest.mark.usefixtures("cached_package_scan")
 def test_a_repository_that_has_decided_nothing_owes_nothing(tmp_path: Path):
     """An absent denominator must never read as zero coverage."""
     root = _repo(tmp_path)
@@ -490,6 +538,7 @@ def test_a_repository_that_has_decided_nothing_owes_nothing(tmp_path: Path):
     assert _learning_row(report)["evaluated"] is True
 
 
+@pytest.mark.usefixtures("cached_package_scan")
 def test_a_root_with_no_canonical_store_reports_unevaluated_not_clean(tmp_path: Path):
     """A worker's worktree holds src/ and tests/ and never owed this duty."""
     report = di.check(_PACKAGE, repo_root=tmp_path)
@@ -505,15 +554,14 @@ def test_a_root_with_no_canonical_store_reports_unevaluated_not_clean(tmp_path: 
     )
 
 
-def test_no_repository_root_is_reported_rather_than_silently_skipped():
-    report = di.check(_PACKAGE)
-
-    row = _learning_row(report)
+def test_no_repository_root_is_reported_rather_than_silently_skipped(canonical_report):
+    row = _learning_row(canonical_report)
     assert row["evaluated"] is False
     assert row["reason"] == "no_repository_root_supplied"
-    assert report["repo_root"] == ""
+    assert canonical_report["repo_root"] == ""
 
 
+@pytest.mark.usefixtures("cached_package_scan")
 def test_a_store_that_cannot_be_measured_fails_closed(tmp_path: Path, monkeypatch):
     """'Could not measure' must not be indistinguishable from 'duty discharged'."""
     root = _repo(tmp_path)
@@ -535,6 +583,7 @@ def test_a_store_that_cannot_be_measured_fails_closed(tmp_path: Path, monkeypatc
     )
 
 
+@pytest.mark.usefixtures("cached_package_scan")
 def test_only_a_missing_manifest_makes_the_duty_not_applicable(tmp_path: Path, monkeypatch):
     """The applicability probe must not swallow a repository that is simply broken.
 
@@ -592,6 +641,7 @@ def test_an_absent_denominator_wins_over_any_run(tmp_path: Path, monkeypatch):
     assert di.recent_decisions_record_a_lesson(root) == []
 
 
+@pytest.mark.usefixtures("cached_package_scan")
 def test_the_checker_never_writes_a_lesson(tmp_path: Path):
     """Authorship stays with the manager: a fabricated lesson is worse than none."""
     import sqlite3
@@ -750,6 +800,7 @@ def test_the_detector_map_refuses_a_detector_that_does_not_run():
         di.RULE_DETECTORS["single_definition"] = original
 
 
+@pytest.mark.usefixtures("cached_package_scan")
 def test_the_report_names_every_obligation_it_does_not_check():
     """`passed` must never be readable as "every declared rule holds"."""
     repo = Path(__file__).resolve().parents[1]
@@ -858,6 +909,7 @@ def test_a_clean_module_that_becomes_duplicated_is_a_new_identity(tmp_path: Path
     )
 
 
+@pytest.mark.usefixtures("cached_package_scan")
 def test_the_canonical_tree_matches_its_own_declared_baseline():
     """The baseline must describe this tree exactly, or the ratchet is fiction."""
     manifest = _parsed_manifest()
@@ -885,6 +937,71 @@ def test_a_parallel_scan_and_a_sequential_scan_agree(monkeypatch):
 
     assert parallel == sequential
     assert len(parallel) > 1000, "the scan must be exhaustive, not a sample"
+
+
+def test_one_check_parses_each_module_once(tmp_path: Path, monkeypatch):
+    """NF-2026-01052. module_level_caches_are_bounded used to ast.parse every
+    module, then duplicate_definition_counts (via collect_definitions) parsed
+    them all again -- two parses per module in one check() call.
+    """
+    repo = _repo_with_manifest(tmp_path)
+    package = repo / "src" / "aiworkhub"
+    for i in range(3):
+        (package / f"mod{i}.py").write_text(f"VALUE_{i} = {i}\n", encoding="utf-8")
+
+    monkeypatch.setattr(di, "_scan_workers", lambda count: 1)
+
+    parse_counts: dict[str, int] = {}
+    original_parse = di.ast.parse
+
+    def _counting_parse(source, filename="<unknown>", *args, **kwargs):
+        parse_counts[filename] = parse_counts.get(filename, 0) + 1
+        return original_parse(source, filename, *args, **kwargs)
+
+    monkeypatch.setattr(di.ast, "parse", _counting_parse)
+
+    report = di.check(package, repo_root=repo)
+
+    # Sanity: both parse sites this test pins actually ran, or a count of 1
+    # would just mean one of them was skipped, not that they shared a scan.
+    rows = {row["invariant"]: row for row in report["invariants"]}
+    assert rows["module_level_caches_are_bounded"]["evaluated"] is True
+    assert rows["copied_helpers_have_one_definition"]["evaluated"] is True
+
+    module_paths = {str(p) for p in package.glob("*.py")}
+    assert len(module_paths) == 3
+    for path in module_paths:
+        assert parse_counts.get(path) == 1, (path, parse_counts)
+
+
+def test_a_scan_error_fails_every_detector_that_needs_the_scan_closed(
+    tmp_path: Path, monkeypatch
+):
+    """One shared scan means one scan error: both consumers report unevaluable.
+
+    This is deliberate. A tree nobody read is not a clean tree, so neither the
+    cache detector nor the duplication ratchet may pass on it.
+    """
+    repo = _repo_with_manifest(tmp_path)
+    package = repo / "src" / "aiworkhub"
+    (package / "one.py").write_text("VALUE = 1\n", encoding="utf-8")
+
+    def _explode(_root: Path):
+        raise RuntimeError("scan unavailable")
+
+    monkeypatch.setattr(di, "_scan_modules", _explode)
+
+    report = di.check(package, repo_root=repo)
+
+    assert not report["passed"]
+    rows = {row["invariant"]: row for row in report["invariants"]}
+    for name in ("module_level_caches_are_bounded", "copied_helpers_have_one_definition"):
+        assert rows[name]["evaluated"] is False, rows[name]
+        assert rows[name]["unevaluable"], rows[name]
+        assert any(
+            v["invariant"] == name and "RuntimeError" in v["detail"]
+            for v in report["violations"]
+        )
 
 
 def test_the_worker_count_is_derived_and_leaves_headroom(monkeypatch):

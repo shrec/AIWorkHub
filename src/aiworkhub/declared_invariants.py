@@ -304,12 +304,29 @@ def _body_without_docstring(node: ast.AST) -> list[ast.stmt]:
     return body
 
 
-def scan_definitions(path: str, relative: str) -> list[_Definition]:
-    """Return every definition in one module. Module level so a pool can call it."""
+@dataclass
+class _ModuleScan:
+    """Everything the tree detectors need from one module, parsed once."""
 
+    definitions: list[_Definition]
+    cache_violations: list[Violation]
+
+
+def _scan_module(path: str, root: str) -> _ModuleScan:
+    """Parse one module once for every detector that needs its tree.
+
+    Module level so a pool can call it. This is what used to be two separate
+    passes -- collect_definitions's walk and module_level_caches_are_bounded's
+    scan -- run over the same ``ast.parse`` result, so a shared
+    ``_scan_modules`` call parses each module exactly once.
+    """
+
+    relative_path = Path(path).relative_to(Path(root))
+    relative = relative_path.as_posix()
     source = _read(Path(path))
     tree = ast.parse(source, filename=path)
-    found: list[_Definition] = []
+
+    definitions: list[_Definition] = []
     scope: list[str] = []
 
     def walk(node: ast.AST) -> None:
@@ -327,7 +344,7 @@ def scan_definitions(path: str, relative: str) -> list[_Definition]:
                     ).hexdigest()
                     shape = hashlib.sha256(_shape_dump(module).encode("utf-8")).hexdigest()
                     nodes = sum(1 for _ in ast.walk(module))
-                    found.append(_Definition(
+                    definitions.append(_Definition(
                         relative, ".".join((*scope, child.name)), child.lineno, exact, shape, nodes,
                     ))
                 scope.append(child.name)
@@ -337,7 +354,51 @@ def scan_definitions(path: str, relative: str) -> list[_Definition]:
                 walk(child)
 
     walk(tree)
-    return found
+
+    cache_violations: list[Violation] = []
+    if source:
+        has_bound_constant = bool(_BOUND_HINT_RE.search(source))
+        for node in tree.body:
+            targets: list[str] = []
+            if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                targets = [node.target.id]
+            elif isinstance(node, ast.Assign):
+                targets = [t.id for t in node.targets if isinstance(t, ast.Name)]
+            for name in targets:
+                if not _CACHE_NAME_RE.match(name):
+                    continue
+                value = node.value
+                is_container = isinstance(value, (ast.Dict, ast.DictComp)) or (
+                    isinstance(value, ast.Call)
+                    and isinstance(value.func, ast.Name)
+                    and value.func.id in {"dict", "OrderedDict"}
+                )
+                if not is_container:
+                    continue
+                declared = BOUNDED_BY_CONSTRUCTION.get((Path(path).name, name))
+                if declared:
+                    continue
+                # Eviction may go through a shared helper that takes the cache as
+                # a parameter -- which is the shape this repository moved TO, so
+                # looking only for the global name would flag the fixed code.
+                # Any eviction call in a module that also declares a max-entry
+                # constant is the honest signal.
+                evicts = bool(
+                    re.search(rf"{re.escape(name)}\s*\.\s*(?:pop|popitem|clear)\s*\(", source)
+                    or re.search(rf"len\(\s*{re.escape(name)}\s*\)", source)
+                    or (has_bound_constant and _EVICTION_RE.search(source))
+                )
+                if not (evicts and has_bound_constant):
+                    cache_violations.append(Violation(
+                        "module_level_caches_are_bounded",
+                        str(relative_path),
+                        f"{name} is a module-level cache with no explicit "
+                        "max-entry bound and eviction, and is not declared "
+                        "bounded-by-construction in BOUNDED_BY_CONSTRUCTION",
+                        getattr(node, "lineno", 0),
+                    ))
+
+    return _ModuleScan(definitions, cache_violations)
 
 
 # Measured on this repository, 2026-09-07, 16 cores, 152 modules / 161,710 lines:
@@ -370,6 +431,46 @@ def _scan_workers(module_count: int) -> int:
     return max(1, min(module_count, cores - _SCAN_CORE_HEADROOM))
 
 
+def _scan_modules(src_root: Path) -> list[_ModuleScan]:
+    """Parse every module under ``src_root`` exactly once.
+
+    module_level_caches_are_bounded and the duplicate-definition detector both
+    consume this, so one ``check()`` call parses each module once and starts
+    at most one process pool, instead of each detector scanning the tree on
+    its own.
+    """
+
+    root = src_root.parent.parent
+    jobs = [(str(path), str(root)) for path in _python_sources(src_root)]
+    workers = _scan_workers(len(jobs))
+    scanned: list[_ModuleScan] = []
+    if workers > 1:
+        try:
+            with ProcessPoolExecutor(max_workers=workers) as pool:
+                for scan in pool.map(_scan_module, *zip(*jobs), chunksize=8):
+                    scanned.append(scan)
+        except Exception:  # noqa: BLE001 - a pool failure must not shrink the scan
+            scanned = []
+            workers = 1
+    if workers == 1:
+        scanned = [_scan_module(path, root) for path, root in jobs]
+    return scanned
+
+
+def _definitions_from_scans(scans: list[_ModuleScan]) -> list[_Definition]:
+    definitions: list[_Definition] = []
+    for scan in scans:
+        definitions.extend(scan.definitions)
+    return sorted(definitions, key=lambda d: (d.path, d.line, d.qualname))
+
+
+def _cache_violations_from_scans(scans: list[_ModuleScan]) -> list[Violation]:
+    violations: list[Violation] = []
+    for scan in scans:
+        violations.extend(scan.cache_violations)
+    return violations[:MAX_VIOLATIONS_PER_INVARIANT]
+
+
 def collect_definitions(src_root: Path) -> list[_Definition]:
     """Return every definition under ``src_root``, exhaustively.
 
@@ -380,30 +481,12 @@ def collect_definitions(src_root: Path) -> list[_Definition]:
     quietly reads fewer files reports a cleaner tree than there is.
     """
 
-    root = src_root.parent.parent
-    jobs = [(str(path), path.relative_to(root).as_posix()) for path in _python_sources(src_root)]
-    workers = _scan_workers(len(jobs))
-    collected: list[_Definition] = []
-    if workers > 1:
-        try:
-            with ProcessPoolExecutor(max_workers=workers) as pool:
-                for batch in pool.map(scan_definitions, *zip(*jobs), chunksize=8):
-                    collected.extend(batch)
-        except Exception:  # noqa: BLE001 - a pool failure must not shrink the scan
-            collected = []
-            workers = 1
-    if workers == 1:
-        for path, relative in jobs:
-            collected.extend(scan_definitions(path, relative))
-    return sorted(collected, key=lambda d: (d.path, d.line, d.qualname))
+    return _definitions_from_scans(_scan_modules(src_root))
 
 
-def duplicate_definition_counts(
-    src_root: Path, thresholds: dict[str, int]
+def _duplicate_counts_from_definitions(
+    definitions: list[_Definition], thresholds: dict[str, int]
 ) -> dict[str, dict[str, int]]:
-    """Return, per pattern, how many definitions each module has in a duplicate group."""
-
-    definitions = collect_definitions(src_root)
     by_exact: dict[str, list[_Definition]] = {}
     by_shape: dict[str, list[_Definition]] = {}
     for definition in definitions:
@@ -429,6 +512,20 @@ def duplicate_definition_counts(
             key = "parallel_implementation"
             counts[key][definition.path] = counts[key].get(definition.path, 0) + 1
     return counts
+
+
+def duplicate_definition_counts(
+    src_root: Path, thresholds: dict[str, int]
+) -> dict[str, dict[str, int]]:
+    """Return, per pattern, how many definitions each module has in a duplicate group."""
+
+    return _duplicate_counts_from_definitions(collect_definitions(src_root), thresholds)
+
+
+def _duplicate_counts_from_scans(
+    scans: list[_ModuleScan], thresholds: dict[str, int]
+) -> dict[str, dict[str, int]]:
+    return _duplicate_counts_from_definitions(_definitions_from_scans(scans), thresholds)
 
 
 def _ratchet_violations(
@@ -526,55 +623,7 @@ def module_level_caches_are_bounded(src_root: Path) -> list[Violation]:
     commit for the lifetime of a long-running server.
     """
 
-    violations: list[Violation] = []
-    for path in _python_sources(src_root):
-        source = _read(path)
-        if not source:
-            continue
-        tree = ast.parse(source, filename=str(path))
-        has_bound_constant = bool(_BOUND_HINT_RE.search(source))
-        for node in tree.body:
-            targets: list[str] = []
-            if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
-                targets = [node.target.id]
-            elif isinstance(node, ast.Assign):
-                targets = [t.id for t in node.targets if isinstance(t, ast.Name)]
-            for name in targets:
-                if not _CACHE_NAME_RE.match(name):
-                    continue
-                value = node.value
-                is_container = isinstance(value, (ast.Dict, ast.DictComp)) or (
-                    isinstance(value, ast.Call)
-                    and isinstance(value.func, ast.Name)
-                    and value.func.id in {"dict", "OrderedDict"}
-                )
-                if not is_container:
-                    continue
-                declared = BOUNDED_BY_CONSTRUCTION.get((path.name, name))
-                if declared:
-                    continue
-                # Eviction may go through a shared helper that takes the cache as
-                # a parameter -- which is the shape this repository moved TO, so
-                # looking only for the global name would flag the fixed code.
-                # Any eviction call in a module that also declares a max-entry
-                # constant is the honest signal.
-                evicts = bool(
-                    re.search(rf"{re.escape(name)}\s*\.\s*(?:pop|popitem|clear)\s*\(", source)
-                    or re.search(rf"len\(\s*{re.escape(name)}\s*\)", source)
-                    or (has_bound_constant and _EVICTION_RE.search(source))
-                )
-                if not (evicts and has_bound_constant):
-                    violations.append(Violation(
-                        "module_level_caches_are_bounded",
-                        str(path.relative_to(src_root.parent.parent)),
-                        f"{name} is a module-level cache with no explicit "
-                        "max-entry bound and eviction, and is not declared "
-                        "bounded-by-construction in BOUNDED_BY_CONSTRUCTION",
-                        getattr(node, "lineno", 0),
-                    ))
-                if len(violations) >= MAX_VIOLATIONS_PER_INVARIANT:
-                    return violations
-    return violations
+    return _cache_violations_from_scans(_scan_modules(src_root))
 
 
 # --------------------------------------------------------------------------- #
@@ -1151,6 +1200,32 @@ def check(
         f"source root holds no python module to check: {root}"
     )
 
+    scans: list[_ModuleScan] = []
+    scan_error: Exception | None = None
+    scan_done = False
+
+    def get_scans() -> list[_ModuleScan]:
+        """Parse every module at most once per ``check()`` call, on first need.
+
+        module_level_caches_are_bounded and duplicate_definition_counts both
+        need every module's tree; sharing this means one check() call parses
+        each module once and starts at most one process pool, not two. A scan
+        error deliberately marks every detector that needs the scan
+        unevaluable (fail-closed), rather than letting any of them pass on a
+        tree nobody read.
+        """
+
+        nonlocal scans, scan_error, scan_done
+        if not scan_done:
+            scan_done = True
+            try:
+                scans = _scan_modules(root)
+            except Exception as exc:  # noqa: BLE001 - surfaced to each caller below
+                scan_error = exc
+        if scan_error is not None:
+            raise scan_error
+        return scans
+
     for name, tree_check in _TREE_INVARIANTS:
         if source_error is not None:
             unevaluable(name, root, source_error)
@@ -1159,7 +1234,10 @@ def check(
             no_sample(name, no_modules)
             continue
         try:
-            found = tree_check(root)
+            if tree_check is module_level_caches_are_bounded:
+                found = _cache_violations_from_scans(get_scans())
+            else:
+                found = tree_check(root)
         except Exception as exc:  # noqa: BLE001 - unevaluable is a violation
             unevaluable(name, root, exc)
             continue
@@ -1227,7 +1305,7 @@ def check(
             for entry in boundary.baseline:
                 baseline.setdefault(entry.pattern, {})[entry.path] = entry.count
             try:
-                counts = duplicate_definition_counts(root, thresholds)
+                counts = _duplicate_counts_from_scans(get_scans(), thresholds)
             except Exception as exc:  # noqa: BLE001 - an unreadable tree is not a clean tree
                 counts = None
                 for name, _ in _RATCHET_INVARIANTS:
