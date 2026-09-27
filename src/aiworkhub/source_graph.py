@@ -354,6 +354,49 @@ class SourceGraphBuildFailedError(SourceGraphError):
     """
 
 
+class SourceGraphCorruptIndexError(SourceGraphError):
+    """A generation's on-disk image is malformed, with a typed repair verdict.
+
+    Raised in place of the bare ``sqlite3.DatabaseError`` text so a caller can
+    tell FTS5-only inverted-index damage -- repairable in place from content
+    SQLite already holds (NF-2026-01017) -- from corruption that only a full
+    rebuild replaces, and can see which of those already happened.
+    """
+
+    def __init__(
+        self,
+        *,
+        operation: str,
+        findings: Any,
+        fts_tables: tuple[str, ...] = (),
+        repair_state: str,
+        detail: str = "",
+    ) -> None:
+        self.operation = operation
+        self.findings = bounded_integrity_findings(findings)
+        self.fts_tables = tuple(fts_tables)
+        self.fts_only = bool(self.fts_tables)
+        self.repair_state = repair_state
+        self.detail = str(detail)[:MAX_INTEGRITY_FINDING_CHARS]
+        super().__init__(
+            "source_graph_index_corrupt:"
+            f"operation={operation} repair_state={repair_state} "
+            f"fts_only={self.fts_only} findings={len(self.findings)}"
+        )
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "reason": "source_graph_index_corrupt",
+            "schema_id": INTEGRITY_SCHEMA_ID,
+            "operation": self.operation,
+            "repair_state": self.repair_state,
+            "fts_only": self.fts_only,
+            "fts_tables": list(self.fts_tables),
+            "findings": list(self.findings),
+            "detail": self.detail,
+        }
+
+
 # ---------------------------------------------------------------------------
 # Repository / database resolution -- identity-bound, never a fixed path
 # ---------------------------------------------------------------------------
@@ -598,6 +641,434 @@ def index_write_lease(repo_root: Path):
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+# ---------------------------------------------------------------------------
+# Index integrity: bounded FTS5 self-repair and typed corruption state
+#
+# NF-2026-01017, measured on a 315 MB canonical index: PRAGMA quick_check
+# returned exactly one finding, ``malformed inverted index for FTS5 table
+# main.entities_fts``, while the b-tree pages and all 65504 stored entity rows
+# were intact. Every refresh died in the incremental FTS delete with
+# ``database disk image is malformed``, so the index went stale while targeted
+# symbol reads kept answering. ``entities_fts`` is content-bearing, so the
+# fts5 ``rebuild`` command regenerates the inverted index from rows SQLite
+# already holds -- no source file is re-parsed. The repair therefore belongs at
+# this shared root, under the writer lease its callers already hold, and it is
+# refused for any damage quick_check does not localize to an FTS5 table.
+# ---------------------------------------------------------------------------
+
+INTEGRITY_SCHEMA_ID = "aiworkhub.source_graph.integrity.v1"
+INTEGRITY_STATUS_OK = "ok"
+INTEGRITY_STATUS_REPAIRED = "repaired"
+INTEGRITY_STATUS_CORRUPT = "corrupt"
+INTEGRITY_REPAIR_NOT_ATTEMPTED = "not_attempted"
+INTEGRITY_REPAIR_REFUSED_NON_FTS = "non_fts_corruption"
+INTEGRITY_REPAIR_FAILED = "repair_failed"
+INTEGRITY_RETRY_FAILED = "retry_failed"
+MAX_INTEGRITY_FINDINGS = 8
+MAX_INTEGRITY_FINDING_CHARS = 300
+
+# SQLite reports SQLITE_CORRUPT as "database disk image is malformed"; fts5's
+# own storage errors add the two table-scoped phrasings below.
+_MALFORMED_IMAGE_MARKERS: tuple[str, ...] = (
+    "database disk image is malformed",
+    "malformed inverted index",
+    "fts5: corrupt",
+)
+# fts5's xIntegrity finding names the damaged table as ``<schema>.<name>``.
+_FTS5_FINDING_PATTERN = re.compile(
+    r"\bFTS5 table\s+(?:(?P<schema>\w+)\.)?(?P<table>\w+)", re.IGNORECASE
+)
+_INTEGRITY_TARGET: ContextVar[Path | None] = ContextVar(
+    "aiworkhub_source_graph_integrity_target", default=None
+)
+
+
+@contextmanager
+def integrity_state_target(db_path: Path):
+    """Attribute an integrity verdict to the generation a candidate replaces.
+
+    A staged candidate is unlinked whether it publishes or not, so recording a
+    corruption/repair verdict against its private path would throw the verdict
+    away. ContextVar scoping keeps concurrent builds of different repositories
+    from claiming each other's verdicts, exactly as ``database_path_override``
+    does for the database path itself.
+    """
+
+    token = _INTEGRITY_TARGET.set(Path(db_path))
+    try:
+        yield
+    finally:
+        _INTEGRITY_TARGET.reset(token)
+
+
+def is_malformed_database_error(exc: BaseException) -> bool:
+    """True only for SQLite corruption, never for an ordinary query error."""
+
+    if not isinstance(exc, sqlite3.DatabaseError):
+        return False
+    message = str(exc).casefold()
+    return any(marker in message for marker in _MALFORMED_IMAGE_MARKERS)
+
+
+def bounded_integrity_findings(findings: Any) -> list[str]:
+    """Cap quick_check output so a health payload stays bounded by construction."""
+
+    capped = list(findings)[:MAX_INTEGRITY_FINDINGS]
+    return [str(finding)[:MAX_INTEGRITY_FINDING_CHARS] for finding in capped]
+
+
+def quick_check_findings(conn: sqlite3.Connection) -> list[str]:
+    """PRAGMA quick_check rows; SQLite's single ``ok`` row means no finding."""
+
+    rows = conn.execute("PRAGMA quick_check").fetchall()
+    reported = [str(row[0]) for row in rows if row is not None and str(row[0]).strip()]
+    if len(reported) == 1 and reported[0].strip().casefold() == "ok":
+        return []
+    return reported
+
+
+def _safe_quick_check_findings(conn: sqlite3.Connection) -> list[str]:
+    """quick_check that reports its own failure instead of raising.
+
+    A quick_check that cannot run is not evidence of FTS-only damage, so the
+    diagnostic it returns deliberately matches no FTS5 table and the caller
+    fails closed into the full-rebuild path.
+    """
+
+    try:
+        return quick_check_findings(conn)
+    except sqlite3.DatabaseError as exc:
+        return [f"quick_check_unavailable:{type(exc).__name__}:{exc}"]
+
+
+def fts5_tables_in_findings(findings: Any) -> tuple[str, ...] | None:
+    """Every finding's FTS5 table, or None when one names something else.
+
+    None is the refusal signal: a single b-tree/page finding makes the whole
+    verdict unrepairable by an FTS rebuild, so partial matching would "repair"
+    a database whose real damage is somewhere else entirely.
+    """
+
+    tables: list[str] = []
+    for finding in findings:
+        match = _FTS5_FINDING_PATTERN.search(str(finding))
+        if match is None:
+            return None
+        qualified = ".".join(
+            part for part in (match.group("schema"), match.group("table")) if part
+        )
+        if qualified not in tables:
+            tables.append(qualified)
+    return tuple(tables) or None
+
+
+def integrity_state_path(db_path: Path) -> Path:
+    """Where one generation's integrity verdict is recorded.
+
+    A sidecar rather than a ``meta`` row on purpose: the verdict has to be
+    readable when the database it describes cannot be opened at all.
+    """
+
+    resolved = Path(db_path)
+    return resolved.with_name(f"{resolved.name}.integrity.json")
+
+
+def read_integrity_state(db_path: Path) -> dict[str, Any]:
+    """Last recorded verdict for a generation; empty when none was ever written."""
+
+    try:
+        raw = integrity_state_path(db_path).read_text(encoding="utf-8")
+        payload = json.loads(raw)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _write_integrity_state(db_path: Path, payload: dict[str, Any]) -> None:
+    """Replace the verdict sidecar, never failing the operation that wrote it."""
+
+    state_path = integrity_state_path(db_path)
+    scratch = state_path.with_name(f".{state_path.name}.{secrets.token_hex(8)}")
+    try:
+        scratch.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+        os.replace(scratch, state_path)
+    except OSError:
+        # Reporting must never be the reason a repair or a build fails: the
+        # typed error still carries the same findings to the caller.
+        try:
+            scratch.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _integrity_payload(
+    *,
+    status: str,
+    operation: str,
+    findings: Any,
+    fts_tables: tuple[str, ...],
+    detail: str,
+    last_repair: dict[str, Any] | None,
+) -> dict[str, Any]:
+    return {
+        "schema_id": INTEGRITY_SCHEMA_ID,
+        "status": status,
+        "operation": operation,
+        "findings": bounded_integrity_findings(findings),
+        "fts_tables": list(fts_tables),
+        "fts_only": bool(fts_tables),
+        "detail": str(detail)[:MAX_INTEGRITY_FINDING_CHARS],
+        "detected_at": _now_iso(),
+        "last_repair": last_repair,
+    }
+
+
+def record_generation_corrupt(
+    db_path: Path,
+    *,
+    operation: str,
+    findings: Any,
+    fts_tables: tuple[str, ...] = (),
+    detail: str = "",
+) -> dict[str, Any]:
+    """Mark a generation corrupt so the next build rebuilds and replaces it."""
+
+    payload = _integrity_payload(
+        status=INTEGRITY_STATUS_CORRUPT,
+        operation=operation,
+        findings=findings,
+        fts_tables=fts_tables,
+        detail=detail,
+        last_repair=read_integrity_state(db_path).get("last_repair"),
+    )
+    _write_integrity_state(db_path, payload)
+    return payload
+
+
+def record_generation_repair(
+    db_path: Path,
+    *,
+    operation: str,
+    tables: tuple[str, ...],
+    findings: Any,
+    duration_seconds: float,
+) -> dict[str, Any]:
+    """Record one successful in-place FTS5 rebuild as a repair event."""
+
+    repair = {
+        "schema_id": INTEGRITY_SCHEMA_ID,
+        "operation": operation,
+        "table": tables[0] if tables else "",
+        "tables": list(tables),
+        "findings": bounded_integrity_findings(findings),
+        "duration_seconds": round(max(0.0, float(duration_seconds)), 3),
+        "repaired_at": _now_iso(),
+    }
+    payload = _integrity_payload(
+        status=INTEGRITY_STATUS_REPAIRED,
+        operation=operation,
+        findings=findings,
+        fts_tables=tables,
+        detail="",
+        last_repair=repair,
+    )
+    _write_integrity_state(db_path, payload)
+    return repair
+
+
+def generation_marked_corrupt(db_path: Path) -> bool:
+    """True while a generation is known corrupt and awaiting its replacement."""
+
+    return read_integrity_state(db_path).get("status") == INTEGRITY_STATUS_CORRUPT
+
+
+def clear_generation_corrupt(db_path: Path) -> None:
+    """Retire a corrupt marker once a replacement generation is published.
+
+    The repair history is kept: health reports the last self-repair as an
+    event, and a published replacement does not make that event untrue.
+    """
+
+    state = read_integrity_state(db_path)
+    if state.get("status") != INTEGRITY_STATUS_CORRUPT:
+        return
+    _write_integrity_state(
+        db_path,
+        _integrity_payload(
+            status=INTEGRITY_STATUS_OK,
+            operation="full_rebuild_published",
+            findings=(),
+            fts_tables=(),
+            detail="",
+            last_repair=state.get("last_repair"),
+        ),
+    )
+
+
+def _fts5_command_names(table: str) -> tuple[str, str]:
+    """Quote a quick_check-reported table for its own fts5 command INSERT.
+
+    The fts5 command form is ``INSERT INTO <table>(<table>) VALUES(...)``,
+    where the column is the BARE table name even when the target carries a
+    schema. The name comes from ``_FTS5_FINDING_PATTERN`` (``\\w+`` parts only)
+    and is re-quoted here because an object name cannot be bound as a
+    parameter.
+    """
+
+    parts = [part for part in str(table).split(".") if part]
+    bare = parts[-1] if parts else ""
+    if not re.fullmatch(r"\w+", bare):
+        raise SourceGraphError(f"source_graph_fts_table_name_unsafe:{table}")
+    quoted = ['"' + part.replace('"', '""') + '"' for part in parts[-2:]]
+    return ".".join(quoted), '"' + bare.replace('"', '""') + '"'
+
+
+def rebuild_fts_index(conn: sqlite3.Connection, table: str) -> None:
+    """Regenerate one FTS5 inverted index from its own stored content.
+
+    ``rebuild`` discards ``<table>_data`` and re-tokenizes the rows already in
+    ``<table>_content``, so a damaged inverted index is repaired without
+    re-parsing a single source file. The following ``integrity-check`` is what
+    makes the repair verifiable rather than hopeful: a rebuild that did not fix
+    the index raises here instead of being reported as a repair.
+    """
+
+    target, column = _fts5_command_names(table)
+    conn.execute(f"INSERT INTO {target}({column}) VALUES('rebuild')")
+    conn.execute(f"INSERT INTO {target}({column}) VALUES('integrity-check')")
+
+
+def _integrity_target_path(conn: sqlite3.Connection) -> Path | None:
+    """The generation a verdict belongs to: the published one, not a candidate."""
+
+    bound = _INTEGRITY_TARGET.get()
+    if bound is not None:
+        return bound
+    try:
+        for row in conn.execute("PRAGMA database_list"):
+            if str(row[1]) == "main" and str(row[2] or ""):
+                return Path(str(row[2]))
+    except sqlite3.Error:
+        return None
+    return None
+
+
+def _corrupt_index_error(
+    target: Path | None,
+    *,
+    operation: str,
+    findings: list[str],
+    fts_tables: tuple[str, ...],
+    repair_state: str,
+    cause: BaseException,
+) -> SourceGraphCorruptIndexError:
+    """Mark the generation for the existing full-rebuild path, then say why."""
+
+    detail = f"{type(cause).__name__}:{cause}"
+    if target is not None:
+        record_generation_corrupt(
+            target,
+            operation=operation,
+            findings=findings,
+            fts_tables=fts_tables,
+            detail=detail,
+        )
+    return SourceGraphCorruptIndexError(
+        operation=operation,
+        findings=findings,
+        fts_tables=fts_tables,
+        repair_state=repair_state,
+        detail=detail,
+    )
+
+
+def _query_corruption_error(
+    conn: sqlite3.Connection, operation: str, cause: sqlite3.DatabaseError
+) -> SourceGraphCorruptIndexError:
+    """Name corruption and the writer's repair state, not the raw sqlite text.
+
+    A reader never repairs anything: it reports what the writer already
+    recorded so the caller can tell "corrupt, being replaced" from "corrupt,
+    nothing has looked at it yet".
+    """
+
+    findings = _safe_quick_check_findings(conn)
+    target = _integrity_target_path(conn)
+    recorded = read_integrity_state(target) if target is not None else {}
+    return SourceGraphCorruptIndexError(
+        operation=operation,
+        findings=findings or [str(cause)],
+        fts_tables=fts5_tables_in_findings(findings) or (),
+        repair_state=str(recorded.get("status") or INTEGRITY_REPAIR_NOT_ATTEMPTED),
+        detail=f"{type(cause).__name__}:{cause}",
+    )
+
+
+def write_with_fts_self_repair(
+    conn: sqlite3.Connection, operation, *, operation_name: str
+):
+    """Run one index write, self-repairing a malformed FTS5 index exactly once.
+
+    Callers reach here only from inside ``index_write_lease``, so the repair
+    adds no lock of its own. FTS5-localized damage is rebuilt in place and the
+    failed statement is retried ONCE; a non-FTS finding, a failed rebuild or a
+    failed retry marks the generation corrupt for the existing full-rebuild and
+    atomic-publication path and never loops.
+    """
+
+    try:
+        return operation()
+    except sqlite3.DatabaseError as exc:
+        if not is_malformed_database_error(exc):
+            raise
+        malformed = exc
+    findings = _safe_quick_check_findings(conn)
+    target = _integrity_target_path(conn)
+    tables = fts5_tables_in_findings(findings)
+    if tables is None:
+        raise _corrupt_index_error(
+            target,
+            operation=operation_name,
+            findings=findings,
+            fts_tables=(),
+            repair_state=INTEGRITY_REPAIR_REFUSED_NON_FTS,
+            cause=malformed,
+        ) from malformed
+    started = time.monotonic()
+    try:
+        for table in tables:
+            rebuild_fts_index(conn, table)
+    except (sqlite3.DatabaseError, SourceGraphError) as repair_exc:
+        raise _corrupt_index_error(
+            target,
+            operation=operation_name,
+            findings=findings,
+            fts_tables=tables,
+            repair_state=INTEGRITY_REPAIR_FAILED,
+            cause=repair_exc,
+        ) from repair_exc
+    try:
+        result = operation()
+    except sqlite3.DatabaseError as retry_exc:
+        raise _corrupt_index_error(
+            target,
+            operation=operation_name,
+            findings=findings,
+            fts_tables=tables,
+            repair_state=INTEGRITY_RETRY_FAILED,
+            cause=retry_exc,
+        ) from retry_exc
+    if target is not None:
+        record_generation_repair(
+            target,
+            operation=operation_name,
+            tables=tables,
+            findings=findings,
+            duration_seconds=time.monotonic() - started,
+        )
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1532,6 +2003,31 @@ def _delete_entities_fts_rows(conn: sqlite3.Connection, entity_ids: list[int]) -
         )
 
 
+# A phrase no indexed identifier can contain, so the probe below costs one
+# bounded FTS5 lookup and can never return rows.
+_FTS_USABILITY_PROBE = '"__aiworkhub_fts_usability_probe__"'
+
+
+def _delete_entities_fts_rows_verified(
+    conn: sqlite3.Connection, entity_ids: list[int]
+) -> None:
+    """Delete FTS rows, then prove the inverted index is still usable.
+
+    fts5 buffers a delete in memory and reads its on-disk segment structure
+    only when that buffer is flushed, which for a small change set is not
+    until COMMIT -- where the whole transaction is already lost and nothing
+    can rebuild anything. One bounded MATCH forces that read HERE, inside the
+    shared root that can rebuild the index and retry the delete once
+    (NF-2026-01017). Both halves are idempotent, so the retry is safe.
+    """
+
+    _delete_entities_fts_rows(conn, entity_ids)
+    conn.execute(
+        "SELECT 1 FROM entities_fts WHERE entities_fts MATCH ? LIMIT 1",
+        (_FTS_USABILITY_PROBE,),
+    ).fetchone()
+
+
 def _invalidate_file(conn: sqlite3.Connection, rel: str) -> None:
     """Remove every entity/edge/FTS row a file owns before re-indexing it.
 
@@ -1542,7 +2038,15 @@ def _invalidate_file(conn: sqlite3.Connection, rel: str) -> None:
 
     ids = [row[0] for row in conn.execute("SELECT id FROM entities WHERE file_path=?", (rel,))]
     if ids:
-        _delete_entities_fts_rows(conn, ids)
+        # The measured failure of NF-2026-01017: every incremental refresh of
+        # a 315 MB index died on this delete with ``database disk image is
+        # malformed`` because only ``entities_fts``'s inverted index was
+        # damaged, while the b-tree pages and all stored content were intact.
+        write_with_fts_self_repair(
+            conn,
+            lambda: _delete_entities_fts_rows_verified(conn, ids),
+            operation_name="invalidate_file_fts_delete",
+        )
     conn.execute("DELETE FROM entities WHERE file_path=?", (rel,))
     conn.execute("DELETE FROM edges WHERE file_path=?", (rel,))
     conn.execute("DELETE FROM files WHERE file_path=?", (rel,))
@@ -3670,6 +4174,13 @@ def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, increme
                     inserted_entities, inserted_edges, file_dropped = _write_extraction(
                         conn, extraction, file_size=file_size, mtime_ns=mtime_ns,
                     )
+                except SourceGraphCorruptIndexError:
+                    # Index-wide corruption is not a per-file defect. Counting
+                    # it as one skip per file would publish a corrupt image as
+                    # a mostly-successful build, and the shared root has
+                    # already marked this generation for the existing full
+                    # rebuild -- so abort the candidate instead of containing.
+                    raise
                 except Exception as exc:  # noqa: BLE001
                     # Containment is deliberately BROAD. The whole point of this
                     # boundary is that ONE file must never take down a repository,
@@ -3966,12 +4477,27 @@ def probe_generation(
             if representative_entity is not None
             else "__aiworkhub_generation_probe_no_match__"
         )
-        fts_row = conn.execute(
-            "SELECT e.id FROM entities_fts AS f "
-            "JOIN entities AS e ON e.id = f.entity_id "
-            "WHERE entities_fts MATCH ? LIMIT 1",
-            (_fts_phrase(fts_term),),
-        ).fetchone()
+        try:
+            fts_row = conn.execute(
+                "SELECT e.id FROM entities_fts AS f "
+                "JOIN entities AS e ON e.id = f.entity_id "
+                "WHERE entities_fts MATCH ? LIMIT 1",
+                (_fts_phrase(fts_term),),
+            ).fetchone()
+        except sqlite3.DatabaseError as exc:
+            if not is_malformed_database_error(exc):
+                raise
+            # This connection is read-only, so classify here and let the
+            # lease-holding writer decide: an FTS5-localized verdict is
+            # repairable in place, anything else is not.
+            findings = _safe_quick_check_findings(conn)
+            raise SourceGraphCorruptIndexError(
+                operation="generation_probe_fts",
+                findings=findings,
+                fts_tables=fts5_tables_in_findings(findings) or (),
+                repair_state=INTEGRITY_REPAIR_NOT_ATTEMPTED,
+                detail=f"{type(exc).__name__}:{exc}",
+            ) from exc
         if representative_entity is not None and fts_row is None:
             raise SourceGraphError("source_graph_generation_probe:fts")
 
@@ -4025,7 +4551,11 @@ def _staged_generation(canonical_path: Path, *, copy_existing: bool):
         else:
             os.close(descriptor)
             descriptor = -1
-        yield staging_path
+        # A candidate's integrity verdict belongs to the generation it is
+        # about to replace, not to the private staging file that is unlinked
+        # either way -- so bind the target here, once, for every staged writer.
+        with integrity_state_target(canonical_path):
+            yield staging_path
     finally:
         if descriptor >= 0:
             os.close(descriptor)
@@ -4033,6 +4563,61 @@ def _staged_generation(canonical_path: Path, *, copy_existing: bool):
             staging_path.unlink(missing_ok=True)
         except OSError:
             pass
+
+
+def _probe_candidate_with_fts_self_repair(
+    staging_path: Path, *, expected_report: BuildReport | None
+) -> dict[str, Any]:
+    """Probe a candidate, rebuilding a malformed FTS5 index once beforehand.
+
+    The candidate is private to this writer and the repository write lease is
+    already held by the caller, so the rebuild needs no lock of its own. Only
+    damage PRAGMA quick_check localizes to FTS5 tables is repaired, exactly
+    once; anything else leaves the candidate unpublished and marks the
+    generation it would have replaced corrupt for the full-rebuild path.
+    """
+
+    try:
+        return probe_generation(staging_path, expected_report=expected_report)
+    except SourceGraphCorruptIndexError as exc:
+        target = _INTEGRITY_TARGET.get()
+        if not exc.fts_only:
+            if target is not None:
+                record_generation_corrupt(
+                    target,
+                    operation=exc.operation,
+                    findings=exc.findings,
+                    detail=exc.detail,
+                )
+            raise
+        started = time.monotonic()
+        try:
+            with closing(connect(staging_path)) as repair_conn:
+                for table in exc.fts_tables:
+                    rebuild_fts_index(repair_conn, table)
+                repair_conn.commit()
+            generation = probe_generation(
+                staging_path, expected_report=expected_report
+            )
+        except (sqlite3.DatabaseError, SourceGraphError) as repair_exc:
+            if target is not None:
+                record_generation_corrupt(
+                    target,
+                    operation=exc.operation,
+                    findings=exc.findings,
+                    fts_tables=exc.fts_tables,
+                    detail=f"{type(repair_exc).__name__}:{repair_exc}",
+                )
+            raise
+        if target is not None:
+            record_generation_repair(
+                target,
+                operation=exc.operation,
+                tables=exc.fts_tables,
+                findings=exc.findings,
+                duration_seconds=time.monotonic() - started,
+            )
+        return generation
 
 
 def _publish_staged_generation(
@@ -4046,7 +4631,9 @@ def _publish_staged_generation(
     staging_stat = staging_path.lstat()
     if not stat.S_ISREG(staging_stat.st_mode):
         raise SourceGraphError("source_graph_generation_probe:unsafe_staging")
-    generation = probe_generation(staging_path, expected_report=expected_report)
+    generation = _probe_candidate_with_fts_self_repair(
+        staging_path, expected_report=expected_report
+    )
     verified_stat = staging_path.lstat()
     if (
         not stat.S_ISREG(verified_stat.st_mode)
@@ -4163,13 +4750,19 @@ def build_index(repo_root: Path, *, db_path: Path | None = None, incremental: bo
 
         canonical_path = resolve_db_path(repo_root)
         _cleanup_abandoned_staging(canonical_path)
+        # A generation already known corrupt is never copied forward: this
+        # staged full rebuild plus atomic publication IS the repository's one
+        # replacement mechanism, so the marker simply routes the next build
+        # through it instead of inventing a second quarantine.
+        replaces_corrupt = generation_marked_corrupt(canonical_path)
+        rebuild_incremental = incremental and not replaces_corrupt
         with _staged_generation(
             canonical_path,
-            copy_existing=incremental and canonical_path.exists(),
+            copy_existing=rebuild_incremental and canonical_path.exists(),
         ) as staging_path:
             try:
                 report = _build_index_locked(
-                    repo_root, db_path=staging_path, incremental=incremental
+                    repo_root, db_path=staging_path, incremental=rebuild_incremental
                 )
             except SourceGraphBuildFailedError as exc:
                 try:
@@ -4183,6 +4776,9 @@ def build_index(repo_root: Path, *, db_path: Path | None = None, incremental: bo
             _publish_staged_generation(
                 staging_path, canonical_path, expected_report=report
             )
+            # The replacement this generation was rebuilt for is now the
+            # readable one, so retire the corrupt marker that forced it.
+            clear_generation_corrupt(canonical_path)
             published = replace(report, db_path=str(canonical_path))
     # Task 3 (LSP batch resolution): the full build's enrichment pass runs
     # here -- after the generation is published AND the writer lease released
@@ -4310,7 +4906,16 @@ def find(
             "e.file_path, e.line_start LIMIT ?",
                 (expression, term, term, f"{term}%", limit),
             ).fetchall()
-        except sqlite3.OperationalError:
+        except sqlite3.DatabaseError as exc:
+            # A malformed image is NOT a retryable expression error. Falling
+            # through to the LIKE pass would answer a corrupt index as though
+            # it merely held no FTS match, so corruption is raised as its own
+            # typed failure and every other operational error keeps the
+            # existing broaden-then-LIKE behaviour (NF-2026-01017).
+            if is_malformed_database_error(exc):
+                raise _query_corruption_error(conn, "find_fts_match", exc) from exc
+            if not isinstance(exc, sqlite3.OperationalError):
+                raise
             rows = []
         if rows:
             break
@@ -5533,6 +6138,39 @@ def _source_snippet(
         return ""
 
 
+def _corrupt_query_payload(
+    mode: str,
+    query: str,
+    budget: int,
+    target: str | None,
+    exc: SourceGraphCorruptIndexError,
+) -> dict[str, Any]:
+    """Answer a corrupt index with a typed payload, never raw sqlite text.
+
+    A malformed image still answers targeted ``entities`` lookups while every
+    FTS-backed retrieval fails, so a caller needs to be told that the index is
+    corrupt and what the writer already did about it -- not handed the bare
+    string ``database disk image is malformed`` with no repair state attached
+    (NF-2026-01017).
+    """
+
+    payload: dict[str, Any] = {
+        "ok": False,
+        "mode": mode,
+        "query": query,
+        "budget": budget,
+        "matches": [],
+        "query_tokens": _query_tokens(str(target or query)),
+        "candidate_files": [],
+        "truncated": False,
+        "error": exc.to_json(),
+    }
+    if target:
+        payload["target"] = target
+        payload["query_tokens_source"] = "target"
+    return payload
+
+
 def _query_payload(
     repo_root: Path,
     mode: str,
@@ -5549,7 +6187,10 @@ def _query_payload(
     conn = connect(db_path, read_only=True)
     try:
         lookup = str(target or query).strip()
-        matches = find(conn, lookup, limit=budget, retrieval=retrieval)
+        try:
+            matches = find(conn, lookup, limit=budget, retrieval=retrieval)
+        except SourceGraphCorruptIndexError as exc:
+            return _corrupt_query_payload(mode, query, budget, target, exc)
         matches, truncated = _bounded_rows(matches, budget, byte_cap)
         files = _candidate_files(matches, limit=min(budget, 16))
         payload: dict[str, Any] = {

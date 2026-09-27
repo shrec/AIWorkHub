@@ -66,6 +66,9 @@ STATUS_STANDBY = "standby"
 STATUS_DEGRADED = "degraded"
 STATUS_STALE = "stale"
 STATUS_RECOVERY = "recovery"
+# A malformed index answers some reads and fails every write, so it is a hard
+# failure of its own rather than a flavour of degraded/stale (NF-2026-01017).
+STATUS_CORRUPT = "corrupt"
 
 _RECOVERY_PHASE_DETECT = "journal_detect"
 _RECOVERY_PHASE_OPEN = "writable_open_recover"
@@ -1512,6 +1515,11 @@ class SourceGraphDaemon:
             db_path = source_graph.resolve_db_path(self.repo_root)
             if not db_path.exists():
                 return False
+            if source_graph.generation_marked_corrupt(db_path):
+                # A generation known corrupt must be REPLACED, not extended.
+                # Reporting no prior build routes the next run through the
+                # existing full rebuild and atomic publication.
+                return False
             conn = source_graph.connect(db_path, read_only=True)
             try:
                 row = conn.execute(
@@ -2077,6 +2085,37 @@ def stop_all_daemons() -> int:
     return sum(1 for root in roots if stop_daemon(root))
 
 
+def _apply_index_integrity(out: dict[str, Any], repo_root: Path | str) -> None:
+    """Fold the writer's recorded integrity verdict into a health payload.
+
+    A malformed index still answers targeted symbol reads while every refresh
+    dies, which used to surface as ``ready`` or merely ``stale`` -- the state
+    NF-2026-01017 was filed against. Corruption is a HARD failure here, and a
+    successful in-place FTS5 rebuild is reported as its own repair event so an
+    index that healed itself is not indistinguishable from one that was never
+    damaged.
+    """
+
+    try:
+        db_path = source_graph.resolve_db_path(Path(repo_root).resolve())
+        state = source_graph.read_integrity_state(db_path)
+    except (OSError, source_graph.SourceGraphError):
+        out["integrity"] = None
+        out["last_repair"] = None
+        return
+    out["integrity"] = state or None
+    out["last_repair"] = state.get("last_repair") or None
+    if state.get("status") != source_graph.INTEGRITY_STATUS_CORRUPT:
+        return
+    out["ok"] = False
+    out["status"] = STATUS_CORRUPT
+    out["refreshable"] = False
+    out["readable_generation"] = False
+    out["last_error"] = (
+        f"source_graph_index_corrupt:{state.get('operation') or 'unknown'}"
+    )
+
+
 def daemon_health(repo_root: Path | str) -> dict[str, Any]:
     """Read-only daemon and canonical-generation health for a repository.
 
@@ -2142,6 +2181,9 @@ def daemon_health(repo_root: Path | str) -> dict[str, Any]:
         out.get("status") == STATUS_RECOVERY or daemon._has_pending_journal()
     ):
         out["registered"] = True
+        # Corruption is recorded in a sidecar, so reporting it needs no
+        # database connection and stays available in this branch too.
+        _apply_index_integrity(out, repo_root)
         return out
     # The canonical committed generation remains readable while another
     # process is INDEXING, while this daemon is STANDBY, and after a daemon
@@ -2228,6 +2270,7 @@ def daemon_health(repo_root: Path | str) -> dict[str, Any]:
         # probe failure must not erase valid local identity or contradict a
         # live query; expose the bounded diagnostic separately.
         out["generation_read_error"] = f"{type(exc).__name__}:{exc}"[:300]
+    _apply_index_integrity(out, repo_root)
     out["registered"] = registered
     return out
 
