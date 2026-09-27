@@ -1,5 +1,12 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.98 — 2026-09-27
+
+### Fixed
+
+- Contained Claude workers on Windows get the PowerShell tool instead of a Git Bash that cannot start inside the AppContainer; every Bash deny has a PowerShell mirror and recursive PowerShell discovery stays denied (NF-2026-01043, NF-2026-01046).
+- Contained validation reads a host-owned tree-sitter grammar mirror under `.aiworkhub/runtime/tree-sitter-cache` instead of the per-user cache on C:, with a read-only grant scoped to that mirror (NF-2026-01042).
+
 ## 0.11.97 — 2026-09-27
 
 ### Fixed

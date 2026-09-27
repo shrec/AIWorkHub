@@ -62,6 +62,11 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
+## What's new in 0.11.98
+
+- Sandboxed Claude workers on Windows run shell commands through PowerShell, so they no longer stall on a shell that cannot start.
+- Sandboxed validation parses code with a grammar copy kept inside the repository, with no C: drive access.
+
 ## What's new in 0.11.97
 
 - A worker route that runs out of monthly credit is skipped automatically until it resets.
