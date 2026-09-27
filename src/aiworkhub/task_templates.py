@@ -94,6 +94,7 @@ __all__ = [
     "template_provenance_payload",
     "validate_custom_validation_roles",
     "validate_template_provenance",
+    "with_package_gate",
 ]
 
 SCHEMA_ID = "aiworkhub.task_templates.v1"
@@ -966,6 +967,29 @@ def _validation_commands_for(
     if gate is not None and gate not in validation:
         validation.append(gate)
     return validation
+
+
+def with_package_gate(
+    card: Mapping[str, Any], validation: Sequence[str], validation_roles: Sequence[str]
+) -> tuple[list[str], list[str]]:
+    """Keep the derived package gate on a caller's validation override.
+
+    NF-2026-01041: an override used to replace the expanded validation
+    wholesale, so the gate ``_validation_commands_for`` derives for a package
+    change silently vanished (AIWORKHUB_01198 then broke the size ratchet on
+    main). A non-read-only card whose writes touch ``PACKAGE_ROOT`` gets the
+    gate appended when the override does not already name it, with the role
+    ``_validation_roles_for`` gives any command past the required prefix.
+    """
+    commands, roles = list(validation), list(validation_roles)
+    # A caller's own length mismatch stays theirs for normalization to report.
+    if bool(card.get("read_only")) or len(commands) != len(roles):
+        return commands, roles
+    gate = _package_gate_command(list(card.get("allowed_writes") or []))
+    canonical = {canonical_validation_command(item) for item in commands}
+    if gate is None or canonical_validation_command(gate) in canonical:
+        return commands, roles
+    return [*commands, gate], [*roles, "generic"]
 
 
 def expand_template(

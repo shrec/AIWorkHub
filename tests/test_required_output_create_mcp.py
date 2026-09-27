@@ -921,3 +921,39 @@ def test_created_empty_output_card_launches_without_top_level_minimality(
     assert historical.pop("minimality_contract") == CANONICAL_MINIMALITY_CONTRACT
 
     assert process_launcher._validate_required_outputs_contract(historical) is None
+
+
+def test_real_core_validation_override_keeps_package_gate(monkeypatch, tmp_path):
+    # NF-2026-01041: an override replaced the expanded validation wholesale and
+    # dropped the package gate. The persisted card keeps it exactly once, and
+    # its receipt digest still matches the card's own stored fields.
+    from aiworkhub import task_templates
+
+    gate = " ".join(
+        [task_templates.COMMAND_PYTHON, "-m", "pytest", "-q"]
+        + list(task_templates.PACKAGE_GATE_TESTS)
+    )
+    _enable_real_core_create(monkeypatch, tmp_path)
+    result = server.aiworkhub_task_create_from_template(
+        task_id="TASK_OVERRIDE_PACKAGE_GATE",
+        title="Package override card",
+        runner="codex_worker",
+        topic="coding",
+        objective="Keep the package gate.",
+        acceptance=["Gate stays."],
+        template_id="bugfix_with_regression",
+        production_paths=["src/aiworkhub/widget.py"],
+        test_paths=["tests/test_widget.py"],
+        validation=["python3 -m pytest -q tests/test_widget.py", "git diff --check"],
+        validation_roles=["reproduction", "regression"],
+        echo_card=True,
+    )
+
+    assert result.get("ok") is True, result
+    stored = json.loads(result["stdout"])
+    assert stored["validation"][-1] == gate
+    assert stored["validation"].count(gate) == 1
+    assert len(stored["validation_roles"]) == len(stored["validation"])
+    assert stored["template_provenance"]["expanded_contract_digest"] == (
+        task_templates.expanded_contract_digest(stored)
+    )

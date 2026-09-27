@@ -1423,6 +1423,54 @@ def test_mixed_python_and_javascript_targets_stay_language_separated():
     assert all(".py" not in command for command in node_commands)
 
 
+def test_with_package_gate_appends_the_expanded_gate_once():
+    # NF-2026-01041: the gate an override keeps is exactly the one the plain
+    # expansion derives, with a role normalize_behavioral_contract accepts.
+    card = expand_template(
+        "bugfix_with_regression",
+        production_paths=["src/aiworkhub/a.py"],
+        test_paths=["tests/test_a.py"],
+    )
+    gate = card["validation"][-1]
+    assert gate.endswith(" ".join(task_templates_module.PACKAGE_GATE_TESTS))
+    override = ["python3 -m pytest -q tests/test_a.py", "git diff --check"]
+    roles = ["reproduction", "regression"]
+    validation, gated_roles = task_templates_module.with_package_gate(
+        card, override, roles
+    )
+    assert validation == [*override, gate]
+    assert gated_roles == [*roles, card["validation_roles"][-1]]
+    normalize_behavioral_contract(card["work_kind"], validation, gated_roles)
+    # Already named -- even under the bare ``python`` spelling -- is kept as is.
+    legacy = [*override, gate.replace("python3 ", "python ", 1)]
+    assert task_templates_module.with_package_gate(
+        card, legacy, [*roles, "generic"]
+    ) == (legacy, [*roles, "generic"])
+    # A caller's own length mismatch is left for normalization to report.
+    assert task_templates_module.with_package_gate(card, override, roles[:1]) == (
+        override,
+        roles[:1],
+    )
+
+
+def test_with_package_gate_skips_read_only_and_non_package_cards():
+    override, roles = ["git diff --check"], ["generic"]
+    read_only = expand_template(
+        "read_only_analysis", production_paths=["src/aiworkhub/a.py"]
+    )
+    outside = expand_template(
+        "bugfix_with_regression",
+        production_paths=["src/a.py"],
+        test_paths=["tests/test_a.py"],
+    )
+    forged = {"allowed_writes": ["src/aiworkhub/a.py"], "read_only": True}
+    for card in (read_only, outside, forged):
+        assert task_templates_module.with_package_gate(card, override, roles) == (
+            override,
+            roles,
+        )
+
+
 def test_suffixless_files_under_tests_never_route_to_pytest_or_ruff():
     card = expand_template(
         "test_only",

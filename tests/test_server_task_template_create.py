@@ -526,6 +526,68 @@ def test_from_template_validation_override_fails_closed(
     _assert_lifecycle_error(result, stderr)
 
 
+_PACKAGE_GATE = " ".join(
+    [task_templates.COMMAND_PYTHON, "-m", "pytest", "-q"]
+    + list(task_templates.PACKAGE_GATE_TESTS)
+)
+_BUGFIX_OVERRIDE = ["python3 -m pytest -q tests/test_a.py", "git diff --check"]
+_BUGFIX_ROLES = ["reproduction", "regression"]
+
+
+def _stored_override_card(
+    repo: Path, task_id: str, **overrides: object
+) -> dict[str, object]:
+    kwargs = _from_template_kwargs(
+        task_id=task_id,
+        production_paths=["src/aiworkhub/a.py"],
+        validation=list(_BUGFIX_OVERRIDE),
+        validation_roles=list(_BUGFIX_ROLES),
+    )
+    kwargs.update(overrides)
+    result = server.aiworkhub_task_create_from_template(**kwargs)  # type: ignore[arg-type]
+    assert result["ok"] is True, result
+    stored = task_store.get_task(repo, task_id)
+    assert stored is not None
+    assert result["template_provenance"]["expanded_contract_digest"] == (
+        task_templates.expanded_contract_digest(stored)
+    )
+    return stored
+
+
+def test_from_template_validation_override_keeps_package_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # NF-2026-01041: the override used to drop the derived package gate.
+    repo = _ready_repo(tmp_path, monkeypatch)
+    stored = _stored_override_card(repo, "TASK_NF1041_GATE")
+    assert stored["validation"] == [*_BUGFIX_OVERRIDE, _PACKAGE_GATE]
+    assert stored["validation_roles"] == [*_BUGFIX_ROLES, "generic"]
+
+
+def test_from_template_validation_override_naming_gate_is_not_duplicated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _ready_repo(tmp_path, monkeypatch)
+    validation = [*_BUGFIX_OVERRIDE, _PACKAGE_GATE]
+    roles = [*_BUGFIX_ROLES, "generic"]
+    stored = _stored_override_card(
+        repo, "TASK_NF1041_NAMED", validation=validation, validation_roles=roles
+    )
+    assert stored["validation"] == validation
+    assert stored["validation_roles"] == roles
+
+
+def test_from_template_validation_override_outside_package_gets_no_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _ready_repo(tmp_path, monkeypatch)
+    stored = _stored_override_card(
+        repo, "TASK_NF1041_OUTSIDE", production_paths=["src/a.py"]
+    )
+    assert stored["validation"] == _BUGFIX_OVERRIDE
+    assert stored["validation_roles"] == _BUGFIX_ROLES
+
+
 def test_task_template_list_is_deterministic_and_repository_bound(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

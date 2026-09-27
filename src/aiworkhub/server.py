@@ -2386,6 +2386,9 @@ def aiworkhub_task_create_from_template(
             task_templates.validate_custom_validation_roles(
                 validation, validation_roles
             )
+            validation, validation_roles = task_templates.with_package_gate(
+                card, validation, validation_roles
+            )
             _work_kind, normalized_roles = (
                 quality_evidence.normalize_behavioral_contract(
                     card["work_kind"], validation, validation_roles
