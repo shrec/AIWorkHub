@@ -128,10 +128,15 @@ async function oversizedReviewSubmitKeepsBoundedRetryRule() {
 }
 
 async function oversizedForcedStageKeepsMissingOutputInstruction() {
-  const sourceGraphEnvelope = JSON.stringify({
+  // NF-2026-01179: each discovery turn must carry a distinct query. This scenario
+  // exists to prove the missing-required-output instruction survives an oversized
+  // stage payload, and it asserts below that all twelve discovery calls execute;
+  // twelve *identical* queries would instead be stopped by the unchanged
+  // repeated-discovery guard, which glm-vscode-lm-bridge.test.js already covers.
+  const sourceGraphEnvelope = (turn) => JSON.stringify({
     schema_id: internals.constants.VSCODE_LM_TOOL_REQUEST_SCHEMA,
     name: "aiworkhub_worker_source_graph_query",
-    input: { mode: "focus", query: "bounded" },
+    input: { mode: "focus", query: `bounded-${turn}` },
   });
   const oversizedStageEnvelope = JSON.stringify({
     schema_id: internals.constants.VSCODE_LM_TOOL_REQUEST_SCHEMA,
@@ -152,7 +157,7 @@ async function oversizedForcedStageKeepsMissingOutputInstruction() {
       }
       return {
         stream: (async function* stream() {
-          yield { value: turns <= 12 ? sourceGraphEnvelope : oversizedStageEnvelope };
+          yield { value: turns <= 12 ? sourceGraphEnvelope(turns) : oversizedStageEnvelope };
         }()),
       };
     },
@@ -179,10 +184,87 @@ async function oversizedForcedStageKeepsMissingOutputInstruction() {
   assert.strictEqual(invoked, 12, "oversized stage calls must not be invoked");
 }
 
+// NF-2026-01179: the oversized-stage strike is keyed to the output that is still
+// owed, not to the run. This run stages alpha correctly and then oversizes bravo
+// exactly ONCE -- it has repeated nothing, and bravo has never been corrected
+// before -- so it must get the same first corrective turn bravo would have got as
+// the only required output, and the run must still be able to finish. A run-global
+// counter instead ended this shape as vscode_lm_semantic_edit_stage_required on
+// bravo's very first oversized payload, blaming a loop that never happened. The
+// scenario above still proves the SAME output oversized twice stays terminal.
+async function oversizedStrikeIsKeyedToTheMissingOutput() {
+  const alpha = "out/alpha.js";
+  const bravo = "out/bravo.js";
+  const stageEnvelope = (input) => JSON.stringify({
+    schema_id: internals.constants.VSCODE_LM_TOOL_REQUEST_SCHEMA,
+    name: "aiworkhub_manager_semantic_edit_stage",
+    input,
+  });
+  const sourceGraphEnvelope = JSON.stringify({
+    schema_id: internals.constants.VSCODE_LM_TOOL_REQUEST_SCHEMA,
+    name: "aiworkhub_worker_source_graph_query",
+    input: { mode: "focus", query: "bounded orientation" },
+  });
+  const boundedAlpha = stageEnvelope({ operation: "create", file_path: alpha, content: "const alpha = 1;\n" });
+  const oversizedBravo = stageEnvelope({ operation: "create", file_path: bravo, content: "x".repeat(17000) });
+  const boundedBravo = stageEnvelope({ operation: "create", file_path: bravo, content: "const bravo = 2;\n" });
+  let turns = 0;
+  let invoked = 0;
+  let correction = null;
+  const model = {
+    capabilities: { toolCalling: false },
+    sendRequest: async (messages) => {
+      turns += 1;
+      if (turns === 4) correction = JSON.parse(messages[messages.length - 1].content);
+      return {
+        stream: (async function* stream() {
+          yield {
+            value: turns === 1 ? sourceGraphEnvelope
+              : turns === 2 ? boundedAlpha
+              : turns === 3 ? oversizedBravo
+              : boundedBravo,
+          };
+        }()),
+      };
+    },
+  };
+
+  const result = await internals.runVscodeLmTextProtocol(
+    model,
+    {
+      requestId: "9876543210fedcba9876543210fedcba",
+      request_kind: "worker",
+      prompt: "Create both required outputs.",
+      allowedWrites: [alpha, bravo],
+      path_contracts: {
+        [alpha]: { action: "create", current_sha256: "", line_count: 0, parent_existed: false },
+        [bravo]: { action: "create", current_sha256: "", line_count: 0, parent_existed: false },
+      },
+      required_outputs: [alpha, bravo],
+      initial_source_graph_request: { mode: "focus", query: "initial" },
+      initial_source_graph_result: { ok: true, content: "initial source graph receipt" },
+    },
+    undefined,
+    async () => { invoked += 1; return { ok: true, content: "bounded result" }; },
+  );
+
+  const envelope = JSON.parse(result);
+  assert.strictEqual(envelope.schema_id, internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA);
+  assert.deepStrictEqual(envelope.creates.map((create) => create.path), [alpha, bravo],
+    "both required outputs must still reach the final envelope");
+  assert.strictEqual(turns, 4,
+    "one oversized payload for a never-corrected output must not terminate the run");
+  assert.strictEqual(correction.result.error, "vscode_lm_tool_input_too_large",
+    "bravo's first oversized payload gets the normal corrective re-prompt");
+  assert.match(correction.instruction, /out\/bravo\.js/);
+  assert.strictEqual(invoked, 1, "only the bounded discovery call may reach the tool");
+}
+
 Promise.resolve()
   .then(oversizedToolInputIsCorrectedWithoutInvocation)
   .then(oversizedReviewSubmitKeepsBoundedRetryRule)
   .then(oversizedForcedStageKeepsMissingOutputInstruction)
+  .then(oversizedStrikeIsKeyedToTheMissingOutput)
   .catch((error) => {
     console.error(error);
     process.exitCode = 1;

@@ -3928,12 +3928,20 @@ async function nf179ForcedStageRecoveryChecks() {
       };
     },
   };
+  // NF-2026-01179: this scenario is the pure discovery spin. A writable request
+  // that stages nothing is never forced into a phase change, so before the
+  // without-edit budget existed the only thing that could stop it was the agent
+  // turn limit, which named the wrong cause. The scenario is unchanged and still
+  // fails closed; the expected typed outcome is tightened to the truthful one and
+  // now lands strictly inside the turn budget.
   await assert.rejects(
     internals.runVscodeLmTextProtocol(
       repeatedModel, request, undefined, async () => ({ ok: true, content: "graph" }),
     ),
-    /vscode_lm_agent_turn_limit/,
+    /vscode_lm_source_graph_no_progress/,
   );
+  assert.ok(repeatedTurns < internals.constants.VSCODE_LM_MAX_AGENT_TURNS,
+    `the repeated-discovery spin must stop before the turn limit (stopped at turn ${repeatedTurns})`);
 
   let nativeWrongNonStageSent = false;
   let nativeWrongTurn = 0;
@@ -6304,6 +6312,259 @@ async function nf998ForcedStageDuplicateAfterReadCap() {
   assert.strictEqual(failure.message, "vscode_lm_source_graph_no_progress");
 }
 
+// NF-2026-01179: the measured production spin was a GLM worker that issued 23
+// consecutive Source Graph turns and nothing else, then died as the untruthful
+// vscode_lm_agent_turn_limit. Every query is distinct, so the repeated-identity
+// half of the guard can never see it and only the without-edit budget can stop
+// it. It must fail closed as vscode_lm_source_graph_no_progress strictly inside
+// the agent turn budget, after executing exactly the calls that budget allows --
+// and the budget itself may never shrink below the discovery the protocol grants,
+// which is what made this guard preempt the typed forced-stage receipts. The
+// spin below owes a declared required output the whole time; the second half of
+// this test pins the identical budget for a writable request that owes nothing,
+// because the budget counts every request.
+async function nf1179PureSourceGraphSpinFailsClosedBeforeTurnLimit() {
+  const file = "src/spin.js";
+  let modelTurns = 0;
+  let liveCalls = 0;
+  const model = {
+    capabilities: { toolCalling: false },
+    sendRequest: async () => {
+      modelTurns += 1;
+      const value = JSON.stringify({
+        schema_id: internals.constants.VSCODE_LM_TOOL_REQUEST_SCHEMA,
+        name: "aiworkhub_worker_source_graph_query",
+        input: { mode: "focus", query: `spin-${modelTurns}`, workflow_stage: "implementation" },
+      });
+      return { stream: (async function* stream() { yield { value }; }()) };
+    },
+  };
+  const failure = await internals.runVscodeLmTextProtocol(model, {
+    requestId: "b".repeat(32),
+    request_kind: "worker",
+    prompt: "Edit the required file.",
+    allowedWrites: [file],
+    required_outputs: [file],
+    path_contracts: {
+      [file]: { action: "edit", current_sha256: "a".repeat(64), line_count: 1, parent_existed: true },
+    },
+  }, undefined, async () => {
+    liveCalls += 1;
+    return { ok: true, content: "bounded graph" };
+  }).then(() => assert.fail("a pure Source Graph spin must never finalize"), (error) => error);
+  assert.strictEqual(failure.message, "vscode_lm_source_graph_no_progress");
+  assert.strictEqual(liveCalls, internals.constants.VSCODE_LM_MAX_SOURCE_GRAPH_WITHOUT_EDIT,
+    "every call inside the without-edit budget executes; the next one fails closed unexecuted");
+  assert.ok(modelTurns < internals.constants.VSCODE_LM_MAX_AGENT_TURNS,
+    `the spin must stop before the agent turn limit (stopped at turn ${modelTurns})`);
+  assert.ok(
+    internals.constants.VSCODE_LM_MAX_SOURCE_GRAPH_WITHOUT_EDIT >=
+      internals.constants.VSCODE_LM_MAX_POST_SOURCE_TURNS,
+    "the without-edit budget may never be smaller than the discovery phase the protocol grants",
+  );
+
+  // The other half of the accounting, pinned here so the two directions stay
+  // together: the identical spin that owes no declared required output is the
+  // shape the protocol protects least, not most, so the budget must count it as
+  // well. While nothing is staged a writable request is never forced into a
+  // phase change, so without this guard its only bound is
+  // VSCODE_LM_MAX_AGENT_TURNS and it reports the untruthful
+  // vscode_lm_agent_turn_limit for what is provably a discovery spin. It fails
+  // closed on exactly the same budget as the spin above.
+  let openTurns = 0;
+  let openCalls = 0;
+  const openModel = {
+    capabilities: { toolCalling: false },
+    sendRequest: async () => {
+      openTurns += 1;
+      const value = JSON.stringify({
+        schema_id: internals.constants.VSCODE_LM_TOOL_REQUEST_SCHEMA,
+        name: "aiworkhub_worker_source_graph_query",
+        input: { mode: "focus", query: `open-${openTurns}`, workflow_stage: "implementation" },
+      });
+      return { stream: (async function* stream() { yield { value }; }()) };
+    },
+  };
+  const openFailure = await internals.runVscodeLmTextProtocol(openModel, {
+    requestId: "c".repeat(32),
+    request_kind: "worker",
+    prompt: "Inspect the graph.",
+    allowedWrites: [file],
+    path_contracts: {
+      [file]: { action: "edit", current_sha256: "a".repeat(64), line_count: 1, parent_existed: true },
+    },
+  }, undefined, async () => {
+    openCalls += 1;
+    return { ok: true, content: "bounded graph" };
+  }).then(() => assert.fail("an unbounded discovery loop must still fail"), (error) => error);
+  assert.match(String(openFailure.message), /vscode_lm_source_graph_no_progress/);
+  assert.strictEqual(openCalls, internals.constants.VSCODE_LM_MAX_SOURCE_GRAPH_WITHOUT_EDIT,
+    "a writable request with no required_outputs is counted on the same budget");
+  assert.ok(openTurns < internals.constants.VSCODE_LM_MAX_AGENT_TURNS,
+    `a spin with nothing owed must stop before the agent turn limit (stopped at turn ${openTurns})`);
+}
+
+// NF-2026-01179: the per-missing-output correction budget is only armed once
+// forced staging begins, so the two-strike invalid-JSON budget has to stay armed
+// until exactly that point. This run stages a required output on its second turn
+// -- far inside VSCODE_LM_MAX_POST_SOURCE_TURNS -- and then answers in plain
+// prose. Keying the invalid-JSON budget off "nothing is staged yet" left it with
+// no bound at all for the rest of the discovery phase; it must stop on the second
+// prose reply instead.
+async function nf1179EarlyStagedPlainTextStaysBounded() {
+  const first = "src/first.js";
+  const second = "src/second.js";
+  const outputs = [
+    JSON.stringify({
+      schema_id: internals.constants.VSCODE_LM_TOOL_REQUEST_SCHEMA,
+      name: "aiworkhub_worker_source_graph_query",
+      input: { mode: "focus", query: "orientation", workflow_stage: "implementation" },
+    }),
+    JSON.stringify({
+      schema_id: internals.constants.VSCODE_LM_TOOL_REQUEST_SCHEMA,
+      name: "aiworkhub_manager_semantic_edit_stage",
+      input: {
+        operation: "replace_range", file_path: first, start_line: 1, end_line: 1,
+        new: "const first = 1;\n",
+      },
+    }),
+    "I staged the first file. Let me explain how I plan to handle the second one.",
+    "Still explaining in prose, with no transport envelope anywhere in this reply.",
+  ];
+  let modelTurns = 0;
+  let sourceGraphCalls = 0;
+  const model = {
+    capabilities: { toolCalling: false },
+    sendRequest: async () => {
+      modelTurns += 1;
+      const value = outputs.shift();
+      return { stream: (async function* stream() { yield { value }; }()) };
+    },
+  };
+  const failure = await internals.runVscodeLmTextProtocol(model, {
+    requestId: "d".repeat(32),
+    request_kind: "worker",
+    prompt: "Edit both required files.",
+    allowedWrites: [first, second],
+    required_outputs: [first, second],
+    path_contracts: {
+      [first]: { action: "edit", current_sha256: "a".repeat(64), line_count: 1, parent_existed: true },
+      [second]: { action: "edit", current_sha256: "b".repeat(64), line_count: 1, parent_existed: true },
+    },
+    initial_source_graph_result: { ok: true, content: "prefetched graph" },
+  }, undefined, async () => {
+    sourceGraphCalls += 1;
+    return { ok: true, content: "bounded graph" };
+  }).then(() => assert.fail("an early-staged prose run must never finalize"), (error) => error);
+  // The bound this test exists for is unchanged: the run still stops on the
+  // second prose reply, at turn 4, instead of drifting through the discovery
+  // phase. Only the identity it reports changed. src/second.js was declared
+  // required and never staged, so the transport error named the symptom and hid
+  // the cause; the forced-stage identity names the output that is still owed.
+  // The nothing-owed counterpart below keeps the transport identity covered.
+  assert.match(String(failure.message), /vscode_lm_semantic_edit_stage_required/);
+  assert.doesNotMatch(String(failure.message), /vscode_lm_agent_turn_limit/);
+  assert.strictEqual(failure.missingRequiredOutput, second,
+    "the failure must name the required output that was never staged");
+  assert.strictEqual(failure.missingRequiredAction, "replace_range");
+  assert.strictEqual(modelTurns, 4,
+    "the two-strike invalid-JSON budget stays armed until forced staging arms the other one");
+  assert.ok(modelTurns < internals.constants.VSCODE_LM_MAX_POST_SOURCE_TURNS,
+    "an early-staged prose run must not drift through the whole discovery phase unbounded");
+  assert.strictEqual(sourceGraphCalls, 1, "the staged edit is offline and only the read executes");
+}
+
+// NF-2026-01179: the counterpart of the run above, and the reason the transport
+// identity is still reachable. The same two-strike invalid-JSON bound trips on
+// the same relative turn, but this request declares no required output, so there
+// is no staging instruction to give and the malformed reply really is the whole
+// story. vscode_lm_text_protocol_invalid_json must stay the outcome here.
+async function nf1179InvalidJsonStaysTransportErrorWhenNothingIsOwed() {
+  const only = "src/only.js";
+  const outputs = [
+    JSON.stringify({
+      schema_id: internals.constants.VSCODE_LM_TOOL_REQUEST_SCHEMA,
+      name: "aiworkhub_worker_source_graph_query",
+      input: { mode: "focus", query: "orientation", workflow_stage: "implementation" },
+    }),
+    "Here is my plan for the file, described entirely in prose.",
+    "Still prose, and still no transport envelope anywhere in this reply.",
+  ];
+  let modelTurns = 0;
+  const model = {
+    capabilities: { toolCalling: false },
+    sendRequest: async () => {
+      modelTurns += 1;
+      const value = outputs.shift();
+      return { stream: (async function* stream() { yield { value }; }()) };
+    },
+  };
+  const failure = await internals.runVscodeLmTextProtocol(model, {
+    requestId: "e".repeat(32),
+    request_kind: "worker",
+    prompt: "Edit the file only if the discovery says it needs it.",
+    allowedWrites: [only],
+    required_outputs: [],
+    path_contracts: {
+      [only]: { action: "edit", current_sha256: "c".repeat(64), line_count: 1, parent_existed: true },
+    },
+    initial_source_graph_result: { ok: true, content: "prefetched graph" },
+  }, undefined, async () => ({ ok: true, content: "bounded graph" }))
+    .then(() => assert.fail("a prose-only run must never finalize"), (error) => error);
+  assert.match(String(failure.message), /vscode_lm_text_protocol_invalid_json/);
+  assert.doesNotMatch(String(failure.message), /vscode_lm_semantic_edit_stage_required/);
+  assert.doesNotMatch(String(failure.message), /vscode_lm_agent_turn_limit/);
+  assert.strictEqual(modelTurns, 3,
+    "the two-strike bound is unchanged when the request owes no declared output");
+}
+
+// NF-2026-01179: the two-strike invalid-JSON bound reports the forced-stage
+// identity only once the protocol has actually asked for a stage. This request
+// does declare required outputs, but it answers in prose from its very first
+// turn -- before Source Graph is acknowledged and before any stage instruction
+// was ever issued -- so nothing about it is a staging failure. Blaming the
+// unstaged output there names the wrong cause; the malformed transport reply is
+// the whole story and vscode_lm_text_protocol_invalid_json is the honest
+// identity. The early-staged run above is the case that earns the other one.
+async function nf1179ProseBeforeAnyStageInstructionStaysTransportError() {
+  const first = "src/first.js";
+  const second = "src/second.js";
+  let modelTurns = 0;
+  let sourceGraphCalls = 0;
+  const model = {
+    capabilities: { toolCalling: false },
+    sendRequest: async () => {
+      modelTurns += 1;
+      const value = modelTurns === 1
+        ? "Let me start by describing, in prose, how I intend to approach both files."
+        : "Still prose on the second turn, with no transport envelope anywhere in it.";
+      return { stream: (async function* stream() { yield { value }; }()) };
+    },
+  };
+  const failure = await internals.runVscodeLmTextProtocol(model, {
+    requestId: "f".repeat(32),
+    request_kind: "worker",
+    prompt: "Edit both required files.",
+    allowedWrites: [first, second],
+    required_outputs: [first, second],
+    path_contracts: {
+      [first]: { action: "edit", current_sha256: "a".repeat(64), line_count: 1, parent_existed: true },
+      [second]: { action: "edit", current_sha256: "b".repeat(64), line_count: 1, parent_existed: true },
+    },
+  }, undefined, async () => {
+    sourceGraphCalls += 1;
+    return { ok: true, content: "bounded graph" };
+  }).then(() => assert.fail("a prose-only run must never finalize"), (error) => error);
+  assert.match(String(failure.message), /vscode_lm_text_protocol_invalid_json/);
+  assert.doesNotMatch(String(failure.message), /vscode_lm_semantic_edit_stage_required/);
+  assert.doesNotMatch(String(failure.message), /vscode_lm_agent_turn_limit/);
+  assert.ok(!failure.missingRequiredOutput,
+    "a run that was never asked to stage must not be blamed for an unstaged output");
+  assert.strictEqual(modelTurns, 2,
+    "the two-strike bound itself is unchanged; only the identity it reports is");
+  assert.strictEqual(sourceGraphCalls, 0, "a prose-only run never executes a tool");
+}
+
 async function nf998BundleTypeChangesSourceGraphBoundary() {
   const graph = "aiworkhub_worker_source_graph_query";
   const bundle = (bundleType) => JSON.stringify({
@@ -6401,6 +6662,10 @@ async function main() {
   await nf998SourceGraphBoundaryAndStageReset();
   await nf998NativeSourceGraphDuplicateStopsLiveLoop();
   await nf998ForcedStageDuplicateAfterReadCap();
+  await nf1179PureSourceGraphSpinFailsClosedBeforeTurnLimit();
+  await nf1179EarlyStagedPlainTextStaysBounded();
+  await nf1179InvalidJsonStaysTransportErrorWhenNothingIsOwed();
+  await nf1179ProseBeforeAnyStageInstructionStaysTransportError();
   await nf988DiscoveryDoesNotImplicitlyEnterSemanticStage();
   await nf651StageContextReadForNextRequiredFile();
   await nf202600023DeclaredDependencyReadDuringForcedStaging();

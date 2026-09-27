@@ -4558,13 +4558,29 @@ function vscodeLmNoteLineOnePin(counter, input, protocolTrace, lastProtocolPrevi
   }
 }
 
-function vscodeLmNoteInvalidJson(counter, protocolTrace, lastProtocolPreview) {
+// NF-2026-01179: the bound itself is unchanged -- the same second malformed
+// reply in a row is still terminal. Only its identity can differ, and the
+// caller owns that choice by passing or withholding the output the request
+// still owes. Reporting a generic transport error on a run that had already
+// been told to stage a declared output, and then answered in prose, hid the one
+// actionable fact: that output was never staged. Name it with the forced-stage
+// identity whenever the caller supplies one; the transport error stays the
+// outcome while the request owes nothing, and while the protocol has never
+// asked for a stage at all, where the malformed reply is the whole story.
+function vscodeLmNoteInvalidJson(counter, protocolTrace, lastProtocolPreview, nextMissing = null) {
   counter.count = (counter.count || 0) + 1;
-  if (counter.count >= VSCODE_LM_MAX_INVALID_JSON) {
+  if (counter.count < VSCODE_LM_MAX_INVALID_JSON) return;
+  if (!nextMissing) {
     throw vscodeLmProtocolFailure(
       "vscode_lm_text_protocol_invalid_json", protocolTrace, lastProtocolPreview,
     );
   }
+  const stageRequired = vscodeLmProtocolFailure(
+    "vscode_lm_semantic_edit_stage_required", protocolTrace, lastProtocolPreview,
+  );
+  stageRequired.missingRequiredOutput = nextMissing.path || "";
+  stageRequired.missingRequiredAction = nextMissing.action || "";
+  throw stageRequired;
 }
 
 const VSCODE_LM_WORKER_SOURCE_GRAPH_TOOL = "aiworkhub_worker_source_graph_query";
@@ -4644,8 +4660,37 @@ async function awaitVscodeLmWorkerSourceGraphReadinessOnce() {
   throw new Error("vscode_lm_mcp_unavailable");
 }
 
-const VSCODE_LM_MAX_SOURCE_GRAPH_WITHOUT_EDIT = 6;
+// NF-2026-01179: this is a *without-edit* budget, not a discovery budget, so it
+// may never be smaller than the discovery the protocol itself authorises. The
+// protocol grants VSCODE_LM_MAX_POST_SOURCE_TURNS post-source turns before it
+// tries to force a phase change -- and NF-2026-00988 keeps valid discovery
+// available past that point while nothing is staged -- plus
+// VSCODE_LM_MAX_FORCED_STAGE_READS bounded declared-file reads once forced
+// staging begins. Their sum is therefore the largest number of Source Graph
+// calls a *progressing* request can legitimately make before its first staged
+// edit. At 6 the guard fired inside the 12-turn orientation phase and preempted
+// the typed forced-stage receipts (read cap -> stage_required ->
+// source_graph_duplicate -> no_progress) that the same guard exists to reach.
+// One call past the sum is provably a spin: it still fails closed as
+// vscode_lm_source_graph_no_progress at turn 17 of VSCODE_LM_MAX_AGENT_TURNS,
+// instead of the measured 23 discovery turns that ended in the untruthful
+// vscode_lm_agent_turn_limit.
+const VSCODE_LM_MAX_SOURCE_GRAPH_WITHOUT_EDIT =
+  VSCODE_LM_MAX_POST_SOURCE_TURNS + VSCODE_LM_MAX_FORCED_STAGE_READS;
 
+// Both halves count every request, with no "does it still owe a declared output"
+// exemption. The sum above is the most Source Graph calls *any* progressing
+// request can make before its first staged edit, so one call past it is a spin
+// in every shape -- and the shape with no declared required output is the one
+// that needs the guard most, not least: for a writable request the protocol
+// never forces a phase change while nothing is staged, so its only other bound
+// is VSCODE_LM_MAX_AGENT_TURNS, which reports the untruthful
+// vscode_lm_agent_turn_limit. Counting only while a required output is owed
+// silently switched the whole protection off for exactly that case. Nothing
+// legitimate is caught in exchange: valid discovery stays available up to the
+// sum (NF-2026-00988), a successful stage resets the counter below, and after
+// the discovery phase the protocol caps further reads at
+// VSCODE_LM_MAX_FORCED_STAGE_READS or drives the request into finalization.
 function createVscodeLmSourceGraphGuard() {
   let lastIdentity = "";
   let duplicates = 0;
@@ -5512,6 +5557,7 @@ async function runVscodeLmTextProtocol(
   let reviewSubmitForced = false;
   let reviewSubmitViolations = 0;
   let toolNotAllowedViolations = 0;
+  const oversizedStageFailure = { key: "", count: 0 }; // Two strikes per missing output, not per run.
   let invalidJsonCorrected = false;
   const invalidJsonCount = { count: 0 };
   const lineOnePins = { count: 0 };
@@ -5688,8 +5734,28 @@ async function runVscodeLmTextProtocol(
             lastProtocolPreview,
           );
         }
-      } else if (String((err && err.message) || err) === "vscode_lm_text_protocol_invalid_json") {
-        vscodeLmNoteInvalidJson(invalidJsonCount, protocolTrace, lastProtocolPreview);
+      } else if (String((err && err.message) || err) === "vscode_lm_text_protocol_invalid_json" &&
+          !forceStagedEdit) {
+        // NF-2026-01179: the per-missing-output correction budget below is only
+        // armed once forced staging begins, so this two-strike budget has to stay
+        // armed until exactly that point -- keying it off "nothing is staged yet"
+        // instead left a run that staged one output early and then answered in
+        // prose with no bound at all until VSCODE_LM_MAX_POST_SOURCE_TURNS.
+        //
+        // Which identity that bound reports is a narrower question than when it
+        // fires. Naming a still-missing output is only truthful once the protocol
+        // has actually asked for one: a request that answers in prose from its
+        // first turn, before Source Graph is even acknowledged, was never told to
+        // stage anything, so the malformed transport reply really is the whole
+        // story and vscode_lm_text_protocol_invalid_json is the honest cause.
+        // Once a stage instruction HAS been issued -- forced staging, or a
+        // successful stage that left another declared output owed -- the transport
+        // error hides the one actionable fact, so carry the still-missing output
+        // through and report the forced-stage identity instead.
+        vscodeLmNoteInvalidJson(
+          invalidJsonCount, protocolTrace, lastProtocolPreview,
+          stagedEditInstructionSent ? vscodeLmNextMissingRequiredOutput(stagedEdits) : null,
+        );
       }
       messages.push(vscode.LanguageModelChatMessage.Assistant([languageModelTextPart(text)]));
       if (forceStagedEdit) {
@@ -6122,6 +6188,43 @@ async function runVscodeLmTextProtocol(
         protocolTrace,
         lastProtocolPreview,
       );
+    }
+    // NF-2026-01179: an oversized stage payload is never executed, and every turn
+    // already carries the exact missing-required-output instruction, so repeating
+    // the identical payload adds no information. Bound it with the same two-strike
+    // gate the oversized review-submit path uses instead of spending the remaining
+    // agent turns on bytes that can never be applied; the failure names the real
+    // reason (the required output is still unstaged), not a generic turn limit.
+    //
+    // The strike is keyed to the output that is still owed, exactly like the
+    // forced-stage correction budget, and a payload that actually staged clears
+    // it. A run-global counter made the second strike mean "two oversized stage
+    // payloads happened at some point", so a request that staged output A and
+    // then oversized output B once -- having repeated nothing -- was terminalized
+    // on B's very first corrective turn. Two strikes must mean the SAME missing
+    // output was oversized twice, which is the only shape that adds no
+    // information and cannot end any other way.
+    if (envelope.name === VSCODE_LM_STAGE_EDIT_TOOL && result && result.ok === true &&
+        result.idempotent_replay !== true) {
+      oversizedStageFailure.key = "";
+      oversizedStageFailure.count = 0;
+    }
+    const oversizedStageMissing = toolInputTooLarge && envelope.name === VSCODE_LM_STAGE_EDIT_TOOL
+      ? vscodeLmNextMissingRequiredOutput(stagedEdits)
+      : null;
+    if (oversizedStageMissing) {
+      const oversizedKey = vscodeLmForcedStageMissingKey(oversizedStageMissing);
+      if (oversizedKey !== oversizedStageFailure.key) {
+        oversizedStageFailure.key = oversizedKey;
+        oversizedStageFailure.count = 0;
+      }
+      protocolTrace.push({ turn, phase: "semantic_edit_stage", outcome: "oversized_stage_rejected" });
+      if (oversizedStageFailure.count >= 1) {
+        throw vscodeLmProtocolFailure(
+          "vscode_lm_semantic_edit_stage_required", protocolTrace, lastProtocolPreview,
+        );
+      }
+      oversizedStageFailure.count += 1;
     }
     protocolTrace.push({ turn, phase: "work", outcome: `tool:${envelope.name}` });
     const historyText = toolInputTooLarge ? "[oversized tool request omitted]" : text;
@@ -12666,6 +12769,9 @@ module.exports = {
       DEBUG_TRACE_MAX_TOTAL_BYTES,
       DEBUG_TRACE_ACTIVE_MS,
       DEBUG_TRACE_DURABLE_EVENTS,
+      VSCODE_LM_MAX_AGENT_TURNS,
+      VSCODE_LM_MAX_POST_SOURCE_TURNS,
+      VSCODE_LM_MAX_SOURCE_GRAPH_WITHOUT_EDIT,
     },
   },
 };
