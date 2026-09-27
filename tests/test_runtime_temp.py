@@ -45,7 +45,7 @@ def _write_manifest(
     return directory
 
 
-def test_temp_root_is_repo_local_and_fails_closed_on_symlink(tmp_path: Path) -> None:
+def test_temp_root_is_repo_local_and_fails_closed_on_symlink(tmp_path: Path, make_symlink) -> None:
     repo = _repo(tmp_path)
     assert runtime_temp.temp_root(repo) == (repo / ".aiworkhub" / "temp")
 
@@ -57,14 +57,14 @@ def test_temp_root_is_repo_local_and_fails_closed_on_symlink(tmp_path: Path) -> 
 
     # A symlinked .aiworkhub hub must fail closed.
     shutil.rmtree(hub)
-    os.symlink(tmp_path / "elsewhere", hub)
+    make_symlink(tmp_path / "elsewhere", hub)
     with pytest.raises(runtime_temp.RuntimeTempError):
         runtime_temp.temp_root(repo)
 
     # A symlinked temp dir must fail closed too.
     hub.unlink()
     hub.mkdir()
-    os.symlink(tmp_path / "elsewhere", hub / "temp")
+    make_symlink(tmp_path / "elsewhere", hub / "temp")
     with pytest.raises(runtime_temp.RuntimeTempError):
         runtime_temp.temp_root(repo)
 
@@ -152,14 +152,14 @@ def test_read_owner_manifest_rejects_fifo_promptly(tmp_path: Path) -> None:
 
 
 def test_read_owner_manifest_rejects_special_symlink_and_oversized(
-    tmp_path: Path,
+    tmp_path: Path, make_symlink
 ) -> None:
     valid = _write_manifest(tmp_path / "valid", "valid", pid=111, starttime=111)
     assert runtime_temp.read_owner_manifest(valid)["request_id"] == "valid"
 
     symlinked = tmp_path / "symlinked"
     symlinked.mkdir()
-    os.symlink(
+    make_symlink(
         valid / runtime_temp.OWNER_MANIFEST_NAME,
         symlinked / runtime_temp.OWNER_MANIFEST_NAME,
     )
@@ -1367,6 +1367,138 @@ def test_windows_directory_authority_failure_close_paths(
         assert kernel32.close_handles == [_WIDE_HANDLE]
 
 
+def _authority_failure_message(
+    monkeypatch: pytest.MonkeyPatch, **kwargs: object
+) -> str:
+    kernel32 = _FakeDirectoryKernel32(
+        handle=_WIDE_HANDLE,
+        final_path=_ENUM_FINAL,
+        volume_serial=9,
+        file_id=9,
+        pages=[],
+    )
+    for key, value in kwargs.items():
+        setattr(kernel32, key, value)
+    _install_directory_kernel32(monkeypatch, kernel32)
+    with pytest.raises(runtime_temp.RuntimeTempError) as caught:
+        runtime_temp.WindowsDirectoryAuthority(_ENUM_ROOT)
+    return str(caught.value)
+
+
+def test_windows_directory_open_failure_reports_winerror_without_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    message = _authority_failure_message(monkeypatch, fail_open=True, last_error=5)
+    assert message.startswith("windows directory handle open failed")
+    assert "winerror=5" in message
+    assert str(_ENUM_ROOT) not in message
+    assert "aiworkhub-enum-root" not in message
+
+
+@pytest.mark.parametrize("failure", [{"final_needed": 0}, {"final_written": 0}])
+def test_windows_directory_final_path_failure_reports_winerror_without_path(
+    monkeypatch: pytest.MonkeyPatch, failure: dict[str, int]
+) -> None:
+    message = _authority_failure_message(monkeypatch, last_error=5, **failure)
+    assert message.startswith("windows directory final path unavailable")
+    assert "winerror=5" in message
+    assert str(_ENUM_ROOT) not in message
+    assert "aiworkhub-enum-root" not in message
+
+
+def _probe_authority_raising(
+    monkeypatch: pytest.MonkeyPatch, message: str, *, appcontainer: bool
+) -> None:
+    from aiworkhub import platform_io, windows_appcontainer
+
+    def failing_authority(path: Path) -> object:
+        raise runtime_temp.RuntimeTempError(message)
+
+    monkeypatch.setattr(platform_io, "is_windows", lambda: True)
+    monkeypatch.setattr(runtime_temp, "WindowsDirectoryAuthority", failing_authority)
+    monkeypatch.setattr(
+        windows_appcontainer, "current_process_is_appcontainer", lambda: appcontainer
+    )
+
+
+_LANE_CAPABILITY_MESSAGES = [
+    "windows directory handle open failed: winerror=5",
+]
+_FINAL_PATH_MESSAGES = [
+    "windows directory final path unavailable: winerror=5",
+    "windows directory final path unavailable: winerror=2",
+]
+
+
+@pytest.mark.parametrize("message", _LANE_CAPABILITY_MESSAGES)
+def test_directory_authority_probe_skips_only_on_named_lane_capability(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, require_directory_authority, message: str
+) -> None:
+    _probe_authority_raising(monkeypatch, message, appcontainer=True)
+    with pytest.raises(pytest.skip.Exception, match="NF-2026-01071"):
+        require_directory_authority(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "windows directory handle open failed: winerror=2",
+        "windows directory handle open failed: winerror=53",
+        "windows directory handle open failed: winerror=50",
+        "windows directory final path escapes root",
+        "windows directory handle is a reparse point",
+        *_FINAL_PATH_MESSAGES,
+    ],
+)
+def test_directory_authority_probe_propagates_other_errors(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, require_directory_authority, message: str
+) -> None:
+    _probe_authority_raising(monkeypatch, message, appcontainer=True)
+    with pytest.raises(runtime_temp.RuntimeTempError, match=message):
+        require_directory_authority(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "message",
+    [*_LANE_CAPABILITY_MESSAGES, *_FINAL_PATH_MESSAGES],
+)
+def test_directory_authority_probe_never_skips_outside_appcontainer(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, require_directory_authority, message: str
+) -> None:
+    _probe_authority_raising(monkeypatch, message, appcontainer=False)
+    with pytest.raises(runtime_temp.RuntimeTempError, match=message):
+        require_directory_authority(tmp_path)
+
+
+def test_directory_authority_probe_enters_root_and_directory_like_production(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, require_directory_authority
+) -> None:
+    from aiworkhub import platform_io
+
+    events: list[tuple[str, Path]] = []
+
+    class Authority:
+        def __init__(self, path: Path) -> None:
+            self.path = path
+
+        def __enter__(self) -> Authority:
+            events.append(("enter", self.path))
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            events.append(("exit", self.path))
+
+    monkeypatch.setattr(platform_io, "is_windows", lambda: True)
+    monkeypatch.setattr(runtime_temp, "WindowsDirectoryAuthority", Authority)
+    require_directory_authority(tmp_path)
+    anchor = Path(tmp_path.anchor)
+    assert events == [("enter", anchor), ("exit", anchor), ("enter", tmp_path), ("exit", tmp_path)]
+    events.clear()
+    monkeypatch.setattr(platform_io, "is_windows", lambda: False)
+    require_directory_authority(tmp_path)
+    assert events == []
+
+
 def test_windows_directory_authority_path_and_containment_fail_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1515,9 +1647,12 @@ def test_windows_close_handle_owner_manifest_remains_non_raising(
 
 
 @pytest.mark.skipif(os.name != "nt", reason="native Windows directory canary")
-def test_windows_directory_authority_native_file_id_canary(tmp_path: Path) -> None:
+def test_windows_directory_authority_native_file_id_canary(
+    tmp_path: Path, require_directory_authority
+) -> None:
     root = tmp_path / "native-dir"
     root.mkdir()
+    require_directory_authority(root)
     regular = root / "regular.txt"
     regular.write_text("payload", encoding="utf-8")
     child = root / "child_dir"

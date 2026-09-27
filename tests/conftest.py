@@ -209,3 +209,54 @@ def symlink_or_skip(
 @pytest.fixture
 def make_symlink():
     return symlink_or_skip
+
+
+# The AppContainer validation lane cannot open the drive root of its temp tree
+# (measured: exactly winerror=5 in all 20 V1 lane failures, NF-2026-01071).
+# The open failure matches by equality so winerror=50/53/500 still propagate.
+# The lane fails at the drive-root open first, so a final-path failure is never
+# a lane-capability skip: if one appears it fails loudly, and its measured
+# winerror is to be named here before any skip is considered.
+# A message alone cannot tell a missing capability from a regression, so the
+# skip is also gated on the process actually running in an AppContainer; that
+# check fails closed to False, so the host never skips (the same pattern as
+# NF-2026-00964 in tests/test_windows_appcontainer.py).
+_DIRECTORY_AUTHORITY_OPEN_DENIED = "windows directory handle open failed: winerror=5"
+
+
+def directory_authority_or_skip(path: os.PathLike[str] | str) -> None:
+    """Open the anchored directory authority for ``path`` or skip when -- and
+    only when -- an AppContainer token lacks the capability (NF-2026-01071).
+
+    Enters the drive-root authority and the directory authority the way
+    production does. Every other error propagates, and outside an
+    AppContainer every error propagates.
+    """
+    from aiworkhub import platform_io, runtime_temp
+
+    if not platform_io.is_windows():
+        return
+    from aiworkhub import windows_appcontainer
+
+    target = Path(path)
+    try:
+        with runtime_temp.WindowsDirectoryAuthority(Path(target.anchor)):
+            pass
+        with runtime_temp.WindowsDirectoryAuthority(target):
+            pass
+    except runtime_temp.RuntimeTempError as exc:
+        message = str(exc)
+        if (
+            message == _DIRECTORY_AUTHORITY_OPEN_DENIED
+            and windows_appcontainer.current_process_is_appcontainer()
+        ):
+            pytest.skip(
+                "windows directory authority unavailable to this token "
+                f"({message}; NF-2026-01071)"
+            )
+        raise
+
+
+@pytest.fixture
+def require_directory_authority():
+    return directory_authority_or_skip

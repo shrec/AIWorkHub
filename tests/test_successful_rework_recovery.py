@@ -3,13 +3,14 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from contextlib import contextmanager
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from aiworkhub import attempt_artifacts, core, process_launcher, task_store, worker_workspace
+from aiworkhub import attempt_artifacts, core, process_launcher, runtime_temp, task_store, worker_workspace
 from aiworkhub import successful_rework_recovery as recovery
 
 
@@ -97,7 +98,8 @@ def _republish(episode):
     )
 
 
-def test_recovery_authenticates_legacy_epoch_and_materializes_exact_bytes(episode, tmp_path):
+def test_recovery_authenticates_legacy_epoch_and_materializes_exact_bytes(episode, tmp_path, require_directory_authority):
+    require_directory_authority(episode.workspace)
     descriptor = _seal(episode)
     target = tmp_path / "materialized"
     target.mkdir()
@@ -111,7 +113,8 @@ def test_recovery_authenticates_legacy_epoch_and_materializes_exact_bytes(episod
 
 
 @pytest.mark.parametrize("tamper", ["candidate", "manifest", "repo", "request", "claim", "episode_claim", "runner", "outcome"])
-def test_recovery_rejects_tampering_before_sealing(episode, monkeypatch, tamper):
+def test_recovery_rejects_tampering_before_sealing(episode, monkeypatch, tamper, require_directory_authority):
+    require_directory_authority(episode.workspace)
     calls = []
     monkeypatch.setattr(worker_workspace, "seal_rework_delta_artifact", lambda *args: calls.append(args))
     claim = 3
@@ -128,12 +131,14 @@ def test_recovery_rejects_tampering_before_sealing(episode, monkeypatch, tamper)
     else:
         episode.payloads["review"]["target_state"] = "validation_failed"
         _republish(episode)
-    with pytest.raises(recovery.SuccessfulReworkRecoveryError):
+    with pytest.raises(recovery.SuccessfulReworkRecoveryError) as caught:
         _seal(episode, claim_epoch=claim)
+    assert not isinstance(caught.value.__cause__, runtime_temp.RuntimeTempError)
     assert calls == []
 
 
-def test_native_blocked_shape_recovers_current_episode_and_preserves_history(episode):
+def test_native_blocked_shape_recovers_current_episode_and_preserves_history(episode, require_directory_authority):
+    require_directory_authority(episode.workspace)
     rejected = core.reject_review(episode.task_id, "Add missing initializer", to="blocked")
     assert rejected["ok"], rejected
     blocked = task_store.get_task(episode.repo, episode.task_id)
@@ -156,7 +161,8 @@ def test_native_blocked_shape_recovers_current_episode_and_preserves_history(epi
     assert task_store.archive_task(episode.repo, episode.task_id, reason="done") == (True, "archived")
 
 
-def test_review_rejection_recovers_the_exact_current_successful_payload(episode):
+def test_review_rejection_recovers_the_exact_current_successful_payload(episode, require_directory_authority):
+    require_directory_authority(episode.workspace)
     before = _snapshot(episode)[1]
     result = core.reject_review(episode.task_id, "Fix current candidate", predecessor_request_id=episode.request_id)
     assert result["ok"], result.get("stderr", result)
@@ -181,7 +187,8 @@ def test_blocked_recovery_rejects_stale_identity_without_mutation(episode, monke
 
 @pytest.mark.parametrize("flow", ["review", "blocked"])
 @pytest.mark.parametrize("change", ["request", "epoch", "card"])
-def test_card_preimage_cas_rejects_change_during_retained_io(episode, monkeypatch, flow, change):
+def test_card_preimage_cas_rejects_change_during_retained_io(episode, monkeypatch, flow, change, require_directory_authority):
+    require_directory_authority(episode.workspace)
     if flow == "blocked":
         assert core.reject_review(episode.task_id, "Fix", to="blocked")["ok"]
     before_events = _snapshot(episode)[1]
@@ -214,8 +221,9 @@ def test_manager_gate_precedes_artifact_mutation(episode, monkeypatch):
     assert calls == [] and _snapshot(episode) == before
 
 
-def test_external_runtime_root_is_supported(episode, tmp_path, monkeypatch):
+def test_external_runtime_root_is_supported(episode, tmp_path, monkeypatch, require_directory_authority):
     external = tmp_path / "external-runtime"
+    require_directory_authority(tmp_path)
     episode.runtime.rename(external)
     episode.workspace = external / "worktrees" / episode.request_id / "worktree"
     episode.bundle = external / "process_logs" / "processes" / "attempt-artifacts" / episode.request_id
@@ -226,7 +234,8 @@ def test_external_runtime_root_is_supported(episode, tmp_path, monkeypatch):
     assert Path(descriptor["artifact_path"]).is_relative_to(external)
 
 
-def test_verified_artifact_is_parsed_from_same_bytes(episode, monkeypatch):
+def test_verified_artifact_is_parsed_from_same_bytes(episode, monkeypatch, require_directory_authority):
+    require_directory_authority(episode.bundle)
     read = recovery._read_regular
     reads = []
 
@@ -246,7 +255,8 @@ def test_verified_artifact_is_parsed_from_same_bytes(episode, monkeypatch):
         _seal(episode)
 
 
-def test_oversize_candidate_is_rejected_before_content_read(episode, monkeypatch):
+def test_oversize_candidate_is_rejected_before_content_read(episode, monkeypatch, require_directory_authority):
+    require_directory_authority(episode.workspace)
     with episode.candidate.open("wb") as stream:
         stream.truncate(worker_workspace.MAX_REWORK_OVERLAY_CONTENT_BYTES + 1)
     calls = []
@@ -256,7 +266,8 @@ def test_oversize_candidate_is_rejected_before_content_read(episode, monkeypatch
     assert calls == []
 
 
-def test_oversize_manifest_bound_artifact_is_rejected(episode):
+def test_oversize_manifest_bound_artifact_is_rejected(episode, require_directory_authority):
+    require_directory_authority(episode.bundle)
     episode.payloads["review"]["padding"] = "x" * (worker_workspace.MAX_REWORK_OVERLAY_CONTENT_BYTES + 1)
     _republish(episode)
     with pytest.raises(recovery.SuccessfulReworkRecoveryError, match="content_too_large"):
@@ -264,7 +275,10 @@ def test_oversize_manifest_bound_artifact_is_rejected(episode):
 
 
 @pytest.mark.parametrize("replacement", ["absent", "file", "directory", "symlink"])
-def test_authenticated_deletion_is_preserved_and_replacements_fail_closed(episode, tmp_path, replacement):
+def test_authenticated_deletion_is_preserved_and_replacements_fail_closed(
+    episode, tmp_path, replacement, make_symlink, require_directory_authority,
+):
+    require_directory_authority(episode.workspace)
     relative = "src/deleted.py"
     episode.evidence["changed_path_hashes"][relative] = None
     _republish(episode)
@@ -274,7 +288,7 @@ def test_authenticated_deletion_is_preserved_and_replacements_fail_closed(episod
     elif replacement == "directory":
         deleted.mkdir()
     elif replacement == "symlink":
-        deleted.symlink_to(tmp_path / "missing")
+        make_symlink(tmp_path / "missing", deleted)
     if replacement != "absent":
         with pytest.raises(recovery.SuccessfulReworkRecoveryError):
             _seal(episode)
@@ -292,7 +306,8 @@ def test_authenticated_deletion_is_preserved_and_replacements_fail_closed(episod
     assert (target / "src/consumer.py").read_bytes() == b"exact candidate\n"
 
 
-def test_successful_two_generation_payload_is_independent_of_prior_seal(episode, tmp_path):
+def test_successful_two_generation_payload_is_independent_of_prior_seal(episode, tmp_path, require_directory_authority):
+    require_directory_authority(tmp_path)
     prior = _seal(episode)
     second_request = "c" * 32
     second = tmp_path / "second"
@@ -316,7 +331,8 @@ def test_successful_two_generation_payload_is_independent_of_prior_seal(episode,
 
 
 @pytest.mark.parametrize("sealed", [None, {"sealed": False}, {"sealed": True, "request_id": "wrong"}])
-def test_successful_publication_refuses_failed_or_wrong_seal(episode, monkeypatch, sealed):
+def test_successful_publication_refuses_failed_or_wrong_seal(episode, monkeypatch, sealed, require_directory_authority):
+    require_directory_authority(episode.workspace)
     monkeypatch.setattr(process_launcher, "_terminal_rework_delta_evidence", lambda *args, **kwargs: deepcopy(sealed))
     with pytest.raises(worker_workspace.WorkspaceError, match="successful_rework_delta_missing"):
         recovery.successful_candidate_evidence(
@@ -325,7 +341,8 @@ def test_successful_publication_refuses_failed_or_wrong_seal(episode, monkeypatc
         )
 
 
-def test_default_review_rejection_also_seals_current_success(episode):
+def test_default_review_rejection_also_seals_current_success(episode, require_directory_authority):
+    require_directory_authority(episode.workspace)
     result = core.reject_review(episode.task_id, "Fix current candidate")
     assert result["ok"], result
     card = task_store.get_task(episode.repo, episode.task_id)
@@ -466,3 +483,36 @@ def test_windows_reader_traverses_relative_handles_and_closes_them(episode, monk
     assert closes == list(reversed([100] + [item[3] for item in calls if item[0] == "directory"]))
     with pytest.raises(OSError):
         recovery.os.fstat(opened[0])
+
+
+def _anchor_walk_raises(monkeypatch, error):
+    @contextmanager
+    def failing_descriptor(path):
+        raise error
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(recovery, "_regular_descriptor", failing_descriptor)
+
+
+def test_anchor_walk_runtime_temp_error_fails_closed_as_read_failed(episode, monkeypatch):
+    # NF-2026-01070: a drive root the restricted token cannot open must not
+    # escape as a RuntimeError past callers that catch OSError/ValueError.
+    error = runtime_temp.RuntimeTempError("windows directory handle open failed: winerror=5")
+    _anchor_walk_raises(monkeypatch, error)
+    with pytest.raises(recovery.SuccessfulReworkRecoveryError) as caught:
+        recovery._read_regular(episode.candidate, episode.workspace, 100)
+    assert caught.value.args[0] == "successful_rework_read_failed"
+    assert caught.value.__cause__ is error
+
+
+def test_capture_candidate_paths_converts_runtime_temp_error_to_value_error(episode, monkeypatch):
+    _anchor_walk_raises(monkeypatch, runtime_temp.RuntimeTempError("windows directory final path unavailable: winerror=5"))
+    with pytest.raises(ValueError, match="successful_rework_read_failed"):
+        recovery.capture_candidate_paths(episode.workspace, ["src/consumer.py"])
+
+
+def test_missing_candidate_still_returns_none_when_missing_ok(episode, monkeypatch):
+    _anchor_walk_raises(monkeypatch, FileNotFoundError("missing"))
+    assert recovery._read_regular(episode.candidate, episode.workspace, 100, missing_ok=True) is None
+    with pytest.raises(recovery.SuccessfulReworkRecoveryError, match="successful_rework_read_failed"):
+        recovery._read_regular(episode.candidate, episode.workspace, 100)

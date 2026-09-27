@@ -1279,7 +1279,11 @@ class WindowsDirectoryAuthority:
             None,
         )
         if not handle or int(handle) == _windows_invalid_handle_value():
-            raise RuntimeTempError("windows directory handle open failed")
+            # Never include the path in the message: it can carry a home directory.
+            winerror = int(getattr(ctypes, "get_last_error")())
+            raise RuntimeTempError(
+                f"windows directory handle open failed: winerror={winerror}"
+            )
         return int(handle)
 
     @staticmethod
@@ -1356,7 +1360,11 @@ class WindowsDirectoryAuthority:
             )
         )
         if needed <= 1:
-            raise RuntimeTempError("windows directory final path unavailable")
+            # Never include the path in the message: it can carry a home directory.
+            winerror = int(getattr(ctypes, "get_last_error")())
+            raise RuntimeTempError(
+                f"windows directory final path unavailable: winerror={winerror}"
+            )
         buf = (ctypes.c_uint16 * needed)()
         written = int(
             kernel32.GetFinalPathNameByHandleW(
@@ -1367,7 +1375,10 @@ class WindowsDirectoryAuthority:
             )
         )
         if written <= 0:
-            raise RuntimeTempError("windows directory final path unavailable")
+            winerror = int(getattr(ctypes, "get_last_error")())
+            raise RuntimeTempError(
+                f"windows directory final path unavailable: winerror={winerror}"
+            )
         if written >= needed:
             raise RuntimeTempError("windows directory final path truncated")
         encoded = ctypes.string_at(buf, written * 2)

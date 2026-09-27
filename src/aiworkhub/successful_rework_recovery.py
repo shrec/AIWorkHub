@@ -85,7 +85,10 @@ def _read_regular(path: Path, root: Path, limit: int, *, missing_ok: bool = Fals
         if missing_ok:
             return None
         raise SuccessfulReworkRecoveryError("successful_rework_read_failed") from exc
-    except OSError as exc:
+    except (OSError, runtime_temp.RuntimeTempError) as exc:
+        # The anchored walk can fail to open a parent (e.g. a drive root a
+        # restricted token cannot list); fail closed as a ValueError so no
+        # RuntimeError escapes callers that catch OSError/ValueError.
         raise SuccessfulReworkRecoveryError("successful_rework_read_failed") from exc
 
 
