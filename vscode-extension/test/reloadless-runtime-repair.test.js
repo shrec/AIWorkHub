@@ -893,19 +893,19 @@ async function testLivePoisonedInvalidParamsShapeRepairsOnce(tmp) {
 
 function testWindowsWorkerRootIsolationPreservesExplicitOverride(tmp) {
   const repoRoot = path.win32.join("D:\\", "Dev", "AIWorkHub");
-  const tempRoot = path.win32.join("C:\\", "Users", "worker", "AppData", "Local", "Temp");
   const host = loadExtensionHost(tmp);
   const resolveWorkerWorktreeRootEnv = host.extension.__testInternals.resolveWorkerWorktreeRootEnv;
 
-  const isolated = resolveWorkerWorktreeRootEnv(
-    repoRoot,
-    { AIWORKHUB_RUNTIME_ROOT: path.win32.join(repoRoot, ".aiworkhub", "runtime") },
-    "win32",
-    tempRoot,
+  // NF-2026-01027: the repository's own sandbox root, never user Temp, and
+  // an ambient runtime root elsewhere cannot move it.
+  assert.strictEqual(
+    resolveWorkerWorktreeRootEnv(
+      repoRoot,
+      { AIWORKHUB_RUNTIME_ROOT: path.win32.join("C:\\", "elsewhere", "runtime") },
+      "win32",
+    ),
+    "D:\\Dev\\AIWorkHub\\.aiworkhub\\runtime\\worktrees",
   );
-  assert.ok(isolated.startsWith(`${tempRoot}\\`));
-  assert.strictEqual(path.win32.basename(path.win32.dirname(isolated)), "aiworkhub-worktrees");
-  assert.strictEqual(path.win32.basename(isolated).length, 16);
 
   const explicit = path.win32.join("C:\\", "custom", "worktrees");
   assert.strictEqual(
@@ -913,11 +913,10 @@ function testWindowsWorkerRootIsolationPreservesExplicitOverride(tmp) {
       repoRoot,
       { AIWORKHUB_RUNTIME_ROOT: "poisoned", AIWORKHUB_WORKTREE_ROOT: explicit },
       "win32",
-      tempRoot,
     ),
     explicit,
   );
-  assert.strictEqual(resolveWorkerWorktreeRootEnv(repoRoot, {}, "linux", "/tmp"), "");
+  assert.strictEqual(resolveWorkerWorktreeRootEnv(repoRoot, {}, "linux"), "");
 }
 
 (async () => {

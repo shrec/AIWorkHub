@@ -1324,17 +1324,12 @@ function resolveWorkerWorktreeRootEnv(
   root,
   inheritedEnv = process.env,
   platform = process.platform,
-  tempRoot = os.tmpdir(),
 ) {
   const explicit = String(inheritedEnv.AIWORKHUB_WORKTREE_ROOT || "").trim();
   if (explicit || platform !== "win32") return explicit;
-  const normalizedRepo = path.win32.normalize(String(root)).toLowerCase();
-  const namespace = crypto
-    .createHash("sha256")
-    .update(normalizedRepo, "utf8")
-    .digest("hex")
-    .slice(0, 16);
-  return path.win32.join(tempRoot, "aiworkhub-worktrees", namespace);
+  // NF-2026-01027: the repository's own sandbox root, which AppContainer
+  // children see as a per-logon-session drive letter.
+  return path.win32.join(String(root), ".aiworkhub", "runtime", "worktrees");
 }
 
 function ensureRepositoryCoordinatorCapability(root) {
@@ -2223,9 +2218,9 @@ class McpStdioClient {
     };
     const workerWorktreeRoot = resolveWorkerWorktreeRootEnv(root);
     if (workerWorktreeRoot) {
-      // Keep an explicit worker-root override, but do not let an ambient
-      // repo-local runtime root drag Windows AppContainer worktrees onto a
-      // protected repository volume.
+      // Keep an explicit worker-root override; otherwise pin Windows
+      // AppContainer worktrees to this repository's sandbox root, whatever
+      // an ambient runtime root says.
       env.AIWORKHUB_WORKTREE_ROOT = workerWorktreeRoot;
     }
     if (mcpDebugTraceFile) {

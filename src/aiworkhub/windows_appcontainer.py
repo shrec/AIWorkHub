@@ -32,7 +32,6 @@ import re
 import secrets
 import shutil
 import stat
-import tempfile
 import threading
 import time
 from ctypes import wintypes
@@ -107,6 +106,7 @@ class AppContainerReason(str, enum.Enum):
 # taxonomy in exactly one place.
 _OPERATION_REASON: dict[str, AppContainerReason] = {
     "grant_path_access": AppContainerReason.FILESYSTEM_GRANT_FAILED,
+    "sandbox_drive": AppContainerReason.FILESYSTEM_GRANT_FAILED,
     "create_appcontainer_profile": AppContainerReason.PROFILE_CREATION_FAILED,
     "derive_appcontainer_sid": AppContainerReason.CAPABILITY_DERIVATION_FAILED,
     "derive_capability_sids": AppContainerReason.CAPABILITY_DERIVATION_FAILED,
@@ -242,6 +242,13 @@ _GRANT_ACCESS_MASKS: dict[str, int] = {
     "modify": 0x001301BF,
     "traverse": 0x000200A0,
 }
+# NF-2026-01027, measured: GetLongPathNameW looks an 8.3-shaped component
+# (``worktree``, ``home``) up with FindFirstFileW in its parent, and git's
+# getcwd() needs that lookup. So a traverse of a request's own directory inside
+# a sandbox root also lists it; the shared root and ``awh`` never do, since
+# that would name every sibling request. FindFirstFileW opens the directory
+# for synchronous I/O, so it needs SYNCHRONIZE as well.
+_LIST_REQUEST_DIRECTORY = 0x00100001  # SYNCHRONIZE | FILE_LIST_DIRECTORY
 
 
 @dataclass(frozen=True)
@@ -251,7 +258,8 @@ class ContainerGrant:
     ``access`` is ``"read_execute"``, ``"modify"`` or ``"traverse"``.
     A grant is revoked -- this container SID's explicit ACEs removed from the
     path again -- when the launch closes or fails, unless ``persistent`` is
-    set (read_execute only; see :func:`launch_appcontainer`).
+    set (read_execute, or the traverse of a sandbox root and its shared
+    helper parent; see :func:`launch_appcontainer`).
     """
 
     path: str
@@ -271,111 +279,119 @@ _REQUEST_SCOPED_ENV_KEYS = (
 )
 
 
-def _real_user_temp_root() -> str:
-    """Resolve the user's OS temp boundary independently of request TEMP/TMP."""
+# The last three components of every sandbox root:
+# ``<repo>\.aiworkhub\runtime\worktrees``.
+_SANDBOX_TAIL = (".aiworkhub", "runtime", "worktrees")
 
-    if os.name == "nt":
-        local_appdata = ""
-        try:
-            local_appdata = _known_folder_local_appdata()
-        except (AppContainerError, OSError, ValueError):
-            pass
-        # SHGetKnownFolderPath can return no path after USERPROFILE is replaced
-        # with the request-local HOME. LOCALAPPDATA is preserved separately by
-        # the trusted launcher for CreateProcess and still names the host user.
-        local_appdata = local_appdata or os.environ.get("LOCALAPPDATA", "").strip()
-        if local_appdata:
-            candidate = Path(local_appdata) / "Temp"
-            try:
-                return os.path.normcase(
-                    os.path.normpath(str(candidate.resolve(strict=True)))
-                )
-            except (OSError, ValueError):
-                # The validation AppContainer cannot open the host Temp it is
-                # already running under. The lexical path is still the boundary
-                # that decides which leaves earn a chain.
-                lexical = os.path.normcase(os.path.normpath(str(candidate)))
-                if lexical and os.path.isabs(lexical):
-                    return lexical
-        return ""
-    return os.path.normcase(
-        os.path.normpath(str(Path(tempfile.gettempdir()).resolve(strict=True)))
+
+def _sandbox_root_of(path: str) -> str:
+    """Nearest ancestor-or-self of ``path`` ending in :data:`_SANDBOX_TAIL`.
+
+    Lexical and case-insensitive; the result is normcased, and "" when there
+    is none. A caller that needs the real location resolves ``path`` first.
+    """
+    candidate = Path(os.path.normcase(os.path.normpath(path)))
+    for directory in (candidate, *candidate.parents):
+        if tuple(part.lower() for part in directory.parts[-3:]) == _SANDBOX_TAIL:
+            return str(directory)
+    return ""
+
+
+def _shared_sandbox_directory(path: str) -> bool:
+    """``path`` is a sandbox root or its shared helper-temp parent ``awh``.
+
+    Every launch of one container SID traverses these at the same time, and a
+    revoke removes all of that SID's explicit ACEs on a path, so the first
+    launch to close would strip a still-running sibling's traverse. Their
+    traverse grant is persistent; every per-request directory stays revocable.
+    """
+    key = os.path.normcase(os.path.normpath(path))
+    root = _sandbox_root_of(key)
+    if not root:
+        return False
+    return key == root or (
+        os.path.dirname(key) == root
+        and os.path.basename(key) == os.path.normcase(_HELPER_TEMP_PARENT)
     )
 
 
 def _request_traversal_anchor(value: str) -> str:
-    """Return trusted real user Temp when ``value`` resolves strictly inside it.
+    """The sandbox root ``value`` resolves strictly inside, else "".
 
-    That boundary decides which leaves earn a request-scoped chain. It is not
-    where the chain stops: a container that cannot traverse a component cannot
-    open anything below it, so ancestors continue through the volume root.
-    Paths outside the boundary have no safe request-scoped grant plan.
+    ``value`` is resolved first, so a junction or symlink cannot carry a path
+    that merely names a sandbox out of it. The root is where a request's
+    traverse chain stops: the child sees it as the drive letter
+    :meth:`Win32Api.sandbox_drive` maps there, so it never opens a component
+    above it.
     """
     if not value:
         return ""
     try:
         candidate = os.path.normcase(os.path.normpath(str(Path(value).resolve())))
-        temp_root = _real_user_temp_root()
-        if os.path.commonpath((candidate, temp_root)) == temp_root:
-            return temp_root
     except (OSError, ValueError):
-        pass
-    return ""
+        return ""
+    root = _sandbox_root_of(candidate)
+    return root if root and candidate != root else ""
 
 
 def request_scoped_grants(
     environment: Mapping[str, str], *paths: str
 ) -> list[ContainerGrant]:
-    """Build the revocable request-path grant plan.
+    """Build the request-path grant plan.
 
-    Each distinct requested leaf receives modify access. Every directory above
-    a leaf already proven strictly below trusted real user Temp receives only
-    non-inheritable traverse access, nearest-first in ``Path.parents`` order
-    through the volume root. An explicit path outside that boundary is refused;
-    an ambient environment path outside it is omitted and does not drag its own
-    siblings into the plan.
+    Each distinct requested leaf receives modify access. Every directory from
+    a leaf's parent up to and including its sandbox root receives only
+    non-inheritable traverse access, nearest-first in ``Path.parents`` order,
+    and the chain stops there. The root and its shared ``awh`` helper parent
+    are persistent (:func:`_shared_sandbox_directory`); every other entry is
+    revoked with the launch. An explicit path that does not resolve strictly
+    inside a sandbox root is refused; an ambient environment path outside one
+    is omitted and does not drag its own siblings into the plan.
     """
     candidates = (
         *((value, True) for value in paths),
         *((environment.get(key, ""), False) for key in _REQUEST_SCOPED_ENV_KEYS),
     )
-    values: list[str] = []
+    values: list[tuple[str, str]] = []
     for value, explicit in candidates:
         if not value:
             continue
         anchor = _request_traversal_anchor(value)
-        if not anchor or os.path.normcase(os.path.normpath(value)) == anchor:
+        if not anchor:
             if explicit:
                 raise AppContainerError(
                     AppContainerReason.INVALID_REQUEST,
-                    detail=f"request path outside user temp boundary: {value!r}.",
+                    detail=f"request path outside sandbox boundary: {value!r}.",
                 )
             continue
-        values.append(value)
+        values.append((value, anchor))
     grants: list[ContainerGrant] = []
     seen: set[str] = set()
 
     # Reserve every leaf first so a path explicitly requested for modification
     # can never be downgraded when it is also another leaf's ancestor.
-    for value in values:
+    for value, _anchor in values:
         key = os.path.normcase(os.path.normpath(value))
         if key not in seen:
             seen.add(key)
             grants.append(ContainerGrant(value, "modify"))
 
-    # Path.parents order, nearest-first through the volume root. Do not stop at
-    # trusted Temp and do not skip a parent this process cannot stat: the
-    # validation AppContainer can see its granted subtree and the volume root
-    # but not the profile ancestors between them, and dropping those emits the
-    # volume root where the first leaf's chain still has the real Temp directory.
-    for value in values:
+    for value, anchor in values:
         for parent in Path(os.path.normpath(value)).parents:
             parent_text = os.path.normpath(str(parent))
             key = os.path.normcase(parent_text)
+            if not _within(key, anchor):
+                break
             if key in seen:
                 continue
             seen.add(key)
-            grants.append(ContainerGrant(parent_text, "traverse"))
+            grants.append(
+                ContainerGrant(
+                    parent_text,
+                    "traverse",
+                    persistent=_shared_sandbox_directory(key),
+                )
+            )
     return grants
 
 
@@ -840,6 +856,8 @@ class Win32Api(Protocol):
 
     def dacl_protected(self, path: str) -> bool: ...
 
+    def sandbox_drive(self, real_root: str) -> str: ...
+
     def build_security_capabilities(
         self, identity: _Identity, capability_sids: Sequence[str]
     ) -> _SecurityCapabilities: ...
@@ -914,6 +932,39 @@ _WAIT_OBJECT_0 = 0
 _WAIT_TIMEOUT = 258
 _WAIT_FAILED = 0xFFFFFFFF
 _MAX_BOUNDED_WAIT_MS = 0xFFFFFFFE
+_WAIT_ABANDONED = 0x80
+# One session-local mutex serializes choosing and defining a sandbox drive.
+_SANDBOX_DRIVE_MUTEX = "Local\\AIWorkHub.SandboxDrive"
+_SANDBOX_DRIVE_WAIT_MS = 10_000
+_DDD_NO_BROADCAST_SYSTEM = 0x8
+_SANDBOX_DRIVE_LETTERS = "ZYXWVUTSRQPONMLKJIHGFE"
+
+
+def _dos_device_target(real_root: str) -> str:
+    """What QueryDosDeviceW reports for a drive defined as ``real_root``, lowercased."""
+    return ("\\??\\" + real_root.rstrip("\\/")).lower()
+
+
+def _choose_sandbox_drive(
+    real_root: str, logical_drives: int, query: Callable[[str], str]
+) -> tuple[str, bool]:
+    """``(drive, needs_define)`` for ``real_root``; ``("", True)`` when none is free.
+
+    A letter whose DOS device already names ``real_root`` is reused. Otherwise
+    the highest of Z..E that is neither a logical drive nor any DOS device.
+    ``query("X:")`` is QueryDosDeviceW's first target for that name, or "".
+    """
+    wanted = _dos_device_target(real_root)
+    free = ""
+    for letter in _SANDBOX_DRIVE_LETTERS:
+        drive = letter + ":"
+        target = query(drive)
+        if target.lower() == wanted:
+            return drive, False
+        taken = logical_drives & (1 << (ord(letter) - ord("A")))
+        if not free and not target and not taken:
+            free = drive
+    return free, True
 
 
 # ---------------------------------------------------------------------------
@@ -1664,15 +1715,13 @@ def _windows_volume_root(canonical: str) -> bool:
 
 
 def _dacl_write_omit_keys() -> frozenset[str]:
-    """Normcased paths launch must not hand to ``grant_path_access``.
+    """Normcased paths the real boundary never writes a DACL on.
 
     ``C:\\Users`` and any other ancestor of a protected tree that sits outside
     the user profile. Writing a DACL there fails (measured:
-    ``filesystem_grant_failed: write DACL C:\\Users``) and aborts the launch
-    before the child exists. The volume root is not in this set: a standalone
-    root write is refused by :func:`_validate_grants`, and a traverse tied to
-    a temp leaf stays in the application loop. The real boundary still refuses
-    SetNamedSecurityInfo on that root.
+    ``filesystem_grant_failed: write DACL C:\\Users``). :func:`_validate_grants`
+    already refuses every grant on them -- a request chain stops at its
+    sandbox root -- so this is the boundary's own last line.
     """
     keys = {_well_known_users_directory()}
     if os.name != "nt":
@@ -1702,24 +1751,12 @@ def _dacl_write_omit_keys() -> frozenset[str]:
     return frozenset(keys)
 
 
-def _launch_omits_dacl_write(
-    path: str, omit_keys: frozenset[str] | None = None
-) -> bool:
-    """True when launch must not call ``grant_path_access`` for ``path``."""
-    if not isinstance(path, str) or not path:
-        return False
-    keys = _dacl_write_omit_keys() if omit_keys is None else omit_keys
-    return _canonical_grant_path(path) in keys
-
-
 def _boundary_omits_dacl_write(path: str) -> bool:
     """True when SetNamedSecurityInfo must not run for ``path``.
 
-    Includes everything :func:`_launch_omits_dacl_write` omits, plus a Windows
-    volume root. A tied root traverse may still be passed to the boundary; the
-    boundary must not turn that into a DACL write that aborts launch. A
-    standalone root write never reaches here: :func:`_validate_grants` refuses
-    it.
+    :func:`_dacl_write_omit_keys` plus a Windows volume root. A launch never
+    asks for either -- :func:`_validate_grants` refuses them -- so this only
+    keeps a direct boundary call from writing there.
     """
     if not isinstance(path, str) or not path:
         return False
@@ -1786,7 +1823,7 @@ def _discard_helper_temp(path: str) -> None:
 
 
 def _create_short_helper_temp(anchor: str, username: str) -> Path | None:
-    """A real directory under trusted Temp, short enough for the nested helper cwd."""
+    """``<sandbox root>\\awh\\<hex>``, short enough for the nested helper cwd."""
 
     parent = Path(anchor) / _HELPER_TEMP_PARENT
     try:
@@ -1820,13 +1857,15 @@ def bind_validation_helper_temp(
     NF-2026-00980. The measured denial is CreateProcessW rejecting the nested
     LSP helper cwd with WinError 267, not a missing execute ACE and not a
     generic spawn ban. Only a validation launch whose scratch is the temp
-    pytest will use, and only when that scratch resolves strictly inside
-    trusted user Temp, is rewritten. The added grants are that short leaf
-    (modify, which includes execute, so a helper created under it is
-    executable) and the traverse ancestors :func:`request_scoped_grants`
-    already emits for a path inside the boundary. A scratch or workspace
-    outside that boundary is not aliased and not granted. A launch without
-    the validation scratch env is left unchanged.
+    pytest will use, and only when that scratch resolves strictly inside a
+    sandbox root, is rewritten, to ``<sandbox root>\\awh\\<hex>``. The added
+    grants are that short leaf (modify, which includes execute, so a helper
+    created under it is executable) and the traverse chain
+    :func:`request_scoped_grants` emits for it: ``awh`` and the root, both
+    persistent. A scratch or workspace outside a sandbox root is not aliased
+    and not granted. A launch without the validation scratch env is left
+    unchanged. The length check reads the real path; the child later sees
+    the shorter drive spelling (:func:`_on_sandbox_drive`).
     """
 
     if os.name != "nt" or request.environment is None:
@@ -1954,6 +1993,13 @@ def _launch_prepared_appcontainer(
     grant_plan = _with_protected_descendants(
         request.filesystem_grants, api, request.withheld_directories
     )
+    # NF-2026-01027: the traverse chain stops at the sandbox root, so the
+    # child must never open or realpath() a component above it. It sees the
+    # root as a drive letter instead; the grants above keep their real paths.
+    sandbox = _request_traversal_anchor(request.working_directory or "")
+    if sandbox:
+        drive = _step("sandbox_drive", partial(api.sandbox_drive, sandbox))
+        request = _on_sandbox_drive(request, sandbox, drive)
 
     name, display_name, description = derive_container_identity(
         request.repo_id, request.worker_kind
@@ -2003,8 +2049,10 @@ def _launch_prepared_appcontainer(
         # revocable grant there would let the first launch to close remove the
         # ACE from under a still-running sibling.  Provider
         # install roots (read-only, public code) are therefore granted
-        # persistent + idempotent; the per-request worktree, HOME and temp --
-        # used by exactly one launch at a time -- are always revoked.
+        # persistent + idempotent, and so is the traverse ACE on the shared
+        # sandbox root (:func:`_shared_sandbox_directory`); the per-request
+        # worktree, HOME and temp -- used by exactly one launch at a time --
+        # are always revoked.
         # ponytail: two *different* SIDs persistently granting the same root
         # within the same few ms can lose one ACE (read-modify-write DACL); that
         # launch fails closed with access denied and the next one re-grants.
@@ -2017,14 +2065,7 @@ def _launch_prepared_appcontainer(
         # them exactly like the directory they came from.
         grants: list[_PathGrant] = []
         persistent_grants: list[tuple[str, str]] = []
-        # NF-2026-01015: a tied traverse may still name C:\Users. Writing a
-        # DACL there fails and aborts the launch before the child exists.
-        # Omit that write (and any protected ancestor outside the profile).
-        # The grant stays revocable and non-persistent in the plan.
-        omit_dacl = _dacl_write_omit_keys()
         for grant in grant_plan:
-            if _launch_omits_dacl_write(grant.path, omit_dacl):
-                continue
             applied: _PathGrant = _step(
                 "grant_path_access",
                 partial(
@@ -2144,6 +2185,46 @@ def _launch_prepared_appcontainer(
     )
 
 
+def _on_sandbox_drive(
+    request: AppContainerRequest, root: str, drive: str
+) -> AppContainerRequest:
+    """``request`` as the child sees it, with ``root`` spelled ``drive``.
+
+    Only what the child reads moves: the working directory, the executable,
+    each argv element (whole, or the value after the first ``=`` of a
+    ``-flag=value``) and each environment value (per ``os.pathsep`` segment).
+    Grants and withheld directories stay real: the host writes those ACLs.
+    """
+    prefix = root.rstrip("\\/").replace("/", "\\").lower()
+    target = drive.rstrip("\\/") + "\\"
+
+    def move(value: str) -> str:
+        head = value[: len(prefix)].replace("/", "\\").lower()
+        if head == prefix and value[len(prefix) : len(prefix) + 1] in ("", "\\", "/"):
+            return target + value[len(prefix) :].lstrip("\\/")
+        return value
+
+    def move_arg(value: str) -> str:
+        flag, equals, rest = value.partition("=")
+        if value.startswith("-") and equals:
+            return flag + equals + move(rest)
+        return move(value)
+
+    environment = request.environment
+    if environment is not None:
+        environment = {
+            key: os.pathsep.join(move(part) for part in value.split(os.pathsep))
+            for key, value in environment.items()
+        }
+    return replace(
+        request,
+        argv=[move_arg(arg) for arg in request.argv],
+        executable=move(request.executable) if request.executable else request.executable,
+        working_directory=move(request.working_directory or ""),
+        environment=environment,
+    )
+
+
 def _step(
     operation: str,
     thunk: Callable[[], Any],
@@ -2207,38 +2288,6 @@ def _validate_request(request: AppContainerRequest) -> None:
     _validate_grants(request.filesystem_grants)
 
 
-def _permission_denied(exc: OSError) -> bool:
-    """True for the Win32 access-denied failures a container sees as absence."""
-
-    winerror = getattr(exc, "winerror", None)
-    return isinstance(exc, PermissionError) or winerror in (5, 65)
-
-
-def _revocable_temp_leaves(grants: Sequence[ContainerGrant]) -> frozenset[str]:
-    """Normcased revocable leaves of ``grants`` strictly below trusted Temp.
-
-    A leaf here is a per-request directory this launch revokes: modify or
-    read_execute, not persistent, and proven by
-    :func:`_request_traversal_anchor` to resolve strictly inside the real user
-    temporary directory. Only those leaves may justify a traverse ACE on a
-    protected ancestor, because revoking the leaf bounds the chain above it.
-    """
-    leaves: set[str] = set()
-    for grant in grants:
-        if (
-            not isinstance(grant, ContainerGrant)
-            or not isinstance(grant.path, str)
-            or grant.persistent
-            or grant.access == "traverse"
-        ):
-            continue
-        anchor = _request_traversal_anchor(grant.path)
-        canonical = os.path.normcase(os.path.normpath(grant.path))
-        if anchor and canonical != anchor:
-            leaves.add(canonical)
-    return frozenset(leaves)
-
-
 def _validate_grants(grants: Sequence[ContainerGrant]) -> None:
     """Refuse any grant that could land somewhere other than the path it names.
 
@@ -2246,35 +2295,15 @@ def _validate_grants(grants: Sequence[ContainerGrant]) -> None:
     reparse points, so a symlink or junction -- at the leaf, or in an ancestor,
     which is what comparing against realpath exposes -- would re-permission a
     target the caller never named. UNC, device and admin-share spellings are
-    refused outright. No grant may expose a protected tree, and none may touch
-    a system tree at all. The single exception is a non-persistent traverse
-    entry on a protected tree or the volume root, tied to a revocable leaf
-    below trusted user Temp. A standalone or unrelated root traverse grant has
-    no such leaf and stays refused. A traverse ancestor this process cannot
-    stat is that same chain, not a missing path: the validation AppContainer
-    cannot open the profile above its granted subtree. Admitting that
-    traverse does not authorize a DACL write on ``C:\\Users`` or any protected
-    ancestor outside the profile: application omits those writes so launch is
-    not aborted by SetNamedSecurityInfo.
+    refused outright. No grant may expose a protected tree or a volume root,
+    and none may touch a system tree at all: a request's traverse chain stops
+    at its sandbox root (:func:`request_scoped_grants`), so it never needs
+    one. Only read_execute, or the traverse of a sandbox root and its shared
+    helper parent, may be persistent.
     """
     protected: list[str] | None = None
     system: list[str] = []
-    leaves: frozenset[str] | None = None
     checked: list[tuple[str, bool, str]] = []
-
-    def tied(canonical: str) -> bool:
-        nonlocal leaves
-        if leaves is None:
-            leaves = _revocable_temp_leaves(grants)
-        return any(leaf != canonical and _within(leaf, canonical) for leaf in leaves)
-
-    def protected_detail(path: str) -> str:
-        return (
-            "grant would equal or contain a protected tree (drive root, "
-            "user profile, AppData, user temp) with no revocable leaf below "
-            "trusted user temp to tie it to, or touch the Windows or "
-            f"Program Files trees: {path!r}."
-        )
 
     for grant in grants:
         if not isinstance(grant, ContainerGrant) or not isinstance(grant.path, str):
@@ -2288,11 +2317,15 @@ def _validate_grants(grants: Sequence[ContainerGrant]) -> None:
                 AppContainerReason.INVALID_REQUEST,
                 detail=f"unknown grant access {grant.access!r} for {path!r}.",
             )
-        if grant.persistent and grant.access != "read_execute":
+        if grant.persistent and not (
+            grant.access == "read_execute"
+            or (grant.access == "traverse" and _shared_sandbox_directory(path))
+        ):
             raise AppContainerError(
                 AppContainerReason.INVALID_REQUEST,
                 detail=(
-                    "only read_execute grants may be persistent; "
+                    "only read_execute grants, or the traverse of a sandbox root "
+                    "and its helper parent, may be persistent; "
                     f"{grant.access!r} must be revoked: {path!r}."
                 ),
             )
@@ -2310,22 +2343,7 @@ def _validate_grants(grants: Sequence[ContainerGrant]) -> None:
         canonical = os.path.normcase(os.path.normpath(path))
         try:
             info = os.lstat(path)
-        except OSError as exc:
-            if (
-                _permission_denied(exc)
-                and grant.access == "traverse"
-                and not grant.persistent
-                and tied(canonical)
-            ):
-                if protected is None:
-                    protected, system = _sensitive_roots()
-                if any(_within(canonical, root) for root in system):
-                    raise AppContainerError(
-                        AppContainerReason.INVALID_REQUEST,
-                        detail=protected_detail(path),
-                    )
-                checked.append((canonical, grant.persistent, grant.access))
-                continue
+        except OSError:
             raise AppContainerError(
                 AppContainerReason.INVALID_REQUEST,
                 detail=f"grant path does not exist: {path!r}.",
@@ -2345,14 +2363,18 @@ def _validate_grants(grants: Sequence[ContainerGrant]) -> None:
         exposes = os.path.dirname(canonical) == canonical or any(
             _within(root, canonical) for root in (*protected, *system)
         )
-        if exposes and grant.access == "traverse" and not grant.persistent:
-            exposes = not tied(canonical)
         if exposes or any(_within(canonical, root) for root in system):
             raise AppContainerError(
                 AppContainerReason.INVALID_REQUEST,
-                detail=protected_detail(path),
+                detail=(
+                    "grant would equal or contain a protected tree (drive root, "
+                    "user profile, AppData, user temp), or touch the Windows or "
+                    f"Program Files trees: {path!r}."
+                ),
             )
         checked.append((canonical, grant.persistent, grant.access))
+    # A persistent traverse is one non-inheritable ACE on one directory, so
+    # only a revocable grant on that same path would take it down on revoke.
     for path, persistent, access in checked:
         if not persistent and any(
             other_persistent
@@ -2360,15 +2382,17 @@ def _validate_grants(grants: Sequence[ContainerGrant]) -> None:
                 path == other
                 or (
                     access != "traverse"
+                    and other_access != "traverse"
                     and (_within(path, other) or _within(other, path))
                 )
             )
-            for other, other_persistent, _other_access in checked
+            for other, other_persistent, other_access in checked
         ):
             raise AppContainerError(
                 AppContainerReason.INVALID_REQUEST,
                 detail=f"revocable grant overlaps a persistent grant: {path!r}.",
             )
+
 
 def _within(child: str, parent: str) -> bool:
     """``child`` equals ``parent`` or lies beneath it (both normcased)."""
@@ -2847,6 +2871,16 @@ class _CtypesWin32Api:
             wintypes.DWORD,
             wintypes.DWORD,
         ]
+        k.CreateMutexW.restype = wintypes.HANDLE
+        k.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+        k.ReleaseMutex.restype = wintypes.BOOL
+        k.ReleaseMutex.argtypes = [wintypes.HANDLE]
+        k.GetLogicalDrives.restype = wintypes.DWORD
+        k.GetLogicalDrives.argtypes = []
+        k.QueryDosDeviceW.restype = wintypes.DWORD
+        k.QueryDosDeviceW.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
+        k.DefineDosDeviceW.restype = wintypes.BOOL
+        k.DefineDosDeviceW.argtypes = [wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR]
 
         # Filesystem grants reuse the snapshot boundary's security-info
         # signatures (GetNamedSecurityInfoW, GetLengthSid, LocalFree) and add
@@ -2977,6 +3011,12 @@ class _CtypesWin32Api:
         if _boundary_omits_dacl_write(path):
             return _PathGrant(path, access, None)
         mask = _GRANT_ACCESS_MASKS[access]
+        if (
+            access == "traverse"
+            and _sandbox_root_of(path)
+            and not _shared_sandbox_directory(path)
+        ):
+            mask |= _LIST_REQUEST_DIRECTORY
         inherit = (
             0
             if access == "traverse"
@@ -3053,6 +3093,53 @@ class _CtypesWin32Api:
             return bool(control.value & _SE_DACL_PROTECTED)
         finally:
             self._kernel32.LocalFree(descriptor)
+
+    def sandbox_drive(self, real_root: str) -> str:
+        """Map ``real_root`` to a drive letter for this logon session.
+
+        DefineDosDeviceW(DDD_NO_BROADCAST_SYSTEM) is per logon session, and an
+        AppContainer child of this process sees the letter too (measured).
+        A session-local mutex serializes choose-and-define across launchers;
+        a letter already naming ``real_root`` is reused. The mapping is never
+        removed: a running sibling may still be using it.
+        """
+        k = self._kernel32
+
+        def fail(error: int, what: str) -> _Win32Failure:
+            return _Win32Failure(error, "sandbox_drive", f"sandbox_drive_unavailable: {what}")
+
+        mutex = k.CreateMutexW(None, False, _SANDBOX_DRIVE_MUTEX)
+        if not mutex:
+            raise fail(_last_win_error(), "CreateMutexW")
+        try:
+            waited = k.WaitForSingleObject(mutex, _SANDBOX_DRIVE_WAIT_MS)
+            if waited not in (_WAIT_OBJECT_0, _WAIT_ABANDONED):
+                error = _last_win_error() if waited == _WAIT_FAILED else int(waited)
+                raise fail(error, f"mutex wait returned {waited:#x}")
+            try:
+                drive, needs_define = _choose_sandbox_drive(
+                    real_root, int(k.GetLogicalDrives()), self._query_dos_device
+                )
+                if not drive:
+                    raise fail(0, f"no free drive letter for {real_root!r}")
+                if needs_define and not k.DefineDosDeviceW(
+                    _DDD_NO_BROADCAST_SYSTEM, drive, real_root
+                ):
+                    raise fail(_last_win_error(), f"DefineDosDeviceW {drive} {real_root!r}")
+                if self._query_dos_device(drive).lower() != _dos_device_target(real_root):
+                    raise fail(0, f"{drive} does not name {real_root!r}")
+                return drive
+            finally:
+                k.ReleaseMutex(mutex)
+        finally:
+            k.CloseHandle(mutex)
+
+    def _query_dos_device(self, drive: str) -> str:
+        """QueryDosDeviceW's first target for ``drive``, or "" when there is none."""
+        buffer = ctypes.create_unicode_buffer(1024)
+        if not self._kernel32.QueryDosDeviceW(drive, buffer, len(buffer)):
+            return ""
+        return buffer.value
 
     def _set_sid_entry(
         self, path: str, sid: bytes, mode: int, mask: int, inherit: int, operation: str,

@@ -26,8 +26,10 @@ letter needs the mount manager, which a container cannot query, while the
 ``VOLUME_NAME_NT`` / ``VOLUME_NAME_NONE`` forms succeed.  So
 ``Path.resolve(strict=True)`` raised for every existing path.  On that denial
 the path is rebuilt from the input's drive letter and the object's
-``VOLUME_NAME_NONE`` name, and returned only if it names the very same file
-(same volume serial and file index); otherwise the original error stands.
+``VOLUME_NAME_NONE`` name -- or, under the per-session drive of a sandbox
+root, from that name's tail as long as the input's own path -- and returned
+only if it names the very same file (same volume serial and file index);
+otherwise the original error stands.
 
 And ``os.stat`` / ``os.lstat`` of the directories above the request's own
 directory: the container can stat none of them (WinError 5 on ``D:\\``,
@@ -97,14 +99,22 @@ def _getfinalpathname(path):
     except PermissionError:
         drive = ntpath.splitdrive(path)[0] if isinstance(path, str) else ""
         relative = _volume_relative_name(path) if len(drive) == 2 else ""
-        candidate = "\\\\?\\" + drive.upper() + relative
-        try:
-            same = relative and ntpath.samestat(_stat(candidate), _stat(path))
-        except OSError:
-            same = False
-        if not same:
-            raise
-        return candidate
+        candidates = ["\\\\?\\" + drive.upper() + relative] if relative else []
+        # NF-2026-01027: a sandbox root is a per-session drive letter of its
+        # own, and its real directories lead the volume-relative name. The
+        # container may not query that mapping (QueryDosDeviceW: WinError 5),
+        # so keep only the input's own length of the name's tail.
+        tail = ntpath.splitdrive(ntpath.abspath(path))[1].rstrip("\\") if relative else ""
+        if relative and relative.lower().endswith(tail.lower()):
+            kept = relative[len(relative) - len(tail):] or "\\"
+            candidates.append("\\\\?\\" + drive.upper() + kept)
+        for candidate in candidates:
+            try:
+                if ntpath.samestat(_stat(candidate), _stat(path)):
+                    return candidate
+            except OSError:
+                pass
+        raise
 
 
 def _ancestor_facts(raw):
