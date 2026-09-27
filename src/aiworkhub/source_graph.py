@@ -5067,6 +5067,25 @@ def _bodygrep_bytes_proves_no_match(needle: str, raw: bytes) -> bool:
 BODYGREP_MATCH_KINDS: tuple[str, ...] = ("literal", "token_and_line", "token_and_file")
 
 
+def _bodygrep_unquote(term: str) -> tuple[str, bool]:
+    """Strip one outer pair of matching quotes wrapping the whole term.
+
+    Seats naturally wrap an exact phrase in quotes, but the literal scan
+    matches characters, not intent, so the quotes were searched for too.
+    Only ONE outer pair is removed, and only when both ends match and the
+    inner text is non-empty -- an inner quote (``record["derived_state"]``),
+    a lone leading/trailing quote, and an empty pair (``""``) all pass
+    through unchanged. Callers pass an already-stripped term (bodygrep_query
+    strips at entry).
+    """
+
+    if len(term) >= 2 and term[0] == term[-1] and term[0] in ('"', "'"):
+        inner = term[1:-1]
+        if inner:
+            return inner, True
+    return term, False
+
+
 def bodygrep_query(
     repo_root: Path,
     term: str,
@@ -5100,13 +5119,14 @@ def bodygrep_query(
             "scan_truncated": False, "cursor": cursor, "next_cursor": None,
             "truncated": False,
         }
+    search_term, query_unquoted = _bodygrep_unquote(term)
     budget = max(1, min(int(budget), MAX_BUDGET_ROWS))
-    tokens = _query_tokens(term) if match_kind != "literal" else []
+    tokens = _query_tokens(search_term) if match_kind != "literal" else []
     if match_kind != "literal" and not tokens:
         raise SourceGraphError("bodygrep_token_query_empty")
     # A token-mode cursor is bound to the kind as well as the term, so a page
     # minted by one kind can never resume a scan of another.
-    cursor_term = term if match_kind == "literal" else f"{match_kind}:{term}"
+    cursor_term = search_term if match_kind == "literal" else f"{match_kind}:{search_term}"
     byte_cap = max(512, budget * 512)
     scan_file_cap = max(64, min(4000, budget * 32))
     scan_byte_cap = max(1_048_576, min(32 * 1_048_576, budget * 262_144))
@@ -5175,7 +5195,7 @@ def bodygrep_query(
     scan_truncated = len(paths) > scan_file_cap
     paths = paths[:scan_file_cap]
     repo_root = repo_root.resolve()
-    needle = term.casefold()
+    needle = search_term.casefold()
     if match_kind != "literal":
         # Pre-decode filter for the token kinds: a file that lacks the longest
         # token cannot hold every token, so the byte-level rejection stays sound.
@@ -5269,7 +5289,7 @@ def bodygrep_query(
             row = {
                 "file_path": file_path,
                 "kind": "body_match",
-                "name": term,
+                "name": search_term,
                 "qualname": f"{file_path}:{line_number}",
                 "line_start": line_number,
                 "line_end": line_number,
@@ -5364,6 +5384,9 @@ def bodygrep_query(
     if match_kind != "literal":
         payload["match_kind"] = match_kind
         payload["query_tokens"] = list(tokens)
+    if query_unquoted:
+        payload["query_unquoted"] = True
+        payload["query_literal"] = search_term
     return _fit_payload_bytes(payload, byte_cap)
 
 
