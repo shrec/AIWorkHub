@@ -6,6 +6,12 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.94] - 2026-09-27
+
+### Fixed
+
+- Windows AppContainer worker sandboxes live inside the repository under `.aiworkhub/runtime/worktrees` and are reached through a per-logon drive letter, so a worker launch no longer writes permissions on the user profile or `%TEMP%` and needs no elevation.
+
 ## [0.11.93] - 2026-09-27
 
 ### Fixed

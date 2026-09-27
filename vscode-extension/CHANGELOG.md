@@ -1,5 +1,11 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.94 — 2026-09-27
+
+### Fixed
+
+- Windows AppContainer worker sandboxes live inside the repository under `.aiworkhub/runtime/worktrees` and are reached through a per-logon drive letter; a launch no longer writes permissions on the user profile or `%TEMP%`.
+
 ## 0.11.93 — 2026-09-27
 
 ### Fixed

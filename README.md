@@ -62,6 +62,10 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
+## What's new in 0.11.94
+
+- Windows AppContainer worker sandboxes moved from `%TEMP%` into the repository; launches no longer touch C: permissions.
+
 ## What's new in 0.11.93
 
 - Windows AppContainer workers no longer spend minutes to hours walking the user profile at launch and close.
