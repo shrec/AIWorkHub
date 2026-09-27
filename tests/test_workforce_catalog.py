@@ -2788,3 +2788,137 @@ def test_catalog_preflight_handoff_is_repo_keyed_and_probe_free(
         "openai/gpt-4o",
     ]
     assert workforce_catalog.cached_preflight_snapshot(other) is None
+
+
+# --- NF-2026-01036 part A: a sealed balance refusal holds until its reset ------
+
+_CREDIT_LIMIT_SENTENCE = (
+    "You've reached your monthly credit limit. Please enable additional paid "
+    "credits or wait until your credits reset on October 1, 2026 at 4:00 AM."
+)
+_BALANCE_FAILED_AT = "2026-09-26T22:00:00+00:00"
+
+
+def _epoch(value: str) -> float:
+    return datetime.fromisoformat(value).timestamp()
+
+
+def _launcher_sealed_balance_row(tmp_path, capsys, monkeypatch) -> dict:
+    """The worker's real terminal line, sealed by the launcher's real reader."""
+    from aiworkhub import vscode_lm_worker
+
+    sealed = vscode_lm_worker.provider_balance_error(_CREDIT_LIMIT_SENTENCE)
+    assert sealed is not None
+
+    def fail(_path):
+        raise vscode_lm_worker.VscodeLmProviderRefusal(sealed)
+
+    monkeypatch.setattr(vscode_lm_worker, "run", fail)
+    capsys.readouterr()
+    assert vscode_lm_worker.main(["--spec", str(tmp_path / "unused.json")]) == 1
+    stdout = tmp_path / "stdout.jsonl"
+    stdout.write_text(capsys.readouterr().out, encoding="utf-8")
+
+    failure = process_launcher._vscode_lm_balance_failure_from_output(stdout)
+    assert failure is not None
+    assert failure["refusal_kind"] == "balance_exhausted"
+    return {
+        "adapter_id": "vscode_lm",
+        "model": "claude-sonnet-5",
+        "state": "worker_failed",
+        "error": failure["reason"],
+        "finished_at": _BALANCE_FAILED_AT,
+        "provider_error": failure["provider_error"],
+    }
+
+
+def test_sealed_balance_route_stays_open_until_the_recorded_reset(
+    tmp_path, capsys, monkeypatch,
+):
+    row = _launcher_sealed_balance_row(tmp_path, capsys, monkeypatch)
+    assert row["provider_error"]["owner"] == "provider"
+    assert row["provider_error"]["sealed"] is True
+    assert row["provider_error"]["reset_at"] == "2026-10-01T16:00:00+00:00"
+
+    # Two days later -- past both the 600 s cooldown and the 24 h lookback.
+    before = workforce_catalog.route_circuit_for(
+        tmp_path, "vscode_lm", "claude-sonnet-5",
+        now_epoch=_epoch("2026-09-29T00:00:00+00:00"), observations=[row],
+    )
+    assert before["state"] == "open"
+    assert before["failure_kind"] == "quota"
+    assert before["reset_at"] == "2026-10-01T16:00:00+00:00"
+
+    after = workforce_catalog.route_circuit_for(
+        tmp_path, "vscode_lm", "claude-sonnet-5",
+        now_epoch=_epoch("2026-10-01T16:01:00+00:00"), observations=[row],
+    )
+    assert after["state"] != "open"
+
+
+def test_a_later_success_closes_a_sealed_balance_route(tmp_path, capsys, monkeypatch):
+    row = _launcher_sealed_balance_row(tmp_path, capsys, monkeypatch)
+    success = {
+        "adapter_id": "vscode_lm",
+        "model": "claude-sonnet-5",
+        "state": "accepted",
+        "error": "",
+        "finished_at": "2026-09-28T00:00:00+00:00",
+    }
+    circuit = workforce_catalog.route_circuit_for(
+        tmp_path, "vscode_lm", "claude-sonnet-5",
+        now_epoch=_epoch("2026-09-28T00:01:00+00:00"), observations=[row, success],
+    )
+    assert circuit["state"] == "closed"
+
+
+def test_a_sealed_quota_without_reset_time_falls_back_to_the_cooldown(tmp_path):
+    row = {
+        "state": "worker_failed",
+        "finished_at": _BALANCE_FAILED_AT,
+        "provider_error": {
+            "owner": "provider", "sealed": True, "code": "insufficient_balance",
+        },
+    }
+    inside = workforce_catalog.route_circuit_for(
+        tmp_path, "vscode_lm", "m",
+        now_epoch=_epoch(_BALANCE_FAILED_AT) + 60, observations=[row],
+    )
+    assert inside["state"] == "open"
+    assert "reset_at" not in inside
+    past = workforce_catalog.route_circuit_for(
+        tmp_path, "vscode_lm", "m",
+        now_epoch=_epoch(_BALANCE_FAILED_AT)
+        + workforce_catalog.ROUTE_CIRCUIT_COOLDOWN_SECONDS + 1,
+        observations=[row],
+    )
+    assert past["state"] == "half_open"
+
+
+def test_worker_prose_credit_limit_sentence_cannot_open_the_circuit(tmp_path):
+    """The same sentence as free text -- in ``error`` or anywhere else -- is
+    never a classification signal; only the sealed provider object is."""
+    rows = [
+        {
+            "state": "worker_failed",
+            "finished_at": _BALANCE_FAILED_AT,
+            "error": f"vscode_lm_request_failed:{_CREDIT_LIMIT_SENTENCE}",
+        },
+        {
+            "state": "worker_failed",
+            "finished_at": _BALANCE_FAILED_AT,
+            "error": _CREDIT_LIMIT_SENTENCE,
+            # Unsealed / not provider-owned: a forged object is ignored.
+            "provider_error": {
+                "owner": "worker", "sealed": True, "code": "insufficient_balance",
+                "reset_at": "2026-10-01T16:00:00+00:00",
+            },
+        },
+    ]
+    for row in rows:
+        circuit = workforce_catalog.route_circuit_for(
+            tmp_path, "vscode_lm", "m",
+            now_epoch=_epoch(_BALANCE_FAILED_AT) + 60, observations=[row],
+        )
+        assert circuit["state"] != "open"
+        assert circuit["failure_kind"] == ""

@@ -3097,6 +3097,106 @@ def _provider_timeout_failure_from_output(path: Path) -> dict[str, Any] | None:
     return None
 
 
+# ``vscode_lm_worker``'s own structured provider refusal (NF-2026-01036), named
+# rather than imported so this module keeps its import graph unchanged.
+_VSCODE_LM_BALANCE_EXHAUSTED = "vscode_lm_provider_balance_exhausted"
+_VSCODE_LM_PROVIDER_ERROR_SOURCE = "vscode_lm_extension_response"
+_VSCODE_LM_BALANCE_CODES: frozenset[str] = frozenset({
+    "insufficient_balance", "quota_exhausted",
+})
+
+
+def _vscode_lm_balance_failure_from_output(path: Path) -> dict[str, Any] | None:
+    """Seal a VS Code LM credit/balance refusal the worker read from the host.
+
+    Trusted only from the worker's machine-generated terminal envelope --
+    ``type=result``, ``is_error``, the exact ``vscode_lm_provider_balance_
+    exhausted`` error constant, and a structured ``provider_error`` whose
+    source is the extension host's response field.  No prose anywhere in the
+    stream is scanned for balance/quota wording, so a model that prints the
+    provider's credit-limit sentence cannot mint this seal.  Every sealed field
+    is re-minted here from a closed vocabulary or a parsed, bounded value.
+    """
+
+    try:
+        st = path.lstat()
+    except OSError:
+        return None
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode) or st.st_size <= 0:
+        return None
+    size = int(st.st_size)
+    if size <= MAX_RECEIPT_SCAN_BYTES:
+        text = _read_byte_range(path, 0, size)
+    else:
+        half = MAX_RECEIPT_SCAN_BYTES // 2
+        text = _read_byte_range(path, 0, half) + "\n" + _read_byte_range(
+            path, size - half, half
+        )
+    for raw_line in text.splitlines():
+        try:
+            event = json.loads(raw_line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        if not (
+            event.get("type") == "result"
+            and event.get("is_error") is True
+            and str(event.get("subtype") or "").strip().lower() == "error"
+            and str(event.get("error") or "").strip() == _VSCODE_LM_BALANCE_EXHAUSTED
+        ):
+            continue
+        body = event.get("provider_error")
+        if not isinstance(body, dict):
+            continue
+        if (
+            body.get("owner") != "provider"
+            or body.get("sealed") is not True
+            or body.get("source") != _VSCODE_LM_PROVIDER_ERROR_SOURCE
+        ):
+            continue
+        code = str(body.get("code") or "").strip().lower()
+        if code not in _VSCODE_LM_BALANCE_CODES:
+            continue
+        reset_at = ""
+        raw_reset = body.get("reset_at")
+        if isinstance(raw_reset, str) and 0 < len(raw_reset) <= 64:
+            try:
+                parsed = datetime.fromisoformat(raw_reset.strip().replace("Z", "+00:00"))
+            except ValueError:
+                parsed = None
+            if parsed is not None and parsed.tzinfo is not None:
+                reset_at = parsed.astimezone(timezone.utc).isoformat()
+        sealed: dict[str, Any] = {
+            "schema_id": "aiworkhub.provider_route_error.v1",
+            "owner": "provider",
+            "sealed": True,
+            "source": _VSCODE_LM_PROVIDER_ERROR_SOURCE,
+            "code": next(item for item in _VSCODE_LM_BALANCE_CODES if item == code),
+            "http_status": 402,
+            "detail": str(body.get("detail") or "")[:300],
+        }
+        if reset_at:
+            sealed["reset_at"] = reset_at
+            if body.get("reset_timezone_assumed") == "UTC-12:00":
+                sealed["reset_timezone_assumed"] = "UTC-12:00"
+        return {
+            "schema_id": "aiworkhub.provider_launch_failure.v1",
+            "reason": (
+                "provider_refused_balance_exhausted_recoverable_after_reported_window"
+                if reset_at
+                else "provider_refused_balance_exhausted"
+            ),
+            "refusal_kind": "balance_exhausted",
+            "recoverable": bool(reset_at),
+            "http_status": 402,
+            "error_code": str(sealed["code"]),
+            "session_id": "",
+            "provider_error": sealed,
+        }
+    return None
+
+
 def _readonly_research_result_evidence(path: Path) -> dict[str, Any]:
     """Digest and validate one bounded provider stdout as research evidence.
 
@@ -3824,6 +3924,21 @@ def validate_workforce_identity(
     return canonical_model
 
 
+def _derivation_route_circuit(repo: Path, adapter_id: str, model: str) -> dict[str, Any]:
+    """The failure circuit of one derivation candidate, or {} when unreadable.
+
+    ``workforce_catalog.route_circuit_for`` already reports unreadable evidence
+    as ``unobserved``; anything else going wrong is likewise not a verdict, so
+    derivation never refuses a candidate on a circuit it could not compute.
+    """
+    try:
+        from . import workforce_catalog  # local import: cycle-safe (core -> launcher)
+
+        return dict(workforce_catalog.route_circuit_for(repo, adapter_id, model))
+    except Exception:  # noqa: BLE001 - an unreadable circuit skips nothing
+        return {}
+
+
 def derive_launch_identity(
     repo: Path,
     card: Mapping[str, Any],
@@ -3888,14 +4003,35 @@ def derive_launch_identity(
             for candidate in adapter_candidates
             if (resolved_runner, candidate) in _CANONICAL_WORKFORCE
         )
+        circuit_skips: list[str] = []
         for candidate in pinnable or adapter_candidates:
             verdict = repo_policy.validate_launch(repo, card, candidate)
-            if verdict.get("ok"):
-                resolved_adapter = candidate
-                break
-            adapter_rejections.append(
-                f"{candidate}:{str(verdict.get('reason') or 'repo_policy_rejected')[:80]}"
+            if not verdict.get("ok"):
+                adapter_rejections.append(
+                    f"{candidate}:{str(verdict.get('reason') or 'repo_policy_rejected')[:80]}"
+                )
+                continue
+            # NF-2026-01036: a pinnable route whose failure circuit is OPEN (a
+            # sealed provider refusal, e.g. an exhausted credit balance) would
+            # be refused by ``validate_workforce_identity`` one step later --
+            # or, worse, launched into the same wall.  Derivation falls through
+            # to the next pinnable candidate and says why; an explicit adapter
+            # pin never reaches this loop and is never overridden.
+            pinned_route = _CANONICAL_WORKFORCE.get((resolved_runner, candidate))
+            circuit = (
+                _derivation_route_circuit(repo, candidate, str(pinned_route["model"]))
+                if pinned_route is not None
+                else {}
             )
+            if str(circuit.get("state") or "") == "open":
+                skip = f"{candidate}:route_circuit_open:{str(circuit.get('failure_kind') or '')[:40]}"
+                if circuit.get("reset_at"):
+                    skip += f":reset_at={str(circuit['reset_at'])[:40]}"
+                circuit_skips.append(skip)
+                adapter_rejections.append(skip)
+                continue
+            resolved_adapter = candidate
+            break
         if not resolved_adapter:
             raise LaunchRejected(
                 "launch_adapter_underivable:runner="
@@ -3906,6 +4042,8 @@ def derive_launch_identity(
             if pinnable
             else "first_launchable_in_tuple_order"
         )
+        if circuit_skips:
+            derived_from["adapter_circuit_skipped"] = ";".join(circuit_skips)[:280]
 
     resolved_model = str(model or "").strip() or None
     if resolved_model is None:
@@ -11771,12 +11909,27 @@ class ProcessManager:
                     reason = terminal_failure_classification.supervisor_incomplete_reason(supervisor_state, supervisor_returncode)
                     error = reason.render()
             provider_launch_failure = None
+            # NF-2026-01036: a VS Code LM credit/balance refusal the worker read
+            # from the extension host's OWN response field.  It stays a
+            # ``worker_failed`` terminal -- that is the substatus whose evidence
+            # is durably recorded, and the recorded ``provider_error`` is what
+            # opens the route circuit -- but its reason and refusal kind are the
+            # provider's, not ``unknown``.
+            provider_route_failure = None
             if terminal_state == "worker_failed":
                 provider_output_path = Path(str(metadata["stdout_path"]))
-                provider_launch_failure = _provider_auth_failure_from_output(
-                    provider_output_path
-                )
-                if provider_launch_failure is None:
+                if str(metadata.get("adapter_id") or "") == "vscode_lm":
+                    provider_route_failure = _vscode_lm_balance_failure_from_output(
+                        provider_output_path
+                    )
+                if provider_route_failure is not None:
+                    error = str(provider_route_failure["reason"])
+                    reason = terminal_failure_classification.recognised_reason(error)
+                else:
+                    provider_launch_failure = _provider_auth_failure_from_output(
+                        provider_output_path
+                    )
+                if provider_launch_failure is None and provider_route_failure is None:
                     # The route, not the work: the provider named THIS launch's
                     # pinned model as unavailable for this account.  It joins
                     # the same refusal path below, so the card lands on the
@@ -11840,12 +11993,13 @@ class ProcessManager:
             # The refusal kind is read from ``provider_launch_failure`` because
             # that detector held the provider's whole response body; a log tail
             # read later is strictly weaker evidence about the same event.
+            provider_sealed_failure = provider_launch_failure or provider_route_failure
             terminal_disposition = terminal_failure_classification.failure_disposition_from_paths(
                 state=terminal_state,
                 error=error,
                 refusal_kind=(
-                    str(provider_launch_failure.get("refusal_kind") or "")
-                    if isinstance(provider_launch_failure, dict)
+                    str(provider_sealed_failure.get("refusal_kind") or "")
+                    if isinstance(provider_sealed_failure, dict)
                     else ""
                 ),
                 stdout_path=metadata.get("stdout_path"),
@@ -12036,10 +12190,10 @@ class ProcessManager:
                             # circuit be computed from the 90-day event log
                             # instead of the short-horizon process ledger.
                             **(
-                                {"provider_error": provider_launch_failure["provider_error"]}
-                                if isinstance(provider_launch_failure, dict)
+                                {"provider_error": provider_sealed_failure["provider_error"]}
+                                if isinstance(provider_sealed_failure, dict)
                                 and isinstance(
-                                    provider_launch_failure.get("provider_error"), dict
+                                    provider_sealed_failure.get("provider_error"), dict
                                 )
                                 else {}
                             ),

@@ -53,6 +53,11 @@ _TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 _MODEL_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/+-]{0,127}$")
 ROUTE_CIRCUIT_COOLDOWN_SECONDS = 600.0
 ROUTE_CIRCUIT_LOOKBACK_SECONDS = 86_400.0
+# A sealed balance/quota refusal that names its own reset time keeps the route
+# open until that time, which is routinely days away (a monthly credit limit).
+# Such evidence is honoured past the ordinary lookback, up to this horizon, so
+# the circuit does not silently close a day after the refusal.
+ROUTE_CIRCUIT_RESET_HORIZON_SECONDS = 40 * 86_400.0
 ROUTE_CIRCUIT_TRANSIENT_THRESHOLD = 2
 # Availability is NOT time-gated.  It used to require a terminal success
 # inside `ROUTE_CIRCUIT_LOOKBACK_SECONDS` for the editor-bridge/BYOK provider
@@ -606,6 +611,31 @@ def _sealed_error_kind(sealed: Mapping[str, Any]) -> str:
         return "model_not_found"
     return ""
 
+
+def _sealed_reset_epoch(process: Mapping[str, Any]) -> float | None:
+    """The reset time a sealed balance/quota refusal recorded, as an epoch.
+
+    Read only from the sealed, provider-owned error object, never from prose,
+    and only for the ``quota`` kind; a reset time without a zone is refused
+    rather than guessed here (the transport that sealed it already chose the
+    conservative zone).
+    """
+
+    sealed = _sealed_provider_error(process)
+    if sealed is None or _sealed_error_kind(sealed) != "quota":
+        return None
+    raw = sealed.get("reset_at")
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.timestamp()
+
+
 def _route_failure_kind(process: Mapping[str, Any]) -> str:
     sealed = _sealed_provider_error(process)
     if sealed is not None:
@@ -641,16 +671,31 @@ def _route_circuit(
     shared MCP control plane.
     """
 
-    observed = [
-        (epoch, process)
-        for process in matched
-        if (epoch := _process_event_epoch(process)) is not None
-        and 0.0 <= now_epoch - epoch <= ROUTE_CIRCUIT_LOOKBACK_SECONDS
-    ]
+    observed: list[tuple[float, Mapping[str, Any]]] = []
+    for process in matched:
+        epoch = _process_event_epoch(process)
+        if epoch is None:
+            continue
+        age = now_epoch - epoch
+        if 0.0 <= age <= ROUTE_CIRCUIT_LOOKBACK_SECONDS:
+            observed.append((epoch, process))
+            continue
+        if not 0.0 <= age <= ROUTE_CIRCUIT_RESET_HORIZON_SECONDS:
+            continue
+        # Past the ordinary lookback only two facts still matter: a sealed
+        # balance/quota refusal whose own reset time has not arrived yet, and
+        # a success, which still ends the run that refusal would start.
+        reset_epoch = _sealed_reset_epoch(process)
+        state = str(process.get("state") or "").strip().casefold()
+        if (reset_epoch is not None and reset_epoch > now_epoch) or (
+            state in _ROUTE_SUCCESS_STATES and not _route_failure_kind(process)
+        ):
+            observed.append((epoch, process))
     observed.sort(key=lambda item: item[0], reverse=True)
     consecutive = 0
     latest_kind = ""
     latest_failure_epoch: float | None = None
+    latest_reset_epoch: float | None = None
     for epoch, process in observed:
         kind = _route_failure_kind(process)
         state = str(process.get("state") or "").strip().casefold()
@@ -660,6 +705,11 @@ def _route_circuit(
             latest_failure_epoch = (
                 epoch if latest_failure_epoch is None else latest_failure_epoch
             )
+            reset_epoch = _sealed_reset_epoch(process)
+            if reset_epoch is not None and (
+                latest_reset_epoch is None or reset_epoch > latest_reset_epoch
+            ):
+                latest_reset_epoch = reset_epoch
             if kind in _ROUTE_SINGLE_FAILURE_KINDS:
                 break
             continue
@@ -689,12 +739,20 @@ def _route_circuit(
         if latest_failure_epoch is not None else None
     )
     tripped = bool(latest_kind and consecutive >= threshold)
+    # NF-2026-01036: a sealed balance/quota refusal that NAMED its reset time
+    # (a monthly credit limit) is not worth retrying until then, so the
+    # cooldown stretches to that reset; the ordinary cooldown remains the
+    # fallback when no reset time is known.  Stretching the cooldown itself,
+    # rather than adding a side condition, keeps ``cooldown_remaining_seconds``
+    # in ``launch_route_refusal_reason`` truthful.
+    if latest_reset_epoch is not None and latest_failure_epoch is not None:
+        cooldown = max(cooldown, latest_reset_epoch - latest_failure_epoch)
     open_now = bool(
         tripped
         and failure_age is not None
         and failure_age < cooldown
     )
-    return {
+    circuit: dict[str, Any] = {
         "schema_id": "aiworkhub.route_failure_circuit.v1",
         "scope": "exact_adapter_and_model",
         "state": "open" if open_now else ("half_open" if tripped else "closed"),
@@ -705,6 +763,11 @@ def _route_circuit(
         "cooldown_seconds": cooldown,
         "mcp_control_plane_affected": False,
     }
+    if latest_reset_epoch is not None:
+        circuit["reset_at"] = datetime.fromtimestamp(
+            latest_reset_epoch, tz=timezone.utc
+        ).isoformat()
+    return circuit
 
 
 LAUNCH_ROUTE_SCHEMA_ID = "aiworkhub.launch_route_identity.v1"
@@ -835,8 +898,10 @@ def route_circuit_for(
         else datetime.now(timezone.utc).timestamp()
     )
     if observations is None:
+        # The reset horizon, not the lookback: ``_route_circuit`` itself keeps
+        # only the rows that still matter past the lookback.
         since = datetime.fromtimestamp(
-            observed_now - ROUTE_CIRCUIT_LOOKBACK_SECONDS, tz=timezone.utc
+            observed_now - ROUTE_CIRCUIT_RESET_HORIZON_SECONDS, tz=timezone.utc
         ).isoformat()
         try:
             observations = task_store.route_terminal_observations(

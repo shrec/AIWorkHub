@@ -568,6 +568,110 @@ def test_both_new_launch_denials_are_classified_for_autolaunch():
         assert reason in dependency_autolaunch.TRANSIENT_DENIAL_REASONS
 
 
+# --- 4b. derivation skips a route whose failure circuit is open --------------
+#
+# NF-2026-01036 part A: an unpinned claude_* launch derived ``vscode_lm`` while
+# that route's credit balance was exhausted, because derivation consulted only
+# ``repo_policy``.  The sealed refusal below is exactly what the launcher records
+# for the measured extension-host credit-limit error.
+
+def _sealed_balance_observations(monkeypatch, *, open_adapter):
+    from datetime import datetime, timedelta, timezone
+
+    from aiworkhub import workforce_catalog
+
+    failed_at = datetime.now(timezone.utc) - timedelta(hours=1)
+    reset_at = datetime.now(timezone.utc) + timedelta(days=3)
+
+    def observations(_root, *, adapter_id, model, since_iso):
+        if adapter_id != open_adapter:
+            return []
+        return [{
+            "adapter_id": adapter_id,
+            "model": model,
+            "state": "worker_failed",
+            "error": "provider_refused_balance_exhausted_recoverable_after_reported_window",
+            "finished_at": failed_at.isoformat(),
+            "provider_error": {
+                "schema_id": "aiworkhub.provider_route_error.v1",
+                "owner": "provider",
+                "sealed": True,
+                "source": "vscode_lm_extension_response",
+                "code": "insufficient_balance",
+                "http_status": 402,
+                "reset_at": reset_at.isoformat(),
+            },
+        }]
+
+    monkeypatch.setattr(
+        workforce_catalog.task_store, "route_terminal_observations", observations
+    )
+    monkeypatch.setattr(
+        process_launcher.repo_policy,
+        "validate_launch",
+        lambda _repo, _card, _adapter: {"ok": True},
+    )
+
+
+def test_derivation_skips_an_open_route_circuit_and_says_why(tmp_path, monkeypatch):
+    card = _launchable_card(runner="claude_sonnet-5")
+    assert process_launcher.adapter_identity_tuple("claude_sonnet-5")[:2] == (
+        "vscode_lm", "claude_cli",
+    )
+    _sealed_balance_observations(monkeypatch, open_adapter="nobody")
+    baseline = process_launcher.derive_launch_identity(tmp_path, card)
+    assert baseline["adapter_id"] == "vscode_lm"
+    assert "adapter_circuit_skipped" not in baseline["derived_from"]
+
+    _sealed_balance_observations(monkeypatch, open_adapter="vscode_lm")
+    derived = process_launcher.derive_launch_identity(tmp_path, card)
+
+    assert derived["adapter_id"] == "claude_cli"
+    assert derived["model"] == "claude-sonnet-5"
+    assert (
+        derived["derived_from"]["adapter_id"]
+        == "first_pinnable_launchable_in_tuple_order"
+    )
+    skipped = derived["derived_from"]["adapter_circuit_skipped"]
+    assert skipped.startswith("vscode_lm:route_circuit_open:quota:reset_at=")
+    assert any(
+        rejection.startswith("vscode_lm:route_circuit_open")
+        for rejection in derived["adapter_rejections"]
+    )
+
+
+def test_an_explicit_adapter_pin_is_never_overridden_by_the_circuit(
+    tmp_path, monkeypatch,
+):
+    _sealed_balance_observations(monkeypatch, open_adapter="vscode_lm")
+    derived = process_launcher.derive_launch_identity(
+        tmp_path, _launchable_card(runner="claude_sonnet-5"), adapter_id="vscode_lm",
+    )
+    assert derived["adapter_id"] == "vscode_lm"
+    assert "adapter_id" not in derived["derived_from"]
+    assert "adapter_circuit_skipped" not in derived["derived_from"]
+
+
+def test_every_candidate_open_is_refused_with_the_reason(tmp_path, monkeypatch):
+    from aiworkhub import workforce_catalog
+
+    _sealed_balance_observations(monkeypatch, open_adapter="vscode_lm")
+    real = workforce_catalog.task_store.route_terminal_observations
+
+    def both_open(root, *, adapter_id, model, since_iso):
+        return real(root, adapter_id="vscode_lm", model=model, since_iso=since_iso)
+
+    monkeypatch.setattr(
+        workforce_catalog.task_store, "route_terminal_observations", both_open
+    )
+    with pytest.raises(process_launcher.LaunchRejected) as excinfo:
+        process_launcher.derive_launch_identity(
+            tmp_path, _launchable_card(runner="claude_sonnet-5")
+        )
+    assert "launch_adapter_underivable" in str(excinfo.value)
+    assert "route_circuit_open" in str(excinfo.value)
+
+
 def test_create_warns_when_a_folded_runner_has_no_route(coord):
     result = _create(task_id="T_NO_ROUTE", runner="phantom_model_9")
     assert result["ok"] is True, result

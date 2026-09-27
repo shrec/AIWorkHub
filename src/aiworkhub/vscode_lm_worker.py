@@ -13,6 +13,7 @@ import tempfile
 import textwrap
 import time
 import unicodedata
+from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, cast
 
@@ -40,6 +41,88 @@ MAX_V2_REPLACEMENT_BYTES = 2 * 1024 * 1024
 MAX_V2_FILE_BYTES = 16 * 1024 * 1024
 PROGRESS_READ_MAX_ATTEMPTS = 2
 PROGRESS_READ_RETRY_SECONDS = 0.01
+
+# ---------------------------------------------------------------------------
+# NF-2026-01036 part A: a provider credit/balance refusal is a ROUTE fact.
+#
+# Measured: the extension host answered a turn with the provider's own
+# ``error`` field ``You've reached your monthly credit limit. Please enable
+# additional paid credits or wait until your credits reset on October 1, 2026
+# at 4:00 AM.``, which this worker re-raised as
+# ``vscode_lm_request_failed:<sentence>`` and the launcher filed as
+# ``worker_failed``/``unknown`` -- so the route circuit never learned it and
+# every unpinned launch picked the same exhausted route again.
+#
+# Only the HOST-OWNED ``response["error"]`` field is ever matched here, and only
+# when the WHOLE field is the provider sentence (anchored at both ends): an
+# extension protocol failure is prefixed with its own ``vscode_lm_*`` code, and
+# worker/model prose never reaches this function at all.  The result is a
+# structured ``provider_error`` (the ``workforce_catalog`` sealed shape) that the
+# launcher re-validates before sealing it onto the card.
+VSCODE_LM_PROVIDER_BALANCE_EXHAUSTED = "vscode_lm_provider_balance_exhausted"
+PROVIDER_ROUTE_ERROR_SCHEMA_ID = "aiworkhub.provider_route_error.v1"
+PROVIDER_ERROR_SOURCE = "vscode_lm_extension_response"
+_CREDIT_LIMIT_RE = re.compile(
+    r"You(?:'|’)ve reached your (?:monthly )?credit limit\."
+    r"(?P<rest>[^\r\n]{0,400})"
+)
+_CREDIT_RESET_RE = re.compile(
+    r"credits reset on (?P<when>[A-Z][a-z]{2,8} \d{1,2}, \d{4} at \d{1,2}:\d{2} [AP]M)\.?\s*\Z"
+)
+# The provider prints the reset as a wall-clock time WITHOUT a zone.  The
+# conservative reading is the LATEST instant that wall time can denote, i.e.
+# the westernmost civil offset UTC-12:00: the route is then never re-admitted
+# before the provider could actually have reset, only (at most ~26 h) after.
+_RESET_ASSUMED_UTC_OFFSET = timedelta(hours=-12)
+
+
+class VscodeLmProviderRefusal(RuntimeError):
+    """A structured provider refusal read from the host-owned response field."""
+
+    def __init__(self, provider_error: dict[str, Any]) -> None:
+        super().__init__(VSCODE_LM_PROVIDER_BALANCE_EXHAUSTED)
+        self.provider_error = provider_error
+
+
+def _credit_reset_iso(rest: str) -> str:
+    match = _CREDIT_RESET_RE.search(rest)
+    if match is None:
+        return ""
+    try:
+        wall = datetime.strptime(match.group("when"), "%B %d, %Y at %I:%M %p")
+    except ValueError:
+        return ""
+    local = wall.replace(tzinfo=timezone(_RESET_ASSUMED_UTC_OFFSET))
+    return local.astimezone(timezone.utc).isoformat()
+
+
+def provider_balance_error(response_error: Any) -> dict[str, Any] | None:
+    """Return the structured provider error for a credit-limit refusal, or None.
+
+    ``response_error`` must be the extension host's own ``response["error"]``
+    value.  The whole field must be the provider's credit-limit sentence.
+    """
+
+    if not isinstance(response_error, str):
+        return None
+    text = response_error.strip()
+    match = _CREDIT_LIMIT_RE.fullmatch(text)
+    if match is None:
+        return None
+    reset_at = _credit_reset_iso(match.group("rest"))
+    sealed: dict[str, Any] = {
+        "schema_id": PROVIDER_ROUTE_ERROR_SCHEMA_ID,
+        "owner": "provider",
+        "sealed": True,
+        "source": PROVIDER_ERROR_SOURCE,
+        "code": "insufficient_balance",
+        "http_status": 402,
+        "detail": text[:300],
+    }
+    if reset_at:
+        sealed["reset_at"] = reset_at
+        sealed["reset_timezone_assumed"] = "UTC-12:00"
+    return sealed
 
 
 def _load_json(path: Path, *, max_bytes: int = 16 * 1024 * 1024) -> dict[str, Any]:
@@ -1390,6 +1473,10 @@ def run(spec_path: Path) -> dict[str, Any]:
             defer_transient=False,
         )
     if response.get("error"):
+        # The host-owned field alone -- never ``text`` or any model output.
+        balance_error = provider_balance_error(response.get("error"))
+        if balance_error is not None:
+            raise VscodeLmProviderRefusal(balance_error)
         diagnostics = response.get("diagnostics")
         detail = ""
         if isinstance(diagnostics, dict):
@@ -1510,6 +1597,8 @@ def main(argv: list[str] | None = None) -> int:
         }
         if isinstance(exc, ProgressReceiptSecurityError):
             failure["diagnostics"] = {"progress_security": exc.receipt}
+        if isinstance(exc, VscodeLmProviderRefusal):
+            failure["provider_error"] = exc.provider_error
         print(json.dumps(failure, ensure_ascii=True, sort_keys=True))
         return 1
     receipt = str(result.pop("project_context_receipt", "") or "").strip()

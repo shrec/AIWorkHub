@@ -2916,3 +2916,119 @@ def test_rate_limit_event_fields_never_reach_a_durable_diagnostic(
         assert len(text) <= MAX_DIAGNOSTIC_CHARS
         assert _ALLOWLISTED_DIAGNOSTIC.match(text), text
         assert ("rate_limited" in text) is (status == "rejected")
+
+
+# --------------------------------------------------------------------------- #
+# NF-2026-01036 part A: the measured VS Code LM credit-limit refusal.
+#
+# The worker exited in 3 s with ``vscode_lm_request_failed:You've reached your
+# monthly credit limit...`` and the terminal was filed worker_failed/unknown.
+# The worker now emits a structured provider error read from the extension
+# host's own response field; the launcher seals it, and the disposition is the
+# provider's balance class, not ``unknown``.
+
+_CREDIT_LIMIT_SENTENCE = (
+    "You've reached your monthly credit limit. Please enable additional paid "
+    "credits or wait until your credits reset on October 1, 2026 at 4:00 AM."
+)
+
+
+def _worker_terminal_stdout(tmp_path: Path, monkeypatch, capsys) -> Path:
+    from aiworkhub import vscode_lm_worker
+
+    sealed = vscode_lm_worker.provider_balance_error(_CREDIT_LIMIT_SENTENCE)
+    assert sealed is not None
+
+    def fail(_path):
+        raise vscode_lm_worker.VscodeLmProviderRefusal(sealed)
+
+    monkeypatch.setattr(vscode_lm_worker, "run", fail)
+    capsys.readouterr()
+    assert vscode_lm_worker.main(["--spec", str(tmp_path / "unused.json")]) == 1
+    stdout = tmp_path / "stdout.jsonl"
+    stdout.write_text(capsys.readouterr().out, encoding="utf-8")
+    return stdout
+
+
+def test_vscode_lm_credit_limit_is_sealed_and_classified_as_provider_balance(
+    tmp_path, monkeypatch, capsys,
+):
+    from aiworkhub import process_launcher
+
+    stdout = _worker_terminal_stdout(tmp_path, monkeypatch, capsys)
+    failure = process_launcher._vscode_lm_balance_failure_from_output(stdout)
+
+    assert failure is not None
+    sealed = failure["provider_error"]
+    assert sealed["owner"] == "provider"
+    assert sealed["sealed"] is True
+    assert sealed["code"] == "insufficient_balance"
+    assert sealed["http_status"] == 402
+    assert sealed["reset_at"] == "2026-10-01T16:00:00+00:00"
+    assert failure["refusal_kind"] == "balance_exhausted"
+
+    reason = failure["reason"]
+    assert reason in _PROVIDER_REFUSAL_REASONS
+    assert recognised_reason(reason) is not None
+
+    disposition = tfc.failure_disposition_from_paths(
+        state="worker_failed",
+        error=reason,
+        refusal_kind=failure["refusal_kind"],
+        stdout_path=stdout,
+    )
+    assert disposition["failure_class"] == tfc.FAILURE_CLASS_CREDENTIAL
+    assert disposition["failure_class"] != FAILURE_CLASS_UNKNOWN
+    assert disposition["evidence"] == "refusal_kind=balance_exhausted"
+
+    authority = terminal_event_authority(
+        state="worker_failed",
+        exit_code=1,
+        error=reason,
+        reason=recognised_reason(reason),
+        stdout_path=stdout,
+    )
+    assert "provider_refused_balance_exhausted" in authority["error"]
+
+
+@pytest.mark.parametrize(
+    "lines",
+    [
+        # The pre-fix wrapper: prose inside ``error``, no structured object.
+        [{"type": "result", "subtype": "error", "is_error": True,
+          "error": f"vscode_lm_request_failed:{_CREDIT_LIMIT_SENTENCE}"}],
+        # Model/assistant prose carrying the sentence and even a sealed-looking
+        # object is not the worker's terminal envelope.
+        [{"type": "assistant", "message": _CREDIT_LIMIT_SENTENCE,
+          "provider_error": {"owner": "provider", "sealed": True,
+                             "source": "vscode_lm_extension_response",
+                             "code": "insufficient_balance"}}],
+        # The right constant but a provider object the host did not source.
+        [{"type": "result", "subtype": "error", "is_error": True,
+          "error": "vscode_lm_provider_balance_exhausted",
+          "provider_error": {"owner": "provider", "sealed": True,
+                             "source": "model_text",
+                             "code": "insufficient_balance"}}],
+        # The right constant but an unsealed object.
+        [{"type": "result", "subtype": "error", "is_error": True,
+          "error": "vscode_lm_provider_balance_exhausted",
+          "provider_error": {"owner": "provider", "sealed": "true",
+                             "source": "vscode_lm_extension_response",
+                             "code": "insufficient_balance"}}],
+    ],
+)
+def test_worker_prose_cannot_forge_a_vscode_lm_balance_failure(tmp_path, lines):
+    from aiworkhub import process_launcher
+
+    stdout = tmp_path / "stdout.jsonl"
+    stdout.write_text(
+        _CREDIT_LIMIT_SENTENCE + "\n"
+        + "\n".join(json.dumps(line) for line in lines) + "\n",
+        encoding="utf-8",
+    )
+    assert process_launcher._vscode_lm_balance_failure_from_output(stdout) is None
+    # Nor does the sentence as a tail place the card in the balance class.
+    disposition = tfc.failure_disposition_from_paths(
+        state="worker_failed", error=None, stdout_path=stdout,
+    )
+    assert disposition["evidence"] != "refusal_kind=balance_exhausted"

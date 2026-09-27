@@ -1584,3 +1584,108 @@ def test_worker_rejects_cancel_won_decision_without_writes(tmp_path: Path) -> No
         vscode_lm_worker.run(spec_path)
 
     assert response_path.is_file()
+
+
+# NF-2026-01036 part A: the measured extension-host credit-limit refusal.
+_CREDIT_LIMIT_SENTENCE = (
+    "You've reached your monthly credit limit. Please enable additional paid "
+    "credits or wait until your credits reset on October 1, 2026 at 4:00 AM."
+)
+
+
+def _credit_limit_response(tmp_path: Path, **overrides: object) -> Path:
+    request_id = "c" * 32
+    spec_path, response_path, repo_id, token = _strict_terminal_fixture(
+        tmp_path, request_id=request_id,
+    )
+    response = _strict_provider_response(
+        request_id=request_id, repo_id=repo_id, token=token,
+    )
+    response.update({"text": "", "error": _CREDIT_LIMIT_SENTENCE})
+    response.update(overrides)
+    vscode_lm_bridge._atomic_json(response_path, response)  # noqa: SLF001
+    return spec_path
+
+
+def test_credit_limit_response_error_becomes_a_structured_provider_error(
+    tmp_path: Path,
+) -> None:
+    spec_path = _credit_limit_response(tmp_path)
+
+    with pytest.raises(vscode_lm_worker.VscodeLmProviderRefusal) as failure:
+        vscode_lm_worker.run(spec_path)
+
+    assert str(failure.value) == vscode_lm_worker.VSCODE_LM_PROVIDER_BALANCE_EXHAUSTED
+    sealed = failure.value.provider_error
+    assert sealed["owner"] == "provider"
+    assert sealed["sealed"] is True
+    assert sealed["source"] == "vscode_lm_extension_response"
+    assert sealed["code"] == "insufficient_balance"
+    assert sealed["http_status"] == 402
+    assert sealed["detail"] == _CREDIT_LIMIT_SENTENCE
+    # No zone is printed; the conservative (latest) reading is UTC-12:00, so
+    # 04:00 local on October 1 is 16:00 UTC the same day.
+    assert sealed["reset_at"] == "2026-10-01T16:00:00+00:00"
+    assert sealed["reset_timezone_assumed"] == "UTC-12:00"
+
+
+def test_main_emits_the_structured_provider_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    sealed = vscode_lm_worker.provider_balance_error(_CREDIT_LIMIT_SENTENCE)
+    assert sealed is not None
+
+    def fail(_path: Path) -> dict[str, object]:
+        raise vscode_lm_worker.VscodeLmProviderRefusal(sealed)
+
+    monkeypatch.setattr(vscode_lm_worker, "run", fail)
+
+    assert vscode_lm_worker.main(["--spec", str(tmp_path / "unused.json")]) == 1
+    result = json.loads(capsys.readouterr().out)
+    assert result["type"] == "result"
+    assert result["is_error"] is True
+    assert result["error"] == "vscode_lm_provider_balance_exhausted"
+    assert result["provider_error"] == sealed
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        # An extension protocol failure echoing the sentence is not the provider.
+        "vscode_lm_tool_input_invalid:" + _CREDIT_LIMIT_SENTENCE,
+        "model said: " + _CREDIT_LIMIT_SENTENCE,
+        _CREDIT_LIMIT_SENTENCE + "\nand then some more text",
+        "vscode_lm_request_cancelled",
+        "",
+        None,
+        {"message": _CREDIT_LIMIT_SENTENCE},
+    ],
+)
+def test_only_the_whole_host_error_field_is_a_balance_refusal(value: object) -> None:
+    assert vscode_lm_worker.provider_balance_error(value) is None
+
+
+def test_credit_limit_without_a_reset_time_keeps_no_reset(tmp_path: Path) -> None:
+    sealed = vscode_lm_worker.provider_balance_error(
+        "You've reached your monthly credit limit."
+    )
+    assert sealed is not None
+    assert sealed["code"] == "insufficient_balance"
+    assert "reset_at" not in sealed
+
+
+def test_model_text_carrying_the_sentence_is_never_a_provider_error(
+    tmp_path: Path,
+) -> None:
+    """Only ``response["error"]`` is read; model ``text`` never is."""
+    spec_path = _credit_limit_response(
+        tmp_path, error="", text=_CREDIT_LIMIT_SENTENCE,
+    )
+
+    with pytest.raises(RuntimeError) as failure:
+        vscode_lm_worker.run(spec_path)
+
+    assert not isinstance(failure.value, vscode_lm_worker.VscodeLmProviderRefusal)
+    assert str(failure.value) == "vscode_lm_edit_response_invalid_json"
