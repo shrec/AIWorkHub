@@ -931,7 +931,10 @@ def test_revoking_one_target_of_a_two_target_caller_keeps_evidence_consistent(
 
 
 def _enriched_javascript_callers(
-    tmp_path: Path, monkeypatch, name: str
+    tmp_path: Path,
+    monkeypatch,
+    name: str,
+    app_imports: str = 'import { helper } from "./missing";\n',
 ) -> tuple[_Lsp, dict[str, dict]]:
     """Bind ``app.ts`` and ``lone.js``; return each ``helper`` edge's lexical state.
 
@@ -939,20 +942,22 @@ def _enriched_javascript_callers(
     revocation must restore are observed from extraction rather than assumed
     -- the extractor installed on the host decides them. A second ``helper``
     keeps lexical resolution ambiguous, so only the server binds the calls.
+    ``app_imports`` is the import block that heads ``app.ts``; by default it
+    names a module that does not exist, so no import binding resolves either.
     """
     fixture = _Lsp(tmp_path, monkeypatch, name)
     fixture.write("util.ts", "export function helper(): number {\n  return 1;\n}\n")
     fixture.write("other.ts", "export function helper(): number {\n  return 2;\n}\n")
     fixture.write(
         "app.ts",
-        'import { helper } from "./missing";\n\n'
+        app_imports + "\n"
         "export function run(): number {\n  return helper();\n}\n",
     )
     fixture.write("lone.js", "function run() {\n  return helper();\n}\n")
     sg.build_index(fixture.root)
     lexical = {rel: fixture.edge(rel, "helper") for rel in ("app.ts", "lone.js")}
     definition = {"workspace_path": "util.ts", "range": [0, 16, 0, 22]}
-    fixture.define_line("app.ts", 3, definition)
+    fixture.define_line("app.ts", app_imports.count("\n") + 2, definition)
     fixture.define_line("lone.js", 1, definition)
     fixture.serve(TYPESCRIPT_SERVER_ENV)
     for rel, before in lexical.items():
@@ -1011,15 +1016,25 @@ def test_edited_javascript_target_keeps_a_fresh_lexical_resolution(
 ):
     """Revoking a binding may not clobber what lexical resolution now proves.
 
-    With ``other.ts`` gone, ``helper`` names exactly one declaration, so the
-    merge that revokes the stale bindings also re-resolves both calls
-    lexically -- here to the very target the server had named. That fresh
-    destination is lexical evidence in its own right: it survives the
+    ``app.ts`` imports ``helper`` from both ``./util`` and ``./other``, so
+    while both modules define it the imported call names two files and stays
+    unbound. With ``other.ts`` gone the import binding names exactly one
+    file, so the merge that revokes the stale bindings also re-resolves the
+    call lexically -- here to the very target the server had named. That
+    fresh destination is lexical evidence in its own right: it survives the
     revocation, under extraction's label and confidence rather than the
-    server's.
+    server's. ``lone.js`` imports nothing, and repository-wide uniqueness of
+    ``helper`` is no evidence, so its revoked call returns to exactly what
+    extraction produced.
     """
     fixture, lexical = _enriched_javascript_callers(
-        tmp_path, monkeypatch, f"ts_js_fresh_lexical_{writer}"
+        tmp_path,
+        monkeypatch,
+        f"ts_js_fresh_lexical_{writer}",
+        app_imports=(
+            'import { helper } from "./util";\n'
+            'import { helper as otherHelper } from "./other";\n'
+        ),
     )
     fixture.unserve(TYPESCRIPT_SERVER_ENV)
     (fixture.root / "other.ts").unlink()
@@ -1034,12 +1049,13 @@ def test_edited_javascript_target_keeps_a_fresh_lexical_resolution(
     else:
         sg.build_index(fixture.root, incremental=True)
 
-    for rel, before in lexical.items():
-        edge = fixture.edge(rel, "helper")
-        assert edge["dst_qualname"] == "util.ts::helper", rel
-        assert (edge["evidence_label"], edge["confidence"]) == (
-            before["evidence_label"], before["confidence"],
-        ), rel
+    edge = fixture.edge("app.ts", "helper")
+    assert edge["dst_qualname"] == "util.ts::helper"
+    assert (edge["evidence_label"], edge["confidence"]) == (
+        lexical["app.ts"]["evidence_label"], lexical["app.ts"]["confidence"],
+    )
+    assert fixture.edge("lone.js", "helper") == lexical["lone.js"]
+    for rel in lexical:
         assert sg.lsp_provenance(fixture.root, source_path=rel) == ()
         assert sg.lsp_receipt(fixture.root, rel) is None
         _assert_evidence_agrees(fixture, rel)
