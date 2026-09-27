@@ -62,6 +62,11 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
+## What's new in 0.11.96
+
+- Validation inside the Windows sandbox can run `git` again, so correct worker changes stop landing as validation failures.
+- NeedFixes can be closed against a verified commit when their card was superseded.
+
 ## What's new in 0.11.95
 
 - Rework relaunch and upgrade GC work again for workspaces created before the sandbox moved into the repository.

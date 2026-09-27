@@ -6,6 +6,16 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.96] - 2026-09-27
+
+### Fixed
+
+- The Windows AppContainer validation lane keeps `git` on `PATH`; only the interactive agent lane drops Git Bash, so candidate tests that spawn `git` stop failing in-container (NF-2026-01037).
+- A NeedFix can link a superseded card when its fix is a commit verified on `HEAD` (`integrated_commit`), closing NeedFixes whose fix was integrated by hand (NF-2026-01030).
+- Accept evidence `verified_by` names the resolved manager instead of a hardcoded provider (NF-2026-01038).
+- Sparse worker checkouts follow `importlib` dynamic imports and module-file siblings (NF-2026-01024).
+- Supersede/archive receipts are bounded, the quality-review packet is paged under the host inline limit, semantic edit refuses drive-qualified and UNC paths, and policy files are pinned to LF so autocrlf worktrees stay byte-exact (NF-2026-01028/01029/01033/01034).
+
 ## [0.11.95] - 2026-09-27
 
 ### Fixed

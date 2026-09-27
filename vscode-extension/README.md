@@ -14,6 +14,11 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.11.96
+
+- Validation inside the Windows sandbox can run `git` again, so correct worker changes stop landing as validation failures.
+- NeedFixes can be closed against a verified commit when their card was superseded.
+
 ## What's new in 0.11.95
 
 - Rework relaunch and upgrade GC work again for workspaces created before the sandbox moved into the repository.
