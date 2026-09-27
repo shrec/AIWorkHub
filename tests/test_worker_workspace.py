@@ -542,6 +542,8 @@ def _commit_validation_worker_package(repo: Path) -> None:
         "runtime_temp.py",
         "windows_file_structures.py",
         "toolchain_authority.py",
+        # worker_workspace imports the grammar mirror relatively (NF-2026-01042).
+        "tree_sitter_cache.py",
         "validation_runner.py",
         # worker_workspace's AppContainer validation helper imports these two
         # siblings by name, so the declared seed closure resolves them and this
