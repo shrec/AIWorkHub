@@ -3005,13 +3005,29 @@ def aiworkhub_task_supersede(
     task_id: str,
     reason: str = "",
     by: str = "",
+    include_card: CardInclude = "none",
 ) -> dict[str, Any]:
     """COORDINATOR WRITE: supersede a stale/active task with a replacement.
+
     Archives the card as ``superseded`` (allowed even from processing) and
     records the optional replacement task id via ``by``. Full coordinator-
-    capability gate; atomic; no direct SQLite patching."""
+    capability gate; atomic; no direct SQLite patching.
 
-    return core.supersede_task(task_id=task_id, reason=reason, by=by)
+    Replies with a receipt (``aiworkhub.task_supersede_receipt.v1``): task_id,
+    status, card_sha256/card_bytes plus any server-derived keys the core call
+    attached. ``include_card`` = none (default) | summary (baselines and
+    evidence folded) | full (the exact post-transition card).
+    """
+
+    refusal = _include_card_refusal(include_card)
+    if refusal is not None:
+        return refusal
+    return _lifecycle_receipt(
+        core.supersede_task(task_id=task_id, reason=reason, by=by),
+        schema_id="aiworkhub.task_supersede_receipt.v1",
+        task_id=task_id,
+        include_card=include_card,
+    )
 
 
 @mcp.tool()
