@@ -188,6 +188,7 @@ def test_non_applied_capability_ceiling_never_emits_flag(
         is reasoning_policy.ControlStatus.CAPABILITY_CEILING
     )
 
+    monkeypatch.setattr(runtime_adapters, "_is_windows_host", lambda: False)
     monkeypatch.setattr(runtime_adapters.shutil, "which", lambda _name: sys.executable)
     plan = runtime_adapters.build_runtime_command(
         "claude_cli",
@@ -213,6 +214,7 @@ def test_build_runtime_command_places_claude_max_effort_and_capacity(
     decision = runtime_adapters.resolve_adapter_reasoning(
         "claude_cli", {"work_kind": "security"}, model="claude-opus-5"
     )
+    monkeypatch.setattr(runtime_adapters, "_is_windows_host", lambda: False)
     monkeypatch.setattr(runtime_adapters.shutil, "which", lambda _name: sys.executable)
     plan = runtime_adapters.build_runtime_command(
         "claude_cli",
@@ -224,7 +226,8 @@ def test_build_runtime_command_places_claude_max_effort_and_capacity(
     )
     assert plan.launchable is True
     assert plan.argv[-2:] == ["--effort", "max"]
-    assert plan.argv[2] == "write tests"
+    assert "write tests" not in plan.argv
+    assert plan.stdin_text == "write tests"
     assert plan.context_capacity == 1_000_000
     receipt = plan.reasoning_receipt
     assert receipt is not None
@@ -241,6 +244,7 @@ def test_build_runtime_command_places_codex_xhigh_effort(
     decision = runtime_adapters.resolve_adapter_reasoning(
         "codex_cli", {"work_kind": "security"}, model="gpt-5.5"
     )
+    monkeypatch.setattr(runtime_adapters, "_is_windows_host", lambda: False)
     monkeypatch.setattr(runtime_adapters.shutil, "which", lambda _name: sys.executable)
     plan = runtime_adapters.build_runtime_command(
         "codex_cli",
@@ -258,6 +262,7 @@ def test_build_runtime_command_places_codex_xhigh_effort(
 def test_opencode_build_never_emits_variant(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
+    monkeypatch.setattr(runtime_adapters, "_is_windows_host", lambda: False)
     monkeypatch.setattr(runtime_adapters.shutil, "which", lambda _name: sys.executable)
     plan = runtime_adapters.build_runtime_command(
         "opencode_cli",
@@ -422,7 +427,9 @@ def _run_claude_launch(
             return runtime_adapters.build_adapter_command(**kwargs)
 
         def _popen(self, *_args: object, **_kwargs: object) -> object:
-            return type("FakeProcess", (), {"pid": 4321})()
+            return type(
+                "FakeProcess", (), {"pid": 4321, "stdin": _FakeStdin()},
+            )()
 
         def _monitor(self, _live: object) -> None:
             return None
@@ -434,19 +441,35 @@ def _run_claude_launch(
         ) -> dict[str, object]:
             return {"ok": True, "card": {"claim_epoch": 1}}
 
+        @staticmethod
+        def mark_launch_failed(
+            *_args: object, **_kwargs: object,
+        ) -> dict[str, object]:
+            return {"ok": True}
+
     class _FakeThread:
         def __init__(self, *args: object, **kwargs: object) -> None:
             self.args = args
             self.kwargs = kwargs
 
         def start(self) -> None:
+            target = self.kwargs.get("target")
+            if getattr(target, "__name__", "") == "_feed_supervisor_stdin":
+                target()
             return None
+
+    runtime_dir = home / "task_mcp_worker_runtime"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    _audit_ledger_path = runtime_dir / "audit_ledger.jsonl"
+    _audit_hmac_key_path = runtime_dir / "audit_hmac.key"
+    _audit_ledger_path.write_bytes(b"")
+    _audit_hmac_key_path.write_bytes(b"k" * 32)
 
     class _Runtime:
         server_name = "test-worker-mcp"
         tool_names = ("aiworkhub_worker_source_graph_query",)
-        audit_ledger_path = None
-        audit_hmac_key_path = None
+        audit_ledger_path = _audit_ledger_path
+        audit_hmac_key_path = _audit_hmac_key_path
         claude_mcp_config_path = home / "claude.json"
         copilot_mcp_config_path = home / "copilot.json"
         codex_config_toml_path = home / "config.toml"
@@ -455,6 +478,15 @@ def _run_claude_launch(
 
     written: list[tuple[Path, dict[str, object]]] = []
     probe_calls: list[str] = []
+    stdin_writes: list[bytes] = []
+
+    class _FakeStdin:
+        def write(self, data: bytes) -> int:
+            stdin_writes.append(data)
+            return len(data)
+
+        def close(self) -> None:
+            return None
 
     def _write_json_0600(path: Path, data: dict[str, object]) -> None:
         written.append((path, data))
@@ -507,6 +539,10 @@ def _run_claude_launch(
     monkeypatch.setattr(
         process_launcher, "sandbox_argv", lambda _w, _a, argv, **_k: argv,
     )
+    monkeypatch.setattr(
+        process_launcher, "_sandbox_backend_for_adapter", lambda _adapter_id: "landlock",
+    )
+    monkeypatch.setattr(runtime_adapters, "_is_windows_host", lambda: False)
     monkeypatch.setattr(process_launcher, "_worker_launch_cwd", lambda path: str(path))
     monkeypatch.setattr(
         process_launcher, "_worker_supervisor_script", lambda: tmp_path / "supervisor.py",
@@ -549,6 +585,9 @@ def _run_claude_launch(
         for (_path, data) in written
         if data.get("schema_id") == "aiworkhub.task_mcp.isolated_request.v1"
     )
+    metadata["_worker_stdin_text"] = (
+        b"".join(stdin_writes).decode("utf-8") if stdin_writes else None
+    )
     return result, metadata, probe_calls
 
 
@@ -572,7 +611,8 @@ def test_launch_isolated_claude5_security_card_emits_max_effort(
     argv = list(metadata["worker_argv"])
     assert "--effort" in argv
     assert argv[argv.index("--effort") + 1] == "max"
-    assert argv[argv.index("-p") + 1] == "write tests"
+    assert "write tests" not in argv
+    assert metadata["_worker_stdin_text"] == "write tests"
 
     receipt = dict(metadata["reasoning_effort"])
     assert receipt["applied"] is True
@@ -622,7 +662,8 @@ def test_launch_isolated_real_workforce_alias_emits_max_effort(
     argv = list(metadata["worker_argv"])
     assert "--effort" in argv
     assert argv[argv.index("--effort") + 1] == "max"
-    assert argv[argv.index("-p") + 1] == "write tests"
+    assert "write tests" not in argv
+    assert metadata["_worker_stdin_text"] == "write tests"
 
     receipt = dict(metadata["reasoning_effort"])
     assert receipt["applied"] is True
