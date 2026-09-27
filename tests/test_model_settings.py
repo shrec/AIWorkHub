@@ -256,7 +256,9 @@ def test_update_requires_initialized_repository(tmp_path: Path) -> None:
         model_settings.update(bare, provider="openai", enabled=False, expected_revision=0)
 
 
-def test_persisted_schema_is_strict_bounded_and_regular_only(tmp_path: Path) -> None:
+def test_persisted_schema_is_strict_bounded_and_regular_only(
+    tmp_path: Path, make_symlink
+) -> None:
     root = _repo(tmp_path, "root")
     schema = model_settings.SCHEMA_ID
 
@@ -342,7 +344,7 @@ def test_persisted_schema_is_strict_bounded_and_regular_only(tmp_path: Path) -> 
     path.unlink()
     outside = tmp_path / "outside.json"
     outside.write_text("{}", encoding="utf-8")
-    path.symlink_to(outside)
+    make_symlink(outside, path)
     with pytest.raises(model_settings.ModelSettingsError, match="regular_file"):
         model_settings.load(root)
 

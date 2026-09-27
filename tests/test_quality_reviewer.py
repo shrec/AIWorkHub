@@ -598,7 +598,7 @@ class TestBuildReviewPrompt:
     ):
         from test_process_launcher import _reviewer_launch_setup
 
-        from aiworkhub import process_launcher, worker_ai_tools_mcp
+        from aiworkhub import process_launcher, toolchain_authority, worker_ai_tools_mcp
 
         manager, binding = _reviewer_launch_setup(tmp_path, monkeypatch)
         monkeypatch.delenv(quality_reviewer.REVIEW_PACKET_FILE_ROOT_ENV, raising=False)
@@ -618,6 +618,9 @@ class TestBuildReviewPrompt:
         monkeypatch.setattr(worker_ai_tools_mcp, "verify_quality_review_prewarm_authority", lambda *_a, **_k: None)
         monkeypatch.setattr(worker_ai_tools_mcp, "prewarm_quality_review_source_graph", lambda *_a, **_k: None)
         monkeypatch.setattr(process_launcher, "_provision_worker_mcp_runtime_for_authority", lambda *_a, **_k: object())
+        # Packet-root ordering does not depend on the real repository's
+        # toolchain-authority secret; pin it so the receipt is hermetic.
+        monkeypatch.setattr(toolchain_authority, "_authority_secret", lambda *_a, **_k: b"k" * 32)
         assemble = quality_review.assemble_reviewer_prompt
         observed = {}
 
@@ -630,11 +633,20 @@ class TestBuildReviewPrompt:
             raise PromptObserved
 
         monkeypatch.setattr(quality_review, "assemble_reviewer_prompt", assemble_then_stop)
-        with pytest.raises(PromptObserved):
-            manager._launch_isolated(
+        # ``pytest.raises`` would discard an early refusal; report it instead
+        # so a lane that returns before prompt assembly names its reason.
+        try:
+            returned = manager._launch_isolated(
                 task_id="TASK_REVIEW_1", runner="claude_worker_reviewer",
                 topic="quality_review", adapter_id="claude_cli", model=None,
                 owner_prompt="", timeout_seconds=30, quality_review_binding=binding,
+            )
+        except PromptObserved:
+            pass
+        else:
+            pytest.fail(
+                "_launch_isolated returned before assembling the reviewer prompt: "
+                f"{returned!r}"
             )
 
         assert observed["packet_root"] == expected_root
@@ -644,13 +656,13 @@ class TestBuildReviewPrompt:
         assert quality_reviewer.REVIEW_PACKET_FILE_ROOT_ENV not in quality_reviewer.os.environ
 
     def test_file_transport_rejects_target_symlink(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, make_symlink
     ):
         packet = _packet_with_findings()
         victim = tmp_path / "victim.json"
         victim.write_text("victim", encoding="utf-8")
         packet_file = tmp_path / "packet.json"
-        packet_file.symlink_to(victim)
+        make_symlink(victim, packet_file)
         monkeypatch.setenv(quality_reviewer.REVIEW_PACKET_FILE_ROOT_ENV, str(tmp_path))
 
         with pytest.raises(ReviewerEvidenceError, match="review_packet_file_symlink"):
@@ -664,14 +676,14 @@ class TestBuildReviewPrompt:
         assert victim.read_text(encoding="utf-8") == "victim"
 
     def test_file_transport_ignores_precreated_predictable_temp_symlink(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, make_symlink
     ):
         packet = _packet_with_findings()
         victim = tmp_path / "victim.json"
         victim.write_text("victim", encoding="utf-8")
         packet_file = tmp_path / "packet.json"
         predictable_old_temp = tmp_path / ".packet.json.tmp"
-        predictable_old_temp.symlink_to(victim)
+        make_symlink(victim, predictable_old_temp)
         monkeypatch.setenv(quality_reviewer.REVIEW_PACKET_FILE_ROOT_ENV, str(tmp_path))
 
         quality_reviewer.build_review_prompt(
