@@ -52,10 +52,13 @@ from typing import Any, Mapping, Sequence
 
 # skill_registry is a pure, standalone, side-effect-free module (no filesystem,
 # store, or lifecycle import), so this keeps the self-contained contract above.
+# source_graph_languages is likewise a dependency-free constant table.
 from . import skill_registry
+from .source_graph_languages import LANGUAGE_BY_EXTENSION
 
 __all__ = [
     "AUDITED_CUSTOM_ESCAPE",
+    "CALLER_VALIDATION_TEMPLATE_NAME",
     "CANONICAL_MINIMALITY_CONTRACT",
     "CANONICAL_VALIDATION_PYTHON",
     "COMMAND_NODE",
@@ -143,6 +146,7 @@ COMMAND_NODE = "node"
 DIFF_CHECK_COMMAND = "git diff --check"
 AUDITED_CUSTOM_ESCAPE = "audited_custom_unclassified"
 CUSTOM_TEMPLATE_NAME = "custom"
+CALLER_VALIDATION_TEMPLATE_NAME = "custom_validation"
 CANONICAL_MINIMALITY_CONTRACT = (
     "Keep changes bounded to the exact card contract. When Source Graph is required, "
     "use a focus or slice query to check an existing repository symbol or primitive "
@@ -161,6 +165,21 @@ _UNSAFE_PATH_CHARS_RE = re.compile(r"[^A-Za-z0-9._+/-]")
 _PATH_LIKE_TOKEN_RE = re.compile(
     r"^(?:\.\.?)$|[/\\]|::|\.(?:py|js|mjs|cjs|ts|tsx|jsx|json|md)$"
 )
+# Every file suffix Source Graph indexes, so a validation-embedded file operand
+# is checked for every registered language, not only Python/Node. The fixed
+# ``_PATH_LIKE_TOKEN_RE`` above is kept verbatim for option tokens
+# (``--config=x.toml``): widening THAT would start refusing option spellings
+# persisted cards already carry, and every classification revalidates them.
+_INDEXED_PATH_SUFFIXES: tuple[str, ...] = tuple(sorted(LANGUAGE_BY_EXTENSION))
+
+
+def _is_path_like_token(token: str) -> bool:
+    """Whether a validation argv token names a path that must be validated."""
+    if _PATH_LIKE_TOKEN_RE.search(token):
+        return True
+    return not token.startswith("-") and token.endswith(_INDEXED_PATH_SUFFIXES)
+
+
 _PYTEST_NODEID_SELECTOR_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # Compiler include-root option whose path payload may be joined (``-Idir``) or
 # separated (``-I dir``); only the payload is validated, never the option prefix.
@@ -329,10 +348,42 @@ _TEMPLATE_SPECS: dict[str, TaskTemplateSpec] = {
         generates_lint=True,
         generates_diff_check=True,
     ),
+    # Language-neutral fallback (NF-2026-01072). The seven templates above only
+    # reason about Python/Node, so a writable PHP/Go/Rust/... card with its own
+    # validation used to end unclassified. This one is tried strictly after
+    # them by ``classify_task_card``, accepts any write targets, and takes its
+    # validation from the caller. It is registered here so the one existing
+    # identity/provenance machinery authenticates it, but it is deliberately
+    # NOT one of the public ``TEMPLATE_IDS``/``TEMPLATE_SPECS`` below: those
+    # stay exactly the seven stable built-ins with byte-identical digests.
+    CALLER_VALIDATION_TEMPLATE_NAME: TaskTemplateSpec(
+        name=CALLER_VALIDATION_TEMPLATE_NAME,
+        title="Caller-validated change",
+        objective=(
+            "Change the explicit write targets in any Source Graph language "
+            "and prove the change with the caller-supplied validation "
+            "commands; the required outputs must change."
+        ),
+        task_type="code",
+        work_kind="generic",
+        read_only=False,
+        production_path_policy=_OPTIONAL,
+        test_path_policy=_OPTIONAL,
+        read_first_fields=("production", "test"),
+        generates_pytest=False,
+        generates_lint=False,
+        generates_diff_check=False,
+    ),
 }
 
-TEMPLATE_SPECS: MappingProxyType = MappingProxyType(_TEMPLATE_SPECS)
-TEMPLATE_IDS: tuple[str, ...] = tuple(_TEMPLATE_SPECS)
+TEMPLATE_SPECS: MappingProxyType = MappingProxyType(
+    {
+        name: spec
+        for name, spec in _TEMPLATE_SPECS.items()
+        if name != CALLER_VALIDATION_TEMPLATE_NAME
+    }
+)
+TEMPLATE_IDS: tuple[str, ...] = tuple(TEMPLATE_SPECS)
 
 
 def _canonical_definition_payload(spec: TaskTemplateSpec) -> str:
@@ -992,6 +1043,26 @@ def with_package_gate(
     return [*commands, gate], [*roles, "generic"]
 
 
+def _caller_validation_commands(
+    validation: Any, write_set: Sequence[str]
+) -> list[str]:
+    """The caller's own non-empty commands, plus the package gate if absent.
+
+    Embedded paths get the same fail-closed checks as any custom validation.
+    The gate is appended exactly as ``with_package_gate`` would, so a card
+    already carrying it expands to its own validation byte for byte.
+    """
+    validate_custom_validation_roles(validation, None)
+    commands = [] if validation is None else list(validation)
+    if not commands or any(not command.strip() for command in commands):
+        raise TaskTemplateError("caller_validation_requires_validation")
+    gate = _package_gate_command(write_set)
+    canonical = {canonical_validation_command(item) for item in commands}
+    if gate is not None and canonical_validation_command(gate) not in canonical:
+        commands.append(gate)
+    return commands
+
+
 def expand_template(
     template_id: Any,
     *,
@@ -1000,6 +1071,8 @@ def expand_template(
     title: Any = None,
     objective: Any = None,
     mandatory_changed_outputs: Sequence[Any] | None = None,
+    validation: Sequence[Any] | None = None,
+    work_kind: Any = None,
 ) -> dict[str, Any]:
     """Expand one template plus explicit bounded paths into card fields.
 
@@ -1016,8 +1089,17 @@ def expand_template(
     authoritative for every template and must be a subset of the write scope:
     only the unresolved DEFAULT was ever the bug, never a caller's deliberate
     choice.
+
+    ``validation`` and ``work_kind`` are accepted ONLY by the language-neutral
+    ``custom_validation`` template, whose validation is caller-supplied by
+    definition; every built-in derives both itself and refuses them. That
+    template also defaults its mandatory outputs to the whole write scope and
+    refuses an empty result, so a writable card always has something to prove.
     """
     spec = resolve_template(template_id)
+    caller_validated = spec.name == CALLER_VALIDATION_TEMPLATE_NAME
+    if not caller_validated and (validation is not None or work_kind is not None):
+        raise TaskTemplateError("template_validation_not_caller_supplied")
     production = _bounded_paths(
         () if production_paths is None else production_paths, "production"
     )
@@ -1026,7 +1108,7 @@ def expand_template(
     if set(production) & set(tests):
         raise TaskTemplateError("duplicate_path_across_fields")
     write_set: list[str] = [] if spec.read_only else [*production, *tests]
-    if spec.name == "bugfix_with_regression":
+    if spec.name == "bugfix_with_regression" or caller_validated:
         mandatory_default: Sequence[Any] = write_set
     elif spec.name == "test_only":
         mandatory_default = tests
@@ -1049,10 +1131,17 @@ def expand_template(
     read_first: list[str] = []
     for field_name in spec.read_first_fields:
         read_first.extend(production if field_name == "production" else tests)
-    validation = _validation_commands_for(spec, production, tests)
+    if caller_validated:
+        if not required_outputs:
+            raise TaskTemplateError("caller_validation_requires_required_outputs")
+        validation = _caller_validation_commands(validation, write_set)
+    else:
+        validation = _validation_commands_for(spec, production, tests)
     resolved_title = spec.title if title is None else title
     resolved_objective = spec.objective if objective is None else objective
-    work_kind = _canonical_work_kind(spec.work_kind)
+    work_kind = _canonical_work_kind(
+        spec.work_kind if work_kind is None else str(work_kind)
+    )
     validation_roles = _validation_roles_for(work_kind, validation)
     return {
         "schema_id": SCHEMA_ID,
@@ -1247,15 +1336,20 @@ def _authenticated_current_provenance(
         return None
     writes = list(card.get("allowed_writes") or [])
     spec = _TEMPLATE_SPECS[name]
-    input_paths = list(card.get("read_first") or []) if spec.read_only else writes
-    production, tests = _partition_write_set(input_paths)
-    try:
-        expected = expand_template(
-            name,
-            production_paths=production,
-            test_paths=tests,
-            mandatory_changed_outputs=list(card.get("required_outputs") or []),
+    if spec.name == CALLER_VALIDATION_TEMPLATE_NAME:
+        expansion_inputs = _caller_validation_inputs(card)
+    else:
+        input_paths = (
+            list(card.get("read_first") or []) if spec.read_only else writes
         )
+        production, tests = _partition_write_set(input_paths)
+        expansion_inputs = {
+            "production_paths": production,
+            "test_paths": tests,
+            "mandatory_changed_outputs": list(card.get("required_outputs") or []),
+        }
+    try:
+        expected = expand_template(name, **expansion_inputs)
     except TaskTemplateError:
         return None
     fields = (
@@ -1375,7 +1469,7 @@ def validate_custom_validation_roles(
                 # Joined include root (``-Idir``): validate only the path payload
                 # so it matches the separated ``-I dir`` form exactly.
                 payload = token[len(_INCLUDE_ROOT_OPTION) :]
-            elif not token or not _PATH_LIKE_TOKEN_RE.search(token):
+            elif not token or not _is_path_like_token(token):
                 continue
             else:
                 payload = token
@@ -1678,6 +1772,22 @@ def _partition_write_set(paths: Sequence[str]) -> tuple[list[str], list[str]]:
     return production, tests
 
 
+def _caller_validation_inputs(card: Mapping[str, Any]) -> dict[str, Any]:
+    """Expansion inputs that reproduce a caller-validated card from its fields.
+
+    The write scope is passed as ONE field in declared order (a language-neutral
+    card has no Python/Node test partition to impose), and validation and work
+    kind are the card's own. Classification and launch authentication both use
+    this, so the two can never re-expand the same card differently.
+    """
+    return {
+        "production_paths": list(card.get("allowed_writes") or []),
+        "mandatory_changed_outputs": list(card.get("required_outputs") or []),
+        "validation": list(card.get("validation") or []),
+        "work_kind": card.get("work_kind") or "generic",
+    }
+
+
 def _custom_escape_provenance(card: Mapping[str, Any]) -> dict[str, Any]:
     expanded_digest = expanded_contract_digest(card)
     payload = {
@@ -1769,6 +1879,11 @@ def classify_task_card(
     for name in TEMPLATE_IDS:
         if name not in seen:
             candidates.append((name, f"compatible_{name}"))
+    # Tried strictly after the seven built-ins, so every card one of them
+    # classifies keeps exactly the identity it had before.
+    candidates.append(
+        (CALLER_VALIDATION_TEMPLATE_NAME, "compatible_caller_supplied_validation")
+    )
     card_view = {
         "allowed_writes": writes,
         "required_outputs": outputs,
@@ -1796,12 +1911,17 @@ def classify_task_card(
         return authenticated
     for name, reason in candidates:
         try:
-            expanded = expand_template(
-                name,
-                production_paths=production,
-                test_paths=tests,
-                mandatory_changed_outputs=outputs,
-            )
+            if name == CALLER_VALIDATION_TEMPLATE_NAME:
+                expanded = expand_template(
+                    name, **_caller_validation_inputs(card_view)
+                )
+            else:
+                expanded = expand_template(
+                    name,
+                    production_paths=production,
+                    test_paths=tests,
+                    mandatory_changed_outputs=outputs,
+                )
         except TaskTemplateError:
             continue
         if (
@@ -1810,6 +1930,14 @@ def classify_task_card(
             or expanded["validation"] != commands
             or expanded["read_only"] is not read_only
         ):
+            continue
+        if (
+            name == CALLER_VALIDATION_TEMPLATE_NAME
+            and expanded["work_kind"] != work_kind
+        ):
+            # Launch re-expands this card and compares work_kind exactly, so a
+            # non-canonical declared kind must not classify here and then fail
+            # authentication later.
             continue
         if first != list(expanded["read_first"]):
             continue

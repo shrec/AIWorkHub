@@ -8,6 +8,7 @@ import pytest
 import aiworkhub.task_templates as task_templates_module
 
 from aiworkhub.quality_evidence import normalize_behavioral_contract
+from aiworkhub.source_graph_languages import LANGUAGE_BY_EXTENSION, LANGUAGE_BY_ID
 from aiworkhub.task_templates import (
     AUDITED_CUSTOM_ESCAPE,
     MAX_PATHS_PER_FIELD,
@@ -2403,3 +2404,170 @@ def test_writable_templates_never_expand_to_zero_validation():
             )
             is None
         )
+
+
+# --- NF-2026-01072: a card with caller validation classifies for every language
+# Source Graph indexes, not only Python/Node. --------------------------------
+
+CALLER_VALIDATED = task_templates_module.CALLER_VALIDATION_TEMPLATE_NAME
+
+
+def _caller_validated_card(path, validation, work_kind="generic"):
+    return {
+        "allowed_writes": [path],
+        "required_outputs": [path],
+        "validation": validation,
+        "validation_roles": _validation_roles_for(work_kind, validation),
+        "work_kind": work_kind,
+        "read_only": False,
+        "read_first": [path],
+    }
+
+
+@pytest.mark.parametrize("language_id", sorted(LANGUAGE_BY_ID))
+def test_writable_card_with_caller_validation_classifies_for_every_language(
+    language_id,
+):
+    extension = LANGUAGE_BY_ID[language_id].extensions[0]
+    path = f"lib/{language_id}/sample{extension}"
+    card = _caller_validated_card(path, [f"check-tool {path}", "git diff --check"])
+
+    provenance = classify_task_card(**card)
+
+    assert provenance["template_name"] == CALLER_VALIDATED
+    assert provenance["classification_reason"] == (
+        "compatible_caller_supplied_validation"
+    )
+    assert provenance["template_full_id"] == template_full_id(CALLER_VALIDATED)
+    # The persisted card re-authenticates through the existing launch path.
+    persisted = {
+        **card,
+        "minimality_contract": task_templates_module.CANONICAL_MINIMALITY_CONTRACT,
+    }
+    assert classify_task_card(**persisted, template_provenance=provenance) == (
+        provenance
+    )
+    validate_template_provenance(provenance, expanded_card=persisted)
+    # A plain JSON receipt (as stored) authenticates against the same card.
+    plain = json.loads(json.dumps(provenance))
+    validate_template_provenance(plain, expanded_card=persisted)
+
+
+def test_caller_validated_template_is_tried_after_and_outside_the_builtins():
+    assert CALLER_VALIDATED not in TEMPLATE_IDS
+    assert CALLER_VALIDATED not in task_templates_module.TEMPLATE_SPECS
+    # A card a built-in classifies keeps the built-in identity.
+    card = expand_template(
+        "bugfix_with_regression",
+        production_paths=["src/a.py"],
+        test_paths=["tests/test_a.py"],
+    )
+    provenance = classify_task_card(
+        **{
+            key: card[key]
+            for key in (
+                "allowed_writes",
+                "required_outputs",
+                "validation",
+                "validation_roles",
+                "work_kind",
+                "read_only",
+                "read_first",
+            )
+        }
+    )
+    assert provenance["template_name"] == "bugfix_with_regression"
+
+
+def test_caller_validated_bugfix_card_carries_its_role_contract():
+    validation = ["go test pkg/fix_test.go", "go vet pkg/fix.go"]
+    card = _caller_validated_card("pkg/fix.go", validation, work_kind="bugfix")
+    assert card["validation_roles"] == ["reproduction", "regression"]
+    provenance = classify_task_card(**card)
+    assert provenance["template_name"] == CALLER_VALIDATED
+    normalize_behavioral_contract("bugfix", validation, card["validation_roles"])
+
+
+def test_caller_validated_card_still_fails_closed_without_its_contract():
+    card = _caller_validated_card("src/app.php", ["php -l src/app.php"])
+    with pytest.raises(TaskTemplateError, match="template_unclassified"):
+        classify_task_card(**{**card, "required_outputs": []})
+    with pytest.raises(TaskTemplateError, match="template_unclassified"):
+        classify_task_card(**{**card, "validation": [], "validation_roles": []})
+    with pytest.raises(TaskTemplateError, match="template_unclassified"):
+        classify_task_card(**{**card, "read_first": []})
+    with pytest.raises(TaskTemplateError, match="template_unclassified"):
+        classify_task_card(**{**card, "work_kind": "implementation"})
+    with pytest.raises(
+        TaskTemplateError, match="caller_validation_requires_required_outputs"
+    ):
+        expand_template(
+            CALLER_VALIDATED,
+            production_paths=["src/app.php"],
+            mandatory_changed_outputs=[],
+            validation=["php -l src/app.php"],
+        )
+    with pytest.raises(TaskTemplateError, match="caller_validation_requires_validation"):
+        expand_template(CALLER_VALIDATED, production_paths=["src/app.php"])
+    with pytest.raises(TaskTemplateError, match="template_validation_not_caller_supplied"):
+        expand_template(
+            "docs_change", production_paths=["docs/a.md"], validation=["x"]
+        )
+
+
+def test_caller_validated_package_change_keeps_the_package_gate():
+    expanded = expand_template(
+        CALLER_VALIDATED,
+        production_paths=["src/aiworkhub/native.rs"],
+        validation=["cargo test"],
+    )
+    gate = " ".join(
+        ["python3", "-m", "pytest", "-q", *task_templates_module.PACKAGE_GATE_TESTS]
+    )
+    assert expanded["validation"] == ["cargo test", gate]
+    assert expanded["required_outputs"] == ["src/aiworkhub/native.rs"]
+    again = expand_template(
+        CALLER_VALIDATED,
+        production_paths=["src/aiworkhub/native.rs"],
+        validation=expanded["validation"],
+    )
+    assert again["validation"] == expanded["validation"]
+
+
+@pytest.mark.parametrize("token", ["index.php", "main.go", "lib.rs"])
+def test_non_python_node_suffix_tokens_are_path_like(token):
+    assert not task_templates_module._PATH_LIKE_TOKEN_RE.search(token)
+    assert task_templates_module._is_path_like_token(token)
+    validate_custom_validation_roles([f"tool {token}"], ["generic"])
+    with pytest.raises(TaskTemplateError, match="invalid_validation_embedded_path"):
+        validate_custom_validation_roles([f"tool ~{token}"], ["generic"])
+
+
+def test_every_indexed_suffix_is_path_like_and_option_tokens_are_unchanged():
+    for extension in LANGUAGE_BY_EXTENSION:
+        assert task_templates_module._is_path_like_token(f"sample{extension}")
+    # Option spellings keep their previous treatment exactly.
+    validate_custom_validation_roles(
+        ["ruff check --config=ruff.toml src/a.py"], ["generic"]
+    )
+
+
+_MAIN_DEFINITION_DIGESTS = {
+    "read_only_analysis": "a13aaaf4cb57d788291f31599aae6eb5e3e84a9e3d4aa203b120eea15e269a12",
+    "bugfix_with_regression": "144663beb289a233ca3922ec62bf7e2f260ef56e3c1a91eb46cae6403384154d",
+    "implementation_with_tests": "4a73174b5cadc839574347d0d71211a3987030f34198648b90a2ff88c5cfd331",
+    "test_only": "db15833762f50b09c183fd049948fc67468c3307cff530bb4e79672d2c928153",
+    "docs_change": "c229a07dc2c947bc63ce355a64f3b992a494ad3b559bee48a7dedf59923f5ad7",
+    "validation_replay": "ad7d166c83379c7c7dd3e3952e123ff791b4ba9e968cd1ae8d7b7cef85a1edf5",
+    "cross_boundary_bugfix": "3696a2f31168415a7fa2f857c8a72626ec04cfe26f7364769c6cde9796e80869",
+}
+
+
+@pytest.mark.parametrize("name", sorted(_MAIN_DEFINITION_DIGESTS))
+def test_builtin_definition_digests_stay_pinned_to_main(name):
+    assert tuple(_MAIN_DEFINITION_DIGESTS) == TEMPLATE_IDS
+    card = expand_template(name, **_TEMPLATE_PATHS[name])
+    assert card["definition_digest"] == _MAIN_DEFINITION_DIGESTS[name]
+    assert template_full_id(name) == (
+        f"{name}@v{REGISTRY_VERSION}:{_MAIN_DEFINITION_DIGESTS[name]}"
+    )
