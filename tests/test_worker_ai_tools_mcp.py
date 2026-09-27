@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import hashlib
+import importlib.util
 import inspect
 import json
 import os
@@ -874,3 +875,156 @@ def test_fit_response_payload_remeasures_telemetry_when_final_pass_is_exhausted(
     }
     assert worker_tools._serialized_response_bytes(result) <= output_cap_bytes
     assert meta["telemetry"]["presented_bytes"] == len(content.encode("utf-8"))
+
+
+# NF-2026-01076: str.splitlines() also breaks on these; JSONL and AST do not.
+_SPLITLINES_ONLY_SEPARATORS = "\u2028\u2029\x85\x0c\x0b\x1c\x1d\x1e"
+
+
+def _nf1076_context(
+    tmp_path: Path, packet_path: Path | None = None
+) -> worker_tools.WorkerToolContext:
+    ledger = tmp_path / "audit.jsonl"
+    ledger.write_text("", encoding="utf-8")
+    key = tmp_path / "audit.key"
+    key.write_bytes(b"k" * 32)
+    return worker_tools.WorkerToolContext(
+        task_id="REVIEW_TASK_1",
+        runner="claude_sonnet5",
+        topic="quality_review",
+        request_id="a" * 32,
+        repo=tmp_path,
+        authority_repo=tmp_path,
+        source_graph_targets=(),
+        session_topic="quality_review",
+        audit_ledger_path=ledger,
+        audit_hmac_key_path=key,
+        quality_review_packet_path=packet_path,
+    )
+
+
+def _nf1076_verify(ctx: worker_tools.WorkerToolContext) -> dict:
+    assert ctx.audit_ledger_path is not None
+    assert ctx.audit_hmac_key_path is not None
+    return worker_tools.verify_audit_ledger(
+        ctx.audit_ledger_path,
+        ctx.audit_hmac_key_path,
+        task_id=ctx.task_id,
+        runner=ctx.runner,
+        topic=ctx.topic,
+        request_id=ctx.request_id,
+    )
+
+
+def test_audit_entry_with_unicode_line_separators_verifies_as_one_entry(
+    tmp_path: Path,
+) -> None:
+    ctx = _nf1076_context(tmp_path)
+    payload = {"summary": f"a{_SPLITLINES_ONLY_SEPARATORS}b", "note": "x\u2028y\u2029z\x85\x0c"}
+    assert worker_tools._append_audit(
+        ctx,
+        tool="quality_review_submit",
+        ok=True,
+        cache_hit=False,
+        hit_count=1,
+        bytes_returned=0,
+        authority_source="runtime",
+        authority_state="process_bound",
+        payload=payload,
+    )
+    raw = ctx.audit_ledger_path.read_bytes()
+    assert raw.count(b"\n") == 1
+    # The separators land raw inside the single JSONL line.
+    assert "\u2028".encode("utf-8") in raw
+
+    report = _nf1076_verify(ctx)
+    assert report["ok"] is True, report
+    assert report["entries_total"] == 1
+    assert report["entries_verified"] == 1
+    assert report["entries_tampered"] == 0
+    assert report["verified_payloads"] == [payload]
+
+
+def test_quality_review_finding_with_line_separators_is_durable(
+    tmp_path: Path,
+) -> None:
+    contract_path = Path(__file__).with_name("test_quality_reviewer_contract.py")
+    spec = importlib.util.spec_from_file_location("_nf1076_qr_contract", contract_path)
+    assert spec is not None and spec.loader is not None
+    contract = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(contract)
+    packet = contract._packet()
+    packet_path = tmp_path / "review_packet.json"
+    packet_path.write_text(json.dumps(packet), encoding="utf-8")
+    ctx = _nf1076_context(tmp_path, packet_path)
+    finding = {
+        "id": "separator-finding",
+        "severity": "high",
+        "summary": "gate\u2028splits\u2029here",
+        "evidence": "src/aiworkhub/core.py:7",
+        "path": "src/aiworkhub/core.py",
+        "line_start": 7,
+        "line_end": 7,
+        "symbol": "src/aiworkhub/core.py.target",
+        "confidence": "high",
+        "evidence_level": "reproduced",
+        "required_validation": "run the focused regression",
+    }
+    result = worker_tools.quality_review_submit(
+        ctx,
+        packet_sha256=str(packet["packet_sha256"]),
+        lens="correctness",
+        findings=[finding],
+    )
+    assert result.get("reason") != "quality_review_submission_not_durable", result
+    assert result["ok"] is True, result
+    assert result["durable"] is True
+
+    report = _nf1076_verify(ctx)
+    assert report["entries_tampered"] == 0
+    findings = report["verified_payloads"][0]["report"]["findings"]
+    assert "\u2028" in findings[0]["summary"]
+    assert "\u2029" in findings[0]["summary"]
+
+
+def test_ast_source_lines_count_only_ast_line_breaks() -> None:
+    text = "a\x0cb\u2028c\r\nd\re\n\n"
+    assert worker_tools._ast_source_lines(text) == ["a\x0cb\u2028c", "d", "e", ""]
+    assert worker_tools._jsonl_lines('{"a":"x\u2028y"}\r\n{}\n') == [
+        '{"a":"x\u2028y"}\r',
+        "{}",
+    ]
+
+
+def test_inline_refresh_body_lines_match_ast_lines_after_formfeed(
+    tmp_path: Path,
+) -> None:
+    source = (
+        "def alpha():\n"
+        '    return "a\x0cb"  # x\u2028y\u2029z\x85w\n'
+        "\x0c\n"
+        "def beta():\n"
+        "    return 2\n"
+    )
+    (tmp_path / "mod.py").write_bytes(source.encode("utf-8"))
+    payload = {
+        "matches": [
+            {
+                "file_path": "mod.py",
+                "qualname": "mod.py.beta",
+                "name": "beta",
+                "kind": "function",
+                "line_start": 1,
+                "line_end": 1,
+                "source": "stale",
+                "freshness": {"state": "stale", "indexed_source_hash": "0" * 64},
+            }
+        ]
+    }
+
+    refreshed = worker_tools._inline_refresh_stale_rows(source_graph, tmp_path, payload)
+
+    assert refreshed == ["mod.py"]
+    row = payload["matches"][0]
+    assert (row["line_start"], row["line_end"]) == (4, 5)
+    assert row["source"] == "def beta():\n    return 2"

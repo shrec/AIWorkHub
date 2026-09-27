@@ -2050,6 +2050,29 @@ def _append_audit(
     return True
 
 
+def _jsonl_lines(text: str) -> list[str]:
+    """Split JSONL text on ``\\n`` only.
+
+    ``str.splitlines`` also breaks on ``\\v``, ``\\f``, ``\\x1c``-``\\x1e``,
+    ``\\x85``, U+2028 and U+2029, which ``json.dumps(ensure_ascii=False)``
+    leaves raw inside one entry. A trailing ``\\r`` is JSON whitespace.
+    """
+
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    return lines
+
+
+def _ast_source_lines(text: str) -> list[str]:
+    """Split source text the way AST line numbers count (``\\n``/``\\r\\n``/``\\r``)."""
+
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    return lines
+
+
 def verify_audit_ledger(
     ledger_path: Path,
     key_path: Path,
@@ -2157,7 +2180,7 @@ def verify_audit_ledger(
         result["reason"] = "audit_key_unreadable"
         return result
     try:
-        lines = ledger_path.read_text(encoding="utf-8").splitlines()
+        lines = _jsonl_lines(ledger_path.read_text(encoding="utf-8"))
     except OSError:
         result["reason"] = "audit_ledger_unreadable"
         return result
@@ -3621,7 +3644,7 @@ def _merge_rework_overlay_payload(
             text = view.sealed_sources.get(relative)
         if text is None:
             raise WorkerToolError(f"rework_overlay_sealed_source_missing:{relative}")
-        lines = text.splitlines()
+        lines = _ast_source_lines(text)
         if mode == "file":
             requested = target or query
             if requested != relative:
@@ -4648,7 +4671,7 @@ def _inline_refresh_stale_rows(
                     if extraction.status in _REWORK_OVERLAY_EXTRACT_OK:
                         found = (
                             extraction,
-                            target.read_text(encoding="utf-8").splitlines(),
+                            _ast_source_lines(target.read_text(encoding="utf-8")),
                         )
         except (OSError, UnicodeDecodeError, ValueError, RuntimeError):
             found = None
