@@ -1879,14 +1879,14 @@ def test_rm33_new_production_and_test_candidates_prepare_read_only_workspace(
 
 
 def test_candidate_authority_does_not_excuse_invalid_canonical_declarations(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, make_symlink
 ) -> None:
     repo = _quality_review_repo(tmp_path, monkeypatch)
     outside = tmp_path / "outside.md"
     outside.write_text("outside\n", encoding="utf-8")
     (repo / "README.md").write_text("readme\n", encoding="utf-8")
     link = repo / "link.md"
-    link.symlink_to("README.md")
+    make_symlink("README.md", link)
 
     for declaration in ("missing.md", "../outside.md", str(outside), "link.md"):
         with pytest.raises(worker_workspace.WorkspaceError):
