@@ -4664,9 +4664,23 @@ def nested_sandbox_requires_host_boundary() -> bool:
     return authenticated_outer_validation_context() is not None
 
 
-def _legacy_worktree_root() -> Path:
-    """Exact pre-repo-runtime root retained only for upgrade-time GC."""
-    return (Path(tempfile.gettempdir()) / "aiworkhub-worktrees").resolve()
+def _legacy_worktree_roots(repo: Path | None) -> tuple[Path, ...]:
+    """Historical %TEMP% worktree roots retained only for upgrade-time GC.
+
+    Covers two pre-current shapes: the flat pre-repo-runtime root
+    ``<tempdir>/aiworkhub-worktrees``, and -- when ``repo`` is known -- the
+    pre-0.11.94 repository-namespaced root
+    ``<tempdir>/aiworkhub-worktrees/<sha256(normcase(resolved repo))[:16]>``
+    that ``configured_worktree_root`` returned on Windows before commit
+    71c2fe4 moved the default to ``<repo>/.aiworkhub/runtime/worktrees``.
+    """
+    flat_root = (Path(tempfile.gettempdir()) / "aiworkhub-worktrees").resolve()
+    if repo is None:
+        return (flat_root,)
+    digest = hashlib.sha256(
+        os.path.normcase(str(Path(repo).resolve())).encode("utf-8")
+    ).hexdigest()[:16]
+    return (flat_root, (flat_root / digest).resolve())
 
 
 def _validation_quality_support(
@@ -6578,7 +6592,7 @@ def assert_gc_safe_workspace_shape(
     """Fail closed unless this is the request's exact configured workspace."""
     if not _REQUEST_ID_RE.fullmatch(request_id):
         raise WorkspaceError(f"gc_invalid_request_id:{request_id}")
-    candidates = (configured_worktree_root(repo), _legacy_worktree_root())
+    candidates = (configured_worktree_root(repo), *_legacy_worktree_roots(repo))
     for root in dict.fromkeys(candidates):
         expected_path = (root / request_id / "worktree").resolve(strict=False)
         expected_home = (root / request_id / "home").resolve(strict=False)

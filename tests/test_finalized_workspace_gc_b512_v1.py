@@ -28,6 +28,7 @@ skipped and reported, never deleted.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
 import signal
@@ -960,6 +961,102 @@ def test_assert_gc_safe_workspace_shape_accepts_legacy_temp_root_for_upgrade_gc(
         worker_workspace.assert_gc_safe_workspace_shape(request_id, path, home)
         == legacy_root.resolve()
     )
+
+
+def test_assert_gc_safe_workspace_shape_accepts_legacy_namespaced_root_for_upgrade_gc(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv(worker_workspace.WORKTREE_ROOT_ENV, raising=False)
+    monkeypatch.delenv(worker_workspace.RUNTIME_ROOT_ENV, raising=False)
+    monkeypatch.setattr(worker_workspace.tempfile, "gettempdir", lambda: str(tmp_path))
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    digest = hashlib.sha256(
+        os.path.normcase(str(repo.resolve())).encode("utf-8")
+    ).hexdigest()[:16]
+    namespaced_root = tmp_path / "aiworkhub-worktrees" / digest
+    request_id = "req-legacy-namespaced"
+    path = namespaced_root / request_id / "worktree"
+    home = namespaced_root / request_id / "home"
+
+    assert (
+        worker_workspace.assert_gc_safe_workspace_shape(
+            request_id, path, home, repo=repo
+        )
+        == namespaced_root.resolve()
+    )
+
+
+def test_assert_gc_safe_workspace_shape_rejects_legacy_namespaced_root_for_another_repo(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv(worker_workspace.WORKTREE_ROOT_ENV, raising=False)
+    monkeypatch.delenv(worker_workspace.RUNTIME_ROOT_ENV, raising=False)
+    monkeypatch.setattr(worker_workspace.tempfile, "gettempdir", lambda: str(tmp_path))
+    repo = tmp_path / "repo"
+    other_repo = tmp_path / "other-repo"
+    repo.mkdir()
+    other_repo.mkdir()
+    other_digest = hashlib.sha256(
+        os.path.normcase(str(other_repo.resolve())).encode("utf-8")
+    ).hexdigest()[:16]
+    other_namespaced_root = tmp_path / "aiworkhub-worktrees" / other_digest
+    request_id = "req-legacy-foreign-namespace"
+    path = other_namespaced_root / request_id / "worktree"
+    home = other_namespaced_root / request_id / "home"
+
+    with pytest.raises(
+        worker_workspace.WorkspaceError, match="gc_workspace_shape_mismatch"
+    ):
+        worker_workspace.assert_gc_safe_workspace_shape(
+            request_id, path, home, repo=repo
+        )
+
+
+def test_assert_gc_safe_workspace_shape_rejects_legacy_namespaced_root_request_id_mismatch(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv(worker_workspace.WORKTREE_ROOT_ENV, raising=False)
+    monkeypatch.delenv(worker_workspace.RUNTIME_ROOT_ENV, raising=False)
+    monkeypatch.setattr(worker_workspace.tempfile, "gettempdir", lambda: str(tmp_path))
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    digest = hashlib.sha256(
+        os.path.normcase(str(repo.resolve())).encode("utf-8")
+    ).hexdigest()[:16]
+    namespaced_root = tmp_path / "aiworkhub-worktrees" / digest
+    request_id = "req-legacy-namespaced-mismatch"
+    path = namespaced_root / "some-other-request" / "worktree"
+    home = namespaced_root / "some-other-request" / "home"
+
+    with pytest.raises(
+        worker_workspace.WorkspaceError, match="gc_workspace_shape_mismatch"
+    ):
+        worker_workspace.assert_gc_safe_workspace_shape(
+            request_id, path, home, repo=repo
+        )
+
+
+def test_assert_gc_safe_workspace_shape_rejects_legacy_namespaced_root_without_repo(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv(worker_workspace.WORKTREE_ROOT_ENV, raising=False)
+    monkeypatch.delenv(worker_workspace.RUNTIME_ROOT_ENV, raising=False)
+    monkeypatch.setattr(worker_workspace.tempfile, "gettempdir", lambda: str(tmp_path))
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    digest = hashlib.sha256(
+        os.path.normcase(str(repo.resolve())).encode("utf-8")
+    ).hexdigest()[:16]
+    namespaced_root = tmp_path / "aiworkhub-worktrees" / digest
+    request_id = "req-legacy-namespaced-no-repo"
+    path = namespaced_root / request_id / "worktree"
+    home = namespaced_root / request_id / "home"
+
+    with pytest.raises(
+        worker_workspace.WorkspaceError, match="gc_workspace_shape_mismatch"
+    ):
+        worker_workspace.assert_gc_safe_workspace_shape(request_id, path, home)
 
 
 def test_assert_gc_safe_workspace_shape_uses_explicit_repo_not_foreign_cwd(
