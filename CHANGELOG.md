@@ -6,7 +6,7 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
-## [0.11.100] - 2026-09-27
+## [0.12.0] - 2026-09-27
 
 ### Fixed
 

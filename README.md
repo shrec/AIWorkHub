@@ -62,7 +62,7 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
-## What's new in 0.11.100
+## What's new in 0.12.0
 
 - Sandboxed validation can create git repositories again, so launcher test suites run inside the sandbox.
 

@@ -14,7 +14,7 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.11.100
+## What's new in 0.12.0
 
 - Sandboxed validation can create git repositories again, so launcher test suites run inside the sandbox.
 
