@@ -3229,7 +3229,7 @@ tbody tr.is-selected td:first-child {
 }
 .manager-chat-tasks-head {
   color: var(--ink-soft);
-  font-size: 12px;
+  font-size: var(--fs-xs);
 }
 #manager-chat-task-filter {
   margin-left: auto;
@@ -3237,8 +3237,7 @@ tbody tr.is-selected td:first-child {
 }
 .manager-chat-task-verb {
   color: var(--ink-soft);
-  font-size: 11px;
-  text-transform: uppercase;
+  font-size: var(--fs-2xs);
 }
 .manager-chat-tasks-list {
   display: flex;
@@ -3246,6 +3245,8 @@ tbody tr.is-selected td:first-child {
   gap: 4px;
   min-height: 0;
   overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
 }
 .manager-chat-task {
   display: block;
@@ -3390,10 +3391,6 @@ tbody tr.is-selected td:first-child {
 @keyframes manager-chat-think {
   0%, 80%, 100% { opacity: 0.25; transform: translateY(0); }
   40% { opacity: 1; transform: translateY(-2px); }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .manager-chat-thinking-dots span { animation: none; opacity: 0.8; }
 }
 
 .manager-chat-marker {
@@ -4052,6 +4049,7 @@ tbody tr.is-selected td:first-child {
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
   }
+  .manager-chat-thinking-dots span { animation: none; opacity: 0.8; }
 }
 
 .live-output-timeline {

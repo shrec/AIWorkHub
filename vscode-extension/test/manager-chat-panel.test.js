@@ -848,7 +848,7 @@ test("tool calls render as fields for every model, not as a JSON blob", () => {
   });
   const text = flattenNodes(node, []).map((part) => String(part.textContent || "")).join("\n");
   assert.match(text, /read_file/);
-  assert.match(text, /a\\.py/);
+  assert.match(text, /a\.py/);
   assert.equal(text.includes('{\"input\"'), false);
 });
 

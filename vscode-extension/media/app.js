@@ -64,6 +64,7 @@ const state = {
   waveMiniRoadmapGeneration: 0,
   waveMiniRoadmapTaskStates: null,
   featureSettings: null,
+  featureSettingsRequested: false,
   settingsPendingIdentity: null,
   settingsCollapsedFamilies: {},
   settingsTab: "features",
@@ -5251,6 +5252,7 @@ function routeTruthSummary(route) {
 }
 
 function renderSettings(payload, options = {}) {
+  state.featureSettingsRequested = false;
   const policyRevision = (value) => {
     const policy = value && value.model_policy;
     if (!policy || policy.ok === false) return 0;
@@ -7448,7 +7450,9 @@ function applyManagerChatSessionUi() {
     const selected = String(elements.managerChatSessionSelect && elements.managerChatSessionSelect.value || "");
     elements.managerChatDeleteSession.disabled = state.managerChatRunning || (!hasSession && !selected);
   }
-  elements.managerChatStatus.classList.toggle("is-live", state.managerChatRunning);
+  if (elements.managerChatStatus && elements.managerChatStatus.classList) {
+    elements.managerChatStatus.classList.toggle("is-live", state.managerChatRunning);
+  }
   elements.managerChatStatusLabel.textContent = state.managerChatRunning ? "Running" + managerChatLiveActivity() : hasSession ? "Idle" : "No session";
   elements.managerChatSessionLine.hidden = false;
   const activeName = String(state.managerChatTitle || state.managerChatSession || "");
@@ -7694,6 +7698,10 @@ window.addEventListener("message", (event) => {
     case "snapshot":
       renderSnapshot(message.payload);
       refreshWaveMiniRoadmapOnTaskChange();
+      // A rebind can drop a pending settings reply with no error at all; the
+      // next live push proves the channel recovered, so a stuck request must
+      // not survive it either.
+      state.featureSettingsRequested = false;
       break;
     case "taskDetail":
       applyTaskDetail(message.payload);
@@ -7706,6 +7714,9 @@ window.addEventListener("message", (event) => {
       break;
     case "error":
       showToast(message.message || "Request failed");
+      // A settings request that ends in a host-side error still ends it --
+      // otherwise the Settings dialog can never retry after a cold MCP call.
+      state.featureSettingsRequested = false;
       if (state.settingsPendingIdentity && /model_setting/.test(String(message.message || ""))) {
         setSettingsPending(null, false);
       }
@@ -8232,7 +8243,8 @@ function openManagerChatDialog() {
 function startManagerChatSidebar() {
   applyManagerChatCollapsed(Boolean(state.managerChatCollapsed));
   if (typeof populateManagerChatModelOptions === "function") populateManagerChatModelOptions();
-  if (!state.featureSettings) {
+  if (!state.featureSettings && !state.featureSettingsRequested) {
+    state.featureSettingsRequested = true;
     vscode.postMessage({ type: "requestSettings" });
   }
   // Opening the chat does not attach a saved session and does not create one.
@@ -8410,7 +8422,10 @@ elements.openSettings.addEventListener("click", () => {
   if (!state.featureSettings && !hasSettingsShell) {
     renderSettingsPlaceholder("Loading repository feature settings");
   }
-  vscode.postMessage({ type: "requestSettings" });
+  if (!state.featureSettingsRequested) {
+    state.featureSettingsRequested = true;
+    vscode.postMessage({ type: "requestSettings" });
+  }
 });
 
 elements.settingsList.addEventListener("change", (event) => {

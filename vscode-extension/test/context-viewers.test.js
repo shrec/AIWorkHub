@@ -630,7 +630,31 @@ test("Settings dialog renders a nonblank loading shell before the first settings
   assert.strictEqual(run("elements.settingsList.children.length > 0"), true);
   assert.match(run("elements.settingsList.textContent"), /Loading repository feature settings/);
   assert.strictEqual(run('elements.settingsList.getAttribute("aria-busy")'), null);
-  assert.deepStrictEqual(run("__posted.map((msg) => msg.type)"), ["ready", "requestSettings"]);
+  // The manager-chat sidebar now starts unconditionally on load and posts its
+  // own status messages (e.g. managerLoopStatus) before any settings-dialog
+  // interaction; this test predates that feature and only cares about the
+  // settings-dialog handshake, so it filters to those message types. The
+  // invariant that still matters -- requestSettings posted at most once while
+  // opening the dialog -- is exactly what this filtered equality enforces.
+  assert.deepStrictEqual(
+    run('__posted.map((msg) => msg.type).filter((type) => type === "ready" || type === "requestSettings")'),
+    ["ready", "requestSettings"],
+  );
+});
+
+test("Settings dialog re-requests settings after a request ends in error", () => {
+  const { run } = buildDomHarness();
+
+  // A host-side error is one of the ways a pending requestSettings can end
+  // without a "settings" reply; it must not leave the dialog stuck refusing
+  // to retry.
+  run('__windowListeners.message.forEach((fn) => fn({ data: { type: "error", message: "x" } }));');
+  run('elements.openSettings._trigger("click", elements.openSettings);');
+
+  assert.deepStrictEqual(
+    run('__posted.map((msg) => msg.type).filter((type) => type === "ready" || type === "requestSettings")'),
+    ["ready", "requestSettings", "requestSettings"],
+  );
 });
 
 test("Models modal preserves pending controls through pending payload, then clears on error and recovery", () => {
