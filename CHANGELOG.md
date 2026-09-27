@@ -6,6 +6,15 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.95] - 2026-09-27
+
+### Fixed
+
+- Upgrade garbage collection accepts worker workspaces left under the pre-0.11.94 repository-namespaced `%TEMP%` root, so rework relaunches and the legacy drain are no longer refused with `gc_workspace_shape_mismatch`.
+- Source Graph repairs a damaged full-text index in place instead of staying stale.
+- Terminal failures keep their measured launcher and sandbox classes instead of collapsing into `runtime_error`.
+- OpenCode configuration, TOML quoting and protocol line coercion each have one owner again, clearing the copied-helper drift on main.
+
 ## [0.11.94] - 2026-09-27
 
 ### Fixed

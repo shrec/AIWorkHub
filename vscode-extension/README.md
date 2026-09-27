@@ -14,6 +14,11 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.11.95
+
+- Rework relaunch and upgrade GC work again for workspaces created before the sandbox moved into the repository.
+- Source Graph self-repairs a damaged full-text index; terminal failures keep their measured cause.
+
 ## What's new in 0.11.94
 
 - Windows AppContainer worker sandboxes moved from `%TEMP%` into the repository; launches no longer touch C: permissions.
