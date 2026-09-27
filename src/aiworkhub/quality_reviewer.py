@@ -12,7 +12,7 @@ import re
 import sys
 import sysconfig
 import tempfile
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 from typing import Any, NotRequired, TypedDict
 
@@ -175,6 +175,16 @@ QUALITY_REVIEW_FINDING_SCHEMA_DOC = (
 QUALITY_REVIEW_SUBMIT_TOOL_DESCRIPTION = (
     "Submit findings for the exact coordinator-bound review packet. "
     + QUALITY_REVIEW_FINDING_SCHEMA_DOC
+)
+# NF-2026-01057: a review that surfaces one new defect per round turns one card
+# into many rework rounds, so the whole changed scope is judged in one pass.
+EXHAUSTIVE_SINGLE_PASS_INSTRUCTION = (
+    "Review exhaustively in a single pass: examine every changed hunk in the "
+    "whole changed scope and its adjacent failure modes (callers, edge cases, "
+    "error paths, tests) before submitting, and list every defect you find, at "
+    "every severity, in this one report. Do not stop at the first defect and do "
+    "not hold findings back for a later round; a defect that was visible now "
+    "and reported only in a later round costs a full rework cycle. "
 )
 
 
@@ -959,6 +969,7 @@ def build_review_prompt(
         f"{overlay_instruction}"
         f"{_ALREADY_ESTABLISHED_MECHANICALLY}"
         "Report only concrete items supported by file/line or check evidence. "
+        f"{EXHAUSTIVE_SINGLE_PASS_INSTRUCTION}"
         f"{QUALITY_REVIEW_FINDING_SCHEMA_DOC}\n"
         f"Finish by calling {submit_tool_name} exactly once with "
         f'{{"packet_sha256":"{packet_digest}","lens":"{lens}","findings":[...]}}. '
@@ -989,6 +1000,7 @@ def normalize_packet_findings(
     *,
     lens: str,
     findings: Iterable[Mapping[str, Any]],
+    symbol_resolver: SymbolResolver | None = None,
 ) -> list[dict[str, Any]]:
     """Bind reviewer findings to exact paths/checks in one scoped packet.
 
@@ -1198,6 +1210,7 @@ def normalize_packet_findings(
                 authorized_repo_replacements=authorized_repo_replacements,
                 changed_paths=changed_paths,
                 changed_source_lines=changed_source_lines,
+                symbol_resolver=symbol_resolver,
             )
         derived_level = (
             EvidenceLevel.STATIC_EVIDENCE
@@ -1526,6 +1539,74 @@ def _authorized_overbuild_replacements(
                 if value:
                     replacements.add(value)
     return replacements
+
+
+SymbolResolver = Callable[[str], list[Mapping[str, Any]]]
+
+
+def canonical_index_symbol_resolver(repo_root: Path) -> SymbolResolver:
+    """Return a resolver over ``repo_root``'s canonical Source Graph index.
+
+    The resolver answers the entities whose qualname is exact. A missing or
+    unreadable index answers "no rows": it can never bind a replacement, so
+    the finding stays refused.
+    """
+
+    def resolve(qualname: str) -> list[Mapping[str, Any]]:
+        try:
+            from . import source_graph
+
+            db_path = source_graph.resolve_db_path(Path(repo_root))
+            if not db_path.is_file():
+                return []
+            conn = source_graph.connect(db_path, read_only=True)
+            try:
+                rows = conn.execute(
+                    "SELECT file_path, line_start, line_end FROM entities "
+                    "WHERE qualname = ? LIMIT 2",
+                    (qualname,),
+                ).fetchall()
+            finally:
+                conn.close()
+        except Exception:
+            return []
+        return [dict(row) for row in rows]
+
+    return resolve
+
+
+def _index_proves_preexisting_replacement(
+    replacement: str,
+    *,
+    symbol_resolver: SymbolResolver | None,
+    changed_paths: set[str],
+) -> bool:
+    """Bind an out-of-packet replacement on index proof, never on the claim.
+
+    Without a resolver nothing outside the packet can bind. The qualname must
+    resolve to exactly one indexed entity in a file the candidate did not
+    change: canonical index rows carry pre-candidate line numbers, so a row in
+    a changed file cannot prove the symbol pre-exists.
+    """
+
+    if symbol_resolver is None:
+        return False
+    rows = symbol_resolver(replacement)
+    if len(rows) != 1 or not isinstance(rows[0], Mapping):
+        return False
+    row = rows[0]
+    path = str(row.get("file_path") or "").strip()
+    start = row.get("line_start")
+    end = row.get("line_end")
+    return (
+        bool(path)
+        and path not in changed_paths
+        and isinstance(start, int)
+        and not isinstance(start, bool)
+        and isinstance(end, int)
+        and not isinstance(end, bool)
+        and start <= end
+    )
 
 
 def _changed_line_reference(
@@ -2133,6 +2214,7 @@ def _validate_overbuild_finding(
     authorized_repo_replacements: set[str],
     changed_paths: set[str],
     changed_source_lines: Mapping[str, list[tuple[int, int]]],
+    symbol_resolver: SymbolResolver | None = None,
 ) -> None:
     if disposition != "defect":
         raise ReviewerEvidenceError(
@@ -2173,7 +2255,13 @@ def _validate_overbuild_finding(
                 f"review_finding_{index}_overbuild_replacement_required"
             )
         if category == "duplicate_existing_symbol":
-            if replacement not in authorized_repo_replacements:
+            if replacement not in authorized_repo_replacements and not (
+                _index_proves_preexisting_replacement(
+                    replacement,
+                    symbol_resolver=symbol_resolver,
+                    changed_paths=changed_paths,
+                )
+            ):
                 raise ReviewerEvidenceError(
                     f"review_finding_{index}_overbuild_replacement_unbound"
                 )

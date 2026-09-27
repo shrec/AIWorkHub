@@ -299,6 +299,19 @@ class TestBuildReviewPrompt:
         assert "must not be downgraded for minimality" in prompt
 
     @pytest.mark.parametrize("lens", ["correctness", "security", "code_quality"])
+    def test_prompt_requires_exhaustive_single_pass_report(self, lens):
+        prompt = quality_reviewer.build_review_prompt(
+            _packet_with_findings(), lens=lens
+        )
+
+        assert quality_reviewer.EXHAUSTIVE_SINGLE_PASS_INSTRUCTION in prompt
+        assert "Review exhaustively in a single pass" in prompt
+        assert "whole changed scope and its adjacent failure modes" in prompt
+        assert "list every defect you find" in prompt
+        assert "in this one report" in prompt
+        assert "Do not stop at the first defect" in prompt
+
+    @pytest.mark.parametrize("lens", ["correctness", "security", "code_quality"])
     def test_prompt_delivers_the_lens_scope_once_inside_the_sealed_packet(self, lens):
         """The scope reaches the reviewer exactly once, inside the packet.
 
@@ -1501,6 +1514,88 @@ class TestNormalizePacketFindings:
                     "replacement": "module.new_helper",
                 }],
             )
+
+    @staticmethod
+    def _duplicate_finding(replacement: str, **extra) -> dict:
+        return {
+            "severity": "low",
+            "category": "duplicate_existing_symbol",
+            "summary": "The changed helper duplicates a pre-existing symbol.",
+            "evidence": "Source Graph and diff show src/module.py:12",
+            "replacement": replacement,
+            **extra,
+        }
+
+    def test_duplicate_replacement_binds_indexed_symbol_outside_packet(self):
+        packet = _packet_with_changed_source()
+        scope = packet["candidate"]["scoped_audits"]["code_quality"]["packet"]
+        scope["target_symbols"] = []
+        queried: list[str] = []
+        row = {"file_path": "src/other.py", "line_start": 40, "line_end": 55}
+
+        def resolver(qualname: str) -> list[dict]:
+            queried.append(qualname)
+            return [row] if qualname == "src/other.py.existing_helper" else []
+
+        result = quality_reviewer.normalize_packet_findings(
+            packet,
+            lens="code_quality",
+            findings=[self._duplicate_finding("src/other.py.existing_helper")],
+            symbol_resolver=resolver,
+        )
+
+        assert queried == ["src/other.py.existing_helper"]
+        assert result[0]["replacement"] == "src/other.py.existing_helper"
+        assert result[0]["category"] == "duplicate_existing_symbol"
+
+    @pytest.mark.parametrize(
+        "rows",
+        [
+            [],
+            [{"file_path": "src/module.py", "line_start": 13, "line_end": 13}],
+            [{"file_path": "src/module.py", "line_start": 10, "line_end": 20}],
+            [{"file_path": "src/module.py", "line_start": 14, "line_end": 30}],
+            [{"file_path": "src/module.py", "line_start": 30, "line_end": 44}],
+            [{"file_path": "src/module.py", "line_start": 1, "line_end": 11}],
+            [{"file_path": "", "line_start": 40, "line_end": 55}],
+            [{"file_path": "src/other.py", "line_start": None, "line_end": 55}],
+            [{"file_path": "src/other.py", "line_start": 55, "line_end": 40}],
+            [
+                {"file_path": "src/other.py", "line_start": 40, "line_end": 55},
+                {"file_path": "src/third.py", "line_start": 1, "line_end": 5},
+            ],
+        ],
+    )
+    def test_duplicate_replacement_refuses_unknown_or_changed_span_symbol(self, rows):
+        packet = _packet_with_changed_source()
+        scope = packet["candidate"]["scoped_audits"]["code_quality"]["packet"]
+        scope["target_symbols"] = []
+
+        with pytest.raises(ReviewerEvidenceError, match="overbuild_replacement_unbound"):
+            quality_reviewer.normalize_packet_findings(
+                packet,
+                lens="code_quality",
+                findings=[self._duplicate_finding("src/module.py.helper")],
+                symbol_resolver=lambda qualname: rows,
+            )
+
+    def test_duplicate_replacement_without_resolver_refuses_out_of_packet(self):
+        packet = _packet_with_changed_source()
+        packet["candidate"]["scoped_audits"]["code_quality"]["packet"][
+            "target_symbols"
+        ] = []
+
+        with pytest.raises(ReviewerEvidenceError, match="overbuild_replacement_unbound"):
+            quality_reviewer.normalize_packet_findings(
+                packet,
+                lens="code_quality",
+                findings=[self._duplicate_finding("src/other.py.existing_helper")],
+            )
+
+    def test_canonical_index_resolver_without_index_returns_no_rows(self, tmp_path):
+        resolver = quality_reviewer.canonical_index_symbol_resolver(tmp_path)
+
+        assert resolver("src/other.py.existing_helper") == []
 
     def test_handrolled_replacement_rejects_locationless_impact_evidence(self):
         packet = _packet_with_changed_source()
