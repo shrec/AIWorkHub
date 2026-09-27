@@ -1,5 +1,11 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.100 — 2026-09-27
+
+### Fixed
+
+- The Windows AppContainer git helper temp directory no longer uses 8.3-shaped path components, so in-container `git init` stops failing with rc=128 on the traverse-only sandbox root (NF-2026-01053).
+
 ## 0.11.99 — 2026-09-27
 
 ### Fixed
