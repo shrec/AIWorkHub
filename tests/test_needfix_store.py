@@ -120,6 +120,65 @@ def test_unknown_status_fails_safe_to_active():
     assert "unrecognised" in st["reason"]
 
 
+# --- foreign_origin_card: positive manager evidence on an absent card -------
+
+def test_absent_card_without_tag_stays_active():
+    row = _row(converted_task_id="T-ghost", tags=[])
+    st = derive_active_state(row, _get({}), _status())
+    assert st["state"] == "active" and st["active"] is True
+    assert "no longer exists" in st["reason"]
+
+
+def test_absent_card_with_unrelated_tag_stays_active():
+    row = _row(converted_task_id="T-ghost", tags=["markdown_intake"])
+    st = derive_active_state(row, _get({}), _status())
+    assert st["state"] == "active" and st["active"] is True
+
+
+def test_absent_card_with_foreign_origin_tag_is_hidden():
+    row = _row(converted_task_id="T-ghost", tags=[needfix_store.FOREIGN_ORIGIN_CARD_TAG])
+    st = derive_active_state(row, _get({}), _status())
+    assert st["state"] == "foreign_card_unverified"
+    assert st["active"] is False
+    assert "T-ghost" in st["reason"]
+    assert needfix_store.FOREIGN_ORIGIN_CARD_TAG in st["reason"]
+
+
+def test_foreign_origin_tag_with_existing_card_derives_from_card():
+    row = _row(converted_task_id="T-1", tags=[needfix_store.FOREIGN_ORIGIN_CARD_TAG])
+    st = derive_active_state(row, _get({"T-1": _card("pending")}), _status())
+    assert st == {
+        "state": "owned",
+        "active": False,
+        "reason": "owned by pending task 'T-1'",
+    }
+
+
+def test_foreign_origin_tag_with_raising_lookup_stays_active():
+    row = _row(converted_task_id="T-ghost", tags=[needfix_store.FOREIGN_ORIGIN_CARD_TAG])
+
+    def raising_get_task(task_id: str):
+        raise RuntimeError("transient lookup failure")
+
+    st = derive_active_state(row, raising_get_task, _status())
+    assert st["state"] == "active" and st["active"] is True
+    assert "no longer exists" in st["reason"]
+
+
+@pytest.mark.parametrize(
+    "malformed_tags", ["not-json{{{", '"a-json-string"', 42, {"a": 1}]
+)
+def test_malformed_tags_value_is_treated_as_untagged(malformed_tags):
+    row = _row(converted_task_id="T-ghost", tags=malformed_tags)
+    st = derive_active_state(row, _get({}), _status())
+    assert st["state"] == "active" and st["active"] is True
+
+
+def test_active_state_definition_names_foreign_card_state_and_tag():
+    assert "foreign_card_unverified" in ACTIVE_STATE_DEFINITION
+    assert needfix_store.FOREIGN_ORIGIN_CARD_TAG in ACTIVE_STATE_DEFINITION
+
+
 # --- link_existing_task relaxation ------------------------------------------
 
 def test_link_existing_task_accepts_owned_status(init: Path):
@@ -490,8 +549,11 @@ def test_legacy_row_has_explicitly_absent_caused_by(init: Path):
 
 
 def _git(cwd: Path, *args: str) -> str:
+    # cwd= as well as -C: git resolves getcwd() on the inherited directory
+    # before applying -C, and a sandboxed pytest cwd may not be resolvable.
     result = subprocess.run(
         ["git", "-c", "user.email=t@t", "-c", "user.name=t", "-C", str(cwd), *args],
+        cwd=str(cwd),
         check=True,
         capture_output=True,
         text=True,
@@ -501,7 +563,13 @@ def _git(cwd: Path, *args: str) -> str:
 
 @pytest.fixture
 def git_repo(repo_root: Path) -> Path:
-    _git(repo_root, "init", "-q")
+    try:
+        _git(repo_root, "init", "-q")
+    except subprocess.CalledProcessError as exc:
+        pytest.skip(
+            f"git init unavailable (rc={exc.returncode}): "
+            f"{(exc.stderr or '')[:300]}"
+        )
     (repo_root / "a.txt").write_text("a", encoding="utf-8")
     _git(repo_root, "add", "a.txt")
     _git(repo_root, "commit", "-q", "-m", "c0")

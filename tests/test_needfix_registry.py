@@ -1235,9 +1235,38 @@ class TestLinkExistingTask:
 
         assert result["converted_task_id"] == "task-1"
         assert result["integrated_commit"] == verified_oid
+        # The FIRST link's receipt already reports the resolution, matching
+        # the identical retry below.
+        assert result["resolved"] is True
+        assert result["already_converted"] is False
         events = needfix_store.list_events(init_store, r["id"])
         claim_event = next(e for e in events if e["event"] == "existing_task_link_claimed")
         assert claim_event["detail"]["integrated_commit"] == verified_oid
+
+        # The verified oid resolves the NeedFix in the same transaction --
+        # derive_active_state must never get a chance to reopen an
+        # intermediate task_created linked to a superseded card.
+        nr = needfix_store.get_needfix(init_store, r["id"])
+        assert nr["status"] == "resolved"
+        assert nr["resolved_at"] is not None
+        assert f"git:{verified_oid}" in nr["evidence_refs"]
+        resolved_event = next(e for e in events if e["event"] == "integrated_commit_resolved")
+        assert resolved_event["detail"]["integrated_commit"] == verified_oid
+
+        # An identical retry short-circuits via the existing resolved branch:
+        # same receipt shape as any other resolved re-link, no new event.
+        retry = needfix_store.link_existing_task(
+            init_store, r["id"], "task-1", get_task_fn, status_fn,
+            integrated_commit="abc1234",
+            verify_commit_fn=lambda commit: verified_oid if commit == "abc1234" else None,
+        )
+        assert retry == {
+            "needfix_id": r["id"],
+            "converted_task_id": "task-1",
+            "already_converted": True,
+            "resolved": True,
+        }
+        assert needfix_store.list_events(init_store, r["id"]) == events
 
     def test_link_existing_task_archived_superseded_without_integrated_commit_fails(
         self, init_store: Path

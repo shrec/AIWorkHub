@@ -11,7 +11,9 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import sqlite3
 import stat
+import subprocess
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -672,6 +674,307 @@ def _reconcile_links_on_read(
         pass
 
 
+# Upper bound on commits scanned per read for the commit-trailer resolve
+# reconcile, and the key ``needfix_meta`` stores the last reconciled HEAD
+# under. Mirrors ``_RECONCILE_CARD_SCAN_LIMIT``'s bounded-per-read shape: the
+# scan runs on the read an operator waits on, so it is capped and skipped
+# entirely once the repository is at the last-seen HEAD.
+_COMMIT_TRAILER_META_KEY = "commit_trailer_last_head"
+_COMMIT_TRAILER_MAX_COUNT = 200
+_COMMIT_TRAILER_GIT_TIMEOUT_SECONDS = 15
+_COMMIT_TRAILER_NF_ID_RE = re.compile(r"\bNF-\d{4}-\d{5}\b")
+
+
+def _git_rev_parse_head(repo: Path) -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"],
+            cwd=str(repo),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=_COMMIT_TRAILER_GIT_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    head = result.stdout.strip()
+    return head or None
+
+
+def _git_rev_list_oldest_first(
+    repo: Path, rev_args: list[str]
+) -> list[tuple[str, tuple[str, ...]]] | None:
+    """Return ``(sha, parents)`` for the commits selected by ``rev_args``,
+    oldest-first in topological order, so every in-range ancestor of a commit
+    precedes it. ``None`` on any git failure except a timeout:
+    ``subprocess.TimeoutExpired`` propagates so the caller can tell an
+    unbounded enumeration apart from a transient failure.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "git", "-C", str(repo), "rev-list", "--topo-order", "--reverse",
+                "--parents", *rev_args,
+            ],
+            cwd=str(repo),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=_COMMIT_TRAILER_GIT_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        raise
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    commits: list[tuple[str, tuple[str, ...]]] = []
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if fields:
+            commits.append((fields[0], tuple(fields[1:])))
+    return commits
+
+
+def _git_known_commits(repo: Path, boundaries: list[str]) -> list[str] | None:
+    """Return the ``boundaries`` git knows as commits, in input order, from one
+    ``git cat-file --batch-check``; an output line ending in `` missing`` marks
+    that boundary unknown. ``None`` on any git failure.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo), "cat-file", "--batch-check"],
+            input="".join(f"{sha}^{{commit}}\n" for sha in boundaries),
+            cwd=str(repo),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=_COMMIT_TRAILER_GIT_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    lines = result.stdout.splitlines()
+    if len(lines) != len(boundaries):
+        return None
+    return [
+        sha
+        for sha, line in zip(boundaries, lines, strict=True)
+        if not line.endswith(" missing")
+    ]
+
+
+def _git_rev_list_newest_window(repo: Path, head: str) -> list[str] | None:
+    """Return at most ``_COMMIT_TRAILER_MAX_COUNT`` commits reachable from
+    ``head``, oldest-first. No ``--topo-order``/``--reverse``, so git stops
+    walking after the cap instead of enumerating the whole history; the
+    reversal happens here. ``None`` on any git failure.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "git", "-C", str(repo), "rev-list",
+                f"--max-count={_COMMIT_TRAILER_MAX_COUNT}", head,
+            ],
+            cwd=str(repo),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=_COMMIT_TRAILER_GIT_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    newest_first = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    return list(reversed(newest_first))
+
+
+def _git_resolves_trailer_log(repo: Path, shas: list[str]) -> list[tuple[str, str]] | None:
+    """Return ``(sha, trailer_value)`` pairs for exactly the commits ``shas``
+    (no history walk), reading ONLY the structured ``Resolves`` git trailer --
+    never the free-text commit body -- via git's own trailer parser. ``None``
+    on any git failure.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "git", "-C", str(repo), "log", "--no-walk=unsorted", "--stdin",
+                "--format=%x1e%H%x1f%(trailers:key=Resolves,valueonly,unfold)",
+            ],
+            input="".join(f"{sha}\n" for sha in shas),
+            cwd=str(repo),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=_COMMIT_TRAILER_GIT_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    entries: list[tuple[str, str]] = []
+    for record in result.stdout.split("\x1e"):
+        if not record:
+            continue
+        sha, _, trailer_value = record.partition("\x1f")
+        sha = sha.strip()
+        if sha:
+            entries.append((sha, trailer_value))
+    return entries
+
+
+def _git_rev_list_unseen(
+    repo: Path, head: str, boundaries: list[str]
+) -> tuple[list[tuple[str, tuple[str, ...]]] | None, bool]:
+    """List ``head --not <boundaries>`` oldest-first; the flag is True only
+    when the listing timed out (as opposed to any other git failure).
+    """
+    try:
+        return _git_rev_list_oldest_first(repo, [head, "--not", *boundaries]), False
+    except subprocess.TimeoutExpired:
+        return None, True
+
+
+def _reconcile_commit_trailers_on_read(repo: Path) -> None:
+    """Bounded, idempotent read-time reconcile from HEAD-reachable commit trailers.
+
+    A ``Resolves: NF-YYYY-NNNNN`` git trailer resolves that NeedFix exactly
+    like a manager's verified direct resolution
+    (:func:`needfix_store.resolve_from_commit_trailer`) -- read via git's own
+    trailer parser, so a free-text body mention never qualifies. Lists the
+    unseen range ``HEAD --not <boundaries>`` oldest-first (topological) and
+    reads trailers for at most the oldest ``_COMMIT_TRAILER_MAX_COUNT``
+    commits per read. ``needfix_meta`` stores a space-separated set of
+    boundary shas (a legacy single-sha value is a one-element set) and
+    collapses to HEAD alone once the whole range fit. Otherwise it stores the
+    old boundaries plus the batch heads (batch commits no other batch commit
+    names as a parent); every batch commit is an ancestor-or-self of a stored
+    boundary, so the next read excludes exactly the batch just scanned --
+    progress is exactly the cap per read, with no rescans, nothing past the
+    cap lost, and no livelock across merges whose sides each exceed the cap.
+    An old boundary that is a parent of a batch commit is dropped: a stored
+    batch head already covers it. An unchanged repository triggers no git log
+    at all. When the incremental listing fails, the boundaries are classified
+    with one ``git cat-file --batch-check``: only a boundary git reports
+    unknown (rewritten history, or a value synced from another clone) is
+    dropped and the listing retried with the known rest; a non-timeout
+    transient failure (busy repository) with every boundary known leaves meta
+    unchanged so the next read retries, and nothing unscanned is skipped.
+    With no boundaries -- a first read, or every boundary unknown -- history
+    is NOT enumerated: ``git rev-list
+    --max-count`` lists only the newest ``_COMMIT_TRAILER_MAX_COUNT`` commits
+    (git stops at the cap), their trailers are read, and HEAD is stored. The
+    ``Resolves:`` trailer convention starts with this feature, so the first
+    read backfills only that bounded window of the newest commits; older
+    history is intentionally not scanned. The same bounded window is used
+    when the incremental listing itself times out
+    (``_COMMIT_TRAILER_GIT_TIMEOUT_SECONDS``) with every boundary known: the
+    unbounded range would time out again on every later read, so the read
+    scans the newest window and stores HEAD instead. Accepted loss: unseen
+    commits older than that window are never scanned for trailers; the
+    manager can still resolve those NeedFix records directly. A resolve that
+    fails with ``sqlite3.OperationalError`` (say "database is locked") is
+    retryable: the read stops and keeps meta unchanged, and the idempotent
+    resolve re-runs on the next read. Any other resolve exception is
+    deterministic and skipped so it cannot stall later trailers.
+    Best-effort: any other git failure -- no repository, no git binary -- is
+    a silent no-op, never raised into a read.
+    """
+    try:
+        head = _git_rev_parse_head(repo)
+        if not head:
+            return
+        conn = needfix_store._connect(repo)
+        try:
+            stored = needfix_store._get_meta(conn, _COMMIT_TRAILER_META_KEY)
+        finally:
+            conn.close()
+        boundaries = list(dict.fromkeys((stored or "").split()))
+        if boundaries == [head]:
+            return
+        commits = None
+        if boundaries:
+            commits, timed_out = _git_rev_list_unseen(repo, head, boundaries)
+            if commits is None:
+                known = _git_known_commits(repo, boundaries)
+                if known is None:
+                    # git itself failing: keep meta so the next read retries.
+                    return
+                if known != boundaries:
+                    boundaries = known
+                    if boundaries:
+                        commits, timed_out = _git_rev_list_unseen(
+                            repo, head, boundaries
+                        )
+                if commits is None and boundaries:
+                    if not timed_out:
+                        # A non-timeout transient failure with every boundary
+                        # valid: keep meta so the next read retries.
+                        return
+                    # The range enumeration exceeded the timeout; retrying it
+                    # would stall every later read, so take the bounded
+                    # newest window below instead.
+                    boundaries = []
+        if not boundaries:
+            window = _git_rev_list_newest_window(repo, head)
+            if window is None:
+                return
+            commits = [(sha, ()) for sha in window]
+        if commits is None:
+            return
+        batch = commits[:_COMMIT_TRAILER_MAX_COUNT]
+        if batch:
+            entries = _git_resolves_trailer_log(repo, [sha for sha, _ in batch])
+            if entries is None:
+                return
+            for sha, trailer_value in entries:
+                for nfid in _COMMIT_TRAILER_NF_ID_RE.findall(trailer_value):
+                    # Two failure classes. sqlite3.OperationalError (a locked
+                    # or busy database) is retryable: stop without advancing
+                    # the watermark; the resolve is idempotent, so the next
+                    # read re-scans this batch safely. Anything else (say a
+                    # corrupt evidence row) is deterministic: skip it so it
+                    # cannot hold the watermark and stall every later
+                    # trailer; the manager can still resolve it through
+                    # needfix_link_existing_task.
+                    try:
+                        needfix_store.resolve_from_commit_trailer(repo, nfid, sha)
+                    except sqlite3.OperationalError:
+                        return
+                    except Exception:
+                        continue
+        if len(commits) <= _COMMIT_TRAILER_MAX_COUNT:
+            new_value = head
+        else:
+            batch_parents = {parent for _, parents in batch for parent in parents}
+            kept = [sha for sha in boundaries if sha not in batch_parents]
+            batch_heads = [sha for sha, _ in batch if sha not in batch_parents]
+            new_value = " ".join(dict.fromkeys([*kept, *batch_heads]))
+        conn = needfix_store._connect(repo)
+        try:
+            needfix_store._set_meta(conn, _COMMIT_TRAILER_META_KEY, new_value)
+        finally:
+            conn.close()
+    except Exception:
+        # Best-effort, same as _reconcile_links_on_read: an unreconciled
+        # commit simply stays unreconciled rather than corrupting the read.
+        pass
+
+
 def _derive_active_surface(
     repo: Path,
     *,
@@ -704,6 +1007,7 @@ def _derive_active_surface(
         list_task_cards_fn,
         include_archived=include_archived,
     )
+    _reconcile_commit_trailers_on_read(repo)
     return {
         "get_task_fn": get_task_fn,
         "canonical_status_fn": canonical_status_fn,

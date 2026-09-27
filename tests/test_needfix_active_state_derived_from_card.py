@@ -83,6 +83,16 @@ def _linked(repo_root: Path, title: str, task_id: str | None) -> dict[str, Any]:
     return needfix_store.get_needfix(repo_root, rec["id"])
 
 
+def _linked_with_tags(
+    repo_root: Path, title: str, task_id: str | None, tags: list[str]
+) -> dict[str, Any]:
+    rec = needfix_store.capture_proposal(
+        repo_root, title=title, description=title, tags=tags
+    )
+    _set_converted(repo_root, rec["id"], task_id)
+    return needfix_store.get_needfix(repo_root, rec["id"])
+
+
 def _active_ids(init_store: Path, cards: Mapping[str, Mapping[str, Any]]) -> set[str]:
     report = needfix_store.list_active_needfix(
         init_store, get_task_fn=_get_task_fn(cards), canonical_status_fn=_canonical_status_fn()
@@ -179,6 +189,53 @@ def test_missing_card_is_active_not_owned(init_store: Path):
     assert found[0]["derived_state"] == "active"
     assert found[0]["active"] is True
     assert "no longer exists" in found[0]["active_reason"]
+
+
+# --- 3b. Manager-tagged foreign-origin card: absent card additionally hides --
+
+def test_tagged_foreign_origin_card_absent_is_hidden_with_reason(init_store: Path):
+    rec = _linked_with_tags(
+        init_store, "foreign-origin", "T-foreign-ghost",
+        [needfix_store.FOREIGN_ORIGIN_CARD_TAG],
+    )
+    cards: dict[str, Mapping[str, Any]] = {}
+
+    active = _active_ids(init_store, cards)
+    assert rec["id"] not in active
+
+    listing = needfix_store.list_needfix(
+        init_store, get_task_fn=_get_task_fn(cards), canonical_status_fn=_canonical_status_fn()
+    )
+    found = [r for r in listing if r["id"] == rec["id"]][0]
+    assert found["derived_state"] == "foreign_card_unverified"
+    assert found["active"] is False
+    assert "T-foreign-ghost" in found["active_reason"]
+    assert needfix_store.FOREIGN_ORIGIN_CARD_TAG in found["active_reason"]
+
+
+def test_active_only_list_and_count_exclude_only_tagged_foreign_rows(init_store: Path):
+    tagged = _linked_with_tags(
+        init_store, "foreign-origin-2", "T-foreign-ghost-2",
+        [needfix_store.FOREIGN_ORIGIN_CARD_TAG],
+    )
+    untagged_dangling = _linked(init_store, "untagged-dangling", "T-untagged-ghost")
+    live = needfix_store.capture_proposal(
+        init_store, title="still-open", description="live"
+    )["id"]
+    cards: dict[str, Mapping[str, Any]] = {}
+
+    active = _active_ids(init_store, cards)
+    assert tagged["id"] not in active
+    assert untagged_dangling["id"] in active
+    assert live in active
+
+    counted = needfix_store.count_needfix(
+        init_store,
+        get_task_fn=_get_task_fn(cards),
+        canonical_status_fn=_canonical_status_fn(),
+        active_only=True,
+    )
+    assert counted == len(active) == 2
 
 
 # --- 4. Derived at read time; report states no synchronisation ---------------

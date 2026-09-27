@@ -229,6 +229,13 @@ LINKABLE_CARD_STATUSES: frozenset[str] = (
     OWNED_CARD_STATUSES | CLOSED_CARD_STATUSES
 ) - {"archived"}
 
+# Positive manager evidence that an absent linked card is a foreign import,
+# not a dangling reference -- the ONLY thing that may additionally hide a
+# NeedFix whose card no longer exists. An absent card without this exact tag
+# always stays ACTIVE (see ``ACTIVE_STATE_DEFINITION`` and
+# ``derive_active_state``).
+FOREIGN_ORIGIN_CARD_TAG = "foreign_origin_card"
+
 # --- Outer layer: the NeedFix's OWN lifecycle status decides first ----------
 # A NeedFix that is itself terminal is a decided non-problem (rejected /
 # duplicate) or an already-recorded closure (resolved / archived). It is never
@@ -254,7 +261,9 @@ NEEDFIX_CARD_DERIVED_STATUSES: frozenset[str] = frozenset(
 )
 
 # Derived states a row may resolve to at read time.
-ACTIVE_STATES: tuple[str, ...] = ("active", "owned", "closed", "reopened", "unknown")
+ACTIVE_STATES: tuple[str, ...] = (
+    "active", "owned", "closed", "reopened", "unknown", "foreign_card_unverified",
+)
 
 
 def _fmt_statuses(statuses: frozenset[str]) -> str:
@@ -272,7 +281,11 @@ ACTIVE_STATE_DEFINITION = (
     "It is CLOSED (hidden, recorded as fixed) while the card status is one of "
     f"{_fmt_statuses(CLOSED_CARD_STATUSES)}, or was superseded/cancelled with a "
     "successor that landed. It is ACTIVE AGAIN (reopened) while the card status "
-    f"is one of {_fmt_statuses(REOPEN_CARD_STATUSES)} without a landed successor."
+    f"is one of {_fmt_statuses(REOPEN_CARD_STATUSES)} without a landed successor. "
+    "It is foreign_card_unverified (hidden) only when the linked card is absent "
+    f"AND the record is tagged {FOREIGN_ORIGIN_CARD_TAG!r} -- positive manager "
+    "evidence the link is a foreign import; an untagged absent card always "
+    "stays ACTIVE."
 )
 
 
@@ -435,6 +448,11 @@ CREATE TABLE IF NOT EXISTS needfix_events (
 );
 
 CREATE INDEX IF NOT EXISTS idx_needfix_events_id ON needfix_events(needfix_id);
+
+CREATE TABLE IF NOT EXISTS needfix_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
 
 
@@ -537,6 +555,32 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     """Create the base schema and run the additive reopen_generation migration."""
     conn.executescript(_SCHEMA_SQL)
     _migrate_needfix_schema(conn)
+
+
+def _ensure_meta_table(conn: sqlite3.Connection) -> None:
+    """Create ``needfix_meta`` lazily: a DB initialized before the table
+    existed only gains it through ``_ensure_schema`` on the next insert."""
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS needfix_meta "
+        "(key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+    )
+
+
+def _get_meta(conn: sqlite3.Connection, key: str) -> str | None:
+    _ensure_meta_table(conn)
+    row = conn.execute(
+        "SELECT value FROM needfix_meta WHERE key = ?", (key,)
+    ).fetchone()
+    return row["value"] if row is not None else None
+
+
+def _set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
+    _ensure_meta_table(conn)
+    conn.execute(
+        "INSERT INTO needfix_meta (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (key, value),
+    )
 
 
 def _validate_reopen_generation_value(stored: Any, needfix_id: str) -> int:
@@ -757,6 +801,48 @@ def _safe_get_task(
         return None
 
 
+def _row_tags(needfix_row: Mapping[str, Any]) -> list[Any]:
+    """Read a NeedFix row's tags, tolerating any non-list shape as untagged.
+
+    ``needfix_row["tags"]`` is normally already the JSON-decoded list
+    ``_row_to_dict`` produces, but this also runs against hand-built rows in
+    tests and other callers, so a raw JSON string is parsed the same way
+    other tag reads do, and anything malformed or absent is untagged rather
+    than raising.
+    """
+    raw = needfix_row.get("tags")
+    if isinstance(raw, list):
+        return raw
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, ValueError):
+            return []
+        return parsed if isinstance(parsed, list) else []
+    return []
+
+
+def _has_foreign_origin_tag(needfix_row: Mapping[str, Any]) -> bool:
+    return FOREIGN_ORIGIN_CARD_TAG in _row_tags(needfix_row)
+
+
+def _lookup_linked_task(
+    get_task_fn: Callable[[str], Mapping[str, Any] | None], task_id: str
+) -> tuple[Mapping[str, Any] | None, bool]:
+    """Look up a linked card, also reporting whether the lookup itself raised.
+
+    A clean ``None`` (the store confirms no such id) and a raising lookup (a
+    transient failure telling us nothing) both mean "no card object", but
+    only the confirmed-absent case may combine with
+    ``FOREIGN_ORIGIN_CARD_TAG`` to hide the record: a merely failing lookup
+    must always fail safe to ACTIVE, tagged or not.
+    """
+    try:
+        return get_task_fn(task_id), False
+    except Exception:
+        return None, True
+
+
 def _superseded_by(task: Mapping[str, Any] | None) -> str:
     if not isinstance(task, Mapping):
         return ""
@@ -787,8 +873,9 @@ def derive_active_state(
     """Derive a NeedFix's ACTIVE state at read time from its linked task card.
 
     Returns ``{"state": str, "active": bool, "reason": str | None}`` where
-    ``state`` is one of ``active``, ``owned``, ``closed``, ``reopened`` or
-    ``unknown``. See ``ACTIVE_STATE_DEFINITION`` for the exact rule.
+    ``state`` is one of ``active``, ``owned``, ``closed``, ``reopened``,
+    ``unknown`` or ``foreign_card_unverified``. See ``ACTIVE_STATE_DEFINITION``
+    for the exact rule.
 
     The derivation has two layers, and the NeedFix's OWN status is the OUTER
     one: a record that is itself terminal (rejected/duplicate/resolved/
@@ -824,8 +911,18 @@ def derive_active_state(
     if not converted_task_id:
         return {"state": "active", "active": True, "reason": None}
 
-    task = _safe_get_task(get_task_fn, converted_task_id)
+    task, lookup_raised = _lookup_linked_task(get_task_fn, converted_task_id)
     if task is None:
+        if not lookup_raised and _has_foreign_origin_tag(needfix_row):
+            return {
+                "state": "foreign_card_unverified",
+                "active": False,
+                "reason": (
+                    f"linked task {converted_task_id!r} is absent and this "
+                    f"record is tagged {FOREIGN_ORIGIN_CARD_TAG!r}; only a "
+                    "manager can verify a foreign-origin card"
+                ),
+            }
         return {
             "state": "active",
             "active": True,
@@ -1912,6 +2009,62 @@ def resolve_verified_needfix(
         conn.close()
 
 
+def resolve_from_commit_trailer(
+    repo_root: str | Path, needfix_id: str, commit_sha: str
+) -> dict[str, Any] | None:
+    """Resolve a non-terminal, non-converting NeedFix from a verified commit trailer.
+
+    A second, independently-gated direct writer straight to ``resolved`` --
+    exactly like :func:`resolve_verified_needfix` and the ``integrated_commit``
+    path in :func:`_commit_conversion` -- not a new edge in the guarded state
+    machine (``VALID_TRANSITIONS`` is unchanged). Silently returns ``None`` for
+    an unknown id, a terminal record, a ``converting`` claim in flight, or a
+    lost race, so a bounded git-log scan can call this once per commit trailer
+    without special-casing rows it must leave alone.
+    """
+    sha = str(commit_sha or "").strip()
+    if not sha:
+        return None
+    conn = _connect(repo_root)
+    try:
+        # One transaction, like _commit_conversion: the evidence read, the
+        # status write and the event commit together or not at all.
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute("SELECT * FROM needfix WHERE id = ?", (needfix_id,)).fetchone()
+            if row is None:
+                conn.rollback()
+                return None
+            current_status = row["status"]
+            if current_status in NEEDFIX_TERMINAL_STATUSES or current_status == "converting":
+                conn.rollback()
+                return None
+            evidence_refs = json.loads(row["evidence_refs_json"] or "[]")
+            ref = f"git:{sha}"
+            if ref not in evidence_refs:
+                evidence_refs.append(ref)
+            now = _utcnow_iso()
+            cur = conn.execute(
+                "UPDATE needfix SET status = 'resolved', updated_at = ?, resolved_at = ?, "
+                "evidence_refs_json = ? WHERE id = ? AND status = ?",
+                (now, now, json.dumps(evidence_refs), needfix_id, current_status),
+            )
+            if cur.rowcount != 1:
+                conn.rollback()
+                return None
+            _record_event(conn, needfix_id, "commit_trailer_resolved", {
+                "prior_status": current_status, "commit": sha,
+            })
+            updated = conn.execute("SELECT * FROM needfix WHERE id = ?", (needfix_id,)).fetchone()
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        return _row_to_dict(updated)
+    finally:
+        conn.close()
+
+
 def update_needfix(
     repo_root: str | Path,
     needfix_id: str,
@@ -2912,34 +3065,75 @@ def recover_interrupted_conversion_claim(
 
 def _commit_conversion(
     repo_root: str | Path, needfix_id: str, task_id: str, claim_updated_at: str,
-    conversion_claim_id: str,
+    conversion_claim_id: str, *, integrated_commit: str = "",
 ) -> dict[str, Any]:
-    """Atomically record ``task_created`` + ``converted_task_id``."""
+    """Atomically record ``task_created`` + ``converted_task_id``.
+
+    A verified ``integrated_commit`` makes the NeedFix end ``resolved`` in
+    this same transaction instead of stopping at ``task_created``: the
+    manager already proved the fix landed by hand, and reporting an
+    intermediate ``task_created`` is exactly what let ``derive_active_state``
+    reopen a superseded card whose fix was already integrated. Without
+    ``integrated_commit`` this is the original, unchanged behaviour.
+    """
+    integrated_commit = str(integrated_commit or "").strip()
     conn = _connect(repo_root)
     try:
         # _connect uses autocommit so the claim CAS and its durable provenance
         # must be enclosed explicitly. Otherwise an event-write failure leaves
         # task_created committed without conversion_committed evidence.
         conn.execute("BEGIN IMMEDIATE")
-        cur = conn.execute(
-            "UPDATE needfix SET status = 'task_created', converted_task_id = ?, "
-            "updated_at = ?, conversion_claim_id = NULL WHERE id = ? "
-            "AND status = 'converting' AND updated_at = ? AND conversion_claim_id = ?",
-            (task_id, _utcnow_iso(), needfix_id, claim_updated_at, conversion_claim_id),
-        )
-        if cur.rowcount != 1:
-            raise NeedFixConflictError(
-                f"needfix {needfix_id} conversion claim changed before commit"
+        if integrated_commit:
+            row = conn.execute(
+                "SELECT evidence_refs_json FROM needfix WHERE id = ?", (needfix_id,)
+            ).fetchone()
+            evidence_refs = json.loads(row["evidence_refs_json"] or "[]")
+            ref = f"git:{integrated_commit}"
+            if ref not in evidence_refs:
+                evidence_refs.append(ref)
+            now = _utcnow_iso()
+            cur = conn.execute(
+                "UPDATE needfix SET status = 'resolved', converted_task_id = ?, "
+                "updated_at = ?, resolved_at = ?, conversion_claim_id = NULL, "
+                "evidence_refs_json = ? WHERE id = ? "
+                "AND status = 'converting' AND updated_at = ? AND conversion_claim_id = ?",
+                (
+                    task_id, now, now, json.dumps(evidence_refs), needfix_id,
+                    claim_updated_at, conversion_claim_id,
+                ),
             )
-        _record_event(conn, needfix_id, "conversion_committed", {
-            "converted_task_id": task_id, "conversion_claim_id": conversion_claim_id,
-        })
+            if cur.rowcount != 1:
+                raise NeedFixConflictError(
+                    f"needfix {needfix_id} conversion claim changed before commit"
+                )
+            _record_event(conn, needfix_id, "integrated_commit_resolved", {
+                "converted_task_id": task_id, "integrated_commit": integrated_commit,
+            })
+        else:
+            cur = conn.execute(
+                "UPDATE needfix SET status = 'task_created', converted_task_id = ?, "
+                "updated_at = ?, conversion_claim_id = NULL WHERE id = ? "
+                "AND status = 'converting' AND updated_at = ? AND conversion_claim_id = ?",
+                (task_id, _utcnow_iso(), needfix_id, claim_updated_at, conversion_claim_id),
+            )
+            if cur.rowcount != 1:
+                raise NeedFixConflictError(
+                    f"needfix {needfix_id} conversion claim changed before commit"
+                )
+            _record_event(conn, needfix_id, "conversion_committed", {
+                "converted_task_id": task_id, "conversion_claim_id": conversion_claim_id,
+            })
         conn.commit()
-        return {
+        result: dict[str, Any] = {
             "needfix_id": needfix_id,
             "converted_task_id": task_id,
             "already_converted": False,
         }
+        if integrated_commit:
+            # Same receipt shape as an identical retry, which short-circuits
+            # on status == "resolved" and reports resolved=True.
+            result["resolved"] = True
+        return result
     except Exception:
         conn.rollback()
         raise
@@ -3227,7 +3421,8 @@ def link_existing_task(
                 )
             )
         result = _commit_conversion(
-            repo_root, needfix_id, existing_task_id, claim_updated_at, conversion_claim_id
+            repo_root, needfix_id, existing_task_id, claim_updated_at, conversion_claim_id,
+            integrated_commit=recheck_oid or "",
         )
         if recheck_oid:
             result["integrated_commit"] = recheck_oid

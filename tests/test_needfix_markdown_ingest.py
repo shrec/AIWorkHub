@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import errno
+import sys
 from pathlib import Path
 
 import pytest
@@ -144,11 +146,36 @@ def test_commit_never_mutates_a_promoted_dedupe_match(repo: Path):
     assert needfix_store.get_needfix(repo, promoted_id)["status"] == "triaged"
 
 
-def test_source_paths_fail_closed_on_traversal_and_symlink(repo: Path):
+def test_source_paths_fail_closed_on_traversal(repo: Path):
     with pytest.raises(needfix_ingest.NeedFixIngestError, match="unsafe_source_path"):
         needfix_ingest.preview(repo, source_paths=["../outside.md"])
+
+
+_WINERROR_PRIVILEGE_NOT_HELD = 1314
+
+
+def _symlink_or_skip(link: Path, target: Path) -> None:
+    """Create a symlink or skip when -- and only when -- the privilege is missing.
+
+    Every other ``OSError`` propagates: a skip must name a missing capability,
+    never hide a broken fixture.
+    """
+    try:
+        link.symlink_to(target)
+    except OSError as exc:
+        if getattr(exc, "winerror", None) == _WINERROR_PRIVILEGE_NOT_HELD:
+            pytest.skip(
+                "symlink privilege not held (WinError 1314, "
+                "SeCreateSymbolicLinkPrivilege missing from this token)"
+            )
+        if sys.platform != "win32" and exc.errno == errno.EPERM:
+            pytest.skip("symlink creation not permitted here (EPERM)")
+        raise
+
+
+def test_source_paths_fail_closed_on_symlink(repo: Path):
     link = repo / "docs" / "linked.md"
-    link.symlink_to(repo / "docs" / "PRODUCT_ROADMAP.md")
+    _symlink_or_skip(link, repo / "docs" / "PRODUCT_ROADMAP.md")
     with pytest.raises(needfix_ingest.NeedFixIngestError, match="source_not_regular"):
         needfix_ingest.preview(repo, source_paths=["docs/linked.md"])
 
