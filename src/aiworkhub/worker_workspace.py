@@ -13222,6 +13222,9 @@ def _run_appcontainer_validation(
                     # NF-2026-00033: no capability_sids.  This runs untrusted
                     # candidate code, and offline is the stronger guarantee.
                     filesystem_grants=request_grants,
+                    # NF-2026-01037: keep this lane's own PATH/COMSPEC (and
+                    # git.exe on it) instead of the agent lane's shell rewrite.
+                    agent_shell=False,
                 )
             )
         except AppContainerError as exc:

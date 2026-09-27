@@ -531,6 +531,11 @@ class AppContainerRequest:
     # Protected directories beneath a revocable grant that stay closed to the
     # container: never granted, never walked (see _with_protected_descendants).
     withheld_directories: Sequence[str] = ()
+    # NF-2026-01037: the interactive agent lane needs Git Bash kept off PATH
+    # and PowerShell forced (appcontainer_shell_environment); the validation
+    # lane runs untrusted candidate tests that need git.exe, so it passes
+    # False and keeps the PATH/COMSPEC it was given.
+    agent_shell: bool = True
 
 
 @dataclass(frozen=True)
@@ -1977,9 +1982,12 @@ def _launch_prepared_appcontainer(
     # later -- passes through here, so the LOCALAPPDATA requirement is met once
     # at the chokepoint instead of being remembered by each caller.  It runs
     # after validation so hostile keys are still refused first.
-    child_environment = appcontainer_shell_environment(
-        appcontainer_child_environment(request.environment)
-    )
+    child_environment = appcontainer_child_environment(request.environment)
+    if request.agent_shell:
+        # NF-2026-01037: only the agent lane needs Git Bash off PATH and
+        # PowerShell forced; the validation lane passes agent_shell=False to
+        # keep the PATH/COMSPEC it was given, since it must still find git.exe.
+        child_environment = appcontainer_shell_environment(child_environment)
     if child_environment is not request.environment:
         request = replace(request, environment=child_environment)
 

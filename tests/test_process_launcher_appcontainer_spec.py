@@ -1481,6 +1481,36 @@ def test_appcontainer_validation_gets_grants_but_no_network(
     assert windows_appcontainer.APPCONTAINER_ANCESTORS_ENV not in request.environment
 
 
+def test_appcontainer_validation_disables_the_agent_shell_rewrite(
+    tmp_path: Path, monkeypatch, identity_osfhandle
+) -> None:
+    """NF-2026-01037: the validation lane must keep git.exe reachable, so it
+    builds its AppContainerRequest with agent_shell=False -- unlike the
+    worker supervisor lane, which keeps the default agent-shell rewrite."""
+    launches: list[_FakeValidationLaunch] = []
+    _stub_repo_id(monkeypatch)
+    _install_fake_launch(
+        monkeypatch,
+        stdout=b"",
+        stderr=b"",
+        outcome=windows_appcontainer.AppContainerLifecycleResult(
+            windows_appcontainer.AppContainerLifecycleState.EXITED, exit_code=0
+        ),
+        sink=launches,
+    )
+
+    worker_workspace._run_appcontainer_validation(
+        ["pytest", "-q"],
+        workspace=SimpleNamespace(repo=tmp_path, path=tmp_path, home=tmp_path),
+        adapter_id="claude_cli",
+        cwd=tmp_path,
+        env={"PATH": "x"},
+        timeout_seconds=30,
+    )
+
+    assert launches[0].request.agent_shell is False
+
+
 def test_appcontainer_validation_python_gets_its_interpreter_read_only_and_no_network(
     tmp_path: Path, monkeypatch, identity_osfhandle
 ) -> None:

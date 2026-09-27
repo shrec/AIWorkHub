@@ -4348,3 +4348,24 @@ def test_appcontainer_shell_drops_git_bash_and_uses_powershell(monkeypatch):
     assert rewritten["AIWORKHUB_APPCONTAINER_SHELL"] == "powershell"
     assert "CLAUDE_CODE_GIT_BASH_PATH" not in rewritten
     assert wac.appcontainer_shell_environment(None) is None
+
+
+def test_launch_appcontainer_keeps_git_bash_when_agent_shell_is_false(monkeypatch):
+    """NF-2026-01037: the validation lane passes agent_shell=False and must
+    keep git.exe reachable, unlike the interactive agent lane's default."""
+    monkeypatch.setattr(wac.os, "name", "nt")
+    monkeypatch.setattr(
+        wac, "resolve_local_appdata", lambda: r"C:\Users\u\AppData\Local"
+    )
+    path = os.pathsep.join([
+        r"C:\Program Files\Git\cmd",
+        r"C:\Program Files\Git\mingw64\bin",
+        r"C:\Windows\System32",
+    ])
+    env = {"PATH": path, "COMSPEC": r"C:\Windows\System32\cmd.exe"}
+    fake = FakeWin32Api()
+    launch_appcontainer(make_request(environment=env, agent_shell=False), api=fake)
+    assert fake.spec.environment["PATH"] == path
+    assert fake.spec.environment["COMSPEC"] == r"C:\Windows\System32\cmd.exe"
+    assert fake.spec.environment["LOCALAPPDATA"] == r"C:\Users\u\AppData\Local"
+    assert "AIWORKHUB_APPCONTAINER_SHELL" not in fake.spec.environment
