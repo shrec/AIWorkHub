@@ -459,7 +459,7 @@ def test_bodygrep_passes_target_into_bounded_engine_scan(
     authority = _authority_repo(tmp_path)
     calls: list[tuple[str, str | None]] = []
 
-    def bodygrep(repo_root, query, budget=64, *, target=None):  # noqa: ANN001
+    def bodygrep(repo_root, query, budget=64, *, target=None, cursor=None):  # noqa: ANN001
         calls.append((query, target))
         return {
             "mode": "bodygrep",

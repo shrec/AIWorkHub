@@ -1655,11 +1655,17 @@ def test_bridge_dispatches_reviewer_packet_read_with_server_side_identity(
         "aiworkhub_worker_quality_review_packet_read",
         {},
     )
-    assert result == {
+    # The read is paged under the host inline limit (NF-2026-01029): a small
+    # packet is one part whose text is the canonical packet body.
+    assert {key: result[key] for key in ("ok", "tool", "packet_sha256", "part", "part_count")} == {
         "ok": True,
         "tool": "quality_review_packet_read",
         "packet_sha256": packet["packet_sha256"],
-        "packet": packet,
+        "part": 0,
+        "part_count": 1,
+    }
+    assert json.loads(result["text"]) == {
+        key: value for key, value in packet.items() if key != "packet_sha256"
     }
 
     # A provider that supplies a path or an identity is ignored, never obeyed,

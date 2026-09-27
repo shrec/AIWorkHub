@@ -162,6 +162,10 @@ def test_dashboard_exposes_and_updates_repository_model_policy(
             "observed_models": ["gpt-5.6-sol", "glm-5.3"],
         },
     )
+    # The CLI-owned lists read the host's own caches; keep them out so the
+    # count below is the editor's two observed models.
+    monkeypatch.setattr(dashboard_mcp_app.cli_model_discovery, "codex_models", lambda *_a, **_k: [])
+    monkeypatch.setattr(dashboard_mcp_app.cli_model_discovery, "claude_models", lambda *_a, **_k: [])
 
     viewed = dashboard_mcp_app.settings_view()
     model_policy = viewed["model_policy"]

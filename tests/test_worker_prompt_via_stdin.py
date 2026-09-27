@@ -150,6 +150,14 @@ def test_supervisor_plain_branch_is_unchanged_when_stdin_text_is_none(tmp_path: 
     assert Path(spec["stdout_path"]).read_text(encoding="utf-8") == "''"
 
 
+def _sandbox_cwd(tmp_path: Path) -> str:
+    """Production's <repo>/.aiworkhub/runtime/worktrees/<request>/worktree:
+    request_scoped_grants refuses a cwd outside a sandbox root (NF-2026-01039)."""
+    cwd = tmp_path / ".aiworkhub" / "runtime" / "worktrees" / "request-1" / "worktree"
+    cwd.mkdir(parents=True, exist_ok=True)
+    return str(cwd)
+
+
 def _read_native_handle(handle: int) -> bytes:
     """Read a stdin handle the launcher passed; on Windows it is an OS HANDLE, not an fd."""
     if os.name == "nt":
@@ -188,11 +196,11 @@ def test_appcontainer_branch_uses_a_pipe_for_stdin_text_and_the_null_device_othe
     spec = {"repo_id": "repo-test", "worker_kind": "claude_cli"}
     argv = [sys.executable, "-c", "pass"]
 
-    worker_supervisor._launch_appcontainer_process(argv, str(tmp_path), spec)
+    worker_supervisor._launch_appcontainer_process(argv, _sandbox_cwd(tmp_path), spec)
     assert null_reads == [b""]
 
     worker_supervisor._launch_appcontainer_process(
-        argv, str(tmp_path), spec, stdin_text="the prompt"
+        argv, _sandbox_cwd(tmp_path), spec, stdin_text="the prompt"
     )
     assert prompts == ["the prompt"]
 
@@ -215,7 +223,7 @@ def test_appcontainer_does_not_retain_the_parent_stdin_reader_after_launch(
 
     process = worker_supervisor._launch_appcontainer_process(
         [sys.executable, "-c", "pass"],
-        str(tmp_path),
+        _sandbox_cwd(tmp_path),
         {"repo_id": "repo-test", "worker_kind": "codex_cli"},
     )
     try:

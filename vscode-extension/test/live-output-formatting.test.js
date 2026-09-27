@@ -15,6 +15,7 @@ class FakeElement {
     this._textContent = "";
     this._innerHTML = "";
     this.value = "";
+    this.classList = { add() {}, remove() {}, toggle() {}, contains() { return false; } };
   }
 
   append(...nodes) {

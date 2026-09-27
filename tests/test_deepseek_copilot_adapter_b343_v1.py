@@ -269,7 +269,9 @@ def test_claude_and_codex_argv_unchanged(monkeypatch, tmp_path):
     assert "--no-session-persistence" in claude.argv
     codex = runtime_adapters.build_runtime_command("codex_cli", "p", repo)
     assert codex.argv[1] == "exec"
-    assert codex.argv[-1] == "p"
+    # The prompt travels on stdin (NF-2026-00042); ``-`` tells codex to read it.
+    assert codex.argv[-1] == "-"
+    assert codex.stdin_text == "p"
 
 
 # ---------------------------------------------------------------------------

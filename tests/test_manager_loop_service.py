@@ -77,7 +77,7 @@ class _FakeOrchestratorFactory:
 
         def new_id() -> str:
             issued["n"] += 1
-            return f"sess-{issued['n']:04d}"
+            return f"mls-{issued['n']:032x}"
 
         return ml.ManagerOrchestrator(
             store,

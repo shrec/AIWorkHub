@@ -31,6 +31,8 @@ from os import PathLike
 from pathlib import Path
 from typing import Union
 
+from . import platform_io
+
 __all__ = [
     "AUTH_FILENAME",
     "KILO_AUTH_RELATIVE_PATH",
@@ -237,13 +239,12 @@ def _prepare_kilo_data_dir(home: Path) -> Path:
         raise KiloAuthDestinationError(
             "Kilo state path must be a non-symlink directory", state_dir
         )
-    if os.name == "posix":
-        try:
-            os.chmod(state_dir, 0o700)
-        except OSError:
-            raise KiloAuthDestinationError(
-                "Kilo state directory permissions cannot be restricted", state_dir
-            ) from None
+    try:
+        platform_io.chmod_path(state_dir, 0o700)
+    except OSError:
+        raise KiloAuthDestinationError(
+            "Kilo state directory permissions cannot be restricted", state_dir
+        ) from None
     return current
 
 

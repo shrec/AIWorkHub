@@ -7393,7 +7393,7 @@ def _trusted_tree_sitter_cache_root() -> Path | None:
     explicit = os.environ.get(_TREE_SITTER_CACHE_ROOT_ENV, "").strip()
     if explicit:
         candidates.append(Path(explicit))
-    if os.name == "nt":
+    if _platform_io.is_windows():
         local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
         if local_app_data and local_app_data != explicit:
             candidates.append(Path(local_app_data))

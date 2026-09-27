@@ -270,7 +270,7 @@ def test_task_show_returns_stored_provenance_not_live_registry(
             "template_full_id": "bugfix_with_regression@v1:" + ("22" * 32),
         },
     )
-    shown = server.aiworkhub_task_show("TASK_NF390_SHOW")
+    shown = server.aiworkhub_task_show("TASK_NF390_SHOW", detail="full")
     assert shown["ok"] is True
     reloaded = json.loads(shown["stdout"])
     assert reloaded["template_provenance"] == persisted
