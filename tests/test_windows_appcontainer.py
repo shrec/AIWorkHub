@@ -48,11 +48,12 @@ from aiworkhub.windows_appcontainer import (
 # ---------------------------------------------------------------------------
 
 
-# NF-2026-00964: the seven tests carrying this marker need real host Win32
-# privileges (the actual process token, a real named pipe, a real job
-# object) that the AppContainer validation lane does not have when it runs
-# this suite inside a container.  On a host -- and on any non-Windows CI
-# runner, where the detector is always False -- they run and must pass.
+# NF-2026-00964 / NF-2026-01039: the tests carrying this marker need real
+# host Win32 privileges (the actual process token, a real named pipe, a real
+# job object, a real junction or DOS drive) that the AppContainer validation
+# lane does not have when it runs this suite inside a container.  On a host --
+# and on any non-Windows CI runner, where the detector is always False -- they
+# run and must pass.
 requires_host_win32_privileges = pytest.mark.skipif(
     wac.current_process_is_appcontainer(),
     reason="requires host Win32 privileges; not available inside an AppContainer",
@@ -386,13 +387,26 @@ def test_request_local_opencode_config_and_home_reach_the_child_unchanged():
 
     launch_appcontainer(make_request(environment=dict(environment)), api=fake)
 
-    # Every key reaches the child exactly. The one permitted addition is
-    # LOCALAPPDATA, which launch_appcontainer supplies when it is absent
-    # because AppContainer process creation fails without it (203); it is
-    # only added where it resolves, so a non-Windows host adds nothing.
+    # Every key reaches the child exactly. This is the supervisor's agent lane
+    # (make_request keeps the default agent_shell=True), so the child block is
+    # the request environment after both launch_appcontainer chokepoints:
+    # LOCALAPPDATA, supplied when it is absent because AppContainer process
+    # creation fails without it (203), and the ce33d1c/71c2fe4 agent-shell
+    # rewrite, which adds COMSPEC=powershell and AIWORKHUB_APPCONTAINER_SHELL.
+    # Both add only on Windows, so a non-Windows host adds nothing.  Neither
+    # may trim or re-derive a key the supervisor handed over.
     child_environment = dict(fake.spec.environment)
     assert {k: child_environment[k] for k in environment} == environment
-    assert set(child_environment) - set(environment) <= {"LOCALAPPDATA"}
+    assert child_environment == dict(
+        wac.appcontainer_shell_environment(wac.appcontainer_child_environment(environment))
+    )
+    assert set(child_environment) - set(environment) <= {
+        "LOCALAPPDATA",
+        "COMSPEC",
+        "AIWORKHUB_APPCONTAINER_SHELL",
+    }
+    if os.name == "nt":
+        assert child_environment["AIWORKHUB_APPCONTAINER_SHELL"] == "powershell"
     delivered = json.loads(
         fake.spec.environment[runtime_adapters.OPENCODE_WORKER_CONFIG_ENV]
     )
@@ -2482,6 +2496,7 @@ def test_temp_and_profile_paths_are_refused_when_explicit_and_omitted_when_ambie
     assert all(wac._within(_key(grant.path), _key(root)) for grant in grants)
 
 
+@requires_host_win32_privileges
 @pytest.mark.parametrize("linked", ["leaf", "root"])
 def test_a_junction_out_of_the_sandbox_is_refused(tmp_path, linked):
     elsewhere = tmp_path / "elsewhere"
@@ -3844,6 +3859,7 @@ def test_the_shim_final_path_matches_the_host_when_the_volume_lookup_is_denied(
 
 
 @windows_only
+@requires_host_win32_privileges
 def test_the_shim_final_path_keeps_the_sandbox_drive_spelling(tmp_path, monkeypatch):
     """NF-2026-01027: under a sandbox root's per-session drive the rebuilt name
     is that drive's spelling, not the root's real directories below it."""
@@ -3989,8 +4005,13 @@ def test_launch_error_carries_sizes_and_paths_as_text_and_attributes():
     assert error.command_line_length == len(build_command_line(request.argv))
     assert error.argument_count == len(request.argv)
     # The launch measures the block it actually hands CreateProcessW, which is
-    # the request environment after the LOCALAPPDATA chokepoint adds to it.
-    launched_environment = wac.appcontainer_child_environment(request.environment)
+    # the request environment after the LOCALAPPDATA chokepoint adds to it and,
+    # on this default agent lane (agent_shell=True), after the ce33d1c/71c2fe4
+    # shell rewrite adds COMSPEC and AIWORKHUB_APPCONTAINER_SHELL.
+    assert request.agent_shell is True
+    launched_environment = wac.appcontainer_shell_environment(
+        wac.appcontainer_child_environment(request.environment)
+    )
     assert error.environment_length == len(wac._environment_block_text(launched_environment))
     assert error.working_directory == "C:\\work\\dir"
 
@@ -4100,10 +4121,13 @@ _PRIVILEGED_LANE_SKIP_TEST_NAMES = {
     "test_worker_pipe_accept_gives_up_at_its_timeout",
     "test_worker_pipe_shutdown_releases_a_waiting_accept",
     "test_the_shim_mkdir_0o700_inherits_the_parent_dacl",
+    # NF-2026-01039: a real junction and a real DefineDosDeviceW drive.
+    "test_a_junction_out_of_the_sandbox_is_refused",
+    "test_the_shim_final_path_keeps_the_sandbox_drive_spelling",
 }
 
 
-def test_the_appcontainer_lane_skip_marks_exactly_the_seven_privileged_tests():
+def test_the_appcontainer_lane_skip_marks_exactly_the_privileged_tests():
     import sys
 
     module = sys.modules[__name__]
@@ -4116,12 +4140,16 @@ def test_the_appcontainer_lane_skip_marks_exactly_the_seven_privileged_tests():
     }
     assert marked == _PRIVILEGED_LANE_SKIP_TEST_NAMES
 
-    # One of the six is parametrized with two cases, making seven collected
-    # items in total -- the exact seven the objective names.
-    parametrized = module.test_ctypes_denied_persistent_grant_names_the_one_time_command
-    parametrize_marks = [m for m in parametrized.pytestmark if m.name == "parametrize"]
-    assert len(parametrize_marks) == 1
-    assert list(parametrize_marks[0].args[1]) == ["directory", "file"]
+    # Two of the eight are parametrized with two cases each, making ten
+    # collected items in total -- the exact ten the lane skips.
+    for parametrized, cases in (
+        (module.test_ctypes_denied_persistent_grant_names_the_one_time_command,
+         ["directory", "file"]),
+        (module.test_a_junction_out_of_the_sandbox_is_refused, ["leaf", "root"]),
+    ):
+        parametrize_marks = [m for m in parametrized.pytestmark if m.name == "parametrize"]
+        assert len(parametrize_marks) == 1
+        assert list(parametrize_marks[0].args[1]) == cases
 
 
 def test_nested_lsp_helper_cwd_budget_names_the_measured_winerror_267_limit():

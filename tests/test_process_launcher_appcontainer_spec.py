@@ -22,6 +22,17 @@ import aiworkhub.worker_workspace as worker_workspace
 
 CANONICAL_REPO_ID = "repo_57de971f505d4a50a7729a99c32615de"
 
+# NF-2026-01039: the same pattern as tests/test_windows_appcontainer.py.  The
+# tests carrying this marker need real host Win32 privileges (icacls on a real
+# DACL, a real junction) that the AppContainer validation lane does not have
+# when it runs this suite inside a container.  On a host -- and on any
+# non-Windows CI runner, where the detector is always False -- they run and
+# must pass.
+requires_host_win32_privileges = pytest.mark.skipif(
+    windows_appcontainer.current_process_is_appcontainer(),
+    reason="requires host Win32 privileges; not available inside an AppContainer",
+)
+
 
 def test_fake_windows_spec_carries_backend_and_repo_id() -> None:
     spec = module._appcontainer_supervisor_identity(
@@ -530,12 +541,24 @@ class _FakeCapture:
             stream.close()
 
 
+def _sandbox_request_dir(tmp_path, request_id="request-1"):
+    """``<repo>\\.aiworkhub\\runtime\\worktrees\\<request>``: production's layout.
+
+    ``request_scoped_grants`` (ce33d1c/71c2fe4) refuses a worker cwd that does
+    not resolve strictly inside a sandbox root, so every supervisor fixture
+    that reaches the grant plan puts its worktree, HOME and temp here.
+    """
+    return tmp_path / ".aiworkhub" / "runtime" / "worktrees" / request_id
+
+
 def _supervisor_spec(tmp_path, **extra):
     process_dir = tmp_path / "supervisor"
     process_dir.mkdir(parents=True, exist_ok=True)
+    worktree = _sandbox_request_dir(tmp_path) / "worktree"
+    worktree.mkdir(parents=True, exist_ok=True)
     spec = {
         "argv": ["fake-worker", "--run"],
-        "cwd": str(tmp_path),
+        "cwd": str(worktree),
         "timeout_seconds": 30,
         "status_path": str(process_dir / "status.json"),
         "cancel_path": str(process_dir / "cancel.json"),
@@ -634,13 +657,20 @@ def test_supervisor_worker_launch_gets_grants_and_only_internet_client(
 ) -> None:
     """NF-2026-00025 / NF-2026-00033, the worker half of the split."""
     shim, package_dir = _npm_shim(tmp_path, name, package)
-    worktree, home, temp = (tmp_path / n for n in ("worktree", "home", "tmp"))
+    # create_workspace's shape: <sandbox root>/<request>/{worktree,home}, with
+    # the request temp inside the isolated HOME.
+    request_dir = _sandbox_request_dir(tmp_path)
+    sandbox_root = request_dir.parent
+    worktree, home = request_dir / "worktree", request_dir / "home"
+    temp = home / "tmp"
     for directory in (worktree, home, temp):
-        directory.mkdir()
+        directory.mkdir(parents=True)
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("USERPROFILE", str(home))
     for key in ("TMP", "TEMP", "TMPDIR"):
         monkeypatch.setenv(key, str(temp))
+    for key in ("XDG_STATE_HOME", "CODEX_HOME"):
+        monkeypatch.delenv(key, raising=False)
     launches: list[windows_appcontainer.AppContainerRequest] = []
 
     def _fake_launch(request):
@@ -678,9 +708,18 @@ def test_supervisor_worker_launch_gets_grants_and_only_internet_client(
         grant(str(home), "modify"),
         grant(str(temp), "modify"),
     ]
+    # request_scoped_grants' documented order: every leaf first (cwd, then the
+    # HOME/temp env keys), then non-inheritable traverse nearest-first up to and
+    # including the sandbox root.  The chain stops at the root, whose traverse
+    # is persistent (shared by every launch of this SID); ce33d1c replaced the
+    # NF-2026-01004 volume-root traverse with the per-session sandbox drive, so
+    # nothing above the root -- not even the volume root -- is ever granted.
+    assert [item for item in grants if item.access == "traverse"] == [
+        grant(str(request_dir), "traverse"),
+        grant(str(sandbox_root), "traverse", persistent=True),
+    ]
     assert grant(str(worktree.parent), "traverse") in grants
-    # NF-2026-01004: Bun realpath needs a non-persistent traverse ACE on the volume root.
-    assert grant(str(worktree.anchor), "traverse") in grants
+    assert not any(item.path == str(worktree.anchor) for item in grants)
 
 
 def test_a_non_npm_shim_is_run_as_is_and_granted_only_itself(tmp_path) -> None:
@@ -1444,7 +1483,11 @@ def test_appcontainer_validation_gets_grants_but_no_network(
         ),
         sink=launches,
     )
-    worktree, home, scratch = (tmp_path / n for n in ("wt", "home", "scratch"))
+    # Strictly inside a sandbox root: request_scoped_grants silently omits an
+    # ambient HOME/temp outside one (ce33d1c/71c2fe4).
+    request_dir = _sandbox_request_dir(tmp_path)
+    sandbox_root = request_dir.parent
+    worktree, home, scratch = (request_dir / n for n in ("wt", "home", "scratch"))
     env = {
         "HOME": str(home),
         "USERPROFILE": str(home),
@@ -1472,10 +1515,20 @@ def test_appcontainer_validation_gets_grants_but_no_network(
         # The root, never the cd subdir a candidate could have made a junction.
         grant(str(worktree), "read_execute"),
     ]
+    # request_scoped_grants' documented order: traverse nearest-first from the
+    # leaves' parent up to and including the sandbox root, never above it --
+    # the per-session sandbox drive replaced the NF-2026-01004 volume-root ACE.
+    assert [item for item in grants if item.access == "traverse"] == [
+        grant(str(request_dir), "traverse"),
+        grant(str(sandbox_root), "traverse", persistent=True),
+    ]
     assert grant(str(worktree.parent), "traverse") in grants
-    # NF-2026-01004: Bun realpath needs a non-persistent traverse ACE on the volume root.
-    assert grant(str(worktree.anchor), "traverse") in grants
-    assert not any(g.persistent for g in grants)
+    assert not any(g.path == str(worktree.anchor) for g in grants)
+    # Only the shared sandbox root outlives the launch; every request grant is
+    # revoked with it.
+    assert [g for g in grants if g.persistent] == [
+        grant(str(sandbox_root), "traverse", persistent=True)
+    ]
     # Not a Python: no PYTHONPATH, and no shim facts, appear.
     assert "PYTHONPATH" not in request.environment
     assert windows_appcontainer.APPCONTAINER_ANCESTORS_ENV not in request.environment
@@ -1534,7 +1587,12 @@ def test_appcontainer_validation_python_gets_its_interpreter_read_only_and_no_ne
     python = venv / "Scripts" / "python.exe"
     python.write_bytes(b"MZ")
     (venv / "pyvenv.cfg").write_text(f"home = {base}\n", encoding="utf-8")
-    worktree, home, scratch = (tmp_path / n for n in ("wt", "home", "scratch"))
+    # Strictly inside a sandbox root (ce33d1c/71c2fe4); the interpreter stays
+    # outside it, where a persistent read grant is allowed.
+    request_dir = _sandbox_request_dir(tmp_path)
+    request_dir.mkdir(parents=True)
+    sandbox_root = request_dir.parent
+    worktree, home, scratch = (request_dir / n for n in ("wt", "home", "scratch"))
     env = {
         "HOME": str(home), "USERPROFILE": str(home), "TMP": str(scratch),
         "TEMP": str(scratch), "PYTHONPATH": os.pathsep.join([str(worktree), "."]),
@@ -1563,9 +1621,15 @@ def test_appcontainer_validation_python_gets_its_interpreter_read_only_and_no_ne
         grant(str(base), "read_execute", persistent=True),
         grant(windows_appcontainer.APPCONTAINER_PYTHON_SITE, "read_execute", persistent=True),
     ]
+    # request_scoped_grants' documented order: traverse nearest-first up to and
+    # including the sandbox root, never above it -- the per-session sandbox
+    # drive replaced the NF-2026-01004 volume-root ACE.
+    assert [item for item in grants if item.access == "traverse"] == [
+        grant(str(request_dir), "traverse"),
+        grant(str(sandbox_root), "traverse", persistent=True),
+    ]
     assert grant(str(worktree.parent), "traverse") in grants
-    # NF-2026-01004: Bun realpath needs a non-persistent traverse ACE on the volume root.
-    assert grant(str(worktree.anchor), "traverse") in grants
+    assert not any(g.path == str(worktree.anchor) for g in grants)
     # NF-40: the mkdir/realpath shim first, ahead of every candidate component.
     assert request.environment["PYTHONPATH"].split(os.pathsep) == [
         windows_appcontainer.APPCONTAINER_PYTHON_SITE, str(worktree), "."
@@ -1715,8 +1779,9 @@ def test_appcontainer_validation_never_lets_appcontainer_error_escape(
 
 
 def _request_layout(tmp_path: Path, request_id: str = "a" * 32):
-    """``create_workspace``'s shape: <root>/<request_id>/{worktree,home}."""
-    request_root = tmp_path / "worktrees" / request_id
+    """``create_workspace``'s shape: <root>/<request_id>/{worktree,home}, with
+    <root> a sandbox root ``request_scoped_grants`` recognises."""
+    request_root = _sandbox_request_dir(tmp_path, request_id)
     worktree, home = request_root / "worktree", request_root / "home"
     worktree.mkdir(parents=True)
     home.mkdir()
@@ -1781,9 +1846,14 @@ def test_appcontainer_validation_grants_the_request_root_read_only_after_home_an
         grant(str(scratch), "modify"),
         grant(str(request_root), "read_execute"),
     ]
-    assert grant(str(request_root.parent), "traverse") in grants
-    # NF-2026-01004: Bun realpath needs a non-persistent traverse ACE on the volume root.
-    assert grant(str(request_root.anchor), "traverse") in grants
+    # The request root's parent is the sandbox root itself: the one traverse
+    # left once the root's own traverse gives way to read_execute, persistent
+    # because every launch of this SID shares it.  The chain stops there --
+    # the per-session sandbox drive replaced the NF-2026-01004 volume-root ACE.
+    assert [item for item in grants if item.access == "traverse"] == [
+        grant(str(request_root.parent), "traverse", persistent=True),
+    ]
+    assert not any(item.path == str(request_root.anchor) for item in grants)
     assert tuple(request.capability_sids) == ()  # offline
 
 
@@ -2281,6 +2351,7 @@ def test_host_git_refuses_while_a_container_can_still_write_the_worktree(
 
 
 @windows_only
+@requires_host_win32_privileges
 def test_appcontainer_writers_names_a_package_sid_with_any_write_right(tmp_path):
     root = tmp_path / "root"
     (root / "child").mkdir(parents=True)
@@ -2298,6 +2369,7 @@ def test_appcontainer_writers_names_a_package_sid_with_any_write_right(tmp_path)
 
 
 @windows_only
+@requires_host_win32_privileges
 def test_run_validations_fails_the_gate_on_a_planted_junction(tmp_path, monkeypatch):
     """A candidate-made link is a failed gate (validation_failed), not an
     environment block, and nothing of the target reaches the record."""
