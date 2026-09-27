@@ -7372,102 +7372,11 @@ def _verify_owner_private_directory(path: Path, label: str) -> Path:
     return path.resolve(strict=True)
 
 
-_TREE_SITTER_CACHE_ROOT_ENV = "TREE_SITTER_LANGUAGE_PACK_CACHE_DIR"
-_TREE_SITTER_CACHE_DIRECTORY = "tree-sitter-language-pack"
-_TREE_SITTER_GRAMMAR_SUFFIXES = frozenset({".dll", ".so", ".dylib"})
-_TREE_SITTER_REQUIRED_GRAMMARS = frozenset({"javascript", "typescript"})
-
-
-def _trusted_tree_sitter_cache_root() -> Path | None:
-    """Return a bounded, parser-complete cache root without exposing HOME.
-
-    tree-sitter-language-pack derives its cache from USERPROFILE on Windows.
-    Validation deliberately replaces that profile, so an already installed
-    grammar otherwise becomes a network download attempt and the Source Graph
-    silently falls back to positionless lexical extraction. The package's own
-    cache-root variable is narrower than restoring any user profile variable.
-    Only a real, parser-complete cache is forwarded.
-    """
-
-    candidates: list[Path] = []
-    explicit = os.environ.get(_TREE_SITTER_CACHE_ROOT_ENV, "").strip()
-    if explicit:
-        candidates.append(Path(explicit))
-    if _platform_io.is_windows():
-        local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
-        if local_app_data and local_app_data != explicit:
-            candidates.append(Path(local_app_data))
-
-    reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
-
-    def _real_directory(path: Path) -> bool:
-        try:
-            info = os.lstat(path)
-        except OSError:
-            return False
-        return stat.S_ISDIR(info.st_mode) and not (
-            getattr(info, "st_file_attributes", 0) & reparse
-        )
-
-    for candidate in candidates[:2]:
-        if not _real_directory(candidate):
-            continue
-        pack = candidate / _TREE_SITTER_CACHE_DIRECTORY
-        if not _real_directory(pack):
-            continue
-        grammars: set[str] = set()
-        try:
-            with os.scandir(pack) as versions:
-                for version_index, version in enumerate(versions):
-                    if version_index >= 32:
-                        grammars.clear()
-                        break
-                    try:
-                        version_info = version.stat(follow_symlinks=False)
-                    except OSError:
-                        continue
-                    if not stat.S_ISDIR(version_info.st_mode) or (
-                        getattr(version_info, "st_file_attributes", 0) & reparse
-                    ):
-                        continue
-                    libs = Path(version.path) / "libs"
-                    if not _real_directory(libs):
-                        continue
-                    with os.scandir(libs) as libraries:
-                        for library_index, library in enumerate(libraries):
-                            if library_index >= 128:
-                                grammars.clear()
-                                break
-                            try:
-                                library_info = library.stat(follow_symlinks=False)
-                            except OSError:
-                                continue
-                            if (
-                                not stat.S_ISREG(library_info.st_mode)
-                                or getattr(library_info, "st_file_attributes", 0)
-                                & reparse
-                                or library_info.st_size <= 0
-                                or Path(library.name).suffix.casefold()
-                                not in _TREE_SITTER_GRAMMAR_SUFFIXES
-                            ):
-                                continue
-                            lowered = library.name.casefold()
-                            grammars.update(
-                                grammar
-                                for grammar in _TREE_SITTER_REQUIRED_GRAMMARS
-                                if grammar in lowered
-                            )
-                    if _TREE_SITTER_REQUIRED_GRAMMARS <= grammars:
-                        return candidate.resolve(strict=True)
-        except OSError:
-            continue
-    return None
-
-
 def sanitized_env(
     adapter_id: str,
     *,
     home: Path | None = None,
+    repo: Path | None = None,
     isolated_task_queue_db: bool = False,
     provider_env: Mapping[str, str] | None = None,
     verify_preprovisioned_home: bool = False,
@@ -7539,9 +7448,18 @@ def sanitized_env(
         # would otherwise resolve to (see TASK_QUEUE_ISOLATED_RELATIVE doc).
         safe["BITNN_TASK_QUEUE_DB"] = str(selected_home / TASK_QUEUE_ISOLATED_RELATIVE)
     if adapter_id == "validation":
-        tree_sitter_cache_root = _trusted_tree_sitter_cache_root()
+        from aiworkhub import tree_sitter_cache as _tsc
+
+        tree_sitter_cache_root = _tsc.trusted_tree_sitter_cache_root()
+        if tree_sitter_cache_root is not None and home is not None and repo is not None:
+            # NF-2026-01042: the AppContainer cannot open the C: profile cache;
+            # forward the host-owned repo mirror it reads via mirror_read_grants.
+            mirror = _tsc.mirror_tree_sitter_cache(
+                tree_sitter_cache_root, _tsc.repo_mirror_root(repo)
+            )
+            tree_sitter_cache_root = mirror or tree_sitter_cache_root
         if tree_sitter_cache_root is not None:
-            safe[_TREE_SITTER_CACHE_ROOT_ENV] = str(tree_sitter_cache_root)
+            safe[_tsc.TREE_SITTER_CACHE_ROOT_ENV] = str(tree_sitter_cache_root)
     passthrough = {
         "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
         "http_proxy", "https_proxy", "all_proxy", "no_proxy",
@@ -13116,6 +13034,7 @@ def _run_appcontainer_validation(
     # validation closure, so this shape is what guarantees both siblings
     # actually land in a sparse worker worktree that has to run this helper.
     from .repository_state import inspect_repository
+    from .tree_sitter_cache import mirror_read_grants
     from .windows_appcontainer import (
         APPCONTAINER_ANCESTORS_ENV,
         APPCONTAINER_PYTHON_SITE,
@@ -13175,6 +13094,8 @@ def _run_appcontainer_validation(
             )
         ),
         ContainerGrant(str(request_root), "read_execute"),
+        # NF-2026-01042: the host-owned grammar mirror, read-only, if forwarded.
+        *mirror_read_grants(workspace.repo, env),
     ]
     try:
         request_grants += python_read_grants(
@@ -13569,6 +13490,7 @@ def run_validations(
             env = sanitized_env(
                 "validation",
                 home=validation_home,
+                repo=workspace.repo,
                 isolated_task_queue_db=True,
                 verify_preprovisioned_home=selected_backend == "landlock",
             )
