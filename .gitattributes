@@ -6,3 +6,7 @@
 *.json text eol=lf
 *.yml text eol=lf
 *.yaml text eol=lf
+docs/AIWORKHUB_TOOL_USE_POLICY.md text eol=lf
+AGENTS.md text eol=lf
+CLAUDE.md text eol=lf
+.github/copilot-instructions.md text eol=lf

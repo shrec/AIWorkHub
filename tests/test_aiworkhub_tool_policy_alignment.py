@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import pytest
 import shutil
 import subprocess
 import sys
@@ -1238,3 +1239,17 @@ def test_missing_host_file_is_structured_check_error_and_cli_failure(tmp_path: P
     assert result.returncode == 1
     assert "- CLAUDE.md: file is missing\n" in result.stdout
     assert "Traceback" not in result.stderr
+
+
+def test_policy_files_are_pinned_to_lf_via_gitattributes() -> None:
+    if shutil.which("git") is None:
+        pytest.skip("git is not available")
+
+    for relative_path in (policy_sync.POLICY_SOURCE, *policy_sync.HOST_FILES):
+        git_path = str(relative_path).replace(os.sep, "/")
+        result = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "check-attr", "eol", "--", git_path],
+            capture_output=True,
+            text=True,
+        )
+        assert result.stdout.strip().endswith(": eol: lf"), (relative_path, result.stdout, result.stderr)
