@@ -539,7 +539,9 @@ def test_cpp_is_skipped_and_its_lexical_edges_are_preserved(tmp_path, monkeypatc
 # --- exact target verification ---------------------------------------------
 
 
-def test_external_ambiguous_and_symlink_targets_all_fail_closed(tmp_path, monkeypatch):
+def test_external_ambiguous_and_symlink_targets_all_fail_closed(
+    tmp_path, monkeypatch, make_symlink
+):
     fixture = _Lsp(tmp_path, monkeypatch, "fail_closed")
     fixture.write("b.py", PY_TARGET)
     fixture.write(
@@ -551,7 +553,7 @@ def test_external_ambiguous_and_symlink_targets_all_fail_closed(tmp_path, monkey
     outside.parent.mkdir(parents=True, exist_ok=True)
     outside.write_text("def target_symbol():\n    return 0\n", encoding="utf-8")
     link = fixture.root / "b_link.py"
-    os.symlink(fixture.root / "b.py", link)
+    make_symlink(fixture.root / "b.py", link)
 
     fixture.define(CALL_KEY, {"uri": outside.resolve().as_uri(), "range": TARGET_SPAN})
     fixture.define(
@@ -2042,13 +2044,13 @@ def test_server_replaced_at_the_same_path_revokes_its_receipts(tmp_path, monkeyp
     assert len(fixture.asked()) == asked_before
 
 
-def test_server_identity_binds_the_bytes_a_command_resolves_to(tmp_path):
+def test_server_identity_binds_the_bytes_a_command_resolves_to(tmp_path, make_symlink):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     server = bin_dir / "langserver-1"
     server.write_bytes(b"#!/bin/sh\nexec real-server --stdio\n")
     link = bin_dir / "langserver"
-    os.symlink(server, link)
+    make_symlink(server, link)
     command = (str(link), "--stdio")
 
     first = sg._lsp_server_identity(command)

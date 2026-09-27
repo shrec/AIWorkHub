@@ -15,6 +15,7 @@ beneath the worktree root.
 
 from __future__ import annotations
 
+import errno
 import os
 import subprocess
 import sys
@@ -177,3 +178,34 @@ def assert_imports_from_worktree():
 @pytest.fixture
 def make_aiworkhub_worktree():
     return make_aiworkhub_tree
+
+
+# ``ERROR_PRIVILEGE_NOT_HELD``: the token lacks SeCreateSymbolicLinkPrivilege,
+# which is what a Windows AppContainer validation token looks like (NF-2026-01042).
+_WINERROR_PRIVILEGE_NOT_HELD = 1314
+
+
+def symlink_or_skip(
+    src: os.PathLike[str] | str, dst: os.PathLike[str] | str
+) -> None:
+    """``os.symlink`` or skip when -- and only when -- the privilege is missing.
+
+    Every other ``OSError`` propagates: a skip must name a missing capability,
+    never hide a broken fixture.
+    """
+    try:
+        os.symlink(src, dst)
+    except OSError as exc:
+        if getattr(exc, "winerror", None) == _WINERROR_PRIVILEGE_NOT_HELD:
+            pytest.skip(
+                "symlink privilege not held (WinError 1314, "
+                "SeCreateSymbolicLinkPrivilege missing from this token)"
+            )
+        if sys.platform != "win32" and exc.errno == errno.EPERM:
+            pytest.skip("symlink creation not permitted here (EPERM)")
+        raise
+
+
+@pytest.fixture
+def make_symlink():
+    return symlink_or_skip
