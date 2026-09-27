@@ -1494,8 +1494,45 @@ CLAUDE_MANAGER_DISALLOWED_TOOLS: tuple[str, ...] = (
     *CLAUDE_WORKER_RAW_EDITOR_DENIES,
 )
 
+# Shell selector for the claude_cli worker tool lists (NF-2026-01043).  Git
+# Bash/msys cannot start inside the Windows agent-lane AppContainer (bash.exe
+# 0xC0000142; the CLI's Bash tool exits 66), while Windows PowerShell and pwsh
+# run native commands there, so a contained Windows worker is handed Claude's
+# ``PowerShell`` tool in place of ``Bash``.  ``Bash`` stays the default so every
+# existing caller -- ``provider_tool_guards`` included -- gets today's lists
+# byte-for-byte.
+CLAUDE_SHELL_BASH = "Bash"
+CLAUDE_SHELL_POWERSHELL = "PowerShell"
+CLAUDE_SHELLS: tuple[str, ...] = (CLAUDE_SHELL_BASH, CLAUDE_SHELL_POWERSHELL)
 
-def claude_allowed_tools(*, read_only: bool) -> tuple[str, ...]:
+# PowerShell-native raw discovery, denied in PowerShell mode beside the
+# ``PowerShell(...)`` mirrors of every ``Bash(...)`` prefix deny.  Scope,
+# stated exactly as for the Bash rules: these are PREFIX rules, so they catch
+# the common recursive-listing and text-search spellings and cannot catch
+# every one -- ``Get-ChildItem -Path . -Recurse``, ``gci -r`` or a pipeline
+# through ``Where-Object`` pass.  The worker runtime policy states the rule in
+# words for exactly that reason.
+CLAUDE_POWERSHELL_RAW_DISCOVERY_PREFIXES: tuple[str, ...] = (
+    "Get-ChildItem -Recurse",
+    "gci -Recurse",
+    "dir -Recurse",
+    "ls -Recurse",
+    "Select-String",
+    "sls",
+)
+CLAUDE_POWERSHELL_RAW_DISCOVERY_DENIES: tuple[str, ...] = tuple(
+    f"PowerShell({prefix} *)" for prefix in CLAUDE_POWERSHELL_RAW_DISCOVERY_PREFIXES
+)
+
+
+def _check_claude_shell(shell: str) -> None:
+    if shell not in CLAUDE_SHELLS:
+        raise ValueError(f"unsupported claude shell: {shell!r}")
+
+
+def claude_allowed_tools(
+    *, read_only: bool, shell: str = CLAUDE_SHELL_BASH
+) -> tuple[str, ...]:
     """Tools this role can actually use -- never the union of every role.
 
     Every worker used to receive one flat list: a strictly read-only reviewer
@@ -1503,14 +1540,24 @@ def claude_allowed_tools(*, read_only: bool) -> tuple[str, ...]:
     reviewer's submit channel. Each tool's schema is prompt text the model
     pays for on every turn, and a tool the sandbox will refuse is worse than
     absent -- it is an invitation to spend a turn discovering that.
+
+    ``shell=CLAUDE_SHELL_POWERSHELL`` holds ``PowerShell`` in place of
+    ``Bash``; the rest of the role's list is unchanged.
     """
 
+    _check_claude_shell(shell)
     if read_only:
-        return (*CLAUDE_READ_TOOLS, *CLAUDE_REVIEWER_SEARCH_TOOLS, *CLAUDE_REVIEW_TOOLS)
-    return (*CLAUDE_READ_TOOLS, *CLAUDE_WRITE_TOOLS)
+        tools = (*CLAUDE_READ_TOOLS, *CLAUDE_REVIEWER_SEARCH_TOOLS, *CLAUDE_REVIEW_TOOLS)
+    else:
+        tools = (*CLAUDE_READ_TOOLS, *CLAUDE_WRITE_TOOLS)
+    if shell == CLAUDE_SHELL_BASH:
+        return tools
+    return tuple(shell if tool == CLAUDE_SHELL_BASH else tool for tool in tools)
 
 
-def claude_disallowed_tools(*, read_only: bool) -> tuple[str, ...]:
+def claude_disallowed_tools(
+    *, read_only: bool, shell: str = CLAUDE_SHELL_BASH
+) -> tuple[str, ...]:
     """The ``--disallowedTools`` list for this role.
 
     A build worker is denied raw discovery in every form (native ``Grep``/
@@ -1524,14 +1571,34 @@ def claude_disallowed_tools(*, read_only: bool) -> tuple[str, ...]:
     tools that would file its report where the supervisor never reads; it
     holds no card validation to route and no tree it may write, so neither the
     validation nor the editor denies apply to it.
+
+    ``shell=CLAUDE_SHELL_POWERSHELL`` keeps that list and adds ``Bash`` itself,
+    a ``PowerShell(...)`` mirror of every ``Bash(...)`` prefix deny, and
+    ``CLAUDE_POWERSHELL_RAW_DISCOVERY_DENIES``.
     """
 
+    _check_claude_shell(shell)
     if read_only:
-        return (*CLAUDE_RAW_DISCOVERY_SHELL_DENIES, *CLAUDE_REVIEWER_HOST_TOOL_DENIES)
+        denies = (*CLAUDE_RAW_DISCOVERY_SHELL_DENIES, *CLAUDE_REVIEWER_HOST_TOOL_DENIES)
+    else:
+        denies = (
+            *CLAUDE_RAW_DISCOVERY_DENIES,
+            *CLAUDE_WORKER_VALIDATION_SHELL_DENIES,
+            *CLAUDE_WORKER_RAW_EDITOR_DENIES,
+        )
+    if shell == CLAUDE_SHELL_BASH:
+        return denies
+    bash_prefix = f"{CLAUDE_SHELL_BASH}("
+    mirrors = tuple(
+        f"{CLAUDE_SHELL_POWERSHELL}({deny[len(bash_prefix):]}"
+        for deny in denies
+        if deny.startswith(bash_prefix)
+    )
     return (
-        *CLAUDE_RAW_DISCOVERY_DENIES,
-        *CLAUDE_WORKER_VALIDATION_SHELL_DENIES,
-        *CLAUDE_WORKER_RAW_EDITOR_DENIES,
+        *denies,
+        CLAUDE_SHELL_BASH,
+        *mirrors,
+        *CLAUDE_POWERSHELL_RAW_DISCOVERY_DENIES,
     )
 
 
@@ -2077,6 +2144,12 @@ def build_runtime_command(
 
     stdin_text: str | None = None
     if adapter_id == "claude_cli":
+        # A non-manager Windows launch reaching here runs in the AppContainer
+        # (refused above otherwise), where Git Bash cannot start: hand it the
+        # PowerShell tool lists instead (NF-2026-01043).
+        worker_shell = (
+            CLAUDE_SHELL_POWERSHELL if _is_windows_host() else CLAUDE_SHELL_BASH
+        )
         argv = [
             executable,
             "-p",
@@ -2089,14 +2162,14 @@ def build_runtime_command(
             *(
                 CLAUDE_MANAGER_ALLOWED_TOOLS
                 if _manager_host
-                else claude_allowed_tools(read_only=read_only)
+                else claude_allowed_tools(read_only=read_only, shell=worker_shell)
             ),
             "--no-session-persistence",
             "--disallowedTools",
             *(
                 CLAUDE_MANAGER_DISALLOWED_TOOLS
                 if _manager_host
-                else claude_disallowed_tools(read_only=read_only)
+                else claude_disallowed_tools(read_only=read_only, shell=worker_shell)
             ),
         ]
         # Partial-message mode emits a JSON event for nearly every provider

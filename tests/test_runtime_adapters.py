@@ -68,6 +68,73 @@ def test_claude_argv_is_current_noninteractive_shape(monkeypatch, tmp_path):
     assert plan.stdin_text == "Implement the focused change"
 
 
+def _claude_tool_lists(argv: list[str]) -> tuple[list[str], list[str]]:
+    allowed = argv[argv.index("--allowedTools") + 1: argv.index("--no-session-persistence")]
+    rest = argv[argv.index("--disallowedTools") + 1:]
+    denied = rest[: rest.index("--model")] if "--model" in rest else rest
+    return allowed, denied
+
+
+@pytest.mark.parametrize("read_only", [False, True])
+def test_claude_windows_appcontainer_worker_gets_powershell_lists(
+    monkeypatch, tmp_path, read_only
+):
+    """NF-2026-01043: Git Bash cannot start inside the AppContainer."""
+    monkeypatch.setattr(runtime_adapters, "_is_windows_host", lambda: True)
+    executable = _executable(tmp_path, "claude")
+    plan = runtime_adapters.build_runtime_command(
+        "claude_cli",
+        "Prompt",
+        tmp_path,
+        read_only=read_only,
+        executable_overrides={"claude_cli": str(executable)},
+        outer_sandbox_backend=runtime_adapters.WINDOWS_APPCONTAINER_SANDBOX_BACKEND,
+    )
+
+    assert plan.argv, plan.validation_reason
+    allowed, denied = _claude_tool_lists(plan.argv)
+    shell = runtime_adapters.CLAUDE_SHELL_POWERSHELL
+    assert allowed == list(
+        runtime_adapters.claude_allowed_tools(read_only=read_only, shell=shell)
+    )
+    assert denied == list(
+        runtime_adapters.claude_disallowed_tools(read_only=read_only, shell=shell)
+    )
+    assert "PowerShell" in allowed and "Bash" not in allowed
+    assert "Bash" in denied
+
+
+def test_claude_non_windows_worker_argv_is_unchanged(tmp_path):
+    executable = _executable(tmp_path, "claude")
+    plan = runtime_adapters.build_runtime_command(
+        "claude_cli",
+        "Prompt",
+        tmp_path,
+        executable_overrides={"claude_cli": str(executable)},
+    )
+
+    allowed, denied = _claude_tool_lists(plan.argv)
+    assert allowed == list(runtime_adapters.claude_allowed_tools(read_only=False))
+    assert denied == list(runtime_adapters.claude_disallowed_tools(read_only=False))
+    assert not any(tool.startswith("PowerShell") for tool in allowed + denied)
+
+
+def test_claude_windows_manager_host_argv_is_unchanged(monkeypatch, tmp_path):
+    monkeypatch.setattr(runtime_adapters, "_is_windows_host", lambda: True)
+    executable = _executable(tmp_path, "claude")
+    plan = runtime_adapters.build_manager_command(
+        "claude_cli",
+        "Prompt",
+        tmp_path,
+        executable_overrides={"claude_cli": str(executable)},
+    )
+
+    assert plan.argv, plan.validation_reason
+    allowed, denied = _claude_tool_lists(plan.argv)
+    assert allowed == list(runtime_adapters.CLAUDE_MANAGER_ALLOWED_TOOLS)
+    assert denied == list(runtime_adapters.CLAUDE_MANAGER_DISALLOWED_TOOLS)
+
+
 def test_claude_partial_stream_is_opt_in_for_explicit_live_budget(
     monkeypatch, tmp_path
 ):
@@ -717,7 +784,7 @@ def test_grok_kilo_path_discovery_precedes_extension_fallback(monkeypatch, tmp_p
     assert plan.executable == str(path_kilo)
 
 
-def test_grok_kilo_extension_symlink_is_rejected(monkeypatch, tmp_path):
+def test_grok_kilo_extension_symlink_is_rejected(monkeypatch, tmp_path, make_symlink):
     repo = tmp_path / "repo"
     repo.mkdir()
     root = tmp_path / "extensions"
@@ -726,7 +793,7 @@ def test_grok_kilo_extension_symlink_is_rejected(monkeypatch, tmp_path):
     real = _executable(real_bin, "kilo")
     link = root / "kilocode.kilo-code-9.0.0" / "bin" / "kilo"
     link.parent.mkdir(parents=True)
-    link.symlink_to(real)
+    make_symlink(real, link)
     monkeypatch.setattr(runtime_adapters.shutil, "which", lambda _: None)
     monkeypatch.setattr(
         runtime_adapters, "_default_kilo_extension_roots", lambda: (root,)

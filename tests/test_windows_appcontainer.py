@@ -392,7 +392,7 @@ def test_request_local_opencode_config_and_home_reach_the_child_unchanged():
     # the request environment after both launch_appcontainer chokepoints:
     # LOCALAPPDATA, supplied when it is absent because AppContainer process
     # creation fails without it (203), and the ce33d1c/71c2fe4 agent-shell
-    # rewrite, which adds COMSPEC=powershell and AIWORKHUB_APPCONTAINER_SHELL.
+    # rewrite, which adds AIWORKHUB_APPCONTAINER_SHELL and leaves COMSPEC.
     # Both add only on Windows, so a non-Windows host adds nothing.  Neither
     # may trim or re-derive a key the supervisor handed over.
     child_environment = dict(fake.spec.environment)
@@ -402,8 +402,10 @@ def test_request_local_opencode_config_and_home_reach_the_child_unchanged():
     )
     assert set(child_environment) - set(environment) <= {
         "LOCALAPPDATA",
-        "COMSPEC",
         "AIWORKHUB_APPCONTAINER_SHELL",
+        # NF-2026-01043: the CLI's PowerShell tool, and the PATHEXT it needs.
+        "CLAUDE_CODE_USE_POWERSHELL_TOOL",
+        "PATHEXT",
     }
     if os.name == "nt":
         assert child_environment["AIWORKHUB_APPCONTAINER_SHELL"] == "powershell"
@@ -4007,7 +4009,7 @@ def test_launch_error_carries_sizes_and_paths_as_text_and_attributes():
     # The launch measures the block it actually hands CreateProcessW, which is
     # the request environment after the LOCALAPPDATA chokepoint adds to it and,
     # on this default agent lane (agent_shell=True), after the ce33d1c/71c2fe4
-    # shell rewrite adds COMSPEC and AIWORKHUB_APPCONTAINER_SHELL.
+    # shell rewrite adds AIWORKHUB_APPCONTAINER_SHELL.
     assert request.agent_shell is True
     launched_environment = wac.appcontainer_shell_environment(
         wac.appcontainer_child_environment(request.environment)
@@ -4355,9 +4357,6 @@ def test_helper_temp_plan_fails_closed_when_no_short_private_temp_fits(monkeypat
 
 def test_appcontainer_shell_drops_git_bash_and_uses_powershell(monkeypatch):
     monkeypatch.setattr(wac.os, "name", "nt")
-    monkeypatch.setattr(
-        wac, "_powershell_executable", lambda: r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
-    )
     env = {
         "PATH": os.pathsep.join([
             r"C:\Program Files\Git\bin",
@@ -4372,10 +4371,70 @@ def test_appcontainer_shell_drops_git_bash_and_uses_powershell(monkeypatch):
     assert r"Git\bin" not in rewritten["PATH"]
     assert r"Git\usr\bin" not in rewritten["PATH"]
     assert rewritten["PATH"].endswith(r"C:\Windows\System32")
-    assert rewritten["COMSPEC"].endswith("powershell.exe")
+    assert rewritten["COMSPEC"] == r"C:\Windows\System32\cmd.exe"
     assert rewritten["AIWORKHUB_APPCONTAINER_SHELL"] == "powershell"
     assert "CLAUDE_CODE_GIT_BASH_PATH" not in rewritten
+    assert rewritten["CLAUDE_CODE_USE_POWERSHELL_TOOL"] == "1"
+    assert "PATHEXT" in rewritten
     assert wac.appcontainer_shell_environment(None) is None
+
+
+def test_appcontainer_shell_keeps_the_given_comspec(monkeypatch):
+    """NF-2026-01046: subprocess(shell=True), os.system and Node exec spawn
+    '%COMSPEC% /c', which powershell.exe cannot run, and cmd.exe starts in
+    the container, so COMSPEC passes through while the PowerShell tool is on."""
+    monkeypatch.setattr(wac.os, "name", "nt")
+    comspec = r"C:\Windows\System32\cmd.exe"
+    rewritten = wac.appcontainer_shell_environment({"ComSpec": comspec})
+    assert rewritten["ComSpec"] == comspec
+    assert [key for key in rewritten if key.upper() == "COMSPEC"] == ["ComSpec"]
+    assert rewritten["CLAUDE_CODE_USE_POWERSHELL_TOOL"] == "1"
+
+
+def test_appcontainer_shell_enables_the_claude_powershell_tool(monkeypatch):
+    """NF-2026-01043: Claude CLI picks Bash when Git Bash is found on disk,
+    which it is inside the container, so the PowerShell tool is forced on and
+    PATHEXT (without which PowerShell cannot run native commands) supplied."""
+    monkeypatch.setattr(wac.os, "name", "nt")
+    monkeypatch.setitem(wac.os.environ, "PATHEXT", ".EXE;.CMD")
+    rewritten = wac.appcontainer_shell_environment({"FOO": "bar"})
+    assert rewritten["CLAUDE_CODE_USE_POWERSHELL_TOOL"] == "1"
+    assert rewritten["PATHEXT"] == ".EXE;.CMD"
+    assert rewritten["FOO"] == "bar"
+    assert not any(key.upper() == "COMSPEC" for key in rewritten)
+
+
+def test_appcontainer_shell_keeps_an_existing_pathext_of_any_case(monkeypatch):
+    monkeypatch.setattr(wac.os, "name", "nt")
+    monkeypatch.setitem(wac.os.environ, "PATHEXT", ".HOST")
+    rewritten = wac.appcontainer_shell_environment({"PathExt": ".COM;.EXE"})
+    assert rewritten["PathExt"] == ".COM;.EXE"
+    assert [key for key in rewritten if key.upper() == "PATHEXT"] == ["PathExt"]
+
+
+def test_appcontainer_shell_falls_back_to_the_windows_default_pathext(monkeypatch):
+    monkeypatch.setattr(wac.os, "name", "nt")
+    monkeypatch.delitem(wac.os.environ, "PATHEXT", raising=False)
+    rewritten = wac.appcontainer_shell_environment({})
+    assert rewritten["PATHEXT"] == ".COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC"
+
+
+def test_appcontainer_shell_returns_the_input_when_already_rewritten(monkeypatch):
+    monkeypatch.setattr(wac.os, "name", "nt")
+    env = {
+        "PATH": r"C:\Windows\System32",
+        "PATHEXT": ".EXE",
+        "COMSPEC": r"C:\Windows\System32\cmd.exe",
+        "AIWORKHUB_APPCONTAINER_SHELL": "powershell",
+        "CLAUDE_CODE_USE_POWERSHELL_TOOL": "1",
+    }
+    assert wac.appcontainer_shell_environment(env) is env
+
+
+def test_appcontainer_shell_is_a_no_op_off_windows(monkeypatch):
+    monkeypatch.setattr(wac.os, "name", "posix")
+    env = {"PATH": "/usr/bin"}
+    assert wac.appcontainer_shell_environment(env) is env
 
 
 def test_launch_appcontainer_keeps_git_bash_when_agent_shell_is_false(monkeypatch):

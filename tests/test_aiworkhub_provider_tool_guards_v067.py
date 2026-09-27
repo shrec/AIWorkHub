@@ -303,3 +303,34 @@ def test_an_owner_deny_is_never_dropped_by_the_role_rewrite(tmp_path: Path) -> N
     assert "Bash(curl *)" in settings["permissions"]["deny"]
     assert "WebFetch" in settings["permissions"]["deny"]
     assert not ({"Grep", "Glob"} & set(settings["permissions"]["deny"]))
+
+
+def test_the_launch_only_powershell_mode_never_reaches_a_tracked_tree(
+    tmp_path: Path,
+) -> None:
+    """NF-2026-01043: the PowerShell-mode lists are argv-only, like validation.
+
+    Only a contained Windows worker launch selects them.  The tracked settings
+    file is shared with the manager seat and human sessions, which keep Bash,
+    so no settings surface may carry a ``Bash`` or ``PowerShell(...)`` deny.
+    """
+    from aiworkhub import runtime_adapters as ra
+
+    for read_only in (True, False):
+        powershell_argv = set(
+            ra.claude_disallowed_tools(read_only=read_only, shell=ra.CLAUDE_SHELL_POWERSHELL)
+        )
+        bash_argv = set(ra.claude_disallowed_tools(read_only=read_only))
+        assert bash_argv < powershell_argv
+        launch_only = powershell_argv - bash_argv
+        assert "Bash" in launch_only
+        assert set(ra.CLAUDE_POWERSHELL_RAW_DISCOVERY_DENIES) <= launch_only
+        settings = set(provider_tool_guards.claude_settings_deny(read_only=read_only))
+        assert not (launch_only & settings)
+
+    root = tmp_path / "repo"
+    root.mkdir()
+    provider_tool_guards.apply_repository_guards(root)
+    tree_deny = set(_deny(root))
+    assert "Bash" not in tree_deny
+    assert not any(deny.startswith("PowerShell") for deny in tree_deny)

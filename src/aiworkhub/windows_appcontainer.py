@@ -1492,22 +1492,30 @@ def _path_entry_is_git_bash(entry: str) -> bool:
     )
 
 
-def _powershell_executable() -> str:
-    windows = _system_windows_directory() if os.name == "nt" else ""
-    if not windows:
-        return ""
-    candidate = os.path.join(
-        windows, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"
-    )
-    return candidate if os.path.isfile(candidate) else ""
+_USE_POWERSHELL_TOOL_ENV = "CLAUDE_CODE_USE_POWERSHELL_TOOL"
+_PATHEXT_ENV = "PATHEXT"
+_DEFAULT_PATHEXT = ".COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC"
 
 
 def appcontainer_shell_environment(
     environment: Mapping[str, str] | None,
 ) -> Mapping[str, str] | None:
+    """Rewrite the agent-lane child environment for a shell that can start.
+
+    NF-2026-01043: Git Bash/msys cannot start inside an AppContainer
+    (bash.exe 0xC0000142), while Windows PowerShell and pwsh run native
+    commands there -- but only when ``PATHEXT`` is present.  Claude CLI
+    enables its PowerShell tool on Windows when
+    ``CLAUDE_CODE_USE_POWERSHELL_TOOL`` is set, and otherwise only when Git
+    Bash is NOT found, which it is at the default install path.  So the flag is
+    set explicitly and a ``PATHEXT`` entry is guaranteed: an existing key of
+    any case is kept unchanged, else the host's value, else the Windows
+    default.  ``COMSPEC`` is left as given because cmd.exe starts in the
+    container and runtimes spawn ``%COMSPEC% /c``.  Off Windows, and for
+    ``None``, the input is returned unchanged.
+    """
     if environment is None or os.name != "nt":
         return environment
-    powershell = _powershell_executable()
     rewritten = dict(environment)
     changed = False
     for key, value in list(rewritten.items()):
@@ -1521,11 +1529,14 @@ def appcontainer_shell_environment(
         if joined != value:
             rewritten[key] = joined
             changed = True
-    if powershell and rewritten.get("COMSPEC") != powershell:
-        rewritten["COMSPEC"] = powershell
-        changed = True
     if rewritten.get("AIWORKHUB_APPCONTAINER_SHELL") != "powershell":
         rewritten["AIWORKHUB_APPCONTAINER_SHELL"] = "powershell"
+        changed = True
+    if rewritten.get(_USE_POWERSHELL_TOOL_ENV) != "1":
+        rewritten[_USE_POWERSHELL_TOOL_ENV] = "1"
+        changed = True
+    if not any(key.upper() == _PATHEXT_ENV for key in rewritten):
+        rewritten[_PATHEXT_ENV] = os.environ.get(_PATHEXT_ENV) or _DEFAULT_PATHEXT
         changed = True
     for key in list(rewritten):
         if key.upper() == "CLAUDE_CODE_GIT_BASH_PATH":

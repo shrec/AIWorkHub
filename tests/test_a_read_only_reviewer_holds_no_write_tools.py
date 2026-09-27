@@ -232,3 +232,75 @@ def test_the_default_is_the_writing_role(tmp_path):
     if plan.argv:
         allowed = plan.argv[plan.argv.index("--allowedTools") + 1:]
         assert "Write" in allowed[: allowed.index("--no-session-persistence")]
+
+
+def test_the_default_shell_is_bash_and_byte_identical():
+    """NF-2026-01043: the new selector must not move any existing caller."""
+    for read_only in (True, False):
+        assert ra.claude_allowed_tools(read_only=read_only) == ra.claude_allowed_tools(
+            read_only=read_only, shell=ra.CLAUDE_SHELL_BASH
+        )
+        assert ra.claude_disallowed_tools(
+            read_only=read_only
+        ) == ra.claude_disallowed_tools(read_only=read_only, shell=ra.CLAUDE_SHELL_BASH)
+        assert "Bash" in ra.claude_allowed_tools(read_only=read_only)
+        assert "PowerShell" not in ra.claude_allowed_tools(read_only=read_only)
+        assert not any(
+            tool.startswith("PowerShell")
+            for tool in ra.claude_disallowed_tools(read_only=read_only)
+        )
+
+
+def test_a_read_only_reviewer_in_powershell_mode_still_cannot_write():
+    shell = ra.CLAUDE_SHELL_POWERSHELL
+    tools = set(ra.claude_allowed_tools(read_only=True, shell=shell))
+    denied = set(ra.claude_disallowed_tools(read_only=True, shell=shell))
+
+    assert "PowerShell" in tools
+    assert "Bash" not in tools
+    assert not (tools & set(ra.CLAUDE_WRITE_TOOLS))
+    assert set(ra.CLAUDE_REVIEWER_HOST_TOOL_DENIES) <= denied
+    assert "Bash" in denied
+    assert {"PowerShell(grep *)", "PowerShell(rg *)", "PowerShell(find *)",
+            "PowerShell(tree *)"} <= denied
+    assert set(ra.CLAUDE_POWERSHELL_RAW_DISCOVERY_DENIES) <= denied
+    # A reviewer holds no card validation to route, in either shell.
+    assert not any("pytest" in deny for deny in denied)
+    assert not (tools & denied)
+
+
+def test_a_build_worker_in_powershell_mode_mirrors_every_bash_deny():
+    shell = ra.CLAUDE_SHELL_POWERSHELL
+    tools = set(ra.claude_allowed_tools(read_only=False, shell=shell))
+    denied = set(ra.claude_disallowed_tools(read_only=False, shell=shell))
+    bash_denies = [
+        deny for deny in ra.claude_disallowed_tools(read_only=False)
+        if deny.startswith("Bash(")
+    ]
+
+    assert "PowerShell" in tools and "Bash" not in tools
+    assert set(ra.CLAUDE_WRITE_TOOLS) <= tools
+    assert "Bash" in denied
+    assert bash_denies
+    for deny in bash_denies:
+        assert "PowerShell(" + deny[len("Bash("):] in denied
+    assert {"PowerShell(pytest *)", "PowerShell(ruff *)", "PowerShell(mypy *)"} <= denied
+    assert {
+        "PowerShell(Get-ChildItem -Recurse *)",
+        "PowerShell(gci -Recurse *)",
+        "PowerShell(dir -Recurse *)",
+        "PowerShell(ls -Recurse *)",
+        "PowerShell(Select-String *)",
+        "PowerShell(sls *)",
+    } <= denied
+    assert set(ra.CLAUDE_RAW_DISCOVERY_DENIES) <= denied
+    assert not (tools & denied)
+
+
+def test_an_unknown_shell_is_refused():
+    import pytest
+
+    with pytest.raises(ValueError):
+        ra.claude_allowed_tools(read_only=False, shell="cmd")
+    with pytest.raises(ValueError):
+        ra.claude_disallowed_tools(read_only=True, shell="bash")
