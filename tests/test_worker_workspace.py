@@ -8568,6 +8568,100 @@ def test_validation_worker_package_support_carries_every_runtime_sibling() -> No
     assert "src/aiworkhub/opencode_auth.py" in support
 
 
+# --- NF-2026-01024: importlib.import_module dynamic edges follow siblings --
+#
+# A dynamic ``importlib.import_module`` call is not an ``ast.Import``/
+# ``ast.ImportFrom`` node, but ``platform_io.py`` uses exactly this shape to
+# load ``_platform_process`` -- and precedes it with an ``if TYPE_CHECKING:``
+# guard, whose compound ``ast.If`` previously reset the sticky importlib trust
+# before the call was ever reached. A sparse worktree that materializes
+# ``platform_io.py`` without its dynamically-loaded sibling breaks every
+# import of the package at validation time.
+
+
+def _write_python_module(repo: Path, relative: str, source: str) -> None:
+    path = repo / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(source, encoding="utf-8")
+
+
+_PLATFORM_IO_STYLE_DYNAMIC_IMPORT_MODULE = (
+    "import importlib\n"
+    "from typing import TYPE_CHECKING\n"
+    "\n"
+    "if TYPE_CHECKING:\n"
+    "    from . import _typing_only_helper\n"
+    "\n"
+    "_sibling = importlib.import_module(\n"
+    '    "._sibling" if __package__ else "_sibling",\n'
+    "    __package__ or None,\n"
+    ")\n"
+)
+
+
+def test_dynamic_import_module_ifexp_pulls_sibling_past_type_checking_guard(
+    repo: Path,
+) -> None:
+    """The platform_io.py:60 shape: an ``if TYPE_CHECKING:`` guard precedes the
+    dynamic import, and the closure must still follow it through to the
+    dynamically-loaded sibling."""
+    _write_python_module(repo, "src/pkgtest_platform_io/__init__.py", "")
+    _write_python_module(
+        repo,
+        "src/pkgtest_platform_io/mod.py",
+        _PLATFORM_IO_STYLE_DYNAMIC_IMPORT_MODULE,
+    )
+    _write_python_module(repo, "src/pkgtest_platform_io/_typing_only_helper.py", "")
+    _write_python_module(repo, "src/pkgtest_platform_io/_sibling.py", "")
+
+    result = worker_workspace._resolve_local_python_imports(
+        repo, ("src/pkgtest_platform_io/mod.py",)
+    )
+
+    assert "src/pkgtest_platform_io/_sibling.py" in result
+
+
+def test_dynamic_import_module_literal_pulls_sibling(repo: Path) -> None:
+    """A plain literal dotted argument is followed like a relative import."""
+    _write_python_module(repo, "src/pkgtest_direct_import/__init__.py", "")
+    _write_python_module(
+        repo,
+        "src/pkgtest_direct_import/mod.py",
+        "import importlib\n"
+        "\n"
+        '_sib = importlib.import_module("._sib", __package__)\n',
+    )
+    _write_python_module(repo, "src/pkgtest_direct_import/_sib.py", "")
+
+    result = worker_workspace._resolve_local_python_imports(
+        repo, ("src/pkgtest_direct_import/mod.py",)
+    )
+
+    assert "src/pkgtest_direct_import/_sib.py" in result
+
+
+def test_dynamic_import_module_non_literal_argument_pulls_nothing(repo: Path) -> None:
+    """A computed argument is never guessed at, and never raises."""
+    _write_python_module(repo, "src/pkgtest_computed_import/__init__.py", "")
+    _write_python_module(
+        repo,
+        "src/pkgtest_computed_import/mod.py",
+        "import importlib\n"
+        "\n"
+        '_name = "." + "sibling_via_variable"\n'
+        "_mod = importlib.import_module(_name, __package__)\n",
+    )
+    _write_python_module(
+        repo, "src/pkgtest_computed_import/sibling_via_variable.py", ""
+    )
+
+    result = worker_workspace._resolve_local_python_imports(
+        repo, ("src/pkgtest_computed_import/mod.py",)
+    )
+
+    assert "src/pkgtest_computed_import/sibling_via_variable.py" not in result
+
+
 def test_declared_seed_closure_materializes_the_opencode_auth_sibling(
     repo: Path,
 ) -> None:
@@ -9608,6 +9702,120 @@ def test_pytest_validation_seeds_literal_repository_asset_bounds_deep_parent_cha
     started = time.monotonic()
     assert worker_workspace._resolve_literal_repository_assets(repo, (module,)) == ()
     assert time.monotonic() - started < 10.0
+
+
+# --- NF-2026-01024: Path(<imported module>.__file__) sibling reads ----------
+#
+# tests/test_runtime_adapters.py:668-670 reads
+# ``Path(runtime_adapters.__file__).with_name("worker_supervisor.py")`` as
+# text.  ``worker_supervisor.py`` is never imported, so it stays skip-worktree
+# and the test fails only in the sparse worktree unless this exact literal
+# shape -- anchored on an imported module's own ``__file__``, not the
+# declaring test's -- is also recognized.
+
+
+def _write_pkgtest_sibling_asset_module(repo: Path) -> None:
+    package = repo / "src" / "pkgtest_sibling_asset"
+    package.mkdir(parents=True, exist_ok=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "mod.py").write_text("", encoding="utf-8")
+    _track(
+        repo,
+        "src/pkgtest_sibling_asset/__init__.py",
+        "src/pkgtest_sibling_asset/mod.py",
+    )
+
+
+_MODULE_FILE_WITH_NAME_ASSET_MODULE = (
+    "from pathlib import Path\n"
+    "from pkgtest_sibling_asset import mod\n"
+    "\n"
+    '_OTHER = Path(mod.__file__).with_name("other.py")\n'
+    "\n"
+    "\n"
+    "def test_other_is_readable() -> None:\n"
+    '    assert _OTHER.read_text(encoding="utf-8")\n'
+)
+
+_MODULE_FILE_PARENT_SLASH_ASSET_MODULE = (
+    "from pathlib import Path\n"
+    "from pkgtest_sibling_asset import mod\n"
+    "\n"
+    '_OTHER = Path(mod.__file__).parent / "other.py"\n'
+    "\n"
+    "\n"
+    "def test_other_is_readable() -> None:\n"
+    '    assert _OTHER.read_text(encoding="utf-8")\n'
+)
+
+_MODULE_FILE_DOT_PREFIXED_ASSET_MODULE = (
+    "from pathlib import Path\n"
+    "from pkgtest_sibling_asset import mod\n"
+    "\n"
+    '_HIDDEN = Path(mod.__file__).with_name(".hidden.py")\n'
+    "\n"
+    "\n"
+    "def test_hidden_is_readable() -> None:\n"
+    '    assert _HIDDEN.read_text(encoding="utf-8")\n'
+)
+
+
+def test_module_file_with_name_sibling_asset_is_seeded(repo: Path) -> None:
+    """``Path(<imported module>.__file__).with_name(<literal>)`` seeds the sibling."""
+    _write_pkgtest_sibling_asset_module(repo)
+    (repo / "src" / "pkgtest_sibling_asset" / "other.py").write_text(
+        "OTHER = True\n", encoding="utf-8"
+    )
+    _track(repo, "src/pkgtest_sibling_asset/other.py")
+    module = _write_declared_asset_module(repo, _MODULE_FILE_WITH_NAME_ASSET_MODULE)
+
+    result = worker_workspace._resolve_literal_repository_assets(repo, (module,))
+
+    assert result == ("src/pkgtest_sibling_asset/other.py",)
+
+
+def test_module_file_parent_slash_sibling_asset_is_seeded(repo: Path) -> None:
+    """``Path(<imported module>.__file__).parent / <literal>`` seeds the sibling."""
+    _write_pkgtest_sibling_asset_module(repo)
+    (repo / "src" / "pkgtest_sibling_asset" / "other.py").write_text(
+        "OTHER = True\n", encoding="utf-8"
+    )
+    _track(repo, "src/pkgtest_sibling_asset/other.py")
+    module = _write_declared_asset_module(repo, _MODULE_FILE_PARENT_SLASH_ASSET_MODULE)
+
+    result = worker_workspace._resolve_literal_repository_assets(repo, (module,))
+
+    assert result == ("src/pkgtest_sibling_asset/other.py",)
+
+
+def test_module_file_sibling_asset_refuses_untracked(repo: Path) -> None:
+    """A sibling reached through ``<module>.__file__`` still needs git tracking.
+
+    ``pkgtest_sibling_asset`` is a legitimate source package, so a path-shape
+    rule alone would happily copy anything dropped inside it; only the
+    git-tracked file is allowed across into the workspace.
+    """
+    _write_pkgtest_sibling_asset_module(repo)
+    (repo / "src" / "pkgtest_sibling_asset" / "other.py").write_text(
+        "OTHER = True\n", encoding="utf-8"
+    )
+    module = _write_declared_asset_module(repo, _MODULE_FILE_WITH_NAME_ASSET_MODULE)
+
+    assert worker_workspace._resolve_literal_repository_assets(repo, (module,)) == ()
+
+
+def test_module_file_sibling_asset_refuses_dot_prefixed(repo: Path) -> None:
+    """A dot-prefixed sibling name is refused even though it is tracked."""
+    _write_pkgtest_sibling_asset_module(repo)
+    (repo / "src" / "pkgtest_sibling_asset" / ".hidden.py").write_text(
+        "HIDDEN = True\n", encoding="utf-8"
+    )
+    _track(repo, "src/pkgtest_sibling_asset/.hidden.py")
+    module = _write_declared_asset_module(repo, _MODULE_FILE_DOT_PREFIXED_ASSET_MODULE)
+
+    assert worker_workspace._resolve_literal_repository_assets(repo, (module,)) == ()
+
+
 
 
 # A literal asset was nominated by a declared test module, not by the card, so

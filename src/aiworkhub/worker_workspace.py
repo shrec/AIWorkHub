@@ -1511,6 +1511,7 @@ def _resolve_local_python_imports(repo: Path, seeded: Iterable[str]) -> tuple[st
             ) from exc
         source_root, package_parts = package_context(relative)
         importlib_ok = False
+        import_module_ok = False
         importlib_tainted = False
         importlib_aliases: set[str] = set()
         package_ok = True
@@ -1548,6 +1549,37 @@ def _resolve_local_python_imports(repo: Path, seeded: Iterable[str]) -> tuple[st
                 return False
             return True if canonical else None
 
+        def import_module_binding(statement: ast.stmt) -> bool | None:
+            canonical = False
+            invalid = False
+            if isinstance(statement, ast.ImportFrom):
+                if statement.module == "importlib" and not statement.level:
+                    for alias in statement.names:
+                        bound_name = alias.asname or alias.name
+                        if bound_name != "import_module":
+                            continue
+                        canonical |= (
+                            alias.name == "import_module" and alias.asname is None
+                        )
+                        invalid |= alias.name != "import_module"
+                else:
+                    invalid = any(
+                        (alias.asname or alias.name) == "import_module"
+                        for alias in statement.names
+                    )
+            elif isinstance(statement, ast.Import):
+                invalid = any(
+                    (alias.asname or alias.name.split(".", 1)[0]) == "import_module"
+                    for alias in statement.names
+                )
+            elif isinstance(
+                statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+            ):
+                invalid = statement.name == "import_module"
+            if invalid:
+                return False
+            return True if canonical else None
+
         def names(expr: ast.expr) -> tuple[str, ...]:
             if isinstance(expr, ast.Constant) and isinstance(expr.value, str):
                 return (expr.value,)
@@ -1578,7 +1610,23 @@ def _resolve_local_python_imports(repo: Path, seeded: Iterable[str]) -> tuple[st
             return None
 
         def add_call(call: ast.Call) -> bool:
-            if not (importlib_ok and isinstance(call.func, ast.Attribute) and call.func.attr == "import_module" and isinstance(call.func.value, ast.Name) and call.func.value.id == "importlib" and len(call.args) <= 2 and not any(kw.arg is None for kw in call.keywords)):
+            attribute_form = (
+                isinstance(call.func, ast.Attribute)
+                and call.func.attr == "import_module"
+                and isinstance(call.func.value, ast.Name)
+                and call.func.value.id == "importlib"
+            )
+            bare_form = (
+                isinstance(call.func, ast.Name) and call.func.id == "import_module"
+            )
+            trusted = (importlib_ok and attribute_form) or (
+                import_module_ok and bare_form
+            )
+            if not (
+                trusted
+                and len(call.args) <= 2
+                and not any(kw.arg is None for kw in call.keywords)
+            ):
                 return False
             kwargs = {kw.arg: kw.value for kw in call.keywords}
             if (
@@ -1640,6 +1688,7 @@ def _resolve_local_python_imports(repo: Path, seeded: Iterable[str]) -> tuple[st
                 # Keep the importlib taint sticky across a later canonical reimport.
                 importlib_tainted = True
                 importlib_ok = False
+                import_module_ok = False
                 package_ok = False
                 getattr_ok = False
                 stdlib_bindings.clear()
@@ -1668,21 +1717,34 @@ def _resolve_local_python_imports(repo: Path, seeded: Iterable[str]) -> tuple[st
                     and module_file(("importlib",), source_root) is None
                 )
                 continue
+            import_module_binding_result = import_module_binding(statement)
+            if import_module_binding_result is not None:
+                import_module_ok = (
+                    import_module_binding_result
+                    and not importlib_tainted
+                    and module_file(("importlib",), source_root) is None
+                )
+                continue
             expression = (
                 statement.value
                 if isinstance(statement, (ast.Expr, ast.Assign, ast.AnnAssign))
                 else None
             )
-            direct_importlib_call = (
-                isinstance(expression, ast.Call)
-                and isinstance(expression.func, ast.Attribute)
-                and expression.func.attr == "import_module"
-                and isinstance(expression.func.value, ast.Name)
-                and expression.func.value.id == "importlib"
+            direct_import_module_call = isinstance(expression, ast.Call) and (
+                (
+                    isinstance(expression.func, ast.Attribute)
+                    and expression.func.attr == "import_module"
+                    and isinstance(expression.func.value, ast.Name)
+                    and expression.func.value.id == "importlib"
+                )
+                or (
+                    isinstance(expression.func, ast.Name)
+                    and expression.func.id == "import_module"
+                )
             )
             permitted_direct_call = bool(
-                importlib_ok
-                and direct_importlib_call
+                (importlib_ok or import_module_ok)
+                and direct_import_module_call
                 and add_call(expression)
             )
             safe_stdlib_getattr = bool(
@@ -1730,18 +1792,23 @@ def _resolve_local_python_imports(repo: Path, seeded: Iterable[str]) -> tuple[st
             # call is a sticky side-effect barrier.  This covers namespace
             # mutation APIs (including future ones) without trying to name them.
             unrecognized_call = (
-                importlib_ok
+                (importlib_ok or import_module_ok)
                 and not permitted_direct_call
                 and not safe_stdlib_getattr
                 and any(isinstance(item, ast.Call) for item in ast.walk(statement))
             )
             if unrecognized_call:
                 importlib_ok = False
+                import_module_ok = False
                 package_ok = False
                 getattr_ok = False
                 stdlib_bindings.clear()
             references_importlib = any(
                 isinstance(item, ast.Name) and item.id == "importlib"
+                for item in ast.walk(statement)
+            )
+            references_import_module = any(
+                isinstance(item, ast.Name) and item.id == "import_module"
                 for item in ast.walk(statement)
             )
             complex_store = any(
@@ -1757,14 +1824,28 @@ def _resolve_local_python_imports(repo: Path, seeded: Iterable[str]) -> tuple[st
                 and references_importlib
             ):
                 importlib_ok = False
+            if stores_name(statement, "import_module") or complex_store or (
+                not permitted_direct_call and references_import_module
+            ):
+                import_module_ok = False
             if stores_name(statement, "__package__") or complex_store: package_ok = False
             if stores_name(statement, "getattr") or complex_store:
                 getattr_ok = False
             for bound_name in tuple(stdlib_bindings):
                 if stores_name(statement, bound_name) or complex_store:
                     stdlib_bindings.discard(bound_name)
-            if isinstance(statement, (ast.If, ast.For, ast.AsyncFor, ast.While, ast.Try, ast.TryStar, ast.With, ast.AsyncWith, ast.Match)):
+            is_type_checking_guard = (
+                isinstance(statement, ast.If)
+                and isinstance(statement.test, ast.Name)
+                and statement.test.id == "TYPE_CHECKING"
+                and not statement.orelse
+            )
+            if (
+                isinstance(statement, (ast.If, ast.For, ast.AsyncFor, ast.While, ast.Try, ast.TryStar, ast.With, ast.AsyncWith, ast.Match))
+                and not is_type_checking_guard
+            ):
                 importlib_ok = False
+                import_module_ok = False
                 package_ok = False
                 getattr_ok = False
                 stdlib_bindings.clear()
@@ -2064,6 +2145,45 @@ def _tracked_repository_paths(repo: Path, candidates: Iterable[str]) -> set[str]
     return {row for row in completed.stdout.split("\x00") if row}
 
 
+def _imported_module_file(repo: Path, tree: ast.Module, name: str) -> Path | None:
+    """Resolve a plain name a declared test module imports to a repository file.
+
+    Only a top-level ``import pkg.mod [as name]`` or ``from pkg import mod``
+    binding is recognized; a name left unresolved (a symbol rather than a
+    module, or bound some other way) simply names no anchor.
+    """
+    parts: tuple[str, ...] | None = None
+    for statement in ast.walk(tree):
+        if isinstance(statement, ast.Import):
+            for alias in statement.names:
+                bound = alias.asname or alias.name.split(".", 1)[0]
+                if bound == name:
+                    dotted = alias.name if alias.asname else bound
+                    parts = tuple(dotted.split("."))
+        elif (
+            isinstance(statement, ast.ImportFrom)
+            and not statement.level
+            and statement.module
+        ):
+            base = tuple(statement.module.split("."))
+            for alias in statement.names:
+                if (alias.asname or alias.name) == name:
+                    parts = base + (alias.name,)
+    if not parts or any(not part.isidentifier() for part in parts):
+        return None
+    for root in (repo, repo / "src"):
+        if not root.is_dir() or root.is_symlink():
+            continue
+        for candidate in (
+            root.joinpath(*parts).with_suffix(".py"),
+            root.joinpath(*parts, "__init__.py"),
+        ):
+            resolved = _require_beneath(repo, candidate)
+            if resolved.is_file():
+                return resolved
+    return None
+
+
 def _resolve_literal_repository_assets(
     repo: Path, test_files: Iterable[str]
 ) -> tuple[str, ...]:
@@ -2145,6 +2265,66 @@ def _resolve_literal_repository_assets(
             if _is_private_repository_path(asset) or asset in rows:
                 continue
             rows.add(asset)
+            if len(rows) > MAX_SEED_FILES:
+                raise WorkspaceError(f"seed_file_limit_exceeded:{len(rows)}")
+        for node in ast.walk(tree):
+            base: ast.expr | None = None
+            literal: str | None = None
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "with_name"
+                and len(node.args) == 1
+                and not node.keywords
+                and isinstance(node.args[0], ast.Constant)
+                and isinstance(node.args[0].value, str)
+            ):
+                base, literal = node.func.value, node.args[0].value
+            elif (
+                isinstance(node, ast.BinOp)
+                and isinstance(node.op, ast.Div)
+                and isinstance(node.right, ast.Constant)
+                and isinstance(node.right.value, str)
+                and isinstance(node.left, ast.Attribute)
+                and node.left.attr == "parent"
+            ):
+                base, literal = node.left.value, node.right.value
+            if base is None or literal is None:
+                continue
+            if not (
+                isinstance(base, ast.Call)
+                and isinstance(base.func, ast.Name)
+                and base.func.id == "Path"
+                and len(base.args) == 1
+                and not base.keywords
+                and isinstance(base.args[0], ast.Attribute)
+                and base.args[0].attr == "__file__"
+                and isinstance(base.args[0].value, ast.Name)
+            ):
+                continue
+            # ``<name>.__file__`` names a module the declared test imports, not
+            # the test file itself, so its sibling lives beside a different
+            # file than every other literal asset resolved above.
+            module_file_path = _imported_module_file(repo, tree, base.args[0].value.id)
+            if module_file_path is None:
+                continue
+            try:
+                sibling_candidate = module_file_path.with_name(literal)
+            except ValueError:
+                # ``with_name`` refuses a literal containing a path separator
+                # or naming no file at all; neither can resolve to an asset.
+                continue
+            if _is_unrepresentable_path(sibling_candidate):
+                continue
+            resolved_sibling = _require_beneath(repo, sibling_candidate)
+            if not resolved_sibling.is_file():
+                continue
+            sibling_asset = _relative_repo_path(
+                resolved_sibling.relative_to(repo).as_posix()
+            )
+            if _is_private_repository_path(sibling_asset) or sibling_asset in rows:
+                continue
+            rows.add(sibling_asset)
             if len(rows) > MAX_SEED_FILES:
                 raise WorkspaceError(f"seed_file_limit_exceeded:{len(rows)}")
     # Bound the scan first (above), then authenticate what survived: the limit
