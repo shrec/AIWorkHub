@@ -833,6 +833,7 @@ def accept_preview(self, request_id: str, task_id: str, **overrides: Any) -> dic
 # global enters this body unannounced" -- and a name that belongs to neither
 # list is exactly the drift it exists to catch.
 ACCEPT_REVIEW_LOCAL_NAMES: tuple[str, ...] = (
+    "_accept_manager_identity",
     "create_supplemental_inspection_rounds",
     "effective_requested_risk_tier",
     "fold_accept_blockers",
