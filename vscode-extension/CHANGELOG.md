@@ -1,5 +1,17 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.99 — 2026-09-27
+
+### Fixed
+
+- Reading NeedFix reconciles explicit `Resolves: NF-YYYY-NNNNN` trailers on HEAD-reachable commits into verified resolution, so hand-integrated fixes close without manual transitions; a git timeout falls back to a bounded newest window and a held database write keeps the watermark for the next read (NF-2026-01048).
+- Linking a NeedFix to an existing task with a verified integrated commit resolves it and reports `resolved: true` on the first link; active NeedFix state is derived from the linked card (NF-2026-01048, NF-2026-01049).
+- Source Graph `bodygrep` searches the inner text of a quoted phrase instead of falling back to a token scan (NF-2026-01051).
+
+### Performance
+
+- The declared-invariants gate parses each module once and shares one scan per check, cutting a card validation from about 111 s to about 33 s (NF-2026-01052).
+
 ## 0.11.98 — 2026-09-27
 
 ### Fixed

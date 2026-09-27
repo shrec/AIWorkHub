@@ -14,6 +14,12 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.11.99
+
+- Fixes that land on main close their NeedFix automatically through a `Resolves:` commit trailer, so the NeedFix count follows the work.
+- Card validation spends about 80 seconds less on the declared-invariants gate.
+- Searching code for an exact quoted phrase finds it in the indexed source.
+
 ## What's new in 0.11.98
 
 - Sandboxed Claude workers on Windows run shell commands through PowerShell, so they no longer stall on a shell that cannot start.
