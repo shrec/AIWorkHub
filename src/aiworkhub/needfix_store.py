@@ -3011,12 +3011,64 @@ def convert_needfix(
     return _commit_conversion(repo_root, needfix_id, task_id, claim_updated_at, conversion_claim_id)
 
 
+_FULL_COMMIT_OID_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def _append_superseded_hint(message: str, task_status: str) -> str:
+    """Add a one-line hint to an archived-and-refused link error.
+
+    Only an ``archived`` status can ever be rescued by the verified-commit
+    relaxation below, so every other refusal reason is returned unchanged.
+    """
+    if task_status != "archived":
+        return message
+    return (
+        f"{message}; a superseded card can be linked by supplying "
+        "integrated_commit verified as a commit reachable from HEAD"
+    )
+
+
+def _link_verdict(
+    task: Mapping[str, Any],
+    task_status: str,
+    *,
+    integrated_commit: str,
+    verify_commit_fn: Callable[[str], str | None] | None,
+) -> tuple[bool, str | None]:
+    """Decide whether ``task`` may receive a fresh NeedFix link.
+
+    Linkable exactly as ``LINKABLE_CARD_STATUSES`` says, OR the task is an
+    ``archived`` card whose ``archive_operation`` is ``superseded`` (the same
+    field ``reopen_superseded_task_link`` reads) and the caller proves the
+    fix already landed by supplying a commit ``verify_commit_fn`` confirms is
+    a real, HEAD-reachable oid. Every other archived case (ordinary archive,
+    no verifier, an unverifiable commit) stays refused. Used identically at
+    the initial check and the last-point re-check, so a verifier that flips
+    to ``None`` between them refuses at the re-check too.
+    """
+    if task_status in LINKABLE_CARD_STATUSES:
+        return True, None
+    if (
+        task_status == "archived"
+        and str(task.get("archive_operation") or "") == "superseded"
+        and integrated_commit
+        and verify_commit_fn is not None
+    ):
+        verified_oid = verify_commit_fn(integrated_commit)
+        if verified_oid and _FULL_COMMIT_OID_RE.match(verified_oid):
+            return True, verified_oid
+    return False, None
+
+
 def link_existing_task(
     repo_root: str | Path,
     needfix_id: str,
     existing_task_id: str,
     get_task_fn: Callable[[str], Mapping[str, Any] | None],
     canonical_status_fn: Callable[[Mapping[str, Any]], str],
+    *,
+    integrated_commit: str = "",
+    verify_commit_fn: Callable[[str], str | None] | None = None,
 ) -> dict[str, Any]:
     """Explicit, manager-only, atomic, idempotent link to an already-existing task.
 
@@ -3041,6 +3093,11 @@ def link_existing_task(
       (``canonical_status_fn`` result not in ``LINKABLE_CARD_STATUSES``)
       both fail closed. This makes after-the-fact linking possible for tasks
       created outside ``convert_needfix`` (e.g. via ``task_create`` directly).
+    - A card whose canonical status is ``archived`` with
+      ``archive_operation == "superseded"`` is linkable too, but only when
+      ``integrated_commit`` is supplied and ``verify_commit_fn`` proves it a
+      commit reachable from HEAD; the verified oid is then recorded on the
+      claim event and returned. Every other archived case still fails closed.
     - On any verification failure the claim is compensated back to its
       original status so the NeedFix is never stranded as ``task_created``
       without a real linked task.
@@ -3051,6 +3108,7 @@ def link_existing_task(
     existing_task_id = str(existing_task_id or "").strip()
     if not existing_task_id:
         raise NeedFixValidationError("existing_task_id is required")
+    integrated_commit = str(integrated_commit or "").strip()
 
     conn = _connect(repo_root)
     try:
@@ -3092,11 +3150,18 @@ def link_existing_task(
                 f"existing task {existing_task_id!r} not found in this repository"
             )
         task_status = canonical_status_fn(task)
-        if task_status not in LINKABLE_CARD_STATUSES:
-            linkable = ", ".join(sorted(LINKABLE_CARD_STATUSES))
+        linkable, claim_oid = _link_verdict(
+            task, task_status,
+            integrated_commit=integrated_commit, verify_commit_fn=verify_commit_fn,
+        )
+        if not linkable:
+            linkable_statuses = ", ".join(sorted(LINKABLE_CARD_STATUSES))
             raise NeedFixConflictError(
-                f"existing task {existing_task_id!r} is not linkable "
-                f"(canonical status is {task_status!r}; linkable statuses are {linkable})"
+                _append_superseded_hint(
+                    f"existing task {existing_task_id!r} is not linkable "
+                    f"(canonical status is {task_status!r}; linkable statuses are {linkable_statuses})",
+                    task_status,
+                )
             )
 
         if row["status"] in ("captured", "triaged"):
@@ -3121,10 +3186,14 @@ def link_existing_task(
                     f"needfix {needfix_id} could not be claimed for linking "
                     f"(current status is {prior_status!r}, must be accepted or task_planned)"
                 )
+            claim_event_payload = {
+                "prior_status": prior_status, "existing_task_id": existing_task_id,
+                "conversion_claim_id": conversion_claim_id,
+            }
+            if claim_oid:
+                claim_event_payload["integrated_commit"] = claim_oid
             _record_event(
-                conn, needfix_id, "existing_task_link_claimed",
-                {"prior_status": prior_status, "existing_task_id": existing_task_id,
-                 "conversion_claim_id": conversion_claim_id},
+                conn, needfix_id, "existing_task_link_claimed", claim_event_payload,
             )
         except Exception:
             conn.execute("ROLLBACK TO existing_task_link_claim")
@@ -3145,14 +3214,24 @@ def link_existing_task(
                 f"existing task {existing_task_id!r} disappeared before link commit"
             )
         current_status = canonical_status_fn(current_task)
-        if current_status not in LINKABLE_CARD_STATUSES:
+        current_linkable, recheck_oid = _link_verdict(
+            current_task, current_status,
+            integrated_commit=integrated_commit, verify_commit_fn=verify_commit_fn,
+        )
+        if not current_linkable:
             raise NeedFixConflictError(
-                f"existing task {existing_task_id!r} became un-linkable before commit "
-                f"(canonical status is {current_status!r})"
+                _append_superseded_hint(
+                    f"existing task {existing_task_id!r} became un-linkable before commit "
+                    f"(canonical status is {current_status!r})",
+                    current_status,
+                )
             )
-        return _commit_conversion(
+        result = _commit_conversion(
             repo_root, needfix_id, existing_task_id, claim_updated_at, conversion_claim_id
         )
+        if recheck_oid:
+            result["integrated_commit"] = recheck_oid
+        return result
     except Exception:
         _compensate_conversion_claim(
             repo_root, needfix_id, prior_status, claim_updated_at, conversion_claim_id

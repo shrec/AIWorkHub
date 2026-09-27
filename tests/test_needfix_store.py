@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any, Mapping
 
 import pytest
 
-from aiworkhub import needfix_store
+from aiworkhub import core, needfix_store
 from aiworkhub.needfix_store import (
     ACTIVE_STATE_DEFINITION,
     CLOSED_CARD_STATUSES,
@@ -483,3 +484,58 @@ def test_legacy_row_has_explicitly_absent_caused_by(init: Path):
     row = needfix_store.capture_proposal(init, title="legacy", description="no cause")
     assert row["caused_by"] is None
     assert needfix_store.get_needfix(init, row["id"])["caused_by"] is None
+
+
+# --- core._verify_integrated_commit against a real git repo -----------------
+
+
+def _git(cwd: Path, *args: str) -> str:
+    result = subprocess.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=t", "-C", str(cwd), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip()
+
+
+@pytest.fixture
+def git_repo(repo_root: Path) -> Path:
+    _git(repo_root, "init", "-q")
+    (repo_root / "a.txt").write_text("a", encoding="utf-8")
+    _git(repo_root, "add", "a.txt")
+    _git(repo_root, "commit", "-q", "-m", "c0")
+    return repo_root
+
+
+def test_verify_integrated_commit_head_ancestor_returns_full_oid(git_repo: Path):
+    head = _git(git_repo, "rev-parse", "HEAD")
+    assert core._verify_integrated_commit(git_repo, head[:12]) == head
+
+
+def test_verify_integrated_commit_unknown_sha_returns_none(git_repo: Path):
+    assert core._verify_integrated_commit(git_repo, "abc1234") is None
+
+
+def test_verify_integrated_commit_unreachable_from_head_returns_none(git_repo: Path):
+    head = _git(git_repo, "rev-parse", "HEAD")
+    _git(git_repo, "checkout", "-q", "-b", "side")
+    (git_repo / "b.txt").write_text("b", encoding="utf-8")
+    _git(git_repo, "add", "b.txt")
+    _git(git_repo, "commit", "-q", "-m", "c1")
+    side_oid = _git(git_repo, "rev-parse", "HEAD")
+    _git(git_repo, "checkout", "-q", head)
+
+    assert core._verify_integrated_commit(git_repo, side_oid) is None
+
+
+def test_verify_integrated_commit_rejects_non_hex_without_running_git(
+    monkeypatch, repo_root: Path
+):
+    def _boom(*_a, **_kw):
+        raise AssertionError("git must not be invoked for a non-hex candidate")
+
+    monkeypatch.setattr(core.subprocess, "run", _boom)
+
+    assert core._verify_integrated_commit(repo_root, "--output=x") is None
+    assert core._verify_integrated_commit(repo_root, "HEAD~1") is None

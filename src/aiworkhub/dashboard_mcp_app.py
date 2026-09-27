@@ -3553,7 +3553,7 @@ def needfix_convert_commit_view(
 
 
 def needfix_link_existing_task_view(
-    needfix_id: str, existing_task_id: str, confirm: bool = False
+    needfix_id: str, existing_task_id: str, confirm: bool = False, integrated_commit: str = ""
 ) -> dict[str, Any]:
     """USER WRITE: manager-only, explicitly link a NeedFix to an existing, finished, accepted task."""
     if confirm is not True:
@@ -3561,7 +3561,9 @@ def needfix_link_existing_task_view(
     else:
         try:
             response = dict(
-                core.needfix_link_existing_task(str(needfix_id or ""), str(existing_task_id or ""))
+                core.needfix_link_existing_task(
+                    str(needfix_id or ""), str(existing_task_id or ""), str(integrated_commit or "")
+                )
             )
             response.setdefault("ok", True)
         except (needfix_store.NeedFixError, OSError, sqlite3.Error, TypeError, ValueError) as exc:

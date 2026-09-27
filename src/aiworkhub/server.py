@@ -5491,9 +5491,11 @@ def needfix_convert(
 
 
 @mcp.tool()
-def needfix_link_existing_task(needfix_id: str, existing_task_id: str) -> dict:
+def needfix_link_existing_task(
+    needfix_id: str, existing_task_id: str, integrated_commit: str = ""
+) -> dict:
     """Manager-only: atomically link a NeedFix to an existing, finished, accepted task."""
-    return core.needfix_link_existing_task(needfix_id, existing_task_id)
+    return core.needfix_link_existing_task(needfix_id, existing_task_id, integrated_commit)
 
 
 @mcp.tool()

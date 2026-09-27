@@ -11801,17 +11801,63 @@ def _canonical_task(task_id: str) -> dict[str, Any] | None:
     return task_store.get_task(repo_root(), task_id)
 
 
-def needfix_link_existing_task(needfix_id: str, existing_task_id: str) -> dict[str, Any]:
+_INTEGRATED_COMMIT_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
+_INTEGRATED_COMMIT_GIT_TIMEOUT_SECONDS = 15
+
+
+def _verify_integrated_commit(root: Path, commit: str) -> str | None:
+    """Return the full 40-hex oid for ``commit`` iff it names a real commit
+    reachable from HEAD in the repository at ``root``; otherwise ``None``.
+
+    Rejects anything that is not a bare hex short/full sha *before* running
+    git, so a value like ``--output=x`` can never be parsed as an option.
+    Never raises: a missing git binary, a timeout, or an OSError all resolve
+    to ``None`` -- this is a verifier, not a diagnostic.
+    """
+    candidate = str(commit or "").strip()
+    if not _INTEGRATED_COMMIT_RE.match(candidate):
+        return None
+    try:
+        resolved = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "--verify", "--quiet", f"{candidate}^{{commit}}"],
+            capture_output=True,
+            timeout=_INTEGRATED_COMMIT_GIT_TIMEOUT_SECONDS,
+            check=False,
+        )
+        if resolved.returncode != 0:
+            return None
+        oid = resolved.stdout.decode("utf-8").strip()
+        if not re.fullmatch(r"[0-9a-f]{40}", oid):
+            return None
+        ancestry = subprocess.run(
+            ["git", "-C", str(root), "merge-base", "--is-ancestor", oid, "HEAD"],
+            capture_output=True,
+            timeout=_INTEGRATED_COMMIT_GIT_TIMEOUT_SECONDS,
+            check=False,
+        )
+        if ancestry.returncode != 0:
+            return None
+        return oid
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def needfix_link_existing_task(
+    needfix_id: str, existing_task_id: str, integrated_commit: str = ""
+) -> dict[str, Any]:
     """Explicit manager-only link of a NeedFix to an already-existing,
     same-repository canonical task that is manager-accepted and finished."""
     ns = _needfix_store_module()
+    root = repo_root()
 
     return ns.link_existing_task(
-        repo_root(),
+        root,
         needfix_id,
         existing_task_id,
         _canonical_task,
         task_store.canonical_status,
+        integrated_commit=integrated_commit,
+        verify_commit_fn=lambda commit: _verify_integrated_commit(root, commit),
     )
 
 

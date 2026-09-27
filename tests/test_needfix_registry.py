@@ -1218,6 +1218,104 @@ class TestLinkExistingTask:
         assert "existing_task_link_claimed" not in {event["event"] for event in events}
         assert "conversion_committed" not in {event["event"] for event in events}
 
+    def test_link_existing_task_archived_superseded_with_verified_commit_links(
+        self, init_store: Path
+    ):
+        r = self._accepted_needfix(init_store)
+        get_task_fn, status_fn = self._tasks(
+            **{"task-1": {"status": "archived", "archive_operation": "superseded"}}
+        )
+        verified_oid = "a" * 40
+
+        result = needfix_store.link_existing_task(
+            init_store, r["id"], "task-1", get_task_fn, status_fn,
+            integrated_commit="abc1234",
+            verify_commit_fn=lambda commit: verified_oid if commit == "abc1234" else None,
+        )
+
+        assert result["converted_task_id"] == "task-1"
+        assert result["integrated_commit"] == verified_oid
+        events = needfix_store.list_events(init_store, r["id"])
+        claim_event = next(e for e in events if e["event"] == "existing_task_link_claimed")
+        assert claim_event["detail"]["integrated_commit"] == verified_oid
+
+    def test_link_existing_task_archived_superseded_without_integrated_commit_fails(
+        self, init_store: Path
+    ):
+        r = self._accepted_needfix(init_store)
+        get_task_fn, status_fn = self._tasks(
+            **{"task-1": {"status": "archived", "archive_operation": "superseded"}}
+        )
+
+        with pytest.raises(needfix_store.NeedFixConflictError):
+            needfix_store.link_existing_task(
+                init_store, r["id"], "task-1", get_task_fn, status_fn,
+                verify_commit_fn=lambda commit: "a" * 40,
+            )
+
+        unchanged = needfix_store.get_needfix(init_store, r["id"])
+        assert unchanged["status"] == "accepted"
+        assert unchanged["converted_task_id"] is None
+
+    def test_link_existing_task_archived_superseded_unverified_commit_fails(
+        self, init_store: Path
+    ):
+        r = self._accepted_needfix(init_store)
+        get_task_fn, status_fn = self._tasks(
+            **{"task-1": {"status": "archived", "archive_operation": "superseded"}}
+        )
+
+        with pytest.raises(needfix_store.NeedFixConflictError):
+            needfix_store.link_existing_task(
+                init_store, r["id"], "task-1", get_task_fn, status_fn,
+                integrated_commit="abc1234",
+                verify_commit_fn=lambda commit: None,
+            )
+
+        unchanged = needfix_store.get_needfix(init_store, r["id"])
+        assert unchanged["status"] == "accepted"
+
+    def test_link_existing_task_archived_ordinary_with_integrated_commit_still_fails(
+        self, init_store: Path
+    ):
+        r = self._accepted_needfix(init_store)
+        get_task_fn, status_fn = self._tasks(
+            **{"task-1": {"status": "archived", "archive_operation": "archived"}}
+        )
+
+        with pytest.raises(needfix_store.NeedFixConflictError):
+            needfix_store.link_existing_task(
+                init_store, r["id"], "task-1", get_task_fn, status_fn,
+                integrated_commit="abc1234",
+                verify_commit_fn=lambda commit: "a" * 40,
+            )
+
+    def test_link_existing_task_archived_superseded_recheck_refuses_when_verifier_flips(
+        self, init_store: Path
+    ):
+        r = self._accepted_needfix(init_store)
+        get_task_fn, status_fn = self._tasks(
+            **{"task-1": {"status": "archived", "archive_operation": "superseded"}}
+        )
+        calls = {"n": 0}
+
+        def verify_commit_fn(commit):
+            calls["n"] += 1
+            return "a" * 40 if calls["n"] == 1 else None
+
+        with pytest.raises(needfix_store.NeedFixConflictError):
+            needfix_store.link_existing_task(
+                init_store, r["id"], "task-1", get_task_fn, status_fn,
+                integrated_commit="abc1234",
+                verify_commit_fn=verify_commit_fn,
+            )
+
+        assert calls["n"] == 2
+        unchanged = needfix_store.get_needfix(init_store, r["id"])
+        assert unchanged["status"] == "accepted"
+        events = needfix_store.list_events(init_store, r["id"])
+        assert "conversion_committed" not in {event["event"] for event in events}
+
     def test_link_existing_task_archived_identical_retry_is_lost_ack_safe(
         self, init_store: Path
     ):
@@ -1873,21 +1971,25 @@ class TestExistingTaskLinkCanonicalDelegation:
 
         calls = []
 
-        def fake(needfix_id, existing_task_id):
-            calls.append((needfix_id, existing_task_id))
+        def fake(needfix_id, existing_task_id, integrated_commit=""):
+            calls.append((needfix_id, existing_task_id, integrated_commit))
             return {"ok": True}
 
         monkeypatch.setattr(core, "needfix_link_existing_task", fake)
         server.needfix_link_existing_task("NF-2026-00001", "task-1")
-        assert calls == [("NF-2026-00001", "task-1")]
+        assert calls == [("NF-2026-00001", "task-1", "")]
+
+        calls.clear()
+        server.needfix_link_existing_task("NF-2026-00001", "task-1", "deadbeef")
+        assert calls == [("NF-2026-00001", "task-1", "deadbeef")]
 
     def test_dashboard_delegates_to_core(self, monkeypatch):
         from aiworkhub import core, dashboard_mcp_app
 
         calls = []
 
-        def fake(needfix_id, existing_task_id):
-            calls.append((needfix_id, existing_task_id))
+        def fake(needfix_id, existing_task_id, integrated_commit=""):
+            calls.append((needfix_id, existing_task_id, integrated_commit))
             return {
                 "needfix_id": needfix_id,
                 "converted_task_id": existing_task_id,
@@ -1898,7 +2000,14 @@ class TestExistingTaskLinkCanonicalDelegation:
         result = dashboard_mcp_app.needfix_link_existing_task_view(
             "NF-2026-00001", "task-1", confirm=True
         )
-        assert calls == [("NF-2026-00001", "task-1")]
+        assert calls == [("NF-2026-00001", "task-1", "")]
+        assert result["ok"] is True
+
+        calls.clear()
+        result = dashboard_mcp_app.needfix_link_existing_task_view(
+            "NF-2026-00001", "task-1", confirm=True, integrated_commit="deadbeef"
+        )
+        assert calls == [("NF-2026-00001", "task-1", "deadbeef")]
         assert result["ok"] is True
 
     def test_dashboard_requires_confirmation(self):
