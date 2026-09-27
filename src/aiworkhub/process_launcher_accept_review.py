@@ -74,6 +74,22 @@ def _blocker(kind: str, detail: str = "", **extra: Any) -> dict[str, Any]:
     }
 
 
+def _accept_manager_identity(core: Any) -> dict[str, Any]:
+    """Resolve the accepting manager's identity once, best-effort.
+
+    Same expression and exception guard the ``accept_manager_identity``
+    quality-gate block has always used: same-uid local runtime state
+    (provider, session, window), never a credential, and never allowed to
+    fail an accept.
+    """
+    try:
+        return (
+            core._claude_manager_identity() or core._codex_manager_identity()
+        ) or {}
+    except Exception:  # noqa: BLE001 -- describing the caller never fails an accept
+        return {}
+
+
 def bound_reviewer_rows(
     repo: Any, parent_task_id: str, parent_request_id: str
 ) -> list[dict[str, Any]]:
@@ -1409,11 +1425,15 @@ def accept_review(
                 "checks": [],
                 "blocking_checks": [],
             }
+            manager_identity = _accept_manager_identity(core)
             acceptance_evidence_record = self._canonical_outcome_evidence(
                 request_id,
                 attempt_artifact_receipt,
                 level=evidence_levels.EvidenceLevel.FIXED_AND_VERIFIED,
-                verified_by=core.CODEX_RUNNER,
+                verified_by=(
+                    str(manager_identity.get("provider") or "").strip()[:60]
+                    or "manager_unverified"
+                ),
                 message=(
                     "Manager reverified and accepted the sealed quality-review outcome."
                 ),
@@ -1619,11 +1639,15 @@ def accept_review(
                 "checks": [],
                 "blocking_checks": [],
             }
+            manager_identity = _accept_manager_identity(core)
             acceptance_evidence_record = self._canonical_outcome_evidence(
                 request_id,
                 attempt_artifact_receipt,
                 level=evidence_levels.EvidenceLevel.FIXED_AND_VERIFIED,
-                verified_by=core.CODEX_RUNNER,
+                verified_by=(
+                    str(manager_identity.get("provider") or "").strip()[:60]
+                    or "manager_unverified"
+                ),
                 message=(
                     "Manager reverified and accepted the sealed research outcome."
                 ),
@@ -2061,12 +2085,7 @@ def accept_review(
             # unverifiable route is recorded as unverified rather than
             # fabricated, and never blocks a promotion that has already passed
             # every gate above.
-            try:
-                manager_identity = (
-                    core._claude_manager_identity() or core._codex_manager_identity()
-                ) or {}
-            except Exception:  # noqa: BLE001 -- describing the caller never fails an accept
-                manager_identity = {}
+            manager_identity = _accept_manager_identity(core)
             quality_gate["accept_manager_identity"] = {
                 "verified": bool(manager_identity),
                 "provider": str(manager_identity.get("provider") or "")[:60],
@@ -2184,7 +2203,10 @@ def accept_review(
             request_id,
             attempt_artifact_receipt,
             level=evidence_levels.EvidenceLevel.FIXED_AND_VERIFIED,
-            verified_by=core.CODEX_RUNNER,
+            verified_by=(
+                str(manager_identity.get("provider") or "").strip()[:60]
+                or "manager_unverified"
+            ),
             message=(
                 "Manager revalidated, promoted, and accepted the exact sealed candidate."
             ),

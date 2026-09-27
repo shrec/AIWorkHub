@@ -589,3 +589,75 @@ def test_readonly_quality_review_accept_review_fails_closed_on_tampered_receipt(
     assert result["error"] == (
         "quality_review_finalize_failed:accepted_outcome_receipt_identity_mismatch"
     )
+
+
+def test_readonly_research_accept_review_records_verified_by_claude_manager(
+    _readonly_research_fixture, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """NF-2026-01038: verified_by must name the manager who actually verified
+    the accept -- not a hardcoded codex runner constant -- when the accepting
+    manager is claude."""
+    manager = _readonly_research_fixture
+    monkeypatch.setattr(
+        process_launcher.core,
+        "_claude_manager_identity",
+        lambda: {"provider": "claude", "session_id": "s-1", "window_id": "w-1"},
+    )
+    monkeypatch.setattr(process_launcher.core, "_codex_manager_identity", lambda: None)
+
+    result = process_launcher.ProcessManager.accept_review(manager, REQUEST_ID, TASK_ID)
+
+    assert result["ok"] is True, result
+    assert result["acceptance_evidence_record"]["verified_by"] == "claude"
+
+
+def test_readonly_quality_review_accept_review_records_verified_by_claude_manager(
+    _readonly_quality_review_fixture, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """NF-2026-01038: same fix, quality-review read-only branch."""
+    manager, _receipt = _readonly_quality_review_fixture
+    monkeypatch.setattr(
+        process_launcher.core,
+        "_claude_manager_identity",
+        lambda: {"provider": "claude", "session_id": "s-1", "window_id": "w-1"},
+    )
+    monkeypatch.setattr(process_launcher.core, "_codex_manager_identity", lambda: None)
+
+    result = process_launcher.ProcessManager.accept_review(manager, QR_REQUEST_ID, QR_TASK_ID)
+
+    assert result["ok"] is True, result
+    assert result["acceptance_evidence_record"]["verified_by"] == "claude"
+
+
+def test_readonly_research_accept_review_records_manager_unverified_when_no_identity_resolves(
+    _readonly_research_fixture, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """NF-2026-01038: an unresolvable manager identity must fall back to the
+    literal ``manager_unverified`` -- never to codex."""
+    manager = _readonly_research_fixture
+    monkeypatch.setattr(process_launcher.core, "_claude_manager_identity", lambda: None)
+    monkeypatch.setattr(process_launcher.core, "_codex_manager_identity", lambda: None)
+
+    result = process_launcher.ProcessManager.accept_review(manager, REQUEST_ID, TASK_ID)
+
+    assert result["ok"] is True, result
+    assert result["acceptance_evidence_record"]["verified_by"] == "manager_unverified"
+
+
+def test_readonly_quality_review_accept_review_records_verified_by_codex_manager(
+    _readonly_quality_review_fixture, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """NF-2026-01038: codex is recorded only when the resolved manager really
+    is codex, never as a default."""
+    manager, _receipt = _readonly_quality_review_fixture
+    monkeypatch.setattr(process_launcher.core, "_claude_manager_identity", lambda: None)
+    monkeypatch.setattr(
+        process_launcher.core,
+        "_codex_manager_identity",
+        lambda: {"provider": "codex", "session_id": "s-2", "window_id": "w-2"},
+    )
+
+    result = process_launcher.ProcessManager.accept_review(manager, QR_REQUEST_ID, QR_TASK_ID)
+
+    assert result["ok"] is True, result
+    assert result["acceptance_evidence_record"]["verified_by"] == "codex"

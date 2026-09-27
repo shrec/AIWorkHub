@@ -1143,6 +1143,33 @@ def test_accept_review_resolves_its_own_reviewer_ids_from_the_bound_children(
     assert recorded["accept_manager_identity"] == result["accept_manager_identity"]
 
 
+def test_accept_review_records_verified_by_from_the_resolved_manager_identity(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """NF-2026-01038: acceptance_evidence_record.verified_by must come from the
+    SAME resolved manager identity the accept_manager_identity block records --
+    never a hardcoded codex runner constant -- for a stubbed claude manager."""
+    (
+        manager, card, request_id, task_id, runner, topic, repo,
+        workspace_dir, promote_calls, accept_review_calls,
+    ) = _fixture(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        process_launcher.core,
+        "_claude_manager_identity",
+        lambda: {"provider": "claude", "session_id": "s-1", "window_id": "w-1"},
+    )
+    monkeypatch.setattr(process_launcher.core, "_codex_manager_identity", lambda: None)
+
+    result = manager.accept_review(request_id, task_id)
+
+    assert result["ok"] is True
+    assert result["accept_manager_identity"]["provider"] == "claude"
+    assert (
+        result["acceptance_evidence_record"]["verified_by"]
+        == result["accept_manager_identity"]["provider"]
+    )
+
+
 def test_accept_review_git_timeout_is_structured_and_releases_promotion_lock(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
