@@ -4973,6 +4973,35 @@ class _QualityReviewPrepFlight:
         self.result: dict[str, Any] | None = None
 
 
+def _sealed_lens_attempts(
+    latest: Mapping[str, Mapping[str, Any]],
+    target_task_id: str,
+    target_request_id: str,
+    lens: str | None = None,
+) -> list[tuple[str, Mapping[str, Any]]]:
+    """Every reviewer attempt sealed to this exact target (and lens).
+
+    Only ``quality_review`` events whose sealed ``quality_review_attempt``
+    matches exactly count.  No liveness is applied here.
+    """
+
+    rows: list[tuple[str, Mapping[str, Any]]] = []
+    for request_id, event in latest.items():
+        attempt = event.get("quality_review_attempt") if isinstance(
+            event, Mapping
+        ) else None
+        if not isinstance(attempt, Mapping) or event.get("topic") != "quality_review":
+            continue
+        if (
+            str(attempt.get("target_task_id") or "") != target_task_id
+            or str(attempt.get("target_request_id") or "") != target_request_id
+            or (lens is not None and str(attempt.get("lens") or "") != lens)
+        ):
+            continue
+        rows.append((str(request_id), event))
+    return rows
+
+
 class ProcessManager:
     """Thread-safe local process registry with append-only lifecycle events."""
 
@@ -7987,6 +8016,31 @@ class ProcessManager:
             pid, event.get("pid_start_ticks")
         ).verdict is not PidIdentityVerdict.MISMATCH
 
+    def _lens_reviewer_attempts(
+        self,
+        latest: Mapping[str, Mapping[str, Any]],
+        target_task_id: str,
+        target_request_id: str,
+        lens: str | None = None,
+    ) -> list[tuple[str, Mapping[str, Any], bool]]:
+        """Every reviewer attempt sealed to this exact target (and lens), with liveness.
+
+        Selection is :func:`_sealed_lens_attempts`.  Liveness is
+        :meth:`_reviewer_event_live`, or a tracked child of this process that
+        has not exited.  This is the one attempt selection behind lens
+        exclusivity and reviewer reuse.
+        """
+
+        running = {
+            live.request_id for live in self._live.values() if live.process.poll() is None
+        }
+        return [
+            (request_id, event, request_id in running or self._reviewer_event_live(event))
+            for request_id, event in _sealed_lens_attempts(
+                latest, target_task_id, target_request_id, lens
+            )
+        ]
+
     def _live_lens_reviewers(
         self,
         latest: Mapping[str, Mapping[str, Any]],
@@ -7996,31 +8050,21 @@ class ProcessManager:
     ) -> list[tuple[str, Mapping[str, Any]]]:
         """Every live reviewer attempt sealed to this exact target (and lens).
 
-        Only ``quality_review`` events whose sealed ``quality_review_attempt``
-        matches exactly count.  Liveness is :meth:`_reviewer_event_live`, or a
-        tracked child of this process that has not exited.  A terminal attempt
-        is never live, so supplemental rounds are never blocked by one.
+        A terminal attempt is never live, so supplemental rounds are never
+        blocked by one.  Uses only ``self._live`` and
+        :meth:`_reviewer_event_live`, so collaborators may borrow it.
         """
 
         running = {
             live.request_id for live in self._live.values() if live.process.poll() is None
         }
-        hits: list[tuple[str, Mapping[str, Any]]] = []
-        for request_id, event in latest.items():
-            attempt = event.get("quality_review_attempt") if isinstance(
-                event, Mapping
-            ) else None
-            if not isinstance(attempt, Mapping) or event.get("topic") != "quality_review":
-                continue
-            if (
-                str(attempt.get("target_task_id") or "") != target_task_id
-                or str(attempt.get("target_request_id") or "") != target_request_id
-                or (lens is not None and str(attempt.get("lens") or "") != lens)
-            ):
-                continue
-            if request_id in running or self._reviewer_event_live(event):
-                hits.append((str(request_id), event))
-        return hits
+        return [
+            (request_id, event)
+            for request_id, event in _sealed_lens_attempts(
+                latest, target_task_id, target_request_id, lens
+            )
+            if request_id in running or self._reviewer_event_live(event)
+        ]
 
     def live_reviewer_for_lens(
         self, target_task_id: str, target_request_id: str, lens: str
@@ -8034,6 +8078,44 @@ class ProcessManager:
             return None
         return {"task_id": str(hits[0][1].get("task_id") or ""), "request_id": hits[0][0]}
 
+    def existing_lens_reviewer(
+        self,
+        *,
+        target_task_id: str,
+        target_request_id: str,
+        claim_epoch: str,
+        lens: str,
+        latest: Mapping[str, Mapping[str, Any]] | None = None,
+        include_sealed: bool = True,
+        exclude_task_id: str = "",
+    ) -> dict[str, str] | None:
+        """The queued, running or sealed-usable reviewer for this exact target and lens.
+
+        Delegates to :func:`review_orchestrator.existing_lens_reviewer` so the
+        automatic chain and this launcher decide reuse by one rule
+        (NF-2026-01064).
+        """
+
+        if latest is None:
+            latest = self._latest_by_request()
+        attempts = [
+            row for row in self._lens_reviewer_attempts(
+                latest, target_task_id, target_request_id, lens
+            )
+            if not exclude_task_id or str(row[1].get("task_id") or "") != exclude_task_id
+        ]
+        if not attempts:
+            return None
+        return review_orchestrator.existing_lens_reviewer(
+            self.repo,
+            target_task_id=target_task_id,
+            target_request_id=target_request_id,
+            claim_epoch=claim_epoch,
+            lens=lens,
+            attempts=attempts,
+            include_sealed=include_sealed,
+        )
+
     def _reserve_quality_reviewer_attempt(
         self,
         *,
@@ -8046,6 +8128,7 @@ class ProcessManager:
         model: str | None,
         timeout_seconds: int,
         refuse_live_lens: bool = False,
+        target_claim_epoch: str = "",
     ) -> dict[str, Any]:
         """Atomically reserve one exact reviewer attempt before any preparation.
 
@@ -8105,9 +8188,38 @@ class ProcessManager:
                         "reviewer_task_id": str(rival[1].get("task_id") or ""),
                         "reviewer_request_id": rival[0], "lens": lens,
                     }
+                if not refuse_live_lens:
+                    # NF-2026-01064: another live reviewer already bought for
+                    # this exact target, claim epoch and lens is reused, checked
+                    # and decided under the same lock that would reserve, so two
+                    # concurrent launches never both spawn a provider. Only
+                    # LIVE ones: a terminal attempt never blocks a supplemental
+                    # round here -- the chain binds sealed verdicts itself.
+                    reused = self.existing_lens_reviewer(
+                        target_task_id=target_task_id,
+                        target_request_id=target_request_id,
+                        claim_epoch=target_claim_epoch,
+                        lens=lens,
+                        latest=latest,
+                        include_sealed=False,
+                        exclude_task_id=reviewer_task_id,
+                    )
+                    if reused is not None:
+                        return {
+                            **self._reviewer_receipt(reused["request_id"], latest),
+                            "reused_existing_reviewer": True,
+                            "lens": lens,
+                        }
                 if self._active_count(latest) >= _configured_limit():
                     return {"ok": False, "error": "concurrency_limit_reached"}
                 request_id = uuid.uuid4().hex
+                sealed_attempt = {
+                    "target_request_id": target_request_id,
+                    "target_task_id": target_task_id,
+                    "lens": lens,
+                }
+                if target_claim_epoch:
+                    sealed_attempt["target_claim_epoch"] = target_claim_epoch
                 self._append_event({
                     "request_id": request_id,
                     "task_id": reviewer_task_id,
@@ -8122,11 +8234,7 @@ class ProcessManager:
                     "owner_pid": os.getpid(),
                     "owner_pid_start_ticks": _pid_start_ticks(os.getpid()),
                     "timeout_seconds": timeout_seconds,
-                    "quality_review_attempt": {
-                        "target_request_id": target_request_id,
-                        "target_task_id": target_task_id,
-                        "lens": lens,
-                    },
+                    "quality_review_attempt": sealed_attempt,
                 })
                 return {
                     "ok": True,
@@ -8982,6 +9090,7 @@ class ProcessManager:
         model: str | None = None,
         timeout_seconds: int = 1800,
         refuse_live_lens: bool = False,
+        target_claim_epoch: str = "",
     ) -> dict[str, Any]:
         """Create and launch one independent packet-bound reviewer task.
 
@@ -9043,6 +9152,20 @@ class ProcessManager:
                 "target_substatus": _target_verdict.get("target_substatus"),
                 "fails_at_launch": True,
             }
+        # The target claim epoch is sealed into the reservation so reuse of a
+        # live reviewer is keyed to this exact claim, not merely its request.
+        # The caller's epoch is the one that commissioned this review; the
+        # card's is only a fallback for callers that name none, because the
+        # card can be re-claimed between commissioning and launch.
+        caller_epoch = "" if target_claim_epoch is None else str(target_claim_epoch)
+        if caller_epoch:
+            target_claim_epoch = caller_epoch
+        else:
+            card_epoch = (
+                _target_card.get("claim_epoch")
+                if isinstance(_target_card, Mapping) else None
+            )
+            target_claim_epoch = "" if card_epoch is None else str(card_epoch)
         reservation = self._reserve_quality_reviewer_attempt(
             reviewer_task_id=reviewer_task_id,
             runner=runner,
@@ -9053,8 +9176,15 @@ class ProcessManager:
             model=model,
             timeout_seconds=timeout_seconds,
             refuse_live_lens=refuse_live_lens,
+            **({"target_claim_epoch": target_claim_epoch} if target_claim_epoch else {}),
         )
         if reservation.get("ok") is not True:
+            return reservation
+        if reservation.get("reused_existing_reviewer") is True:
+            # Another reviewer already owns this exact target and lens; its own
+            # card is already bound. Binding THIS reviewer task id to that
+            # request would corrupt both, so the reused receipt is returned
+            # untouched and no provider is started.
             return reservation
         request_id = str(reservation["request_id"])
         bound = _bind_visible_card(

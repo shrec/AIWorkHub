@@ -12,7 +12,7 @@ from contextlib import ExitStack, closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Mapping, Protocol
+from typing import Any, Callable, Iterable, Mapping, Protocol
 
 from . import (
     db_writer,
@@ -1399,6 +1399,106 @@ def _reviewer_lens_coverage(
     return coverage
 
 
+# A reviewer in any of these states can never report for its lens, so it is
+# never reused: the lens it was launched for still needs a reviewer.
+_REVIEWER_REUSE_EXCLUDED_STATES = _REVIEWER_FAILED_STATES | frozenset({
+    "superseded", "retired", "rejected",
+})
+
+
+def existing_lens_reviewer(
+    repo: Path,
+    *,
+    target_task_id: str,
+    target_request_id: str,
+    claim_epoch: str,
+    lens: str,
+    attempts: Iterable[tuple[str, Mapping[str, Any], bool]],
+    include_sealed: bool = True,
+) -> dict[str, str] | None:
+    """The reviewer already bound to exactly this target identity and lens.
+
+    ONE answer to "is a reviewer for (target task, target request, claim
+    epoch, lens) already bought?", shared by the automatic chain and by
+    ``ProcessManager``'s reservation. The chain alone used to probe only its
+    own hashed children, so a manager-launched reviewer on the same lens was
+    invisible to it and a second paid reviewer duplicated a verdict sealed
+    minutes earlier (NF-2026-01064).
+
+    ``attempts`` are the process ledger's latest ``(request_id, event, live)``
+    rows; the ledger belongs to ``ProcessManager``, which supplies them from
+    the snapshot it is deciding on. A sealed reviewer is returned only when
+    its card carries THIS claim's verified lens report written by that exact
+    request; a live one only when its sealed attempt names this target, lens
+    and claim epoch. An attempt with no recorded claim epoch never matches a
+    stamped claim: it may belong to a superseded claim, so it fails closed.
+    Failed, cancelled, superseded or retired reviewers, other claim epochs
+    and other lenses return None, so they still launch normally.
+    """
+    identity = {
+        "target_task_id": str(target_task_id or ""),
+        "target_request_id": str(target_request_id or ""),
+        "claim_epoch": str(claim_epoch or ""),
+    }
+    if not identity["target_task_id"] or not identity["target_request_id"] or not lens:
+        return None
+    running: dict[str, str] | None = None
+    for request_id, event, live in attempts:
+        if not isinstance(event, Mapping) or event.get("topic") != "quality_review":
+            continue
+        attempt = event.get("quality_review_attempt")
+        if not isinstance(attempt, Mapping) or (
+            str(attempt.get("target_task_id") or "") != identity["target_task_id"]
+            or str(attempt.get("target_request_id") or "") != identity["target_request_id"]
+            or str(attempt.get("lens") or "") != lens
+        ):
+            continue
+        sealed_epoch = str(attempt.get("target_claim_epoch") or "")
+        if identity["claim_epoch"] and sealed_epoch != identity["claim_epoch"]:
+            continue
+        task_id = str(event.get("task_id") or "")
+        if not task_id or not request_id:
+            continue
+        try:
+            card = task_store.get_task(repo, task_id)
+        except Exception:  # noqa: BLE001 -- unreadable is ambiguous, never absent
+            card = None
+        states = _reviewer_row_states(card) if isinstance(card, Mapping) else frozenset()
+        if states & _REVIEWER_REUSE_EXCLUDED_STATES or any(
+            state.startswith("blocked") for state in states
+        ):
+            continue
+        found = {
+            "task_id": task_id,
+            "request_id": str(request_id),
+            "runner": str(event.get("runner") or ""),
+            "adapter_id": str(event.get("adapter_id") or ""),
+            "model": str(event.get("model") or ""),
+        }
+        if (
+            include_sealed
+            and identity["claim_epoch"]
+            and str(event.get("state") or "") == "review_ready"
+            and _verified_lens_report(card, identity, lens, task_id)
+            and _sealed_reviewer_request_id(card) == str(request_id)
+        ):
+            return {**found, "state": "sealed"}
+        if live and running is None:
+            # An unreadable card on a live attempt is ambiguous, and ambiguous
+            # is waited on: reading it as "absent" buys the duplicate.
+            running = {**found, "state": "running"}
+    return running
+
+
+def _sealed_reviewer_request_id(card: Any) -> str:
+    """The reviewer request id recorded in a card's sealed quality receipt."""
+    terminal = card.get("terminal_review") if isinstance(card, Mapping) else None
+    evidence = terminal.get("evidence") if isinstance(terminal, Mapping) else None
+    receipt = evidence.get("quality_review_receipt") if isinstance(evidence, Mapping) else None
+    reviewer = receipt.get("reviewer") if isinstance(receipt, Mapping) else None
+    return str(reviewer.get("request_id") or "") if isinstance(reviewer, Mapping) else ""
+
+
 def recover_review_ready_targets(
     manager: Manager,
     *,
@@ -2568,6 +2668,92 @@ class ReviewOrchestrator:
             return None
         return self._route_attempts(action.chain_id, action.lens)
 
+    def _existing_lens_reviewer(
+        self, action: review_lifecycle.ReviewAction
+    ) -> dict[str, str] | None:
+        """A reviewer already bought for this chain's exact target and lens.
+
+        Answered by the manager from its own ledger through
+        :func:`existing_lens_reviewer`. A manager without the lookup, or one
+        whose answer cannot be read, reports nothing and planning proceeds
+        exactly as before; the launcher's reservation still refuses to spawn a
+        live duplicate.
+        """
+        finder = getattr(self.manager, "existing_lens_reviewer", None)
+        if not callable(finder):
+            return None
+        identity = action.descriptor["chain_identity"]
+        try:
+            found = finder(
+                target_task_id=str(identity["target_task_id"]),
+                target_request_id=str(identity["target_request_id"]),
+                claim_epoch=str(identity["claim_epoch"]),
+                lens=action.lens,
+            )
+        except Exception:  # noqa: BLE001 -- an unreadable lookup plans normally
+            return None
+        if not isinstance(found, Mapping):
+            return None
+        found = {key: str(found.get(key) or "") for key in (
+            "task_id", "request_id", "runner", "adapter_id", "model", "state",
+        )}
+        if not all(found[key] for key in ("task_id", "request_id", "runner", "adapter_id")):
+            return None
+        return found
+
+    def _adopt_existing_lens_reviewer(
+        self,
+        action: review_lifecycle.ReviewAction,
+        attempts: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        """Bind an already-bought reviewer as this lens's next attempt.
+
+        The adopted attempt is durably ``launched`` on the existing request, so
+        the accept path polls and binds that reviewer's sealed verdict exactly
+        as it would a chain child's, and no provider is launched for it.
+        """
+        found = self._existing_lens_reviewer(action)
+        if found is None or any(
+            str(row["reviewer_task_id"]) == found["task_id"] for row in attempts
+        ):
+            return None
+        attempt_index = len(attempts) + 1
+        with closing(_side_table_connection(self.db_path)) as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(ROUTE_ATTEMPT_TABLE)
+            conn.execute(
+                "INSERT OR IGNORE INTO review_orchestrator_route_attempts "
+                "(chain_id,lens,attempt_index,reviewer_task_id,reviewer_request_id,"
+                "runner,adapter_id,model,state) VALUES (?,?,?,?,?,?,?,?,'launched')",
+                (
+                    int(action.chain_id), action.lens, attempt_index,
+                    found["task_id"], found["request_id"], found["runner"],
+                    found["adapter_id"], found["model"],
+                ),
+            )
+        planned = self._route_attempts(action.chain_id, action.lens)
+        if (
+            not planned
+            or int(planned[-1]["attempt_index"]) != attempt_index
+            or str(planned[-1]["reviewer_task_id"]) != found["task_id"]
+        ):
+            raise RuntimeError("review_route_attempt_plan_conflict")
+        return planned[-1]
+
+    def _is_adopted_attempt(
+        self, action: review_lifecycle.ReviewAction, attempt: Mapping[str, Any]
+    ) -> bool:
+        """Whether a durably launched attempt names a reviewer this chain did not mint."""
+        if str(attempt.get("state") or "") != "launched" or not str(
+            attempt.get("reviewer_request_id") or ""
+        ):
+            return False
+        canonical = self._reviewer_task_id(
+            action.descriptor["chain_identity"], action.lens,
+            attempt_index=int(attempt["attempt_index"]),
+        )
+        return str(attempt.get("reviewer_task_id") or "") != canonical
+
     def _plan_route_attempt(
         self, action: review_lifecycle.ReviewAction
     ) -> dict[str, Any]:
@@ -2590,6 +2776,14 @@ class ReviewOrchestrator:
             # just spends the next pass's provider instead of this one's.
             if manager_authorization is None:
                 raise RuntimeError("review_route_hold:" + held)
+        # NF-2026-01064: a reviewer already queued, running or sealed for this
+        # exact target request, claim epoch and lens -- typically one a manager
+        # launched by hand -- is bound instead of buying a duplicate. Adoption
+        # must pass the hold gate like any other attempt, but it is checked
+        # before the ceiling: binding it spends nothing.
+        adopted = self._adopt_existing_lens_reviewer(action, attempts)
+        if adopted is not None:
+            return adopted
         if len(attempts) >= _MAX_ROUTE_ATTEMPTS:
             # The NF847 ceiling, stated once where the spend actually happens.
             # Every caller turns a ``review_route_`` failure into a durable
@@ -2685,11 +2879,77 @@ class ReviewOrchestrator:
         except Exception:  # noqa: BLE001 -- an acknowledged launch stays retryable
             return False
 
+    def _adopt_reused_launch(
+        self,
+        action: review_lifecycle.ReviewAction,
+        attempt: Mapping[str, Any],
+        result: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        """Rebind a planned attempt to the live reviewer the launcher reused.
+
+        The launcher's reservation found another live reviewer for this exact
+        target and lens and returned its receipt instead of spawning. The
+        planned attempt now names that reviewer; ``None`` keeps the action
+        retryable when the rebinding is not durable yet.
+        """
+        task_id = str(result.get("task_id") or "")
+        request_id = str(result.get("request_id") or "")
+        route = (
+            str(result.get("runner") or attempt["runner"]),
+            str(result.get("adapter_id") or attempt["adapter_id"]),
+            str(result.get("model") or attempt["model"]),
+        )
+        if not task_id or not request_id:
+            raise RuntimeError("reviewer_launch_identity_invalid")
+        try:
+            with closing(_side_table_connection(self.db_path)) as conn, conn:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(ROUTE_ATTEMPT_TABLE)
+                conn.execute(
+                    "UPDATE review_orchestrator_route_attempts "
+                    "SET reviewer_task_id=?,reviewer_request_id=?,runner=?,"
+                    "adapter_id=?,model=?,state='launched' "
+                    "WHERE chain_id=? AND lens=? AND attempt_index=? "
+                    "AND state='planned' AND reviewer_request_id=''",
+                    (
+                        task_id, request_id, *route, int(action.chain_id),
+                        action.lens, int(attempt["attempt_index"]),
+                    ),
+                )
+        except Exception:  # noqa: BLE001 -- the reused reviewer stays reconcilable
+            return None
+        rows = [
+            row for row in self._route_attempts(action.chain_id, action.lens)
+            if int(row["attempt_index"]) == int(attempt["attempt_index"])
+        ]
+        if (
+            not rows
+            or str(rows[0]["reviewer_task_id"]) != task_id
+            or str(rows[0]["reviewer_request_id"]) != request_id
+            or rows[0]["state"] != "launched"
+        ):
+            return None
+        return rows[0]
+
     def _launch_route_attempt(
         self, action: review_lifecycle.ReviewAction, attempt: Mapping[str, Any]
     ) -> dict[str, Any] | None:
         """Launch or reconcile one pre-bound attempt without duplicating its provider."""
         identity = action.descriptor["chain_identity"]
+        if self._is_adopted_attempt(action, attempt):
+            # An adopted reviewer was bought elsewhere and is already bound to
+            # its own request. Launching it again under this chain would be the
+            # duplicate NF-2026-01064 removed; the accept path reads it instead.
+            return {
+                "ok": True,
+                "request_id": str(attempt["reviewer_request_id"]),
+                "task_id": str(attempt["reviewer_task_id"]),
+                "runner": str(attempt["runner"]),
+                "adapter_id": str(attempt["adapter_id"]),
+                "model": str(attempt["model"]),
+                "state": "adopted",
+                "adopted_existing_reviewer": True,
+            }
         try:
             result = self.manager.launch_quality_reviewer(
                 target_request_id=str(identity["target_request_id"]),
@@ -2699,6 +2959,12 @@ class ReviewOrchestrator:
                 adapter_id=str(attempt["adapter_id"]),
                 model=str(attempt["model"]),
                 lens=action.lens,
+                # Seal the epoch that commissioned this review, not whatever
+                # the target card carries by the time the launcher reads it.
+                target_claim_epoch=(
+                    "" if identity.get("claim_epoch") is None
+                    else str(identity["claim_epoch"])
+                ),
             )
         except Exception:  # noqa: BLE001 -- reconcile the pre-bound task on retry
             return None
@@ -2763,6 +3029,15 @@ class ReviewOrchestrator:
                 "_route_dispatch": dispatch,
             }
         self._require_ok(result, "reviewer_launch_failed")
+        if result.get("reused_existing_reviewer") is True and str(
+            result.get("task_id") or ""
+        ) != str(attempt["reviewer_task_id"]):
+            # The reservation found another live reviewer for this exact
+            # target and lens and handed back its receipt instead of spawning.
+            adopted = self._adopt_reused_launch(action, attempt, result)
+            if adopted is None:
+                return None
+            return {**result, "_adopted_attempt": adopted}
         request_id = str(result.get("request_id") or "")
         if (
             not request_id
@@ -2796,7 +3071,8 @@ class ReviewOrchestrator:
             if result is None:
                 return None
             if "_route_terminal_failure" not in result:
-                return current, result
+                adopted = result.pop("_adopted_attempt", None)
+                return (dict(adopted) if adopted is not None else current), result
             if launch_index:
                 # The second exact route is already retired.  A later drain
                 # continues from that durable state instead of spinning here.

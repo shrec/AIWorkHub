@@ -3306,7 +3306,9 @@ def test_live_lens_reviewer_blocks_only_its_exact_target_and_lens(tmp_path):
         assert receipt["already_reserved"] is False
 
 
-def test_lens_exclusivity_is_opt_in_for_the_orchestrator_path(tmp_path):
+def test_orchestrator_path_reuses_live_lens_reviewer_instead_of_spawning(tmp_path):
+    # NF-2026-01064: the automatic path no longer buys a second reviewer for a
+    # lens another launch already owns; it gets that reviewer's receipt back.
     manager = _manager(tmp_path)
     manager._append_event(
         _starting(
@@ -3316,7 +3318,148 @@ def test_lens_exclusivity_is_opt_in_for_the_orchestrator_path(tmp_path):
 
     receipt = _reserve_lens(manager, "REVIEWER_B", refuse=False)
     assert receipt["ok"] is True
-    assert receipt["already_reserved"] is False
+    assert receipt["reused_existing_reviewer"] is True
+    assert receipt["request_id"] == "live-a"
+    assert receipt["task_id"] == "REVIEWER_A"
+    assert _starting_count(manager, "REVIEWER_B") == 0
+
+
+def _reserve_epoch(
+    manager: process_launcher.ProcessManager, reviewer_task_id: str, epoch: str
+) -> dict:
+    return manager._reserve_quality_reviewer_attempt(
+        reviewer_task_id=reviewer_task_id,
+        runner=RUNNER,
+        adapter_id=ADAPTER,
+        target_request_id=_LENS_BINDING["target_request_id"],
+        target_task_id=_LENS_BINDING["target_task_id"],
+        lens=_LENS_BINDING["lens"],
+        model=None,
+        timeout_seconds=1800,
+        target_claim_epoch=epoch,
+    )
+
+
+def test_orchestrator_reuse_is_keyed_to_the_target_claim_epoch(tmp_path):
+    manager = _manager(tmp_path)
+    manager._append_event(
+        _starting(
+            request_id="live-a", task_id="REVIEWER_A", expires_at=time.time() + 120.0,
+            quality_review_attempt={**_LENS_BINDING, "target_claim_epoch": "2"},
+        )
+    )
+
+    other_epoch = _reserve_epoch(manager, "REVIEWER_B", "1")
+    assert other_epoch["ok"] is True
+    assert other_epoch["already_reserved"] is False
+    assert "reused_existing_reviewer" not in other_epoch
+    sealed = _latest(manager, other_epoch["request_id"])["quality_review_attempt"]
+    assert sealed == {**_LENS_BINDING, "target_claim_epoch": "1"}
+
+    same_epoch = _reserve_epoch(manager, "REVIEWER_C", "2")
+    assert same_epoch["reused_existing_reviewer"] is True
+    assert same_epoch["request_id"] == "live-a"
+    assert _starting_count(manager, "REVIEWER_C") == 0
+
+
+def _launch_sealing_epoch(
+    tmp_path, monkeypatch, *, card_epoch, caller_epoch: str | None,
+) -> str:
+    """Drive launch_quality_reviewer to its reservation and read the seal."""
+    manager = _manager(tmp_path)
+    monkeypatch.setattr(
+        process_launcher, "_parse_card",
+        lambda _raw, _task_id: {"task_id": "TARGET_TASK", "claim_epoch": card_epoch},
+    )
+    monkeypatch.setattr(manager, "_show_task", lambda _task_id: "{}")
+    monkeypatch.setattr(
+        process_launcher.quality_review, "assess_reviewer_launch_target",
+        lambda **_kwargs: {"can_launch": True},
+    )
+    monkeypatch.setattr(manager, "_live_reviewer_receipt", lambda *_a, **_k: None)
+    real_reserve = manager._reserve_quality_reviewer_attempt
+    reserved: list[dict] = []
+
+    def _reserve_then_stop(**kwargs):
+        reserved.append(real_reserve(**kwargs))
+        return {"ok": False, "error": "stopped_after_reservation"}
+
+    monkeypatch.setattr(manager, "_reserve_quality_reviewer_attempt", _reserve_then_stop)
+    kwargs = {} if caller_epoch is None else {"target_claim_epoch": caller_epoch}
+    result = manager.launch_quality_reviewer(
+        target_request_id=_LENS_BINDING["target_request_id"],
+        target_task_id=_LENS_BINDING["target_task_id"],
+        reviewer_task_id="REVIEWER_EPOCH",
+        runner=RUNNER,
+        adapter_id=ADAPTER,
+        lens=_LENS_BINDING["lens"],
+        **kwargs,
+    )
+    assert result == {"ok": False, "error": "stopped_after_reservation"}
+    assert len(reserved) == 1 and reserved[0]["ok"] is True
+    sealed = _latest(manager, reserved[0]["request_id"])["quality_review_attempt"]
+    return sealed.get("target_claim_epoch", "")
+
+
+def test_launch_seals_the_commissioning_epoch_not_the_cards_current_one(
+    tmp_path, monkeypatch,
+):
+    # The target was re-claimed (epoch 5) after the chain commissioned this
+    # review under epoch 4: the reviewer belongs to epoch 4.
+    assert _launch_sealing_epoch(
+        tmp_path, monkeypatch, card_epoch=5, caller_epoch="4"
+    ) == "4"
+
+
+def test_launch_falls_back_to_the_card_epoch_without_a_caller_epoch(
+    tmp_path, monkeypatch,
+):
+    assert _launch_sealing_epoch(
+        tmp_path, monkeypatch, card_epoch=5, caller_epoch=None
+    ) == "5"
+
+
+def test_launch_does_not_swallow_a_zero_card_epoch(tmp_path, monkeypatch):
+    assert _launch_sealing_epoch(
+        tmp_path, monkeypatch, card_epoch=0, caller_epoch=""
+    ) == "0"
+
+
+def test_concurrent_orchestrator_launches_for_one_lens_reserve_one_provider(tmp_path):
+    first, second = _manager(tmp_path), _manager(tmp_path)
+    barrier = threading.Barrier(2)
+    results: dict[str, dict] = {}
+
+    def reserve(manager: process_launcher.ProcessManager, task_id: str) -> None:
+        barrier.wait(timeout=10)
+        results[task_id] = _reserve_lens(manager, task_id, refuse=False)
+
+    threads = [
+        threading.Thread(target=reserve, args=(first, "REVIEWER_A")),
+        threading.Thread(target=reserve, args=(second, "REVIEWER_B")),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=15)
+        assert not thread.is_alive()
+
+    assert all(receipt.get("ok") is True for receipt in results.values())
+    fresh = [
+        task for task, receipt in results.items() if not receipt["already_reserved"]
+    ]
+    reused = [
+        task for task, receipt in results.items()
+        if receipt.get("reused_existing_reviewer")
+    ]
+    assert len(fresh) == 1 and len(reused) == 1
+    winner = fresh[0]
+    assert results[reused[0]]["request_id"] == results[winner]["request_id"]
+    assert results[reused[0]]["task_id"] == winner
+    reservations = [
+        event for event in first._events() if event.get("state") == "starting"
+    ]
+    assert [event["task_id"] for event in reservations] == [winner]
 
 
 def test_launch_with_refuse_live_lens_returns_refusal_and_appends_nothing(

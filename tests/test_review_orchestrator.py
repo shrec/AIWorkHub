@@ -4379,3 +4379,302 @@ def test_nf888_a_finalize_failed_hold_is_re_read_on_every_later_pass(
     assert [
         call["reviewer_task_id"] for call in manager.launches
     ].count(str(stale["reviewer_task_id"])) == 1
+
+
+# ---------------------------------------------------------------------------
+# NF-2026-01064: a reviewer already bought for the same target request, claim
+# epoch and lens -- typically one a manager launched by hand -- is bound by the
+# chain instead of being duplicated by a second paid reviewer.
+# ---------------------------------------------------------------------------
+
+_MANUAL_REVIEWER = {"task_id": "MANUAL-REVIEWER", "request_id": "manual-request", **ROUTE}
+_LOOKUP_IDENTITY = {
+    "target_task_id": "TARGET", "target_request_id": "target-request",
+    "claim_epoch": "1", "lens": "correctness",
+}
+
+
+class _ExistingReviewerManager(_Manager):
+    def __init__(self, repo: Path, existing: dict[str, dict] | None = None) -> None:
+        super().__init__(repo)
+        self.existing = dict(existing or {})
+        self.lookups: list[dict] = []
+
+    def existing_lens_reviewer(self, **kwargs):
+        self.lookups.append(kwargs)
+        found = self.existing.get(kwargs["lens"])
+        return dict(found) if found is not None else None
+
+
+class _ReusingLaunchManager(_Manager):
+    """The launcher's reservation found another live reviewer for the lens."""
+
+    def launch_quality_reviewer(self, **kwargs):
+        self.launches.append(kwargs)
+        return {
+            "ok": True, "already_reserved": True, "reused_existing_reviewer": True,
+            **_MANUAL_REVIEWER, "state": "running", "lens": kwargs["lens"],
+        }
+
+
+def _nf1064_driver(tmp_path: Path, manager: _Manager):
+    driver = review_orchestrator.ReviewOrchestrator(
+        manager, db_path=tmp_path / "review.sqlite", route_selector=_route
+    )
+    chain = driver.ensure_chain(
+        target_task_id="TARGET", target_request_id="target-request", claim_epoch=1,
+        packet_sha256="a" * 64, candidate_sha256="b" * 64, now=NOW,
+    )
+    return driver, chain
+
+
+def _manual_sealed_status() -> dict:
+    return _review_status(
+        reviewer_request="manual-request", reviewer_task="MANUAL-REVIEWER"
+    )
+
+
+def test_chain_binds_sealed_manager_reviewer_verdict_without_launching(
+    tmp_path: Path,
+) -> None:
+    manager = _ExistingReviewerManager(
+        tmp_path, {"correctness": {**_MANUAL_REVIEWER, "state": "sealed"}}
+    )
+    driver, chain = _nf1064_driver(tmp_path, manager)
+
+    assert driver.drain(max_actions=1, now=NOW).completed == 1
+
+    assert manager.launches == []
+    assert manager.lookups[0] == _LOOKUP_IDENTITY
+    attempts = driver._route_attempts(chain.chain_id, "correctness")
+    assert [
+        (row["reviewer_task_id"], row["reviewer_request_id"], row["state"])
+        for row in attempts
+    ] == [("MANUAL-REVIEWER", "manual-request", "launched")]
+
+    manager.status_results["manual-request"] = _manual_sealed_status()
+    result = driver.drain(max_actions=1, now=NOW)
+
+    assert result.completed == 1
+    assert result.failed == 0
+    assert manager.launches == []
+    assert manager.accepts == [("manual-request", "MANUAL-REVIEWER")]
+    rows = review_lifecycle.rows_for_test(tmp_path / "review.sqlite")
+    accepted = json.loads(rows[1]["receipt_json"])
+    assert accepted["reviewer_task_id"] == "MANUAL-REVIEWER"
+    assert accepted["reviewer_request_id"] == "manual-request"
+
+
+def test_chain_waits_on_running_manager_reviewer_instead_of_launching(
+    tmp_path: Path,
+) -> None:
+    manager = _ExistingReviewerManager(
+        tmp_path, {"correctness": {**_MANUAL_REVIEWER, "state": "running"}}
+    )
+    driver, _chain = _nf1064_driver(tmp_path, manager)
+    manager.status_results["manual-request"] = {"ok": True, "state": "running"}
+
+    assert driver.drain(max_actions=1, now=NOW).completed == 1
+    for _ in range(2):
+        waiting = driver.drain(max_actions=1, now=NOW)
+        assert waiting.completed == 0
+        assert waiting.failed == 0
+
+    assert manager.launches == []
+    assert manager.accepts == []
+
+    manager.status_results["manual-request"] = _manual_sealed_status()
+    assert driver.drain(max_actions=1, now=NOW).completed == 1
+    assert manager.accepts == [("manual-request", "MANUAL-REVIEWER")]
+    assert manager.launches == []
+
+
+def test_chain_without_existing_reviewer_for_its_lens_still_launches(
+    tmp_path: Path,
+) -> None:
+    manager = _ExistingReviewerManager(
+        tmp_path, {"security": {**_MANUAL_REVIEWER, "state": "running"}}
+    )
+    driver, _chain = _nf1064_driver(tmp_path, manager)
+
+    assert driver.drain(max_actions=1, now=NOW).completed == 1
+
+    assert manager.lookups == [_LOOKUP_IDENTITY]
+    assert len(manager.launches) == 1
+    assert manager.launches[0]["reviewer_task_id"] != "MANUAL-REVIEWER"
+
+
+def test_chain_adopts_reviewer_the_launch_reservation_reused(tmp_path: Path) -> None:
+    manager = _ReusingLaunchManager(tmp_path)
+    driver, chain = _nf1064_driver(tmp_path, manager)
+
+    assert driver.drain(max_actions=1, now=NOW).completed == 1
+
+    assert len(manager.launches) == 1
+    attempts = driver._route_attempts(chain.chain_id, "correctness")
+    assert [
+        (row["reviewer_task_id"], row["reviewer_request_id"], row["state"])
+        for row in attempts
+    ] == [("MANUAL-REVIEWER", "manual-request", "launched")]
+
+    manager.status_results["manual-request"] = _manual_sealed_status()
+    assert driver.drain(max_actions=1, now=NOW).completed == 1
+    assert manager.accepts == [("manual-request", "MANUAL-REVIEWER")]
+    assert len(manager.launches) == 1
+
+
+def test_chain_adoption_does_not_bypass_a_route_hold(tmp_path: Path) -> None:
+    """A held lens stays held even when a reviewer for it is available.
+
+    Adoption spends nothing, but it is still a new attempt on a lens whose
+    typed disposition says no reviewer route can settle it; only a manager
+    authorization may lift that hold.
+    """
+    manager = _ExistingReviewerManager(
+        tmp_path, {"correctness": {**_MANUAL_REVIEWER, "state": "running"}}
+    )
+    driver, chain = _nf1064_driver(tmp_path, manager)
+    reason = "launch_failed" + review_orchestrator._ROUTE_HOLD_MARKER + "callback_reconcile"
+    assert review_orchestrator.route_attempt_hold(reason) == "callback_reconcile"
+    conn = sqlite3.connect(tmp_path / "review.sqlite")
+    try:
+        with conn:
+            conn.execute(review_orchestrator.ROUTE_ATTEMPT_TABLE)
+            conn.execute(
+                "INSERT INTO review_orchestrator_route_attempts "
+                "(chain_id,lens,attempt_index,reviewer_task_id,runner,adapter_id,"
+                "model,state,failure_reason) VALUES (?,?,?,?,?,?,?,'retired',?)",
+                (
+                    int(chain.chain_id), "correctness", 1, "HELD-REVIEWER",
+                    ROUTE["runner"], ROUTE["adapter_id"], ROUTE["model"], reason,
+                ),
+            )
+    finally:
+        conn.close()
+    held = driver._route_attempts(chain.chain_id, "correctness")
+
+    planned: list[str] = []
+    original = driver._plan_route_attempt
+
+    def _recording_plan(action):
+        try:
+            return original(action)
+        except RuntimeError as exc:
+            planned.append(str(exc))
+            raise
+
+    driver._plan_route_attempt = _recording_plan
+    result = driver.drain(max_actions=1, now=NOW)
+
+    assert result.completed == 0
+    assert planned == ["review_route_hold:callback_reconcile"]
+    assert driver._route_attempts(chain.chain_id, "correctness") == held
+    assert manager.launches == []
+
+
+def _ledger_row(
+    request_id: str,
+    task_id: str,
+    *,
+    state: str = "running",
+    live: bool = True,
+    lens: str = "correctness",
+    target_request_id: str = "target-request",
+    claim_epoch: str | None = None,
+) -> tuple[str, dict, bool]:
+    attempt = {
+        "target_task_id": "TARGET", "target_request_id": target_request_id,
+        "lens": lens,
+    }
+    if claim_epoch is not None:
+        attempt["target_claim_epoch"] = claim_epoch
+    event = {
+        "request_id": request_id, "task_id": task_id, "topic": "quality_review",
+        "state": state, **ROUTE, "quality_review_attempt": attempt,
+    }
+    return request_id, event, live
+
+
+def _lookup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    rows: list[tuple[str, dict, bool]],
+    cards: dict[str, dict] | None = None,
+    **overrides: str,
+) -> dict | None:
+    cards = dict(cards or {})
+    monkeypatch.setattr(
+        review_orchestrator.task_store, "get_task",
+        lambda _repo, task_id: cards.get(task_id),
+    )
+    identity = {**_LOOKUP_IDENTITY, **overrides}
+    return review_orchestrator.existing_lens_reviewer(
+        tmp_path, attempts=rows, **identity
+    )
+
+
+def test_existing_lens_reviewer_returns_running_and_sealed_reviewers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    running = _lookup(
+        tmp_path, monkeypatch, [_ledger_row("q1", "R1", claim_epoch="1")]
+    )
+    assert running == {
+        "task_id": "R1", "request_id": "q1", **ROUTE, "state": "running",
+    }
+
+    sealed_card = _review_status(reviewer_request="q2", reviewer_task="R2")["task_card"]
+    sealed = _lookup(
+        tmp_path, monkeypatch,
+        [_ledger_row("q2", "R2", state="review_ready", live=False, claim_epoch="1")],
+        {"R2": sealed_card},
+    )
+    assert sealed == {"task_id": "R2", "request_id": "q2", **ROUTE, "state": "sealed"}
+
+
+@pytest.mark.parametrize(
+    ("rows", "cards", "overrides"),
+    [
+        # A failed or cancelled prior reviewer is never reused.
+        (
+            [_ledger_row("q1", "R1", claim_epoch="1")],
+            {"R1": {"status": "pending", "worker_status": "worker_failed"}},
+            {},
+        ),
+        ([_ledger_row("q1", "R1", claim_epoch="1")], {"R1": {"status": "cancelled"}}, {}),
+        # Terminal without a sealed report for this claim.
+        (
+            [_ledger_row("q1", "R1", state="worker_failed", live=False, claim_epoch="1")],
+            {},
+            {},
+        ),
+        # A different lens, target request or claim epoch.
+        ([_ledger_row("q1", "R1", lens="security", claim_epoch="1")], {}, {}),
+        ([_ledger_row("q1", "R1", claim_epoch="1")], {}, {"lens": "security"}),
+        (
+            [_ledger_row("q1", "R1", target_request_id="other-request", claim_epoch="1")],
+            {},
+            {},
+        ),
+        ([_ledger_row("q1", "R1", claim_epoch="2")], {}, {}),
+        (
+            [_ledger_row(
+                "q2", "R2", state="review_ready", live=False, claim_epoch="1"
+            )],
+            {"R2": _review_status(reviewer_request="q2", reviewer_task="R2")["task_card"]},
+            {"claim_epoch": "2"},
+        ),
+        # A live attempt with no recorded epoch may belong to a superseded
+        # claim, so it never matches a stamped lookup: fail closed.
+        ([_ledger_row("q1", "R1")], {}, {"claim_epoch": "1"}),
+    ],
+    ids=[
+        "worker_failed", "cancelled", "terminal_unsealed", "other_lens_row",
+        "other_lens_query", "other_request", "other_epoch_live",
+        "other_epoch_sealed", "unstamped_live",
+    ],
+)
+def test_existing_lens_reviewer_ignores_unusable_or_foreign_reviewers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, rows, cards, overrides,
+) -> None:
+    assert _lookup(tmp_path, monkeypatch, rows, cards, **overrides) is None
