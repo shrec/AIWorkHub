@@ -209,6 +209,9 @@ def test_required_empty_code_source_graph_fails_before_claim(monkeypatch: pytest
     monkeypatch.setattr(os, "fchmod", lambda *args, **kwargs: None, raising=False)
     repo = _repo(tmp_path)
     _stub_source_graph_direct(monkeypatch, "{}")
+    from aiworkhub import toolchain_authority
+
+    monkeypatch.setattr(toolchain_authority, "_authority_secret", lambda _repo, *, create: b"b437-test-authority-secret")
     claims: list[tuple] = []
     monkeypatch.setattr(process_launcher.core, "claim_start_exact", lambda *args: claims.append(args) or {"ok": True})
     manager = process_launcher.ProcessManager(

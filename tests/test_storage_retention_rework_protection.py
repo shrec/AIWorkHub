@@ -48,12 +48,29 @@ def _aged_now() -> float:
 
 
 def _git(cwd: Path, *args: str) -> None:
-    subprocess.run(
-        ["git", "-c", "user.email=t@t", "-c", "user.name=t", "-C", str(cwd), *args],
-        check=True,
+    result = subprocess.run(
+        [
+            "git", "-c", "user.email=t@t", "-c", "user.name=t",
+            # A sandboxed runner (windows_appcontainer) can see its own tmp
+            # repositories as owned by another principal; git then refuses
+            # them as "dubious ownership". Only these test-local repos are
+            # trusted, and only for this command line.
+            "-c", "safe.directory=*",
+            "-C", str(cwd), *args,
+        ],
+        # git resolves getcwd() on the inherited directory before applying
+        # -C; inside the AppContainer the pytest cwd can be unresolvable
+        # ("Permission denied"), so always start git in its target directory.
+        cwd=str(cwd),
+        check=False,
         capture_output=True,
         text=True,
     )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"git {' '.join(args)} failed with exit {result.returncode}: "
+            f"stderr={result.stderr.strip()!r} stdout={result.stdout.strip()!r}"
+        )
 
 
 @pytest.fixture()
@@ -62,13 +79,17 @@ def repo_with_worktrees(tmp_path: Path) -> dict[str, Path]:
     repo = tmp_path / "repo"
     base = tmp_path / "worktrees"
     base.mkdir()
-    subprocess.run(["git", "init", "--bare", str(remote)], check=True, capture_output=True)
-    _git(tmp_path, "clone", str(remote), str(repo))
+    _git(tmp_path, "init", "--bare", str(remote))
+    # No transport at all: ``git clone``/``push``/``fetch`` over a local path
+    # must spawn a git-receive-pack/upload-pack child, and the validation
+    # sandbox refuses that child ("Could not read from remote repository").
+    # init + remote add + update-ref builds the same origin-tracking layout.
+    _git(tmp_path, "init", str(repo))
+    _git(repo, "remote", "add", "origin", str(remote))
     (repo / "file.txt").write_text("base\n", encoding="utf-8")
     _git(repo, "add", "file.txt")
     _git(repo, "commit", "-m", "base")
-    _git(repo, "push", "origin", "HEAD:refs/heads/main")
-    _git(repo, "fetch", "origin")
+    _git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
     assert task_store.initialize_repository(repo)["ok"]
     return {"repo": repo, "base": base}
 
@@ -1479,7 +1500,12 @@ def test_cleanup_fail_closed_live_process_active_rework_and_symlink(repo_with_wo
     assert (pinned / "worktree").is_dir()
 
     alias = base / "accepted-succ-alias"
-    alias.symlink_to(accepted)
+    try:
+        alias.symlink_to(accepted)
+    except OSError as exc:
+        if getattr(exc, "winerror", None) == 1314:
+            pytest.skip("symlink privilege not held in this sandbox")
+        raise
     _write_idle_process_identity(repo, "accepted-succ-alias")
     _insert_card(
         repo,

@@ -570,15 +570,17 @@ def test_no_acceptance_or_gate_module_reads_the_coverage_record() -> None:
 
 
 def test_the_launcher_only_builds_and_records_the_coverage_measurement() -> None:
-    text = (REPO_ROOT / "src" / "aiworkhub" / "process_launcher.py").read_text(
-        encoding="utf-8"
-    )
-    # One definition, one call, one terminal-event field, plus the guarded
-    # fallback record.  No branch, gate, or refusal consults it.
-    assert text.count("_semantic_edit_coverage(") == 2
-    assert text.count('"semantic_edit_coverage": semantic_edit_coverage,') == 1
+    package = REPO_ROOT / "src" / "aiworkhub"
+    launcher = (package / "process_launcher.py").read_text(encoding="utf-8")
+    evidence = (package / "semantic_edit_evidence.py").read_text(encoding="utf-8")
+    # The definition lives in semantic_edit_evidence.py; process_launcher.py
+    # holds one call and one terminal-event field, plus the guarded fallback
+    # record.  No branch, gate, or refusal in either file consults it.
+    assert launcher.count("_semantic_edit_coverage(") == 1
+    assert evidence.count("def _semantic_edit_coverage(") == 1
+    assert launcher.count('"semantic_edit_coverage": semantic_edit_coverage,') == 1
     for refusal in ("raise", "return False", "satisfied"):
-        for line in text.splitlines():
+        for line in (launcher + "\n" + evidence).splitlines():
             if "semantic_edit_coverage" in line:
                 assert refusal not in line
 
