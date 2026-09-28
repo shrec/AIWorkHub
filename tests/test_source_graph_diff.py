@@ -292,6 +292,40 @@ def test_change_only_in_invalid_utf8_bytes_is_reported_binary(repo: Path) -> Non
     assert result["hunks"][0]["text"] == "Binary files differ\n"
 
 
+@pytest.mark.parametrize(
+    "base, candidate",
+    [
+        (b"a\xff\nb\n", b"a\xfe\nB\n"),
+        (b"a\xff\nb\n", b"new\na\xfe\nb\n"),
+    ],
+    ids=["beside_a_visible_edit", "below_an_insertion"],
+)
+def test_invalid_utf8_change_beside_a_visible_edit_is_reported_binary(
+    repo: Path, base: bytes, candidate: bytes
+) -> None:
+    old, new = repo / "mix" / "a", repo / "mix" / "b"
+    old.mkdir(parents=True)
+    new.mkdir(parents=True)
+    (old / "data.txt").write_bytes(base)
+    (new / "data.txt").write_bytes(candidate)
+    result = sgd.diff_directories(repo, old, new)
+    # "replace" decodes \xff and \xfe alike, so the visible edit must not be the
+    # whole report; the two bad lines still pair up across an insertion above.
+    assert [hunk["header"] for hunk in result["hunks"]] == ["binary"]
+    assert result["hunks"][0]["text"] == "Binary files differ\n"
+
+
+def test_unchanged_invalid_utf8_line_beside_a_visible_edit_stays_a_text_diff(repo: Path) -> None:
+    old, new = repo / "keep" / "a", repo / "keep" / "b"
+    old.mkdir(parents=True)
+    new.mkdir(parents=True)
+    (old / "data.txt").write_bytes(b"caf\xe9\nx\n")
+    (new / "data.txt").write_bytes(b"caf\xe9\ny\n")
+    result = sgd.diff_directories(repo, old, new)
+    assert [hunk["header"] for hunk in result["hunks"]] == ["@@ -1,2 +1,2 @@"]
+    assert "-x\n+y\n" in result["hunks"][0]["text"]
+
+
 GUIDE = "".join(f"line {index}\n" for index in range(1, 21))
 
 
@@ -357,6 +391,37 @@ def test_oversized_file_is_skipped_while_the_rest_still_diffs(
     assert ("src/pkg/new.py", "fresh") in {
         (row["path"], row["symbol"]) for row in result["symbols"]
     }
+
+
+def test_oversized_side_is_reported_under_its_own_directory(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    old, new = repo / "big" / "a", repo / "big" / "b"
+    monkeypatch.setattr(sgd, "MAX_FILE_BYTES", 32)
+    big, small = "x" * 64 + "\n", "small\n"
+    _write(old / "shrunk.txt", big)  # only the base side is over the limit
+    _write(new / "shrunk.txt", small)
+    _write(old / "gone.txt", big)  # deleted, so only the base side exists
+    _write(old / "grew.txt", small)  # only the candidate side is over the limit
+    _write(new / "grew.txt", big)
+    result = sgd.diff_directories(repo, old, new)
+    limit = {"reason": "file_over_byte_limit", "byte_limit": 32}
+    assert result["skipped"] == [
+        {"path": "big/a/gone.txt", **limit},
+        {"path": "big/b/grew.txt", **limit},
+        {"path": "big/a/shrunk.txt", **limit},
+    ]
+
+
+def test_skip_path_follows_the_side_its_reason_names(tmp_path: Path) -> None:
+    # Base oversized and candidate unreadable: "unreadable" is the reason the row
+    # reports, so it is the candidate's path that must carry it.
+    result = sgd._assemble(
+        tmp_path, tmp_path, {"m.txt": sgd.OVERSIZED}, {"m.txt": sgd.UNREADABLE},
+        byte_budget=sgd.DEFAULT_BYTE_BUDGET, cursor=None,
+        repo_prefixes=("old", "new"), extra={},
+    )
+    assert result["skipped"] == [{"path": "new/m.txt", "reason": "unreadable"}]
 
 
 def test_unreadable_file_is_skipped_while_the_rest_still_diffs(

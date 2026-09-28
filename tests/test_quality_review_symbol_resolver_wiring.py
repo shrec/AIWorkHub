@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -153,3 +154,66 @@ def test_submit_without_canonical_root_refuses_the_binding(
     outcome = _submit(tmp_path, monkeypatch, authority_repo=tmp_path / "missing")
     assert fake_index == []
     assert outcome == "review_finding_0_overbuild_replacement_unbound"
+
+
+def _ingest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, workspace: Any
+) -> list[dict[str, Any]]:
+    """Drive the real ``supervisor_ingest`` over one overbuild final; return its submissions."""
+    stdout = tmp_path / "req.stdout.log"
+    report = {"lens": LENS, "findings": [_overbuild_finding()]}
+    stdout.write_text(
+        json.dumps({"type": "result", "result": json.dumps(report)}), encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        worker_ai_tools_mcp, "verify_audit_ledger",
+        lambda *args, **kwargs: {"ok": True, "entries_tampered": 0, "verified_payloads": []},
+    )
+    # The submit boundary binds the resolver too (see _submit); stubbing it leaves
+    # the ingest's own normalization the only thing that can bind one here.
+    monkeypatch.setattr(worker_ai_tools_mcp, "WorkerToolContext", lambda **kwargs: object())
+    submitted: list[dict[str, Any]] = []
+
+    def quality_review_submit(ctx: Any, **kwargs: Any) -> dict[str, Any]:
+        submitted.append(kwargs)
+        return {"ok": True}
+
+    monkeypatch.setattr(worker_ai_tools_mcp, "quality_review_submit", quality_review_submit)
+    quality_review_ingest.supervisor_ingest(
+        metadata={
+            "worker_mcp": {
+                "audit_ledger_path": str(tmp_path / "ledger.jsonl"),
+                "audit_hmac_key_path": str(tmp_path / "ledger.key"),
+            },
+            "stdout_path": str(stdout), "task_id": "task", "runner": "claude", "topic": "topic",
+        },
+        workspace=workspace, packet=_packet(), packet_path=tmp_path / "packet.json",
+        request_id="req", expected_lens=LENS,
+    )
+    return submitted
+
+
+def test_supervisor_ingest_binds_on_the_canonical_root_not_the_worktree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_index: list[Path]
+) -> None:
+    canonical = tmp_path / "canonical"
+    canonical.mkdir()
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    submitted = _ingest(
+        tmp_path, monkeypatch, workspace=SimpleNamespace(repo=canonical, path=worktree)
+    )
+    assert fake_index == [canonical]
+    assert [f["category"] for f in submitted[0]["findings"]] == ["duplicate_existing_symbol"]
+
+
+def test_supervisor_ingest_without_canonical_root_refuses_the_binding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_index: list[Path]
+) -> None:
+    # The worktree exists, so a binding taken from it instead would be accepted.
+    workspace = SimpleNamespace(repo=tmp_path / "missing", path=tmp_path)
+    with pytest.raises(
+        quality_review_ingest.ReviewProtocolError, match="overbuild_replacement_unbound"
+    ):
+        _ingest(tmp_path, monkeypatch, workspace=workspace)
+    assert fake_index == []

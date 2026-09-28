@@ -340,15 +340,47 @@ def _decode(raw: bytes | None) -> str | None:
     return raw.decode("utf-8", "replace")
 
 
+def _hides_byte_change(
+    before: bytes | None, after: bytes | None, old_lines: list[str], new_lines: list[str]
+) -> bool:
+    """True when a line the text diff pairs as unchanged still differs in bytes.
+
+    ``errors="replace"`` folds every invalid byte to U+FFFD, so lines that differ
+    only in invalid UTF-8 decode alike and the diff has nothing to show for them.
+    """
+    if before is None or after is None or before == after:
+        return False
+    if old_lines == new_lines:
+        return True
+    # ``surrogateescape`` keeps each invalid byte distinct and never moves a
+    # ``\n``, so these lines pair one for one with the decoded ones.
+    old_raw = _split_lines(before.decode("utf-8", "surrogateescape"))
+    new_raw = _split_lines(after.decode("utf-8", "surrogateescape"))
+    if old_raw == old_lines and new_raw == new_lines:
+        return False  # valid UTF-8 differs exactly where its text does
+    # ``unified_diff`` draws its pairing with this same matcher: the equal lines
+    # are the context it prints and the stretches it leaves out.
+    matcher = difflib.SequenceMatcher(None, old_lines, new_lines)
+    return any(
+        old_raw[i:i + size] != new_raw[j:j + size]
+        for i, j, size in matcher.get_matching_blocks()
+    )
+
+
 def _file_hunks(row: Mapping[str, Any], before: bytes | None, after: bytes | None) -> list[dict[str, Any]]:
     old_text, new_text = _decode(before), _decode(after)
-    hidden = before is not None and after is not None and before != after
-    if old_text is None or new_text is None or (hidden and old_text == new_text):
-        # Equal decoded text over different bytes means the change is only in
-        # invalid UTF-8, which "replace" hides; report it as binary, not silence.
-        return [{"path": row["path"], "header": "binary", "text": "Binary files differ\n"}]
+    binary: list[dict[str, Any]] = [
+        {"path": row["path"], "header": "binary", "text": "Binary files differ\n"}
+    ]
+    if old_text is None or new_text is None:
+        return binary
+    old_lines, new_lines = _split_lines(old_text), _split_lines(new_text)
+    if _hides_byte_change(before, after, old_lines, new_lines):
+        # A line changed only in invalid UTF-8 reads as unchanged, alone or beside
+        # a visible edit; report the file as binary, not silence.
+        return binary
     lines = list(difflib.unified_diff(
-        _split_lines(old_text), _split_lines(new_text),
+        old_lines, new_lines,
         fromfile=f"a/{row['old_path']}", tofile=f"b/{row['path']}", n=3,
     ))
     hunks: list[dict[str, Any]] = []
@@ -529,10 +561,11 @@ def _assemble(
             continue
         if row.get("oversized") or row.get("unreadable"):
             # One oversized or unreadable file is reported and skipped; the
-            # rest still diff.
+            # rest still diff.  The prefix names the side the reason blames.
+            blamed = _Unreadable if row.get("unreadable") else _Oversized
             prefix, relative = (
                 (repo_prefixes[0], row["old_path"])
-                if after is None or isinstance(before, _Unreadable)
+                if after is None or isinstance(before, blamed)
                 else (repo_prefixes[1], row["path"])
             )
             skipped.append(
