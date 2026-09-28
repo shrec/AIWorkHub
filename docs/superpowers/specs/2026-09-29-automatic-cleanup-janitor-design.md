@@ -9,8 +9,11 @@ Owner's rule, verbatim:
 
 - "სამუშაო ხე მანამ გინდა სანამ ხეზე მუშაობას აგრძელებ" — a worktree is needed only while work on it continues.
 - "ტასკი დასრულდა მივიღეთ ხეში უნდა ამოიშალოს ნიდ ფიქს ლისტიდან მისი დაგიც უნდა გაიწმინდოს" — once a task is accepted into the tree, its NeedFix leaves the list and its traces are cleaned.
+- "ტასკი რომ დაიხურება და შევა ხეში ვორკჰაბმა თავად უნდა წაშალოს იმ ტასკთანდ აკავშირებული არტიფაქტები რადგან ის ისედაც კომიტში იქნება უკვე" — when a task closes and enters the tree, WorkHub itself deletes the artifacts linked to that task, because the change is already in a commit.
 
 So every artifact lives exactly as long as the work that owns it. Once that work is **decided** (accept, reject, supersede, archive, cancel), WorkHub removes the artifact on its own. No model turn and no human does cleanup.
+
+Nothing is kept "just in case". After an accept, the tree is the durable copy of the change; from S2 on, the WorkHub commit is too. Task events, receipts and usage rows are the durable record of how the change got there. A rejected or superseded attempt has no copy to keep: rework reads its sealed delta, not its worktree.
 
 Success criteria (measured, not asserted):
 
@@ -33,6 +36,7 @@ Success criteria (measured, not asserted):
 | NeedFix | resolved 151 not archived; `task_created` 83 (81 point to a missing or dead task); `converting` 1 | resolution stops at `resolved`; dead links are never cleared |
 | Callback outbox | pending 15, dead_letter 55 | rows of decided tasks are never closed |
 | process_logs / rework_deltas | 645 MB / 154 MB | age policy (`logs_days` = 7) plus a 7-day quarantine |
+| MCP output spill (`.aiworkhub/spill/`) | 1,594 files, 47 MB, oldest 2026-09-15 | no retention at all: output_spill_store.py:26 records that it "retains every spilled file" |
 
 About 22 GB is on disk; the only part still needed is the live worker's tree.
 
@@ -78,7 +82,7 @@ The steps run in the order below. Each step is isolated: its failure is recorded
 
 1. worktrees of decided work (§4.3, §4.4);
 2. rework deltas of decided tasks;
-3. process logs of terminal requests whose usage is in the DB;
+3. process logs of terminal requests whose usage is in the DB, and MCP output spill files older than `logs_days`;
 4. the quarantine backlog, plus the unattributed lane (unchanged);
 5. prune stale worktree registrations;
 6. records: tasks, NeedFix, callbacks (§4.5).
@@ -94,6 +98,7 @@ The steps run in the order below. Each step is isolated: its failure is recorded
 | NeedFix | its task is accepted | resolved, then archived. If its task link is dead, the link is cleared and the item returns to its open status |
 | callback | delivered, or its task is decided | a `pending` or `dead_letter` row of a decided task moves to `superseded` with `last_error = "task_decided"` |
 | worktree registration | its directory exists | pruned |
+| MCP output spill file | `logs_days` after it is written. It is not task-linked: a locator is read back within the session that received it | deleted; a later `retrieve_text` fails closed with `output_spill_store_missing` |
 
 These are kept as durable history: task events, receipts, usage rows, `accepted_outcome_receipt`, and git history.
 
@@ -160,7 +165,7 @@ Per-item deletions (worktrees, log files) are IO-bound and run in a thread pool 
    - a failed seal (worktree kept, one NeedFix).
 4. **Unattributed.** An unattributed worktree still goes to quarantine with the 7-day window.
 5. **Quarantine purge.** A batch whose items all belong to decided tasks is purged on the next sweep; a batch with any unknown item keeps its deadline.
-6. **Logs.** A log is deleted only after its usage row exists; a backfill failure keeps the log.
+6. **Logs and spill.** A log is deleted only after its usage row exists; a backfill failure keeps the log. A spill file older than `logs_days` is deleted and a newer one is kept.
 7. **Records.**
    - finished → archived;
    - resolved NeedFix → archived;
