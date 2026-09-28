@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import sqlite3
 import sys
 from types import SimpleNamespace
 from pathlib import Path
@@ -13,12 +14,14 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from aiworkhub import (  # noqa: E402
+    context_writes,
     core,
     feature_settings,
     manager_ai_tools,
     server,
     shared_router,
     source_graph,
+    storage_registry,
     task_store,
     workforce_catalog,
     worker_ai_tools_mcp as worker_tools,
@@ -267,6 +270,195 @@ def test_manager_ai_memory_read_surface_closes_get_search_related_cycle(tmp_path
 
     assert json.loads(exact["content"])["memory"]["value"] == "value-a"
     assert json.loads(related["content"])["related"][0]["key"] == "callback.contract"
+
+
+def _seed_searchable_memory(root: Path, *, strand: bool) -> Path:
+    """Write one memory canonically; ``strand`` then drops memories_fts, as a
+    legacy or half-migrated store lacks it.  Returns the memory database path."""
+    context_writes.memory_write(
+        root,
+        actor={
+            "role": "manager", "actor_id": "thread-1", "task_id": "",
+            "provider": "codex", "session_id": "thread-1",
+        },
+        action="remember", key="routing.contract", value="callback gate passed",
+        idempotency_key="memory:manager:fts:0001", provenance="test",
+    )
+    db = storage_registry.resolve_database_path(
+        storage_registry.load_storage_registry(root), "memory"
+    )
+    if strand:
+        con = sqlite3.connect(str(db))
+        try:
+            con.execute("DROP TABLE memories_fts")
+            con.commit()
+        finally:
+            con.close()
+    return db
+
+
+def _memory_schema(db: Path) -> list[tuple]:
+    con = sqlite3.connect(str(db))
+    try:
+        return [
+            tuple(row) for row in con.execute(
+                "SELECT type,name,sql FROM sqlite_master ORDER BY type,name"
+            ).fetchall()
+        ]
+    finally:
+        con.close()
+
+
+def _has_memories_fts(db: Path) -> bool:
+    return any(name == "memories_fts" for _type, name, _sql in _memory_schema(db))
+
+
+def test_manager_ai_memory_search_repairs_missing_fts_and_returns_hits(tmp_path, monkeypatch):
+    root = tmp_path / "repo"
+    root.mkdir()
+    assert task_store.initialize_repository(root)["ok"]
+    monkeypatch.setattr(core, "manager_bootstrap", lambda: _manager_route(root))
+    monkeypatch.setattr(core, "writes_allowed", lambda: True)
+    db = _seed_searchable_memory(root, strand=True)
+    assert not _has_memories_fts(db)
+
+    # The worker-facing tool only reads: it reports the missing index, never writes.
+    ctx, _manager = manager_ai_tools._manager_context()
+    unrepaired = worker_tools.ai_memory_search(ctx, query="callback", limit=3)
+    assert unrepaired["ok"] is False
+    assert unrepaired["reason"] == "fts_unavailable:memories_fts_absent"
+    assert not _has_memories_fts(db)
+
+    result = manager_ai_tools.ai_memory_search(query="callback", limit=3)
+
+    assert result["ok"] is True
+    assert result["surface"] == "manager_mcp"
+    assert "fts_repair" not in result
+    assert [hit["key"] for hit in json.loads(result["content"])["results"]] == ["routing.contract"]
+    assert _has_memories_fts(db)
+
+
+def test_manager_ai_memory_search_leaves_a_stranded_store_untouched_while_the_write_gate_is_closed(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "repo"
+    root.mkdir()
+    assert task_store.initialize_repository(root)["ok"]
+    monkeypatch.setattr(core, "manager_bootstrap", lambda: _manager_route(root))
+    db = _seed_searchable_memory(root, strand=True)
+    schema_before = _memory_schema(db)
+    repaired_repos = []
+    real_ensure = context_writes.ensure_memories_fts
+
+    def spy(repo):
+        repaired_repos.append(repo)
+        return real_ensure(repo)
+
+    monkeypatch.setattr(context_writes, "ensure_memories_fts", spy)
+    monkeypatch.setattr(core, "writes_allowed", lambda: False)
+
+    closed = manager_ai_tools.ai_memory_search(query="callback", limit=3)
+
+    # A read surface behind a closed write gate: it reports the missing index and
+    # repairs nothing -- the store is not even opened for the repair.
+    assert closed["ok"] is False
+    assert closed["reason"] == "fts_unavailable:memories_fts_absent"
+    assert "fts_repair" not in closed
+    assert manager_ai_tools._repair_memory_fts(root) == {
+        "ok": True, "created": False, "reason": "write_gate_closed",
+    }
+    assert repaired_repos == []
+    assert _memory_schema(db) == schema_before
+
+    # The very same search repairs the store once the manager's write gate opens.
+    monkeypatch.setattr(core, "writes_allowed", lambda: True)
+    opened = manager_ai_tools.ai_memory_search(query="callback", limit=3)
+
+    assert opened["ok"] is True
+    assert repaired_repos == [root.resolve()]
+    assert [hit["key"] for hit in json.loads(opened["content"])["results"]] == ["routing.contract"]
+    assert _has_memories_fts(db)
+
+
+def test_manager_ai_memory_search_repair_is_a_noop_on_a_healthy_store(tmp_path, monkeypatch):
+    root = tmp_path / "repo"
+    root.mkdir()
+    assert task_store.initialize_repository(root)["ok"]
+    monkeypatch.setattr(core, "manager_bootstrap", lambda: _manager_route(root))
+    monkeypatch.setattr(core, "writes_allowed", lambda: True)
+    db = _seed_searchable_memory(root, strand=False)
+    schema_before = _memory_schema(db)
+    outcomes = []
+    real_ensure = context_writes.ensure_memories_fts
+
+    def spy(repo):
+        outcome = real_ensure(repo)
+        outcomes.append((repo, outcome))
+        return outcome
+
+    monkeypatch.setattr(context_writes, "ensure_memories_fts", spy)
+
+    result = manager_ai_tools.ai_memory_search(query="callback", limit=3)
+
+    assert result["ok"] is True
+    assert result["hit_count"] == 1
+    assert "fts_repair" not in result
+    # Once, on the manager's authority repo, and nothing to repair.
+    assert outcomes == [
+        (root.resolve(), {"ok": True, "created": False, "reason": "fts_already_exists"})
+    ]
+    assert _memory_schema(db) == schema_before
+
+
+def test_manager_ai_memory_search_survives_a_failed_fts_repair(tmp_path, monkeypatch):
+    root = tmp_path / "repo"
+    root.mkdir()
+    assert task_store.initialize_repository(root)["ok"]
+    monkeypatch.setattr(core, "manager_bootstrap", lambda: _manager_route(root))
+    monkeypatch.setattr(core, "writes_allowed", lambda: True)
+    db = _seed_searchable_memory(root, strand=True)
+
+    def raising(repo):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    def reporting(repo):
+        return {"ok": False, "error": "fts_lock_blocked", "detail": "database is locked"}
+
+    for broken, expected_error in ((raising, "fts_repair_raised"), (reporting, "fts_lock_blocked")):
+        monkeypatch.setattr(context_writes, "ensure_memories_fts", broken)
+
+        result = manager_ai_tools.ai_memory_search(query="callback", limit=3)
+
+        # Still the search's own fts_unavailable result, now carrying the repair error.
+        assert result["ok"] is False
+        assert result["reason"] == "fts_unavailable:memories_fts_absent"
+        assert result["surface"] == "manager_mcp"
+        assert result["fts_repair"]["ok"] is False
+        assert result["fts_repair"]["error"] == expected_error
+        assert not _has_memories_fts(db)
+
+
+def test_manager_ai_memory_search_leaves_a_disabled_store_untouched(tmp_path, monkeypatch):
+    root = tmp_path / "repo"
+    root.mkdir()
+    assert task_store.initialize_repository(root)["ok"]
+    monkeypatch.setattr(core, "manager_bootstrap", lambda: _manager_route(root))
+    # An open gate, so it is the disabled feature alone that keeps the store untouched.
+    monkeypatch.setattr(core, "writes_allowed", lambda: True)
+    db = _seed_searchable_memory(root, strand=True)
+    monkeypatch.setattr(feature_settings, "enabled", lambda repo_path, name: name != "ai_memory")
+    monkeypatch.setattr(
+        context_writes,
+        "ensure_memories_fts",
+        lambda repo: (_ for _ in ()).throw(AssertionError("a disabled feature must not be repaired")),
+    )
+
+    result = manager_ai_tools.ai_memory_search(query="callback", limit=3)
+
+    assert result["ok"] is False
+    assert result["error"] == "feature_disabled:ai_memory"
+    assert "fts_repair" not in result
+    assert not _has_memories_fts(db)
 
 
 def test_main_mcp_exposes_complete_manager_ai_tool_surface():

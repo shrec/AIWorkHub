@@ -119,14 +119,68 @@ def _open(repo: Path, db_id: str) -> sqlite3.Connection:
     return con
 
 
-def _ensure_memories_fts(con: sqlite3.Connection) -> dict[str, Any]:
-    """Atomic repair: acquire BEGIN IMMEDIATE, re-check, backfill rowid=id.
+def _create_memories_fts(con: sqlite3.Connection) -> None:
+    """Create and backfill ``memories_fts`` (rowid=id) in the caller's transaction.
 
-    Single source of truth for ``memories_fts`` DDL and backfill used by both
-    the write-path schema normalizer and the public search-path repair entry
-    point.  Returns a bounded outcome dict; callers decide interpretation.
+    Single source of truth for the ``memories_fts`` DDL and backfill.  The
+    caller owns BEGIN/COMMIT, so the atomic schema rebuild and the standalone
+    repair share one definition without either nesting a transaction.
+    """
+    con.execute("CREATE VIRTUAL TABLE memories_fts USING fts5(key,value,tags,scope)")
+    con.execute(
+        "INSERT INTO memories_fts(rowid,key,value,tags,scope) "
+        "SELECT id,key,value,tags,scope FROM memories"
+    )
+
+
+def _memories_fts_triggers(con: sqlite3.Connection) -> list[str]:
+    """Names of every trigger, on any table, whose SQL references ``memories_fts``.
+
+    Deliberately not limited to triggers on ``memories``: with
+    ``legacy_alter_table`` off, ``ALTER TABLE ... RENAME`` re-parses the whole
+    schema, so a trigger on another table that writes to a dropped
+    ``memories_fts`` fails the rename just as the legacy ``memories`` triggers
+    do.
+    """
+    return [
+        str(name)
+        for name, sql in con.execute(
+            "SELECT name,sql FROM sqlite_master WHERE type='trigger'"
+        ).fetchall()
+        if "memories_fts" in str(sql or "").lower()
+    ]
+
+
+def _drop_memories_fts_triggers(con: sqlite3.Connection) -> None:
+    """Drop the legacy triggers that keep ``memories_fts`` in sync behind our back.
+
+    The canonical model maintains ``memories_fts`` explicitly in
+    ``memory_write``, so these triggers must not survive: with the index gone
+    they fail every statement on their table (``no such table:
+    main.memories_fts``), and beside a recreated index they would maintain it a
+    second time.  The caller owns the transaction.
+    """
+    for name in _memories_fts_triggers(con):
+        con.execute('DROP TRIGGER IF EXISTS "' + name.replace('"', '""') + '"')
+
+
+def _ensure_memories_fts(con: sqlite3.Connection) -> dict[str, Any]:
+    """Atomic repair: lock-free check, then BEGIN IMMEDIATE, re-check, backfill rowid=id.
+
+    Standalone repair built on ``_create_memories_fts`` and used by both the
+    write-path schema normalizer and the public search-path repair entry
+    point.  An index that already exists is a no-op decided by a read alone, so
+    the hot search path never takes the write lock; only an absent index goes
+    on to BEGIN IMMEDIATE, where it is checked again against a concurrent
+    repairer.  Creating the index also drops any legacy trigger that would
+    maintain it a second time (``_drop_memories_fts_triggers``).  Returns a
+    bounded outcome dict; callers decide interpretation.
     """
     try:
+        if con.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='memories_fts'"
+        ).fetchone() is not None:
+            return {"ok": True, "created": False, "reason": "fts_already_exists"}
         con.execute("BEGIN IMMEDIATE")
     except sqlite3.OperationalError as exc:
         return {"ok": False, "error": "fts_lock_blocked", "detail": str(exc)[:120]}
@@ -141,11 +195,8 @@ def _ensure_memories_fts(con: sqlite3.Connection) -> dict[str, Any]:
         ).fetchone() is None:
             con.rollback()
             return {"ok": True, "created": False, "reason": "memories_table_absent"}
-        con.execute("CREATE VIRTUAL TABLE memories_fts USING fts5(key,value,tags,scope)")
-        con.execute(
-            "INSERT INTO memories_fts(rowid,key,value,tags,scope) "
-            "SELECT id,key,value,tags,scope FROM memories"
-        )
+        _drop_memories_fts_triggers(con)
+        _create_memories_fts(con)
         con.commit()
         return {"ok": True, "created": True, "reason": "fts_created"}
     except sqlite3.Error as exc:
@@ -156,6 +207,113 @@ def _ensure_memories_fts(con: sqlite3.Connection) -> dict[str, Any]:
         return {"ok": False, "error": "fts_migration_failed", "detail": str(exc)[:160], "sqlite_errorname": str(getattr(exc, "sqlite_errorname", "UNKNOWN"))}
 
 
+def _has_unique_key_index(con: sqlite3.Connection) -> bool:
+    """True when ``memories`` carries a unique index on exactly ``key``."""
+    for row in con.execute("PRAGMA index_list(memories)").fetchall():
+        # seq, name, unique, origin, partial
+        if not bool(row[2]):
+            continue
+        index_name = str(row[1]).replace('"', '""')
+        columns = [
+            str(info[2])
+            for info in con.execute(f'PRAGMA index_info("{index_name}")').fetchall()
+        ]
+        if columns == ["key"]:
+            return True
+    return False
+
+
+def _migrate_memories_schema(con: sqlite3.Connection) -> None:
+    """Atomically clear legacy FTS triggers, rebuild ``memories_fts``, un-``UNIQUE`` ``memories``.
+
+    Every legacy trigger that writes to ``memories_fts`` is dropped, on
+    whichever table it sits: the canonical model maintains that index
+    explicitly in ``memory_write``.  A surviving trigger double-indexes every
+    write, and once ``memories_fts`` is gone it fails every statement on its
+    table with ``no such table: main.memories_fts`` -- modern SQLite refuses
+    the ``ALTER TABLE ... RENAME`` below for the same reason, because it
+    re-parses every trigger in the schema.  ``memories_fts`` is then dropped
+    and recreated in the canonical shape, backfilled with rowid=id, whether or
+    not the table itself needs rebuilding.  A legacy store keeps an
+    external-content index (``content='memories'``) that only the dropped
+    triggers maintained, and an existence check by name cannot tell it from
+    the canonical one.  Left in place it would keep answering ``MATCH`` from
+    superseded text: ``memory_write`` deletes by rowid after the content row
+    has already changed, so an external-content index can no longer recover the
+    old terms.  When an exact ``key UNIQUE`` index is observed, the table is
+    rebuilt without it in between, preserving ids.
+
+    The whole sequence is one ``BEGIN IMMEDIATE`` transaction, like
+    ``_normalize_context_mutations_schema``.  The former ``executescript``
+    form committed ``DROP TABLE memories_fts`` by itself and only then failed
+    the rename, stranding a store with no FTS index, the stale trigger and the
+    unique index all still in place.  Here the index drop is rolled back with
+    everything else: the copied row count is verified against the source and
+    the rebuilt index against ``memories``, and any failure -- a count mismatch
+    or any exception -- restores the original tables, triggers and index
+    untouched and raises ``ContextWriteError`` naming the step that failed.
+    What needs migrating is re-checked under the write lock, so a concurrent
+    opener that already migrated the store is not migrated twice.
+    """
+    step = "begin_immediate"
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        step = "recheck_under_lock"
+        rebuild_table = _has_unique_key_index(con)
+        if not rebuild_table and not _memories_fts_triggers(con):
+            con.rollback()
+            return
+        step = "drop_fts_triggers"
+        _drop_memories_fts_triggers(con)
+        step = "drop_memories_fts"
+        con.execute("DROP TABLE IF EXISTS memories_fts")
+        if rebuild_table:
+            step = "count_source_rows"
+            source_count = con.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
+            step = "rename_memories_to_legacy"
+            con.execute("ALTER TABLE memories RENAME TO memories_legacy_unique")
+            step = "create_memories"
+            con.execute(
+                "CREATE TABLE memories(id INTEGER PRIMARY KEY,key TEXT,value TEXT,tags TEXT,scope TEXT)"
+            )
+            step = "copy_rows"
+            con.execute(
+                "INSERT INTO memories(id,key,value,tags,scope) "
+                "SELECT id,key,value,tags,scope FROM memories_legacy_unique"
+            )
+            step = "verify_row_count"
+            copied_count = con.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
+            if copied_count != source_count:
+                raise ContextWriteError(
+                    "memories_migration_row_count_mismatch:"
+                    f"source={source_count}:copied={copied_count}"
+                )
+            step = "drop_legacy_table"
+            con.execute("DROP TABLE memories_legacy_unique")
+        step = "create_memories_fts"
+        _create_memories_fts(con)
+        step = "verify_fts_row_count"
+        memories_count = con.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
+        indexed_count = con.execute("SELECT COUNT(*) FROM memories_fts").fetchone()[0]
+        if indexed_count != memories_count:
+            raise ContextWriteError(
+                "memories_migration_fts_row_count_mismatch:"
+                f"memories={memories_count}:indexed={indexed_count}"
+            )
+        step = "commit"
+        con.commit()
+    except Exception as exc:
+        try:
+            con.rollback()
+        except sqlite3.Error:
+            pass
+        if isinstance(exc, ContextWriteError):
+            raise
+        raise ContextWriteError(
+            f"memories_migration_failed:step={step}:{type(exc).__name__}:{str(exc)[:120]}"
+        ) from exc
+
+
 def _normalize_memory_schema(con: sqlite3.Connection) -> None:
     """Repair known legacy ``memories`` schema shapes without losing rows.
 
@@ -163,36 +321,22 @@ def _normalize_memory_schema(con: sqlite3.Connection) -> None:
     key.  Early databases declared ``key UNIQUE``; after an archived row was
     imported, ``remember`` therefore raised an opaque IntegrityError.  Rebuild
     only when an exact unique-key index is observed, preserve ids, and rebuild
-    the contentless FTS mirror deterministically via the shared
-    ``_ensure_memories_fts`` primitive.  Both paths are idempotent.
+    the FTS mirror deterministically.  Independently of the unique index, any
+    legacy trigger that writes to ``memories_fts`` sends the store through
+    ``_migrate_memories_schema``, which drops it and always recreates the index
+    in the canonical shape.  A database stranded with no ``memories_fts`` and a
+    stale trigger therefore repairs itself here whether or not the unique index
+    survives, and a legacy external-content index never outlives the triggers
+    that maintained it.  The closing ``_ensure_memories_fts`` call is the
+    shared primitive that backfills an index that is still absent.  Both paths
+    are idempotent.
     """
     if con.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='memories'"
     ).fetchone() is None:
         return
-    unique_key_index = False
-    for row in con.execute("PRAGMA index_list(memories)"):
-        # seq, name, unique, origin, partial
-        if not bool(row[2]):
-            continue
-        index_name = str(row[1]).replace('"', '""')
-        columns = [
-            str(info[2])
-            for info in con.execute(f'PRAGMA index_info("{index_name}")')
-        ]
-        if columns == ["key"]:
-            unique_key_index = True
-            break
-    if unique_key_index:
-        con.executescript(
-            "DROP TABLE IF EXISTS memories_fts;"
-            "ALTER TABLE memories RENAME TO memories_legacy_unique;"
-            "CREATE TABLE memories(id INTEGER PRIMARY KEY,key TEXT,value TEXT,tags TEXT,scope TEXT);"
-            "INSERT INTO memories(id,key,value,tags,scope) "
-            "SELECT id,key,value,tags,scope FROM memories_legacy_unique;"
-            "DROP TABLE memories_legacy_unique;"
-        )
-        con.commit()
+    if _has_unique_key_index(con) or _memories_fts_triggers(con):
+        _migrate_memories_schema(con)
     result = _ensure_memories_fts(con)
     if not result.get("ok"):
         raise ContextWriteError(f"fts_normalization_failed:{result.get('error', 'unknown')}")
@@ -267,11 +411,11 @@ def _normalize_context_mutations_schema(con: sqlite3.Connection) -> None:
 def ensure_memories_fts(repo: Path) -> dict[str, Any]:
     """Public entry point for search-path FTS repair on the canonical memory DB.
 
-    Opens a fresh writable connection, acquires BEGIN IMMEDIATE, checks
-    whether ``memories_fts`` already exists, creates and backfills if absent,
-    and returns a bounded outcome dict.  Callers on the read-only search path
-    invoke this once before their MATCH query; exact get/related never call
-    it.
+    Opens a fresh writable connection, checks whether ``memories_fts`` already
+    exists, creates and backfills it if absent, and returns a bounded outcome
+    dict.  With the index present this is a no-op that never takes the write
+    lock (see ``_ensure_memories_fts``).  The manager search path invokes this
+    once before its MATCH query; exact get/related never call it.
     """
     try:
         registry = storage_registry.load_storage_registry(repo)

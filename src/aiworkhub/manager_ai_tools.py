@@ -150,8 +150,42 @@ def session_current_state(*, topic: str = "management", limit: int = 12) -> dict
     )
 
 
+def _repair_memory_fts(repo: Path) -> dict[str, Any]:
+    """Repair a missing ``memories_fts`` on the canonical memory DB; never raise.
+
+    The repair is DDL on the canonical store, so it passes the same manager
+    write gate as ``_write_invoke``: with the gate closed the store is not
+    opened at all and the search reports its own result.
+    ``context_writes.ensure_memories_fts`` is a bounded no-op once the index
+    exists.  Any failure comes back as a bounded outcome for the caller to
+    attach: the repair is best-effort and must not crash the search it serves.
+    """
+    try:
+        if not feature_settings.enabled(repo, "ai_memory"):
+            return {"ok": True, "created": False, "reason": "ai_memory_disabled"}
+        if not core.writes_allowed():
+            return {"ok": True, "created": False, "reason": "write_gate_closed"}
+        outcome = context_writes.ensure_memories_fts(repo)
+    except Exception as exc:
+        return {"ok": False, "error": "fts_repair_raised", "detail": f"{type(exc).__name__}: {exc}"[:160]}
+    if not isinstance(outcome, dict):
+        return {"ok": False, "error": "fts_repair_invalid_outcome"}
+    return outcome
+
+
 def ai_memory_search(*, query: str, limit: int = 8) -> dict[str, Any]:
-    return _invoke(lambda ctx: worker_tools.ai_memory_search(ctx, query=query, limit=limit))
+    def _search(ctx: worker_tools.WorkerToolContext) -> dict[str, Any]:
+        # The worker-facing tool only reads the canonical store.  The manager
+        # holds its authority, so a legacy or stranded store is repaired here,
+        # once, before the query.  A failed repair leaves the search's own
+        # ``fts_unavailable`` result in place, with the repair error attached.
+        repair = _repair_memory_fts(ctx.authority_repo)
+        result = dict(worker_tools.ai_memory_search(ctx, query=query, limit=limit))
+        if not repair.get("ok"):
+            result["fts_repair"] = repair
+        return result
+
+    return _invoke(_search)
 
 
 def ai_memory_get(*, key: str) -> dict[str, Any]:
