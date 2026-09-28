@@ -48,6 +48,27 @@ MANAGER_CHAT_PROVIDER = "manager_chat"
 _CALLBACK_PROVIDERS = frozenset({"", "codex", "claude", "copilot", MANAGER_CHAT_PROVIDER})
 _MANAGER_CHAT_SESSION_RE = re.compile(r"^mls-[0-9a-f]{32}$", re.I)
 
+# A Manager Chat conversation is the seat only while it is in use: an active
+# record nobody has touched for this long is a leftover, not the manager (a
+# one-turn console test stayed the seat for two days on 0.12.1). A stamp counts
+# as activity when now - LEASE <= stamp <= now + CLOCK_SKEW. The skew tolerates
+# a writer whose clock runs a little ahead; a stamp further ahead than that is a
+# wrong clock, and with no upper bound it would hold the seat until real time
+# caught up with it.
+MANAGER_CHAT_SEAT_LEASE = timedelta(hours=12)
+MANAGER_CHAT_SEAT_CLOCK_SKEW = timedelta(minutes=5)
+_MANAGER_CHAT_ACTIVITY_FIELDS = ("last_turn_at", "updated_at", "created_at")
+# ``manager_loop.SessionStore.append_event`` logs each event as one ASCII-escaped JSON line:
+# an envelope of about 100 bytes around a payload of at most
+# ``manager_loop.MAX_EVENT_PAYLOAD_BYTES`` (4 KiB; a larger one is cut to a 2 KiB preview).
+# Escaping writes a non-ASCII character as ``\uXXXX``, 6 bytes for a 2-byte character and
+# 12 for a 4-byte one, so at most 3x the payload's own size. A line therefore stays under
+# 3 * 4 KiB + 100 bytes, about 12 KiB, and this tail holds the newest one whole. That
+# writer is not in this module, so
+# ``test_manager_chat_event_tail_holds_the_longest_line_the_writer_can_log`` pins the
+# bound: it fails once the payload cap is raised until 3x of it no longer fits here.
+_MANAGER_CHAT_EVENT_TAIL_BYTES = 64 * 1024
+
 CALLBACK_OUTBOX_STATES: tuple[str, ...] = (
     "pending", "inflight", "delivered", "dead_letter", "superseded",
 )
@@ -452,11 +473,102 @@ def _main_database_file(conn: sqlite3.Connection) -> str:
     return ""
 
 
-def _active_manager_chat_session_from_conn(conn: sqlite3.Connection) -> str:
-    """The selected active Manager Chat session for this connection's repo.
+def _parse_instant(value: Any) -> datetime | None:
+    """``value`` as an aware UTC datetime, or ``None`` when it is not an ISO-8601 string."""
 
-    Derived from the database file, never from an ambient repo env, so a
-    test database cannot inherit the owner's live session.
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except (ValueError, OverflowError):
+        return None
+
+
+def _manager_chat_last_event_at(
+    state_dir: Path | None, session_id: str, *, not_after: datetime
+) -> datetime | None:
+    """When the newest event in one Manager Chat session's log happened, else ``None``.
+
+    The session record only carries ``created_at``, but every turn appends to
+    ``events/<id>.jsonl``, so that log's last ``at`` is the last real activity.
+    Only the last ``_MANAGER_CHAT_EVENT_TAIL_BYTES`` are read; the writer's line
+    bound (see that constant) keeps the newest line whole inside them. A line
+    that is not a timestamped event is skipped, and so is one stamped after
+    ``not_after``: an event from the future is a wrong clock, not activity, and
+    must not stand in for the real last one. A tail with no such line, a log
+    whose last line outgrew the tail included, yields ``None``: no activity, so
+    no seat.
+    """
+
+    if state_dir is None or not _MANAGER_CHAT_SESSION_RE.fullmatch(session_id):
+        return None
+    log = state_dir / "events" / f"{session_id}.jsonl"
+    try:
+        size = log.stat().st_size
+        with log.open("rb") as handle:
+            handle.seek(max(0, size - _MANAGER_CHAT_EVENT_TAIL_BYTES))
+            tail = handle.read()
+    except OSError:
+        return None
+    for line in reversed(tail.splitlines()):
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        moment = _parse_instant(event.get("at")) if isinstance(event, dict) else None
+        if moment is not None and moment <= not_after:
+            return moment
+    return None
+
+
+def manager_chat_record_holds_seat(
+    record: Any, *, state_dir: Path | None = None, now: datetime | None = None
+) -> bool:
+    """Whether one Manager Chat session record is the manager seat right now.
+
+    The one rule every reader shares: the callback origin here, the seat
+    ``core`` reports, and the wake consumer in ``manager_loop_service``. A
+    record holds the seat only when it is ``active``, pinned to a backend and
+    model (a passive conversation has neither and owns no route to answer on),
+    and used recently: one of ``last_turn_at``, ``updated_at`` or ``created_at``
+    satisfies ``now - MANAGER_CHAT_SEAT_LEASE <= stamp <= now +
+    MANAGER_CHAT_SEAT_CLOCK_SKEW``. When none does, the newest event in its log
+    under ``state_dir`` (the ``manager_loop`` runtime directory) inside that same
+    bound still counts. A stamp older than the lease is a leftover and one
+    ahead of the skew is a wrong clock; neither keeps the seat, so a record
+    with no such stamp and no such event is not the seat.
+    """
+
+    if not isinstance(record, dict):
+        return False
+    if str(record.get("status") or "") != "active":
+        return False
+    backend_id = str(record.get("backend_id") or "").strip()
+    model = str(record.get("model") or "").strip()
+    if not backend_id or not model:
+        return False
+    current = now or datetime.now(timezone.utc)
+    earliest = current - MANAGER_CHAT_SEAT_LEASE
+    latest = current + MANAGER_CHAT_SEAT_CLOCK_SKEW
+    stamps = (_parse_instant(record.get(field)) for field in _MANAGER_CHAT_ACTIVITY_FIELDS)
+    if any(stamp is not None and earliest <= stamp <= latest for stamp in stamps):
+        return True
+    logged = _manager_chat_last_event_at(
+        state_dir, str(record.get("session_id") or ""), not_after=latest
+    )
+    return logged is not None and logged >= earliest
+
+
+def _active_manager_chat_session_from_conn(conn: sqlite3.Connection) -> str:
+    """The selected Manager Chat session for this connection's repo, when it holds the seat.
+
+    A closed, passive or long-idle record is not the seat
+    (:func:`manager_chat_record_holds_seat`). Derived from the database file,
+    never from an ambient repo env, so a test database cannot inherit the
+    owner's live session.
     """
 
     db_file = _main_database_file(conn)
@@ -478,7 +590,7 @@ def _active_manager_chat_session_from_conn(conn: sqlite3.Connection) -> str:
         return ""
     if str(record.get("session_id") or "") != session_id:
         return ""
-    if str(record.get("status") or "") != "active":
+    if not manager_chat_record_holds_seat(record, state_dir=selected_path.parent):
         return ""
     return session_id
 
@@ -486,8 +598,8 @@ def _active_manager_chat_session_from_conn(conn: sqlite3.Connection) -> str:
 def _callback_manager_chat_session(conn: sqlite3.Connection, task_id: str) -> str:
     """Where this task's Manager Chat copy should land.
 
-    The card's stamped session wins. Otherwise the active selected session.
-    Window ids and episode ids are not sessions.
+    The card's stamped session wins. Otherwise the selected session, when it
+    still holds the seat. Window ids and episode ids are not sessions.
     """
 
     try:

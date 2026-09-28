@@ -5,6 +5,7 @@ import hashlib
 import json
 import sqlite3
 import sys
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from pathlib import Path
 
@@ -15,6 +16,7 @@ if str(SRC) not in sys.path:
 
 from aiworkhub import (  # noqa: E402
     context_writes,
+    callback_store,
     core,
     feature_settings,
     manager_ai_tools,
@@ -1306,19 +1308,41 @@ def test_task_create_callback_required_waits_for_real_origin_thread(tmp_path, mo
     assert result["stderr"] == "callback_route_pending:codex_thread_id_not_observed"
 
 
+_SEAT_SESSION = "mls-" + "ab" * 16
+
+
+def _hours_ago(hours):
+    return (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+
+
+def _hours_ahead(hours):
+    return _hours_ago(-hours)
+
+
+def _select_manager_chat_session(root, session_id=_SEAT_SESSION, **fields):
+    """Select one Manager Chat session record: active, bound and just created unless ``fields`` differ."""
+
+    state = root / ".aiworkhub" / "runtime" / "manager_loop"
+    (state / "sessions").mkdir(parents=True, exist_ok=True)
+    (state / "selected.json").write_text(json.dumps({"session_id": session_id}), encoding="utf-8")
+    record = {
+        "session_id": session_id,
+        "status": "active",
+        "backend_id": "opencode_cli",
+        "model": "xai/grok-4.7",
+        "created_at": _hours_ago(0),
+        **fields,
+    }
+    (state / "sessions" / f"{session_id}.json").write_text(json.dumps(record), encoding="utf-8")
+    return state
+
+
 def test_task_create_uses_active_manager_chat_session_as_callback_origin(tmp_path, monkeypatch):
     root = tmp_path / "repo"
     root.mkdir()
     assert task_store.initialize_repository(root)["ok"]
     session_id = "mls-" + "ab" * 16
-    session_dir = root / ".aiworkhub" / "runtime" / "manager_loop" / "sessions"
-    session_dir.mkdir(parents=True)
-    (root / ".aiworkhub" / "runtime" / "manager_loop" / "selected.json").write_text(
-        json.dumps({"session_id": session_id}), encoding="utf-8"
-    )
-    (session_dir / f"{session_id}.json").write_text(
-        json.dumps({"session_id": session_id, "status": "active"}), encoding="utf-8"
-    )
+    _select_manager_chat_session(root, session_id)
     monkeypatch.setenv("AIWORKHUB_REPO", str(root))
     monkeypatch.setenv("AIWORKHUB_ALLOW_WRITES", "1")
     monkeypatch.setattr(core, "_claude_manager_identity", lambda: None)
@@ -1359,14 +1383,7 @@ def test_task_create_keeps_codex_thread_and_manager_chat_session(tmp_path, monke
     assert task_store.initialize_repository(root)["ok"]
     session_id = "mls-" + "cd" * 16
     thread_id = "11111111-1111-4111-8111-111111111111"
-    session_dir = root / ".aiworkhub" / "runtime" / "manager_loop" / "sessions"
-    session_dir.mkdir(parents=True)
-    (root / ".aiworkhub" / "runtime" / "manager_loop" / "selected.json").write_text(
-        json.dumps({"session_id": session_id}), encoding="utf-8"
-    )
-    (session_dir / f"{session_id}.json").write_text(
-        json.dumps({"session_id": session_id, "status": "active"}), encoding="utf-8"
-    )
+    _select_manager_chat_session(root, session_id)
     monkeypatch.setenv("AIWORKHUB_REPO", str(root))
     monkeypatch.setenv("AIWORKHUB_ALLOW_WRITES", "1")
     monkeypatch.setattr(core, "_claude_manager_identity", lambda: None)
@@ -1404,20 +1421,7 @@ def test_manager_bootstrap_reports_the_active_manager_chat_seat(tmp_path, monkey
     root = tmp_path / "repo"
     root.mkdir()
     session_id = "mls-" + "ab" * 16
-    session_dir = root / ".aiworkhub" / "runtime" / "manager_loop" / "sessions"
-    session_dir.mkdir(parents=True)
-    (session_dir.parent / "selected.json").write_text(
-        json.dumps({"session_id": session_id}), encoding="utf-8"
-    )
-    (session_dir / f"{session_id}.json").write_text(
-        json.dumps({
-            "session_id": session_id,
-            "status": "active",
-            "backend_id": "opencode_cli",
-            "model": "xai/grok-4.7",
-        }),
-        encoding="utf-8",
-    )
+    _select_manager_chat_session(root, session_id)
     monkeypatch.setattr(core, "repo_root", lambda: root)
     monkeypatch.setattr(core, "_claude_manager_identity", lambda: None)
     monkeypatch.setattr(core, "_codex_manager_identity", lambda: {
@@ -1443,6 +1447,398 @@ def test_manager_bootstrap_reports_the_active_manager_chat_seat(tmp_path, monkey
     assert route["manager_chat"]["session_id"] == session_id
     assert contract["codex_route"]["session_id"] == "episode_pending"
     assert contract["reason"] == ""
+
+
+_VERIFIED_CODEX_ROUTE = {
+    "provider": "codex",
+    "session_id": "episode_verified",
+    "thread_id": "11111111-1111-4111-8111-111111111111",
+    "window_id": "window_owner",
+    "route_state": "ready",
+    "callback_supported": "true",
+}
+
+
+def _bootstrap_as_verified_codex(monkeypatch, root):
+    monkeypatch.setattr(core, "repo_root", lambda: root)
+    monkeypatch.setattr(core, "_claude_manager_identity", lambda: None)
+    monkeypatch.setattr(core, "_codex_manager_identity", lambda: dict(_VERIFIED_CODEX_ROUTE))
+    monkeypatch.setattr(core, "_CONTRACT_DELIVERIES", {})
+    return core.manager_bootstrap()
+
+
+def test_bootstrap_keeps_the_verified_route_when_the_selected_session_is_passive(tmp_path, monkeypatch):
+    root = tmp_path / "repo"
+    root.mkdir()
+    _select_manager_chat_session(root, backend_id="", model="")
+
+    contract = _bootstrap_as_verified_codex(monkeypatch, root)
+
+    assert contract["provider"] == "codex"
+    assert contract["manager_verified"] is True
+    assert contract["manager_route"] == _VERIFIED_CODEX_ROUTE
+    assert "codex_route" not in contract
+
+
+def test_bootstrap_keeps_the_verified_route_when_the_selected_session_is_idle_past_the_lease(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "repo"
+    root.mkdir()
+    _select_manager_chat_session(root, created_at=_hours_ago(13))
+
+    contract = _bootstrap_as_verified_codex(monkeypatch, root)
+
+    assert contract["provider"] == "codex"
+    assert contract["manager_verified"] is True
+    assert contract["manager_route"] == _VERIFIED_CODEX_ROUTE
+    assert "codex_route" not in contract
+
+
+def test_bootstrap_keeps_the_verified_route_when_the_selected_session_is_stamped_from_the_future(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "repo"
+    root.mkdir()
+    _select_manager_chat_session(root, created_at=_hours_ahead(1))
+
+    contract = _bootstrap_as_verified_codex(monkeypatch, root)
+
+    assert contract["provider"] == "codex"
+    assert contract["manager_verified"] is True
+    assert contract["manager_route"] == _VERIFIED_CODEX_ROUTE
+    assert "codex_route" not in contract
+
+
+def _seen_seat(monkeypatch, root):
+    """What core and callback_store each report as the seat for the selected session."""
+
+    monkeypatch.setattr(core, "repo_root", lambda: root)
+    conn = callback_store.open_db(root / ".aiworkhub" / "tasking" / "task_queue.sqlite")
+    try:
+        callback_store.init_db(conn)
+        return (
+            core._active_manager_chat_record(),
+            core._manager_chat_session_origin(),
+            callback_store._active_manager_chat_session_from_conn(conn),
+            callback_store._callback_manager_chat_session(conn, "TASK_WITHOUT_A_CARD"),
+        )
+    finally:
+        conn.close()
+
+
+def test_a_fresh_bound_session_is_the_manager_chat_seat_in_core_and_callback_store(tmp_path, monkeypatch):
+    root = tmp_path / "repo"
+    root.mkdir()
+    _select_manager_chat_session(root)
+
+    record, origin, session, callback_origin = _seen_seat(monkeypatch, root)
+
+    assert record == {
+        "session_id": _SEAT_SESSION,
+        "backend_id": "opencode_cli",
+        "model": "xai/grok-4.7",
+        "status": "active",
+    }
+    assert origin == session == callback_origin == _SEAT_SESSION
+
+
+def test_an_active_session_idle_past_the_lease_is_not_the_manager_chat_seat(tmp_path, monkeypatch):
+    root = tmp_path / "repo"
+    root.mkdir()
+    _select_manager_chat_session(root, created_at=_hours_ago(13))
+
+    assert _seen_seat(monkeypatch, root) == (None, "", "", "")
+
+
+def test_a_session_stamped_from_the_future_is_not_the_manager_chat_seat(tmp_path, monkeypatch):
+    root = tmp_path / "repo"
+    root.mkdir()
+    _select_manager_chat_session(root, created_at=_hours_ahead(1))
+
+    assert _seen_seat(monkeypatch, root) == (None, "", "", "")
+
+    _select_manager_chat_session(root, created_at=_hours_ahead(1 / 60))
+
+    record, origin, session, callback_origin = _seen_seat(monkeypatch, root)
+
+    assert record is not None
+    assert origin == session == callback_origin == _SEAT_SESSION
+
+
+def test_a_passive_session_is_not_the_manager_chat_seat(tmp_path, monkeypatch):
+    root = tmp_path / "repo"
+    root.mkdir()
+    _select_manager_chat_session(root, backend_id="", model="")
+
+    assert _seen_seat(monkeypatch, root) == (None, "", "", "")
+
+
+def test_a_session_created_long_ago_but_still_in_use_keeps_the_manager_chat_seat(tmp_path, monkeypatch):
+    root = tmp_path / "repo"
+    root.mkdir()
+    state = _select_manager_chat_session(root, created_at=_hours_ago(72))
+    log = state / "events" / f"{_SEAT_SESSION}.jsonl"
+    log.parent.mkdir()
+    log.write_text(
+        json.dumps({"at": _hours_ago(1), "seq": 1, "turn": 1, "type": "user_message", "payload": {}})
+        + "\n",
+        encoding="utf-8",
+    )
+
+    record, origin, session, callback_origin = _seen_seat(monkeypatch, root)
+
+    assert record is not None
+    assert origin == session == callback_origin == _SEAT_SESSION
+
+
+def test_core_and_callback_store_both_defer_to_the_one_shared_seat_predicate(tmp_path, monkeypatch):
+    root = tmp_path / "repo"
+    root.mkdir()
+    _select_manager_chat_session(root)
+    monkeypatch.setattr(callback_store, "manager_chat_record_holds_seat", lambda record, **_kw: False)
+
+    assert _seen_seat(monkeypatch, root) == (None, "", "", "")
+
+    _select_manager_chat_session(root, backend_id="", model="", created_at=_hours_ago(99))
+    monkeypatch.setattr(callback_store, "manager_chat_record_holds_seat", lambda record, **_kw: True)
+
+    record, origin, session, callback_origin = _seen_seat(monkeypatch, root)
+
+    assert record is not None
+    assert origin == session == callback_origin == _SEAT_SESSION
+
+
+def test_manager_chat_seat_needs_an_active_bound_session_used_within_the_lease():
+    now = datetime(2026, 9, 28, 12, 0, tzinfo=timezone.utc)
+    lease = callback_store.MANAGER_CHAT_SEAT_LEASE
+    assert lease == timedelta(hours=12)
+
+    def holds(**fields):
+        record = {
+            "session_id": _SEAT_SESSION,
+            "status": "active",
+            "backend_id": "opencode_cli",
+            "model": "xai/grok-4.7",
+            "created_at": (now - timedelta(minutes=5)).isoformat(),
+            **fields,
+        }
+        return callback_store.manager_chat_record_holds_seat(record, now=now)
+
+    assert holds()
+    assert holds(created_at="2026-09-28T11:55:00Z")
+    assert holds(created_at="2026-09-28T11:55:00")
+    assert holds(created_at=(now - lease).isoformat())
+    assert not holds(created_at=(now - lease - timedelta(seconds=1)).isoformat())
+    assert not holds(status="closed")
+    assert not holds(backend_id="")
+    assert not holds(model="  ")
+    assert not holds(backend_id="", model="")
+    assert not holds(created_at="")
+    assert not holds(created_at=None)
+    assert not holds(created_at="not a timestamp")
+    assert not callback_store.manager_chat_record_holds_seat(None, now=now)
+
+    old = (now - timedelta(days=3)).isoformat()
+    recent = (now - timedelta(hours=1)).isoformat()
+    assert not holds(created_at=old)
+    assert holds(created_at=old, updated_at=recent)
+    assert holds(created_at=old, last_turn_at=recent)
+
+
+def test_manager_chat_seat_lease_counts_the_last_logged_event(tmp_path):
+    now = datetime(2026, 9, 28, 12, 0, tzinfo=timezone.utc)
+    state = tmp_path / "manager_loop"
+    log = state / "events" / f"{_SEAT_SESSION}.jsonl"
+    log.parent.mkdir(parents=True)
+    record = {
+        "session_id": _SEAT_SESSION,
+        "status": "active",
+        "backend_id": "opencode_cli",
+        "model": "xai/grok-4.7",
+        "created_at": (now - timedelta(days=3)).isoformat(),
+    }
+
+    def holds(session_record=record):
+        return callback_store.manager_chat_record_holds_seat(session_record, state_dir=state, now=now)
+
+    def event(seq, when):
+        return json.dumps(
+            {"at": when.isoformat(), "seq": seq, "turn": seq, "type": "user_message", "payload": {}}
+        )
+
+    long_ago = event(1, now - timedelta(days=3))
+    an_hour_ago = event(2, now - timedelta(hours=1))
+    assert not holds()  # no log yet: only the three-day-old creation counts
+    log.write_text(long_ago + "\n", encoding="utf-8")
+    assert not holds()
+    log.write_text(long_ago + "\n" + an_hour_ago + "\n", encoding="utf-8")
+    assert holds()
+    # A torn last line is skipped, not trusted: the last whole event still counts.
+    log.write_text(long_ago + "\n" + an_hour_ago + '\n{"at": "2026-09-28T11', encoding="utf-8")
+    assert holds()
+    log.write_text(long_ago + '\n{"at": "not a timestamp"}\n', encoding="utf-8")
+    assert not holds()
+    # Only a Manager Chat session's own log is read, never a path a record names.
+    (state / "escape.jsonl").write_text(event(1, now) + "\n", encoding="utf-8")
+    assert not holds({**record, "session_id": "../escape"})
+
+
+def test_manager_chat_seat_ignores_a_stamp_from_the_future():
+    now = datetime(2026, 9, 28, 12, 0, tzinfo=timezone.utc)
+    skew = callback_store.MANAGER_CHAT_SEAT_CLOCK_SKEW
+    assert skew == timedelta(minutes=5)
+
+    def at(delta):
+        return (now + delta).isoformat()
+
+    def holds(**fields):
+        record = {
+            "session_id": _SEAT_SESSION,
+            "status": "active",
+            "backend_id": "opencode_cli",
+            "model": "xai/grok-4.7",
+            **fields,
+        }
+        return callback_store.manager_chat_record_holds_seat(record, now=now)
+
+    assert holds(created_at=at(timedelta(minutes=1)))
+    assert holds(created_at=at(skew))
+    assert not holds(created_at=at(skew + timedelta(seconds=1)))
+    assert not holds(created_at=at(timedelta(hours=1)))
+    assert not holds(created_at=at(timedelta(days=3650)))
+    for field in ("last_turn_at", "updated_at"):
+        assert not holds(created_at=at(-timedelta(days=3)), **{field: at(timedelta(hours=1))})
+    # A wrong clock on one stamp does not throw away a real recent one.
+    assert holds(created_at=at(-timedelta(minutes=5)), updated_at=at(timedelta(hours=1)))
+
+
+def test_manager_chat_seat_lease_ignores_a_logged_event_from_the_future(tmp_path):
+    now = datetime(2026, 9, 28, 12, 0, tzinfo=timezone.utc)
+    skew = callback_store.MANAGER_CHAT_SEAT_CLOCK_SKEW
+    state = tmp_path / "manager_loop"
+    log = state / "events" / f"{_SEAT_SESSION}.jsonl"
+    log.parent.mkdir(parents=True)
+    record = {
+        "session_id": _SEAT_SESSION,
+        "status": "active",
+        "backend_id": "opencode_cli",
+        "model": "xai/grok-4.7",
+        "created_at": (now - timedelta(days=3)).isoformat(),
+    }
+
+    def event(seq, when):
+        return json.dumps(
+            {"at": when.isoformat(), "seq": seq, "turn": seq, "type": "user_message", "payload": {}}
+        )
+
+    def holds_after_logging(*offsets):
+        lines = [event(seq, now + offset) for seq, offset in enumerate(offsets, 1)]
+        log.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return callback_store.manager_chat_record_holds_seat(record, state_dir=state, now=now)
+
+    assert not holds_after_logging(timedelta(hours=1))
+    assert not holds_after_logging(skew + timedelta(seconds=1))
+    assert holds_after_logging(timedelta(minutes=1))
+    assert holds_after_logging(skew)
+    # Behind a wrong-clock line the real last event is the one that counts.
+    assert holds_after_logging(-timedelta(hours=1), timedelta(hours=1))
+    assert not holds_after_logging(-timedelta(days=3), timedelta(hours=1))
+
+
+def test_manager_chat_event_tail_holds_the_longest_line_the_writer_can_log(tmp_path):
+    from aiworkhub import manager_loop
+
+    now = datetime(2026, 9, 28, 12, 0, tzinfo=timezone.utc)
+    store = manager_loop.SessionStore(tmp_path / "manager_loop", "repo_event_tail")
+    log = store.root / "events" / f"{_SEAT_SESSION}.jsonl"
+    cap = manager_loop.MAX_EVENT_PAYLOAD_BYTES
+    frame = len(json.dumps({"text": ""}, separators=(",", ":")))
+    # The longest payloads the writer accepts: text that fills the cap with the characters
+    # json.dumps escapes to the most bytes per byte of UTF-8 (a 2-byte one becomes 6, a
+    # 4-byte one 12), and text past the cap, which is logged as a preview with its quotes
+    # and backslashes doubled.
+    payloads = {
+        "two_byte": {"text": chr(0xE9) * ((cap - frame) // 2)},
+        "four_byte": {"text": "\U0001f600" * ((cap - frame) // 4)},
+        "preview": {"text": '"' * (4 * cap)},
+    }
+
+    for name, payload in payloads.items():
+        event = store.append_event(
+            _SEAT_SESSION,
+            {"at": now.isoformat(), "turn": 999, "type": "assistant_text", "payload": payload},
+        )
+        line = log.read_bytes().splitlines(keepends=True)[-1]
+
+        assert ("truncated" in event["payload"]) == (name == "preview"), name
+        assert len(line) <= callback_store._MANAGER_CHAT_EVENT_TAIL_BYTES, name
+        newest = callback_store._manager_chat_last_event_at(
+            store.root, _SEAT_SESSION, not_after=now
+        )
+        assert newest == now, name
+
+
+def test_manager_chat_seat_fails_closed_when_the_newest_event_line_outgrows_the_tail(tmp_path):
+    now = datetime(2026, 9, 28, 12, 0, tzinfo=timezone.utc)
+    state = tmp_path / "manager_loop"
+    log = state / "events" / f"{_SEAT_SESSION}.jsonl"
+    log.parent.mkdir(parents=True)
+    record = {
+        "session_id": _SEAT_SESSION,
+        "status": "active",
+        "backend_id": "opencode_cli",
+        "model": "xai/grok-4.7",
+        "created_at": (now - timedelta(days=3)).isoformat(),
+    }
+    tail = callback_store._MANAGER_CHAT_EVENT_TAIL_BYTES
+    stem = f'{{"at": "{(now - timedelta(minutes=1)).isoformat()}", "pad": "'
+
+    def holds_with_a_newest_line_of(size):
+        log.write_bytes((stem + "x" * (size - len(stem) - 3) + '"}\n').encode("ascii"))
+        assert log.stat().st_size == size
+        return callback_store.manager_chat_record_holds_seat(record, state_dir=state, now=now)
+
+    assert holds_with_a_newest_line_of(tail)
+    assert not holds_with_a_newest_line_of(tail + 1)
+
+
+def test_a_stale_manager_chat_session_gets_no_mirrored_callback_copy(tmp_path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    thread = "11111111-1111-4111-8111-111111111111"
+    conn = callback_store.open_db(root / ".aiworkhub" / "tasking" / "task_queue.sqlite")
+    try:
+        callback_store.init_db(conn)
+        now = callback_store.utc_now()
+        for task_id in ("TASK_IDLE_SEAT", "TASK_LIVE_SEAT"):
+            card = {"task_id": task_id, "origin_thread_id": thread, "coordinator_provider": "codex"}
+            conn.execute(
+                "INSERT INTO tasks(task_id, runner, topic, status, worker_status, card_json, created_at, updated_at, origin_thread_id) "
+                "VALUES (?, 'codex', 'task_mcp', 'review', 'review', ?, ?, ?, ?)",
+                (task_id, json.dumps(card), now, now, thread),
+            )
+        conn.commit()
+
+        _select_manager_chat_session(root, created_at=_hours_ago(13))
+        assert callback_store.enqueue_callback(
+            conn, "TASK_IDLE_SEAT", thread, "review_ready", provider="codex", episode_id="1"
+        ) is True
+        _select_manager_chat_session(root)
+        assert callback_store.enqueue_callback(
+            conn, "TASK_LIVE_SEAT", thread, "review_ready", provider="codex", episode_id="1"
+        ) is True
+
+        rows = conn.execute(
+            "SELECT task_id, provider, origin_thread_id FROM callback_outbox ORDER BY task_id, provider"
+        ).fetchall()
+        assert [tuple(row) for row in rows] == [
+            ("TASK_IDLE_SEAT", "codex", thread),
+            ("TASK_LIVE_SEAT", "codex", thread),
+            ("TASK_LIVE_SEAT", "manager_chat", _SEAT_SESSION),
+        ]
+    finally:
+        conn.close()
 
 
 def test_task_create_polling_only_succeeds_while_route_is_pending(tmp_path, monkeypatch):

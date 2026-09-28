@@ -28,7 +28,7 @@ from typing import Any, Callable, Mapping
 
 from .manager_loop import ManagerLoopError, ManagerOrchestrator, ManagerSession
 from .manager_loop_backends import MANAGER_BACKEND_IDS, cli_discovers_model, manager_backend_factory
-from . import manager_loop_wake, model_settings, workforce_catalog
+from . import callback_store, manager_loop_wake, model_settings, workforce_catalog
 
 _REGISTRY_LOCK = threading.Lock()
 _ENTRIES: dict[str, "_Entry"] = {}
@@ -287,8 +287,15 @@ def _dispatch_turn(
                 entry.last_turn = {"turn": turn, "ok": False, "errors": [detail], "reply": ""}
         finally:
             entry.turn_lock.release()
-            if entry.orchestrator.session is None:
-                _stop_wake(entry)
+            # Re-read the seat now the turn is over. A session that idled past the
+            # seat lease got no wake consumer when it was loaded, and whichever send
+            # revived it just logged its activity: that arms the consumer, leaves a
+            # running one alone while the session still holds the seat, and stops it
+            # when the turn ended the session (rotate). A close() that lands between
+            # the release above and this call has already dropped the orchestrator's
+            # session, so the re-arm reads none and starts nothing: a closed entry
+            # does not get a consumer back from the turn that ended just before it.
+            _ensure_wake_started(entry, repo)
 
     thread = threading.Thread(target=run, daemon=True)
     entry.thread = thread
@@ -395,6 +402,9 @@ def discard_session(repo: str | Path, session_id: str) -> dict[str, Any]:
         return {"ok": False, "error": f"manager_loop_unavailable:{type(exc).__name__}"}
     finally:
         entry.turn_lock.release()
+    # Discarding the loaded conversation leaves none attached, and a consumer with
+    # no seat to serve has nothing to wake.
+    _ensure_wake_started(entry, repo)
     session = entry.orchestrator.session
     return {"ok": True, "session": session.to_json() if session is not None else None}
 
@@ -505,6 +515,10 @@ def continue_session(repo: str | Path, session_id: str) -> dict[str, Any]:
         return {"ok": False, "error": f"manager_loop_unavailable:{type(exc).__name__}"}
     finally:
         entry.turn_lock.release()
+    # The consumer follows the attached conversation: one that holds the seat starts
+    # it (a conversation restored after idling past the lease had none), and one that
+    # fails the rule, passive or idle past the lease, stops a consumer that was running.
+    _ensure_wake_started(entry, repo)
     return {"ok": True, "session": session.to_json()}
 
 
@@ -524,6 +538,10 @@ def begin_new(repo: str | Path) -> dict[str, Any]:
         return {"ok": False, "error": f"manager_loop_unavailable:{type(exc).__name__}"}
     finally:
         entry.turn_lock.release()
+    # The fresh conversation is passive, so it does not hold the seat: the consumer
+    # that woke the one just closed stops here instead of claiming for a session
+    # with no route.
+    _ensure_wake_started(entry, repo)
     return {"ok": True, "session": session.to_json()}
 
 
@@ -549,7 +567,13 @@ def events(
 
 
 def close(repo: str | Path) -> dict[str, Any]:
-    """Release the backend and the lock at shutdown; synchronous, not backgrounded."""
+    """Release the backend and the lock at shutdown; synchronous, not backgrounded.
+
+    The orchestrator drops its session first and the wake consumer is retired after,
+    under ``wake_lock``, the lock ``_ensure_wake_started`` judges the session under. A
+    re-arm in flight, the one at the end of a turn, either finishes first and is retired
+    here or runs after and reads no session: nothing outlives a successful close.
+    """
 
     entry, err = _entry_or_error(repo)
     if err is not None:
@@ -591,37 +615,83 @@ def _wake_dispatch(repo: str | Path, member: Mapping[str, Any]) -> bool:
     return bool(result.get("ok"))
 
 
+def _session_holds_seat(entry: _Entry, session: ManagerSession | None) -> bool:
+    """Whether ``session`` holds the manager seat right now; no session holds none.
+
+    The rule is ``callback_store.manager_chat_record_holds_seat``, the one the
+    callback origin and the bootstrap seat share, judged on the session's own
+    record and on its event log under the store.
+    """
+
+    return session is not None and callback_store.manager_chat_record_holds_seat(
+        session.to_json(), state_dir=entry.orchestrator.store.root
+    )
+
+
 def _ensure_wake_started(entry: _Entry, repo: str | Path) -> None:
-    """Start this repository's one wake consumer; a second call is a no-op.
+    """Run this repository's one wake consumer exactly while its session holds the seat.
+
+    A second call is a no-op. Only a session that holds the manager seat gets a
+    consumer: a passive conversation has no route to wake, and one nobody has
+    used within the seat lease is a leftover, not the manager
+    (``callback_store.manager_chat_record_holds_seat``, the rule the callback
+    origin and the bootstrap seat share). The same rule stops a consumer that is
+    already running once the attached session is gone, passive or idle past the
+    lease: left alone, its claim would keep copying pending callbacks onto a
+    conversation that is not the manager.
+
+    The session is read and judged inside ``wake_lock``, the lock that installs
+    and retires the consumer. A swap that lands before the read is seen by it;
+    one that lands after is followed by its own call, which waits for the lock
+    and reads the new session. Either way the last call decides, so a consumer
+    never outlives the session that failed the rule. A closed entry has no session
+    (``ManagerOrchestrator.close`` drops it) and so fails the rule like any other: a
+    re-arm that lands after ``close`` starts nothing.
 
     The claim origin is read at claim time, so a session switch rebinds
-    pending callbacks onto whichever conversation is active.
+    pending callbacks onto whichever conversation is active, and it is empty
+    (nothing is claimed) once the attached session no longer holds the seat.
     """
 
     with entry.wake_lock:
-        if entry.wake is None:
-            def active_session_id() -> str:
-                session = entry.orchestrator.session
-                return session.session_id if session is not None else ""
+        if not _session_holds_seat(entry, entry.orchestrator.session):
+            retired = _detach_wake(entry)
+        else:
+            retired = None
+            if entry.wake is None:
+                def active_session_id() -> str:
+                    session = entry.orchestrator.session
+                    return session.session_id if _session_holds_seat(entry, session) else ""
 
-            claim, ack = default_callback_source(session_id=active_session_id)
-            entry.wake = manager_loop_wake.WakeConsumer(
-                claim=claim,
-                ack=ack,
-                dispatch=lambda member: _wake_dispatch(repo, member),
-                cap_per_hour=entry.wake_cap_per_hour,
-                idle_poll_seconds=WAKE_IDLE_POLL_SECONDS,
-                retry_poll_seconds=WAKE_RETRY_POLL_SECONDS,
-            )
-        wake = entry.wake
-    wake.start()
+                claim, ack = default_callback_source(session_id=active_session_id)
+                entry.wake = manager_loop_wake.WakeConsumer(
+                    claim=claim,
+                    ack=ack,
+                    dispatch=lambda member: _wake_dispatch(repo, member),
+                    cap_per_hour=entry.wake_cap_per_hour,
+                    idle_poll_seconds=WAKE_IDLE_POLL_SECONDS,
+                    retry_poll_seconds=WAKE_RETRY_POLL_SECONDS,
+                )
+            entry.wake.start()
+    if retired is not None:
+        retired.stop()
+
+
+def _detach_wake(entry: _Entry) -> manager_loop_wake.WakeConsumer | None:
+    """Forget this repository's wake consumer and return it; the caller holds ``wake_lock``.
+
+    Stopping joins the consumer's thread, so the caller does that after releasing the lock.
+    """
+
+    wake, entry.wake = entry.wake, None
+    return wake
 
 
 def _stop_wake(entry: _Entry) -> None:
     """Stop and forget this repository's wake consumer, if any."""
 
     with entry.wake_lock:
-        wake, entry.wake = entry.wake, None
+        wake = _detach_wake(entry)
     if wake is not None:
         wake.stop()
 

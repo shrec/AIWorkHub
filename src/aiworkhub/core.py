@@ -827,10 +827,13 @@ _MANAGER_CHAT_SESSION_RE = re.compile(r"^mls-[0-9a-f]{32}$", re.I)
 
 
 def _active_manager_chat_record() -> dict[str, str] | None:
-    """The selected Manager Chat session, when it is still active.
+    """The selected Manager Chat session, when it holds the manager seat.
 
-    Window ids and episode ids are not sessions. A closed session is not
-    the seat, even if its file is still on disk.
+    Window ids and episode ids are not sessions. A closed session is not the
+    seat, even if its file is still on disk, and neither is a passive one (no
+    backend or model) or one nobody has used within the seat lease. That rule
+    is :func:`callback_store.manager_chat_record_holds_seat`, shared with the
+    callback origin and the wake consumer.
     """
 
     try:
@@ -847,7 +850,7 @@ def _active_manager_chat_record() -> dict[str, str] | None:
         return None
     if str(record.get("session_id") or "") != session_id:
         return None
-    if str(record.get("status") or "") != "active":
+    if not callback_store.manager_chat_record_holds_seat(record, state_dir=selected_path.parent):
         return None
     return {
         "session_id": session_id,
@@ -862,8 +865,8 @@ def _manager_chat_session_origin() -> str:
 
     A Codex or Claude UUID is still the origin when one has been observed.
     This is only the fallback for the owner seat: an ``mls-`` conversation
-    that is selected and still active. Window ids and episode ids stay
-    refused.
+    that is selected, still active, bound to a route and used within the
+    seat lease. Window ids and episode ids stay refused.
     """
 
     record = _active_manager_chat_record()
