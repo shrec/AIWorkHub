@@ -1,5 +1,16 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.12.2 — 2026-09-28
+
+### Fixed
+
+- Manager AI Memory search and writes repair a missing `memories_fts` index in place without losing rows, so a legacy or half-migrated store no longer fails the worker's mandatory AI Memory call with `fts_unavailable` (NF-2026-01083).
+- A stale Manager Console session no longer holds the manager seat: bootstrap reports the calling chat's own route, task creation stops stamping the expired session as callback origin, and wake never starts on it (NF-2026-01078).
+- Semantic edit numbers lines on `\n` only, so a range from Source Graph, git or an editor selects the same text in files holding bare CR, U+0085 or U+2028; a junction path component is refused like a symlink (NF-2026-01077).
+- A reviewer spends a submit attempt only on its own rejected submission, never on a supervisor persistence fault (NF-2026-01074).
+- Source Graph directory diff reports edits that differ only in invalid UTF-8 bytes as binary and names the correct side of a skipped file (NF-2026-01079, NF-2026-01085).
+- The runtime symlink escape test skips only when the symlink privilege is missing, so the AppContainer validation lane no longer fails it (NF-2026-01071).
+
 ## 0.12.1 — 2026-09-28
 
 ### Added

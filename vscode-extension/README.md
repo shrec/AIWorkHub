@@ -14,6 +14,13 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.12.2
+
+- AI Memory rebuilds a lost search index by itself, so worker cards stop failing on `fts_unavailable`.
+- A forgotten Manager Console test session no longer claims to be the manager of every chat.
+- Semantic edits land on the right lines in files with unusual line separators.
+- Reviewers are no longer charged for supervisor faults, and directory diffs catch byte-only edits.
+
 ## What's new in 0.12.1
 
 - Cards can be created and validated for every language Source Graph indexes, not only Python.

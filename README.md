@@ -62,6 +62,13 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
+## What's new in 0.12.2
+
+- AI Memory rebuilds a lost search index by itself, so worker cards stop failing on `fts_unavailable`.
+- A forgotten Manager Console test session no longer claims to be the manager of every chat.
+- Semantic edits land on the right lines in files with unusual line separators.
+- Reviewers are no longer charged for supervisor faults, and directory diffs catch byte-only edits.
+
 ## What's new in 0.12.1
 
 - Cards can be created and validated for every language Source Graph indexes, not only Python.
