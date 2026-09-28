@@ -206,6 +206,7 @@ REASON_CORRECTNESS_REVIEW_WORK = "correctness_review_work"
 REASON_COMPLEX_DIFFICULTY = "complex_difficulty"
 REASON_CLAUDE_REPOSITORY_DEFAULT = "claude_repository_coding_default_maximum"
 REASON_CLAUDE_MECHANICAL_FLOOR = "claude_explicit_mechanical_floor_high"
+REASON_CLAUDE_BOUNDED_IMPLEMENTER = "claude_bounded_implementer_high"
 REASON_EXPLICIT_MECHANICAL = "explicit_mechanical_bounded_low_risk"
 REASON_REPOSITORY_QUALITY_FLOOR = "repository_coding_quality_floor_high"
 REASON_GENERAL_QUALITY_FLOOR = "general_quality_floor_high"
@@ -298,6 +299,17 @@ def _baseline(request: EffortRequest) -> tuple[ReasoningProfile, str]:
         if is_claude:
             return ReasoningProfile.HIGH, REASON_CLAUDE_MECHANICAL_FLOOR
         return ReasoningProfile.MEDIUM_HIGH, REASON_EXPLICIT_MECHANICAL
+    # A declared-bounded task already has its problem pinned down, so a Claude
+    # implementer starts at HIGH rather than the repository default. Only the
+    # baseline moves: ``_escalations`` still lifts critical risk, security,
+    # architecture, review and complex work to MAXIMUM.
+    if (
+        is_claude
+        and request.role is TaskRole.IMPLEMENTER
+        and request.difficulty is Difficulty.BOUNDED
+        and request.work_kind in _REPOSITORY_CODING_KINDS
+    ):
+        return ReasoningProfile.HIGH, REASON_CLAUDE_BOUNDED_IMPLEMENTER
     if request.work_kind in _REPOSITORY_CODING_KINDS:
         if is_claude:
             return ReasoningProfile.MAXIMUM, REASON_CLAUDE_REPOSITORY_DEFAULT

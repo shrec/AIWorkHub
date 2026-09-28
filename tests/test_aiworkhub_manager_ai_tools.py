@@ -935,6 +935,231 @@ def test_task_create_rejects_invalid_explicit_risk_tier(tmp_path, monkeypatch):
     assert result["received_risk_tier"] == "probably-safe"
 
 
+def _difficulty_repo(tmp_path, monkeypatch):
+    root = tmp_path / "repo"
+    root.mkdir()
+    assert task_store.initialize_repository(root)["ok"]
+    monkeypatch.setenv("AIWORKHUB_REPO", str(root))
+    monkeypatch.setenv("AIWORKHUB_ALLOW_WRITES", "1")
+    monkeypatch.setattr(core, "_claude_manager_identity", lambda: None)
+    monkeypatch.setattr(core, "_codex_manager_identity", lambda: {
+        "provider": "codex",
+        "session_id": "019f5097-6dbe-7172-870a-945afc5f3bfa",
+        "thread_id": "019f5097-6dbe-7172-870a-945afc5f3bfa",
+    })
+    monkeypatch.setattr(
+        core, "_verify_coordinator_capability", lambda runner: (True, "ok")
+    )
+    return root
+
+
+def _create_difficulty_task(task_id, **overrides):
+    kwargs = dict(
+        task_id=task_id,
+        title="Difficulty card",
+        runner="claude_difficulty",
+        topic="task_mcp",
+        objective="Prove the card records a declared difficulty.",
+        acceptance=["Difficulty is persisted."],
+        allowed_writes=["research/difficulty.json"],
+        required_outputs=["research/difficulty.json"],
+        validation=["python3 -m json.tool research/difficulty.json"],
+        custom_template_escape="audited_custom_unclassified",
+    )
+    kwargs.update(overrides)
+    return core.create_task(**kwargs)
+
+
+def test_task_create_persists_declared_difficulty_and_reads_it_back(
+    tmp_path, monkeypatch
+):
+    root = _difficulty_repo(tmp_path, monkeypatch)
+
+    result = _create_difficulty_task("TASK_DIFFICULTY_BOUNDED", difficulty="bounded")
+
+    assert result["ok"] is True, result
+    card = json.loads(result["stdout"])
+    assert card["difficulty"] == "bounded"
+    assert card["difficulty_origin"] == "declared"
+    stored = task_store.get_task(root, "TASK_DIFFICULTY_BOUNDED")
+    assert stored is not None
+    assert stored["difficulty"] == "bounded"
+    assert stored["difficulty_origin"] == "declared"
+
+    retry = _create_difficulty_task("TASK_DIFFICULTY_BOUNDED", difficulty="bounded")
+    assert retry["ok"] is True, retry
+    assert retry["reconciled"] is True
+    assert retry["receipt_state"] == "existing_identical"
+
+    for other in ("complex", None):
+        conflict = _create_difficulty_task("TASK_DIFFICULTY_BOUNDED", difficulty=other)
+        assert conflict["ok"] is False
+        assert conflict["stderr"] == "task_already_exists:TASK_DIFFICULTY_BOUNDED"
+        assert conflict["conflict_fields"] == ["difficulty"]
+
+
+def test_task_create_without_difficulty_stores_none_and_undeclared(
+    tmp_path, monkeypatch
+):
+    root = _difficulty_repo(tmp_path, monkeypatch)
+
+    result = _create_difficulty_task("TASK_DIFFICULTY_UNDECLARED")
+
+    assert result["ok"] is True, result
+    card = json.loads(result["stdout"])
+    assert "difficulty" in card
+    assert card["difficulty"] is None
+    assert card["difficulty_origin"] == "undeclared"
+    stored = task_store.get_task(root, "TASK_DIFFICULTY_UNDECLARED")
+    assert stored is not None
+    assert stored.get("difficulty") is None
+    assert stored["difficulty_origin"] == "undeclared"
+
+    retry = _create_difficulty_task("TASK_DIFFICULTY_UNDECLARED")
+    assert retry["ok"] is True, retry
+    assert retry["reconciled"] is True
+    assert retry["receipt_state"] == "existing_identical"
+
+
+def test_task_create_normalizes_declared_difficulty_case_and_space(
+    tmp_path, monkeypatch
+):
+    _difficulty_repo(tmp_path, monkeypatch)
+
+    result = _create_difficulty_task(
+        "TASK_DIFFICULTY_NORMALIZED", difficulty=" Standard "
+    )
+
+    assert result["ok"] is True, result
+    card = json.loads(result["stdout"])
+    assert card["difficulty"] == "standard"
+    assert card["difficulty_origin"] == "declared"
+
+
+def test_task_create_rejects_invalid_difficulty(tmp_path, monkeypatch):
+    root = _difficulty_repo(tmp_path, monkeypatch)
+
+    result = _create_difficulty_task(
+        "TASK_DIFFICULTY_INVALID",
+        difficulty="easy",
+        allowed_writes=[],
+        required_outputs=[],
+        validation=[],
+        read_only=True,
+    )
+
+    assert result["ok"] is False
+    assert result["stderr"] == "invalid_difficulty"
+    assert result["allowed_difficulties"] == ["bounded", "standard", "complex"]
+    assert result["received_difficulty"] == "easy"
+    assert task_store.get_task(root, "TASK_DIFFICULTY_INVALID") is None
+
+
+def test_task_create_from_template_forwards_declared_difficulty(monkeypatch):
+    captured = {}
+
+    def fake_create_task(**kwargs):
+        captured.update(kwargs)
+        return {"ok": True}
+
+    monkeypatch.setattr(server.core, "create_task", fake_create_task)
+    common = dict(
+        title="Fix the leak",
+        runner="codex_worker",
+        topic="coding",
+        objective="Close the leak and add a regression.",
+        acceptance=["Leak is gone."],
+        template_id="bugfix_with_regression",
+        production_paths=["src/aiworkhub/a.py"],
+        test_paths=["tests/test_a.py"],
+    )
+
+    declared = server.aiworkhub_task_create_from_template(
+        task_id="TASK_TEMPLATE_DIFFICULTY", difficulty="bounded", **common
+    )
+    assert declared["ok"] is True
+    assert captured["difficulty"] == "bounded"
+
+    server.aiworkhub_task_create_from_template(
+        task_id="TASK_TEMPLATE_NO_DIFFICULTY", **common
+    )
+    assert captured["difficulty"] is None
+
+
+def test_task_create_forwards_declared_difficulty(monkeypatch):
+    captured = {}
+
+    def fake_create_task(**kwargs):
+        captured.update(kwargs)
+        return {"ok": True}
+
+    monkeypatch.setattr(server.core, "create_task", fake_create_task)
+    common = dict(
+        title="Fix the leak",
+        runner="codex_worker",
+        topic="coding",
+        objective="Close the leak and add a regression.",
+        acceptance=["Leak is gone."],
+        allowed_writes=["src/aiworkhub/a.py", "tests/test_a.py"],
+        validation=[".venv/Scripts/python.exe -m pytest -q tests/test_a.py"],
+    )
+
+    declared = server.aiworkhub_task_create(
+        task_id="TASK_CREATE_DIFFICULTY", difficulty="bounded", **common
+    )
+    assert declared["ok"] is True
+    assert captured["difficulty"] == "bounded"
+
+    server.aiworkhub_task_create(task_id="TASK_CREATE_NO_DIFFICULTY", **common)
+    assert captured["difficulty"] is None
+
+
+def test_task_create_receipt_reads_back_declared_difficulty(tmp_path, monkeypatch):
+    root = tmp_path / "repo"
+    root.mkdir()
+    assert task_store.initialize_repository(root)["ok"]
+    monkeypatch.setenv("AIWORKHUB_REPO_ROOT", str(root.resolve()))
+    monkeypatch.setenv("AIWORKHUB_REPO", str(root.resolve()))
+    monkeypatch.setattr(core, "_canonical_write_gate", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        core, "_verify_coordinator_capability", lambda *args, **kwargs: (True, "")
+    )
+    monkeypatch.setattr(
+        core,
+        "_claude_manager_identity",
+        lambda: {
+            "provider": "claude",
+            "session_id": "01234567-89ab-4def-8123-456789abcdef",
+            "route_state": "verified",
+        },
+    )
+    monkeypatch.setattr(core, "_PROCESS_REPO_ROOT_OVERRIDE", root.resolve())
+    common = dict(
+        title="Difficulty receipt",
+        runner="codex_worker_nf390",
+        topic="task_mcp",
+        objective="Read the declared difficulty back through the receipt.",
+        acceptance=["Receipt names difficulty."],
+        template_id="bugfix_with_regression",
+        production_paths=["src/a.py"],
+        test_paths=["tests/test_a.py"],
+    )
+
+    declared = server.aiworkhub_task_create_from_template(
+        task_id="TASK_RECEIPT_DECLARED", difficulty="bounded", **common
+    )
+    assert declared["ok"] is True, declared
+    assert declared["difficulty"] == "bounded"
+    assert declared["difficulty_origin"] == "declared"
+
+    undeclared = server.aiworkhub_task_create_from_template(
+        task_id="TASK_RECEIPT_UNDECLARED", **common
+    )
+    assert undeclared["ok"] is True, undeclared
+    assert undeclared["difficulty"] is None
+    assert undeclared["difficulty_origin"] == "undeclared"
+
+
 def test_task_create_rejects_invalid_priority_with_supported_values(
     tmp_path, monkeypatch
 ):

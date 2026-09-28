@@ -238,6 +238,54 @@ def test_build_runtime_command_places_claude_max_effort_and_capacity(
     assert receipt["context_capacity"] == 1_000_000
 
 
+@pytest.mark.parametrize(
+    ("card", "expected_difficulty", "expected_effort"),
+    [
+        ({"risk_tier": "low", "difficulty": "bounded"}, "bounded", "high"),
+        ({"risk_tier": "low"}, "standard", "max"),
+        (
+            {"risk_tier": "low", "rework_predecessor": {"request_id": "R-prev"}},
+            "complex",
+            "max",
+        ),
+        (
+            {
+                "risk_tier": "low",
+                "difficulty": "bounded",
+                "rework_predecessor": {"request_id": "R-prev"},
+            },
+            "bounded",
+            "high",
+        ),
+    ],
+)
+def test_reasoning_receipt_carries_the_card_difficulty(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    card: dict[str, object],
+    expected_difficulty: str,
+    expected_effort: str,
+) -> None:
+    decision = runtime_adapters.resolve_adapter_reasoning(
+        "claude_cli", card, model="claude-opus-5"
+    )
+    monkeypatch.setattr(runtime_adapters, "_is_windows_host", lambda: False)
+    monkeypatch.setattr(runtime_adapters.shutil, "which", lambda _name: sys.executable)
+    plan = runtime_adapters.build_runtime_command(
+        "claude_cli",
+        "write tests",
+        tmp_path,
+        model="claude-opus-5",
+        reasoning_decision=decision,
+        context_capacity=1_000_000,
+    )
+    assert plan.launchable is True
+    assert plan.argv[-2:] == ["--effort", expected_effort]
+    receipt = plan.reasoning_receipt
+    assert receipt is not None
+    assert receipt["difficulty"] == expected_difficulty
+
+
 def test_build_runtime_command_places_codex_xhigh_effort(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
@@ -272,6 +320,118 @@ def test_opencode_build_never_emits_variant(
     )
     assert plan.launchable is True
     assert "--variant" not in plan.argv
+
+
+# --- card difficulty drives the derived effort request ----------------------
+
+
+def _claude_decision(
+    card: dict[str, object], *, is_reviewer: bool = False
+) -> reasoning_policy.ReasoningDecision:
+    decision = runtime_adapters.resolve_adapter_reasoning(
+        "claude_cli", card, is_reviewer=is_reviewer, model="claude-opus-5"
+    )
+    assert decision is not None
+    return decision
+
+
+@pytest.mark.parametrize("risk", ["low", "medium", "high"])
+def test_declared_bounded_claude_card_resolves_to_high(risk: str) -> None:
+    decision = _claude_decision(
+        {"work_kind": "generic", "risk_tier": risk, "difficulty": "bounded"}
+    )
+    assert decision.request.difficulty is reasoning_policy.Difficulty.BOUNDED
+    assert decision.profile is reasoning_policy.ReasoningProfile.HIGH
+    assert decision.rationale.baseline_reason == "claude_bounded_implementer_high"
+    assert decision.route_effort is not None
+    assert decision.route_effort.applied_key == "high"
+
+
+@pytest.mark.parametrize(
+    ("card", "is_reviewer"),
+    [
+        ({"risk_tier": "critical", "difficulty": "bounded"}, False),
+        ({"work_kind": "security", "risk_tier": "low", "difficulty": "bounded"}, False),
+        ({"risk_tier": "low", "difficulty": "bounded"}, True),
+    ],
+)
+def test_declared_bounded_critical_security_and_reviewer_cards_stay_maximum(
+    card: dict[str, object], is_reviewer: bool
+) -> None:
+    decision = _claude_decision(card, is_reviewer=is_reviewer)
+    assert decision.request.difficulty is reasoning_policy.Difficulty.BOUNDED
+    assert decision.profile is reasoning_policy.ReasoningProfile.MAXIMUM
+    assert decision.route_effort is not None
+    assert decision.route_effort.applied_key == "max"
+
+
+def test_undeclared_claude_card_keeps_the_standard_maximum_rule() -> None:
+    decision = _claude_decision({"work_kind": "generic", "risk_tier": "low"})
+    assert decision.request.difficulty is reasoning_policy.Difficulty.STANDARD
+    assert decision.profile is reasoning_policy.ReasoningProfile.MAXIMUM
+    assert (
+        decision.rationale.baseline_reason
+        == "claude_repository_coding_default_maximum"
+    )
+
+
+def test_undeclared_rework_card_is_complex_and_maximum() -> None:
+    decision = _claude_decision(
+        {"risk_tier": "low", "rework_predecessor": {"request_id": "R-prev"}}
+    )
+    assert decision.request.difficulty is reasoning_policy.Difficulty.COMPLEX
+    assert decision.profile is reasoning_policy.ReasoningProfile.MAXIMUM
+    assert "complex_difficulty" in decision.rationale.reason_codes
+
+
+def test_declared_difficulty_wins_on_a_rework_card() -> None:
+    rework = {"request_id": "R-prev"}
+    bounded = _claude_decision(
+        {"risk_tier": "low", "difficulty": "bounded", "rework_predecessor": rework}
+    )
+    assert bounded.request.difficulty is reasoning_policy.Difficulty.BOUNDED
+    assert bounded.profile is reasoning_policy.ReasoningProfile.HIGH
+    standard = _claude_decision(
+        {"risk_tier": "low", "difficulty": "standard", "rework_predecessor": rework}
+    )
+    assert standard.request.difficulty is reasoning_policy.Difficulty.STANDARD
+    assert "complex_difficulty" not in standard.rationale.reason_codes
+
+
+@pytest.mark.parametrize("value", [None, "", "easy", "unknown", 3, ["bounded"]])
+def test_an_unrecognized_card_difficulty_is_treated_as_undeclared(
+    value: object,
+) -> None:
+    plain = _claude_decision({"risk_tier": "low", "difficulty": value})
+    assert plain.request.difficulty is reasoning_policy.Difficulty.STANDARD
+    assert plain.profile is reasoning_policy.ReasoningProfile.MAXIMUM
+    rework = _claude_decision(
+        {
+            "risk_tier": "low",
+            "difficulty": value,
+            "rework_predecessor": {"request_id": "R-prev"},
+        }
+    )
+    assert rework.request.difficulty is reasoning_policy.Difficulty.COMPLEX
+
+
+def test_declared_card_difficulty_ignores_case_and_surrounding_space() -> None:
+    decision = _claude_decision({"risk_tier": "low", "difficulty": " Bounded "})
+    assert decision.request.difficulty is reasoning_policy.Difficulty.BOUNDED
+    assert decision.profile is reasoning_policy.ReasoningProfile.HIGH
+
+
+def test_declared_bounded_difficulty_does_not_change_the_codex_decision() -> None:
+    bounded = runtime_adapters.resolve_adapter_reasoning(
+        "codex_cli", {"risk_tier": "low", "difficulty": "bounded"}, model="gpt-5.5"
+    )
+    undeclared = runtime_adapters.resolve_adapter_reasoning(
+        "codex_cli", {"risk_tier": "low"}, model="gpt-5.5"
+    )
+    assert bounded is not None and undeclared is not None
+    assert bounded.request.difficulty is reasoning_policy.Difficulty.BOUNDED
+    assert bounded.profile is undeclared.profile
+    assert bounded.rationale.baseline_reason == "repository_coding_quality_floor_high"
 
 
 # --- bounded cross-platform release probe -----------------------------------
@@ -361,6 +521,7 @@ def _run_claude_launch(
     probe_result: dict[str, object] | None = _PROBE_OK,
     runner: str = "claude_cli",
     use_real_workforce_identity: bool = False,
+    preflight_card: dict[str, object] | None = None,
 ) -> tuple[dict[str, object], dict[str, object], list[str]]:
     from aiworkhub.repository_state import bootstrap_repository
     from aiworkhub.worker_workspace import WorkerWorkspace
@@ -400,7 +561,11 @@ def _run_claude_launch(
         def _preflight_card(
             self, *_args: object, **_kwargs: object,
         ) -> dict[str, object]:
-            return {"request_id": "R-cli", "allowed_writes": ["src/changed.py"]}
+            return {
+                "request_id": "R-cli",
+                "allowed_writes": ["src/changed.py"],
+                **(preflight_card or {}),
+            }
 
         def _with_dependency_inputs(
             self, card: dict[str, object],
@@ -625,6 +790,55 @@ def test_launch_isolated_claude5_security_card_emits_max_effort(
 
     assert metadata["claude_cli_release"] == "1.2.3"
     assert probe_calls == [str(Path(sys.executable).resolve())]
+
+
+@pytest.mark.parametrize(
+    (
+        "difficulty",
+        "risk_tier",
+        "expected_effort",
+        "expected_profile",
+        "expected_difficulty",
+    ),
+    [
+        ("bounded", "low", "high", "canonical_high", "bounded"),
+        ("bounded", "high", "high", "canonical_high", "bounded"),
+        ("bounded", "critical", "max", "canonical_maximum", "bounded"),
+        (None, "medium", "max", "canonical_maximum", "standard"),
+        ("standard", "medium", "max", "canonical_maximum", "standard"),
+    ],
+)
+def test_launch_isolated_card_difficulty_selects_the_claude_effort(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    difficulty: str | None,
+    risk_tier: str,
+    expected_effort: str,
+    expected_profile: str,
+    expected_difficulty: str,
+) -> None:
+    # The effort decision is derived from the card the launcher reads before
+    # the claim, so a declared difficulty has to arrive on that preflight card.
+    card: dict[str, object] = {"work_kind": "generic", "risk_tier": risk_tier}
+    if difficulty is not None:
+        card["difficulty"] = difficulty
+    result, metadata, _probe_calls = _run_claude_launch(
+        monkeypatch,
+        tmp_path,
+        model="claude-opus-5",
+        preflight_card=card,
+        committed_card={**card, "token_budget": {"cap_tokens": 200_000}},
+    )
+    assert result["ok"] is True
+
+    argv = list(metadata["worker_argv"])
+    assert argv[argv.index("--effort") + 1] == expected_effort
+    receipt = dict(metadata["reasoning_effort"])
+    assert receipt["applied"] is True
+    assert receipt["flag_emitted"] is True
+    assert receipt["applied_key"] == expected_effort
+    assert receipt["profile"] == expected_profile
+    assert receipt["difficulty"] == expected_difficulty
 
 
 @pytest.mark.parametrize(

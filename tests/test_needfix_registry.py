@@ -795,6 +795,51 @@ class TestNeedFixConversionPublicPlanContract:
             task_templates.AUDITED_CUSTOM_ESCAPE
         )
 
+    @pytest.mark.parametrize("difficulty", ["bounded", None])
+    def test_conversion_plan_difficulty_reaches_the_created_task(
+        self, init_store, monkeypatch, difficulty
+    ):
+        from aiworkhub import core
+
+        r = self._accepted_with_scope(init_store, ["src/aiworkhub/foo.py"])
+        plan = {
+            "runner": "codex_gpt-5.6-sol",
+            "topic": "needfix_fix",
+            "required_outputs": ["src/aiworkhub/foo.py"],
+        }
+        if difficulty is not None:
+            plan["difficulty"] = difficulty
+        preview = needfix_store.preview_convert(init_store, r["id"], plan)
+        assert preview["task_plan"].get("difficulty") == difficulty
+        captured = {}
+
+        def fake_create_task(**kwargs):
+            captured.update(kwargs)
+            return {"ok": True, "task_id": f"needfix-{r['id']}"}
+
+        monkeypatch.setattr(core, "repo_root", lambda: init_store)
+        monkeypatch.setattr(core, "create_task", fake_create_task)
+        result = core.needfix_convert(
+            r["id"],
+            task_plan=plan,
+            plan_digest=preview["plan_digest"],
+        )
+
+        assert result["converted_task_id"] == f"needfix-{r['id']}"
+        assert captured["difficulty"] == difficulty
+
+    @pytest.mark.parametrize("value", ["", "   ", 3, ["bounded"]])
+    def test_conversion_plan_difficulty_must_be_a_non_empty_string(
+        self, init_store: Path, value
+    ):
+        r = self._accepted_with_scope(init_store)
+        with pytest.raises(needfix_store.NeedFixValidationError):
+            needfix_store.preview_convert(
+                init_store,
+                r["id"],
+                {"runner": "codex", "topic": "needfix_readonly", "difficulty": value},
+            )
+
     def test_malformed_plan_unknown_field_fails_closed_without_mutation(self, init_store: Path):
         r = self._accepted_with_scope(init_store)
         with pytest.raises(needfix_store.NeedFixValidationError, match="unsupported"):

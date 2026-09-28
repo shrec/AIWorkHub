@@ -720,6 +720,7 @@ class RuntimeAdapterPlan:
             "profile": decision.profile.value,
             "applied_key": applied_key,
             "provider_family": decision.request.provider_family.value,
+            "difficulty": decision.request.difficulty.value,
             "context_capacity": self.context_capacity,
         }
 
@@ -2916,6 +2917,27 @@ def _coerce_risk_tier(value: Any) -> reasoning_policy.RiskTier:
     )
 
 
+_DIFFICULTY_BY_CARD: Mapping[str, reasoning_policy.Difficulty] = MappingProxyType(
+    {
+        "bounded": reasoning_policy.Difficulty.BOUNDED,
+        "standard": reasoning_policy.Difficulty.STANDARD,
+        "complex": reasoning_policy.Difficulty.COMPLEX,
+    }
+)
+
+
+def _coerce_difficulty(value: Any) -> reasoning_policy.Difficulty | None:
+    """The difficulty a card declared, or ``None`` when it declared none.
+
+    Unlike risk there is no default to fall back to here: an absent or unknown
+    value must stay distinguishable from a declared ``standard`` so the caller
+    can apply the undeclared-card rule instead.
+    """
+    if not isinstance(value, str):
+        return None
+    return _DIFFICULTY_BY_CARD.get(value.strip().lower())
+
+
 def _coerce_work_kind(value: Any, *, is_reviewer: bool) -> reasoning_policy.WorkKind:
     if isinstance(value, str) and value.strip().lower() == "security":
         return reasoning_policy.WorkKind.SECURITY
@@ -2933,13 +2955,21 @@ def _derive_reasoning_request(
     """Derive the canonical effort request from a real task card.
 
     The card vocabulary differs from the policy vocabulary: a card carries
-    ``risk_tier`` and ``work_kind`` but no ``role`` or ``difficulty``.  Role is
-    derived from whether this is a quality-review launch, difficulty is STANDARD
-    unless the card declares a rework predecessor, and the provider family is
-    the route's own family so a Claude route still receives the Claude
-    repository default.
+    ``risk_tier``, ``work_kind`` and an optional declared ``difficulty`` but no
+    ``role``.  Role is derived from whether this is a quality-review launch, and
+    the provider family is the route's own family so a Claude route still
+    receives the Claude repository default.  A declared, valid card difficulty
+    wins, also on a rework card; only an undeclared card keeps the older rule of
+    COMPLEX when it declares a rework predecessor and STANDARD otherwise.
     """
 
+    difficulty = _coerce_difficulty(card.get("difficulty"))
+    if difficulty is None:
+        difficulty = (
+            reasoning_policy.Difficulty.COMPLEX
+            if isinstance(card.get("rework_predecessor"), Mapping)
+            else reasoning_policy.Difficulty.STANDARD
+        )
     return reasoning_policy.EffortRequest(
         role=(
             reasoning_policy.TaskRole.REVIEWER
@@ -2948,11 +2978,7 @@ def _derive_reasoning_request(
         ),
         risk_tier=_coerce_risk_tier(card.get("risk_tier")),
         work_kind=_coerce_work_kind(card.get("work_kind"), is_reviewer=is_reviewer),
-        difficulty=(
-            reasoning_policy.Difficulty.COMPLEX
-            if isinstance(card.get("rework_predecessor"), Mapping)
-            else reasoning_policy.Difficulty.STANDARD
-        ),
+        difficulty=difficulty,
         provider_family=reasoning_policy.provider_family_for_route(adapter_id),
     )
 

@@ -182,7 +182,9 @@ def test_a_mechanical_edit_that_is_not_bounded_and_low_risk_keeps_the_coding_def
         _request(
             work_kind=WorkKind.MECHANICAL_EDIT,
             risk_tier=RiskTier.HIGH,
-            difficulty=Difficulty.BOUNDED,
+            # A bounded Claude implementer is lowered to HIGH by the declared
+            # difficulty itself, not by this shape; that case has its own tests.
+            difficulty=Difficulty.STANDARD,
             provider_family=ProviderFamily.CLAUDE,
         )
     )
@@ -196,6 +198,122 @@ def test_a_mechanical_edit_that_is_not_bounded_and_low_risk_keeps_the_coding_def
         )
     )
     assert other.selected is ReasoningProfile.HIGH
+
+
+# --- declared-bounded Claude implementer ------------------------------------
+
+_CODING_KINDS = (WorkKind.REPOSITORY_CODING, WorkKind.MECHANICAL_EDIT, WorkKind.REWORK)
+
+
+def _is_bounded_claude_implementer_coding(request: EffortRequest) -> bool:
+    return (
+        request.provider_family is ProviderFamily.CLAUDE
+        and request.role is TaskRole.IMPLEMENTER
+        and request.difficulty is Difficulty.BOUNDED
+        and request.work_kind in _CODING_KINDS
+    )
+
+
+@pytest.mark.parametrize("risk", [RiskTier.LOW, RiskTier.MEDIUM, RiskTier.HIGH])
+@pytest.mark.parametrize("kind", _CODING_KINDS)
+def test_claude_bounded_implementer_coding_selects_high_not_maximum(risk, kind):
+    rationale = select_reasoning_profile(
+        _request(
+            risk_tier=risk,
+            work_kind=kind,
+            difficulty=Difficulty.BOUNDED,
+            provider_family=ProviderFamily.CLAUDE,
+        )
+    )
+    assert rationale.selected is ReasoningProfile.HIGH
+    assert rationale.baseline is ReasoningProfile.HIGH
+    assert rationale.escalations == ()
+    if kind is WorkKind.MECHANICAL_EDIT and risk is RiskTier.LOW:
+        # The explicit mechanical floor is decided first and keeps its reason.
+        assert rationale.decisive_reason == "claude_explicit_mechanical_floor_high"
+    else:
+        assert rationale.decisive_reason == "claude_bounded_implementer_high"
+
+
+@pytest.mark.parametrize("difficulty", [Difficulty.STANDARD, Difficulty.COMPLEX])
+def test_claude_coding_not_declared_bounded_keeps_the_maximum_default(difficulty):
+    rationale = select_reasoning_profile(
+        _request(difficulty=difficulty, provider_family=ProviderFamily.CLAUDE)
+    )
+    assert rationale.selected is ReasoningProfile.MAXIMUM
+    assert rationale.baseline_reason == "claude_repository_coding_default_maximum"
+
+
+@pytest.mark.parametrize(
+    ("overrides", "reason"),
+    [
+        ({"risk_tier": RiskTier.CRITICAL}, "critical_risk_tier"),
+        ({"work_kind": WorkKind.SECURITY}, "security_work"),
+        ({"work_kind": WorkKind.ARCHITECTURE}, "architecture_work"),
+        ({"work_kind": WorkKind.CORRECTNESS_REVIEW}, "correctness_review_work"),
+        ({"role": TaskRole.REVIEWER}, "correctness_review_work"),
+        ({"role": TaskRole.SECURITY_AUDITOR}, "security_work"),
+        ({"role": TaskRole.ARCHITECT}, "architecture_work"),
+    ],
+)
+def test_a_bounded_claude_implementer_still_escalates_to_maximum(overrides, reason):
+    shape = {
+        "risk_tier": RiskTier.LOW,
+        "difficulty": Difficulty.BOUNDED,
+        "provider_family": ProviderFamily.CLAUDE,
+    }
+    shape.update(overrides)
+    rationale = select_reasoning_profile(_request(**shape))
+    assert rationale.selected is ReasoningProfile.MAXIMUM
+    assert reason in rationale.reason_codes
+
+
+@pytest.mark.parametrize("role", [TaskRole.PLANNER, TaskRole.MECHANICAL_OPERATOR])
+def test_the_bounded_lowering_needs_the_implementer_role(role):
+    rationale = select_reasoning_profile(
+        _request(
+            role=role,
+            difficulty=Difficulty.BOUNDED,
+            provider_family=ProviderFamily.CLAUDE,
+        )
+    )
+    assert rationale.selected is ReasoningProfile.MAXIMUM
+    assert rationale.baseline_reason == "claude_repository_coding_default_maximum"
+
+
+@pytest.mark.parametrize("family", NON_CLAUDE_FAMILIES)
+def test_the_bounded_lowering_is_claude_only(family):
+    rationale = select_reasoning_profile(
+        _request(difficulty=Difficulty.BOUNDED, provider_family=family)
+    )
+    assert rationale.selected is ReasoningProfile.HIGH
+    assert rationale.baseline_reason == "repository_coding_quality_floor_high"
+
+
+def test_claude_lands_below_maximum_only_for_declared_cheap_shapes():
+    for request in ALL_REQUESTS:
+        if request.provider_family is not ProviderFamily.CLAUDE:
+            continue
+        if select_reasoning_profile(request).selected is ReasoningProfile.MAXIMUM:
+            continue
+        assert not _is_mandatory_maximum(request), request
+        assert (
+            _is_bounded_claude_implementer_coding(request)
+            or _is_explicit_mechanical(request)
+            or request.work_kind not in _CODING_KINDS
+        ), request
+
+
+def test_every_unescalated_bounded_claude_implementer_cell_selects_exactly_high():
+    cells = [
+        request
+        for request in ALL_REQUESTS
+        if _is_bounded_claude_implementer_coding(request)
+        and not _is_mandatory_maximum(request)
+    ]
+    assert cells
+    for request in cells:
+        assert select_reasoning_profile(request).selected is ReasoningProfile.HIGH, request
 
 
 @pytest.mark.parametrize("family", list(ProviderFamily))

@@ -861,6 +861,8 @@ def _task_create_receipt(
         "risk_tier": card.get("risk_tier"),
         "risk_tier_origin": card.get("risk_tier_origin"),
         "risk_signals": card.get("risk_signals"),
+        "difficulty": card.get("difficulty"),
+        "difficulty_origin": card.get("difficulty_origin"),
         "validation_exemption": card.get("validation_exemption"),
         "template_provenance": card.get("template_provenance") or fallback_provenance,
         "project_context": {"source_graph": {"query": source_graph.get("query")}},
@@ -2182,6 +2184,7 @@ def aiworkhub_task_create(
     work_kind: str = "generic",
     validation_roles: list[str] | None = None,
     risk_tier: str | None = None,
+    difficulty: str | None = None,
     skill_task_family: str | None = None,
     skill_stage: str | None = None,
     skill_triggers: list[str] | None = None,
@@ -2197,7 +2200,8 @@ def aiworkhub_task_create(
     Replies with a creation receipt (``aiworkhub.task_create_receipt.v1``):
     task_id, created/reconciled/receipt_state, scope_warnings, the
     server-derived validation_roles, risk_tier/origin/signals,
-    validation_exemption, template_provenance, the project_context
+    difficulty/origin, validation_exemption, template_provenance, the
+    project_context
     Source Graph query, and card_sha256/card_bytes -- never the card the
     caller just typed. ``echo_card=True`` returns the full CLI envelope with
     the persisted card in ``stdout`` instead. A refusal names every
@@ -2289,6 +2293,7 @@ def aiworkhub_task_create(
         work_kind=work_kind,
         validation_roles=validation_roles,
         risk_tier=risk_tier,
+        difficulty=difficulty,
         skill_task_family=skill_task_family,
         skill_stage=skill_stage,
         skill_triggers=skill_triggers,
@@ -2328,6 +2333,7 @@ def aiworkhub_task_create_from_template(
     immutable_inputs: list[str] | None = None,
     max_live_tokens: int | None = None,
     risk_tier: str | None = None,
+    difficulty: str | None = None,
     validation: list[str] | None = None,
     validation_roles: list[str] | None = None,
     skill_task_family: str | None = None,
@@ -2367,6 +2373,10 @@ def aiworkhub_task_create_from_template(
     predecessor_task_id}`` and is forwarded to ``core.create_task`` unchanged,
     exactly as ``aiworkhub_task_create`` does; it is never inferred from the
     template, title or prose, and core refuses a malformed binding.
+    ``difficulty`` (optional) is ``bounded``, ``standard`` or ``complex`` and
+    is forwarded to ``core.create_task`` unchanged; core alone validates it.
+    It only selects the worker's reasoning effort and is never inferred from
+    the template, title or prose: omitted means undeclared.
     """
     try:
         card = task_templates.expand_template(
@@ -2449,6 +2459,7 @@ def aiworkhub_task_create_from_template(
         work_kind=card["work_kind"],
         validation_roles=card["validation_roles"],
         risk_tier=risk_tier,
+        difficulty=difficulty,
         # The template's DECLARED work kind already names a real skill family
         # (``expand_template`` resolves it before ``work_kind`` is flattened to
         # the behavioral-contract vocabulary), so a card created from a template

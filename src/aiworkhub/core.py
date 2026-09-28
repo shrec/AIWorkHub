@@ -4002,6 +4002,7 @@ def create_task(
     work_kind: str = "generic",
     validation_roles: list[str] | None = None,
     risk_tier: str | None = None,
+    difficulty: str | None = None,
     skill_task_family: str | None = None,
     skill_stage: str | None = None,
     skill_triggers: list[str] | None = None,
@@ -4044,6 +4045,13 @@ def create_task(
     refuses the create; the reply's ``wave_goal_binding.state`` is
     ``applied``, ``refused`` (a concurrent successor won) or ``pending`` (the
     reconciler repairs it from the durable card binding).
+
+    ``difficulty`` (optional) is ``bounded``, ``standard`` or ``complex``: how
+    much of the problem the objective already pins down. It is stored on the
+    card as declared (``difficulty_origin`` ``declared``); omitting it stores
+    ``None`` with origin ``undeclared`` and is never inferred. It only selects
+    the worker's reasoning effort, never lowers the risk tier, and any other
+    value is refused as ``invalid_difficulty``.
     """
     identity = _claude_manager_identity() or _codex_manager_identity()
     if identity is None:
@@ -4069,6 +4077,11 @@ def create_task(
     risk_tier = (
         str(risk_tier).strip().lower()
         if risk_tier is not None
+        else None
+    )
+    difficulty = (
+        str(difficulty).strip().lower()
+        if difficulty is not None
         else None
     )
     if not _TASK_ID_RE.fullmatch(task_id):
@@ -4101,6 +4114,7 @@ def create_task(
     objective_limit = task_templates.MAX_OBJECTIVE_LENGTH
     allowed_priorities = ("low", "normal", "high", "critical")
     allowed_risk_tiers = ("low", "medium", "high", "critical")
+    allowed_difficulties = ("bounded", "standard", "complex")
     allowed_task_types = ("code", "data_classification", "research")
     violations: list[dict[str, Any]] = []
     violation_extra: dict[str, Any] = {}
@@ -4139,6 +4153,15 @@ def create_task(
         })
         violation_extra["allowed_risk_tiers"] = list(allowed_risk_tiers)
         violation_extra["received_risk_tier"] = risk_tier[:80]
+    if difficulty is not None and difficulty not in allowed_difficulties:
+        violations.append({
+            "code": "invalid_difficulty",
+            "field": "difficulty",
+            "received": difficulty[:80],
+            "allowed": list(allowed_difficulties),
+        })
+        violation_extra["allowed_difficulties"] = list(allowed_difficulties)
+        violation_extra["received_difficulty"] = difficulty[:80]
     if task_type not in allowed_task_types:
         violations.append({
             "code": "invalid_task_type",
@@ -4354,6 +4377,9 @@ def create_task(
     except quality_evidence.MalformedConfigError as exc:
         return _lifecycle_error(f"invalid_risk_signals:{exc}", 2)
     risk_tier_origin = "declared" if declared_risk_tier is not None else "derived"
+    # Difficulty is declared or absent, never derived: nothing at create time
+    # can know how much of the problem the statement already pins down.
+    difficulty_origin = "declared" if difficulty is not None else "undeclared"
 
     # Skill selection vocabulary. Closed sets shared with skill_registry; an
     # unknown token is refused here rather than silently matching nothing.
@@ -4738,6 +4764,12 @@ def create_task(
         "risk_tier": risk_tier,
         "risk_tier_origin": risk_tier_origin,
         "risk_signals": list(risk_signals),
+        # The caller-declared difficulty, or None. It is never derived here:
+        # ``difficulty_origin`` says whether the value was declared, so a reader
+        # (the reasoning-effort policy included) can tell an undeclared card
+        # from one that declared "standard".
+        "difficulty": difficulty,
+        "difficulty_origin": difficulty_origin,
         **({"skill_task_family": skill_task_family2} if skill_task_family2 else {}),
         **({"skill_stage": skill_stage2} if skill_stage2 else {}),
         **({"skill_triggers": skill_triggers2} if skill_triggers2 else {}),
@@ -4800,6 +4832,9 @@ def create_task(
         # derivation carries no tier at all, and a same-payload retry of it must
         # still reconcile instead of failing as a payload conflict.
         "risk_tier": declared_risk_tier,
+        # Declared difficulty as requested (None when the caller declared none),
+        # compared against the readback of the stored card field.
+        "difficulty": difficulty,
         "skill_task_family": skill_task_family2,
         "skill_stage": skill_stage2,
         "skill_triggers": skill_triggers2,
@@ -4994,6 +5029,12 @@ def create_task(
                     str(existing_card.get("risk_tier") or "").strip().lower()
                     or None
                 )
+            ),
+            # Read back the DECLARED difficulty, mirroring requested_payload. A
+            # card created without one, or written before the field existed,
+            # carries none and reads back as None.
+            "difficulty": (
+                str(existing_card.get("difficulty") or "").strip().lower() or None
             ),
             "skill_task_family": str(
                 existing_card.get("skill_task_family") or ""
@@ -11770,6 +11811,7 @@ def needfix_convert(
             priority=card.get("priority", "normal"),
             work_kind=card.get("work_kind", "generic"),
             risk_tier=card.get("risk_tier"),
+            difficulty=card.get("difficulty"),
             callback_required=card.get("callback_required", True),
             task_type=card.get("task_type", "code"),
             depends_on=card.get("depends_on"),
