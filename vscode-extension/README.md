@@ -14,6 +14,11 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.12.3
+
+- Reworked cards are reviewed only on what changed since the last round, so a small fix no longer pays for a full review.
+- Reviewers see the manager's rework instructions sealed into their own packet.
+
 ## What's new in 0.12.2
 
 - AI Memory rebuilds a lost search index by itself, so worker cards stop failing on `fts_unavailable`.

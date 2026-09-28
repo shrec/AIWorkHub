@@ -1,5 +1,15 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.12.3 — 2026-09-28
+
+### Changed
+
+- A rework round is reviewed on the hunks that changed since the predecessor round: the candidate carries a sealed rework delta, and a lens that already judged the predecessor reviews only those hunks instead of the whole candidate. An unreadable or partial delta falls back to the full review surface with a recorded reason (NF-2026-01093).
+
+### Fixed
+
+- The manager's rework amendment is sealed into every reviewer lens packet, so the reviewer judges the candidate against the amended contract instead of the original card (NF-2026-01086).
+
 ## 0.12.2 — 2026-09-28
 
 ### Fixed
