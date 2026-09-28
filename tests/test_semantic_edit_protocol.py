@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 
 from aiworkhub import semantic_edit
+from aiworkhub import semantic_edit_applier
 from aiworkhub import process_launcher
 from aiworkhub import worker_ai_tools_mcp as worker_tools
 
@@ -545,3 +548,142 @@ def test_the_package_has_one_protocol_line_coercion() -> None:
     for raw, expected in (("55", 55), (" 55 ", 55), (55, 55), (True, True), ("x", "x")):
         assert semantic_edit.coerce_protocol_line(raw) == expected
         assert isinstance(semantic_edit.coerce_protocol_line(raw), type(expected))
+
+
+# ---------------------------------------------------------------------------
+# NF-2026-01077: a line is what ``\n`` ends.
+#
+# Source Graph, git and editors number lines on ``\n`` only.  ``str.splitlines``
+# also breaks on a bare CR, \v, \f, \x1c-\x1e, U+0085, U+2028 and U+2029, so a
+# range taken from any of them selected -- and replaced -- the wrong fragment of a
+# file that holds one of those characters.
+# ---------------------------------------------------------------------------
+
+# Every character ``str.splitlines`` breaks on besides ``\n``.
+_OTHER_LINE_BREAKS = (
+    "\r", "\v", "\f", "\x1c", "\x1d", "\x1e", "\x85",
+    "\N{LINE SEPARATOR}", "\N{PARAGRAPH SEPARATOR}",
+)
+
+
+def _write_break_in_line_two(root: Path, char: str) -> str:
+    """Write ``src/module.txt`` byte for byte with ``char`` inside its line 2."""
+    text = f"one\ntwo{char}2\nthree\nfour\n"
+    target = root / "src" / "module.txt"
+    target.parent.mkdir()
+    target.write_bytes(text.encode("utf-8"))
+    return text
+
+
+def _prepare_lines(root: Path, start: int, end: int) -> semantic_edit.PreparedLineTarget:
+    return semantic_edit.prepare_line_target(
+        root,
+        path="src/module.txt",
+        start_line=start,
+        end_line=end,
+        allowed_writes=("src/*.txt",),
+    )
+
+
+@pytest.mark.parametrize("char", _OTHER_LINE_BREAKS, ids=repr)
+def test_prepare_numbers_lines_on_lf_only(tmp_path: Path, char: str) -> None:
+    text = _write_break_in_line_two(tmp_path, char)
+
+    third = _prepare_lines(tmp_path, 3, 3)
+    assert third.fragment == "three\n"
+    assert third.fragment_sha256 == hashlib.sha256(b"three\n").hexdigest()
+    assert third.current_sha256 == hashlib.sha256(text.encode("utf-8")).hexdigest()
+    assert _prepare_lines(tmp_path, 2, 2).fragment == f"two{char}2\n"
+    assert _prepare_lines(tmp_path, 2, 3).fragment == f"two{char}2\nthree\n"
+    # Four lines, not five or more: the character splits nothing.
+    with pytest.raises(semantic_edit.SemanticEditError, match="out_of_bounds:5:5:4"):
+        _prepare_lines(tmp_path, 5, 5)
+
+
+@pytest.mark.parametrize("char", _OTHER_LINE_BREAKS, ids=repr)
+def test_apply_line_ranges_changes_only_the_lf_numbered_line(char: str) -> None:
+    text = f"one\ntwo{char}2\nthree\nfour\n"
+
+    next_text, metrics = semantic_edit.apply_line_ranges(
+        text,
+        [{
+            "start_line": 3,
+            "end_line": 3,
+            "new": "THREE",
+            "fragment_sha256": hashlib.sha256(b"three\n").hexdigest(),
+        }],
+    )
+    assert next_text == f"one\ntwo{char}2\nTHREE\nfour\n"
+    assert metrics["old_region_bytes"] == len(b"three\n")
+    assert metrics["preimage_verified"] is True
+
+    # The line holding the character is replaced whole: no stray tail is left.
+    whole_line, _metrics = semantic_edit.apply_line_ranges(
+        text, [{"start_line": 2, "end_line": 2, "new": "TWO"}]
+    )
+    assert whole_line == "one\nTWO\nthree\nfour\n"
+
+
+# Text shapes for the ``\n``-only splitter: every break ``str.splitlines`` would
+# also honour, plus the edges a splitter tends to get wrong.
+_SPLIT_LINES_CORPUS = (
+    "",
+    "a",
+    "\n",
+    "\n\n",
+    "a\n",
+    "a\nb",
+    "a\nb\n",
+    "a\n\nb\n",
+    "a\r\nb\r\n",
+    "a\r\nb",
+    "a\rb\rc\r",
+    "a\rb\nc",
+    "a\x85b\nc\n",
+    "a\N{LINE SEPARATOR}b\nc\n",
+    "a\N{PARAGRAPH SEPARATOR}b\nc\n",
+    "a\vb\nc\n",
+    "a\fb\nc\n",
+    "a\x1cb\x1dc\x1ed\n",
+    "\r\n\r\n",
+    "\x85\N{LINE SEPARATOR}\N{PARAGRAPH SEPARATOR}\v\f\x1c\r",
+    "a\r\nb\rc\x85d\N{LINE SEPARATOR}e\N{PARAGRAPH SEPARATOR}f\vg\fh\x1ci\nj",
+)
+
+
+@pytest.mark.parametrize("text", _SPLIT_LINES_CORPUS, ids=repr)
+def test_split_lines_keeps_line_ends_and_round_trips(text: str) -> None:
+    lines = semantic_edit._split_lines(text)
+
+    assert "".join(lines) == text
+    assert all(line.count("\n") == 1 and line.endswith("\n") for line in lines[:-1])
+    assert (lines == []) is (text == "")
+
+
+@pytest.mark.parametrize("text", _SPLIT_LINES_CORPUS, ids=repr)
+def test_split_lines_agrees_with_source_graph_diff(text: str) -> None:
+    """Two splitters, one rule.  ``source_graph_diff`` numbers the lines a reviewer
+    reads and this module the lines an edit replaces, so they must never differ;
+    moving the diff onto this splitter is the follow-up NF-2026-01085."""
+    from aiworkhub import source_graph_diff  # heavy import: only this test pays for it
+
+    assert semantic_edit._split_lines(text) == source_graph_diff._split_lines(text)
+
+
+@pytest.mark.parametrize("module", [semantic_edit, semantic_edit_applier], ids=lambda m: m.__name__)
+def test_no_editor_module_calls_str_splitlines(module: ModuleType) -> None:
+    """``_split_lines`` is the one splitter: a ``splitlines`` call is a second rule."""
+    tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
+    lines = sorted(
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute) and node.attr == "splitlines"
+    )
+    assert lines == [], f"{module.__name__} uses str.splitlines at line(s) {lines}"
+
+
+def test_the_applier_has_no_line_splitter_of_its_own() -> None:
+    assert (
+        getattr(semantic_edit_applier, "_split_lines", semantic_edit._split_lines)
+        is semantic_edit._split_lines
+    )

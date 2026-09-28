@@ -9,10 +9,10 @@ behaviour is asserted at the exact layer that owns it:
   absent key) still applies the edit but is reported as unverified in the
   returned accounting, so a caller can never mistake an unchecked write for a
   checked one;
-* the trailing terminator is derived from what the old text ends with, so every
-  terminator ``str.splitlines`` can produce -- including a bare ``\\r`` and the
-  Unicode line breaks -- round-trips instead of being dropped by a hand-written
-  ladder that only named CRLF and LF.
+* lines are numbered on ``\\n`` only (NF-2026-01077), so the trailing terminator
+  is CRLF, LF or nothing: LF and CRLF round-trip through a range edit, while a
+  bare ``\\r``, ``\\f``, U+0085, U+2028 and the other characters ``str.splitlines``
+  breaks on are line content -- they neither split a line nor end one.
 
 The existing refusals (wrong hash, overlapping ranges, size caps) are exercised
 here too and, canonically, by ``tests/test_semantic_edit_protocol.py``.
@@ -88,46 +88,102 @@ def test_mixed_ranges_report_only_the_unverified_one() -> None:
     assert metrics["preimage_unverified_range_count"] == 1
 
 
-# --- U1: the terminator is derived, not laddered --------------------------
+# --- U1: the terminator is CRLF, LF or nothing (NF-2026-01077) --------------
+# Replaces ``test_bare_cr_file_keeps_its_line_structure`` and
+# ``test_every_splitlines_terminator_round_trips``: they pinned ``str.splitlines``
+# numbering, where a bare CR, \v, \f, \x1c-\x1e, U+0085, U+2028 or U+2029 ended a
+# line.  That numbering is the defect -- ranges from Source Graph, git and editors
+# count ``\n`` only -- so those characters are now line content, pinned below.
 
-def test_bare_cr_file_keeps_its_line_structure() -> None:
+@pytest.mark.parametrize("term", ["\r\n", "\n"], ids=repr)
+def test_lf_and_crlf_terminators_round_trip_through_a_range_edit(term: str) -> None:
     new_text, _metrics = semantic_edit.apply_line_ranges(
-        "a\rb\rc\r",
-        [{"start_line": 1, "end_line": 1, "new": "X", "fragment_sha256": _sha("a\r")}],
-    )
-    # The regression: lines 1 and 2 must not be glued into "Xb\rc\r".
-    assert new_text == "X\rb\rc\r"
-    assert new_text != "Xb\rc\r"
-
-
-# Every terminator ``str.splitlines`` can produce.  A two-case ladder that only
-# names CRLF and LF fails every row below except the first two.
-_TERMINATORS = [
-    "\r\n",
-    "\n",
-    "\r",
-    "\v",
-    "\f",
-    "\x1c",
-    "\x1d",
-    "\x1e",
-    "\x85",
-    " ",
-    " ",
-]
-
-
-@pytest.mark.parametrize("term", _TERMINATORS, ids=[repr(t) for t in _TERMINATORS])
-def test_every_splitlines_terminator_round_trips(term: str) -> None:
-    text = f"a{term}b{term}"
-    # Sanity: this terminator really is one splitlines treats as a line break.
-    assert text.splitlines(keepends=True) == [f"a{term}", f"b{term}"]
-
-    new_text, _metrics = semantic_edit.apply_line_ranges(
-        text,
+        f"a{term}b{term}",
         [{"start_line": 1, "end_line": 1, "new": "X", "fragment_sha256": _sha(f"a{term}")}],
     )
     assert new_text == f"X{term}b{term}"
+
+
+# Every character ``str.splitlines`` breaks on besides ``\n``.  Lines are numbered
+# on ``\n`` only, as Source Graph, git and editors number them, so these are line
+# content: they neither split a line nor end one.
+_OTHER_LINE_BREAKS = [
+    "\r", "\v", "\f", "\x1c", "\x1d", "\x1e", "\x85",
+    "\N{LINE SEPARATOR}", "\N{PARAGRAPH SEPARATOR}",
+]
+
+
+@pytest.mark.parametrize("char", _OTHER_LINE_BREAKS, ids=repr)
+def test_another_line_break_inside_a_line_does_not_split_it(char: str) -> None:
+    text = f"a{char}b\nc\n"
+    # Sanity: splitlines would have cut line 1 right after the character.
+    assert text.splitlines(keepends=True)[0] == f"a{char}"
+
+    new_text, metrics = semantic_edit.apply_line_ranges(
+        text,
+        [{"start_line": 1, "end_line": 1, "new": "X", "fragment_sha256": _sha(f"a{char}b\n")}],
+    )
+    # No stray ``b\n`` is left behind, and the replacement is completed with the
+    # LF that ended the line, not with the character.
+    assert new_text == "X\nc\n"
+    assert metrics["preimage_verified"] is True
+
+
+@pytest.mark.parametrize("char", _OTHER_LINE_BREAKS, ids=repr)
+def test_another_line_break_at_the_end_of_a_line_is_no_terminator(char: str) -> None:
+    # ``b{char}`` closes the text but no line, so there is no terminator to
+    # restore; ``splitlines`` would have appended the character to the replacement.
+    new_text, _metrics = semantic_edit.apply_line_ranges(
+        f"a\nb{char}",
+        [{"start_line": 2, "end_line": 2, "new": "X", "fragment_sha256": _sha(f"b{char}")}],
+    )
+    assert new_text == "a\nX"
+
+
+@pytest.mark.parametrize("char", _OTHER_LINE_BREAKS, ids=repr)
+def test_a_text_with_only_other_line_breaks_is_a_single_line(char: str) -> None:
+    text = f"a{char}b{char}"
+
+    new_text, _metrics = semantic_edit.apply_line_ranges(
+        text,
+        [{"start_line": 1, "end_line": 1, "new": "X", "fragment_sha256": _sha(text)}],
+    )
+    assert new_text == "X"
+    with pytest.raises(semantic_edit.SemanticEditError, match="out_of_bounds:2:2:1"):
+        semantic_edit.apply_line_ranges(text, [{"start_line": 2, "end_line": 2, "new": "X"}])
+
+
+@pytest.mark.parametrize(
+    ("fragment", "expected"),
+    [
+        ("", ""),
+        ("a", ""),
+        ("a\n", "\n"),
+        ("a\r\n", "\r\n"),
+        ("\n", "\n"),
+        ("\r\n", "\r\n"),
+        ("a\nb\n", "\n"),
+        ("a\r\nb\r\n", "\r\n"),
+        ("a\r\nb", ""),
+        ("a\n\r", ""),
+        *[(f"a{char}", "") for char in _OTHER_LINE_BREAKS],
+        *[(f"a{char}\n", "\n") for char in _OTHER_LINE_BREAKS if char != "\r"],
+        *[(f"a{char}\r\n", "\r\n") for char in _OTHER_LINE_BREAKS],
+    ],
+    ids=repr,
+)
+def test_line_terminator_is_crlf_lf_or_nothing(fragment: str, expected: str) -> None:
+    assert semantic_edit._line_terminator(fragment) == expected
+
+
+def test_a_replacement_ending_in_a_bare_cr_is_completed_with_the_line_terminator() -> None:
+    # ``B\r`` ends no line, so it is completed like any unterminated replacement:
+    # over an LF line it becomes ``B\r\n`` instead of gluing line 3 onto it.
+    new_text, _metrics = semantic_edit.apply_line_ranges(
+        "a\nb\nc\n",
+        [{"start_line": 2, "end_line": 2, "new": "B\r", "fragment_sha256": _sha("b\n")}],
+    )
+    assert new_text == "a\nB\r\nc\n"
 
 
 def test_last_line_without_terminator_gets_none_invented() -> None:

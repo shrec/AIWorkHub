@@ -630,3 +630,76 @@ def test_the_chain_cannot_be_swapped_while_an_apply_holds_it(tmp_path, monkeypat
     )
     assert attempts == ["refused:32"]  # ERROR_SHARING_VIOLATION
     assert (root / "src" / "pkg" / "mod.py").read_text(encoding="utf-8") == "changed\nb\n"
+
+
+# -- lines are numbered on ``\n`` only (NF-2026-01077) -------------------------
+# ``str.splitlines`` also breaks on a bare CR, \v, \f, \x1c-\x1e, U+0085, U+2028
+# and U+2029, so a range counted the way Source Graph, git and editors count it
+# selected -- and replaced -- the wrong fragment of a file holding one of them.
+
+
+@pytest.mark.parametrize(
+    "char",
+    [
+        "\r", "\v", "\f", "\x1c", "\x1d", "\x1e", "\x85",
+        "\N{LINE SEPARATOR}", "\N{PARAGRAPH SEPARATOR}",
+    ],
+    ids=repr,
+)
+def test_a_range_replaces_only_the_lf_numbered_line(tmp_path, char):
+    root = _repo(tmp_path, f"one\ntwo{char}2\nthree\nfour\n")
+
+    target = _prepare(root, 3, 3)
+    assert target.fragment == "three\n"
+    semantic_edit_applier.replace_prepared_range(
+        root, target, "THREE", allowed_writes=["x.py"]
+    )
+    # Line 3 changed; the line holding the character is intact, byte for byte.
+    assert (root / "x.py").read_bytes() == f"one\ntwo{char}2\nTHREE\nfour\n".encode("utf-8")
+
+    # The line holding the character is one line: replaced whole, no stray tail.
+    target = _prepare(root, 2, 2)
+    assert target.fragment == f"two{char}2\n"
+    semantic_edit_applier.replace_prepared_range(
+        root, target, "TWO", allowed_writes=["x.py"]
+    )
+    assert (root / "x.py").read_bytes() == b"one\nTWO\nTHREE\nfour\n"
+
+
+# -- a junction is refused from lstat, before resolve() runs (NF-2026-01077) ----
+# ``resolve(strict=True)`` cannot traverse a directory junction in the
+# AppContainer lane and reports the target missing rather than a link, so the
+# refusal has to come from the per-component lstat check.  This proves it on every
+# OS: ``is_junction`` says ``root/src/pkg`` is one, and any ``resolve`` at or under
+# it fails the test.  ``Path.is_junction`` is a Python 3.12 API and pyproject.toml
+# declares ``requires-python >=3.12``, so the guard carries no fallback branch.
+
+
+def test_a_junction_is_refused_before_resolve_can_traverse_it(tmp_path, monkeypatch):
+    root, _outside = _tree(tmp_path)
+    root = root.resolve()
+    junction = root / "src" / "pkg"
+    real_is_junction = Path.is_junction
+    real_resolve = Path.resolve
+
+    def is_junction(self):
+        return self == junction or real_is_junction(self)
+
+    def resolve(self, *args, **kwargs):
+        if self == junction or junction in self.parents:
+            raise AssertionError(f"resolve() reached {self} before the junction was refused")
+        return real_resolve(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "is_junction", is_junction)
+    monkeypatch.setattr(Path, "resolve", resolve)
+
+    expected = "semantic_edit_symlink_forbidden:src/pkg/mod.py"
+    with pytest.raises(semantic_edit.SemanticEditError) as resolved:
+        semantic_edit.resolve_existing_file(root, "src/pkg/mod.py")
+    assert str(resolved.value) == expected
+    with pytest.raises(semantic_edit.SemanticEditError) as prepared:
+        semantic_edit.prepare_line_target(
+            root, path="src/pkg/mod.py", start_line=1, end_line=1,
+            allowed_writes=["src/pkg/mod.py"],
+        )
+    assert str(prepared.value) == expected

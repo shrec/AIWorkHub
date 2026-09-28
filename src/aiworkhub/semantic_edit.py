@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import fnmatch
 import hashlib
+import re
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -117,7 +118,9 @@ def resolve_existing_file(root: Path, relative: str) -> Path:
     cursor = root
     for part in PurePosixPath(relative).parts:
         cursor /= part
-        if cursor.is_symlink():
+        # A junction is no symlink and resolve() may not traverse one (NF-2026-01077): refuse it
+        # from lstat first.  Path.is_junction is 3.12 API; requires-python is >=3.12: no fallback.
+        if cursor.is_symlink() or cursor.is_junction():
             raise SemanticEditError(f"semantic_edit_symlink_forbidden:{relative}")
     try:
         target = (root / relative).resolve(strict=True)
@@ -222,9 +225,26 @@ def _validated_line_bounds(start_line: object, end_line: object) -> tuple[int, i
     return start, end
 
 
+# A line is what ``\n`` ends, the way Source Graph, git and editors number them
+# (``source_graph_diff._split_lines`` states the same rule; a test pins the two
+# together).  ``str.splitlines`` also breaks on a bare CR, \v, \f, \x1c-\x1e,
+# U+0085, U+2028 and U+2029, so a range taken from any of those tools selected
+# and replaced the wrong fragment of a file holding one of them (NF-2026-01077).
+_LINE_RE = re.compile(r"[^\n]*\n|[^\n]+\Z")
+
+
+def _split_lines(text: str) -> list[str]:
+    """Split ``text`` on ``\\n`` only, keeping line ends.
+
+    ``"".join`` of the result is ``text`` and empty text has no lines.  Every
+    line split in this module goes through here.
+    """
+    return _LINE_RE.findall(text)
+
+
 def _line_slice(text: str, start_line: object, end_line: object) -> tuple[list[str], str]:
     start_line, end_line = _validated_line_bounds(start_line, end_line)
-    lines = text.splitlines(keepends=True)
+    lines = _split_lines(text)
     # An existing zero-byte file has one deterministic virtual insertion
     # point.  VS Code LM workers receive such files as trusted placeholders
     # for declared required outputs; treating ``1:1`` as a zero-byte region
@@ -273,21 +293,17 @@ def prepare_line_target(
 
 
 def _line_terminator(fragment: str) -> str:
-    """Return the exact line terminator ``fragment`` ends with (``""`` if none).
+    """Return the terminator ``fragment`` ends with: ``"\\r\\n"``, ``"\\n"`` or ``""``.
 
-    Derived from what ``fragment`` actually ends with -- via ``str.splitlines``,
-    the same splitter ``apply_line_ranges`` uses -- so every terminator that
-    splitter can produce (CRLF, bare LF, bare CR and the other Unicode line
-    breaks) round-trips through a range edit.  A hand-written ladder that only
-    names a couple of cases silently drops the terminators it forgot and glues
-    the following line onto the replacement; deriving it cannot.
+    Lines are numbered on ``\\n`` only (:func:`_split_lines`), so a line ends with
+    LF, or with CRLF whose CR belongs to the terminator.  A bare CR, ``\\f``,
+    U+0085, U+2028 and the other characters ``str.splitlines`` would break on are
+    line content: they end nothing, so a fragment that ends with one has no
+    terminator to restore.
     """
-    if not fragment:
-        return ""
-    last_line = fragment.splitlines(keepends=True)[-1]
-    without_terminator = last_line.splitlines(keepends=False)
-    body = without_terminator[0] if without_terminator else ""
-    return last_line[len(body):]
+    if fragment.endswith("\r\n"):
+        return "\r\n"
+    return "\n" if fragment.endswith("\n") else ""
 
 
 def apply_line_ranges(
@@ -296,7 +312,7 @@ def apply_line_ranges(
 ) -> tuple[str, dict[str, Any]]:
     if not ranges or len(ranges) > MAX_RANGES_PER_FILE:
         raise SemanticEditError("semantic_edit_ranges_invalid")
-    lines = current_text.splitlines(keepends=True)
+    lines = _split_lines(current_text)
     normalized: list[tuple[int, int, str, int, int, bool]] = []
     for index, item in enumerate(ranges):
         if not isinstance(item, dict):
@@ -333,11 +349,10 @@ def apply_line_ranges(
         preserve = item.get("preserve_trailing_newline", True)
         if not isinstance(preserve, bool):
             raise SemanticEditError(f"semantic_edit_newline_policy_invalid:{index}")
-        # Restore whatever terminator ``old`` actually ended with rather than a
-        # two-case ladder that only knew CRLF and LF; ``_line_terminator``
-        # covers every terminator ``splitlines`` can produce, so a bare-CR (or
-        # any other line-break) file keeps its line structure.
-        if preserve and replacement and not replacement.endswith(("\n", "\r")):
+        # Complete the replacement with the terminator ``old`` ended with, exactly
+        # when it does not itself end a ``\n``-numbered line: a bare CR ends
+        # nothing, so ``B\r`` over an LF line becomes ``B\r\n``.
+        if preserve and replacement and not replacement.endswith("\n"):
             replacement += _line_terminator(old)
         normalized.append(
             (
