@@ -76,6 +76,8 @@ _TASK_CREATE_CONTRACT = [
     "work_kind",
     "validation_roles",
     "risk_tier",
+    # NF-2026-01101: a declared difficulty drives the worker effort tier.
+    "difficulty",
 ]
 
 # The skill selection vocabulary a card may declare. It is listed separately
