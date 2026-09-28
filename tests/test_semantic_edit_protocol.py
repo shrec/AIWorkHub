@@ -660,14 +660,15 @@ def test_split_lines_keeps_line_ends_and_round_trips(text: str) -> None:
     assert (lines == []) is (text == "")
 
 
-@pytest.mark.parametrize("text", _SPLIT_LINES_CORPUS, ids=repr)
-def test_split_lines_agrees_with_source_graph_diff(text: str) -> None:
-    """Two splitters, one rule.  ``source_graph_diff`` numbers the lines a reviewer
+def test_source_graph_diff_reuses_the_semantic_edit_line_splitter() -> None:
+    """One splitter, one rule.  ``source_graph_diff`` numbers the lines a reviewer
     reads and this module the lines an edit replaces, so they must never differ;
-    moving the diff onto this splitter is the follow-up NF-2026-01085."""
+    the diff imports this module's splitter (NF-2026-01085) instead of restating it."""
     from aiworkhub import source_graph_diff  # heavy import: only this test pays for it
 
-    assert semantic_edit._split_lines(text) == source_graph_diff._split_lines(text)
+    assert source_graph_diff._split_lines is semantic_edit._split_lines
+    # A bare CR stays inside its line and a last line without ``\n`` is still a line.
+    assert source_graph_diff._split_lines("a\rb\nc") == ["a\rb\n", "c"]
 
 
 @pytest.mark.parametrize("module", [semantic_edit, semantic_edit_applier], ids=lambda m: m.__name__)

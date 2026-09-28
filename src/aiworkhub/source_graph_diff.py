@@ -28,13 +28,13 @@ import dataclasses
 import difflib
 import hashlib
 import os
-import re
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from . import parallelism, source_graph, source_graph_ast, worker_workspace
+from .semantic_edit import _split_lines
 
 SCHEMA_ID = "aiworkhub.source_graph_diff.v1"
 DEFAULT_BYTE_BUDGET = 32 * 1024
@@ -338,14 +338,6 @@ def _decode(raw: bytes | None) -> str | None:
     if b"\x00" in raw:
         return None
     return raw.decode("utf-8", "replace")
-
-
-_LINE_RE = re.compile(r"[^\n]*\n|[^\n]+\Z")
-
-
-def _split_lines(text: str) -> list[str]:
-    """Split on ``\\n`` only, keeping terminators, as git and the AST count lines."""
-    return _LINE_RE.findall(text)
 
 
 def _file_hunks(row: Mapping[str, Any], before: bytes | None, after: bytes | None) -> list[dict[str, Any]]:
