@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import builtins
 import copy
+import difflib
 import hashlib
 import importlib.machinery
 import importlib.util
@@ -34,6 +35,16 @@ MAX_VALIDATION_OUTPUT_TAIL_CHARS = 4_096
 REVIEW_PACKET_FILE_ROOT_ENV = "AIWORKHUB_QUALITY_REVIEW_PACKET_ROOT"
 REVIEWER_LENSES = frozenset({"correctness", "security", "code_quality"})
 CANDIDATE_DELTA_SCHEMA_ID = "aiworkhub.quality_review_candidate_delta.v1"
+# The most predecessor->candidate diff text (``rework_hunks``, every path
+# together) a candidate.delta may carry.  The launcher drops the hunks and the
+# completeness claim when they would exceed it, and ``_candidate_delta_rows``
+# refuses a record that does, so the cap belongs to the sealed packet and not
+# to one producer.
+MAX_REWORK_HUNKS_CHARS = 65_536
+# The longest ``rework_delta_fallback_reason`` a candidate.delta keeps: a short
+# diagnostic code, not prose, so a longer one is cut rather than refusing the
+# whole packet over a diagnostic.
+MAX_REWORK_FALLBACK_REASON_CHARS = 200
 PRIOR_FINDINGS_SCHEMA_ID = "aiworkhub.quality_review_prior_findings.v1"
 # Bounded so a target with a long rework history cannot grow the packet without
 # limit: the newest reports first, and the count of what was dropped is kept.
@@ -202,14 +213,53 @@ QUALITY_REVIEW_SUBMIT_TOOL_DESCRIPTION = (
     + QUALITY_REVIEW_FINDING_SCHEMA_DOC
 )
 # NF-2026-01057: a review that surfaces one new defect per round turns one card
-# into many rework rounds, so the whole changed scope is judged in one pass.
+# into many rework rounds, so every defect on the review surface is reported in
+# one pass.  NF-2026-01093 scopes that surface to what the worker wrote.
 EXHAUSTIVE_SINGLE_PASS_INSTRUCTION = (
-    "Review exhaustively in a single pass: examine every changed hunk in the "
-    "whole changed scope and its adjacent failure modes (callers, edge cases, "
-    "error paths, tests) before submitting, and list every defect you find, at "
-    "every severity, in this one report. Do not stop at the first defect and do "
-    "not hold findings back for a later round; a defect that was visible now "
-    "and reported only in a later round costs a full rework cycle. "
+    "Review exhaustively in a single pass: examine every changed hunk on the "
+    "review surface and every defect those changed lines introduce before "
+    "submitting, and list every defect you find, at every severity, in this "
+    "one report. Do not stop at the first defect and do not hold findings "
+    "back for a later round; a defect that was visible now and reported only "
+    "in a later round costs a full rework cycle. "
+)
+# NF-2026-01093: the review surface of EVERY round is exactly what the worker
+# wrote -- its changed hunks -- never the files they sit in.  Measured:
+# correctness reviews took 13-20 minutes on small diffs and one timed out at
+# 1800 s; one reviewer made 60 whole-file reads and 78 shell searches, another
+# spent 45K thinking tokens enumerating failure modes beyond the change.
+HUNK_REVIEW_SURFACE_INSTRUCTION = (
+    "REVIEW SURFACE. The review surface is the '+'/'-' lines of "
+    "candidate.source_evidence; unchanged context lines are not review "
+    "surface. A caller or test is in scope only when a hunk changes a "
+    "signature, return value, raised exception, persisted format or other "
+    "contract; judge it from candidate.caller_context and the scoped audit, "
+    "not by opening files. Do not read whole files and do not search the "
+    "repository. Open the workspace only for hunks the packet marks omitted "
+    "(diff_complete false), and only those line ranges.\n"
+)
+# A rework round whose predecessor's sealed delta authenticated carries the
+# predecessor->candidate diff in candidate.delta, so what the predecessor round
+# already reviewed is not review surface again and the whole surface is in the
+# packet.  Rendered per lens, only for a COMPLETE delta with a changed hunk and
+# only when prior_review holds THAT lens's report that JUDGED the predecessor
+# (no process_limit finding, every finding listed): the predecessor is pinned
+# after ANY terminal, so a delta alone does not show that this lens ever
+# reviewed those bytes.  Otherwise the hunk surface above is the whole
+# statement.
+REWORK_DELTA_REVIEW_INSTRUCTION = (
+    "REWORK ROUND. candidate.delta.rework_delta_complete is true and "
+    "prior_review holds this lens's completed report on the predecessor, so "
+    "the review surface above narrows to the '+'/'-' lines of "
+    "candidate.delta.paths[*].rework_hunks, plus whether each prior finding "
+    "in prior_review is resolved. Each rework_hunks is the complete unified "
+    "diff from the predecessor to this candidate for one path (empty when the "
+    "path did not change); cite candidate lines from the '+' side of its @@ "
+    "headers. This round needs no workspace read and supersedes any "
+    "omitted-hunk inspection below: rework_hunks already carries every line "
+    "under review, so an omitted source_evidence hunk is neither read nor "
+    "escalated. Everything else was reviewed in the predecessor round: do "
+    "not re-review it and do not re-derive these hunks from files.\n"
 )
 
 
@@ -270,9 +320,10 @@ def build_review_packet(
 
     ``caller_context`` is the canonical source read around every graph-resolved
     caller line the scoped audit lists, and ``candidate_delta`` marks which
-    changed paths are byte-identical to the previously reviewed candidate.
-    Both are mechanical facts derived by the coordinator; neither carries any
-    reviewer or worker prose.
+    changed paths are byte-identical to the previously reviewed candidate --
+    and, when the predecessor's sealed delta authenticated, carries each path's
+    predecessor->candidate diff (``rework_hunks``).  All are mechanical facts
+    derived by the coordinator; none carries any reviewer or worker prose.
 
     ``prior_findings`` carries prose written by a model, and it is prose
     written by EARLIER REVIEWERS of this same task -- never by the worker.
@@ -718,8 +769,8 @@ _ALREADY_ESTABLISHED_MECHANICALLY = (
     "- candidate.delta, when present, marks the changed paths whose bytes are "
     "identical to the previously reviewed candidate (basis: "
     "changed_path_hashes). It is a fact about bytes, never a prior verdict: "
-    "a changed hunk is reviewed in full regardless.\n"
-    "Read the candidate and judge it. Spend your turns on the code, not on "
+    "a hunk on the review surface is reviewed in full regardless.\n"
+    "Judge the changed hunks. Spend your turns on the code, not on "
     "reproducing receipts you were handed.\n"
 )
 
@@ -772,9 +823,10 @@ _OVERLAY_INSPECTION_STEPS = (
     "equal to the candidate_sha256 above with freshness.state fresh. Compare "
     "the strings; never run a hashing command.\n"
     "2. Then read only each omitted hunk, at the candidate_start_line to "
-    "candidate_end_line of its segments row in that exact path, and after "
-    "that only the graph-connected callers and tests of those hunks. No "
-    "whole-file read, no repository scan, no path outside this list.\n"
+    "candidate_end_line of its segments row in that exact path, and only "
+    "those line ranges; a caller or test of those hunks is in scope only "
+    "under the review surface rule above. No whole-file read, no "
+    "repository scan, no path outside this list.\n"
     "3. Judge what you read like any inline hunk: report a defect as a defect "
     "finding; a hunk you read and found sound needs no finding. diff_complete "
     "false alone is never a reason to file process_limit.\n"
@@ -855,6 +907,106 @@ def _omitted_hunk_overlay_instruction(
     )
 
 
+def _lens_reviewed_predecessor(
+    packet: Mapping[str, Any], lens: str, predecessor_request_id: object
+) -> bool:
+    """Whether ``prior_review`` holds THIS lens's report that JUDGED the predecessor.
+
+    A report counts only under this lens's own section and only when its
+    ``target_request_id`` names the rework predecessor: another lens's report,
+    or this lens's report on an earlier round, says nothing about the bytes the
+    predecessor round left.
+
+    It must also have judged them.  A reviewer that filed a ``process_limit``
+    finding declared it could not establish coverage (the supplemental
+    inspection below already treats a reviewer whose every finding is one as
+    not having judged).  The section lists each report's findings under its
+    ``reviewer_request_id``, so a report counts only when those findings number
+    exactly its ``finding_count`` and none is a ``process_limit``.  The per-lens
+    cap drops ``process_limit`` rows first, so a list shorter than the count
+    cannot show that none was filed and fails closed, as does a report whose
+    count or reviewer identity is unusable.
+    """
+
+    prior = packet.get("prior_review")
+    lenses = prior.get("lenses") if isinstance(prior, Mapping) else None
+    section = lenses.get(lens) if isinstance(lenses, Mapping) else None
+    reports = section.get("reports") if isinstance(section, Mapping) else None
+    findings = section.get("findings") if isinstance(section, Mapping) else None
+    if (
+        not isinstance(predecessor_request_id, str)
+        or not predecessor_request_id
+        or not isinstance(reports, list)
+        or not isinstance(findings, list)
+    ):
+        return False
+    for report in reports:
+        if (
+            not isinstance(report, Mapping)
+            or report.get("target_request_id") != predecessor_request_id
+        ):
+            continue
+        reviewer = report.get("reviewer_request_id")
+        count = report.get("finding_count")
+        if (
+            not isinstance(reviewer, str)
+            or not reviewer
+            or not isinstance(count, int)
+            or isinstance(count, bool)
+        ):
+            continue
+        filed = [
+            row
+            for row in findings
+            if isinstance(row, Mapping) and row.get("reviewer_request_id") == reviewer
+        ]
+        if len(filed) == count and all(
+            row.get("disposition") != "process_limit" for row in filed
+        ):
+            return True
+    return False
+
+
+def _rework_delta_instruction(packet: Mapping[str, Any], *, lens: str) -> str:
+    """Render the narrowed rework review surface for ``lens``, or ``""`` when unearned.
+
+    The narrowed surface says everything outside the rework hunks was reviewed
+    in the predecessor round, so it is rendered only when that is true for THIS
+    lens, and all of these hold:
+
+    * the delta is complete: the sealed record says so (``rework_delta_complete``
+      is exactly ``True``) AND every changed path carries its own
+      ``rework_hunks`` string;
+    * at least one hunk is non-empty -- an all-empty delta names no line to
+      review, so narrowing to it would leave the reviewer no surface at all;
+    * ``prior_review`` holds a report by this lens that JUDGED the predecessor
+      (see ``_lens_reviewed_predecessor``: a report that filed a
+      ``process_limit`` finding, or whose findings are not all listed, did
+      not).  The predecessor is pinned after ANY terminal, a failed validation
+      or a timeout included, so an authenticated delta alone does not show that
+      anyone reviewed those bytes.
+
+    Anything less renders nothing, so the prompt keeps the hunk surface every
+    round already states; the hunks stay in the packet as context.
+    """
+
+    candidate = packet.get("candidate")
+    delta = candidate.get("delta") if isinstance(candidate, Mapping) else None
+    if not isinstance(delta, Mapping) or delta.get("rework_delta_complete") is not True:
+        return ""
+    rows = delta.get("paths")
+    if not isinstance(rows, Mapping) or not rows or not all(
+        isinstance(row, Mapping) and isinstance(row.get("rework_hunks"), str)
+        for row in rows.values()
+    ):
+        return ""
+    if not any(row["rework_hunks"] for row in rows.values()):
+        return ""
+    if not _lens_reviewed_predecessor(packet, lens, delta.get("predecessor_request_id")):
+        return ""
+    return REWORK_DELTA_REVIEW_INSTRUCTION
+
+
 def build_review_prompt(
     packet: Mapping[str, Any],
     *,
@@ -932,24 +1084,33 @@ def build_review_prompt(
     overlay_instruction = _omitted_hunk_overlay_instruction(
         packet, packet_digest=packet_digest
     )
+    rework_instruction = _rework_delta_instruction(packet, lens=lens)
     unread_evidence = (
         "changed-segment evidence for any changed path that is still missing "
         "or stale after the omitted-hunk inspection below"
         if overlay_instruction
         else "missing or stale changed-segment evidence for any changed path"
     )
+    # A narrowed rework round's rework_hunks already carry every line under
+    # review and its instruction says an omitted source_evidence hunk is neither
+    # read nor escalated, so the fail-closed sentence must not demand the
+    # opposite there: it names known_unknowns alone.  Every other prompt keeps
+    # its changed-segment clause, byte for byte.
+    unread_clause = "" if rework_instruction else f", or {unread_evidence},"
     scope_instruction = (
         f"candidate.scoped_audits.{lens} is the graph-scoped audit for this "
         "lens: use it as the primary behavior boundary and treat its "
         "known_unknowns as explicit limits.\n"
-        "Review boundary, in order: first the authenticated changed hunks in "
-        "candidate.source_evidence[*].segments; then only the graph-connected "
-        "affected callers and tests the scoped audit lists; then its explicit "
-        "known_unknowns. Review exactly that bounded delta: do not re-read "
-        "whole files and do not scan the whole repository.\n"
-        "Fail closed on unknowns: a non-empty known_unknowns list, or "
-        f"{unread_evidence}, must be escalated as a process_limit finding and "
-        f"can never support a clean result.\n{unchanged_instruction}"
+        "Review boundary, in order: first the authenticated changed hunks of "
+        "the review surface above; then only the graph-connected affected "
+        "callers and tests the scoped audit lists, and only for a hunk that "
+        "changes a signature, return value, raised exception, persisted "
+        "format or other contract; then its explicit known_unknowns. Review "
+        "exactly that bounded delta: do not re-read whole files and do not "
+        "scan the whole repository.\n"
+        f"Fail closed on unknowns: a non-empty known_unknowns list{unread_clause} "
+        "must be escalated as a process_limit finding and can never support a "
+        f"clean result.\n{unchanged_instruction}"
         if active_scope is not None
         else ""
     )
@@ -1011,11 +1172,13 @@ def build_review_prompt(
         "You are an independent, strictly read-only quality reviewer.\n"
         f"Review lens: {lens}.\n"
         "Judge the candidate from the deterministic packet below; the exact "
-        "candidate workspace is there for what the packet marks incomplete and "
-        "for context beyond it, not to re-read what the packet already carries. "
+        "candidate workspace is there only for what the packet marks "
+        "incomplete, not to re-read what the packet already carries. "
         "You are intentionally not given the worker's rationale, self-verdict, or final answer. "
         "Do not write, edit, format, or delete repository files.\n"
         f"{amendment_instruction}"
+        f"{HUNK_REVIEW_SURFACE_INSTRUCTION}"
+        f"{rework_instruction}"
         f"{scope_instruction}"
         f"{overlay_instruction}"
         f"{_ALREADY_ESTABLISHED_MECHANICALLY}"
@@ -2584,8 +2747,24 @@ def _candidate_delta_rows(
 
     The basis is the predecessor's ``changed_path_hashes`` on the card: a path
     is ``unchanged_since_reviewed`` when its candidate sha256 equals the
-    predecessor's.  That is the only fact this record asserts -- it carries no
-    prior report, verdict or line map.
+    predecessor's.  That is the only fact the base record asserts -- it carries
+    no prior report, verdict or line map.
+
+    A rework round whose predecessor's sealed delta authenticated adds two
+    keys: ``rework_delta_complete`` and, per path, ``rework_hunks`` -- the
+    predecessor->candidate unified diff (see ``rework_delta_hunks``), at most
+    ``MAX_REWORK_HUNKS_CHARS`` across all paths.  Both are carried only when
+    supplied, so a delta without them is unchanged byte for byte, and they are
+    all or nothing: complete means every path carries its hunks, anything else
+    means none does, because a partial delta would tell the reviewer that
+    lines it never saw were already reviewed.  Complete describes the delta
+    alone: whether a lens already reviewed the predecessor is decided per lens,
+    from ``prior_review``, when the prompt is built.
+
+    An incomplete delta may add ``rework_delta_fallback_reason``, a short
+    diagnostic code for why no hunks were sealed (cut to
+    ``MAX_REWORK_FALLBACK_REASON_CHARS``).  A complete delta cannot carry one,
+    and it never changes what the reviewer is told.
     """
 
     if not isinstance(value, Mapping):
@@ -2595,6 +2774,17 @@ def _candidate_delta_rows(
     )
     paths = value.get("paths")
     if not isinstance(paths, Mapping) or set(paths) != changed_paths:
+        raise ReviewerEvidenceError("invalid_candidate_delta")
+    rework_complete = value.get("rework_delta_complete", False)
+    if not isinstance(rework_complete, bool):
+        raise ReviewerEvidenceError("invalid_candidate_delta")
+    fallback_reason = value.get("rework_delta_fallback_reason")
+    if fallback_reason is not None and (
+        "rework_delta_complete" not in value
+        or rework_complete
+        or not isinstance(fallback_reason, str)
+        or not fallback_reason
+    ):
         raise ReviewerEvidenceError("invalid_candidate_delta")
     rows: dict[str, dict[str, Any]] = {}
     for path in sorted(paths):
@@ -2614,12 +2804,116 @@ def _candidate_delta_rows(
             "unchanged_since_reviewed": unchanged,
             "predecessor_sha256": predecessor_digest,
         }
-    return {
+        if "rework_hunks" in row:
+            if not isinstance(row["rework_hunks"], str):
+                raise ReviewerEvidenceError("invalid_candidate_delta")
+            rows[path]["rework_hunks"] = row["rework_hunks"]
+    hunks = [row["rework_hunks"] for row in rows.values() if "rework_hunks" in row]
+    if (
+        len(hunks) != (len(rows) if rework_complete else 0)
+        or sum(map(len, hunks)) > MAX_REWORK_HUNKS_CHARS
+    ):
+        raise ReviewerEvidenceError("invalid_candidate_delta")
+    delta: dict[str, Any] = {
         "schema_id": CANDIDATE_DELTA_SCHEMA_ID,
         "basis": "changed_path_hashes",
         "predecessor_request_id": predecessor_request_id,
         "paths": rows,
     }
+    if "rework_delta_complete" in value:
+        delta["rework_delta_complete"] = rework_complete
+    if fallback_reason is not None:
+        delta["rework_delta_fallback_reason"] = fallback_reason[:MAX_REWORK_FALLBACK_REASON_CHARS]
+    return delta
+
+
+_NO_NEWLINE_MARKER = "\\ No newline at end of file\n"
+
+
+def _diff_lines(data: bytes) -> list[str]:
+    """Split UTF-8 ``data`` into diff lines, marking a last line with no newline.
+
+    A line ends at ``"\\n"`` and nowhere else, so a hunk's ``@@`` numbers are the
+    numbers the file really has: ``str.splitlines`` would also break at a form
+    feed, a vertical tab, U+001C-U+001E, U+0085, U+2028, U+2029 and a bare
+    carriage return, and every number after the first of those would drift.  A
+    carriage return ahead of the newline stays inside its line, byte for byte.
+
+    The standard marker line rides inside that last line, as GNU diff writes it
+    after it: ``difflib`` then sees ``b`` and ``b\\n`` as different lines and
+    emits the marker exactly where a file really ends without a newline, after a
+    changed line and a context line alike.
+    """
+
+    *terminated, tail = data.decode("utf-8").split("\n")
+    lines = [line + "\n" for line in terminated]
+    if tail:
+        lines.append(tail + "\n" + _NO_NEWLINE_MARKER)
+    return lines
+
+
+def rework_delta_hunks(
+    predecessor: Mapping[str, bytes | None],
+    candidate_root: Path,
+    candidate_hashes: Mapping[str, str | None],
+) -> dict[str, str] | None:
+    """Diff every changed path from the predecessor's bytes to the candidate's.
+
+    ``predecessor`` maps each path the predecessor changed to its authenticated
+    bytes (``None``: the predecessor deleted it).  ``candidate_hashes`` are the
+    sha256 digests the packet seals for this candidate; the bytes are read from
+    ``candidate_root`` and re-hashed against them, so a hunk always describes
+    exactly the sealed bytes.  A path with identical bytes gets ``""``; any
+    other gets ``difflib.unified_diff(..., n=3)`` as one newline-terminated
+    string over lines that end at ``"\\n"`` alone (see ``_diff_lines``), so its
+    ``@@`` numbers are the file's own.  A last line without a newline is
+    followed by the ``\\ No newline at end of file`` marker line, so that fact
+    is kept rather than silently repaired.
+
+    ``None`` -- for the whole delta, never a subset -- when a path was not
+    changed by the predecessor (its baseline bytes are not in the sealed delta),
+    is not a plain file beneath ``candidate_root`` (absent, behind a symlink, or
+    resolving outside it), drifted from its sealed digest or is not UTF-8, or
+    when the hunks together exceed ``MAX_REWORK_HUNKS_CHARS``.  The cap is
+    checked as each diff line is produced, so a runaway diff stops there instead
+    of being built in full first; the size of the inputs alone never refuses a
+    path.  Reads only.
+    """
+
+    hunks: dict[str, str] = {}
+    total = 0
+    for path, digest in sorted(candidate_hashes.items()):
+        if path not in predecessor:
+            return None
+        before = predecessor[path]
+        if (None if before is None else hashlib.sha256(before).hexdigest()) == digest:
+            hunks[path] = ""
+            continue
+        after: bytes | None = None
+        try:
+            if digest is not None:
+                source = candidate_root / path
+                if (
+                    _has_symlink_component(candidate_root, path)
+                    or not source.is_file()
+                    or not source.resolve().is_relative_to(candidate_root.resolve())
+                ):
+                    return None
+                after = source.read_bytes()
+                if hashlib.sha256(after).hexdigest() != digest:
+                    return None
+            old = _diff_lines(before or b"")
+            new = _diff_lines(after or b"")
+        except (OSError, UnicodeDecodeError):
+            return None
+        parts: list[str] = []
+        for line in difflib.unified_diff(old, new, n=3):
+            total += len(line)
+            if total > MAX_REWORK_HUNKS_CHARS:
+                return None
+            parts.append(line)
+        hunks[path] = "".join(parts)
+    return hunks
 
 
 def _manager_amendment_section(value: object) -> dict[str, str] | None:
@@ -3203,6 +3497,7 @@ def plan_supplemental_inspection(
 __all__ = [
     "PACKET_SCHEMA_ID",
     "RECEIPT_SCHEMA_ID",
+    "MAX_REWORK_HUNKS_CHARS",
     "MAX_SOURCE_EVIDENCE_CHARS",
     "MAX_SOURCE_EVIDENCE_TOTAL_CHARS",
     "MAX_SUPPLEMENTAL_INSPECTION_ROUNDS",
@@ -3228,6 +3523,7 @@ __all__ = [
     "candidate_hunk_inspection_coverage",
     "normalize_packet_findings",
     "plan_supplemental_inspection",
+    "rework_delta_hunks",
     "verify_review_packet_candidate",
     "verify_reviewer_receipt",
 ]

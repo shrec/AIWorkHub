@@ -306,10 +306,80 @@ class TestBuildReviewPrompt:
 
         assert quality_reviewer.EXHAUSTIVE_SINGLE_PASS_INSTRUCTION in prompt
         assert "Review exhaustively in a single pass" in prompt
-        assert "whole changed scope and its adjacent failure modes" in prompt
-        assert "list every defect you find" in prompt
+        # NF-2026-01093 scoped the single pass to the review surface: every
+        # changed hunk and every defect those changed lines introduce.
+        assert "every changed hunk on the review surface" in prompt
+        assert "every defect those changed lines introduce" in prompt
+        assert "list every defect you find, at every severity" in prompt
         assert "in this one report" in prompt
         assert "Do not stop at the first defect" in prompt
+        assert "do not hold findings back for a later round" in prompt
+
+    @pytest.mark.parametrize("lens", ["correctness", "security", "code_quality"])
+    @pytest.mark.parametrize("scoped", [True, False], ids=["scoped", "unscoped"])
+    def test_every_prompt_states_the_hunk_review_surface(self, lens, scoped):
+        """NF-2026-01093: the surface is what the worker wrote, in EVERY prompt.
+
+        Measured: correctness reviews took 13-20 minutes on small diffs and one
+        timed out at 1800 s; one reviewer made 60 whole-file reads and 78 shell
+        searches, another spent 45K thinking tokens enumerating failure modes
+        beyond the change.  The statement does not wait for a scoped audit.
+        """
+        packet = (
+            _packet_with_findings()
+            if scoped
+            else quality_reviewer.build_review_packet(
+                request_id="req1",
+                task_id="task1",
+                claim_epoch=1,
+                worker_provider="adapter-a",
+                changed_path_hashes={"src/module.py": "a" * 64},
+            )
+        )
+
+        prompt = quality_reviewer.build_review_prompt(packet, lens=lens)
+
+        surface = quality_reviewer.HUNK_REVIEW_SURFACE_INSTRUCTION
+        assert prompt.count(surface) == 1
+        for stated in (
+            "the '+'/'-' lines of candidate.source_evidence",
+            "unchanged context lines are not review surface",
+            "signature, return value, raised exception, persisted format or other contract",
+            "candidate.caller_context and the scoped audit, not by opening files",
+            "Do not read whole files and do not search the repository",
+            "Open the workspace only for hunks the packet marks omitted "
+            "(diff_complete false), and only those line ranges",
+        ):
+            assert stated in surface
+        assert (
+            "candidate workspace is there only for what the packet marks incomplete"
+            in prompt
+        )
+        lowered = prompt.lower()
+        for removed in ("adjacent failure modes", "whole changed scope", "context beyond it"):
+            assert removed not in lowered
+
+    def test_review_boundary_agrees_with_the_hunk_review_surface(self):
+        prompt = quality_reviewer.build_review_prompt(
+            _packet_with_findings(), lens="correctness"
+        )
+
+        boundary = prompt[
+            prompt.index("Review boundary") : prompt.index("Fail closed on unknowns")
+        ]
+        # The boundary defers to the surface stated above it, so a rework round's
+        # narrower surface never meets a second, conflicting definition.
+        assert "the authenticated changed hunks of the review surface above" in boundary
+        assert prompt.index(quality_reviewer.HUNK_REVIEW_SURFACE_INSTRUCTION) < prompt.index(
+            "Review boundary"
+        )
+        assert (
+            "only for a hunk that changes a signature, return value, raised "
+            "exception, persisted format or other contract"
+        ) in boundary
+        # The unconditional "callers and tests the scoped audit lists" is gone.
+        assert "audit lists; then its explicit" not in boundary
+        assert "do not re-read whole files" in boundary
 
     @pytest.mark.parametrize("lens", ["correctness", "security", "code_quality"])
     def test_prompt_delivers_the_lens_scope_once_inside_the_sealed_packet(self, lens):
@@ -3007,6 +3077,27 @@ def test_overlay_instruction_verifies_path_and_digest_before_reading_and_stays_e
         "File process_limit only when a listed path's overlay is unreachable, "
         "missing, stale or fails step 1"
     ) in block
+
+
+def test_overlay_step_reads_only_the_omitted_line_ranges_under_the_surface_rule():
+    """NF-2026-01093: the omitted-hunk read obeys the same review-surface rule.
+
+    Step 2 used to allow "the graph-connected callers and tests of those hunks"
+    after the hunk itself, which contradicted opening the workspace only for
+    the omitted line ranges.
+    """
+    packet = quality_reviewer.build_lens_packet(_nf931_packet(), lens="correctness")
+
+    prompt = quality_reviewer.build_review_prompt(packet, lens="correctness")
+
+    start = prompt.index("OMITTED CHANGED HUNKS.")
+    block = prompt[start : prompt.index("The packet is deterministic evidence", start)]
+    assert (
+        "and only those line ranges; a caller or test of those hunks is in scope "
+        "only under the review surface rule above"
+    ) in block
+    assert "only the graph-connected callers and tests of those hunks" not in prompt
+    assert prompt.index(quality_reviewer.HUNK_REVIEW_SURFACE_INSTRUCTION) < start
 
 
 def test_known_unknowns_still_escalate_beside_the_overlay_instruction():

@@ -7094,9 +7094,11 @@ class ProcessManager:
             )
         return {"rows": rows, "complete": omitted == 0, "omitted": omitted}
 
-    @staticmethod
     def _quality_review_candidate_delta(
-        card: Mapping[str, Any], current_hashes: Mapping[str, str | None]
+        self,
+        card: Mapping[str, Any],
+        current_hashes: Mapping[str, str | None],
+        workspace: WorkerWorkspace,
     ) -> dict[str, Any] | None:
         """Mark which changed paths are byte-identical to the reviewed predecessor.
 
@@ -7104,9 +7106,21 @@ class ProcessManager:
         card against the current candidate's hashes.  Measured 2026-09-08:
         80% of lens launches target rework candidates and 34.6% of their
         changed paths are byte-identical to the predecessor.  Predecessor
-        worktrees are retired, so this records only hash identity -- never a
-        hunk diff against the predecessor and never a prior report.  ``None``
-        when the card names no well-formed predecessor.
+        worktrees are retired, so hash identity is all that survives of them
+        unless the card carries their sealed ``delta_artifact``.  That is
+        authenticated read-only -- no worktree argument, so nothing is written
+        -- and, when it verifies, ``rework_delta_complete`` is true and each
+        path carries ``rework_hunks``: its predecessor->candidate unified diff
+        (``""`` if unchanged), the candidate bytes read from ``workspace``,
+        the workspace ``current_hashes`` were verified against.  Any failure
+        -- a missing, tampered or over-cap artifact, non-UTF-8 bytes, a path
+        the predecessor did not change -- leaves it false with no hunks and
+        with ``rework_delta_fallback_reason`` saying what failed.  Complete
+        vouches for the delta alone, not for a review: the predecessor is
+        pinned after any terminal, so whether a lens judged it is decided per
+        lens, from ``prior_review``, when that lens's prompt is built.  Never
+        a prior report.  ``None`` when the card names no well-formed
+        predecessor.
         """
 
         predecessor = card.get("rework_predecessor")
@@ -7127,7 +7141,43 @@ class ProcessManager:
                 "unchanged_since_reviewed": path in hashes and prior == current_hashes[path],
                 "predecessor_sha256": prior,
             }
-        return {"predecessor_request_id": request_id, "paths": paths}
+        artifact = predecessor.get("delta_artifact")
+        hunks: dict[str, str] | None = None
+        reason = "no_delta_artifact"
+        if artifact is not None:
+            reason = "rework_hunks_unavailable"
+            try:
+                hunks = quality_reviewer.rework_delta_hunks(
+                    dict(
+                        _worker_workspace.verify_rework_delta_artifact(
+                            artifact=artifact,
+                            authority_repo=Path(self.repo),
+                            request_id=request_id,
+                            task_id=str(predecessor.get("task_id") or ""),
+                            claim_epoch=predecessor.get("claim_epoch"),
+                            expected_path_hashes=dict(hashes),
+                            allowed_writes=tuple(map(str, card.get("allowed_writes") or ())),
+                        )
+                    ),
+                    Path(workspace.path),
+                    current_hashes,
+                )
+            except Exception as exc:  # noqa: BLE001 -- falls back to the hunk surface
+                # Only the verifier's own codes keep their message; any other
+                # error is named by class, so no path or payload rides along.
+                reason = f"delta_error:{type(exc).__name__}" + (
+                    f":{exc}" if isinstance(exc, WorkspaceError) else ""
+                )
+        for path, hunk in (hunks or {}).items():
+            paths[path]["rework_hunks"] = hunk
+        delta: dict[str, Any] = {
+            "predecessor_request_id": request_id,
+            "paths": paths,
+            "rework_delta_complete": hunks is not None,
+        }
+        if hunks is None:
+            delta["rework_delta_fallback_reason"] = reason
+        return delta
 
     # Bounds on what the prior-review section may cost.  Reviewer children are
     # read for ONE task id, the target's own terminal history for ONE task id,
@@ -7671,7 +7721,7 @@ class ProcessManager:
                 current_hashes, scoped_audits
             )
             candidate_delta = self._quality_review_candidate_delta(
-                card, current_hashes
+                card, current_hashes, workspace
             )
             prior_findings = self._quality_review_prior_findings(
                 target_task_id=target_task_id,

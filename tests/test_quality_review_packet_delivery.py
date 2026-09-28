@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -12,7 +13,7 @@ from aiworkhub import process_launcher
 from aiworkhub import quality_evidence as qe
 from aiworkhub import quality_review as qr
 from aiworkhub import quality_review_ingest
-from aiworkhub import quality_reviewer, runtime_adapters
+from aiworkhub import quality_reviewer, runtime_adapters, worker_workspace
 from aiworkhub import worker_ai_tools_mcp as worker_mcp
 
 CANDIDATE_PATH = "src/aiworkhub/quality_review.py"
@@ -923,7 +924,12 @@ def test_content_prompt_builder_adds_the_precedence_line_for_any_toolset(tools) 
 
 
 def _launched_review_packet(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **card_extra: object
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    rework_predecessor: Callable[[process_launcher.ProcessManager], dict[str, object]]
+    | None = None,
+    **card_extra: object,
 ) -> dict[str, object]:
     """Seal the packet ``ProcessManager._build_quality_review_packet`` builds.
 
@@ -931,6 +937,8 @@ def _launched_review_packet(
     ``test_quality_review_packet_binding_carries_explicit_target_inputs`` -- a
     review_ready target card, its retained workspace and its review_ready
     event -- but with the real packet builder in place of a kwargs spy.
+    ``rework_predecessor`` builds the card's predecessor from the manager, so a
+    sealed delta can be bound to that manager's repository.
     """
     from test_process_launcher import _card, _manager, _show
 
@@ -981,6 +989,8 @@ def _launched_review_packet(
             **card_extra,
         }
     )
+    if rework_predecessor is not None:
+        card["rework_predecessor"] = rework_predecessor(manager)
     manager._show_task = _show(lambda: card)
     manager._append_event(
         {
@@ -1046,3 +1056,453 @@ def test_a_first_attempt_card_yields_a_packet_with_no_manager_amendment(
     packet = _launched_review_packet(tmp_path, monkeypatch)
 
     assert "manager_amendment" not in packet
+
+
+# --- NF-2026-01093: the launcher authenticates the rework delta, read-only ----
+
+CHANGED_PATH = "src/changed.py"
+PREDECESSOR_REQUEST_ID = "d" * 32
+PREDECESSOR_SOURCE = b"value = 1\n"
+CANDIDATE_SOURCE = b"value = 2\n"
+CHANGED_HUNKS = "--- \n+++ \n@@ -1 +1 @@\n-value = 1\n+value = 2\n"
+
+
+def _sha256(data: bytes | None) -> str | None:
+    return None if data is None else hashlib.sha256(data).hexdigest()
+
+
+def _predecessor(
+    entries: dict[str, bytes | None] | None = None, **extra: object
+) -> dict[str, object]:
+    """The ``rework_predecessor`` a rejected card carries, before any delta is attached."""
+    entries = {CHANGED_PATH: PREDECESSOR_SOURCE} if entries is None else entries
+    return {
+        "request_id": PREDECESSOR_REQUEST_ID,
+        "task_id": TASK_ID,
+        "claim_epoch": 1,
+        "changed_path_hashes": {path: _sha256(data) for path, data in entries.items()},
+        **extra,
+    }
+
+
+def _sealed_predecessor(
+    manager: process_launcher.ProcessManager,
+    tmp_path: Path,
+    entries: dict[str, bytes | None] | None = None,
+) -> dict[str, object]:
+    """``_predecessor`` with its delta sealed on disk, bound to the manager's repository."""
+    entries = {CHANGED_PATH: PREDECESSOR_SOURCE} if entries is None else entries
+    artifact = worker_workspace.seal_rework_delta_artifact(
+        manager.repo,
+        TASK_ID,
+        PREDECESSOR_REQUEST_ID,
+        1,
+        entries.items(),
+        tmp_path / "rework_deltas",
+    )
+    return _predecessor(entries, delta_artifact=artifact)
+
+
+def _rework_review_setup(
+    tmp_path: Path,
+) -> tuple[process_launcher.ProcessManager, process_launcher.WorkerWorkspace]:
+    """A manager and a retained candidate workspace holding ``CANDIDATE_SOURCE``."""
+    from test_process_launcher import _manager
+
+    manager = _manager(
+        tmp_path,
+        show_task=lambda _task_id: {"returncode": 1, "stdout": "", "stderr": ""},
+        argv=[sys.executable, "-c", "pass"],
+    )
+    request_id = "e" * 32
+    path = tmp_path / "worktrees" / request_id / "worktree"
+    home = tmp_path / "worktrees" / request_id / "home"
+    (path / "src").mkdir(parents=True)
+    home.mkdir(parents=True)
+    (path / CHANGED_PATH).write_bytes(CANDIDATE_SOURCE)
+    workspace = process_launcher.WorkerWorkspace(
+        request_id=request_id,
+        repo=manager.repo,
+        path=path,
+        home=home,
+        allowed_writes=(CHANGED_PATH,),
+        parent_baseline={},
+        workspace_baseline={},
+    )
+    return manager, workspace
+
+
+def _launcher_delta(
+    manager: process_launcher.ProcessManager,
+    workspace: process_launcher.WorkerWorkspace,
+    predecessor: dict[str, object],
+    *allowed_writes: str,
+) -> dict[str, object]:
+    card = {
+        "allowed_writes": list(allowed_writes or (CHANGED_PATH,)),
+        "rework_predecessor": predecessor,
+    }
+    delta = manager._quality_review_candidate_delta(
+        card, {CHANGED_PATH: _sha256(CANDIDATE_SOURCE)}, workspace
+    )
+    assert delta is not None
+    return delta
+
+
+def _tree_snapshot(root: Path) -> list[tuple[str, int, int]]:
+    return sorted(
+        (path.relative_to(root).as_posix(), path.stat().st_size, path.stat().st_mtime_ns)
+        for path in root.rglob("*")
+    )
+
+
+def test_a_verified_predecessor_delta_yields_complete_hunks_against_the_candidate(
+    tmp_path: Path,
+) -> None:
+    manager, workspace = _rework_review_setup(tmp_path)
+    predecessor = _sealed_predecessor(manager, tmp_path)
+
+    delta = _launcher_delta(manager, workspace, predecessor)
+
+    assert delta == {
+        "predecessor_request_id": PREDECESSOR_REQUEST_ID,
+        "rework_delta_complete": True,
+        "paths": {
+            CHANGED_PATH: {
+                "unchanged_since_reviewed": False,
+                "predecessor_sha256": _sha256(PREDECESSOR_SOURCE),
+                "rework_hunks": CHANGED_HUNKS,
+            }
+        },
+    }
+
+
+def test_a_path_unchanged_since_the_predecessor_gets_an_empty_hunk(
+    tmp_path: Path,
+) -> None:
+    manager, workspace = _rework_review_setup(tmp_path)
+    predecessor = _sealed_predecessor(manager, tmp_path, {CHANGED_PATH: CANDIDATE_SOURCE})
+
+    delta = _launcher_delta(manager, workspace, predecessor)
+
+    assert delta["rework_delta_complete"] is True
+    assert delta["paths"][CHANGED_PATH]["unchanged_since_reviewed"] is True
+    assert delta["paths"][CHANGED_PATH]["rework_hunks"] == ""
+
+
+@pytest.mark.parametrize(
+    "card",
+    [
+        {},
+        {"rework_predecessor": _predecessor(request_id="")},
+        {"rework_predecessor": _predecessor(changed_path_hashes={CHANGED_PATH: "not-a-digest"})},
+    ],
+    ids=["no-predecessor", "no-request-id", "malformed-predecessor-hash"],
+)
+def test_a_card_without_a_well_formed_predecessor_has_no_delta(
+    tmp_path: Path, card: dict[str, object]
+) -> None:
+    manager, workspace = _rework_review_setup(tmp_path)
+
+    assert (
+        manager._quality_review_candidate_delta(
+            card, {CHANGED_PATH: _sha256(CANDIDATE_SOURCE)}, workspace
+        )
+        is None
+    )
+
+
+def _assert_hunk_surface_only(delta: dict[str, object], reason: str) -> None:
+    """The delta keeps its byte-identity facts, claims no rework hunks, and says why."""
+    assert delta["rework_delta_complete"] is False
+    assert delta["rework_delta_fallback_reason"] == reason
+    assert delta["predecessor_request_id"] == PREDECESSOR_REQUEST_ID
+    assert delta["paths"][CHANGED_PATH]["unchanged_since_reviewed"] is False
+    assert all("rework_hunks" not in row for row in delta["paths"].values())
+
+
+@pytest.mark.parametrize(
+    ("case", "reason"),
+    [
+        ("no-artifact", "no_delta_artifact"),
+        ("missing-artifact-file", "delta_error:WorkspaceError:rework_delta_artifact_missing"),
+    ],
+)
+def test_a_predecessor_delta_that_cannot_be_read_leaves_the_flag_false_with_no_hunks(
+    tmp_path: Path, case: str, reason: str
+) -> None:
+    manager, workspace = _rework_review_setup(tmp_path)
+    predecessor = _predecessor()
+    if case == "missing-artifact-file":
+        digest = "a" * 64
+        predecessor["delta_artifact"] = {
+            "path": str(tmp_path / "rework_deltas" / f"{digest}.json"),
+            "digest": digest,
+        }
+
+    delta = _launcher_delta(manager, workspace, predecessor)
+
+    _assert_hunk_surface_only(delta, reason)
+
+
+@pytest.mark.parametrize(
+    ("case", "reason"),
+    [
+        ("tampered-artifact", "delta_error:WorkspaceError:rework_delta_artifact_tampered"),
+        ("path-new-since-predecessor", "rework_hunks_unavailable"),
+        ("non-utf8-predecessor", "rework_hunks_unavailable"),
+        ("hunks-over-cap", "rework_hunks_unavailable"),
+    ],
+)
+def test_a_sealed_delta_that_cannot_be_proven_or_diffed_leaves_the_flag_false_with_no_hunks(
+    tmp_path: Path, case: str, reason: str
+) -> None:
+    manager, workspace = _rework_review_setup(tmp_path)
+    allowed = [CHANGED_PATH]
+    entries: dict[str, bytes | None] | None = None
+    if case == "path-new-since-predecessor":
+        entries = {"src/other.py": b"other\n"}
+        allowed.append("src/other.py")
+    elif case == "non-utf8-predecessor":
+        entries = {CHANGED_PATH: b"\xff\xfe"}
+    elif case == "hunks-over-cap":
+        entries = {CHANGED_PATH: b"x\n" * quality_reviewer.MAX_REWORK_HUNKS_CHARS}
+    predecessor = _sealed_predecessor(manager, tmp_path, entries)
+    if case == "tampered-artifact":
+        artifact_path = Path(predecessor["delta_artifact"]["path"])  # type: ignore[index]
+        artifact_path.write_bytes(artifact_path.read_bytes() + b" ")
+
+    delta = _launcher_delta(manager, workspace, predecessor, *allowed)
+
+    _assert_hunk_surface_only(delta, reason)
+
+
+def test_the_rework_delta_is_authenticated_read_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager, workspace = _rework_review_setup(tmp_path)
+    predecessor = _sealed_predecessor(manager, tmp_path)
+    calls: list[dict[str, object]] = []
+    real = worker_workspace.verify_rework_delta_artifact
+
+    def spy(*args: object, **kwargs: object) -> object:
+        assert not args
+        calls.append(kwargs)
+        return real(**kwargs)  # type: ignore[arg-type]
+
+    def refuse(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("a rework delta review must never materialize a worktree")
+
+    monkeypatch.setattr(worker_workspace, "verify_rework_delta_artifact", spy)
+    monkeypatch.setattr(worker_workspace, "materialize_rework_delta_artifact", refuse)
+    before = _tree_snapshot(tmp_path)
+
+    delta = _launcher_delta(manager, workspace, predecessor)
+
+    assert delta["rework_delta_complete"] is True
+    assert _tree_snapshot(tmp_path) == before
+    (kwargs,) = calls
+    # No ``worktree`` argument: the verifier proves the artifact and writes nothing.
+    assert "worktree" not in kwargs
+    assert kwargs["artifact"] == predecessor["delta_artifact"]
+    assert kwargs["authority_repo"] == manager.repo
+    assert kwargs["request_id"] == PREDECESSOR_REQUEST_ID
+    assert kwargs["task_id"] == TASK_ID
+    assert kwargs["claim_epoch"] == 1
+    assert kwargs["expected_path_hashes"] == predecessor["changed_path_hashes"]
+    assert kwargs["allowed_writes"] == (CHANGED_PATH,)
+
+
+def _predecessor_reviewed_by(
+    monkeypatch: pytest.MonkeyPatch,
+    *lenses: str,
+    target: str = PREDECESSOR_REQUEST_ID,
+    findings: dict[str, list[dict[str, object]]] | None = None,
+) -> None:
+    """Make the collector find a completed report by each lens on ``target``.
+
+    ``findings`` maps a lens to the findings its report filed; the default is none.
+
+    ``ProcessManager._prior_reviewer_receipts`` reads the task store, which a launch
+    test does not have, so this stands in with the reports a reviewed round leaves.
+    """
+
+    def receipts(
+        _manager: object, _task_id: str, _exclude_request_id: str
+    ) -> tuple[list[dict[str, object]], dict[str, dict[str, str | None]]]:
+        return (
+            [
+                {
+                    "lens": lens,
+                    "reviewer_task_id": f"reviewer-{lens}",
+                    "reviewer_request_id": f"rev-{lens}",
+                    "reviewer_provider": "reviewer_adapter",
+                    "packet_sha256": "",
+                    "target_request_id": target,
+                    "findings": (findings or {}).get(lens, []),
+                }
+                for lens in lenses
+            ],
+            {},
+        )
+
+    monkeypatch.setattr(process_launcher.ProcessManager, "_prior_reviewer_receipts", receipts)
+
+
+def _lens_prompts(packet: dict[str, object]) -> dict[str, str]:
+    """The prompt each lens receives: its own sliced packet, rendered."""
+    return {
+        lens: quality_reviewer.build_review_prompt(
+            quality_reviewer.build_lens_packet(packet, lens=lens), lens=lens
+        )
+        for lens in LENSES
+    }
+
+
+def test_the_launch_path_seals_the_authenticated_rework_delta_and_narrows_the_prompt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every lens reviewed the predecessor, so every lens narrows to the rework hunks."""
+    _predecessor_reviewed_by(monkeypatch, *LENSES)
+    packet = _launched_review_packet(
+        tmp_path,
+        monkeypatch,
+        rework_predecessor=lambda manager: _sealed_predecessor(manager, tmp_path),
+    )
+
+    delta = packet["candidate"]["delta"]
+    assert delta["rework_delta_complete"] is True
+    assert "rework_delta_fallback_reason" not in delta
+    assert delta["paths"][CHANGED_PATH]["rework_hunks"] == CHANGED_HUNKS
+    for prompt in _lens_prompts(packet).values():
+        assert quality_reviewer.HUNK_REVIEW_SURFACE_INSTRUCTION in prompt
+        assert quality_reviewer.REWORK_DELTA_REVIEW_INSTRUCTION in prompt
+
+
+def test_a_predecessor_without_a_sealed_delta_keeps_the_hunk_surface_end_to_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    packet = _launched_review_packet(
+        tmp_path, monkeypatch, rework_predecessor=lambda _manager: _predecessor()
+    )
+
+    delta = packet["candidate"]["delta"]
+    assert delta["rework_delta_complete"] is False
+    # The sealed packet says why narrowing was skipped, so a manager can see it.
+    assert delta["rework_delta_fallback_reason"] == "no_delta_artifact"
+    assert "rework_hunks" not in delta["paths"][CHANGED_PATH]
+    prompt = quality_reviewer.build_review_prompt(
+        quality_reviewer.build_lens_packet(packet, lens="correctness"),
+        lens="correctness",
+    )
+    assert quality_reviewer.HUNK_REVIEW_SURFACE_INSTRUCTION in prompt
+    assert quality_reviewer.REWORK_DELTA_REVIEW_INSTRUCTION not in prompt
+
+
+def test_a_first_attempt_card_yields_a_packet_with_no_delta_section(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    packet = _launched_review_packet(tmp_path, monkeypatch)
+
+    assert "delta" not in packet["candidate"]
+
+
+def test_a_sealed_delta_whose_predecessor_was_never_reviewed_narrows_no_lens(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A predecessor pinned after a failed validation or a timeout has no review to lean on."""
+    packet = _launched_review_packet(
+        tmp_path,
+        monkeypatch,
+        rework_predecessor=lambda manager: _sealed_predecessor(manager, tmp_path),
+    )
+
+    delta = packet["candidate"]["delta"]
+    assert delta["rework_delta_complete"] is True
+    assert delta["paths"][CHANGED_PATH]["rework_hunks"] == CHANGED_HUNKS
+    assert "prior_review" not in packet
+    for prompt in _lens_prompts(packet).values():
+        # The hunks stay in the packet as context; no lens is told to skip the rest.
+        assert quality_reviewer.HUNK_REVIEW_SURFACE_INSTRUCTION in prompt
+        assert quality_reviewer.REWORK_DELTA_REVIEW_INSTRUCTION not in prompt
+
+
+def test_only_a_lens_that_reviewed_the_predecessor_gets_the_narrowed_surface(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _predecessor_reviewed_by(monkeypatch, "correctness")
+
+    packet = _launched_review_packet(
+        tmp_path,
+        monkeypatch,
+        rework_predecessor=lambda manager: _sealed_predecessor(manager, tmp_path),
+    )
+
+    assert set(packet["prior_review"]["lenses"]) == {"correctness"}
+    prompts = _lens_prompts(packet)
+    assert quality_reviewer.REWORK_DELTA_REVIEW_INSTRUCTION in prompts["correctness"]
+    for lens in ("security", "code_quality"):
+        assert quality_reviewer.REWORK_DELTA_REVIEW_INSTRUCTION not in prompts[lens]
+        assert quality_reviewer.HUNK_REVIEW_SURFACE_INSTRUCTION in prompts[lens]
+
+
+def test_a_lens_that_filed_a_process_limit_on_the_predecessor_keeps_the_hunk_surface(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reviewer that could not read its packet judged nothing, so nothing was reviewed."""
+    blind = {
+        "id": "blind-1",
+        "severity": "low",
+        "disposition": "process_limit",
+        "actionable": False,
+        "summary": "the packet could not be read",
+    }
+    _predecessor_reviewed_by(
+        monkeypatch, "correctness", "security", findings={"correctness": [blind]}
+    )
+
+    packet = _launched_review_packet(
+        tmp_path,
+        monkeypatch,
+        rework_predecessor=lambda manager: _sealed_predecessor(manager, tmp_path),
+    )
+
+    assert set(packet["prior_review"]["lenses"]) == {"correctness", "security"}
+    prompts = _lens_prompts(packet)
+    assert quality_reviewer.REWORK_DELTA_REVIEW_INSTRUCTION in prompts["security"]
+    assert quality_reviewer.REWORK_DELTA_REVIEW_INSTRUCTION not in prompts["correctness"]
+    assert quality_reviewer.HUNK_REVIEW_SURFACE_INSTRUCTION in prompts["correctness"]
+
+
+def test_a_report_on_an_earlier_round_does_not_narrow_the_surface(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every lens reviewed round one, but the sealed delta starts from round two."""
+    _predecessor_reviewed_by(monkeypatch, *LENSES, target="c" * 32)
+
+    packet = _launched_review_packet(
+        tmp_path,
+        monkeypatch,
+        rework_predecessor=lambda manager: _sealed_predecessor(manager, tmp_path),
+    )
+
+    assert set(packet["prior_review"]["lenses"]) == set(LENSES)
+    for prompt in _lens_prompts(packet).values():
+        assert quality_reviewer.REWORK_DELTA_REVIEW_INSTRUCTION not in prompt
+
+
+def test_an_unexpected_verifier_error_is_named_by_class_and_never_by_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager, workspace = _rework_review_setup(tmp_path)
+    predecessor = _sealed_predecessor(manager, tmp_path)
+
+    def explode(**_kwargs: object) -> object:
+        raise RuntimeError(f"cannot open {tmp_path}")
+
+    monkeypatch.setattr(worker_workspace, "verify_rework_delta_artifact", explode)
+
+    delta = _launcher_delta(manager, workspace, predecessor)
+
+    _assert_hunk_surface_only(delta, "delta_error:RuntimeError")
+    assert str(tmp_path) not in json.dumps(delta)
