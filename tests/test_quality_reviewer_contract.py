@@ -1696,7 +1696,7 @@ def test_invalid_then_different_invalid_returns_the_exact_second_error(
     assert _verified_payloads(ctx) == []
 
 
-def test_audit_unavailable_submission_fails_closed_after_one_correction(
+def test_audit_unavailable_submission_fails_closed_after_the_durability_bound(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     ctx, packet = _submit_context(tmp_path)
@@ -1706,20 +1706,30 @@ def test_audit_unavailable_submission_fails_closed_after_one_correction(
 
     monkeypatch.setattr(worker_tools, "_append_line_0600", fail_append)
 
+    # A ledger fault is not the reviewer's doing: it spends no correction and
+    # is bounded by the durability bound instead.
     first = _submit(ctx, packet, [_in_scope_finding("unauthenticated")])
     assert first["ok"] is False
     assert first["reason"] == "quality_review_submission_not_durable"
     assert first["durable"] is False
-    assert first["attempt"] == 1
-    assert first["corrections_remaining"] == 1
+    assert first["durability_branch"] == "audit_append_failed"
+    assert first["attempt"] == 0
+    assert first["corrections_remaining"] == 2
     assert first["terminal"] is False
+    assert first["retry_requires_identical_receipt"] is True
 
     second = _submit(ctx, packet, [_in_scope_finding("unauthenticated")])
     assert second["reason"] == "quality_review_submission_not_durable"
+    assert second["durability_branch"] == "audit_append_failed"
+    assert second["attempt"] == 0
+    assert second["corrections_remaining"] == 0
     assert second["terminal"] is True
+    assert "retry_requires_identical_receipt" not in second
 
     third = _submit(ctx, packet, [_in_scope_finding("unauthenticated")])
     assert third["reason"] == "quality_review_correction_retry_exhausted"
+    assert third["durability_branch"] == "audit_append_failed"
+    assert third["corrections_remaining"] == 0
     assert third["terminal"] is True
     assert _verified_payloads(ctx) == []
 
@@ -1777,6 +1787,312 @@ def test_audit_tampered_submission_is_never_acknowledged(tmp_path: Path) -> None
     third = _submit(ctx, packet, [_in_scope_finding("real")])
     assert third["reason"] == "quality_review_correction_retry_exhausted"
     assert third["terminal"] is True
+
+
+def _arm_read_back_fault(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fail the first ledger read that follows a receipt landing with ok=true."""
+    real_append = worker_tools._append_line_0600
+    real_verify = worker_tools.verify_audit_ledger
+    landed: list[bool] = []
+
+    def append_then_arm(path: Path, line: str) -> None:
+        real_append(path, line)
+        if '"ok": true' in line:
+            landed.append(True)
+
+    def faulty_read_back(ledger: Path, key: Path, **identity: str) -> dict[str, object]:
+        report = real_verify(ledger, key, **identity)
+        if landed:
+            landed.clear()
+            return {**report, "ok": False, "reason": "audit_ledger_unreadable"}
+        return report
+
+    monkeypatch.setattr(worker_tools, "_append_line_0600", append_then_arm)
+    monkeypatch.setattr(worker_tools, "verify_audit_ledger", faulty_read_back)
+
+
+def _fault_audit_append_failed(
+    ctx: worker_tools.WorkerToolContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fail_append(_path: Path, _line: str) -> None:
+        raise PermissionError("simulated denied audit append")
+
+    monkeypatch.setattr(worker_tools, "_append_line_0600", fail_append)
+
+
+def _fault_ledger_verify_not_ok(
+    ctx: worker_tools.WorkerToolContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _arm_read_back_fault(monkeypatch)
+
+
+def _fault_ledger_tampered(
+    ctx: worker_tools.WorkerToolContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ctx.audit_ledger_path.write_text(
+        _r4_signed_line(_r4_entry(), tamper=True), encoding="utf-8"
+    )
+
+
+def _fault_payload_not_persisted(
+    ctx: worker_tools.WorkerToolContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The append reports success but nothing lands in the ledger.
+    monkeypatch.setattr(worker_tools, "_append_line_0600", lambda _path, _line: None)
+
+
+_NOT_DURABLE_FAULTS = {
+    "audit_append_failed": _fault_audit_append_failed,
+    "ledger_verify_not_ok": _fault_ledger_verify_not_ok,
+    "ledger_tampered": _fault_ledger_tampered,
+    "payload_not_persisted": _fault_payload_not_persisted,
+}
+
+
+@pytest.mark.parametrize("branch", list(_NOT_DURABLE_FAULTS))
+def test_not_durable_branch_spends_no_correction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, branch: str,
+) -> None:
+    ctx, packet = _submit_context(tmp_path)
+    _NOT_DURABLE_FAULTS[branch](ctx, monkeypatch)
+
+    # One correction is already spent on a reviewer-caused rejection, so equal
+    # to the values before the call is more than the untouched defaults.
+    rejected = _submit(ctx, packet, [_out_of_scope_finding()])
+    assert rejected["reason"] == "review_finding_0_path_out_of_scope"
+    assert (rejected["attempt"], rejected["corrections_remaining"]) == (1, 1)
+
+    result = _submit(ctx, packet, [_in_scope_finding("persist")])
+    assert result["ok"] is False
+    assert result["durable"] is False
+    assert result["reason"] == "quality_review_submission_not_durable"
+    assert result["durability_branch"] == branch
+    assert result["attempt"] == rejected["attempt"]
+    assert result["corrections_remaining"] == rejected["corrections_remaining"]
+    assert result["terminal"] is False
+    assert result["retry_requires_identical_receipt"] is True
+    assert worker_tools._spent_submit_attempts(ctx, "quality_review_submit") == 1
+
+
+def test_durability_bound_ends_the_run_without_further_appends(
+    tmp_path: Path,
+) -> None:
+    ctx, packet = _submit_context(tmp_path)
+    # A forged line makes every append land yet never be durable.
+    ctx.audit_ledger_path.write_text(
+        _r4_signed_line(_r4_entry(), tamper=True), encoding="utf-8"
+    )
+
+    charged = _submit(ctx, packet, [_out_of_scope_finding()])
+    assert (charged["attempt"], charged["corrections_remaining"]) == (1, 1)
+
+    first = _submit(ctx, packet, [_in_scope_finding("real")])
+    assert first["durability_branch"] == "ledger_tampered"
+    assert (first["attempt"], first["corrections_remaining"]) == (1, 1)
+    assert first["terminal"] is False
+
+    # The second persistence failure is terminal, and a terminal result never
+    # reports a correction left -- although one was never spent.
+    second = _submit(ctx, packet, [_in_scope_finding("real")])
+    assert second["reason"] == "quality_review_submission_not_durable"
+    assert (second["attempt"], second["corrections_remaining"]) == (1, 0)
+    assert second["terminal"] is True
+
+    landed = ctx.audit_ledger_path.read_text(encoding="utf-8")
+    for _ in range(2):
+        later = _submit(ctx, packet, [_in_scope_finding("real")])
+        assert later["reason"] == "quality_review_correction_retry_exhausted"
+        assert later["corrections_remaining"] == 0
+        assert later["terminal"] is True
+        assert later["durability_branch"] == "ledger_tampered"
+    assert ctx.audit_ledger_path.read_text(encoding="utf-8") == landed
+
+
+def _fault_ledger_unreadable(
+    ctx: worker_tools.WorkerToolContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ctx.audit_ledger_path.unlink()
+
+
+_EMPTY_REPORT_LEDGER_FAULTS = {
+    "ledger_verify_not_ok": _fault_ledger_unreadable,
+    "ledger_tampered": _fault_ledger_tampered,
+}
+
+
+@pytest.mark.parametrize("branch", list(_EMPTY_REPORT_LEDGER_FAULTS))
+def test_empty_report_on_an_unverifiable_ledger_spends_no_correction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, branch: str,
+) -> None:
+    ctx, packet = _submit_context(tmp_path)
+    # One correction is already spent on a reviewer-caused rejection, so equal
+    # to the values before the call is more than the untouched defaults.
+    rejected = _submit(ctx, packet, [_out_of_scope_finding()])
+    assert (rejected["attempt"], rejected["corrections_remaining"]) == (1, 1)
+
+    # A ledger that cannot be verified cannot show whether a rejected intent
+    # came first: the empty report is refused all the same, but the fault is
+    # the supervisor's, so it is a persistence failure and not a correction.
+    _EMPTY_REPORT_LEDGER_FAULTS[branch](ctx, monkeypatch)
+    empty = _submit(ctx, packet, [])
+    assert empty["ok"] is False
+    assert empty["reason"] == "quality_review_submission_not_durable"
+    assert empty["durable"] is False
+    assert empty["durability_branch"] == branch
+    assert len(empty["submission_id"]) == 64
+    assert (empty["attempt"], empty["corrections_remaining"]) == (1, 1)
+    assert empty["terminal"] is False
+    assert empty["retry_requires_identical_receipt"] is True
+    assert "rejected_intent_sha256" not in empty
+    assert worker_tools._spent_submit_attempts(ctx, "quality_review_submit") == 1
+    assert _verified_payloads(ctx) == []
+
+
+def test_empty_report_durability_failures_end_the_run_without_appends(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx, packet = _submit_context(tmp_path)
+    _fault_ledger_tampered(ctx, monkeypatch)
+    landed = ctx.audit_ledger_path.read_text(encoding="utf-8")
+
+    first = _submit(ctx, packet, [])
+    assert first["reason"] == "quality_review_submission_not_durable"
+    assert first["durability_branch"] == "ledger_tampered"
+    assert (first["attempt"], first["corrections_remaining"]) == (0, 2)
+    assert first["terminal"] is False
+    assert first["retry_requires_identical_receipt"] is True
+
+    # The second persistence failure is terminal, and a terminal result never
+    # reports a correction left -- although none was ever spent.
+    second = _submit(ctx, packet, [])
+    assert second["reason"] == "quality_review_submission_not_durable"
+    assert second["durability_branch"] == "ledger_tampered"
+    assert (second["attempt"], second["corrections_remaining"]) == (0, 0)
+    assert second["terminal"] is True
+    assert "retry_requires_identical_receipt" not in second
+
+    for _ in range(2):
+        later = _submit(ctx, packet, [])
+        assert later["reason"] == "quality_review_correction_retry_exhausted"
+        assert later["corrections_remaining"] == 0
+        assert later["terminal"] is True
+        assert later["durability_branch"] == "ledger_tampered"
+    # Every refusal came before anything was appended: no receipt, no charge.
+    assert ctx.audit_ledger_path.read_text(encoding="utf-8") == landed
+
+
+def test_empty_and_nonempty_persistence_failures_share_one_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx, packet = _submit_context(tmp_path)
+    _fault_ledger_tampered(ctx, monkeypatch)
+
+    empty = _submit(ctx, packet, [])
+    assert empty["durability_branch"] == "ledger_tampered"
+    assert empty["terminal"] is False
+
+    nonempty = _submit(ctx, packet, [_in_scope_finding("real")])
+    assert nonempty["reason"] == "quality_review_submission_not_durable"
+    assert nonempty["durability_branch"] == "ledger_tampered"
+    assert (nonempty["attempt"], nonempty["corrections_remaining"]) == (0, 0)
+    assert nonempty["terminal"] is True
+
+
+def test_empty_report_after_a_verified_rejected_intent_is_still_charged(
+    tmp_path: Path,
+) -> None:
+    ctx, packet = _submit_context(tmp_path)
+    rejected = _submit(ctx, packet, [_out_of_scope_finding()])
+    assert (rejected["attempt"], rejected["corrections_remaining"]) == (1, 1)
+
+    # The ledger verifies and shows the rejected intent: that is the reviewer's
+    # doing, so the empty report spends the last correction, as before.
+    empty = _submit(ctx, packet, [])
+    assert empty["reason"] == "quality_review_empty_after_rejected_intent"
+    assert empty["rejected_intent_authenticated"] is True
+    assert (empty["attempt"], empty["corrections_remaining"]) == (2, 0)
+    assert empty["terminal"] is True
+    assert "durability_branch" not in empty
+    assert worker_tools._durability_failures(ctx, "quality_review_submit") == []
+    assert _verified_payloads(ctx) == []
+
+
+def test_not_durable_retry_must_resubmit_the_identical_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx, packet = _submit_context(tmp_path)
+    _arm_read_back_fault(monkeypatch)
+
+    first = _submit(ctx, packet, [_in_scope_finding("landed")])
+    assert first["reason"] == "quality_review_submission_not_durable"
+    assert first["terminal"] is False
+    assert first["retry_requires_identical_receipt"] is True
+
+    # The receipt may have landed, so a changed report conflicts with it: it is
+    # refused and charged like any other reviewer-caused rejection.
+    changed = _submit(ctx, packet, [_in_scope_finding("changed")])
+    assert changed["ok"] is False
+    assert changed["reason"] == "quality_review_submission_conflict"
+    assert (changed["attempt"], changed["corrections_remaining"]) == (1, 1)
+    assert changed["terminal"] is False
+
+    identical = _submit(ctx, packet, [_in_scope_finding("landed")])
+    assert identical["ok"] is True
+    assert identical["deduplicated"] is True
+
+
+def test_read_back_fault_leaves_the_spent_count_unchanged_across_a_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx, packet = _submit_context(tmp_path)
+    _arm_read_back_fault(monkeypatch)
+
+    first = _submit(ctx, packet, [_in_scope_finding("landed")])
+    assert first["reason"] == "quality_review_submission_not_durable"
+    assert first["durability_branch"] == "ledger_verify_not_ok"
+    assert (first["attempt"], first["corrections_remaining"]) == (0, 2)
+
+    # The receipt landed with ok=true behind the failed read-back: a call, but
+    # never a failed one, so it is not a spent correction.
+    audit = worker_tools.verify_audit_ledger(
+        ctx.audit_ledger_path,
+        ctx.audit_hmac_key_path,
+        task_id=ctx.task_id,
+        runner=ctx.runner,
+        topic=ctx.topic,
+        request_id=ctx.request_id,
+    )
+    assert len(audit["verified_payloads"]) == 1
+    assert audit["call_count_by_tool"] == {"quality_review_submit": 1}
+    assert audit["failed_call_count_by_tool"] == {}
+    spent = worker_tools._spent_submit_attempts(ctx, "quality_review_submit")
+    assert spent == 0
+
+    # A server restart empties every in-process tally; the ledger-derived
+    # count does not move, and the identical report converges on the receipt.
+    monkeypatch.setattr(worker_tools, "_QUALITY_REVIEW_ATTEMPTS", {})
+    monkeypatch.setattr(worker_tools, "_QUALITY_REVIEW_DURABILITY_FAILURES", {})
+    assert worker_tools._spent_submit_attempts(ctx, "quality_review_submit") == spent
+    again = _submit(ctx, packet, [_in_scope_finding("landed")])
+    assert again["ok"] is True
+    assert again["durable"] is True
+    assert again["deduplicated"] is True
+
+
+def test_packet_mismatch_still_spends_the_correction_budget(tmp_path: Path) -> None:
+    ctx, packet = _submit_context(tmp_path)
+    for _ in range(2):
+        mismatch = worker_tools.quality_review_submit(
+            ctx, packet_sha256="0" * 64, lens="correctness", findings=[]
+        )
+        assert mismatch["reason"] == "quality_review_packet_digest_mismatch"
+
+    exhausted = _submit(ctx, packet, [_in_scope_finding("late")])
+    assert exhausted["reason"] == "quality_review_correction_retry_exhausted"
+    assert exhausted["attempt"] == 2
+    assert exhausted["terminal"] is True
+
+
 def test_quality_review_read_only_input_paths_are_strict_path_declarations(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

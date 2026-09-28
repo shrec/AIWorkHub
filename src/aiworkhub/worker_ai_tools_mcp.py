@@ -2099,6 +2099,7 @@ def verify_audit_ledger(
         "entries_invalid_identity": 0,
         "call_count_by_tool": {},
         "successful_call_count_by_tool": {},
+        "failed_call_count_by_tool": {},
         "bounded_bytes_returned": 0,
         "bounded_bytes_by_tool": {},
         "cache_hits": 0,
@@ -2187,6 +2188,7 @@ def verify_audit_ledger(
 
     call_count: dict[str, int] = {}
     successful_call_count: dict[str, int] = {}
+    failed_call_count: dict[str, int] = {}
     bounded_bytes_by_tool: dict[str, int] = {}
     cache_hits_by_tool: dict[str, int] = {}
     authority_seen: set[tuple[str, str, str, str]] = set()
@@ -2249,6 +2251,10 @@ def verify_audit_ledger(
         result["entries_verified"] += 1
         tool = str(entry.get("tool") or "unknown")
         call_count[tool] = call_count.get(tool, 0) + 1
+        # An authenticated ok=false row is a charge, whatever else the call
+        # was: a receipt that landed with ok=true is never one.
+        if not entry.get("ok"):
+            failed_call_count[tool] = failed_call_count.get(tool, 0) + 1
         if provider_call_id:
             if len(result["provider_call_ids"]) < 128:
                 result["provider_call_ids"].append(provider_call_id)
@@ -2575,6 +2581,7 @@ def verify_audit_ledger(
             result["live_source_graph_calls"] += 1
     result["call_count_by_tool"] = call_count
     result["successful_call_count_by_tool"] = successful_call_count
+    result["failed_call_count_by_tool"] = failed_call_count
     result["bounded_bytes_by_tool"] = bounded_bytes_by_tool
     result["cache_hits_by_tool"] = cache_hits_by_tool
     # Repeated-query discipline is measured over the LIVE query sequence only:
@@ -6356,10 +6363,33 @@ def _record_rejected_finding_intent(
     }
 
 
-def _prior_rejected_finding_intent(ctx: WorkerToolContext, tool: str) -> bool:
-    """Return true when this exact reviewer already submitted a rejected intent."""
+def _ledger_fault_branch(verification: Mapping[str, Any]) -> str:
+    """Name the persistence check an audit-ledger read fails, or "" when it holds.
+
+    The same names label a receipt that could not be proven durable and an
+    empty report that could not be checked against the ledger: either way the
+    fault is the supervisor's, not the reviewer's.
+    """
+    if not verification.get("ok"):
+        return "ledger_verify_not_ok"
+    if int(verification.get("entries_tampered") or 0) != 0:
+        return "ledger_tampered"
+    return ""
+
+
+def _prior_rejected_finding_intent(
+    ctx: WorkerToolContext, tool: str
+) -> tuple[bool, str]:
+    """Say what the ledger proves about an earlier rejected intent of this run.
+
+    Returns ``(rejected, ledger_fault)``.  ``rejected`` is true only when a
+    verified ledger shows this exact reviewer already submitted a rejected
+    intent and holds no receipt.  A ledger that cannot be verified proves
+    neither way, so ``ledger_fault`` names the failed check instead and
+    ``rejected`` stays false: that fault is not the reviewer's to pay for.
+    """
     if ctx.audit_ledger_path is None or ctx.audit_hmac_key_path is None:
-        return False
+        return False, ""
     verification = verify_audit_ledger(
         ctx.audit_ledger_path,
         ctx.audit_hmac_key_path,
@@ -6368,36 +6398,53 @@ def _prior_rejected_finding_intent(ctx: WorkerToolContext, tool: str) -> bool:
         topic=ctx.topic,
         request_id=ctx.request_id,
     )
-    if not verification.get("ok") or int(verification.get("entries_tampered") or 0):
-        return True
+    ledger_fault = _ledger_fault_branch(verification)
+    if ledger_fault:
+        return False, ledger_fault
     calls = verification.get("call_count_by_tool") or {}
-    return (
+    rejected = (
         isinstance(calls, dict)
         and int(calls.get(tool) or 0) > 0
         and not verification.get("verified_payloads")
     )
+    return rejected, ""
 
 
-# One initial submission plus exactly one correction retry, and never a third
-# provider attempt.  M6 measured a ~300k-input-token review run discarded at
-# finalize with review_protocol:structured_report_invalid because the reviewer
-# only learned its report was out of scope after the run had ended; an
-# unbounded correction loop would burn the same tokens a different way.
+# One initial submission plus exactly one correction retry.  Only the
+# reviewer's own rejected attempts are charged against it: a persistence
+# failure is never charged and is bounded by
+# QUALITY_REVIEW_SUBMIT_MAX_DURABILITY_FAILURES below instead.  A run thus
+# allows charged attempts up to QUALITY_REVIEW_SUBMIT_MAX_ATTEMPTS or
+# persistence failures up to QUALITY_REVIEW_SUBMIT_MAX_DURABILITY_FAILURES,
+# whichever is spent first.  M6 measured a ~300k-input-token review run
+# discarded at finalize with review_protocol:structured_report_invalid because
+# the reviewer only learned its report was out of scope after the run had
+# ended; an unbounded correction loop would burn the same tokens a different
+# way.
 QUALITY_REVIEW_SUBMIT_MAX_ATTEMPTS = 2
 
 _QUALITY_REVIEW_ATTEMPT_LOCK = threading.Lock()
 _QUALITY_REVIEW_ATTEMPTS: dict[tuple[str, str, str, str], int] = {}
 
+# ponytail: in-process, so a server restart starts a new bound (the reviewer process timeout bounds a restart loop); persist it as its own authenticated ledger rows if that is ever seen.
+QUALITY_REVIEW_SUBMIT_MAX_DURABILITY_FAILURES = 2
+_QUALITY_REVIEW_DURABILITY_FAILURES: dict[tuple[str, str, str, str], list[str]] = {}
+
 
 def _quality_review_attempt_key(
     ctx: WorkerToolContext, tool: str
 ) -> tuple[str, str, str, str]:
-    """Scope the correction budget to this exact reviewer run and ledger."""
+    """Scope the correction and durability budgets to this reviewer run and ledger."""
     return (ctx.request_id, ctx.task_id, str(ctx.audit_ledger_path), tool)
 
 
 def _durable_failed_submit_attempts(ctx: WorkerToolContext, tool: str) -> int:
-    """Count this run's authenticated submission attempts that never landed."""
+    """Count this run's authenticated rejected submissions.
+
+    These are its spent corrections.  Failures are counted, not calls, so a
+    receipt that landed with ok=true (say behind a failed read-back) is never
+    a spent correction -- in this process or after a restart.
+    """
     if ctx.audit_ledger_path is None or ctx.audit_hmac_key_path is None:
         return 0
     verification = verify_audit_ledger(
@@ -6410,9 +6457,8 @@ def _durable_failed_submit_attempts(ctx: WorkerToolContext, tool: str) -> int:
     )
     if not verification.get("ok") or int(verification.get("entries_tampered") or 0):
         return 0
-    calls = verification.get("call_count_by_tool") or {}
-    successful = verification.get("successful_call_count_by_tool") or {}
-    return max(0, int(calls.get(tool) or 0) - int(successful.get(tool) or 0))
+    failed = verification.get("failed_call_count_by_tool") or {}
+    return max(0, int(failed.get(tool) or 0))
 
 
 def _spent_submit_attempts(ctx: WorkerToolContext, tool: str) -> int:
@@ -6454,6 +6500,53 @@ def _charge_failed_submit_attempt(
     }
 
 
+def _durability_failures(ctx: WorkerToolContext, tool: str) -> list[str]:
+    """Name the persistence checks this reviewer run has failed, oldest first."""
+    key = _quality_review_attempt_key(ctx, tool)
+    with _QUALITY_REVIEW_ATTEMPT_LOCK:
+        return list(_QUALITY_REVIEW_DURABILITY_FAILURES.get(key, ()))
+
+
+def _charge_durability_failure(
+    ctx: WorkerToolContext,
+    tool: str,
+    *,
+    spent: int,
+    submission_id: str,
+    branch: str,
+) -> dict[str, Any]:
+    """Refuse a submission that could not be proven durable.
+
+    A ledger fault is the supervisor's, not the reviewer's, so it spends no
+    correction: ``attempt`` and ``corrections_remaining`` stay what they were
+    before the call.  It is bounded by its own tally instead -- the last one
+    allowed is terminal, and every terminal result reports no corrections
+    left.  The receipt may have landed despite the fault, so a retry must
+    resubmit the identical report.
+    """
+    key = _quality_review_attempt_key(ctx, tool)
+    with _QUALITY_REVIEW_ATTEMPT_LOCK:
+        failures = _QUALITY_REVIEW_DURABILITY_FAILURES.setdefault(key, [])
+        failures.append(branch)
+        terminal = len(failures) >= QUALITY_REVIEW_SUBMIT_MAX_DURABILITY_FAILURES
+    result: dict[str, Any] = {
+        "ok": False,
+        "tool": tool,
+        "reason": "quality_review_submission_not_durable",
+        "submission_id": submission_id,
+        "durable": False,
+        "durability_branch": branch,
+        "attempt": spent,
+        "corrections_remaining": (
+            0 if terminal else QUALITY_REVIEW_SUBMIT_MAX_ATTEMPTS - spent
+        ),
+        "terminal": terminal,
+    }
+    if not terminal:
+        result["retry_requires_identical_receipt"] = True
+    return result
+
+
 def quality_review_submit(
     ctx: WorkerToolContext,
     *,
@@ -6474,6 +6567,15 @@ def quality_review_submit(
     ``terminal``, so the reviewer can correct and resubmit once. The second
     failed attempt is terminal and a third attempt is refused outright.
 
+    A persistence fault (``quality_review_submission_not_durable``, with
+    ``durability_branch`` naming the check that failed) is not the reviewer's
+    doing, so it spends no correction: it is bounded by
+    ``QUALITY_REVIEW_SUBMIT_MAX_DURABILITY_FAILURES`` instead, and the last
+    one is terminal.  The receipt may already have landed, so a non-terminal
+    one carries ``retry_requires_identical_receipt``: resubmit the same report.
+    An empty report is refused the same way while the ledger cannot be
+    verified to show that no rejected intent came before it.
+
     This tool is inert for ordinary workers: the launcher must bind one
     immutable packet path into the worker runtime. The model cannot choose a
     target task/provider, and the signed audit payload carries the worker's
@@ -6484,10 +6586,19 @@ def quality_review_submit(
 
     tool = "quality_review_submit"
     spent = _spent_submit_attempts(ctx, tool)
-    if spent >= QUALITY_REVIEW_SUBMIT_MAX_ATTEMPTS:
-        # Refuse before validating anything so no third provider attempt can
-        # exist, and so an exhausted reviewer cannot append further evidence.
-        return {
+    durability_failures = _durability_failures(ctx, tool)
+    durability_exhausted = (
+        len(durability_failures) >= QUALITY_REVIEW_SUBMIT_MAX_DURABILITY_FAILURES
+    )
+    if spent >= QUALITY_REVIEW_SUBMIT_MAX_ATTEMPTS or durability_exhausted:
+        # Refuse before validating anything once EITHER the correction budget
+        # (QUALITY_REVIEW_SUBMIT_MAX_ATTEMPTS) OR the durability bound
+        # (QUALITY_REVIEW_SUBMIT_MAX_DURABILITY_FAILURES) is spent.
+        # Persistence failures are uncharged, so a run allows charged attempts
+        # up to the correction budget or persistence failures up to the
+        # durability bound, whichever is spent first, and after that nothing
+        # more is validated or appended.
+        exhausted: dict[str, Any] = {
             "ok": False,
             "tool": tool,
             "reason": "quality_review_correction_retry_exhausted",
@@ -6495,6 +6606,11 @@ def quality_review_submit(
             "corrections_remaining": 0,
             "terminal": True,
         }
+        if durability_exhausted:
+            # A persistence fault, not the reviewer, ended this run: keep
+            # naming the check that failed last.
+            exhausted["durability_branch"] = durability_failures[-1]
+        return exhausted
     path = ctx.quality_review_packet_path
     if path is None:
         return _violation(ctx, tool, "quality_review_packet_not_bound")
@@ -6601,19 +6717,6 @@ def quality_review_submit(
                 raw_findings=list(findings),
             ),
         )
-    if not normalized_findings and _prior_rejected_finding_intent(ctx, tool):
-        return _charge_failed_submit_attempt(
-            ctx,
-            tool,
-            _record_rejected_finding_intent(
-                ctx,
-                tool,
-                "quality_review_empty_after_rejected_intent",
-                packet_sha256=packet_sha256,
-                lens=lens,
-                raw_findings=[],
-            ),
-        )
     receipt = {
         "schema_id": quality_reviewer.RECEIPT_SCHEMA_ID,
         "packet_sha256": packet_sha256,
@@ -6637,6 +6740,35 @@ def quality_review_submit(
         receipt, ensure_ascii=False, separators=(",", ":"), sort_keys=True
     ).encode("utf-8")
     submission_id = hashlib.sha256(receipt_bytes).hexdigest()
+
+    if not normalized_findings:
+        # An empty report is only trusted once the ledger shows no rejected
+        # intent came first.  A ledger that cannot be verified shows neither
+        # way: the report is refused all the same, but as a persistence fault
+        # (the supervisor's, uncharged, bounded by the durability bound) and
+        # not as the reviewer's rejected intent.
+        prior_rejected, ledger_fault = _prior_rejected_finding_intent(ctx, tool)
+        if ledger_fault:
+            return _charge_durability_failure(
+                ctx,
+                tool,
+                spent=spent,
+                submission_id=submission_id,
+                branch=ledger_fault,
+            )
+        if prior_rejected:
+            return _charge_failed_submit_attempt(
+                ctx,
+                tool,
+                _record_rejected_finding_intent(
+                    ctx,
+                    tool,
+                    "quality_review_empty_after_rejected_intent",
+                    packet_sha256=packet_sha256,
+                    lens=lens,
+                    raw_findings=[],
+                ),
+            )
 
     def durable_ack(*, deduplicated: bool, retry_count: int) -> dict[str, Any]:
         return {
@@ -6702,34 +6834,25 @@ def quality_review_submit(
     )
     if not appended:
         # The audit ledger is unavailable, so nothing about this submission can
-        # be authenticated: fail closed and spend the attempt.
-        return _charge_failed_submit_attempt(
+        # be authenticated: fail closed, without spending a correction.
+        return _charge_durability_failure(
             ctx,
             tool,
-            {
-                "ok": False,
-                "tool": tool,
-                "reason": "quality_review_submission_not_durable",
-                "submission_id": submission_id,
-                "durable": False,
-            },
+            spent=spent,
+            submission_id=submission_id,
+            branch="audit_append_failed",
         )
     after, persisted_payloads = verified_payloads()
-    if (
-        not after.get("ok")
-        or int(after.get("entries_tampered") or 0) != 0
-        or not persisted_payloads
-    ):
-        return _charge_failed_submit_attempt(
+    durability_branch = _ledger_fault_branch(after)
+    if not durability_branch and not persisted_payloads:
+        durability_branch = "payload_not_persisted"
+    if durability_branch:
+        return _charge_durability_failure(
             ctx,
             tool,
-            {
-                "ok": False,
-                "tool": tool,
-                "reason": "quality_review_submission_not_durable",
-                "submission_id": submission_id,
-                "durable": False,
-            },
+            spent=spent,
+            submission_id=submission_id,
+            branch=durability_branch,
         )
     if any(payload != receipt for payload in persisted_payloads):
         return _charge_failed_submit_attempt(

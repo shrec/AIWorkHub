@@ -12,6 +12,7 @@ import stat
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 from typing import get_args, get_type_hints
 
@@ -1028,3 +1029,87 @@ def test_inline_refresh_body_lines_match_ast_lines_after_formfeed(
     row = payload["matches"][0]
     assert (row["line_start"], row["line_end"]) == (4, 5)
     assert row["source"] == "def beta():\n    return 2"
+
+
+# NF-2026-01074: a submit's spent corrections are its authenticated ok=false
+# ledger rows, so ``verify_audit_ledger`` counts failures beside calls.
+def test_verify_audit_ledger_counts_authenticated_failed_calls_per_tool(
+    tmp_path: Path,
+) -> None:
+    ctx = _nf1076_context(tmp_path)
+    for tool, ok in (
+        ("quality_review_submit", False),
+        ("quality_review_submit", True),
+        ("kb_search", False),
+        ("kb_search", False),
+        ("kb_search", True),
+    ):
+        assert worker_tools._append_audit(
+            ctx, tool=tool, ok=ok, cache_hit=False, hit_count=0, bytes_returned=0
+        )
+    # Another request's failure and a forged line are not this run's failures.
+    assert worker_tools._append_audit(
+        replace(ctx, request_id="b" * 32),
+        tool="quality_review_submit",
+        ok=False,
+        cache_hit=False,
+        hit_count=0,
+        bytes_returned=0,
+    )
+    forged = json.loads(ctx.audit_ledger_path.read_text(encoding="utf-8").splitlines()[1])
+    forged["ok"] = False
+    with ctx.audit_ledger_path.open("a", encoding="utf-8") as ledger:
+        ledger.write(json.dumps(forged, sort_keys=True) + "\n")
+
+    report = _nf1076_verify(ctx)
+    assert report["ok"] is True, report
+    assert report["entries_tampered"] == 1
+    assert report["call_count_by_tool"] == {"quality_review_submit": 2, "kb_search": 3}
+    assert report["failed_call_count_by_tool"] == {
+        "quality_review_submit": 1,
+        "kb_search": 2,
+    }
+
+    unreadable = worker_tools.verify_audit_ledger(
+        tmp_path / "absent.jsonl",
+        ctx.audit_hmac_key_path,
+        task_id=ctx.task_id,
+        runner=ctx.runner,
+        topic=ctx.topic,
+        request_id=ctx.request_id,
+    )
+    assert unreadable["ok"] is False
+    assert unreadable["failed_call_count_by_tool"] == {}
+
+
+def test_spent_submit_attempts_is_the_authenticated_failed_row_count(
+    tmp_path: Path,
+) -> None:
+    ctx = _nf1076_context(tmp_path)
+    tool = "quality_review_submit"
+    # A receipt that landed with ok=true is a call, never a spent correction.
+    assert worker_tools._append_audit(
+        ctx,
+        tool=tool,
+        ok=True,
+        cache_hit=False,
+        hit_count=1,
+        bytes_returned=0,
+        authority_source="runtime",
+        authority_state="process_bound",
+        payload={"receipt": "landed"},
+    )
+    assert worker_tools._spent_submit_attempts(ctx, tool) == 0
+    for expected in (1, 2):
+        assert worker_tools._append_audit(
+            ctx,
+            tool=tool,
+            ok=False,
+            cache_hit=False,
+            hit_count=0,
+            bytes_returned=0,
+            violation="review_finding_0_path_out_of_scope",
+        )
+        # No in-process tally backs this count: it is read back from the
+        # ledger alone, exactly as a restarted server would read it.
+        assert worker_tools._spent_submit_attempts(ctx, tool) == expected
