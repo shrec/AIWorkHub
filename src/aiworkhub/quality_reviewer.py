@@ -60,6 +60,31 @@ PRIOR_FINDINGS_NOTICE = (
     "report with no findings ('clean': true) is NOT a reason to skip this lens "
     "or any changed hunk: it was written about different bytes."
 )
+MANAGER_AMENDMENT_SCHEMA_ID = "aiworkhub.quality_review_manager_amendment.v1"
+# The rejection reason is bounded where the manager writes it; bounding it again
+# here keeps the packet's size a property of the packet, not of whatever a card
+# happens to carry.
+MAX_MANAGER_AMENDMENT_CHARS = 8_000
+# Stated inside the packet, in the packet's own words, beside the prior-review
+# notice and pointing the other way: prior findings are reviewer prose a
+# reviewer may weigh and disagree with, while this is the contract itself.
+MANAGER_AMENDMENT_NOTICE = (
+    "TASK MANAGER CONTRACT AMENDMENT -- PART OF THE TASK CONTRACT, NOT WORKER "
+    "PROSE, NOT EVIDENCE. This is the task manager's amendment, issued when "
+    "the previous candidate was rejected. It is part of the task contract: it "
+    "is not the worker's words and it is not evidence about the candidate. "
+    "Where it conflicts with contract.acceptance, the amendment wins. A "
+    "behaviour the amendment requires must not be reported as a defect, as "
+    "scope creep, or as an unrequested change. It does not lower any other "
+    "requirement: whatever in contract.acceptance it does not contradict "
+    "still applies, and every other review obligation is unchanged."
+)
+# The one line both reviewer prompt transports add when the packet carries that
+# section; build_review_prompt is the single place it is emitted.
+MANAGER_AMENDMENT_PROMPT_LINE = (
+    "Read manager_amendment before judging; it takes precedence over "
+    "contract.acceptance; behaviour it requires is not a finding.\n"
+)
 
 _IDENTITY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -235,6 +260,7 @@ def build_review_packet(
     caller_context: Mapping[str, Any] | None = None,
     candidate_delta: Mapping[str, Any] | None = None,
     prior_findings: Mapping[str, Any] | None = None,
+    manager_amendment: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the only evidence packet an independent reviewer may receive.
 
@@ -248,13 +274,21 @@ def build_review_packet(
     Both are mechanical facts derived by the coordinator; neither carries any
     reviewer or worker prose.
 
-    ``prior_findings`` is the ONE section that carries prose written by a
-    model, and it is prose written by EARLIER REVIEWERS of this same task --
-    never by the worker.  It lives at the packet's top level rather than under
+    ``prior_findings`` carries prose written by a model, and it is prose
+    written by EARLIER REVIEWERS of this same task -- never by the worker.
+    It lives at the packet's top level rather than under
     ``candidate`` precisely so it cannot be read as this candidate's own
     evidence, it is labelled as prior reviewer output on every row, and its
     per-finding status is a mechanical sha256 comparison rather than a verdict.
     See ``_prior_findings_rows``.
+
+    ``manager_amendment`` is the other prose section, and it is neither a
+    reviewer's nor the worker's: it is the task manager's own instruction,
+    written when it rejected the previous candidate (the target card's
+    ``review_feedback``).  It is contract, not evidence, so it sits at the top
+    level beside ``contract`` and ``packet_sha256`` covers it.  A first attempt
+    has none: the key is then absent and the packet is byte-identical to one
+    built without the argument.  See ``_manager_amendment_section``.
     """
 
     if not isinstance(claim_epoch, int) or claim_epoch < 1:
@@ -385,6 +419,9 @@ def build_review_packet(
         body["prior_review"] = _prior_findings_rows(
             prior_findings, changed_paths={row["path"] for row in path_rows}
         )
+    amendment = _manager_amendment_section(manager_amendment)
+    if amendment is not None:
+        body["manager_amendment"] = amendment
     return {**body, "packet_sha256": _canonical_digest(body)}
 
 
@@ -415,6 +452,10 @@ def build_lens_packet(packet: Mapping[str, Any], *, lens: str) -> dict[str, Any]
     ``prior_review`` is sliced the same way and for the same reason: a
     correctness reviewer has no use for what the security lens said last round,
     and carrying it would both cost tokens and blur whose judgment is whose.
+
+    ``manager_amendment`` is deliberately NOT sliced: it amends the contract
+    every lens judges against, so each lens packet carries it whole and its
+    re-seal covers it.
 
     A packet with nothing left to slice -- no scoped audits and no other-lens
     prior review -- is returned as a copy and never re-sealed.
@@ -912,6 +953,15 @@ def build_review_prompt(
         if active_scope is not None
         else ""
     )
+    # The section is sealed into every lens packet, so the packet alone carries
+    # the amendment; this line only sends the reviewer to it first and says how
+    # it ranks against the contract.  No section, no line: the prompt is
+    # byte-identical to the one built before manager_amendment existed.
+    amendment_instruction = (
+        MANAGER_AMENDMENT_PROMPT_LINE
+        if isinstance(packet.get("manager_amendment"), Mapping)
+        else ""
+    )
     use_file_transport = packet_file is not None and (
         packet_root is not None or os.environ.get(REVIEW_PACKET_FILE_ROOT_ENV)
     )
@@ -965,6 +1015,7 @@ def build_review_prompt(
         "for context beyond it, not to re-read what the packet already carries. "
         "You are intentionally not given the worker's rationale, self-verdict, or final answer. "
         "Do not write, edit, format, or delete repository files.\n"
+        f"{amendment_instruction}"
         f"{scope_instruction}"
         f"{overlay_instruction}"
         f"{_ALREADY_ESTABLISHED_MECHANICALLY}"
@@ -2568,6 +2619,35 @@ def _candidate_delta_rows(
         "basis": "changed_path_hashes",
         "predecessor_request_id": predecessor_request_id,
         "paths": rows,
+    }
+
+
+def _manager_amendment_section(value: object) -> dict[str, str] | None:
+    """Carry the manager's contract amendment for a rework candidate, or nothing.
+
+    ``value`` is the target card's ``review_feedback`` exactly as
+    ``reject_review`` wrote it: what the task manager required of the successor
+    when it rejected the previous candidate.  A reviewer that judged only
+    ``contract.acceptance`` would report that very behaviour as a defect, so the
+    manager's words travel in the sealed packet as their own section.  Only the
+    ``instruction`` and the ``predecessor_request_id`` it answered are carried.
+
+    Anything that is not a mapping with a non-blank string ``instruction`` --
+    ``None`` on a first attempt, ``{}``, feedback with no instruction -- is
+    "no amendment" rather than an error, so the packet and its digest stay
+    byte-identical to what they were before this section existed.
+    """
+
+    if not isinstance(value, Mapping):
+        return None
+    instruction = value.get("instruction")
+    if not isinstance(instruction, str) or not instruction.strip():
+        return None
+    return {
+        "schema_id": MANAGER_AMENDMENT_SCHEMA_ID,
+        "notice": MANAGER_AMENDMENT_NOTICE,
+        "instruction": instruction[:MAX_MANAGER_AMENDMENT_CHARS],
+        "predecessor_request_id": str(value.get("predecessor_request_id") or "")[:200],
     }
 
 

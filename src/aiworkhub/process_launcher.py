@@ -7712,6 +7712,7 @@ class ProcessManager:
                 caller_context=caller_context,
                 candidate_delta=candidate_delta,
                 prior_findings=prior_findings,
+                manager_amendment=card.get("review_feedback"),
             )
             # Immutable inputs are authenticated reviewer contract context and
             # read-only workspace materialization authority. Keep candidate

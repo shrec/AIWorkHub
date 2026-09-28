@@ -3,10 +3,12 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sys
 from pathlib import Path
 
 import pytest
 
+from aiworkhub import process_launcher
 from aiworkhub import quality_evidence as qe
 from aiworkhub import quality_review as qr
 from aiworkhub import quality_review_ingest
@@ -47,7 +49,7 @@ def _scoped_audit(lens: str, paths: list[str]) -> dict[str, object]:
     }
 
 
-def _packet(lens: str = "correctness") -> dict[str, object]:
+def _packet(lens: str = "correctness", **extra: object) -> dict[str, object]:
     digest = hashlib.sha256(b"candidate-bytes").hexdigest()
     return quality_reviewer.build_review_packet(
         request_id="req-1",
@@ -60,6 +62,7 @@ def _packet(lens: str = "correctness") -> dict[str, object]:
         required_outputs=[CANDIDATE_PATH],
         validation=["python3 -m pytest -q"],
         scoped_audits={lens: _scoped_audit(lens, [CANDIDATE_PATH])},
+        **extra,
     )
 
 
@@ -826,3 +829,220 @@ def test_packet_and_reviewer_normalization_preserve_category_end_to_end() -> Non
         <= set(reviewed)
         <= quality_reviewer.QUALITY_REVIEW_FINDING_KEYS
     )
+
+
+# --- NF-2026-01086: the manager's rework amendment reaches both transports ----
+
+REWORK_FEEDBACK = {
+    "schema_id": "aiworkhub.rework_feedback_delta.v1",
+    "instruction": "keep the junction guard",
+    "reason_identity": "reason-1",
+    "predecessor_request_id": "r0",
+    "predecessor_changed_paths": [CANDIDATE_PATH],
+    "residual_identities": [],
+}
+PRECEDENCE_LINE = quality_reviewer.MANAGER_AMENDMENT_PROMPT_LINE
+LENSES = ("correctness", "security", "code_quality")
+
+
+def _assemble(adapter_id: str, packet: dict[str, object], runtime_root: Path) -> str:
+    return qr.assemble_reviewer_prompt(
+        packet,
+        lens="correctness",
+        adapter_id=adapter_id,
+        packet_path=str(runtime_root / "quality_review_packet.json"),
+        packet_root=runtime_root,
+    )
+
+
+def test_sighted_prompt_differs_by_exactly_the_manager_amendment_line(
+    tmp_path: Path,
+) -> None:
+    runtime_root = tmp_path / "runtime"
+    runtime_root.mkdir()
+    plain = _packet()
+    amended = _packet(manager_amendment=REWORK_FEEDBACK)
+
+    plain_prompt = _assemble("claude_cli", plain, runtime_root)
+    amended_prompt = _assemble("claude_cli", amended, runtime_root)
+
+    assert PRECEDENCE_LINE not in plain_prompt
+    assert "manager_amendment" not in plain_prompt
+    assert amended_prompt.count(PRECEDENCE_LINE) == 1
+    # File transport: the prompt only names the sealed file, so the section adds
+    # one instruction line and re-points the digest, and nothing else.
+    assert amended_prompt.replace(PRECEDENCE_LINE, "", 1).replace(
+        str(amended["packet_sha256"]), str(plain["packet_sha256"])
+    ) == plain_prompt
+    sealed = json.loads(
+        (runtime_root / "quality_review_packet.json").read_text(encoding="utf-8")
+    )
+    assert sealed == amended
+    assert sealed["manager_amendment"]["instruction"] == "keep the junction guard"
+
+
+def test_blind_prompt_delivers_the_amendment_inline_after_the_precedence_line(
+    tmp_path: Path,
+) -> None:
+    runtime_root = tmp_path / "runtime"
+    runtime_root.mkdir()
+    amended = _packet(manager_amendment=REWORK_FEEDBACK)
+
+    prompt = _assemble("vscode_lm", amended, runtime_root)
+    plain_prompt = _assemble("vscode_lm", _packet(), runtime_root)
+
+    assert prompt.count(PRECEDENCE_LINE) == 1
+    # Instruction text ahead of the inline packet, not a copy inside it.
+    assert prompt.index(PRECEDENCE_LINE) < prompt.index("QUALITY_REVIEW_PACKET:")
+    inline = qr.extract_inline_packet(prompt)
+    assert inline == amended
+    assert (
+        inline["manager_amendment"]["notice"]
+        == quality_reviewer.MANAGER_AMENDMENT_NOTICE
+    )
+    assert PRECEDENCE_LINE not in plain_prompt
+    assert "manager_amendment" not in plain_prompt
+
+
+@pytest.mark.parametrize(
+    "tools", [BLIND_TOOLSET, {"Read", "aiworkhub_worker_quality_review_submit"}]
+)
+def test_content_prompt_builder_adds_the_precedence_line_for_any_toolset(tools) -> None:
+    def prompt_for(packet: dict[str, object]) -> str:
+        return qr.build_reviewer_prompt_with_content(
+            packet,
+            lens="correctness",
+            reviewer_tool_names=tools,
+            packet_path="/runtime/quality_review_packet.json",
+        )
+
+    assert prompt_for(_packet(manager_amendment=REWORK_FEEDBACK)).count(
+        PRECEDENCE_LINE
+    ) == 1
+    assert PRECEDENCE_LINE not in prompt_for(_packet())
+
+
+def _launched_review_packet(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **card_extra: object
+) -> dict[str, object]:
+    """Seal the packet ``ProcessManager._build_quality_review_packet`` builds.
+
+    The seam of ``test_process_launcher``'s
+    ``test_quality_review_packet_binding_carries_explicit_target_inputs`` -- a
+    review_ready target card, its retained workspace and its review_ready
+    event -- but with the real packet builder in place of a kwargs spy.
+    """
+    from test_process_launcher import _card, _manager, _show
+
+    monkeypatch.setattr(
+        process_launcher.storage_retention,
+        "schedule_repository_cleanup",
+        lambda *_args, **_kwargs: None,
+    )
+    request_id = "e" * 32
+    manager = _manager(
+        tmp_path,
+        show_task=lambda _task_id: {"returncode": 1, "stdout": "", "stderr": ""},
+        argv=[sys.executable, "-c", "pass"],
+    )
+    workspace_path = tmp_path / "worktrees" / request_id / "worktree"
+    home = tmp_path / "worktrees" / request_id / "home"
+    (workspace_path / "src").mkdir(parents=True)
+    home.mkdir(parents=True)
+    source = "value = 2\n"
+    (workspace_path / "src" / "changed.py").write_bytes(source.encode("utf-8"))
+    digest = hashlib.sha256(source.encode("utf-8")).hexdigest()
+    workspace = process_launcher.WorkerWorkspace(
+        request_id=request_id,
+        repo=manager.repo,
+        path=workspace_path,
+        home=home,
+        allowed_writes=("src/changed.py",),
+        parent_baseline={},
+        workspace_baseline={},
+    )
+    card = _card(task_id=TASK_ID, state="review")
+    card.update(
+        {
+            "claim_epoch": 1,
+            "terminal_substatus": "review_ready",
+            "allowed_writes": ["src/changed.py"],
+            "objective": "keep the guard",
+            "acceptance": ["the original acceptance"],
+            "terminal_review": {
+                "substatus": "review_ready",
+                "evidence": {
+                    "workspace": workspace.as_metadata(),
+                    "changed_path_hashes": {"src/changed.py": digest},
+                    "quality_gate": {"checks": []},
+                    "validation": [],
+                },
+            },
+            **card_extra,
+        }
+    )
+    manager._show_task = _show(lambda: card)
+    manager._append_event(
+        {
+            "request_id": request_id,
+            "task_id": TASK_ID,
+            "runner": "worker",
+            "topic": "code",
+            "adapter_id": "worker_adapter",
+            "state": "review_ready",
+        }
+    )
+    monkeypatch.setenv("AIWORKHUB_WORKTREE_ROOT", str(tmp_path / "worktrees"))
+    monkeypatch.setattr(
+        manager,
+        "_quality_review_source_evidence",
+        lambda *_args, **_kwargs: {
+            "src/changed.py": {
+                "candidate_sha256": digest,
+                "excerpt": source,
+                "excerpt_bytes": len(source),
+                "source_bytes": len(source),
+                "truncated": False,
+            }
+        },
+    )
+    monkeypatch.setattr(
+        process_launcher.quality_review_scope,
+        "build_scoped_audits",
+        lambda **_kwargs: {
+            lens: _scoped_audit(lens, ["src/changed.py"]) for lens in LENSES
+        },
+    )
+
+    result = manager._build_quality_review_packet(request_id, TASK_ID)
+
+    assert result["ok"] is True, result
+    return result["prepared"]["packet"]
+
+
+def test_the_launch_path_seals_the_target_cards_review_feedback_into_the_packet(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    packet = _launched_review_packet(
+        tmp_path, monkeypatch, review_feedback=dict(REWORK_FEEDBACK)
+    )
+
+    amendment = packet["manager_amendment"]
+    assert amendment["instruction"] == "keep the junction guard"
+    assert amendment["predecessor_request_id"] == "r0"
+    assert amendment["notice"] == quality_reviewer.MANAGER_AMENDMENT_NOTICE
+    # The launcher re-seals after binding immutable inputs: the seal must still
+    # cover the section, and every lens packet must carry it on unchanged.
+    body = {key: value for key, value in packet.items() if key != "packet_sha256"}
+    assert packet["packet_sha256"] == quality_reviewer._canonical_digest(body)
+    for lens in LENSES:
+        lens_packet = quality_reviewer.build_lens_packet(packet, lens=lens)
+        assert lens_packet["manager_amendment"] == amendment
+
+
+def test_a_first_attempt_card_yields_a_packet_with_no_manager_amendment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    packet = _launched_review_packet(tmp_path, monkeypatch)
+
+    assert "manager_amendment" not in packet

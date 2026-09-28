@@ -644,3 +644,185 @@ def test_deleted_candidate_path_keeps_the_ordinary_fail_closed_prompt():
         "or missing or stale changed-segment evidence for any changed path, must be "
         "escalated as a process_limit finding"
     ) in prompt
+
+
+# --- NF-2026-01086: the manager's rework amendment rides in the sealed packet ---
+
+REWORK_FEEDBACK = {
+    "schema_id": "aiworkhub.rework_feedback_delta.v1",
+    "instruction": "keep the junction guard",
+    "reason_identity": "reason-1",
+    "predecessor_request_id": "r0",
+    "predecessor_changed_paths": ["src/mod.py"],
+    "residual_identities": [],
+}
+
+
+def _body(packet):
+    return {key: value for key, value in packet.items() if key != "packet_sha256"}
+
+
+def _prior_findings(*lenses: str) -> dict:
+    return {
+        "predecessor_request_id": "r0",
+        "omitted": 0,
+        "lenses": {
+            lens: {
+                "reports": [
+                    {
+                        "reviewer_request_id": f"rev-{lens}",
+                        "finding_count": 0,
+                        "packet_sha256": None,
+                    }
+                ],
+                "findings": [],
+            }
+            for lens in lenses
+        },
+    }
+
+
+def test_manager_amendment_is_a_top_level_section_sealed_into_the_digest():
+    plain = _packet()
+    packet = _packet(manager_amendment=REWORK_FEEDBACK)
+
+    assert packet["manager_amendment"] == {
+        "schema_id": "aiworkhub.quality_review_manager_amendment.v1",
+        "notice": quality_reviewer.MANAGER_AMENDMENT_NOTICE,
+        "instruction": "keep the junction guard",
+        "predecessor_request_id": "r0",
+    }
+    # Beside ``contract``, never under ``candidate``: it is contract, not evidence.
+    assert "manager_amendment" not in packet["candidate"]
+    assert packet["packet_sha256"] != plain["packet_sha256"]
+    assert packet["packet_sha256"] == quality_reviewer._canonical_digest(_body(packet))
+    assert {
+        key: value for key, value in _body(packet).items() if key != "manager_amendment"
+    } == _body(plain)
+
+    forged = {
+        **packet,
+        "manager_amendment": {**packet["manager_amendment"], "instruction": "drop it"},
+    }
+    with pytest.raises(
+        quality_reviewer.ReviewerEvidenceError, match="review_packet_digest_invalid"
+    ):
+        quality_reviewer.build_review_prompt(forged, lens="correctness")
+
+
+def test_manager_amendment_notice_states_its_authority_in_the_packets_own_words():
+    notice = quality_reviewer.MANAGER_AMENDMENT_NOTICE.lower()
+
+    for stated in (
+        "task manager's amendment, issued when the previous candidate was rejected",
+        "part of the task contract",
+        "not worker prose",
+        "not evidence",
+        "conflicts with contract.acceptance, the amendment wins",
+        "must not be reported as a defect, as scope creep, or as an unrequested change",
+        "does not lower any other requirement",
+    ):
+        assert stated in notice
+
+
+@pytest.mark.parametrize(
+    "unusable",
+    [
+        None,
+        {},
+        {"schema_id": "aiworkhub.rework_feedback_delta.v1", "predecessor_request_id": "r0"},
+        {"instruction": ""},
+        {"instruction": " \n\t"},
+        {"instruction": None},
+        {"instruction": ["keep the junction guard"]},
+        "keep the junction guard",
+    ],
+    ids=[
+        "none",
+        "empty-mapping",
+        "no-instruction",
+        "empty-instruction",
+        "blank-instruction",
+        "null-instruction",
+        "non-string-instruction",
+        "not-a-mapping",
+    ],
+)
+def test_an_unusable_manager_amendment_leaves_the_packet_byte_identical(unusable):
+    inputs = {
+        "source_evidence": _evidence(),
+        "scoped_audits": _scoped_audits("correctness"),
+    }
+    baseline = _packet(**inputs)
+
+    packet = _packet(manager_amendment=unusable, **inputs)
+
+    assert "manager_amendment" not in packet
+    assert json.dumps(packet, sort_keys=True) == json.dumps(baseline, sort_keys=True)
+    assert packet["packet_sha256"] == baseline["packet_sha256"]
+
+
+def test_manager_amendment_instruction_is_bounded_to_8000_characters():
+    assert quality_reviewer.MAX_MANAGER_AMENDMENT_CHARS == 8000
+
+    long = _packet(manager_amendment={"instruction": "a" * 8000 + "b" * 500})
+    exact = _packet(manager_amendment={"instruction": "c" * 8000})
+
+    assert long["manager_amendment"]["instruction"] == "a" * 8000
+    assert exact["manager_amendment"]["instruction"] == "c" * 8000
+    # The amendment names the candidate it answered, or carries an empty string.
+    assert exact["manager_amendment"]["predecessor_request_id"] == ""
+    lengthy = _packet(
+        manager_amendment={"instruction": "x", "predecessor_request_id": "r" * 300}
+    )
+    assert lengthy["manager_amendment"]["predecessor_request_id"] == "r" * 200
+
+
+@pytest.mark.parametrize("lens", ["correctness", "security", "code_quality"])
+def test_every_lens_packet_keeps_the_manager_amendment_unchanged(lens):
+    shared = _packet(
+        source_evidence=_evidence(),
+        scoped_audits=_scoped_audits("correctness", "security", "code_quality"),
+        prior_findings=_prior_findings("correctness", "security"),
+        manager_amendment=REWORK_FEEDBACK,
+    )
+
+    packet = quality_reviewer.build_lens_packet(shared, lens=lens)
+
+    assert packet["manager_amendment"] == shared["manager_amendment"]
+    # The slice really happened, and its re-seal covers the amendment.
+    assert set(packet["candidate"]["scoped_audits"]) == {lens}
+    assert set(packet["prior_review"]["lenses"]) <= {lens}
+    assert packet["packet_sha256"] != shared["packet_sha256"]
+    assert packet["packet_sha256"] == quality_reviewer._canonical_digest(_body(packet))
+
+
+def test_a_packet_with_nothing_to_slice_keeps_the_manager_amendment():
+    shared = _packet(
+        scoped_audits=_scoped_audits("correctness"),
+        manager_amendment=REWORK_FEEDBACK,
+    )
+
+    assert quality_reviewer.build_lens_packet(shared, lens="correctness") == shared
+
+
+def test_prompt_sends_the_reviewer_to_the_manager_amendment_only_when_the_packet_has_one():
+    line = quality_reviewer.MANAGER_AMENDMENT_PROMPT_LINE
+    assert line.startswith("Read manager_amendment before judging; ")
+    assert "takes precedence over contract.acceptance" in line
+    assert "is not a finding" in line
+    assert line.count("\n") == 1
+
+    amended = quality_reviewer.build_review_prompt(
+        _packet(manager_amendment=REWORK_FEEDBACK), lens="correctness"
+    )
+    assert amended.count(line) == 1
+    # Instruction text ahead of the inline packet it points at, not a copy in it.
+    assert amended.index(line) < amended.index("QUALITY_REVIEW_PACKET:")
+
+    for absent in (None, {}, {"instruction": ""}):
+        prompt = quality_reviewer.build_review_prompt(
+            _packet(manager_amendment=absent), lens="correctness"
+        )
+        assert line not in prompt
+        assert "manager_amendment" not in prompt
