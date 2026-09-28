@@ -1,5 +1,24 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.12.1 — 2026-09-28
+
+### Added
+
+- Source Graph directory diff core: compares two directory trees, classifies each file as added, removed, modified or renamed, and emits bounded unified-diff hunks plus per-symbol body changes (RM-2026-00071).
+- A language-neutral `custom_validation` card template and host-toolchain trust for every Source Graph language family, so cards can be created and validated in all of them (NF-2026-01072 parts A and C).
+- Reviewer ingest resolves findings through the index-proven symbol resolver; overbuild findings bind to indexed symbols and the reviewer prompt covers every lens item in one pass (NF-2026-01065, NF-2026-01057 part 1).
+
+### Fixed
+
+- Reviewer findings that contain U+2028, U+2029 or U+0085 are durable: the audit ledger splits on the line-feed character only, and rework overlays count lines the way the AST does (NF-2026-01076).
+- One live reviewer per lens, with liveness taken from the launcher's per-event rule (NF-2026-01058, NF-2026-01069).
+- Rework sealing reports `RuntimeTempError` as a recovery error, never a raw temp failure (NF-2026-01070).
+- Validation records carry a bounded candidate-authority reference (NF-2026-01060 part A).
+- Relinking a NeedFix with a verified integrated commit resolves it (NF-2026-01062).
+- The GLM bridge over VS Code LM orders no-progress events correctly and rejects oversized tool input cleanly.
+- The extension webview suite passes again, and `*.css` is pinned to LF so fresh worktrees match the suite's markers.
+- AppContainer-lane symlink and launcher tests skip only on the measured missing capability (NF-2026-01071).
+
 ## 0.12.0 — 2026-09-27
 
 ### Fixed

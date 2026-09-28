@@ -14,6 +14,13 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.12.1
+
+- Cards can be created and validated for every language Source Graph indexes, not only Python.
+- Source Graph can compare two directory trees, down to changed hunks and changed symbols.
+- Reviewer findings are no longer lost when they contain Unicode line separators.
+- Each review lens runs one live reviewer, and findings point at indexed symbols.
+
 ## What's new in 0.12.0
 
 - Sandboxed validation can create git repositories again, so launcher test suites run inside the sandbox.
