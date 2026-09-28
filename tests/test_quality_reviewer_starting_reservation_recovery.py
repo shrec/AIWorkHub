@@ -114,7 +114,9 @@ def _assert_nonregular_intent_is_contained(tmp_path, monkeypatch, intent_path) -
     assert callback_calls == []
 
 
-def test_symlink_terminal_intent_diagnostic_never_follows_subject(tmp_path, monkeypatch):
+def test_symlink_terminal_intent_diagnostic_never_follows_subject(
+    tmp_path, monkeypatch, make_symlink
+):
     manager = _manager_for_periodic_scan(tmp_path, monkeypatch)
     target = tmp_path / "outside-intent-target"
     target.write_text("sensitive target bytes", encoding="utf-8")
@@ -122,7 +124,7 @@ def test_symlink_terminal_intent_diagnostic_never_follows_subject(tmp_path, monk
         "symlink" + manager._REVIEWER_TERMINAL_INTENT_SUFFIX
     )
     intent.parent.mkdir(parents=True, exist_ok=True)
-    intent.symlink_to(target)
+    make_symlink(target, intent)
 
     _assert_nonregular_intent_is_contained(tmp_path, monkeypatch, intent)
 
@@ -252,14 +254,16 @@ def test_periodic_scan_recovers_crash_immediately_after_claim_commit(
     assert sum(event.get("state") == "blocked" for event in events_after_first) == 1
 
 
-def test_existing_terminal_intent_symlink_swap_fails_closed(tmp_path, monkeypatch):
+def test_existing_terminal_intent_symlink_swap_fails_closed(
+    tmp_path, monkeypatch, make_symlink
+):
     manager = _manager_for_periodic_scan(tmp_path, monkeypatch)
     event = _starting("intent-symlink-swap", deadline=time.time() - 1.0)
     target = tmp_path / "foreign-intent"
     target.write_text("{}", encoding="utf-8")
     intent = manager._reviewer_terminal_intent_path("intent-symlink-swap")
     intent.parent.mkdir(parents=True, exist_ok=True)
-    intent.symlink_to(target)
+    make_symlink(target, intent)
 
     assert (
         manager._record_reviewer_terminal_intent(
