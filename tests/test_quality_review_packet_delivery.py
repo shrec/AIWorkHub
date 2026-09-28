@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from aiworkhub import process_launcher
+from aiworkhub import agent_tool_instructions, process_launcher
 from aiworkhub import quality_evidence as qe
 from aiworkhub import quality_review as qr
 from aiworkhub import quality_review_ingest
@@ -18,6 +18,10 @@ from aiworkhub import worker_ai_tools_mcp as worker_mcp
 
 CANDIDATE_PATH = "src/aiworkhub/quality_review.py"
 TASK_ID = "NF-2026-00259-PACKET-DELIVERY"
+# NF-2026-01108: the most a stdin-prompt reviewer (claude_cli, codex_cli) is
+# handed inline; past it, and for every other sighted adapter, the packet is a file.
+INLINE_CAP = qr.SIGHTED_INLINE_PACKET_MAX_BYTES
+STDIN_PROMPT_ADAPTERS = ("claude_cli", "codex_cli")
 
 # The exact capability set given to a reviewer on the vscode_lm_in_process
 # sandbox: a Source Graph query tool and a submit tool, and NO file-read tool.
@@ -104,6 +108,23 @@ def _canonical_packet_text(packet: dict[str, object]) -> str:
         separators=(",", ":"),
         sort_keys=True,
     )
+
+
+def _packet_of_size(size: int, **extra: object) -> dict[str, object]:
+    """A sealed packet whose canonical text is exactly ``size`` bytes long."""
+    body = {k: v for k, v in _packet(**extra).items() if k != "packet_sha256"}
+    candidate = dict(body["candidate"])  # type: ignore[arg-type]
+    body["candidate"] = candidate
+
+    def sealed(padding: int) -> dict[str, object]:
+        candidate["padding"] = "x" * padding
+        return {**body, "packet_sha256": quality_reviewer._canonical_digest(body)}
+
+    unpadded = len(quality_reviewer.canonical_packet_text(sealed(0)).encode("utf-8"))
+    assert size >= unpadded
+    packet = sealed(size - unpadded)
+    assert len(quality_reviewer.canonical_packet_text(packet).encode("utf-8")) == size
+    return packet
 
 
 def _read_every_part(ctx: worker_mcp.WorkerToolContext) -> list[dict]:
@@ -329,36 +350,12 @@ def test_file_transport_prompt_names_the_paged_packet_tool(tmp_path: Path) -> No
     assert "Do not supply a path or identity" in prompt
 
 
-def test_sighted_bound_packet_stays_file_ref_just_below_inline_cap(
+def test_sighted_bound_packet_stays_file_ref_just_above_the_sighted_inline_cap(
     tmp_path: Path,
 ) -> None:
-    cap = 96 * 1024
-    body = {k: v for k, v in _packet().items() if k != "packet_sha256"}
-    candidate = dict(body["candidate"])
-    body = {**body, "candidate": candidate}
-
-    def sealed() -> dict[str, object]:
-        digest = hashlib.sha256(
-            json.dumps(
-                body, ensure_ascii=False, separators=(",", ":"), sort_keys=True
-            ).encode("utf-8")
-        ).hexdigest()
-        return {**body, "packet_sha256": digest}
-
-    def encoded_len(payload: dict[str, object]) -> int:
-        return len(
-            json.dumps(
-                payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True
-            ).encode("utf-8")
-        )
-
-    candidate["padding"] = "x" * (90 * 1024)
-    packet = sealed()
-    extra = cap - 1 - encoded_len(packet)
-    assert extra > 0
-    candidate["padding"] = str(candidate["padding"]) + ("x" * extra)
-    packet = sealed()
-    assert encoded_len(packet) == cap - 1
+    # One byte past the most a claude_cli reviewer is handed inline: the file
+    # transport applies, and it is read back through the paged packet tool.
+    packet = _packet_of_size(INLINE_CAP + 1)
 
     runtime_root = tmp_path / "runtime"
     runtime_root.mkdir()
@@ -424,6 +421,183 @@ def test_sighted_bound_packet_stays_file_ref_just_below_inline_cap(
         verification["successful_call_count_by_tool"]["quality_review_packet_read"]
         == reads
     )
+
+
+# --- NF-2026-01108: a stdin-prompt reviewer gets its packet inline -----------
+
+
+def test_the_sighted_inline_cap_belongs_to_the_stdin_prompt_pair() -> None:
+    assert INLINE_CAP == 192 * 1024
+    assert qr._STDIN_PROMPT_ADAPTERS == frozenset(STDIN_PROMPT_ADAPTERS)
+    for adapter_id in STDIN_PROMPT_ADAPTERS:
+        assert runtime_adapters.adapter_provides_file_read(adapter_id) is True
+    # The one schema load a Claude reviewer makes names only registered tools.
+    for name in (qr._SOURCE_GRAPH_TOOL, qr._PACKET_READ_TOOL, qr.DEFAULT_SUBMIT_TOOL):
+        assert name in agent_tool_instructions.WORKER_MCP_TOOL_NAMES
+
+
+@pytest.mark.parametrize("adapter_id", STDIN_PROMPT_ADAPTERS)
+def test_a_stdin_prompt_reviewer_gets_the_packet_inline_and_the_file_still_written(
+    tmp_path: Path, adapter_id: str
+) -> None:
+    runtime_root = tmp_path / "runtime"
+    runtime_root.mkdir()
+    packet = _packet()
+
+    prompt = _assemble(adapter_id, packet, runtime_root)
+
+    assert qr.extract_inline_packet(prompt) == packet
+    assert "QUALITY_REVIEW_PACKET_FILE:" not in prompt
+    assert "quality_review_packet_read" not in prompt
+
+    # The bound file holds exactly the bytes the file transport writes for it.
+    reference = runtime_root / "file_transport_packet.json"
+    quality_reviewer.build_review_prompt(
+        packet, lens="correctness", packet_file=str(reference), packet_root=runtime_root
+    )
+    written = runtime_root / "quality_review_packet.json"
+    assert written.read_bytes() == reference.read_bytes()
+    assert json.loads(written.read_text(encoding="utf-8")) == packet
+
+
+@pytest.mark.parametrize("adapter_id", STDIN_PROMPT_ADAPTERS)
+def test_the_inline_cap_is_inclusive_and_the_file_transport_starts_above_it(
+    tmp_path: Path, adapter_id: str
+) -> None:
+    runtime_root = tmp_path / "runtime"
+    runtime_root.mkdir()
+
+    at_cap = _assemble(adapter_id, _packet_of_size(INLINE_CAP), runtime_root)
+    assert qr.extract_inline_packet(at_cap) is not None
+    assert "QUALITY_REVIEW_PACKET_FILE:" not in at_cap
+    assert (runtime_root / "quality_review_packet.json").stat().st_size == INLINE_CAP
+
+    over_cap = _assemble(adapter_id, _packet_of_size(INLINE_CAP + 1), runtime_root)
+    assert qr.extract_inline_packet(over_cap) is None
+    assert "QUALITY_REVIEW_PACKET_FILE:" in over_cap
+    assert "aiworkhub_worker_quality_review_packet_read" in over_cap
+
+
+@pytest.mark.parametrize("adapter_id", ["deepseek_copilot_cli", "glm_copilot_cli"])
+@pytest.mark.parametrize("size", [None, 96 * 1024 - 1, INLINE_CAP])
+def test_every_other_sighted_adapter_keeps_the_file_transport_byte_for_byte(
+    tmp_path: Path, adapter_id: str, size: int | None
+) -> None:
+    runtime_root = tmp_path / "runtime"
+    runtime_root.mkdir()
+    packet = _packet() if size is None else _packet_of_size(size)
+    packet_path = str(runtime_root / "quality_review_packet.json")
+
+    prompt = qr.assemble_reviewer_prompt(
+        packet,
+        lens="correctness",
+        adapter_id=adapter_id,
+        packet_path=packet_path,
+        packet_root=runtime_root,
+    )
+
+    assert prompt == quality_reviewer.build_review_prompt(
+        packet, lens="correctness", packet_file=packet_path, packet_root=runtime_root
+    )
+    assert "QUALITY_REVIEW_PACKET_FILE:" in prompt
+    assert qr.extract_inline_packet(prompt) is None
+
+
+def test_a_claude_reviewer_loads_its_tool_schemas_with_exactly_one_tool_search(
+    tmp_path: Path,
+) -> None:
+    runtime_root = tmp_path / "runtime"
+    runtime_root.mkdir()
+    server = agent_tool_instructions.WORKER_MCP_SERVER_NAME
+    source_graph = f"mcp__{server}__aiworkhub_worker_source_graph_query"
+    submit = f"mcp__{server}__aiworkhub_worker_quality_review_submit"
+    packet_read = f"mcp__{server}__aiworkhub_worker_quality_review_packet_read"
+
+    inline = _assemble("claude_cli", _packet(), runtime_root)
+    assert inline.count("ToolSearch") == 1
+    assert inline.count("select:") == 1
+    assert f'query "select:{source_graph},{submit}"' in inline
+    assert "never search schemas by keyword" in inline
+    assert packet_read not in inline
+
+    # The file transport is the only one that sends the reviewer to packet_read.
+    filed = _assemble("claude_cli", _packet_of_size(INLINE_CAP + 1), runtime_root)
+    assert filed.count("ToolSearch") == 1
+    assert filed.count("select:") == 1
+    assert f'query "select:{source_graph},{submit},{packet_read}"' in filed
+
+
+@pytest.mark.parametrize(
+    "adapter_id", ["claude_cli", "codex_cli", "deepseek_copilot_cli", "vscode_lm"]
+)
+@pytest.mark.parametrize("over_cap", [False, True], ids=["small", "over-cap"])
+def test_every_reviewer_prompt_batches_tool_calls_once_and_only_claude_names_tool_search(
+    tmp_path: Path, adapter_id: str, over_cap: bool
+) -> None:
+    runtime_root = tmp_path / "runtime"
+    runtime_root.mkdir()
+    packet = _packet_of_size(INLINE_CAP + 1) if over_cap else _packet()
+
+    prompt = _assemble(adapter_id, packet, runtime_root)
+
+    assert prompt.count(quality_reviewer.PARALLEL_TOOL_CALLS_INSTRUCTION) == 1
+    assert ("ToolSearch" in prompt) is (adapter_id == "claude_cli")
+
+
+def test_without_root_authority_a_claude_reviewer_inlines_to_the_cap_and_fails_closed_above(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv(quality_reviewer.REVIEW_PACKET_FILE_ROOT_ENV, raising=False)
+    caller_path = tmp_path / "caller-selected.json"
+    # Past build_review_prompt's own 96 KiB inline bound, under the sighted cap.
+    packet = _packet_of_size(100 * 1024)
+
+    prompt = qr.assemble_reviewer_prompt(
+        packet, lens="correctness", adapter_id="claude_cli", packet_path=str(caller_path)
+    )
+
+    assert qr.extract_inline_packet(prompt) == packet
+    assert not caller_path.exists()
+    with pytest.raises(
+        quality_reviewer.ReviewerEvidenceError, match="quality_review_packet_too_large"
+    ):
+        qr.assemble_reviewer_prompt(
+            _packet_of_size(INLINE_CAP + 1),
+            lens="correctness",
+            adapter_id="claude_cli",
+            packet_path=str(caller_path),
+        )
+    assert not caller_path.exists()
+
+
+def test_the_environment_root_still_binds_the_file_for_an_inline_reviewer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime_root = tmp_path / "runtime"
+    runtime_root.mkdir()
+    monkeypatch.setenv(quality_reviewer.REVIEW_PACKET_FILE_ROOT_ENV, str(runtime_root))
+    packet = _packet()
+    packet_path = runtime_root / "quality_review_packet.json"
+
+    prompt = qr.assemble_reviewer_prompt(
+        packet, lens="correctness", adapter_id="codex_cli", packet_path=str(packet_path)
+    )
+
+    assert qr.extract_inline_packet(prompt) == packet
+    assert json.loads(packet_path.read_text(encoding="utf-8")) == packet
+
+
+def test_a_refused_packet_leaves_no_file_behind_on_the_inline_path(tmp_path: Path) -> None:
+    runtime_root = tmp_path / "runtime"
+    runtime_root.mkdir()
+    tampered = {**_packet(), "packet_sha256": "0" * 64}
+
+    with pytest.raises(
+        quality_reviewer.ReviewerEvidenceError, match="review_packet_digest_invalid"
+    ):
+        _assemble("claude_cli", tampered, runtime_root)
+
+    assert not (runtime_root / "quality_review_packet.json").exists()
 
 
 def test_legacy_blind_toolset_remains_unchanged() -> None:
@@ -861,8 +1035,10 @@ def test_sighted_prompt_differs_by_exactly_the_manager_amendment_line(
 ) -> None:
     runtime_root = tmp_path / "runtime"
     runtime_root.mkdir()
-    plain = _packet()
-    amended = _packet(manager_amendment=REWORK_FEEDBACK)
+    # Past the sighted inline cap, so the file transport this test is about still
+    # applies to a claude_cli reviewer.
+    plain = _packet_of_size(INLINE_CAP + 1)
+    amended = _packet_of_size(INLINE_CAP + 1, manager_amendment=REWORK_FEEDBACK)
 
     plain_prompt = _assemble("claude_cli", plain, runtime_root)
     amended_prompt = _assemble("claude_cli", amended, runtime_root)

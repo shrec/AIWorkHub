@@ -316,6 +316,27 @@ class TestBuildReviewPrompt:
         assert "do not hold findings back for a later round" in prompt
 
     @pytest.mark.parametrize("lens", ["correctness", "security", "code_quality"])
+    def test_prompt_batches_independent_tool_calls_exactly_once(self, lens, tmp_path):
+        """NF-2026-01108: only 15-19% of a review's messages batched their calls."""
+        packet = _packet_with_findings()
+        instruction = quality_reviewer.PARALLEL_TOOL_CALLS_INSTRUCTION
+        inline = quality_reviewer.build_review_prompt(packet, lens=lens)
+        filed = quality_reviewer.build_review_prompt(
+            packet, lens=lens, packet_file=str(tmp_path / "packet.json"),
+            packet_root=tmp_path,
+        )
+
+        for prompt in (inline, filed):
+            assert prompt.count(instruction) == 1
+            assert "parallel tool calls in ONE message" in prompt
+            # Beside the single-pass instruction, ahead of the submit contract.
+            assert (
+                prompt.index(quality_reviewer.EXHAUSTIVE_SINGLE_PASS_INSTRUCTION)
+                < prompt.index(instruction)
+                < prompt.index("calling aiworkhub_worker_quality_review_submit exactly once")
+            )
+
+    @pytest.mark.parametrize("lens", ["correctness", "security", "code_quality"])
     @pytest.mark.parametrize("scoped", [True, False], ids=["scoped", "unscoped"])
     def test_every_prompt_states_the_hunk_review_surface(self, lens, scoped):
         """NF-2026-01093: the surface is what the worker wrote, in EVERY prompt.
@@ -535,7 +556,11 @@ class TestBuildReviewPrompt:
 
         oversized = dict(packet)
         oversized["candidate"] = dict(packet["candidate"])
-        oversized["candidate"]["padding"] = "x" * (100 * 1024)
+        # Past the sighted inline cap: below it a claude_cli reviewer is inlined
+        # even with no root, so only above it is the too-large refusal reachable.
+        oversized["candidate"]["padding"] = "x" * (
+            quality_review.SIGHTED_INLINE_PACKET_MAX_BYTES + 1
+        )
         oversized["packet_sha256"] = _canonical_digest(
             {k: v for k, v in oversized.items() if k != "packet_sha256"}
         )
@@ -550,13 +575,13 @@ class TestBuildReviewPrompt:
         runtime_root.mkdir()
         bound_path = runtime_root / "quality_review_packet.json"
         bound = quality_review.assemble_reviewer_prompt(
-            packet, lens="correctness", adapter_id="claude_cli",
+            oversized, lens="correctness", adapter_id="claude_cli",
             packet_path=str(bound_path), packet_root=runtime_root,
         )
         assert bound.count("QUALITY_REVIEW_PACKET_FILE:") == 1
-        assert f"PACKET_SHA256: {packet['packet_sha256']}" in bound
+        assert f"PACKET_SHA256: {oversized['packet_sha256']}" in bound
         assert "QUALITY_REVIEW_PACKET:" not in bound
-        assert json.loads(bound_path.read_text(encoding="utf-8")) == packet
+        assert json.loads(bound_path.read_text(encoding="utf-8")) == oversized
 
     @pytest.mark.parametrize("adapter_id", ["codex_cli", "deepseek_copilot_cli"])
     def test_native_oversized_packet_uses_explicit_coordinator_root_without_env(
@@ -564,7 +589,11 @@ class TestBuildReviewPrompt:
     ):
         monkeypatch.delenv(quality_reviewer.REVIEW_PACKET_FILE_ROOT_ENV, raising=False)
         packet = _packet_with_findings()
-        packet["candidate"]["padding"] = "x" * (100 * 1024)
+        # Past the sighted inline cap: codex_cli joins deepseek_copilot_cli on the
+        # file transport.
+        packet["candidate"]["padding"] = "x" * (
+            quality_review.SIGHTED_INLINE_PACKET_MAX_BYTES + 1
+        )
         packet["packet_sha256"] = _canonical_digest({k: v for k, v in packet.items() if k != "packet_sha256"})
         runtime_root = tmp_path / "task_mcp_worker_runtime"
         runtime_root.mkdir()
@@ -680,7 +709,10 @@ class TestBuildReviewPrompt:
         packet["candidate"]["scoped_audits"] = {
             binding["lens"]: packet["candidate"]["scoped_audits"][binding["lens"]]
         }
-        packet["candidate"]["padding"] = "x" * (100 * 1024)
+        # Past the sighted inline cap: claude_cli still gets the file transport.
+        packet["candidate"]["padding"] = "x" * (
+            quality_review.SIGHTED_INLINE_PACKET_MAX_BYTES + 1
+        )
         packet["packet_sha256"] = _canonical_digest({k: v for k, v in packet.items() if k != "packet_sha256"})
         binding["packet"] = packet
         expected_root = Path(binding["source_workspace"]["home"]) / "task_mcp_worker_runtime"
@@ -2616,7 +2648,11 @@ class TestSchemaRepairTurn:
 
     def _blind_packet(self) -> dict:
         packet = _packet_with_findings()
-        packet["candidate"]["padding"] = "x" * (100 * 1024)
+        # Past the sighted inline cap, so a codex_cli reviewer still gets the
+        # file transport this class compares against the blind inline one.
+        packet["candidate"]["padding"] = "x" * (
+            quality_review.SIGHTED_INLINE_PACKET_MAX_BYTES + 1
+        )
         packet["packet_sha256"] = _canonical_digest(
             {k: v for k, v in packet.items() if k != "packet_sha256"}
         )

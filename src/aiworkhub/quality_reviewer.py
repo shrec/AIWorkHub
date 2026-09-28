@@ -223,6 +223,16 @@ EXHAUSTIVE_SINGLE_PASS_INSTRUCTION = (
     "back for a later round; a defect that was visible now and reported only "
     "in a later round costs a full rework cycle. "
 )
+# NF-2026-01108: only 15-19% of a reviewer's messages batched their tool calls,
+# and every extra turn re-sends the whole context.  agent_tool_instructions
+# carries the same sentence for the worker runtime policy as a copy pinned equal
+# by test, not an import: this module sits in the worker MCP package's import
+# closure and agent_tool_instructions does not.
+PARALLEL_TOOL_CALLS_INSTRUCTION = (
+    "Issue independent reads and queries (known line ranges, Source Graph "
+    "lookups) together as parallel tool calls in ONE message, never one call "
+    "per turn."
+)
 # NF-2026-01093: the review surface of EVERY round is exactly what the worker
 # wrote -- its changed hunks -- never the files they sit in.  Measured:
 # correctness reviews took 13-20 minutes on small diffs and one timed out at
@@ -1007,6 +1017,27 @@ def _rework_delta_instruction(packet: Mapping[str, Any], *, lens: str) -> str:
     return REWORK_DELTA_REVIEW_INSTRUCTION
 
 
+def canonical_packet_text(packet: Mapping[str, Any]) -> str:
+    """Serialise *packet* canonically: the text a prompt embeds and a file holds."""
+
+    return json.dumps(packet, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def uses_packet_file_transport(
+    packet_file: str | None, packet_root: Path | str | None = None
+) -> bool:
+    """Whether *packet_file* carries the packet in place of the prompt.
+
+    A path alone never selects the file transport: it also needs coordinator-owned
+    root authority (an explicit *packet_root* or the worker-environment fallback),
+    because that authority is what lets the file be written at all.
+    """
+
+    return packet_file is not None and bool(
+        packet_root is not None or os.environ.get(REVIEW_PACKET_FILE_ROOT_ENV)
+    )
+
+
 def build_review_prompt(
     packet: Mapping[str, Any],
     *,
@@ -1023,7 +1054,9 @@ def build_review_prompt(
     path and the prompt references it via FILE + SHA regardless of size, even
     just below 96 KiB.  This avoids E2BIG on native CLI adapters where
     quality-review payloads would otherwise be passed through argv.
-    Blind adapters omit *packet_file* and still receive the packet inline.
+    Blind adapters omit *packet_file* and still receive the packet inline, as do
+    the stdin-prompt CLI adapters within the sighted inline cap (the choice is
+    ``quality_review.assemble_reviewer_prompt``'s, made before this is called).
     *packet_root* is coordinator-owned write authority, independent of the
     destination path. It overrides the worker-environment fallback without
     *prior_rejection* is the durable refusal a previous attempt at this exact
@@ -1050,7 +1083,7 @@ def build_review_prompt(
         active_scope = scoped_audits[lens]
         if not isinstance(active_scope, Mapping):
             raise ReviewerEvidenceError("review_scope_invalid")
-    encoded = json.dumps(packet, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    encoded = canonical_packet_text(packet)
     # The packet a lens receives is built by ``build_lens_packet`` and carries
     # exactly that lens's scoped audit, so the scope is delivered ONCE, inside
     # the sealed packet.  It used to be inlined a second time here as
@@ -1123,9 +1156,7 @@ def build_review_prompt(
         if isinstance(packet.get("manager_amendment"), Mapping)
         else ""
     )
-    use_file_transport = packet_file is not None and (
-        packet_root is not None or os.environ.get(REVIEW_PACKET_FILE_ROOT_ENV)
-    )
+    use_file_transport = uses_packet_file_transport(packet_file, packet_root)
     if use_file_transport and packet_file is not None:
         _write_review_packet_file(Path(packet_file), encoded, packet_root=packet_root)
     elif packet_file is not None and len(encoded.encode("utf-8")) > max_inline_bytes:
@@ -1184,6 +1215,7 @@ def build_review_prompt(
         f"{_ALREADY_ESTABLISHED_MECHANICALLY}"
         "Report only concrete items supported by file/line or check evidence. "
         f"{EXHAUSTIVE_SINGLE_PASS_INSTRUCTION}"
+        f"{PARALLEL_TOOL_CALLS_INSTRUCTION} "
         f"{QUALITY_REVIEW_FINDING_SCHEMA_DOC}\n"
         f"Finish by calling {submit_tool_name} exactly once with "
         f'{{"packet_sha256":"{packet_digest}","lens":"{lens}","findings":[...]}}. '

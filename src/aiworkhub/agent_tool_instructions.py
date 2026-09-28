@@ -440,6 +440,18 @@ _ENFORCEMENT_NOTICE = (
 )
 
 
+# The sentence quality_reviewer renders into every reviewer prompt (NF-2026-01108:
+# only 15-19% of messages batched their tool calls, and each extra turn re-sends
+# the whole context).  A copy pinned equal by test, not an import:
+# quality_reviewer sits in the worker MCP package's import closure and must not
+# import this module, and this module stays free of a reviewer dependency.
+PARALLEL_TOOL_CALLS_INSTRUCTION = (
+    "Issue independent reads and queries (known line ranges, Source Graph "
+    "lookups) together as parallel tool calls in ONE message, never one call "
+    "per turn."
+)
+
+
 WORKER_RUNTIME_POLICY = f"""You are the sole worker for one exact AIWorkHub task in an isolated worktree.
 
 The coordinator already claimed the task. Do not run taskctl lifecycle commands,
@@ -492,6 +504,7 @@ MANDATORY_AIWORKHUB_TOOLS:
 - Prefer Source Graph body/file previews after discovery. If an exact provider
   file read is still necessary, request one bounded range and reuse it instead
   of rereading an unchanged identical range.
+- {PARALLEL_TOOL_CALLS_INSTRUCTION}
 - SEMANTIC_EDIT_IS_MANDATORY: change an existing file with
   aiworkhub_worker_semantic_edit_prepare on the smallest Source Graph line
   range, then aiworkhub_worker_semantic_edit_apply with replacement code only.
@@ -915,6 +928,7 @@ __all__ = [
     "END",
     "MANAGER_CONTEXT_GRAPH_TOOL_NAMES",
     "OutsideScan",
+    "PARALLEL_TOOL_CALLS_INSTRUCTION",
     "POLICY",
     "PROJECTION_MAX_BYTES",
     "PROVIDERS",

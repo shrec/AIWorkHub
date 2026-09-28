@@ -29,6 +29,7 @@ from aiworkhub import (  # noqa: E402
     task_store,
     task_templates,
     toolchain_authority,
+    windows_appcontainer,
     worker_ai_tools_mcp,
     worker_workspace,
 )
@@ -242,6 +243,35 @@ def _manager(tmp_path: Path, *, show_task, argv) -> process_launcher.ProcessMana
         adapter_builder=_plan(argv, repo),
         isolation_enabled=False,
     )
+
+
+# NF-2026-01109.  A real launch preflight cannot run inside the Windows AppContainer
+# validation lane: ``_preflight_card`` mints a toolchain-authority receipt, which
+# needs its HMAC key hardened to an owner-only DACL, and the container is refused
+# WRITE_DAC on the key file it just created.  Reproduced in the container:
+# ``terminal_authority.load_or_create_key`` raises the RuntimeError named below,
+# ``_authority_secret`` then answers ``b""`` and ``_preflight_card`` raises
+# ``validation_toolchain_authority_secret_unavailable``, so ``launch``,
+# ``_launch_isolated`` and ``_preflight_card`` all fail there.  No fixture can grant
+# that right, so the tests that need a real preflight skip in the container and are
+# decided by the canonical run on the host.
+_APPCONTAINER_PREFLIGHT_KEY_DENIED = (
+    "windows_appcontainer: terminal_authority.load_or_create_key raises "
+    "RuntimeError terminal_authority_key_dacl_hardening_failed:"
+    "create_file_write_dac_failed:5, so the launch preflight fails with "
+    "validation_toolchain_authority_secret_unavailable (NF-2026-01109)"
+)
+
+
+def _skip_in_appcontainer(reason: str) -> None:
+    """Skip inside the Windows AppContainer validation lane, and nowhere else.
+
+    ``current_process_is_appcontainer`` fails closed to ``False`` off Windows and
+    on any token-read failure, so a host or CI run always executes the test.
+    """
+
+    if windows_appcontainer.current_process_is_appcontainer():
+        pytest.skip(reason)
 
 
 def test_memory_admission_rejects_insufficient_available_memory(monkeypatch) -> None:
@@ -2695,6 +2725,7 @@ def test_launch_accepts_valid_canonical_tuple_for_high_risk_task(
 
 
 def test_real_shell_free_process_reaches_review_ready(monkeypatch, tmp_path):
+    _skip_in_appcontainer(_APPCONTAINER_PREFLIGHT_KEY_DENIED)
     _open_gates(monkeypatch)
     marker = tmp_path / "review.marker"
 
@@ -2728,6 +2759,7 @@ def test_real_shell_free_process_reaches_review_ready(monkeypatch, tmp_path):
 
 
 def test_success_without_review_is_explicit_failure_state(monkeypatch, tmp_path):
+    _skip_in_appcontainer(_APPCONTAINER_PREFLIGHT_KEY_DENIED)
     _open_gates(monkeypatch)
     manager = _manager(
         tmp_path,
@@ -7188,6 +7220,7 @@ def _reviewer_launch_setup(tmp_path: Path, monkeypatch):
 def test_quality_review_launch_isolated_orders_authority_prewarm_registration(
     monkeypatch, tmp_path,
 ):
+    _skip_in_appcontainer(_APPCONTAINER_PREFLIGHT_KEY_DENIED)
     manager, binding = _reviewer_launch_setup(tmp_path, monkeypatch)
     order: list[str] = []
 
@@ -7237,6 +7270,7 @@ def test_quality_review_launch_isolated_orders_authority_prewarm_registration(
 def test_quality_review_launch_isolated_fails_closed_before_prewarm_and_registration(
     monkeypatch, tmp_path,
 ):
+    _skip_in_appcontainer(_APPCONTAINER_PREFLIGHT_KEY_DENIED)
     manager, binding = _reviewer_launch_setup(tmp_path, monkeypatch)
     order: list[str] = []
 
@@ -7295,6 +7329,7 @@ def test_quality_review_launch_isolated_classifies_prewarm_data_failure_truthful
     registration.
     """
 
+    _skip_in_appcontainer(_APPCONTAINER_PREFLIGHT_KEY_DENIED)
     manager, binding = _reviewer_launch_setup(tmp_path, monkeypatch)
     order: list[str] = []
 
@@ -10161,6 +10196,7 @@ def test_quality_reviewer_preflight_omits_none_reserved_request_id(
 def test_quality_reviewer_reserved_launch_handoff_skips_second_claim(
     tmp_path, monkeypatch,
 ):
+    _skip_in_appcontainer(_APPCONTAINER_PREFLIGHT_KEY_DENIED)
     monkeypatch.setattr(process_launcher, "chmod_fd", lambda *_a, **_k: None)
     monkeypatch.setattr(process_launcher, "chmod_path", lambda *_a, **_k: None)
     monkeypatch.setattr(os, "chmod", lambda *_a, **_k: None)
@@ -11626,6 +11662,7 @@ def _nf548_changed_content_card() -> dict:
 def test_identical_relaunch_guard_permits_every_changed_input(
     tmp_path: Path, card_fn
 ) -> None:
+    _skip_in_appcontainer(_APPCONTAINER_PREFLIGHT_KEY_DENIED)
     card = card_fn()
     assert (
         process_launcher.identical_relaunch_refusal(
@@ -13076,6 +13113,7 @@ def test_launcher_hands_the_repair_ask_the_retry_that_produced_this_launch(
 
 
 def test_a_first_reviewer_launch_carries_no_repair_ask(monkeypatch, tmp_path):
+    _skip_in_appcontainer(_APPCONTAINER_PREFLIGHT_KEY_DENIED)
     captured = _reach_reviewer_prompt_seam(tmp_path, monkeypatch, {})
 
     assert captured["prior_rejection"] == ""

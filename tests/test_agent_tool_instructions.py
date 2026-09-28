@@ -537,6 +537,27 @@ def test_worker_policy_states_resolved_toolchain_and_bounded_output() -> None:
     assert "Call aiworkhub_worker_session_current_state for continuity" not in policy
 
 
+def test_worker_policy_batches_independent_tool_calls_once_for_every_adapter() -> None:
+    from aiworkhub import quality_reviewer, runtime_adapters
+
+    # NF-2026-01108: one sentence, two carriers. Each keeps its own copy
+    # (quality_reviewer must not import this module), so this pins them equal.
+    assert (
+        instr.PARALLEL_TOOL_CALLS_INSTRUCTION
+        == quality_reviewer.PARALLEL_TOOL_CALLS_INSTRUCTION
+    )
+    assert "parallel tool calls in ONE message" in instr.PARALLEL_TOOL_CALLS_INSTRUCTION
+    for adapter_id in (None, *runtime_adapters.SUPPORTED_ADAPTERS):
+        policy = instr.render_worker_runtime_policy(adapter_id)
+        assert policy.count(instr.PARALLEL_TOOL_CALLS_INSTRUCTION) == 1, adapter_id
+    policy = instr.render_worker_runtime_policy()
+    assert (
+        policy.index("MANDATORY_AIWORKHUB_TOOLS:")
+        < policy.index(instr.PARALLEL_TOOL_CALLS_INSTRUCTION)
+        < policy.index("Your final message must be at most 12 lines")
+    )
+
+
 # ---------------------------------------------------------------------------
 # Derived prohibition, derived substitution, and per-seat enforcement honesty.
 #

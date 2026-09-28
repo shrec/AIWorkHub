@@ -15,8 +15,9 @@ mutation.  The functions:
   path only as a convenience for adapters that *do* have a file-read tool;
 * assemble the reviewer prompt for the exact adapter that will run it
   (:func:`assemble_reviewer_prompt`) -- the single seam the reviewer launch
-  path uses so a blind adapter is handed content and a sighted one keeps its
-  path transport;
+  path uses so a blind adapter is handed content, a sighted adapter that reads
+  its prompt from stdin gets a bounded packet inline, and every other sighted
+  adapter keeps its path transport;
 * decide when a reviewer may keep inspecting rather than being forced to submit
   after a single zero-hit Source Graph query
   (:func:`reviewer_may_query_source_graph_again` / :func:`reviewer_submit_forced`);
@@ -44,7 +45,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from . import quality_reviewer, runtime_adapters
+from . import agent_tool_instructions, quality_reviewer, runtime_adapters
 from .quality_reviewer import ReviewerEvidenceError
 
 DELIVERY_SCHEMA_ID = "aiworkhub.quality_review_packet_delivery.v1"
@@ -53,6 +54,22 @@ SCOPE_SCHEMA_ID = "aiworkhub.quality_review_source_graph_scope.v1"
 INDEPENDENCE_SCHEMA_ID = "aiworkhub.quality_review_independence.v1"
 
 DEFAULT_SUBMIT_TOOL = "aiworkhub_worker_quality_review_submit"
+
+# The reviewer tools a Claude host has to load before it can call them; the
+# submit tool is whatever ``submit_tool_name`` the caller binds.
+_SOURCE_GRAPH_TOOL = "aiworkhub_worker_source_graph_query"
+_PACKET_READ_TOOL = "aiworkhub_worker_quality_review_packet_read"
+
+# Sighted adapters whose prompt reaches the child on stdin, never argv, so a large
+# inline packet cannot hit E2BIG: runtime_adapters.py:2185 (claude_cli) and :2214
+# (codex_cli) both set ``stdin_text = prompt``.  Every other sighted adapter keeps
+# the file transport, which is what protects its argv.
+_STDIN_PROMPT_ADAPTERS = frozenset({"claude_cli", "codex_cli"})
+# The most such a reviewer is handed inline.  The file transport costs it a
+# quality_review_packet_read call per part (NF-2026-01108: 369 in 187 reviews,
+# 25% of all reviewer tool calls) and every call re-sends the whole context.
+# Above the cap the file transport is unchanged.
+SIGHTED_INLINE_PACKET_MAX_BYTES = 192 * 1024
 
 # Inline transport marker emitted by ``quality_reviewer.build_review_prompt``
 # when the packet content is embedded rather than referenced by path.
@@ -200,6 +217,30 @@ def build_reviewer_prompt_with_content(
     return prompt
 
 
+def _claude_reviewer_schema_block(submit_tool_name: str, *, file_transport: bool) -> str:
+    """The one ToolSearch a Claude reviewer makes, naming only the tools it calls.
+
+    A Claude CLI host defers MCP tool schemas, and left to itself a reviewer
+    finds them one keyword search at a time (NF-2026-01108: 341 ToolSearch calls
+    in 187 reviews).  ``packet_read`` is named only when the prompt actually
+    sends the reviewer to it.
+    """
+
+    tools = [_SOURCE_GRAPH_TOOL, submit_tool_name]
+    if file_transport:
+        tools.append(_PACKET_READ_TOOL)
+    query = "select:" + ",".join(
+        f"mcp__{agent_tool_instructions.WORKER_MCP_SERVER_NAME}__{name}"
+        for name in tools
+    )
+    return (
+        "CLAUDE_TOOL_SCHEMAS: a Claude CLI host defers MCP tool schemas. Load the "
+        "required schemas with exactly one ToolSearch call before any other tool "
+        f'call, query "{query}"\n'
+        "(that query is exact; never search schemas by keyword).\n"
+    )
+
+
 def assemble_reviewer_prompt(
     packet: Mapping[str, Any],
     *,
@@ -216,11 +257,20 @@ def assemble_reviewer_prompt(
     This is the single prompt-assembly seam used by the reviewer launch path in
     :mod:`aiworkhub.process_launcher`.  A *sighted* adapter -- one whose reviewer
     is handed a worker file-read tool -- keeps the path-referenced transport,
-    which avoids passing a large packet through argv on native CLI adapters.  A
+    which avoids passing a large packet through argv on native CLI adapters.
+    ``claude_cli`` and ``codex_cli`` are the exception: they send the prompt on
+    stdin, so argv size does not bind them, and a packet up to
+    ``SIGHTED_INLINE_PACKET_MAX_BYTES`` is embedded inline instead, saving the
+    reviewer a ``quality_review_packet_read`` turn per part.  The bound packet
+    file is still written, with the same bytes and under the same root
+    authority, because the request-bound tools resolve the packet from it.  A
     *blind* adapter -- notably the in-process ``vscode_lm`` routes, which hand
     the model no file-read tool of any kind -- receives the packet content
     inline so it can still cite an exact packet-permitted path and line.  A
     blind reviewer is never handed only an unreadable path.
+
+    A ``claude_cli`` prompt ends with the one ``ToolSearch`` that loads the tool
+    schemas its host defers; no other adapter is told to call ``ToolSearch``.
 
     ``packet_root`` comes from the coordinator's verified worker runtime directory;
     it is not inferred from ``packet_path`` or asserted by the reviewer.
@@ -235,14 +285,41 @@ def assemble_reviewer_prompt(
     if runtime_adapters.adapter_provides_file_read(
         adapter_id, adapter_fallback_used=adapter_fallback_used
     ):
-        return quality_reviewer.build_review_prompt(
-            packet,
-            lens=lens,
-            submit_tool_name=submit_tool_name,
-            packet_file=packet_path,
-            packet_root=packet_root,
-            prior_rejection=prior_rejection,
+        file_bound = quality_reviewer.uses_packet_file_transport(packet_path, packet_root)
+        inline_packet = adapter_id in _STDIN_PROMPT_ADAPTERS and (
+            len(quality_reviewer.canonical_packet_text(packet).encode("utf-8"))
+            <= SIGHTED_INLINE_PACKET_MAX_BYTES
         )
+        if inline_packet:
+            prompt = quality_reviewer.build_review_prompt(
+                packet,
+                lens=lens,
+                submit_tool_name=submit_tool_name,
+                packet_file=None,
+                prior_rejection=prior_rejection,
+            )
+            # Written only once the prompt has validated the packet, so a refused
+            # packet leaves no file behind; the write is the file transport's own.
+            if file_bound and packet_path is not None:
+                quality_reviewer._write_review_packet_file(
+                    Path(packet_path),
+                    quality_reviewer.canonical_packet_text(packet),
+                    packet_root=packet_root,
+                )
+        else:
+            prompt = quality_reviewer.build_review_prompt(
+                packet,
+                lens=lens,
+                submit_tool_name=submit_tool_name,
+                packet_file=packet_path,
+                packet_root=packet_root,
+                prior_rejection=prior_rejection,
+            )
+        if adapter_id == "claude_cli":
+            prompt += _claude_reviewer_schema_block(
+                submit_tool_name, file_transport=file_bound and not inline_packet
+            )
+        return prompt
     return build_reviewer_prompt_with_content(
         packet,
         lens=lens,
@@ -1141,6 +1218,7 @@ __all__ = [
     "SCOPE_SCHEMA_ID",
     "INDEPENDENCE_SCHEMA_ID",
     "DEFAULT_SUBMIT_TOOL",
+    "SIGHTED_INLINE_PACKET_MAX_BYTES",
     "REVIEWER_MIN_INSPECTION_QUERIES",
     "REVIEWER_MAX_INSPECTION_QUERIES",
     "AVAILABILITY_AVAILABLE",
