@@ -162,7 +162,7 @@ def test_missing_approved_executable_fails_closed(
 
 
 def test_runtime_symlink_escape_fails_closed(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, make_symlink
 ) -> None:
     runtime_root = tmp_path / "project" / ".venv"
     escaped = _executable(tmp_path / "elsewhere" / "ruff")
@@ -172,7 +172,7 @@ def test_runtime_symlink_escape_fails_closed(
         else runtime_root / "bin" / "ruff"
     )
     link.parent.mkdir(parents=True)
-    link.symlink_to(escaped)
+    make_symlink(escaped, link)
     monkeypatch.setattr(
         worker_workspace,
         "_trusted_validation_runtime_roots",
