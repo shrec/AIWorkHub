@@ -62,6 +62,12 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
+## What's new in 0.12.5
+
+- The SDLC loop measures itself: quality drifts beyond 2σ/3σ file a NeedFix automatically, and escaped defects are traced to the card that introduced them.
+- Every release leaves a receipt (commit, VSIX digest, rollback target, installed confirmation).
+- Sandboxed workers can run their validation while they work, instead of finding failures only after they exit.
+
 ## What's new in 0.12.4
 
 - Cleanup is automatic: after every task decision AIWorkHub removes the worktrees, logs, deltas and records nobody needs any more, and files a NeedFix if something cannot be removed.

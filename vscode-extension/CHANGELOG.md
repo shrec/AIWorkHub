@@ -1,5 +1,18 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.12.5 — 2026-09-29
+
+### Added
+
+- SDLC control bands: a deterministic detector compares the last 20 decided cards with the 100 before them (first-pass acceptance, review rounds, validation-failed rate) and files a medium NeedFix at 2σ and a high one at 3σ, one per metric, with no model in the loop (RM-2026-00076).
+- Escaped-defect attribution: a NeedFix whose fix card was accepted is traced by blame to the accepted card that introduced the defect and linked through a validated, immutable `caused_by` (RM-2026-00076).
+- Release receipts: `scripts/release_receipt.py` records each built VSIX (commit, digest, rollback target) and its installed confirmation in the tracked `.aiworkhub/releases.jsonl` (RM-2026-00076).
+
+### Fixed
+
+- A worker contained in an AppContainer can run its card validation in-loop: `validation_run` executes in a separate validation AppContainer instead of refusing, so workers no longer loop blind until post-exit validation (NF-2026-01120).
+- The reconciler heartbeat no longer reads as stale: its status temp file is hardened to an owner-only DACL when the inherited one is untrusted, so the durable status is written (NF-2026-01119).
+
 ## 0.12.4 — 2026-09-29
 
 ### Added

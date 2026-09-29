@@ -14,6 +14,12 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.12.5
+
+- The SDLC loop measures itself: quality drifts beyond 2σ/3σ file a NeedFix automatically, and escaped defects are traced to the card that introduced them.
+- Every release leaves a receipt (commit, VSIX digest, rollback target, installed confirmation).
+- Sandboxed workers can run their validation while they work, instead of finding failures only after they exit.
+
 ## What's new in 0.12.4
 
 - Cleanup is automatic: after every task decision AIWorkHub removes the worktrees, logs, deltas and records nobody needs any more, and files a NeedFix if something cannot be removed.
