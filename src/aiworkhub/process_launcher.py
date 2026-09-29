@@ -1064,6 +1064,56 @@ def read_supervisor_status(path: Path) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+def finalize_supervisor_record(
+    path: Path, supervisor_status: dict[str, Any], terminal_state: str, error: str
+) -> bool:
+    """Settle a supervisor record still claiming ``starting``/``running``.
+
+    NF-2026-01107: a supervisor that died before its own terminal write left
+    ``state: running`` behind forever. Once the launcher has classified the
+    request terminally it replaces that stale claim through the same
+    owner-only atomic writer; a record the supervisor already finalized is
+    never touched, so its own terminal write stays authoritative.
+    """
+    if str(supervisor_status.get("state") or "") not in {"starting", "running"}:
+        return False
+    # Re-read immediately before writing: the supervisor may have published
+    # its own terminal record after the caller's snapshot was taken.
+    on_disk = read_supervisor_status(path)
+    if str(on_disk.get("state") or "") not in {"starting", "running"}:
+        return False
+    try:
+        write_json_0600(path, {
+            **on_disk,
+            "state": terminal_state,
+            "error": str(on_disk.get("error") or error)[:500],
+            "finalized_by": "launcher",
+            "finalized_at_epoch": time.time(),
+        })
+    except OSError:
+        return False
+    return True
+
+
+def supervisor_pids_dead(latest: dict[str, Any]) -> bool:
+    """Read-only: the row and its supervisor record claim ``running`` while
+    every recorded PID (supervisor and child) is proven dead. Unknown PID
+    identity fails closed (not dead); nothing is signalled or rewritten."""
+    status_raw = latest.get("supervisor_status_path")
+    if latest.get("state") != "running" or not status_raw:
+        return False
+    record = read_supervisor_status(Path(str(status_raw)))
+    if record.get("state") != "running":
+        return False
+    pids = (
+        (latest.get("pid"), latest.get("pid_start_ticks")),
+        (record.get("child_pid"), record.get("child_pid_start_ticks")),
+    )
+    if not any(pid for pid, _ in pids):
+        return False
+    return all(_process_proven_dead(pid, ticks) for pid, ticks in pids)
+
+
 _terminal_authority_signing_material = terminal_authority.signing_material
 _load_or_create_terminal_authority_key = terminal_authority.load_or_create_key
 _write_terminal_authority_grant = terminal_authority.write_grant
@@ -11281,6 +11331,11 @@ class ProcessManager:
                 if not error:
                     reason = terminal_failure_classification.supervisor_incomplete_reason(supervisor_state, supervisor_returncode)
                     error = reason.render()
+            # NF-2026-01107: the request has been classified terminally here,
+            # so a record still claiming running is settled terminally.
+            finalize_supervisor_record(
+                status_path, supervisor_status, terminal_state, error
+            )
             provider_launch_failure = None
             # NF-2026-01036: a VS Code LM credit/balance refusal the worker read
             # from the extension host's OWN response field.  It stays a
@@ -13878,11 +13933,18 @@ class ProcessManager:
         self._reconcile_persisted_requests()
         latest = list(self._latest_by_request().values())
         latest.sort(key=lambda row: str(row.get("timestamp") or ""), reverse=True)
-        rows = latest[: max(1, min(limit, 1000))]
+        rows = [dict(row) for row in latest[: max(1, min(limit, 1000))]]
         for row in rows:
             liveness = self._liveness_snapshot(row)
             if liveness:
                 row["liveness"] = liveness
+            if supervisor_pids_dead(row):
+                # NF-2026-01107: a view-only correction; the record is untouched.
+                row.update({
+                    "state": "stale",
+                    "recorded_state": "running",
+                    "stale_reason": "supervisor_pids_dead",
+                })
         return {
             "ok": True,
             "launch_implemented": LAUNCH_IMPLEMENTED,

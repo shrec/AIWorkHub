@@ -4,11 +4,13 @@ import errno
 import hashlib
 import json
 import os
+import shutil
 import signal
 import sqlite3
 import subprocess
 import stat
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -26,6 +28,7 @@ from aiworkhub import (  # noqa: E402
     platform_io,
     process_launcher,
     process_launcher_acceptance,
+    runtime_temp,
     task_store,
     task_templates,
     toolchain_authority,
@@ -42,6 +45,99 @@ def _disable_async_retention_sweep(monkeypatch: pytest.MonkeyPatch) -> None:
         "schedule_repository_cleanup",
         lambda *_args, **_kwargs: None,
     )
+
+
+# A fixed receipt key for every test.  ``toolchain_authority._authority_secret``
+# prefers this variable over the repository key file, so a launch preflight never
+# needs the key file's owner-only DACL, which the Windows AppContainer validation
+# lane is refused (NF-2026-01109).  Tests that pin their own key still override it.
+_TEST_TOOLCHAIN_AUTHORITY_HMAC_KEY = "hex:" + ("5a" * 32)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_runtime_state(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Keep audit and toolchain-authority state inside this test's tmp_path.
+
+    Without an explicit audit path ``core.write_audit_entry`` resolves the
+    repository-relative ``.aiworkhub/runtime/process_logs/audit.jsonl`` of the
+    checkout running the tests, which the contained validation lane cannot write.
+    """
+
+    monkeypatch.setenv(
+        "AIWORKHUB_AUDIT_LOG_PATH",
+        str(tmp_path / "isolated-runtime" / "process_logs" / "audit.jsonl"),
+    )
+    monkeypatch.setenv(
+        "AIWORKHUB_TOOLCHAIN_AUTHORITY_HMAC_KEY", _TEST_TOOLCHAIN_AUTHORITY_HMAC_KEY
+    )
+
+
+def _symlink_creation_supported() -> bool:
+    probe = Path(tempfile.mkdtemp(prefix="aiworkhub-symlink-probe-"))
+    try:
+        target = probe / "target"
+        target.write_bytes(b"")
+        (probe / "link").symlink_to(target)
+    except OSError as exc:
+        # Only a missing symlink privilege (WinError 1314) or an access denial
+        # means "unsupported here"; any other failure is a real error.
+        if getattr(exc, "winerror", None) == 1314 or exc.errno in (
+            errno.EPERM,
+            errno.EACCES,
+        ):
+            return False
+        raise
+    finally:
+        shutil.rmtree(probe, ignore_errors=True)
+    return True
+
+
+# Probed once, up front: the Windows AppContainer validation lane is denied
+# symlink creation, so tests that plant a link skip there instead of failing.
+_requires_symlinks = pytest.mark.skipif(
+    not _symlink_creation_supported(),
+    reason="validation_unsupported_in_sandbox:symlink_denied",
+)
+
+
+def _anchored_regular_read_denial() -> str | None:
+    """Return why an anchored candidate read fails here, or None when it works.
+
+    Candidate capture (``successful_rework_recovery._read_regular``) walks from
+    the drive root with retained parent handles; a restricted AppContainer
+    token cannot open that root, so every path that seals or replays candidate
+    bytes fails closed there while the same test passes on the host.
+    """
+    from aiworkhub import successful_rework_recovery
+
+    probe = Path(tempfile.mkdtemp(prefix="aiworkhub-anchored-read-probe-"))
+    try:
+        (probe / "candidate.txt").write_bytes(b"probe")
+        successful_rework_recovery._read_regular(
+            probe / "candidate.txt", probe, 64
+        )
+    except successful_rework_recovery.SuccessfulReworkRecoveryError as exc:
+        # Skip ONLY on the measured AppContainer denial: the anchored-walk open
+        # failure, raised from an OSError or a runtime_temp.RuntimeTempError.
+        # Every other refusal (path_unsafe, content_too_large, content_changed)
+        # returns None so integrity regressions fail loudly.
+        if str(exc) == "successful_rework_read_failed" and isinstance(
+            exc.__cause__, (OSError, runtime_temp.RuntimeTempError)
+        ):
+            return f"anchored_read_denied:{exc}"
+        return None
+    finally:
+        shutil.rmtree(probe, ignore_errors=True)
+    return None
+
+
+_ANCHORED_READ_DENIAL = _anchored_regular_read_denial()
+_requires_anchored_reads = pytest.mark.skipif(
+    _ANCHORED_READ_DENIAL is not None,
+    reason=f"validation_unsupported_in_sandbox:{_ANCHORED_READ_DENIAL}",
+)
 
 
 class _RejectingToolchainAuthority:
@@ -2991,6 +3087,7 @@ def test_external_readonly_sources_are_bounded_and_collapsed(monkeypatch, tmp_pa
     ) == [str(release.resolve())]
 
 
+@_requires_symlinks
 def test_external_readonly_sources_fail_closed_on_escape(monkeypatch, tmp_path):
     root = tmp_path / "external"
     root.mkdir()
@@ -3164,6 +3261,7 @@ def test_direct_launch_duplicate_check_uses_pid_start_ticks_not_bare_liveness(
     assert "duplicate_persisted_task" in blocked["blocked_reason"]
 
 
+@_requires_symlinks
 def test_safe_tail_refuses_to_follow_a_symlinked_log_path(tmp_path):
     """B314_F008 regression: _safe_tail must not dereference a symlink that
     has replaced the expected log path -- open with O_NOFOLLOW and return an
@@ -4013,6 +4111,7 @@ def test_validation_only_replay_authorization_fails_closed_before_launch():
         )
 
 
+@_requires_anchored_reads
 def test_validation_only_replay_preserves_complete_toolchain_receipt_identity(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -4472,6 +4571,7 @@ def test_validation_only_replay_rejects_tampered_inherited_gate_packet(
         )
 
 
+@_requires_anchored_reads
 def test_isolated_validation_only_replay_never_resolves_or_starts_provider(
     monkeypatch, tmp_path
 ):
@@ -7623,6 +7723,163 @@ def test_process_manager_enforced_timeout_retains_delta_not_candidate_failure(
     assert captured["rework_delta"]["sealed"] is True
 
 
+@pytest.mark.parametrize(
+    ("latest_state", "terminal_state"),
+    [("cancel_requested", "cancelled"), ("finalizing", "worker_failed")],
+)
+def test_nf01107_terminal_finalization_settles_a_running_supervisor_record(
+    monkeypatch, tmp_path, latest_state, terminal_state
+):
+    from aiworkhub import worker_workspace
+
+    manager, request_id, metadata_path, status_path = _finalize_retry_manager(tmp_path)
+    # The supervisor died before its own terminal write: the record still
+    # claims running, and both recorded PIDs are gone.
+    worker_workspace.write_json_0600(status_path, {
+        "state": "running",
+        "child_pid": 999_999_998,
+        "child_pid_start_ticks": 1,
+    })
+    manager._append_event({
+        "request_id": request_id,
+        "task_id": "TASK_B1",
+        "runner": "claude_worker_b1",
+        "topic": "task_mcp",
+        "adapter_id": "claude_cli",
+        "state": latest_state,
+        "metadata_path": str(metadata_path),
+        "supervisor_status_path": str(status_path),
+        "pid": 999_999_999,
+        "pid_start_ticks": 1,
+    })
+    monkeypatch.setattr(process_launcher, "enforce_scope", lambda *_a, **_k: [])
+    monkeypatch.setattr(manager, "_exact_claim_state", lambda _metadata: "processing")
+    monkeypatch.setattr(
+        process_launcher,
+        "_terminal_rework_delta_evidence",
+        lambda *_a, **_k: {"schema_id": "aiworkhub.rework_delta_descriptor.v1", "sealed": True},
+    )
+    monkeypatch.setattr(manager, "_persist_attempt_artifacts", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        manager,
+        "_terminal_failure_exact",
+        lambda *_a, **_k: {"ok": True, "stderr": ""},
+    )
+
+    event = manager._finalize_isolated_request(request_id, 1)
+
+    assert event["state"] == terminal_state
+    record = process_launcher.read_supervisor_status(status_path)
+    assert record["state"] == terminal_state
+    assert record["finalized_by"] == "launcher"
+    assert record["child_pid"] == 999_999_998
+
+
+def test_nf01107_supervisor_record_writer_leaves_a_terminal_record_alone(tmp_path):
+    status_path = tmp_path / "req.supervisor.json"
+    process_launcher.write_json_0600(status_path, {"state": "exited", "exit_code": 0})
+    before = status_path.read_bytes()
+
+    assert not process_launcher.finalize_supervisor_record(
+        status_path, {"state": "exited", "exit_code": 0}, "worker_failed", "x"
+    )
+    assert status_path.read_bytes() == before
+
+
+def test_nf01107_supervisor_record_writer_rechecks_the_on_disk_state(tmp_path):
+    status_path = tmp_path / "req.supervisor.json"
+    process_launcher.write_json_0600(status_path, {"state": "finished", "exit_code": 0})
+    before = status_path.read_bytes()
+
+    assert not process_launcher.finalize_supervisor_record(
+        status_path, {"state": "running", "child_pid": 1}, "worker_failed", "x"
+    )
+    assert status_path.read_bytes() == before
+
+
+def _nf01107_listing_manager(monkeypatch, tmp_path, *, supervisor_pid, child_pid):
+    manager = _manager(
+        tmp_path,
+        show_task=_show(lambda: _card()),
+        argv=[sys.executable, "-c", "pass"],
+    )
+    manager.process_dir.mkdir(parents=True, exist_ok=True)
+    request_id = "e" * 32
+    status_path = manager.process_dir / f"{request_id}.supervisor.json"
+    process_launcher.write_json_0600(status_path, {
+        "state": "running",
+        "child_pid": child_pid,
+        "child_pid_start_ticks": 7,
+    })
+    manager._append_event({
+        "request_id": request_id,
+        "task_id": "TASK_B1",
+        "runner": "claude_worker_b1",
+        "topic": "task_mcp",
+        "adapter_id": "claude_cli",
+        "state": "running",
+        "pid": supervisor_pid,
+        "pid_start_ticks": 5,
+        "supervisor_status_path": str(status_path),
+    })
+    # Isolate the listing's own cross-check from reconciliation, and pin PID
+    # identity: only this test process counts as alive.
+    monkeypatch.setattr(manager, "_reconcile_persisted_requests", lambda: None)
+    monkeypatch.setattr(
+        process_launcher,
+        "_process_proven_dead",
+        lambda pid, _ticks: int(pid or 0) != os.getpid(),
+    )
+
+    def forbid_signal(*_args, **_kwargs):
+        raise AssertionError("the listing must never signal a process")
+
+    monkeypatch.setattr(process_launcher.os, "kill", forbid_signal)
+    monkeypatch.setattr(process_launcher, "_terminate_process_group", forbid_signal)
+    return manager, status_path
+
+
+def _nf01107_state_counts(payload):
+    counts: dict[str, int] = {}
+    for row in payload["processes"]:
+        counts[row["state"]] = counts.get(row["state"], 0) + 1
+    return counts
+
+
+def test_nf01107_listing_reports_running_record_with_dead_pids_as_stale(
+    monkeypatch, tmp_path
+):
+    manager, status_path = _nf01107_listing_manager(
+        monkeypatch, tmp_path, supervisor_pid=999_999_999, child_pid=999_999_998
+    )
+    record_before = status_path.read_bytes()
+    events_before = manager._events()
+
+    payload = manager.list_processes()
+
+    [row] = payload["processes"]
+    assert row["state"] == "stale"
+    assert row["stale_reason"] == "supervisor_pids_dead"
+    assert row["recorded_state"] == "running"
+    assert "running" not in _nf01107_state_counts(payload)
+    # Read-only: neither the supervisor record nor the event ledger moved.
+    assert status_path.read_bytes() == record_before
+    assert manager._events() == events_before
+
+
+def test_nf01107_listing_keeps_a_record_with_a_live_pid_running(monkeypatch, tmp_path):
+    manager, _status_path = _nf01107_listing_manager(
+        monkeypatch, tmp_path, supervisor_pid=999_999_999, child_pid=os.getpid()
+    )
+
+    payload = manager.list_processes()
+
+    [row] = payload["processes"]
+    assert row["state"] == "running"
+    assert "stale_reason" not in row
+    assert _nf01107_state_counts(payload) == {"running": 1}
+
+
 def test_process_manager_windows_metadata_timeout_stays_distinct_from_cancel(
     monkeypatch, tmp_path
 ):
@@ -7804,6 +8061,7 @@ def test_finalization_retry_reuses_prior_recorded_usage(monkeypatch, tmp_path):
     assert event["usage"]["input_tokens"] == 7
 
 
+@_requires_anchored_reads
 def test_terminal_rework_delta_evidence_seals_changed_and_deleted_paths(
     monkeypatch, tmp_path
 ):
@@ -7892,6 +8150,7 @@ def test_terminal_rework_delta_evidence_rejects_invalid_claim_epoch(
     }
 
 
+@_requires_anchored_reads
 def test_terminal_rework_delta_evidence_reports_seal_failure_without_descriptor(
     monkeypatch, tmp_path
 ):
@@ -12141,6 +12400,7 @@ def test_declared_validation_forwards_preflight_toolchain_receipt(
     assert seen["commands"] == ["python -m pytest -q"]
 
 
+@_requires_anchored_reads
 def test_process_manager_finalization_uses_complete_toolchain_receipt_identity(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -13709,6 +13969,7 @@ def test_absent_worker_log_is_typed_absent(tmp_path):
     _assert_typed_unknown(record, "receipt_absent")
 
 
+@_requires_symlinks
 def test_attempt_receipt_refuses_a_symlinked_worker_log(tmp_path):
     real = tmp_path / "real.stdout.log"
     real.write_text(
