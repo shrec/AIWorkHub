@@ -140,10 +140,97 @@ def test_repeated_probe_timeout_is_measured_and_never_persisted(
     assert len(timeouts) == 2
     assert not state_path.exists()
 
-    # A timeout is not cached as an auth verdict: the next launch re-probes.
-    claude_auth.auth_status(sys.executable)
+    # A timeout is only briefly cached; force=True always re-probes.
+    claude_auth.auth_status(sys.executable, force=True)
     assert len(timeouts) == 4
     assert not state_path.exists()
+
+
+def _always_unavailable(monkeypatch, tmp_path) -> tuple[list[float], list[float]]:
+    monkeypatch.setenv(
+        "AIWORKHUB_CLAUDE_AUTH_STATE_FILE", str(tmp_path / "claude-auth.json")
+    )
+    claude_auth.invalidate()
+    timeouts: list[float] = []
+    clock = [1000.0]
+
+    def always_slow(argv, **kwargs):
+        timeouts.append(kwargs["timeout"])
+        raise subprocess.TimeoutExpired(cmd=argv, timeout=kwargs["timeout"])
+
+    monkeypatch.setattr(subprocess, "run", always_slow)
+    monkeypatch.setattr(claude_auth.time, "monotonic", lambda: clock[0])
+    return timeouts, clock
+
+
+def test_unavailable_probe_is_negatively_cached_within_short_ttl(
+    tmp_path, monkeypatch
+) -> None:
+    timeouts, clock = _always_unavailable(monkeypatch, tmp_path)
+
+    first = claude_auth.auth_status(sys.executable)
+    clock[0] += claude_auth.UNAVAILABLE_CACHE_TTL_SECONDS - 1
+    second = claude_auth.auth_status(sys.executable)
+
+    assert claude_auth.UNAVAILABLE_CACHE_TTL_SECONDS == 30.0
+    assert first["status"] == "auth_status_unavailable"
+    assert first["cache_hit"] is False
+    assert second["status"] == "auth_status_unavailable"
+    assert second["launchable"] is False
+    assert second["cache_hit"] is True
+    assert second["probe_attempts"] == first["probe_attempts"]
+    # Both bounded attempts ran exactly once: one probe, not two.
+    assert len(timeouts) == 2
+
+
+def test_unavailable_cache_expires_after_short_ttl(tmp_path, monkeypatch) -> None:
+    timeouts, clock = _always_unavailable(monkeypatch, tmp_path)
+
+    claude_auth.auth_status(sys.executable)
+    clock[0] += claude_auth.UNAVAILABLE_CACHE_TTL_SECONDS
+    again = claude_auth.auth_status(sys.executable)
+
+    assert claude_auth.UNAVAILABLE_CACHE_TTL_SECONDS < claude_auth.CACHE_TTL_SECONDS
+    assert again["cache_hit"] is False
+    assert again["status"] == "auth_status_unavailable"
+    assert len(timeouts) == 4
+
+
+def test_force_bypasses_unavailable_cache(tmp_path, monkeypatch) -> None:
+    timeouts, _clock = _always_unavailable(monkeypatch, tmp_path)
+
+    claude_auth.auth_status(sys.executable)
+    forced = claude_auth.auth_status(sys.executable, force=True)
+
+    assert forced["cache_hit"] is False
+    assert len(timeouts) == 4
+
+
+def test_launchable_result_keeps_long_cache_ttl(monkeypatch) -> None:
+    claude_auth.invalidate()
+    calls: list[list[str]] = []
+    clock = [1000.0]
+
+    def ready(argv, **_kwargs):
+        calls.append(list(argv))
+        return SimpleNamespace(
+            returncode=0,
+            stdout=b'{"loggedIn":true,"authMethod":"claude.ai"}',
+            stderr=b"",
+        )
+
+    monkeypatch.setattr(subprocess, "run", ready)
+    monkeypatch.setattr(claude_auth.time, "monotonic", lambda: clock[0])
+    first = claude_auth.auth_status(sys.executable, force=True)
+    clock[0] += claude_auth.UNAVAILABLE_CACHE_TTL_SECONDS + 1
+    within = claude_auth.auth_status(sys.executable)
+    clock[0] = 1000.0 + claude_auth.CACHE_TTL_SECONDS
+    expired = claude_auth.auth_status(sys.executable)
+
+    assert first["launchable"] is True
+    assert within["cache_hit"] is True
+    assert expired["cache_hit"] is False
+    assert len(calls) == 2
 
 
 def test_editor_launcher_never_receives_claude_auth_arguments(

@@ -20,6 +20,7 @@ from typing import Any
 
 
 CACHE_TTL_SECONDS = 300.0
+UNAVAILABLE_CACHE_TTL_SECONDS = 30.0
 RUNTIME_AUTH_FAILURE_TTL_SECONDS = 300.0
 STATUS_TIMEOUT_SECONDS = 5.0
 STATUS_RETRY_TIMEOUT_SECONDS = 3 * STATUS_TIMEOUT_SECONDS
@@ -338,19 +339,20 @@ def auth_status(executable: str | None = None, *, force: bool = False) -> dict[s
                 "persisted_runtime_observation": True,
             }
         cached = _cache.get(path)
-        if not force and cached and now - cached[0] < CACHE_TTL_SECONDS:
+        if cached and cached[1].get("status") == "auth_status_unavailable":
+            # A probe that could not run or timed out says nothing about the
+            # login: throttle re-probing briefly, never park launches for long.
+            ttl = UNAVAILABLE_CACHE_TTL_SECONDS
+        else:
+            ttl = CACHE_TTL_SECONDS
+        if not force and cached and now - cached[0] < ttl:
             return {**cached[1], "cache_hit": True}
     result = _probe_auth_status(path)
     with _lock:
         if result.get("launchable") is True:
             _runtime_failures.pop(path, None)
             _clear_persisted_runtime_failure(path)
-        if result.get("status") == "auth_status_unavailable":
-            # A probe that could not run or timed out says nothing about the
-            # login; never let it park later launches behind a cached failure.
-            _cache.pop(path, None)
-        else:
-            _cache[path] = (now, dict(result))
+        _cache[path] = (now, dict(result))
     return result
 
 
