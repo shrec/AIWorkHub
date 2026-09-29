@@ -1,0 +1,762 @@
+diff --git a/src/aiworkhub/process_launcher.py b/src/aiworkhub/process_launcher.py
+index 96dbaa3..8c28a53 100644
+--- a/src/aiworkhub/process_launcher.py
++++ b/src/aiworkhub/process_launcher.py
+@@ -846,13 +846,16 @@ def _terminal_state_for_workspace_error(exc: WorkspaceError) -> str:
+     return _launcher_validation.terminal_state_for_workspace_error(exc)
+ 
+ # Failure workspaces remain available through coordinator review.  Once a
+-# coordinator has disposed that exact attempt (finished/archived, returned it
+-# to pending, or moved it to blocked), the retained workspace is no longer the
+-# authoritative review surface and is safe to collect.  While a card is in
+-# review, only the request_id named by terminal_review remains authoritative;
+-# older retained attempts for the same card are superseded and collectable.
+-GC_CANDIDATE_PROCESS_STATES = TERMINAL_PROCESS_STATES - {"blocked"}
+-GC_DISPOSED_CANONICAL_STATUSES = {"finished", "archived", "pending", "blocked"}
++# coordinator has disposed that exact attempt (finished/archived/superseded,
++# returned it to pending, or moved it to blocked), the retained workspace is no
++# longer the authoritative review surface and is safe to collect.  While a card
++# is in review, only the request_id named by terminal_review remains
++# authoritative; older retained attempts for the same card are superseded and
++# collectable.  Every terminal process state is a candidate: a state without a
++# retained workspace is filtered by ``workspace_retained`` itself.
++GC_CANDIDATE_PROCESS_STATES = TERMINAL_PROCESS_STATES
++GC_DISPOSED_CANONICAL_STATUSES = {"finished", "archived", "superseded", "pending", "blocked"}
++_GC_FAILURE_REPORT_LIMIT = 50
+ 
+ 
+ # --- B412: token-free liveness contract -------------------------------------
+@@ -10480,7 +10483,7 @@ class ProcessManager:
+         )
+         result = self._reconcile_persisted_requests()
+         result["ambiguous_claims_recovered"] = ambiguous_claims_recovered
+-        gc_result: dict[str, int] = (
++        gc_result: dict[str, Any] = (
+             self._gc_finalized_workspaces()
+             if include_gc
+             else {"gc_scanned": 0, "gc_cleaned": 0, "gc_skipped": 0}
+@@ -10532,11 +10535,17 @@ class ProcessManager:
+             })
+         return abandoned
+ 
+-    def _gc_finalized_workspaces(self) -> dict[str, int]:
+-        """Run one idempotent, fail-closed sweep of retained workspaces."""
++    def _gc_finalized_workspaces(self) -> dict[str, Any]:
++        """Run one idempotent, fail-closed sweep of retained workspaces.
++
++        A worktree the sweep tried and failed to release (a seal or a cleanup
++        that failed) is reported under ``failures`` -- bounded, and only when
++        there is one -- so a stuck worktree is visible instead of silently kept.
++        """
+         scanned = 0
+         cleaned = 0
+         skipped = 0
++        failures: list[dict[str, str]] = []
+         for request_id, event in list(self._latest_by_request().items()):
+             result = self._gc_finalized_workspace(request_id, event)
+             if result is None:
+@@ -10544,9 +10553,24 @@ class ProcessManager:
+             scanned += 1
+             if result.get("gc"):
+                 cleaned += 1
+-            else:
+-                skipped += 1
+-        return {"gc_scanned": scanned, "gc_cleaned": cleaned, "gc_skipped": skipped}
++                continue
++            skipped += 1
++            reason = str(result.get("reason") or "")
++            if (
++                reason.startswith(("rework_seal_failed:", "cleanup_failed:"))
++                and len(failures) < _GC_FAILURE_REPORT_LIMIT
++            ):
++                failures.append({
++                    "request_id": request_id,
++                    "task_id": str(event.get("task_id") or ""),
++                    "reason": reason,
++                })
++        summary: dict[str, Any] = {
++            "gc_scanned": scanned, "gc_cleaned": cleaned, "gc_skipped": skipped,
++        }
++        if failures:
++            summary["failures"] = failures
++        return summary
+ 
+     @staticmethod
+     def _gc_disposition(
+@@ -10583,7 +10607,7 @@ class ProcessManager:
+             if canonical_status not in task_fsm.REWORK_RECOVERABLE_STATUSES:
+                 return True, f"pin_unrecoverable_task_status:{canonical_status}"
+             return False, "pinned_rework_predecessor"
+-        if process_state == "finalize_failed" and canonical_status not in {"finished", "archived"}:
++        if process_state == "finalize_failed" and canonical_status not in {"finished", "archived", "superseded"}:
+             return False, "retryable_finalize_failed"  # a retry can still recover it
+         if canonical_status in GC_DISPOSED_CANONICAL_STATUSES:
+             return True, f"disposed_task_status:{canonical_status}"
+@@ -10674,6 +10698,82 @@ class ProcessManager:
+             return False, "review_workspace_hash_mismatch"
+         return True, "review_workspace_verified"
+ 
++    def _seal_pinned_rework_predecessor(
++        self,
++        card: dict[str, Any],
++        task_id: str,
++        request_id: str,
++        latest: dict[str, Any],
++        *,
++        workspace_meta: Mapping[str, Any],
++        path: Path,
++        home: Path,
++        repo: Path,
++    ) -> tuple[dict[str, Any] | None, str]:
++        """Seal a pinned predecessor's exact bytes and attach them to its card.
++
++        Returns the re-read card and ``sealed_rework_delta`` once the card's own
++        disposition proves the attached delta verifies, else ``(None, reason)``
++        with the worktree untouched. The caller releases the worktree through
++        its ordinary delete path; nothing here deletes.
++        """
++        if not _process_proven_dead(int(latest.get("pid") or 0), latest.get("pid_start_ticks")):
++            return None, "process_not_proven_dead"
++        try:
++            workspace = WorkerWorkspace.from_metadata(dict(workspace_meta))
++            assert_gc_safe_workspace_shape(request_id, path, home, repo=repo)
++        except (KeyError, TypeError, ValueError, WorkspaceError) as exc:
++            return None, f"unsafe_workspace_shape:{exc}"[:200]
++        predecessor = card.get("rework_predecessor")
++        predecessor = predecessor if isinstance(predecessor, dict) else {}
++        hashes = predecessor.get("changed_path_hashes")
++        claim_epoch = predecessor.get("claim_epoch")
++        if not isinstance(hashes, dict) or not hashes:
++            return None, "rework_seal_failed:rework_predecessor_hashes_missing"
++        pinned_workspace = predecessor.get("workspace")
++        if isinstance(pinned_workspace, dict) and (
++            str(pinned_workspace.get("path") or "") != str(path)
++        ):
++            return None, "rework_seal_failed:rework_predecessor_workspace_mismatch"
++        try:
++            from .successful_rework_recovery import candidate_entries
++
++            entries = candidate_entries(path, hashes)
++        except ValueError as exc:  # SuccessfulReworkRecoveryError is a ValueError
++            return None, f"rework_seal_failed:{exc}"[:200]
++        descriptor = _terminal_rework_delta_evidence(
++            workspace,
++            {"task_id": task_id, "claim_epoch": claim_epoch},
++            request_id,
++            sorted(hashes),
++            captured_entries=entries,
++        )
++        if not isinstance(descriptor, dict) or descriptor.get("sealed") is not True:
++            code = (descriptor or {}).get("reason") or "rework_delta_empty"
++            return None, f"rework_seal_failed:{code}"[:200]
++        try:
++            attached, code = task_store.attach_rework_delta(
++                self.repo, task_id,
++                predecessor_request_id=request_id,
++                claim_epoch=claim_epoch,
++                descriptor=descriptor,
++            )
++        except Exception as exc:  # noqa: BLE001 -- any store failure keeps the worktree
++            return None, f"rework_seal_failed:attach_failed:{type(exc).__name__}"
++        if not attached:
++            return None, f"rework_seal_failed:{code}"
++        try:
++            refreshed = _parse_card(self._show_task(task_id), task_id)
++        except Exception as exc:  # noqa: BLE001 -- fail closed, keep the worktree
++            return None, f"rework_seal_failed:task_lookup_failed:{exc}"[:200]
++        eligible, disposition = self._gc_disposition(
++            refreshed, request_id, repo=self.repo,
++            process_state=str(latest.get("state") or ""),
++        )
++        if not eligible or disposition != "sealed_rework_delta":
++            return None, f"rework_seal_failed:post_attach_disposition:{disposition}"[:200]
++        return refreshed, disposition
++
+     def _gc_finalized_workspace(
+         self, request_id: str, event: dict[str, Any]
+     ) -> dict[str, Any] | None:
+@@ -10728,6 +10828,17 @@ class ProcessManager:
+                 }
+             eligible, disposition = self._gc_disposition(
+                 card, request_id, repo=self.repo, process_state=str(latest.get("state") or ""))
++            if not eligible and disposition == "pinned_rework_predecessor":
++                # Seal the pinned bytes into a verified delta; the delta then
++                # stands in for the worktree and the ordinary path below
++                # releases it. Any failure keeps the worktree.
++                sealed_card, disposition = self._seal_pinned_rework_predecessor(
++                    card, task_id, request_id, latest,
++                    workspace_meta=workspace_meta, path=path, home=home, repo=repo,
++                )
++                if sealed_card is None:
++                    return {"request_id": request_id, "gc": False, "reason": disposition}
++                card, eligible = sealed_card, True
+             if not eligible:
+                 if disposition != "current_review_request":
+                     return {
+diff --git a/src/aiworkhub/task_store.py b/src/aiworkhub/task_store.py
+index 844c242..0c3fb36 100644
+--- a/src/aiworkhub/task_store.py
++++ b/src/aiworkhub/task_store.py
+@@ -1794,6 +1794,144 @@ def archive_task(
+         return True, operation
+ 
+ 
++def attach_rework_delta(
++    root: str | Path,
++    task_id: str,
++    *,
++    predecessor_request_id: str,
++    claim_epoch: int,
++    descriptor: Mapping[str, Any],
++) -> tuple[bool, str]:
++    """Pin one sealed rework delta onto the card's exact rework predecessor.
++
++    The janitor seals a pinned predecessor's worktree before releasing it; the
++    delta is the recovery input from then on. Like :func:`archive_task` this is
++    one preimage-guarded UPDATE: the ``card_json`` read is the ``WHERE`` clause,
++    so a card that changed between read and write reports ``card_changed``
++    instead of overwriting the newer card. An already-present delta is never
++    replaced.
++    """
++    _readiness, db_path = _require_ready(root)
++    request_id = str(predecessor_request_id or "").strip()
++    with _write_connection(db_path) as conn:
++        _begin_immediate(conn)
++        row = conn.execute(
++            "SELECT card_json FROM tasks WHERE task_id=?", (task_id,)
++        ).fetchone()
++        if row is None:
++            return False, "task_missing"
++        preimage = str(row["card_json"] or "{}")
++        try:
++            card = json.loads(preimage)
++        except json.JSONDecodeError:
++            card = {}
++        predecessor = card.get("rework_predecessor") if isinstance(card, dict) else None
++        if (
++            not isinstance(predecessor, dict)
++            or not request_id
++            or str(predecessor.get("request_id") or "").strip() != request_id
++            or type(claim_epoch) is not int
++            or predecessor.get("claim_epoch") != claim_epoch
++            or str(predecessor.get("task_id") or task_id) != task_id
++            or not isinstance(descriptor, Mapping)
++            or descriptor.get("request_id") != request_id
++            or descriptor.get("task_id") != task_id
++            or descriptor.get("claim_epoch") != claim_epoch
++        ):
++            return False, "rework_predecessor_mismatch"
++        if (
++            predecessor.get("rework_delta") is not None
++            or predecessor.get("delta_artifact") is not None
++        ):
++            return False, "rework_delta_present"
++        sealed = dict(descriptor)
++        pinned = dict(predecessor)
++        pinned["task_id"] = task_id
++        pinned["rework_delta"] = sealed
++        pinned["delta_artifact"] = {
++            "path": sealed.get("artifact_path"),
++            "digest": sealed.get("artifact_sha256"),
++        }
++        card["rework_predecessor"] = pinned
++        now = datetime.now(timezone.utc).isoformat()
++        try:
++            cur = conn.execute(
++                "UPDATE tasks SET card_json=?, updated_at=? WHERE task_id=? AND card_json=?",
++                (
++                    json.dumps(card, ensure_ascii=False, sort_keys=True),
++                    now,
++                    task_id,
++                    preimage,
++                ),
++            )
++            if cur.rowcount != 1:
++                conn.rollback()
++                return False, "card_changed"
++            conn.execute(
++                "INSERT INTO task_events(task_id, event, runner, payload_json, created_at) "
++                "VALUES (?, ?, ?, ?, ?)",
++                (
++                    task_id,
++                    "rework_delta_sealed",
++                    "janitor",
++                    json.dumps(
++                        {
++                            "request_id": request_id,
++                            "claim_epoch": claim_epoch,
++                            "artifact_sha256": sealed.get("artifact_sha256"),
++                        },
++                        sort_keys=True,
++                    ),
++                    now,
++                ),
++            )
++            conn.commit()
++        except Exception:  # noqa: BLE001 -- a partial attach must never persist
++            conn.rollback()
++            raise
++    return True, "attached"
++
++
++_REWORK_DELTA_DIGEST_KEYS = frozenset({"artifact_sha256", "digest"})
++_REWORK_DELTA_UNREFERENCING_STATUSES = frozenset({"finished", "archived", "superseded"})
++
++
++def referenced_rework_delta_digests(root: str | Path) -> set[str]:
++    """Every sealed-delta digest a still-undecided task can still recover from."""
++    _readiness, db_path = _require_ready(root)
++    conn = _connect(db_path, readonly=True)
++    try:
++        rows = conn.execute(
++            "SELECT status, worker_status, archived_at, card_json FROM tasks"
++        ).fetchall()
++    finally:
++        conn.close()
++    digests: set[str] = set()
++    for row in rows:
++        if canonical_status(dict(row)) in _REWORK_DELTA_UNREFERENCING_STATUSES:
++            continue
++        try:
++            stack: list[Any] = [json.loads(str(row["card_json"] or "{}"))]
++        except json.JSONDecodeError:
++            continue
++        while stack:
++            node = stack.pop()
++            if isinstance(node, dict):
++                for key, value in node.items():
++                    if (
++                        key in _REWORK_DELTA_DIGEST_KEYS
++                        and isinstance(value, str)
++                        and len(value) == 64
++                        and all(ch in "0123456789abcdef" for ch in value)
++                    ):
++                        digests.add(value)
++                    elif isinstance(value, (dict, list)):
++                        stack.append(value)
++            elif isinstance(node, list):
++                stack.extend(node)
++    return digests
++
++
+ def reconcile_dead_processing_claim(
+     root: str | Path,
+     task_id: str,
+diff --git a/tests/test_finalized_workspace_gc_b512_v1.py b/tests/test_finalized_workspace_gc_b512_v1.py
+index 23f31f4..1a67192 100644
+--- a/tests/test_finalized_workspace_gc_b512_v1.py
++++ b/tests/test_finalized_workspace_gc_b512_v1.py
+@@ -569,7 +569,16 @@ def test_pending_rework_predecessor_is_pinned_until_successor_claim(tmp_path, mo
+ 
+     result = manager._gc_finalized_workspaces()
+ 
+-    assert result == {"gc_scanned": 1, "gc_cleaned": 0, "gc_skipped": 1}
++    # S1 janitor C1: a pinned predecessor is sealed before release; one with no
++    # hash-pinned bytes cannot be sealed, so it stays and is reported.
++    assert result == {
++        "gc_scanned": 1, "gc_cleaned": 0, "gc_skipped": 1,
++        "failures": [{
++            "request_id": request_id,
++            "task_id": card["task_id"],
++            "reason": "rework_seal_failed:rework_predecessor_hashes_missing",
++        }],
++    }
+     assert path.exists() and home.exists()
+     assert "workspace_gc" not in manager._request_events(request_id)[-1]
+ 
+@@ -596,7 +605,14 @@ def test_blocked_rework_predecessor_survives_failed_successor(tmp_path, monkeypa
+ 
+     result = manager._gc_finalized_workspaces()
+ 
+-    assert result == {"gc_scanned": 1, "gc_cleaned": 0, "gc_skipped": 1}
++    assert result == {
++        "gc_scanned": 1, "gc_cleaned": 0, "gc_skipped": 1,
++        "failures": [{
++            "request_id": request_id,
++            "task_id": card["task_id"],
++            "reason": "rework_seal_failed:rework_predecessor_hashes_missing",
++        }],
++    }
+     assert path.exists() and home.exists()
+     assert "workspace_gc" not in manager._request_events(request_id)[-1]
+ 
+@@ -757,10 +773,13 @@ def test_review_without_exact_request_identity_fails_closed(tmp_path, monkeypatc
+     assert path.exists() and home.exists()
+ 
+ 
+-def test_blocked_process_event_is_never_a_gc_candidate_even_if_task_finished(tmp_path, monkeypatch):
+-    """Defense in depth: "blocked" is excluded from GC_CANDIDATE_PROCESS_STATES
+-    even though it is a member of TERMINAL_PROCESS_STATES, because a launch
+-    rejection never has a retained workspace worth reconsidering."""
++def test_retained_blocked_process_event_is_collected_once_task_finished(tmp_path, monkeypatch):
++    """S1 janitor C1: every terminal process state is a GC candidate.
++
++    ``blocked`` used to be excluded outright, so a blocked attempt that DID
++    retain a workspace was kept forever. ``workspace_retained`` is the filter
++    now: a launch rejection that retained nothing is still never scanned, and
++    one that retained a workspace is collected under the ordinary guards."""
+     monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "wtroot"))
+     card = _card()
+     card.update({"status": "finished", "worker_status": "done", "claimed_by": ""})
+@@ -774,8 +793,8 @@ def test_blocked_process_event_is_never_a_gc_candidate_even_if_task_finished(tmp
+ 
+     result = manager._gc_finalized_workspaces()
+ 
+-    assert result == {"gc_scanned": 0, "gc_cleaned": 0, "gc_skipped": 0}
+-    assert path.exists() and home.exists()
++    assert result == {"gc_scanned": 1, "gc_cleaned": 1, "gc_skipped": 0}
++    assert not path.exists() and not home.exists()
+ 
+ 
+ @pytest.mark.parametrize("state", ["review_pending", "release_pending", "reconcile_pending"])
+diff --git a/tests/test_janitor_rework_seal.py b/tests/test_janitor_rework_seal.py
+new file mode 100644
+index 0000000..524ab8c
+--- /dev/null
++++ b/tests/test_janitor_rework_seal.py
+@@ -0,0 +1,345 @@
++"""S1 janitor C1: pinned rework predecessors are sealed, then released.
++
++A worktree pinned as a card's ``rework_predecessor`` used to be retained for
++as long as the card could still be recovered -- in practice forever. The sweep
++now seals the predecessor's exact hash-pinned bytes into a verified delta,
++attaches that delta to the card with a preimage-guarded write, and only then
++releases the worktree through the ordinary delete path. Any seal failure keeps
++the worktree and is reported under ``failures``.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import os
++import sqlite3
++import sys
++from datetime import datetime, timezone
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++
++_SRC = Path(__file__).resolve().parents[1] / "src"
++if str(_SRC) not in sys.path:
++    sys.path.insert(0, str(_SRC))
++
++from aiworkhub import process_launcher, task_store, worker_workspace  # noqa: E402
++
++TASK_ID = "TASK_JANITOR_C1"
++RUNNER = "claude_worker_janitor"
++REQUEST_ID = "0123456789abcdef0123456789abcdef"
++CLAIM_EPOCH = 3
++CANDIDATE = b"sealed candidate bytes\n"
++
++
++def _chmod_blocked_by_sandbox() -> bool:
++    import tempfile
++
++    with tempfile.TemporaryDirectory() as name:
++        try:
++            os.chmod(name, 0o700)
++        except PermissionError:
++            return True
++    return False
++
++
++@pytest.fixture(autouse=True)
++def _bridge_chmod_sandbox_restriction(monkeypatch: pytest.MonkeyPatch) -> None:
++    """Neutralize chmod only where this exact sandbox rejects the bare syscall."""
++    if _chmod_blocked_by_sandbox():
++        monkeypatch.setattr(os, "chmod", lambda *a, **k: None)
++        monkeypatch.setattr(os, "fchmod", lambda *a, **k: None)
++
++
++def _repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
++    monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "wtroot"))
++    monkeypatch.delenv(worker_workspace.RUNTIME_ROOT_ENV, raising=False)
++    repo = tmp_path / "repo"
++    repo.mkdir()
++    assert task_store.initialize_repository(repo)["ok"]
++    return repo
++
++
++def _insert_card(
++    repo: Path,
++    task_id: str,
++    card: dict,
++    *,
++    status: str = "blocked",
++    worker_status: str = "blocked",
++    archived_at: str = "",
++) -> None:
++    now = datetime.now(timezone.utc).isoformat()
++    conn = sqlite3.connect(str(task_store.canonical_db_path(repo)))
++    try:
++        conn.execute(
++            "INSERT INTO tasks(task_id, runner, topic, status, worker_status, "
++            "card_json, created_at, updated_at, archived_at) "
++            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
++            (task_id, RUNNER, "task_mcp", status, worker_status,
++             json.dumps(card), now, now, archived_at),
++        )
++        conn.commit()
++    finally:
++        conn.close()
++
++
++def _show(repo: Path):
++    def show(task_id: str) -> dict:
++        card = task_store.get_task(repo, task_id)
++        if card is None:
++            return {"returncode": 1, "stdout": "", "stderr": "missing"}
++        return {"returncode": 0, "stdout": json.dumps(card), "stderr": ""}
++
++    return show
++
++
++def _manager(tmp_path: Path, repo: Path) -> process_launcher.ProcessManager:
++    return process_launcher.ProcessManager(
++        repo=repo,
++        process_log_path=tmp_path / "events.jsonl",
++        process_dir=tmp_path / "processes",
++        show_task=_show(repo),
++        collision_guard=lambda **_k: {
++            "returncode": 0, "stdout": '{"collision_free":true}', "stderr": "",
++        },
++        adapter_builder=lambda **_k: SimpleNamespace(
++            argv=[], cwd=str(tmp_path), launchable=True, reason=""
++        ),
++        isolation_enabled=True,
++    )
++
++
++def _seed(
++    manager: process_launcher.ProcessManager,
++    tmp_path: Path,
++    repo: Path,
++    *,
++    state: str,
++    pid: int,
++) -> tuple[Path, Path, dict]:
++    """Seed one retained, proven-dead attempt and return its workspace payload."""
++    path = tmp_path / "wtroot" / REQUEST_ID / "worktree"
++    home = tmp_path / "wtroot" / REQUEST_ID / "home"
++    (path / "out").mkdir(parents=True)
++    (path / "out" / "result.txt").write_bytes(CANDIDATE)
++    home.mkdir(parents=True)
++    workspace = {
++        "request_id": REQUEST_ID,
++        "repo": str(repo),
++        "path": str(path),
++        "home": str(home),
++        "allowed_writes": ["out/result.txt"],
++        "parent_baseline": {},
++        "workspace_baseline": {},
++    }
++    process_dir = tmp_path / "processes"
++    process_dir.mkdir(parents=True, exist_ok=True)
++    metadata_path = process_dir / f"{REQUEST_ID}.request.json"
++    worker_workspace.write_json_0600(metadata_path, {
++        "request_id": REQUEST_ID,
++        "task_id": TASK_ID,
++        "runner": RUNNER,
++        "topic": "task_mcp",
++        "adapter_id": "claude_cli",
++        "metadata_path": str(metadata_path),
++        "workspace": workspace,
++    })
++    manager._append_event({
++        "request_id": REQUEST_ID,
++        "task_id": TASK_ID,
++        "runner": RUNNER,
++        "topic": "task_mcp",
++        "adapter_id": "claude_cli",
++        "state": state,
++        "pid": pid,
++        "pid_start_ticks": 999_999_000,
++        "metadata_path": str(metadata_path),
++        "workspace_retained": True,
++    })
++    return path, home, workspace
++
++
++def _pinned_card(workspace: dict, hashes: dict) -> dict:
++    return {
++        "task_id": TASK_ID,
++        "runner": RUNNER,
++        "topic": "task_mcp",
++        "rework_predecessor": {
++            "schema_id": "aiworkhub.rework_predecessor.v1",
++            "task_id": TASK_ID,
++            "request_id": REQUEST_ID,
++            "claim_epoch": CLAIM_EPOCH,
++            "workspace": workspace,
++            "changed_path_hashes": hashes,
++        },
++    }
++
++
++def _descriptor(repo: Path, digest: str = "d" * 64) -> dict:
++    return {
++        "schema_id": "aiworkhub.rework_delta_descriptor.v1",
++        "sealed": True,
++        "authority_repo": str(repo.resolve()),
++        "task_id": TASK_ID,
++        "request_id": REQUEST_ID,
++        "claim_epoch": CLAIM_EPOCH,
++        "artifact_path": str(repo / "delta.json"),
++        "artifact_sha256": digest,
++    }
++
++
++# --- the sweep seals a pinned predecessor, then releases it --------------------
++
++
++def test_pinned_rework_predecessor_is_sealed_then_released(tmp_path, monkeypatch):
++    repo = _repo(tmp_path, monkeypatch)
++    manager = _manager(tmp_path, repo)
++    path, home, workspace = _seed(
++        manager, tmp_path, repo, state="validation_failed", pid=2_147_483_101,
++    )
++    hashes = {"out/result.txt": hashlib.sha256(CANDIDATE).hexdigest()}
++    _insert_card(repo, TASK_ID, _pinned_card(workspace, hashes))
++
++    result = manager._gc_finalized_workspaces()
++
++    assert result == {"gc_scanned": 1, "gc_cleaned": 1, "gc_skipped": 0}
++    assert not path.exists() and not home.exists()
++    card = task_store.get_task(repo, TASK_ID)
++    predecessor = card["rework_predecessor"]
++    descriptor = predecessor["rework_delta"]
++    artifact = Path(descriptor["artifact_path"])
++    assert hashlib.sha256(artifact.read_bytes()).hexdigest() == descriptor["artifact_sha256"]
++    assert predecessor["delta_artifact"] == {
++        "path": descriptor["artifact_path"], "digest": descriptor["artifact_sha256"],
++    }
++    assert manager._gc_disposition(card, REQUEST_ID, repo=manager.repo) == (
++        True, "sealed_rework_delta",
++    )
++    latest = manager._request_events(REQUEST_ID)[-1]
++    assert latest["workspace_gc"] is True
++    assert latest["workspace_gc_reason"] == "sealed_rework_delta"
++    assert task_store.get_task_events(repo, TASK_ID)[0]["event"] == "rework_delta_sealed"
++
++
++def test_hash_mismatch_keeps_the_worktree_and_reports_the_failure(tmp_path, monkeypatch):
++    repo = _repo(tmp_path, monkeypatch)
++    manager = _manager(tmp_path, repo)
++    path, home, workspace = _seed(
++        manager, tmp_path, repo, state="validation_failed", pid=2_147_483_102,
++    )
++    hashes = {"out/result.txt": hashlib.sha256(b"what the reviewer saw\n").hexdigest()}
++    _insert_card(repo, TASK_ID, _pinned_card(workspace, hashes))
++    reason = "rework_seal_failed:successful_rework_hash_mismatch"
++
++    single = manager._gc_finalized_workspace(
++        REQUEST_ID, manager._latest_by_request()[REQUEST_ID]
++    )
++    result = manager._gc_finalized_workspaces()
++
++    assert single == {"request_id": REQUEST_ID, "gc": False, "reason": reason}
++    assert result["failures"] == [
++        {"request_id": REQUEST_ID, "task_id": TASK_ID, "reason": reason}
++    ]
++    assert (result["gc_cleaned"], result["gc_skipped"]) == (0, 1)
++    assert path.exists() and home.exists()
++    predecessor = task_store.get_task(repo, TASK_ID)["rework_predecessor"]
++    assert "rework_delta" not in predecessor
++
++
++# --- every terminal process state reaches GC -----------------------------------
++
++
++def test_gc_candidates_are_every_terminal_process_state():
++    assert set(process_launcher.GC_CANDIDATE_PROCESS_STATES) == set(
++        process_launcher.TERMINAL_PROCESS_STATES
++    )
++    assert "superseded" in process_launcher.GC_DISPOSED_CANONICAL_STATUSES
++
++
++def test_finalize_failed_attempt_of_superseded_task_is_removed(tmp_path, monkeypatch):
++    repo = _repo(tmp_path, monkeypatch)
++    manager = _manager(tmp_path, repo)
++    path, home, _ = _seed(
++        manager, tmp_path, repo, state="finalize_failed", pid=2_147_483_103,
++    )
++    _insert_card(
++        repo, TASK_ID, {"task_id": TASK_ID},
++        status="superseded", worker_status="superseded",
++    )
++
++    result = manager._gc_finalized_workspaces()
++
++    assert result == {"gc_scanned": 1, "gc_cleaned": 1, "gc_skipped": 0}
++    assert not path.exists() and not home.exists()
++    assert manager._request_events(REQUEST_ID)[-1]["workspace_gc_reason"] == (
++        "disposed_task_status:superseded"
++    )
++
++
++# --- task_store.attach_rework_delta ---------------------------------------------
++
++
++def test_attach_rework_delta_is_exact_and_single_shot(tmp_path, monkeypatch):
++    repo = _repo(tmp_path, monkeypatch)
++    _insert_card(repo, TASK_ID, _pinned_card({}, {"out/result.txt": "a" * 64}))
++    descriptor = _descriptor(repo)
++
++    wrong = task_store.attach_rework_delta(
++        repo, TASK_ID, predecessor_request_id="f" * 32,
++        claim_epoch=CLAIM_EPOCH, descriptor={**descriptor, "request_id": "f" * 32},
++    )
++    first = task_store.attach_rework_delta(
++        repo, TASK_ID, predecessor_request_id=REQUEST_ID,
++        claim_epoch=CLAIM_EPOCH, descriptor=descriptor,
++    )
++    second = task_store.attach_rework_delta(
++        repo, TASK_ID, predecessor_request_id=REQUEST_ID,
++        claim_epoch=CLAIM_EPOCH, descriptor=descriptor,
++    )
++
++    assert wrong == (False, "rework_predecessor_mismatch")
++    assert first == (True, "attached")
++    assert second == (False, "rework_delta_present")
++    assert task_store.get_task_events(repo, TASK_ID)[0]["event"] == "rework_delta_sealed"
++    predecessor = task_store.get_task(repo, TASK_ID)["rework_predecessor"]
++    assert predecessor["rework_delta"] == descriptor
++    assert predecessor["delta_artifact"] == {
++        "path": descriptor["artifact_path"], "digest": descriptor["artifact_sha256"],
++    }
++
++
++def test_attach_rework_delta_reports_a_missing_task(tmp_path, monkeypatch):
++    repo = _repo(tmp_path, monkeypatch)
++
++    assert task_store.attach_rework_delta(
++        repo, "NO_SUCH_TASK", predecessor_request_id=REQUEST_ID,
++        claim_epoch=CLAIM_EPOCH, descriptor=_descriptor(repo),
++    ) == (False, "task_missing")
++
++
++def test_referenced_rework_delta_digests_counts_undecided_tasks_only(tmp_path, monkeypatch):
++    repo = _repo(tmp_path, monkeypatch)
++
++    def sealed(digest: str) -> dict:
++        return {"rework_predecessor": {
++            "rework_delta": {"artifact_sha256": digest},
++            "delta_artifact": {"digest": digest},
++        }}
++
++    _insert_card(repo, "BLOCKED", sealed("1" * 64))
++    _insert_card(repo, "PENDING", sealed("2" * 64), status="pending", worker_status="unclaimed")
++    _insert_card(repo, "FINISHED", sealed("3" * 64), status="finished", worker_status="done")
++    _insert_card(
++        repo, "SUPERSEDED", sealed("4" * 64),
++        status="superseded", worker_status="superseded",
++    )
++    _insert_card(
++        repo, "ARCHIVED", sealed("5" * 64),
++        archived_at=datetime.now(timezone.utc).isoformat(),
++    )
++    _insert_card(repo, "NOT_A_DIGEST", {"digest": "not-hex"})
++
++    assert task_store.referenced_rework_delta_digests(repo) == {"1" * 64, "2" * 64}
