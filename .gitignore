@@ -58,6 +58,7 @@ node_modules/
 !.aiworkhub/release-evidence.json
 !.aiworkhub/release-residual-risks.json
 !.aiworkhub/release-route-parity.json
+!.aiworkhub/releases.jsonl
 
 # Local coordinator handoffs, dated audits, and review scratch reports.
 /AUTONOMOUS_SESSION_SUMMARY.md
