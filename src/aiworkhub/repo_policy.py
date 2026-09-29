@@ -100,6 +100,8 @@ _POLICY_ALLOWED_ADAPTERS: tuple[str, ...] = (
     *runtime_adapters.LOCAL_ADAPTERS,
     runtime_adapters.OPENCODE_CLI_ADAPTER,
 )
+# The only seat that may approve a Deploy; any other approver is refused.
+DEPLOY_APPROVER = "manager_seat"
 DEFAULT_POLICY: dict[str, Any] = {
     "schema_id": SCHEMA_ID,
     "providers": {"allowed_adapters": list(_POLICY_ALLOWED_ADAPTERS)},
@@ -116,6 +118,7 @@ DEFAULT_POLICY: dict[str, Any] = {
         "source_graph_generations": 3,
         "worktree_max_bytes": 5 * 1024 * 1024 * 1024,
     },
+    "deploy": {"targets": ["vscode_local"], "approver": DEPLOY_APPROVER},
 }
 _PRE_GROK_LOCAL_ADAPTERS = frozenset(
     set(runtime_adapters.LOCAL_ADAPTERS) - {runtime_adapters.GROK_KILO_ADAPTER}
@@ -147,6 +150,21 @@ def _bounded_int(value: Any, field: str, minimum: int, maximum: int) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
         raise RepoPolicyError(f"{field}_out_of_range")
     return value
+
+
+def _deploy_section(value: Any) -> dict[str, Any]:
+    """Where a proven Deploy may land, and the one seat that approves it."""
+    if not isinstance(value, Mapping):
+        raise RepoPolicyError("deploy_section_invalid")
+    targets = _string_list(
+        value.get("targets", DEFAULT_POLICY["deploy"]["targets"]), "deploy_targets"
+    )
+    if not targets:
+        raise RepoPolicyError("deploy_targets_empty")
+    approver = value.get("approver", DEPLOY_APPROVER)
+    if approver != DEPLOY_APPROVER:
+        raise RepoPolicyError("deploy_approver_unsupported")
+    return {"targets": targets, "approver": approver}
 
 
 def validate_policy(value: Any) -> dict[str, Any]:
@@ -183,6 +201,7 @@ def validate_policy(value: Any) -> dict[str, Any]:
             "raw_discovery_forbidden": raw_denies,
         },
         "validation": {"required_check_ids": required_checks},
+        "deploy": _deploy_section(value.get("deploy", DEFAULT_POLICY["deploy"])),
         "retention": {
             "logs_days": _bounded_int(retention.get("logs_days"), "logs_days", 1, 7),
             "terminal_runs_days": _bounded_int(

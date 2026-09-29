@@ -30,12 +30,12 @@ test      the sealed validation evidence re-derives, through
           candidate passes ``task_engine``'s canonical validator, which
           re-hashes the promoted paths so a later edit makes the candidate
           stale; and its ``accept_review`` event exists.
-deploy    no target allowlist, release/build provenance, install, rollback or
-maintain  approval-policy producer exists, nor observed outcome metrics or a
-          control-limit policy. The gate names each missing producer (see
-          ``MISSING_PRODUCERS``) and never infers a pass. Maintain still
-          resolves what is available -- the accepted candidate and its
-          learning disposition -- into its refusal.
+deploy    Test re-proven, then ``sdlc_deploy_proof``: the target is in the
+          policy's ``deploy.targets`` and a confirmed release was built from a
+          commit holding every promoted path's accepted bytes (or a later
+          acceptance promoted that path).
+maintain  Deploy proven, no control band in tier ``needfix`` and no open
+          NeedFix whose ``caused_by`` names the task.
 
 ``not_applicable`` needs a verifiable policy. No canonical policy registry
 exists, so every such claim is refused with that producer named rather than
@@ -60,7 +60,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from . import attempt_artifacts, task_fsm, task_store
+from . import attempt_artifacts, sdlc_deploy_proof, task_fsm, task_store
 from .sqlite_readonly import connect_readonly
 
 SCHEMA_ID = "aiworkhub.sdlc_stage_evidence.v1"
@@ -122,20 +122,8 @@ _SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 _DRIVE_PREFIX = re.compile(r"[A-Za-z]:")
 
 # Producers the approved six-stage contract needs and this repository does not
-# have yet: the exact target list for the dependent deployment/Maintain card.
+# have yet. Deploy and Maintain are proven by ``sdlc_deploy_proof``.
 MISSING_PRODUCERS: dict[str, tuple[str, ...]] = {
-    "deploy": (
-        "deploy_target_allowlist",
-        "release_build_provenance_receipt",
-        "install_receipt",
-        "rollback_receipt",
-        "deploy_approval_policy",
-    ),
-    "maintain": (
-        "deployed_release_identity",
-        "observed_outcome_metrics",
-        "control_limit_policy",
-    ),
     "not_applicable": ("sdlc_not_applicable_policy_registry",),
 }
 # The launcher's own receipt schemas a proven Build is joined through.
@@ -146,11 +134,15 @@ MAX_REQUEST_EVENTS = 64
 MAX_EDIT_RECEIPTS = 128
 
 # Each stage's refused binding to what an earlier, re-proven stage recorded.
+_ACCEPTED_CANDIDATE_BINDINGS = (
+    ("test", "candidate_sha256"), ("test", "accepted_outcome_receipt_id"),
+)
 PREDECESSOR_BINDINGS: dict[str, tuple[tuple[str, str], ...]] = {
     "design": (("plan", "task_id"),),
     "build": (("design", "task_id"), ("design", "contract_sha256")),
     "test": (("build", "task_id"), ("build", "candidate_sha256")),
-    "maintain": (("test", "candidate_sha256"), ("test", "accepted_outcome_receipt_id")),
+    "deploy": _ACCEPTED_CANDIDATE_BINDINGS,
+    "maintain": (*_ACCEPTED_CANDIDATE_BINDINGS, ("deploy", "candidate_sha256")),
 }
 
 NEXT_ACTIONS: dict[str, str] = {
@@ -172,12 +164,13 @@ NEXT_ACTIONS: dict[str, str] = {
         "then record test naming it while its promoted paths are unchanged"
     ),
     "deploy": (
-        "no deploy producer exists: a deployment-policy card must add a target "
-        "allowlist and release, install and rollback receipts first"
+        "build and confirm a release (scripts/release_receipt.py record, then "
+        "confirm) from a commit holding the accepted bytes, then record deploy "
+        "naming a target from the policy's deploy.targets"
     ),
     "maintain": (
-        "maintain needs a deployed release, observed outcome metrics and a "
-        "control-limit policy; none has a producer yet"
+        "keep the deployed release inside every SDLC control band and resolve "
+        "each open NeedFix caused by this task, then record maintain"
     ),
     "binding": (
         "bind the case to its canonical task (aiworkhub_manager_sdlc_case_create_for_task) "
@@ -1211,6 +1204,32 @@ def _verify_build(
     return {"route": route, "semantic_edit": edit, "effective_effort_context": effort}
 
 
+def _release_proof(
+    reader: EvidenceReader,
+    snapshot: TaskSnapshot,
+    stage: str,
+    payload: Mapping[str, Any],
+    predecessors: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any] | str:
+    """The release-ledger proof of Deploy, or of Maintain on top of it."""
+
+    if stage == "maintain":
+        # Maintain watches the release the recorded Deploy evidence names; it
+        # never re-proves Deploy. Without that evidence it is deploy_not_ready.
+        return sdlc_deploy_proof.maintain_proof(
+            reader.root, reader.repo_id, snapshot.task_id,
+            (predecessors.get("deploy") or {}).get("deploy"),
+        )
+    card = snapshot.card
+    receipt = card["accept_evidence"]["accepted_outcome_receipt"]
+    accepted_at = card.get("accepted_at") if isinstance(card.get("accepted_at"), str) else ""
+    target = payload.get("target")
+    return sdlc_deploy_proof.deploy_proof(
+        reader.root, reader.repo_id, snapshot.task_id, receipt,
+        target if isinstance(target, str) else "", accepted_at=accepted_at,
+    )
+
+
 # --------------------------------------------------------------------------- #
 # the gate
 # --------------------------------------------------------------------------- #
@@ -1228,20 +1247,14 @@ def decide(
 
     ``predecessors`` maps each earlier stage the caller re-proved in this same
     session to its stored evidence; one naming another task, contract or
-    candidate than this stage resolves fails closed. Unsupported stages return
-    their missing producers. A refusal never carries a fingerprint.
+    candidate than this stage resolves fails closed. Deploy and Maintain
+    re-prove the acceptance and then the release ledger through
+    ``sdlc_deploy_proof``. A refusal never carries a fingerprint.
     """
 
     refused = payload_refusal(stage, payload)
     if refused is not None:
         return refused
-    if stage == "deploy":
-        code = (
-            "deploy_target_unknown"
-            if "target" in payload
-            else "missing_producer:release_build_provenance_receipt"
-        )
-        return _refusal(stage, code, missing_producers=list(MISSING_PRODUCERS["deploy"]))
     if not task_id:
         return _refusal(
             stage, "approval_authority_missing" if stage == "plan" else "case_not_task_bound"
@@ -1260,18 +1273,15 @@ def decide(
     proof: dict[str, Any] | str = {}
     if stage == "build":
         proof = _verify_build(reader, snapshot, identity)
-    elif stage in ("test", "maintain"):
+    elif stage in ("test", "deploy", "maintain"):
         proof = _verify_acceptance(reader, snapshot, identity)
     if isinstance(proof, str):
         return _refusal(stage, proof)
-    if stage == "maintain":
-        return _refusal(
-            stage,
-            "missing_producer:observed_outcome_metrics",
-            accepted_outcome_receipt_id=identity["accepted_outcome_receipt_id"],
-            learning=reader.learning(snapshot.task_id, identity["request_id"]),
-            missing_producers=list(MISSING_PRODUCERS["maintain"]),
-        )
+    if stage in ("deploy", "maintain"):
+        released = _release_proof(reader, snapshot, stage, payload, predecessors)
+        if isinstance(released, str):
+            return _refusal(stage, released)
+        proof = {**proof, stage: released}
     return StageDecision(
         stage=stage,
         evidence={"schema_id": SCHEMA_ID, "stage": stage, **identity, **proof},

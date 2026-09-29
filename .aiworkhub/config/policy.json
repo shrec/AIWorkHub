@@ -1,4 +1,10 @@
 {
+  "deploy": {
+    "approver": "manager_seat",
+    "targets": [
+      "vscode_local"
+    ]
+  },
   "providers": {
     "allowed_adapters": [
       "vscode_lm",

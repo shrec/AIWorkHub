@@ -5,10 +5,10 @@ the attempt bundle from ``attempt_artifacts.persist_json_bundle``, the
 launcher's own semantic-edit, coverage and reasoning-context functions feeding
 a terminal event appended through ``process_event_ledger``,
 ``task_store.mark_terminal_review``, the accepted-outcome receipt from
-``process_launcher_acceptance`` and ``task_engine.accept_review``, and
-``learning_commit_store.record_disposition`` -- and nothing patches the gate
-to success. The one test that wraps ``decide`` passes its real decision
-through and only simulates a concurrent writer after it.
+``process_launcher_acceptance`` and ``task_engine.accept_review``, and a real
+git release commit plus release-ledger lines for Deploy and Maintain -- and
+nothing patches the gate to success. The one test that wraps ``decide`` passes
+its real decision through and only simulates a concurrent writer after it.
 """
 
 from __future__ import annotations
@@ -24,11 +24,13 @@ import pytest
 
 from aiworkhub import (
     attempt_artifacts,
-    learning_commit_store,
+    needfix_store,
     process_event_ledger,
     process_launcher,
     process_launcher_acceptance,
     runtime_adapters,
+    sdlc_control_bands,
+    sdlc_deploy_proof,
     sdlc_stage_evidence,
     task_engine,
     task_store,
@@ -537,60 +539,246 @@ def test_caller_asserted_verdicts_are_refused_even_beside_real_evidence(accepted
     assert len(_stage_rows(accepted)) == 4
 
 
-def test_deploy_and_maintain_name_missing_producers_and_never_pass(accepted):
+def _git(root: Path, *args: str) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(root), *args],
+        check=True,
+        capture_output=True,
+        env=sdlc_deploy_proof.scrubbed_git_env(),
+    )
+    return result.stdout.decode().strip()
+
+
+def _append_ledger(root: Path, *lines: dict) -> None:
+    ledger = root.joinpath(*sdlc_deploy_proof.LEDGER_REL)
+    with ledger.open("a", encoding="utf-8") as handle:
+        handle.writelines(json.dumps(line) + "\n" for line in lines)
+
+
+def _release(
+    root: Path,
+    version: str,
+    *,
+    content: bytes | None = None,
+    confirm: bool = True,
+    server_version: str | None = None,
+) -> str:
+    """Commit the promoted path and append a built line, and its confirmation.
+
+    ``content`` commits other bytes than the accepted ones; the working tree is
+    restored afterwards, so the accepted candidate itself stays unchanged.
+    """
+    target = root / PROMOTED
+    accepted_bytes = target.read_bytes()
+    if content is not None:
+        target.write_bytes(content)
+    _git(root, "init", "-q")
+    for key, value in (
+        ("user.email", "fixture@example.com"), ("user.name", "Fixture"),
+        ("commit.gpgsign", "false"), ("core.autocrlf", "false"),
+    ):
+        _git(root, "config", key, value)
+    _git(root, "add", PROMOTED)
+    _git(root, "commit", "-q", "--allow-empty", "-m", f"release {version}")
+    commit = _git(root, "rev-parse", "HEAD")
+    target.write_bytes(accepted_bytes)
+    lines = [{
+        "kind": "built", "version": version, "release_commit": commit,
+        "vsix_sha256": hashlib.sha256(version.encode()).hexdigest(),
+        "built_at": "2026-09-29T00:00:00Z",
+        "previous_vsix": {"path": "dist/previous.vsix", "sha256": "c" * 64},
+        "target": "vscode_local",
+    }]
+    if confirm:
+        lines.append({
+            "kind": "installed", "version": version, "installed_at": "2026-09-29T00:05:00Z",
+            "server_version": server_version or version,
+        })
+    _append_ledger(root, *lines)
+    return commit
+
+
+def _release_payload(ns: SimpleNamespace, **extra) -> dict:
+    return {"task_id": ns.task_id, "request_id": ns.request_id, **extra}
+
+
+def _decide_maintain(ns: SimpleNamespace) -> sdlc_stage_evidence.StageDecision:
+    """Maintain over the Deploy evidence a ready Deploy decision records."""
+    reader = sdlc_stage_evidence.EvidenceReader(ns.root, ns.repo_id)
+    deploy = sdlc_stage_evidence.decide(
+        reader,
+        stage="deploy",
+        payload=_release_payload(ns, target="vscode_local"),
+        task_id=ns.task_id,
+        predecessors={},
+    )
+    assert deploy.ready, deploy.code
+    return sdlc_stage_evidence.decide(
+        reader,
+        stage="maintain",
+        payload=_release_payload(ns),
+        task_id=ns.task_id,
+        predecessors={"deploy": deploy.evidence},
+    )
+
+
+def test_maintain_without_recorded_deploy_evidence_is_deploy_not_ready(accepted, monkeypatch):
+    _release(accepted.root, "1.0.0")
+
+    def no_git(*_args, **_kwargs):
+        raise AssertionError("Maintain must not re-prove Deploy")
+
+    monkeypatch.setattr(sdlc_deploy_proof, "_git", no_git)
+    decision = sdlc_stage_evidence.decide(
+        sdlc_stage_evidence.EvidenceReader(accepted.root, accepted.repo_id),
+        stage="maintain",
+        payload=_release_payload(accepted),
+        task_id=accepted.task_id,
+        predecessors={},
+    )
+    assert decision.code == "deploy_not_ready"
+    assert not decision.ready
+
+
+def test_deploy_and_maintain_refuse_with_typed_codes_until_a_release_is_confirmed(accepted):
+    """Deploy/Maintain no longer name missing producers: each refusal is typed."""
+    assert set(sdlc_stage_evidence.MISSING_PRODUCERS) == {"not_applicable"}
     _record_through(accepted, "test")
     with pytest.raises(SdlcStageEvidenceRefusal) as unknown_target:
-        _record(accepted, "deploy", {"target": "production"})
+        _record(accepted, "deploy", _release_payload(accepted, target="production"))
     assert unknown_target.value.decision.code == "deploy_target_unknown"
-    assert unknown_target.value.decision.evidence["missing_producers"] == list(
-        sdlc_stage_evidence.MISSING_PRODUCERS["deploy"]
-    )
-    with pytest.raises(SdlcStageEvidenceRefusal) as no_receipt:
-        _record(accepted, "deploy", {}, request_id="R-deploy-bare")
-    assert no_receipt.value.decision.code == "missing_producer:release_build_provenance_receipt"
+    with pytest.raises(SdlcStageEvidenceRefusal) as no_target:
+        _record(accepted, "deploy", _release_payload(accepted), request_id="R-deploy-bare")
+    assert no_target.value.decision.code == "deploy_target_unknown"
+    with pytest.raises(SdlcStageEvidenceRefusal) as no_release:
+        _record(
+            accepted, "deploy", _release_payload(accepted, target="vscode_local"),
+            request_id="R-deploy-unreleased",
+        )
+    assert no_release.value.decision.code == "release_not_confirmed"
+    assert "release_receipt.py" in no_release.value.decision.next_action
     with pytest.raises(SdlcCaseValidationError, match="missing ready predecessor: deploy"):
-        _record(accepted, "maintain", {})
+        _record(accepted, "maintain", _release_payload(accepted))
     case = read_case(accepted.root, accepted.repo_id, accepted.case_id)
-    assert case["cycle"]["state"] == "incomplete"
     assert case["cycle"]["blocking_stage"] == "deploy"
     assert [row[0] for row in _stage_rows(accepted)] == ["plan", "design", "build", "test"]
 
 
-def test_maintain_resolves_available_evidence_but_never_passes(accepted):
-    before = sdlc_stage_evidence.decide(
-        sdlc_stage_evidence.EvidenceReader(accepted.root, accepted.repo_id),
-        stage="maintain",
-        payload={},
-        task_id=accepted.task_id,
-        predecessors={},
-    )
-    assert before.code == "missing_producer:observed_outcome_metrics"
-    assert before.evidence["learning"] == {
-        "state": "unknown",
-        "reason": "learning_disposition_missing",
+def test_a_confirmed_release_of_the_accepted_bytes_proves_deploy_then_maintain(accepted):
+    _record_through(accepted, "test")
+    commit = _release(accepted.root, "1.0.0")
+
+    _record(accepted, "deploy", _release_payload(accepted, target="vscode_local"))
+    _record(accepted, "maintain", _release_payload(accepted))
+
+    case = read_case(accepted.root, accepted.repo_id, accepted.case_id)
+    assert case["cycle"] == {"state": "complete", "blocking_stage": None, "reason": None}
+    deploy = case["stages"]["deploy"]["evidence"]["deploy"]
+    assert deploy == {
+        "version": "1.0.0",
+        "release_commit": commit,
+        "vsix_sha256": hashlib.sha256(b"1.0.0").hexdigest(),
+        "built_at": "2026-09-29T00:00:00Z",
+        "installed_at": "2026-09-29T00:05:00Z",
+        "previous_vsix": {"path": "dist/previous.vsix", "sha256": "c" * 64},
+        "target": "vscode_local",
+        "approval_policy": "manager_seat",
+        "promoted_path_count": 1,
+        "superseded_paths": [],
     }
-    assert before.evidence["accepted_outcome_receipt_id"] == accepted.receipt["receipt_id"]
-    learning_commit_store.record_disposition(
+    maintain = case["stages"]["maintain"]["evidence"]
+    assert maintain["candidate_sha256"] == case["stages"]["test"]["evidence"]["candidate_sha256"]
+    assert maintain["maintain"]["deployed_release"]["release_commit"] == commit
+    assert maintain["maintain"]["open_caused_by_count"] == 0
+    assert "needfix" not in maintain["maintain"]["band_report"]["tiers"].values()
+    assert len(maintain["maintain"]["band_report"]["config_sha256"]) == 64
+
+
+@pytest.mark.parametrize("server_version", [None, "9.9.9"])
+def test_a_built_but_unconfirmed_release_refuses_deploy(accepted, server_version):
+    _record_through(accepted, "test")
+    _release(accepted.root, "1.0.0", confirm=server_version is not None,
+             server_version=server_version)
+    with pytest.raises(SdlcStageEvidenceRefusal) as refused:
+        _record(accepted, "deploy", _release_payload(accepted, target="vscode_local"))
+    assert refused.value.decision.code == "release_not_confirmed"
+
+
+def test_other_bytes_at_the_release_commit_refuse_unless_a_later_acceptance_promoted_them(
+    accepted,
+):
+    _record_through(accepted, "test")
+    released = b"other bytes\n"
+    _release(accepted.root, "1.0.0", content=released)
+    with pytest.raises(SdlcStageEvidenceRefusal) as refused:
+        _record(accepted, "deploy", _release_payload(accepted, target="vscode_local"))
+    assert refused.value.decision.code == "release_commit_missing_promoted_hash"
+
+    later = "T-LATER"
+    _insert_claimed(accepted.root, _contract(later))
+    _accept(accepted.root, later, _seal(accepted.root, later))
+    # A later acceptance of the same path supersedes only with the released bytes.
+    with pytest.raises(SdlcStageEvidenceRefusal) as other_bytes:
+        _record(accepted, "deploy", _release_payload(accepted, target="vscode_local"))
+    assert other_bytes.value.decision.code == "release_commit_missing_promoted_hash"
+
+    conn = sqlite3.connect(str(task_store.canonical_db_path(accepted.root)))
+    try:
+        conn.execute(
+            "UPDATE tasks SET card_json=json_set(card_json, "
+            f"'$.accept_evidence.accepted_outcome_receipt.changed_path_hashes.\"{PROMOTED}\"', ?) "
+            "WHERE task_id=?",
+            (hashlib.sha256(released).hexdigest(), later),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    _record(accepted, "deploy", _release_payload(accepted, target="vscode_local"))
+    deploy = read_case(accepted.root, accepted.repo_id, accepted.case_id)["stages"]["deploy"]
+    assert deploy["state"] == "ready"
+    assert deploy["evidence"]["deploy"]["superseded_paths"] == [PROMOTED]
+
+
+def test_maintain_refuses_on_a_breached_control_band(accepted, monkeypatch):
+    _release(accepted.root, "1.0.0")
+    assert _decide_maintain(accepted).ready
+
+    def breached(root, repository_id):
+        band = sdlc_control_bands.MetricBand(
+            metric_id="first_pass_acceptance", direction="lower_is_bad", status="ok",
+            tier="needfix", severity="high", value=0.1, baseline=0.9, n=20,
+            baseline_n=100, z=-4.0, window_task_ids=(accepted.task_id,),
+        )
+        return sdlc_control_bands.BandReport(
+            schema_id=sdlc_control_bands.SCHEMA_ID, repository_id=repository_id,
+            config_sha256="d" * 64, metrics=(band,),
+        )
+
+    monkeypatch.setattr(sdlc_control_bands, "evaluate", breached)
+    decision = _decide_maintain(accepted)
+    assert decision.code == "band_breached"
+    assert not decision.ready and decision.fingerprint == ""
+
+
+def test_maintain_refuses_while_an_open_needfix_is_caused_by_the_task(accepted):
+    _release(accepted.root, "1.0.0")
+    row = needfix_store.add_needfix(
         accepted.root,
-        task_id=accepted.task_id,
-        request_id=accepted.request_id,
-        disposition=learning_commit_store.DISPOSITION_NO_NEW_LESSON,
-        reason="mechanical_change_only",
+        title="Escaped defect",
+        description="The accepted change broke a caller.",
+        caused_by={
+            "schema_id": needfix_store.CAUSED_BY_SCHEMA_ID,
+            "repository_id": accepted.repo_id,
+            "task_id": accepted.task_id,
+            "request_id": accepted.request_id,
+            "accepted_outcome_receipt": accepted.receipt,
+        },
+        repository_id=accepted.repo_id,
+        verify_accepted_outcome=lambda identity: {**identity, "outcome": "accepted"},
     )
-    after = sdlc_stage_evidence.decide(
-        sdlc_stage_evidence.EvidenceReader(accepted.root, accepted.repo_id),
-        stage="maintain",
-        payload={},
-        task_id=accepted.task_id,
-        predecessors={},
-    )
-    assert after.code == "missing_producer:observed_outcome_metrics"
-    assert after.evidence["learning"]["state"] == "recorded"
-    assert after.evidence["learning"]["disposition"] == "no_new_lesson"
-    assert after.evidence["missing_producers"] == list(
-        sdlc_stage_evidence.MISSING_PRODUCERS["maintain"]
-    )
-    assert not after.ready and after.fingerprint == ""
+    assert row["caused_by"]["task_id"] == accepted.task_id
+    assert _decide_maintain(accepted).code == "open_caused_by_needfix"
 
 
 def test_an_arbitrary_not_applicable_policy_cannot_skip_a_stage(accepted):

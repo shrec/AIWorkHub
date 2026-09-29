@@ -402,9 +402,9 @@ def test_latest_confirmed_returns_the_newest_fully_confirmed_version(tmp_path: P
     ledger = tmp_path / "ledger.jsonl"
     lines = [
         {"kind": "built", "version": "1.0.0"},
-        {"kind": "installed", "version": "1.0.0"},
+        {"kind": "installed", "version": "1.0.0", "server_version": "1.0.0"},
         {"kind": "built", "version": "1.2.0"},
-        {"kind": "installed", "version": "1.2.0"},
+        {"kind": "installed", "version": "1.2.0", "server_version": "1.2.0"},
         {"kind": "built", "version": "1.3.0"},
     ]
     ledger.write_text("".join(json.dumps(line) + "\n" for line in lines), encoding="utf-8")
@@ -412,6 +412,24 @@ def test_latest_confirmed_returns_the_newest_fully_confirmed_version(tmp_path: P
     result = rr.latest_confirmed(ledger)
 
     assert result == {"kind": "built", "version": "1.2.0"}
+
+
+def test_latest_confirmed_ignores_a_confirmation_from_another_server_version(
+    tmp_path: Path,
+) -> None:
+    ledger = tmp_path / "ledger.jsonl"
+    lines = [
+        {"kind": "built", "version": "1.0.0"},
+        {"kind": "installed", "version": "1.0.0", "server_version": "0.9.0"},
+    ]
+    ledger.write_text("".join(json.dumps(line) + "\n" for line in lines), encoding="utf-8")
+
+    assert rr.latest_confirmed(ledger) is None
+
+
+def test_the_script_and_the_deploy_proof_share_one_ledger_parser() -> None:
+    assert rr.sdlc_deploy_proof.LEDGER_REL == tuple(rr._LEDGER_RELATIVE.parts)
+    assert rr._GIT_ENV_BLOCKLIST is rr.sdlc_deploy_proof.GIT_ENV_BLOCKLIST
 
 
 def test_record_refuses_previous_vsix_outside_repo_root(

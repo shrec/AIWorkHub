@@ -50,6 +50,49 @@ def test_ensure_policy_is_owner_only_idempotent_and_valid(tmp_path: Path) -> Non
     assert created_again is False
 
 
+def _policy_with(deploy: object = None) -> dict:
+    policy = json.loads(json.dumps(repo_policy.DEFAULT_POLICY))
+    policy.pop("deploy")
+    if deploy is not None:
+        policy["deploy"] = deploy
+    return policy
+
+
+def test_a_policy_without_a_deploy_section_gets_the_default_target() -> None:
+    assert repo_policy.validate_policy(_policy_with())["deploy"] == {
+        "targets": ["vscode_local"], "approver": "manager_seat",
+    }
+    assert repo_policy.validate_policy(_policy_with({"targets": ["vscode_local", "staging"]}))[
+        "deploy"
+    ] == {"targets": ["vscode_local", "staging"], "approver": "manager_seat"}
+
+
+@pytest.mark.parametrize(
+    "deploy",
+    [
+        {"targets": ["vscode_local"], "approver": "worker_seat"},
+        {"targets": ["vscode_local"], "approver": None},
+        {"targets": []},
+        {"targets": ["not a token"]},
+        ["vscode_local"],
+    ],
+)
+def test_a_deploy_section_other_than_manager_seat_approval_is_refused(deploy) -> None:
+    with pytest.raises(repo_policy.RepoPolicyError):
+        repo_policy.validate_policy(_policy_with(deploy))
+
+
+def test_the_repository_policy_declares_its_deploy_section() -> None:
+    policy = json.loads(
+        (Path(__file__).resolve().parents[1] / repo_policy.POLICY_RELATIVE_PATH).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert repo_policy.validate_policy(policy)["deploy"] == {
+        "targets": ["vscode_local"], "approver": "manager_seat",
+    }
+
+
 def test_grok_kilo_preflight_uses_local_xai_auth_without_exposing_it(
     monkeypatch, tmp_path: Path
 ) -> None:

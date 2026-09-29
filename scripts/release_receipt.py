@@ -1,7 +1,6 @@
 import argparse
 import hashlib
 import json
-import os
 import re
 import subprocess
 import sys
@@ -9,19 +8,19 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-_LEDGER_RELATIVE = Path(".aiworkhub") / "releases.jsonl"
+try:
+    from aiworkhub import sdlc_deploy_proof
+except ImportError:  # a bare checkout: read the ledger module from its src tree
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+    from aiworkhub import sdlc_deploy_proof
+
+_DEFAULT_REPO_ROOT = Path(__file__).resolve().parents[1]
+
+_LEDGER_RELATIVE = Path(*sdlc_deploy_proof.LEDGER_REL)
 _VERSION_FILE_RELATIVE = Path("src") / "aiworkhub" / "_version.py"
 _VERSION_LITERAL = re.compile(r'__version__\s*=\s*"([^"]+)"')
-_GIT_TIMEOUT_SECONDS = 15
-_GIT_ENV_BLOCKLIST = (
-    "GIT_DIR",
-    "GIT_WORK_TREE",
-    "GIT_INDEX_FILE",
-    "GIT_OBJECT_DIRECTORY",
-    "GIT_COMMON_DIR",
-    "GIT_PREFIX",
-)
-_DEFAULT_REPO_ROOT = Path(__file__).resolve().parents[1]
+_GIT_TIMEOUT_SECONDS = sdlc_deploy_proof.GIT_TIMEOUT_SECONDS
+_GIT_ENV_BLOCKLIST = sdlc_deploy_proof.GIT_ENV_BLOCKLIST
 
 
 class ReceiptRefused(Exception):
@@ -29,10 +28,8 @@ class ReceiptRefused(Exception):
 
 
 def _git_clean_env() -> dict[str, str]:
-    env = os.environ.copy()
-    for key in _GIT_ENV_BLOCKLIST:
-        env.pop(key, None)
-    return env
+    # The one scrub the deploy proof uses, over the one _GIT_ENV_BLOCKLIST.
+    return sdlc_deploy_proof.scrubbed_git_env()
 
 
 def _git_rev_parse_head(repo_root: Path) -> str:
@@ -99,63 +96,15 @@ def _iso_now() -> str:
 
 
 def load_ledger(path: Path | str) -> list[dict[str, Any]]:
-    ledger_path = Path(path)
-    if not ledger_path.exists():
-        return []
-    entries: list[dict[str, Any]] = []
+    # One parser: the SDLC deploy proof reads the same ledger through it.
     try:
-        with ledger_path.open("r", encoding="utf-8", errors="strict") as handle:
-            for line_number, line in enumerate(handle, start=1):
-                stripped = line.strip()
-                if not stripped:
-                    continue
-                try:
-                    entry = json.loads(stripped)
-                except (ValueError, RecursionError):
-                    raise ReceiptRefused(
-                        f"ledger {ledger_path} line {line_number} is not valid JSON"
-                    ) from None
-                if not isinstance(entry, dict):
-                    raise ReceiptRefused(
-                        f"ledger {ledger_path} line {line_number} is not a JSON object"
-                    )
-                version = entry.get("version")
-                if version is not None and not isinstance(version, str):
-                    raise ReceiptRefused(f"ledger line {line_number} has non-string version")
-                if entry.get("kind") in ("built", "installed") and version is None:
-                    raise ReceiptRefused(f"ledger line {line_number} has missing version")
-                entries.append(entry)
-    except (UnicodeDecodeError, OSError) as exc:
-        raise ReceiptRefused(f"ledger unreadable: {type(exc).__name__}") from exc
-    return entries
-
-
-def _version_sort_key(version: str) -> tuple[int, ...]:
-    core = version.split("+", 1)[0].split("-", 1)[0]
-    key: list[int] = []
-    for part in core.split("."):
-        try:
-            key.append(int(part))
-        except ValueError:
-            key.append(0)
-    return tuple(key)
+        return sdlc_deploy_proof.parse_ledger(path)
+    except sdlc_deploy_proof.ReleaseLedgerError as exc:
+        raise ReceiptRefused(str(exc)) from exc
 
 
 def latest_confirmed(path: Path | str) -> dict[str, Any] | None:
-    entries = load_ledger(path)
-    built_by_version: dict[str, dict[str, Any]] = {}
-    installed_versions: set[str] = set()
-    for entry in entries:
-        version = entry.get("version")
-        if entry.get("kind") == "built":
-            built_by_version[version] = entry
-        elif entry.get("kind") == "installed":
-            installed_versions.add(version)
-    confirmed_versions = [v for v in built_by_version if v in installed_versions]
-    if not confirmed_versions:
-        return None
-    newest = max(confirmed_versions, key=_version_sort_key)
-    return built_by_version[newest]
+    return sdlc_deploy_proof.newest_confirmed(load_ledger(path))
 
 
 def _append_line(ledger_path: Path, entry: dict[str, Any]) -> None:
