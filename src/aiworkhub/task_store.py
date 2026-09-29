@@ -1794,6 +1794,144 @@ def archive_task(
         return True, operation
 
 
+def attach_rework_delta(
+    root: str | Path,
+    task_id: str,
+    *,
+    predecessor_request_id: str,
+    claim_epoch: int,
+    descriptor: Mapping[str, Any],
+) -> tuple[bool, str]:
+    """Pin one sealed rework delta onto the card's exact rework predecessor.
+
+    The janitor seals a pinned predecessor's worktree before releasing it; the
+    delta is the recovery input from then on. Like :func:`archive_task` this is
+    one preimage-guarded UPDATE: the ``card_json`` read is the ``WHERE`` clause,
+    so a card that changed between read and write reports ``card_changed``
+    instead of overwriting the newer card. An already-present delta is never
+    replaced.
+    """
+    _readiness, db_path = _require_ready(root)
+    request_id = str(predecessor_request_id or "").strip()
+    with _write_connection(db_path) as conn:
+        _begin_immediate(conn)
+        row = conn.execute(
+            "SELECT card_json FROM tasks WHERE task_id=?", (task_id,)
+        ).fetchone()
+        if row is None:
+            return False, "task_missing"
+        preimage = str(row["card_json"] or "{}")
+        try:
+            card = json.loads(preimage)
+        except json.JSONDecodeError:
+            card = {}
+        predecessor = card.get("rework_predecessor") if isinstance(card, dict) else None
+        if (
+            not isinstance(predecessor, dict)
+            or not request_id
+            or str(predecessor.get("request_id") or "").strip() != request_id
+            or type(claim_epoch) is not int
+            or predecessor.get("claim_epoch") != claim_epoch
+            or str(predecessor.get("task_id") or task_id) != task_id
+            or not isinstance(descriptor, Mapping)
+            or descriptor.get("request_id") != request_id
+            or descriptor.get("task_id") != task_id
+            or descriptor.get("claim_epoch") != claim_epoch
+        ):
+            return False, "rework_predecessor_mismatch"
+        if (
+            predecessor.get("rework_delta") is not None
+            or predecessor.get("delta_artifact") is not None
+        ):
+            return False, "rework_delta_present"
+        sealed = dict(descriptor)
+        pinned = dict(predecessor)
+        pinned["task_id"] = task_id
+        pinned["rework_delta"] = sealed
+        pinned["delta_artifact"] = {
+            "path": sealed.get("artifact_path"),
+            "digest": sealed.get("artifact_sha256"),
+        }
+        card["rework_predecessor"] = pinned
+        now = datetime.now(timezone.utc).isoformat()
+        try:
+            cur = conn.execute(
+                "UPDATE tasks SET card_json=?, updated_at=? WHERE task_id=? AND card_json=?",
+                (
+                    json.dumps(card, ensure_ascii=False, sort_keys=True),
+                    now,
+                    task_id,
+                    preimage,
+                ),
+            )
+            if cur.rowcount != 1:
+                conn.rollback()
+                return False, "card_changed"
+            conn.execute(
+                "INSERT INTO task_events(task_id, event, runner, payload_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    task_id,
+                    "rework_delta_sealed",
+                    "janitor",
+                    json.dumps(
+                        {
+                            "request_id": request_id,
+                            "claim_epoch": claim_epoch,
+                            "artifact_sha256": sealed.get("artifact_sha256"),
+                        },
+                        sort_keys=True,
+                    ),
+                    now,
+                ),
+            )
+            conn.commit()
+        except Exception:  # noqa: BLE001 -- a partial attach must never persist
+            conn.rollback()
+            raise
+    return True, "attached"
+
+
+_REWORK_DELTA_DIGEST_KEYS = frozenset({"artifact_sha256", "digest"})
+_REWORK_DELTA_UNREFERENCING_STATUSES = frozenset({"finished", "archived", "superseded"})
+
+
+def referenced_rework_delta_digests(root: str | Path) -> set[str]:
+    """Every sealed-delta digest a still-undecided task can still recover from."""
+    _readiness, db_path = _require_ready(root)
+    conn = _connect(db_path, readonly=True)
+    try:
+        rows = conn.execute(
+            "SELECT status, worker_status, archived_at, card_json FROM tasks"
+        ).fetchall()
+    finally:
+        conn.close()
+    digests: set[str] = set()
+    for row in rows:
+        if canonical_status(dict(row)) in _REWORK_DELTA_UNREFERENCING_STATUSES:
+            continue
+        try:
+            stack: list[Any] = [json.loads(str(row["card_json"] or "{}"))]
+        except json.JSONDecodeError:
+            continue
+        while stack:
+            node = stack.pop()
+            if isinstance(node, dict):
+                for key, value in node.items():
+                    if (
+                        key in _REWORK_DELTA_DIGEST_KEYS
+                        and isinstance(value, str)
+                        and len(value) == 64
+                        and all(ch in "0123456789abcdef" for ch in value)
+                    ):
+                        digests.add(value)
+                    elif isinstance(value, (dict, list)):
+                        stack.append(value)
+            elif isinstance(node, list):
+                stack.extend(node)
+    return digests
+
+
 def reconcile_dead_processing_claim(
     root: str | Path,
     task_id: str,

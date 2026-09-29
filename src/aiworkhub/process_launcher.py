@@ -846,13 +846,16 @@ def _terminal_state_for_workspace_error(exc: WorkspaceError) -> str:
     return _launcher_validation.terminal_state_for_workspace_error(exc)
 
 # Failure workspaces remain available through coordinator review.  Once a
-# coordinator has disposed that exact attempt (finished/archived, returned it
-# to pending, or moved it to blocked), the retained workspace is no longer the
-# authoritative review surface and is safe to collect.  While a card is in
-# review, only the request_id named by terminal_review remains authoritative;
-# older retained attempts for the same card are superseded and collectable.
-GC_CANDIDATE_PROCESS_STATES = TERMINAL_PROCESS_STATES - {"blocked"}
-GC_DISPOSED_CANONICAL_STATUSES = {"finished", "archived", "pending", "blocked"}
+# coordinator has disposed that exact attempt (finished/archived/superseded,
+# returned it to pending, or moved it to blocked), the retained workspace is no
+# longer the authoritative review surface and is safe to collect.  While a card
+# is in review, only the request_id named by terminal_review remains
+# authoritative; older retained attempts for the same card are superseded and
+# collectable.  Every terminal process state is a candidate: a state without a
+# retained workspace is filtered by ``workspace_retained`` itself.
+GC_CANDIDATE_PROCESS_STATES = TERMINAL_PROCESS_STATES
+GC_DISPOSED_CANONICAL_STATUSES = {"finished", "archived", "superseded", "pending", "blocked"}
+_GC_FAILURE_REPORT_LIMIT = 50
 
 
 # --- B412: token-free liveness contract -------------------------------------
@@ -10480,7 +10483,7 @@ class ProcessManager:
         )
         result = self._reconcile_persisted_requests()
         result["ambiguous_claims_recovered"] = ambiguous_claims_recovered
-        gc_result: dict[str, int] = (
+        gc_result: dict[str, Any] = (
             self._gc_finalized_workspaces()
             if include_gc
             else {"gc_scanned": 0, "gc_cleaned": 0, "gc_skipped": 0}
@@ -10532,11 +10535,17 @@ class ProcessManager:
             })
         return abandoned
 
-    def _gc_finalized_workspaces(self) -> dict[str, int]:
-        """Run one idempotent, fail-closed sweep of retained workspaces."""
+    def _gc_finalized_workspaces(self) -> dict[str, Any]:
+        """Run one idempotent, fail-closed sweep of retained workspaces.
+
+        A worktree the sweep tried and failed to release (a seal or a cleanup
+        that failed) is reported under ``failures`` -- bounded, and only when
+        there is one -- so a stuck worktree is visible instead of silently kept.
+        """
         scanned = 0
         cleaned = 0
         skipped = 0
+        failures: list[dict[str, str]] = []
         for request_id, event in list(self._latest_by_request().items()):
             result = self._gc_finalized_workspace(request_id, event)
             if result is None:
@@ -10544,9 +10553,24 @@ class ProcessManager:
             scanned += 1
             if result.get("gc"):
                 cleaned += 1
-            else:
-                skipped += 1
-        return {"gc_scanned": scanned, "gc_cleaned": cleaned, "gc_skipped": skipped}
+                continue
+            skipped += 1
+            reason = str(result.get("reason") or "")
+            if (
+                reason.startswith(("rework_seal_failed:", "cleanup_failed:"))
+                and len(failures) < _GC_FAILURE_REPORT_LIMIT
+            ):
+                failures.append({
+                    "request_id": request_id,
+                    "task_id": str(event.get("task_id") or ""),
+                    "reason": reason,
+                })
+        summary: dict[str, Any] = {
+            "gc_scanned": scanned, "gc_cleaned": cleaned, "gc_skipped": skipped,
+        }
+        if failures:
+            summary["failures"] = failures
+        return summary
 
     @staticmethod
     def _gc_disposition(
@@ -10583,7 +10607,7 @@ class ProcessManager:
             if canonical_status not in task_fsm.REWORK_RECOVERABLE_STATUSES:
                 return True, f"pin_unrecoverable_task_status:{canonical_status}"
             return False, "pinned_rework_predecessor"
-        if process_state == "finalize_failed" and canonical_status not in {"finished", "archived"}:
+        if process_state == "finalize_failed" and canonical_status not in {"finished", "archived", "superseded"}:
             return False, "retryable_finalize_failed"  # a retry can still recover it
         if canonical_status in GC_DISPOSED_CANONICAL_STATUSES:
             return True, f"disposed_task_status:{canonical_status}"
@@ -10674,6 +10698,82 @@ class ProcessManager:
             return False, "review_workspace_hash_mismatch"
         return True, "review_workspace_verified"
 
+    def _seal_pinned_rework_predecessor(
+        self,
+        card: dict[str, Any],
+        task_id: str,
+        request_id: str,
+        latest: dict[str, Any],
+        *,
+        workspace_meta: Mapping[str, Any],
+        path: Path,
+        home: Path,
+        repo: Path,
+    ) -> tuple[dict[str, Any] | None, str]:
+        """Seal a pinned predecessor's exact bytes and attach them to its card.
+
+        Returns the re-read card and ``sealed_rework_delta`` once the card's own
+        disposition proves the attached delta verifies, else ``(None, reason)``
+        with the worktree untouched. The caller releases the worktree through
+        its ordinary delete path; nothing here deletes.
+        """
+        if not _process_proven_dead(int(latest.get("pid") or 0), latest.get("pid_start_ticks")):
+            return None, "process_not_proven_dead"
+        try:
+            workspace = WorkerWorkspace.from_metadata(dict(workspace_meta))
+            assert_gc_safe_workspace_shape(request_id, path, home, repo=repo)
+        except (KeyError, TypeError, ValueError, WorkspaceError) as exc:
+            return None, f"unsafe_workspace_shape:{exc}"[:200]
+        predecessor = card.get("rework_predecessor")
+        predecessor = predecessor if isinstance(predecessor, dict) else {}
+        hashes = predecessor.get("changed_path_hashes")
+        claim_epoch = predecessor.get("claim_epoch")
+        if not isinstance(hashes, dict) or not hashes:
+            return None, "rework_seal_failed:rework_predecessor_hashes_missing"
+        pinned_workspace = predecessor.get("workspace")
+        if isinstance(pinned_workspace, dict) and (
+            str(pinned_workspace.get("path") or "") != str(path)
+        ):
+            return None, "rework_seal_failed:rework_predecessor_workspace_mismatch"
+        try:
+            from .successful_rework_recovery import candidate_entries
+
+            entries = candidate_entries(path, hashes)
+        except ValueError as exc:  # SuccessfulReworkRecoveryError is a ValueError
+            return None, f"rework_seal_failed:{exc}"[:200]
+        descriptor = _terminal_rework_delta_evidence(
+            workspace,
+            {"task_id": task_id, "claim_epoch": claim_epoch},
+            request_id,
+            sorted(hashes),
+            captured_entries=entries,
+        )
+        if not isinstance(descriptor, dict) or descriptor.get("sealed") is not True:
+            code = (descriptor or {}).get("reason") or "rework_delta_empty"
+            return None, f"rework_seal_failed:{code}"[:200]
+        try:
+            attached, code = task_store.attach_rework_delta(
+                self.repo, task_id,
+                predecessor_request_id=request_id,
+                claim_epoch=claim_epoch,
+                descriptor=descriptor,
+            )
+        except Exception as exc:  # noqa: BLE001 -- any store failure keeps the worktree
+            return None, f"rework_seal_failed:attach_failed:{type(exc).__name__}"
+        if not attached:
+            return None, f"rework_seal_failed:{code}"
+        try:
+            refreshed = _parse_card(self._show_task(task_id), task_id)
+        except Exception as exc:  # noqa: BLE001 -- fail closed, keep the worktree
+            return None, f"rework_seal_failed:task_lookup_failed:{exc}"[:200]
+        eligible, disposition = self._gc_disposition(
+            refreshed, request_id, repo=self.repo,
+            process_state=str(latest.get("state") or ""),
+        )
+        if not eligible or disposition != "sealed_rework_delta":
+            return None, f"rework_seal_failed:post_attach_disposition:{disposition}"[:200]
+        return refreshed, disposition
+
     def _gc_finalized_workspace(
         self, request_id: str, event: dict[str, Any]
     ) -> dict[str, Any] | None:
@@ -10728,6 +10828,17 @@ class ProcessManager:
                 }
             eligible, disposition = self._gc_disposition(
                 card, request_id, repo=self.repo, process_state=str(latest.get("state") or ""))
+            if not eligible and disposition == "pinned_rework_predecessor":
+                # Seal the pinned bytes into a verified delta; the delta then
+                # stands in for the worktree and the ordinary path below
+                # releases it. Any failure keeps the worktree.
+                sealed_card, disposition = self._seal_pinned_rework_predecessor(
+                    card, task_id, request_id, latest,
+                    workspace_meta=workspace_meta, path=path, home=home, repo=repo,
+                )
+                if sealed_card is None:
+                    return {"request_id": request_id, "gc": False, "reason": disposition}
+                card, eligible = sealed_card, True
             if not eligible:
                 if disposition != "current_review_request":
                     return {

@@ -569,7 +569,16 @@ def test_pending_rework_predecessor_is_pinned_until_successor_claim(tmp_path, mo
 
     result = manager._gc_finalized_workspaces()
 
-    assert result == {"gc_scanned": 1, "gc_cleaned": 0, "gc_skipped": 1}
+    # S1 janitor C1: a pinned predecessor is sealed before release; one with no
+    # hash-pinned bytes cannot be sealed, so it stays and is reported.
+    assert result == {
+        "gc_scanned": 1, "gc_cleaned": 0, "gc_skipped": 1,
+        "failures": [{
+            "request_id": request_id,
+            "task_id": card["task_id"],
+            "reason": "rework_seal_failed:rework_predecessor_hashes_missing",
+        }],
+    }
     assert path.exists() and home.exists()
     assert "workspace_gc" not in manager._request_events(request_id)[-1]
 
@@ -596,7 +605,14 @@ def test_blocked_rework_predecessor_survives_failed_successor(tmp_path, monkeypa
 
     result = manager._gc_finalized_workspaces()
 
-    assert result == {"gc_scanned": 1, "gc_cleaned": 0, "gc_skipped": 1}
+    assert result == {
+        "gc_scanned": 1, "gc_cleaned": 0, "gc_skipped": 1,
+        "failures": [{
+            "request_id": request_id,
+            "task_id": card["task_id"],
+            "reason": "rework_seal_failed:rework_predecessor_hashes_missing",
+        }],
+    }
     assert path.exists() and home.exists()
     assert "workspace_gc" not in manager._request_events(request_id)[-1]
 
@@ -757,10 +773,13 @@ def test_review_without_exact_request_identity_fails_closed(tmp_path, monkeypatc
     assert path.exists() and home.exists()
 
 
-def test_blocked_process_event_is_never_a_gc_candidate_even_if_task_finished(tmp_path, monkeypatch):
-    """Defense in depth: "blocked" is excluded from GC_CANDIDATE_PROCESS_STATES
-    even though it is a member of TERMINAL_PROCESS_STATES, because a launch
-    rejection never has a retained workspace worth reconsidering."""
+def test_retained_blocked_process_event_is_collected_once_task_finished(tmp_path, monkeypatch):
+    """S1 janitor C1: every terminal process state is a GC candidate.
+
+    ``blocked`` used to be excluded outright, so a blocked attempt that DID
+    retain a workspace was kept forever. ``workspace_retained`` is the filter
+    now: a launch rejection that retained nothing is still never scanned, and
+    one that retained a workspace is collected under the ordinary guards."""
     monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "wtroot"))
     card = _card()
     card.update({"status": "finished", "worker_status": "done", "claimed_by": ""})
@@ -774,8 +793,8 @@ def test_blocked_process_event_is_never_a_gc_candidate_even_if_task_finished(tmp
 
     result = manager._gc_finalized_workspaces()
 
-    assert result == {"gc_scanned": 0, "gc_cleaned": 0, "gc_skipped": 0}
-    assert path.exists() and home.exists()
+    assert result == {"gc_scanned": 1, "gc_cleaned": 1, "gc_skipped": 0}
+    assert not path.exists() and not home.exists()
 
 
 @pytest.mark.parametrize("state", ["review_pending", "release_pending", "reconcile_pending"])
