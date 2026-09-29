@@ -430,48 +430,103 @@ def verify_provenance(
     """
     if not rows:
         return
+    manager_decisions, usage_rows = _provenance_snapshot(repo_root)
+    authority = accepted_outcome_authority or partial(
+        historical_accepted_outcome_authority, repo_root,
+    )
+    for row in rows:
+        failure = _row_provenance_failure(
+            repo_root, row, authority=authority,
+            manager_decisions=manager_decisions, usage_rows=usage_rows,
+        )
+        if failure:
+            raise AcceptedTaskEvalError(failure)
+
+
+def _provenance_snapshot(repo_root: Path) -> tuple[Any, Any]:
     try:
         manager_decisions = task_store.latest_manager_decisions(repo_root)
         usage_rows = task_store.list_usage_events(repo_root, limit=10_000)
     except task_store.TaskStoreError as orig:
         raise AcceptedTaskEvalError(f"task_store_unavailable:{orig}") from orig
-    authority = accepted_outcome_authority or partial(
-        historical_accepted_outcome_authority, repo_root,
-    )
-    for row in rows:
-        task_id = str(row.get("task_id") or "")
-        request_id = str(row.get("request_id") or "")
-        try:
-            trajectory = trajectory_export.export_attempt_trajectory(
-                repo_root, task_id=task_id, request_id=request_id,
-                manager_decisions=manager_decisions, usage_rows=usage_rows,
-                accepted_outcome_authority=authority,
-            )
-        except trajectory_export.AttemptTrajectoryExportError as orig:
-            raise AcceptedTaskEvalError(
-                f"provenance_absent_from_sealed_source:{task_id}:{request_id}:{orig}"
-            ) from orig
-        if trajectory["outcome"]["state"] != "accepted":
-            raise AcceptedTaskEvalError(
-                f"provenance_absent_from_sealed_source:{task_id}:{request_id}:not_accepted"
-            )
-        live_receipt = trajectory["outcome"]["accepted_outcome_receipt"] or {}
-        live_receipt_id = live_receipt.get("receipt_id", trajectory_export.UNKNOWN)
-        if live_receipt_id != row.get("accepted_outcome_receipt_id"):
-            raise AcceptedTaskEvalError(
-                f"provenance_receipt_mismatch:{task_id}:{request_id}"
-            )
+    return manager_decisions, usage_rows
+
+
+def _row_provenance_failure(
+    repo_root: Path,
+    row: dict[str, Any],
+    *,
+    authority: trajectory_export.AcceptedOutcomeAuthority,
+    manager_decisions: Any,
+    usage_rows: Any,
+) -> str:
+    """Return the ``verify_provenance`` refusal for one row, or ``""``."""
+    task_id = str(row.get("task_id") or "")
+    request_id = str(row.get("request_id") or "")
+    try:
+        trajectory = trajectory_export.export_attempt_trajectory(
+            repo_root, task_id=task_id, request_id=request_id,
+            manager_decisions=manager_decisions, usage_rows=usage_rows,
+            accepted_outcome_authority=authority,
+        )
+    except trajectory_export.AttemptTrajectoryExportError as orig:
+        return f"provenance_absent_from_sealed_source:{task_id}:{request_id}:{orig}"
+    if trajectory["outcome"]["state"] != "accepted":
+        return f"provenance_absent_from_sealed_source:{task_id}:{request_id}:not_accepted"
+    live_receipt = trajectory["outcome"]["accepted_outcome_receipt"] or {}
+    live_receipt_id = live_receipt.get("receipt_id", trajectory_export.UNKNOWN)
+    if live_receipt_id != row.get("accepted_outcome_receipt_id"):
+        return f"provenance_receipt_mismatch:{task_id}:{request_id}"
+    return ""
+
+
+def exclude_historically_unprovable(
+    repo_root: Path, candidates: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Split candidates by the historical default of ``verify_provenance``.
+
+    A candidate whose row that default check would refuse (historical
+    authority mismatch, or an outcome that is no longer accepted) is never
+    written. It is returned with its refusal reason so an exclusion is always
+    visible, never silent. A store that cannot be read at all still fails
+    closed rather than excluding everything.
+    """
+    if not candidates:
+        return [], []
+    manager_decisions, usage_rows = _provenance_snapshot(repo_root)
+    authority = partial(historical_accepted_outcome_authority, repo_root)
+    kept: list[dict[str, Any]] = []
+    excluded: list[dict[str, Any]] = []
+    for candidate in candidates:
+        failure = _row_provenance_failure(
+            repo_root, _row_from_candidate(candidate), authority=authority,
+            manager_decisions=manager_decisions, usage_rows=usage_rows,
+        )
+        if failure:
+            excluded.append({
+                "task_id": candidate["task_id"],
+                "request_id": candidate["request_id"],
+                "reason": failure,
+            })
+        else:
+            kept.append(candidate)
+    excluded.sort(key=lambda entry: (entry["task_id"], entry["request_id"]))
+    return kept, excluded
 
 
 def rebuild(repo_root: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """Query the live canonical task store and (re)write the tracked corpus.
 
+    Candidates the historical default of ``verify_provenance`` would refuse
+    are dropped first and listed in the summary's ``excluded_candidates``.
     Fails closed via ``AcceptedTaskEvalError`` when fewer than ``MIN_ROWS``
-    authenticated accepted trajectories are available -- a thin/empty corpus
-    is never written as if it passed -- and again if any selected row's
-    provenance does not re-authenticate live via ``verify_provenance``.
+    authenticated accepted trajectories remain after that exclusion -- a
+    thin/empty corpus is never written as if it passed -- and again if any
+    selected row's provenance does not re-authenticate both live and
+    historically via ``verify_provenance``.
     """
     candidates = discover_candidates(repo_root)
+    candidates, excluded = exclude_historically_unprovable(repo_root, candidates)
     rows = build_rows(candidates)
     verify_provenance(
         repo_root,
@@ -480,7 +535,9 @@ def rebuild(repo_root: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
             task_engine._validate_accepted_outcome_receipt, repo_root,
         ),
     )
+    verify_provenance(repo_root, rows)
     summary = build_summary(rows)
+    summary["excluded_candidates"] = excluded
     _write_json(repo_root / SUMMARY_RELATIVE_PATH, summary)
     _write_jsonl(repo_root / ROWS_RELATIVE_PATH, rows)
     _update_registry(repo_root)
@@ -591,7 +648,11 @@ def main(argv: list[str] | None = None) -> int:
     except AcceptedTaskEvalError as exc:
         print(json.dumps({"passed": False, "reason": str(exc)}, ensure_ascii=False))
         return 1
-    print(json.dumps({"passed": True, "record_count": summary["record_count"]}, ensure_ascii=False))
+    print(json.dumps({
+        "passed": True,
+        "record_count": summary["record_count"],
+        "excluded_candidates": summary["excluded_candidates"],
+    }, ensure_ascii=False))
     return 0
 
 

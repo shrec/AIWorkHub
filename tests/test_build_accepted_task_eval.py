@@ -41,6 +41,8 @@ def _git(repo: Path, *args: str, input_bytes: bytes | None = None) -> str:
         "GIT_OBJECT_DIRECTORY", "GIT_COMMON_DIR", "GIT_PREFIX",
     ):
         env.pop(key, None)
+    # Pinned dates keep fixture commit oids (and so receipt ids) reproducible.
+    env["GIT_AUTHOR_DATE"] = env["GIT_COMMITTER_DATE"] = "2026-09-01T00:00:00+00:00"
     result = subprocess.run(
         ["git", "-C", str(repo), *args],
         check=True,
@@ -154,17 +156,13 @@ def _seed_accepted_scenario(
 
 
 def seed_fixture_repository(repo: Path) -> list[tuple[str, str]]:
-    """Seed 27 accepted scenarios across 3 families x 3 risk tiers x 3 complexities."""
-    task_store.initialize_repository(repo)
-    seeded = []
-    for family in FAMILIES:
-        for risk_tier in RISK_TIERS:
-            for complexity, promoted_count in COMPLEXITY_PROMOTED_COUNTS.items():
-                seeded.append(_seed_accepted_scenario(
-                    repo, family=family, risk_tier=risk_tier,
-                    complexity=complexity, promoted_count=promoted_count,
-                ))
-    return seeded
+    """Seed 27 accepted scenarios across 3 families x 3 risk tiers x 3 complexities.
+
+    Promoted bytes are committed after a real ``base_oid`` so every scenario
+    also passes the historical default of ``verify_provenance`` that rebuild
+    now filters candidates by.
+    """
+    return seed_historical_fixture_repository(repo)
 
 
 def seed_historical_fixture_repository(repo: Path) -> list[tuple[str, str]]:
@@ -629,6 +627,65 @@ def test_rebuild_fails_closed_and_writes_nothing_when_a_row_is_forged(
     monkeypatch.setattr(builder, "build_rows", _forged_build_rows)
 
     with pytest.raises(builder.AcceptedTaskEvalError, match="provenance_absent_from_sealed_source"):
+        builder.rebuild(repo)
+    assert not (repo / builder.SUMMARY_RELATIVE_PATH).exists()
+    assert not (repo / builder.ROWS_RELATIVE_PATH).exists()
+
+
+def _fail_historical_authority_for(
+    monkeypatch: pytest.MonkeyPatch, failing_task_ids: set[str],
+) -> None:
+    """Stub the historical authority so the named candidates fail it."""
+    real_authority = builder.historical_accepted_outcome_authority
+
+    def _stubbed(repo, card, task_id, request_id, receipt):
+        if task_id in failing_task_ids:
+            return None, "accepted_outcome_receipt_historical_hash_mismatch"
+        return real_authority(repo, card, task_id, request_id, receipt)
+
+    monkeypatch.setattr(builder, "historical_accepted_outcome_authority", _stubbed)
+
+
+def test_rebuild_excludes_and_reports_candidate_failing_historical_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """NF-2026-01129: rebuild never writes a row its own default check rejects."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    seeded = seed_historical_fixture_repository(repo)
+    failing = seeded[0]
+    _fail_historical_authority_for(monkeypatch, {failing[0]})
+
+    summary, rows = builder.rebuild(repo)
+
+    written = {(row["task_id"], row["request_id"]) for row in rows}
+    assert failing not in written
+    assert written == set(seeded) - {failing}
+    excluded = summary["excluded_candidates"]
+    assert [(entry["task_id"], entry["request_id"]) for entry in excluded] == [failing]
+    assert "accepted_outcome_receipt_historical_hash_mismatch" in excluded[0]["reason"]
+    on_disk = json.loads((repo / builder.SUMMARY_RELATIVE_PATH).read_text(encoding="utf-8"))
+    assert on_disk["excluded_candidates"] == excluded
+    committed = [
+        json.loads(line)
+        for line in (repo / builder.ROWS_RELATIVE_PATH).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert committed == rows
+    builder.verify_provenance(repo, committed)
+    assert builder.check(repo)["passed"] is True
+
+
+def test_rebuild_enforces_minimum_rows_after_historical_exclusion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    seeded = seed_historical_fixture_repository(repo)
+    keep = builder.MIN_ROWS - 1
+    _fail_historical_authority_for(monkeypatch, {task_id for task_id, _ in seeded[keep:]})
+
+    with pytest.raises(builder.InsufficientAcceptedTrajectoriesError):
         builder.rebuild(repo)
     assert not (repo / builder.SUMMARY_RELATIVE_PATH).exists()
     assert not (repo / builder.ROWS_RELATIVE_PATH).exists()
