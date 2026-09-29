@@ -69,13 +69,18 @@ def _db_path(repo_root: Path) -> Path:
     return Path(repo_root).joinpath(*CASES_DB_REL)
 
 
-def _connect(path: Path) -> sqlite3.Connection:
+def connect_writer(path: Path) -> sqlite3.Connection:
+    """Open a WAL-mode writer connection; the module's only ``sqlite3.connect``."""
+
     conn = sqlite3.connect(str(path), timeout=30.0, isolation_level=None)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=30000")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.row_factory = sqlite3.Row
     return conn
+
+
+_connect = connect_writer
 
 
 def _ensure_schema(conn: sqlite3.Connection) -> None:

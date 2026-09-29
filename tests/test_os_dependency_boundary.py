@@ -16,6 +16,17 @@ ROOT = Path(__file__).resolve().parents[1]
 CONFIG = ROOT / ".aiworkhub/config/development_rules.json"
 
 
+def _symlink_or_skip(link: Path, target: Path) -> None:
+    """Create a directory symlink, skipping only when the OS refuses the privilege."""
+
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except OSError as exc:
+        if isinstance(exc, PermissionError) or getattr(exc, "winerror", None) == 1314:
+            pytest.skip("symlink creation not permitted")
+        raise
+
+
 @pytest.mark.parametrize("module", ["fcntl", "msvcrt"])
 def test_ast_import_scanner_matches_valid_import_forms(tmp_path, module):
     positives = [
@@ -175,7 +186,7 @@ def test_declared_scan_root_symlink_fails_closed_before_scanning(tmp_path):
     alternate = root / "alternate"
     alternate.mkdir()
     (alternate / "would_scan.py").write_text("sys.platform\n", encoding="utf-8")
-    scan_root.symlink_to(alternate, target_is_directory=True)
+    _symlink_or_skip(scan_root, alternate)
 
     with pytest.raises(ValueError, match="scan root must not be a symlink"):
         checker.check(root, config)
@@ -188,7 +199,7 @@ def test_nested_directory_symlink_fails_closed_without_following_it(tmp_path):
     (tracked_directory / "violation.py").write_text("sys.platform\n", encoding="utf-8")
     nested = root / "src/aiworkhub/nested"
     nested.mkdir()
-    (nested / "linked").symlink_to(tracked_directory, target_is_directory=True)
+    _symlink_or_skip(nested / "linked", tracked_directory)
 
     with pytest.raises(ValueError, match="symlink in scan input"):
         checker.check(root, config)
@@ -196,7 +207,7 @@ def test_nested_directory_symlink_fails_closed_without_following_it(tmp_path):
 
 def test_generator_cli_rejects_symlinked_root_with_exit_2(tmp_path):
     linked_root = tmp_path / "linked-root"
-    linked_root.symlink_to(ROOT, target_is_directory=True)
+    _symlink_or_skip(linked_root, ROOT)
 
     result = subprocess.run(
         [

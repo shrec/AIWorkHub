@@ -242,7 +242,7 @@ def _write_state(
     """Upsert cursors, per-task stage states and attribution retries in one short write transaction."""
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(path), timeout=30.0, isolation_level=None)
+    conn = sdlc_case_store.connect_writer(path)
     try:
         conn.execute("PRAGMA busy_timeout=30000")
         conn.execute("BEGIN IMMEDIATE")

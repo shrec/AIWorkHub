@@ -825,3 +825,24 @@ def test_more_undeployed_tasks_than_a_pass_allows_drain_over_several_passes(repo
     ]
     final = sdlc_sync.sync_once(repo.root, repo.repo_id)
     assert {final["stages"][task_id]["deploy"] for task_id in task_ids} == {"ready"}
+
+
+def test_sweep_state_db_is_opened_through_the_wal_writer(repo, monkeypatch):
+    opened = []
+    real_writer = sdlc_case_store.connect_writer
+
+    def connect_writer(path):
+        opened.append(Path(path))
+        return real_writer(path)
+
+    monkeypatch.setattr(sdlc_sync.sdlc_case_store, "connect_writer", connect_writer)
+    _create_task(repo.root, TASK_ID)
+    sdlc_sync.sync_once(repo.root, repo.repo_id)
+
+    state_path = repo.root.joinpath(*sdlc_sync.STATE_DB_REL)
+    assert state_path in opened
+    conn = sqlite3.connect(str(state_path))
+    try:
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+    finally:
+        conn.close()
