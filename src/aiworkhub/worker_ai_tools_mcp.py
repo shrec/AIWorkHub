@@ -154,6 +154,9 @@ ENV_PROVENANCE = "AIWORKHUB_WORKER_MCP_PROVENANCE"
 # Names the sandbox the worker itself is confined by when this server runs
 # OUTSIDE it, bridged to the worker (NF-2026-00034: "windows_appcontainer").
 ENV_CONTAINED_WORKER = "AIWORKHUB_WORKER_MCP_CONTAINED_WORKER"
+# And that worker's adapter id, from which its own AppContainer SID is derived,
+# so validation_run can hand a command to that container (NF-2026-01120).
+ENV_CONTAINED_WORKER_ADAPTER = "AIWORKHUB_WORKER_MCP_CONTAINED_WORKER_ADAPTER"
 # The interpreter's own import-path variable (never an AIWORKHUB_* identity
 # binding) -- carries the portable ".../src" import root so `python -m
 # aiworkhub.worker_ai_tools_mcp` resolves regardless of the launcher's cwd.
@@ -395,6 +398,9 @@ class WorkerToolContext:
     # Set when this server runs on the host for a worker confined elsewhere
     # (ENV_CONTAINED_WORKER, NF-2026-00034): nothing may be EXECUTED for it here.
     contained_worker: str = ""
+    # That worker's adapter (ENV_CONTAINED_WORKER_ADAPTER), which names its own
+    # container for validation_run (NF-2026-01120).
+    contained_worker_adapter: str = ""
     _supervisor_owned: bool = False
 
 
@@ -498,6 +504,7 @@ def load_context_from_env(env: Any = None) -> WorkerToolContext:
         provider_call_id=provider_call_id,
         provenance=provenance,
         contained_worker=str(source.get(ENV_CONTAINED_WORKER) or ""),
+        contained_worker_adapter=str(source.get(ENV_CONTAINED_WORKER_ADAPTER) or ""),
     )
 
 
@@ -7441,6 +7448,37 @@ def _validation_memo_reset() -> None:
         _EXIT_PREFLIGHT_AUTO_ATTACHED.clear()
 
 
+def _cached_validation_receipt(
+    ctx: WorkerToolContext, memo_key: tuple[str, str, str], index: int
+) -> dict[str, Any] | None:
+    """The memoised receipt for ``memo_key``, audited as a memo hit, or None."""
+
+    with _VALIDATION_MEMO_LOCK:
+        cached = _VALIDATION_MEMO.get(memo_key)
+    if cached is None:
+        return None
+    _append_audit(
+        ctx,
+        tool="validation_command",
+        ok=cached.get("returncode") == 0,
+        cache_hit=True,
+        hit_count=1,
+        bytes_returned=0,
+        authority_source="worker_advisory",
+        authority_state="validation_memo_hit",
+    )
+    return {**cached, "unchanged_since_last_run": True, "index": index}
+
+
+def _remember_validation_receipt(
+    memo_key: tuple[str, str, str], receipt: Mapping[str, Any]
+) -> None:
+    with _VALIDATION_MEMO_LOCK:
+        _VALIDATION_MEMO[memo_key] = dict(receipt)
+        while len(_VALIDATION_MEMO) > MAX_VALIDATION_MEMO_ENTRIES:
+            _VALIDATION_MEMO.pop(next(iter(_VALIDATION_MEMO)))
+
+
 def _contract_packet(ctx: WorkerToolContext) -> dict[str, Any]:
     """Read the coordinator-sealed contract packet, or fail closed with why."""
 
@@ -7656,22 +7694,31 @@ def validation_run(
 
     A server bridged to a contained worker (``ctx.contained_worker``) runs on
     the host, outside that worker's sandbox, and a validation command runs
-    the worker's candidate code -- so here it refuses, and the coordinator's
-    post-exit validation, which runs inside the sandbox, stays the only run.
+    the worker's candidate code -- so it never executes one here.  For a
+    Windows AppContainer worker whose adapter is bound (NF-2026-01120) it
+    resolves the packet, selection and workspace exactly as below and hands
+    the commands to ``worker_workspace.run_validations`` with that backend:
+    the coordinator's own post-exit lane, which runs them in an AppContainer
+    under a separate ``<adapter>_validation`` identity, so its grant cleanup
+    never touches the live worker's own container grants.  Any other
+    contained backend, an unbound adapter, or a validation HOME that would
+    expose this server's private runtime directory
+    (``_contained_validation_blocker``) keeps the refusal, and the
+    coordinator's post-exit validation stays the only run.
     """
 
-    if ctx.contained_worker:
-        return {
-            "ok": False,
-            "tool": "validation_run",
-            "reason": "validation_run_unavailable_outside_the_worker_sandbox",
-            "detail": (
-                f"this server runs outside the worker's {ctx.contained_worker} "
-                "sandbox, so it never executes candidate code; the coordinator "
-                "runs the card's validation inside the sandbox after you exit"
-            ),
-            "advisory_only": True,
-        }
+    contained = bool(ctx.contained_worker)
+    if contained:
+        from . import worker_workspace
+
+        if ctx.contained_worker != worker_workspace.WINDOWS_APPCONTAINER_BACKEND:
+            return _contained_validation_refusal(
+                ctx, "no in-sandbox validation lane exists for this backend"
+            )
+        if not ctx.contained_worker_adapter:
+            return _contained_validation_refusal(
+                ctx, "no adapter id is bound, so the worker's own container is unknown"
+            )
     packet = _contract_packet(ctx)
     commands = [str(v) for v in (packet.get("validation") or [])]
     if not commands:
@@ -7698,13 +7745,28 @@ def validation_run(
         selected = [position]
 
     workspace = _packet_workspace(ctx, packet)
+    if contained:
+        blocker = _contained_validation_blocker(ctx, workspace)
+        if blocker:
+            return _contained_validation_refusal(ctx, blocker)
     candidate_digest = _candidate_bytes_digest(
         Path(workspace.path), workspace.allowed_writes
     )
     run_dir = _validation_run_dir(ctx)
-    results: list[dict[str, Any]] = []
-    for position in selected:
-        results.append(
+    results: list[dict[str, Any]]
+    if contained:
+        results = _run_contained_validations(
+            ctx,
+            workspace=workspace,
+            commands=commands,
+            selected=selected,
+            candidate_digest=candidate_digest,
+            run_dir=run_dir,
+            force=bool(force),
+            timeout_seconds=timeout_seconds,
+        )
+    else:
+        results = [
             _run_one_validation(
                 ctx,
                 workspace=workspace,
@@ -7715,7 +7777,8 @@ def validation_run(
                 force=bool(force),
                 timeout_seconds=timeout_seconds,
             )
-        )
+            for position in selected
+        ]
     result: dict[str, Any] = {
         "ok": True,
         "tool": "validation_run",
@@ -7751,20 +7814,9 @@ def _run_one_validation(
     command_sha256 = hashlib.sha256(command.encode("utf-8")).hexdigest()
     memo_key = (str(ctx.request_id), command_sha256, candidate_digest)
     if not force:
-        with _VALIDATION_MEMO_LOCK:
-            cached = _VALIDATION_MEMO.get(memo_key)
+        cached = _cached_validation_receipt(ctx, memo_key, index)
         if cached is not None:
-            _append_audit(
-                ctx,
-                tool="validation_command",
-                ok=cached.get("returncode") == 0,
-                cache_hit=True,
-                hit_count=1,
-                bytes_returned=0,
-                authority_source="worker_advisory",
-                authority_state="validation_memo_hit",
-            )
-            return {**cached, "unchanged_since_last_run": True, "index": index}
+            return cached
 
     try:
         resolution = worker_workspace.resolve_worker_validation_argv(
@@ -7868,14 +7920,196 @@ def _run_one_validation(
         "unchanged_since_last_run": False,
         **digest,
     }
-    with _VALIDATION_MEMO_LOCK:
-        _VALIDATION_MEMO[memo_key] = dict(receipt)
-        while len(_VALIDATION_MEMO) > MAX_VALIDATION_MEMO_ENTRIES:
-            _VALIDATION_MEMO.pop(next(iter(_VALIDATION_MEMO)))
+    _remember_validation_receipt(memo_key, receipt)
     # Recorded with a purely advisory authority so it can never be counted as a
     # satisfying canonical call: ``verify_audit_ledger`` only counts an entry
     # whose authority_source is "canonical" (or one of the two named
     # semantic-edit/review-packet authorities), so acceptance never reads this.
+    _append_audit(
+        ctx,
+        tool="validation_command",
+        ok=returncode == 0,
+        cache_hit=False,
+        hit_count=1,
+        bytes_returned=len(raw),
+        authority_source="worker_advisory",
+        authority_state="validation_executed",
+    )
+    return receipt
+
+
+def _contained_validation_refusal(ctx: WorkerToolContext, why: str) -> dict[str, Any]:
+    """The refusal a server bridged to a contained worker returns, naming why."""
+
+    return {
+        "ok": False,
+        "tool": "validation_run",
+        "reason": "validation_run_unavailable_outside_the_worker_sandbox",
+        "detail": (
+            f"this server runs outside the worker's {ctx.contained_worker} sandbox "
+            f"and never executes candidate code itself; {why}; the coordinator "
+            "runs the card's validation inside the sandbox after you exit"
+        ),
+        "advisory_only": True,
+    }
+
+
+def _contained_validation_blocker(ctx: WorkerToolContext, workspace: Any) -> str:
+    """Why the contained validation lane cannot run a command now, or ``""``.
+
+    ``run_validations``' AppContainer lane grants its HOME to the validation
+    container, and that grant reaches each protected directory beneath HOME
+    -- it withholds none -- so a HOME at or above this server's private
+    runtime directory would hand the audit key and ledger to candidate code.
+    """
+
+    home = Path(workspace.home).resolve()
+    for secret in (ctx.audit_hmac_key_path, ctx.audit_ledger_path):
+        private = None if secret is None else secret.resolve().parent
+        if private is not None and (private == home or home in private.parents):
+            return (
+                f"the validation HOME {home} would grant candidate code this "
+                f"server's private runtime directory {private}"
+            )
+    return ""
+
+
+def _run_contained_validations(
+    ctx: WorkerToolContext,
+    *,
+    workspace: Any,
+    commands: Sequence[str],
+    selected: Sequence[int],
+    candidate_digest: str,
+    run_dir: Path,
+    force: bool,
+    timeout_seconds: int,
+) -> list[dict[str, Any]]:
+    """Run the selected commands in an AppContainer, never on the host.
+
+    Every command the memo cannot answer goes to ONE
+    ``worker_workspace.run_validations`` call on the backend the coordinator's
+    post-exit validation uses, so no candidate command ever runs in this
+    process's security context.  A failing batch still carries its rows
+    (``ValidationRunError``); any other ``WorkspaceError`` or ``OSError``
+    becomes a ``tool_unavailable`` row per command, never a traceback.
+    """
+
+    from . import worker_workspace
+
+    receipts: dict[int, dict[str, Any]] = {}
+    pending: list[tuple[int, str, tuple[str, str, str]]] = []
+    for position in selected:
+        command_sha256 = hashlib.sha256(commands[position].encode("utf-8")).hexdigest()
+        memo_key = (str(ctx.request_id), command_sha256, candidate_digest)
+        cached = None if force else _cached_validation_receipt(ctx, memo_key, position)
+        if cached is None:
+            pending.append((position, command_sha256, memo_key))
+        else:
+            receipts[position] = cached
+    rows: list[dict[str, Any]] = []
+    failure = "run_validations_returned_no_row"
+    if pending:
+        # The "_validation" suffix gives this run its OWN AppContainer SID (the
+        # SID derives from the adapter id's worker kind and the repo id).  The
+        # lane grants request_root and HOME to whichever SID it launches and on
+        # exit revokes every explicit ACE of that SID; under the worker's own
+        # SID that cleanup would strip the live worker's worktree and HOME grants.
+        try:
+            rows = worker_workspace.run_validations(
+                workspace,
+                [commands[position] for position, _sha, _key in pending],
+                timeout_seconds=max(1, int(timeout_seconds)),
+                backend=worker_workspace.WINDOWS_APPCONTAINER_BACKEND,
+                adapter_id=f"{ctx.contained_worker_adapter}_validation",
+            )
+        except worker_workspace.ValidationRunError as exc:
+            rows = exc.results
+        except (worker_workspace.WorkspaceError, OSError) as exc:
+            failure = str(exc) or type(exc).__name__
+    for offset, (position, command_sha256, memo_key) in enumerate(pending):
+        receipts[position] = _contained_validation_receipt(
+            ctx,
+            index=position,
+            command=commands[position],
+            command_sha256=command_sha256,
+            memo_key=memo_key,
+            row=rows[offset] if offset < len(rows) else None,
+            failure=failure,
+            run_dir=run_dir,
+        )
+    return [receipts[position] for position in selected]
+
+
+def _contained_validation_receipt(
+    ctx: WorkerToolContext,
+    *,
+    index: int,
+    command: str,
+    command_sha256: str,
+    memo_key: tuple[str, str, str],
+    row: Mapping[str, Any] | None,
+    failure: str,
+    run_dir: Path,
+) -> dict[str, Any]:
+    """Reduce one ``run_validations`` row to ``_run_one_validation``'s receipt.
+
+    That lane keeps only a bounded head and tail of each stream, so the digest
+    -- and the log ``validation_output_page`` serves -- are its stream tails.
+    """
+
+    timed_out = bool(row is not None and row.get("timed_out"))
+    if row is None or (row.get("returncode") is None and not timed_out):
+        reason = str((row or {}).get("launch_error_message") or failure)
+        _append_audit(
+            ctx,
+            tool="validation_command",
+            ok=False,
+            cache_hit=False,
+            hit_count=0,
+            bytes_returned=0,
+            violation=reason[:160],
+            authority_source="worker_advisory",
+            authority_state="validation_unresolved" if row is None else "validation_spawn_failed",
+        )
+        return {
+            "index": index,
+            "command": command,
+            "command_sha256": command_sha256,
+            "resolved": row is not None,
+            "returncode": None,
+            "failure_class": "tool_unavailable",
+            "reason": reason[:300],
+            "unchanged_since_last_run": False,
+        }
+    stdout = str(row.get("stdout_tail") or "")
+    stderr = str(row.get("stderr_tail") or "")
+    text = stdout + ("\n" if stdout and stderr and not stdout.endswith("\n") else "") + stderr
+    raw = text.encode("utf-8")
+    output_path = run_dir / f"validation_{index}_{command_sha256[:16]}.log"
+    try:
+        output_path.write_bytes(raw)
+    except OSError:
+        pass
+    returncode = 124 if timed_out else int(row["returncode"])
+    receipt = {
+        "index": index,
+        "command": command,
+        "command_sha256": command_sha256,
+        "resolved": True,
+        "argv": [str(token) for token in row.get("executed_argv") or row.get("argv") or ()],
+        "returncode": returncode,
+        "duration_seconds": row.get("duration_seconds"),
+        "timed_out": timed_out,
+        "sandbox_backend": row.get("sandbox_backend"),
+        "full_output_path": str(output_path),
+        "full_output_sha256": hashlib.sha256(raw).hexdigest(),
+        "unchanged_since_last_run": False,
+        **_validation_digest(
+            text=text, returncode=returncode, timed_out=timed_out, total_bytes=len(raw)
+        ),
+    }
+    _remember_validation_receipt(memo_key, receipt)
     _append_audit(
         ctx,
         tool="validation_command",
@@ -8498,6 +8732,10 @@ def generate_worker_mcp_runtime(
 
 
 APPCONTAINER_BRIDGE_CONFIG_NAME = "worker_mcp_bridge.json"
+# The one adapter process_launcher_launch_isolated bridges (the server is the
+# one the generated Claude config names).  Bound into the bridged server's env
+# so validation_run can name the worker's own container (NF-2026-01120).
+APPCONTAINER_BRIDGE_ADAPTER_ID = "claude_cli"
 # Every binding that names a file the server reads or writes for authority.
 APPCONTAINER_BRIDGE_AUTHORITY_FILES: tuple[str, ...] = (
     ENV_AUDIT_LEDGER_PATH,
@@ -8536,7 +8774,11 @@ def appcontainer_mcp_bridge(
     runtime_dir = runtime.audit_ledger_path.parent.resolve()
     real = json.loads(runtime.claude_mcp_config_path.read_text(encoding="utf-8"))
     server = real["mcpServers"][SERVER_NAME]
-    env = {**server["env"], ENV_CONTAINED_WORKER: "windows_appcontainer"}
+    env = {
+        **server["env"],
+        ENV_CONTAINED_WORKER: "windows_appcontainer",
+        ENV_CONTAINED_WORKER_ADAPTER: APPCONTAINER_BRIDGE_ADAPTER_ID,
+    }
     sealed = env.get(ENV_CONTRACT_PACKET_PATH)
     if sealed:
         private_copy = runtime_dir / Path(sealed).name

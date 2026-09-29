@@ -108,31 +108,258 @@ def _ctx(tmp_path: Path, packet_path: Path, worktree: Path) -> w.WorkerToolConte
 
 
 # ---------------------------------------------------------------------------
-# NF-2026-00034: a server bridged to a contained worker never executes for it.
+# NF-2026-00034 / NF-2026-01120: a server bridged to a contained worker never
+# executes candidate code on the host.  A Windows AppContainer worker's commands
+# go to run_validations -- the coordinator's own post-exit lane -- inside that
+# worker's own container, or are refused.
 # ---------------------------------------------------------------------------
 
 
-def test_a_server_outside_the_worker_sandbox_runs_no_validation(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def _contained_ctx(
+    tmp_path: Path,
+    packet_path: Path,
+    worktree: Path,
+    *,
+    backend: str = "windows_appcontainer",
+    adapter: str = "claude_cli",
+) -> w.WorkerToolContext:
     import dataclasses
 
-    _mute_chmod(monkeypatch)
-    worktree = _worktree(tmp_path)
+    return dataclasses.replace(
+        _ctx(tmp_path, packet_path, worktree),
+        contained_worker=backend,
+        contained_worker_adapter=adapter,
+    )
+
+
+def _host_marker_command(tmp_path: Path, worktree: Path) -> Path:
+    """The card's command: ANY host subprocess running it leaves this marker."""
     marker = tmp_path / "ran"
     (worktree / "touch.py").write_text(
         f"open({str(marker)!r}, 'w').close()\n", encoding="utf-8"
     )
+    return marker
+
+
+def _never(*args: object, **kwargs: object) -> None:
+    raise AssertionError("nothing may run for this contained worker")
+
+
+def _container_row(command: str, *, returncode: int, stdout: str) -> dict[str, object]:
+    """One row in the shape worker_workspace.run_validations returns."""
+    return {
+        "command": command,
+        "executed_argv": ["python.exe", "-P", "touch.py"],
+        "returncode": returncode,
+        "duration_seconds": 0.25,
+        "sandbox_backend": "windows_appcontainer",
+        "stdout_head": stdout[:4096],
+        "stdout_tail": stdout[-4096:],
+        "stdout_truncated": False,
+        "stderr_head": "",
+        "stderr_tail": "",
+        "stderr_truncated": False,
+    }
+
+
+def test_a_contained_appcontainer_worker_validates_inside_its_own_container(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _mute_chmod(monkeypatch)
+    worktree = _worktree(tmp_path)
+    marker = _host_marker_command(tmp_path, worktree)
     packet = _packet(tmp_path, validation=["python3 touch.py"])
-    ctx = dataclasses.replace(
-        _ctx(tmp_path, packet, worktree), contained_worker="windows_appcontainer"
-    )
+    ctx = _contained_ctx(tmp_path, packet, worktree)
+    calls: list[tuple[object, list[str], dict[str, object]]] = []
+
+    def _run_validations(workspace, commands, **route):
+        calls.append((workspace, list(commands), route))
+        return [_container_row(commands[0], returncode=0, stdout="1 passed in 0.10s\n")]
+
+    monkeypatch.setattr(worker_workspace, "run_validations", _run_validations)
+    # The host lane -- a subprocess of THIS process -- is never taken.
+    monkeypatch.setattr(w, "_run_one_validation", _never)
+
+    result = w.validation_run(ctx, index="all")
+
+    [(workspace, commands, route)] = calls
+    assert commands == ["python3 touch.py"]
+    assert route["backend"] == worker_workspace.WINDOWS_APPCONTAINER_BACKEND
+    # A distinct identity, so the lane's ACE cleanup never hits the live worker.
+    assert str(route["adapter_id"]).endswith("_validation")
+    assert route["adapter_id"] != ctx.contained_worker_adapter
+    assert Path(workspace.path) == worktree
+    assert not marker.exists()
+    assert result["ok"] is True
+    assert result["schema_id"] == "aiworkhub.worker_validation_run.v1"
+    assert result["advisory_only"] is True
+    assert result["acceptance_evidence"] == "coordinator_post_exit_run_validations"
+    assert result["all_passed"] is True
+    assert len(result["candidate_bytes_sha256"]) == 64
+    row = result["results"][0]
+    assert row["index"] == 0
+    assert row["command"] == "python3 touch.py"
+    assert row["command_sha256"] == hashlib.sha256(b"python3 touch.py").hexdigest()
+    assert row["returncode"] == 0
+    assert row["failure_class"] == "passed"
+    assert row["diagnostic_tail"] == "1 passed in 0.10s\n"
+    assert row["sandbox_backend"] == "windows_appcontainer"
+    assert row["unchanged_since_last_run"] is False
+
+    # The memo still answers a repeat on unchanged candidate bytes.
+    again = w.validation_run(ctx, index="all")
+    assert again["results"][0]["unchanged_since_last_run"] is True
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("backend", "adapter", "why"),
+    [
+        ("bubblewrap", "claude_cli", "no in-sandbox validation lane exists"),
+        ("windows_appcontainer", "", "no adapter id is bound"),
+    ],
+    ids=["other_backend", "no_adapter"],
+)
+def test_a_contained_worker_without_its_container_lane_runs_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, backend: str, adapter: str, why: str
+) -> None:
+    _mute_chmod(monkeypatch)
+    worktree = _worktree(tmp_path)
+    marker = _host_marker_command(tmp_path, worktree)
+    packet = _packet(tmp_path, validation=["python3 touch.py"])
+    ctx = _contained_ctx(tmp_path, packet, worktree, backend=backend, adapter=adapter)
+    monkeypatch.setattr(worker_workspace, "run_validations", _never)
+    monkeypatch.setattr(w, "_run_one_validation", _never)
 
     result = w.validation_run(ctx, index="all")
 
     assert result["ok"] is False
     assert result["reason"] == "validation_run_unavailable_outside_the_worker_sandbox"
+    assert why in result["detail"]
+    assert result["advisory_only"] is True
     assert not marker.exists()
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        worker_workspace.WorkspaceError("validation_exec_scratch_unavailable:denied"),
+        OSError("windows_appcontainer_validation_launch_failed:create_process"),
+    ],
+    ids=["workspace_error", "os_error"],
+)
+def test_run_validations_raising_becomes_a_tool_unavailable_row(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, error: Exception
+) -> None:
+    _mute_chmod(monkeypatch)
+    worktree = _worktree(tmp_path)
+    _host_marker_command(tmp_path, worktree)
+    packet = _packet(tmp_path, validation=["python3 touch.py"])
+    ctx = _contained_ctx(tmp_path, packet, worktree)
+
+    def _raise(workspace, commands, **route):
+        raise error
+
+    monkeypatch.setattr(worker_workspace, "run_validations", _raise)
+
+    result = w.validation_run(ctx, index=0)
+
+    assert result["ok"] is True
+    assert result["all_passed"] is False
+    row = result["results"][0]
+    assert row["failure_class"] == "tool_unavailable"
+    assert row["returncode"] is None
+    assert str(error) in row["reason"]
+
+
+def test_a_red_contained_command_keeps_its_own_row(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """run_validations RAISES on a red batch; the rows it carries are the result."""
+    _mute_chmod(monkeypatch)
+    worktree = _worktree(tmp_path)
+    _host_marker_command(tmp_path, worktree)
+    packet = _packet(tmp_path, validation=["python3 touch.py"])
+    ctx = _contained_ctx(tmp_path, packet, worktree)
+    summary = "FAILED tests/test_x.py::test_a - AssertionError"
+
+    def _red(workspace, commands, **route):
+        stdout = f"tests/test_x.py:41: AssertionError\n{summary}\n"
+        raise worker_workspace.ValidationRunError(
+            "validation_failed:python3 touch.py:rc=1",
+            [_container_row(commands[0], returncode=1, stdout=stdout)],
+        )
+
+    monkeypatch.setattr(worker_workspace, "run_validations", _red)
+
+    result = w.validation_run(ctx, index=0)
+
+    row = result["results"][0]
+    assert result["all_passed"] is False
+    assert row["returncode"] == 1
+    assert row["failure_class"] == "test_failed"
+    assert row["short_summary_lines"] == [summary]
+    assert "tests/test_x.py:41" in row["path_refs"]
+
+
+def test_a_live_worker_holding_its_grants_still_validates(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The live worker's container always holds the worktree while it runs.  The
+    lane launches under a separate ``_validation`` SID and revokes only that
+    SID's ACEs, so a held worktree is no reason to refuse."""
+    from aiworkhub import windows_appcontainer
+
+    _mute_chmod(monkeypatch)
+    worktree = _worktree(tmp_path)
+    marker = _host_marker_command(tmp_path, worktree)
+    packet = _packet(tmp_path, validation=["python3 touch.py"])
+    ctx = _contained_ctx(tmp_path, packet, worktree)
+    monkeypatch.setattr(
+        windows_appcontainer, "appcontainer_writers", lambda path: ["S-1-15-2-1-2-3"]
+    )
+    adapters: list[object] = []
+
+    def _run_validations(workspace, commands, **route):
+        adapters.append(route["adapter_id"])
+        return [_container_row(commands[0], returncode=0, stdout="1 passed\n")]
+
+    monkeypatch.setattr(worker_workspace, "run_validations", _run_validations)
+    monkeypatch.setattr(w, "_run_one_validation", _never)
+
+    result = w.validation_run(ctx, index="all")
+
+    assert result["ok"] is True
+    assert result["all_passed"] is True
+    assert adapters == ["claude_cli_validation"]
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("private", ["home", "home/task_mcp_worker_runtime"])
+def test_the_private_runtime_directory_is_never_the_validation_home(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, private: str
+) -> None:
+    """The bridge binds the contract packet into the directory holding the audit
+    key, so that is the HOME the packet resolves to; its HOME grant would hand
+    candidate code that key."""
+    import dataclasses
+
+    _mute_chmod(monkeypatch)
+    worktree = _worktree(tmp_path)
+    packet = _packet(tmp_path, validation=["python3 touch.py"])
+    runtime = tmp_path / private
+    ctx = dataclasses.replace(
+        _contained_ctx(tmp_path, packet, worktree),
+        audit_ledger_path=runtime / "audit_ledger.jsonl",
+        audit_hmac_key_path=runtime / "audit_hmac.key",
+    )
+    monkeypatch.setattr(worker_workspace, "run_validations", _never)
+
+    result = w.validation_run(ctx, index="all")
+
+    assert result["ok"] is False
+    assert result["reason"] == "validation_run_unavailable_outside_the_worker_sandbox"
+    assert "private runtime directory" in result["detail"]
 
 
 def test_the_contained_marker_is_bound_from_the_environment(tmp_path: Path) -> None:
@@ -140,9 +367,14 @@ def test_the_contained_marker_is_bound_from_the_environment(tmp_path: Path) -> N
         w.ENV_TASK_ID: "T", w.ENV_RUNNER: "r", w.ENV_TOPIC: "t",
         w.ENV_REPO: str(tmp_path), w.ENV_AUTHORITY_REPO: str(tmp_path),
     }
-    assert w.load_context_from_env(env).contained_worker == ""
+    unbound = w.load_context_from_env(env)
+    assert (unbound.contained_worker, unbound.contained_worker_adapter) == ("", "")
     env[w.ENV_CONTAINED_WORKER] = "windows_appcontainer"
-    assert w.load_context_from_env(env).contained_worker == "windows_appcontainer"
+    env[w.ENV_CONTAINED_WORKER_ADAPTER] = "claude_cli"
+    bound = w.load_context_from_env(env)
+    assert (bound.contained_worker, bound.contained_worker_adapter) == (
+        "windows_appcontainer", "claude_cli",
+    )
 
 
 def _generated_runtime(tmp_path: Path, **extra):
@@ -178,9 +410,12 @@ def test_appcontainer_bridge_moves_the_real_server_to_the_host(tmp_path: Path) -
     private_contract = Path(bridge["env"][w.ENV_CONTRACT_PACKET_PATH])
     assert private_contract.parent == runtime_dir
     assert private_contract.read_bytes() == contract.read_bytes()
+    # ... also naming the one adapter the launcher bridges, whose own container
+    # validation_run hands commands to (NF-2026-01120) ...
     assert bridge["env"] == {
         **server["env"],
         w.ENV_CONTAINED_WORKER: "windows_appcontainer",
+        w.ENV_CONTAINED_WORKER_ADAPTER: "claude_cli",
         w.ENV_CONTRACT_PACKET_PATH: str(private_contract),
     }
     for key in w.APPCONTAINER_BRIDGE_AUTHORITY_FILES:
@@ -259,9 +494,16 @@ def test_the_runtime_directory_the_bridge_withholds_is_really_protected(
     from aiworkhub import windows_appcontainer
 
     _home, _contract, runtime = _generated_runtime(tmp_path)
-    assert windows_appcontainer._load_win32().dacl_protected(
-        str(runtime.audit_ledger_path.parent)
-    )
+    runtime_dir = str(runtime.audit_ledger_path.parent)
+    protected = windows_appcontainer._load_win32().dacl_protected(runtime_dir)
+    # Inside the AppContainer validation lane mkdir(mode=0o700) under its
+    # scratch basetemp does not yield a protected DACL; the host run decides.
+    if not protected and windows_appcontainer.current_process_is_appcontainer():
+        pytest.skip(
+            "validation_unsupported_in_sandbox:"
+            f"runtime_dir_dacl_not_protected_in_appcontainer:{runtime_dir}"
+        )
+    assert protected
 
 
 # ---------------------------------------------------------------------------
