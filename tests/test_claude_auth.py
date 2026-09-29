@@ -72,6 +72,80 @@ def test_timeout_is_classified_without_stderr_or_credentials(monkeypatch) -> Non
     assert "secret" not in json.dumps(status)
 
 
+def test_transient_probe_timeout_is_retried_once_with_longer_bound(
+    tmp_path, monkeypatch
+) -> None:
+    state_path = tmp_path / "runtime" / "claude-auth.json"
+    monkeypatch.setenv("AIWORKHUB_CLAUDE_AUTH_STATE_FILE", str(state_path))
+    claude_auth.invalidate()
+    timeouts: list[float] = []
+
+    def slow_then_ready(argv, **kwargs):
+        timeouts.append(kwargs["timeout"])
+        if len(timeouts) == 1:
+            raise subprocess.TimeoutExpired(cmd=argv, timeout=kwargs["timeout"])
+        return SimpleNamespace(
+            returncode=0,
+            stdout=b'{"loggedIn":true,"authMethod":"claude.ai"}',
+            stderr=b"",
+        )
+
+    monkeypatch.setattr(subprocess, "run", slow_then_ready)
+    status = claude_auth.auth_status(sys.executable, force=True)
+
+    assert status["launchable"] is True
+    assert status["status"] == "ready"
+    assert timeouts == [
+        claude_auth.STATUS_TIMEOUT_SECONDS,
+        claude_auth.STATUS_RETRY_TIMEOUT_SECONDS,
+    ]
+    assert claude_auth.STATUS_TIMEOUT_SECONDS == 5.0
+    assert (
+        claude_auth.STATUS_RETRY_TIMEOUT_SECONDS
+        > claude_auth.STATUS_TIMEOUT_SECONDS
+    )
+    assert not state_path.exists()
+
+
+def test_repeated_probe_timeout_is_measured_and_never_persisted(
+    tmp_path, monkeypatch
+) -> None:
+    state_path = tmp_path / "runtime" / "claude-auth.json"
+    monkeypatch.setenv("AIWORKHUB_CLAUDE_AUTH_STATE_FILE", str(state_path))
+    claude_auth.invalidate()
+    timeouts: list[float] = []
+
+    def always_slow(argv, **kwargs):
+        timeouts.append(kwargs["timeout"])
+        raise subprocess.TimeoutExpired(cmd=argv, timeout=kwargs["timeout"])
+
+    monkeypatch.setattr(subprocess, "run", always_slow)
+    status = claude_auth.auth_status(sys.executable)
+
+    assert status["launchable"] is False
+    assert status["status"] == "auth_status_unavailable"
+    assert status["blocker_reason"] == "claude_auth_status_failed:TimeoutExpired"
+    resolved = claude_auth.Path(sys.executable).resolve(strict=True)
+    assert status["executable_path"] == str(resolved)
+    attempts = status["probe_attempts"]
+    assert [item["timeout_seconds"] for item in attempts] == [
+        claude_auth.STATUS_TIMEOUT_SECONDS,
+        claude_auth.STATUS_RETRY_TIMEOUT_SECONDS,
+    ]
+    assert all(item["outcome"] == "TimeoutExpired" for item in attempts)
+    assert all(
+        isinstance(item["elapsed_seconds"], float) and item["elapsed_seconds"] >= 0
+        for item in attempts
+    )
+    assert len(timeouts) == 2
+    assert not state_path.exists()
+
+    # A timeout is not cached as an auth verdict: the next launch re-probes.
+    claude_auth.auth_status(sys.executable)
+    assert len(timeouts) == 4
+    assert not state_path.exists()
+
+
 def test_editor_launcher_never_receives_claude_auth_arguments(
     tmp_path, monkeypatch
 ) -> None:

@@ -22,6 +22,7 @@ from typing import Any
 CACHE_TTL_SECONDS = 300.0
 RUNTIME_AUTH_FAILURE_TTL_SECONDS = 300.0
 STATUS_TIMEOUT_SECONDS = 5.0
+STATUS_RETRY_TIMEOUT_SECONDS = 3 * STATUS_TIMEOUT_SECONDS
 MAX_STATUS_BYTES = 16 * 1024
 MAX_FAILURE_STATE_BYTES = 4 * 1024
 MAX_SESSION_ID_HASH_BYTES = 64
@@ -197,27 +198,57 @@ def _is_editor_launcher(path: str) -> bool:
     return name in _EDITOR_LAUNCHER_NAMES
 
 
-def _probe_auth_status(path: str) -> dict[str, Any]:
-    """Run Claude's bounded local status probe without changing failure circuits."""
+def _status_probe_unavailable(
+    path: str, failure: str, attempts: list[dict[str, Any]]
+) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "authenticated": False,
+        "launchable": False,
+        "status": "auth_status_unavailable",
+        "blocker_reason": f"claude_auth_status_failed:{failure}",
+        "cache_hit": False,
+        "executable_path": path,
+        "probe_attempts": attempts,
+    }
 
-    try:
-        completed = subprocess.run(
-            [path, "auth", "status", "--json"],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-            timeout=STATUS_TIMEOUT_SECONDS,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return {
-            "ok": False,
-            "authenticated": False,
-            "launchable": False,
-            "status": "auth_status_unavailable",
-            "blocker_reason": f"claude_auth_status_failed:{type(exc).__name__}",
-            "cache_hit": False,
-        }
+
+def _probe_auth_status(path: str) -> dict[str, Any]:
+    """Run Claude's bounded local status probe without changing failure circuits.
+
+    A cold start of the CLI shim under load can exceed the first bound, so a
+    timeout is retried once with ``STATUS_RETRY_TIMEOUT_SECONDS``. Each attempt's
+    timeout and elapsed wall time are reported so a remaining failure is
+    measurable rather than mistaken for an authentication failure.
+    """
+
+    attempts: list[dict[str, Any]] = []
+    for timeout in (STATUS_TIMEOUT_SECONDS, STATUS_RETRY_TIMEOUT_SECONDS):
+        started = time.monotonic()
+        try:
+            completed = subprocess.run(
+                [path, "auth", "status", "--json"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=timeout,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            failure = type(exc).__name__
+            attempts.append(
+                {
+                    "timeout_seconds": timeout,
+                    "elapsed_seconds": round(time.monotonic() - started, 3),
+                    "outcome": failure,
+                }
+            )
+            if isinstance(exc, subprocess.TimeoutExpired):
+                continue
+            return _status_probe_unavailable(path, failure, attempts)
+        break
+    else:
+        return _status_probe_unavailable(path, "TimeoutExpired", attempts)
     stdout = bytes(completed.stdout or b"")[:MAX_STATUS_BYTES]
     try:
         payload = json.loads(stdout.decode("utf-8"))
@@ -314,7 +345,12 @@ def auth_status(executable: str | None = None, *, force: bool = False) -> dict[s
         if result.get("launchable") is True:
             _runtime_failures.pop(path, None)
             _clear_persisted_runtime_failure(path)
-        _cache[path] = (now, dict(result))
+        if result.get("status") == "auth_status_unavailable":
+            # A probe that could not run or timed out says nothing about the
+            # login; never let it park later launches behind a cached failure.
+            _cache.pop(path, None)
+        else:
+            _cache[path] = (now, dict(result))
     return result
 
 
