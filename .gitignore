@@ -34,6 +34,7 @@ node_modules/
 !.aiworkhub/config/features.json
 !.aiworkhub/config/models.json
 !.aiworkhub/config/policy.json
+!.aiworkhub/config/sdlc_bands.json
 !.aiworkhub/config/source_graph.json
 !.aiworkhub/config/workforce.json
 !.aiworkhub/kb/

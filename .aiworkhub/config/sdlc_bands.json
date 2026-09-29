@@ -1,0 +1,25 @@
+{
+  "metrics": [
+    {
+      "id": "first_pass_acceptance",
+      "direction": "lower_is_bad",
+      "window_cards": 20,
+      "baseline_cards": 100,
+      "min_baseline": 30
+    },
+    {
+      "id": "review_rounds_per_accepted_task",
+      "direction": "upper_is_bad",
+      "window_cards": 20,
+      "baseline_cards": 100,
+      "min_baseline": 30
+    },
+    {
+      "id": "validation_failed_rate",
+      "direction": "upper_is_bad",
+      "window_cards": 20,
+      "baseline_cards": 100,
+      "min_baseline": 30
+    }
+  ]
+}
