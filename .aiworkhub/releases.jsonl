@@ -1,0 +1,2 @@
+{"kind": "built", "version": "0.12.5", "release_commit": "00d21f9448aabc4e0f06242041baaffdc3b264f8", "vsix_sha256": "613aede7ef26361798dd544253254a6184b701973c44a429bb02b4c9270fc94a", "built_at": "2026-09-29T14:45:27Z", "previous_vsix": {"path": "vscode-extension/dist/aiworkhub-0.12.4.vsix", "sha256": "5998cb3b70ba3f3250e1a3705c6d682455dd9f39ea6478d4c9a4ff0a39f66b63"}, "target": "vscode_local"}
+{"kind": "installed", "version": "0.12.5", "installed_at": "2026-09-29T15:32:18Z", "server_version": "0.12.5"}
