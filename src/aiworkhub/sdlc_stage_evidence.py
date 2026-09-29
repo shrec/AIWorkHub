@@ -27,9 +27,11 @@ build     the current claim sealed a ``review_ready`` candidate -- request
 test      the sealed validation evidence re-derives, through
           ``task_fsm.deterministic_verification``, to the stored passing
           verdict; the coordinator's accepted-outcome receipt for that same
-          candidate passes ``task_engine``'s canonical validator, which
-          re-hashes the promoted paths so a later edit makes the candidate
-          stale; and its ``accept_review`` event exists.
+          candidate passes ``task_engine``'s canonical validator -- or, when
+          that refuses only because the live promoted bytes changed since,
+          ``sdlc_attribution.historical_accepted_outcome_authority`` finds a
+          canonical descendant of ``base_oid`` that held them; and its
+          ``accept_review`` event exists.
 deploy    Test re-proven, then ``sdlc_deploy_proof``: the target is in the
           policy's ``deploy.targets`` and a confirmed release was built from a
           commit holding every promoted path's accepted bytes (or a later
@@ -960,12 +962,19 @@ def _verify_acceptance(
     # authority; accept_review, external_qualification and the trajectory
     # export all bind to it by this name rather than restating its rules.
     # Imported lazily because task_engine pulls in the whole core module.
-    from . import task_engine
+    from . import sdlc_attribution, task_engine
 
+    args = (reader.root, card, snapshot.task_id, identity["request_id"], receipt)
     try:
-        validated, error = task_engine._validate_accepted_outcome_receipt(
-            reader.root, card, snapshot.task_id, identity["request_id"], receipt
-        )
+        validated, error = task_engine._validate_accepted_outcome_receipt(*args)
+        # The canonical validator re-hashes the live tree, so a later accepted
+        # commit touching a promoted file makes it answer "hash mismatch" for a
+        # candidate that really was accepted (NF-2026-01132). A stage proof is a
+        # historical question: only for that one refusal, ask whether a
+        # canonical descendant of base_oid ever held exactly those bytes. Every
+        # other refusal, and an unreadable history, stays a refusal.
+        if validated is None and error == "accepted_outcome_receipt_canonical_hash_mismatch":
+            validated, error = sdlc_attribution.historical_accepted_outcome_authority(*args)
     except (OSError, TypeError, ValueError):
         return "acceptance_receipt_unverifiable"
     if validated is None:

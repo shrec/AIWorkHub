@@ -1045,6 +1045,13 @@ def test_the_script_uses_the_shared_holding_commit_helper() -> None:
         assert not hasattr(builder, gone), f"{gone} is still defined in the script"
 
 
+def test_the_script_reexports_the_shared_historical_authority() -> None:
+    """NF-2026-01132: the SDLC test stage and provenance ask one historical question."""
+    assert builder.historical_accepted_outcome_authority is (
+        sdlc_attribution.historical_accepted_outcome_authority
+    )
+
+
 def test_the_moved_helper_module_never_imports_from_scripts() -> None:
     source = Path(sdlc_attribution.__file__).read_text(encoding="utf-8")
     imported: list[str] = []

@@ -310,101 +310,13 @@ def _update_registry(repo_root: Path) -> None:
     )
 
 
-# The git plumbing under this check -- "the first canonical descendant of
-# base_oid holding every promoted-path hash", and the oid/path guards and the
-# argument-list runner beneath it -- now lives in ``aiworkhub.sdlc_attribution``.
-# Escaped-defect attribution asks the same question of the same history, and two
-# copies of that answer would eventually be two different answers.
-
-
-def historical_accepted_outcome_authority(
-    repo: Path,
-    card: dict[str, Any],
-    task_id: str,
-    request_id: str,
-    receipt: dict[str, Any] | None,
-) -> tuple[dict[str, Any] | None, str]:
-    """Read-only historical authority: sealed identity plus git ancestry hashes."""
-    if not isinstance(receipt, dict):
-        return None, "accepted_outcome_receipt_missing"
-    required = {
-        "schema_id", "receipt_id", "task_id", "request_id", "claim_epoch",
-        "base_oid", "promoted_paths", "changed_path_hashes",
-        "attempt_artifact_manifest_id", "repository_revision",
-    }
-    if (
-        set(receipt) != required
-        or receipt.get("schema_id") != task_engine.ACCEPTED_OUTCOME_RECEIPT_SCHEMA
-    ):
-        return None, "accepted_outcome_receipt_malformed"
-    digest_fields = (
-        receipt.get("receipt_id"),
-        receipt.get("attempt_artifact_manifest_id"),
-        receipt.get("repository_revision"),
-    )
-    promoted_paths = receipt.get("promoted_paths")
-    if (
-        not isinstance(receipt.get("task_id"), str)
-        or not isinstance(receipt.get("request_id"), str)
-        or not isinstance(receipt.get("claim_epoch"), int)
-        or isinstance(receipt.get("claim_epoch"), bool)
-        or not isinstance(receipt.get("base_oid"), str)
-        or not receipt.get("base_oid")
-        or not isinstance(promoted_paths, list)
-        or any(not isinstance(path, str) for path in promoted_paths)
-        or promoted_paths != sorted(set(promoted_paths))
-        or not isinstance(receipt.get("changed_path_hashes"), dict)
-        or any(
-            not isinstance(raw_digest, str)
-            or len(raw_digest.removeprefix("sha256:")) != 64
-            or any(
-                char not in "0123456789abcdef"
-                for char in raw_digest.removeprefix("sha256:")
-            )
-            for raw_digest in digest_fields
-        )
-    ):
-        return None, "accepted_outcome_receipt_malformed"
-    terminal = card.get("terminal_review") or {}
-    sealed = terminal.get("evidence") or {}
-    paths = sorted(str(path) for path in (sealed.get("changed_paths") or []))
-    hashes = sealed.get("changed_path_hashes")
-    manifest = sealed.get("attempt_artifact_manifest")
-    workspace = sealed.get("workspace") or {}
-    expected = {
-        "schema_id": task_engine.ACCEPTED_OUTCOME_RECEIPT_SCHEMA,
-        "task_id": task_id,
-        "request_id": request_id,
-        "claim_epoch": int(card.get("claim_epoch") or 0),
-        "base_oid": str(workspace.get("base_oid") or ""),
-        "promoted_paths": paths,
-        "changed_path_hashes": hashes,
-        "attempt_artifact_manifest_id": _digest(manifest),
-    }
-    if not isinstance(hashes, dict) or not isinstance(manifest, dict):
-        return None, "accepted_outcome_receipt_sealed_evidence_missing"
-    if any(receipt.get(key) != value for key, value in expected.items()):
-        return None, "accepted_outcome_receipt_identity_mismatch"
-    if any(not sdlc_attribution.safe_repo_relative_path(path) for path in paths):
-        return None, "accepted_outcome_receipt_path_traversal"
-    if paths:
-        commit, failure = sdlc_attribution.first_holding_commit(
-            repo, expected["base_oid"], paths, hashes,
-        )
-        if failure == sdlc_attribution.GIT_UNAVAILABLE:
-            return None, "accepted_outcome_receipt_historical_git_unavailable"
-        if commit is None:
-            return None, "accepted_outcome_receipt_historical_hash_mismatch"
-    revision = "sha256:" + _digest({
-        "base_oid": expected["base_oid"], "changed_path_hashes": hashes,
-    })
-    if receipt.get("repository_revision") != revision:
-        return None, "accepted_outcome_receipt_revision_mismatch"
-    unsigned = dict(receipt)
-    receipt_id = str(unsigned.pop("receipt_id", ""))
-    if receipt_id != "sha256:" + _digest(unsigned):
-        return None, "accepted_outcome_receipt_id_mismatch"
-    return dict(receipt), ""
+# The historical authority -- sealed identity plus "the first canonical
+# descendant of base_oid holding every promoted-path hash" -- now lives in
+# ``aiworkhub.sdlc_attribution`` beside the git plumbing it rests on, so the SDLC
+# test stage can ask the same historical question without importing a script.
+# It is re-exported here under its old name: the callers below bind it through
+# this module's globals, and tests monkeypatch it here.
+historical_accepted_outcome_authority = sdlc_attribution.historical_accepted_outcome_authority
 
 
 def verify_provenance(

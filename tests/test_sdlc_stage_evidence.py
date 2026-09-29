@@ -30,6 +30,7 @@ from aiworkhub import (
     process_launcher_acceptance,
     runtime_adapters,
     sdlc_control_bands,
+    sdlc_attribution,
     sdlc_deploy_proof,
     sdlc_stage_evidence,
     task_engine,
@@ -224,6 +225,7 @@ def _seal(
     gate: dict | None = None,
     host_receipt=ABSENT,
     terminal_event: bool = True,
+    base_oid: str | None = None,
 ) -> SimpleNamespace:
     """The finalizer seals one review-ready candidate the way the launcher does."""
     request_id = f"req-{task_id}"
@@ -232,7 +234,7 @@ def _seal(
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(content)
     digest = hashlib.sha256(content).hexdigest()
-    base_oid = f"base-{task_id}"
+    base_oid = base_oid or f"base-{task_id}"
     gate = _gate() if gate is None else gate
     validations = [{"command": "python3 -m pytest -q", "returncode": returncode}]
     required_outputs = [{"path": PROMOTED, "sha256": digest, "bytes": len(content)}]
@@ -889,8 +891,11 @@ def test_a_later_edit_of_a_promoted_path_makes_the_tested_candidate_stale(accept
     assert packet["state"] == "unknown"
     assert packet["recorded_state"] == "ready"
     assert packet["reason"] == "evidence_stale"
+    # The live tree no longer holds the accepted bytes, so the historical
+    # authority is asked -- and a base_oid that is no readable commit is an
+    # unavailable history, which stays a refusal (NF-2026-01132).
     assert packet["evidence_code"] == (
-        "acceptance_receipt_invalid:accepted_outcome_receipt_canonical_hash_mismatch"
+        "acceptance_receipt_invalid:accepted_outcome_receipt_historical_git_unavailable"
     )
     assert packet["next_action"] == sdlc_stage_evidence.NEXT_ACTIONS["test"]
     assert packet["receipt_sha256"]
@@ -900,6 +905,90 @@ def test_a_later_edit_of_a_promoted_path_makes_the_tested_candidate_stale(accept
     assert read_case(accepted.root, accepted.repo_id, accepted.case_id)["cycle"][
         "blocking_stage"
     ] == "test"
+
+
+def _git_commit_promoted(root: Path, content: bytes | None, message: str) -> str:
+    if content is not None:
+        (root / PROMOTED).write_bytes(content)
+    _git(root, "add", PROMOTED)
+    _git(root, "commit", "-q", "-m", message)
+    return _git(root, "rev-parse", "HEAD")
+
+
+@pytest.fixture
+def git_accepted(contracted):
+    """A canonical card accepted against a real git ``base_oid``.
+
+    The fixture repository's history is: an empty base commit, then nothing yet;
+    each test commits what the canonical history did after acceptance.
+    """
+    root = contracted.root
+    _git(root, "init", "-q")
+    for key, value in (
+        ("user.email", "fixture@example.com"), ("user.name", "Fixture"),
+        ("commit.gpgsign", "false"), ("core.autocrlf", "false"),
+    ):
+        _git(root, "config", key, value)
+    _git(root, "commit", "-q", "--allow-empty", "-m", "base")
+    base_oid = _git(root, "rev-parse", "HEAD")
+    sealed = _seal(root, TASK_ID, base_oid=base_oid)
+    receipt = _accept(root, TASK_ID, sealed)
+    return SimpleNamespace(**vars(contracted), receipt=receipt, sealed=sealed)
+
+
+def test_a_later_canonical_commit_keeps_the_accepted_test_stage_ready(git_accepted):
+    """NF-2026-01132: a post-hoc stage proof asks the historical question."""
+    ns = git_accepted
+    _git_commit_promoted(ns.root, None, "promote the accepted candidate")
+    _record_through(ns, "test")
+    # A later accepted card rewrites the same promoted file on canonical HEAD.
+    _git_commit_promoted(ns.root, b"a later accepted card's bytes\n", "later canonical edit")
+    card = task_store.get_task(ns.root, ns.task_id)
+    receipt = card["accept_evidence"]["accepted_outcome_receipt"]
+    # The live-tree validator alone refuses, which is exactly the regression.
+    assert task_engine._validate_accepted_outcome_receipt(
+        ns.root, card, ns.task_id, ns.request_id, receipt
+    ) == (None, "accepted_outcome_receipt_canonical_hash_mismatch")
+    packet = stage_packet(ns.root, ns.repo_id, ns.case_id, "test")
+    assert packet["state"] == "ready", packet
+    assert read_case(ns.root, ns.repo_id, ns.case_id)["cycle"]["blocking_stage"] != "test"
+
+
+def test_accepted_bytes_absent_from_every_canonical_commit_stay_refused(git_accepted):
+    ns = git_accepted
+    _record_through(ns, "test")
+    # History only ever holds other bytes than the accepted ones.
+    _git_commit_promoted(ns.root, b"never the accepted bytes\n", "unrelated edit")
+    packet = stage_packet(ns.root, ns.repo_id, ns.case_id, "test")
+    assert packet["state"] == "unknown"
+    assert packet["reason"] == "evidence_stale"
+    assert packet["evidence_code"] == (
+        "acceptance_receipt_invalid:accepted_outcome_receipt_historical_hash_mismatch"
+    )
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "accepted_outcome_receipt_identity_mismatch",
+        "accepted_outcome_receipt_malformed",
+        "accepted_outcome_receipt_revision_mismatch",
+        "accepted_outcome_receipt_id_mismatch",
+    ],
+)
+def test_only_a_canonical_hash_mismatch_consults_history(accepted, monkeypatch, code):
+    _record_through(accepted, "test")
+
+    def _no_history(*_args, **_kwargs):
+        raise AssertionError("historical authority consulted for a non-hash refusal")
+
+    monkeypatch.setattr(
+        task_engine, "_validate_accepted_outcome_receipt", lambda *_args: (None, code)
+    )
+    monkeypatch.setattr(sdlc_attribution, "historical_accepted_outcome_authority", _no_history)
+    packet = stage_packet(accepted.root, accepted.repo_id, accepted.case_id, "test")
+    assert packet["state"] == "unknown"
+    assert packet["evidence_code"] == f"acceptance_receipt_invalid:{code}"
 
 
 def test_a_replaced_candidate_invalidates_the_build_that_named_the_old_one(accepted):
