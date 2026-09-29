@@ -14,6 +14,12 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.12.4
+
+- Cleanup is automatic: after every task decision AIWorkHub removes the worktrees, logs, deltas and records nobody needs any more, and files a NeedFix if something cannot be removed.
+- Worker effort follows the card's declared difficulty, so simple cards stop paying for maximum reasoning.
+- Reviews are cheaper: one bounded read pass, and no duplicate reviewer for the same lens.
+
 ## What's new in 0.12.3
 
 - Reworked cards are reviewed only on what changed since the last round, so a small fix no longer pays for a full review.

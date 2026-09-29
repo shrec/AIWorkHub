@@ -62,6 +62,12 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
+## What's new in 0.12.4
+
+- Cleanup is automatic: after every task decision AIWorkHub removes the worktrees, logs, deltas and records nobody needs any more, and files a NeedFix if something cannot be removed.
+- Worker effort follows the card's declared difficulty, so simple cards stop paying for maximum reasoning.
+- Reviews are cheaper: one bounded read pass, and no duplicate reviewer for the same lens.
+
 ## What's new in 0.12.3
 
 - Reworked cards are reviewed only on what changed since the last round, so a small fix no longer pays for a full review.

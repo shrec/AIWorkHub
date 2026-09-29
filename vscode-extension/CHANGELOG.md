@@ -1,5 +1,22 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.12.4 — 2026-09-29
+
+### Added
+
+- Automatic cleanup janitor: every done, reject or archive decision queues one per-repository sweep on a background thread. The sweep removes finalized worker worktrees (sealing each rework predecessor's delta first), unreferenced rework deltas, decided attempts' terminal logs, aged process bundles and expired spill payloads. It retires callbacks of decided tasks, archives decided tasks past their TTL, and closes NeedFix whose linked task was accepted. Hints coalesce, and the sweep wakes itself at the next restore deadline.
+- `aiworkhub_task_create` takes a declared difficulty (bounded / standard / complex), and the worker's reasoning effort follows it instead of always running at maximum (NF-2026-01101).
+
+### Changed
+
+- The janitor is the single deletion path: the separate accepted-artifact cleanup lane is retired. A step that fails, or an item it cannot delete, makes the sweep report `ok: false` and files one deduplicated NeedFix instead of failing silently.
+- A reviewer packet now carries what the reviewer used to fetch turn by turn, so a review is one bounded read pass (NF-2026-01108).
+
+### Fixed
+
+- The automatic review chain reuses a usable or running reviewer for the same target, claim epoch and lens instead of launching a duplicate (NF-2026-01064).
+- The retention test fixtures no longer need local git transport, so validation runs inside the worker sandbox (NF-2026-01116).
+
 ## 0.12.3 — 2026-09-28
 
 ### Changed
