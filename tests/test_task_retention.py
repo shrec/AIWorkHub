@@ -885,3 +885,351 @@ def test_final_archive_fence_releases_retained_evidence_once_workspace_is_gone(
     monkeypatch.setattr(task_store, "get_task", lambda _root, _task_id: pathless)
     fenced, reason = task_retention._final_archive_fence(repo, "FAMILY_V1", "req-v1")
     assert fenced is None and reason == "retained_evidence"
+
+
+# --- records janitor: decided tasks ------------------------------------------
+
+
+_OLD = "2026-08-31T00:00:00+00:00"
+_JANITOR_NOW = datetime(2026, 9, 1, 12, tzinfo=timezone.utc)
+
+
+def _task_row(
+    repo: Path,
+    task_id: str,
+    status: str,
+    *,
+    worker_status: str = "done",
+    updated_at: str = _OLD,
+    card: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    body = {
+        "task_id": task_id,
+        "launch_request_id": f"req-{task_id}",
+        "status": status,
+        "worker_status": worker_status,
+        "updated_at": updated_at,
+        **dict(card or {}),
+    }
+    connection = sqlite3.connect(task_store.canonical_db_path(repo))
+    try:
+        connection.execute(
+            "INSERT INTO tasks(task_id,runner,topic,status,worker_status,card_json,"
+            "created_at,updated_at,completed_at) VALUES(?,?,?,?,?,?,?,?,?)",
+            (task_id, "runner", "coding", status, worker_status, json.dumps(body),
+             updated_at, updated_at, updated_at),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    return body
+
+
+def _terminal_ledger(timestamp: str = "2026-08-31T00:00:01+00:00"):
+    def latest(_root: Path, request_id: str) -> dict[str, Any]:
+        return {
+            "task_id": request_id.removeprefix("req-"),
+            "request_id": request_id,
+            "state": "accepted",
+            "timestamp": timestamp,
+        }
+
+    return latest
+
+
+def test_automatic_hygiene_archives_standalone_decided_rows_past_ttl(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _repo(tmp_path)
+    cards = {
+        "STANDALONE_DONE": _task_row(repo, "STANDALONE_DONE", "finished"),
+        # Touched after its worker's last ledger row: ledger_stale must not hold it.
+        "STANDALONE_SUPERSEDED": _task_row(
+            repo,
+            "STANDALONE_SUPERSEDED",
+            "superseded",
+            worker_status="superseded",
+            updated_at="2026-08-31T06:00:00+00:00",
+        ),
+        "STANDALONE_FRESH": _task_row(
+            repo, "STANDALONE_FRESH", "finished", updated_at="2026-09-01T11:00:00+00:00"
+        ),
+        "STANDALONE_BLOCKED": _task_row(
+            repo, "STANDALONE_BLOCKED", "blocked", worker_status="blocked"
+        ),
+    }
+    archived: list[str] = []
+    monkeypatch.setenv("AIWORKHUB_ALLOW_WRITES", "1")
+    monkeypatch.setattr(task_store, "get_task", lambda _root, task_id: cards.get(task_id))
+    monkeypatch.setattr(task_retention, "_latest_process_row", _terminal_ledger())
+    monkeypatch.setattr(
+        task_store,
+        "archive_task",
+        lambda _root, task_id, **_kwargs: (archived.append(task_id) is None, "archived"),
+    )
+
+    result = task_retention.run_automatic_hygiene(repo, now=_JANITOR_NOW)
+
+    assert archived == ["STANDALONE_DONE", "STANDALONE_SUPERSEDED"]
+    assert result["eligible"] == 2
+    assert result["archived"] == 2
+
+
+def test_final_archive_fence_returns_dependency_live_for_undecided_dependent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _repo(tmp_path)
+    dependency = _task_row(repo, "DEP_DONE", "finished")
+    _task_row(
+        repo,
+        "DEPENDENT_WAITING",
+        "pending",
+        worker_status="unclaimed",
+        card={"depends_on": ["DEP_DONE"]},
+    )
+    monkeypatch.setattr(task_store, "get_task", lambda _root, _task_id: dependency)
+    monkeypatch.setattr(task_retention, "_latest_process_row", _terminal_ledger())
+
+    fenced, reason = task_retention._final_archive_fence(repo, "DEP_DONE", "req-DEP_DONE")
+    assert fenced is None and reason == "dependency_live"
+
+    connection = sqlite3.connect(task_store.canonical_db_path(repo))
+    try:
+        connection.execute(
+            "UPDATE tasks SET status='finished', worker_status='done' "
+            "WHERE task_id='DEPENDENT_WAITING'"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    fenced, reason = task_retention._final_archive_fence(repo, "DEP_DONE", "req-DEP_DONE")
+    assert reason == "" and fenced == dependency
+
+
+def test_final_archive_fence_matches_padded_dependency_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _repo(tmp_path)
+    dependency = _task_row(repo, "DEP_DONE", "finished")
+    _task_row(
+        repo,
+        "DEPENDENT_WAITING",
+        "pending",
+        worker_status="unclaimed",
+        card={"depends_on": [" DEP_DONE "]},
+    )
+    monkeypatch.setattr(task_store, "get_task", lambda _root, _task_id: dependency)
+    monkeypatch.setattr(task_retention, "_latest_process_row", _terminal_ledger())
+
+    fenced, reason = task_retention._final_archive_fence(repo, "DEP_DONE", "req-DEP_DONE")
+    assert fenced is None and reason == "dependency_live"
+
+
+def test_records_janitor_supersedes_callback_before_archiving_in_one_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from aiworkhub import needfix_store
+
+    repo = _repo(tmp_path)
+    card = _task_row(repo, "STANDALONE_DONE", "finished")
+    connection = sqlite3.connect(task_store.canonical_db_path(repo))
+    try:
+        connection.execute(
+            "INSERT INTO callback_outbox(task_id,origin_thread_id,state,created_at,updated_at) "
+            "VALUES(?,?,?,?,?)",
+            ("STANDALONE_DONE", "thread", "pending", _OLD, _OLD),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    archived: list[str] = []
+    monkeypatch.setenv("AIWORKHUB_ALLOW_WRITES", "1")
+    monkeypatch.setattr(task_store, "get_task", lambda _root, _task_id: card)
+    monkeypatch.setattr(task_retention, "_latest_process_row", _terminal_ledger())
+    monkeypatch.setattr(
+        task_store,
+        "archive_task",
+        lambda _root, task_id, **_kwargs: (archived.append(task_id) is None, "archived"),
+    )
+    monkeypatch.setattr(
+        needfix_store,
+        "janitor_bookkeeping",
+        lambda _root, **_kwargs: {"scanned": 0, "archived": 0, "reopened": 0, "skipped": 0},
+    )
+
+    result = task_retention.run_records_janitor(repo, now=_JANITOR_NOW)
+
+    assert result["callbacks"] == {
+        "ok": True, "scanned": 1, "superseded": 1, "batches_superseded": 0,
+    }
+    assert result["tasks"]["archived"] == 1
+    assert archived == ["STANDALONE_DONE"]
+    assert result["needfix"]["ok"] is True
+
+
+def test_records_janitor_isolates_a_raising_step(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from aiworkhub import callback_store, needfix_store
+
+    repo = _repo(tmp_path)
+    ran: list[str] = []
+
+    def boom(_conn: Any) -> dict[str, int]:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(callback_store, "supersede_decided_task_callbacks", boom)
+    monkeypatch.setattr(
+        task_retention,
+        "run_automatic_hygiene",
+        lambda _root, **_kwargs: ran.append("tasks") or {"ok": True, "archived": 0},
+    )
+    monkeypatch.setattr(
+        needfix_store,
+        "janitor_bookkeeping",
+        lambda _root, **_kwargs: ran.append("needfix") or {"scanned": 0},
+    )
+
+    result = task_retention.run_records_janitor(repo, now=_JANITOR_NOW)
+
+    assert result["callbacks"] == {"ok": False, "error": "RuntimeError: boom"}
+    assert ran == ["needfix", "tasks"]
+    assert result["tasks"] == {"ok": True, "archived": 0}
+    assert result["needfix"] == {"ok": True, "scanned": 0}
+
+
+def _accepted_task_needfix(repo: Path) -> tuple[str, str]:
+    from aiworkhub import needfix_store
+
+    needfix_store.initialize_repository(repo)
+    record = needfix_store.add_needfix(
+        repo, title="accepted fix", description="d", status="accepted"
+    )
+    converted = needfix_store.convert_needfix(
+        repo, record["id"], lambda card: {"ok": True, "task_id": card["task_id"]}
+    )
+    return record["id"], str(converted["converted_task_id"])
+
+
+def _quarantine_on_archive(
+    repo: Path, monkeypatch: pytest.MonkeyPatch, card: Mapping[str, Any]
+) -> None:
+    """Stand in for quarantine: hygiene moves the row into a retention batch."""
+
+    def live_card(_root: Path, task_id: str) -> dict[str, Any] | None:
+        connection = sqlite3.connect(task_store.canonical_db_path(repo))
+        try:
+            row = connection.execute(
+                "SELECT 1 FROM tasks WHERE task_id=?", (task_id,)
+            ).fetchone()
+        finally:
+            connection.close()
+        return dict(card) if row else None
+
+    def quarantine(_root: Path, task_id: str, **_kwargs: Any) -> tuple[bool, str]:
+        connection = sqlite3.connect(task_store.canonical_db_path(repo))
+        connection.row_factory = sqlite3.Row
+        try:
+            task_retention._ensure_schema(connection)
+            tasks = [
+                dict(row)
+                for row in connection.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,))
+            ]
+            payload = {
+                "schema_id": task_retention.SCHEMA_ID,
+                "batch_id": f"tasks-test-{task_id}",
+                "tasks": tasks,
+                "task_events": [],
+                "callback_outbox": [],
+                "callback_batches": [],
+            }
+            connection.execute(
+                "INSERT INTO task_retention_batches("
+                "batch_id,task_count,payload_json,quarantined_at,restore_deadline"
+                ") VALUES (?,?,?,?,?)",
+                (payload["batch_id"], len(tasks), json.dumps(payload), _OLD, _OLD),
+            )
+            connection.execute("DELETE FROM task_events WHERE task_id=?", (task_id,))
+            connection.execute("DELETE FROM tasks WHERE task_id=?", (task_id,))
+            connection.commit()
+        finally:
+            connection.close()
+        return True, "archived"
+
+    monkeypatch.setenv("AIWORKHUB_ALLOW_WRITES", "1")
+    monkeypatch.setattr(task_store, "get_task", live_card)
+    monkeypatch.setattr(task_retention, "_latest_process_row", _terminal_ledger())
+    monkeypatch.setattr(task_store, "archive_task", quarantine)
+
+
+def _assert_needfix_retired_and_task_quarantined(
+    repo: Path, needfix_id: str, task_id: str
+) -> None:
+    from aiworkhub import needfix_store
+
+    assert needfix_store.get_needfix(repo, needfix_id)["status"] == "archived"
+    events = [event["event"] for event in needfix_store.list_events(repo, needfix_id, limit=20)]
+    assert "missing_task_link_reopened" not in events
+    assert task_store.get_task(repo, task_id) is None
+    assert task_retention._retained_task_row(repo, task_id)["status"] == "finished"
+
+
+def test_records_janitor_retires_needfix_of_accepted_task_it_quarantines(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _repo(tmp_path)
+    needfix_id, task_id = _accepted_task_needfix(repo)
+    card = _task_row(repo, task_id, "finished", card={"accepted_at": _OLD})
+    _quarantine_on_archive(repo, monkeypatch, card)
+
+    result = task_retention.run_records_janitor(repo, now=_JANITOR_NOW)
+
+    assert result["needfix"]["archived"] == 1
+    assert result["needfix"]["reopened"] == 0
+    assert result["tasks"]["archived"] == 1
+    _assert_needfix_retired_and_task_quarantined(repo, needfix_id, task_id)
+
+
+def test_records_janitor_retires_needfix_of_already_quarantined_accepted_task(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _repo(tmp_path)
+    needfix_id, task_id = _accepted_task_needfix(repo)
+    card = _task_row(repo, task_id, "finished", card={"accepted_at": _OLD})
+    _quarantine_on_archive(repo, monkeypatch, card)
+    assert task_retention.run_automatic_hygiene(repo, now=_JANITOR_NOW)["archived"] == 1
+
+    result = task_retention.run_records_janitor(repo, now=_JANITOR_NOW)
+
+    assert result["needfix"]["archived"] == 1
+    assert result["needfix"]["reopened"] == 0
+    _assert_needfix_retired_and_task_quarantined(repo, needfix_id, task_id)
+
+
+def test_records_janitor_retires_needfix_of_quarantined_archived_accepted_task(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from aiworkhub import needfix_store
+
+    repo = _repo(tmp_path)
+    needfix_id, task_id = _accepted_task_needfix(repo)
+    card = _task_row(
+        repo,
+        task_id,
+        "archived",
+        card={"accepted_at": _OLD, "archive_operation": "archived"},
+    )
+    _quarantine_on_archive(repo, monkeypatch, card)
+    # accepted_at lives only inside the retained row's card_json.
+    assert task_store.archive_task(repo, task_id) == (True, "archived")
+    retained = task_retention._retained_task_row(repo, task_id)
+    assert retained["status"] == "archived" and retained["accepted_at"] == _OLD
+    assert "card_json" not in retained
+
+    result = task_retention.run_records_janitor(repo, now=_JANITOR_NOW)
+
+    assert result["needfix"]["archived"] == 1
+    assert result["needfix"]["reopened"] == 0
+    assert needfix_store.get_needfix(repo, needfix_id)["status"] == "archived"
+    events = [event["event"] for event in needfix_store.list_events(repo, needfix_id, limit=20)]
+    assert "missing_task_link_reopened" not in events

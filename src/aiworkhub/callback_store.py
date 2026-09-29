@@ -1701,21 +1701,7 @@ def prune_stale_pending_callbacks(
             pruned += 1
             if row["batch_id"]:
                 touched_batches.add(str(row["batch_id"]))
-        batches_superseded = 0
-        for batch_id in sorted(touched_batches):
-            live = conn.execute(
-                "SELECT 1 FROM callback_outbox WHERE batch_id=? "
-                "AND state IN ('pending','inflight') LIMIT 1",
-                (batch_id,),
-            ).fetchone()
-            if live is not None:
-                continue
-            emptied = conn.execute(
-                "UPDATE callback_batches SET state='superseded', lease_id='', "
-                "lease_expires_at='', updated_at=? WHERE batch_id=? AND state='pending'",
-                (now, batch_id),
-            )
-            batches_superseded += int(emptied.rowcount == 1)
+        batches_superseded = _supersede_emptied_batches(conn, touched_batches, now)
         conn.commit()
     except Exception:
         conn.rollback()
@@ -1723,6 +1709,104 @@ def prune_stale_pending_callbacks(
     return {
         "scanned": len(candidates),
         "pruned": pruned,
+        "batches_superseded": batches_superseded,
+    }
+
+
+DECIDED_TASK_SUPERSEDE_REASON = "task_decided"
+_DECIDED_TASK_STATUSES = ("finished", "archived", "superseded")
+
+
+def _supersede_emptied_batches(
+    conn: sqlite3.Connection,
+    batch_ids: set[str],
+    now: str,
+    *,
+    states: tuple[str, ...] = ("pending",),
+) -> int:
+    """Supersede each batch in ``batch_ids`` that has no pending/inflight
+    member left and is still in one of ``states``; returns how many were."""
+    placeholders = ",".join("?" for _ in states)
+    batches_superseded = 0
+    for batch_id in sorted(batch_ids):
+        live = conn.execute(
+            "SELECT 1 FROM callback_outbox WHERE batch_id=? "
+            "AND state IN ('pending','inflight') LIMIT 1",
+            (batch_id,),
+        ).fetchone()
+        if live is not None:
+            continue
+        emptied = conn.execute(
+            "UPDATE callback_batches SET state='superseded', lease_id='', "
+            "lease_expires_at='', updated_at=? WHERE batch_id=? "
+            f"AND state IN ({placeholders})",
+            (now, batch_id, *states),
+        )
+        batches_superseded += int(emptied.rowcount == 1)
+    return batches_superseded
+
+
+def supersede_decided_task_callbacks(conn: sqlite3.Connection) -> dict[str, int]:
+    """Supersede pending and dead-letter outbox rows whose task is decided.
+
+    A task that is finished, archived or superseded -- or no longer exists --
+    can never be woken usefully again, yet its undelivered row fences task
+    hygiene (``callback_live``) forever.  Unlike
+    :func:`prune_stale_pending_callbacks` this also retires ``dead_letter``
+    rows, and it keys on the task's decided status alone.  Inflight rows and
+    rows of undecided (review, blocked, running ...) tasks are never touched.
+    ``callback_superseded`` is recorded per row; a batch left with no live
+    member is superseded as well.
+    """
+    _ensure_callback_outbox_table(conn)
+    _ensure_callback_batches_table(conn)
+    status_marks = ",".join("?" for _ in _DECIDED_TASK_STATUSES)
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        candidates = conn.execute(
+            "SELECT o.outbox_id, o.batch_id, o.task_id, o.transition, o.state "
+            "FROM callback_outbox o LEFT JOIN tasks t ON t.task_id = o.task_id "
+            "WHERE o.state IN ('pending','dead_letter') "
+            f"AND (t.task_id IS NULL OR t.status IN ({status_marks})) "
+            "ORDER BY o.created_at ASC, o.outbox_id ASC",
+            _DECIDED_TASK_STATUSES,
+        ).fetchall()
+        superseded = 0
+        touched_batches: set[str] = set()
+        now = utc_now()
+        for row in candidates:
+            updated = conn.execute(
+                "UPDATE callback_outbox SET state='superseded', last_error=?, "
+                "lease_id='', lease_expires_at='', updated_at=? "
+                "WHERE outbox_id=? AND state IN ('pending','dead_letter')",
+                (DECIDED_TASK_SUPERSEDE_REASON, now, row["outbox_id"]),
+            )
+            if updated.rowcount != 1:
+                continue
+            append_event(
+                conn,
+                row["task_id"],
+                "callback_superseded",
+                "",
+                {
+                    "transition": row["transition"],
+                    "reason": DECIDED_TASK_SUPERSEDE_REASON,
+                    "prior_state": row["state"],
+                },
+            )
+            superseded += 1
+            if row["batch_id"]:
+                touched_batches.add(str(row["batch_id"]))
+        batches_superseded = _supersede_emptied_batches(
+            conn, touched_batches, now, states=("pending", "dead_letter"),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return {
+        "scanned": len(candidates),
+        "superseded": superseded,
         "batches_superseded": batches_superseded,
     }
 

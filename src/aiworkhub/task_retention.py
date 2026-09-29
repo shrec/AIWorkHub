@@ -69,6 +69,9 @@ _TERMINAL_LEDGER_STATES = frozenset(
     }
 )
 _TERMINAL_TASK_STATES = frozenset({"blocked", "finished", "superseded"})
+# Decided outcomes: nothing can revive such a task, so no family head or
+# ledger freshness has to hold it in the live queue.
+DECIDED_TASK_STATUSES = frozenset({"finished", "archived", "superseded"})
 
 
 class TaskFamily(NamedTuple):
@@ -967,6 +970,13 @@ def _candidate_ids(rows: list[dict[str, Any]], cutoff: datetime) -> set[str]:
     selected: set[str] = set()
     for row in rows:
         task_id = str(row.get("task_id") or "")
+        # A decided row past its TTL is a candidate whether or not it belongs
+        # to a family (and even as a family head): nothing can revive it.
+        if (
+            str(row.get("status") or "").lower() in DECIDED_TASK_STATUSES
+            and _expired(row, cutoff)
+        ):
+            selected.add(task_id)
         parsed = task_family(task_id)
         if parsed and not parsed.reviewer:
             families.setdefault(parsed.family, []).append((parsed, row))
@@ -1028,6 +1038,34 @@ def _retained_workspace_present(
     return recorded == 0
 
 
+def _has_undecided_dependent(root: Path | str, task_id: str) -> bool:
+    """True when any undecided task lists ``task_id`` in ``depends_on``."""
+
+    connection = _connect(root, readonly=True)
+    try:
+        rows = connection.execute(
+            "SELECT status, worker_status, archived_at, card_json FROM tasks "
+            "WHERE task_id<>? AND instr(card_json, ?) > 0",
+            (task_id, task_id),
+        ).fetchall()
+    finally:
+        connection.close()
+    for row in rows:
+        if task_store.canonical_status(dict(row)) in DECIDED_TASK_STATUSES:
+            continue
+        try:
+            card = json.loads(row["card_json"] or "{}")
+        except (TypeError, ValueError):
+            # An unreadable live card may still depend on ``task_id``: fence.
+            return True
+        dependencies = card.get("depends_on") if isinstance(card, dict) else None
+        if isinstance(dependencies, list) and any(
+            str(item or "").strip() == task_id for item in dependencies
+        ):
+            return True
+    return False
+
+
 def _final_archive_fence(
     root: Path | str, task_id: str, expected_request_id: str
 ) -> tuple[dict[str, Any] | None, str]:
@@ -1055,6 +1093,11 @@ def _final_archive_fence(
     reservation_keys = ("launch_reservation", "reservation", "reservation_id")
     if any(card.get(key) for key in reservation_keys):
         return None, "task_reserved"
+    # ``core._card_dependencies_have_accepted_outcomes`` requires each
+    # dependency to still read ``finished``; archiving one would block its
+    # undecided dependents forever.
+    if _has_undecided_dependent(root, task_id):
+        return None, "dependency_live"
     terminal_review = card.get("terminal_review")
     terminal_evidence = (
         terminal_review.get("evidence") if isinstance(terminal_review, Mapping) else None
@@ -1108,6 +1151,10 @@ def _final_archive_fence(
         return None, "ledger_live"
     if ledger_state not in _TERMINAL_LEDGER_STATES:
         return None, "ledger_not_terminal"
+    if status in DECIDED_TASK_STATUSES:
+        # A decided card is routinely touched after its worker exited
+        # (acceptance, supersession); the ledger cannot be newer than that.
+        return card, ""
     ledger_timestamp = str(ledger.get("timestamp") or "")
     card_updated = str(card.get("updated_at") or "")
     try:
@@ -1205,7 +1252,109 @@ def run_automatic_hygiene(
     return summary
 
 
+def _retained_task_row(root: Path | str, task_id: str) -> dict[str, Any] | None:
+    """The ``tasks`` row held by the newest retention batch for ``task_id``, if any."""
+
+    connection = _connect(root, readonly=True)
+    try:
+        if not _table_exists(connection):
+            return None
+        batches = connection.execute(
+            "SELECT payload_json FROM task_retention_batches WHERE instr(payload_json, ?) > 0 "
+            "ORDER BY quarantined_at DESC, batch_id DESC",
+            (json.dumps(task_id),),
+        ).fetchall()
+    finally:
+        connection.close()
+    for (payload_json,) in batches:
+        try:
+            payload = json.loads(payload_json)
+        except (TypeError, ValueError):
+            continue
+        rows = payload.get("tasks") if isinstance(payload, dict) else None
+        for row in rows if isinstance(rows, list) else []:
+            if isinstance(row, dict) and str(row.get("task_id") or "") == task_id:
+                try:
+                    card = json.loads(row.get("card_json") or "{}")
+                except (TypeError, ValueError):
+                    card = {}
+                if not isinstance(card, dict):
+                    card = {}
+                return {**card, **{k: v for k, v in row.items() if k != "card_json"}}
+    return None
+
+
+def _task_has_local_history(root: Path | str, task_id: str, *, retained_fn: Any = None) -> bool:
+    """True when this host ever held ``task_id``: live events or a retention batch."""
+
+    connection = _connect(root, readonly=True)
+    try:
+        if connection.execute(
+            "SELECT 1 FROM task_events WHERE task_id=? LIMIT 1", (task_id,)
+        ).fetchone():
+            return True
+    finally:
+        connection.close()
+    if retained_fn is None:
+        return _retained_task_row(root, task_id) is not None
+    return retained_fn(task_id) is not None
+
+
+def _janitor_step(step: Any) -> dict[str, Any]:
+    try:
+        return {"ok": True, **step()}
+    except Exception as exc:  # noqa: BLE001 -- one failing step never stops the others
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
+def _janitor_callbacks(root: Path | str) -> dict[str, Any]:
+    from . import callback_store
+
+    conn = callback_store.open_db(callback_store.resolve_db_path(root))
+    try:
+        return callback_store.supersede_decided_task_callbacks(conn)
+    finally:
+        conn.close()
+
+
+def _janitor_needfix(root: Path | str) -> dict[str, Any]:
+    import functools
+
+    from . import needfix_store
+
+    # One scan of the retention batches per task id for this whole pass.
+    retained = functools.lru_cache(maxsize=None)(
+        lambda task_id: _retained_task_row(root, task_id)
+    )
+    # A quarantined task is gone from ``tasks`` but its retained row still
+    # carries its decision, so an accepted task never reads as a dead link.
+    return needfix_store.janitor_bookkeeping(
+        root,
+        get_task_fn=lambda task_id: task_store.get_task(root, task_id) or retained(task_id),
+        canonical_status_fn=task_store.canonical_status,
+        task_has_local_history_fn=lambda task_id: _task_has_local_history(
+            root, task_id, retained_fn=retained
+        ),
+    )
+
+
+def run_records_janitor(
+    root: Path | str, *, now: datetime | None = None
+) -> dict[str, Any]:
+    """Retire decided records: callbacks first, so their tasks are no longer
+    fenced by ``callback_live``; then NeedFix bookkeeping, while the linked
+    tasks are still live rows rather than quarantined payloads; then task
+    hygiene.  Each step is isolated -- a failure is reported, never propagated."""
+
+    return {
+        "callbacks": _janitor_step(lambda: _janitor_callbacks(root)),
+        "needfix": _janitor_step(lambda: _janitor_needfix(root)),
+        "tasks": _janitor_step(lambda: run_automatic_hygiene(root, now=now)),
+    }
+
+
 __all__ = [
+    "DECIDED_TASK_STATUSES",
     "SCHEMA_ID",
     "TaskRetentionError",
     "canonical_acceptance_digest",
@@ -1219,6 +1368,7 @@ __all__ = [
     "restore",
     "hygiene_config",
     "run_automatic_hygiene",
+    "run_records_janitor",
     "task_family",
     "validate_accepted_cleanup_evidence",
 ]

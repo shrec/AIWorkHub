@@ -463,20 +463,26 @@ def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
 
 
 REOPEN_EVENT_LEGACY_ALIAS = "archived_task_link_reopened"
+# A task_created link whose task this host once held but no longer has (the
+# records janitor retired it) is reopened under its own event name.
+REOPEN_EVENT_MISSING_TASK = "missing_task_link_reopened"
 # One compatible durable reopen vocabulary shared by the reopen writer and
 # the authoritative read validator: the canonical superseded reopen event
-# plus its authenticated legacy ordinary-archive alias. Each name counts as
-# exactly one durable reopen for generation authority, so authenticated
-# legacy ``archived_task_link_reopened`` rows stay readable without any
-# direct database edit.
-REOPEN_EVENT_ALIASES: tuple[str, ...] = (REOPEN_EVENT, REOPEN_EVENT_LEGACY_ALIAS)
+# plus its authenticated legacy ordinary-archive alias and the missing-task
+# reopen. Each name counts as exactly one durable reopen for generation
+# authority, so authenticated legacy ``archived_task_link_reopened`` rows stay
+# readable without any direct database edit.
+REOPEN_EVENT_ALIASES: tuple[str, ...] = (
+    REOPEN_EVENT, REOPEN_EVENT_LEGACY_ALIAS, REOPEN_EVENT_MISSING_TASK,
+)
+_REOPEN_EVENT_MARKS = ", ".join("?" for _ in REOPEN_EVENT_ALIASES)
 
 
 def _durable_reopen_count(conn: sqlite3.Connection, needfix_id: str) -> int:
     """Exact durable lineage authority: recorded reopen event count."""
     row = conn.execute(
         "SELECT COUNT(*) AS n FROM needfix_events "
-        "WHERE needfix_id = ? AND event IN (?, ?)",
+        f"WHERE needfix_id = ? AND event IN ({_REOPEN_EVENT_MARKS})",
         (needfix_id, *REOPEN_EVENT_ALIASES),
     ).fetchone()
     return int(row["n"])
@@ -487,17 +493,18 @@ def _backfill_legacy_reopen_generation(conn: sqlite3.Connection) -> None:
 
     Only rows still carrying the migration default of 0 and with at least one
     durable reopen event in the compatible vocabulary (canonical
-    ``superseded_task_link_reopened`` or the legacy
-    ``archived_task_link_reopened`` alias) are rewritten; nonzero values are
-    never silently repaired here (they fail closed elsewhere).
+    ``superseded_task_link_reopened``, the legacy
+    ``archived_task_link_reopened`` alias or ``missing_task_link_reopened``)
+    are rewritten; nonzero values are never silently repaired here (they fail
+    closed elsewhere).
     """
     conn.execute(
         "UPDATE needfix SET reopen_generation = ("
         "    SELECT COUNT(*) FROM needfix_events e "
-        "    WHERE e.needfix_id = needfix.id AND e.event IN (?, ?)"
+        f"    WHERE e.needfix_id = needfix.id AND e.event IN ({_REOPEN_EVENT_MARKS})"
         ") WHERE reopen_generation = 0 AND ("
         "    SELECT COUNT(*) FROM needfix_events e "
-        "    WHERE e.needfix_id = needfix.id AND e.event IN (?, ?)"
+        f"    WHERE e.needfix_id = needfix.id AND e.event IN ({_REOPEN_EVENT_MARKS})"
         ") > 0",
         (*REOPEN_EVENT_ALIASES, *REOPEN_EVENT_ALIASES),
     )
@@ -3513,6 +3520,7 @@ def reopen_superseded_task_link(
     canonical_status_fn: Callable[[Mapping[str, Any]], str],
     reason: str,
     actor: str = "manager",
+    missing_task_has_local_history_fn: Callable[[str], bool] | None = None,
 ) -> dict[str, Any]:
     """Return a stale ``task_created`` NeedFix to ``accepted``.
 
@@ -3555,25 +3563,37 @@ def reopen_superseded_task_link(
 
         task = get_task_fn(linked_task_id)
         if task is None:
-            raise NeedFixValidationError(
-                f"linked task {linked_task_id!r} not found in this repository"
+            # Only a task this host once held may be reopened as missing; a
+            # link to a task that simply lives on another host stays put.
+            if missing_task_has_local_history_fn is None or not (
+                missing_task_has_local_history_fn(linked_task_id)
+            ):
+                raise NeedFixValidationError(
+                    f"linked task {linked_task_id!r} not found in this repository"
+                )
+            task_status = "missing"
+            archive_operation = ""
+        else:
+            canonical_task_id = str(task.get("id") or task.get("task_id") or "").strip()
+            if canonical_task_id and canonical_task_id != linked_task_id:
+                raise NeedFixConflictError(
+                    f"canonical task identity {canonical_task_id!r} does not match "
+                    f"linked task {linked_task_id!r}"
+                )
+            task_status = canonical_status_fn(task)
+            archive_operation = str(task.get("archive_operation") or "").strip()
+            accepted_at = str(task.get("accepted_at") or "").strip()
+            supported_archive = archive_operation in {"archived", "superseded"}
+            eligible = not accepted_at and (
+                task_status == "superseded"
+                or (task_status == "archived" and supported_archive)
             )
-        canonical_task_id = str(task.get("id") or task.get("task_id") or "").strip()
-        if canonical_task_id and canonical_task_id != linked_task_id:
-            raise NeedFixConflictError(
-                f"canonical task identity {canonical_task_id!r} does not match "
-                f"linked task {linked_task_id!r}"
-            )
-        task_status = canonical_status_fn(task)
-        archive_operation = str(task.get("archive_operation") or "").strip()
-        accepted_at = str(task.get("accepted_at") or "").strip()
-        supported_archive = archive_operation in {"archived", "superseded"}
-        if task_status != "archived" or not supported_archive or accepted_at:
-            raise NeedFixConflictError(
-                f"linked task {linked_task_id!r} is not an eligible archived task "
-                f"(canonical status={task_status!r}, archive_operation="
-                f"{archive_operation!r}, accepted_at={accepted_at!r})"
-            )
+            if not eligible:
+                raise NeedFixConflictError(
+                    f"linked task {linked_task_id!r} is not an eligible archived task "
+                    f"(canonical status={task_status!r}, archive_operation="
+                    f"{archive_operation!r}, accepted_at={accepted_at!r})"
+                )
 
         conn.execute("BEGIN IMMEDIATE")
         now = _utcnow_iso()
@@ -3594,11 +3614,12 @@ def reopen_superseded_task_link(
             raise NeedFixConflictError(
                 f"needfix {needfix_id} changed during stale-link reconciliation"
             )
-        event_name = (
-            "superseded_task_link_reopened"
-            if archive_operation == "superseded"
-            else "archived_task_link_reopened"
-        )
+        if task is None:
+            event_name = REOPEN_EVENT_MISSING_TASK
+        elif archive_operation == "superseded" or task_status == "superseded":
+            event_name = REOPEN_EVENT
+        else:
+            event_name = REOPEN_EVENT_LEGACY_ALIAS
         _record_event(
             conn,
             needfix_id,
@@ -3624,6 +3645,64 @@ def reopen_superseded_task_link(
         raise
     finally:
         conn.close()
+
+
+def janitor_bookkeeping(
+    repo_root: str | Path,
+    *,
+    get_task_fn: Callable[[str], Mapping[str, Any] | None],
+    canonical_status_fn: Callable[[Mapping[str, Any]], str],
+    task_has_local_history_fn: Callable[[str], bool],
+) -> dict[str, int]:
+    """Retire or reopen ``task_created`` NeedFix rows whose task is decided.
+
+    An accepted task (``finished``, or ``archived`` with ``accepted_at``)
+    retires its NeedFix through :func:`archive_needfix`.  A dead local link
+    -- superseded or archived without acceptance, or a task this host once
+    held but no longer has -- is reopened through
+    :func:`reopen_superseded_task_link`.  A link to a task this host never
+    held belongs to another host and is skipped untouched.
+    """
+    conn = _connect(repo_root)
+    try:
+        rows = conn.execute(
+            "SELECT id, converted_task_id FROM needfix WHERE status = 'task_created' "
+            "AND COALESCE(converted_task_id, '') <> '' ORDER BY id"
+        ).fetchall()
+    finally:
+        conn.close()
+    summary = {"scanned": len(rows), "archived": 0, "reopened": 0, "skipped": 0}
+    for row in rows:
+        needfix_id = str(row["id"])
+        task_id = str(row["converted_task_id"]).strip()
+        task = get_task_fn(task_id)
+        if task is None:
+            if not task_has_local_history_fn(task_id):
+                summary["skipped"] += 1
+                continue
+        else:
+            status = canonical_status_fn(task)
+            accepted_at = str(task.get("accepted_at") or "").strip()
+            if status == "finished" or (status == "archived" and accepted_at):
+                archive_needfix(repo_root, needfix_id, reason="janitor:task_accepted")
+                summary["archived"] += 1
+                continue
+            if accepted_at or status not in {"archived", "superseded"}:
+                continue
+        try:
+            reopen_superseded_task_link(
+                repo_root,
+                needfix_id,
+                get_task_fn=get_task_fn,
+                canonical_status_fn=canonical_status_fn,
+                reason="janitor:dead_task_link",
+                actor="janitor",
+                missing_task_has_local_history_fn=task_has_local_history_fn,
+            )
+        except (NeedFixConflictError, NeedFixValidationError, NeedFixNotFoundError):
+            continue
+        summary["reopened"] += 1
+    return summary
 
 
 # The only NeedFix own-statuses ``link_existing_task`` will claim from. Gating on

@@ -424,6 +424,93 @@ def test_unrelated_and_forged_events_do_not_count_toward_generation(init: Path):
     assert needfix_store.get_needfix(init, rec["id"])["reopen_generation"] == 1
 
 
+# --- records janitor bookkeeping --------------------------------------------
+
+
+def _converted(init: Path, title: str) -> tuple[str, str]:
+    rec = needfix_store.add_needfix(init, title=title, description="d", status="accepted")
+    converted = needfix_store.convert_needfix(init, rec["id"], _reopen_create_task_fn)
+    return rec["id"], converted["converted_task_id"]
+
+
+def test_reopen_missing_task_without_history_fn_still_raises(init: Path):
+    rec_id, _task_id = _converted(init, "missing")
+    with pytest.raises(needfix_store.NeedFixValidationError, match="not found"):
+        needfix_store.reopen_superseded_task_link(
+            init,
+            rec_id,
+            get_task_fn=lambda _task_id: None,
+            canonical_status_fn=_reopen_canonical_status,
+            reason="missing task, no local history authority",
+        )
+    assert needfix_store.get_needfix(init, rec_id)["status"] == "task_created"
+
+
+def test_reopen_accepts_canonical_superseded_without_accepted_at(init: Path):
+    rec_id, _task_id = _converted(init, "superseded")
+    reopened = needfix_store.reopen_superseded_task_link(
+        init,
+        rec_id,
+        get_task_fn=lambda task_id: {"id": task_id, "status": "superseded"},
+        canonical_status_fn=_reopen_canonical_status,
+        reason="canonical superseded task",
+    )
+    assert reopened["status"] == "accepted"
+    events = needfix_store.list_events(init, rec_id, limit=10)
+    assert events[0]["event"] == "superseded_task_link_reopened"
+
+
+def test_janitor_bookkeeping_archives_accepted_reopens_dead_and_skips_foreign(init: Path):
+    finished = _converted(init, "finished")
+    archived_accepted = _converted(init, "archived accepted")
+    archived_superseded = _converted(init, "archived superseded")
+    superseded = _converted(init, "superseded")
+    missing_local = _converted(init, "missing local")
+    missing_foreign = _converted(init, "missing foreign")
+    live = _converted(init, "live")
+    cards = {
+        finished[1]: {"id": finished[1], "status": "finished"},
+        archived_accepted[1]: {
+            "id": archived_accepted[1],
+            "status": "archived",
+            "archive_operation": "archived",
+            "accepted_at": "2026-09-01T00:00:00+00:00",
+        },
+        archived_superseded[1]: {
+            "id": archived_superseded[1],
+            "status": "archived",
+            "archive_operation": "superseded",
+        },
+        superseded[1]: {"id": superseded[1], "status": "superseded"},
+        live[1]: {"id": live[1], "status": "review"},
+    }
+
+    summary = needfix_store.janitor_bookkeeping(
+        init,
+        get_task_fn=cards.get,
+        canonical_status_fn=_reopen_canonical_status,
+        task_has_local_history_fn=lambda task_id: task_id == missing_local[1],
+    )
+
+    assert summary == {"scanned": 7, "archived": 2, "reopened": 3, "skipped": 1}
+    for rec_id, _task_id in (finished, archived_accepted):
+        row = needfix_store.get_needfix(init, rec_id)
+        assert row["status"] == "archived"
+        event = needfix_store.list_events(init, rec_id, limit=10)[0]
+        assert event["event"] == "archived"
+    for rec_id, _task_id in (archived_superseded, superseded, missing_local):
+        row = needfix_store.get_needfix(init, rec_id)
+        assert row["status"] == "accepted"
+        assert row["converted_task_id"] is None
+        assert row["reopen_generation"] == 1
+    missing_event = needfix_store.list_events(init, missing_local[0], limit=10)[0]
+    assert missing_event["event"] == "missing_task_link_reopened"
+    for rec_id, task_id in (missing_foreign, live):
+        row = needfix_store.get_needfix(init, rec_id)
+        assert row["status"] == "task_created"
+        assert row["converted_task_id"] == task_id
+
+
 def _receipt(task_id: str = "TASK-1", request_id: str = "request-1") -> dict[str, Any]:
     hashes = {"src/fix.py": "b" * 64}
     unsigned = {

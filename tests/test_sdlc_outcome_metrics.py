@@ -715,6 +715,35 @@ def test_cohort_read_loads_payloads_only_for_acceptance_events(tmp_path):
     assert cohort.complete == frozenset({"T"})
 
 
+def test_archived_task_with_accept_review_stays_in_decided_cohort(tmp_path):
+    # The records janitor archives decided tasks; archiving is a status, and the
+    # cohort keys on the durable accept_review event, so it must not drop them.
+    db_path = tmp_path / "tasks.db"
+    _seed_task_store(db_path, _numbered([
+        ("T_ARCHIVED", "claim", {}),
+        ("T_ARCHIVED", "accept_review", _acceptance("T_ARCHIVED", "R", "a" * 64)),
+        ("T_ARCHIVED", "archived", {"reason": "automatic_task_hygiene"}),
+    ]))
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute(
+            "INSERT INTO tasks(task_id,runner,topic,status,worker_status,card_json,"
+            "created_at,updated_at,archived_at) VALUES(?,?,?,?,?,?,?,?,?)",
+            ("T_ARCHIVED", "r", "t", "finished", "done", "{}",
+             "2026-09-20T00:00:00Z", "2026-09-20T00:00:00Z", "2026-09-21T00:00:00Z"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    conn = sdlc_outcome_metrics.connect_readonly(db_path)
+    try:
+        _rows, cohort = sdlc_outcome_metrics.read_decided_task_cohort(conn, 50)
+    finally:
+        conn.close()
+    assert cohort.selected == ("T_ARCHIVED",)
+    assert cohort.complete == frozenset({"T_ARCHIVED"})
+
+
 # --- matched reasoning/context outcome comparison (plan Task 3) -------------------------------
 
 _REPO = "repo-one"
