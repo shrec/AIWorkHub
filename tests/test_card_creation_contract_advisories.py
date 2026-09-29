@@ -474,6 +474,7 @@ def test_a_runner_family_with_no_adapter_tuple_is_refused_not_guessed(tmp_path):
 def test_adapter_identity_tuple_is_the_validator_table(tmp_path):
     """The extracted tuple and the validator can never disagree."""
     for runner in (
+        "claude",
         "claude_opus-5",
         "codex_gpt-5.5",
         "deepseek_v4",
@@ -553,12 +554,81 @@ def test_launch_with_an_explicit_tuple_derives_nothing(tmp_path, monkeypatch):
     assert "launch_identity_derivation" not in result
 
 
-def test_launch_reports_an_underivable_identity_as_a_blocked_launch(tmp_path):
-    card = _launchable_card(task_id="T_UNDERIVABLE", runner="", topic="")
+def _refuse_any_claim(manager, monkeypatch):
+    """Both launch paths own the claim; reaching either would be a post-claim refusal."""
+    def _claimed(**_kwargs):
+        raise AssertionError("an underivable identity reached the claim")
+
+    monkeypatch.setattr(manager, "_launch_direct_for_tests", _claimed)
+    monkeypatch.setattr(manager, "_launch_isolated", _claimed)
+
+
+@pytest.mark.parametrize(
+    ("runner", "topic", "reason"),
+    [
+        ("", "", "launch_identity_underivable"),
+        ("mystery_worker", "coding", "launch_adapter_underivable"),
+    ],
+)
+def test_launch_refuses_an_underivable_identity_before_the_claim(
+    tmp_path, monkeypatch, runner, topic, reason,
+):
+    card = _launchable_card(
+        task_id="T_UNDERIVABLE",
+        runner=runner,
+        topic=topic,
+        status="pending",
+        worker_status="unclaimed",
+        claim_epoch=0,
+    )
+    before = json.loads(json.dumps(card))
     manager = _derivation_manager(tmp_path, card)
+    _refuse_any_claim(manager, monkeypatch)
     result = manager.launch(task_id="T_UNDERIVABLE")
     assert result["ok"] is False
-    assert "launch_identity_underivable" in result["blocked_reason"]
+    assert reason in result["blocked_reason"]
+    # A refusal, not a blocked transition the event ledger projects onto the card.
+    assert result["state"] == "refused"
+    assert result["state"] != "blocked"
+    # Pre-claim: the card (status, worker_status, claim_epoch) is untouched.
+    assert card == before
+    shown = json.loads(manager._show_task("T_UNDERIVABLE")["stdout"])
+    assert shown["status"] == "pending"
+    assert shown["worker_status"] == "unclaimed"
+    assert shown["claim_epoch"] == 0
+
+
+def test_launch_derives_claude_cli_for_the_bare_claude_runner(tmp_path, monkeypatch):
+    """NF-2026-01125: runner ``claude`` with no adapter_id launches on claude_cli."""
+    card = _launchable_card(task_id="T_BARE_CLAUDE", runner="claude")
+    manager = _derivation_manager(tmp_path, card)
+    seen: dict[str, object] = {}
+
+    def _capture(**kwargs):
+        seen.update(kwargs)
+        return {"ok": True, "task_id": kwargs["task_id"]}
+
+    monkeypatch.setattr(manager, "_launch_direct_for_tests", _capture)
+    result = manager.launch(task_id="T_BARE_CLAUDE")
+
+    assert result["ok"] is True, result
+    assert seen["runner"] == "claude"
+    assert seen["adapter_id"] == "claude_cli"
+    derived_from = result["launch_identity_derivation"]["derived_from"]
+    assert derived_from["adapter_id"] == "first_launchable_in_tuple_order"
+
+
+def test_an_explicit_adapter_for_the_bare_claude_runner_is_kept_and_validated(tmp_path):
+    derived = process_launcher.derive_launch_identity(
+        tmp_path, _launchable_card(runner="claude"), adapter_id="claude_cli"
+    )
+    assert derived["adapter_id"] == "claude_cli"
+    assert "adapter_id" not in derived["derived_from"]
+    process_launcher._validate_adapter_identity("claude", derived["adapter_id"])
+    # The editor bridge stays acceptable, exactly as for the ``claude_`` family.
+    process_launcher._validate_adapter_identity("claude", "vscode_lm")
+    with pytest.raises(process_launcher.LaunchRejected):
+        process_launcher._validate_adapter_identity("claude", "codex_cli")
 
 
 def test_both_new_launch_denials_are_classified_for_autolaunch():

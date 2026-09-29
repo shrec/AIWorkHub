@@ -2816,6 +2816,11 @@ def adapter_identity_tuple(runner: str) -> tuple[str, ...]:
     """
     if runner == core.CODEX_RUNNER:
         return ()
+    if runner == "claude":
+        # NF-2026-01125: the bare family runner has no canonical workforce row;
+        # the Claude Code CLI leads so derivation picks it, and the editor
+        # bridge stays acceptable exactly as for the ``claude_`` family.
+        return ("claude_cli", "vscode_lm")
     if runner.startswith("claude_"):
         return ("vscode_lm", "claude_cli")
     if runner.startswith("codex_"):
@@ -6103,12 +6108,18 @@ class ProcessManager:
                     model=model,
                 )
             except LaunchRejected as exc:
+                # NF-2026-01125: an underivable identity is a pre-claim refusal;
+                # the card stays pending, never projected as blocked.
+                reason = str(exc)
                 return self._blocked(
                     task_id,
                     str(runner or ""),
                     str(topic or ""),
                     str(adapter_id or ""),
-                    str(exc),
+                    reason,
+                    state="refused" if reason.startswith(
+                        ("launch_identity_underivable", "launch_adapter_underivable")
+                    ) else "blocked",
                 )
             runner = identity_derivation["runner"]
             topic = identity_derivation["topic"]

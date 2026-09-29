@@ -14129,3 +14129,19 @@ def test_attempt_receipt_scan_is_a_bounded_tail_and_survives_hostile_bytes(tmp_p
     assert recent["receipt"] == receipt
     _assert_typed_unknown(outside_window, "receipt_absent")
     _assert_typed_unknown(hostile_record, "receipt_absent")
+
+
+def test_bare_claude_runner_derives_claude_cli_first():
+    """NF-2026-01125: the bare ``claude`` runner derives, and validates, claude_cli."""
+    tuple_ = process_launcher.adapter_identity_tuple("claude")
+    assert tuple_ == ("claude_cli", "vscode_lm")
+    # Derivation walks the tuple in order, so claude_cli is picked first.
+    assert tuple_[0] == "claude_cli"
+    process_launcher._validate_adapter_identity("claude", "claude_cli")
+    process_launcher._validate_adapter_identity("claude", "vscode_lm")
+    with pytest.raises(process_launcher.LaunchRejected):
+        process_launcher._validate_adapter_identity("claude", "not_an_adapter")
+    # The prefixed family keeps its editor-bridge-first order unchanged.
+    assert process_launcher.adapter_identity_tuple("claude_opus-5") == (
+        "vscode_lm", "claude_cli",
+    )
