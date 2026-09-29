@@ -119,6 +119,62 @@ def _refuse(message: str) -> int:
     return 2
 
 
+def _derive_previous_vsix(
+    entries: list[dict[str, Any]], version: str, vsix_path: Path, repo_root: Path
+) -> dict[str, str] | None:
+    # The release recipe ends every release with an installed line, so the
+    # rollback pointer comes from the built lines, never from the last line.
+    built = [
+        entry
+        for entry in entries
+        if entry.get("kind") == "built"
+        and isinstance(entry.get("version"), str)
+        and entry.get("version") != version
+        and isinstance(entry.get("vsix_sha256"), str)
+    ]
+    if not built:
+        return None
+    installed = {entry.get("version") for entry in entries if entry.get("kind") == "installed"}
+    confirmed = [entry for entry in built if entry["version"] in installed]
+    chosen = (confirmed or built)[-1]
+    recorded_sha256: str = chosen["vsix_sha256"]
+
+    # A built line carries no vsix path: take one an earlier pointer recorded
+    # for these bytes, else the new vsix's sibling named for that version.
+    candidates: list[Path] = []
+    for entry in reversed(entries):
+        pointer = entry.get("previous_vsix")
+        if (
+            isinstance(pointer, dict)
+            and pointer.get("sha256") == recorded_sha256
+            and isinstance(pointer.get("path"), str)
+        ):
+            candidates.append(repo_root / pointer["path"])
+    if version in vsix_path.name:
+        # The ledger is tracked input: a version holding a path separator
+        # must not steer the sibling name anywhere else.
+        sibling_name = vsix_path.name.replace(version, chosen["version"])
+        if (
+            sibling_name not in ("", ".", "..")
+            and "/" not in sibling_name
+            and "\\" not in sibling_name
+            and sibling_name == Path(sibling_name).name
+        ):
+            candidates.append(vsix_path.with_name(sibling_name))
+
+    for candidate in candidates:
+        if not candidate.is_file():
+            continue
+        try:
+            relative = _relative_to_repo_root(candidate, repo_root)
+        except ReceiptRefused:
+            continue
+        if _sha256_file(candidate) != recorded_sha256:
+            continue
+        return {"path": relative, "sha256": recorded_sha256}
+    return None
+
+
 def _cmd_record(args: argparse.Namespace) -> int:
     repo_root = Path(args.repo_root).resolve()
     try:
@@ -145,7 +201,8 @@ def _cmd_record(args: argparse.Namespace) -> int:
             }
 
         ledger_path = _resolve_ledger_path(repo_root, args.ledger)
-        for entry in load_ledger(ledger_path):
+        entries = load_ledger(ledger_path)
+        for entry in entries:
             if entry.get("kind") == "built" and entry.get("version") == args.version:
                 if entry.get("vsix_sha256") == vsix_sha256:
                     return 0
@@ -153,6 +210,9 @@ def _cmd_record(args: argparse.Namespace) -> int:
                     f"built receipt for version {args.version!r} already exists "
                     "with a different vsix_sha256"
                 )
+
+        if previous_vsix is None:
+            previous_vsix = _derive_previous_vsix(entries, args.version, vsix_path, repo_root)
 
         release_commit = _git_rev_parse_head(repo_root)
     except ReceiptRefused as exc:

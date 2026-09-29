@@ -741,3 +741,186 @@ def test_confirm_uses_repo_root_argument_not_cwd(
     installed = [e for e in rr.load_ledger(ledger) if e["kind"] == "installed"]
     assert len(installed) == 1
     assert not (other_cwd / ".aiworkhub").exists()
+
+
+def _write_ledger(ledger: Path, lines: list[dict[str, object]]) -> None:
+    ledger.write_text("".join(json.dumps(line) + "\n" for line in lines), encoding="utf-8")
+
+
+def _record_argv(vsix: Path, ledger: Path, repo_dir: Path) -> list[str]:
+    return [
+        "record",
+        "--version",
+        "1.2.3",
+        "--vsix",
+        str(vsix),
+        "--ledger",
+        str(ledger),
+        "--repo-root",
+        str(repo_dir),
+    ]
+
+
+def test_record_keeps_rollback_pointer_after_an_installed_line(repo: Path) -> None:
+    # NF-2026-01130: the ledger ends with an installed confirmation, not a
+    # built line, and the previous release must still be named.
+    previous = _make_vsix(repo / "dist" / "aiworkhub-1.2.2.vsix", b"previous-bytes")
+    vsix = _make_vsix(repo / "dist" / "aiworkhub-1.2.3.vsix")
+    ledger = _ledger(repo)
+    previous_sha256 = rr._sha256_file(previous)
+    _write_ledger(
+        ledger,
+        [
+            {"kind": "built", "version": "1.2.2", "vsix_sha256": previous_sha256},
+            {"kind": "installed", "version": "1.2.2", "server_version": "1.2.2"},
+        ],
+    )
+
+    assert rr.main(_record_argv(vsix, ledger, repo)) == 0
+
+    entry = rr.load_ledger(ledger)[-1]
+    assert entry["kind"] == "built"
+    assert entry["version"] == "1.2.3"
+    assert entry["previous_vsix"] == {
+        "path": "dist/aiworkhub-1.2.2.vsix",
+        "sha256": previous_sha256,
+    }
+    assert set(entry) == {
+        "kind",
+        "version",
+        "release_commit",
+        "vsix_sha256",
+        "built_at",
+        "previous_vsix",
+        "target",
+    }
+
+
+def test_record_prefers_the_installed_previous_release(repo: Path) -> None:
+    confirmed = _make_vsix(repo / "dist" / "aiworkhub-1.2.1.vsix", b"confirmed-bytes")
+    unconfirmed = _make_vsix(repo / "dist" / "aiworkhub-1.2.2.vsix", b"unconfirmed-bytes")
+    vsix = _make_vsix(repo / "dist" / "aiworkhub-1.2.3.vsix")
+    ledger = _ledger(repo)
+    _write_ledger(
+        ledger,
+        [
+            {"kind": "built", "version": "1.2.1", "vsix_sha256": rr._sha256_file(confirmed)},
+            {"kind": "installed", "version": "1.2.1", "server_version": "1.2.1"},
+            {"kind": "built", "version": "1.2.2", "vsix_sha256": rr._sha256_file(unconfirmed)},
+        ],
+    )
+
+    assert rr.main(_record_argv(vsix, ledger, repo)) == 0
+
+    assert rr.load_ledger(ledger)[-1]["previous_vsix"] == {
+        "path": "dist/aiworkhub-1.2.1.vsix",
+        "sha256": rr._sha256_file(confirmed),
+    }
+
+
+def test_record_falls_back_to_the_newest_built_release(repo: Path) -> None:
+    previous = _make_vsix(repo / "dist" / "aiworkhub-1.2.2.vsix", b"previous-bytes")
+    vsix = _make_vsix(repo / "dist" / "aiworkhub-1.2.3.vsix")
+    ledger = _ledger(repo)
+    _write_ledger(
+        ledger,
+        [{"kind": "built", "version": "1.2.2", "vsix_sha256": rr._sha256_file(previous)}],
+    )
+
+    assert rr.main(_record_argv(vsix, ledger, repo)) == 0
+
+    assert rr.load_ledger(ledger)[-1]["previous_vsix"] == {
+        "path": "dist/aiworkhub-1.2.2.vsix",
+        "sha256": rr._sha256_file(previous),
+    }
+
+
+def test_record_uses_the_path_an_earlier_pointer_recorded(repo: Path) -> None:
+    previous = _make_vsix(repo / "archive" / "old-release.vsix", b"previous-bytes")
+    vsix = _make_vsix(repo / "dist" / "aiworkhub-1.2.3.vsix")
+    ledger = _ledger(repo)
+    previous_sha256 = rr._sha256_file(previous)
+    _write_ledger(
+        ledger,
+        [
+            {"kind": "built", "version": "1.2.2", "vsix_sha256": previous_sha256},
+            {
+                "kind": "built",
+                "version": "1.2.2-hotfix",
+                "vsix_sha256": "0" * 64,
+                "previous_vsix": {"path": "archive/old-release.vsix", "sha256": previous_sha256},
+            },
+            {"kind": "installed", "version": "1.2.2", "server_version": "1.2.2"},
+        ],
+    )
+
+    assert rr.main(_record_argv(vsix, ledger, repo)) == 0
+
+    assert rr.load_ledger(ledger)[-1]["previous_vsix"] == {
+        "path": "archive/old-release.vsix",
+        "sha256": previous_sha256,
+    }
+
+
+def test_record_emits_null_previous_when_the_previous_file_is_gone(repo: Path) -> None:
+    vsix = _make_vsix(repo / "dist" / "aiworkhub-1.2.3.vsix")
+    ledger = _ledger(repo)
+    _write_ledger(
+        ledger,
+        [
+            {"kind": "built", "version": "1.2.2", "vsix_sha256": "a" * 64},
+            {"kind": "installed", "version": "1.2.2", "server_version": "1.2.2"},
+        ],
+    )
+
+    assert rr.main(_record_argv(vsix, ledger, repo)) == 0
+
+    assert rr.load_ledger(ledger)[-1]["previous_vsix"] is None
+
+
+def test_record_emits_null_previous_when_the_previous_bytes_changed(repo: Path) -> None:
+    _make_vsix(repo / "dist" / "aiworkhub-1.2.2.vsix", b"rebuilt-bytes")
+    vsix = _make_vsix(repo / "dist" / "aiworkhub-1.2.3.vsix")
+    ledger = _ledger(repo)
+    _write_ledger(
+        ledger,
+        [
+            {"kind": "built", "version": "1.2.2", "vsix_sha256": "a" * 64},
+            {"kind": "installed", "version": "1.2.2", "server_version": "1.2.2"},
+        ],
+    )
+
+    assert rr.main(_record_argv(vsix, ledger, repo)) == 0
+
+    assert rr.load_ledger(ledger)[-1]["previous_vsix"] is None
+
+
+def test_record_ignores_a_ledger_version_holding_a_path_separator(repo: Path) -> None:
+    vsix = _make_vsix(repo / "dist" / "aiworkhub-1.2.3.vsix")
+    ledger = _ledger(repo)
+    _write_ledger(
+        ledger,
+        [
+            {"kind": "built", "version": "0.1/../evil", "vsix_sha256": "a" * 64},
+            {"kind": "installed", "version": "0.1/../evil", "server_version": "0.1"},
+        ],
+    )
+
+    assert rr.main(_record_argv(vsix, ledger, repo)) == 0
+
+    assert rr.load_ledger(ledger)[-1]["previous_vsix"] is None
+
+
+def test_record_ignores_a_ledger_version_that_empties_the_sibling_name(
+    repo: Path,
+) -> None:
+    vsix = _make_vsix(repo / "dist" / "1.2.3")
+    ledger = _ledger(repo)
+    _write_ledger(
+        ledger,
+        [{"kind": "built", "version": "", "vsix_sha256": "a" * 64}],
+    )
+
+    assert rr.main(_record_argv(vsix, ledger, repo)) == 0
+
+    assert rr.load_ledger(ledger)[-1]["previous_vsix"] is None
