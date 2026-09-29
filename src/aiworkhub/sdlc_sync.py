@@ -63,6 +63,9 @@ MAX_TASKS_PER_PASS = 64
 MAX_REPORTED_TASKS = 64
 DECISION_EVENTS = frozenset({"accept_review", "reject_review"})
 ACCEPT_EVENT = "accept_review"
+REVIEWER_TOPIC = "quality_review"
+REVIEWER_TASK_PREFIX = "QUALITY_REVIEW_"
+UNACCEPTED_TERMINAL_STATUSES = frozenset({"superseded", "archived", "withdrawn"})
 REQUEST_PREFIX = "sdlc_sync"
 TASK_EVENTS_CURSOR = "task_events"
 LAST_DECISION_CURSOR = "last_decision"
@@ -342,14 +345,43 @@ def _read_window(root: Path, after: int) -> dict[str, Any]:
             last = int(event_id)
         for task_id, entry in tasks.items():
             row = conn.execute(
-                "SELECT card_json FROM tasks WHERE task_id=?", (task_id,)
+                "SELECT card_json, status FROM tasks WHERE task_id=?", (task_id,)
             ).fetchone()
             if row is not None and len(row[0] or "") <= sdlc_stage_evidence.MAX_TASK_CARD_CHARS:
                 card = json.loads(row[0] or "{}")
                 entry["card"] = card if isinstance(card, dict) else None
+                entry["status"] = str(row[1] or "")
     finally:
         conn.close()
     return {"ready": True, "tasks": tasks, "last": last}
+
+
+def _skip_reason(task_id: str, entry: dict[str, Any]) -> str | None:
+    """Why a window task is not SDLC work and opens no case, or None when it is.
+
+    A quality-reviewer card is recognised by the binding the reviewer launcher
+    writes (``quality_review.target_task_id``), its topic, or -- only as a
+    fallback -- its task-id prefix. A superseded/archived/withdrawn task is
+    skipped unless it was ever accepted, so an accepted-then-archived task
+    keeps its case.
+    """
+
+    card = entry.get("card") or {}
+    binding = card.get("quality_review")
+    if (
+        (isinstance(binding, dict) and binding.get("target_task_id"))
+        or card.get("topic") == REVIEWER_TOPIC
+        or task_id.startswith(REVIEWER_TASK_PREFIX)
+    ):
+        return "reviewer_card"
+    status = entry.get("status") or str(card.get("status") or "")
+    if (
+        status in UNACCEPTED_TERMINAL_STATUSES
+        and ACCEPT_EVENT not in entry.get("events", ())
+        and not card.get("accepted_at")
+    ):
+        return f"never_accepted:{status}"
+    return None
 
 
 def _ensure_case(root: Path, repository_id: str, task_id: str) -> tuple[str, bool]:
@@ -526,10 +558,17 @@ def sync_once(repo_root: Path, repository_id: str) -> dict[str, Any]:
         window.update(_read_window(root, after))
         if not window.get("ready", True):
             return {"summary": {"state": "skipped", "reason": window["reason"]}}
-        created, refused = 0, {}
+        created, refused, skipped = 0, {}, {}
         for task_id, entry in window["tasks"].items():
             if entry["card"] is None:
                 refused[task_id] = "task_card_unavailable"
+                continue
+            # Reviewer cards and never-accepted withdrawn tasks are not SDLC
+            # work: no case is opened, an existing one is left untouched, and
+            # the cursor still moves past them.
+            skip = _skip_reason(task_id, entry)
+            if skip:
+                skipped[skip] = skipped.get(skip, 0) + 1
                 continue
             try:
                 case_id, was_created = _ensure_case(root, repository_id, task_id)
@@ -540,6 +579,7 @@ def sync_once(repo_root: Path, repository_id: str) -> dict[str, Any]:
             created += int(was_created)
         return {"summary": {
             "state": "ok", "scanned": len(window["tasks"]), "created": created, "refused": refused,
+            "skipped": skipped,
         }}
 
     window_transient: set[str] = set()

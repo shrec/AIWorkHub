@@ -846,3 +846,101 @@ def test_sweep_state_db_is_opened_through_the_wal_writer(repo, monkeypatch):
         assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
     finally:
         conn.close()
+
+
+def _update_task(root: Path, task_id: str, *, status: str | None = None, **card_fields) -> None:
+    conn = sqlite3.connect(str(task_store.canonical_db_path(root)))
+    try:
+        card = json.loads(
+            conn.execute("SELECT card_json FROM tasks WHERE task_id=?", (task_id,)).fetchone()[0]
+        )
+        card.update(card_fields)
+        conn.execute(
+            "UPDATE tasks SET card_json=?, status=coalesce(?, status) WHERE task_id=?",
+            (json.dumps(card), status, task_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_reviewer_cards_get_no_case_and_are_counted_as_skipped(repo, spies):
+    # NF-2026-01133: the reviewer launcher's binding, the reviewer topic and the
+    # legacy task-id prefix each mark a card that is not SDLC work.
+    _create_task(repo.root, "T-REVIEWER-BOUND")
+    _update_task(repo.root, "T-REVIEWER-BOUND", quality_review={"target_task_id": TASK_ID})
+    _create_task(repo.root, "T-REVIEWER-TOPIC")
+    _update_task(repo.root, "T-REVIEWER-TOPIC", topic="quality_review")
+    _create_task(repo.root, "QUALITY_REVIEW_T-SYNC")
+    _create_task(repo.root, TASK_ID)
+
+    result = sdlc_sync.sync_once(repo.root, repo.repo_id)
+
+    assert result["failures"] == []
+    cases = result["parts"]["cases"]
+    assert cases["scanned"] == 4 and cases["created"] == 1
+    assert cases["skipped"] == {"reviewer_card": 3}
+    assert cases["refused"] == {}
+    assert set(result["stages"]) == {TASK_ID}
+    for reviewer in ("T-REVIEWER-BOUND", "T-REVIEWER-TOPIC", "QUALITY_REVIEW_T-SYNC"):
+        assert sdlc_case_store.case_for_task(repo.root, repo.repo_id, reviewer)["state"] != "bound"
+    assert _row_counts(repo.root)["cases"] == 1
+    # The cursor advanced past the skipped cards: the next pass reads nothing.
+    assert result["parts"]["cursor"]["state"] == "advanced"
+    assert sdlc_sync.sync_once(repo.root, repo.repo_id)["parts"]["cases"]["scanned"] == 0
+
+
+@pytest.mark.parametrize("status", ["superseded", "archived", "withdrawn"])
+def test_a_never_accepted_withdrawn_task_gets_no_new_case(repo, spies, status):
+    _create_task(repo.root, TASK_ID)
+    _update_task(repo.root, TASK_ID, status=status)
+    _append_task_event(repo.root, TASK_ID, status)
+
+    result = sdlc_sync.sync_once(repo.root, repo.repo_id)
+
+    assert result["failures"] == []
+    assert result["parts"]["cases"]["created"] == 0
+    assert result["parts"]["cases"]["skipped"] == {f"never_accepted:{status}": 1}
+    assert result["parts"]["cases"]["refused"] == {}
+    assert TASK_ID not in result["stages"] and TASK_ID not in result["refusals"]
+    assert sdlc_case_store.case_for_task(repo.root, repo.repo_id, TASK_ID)["state"] != "bound"
+    assert result["parts"]["cursor"]["state"] == "advanced"
+    assert sdlc_sync.sync_once(repo.root, repo.repo_id)["parts"]["cases"]["scanned"] == 0
+
+
+def test_an_existing_case_is_left_untouched_when_the_task_is_later_superseded(repo, spies):
+    _create_task(repo.root, TASK_ID)
+    first = sdlc_sync.sync_once(repo.root, repo.repo_id)
+    assert first["parts"]["cases"]["created"] == 1
+    counts = _row_counts(repo.root)
+
+    _update_task(repo.root, TASK_ID, status="superseded")
+    _append_task_event(repo.root, TASK_ID, "superseded")
+    second = sdlc_sync.sync_once(repo.root, repo.repo_id)
+
+    assert second["parts"]["cases"]["skipped"] == {"never_accepted:superseded": 1}
+    assert sdlc_case_store.case_for_task(repo.root, repo.repo_id, TASK_ID)["state"] == "bound"
+    counts.pop("sync_cursor", None)
+    after = _row_counts(repo.root)
+    after.pop("sync_cursor", None)
+    assert after == counts
+
+
+def test_an_accepted_task_that_is_later_archived_still_gets_its_case(repo, spies):
+    _create_task(repo.root, TASK_ID)
+    _seal_and_accept(repo.root, TASK_ID)
+    _update_task(repo.root, TASK_ID, status="archived")
+    _append_task_event(repo.root, TASK_ID, "archived")
+
+    # The accept event is in the window: the case is opened and its stages recorded.
+    result = sdlc_sync.sync_once(repo.root, repo.repo_id)
+    assert result["failures"] == []
+    assert result["parts"]["cases"]["created"] == 1
+    assert result["parts"]["cases"]["skipped"] == {}
+    assert sdlc_case_store.case_for_task(repo.root, repo.repo_id, TASK_ID)["state"] == "bound"
+
+    # A later archive event alone is still accepted work: the card carries accepted_at.
+    _append_task_event(repo.root, TASK_ID, "archived")
+    later = sdlc_sync.sync_once(repo.root, repo.repo_id)
+    assert later["parts"]["cases"]["scanned"] == 1
+    assert later["parts"]["cases"]["skipped"] == {}
