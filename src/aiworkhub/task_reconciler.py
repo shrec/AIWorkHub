@@ -47,7 +47,9 @@ from . import review_lifecycle
 from . import review_orchestrator
 from . import repository_state
 from . import roadmap_store
+from . import runtime_generation
 from . import sdlc_sync
+from ._version import __version__ as SERVER_VERSION
 from .platform_io import (
     DIRECTORY_DESCRIPTOR_BACKEND_NONE,
     chmod_fd,
@@ -117,6 +119,9 @@ AUTHORITY_BACKOFF_FACTOR = 2.0
 AUTHORITY_BACKOFF_MAX_SECONDS = 60.0
 # Held-lock standby retries back off to this cap instead of spinning at the fast retry rate.
 AUTHORITY_STANDBY_MAX_SECONDS = 5.0
+# A server whose installed runtime generation is superseded retakes a free lock
+# only after this many scan intervals, so a fresh server always wins the race.
+SUPERSEDED_FREE_INTERVALS = 3
 
 
 def _utcnow() -> str:
@@ -349,7 +354,12 @@ def write_status(repo: Path | str, payload: dict[str, Any]) -> None:
     """Record the scan outcome durably; never let bookkeeping break the loop."""
 
     target = status_path(repo)
-    record = {"schema_id": "aiworkhub.task_reconciler_status.v1", **payload}
+    record = {
+        "schema_id": "aiworkhub.task_reconciler_status.v1",
+        "runtime_generation": runtime_generation.own_generation(),
+        "server_version": SERVER_VERSION,
+        **payload,
+    }
     tmp: str | None = None
     try:
         target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -840,6 +850,10 @@ class ReconcilerService:
     # Class-level default so the counter exists on any instance, including one
     # built for a test without running __init__.
     _pass_index = 0
+    # Module path whose installed generation is compared with current.json;
+    # None means this module's own location. Tests point it at a fake tree.
+    _runtime_path: Path | None = None
+    _lock_free_since: float | None = None
 
     def __init__(self, repo: Path, *, scan_interval_seconds: float | None = None) -> None:
         self.repo = repo.resolve()
@@ -863,6 +877,46 @@ class ReconcilerService:
     def is_running(self) -> bool:
         return bool(self._thread is not None and self._thread.is_alive())
 
+    def _superseded_reason(self) -> str:
+        """Non-empty only when this server's installed generation is not current."""
+
+        own, current = runtime_generation.generation_pair(self._runtime_path)
+        if own is None or current is None or own == current:
+            return ""
+        return f"superseded_runtime_generation:{own}->{current}"
+
+    def _superseded_hold(self, lock_path: Path) -> bool:
+        """Keep a superseded server off the lock unless it has been free a while.
+
+        A newer server takes the lock as soon as it is free; a superseded one
+        only after SUPERSEDED_FREE_INTERVALS scan intervals of observed
+        freedom, so the reconciler never goes dark when nothing newer runs.
+        """
+
+        reason = self._superseded_reason()
+        if not reason:
+            self._lock_free_since = None
+            return False
+        now = time.monotonic()
+        if lock_is_held(lock_path):
+            self._lock_free_since = None
+        elif self._lock_free_since is None:
+            self._lock_free_since = now
+        elif now - self._lock_free_since >= SUPERSEDED_FREE_INTERVALS * self.scan_interval_seconds:
+            self._lock_free_since = None
+            return False
+        wait_seconds = max(
+            AUTHORITY_RETRY_SECONDS,
+            min(self.scan_interval_seconds / 4.0, AUTHORITY_STANDBY_MAX_SECONDS),
+        )
+        with self._state_lock:
+            self._authority_state = "standby"
+            self._authority_identity = {}
+            self._last_acquisition_error = reason
+            self._acquisition_backoff_seconds = wait_seconds
+        self._stop_event.wait(wait_seconds)
+        return True
+
     def _loop(self) -> None:
         lock_path = self.repo / LOCK_REL_PATH
         # Grows only while the SAME deterministic cause keeps repeating, and is
@@ -871,6 +925,8 @@ class ReconcilerService:
         backoff_seconds = AUTHORITY_RETRY_SECONDS
         standby_seconds = AUTHORITY_RETRY_SECONDS
         while not self._stop_event.is_set():
+            if self._superseded_hold(lock_path):
+                continue
             with self._state_lock:
                 self._authority_state = "acquiring"
                 self._acquisition_attempts = getattr(self, "_acquisition_attempts", 0) + 1
@@ -952,6 +1008,7 @@ class ReconcilerService:
                     granted.get("parent_authority_backend", "")
                 ),
                 "reduced_guarantees": list(granted.get("reduced_guarantees", [])),
+                "runtime_generation": runtime_generation.own_generation(self._runtime_path),
             }
             write_status(self.repo, {
                 "pid": owner["owner_pid"],
@@ -1006,6 +1063,13 @@ class ReconcilerService:
             })
             if on_scan is not None:
                 on_scan(result)
+            # Scan boundary: an owner whose installed generation is no longer
+            # current releases the lock so the newer server's fixes run.
+            yielded = self._superseded_reason()
+            if yielded:
+                with self._state_lock:
+                    self._last_acquisition_error = yielded
+                break
             iterations += 1
             if max_iterations is not None and iterations >= max_iterations:
                 break
@@ -1139,6 +1203,12 @@ def reconciler_health(repo: Path | str) -> dict[str, Any]:
         "durable_scan_age_seconds": round(age, 1) if age is not None else None,
         "durable_authority_live": durable_authority_live,
         "durable_last_scan": record,
+        # NF-2026-01124: an owner from an older installed generation keeps
+        # running old code; naming both generations makes that visible.
+        "owner_runtime_generation": record.get("runtime_generation"),
+        "own_runtime_generation": runtime_generation.own_generation(
+            getattr(service, "_runtime_path", None)
+        ),
     }
     if service is None:
         healthy = (

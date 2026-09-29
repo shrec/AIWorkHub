@@ -126,6 +126,24 @@ def _kill_if_alive(proc: subprocess.Popen) -> None:
             proc.wait(timeout=5)
 
 
+def _skip_if_sandbox_denied(exc: OSError, reason: str) -> None:
+    """Skip only on a contained-lane denial (access denied / symlink privilege
+    not held); the caller re-raises any other OSError unchanged."""
+    if isinstance(exc, PermissionError) or getattr(exc, "winerror", None) in (5, 1314):
+        pytest.skip(f"validation_unsupported_in_sandbox:{reason}:{exc}")
+
+
+def _require_named_pipes() -> None:
+    """Skip when this lane denies the named pipes/unix sockets that
+    ``multiprocessing`` and the finalize path rely on; runs normally elsewhere."""
+    try:
+        from multiprocessing.connection import Listener
+
+        Listener(family="AF_PIPE" if os.name == "nt" else "AF_UNIX").close()
+    except (PermissionError, OSError) as exc:
+        pytest.skip(f"validation_unsupported_in_sandbox:named_pipe_denied:{exc}")
+
+
 # --- worker_supervisor.py heartbeat -----------------------------------------
 
 
@@ -230,7 +248,11 @@ def test_supervisor_status_read_secure_modes_and_symlink_rejection(tmp_path):
     assert process_launcher.read_supervisor_status(real) == payload
 
     symlink = tmp_path / "status_symlink.json"
-    symlink.symlink_to(real)
+    try:
+        symlink.symlink_to(real)
+    except (PermissionError, OSError) as exc:
+        _skip_if_sandbox_denied(exc, "symlink_privilege_not_held")
+        raise
     assert process_launcher.read_supervisor_status(symlink) == {}
 
     insecure = tmp_path / "status_insecure.json"
@@ -473,6 +495,7 @@ def test_supervisor_unresponsive_beyond_grace_is_finalized_as_lost_and_kills_exa
     whose heartbeat lease AND recovery grace have both elapsed is escalated
     to "lost", its exact process group (and its child's) is terminated, and
     the task is routed to review/blocked -- never left pending."""
+    _require_named_pipes()
     card = _card()
     fake_supervisor = _spawn_sleeper()
     fake_child = _spawn_sleeper()
@@ -703,6 +726,7 @@ def test_supervisor_crash_with_surviving_child_is_terminated_and_never_left_pend
     match) while its child is still running -- the orphaned child's exact
     process group is terminated and the task is routed to review, never
     silently left in pending."""
+    _require_named_pipes()
     card = _card()
     fake_child = _spawn_sleeper()
     try:
@@ -756,6 +780,7 @@ def test_successful_exit_reconciled_after_launcher_disappearance_runs_each_step_
     reconciler daemon's one iteration) must finalize it through scope
     validation -> validation commands -> promotion -> ``taskctl review``,
     each exactly once."""
+    _require_named_pipes()
     card = _card()
     card.update({"status": "processing", "worker_status": "in_progress"})
     manager = _build_manager(tmp_path, card)
@@ -1351,7 +1376,11 @@ def test_read_status_rejects_symlink_and_insecure_mode(tmp_path):
     target.parent.mkdir(parents=True)
     foreign = tmp_path / "foreign-status.json"
     foreign.write_text('{"ok": true}', encoding="utf-8")
-    target.symlink_to(foreign)
+    try:
+        target.symlink_to(foreign)
+    except (PermissionError, OSError) as exc:
+        _skip_if_sandbox_denied(exc, "symlink_privilege_not_held")
+        raise
     assert task_reconciler.read_status(tmp_path) == {}
 
     target.unlink()
@@ -1480,6 +1509,7 @@ def test_daemon_writes_lifecycle_transitions_with_writes_enabled(tmp_path, monke
     worktrees: with AIWORKHUB_ALLOW_WRITES=1 set, a scan drives a terminal
     request through to review_ready exactly as task_reconciler.run_scan
     already proves above."""
+    _require_named_pipes()
     monkeypatch.setenv("AIWORKHUB_ALLOW_WRITES", "1")
     card = _card()
     card.update({"status": "processing", "worker_status": "in_progress"})
@@ -2088,7 +2118,11 @@ def test_reconciler_status_rejects_symlink_without_o_nofollow(tmp_path, monkeypa
     _write_status(spoof, {"scan_finished_epoch": time.time(), "ok": True})
     status = task_reconciler.status_path(repo)
     status.parent.mkdir(parents=True, exist_ok=True)
-    status.symlink_to(spoof)
+    try:
+        status.symlink_to(spoof)
+    except (PermissionError, OSError) as exc:
+        _skip_if_sandbox_denied(exc, "symlink_privilege_not_held")
+        raise
     monkeypatch.delattr(task_reconciler.os, "O_NOFOLLOW", raising=False)
 
     assert task_reconciler.read_status(repo) == {}
@@ -2149,6 +2183,7 @@ def _run_contending_cli_daemon(repo: str, entered, release_path: str) -> None:
 
 def test_two_cli_daemons_standby_then_fail_over_without_overlapping_scans(tmp_path):
     """A contended CLI stays alive, then scans only after the owner exits."""
+    _require_named_pipes()
     ctx = multiprocessing.get_context("spawn")
     entered, child_entered = ctx.Pipe(duplex=False)
     release = tmp_path / "release-scan"
