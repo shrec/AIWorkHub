@@ -6657,40 +6657,41 @@ def reject_review(
             )
             pred_workspace = workspace
             pred_changed_hashes = changed_hashes
-            if disposition == "pending":
-                terminal_epoch = (
-                    terminal_review.get("claim_epoch")
-                    if isinstance(terminal_review, dict)
-                    else None
-                )
-                if type(terminal_epoch) is not int or terminal_epoch < 1:
-                    terminal_epoch = card.get("claim_epoch")
-                raw_delta = (
-                    evidence.get("rework_delta")
-                    if isinstance(evidence, dict)
-                    else None
-                )
-                if (
-                    raw_delta is None
-                    and isinstance(terminal_review, dict)
-                    and terminal_review.get("substatus") == "validation_failed"
-                ):
-                    pred_rework_delta = None
-                    delta_error = "rework_delta_descriptor_missing"
-                else:
-                    pred_rework_delta, delta_error = _validated_rework_delta(
-                        raw_delta,
-                        expected_request_id=pred_request_id,
-                        expected_claim_epoch=(
-                            terminal_epoch if type(terminal_epoch) is int else None
-                        ),
-                    )
-                if delta_error:
-                    rework_delta_reuse_error = delta_error
-                    pred_workspace = {}
-                    pred_changed_hashes = {}
-                    pred_rework_delta = None
+            # NF-2026-01112: a blocked rejection pins the sealed delta exactly
+            # as a pending one does.  Otherwise recover_blocked_rework of an
+            # unedited candidate cannot see the delta and fails every
+            # inherited path as required_output_unchanged.
+            terminal_epoch = (
+                terminal_review.get("claim_epoch")
+                if isinstance(terminal_review, dict)
+                else None
+            )
+            if type(terminal_epoch) is not int or terminal_epoch < 1:
+                terminal_epoch = card.get("claim_epoch")
+            raw_delta = (
+                evidence.get("rework_delta")
+                if isinstance(evidence, dict)
+                else None
+            )
+            if (
+                raw_delta is None
+                and isinstance(terminal_review, dict)
+                and terminal_review.get("substatus") == "validation_failed"
+            ):
+                pred_rework_delta = None
+                delta_error = "rework_delta_descriptor_missing"
             else:
+                pred_rework_delta, delta_error = _validated_rework_delta(
+                    raw_delta,
+                    expected_request_id=pred_request_id,
+                    expected_claim_epoch=(
+                        terminal_epoch if type(terminal_epoch) is int else None
+                    ),
+                )
+            if delta_error:
+                rework_delta_reuse_error = delta_error
+                pred_workspace = {}
+                pred_changed_hashes = {}
                 pred_rework_delta = None
         if (
             pred_request_id
@@ -6933,6 +6934,70 @@ def reject_review(
     return result
 
 
+def _validation_replay_predecessor_gate_missing(
+    card: Mapping[str, Any], *, task_id: str
+) -> bool:
+    """Whether a validation-only replay of ``card`` can never find its predecessor gate.
+
+    Mirrors where the launcher looks for the gate: a terminal process event of
+    the predecessor, then that request packet's inherited replay gate.  This
+    checks presence only; the launcher still authenticates the gate on launch.
+    """
+    context = card.get("project_context")
+    context = context if isinstance(context, dict) else {}
+    if str(context.get("task_type") or "") != "code" and context.get("required") is not True:
+        return False
+    predecessor = card.get("rework_predecessor")
+    request_id = (
+        str(predecessor.get("request_id") or "").strip()
+        if isinstance(predecessor, dict)
+        else ""
+    )
+    if not request_id:
+        return False  # task_store refuses the missing predecessor itself
+    from . import process_event_ledger, process_launcher
+
+    process_log = Path(
+        os.environ.get(
+            process_launcher.PROCESS_LOG_ENV,
+            str(repo_root() / process_launcher.PROCESS_LOG_DEFAULT_REL),
+        )
+    )
+    try:
+        for event in process_event_ledger.iter_events(process_log):
+            if (
+                event.get("request_id") == request_id
+                and event.get("task_id") == task_id
+                and event.get("state") in process_launcher.TERMINAL_PROCESS_STATES
+                and isinstance(event.get("worker_mcp_gate"), dict)
+            ):
+                return False
+    except Exception:  # noqa: BLE001 - unreadable process authority has no gate
+        pass
+    process_dir = Path(
+        os.environ.get(
+            process_launcher.PROCESS_DIR_ENV,
+            str(repo_root() / process_launcher.PROCESS_DIR_DEFAULT_REL),
+        )
+    )
+    try:
+        metadata = json.loads(
+            (process_dir / f"{request_id}.request.json").read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError):
+        return True
+    worker_mcp = metadata.get("worker_mcp") if isinstance(metadata, dict) else None
+    inherited = (
+        worker_mcp.get("inherited_predecessor_gate")
+        if isinstance(worker_mcp, dict)
+        else None
+    )
+    return not (
+        isinstance(inherited, dict)
+        and isinstance(inherited.get("worker_mcp_gate"), dict)
+    )
+
+
 def recover_blocked_rework(
     task_id: str,
     *,
@@ -6973,6 +7038,23 @@ def recover_blocked_rework(
     )
     if blocked is not None:
         return blocked
+    if (
+        validation_only_replay
+        and str(card.get("status") or "").strip().lower() == "blocked"
+        and _validation_replay_predecessor_gate_missing(card, task_id=task_id)
+    ):
+        # NF-2026-01112: the launcher refuses such a replay on every launch.
+        # Refuse here instead, so the card stays blocked and can still be
+        # recovered without replay.
+        reason = "validation_only_replay_predecessor_gate_missing"
+        result = _canonical_result(
+            ok=False,
+            returncode=1,
+            stderr=f"recover_blocked_rework_failed:{reason}",
+            command=command,
+        )
+        result["reason"] = reason
+        return result
     try:
         ok, state = task_store.recover_blocked_rework(
             repo_root(),

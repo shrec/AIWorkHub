@@ -18,6 +18,15 @@ import pytest
 from aiworkhub import task_store, worker_workspace
 
 
+def _symlink_or_skip(link: Path, target: Path, *, directory: bool = False) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=directory)
+    except OSError as exc:
+        if getattr(exc, "winerror", None) == 1314:
+            pytest.skip("symlink privilege not held")
+        raise
+
+
 _TERMINAL_REVIEW_EVIDENCE = {
     "validation": [
         {"command": "pytest -q", "returncode": 1, "stdout": "1 failed", "stderr": ""}
@@ -528,7 +537,7 @@ def test_normal_rework_terminal_failure_fallback_fails_closed(
     elif mutation == "symlink":
         target = candidate.with_suffix(".retained")
         candidate.rename(target)
-        candidate.symlink_to(target)
+        _symlink_or_skip(candidate, target)
     elif mutation == "hardlink":
         os.link(candidate, candidate.with_suffix(".retained"))
     elif mutation == "pinned_predecessor":
@@ -3003,6 +3012,12 @@ def test_nf594_timed_out_gc_recovers_from_authenticated_sealed_delta(
     # materializer: nothing is regenerated and the collected worktree stays gone.
     successor = tmp_path / "successor"
     successor.mkdir()
+    # A plain successor dir is not an isolated worktree; pin its base to the
+    # predecessor's so no base-drift rebase runs and only the delta is tested.
+    predecessor_base = recovered["rework_predecessor"]["workspace"]["base_oid"]
+    monkeypatch.setattr(
+        worker_workspace, "_isolated_worktree_base_oid", lambda *_a, **_k: predecessor_base,
+    )
     assert worker_workspace._materialize_rework_predecessor(
         repo, successor, recovered, tuple(recovered["allowed_writes"])
     ) == sorted(_NF919_PATHS)
@@ -3043,11 +3058,11 @@ def test_nf594_gc_sealed_delta_fails_closed_without_task_mutation(
     elif tamper == "artifact_symlink":
         moved = tmp_path / "outside-delta.json"
         artifact.rename(moved)
-        artifact.symlink_to(moved)
+        _symlink_or_skip(artifact, moved)
     elif tamper == "delta_dir_symlink":
         moved = tmp_path / "outside-deltas"
         artifact.parent.rename(moved)
-        artifact.parent.symlink_to(moved, target_is_directory=True)
+        _symlink_or_skip(artifact.parent, moved, directory=True)
     elif tamper.startswith("descriptor_"):
         changed: dict[str, object] | None = dict(descriptor)
         if tamper == "descriptor_repo":
@@ -3087,7 +3102,7 @@ def test_nf594_gc_sealed_delta_fails_closed_without_task_mutation(
             (target / path).write_bytes(data)
         worktree = repo / ".aiworkhub" / "runtime" / "worktrees" / request_id / "worktree"
         worktree.parent.mkdir(parents=True)
-        worktree.symlink_to(target, target_is_directory=True)
+        _symlink_or_skip(worktree, target, directory=True)
     before = _nf919_state(repo, task_id)
 
     assert task_store.recover_blocked_rework(
@@ -3112,3 +3127,181 @@ def test_nf594_clean_root_never_discards_authenticated_sealed_delta(
     ) == (False, "clean_root_rework_sealed_delta_available")
 
     assert _nf919_state(repo, task_id) == before
+
+
+# ---------------------------------------------------------------------------
+# NF-2026-01112: reject->blocked keeps the sealed rework_delta, and an
+# unsatisfiable validation-only replay fails at recover time
+# ---------------------------------------------------------------------------
+
+
+_NF1112_REQUEST = "7" * 32
+_NF1112_PATH = "src/aiworkhub/nf1112.py"
+
+
+@pytest.fixture
+def nf1112_coord(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    from aiworkhub import process_launcher
+
+    repo = (tmp_path / "repo").resolve()
+    repo.mkdir()
+    assert task_store.initialize_repository(repo)["ok"]
+    monkeypatch.setenv("AIWORKHUB_REPO", str(repo))
+    monkeypatch.setenv("AIWORKHUB_ALLOW_WRITES", "1")
+    monkeypatch.delenv(worker_workspace.RUNTIME_ROOT_ENV, raising=False)
+    monkeypatch.delenv(worker_workspace.WORKTREE_ROOT_ENV, raising=False)
+    monkeypatch.setenv(process_launcher.PROCESS_LOG_ENV, str(tmp_path / "processes.jsonl"))
+    monkeypatch.setenv(process_launcher.PROCESS_DIR_ENV, str(tmp_path / "processes"))
+    token = tmp_path / "coordinator.token"
+    fd = os.open(token, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write("coord-token\n")
+    monkeypatch.setenv("BITNN_TASKCTL_COORDINATOR_TOKEN_FILE", str(token))
+    monkeypatch.setenv("BITNN_TASKCTL_COORDINATOR_TOKEN", "coord-token")
+    return repo
+
+
+def _nf1112_insert(repo: Path, task_id: str, *, status: str, card: dict) -> None:
+    now = "2026-09-29T00:00:00+00:00"
+    _readiness, db_path = task_store._require_ready(repo)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO tasks (task_id,runner,topic,mode,status,worker_status,priority,"
+            "objective,card_json,created_at,updated_at,claimed_by) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (task_id, "claude_coding", "coding", "solo", status, status, "normal",
+             "obj", json.dumps(card), now, now, "claude_coding"),
+        )
+
+
+def _nf1112_sealed_review(repo: Path, task_id: str) -> dict[str, object]:
+    """Insert one review card whose terminal evidence carries a sealed delta."""
+    artifact_dir = worker_workspace.configured_runtime_root(repo) / "rework_deltas"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    encoded = b'{"sealed": "nf1112 candidate"}\n'
+    digest = hashlib.sha256(encoded).hexdigest()
+    artifact = artifact_dir / f"{digest}.json"
+    artifact.write_bytes(encoded)
+    descriptor: dict[str, object] = {
+        "schema_id": "aiworkhub.rework_delta_descriptor.v1",
+        "sealed": True,
+        "authority_repo": str(repo.resolve(strict=False)),
+        "task_id": task_id,
+        "request_id": _NF1112_REQUEST,
+        "claim_epoch": 1,
+        "artifact_path": str(artifact),
+        "artifact_sha256": digest,
+    }
+    candidate_hash = hashlib.sha256(b"candidate\n").hexdigest()
+    evidence = {
+        "request_identity": {"request_id": _NF1112_REQUEST, "task_id": task_id},
+        "workspace": {
+            "request_id": _NF1112_REQUEST,
+            "repo": str(repo),
+            "path": str(
+                repo / ".aiworkhub" / "runtime" / "worktrees" / _NF1112_REQUEST / "worktree"
+            ),
+        },
+        "changed_paths": [_NF1112_PATH],
+        "changed_path_hashes": {_NF1112_PATH: candidate_hash},
+        "rework_delta": descriptor,
+    }
+    _nf1112_insert(repo, task_id, status="review", card={
+        "task_id": task_id,
+        "topic": "coding",
+        "claim_epoch": 1,
+        "allowed_writes": [_NF1112_PATH],
+        "terminal_review": {
+            "substatus": "review_ready",
+            "request_id": _NF1112_REQUEST,
+            "claim_epoch": 1,
+            "evidence": evidence,
+        },
+    })
+    return descriptor
+
+
+@pytest.mark.parametrize("disposition", ["blocked", "pending"])
+def test_nf1112_reject_pins_sealed_rework_delta(
+    nf1112_coord: Path, disposition: str,
+) -> None:
+    from aiworkhub import core
+
+    task_id = f"NF1112_PIN_{disposition.upper()}"
+    descriptor = _nf1112_sealed_review(nf1112_coord, task_id)
+
+    result = core.reject_review(task_id, "replay the sealed candidate", to=disposition)
+
+    assert result["ok"] is True, result
+    assert "rework_delta_recovery" not in result
+    card = _get_card(nf1112_coord, task_id)
+    assert card["status"] == disposition
+    predecessor = card["rework_predecessor"]
+    assert predecessor["request_id"] == _NF1112_REQUEST
+    assert predecessor["task_id"] == task_id
+    assert predecessor["claim_epoch"] == 1
+    assert predecessor["rework_delta"] == descriptor
+    assert predecessor["delta_artifact"] == {
+        "path": descriptor["artifact_path"],
+        "digest": descriptor["artifact_sha256"],
+    }
+
+
+@pytest.mark.parametrize("disposition", ["blocked", "pending"])
+def test_nf1112_reject_discards_tampered_rework_delta(
+    nf1112_coord: Path, disposition: str,
+) -> None:
+    from aiworkhub import core
+
+    task_id = f"NF1112_TAMPERED_{disposition.upper()}"
+    descriptor = _nf1112_sealed_review(nf1112_coord, task_id)
+    Path(str(descriptor["artifact_path"])).write_bytes(b"tampered\n")
+
+    result = core.reject_review(task_id, "replay the sealed candidate", to=disposition)
+
+    assert result["ok"] is True, result
+    assert result["rework_delta_recovery"]["reason"] == (
+        "rework_delta_descriptor_tampered"
+    )
+    card = _get_card(nf1112_coord, task_id)
+    assert card["status"] == disposition
+    assert "rework_predecessor" not in card
+
+
+def test_nf1112_validation_only_replay_refused_without_predecessor_gate(
+    nf1112_coord: Path,
+) -> None:
+    from aiworkhub import core
+
+    task_id = "NF1112_REPLAY_NO_GATE"
+    _nf1112_insert(nf1112_coord, task_id, status="blocked", card={
+        "task_id": task_id,
+        "topic": "coding",
+        "status": "blocked",
+        "worker_status": "blocked",
+        "claim_epoch": 2,
+        "project_context": {"task_type": "code", "required": True},
+        "rework_predecessor": {
+            "schema_id": "aiworkhub.rework_predecessor.v1",
+            "request_id": _NF1112_REQUEST,
+            "changed_path_hashes": {
+                _NF1112_PATH: hashlib.sha256(b"candidate\n").hexdigest(),
+            },
+        },
+    })
+    before = _nf919_state(nf1112_coord, task_id)
+
+    result = core.recover_blocked_rework(
+        task_id, feedback_reason="replay validation", validation_only_replay=True,
+    )
+
+    assert result["ok"] is False, result
+    assert result["reason"] == "validation_only_replay_predecessor_gate_missing"
+    assert _nf919_state(nf1112_coord, task_id) == before
+    assert _get_card(nf1112_coord, task_id)["status"] == "blocked"
+
+    # Recovery without replay is not refused by the gate check.
+    ordinary = core.recover_blocked_rework(task_id, feedback_reason="rework it")
+    assert "validation_only_replay_predecessor_gate_missing" not in str(
+        ordinary.get("stderr") or ""
+    )
