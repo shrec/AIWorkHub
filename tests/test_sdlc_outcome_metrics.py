@@ -92,16 +92,20 @@ def test_read_repository_metrics_reads_real_hash_paths_readonly(
     try:
         nf_conn.execute(
             "CREATE TABLE needfix("
-            "id TEXT, caused_by_json TEXT, created_at TEXT)"
+            "id TEXT, caused_by_json TEXT, converted_task_id TEXT, created_at TEXT)"
         )
-        nf_conn.execute(
-            "INSERT INTO needfix(id, caused_by_json, created_at) "
-            "VALUES (?, ?, ?)",
-            (
-                "NF-1",
-                json.dumps(_cause("T1", "R1", "a" * 64)),
-                "2026-01-01T00:00:01Z",
-            ),
+        nf_conn.executemany(
+            "INSERT INTO needfix(id, caused_by_json, converted_task_id, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            [
+                (
+                    "NF-1",
+                    json.dumps(_cause("T1", "R1", "a" * 64)),
+                    "FIX-1",
+                    "2026-01-01T00:00:01Z",
+                ),
+                ("NF-2", None, None, "2026-01-01T00:00:02Z"),
+            ],
         )
         nf_conn.commit()
     finally:
@@ -119,7 +123,9 @@ def test_read_repository_metrics_reads_real_hash_paths_readonly(
     assert result["first_pass_acceptance"]["numerator"] == 1
     assert result["first_pass_acceptance"]["denominator"] == 1
     assert result["escaped_defect_attribution"]["numerator"] == 1
+    assert result["escaped_defect_attribution"]["denominator"] == 1
     assert result["escaped_defect_attribution"]["unknown_unattributed"] == 0
+    assert result["escaped_defect_attribution"]["excluded_unconverted"] == 1
     assert (
         result["population_bounds"]["canonical_events_after_deduplication"] == 1
     )
@@ -137,9 +143,14 @@ def test_mixed_population_reports_coverage_and_unknown_without_guessing():
         _accepted(3, "T2", "R2", "c" * 64),
     ]
     rows = [
-        {"id": "NF-1", "caused_by": _cause("T1", "R1", "a" * 64)},
-        {"id": "NF-2", "caused_by": None},
-        {"id": "NF-3", "caused_by": _cause("T1", "stale", "a" * 64)},
+        {"id": "NF-1", "converted_task_id": "FIX-1", "caused_by": _cause("T1", "R1", "a" * 64)},
+        {"id": "NF-2", "converted_task_id": "FIX-2", "caused_by": None},
+        {
+            "id": "NF-3",
+            "converted_task_id": "FIX-3",
+            "caused_by": _cause("T1", "stale", "a" * 64),
+        },
+        {"id": "NF-4", "caused_by": _cause("T1", "R1", "a" * 64)},
     ]
     result = sdlc_outcome_metrics.aggregate(
         events, rows, repository_id="repo-one", limit=100
@@ -148,14 +159,16 @@ def test_mixed_population_reports_coverage_and_unknown_without_guessing():
         "numerator": 1, "denominator": 2, "evidence_covered": 2, "evidence_total": 2
     }
     assert result["review_rounds_per_accepted_task"]["numerator"] == 3
+    # NF-3 is a well-formed identity the store verified, even though no scanned
+    # acceptance event carries it; NF-4 was never converted and is not attributable.
     assert result["escaped_defect_attribution"] == {
-        "numerator": 1,
+        "numerator": 2,
         "denominator": 3,
-        "evidence_covered": 1,
+        "evidence_covered": 2,
         "evidence_total": 3,
-        "unknown_unattributed": 2,
-        "outside_event_bound_unknown": 0,
-        "task_event_population_complete": True,
+        "unknown_unattributed": 1,
+        "excluded_unconverted": 1,
+        "outside_event_window": 1,
     }
     assert result["population_bounds"]["canonical_events_after_deduplication"] == 3
 
@@ -165,7 +178,7 @@ def test_cross_repository_identity_is_unknown():
     cause = _cause("T1", "R1", "a" * 64)
     cause["repository_id"] = "other-repo"
     result = sdlc_outcome_metrics.aggregate(
-        events, [{"caused_by": cause}], repository_id="repo-one"
+        events, [{"converted_task_id": "FIX-1", "caused_by": cause}], repository_id="repo-one"
     )
     assert result["escaped_defect_attribution"]["numerator"] == 0
     assert result["escaped_defect_attribution"]["unknown_unattributed"] == 1
@@ -175,7 +188,7 @@ def test_malformed_stored_identity_with_extra_fields_is_unknown():
     events = [_accepted(1, "T1", "R1", "a" * 64)]
     cause = {**_cause("T1", "R1", "a" * 64), "unverified": True}
     result = sdlc_outcome_metrics.aggregate(
-        events, [{"caused_by": cause}], repository_id="repo-one"
+        events, [{"converted_task_id": "FIX-1", "caused_by": cause}], repository_id="repo-one"
     )
     assert result["escaped_defect_attribution"]["numerator"] == 0
     assert result["escaped_defect_attribution"]["unknown_unattributed"] == 1
@@ -193,30 +206,121 @@ def test_population_is_bounded_and_never_emits_a_percentage():
     assert "percentage" not in str(result).lower()
 
 
-def test_truncated_event_population_does_not_claim_unattributed_certainty():
+def test_verified_cause_outside_the_event_window_is_attributed():
+    # NF-2026-01134: the store verified caused_by when it was written, so the bounded
+    # task-event window cannot demote it to unknown.
     cross_repository = _cause("old", "old-request", "b" * 64)
     cross_repository["repository_id"] = "other-repo"
+    events = [
+        _accepted(3, "new", "new-request", "a" * 64),
+        _accepted(2, "newer", "newer-request", "c" * 64),
+        _accepted(1, "old", "old-request", "b" * 64),
+    ]
     result = sdlc_outcome_metrics.aggregate(
+        events,
         [
-            _accepted(3, "new", "new-request", "a" * 64),
-            _accepted(2, "newer", "newer-request", "c" * 64),
-            _accepted(1, "old", "old-request", "b" * 64),
-        ],
-        [
-            {"caused_by": _cause("old", "old-request", "b" * 64)},
-            {"caused_by": cross_repository},
+            {"converted_task_id": "FIX-1", "caused_by": _cause("old", "old-request", "b" * 64)},
+            {"converted_task_id": "FIX-2", "caused_by": cross_repository},
         ],
         repository_id="repo-one",
         limit=2,
     )
-    attribution = result["escaped_defect_attribution"]
     assert result["first_pass_acceptance"]["evidence_covered"] == 0
     assert result["review_rounds_per_accepted_task"]["evidence_covered"] == 0
-    assert attribution["numerator"] == 0
-    assert attribution["evidence_covered"] == 0
-    assert attribution["unknown_unattributed"] == 2
-    assert attribution["outside_event_bound_unknown"] == 1
-    assert attribution["task_event_population_complete"] is False
+    assert result["escaped_defect_attribution"] == {
+        "numerator": 1,
+        "denominator": 2,
+        "evidence_covered": 1,
+        "evidence_total": 2,
+        "unknown_unattributed": 1,
+        "excluded_unconverted": 0,
+        "outside_event_window": 1,
+    }
+    in_window = sdlc_outcome_metrics.aggregate(
+        events,
+        [{"converted_task_id": "FIX-3", "caused_by": _cause("new", "new-request", "a" * 64)}],
+        repository_id="repo-one",
+        limit=2,
+    )
+    assert in_window["escaped_defect_attribution"] == {
+        "numerator": 1,
+        "denominator": 1,
+        "evidence_covered": 1,
+        "evidence_total": 1,
+        "unknown_unattributed": 0,
+        "excluded_unconverted": 0,
+        "outside_event_window": 0,
+    }
+
+
+def test_verified_cause_with_no_task_events_at_all_is_attributed():
+    result = sdlc_outcome_metrics.aggregate(
+        [], [{"converted_task_id": "FIX-1", "caused_by": _cause("T1", "R1", "a" * 64)}],
+        repository_id="repo-one",
+    )
+    attribution = result["escaped_defect_attribution"]
+    assert (attribution["numerator"], attribution["denominator"]) == (1, 1)
+    assert attribution["outside_event_window"] == 1
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda cause: {**cause, "repository_id": "other-repo"},
+        lambda cause: {**cause, "unverified": True},
+        lambda cause: {k: v for k, v in cause.items() if k != "request_id"},
+        lambda cause: {**cause, "schema_id": "other"},
+        lambda cause: {**cause, "accepted_outcome_receipt": {"receipt_id": "sha256:x"}},
+        lambda cause: "not-a-mapping",
+        lambda cause: None,
+    ],
+)
+def test_malformed_or_foreign_cause_stays_unknown_without_any_event_window(mutate):
+    result = sdlc_outcome_metrics.aggregate(
+        [],
+        [{"converted_task_id": "FIX-1", "caused_by": mutate(_cause("T1", "R1", "a" * 64))}],
+        repository_id="repo-one",
+    )
+    assert result["escaped_defect_attribution"] == {
+        "numerator": 0,
+        "denominator": 1,
+        "evidence_covered": 0,
+        "evidence_total": 1,
+        "unknown_unattributed": 1,
+        "excluded_unconverted": 0,
+        "outside_event_window": 0,
+    }
+
+
+def test_unconverted_needfix_rows_are_excluded_from_the_denominator():
+    verified = _cause("T1", "R1", "a" * 64)
+    rows = [
+        {"id": "NF-1", "converted_task_id": "FIX-1", "caused_by": verified},
+        {"id": "NF-2", "converted_task_id": None, "caused_by": verified},
+        {"id": "NF-3", "converted_task_id": "  ", "caused_by": None},
+        {"id": "NF-4", "caused_by": None},
+        {"id": "NF-5", "converted_task_id": "FIX-5", "caused_by": None},
+    ]
+    events = [_accepted(1, "T1", "R1", "a" * 64)]
+    result = sdlc_outcome_metrics.aggregate(events, rows, repository_id="repo-one")
+    assert result["escaped_defect_attribution"] == {
+        "numerator": 1,
+        "denominator": 2,
+        "evidence_covered": 1,
+        "evidence_total": 2,
+        "unknown_unattributed": 1,
+        "excluded_unconverted": 3,
+        "outside_event_window": 0,
+    }
+    # The other metrics do not depend on the NeedFix population at all.
+    baseline = sdlc_outcome_metrics.aggregate(events, [], repository_id="repo-one")
+    for name in (
+        "first_pass_acceptance",
+        "review_rounds_per_accepted_task",
+        "reasoning_context_outcome_comparison",
+        "decided_task_cohort",
+    ):
+        assert result[name] == baseline[name]
 
 
 def test_identity_parses_real_task_engine_acceptance_event(monkeypatch, tmp_path):
@@ -336,13 +440,18 @@ def _seed_needfix(repo_root, causes):
     needfix_db.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(needfix_db))
     try:
-        conn.execute("CREATE TABLE needfix(id TEXT, caused_by_json TEXT, created_at TEXT)")
+        conn.execute(
+            "CREATE TABLE needfix("
+            "id TEXT, caused_by_json TEXT, converted_task_id TEXT, created_at TEXT)"
+        )
         conn.executemany(
-            "INSERT INTO needfix(id, caused_by_json, created_at) VALUES (?, ?, ?)",
+            "INSERT INTO needfix(id, caused_by_json, converted_task_id, created_at) "
+            "VALUES (?, ?, ?, ?)",
             [
                 (
                     f"NF-{index}",
                     json.dumps(cause) if cause else None,
+                    f"TASK-NF-{index}",
                     f"2026-09-20T00:00:{index:02d}Z",
                 )
                 for index, cause in enumerate(causes)
@@ -467,14 +576,15 @@ def test_recent_complete_cohort_is_covered_despite_more_events_than_the_cap(
     assert result["review_rounds_per_accepted_task"] == {
         "numerator": 3, "denominator": 2, "evidence_covered": 2, "evidence_total": 4
     }
+    # T-old's history is cut by the event bound, yet its store-verified cause still counts.
     assert result["escaped_defect_attribution"] == {
-        "numerator": 1,
+        "numerator": 2,
         "denominator": 3,
-        "evidence_covered": 0,
+        "evidence_covered": 2,
         "evidence_total": 3,
-        "unknown_unattributed": 2,
-        "outside_event_bound_unknown": 1,
-        "task_event_population_complete": False,
+        "unknown_unattributed": 1,
+        "excluded_unconverted": 0,
+        "outside_event_window": 1,
     }
 
     # The raw newest-events window cannot vouch for any history, so it still claims none.
@@ -590,7 +700,10 @@ def test_small_store_reads_the_same_metrics_as_the_pure_aggregate(tmp_path, monk
             {"event_id": event_id, "task_id": task_id, "event": event, "payload": payload}
             for event_id, task_id, event, payload in _numbered(events)
         ],
-        [{"id": f"NF-{index}", "caused_by": cause} for index, cause in enumerate(causes)],
+        [
+            {"id": f"NF-{index}", "converted_task_id": f"TASK-NF-{index}", "caused_by": cause}
+            for index, cause in enumerate(causes)
+        ],
         repository_id="repo-one",
         limit=100,
     )

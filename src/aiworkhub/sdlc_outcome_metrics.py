@@ -780,22 +780,24 @@ def aggregate(
         first_pass += int(acceptance.rejections == 0)
         review_rounds += acceptance.rejections + 1
 
+    # Only a NeedFix converted into a task is attributable; the store verified and froze
+    # caused_by at write time, so a canonical identity counts whatever the event window holds.
+    attributable = 0
     attributed = 0
     unknown = 0
-    outside_event_bound = 0
+    excluded_unconverted = 0
+    outside_event_window = 0
     for row in rows:
-        cause = row.get("caused_by")
-        if not isinstance(cause, Mapping):
-            unknown += 1
+        if not str(row.get("converted_task_id") or "").strip():
+            excluded_unconverted += 1
             continue
-        key = _verified_identity_key(cause, repository_id)
+        attributable += 1
+        key = _verified_identity_key(row.get("caused_by"), repository_id)
         if key is None:
             unknown += 1
-        elif key in identities:
-            attributed += 1
-        else:
-            unknown += 1
-            outside_event_bound += int(events_truncated)
+            continue
+        attributed += 1
+        outside_event_window += int(key not in identities)
 
     return {
         "schema_id": SCHEMA_ID,
@@ -831,12 +833,12 @@ def aggregate(
         },
         "escaped_defect_attribution": {
             "numerator": attributed,
-            "denominator": len(rows),
-            "evidence_covered": attributed if not events_truncated else 0,
-            "evidence_total": len(rows),
+            "denominator": attributable,
+            "evidence_covered": attributed,
+            "evidence_total": attributable,
             "unknown_unattributed": unknown,
-            "outside_event_bound_unknown": outside_event_bound,
-            "task_event_population_complete": not events_truncated,
+            "excluded_unconverted": excluded_unconverted,
+            "outside_event_window": outside_event_window,
         },
         "reasoning_context_outcome_comparison": _compare_matched_outcomes(
             selected,
@@ -1050,6 +1052,8 @@ def read_repository_metrics(
                 {
                     "id": row["id"],
                     "severity": row["severity"] if "severity" in row.keys() else None,
+                    "converted_task_id": row["converted_task_id"]
+                    if "converted_task_id" in row.keys() else None,
                     "caused_by": json.loads(row["caused_by_json"])
                     if "caused_by_json" in row.keys() and row["caused_by_json"] else None,
                 }
