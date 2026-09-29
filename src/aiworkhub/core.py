@@ -91,8 +91,6 @@ COORDINATOR_COMMANDS = frozenset(
 # package __init__ (imported above) so existing callers keep working against
 # core.COORDINATOR_TOKEN_ENV unchanged.
 DEFAULT_COORDINATOR_TOKEN_FILE = Path.home() / ".config/aiworkhub/taskctl_coordinator.token"
-_WORKSPACE_GC_JOBS_LOCK = threading.Lock()
-_WORKSPACE_GC_JOBS: set[str] = set()
 _TASK_HYGIENE_LOCK = threading.Lock()
 _TASK_HYGIENE_LAST_RUNS: dict[str, float] = {}
 _TASK_HYGIENE_REPOSITORY_LIMIT = 128
@@ -5608,53 +5606,30 @@ def mark_done(task_id: str, runner: str | None = None, topic: str | None = None)
 
 
 def _reconcile_retained_workspaces(result: dict[str, Any]) -> dict[str, Any]:
-    """Queue best-effort GC outside the lifecycle transition critical path.
+    """Hand post-decision cleanup to the repository janitor.
 
-    The periodic process reconciler remains the durable safety net, but a
-    successful done/reject/archive/supersede should not leave a large isolated
-    checkout on disk until an extension refresh happens.  Import lazily to
-    avoid the module-level ``core <-> process_launcher`` cycle.  Cleanup is
-    fail-closed and can never turn a successful task transition into failure.
+    The janitor (``storage_retention.schedule_repository_cleanup``) is
+    single-flight and repository-locked; a hint arriving while it runs is
+    recorded as one rerun rather than dropped. Its step failures become
+    deduplicated NeedFix items; a scheduling failure is reported in
+    ``workspace_retention`` and never raised past the committed transition.
     """
     if not result.get("ok"):
         return result
-    root = repo_root().resolve()
-    key = str(root)
-    with _WORKSPACE_GC_JOBS_LOCK:
-        if key in _WORKSPACE_GC_JOBS:
-            result["workspace_retention"] = {
-                "ok": True,
-                "queued": True,
-                "coalesced": True,
-                "mode": "async_periodic_sweep",
-            }
-            return result
-        _WORKSPACE_GC_JOBS.add(key)
+    from . import storage_retention  # local import: keep core import-light
 
-    def run_gc() -> None:
-        try:
-            from . import process_launcher  # local import: cycle-safe
-
-            process_launcher.ProcessManager(repo=root)._gc_finalized_workspaces()
-        except Exception:
-            # The durable periodic reconciler retries. A post-commit cleanup
-            # failure must never rewrite the already-returned transition.
-            pass
-        finally:
-            with _WORKSPACE_GC_JOBS_LOCK:
-                _WORKSPACE_GC_JOBS.discard(key)
-
-    threading.Thread(
-        target=run_gc,
-        name=f"aiworkhub-workspace-gc-{abs(hash(key)) & 0xffff:x}",
-        daemon=True,
-    ).start()
-    result["workspace_retention"] = {
-        "ok": True,
-        "queued": True,
-        "coalesced": False,
-        "mode": "async_periodic_sweep",
-    }
+    try:
+        queued = storage_retention.schedule_repository_cleanup(repo_root().resolve())
+    # A post-commit hint must never fail a committed transition.
+    except Exception as exc:  # noqa: BLE001
+        result["workspace_retention"] = {
+            "ok": False,
+            "queued": False,
+            "mode": "janitor",
+            "error": f"{type(exc).__name__}: {exc}"[:300],
+        }
+        return result
+    result["workspace_retention"] = {"ok": True, "queued": queued, "mode": "janitor"}
     return result
 
 

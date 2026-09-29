@@ -128,39 +128,49 @@ def test_public_purge_rejects_tampered_authenticated_deadline(
     assert evidence.read_text(encoding="utf-8") == "restorable"
 
 
-def test_cleanup_telemetry_is_bounded_when_no_candidates(monkeypatch, tmp_path: Path) -> None:
-    protected = [{"reason": f"reason-{index}"} for index in range(50)]
+def _only_batch_lane(monkeypatch, *, keep_logs: bool = False) -> None:
+    """Stub every janitor step except the quarantine-batch half of step 4."""
+    monkeypatch.setattr(storage_retention, "_janitor_worktrees", lambda root: {"gc_scanned": 0})
+    monkeypatch.setattr(
+        storage_retention, "_prune_decided_rework_deltas", lambda root, now: {"removed": 0}
+    )
+    if not keep_logs:
+        monkeypatch.setattr(storage_retention, "_janitor_logs", lambda root: {"ok": True})
     monkeypatch.setattr(
         storage_retention,
-        "preview",
-        lambda *args, **kwargs: {
-            "complete": True,
-            "candidates": [],
-            "protected": protected,
-            "preview_digest": "digest",
-        },
+        "_remove_unattributed_worktrees",
+        lambda root, base, now: {"scanned": 0, "removed": []},
     )
+    monkeypatch.setattr(
+        storage_retention, "_janitor_registrations", lambda root, base: {"pruned": 0}
+    )
+    monkeypatch.setattr(storage_retention, "_janitor_records", lambda root: {"tasks": {}})
+
+
+def test_cleanup_result_reports_every_janitor_step(monkeypatch, tmp_path: Path) -> None:
+    _only_batch_lane(monkeypatch)
     monkeypatch.setattr(storage_retention, "_iter_batch_rows", lambda *args: iter(()))
     monkeypatch.setattr(storage_retention, "_repo_id", lambda root: "repo-test")
-    result = storage_retention.run_repository_cleanup(tmp_path)
-    assert result["scanned"] == 50
-    assert result["protected"] == 50
-    assert len(result["protected_reasons"]) == 20
+    result = storage_retention.run_repository_cleanup(tmp_path, base=tmp_path)
+    assert list(result) == [
+        "ok",
+        "needfix",
+        "next_deadline",
+        "worktrees",
+        "rework_deltas",
+        "logs",
+        "unattributed",
+        "registrations",
+        "records",
+    ]
+    assert result["ok"] is True
+    assert result["needfix"] == []
 
 
 def test_repository_cleanup_runs_terminal_log_retention_in_same_lane(
     monkeypatch, tmp_path: Path
 ) -> None:
-    monkeypatch.setattr(
-        storage_retention,
-        "preview",
-        lambda *args, **kwargs: {
-            "complete": True,
-            "candidates": [],
-            "protected": [],
-            "preview_digest": "digest",
-        },
-    )
+    _only_batch_lane(monkeypatch, keep_logs=True)
     monkeypatch.setattr(storage_retention, "_iter_batch_rows", lambda *args: iter(()))
     monkeypatch.setattr(storage_retention, "_repo_id", lambda root: "repo-test")
     calls: list[Path] = []
@@ -170,32 +180,27 @@ def test_repository_cleanup_runs_terminal_log_retention_in_same_lane(
         lambda root: calls.append(Path(root)) or {"ok": True, "logs_capped": 2},
     )
 
-    result = storage_retention._run_repository_cleanup(tmp_path, now=1.0)
+    result = storage_retention._run_repository_cleanup(tmp_path, base=tmp_path, now=1.0)
 
     assert calls == [tmp_path.resolve()]
-    assert result["terminal_log_cleanup"] == {"ok": True, "logs_capped": 2}
+    assert result["logs"] == {"ok": True, "logs_capped": 2}
 
 
-def test_cleanup_quarantines_candidates(monkeypatch, tmp_path: Path) -> None:
+def test_janitor_never_quarantines(monkeypatch, tmp_path: Path) -> None:
+    # Deletion is direct: the retention preview no longer feeds quarantine().
+    _only_batch_lane(monkeypatch)
+    touched: list[str] = []
     monkeypatch.setattr(
-        storage_retention,
-        "preview",
-        lambda *args, **kwargs: {
-            "complete": True,
-            "candidates": [{"path": "one"}],
-            "protected": [],
-            "preview_digest": "digest",
-        },
+        storage_retention, "preview", lambda *args, **kwargs: touched.append("preview")
     )
     monkeypatch.setattr(
-        storage_retention,
-        "quarantine",
-        lambda *args, **kwargs: {"quarantined": 1, "bytes": 123},
+        storage_retention, "quarantine", lambda *args, **kwargs: touched.append("quarantine")
     )
     monkeypatch.setattr(storage_retention, "_iter_batch_rows", lambda *args: iter(()))
     monkeypatch.setattr(storage_retention, "_repo_id", lambda root: "repo-test")
-    result = storage_retention._run_repository_cleanup(tmp_path, now=1.0)
-    assert (result["quarantined"], result["bytes_moved"]) == (1, 123)
+    result = storage_retention._run_repository_cleanup(tmp_path, base=tmp_path, now=1.0)
+    assert touched == []
+    assert "quarantined" not in result
 
 
 def test_auto_purge_requires_authentication_and_uses_injected_now(
@@ -203,16 +208,7 @@ def test_auto_purge_requires_authentication_and_uses_injected_now(
 ) -> None:
     deadline = "2026-09-05T20:39:12+00:00"
     now = datetime(2026, 9, 6, tzinfo=timezone.utc).timestamp()
-    monkeypatch.setattr(
-        storage_retention,
-        "preview",
-        lambda *args, **kwargs: {
-            "complete": True,
-            "candidates": [],
-            "protected": [],
-            "preview_digest": "digest",
-        },
-    )
+    _only_batch_lane(monkeypatch)
     monkeypatch.setattr(
         storage_retention,
         "_iter_batch_rows",
@@ -220,29 +216,34 @@ def test_auto_purge_requires_authentication_and_uses_injected_now(
             [{"batch_id": "q20260905T203912-49829298592d", "restore_deadline": deadline}]
         ),
     )
-    monkeypatch.setattr(storage_retention, "configured_worktree_root", lambda root: tmp_path)
+    base = tmp_path / "worktrees"
+    base.mkdir()
+    monkeypatch.setattr(storage_retention, "configured_worktree_root", lambda root: base)
     monkeypatch.setattr(storage_retention, "_verified_batch", lambda *args: tmp_path)
     monkeypatch.setattr(storage_retention, "_repo_id", lambda root: "repo-test")
-    manifest = {"restore_deadline": deadline}
+    manifest = {"restore_deadline": deadline, "source": "sweep"}
     monkeypatch.setattr(storage_retention, "_load_manifest", lambda *args: manifest)
-    purged: list[datetime] = []
+    purged: list[tuple[datetime, bool]] = []
     monkeypatch.setattr(
         storage_retention,
         "_purge_batch",
-        lambda *args, **kwargs: purged.append(kwargs["current"]) or {"bytes": 7},
+        lambda *args, **kwargs: (
+            purged.append((kwargs["current"], kwargs["ignore_deadline"])) or {"bytes": 7}
+        ),
     )
 
     monkeypatch.setattr(storage_retention, "_authenticated_manifest", lambda *args: False)
-    assert storage_retention._run_repository_cleanup(tmp_path, now=now)[
-        "expired_batches_purged"
-    ] == 0
+    rejected = storage_retention._run_repository_cleanup(tmp_path, now=now)
+    assert rejected["unattributed"]["batches"]["purged"] == 0
+    assert rejected["unattributed"]["batches"]["skipped"] == 1
     assert purged == []
 
     monkeypatch.setattr(storage_retention, "_authenticated_manifest", lambda *args: True)
     result = storage_retention._run_repository_cleanup(tmp_path, now=now)
-    assert result["expired_batches_purged"] == 1
-    assert result["bytes_freed"] == 7
-    assert purged == [datetime.fromtimestamp(now, timezone.utc)]
+    assert result["unattributed"]["batches"]["purged"] == 1
+    assert result["unattributed"]["batches"]["bytes_freed"] == 7
+    # A "sweep"-sourced manifest was written by the retention sweep: no undo window.
+    assert purged == [(datetime.fromtimestamp(now, timezone.utc), True)]
 
 
 def test_public_purge_rejects_caller_controlled_clock(tmp_path: Path) -> None:
@@ -283,40 +284,39 @@ def test_cleanup_streams_batches_beyond_public_preview_cap(
         f"q20981231T23{index // 60:02d}{index % 60:02d}-{index:012x}"
         for index in range(101)
     ]
+    quarantine = tmp_path / "quarantine"
+    quarantine.mkdir()
     for batch_id in batch_ids:
-        (tmp_path / batch_id).mkdir()
+        (quarantine / batch_id).mkdir()
 
+    _only_batch_lane(monkeypatch)
     monkeypatch.setattr(
-        storage_retention,
-        "preview",
-        lambda *args, **kwargs: {
-            "complete": True,
-            "candidates": [],
-            "protected": [],
-            "preview_digest": "digest",
-        },
+        storage_retention, "_read_quarantine_root", lambda *args: quarantine
     )
-    monkeypatch.setattr(storage_retention, "_read_quarantine_root", lambda *args: tmp_path)
     monkeypatch.setattr(storage_retention, "_repo_id", lambda root: "repo-test")
 
     def load_manifest(path: Path, repo_id: str):
         batch_id = path.parent.name
-        return {
+        manifest = {
             "batch_id": batch_id,
             "created_at": "2020-01-01T00:00:00+00:00",
             "restore_deadline": (
                 expired_deadline if batch_id == expired_id else future_deadline
             ),
             "status": "quarantined",
-            "items": [],
+            "items": [{"id": "held", "state": "quarantined"}],
         }
+        if batch_id != expired_id:
+            # A person's batch keeps its undo window; only its deadline purges it.
+            manifest["source"] = "manual"
+        return manifest
 
     monkeypatch.setattr(storage_retention, "_load_manifest", load_manifest)
     monkeypatch.setattr(storage_retention, "_authenticated_manifest", lambda *args: True)
     monkeypatch.setattr(
         storage_retention,
         "_verified_batch",
-        lambda root, base, batch_id: tmp_path / batch_id,
+        lambda root, base, batch_id: quarantine / batch_id,
     )
     purged: list[str] = []
     monkeypatch.setattr(
@@ -325,17 +325,21 @@ def test_cleanup_streams_batches_beyond_public_preview_cap(
         lambda *args, **kwargs: purged.append(kwargs["batch_id"]) or {"bytes": 9},
     )
 
-    public = storage_retention.list_batches(tmp_path, base=tmp_path)
+    base = tmp_path / "worktrees"
+    base.mkdir()
+    public = storage_retention.list_batches(tmp_path, base=base)
     assert public["count"] == 100
     assert expired_id not in {row["batch_id"] for row in public["batches"]}
 
     now = datetime(2026, 9, 6, tzinfo=timezone.utc).timestamp()
     result = storage_retention._run_repository_cleanup(
-        tmp_path, base=tmp_path, now=now
+        tmp_path, base=base, now=now
     )
+    batches = result["unattributed"]["batches"]
     assert purged == [expired_id]
-    assert result["expired_batches_purged"] == 1
-    assert result["bytes_freed"] == 9
+    assert batches["purged"] == 1
+    assert batches["kept"] == 101
+    assert batches["bytes_freed"] == 9
     assert result["next_deadline"] == future_deadline
 
 
