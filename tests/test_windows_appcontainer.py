@@ -3478,6 +3478,10 @@ def test_ctypes_denied_persistent_grant_names_the_one_time_command(
         requested = str(target)
         # Measured: icacls drops an (OI)(CI) ACE on a file yet reports success.
         command = f'icacls "{target}" /grant "*S-1-15-2-1:(RX)"'
+    # A deep tmp_path (a sandbox worktree) pushes the detail past the hint
+    # bound, which then keeps only the command; lift the bound so the full
+    # WRITE_DAC explanation is what this test pins.
+    monkeypatch.setattr(wac, "_GRANT_HINT_MAX_CHARS", 10_000)
     api = _security_api(FakeSecurityLib(set_status=5), monkeypatch, present=False)
     with pytest.raises(_Win32Failure) as excinfo:
         api.grant_path_access(_identity(), requested, "read_execute", persistent=True)
