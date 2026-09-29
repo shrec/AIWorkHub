@@ -51,11 +51,23 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     root = Path(args.repo).resolve() if args.repo else Path.cwd().resolve()
-    new = (
-        Path(args.new_file).read_text(encoding="utf-8")
-        if args.new_file
-        else sys.stdin.read()
-    )
+    if args.new_file:
+        new = Path(args.new_file).read_text(encoding="utf-8")
+    else:
+        # NF-2026-01121: text-mode stdin decodes with the locale code page
+        # (cp1251 here), turning UTF-8 such as "—" into mojibake that was
+        # then written as UTF-8 under an ok receipt. Decode the bytes strictly.
+        try:
+            raw = sys.stdin.buffer.read().decode("utf-8")
+        except UnicodeDecodeError as exc:
+            print(json.dumps({
+                "ok": False,
+                "error": "replacement_not_utf8",
+                "reason": f"replacement_not_utf8:{exc}",
+            }), file=sys.stderr)
+            return 1
+        # The universal-newline translation text-mode stdin used to apply.
+        new = raw.replace("\r\n", "\n").replace("\r", "\n")
 
     try:
         target = semantic_edit.prepare_line_target(

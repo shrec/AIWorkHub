@@ -129,6 +129,47 @@ def test_the_cli_fails_closed_with_a_reason(tmp_path):
     assert json.loads(result.stderr)["ok"] is False
     assert (root / "x.py").read_text(encoding="utf-8") == "one\ntwo\nthree\nfour\nfive\n"
 
+
+# -- stdin is UTF-8 bytes, whatever the locale says (NF-2026-01121) ------------
+# Text-mode stdin decoded the replacement with the locale code page (cp1251 on
+# the host that caught it), so "—" and "σ" landed as mojibake under an
+# ok receipt. The run below strips every override that would mask the locale.
+
+
+def _locale_env() -> dict[str, str]:
+    env = dict(os.environ)
+    env.pop("PYTHONIOENCODING", None)
+    env.pop("PYTHONLEGACYWINDOWSSTDIO", None)
+    env["PYTHONUTF8"] = "0"
+    return env
+
+
+def _run_cli_bytes(root: Path, payload: bytes) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [sys.executable, str(CLI), "--repo", str(root), "--path", "x.py",
+         "--start", "2", "--end", "2"],
+        input=payload, capture_output=True, env=_locale_env(),
+    )
+
+
+def test_the_cli_writes_utf8_stdin_byte_exact(tmp_path):
+    root = _repo(tmp_path)
+    result = _run_cli_bytes(root, "TWO —σ\n".encode("utf-8"))
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["ok"] is True
+    assert (root / "x.py").read_bytes() == (
+        b"one\nTWO \xe2\x80\x94\xcf\x83\nthree\nfour\nfive\n"
+    )
+
+
+def test_the_cli_refuses_invalid_utf8_stdin_and_leaves_the_file(tmp_path):
+    root = _repo(tmp_path)
+    before = (root / "x.py").read_bytes()
+    result = _run_cli_bytes(root, b"TWO \xff\xfe\x80\n")
+    assert result.returncode != 0
+    assert json.loads(result.stderr)["error"] == "replacement_not_utf8"
+    assert (root / "x.py").read_bytes() == before
+
 # ---------------------------------------------------------------------------
 # The MANAGER MCP surface itself: reachable, mandatory, and recorded.
 #
