@@ -682,10 +682,11 @@ def _run(
     timeout: float = 120,
     phase: str = "workspace_git",
     input_text: str | None = None,
-) -> subprocess.CompletedProcess[str]:
+    text: bool = True,
+) -> subprocess.CompletedProcess[Any]:
     popen_kwargs: dict[str, Any] = {
         "cwd": cwd,
-        "text": True,
+        "text": text,
         "stdout": subprocess.PIPE,
         "stderr": subprocess.PIPE,
         "stdin": subprocess.DEVNULL,
@@ -2895,9 +2896,10 @@ def _materialize_rework_predecessor(
     assert_gc_safe_workspace_shape(
         request_id, source_workspace.path, source_workspace.home, repo=repo
     )
+    rebase = _rework_base_drift_rebase(repo, worktree, source_workspace.base_oid)
     if not source_workspace.path.is_symlink() and source_workspace.path.is_dir():
         return _materialize_rework_predecessor_from_worktree(
-            worktree, source_workspace, hashes, allowed_writes
+            worktree, source_workspace, hashes, allowed_writes, rebase=rebase
         )
     if predecessor.get("delta_artifact") is None:
         raise WorkspaceError("rework_predecessor_workspace_missing")
@@ -2910,7 +2912,81 @@ def _materialize_rework_predecessor(
         worktree=worktree,
         expected_path_hashes=hashes,
         allowed_writes=allowed_writes,
+        rebase=rebase,
     )
+
+
+_ReworkRebase = Callable[[list[tuple[str, bytes | None]]], dict[str, bytes | None]]
+
+
+def _rework_base_drift_rebase(
+    repo: Path, worktree: Path, base: str | None
+) -> _ReworkRebase | None:
+    """3-way merge P0=``base`` predecessor bytes onto S0 (NF-2026-01113): ours=S0,
+    base=P0, theirs=predecessor; conflicts and symlink/gitlink drift fail closed.
+    ``changed_path_hashes`` pins theirs before this merge, never the merged output.
+    """
+    if not base or re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", base) is None:
+        raise WorkspaceError("rework_base_invalid" if base else "rework_base_unknown")
+    if base == (successor := _isolated_worktree_base_oid(repo, worktree)):
+        return None
+
+    def git(failure: str, *args: str) -> Any:
+        done = _run(["git", *args], cwd=worktree, phase="rework_base_drift", text=False)
+        if done.returncode != 0 and failure:
+            raise WorkspaceError(failure)
+        return None if done.returncode else done.stdout
+
+    def rebase(planned: list[tuple[str, bytes | None]]) -> dict[str, bytes | None]:
+        names = [relative for relative, _ in planned]
+        argv = ("--literal-pathspecs", "diff-tree", "-r", "-z", base, successor, "--", *names)
+        fields = os.fsdecode(git("rework_base_drift_diff_failed", *argv)).split("\0")
+        drifted = {path: meta.split()  # [":old_mode", new_mode, P0 oid, S0 oid, status]
+                   for meta, path in zip(fields[::2], fields[1::2], strict=False)}
+        merged: dict[str, bytes | None] = {}
+        conflicts: list[str] = []
+        with tempfile.TemporaryDirectory(prefix="aiworkhub-rebase-") as scratch:
+            sides = [Path(scratch, name) for name in ("ours", "base", "theirs")]
+            for relative, theirs in (entry for entry in planned if entry[0] in drifted):
+                failed = f"rework_base_drift_blob_failed:{relative}"
+                clean = ("hash-object", "-w", f"--path={relative}", str(sides[2]))
+                meta = drifted[relative]
+                ancestor, ours = (None if set(oid) == {"0"} else oid for oid in meta[2:4])
+                sides[2].write_bytes(theirs or b"")
+                result = None if theirs is None else os.fsdecode(git(failed, *clean)).strip()
+                if {meta[0].lstrip(":"), meta[1]} - {"100644", "100755", "000000"}:
+                    result = ""
+                elif result in (ancestor, ours):
+                    result = ours
+                elif None in (ancestor, ours, result):
+                    result = ""
+                else:
+                    for side, oid in zip(sides, (ours, ancestor, result), strict=True):
+                        side.write_bytes(git(failed, "cat-file", "blob", str(oid)))
+                    three_way = git("", "merge-file", "-p", *map(str, sides))
+                    sides[2].write_bytes(three_way or b"")
+                    result = "" if three_way is None else os.fsdecode(git(failed, *clean)).strip()
+                if result == "":
+                    conflicts.append(relative)
+                else:
+                    checkout = ("cat-file", "--filters", f"--path={relative}", str(result))
+                    merged[relative] = result and git(failed, *checkout)
+        if conflicts:
+            raise WorkspaceError(f"rework_base_drift:{','.join(sorted(conflicts))}")
+        return merged
+
+    return rebase
+
+
+def _write_rework_path(destination: Path, relative: str, content: bytes | None) -> None:
+    if content is None:
+        if destination.is_symlink() or destination.is_file():
+            destination.unlink()
+        elif destination.exists():
+            raise WorkspaceError(f"rework_predecessor_delete_non_file:{relative}")
+    else:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(content)
 
 
 def _materialize_rework_predecessor_from_worktree(
@@ -2918,10 +2994,11 @@ def _materialize_rework_predecessor_from_worktree(
     source_workspace: WorkerWorkspace,
     hashes: dict[str, Any],
     allowed_writes: tuple[str, ...],
+    rebase: _ReworkRebase | None = None,
 ) -> list[str]:
     """Copy the hash-pinned predecessor delta from the retained worktree."""
 
-    seeded: list[str] = []
+    planned: list[tuple[str, bytes | None]] = []
     for raw_relative, raw_expected in sorted(hashes.items()):
         relative = _relative_repo_path(str(raw_relative))
         if not _matches(relative, allowed_writes):
@@ -2932,24 +3009,21 @@ def _materialize_rework_predecessor_from_worktree(
         ):
             raise WorkspaceError(f"rework_predecessor_hash_invalid:{relative}")
         source = source_workspace.path / relative
-        destination = worktree / relative
         _require_beneath(source_workspace.path, source)
-        _require_beneath(worktree, destination)
-        if source.is_symlink() or not source.is_file():
-            observed = None
-        else:
-            observed = hashlib.sha256(source.read_bytes()).hexdigest()
+        _require_beneath(worktree, worktree / relative)
+        regular = source.is_file() and not source.is_symlink()
+        content = source.read_bytes() if regular else None
+        observed = None if content is None else hashlib.sha256(content).hexdigest()
         if observed != raw_expected:
             raise WorkspaceError(f"rework_predecessor_hash_mismatch:{relative}")
-        if raw_expected is None:
-            if destination.is_symlink() or destination.is_file():
-                destination.unlink()
-            elif destination.exists():
-                raise WorkspaceError(f"rework_predecessor_delete_non_file:{relative}")
-        else:
-            _copy_one(source, destination)
-        seeded.append(relative)
-    return seeded
+        planned.append((relative, content if rebase is not None or content is None else b""))
+    merged = {} if rebase is None else rebase(planned)
+    for relative, content in planned:
+        if content is not None:  # _copy_one carries the mode; merged bytes replace content.
+            _copy_one(source_workspace.path / relative, worktree / relative)
+        if content is None or relative in merged:
+            _write_rework_path(worktree / relative, relative, merged.get(relative, content))
+    return [relative for relative, _ in planned]
 
 
 REWORK_DELTA_ARTIFACT_SCHEMA_ID = "aiworkhub.rework_delta_artifact.v2"
@@ -3301,6 +3375,7 @@ def materialize_rework_delta_artifact(
     worktree: Path,
     expected_path_hashes: dict[str, Any],
     allowed_writes: tuple[str, ...],
+    rebase: _ReworkRebase | None = None,
 ) -> list[str]:
     """Verify and materialize one sealed changed/deleted-file delta."""
     planned = verify_rework_delta_artifact(
@@ -3313,19 +3388,11 @@ def materialize_rework_delta_artifact(
         allowed_writes,
         worktree=worktree,
     )
-    seeded: list[str] = []
+    merged = {} if rebase is None else rebase(planned)
     for relative, content in planned:
-        destination = worktree / relative
-        if content is None:
-            if destination.is_symlink() or destination.is_file():
-                destination.unlink()
-            elif destination.exists():
-                raise WorkspaceError(f"rework_predecessor_delete_non_file:{relative}")
-        else:
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            destination.write_bytes(content)
-        seeded.append(relative)
-    return sorted(seeded)
+        content = merged.get(relative, content)
+        _write_rework_path(worktree / relative, relative, content)
+    return sorted(relative for relative, _ in planned)
 
 
 def _json_pointer_parts(pointer: str) -> tuple[str, ...]:

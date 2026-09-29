@@ -2343,6 +2343,283 @@ def test_rework_workspace_materializes_hash_pinned_predecessor_baseline(
         worker_workspace.cleanup_workspace(repo, predecessor.path, predecessor.home)
 
 
+_REBASE_LINES = tuple(f"line-{index}\n" for index in range(1, 9))
+
+
+def _rebase_bytes(**replaced: str) -> bytes:
+    lines = list(_REBASE_LINES)
+    for key, value in replaced.items():
+        lines[int(key.removeprefix("line")) - 1] = value
+    return "".join(lines).encode("utf-8")
+
+
+def _commit_rebase_result(
+    repo: Path, content: bytes, message: str, mode: str = "100644"
+) -> None:
+    if mode == "100644":
+        (repo / "out" / "result.txt").write_bytes(content)
+        assert _git(repo, "add", "out/result.txt").returncode == 0
+    else:  # Plumbing commits a symlink/gitlink without needing symlink privilege.
+        (blob_source := repo.parent / "rebase-blob").write_bytes(content)
+        oid = _git(repo, "hash-object", "-w", str(blob_source)).stdout.strip()
+        cacheinfo = f"{mode},{oid},out/result.txt"
+        assert _git(repo, "update-index", "--cacheinfo", cacheinfo).returncode == 0
+    assert _git(repo, "commit", "-q", "-m", message).returncode == 0
+
+
+def _seed_rebased_rework(
+    repo: Path,
+    tmp_path: Path,
+    candidate: bytes,
+    canonical: bytes | None,
+    *,
+    sealed: bool,
+    base_oid: str | None = None,
+    canonical_mode: str = "100644",
+) -> worker_workspace.WorkerWorkspace:
+    """Seed a successor from a predecessor made before an optional canonical commit."""
+    _commit_rebase_result(repo, _rebase_bytes(), "rebase base")
+    predecessor = worker_workspace.create_workspace(
+        repo, "rebase-predecessor", {"allowed_writes": ["out/result.txt"]}, "validation"
+    )
+    (predecessor.path / "out" / "result.txt").write_bytes(candidate)
+    metadata = predecessor.as_metadata()
+    if base_oid is not None:
+        metadata["base_oid"] = base_oid
+    rework: dict[str, object] = {
+        "schema_id": "aiworkhub.rework_predecessor.v1",
+        "request_id": "rebase-predecessor",
+        "task_id": "task-1",
+        "claim_epoch": 1,
+        "workspace": metadata,
+        "changed_path_hashes": {"out/result.txt": hashlib.sha256(candidate).hexdigest()},
+    }
+    if sealed:
+        rework["delta_artifact"] = worker_workspace.seal_rework_delta_artifact(
+            repo,
+            "task-1",
+            "rebase-predecessor",
+            1,
+            [("out/result.txt", candidate)],
+            tmp_path / "artifacts",
+        )
+        worker_workspace.cleanup_workspace(repo, predecessor.path, predecessor.home)
+    try:
+        if canonical is not None:
+            _commit_rebase_result(repo, canonical, "canonical drift", canonical_mode)
+        return worker_workspace.create_workspace(
+            repo,
+            "rebase-successor",
+            {"allowed_writes": ["out/result.txt"], "rework_predecessor": rework},
+            "validation",
+        )
+    finally:
+        if not sealed:
+            worker_workspace.cleanup_workspace(repo, predecessor.path, predecessor.home)
+
+
+@pytest.mark.parametrize("sealed", [False, True], ids=["retained", "delta_artifact"])
+def test_rework_overlay_same_base_is_whole_file_copy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, repo: Path, sealed: bool
+) -> None:
+    monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "worktrees"))
+    candidate = _rebase_bytes(line1="predecessor-1\n")
+    successor = _seed_rebased_rework(repo, tmp_path, candidate, None, sealed=sealed)
+    try:
+        assert (successor.path / "out" / "result.txt").read_bytes() == candidate
+        assert successor.inherited_rework_paths == ("out/result.txt",)
+    finally:
+        worker_workspace.cleanup_workspace(repo, successor.path, successor.home)
+
+
+@pytest.mark.parametrize("sealed", [False, True], ids=["retained", "delta_artifact"])
+def test_rework_overlay_merges_predecessor_delta_onto_newer_base(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, repo: Path, sealed: bool
+) -> None:
+    """NF-2026-01113: a newer canonical hunk survives the rework overlay."""
+    monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "worktrees"))
+    # LF checkout even on hosts with a global core.autocrlf=true.
+    assert _git(repo, "config", "core.autocrlf", "false").returncode == 0
+    candidate = _rebase_bytes(line1="predecessor-1\n")
+    canonical = _rebase_bytes(line8="canonical-8\n")
+    successor = _seed_rebased_rework(repo, tmp_path, candidate, canonical, sealed=sealed)
+    try:
+        assert (successor.path / "out" / "result.txt").read_bytes() == _rebase_bytes(
+            line1="predecessor-1\n", line8="canonical-8\n"
+        )
+        assert successor.inherited_rework_paths == ("out/result.txt",)
+    finally:
+        worker_workspace.cleanup_workspace(repo, successor.path, successor.home)
+
+
+@pytest.mark.parametrize("sealed", [False, True], ids=["retained", "delta_artifact"])
+def test_rework_overlay_overlapping_base_drift_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, repo: Path, sealed: bool
+) -> None:
+    monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "worktrees"))
+    written: list[str] = []
+    monkeypatch.setattr(
+        worker_workspace,
+        "_write_rework_path",
+        lambda destination, relative, content, **_: written.append(relative),
+    )
+    candidate = _rebase_bytes(line1="predecessor-1\n")
+    canonical = _rebase_bytes(line1="canonical-1\n")
+    with pytest.raises(
+        worker_workspace.WorkspaceError, match="^rework_base_drift:out/result.txt$"
+    ):
+        _seed_rebased_rework(repo, tmp_path, candidate, canonical, sealed=sealed)
+    assert written == []
+    assert (repo / "out" / "result.txt").read_bytes() == canonical
+    leftovers = [
+        path
+        for path in (tmp_path / "worktrees").rglob("*")
+        if path.is_file() and b"<<<<<<<" in path.read_bytes()
+    ]
+    assert leftovers == []
+
+
+@pytest.mark.parametrize("eol", ["autocrlf", "attributes"])
+@pytest.mark.parametrize("sealed", [False, True], ids=["retained", "delta_artifact"])
+def test_rework_overlay_merges_in_checkout_form_under_crlf_attributes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, repo: Path, sealed: bool, eol: str
+) -> None:
+    """LF-written predecessor bytes merge in repository form under CRLF checkouts."""
+    monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "worktrees"))
+    if eol == "autocrlf":
+        assert _git(repo, "config", "core.autocrlf", "true").returncode == 0
+    else:
+        (repo / ".gitattributes").write_bytes(b"* text=auto eol=crlf\n")
+        assert _git(repo, "add", ".gitattributes").returncode == 0
+        assert _git(repo, "commit", "-q", "-m", "crlf checkout").returncode == 0
+    candidate = _rebase_bytes(line1="predecessor-1\n")
+    canonical = _rebase_bytes(line8="canonical-8\n")
+    successor = _seed_rebased_rework(repo, tmp_path, candidate, canonical, sealed=sealed)
+    try:
+        merged = _rebase_bytes(line1="predecessor-1\n", line8="canonical-8\n")
+        assert (successor.path / "out" / "result.txt").read_bytes() == merged.replace(
+            b"\n", b"\r\n"
+        )
+        assert successor.inherited_rework_paths == ("out/result.txt",)
+    finally:
+        worker_workspace.cleanup_workspace(repo, successor.path, successor.home)
+
+
+@pytest.mark.parametrize("bad_base", ["--output={target}", "HEAD~1"])
+def test_rework_overlay_rejects_non_oid_predecessor_base(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, repo: Path, bad_base: str
+) -> None:
+    monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "worktrees"))
+    target = tmp_path / "x"
+    written: list[str] = []
+    monkeypatch.setattr(
+        worker_workspace,
+        "_write_rework_path",
+        lambda destination, relative, content, **_: written.append(relative),
+    )
+    candidate = _rebase_bytes(line1="predecessor-1\n")
+    canonical = _rebase_bytes(line8="canonical-8\n")
+    with pytest.raises(worker_workspace.WorkspaceError, match="^rework_base_invalid$"):
+        _seed_rebased_rework(
+            repo,
+            tmp_path,
+            candidate,
+            canonical,
+            sealed=False,
+            base_oid=bad_base.format(target=target),
+        )
+    assert written == []
+    assert not target.exists()
+    assert (repo / "out" / "result.txt").read_bytes() == canonical
+    worktrees = tmp_path / "worktrees"
+    seeded = [
+        path
+        for path in (worktrees.rglob("result.txt") if worktrees.exists() else ())
+        if path.is_file() and path.read_bytes() == candidate
+    ]
+    assert seeded == []
+
+
+def test_rework_overlay_unknown_predecessor_base_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, repo: Path
+) -> None:
+    """An empty predecessor base_oid is unknown drift, never a whole-file copy."""
+    monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "worktrees"))
+    written: list[str] = []
+    monkeypatch.setattr(
+        worker_workspace,
+        "_write_rework_path",
+        lambda destination, relative, content, **_: written.append(relative),
+    )
+    candidate = _rebase_bytes(line1="predecessor-1\n")
+    with pytest.raises(worker_workspace.WorkspaceError, match="^rework_base_unknown$"):
+        _seed_rebased_rework(repo, tmp_path, candidate, None, sealed=False, base_oid="")
+    assert written == []
+    worktrees = tmp_path / "worktrees"
+    seeded = [
+        path
+        for path in (worktrees.rglob("result.txt") if worktrees.exists() else ())
+        if path.is_file() and path.read_bytes() == candidate
+    ]
+    assert seeded == []
+
+
+@pytest.mark.parametrize("sealed", [False, True], ids=["retained", "delta_artifact"])
+def test_rework_overlay_symlink_base_drift_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, repo: Path, sealed: bool
+) -> None:
+    """S0 turning a planned path into a symlink is drift, never a text merge."""
+    monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "worktrees"))
+    # Check out 120000 blobs as plain files: no symlink privilege needed (WinError 1314).
+    assert _git(repo, "config", "core.symlinks", "false").returncode == 0
+    written: list[str] = []
+    monkeypatch.setattr(
+        worker_workspace,
+        "_write_rework_path",
+        lambda destination, relative, content, **_: written.append(relative),
+    )
+    candidate = _rebase_bytes(line1="predecessor-1\n")
+    with pytest.raises(
+        worker_workspace.WorkspaceError, match="^rework_base_drift:out/result.txt$"
+    ):
+        _seed_rebased_rework(
+            repo, tmp_path, candidate, b"line-1\n", sealed=sealed, canonical_mode="120000"
+        )
+    assert written == []
+    assert _git(repo, "ls-tree", "HEAD", "out/result.txt").stdout.startswith("120000 ")
+
+
+def test_rework_overlay_blob_read_failure_raises_instead_of_deleting(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, repo: Path
+) -> None:
+    """Only a path absent from the tree reads as None; other git failures raise."""
+    monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "worktrees"))
+    real_run = worker_workspace._run
+
+    def failing_cat_file(argv: list[str], *args: object, **kwargs: object) -> object:
+        if kwargs.get("phase") == "rework_base_drift" and "cat-file" in argv:
+            return subprocess.CompletedProcess(argv, 128, b"", b"fatal: injected")
+        return real_run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(worker_workspace, "_run", failing_cat_file)
+    written: list[str] = []
+    monkeypatch.setattr(
+        worker_workspace,
+        "_write_rework_path",
+        lambda destination, relative, content, **_: written.append(relative),
+    )
+    canonical = _rebase_bytes(line8="canonical-8\n")
+    with pytest.raises(
+        worker_workspace.WorkspaceError,
+        match="^rework_base_drift_blob_failed:out/result.txt$",
+    ):
+        _seed_rebased_rework(
+            repo, tmp_path, _rebase_bytes(line1="predecessor-1\n"), canonical, sealed=True
+        )
+    assert written == []
+    assert (repo / "out" / "result.txt").read_bytes() == canonical
+
+
 def _rewrite_rework_delta_packet(
     descriptor: dict[str, str], mutate: object
 ) -> dict[str, str]:
