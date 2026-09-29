@@ -58,6 +58,7 @@ from .platform_io import (
     open_directory_descriptor,
     stat_owned_by_current_user,
     windows_descriptor_secret_trust,
+    windows_harden_owner_only_key_dacl,
     unlock_fd,
 )
 
@@ -363,6 +364,10 @@ def write_status(repo: Path | str, payload: dict[str, Any]) -> None:
                 != (path_stat.st_dev, path_stat.st_ino)
             ):
                 raise OSError("unsafe reconciler status temporary file")
+            if is_windows() and not windows_descriptor_secret_trust(fd)[0]:
+                hardened, reason = windows_harden_owner_only_key_dacl(tmp)
+                if not hardened:
+                    raise OSError(reason)
             with contextlib.suppress(OSError):
                 chmod_fd(fd, 0o600)
             os.write(fd, json.dumps(record, ensure_ascii=False, sort_keys=True).encode("utf-8"))

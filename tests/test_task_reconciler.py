@@ -488,6 +488,100 @@ def test_world_readable_status_is_still_discarded(tmp_path: Path) -> None:
     assert task_reconciler.read_status(tmp_path) == {}
 
 
+def _grant_everyone_inheritable(target: Path) -> bool:
+    """Grant Everyone read, inherited by every file created under ``target``.
+
+    Mirrors ``tests/test_terminal_authority_windows.py``'s helper of the same
+    name: a runtime directory whose DACL grants a broad principal, from
+    before write_status hardened the temp file it creates under it. Returns
+    whether the grant was actually applied, so a test can skip rather than
+    assert against a setup that never happened.
+    """
+    import subprocess
+
+    completed = subprocess.run(
+        ["icacls", str(target), "/grant", "*S-1-1-0:(OI)(CI)(R)"],
+        capture_output=True,
+        check=False,
+    )
+    return completed.returncode == 0
+
+
+def test_write_status_hardens_inherited_dacl_so_reader_trusts_it(
+    tmp_path: Path,
+) -> None:
+    import os
+
+    if os.name != "nt":
+        import pytest
+
+        pytest.skip("windows_only")
+
+    if not _grant_everyone_inheritable(tmp_path):
+        import pytest
+
+        pytest.skip("validation_unsupported_in_sandbox:cannot_grant_inheritable_dacl")
+
+    task_reconciler.write_status(tmp_path, {"authority_state": "standby"})
+
+    record = task_reconciler.read_status(tmp_path)
+    assert record.get("schema_id") == "aiworkhub.task_reconciler_status.v1"
+    assert bool(record) is True
+
+    from aiworkhub.platform_io import windows_descriptor_secret_trust
+
+    target = task_reconciler.status_path(tmp_path)
+    fd = os.open(target, os.O_RDONLY)
+    try:
+        trusted, _reason = windows_descriptor_secret_trust(fd)
+    finally:
+        os.close(fd)
+    assert trusted is True
+
+
+def test_write_status_dacl_hardening_failure_leaves_no_residue(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(task_reconciler, "is_windows", lambda: True)
+    monkeypatch.setattr(
+        task_reconciler,
+        "windows_descriptor_secret_trust",
+        lambda _fd: (False, "world_readable_ace:S-1-5-11"),
+    )
+    monkeypatch.setattr(
+        task_reconciler,
+        "windows_harden_owner_only_key_dacl",
+        lambda _path: (False, "x"),
+    )
+
+    task_reconciler.write_status(tmp_path, {"authority_state": "standby"})
+
+    target = task_reconciler.status_path(tmp_path)
+    assert not target.exists()
+    assert list(target.parent.glob(f".{target.name}.*.tmp")) == []
+
+
+def test_write_status_never_hardens_an_already_trusted_temp(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(task_reconciler, "is_windows", lambda: True)
+    monkeypatch.setattr(
+        task_reconciler, "windows_descriptor_secret_trust", lambda _fd: (True, "")
+    )
+
+    def _must_not_be_called(_path):
+        raise AssertionError("hardening must not run on an already-trusted temp")
+
+    monkeypatch.setattr(
+        task_reconciler, "windows_harden_owner_only_key_dacl", _must_not_be_called
+    )
+
+    task_reconciler.write_status(tmp_path, {"authority_state": "standby"})
+
+    record = task_reconciler.read_status(tmp_path)
+    assert record.get("schema_id") == "aiworkhub.task_reconciler_status.v1"
+
+
 # --- Pending exact wave-goal bindings --------------------------------------
 
 
