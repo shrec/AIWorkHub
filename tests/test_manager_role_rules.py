@@ -261,7 +261,7 @@ def test_manager_semantic_editor_named_in_the_preamble_exists_and_says_so() -> N
     assert "Replace one hash-verified line range; never rewrite a file." in source
     for flag in ("--path", "--start", "--end"):
         assert f'"{flag}"' in source
-    assert "sys.stdin.read()" in source
+    assert "sys.stdin.buffer.read()" in source
 
 
 def test_role_addition_keeps_every_projection_within_the_declared_caps() -> None:
