@@ -312,6 +312,33 @@ def _canonical_terminal_reason(event: dict[str, Any], state: str) -> dict[str, A
                 "missing_cause": False,
                 "alertable": alertable,
             }
+    # NF-2026-01126: with no scalar cause, a typed terminal_failure category
+    # (e.g. an expired OAuth credential) is still a known cause, not a missing one.
+    failure = event.get("terminal_failure")
+    category = _bounded_cause(failure.get("category")) if isinstance(failure, dict) else None
+    if isinstance(failure, dict) and category is not None:
+        failure_message = next(
+            (
+                bounded
+                for key in ("reason", "detail", "message")
+                if (bounded := _bounded_cause(failure.get(key))) is not None
+            ),
+            category,
+        )
+        alertable_value = reason.get("alertable")
+        typed: dict[str, Any] = {
+            "code": state,
+            "taxonomy": "lifecycle_terminal_failure",
+            "source": "terminal_failure",
+            "message": failure_message,
+            "missing_cause": False,
+            "alertable": alertable_value if isinstance(alertable_value, bool) else True,
+        }
+        if category == "credential":
+            typed.update(
+                code="credential_expired", taxonomy="provider_credential", retryable=True
+            )
+        return typed
     return {
         "code": "terminal_reason_missing",
         "taxonomy": "observability_missing_cause",

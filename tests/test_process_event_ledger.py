@@ -339,6 +339,82 @@ def test_causeless_failure_forces_observability_alert(
     }
 
 
+def _append_and_read_reason(tmp_path: Path, event: dict[str, object]) -> dict[str, object]:
+    path = tmp_path / "terminal_failure.jsonl"
+    process_event_ledger.append_event(path, event)
+    return list(process_event_ledger.iter_events(path))[0]["terminal_reason"]
+
+
+def test_causeless_credential_terminal_failure_is_typed_retryable(tmp_path: Path) -> None:
+    oauth = "Failed to authenticate: OAuth session expired and could not be refreshed"
+    reason = _append_and_read_reason(
+        tmp_path,
+        {
+            "request_id": "31303df82fba42eea0d0a3950bcee94f",
+            "state": "worker_failed",
+            "terminal_failure": {"category": "credential", "reason": oauth},
+        },
+    )
+
+    assert reason == {
+        "code": "credential_expired",
+        "taxonomy": "provider_credential",
+        "source": "terminal_failure",
+        "message": oauth,
+        "missing_cause": False,
+        "alertable": True,
+        "retryable": True,
+    }
+
+
+def test_causeless_other_terminal_failure_uses_state_code(tmp_path: Path) -> None:
+    reason = _append_and_read_reason(
+        tmp_path,
+        {
+            "request_id": "other",
+            "state": "finalize_failed",
+            "terminal_failure": {"category": "tool_unavailable", "detail": {"no": "dict"}},
+        },
+    )
+
+    assert reason == {
+        "code": "finalize_failed",
+        "taxonomy": "lifecycle_terminal_failure",
+        "source": "terminal_failure",
+        "message": "tool_unavailable",
+        "missing_cause": False,
+        "alertable": True,
+    }
+
+
+def test_scalar_cause_precedes_terminal_failure_and_empty_category_is_missing(
+    tmp_path: Path,
+) -> None:
+    scalar = _append_and_read_reason(
+        tmp_path / "scalar",
+        {
+            "request_id": "scalar",
+            "state": "worker_failed",
+            "error": "worker crashed",
+            "terminal_failure": {"category": "credential"},
+        },
+    )
+    assert scalar["source"] == "error"
+    assert scalar["code"] == "worker_failed"
+    assert "retryable" not in scalar
+
+    missing = _append_and_read_reason(
+        tmp_path / "missing",
+        {
+            "request_id": "missing",
+            "state": "worker_failed",
+            "terminal_failure": {"category": ""},
+        },
+    )
+    assert missing["code"] == "terminal_reason_missing"
+    assert missing["missing_cause"] is True
+
+
 def test_failure_reason_bounds_message_and_alertable_type(tmp_path: Path) -> None:
     path = tmp_path / "bounded.jsonl"
     process_event_ledger.append_event(
