@@ -27,18 +27,23 @@ def git(cwd: Path, *args: str) -> None:
 
 
 def repository(tmp_path: Path) -> dict[str, Path]:
-    """Create the local bare remote, clone, base commit, and worktree root."""
+    """Create the repository, base commit, pushed ``origin/main`` and worktree root.
+
+    No local transport (clone/push/fetch): the worker validation sandbox denies
+    it (NF-2026-01116). ``origin/main`` is set with update-ref instead, so the
+    base commit still reads as pushed.
+    """
     remote = tmp_path / "remote.git"
     repo = tmp_path / "repo"
     base = tmp_path / "worktrees"
     base.mkdir()
-    subprocess.run(["git", "init", "--bare", str(remote)], check=True, capture_output=True)
-    git(tmp_path, "clone", str(remote), str(repo))
+    repo.mkdir()
+    git(repo, "init")
+    git(repo, "remote", "add", "origin", str(remote))
     (repo / "file.txt").write_text("base\n", encoding="utf-8")
     git(repo, "add", "file.txt")
     git(repo, "commit", "-m", "base")
-    git(repo, "push", "origin", "HEAD:refs/heads/main")
-    git(repo, "fetch", "origin")
+    git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
     assert task_store.initialize_repository(repo)["ok"]
     return {"repo": repo, "base": base}
 
