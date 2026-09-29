@@ -569,6 +569,9 @@ def _commit_validation_worker_package(repo: Path) -> None:
         # worker_workspace imports the grammar mirror relatively (NF-2026-01042).
         "tree_sitter_cache.py",
         "validation_runner.py",
+        # worker_workspace imports its trusted host-tool set from this
+        # dependency-free sibling (NF-2026-01114).
+        "validation_toolchains.py",
         # worker_workspace's AppContainer validation helper imports these two
         # siblings by name, so the declared seed closure resolves them and this
         # fixture repository has to track them and their own closure.
