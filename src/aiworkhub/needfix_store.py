@@ -2095,6 +2095,9 @@ def update_needfix(
     scope_files_add: Sequence[str] | None = None,
     scope_symbols_add: Sequence[str] | None = None,
     expected_updated_at: str | None = None,
+    caused_by: Mapping[str, Any] | None = None,
+    repository_id: str = "",
+    verify_accepted_outcome: Callable[[Mapping[str, Any]], Mapping[str, Any] | None] | None = None,
 ) -> dict[str, Any]:
     """Update mutable fields. Blocked for transient/terminal statuses.
 
@@ -2108,6 +2111,14 @@ def update_needfix(
     never mean both. ``expected_updated_at`` is optimistic concurrency: when
     supplied it must equal the stored ``updated_at`` or the update is refused.
 
+    ``caused_by`` is write-once causality, validated by ``validate_caused_by``
+    against the canonical ``verify_accepted_outcome`` authority exactly as
+    ``_insert`` does. Setting it on a row that carries none succeeds; re-sending
+    the same identity is a no-op that does not even appear in
+    ``fields_changed``; a *different* identity is refused with
+    ``NeedFixConflictError``. Who caused a defect is evidence, and evidence that
+    a later caller can quietly overwrite is not evidence.
+
     The returned row carries an ``update_receipt`` (``fields_changed``,
     ``event_id``, ``evidence_keys_after``) so the MCP wrapper can answer with
     a delta instead of echoing the row; the ``updated`` audit event records
@@ -2117,8 +2128,23 @@ def update_needfix(
         raise NeedFixValidationError(
             "evidence (full replace) and evidence_patch (merge) are mutually exclusive"
         )
+    verified_cause: dict[str, Any] | None = None
+    if caused_by is not None:
+        if verify_accepted_outcome is None:
+            raise NeedFixValidationError(
+                "caused_by requires canonical accepted-outcome verification"
+            )
+        verified_cause = validate_caused_by(
+            caused_by,
+            repository_id=repository_id,
+            verify_accepted_outcome=verify_accepted_outcome,
+        )
     conn = _connect(repo_root)
     try:
+        if verified_cause is not None:
+            # The same guarantee ``_insert`` gives before it writes a cause: the
+            # column the schema migration adds has to actually exist first.
+            _ensure_schema(conn)
         row = conn.execute("SELECT * FROM needfix WHERE id = ?", (needfix_id,)).fetchone()
         if row is None:
             raise NeedFixNotFoundError(needfix_id)
@@ -2130,6 +2156,17 @@ def update_needfix(
             raise NeedFixConflictError(
                 f"needfix_update_stale: expected_updated_at={expected_updated_at!r} "
                 f"current_updated_at={row['updated_at']!r}"
+            )
+        stored_cause = (
+            json.loads(row["caused_by_json"])
+            if "caused_by_json" in row.keys() and row["caused_by_json"]
+            else None
+        )
+        cause_changed = verified_cause is not None and stored_cause != verified_cause
+        if cause_changed and stored_cause is not None:
+            raise NeedFixConflictError(
+                f"needfix {needfix_id} already records a different caused_by identity; "
+                "refusing to rewrite causality"
             )
         if kind is not None and kind not in KINDS:
             raise NeedFixValidationError(f"invalid kind: {kind!r}; valid: {KINDS}")
@@ -2205,6 +2242,8 @@ def update_needfix(
             for column, value in new_values.items()
             if _stored_changed(column, value)
         ]
+        if cause_changed:
+            fields_changed.append("caused_by")
 
         def _sha(text: str) -> str:
             return hashlib.sha256(text.encode("utf-8")).hexdigest()
@@ -2222,6 +2261,11 @@ def update_needfix(
                 new_values["readiness_score"], _utcnow_iso(), needfix_id,
             ),
         )
+        if cause_changed:
+            conn.execute(
+                "UPDATE needfix SET caused_by_json = ? WHERE id = ?",
+                (json.dumps(verified_cause, sort_keys=True), needfix_id),
+            )
         event_id = _record_event(
             conn,
             needfix_id,

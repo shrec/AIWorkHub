@@ -632,6 +632,104 @@ def test_legacy_row_has_explicitly_absent_caused_by(init: Path):
     assert needfix_store.get_needfix(init, row["id"])["caused_by"] is None
 
 
+# --- update_needfix caused_by: write-once causality -------------------------
+
+
+def _uncaused(init: Path, title: str = "escaped defect") -> str:
+    row = needfix_store.capture_proposal(
+        init, title=title, description="regression after accepted outcome",
+    )
+    assert row["caused_by"] is None
+    return row["id"]
+
+
+def test_update_sets_caused_by_on_a_row_that_has_none(init: Path):
+    needfix_id = _uncaused(init)
+
+    updated = needfix_store.update_needfix(
+        init,
+        needfix_id,
+        caused_by=_cause(),
+        repository_id="repo-one",
+        verify_accepted_outcome=_accepted,
+    )
+
+    assert "caused_by" in updated["update_receipt"]["fields_changed"]
+    assert updated["caused_by"] == _cause()
+    assert needfix_store.get_needfix(init, needfix_id)["caused_by"] == _cause()
+
+
+def test_update_with_the_same_caused_by_is_a_no_op(init: Path):
+    """Re-sending an identical identity is not a change and must not report one."""
+    needfix_id = _uncaused(init)
+    kwargs = {
+        "caused_by": _cause(),
+        "repository_id": "repo-one",
+        "verify_accepted_outcome": _accepted,
+    }
+    needfix_store.update_needfix(init, needfix_id, **kwargs)
+
+    again = needfix_store.update_needfix(init, needfix_id, **kwargs)
+
+    assert again["update_receipt"]["fields_changed"] == []
+    assert again["caused_by"] == _cause()
+
+
+def test_update_with_a_different_caused_by_is_refused(init: Path):
+    """Who caused a defect is evidence; a later caller may not overwrite it."""
+    needfix_id = _uncaused(init)
+    needfix_store.update_needfix(
+        init,
+        needfix_id,
+        caused_by=_cause(),
+        repository_id="repo-one",
+        verify_accepted_outcome=_accepted,
+    )
+    other = _cause(
+        task_id="TASK-2",
+        request_id="request-2",
+        accepted_outcome_receipt=_receipt(task_id="TASK-2", request_id="request-2"),
+    )
+
+    with pytest.raises(needfix_store.NeedFixConflictError):
+        needfix_store.update_needfix(
+            init,
+            needfix_id,
+            caused_by=other,
+            repository_id="repo-one",
+            verify_accepted_outcome=_accepted,
+        )
+
+    assert needfix_store.get_needfix(init, needfix_id)["caused_by"] == _cause()
+
+
+def test_update_refuses_a_cause_with_no_canonical_verifier(init: Path):
+    needfix_id = _uncaused(init)
+
+    with pytest.raises(needfix_store.NeedFixValidationError):
+        needfix_store.update_needfix(
+            init, needfix_id, caused_by=_cause(), repository_id="repo-one",
+        )
+
+    assert needfix_store.get_needfix(init, needfix_id)["caused_by"] is None
+
+
+def test_an_ordinary_update_never_touches_a_recorded_cause(init: Path):
+    needfix_id = _uncaused(init)
+    needfix_store.update_needfix(
+        init,
+        needfix_id,
+        caused_by=_cause(),
+        repository_id="repo-one",
+        verify_accepted_outcome=_accepted,
+    )
+
+    updated = needfix_store.update_needfix(init, needfix_id, title="retitled")
+
+    assert updated["update_receipt"]["fields_changed"] == ["title"]
+    assert updated["caused_by"] == _cause()
+
+
 # --- core._verify_integrated_commit against a real git repo -----------------
 
 

@@ -35,14 +35,12 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
-import subprocess
 from functools import partial
 from pathlib import Path
 from typing import Any
 
 from aiworkhub import attempt_trajectory_export as trajectory_export
-from aiworkhub import eval_artifact_gate, task_engine, task_store
+from aiworkhub import eval_artifact_gate, sdlc_attribution, task_engine, task_store
 
 SCHEMA_ID = "aiworkhub.accepted_task_trajectories.v1"
 ROW_SCHEMA_ID = "aiworkhub.accepted_task_trajectories.row.v1"
@@ -312,93 +310,11 @@ def _update_registry(repo_root: Path) -> None:
     )
 
 
-_GIT_TIMEOUT_SECONDS = 30
-_GIT_ENV_BLOCKLIST = (
-    "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE",
-    "GIT_OBJECT_DIRECTORY", "GIT_COMMON_DIR", "GIT_PREFIX",
-)
-
-
-def _safe_git_oid(value: str) -> bool:
-    if not value or value.startswith("-") or ".." in value:
-        return False
-    if any(char.isspace() for char in value):
-        return False
-    return 7 <= len(value) <= 64 and all(
-        char in "0123456789abcdefABCDEF" for char in value
-    )
-
-
-def _safe_repo_relative_path(relative: str) -> bool:
-    if not relative or relative.startswith("/") or "\\" in relative or ":" in relative:
-        return False
-    if any(char in relative for char in ("\x00", "\n", "\r")):
-        return False
-    parts = relative.split("/")
-    return bool(parts) and all(part not in ("", ".", "..") for part in parts)
-
-
-def _git_clean_env() -> dict[str, str]:
-    env = os.environ.copy()
-    for key in _GIT_ENV_BLOCKLIST:
-        env.pop(key, None)
-    return env
-
-
-def _git_run(repo: Path, *args: str) -> tuple[int, bytes]:
-    try:
-        result = subprocess.run(
-            ["git", "-C", str(repo), *args],
-            capture_output=True,
-            timeout=_GIT_TIMEOUT_SECONDS,
-            env=_git_clean_env(),
-        )
-    except (OSError, subprocess.SubprocessError):
-        return 1, b""
-    return result.returncode, result.stdout
-
-
-def _historical_descendant_commits(repo: Path, base_oid: str) -> list[str] | None:
-    if not _safe_git_oid(base_oid):
-        return None
-    rc, kind = _git_run(repo, "cat-file", "-t", "--", base_oid)
-    if rc != 0 or kind.strip() != b"commit":
-        return None
-    rc, out = _git_run(
-        repo, "rev-list", "--reverse", "--ancestry-path", f"{base_oid}..HEAD",
-    )
-    if rc != 0:
-        return None
-    return [
-        line.decode("ascii", "replace").strip()
-        for line in out.splitlines() if line.strip()
-    ]
-
-
-def _commit_path_sha256(repo: Path, commit: str, path: str) -> str | None:
-    if not _safe_git_oid(commit) or not _safe_repo_relative_path(path):
-        return None
-    rc, listing = _git_run(
-        repo, "ls-tree", "--full-tree", "-z", commit, "--", path,
-    )
-    if rc != 0 or not listing:
-        return None
-    entries = [entry for entry in listing.split(b"\0") if entry]
-    if len(entries) != 1:
-        return None
-    meta, sep, name = entries[0].partition(b"\t")
-    if not sep or name != path.encode("utf-8"):
-        return None
-    parts = meta.split(b" ", 2)
-    if len(parts) != 3:
-        return None
-    mode, kind, _object = parts
-    if kind != b"blob" or mode not in (b"100644", b"100755"):
-        return None
-    rc, blob = _git_run(repo, "cat-file", "blob", f"{commit}:{path}")
-    if rc != 0:
-        return None
-    return hashlib.sha256(blob).hexdigest()
+# The git plumbing under this check -- "the first canonical descendant of
+# base_oid holding every promoted-path hash", and the oid/path guards and the
+# argument-list runner beneath it -- now lives in ``aiworkhub.sdlc_attribution``.
+# Escaped-defect attribution asks the same question of the same history, and two
+# copies of that answer would eventually be two different answers.
 
 
 def historical_accepted_outcome_authority(
@@ -469,28 +385,15 @@ def historical_accepted_outcome_authority(
         return None, "accepted_outcome_receipt_sealed_evidence_missing"
     if any(receipt.get(key) != value for key, value in expected.items()):
         return None, "accepted_outcome_receipt_identity_mismatch"
-    if any(not _safe_repo_relative_path(path) for path in paths):
+    if any(not sdlc_attribution.safe_repo_relative_path(path) for path in paths):
         return None, "accepted_outcome_receipt_path_traversal"
     if paths:
-        commits = _historical_descendant_commits(repo, expected["base_oid"])
-        if commits is None:
+        commit, failure = sdlc_attribution.first_holding_commit(
+            repo, expected["base_oid"], paths, hashes,
+        )
+        if failure == sdlc_attribution.GIT_UNAVAILABLE:
             return None, "accepted_outcome_receipt_historical_git_unavailable"
-        matched = False
-        for commit in commits:
-            observed: dict[str, str] = {}
-            missing = False
-            for relative in paths:
-                digest = _commit_path_sha256(repo, commit, relative)
-                if digest is None:
-                    missing = True
-                    break
-                observed[relative] = digest
-            if missing:
-                continue
-            if observed == hashes:
-                matched = True
-                break
-        if not matched:
+        if commit is None:
             return None, "accepted_outcome_receipt_historical_hash_mismatch"
     revision = "sha256:" + _digest({
         "base_oid": expected["base_oid"], "changed_path_hashes": hashes,

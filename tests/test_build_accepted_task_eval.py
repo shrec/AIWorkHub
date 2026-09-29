@@ -1,6 +1,7 @@
 """Tests for scripts/build_accepted_task_eval.py."""
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import os
@@ -16,7 +17,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 import build_accepted_task_eval as builder  # noqa: E402
 
-from aiworkhub import eval_artifact_gate, task_engine, task_store  # noqa: E402
+from aiworkhub import (  # noqa: E402
+    eval_artifact_gate, sdlc_attribution, task_engine, task_store,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -801,7 +804,12 @@ def test_verify_provenance_rejects_committed_symlink_matching_digest(tmp_path: P
     )
     linked = repo / "src" / "linked.py"
     linked.unlink()
-    linked.symlink_to(payload.decode("ascii"))
+    try:
+        linked.symlink_to(payload.decode("ascii"))
+    except OSError as exc:
+        pytest.skip(
+            f"validation_unsupported_in_sandbox:symlink_privilege_not_held:{exc}"
+        )
     _git_commit_paths(repo, "promote-symlink", "src")
 
     with pytest.raises(builder.AcceptedTaskEvalError, match="provenance_absent_from_sealed_source"):
@@ -962,3 +970,86 @@ def test_discover_candidates_bounds_whole_store_lookups_on_multi_thousand_card_s
     assert call_counts["decisions"] == 1
     assert call_counts["usage"] == 1
     assert {candidate["task_id"] for candidate in candidates} == {genuine_task_id}
+
+
+# --------------------------------------------------------------------------
+# the canonical-commit helper has exactly one definition, and src/ owns it
+# --------------------------------------------------------------------------
+
+def test_the_script_uses_the_shared_holding_commit_helper() -> None:
+    """Moved, not copied: two copies of this answer eventually disagree."""
+    assert builder.sdlc_attribution.first_holding_commit is (
+        sdlc_attribution.first_holding_commit
+    )
+    for gone in (
+        "_historical_descendant_commits", "_commit_path_sha256",
+        "_git_run", "_git_clean_env", "_safe_git_oid",
+    ):
+        assert not hasattr(builder, gone), f"{gone} is still defined in the script"
+
+
+def test_the_moved_helper_module_never_imports_from_scripts() -> None:
+    source = Path(sdlc_attribution.__file__).read_text(encoding="utf-8")
+    imported: list[str] = []
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            imported.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module is not None:
+            imported.append(node.module)
+    offenders = [
+        name for name in imported if name == "scripts" or name.startswith("scripts.")
+    ]
+    assert offenders == []
+    shell_true_calls = [
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call)
+        and any(
+            keyword.arg == "shell"
+            and isinstance(keyword.value, ast.Constant)
+            and keyword.value.value is True
+            for keyword in node.keywords
+        )
+    ]
+    assert shell_true_calls == []
+
+
+def test_provenance_still_finds_the_first_commit_holding_every_promoted_hash(
+    tmp_path: Path,
+) -> None:
+    """The shared helper answers exactly what the inline loop used to answer."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    task_store.initialize_repository(repo)
+    base_oid = _init_git_base(repo)
+    receipt = _insert_accepted_card(
+        repo,
+        task_id="HIST_SHARED_TASK",
+        request_id="req-hist-shared",
+        files={"src/shared.py": b"promoted-bytes\n"},
+        base_oid=base_oid,
+    )
+    _git_commit_paths(repo, "promote", "src")
+
+    commit, failure = sdlc_attribution.first_holding_commit(
+        repo, base_oid, receipt["promoted_paths"], receipt["changed_path_hashes"],
+    )
+
+    assert failure == ""
+    assert commit == _git(repo, "rev-parse", "HEAD")
+    builder.verify_provenance(
+        repo, [_provenance_row("HIST_SHARED_TASK", "req-hist-shared", receipt)],
+    )
+
+
+def test_an_unreadable_base_oid_is_not_reported_as_a_hash_mismatch(tmp_path: Path) -> None:
+    """A history nobody could read is not a history that answered "no"."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    commit, failure = sdlc_attribution.first_holding_commit(
+        repo, "0123456789abcdef", ["src/x.py"], {"src/x.py": "a" * 64},
+    )
+
+    assert commit is None
+    assert failure == sdlc_attribution.GIT_UNAVAILABLE
