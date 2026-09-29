@@ -1112,3 +1112,76 @@ def test_non_superseded_and_invalid_successor_ids_fail_closed_on_dag_and_project
         {"old": archived_cancelled, "T-landed": landed},
     )
     assert archived_error == "__archived_dependency_not_superseded__:old"
+
+
+_PINNED_PREDECESSOR = {
+    "schema_id": "aiworkhub.rework_predecessor.v1",
+    "request_id": "request-prior",
+}
+
+
+def test_rework_card_wins_scope_over_fresh_card_of_same_priority():
+    cards = [
+        _card("A-fresh", priority="high", allowed_writes=["src/shared.py"]),
+        _card(
+            "Z-rework",
+            priority="high",
+            allowed_writes=["src/shared.py"],
+            rework_predecessor=dict(_PINNED_PREDECESSOR),
+            claim_epoch=1,
+        ),
+    ]
+
+    snap = task_plan.build_snapshot(cards)
+
+    assert snap["ready"] == ["Z-rework"]
+    assert snap["write_scope_overlaps"] == {"A-fresh": ["src/shared.py"]}
+
+
+def test_claim_epoch_alone_marks_rework_card():
+    cards = [
+        _card("A-fresh", priority="high", allowed_writes=["src/shared.py"]),
+        _card("Z-rework", priority="high", allowed_writes=["src/shared.py"], claim_epoch=2),
+    ]
+
+    snap = task_plan.build_snapshot(cards)
+
+    assert snap["ready"] == ["Z-rework"]
+    assert "A-fresh" in snap["write_scope_overlaps"]
+
+
+def test_higher_priority_fresh_card_still_beats_rework_card():
+    cards = [
+        _card("Z-fresh", priority="critical", allowed_writes=["src/shared.py"]),
+        _card(
+            "A-rework",
+            priority="high",
+            allowed_writes=["src/shared.py"],
+            rework_predecessor=dict(_PINNED_PREDECESSOR),
+            claim_epoch=1,
+        ),
+    ]
+
+    snap = task_plan.build_snapshot(cards)
+
+    assert snap["ready"] == ["Z-fresh"]
+    assert snap["write_scope_overlaps"] == {"A-rework": ["src/shared.py"]}
+
+
+def test_scope_ordering_without_rework_cards_is_unchanged():
+    cards = [
+        _card("B-fresh", priority="high", allowed_writes=["src/shared.py"]),
+        _card("A-fresh", priority="high", allowed_writes=["src/shared.py"]),
+        _card("C-low", priority="low", allowed_writes=["src/other.py"]),
+        _card("D-crit", priority="critical", allowed_writes=["src/other.py"]),
+        _card("E-epoch-zero", priority="high", allowed_writes=["src/shared.py"], claim_epoch=0),
+    ]
+
+    snap = task_plan.build_snapshot(cards)
+
+    assert snap["ready"] == ["D-crit", "A-fresh"]
+    assert snap["write_scope_overlaps"] == {
+        "B-fresh": ["src/shared.py"],
+        "C-low": ["src/other.py"],
+        "E-epoch-zero": ["src/shared.py"],
+    }

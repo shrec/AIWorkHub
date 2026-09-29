@@ -652,11 +652,24 @@ def build_snapshot(cards: list[dict[str, Any]]) -> dict[str, Any]:
     # Keep pending-scope arbitration identical to launch_collision_guard.
     # Otherwise the plan can advertise one overlapping card as ready while
     # the atomic launch guard deterministically admits a different winner.
+    # Within one priority rank a card already returned for rework (pinned
+    # rework_predecessor or claim_epoch >= 1) keeps its write scope over
+    # never-started cards; letting a fresh card win strands the rework and
+    # can revert its predecessor's changes.  Priority still dominates.
     priority_rank = {"critical": 0, "high": 1, "medium": 2, "low": 3, "": 4}
+
+    def is_rework(card: dict[str, Any]) -> bool:
+        predecessor = card.get("rework_predecessor")
+        if isinstance(predecessor, dict) and predecessor:
+            return True
+        epoch = card.get("claim_epoch")
+        return isinstance(epoch, int) and not isinstance(epoch, bool) and epoch >= 1
+
     ordered = sorted(
         by_id.values(),
         key=lambda c: (
             priority_rank.get(str(c.get("priority") or "").strip().lower(), 4),
+            0 if is_rework(c) else 1,
             str(c.get("task_id") or ""),
         ),
     )
