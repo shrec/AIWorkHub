@@ -2705,7 +2705,7 @@ function renderStorage(snapshot) {
   if (terminalLogs) {
     fragment.appendChild(createElement("div", "storage-section-title", "Terminal log retention"));
     for (const [label, value] of [
-      ["Policy", `keep ${formatCount(terminalLogs.logs_days)} days · latest ${formatCount(terminalLogs.keep_last_per_task)} runs/task`],
+      ["Policy", `keep ${formatCount(terminalLogs.logs_days)} days`],
       ["Current", formatBytes(terminalLogs.current_bytes)],
       ["Eligible", `${formatCount(terminalLogs.candidate_count)} runs · ${formatBytes(terminalLogs.candidate_bytes)}`],
       ["After quarantine", formatBytes(terminalLogs.projected_bytes)],

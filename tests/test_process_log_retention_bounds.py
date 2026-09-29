@@ -8,13 +8,13 @@ by construction. This proves the two bounds:
 * An oversized log is tail-capped to its last ``MAX_PROCESS_LOG_FILE_BYTES`` --
   the exact window the launcher itself reads to diagnose a failure -- so the
   head is released while the diagnostic tail an operator needs is always kept.
-* An attempt-artifacts bundle whose run has aged past ``logs_days`` is moved
-  into a reversible quarantine batch.
+* An attempt-artifacts bundle whose run has aged past ``logs_days`` is
+  deleted outright.
 
 The bound fires ONLY for a run in a terminal ledger state (its writer has
 stopped): a live/non-terminal run is never touched, so a tail an operator is
 still watching is never cut. ``os.chmod`` is denied in the validation sandbox,
-so the two mutating paths (tail-cap and bundle move) go through the coordinator's
+so the two mutating paths (tail-cap and bundle delete) go through the coordinator's
 canonical run; every read-only and protected-item assertion runs everywhere.
 """
 
@@ -263,17 +263,49 @@ def test_enforce_converges_when_the_kept_window_begins_on_a_line_boundary(
     assert preview["oversized_log_count"] == 0
 
 
-def test_enforce_quarantines_an_aged_terminal_bundle_reversibly(tmp_path: Path) -> None:
+def test_enforce_deletes_an_aged_terminal_bundle_without_a_batch(tmp_path: Path) -> None:
     repo = _repo(tmp_path)
     _ledger_row(repo, _TERMINAL, "exited")
     bundle = _write_bundle(repo, _TERMINAL, '{"artifacts": []}')
 
     result = terminal_log_retention.enforce_process_log_bounds(repo, confirm=True)
 
-    assert result["bundles_quarantined"] == 1
+    assert result["bundles_deleted"] == 1
     assert result["bundle_bytes"] > 0
-    # The bundle left the unbounded processes tree...
+    assert result["errors"] == []
+    # The bundle is gone from the processes tree...
     assert not bundle.exists()
-    # ...and now sits in a bounded, reversible quarantine batch.
-    batches = terminal_log_retention.list_batches(repo)["batches"]
-    assert any(row["batch_id"] == result["bundle_batch_id"] for row in batches)
+    # ...and was deleted outright, not moved into a quarantine batch.
+    assert terminal_log_retention.list_batches(repo)["count"] == 0
+    qroot = repo / terminal_log_retention.QUARANTINE_RELATIVE_PATH
+    assert not qroot.exists() or list(qroot.iterdir()) == []
+
+
+def test_enforce_reports_a_bundle_it_could_not_delete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _repo(tmp_path)
+    _ledger_row(repo, _TERMINAL, "exited")
+    bundle = _write_bundle(repo, _TERMINAL, "{}")
+
+    def _refuse(path, *args, **kwargs):
+        raise PermissionError("locked")
+
+    monkeypatch.setattr(terminal_log_retention.shutil, "rmtree", _refuse)
+    result = terminal_log_retention.enforce_process_log_bounds(repo, confirm=True)
+
+    assert result["bundles_deleted"] == 0
+    assert result["errors"] == [f"{bundle}: locked"]
+    assert bundle.is_dir()
+
+
+def test_enforce_keeps_a_live_run_bundle(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    _ledger_row(repo, _LIVE, "processing")
+    bundle = _write_bundle(repo, _LIVE, "{}")
+
+    result = terminal_log_retention.enforce_process_log_bounds(repo, confirm=True)
+
+    assert result["bundles_deleted"] == 0
+    assert result["errors"] == []
+    assert bundle.is_dir()

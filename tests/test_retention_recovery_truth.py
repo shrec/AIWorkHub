@@ -184,12 +184,11 @@ def test_aged_legacy_logs_stay_protected_never_a_candidate(
     assert (repo / "logs" / "processes" / "old.stdout.log").is_file()
 
 
-def test_orphan_files_stay_protected_never_a_candidate(
+def test_aged_orphan_files_become_a_candidate(
     tmp_path: Path, frozen_clock: None
 ) -> None:
-    # The removed ``orphan_candidates`` path had no reachable case: an owned file
-    # set with no ledger row cannot be proved to belong to a finished/archived
-    # task, so it always fails closed to ``protected`` and is never swept.
+    # An owned file set with no ledger row is a deletion candidate once it is
+    # older than logs_days (the frozen far-future clock ages it).
     repo = _repo(tmp_path)
     process_root = repo / terminal_log_retention.PROCESS_FILES_RELATIVE_PATH
     process_root.mkdir(parents=True, exist_ok=True)
@@ -199,8 +198,8 @@ def test_orphan_files_stay_protected_never_a_candidate(
 
     preview = terminal_log_retention.preview(repo)
 
-    assert all(item["request_id"] != orphan_id for item in preview["candidates"])
-    assert any(item["request_id"] == orphan_id for item in preview["protected"])
+    assert any(item["request_id"] == orphan_id for item in preview["candidates"])
+    assert all(item["request_id"] != orphan_id for item in preview["protected"])
 
 
 # --------------------------------------------------------------------------
@@ -258,29 +257,42 @@ def test_purge_reports_bytes_reclaimed_for_unclaimed_batch(
 
 
 def _git(cwd: Path, *args: str) -> None:
-    subprocess.run(
-        ["git", "-c", "user.email=t@t", "-c", "user.name=t", "-C", str(cwd), *args],
-        check=True,
+    result = subprocess.run(
+        [
+            "git", "-c", "safe.directory=*", "-c", "user.email=t@t", "-c", "user.name=t",
+            *args,
+        ],
+        cwd=str(cwd),
+        check=False,
         capture_output=True,
         text=True,
     )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"git {' '.join(args)} failed ({result.returncode}): "
+            f"{result.stderr}{result.stdout}"
+        )
 
 
 @pytest.fixture()
 def retained(tmp_path: Path) -> dict[str, Path]:
     if shutil.which("git") is None:
         pytest.skip("git executable not available in sandbox")
-    remote = tmp_path / "remote.git"
+    origin = tmp_path / "origin.git"
     repo = tmp_path / "repo"
     base = tmp_path / "worktrees"
     base.mkdir()
-    subprocess.run(["git", "init", "--bare", str(remote)], check=True, capture_output=True)
-    _git(tmp_path, "clone", str(remote), str(repo))
+    origin.mkdir()
+    repo.mkdir()
+    # No clone/push: git's local transport is unavailable in the sandbox, so the
+    # remote-tracking ref is written directly.
+    _git(origin, "init", "--bare")
+    _git(repo, "init")
+    _git(repo, "remote", "add", "origin", str(origin))
     (repo / "file.txt").write_text("base\n", encoding="utf-8")
     _git(repo, "add", "file.txt")
     _git(repo, "commit", "-m", "base")
-    _git(repo, "push", "origin", "HEAD:refs/heads/main")
-    _git(repo, "fetch", "origin")
+    _git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
     assert task_store.initialize_repository(repo)["ok"]
     entry = base / "request-safe"
     worktree = entry / "worktree"

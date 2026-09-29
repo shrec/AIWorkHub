@@ -159,6 +159,8 @@ def _write_batch(
         "batch_id": batch_id,
         "created_at": "2035-01-01T00:00:00+00:00",
         "restore_deadline": deadline,
+        # Operator batches keep their deadline; enforce sweeps source-less ones early.
+        "source": "manual",
         "preview_digest": "0" * 64,
         "status": status,
         "items": items,
@@ -245,8 +247,7 @@ def test_enforce_with_nothing_eligible_opens_no_batch(tmp_path: Path) -> None:
     result = terminal_log_retention.enforce(repo)
 
     assert result["status"] == "completed"
-    assert result["quarantined_files"] == 0
-    assert result["batch_id"] == ""
+    assert result["deleted"] == 0
     assert terminal_log_retention.list_batches(repo)["count"] == 0
 
 

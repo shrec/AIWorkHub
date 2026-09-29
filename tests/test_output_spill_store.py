@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import os
+import time
 
 import pytest
 
@@ -267,3 +269,114 @@ def test_spill_and_prune_rejects_non_positive_budget_before_any_write(
         output_spill_store.spill_and_prune("x" * 5000, repo=tmp_path, max_bytes=-1)
 
     assert not spill_dir.exists()
+
+
+# --- lifetime: logs_days pruning and repeat-spill refresh --------------------
+
+_DAY = 86400
+
+
+def test_verified_repeat_spill_refreshes_the_payload_mtime(tmp_path, monkeypatch) -> None:
+    receipt = output_spill_store.spill_text("refresh me", repo=tmp_path)
+    stored = tmp_path / ".aiworkhub" / "spill" / f"{receipt.content_sha256}.txt"
+    touched: list[str] = []
+    monkeypatch.setattr(
+        output_spill_store.os, "utime", lambda path, *a, **k: touched.append(str(path))
+    )
+
+    output_spill_store.spill_text("refresh me", repo=tmp_path)
+
+    assert touched == [str(stored)]
+
+
+def test_repeat_spill_keeps_an_aged_payload_alive_for_prune_expired(tmp_path) -> None:
+    receipt = output_spill_store.spill_text("still in use", repo=tmp_path)
+    stored = tmp_path / ".aiworkhub" / "spill" / f"{receipt.content_sha256}.txt"
+    aged = time.time() - 10 * _DAY
+    os.utime(stored, (aged, aged))
+
+    output_spill_store.spill_text("still in use", repo=tmp_path)
+    result = output_spill_store.prune_expired(tmp_path, max_age_days=1)
+
+    assert result["removed"] == 0
+    assert output_spill_store.retrieve_text(receipt.locator, repo=tmp_path) == "still in use"
+
+
+def test_repeat_spill_survives_payload_pruned_before_the_read(tmp_path, monkeypatch) -> None:
+    text = "pruned mid-spill"
+    receipt = output_spill_store.spill_text(text, repo=tmp_path)
+    stored = tmp_path / ".aiworkhub" / "spill" / f"{receipt.content_sha256}.txt"
+    real_read_bytes = type(stored).read_bytes
+    raced: list[bool] = []
+
+    def _pruned_then_missing(self):
+        if self == stored and not raced:
+            raced.append(True)
+            self.unlink()
+            raise FileNotFoundError(str(self))
+        return real_read_bytes(self)
+
+    monkeypatch.setattr(type(stored), "read_bytes", _pruned_then_missing)
+
+    again = output_spill_store.spill_text(text, repo=tmp_path)
+
+    assert raced == [True]
+    assert again.content_sha256 == receipt.content_sha256
+    assert stored.is_file()
+    assert hashlib.sha256(real_read_bytes(stored)).hexdigest() == receipt.content_sha256
+
+
+def test_prune_expired_removes_old_spill_and_temp_files_only(tmp_path) -> None:
+    receipt = output_spill_store.spill_text("expiring payload", repo=tmp_path)
+    spill_dir = tmp_path / ".aiworkhub" / "spill"
+    stale_tmp = spill_dir / f".{receipt.content_sha256}.abc123.tmp"
+    stale_tmp.write_bytes(b"partial")
+    unrelated = spill_dir / "notes.txt"
+    unrelated.write_text("not a spill file", encoding="utf-8")
+
+    young = output_spill_store.prune_expired(tmp_path, max_age_days=1)
+    assert young == {"scanned": 2, "removed": 0, "bytes_freed": 0, "errors": []}
+
+    result = output_spill_store.prune_expired(
+        tmp_path, max_age_days=1, now=time.time() + 10 * _DAY
+    )
+
+    assert result["scanned"] == 2
+    assert result["removed"] == 2
+    assert result["bytes_freed"] == len(b"expiring payload") + len(b"partial")
+    assert result["errors"] == []
+    assert not stale_tmp.exists()
+    assert unrelated.is_file()
+    with pytest.raises(output_spill_store.OutputSpillError, match="output_spill_store_missing"):
+        output_spill_store.retrieve_text(receipt.locator, repo=tmp_path)
+
+
+def test_prune_expired_reports_capped_path_errors_and_keeps_going(tmp_path, monkeypatch) -> None:
+    receipt = output_spill_store.spill_text("locked payload", repo=tmp_path)
+    spill_dir = tmp_path / ".aiworkhub" / "spill"
+    for index in range(104):
+        (spill_dir / f".{receipt.content_sha256}.{index}.tmp").write_bytes(b"x")
+
+    def _refuse(self, *args, **kwargs):
+        raise PermissionError("locked")
+
+    monkeypatch.setattr(type(spill_dir), "unlink", _refuse)
+    result = output_spill_store.prune_expired(
+        tmp_path, max_age_days=1, now=time.time() + 10 * _DAY
+    )
+
+    assert result["scanned"] == 105
+    assert result["removed"] == 0
+    assert len(result["errors"]) == 100
+    assert all(isinstance(entry, str) for entry in result["errors"])
+    assert all(entry.endswith(": locked") for entry in result["errors"])
+    assert all(entry.startswith(str(spill_dir)) for entry in result["errors"])
+
+
+def test_prune_expired_without_a_spill_directory_is_a_no_op(tmp_path) -> None:
+    assert output_spill_store.prune_expired(tmp_path, max_age_days=1) == {
+        "scanned": 0,
+        "removed": 0,
+        "bytes_freed": 0,
+        "errors": [],
+    }

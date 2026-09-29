@@ -2,10 +2,11 @@
 
 The append-only process event ledger is canonical evidence; its bounded active
 file and immutable rotations are never cleanup candidates here. Only the four
-per-request files owned by a terminal run
-may enter quarantine, and only after the task store independently confirms the
-task itself is finished or archived.  Active, review, blocked, pending,
-unknown and recent runs fail closed.
+per-request files owned by a terminal run are deleted, and only after the task
+store independently confirms the task is decided (finished, archived or
+superseded) and its usage capture is recorded; orphans are deleted once older
+than ``logs_days``.  Active, review, blocked, pending and unknown runs fail
+closed.
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from . import (
+    output_spill_store,
     process_event_ledger,
     provider_usage,
     repo_policy,
@@ -44,12 +46,6 @@ LEGACY_PROCESS_LOG_RELATIVE_PATH = Path("logs/process_events.jsonl")
 LEGACY_PROCESS_FILES_RELATIVE_PATH = Path("logs/processes")
 MANIFEST_NAME = "manifest.json"
 UNDO_DAYS = 7
-# Completed task output is retained by age, not forever by per-task position.
-# The canonical append-only event ledger remains available after these bounded
-# stdout/stderr/request artifacts enter quarantine.  Active and review tasks
-# still fail closed below, so removing this historical keep-last exemption does
-# not discard evidence that a manager has not adjudicated yet.
-KEEP_LAST_PER_TASK = 0
 # Compatibility constant for callers/tests.  Writers rotate at 48 MiB and the
 # reader streams every immutable segment, so this is no longer a failure cap.
 MAX_LEDGER_BYTES = 64 * 1024 * 1024
@@ -95,6 +91,8 @@ _enforcement_lock = threading.Lock()
 _TERMINAL_STATES = frozenset(
     task_fsm.LAUNCHER_TERMINAL_SUBSTATUSES | {"accepted", "rejected", "archived"}
 )
+# Task statuses a manager has adjudicated; only their runs' logs may be deleted.
+_DECIDED_TASK_STATUSES = frozenset({"finished", "archived", "superseded"})
 
 
 class TerminalLogRetentionError(RuntimeError):
@@ -522,7 +520,7 @@ def _candidate_payload(root: Path, *, deadline: float | None = None) -> dict[str
             raise TerminalLogRetentionError("terminal_log_root_invalid")
     cutoff = now_utc() - timedelta(days=_logs_days(root))
     protected: list[dict[str, Any]] = []
-    eligible_by_task: dict[str, list[dict[str, Any]]] = {}
+    candidates: list[dict[str, Any]] = []
     # One directory stat of every owned per-request file.  IO-bound (``lstat``
     # releases the GIL), so it overlaps across a core-derived worker count on a
     # large store while a small one stays sequential -- identical result either
@@ -569,13 +567,13 @@ def _candidate_payload(root: Path, *, deadline: float | None = None) -> dict[str
             "size_bytes": sum(entry["size_bytes"] for entry in files),
             "files": files,
         }
-        if state not in _TERMINAL_STATES or task_status not in {"finished", "archived"}:
+        if state not in _TERMINAL_STATES or task_status not in _DECIDED_TASK_STATUSES:
             protected.append({**item, "reason": "active_or_unverified_authority"})
             continue
         if request_id not in usage_capture_ids:
             protected.append({**item, "reason": "usage_capture_receipt_missing"})
             continue
-        eligible_by_task.setdefault(task_id, []).append(item)
+        candidates.append(item)
 
     orphan_file_bytes = 0
     for request_id, files in sorted(inventory.items()):
@@ -595,40 +593,17 @@ def _candidate_payload(root: Path, *, deadline: float | None = None) -> dict[str
             "size_bytes": sum(int(item["size_bytes"]) for item in files),
             "files": files,
         }
-        orphan_modified = datetime.fromisoformat(orphan_item["modified_at"])
-        protected.append({
-            **orphan_item,
-            "reason": (
-                "usage_capture_receipt_missing"
-                if orphan_modified <= cutoff
-                else "orphan_retention_age_not_met"
-            ),
-        })
+        if datetime.fromisoformat(orphan_item["modified_at"]) <= cutoff:
+            candidates.append(orphan_item)
+        else:
+            protected.append({**orphan_item, "reason": "orphan_retention_age_not_met"})
 
-    candidates: list[dict[str, Any]] = []
-    for rows in eligible_by_task.values():
-        rows.sort(key=lambda item: (item["modified_at_ns"], item["request_id"]), reverse=True)
-        for index, item in enumerate(rows):
-            modified = datetime.fromisoformat(item["modified_at"])
-            if index < KEEP_LAST_PER_TASK:
-                protected.append({**item, "reason": "last_runs_protected"})
-            elif modified > cutoff:
-                protected.append({**item, "reason": "retention_age_not_met"})
-            else:
-                candidates.append(item)
-    # NF-2026-00286: an orphan (a per-request file set with no ledger row) can
-    # never be proved to belong to a finished/archived task, so it is always
-    # protected above and fails closed -- it is never a quarantine candidate.
-    # The former ``candidates.extend(orphan_candidates)`` consumed a list that
-    # nothing ever appended to; wiring it would sweep unattributable files and
-    # break that fail-closed guarantee, so the dead path is removed rather than
-    # wired.
+    # An orphan (per-request files with no ledger row) is a candidate once older than logs_days.
     candidates.sort(key=lambda item: item["request_id"])
     digest_source = {
         "schema_id": SCHEMA_ID,
         "repo_id": _repo_id(root),
         "logs_days": _logs_days(root),
-        "keep_last_per_task": KEEP_LAST_PER_TASK,
         "candidates": candidates,
     }
     digest = hashlib.sha256(
@@ -692,7 +667,6 @@ def _candidate_payload(root: Path, *, deadline: float | None = None) -> dict[str
         # short, so a partial measurement never reads as a whole (or clean) one.
         "partial": partial,
         "logs_days": _logs_days(root),
-        "keep_last_per_task": KEEP_LAST_PER_TASK,
         "current_bytes": observed_current_bytes,
         "canonical_current_bytes": canonical_current_bytes,
         "legacy_current_bytes": legacy_current_bytes,
@@ -854,6 +828,9 @@ def quarantine(repo_root: Path | str, *, preview_digest: str, confirm: bool) -> 
         "created_at": now.isoformat(),
         "restore_deadline": (now + timedelta(days=UNDO_DAYS)).isoformat(),
         "preview_digest": preview_digest,
+        # An operator-invoked batch keeps its undo window; enforce sweeps only
+        # source-less (automatically created) batches regardless of deadline.
+        "source": "manual",
         "status": "quarantining",
         "items": [dict(item, state="planned") for item in current["candidates"]],
         "legacy_store": (
@@ -1035,14 +1012,15 @@ def list_batches(repo_root: Path | str) -> dict[str, Any]:
     return {"ok": True, "batches": rows, "count": len(rows)}
 
 
-def _all_batch_deadlines(root: Path) -> list[tuple[str, datetime]]:
-    """Return every valid quarantine deadline without walking batch payloads.
+def _all_batch_records(root: Path) -> list[tuple[str, datetime, str]]:
+    """Return every valid batch's ``(id, deadline, source)`` without walking payloads.
 
     ``list_batches`` is intentionally UI-bounded to the newest 100 entries. It
     must therefore never drive automatic expiry: on a busy repository, a steady
     stream of new batches kept every older expired batch permanently outside
     that window. This lightweight authority scan reads only each manifest and
-    lets enforcement purge the complete expired population.
+    lets enforcement purge the complete expired population. ``source`` is ""
+    for a batch created automatically (its manifest carries no ``source``).
     """
     qroot = root / QUARANTINE_RELATIVE_PATH
     try:
@@ -1054,7 +1032,7 @@ def _all_batch_deadlines(root: Path) -> list[tuple[str, datetime]]:
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
         raise TerminalLogRetentionError("terminal_log_quarantine_root_invalid")
     repo_id = _repo_id(root)
-    rows: list[tuple[str, datetime]] = []
+    rows: list[tuple[str, datetime, str]] = []
     for entry in qroot.iterdir():
         try:
             entry_info = entry.lstat()
@@ -1071,7 +1049,7 @@ def _all_batch_deadlines(root: Path) -> list[tuple[str, datetime]]:
             deadline = datetime.fromisoformat(str(value.get("restore_deadline") or ""))
         except (TerminalLogRetentionError, ValueError):
             continue
-        rows.append((entry.name, deadline))
+        rows.append((entry.name, deadline, str(value.get("source") or "")))
     return sorted(rows, key=lambda item: (item[1], item[0]))
 
 
@@ -1260,7 +1238,11 @@ def _batch_reapable_empty(manifest: Mapping[str, Any], batch_path: Path) -> bool
 def purge(repo_root: Path | str, *, batch_id: str, confirm: bool) -> dict[str, Any]:
     if confirm is not True:
         raise TerminalLogRetentionError("explicit_confirmation_required")
-    root = Path(repo_root).resolve()
+    return _purge_batch(Path(repo_root).resolve(), batch_id, honour_deadline=True)
+
+
+def _purge_batch(root: Path, batch_id: str, *, honour_deadline: bool) -> dict[str, Any]:
+    """Remove one batch; ``honour_deadline=False`` is enforce's source-less sweep."""
     batch = _batch(root, batch_id)
     manifest = _manifest(batch / MANIFEST_NAME, _repo_id(root))
     try:
@@ -1275,7 +1257,7 @@ def purge(repo_root: Path | str, *, batch_id: str, confirm: bool) -> dict[str, A
     # is reapable before its deadline; a batch whose record reads empty while its
     # directory still holds bytes keeps its full window and is reconciled, never
     # purged out from under an operator on a stale record.
-    if now_utc() < deadline and not _batch_reapable_empty(manifest, batch):
+    if honour_deadline and now_utc() < deadline and not _batch_reapable_empty(manifest, batch):
         raise TerminalLogRetentionError("retention_undo_window_active")
     # NF-2026-00287: report the bytes actually reclaimed from disk, not the
     # record's ``quarantined_bytes``. A batch whose files exist on disk but are
@@ -1426,6 +1408,9 @@ def _stage_reconcile_batch(
         "status": "reconciling",
         "reconciled": True,
         "reconcile_action": action,
+        # Only the explicit operator reconcile reaches this now, so the batch
+        # keeps its undo window instead of being swept as automatic.
+        "source": "manual",
         "items": items,
         "quarantined_files": 0,
         "quarantined_bytes": 0,
@@ -1747,9 +1732,8 @@ def enforce_process_log_bounds(repo_root: Path | str, *, confirm: bool = True) -
 
     Oversized logs of terminal runs are tail-capped in place (head released, tail
     kept). Attempt-artifacts bundles of terminal runs aged past ``logs_days`` are
-    moved into a reversible quarantine batch (7-day undo, then ordinary purge).
-    A live/non-terminal run is never touched. ``confirm=False`` returns the
-    read-only preview unchanged.
+    deleted. A live/non-terminal run is never touched. ``confirm=False`` returns
+    the read-only preview unchanged.
     """
     root = Path(repo_root).resolve()
     if not confirm:
@@ -1765,30 +1749,45 @@ def enforce_process_log_bounds(repo_root: Path | str, *, confirm: bool = True) -
             continue  # raced away or shrank since the plan; skip
         freed += _tail_cap_file(path, int(info.st_size))
         capped += 1
-    staged = (
-        _stage_reconcile_batch(root, plan["aged_bundles"], action="attempt_artifacts_bound")
-        if plan["aged_bundles"]
-        else {"batch_id": "", "count": 0, "bytes": 0}
-    )
-    if capped or staged["count"]:
+    bundles_deleted = 0
+    bundle_bytes = 0
+    errors: list[str] = []
+    for bundle in plan["aged_bundles"]:
+        path = Path(bundle["path"])
+        try:
+            b_info = path.lstat()
+        except OSError:
+            continue  # raced away since the plan
+        # Re-prove identity immediately before removal: a real directory, never
+        # a symlink swapped in since the plan.
+        if stat.S_ISLNK(b_info.st_mode) or not stat.S_ISDIR(b_info.st_mode):
+            continue
+        try:
+            shutil.rmtree(path)
+        except OSError as exc:
+            if len(errors) < 100:
+                errors.append(f"{path}: {exc}")
+            continue
+        bundles_deleted += 1
+        bundle_bytes += int(bundle["size_bytes"])
+    if capped or bundles_deleted:
         _append_audit(root, {
             "schema_id": AUDIT_SCHEMA_ID,
             "timestamp": now_utc().isoformat(),
             "action": "process_log_bounds_enforced",
             "logs_capped": capped,
             "log_bytes_freed": freed,
-            "bundles_quarantined": staged["count"],
-            "bundle_batch_id": staged["batch_id"],
-            "bundle_bytes": staged["bytes"],
+            "bundles_deleted": bundles_deleted,
+            "bundle_bytes": bundle_bytes,
         })
     return {
         "ok": True,
         "repository_scoped": True,
         "logs_capped": capped,
         "log_bytes_freed": freed,
-        "bundles_quarantined": staged["count"],
-        "bundle_batch_id": staged["batch_id"],
-        "bundle_bytes": staged["bytes"],
+        "bundles_deleted": bundles_deleted,
+        "bundle_bytes": bundle_bytes,
+        "errors": errors,
     }
 
 
@@ -1826,89 +1825,153 @@ def _dead_owner_temp_gc(root: Path) -> tuple[int, int]:
     return count, released
 
 
-def enforce(repo_root: Path | str) -> dict[str, Any]:
-    """Apply configured log age and quarantine deadlines once.
+def _delete_worker_count() -> int:
+    """Threads for direct candidate deletion: every core but one, never zero."""
+    return max(1, (os.cpu_count() or 2) - 1)
 
-    Old active output enters reversible quarantine.  Permanent deletion is
-    limited to batches whose independent seven-day undo window has expired.
-    The repository-local temp authority is reaped here too: this is the sole
-    cleanup authority, and only exact dead-owner request directories (never a
-    live or unknown owner) are removed.
+
+def _delete_candidate(process_root: Path, item: Mapping[str, Any]) -> dict[str, Any]:
+    """Delete one candidate's owned files after re-proving their identity.
+
+    Per-item isolated: any failure is returned as ``error`` and never escapes,
+    so one bad request can never stop the rest of the sweep.  A file whose
+    size or mtime changed since classification is left untouched.
+    """
+    request_id = str(item.get("request_id") or "")
+    outcome: dict[str, Any] = {"request_id": request_id, "files": 0, "bytes": 0, "error": ""}
+    try:
+        if not _REQUEST_RE.fullmatch(request_id):
+            outcome["error"] = "request_id_invalid"
+            return outcome
+        expected_files = [entry for entry in item.get("files") or [] if isinstance(entry, Mapping)]
+        owned_names = {f"{request_id}{suffix}" for suffix in _OWNED_SUFFIXES}
+        for expected in expected_files:
+            name = str(expected.get("name") or "")
+            info = (
+                _owned_regular_file(process_root / name, process_root)
+                if name in owned_names
+                else None
+            )
+            if (
+                info is None
+                or int(info.st_size) != int(expected.get("size_bytes", -1))
+                or int(info.st_mtime_ns) != int(expected.get("mtime_ns", -1))
+            ):
+                outcome["error"] = "identity_changed"
+                return outcome
+        for expected in expected_files:
+            (process_root / str(expected["name"])).unlink()
+            outcome["files"] += 1
+            outcome["bytes"] += int(expected["size_bytes"])
+    except Exception as exc:  # noqa: BLE001 - per-item error isolation
+        outcome["error"] = f"delete_failed:{type(exc).__name__}"
+    return outcome
+
+
+def _delete_candidates(
+    root: Path, candidates: list[dict[str, Any]], *, workers: int | None = None
+) -> dict[str, Any]:
+    """Delete every candidate directly, in parallel, with an order-stable result.
+
+    ``pool.map`` preserves input order, so the aggregate is identical to the
+    single-threaded path whatever the pool size.
+    """
+    process_root = root / PROCESS_FILES_RELATIVE_PATH
+    count = _delete_worker_count() if workers is None else max(1, int(workers))
+    if count <= 1 or len(candidates) <= 1:
+        outcomes = [_delete_candidate(process_root, item) for item in candidates]
+    else:
+        with ThreadPoolExecutor(max_workers=count) as pool:
+            outcomes = list(pool.map(lambda item: _delete_candidate(process_root, item), candidates))
+    return {
+        "deleted": sum(1 for outcome in outcomes if not outcome["error"]),
+        "deleted_files": sum(int(outcome["files"]) for outcome in outcomes),
+        "deleted_bytes": sum(int(outcome["bytes"]) for outcome in outcomes),
+        "errors": [
+            {"request_id": outcome["request_id"], "reason": outcome["error"]}
+            for outcome in outcomes
+            if outcome["error"]
+        ][:100],
+    }
+
+
+def enforce(repo_root: Path | str) -> dict[str, Any]:
+    """Apply the configured log, batch, bundle and spill lifetimes once.
+
+    Usage capture is backfilled first, so a finished run whose retained stdout
+    still holds its receipt is never blocked on it.  Every terminal request
+    whose task is decided and whose usage is captured, and every orphan older
+    than ``logs_days``, is deleted directly -- no quarantine batch is opened.
+    A log batch whose manifest has no ``source`` was created automatically and
+    is purged regardless of its deadline; a ``source="manual"`` batch keeps its
+    undo window.  Aged attempt bundles, exact dead-owner temp directories and
+    spill files older than ``logs_days`` are removed in the same pass.
     """
 
     root = Path(repo_root).resolve()
     if not _enforcement_lock.acquire(blocking=False):
         return {"ok": True, "status": "already_running", "repository_scoped": True}
     try:
+        usage_backfill = backfill_usage_capture(root, confirm=True)
         purged_batches = 0
         purged_bytes = 0
         next_deadline: tuple[datetime, str] | None = None
-        for batch_id, deadline in _all_batch_deadlines(root):
-            # Reap only batches whose independent seven-day undo window has
-            # actually expired.  A pre-existing empty batch is reapable on an
-            # explicit operator purge (see ``purge``/``_batch_is_empty``), but
-            # enforce never deletes a batch the operator has not asked to
-            # release: this repository has spent enough of its history letting
-            # retention destroy things that were still wanted, so an empty batch
-            # is made eligible and surfaced, not silently swept.
-            if now_utc() < deadline:
+        for batch_id, deadline, source in _all_batch_records(root):
+            if source and now_utc() < deadline:
                 if next_deadline is None or deadline < next_deadline[0]:
                     next_deadline = (deadline, deadline.isoformat())
                 continue
-            result = purge(root, batch_id=batch_id, confirm=True)
+            result = _purge_batch(root, batch_id, honour_deadline=False)
             purged_batches += 1
             purged_bytes += int(result.get("bytes") or 0)
 
         current = _candidate_payload(root)
-        quarantined_files = 0
-        quarantined_bytes = 0
-        batch_id = ""
-        if current.get("candidate_count"):
-            result = quarantine(
-                root,
-                preview_digest=str(current["preview_digest"]),
-                confirm=True,
-            )
-            quarantined_files = int(result.get("quarantined") or 0)
-            quarantined_bytes = int(result.get("bytes") or 0)
-            batch_id = str(result.get("batch_id") or "")
+        deletion = _delete_candidates(root, list(current.get("candidates") or []))
 
         temp_gc_count, temp_gc_bytes = _dead_owner_temp_gc(root)
         # The per-file worker-log bound and the attempt-artifacts bound: an
         # oversized terminal-run log is tail-capped (head released, diagnostic
-        # tail kept) and an aged terminal-run bundle enters reversible quarantine.
-        # A live/non-terminal run is never touched, so this self-bounds the two
-        # stores that previously grew without limit without ever cutting a tail an
-        # operator still needs.
+        # tail kept) and an aged terminal-run bundle is deleted.  A live or
+        # non-terminal run is never touched.
         process_bounds = enforce_process_log_bounds(root, confirm=True)
+        spill = output_spill_store.prune_expired(root, max_age_days=_logs_days(root))
         _append_audit(root, {
             "schema_id": AUDIT_SCHEMA_ID,
             "timestamp": now_utc().isoformat(),
             "action": "policy_enforcement_completed",
-            "quarantined_files": quarantined_files,
-            "quarantined_bytes": quarantined_bytes,
+            "usage_backfill_recorded": int(usage_backfill.get("recorded") or 0),
+            "deleted": deletion["deleted"],
+            "deleted_files": deletion["deleted_files"],
+            "deleted_bytes": deletion["deleted_bytes"],
+            "delete_errors": len(deletion["errors"]),
             "purged_batches": purged_batches,
             "purged_bytes": purged_bytes,
             "temp_gc_count": temp_gc_count,
             "temp_gc_bytes": temp_gc_bytes,
             "logs_capped": int(process_bounds.get("logs_capped") or 0),
-            "bundles_quarantined": int(process_bounds.get("bundles_quarantined") or 0),
+            "bundles_deleted": int(process_bounds.get("bundles_deleted") or 0),
+            "spill_removed": int(spill.get("removed") or 0),
+            "spill_bytes_freed": int(spill.get("bytes_freed") or 0),
         })
         return {
             "ok": True,
             "status": "completed",
             "repository_scoped": True,
-            "batch_id": batch_id,
-            "quarantined_files": quarantined_files,
-            "quarantined_bytes": quarantined_bytes,
+            "usage_backfill": usage_backfill,
+            "deleted": deletion["deleted"],
+            "deleted_files": deletion["deleted_files"],
+            "deleted_bytes": deletion["deleted_bytes"],
+            "delete_errors": deletion["errors"],
             "purged_batches": purged_batches,
             "purged_bytes": purged_bytes,
             "temp_gc_count": temp_gc_count,
             "temp_gc_bytes": temp_gc_bytes,
             "logs_capped": int(process_bounds.get("logs_capped") or 0),
             "log_bytes_freed": int(process_bounds.get("log_bytes_freed") or 0),
-            "bundles_quarantined": int(process_bounds.get("bundles_quarantined") or 0),
+            "bundles_deleted": int(process_bounds.get("bundles_deleted") or 0),
             "bundle_bytes": int(process_bounds.get("bundle_bytes") or 0),
+            "bundle_errors": list(process_bounds.get("errors") or []),
+            "spill": spill,
             "next_deadline": next_deadline[1] if next_deadline else None,
         }
     finally:

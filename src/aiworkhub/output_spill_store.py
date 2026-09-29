@@ -23,17 +23,21 @@ prune with the locator embedded), and ``build_telemetry`` reports the byte
 accounting a caller needs -- explicitly marking provider-token savings as
 UNKNOWN, since a byte or character count is not a token count.
 
-Known bounded-foundation limit: this slice retains every spilled file under
-the repository-scoped store indefinitely. There is no eviction, TTL, or size
-cap on the store itself -- that is out of scope here and must not be assumed
-to exist.
+Lifetime: a spilled file lives ``logs_days`` (repository retention policy)
+from its last write or verified repeat spill; ``prune_expired`` -- run by the
+terminal-log retention janitor -- removes older payloads and stale temp
+files. A locator whose payload has expired fails closed on retrieval with
+``output_spill_store_missing``.
 """
 
 from __future__ import annotations
 
 import hashlib
 import os
+import re
+import stat
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -44,6 +48,9 @@ _SPILL_SUBDIR = Path(".aiworkhub") / "spill"
 _LOCATOR_PREFIX = "aiworkhub-spill-sha256:"
 _MARKER_SCHEMA_ID = "aiworkhub.output_spill_store.measured_pruning_marker.v1"
 _TELEMETRY_SCHEMA_ID = "aiworkhub.output_spill_store.telemetry.v1"
+_SPILL_FILE_RE = re.compile(r"^[0-9a-f]{64}\.txt$")
+_SPILL_TMP_RE = re.compile(r"^\.[0-9a-f]{64}\..*\.tmp$")
+_PRUNE_ERROR_CAP = 100
 
 
 class OutputSpillError(RuntimeError):
@@ -132,9 +139,21 @@ def spill_text(text: str, *, repo: Path | str) -> SpillReceipt:
     tmp_path: Path | None = None
     try:
         root.mkdir(parents=True, exist_ok=True)
-        if target.exists():
-            if hashlib.sha256(target.read_bytes()).hexdigest() != digest:
+        existing: bytes | None = None
+        try:
+            existing = target.read_bytes()
+        except FileNotFoundError:
+            existing = None  # absent, or pruned by the janitor since the last spill
+        if existing is not None:
+            if hashlib.sha256(existing).hexdigest() != digest:
                 raise OutputSpillError(f"output_spill_store_collision:{digest}")
+            # A verified repeat spill restarts the payload's logs_days lifetime
+            # so prune_expired keeps text that is still being produced. The
+            # bytes are already durable, so a refused refresh is not a failure.
+            try:
+                os.utime(target)
+            except OSError:
+                pass
         else:
             fd, tmp_name = tempfile.mkstemp(
                 dir=str(root), prefix=f".{digest}.", suffix=".tmp"
@@ -164,6 +183,60 @@ def spill_text(text: str, *, repo: Path | str) -> SpillReceipt:
             "exact original bytes; the locator carries no filesystem path."
         ),
     )
+
+
+def prune_expired(
+    repo: Path | str, *, max_age_days: int, now: float | None = None
+) -> dict[str, Any]:
+    """Remove spill payloads and stale temp files older than ``max_age_days``.
+
+    Only ``<digest>.txt`` payloads and ``.<digest>.*.tmp`` leftovers directly
+    under the repository's spill root are considered; anything else is left
+    alone. Age is the file mtime, which :func:`spill_text` refreshes on every
+    verified repeat spill, so a payload still being produced stays young.
+    Each removal is isolated: a failure is recorded as ``"<path>: <exc>"``
+    (at most ``_PRUNE_ERROR_CAP`` entries) and the sweep continues.
+    """
+
+    root = _spill_root(repo)
+    reference = time.time() if now is None else float(now)
+    cutoff = reference - max(0, int(max_age_days)) * 86400
+    scanned = removed = bytes_freed = 0
+    errors: list[str] = []
+
+    def _record(path: Path, exc: OSError) -> None:
+        if len(errors) < _PRUNE_ERROR_CAP:
+            errors.append(f"{path}: {exc}")
+
+    try:
+        entries = list(root.iterdir())
+    except FileNotFoundError:
+        entries = []
+    except OSError as exc:
+        entries = []
+        _record(root, exc)
+    for path in entries:
+        if not (_SPILL_FILE_RE.fullmatch(path.name) or _SPILL_TMP_RE.fullmatch(path.name)):
+            continue
+        scanned += 1
+        try:
+            info = path.lstat()
+            if not stat.S_ISREG(info.st_mode) or info.st_mtime >= cutoff:
+                continue
+            path.unlink()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            _record(path, exc)
+            continue
+        removed += 1
+        bytes_freed += int(info.st_size)
+    return {
+        "scanned": scanned,
+        "removed": removed,
+        "bytes_freed": bytes_freed,
+        "errors": errors,
+    }
 
 
 def retrieve_text(locator: str, *, repo: Path | str) -> str:

@@ -185,7 +185,7 @@ def test_latest_rows_uses_incremental_ledger_projection(
     }
 
 
-def test_policy_enforcement_automatically_quarantines_expired_output(tmp_path: Path) -> None:
+def test_policy_enforcement_deletes_decided_output_without_a_batch(tmp_path: Path) -> None:
     repo = _repo(tmp_path)
     request_id = "1" * 32
     _run(repo, request_id, "TASK_DONE")
@@ -193,10 +193,11 @@ def test_policy_enforcement_automatically_quarantines_expired_output(tmp_path: P
     result = terminal_log_retention.enforce(repo)
 
     assert result["status"] == "completed"
-    assert result["quarantined_files"] == 4
+    assert result["deleted"] == 1
+    assert result["deleted_files"] == 4
     process_root = repo / terminal_log_retention.PROCESS_FILES_RELATIVE_PATH
     assert not (process_root / f"{request_id}.stdout.log").exists()
-    assert terminal_log_retention.list_batches(repo)["count"] == 1
+    assert terminal_log_retention.list_batches(repo)["count"] == 0
 
 
 def test_preview_accounts_for_orphan_request_files_and_legacy_store(tmp_path: Path) -> None:
@@ -217,7 +218,9 @@ def test_preview_accounts_for_orphan_request_files_and_legacy_store(tmp_path: Pa
     assert result["legacy_current_bytes"] >= 4096
     assert result["legacy_status"] == "present_unmanaged"
     assert result["current_bytes"] >= 7168
-    assert result["protected_count"] == 2
+    # The aged orphan is a candidate; the legacy store stays protected.
+    assert result["candidate_count"] == 1
+    assert result["protected_count"] == 1
 
 
 def test_preview_expresses_orphan_age_without_mtime_mutation(
@@ -230,13 +233,11 @@ def test_preview_expresses_orphan_age_without_mtime_mutation(
     orphan_path = process_root / f"{orphan_id}.stdout.log"
     orphan_path.write_bytes(b"old")
 
-    # An aged orphan (mtime well before the frozen cutoff) is still protected,
-    # reported with the usage-capture-missing reason.
+    # An aged orphan (mtime well before the frozen cutoff) is a deletion candidate.
     aged = terminal_log_retention.preview(repo)
-    assert aged["candidate_count"] == 0
-    assert {row["reason"] for row in aged["protected"]} == {
-        "usage_capture_receipt_missing"
-    }
+    assert aged["candidate_count"] == 1
+    assert {row["request_id"] for row in aged["candidates"]} == {orphan_id}
+    assert aged["protected_count"] == 0
 
     # A recent orphan (clock pinned at real write time) is protected with the
     # retention-age-not-met reason instead.
@@ -490,6 +491,8 @@ def test_enforce_purges_expired_batch_beyond_bounded_ui_window(tmp_path: Path) -
                 "batch_id": batch_id,
                 "created_at": "2034-01-01T00:00:00+00:00",
                 "restore_deadline": deadline,
+                # Operator batches keep their deadline; source-less ones are swept early.
+                "source": "manual",
                 "status": "quarantined",
                 "quarantined_bytes": 1,
                 "items": [
@@ -533,9 +536,210 @@ def test_stale_preview_and_symlink_swap_fail_closed(tmp_path: Path) -> None:
     request_id = preview["candidates"][0]["request_id"]
     target = repo / terminal_log_retention.PROCESS_FILES_RELATIVE_PATH / f"{request_id}.stdout.log"
     target.unlink()
-    target.symlink_to(repo / terminal_log_retention.PROCESS_LOG_RELATIVE_PATH)
+    try:
+        target.symlink_to(repo / terminal_log_retention.PROCESS_LOG_RELATIVE_PATH)
+    except OSError as exc:
+        # The AppContainer validation lane lacks the symlink privilege
+        # (WinError 1314); the content-swap test below drives the same
+        # stale-preview refusal without it.
+        pytest.skip(f"symlink privilege unavailable: {exc}")
 
     with pytest.raises(terminal_log_retention.TerminalLogRetentionError, match="terminal_log_preview_stale"):
         terminal_log_retention.quarantine(
             repo, preview_digest=preview["preview_digest"], confirm=True
         )
+
+
+def test_stale_preview_after_content_swap_fails_closed(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    for index in range(11):
+        _run(repo, f"{index + 1:032x}", "TASK_DONE")
+    preview = terminal_log_retention.preview(repo)
+    request_id = preview["candidates"][0]["request_id"]
+    target = repo / terminal_log_retention.PROCESS_FILES_RELATIVE_PATH / f"{request_id}.stdout.log"
+    target.write_bytes(target.read_bytes() + b"swapped after preview\n")
+
+    with pytest.raises(terminal_log_retention.TerminalLogRetentionError, match="terminal_log_preview_stale"):
+        terminal_log_retention.quarantine(
+            repo, preview_digest=preview["preview_digest"], confirm=True
+        )
+
+
+# --- S1 janitor C3: decided logs are deleted directly ------------------------
+
+
+def _process_names(repo: Path) -> set[str]:
+    process_root = repo / terminal_log_retention.PROCESS_FILES_RELATIVE_PATH
+    return {path.name for path in process_root.iterdir() if path.is_file()}
+
+
+def _quarantine_entries(repo: Path) -> list[str]:
+    qroot = repo / terminal_log_retention.QUARANTINE_RELATIVE_PATH
+    return sorted(path.name for path in qroot.iterdir()) if qroot.exists() else []
+
+
+def test_enforce_deletes_decided_logs_and_keeps_review_task_logs(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    done_id = "1" * 32
+    review_id = "2" * 32
+    _run(repo, done_id, "TASK_DONE")
+    _run(repo, review_id, "TASK_REVIEW")
+
+    result = terminal_log_retention.enforce(repo)
+
+    assert result["status"] == "completed"
+    assert result["deleted"] == 1
+    assert result["deleted_files"] == len(terminal_log_retention._OWNED_SUFFIXES)
+    assert result["delete_errors"] == []
+    names = _process_names(repo)
+    assert not any(name.startswith(done_id) for name in names)
+    assert {
+        f"{review_id}{suffix}" for suffix in terminal_log_retention._OWNED_SUFFIXES
+    } <= names
+    # Deleted directly: no quarantine batch is opened.
+    assert _quarantine_entries(repo) == []
+
+
+def test_enforce_backfills_uncaptured_usage_then_deletes_in_the_same_pass(
+    tmp_path: Path,
+) -> None:
+    repo = _repo(tmp_path)
+    request_id = "d" * 32
+    process_root = repo / terminal_log_retention.PROCESS_FILES_RELATIVE_PATH
+    process_root.mkdir(parents=True, exist_ok=True)
+    for suffix in terminal_log_retention._OWNED_SUFFIXES:
+        (process_root / f"{request_id}{suffix}").write_text(
+            '{"type":"result","usage":{"input_tokens":7,"output_tokens":3}}\n'
+            if suffix == ".stdout.log" else "run\n",
+            encoding="utf-8",
+        )
+    ledger = repo / terminal_log_retention.PROCESS_LOG_RELATIVE_PATH
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    ledger.write_text(json.dumps({
+        "request_id": request_id,
+        "task_id": "TASK_DONE",
+        "runner": "runner",
+        "topic": "topic",
+        "adapter_id": "codex_cli",
+        "model": "codex",
+        "state": "exited",
+    }) + "\n", encoding="utf-8")
+
+    result = terminal_log_retention.enforce(repo)
+
+    assert result["usage_backfill"]["recorded"] == 1
+    assert result["deleted"] == 1
+    assert _process_names(repo) == set()
+    assert task_store.list_usage_events(repo)[0]["total_tokens"] == 10
+
+
+def test_enforce_deletes_only_aged_orphans_and_never_the_legacy_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _repo(tmp_path)
+    process_root = repo / terminal_log_retention.PROCESS_FILES_RELATIVE_PATH
+    process_root.mkdir(parents=True, exist_ok=True)
+    orphan = process_root / f"{'b' * 32}.stdout.log"
+    orphan.write_bytes(b"orphan")
+    legacy = repo / "logs" / "processes" / "old.stdout.log"
+    legacy.parent.mkdir(parents=True)
+    legacy.write_bytes(b"legacy")
+
+    # Younger than logs_days (clock pinned at real write time): kept.
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            terminal_log_retention, "now_utc", lambda: datetime.now(timezone.utc)
+        )
+        young = terminal_log_retention.enforce(repo)
+    assert young["deleted"] == 0
+    assert orphan.is_file()
+
+    # Older than logs_days (frozen far-future clock): deleted.
+    aged = terminal_log_retention.enforce(repo)
+    assert aged["deleted"] == 1
+    assert not orphan.exists()
+    assert legacy.read_bytes() == b"legacy"
+
+
+def _write_log_batch(repo: Path, batch_id: str, *, deadline: str, source: str | None) -> Path:
+    batch = repo / terminal_log_retention.QUARANTINE_RELATIVE_PATH / batch_id
+    (batch / ("a" * 32)).mkdir(parents=True)
+    (batch / ("a" * 32) / f"{'a' * 32}.stdout.log").write_text("x", encoding="utf-8")
+    manifest: dict[str, object] = {
+        "schema_id": terminal_log_retention.SCHEMA_ID,
+        "repo_id": terminal_log_retention._repo_id(repo),
+        "batch_id": batch_id,
+        "created_at": "2034-01-01T00:00:00+00:00",
+        "restore_deadline": deadline,
+        "status": "quarantined",
+        "quarantined_bytes": 1,
+        "items": [{"request_id": "a" * 32, "state": "quarantined", "files": []}],
+    }
+    if source is not None:
+        manifest["source"] = source
+    (batch / terminal_log_retention.MANIFEST_NAME).write_text(
+        json.dumps(manifest), encoding="utf-8"
+    )
+    return batch
+
+
+def test_enforce_purges_sourceless_batch_early_and_keeps_manual_batch(
+    tmp_path: Path,
+) -> None:
+    repo = _repo(tmp_path)
+    automatic = _write_log_batch(
+        repo, "l20340101T000000-00000000000a",
+        deadline="2040-01-01T00:00:00+00:00", source=None,
+    )
+    manual = _write_log_batch(
+        repo, "l20340101T000000-00000000000b",
+        deadline="2040-01-01T00:00:00+00:00", source="manual",
+    )
+
+    result = terminal_log_retention.enforce(repo)
+
+    assert result["purged_batches"] == 1
+    assert not automatic.exists()
+    assert manual.is_dir()
+    assert result["next_deadline"] == "2040-01-01T00:00:00+00:00"
+
+
+def test_operator_quarantine_stamps_manual_source(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    _run(repo, "1" * 32, "TASK_DONE")
+    preview = terminal_log_retention.preview(repo)
+
+    moved = terminal_log_retention.quarantine(
+        repo, preview_digest=preview["preview_digest"], confirm=True
+    )
+
+    batch = repo / terminal_log_retention.QUARANTINE_RELATIVE_PATH / moved["batch_id"]
+    manifest = json.loads((batch / terminal_log_retention.MANIFEST_NAME).read_text())
+    assert manifest["source"] == "manual"
+
+
+def test_pool_size_one_and_default_pool_delete_identically(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def _sweep(case: str, workers: int) -> tuple[dict[str, object], set[str]]:
+        case_root = tmp_path / case
+        case_root.mkdir()
+        repo = _repo(case_root)
+        for index in range(6):
+            _run(repo, f"{index + 1:032x}", "TASK_DONE")
+        _run(repo, "f" * 32, "TASK_REVIEW")
+        with monkeypatch.context() as patch:
+            patch.setattr(terminal_log_retention, "_delete_worker_count", lambda: workers)
+            result = terminal_log_retention.enforce(repo)
+        summary = {
+            key: result[key]
+            for key in ("deleted", "deleted_files", "deleted_bytes", "delete_errors")
+        }
+        return summary, _process_names(repo)
+
+    sequential = _sweep("sequential", 1)
+    pooled = _sweep("pooled", 4)
+
+    assert sequential == pooled
+    assert sequential[0]["deleted"] == 6
+    assert terminal_log_retention._delete_worker_count() >= 1
