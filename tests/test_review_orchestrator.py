@@ -4678,3 +4678,147 @@ def test_existing_lens_reviewer_ignores_unusable_or_foreign_reviewers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, rows, cards, overrides,
 ) -> None:
     assert _lookup(tmp_path, monkeypatch, rows, cards, **overrides) is None
+
+
+# ---------------------------------------------------------------------------
+# NF-2026-01123 / NF-2026-01115: a manager-launched reviewer that is still a
+# deferred pid-0 ``starting`` reservation is reused by the chain. The lookup is
+# the real ProcessManager ledger rule, read after the deferred launcher thread
+# published preparation progress -- the event that used to drop the sealed
+# attempt identity and so hid the reservation from the chain.
+# ---------------------------------------------------------------------------
+
+
+class _LedgerManager(_Manager):
+    """Chain manager whose reuse lookup is the real ProcessManager ledger."""
+
+    def __init__(self, repo: Path, ledger) -> None:
+        super().__init__(repo)
+        self.ledger = ledger
+
+    def existing_lens_reviewer(self, **kwargs):
+        return self.ledger.existing_lens_reviewer(**kwargs)
+
+
+def _deferred_manager_reservation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    lens: str = "correctness",
+    claim_epoch: str = "1",
+):
+    import os
+    import time
+
+    from aiworkhub import process_launcher
+
+    ledger = process_launcher.ProcessManager(
+        repo=tmp_path,
+        process_log_path=tmp_path / "processes.jsonl",
+        process_dir=tmp_path / "processes",
+        isolation_enabled=False,
+    )
+    cards = {"MANUAL-REVIEWER": {"task_id": "MANUAL-REVIEWER", "status": "claimed"}}
+    original = review_orchestrator.task_store.get_task
+    monkeypatch.setattr(
+        review_orchestrator.task_store, "get_task",
+        lambda repo, task_id: (
+            cards[task_id] if task_id in cards else original(repo, task_id)
+        ),
+    )
+    attempt = {
+        "target_task_id": "TARGET", "target_request_id": "target-request",
+        "lens": lens,
+    }
+    if claim_epoch:
+        attempt["target_claim_epoch"] = claim_epoch
+    # Exactly what aiworkhub_quality_reviewer_launch reserves before it returns
+    # deferred=true, state=starting, pid=0.
+    ledger._append_event({
+        "request_id": "manual-request", "task_id": "MANUAL-REVIEWER",
+        "topic": "quality_review", **ROUTE, "state": "starting",
+        "reservation_expires_at_epoch": time.time() + 600,
+        "owner_pid": os.getpid(),
+        "owner_pid_start_ticks": process_launcher._pid_start_ticks(os.getpid()),
+        "timeout_seconds": 600,
+        "quality_review_attempt": attempt,
+    })
+    ledger._publish_reviewer_progress("manual-request", "packet_prepared")
+    latest = ledger._latest_by_request()["manual-request"]
+    assert latest["state"] == "starting"
+    assert latest["preparation_phase"] == "packet_prepared"
+    assert not latest.get("pid")
+    return ledger, cards
+
+
+def test_nf1123_chain_adopts_deferred_manager_reservation_instead_of_launching(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger, _cards = _deferred_manager_reservation(tmp_path, monkeypatch)
+    manager = _LedgerManager(tmp_path, ledger)
+    driver, chain = _nf1064_driver(tmp_path, manager)
+
+    assert driver.drain(max_actions=1, now=NOW).completed == 1
+
+    assert manager.launches == []
+    attempts = driver._route_attempts(chain.chain_id, "correctness")
+    assert [
+        (
+            row["reviewer_task_id"], row["reviewer_request_id"], row["state"],
+            row["runner"], row["adapter_id"], row["model"],
+        )
+        for row in attempts
+    ] == [(
+        "MANUAL-REVIEWER", "manual-request", "launched",
+        ROUTE["runner"], ROUTE["adapter_id"], ROUTE["model"],
+    )]
+
+
+@pytest.mark.parametrize(
+    ("ledger_state", "card_status"),
+    [
+        ("launch_failed", "claimed"),
+        ("cancelled", "cancelled"),
+        ("starting", "retired"),
+    ],
+    ids=["launch_failed", "cancelled", "retired"],
+)
+def test_nf1123_failed_deferred_reservation_does_not_block_a_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ledger_state: str,
+    card_status: str,
+) -> None:
+    ledger, cards = _deferred_manager_reservation(tmp_path, monkeypatch)
+    manager = _LedgerManager(tmp_path, ledger)
+    assert manager.existing_lens_reviewer(**_LOOKUP_IDENTITY)["state"] == "running"
+    latest = dict(ledger._latest_by_request()["manual-request"])
+    ledger._append_event({**latest, "state": ledger_state})
+    cards["MANUAL-REVIEWER"]["status"] = card_status
+    assert manager.existing_lens_reviewer(**_LOOKUP_IDENTITY) is None
+    driver, _chain = _nf1064_driver(tmp_path, manager)
+
+    assert driver.drain(max_actions=1, now=NOW).completed == 1
+
+    assert len(manager.launches) == 1
+    assert manager.launches[0]["lens"] == "correctness"
+    assert manager.launches[0]["reviewer_task_id"] != "MANUAL-REVIEWER"
+
+
+@pytest.mark.parametrize(
+    ("lens", "claim_epoch"),
+    [("security", "1"), ("correctness", "2"), ("correctness", "")],
+    ids=["other_lens", "other_claim_epoch", "missing_claim_epoch"],
+)
+def test_nf1123_deferred_reservation_for_another_lens_or_epoch_still_launches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lens: str, claim_epoch: str,
+) -> None:
+    ledger, _cards = _deferred_manager_reservation(
+        tmp_path, monkeypatch, lens=lens, claim_epoch=claim_epoch
+    )
+    manager = _LedgerManager(tmp_path, ledger)
+    driver, _chain = _nf1064_driver(tmp_path, manager)
+
+    assert driver.drain(max_actions=1, now=NOW).completed == 1
+
+    assert len(manager.launches) == 1
+    assert manager.launches[0]["lens"] == "correctness"
+    assert manager.launches[0]["reviewer_task_id"] != "MANUAL-REVIEWER"

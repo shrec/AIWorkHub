@@ -7444,6 +7444,13 @@ class ProcessManager:
             event["owner_pid_start_ticks"] = base.get("owner_pid_start_ticks")
         if base.get("reviewer_claim_epoch") is not None:
             event["reviewer_claim_epoch"] = base.get("reviewer_claim_epoch")
+        # NF-2026-01123: the progress event replaces the reservation in the
+        # latest-by-request projection, so it must carry the sealed attempt
+        # identity. Without it a deferred reviewer vanished from
+        # ``_sealed_lens_attempts`` and the automatic chain bought a duplicate.
+        for key in ("model", "quality_review_attempt"):
+            if base.get(key) is not None:
+                event[key] = base.get(key)
         if detail:
             event["preparation_detail"] = str(detail)[:300]
         self._append_event(event)
