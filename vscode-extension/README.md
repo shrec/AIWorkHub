@@ -14,6 +14,12 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.12.6
+
+- Every card walks all six SDLC stages on its own, through deploy and maintain, each proven from receipts.
+- Rework is safer: a reworked card keeps the previous attempt's changes on top of newer code, and a blocked rework can be recovered.
+- Fewer stuck launches: a missing adapter is derived, stale reconciler locks hand over, and reviewer reuse matches the sealed attempt.
+
 ## What's new in 0.12.5
 
 - The SDLC loop measures itself: quality drifts beyond 2σ/3σ file a NeedFix automatically, and escaped defects are traced to the card that introduced them.

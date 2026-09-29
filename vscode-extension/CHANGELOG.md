@@ -1,5 +1,25 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.12.6 — 2026-09-29
+
+### Added
+
+- SDLC sweep: the task reconciler records every stage it can prove (plan, design, build, test) for each card, with no manual call, and runs escaped-defect attribution and the control bands once per sweep (RM-2026-00076).
+- Deploy and maintain proofs: a card reaches deploy `ready` once a confirmed release receipt's commit holds every file it promoted, and maintain `ready` when deploy is ready, no control band is breached and no open NeedFix names it as the cause (RM-2026-00076).
+
+### Fixed
+
+- A rework overlay rebases the previous attempt's changes onto newer canonical lines instead of reverting them (NF-2026-01113).
+- Rejecting a card to `blocked` keeps its sealed rework delta, so a recovered rework no longer fails `required_output_unchanged` (NF-2026-01112).
+- A launch without an adapter derives the runner's registered adapter instead of parking the card in `blocked` (NF-2026-01125).
+- Supervisor finalization re-reads the on-disk record, and sandbox-denied anchored reads are skipped instead of failing (NF-2026-01107).
+- A reconciler lock held by a stale runtime generation hands over to the current runtime (NF-2026-01124).
+- Deferred reviewer reuse matches the sealed model and attempt identity (NF-2026-01123).
+- Rework cards sort ahead of fresh cards within the same priority (NF-2026-01097).
+- The manager semantic edit reads its stdin replacement as strict UTF-8 (NF-2026-01121).
+- The SDLC sweep opens its state database through the shared WAL writer instead of a raw connection, and the symlink boundary tests skip only where the OS refuses symlinks.
+- The AppContainer persistent-grant test pins the full WRITE_DAC message regardless of how deep the test directory is (NF-2026-01128).
+
 ## 0.12.5 — 2026-09-29
 
 ### Added

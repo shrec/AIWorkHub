@@ -62,6 +62,12 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
+## What's new in 0.12.6
+
+- Every card walks all six SDLC stages on its own, through deploy and maintain, each proven from receipts.
+- Rework is safer: a reworked card keeps the previous attempt's changes on top of newer code, and a blocked rework can be recovered.
+- Fewer stuck launches: a missing adapter is derived, stale reconciler locks hand over, and reviewer reuse matches the sealed attempt.
+
 ## What's new in 0.12.5
 
 - The SDLC loop measures itself: quality drifts beyond 2σ/3σ file a NeedFix automatically, and escaped defects are traced to the card that introduced them.
