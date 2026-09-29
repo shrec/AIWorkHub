@@ -894,3 +894,61 @@ def test_completion_pass_closes_an_accepted_wave_once_under_the_write_gate(
         for event in roadmap_store.list_events(root, wave["id"])
         if event["event"] == "transitioned"
     ].count("completed") == 1
+
+
+def _stub_repository_id(monkeypatch) -> None:
+    monkeypatch.setattr(
+        task_reconciler.repository_state,
+        "inspect_repository",
+        lambda _repo: SimpleNamespace(manifest=SimpleNamespace(repo_id="repo_test")),
+    )
+
+
+def test_run_scan_survives_an_sdlc_sync_exception(monkeypatch, tmp_path):
+    mgr = _Mgr(tmp_path)
+    monkeypatch.setattr(
+        task_reconciler.review_orchestrator, "canonical_review_db", lambda _mgr: None
+    )
+    _stub_repository_id(monkeypatch)
+    monkeypatch.setattr(
+        task_reconciler.sdlc_sync,
+        "sync_once",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("sync_exploded")),
+    )
+
+    result = task_reconciler.run_scan(mgr, include_gc=False)
+
+    assert result["ok"] is True
+    assert result["finalized"] == 3
+    assert result["sdlc_sync"] == {"state": "skipped", "reason": "RuntimeError"}
+
+
+def test_run_scan_reports_a_failed_sdlc_part_while_the_others_run(monkeypatch, tmp_path):
+    mgr = _Mgr(tmp_path)
+    monkeypatch.setattr(
+        task_reconciler.review_orchestrator, "canonical_review_db", lambda _mgr: None
+    )
+    seen: list[tuple[Path, str]] = []
+
+    def sync_once(repo_root, repository_id):
+        seen.append((repo_root, repository_id))
+        return real_sync_once(repo_root, repository_id)
+
+    real_sync_once = task_reconciler.sdlc_sync.sync_once
+    _stub_repository_id(monkeypatch)
+    monkeypatch.setattr(task_reconciler.sdlc_sync, "sync_once", sync_once)
+    monkeypatch.setattr(
+        task_reconciler.sdlc_sync,
+        "_read_window",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("window_exploded")),
+    )
+
+    result = task_reconciler.run_scan(mgr, include_gc=False)
+
+    assert result["ok"] is True
+    assert seen == [(tmp_path.resolve(), "repo_test")]
+    sdlc = result["sdlc_sync"]
+    assert sdlc["failures"] == ["sdlc_sync:cases:failed"]
+    assert {part: sdlc["parts"][part]["state"] for part in ("stages", "attribution", "bands")} == {
+        "stages": "ok", "attribution": "idle", "bands": "idle",
+    }

@@ -45,7 +45,9 @@ from . import core
 from . import process_launcher
 from . import review_lifecycle
 from . import review_orchestrator
+from . import repository_state
 from . import roadmap_store
+from . import sdlc_sync
 from .platform_io import (
     DIRECTORY_DESCRIPTOR_BACKEND_NONE,
     chmod_fd,
@@ -528,6 +530,16 @@ def run_scan(
     wave_goal_bindings = _scan_wave_goal_bindings(Path(mgr.repo).resolve())
     # After binding repair, so completion is decided on current goal pointers.
     wave_completion = _scan_wave_completion(Path(mgr.repo).resolve())
+    # Sequential by design, not fanned out across cores: the SDLC case store is
+    # a single-writer SQLite file and the pass is bounded per scan, so parallel
+    # writers would only contend for the same write lock.
+    try:
+        repo_root = Path(mgr.repo).resolve()
+        # The same repository identity the SDLC case store binds every case to.
+        repository_id = repository_state.inspect_repository(repo_root).manifest.repo_id
+        sdlc = sdlc_sync.sync_once(repo_root, repository_id)
+    except Exception as exc:  # noqa: BLE001 -- a scan must never fail on SDLC sync
+        sdlc = {"state": "skipped", "reason": f"{type(exc).__name__}"[:80]}
     return {
         "ok": True,
         "scanned_at": _utcnow(),
@@ -538,6 +550,7 @@ def run_scan(
         "review_recovery": review_recovery,
         "wave_goal_bindings": wave_goal_bindings,
         "wave_completion": wave_completion,
+        "sdlc_sync": sdlc,
     }
 
 
