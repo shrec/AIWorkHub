@@ -864,6 +864,74 @@ def test_task_claim_and_candidate_swaps_fail_closed(accepted):
     assert build["evidence_code"] == "claim_epoch_mismatch"
 
 
+def _set_task_columns(root: Path, task_id: str, **columns) -> None:
+    """Move a canonical task row's lifecycle columns, as task hygiene or a reviewer would."""
+    assignments = ", ".join(f"{name}=?" for name in columns)
+    conn = sqlite3.connect(str(task_store.canonical_db_path(root)))
+    try:
+        conn.execute(
+            f"UPDATE tasks SET {assignments} WHERE task_id=?", (*columns.values(), task_id)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _decide(ns: SimpleNamespace, stage: str):
+    reader = sdlc_stage_evidence.EvidenceReader(ns.root, ns.repo_id)
+    return sdlc_stage_evidence.decide(
+        reader, stage=stage, payload=_pointers(ns), task_id=ns.task_id, predecessors={},
+    )
+
+
+def test_an_accepted_card_archived_by_hygiene_is_not_withdrawn(accepted):
+    # NF-2026-01135: hygiene archives accepted cards hours after accept.
+    _set_task_columns(accepted.root, accepted.task_id, archived_at=NOW)
+    assert _decide(accepted, "plan").code != "task_withdrawn:archived"
+    _record_through(accepted, "test")
+    case = read_case(accepted.root, accepted.repo_id, accepted.case_id)
+    for stage in ("build", "test"):
+        assert case["stages"][stage]["state"] == "ready", case["stages"][stage]
+    test = case["stages"]["test"]["evidence"]
+    assert test["accepted_outcome_receipt_id"] == accepted.receipt["receipt_id"]
+
+
+def test_an_archived_card_without_accept_evidence_stays_withdrawn(accepted):
+    _set_task_columns(accepted.root, accepted.task_id, archived_at=NOW)
+    for mutate in (
+        lambda card: card.pop("accepted_at", None),
+        lambda card: card.update(accepted_at="  "),
+        lambda card: (card.update(accepted_at=NOW), card.pop("accept_evidence", None)),
+        lambda card: (card.update(accepted_at=NOW, accept_evidence={}),),
+    ):
+        _mutate_card(accepted.root, accepted.task_id, mutate)
+        for stage in ("build", "test"):
+            assert _decide(accepted, stage).code == "task_withdrawn:archived"
+
+
+def test_a_never_accepted_archived_card_is_refused_withdrawn(contracted):
+    _seal(contracted.root, TASK_ID)
+    _record_through(contracted, "design")
+    _set_task_columns(contracted.root, TASK_ID, archived_at=NOW)
+    for stage in ("build", "test"):
+        assert _decide(contracted, stage).code == "task_withdrawn:archived"
+    with pytest.raises(SdlcCaseValidationError, match="missing ready predecessor: plan"):
+        _record(contracted, "build", _pointers(contracted))
+
+
+def test_a_superseded_card_stays_withdrawn_even_when_accepted(accepted):
+    _set_task_columns(
+        accepted.root, accepted.task_id, status="superseded", worker_status="superseded"
+    )
+    for stage in ("build", "test"):
+        assert _decide(accepted, stage).code == "task_withdrawn:superseded"
+    # Retirement can rebuild a superseded row as archived; the card still says superseded.
+    _set_task_columns(accepted.root, accepted.task_id, archived_at=NOW)
+    _mutate_card(accepted.root, accepted.task_id, lambda card: card.update(status="superseded"))
+    for stage in ("build", "test"):
+        assert _decide(accepted, stage).code == "task_withdrawn:archived"
+
+
 def test_evidence_from_another_repository_never_counts(tmp_path, accepted):
     foreign = _bootstrap(tmp_path / "foreign", "sdlc-evidence-foreign")
     reader = sdlc_stage_evidence.EvidenceReader(accepted.root, foreign.repo_id)

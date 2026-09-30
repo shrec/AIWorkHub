@@ -831,12 +831,36 @@ def _candidate_identity(snapshot: TaskSnapshot) -> dict[str, Any] | str:
     }
 
 
+def _accepted_then_archived(snapshot: TaskSnapshot) -> bool:
+    """An archived card that was accepted first: hygiene archiving is not withdrawal.
+
+    NF-2026-01135: automatic task hygiene archives accepted cards hours after
+    accept. Only the accept's own traces qualify -- a non-empty ``accepted_at``
+    and the accepted-outcome receipt -- and the receipt is still validated
+    downstream exactly as for a finished card. ``superseded`` never qualifies.
+    """
+
+    if snapshot.status != "archived":
+        return False
+    card = snapshot.card
+    # Retirement can rebuild a superseded row as archived; its card still says so.
+    if any(str(card.get(key) or "").strip().lower() == "superseded"
+           for key in ("status", "worker_status")):
+        return False
+    accepted_at = card.get("accepted_at")
+    if not isinstance(accepted_at, str) or not accepted_at.strip():
+        return False
+    evidence = card.get("accept_evidence")
+    receipt = evidence.get("accepted_outcome_receipt") if isinstance(evidence, dict) else None
+    return isinstance(receipt, dict)
+
+
 def _acceptance_identity(
     snapshot: TaskSnapshot, candidate: Mapping[str, Any]
 ) -> dict[str, Any] | str:
     """The coordinator's acceptance of exactly ``candidate``, or why not."""
 
-    if snapshot.status != "finished":
+    if snapshot.status != "finished" and not _accepted_then_archived(snapshot):
         return f"candidate_not_accepted:{snapshot.status}"
     card = snapshot.card
     if card.get("accepted_request_id") != candidate["request_id"]:
@@ -860,7 +884,7 @@ def _acceptance_identity(
 def _identity(stage: str, snapshot: TaskSnapshot) -> dict[str, Any] | str:
     """The card-only canonical identity ``stage`` is drawn from, or a refusal code."""
 
-    if snapshot.status in WITHDRAWN_STATUSES:
+    if snapshot.status in WITHDRAWN_STATUSES and not _accepted_then_archived(snapshot):
         return f"task_withdrawn:{snapshot.status}"
     if stage == "plan":
         return _plan_identity(snapshot)
