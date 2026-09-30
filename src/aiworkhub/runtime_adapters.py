@@ -2202,7 +2202,7 @@ def build_runtime_command(
         if include_partial_messages:
             argv.insert(argv.index("--permission-mode"), "--include-partial-messages")
         if model is not None:
-            argv.extend(("--model", model))
+            argv.extend(("--model", _claude_cli_model_id(model)))
         argv.extend(effort_tokens)
         stdin_text = prompt
     elif adapter_id == "codex_cli":
@@ -2850,6 +2850,28 @@ def _canonical_model_id(model: str | None) -> str:
 
     stripped = (model or "").strip().lower()
     return _WORKFORCE_MODEL_ALIASES.get(stripped, stripped)
+
+
+# Claude Code CLI spelling overrides.  Claude Code (the ``claude`` CLI binary)
+# rejects the workforce's canonical id for this model and accepts only the
+# hyphenated form below; every other canonical id already matches what
+# Claude Code accepts and passes through unchanged.
+_CLAUDE_CLI_MODEL_ID_OVERRIDES: Mapping[str, str] = MappingProxyType(
+    {
+        "claude-haiku-4.5": "claude-haiku-4-5",
+    }
+)
+
+
+def _claude_cli_model_id(model: str | None) -> str:
+    """Map a verified workforce model spelling to Claude Code's CLI spelling.
+
+    Resolves aliases (``haiku``) through :func:`_canonical_model_id` first, so
+    the returned id is always the spelling Claude Code's CLI accepts.
+    """
+
+    canonical = _canonical_model_id(model)
+    return _CLAUDE_CLI_MODEL_ID_OVERRIDES.get(canonical, canonical)
 
 
 # Claude CLI's documented ``--effort`` ladder.  Claude-5-class models attest

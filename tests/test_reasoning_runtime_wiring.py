@@ -164,6 +164,34 @@ def test_context_capacity_is_verified_model_window_not_spend_cap() -> None:
     )
 
 
+def test_claude_cli_argv_uses_claude_code_haiku_spelling_haiku_unchanged_elsewhere(
+    tmp_path: Path,
+) -> None:
+    """NF-2026-01019: only the Claude CLI ``--model`` argv site is respelled.
+
+    The canonical workforce id ``claude-haiku-4.5`` keeps driving effort and
+    context-capacity resolution unchanged; only the argv token Claude Code's
+    CLI receives is translated to the spelling it accepts.
+    """
+
+    assert runtime_adapters._canonical_model_id("claude-haiku-4.5") == "claude-haiku-4.5"
+    assert runtime_adapters._canonical_model_id("haiku") == "claude-haiku-4.5"
+    assert "max" not in runtime_adapters._claude_effort_keys("claude-haiku-4.5")
+    assert "high" in runtime_adapters._claude_effort_keys("claude-haiku-4.5")
+    assert runtime_adapters.resolve_context_capacity("claude_cli", "claude-haiku-4.5") == 200_000
+
+    # The VS Code LM route never builds Claude CLI argv, so it is structurally
+    # unreachable by ``_claude_cli_model_id``; its plan and canonical model
+    # identity for claude-haiku-4.5 stay exactly as verified.
+    vscode_lm_plan = runtime_adapters.build_runtime_command(
+        "vscode_lm", "Prompt", tmp_path, model="claude-haiku-4.5"
+    )
+    assert vscode_lm_plan.argv == []
+    assert vscode_lm_plan.validation_reason == "vscode_lm_requires_process_launcher_bridge_context"
+    assert runtime_adapters.resolve_context_capacity("vscode_lm", "claude-haiku-4.5") is None
+    assert runtime_adapters.route_reasoning_capability("vscode_lm", "claude-haiku-4.5") is None
+
+
 def test_non_applied_capability_ceiling_never_emits_flag(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:

@@ -68,6 +68,43 @@ def test_claude_argv_is_current_noninteractive_shape(monkeypatch, tmp_path):
     assert plan.stdin_text == "Implement the focused change"
 
 
+@pytest.mark.parametrize("model", ["claude-haiku-4.5", "haiku"])
+def test_claude_cli_argv_uses_claude_code_haiku_spelling(monkeypatch, tmp_path, model):
+    """NF-2026-01019: Claude Code rejects the workforce's canonical id."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    executable = _executable(tmp_path, "claude")
+    monkeypatch.setattr(runtime_adapters.shutil, "which", lambda binary: str(executable))
+
+    plan = runtime_adapters.build_runtime_command(
+        "claude_cli",
+        "Prompt",
+        repo,
+        model=model,
+    )
+
+    model_index = plan.argv.index("--model")
+    assert plan.argv[model_index + 1] == "claude-haiku-4-5"
+
+
+@pytest.mark.parametrize("model", ["claude-opus-5", "claude-sonnet-5"])
+def test_claude_cli_argv_unchanged_for_already_correct_models(monkeypatch, tmp_path, model):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    executable = _executable(tmp_path, "claude")
+    monkeypatch.setattr(runtime_adapters.shutil, "which", lambda binary: str(executable))
+
+    plan = runtime_adapters.build_runtime_command(
+        "claude_cli",
+        "Prompt",
+        repo,
+        model=model,
+    )
+
+    model_index = plan.argv.index("--model")
+    assert plan.argv[model_index + 1] == model
+
+
 def _claude_tool_lists(argv: list[str]) -> tuple[list[str], list[str]]:
     allowed = argv[argv.index("--allowedTools") + 1: argv.index("--no-session-persistence")]
     rest = argv[argv.index("--disallowedTools") + 1:]
