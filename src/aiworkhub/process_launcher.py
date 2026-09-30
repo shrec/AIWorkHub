@@ -13829,19 +13829,44 @@ class ProcessManager:
         """
         return _accept_preview_impl(self, request_id, task_id, **overrides)
 
+    def _reviewer_launch_target_request_id(
+        self, request_id: str, event: Mapping[str, Any]
+    ) -> str:
+        """The quality-review target request a reviewer request is bound to.
+
+        A later ledger row can replace an earlier one's full payload without
+        re-embedding the launch-time ``quality_review`` binding, so the
+        durable ``request.json`` is the fallback authority when the latest
+        event does not carry it.
+        """
+        binding = event.get("quality_review")
+        if not isinstance(binding, dict):
+            metadata_path = self.process_dir / f"{request_id}.request.json"
+            try:
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                metadata = None
+            binding = metadata.get("quality_review") if isinstance(metadata, dict) else None
+        return str(binding.get("target_request_id") or "").strip() if isinstance(binding, dict) else ""
+
     def cancel_disposed_reviewer_processes(
         self,
         reviewer_finalization: Any,
         *,
+        rejected_request_id: str = "",
         reason: str = "parent_candidate_rejected",
     ) -> dict[str, Any]:
-        """Cancel live requests for the exact reviewer tasks core disposed.
+        """Cancel every live request bound to a rejected review, exact and stable.
 
         ``core.reject_review`` is the authority that binds reviewer children to
         the rejected ``(task_id, request_id)`` pair.  Reusing only the task ids
         in its durable ``reviewer_finalization`` receipt avoids guessing from
-        names, lenses, or timing.  A stable process-ledger snapshot is required
-        before cancellation so an append racing this read cannot hide a newly
+        names, lenses, or timing.  A server-launched auto reviewer is never a
+        reviewer child of the card and so never appears there: when
+        ``rejected_request_id`` is given, every other non-terminal ledger
+        request whose own quality-review binding targets that exact request id
+        is cancelled too.  A stable process-ledger snapshot is required before
+        cancellation so an append racing this read cannot hide a newly
         launched reviewer request.
         """
         rows = reviewer_finalization if isinstance(reviewer_finalization, list) else []
@@ -13850,7 +13875,8 @@ class ProcessManager:
             for row in rows
             if isinstance(row, dict) and str(row.get("task_id") or "").strip()
         })
-        if not reviewer_task_ids:
+        target_request_id = str(rejected_request_id or "").strip()
+        if not reviewer_task_ids and not target_request_id:
             return {
                 "schema_id": "aiworkhub.reviewer_process_cancellation.v1",
                 "ok": True,
@@ -13871,22 +13897,24 @@ class ProcessManager:
             }
 
         exact_ids = set(reviewer_task_ids)
-        requests = sorted(
-            (
-                str(request_id),
-                event,
-            )
-            for request_id, event in latest.items()
-            if isinstance(event, dict)
-            and str(event.get("task_id") or "") in exact_ids
-            and str(event.get("state") or "") not in TERMINAL_PROCESS_STATES
-        )
+        candidates: list[tuple[str, dict[str, Any], str]] = []
+        for request_id, event in sorted(latest.items(), key=lambda item: item[0]):
+            if not isinstance(event, dict) or str(event.get("state") or "") in TERMINAL_PROCESS_STATES:
+                continue
+            if str(event.get("task_id") or "") in exact_ids:
+                candidates.append((str(request_id), event, "bound_child"))
+            elif target_request_id and self._reviewer_launch_target_request_id(
+                str(request_id), event
+            ) == target_request_id:
+                candidates.append((str(request_id), event, "target_request"))
+
         cancelled: list[dict[str, Any]] = []
-        for request_id, event in requests:
+        for request_id, event, match in candidates:
             outcome = self.cancel(request_id, reason=reason)
             cancelled.append({
                 "task_id": str(event.get("task_id") or ""),
                 "request_id": request_id,
+                "match": match,
                 "ok": bool(outcome.get("ok")) if isinstance(outcome, dict) else False,
                 "state": str(outcome.get("state") or "") if isinstance(outcome, dict) else "",
                 "blocked_reason": (
@@ -13902,6 +13930,39 @@ class ProcessManager:
             "reviewer_task_ids": reviewer_task_ids,
             "cancelled": cancelled,
         }
+
+    @staticmethod
+    def _rejected_request_id_from_result(result: Mapping[str, Any]) -> str:
+        """The exact rejected request id pinned onto ``core.reject_review``'s card.
+
+        Reads the same three fields server.py's reject-review receipt does
+        (``rejection_disposition`` / ``review_feedback`` / ``rework_predecessor``)
+        from the card ``core.reject_review`` embeds in ``stdout``:
+        ``rejection_disposition.request_id`` is set for every pending/blocked
+        rejection, ``review_feedback.predecessor_request_id`` for pending
+        rework, and ``rework_predecessor.request_id`` when a retained
+        workspace was pinned.  An archived/superseded disposition sets none of
+        these, so an empty string is returned and only the exact
+        ``reviewer_finalization`` task ids are cancelled.
+        """
+        stdout = result.get("stdout")
+        if not isinstance(stdout, str) or not stdout.lstrip().startswith("{"):
+            return ""
+        try:
+            card = json.loads(stdout)
+        except ValueError:
+            return ""
+        if not isinstance(card, dict):
+            return ""
+        rejection = card.get("rejection_disposition")
+        feedback = card.get("review_feedback")
+        rework = card.get("rework_predecessor")
+        return str(
+            (rejection.get("request_id") if isinstance(rejection, dict) else None)
+            or (feedback.get("predecessor_request_id") if isinstance(feedback, dict) else None)
+            or (rework.get("request_id") if isinstance(rework, dict) else None)
+            or ""
+        )
 
     def reject_review(
         self,
@@ -13958,10 +14019,11 @@ class ProcessManager:
         result = core.reject_review(target, bounded_reason, to=to)
         if not isinstance(result, dict):
             return {**refusal, "error": "reject_review_result_invalid"}
-        if result.get("ok") is True and result.get("reviewer_finalization"):
+        if result.get("ok") is True:
             result["reviewer_process_cancellation"] = (
                 self.cancel_disposed_reviewer_processes(
-                    result["reviewer_finalization"],
+                    result.get("reviewer_finalization") or [],
+                    rejected_request_id=self._rejected_request_id_from_result(result),
                 )
             )
         result.setdefault("task_id", target)
