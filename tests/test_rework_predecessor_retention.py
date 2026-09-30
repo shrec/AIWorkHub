@@ -1,23 +1,30 @@
-"""NF-2026-00138 / NF-2026-00246: rework predecessor retention + gate.
+"""NF-2026-00138 / NF-2026-00246 / NF-2026-01044: rework predecessor retention
++ gate + materialization.
 
 - A timed-out worker's delta is retained as a rework predecessor (the same
   pinning a validation failure receives), so the successor starts from the work
   instead of nothing.
 - A rework attempt no longer discards fully-green work over context-tool
   receipts the rework (validation-only replay) path structurally never makes.
+- A recorded delta artifact is preferred over a predecessor's live worktree at
+  materialization time, since a retention sweep can leave that worktree
+  directory in place but emptied (NF-2026-01044).
 
 Exercised through the module-level seams; no ProcessManager is constructed.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
+import subprocess
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from aiworkhub import process_launcher as pl
+from aiworkhub import worker_workspace
 
 
 class _FakeWorkspace:
@@ -220,3 +227,251 @@ def test_recovered_rework_gets_fresh_request_but_active_lost_ack_is_idempotent(
         reserved_request_id=fresh["request_id"],
     )
     assert replay["request_id"] == fresh["request_id"]
+
+
+def _git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", *args],
+        cwd=repo,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        shell=False,
+    )
+
+
+@pytest.fixture
+def repo(tmp_path: Path) -> Path:
+    root = tmp_path / "parent"
+    root.mkdir()
+    assert _git(root, "init", "-q").returncode == 0
+    assert _git(root, "config", "user.email", "tests@example.invalid").returncode == 0
+    assert _git(root, "config", "user.name", "Task MCP Tests").returncode == 0
+    (root / "out").mkdir()
+    (root / "out" / "result.txt").write_bytes(b"result-v1\n")
+    assert _git(root, "add", "out/result.txt").returncode == 0
+    assert _git(root, "commit", "-qm", "fixture").returncode == 0
+    return root
+
+
+def _rework_predecessor_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    repo: Path,
+    request_id: str,
+    allowed_writes: list[str],
+) -> Any:
+    monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "worktrees"))
+    return worker_workspace.create_workspace(
+        repo, request_id, {"allowed_writes": allowed_writes}, "validation",
+    )
+
+
+def test_rework_predecessor_seeds_from_artifact_when_worktree_left_empty(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, repo: Path,
+) -> None:
+    """NF-2026-01044: a Windows retention sweep can empty a predecessor's
+    worktree directory without removing it (another process still holds it
+    as cwd). A recorded delta artifact must still seed the successor instead
+    of blocking on a hash mismatch against the now-empty directory."""
+    predecessor = _rework_predecessor_workspace(
+        monkeypatch, tmp_path, repo, "predecessor-empty", ["out/result.txt"]
+    )
+    successor = None
+    try:
+        candidate = predecessor.path / "out" / "result.txt"
+        candidate.write_bytes(b"reviewed candidate\n")
+        content = candidate.read_bytes()
+        content_hash = hashlib.sha256(content).hexdigest()
+        descriptor = worker_workspace.seal_rework_delta_artifact(
+            repo,
+            "task-empty",
+            "predecessor-empty",
+            1,
+            [("out/result.txt", content)],
+            tmp_path / "artifacts",
+        )
+        predecessor_metadata = predecessor.as_metadata()
+
+        # Simulate the Windows retention race: files are gone but the
+        # directory itself is still present (another process holds it open).
+        candidate.unlink()
+        assert predecessor.path.is_dir()
+
+        successor = worker_workspace.create_workspace(
+            repo,
+            "successor-empty",
+            {
+                "allowed_writes": ["out/result.txt"],
+                "rework_predecessor": {
+                    "schema_id": "aiworkhub.rework_predecessor.v1",
+                    "request_id": "predecessor-empty",
+                    "task_id": "task-empty",
+                    "claim_epoch": 1,
+                    "workspace": predecessor_metadata,
+                    "changed_path_hashes": {"out/result.txt": content_hash},
+                    "delta_artifact": descriptor,
+                },
+            },
+            "validation",
+        )
+        assert (successor.path / "out" / "result.txt").read_bytes() == content
+        assert successor.inherited_rework_paths == ("out/result.txt",)
+    finally:
+        if successor is not None:
+            worker_workspace.cleanup_workspace(repo, successor.path, successor.home)
+        worker_workspace.cleanup_workspace(repo, predecessor.path, predecessor.home)
+
+
+def test_rework_predecessor_seeds_from_artifact_when_worktree_missing_one_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, repo: Path,
+) -> None:
+    """A partially emptied worktree -- missing just one expected file -- must
+    also fall back to the sealed artifact rather than partially
+    materializing from whatever the worktree still happens to hold."""
+    predecessor = _rework_predecessor_workspace(
+        monkeypatch,
+        tmp_path,
+        repo,
+        "predecessor-partial",
+        ["out/result.txt", "out/extra.txt"],
+    )
+    successor = None
+    try:
+        result_path = predecessor.path / "out" / "result.txt"
+        extra_path = predecessor.path / "out" / "extra.txt"
+        result_path.write_bytes(b"reviewed result\n")
+        extra_path.write_bytes(b"reviewed extra\n")
+        result_content = result_path.read_bytes()
+        extra_content = extra_path.read_bytes()
+        result_hash = hashlib.sha256(result_content).hexdigest()
+        extra_hash = hashlib.sha256(extra_content).hexdigest()
+        descriptor = worker_workspace.seal_rework_delta_artifact(
+            repo,
+            "task-partial",
+            "predecessor-partial",
+            1,
+            [("out/result.txt", result_content), ("out/extra.txt", extra_content)],
+            tmp_path / "artifacts",
+        )
+        predecessor_metadata = predecessor.as_metadata()
+
+        extra_path.unlink()
+        assert predecessor.path.is_dir()
+
+        successor = worker_workspace.create_workspace(
+            repo,
+            "successor-partial",
+            {
+                "allowed_writes": ["out/result.txt", "out/extra.txt"],
+                "rework_predecessor": {
+                    "schema_id": "aiworkhub.rework_predecessor.v1",
+                    "request_id": "predecessor-partial",
+                    "task_id": "task-partial",
+                    "claim_epoch": 1,
+                    "workspace": predecessor_metadata,
+                    "changed_path_hashes": {
+                        "out/result.txt": result_hash,
+                        "out/extra.txt": extra_hash,
+                    },
+                    "delta_artifact": descriptor,
+                },
+            },
+            "validation",
+        )
+        assert (successor.path / "out" / "result.txt").read_bytes() == result_content
+        assert (successor.path / "out" / "extra.txt").read_bytes() == extra_content
+    finally:
+        if successor is not None:
+            worker_workspace.cleanup_workspace(repo, successor.path, successor.home)
+        worker_workspace.cleanup_workspace(repo, predecessor.path, predecessor.home)
+
+
+def test_rework_predecessor_without_artifact_still_uses_worktree(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, repo: Path,
+) -> None:
+    """No delta artifact was ever recorded: materialization is unchanged and
+    still reads the live worktree directly, exactly as before."""
+    predecessor = _rework_predecessor_workspace(
+        monkeypatch, tmp_path, repo, "predecessor-no-artifact", ["out/result.txt"]
+    )
+    successor = None
+    try:
+        candidate = predecessor.path / "out" / "result.txt"
+        candidate.write_bytes(b"reviewed candidate\n")
+        content_hash = hashlib.sha256(candidate.read_bytes()).hexdigest()
+
+        successor = worker_workspace.create_workspace(
+            repo,
+            "successor-no-artifact",
+            {
+                "allowed_writes": ["out/result.txt"],
+                "rework_predecessor": {
+                    "schema_id": "aiworkhub.rework_predecessor.v1",
+                    "request_id": "predecessor-no-artifact",
+                    "workspace": predecessor.as_metadata(),
+                    "changed_path_hashes": {"out/result.txt": content_hash},
+                },
+            },
+            "validation",
+        )
+        assert (successor.path / "out" / "result.txt").read_text(
+            encoding="utf-8"
+        ) == "reviewed candidate\n"
+        assert successor.inherited_rework_paths == ("out/result.txt",)
+    finally:
+        if successor is not None:
+            worker_workspace.cleanup_workspace(repo, successor.path, successor.home)
+        worker_workspace.cleanup_workspace(repo, predecessor.path, predecessor.home)
+
+
+def test_rework_predecessor_rejects_tampered_artifact_despite_intact_worktree(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, repo: Path,
+) -> None:
+    """A recorded artifact is preferred even when the worktree is fully
+    intact, so a tampered artifact must still block launch -- materialization
+    must never silently fall back to the worktree just because it happens to
+    be available. Verification is not weakened by adding the fallback."""
+    predecessor = _rework_predecessor_workspace(
+        monkeypatch, tmp_path, repo, "predecessor-tampered", ["out/result.txt"]
+    )
+    try:
+        candidate = predecessor.path / "out" / "result.txt"
+        candidate.write_bytes(b"reviewed candidate\n")
+        content = candidate.read_bytes()
+        content_hash = hashlib.sha256(content).hexdigest()
+        descriptor = worker_workspace.seal_rework_delta_artifact(
+            repo,
+            "task-tampered",
+            "predecessor-tampered",
+            1,
+            [("out/result.txt", content)],
+            tmp_path / "artifacts",
+        )
+        Path(descriptor["path"]).write_bytes(b"{}")
+        assert predecessor.path.is_dir()
+        assert candidate.read_bytes() == content
+
+        with pytest.raises(
+            worker_workspace.WorkspaceError, match="rework_delta_artifact_tampered"
+        ):
+            worker_workspace.create_workspace(
+                repo,
+                "successor-tampered",
+                {
+                    "allowed_writes": ["out/result.txt"],
+                    "rework_predecessor": {
+                        "schema_id": "aiworkhub.rework_predecessor.v1",
+                        "request_id": "predecessor-tampered",
+                        "task_id": "task-tampered",
+                        "claim_epoch": 1,
+                        "workspace": predecessor.as_metadata(),
+                        "changed_path_hashes": {"out/result.txt": content_hash},
+                        "delta_artifact": descriptor,
+                    },
+                },
+                "validation",
+            )
+    finally:
+        worker_workspace.cleanup_workspace(repo, predecessor.path, predecessor.home)

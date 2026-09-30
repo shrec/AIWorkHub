@@ -2867,10 +2867,10 @@ def _materialize_rework_predecessor(
     card: dict[str, Any],
     allowed_writes: tuple[str, ...],
 ) -> list[str]:
-    """Overlay one hash-pinned reviewed candidate into a successor worktree.
+    """Overlay one hash-pinned predecessor into a successor worktree.
 
-    Use the retained worktree while it exists. Once it is absent, only a
-    sealed content-addressed changed/deleted-file delta may seed the successor.
+    The recorded delta artifact is preferred when present; otherwise the retained
+    worktree is used, since a retention sweep can leave it emptied but present.
     """
     predecessor = card.get("rework_predecessor")
     if predecessor is None:
@@ -2878,17 +2878,16 @@ def _materialize_rework_predecessor(
     if not isinstance(predecessor, dict):
         raise WorkspaceError("rework_predecessor_invalid")
     request_id = str(predecessor.get("request_id") or "").strip()
-    workspace_payload = predecessor.get("workspace")
     hashes = predecessor.get("changed_path_hashes")
     if (
         not _REQUEST_ID_RE.fullmatch(request_id)
-        or not isinstance(workspace_payload, dict)
+        or not isinstance(predecessor.get("workspace"), dict)
         or not isinstance(hashes, dict)
         or not hashes
     ):
         raise WorkspaceError("rework_predecessor_invalid")
     try:
-        source_workspace = WorkerWorkspace.from_metadata(workspace_payload)
+        source_workspace = WorkerWorkspace.from_metadata(predecessor.get("workspace"))
     except (KeyError, TypeError, ValueError) as exc:
         raise WorkspaceError(f"rework_predecessor_workspace_invalid:{exc}") from exc
     if source_workspace.repo != repo or source_workspace.request_id != request_id:
@@ -2897,23 +2896,23 @@ def _materialize_rework_predecessor(
         request_id, source_workspace.path, source_workspace.home, repo=repo
     )
     rebase = _rework_base_drift_rebase(repo, worktree, source_workspace.base_oid)
+    if predecessor.get("delta_artifact") is not None:
+        return materialize_rework_delta_artifact(
+            artifact=predecessor.get("delta_artifact"),
+            authority_repo=repo,
+            request_id=request_id,
+            task_id=str(predecessor.get("task_id") or ""),
+            claim_epoch=predecessor.get("claim_epoch"),
+            worktree=worktree,
+            expected_path_hashes=hashes,
+            allowed_writes=allowed_writes,
+            rebase=rebase,
+        )
     if not source_workspace.path.is_symlink() and source_workspace.path.is_dir():
         return _materialize_rework_predecessor_from_worktree(
             worktree, source_workspace, hashes, allowed_writes, rebase=rebase
         )
-    if predecessor.get("delta_artifact") is None:
-        raise WorkspaceError("rework_predecessor_workspace_missing")
-    return materialize_rework_delta_artifact(
-        artifact=predecessor["delta_artifact"],
-        authority_repo=repo,
-        request_id=request_id,
-        task_id=str(predecessor.get("task_id") or ""),
-        claim_epoch=predecessor.get("claim_epoch"),
-        worktree=worktree,
-        expected_path_hashes=hashes,
-        allowed_writes=allowed_writes,
-        rebase=rebase,
-    )
+    raise WorkspaceError("rework_predecessor_workspace_missing")
 
 
 _ReworkRebase = Callable[[list[tuple[str, bytes | None]]], dict[str, bytes | None]]
