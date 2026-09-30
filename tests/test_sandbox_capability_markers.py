@@ -9,6 +9,9 @@ unconditionally, so a capable host still runs every marked test.
 
 from __future__ import annotations
 
+import errno
+from pathlib import Path
+
 import pytest
 
 import conftest
@@ -96,3 +99,64 @@ def test_capability_probes_are_cached_across_calls() -> None:
     conftest.can_create_symlink()
     conftest.can_create_symlink()
     assert conftest.can_create_symlink.cache_info().hits >= 1
+
+
+def test_symlink_denial_is_converted_to_skip_with_reason(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(conftest, "can_create_symlink", lambda: False)
+
+    conftest._install_symlink_skip_guard(monkeypatch)
+
+    def _raise_denied(*_args: object, **_kwargs: object) -> None:
+        raise OSError(errno.EPERM, "denied")
+
+    monkeypatch.setattr(conftest.os, "symlink", _raise_denied)
+
+    with pytest.raises(pytest.skip.Exception) as excinfo:
+        (tmp_path / "source").symlink_to(tmp_path / "target")
+    assert excinfo.value.msg == "sandbox_capability_denied:symlink"
+
+
+def test_symlink_capability_available_installs_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(conftest, "can_create_symlink", lambda: True)
+    original_symlink_to = Path.symlink_to
+    original_os_symlink = conftest.os.symlink
+
+    conftest._install_symlink_skip_guard(monkeypatch)
+
+    assert Path.symlink_to is original_symlink_to
+    assert conftest.os.symlink is original_os_symlink
+
+
+def test_non_capability_oserror_from_symlink_primitive_is_never_converted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(conftest, "can_create_symlink", lambda: False)
+
+    def _raise_exists(*_args: object, **_kwargs: object) -> None:
+        raise FileExistsError(errno.EEXIST, "exists")
+
+    monkeypatch.setattr(conftest.os, "symlink", _raise_exists)
+    conftest._install_symlink_skip_guard(monkeypatch)
+
+    with pytest.raises(FileExistsError):
+        conftest.os.symlink(tmp_path / "target", tmp_path / "source")
+
+
+def test_symlink_primitive_capability_denial_errno_is_converted_to_skip(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(conftest, "can_create_symlink", lambda: False)
+
+    def _raise_denied(*_args: object, **_kwargs: object) -> None:
+        raise OSError(errno.EPERM, "denied")
+
+    monkeypatch.setattr(conftest.os, "symlink", _raise_denied)
+    conftest._install_symlink_skip_guard(monkeypatch)
+
+    with pytest.raises(pytest.skip.Exception) as excinfo:
+        conftest.os.symlink(tmp_path / "target", tmp_path / "source")
+    assert excinfo.value.msg == "sandbox_capability_denied:symlink"

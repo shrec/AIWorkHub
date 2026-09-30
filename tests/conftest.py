@@ -313,3 +313,47 @@ def _skip_unless_capable(
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
     _skip_unless_capable(items, "requires_named_pipe", can_create_named_pipe(), "named_pipe")
     _skip_unless_capable(items, "requires_symlink", can_create_symlink(), "symlink")
+
+
+# NF-2026-01150: an unmarked test that calls ``Path.symlink_to``/``os.symlink``
+# directly (rather than going through a ``@pytest.mark.requires_symlink`` item)
+# still hits the sandbox's raw ``OSError`` as a hard failure. Wrap both
+# primitives so a denial becomes the same explicit skip instead; a capable
+# host leaves both primitives untouched.
+def _install_symlink_skip_guard(monkeypatch: pytest.MonkeyPatch) -> None:
+    if can_create_symlink():
+        return
+
+    original_symlink_to = Path.symlink_to
+    original_os_symlink = os.symlink
+
+    def _is_symlink_capability_denial(exc: OSError) -> bool:
+        return getattr(exc, "winerror", None) == 1314 or exc.errno in {
+            errno.EPERM,
+            errno.EACCES,
+            errno.ENOSYS,
+        }
+
+    def _symlink_to(self, *args, **kwargs):
+        try:
+            return original_symlink_to(self, *args, **kwargs)
+        except OSError as exc:
+            if not _is_symlink_capability_denial(exc):
+                raise
+            pytest.skip("sandbox_capability_denied:symlink")
+
+    def _os_symlink(*args, **kwargs):
+        try:
+            return original_os_symlink(*args, **kwargs)
+        except OSError as exc:
+            if not _is_symlink_capability_denial(exc):
+                raise
+            pytest.skip("sandbox_capability_denied:symlink")
+
+    monkeypatch.setattr(Path, "symlink_to", _symlink_to)
+    monkeypatch.setattr(os, "symlink", _os_symlink)
+
+
+@pytest.fixture(autouse=True)
+def _skip_on_symlink_capability_denied(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_symlink_skip_guard(monkeypatch)
