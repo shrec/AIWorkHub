@@ -82,6 +82,10 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+markers = [
+  "requires_named_pipe: needs the OS named-pipe capability multiprocessing opens; skips with sandbox_capability_denied:named_pipe where the sandbox denies it (NF-2026-01138).",
+  "requires_symlink: needs the OS symlink capability (os.symlink/Path.symlink_to); skips with sandbox_capability_denied:symlink where the sandbox denies it (NF-2026-01138).",
+]
 # NF-2026-00639: this suite was running single-threaded on a 16-core host at
 # 0.34 of a core while pytest-xdist sat installed and unused. `-n auto` is
 # resolved by pytest_xdist_auto_num_workers in tests/conftest.py, which derives

@@ -1219,6 +1219,7 @@ def _child_probe_lease(database: str, started, done) -> None:  # pragma: no cove
         done.put("timed_out")
 
 
+@pytest.mark.requires_named_pipe
 def test_write_connection_excludes_another_process(tmp_path: Path) -> None:
     """The measured contention is cross-process (6,247 distinct supervisor pids,
     up to 12 alive at once), so the exclusion must hold across processes."""
@@ -1509,6 +1510,7 @@ def _child_mark_review(repo: str, task_id: str, out) -> None:  # pragma: no cove
         out.put((type(exc).__name__, str(exc)))
 
 
+@pytest.mark.requires_named_pipe
 def test_concurrent_processes_do_not_surface_database_is_locked(tmp_path: Path) -> None:
     """The regression this whole change exists for.
 

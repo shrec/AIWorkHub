@@ -16,9 +16,12 @@ beneath the worktree root.
 from __future__ import annotations
 
 import errno
+import functools
+import multiprocessing.connection
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -260,3 +263,53 @@ def directory_authority_or_skip(path: os.PathLike[str] | str) -> None:
 @pytest.fixture
 def require_directory_authority():
     return directory_authority_or_skip
+
+
+# NF-2026-01138: the windows_appcontainer worker sandbox denies the OS
+# capabilities probed below (named pipes via multiprocessing, os.symlink /
+# Path.symlink_to). Tests that need one carry @pytest.mark.requires_named_pipe
+# or @pytest.mark.requires_symlink and skip with an explicit reason where the
+# sandbox denies it, so card validation is never failed by the environment
+# instead of the code under test. A capable host runs every marked test.
+
+
+@functools.cache
+def can_create_named_pipe() -> bool:
+    """Whether this process may open multiprocessing's IPC connection primitive."""
+    try:
+        parent_conn, child_conn = multiprocessing.connection.Pipe()
+    except OSError:
+        return False
+    parent_conn.close()
+    child_conn.close()
+    return True
+
+
+@functools.cache
+def can_create_symlink() -> bool:
+    """Whether this process may create a filesystem symlink."""
+    try:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp_dir:
+            target = Path(tmp_dir) / "target"
+            target.write_text("probe", encoding="utf-8")
+            link = Path(tmp_dir) / "link"
+            link.symlink_to(target)
+    except OSError:
+        return False
+    return True
+
+
+def _skip_unless_capable(
+    items: list[pytest.Item], marker_name: str, capable: bool, capability: str
+) -> None:
+    if capable:
+        return
+    skip_marker = pytest.mark.skip(reason=f"sandbox_capability_denied:{capability}")
+    for item in items:
+        if item.get_closest_marker(marker_name) is not None:
+            item.add_marker(skip_marker)
+
+
+def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+    _skip_unless_capable(items, "requires_named_pipe", can_create_named_pipe(), "named_pipe")
+    _skip_unless_capable(items, "requires_symlink", can_create_symlink(), "symlink")

@@ -297,6 +297,7 @@ def test_opencode_linux_snap_bin_is_used_when_path_lookup_misses(
     assert resolution.executable == str(snap)
 
 
+@pytest.mark.requires_symlink
 def test_opencode_linux_snap_bin_preserves_wrapper_when_symlink_target_is_snap(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -320,6 +321,7 @@ def test_opencode_linux_snap_bin_preserves_wrapper_when_symlink_target_is_snap(
     assert resolution.executable != str(wrapper.resolve(strict=True))
 
 
+@pytest.mark.requires_symlink
 def test_opencode_path_discovery_preserves_snap_wrapper_when_symlink_target_is_snap(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -344,6 +346,7 @@ def test_opencode_path_discovery_preserves_snap_wrapper_when_symlink_target_is_s
 
 
 @pytest.mark.skipif(os.name == "nt", reason="classic Snap is a Linux runtime")
+@pytest.mark.requires_symlink
 def test_opencode_classic_snap_resolves_authenticated_real_executable(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -368,6 +371,7 @@ def test_opencode_classic_snap_resolves_authenticated_real_executable(
         ({"current_escape": True}, "current_escapes_snap_root"),
     ],
 )
+@pytest.mark.requires_symlink
 def test_opencode_snap_resolution_fails_closed_for_untrusted_installation(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

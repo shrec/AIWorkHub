@@ -268,6 +268,7 @@ def test_classify_from_paths_skips_reads_for_a_clean_exit(tmp_path: Path) -> Non
     assert result["diagnostic"] == ""
 
 
+@pytest.mark.requires_symlink
 def test_classify_from_paths_never_follows_a_symlinked_log_path(tmp_path: Path) -> None:
     """Sentinel symlink-swap regression: if a declared log path is replaced by
     a symlink to an arbitrary host file, that file's content must never be
