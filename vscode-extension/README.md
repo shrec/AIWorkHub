@@ -14,6 +14,12 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.12.9
+
+- C/C++ code tasks launch with their project headers: angle-bracket includes resolve against the declared include roots.
+- The Claude haiku route launches instead of failing with `model_not_found`.
+- Rejecting a review stops its now-useless reviewers, and OpenCode workers lose the file-writing builtins they must not use.
+
 ## What's new in 0.12.8
 
 - Rework and ranged `read_first` launches no longer fail on an emptied worktree or a `path:N-M` context suffix.

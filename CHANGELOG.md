@@ -6,6 +6,17 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.9] - 2026-09-30
+
+### Fixed
+
+- Code tasks on C/C++ repositories seed the project headers named by angle-bracket `#include <x.h>` directives, resolved against the declared include roots only (NF-2026-01149).
+- A Claude CLI launch on the haiku route passes the Claude Code model spelling `claude-haiku-4-5` on `--model`, so it no longer fails with `model_not_found`; every other subsystem keeps the canonical `claude-haiku-4.5` id (AIWORKHUB_01182).
+- OpenCode workers can no longer reach the write/patch/multiedit/todo/list builtins, and the `opencode/*-free` route is reported as `opencode_free_tier_client_restricted` instead of disappearing from discovery (NF-2026-01081).
+- Rejecting a review also cancels the live auto quality reviewers bound to the rejected request (NF-2026-01087).
+- Tests that need symlinks or named pipes carry `requires_symlink` / `requires_named_pipe` markers and skip with `sandbox_capability_denied:<capability>` only where the worker sandbox denies that capability (NF-2026-01138).
+- The header manager-chat insight card and its dead dialog path are removed; the sidebar control is the single entry point (AIWORKHUB_01180).
+
 ## [0.12.8] - 2026-09-30
 
 ### Fixed
