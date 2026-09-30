@@ -650,6 +650,9 @@ def _commit_validation_worker_package(repo: Path) -> None:
         # The seed closure fails closed when the sibling is absent.
         "windows_mxc.py",
         "worker_workspace.py",
+        # worker_workspace imports its C/C++ include-seed helpers from here
+        # (NF-2026-01156-RATCHET).
+        "worker_workspace_include_seed.py",
     ):
         shutil.copyfile(source_package / name, destination_package / name)
     # write_bytes, not write_text: several tests compare a raw on-disk byte
