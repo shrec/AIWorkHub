@@ -659,6 +659,44 @@ def _route_failure_kind(process: Mapping[str, Any]) -> str:
     return ""
 
 
+_SANDBOX_START_FAILURE_STREAK_MIN_LAUNCHES = 3
+
+
+def _is_sandbox_start_failure(process: Mapping[str, Any]) -> bool:
+    for field in ("failure_kind", "diagnostic"):
+        if str(process.get(field) or "").startswith("sandbox_"):
+            return True
+    terminal_reason = process.get("terminal_reason")
+    return (
+        isinstance(terminal_reason, Mapping)
+        and str(terminal_reason.get("code") or "") == "sandbox_spawn_failed"
+    )
+
+
+def _sandbox_start_failure_streak(matched: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
+    # NF-2026-01140: every measured launch dying in the sandbox (never a
+    # provider round trip) is measured dead, distinct from _route_circuit's
+    # auth/quota/transient provider-failure classification below.
+    launches = list(matched)
+    total = len(launches)
+    successes = sum(
+        1 for process in launches
+        if str(process.get("state") or "").strip().casefold() in _ROUTE_SUCCESS_STATES
+    )
+    sandbox_failures = sum(1 for process in launches if _is_sandbox_start_failure(process))
+    tripped = (
+        total >= _SANDBOX_START_FAILURE_STREAK_MIN_LAUNCHES
+        and successes == 0
+        and sandbox_failures == total
+    )
+    return {
+        "tripped": tripped,
+        "launch_count": total,
+        "success_count": successes,
+        "sandbox_failure_count": sandbox_failures,
+    }
+
+
 def _route_circuit(
     matched: Iterable[Mapping[str, Any]], *, now_epoch: float,
 ) -> dict[str, Any]:
@@ -1594,6 +1632,7 @@ def build_catalog(
         access_observed = bool(adapter_ready.get("access_observed"))
         route_health = _route_circuit(matched, now_epoch=observed_now_epoch)
         route_available = route_health["state"] != "open"
+        sandbox_start_failure_streak = _sandbox_start_failure_streak(matched)
         policy_provider, policy_adapter = policy_route_identity(
             worker["provider"], effective_adapter
         )
@@ -1618,6 +1657,7 @@ def build_catalog(
             effective_enabled
             and adapter_ready.get("launchable")
             and route_available
+            and not sandbox_start_failure_streak["tripped"]
         )
         exact_route_success_observed = any(
             str(process.get("state") or "").strip().casefold()
@@ -1770,6 +1810,8 @@ def build_catalog(
             availability_reason = "worker_disabled_in_workforce_catalog"
         elif not policy_enabled:
             availability_reason = "route_disabled_by_repository_model_settings"
+        elif sandbox_start_failure_streak["tripped"]:
+            availability_reason = "sandbox_start_failure_streak"
         elif not adapter_ready.get("launchable"):
             availability_reason = (
                 f"{repo_policy.ROUTE_QUESTION_STARTABLE}:"
@@ -1823,6 +1865,7 @@ def build_catalog(
                 "proves_round_trip": False,
             },
             "route_health": route_health,
+            "sandbox_start_failure_streak": sandbox_start_failure_streak,
             "quota_observed": False,
             "quota_state": "unavailable_from_provider_api",
             "outcomes": {

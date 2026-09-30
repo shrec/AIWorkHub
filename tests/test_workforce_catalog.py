@@ -2922,3 +2922,205 @@ def test_worker_prose_credit_limit_sentence_cannot_open_the_circuit(tmp_path):
         )
         assert circuit["state"] != "open"
         assert circuit["failure_kind"] == ""
+
+
+def test_build_routing_catalog_excludes_a_route_whose_every_measured_launch_died_in_the_sandbox(
+    tmp_path: Path,
+) -> None:
+    """NF-2026-01140: a route measured 100% sandbox-dead must stop ranking.
+
+    Three launches, zero successes, each launch naming the sandbox failure
+    through a different field the ledger actually uses -- a summarized
+    ``failure_kind``, a summarized ``diagnostic``, and the launcher-minted
+    ``terminal_reason.code`` -- so all three recognised spellings are proven
+    at once.
+    """
+    root = _root(tmp_path)
+    now = 2_000_000_000.0
+    dead = [
+        {
+            "request_id": "glm-sandbox-0",
+            "task_id": "T-glm-sandbox-0",
+            "adapter_id": "glm_vscode_lm",
+            "model": "glm-5.2",
+            "state": "worker_failed",
+            "failure_kind": "sandbox_filesystem_denied",
+            "finished_at": datetime.fromtimestamp(now - 60, tz=timezone.utc).isoformat(),
+        },
+        {
+            "request_id": "glm-sandbox-1",
+            "task_id": "T-glm-sandbox-1",
+            "adapter_id": "glm_vscode_lm",
+            "model": "glm-5.2",
+            "state": "worker_failed",
+            "diagnostic": "sandbox_filesystem_denied",
+            "finished_at": datetime.fromtimestamp(now - 61, tz=timezone.utc).isoformat(),
+        },
+        {
+            "request_id": "glm-sandbox-2",
+            "task_id": "T-glm-sandbox-2",
+            "adapter_id": "glm_vscode_lm",
+            "model": "glm-5.2",
+            "state": "worker_failed",
+            "terminal_reason": {"code": "sandbox_spawn_failed"},
+            "finished_at": datetime.fromtimestamp(now - 62, tz=timezone.utc).isoformat(),
+        },
+    ]
+    built = workforce_catalog.build_catalog(
+        root, cards=[], process_rows=dead, preflight=_preflight(), now_epoch=now,
+    )
+    glm = next(row for row in built["workers"] if row["worker_id"] == "glm-5.2")
+    assert glm["available"] is False
+    assert glm["launch_eligible"] is False
+    assert glm["availability_reason"] == "sandbox_start_failure_streak"
+    assert glm["sandbox_start_failure_streak"] == {
+        "tripped": True,
+        "launch_count": 3,
+        "success_count": 0,
+        "sandbox_failure_count": 3,
+    }
+
+
+def test_sandbox_start_failure_streak_does_not_trip_with_one_success(
+    tmp_path: Path,
+) -> None:
+    root = _root(tmp_path)
+    now = 2_000_000_000.0
+    rows = [
+        {
+            "request_id": f"glm-sandbox-{index}",
+            "task_id": f"T-glm-sandbox-{index}",
+            "adapter_id": "glm_vscode_lm",
+            "model": "glm-5.2",
+            "state": "worker_failed",
+            "failure_kind": "sandbox_filesystem_denied",
+            "finished_at": datetime.fromtimestamp(
+                now - 60 - index, tz=timezone.utc
+            ).isoformat(),
+        }
+        for index in range(2)
+    ]
+    rows.append({
+        "request_id": "glm-success",
+        "task_id": "T-glm-success",
+        "adapter_id": "glm_vscode_lm",
+        "model": "glm-5.2",
+        "state": "accepted",
+        "finished_at": datetime.fromtimestamp(now - 70, tz=timezone.utc).isoformat(),
+    })
+    snapshot = workforce_catalog.build_catalog(
+        root, cards=[], process_rows=rows, preflight=_preflight(), now_epoch=now,
+    )
+    glm = next(row for row in snapshot["workers"] if row["worker_id"] == "glm-5.2")
+    assert glm["sandbox_start_failure_streak"] == {
+        "tripped": False,
+        "launch_count": 3,
+        "success_count": 1,
+        "sandbox_failure_count": 2,
+    }
+    assert glm["available"] is True
+
+
+def test_sandbox_start_failure_streak_does_not_trip_below_three_launches(
+    tmp_path: Path,
+) -> None:
+    """A cold route -- too few measured launches to judge -- stays rankable."""
+    root = _root(tmp_path)
+    now = 2_000_000_000.0
+    rows = [
+        {
+            "request_id": f"glm-sandbox-{index}",
+            "task_id": f"T-glm-sandbox-{index}",
+            "adapter_id": "glm_vscode_lm",
+            "model": "glm-5.2",
+            "state": "worker_failed",
+            "failure_kind": "sandbox_filesystem_denied",
+            "finished_at": datetime.fromtimestamp(
+                now - 60 - index, tz=timezone.utc
+            ).isoformat(),
+        }
+        for index in range(2)
+    ]
+    snapshot = workforce_catalog.build_catalog(
+        root, cards=[], process_rows=rows, preflight=_preflight(), now_epoch=now,
+    )
+    glm = next(row for row in snapshot["workers"] if row["worker_id"] == "glm-5.2")
+    assert glm["sandbox_start_failure_streak"] == {
+        "tripped": False,
+        "launch_count": 2,
+        "success_count": 0,
+        "sandbox_failure_count": 2,
+    }
+    assert glm["available"] is True
+
+
+def test_sandbox_start_failure_streak_ignores_non_sandbox_failures(
+    tmp_path: Path,
+) -> None:
+    """validation_failed/provider-error style failures are not this rule's business."""
+    root = _root(tmp_path)
+    now = 2_000_000_000.0
+    rows = [
+        {
+            "request_id": f"glm-other-{index}",
+            "task_id": f"T-glm-other-{index}",
+            "adapter_id": "glm_vscode_lm",
+            "model": "glm-5.2",
+            "state": "worker_failed",
+            "error": "boom",
+            "finished_at": datetime.fromtimestamp(
+                now - 60 - index, tz=timezone.utc
+            ).isoformat(),
+        }
+        for index in range(3)
+    ]
+    snapshot = workforce_catalog.build_catalog(
+        root, cards=[], process_rows=rows, preflight=_preflight(), now_epoch=now,
+    )
+    glm = next(row for row in snapshot["workers"] if row["worker_id"] == "glm-5.2")
+    streak = glm["sandbox_start_failure_streak"]
+    assert streak["tripped"] is False
+    assert streak["sandbox_failure_count"] == 0
+    assert glm["availability_reason"] != "sandbox_start_failure_streak"
+    assert glm["available"] is True
+
+
+def test_rank_task_never_returns_a_sandbox_dead_route_as_launch_contract(
+    tmp_path: Path,
+) -> None:
+    """NF-2026-01140: the router must skip a route measured dead by the sandbox rule."""
+    root = _root(tmp_path)
+    now = 2_000_000_000.0
+    dead = [
+        {
+            "request_id": f"glm-sandbox-{index}",
+            "task_id": f"T-glm-sandbox-{index}",
+            "adapter_id": "glm_vscode_lm",
+            "model": "glm-5.2",
+            "state": "worker_failed",
+            "failure_kind": "sandbox_filesystem_denied",
+            "finished_at": datetime.fromtimestamp(
+                now - 60 - index, tz=timezone.utc
+            ).isoformat(),
+        }
+        for index in range(3)
+    ]
+    snapshot = workforce_catalog.build_catalog(
+        root, cards=[], process_rows=dead, preflight=_preflight(), now_epoch=now,
+    )
+    task = workforce_router.TaskRequirements.build(
+        task_id="sandbox-streak-routing",
+        repo_id="repo",
+        kinds=["code"],
+        risk="medium",
+        tool_needs=["source-graph"],
+    )
+    decision = workforce_catalog.rank_task(root, task, catalog=snapshot)
+    glm = next(
+        item for item in decision["candidates"] if item["worker_id"] == "glm-5.2"
+    )
+    assert glm["excluded"] is True
+    assert glm["availability_reason"] == "sandbox_start_failure_streak"
+    assert decision["selected_worker_id"] != "glm-5.2"
+    if decision["launch_contract"] is not None:
+        assert decision["launch_contract"]["adapter_id"] != "glm_vscode_lm"
