@@ -5881,6 +5881,7 @@ def test_direct_launch_cancel_requested_pid_identity_admission_matrix(
         "_pid_identity_evidence",
         lambda _pid, _ticks: _w1_pid_evidence(verdict),
     )
+    original_pid_matches = process_launcher._pid_matches
     monkeypatch.setattr(
         process_launcher,
         "_pid_matches",
@@ -5892,13 +5893,16 @@ def test_direct_launch_cancel_requested_pid_identity_admission_matrix(
         else []
     )
 
-    result = manager.launch(
-        task_id="TASK_B1",
-        runner="claude_worker_b1",
-        topic="task_mcp",
-        adapter_id="claude_cli",
-        timeout_seconds=30,
-    )
+    try:
+        result = manager.launch(
+            task_id="TASK_B1",
+            runner="claude_worker_b1",
+            topic="task_mcp",
+            adapter_id="claude_cli",
+            timeout_seconds=30,
+        )
+    finally:
+        monkeypatch.setattr(process_launcher, "_pid_matches", original_pid_matches)
 
     assert result["ok"] is not expected_blocked
     if expected_blocked:
