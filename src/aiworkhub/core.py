@@ -3545,7 +3545,7 @@ def _task_contract_path(raw: Any) -> str:
         or "." in leaf
     ):
         return ""
-    value = re.sub(r"^(?:\./)+", "", value)
+    value = re.sub(r"^(?:\./|/)+", "", value)
     return value
 
 
@@ -6313,6 +6313,8 @@ def reject_review(
                 return True
             if any(ch in allowed for ch in "*?["):
                 return fnmatch.fnmatchcase(residual, allowed)
+            if not allowed.endswith("/"):
+                return False
             return residual.startswith(allowed.rstrip("/") + "/")
 
         seen_residuals: set[tuple[str, str]] = set()
@@ -6320,6 +6322,7 @@ def reject_review(
             if not isinstance(row, dict):
                 return residual_error("invalid_residual_identities", index=index)
             path = _task_contract_path(row.get("path"))
+            raw_path = str(row.get("path") or "").strip().replace("\\", "/")
             pointer = str(row.get("pointer") or "").strip()
             if (
                 not path
@@ -6332,7 +6335,7 @@ def reject_review(
                 any(ch in path for ch in "*?[]")
                 or any(seg in (".", "..") for seg in path.split("/"))
                 or path.endswith("/")
-                or path.startswith("/")
+                or re.match(r"^(?:\./)*/", raw_path) is not None
                 or (len(path) > 1 and path[1] == ":")
             )
             if has_unsafe_shape or not any(

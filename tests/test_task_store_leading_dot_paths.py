@@ -184,10 +184,13 @@ UNSAFE_RESIDUAL_CASES = [
     ("src/data/rows.json", ["src/*.py"]),
     ("src/x.py/../../../.aiworkhub/config/development_rules.json", ["src/x.py"]),
     ("/etc/app.json", ["*.json"]),
+    (".//etc/app.json", ["*.json"]),
+    ("././/etc/app.json", ["*.json"]),
     ("C:/x/app.json", ["*.json"]),
     ("src/*.py", ["src/"]),
     ("src/pkg/", ["src/"]),
     ("src/./x.py", ["src/"]),
+    ("out/result.txt/extra.json", ["out/result.txt"]),
 ]
 
 
@@ -300,6 +303,19 @@ def test_normalize_write_path_treats_leading_slash_as_repo_relative():
     assert task_store._normalize_write_path("/./src/a.py") == "src/a.py"
 
 
+LEADING_SLASH_EQUIVALENCE_CASES = ["/src/a.py", ".//src/a.py", "/./src/a.py"]
+
+
+@pytest.mark.parametrize("raw", LEADING_SLASH_EQUIVALENCE_CASES)
+def test_task_contract_path_and_normalize_write_path_agree_on_leading_slash(raw):
+    assert core._task_contract_path(raw) == task_store._normalize_write_path(raw) == "src/a.py"
+
+
+def test_task_contract_path_peels_quadratic_interleaved_leading_dot_slash_run():
+    raw = ".//" * 50000 + "src/a.py"
+    assert core._task_contract_path(raw) == "src/a.py"
+
+
 def test_reject_review_refuses_when_allowed_writes_is_not_a_list(coord):
     task_id = "T_ALLOWED_WRITES_NOT_A_LIST"
     card = {
@@ -321,3 +337,39 @@ def test_reject_review_refuses_when_allowed_writes_is_not_a_list(coord):
 
     after = task_store.get_task(coord, task_id)
     assert after == before
+
+
+def test_task_card_path_conflicts_reports_forbidden_path_declared_with_dot_slash_spelling():
+    conflicts = core.task_card_path_conflicts(
+        {"forbidden": ["src/secret.py"], "allowed_writes": [".//src/secret.py"]}
+    )
+    assert {
+        "field": "allowed_writes",
+        "path": "src/secret.py",
+        "forbidden": "src/secret.py",
+    } in conflicts
+
+
+def test_card_scope_warnings_folds_leading_slash_spellings():
+    assert (
+        core.card_scope_warnings(
+            {"allowed_writes": ["src/a.py"], "scope_files": ["/src/a.py", ".//src/a.py"]}
+        )
+        == []
+    )
+    assert core.card_scope_warnings(
+        {"allowed_writes": ["src/a.py"], "scope_files": [".//src/b.py"]}
+    ) == ["src/b.py"]
+
+
+def test_card_test_scope_warnings_folds_leading_slash_read_only(tmp_path):
+    result = core.card_test_scope_warnings(
+        {
+            "allowed_writes": ["src/a.py"],
+            "read_first": ["/tests/test_a.py"],
+            "validation": ["python -m pytest -q tests/test_a.py"],
+        },
+        repo=tmp_path,
+    )
+    assert result["test_scope_warnings"] == []
+    assert result["suppressed_read_only"] == ["tests/test_a.py"]
