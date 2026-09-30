@@ -15,6 +15,7 @@ Proves:
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import sys
@@ -944,3 +945,18 @@ def test_angle_bracket_include_target_symlink_rejected(tmp_path: Path) -> None:
     assert worker_workspace._resolve_local_quoted_includes(
         repo, ["src/main.cpp"], include_roots=("include", "src")
     ) == ["src/main.cpp"]
+
+
+def test_include_seed_module_importable_standalone() -> None:
+    """``worker_workspace_include_seed`` must not top-level-import back from
+    ``worker_workspace``: a fresh interpreter importing it directly (never
+    having imported ``worker_workspace`` first) must not hit a partially
+    initialized module ImportError."""
+    result = subprocess.run(
+        [sys.executable, "-c", "import aiworkhub.worker_workspace_include_seed"],
+        env={**os.environ, "PYTHONPATH": str(Path(worker_workspace.__file__).resolve().parents[1])},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
