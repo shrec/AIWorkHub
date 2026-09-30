@@ -1,5 +1,15 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.12.11 — 2026-10-01
+
+### Added
+
+- `reject_review` and `recover_blocked_rework` accept an optional `validation_amendment`: validated commands are appended to the card's validation in the same transaction, so a reject reason that demands new evidence is runnable by the next attempt's terminal validation; an over-cap amendment is refused on every branch, including an idempotent replay (NF-2026-01151).
+
+### Changed
+
+- The C/C++ quoted-include seeding moved into `worker_workspace_include_seed.py`, so `worker_workspace.py` is back under the module-size ratchet without raising the limit (NF-2026-01156).
+
 ## 0.12.10 — 2026-10-01
 
 ### Added

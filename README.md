@@ -62,6 +62,10 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
+## What's new in 0.12.11
+
+- A rejected review can demand new evidence: `validation_amendment` appends the required commands to the card's validation, so the next attempt must run them.
+
 ## What's new in 0.12.10
 
 - Concurrent reviewer launches on Windows share one AppContainer profile instead of racing each other into a failed launch.
