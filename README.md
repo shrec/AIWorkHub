@@ -62,6 +62,11 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
+## What's new in 0.12.7
+
+- SDLC stage proofs no longer stall: accepted cards that were archived later, and cards whose files moved on after accept, still reach build, test and deploy.
+- Escaped-defect attribution counts only real, converted defects, so the quality metric is honest.
+
 ## What's new in 0.12.6
 
 - Every card walks all six SDLC stages on its own, through deploy and maintain, each proven from receipts.

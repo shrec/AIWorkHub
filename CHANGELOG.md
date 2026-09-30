@@ -6,6 +6,15 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.7] - 2026-09-30
+
+### Fixed
+
+- The SDLC sync opens no case for quality-reviewer cards or for withdrawn tasks that were never accepted, and reports them as skipped (NF-2026-01133).
+- Escaped-defect attribution counts only converted NeedFixes and trusts the store-verified `caused_by` regardless of the event window (NF-2026-01134).
+- The test stage falls back to the historical accepted-outcome authority when only the live promoted bytes changed since accept (NF-2026-01132).
+- A card that task hygiene archives after it was accepted is no longer treated as withdrawn, so its build, test and deploy proofs verify (NF-2026-01135).
+
 ## [0.12.6] - 2026-09-29
 
 ### Added

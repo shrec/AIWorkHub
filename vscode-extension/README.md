@@ -14,6 +14,11 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.12.7
+
+- SDLC stage proofs no longer stall: accepted cards that were archived later, and cards whose files moved on after accept, still reach build, test and deploy.
+- Escaped-defect attribution counts only real, converted defects, so the quality metric is honest.
+
 ## What's new in 0.12.6
 
 - Every card walks all six SDLC stages on its own, through deploy and maintain, each proven from receipts.
