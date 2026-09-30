@@ -4751,6 +4751,35 @@ def _validation_only_replay_configured_workspace_rejected(
     )
 
 
+def apply_validation_amendment(card: dict[str, Any], commands: list[str]) -> list[str]:
+    """Append new validation commands (deduped) and a matching role in place."""
+    if not commands:
+        return []
+    validation = card.get("validation")
+    validation_list = list(validation) if isinstance(validation, list) else []
+    seen = set(validation_list)
+    roles = card.get("validation_roles")
+    roles_is_list = isinstance(roles, list)
+    roles_list = list(roles) if roles_is_list else []
+    applied: list[str] = []
+    for command in commands:
+        if command in seen:
+            continue
+        seen.add(command)
+        validation_list.append(command)
+        if roles_is_list:
+            roles_list.append("generic")
+        applied.append(command)
+    from . import task_templates
+    if len(validation_list) > task_templates.MAX_PATHS_PER_FIELD:
+        raise ValueError("validation_amendment_exceeds_limit")
+    if applied:
+        card["validation"] = validation_list
+        if roles_is_list:
+            card["validation_roles"] = roles_list
+    return applied
+
+
 @_os_failure_names_its_operation
 def recover_blocked_rework(
     root: str | Path,
@@ -4760,6 +4789,8 @@ def recover_blocked_rework(
     feedback_reason: str = "",
     validation_only_replay: bool = False,
     clean_root_if_predecessor_missing: bool = False,
+    validation_amendment: list[str] | None = None,
+    applied_out: list[str] | None = None,
 ) -> tuple[bool, str]:
     """Recover the same blocked task ID for rework when retained predecessor
     evidence and actionable residual feedback are present.
@@ -4802,6 +4833,19 @@ def recover_blocked_rework(
     already re-queued the same task, without duplicating audit history.  A
     pending recovered task may still receive the explicit clean-root
     authorization once when its predecessor is demonstrably missing.
+
+    ``validation_amendment`` appends its new (deduped) commands to the card's
+    ``validation`` -- and a matching ``generic`` role where
+    ``validation_roles`` exists -- inside this same transaction, so the next
+    attempt's terminal validation runs them.  ``applied_out`` receives exactly
+    the commands a committed branch persisted: an idempotent
+    ``already_recovered`` return commits nothing and therefore reports nothing,
+    so a receipt can never name a command the stored card lacks.  The
+    amendment is validated before any branch is chosen, so an amendment that
+    would exceed MAX_PATHS_PER_FIELD is refused with
+    ``invalid_validation_amendment:validation_amendment_exceeds_limit`` even
+    when the task is already recovered; an idempotent success never silently
+    drops a caller's amendment.
     """
     _readiness, db_path = _require_ready(root)
     from .successful_rework_recovery import prepare_blocked_recovery
@@ -4842,6 +4886,25 @@ def recover_blocked_rework(
             return False, "card_json_invalid"
         if not isinstance(card, dict):
             return False, "card_json_not_dict"
+
+        # The amendment mutates the in-memory ``card`` here, so every branch
+        # that serializes ``card`` persists it -- but the idempotent branches
+        # below return True *before* any ``conn.commit()`` and persist nothing.
+        # Reporting from here would name commands the stored card does not
+        # carry, so ``applied_out`` is filled only by ``report_applied_amendment``
+        # on a branch that has actually committed (NF-2026-01151).
+        pending_amendment: list[str] = []
+        if validation_amendment:
+            try:
+                pending_amendment = apply_validation_amendment(
+                    card, validation_amendment
+                )
+            except ValueError as exc:
+                return False, f"invalid_validation_amendment:{exc}"
+
+        def report_applied_amendment() -> None:
+            if applied_out is not None and pending_amendment:
+                applied_out.extend(pending_amendment)
 
         if str(card.get("topic") or row["topic"] or "") == "quality_review":
             return False, "quality_review_recovery_requires_bound_relaunch"
@@ -5260,6 +5323,7 @@ def recover_blocked_rework(
                         ),
                     )
                     conn.commit()
+                    report_applied_amendment()
                     return True, "recovered_validation_only_replay"
                 if not clean_root_if_predecessor_missing:
                     stale_authorization = card.get(
@@ -5306,6 +5370,7 @@ def recover_blocked_rework(
                         ),
                     )
                     conn.commit()
+                    report_applied_amendment()
                     return True, "consumed_stale_validation_only_replay_authorization"
                 allowed, reason, clean_root_evidence = clean_root_predecessor_authority()
                 if not allowed:
@@ -5346,6 +5411,7 @@ def recover_blocked_rework(
                     ),
                 )
                 conn.commit()
+                report_applied_amendment()
                 return True, "recovered_clean_root"
 
         if current_canonical != "blocked":
@@ -6116,6 +6182,7 @@ def recover_blocked_rework(
             ),
         )
         conn.commit()
+        report_applied_amendment()
         return True, "recovered"
 
 

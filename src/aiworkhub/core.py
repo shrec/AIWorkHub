@@ -6204,6 +6204,42 @@ def classify_terminal_disposition(card: Mapping[str, Any] | None) -> FailureCate
     )
 
 
+def _validate_validation_amendment_commands(commands: list[str]) -> dict[str, Any] | None:
+    """Validate amendment commands with task_create's own validation-command
+    rules (task_create ~4205-4230 and ~4529-4547), reused rather than
+    reimplemented, so a refused command carries the identical error code."""
+    from . import quality_evidence, task_templates
+
+    if len(commands) > task_templates.MAX_PATHS_PER_FIELD:
+        return _lifecycle_error("invalid_validation", 2)
+    try:
+        task_templates.validate_custom_validation_roles(
+            commands, [quality_evidence.VALIDATION_ROLE_GENERIC] * len(commands)
+        )
+    except task_templates.TaskTemplateError as exc:
+        return _lifecycle_error(str(exc), 2)
+
+    from . import worker_workspace
+
+    for validation_index, validation_command in enumerate(commands):
+        try:
+            worker_workspace.validation_argv(validation_command)
+        except worker_workspace.WorkspaceError as exc:
+            result = _lifecycle_error(f"invalid_validation_command:{exc}", 2)
+            result.update({
+                "validation_index": validation_index,
+                "validation_command": validation_command[:240],
+                "supported_validation_examples": [
+                    "pytest -q tests/test_target.py",
+                    "ruff check src/target.py tests/test_target.py",
+                    "python3 -m pytest -q tests/test_target.py",
+                    "python3 scripts/validate_target.py",
+                ],
+            })
+            return result
+    return None
+
+
 def reject_review(
     task_id: str,
     reason: str,
@@ -6212,6 +6248,7 @@ def reject_review(
     residual_identities: list[dict[str, str]] | None = None,
     predecessor_request_id: str | None = None,
     failure_category: str | None = None,
+    validation_amendment: list[str] | None = None,
 ) -> dict[str, Any]:
     card, error = _live_card(task_id)
     if error:
@@ -6230,6 +6267,11 @@ def reject_review(
     disposition = str(to or "pending").strip().lower()
     if disposition not in ("pending", "blocked", "archived", "superseded"):
         return _lifecycle_error(f"invalid reject-review disposition: {disposition}")
+    amendment_commands = list(validation_amendment) if validation_amendment else []
+    if amendment_commands:
+        amendment_error = _validate_validation_amendment_commands(amendment_commands)
+        if amendment_error is not None:
+            return amendment_error
     actor = _verified_manager_actor()
     blocked = _canonical_write_gate(
         "reject-review", runner=CODEX_RUNNER, topic=str(live_topic), coordinator_capability=True
@@ -6840,6 +6882,19 @@ def reject_review(
             "card_json=?, updated_at=?"
         )
     try:
+        applied_validation_amendment = (
+            task_store.apply_validation_amendment(card, amendment_commands)
+            if amendment_commands
+            else []
+        )
+    except ValueError as exc:
+        return _canonical_result(
+            ok=False,
+            returncode=1,
+            stderr=f"invalid_validation_amendment:{exc}",
+            command=command,
+        )
+    try:
         conn = _canonical_connect()
     except task_store.TaskStoreError as exc:
         return _canonical_result(ok=False, returncode=1, stderr=str(exc), command=command)
@@ -6897,6 +6952,8 @@ def reject_review(
     result = _reconcile_retained_workspaces(
         _canonical_result(ok=True, returncode=0, stdout=stdout, command=command)
     )
+    if amendment_commands:
+        result["validation_amendment_applied"] = applied_validation_amendment
     if rework_delta_reuse_error is not None:
         result["rework_delta_recovery"] = {
             "schema_id": "aiworkhub.rework_delta_recovery.v1",
@@ -7036,6 +7093,7 @@ def recover_blocked_rework(
     topic: str | None = None,
     validation_only_replay: bool = False,
     clean_root_if_predecessor_missing: bool = False,
+    validation_amendment: list[str] | None = None,
 ) -> dict[str, Any]:
     """Recover one exact blocked task through the canonical task-store transaction."""
     card, error = _live_card(task_id)
@@ -7047,6 +7105,13 @@ def recover_blocked_rework(
         return _lifecycle_error("task has no exact topic identity")
     if topic is not None and topic != live_topic:
         return _lifecycle_error(f"topic mismatch expected={live_topic} got={topic}")
+
+    amendment_commands = list(validation_amendment) if validation_amendment else []
+    if amendment_commands:
+        amendment_error = _validate_validation_amendment_commands(amendment_commands)
+        if amendment_error is not None:
+            return amendment_error
+    applied: list[str] = []
 
     bounded_feedback, _truncated = _bounded_utf8_prefix(
         str(feedback_reason or "").strip(), _MAX_REWORK_FEEDBACK_BYTES
@@ -7087,15 +7152,19 @@ def recover_blocked_rework(
         result["reason"] = reason
         return result
     try:
-        ok, state = task_store.recover_blocked_rework(
-            repo_root(),
-            task_id,
-            actor=actor,
-            feedback_reason=bounded_feedback,
-            validation_only_replay=bool(validation_only_replay),
-            clean_root_if_predecessor_missing=bool(
+        task_store_kwargs: dict[str, Any] = {
+            "actor": actor,
+            "feedback_reason": bounded_feedback,
+            "validation_only_replay": bool(validation_only_replay),
+            "clean_root_if_predecessor_missing": bool(
                 clean_root_if_predecessor_missing
             ),
+        }
+        if amendment_commands:
+            task_store_kwargs["validation_amendment"] = amendment_commands
+            task_store_kwargs["applied_out"] = applied
+        ok, state = task_store.recover_blocked_rework(
+            repo_root(), task_id, **task_store_kwargs
         )
     except task_store.TaskStoreError as exc:
         return _canonical_result(ok=False, returncode=1, stderr=str(exc), command=command)
@@ -7108,9 +7177,15 @@ def recover_blocked_rework(
         )
     card2 = task_store.get_task(repo_root(), task_id)
     stdout = json.dumps(card2, ensure_ascii=False, default=str) if card2 else ""
-    return _reconcile_retained_workspaces(
+    result = _reconcile_retained_workspaces(
         _canonical_result(ok=True, returncode=0, stdout=stdout, command=command)
     )
+    if amendment_commands:
+        # ``applied`` is filled by task_store only from a branch that committed,
+        # so an idempotent already-recovered success reports [] rather than
+        # commands the stored card never received (NF-2026-01151).
+        result["validation_amendment_applied"] = applied
+    return result
 
 
 _RETRYABLE_OPERATIONAL_TERMINAL_SUBSTATUSES: frozenset[str] = frozenset(

@@ -433,6 +433,51 @@ def test_server_recover_blocked_rework_forwards_public_schema(monkeypatch):
     assert calls == [("T_BLOCKED", "focused repair", False, False)]
 
 
+def test_server_recover_blocked_rework_forwards_validation_amendment(monkeypatch):
+    calls = []
+
+    def recover(
+        task_id,
+        *,
+        feedback_reason="",
+        validation_only_replay=False,
+        clean_root_if_predecessor_missing=False,
+        validation_amendment=None,
+    ):
+        calls.append(validation_amendment)
+        return {"ok": True, "task_id": task_id}
+
+    monkeypatch.setattr(core, "recover_blocked_rework", recover)
+
+    result = server.aiworkhub_task_recover_blocked_rework(
+        "T_BLOCKED", "focused repair", validation_amendment=["pytest -q tests/test_x.py"]
+    )
+
+    assert result == {"ok": True, "task_id": "T_BLOCKED"}
+    assert calls == [["pytest -q tests/test_x.py"]]
+
+
+def test_server_reject_review_forwards_validation_amendment(monkeypatch):
+    calls = []
+
+    def reject(**kwargs):
+        calls.append(kwargs)
+        return {"ok": True, **kwargs}
+
+    monkeypatch.setattr(core, "reject_review", reject)
+
+    server.aiworkhub_task_reject_review(
+        "T1", "repair", validation_amendment=["pytest -q tests/test_x.py"]
+    )
+
+    assert calls == [{
+        "task_id": "T1",
+        "reason": "repair",
+        "to": "pending",
+        "validation_amendment": ["pytest -q tests/test_x.py"],
+    }]
+
+
 def test_server_reroute_launch_identity_forwards_public_schema(monkeypatch):
     calls = []
 
@@ -629,7 +674,7 @@ def test_server_reject_review_cancels_only_core_disposed_reviewer_processes(monk
         return {"ok": True, "reviewer_finalization": reviewer_rows, **kwargs}
 
     class Manager:
-        def cancel_disposed_reviewer_processes(self, rows):
+        def cancel_disposed_reviewer_processes(self, rows, rejected_request_id: str = ""):
             assert rows is reviewer_rows
             return {
                 "schema_id": "aiworkhub.reviewer_process_cancellation.v1",

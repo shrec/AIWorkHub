@@ -2832,6 +2832,7 @@ def aiworkhub_task_reject_review(
     residual_identities: list[dict[str, str]] | None = None,
     predecessor_request_id: str | None = None,
     failure_category: InfrastructureFailureCategory | None = None,
+    validation_amendment: list[str] | None = None,
     include_card: CardInclude = "none",
 ) -> dict[str, Any]:
     """Write-gated Codex action: reject a reviewed task with exact feedback and
@@ -2868,6 +2869,8 @@ def aiworkhub_task_reject_review(
         kwargs["predecessor_request_id"] = predecessor_request_id
     if failure_category is not None:
         kwargs["failure_category"] = failure_category
+    if validation_amendment is not None:
+        kwargs["validation_amendment"] = validation_amendment
     result = core.reject_review(**kwargs)
     card = _envelope_card(result)
     extra = (
@@ -2898,17 +2901,20 @@ def aiworkhub_task_recover_blocked_rework(
     feedback_reason: str = "",
     validation_only_replay: bool = False,
     clean_root_if_predecessor_missing: bool = False,
+    validation_amendment: list[str] | None = None,
 ) -> dict[str, Any]:
     """Recover one exact blocked task through the canonical transaction."""
 
-    return core.recover_blocked_rework(
-        task_id,
-        feedback_reason=feedback_reason,
-        validation_only_replay=bool(validation_only_replay),
-        clean_root_if_predecessor_missing=bool(
+    kwargs: dict[str, Any] = {
+        "feedback_reason": feedback_reason,
+        "validation_only_replay": bool(validation_only_replay),
+        "clean_root_if_predecessor_missing": bool(
             clean_root_if_predecessor_missing
         ),
-    )
+    }
+    if validation_amendment is not None:
+        kwargs["validation_amendment"] = validation_amendment
+    return core.recover_blocked_rework(task_id, **kwargs)
 
 @mcp.tool()
 @_serialize_task_lifecycle_write
