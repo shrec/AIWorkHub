@@ -3,7 +3,9 @@
 Proves:
 - B646 canary: S0/S4/S6 headers seeded transitively from the B646 feature packet.
 - Unresolvable quoted includes fail closed before worker launch.
-- Angle-bracket includes are never followed.
+- Angle-bracket includes (NF-2026-01149) resolve transitively, ONLY against
+  declared include roots -- never the including file's directory, never the
+  tracked-file fallback; a target under no root is never seeded.
 - Recursive resolution (A -> B -> C).
 - Cycle deduplication.
 - Symlink rejection is preserved.
@@ -182,7 +184,9 @@ def test_unresolvable_quoted_include_is_skipped_not_refused(
 
 
 # ---------------------------------------------------------------------------
-# Angle-bracket includes are never followed.
+# Angle-bracket includes (NF-2026-01149) resolve only against declared
+# include roots -- never the including file's directory, never the
+# tracked-file fallback.
 # ---------------------------------------------------------------------------
 def _angle_bracket_repo(tmp_path: Path) -> Path:
     repo = tmp_path / "parent"
@@ -194,7 +198,8 @@ def _angle_bracket_repo(tmp_path: Path) -> Path:
     include = repo / "include"
     include.mkdir()
     (include / "lib.h").write_text(
-        '#include <stddef.h>\n#include "util.h"\n#define LIB 1\n',
+        '#include <stddef.h>\n#include "util.h"\n'
+        '#include <no_such_system_header_b664.h>\n#define LIB 1\n',
         encoding="utf-8",
     )
     (include / "util.h").write_text("#define UTIL 1\n", encoding="utf-8")
@@ -203,17 +208,23 @@ def _angle_bracket_repo(tmp_path: Path) -> Path:
     (repo / "out" / "result.txt").write_text("baseline\n", encoding="utf-8")
     assert _git(repo, "add", ".").returncode == 0
     assert _git(repo, "commit", "-qm", "angle-bracket-fixture").returncode == 0
-    # Keep this file untracked: if it appears in the detached workspace it was
-    # incorrectly pulled in by angle-bracket dependency hydration.
+    # NF-2026-01149: angle includes now resolve against declared include
+    # roots (a project/SDK-style search), so a header reachable at
+    # <root>/<target> is seeded even though it is untracked here -- the
+    # include root on disk, not git tracking, is authoritative for angle
+    # resolution.  This replaces the old (incorrect) expectation that
+    # angle-bracket includes were never followed at all.
     (include / "stddef.h").write_text("#define FAKE_STDDEF 1\n", encoding="utf-8")
     return repo
 
 
-def test_angle_bracket_includes_never_followed(
+def test_angle_bracket_include_resolves_under_declared_include_root(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
-    """``#include <stddef.h>`` is never resolved even when a file with that
-    name sits inside a configured include root."""
+    """``#include <stddef.h>`` resolves to include/stddef.h because it lives
+    under a declared include root (NF-2026-01149).  A target that resolves
+    under no root, like <no_such_system_header_b664.h>, is never seeded and
+    never refuses the launch."""
     repo = _angle_bracket_repo(tmp_path)
     monkeypatch.setenv(
         worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "worktrees")
@@ -230,11 +241,13 @@ def test_angle_bracket_includes_never_followed(
     try:
         ws = workspace.path
         assert (ws / "include/lib.h").is_file()
-        # util.h is a quoted include and should be seeded.
+        # util.h is a quoted include and is seeded.
         assert (ws / "include/util.h").is_file()
-        # stddef.h was an angle-bracket include -- NOT seeded even though it
-        # exists in the repo include root.
-        assert not (ws / "include/stddef.h").exists()
+        # stddef.h is an angle-bracket include resolved under the "include"
+        # root -- seeded under NF-2026-01149.
+        assert (ws / "include/stddef.h").is_file()
+        # A genuine SDK/system header matching no include root is skipped.
+        assert not (ws / "include/no_such_system_header_b664.h").exists()
     finally:
         worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
 
@@ -361,6 +374,7 @@ def _symlink_repo(tmp_path: Path) -> Path:
     return repo
 
 
+@pytest.mark.requires_symlink
 def test_include_target_symlink_rejected(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
@@ -615,6 +629,7 @@ def test_absolute_and_traversal_escape_includes_fail_closed_with_evidence(
     ) == ["src/nested/escape.c"]
 
 
+@pytest.mark.requires_symlink
 def test_symlink_escape_include_under_declared_root_fails_closed_with_evidence(
     tmp_path: Path,
 ) -> None:
@@ -821,3 +836,111 @@ def test_an_untracked_header_is_never_seeded_by_the_fallback(tmp_path: Path) -> 
     assert worker_workspace._resolve_local_quoted_includes(
         repo, ["src/cpu/src/pool.cpp"], include_roots=(".", "src")
     ) == ["src/cpu/src/pool.cpp"]
+
+
+# ---------------------------------------------------------------------------
+# NF-2026-01149: angle-bracket includes seed transitively against include
+# roots only -- never the including file's directory, never the tracked-file
+# fallback that quoted includes use.
+# ---------------------------------------------------------------------------
+def _angle_root_repro_repo(tmp_path: Path) -> Path:
+    repo = tmp_path / "parent"
+    repo.mkdir()
+    assert _git(repo, "init", "-q").returncode == 0
+    assert _git(repo, "config", "user.email", "b664@example.invalid").returncode == 0
+    assert _git(repo, "config", "user.name", "B664").returncode == 0
+
+    proj = repo / "include" / "proj"
+    proj.mkdir(parents=True)
+    (proj / "a.hpp").write_text('#include <proj/b.hpp>\n#pragma once\n', encoding="utf-8")
+    (proj / "b.hpp").write_text("#pragma once\n", encoding="utf-8")
+    (proj / "q.hpp").write_text("#pragma once\n", encoding="utf-8")
+
+    src = repo / "src"
+    src.mkdir()
+    (src / "main.cpp").write_text(
+        '#include <proj/a.hpp>\n#include "proj/q.hpp"\n#include <vector>\n',
+        encoding="utf-8",
+    )
+
+    (repo / "out").mkdir()
+    (repo / "out" / "result.txt").write_text("baseline\n", encoding="utf-8")
+    assert _git(repo, "add", ".").returncode == 0
+    assert _git(repo, "commit", "-qm", "angle-root-repro-fixture").returncode == 0
+    return repo
+
+
+def test_angle_bracket_includes_seed_transitively_under_include_roots(
+    tmp_path: Path,
+) -> None:
+    """NF-2026-01149 repro: ``<proj/a.hpp>`` and its transitive
+    ``<proj/b.hpp>`` resolve under include/, the quoted "proj/q.hpp" include
+    is unaffected, and ``<vector>`` (no include root contains it) is never
+    seeded."""
+    repo = _angle_root_repro_repo(tmp_path)
+    assert worker_workspace._resolve_local_quoted_includes(
+        repo, ["src/main.cpp"], include_roots=("include", "src")
+    ) == [
+        "include/proj/a.hpp",
+        "include/proj/b.hpp",
+        "include/proj/q.hpp",
+        "src/main.cpp",
+    ]
+
+
+def test_angle_bracket_include_matching_only_a_tracked_file_outside_roots_is_not_seeded(
+    tmp_path: Path,
+) -> None:
+    """A target that only exists as a tracked file outside every include root
+    is not seeded -- angle includes never use the tracked-file fallback that
+    quoted includes use."""
+    repo = tmp_path / "parent"
+    repo.mkdir()
+    assert _git(repo, "init", "-q").returncode == 0
+    assert _git(repo, "config", "user.email", "b664@example.invalid").returncode == 0
+    assert _git(repo, "config", "user.name", "B664").returncode == 0
+
+    (repo / "elsewhere" / "proj").mkdir(parents=True)
+    (repo / "elsewhere" / "proj" / "outside.hpp").write_text(
+        "#pragma once\n", encoding="utf-8"
+    )
+    (repo / "src").mkdir()
+    (repo / "src" / "main.cpp").write_text(
+        '#include <proj/outside.hpp>\n', encoding="utf-8"
+    )
+    assert _git(repo, "add", ".").returncode == 0
+    assert _git(
+        repo, "commit", "-qm", "angle-tracked-outside-root-fixture"
+    ).returncode == 0
+
+    assert worker_workspace._resolve_local_quoted_includes(
+        repo, ["src/main.cpp"], include_roots=("src",)
+    ) == ["src/main.cpp"]
+
+
+@pytest.mark.requires_symlink
+def test_angle_bracket_include_target_symlink_rejected(tmp_path: Path) -> None:
+    """An angle include that resolves to a symlink under an include root is
+    never seeded -- only regular files are accepted."""
+    repo = tmp_path / "parent"
+    repo.mkdir()
+    assert _git(repo, "init", "-q").returncode == 0
+    assert _git(repo, "config", "user.email", "b664@example.invalid").returncode == 0
+    assert _git(repo, "config", "user.name", "B664").returncode == 0
+
+    include = repo / "include"
+    include.mkdir()
+    real = include / "real.hpp"
+    real.write_text("#pragma once\n", encoding="utf-8")
+    link = include / "target.hpp"
+    link.symlink_to(real)
+    (repo / "src").mkdir()
+    (repo / "src" / "main.cpp").write_text(
+        '#include <target.hpp>\n', encoding="utf-8"
+    )
+    assert _git(repo, "add", "include/real.hpp", "src/main.cpp").returncode == 0
+    assert _git(repo, "commit", "-qm", "angle-symlink-fixture").returncode == 0
+
+    assert worker_workspace._resolve_local_quoted_includes(
+        repo, ["src/main.cpp"], include_roots=("include", "src")
+    ) == ["src/main.cpp"]
