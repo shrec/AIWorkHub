@@ -2,3 +2,5 @@
 {"kind": "installed", "version": "0.12.5", "installed_at": "2026-09-29T15:32:18Z", "server_version": "0.12.5"}
 {"kind": "built", "version": "0.12.6", "release_commit": "0afd34a2857b657f74b6b2177b0b0b735d2fbae8", "vsix_sha256": "df546f19d336ceca42b49072d7a4ae23fe43cba1422f97af8586ab67c5173601", "built_at": "2026-09-29T20:37:19Z", "previous_vsix": null, "target": "vscode_local"}
 {"kind": "installed", "version": "0.12.6", "installed_at": "2026-09-29T22:03:37Z", "server_version": "0.12.6"}
+{"kind": "built", "version": "0.12.7", "release_commit": "3b9d147348b5c519389468a7755484e3364f1c77", "vsix_sha256": "e362e504f541c009025c7ed730121d58877aeaedfa45df096c5f9ce0b55f3771", "built_at": "2026-09-30T00:45:03Z", "previous_vsix": {"path": "vscode-extension/dist/aiworkhub-0.12.6.vsix", "sha256": "df546f19d336ceca42b49072d7a4ae23fe43cba1422f97af8586ab67c5173601"}, "target": "vscode_local"}
+{"kind": "installed", "version": "0.12.7", "installed_at": "2026-09-30T00:49:37Z", "server_version": "0.12.7"}
