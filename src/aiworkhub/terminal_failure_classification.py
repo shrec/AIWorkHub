@@ -4,7 +4,7 @@ import json
 import os
 import re
 import sqlite3
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -1293,6 +1293,51 @@ def supervisor_incomplete_reason(state: object, returncode: object) -> TerminalR
     return TerminalReason("supervisor_incomplete", detail)
 
 
+_SPAWN_FAILURE_CAUSE_MAX_CHARS = MAX_DIAGNOSTIC_CHARS if MAX_DIAGNOSTIC_CHARS <= 500 else 500
+
+# Allowlist, not blocklist, for supervisor_spawn_failure_cause only. Every
+# other sink in this module reduces caller text to a closed-vocabulary code
+# and discards it (see the "SECRET-SAFE" notes above) -- but that function
+# deliberately emits bounded supervisor text AS ITSELF, so nothing here may
+# spot-and-redact a credential shape (V7 rejects that heuristic). Text is
+# withheld unless it fullmatches this one fixed shape.
+_SPAWN_ERROR_SHAPE_RE = re.compile(
+    r"[A-Z][A-Za-z0-9]{0,63}Error:[a-z0-9_]{1,64}(?:: hr=0x[0-9A-Fa-f]{1,8})?"
+)
+
+
+def supervisor_spawn_failure_cause(
+    supervisor_state: object, supervisor_status: Mapping[str, Any] | None,
+) -> str | None:
+    """The bounded supervisor error text, IFF ``spawn_failed`` genuinely names one.
+
+    ``spawn_failed`` means the worker process never ran, so no provider or
+    model output is in play: this text is control-plane evidence the
+    launcher's own supervisor recorded about itself, not untrusted work
+    output, and may reach the terminal event as itself instead of behind
+    ``safe_error_text``'s closed vocabulary.
+
+    Fail-closed by whole-string allowlist, not blocklist: only
+    ``supervisor_status["error"]`` is read (no other key); it must already be
+    a ``str`` (a dict/list/int cause is withheld, never ``str()``-ified); and
+    the bounded, stripped value must fullmatch ``_SPAWN_ERROR_SHAPE_RE`` --
+    the fixed ``SomeError:some_code[: hr=0x...]`` shape the real launcher
+    supervisor emits. Anything else is withheld (``None``), whatever it looks
+    like.
+    """
+    if str(supervisor_state or "") != "spawn_failed":
+        return None
+    if not isinstance(supervisor_status, Mapping):
+        return None
+    raw = supervisor_status.get("error")
+    if not isinstance(raw, str):
+        return None
+    text = raw[: 4 * _SPAWN_FAILURE_CAUSE_MAX_CHARS].strip()
+    if len(text) > _SPAWN_FAILURE_CAUSE_MAX_CHARS or not _SPAWN_ERROR_SHAPE_RE.fullmatch(text):
+        return None
+    return text
+
+
 def workspace_error_reason(
     text: str | None, declared_outputs: Sequence[str] | None = None,
 ) -> TerminalReason | None:
@@ -1735,6 +1780,10 @@ REASON_DISPOSITION: dict[str, str] = {
     # a cancellation or an unavailable MCP host says nothing about the work.
     **{code: FAILURE_CLASS_DEFECT for code in _VSCODE_LM_BEHAVIOUR_CODES},
     **{reason: FAILURE_CLASS_TRANSIENT for reason in _SANDBOX_REASONS},
+    # NF-2026-01136: the launcher's own spawn_failed verdict is a control-plane
+    # fact about the sandbox, never the candidate's work -- same shape as the
+    # other launcher-minted sandbox reasons above.
+    "sandbox_spawn_failed": FAILURE_CLASS_TRANSIENT,
 }
 
 # Reasons deliberately left unplaced, and why they cannot be placed:

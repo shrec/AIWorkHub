@@ -304,6 +304,13 @@ def _canonical_terminal_reason(event: dict[str, Any], state: str) -> dict[str, A
             if message.startswith(_ENVIRONMENT_UNSUPPORTED_PREFIXES):
                 code = "validation_unsupported_in_sandbox"
                 taxonomy = "validation_environment_unsupported"
+            # NF-2026-01136: spawn_failed means the worker never ran, so the
+            # supervisor's own bounded error is control-plane evidence about
+            # the sandbox, not untrusted work output -- the caller names it
+            # via this closed-vocabulary code hint rather than message text.
+            elif reason.get("code") == "sandbox_spawn_failed":
+                code = "sandbox_spawn_failed"
+                taxonomy = "sandbox_spawn_failure"
             return {
                 "code": code,
                 "taxonomy": taxonomy,

@@ -11,6 +11,8 @@ from aiworkhub.terminal_failure_classification import (
     MAX_DIAGNOSTIC_CHARS,
     MAX_TAIL_READ_BYTES,
     FAILURE_CLASS_UNKNOWN,
+    FAILURE_CLASS_TRANSIENT,
+    disposition_for_reason,
     _CONTROL_PLANE_REASONS,
     _PROVIDER_REFUSAL_REASONS,
     _REASON_CONSTANTS,
@@ -29,6 +31,13 @@ from aiworkhub.terminal_failure_classification import (
     terminal_event_authority,
     workspace_error_reason,
 )
+
+
+def test_sandbox_spawn_failed_is_placed_not_unknown() -> None:
+    """NF-2026-01136: the launcher's own ``spawn_failed`` verdict must be
+    placed in ``REASON_DISPOSITION``, not fall through to ``unknown``."""
+    assert disposition_for_reason("sandbox_spawn_failed") == FAILURE_CLASS_TRANSIENT
+    assert disposition_for_reason("sandbox_spawn_failed") != FAILURE_CLASS_UNKNOWN
 
 # Any diagnostic must be exactly `<failure_kind>:<code>` optionally followed
 # by `:http_status=NNN` and/or `:exit_code=N` -- never anything else. This
@@ -266,9 +275,15 @@ def test_classify_from_paths_never_follows_a_symlinked_log_path(tmp_path: Path) 
     host_secret = tmp_path / "outside_host_secret.txt"
     host_secret.write_text("ARBITRARY_HOST_FILE_CONTENT\n", encoding="utf-8")
     stderr_path = tmp_path / "err.log"
-    stderr_path.symlink_to(host_secret)
+    try:
+        stderr_path.symlink_to(host_secret)
+    except OSError as exc:
+        pytest.skip(f"symlink creation not permitted here: {exc}")
     stdout_path = tmp_path / "out.log"
-    stdout_path.symlink_to(host_secret)
+    try:
+        stdout_path.symlink_to(host_secret)
+    except OSError as exc:
+        pytest.skip(f"symlink creation not permitted here: {exc}")
 
     result = classify_terminal_failure_from_paths(
         state="worker_failed",

@@ -12379,6 +12379,12 @@ class ProcessManager:
             # Derive fresh, live authority immediately before construction --
             # after every branch above has had its say -- never a cached value.
             final_terminal_failure_authority = _settle_terminal_failure_authority()
+            # NF-2026-01136: spawn_failed means the worker never ran, so the
+            # supervisor's own bounded error is control-plane evidence, not
+            # untrusted work output -- see supervisor_spawn_failure_cause.
+            spawn_failure_cause = terminal_failure_classification.supervisor_spawn_failure_cause(
+                supervisor_state, supervisor_status,
+            )
             event = self._retention_event({
                 "request_id": request_id,
                 "task_id": metadata["task_id"],
@@ -12437,6 +12443,14 @@ class ProcessManager:
                 "stall_supervisor_pid": supervisor_pid,
                 "stall_supervisor_pid_start_ticks": supervisor_ticks,
                 **final_terminal_failure_authority,
+                **(
+                    {
+                        "terminal_reason": {"code": "sandbox_spawn_failed"},
+                        "error": spawn_failure_cause or "supervisor_spawn_failed",
+                    }
+                    if supervisor_state == "spawn_failed"
+                    else {}
+                ),
                 "usage": usage,
                 "usage_recorded": usage_recorded,
                 "usage_error": usage_error,
