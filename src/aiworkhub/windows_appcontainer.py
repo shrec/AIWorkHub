@@ -28,6 +28,7 @@ import enum
 import hashlib
 import json
 import os
+import random
 import re
 import secrets
 import shutil
@@ -2978,30 +2979,43 @@ class _CtypesWin32Api:
     def derive_identity(
         self, name: str, display_name: str, description: str
     ) -> _Identity:
-        sid = wintypes.LPVOID()
-        hr = self._userenv.CreateAppContainerProfile(
-            name, display_name, description, None, 0, ctypes.byref(sid)
-        )
-        created = True
-        if hr == _HRESULT_ALREADY_EXISTS:
-            created = False
-            hr = self._userenv.DeriveAppContainerSidFromAppContainerName(
-                name, ctypes.byref(sid)
+        max_attempts = 3
+        create_failure: _Win32Failure | None = None
+        for attempt in range(max_attempts):
+            sid = wintypes.LPVOID()
+            hr = self._userenv.CreateAppContainerProfile(
+                name, display_name, description, None, 0, ctypes.byref(sid)
             )
-            if hr != 0:
-                raise _Win32Failure(
+            if hr == 0:
+                sid_string = self._sid_to_string(sid)
+                return _Identity(name, display_name, sid_string, sid, True)
+            if hr == _HRESULT_ALREADY_EXISTS:
+                derive_hr = self._userenv.DeriveAppContainerSidFromAppContainerName(
+                    name, ctypes.byref(sid)
+                )
+                if derive_hr != 0:
+                    raise _Win32Failure(
+                        derive_hr & 0xFFFF,
+                        "derive_appcontainer_sid",
+                        f"hr=0x{derive_hr & 0xFFFFFFFF:08x}",
+                    )
+                sid_string = self._sid_to_string(sid)
+                return _Identity(name, display_name, sid_string, sid, False)
+            if create_failure is None:
+                create_failure = _Win32Failure(
                     hr & 0xFFFF,
-                    "derive_appcontainer_sid",
+                    "create_appcontainer_profile",
                     f"hr=0x{hr & 0xFFFFFFFF:08x}",
                 )
-        elif hr != 0:
-            raise _Win32Failure(
-                hr & 0xFFFF,
-                "create_appcontainer_profile",
-                f"hr=0x{hr & 0xFFFFFFFF:08x}",
+            derive_hr = self._userenv.DeriveAppContainerSidFromAppContainerName(
+                name, ctypes.byref(sid)
             )
-        sid_string = self._sid_to_string(sid)
-        return _Identity(name, display_name, sid_string, sid, created)
+            if derive_hr == 0:
+                sid_string = self._sid_to_string(sid)
+                return _Identity(name, display_name, sid_string, sid, False)
+            if attempt < max_attempts - 1:
+                time.sleep(random.uniform(0.05, 0.2))
+        raise create_failure
 
     def free_identity(self, identity: _Identity) -> None:
         if identity.sid_token:
