@@ -166,6 +166,7 @@ def test_mixed_population_reports_coverage_and_unknown_without_guessing():
         "denominator": 3,
         "evidence_covered": 2,
         "evidence_total": 3,
+        "non_card": 0,
         "unknown_unattributed": 1,
         "excluded_unconverted": 1,
         "outside_event_window": 1,
@@ -232,6 +233,7 @@ def test_verified_cause_outside_the_event_window_is_attributed():
         "denominator": 2,
         "evidence_covered": 1,
         "evidence_total": 2,
+        "non_card": 0,
         "unknown_unattributed": 1,
         "excluded_unconverted": 0,
         "outside_event_window": 1,
@@ -247,6 +249,7 @@ def test_verified_cause_outside_the_event_window_is_attributed():
         "denominator": 1,
         "evidence_covered": 1,
         "evidence_total": 1,
+        "non_card": 0,
         "unknown_unattributed": 0,
         "excluded_unconverted": 0,
         "outside_event_window": 0,
@@ -286,6 +289,7 @@ def test_malformed_or_foreign_cause_stays_unknown_without_any_event_window(mutat
         "denominator": 1,
         "evidence_covered": 0,
         "evidence_total": 1,
+        "non_card": 0,
         "unknown_unattributed": 1,
         "excluded_unconverted": 0,
         "outside_event_window": 0,
@@ -308,6 +312,7 @@ def test_unconverted_needfix_rows_are_excluded_from_the_denominator():
         "denominator": 2,
         "evidence_covered": 1,
         "evidence_total": 2,
+        "non_card": 0,
         "unknown_unattributed": 1,
         "excluded_unconverted": 3,
         "outside_event_window": 0,
@@ -483,6 +488,100 @@ def _read_store(tmp_path, monkeypatch, rows, *, limit, causes=(), name="repo"):
     )
 
 
+def _valid_caused_by(*, task_id, request_id, claim_epoch=1):
+    import hashlib
+
+    base_oid = hashlib.sha256(f"base:{task_id}".encode()).hexdigest()
+    changed_path_hashes = {"src/example.py": hashlib.sha256(f"blob:{task_id}".encode()).hexdigest()}
+    payload = {
+        "schema_id": needfix_store.ACCEPTED_OUTCOME_RECEIPT_SCHEMA_ID,
+        "task_id": task_id,
+        "request_id": request_id,
+        "claim_epoch": claim_epoch,
+        "base_oid": base_oid,
+        "promoted_paths": sorted(changed_path_hashes),
+        "changed_path_hashes": changed_path_hashes,
+        "attempt_artifact_manifest_id": hashlib.sha256(
+            f"manifest:{task_id}:{request_id}".encode()
+        ).hexdigest(),
+    }
+    payload["repository_revision"] = "sha256:" + hashlib.sha256(json.dumps(
+        {"base_oid": base_oid, "changed_path_hashes": changed_path_hashes},
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode()).hexdigest()
+    payload["receipt_id"] = "sha256:" + hashlib.sha256(json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode()).hexdigest()
+    return {
+        "schema_id": needfix_store.CAUSED_BY_SCHEMA_ID,
+        "repository_id": "repo-one",
+        "task_id": task_id,
+        "request_id": request_id,
+        "accepted_outcome_receipt": payload,
+    }
+
+
+def _seed_needfix_with_attribution(repo_root, entries):
+    needfix_db = repo_root.joinpath(*needfix_store.NEEDFIX_DB_REL)
+    needfix_db.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(needfix_db))
+    try:
+        conn.execute(
+            "CREATE TABLE needfix("
+            "id TEXT, caused_by_json TEXT, attribution_json TEXT, "
+            "converted_task_id TEXT, created_at TEXT)"
+        )
+        conn.executemany(
+            "INSERT INTO needfix(id, caused_by_json, attribution_json, converted_task_id, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            [
+                (
+                    f"NF-ATTR-{index}",
+                    json.dumps(cause) if cause else None,
+                    json.dumps(attribution) if attribution else None,
+                    f"TASK-NF-ATTR-{index}",
+                    f"2026-09-21T00:00:{index:02d}Z",
+                )
+                for index, (cause, attribution) in enumerate(entries)
+            ],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_escaped_defect_attribution_counts_non_card_dispositions(tmp_path, monkeypatch):
+    non_card = {
+        "schema_id": needfix_store.ATTRIBUTION_SCHEMA_ID,
+        "state": "non_card_change",
+        "method": "szz_blame_v1",
+        "fix_commit": "a" * 40,
+        "introducing_commits": ["b" * 40],
+        "evidence": {},
+    }
+    entries = [
+        (None, None),
+        (None, non_card),
+        (_valid_caused_by(task_id="TASK-NF-ATTR-2", request_id="req-2"), None),
+    ]
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    task_db = repo_root / "tasks.db"
+    _seed_task_store(task_db, [])
+    _seed_needfix_with_attribution(repo_root, entries)
+    _use_store(monkeypatch, task_db)
+
+    metrics = sdlc_outcome_metrics.read_repository_metrics(
+        repo_root, repository_id="repo-one", limit=50
+    )
+    escaped = metrics["escaped_defect_attribution"]
+    assert escaped["denominator"] == 3
+    assert escaped["numerator"] == 1
+    assert escaped["non_card"] == 1
+    assert escaped["evidence_covered"] == 2
+    assert escaped["unknown_unattributed"] == 1
+
+
 def _large_store_events():
     events = []
 
@@ -582,6 +681,7 @@ def test_recent_complete_cohort_is_covered_despite_more_events_than_the_cap(
         "denominator": 3,
         "evidence_covered": 2,
         "evidence_total": 3,
+        "non_card": 0,
         "unknown_unattributed": 1,
         "excluded_unconverted": 0,
         "outside_event_window": 1,

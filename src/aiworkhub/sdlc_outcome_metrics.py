@@ -784,6 +784,7 @@ def aggregate(
     # caused_by at write time, so a canonical identity counts whatever the event window holds.
     attributable = 0
     attributed = 0
+    non_card = 0
     unknown = 0
     excluded_unconverted = 0
     outside_event_window = 0
@@ -793,11 +794,15 @@ def aggregate(
             continue
         attributable += 1
         key = _verified_identity_key(row.get("caused_by"), repository_id)
-        if key is None:
-            unknown += 1
+        if key is not None:
+            attributed += 1
+            outside_event_window += int(key not in identities)
             continue
-        attributed += 1
-        outside_event_window += int(key not in identities)
+        disposition = row.get("attribution_json")
+        if isinstance(disposition, Mapping) and disposition.get("state") == "non_card_change":
+            non_card += 1
+            continue
+        unknown += 1
 
     return {
         "schema_id": SCHEMA_ID,
@@ -834,8 +839,9 @@ def aggregate(
         "escaped_defect_attribution": {
             "numerator": attributed,
             "denominator": attributable,
-            "evidence_covered": attributed,
+            "evidence_covered": attributed + non_card,
             "evidence_total": attributable,
+            "non_card": non_card,
             "unknown_unattributed": unknown,
             "excluded_unconverted": excluded_unconverted,
             "outside_event_window": outside_event_window,
@@ -1056,6 +1062,8 @@ def read_repository_metrics(
                     if "converted_task_id" in row.keys() else None,
                     "caused_by": json.loads(row["caused_by_json"])
                     if "caused_by_json" in row.keys() and row["caused_by_json"] else None,
+                    "attribution_json": json.loads(row["attribution_json"])
+                    if "attribution_json" in row.keys() and row["attribution_json"] else None,
                 }
                 for row in nf_conn.execute(
                     "SELECT * FROM needfix ORDER BY created_at DESC, id DESC LIMIT ?",

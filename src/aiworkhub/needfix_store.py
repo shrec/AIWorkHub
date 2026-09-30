@@ -522,6 +522,7 @@ def _migrate_needfix_schema(conn: sqlite3.Connection) -> None:
         ("reopen_generation", "INTEGER NOT NULL DEFAULT 0"),
         ("conversion_claim_id", "TEXT"),
         ("caused_by_json", "TEXT"),
+        ("attribution_json", "TEXT"),
     ):
         if _column_exists(conn, "needfix", column):
             continue
@@ -748,6 +749,53 @@ def validate_caused_by(
     return identity
 
 
+ATTRIBUTION_SCHEMA_ID = "aiworkhub.needfix_attribution.v1"
+ATTRIBUTION_STATES = frozenset({"non_card_change"})
+ATTRIBUTION_METHODS = frozenset({"szz_blame_v1"})
+
+
+def validate_attribution_json(attribution: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate one verified-negative attribution disposition, failing closed."""
+
+    if not isinstance(attribution, Mapping):
+        raise NeedFixValidationError("attribution_json must be an object")
+    fields = ("schema_id", "state", "method", "fix_commit", "introducing_commits", "evidence")
+    extra = set(attribution) - set(fields)
+    if extra:
+        raise NeedFixValidationError(f"attribution_json has unsupported fields: {sorted(extra)}")
+    if attribution.get("schema_id") != ATTRIBUTION_SCHEMA_ID:
+        raise NeedFixValidationError("attribution_json has an invalid schema_id")
+    state = attribution.get("state")
+    if state not in ATTRIBUTION_STATES:
+        raise NeedFixValidationError(f"attribution_json has an invalid state: {state!r}")
+    method = attribution.get("method")
+    if method not in ATTRIBUTION_METHODS:
+        raise NeedFixValidationError(f"attribution_json has an invalid method: {method!r}")
+    fix_commit = attribution.get("fix_commit")
+    if not isinstance(fix_commit, str) or not re.fullmatch(r"[0-9a-f]{40}", fix_commit):
+        raise NeedFixValidationError("attribution_json fix_commit must be a 40-hex commit sha")
+    introducing = attribution.get("introducing_commits")
+    if (
+        not isinstance(introducing, list)
+        or not introducing
+        or any(not isinstance(c, str) or not re.fullmatch(r"[0-9a-f]{40}", c) for c in introducing)
+    ):
+        raise NeedFixValidationError(
+            "attribution_json introducing_commits must be a non-empty list of commit shas"
+        )
+    evidence = attribution.get("evidence")
+    if not isinstance(evidence, Mapping):
+        raise NeedFixValidationError("attribution_json evidence must be an object")
+    return {
+        "schema_id": ATTRIBUTION_SCHEMA_ID,
+        "state": attribution["state"],
+        "method": attribution["method"],
+        "fix_commit": fix_commit,
+        "introducing_commits": list(introducing),
+        "evidence": dict(evidence),
+    }
+
+
 def _record_event(
     conn: sqlite3.Connection,
     needfix_id: str,
@@ -786,6 +834,11 @@ def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         "caused_by": (
             json.loads(row["caused_by_json"])
             if "caused_by_json" in row.keys() and row["caused_by_json"]
+            else None
+        ),
+        "attribution_json": (
+            json.loads(row["attribution_json"])
+            if "attribution_json" in row.keys() and row["attribution_json"]
             else None
         ),
         "reopen_generation": row["reopen_generation"],
@@ -1826,6 +1879,9 @@ def close_for_accepted_task(
     task_id: str,
     *,
     accepted_request_id: str,
+    repository_id: str = "",
+    accepted_receipts: Sequence[Mapping[str, Any]] = (),
+    verify_accepted_outcome: Callable[[Mapping[str, Any]], Mapping[str, Any] | None] | None = None,
 ) -> dict[str, Any]:
     """Durably resolve the one NeedFix linked to an accepted canonical task.
 
@@ -1897,6 +1953,23 @@ def close_for_accepted_task(
             },
         )
         conn.commit()
+        if verify_accepted_outcome is not None:
+            try:
+                from aiworkhub import defect_attribution
+
+                defect_attribution.attribute_needfix(
+                    repo_root,
+                    needfix_id,
+                    repository_id=repository_id,
+                    accepted_receipts=accepted_receipts,
+                    verify_accepted_outcome=verify_accepted_outcome,
+                )
+            except Exception:
+                import logging
+
+                logging.getLogger(__name__).exception(
+                    "defect attribution failed for needfix %s", needfix_id
+                )
         return {
             "state": "closed",
             "task_id": linked_task_id,
@@ -2096,6 +2169,7 @@ def update_needfix(
     scope_symbols_add: Sequence[str] | None = None,
     expected_updated_at: str | None = None,
     caused_by: Mapping[str, Any] | None = None,
+    attribution_json: Mapping[str, Any] | None = None,
     repository_id: str = "",
     verify_accepted_outcome: Callable[[Mapping[str, Any]], Mapping[str, Any] | None] | None = None,
 ) -> dict[str, Any]:
@@ -2117,7 +2191,9 @@ def update_needfix(
     the same identity is a no-op that does not even appear in
     ``fields_changed``; a *different* identity is refused with
     ``NeedFixConflictError``. Who caused a defect is evidence, and evidence that
-    a later caller can quietly overwrite is not evidence.
+    a later caller can quietly overwrite is not evidence. ``attribution_json``
+    is a second write-once column with the same no-op/conflict semantics, for
+    the verified-negative disposition ``validate_attribution_json`` produces.
 
     The returned row carries an ``update_receipt`` (``fields_changed``,
     ``event_id``, ``evidence_keys_after``) so the MCP wrapper can answer with
@@ -2139,9 +2215,12 @@ def update_needfix(
             repository_id=repository_id,
             verify_accepted_outcome=verify_accepted_outcome,
         )
+    verified_attribution: dict[str, Any] | None = None
+    if attribution_json is not None:
+        verified_attribution = validate_attribution_json(attribution_json)
     conn = _connect(repo_root)
     try:
-        if verified_cause is not None:
+        if verified_cause is not None or verified_attribution is not None:
             # The same guarantee ``_insert`` gives before it writes a cause: the
             # column the schema migration adds has to actually exist first.
             _ensure_schema(conn)
@@ -2167,6 +2246,19 @@ def update_needfix(
             raise NeedFixConflictError(
                 f"needfix {needfix_id} already records a different caused_by identity; "
                 "refusing to rewrite causality"
+            )
+        stored_attribution = (
+            json.loads(row["attribution_json"])
+            if "attribution_json" in row.keys() and row["attribution_json"]
+            else None
+        )
+        attribution_changed = (
+            verified_attribution is not None and stored_attribution != verified_attribution
+        )
+        if attribution_changed and stored_attribution is not None:
+            raise NeedFixConflictError(
+                f"needfix {needfix_id} already records a different attribution_json disposition; "
+                "refusing to rewrite attribution"
             )
         if kind is not None and kind not in KINDS:
             raise NeedFixValidationError(f"invalid kind: {kind!r}; valid: {KINDS}")
@@ -2244,6 +2336,8 @@ def update_needfix(
         ]
         if cause_changed:
             fields_changed.append("caused_by")
+        if attribution_changed:
+            fields_changed.append("attribution_json")
 
         def _sha(text: str) -> str:
             return hashlib.sha256(text.encode("utf-8")).hexdigest()
@@ -2265,6 +2359,11 @@ def update_needfix(
             conn.execute(
                 "UPDATE needfix SET caused_by_json = ? WHERE id = ?",
                 (json.dumps(verified_cause, sort_keys=True), needfix_id),
+            )
+        if attribution_changed:
+            conn.execute(
+                "UPDATE needfix SET attribution_json = ? WHERE id = ?",
+                (json.dumps(verified_attribution, sort_keys=True), needfix_id),
             )
         event_id = _record_event(
             conn,
