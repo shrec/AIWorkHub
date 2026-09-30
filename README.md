@@ -62,6 +62,12 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
+## What's new in 0.12.10
+
+- Concurrent reviewer launches on Windows share one AppContainer profile instead of racing each other into a failed launch.
+- Worker-sandbox test runs count as real coverage again: `tmp_path` tests run instead of skipping silently, and a reviewer that could not inspect is replaced rather than reused.
+- Converted NeedFix rows are attributed to the card that introduced the defect, and Context MCP / KB writes no longer fail on read-only seats or legacy timestamp schemas.
+
 ## What's new in 0.12.9
 
 - C/C++ code tasks launch with their project headers: angle-bracket includes resolve against the declared include roots.

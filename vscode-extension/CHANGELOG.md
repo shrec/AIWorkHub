@@ -1,5 +1,19 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.12.10 — 2026-10-01
+
+### Added
+
+- Converted NeedFix rows get SZZ-style escaped-defect attribution: the lines a fix deleted or modified are blamed back to the accepted card whose sealed receipt promoted them, and tied, mixed or ambiguous blame stays `unknown`; `scripts/needfix_attribution_backfill.py` backfills existing rows (dry-run by default) (RM-2026-00076).
+
+### Fixed
+
+- Concurrent reviewer launches on Windows share one AppContainer profile: `derive_identity` retries a raced `CreateAppContainerProfile` (bounded, with jitter) and falls back to deriving the winner's SID (NF-2026-01096).
+- Tests inside the worker sandbox run for real: the symlink capability guard raises an `OSError` instead of `pytest.skip`, so `tmp_path` tests no longer skip silently, and only a real symlink denial is reported as `sandbox_capability_denied:symlink` (NF-2026-01150, NF-2026-01163).
+- A read-only worker seat degrades an oversized Context MCP reply to truncated inline content with a typed `spill_unavailable` instead of failing the query; collision and tamper failures stay fail-closed (NF-2026-01162).
+- A review lens whose only reviewer hit a process limit gets a fresh reviewer instead of reusing the blind one, and `accept_preview` predicts `reviewer_could_not_inspect:<lens>` with the same classifier `accept_review` uses (NF-2026-01158).
+- KB and AI Memory writes fill `created_at`/`updated_at` on legacy schemas with NOT NULL timestamp columns instead of failing the insert; upserts keep `created_at` and refresh `updated_at` (NF-2026-01161).
+
 ## 0.12.9 — 2026-09-30
 
 ### Fixed

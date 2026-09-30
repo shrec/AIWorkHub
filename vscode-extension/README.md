@@ -14,6 +14,12 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.12.10
+
+- Concurrent reviewer launches on Windows share one AppContainer profile instead of racing each other into a failed launch.
+- Worker-sandbox test runs count as real coverage again: `tmp_path` tests run instead of skipping silently, and a reviewer that could not inspect is replaced rather than reused.
+- Converted NeedFix rows are attributed to the card that introduced the defect, and Context MCP / KB writes no longer fail on read-only seats or legacy timestamp schemas.
+
 ## What's new in 0.12.9
 
 - C/C++ code tasks launch with their project headers: angle-bracket includes resolve against the declared include roots.
