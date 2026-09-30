@@ -1313,6 +1313,7 @@ _VALIDATION_OPTIONS_WITH_VALUE = frozenset(
         "--rootdir",
     }
 )
+_READ_FIRST_RANGE = re.compile(r":[0-9]+(?:-[0-9]+)?$")  # read_first "path:N[-M]" context suffix
 
 
 def _input_missing_error(field: str, index: int, relative: str) -> WorkspaceError:
@@ -1336,7 +1337,7 @@ def _exact_required_card_inputs(
     }
     for field in ("immutable_inputs", "read_first"):
         for index, raw in enumerate(card.get(field) or []):
-            relative = _relative_repo_path(raw)
+            relative = _relative_repo_path(_READ_FIRST_RANGE.sub("", str(raw)) if field == "read_first" else raw)
             if any(character in relative for character in "*?["):
                 continue
             if relative in exempt:
@@ -5018,7 +5019,7 @@ def _declared_workspace_seed_closure(
     validation_inputs = _validation_file_operands(source_root, card, allowed)
     required_card_inputs = _exact_required_card_inputs(source_root, card, allowed)
     declared = (
-        list(card.get("read_first") or [])
+        [_READ_FIRST_RANGE.sub("", str(v)) for v in (card.get("read_first") or [])]
         + list(card.get("immutable_inputs") or [])
         + list(allowed)
         + list(required_card_inputs)
@@ -6685,7 +6686,7 @@ def quality_review_read_only_input_paths(
         _relative_repo_path(value) for value in candidate_changed_paths
     }
     canonical_declarations: list[str] = []
-    for declaration in [*read_first, *immutable_input_paths]:
+    for declaration in [*(_READ_FIRST_RANGE.sub("", str(v)) for v in read_first), *immutable_input_paths]:
         raw = str(declaration)
         declared = Path(raw)
         if declared.is_absolute():

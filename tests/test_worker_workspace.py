@@ -445,6 +445,73 @@ def test_workspace_rejects_missing_exact_card_input_before_git_launch(
         )
 
 
+@pytest.mark.parametrize("suffix", [":1-5", ":7"])
+def test_exact_required_card_inputs_strips_read_first_range_suffix(
+    repo: Path, suffix: str
+) -> None:
+    card = {
+        "allowed_writes": ["out/result.txt"],
+        "read_first": [f"read/input.txt{suffix}"],
+    }
+    rows = worker_workspace._exact_required_card_inputs(
+        repo, card, ("out/result.txt",)
+    )
+    assert "read/input.txt" in rows
+
+
+def test_exact_required_card_inputs_missing_read_first_range_reports_bare_path(
+    repo: Path,
+) -> None:
+    card = {
+        "allowed_writes": ["out/result.txt"],
+        "read_first": ["missing/input.py:1-5"],
+    }
+    with pytest.raises(
+        worker_workspace.WorkspaceError,
+        match="workspace_required_input_missing:field=read_first:index=0:path=missing/input.py",
+    ):
+        worker_workspace._exact_required_card_inputs(repo, card, ("out/result.txt",))
+
+
+def test_exact_required_card_inputs_immutable_inputs_range_suffix_not_stripped(
+    repo: Path,
+) -> None:
+    card = {
+        "allowed_writes": ["out/result.txt"],
+        "immutable_inputs": ["read/input.txt:1-5"],
+    }
+    with pytest.raises(
+        worker_workspace.WorkspaceError,
+        match="workspace_required_input_missing:field=immutable_inputs:index=0:path=read/input.txt:1-5",
+    ):
+        worker_workspace._exact_required_card_inputs(repo, card, ("out/result.txt",))
+
+
+def test_declared_workspace_seed_closure_strips_read_first_range_suffix(
+    repo: Path,
+) -> None:
+    card = {
+        "allowed_writes": ["out/result.txt"],
+        "read_first": ["read/input.txt:1-5"],
+    }
+    _live_seeded, _support_seeded, seeded = (
+        worker_workspace._declared_workspace_seed_closure(
+            repo, card, ("out/result.txt",)
+        )
+    )
+    assert "read/input.txt" in seeded
+    assert "read/input.txt:1-5" not in seeded
+
+
+def test_quality_review_read_only_input_paths_strips_read_first_range_suffix(
+    repo: Path,
+) -> None:
+    result = worker_workspace.quality_review_read_only_input_paths(
+        repo, read_first=["read/input.txt:1-5"]
+    )
+    assert result == ["read/input.txt"]
+
+
 def test_workspace_rejects_missing_validation_script_before_git_launch(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, repo: Path
 ) -> None:
