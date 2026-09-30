@@ -238,3 +238,165 @@ def test_invalid_or_duplicate_inputs_fail_closed(tmp_path: Path) -> None:
             repo, actor=_actor(), action="remember", key="same", value="B",
             idempotency_key="memory:test:1002", provenance="test",
         )
+
+
+def _replace_entries_table(repo: Path, ddl: str) -> Path:
+    db = storage_registry.resolve_database_path(storage_registry.load_storage_registry(repo), "kb")
+    con = sqlite3.connect(db)
+    try:
+        con.executescript(f"DROP TABLE entries;{ddl}")
+        con.commit()
+    finally:
+        con.close()
+    return db
+
+
+def _replace_memories_table(repo: Path, ddl: str) -> Path:
+    db = storage_registry.resolve_database_path(storage_registry.load_storage_registry(repo), "memory")
+    con = sqlite3.connect(db)
+    try:
+        con.executescript(f"DROP TABLE memories;{ddl}")
+        con.commit()
+    finally:
+        con.close()
+    return db
+
+
+def test_kb_write_legacy_not_null_timestamps_write_paths(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    db = _replace_entries_table(
+        repo,
+        "CREATE TABLE entries(id INTEGER PRIMARY KEY,key TEXT,title TEXT,body TEXT,"
+        "category TEXT,tags TEXT,source_refs TEXT,"
+        "created_at TEXT NOT NULL,updated_at TEXT NOT NULL);",
+    )
+    base = dict(
+        actor=_actor(), provenance="legacy schema regression",
+        category="ops", tags="legacy", source_refs="NF-2026-01161",
+    )
+
+    upserted = context_writes.kb_write(
+        repo, **base, action="upsert", key="legacy.k1", title="T1", body="A",
+        idempotency_key="kb:legacy:0001",
+    )
+    assert upserted["ok"] and upserted["entry_id"]
+    con = sqlite3.connect(db)
+    try:
+        created_before, updated_before = con.execute(
+            "SELECT created_at,updated_at FROM entries WHERE id=?", (upserted["entry_id"],)
+        ).fetchone()
+        con.execute(
+            "UPDATE entries SET updated_at=? WHERE id=?",
+            ("2000-01-01T00:00:00+00:00", upserted["entry_id"]),
+        )
+        con.commit()
+    finally:
+        con.close()
+    assert created_before and created_before == updated_before
+
+    updated = context_writes.kb_write(
+        repo, **base, action="upsert", key="legacy.k1", title="T1", body="B",
+        idempotency_key="kb:legacy:0002",
+    )
+    assert updated["ok"] and updated["entry_id"] == upserted["entry_id"]
+    con = sqlite3.connect(db)
+    try:
+        created_after, updated_after = con.execute(
+            "SELECT created_at,updated_at FROM entries WHERE id=?", (upserted["entry_id"],)
+        ).fetchone()
+    finally:
+        con.close()
+    assert created_after == created_before
+    assert updated_after != "2000-01-01T00:00:00+00:00"
+
+    superseded = context_writes.kb_write(
+        repo, **base, action="supersede", key="legacy.k1", replacement_key="legacy.k2",
+        title="T2", body="C", idempotency_key="kb:legacy:0003",
+    )
+    assert superseded["ok"] and superseded["entry_id"] != upserted["entry_id"]
+
+
+def test_kb_write_legacy_not_null_timestamps_other_column_error(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    _replace_entries_table(
+        repo,
+        "CREATE TABLE entries(id INTEGER PRIMARY KEY,key TEXT,title TEXT,body TEXT,"
+        "category TEXT,tags TEXT,source_refs TEXT,owner_id TEXT NOT NULL);",
+    )
+    with pytest.raises(context_writes.ContextWriteError) as excinfo:
+        context_writes.kb_write(
+            repo, actor=_actor(), action="upsert", key="k1", title="T", body="A",
+            provenance="test", idempotency_key="kb:legacy:owner:0001",
+        )
+    assert (
+        "context_write_integrity_error:component=kb:action=upsert:column=entries.owner_id"
+        in str(excinfo.value)
+    )
+
+
+def test_memory_write_legacy_not_null_timestamps_write_paths(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    db = _replace_memories_table(
+        repo,
+        "CREATE TABLE memories(id INTEGER PRIMARY KEY,key TEXT,value TEXT,tags TEXT,scope TEXT,"
+        "created_at TEXT NOT NULL,updated_at TEXT NOT NULL);",
+    )
+    base = dict(
+        actor=_actor(), key="legacy.decision", tags="legacy",
+        scope="project", provenance="legacy schema regression",
+    )
+
+    remembered = context_writes.memory_write(
+        repo, **base, action="remember", value="A", idempotency_key="memory:legacy:0001",
+    )
+    assert remembered["ok"] and remembered["memory_id"]
+    con = sqlite3.connect(db)
+    try:
+        created_before, updated_before = con.execute(
+            "SELECT created_at,updated_at FROM memories WHERE id=?", (remembered["memory_id"],)
+        ).fetchone()
+        con.execute(
+            "UPDATE memories SET updated_at=? WHERE id=?",
+            ("2000-01-01T00:00:00+00:00", remembered["memory_id"]),
+        )
+        con.commit()
+    finally:
+        con.close()
+    assert created_before and created_before == updated_before
+
+    updated = context_writes.memory_write(
+        repo, **base, action="update", value="B", idempotency_key="memory:legacy:0002",
+    )
+    assert updated["ok"] and updated["memory_id"] == remembered["memory_id"]
+    con = sqlite3.connect(db)
+    try:
+        created_after, updated_after = con.execute(
+            "SELECT created_at,updated_at FROM memories WHERE id=?", (remembered["memory_id"],)
+        ).fetchone()
+    finally:
+        con.close()
+    assert created_after == created_before
+    assert updated_after != "2000-01-01T00:00:00+00:00"
+
+    superseded = context_writes.memory_write(
+        repo, **base, action="supersede", value="C", idempotency_key="memory:legacy:0003",
+    )
+    assert superseded["ok"] and superseded["memory_id"] != remembered["memory_id"]
+
+
+def test_memory_write_legacy_not_null_timestamps_other_column_error(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    _replace_memories_table(
+        repo,
+        "CREATE TABLE memories(id INTEGER PRIMARY KEY,key TEXT,value TEXT,tags TEXT,scope TEXT,"
+        "owner_id TEXT NOT NULL);",
+    )
+    with pytest.raises(context_writes.ContextWriteError) as excinfo:
+        context_writes.memory_write(
+            repo, actor=_actor(), action="remember", key="k1", value="A",
+            provenance="test", idempotency_key="memory:legacy:owner:0001",
+        )
+    assert (
+        "context_write_integrity_error:component=memory:action=remember:column=memories.owner_id"
+        in str(excinfo.value)
+    )

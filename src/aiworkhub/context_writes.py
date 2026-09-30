@@ -547,6 +547,27 @@ def session_write(
         con.close()
 
 
+def _legacy_timestamp_columns(con: sqlite3.Connection, table: str) -> frozenset[str]:
+    """Which of created_at/updated_at ``table`` declares as real columns."""
+    names = {str(row[1]) for row in con.execute(f"PRAGMA table_info({table})").fetchall()}
+    return frozenset(c for c in ("created_at", "updated_at") if c in names)
+
+
+def _timestamp_insert_extra(columns: frozenset[str], now: str) -> tuple[str, str, tuple[str, ...]]:
+    present = [c for c in ("created_at", "updated_at") if c in columns]
+    return (
+        "".join(f",{c}" for c in present),
+        "".join(",?" for _ in present),
+        tuple(now for _ in present),
+    )
+
+
+def _timestamp_update_extra(columns: frozenset[str], now: str) -> tuple[str, tuple[str, ...]]:
+    if "updated_at" in columns:
+        return ",updated_at=?", (now,)
+    return "", ()
+
+
 def memory_write(
     repo: Path, *, actor: dict[str, Any], action: MemoryAction, key: str,
     value: str = "", tags: str = "", scope: str = "project",
@@ -572,10 +593,16 @@ def memory_write(
             "WHERE m.key=? ORDER BY m.id DESC LIMIT 1", (key,),
         ).fetchone()
         now = datetime.now(timezone.utc).isoformat()
+        ts_columns = _legacy_timestamp_columns(con, "memories")
+        ins_col_extra, ins_ph_extra, ins_val_extra = _timestamp_insert_extra(ts_columns, now)
+        upd_set_extra, upd_val_extra = _timestamp_update_extra(ts_columns, now)
         if action == "remember":
             if row is not None and row["status"] == "active":
                 raise ContextWriteError("memory_key_exists_use_update")
-            cur = con.execute("INSERT INTO memories(key,value,tags,scope) VALUES(?,?,?,?)", (key, value, tags, scope))
+            cur = con.execute(
+                f"INSERT INTO memories(key,value,tags,scope{ins_col_extra}) VALUES(?,?,?,?{ins_ph_extra})",
+                (key, value, tags, scope) + ins_val_extra,
+            )
             entity_id = int(cur.lastrowid)
             con.execute("INSERT INTO memories_fts(rowid,key,value,tags,scope) VALUES(?,?,?,?,?)", (entity_id, key, value, tags, scope))
         elif action == "archive":
@@ -587,14 +614,20 @@ def memory_write(
             if row is None or row["status"] != "active":
                 raise ContextWriteError("memory_active_key_not_found")
             entity_id = int(row["id"])
-            con.execute("UPDATE memories SET value=?,tags=?,scope=? WHERE id=?", (value, tags, scope, entity_id))
+            con.execute(
+                f"UPDATE memories SET value=?,tags=?,scope=?{upd_set_extra} WHERE id=?",
+                (value, tags, scope) + upd_val_extra + (entity_id,),
+            )
             con.execute("DELETE FROM memories_fts WHERE rowid=?", (entity_id,))
             con.execute("INSERT INTO memories_fts(rowid,key,value,tags,scope) VALUES(?,?,?,?,?)", (entity_id, key, value, tags, scope))
         else:
             if row is None or row["status"] != "active":
                 raise ContextWriteError("memory_active_key_not_found")
             old_id = int(row["id"])
-            cur = con.execute("INSERT INTO memories(key,value,tags,scope) VALUES(?,?,?,?)", (key, value, tags, scope))
+            cur = con.execute(
+                f"INSERT INTO memories(key,value,tags,scope{ins_col_extra}) VALUES(?,?,?,?{ins_ph_extra})",
+                (key, value, tags, scope) + ins_val_extra,
+            )
             entity_id = int(cur.lastrowid)
             con.execute("INSERT INTO memories_fts(rowid,key,value,tags,scope) VALUES(?,?,?,?,?)", (entity_id, key, value, tags, scope))
             con.execute("INSERT OR REPLACE INTO context_entity_state VALUES('memory',?,'superseded',?,?)", (old_id, entity_id, now))
@@ -638,6 +671,9 @@ def kb_write(
             return _idempotent(prior)
         row = con.execute("SELECT id FROM entries WHERE key=?", (key,)).fetchone()
         now = datetime.now(timezone.utc).isoformat()
+        ts_columns = _legacy_timestamp_columns(con, "entries")
+        ins_col_extra, ins_ph_extra, ins_val_extra = _timestamp_insert_extra(ts_columns, now)
+        upd_set_extra, upd_val_extra = _timestamp_update_extra(ts_columns, now)
         if action == "archive":
             if row is None:
                 raise ContextWriteError("kb_key_not_found")
@@ -650,18 +686,29 @@ def kb_write(
             if con.execute("SELECT 1 FROM entries WHERE key=?", (new_key,)).fetchone() is not None:
                 raise ContextWriteError("kb_replacement_key_exists")
             old_id = int(row["id"])
-            cur = con.execute("INSERT INTO entries(key,title,body,category,tags,source_refs) VALUES(?,?,?,?,?,?)", (new_key, title, body, category, tags, source_refs))
+            cur = con.execute(
+                f"INSERT INTO entries(key,title,body,category,tags,source_refs{ins_col_extra}) "
+                f"VALUES(?,?,?,?,?,?{ins_ph_extra})",
+                (new_key, title, body, category, tags, source_refs) + ins_val_extra,
+            )
             entity_id = int(cur.lastrowid)
             con.execute("INSERT INTO entries_fts(rowid,key,title,body,category,tags) VALUES(?,?,?,?,?,?)", (entity_id, new_key, title, body, category, tags))
             con.execute("INSERT OR REPLACE INTO context_entity_state VALUES('kb',?,'superseded',?,?)", (old_id, entity_id, now))
             key = new_key
         else:
             if row is None:
-                cur = con.execute("INSERT INTO entries(key,title,body,category,tags,source_refs) VALUES(?,?,?,?,?,?)", (key, title, body, category, tags, source_refs))
+                cur = con.execute(
+                    f"INSERT INTO entries(key,title,body,category,tags,source_refs{ins_col_extra}) "
+                    f"VALUES(?,?,?,?,?,?{ins_ph_extra})",
+                    (key, title, body, category, tags, source_refs) + ins_val_extra,
+                )
                 entity_id = int(cur.lastrowid)
             else:
                 entity_id = int(row["id"])
-                con.execute("UPDATE entries SET title=?,body=?,category=?,tags=?,source_refs=? WHERE id=?", (title, body, category, tags, source_refs, entity_id))
+                con.execute(
+                    f"UPDATE entries SET title=?,body=?,category=?,tags=?,source_refs=?{upd_set_extra} WHERE id=?",
+                    (title, body, category, tags, source_refs) + upd_val_extra + (entity_id,),
+                )
                 con.execute("DELETE FROM entries_fts WHERE rowid=?", (entity_id,))
             con.execute("INSERT INTO entries_fts(rowid,key,title,body,category,tags) VALUES(?,?,?,?,?,?)", (entity_id, key, title, body, category, tags))
         con.execute("INSERT OR REPLACE INTO context_entity_state VALUES('kb',?,'active',NULL,?)", (entity_id, now)) if action != "archive" else None
