@@ -954,6 +954,23 @@ def _provider_status(
             result["launchable"] = False
             result["status"] = "repository_model_policy_disabled"
             result["reason"] = "all_observed_models_disabled_by_repository_model_settings"
+        opencode_free_tier_models = [
+            value
+            for value in eligible_observed_models
+            if runtime_adapters.opencode_model_is_free_tier(value)
+        ]
+        if opencode_free_tier_models:
+            result["opencode_free_tier_restricted_models"] = opencode_free_tier_models
+        route_eligible_models = [
+            value
+            for value in eligible_observed_models
+            if value not in opencode_free_tier_models
+        ]
+        if eligible_observed_models and not route_eligible_models:
+            result["provider_launchable"] = result["launchable"]
+            result["launchable"] = False
+            result["status"] = "opencode_free_tier_client_restricted"
+            result["reason"] = "opencode_free_tier_client_restricted"
     if adapter_id in _VSCODE_LM_IN_PROCESS_ADAPTERS:
         result["sandbox_backend"] = SANDBOX_BACKEND_VSCODE_LM_IN_PROCESS
     else:

@@ -135,6 +135,46 @@ def test_opencode_argv_is_format_json_and_exact_provider_model(tmp_path: Path) -
     assert not any("AUTH" in token or "KEY" in token for token in plan.argv)
 
 
+def test_resolve_opencode_model_preserves_free_tier_identity_for_discovery() -> None:
+    # The free-tier identity must stay valid at the parsing/shape layer so
+    # discovery keeps listing it (NF-2026-01081); the launch-time and
+    # preflight restrictions are enforced separately via
+    # ``opencode_model_is_free_tier``.
+    resolved, error = runtime_adapters.resolve_opencode_model(
+        "opencode/muse-spark-1.3-contributor-free"
+    )
+    assert resolved == "opencode/muse-spark-1.3-contributor-free"
+    assert error is None
+    assert runtime_adapters.opencode_model_is_free_tier(resolved) is True
+
+    # The distinct paid Contributor route is a different provider and must
+    # not be caught by the free-tier predicate.
+    resolved, error = runtime_adapters.resolve_opencode_model(
+        "opencode-go/muse-spark-1.3-contributor"
+    )
+    assert resolved == "opencode-go/muse-spark-1.3-contributor"
+    assert error is None
+    assert runtime_adapters.opencode_model_is_free_tier(resolved) is False
+
+
+def test_opencode_free_tier_model_is_never_reported_launchable(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    executable = _executable(tmp_path, "opencode")
+
+    plan = runtime_adapters.build_runtime_command(
+        runtime_adapters.OPENCODE_CLI_ADAPTER,
+        "prompt",
+        repo,
+        model="opencode/muse-spark-1.3-contributor-free",
+        executable_overrides={runtime_adapters.OPENCODE_CLI_ADAPTER: executable},
+    )
+
+    assert plan.launchable is False
+    assert plan.argv == []
+    assert plan.validation_reason == "opencode_free_tier_client_restricted"
+
+
 def test_opencode_preserves_unknown_provider_model_identity(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -262,10 +302,16 @@ def test_opencode_linux_snap_bin_preserves_wrapper_when_symlink_target_is_snap(
 ) -> None:
     snap_target = tmp_path / "usr" / "bin" / "snap"
     snap_target.parent.mkdir(parents=True)
-    snap_target.symlink_to(Path(sys.executable).resolve())
+    try:
+        snap_target.symlink_to(Path(sys.executable).resolve())
+    except OSError:
+        pytest.skip("symlink privilege unavailable")
     wrapper = tmp_path / "snap" / "bin" / "opencode"
     wrapper.parent.mkdir(parents=True)
-    wrapper.symlink_to(snap_target)
+    try:
+        wrapper.symlink_to(snap_target)
+    except OSError:
+        pytest.skip("symlink privilege unavailable")
     monkeypatch.setattr(runtime_adapters, "OPENCODE_SNAP_BIN", str(wrapper))
     monkeypatch.setattr(runtime_adapters.shutil, "which", lambda _binary: None)
     resolution = runtime_adapters.resolve_executable(runtime_adapters.OPENCODE_CLI_ADAPTER)
@@ -279,10 +325,16 @@ def test_opencode_path_discovery_preserves_snap_wrapper_when_symlink_target_is_s
 ) -> None:
     snap_target = tmp_path / "usr" / "bin" / "snap"
     snap_target.parent.mkdir(parents=True)
-    snap_target.symlink_to(Path(sys.executable).resolve())
+    try:
+        snap_target.symlink_to(Path(sys.executable).resolve())
+    except OSError:
+        pytest.skip("symlink privilege unavailable")
     wrapper = tmp_path / "snap" / "bin" / "opencode"
     wrapper.parent.mkdir(parents=True)
-    wrapper.symlink_to(snap_target)
+    try:
+        wrapper.symlink_to(snap_target)
+    except OSError:
+        pytest.skip("symlink privilege unavailable")
     monkeypatch.setattr(runtime_adapters, "OPENCODE_SNAP_BIN", str(tmp_path / "unused-snap"))
     monkeypatch.setattr(runtime_adapters.shutil, "which", lambda _binary: str(wrapper))
     resolution = runtime_adapters.resolve_executable(runtime_adapters.OPENCODE_CLI_ADAPTER)
@@ -381,6 +433,57 @@ def test_opencode_permission_allows_only_worker_mcp_namespace() -> None:
         assert runtime_adapters.opencode_permission_action(name) == (
             runtime_adapters.OPENCODE_PERMISSION_DENY
         )
+
+
+def test_opencode_denied_builtin_tools_cover_every_offered_builtin_explicitly() -> None:
+    """NF-2026-01081: OpenCode hides/denies a builtin only when that tool's
+    own key is denied; a bare ``"*"`` deny leaves any builtin the installed
+    OpenCode ships but we never named reachable to the model.
+    """
+
+    offered_by_installed_opencode = {
+        "read",
+        "edit",
+        "write",
+        "patch",
+        "multiedit",
+        "bash",
+        "task",
+        "skill",
+        "lsp",
+        "websearch",
+        "glob",
+        "grep",
+        "webfetch",
+        "list",
+        "todowrite",
+        "todoread",
+        "question",
+        "external_directory",
+        "doom_loop",
+    }
+    assert offered_by_installed_opencode <= set(runtime_adapters.OPENCODE_DENIED_BUILTIN_TOOLS)
+    for contract in (
+        runtime_adapters.opencode_worker_permission_contract(),
+        runtime_adapters.opencode_manager_permission_contract(),
+    ):
+        assert contract["*"] == runtime_adapters.OPENCODE_PERMISSION_DENY
+        for name in offered_by_installed_opencode:
+            assert contract.get(name) == runtime_adapters.OPENCODE_PERMISSION_DENY
+        for name, action in contract.items():
+            if action == runtime_adapters.OPENCODE_PERMISSION_ALLOW:
+                assert name.startswith(f"{runtime_adapters.OPENCODE_WORKER_MCP_SERVER}_")
+
+
+def test_opencode_worker_and_manager_configs_validate_with_expanded_deny_set() -> None:
+    command = ("/usr/bin/python3", "-m", "aiworkhub.worker_ai_tools_mcp")
+    worker = runtime_adapters.build_opencode_worker_mcp_config(command)
+    manager = runtime_adapters.build_opencode_manager_mcp_config(command)
+    assert runtime_adapters.validate_opencode_worker_config(worker) is worker
+    assert runtime_adapters.validate_opencode_manager_config(manager) is manager
+    for config in (worker, manager):
+        assert config["permission"]["multiedit"] == runtime_adapters.OPENCODE_PERMISSION_DENY
+        assert config["permission"]["todoread"] == runtime_adapters.OPENCODE_PERMISSION_DENY
 
 
 def test_opencode_worker_mcp_config_is_request_local_and_secret_free() -> None:

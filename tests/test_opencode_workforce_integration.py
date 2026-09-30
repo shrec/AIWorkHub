@@ -413,6 +413,46 @@ def test_listing_probe_does_not_mark_access_observed(
     assert "round_trip_observed" not in status
 
 
+def test_provider_status_reports_opencode_free_tier_restriction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(repo_policy, "_is_windows_host", lambda: False)
+    monkeypatch.setattr(
+        repo_policy,
+        "_list_opencode_models",
+        lambda _executable: [_FREE],
+    )
+    resolution = runtime_adapters.ExecutableResolution(
+        "opencode_cli", "/tmp/opencode", True, ""
+    )
+    monkeypatch.setattr(
+        repo_policy.runtime_adapters,
+        "resolve_executable",
+        lambda adapter_id: resolution,
+    )
+    status = repo_policy._provider_status(
+        Path("."),
+        "opencode_cli",
+        {
+            "providers": {
+                "allowed_adapters": list(
+                    repo_policy.DEFAULT_POLICY["providers"]["allowed_adapters"]
+                )
+            }
+        },
+        "bubblewrap",
+        "",
+        model_policy=model_settings.load(_repo(tmp_path)),
+    )
+    assert status["provider_observed_models"] == [_FREE]
+    assert status["observed_models"] == [_FREE]
+    assert status["opencode_free_tier_restricted_models"] == [_FREE]
+    assert status["launchable"] is False
+    assert status["provider_launchable"] is True
+    assert status["status"] == "opencode_free_tier_client_restricted"
+    assert status["reason"] == "opencode_free_tier_client_restricted"
+
+
 def test_opencode_worker_mcp_config_never_bakes_repository_identity() -> None:
     # The generated worker MCP config is request-local (see
     # test_opencode_worker_mcp_config_is_request_local_and_secret_free in

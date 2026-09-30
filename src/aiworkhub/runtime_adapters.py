@@ -1220,6 +1220,21 @@ def resolve_opencode_model(model: str | None) -> tuple[str | None, str | None]:
     return candidate, None
 
 
+def opencode_model_is_free_tier(model: str) -> bool:
+    """Exact shape of OpenCode's hosted free-tier identity: ``opencode/<x>-free``.
+
+    The free route 403s "can only be used from within OpenCode" through a
+    headless ``opencode_cli`` launch (NF-2026-01081). Callers use this to
+    report or block the restriction without dropping the identity from
+    discovery. Whether a per-request sandbox HOME losing the persistent
+    client session is the unavoidable cause is unmeasured: no live canary
+    has exercised this route through this adapter.
+    """
+
+    provider, sep, remainder = model.partition("/")
+    return bool(sep) and provider == "opencode" and remainder.endswith("-free")
+
+
 def _is_glm_family(name: str) -> bool:
     """True when ``name`` normalizes into the GLM provider family."""
 
@@ -1634,13 +1649,19 @@ OPENCODE_WORKER_MCP_TOOLS: tuple[str, ...] = (
 OPENCODE_DENIED_BUILTIN_TOOLS: tuple[str, ...] = (
     "read",
     "edit",
+    "write",
+    "patch",
+    "multiedit",
     "bash",
     "task",
+    "todowrite",
+    "todoread",
     "skill",
     "lsp",
     "websearch",
     "glob",
     "grep",
+    "list",
     "webfetch",
     "question",
     "external_directory",
@@ -2236,6 +2257,10 @@ def build_runtime_command(
         if model_error:
             return _invalid_plan(adapter_id, model_error, cwd=cwd)
         assert resolved_model is not None
+        if opencode_model_is_free_tier(resolved_model):
+            return _invalid_plan(
+                adapter_id, "opencode_free_tier_client_restricted", cwd=cwd
+            )
         argv = [
             executable,
             "run",
