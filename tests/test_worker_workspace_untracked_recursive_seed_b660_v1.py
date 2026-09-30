@@ -74,6 +74,7 @@ def test_terminal_recursive_glob_hydrates_untracked_ignored_files(
         worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
 
 
+@pytest.mark.requires_symlink
 @pytest.mark.parametrize("symlink_directory", [False, True])
 def test_terminal_recursive_glob_rejects_selected_symlink(
     monkeypatch: pytest.MonkeyPatch,
