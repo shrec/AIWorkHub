@@ -3362,6 +3362,254 @@ def test_orchestrator_reuse_is_keyed_to_the_target_claim_epoch(tmp_path):
     assert _starting_count(manager, "REVIEWER_C") == 0
 
 
+# ---------------------------------------------------------------------------
+# NF-2026-01131: only a reviewer's reservation row carries its sealed
+# ``quality_review_attempt``; the ``running`` and terminal rows that replace it
+# in the latest-row projection do not. Exclusivity and reuse must still see the
+# reviewer for its whole life, not only the spawn window.
+# ---------------------------------------------------------------------------
+
+_NF1131_ATTEMPT = {**_LENS_BINDING, "target_claim_epoch": "2"}
+
+
+def _nf1131_reviewer(
+    manager: process_launcher.ProcessManager,
+    request_id: str,
+    task_id: str,
+    later_state: str,
+    **later: object,
+) -> None:
+    manager._append_event(
+        _starting(
+            request_id=request_id, task_id=task_id, expires_at=time.time() + 120.0,
+            quality_review_attempt=dict(_NF1131_ATTEMPT),
+        )
+    )
+    manager._append_event({
+        "request_id": request_id, "task_id": task_id, "runner": RUNNER,
+        "topic": TOPIC, "adapter_id": ADAPTER, "state": later_state, **later,
+    })
+    latest = manager._latest_by_request()[request_id]
+    # The replace projection is unchanged: state from the latest row, which
+    # carries no seal.
+    assert latest["state"] == later_state
+    assert "quality_review_attempt" not in latest
+
+
+def _reserve_nf1131(
+    manager: process_launcher.ProcessManager,
+    reviewer_task_id: str,
+    *,
+    refuse: bool,
+    lens: str = "correctness",
+    epoch: str = "2",
+) -> dict:
+    return manager._reserve_quality_reviewer_attempt(
+        reviewer_task_id=reviewer_task_id,
+        runner=RUNNER,
+        adapter_id=ADAPTER,
+        target_request_id=_LENS_BINDING["target_request_id"],
+        target_task_id=_LENS_BINDING["target_task_id"],
+        lens=lens,
+        model=None,
+        timeout_seconds=1800,
+        refuse_live_lens=refuse,
+        target_claim_epoch=epoch,
+    )
+
+
+def _nf1131_sealed_card(
+    task_id: str, request_id: str, **card: object
+) -> dict:
+    packet = "c" * 64
+    receipt = {
+        "packet_sha256": packet,
+        "target": {"request_id": "target-req", "task_id": "TARGET_TASK", "claim_epoch": 2},
+        "reviewer": {"request_id": request_id, "task_id": task_id},
+        "report": {
+            "lens": "correctness", "read_only": True, "can_mutate_repo": False,
+            "findings": [],
+        },
+        "authority": {
+            "process_identity_verified": True, "audit_verified": True,
+            "terminal_state": "review_ready",
+        },
+        "submission_id": "d" * 64,
+        "physical_submission_count": 1,
+        "logical_submission_count": 1,
+    }
+    binding = {
+        "lens": "correctness", "packet_sha256": packet,
+        "target_request_id": "target-req", "target_task_id": "TARGET_TASK",
+        "target_claim_epoch": 2,
+    }
+    return {
+        "task_id": task_id,
+        "terminal_review": {
+            "evidence": {"quality_review": binding, "quality_review_receipt": receipt},
+        },
+        **card,
+    }
+
+
+def _nf1131_cards(monkeypatch, cards: dict[str, dict]) -> None:
+    from aiworkhub import review_orchestrator
+
+    original = review_orchestrator.task_store.get_task
+    monkeypatch.setattr(
+        review_orchestrator.task_store, "get_task",
+        lambda repo, task_id: (
+            cards[task_id] if task_id in cards else original(repo, task_id)
+        ),
+    )
+
+
+def test_nf1131_running_reviewer_without_seal_on_latest_row_stays_exclusive(tmp_path):
+    manager = _manager(tmp_path)
+    _nf1131_reviewer(
+        manager, "live-a", "REVIEWER_A", "running",
+        pid=os.getpid(),
+        pid_start_ticks=process_launcher._pid_start_ticks(os.getpid()),
+    )
+    latest = manager._latest_by_request()
+
+    rows = process_launcher._sealed_lens_attempts(
+        latest, "TARGET_TASK", "target-req", "correctness", manager.process_log_path
+    )
+    assert [
+        (request_id, event["state"], event["quality_review_attempt"])
+        for request_id, event in rows
+    ] == [("live-a", "running", _NF1131_ATTEMPT)]
+    found = manager.existing_lens_reviewer(
+        target_task_id="TARGET_TASK", target_request_id="target-req",
+        claim_epoch="2", lens="correctness",
+    )
+    assert found is not None
+    assert (found["request_id"], found["state"]) == ("live-a", "running")
+
+    # MCP tool path: the live rival is refused.
+    assert _reserve_nf1131(manager, "REVIEWER_B", refuse=True) == _lens_refusal(
+        "REVIEWER_A", "live-a"
+    )
+    # Automation path: the live reviewer is reused.
+    reused = _reserve_nf1131(manager, "REVIEWER_C", refuse=False)
+    assert reused["ok"] is True
+    assert reused["reused_existing_reviewer"] is True
+    assert reused["request_id"] == "live-a"
+    assert reused["state"] == "running"
+    assert _starting_count(manager, "REVIEWER_B") == 0
+    assert _starting_count(manager, "REVIEWER_C") == 0
+
+
+@pytest.mark.parametrize("malformed_seal", ["not-a-mapping", None])
+def test_nf1131_persisted_malformed_latest_seal_keeps_reservation_seal(
+    tmp_path, malformed_seal
+):
+    manager = _manager(tmp_path)
+    # The latest persisted ``running`` row carries a non-Mapping seal. The
+    # ledger writer drops it, so the merge fold cannot overlay the reservation
+    # seal and the reviewer stays visible to exclusivity.
+    _nf1131_reviewer(
+        manager, "live-a", "REVIEWER_A", "running",
+        pid=os.getpid(),
+        pid_start_ticks=process_launcher._pid_start_ticks(os.getpid()),
+        quality_review_attempt=malformed_seal,
+    )
+
+    rows = process_launcher._sealed_lens_attempts(
+        manager._latest_by_request(), "TARGET_TASK", "target-req", "correctness",
+        manager.process_log_path,
+    )
+    assert [
+        (request_id, event["state"], event["quality_review_attempt"])
+        for request_id, event in rows
+    ] == [("live-a", "running", _NF1131_ATTEMPT)]
+    assert _reserve_nf1131(manager, "REVIEWER_B", refuse=True) == _lens_refusal(
+        "REVIEWER_A", "live-a"
+    )
+    assert _starting_count(manager, "REVIEWER_B") == 0
+
+
+def test_nf1131_append_event_drops_non_mapping_seal(tmp_path):
+    ledger = tmp_path / "ledger.jsonl"
+    persisted = process_event_ledger.append_event(
+        ledger, {"request_id": "r", "state": "running", "quality_review_attempt": "x"}
+    )
+    assert "quality_review_attempt" not in persisted
+    rows = [json.loads(line) for line in ledger.read_text("utf-8").splitlines()]
+    assert rows == [{"request_id": "r", "state": "running"}]
+
+
+def test_nf1131_seal_recovery_covers_retry(tmp_path):
+    manager = _manager(tmp_path)
+    _nf1131_reviewer(
+        manager, "live-a", "REVIEWER_A", "running",
+        pid=os.getpid(),
+        pid_start_ticks=process_launcher._pid_start_ticks(os.getpid()),
+    )
+
+    # A retried launch of the same reviewer reconciles its own attempt instead
+    # of reporting a false identity mismatch for the seal-less running row.
+    retried = _reserve_nf1131(manager, "REVIEWER_A", refuse=True)
+    assert retried.get("error") != "quality_review_attempt_identity_mismatch"
+    assert retried["ok"] is True
+    assert retried["request_id"] == "live-a"
+    assert _starting_count(manager, "REVIEWER_A") == 1
+
+
+def test_nf1131_accepted_reviewer_with_this_claims_sealed_report_is_reused(
+    tmp_path, monkeypatch,
+):
+    manager = _manager(tmp_path)
+    _nf1131_reviewer(manager, "done-a", "REVIEWER_A", "accepted")
+    _nf1131_cards(monkeypatch, {"REVIEWER_A": _nf1131_sealed_card("REVIEWER_A", "done-a")})
+
+    assert manager.live_reviewer_for_lens(
+        "TARGET_TASK", "target-req", "correctness"
+    ) is None
+    for task_id, refuse in (("REVIEWER_B", True), ("REVIEWER_C", False)):
+        receipt = _reserve_nf1131(manager, task_id, refuse=refuse)
+        assert receipt["ok"] is True, refuse
+        assert receipt["reused_existing_reviewer"] is True, refuse
+        assert receipt["request_id"] == "done-a"
+        assert receipt["task_id"] == "REVIEWER_A"
+        assert receipt["state"] == "accepted"
+        assert _starting_count(manager, task_id) == 0
+
+
+@pytest.mark.parametrize(
+    ("card", "reserve", "reviewer_request"),
+    [
+        ({}, {"epoch": "3"}, "done-a"),
+        ({}, {"lens": "security"}, "done-a"),
+        ({"status": "pending", "worker_status": "worker_failed"}, {}, "done-a"),
+        ({"status": "superseded"}, {}, "done-a"),
+        ({"status": "rejected"}, {}, "done-a"),
+        ({}, {}, "other-request"),
+    ],
+    ids=[
+        "other_claim_epoch", "other_lens", "failed", "superseded", "rejected",
+        "sealed_by_other_request",
+    ],
+)
+@pytest.mark.parametrize("refuse", [True, False], ids=["mcp", "automation"])
+def test_nf1131_unusable_or_foreign_sealed_reviewer_still_launches(
+    tmp_path, monkeypatch, card, reserve, reviewer_request, refuse,
+):
+    manager = _manager(tmp_path)
+    _nf1131_reviewer(manager, "done-a", "REVIEWER_A", "accepted")
+    _nf1131_cards(
+        monkeypatch,
+        {"REVIEWER_A": _nf1131_sealed_card("REVIEWER_A", reviewer_request, **card)},
+    )
+
+    receipt = _reserve_nf1131(manager, "REVIEWER_B", refuse=refuse, **reserve)
+    assert receipt["ok"] is True
+    assert receipt["already_reserved"] is False
+    assert "reused_existing_reviewer" not in receipt
+    assert _starting_count(manager, "REVIEWER_B") == 1
+
+
 def _launch_sealing_epoch(
     tmp_path, monkeypatch, *, card_epoch, caller_epoch: str | None,
 ) -> str:

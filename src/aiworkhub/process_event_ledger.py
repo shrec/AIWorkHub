@@ -19,7 +19,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Iterator
+from typing import Any, Iterable, Iterator, Mapping
 
 from .platform_io import atomic_replace, chmod_fd, lock_fd, unlock_fd
 
@@ -368,6 +368,10 @@ def append_event(
     if max_active_bytes < 1024:
         raise ValueError("process_ledger_max_bytes_too_small")
     persisted_event = event.copy()
+    # The seal is set once as a Mapping on the reservation row (NF-2026-01131);
+    # a non-Mapping value is never a seal and must not overlay it in the merge fold.
+    if not isinstance(persisted_event.get("quality_review_attempt"), Mapping):
+        persisted_event.pop("quality_review_attempt", None)
     state_value = persisted_event.get("state")
     if isinstance(state_value, str):
         state = state_value.strip().lower()
@@ -745,6 +749,25 @@ def latest_events(
         replace=replace,
         drop_fields=drop_fields,
     )
+
+
+def sealed_request_field(path: Path, field: str) -> dict[str, Any]:
+    """``{request_id: value}`` of a field sealed once per request and never rewritten.
+
+    A seal such as ``quality_review_attempt`` is written on a request's
+    reservation row, and later lifecycle rows (the supervisor's ``running``
+    row, terminal rows) omit it, so the launcher's REPLACE projection loses it
+    for the rest of the attempt's life (NF-2026-01131). The cached MERGE fold of
+    the same ledger keeps the last value any row carried, which for an
+    immutable seal is the reservation's own. Lifecycle state is never read
+    from here: that stays the replace projection's latest row.
+    """
+
+    return {
+        key: row[field]
+        for key, row in latest_events(path, key_field="request_id").items()
+        if isinstance(row.get(field), Mapping)
+    }
 
 
 # --- Bounded multi-request event projection ---------------------------------

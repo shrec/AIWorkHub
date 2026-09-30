@@ -1404,6 +1404,11 @@ def _reviewer_lens_coverage(
 _REVIEWER_REUSE_EXCLUDED_STATES = _REVIEWER_FAILED_STATES | frozenset({
     "superseded", "retired", "rejected",
 })
+# Ledger states of a finished reviewer whose sealed report may be reused. The
+# chain auto-accepts a clean reviewer's own card, moving its ledger state from
+# ``review_ready`` to ``accepted``; its verified report is still this claim's
+# (NF-2026-01131). The card's report, not the state, is what is trusted.
+_REVIEWER_SEALED_EVENT_STATES = frozenset({"review_ready", "accepted"})
 
 
 def existing_lens_reviewer(
@@ -1478,7 +1483,7 @@ def existing_lens_reviewer(
         if (
             include_sealed
             and identity["claim_epoch"]
-            and str(event.get("state") or "") == "review_ready"
+            and str(event.get("state") or "") in _REVIEWER_SEALED_EVENT_STATES
             and _verified_lens_report(card, identity, lens, task_id)
             and _sealed_reviewer_request_id(card) == str(request_id)
         ):

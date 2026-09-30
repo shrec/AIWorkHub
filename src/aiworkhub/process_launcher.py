@@ -4581,21 +4581,32 @@ def _sealed_lens_attempts(
     target_task_id: str,
     target_request_id: str,
     lens: str | None = None,
+    ledger_path: Path | None = None,
 ) -> list[tuple[str, Mapping[str, Any]]]:
     """Every reviewer attempt sealed to this exact target (and lens).
 
     Only ``quality_review`` events whose sealed ``quality_review_attempt``
-    matches exactly count.  No liveness is applied here.
+    matches exactly count.  No liveness is applied here.  The seal is
+    immutable per request but only its reservation row carries it, so a
+    latest row without one (``running``, terminal) takes it from
+    ``ledger_path``'s seal projection; state stays the latest row's
+    (NF-2026-01131).
     """
 
     rows: list[tuple[str, Mapping[str, Any]]] = []
+    seals: dict[str, Any] | None = None
     for request_id, event in latest.items():
-        attempt = event.get("quality_review_attempt") if isinstance(
-            event, Mapping
-        ) else None
-        if not isinstance(attempt, Mapping) or event.get("topic") != "quality_review":
+        if not isinstance(event, Mapping) or event.get("topic") != "quality_review":
             continue
-        if (
+        attempt = event.get("quality_review_attempt")
+        if not isinstance(attempt, Mapping) and ledger_path is not None:
+            if seals is None:
+                seals = process_event_ledger.sealed_request_field(
+                    ledger_path, "quality_review_attempt"
+                )
+            attempt = seals.get(str(request_id))
+            event = {**event, "quality_review_attempt": attempt}
+        if not isinstance(attempt, Mapping) or (
             str(attempt.get("target_task_id") or "") != target_task_id
             or str(attempt.get("target_request_id") or "") != target_request_id
             or (lens is not None and str(attempt.get("lens") or "") != lens)
@@ -7559,8 +7570,11 @@ class ProcessManager:
                     "ok": False,
                     "error": "quality_review_attempt_identity_mismatch",
                 }
-            event = latest.get(request_id) or {}
-            attempt = event.get("quality_review_attempt")
+            attempt = (latest.get(request_id) or {}).get("quality_review_attempt")
+            if not isinstance(attempt, Mapping):  # seal recovery, NF-2026-01131
+                attempt = process_event_ledger.sealed_request_field(
+                    self.process_log_path, "quality_review_attempt"
+                ).get(request_id)
             if not isinstance(attempt, Mapping):
                 return {
                     "ok": False,
@@ -7653,7 +7667,8 @@ class ProcessManager:
         return [
             (request_id, event, request_id in running or self._reviewer_event_live(event))
             for request_id, event in _sealed_lens_attempts(
-                latest, target_task_id, target_request_id, lens
+                latest, target_task_id, target_request_id, lens,
+                self.process_log_path,
             )
         ]
 
@@ -7667,8 +7682,9 @@ class ProcessManager:
         """Every live reviewer attempt sealed to this exact target (and lens).
 
         A terminal attempt is never live, so supplemental rounds are never
-        blocked by one.  Uses only ``self._live`` and
-        :meth:`_reviewer_event_live`, so collaborators may borrow it.
+        blocked by one.  Uses only ``self._live``, :meth:`_reviewer_event_live`
+        and ``self.process_log_path`` (the seal projection, NF-2026-01131), so
+        collaborators that provide those may borrow it.
         """
 
         running = {
@@ -7677,7 +7693,8 @@ class ProcessManager:
         return [
             (request_id, event)
             for request_id, event in _sealed_lens_attempts(
-                latest, target_task_id, target_request_id, lens
+                latest, target_task_id, target_request_id, lens,
+                self.process_log_path,
             )
             if request_id in running or self._reviewer_event_live(event)
         ]
@@ -7758,8 +7775,12 @@ class ProcessManager:
         # The stable snapshot may replay the whole ledger up to
         # ``_LEDGER_SNAPSHOT_MAX_ATTEMPTS`` times.  Taking it here, before the
         # cross-process registry lock, keeps that amplified work off every
-        # unrelated reservation acknowledgement waiting on the same lock.
+        # unrelated reservation acknowledgement waiting on the same lock; so
+        # does warming the NF-2026-01131 seal projection read under the lock.
         snapshot = self._latest_by_request_stable()
+        process_event_ledger.sealed_request_field(
+            self.process_log_path, "quality_review_attempt"
+        )
         try:
             with self._lock, self._registry_lock():
                 # ONE proven snapshot backs this whole critical section, and
@@ -7804,28 +7825,23 @@ class ProcessManager:
                         "reviewer_task_id": str(rival[1].get("task_id") or ""),
                         "reviewer_request_id": rival[0], "lens": lens,
                     }
-                if not refuse_live_lens:
-                    # NF-2026-01064: another live reviewer already bought for
-                    # this exact target, claim epoch and lens is reused, checked
-                    # and decided under the same lock that would reserve, so two
-                    # concurrent launches never both spawn a provider. Only
-                    # LIVE ones: a terminal attempt never blocks a supplemental
-                    # round here -- the chain binds sealed verdicts itself.
-                    reused = self.existing_lens_reviewer(
-                        target_task_id=target_task_id,
-                        target_request_id=target_request_id,
-                        claim_epoch=target_claim_epoch,
-                        lens=lens,
-                        latest=latest,
-                        include_sealed=False,
-                        exclude_task_id=reviewer_task_id,
-                    )
-                    if reused is not None:
-                        return {
-                            **self._reviewer_receipt(reused["request_id"], latest),
-                            "reused_existing_reviewer": True,
-                            "lens": lens,
-                        }
+                # NF-2026-01064: a live reviewer, or a finished one whose card
+                # holds this claim's verified lens report (NF-2026-01131), already
+                # bought for this exact target, claim epoch and lens is reused,
+                # decided under the same lock that would reserve, so two launches
+                # never both spawn a provider. Unsealed terminal attempts never
+                # block a supplemental round.
+                reused = self.existing_lens_reviewer(
+                    target_task_id=target_task_id,
+                    target_request_id=target_request_id,
+                    claim_epoch=target_claim_epoch, lens=lens, latest=latest,
+                    exclude_task_id=reviewer_task_id,
+                )
+                if reused is not None:
+                    return {
+                        **self._reviewer_receipt(reused["request_id"], latest),
+                        "reused_existing_reviewer": True, "lens": lens,
+                    }
                 if self._active_count(latest) >= _configured_limit():
                     return {"ok": False, "error": "concurrency_limit_reached"}
                 request_id = uuid.uuid4().hex

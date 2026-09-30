@@ -4822,3 +4822,91 @@ def test_nf1123_deferred_reservation_for_another_lens_or_epoch_still_launches(
     assert len(manager.launches) == 1
     assert manager.launches[0]["lens"] == "correctness"
     assert manager.launches[0]["reviewer_task_id"] != "MANUAL-REVIEWER"
+
+
+# ---------------------------------------------------------------------------
+# NF-2026-01131: a reviewer stays reusable for its whole life. Its ``running``
+# row carries no sealed attempt, and a clean reviewer's own card is
+# auto-accepted, moving its ledger state from ``review_ready`` to ``accepted``.
+# ---------------------------------------------------------------------------
+
+
+def test_nf1131_chain_adopts_running_manager_reviewer_without_seal_on_latest_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import os
+
+    from aiworkhub import process_launcher
+
+    ledger, _cards = _deferred_manager_reservation(tmp_path, monkeypatch)
+    ledger._append_event({
+        "request_id": "manual-request", "task_id": "MANUAL-REVIEWER",
+        "topic": "quality_review", **ROUTE, "state": "running",
+        "pid": os.getpid(),
+        "pid_start_ticks": process_launcher._pid_start_ticks(os.getpid()),
+    })
+    latest = ledger._latest_by_request()["manual-request"]
+    assert latest["state"] == "running"
+    assert "quality_review_attempt" not in latest
+    manager = _LedgerManager(tmp_path, ledger)
+    assert manager.existing_lens_reviewer(**_LOOKUP_IDENTITY)["state"] == "running"
+    driver, chain = _nf1064_driver(tmp_path, manager)
+
+    assert driver.drain(max_actions=1, now=NOW).completed == 1
+
+    assert manager.launches == []
+    assert [
+        (row["reviewer_task_id"], row["reviewer_request_id"], row["state"])
+        for row in driver._route_attempts(chain.chain_id, "correctness")
+    ] == [("MANUAL-REVIEWER", "manual-request", "launched")]
+
+
+def test_nf1131_accepted_reviewer_with_this_claims_sealed_report_is_reused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sealed_card = _review_status(reviewer_request="q2", reviewer_task="R2")["task_card"]
+    sealed = _lookup(
+        tmp_path, monkeypatch,
+        [_ledger_row("q2", "R2", state="accepted", live=False, claim_epoch="1")],
+        {"R2": sealed_card},
+    )
+    assert sealed == {"task_id": "R2", "request_id": "q2", **ROUTE, "state": "sealed"}
+
+
+def _nf1131_sealed_card(**card: str) -> dict:
+    return {
+        **_review_status(reviewer_request="q2", reviewer_task="R2")["task_card"],
+        **card,
+    }
+
+
+@pytest.mark.parametrize(
+    ("row", "card", "overrides"),
+    [
+        ({}, _nf1131_sealed_card(), {"claim_epoch": "2"}),
+        ({"lens": "security"}, _nf1131_sealed_card(), {}),
+        (
+            {},
+            _nf1131_sealed_card(status="pending", worker_status="worker_failed"),
+            {},
+        ),
+        ({}, _nf1131_sealed_card(status="superseded"), {}),
+        ({}, _nf1131_sealed_card(status="rejected"), {}),
+        (
+            {},
+            _review_status(reviewer_request="other", reviewer_task="R2")["task_card"],
+            {},
+        ),
+    ],
+    ids=[
+        "other_claim_epoch", "other_lens", "failed", "superseded", "rejected",
+        "sealed_by_other_request",
+    ],
+)
+def test_nf1131_accepted_reviewer_unusable_or_foreign_is_not_reused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, row, card, overrides,
+) -> None:
+    rows = [_ledger_row(
+        "q2", "R2", state="accepted", live=False, claim_epoch="1", **row
+    )]
+    assert _lookup(tmp_path, monkeypatch, rows, {"R2": card}, **overrides) is None
