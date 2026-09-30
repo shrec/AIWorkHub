@@ -482,7 +482,7 @@ function loadWebviewSlice() {
     `"use strict";\n${utilities}\n${constants}\n${managerChat}\n${managerChatWiring}\n` +
       "this.api = { managerChatEventNode, renderManagerChatEvents, renderManagerChatEventsResponse, " +
       "renderManagerChatAction, renderManagerChatStatus, requestManagerChatEvents, scheduleManagerChatPoll, " +
-      "applyManagerChatSessionUi, applyManagerChatComposerState, managerChatEnabledModels, managerChatSelectedRoute, populateManagerChatModelOptions, applyManagerChatCollapsed, toggleManagerChatSidebar, startManagerChatSidebar, openManagerChatDialog, renderManagerChatTaskBoard, driveManagerChatTask };",
+      "applyManagerChatSessionUi, applyManagerChatComposerState, managerChatEnabledModels, managerChatSelectedRoute, populateManagerChatModelOptions, applyManagerChatCollapsed, toggleManagerChatSidebar, startManagerChatSidebar, renderManagerChatTaskBoard, driveManagerChatTask };",
     context,
   );
   return { api: context.api, state, elements, posts, timers };
@@ -1237,7 +1237,8 @@ test("the model field is a <select>, not a free-text input", () => {
 // ── Structural reuse: sidebar beside the dashboard, no covering dialog ──
 
 test("the Manager panel is a persistent sidebar and reuses existing theme tokens", () => {
-  assert.match(extensionSource, /id="header-manager-chat"[^>]+title="Collapse or expand Manager chat"/);
+  assert.doesNotMatch(extensionSource, /id="header-manager-chat/);
+  assert.match(extensionSource, /id="manager-chat-collapse"[^>]*aria-controls="manager-chat-sidebar"/);
   assert.match(extensionSource, /<div class="dashboard-shell" id="dashboard-shell">/);
   assert.match(extensionSource, /<div class="dashboard-column" id="dashboard-column">/);
   assert.match(extensionSource, /<aside class="manager-chat-sidebar" id="manager-chat-sidebar" aria-label="Manager chat">/);

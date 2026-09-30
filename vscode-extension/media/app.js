@@ -325,9 +325,6 @@ const elements = {
   repoRouter: document.querySelector("#repo-router"),
   repoRouterList: document.querySelector("#repo-router-list"),
   targetButtons: Array.from(document.querySelectorAll("[data-provider]")),
-  headerManagerChat: document.querySelector("#header-manager-chat"),
-  headerManagerChatValue: document.querySelector("#header-manager-chat-value"),
-  headerManagerChatDetail: document.querySelector("#header-manager-chat-detail"),
   managerChatSidebar: document.querySelector("#manager-chat-sidebar"),
   managerChatShell: document.querySelector("#dashboard-shell"),
   managerChatCollapse: document.querySelector("#manager-chat-collapse"),
@@ -7463,12 +7460,6 @@ function applyManagerChatSessionUi() {
   elements.managerChatSummary.textContent = hasSession
     ? (state.managerChatRunning ? "Running" : "Active") + " · " + activeName
     : "No session";
-  if (elements.headerManagerChatValue) {
-    elements.headerManagerChatValue.textContent = state.managerChatRunning ? "Running" : hasSession ? activeName : "—";
-  }
-  if (elements.headerManagerChatDetail) {
-    elements.headerManagerChatDetail.textContent = hasSession ? activeName : "No session";
-  }
   applyManagerChatComposerState();
 }
 
@@ -8225,19 +8216,11 @@ function applyManagerChatCollapsed(collapsed) {
     toggle.setAttribute("aria-expanded", String(!state.managerChatCollapsed));
     toggle.textContent = state.managerChatCollapsed ? "Expand" : "Collapse";
   }
-  if (elements.headerManagerChat && typeof elements.headerManagerChat.setAttribute === "function") {
-    elements.headerManagerChat.setAttribute("aria-expanded", String(!state.managerChatCollapsed));
-  }
   if (typeof persistState === "function") persistState();
 }
 
 function toggleManagerChatSidebar() {
   applyManagerChatCollapsed(!state.managerChatCollapsed);
-}
-
-function openManagerChatDialog() {
-  // Header card toggles the persistent sidebar. It does not open a dialog.
-  toggleManagerChatSidebar();
 }
 
 function startManagerChatSidebar() {
@@ -8260,7 +8243,6 @@ function startManagerChatSidebar() {
   renderManagerChatTaskBoard();
 }
 
-elements.headerManagerChat.addEventListener("click", openManagerChatDialog);
 if (elements.managerChatCollapse && typeof elements.managerChatCollapse.addEventListener === "function") {
   elements.managerChatCollapse.addEventListener("click", toggleManagerChatSidebar);
 }

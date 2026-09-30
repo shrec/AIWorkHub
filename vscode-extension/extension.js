@@ -11417,12 +11417,6 @@ function getHtmlForWebview(webview, extensionUri) {
         <span class="header-insight-detail" id="header-roadmap-detail">No outcomes</span>
       </button>
 
-      <button class="header-insight-card" id="header-manager-chat" type="button" title="Collapse or expand Manager chat" aria-controls="manager-chat-sidebar" aria-expanded="true">
-        <span class="header-storage-label">Manager</span>
-        <strong id="header-manager-chat-value">—</strong>
-        <span class="header-insight-detail" id="header-manager-chat-detail">No session</span>
-      </button>
-
       <div class="header-insight-card" id="header-preflight" title="Unified repository, policy, Source Graph and provider preflight">
         <span class="header-storage-label">Preflight</span>
         <strong id="header-preflight-value">Checking</strong>
