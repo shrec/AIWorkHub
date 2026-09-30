@@ -380,3 +380,28 @@ def test_prune_expired_without_a_spill_directory_is_a_no_op(tmp_path) -> None:
         "bytes_freed": 0,
         "errors": [],
     }
+
+
+# --- NF-2026-01162: try_spill_text stays fail-closed for untrustworthy stores -
+
+
+def test_nf01162_worker_root_collision_is_not_downgraded_to_spill_unavailable(
+    tmp_path, monkeypatch
+) -> None:
+    repo = tmp_path / "repo"
+    (repo / ".aiworkhub").mkdir(parents=True)
+    # Occupy the repository spill root with a regular file: mkdir refuses it
+    # with the same output_spill_store_persist_failed a read-only root gives.
+    (repo / ".aiworkhub" / "spill").write_text("not a directory", encoding="utf-8")
+    seat = tmp_path / "seat"
+    seat_root = seat / ".aiworkhub" / "spill"
+    seat_root.mkdir(parents=True)
+    monkeypatch.setenv("AIWORKHUB_WORKER_SPILL_ROOT", str(seat))
+    text = "payload " * 500
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    (seat_root / f"{digest}.txt").write_text("tampered", encoding="utf-8")
+
+    with pytest.raises(
+        output_spill_store.OutputSpillError, match="output_spill_store_collision"
+    ):
+        output_spill_store.try_spill_text(text, repo=repo)

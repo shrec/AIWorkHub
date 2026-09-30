@@ -11,7 +11,11 @@ gone. This module splits those two concerns:
     back only as an opaque locator (never a filesystem path). A storage or
     durability failure raises :class:`OutputSpillError` rather than letting
     a caller fall through to a preview-only result that quietly lost the
-    full text.
+    full text. ``try_spill_text`` is the one deliberate exception
+    (NF-2026-01162): a seat with no writable spill root anywhere gets a
+    typed ``spill_unavailable`` and no locator, so a bounded answer still
+    reaches the caller instead of the whole request failing. Collision and
+    tamper failures stay fail-closed there too.
   * ``prune_text`` -- a pure, deterministic, model-free transform. Text at
     or under the byte budget is returned byte-for-byte unchanged. Text over
     budget becomes a bounded head, one explicit measured-pruning marker
@@ -51,6 +55,15 @@ _TELEMETRY_SCHEMA_ID = "aiworkhub.output_spill_store.telemetry.v1"
 _SPILL_FILE_RE = re.compile(r"^[0-9a-f]{64}\.txt$")
 _SPILL_TMP_RE = re.compile(r"^\.[0-9a-f]{64}\..*\.tmp$")
 _PRUNE_ERROR_CAP = 100
+# The one pure-storage persist failure, named once so ``try_spill_text`` can
+# tell it apart from the collision/tamper failures that must stay fail-closed.
+_PERSIST_FAILED_PREFIX = "output_spill_store_persist_failed"
+# Typed reason a caller reports when nothing could be spilled anywhere.
+SPILL_UNAVAILABLE = "spill_unavailable"
+_UNAVAILABLE_DETAIL_CAP = 200
+# A worker-writable, repository-shaped root for seats whose own checkout is
+# read-only; consulted by both the spill fallback and retrieval.
+_WORKER_SPILL_ROOT_ENV = "AIWORKHUB_WORKER_SPILL_ROOT"
 
 
 class OutputSpillError(RuntimeError):
@@ -71,6 +84,19 @@ class SpillReceipt:
     original_bytes: int
     content_sha256: str
     retrieval_hint: str
+
+
+@dataclass(frozen=True, slots=True)
+class SpillUnavailable:
+    """Typed, non-fatal outcome: this seat has no writable spill root.
+
+    Deliberately carries NO locator -- there is nothing to retrieve -- so a
+    caller handed one must present truncated inline content and say why,
+    never imply that a full payload is still recoverable.
+    """
+
+    reason: str
+    detail: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -169,7 +195,7 @@ def spill_text(text: str, *, repo: Path | str) -> SpillReceipt:
     except OutputSpillError:
         raise
     except Exception as exc:  # noqa: BLE001 - one named fail-closed error
-        raise OutputSpillError(f"output_spill_store_persist_failed:{digest}") from exc
+        raise OutputSpillError(f"{_PERSIST_FAILED_PREFIX}:{digest}") from exc
     finally:
         if tmp_path is not None:
             tmp_path.unlink(missing_ok=True)
@@ -182,6 +208,73 @@ def spill_text(text: str, *, repo: Path | str) -> SpillReceipt:
             "retrieve_text(locator, repo=<same repository root>) returns the "
             "exact original bytes; the locator carries no filesystem path."
         ),
+    )
+
+
+def _worker_spill_repo() -> Path | None:
+    """The worker-writable root this seat declared, if any.
+
+    NF-2026-01162: a worker whose repository checkout is read-only can still
+    be handed a scratch root it owns, via ``AIWORKHUB_WORKER_SPILL_ROOT``. It
+    is repository-shaped -- the same ``.aiworkhub/spill`` subdirectory is
+    used underneath -- so a payload spilled there is found by
+    :func:`retrieve_text` without the locator ever carrying a filesystem
+    path. Unset (the normal case) means there is no second root at all and
+    every lookup behaves exactly as it did before.
+    """
+
+    raw = os.environ.get(_WORKER_SPILL_ROOT_ENV, "").strip()
+    return Path(raw) if raw else None
+
+
+def _same_root(left: Path | str, right: Path | str) -> bool:
+    try:
+        return Path(left).resolve() == Path(right).resolve()
+    except OSError:
+        return str(left) == str(right)
+
+
+def _retrieval_roots(repo: Path | str) -> list[Path]:
+    """Spill directories to read, in order: the repository's, then the seat's."""
+
+    roots = [_spill_root(repo)]
+    worker_repo = _worker_spill_repo()
+    if worker_repo is not None and not _same_root(worker_repo, repo):
+        roots.append(_spill_root(worker_repo))
+    return roots
+
+
+def try_spill_text(text: str, *, repo: Path | str) -> SpillReceipt | SpillUnavailable:
+    """Spill ``text``, or report a typed, NON-fatal ``spill_unavailable``.
+
+    NF-2026-01162: a worker seat whose spill root cannot be written must not
+    lose the whole query. :func:`spill_text` stays fail-closed for the
+    failures that mean the store itself is untrustworthy -- a digest
+    collision, a tampered payload -- and those still propagate here. A pure
+    storage failure is a different fact: nothing is corrupt, this seat simply
+    cannot persist at that root. The worker-writable root is tried next when
+    the seat declared one, and if that is unavailable too the caller receives
+    a typed :class:`SpillUnavailable` so it can return truncated inline
+    content with NO locator instead of failing a request whose answer was
+    otherwise fine.
+    """
+
+    try:
+        return spill_text(text, repo=repo)
+    except OutputSpillError as exc:
+        detail = str(exc)
+        if not detail.startswith(_PERSIST_FAILED_PREFIX):
+            raise
+    worker_repo = _worker_spill_repo()
+    if worker_repo is not None and not _same_root(worker_repo, repo):
+        try:
+            return spill_text(text, repo=worker_repo)
+        except OutputSpillError as exc:
+            detail = str(exc)
+            if not detail.startswith(_PERSIST_FAILED_PREFIX):
+                raise
+    return SpillUnavailable(
+        reason=SPILL_UNAVAILABLE, detail=detail[:_UNAVAILABLE_DETAIL_CAP]
     )
 
 
@@ -244,7 +337,9 @@ def retrieve_text(locator: str, *, repo: Path | str) -> str:
 
     Fails closed (:class:`OutputSpillError`) on a malformed locator, a
     missing spill file, or a digest mismatch -- tampering is refused, never
-    silently served.
+    silently served. The repository's own spill root is read first; the
+    worker-writable root (NF-2026-01162) is consulted only when this seat
+    declared one, so an ordinary repository resolves exactly as before.
     """
 
     if not isinstance(locator, str) or not locator.startswith(_LOCATOR_PREFIX):
@@ -252,13 +347,18 @@ def retrieve_text(locator: str, *, repo: Path | str) -> str:
     digest = locator[len(_LOCATOR_PREFIX):]
     if len(digest) != 64 or any(ch not in "0123456789abcdef" for ch in digest):
         raise OutputSpillError("output_spill_store_locator_malformed")
-    target = _spill_root(repo) / f"{digest}.txt"
-    try:
-        encoded = target.read_bytes()
-    except FileNotFoundError as exc:
-        raise OutputSpillError(f"output_spill_store_missing:{digest}") from exc
-    except OSError as exc:
-        raise OutputSpillError(f"output_spill_store_retrieve_failed:{digest}") from exc
+    encoded: bytes | None = None
+    missing: FileNotFoundError | None = None
+    for root in _retrieval_roots(repo):
+        try:
+            encoded = (root / f"{digest}.txt").read_bytes()
+            break
+        except FileNotFoundError as exc:
+            missing = exc
+        except OSError as exc:
+            raise OutputSpillError(f"output_spill_store_retrieve_failed:{digest}") from exc
+    if encoded is None:
+        raise OutputSpillError(f"output_spill_store_missing:{digest}") from missing
     if hashlib.sha256(encoded).hexdigest() != digest:
         raise OutputSpillError(f"output_spill_store_digest_mismatch:{digest}")
     return encoded.decode("utf-8")

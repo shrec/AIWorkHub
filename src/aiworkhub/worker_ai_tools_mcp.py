@@ -123,7 +123,11 @@ from . import semantic_edit_applier
 # planner whose own package imports are ``platform_io`` and
 # ``reasoning_policy``, so this edge cannot close a cycle (NF-2026-01022).
 from .runtime_adapters import toml_basic_string, toml_string_array
-from .sqlite_readonly import connect_readonly
+from .sqlite_readonly import connect_readonly, fallback_mode
+
+# Names the shape of the ``degraded`` / ``degraded_reason`` pair a worker read
+# attaches when ``connect_readonly`` had to serve it from a fallback open.
+_READONLY_DEGRADED_SCHEMA_ID = "aiworkhub.task_mcp.readonly_storage_degraded.v1"
 
 
 SERVER_NAME = "aiworkhub_worker_ai_tools"
@@ -606,6 +610,26 @@ def _open_readonly_db(path: Path, *, tool: str) -> sqlite3.Connection:
     return con
 
 
+def _readonly_degraded_fields(con: sqlite3.Connection) -> dict[str, Any]:
+    """Typed degraded marker for a read served by a fallback open.
+
+    NF-2026-01162: ``connect_readonly`` keeps a reader working when the
+    canonical database's WAL sidecars are unwritable from this seat, by
+    reopening it ``immutable=1``. That read is real, but it is not
+    equivalent -- an immutable reader cannot see uncheckpointed WAL frames --
+    so a response built on one says so and NAMES the fallback instead of
+    passing for a normal read. ``degraded`` is always present so a consumer
+    never has to infer it from a missing key.
+    """
+
+    fallback = fallback_mode(con)
+    return {
+        "degraded": fallback is not None,
+        "degraded_reason": fallback,
+        "degraded_schema_id": _READONLY_DEGRADED_SCHEMA_ID,
+    }
+
+
 def _table_exists(con: sqlite3.Connection, name: str) -> bool:
     return con.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
@@ -703,9 +727,13 @@ def _canonical_json_output(
     Over-cap text is spilled in full via ``output_spill_store`` BEFORE this
     builds its bounded preview (RM-2026-00044): the exact original stays
     retrievable and digest-verified from the wrapper's ``spill_locator``
-    rather than being discarded the moment it is trimmed. A spill failure
-    raises ``OutputSpillError`` here -- it never falls through to returning
-    a preview-only reply for a result that failed to persist.
+    rather than being discarded the moment it is trimmed. A spill that is
+    merely UNTRUSTWORTHY -- a digest collision or a tampered payload -- still
+    raises ``OutputSpillError`` here rather than returning a preview-only
+    reply. A spill root this seat simply cannot write is not that
+    (NF-2026-01162): nothing is corrupt, so the wrapper carries
+    ``spill_unavailable_reason`` and NO locator, keeping the bounded preview
+    the caller can still use instead of failing the whole query.
     """
 
     start = text.find("{")
@@ -725,7 +753,21 @@ def _canonical_json_output(
     if len(encoded) <= max_bytes:
         return canonical, False
 
-    receipt = output_spill_store.spill_text(canonical, repo=repo)
+    spilled = output_spill_store.try_spill_text(canonical, repo=repo)
+    if isinstance(spilled, output_spill_store.SpillReceipt):
+        spilled_bytes = spilled.original_bytes
+        spill_fields: dict[str, Any] = {
+            "spill_locator": spilled.locator,
+            "spill_retrieval_hint": (
+                "output_spill_store.retrieve_text(spill_locator, repo=<repository root>)"
+            ),
+        }
+    else:
+        spilled_bytes = 0
+        spill_fields = {
+            "spill_unavailable_reason": output_spill_store.SPILL_UNAVAILABLE,
+            "spill_unavailable_detail": spilled.detail,
+        }
 
     priority_keys = (
         "ranked_symbols",
@@ -773,10 +815,7 @@ def _canonical_json_output(
         "original_sha256": hashlib.sha256(encoded).hexdigest(),
         "original_hit_count": _json_hit_count(payload),
         "preview_semantics": "structure_aware_priority_preserving",
-        "spill_locator": receipt.locator,
-        "spill_retrieval_hint": (
-            "output_spill_store.retrieve_text(spill_locator, repo=<repository root>)"
-        ),
+        **spill_fields,
         "preview": {},
     }
     preview: dict[str, Any] = wrapper["preview"]
@@ -842,7 +881,7 @@ def _canonical_json_output(
     wrapper["telemetry"] = output_spill_store.build_telemetry(
         original_bytes=len(encoded),
         presented_bytes=len(bounded.encode("utf-8")),
-        spilled_bytes=receipt.original_bytes,
+        spilled_bytes=spilled_bytes,
         pruned_bytes=len(encoded) - len(bounded.encode("utf-8")),
     )
     bounded = _stabilize_telemetry()
@@ -4436,24 +4475,40 @@ def _fit_response_payload(
         fitted_once = True
     if fitted_once:
         original_bytes = len(original_text.encode("utf-8"))
-        receipt = output_spill_store.spill_text(original_text, repo=repo)
+        # NF-2026-01162: an unwritable spill root DEGRADES this reply rather
+        # than failing it. ``try_spill_text`` returns a typed
+        # ``spill_unavailable`` instead of raising, and the envelope then
+        # carries that reason and no locator. The telemetry fields stay
+        # exactly as they are today, honestly reporting spilled_bytes=0 for
+        # a payload that really was not kept.
+        spilled = output_spill_store.try_spill_text(original_text, repo=repo)
+        if isinstance(spilled, output_spill_store.SpillReceipt):
+            spilled_bytes = spilled.original_bytes
+            spill_fields: dict[str, Any] = {
+                "spill_locator": spilled.locator,
+                "spill_retrieval_hint": spilled.retrieval_hint,
+            }
+        else:
+            spilled_bytes = 0
+            spill_fields = {
+                "spill_unavailable_reason": output_spill_store.SPILL_UNAVAILABLE,
+                "spill_unavailable_detail": spilled.detail,
+            }
         for _ in range(_FIT_MAX_PASSES):
             presented_text = json.dumps(
                 payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
             )
             presented_bytes = len(presented_text.encode("utf-8"))
-            meta["spill_locator"] = receipt.locator
-            meta["spill_retrieval_hint"] = receipt.retrieval_hint
+            meta.update(spill_fields)
             meta["telemetry"] = output_spill_store.build_telemetry(
                 original_bytes=original_bytes,
                 presented_bytes=presented_bytes,
-                spilled_bytes=receipt.original_bytes,
+                spilled_bytes=spilled_bytes,
                 pruned_bytes=max(0, original_bytes - presented_bytes),
             )
             probe["content"] = presented_text
             probe["bytes"] = presented_bytes
-            probe["spill_locator"] = meta["spill_locator"]
-            probe["spill_retrieval_hint"] = meta["spill_retrieval_hint"]
+            probe.update(spill_fields)
             probe["telemetry"] = meta["telemetry"]
             size = _serialized_response_bytes(probe)
             if size <= output_cap_bytes:
@@ -4475,7 +4530,7 @@ def _fit_response_payload(
             meta["telemetry"] = output_spill_store.build_telemetry(
                 original_bytes=original_bytes,
                 presented_bytes=presented_bytes,
-                spilled_bytes=receipt.original_bytes,
+                spilled_bytes=spilled_bytes,
                 pruned_bytes=max(0, original_bytes - presented_bytes),
             )
     dropped = payload.get("fit_dropped")
@@ -5910,6 +5965,9 @@ def ai_memory_search(ctx: WorkerToolContext, *, query: str, limit: int = 8) -> d
         con = _open_readonly_db(binding.db_path, tool=tool)
     except WorkerToolError as exc:
         return _violation(ctx, tool, str(exc)[:160])
+    # Captured at open time: the connection is closed before the reply is
+    # built, and a degraded read must still be NAMED in that reply.
+    degraded = _readonly_degraded_fields(con)
     stats: dict[str, Any] = {"store_rows": 0, "last_write_at": None}
     try:
         rows: list[sqlite3.Row] = []
@@ -5963,6 +6021,7 @@ def ai_memory_search(ctx: WorkerToolContext, *, query: str, limit: int = 8) -> d
         "truncated": truncated, "hit_count": hit_count, "bytes": bytes_returned,
         "store_rows": stats["store_rows"], "last_write_at": stats["last_write_at"],
         "content": text, "cache_hit": False,
+        **degraded,
         "authority_source": binding.authority_source, "authority_state": binding.authority_state,
     }
 
