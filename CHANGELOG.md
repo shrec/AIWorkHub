@@ -6,6 +6,18 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.8] - 2026-09-30
+
+### Fixed
+
+- A running reviewer stays visible to lens exclusivity and reuse for its whole life, not only the spawn window (NF-2026-01131).
+- A rework launch seeds from the recorded, digest-bound delta artifact first; an emptied predecessor worktree no longer blocks it (NF-2026-01044).
+- A supervisor spawn failure reaches the terminal event as the transient `sandbox_spawn_failed` (NF-2026-01136).
+- A ranged `read_first` entry (`path:N-M`) no longer fails launch as an unknown path (NF-2026-01137).
+- A route whose every recent launch died in the sandbox is marked not launchable, so auto reviewer routing stops picking it (NF-2026-01140).
+- Write-path normalization keeps the dot in `.aiworkhub/...` paths, and `reject_review` refuses residual paths that are unsafe or outside `allowed_writes` (NF-2026-00535).
+- The forbidden-vs-`allowed_writes` guard no longer fails open on a `.//` or leading-`/` spelling, and a file-valued `allowed_writes` entry no longer covers nested paths (NF-2026-01144).
+
 ## [0.12.7] - 2026-09-30
 
 ### Fixed

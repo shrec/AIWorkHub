@@ -14,6 +14,12 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.12.8
+
+- Rework and ranged `read_first` launches no longer fail on an emptied worktree or a `path:N-M` context suffix.
+- Reviewer routing skips sandbox-dead adapters, and a running reviewer is never launched twice for one lens.
+- Path scope checks fail closed on `.//`, leading-`/` and out-of-scope residual paths.
+
 ## What's new in 0.12.7
 
 - SDLC stage proofs no longer stall: accepted cards that were archived later, and cards whose files moved on after accept, still reach build, test and deploy.
