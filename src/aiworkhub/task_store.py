@@ -28,6 +28,7 @@ import functools
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import tempfile
 import threading
@@ -2117,7 +2118,8 @@ def _raw_status_bucket(status: Any, worker_status: Any) -> str:
 
 
 def _normalize_write_path(path: Any) -> str:
-    return str(path or "").replace("\\", "/").lstrip("./")
+    value = str(path or "").replace("\\", "/")
+    return re.sub(r"^(?:\./|/)+", "", value)
 
 
 def _write_path_touches(candidate: str, watched: str) -> bool:

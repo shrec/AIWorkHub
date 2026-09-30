@@ -3545,7 +3545,8 @@ def _task_contract_path(raw: Any) -> str:
         or "." in leaf
     ):
         return ""
-    return value.lstrip("./")
+    value = re.sub(r"^(?:\./)+", "", value)
+    return value
 
 
 def _paths_overlap(left: str, right: str, *, glob_aware: bool) -> bool:
@@ -6299,6 +6300,21 @@ def reject_review(
             return residual_error("residual_identities_require_pending_rework")
         if not residual_identities or len(residual_identities) > 256:
             return residual_error("invalid_residual_identities")
+        raw_allowed = card.get("allowed_writes")
+        raw_allowed = raw_allowed if isinstance(raw_allowed, list) else []
+        allowed_write_paths = [
+            path
+            for path in (_task_contract_path(v) for v in raw_allowed)
+            if path
+        ]
+
+        def _residual_within_allowed_write(residual: str, allowed: str) -> bool:
+            if residual == allowed:
+                return True
+            if any(ch in allowed for ch in "*?["):
+                return fnmatch.fnmatchcase(residual, allowed)
+            return residual.startswith(allowed.rstrip("/") + "/")
+
         seen_residuals: set[tuple[str, str]] = set()
         for index, row in enumerate(residual_identities):
             if not isinstance(row, dict):
@@ -6312,6 +6328,18 @@ def reject_review(
                 or "\x00" in pointer
             ):
                 return residual_error("invalid_residual_identities", index=index)
+            has_unsafe_shape = (
+                any(ch in path for ch in "*?[]")
+                or any(seg in (".", "..") for seg in path.split("/"))
+                or path.endswith("/")
+                or path.startswith("/")
+                or (len(path) > 1 and path[1] == ":")
+            )
+            if has_unsafe_shape or not any(
+                _residual_within_allowed_write(path, allowed)
+                for allowed in allowed_write_paths
+            ):
+                return residual_error("residual_artifact_outside_scope", index=index)
             key = (path, pointer)
             if key in seen_residuals:
                 continue
