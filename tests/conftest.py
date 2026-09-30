@@ -320,6 +320,42 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
 # still hits the sandbox's raw ``OSError`` as a hard failure. Wrap both
 # primitives so a denial becomes the same explicit skip instead; a capable
 # host leaves both primitives untouched.
+#
+# NF-2026-01163: the wrappers must never raise a ``BaseException``.
+# ``pytest.skip`` raises ``Skipped``, which is one, and pytest itself calls
+# ``Path.symlink_to`` while building every ``tmp_path``
+# (``_pytest.pathlib._force_symlink`` guards it with ``except Exception``), so
+# the skip escaped that handler and EVERY test that merely requested
+# ``tmp_path`` was reported ``sandbox_capability_denied:symlink`` while the
+# session still exited 0. The wrappers raise ``SymlinkCapabilityDenied``
+# instead -- a plain ``OSError`` -- so pytest's own handler, and every
+# production ``except OSError``, behaves exactly as it does without the guard.
+# The conversion to a skip happens in ``pytest_runtest_makereport`` below,
+# which sees only the denials that actually escaped a test.
+
+# The reason ``_skip_unless_capable`` builds for the marker path, reused so
+# both routes name the denied capability identically.
+SYMLINK_CAPABILITY_DENIED_REASON = "sandbox_capability_denied:symlink"
+
+
+class SymlinkCapabilityDenied(OSError):
+    """A symlink primitive the sandbox denied, raised as a plain ``OSError``."""
+
+
+def _as_symlink_capability_denial(exc: OSError) -> SymlinkCapabilityDenied:
+    """Rebuild ``exc`` as a ``SymlinkCapabilityDenied``, keeping everything a
+    caller inspecting the error would read: ``errno``, ``strerror``,
+    ``filename``, ``filename2`` and, where the platform has one, ``winerror``.
+    """
+
+    denied = SymlinkCapabilityDenied(exc.errno, exc.strerror, exc.filename)
+    denied.filename2 = exc.filename2
+    winerror = getattr(exc, "winerror", None)
+    if winerror is not None:
+        denied.winerror = winerror
+    return denied
+
+
 def _install_symlink_skip_guard(monkeypatch: pytest.MonkeyPatch) -> None:
     if can_create_symlink():
         return
@@ -334,21 +370,27 @@ def _install_symlink_skip_guard(monkeypatch: pytest.MonkeyPatch) -> None:
             errno.ENOSYS,
         }
 
+    # ``Path.symlink_to`` reaches ``os.symlink``, so a denial the other wrapper
+    # already converted propagates unchanged instead of being wrapped twice.
     def _symlink_to(self, *args, **kwargs):
         try:
             return original_symlink_to(self, *args, **kwargs)
+        except SymlinkCapabilityDenied:
+            raise
         except OSError as exc:
             if not _is_symlink_capability_denial(exc):
                 raise
-            pytest.skip("sandbox_capability_denied:symlink")
+            raise _as_symlink_capability_denial(exc) from exc
 
     def _os_symlink(*args, **kwargs):
         try:
             return original_os_symlink(*args, **kwargs)
+        except SymlinkCapabilityDenied:
+            raise
         except OSError as exc:
             if not _is_symlink_capability_denial(exc):
                 raise
-            pytest.skip("sandbox_capability_denied:symlink")
+            raise _as_symlink_capability_denial(exc) from exc
 
     monkeypatch.setattr(Path, "symlink_to", _symlink_to)
     monkeypatch.setattr(os, "symlink", _os_symlink)
@@ -357,3 +399,32 @@ def _install_symlink_skip_guard(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.fixture(autouse=True)
 def _skip_on_symlink_capability_denied(monkeypatch: pytest.MonkeyPatch) -> None:
     _install_symlink_skip_guard(monkeypatch)
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo):
+    """Report a symlink capability denial that ESCAPED a test as the skip.
+
+    The wrappers raise an ``OSError`` so pytest's own ``tmp_path`` symlink and
+    every production ``except OSError`` keep working (NF-2026-01163); a denial
+    that survived to the report is one the test itself needed the capability
+    for, which is exactly the case NF-2026-01150 skips.
+    """
+
+    report = yield
+    if report.when not in {"setup", "call"} or not report.failed:
+        return report
+    if call.excinfo is None or not isinstance(
+        call.excinfo.value, SymlinkCapabilityDenied
+    ):
+        return report
+    path, line = item.reportinfo()[:2]
+    report.outcome = "skipped"
+    # The 3-tuple ``longrepr`` pytest itself builds for a skip, so the reason
+    # reaches ``-rs``, the JUnit report and every other report consumer.
+    report.longrepr = (
+        os.fspath(path),
+        (line or 0) + 1,
+        f"Skipped: {SYMLINK_CAPABILITY_DENIED_REASON}",
+    )
+    return report

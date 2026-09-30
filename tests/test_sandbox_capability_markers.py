@@ -101,7 +101,7 @@ def test_capability_probes_are_cached_across_calls() -> None:
     assert conftest.can_create_symlink.cache_info().hits >= 1
 
 
-def test_symlink_denial_is_converted_to_skip_with_reason(
+def test_symlink_denial_is_converted_to_a_capability_denial_oserror(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setattr(conftest, "can_create_symlink", lambda: False)
@@ -113,9 +113,14 @@ def test_symlink_denial_is_converted_to_skip_with_reason(
 
     monkeypatch.setattr(conftest.os, "symlink", _raise_denied)
 
-    with pytest.raises(pytest.skip.Exception) as excinfo:
+    with pytest.raises(conftest.SymlinkCapabilityDenied) as excinfo:
         (tmp_path / "source").symlink_to(tmp_path / "target")
-    assert excinfo.value.msg == "sandbox_capability_denied:symlink"
+    assert excinfo.value.errno == errno.EPERM
+    assert excinfo.value.strerror == "denied"
+    # NF-2026-01163: an ``Exception``, never pytest's ``BaseException`` skip,
+    # so pytest's own ``except Exception`` around tmp_path still catches it.
+    assert isinstance(excinfo.value, Exception)
+    assert not isinstance(excinfo.value, pytest.skip.Exception)
 
 
 def test_symlink_capability_available_installs_nothing(
@@ -146,7 +151,7 @@ def test_non_capability_oserror_from_symlink_primitive_is_never_converted(
         conftest.os.symlink(tmp_path / "target", tmp_path / "source")
 
 
-def test_symlink_primitive_capability_denial_errno_is_converted_to_skip(
+def test_symlink_primitive_capability_denial_errno_is_converted_to_denial(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setattr(conftest, "can_create_symlink", lambda: False)
@@ -157,6 +162,10 @@ def test_symlink_primitive_capability_denial_errno_is_converted_to_skip(
     monkeypatch.setattr(conftest.os, "symlink", _raise_denied)
     conftest._install_symlink_skip_guard(monkeypatch)
 
-    with pytest.raises(pytest.skip.Exception) as excinfo:
+    with pytest.raises(conftest.SymlinkCapabilityDenied) as excinfo:
         conftest.os.symlink(tmp_path / "target", tmp_path / "source")
-    assert excinfo.value.msg == "sandbox_capability_denied:symlink"
+    assert excinfo.value.errno == errno.EPERM
+    # NF-2026-01163: an ``Exception``, never pytest's ``BaseException`` skip,
+    # so pytest's own ``except Exception`` around tmp_path still catches it.
+    assert isinstance(excinfo.value, Exception)
+    assert not isinstance(excinfo.value, pytest.skip.Exception)
