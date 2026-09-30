@@ -62,6 +62,11 @@ ACCEPT_BLOCKER_KINDS = (
     "explicit_human_approval_missing",       # 5 of 159
     "destructive_diff_requires_manager_confirmation",
     "reviewer_state_unknown",  # ledger unreadable: neither running nor missing
+    # A reviewer that finished and reported it could not READ its packet. Named
+    # here because the accept fold refuses with it and the preview now predicts
+    # it (NF-2026-01158) -- a caller branching on this closed set has to be able
+    # to see it without matching prose.
+    "reviewer_could_not_inspect",
 )
 
 
@@ -418,6 +423,27 @@ def _refinement_blockers(reviewers: list[dict[str, Any]]) -> list[dict[str, Any]
     return blockers
 
 
+def _blind_reviewer_lenses(reviewers: list[dict[str, Any]]) -> set[str]:
+    """Lenses whose ALREADY-SEALED reports show that nothing inspected them.
+
+    Literally ``quality_evidence.blind_reviewer_lenses`` -- the classifier
+    :func:`quality_evidence.fold_quality_verdict` decides acceptance with -- over
+    the very receipts the accept path would read. Sharing the function, rather
+    than restating the rule, is the whole point: a second hand-written copy of
+    "what counts as blind" is how a preview starts promising an acceptance the
+    gate then refuses.
+
+    Only ``receipt.report`` is consulted, and that receipt was verified and
+    sealed by the server: nothing here re-verifies anything, and no report a
+    model, worker or manager supplied can reach this function.
+    """
+    return quality_evidence.blind_reviewer_lenses(
+        reviewer["receipt"].get("report")
+        for reviewer in reviewers
+        if isinstance(reviewer.get("receipt"), Mapping)
+    )
+
+
 # ---------------------------------------------------------------------------
 # Supplemental inspection, on the production accept path.
 #
@@ -741,7 +767,24 @@ def fold_accept_blockers(
                     } if live is not None else {}),
                 )
             )
-    blockers.extend(_refinement_blockers([row for row in chosen if row["usable"]]))
+    evidence_rows = [row for row in chosen if row["usable"]]
+    blockers.extend(_refinement_blockers(evidence_rows))
+    # NF-2026-01158: the refusal the accept fold WILL make for a lens nothing
+    # inspected, predicted here from the same already-verified receipts with the
+    # fold's own classifier -- so a manager never reads a clear preview and then
+    # meets ``reviewer_could_not_inspect:<lens>`` after paying for a combined
+    # tree and two validation runs.
+    #
+    # Gated on ``required`` for the same reason ``fold_quality_verdict`` gates it
+    # on ``review_active``: at a tier that runs no attributable review an
+    # unsolicited blind report is non-blocking noise there, so claiming it blocks
+    # here would be a refusal the real path never makes. The lens set itself is
+    # deliberately NOT narrowed to ``required`` -- the fold blocks on a blind
+    # report for any judgment lens, and predicting less would be the same
+    # disagreement in the other direction.
+    if required:
+        for lens in sorted(_blind_reviewer_lenses(evidence_rows)):
+            blockers.append(_blocker("reviewer_could_not_inspect", lens, lens=lens))
     if risk_profile.get("explicit_human_approval_required") and not confirm_high_risk:
         blockers.append(_blocker("explicit_human_approval_missing"))
     if not confirm_destructive_change:
@@ -1881,13 +1924,23 @@ def accept_review(
                 terminal_substatus=str(terminal_review.get("substatus") or ""),
                 confirm_high_risk=confirm_high_risk,
             )
-            if accept_fold["blockers"]:
+            # NF-2026-01158: the blind-lens prediction stays in the fold so
+            # ``accept_preview`` reports it, but refusing on it HERE would skip
+            # the quality-gate path below that launches the one bounded
+            # supplemental round -- ``fold_quality_verdict`` refuses it there
+            # with the same classifier, so preview and accept still agree.
+            early_blockers = [
+                blocker
+                for blocker in accept_fold["blockers"]
+                if blocker["kind"] != "reviewer_could_not_inspect"
+            ]
+            if early_blockers:
                 return {
                     "ok": False,
-                    "error": str(accept_fold["blockers"][0]["error"]),
+                    "error": str(early_blockers[0]["error"]),
                     "request_id": request_id,
                     "task_id": task_id,
-                    "accept_blockers": accept_fold["blockers"],
+                    "accept_blockers": early_blockers,
                     "reviewer_request_ids": accept_fold["reviewer_request_ids"],
                     "reviewer_request_id_source": accept_fold[
                         "reviewer_request_id_source"

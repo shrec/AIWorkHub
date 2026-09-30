@@ -1260,6 +1260,68 @@ def reviewer_report_could_not_inspect(report: Mapping[str, Any]) -> bool:
     return False
 
 
+def blind_reviewer_lenses(reports: Iterable[Any]) -> set[str]:
+    """The judgment lenses NOTHING inspected, from raw reviewer reports.
+
+    A LENS is blind when every report for it is blind and none is sighted: one
+    sighted read of the same packet answers a blind one, which is what lets a
+    supplemental round -- or a fresh reviewer -- clear the lens at all.
+
+    This is the ONE rule behind ``reviewer_could_not_inspect``, and it exists as
+    a function so that the three places that must agree about it cannot drift:
+    :func:`fold_quality_verdict` refuses acceptance with it, ``accept_preview``
+    predicts that refusal with it, and
+    :func:`review_orchestrator.existing_lens_reviewer` refuses to REUSE a
+    reviewer it names (NF-2026-01158, via
+    :func:`reviewer_card_lens_verdict_is_blind`).
+
+    Performs no I/O, trusts no model-supplied pass/fail field, and cannot
+    satisfy a lens: every return value of it only ever ADDS a refusal.
+    """
+
+    blind: set[str] = set()
+    sighted: set[str] = set()
+    for report in reports:
+        if not isinstance(report, Mapping):
+            continue
+        lens = report.get("lens")
+        if not isinstance(lens, str) or lens not in JUDGMENT_LENSES:
+            continue
+        (blind if reviewer_report_could_not_inspect(report) else sighted).add(lens)
+    return blind - sighted
+
+
+def reviewer_card_lens_verdict_is_blind(card: Any, lens: str) -> bool:
+    """True only when a reviewer card's OWN sealed report for ``lens`` is blind.
+
+    The report is read from
+    ``terminal_review.evidence.quality_review_receipt.report`` -- the receipt the
+    server verified and sealed. There is deliberately no parameter through which
+    a model, a worker or a manager could hand this function a report or a
+    verdict: the card is the only input, and a caller that wants a different
+    answer has to make a reviewer produce one.
+
+    A card with no sealed report for this lens is UNKNOWN, never blind, so an
+    unreadable or not-yet-finished reviewer behaves exactly as it did before.
+    Blind is the only answer that changes anything, and all it can do is refuse
+    a reuse -- buying MORE review, never less.
+    """
+
+    if not isinstance(card, Mapping) or not lens:
+        return False
+    terminal = card.get("terminal_review")
+    evidence = terminal.get("evidence") if isinstance(terminal, Mapping) else None
+    receipt = (
+        evidence.get("quality_review_receipt")
+        if isinstance(evidence, Mapping)
+        else None
+    )
+    report = receipt.get("report") if isinstance(receipt, Mapping) else None
+    if not isinstance(report, Mapping) or str(report.get("lens") or "") != lens:
+        return False
+    return lens in blind_reviewer_lenses((report,))
+
+
 def _reviewer_model_for(report: Mapping[str, Any]) -> str:
     """Recover a reviewer's declared model from the raw report it describes.
 
@@ -1429,18 +1491,19 @@ def fold_quality_verdict(
     normalized_reports, schema_errors = normalize_reviewer_reports(raw_reports)
     blockers.extend(schema_errors)
 
-    # Blindness is a property of the REPORT, not of the tier. It is computed up
-    # front for EVERY judgment lens so that both the skipped->passed lift below
-    # and the tier-wide blindness sweep after it can honour it. Previously this
-    # was consumed only inside the required-lenses loop, so a blind reviewer for
-    # a lens the tier did not require (security/code_quality at medium) was
-    # never checked and its report's mere existence lifted the lens to passed.
+    # Blindness is a property of the REPORT, not of the tier, and it is resolved
+    # up front for EVERY judgment lens so that both the skipped->passed lift
+    # below and the tier-wide blindness sweep after it can honour it. Before
+    # NF-2026-00344 it was consumed only inside the required-lenses loop, so a
+    # blind reviewer for a lens the tier did not require (security/code_quality
+    # at medium) was never checked and its report's mere existence lifted the
+    # lens to passed.
     #
     # A LENS is blind when NOTHING inspected it. That is the exact claim
     # ``reviewer_could_not_inspect`` makes, and stating it per LENS rather than
-    # per REPORT is what makes a supplemental round able to answer it: a lens
-    # can now carry a blind first read and a sighted second one, and the second
-    # is a real attributable review of these exact bytes.
+    # per REPORT is what makes a second read able to answer it: a lens can carry
+    # a blind first read and a sighted second one, and the second is a real
+    # attributable review of these exact bytes.
     #
     # This cannot weaken the gate. A lens whose every report is blind is still
     # blind, still never PASSED, and still blocks; a blind report still
@@ -1449,19 +1512,13 @@ def fold_quality_verdict(
     # refuses to do is let one blind reviewer permanently veto a lens that was
     # afterwards actually read, which would make the re-read pointless and
     # leave the chain with no exit but a rerun of the untouched candidate.
-    blind_lenses: set[str] = set()
-    sighted_lenses: set[str] = set()
-    for report in raw_reports:
-        if not isinstance(report, Mapping):
-            continue
-        report_lens = report.get("lens")
-        if not isinstance(report_lens, str) or report_lens not in JUDGMENT_LENSES:
-            continue
-        if reviewer_report_could_not_inspect(report):
-            blind_lenses.add(report_lens)
-        else:
-            sighted_lenses.add(report_lens)
-    blind_lenses -= sighted_lenses
+    #
+    # The rule itself lives in :func:`blind_reviewer_lenses`, stated once:
+    # ``accept_preview`` predicts this fold's refusal with that same function,
+    # and reviewer REUSE is refused with it too (NF-2026-01158), so the preview,
+    # the acceptance and the decision to buy a fresh reviewer cannot disagree
+    # about which lens nothing inspected.
+    blind_lenses: set[str] = blind_reviewer_lenses(raw_reports)
 
     reports_by_lens: dict[str, list[dict[str, Any]]] = {}
     refine_required = False

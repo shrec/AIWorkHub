@@ -388,6 +388,10 @@ class _ReviewerManager:
 
     def __init__(self, repo: Path, events: dict[str, dict] | None = None) -> None:
         self.repo = repo
+        # The same default ``ProcessManager.__init__`` resolves.
+        # ``_live_lens_reviewers`` reads it; a fake without it raises into the
+        # accept path's ``except Exception``, which reports ``state_unknown``.
+        self.process_log_path = repo / process_launcher.PROCESS_LOG_DEFAULT_REL
         self._events = events or {}
 
     def _latest_by_request(self) -> dict[str, dict]:

@@ -17,6 +17,7 @@ from typing import Any, Callable, Iterable, Mapping, Protocol
 from . import (
     db_writer,
     needfix_store,
+    quality_evidence,
     review_lifecycle,
     sqlite_readonly,
     task_engine,
@@ -1439,6 +1440,15 @@ def existing_lens_reviewer(
     stamped claim: it may belong to a superseded claim, so it fails closed.
     Failed, cancelled, superseded or retired reviewers, other claim epochs
     and other lenses return None, so they still launch normally.
+
+    So does a sealed reviewer whose own report for this lens is blind
+    (NF-2026-01158): it is not evidence about this lens, so it is not a
+    reviewer this lens already has. Being the single reuse decision, this is
+    also the single place that rule has to hold -- the launcher's reservation
+    and :meth:`ReviewOrchestrator._adopt_existing_lens_reviewer` both read their
+    answer from here -- and the predicate is
+    :func:`quality_evidence.reviewer_card_lens_verdict_is_blind`, the one the
+    accept fold judges the finished review with.
     """
     identity = {
         "target_task_id": str(target_task_id or ""),
@@ -1486,6 +1496,20 @@ def existing_lens_reviewer(
             and str(event.get("state") or "") in _REVIEWER_SEALED_EVENT_STATES
             and _verified_lens_report(card, identity, lens, task_id)
             and _sealed_reviewer_request_id(card) == str(request_id)
+            # NF-2026-01158: a sealed report that says "I could not read the
+            # packet" is not a verdict ON this lens, so it is disqualified from
+            # the reuse POOL here rather than returned and annotated afterwards.
+            # Returning it made every relaunch hand the caller back the same
+            # blind reviewer with ``reused_existing_reviewer`` True, so the lens
+            # could never be cleared and the chain's only remaining exit was a
+            # rerun of a candidate whose bytes were never in question.
+            #
+            # The predicate is resolved off the ``quality_evidence`` module at
+            # call time and is the SAME one the accept fold and ``accept_preview``
+            # use, which is what keeps this single reuse decision -- the one the
+            # launcher's reservation and the chain's adoption both read -- from
+            # disagreeing with the gate that judges the result.
+            and not quality_evidence.reviewer_card_lens_verdict_is_blind(card, lens)
         ):
             return {**found, "state": "sealed"}
         if live and running is None:

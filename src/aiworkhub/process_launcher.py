@@ -7831,6 +7831,12 @@ class ProcessManager:
                 # decided under the same lock that would reserve, so two launches
                 # never both spawn a provider. Unsealed terminal attempts never
                 # block a supplemental round.
+                #
+                # NF-2026-01158: "already bought" excludes a sealed reviewer whose
+                # own report for this lens says it could not read the packet, so a
+                # relaunch mints a FRESH reviewer instead of the same blind one.
+                # ``existing_lens_reviewer`` owns that predicate for every reuse
+                # site, so nothing about it is re-decided here or downstream.
                 reused = self.existing_lens_reviewer(
                     target_task_id=target_task_id,
                     target_request_id=target_request_id,
@@ -8816,7 +8822,10 @@ class ProcessManager:
             # Another reviewer already owns this exact target and lens; its own
             # card is already bound. Binding THIS reviewer task id to that
             # request would corrupt both, so the reused receipt is returned
-            # untouched and no provider is started.
+            # untouched and no provider is started. Whether one exists at all
+            # is decided in exactly one place -- the reservation's own
+            # ``existing_lens_reviewer`` call -- so a lens whose only reviewer
+            # went blind arrives here with nothing to return (NF-2026-01158).
             return reservation
         request_id = str(reservation["request_id"])
         bound = _bind_visible_card(

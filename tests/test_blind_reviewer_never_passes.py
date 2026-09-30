@@ -11,6 +11,10 @@ lens to passed.
 
 from __future__ import annotations
 
+import inspect
+
+import pytest
+
 from aiworkhub import quality_evidence as qe
 
 
@@ -196,4 +200,90 @@ def test_blind_required_correctness_lens_still_blocks() -> None:
     assert (
         _lens_row(verdict, qe.LENS_CORRECTNESS)["status"]
         == qe.STATUS_REVIEWER_COULD_NOT_INSPECT
+    )
+
+
+def test_a_supplied_pass_never_makes_a_blind_reviewer_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # NF-2026-01158 gave a blind lens a way OUT (a fresh reviewer is bought
+    # instead of the blind one being reused forever). This is the negative
+    # control on that: the way out is a second real review, never a claim that
+    # the first one succeeded.
+    #
+    # Every field below is one a model or a manager might supply to assert a
+    # pass -- on the finding, on the report, and beside the reports -- and the
+    # fold is the only authority, so none of them counts.
+    forged = _report(
+        qe.LENS_CORRECTNESS,
+        findings=[_process_limit_finding()],
+        passed=True,
+        verdict="pass",
+        status="passed",
+        inspected=True,
+        reviewer_could_not_inspect=False,
+        blind=False,
+        usage_observed=True,
+    )
+    verdict = qe.fold_quality_verdict(
+        [_check()],
+        risk_profile=qe.resolve_risk_profile(qe.RISK_MEDIUM),
+        reviewer_reports=[forged],
+        combined_tree_checks=[_check("union")],
+        worker_provider="worker-a",
+    )
+
+    assert verdict["passed"] is False
+    assert verdict["status"] == "unverified"
+    assert (
+        f"reviewer_could_not_inspect:{qe.LENS_CORRECTNESS}"
+        in verdict["blocking_evidence"]
+    )
+    assert (
+        _lens_row(verdict, qe.LENS_CORRECTNESS)["status"]
+        == qe.STATUS_REVIEWER_COULD_NOT_INSPECT
+    )
+    # The shared classifier the recovery path added reaches the same answer, so
+    # the reuse refusal and the accept refusal cannot be talked out of it
+    # separately.
+    assert qe.blind_reviewer_lenses([forged]) == {qe.LENS_CORRECTNESS}
+
+    # And the receipt itself is never a caller's to hand over. The card-side
+    # predicate takes no report parameter, and a card whose sealed report is
+    # blind stays blind however the card is decorated around it.
+    card = {
+        "task_id": "QR-FORGED",
+        "passed": True,
+        "quality_gate": {"passed": True},
+        "terminal_review": {
+            "substatus": "review_ready",
+            "evidence": {
+                "quality_review_receipt": {
+                    "report": forged, "passed": True, "verdict": "pass",
+                },
+            },
+        },
+    }
+    assert (
+        qe.reviewer_card_lens_verdict_is_blind(card, qe.LENS_CORRECTNESS) is True
+    )
+    assert list(
+        inspect.signature(qe.reviewer_card_lens_verdict_is_blind).parameters
+    ) == ["card", "lens"]
+
+    # Patching the classifier is a TEST-only capability, not a production seam:
+    # nothing in the accept path lets a caller reach it, so the fold's refusal
+    # is unchanged even when the predicate is silenced.
+    monkeypatch.setattr(qe, "reviewer_card_lens_verdict_is_blind", lambda *_a: False)
+    silenced = qe.fold_quality_verdict(
+        [_check()],
+        risk_profile=qe.resolve_risk_profile(qe.RISK_MEDIUM),
+        reviewer_reports=[forged],
+        combined_tree_checks=[_check("union")],
+        worker_provider="worker-a",
+    )
+    assert silenced["passed"] is False
+    assert (
+        f"reviewer_could_not_inspect:{qe.LENS_CORRECTNESS}"
+        in silenced["blocking_evidence"]
     )
