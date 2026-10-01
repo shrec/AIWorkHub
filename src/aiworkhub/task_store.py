@@ -4289,6 +4289,287 @@ _NO_CANDIDATE_RECOVERY_SUBSTATUSES: frozenset[str] = frozenset(
 )
 
 
+def _workspace_has_link_component(repo: Path, workspace: Path) -> bool:
+    """True when any component from ``repo`` down to ``workspace`` is a link.
+
+    A symlink or junction can make the verified worktree record describe a
+    directory other than the one recovery reasons about, so either refuses.
+    """
+    try:
+        relative = workspace.relative_to(repo)
+    except ValueError:
+        return True
+    current = repo
+    for part in relative.parts:
+        current = current / part
+        try:
+            if current.is_symlink():
+                return True
+            is_junction = getattr(current, "is_junction", None)
+            if is_junction is not None:
+                if is_junction():
+                    return True
+            elif os.name == "nt" and current.exists():
+                # Python < 3.12: a junction is a reparse point that is not a
+                # symlink (FILE_ATTRIBUTE_REPARSE_POINT == 0x400).
+                attributes = getattr(os.lstat(current), "st_file_attributes", 0)
+                if attributes & 0x400:
+                    return True
+        except OSError:
+            return True
+    return False
+
+
+def _request_worktree_path(repo: Path, request_id: str) -> Path:
+    """The canonical isolated worktree path of one launch request."""
+    return repo / ".aiworkhub" / "runtime" / "worktrees" / request_id / "worktree"
+
+
+def _is_present_request_worktree_metadata(
+    root: str | Path, terminal_review: dict[str, Any], metadata: Any
+) -> bool:
+    """True when ``metadata`` names this request's own, still present worktree.
+
+    Such metadata carries no candidate of its own; anything else (another
+    request, another path, a candidate authority, an absent worktree) stays
+    with the hash-pinned path exactly as before NF-2026-01160.
+    """
+    if (
+        not isinstance(metadata, dict)
+        or metadata.get("python_candidate_authority") not in (None, {})
+    ):
+        return False
+    request_id = str(terminal_review.get("request_id") or "").strip()
+    if (
+        len(request_id) != 32
+        or any(ch not in "0123456789abcdef" for ch in request_id)
+        or metadata.get("request_id") != request_id
+        or not isinstance(metadata.get("path"), str)
+        or not metadata.get("path")
+    ):
+        return False
+    try:
+        workspace = _request_worktree_path(Path(root).resolve(strict=True), request_id)
+        if not workspace.exists() and not workspace.is_symlink():
+            return False
+        return Path(metadata["path"]).resolve() == workspace.resolve()
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def _worktree_stat_fingerprint(workspace: Path) -> str:
+    """sha256 over every entry's lstat (path, mode, size, mtime_ns) in a worktree.
+
+    It lets the writer lease re-prove content without spawning git. The admin
+    index is deliberately excluded: ``git diff``'s quiet index refresh may
+    rewrite it on a stat-dirty tree whose content is unchanged.
+    """
+
+    def _raise(error: OSError) -> None:
+        raise error
+
+    root_stat = os.lstat(workspace)
+    rows: list[tuple[str, int, int, int]] = [
+        (".", root_stat.st_mode, root_stat.st_size, root_stat.st_mtime_ns)
+    ]
+    # Sequential on purpose: the sparse request tree is small and this walk is
+    # also held under the writer lease, where no worker pool belongs.
+    for dirpath, dirnames, filenames in os.walk(
+        workspace, followlinks=False, onerror=_raise
+    ):
+        base = Path(dirpath)
+        for name in (*dirnames, *filenames):
+            entry = base / name
+            stat = os.lstat(entry)
+            rows.append(
+                (
+                    entry.relative_to(workspace).as_posix(),
+                    stat.st_mode,
+                    stat.st_size,
+                    stat.st_mtime_ns,
+                )
+            )
+    rows.sort()
+    return hashlib.sha256(
+        json.dumps(rows, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _untouched_no_candidate_worktree_proof(
+    repo: Path, workspace: Path, workspace_metadata: dict[str, Any] | None
+) -> dict[str, Any] | None:
+    """Prove a present request worktree carries no content change (NF-01160).
+
+    The trust anchor is the worktree's verified administrative record in
+    ``repo``'s own common directory, and the content proof is promotion's own
+    collector (``changed_paths``), so provisioning-seeded paths are judged by
+    the recorded ``workspace_baseline``. ``git status --porcelain`` is
+    deliberately not used: provisioning live-seeds ``.gitignore``, so real
+    worktrees are stat-dirty while content-identical. An unseeded ignored
+    ``.gitignore`` would hide itself and its siblings from the collector, so
+    one refuses. Any doubt returns ``None``.
+    """
+    from . import worker_workspace as _ww
+
+    if not isinstance(workspace_metadata, dict):
+        return None
+    if _workspace_has_link_component(repo, workspace):
+        return None
+    phase = "nf01160_untouched_proof"
+    try:
+        admin_dir = _ww._verified_worktree_admin_dir(repo, workspace)
+        head = _ww._isolated_worktree_base_oid(repo, workspace)
+        ws = _ww.WorkerWorkspace.from_metadata(dict(workspace_metadata))
+        if (
+            Path(ws.path).resolve() != workspace
+            or Path(ws.repo).resolve() != repo
+            or ws.base_oid != head
+        ):
+            return None
+        git_prefix = [
+            "git",
+            "--git-dir",
+            str(admin_dir),
+            "--work-tree",
+            str(workspace),
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.hooksPath=" + os.devnull,
+        ]
+        fingerprint = _worktree_stat_fingerprint(workspace)
+        if _ww.changed_paths(ws, git_phase=phase, git_timeout=60) != []:
+            return None
+        ignored = _ww._run(
+            [*git_prefix, "ls-files", "--others", "--ignored", "--exclude-standard", "-z"],
+            cwd=admin_dir,
+            timeout=60,
+            phase=phase,
+        )
+        if ignored.returncode != 0:
+            return None
+        for relative in ignored.stdout.split("\x00"):
+            if (
+                relative
+                and relative.rsplit("/", 1)[-1] == ".gitignore"
+                and ws.workspace_baseline.get(relative)
+                != _ww._hash_path(workspace / relative)
+            ):
+                return None
+        ancestry = _ww._run(
+            [
+                "git",
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.hooksPath=" + os.devnull,
+                "merge-base",
+                "--is-ancestor",
+                head,
+                "HEAD",
+            ],
+            cwd=repo,
+            timeout=60,
+            phase=phase,
+        )
+        if ancestry.returncode != 0:
+            return None
+        if _worktree_stat_fingerprint(workspace) != fingerprint:
+            return None
+    except (
+        _ww.WorkspaceError,
+        _ww.GitCommandTimeout,
+        OSError,
+        ValueError,
+        KeyError,
+        TypeError,
+    ):
+        return None
+    return {
+        "schema_id": "aiworkhub.untouched_no_candidate_worktree_proof.v1",
+        "repo": str(repo),
+        "workspace": str(workspace),
+        "admin_dir": str(admin_dir),
+        "head_oid": head,
+        "tree_fingerprint": fingerprint,
+    }
+
+
+def _untouched_proof_still_holds(
+    repo: Path, workspace: Path, proof: dict[str, Any] | None
+) -> bool:
+    """Re-check a pre-lease proof under the writer lease without spawning git."""
+    from . import worker_workspace as _ww
+
+    if (
+        not isinstance(proof, dict)
+        or proof.get("repo") != str(repo)
+        or proof.get("workspace") != str(workspace)
+        or not isinstance(proof.get("head_oid"), str)
+        or not isinstance(proof.get("tree_fingerprint"), str)
+    ):
+        return False
+    if _workspace_has_link_component(repo, workspace):
+        return False
+    try:
+        head = _ww._isolated_worktree_base_oid(repo, workspace)
+        fingerprint = _worktree_stat_fingerprint(workspace)
+    except (_ww.WorkspaceError, OSError, ValueError):
+        return False
+    return head == proof["head_oid"] and fingerprint == proof["tree_fingerprint"]
+
+
+def _pre_lease_untouched_no_candidate_proof(
+    root: str | Path, db_path: Path, task_id: str
+) -> dict[str, Any] | None:
+    """Run the untouched-worktree proof before the lease, only when it applies.
+
+    Applies only to a no-candidate terminal failure whose worktree is present;
+    every other card (and an absent worktree) runs no git at all.
+    """
+    try:
+        conn = _connect(db_path, readonly=True)
+        try:
+            row = conn.execute(
+                "SELECT card_json FROM tasks WHERE task_id=?", (task_id,)
+            ).fetchone()
+        finally:
+            conn.close()
+        card = json.loads(str(row["card_json"] or "{}")) if row is not None else None
+    except (sqlite3.Error, OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(card, dict):
+        return None
+    failure = card.get("terminal_failure")
+    if not isinstance(failure, dict):
+        return None
+    evidence = failure.get("evidence")
+    if (
+        str(failure.get("substatus") or "").strip()
+        not in _NO_CANDIDATE_RECOVERY_SUBSTATUSES
+        or not isinstance(evidence, dict)
+        or evidence.get("changed_paths") not in (None, [])
+        or evidence.get("changed_path_hashes") not in (None, {})
+    ):
+        return None
+    request_id = str(failure.get("request_id") or "").strip()
+    if len(request_id) != 32 or any(ch not in "0123456789abcdef" for ch in request_id):
+        return None
+    try:
+        repo = Path(root).resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    workspace = _request_worktree_path(repo, request_id)
+    if not workspace.exists() and not workspace.is_symlink():
+        return None
+    workspace_metadata = evidence.get("workspace")
+    return _untouched_no_candidate_worktree_proof(
+        repo,
+        workspace,
+        workspace_metadata if isinstance(workspace_metadata, dict) else None,
+    )
+
+
 def _clean_root_no_candidate_failure_authority(
     root: str | Path,
     task_id: str,
@@ -4296,12 +4577,15 @@ def _clean_root_no_candidate_failure_authority(
     card: dict[str, Any],
     terminal_review: dict[str, Any],
     terminal_runner: str,
+    untouched_proof: dict[str, Any] | None = None,
 ) -> tuple[bool, str, dict[str, Any]]:
     """Authenticate one terminal provider failure that produced no candidate.
 
     This is deliberately narrower than retained-candidate recovery: it applies
     only when the terminal event is the card's exact event, no candidate
-    metadata or bytes exist, and the request worktree is absent.
+    metadata or bytes exist, and the request worktree is absent -- or present
+    but proven untouched by ``untouched_proof`` (NF-2026-01160), re-checked
+    here under the writer lease.
     """
 
     recorded_failure = card.get("terminal_failure")
@@ -4323,11 +4607,19 @@ def _clean_root_no_candidate_failure_authority(
 
     # Any candidate-bearing evidence belongs to the existing hash-pinned path.
     # Returning not_applicable lets that path validate it without weakening it.
+    # NF-2026-01160: workspace metadata naming this request's own, still
+    # present worktree is not a candidate (the hash-pinned path refuses empty
+    # changed_paths); it is what the untouched-worktree proof judges.
     if (
         evidence.get("changed_paths") not in (None, [])
         or evidence.get("changed_path_hashes") not in (None, {})
         or evidence.get("python_candidate_authority") not in (None, {})
-        or evidence.get("workspace") not in (None, {})
+        or (
+            evidence.get("workspace") not in (None, {})
+            and not _is_present_request_worktree_metadata(
+                root, terminal_review, evidence.get("workspace")
+            )
+        )
     ):
         return False, "clean_root_no_candidate_not_applicable", {}
 
@@ -4383,14 +4675,7 @@ def _clean_root_no_candidate_failure_authority(
 
     try:
         expected_repo = Path(root).resolve(strict=True)
-        expected_workspace = (
-            expected_repo
-            / ".aiworkhub"
-            / "runtime"
-            / "worktrees"
-            / request_id
-            / "worktree"
-        )
+        expected_workspace = _request_worktree_path(expected_repo, request_id)
     except (OSError, RuntimeError, ValueError):
         return False, "clean_root_no_candidate_repo_invalid", {}
     request_repo = (
@@ -4403,10 +4688,7 @@ def _clean_root_no_candidate_failure_authority(
         or request_repo not in (None, "", str(expected_repo))
     ):
         return False, "clean_root_no_candidate_identity_invalid", {}
-    if expected_workspace.exists() or expected_workspace.is_symlink():
-        return False, "clean_root_no_candidate_workspace_still_available", {}
-
-    return True, "authenticated", {
+    authority: dict[str, Any] = {
         "schema_id": "aiworkhub.clean_root_no_candidate_authority.v1",
         "predecessor_request_id": request_id,
         "predecessor_claim_epoch": claim_epoch,
@@ -4416,6 +4698,23 @@ def _clean_root_no_candidate_failure_authority(
         "terminal_substatus": terminal_substatus,
         "recovery_mode": "clean_root_no_candidate_terminal_failure",
     }
+    if expected_workspace.exists() or expected_workspace.is_symlink():
+        # NF-2026-01160: a launch that exited before doing any work leaves its
+        # worktree behind. It is admitted only with a pre-lease content proof
+        # whose anchor (link-free path, same verified HEAD, same stat
+        # fingerprint) still holds now; a worktree with any change never
+        # carries such a proof.
+        if not _untouched_proof_still_holds(
+            expected_repo, expected_workspace, untouched_proof
+        ):
+            return False, "clean_root_no_candidate_workspace_still_available", {}
+        assert untouched_proof is not None
+        # The v1 key set is kept: the worktree is present, so nothing is missing.
+        authority["missing_workspace"] = None
+        authority["untouched_workspace"] = str(expected_workspace)
+        authority["untouched_worktree_proof"] = dict(untouched_proof)
+
+    return True, "authenticated", authority
 
 
 def retry_finalize_failed(
@@ -4859,6 +5158,14 @@ def recover_blocked_rework(
         )
     except (OSError, ValueError):
         return False, "successful_rework_artifacts_invalid"
+    # NF-2026-01160: the untouched-worktree proof spawns git, so it runs here,
+    # before the lease; under the lease nothing is spawned: its HEAD anchor is
+    # re-read and its worktree stat fingerprint recomputed and compared.
+    untouched_proof = (
+        _pre_lease_untouched_no_candidate_proof(root, db_path, task_id)
+        if clean_root_if_predecessor_missing and not validation_only_replay
+        else None
+    )
     # Serialized on the same lease as the terminal transitions. Its four
     # ``conn.commit()`` calls are MUTUALLY EXCLUSIVE branch exits, not four
     # sequential transactions -- every one is immediately followed by a
@@ -5758,6 +6065,7 @@ def recover_blocked_rework(
                 card=card,
                 terminal_review=terminal_review,
                 terminal_runner=str(terminal_row["runner"] or ""),
+                untouched_proof=untouched_proof,
             )
             if no_candidate_allowed:
                 clean_root_terminal_failure_evidence = no_candidate_evidence
