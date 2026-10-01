@@ -65,6 +65,7 @@ class _Kernel32:
         self.CreateJobObjectW = _Function(71)
         self.SetInformationJobObject = _Function(1)
         self.AssignProcessToJobObject = _Function(1)
+        self.TerminateJobObject = _Function(1)
         self.CloseHandle = _Function(1)
 
 
