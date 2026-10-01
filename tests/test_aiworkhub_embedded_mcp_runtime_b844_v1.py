@@ -44,9 +44,9 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 
-def _vsix_path() -> Path:
-    """Always (re)build the VSIX from the CURRENT source and return exactly that
-    freshly-built artifact.
+def _vsix_path(output_dir: Path) -> Path:
+    """Always (re)build the VSIX from the CURRENT source into ``output_dir``
+    and return exactly that freshly-built artifact.
 
     An earlier version globbed ``dist/aiworkhub-*.vsix`` and returned
     ``sorted(...)[-1]``. That sort is lexicographic, so a dist/ holding many
@@ -54,25 +54,55 @@ def _vsix_path() -> Path:
     after "...-0.6.31") -- a stale bundle. The test then validated OLD bundled
     output and silently passed local source changes, while CI (with an empty
     dist/) built fresh and failed. Building fresh every time makes this test
-    validate the current extension.js/runtime deterministically on every host.
+    validate the current extension.js/runtime deterministically on every host,
+    now routed through ``AIWORKHUB_VALIDATION_EXEC_SCRATCH_ROOT`` into
+    ``output_dir`` so the build never touches the release ``dist/`` directory.
     """
-    dist = EXT_DIR / "dist"
     version = json.loads((EXT_DIR / "package.json").read_text(encoding="utf-8"))["version"]
     subprocess.run(
-        ["node", "test/package-vsix.js"], cwd=str(EXT_DIR), check=True, timeout=120
+        ["node", "test/package-vsix.js"],
+        cwd=str(EXT_DIR),
+        check=True,
+        timeout=120,
+        env={**os.environ, "AIWORKHUB_VALIDATION_EXEC_SCRATCH_ROOT": str(output_dir)},
     )
-    built = dist / f"aiworkhub-{version}.vsix"
+    built = output_dir / f"aiworkhub-{version}.vsix"
     assert built.is_file(), f"packaging step did not produce {built.name}"
     return built
 
 
+def _dist_vsix_snapshot(dist: Path) -> dict[str, tuple[int, int]]:
+    if not dist.is_dir():
+        return {}
+    return {p.name: (p.stat().st_size, p.stat().st_mtime_ns) for p in dist.glob("*.vsix")}
+
+
 @pytest.fixture(scope="module")
-def extracted_vsix(tmp_path_factory):
-    vsix = _vsix_path()
+def built_vsix(tmp_path_factory):
+    dist = EXT_DIR / "dist"
+    dist_before = _dist_vsix_snapshot(dist)
+    output_dir = tmp_path_factory.mktemp("vsix_build")
+    vsix = _vsix_path(output_dir)
+    return {"path": vsix, "dist_before": dist_before}
+
+
+@pytest.fixture(scope="module")
+def extracted_vsix(tmp_path_factory, built_vsix):
     dest = tmp_path_factory.mktemp("vsix_extract")
-    with zipfile.ZipFile(vsix) as zf:
+    with zipfile.ZipFile(built_vsix["path"]) as zf:
         zf.extractall(dest)
     return dest
+
+
+def test_packaging_fixture_leaves_release_dist_untouched(built_vsix):
+    dist = EXT_DIR / "dist"
+    dist_after = _dist_vsix_snapshot(dist)
+    assert dist_after == built_vsix["dist_before"]
+
+    built = built_vsix["path"].resolve()
+    dist_resolved = dist.resolve()
+    assert dist_resolved != built.parent
+    assert dist_resolved not in built.parents
 
 
 # ---------------------------------------------------------------------------
