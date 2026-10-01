@@ -72,6 +72,10 @@ MIN_MAX_OUTPUT_BYTES = 1024
 MAX_TOTAL_OUTPUT_BYTES = 1024 * 1024 * 1024
 _TRUNCATION_MARKER = b"\n[AIWorkHub: earlier worker output truncated; latest bytes retained]\n"
 _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+# Attribute under which supervise() records the kill-on-close Job a spawned
+# child was assigned to, so _terminate_child can escalate to it without a new
+# parameter -- the callers wrap _terminate_child with a single-argument shim.
+_KILL_JOB_ATTR = "_aiworkhub_kill_on_close_job"
 MAX_USAGE_SCAN_BYTES = 32 * 1024 * 1024
 MAX_PROGRESS_SCAN_BYTES = 128 * 1024
 TRUSTED_PROGRESS_ADAPTERS = {"vscode_lm", "deepseek_vscode_lm", "glm_vscode_lm"}
@@ -96,6 +100,8 @@ class _WindowsKillOnCloseJob:
         kernel32.SetInformationJobObject.restype = ctypes.c_int
         kernel32.AssignProcessToJobObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
         kernel32.AssignProcessToJobObject.restype = ctypes.c_int
+        kernel32.TerminateJobObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        kernel32.TerminateJobObject.restype = ctypes.c_int
         kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
         kernel32.CloseHandle.restype = ctypes.c_int
         handle = kernel32.CreateJobObjectW(None, None)
@@ -115,6 +121,18 @@ class _WindowsKillOnCloseJob:
     def assign(self, child: subprocess.Popen[bytes]) -> None:
         if self._handle is None or not self._kernel32.AssignProcessToJobObject(
             self._handle, int(child._handle)  # type: ignore[attr-defined]
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+
+    def terminate(self, exit_code: int = 1) -> None:
+        """Kill every process in this Job, keeping the handle open to wait on.
+
+        NF-2026-01166: this is the tree kill the supervisor owns outright. It
+        needs no pid lookup and no helper executable, so it still works where
+        `taskkill` is refused.
+        """
+        if self._handle is None or not self._kernel32.TerminateJobObject(
+            self._handle, ctypes.c_uint32(exit_code)
         ):
             raise ctypes.WinError(ctypes.get_last_error())
 
@@ -688,19 +706,97 @@ def _launch_appcontainer_process(
         raise
 
 
+class ChildTerminationError(RuntimeError):
+    """A child outlived every termination primitive the supervisor owns."""
+
+
+def _wait_for_child_exit(child: Any, grace: float) -> int | None:
+    """Return the child's exit code, or None if it is still alive after grace."""
+    try:
+        return int(child.wait(timeout=grace))
+    except subprocess.TimeoutExpired:
+        return None
+
+
+def _windows_tree_kill(pid: int, grace: float) -> str:
+    """Attempt a `taskkill /T` tree kill; return "" on success, else why it failed.
+
+    NF-2026-01166: inside the Windows AppContainer worker sandbox this exits 1
+    with "ERROR: The user name or password is incorrect." and leaves the child
+    running, so the outcome has to be read rather than discarded. A taskkill
+    that hangs must not block the rest of the ladder either, so it is bounded
+    by the caller's own grace period.
+    """
+    try:
+        completed = subprocess.run(
+            ["taskkill", "/F", "/PID", str(pid), "/T"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            check=False,
+            shell=False,
+            timeout=grace,
+        )
+    except subprocess.TimeoutExpired:
+        return f"timeout_after_{grace}s"
+    except OSError as exc:
+        return f"{type(exc).__name__}:{exc}"[:200]
+    if completed.returncode == 0:
+        return ""
+    detail = (completed.stderr or b"").decode("utf-8", errors="replace").strip()
+    return f"exit_{completed.returncode}:{detail}"[:200]
+
+
+def _terminate_child_windows(child: Any, grace: float) -> int:
+    """End a live Windows child, escalating to the handles the supervisor owns.
+
+    The tree kill stays the first attempt because it is the only one that
+    reaches grandchildren by pid. When it cannot do its job the supervisor
+    falls back to what it holds directly -- the kill-on-close Job this child
+    was assigned to, then the child handle itself -- and raises rather than
+    returning an exit code while the child is still alive.
+    """
+    tree_kill_error = _windows_tree_kill(child.pid, grace)
+    # A tree kill that ran is given the full grace period. One that failed is
+    # given none: waiting on it is exactly the TimeoutExpired that used to
+    # escape this function with the child still running.
+    if tree_kill_error:
+        returncode = child.poll()
+    else:
+        returncode = _wait_for_child_exit(child, grace)
+    if returncode is not None:
+        return int(returncode)
+    attempts = [f"taskkill:{tree_kill_error or 'child_survived'}"]
+    job = getattr(child, _KILL_JOB_ATTR, None)
+    if job is not None:
+        try:
+            job.terminate()
+        except OSError as exc:
+            attempts.append(f"kill_on_close_job:{type(exc).__name__}:{exc}")
+        else:
+            attempts.append("kill_on_close_job:terminated")
+            returncode = _wait_for_child_exit(child, grace)
+            if returncode is not None:
+                return returncode
+    try:
+        child.kill()
+    except OSError as exc:
+        attempts.append(f"child_handle:{type(exc).__name__}:{exc}")
+    else:
+        attempts.append("child_handle:killed")
+    returncode = _wait_for_child_exit(child, grace)
+    if returncode is not None:
+        return returncode
+    raise ChildTerminationError(
+        f"child_pid={child.pid} still alive after " + ", ".join(attempts)
+    )
+
+
 def _terminate_child(child: Any, grace: float = KILL_GRACE_SECONDS) -> int:
     if isinstance(child, _AppContainerProcess):
         child.terminate()
         return int(child.wait(timeout=grace))
     if os.name == "nt":
-        subprocess.run(
-            ["taskkill", "/F", "/PID", str(child.pid), "/T"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-            shell=False,
-        )
-        return int(child.wait(timeout=grace))
+        return _terminate_child_windows(child, grace)
     try:
         os.killpg(child.pid, signal.SIGTERM)
     except ProcessLookupError:
@@ -1052,6 +1148,10 @@ def supervise(spec: dict[str, Any], *, stdin_text: str | None = None) -> int:
                 if windows_job is not None:
                     spawn_phase = "job_assignment"
                     windows_job.assign(child)
+                    # NF-2026-01166: remember the Job this child just joined so
+                    # _terminate_child can escalate to a supervisor-owned tree
+                    # kill when `taskkill` cannot do its job.
+                    setattr(child, _KILL_JOB_ATTR, windows_job)
         except Exception as exc:
             if child is not None and child.poll() is None:
                 _terminate_child(child)

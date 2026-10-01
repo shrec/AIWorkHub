@@ -1354,3 +1354,270 @@ def test_fake_clock_simulated_appcontainer_hard_deadline(
     assert status["state"] == "timed_out"
     _assert_hard_deadline(status, timeout_seconds)
     assert status["exit_code"] == 1
+
+
+def _live_sleeping_child(tmp_path: Path) -> subprocess.Popen:
+    return subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        cwd=str(tmp_path),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        shell=False,
+    )
+
+
+@pytest.mark.parametrize("tree_kill_failure", ["nonzero_exit", "missing_executable"])
+def test_terminate_child_ends_live_child_when_tree_kill_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tree_kill_failure: str
+) -> None:
+    """NF-2026-01166: a tree kill that cannot do its job must not be fatal.
+
+    Inside the Windows AppContainer worker sandbox `taskkill /F /PID <pid> /T`
+    exits 1 with "ERROR: The user name or password is incorrect." and the child
+    keeps running; a bare-name taskkill that cannot be resolved raises
+    FileNotFoundError instead. Either way the supervisor must still end the
+    child it spawned, using a handle it owns, and report that child's real exit
+    code -- it previously raised TimeoutExpired with the child still alive.
+    """
+    child = _live_sleeping_child(tmp_path)
+    try:
+        taskkill_calls: list[list[str]] = []
+
+        def fake_run(argv, **kwargs):
+            taskkill_calls.append([str(part) for part in argv])
+            if tree_kill_failure == "missing_executable":
+                raise FileNotFoundError(2, "The system cannot find the file specified")
+            return subprocess.CompletedProcess(
+                argv, 1, b"", b"ERROR: The user name or password is incorrect.\r\n"
+            )
+
+        # Run the Windows escalation ladder on every platform. The POSIX branch
+        # is deliberately untouched by this fix, so gating this test on os.name
+        # would leave the regression unguarded on the host that reported it.
+        monkeypatch.setattr(worker_supervisor.os, "name", "nt")
+        monkeypatch.setattr(worker_supervisor.subprocess, "run", fake_run)
+
+        started = time.monotonic()
+        returncode = worker_supervisor._terminate_child(child)
+        elapsed = time.monotonic() - started
+
+        # The tree kill is still attempted first; it is only no longer trusted.
+        assert [call[:2] for call in taskkill_calls] == [["taskkill", "/F"]]
+        assert child.poll() is not None
+        assert returncode is not None
+        assert returncode == child.returncode
+        assert elapsed < worker_supervisor.KILL_GRACE_SECONDS
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=5)
+
+
+def test_terminate_child_raises_rather_than_returning_while_child_is_alive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A termination that failed outright must never look like a clean exit.
+
+    supervise() turns the returned value into a terminal status artifact, so
+    returning any int while the child still runs reports a dead worker that is
+    in fact alive. The raise is what keeps that impossible.
+    """
+
+    class UnkillableChild:
+        pid = 424242
+
+        def __init__(self) -> None:
+            self.kill_calls = 0
+
+        def poll(self) -> None:
+            return None
+
+        def wait(self, timeout=None):
+            raise subprocess.TimeoutExpired("worker", timeout or 0)
+
+        def kill(self) -> None:
+            self.kill_calls += 1
+
+    child = UnkillableChild()
+
+    def fake_run(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 1, b"", b"ERROR: Access is denied.\r\n")
+
+    monkeypatch.setattr(worker_supervisor.os, "name", "nt")
+    monkeypatch.setattr(worker_supervisor.subprocess, "run", fake_run)
+
+    with pytest.raises(worker_supervisor.ChildTerminationError) as raised:
+        worker_supervisor._terminate_child(child, grace=0.01)
+
+    assert child.kill_calls == 1
+    message = str(raised.value)
+    assert "424242" in message
+    # The diagnostic names the primitive that failed instead of hiding it.
+    assert "taskkill" in message
+    assert "Access is denied" in message
+
+
+def test_terminate_child_kill_on_close_job_rung_ends_child_when_tree_kill_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """NF-2026-01166 FINDING 1: the Job rung must actually run, and be trusted.
+
+    child.kill() only reaches the direct child, not grandchildren, so when the
+    tree kill fails the Job this child was assigned to has to be tried next,
+    and trusted when it succeeds, rather than falling through to child.kill()
+    regardless.
+    """
+
+    class StubJob:
+        def __init__(self) -> None:
+            self.terminate_calls = 0
+            self.terminated = False
+
+        def terminate(self) -> None:
+            self.terminate_calls += 1
+            self.terminated = True
+
+    class StubChild:
+        pid = 777777
+
+        def __init__(self, job: StubJob) -> None:
+            self.kill_calls = 0
+            self._job = job
+            setattr(self, worker_supervisor._KILL_JOB_ATTR, job)
+
+        def poll(self):
+            return 0 if self._job.terminated else None
+
+        def wait(self, timeout=None):
+            if self._job.terminated:
+                return 0
+            raise subprocess.TimeoutExpired("worker", timeout or 0)
+
+        def kill(self) -> None:
+            self.kill_calls += 1
+
+    job = StubJob()
+    child = StubChild(job)
+
+    monkeypatch.setattr(worker_supervisor.os, "name", "nt")
+    monkeypatch.setattr(
+        worker_supervisor, "_windows_tree_kill", lambda pid, grace: "forced_failure"
+    )
+
+    returncode = worker_supervisor._terminate_child(child, grace=1.0)
+
+    assert job.terminate_calls == 1
+    assert returncode == 0
+    assert child.kill_calls == 0
+
+
+def test_terminate_child_raises_when_kill_on_close_job_terminate_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """NF-2026-01166 FINDING 1: a Job that refuses to terminate must not be silent.
+
+    The ladder falls through to child.kill() when the Job rung fails, but if
+    the child still never dies the failure must surface as
+    ChildTerminationError and name the rung that failed.
+    """
+
+    class FailingJob:
+        def terminate(self) -> None:
+            raise OSError("job handle is invalid")
+
+    class StubChild:
+        pid = 888888
+
+        def __init__(self) -> None:
+            self.kill_calls = 0
+            setattr(self, worker_supervisor._KILL_JOB_ATTR, FailingJob())
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            raise subprocess.TimeoutExpired("worker", timeout or 0)
+
+        def kill(self) -> None:
+            self.kill_calls += 1
+
+    child = StubChild()
+
+    monkeypatch.setattr(worker_supervisor.os, "name", "nt")
+    monkeypatch.setattr(
+        worker_supervisor, "_windows_tree_kill", lambda pid, grace: "forced_failure"
+    )
+
+    with pytest.raises(worker_supervisor.ChildTerminationError) as raised:
+        worker_supervisor._terminate_child(child, grace=0.01)
+
+    assert child.kill_calls == 1
+    assert "kill_on_close_job:" in str(raised.value)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="exercises real Win32 Job Object calls")
+def test_terminate_child_kill_on_close_job_terminates_real_child(
+    tmp_path: Path,
+) -> None:
+    """NF-2026-01166 FINDING 1: proves the TerminateJobObject ctypes signature.
+
+    The stub-based tests above cover the ladder's control flow only; this is
+    the one test that proves kernel32.TerminateJobObject's argtypes and the
+    Job handle actually end a real assigned child.
+    """
+    child = _live_sleeping_child(tmp_path)
+    job = worker_supervisor._WindowsKillOnCloseJob()
+    try:
+        job.assign(child)
+        job.terminate()
+        returncode = child.wait(timeout=worker_supervisor.KILL_GRACE_SECONDS)
+        assert returncode is not None
+    finally:
+        job.close()
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=5)
+
+
+def test_terminate_child_tree_kill_timeout_falls_back_and_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """NF-2026-01166 FINDING 2: a hung taskkill must not block the ladder forever.
+
+    `_windows_tree_kill` used to call subprocess.run with no timeout, so a
+    taskkill that never returns would hang rung 1 forever and the later
+    rungs -- and the ChildTerminationError guarantee -- were unreachable.
+    """
+
+    class UnkillableChild:
+        pid = 909090
+
+        def __init__(self) -> None:
+            self.kill_calls = 0
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            raise subprocess.TimeoutExpired("worker", timeout or 0)
+
+        def kill(self) -> None:
+            self.kill_calls += 1
+
+    child = UnkillableChild()
+
+    def fake_run(argv, **kwargs):
+        raise subprocess.TimeoutExpired(argv, kwargs.get("timeout"))
+
+    monkeypatch.setattr(worker_supervisor.os, "name", "nt")
+    monkeypatch.setattr(worker_supervisor.subprocess, "run", fake_run)
+
+    started = time.monotonic()
+    with pytest.raises(worker_supervisor.ChildTerminationError) as raised:
+        worker_supervisor._terminate_child(child, grace=0.01)
+    elapsed = time.monotonic() - started
+
+    assert child.kill_calls == 1
+    assert "timeout" in str(raised.value)
+    assert elapsed < 1.0
