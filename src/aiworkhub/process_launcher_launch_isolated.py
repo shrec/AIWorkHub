@@ -1527,6 +1527,10 @@ def launch_isolated(
             blocker_result = task_engine.record_launch_blocker(
                 self.repo, task_id, runner, topic,
                 adapter_id=adapter_id, reason=reason,
+                # NF-2026-01192.  The claimed branch above already names the
+                # request it was launching; this branch dropped it, so the
+                # blocker it recorded could not be matched to the dead launch.
+                request_id=request_id or reserved_request_id or "",
             )
             if not blocker_result.get("ok"):
                 reason += ":launch_blocker_record_failed:" + str(

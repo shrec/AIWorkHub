@@ -2261,6 +2261,13 @@ def claim_start_exact(
         prior_episode = task_store.begin_claim_episode(stored_card)
         stored_card.update(
             claim_epoch=claim_epoch,
+            # A new episode owns its own launch request and inherits none.  A
+            # stale id left on the card by a previous episode is compared against
+            # the next launch's request by every check that guards the claim, so
+            # inheriting one refuses the very launch this claim is for
+            # (NF-2026-01192).  ``task_engine``'s claim already set this field
+            # explicitly; this is the same rule on the CLI claim-start route.
+            launch_request_id=request_id,
             status="processing",
             worker_status="claimed",
             claimed_by=runner,
@@ -7306,6 +7313,49 @@ def automatic_terminal_retry_refusal(card: Mapping[str, Any]) -> str:
     return f"failure_class_{recorded}:{named}"
 
 
+def _blocked_episode_launch_failed_request_id(task_id: str, *, blocked_at: str) -> str:
+    """The request id this card's CURRENT blocked launch_failed episode names.
+
+    Bound to the episode by recorded time.  ``task_store.mark_launch_failed``
+    writes the card's ``blocked_at`` and its ``launch_failed`` event inside one
+    transaction from one timestamp, so equality on that exact instant selects
+    this episode's terminal events and can never reach an earlier episode's --
+    which matters, because borrowing a historical id would let any request this
+    card ever had unlock the one it is blocked on now.
+
+    Returns ``""`` when no such event names a request.  That is the legacy
+    0.12.13/0.12.14 shape this lookup exists to recognise, not an error: the
+    caller fails closed on everything except that measured case.
+    """
+
+    if not blocked_at:
+        return ""
+    try:
+        _readiness, db_path = task_store._require_ready(repo_root())
+        conn = task_store._connect(db_path, readonly=True)
+    except task_store.TaskStoreError:
+        return ""
+    try:
+        rows = conn.execute(
+            "SELECT payload_json FROM task_events WHERE task_id=? "
+            "AND event='launch_failed' AND created_at=? ORDER BY event_id",
+            (task_id, blocked_at),
+        ).fetchall()
+    finally:
+        conn.close()
+    for row in rows:
+        try:
+            payload = json.loads(row["payload_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        named = str(payload.get("request_id") or "").strip()
+        if named:
+            return named
+    return ""
+
+
 def retry_terminal_task(
     task_id: str,
     request_id: str,
@@ -7400,7 +7450,23 @@ def retry_terminal_task(
             "terminal_retry_substatus_mismatch:"
             f"expected={actual_substatus or worker_status}:got={terminal_substatus}"
         )
-    if actual_request_id != request_id:
+    # NF-2026-01192.  A launch rejected in preflight on 0.12.13/0.12.14 recorded
+    # neither a card ``launch_request_id`` nor ``terminal_failure`` evidence, so
+    # neither source above names a request and the blocked card could never be
+    # retried -- ``expected=:got=<id>`` for every id a manager could supply.  The
+    # remaining authority is this blocked episode's OWN ``launch_failed`` event:
+    # where it names a request, that id still decides and a different supplied id
+    # is still refused.  Only when nothing anywhere names one does task identity
+    # plus the terminal substatus plus the card compare-and-swap below carry the
+    # retry, and that weaker linkage is recorded as exactly what it is.
+    request_linkage = ""
+    if not actual_request_id and terminal_substatus == "launch_failed":
+        actual_request_id = _blocked_episode_launch_failed_request_id(
+            task_id, blocked_at=str(card.get("blocked_at") or "")
+        )
+        if not actual_request_id:
+            request_linkage = "legacy_unlinked"
+    if not request_linkage and actual_request_id != request_id:
         return _lifecycle_error(
             f"terminal_retry_request_mismatch:expected={actual_request_id}:got={request_id}"
         )
@@ -7450,6 +7516,11 @@ def retry_terminal_task(
             "terminal_substatus": terminal_substatus,
             "reason": bounded_reason,
             "retried_at": now,
+            # Present only where it happened: a retry accepted because the
+            # episode named no request at all is a weaker fact than one
+            # authenticated against a named id, and the receipt has to say
+            # which of the two this was (NF-2026-01192).
+            **({"request_linkage": request_linkage} if request_linkage else {}),
         },
     )
     encoded_card = json.dumps(semantic_card, ensure_ascii=False, sort_keys=True)

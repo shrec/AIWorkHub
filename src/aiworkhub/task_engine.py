@@ -481,12 +481,20 @@ def record_launch_blocker(
             card = {}
         if not isinstance(card, dict):
             card = {}
-        card["operational_blocker"] = {
+        blocker: dict[str, Any] = {
             "kind": "launch_blocked",
             "adapter_id": str(adapter_id)[:128],
             "reason": str(reason)[:500],
             "observed_at": now,
         }
+        if request_id:
+            # NF-2026-01192.  The pre-claim blocker is the only record this
+            # rejection leaves, so it has to name the request that died; a
+            # blocker with no linkage cannot be matched to the launch it refers
+            # to.  Omitted entirely when the caller names none, so a legacy
+            # blocker payload stays byte-identical.
+            blocker["request_id"] = str(request_id)[:120]
+        card["operational_blocker"] = blocker
         cur = conn.execute(
             "UPDATE tasks SET card_json=?, updated_at=? "
             "WHERE task_id=? AND status='pending' AND worker_status='unclaimed' AND card_json=?",

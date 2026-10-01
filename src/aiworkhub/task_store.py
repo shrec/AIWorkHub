@@ -1981,7 +1981,11 @@ def reconcile_dead_processing_claim(
                 return False, "reconcile_identity_mismatch"
             if canonical_status(dict(row)) != "processing" or str(row["worker_status"] or "") != "claimed":
                 return False, "task_not_processing_claimed"
-            if str(card.get("launch_request_id") or "") != request_id:
+            # A claim whose launch failed in preflight never got an id attached
+            # (NF-2026-01192); the claim epoch below is then the whole identity
+            # check.  A DIFFERENT non-empty attached id is still a contradiction.
+            attached_request_id = str(card.get("launch_request_id") or "")
+            if attached_request_id and attached_request_id != request_id:
                 return False, "request_id_mismatch"
             if card.get("claim_epoch") != claim_epoch:
                 return False, "claim_epoch_mismatch"
@@ -3268,7 +3272,7 @@ def mark_launch_failed(
             card = {}
         attached_request_id = str(card.get("launch_request_id") or "")
         if request_id:
-            if attached_request_id != request_id:
+            if attached_request_id and attached_request_id != request_id:
                 return False, "launch_request_mismatch"
         elif attached_request_id:
             return False, "launch_request_id_required"
@@ -3285,6 +3289,14 @@ def mark_launch_failed(
             blocked_at=now,
             blocked_by=runner,
         )
+        if request_id and not attached_request_id:
+            # NF-2026-01192.  A launch rejected in preflight dies BEFORE the
+            # claim carries its request id, so this compare-and-swap is the last
+            # point at which the dead episode can still be linked to the request
+            # that died.  Without the linkage the blocked card is unrecoverable:
+            # retry-terminal and the dead-claim reconciler both authenticate a
+            # recovery against exactly this field.
+            card["launch_request_id"] = request_id
         cur = conn.execute(
             "UPDATE tasks SET status='blocked', worker_status='launch_failed', "
             "completed_at=?, updated_at=?, card_json=? "
