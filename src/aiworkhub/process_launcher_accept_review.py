@@ -381,15 +381,40 @@ def effective_requested_risk_tier(card: Any, requested_risk_tier: Any) -> str:
     return requested
 
 
-def _refinement_blockers(reviewers: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _refinement_blockers(
+    reviewers: list[dict[str, Any]],
+    *,
+    finding_dispositions: list[Mapping[str, Any]] | None = None,
+    disposition_rows: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     """Findings on ALREADY-VERIFIED reports that will refuse this acceptance.
 
     Only the receipts a reviewer already sealed are read -- nothing is
     re-verified here and nothing unverified is trusted. ``fold_quality_verdict``
     remains the authority; this names in advance the subset of its verdict a
     manager can act on before paying for a combined tree.
+
+    ``finding_dispositions`` are manager disposition receipts ALREADY bound by
+    :func:`bound_finding_dispositions`. Each finding they name is appended to
+    ``disposition_rows`` with its disposition and receipt digest; a
+    ``dismissed`` non-blocking finding is not a blocker (NF-2026-01170), every
+    other finding blocks exactly as before.
     """
-    blockers: list[dict[str, Any]] = []
+    by_finding = {
+        (
+            str(row.get("reviewer_request_id") or ""),
+            str(row.get("finding_id") or ""),
+        ): row
+        for row in (finding_dispositions or ())
+        if isinstance(row, Mapping)
+    }
+    dismissed_by_finding = quality_evidence.dismissed_finding_receipts(
+        finding_dispositions
+    )
+    reports: list[tuple[dict[str, Any], str, list[Any]]] = []
+    # Ids are counted across EVERY report given, exactly as the fold counts
+    # them: an id that is not unique is never lifted by either surface.
+    finding_id_counts: dict[str, int] = {}
     for reviewer in reviewers:
         receipt = reviewer.get("receipt")
         report = receipt.get("report") if isinstance(receipt, Mapping) else None
@@ -397,30 +422,155 @@ def _refinement_blockers(reviewers: list[dict[str, Any]]) -> list[dict[str, Any]
             continue
         lens = str(report.get("lens") or reviewer.get("lens") or "")
         findings = report.get("findings")
-        for finding in findings if isinstance(findings, list) else []:
+        rows = findings if isinstance(findings, list) else []
+        reports.append((reviewer, lens, rows))
+        for finding in rows:
+            if isinstance(finding, Mapping):
+                counted_id = f"reviewer:{lens}:{str(finding.get('id') or '')}"
+                finding_id_counts[counted_id] = finding_id_counts.get(counted_id, 0) + 1
+    blockers: list[dict[str, Any]] = []
+    for reviewer, lens, rows in reports:
+        for finding in rows:
             if not isinstance(finding, Mapping):
                 continue
             if finding.get("disposition") != "defect":
                 continue
-            finding_id = f"reviewer:{lens}:{str(finding.get('id') or '')}"[:300]
+            finding_id = f"reviewer:{lens}:{str(finding.get('id') or '')}"
             severity = str(finding.get("severity") or "")
+            stored = by_finding.get((str(reviewer.get("request_id") or ""), finding_id))
+            disposition = str(stored.get("disposition") or "") if stored else ""
+            lifted = (
+                disposition == "dismissed"
+                and lens
+                in {quality_evidence.LENS_CORRECTNESS, quality_evidence.LENS_SECURITY}
+                and quality_evidence.dismissal_lifts_finding(
+                    finding_id,
+                    severity=severity,
+                    finding_id_counts=finding_id_counts,
+                    dismissed_by_finding=dismissed_by_finding,
+                )
+            )
+            if stored is not None and disposition_rows is not None:
+                disposition_rows.append(
+                    {
+                        "finding_id": finding_id,
+                        "reviewer_request_id": str(reviewer.get("request_id") or ""),
+                        "lens": lens,
+                        "severity": severity,
+                        "disposition": disposition,
+                        "receipt_sha256": str(stored.get("receipt_sha256") or ""),
+                        "blocker_lifted": lifted,
+                    }
+                )
+            extra: dict[str, Any] = (
+                {
+                    "disposition": disposition,
+                    "disposition_receipt_sha256": str(
+                        stored.get("receipt_sha256") or ""
+                    ),
+                }
+                if stored is not None
+                else {}
+            )
             if severity in quality_evidence.BLOCKING_SEVERITIES:
                 blockers.append(
                     _blocker(
-                        "refinement_required", finding_id,
+                        "refinement_required", finding_id[:300],
                         lens=lens, severity=severity, blocking_severity=True,
+                        **extra,
                     )
                 )
             elif lens in {
                 quality_evidence.LENS_CORRECTNESS, quality_evidence.LENS_SECURITY
             }:
+                if lifted:
+                    continue
                 blockers.append(
                     _blocker(
-                        "refinement_required", finding_id,
+                        "refinement_required", finding_id[:300],
                         lens=lens, severity=severity, blocking_severity=False,
+                        **extra,
                     )
                 )
     return blockers
+
+
+def _receipt_sha256(receipt: Any) -> str:
+    """The canonical digest of one reviewer receipt, or "" when unreadable."""
+    import json as _json
+
+    from . import review_orchestrator
+
+    if not isinstance(receipt, Mapping):
+        return ""
+    try:
+        return review_orchestrator.canonical_digest(
+            _json.loads(_json.dumps(dict(receipt)))
+        )
+    except (TypeError, ValueError):
+        return ""
+
+
+def _sealed_receipt_sha256(reviewers: list[dict[str, Any]]) -> dict[str, str]:
+    """Reviewer request id -> digest of the receipt the server sealed for it."""
+    digests: dict[str, str] = {}
+    for row in reviewers:
+        request_id = str(row.get("request_id") or "")
+        digest = _receipt_sha256(row.get("receipt"))
+        if request_id and digest and row.get("usable"):
+            digests[request_id] = digest
+    return digests
+
+
+def _target_candidate_sha256(card: Any) -> str:
+    """The candidate digest sealed on the target's own terminal evidence."""
+    from . import review_orchestrator
+
+    return str(
+        review_orchestrator.target_identity_from_card(card).get("candidate_sha256")
+        or ""
+    )
+
+
+def bound_finding_dispositions(
+    self: Any,
+    task_id: str,
+    request_id: str,
+    *,
+    candidate_sha256: str,
+    receipt_sha256_by_reviewer: Mapping[str, str],
+) -> list[dict[str, Any]]:
+    """Stored finding dispositions still bound to THIS candidate and receipts.
+
+    A row survives only when its stored candidate digest equals
+    ``candidate_sha256`` and its stored reviewer receipt digest equals the
+    digest of the receipt verified for that reviewer request here. Anything
+    else -- other bytes, another report, an unreadable store -- is ignored, so
+    the finding blocks exactly as it did before the disposition existed.
+    """
+    loader = getattr(self, "review_finding_dispositions", None)
+    if not callable(loader) or not candidate_sha256:
+        return []
+    try:
+        rows = loader(task_id, request_id)
+    except Exception:  # noqa: BLE001 -- an unreadable store lifts nothing
+        return []
+    bound: list[dict[str, Any]] = []
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, Mapping):
+            continue
+        expected = str(
+            receipt_sha256_by_reviewer.get(str(row.get("reviewer_request_id") or ""))
+            or ""
+        )
+        if (
+            str(row.get("candidate_sha256") or "") != candidate_sha256
+            or not expected
+            or str(row.get("reviewer_receipt_sha256") or "") != expected
+        ):
+            continue
+        bound.append(dict(row))
+    return bound
 
 
 def _blind_reviewer_lenses(reviewers: list[dict[str, Any]]) -> set[str]:
@@ -672,6 +822,7 @@ def fold_accept_blockers(
     confirm_high_risk: bool = False,
     destructive_blockers: list[str] | None = None,
     confirm_destructive_change: bool = False,
+    finding_dispositions: list[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Every acceptance blocker decidable from persisted evidence alone.
 
@@ -768,7 +919,14 @@ def fold_accept_blockers(
                 )
             )
     evidence_rows = [row for row in chosen if row["usable"]]
-    blockers.extend(_refinement_blockers(evidence_rows))
+    disposition_rows: list[dict[str, Any]] = []
+    blockers.extend(
+        _refinement_blockers(
+            evidence_rows,
+            finding_dispositions=finding_dispositions,
+            disposition_rows=disposition_rows,
+        )
+    )
     # NF-2026-01158: the refusal the accept fold WILL make for a lens nothing
     # inspected, predicted here from the same already-verified receipts with the
     # fold's own classifier -- so a manager never reads a clear preview and then
@@ -823,6 +981,13 @@ def fold_accept_blockers(
                 for row in reviewers
             ),
             key=lambda entry: (entry["lens"], entry["task_id"]),
+        ),
+        # NF-2026-01170: each finding's bound manager disposition, shown only
+        # when one exists so a fold without dispositions is unchanged.
+        **(
+            {"finding_dispositions": disposition_rows}
+            if disposition_rows
+            else {}
         ),
     }
 
@@ -880,13 +1045,26 @@ def accept_preview(self, request_id: str, task_id: str, **overrides: Any) -> dic
             intents = int((snapshot.get("counts") or {}).get("pending") or 0)
     except Exception:  # noqa: BLE001 -- an unreadable snapshot blocks nothing here
         intents = 0
+    preview_reviewers = reviewer_evidence(self, task_id, request_id)
+    preview_dispositions = bound_finding_dispositions(
+        self,
+        task_id,
+        request_id,
+        candidate_sha256=_target_candidate_sha256(card),
+        receipt_sha256_by_reviewer=_sealed_receipt_sha256(preview_reviewers),
+    )
     fold = fold_accept_blockers(
-        reviewers=reviewer_evidence(self, task_id, request_id),
+        reviewers=preview_reviewers,
         reviewer_request_ids=overrides.get("reviewer_request_ids"),
         risk_profile=risk_profile,
         terminal_substatus=str(terminal_review.get("substatus") or ""),
         pending_context_write_intents=intents,
         confirm_high_risk=bool(overrides.get("confirm_high_risk")),
+        **(
+            {"finding_dispositions": preview_dispositions}
+            if preview_dispositions
+            else {}
+        ),
     )
     return {
         **result,
@@ -928,6 +1106,10 @@ def accept_preview(self, request_id: str, task_id: str, **overrides: Any) -> dic
 # list is exactly the drift it exists to catch.
 ACCEPT_REVIEW_LOCAL_NAMES: tuple[str, ...] = (
     "_accept_manager_identity",
+    "_receipt_sha256",
+    "_sealed_receipt_sha256",
+    "_target_candidate_sha256",
+    "bound_finding_dispositions",
     "create_supplemental_inspection_rounds",
     "effective_requested_risk_tier",
     "fold_accept_blockers",
@@ -1917,12 +2099,27 @@ def accept_review(
             # manager meets them: the point is that the two surfaces answer
             # from one implementation, not two that drift.
             reviewers = reviewer_evidence(self, task_id, request_id)
+            # Bound against the SEALED receipts here; the gate below re-binds
+            # against the receipts it re-verifies, so a disposition that no
+            # longer matches is dropped there and the finding blocks again.
+            sealed_finding_dispositions = bound_finding_dispositions(
+                self,
+                task_id,
+                request_id,
+                candidate_sha256=_target_candidate_sha256(card),
+                receipt_sha256_by_reviewer=_sealed_receipt_sha256(reviewers),
+            )
             accept_fold = fold_accept_blockers(
                 reviewers=reviewers,
                 reviewer_request_ids=reviewer_request_ids,
                 risk_profile=risk_profile,
                 terminal_substatus=str(terminal_review.get("substatus") or ""),
                 confirm_high_risk=confirm_high_risk,
+                **(
+                    {"finding_dispositions": sealed_finding_dispositions}
+                    if sealed_finding_dispositions
+                    else {}
+                ),
             )
             # NF-2026-01158: the blind-lens prediction stays in the fold so
             # ``accept_preview`` reports it, but refusing on it HERE would skip
@@ -2049,6 +2246,9 @@ def accept_review(
             # fact about what can be proven now, not a defect: a lens with no
             # packet here simply gets no supplemental round.
             sealed_review_packets: dict[str, dict[str, Any]] = {}
+            # The digest of each reviewer receipt verified in THIS accept, the
+            # only value a stored finding disposition may be bound to.
+            verified_receipt_sha256: dict[str, str] = {}
             for reviewer_request_id in reviewer_ids:
                 reviewer_events = self._request_events(reviewer_request_id)
                 if not reviewer_events:
@@ -2075,6 +2275,9 @@ def accept_review(
                             f"quality_reviewer_accepted_invalid:{reviewer_request_id}:{exc}"
                         ) from exc
                     verified_reviewer_reports.append(dict(receipt["report"]))
+                    verified_receipt_sha256[reviewer_request_id] = _receipt_sha256(
+                        receipt
+                    )
                     verified_reviewer_tasks.append(
                         (reviewer_task_id, None, True)
                     )
@@ -2131,6 +2334,7 @@ def accept_review(
                     reviewer_request_id,
                 )
                 verified_reviewer_reports.append(dict(receipt["report"]))
+                verified_receipt_sha256[reviewer_request_id] = _receipt_sha256(receipt)
                 verified_reviewer_tasks.append(
                     (
                         str(reviewer_metadata.get("task_id") or ""),
@@ -2151,6 +2355,15 @@ def accept_review(
                 )
                 if reviewer_packet is not None and reviewer_report_lens:
                     sealed_review_packets[reviewer_report_lens] = reviewer_packet
+            # NF-2026-01170: only dispositions bound to THIS candidate digest and
+            # to the reviewer receipts just verified above reach the fold.
+            accepted_finding_dispositions = bound_finding_dispositions(
+                self,
+                task_id,
+                request_id,
+                candidate_sha256=_target_candidate_sha256(card),
+                receipt_sha256_by_reviewer=verified_receipt_sha256,
+            )
             quality_gate = quality_evidence.run_completion_quality_gate(
                 workspace.path,
                 changed_paths=changed,
@@ -2168,6 +2381,11 @@ def accept_review(
                 # sealed against, and how many re-reads that lens already had.
                 review_packets=sealed_review_packets,
                 supplemental_rounds=supplemental_rounds_completed(reviewers),
+                **(
+                    {"finding_dispositions": accepted_finding_dispositions}
+                    if accepted_finding_dispositions
+                    else {}
+                ),
             )
             quality_gate["combined_tree"] = combined_tree
             quality_gate["quality_policy_authority"] = policy_authority

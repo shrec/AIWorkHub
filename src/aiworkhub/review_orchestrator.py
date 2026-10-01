@@ -990,6 +990,23 @@ MANAGER_HOLD_DECISION_TABLE = (
     "UNIQUE (chain_id,lens,attempt_index))"
 )
 
+# NF-2026-01170: one manager disposition per (request, reviewer request,
+# finding). Append-only: a row is inserted once and never updated, and its
+# receipt is bound to the candidate digest and the verified reviewer receipt
+# digest so a disposition can never travel to other bytes or another report.
+FINDING_DISPOSITION_SCHEMA = "aiworkhub.review_finding_disposition.v1"
+FINDING_DISPOSITION_TABLE = (
+    "CREATE TABLE IF NOT EXISTS review_orchestrator_finding_dispositions ("
+    "receipt_sha256 TEXT PRIMARY KEY, target_task_id TEXT NOT NULL, "
+    "target_request_id TEXT NOT NULL, reviewer_request_id TEXT NOT NULL, "
+    "finding_id TEXT NOT NULL, disposition TEXT NOT NULL, "
+    "candidate_sha256 TEXT NOT NULL, reviewer_receipt_sha256 TEXT NOT NULL, "
+    "actor TEXT NOT NULL, decided_at TEXT NOT NULL, receipt_json TEXT NOT NULL, "
+    "UNIQUE (target_request_id,reviewer_request_id,finding_id))"
+)
+FINDING_DISPOSITIONS = frozenset({"confirmed", "dismissed"})
+MAX_FINDING_DISPOSITION_TEXT = 4000
+
 MANAGER_HOLD_DECISIONS = frozenset({
     "authorize_distinct_route_successor",
     "callback_reconcile",
@@ -2591,6 +2608,211 @@ class ReviewOrchestrator:
             "receipt_sha256": decision_id,
             **receipt,
         }
+
+    def dispose_review_finding(
+        self,
+        *,
+        task_id: str,
+        request_id: str,
+        reviewer_request_id: str,
+        finding_id: str,
+        disposition: str,
+        counter_evidence: str,
+        reason: str,
+        actor: str,
+        reviewer_receipt: Mapping[str, Any] | None,
+        candidate_sha256: str,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Record one audited manager disposition of one non-blocking finding.
+
+        ``reviewer_receipt`` and ``candidate_sha256`` are derived server-side by
+        the caller from the verified reviewer receipt and the target's sealed
+        terminal evidence -- never from manager arguments. The receipt is
+        append-only: an identical replay returns the stored receipt and a
+        different second disposition for the same finding is refused. Nothing
+        here accepts a candidate or edits a reviewer report.
+        """
+        if disposition not in FINDING_DISPOSITIONS:
+            return {"ok": False, "error": "review_finding_disposition_invalid"}
+        actor = str(actor or "").strip()
+        if not actor or len(actor) > 240:
+            return {"ok": False, "error": "review_finding_disposition_actor_invalid"}
+        counter_evidence = str(counter_evidence or "")
+        reason = str(reason or "")
+        if disposition == "dismissed" and not counter_evidence.strip():
+            return {
+                "ok": False,
+                "error": "review_finding_disposition_counter_evidence_required",
+            }
+        if (
+            len(counter_evidence) > MAX_FINDING_DISPOSITION_TEXT
+            or len(reason) > MAX_FINDING_DISPOSITION_TEXT
+        ):
+            return {"ok": False, "error": "review_finding_disposition_text_too_long"}
+        receipt_map = reviewer_receipt if isinstance(reviewer_receipt, Mapping) else {}
+        target = receipt_map.get("target")
+        reviewer = receipt_map.get("reviewer")
+        report = receipt_map.get("report")
+        if not (
+            str(reviewer_request_id or "")
+            and isinstance(target, Mapping)
+            and isinstance(reviewer, Mapping)
+            and isinstance(report, Mapping)
+            and str(target.get("task_id") or "") == str(task_id)
+            and str(target.get("request_id") or "") == str(request_id)
+            and str(reviewer.get("request_id") or "") == str(reviewer_request_id)
+        ):
+            return {"ok": False, "error": "review_finding_disposition_reviewer_not_bound"}
+        if not re.fullmatch(r"[0-9a-f]{64}", str(candidate_sha256 or "")):
+            return {
+                "ok": False,
+                "error": "review_finding_disposition_candidate_unavailable",
+            }
+        lens = str(report.get("lens") or "")
+        findings = report.get("findings")
+        matches = [
+            row
+            for row in (findings if isinstance(findings, list) else [])
+            if isinstance(row, Mapping)
+            and f"reviewer:{lens}:{str(row.get('id') or '')}" == str(finding_id)
+        ]
+        if not matches:
+            return {"ok": False, "error": "review_finding_disposition_finding_unknown"}
+        if len(matches) > 1:
+            # The fold never lifts an id that is not unique, so a receipt
+            # naming one would bind to an arbitrary finding and lift nothing.
+            return {"ok": False, "error": "review_finding_disposition_ambiguous"}
+        finding = matches[0]
+        severity = str(finding.get("severity") or "")
+        if severity in quality_evidence.BLOCKING_SEVERITIES:
+            return {
+                "ok": False,
+                "error": "review_finding_disposition_blocking_severity",
+            }
+        if disposition == "dismissed" and (
+            finding.get("disposition", quality_evidence.FINDING_DISPOSITION_DEFECT)
+            != quality_evidence.FINDING_DISPOSITION_DEFECT
+            or lens
+            not in {quality_evidence.LENS_CORRECTNESS, quality_evidence.LENS_SECURITY}
+        ):
+            # Only an actionable correctness/security finding is a refinement
+            # blocker; dismissing anything else would be a no-op receipt.
+            return {"ok": False, "error": "review_finding_disposition_not_a_blocker"}
+        receipt = {
+            "schema_id": FINDING_DISPOSITION_SCHEMA,
+            "target_task_id": str(task_id),
+            "target_request_id": str(request_id),
+            "reviewer_task_id": str(reviewer.get("task_id") or ""),
+            "reviewer_request_id": str(reviewer_request_id),
+            "finding_id": str(finding_id),
+            "lens": lens,
+            "severity": severity,
+            "disposition": disposition,
+            "counter_evidence": counter_evidence,
+            "reason": reason,
+            "candidate_sha256": str(candidate_sha256),
+            "reviewer_receipt_sha256": canonical_digest(
+                json.loads(json.dumps(dict(receipt_map)))
+            ),
+            "actor": actor,
+            "decided_at": (now or datetime.now(timezone.utc)).isoformat(),
+        }
+        receipt_sha256 = canonical_digest(receipt)
+        existing = None
+        try:
+            with closing(_side_table_connection(self.db_path)) as conn, conn:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(FINDING_DISPOSITION_TABLE)
+                existing = conn.execute(
+                    "SELECT receipt_json,receipt_sha256 "
+                    "FROM review_orchestrator_finding_dispositions "
+                    "WHERE target_request_id=? AND reviewer_request_id=? "
+                    "AND finding_id=?",
+                    (str(request_id), str(reviewer_request_id), str(finding_id)),
+                ).fetchone()
+                if existing is None:
+                    conn.execute(
+                        "INSERT INTO review_orchestrator_finding_dispositions "
+                        "(receipt_sha256,target_task_id,target_request_id,"
+                        "reviewer_request_id,finding_id,disposition,candidate_sha256,"
+                        "reviewer_receipt_sha256,actor,decided_at,receipt_json) "
+                        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                        (
+                            receipt_sha256, str(task_id), str(request_id),
+                            str(reviewer_request_id), str(finding_id), disposition,
+                            str(candidate_sha256), receipt["reviewer_receipt_sha256"],
+                            actor, receipt["decided_at"],
+                            json.dumps(receipt, ensure_ascii=False, sort_keys=True),
+                        ),
+                    )
+        except sqlite3.Error as exc:
+            return {"ok": False, "error": str(exc)[:300]}
+        if existing is not None:
+            try:
+                stored = json.loads(str(existing[0]))
+            except ValueError:
+                stored = None
+
+            def _comparable(value: Mapping[str, Any]) -> dict[str, Any]:
+                return {key: item for key, item in value.items() if key != "decided_at"}
+
+            if not isinstance(stored, dict) or _comparable(stored) != _comparable(receipt):
+                return {
+                    "ok": False,
+                    "error": "review_finding_disposition_conflict",
+                    "receipt_sha256": str(existing[1]),
+                }
+            return {
+                "ok": True,
+                "idempotent": True,
+                "state": "review_finding_disposition_recorded",
+                **stored,
+                "receipt_sha256": str(existing[1]),
+            }
+        return {
+            "ok": True,
+            "idempotent": False,
+            "state": "review_finding_disposition_recorded",
+            **receipt,
+            "receipt_sha256": receipt_sha256,
+        }
+
+    def review_finding_dispositions(
+        self, *, task_id: str, request_id: str
+    ) -> list[dict[str, Any]]:
+        """Every stored disposition for one exact target request, read-only.
+
+        A row whose receipt no longer hashes to its own ``receipt_sha256`` or
+        names another target is dropped. Total: an unreadable store returns
+        ``[]``, which can only leave a blocker standing, never lift one.
+        """
+        try:
+            with closing(_side_table_connection(self.db_path, readonly=True)) as conn:
+                rows = conn.execute(
+                    "SELECT receipt_json,receipt_sha256 "
+                    "FROM review_orchestrator_finding_dispositions "
+                    "WHERE target_task_id=? AND target_request_id=? "
+                    "ORDER BY reviewer_request_id,finding_id",
+                    (str(task_id), str(request_id)),
+                ).fetchall()
+        except Exception:  # noqa: BLE001 -- no table / no store lifts nothing
+            return []
+        dispositions: list[dict[str, Any]] = []
+        for raw_json, stored_sha256 in rows:
+            try:
+                receipt = json.loads(str(raw_json))
+            except ValueError:
+                continue
+            if (
+                not isinstance(receipt, dict)
+                or canonical_digest(receipt) != str(stored_sha256)
+                or str(receipt.get("target_task_id") or "") != str(task_id)
+                or str(receipt.get("target_request_id") or "") != str(request_id)
+            ):
+                continue
+            dispositions.append({**receipt, "receipt_sha256": str(stored_sha256)})
+        return dispositions
 
     def _select_attempt_route(
         self,

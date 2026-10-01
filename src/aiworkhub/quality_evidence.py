@@ -1385,6 +1385,44 @@ def _best_independence_rung(
     return best
 
 
+def dismissed_finding_receipts(
+    finding_dispositions: Iterable[Mapping[str, Any]] | None,
+) -> dict[str, str]:
+    """Finding id -> disposition receipt digest for every ``dismissed`` row."""
+    dismissed: dict[str, str] = {}
+    for row in finding_dispositions or ():
+        if not isinstance(row, Mapping):
+            continue
+        if str(row.get("disposition") or "") != "dismissed":
+            continue
+        finding_id = str(row.get("finding_id") or "")
+        if finding_id:
+            dismissed[finding_id] = str(row.get("receipt_sha256") or "")
+    return dismissed
+
+
+def dismissal_lifts_finding(
+    finding_id: str,
+    *,
+    severity: str,
+    finding_id_counts: Mapping[str, int],
+    dismissed_by_finding: Mapping[str, str],
+) -> bool:
+    """THE rule for whether a manager dismissal lifts one finding (NF-2026-01170).
+
+    True only when the finding id occurs exactly once across every report the
+    caller counted, a bound ``dismissed`` row names it, and its severity is not
+    blocking. ``fold_quality_verdict`` and ``accept_preview`` both call this, so
+    the preview can never drop a blocker the verdict keeps. The caller still
+    owns the lens and actionable conditions of the blocker itself.
+    """
+    return (
+        severity not in BLOCKING_SEVERITIES
+        and finding_id in dismissed_by_finding
+        and finding_id_counts.get(finding_id) == 1
+    )
+
+
 def fold_quality_verdict(
     checks: Iterable[EvidenceCheck | Mapping[str, Any]],
     *,
@@ -1398,13 +1436,24 @@ def fold_quality_verdict(
     replay_binding: Mapping[str, Any] | None = None,
     review_packets: Mapping[str, Mapping[str, Any]] | None = None,
     supplemental_rounds: Mapping[str, int] | None = None,
+    finding_dispositions: Iterable[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Purely fold mechanical and reviewer evidence into one final verdict.
 
     The function performs no I/O and trusts no model-supplied pass/fail field.
     Blocking mechanical states, malformed reviewer evidence, missing required
     lenses and required combined-tree failures all produce ``unverified``.
+
+    ``finding_dispositions`` (NF-2026-01170) are manager disposition receipts
+    the CALLER already bound to this exact candidate and reviewer receipt. A
+    ``dismissed`` row lifts only that finding's ``refinement_required`` blocker
+    and is recorded as a manager-dismissed reviewer false positive; any other
+    disposition, and any finding at a blocking severity, changes nothing. With
+    no dispositions the verdict is exactly what it was before they existed.
     """
+
+    dismissed_by_finding = dismissed_finding_receipts(finding_dispositions)
+    manager_dismissed: list[dict[str, Any]] = []
 
     profile = dict(risk_profile or resolve_risk_profile())
     effective_tier = profile.get("effective_tier")
@@ -1522,6 +1571,14 @@ def fold_quality_verdict(
 
     reports_by_lens: dict[str, list[dict[str, Any]]] = {}
     refine_required = False
+    # A dismissal names a finding id, and two reports of one lens can reuse an
+    # id: an id that is not unique across the reports is never suppressed.
+    finding_id_counts: dict[str, int] = {}
+    if dismissed_by_finding:
+        for report in normalized_reports:
+            for finding in report["findings"]:
+                counted_id = f"reviewer:{report['lens']}:{finding['id']}"
+                finding_id_counts[counted_id] = finding_id_counts.get(counted_id, 0) + 1
     for report in normalized_reports:
         lens = str(report["lens"])
         reports_by_lens.setdefault(lens, []).append(report)
@@ -1542,6 +1599,26 @@ def fold_quality_verdict(
                 blockers.append(finding_id)
                 row["status"] = STATUS_FAILED
             if lens in {LENS_CORRECTNESS, LENS_SECURITY}:
+                if dismissal_lifts_finding(
+                    finding_id,
+                    severity=str(finding["severity"]),
+                    finding_id_counts=finding_id_counts,
+                    dismissed_by_finding=dismissed_by_finding,
+                ):
+                    # A manager-dismissed false positive: only THIS finding's
+                    # refinement blocker is lifted, on the record. A blocking
+                    # severity never reaches this branch.
+                    manager_dismissed.append(
+                        {
+                            "finding_id": finding_id,
+                            "lens": lens,
+                            "severity": str(finding["severity"]),
+                            "disposition": "dismissed",
+                            "classification": "manager_dismissed_reviewer_false_positive",
+                            "receipt_sha256": dismissed_by_finding[finding_id],
+                        }
+                    )
+                    continue
                 refine_required = True
                 if finding["severity"] not in BLOCKING_SEVERITIES:
                     blockers.append(f"refinement_required:{finding_id}")
@@ -1686,6 +1763,13 @@ def fold_quality_verdict(
         # appears in ``blocking_evidence`` and never changes ``passed``.
         "supplemental_inspection": supplemental_inspection,
         "config_error": config_error[:MAX_SUMMARY_CHARS],
+        # Present only when a manager dismissal actually lifted a blocker, so
+        # a fold with no dispositions is byte-identical to before NF-2026-01170.
+        **(
+            {"manager_dismissed_findings": manager_dismissed}
+            if manager_dismissed
+            else {}
+        ),
     }
 
 
@@ -2792,6 +2876,7 @@ def run_completion_quality_gate(
     review_packets: Mapping[str, Mapping[str, Any]] | None = None,
     supplemental_rounds: Mapping[str, int] | None = None,
     replay_binding: Mapping[str, Any] | None = None,
+    finding_dispositions: Iterable[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Execute the mandatory review-quality floor for one task delta.
 
@@ -2895,6 +2980,7 @@ def run_completion_quality_gate(
             replay_binding=replay_binding,
             review_packets=review_packets,
             supplemental_rounds=supplemental_rounds,
+            finding_dispositions=finding_dispositions,
         )
     except MalformedConfigError as exc:
         risk_profile = {}

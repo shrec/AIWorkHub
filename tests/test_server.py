@@ -46,6 +46,34 @@ def test_manager_review_hold_tool_forwards_the_exact_identity(monkeypatch) -> No
     }
 
 
+def test_manager_review_finding_dispose_tool_forwards_the_exact_identity(
+    monkeypatch,
+) -> None:
+    captured: dict = {}
+
+    class Manager:
+        def dispose_review_finding(self, **kwargs):
+            captured.update(kwargs)
+            return {"ok": True, "state": "review_finding_disposition_recorded"}
+
+    monkeypatch.setattr(server.process_launcher, "default_manager", lambda: Manager())
+    result = server.aiworkhub_manager_review_finding_dispose(
+        task_id="TARGET", request_id="target-request",
+        reviewer_request_id="review-request-exact",
+        finding_id="reviewer:correctness:finding-1", disposition="dismissed",
+        counter_evidence="measured: the path is unreachable", reason="false positive",
+    )
+
+    assert result == {"ok": True, "state": "review_finding_disposition_recorded"}
+    assert captured == {
+        "task_id": "TARGET", "request_id": "target-request",
+        "reviewer_request_id": "review-request-exact",
+        "finding_id": "reviewer:correctness:finding-1", "disposition": "dismissed",
+        "counter_evidence": "measured: the path is unreachable",
+        "reason": "false positive",
+    }
+
+
 def test_stdlib_backend_can_be_selected_even_when_sdk_is_installed() -> None:
     env = dict(os.environ)
     env["PYTHONPATH"] = str(_SRC)

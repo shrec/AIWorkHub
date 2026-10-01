@@ -4360,6 +4360,37 @@ def aiworkhub_manager_review_hold_resolve(
 
 
 @mcp.tool()
+@_serialize_task_lifecycle_write
+def aiworkhub_manager_review_finding_dispose(
+    task_id: str,
+    request_id: str,
+    reviewer_request_id: str,
+    finding_id: str,
+    disposition: Literal["confirmed", "dismissed"],
+    counter_evidence: str = "",
+    reason: str = "",
+) -> dict[str, Any]:
+    """MANAGER WRITE: record one audited disposition of one reviewer finding.
+
+    ``dismissed`` needs non-empty ``counter_evidence`` and lifts only that
+    LOW/MEDIUM finding's ``refinement_required`` blocker at accept; a
+    high/critical finding cannot be disposed. The receipt is append-only and
+    bound server-side to the verified reviewer receipt and the candidate
+    digest. It never edits the reviewer report and never accepts the target.
+    """
+
+    return process_launcher.default_manager().dispose_review_finding(
+        task_id=task_id,
+        request_id=request_id,
+        reviewer_request_id=reviewer_request_id,
+        finding_id=finding_id,
+        disposition=disposition,
+        counter_evidence=counter_evidence,
+        reason=reason,
+    )
+
+
+@mcp.tool()
 def aiworkhub_agent_accept_preview(
     request_id: str,
     task_id: str,
