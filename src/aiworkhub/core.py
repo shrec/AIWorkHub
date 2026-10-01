@@ -8166,6 +8166,163 @@ def _verified_recovered_launch_failure_reroute_receipt(
     }
 
 
+# The exact object ``task_store.recover_blocked_rework`` seals, in its own
+# transaction, for a recovery that kept the manager-rejected candidate.
+_REJECTION_RECOVERY_REBIND_SCHEMA_ID = "aiworkhub.blocked_recovery_rejection_rebind.v1"
+
+
+def _verified_rejection_recovery_rebind_receipt(
+    card: Mapping[str, Any], *, task_id: str
+) -> dict[str, Any] | None:
+    """Authenticate the claim epoch a blocked-rework recovery produced (NF-2026-01196).
+
+    Live NF-2026-00046 shape: the manager rejected sealed candidate N, the
+    rework attempt claimed N+1 and terminalized, and ``recover_blocked_rework``
+    moved the card to pending at N+2 WITHOUT replacing the sealed predecessor.
+    Neither recovery rebind can explain that advance -- both require the
+    recovered terminal episode to sit at the rejected candidate's own epoch,
+    which the intervening attempt moved past -- and no zero-delta launch-failure
+    receipt applies either, because an attempt that reached a terminal state is
+    not a launch that never ran.
+
+    Authority is the rebind the recovery transaction sealed, matched field for
+    field against the card AND against the newest ``blocked_rework_recovery``
+    task event that wrote it.  It proves exactly three things: (a) the manager
+    rejection authorization is still current for the sealed predecessor, (b) this
+    claim epoch is the one the recovery produced, from a strictly later blocked
+    episode than the rejected candidate, and (c) the sealed predecessor's
+    request id and changed paths are unchanged.  Any later lineage event --
+    including the reroute this authorizes -- makes the recovery stale, so the
+    authorization is one-shot.
+    """
+    rebind = card.get("blocked_recovery_rejection_rebind")
+    rejection = card.get("rejection_disposition")
+    predecessor = card.get("rework_predecessor")
+    recovery = card.get("recovery_predecessor")
+    if not all(
+        isinstance(value, dict)
+        for value in (rebind, rejection, predecessor, recovery)
+    ):
+        return None
+    assert isinstance(rebind, dict)
+    assert isinstance(rejection, dict)
+    assert isinstance(predecessor, dict)
+    assert isinstance(recovery, dict)
+    manager = _verified_manager_actor()
+    request_id = str(predecessor.get("request_id") or "").strip()
+    pinned_at = str(predecessor.get("pinned_at") or "").strip()
+    claim_epoch = predecessor.get("claim_epoch")
+    hashes = predecessor.get("changed_path_hashes")
+    current_claim_epoch = card.get("claim_epoch")
+    recovered_at = str(card.get("recovered_from_blocked_at") or "").strip()
+    blocked_epoch = rebind.get("recovered_from_claim_epoch")
+    if (
+        rebind.get("schema_id") != _REJECTION_RECOVERY_REBIND_SCHEMA_ID
+        or str(rebind.get("task_id") or "") != task_id
+        or str(rebind.get("actor") or "").strip() != manager
+        or str(card.get("recovered_by") or "").strip() != manager
+        # A live reservation is a later launch, never this recovered episode.
+        or str(card.get("launch_request_id") or "").strip()
+        or re.fullmatch(r"[0-9a-f]{32}", request_id) is None
+        or not pinned_at
+        or type(claim_epoch) is not int
+        or claim_epoch < 1
+        or not isinstance(hashes, dict)
+        or not hashes
+        or type(current_claim_epoch) is not int
+        or card.get("recovery_epoch") != current_claim_epoch
+        or not recovered_at
+        # (a) the rejection authorization still current for that predecessor.
+        or str(rebind.get("rejection_request_id") or "").strip() != request_id
+        or str(rejection.get("request_id") or "").strip() != request_id
+        or str(rebind.get("rejection_pinned_at") or "").strip() != pinned_at
+        or str(rejection.get("pinned_at") or "").strip() != pinned_at
+        # (b) the claim epoch this recovery produced, from a blocked episode
+        # strictly later than the rejected candidate: that intervening attempt
+        # is the whole reason the direct and sequential rebinds cannot apply.
+        or rebind.get("recovered_claim_epoch") != current_claim_epoch
+        or type(blocked_epoch) is not int
+        or blocked_epoch != current_claim_epoch - 1
+        or blocked_epoch <= claim_epoch
+        or str(rebind.get("recorded_at") or "") != recovered_at
+        # (c) the exact sealed predecessor, byte-identical on both objects.
+        or str(rebind.get("predecessor_request_id") or "").strip() != request_id
+        or rebind.get("predecessor_claim_epoch") != claim_epoch
+        or rebind.get("changed_path_hashes") != hashes
+        or str(recovery.get("task_id") or task_id) != task_id
+        or str(recovery.get("request_id") or "").strip() != request_id
+        or recovery.get("terminal_claim_epoch") != claim_epoch
+        or recovery.get("changed_path_hashes") != hashes
+    ):
+        return None
+
+    try:
+        events = task_store.get_task_events(repo_root(), task_id, limit=200)
+    except Exception:  # noqa: BLE001 - unreadable canonical history fails closed
+        return None
+    # get_task_events is newest-first: the recovery that sealed this rebind must
+    # be the card's newest lineage event, so a later claim, terminal, recovery
+    # or reroute spends the authorization rather than replaying it.
+    recovery_event: dict[str, Any] | None = None
+    recovered: dict[str, Any] | None = None
+    for event in events:
+        if not isinstance(event, dict):
+            return None
+        name = str(event.get("event") or "").strip()
+        if name not in _RECOVERED_LAUNCH_FAILURE_LINEAGE_EVENTS:
+            continue
+        if name != "blocked_rework_recovery":
+            return None
+        raw_payload = event.get("payload")
+        try:
+            payload = (
+                json.loads(raw_payload) if isinstance(raw_payload, str) else raw_payload
+            )
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        recovery_event, recovered = event, payload
+        break
+    if recovery_event is None or recovered is None:
+        return None
+    if (
+        recovery_event.get("task_id", task_id) != task_id
+        or recovered.get("task_id", task_id) != task_id
+        # The rebind as recover_blocked_rework published it, not as the card
+        # carries it: a card-only edit cannot move this authorization.
+        or recovered.get("rejection_rebind") != rebind
+        or recovered.get("transition") != "blocked->pending"
+        or recovered.get("claim_epoch") != current_claim_epoch
+        or recovered.get("predecessor") != recovery
+        or recovered.get("feedback") != card.get("recovery_feedback")
+        or recovered.get("validation_only_replay") is not False
+        or recovered.get("actor") != manager
+        or recovered.get("recorded_at") != recovered_at
+        or recovery_event.get("runner") != manager
+        or recovery_event.get("created_at") != recovered_at
+    ):
+        return None
+    return {
+        "schema_id": "aiworkhub.rejection_recovery_reroute.v1",
+        "task_id": task_id,
+        "request_id": request_id,
+        "claim_epoch": claim_epoch,
+        "blocked_claim_epoch": blocked_epoch,
+        "recovery_epoch": current_claim_epoch,
+        "rejection_rebind_sha256": _canonical_receipt_digest(rebind),
+        "recovery_predecessor_sha256": _canonical_receipt_digest(recovery),
+        "recovery_event_sha256": _canonical_receipt_digest(
+            {
+                "event": recovery_event.get("event"),
+                "runner": recovery_event.get("runner"),
+                "created_at": recovery_event.get("created_at"),
+                "payload": recovered,
+            }
+        ),
+    }
+
+
 def _verified_manager_rejection_receipt(
     card: Mapping[str, Any], *, task_id: str
 ) -> tuple[dict[str, Any] | None, str | None]:
@@ -8300,6 +8457,7 @@ def _verified_manager_rejection_receipt(
     )
     pending_launch_failure_rebind: dict[str, Any] | None = None
     recovered_launch_failure_rebind: dict[str, Any] | None = None
+    rejection_recovery_rebind: dict[str, Any] | None = None
     if (
         type(claim_epoch) is int
         and type(current_claim_epoch) is int
@@ -8315,6 +8473,17 @@ def _verified_manager_rejection_receipt(
             # recovered by the manager instead of staying pending.
             recovered_launch_failure_rebind = (
                 _verified_recovered_launch_failure_reroute_receipt(card, task_id=task_id)
+            )
+        if (
+            pending_launch_failure_rebind is None
+            and recovered_launch_failure_rebind is None
+        ):
+            # NF-2026-01196: the rework attempt itself terminalized, so the
+            # recovered episode is neither the rejected candidate nor a
+            # zero-delta launch failure, and the epoch advance is authenticated
+            # from the recovery transaction's own sealed rebind instead.
+            rejection_recovery_rebind = (
+                _verified_rejection_recovery_rebind_receipt(card, task_id=task_id)
             )
     if (
         rejection.get("schema_id") != "aiworkhub.rejection_disposition.v1"
@@ -8333,6 +8502,7 @@ def _verified_manager_rejection_receipt(
             and not terminal_retry_rebind
             and pending_launch_failure_rebind is None
             and recovered_launch_failure_rebind is None
+            and rejection_recovery_rebind is None
         )
     ):
         return None, "reroute_manager_rejection_identity_mismatch"
@@ -8397,6 +8567,8 @@ def _verified_manager_rejection_receipt(
         receipt["pending_launch_failure_rebind"] = pending_launch_failure_rebind
     if recovered_launch_failure_rebind is not None:
         receipt["recovered_launch_failure_rebind"] = recovered_launch_failure_rebind
+    if rejection_recovery_rebind is not None:
+        receipt["rejection_recovery_rebind"] = rejection_recovery_rebind
     return receipt, None
 
 

@@ -6562,6 +6562,60 @@ def recover_blocked_rework(
             "request_id": str(retained_predecessor.get("request_id") or ""),
         }
 
+        # NF-2026-01196: a recovery that KEEPS the manager-rejected candidate
+        # still advances the claim epoch, and the canonical reroute had no way
+        # to tell that advance from a tampered one -- so it refused the whole
+        # field sequence with reroute_manager_rejection_identity_mismatch.
+        # Seal the three facts the authorization needs, in this transaction, and
+        # republish them in the recovery event below so the reroute reads
+        # canonical history rather than the card: the rejection that is still
+        # current for the sealed predecessor, the epoch this transaction
+        # produced (and the blocked one it came from), and that predecessor's
+        # exact request id and changed paths.  Any field that does not line up
+        # seals nothing, and the reroute keeps refusing.
+        rebind_rejection = card.get("rejection_disposition")
+        rebind_hashes = retained_predecessor.get("changed_path_hashes")
+        rebind_pinned_at = (
+            str(rebind_rejection.get("pinned_at") or "").strip()
+            if isinstance(rebind_rejection, dict)
+            else ""
+        )
+        rebind_request_id = (
+            str(rebind_rejection.get("request_id") or "").strip()
+            if isinstance(rebind_rejection, dict)
+            else ""
+        )
+        predecessor_request_id = str(
+            retained_predecessor.get("request_id") or ""
+        ).strip()
+        rejection_rebind: dict[str, Any] | None = None
+        if (
+            isinstance(rebind_rejection, dict)
+            and rebind_rejection.get("schema_id")
+            == "aiworkhub.rejection_disposition.v1"
+            and bool(rebind_request_id)
+            and rebind_request_id == predecessor_request_id
+            and bool(rebind_pinned_at)
+            and rebind_pinned_at
+            == str(retained_predecessor.get("pinned_at") or "").strip()
+            and type(retained_predecessor.get("claim_epoch")) is int
+            and isinstance(rebind_hashes, dict)
+            and rebind_hashes
+        ):
+            rejection_rebind = {
+                "schema_id": "aiworkhub.blocked_recovery_rejection_rebind.v1",
+                "task_id": task_id,
+                "actor": actor[:120],
+                "rejection_request_id": rebind_request_id,
+                "rejection_pinned_at": rebind_pinned_at,
+                "predecessor_request_id": predecessor_request_id,
+                "predecessor_claim_epoch": retained_predecessor["claim_epoch"],
+                "changed_path_hashes": dict(rebind_hashes),
+                "recovered_from_claim_epoch": claim_epoch - 1,
+                "recovered_claim_epoch": claim_epoch,
+                "recorded_at": now,
+            }
+
         prior_episode_summary = begin_claim_episode(card)
         # Recovery starts a new, unclaimed episode. The previous request ID is
         # append-only history in task_events/recovery_predecessor, not a live
@@ -6630,6 +6684,17 @@ def recover_blocked_rework(
             card.pop("clean_root_recovery_authorization", None)
             card.pop("recovery_mode", None)
 
+        # A clean-root or scope-rejection recovery discarded the sealed
+        # predecessor above, so a rebind naming bytes this card no longer pins
+        # must never be published on either the card or the recovery event.
+        if rejection_rebind is not None and isinstance(
+            card.get("rework_predecessor"), dict
+        ):
+            card["blocked_recovery_rejection_rebind"] = rejection_rebind
+        else:
+            rejection_rebind = None
+            card.pop("blocked_recovery_rejection_rebind", None)
+
         conn.execute(
             "UPDATE tasks SET status='pending', worker_status='unclaimed', "
             "claimed_by=NULL, claimed_at=NULL, started_at=NULL, "
@@ -6653,6 +6718,8 @@ def recover_blocked_rework(
             "actor": actor[:120],
             "validation_only_replay": bool(validation_only_replay),
         }
+        if rejection_rebind is not None:
+            recovery_payload["rejection_rebind"] = rejection_rebind
         if validation_only_replay:
             recovery_payload["validation_only_replay_lineage"] = card[
                 "validation_only_replay_lineage"
