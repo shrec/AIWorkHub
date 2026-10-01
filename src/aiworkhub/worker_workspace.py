@@ -5728,7 +5728,7 @@ def _restat_seeds_equal_to_index_blobs(worktree: Path, relatives: list[str]) -> 
             for relative, oid in zip(tracked, oids, strict=True)
             if oid == index_entries[relative][1]
             and (
-                os.name == "nt"
+                is_windows()
                 or (index_entries[relative][0] == "100755")
                 == bool((worktree / relative).stat().st_mode & 0o100)
             )

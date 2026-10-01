@@ -59,7 +59,7 @@ from .storage_registry import (
     resolve_database_path,
 )
 from .provider_tool_guards import ProviderGuardError, apply_repository_guards
-from .platform_io import process_is_alive
+from .platform_io import is_windows, process_is_alive
 from . import db_writer
 from . import review_lifecycle
 from . import task_fsm
@@ -4309,7 +4309,7 @@ def _workspace_has_link_component(repo: Path, workspace: Path) -> bool:
             if is_junction is not None:
                 if is_junction():
                     return True
-            elif os.name == "nt" and current.exists():
+            elif is_windows() and current.exists():
                 # Python < 3.12: a junction is a reparse point that is not a
                 # symlink (FILE_ATTRIBUTE_REPARSE_POINT == 0x400).
                 attributes = getattr(os.lstat(current), "st_file_attributes", 0)
