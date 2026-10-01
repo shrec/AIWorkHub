@@ -1210,6 +1210,12 @@ def launch_isolated(
                     "repo_id": identity["repo_id"],
                     "worker_kind": identity["worker_kind"],
                 }
+            # NF-2026-01159: one encoder decides the prompt bytes, and the
+            # supervisor is told how many to expect before it is able to spawn
+            # anything.  A count is not the prompt, so the spec, the logs and
+            # the receipts still carry no prompt text and the argv still
+            # carries no positional prompt.
+            stdin_payload = runtime_adapters.plan_stdin_payload(plan)
             write_json_0600(spec_path, {
                 "argv": worker_argv,
                 "cwd": launch_cwd,
@@ -1221,6 +1227,15 @@ def launch_isolated(
                 "max_output_bytes": MAX_WORKER_STREAM_LOG_BYTES,
                 "adapter_id": adapter_id,
                 "token_budget": metadata.get("token_budget"),
+                **(
+                    {
+                        runtime_adapters.WORKER_PROMPT_BYTES_SPEC_KEY: len(
+                            stdin_payload
+                        )
+                    }
+                    if stdin_payload is not None
+                    else {}
+                ),
                 **appcontainer_identity_fields,
                 **({"worker_mcp_bridge": worker_mcp_bridge} if worker_mcp_bridge else {}),
             })
@@ -1248,31 +1263,68 @@ def launch_isolated(
             ):
                 raise _ReviewerReservationTerminalized(reserved_request_id)
             launch_phase = "supervisor_spawn"
-            stdin_text = getattr(plan, "stdin_text", None)
             process = self._popen(
                 [sys.executable, str(supervisor), "--spec", str(spec_path)],
                 cwd=launch_cwd,
                 env=launch_env,
-                stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
+                stdin=(
+                    subprocess.PIPE
+                    if stdin_payload is not None
+                    else subprocess.DEVNULL
+                ),
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 shell=False,
                 **process_group_launch_kwargs(os.name),
             )
-            if stdin_text is not None:
+            if stdin_payload is not None:
+                launch_phase = "supervisor_prompt_delivery"
+                # NF-2026-01159: this was a fire-and-forget daemon thread that
+                # swallowed every write error and closed the pipe in its
+                # ``finally`` even when nothing had been written, so a failed
+                # or short delivery reached the supervisor as a clean zero-byte
+                # EOF -- indistinguishable there from a plan that carries no
+                # prompt, and the worker was launched with ``stdin=DEVNULL``.
+                # The feeder is still a thread so a supervisor that dies before
+                # reading cannot wedge this one, but its outcome is now read.
+                # It cannot deadlock on a full pipe: the supervisor drains its
+                # whole stdin before it loads the spec or spawns anything.
+                delivery_error: list[str] = []
 
                 def _feed_supervisor_stdin() -> None:
                     try:
-                        process.stdin.write(stdin_text.encode("utf-8"))
-                    except (OSError, ValueError):
-                        pass
+                        # The flushed write IS the delivery, so this is the
+                        # only failure that can mean the prompt did not land.
+                        process.stdin.write(stdin_payload)
+                        process.stdin.flush()
+                    except Exception as exc:
+                        delivery_error.append(f"{type(exc).__name__}:{exc}")
                     finally:
+                        # The close is what the supervisor reads as EOF, and
+                        # CPython releases the descriptor even when the call
+                        # raises, so a failure here cannot have cost an already
+                        # flushed byte and must not reject a delivered prompt.
                         try:
                             process.stdin.close()
-                        except OSError:
+                        except Exception:
                             pass
 
-                threading.Thread(target=_feed_supervisor_stdin, daemon=True).start()
+                feeder = threading.Thread(
+                    target=_feed_supervisor_stdin, daemon=True
+                )
+                feeder.start()
+                feeder.join(timeout=60.0)
+                if feeder.is_alive():
+                    delivery_error.append("delivery_timeout")
+                if delivery_error:
+                    # The supervisor refuses a short delivery on its own side
+                    # too; failing here as well keeps a launch that can never
+                    # produce work from ever becoming a live request.
+                    _terminate_process_group(process.pid, grace_seconds=5.0)
+                    raise LaunchRejected(
+                        "worker_prompt_not_delivered:launcher:"
+                        + ";".join(delivery_error)[:200]
+                    )
             started_at = _utcnow()
             launch_phase = "supervisor_pid_identity"
             start_ticks = _pid_start_ticks(process.pid)

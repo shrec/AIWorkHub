@@ -939,6 +939,15 @@ class _FakeThread:
     def start(self) -> None:
         return None
 
+    # A launch that carries a prompt now reads its feeder's outcome instead of
+    # abandoning the thread (NF-2026-01159), so this double must answer both
+    # calls: joined instantly, and never still running.
+    def join(self, timeout: float | None = None) -> None:
+        return None
+
+    def is_alive(self) -> bool:
+        return False
+
 
 class _OpenCodeLaunchManager(_StubManager):
     def __init__(self, authority: Path, process_dir: Path) -> None:
@@ -1526,3 +1535,192 @@ def test_a_non_opencode_launch_never_reads_or_receives_the_opencode_config(
     env = harness.manager.popen_calls[0][1]["env"]
     assert not [key for key in env if key.startswith("OPENCODE_")]
     assert harness.env_calls[0]["provider_env"] is None
+
+
+def test_nf01159_feeder_write_failure_rejects_the_launch_and_terminates_the_supervisor(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A feeder whose write() raises must fail loud, not hand back a live request.
+
+    Before this fix the feeder thread was fire-and-forget: a failed write left
+    the supervisor reading a clean zero-byte EOF, indistinguishable from "no
+    prompt", and the launch still reported success. The launcher must now read
+    the feeder's outcome, terminate the supervisor it already spawned, and
+    refuse the launch.
+    """
+    base = tmp_path.resolve()
+    authority = base / "authority"
+    root = base / ".aiworkhub" / "runtime" / "worktrees" / "R-nf01159-feeder"
+    workspace = worker_workspace.WorkerWorkspace(
+        request_id="R-nf01159-feeder",
+        repo=authority,
+        path=root / "worktree",
+        home=root / "home",
+        allowed_writes=("src/a.py",),
+        parent_baseline={},
+        workspace_baseline={},
+    )
+    process_dir = base / "processes"
+    for directory in (authority, workspace.path, workspace.home, process_dir):
+        directory.mkdir(parents=True)
+
+    class _WriteFailsStdin:
+        def write(self, _data: bytes) -> int:
+            raise OSError("broken pipe")
+
+        def flush(self) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    plan = runtime_adapters.RuntimeAdapterPlan(
+        adapter_id="claude_cli",
+        argv=[sys.executable, "-c", "pass"],
+        cwd=str(workspace.path),
+        executable=sys.executable,
+        launchable=True,
+        manual_only=False,
+        validation_ok=True,
+        validation_reason="",
+        reasoning_decision=None,
+        context_capacity=None,
+        stdin_text="prompt-text",
+    )
+    terminated: list[tuple[int, float]] = []
+
+    class _Manager(_StubManager):
+        def __init__(self) -> None:
+            super().__init__(authority)
+            self.process_dir = process_dir
+            self._live: dict[str, object] = {}
+            self._lock = contextlib.nullcontext()
+            self.popen_calls: list[tuple[list[str], dict[str, object]]] = []
+
+        def _preflight_card(self, *_a: object, **_k: object) -> dict[str, object]:
+            return {
+                "request_id": "R-nf01159-feeder",
+                "allowed_writes": ["src/a.py"],
+                "required_outputs": ["src/a.py"],
+            }
+
+        def _with_dependency_inputs(self, card: dict[str, object]) -> dict[str, object]:
+            return dict(card)
+
+        def _resolve_provider_env(
+            self, _adapter_id: str, model: str | None
+        ) -> tuple[None, str | None]:
+            return None, model
+
+        def _launch_reservation(
+            self, _event: dict[str, object]
+        ) -> contextlib.AbstractContextManager[None]:
+            return contextlib.nullcontext()
+
+        def _terminal_authority_grant_path(self, request_id: str) -> Path:
+            return self.process_dir / f"{request_id}.authority.json"
+
+        def _terminal_authority_key(self) -> bytes:
+            return b"test-key"
+
+        def _build_adapter(self, **_kwargs: object) -> object:
+            return plan
+
+        def _popen(self, argv: list[str], **kwargs: object) -> object:
+            self.popen_calls.append((list(argv), dict(kwargs)))
+            return SimpleNamespace(pid=9191, stdin=_WriteFailsStdin())
+
+        def _monitor(self, _live: object) -> None:
+            return None
+
+    runtime = SimpleNamespace(
+        server_name="test-worker-mcp",
+        tool_names=(),
+        env={},
+        audit_ledger_path=None,
+        audit_hmac_key_path=None,
+        claude_mcp_config_path=workspace.home / "claude.json",
+        copilot_mcp_config_path=workspace.home / "copilot.json",
+        codex_config_toml_path=workspace.home / "config.toml",
+        kilo_config_path=workspace.home / "kilo.json",
+        package_import_root=tmp_path,
+    )
+    workspace.home.mkdir(parents=True, exist_ok=True)
+    (workspace.home / "claude.json").write_text("{}", encoding="utf-8")
+
+    class _TaskEngine:
+        @staticmethod
+        def claim_start_exact(*_a: object, **_k: object) -> dict[str, object]:
+            return {"ok": True, "card": {"claim_epoch": 1}}
+
+        @staticmethod
+        def mark_launch_failed(
+            *_a: object, reason: str, **_k: object
+        ) -> dict[str, object]:
+            return {"ok": True}
+
+    def _spy_terminate(pid: int, *, grace_seconds: float) -> None:
+        terminated.append((pid, grace_seconds))
+
+    def _set(name: str, value: object) -> None:
+        monkeypatch.setattr(process_launcher, name, value)
+
+    monkeypatch.setattr(worker_workspace, "chmod_path", lambda *_a, **_k: None)
+    monkeypatch.setattr(runtime_adapters, "probe_release", lambda _exe: {"ok": False})
+    _set("launch_gates_open", lambda: True)
+    _set("task_engine", _TaskEngine)
+    _set("_validate_adapter_identity", lambda *_a: None)
+    _set("validate_workforce_identity", lambda _r, _a, model, **_k: model)
+    _set("_memory_launch_admission", lambda: {"admit": True})
+    _set("_external_readonly_dirs", lambda *_a: [])
+    _set("_task_authority_repo", lambda *_a: authority)
+    _set("_launch_project_context", lambda *_a: None)
+    _set("_launch_source_graph_request", lambda *_a: None)
+    _set("_sandbox_backend_for_adapter", lambda _adapter_id: "landlock")
+    _set("sandbox_argv", lambda _ws, _adapter, argv, **_k: list(argv))
+    _set("create_workspace", lambda *_a: workspace)
+    _set("build_residual_contract_manifest", lambda *_a: [])
+    _set("_materialize_worker_rework_overlay", lambda *_a, **_k: (None, None))
+    _set("_materialize_crash_retry_packet", lambda *_a, **_k: (None, None))
+    _set("_provision_worker_mcp_runtime_for_authority", lambda *_a, **_k: runtime)
+    _set("_worker_mcp_source_graph_targets", lambda _context: ("src/a.py",))
+    _set("_worker_mcp_session_topic", lambda *_a: "topic")
+    _set("build_worker_prompt", lambda **_k: "prompt-text")
+    _set("worker_launch_env", lambda *_a, **_k: dict(os.environ))
+    _set("worker_temp_environment", lambda _repo, _request_id: {})
+    _set("worker_validation_affordance_env", lambda *_a, **_k: {})
+    _set("_worker_launch_cwd", lambda path: str(path))
+    _set("_worker_supervisor_script", lambda: tmp_path / "supervisor.py")
+    _set("_touch_0600", lambda path: Path(path).write_text("", encoding="utf-8"))
+    _set("chmod_path", lambda *_a: None)
+    _set("write_json_0600", lambda path, data: None)
+    _set("_write_terminal_authority_grant", lambda *_a, **_k: None)
+    _set("_release_launch_request_resources", lambda **_k: [])
+    _set("_pid_start_ticks", lambda _pid: 123)
+    _set("process_group_launch_kwargs", lambda _name: {})
+    _set("_terminate_process_group", _spy_terminate)
+    _set(
+        "_committed_claim_card",
+        lambda _claim, **_k: {
+            "request_id": "R-nf01159-feeder",
+            "claim_epoch": 1,
+            "allowed_writes": ["src/a.py"],
+        },
+    )
+
+    manager = _Manager()
+
+    result = _launch(
+        manager,
+        task_id="T-nf01159-feeder",
+        runner="claude",
+        topic="topic",
+        adapter_id="claude_cli",
+        model=None,
+        owner_prompt="",
+        timeout_seconds=120,
+    )
+
+    assert result["ok"] is False
+    assert str(result["blocked_reason"]).startswith("worker_prompt_not_delivered:launcher:")
+    assert terminated == [(9191, 5.0)]

@@ -854,6 +854,30 @@ def _validated_argv(value: Any) -> list[str]:
     return list(value)
 
 
+# NF-2026-01159.  The launcher records how many prompt bytes it is about to
+# put on this supervisor's stdin under this spec key -- a count only, never the
+# prompt text, so the spec, the logs and the receipts stay free of it.  The
+# producer is ``runtime_adapters.WORKER_PROMPT_BYTES_SPEC_KEY``; it is spelled
+# out here rather than imported because the supervisor also runs as a direct
+# script next to its sibling modules, with no ``runtime_adapters`` on the path.
+WORKER_PROMPT_BYTES_SPEC_KEY = "stdin_text_bytes"
+WORKER_PROMPT_NOT_DELIVERED = "worker_prompt_not_delivered"
+
+
+def _expected_prompt_bytes(spec: dict[str, Any]) -> int:
+    """Prompt bytes the launcher declared it would deliver, else ``0``.
+
+    ``0`` is the whole no-prompt fact: an absent key (every adapter that keeps
+    its prompt in argv, and every spec written before this key existed), a
+    malformed value, or a negative one.  Only a positive declared count can
+    make :func:`supervise` refuse, so no existing launch shape is affected.
+    """
+    try:
+        declared = int(spec.get(WORKER_PROMPT_BYTES_SPEC_KEY) or 0)
+    except (TypeError, ValueError):
+        return 0
+    return declared if declared > 0 else 0
+
 def _die_with_supervisor() -> None:
     """Ensure an abruptly killed Linux supervisor cannot orphan its worker."""
     libc = ctypes.CDLL(None, use_errno=True)
@@ -1104,6 +1128,12 @@ def supervise(spec: dict[str, Any], *, stdin_text: str | None = None) -> int:
     signal.signal(signal.SIGINT, stop)
     if os.name == "nt":
         signal.signal(signal.SIGBREAK, stop)
+    # NF-2026-01159: the number of prompt bytes this supervisor actually
+    # received on its own stdin.  A count is not the prompt, so it is safe in
+    # every receipt -- and it is the only thing that can tell "this plan
+    # carries no prompt" apart from "this plan's prompt was lost on the way".
+    prompt_bytes_delivered = len(stdin_text.encode("utf-8")) if stdin_text else 0
+    expected_prompt_bytes = _expected_prompt_bytes(spec)
     _write_json_0600(status_path, {
         "state": "starting",
         "supervisor_pid": supervisor_pid,
@@ -1112,9 +1142,35 @@ def supervise(spec: dict[str, Any], *, stdin_text: str | None = None) -> int:
         "deadline_epoch": deadline_epoch,
         "timeout_seconds": timeout,
         "timeout_enforced": True,
+        "prompt_bytes_delivered": prompt_bytes_delivered,
     })
 
     try:
+        # The launch plan declared a prompt of exactly this many bytes.  Refuse
+        # here rather than hand the child DEVNULL and let it die on an empty
+        # stdin with a provider-worded error and zero changed files.  This runs
+        # before any spawn and ahead of the backend branch below, so the
+        # plain-subprocess and AppContainer paths are covered by one check.
+        if expected_prompt_bytes and prompt_bytes_delivered != expected_prompt_bytes:
+            _write_json_0600(status_path, {
+                "state": "spawn_failed",
+                "supervisor_pid": supervisor_pid,
+                "exit_code": 126,
+                "spawn_phase": "worker_prompt_delivery",
+                "error": (
+                    f"{WORKER_PROMPT_NOT_DELIVERED}:"
+                    f"expected_bytes={expected_prompt_bytes}:"
+                    f"received_bytes={prompt_bytes_delivered}"
+                ),
+                "prompt_bytes_expected": expected_prompt_bytes,
+                "prompt_bytes_delivered": prompt_bytes_delivered,
+                "started_at_epoch": started_epoch,
+                "finished_at_epoch": time.time(),
+                "deadline_epoch": deadline_epoch,
+                "timeout_seconds": timeout,
+                "timeout_enforced": True,
+            })
+            return 126
         spawn_phase = "child_spawn"
         try:
             if execution_backend == "windows_appcontainer":
@@ -1204,6 +1260,7 @@ def supervise(spec: dict[str, Any], *, stdin_text: str | None = None) -> int:
             "deadline_epoch": deadline_epoch,
             "timeout_seconds": timeout,
             "timeout_enforced": True,
+            "prompt_bytes_delivered": prompt_bytes_delivered,
             "heartbeat_seq": heartbeat_seq,
             "heartbeat_at_epoch": time.time(),
             "stdout_bytes": last_stdout_bytes,
@@ -1292,6 +1349,7 @@ def supervise(spec: dict[str, Any], *, stdin_text: str | None = None) -> int:
                     "deadline_epoch": deadline_epoch,
                     "timeout_seconds": timeout,
                     "timeout_enforced": True,
+                    "prompt_bytes_delivered": prompt_bytes_delivered,
                     "heartbeat_seq": heartbeat_seq,
                     "heartbeat_at_epoch": time.time(),
                     "stdout_bytes": last_stdout_bytes,
@@ -1395,6 +1453,7 @@ def supervise(spec: dict[str, Any], *, stdin_text: str | None = None) -> int:
             "deadline_epoch": deadline_epoch,
             "timeout_seconds": timeout,
             "timeout_enforced": True,
+            "prompt_bytes_delivered": prompt_bytes_delivered,
             "heartbeat_seq": heartbeat_seq,
             "heartbeat_at_epoch": time.time(),
             "stdout_bytes": final_stdout_bytes,
@@ -1523,8 +1582,20 @@ def main() -> None:
     args = parser.parse_args()
     # The prompt (NF-2026-00042) arrives on our own stdin, never in the spec
     # file: a plain-subprocess DEVNULL launch reads back empty bytes here.
-    raw_stdin = sys.stdin.buffer.read()
-    stdin_text = raw_stdin.decode("utf-8") if raw_stdin else None
+    #
+    # NF-2026-01159: an empty read is NOT the same fact as "this launch plan
+    # carries no prompt", and collapsing both into ``None`` here is what let a
+    # prompt lost anywhere upstream reach ``claude -p`` as ``stdin=DEVNULL``.
+    # The value still collapses to ``None`` so the genuine no-prompt branch is
+    # unchanged; ``supervise`` is what refuses a short delivery now, by
+    # comparing the bytes that arrived against the count the launcher recorded
+    # in the spec.  Undecodable bytes are a lost prompt too, never a prompt.
+    raw_stdin = sys.stdin.buffer.read() if sys.stdin is not None else b""
+    try:
+        decoded = raw_stdin.decode("utf-8")
+    except UnicodeDecodeError:
+        decoded = ""
+    stdin_text = decoded or None
     spec_path = Path(args.spec)
     try:
         spec = _load_spec(spec_path)

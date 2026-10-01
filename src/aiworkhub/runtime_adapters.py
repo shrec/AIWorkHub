@@ -2326,6 +2326,32 @@ def build_runtime_command(
     )
 
 
+# NF-2026-01159.  The supervisor spec key carrying the prompt's byte COUNT --
+# never the prompt itself -- so the supervisor can tell a plan that has no
+# prompt apart from a plan whose prompt was lost before it arrived.
+WORKER_PROMPT_BYTES_SPEC_KEY = "stdin_text_bytes"
+
+
+def plan_stdin_payload(plan: object) -> bytes | None:
+    """The exact bytes a launcher must put on the worker's stdin, or ``None``.
+
+    Every launcher routes a plan's prompt through this one encoder, so the
+    count a supervisor is told to expect and the bytes actually written can
+    never be derived two different ways (NF-2026-01159: a prompt that went
+    missing between the two was indistinguishable from a plan that never
+    carried one, and the worker was launched with ``stdin=DEVNULL``).
+
+    ``None`` means "this plan has no prompt to deliver" and is the answer for
+    every argv-prompt adapter, for a plan with no ``stdin_text`` attribute at
+    all, and for an empty ``stdin_text`` -- an empty prompt is not something a
+    launcher can deliver, so those callers keep the unchanged DEVNULL branch.
+    """
+    stdin_text = getattr(plan, "stdin_text", None)
+    if stdin_text is None:
+        return None
+    payload = str(stdin_text).encode("utf-8")
+    return payload or None
+
 def build_manager_command(
     adapter_id: str,
     prompt: str,
