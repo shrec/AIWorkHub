@@ -251,10 +251,18 @@ def test_learning_commit_resumes_only_failed_projection(tmp_path, monkeypatch):
 def test_rejected_finalization_creates_one_idempotent_commit_classified_candidate_code(
     tmp_path, monkeypatch,
 ):
+    """NF-2026-01197: "rejected" binds to a LANDED manager disposition, so this
+    fixture routes through the real ``core.reject_review`` instead of seeding
+    ``terminal_review`` alone -- a card that only ever terminalized, with no
+    manager reject, must no longer resolve as rejected.
+    """
     root = _setup_repo(tmp_path, monkeypatch)
+    _coordinator_env(root, tmp_path, monkeypatch)
     task_id = "TASK-REJECTED-1"
     request_id = "request-rejected-0001"
-    _review_card(root, task_id=task_id, request_id=request_id, substatus="validation_failed")
+    _rejectable_card(root, task_id=task_id, request_id=request_id, substatus="validation_failed")
+    rejected = core.reject_review(task_id, "candidate code defect", to="pending")
+    assert rejected["ok"] is True, rejected
 
     def _reject() -> dict:
         return manager_ai_tools.learning_commit(
@@ -317,13 +325,23 @@ def test_blocked_finalization_creates_one_idempotent_inconclusive_commit_classif
     assert second["commit_id"] == first["commit_id"]
 
 
-def test_failure_category_is_never_derived_from_manager_supplied_prose(tmp_path, monkeypatch):
+def test_failure_category_is_never_derived_from_manager_supplied_prose(
+    tmp_path, monkeypatch,
+):
+    """NF-2026-01197: a "rejected" commit now binds to a LANDED manager
+    disposition, so this fixture routes through the real ``core.reject_review``
+    instead of seeding ``terminal_review`` alone -- the prose-immunity claim
+    this test makes only holds for a rejection that actually happened.
+    """
     root = _setup_repo(tmp_path, monkeypatch)
+    _coordinator_env(root, tmp_path, monkeypatch)
     task_id = "TASK-PROSE-SPOOF-1"
     request_id = "request-prose-spoof-0001"
     # Structured evidence says review_ready (candidate_code); a manager
     # cannot override that by writing convincing infra-sounding prose.
-    _review_card(root, task_id=task_id, request_id=request_id, substatus="review_ready")
+    _rejectable_card(root, task_id=task_id, request_id=request_id, substatus="review_ready")
+    rejected = core.reject_review(task_id, "looks like an outage but is not", to="pending")
+    assert rejected["ok"] is True, rejected
 
     result = manager_ai_tools.learning_commit(
         task_id=task_id,

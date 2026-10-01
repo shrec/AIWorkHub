@@ -204,7 +204,53 @@ def _canonical_acceptance_reference(card: dict[str, Any], request_id: str) -> st
     return cast(str, record.reference)
 
 
+def _landed_manager_rejection(card: dict[str, Any], request_id: str) -> bool:
+    """True only when ``core.reject_review`` committed a rejection for this exact request.
+
+    A rejection that sends the card back for rework is still an adjudicated
+    outcome, and it is the COMMON one -- but it never stamps terminal_review,
+    so until now only a rejection that TERMINATED a card could be learned
+    from. Measured 2026-09-02 on AIWORKHUB_01082: after reject_review the
+    card carried the adjudicated request id twice, in review_feedback and in
+    rework_predecessor, and this predicate looked at neither, so the commit
+    failed learning_commit_request_identity_mismatch.
+
+    All three fields below are written by reject_review itself, not supplied
+    by a model: rework_predecessor pins the predecessor's changed-path hashes
+    and review_feedback carries the reason's sha256. A blocked park may have
+    neither, so rejection_disposition -- written for every disposition,
+    including one that terminates the card -- is the durable exact-request
+    authority for that path. Accepting only its schema- and category-validated
+    pin binds the lesson to the exact request that was judged.
+
+    NF-2026-01197: a card's ``terminal_review`` is deliberately NOT checked
+    here. It is stamped by the FINALIZER for any terminal request
+    (validation_failed, worker_failed, finalize_failed) whether or not a
+    manager ever acted on it, and it is never cleared by an older episode's
+    rejection, so matching it alone let a request with no landed manager
+    reject -- or a stale pin left by an OLDER rejection of the same card --
+    resolve as "rejected".
+    """
+    for section in ("rework_predecessor", "review_feedback"):
+        block = card.get(section)
+        if not isinstance(block, dict):
+            continue
+        for key in ("request_id", "predecessor_request_id"):
+            if str(block.get(key) or "") == request_id:
+                return True
+    return _pinned_rejection_disposition(card, request_id) is not None
+
+
 def _request_matches_candidate(card: dict[str, Any], request_id: str) -> bool:
+    """True when the card's own state -- adjudicated or not -- names this request.
+
+    Looser than :func:`_landed_manager_rejection`: it also accepts the
+    ``accepted_request_id`` seal and the finalizer-stamped ``terminal_review``
+    identity, neither of which proves a manager rejected anything. That is
+    only safe where no adjudicated judgement is being claimed -- today, the
+    ``inconclusive`` outcome, which per :data:`learning_commit._PROMOTABLE_OUTCOMES`
+    never promotes past the local receipt.
+    """
     if str(card.get("accepted_request_id") or "") == request_id:
         return True
     identity = (
@@ -213,30 +259,7 @@ def _request_matches_candidate(card: dict[str, Any], request_id: str) -> bool:
     )
     if str(identity.get("request_id") or "") == request_id:
         return True
-    # A rejection that sends the card back for rework is still an adjudicated
-    # outcome, and it is the COMMON one -- but it never stamps terminal_review,
-    # so until now only a rejection that TERMINATED a card could be learned
-    # from. Measured 2026-09-02 on AIWORKHUB_01082: after reject_review the
-    # card carried the adjudicated request id twice, in review_feedback and in
-    # rework_predecessor, and this predicate looked at neither, so the commit
-    # failed learning_commit_request_identity_mismatch.
-    #
-    # All three are written by reject_review itself, not supplied by a model:
-    # rework_predecessor pins the predecessor's changed-path hashes and
-    # review_feedback carries the reason's sha256. A blocked park may have
-    # neither, so rejection_disposition is the durable exact-request authority
-    # for that path. Accepting only its schema- and category-validated pin binds
-    # the lesson to the exact request that was judged.
-    for section in ("rework_predecessor", "review_feedback"):
-        block = card.get(section)
-        if not isinstance(block, dict):
-            continue
-        for key in ("request_id", "predecessor_request_id"):
-            if str(block.get(key) or "") == request_id:
-                return True
-    if _pinned_rejection_disposition(card, request_id) is not None:
-        return True
-    return False
+    return _landed_manager_rejection(card, request_id)
 
 
 # Written by core.reject_review only, from structured card evidence, in the
@@ -896,6 +919,14 @@ def commit_learning(
     if outcome == Outcome.ACCEPTED:
         canonical_reference = _canonical_acceptance_reference(card, request_id)
         evidence_ids = list(dict.fromkeys([canonical_reference, *evidence_ids]))
+    elif outcome == Outcome.REJECTED:
+        # "rejected" is an adjudicated judgement that promotes into durable
+        # knowledge, so it binds only to a LANDED manager disposition for this
+        # exact request (NF-2026-01197) -- never to a finalizer-only
+        # terminal_review, which _request_matches_candidate below still
+        # accepts for the non-adjudicated "inconclusive" outcome.
+        if not _landed_manager_rejection(card, request_id):
+            raise LearningCommitStoreError("learning_commit_request_identity_mismatch")
     elif not _request_matches_candidate(card, request_id):
         raise LearningCommitStoreError("learning_commit_request_identity_mismatch")
     normalized["evidence_ids"] = evidence_ids
@@ -1243,7 +1274,7 @@ def adjudicated_decision(card: dict[str, Any], request_id: str) -> str:
         and str(card.get("accepted_request_id") or "") == request
     ):
         return "accepted"
-    if _request_matches_candidate(card, request):
+    if _landed_manager_rejection(card, request):
         return "rejected"
     return ""
 
