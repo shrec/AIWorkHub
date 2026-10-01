@@ -7,6 +7,7 @@ import json
 import math
 import os
 import posixpath
+import re
 import shutil
 import stat
 import subprocess
@@ -292,6 +293,53 @@ def _performance_metric(receipt: Mapping[str, Any]) -> dict[str, Any]:
     return {**payload, "metric": metric, "unit": unit, "value": numeric}
 
 
+_PYTEST_EXECUTABLE_NAMES = frozenset({"pytest", "pytest.exe", "py.test"})
+_PYTEST_TALLY_WORD = (
+    r"(?:passed|failed|skipped|xfailed|xpassed|deselected|errors?|warnings?)"
+)
+_PYTEST_SUMMARY_RE = re.compile(
+    r"^=*\s*(?P<groups>\d+ " + _PYTEST_TALLY_WORD
+    + r"(?:, \d+ " + _PYTEST_TALLY_WORD + r")*)"
+    r" in \d+(?:\.\d+)?s(?: \(\d+:\d{2}:\d{2}\))?\s*=*$"
+)
+
+
+def _pytest_tally(receipt: Mapping[str, Any]) -> dict[str, int] | None:
+    """Parse the final pytest summary line of a pytest validation receipt.
+
+    Limits: a receipt without a parsable summary keeps returncode semantics
+    (None). The tally comes from candidate-visible stdout, so it guards
+    accidental emptiness (e.g. an environment-wide skip) and is not an
+    anti-forgery control. An xfail-only run executed no passing test and is
+    unmeasured by design; an xpassed test ran and counts as measured.
+    """
+
+    command = str(receipt.get("declared_command") or receipt.get("command") or "")
+    if not any(
+        token == "pytest"
+        or posixpath.basename(token.replace("\\", "/")) in _PYTEST_EXECUTABLE_NAMES
+        for token in (raw.strip("\"'") for raw in command.split())
+    ):
+        return None
+    head = str(receipt.get("stdout_head") or "")
+    tail = str(receipt.get("stdout_tail") or "")
+    text = _merge_stdout_windows(head, tail)
+    summary: str | None = None
+    for raw_line in text.splitlines():
+        match = _PYTEST_SUMMARY_RE.match(raw_line.strip())
+        if match is not None:
+            summary = match.group("groups")
+    if summary is None:
+        return None
+    tally: dict[str, int] = {"passed": 0}
+    for group in summary.split(", "):
+        count, word = group.split(" ", 1)
+        if word in {"errors", "warnings"}:
+            word = word[:-1]
+        tally[word] = tally.get(word, 0) + int(count)
+    return tally
+
+
 def evaluate_behavioral_gate(
     authority: Mapping[str, Any],
     validation_receipts: Iterable[Mapping[str, Any]],
@@ -356,6 +404,12 @@ def evaluate_behavioral_gate(
             "returncode": receipt.get("returncode"),
             "timed_out": bool(receipt.get("timed_out")),
         }
+        if passed and role != VALIDATION_ROLE_GENERIC:
+            tally = _pytest_tally(receipt)
+            if tally is not None and tally["passed"] + tally.get("xpassed", 0) == 0:
+                check["passed"] = False
+                check["unmeasured"] = "no_tests_passed"
+                check["pytest_tally"] = tally
         checks.append(check)
         by_role.setdefault(role, []).append(receipt)
 
@@ -373,13 +427,21 @@ def evaluate_behavioral_gate(
             "checks": checks,
         }
     missing = [role for role in required if role not in by_role]
-    failed = [check["role"] for check in checks if not check["passed"]]
-    if missing or failed:
-        reason = (
-            "behavioral_evidence_missing:" + ",".join(missing)
-            if missing
-            else "behavioral_evidence_failed:" + ",".join(sorted(set(failed)))
-        )
+    failed = [
+        check["role"]
+        for check in checks
+        if not check["passed"] and "unmeasured" not in check
+    ]
+    unmeasured = [check["role"] for check in checks if "unmeasured" in check]
+    if missing or failed or unmeasured:
+        if missing:
+            reason = "behavioral_evidence_missing:" + ",".join(missing)
+        elif failed:
+            reason = "behavioral_evidence_failed:" + ",".join(sorted(set(failed)))
+        else:
+            reason = "behavioral_evidence_unmeasured:" + ",".join(
+                sorted(set(unmeasured))
+            )
         return {
             "schema_id": BEHAVIORAL_GATE_SCHEMA_ID,
             "applicable": True,

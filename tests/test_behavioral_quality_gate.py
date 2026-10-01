@@ -237,6 +237,176 @@ def test_runtime_enforcement_attaches_gate_and_fails_closed():
     assert quality_gate["behavioral_gate"]["passed"] is False
 
 
+_REPRO = "python -m pytest -q tests/test_repro.py"
+_REGRESS = "python -m pytest -q tests/test_regress.py"
+
+
+def _bugfix_gate(repro_stdout: str, regress_stdout: str = "64 passed in 1.00s"):
+    return quality_evidence.evaluate_behavioral_gate(
+        {
+            "work_kind": "bugfix",
+            "validation": [_REPRO, _REGRESS],
+            "validation_roles": ["reproduction", "regression"],
+        },
+        [
+            _receipt(_REPRO, "reproduction", stdout=repro_stdout),
+            _receipt(_REGRESS, "regression", stdout=regress_stdout),
+        ],
+    )
+
+
+def test_unmeasured_all_skipped_reproduction_is_not_passed():
+    gate = _bugfix_gate(
+        "4 skipped in 0.12s", "64 passed, 10 skipped in 38.31s"
+    )
+
+    assert gate["passed"] is False
+    assert gate["reason"] == "behavioral_evidence_unmeasured:reproduction"
+    assert gate["checks"][0]["passed"] is False
+    assert gate["checks"][0]["unmeasured"] == "no_tests_passed"
+    assert gate["checks"][0]["pytest_tally"]["skipped"] == 4
+    assert gate["checks"][0]["pytest_tally"]["passed"] == 0
+    assert "unmeasured" not in gate["checks"][1]
+    assert "pytest_tally" not in gate["checks"][1]
+    assert gate["checks"][1]["passed"] is True
+
+
+def test_unmeasured_padded_summary_with_warning_is_detected():
+    gate = _bugfix_gate(
+        "collected 6 items\n===== 6 skipped, 1 warning in 0.30s =====\n"
+    )
+
+    assert gate["passed"] is False
+    assert gate["reason"] == "behavioral_evidence_unmeasured:reproduction"
+    assert gate["checks"][0]["pytest_tally"] == {
+        "passed": 0,
+        "skipped": 6,
+        "warning": 1,
+    }
+
+
+def test_unmeasured_guard_lets_one_passed_test_with_skips_pass():
+    gate = _bugfix_gate("1 passed, 3 skipped in 0.20s (0:00:00)")
+
+    assert gate["passed"] is True
+    assert gate["reason"] == ""
+    assert all("unmeasured" not in check for check in gate["checks"])
+
+
+def test_unmeasured_guard_counts_xpassed_as_measured():
+    gate = _bugfix_gate("2 xpassed in 0.20s")
+
+    assert gate["passed"] is True
+
+
+def test_unmeasured_guard_reads_a_quoted_pytest_path_with_spaces():
+    command = '"C:/Program Files/venv/Scripts/pytest.exe" -q tests/test_repro.py'
+    gate = quality_evidence.evaluate_behavioral_gate(
+        {
+            "work_kind": "bugfix",
+            "validation": [command, _REGRESS],
+            "validation_roles": ["reproduction", "regression"],
+        },
+        [
+            _receipt(command, "reproduction", stdout="4 skipped in 0.12s"),
+            _receipt(_REGRESS, "regression", stdout="64 passed in 1.00s"),
+        ],
+    )
+
+    assert gate["reason"] == "behavioral_evidence_unmeasured:reproduction"
+
+
+def test_unmeasured_guard_ignores_non_pytest_command():
+    command = "python checks/reproduce.py"
+    gate = quality_evidence.evaluate_behavioral_gate(
+        {
+            "work_kind": "bugfix",
+            "validation": [command, _REGRESS],
+            "validation_roles": ["reproduction", "regression"],
+        },
+        [
+            _receipt(command, "reproduction", stdout="4 skipped in 0.12s"),
+            _receipt(_REGRESS, "regression", stdout="64 passed in 1.00s"),
+        ],
+    )
+
+    assert gate["passed"] is True
+    assert "unmeasured" not in gate["checks"][0]
+
+
+def test_unmeasured_guard_keeps_returncode_semantics_without_summary():
+    gate = _bugfix_gate("", "")
+
+    assert gate["passed"] is True
+    assert all("unmeasured" not in check for check in gate["checks"])
+
+
+def test_unmeasured_generic_role_row_does_not_fail_bugfix_gate():
+    generic = "pytest -q tests/test_extra.py"
+    gate = quality_evidence.evaluate_behavioral_gate(
+        {
+            "work_kind": "bugfix",
+            "validation": [_REPRO, _REGRESS, generic],
+            "validation_roles": ["reproduction", "regression", "generic"],
+        },
+        [
+            _receipt(_REPRO, "reproduction", stdout="2 passed in 0.10s"),
+            _receipt(_REGRESS, "regression", stdout="64 passed in 1.00s"),
+            _receipt(generic, "generic", stdout="5 skipped in 0.10s"),
+        ],
+    )
+
+    assert gate["passed"] is True
+    assert "unmeasured" not in gate["checks"][2]
+
+
+def test_unmeasured_row_beside_failed_row_reports_failed():
+    gate = quality_evidence.evaluate_behavioral_gate(
+        {
+            "work_kind": "bugfix",
+            "validation": [_REPRO, _REGRESS],
+            "validation_roles": ["reproduction", "regression"],
+        },
+        [
+            _receipt(_REPRO, "reproduction", stdout="4 skipped in 0.12s"),
+            _receipt(
+                _REGRESS,
+                "regression",
+                returncode=1,
+                stdout="1 failed, 63 passed in 1.00s",
+            ),
+        ],
+    )
+
+    assert gate["passed"] is False
+    assert gate["reason"] == "behavioral_evidence_failed:regression"
+    assert gate["checks"][0]["unmeasured"] == "no_tests_passed"
+
+
+def test_unmeasured_runtime_enforcement_fails_closed():
+    authority = {
+        "work_kind": "bugfix",
+        "validation": [_REPRO, _REGRESS],
+        "validation_roles": ["reproduction", "regression"],
+    }
+    quality_gate: dict[str, object] = {}
+
+    with pytest.raises(
+        process_launcher.WorkspaceError,
+        match="behavioral_gate_failed:behavioral_evidence_unmeasured:reproduction",
+    ):
+        process_launcher._enforce_behavioral_gate(
+            authority,
+            [
+                _receipt(_REPRO, "reproduction", stdout="4 skipped in 0.12s"),
+                _receipt(_REGRESS, "regression", stdout="64 passed in 1.00s"),
+            ],
+            quality_gate,
+        )
+
+    assert quality_gate["behavioral_gate"]["passed"] is False
+
+
 def test_public_task_create_exposes_behavioral_contract_fields():
     parameters = inspect.signature(server.aiworkhub_task_create).parameters
 
