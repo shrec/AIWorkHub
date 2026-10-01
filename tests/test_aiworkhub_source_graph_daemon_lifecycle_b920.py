@@ -286,15 +286,15 @@ def test_production_default_build_runs_in_dedicated_subprocess(tmp_path, monkeyp
     root = _init_repo(tmp_path)
     (root / "app.py").write_text("def live_probe():\n    return 1\n", encoding="utf-8")
     monkeypatch.delenv(source_graph_daemon.BUILD_EXECUTION_ENV, raising=False)
-    monkeypatch.setenv("PYTHONPATH", str(_SRC))
+    monkeypatch.setenv("PYTHONPATH", str(_SRC), prepend=os.pathsep)
     daemon = source_graph_daemon.SourceGraphDaemon(root)
 
     assert daemon._build_execution == source_graph_daemon.BUILD_EXECUTION_SUBPROCESS
     assert daemon._run_one_build() is True
     health = daemon.health()
-    assert health["ok"] is True
-    assert health["status"] == source_graph_daemon.STATUS_READY
-    assert health["last_report"]["files_seen"] == 4
+    assert health["ok"] is True, health.get("last_error")
+    assert health["status"] == source_graph_daemon.STATUS_READY, health.get("last_error")
+    assert health["last_report"]["files_seen"] == 4, health.get("last_error")
 
 
 def test_old_success_is_truthfully_stale_until_next_success(tmp_path, monkeypatch):
