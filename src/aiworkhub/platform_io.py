@@ -11,6 +11,7 @@ import contextlib
 import ctypes
 import errno
 import importlib
+import json
 import math
 import ntpath
 import os
@@ -23,6 +24,7 @@ import sys
 import time
 import unicodedata
 from collections.abc import Callable, Iterator, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, TypedDict, cast
 
@@ -2980,3 +2982,605 @@ def pinned_paths(paths: "list[Path]") -> "Iterator[None]":
     finally:
         for handle in reversed(handles):
             kernel32.CloseHandle(handle)
+
+
+# ---------------------------------------------------------------------------
+# AIWORKHUB_SANDBOX_SLOT_SECTION -- the repo-local worker sandbox model.
+#
+# Every byte a worker writes -- home, temp, cache, state, config, workspace and
+# logs -- lives under <repo>/.aiworkhub/runtime/sandboxes/slots/<slot-id>.  No
+# path below is derived from the user profile, the local app-data root, the
+# interpreter's own home or temp defaults, the system drive or a hardcoded
+# drive letter: the repository may live on any volume, and a request whose
+# containment cannot be proved does not start rather than falling back.  No
+# elevation, no drive-letter mapping and no ACL is written here -- the Windows
+# AppContainer backend is a separate authority.  Holder liveness goes through
+# process_is_alive, which on Windows asks the kernel for the exit code and
+# never touches the process.
+# ---------------------------------------------------------------------------
+
+# The seven storage conventions a worker can reach, in the order they are
+# created and cleaned.  Card 01173B/C consume this tuple, so its order and
+# spelling are part of the contract.
+SANDBOX_SLOT_DIRS: tuple[str, ...] = (
+    "home",
+    "temp",
+    "state",
+    "cache",
+    "config",
+    "workspace",
+    "logs",
+)
+
+SANDBOX_REASON_SLOTS_EXHAUSTED = "sandbox_slots_exhausted"
+SANDBOX_REASON_PATH_ESCAPES_ROOT = "sandbox_path_escapes_root"
+SANDBOX_REASON_REPARSE_POINT = "sandbox_reparse_point"
+SANDBOX_REASON_UNC_PATH = "sandbox_unc_path"
+SANDBOX_REASON_CASE_ALIAS = "sandbox_case_alias"
+SANDBOX_REASON_LEASE_CONFLICT = "sandbox_lease_conflict"
+
+# The whole typed refusal vocabulary.  A caller branches on these codes, never
+# on a message, and there is no seventh "it probably worked" outcome.
+SANDBOX_REASONS: tuple[str, ...] = (
+    SANDBOX_REASON_SLOTS_EXHAUSTED,
+    SANDBOX_REASON_PATH_ESCAPES_ROOT,
+    SANDBOX_REASON_REPARSE_POINT,
+    SANDBOX_REASON_UNC_PATH,
+    SANDBOX_REASON_CASE_ALIAS,
+    SANDBOX_REASON_LEASE_CONFLICT,
+)
+
+# Relative, so the model is volume-agnostic: the tree is always resolved from
+# the repository root the caller supplies.
+_SANDBOX_TREE_RELATIVE = (".aiworkhub", "runtime", "sandboxes")
+_SANDBOX_XDG_DATA_RELATIVE = (".local", "share")
+
+# The slot tree is owner-only.  Windows ignores POSIX mode bits (see
+# chmod_path, which is a no-op there) and this module writes no ACL, so on
+# Windows containment is carried by the path checks below, not by a mode.
+_SANDBOX_DIR_MODE = 0o700
+_SANDBOX_LEASE_MODE = 0o600
+
+_SANDBOX_REPARSE_ATTRIBUTE = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+_SANDBOX_WIN32_EXTENDED_PREFIX = "\\\\?\\"
+
+
+class SandboxUnavailable(RuntimeError):
+    """No sandbox slot could be handed out, with the typed reason why.
+
+    ``reason`` is one of :data:`SANDBOX_REASONS` and is the only thing callers
+    branch on.  Raising is the whole contract: there is no unsandboxed or
+    unverified path to fall back to, because a worker that escapes its slot
+    writes into the repository the slot exists to protect.
+    """
+
+    def __init__(self, reason: str, detail: str = "") -> None:
+        super().__init__(f"{reason}: {detail}" if detail else reason)
+        self.reason = reason
+        self.detail = detail
+
+
+def _sandbox_normalized_key(path: str | os.PathLike[str]) -> str:
+    """One comparison key for containment: case-folded by host semantics.
+
+    ``os.path.normcase`` is the host's own answer to whether two spellings name
+    one path, which is what containment must be measured with.  A Windows
+    extended-length prefix is dropped first so a long resolved child and its
+    shorter resolved root stay comparable; anything the strip does not
+    recognise keeps its prefix and therefore fails the containment test.
+    """
+
+    text = os.fspath(path)
+    if text.startswith(_SANDBOX_WIN32_EXTENDED_PREFIX) and not text.startswith(
+        _SANDBOX_WIN32_EXTENDED_PREFIX + "UNC\\"
+    ):
+        text = text[len(_SANDBOX_WIN32_EXTENDED_PREFIX) :]
+    return os.path.normcase(text)
+
+
+def _sandbox_resolved_key(path: str | os.PathLike[str]) -> str:
+    """Resolve ``path`` strictly and return its containment key.
+
+    Strict resolution is the point: a path that does not exist, or whose
+    resolution fails, has not been proved contained and so is refused.
+    """
+
+    try:
+        return _sandbox_normalized_key(os.path.realpath(path, strict=True))
+    except OSError as exc:
+        raise SandboxUnavailable(SANDBOX_REASON_PATH_ESCAPES_ROOT, os.fspath(path)) from exc
+
+
+def _sandbox_assert_strictly_inside(path: str | os.PathLike[str], root_key: str) -> None:
+    """Refuse ``path`` unless it resolves strictly inside ``root_key``."""
+
+    if not _sandbox_resolved_key(path).startswith(root_key + os.sep):
+        raise SandboxUnavailable(SANDBOX_REASON_PATH_ESCAPES_ROOT, os.fspath(path))
+
+
+def _sandbox_assert_reparse_free(path: Path) -> None:
+    """Refuse a symlink, junction or any other reparse point at ``path``.
+
+    ``lstat`` answers about the link itself, never its target, which is the
+    only way to see a junction planted where the sandbox is about to write or
+    delete.  POSIX reports a symlink through ``S_ISLNK``; Windows does NOT set
+    ``S_IFLNK`` for a junction but does set FILE_ATTRIBUTE_REPARSE_POINT in
+    ``st_file_attributes``, so both answers are consulted.  A path that does
+    not exist yet is not a reparse point and is left to the caller.
+    """
+
+    try:
+        metadata = os.lstat(path)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise SandboxUnavailable(SANDBOX_REASON_REPARSE_POINT, str(path)) from exc
+    if stat.S_ISLNK(metadata.st_mode):
+        raise SandboxUnavailable(SANDBOX_REASON_REPARSE_POINT, str(path))
+    if getattr(metadata, "st_file_attributes", 0) & _SANDBOX_REPARSE_ATTRIBUTE:
+        raise SandboxUnavailable(SANDBOX_REASON_REPARSE_POINT, str(path))
+
+
+def _sandbox_reject_device_or_unc(text: str) -> None:
+    """Refuse a UNC share or a ``\\\\?\\`` / ``\\\\.\\`` device-prefixed root.
+
+    Neither spelling can anchor this containment model: a UNC root has no
+    volume to compare against, and a device prefix suppresses exactly the
+    normalisation every later comparison assumes.  Forward slashes are folded
+    first so ``//server/share`` is refused the same way ``\\\\server\\share``
+    is, on every platform -- a Windows-only refusal would leave the POSIX path
+    accepting a root it cannot contain either.
+    """
+
+    if text.replace("/", "\\").startswith("\\\\"):
+        raise SandboxUnavailable(SANDBOX_REASON_UNC_PATH, text)
+
+
+def _sandbox_reject_case_alias(path: Path) -> None:
+    """Refuse a spelling that only case-folds onto the real directory entry.
+
+    A case-insensitive volume accepts ``...\\REPO`` for a directory stored as
+    ``repo``: every later normcase comparison then passes while the audit trail
+    names a path that was never created.  The real entry is the only accepted
+    spelling, and the check reads the parent's entries rather than asking the
+    host whether it folds case -- so a case-sensitive host refuses the same
+    alias a case-insensitive one would silently accept.
+    """
+
+    name = path.name
+    parent = path.parent
+    if not name or parent == path:
+        return
+    try:
+        entries = os.listdir(parent)
+    except OSError:
+        return
+    if name in entries:
+        return
+    folded = name.casefold()
+    if any(entry.casefold() == folded for entry in entries):
+        raise SandboxUnavailable(SANDBOX_REASON_CASE_ALIAS, str(path))
+
+
+def _sandbox_repo_root(repo_root: str | os.PathLike[str]) -> Path:
+    """Canonicalise the repository root the whole slot tree hangs off.
+
+    Every refusal here happens before anything is created, so a rejected root
+    leaves the target directory exactly as it was.  Resolving the root first is
+    also what makes the reparse checks below meaningful on a host whose temp or
+    home tree is itself reached through a link.
+    """
+
+    text = os.fspath(repo_root)
+    if not text:
+        raise SandboxUnavailable(SANDBOX_REASON_PATH_ESCAPES_ROOT, "repo_root_not_configured")
+    _sandbox_reject_device_or_unc(text)
+    absolute = Path(os.path.abspath(text))
+    _sandbox_reject_device_or_unc(str(absolute))
+    _sandbox_reject_case_alias(absolute)
+    resolved = Path(os.path.realpath(absolute, strict=False))
+    _sandbox_reject_device_or_unc(str(resolved))
+    if not os.path.isdir(resolved):
+        raise SandboxUnavailable(SANDBOX_REASON_PATH_ESCAPES_ROOT, str(resolved))
+    return resolved
+
+
+def sandbox_root(repo_root: str | os.PathLike[str]) -> Path:
+    """The one repo-local root every worker sandbox slot lives under.
+
+    ``realpath(repo_root)/.aiworkhub/runtime/sandboxes`` -- repository-relative
+    on purpose, so the answer is the same on any volume and never borrows the
+    user profile or the system drive.
+    """
+
+    return _sandbox_repo_root(repo_root).joinpath(*_SANDBOX_TREE_RELATIVE)
+
+
+def sandbox_slot_count(cpu_count: int | None = None) -> int:
+    """Derive how many slots this host may lease, from its observed core count.
+
+    The count is the observed cores minus one, so the interactive MCP server
+    keeps a core of its own while every slot is leased; a single-core host
+    still gets one slot rather than none.  The only input is the measurement
+    (``os.cpu_count()`` when the caller supplies nothing) -- there is no pinned
+    worker constant here, because the right number is a property of the machine
+    and cannot be decided in advance.
+    """
+
+    observed = os.cpu_count() if cpu_count is None else cpu_count
+    cores = max(1, int(observed or 1))
+    return max(1, cores - 1)
+
+
+def _sandbox_slot_id(index: int) -> str:
+    """The on-disk name of one slot: stable, sortable, and never a path."""
+
+    return f"slot-{index:02d}"
+
+
+@dataclass(frozen=True)
+class SandboxPlan:
+    """Where one leased worker may write, and nowhere else.
+
+    The seven storage paths and every value :meth:`environment` exports resolve
+    strictly inside ``slot_root``; ``repo_root``, ``sandbox_root`` and
+    ``slot_root`` are the anchors that containment is measured against.  The
+    record is frozen so a launcher cannot retarget a path after containment was
+    proved for it.
+    """
+
+    repo_root: Path
+    sandbox_root: Path
+    slot_id: str
+    slot_root: Path
+    home: Path
+    temp: Path
+    state: Path
+    cache: Path
+    config: Path
+    workspace: Path
+    logs: Path
+    request_id: str
+
+    @property
+    def xdg_data_home(self) -> Path:
+        """``home/.local/share`` -- the XDG data root, still inside the slot."""
+
+        return self.home.joinpath(*_SANDBOX_XDG_DATA_RELATIVE)
+
+    def environment(self) -> dict[str, str]:
+        """The child environment that keeps every storage convention in-slot.
+
+        POSIX tools read HOME and the XDG_* variables, Windows tools read TEMP,
+        TMP and USERPROFILE, and portable ones read TMPDIR; all of them are
+        answered from this slot, so a worker never writes to the real user
+        profile, the real %TEMP% or the system drive.  USERPROFILE is exported
+        on Windows only: inventing it on POSIX would hand tools a variable the
+        host does not have.
+        """
+
+        values = {
+            "HOME": str(self.home),
+            "TEMP": str(self.temp),
+            "TMP": str(self.temp),
+            "TMPDIR": str(self.temp),
+            "XDG_CONFIG_HOME": str(self.config),
+            "XDG_CACHE_HOME": str(self.cache),
+            "XDG_STATE_HOME": str(self.state),
+            "XDG_DATA_HOME": str(self.xdg_data_home),
+        }
+        if is_windows():
+            values["USERPROFILE"] = str(self.home)
+        return values
+
+
+def _sandbox_make_owner_only_dir(path: Path) -> None:
+    """Create one sandbox-owned directory, owner-only, never through a link.
+
+    The reparse check runs before AND after creation: before, because
+    ``exist_ok=True`` would happily accept a junction someone planted at the
+    path; after, because the entry we now hold is the one we are about to write
+    and delete inside.
+    """
+
+    _sandbox_assert_reparse_free(path)
+    os.makedirs(path, mode=_SANDBOX_DIR_MODE, exist_ok=True)
+    _sandbox_assert_reparse_free(path)
+    chmod_path(path, _SANDBOX_DIR_MODE)
+
+
+def _sandbox_remove_entry(path: Path, slot_key: str) -> None:
+    """Remove one entry that is proved to live strictly inside the slot."""
+
+    _sandbox_assert_reparse_free(path)
+    _sandbox_assert_strictly_inside(path, slot_key)
+    if os.path.isdir(path):
+        _sandbox_clear_children(path, slot_key)
+        os.rmdir(path)
+    else:
+        os.unlink(path)
+
+
+def _sandbox_clear_children(path: Path, slot_key: str) -> None:
+    """Empty ``path`` in place, keeping ``path`` itself.
+
+    Nothing outside the slot is reachable from here: ``path`` must resolve at
+    or inside ``slot_key``, every child must resolve strictly inside it, and a
+    reparse point refuses the whole wipe instead of being followed.  Following
+    one is exactly how a junction planted in a scratch tree turns a scratch
+    wipe into a wipe of the canonical ``.aiworkhub`` config, databases or
+    worktrees it points at.
+    """
+
+    key = _sandbox_resolved_key(path)
+    if key != slot_key and not key.startswith(slot_key + os.sep):
+        raise SandboxUnavailable(SANDBOX_REASON_PATH_ESCAPES_ROOT, str(path))
+    with os.scandir(path) as entries:
+        children = [Path(entry.path) for entry in entries]
+    for child in children:
+        _sandbox_remove_entry(child, slot_key)
+
+
+def _sandbox_empty_slot_dirs(plan: SandboxPlan) -> None:
+    """Empty the seven slot directories, keeping the directories themselves."""
+
+    slot_key = _sandbox_resolved_key(plan.slot_root)
+    for name in SANDBOX_SLOT_DIRS:
+        directory = plan.slot_root / name
+        if not os.path.lexists(directory):
+            continue
+        _sandbox_assert_reparse_free(directory)
+        _sandbox_assert_strictly_inside(directory, slot_key)
+        _sandbox_clear_children(directory, slot_key)
+
+
+def _sandbox_prepare_slot(repo: Path, root: Path, slot_id: str, request_id: str) -> SandboxPlan:
+    """Wipe one slot, rebuild it, and prove every plan path lives inside it.
+
+    The wipe is what makes a crashed, timed-out or cancelled predecessor
+    harmless: its residue is removed on the next lease of the same slot rather
+    than leaking into the next request.
+    """
+
+    slots_key = _sandbox_resolved_key(root / "slots")
+    slot_root = root / "slots" / slot_id
+    _sandbox_make_owner_only_dir(slot_root)
+    slot_key = _sandbox_resolved_key(slot_root)
+    if not slot_key.startswith(slots_key + os.sep):
+        raise SandboxUnavailable(SANDBOX_REASON_PATH_ESCAPES_ROOT, str(slot_root))
+    _sandbox_clear_children(slot_root, slot_key)
+    directories = {name: slot_root / name for name in SANDBOX_SLOT_DIRS}
+    for directory in directories.values():
+        _sandbox_make_owner_only_dir(directory)
+    # XDG_DATA_HOME is conventionally home/.local/share, so each level is
+    # created explicitly rather than left to makedirs: an intermediate created
+    # as a side effect would keep the process umask instead of 0o700.
+    xdg_data = directories["home"]
+    for part in _SANDBOX_XDG_DATA_RELATIVE:
+        xdg_data = xdg_data / part
+        _sandbox_make_owner_only_dir(xdg_data)
+    for directory in (*directories.values(), xdg_data):
+        _sandbox_assert_strictly_inside(directory, slot_key)
+    plan = SandboxPlan(
+        repo_root=repo,
+        sandbox_root=root,
+        slot_id=slot_id,
+        slot_root=slot_root,
+        request_id=request_id,
+        **directories,
+    )
+    for value in plan.environment().values():
+        _sandbox_assert_strictly_inside(value, slot_key)
+    return plan
+
+
+def _sandbox_lease_record(request_id: str, slot_id: str) -> bytes:
+    """The bytes one lease file holds: who claimed the slot, and from where."""
+
+    return json.dumps(
+        {
+            "claimed_at_epoch": time.time(),
+            "pid": os.getpid(),
+            "request_id": request_id,
+            "slot_id": slot_id,
+        },
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def _sandbox_lease_holder(lease_path: Path) -> tuple[str, int] | None:
+    """The (request id, holder pid) a lease names, or None when it names nobody.
+
+    ``None`` means the file exists but does not prove who holds it -- foreign,
+    truncated or unreadable.  That is deliberately not the same answer as "the
+    holder is dead": see :func:`_sandbox_lease_is_reclaimable`.
+    """
+
+    try:
+        raw = lease_path.read_bytes()
+    except OSError:
+        return None
+    try:
+        record = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return None
+    if not isinstance(record, dict):
+        return None
+    pid = record.get("pid")
+    request_id = record.get("request_id")
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return None
+    if not isinstance(request_id, str):
+        return None
+    return request_id, pid
+
+
+def _sandbox_lease_is_reclaimable(lease_path: Path) -> bool:
+    """Whether a lease may be removed: only once its holder is proven dead.
+
+    A lease that has already vanished is reclaimable -- there is nothing left
+    holding the slot.  A lease that names no usable pid is NOT: it proves
+    nothing, and proving nothing must never be the reason two live requests are
+    handed one slot.  Liveness is :func:`process_is_alive`, which reads the
+    Windows exit code instead of raising anything at the process, and which
+    answers ALIVE for every ambiguity so a running holder is never evicted.
+    """
+
+    if not os.path.lexists(lease_path):
+        return True
+    holder = _sandbox_lease_holder(lease_path)
+    if holder is None:
+        return False
+    return not process_is_alive(holder[1])
+
+
+def _sandbox_try_claim(lease_path: Path, request_id: str, slot_id: str) -> bool:
+    """Claim one slot's lease file with an exclusive create, or report it held.
+
+    The exclusive create IS the mutual exclusion for an UNHELD slot: two
+    callers -- threads or processes -- cannot both create the same path.  It is
+    not the mutual exclusion for reclaiming a dead holder, because that is a
+    check followed by an unlink: a second claimer that had already read the
+    same dead lease would unlink the LIVE lease the first claimer just created,
+    and one slot would be handed to two live requests -- the second of which
+    then wipes the first one's workspace.  So the check, the unlink and the
+    exclusive create all run under one advisory lock per slot, taken on a
+    sibling ``<slot_id>.claim`` file.  That file is never deleted: the OS lock
+    dies with its holder, so it cannot go stale, while unlinking it would let
+    two claimers lock two different inodes under one name and reopen the race.
+
+    A lease whose holder is provably dead is removed and the create retried
+    exactly once; a lease held by a live process, or one that names nobody, is
+    left untouched and the caller moves on.
+    """
+
+    claim_path = lease_path.with_name(f"{slot_id}.claim")
+    _sandbox_assert_reparse_free(claim_path)
+    guard = os.open(claim_path, lock_file_open_flags(nofollow=True), _SANDBOX_LEASE_MODE)
+    try:
+        try:
+            lock_fd(guard, blocking=True)
+        except AdvisoryLockTimeout as exc:
+            raise SandboxUnavailable(SANDBOX_REASON_LEASE_CONFLICT, str(claim_path)) from exc
+        try:
+            for attempt in (0, 1):
+                try:
+                    descriptor = os.open(
+                        lease_path,
+                        os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0),
+                        _SANDBOX_LEASE_MODE,
+                    )
+                except FileExistsError:
+                    if attempt or not _sandbox_lease_is_reclaimable(lease_path):
+                        return False
+                    try:
+                        os.unlink(lease_path)
+                    except FileNotFoundError:
+                        pass
+                    except OSError:
+                        return False
+                    continue
+                try:
+                    os.write(descriptor, _sandbox_lease_record(request_id, slot_id))
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+                if _sandbox_lease_holder(lease_path) != (request_id, os.getpid()):
+                    raise SandboxUnavailable(SANDBOX_REASON_LEASE_CONFLICT, str(lease_path))
+                return True
+            return False
+        finally:
+            unlock_fd(guard)
+    finally:
+        os.close(guard)
+
+
+class SandboxSlotLease:
+    """One live claim on one slot: the plan it hands out, and its release.
+
+    The lease file is the claim, so releasing it is what frees the slot.
+    ``release`` empties the seven directories and then removes that file even
+    if the wipe failed, because a lease nobody can release is a slot nobody can
+    ever use again.
+    """
+
+    def __init__(self, plan: SandboxPlan, lease_path: Path) -> None:
+        self.plan = plan
+        self.lease_path = lease_path
+        self._released = False
+
+    @property
+    def released(self) -> bool:
+        return self._released
+
+    def release(self) -> None:
+        """Empty the seven slot directories and drop the claim, exactly once."""
+
+        if self._released:
+            return
+        self._released = True
+        try:
+            _sandbox_empty_slot_dirs(self.plan)
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(self.lease_path)
+
+    def __enter__(self) -> SandboxSlotLease:
+        return self
+
+    def __exit__(self, *_exc_info: object) -> None:
+        self.release()
+
+
+def lease_sandbox_slot(
+    repo_root: str | os.PathLike[str],
+    request_id: str,
+    *,
+    slot_count: int | None = None,
+) -> SandboxSlotLease:
+    """Lease one isolated, cleaned, repo-local slot for one request.
+
+    One live request per slot: the claim is an exclusive-create lease file at
+    ``sandbox_root/leases/<slot_id>.lease`` naming the request and the holder
+    pid.  The slot is wiped and rebuilt before the plan is returned, so a
+    predecessor that crashed, timed out or was cancelled leaves no residue, and
+    slots are mutually isolated because no path in one resolves inside another.
+
+    Every containment failure raises :class:`SandboxUnavailable` with a typed
+    reason and changes nothing outside the slot; there is no unsandboxed or
+    unverified path to fall back to.
+    """
+
+    identity = str(request_id)
+    if not identity:
+        raise SandboxUnavailable(SANDBOX_REASON_LEASE_CONFLICT, "request_id_not_configured")
+    repo = _sandbox_repo_root(repo_root)
+    root = repo.joinpath(*_SANDBOX_TREE_RELATIVE)
+    # The ancestors above sandbox_root are canonical repository data: they are
+    # verified against a planted link and created if absent, but never
+    # re-permissioned and never cleaned.
+    ancestor = repo
+    for part in _SANDBOX_TREE_RELATIVE[:-1]:
+        ancestor = ancestor / part
+        _sandbox_assert_reparse_free(ancestor)
+        os.makedirs(ancestor, exist_ok=True)
+        _sandbox_assert_reparse_free(ancestor)
+    leases_root = root / "leases"
+    for directory in (root, root / "slots", leases_root):
+        _sandbox_make_owner_only_dir(directory)
+    count = sandbox_slot_count() if slot_count is None else max(1, int(slot_count))
+    for index in range(count):
+        slot_id = _sandbox_slot_id(index)
+        lease_path = leases_root / f"{slot_id}.lease"
+        if not _sandbox_try_claim(lease_path, identity, slot_id):
+            continue
+        try:
+            plan = _sandbox_prepare_slot(repo, root, slot_id, identity)
+        except BaseException:
+            # The claim is ours and the slot is unusable: drop it rather than
+            # leave a lease that blocks the slot for the rest of the host's life.
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(lease_path)
+            raise
+        return SandboxSlotLease(plan, lease_path)
+    raise SandboxUnavailable(SANDBOX_REASON_SLOTS_EXHAUSTED, f"{count}_slots_all_held")

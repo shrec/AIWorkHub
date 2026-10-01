@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import ast
+import dataclasses
 import errno
 import io
 import importlib.util
 import json
 import os
 import stat
+import tempfile
 import threading
 import subprocess
 import sys
@@ -1630,6 +1632,7 @@ def test_windows_module_import_and_process_branches_do_not_require_killpg(monkey
     assert spec is not None
     assert spec.loader is not None
     imported = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, imported)
     monkeypatch.delattr(os, "killpg", raising=False)
     spec.loader.exec_module(imported)
 
@@ -2312,3 +2315,620 @@ def test_platform_io_delegates_to_the_primitives_instead_of_restating_their_poli
         "CreateAppContainerProfile",
     ):
         assert owned_by_a_primitive not in source
+
+
+# --- repo-local worker sandbox: plan, slot lease and containment -----------
+
+_SANDBOX_STORAGE_NAMES = (
+    "home",
+    "temp",
+    "state",
+    "cache",
+    "config",
+    "workspace",
+    "logs",
+)
+
+
+def _sandbox_slot_repo(tmp_path):
+    """One repository root on whatever volume pytest handed us.
+
+    Never a fixed drive and never the user profile: the model under test has to
+    work wherever the repository actually lives.
+    """
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    return repo
+
+
+def _sandbox_slot_link_dir(link, target):
+    """Plant a directory link at ``link`` pointing at ``target``.
+
+    A Windows junction needs no privilege, which is why it is tried first
+    there; ``os.symlink`` covers every other host.  Only the privilege denial
+    (winerror 1314) is a genuine capability gap and skips; every other error is
+    re-raised, because a skip that swallows a real failure reports a negative
+    fixture as satisfied when it never ran.
+    """
+
+    if os.name == "nt":
+        create_junction = getattr(importlib.import_module("_winapi"), "CreateJunction", None)
+        if create_junction is not None:
+            create_junction(str(target), str(link))
+            return
+    try:
+        os.symlink(target, link, target_is_directory=True)
+    except OSError as exc:
+        if getattr(exc, "winerror", None) != 1314:
+            raise
+        pytest.skip("sandbox_capability_denied:symlink (winerror 1314)")
+
+
+def _sandbox_slot_config_sentinel(repo):
+    """A canonical ``.aiworkhub/config`` file cleanup must never reach."""
+
+    config = repo / ".aiworkhub" / "config"
+    config.mkdir(parents=True)
+    sentinel = config / "settings.json"
+    sentinel.write_text("{}", encoding="utf-8")
+    return config, sentinel
+
+
+def _sandbox_slot_containment_key(path):
+    return os.path.normcase(os.path.realpath(path, strict=True))
+
+
+def test_sandbox_slot_dirs_and_root_are_repo_local_on_any_volume(tmp_path):
+    repo = _sandbox_slot_repo(tmp_path)
+
+    assert platform_io.SANDBOX_SLOT_DIRS == _SANDBOX_STORAGE_NAMES
+    expected = Path(os.path.realpath(repo)) / ".aiworkhub" / "runtime" / "sandboxes"
+    assert platform_io.sandbox_root(repo) == expected
+    assert platform_io.sandbox_root(str(repo)) == expected
+
+
+def test_sandbox_plan_reason_codes_are_exactly_the_declared_typed_set():
+    assert platform_io.SANDBOX_REASONS == (
+        "sandbox_slots_exhausted",
+        "sandbox_path_escapes_root",
+        "sandbox_reparse_point",
+        "sandbox_unc_path",
+        "sandbox_case_alias",
+        "sandbox_lease_conflict",
+    )
+
+    refused = platform_io.SandboxUnavailable("sandbox_slots_exhausted", "4_slots_all_held")
+
+    assert isinstance(refused, RuntimeError)
+    assert refused.reason == "sandbox_slots_exhausted"
+    assert "sandbox_slots_exhausted" in str(refused)
+
+
+@pytest.mark.parametrize(("cores", "expected"), [(1, 1), (2, 1), (8, 7), (32, 31)])
+def test_sandbox_slot_count_leaves_a_core_of_headroom(cores, expected):
+    observed = platform_io.sandbox_slot_count(cores)
+
+    assert observed == expected
+    assert observed >= 1
+    if cores >= 2:
+        assert cores - observed >= 1
+
+
+def test_sandbox_slot_count_is_derived_from_the_observed_core_count(monkeypatch):
+    monkeypatch.setattr(platform_io.os, "cpu_count", lambda: 12)
+    assert platform_io.sandbox_slot_count() == 11
+
+    monkeypatch.setattr(platform_io.os, "cpu_count", lambda: None)
+    assert platform_io.sandbox_slot_count() == 1
+
+    monkeypatch.setattr(platform_io.os, "cpu_count", lambda: 1)
+    assert platform_io.sandbox_slot_count() == 1
+
+
+def test_sandbox_plan_paths_and_environment_resolve_inside_the_slot(tmp_path):
+    repo = _sandbox_slot_repo(tmp_path)
+    lease = platform_io.lease_sandbox_slot(repo, "request-a", slot_count=2)
+    try:
+        plan = lease.plan
+
+        assert tuple(field.name for field in dataclasses.fields(plan)) == (
+            "repo_root",
+            "sandbox_root",
+            "slot_id",
+            "slot_root",
+            *_SANDBOX_STORAGE_NAMES,
+            "request_id",
+        )
+        assert plan.repo_root == Path(os.path.realpath(repo))
+        assert plan.sandbox_root == platform_io.sandbox_root(repo)
+        assert plan.request_id == "request-a"
+        assert plan.slot_id == "slot-00"
+
+        # repo_root, sandbox_root and slot_root are the anchors containment is
+        # measured against; every storage path and every exported value has to
+        # resolve strictly inside the slot.
+        slot_key = _sandbox_slot_containment_key(plan.slot_root)
+        slots_key = _sandbox_slot_containment_key(plan.sandbox_root / "slots")
+        assert slot_key.startswith(slots_key + os.sep)
+        candidates = [getattr(plan, name) for name in platform_io.SANDBOX_SLOT_DIRS]
+        candidates.append(plan.xdg_data_home)
+        candidates.extend(Path(value) for value in plan.environment().values())
+        for candidate in candidates:
+            resolved = _sandbox_slot_containment_key(candidate)
+            assert resolved != slot_key
+            assert resolved.startswith(slot_key + os.sep)
+
+        environment = plan.environment()
+        expected_keys = {
+            "HOME",
+            "TEMP",
+            "TMP",
+            "TMPDIR",
+            "XDG_CONFIG_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_STATE_HOME",
+            "XDG_DATA_HOME",
+        }
+        if platform_io.is_windows():
+            expected_keys.add("USERPROFILE")
+            assert environment["USERPROFILE"] == str(plan.home)
+        assert set(environment) == expected_keys
+        assert environment["HOME"] == str(plan.home)
+        assert environment["TEMP"] == str(plan.temp)
+        assert environment["TMP"] == str(plan.temp)
+        assert environment["TMPDIR"] == str(plan.temp)
+        assert environment["XDG_CONFIG_HOME"] == str(plan.config)
+        assert environment["XDG_CACHE_HOME"] == str(plan.cache)
+        assert environment["XDG_STATE_HOME"] == str(plan.state)
+        assert environment["XDG_DATA_HOME"] == str(plan.home / ".local" / "share")
+
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            plan.home = tmp_path
+    finally:
+        lease.release()
+
+
+def test_sandbox_plan_slots_are_mutually_isolated(tmp_path):
+    repo = _sandbox_slot_repo(tmp_path)
+    first = platform_io.lease_sandbox_slot(repo, "request-a", slot_count=2)
+    second = platform_io.lease_sandbox_slot(repo, "request-b", slot_count=2)
+    try:
+        assert first.plan.slot_id != second.plan.slot_id
+        first_key = _sandbox_slot_containment_key(first.plan.slot_root)
+        second_key = _sandbox_slot_containment_key(second.plan.slot_root)
+
+        assert not first_key.startswith(second_key + os.sep)
+        assert not second_key.startswith(first_key + os.sep)
+        assert set(first.plan.environment().values()) & set(second.plan.environment().values()) == set()
+    finally:
+        second.release()
+        first.release()
+
+
+@pytest.mark.skipif(
+    not platform_io.posix_path_modes_supported(),
+    reason="POSIX mode bits are not an authority on Windows; this card writes no ACL",
+)
+def test_sandbox_slot_dirs_are_created_owner_only(tmp_path):
+    repo = _sandbox_slot_repo(tmp_path)
+    lease = platform_io.lease_sandbox_slot(repo, "request", slot_count=1)
+    try:
+        for name in platform_io.SANDBOX_SLOT_DIRS:
+            directory = getattr(lease.plan, name)
+            assert stat.S_IMODE(os.stat(directory).st_mode) == 0o700
+        assert stat.S_IMODE(os.stat(lease.plan.slot_root).st_mode) == 0o700
+    finally:
+        lease.release()
+
+
+def test_sandbox_slot_lease_never_hands_one_slot_to_two_live_leases(tmp_path):
+    repo = _sandbox_slot_repo(tmp_path)
+    workers = 8
+    start = threading.Barrier(workers)
+    guard = threading.Lock()
+    leases = []
+    failures = []
+
+    def claim(index):
+        try:
+            start.wait(timeout=60)
+            lease = platform_io.lease_sandbox_slot(
+                repo, f"request-{index}", slot_count=workers
+            )
+        except BaseException as exc:  # recorded, then asserted on the main thread
+            with guard:
+                failures.append(repr(exc))
+            return
+        with guard:
+            leases.append(lease)
+
+    threads = [threading.Thread(target=claim, args=(index,)) for index in range(workers)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=120)
+
+    try:
+        assert failures == []
+        assert [thread.is_alive() for thread in threads] == [False] * workers
+        slot_ids = [lease.plan.slot_id for lease in leases]
+        assert len(slot_ids) == workers
+        assert len(set(slot_ids)) == workers
+        assert len({str(lease.plan.slot_root) for lease in leases}) == workers
+
+        with pytest.raises(platform_io.SandboxUnavailable) as exhausted:
+            platform_io.lease_sandbox_slot(repo, "one-too-many", slot_count=workers)
+
+        assert exhausted.value.reason == "sandbox_slots_exhausted"
+    finally:
+        for lease in leases:
+            lease.release()
+
+
+def test_sandbox_slot_lease_reuses_a_slot_once_its_lease_is_released(tmp_path):
+    repo = _sandbox_slot_repo(tmp_path)
+    first = platform_io.lease_sandbox_slot(repo, "request-a", slot_count=1)
+    leftover = first.plan.workspace / "leftover.txt"
+    leftover.write_text("residue", encoding="utf-8")
+    first.release()
+
+    assert not first.lease_path.exists()
+
+    second = platform_io.lease_sandbox_slot(repo, "request-b", slot_count=1)
+    try:
+        assert second.plan.slot_id == first.plan.slot_id
+        assert not leftover.exists()
+        assert second.lease_path.exists()
+    finally:
+        second.release()
+
+
+def test_sandbox_slot_lease_reclaims_a_provably_dead_holder_and_cleans_the_slot(
+    tmp_path, monkeypatch
+):
+    repo = _sandbox_slot_repo(tmp_path)
+    root = platform_io.sandbox_root(repo)
+    (root / "leases").mkdir(parents=True)
+    residue_dir = root / "slots" / "slot-00" / "logs" / "nested"
+    residue_dir.mkdir(parents=True)
+    residue = residue_dir / "crash.log"
+    residue.write_text("residue", encoding="utf-8")
+    (root / "leases" / "slot-00.lease").write_text(
+        json.dumps({"pid": 4242424, "request_id": "dead-request", "slot_id": "slot-00"}),
+        encoding="utf-8",
+    )
+    probed = []
+
+    def never_alive(pid):
+        probed.append(pid)
+        return False
+
+    monkeypatch.setattr(platform_io, "process_is_alive", never_alive)
+
+    lease = platform_io.lease_sandbox_slot(repo, "next-request", slot_count=1)
+    try:
+        assert probed == [4242424]
+        assert lease.plan.slot_id == "slot-00"
+        assert not residue.exists()
+        assert not residue_dir.exists()
+        assert list(lease.plan.logs.iterdir()) == []
+        claimed = json.loads(lease.lease_path.read_text(encoding="utf-8"))
+        assert claimed["pid"] == os.getpid()
+        assert claimed["request_id"] == "next-request"
+        assert claimed["slot_id"] == "slot-00"
+        assert isinstance(claimed["claimed_at_epoch"], float)
+    finally:
+        lease.release()
+
+
+def test_sandbox_slot_lease_never_reclaims_a_lease_held_by_a_live_pid(tmp_path):
+    repo = _sandbox_slot_repo(tmp_path)
+    root = platform_io.sandbox_root(repo)
+    (root / "leases").mkdir(parents=True)
+    held = root / "leases" / "slot-00.lease"
+    record = json.dumps({"pid": os.getpid(), "request_id": "live-request", "slot_id": "slot-00"})
+    held.write_text(record, encoding="utf-8")
+
+    with pytest.raises(platform_io.SandboxUnavailable) as exhausted:
+        platform_io.lease_sandbox_slot(repo, "second-request", slot_count=1)
+
+    assert exhausted.value.reason == "sandbox_slots_exhausted"
+    assert held.read_text(encoding="utf-8") == record
+
+
+def test_sandbox_slot_lease_never_reclaims_a_lease_that_names_nobody(tmp_path):
+    repo = _sandbox_slot_repo(tmp_path)
+    root = platform_io.sandbox_root(repo)
+    (root / "leases").mkdir(parents=True)
+    unreadable = root / "leases" / "slot-00.lease"
+    unreadable.write_text("not-a-lease-record", encoding="utf-8")
+
+    with pytest.raises(platform_io.SandboxUnavailable) as exhausted:
+        platform_io.lease_sandbox_slot(repo, "request", slot_count=1)
+
+    assert exhausted.value.reason == "sandbox_slots_exhausted"
+    assert unreadable.read_text(encoding="utf-8") == "not-a-lease-record"
+
+
+def test_sandbox_slot_liveness_never_raises_a_signal_at_the_holder():
+    source = Path(platform_io.__file__).read_text(encoding="utf-8")
+    marker = "AIWORKHUB_SANDBOX_SLOT_SECTION"
+
+    assert source.count(marker) == 1
+    section = source.split(marker, 1)[1]
+
+    assert "os.kill" not in section
+    assert "signal." not in section
+    assert "killpg" not in section
+    assert "process_is_alive" in section
+    # The section's own prose names the host locations it refuses, so the scan
+    # looks for the calls that would actually read them, not for the words.
+    for host_derived in (
+        "os.environ",
+        "os.getenv",
+        "environ[",
+        "expanduser",
+        "tempfile.",
+        "Path.home(",
+    ):
+        assert host_derived not in section
+
+
+def test_sandbox_slot_lease_reports_a_lease_conflict_when_the_claim_is_not_ours(
+    tmp_path, monkeypatch
+):
+    repo = _sandbox_slot_repo(tmp_path)
+
+    def foreign(_request_id, slot_id):
+        return json.dumps(
+            {"pid": os.getpid(), "request_id": "someone-else", "slot_id": slot_id}
+        ).encode("utf-8")
+
+    monkeypatch.setattr(platform_io, "_sandbox_lease_record", foreign)
+
+    with pytest.raises(platform_io.SandboxUnavailable) as conflict:
+        platform_io.lease_sandbox_slot(repo, "request", slot_count=1)
+
+    assert conflict.value.reason == "sandbox_lease_conflict"
+
+
+def test_sandbox_slot_lease_refuses_an_unnamed_request(tmp_path):
+    repo = _sandbox_slot_repo(tmp_path)
+
+    with pytest.raises(platform_io.SandboxUnavailable) as refused:
+        platform_io.lease_sandbox_slot(repo, "", slot_count=1)
+
+    assert refused.value.reason == "sandbox_lease_conflict"
+    assert not (repo / ".aiworkhub").exists()
+
+
+@pytest.mark.requires_symlink
+def test_sandbox_slot_lease_refuses_a_reparse_point_planted_at_the_slot(tmp_path):
+    repo = _sandbox_slot_repo(tmp_path)
+    config, sentinel = _sandbox_slot_config_sentinel(repo)
+    slots = platform_io.sandbox_root(repo) / "slots"
+    slots.mkdir(parents=True)
+    _sandbox_slot_link_dir(slots / "slot-00", config)
+
+    with pytest.raises(platform_io.SandboxUnavailable) as refused:
+        platform_io.lease_sandbox_slot(repo, "request", slot_count=1)
+
+    assert refused.value.reason == "sandbox_reparse_point"
+    assert sentinel.read_text(encoding="utf-8") == "{}"
+    assert sorted(entry.name for entry in config.iterdir()) == ["settings.json"]
+    assert list((platform_io.sandbox_root(repo) / "leases").glob("*.lease")) == []
+
+
+@pytest.mark.requires_symlink
+def test_sandbox_slot_lease_refuses_a_reparse_point_under_the_sandbox_root(tmp_path):
+    repo = _sandbox_slot_repo(tmp_path)
+    config, sentinel = _sandbox_slot_config_sentinel(repo)
+    root = platform_io.sandbox_root(repo)
+    root.mkdir(parents=True)
+    _sandbox_slot_link_dir(root / "slots", config)
+
+    with pytest.raises(platform_io.SandboxUnavailable) as refused:
+        platform_io.lease_sandbox_slot(repo, "request", slot_count=1)
+
+    assert refused.value.reason == "sandbox_reparse_point"
+    assert sentinel.read_text(encoding="utf-8") == "{}"
+    assert sorted(entry.name for entry in config.iterdir()) == ["settings.json"]
+
+
+@pytest.mark.requires_symlink
+def test_sandbox_slot_release_never_follows_a_reparse_point_out_of_the_slot(tmp_path):
+    repo = _sandbox_slot_repo(tmp_path)
+    config, sentinel = _sandbox_slot_config_sentinel(repo)
+    lease = platform_io.lease_sandbox_slot(repo, "request", slot_count=1)
+    _sandbox_slot_link_dir(lease.plan.workspace / "escape", config)
+
+    with pytest.raises(platform_io.SandboxUnavailable) as refused:
+        lease.release()
+
+    assert refused.value.reason == "sandbox_reparse_point"
+    assert sentinel.read_text(encoding="utf-8") == "{}"
+    assert not lease.lease_path.exists()
+
+
+@pytest.mark.parametrize(
+    "root",
+    [
+        pytest.param(r"\\aiworkhub-share\repo", id="unc"),
+        pytest.param(r"\\?\C:\repo", id="extended-device"),
+        pytest.param(r"\\.\C:\repo", id="dos-device"),
+        pytest.param("//aiworkhub-share/repo", id="unc-forward-slashes"),
+    ],
+)
+def test_sandbox_slot_lease_refuses_a_unc_or_device_prefixed_repo_root(root):
+    with pytest.raises(platform_io.SandboxUnavailable) as refused:
+        platform_io.lease_sandbox_slot(root, "request", slot_count=1)
+
+    assert refused.value.reason == "sandbox_unc_path"
+
+    with pytest.raises(platform_io.SandboxUnavailable) as root_refused:
+        platform_io.sandbox_root(root)
+
+    assert root_refused.value.reason == "sandbox_unc_path"
+
+
+def test_sandbox_slot_lease_refuses_a_case_alias_repo_root(tmp_path):
+    repo = _sandbox_slot_repo(tmp_path)
+    alias = tmp_path / repo.name.upper()
+
+    with pytest.raises(platform_io.SandboxUnavailable) as refused:
+        platform_io.lease_sandbox_slot(alias, "request", slot_count=1)
+
+    assert refused.value.reason == "sandbox_case_alias"
+    assert not (repo / ".aiworkhub").exists()
+    assert sorted(entry.name for entry in tmp_path.iterdir()) == ["repo"]
+
+
+def test_sandbox_slot_release_empties_the_seven_dirs_and_nothing_else(tmp_path):
+    repo = _sandbox_slot_repo(tmp_path)
+    config, config_sentinel = _sandbox_slot_config_sentinel(repo)
+    repo_sentinel = repo / "README.md"
+    repo_sentinel.write_text("repository root", encoding="utf-8")
+    lease = platform_io.lease_sandbox_slot(repo, "request", slot_count=1)
+    plan = lease.plan
+    for name in platform_io.SANDBOX_SLOT_DIRS:
+        (getattr(plan, name) / "scratch.txt").write_text(name, encoding="utf-8")
+    nested = plan.workspace / "checkout" / "src"
+    nested.mkdir(parents=True)
+    (nested / "module.py").write_text("x = 1\n", encoding="utf-8")
+
+    lease.release()
+
+    for name in platform_io.SANDBOX_SLOT_DIRS:
+        directory = getattr(plan, name)
+        assert directory.is_dir()
+        assert list(directory.iterdir()) == []
+    assert plan.slot_root.is_dir()
+    assert not lease.lease_path.exists()
+    assert config_sentinel.read_text(encoding="utf-8") == "{}"
+    assert sorted(entry.name for entry in config.iterdir()) == ["settings.json"]
+    assert repo_sentinel.read_text(encoding="utf-8") == "repository root"
+    assert "repo" in {entry.name for entry in tmp_path.iterdir()}
+
+    lease.release()
+
+    assert plan.slot_root.is_dir()
+
+
+def test_sandbox_plan_never_derives_a_path_from_the_user_profile_or_temp(tmp_path, monkeypatch):
+    repo = _sandbox_slot_repo(tmp_path)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+
+    def refuse(*_args, **_kwargs):
+        raise AssertionError("a sandbox path must never come from the host profile")
+
+    monkeypatch.setattr(tempfile, "gettempdir", refuse)
+    monkeypatch.setattr(Path, "home", refuse)
+    for name in ("USERPROFILE", "LOCALAPPDATA", "HOME", "TEMP", "TMP", "TMPDIR"):
+        monkeypatch.setenv(name, str(elsewhere))
+
+    lease = platform_io.lease_sandbox_slot(repo, "request", slot_count=1)
+    try:
+        plan = lease.plan
+        slot_key = _sandbox_slot_containment_key(plan.slot_root)
+        values = [str(getattr(plan, name)) for name in platform_io.SANDBOX_SLOT_DIRS]
+        values.extend(plan.environment().values())
+
+        for value in values:
+            assert str(elsewhere) not in value
+            assert _sandbox_slot_containment_key(value).startswith(slot_key + os.sep)
+        assert str(elsewhere) not in str(plan.slot_root)
+        assert plan.environment()["TEMP"] == str(plan.temp)
+    finally:
+        lease.release()
+
+
+def test_sandbox_slot_lease_reclaim_of_a_dead_holder_is_atomic_under_one_claim(
+    tmp_path, monkeypatch
+):
+    """REPRODUCTION: reclaiming a stale lease was check-then-unlink by path, so
+    two claimers that had both read the same dead lease were handed one slot and
+    the second wiped the first one's workspace. One claimer is parked right after
+    its liveness check and the other is started behind it: the reclaim has to be
+    serialized per slot, not merely retried."""
+
+    repo = _sandbox_slot_repo(tmp_path)
+    root = platform_io.sandbox_root(repo)
+    (root / "leases").mkdir(parents=True)
+    (root / "leases" / "slot-00.lease").write_text(
+        json.dumps({"pid": 4242424, "request_id": "dead-request", "slot_id": "slot-00"}),
+        encoding="utf-8",
+    )
+    # Only this process is alive: the seeded holder reads dead, so the slot is
+    # genuinely reclaimable, while a lease a competing claimer has just written
+    # reads live and must never be reclaimed out from under them.
+    monkeypatch.setattr(platform_io, "process_is_alive", lambda pid: pid == os.getpid())
+
+    real_reclaimable = platform_io._sandbox_lease_is_reclaimable
+    parked = threading.Event()
+    resume = threading.Event()
+
+    def park_the_first_checker(lease_path):
+        verdict = real_reclaimable(lease_path)
+        if threading.current_thread().name == "parked-claimer" and not parked.is_set():
+            parked.set()
+            assert resume.wait(timeout=60)
+        return verdict
+
+    monkeypatch.setattr(
+        platform_io, "_sandbox_lease_is_reclaimable", park_the_first_checker
+    )
+
+    guard = threading.Lock()
+    leases = {}
+    refusals = {}
+
+    def claim(name):
+        try:
+            lease = platform_io.lease_sandbox_slot(repo, name, slot_count=1)
+        except platform_io.SandboxUnavailable as exc:
+            with guard:
+                refusals[name] = exc.reason
+            return
+        except BaseException as exc:  # recorded, then asserted on the main thread
+            with guard:
+                refusals[name] = repr(exc)
+            return
+        with guard:
+            leases[name] = lease
+        try:
+            (lease.plan.workspace / "live-work.txt").write_text(name, encoding="utf-8")
+        except BaseException as exc:  # recorded, then asserted on the main thread
+            with guard:
+                refusals[name] = repr(exc)
+
+    first = threading.Thread(target=claim, args=("req-parked",), name="parked-claimer")
+    second = threading.Thread(target=claim, args=("req-racer",), name="racing-claimer")
+    first.start()
+    assert parked.wait(timeout=60)
+    second.start()
+    # The racer either completes its own reclaim while the first claimer is still
+    # parked -- the defect -- or waits for that claimer to finish with the slot
+    # -- the fix. One bounded wait tells the two apart without making the test
+    # depend on winning a race.
+    second.join(timeout=0.75)
+    resume.set()
+    first.join(timeout=60)
+    second.join(timeout=60)
+
+    try:
+        assert not first.is_alive()
+        assert not second.is_alive()
+        assert len(leases) == 1, f"one slot handed to two live leases: {sorted(leases)}"
+        [(winner, lease)] = leases.items()
+        loser = ({"req-parked", "req-racer"} - {winner}).pop()
+        assert refusals == {loser: "sandbox_slots_exhausted"}
+        assert lease.plan.slot_id == "slot-00"
+        claimed = json.loads(lease.lease_path.read_text(encoding="utf-8"))
+        assert claimed["request_id"] == winner
+        assert claimed["pid"] == os.getpid()
+        assert (lease.plan.workspace / "live-work.txt").read_text(encoding="utf-8") == winner
+    finally:
+        for held in leases.values():
+            held.release()
