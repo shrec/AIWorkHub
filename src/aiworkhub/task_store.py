@@ -5090,6 +5090,7 @@ def recover_blocked_rework(
     clean_root_if_predecessor_missing: bool = False,
     validation_amendment: list[str] | None = None,
     applied_out: list[str] | None = None,
+    scope_rejection_resolved: bool = False,
 ) -> tuple[bool, str]:
     """Recover the same blocked task ID for rework when retained predecessor
     evidence and actionable residual feedback are present.
@@ -5105,13 +5106,32 @@ def recover_blocked_rework(
     validation-only execution.
 
     Fails closed on:
-      - dependency, policy, or scope blockers (must be resolved first)
+      - dependency, policy, or scope blockers (must be resolved first); only
+        an explicit ``scope_rejection_resolved`` lifts ``scope_rejected``
       - blocked tasks without retained terminal predecessor evidence
       - blocked tasks without residual feedback
       - tasks with a live claim or in-process episode
       - non-blocked tasks
       - explicit validation_only_replay authorization lacking retained
         predecessor request_id or changed_path_hashes
+      - ``scope_rejection_resolved`` when the terminal substatus is not
+        ``scope_rejected`` (``scope_rejection_resolution_not_applicable:*``),
+        without a non-empty ``feedback_reason`` in this call
+        (``scope_rejection_resolution_requires_feedback``; a stored
+        reject_review reason does not count), with ``validation_only_replay``
+        (``scope_rejection_resolution_incompatible_with_validation_replay``),
+        or without a recorded rejected request identity
+
+    ``scope_rejection_resolved`` (NF-2026-01169) is the verified manager's
+    audited resolution of a ``scope_rejected`` card on the same task ID.  The
+    recovery is always clean-root, whether or not the rejected worktree still
+    exists: that worktree holds out-of-scope writes and unsealed in-scope
+    bytes, so ``rework_predecessor`` is removed and nothing is materialized.
+    ``clean_root_recovery_authorization`` records recovery_mode
+    ``clean_root_scope_rejection_resolved``, the rejected request ID, the
+    bounded scope-violation text and the SHA-256 of the feedback.  No worktree
+    is deleted or modified; ``clean_root_if_predecessor_missing`` is neither
+    required nor harmful.
 
     ``clean_root_if_predecessor_missing`` is an explicit coordinator escape
     hatch for an ordinary rework episode whose hash-pinned predecessor
@@ -5151,9 +5171,10 @@ def recover_blocked_rework(
 
     # Native callers have already passed the manager/write gate. Retained
     # filesystem verification and sealing must finish before the writer lease.
+    # A scope-rejection resolution never reads or seals predecessor bytes.
     try:
         successful_preparation = (
-            None if clean_root_if_predecessor_missing else
+            None if clean_root_if_predecessor_missing or scope_rejection_resolved else
             prepare_blocked_recovery(Path(root), db_path, task_id, feedback_reason)
         )
     except (OSError, ValueError):
@@ -5163,7 +5184,9 @@ def recover_blocked_rework(
     # re-read and its worktree stat fingerprint recomputed and compared.
     untouched_proof = (
         _pre_lease_untouched_no_candidate_proof(root, db_path, task_id)
-        if clean_root_if_predecessor_missing and not validation_only_replay
+        if clean_root_if_predecessor_missing
+        and not validation_only_replay
+        and not scope_rejection_resolved
         else None
     )
     # Serialized on the same lease as the terminal transitions. Its four
@@ -5215,6 +5238,16 @@ def recover_blocked_rework(
 
         if str(card.get("topic") or row["topic"] or "") == "quality_review":
             return False, "quality_review_recovery_requires_bound_relaunch"
+
+        if scope_rejection_resolved:
+            if validation_only_replay:
+                return False, (
+                    "scope_rejection_resolution_incompatible_with_validation_replay"
+                )
+            # The manager's resolution must arrive with this call; a stored
+            # reject_review residual is not a scope-rejection resolution.
+            if not str(feedback_reason or "").strip():
+                return False, "scope_rejection_resolution_requires_feedback"
 
         if clean_root_if_predecessor_missing and validation_only_replay:
             return False, "clean_root_incompatible_with_validation_only_replay"
@@ -5363,6 +5396,22 @@ def recover_blocked_rework(
             == "launch_blocked"
         )
         if already is not None or pending_clean_root_blocker:
+            if current_canonical == "pending" and scope_rejection_resolved:
+                # A replay of the scope-rejection resolution is idempotent; it
+                # never consumes or rebinds another recovery's authorization.
+                scope_authorization = card.get("clean_root_recovery_authorization")
+                if (
+                    already is not None
+                    and isinstance(scope_authorization, dict)
+                    and scope_authorization.get("recovery_mode")
+                    == "clean_root_scope_rejection_resolved"
+                    and scope_authorization.get("task_id") == task_id
+                    and scope_authorization.get("claim_epoch")
+                    == card.get("claim_epoch")
+                    and scope_authorization.get("one_episode_binding") is True
+                ):
+                    return True, "already_recovered"
+                return False, "scope_rejection_resolution_not_applicable:pending"
             if current_canonical == "pending":
                 clean_root_authorization = card.get(
                     "clean_root_recovery_authorization"
@@ -5818,6 +5867,20 @@ def recover_blocked_rework(
         ):
             terminal_event = "terminal_failure"
             terminal_row = newest_terminal_failure
+
+        if scope_rejection_resolved:
+            # NF-2026-01169: an explicit scope-rejection resolution binds the
+            # newest terminal event of either kind and never inherits or
+            # synthesizes a predecessor: a non-terminal_failure event name
+            # keeps the candidate-synthesis and no-candidate paths below out.
+            retained_predecessor = {}
+            terminal_event = "scope_rejection_resolution"
+            terminal_row = conn.execute(
+                "SELECT runner, payload_json, created_at FROM task_events "
+                "WHERE task_id=? AND event IN ('terminal_review', 'terminal_failure') "
+                "ORDER BY rowid DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
 
         if validation_only_replay and has_reviewer_transport and not successful_preparation:
             predecessor_request_id = str(
@@ -6347,10 +6410,72 @@ def recover_blocked_rework(
             terminal_review.get("substatus") or ""
         ).strip()
 
-        if terminal_substatus in _HARD_BLOCKER_SUBSTATUSES:
+        scope_resolution_evidence: dict[str, Any] | None = None
+        if scope_rejection_resolved:
+            # Only the explicit manager resolution lifts scope_rejected, and it
+            # lifts nothing else: dependency_blocked/blocked stay hard blockers.
+            # The card's live server-written state must agree with the newest
+            # terminal event, as for clean_root_no_candidate.
+            if terminal_substatus != "scope_rejected":
+                return False, (
+                    f"scope_rejection_resolution_not_applicable:{terminal_substatus}"
+                )
+            card_substatus = str(card.get("terminal_substatus") or "")
+            if card_substatus != "scope_rejected":
+                return False, (
+                    f"scope_rejection_resolution_not_applicable:{card_substatus}"
+                )
+            scope_evidence = terminal_review.get("evidence")
+            if not isinstance(scope_evidence, dict):
+                scope_evidence = {}
+            scope_identity = scope_evidence.get("request_identity")
+            if not isinstance(scope_identity, dict):
+                scope_identity = {}
+            identity_sources = [
+                str(terminal_review.get("request_id") or "").strip(),
+                str(scope_evidence.get("request_id") or "").strip(),
+                str(scope_identity.get("request_id") or "").strip(),
+            ]
+            rejected_request_id = next(
+                (source for source in identity_sources if source), ""
+            )
+            if not rejected_request_id:
+                return False, "scope_rejection_resolution_request_identity_missing"
+            # The evidence was written by the episode that violated scope: it
+            # is an attestation verified against the card, never a source.
+            scope_identity_task = str(scope_identity.get("task_id") or "")
+            if (
+                len(rejected_request_id) != 32
+                or any(ch not in "0123456789abcdef" for ch in rejected_request_id)
+                or card.get("launch_request_id") != rejected_request_id
+                or any(
+                    source and source != rejected_request_id
+                    for source in identity_sources
+                )
+                or (scope_identity_task and scope_identity_task != task_id)
+            ):
+                return False, "scope_rejection_resolution_request_identity_invalid"
+            scope_violation = str(
+                scope_evidence.get("error")
+                or terminal_review.get("error")
+                or card.get("blocker_reason")
+                or ""
+            ).strip()[:2000]
+            scope_resolution_evidence = {
+                "recovery_mode": "clean_root_scope_rejection_resolved",
+                "rejected_request_id": rejected_request_id,
+                "predecessor_request_id": rejected_request_id,
+                "scope_violation": scope_violation,
+                "feedback_sha256": hashlib.sha256(
+                    str(feedback_reason or "").strip().encode("utf-8")
+                ).hexdigest(),
+            }
+        elif terminal_substatus in _HARD_BLOCKER_SUBSTATUSES:
             return False, f"hard_blocker:{terminal_substatus}"
-
-        if terminal_substatus and terminal_substatus not in _REWORK_ELIGIBLE_SUBSTATUSES:
+        elif (
+            terminal_substatus
+            and terminal_substatus not in _REWORK_ELIGIBLE_SUBSTATUSES
+        ):
             return False, f"unrecognized_terminal_substatus:{terminal_substatus}"
 
         bounded_feedback = str(feedback_reason or "").strip()
@@ -6430,7 +6555,22 @@ def recover_blocked_rework(
         else:
             card.pop("validation_only_replay_authorization", None)
 
-        if clean_root_if_predecessor_missing:
+        if scope_resolution_evidence is not None:
+            # NF-2026-01169: the scope-rejected worktree holds out-of-scope
+            # writes and unsealed in-scope bytes, so nothing of it is ever a
+            # materialization source.  Its identity stays audit-only here and
+            # in the recovery event; the worktree itself is left untouched.
+            card.pop("rework_predecessor", None)
+            card["clean_root_recovery_authorization"] = {
+                **scope_resolution_evidence,
+                "task_id": task_id,
+                "actor": actor,
+                "authorized_at": now,
+                "claim_epoch": claim_epoch,
+                "one_episode_binding": True,
+            }
+            card["recovery_mode"] = str(scope_resolution_evidence["recovery_mode"])
+        elif clean_root_if_predecessor_missing:
             allowed, reason, clean_root_evidence = clean_root_predecessor_authority()
             if not allowed:
                 return False, reason
@@ -6474,6 +6614,10 @@ def recover_blocked_rework(
         if validation_only_replay:
             recovery_payload["validation_only_replay_lineage"] = card[
                 "validation_only_replay_lineage"
+            ]
+        if scope_resolution_evidence is not None:
+            recovery_payload["clean_root_recovery_authorization"] = card[
+                "clean_root_recovery_authorization"
             ]
         if successful_preparation:
             recovery_payload["successful_rework_delta"] = (

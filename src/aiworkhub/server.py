@@ -2902,8 +2902,13 @@ def aiworkhub_task_recover_blocked_rework(
     validation_only_replay: bool = False,
     clean_root_if_predecessor_missing: bool = False,
     validation_amendment: list[str] | None = None,
+    scope_rejection_resolved: bool = False,
 ) -> dict[str, Any]:
-    """Recover one exact blocked task through the canonical transaction."""
+    """Recover one exact blocked task through the canonical transaction.
+
+    ``scope_rejection_resolved`` is the manager's explicit, audited clean-root
+    resolution of a ``scope_rejected`` card; it requires ``feedback_reason``.
+    """
 
     kwargs: dict[str, Any] = {
         "feedback_reason": feedback_reason,
@@ -2912,6 +2917,8 @@ def aiworkhub_task_recover_blocked_rework(
             clean_root_if_predecessor_missing
         ),
     }
+    if scope_rejection_resolved:
+        kwargs["scope_rejection_resolved"] = True
     if validation_amendment is not None:
         kwargs["validation_amendment"] = validation_amendment
     return core.recover_blocked_rework(task_id, **kwargs)

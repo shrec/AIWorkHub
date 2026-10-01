@@ -7094,6 +7094,7 @@ def recover_blocked_rework(
     validation_only_replay: bool = False,
     clean_root_if_predecessor_missing: bool = False,
     validation_amendment: list[str] | None = None,
+    scope_rejection_resolved: bool = False,
 ) -> dict[str, Any]:
     """Recover one exact blocked task through the canonical task-store transaction."""
     card, error = _live_card(task_id)
@@ -7160,6 +7161,10 @@ def recover_blocked_rework(
                 clean_root_if_predecessor_missing
             ),
         }
+        if scope_rejection_resolved:
+            # NF-2026-01169: forwarded only when set, so the default call is
+            # byte-for-byte the pre-existing transaction.
+            task_store_kwargs["scope_rejection_resolved"] = True
         if amendment_commands:
             task_store_kwargs["validation_amendment"] = amendment_commands
             task_store_kwargs["applied_out"] = applied

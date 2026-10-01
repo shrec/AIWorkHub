@@ -457,6 +457,43 @@ def test_server_recover_blocked_rework_forwards_validation_amendment(monkeypatch
     assert calls == [["pytest -q tests/test_x.py"]]
 
 
+def test_server_recover_blocked_rework_exposes_and_forwards_scope_resolution_nf01169(
+    monkeypatch,
+):
+    import inspect
+
+    parameter = inspect.signature(
+        server.aiworkhub_task_recover_blocked_rework
+    ).parameters["scope_rejection_resolved"]
+    assert parameter.default is False
+    calls = []
+
+    def recover(
+        task_id,
+        *,
+        feedback_reason="",
+        validation_only_replay=False,
+        clean_root_if_predecessor_missing=False,
+        validation_amendment=None,
+        scope_rejection_resolved=False,
+    ):
+        calls.append((task_id, feedback_reason, scope_rejection_resolved))
+        return {"ok": True, "task_id": task_id}
+
+    monkeypatch.setattr(core, "recover_blocked_rework", recover)
+
+    result = server.aiworkhub_task_recover_blocked_rework(
+        "T_BLOCKED", "scope resolved", scope_rejection_resolved=True
+    )
+    server.aiworkhub_task_recover_blocked_rework("T_BLOCKED", "default")
+
+    assert result == {"ok": True, "task_id": "T_BLOCKED"}
+    assert calls == [
+        ("T_BLOCKED", "scope resolved", True),
+        ("T_BLOCKED", "default", False),
+    ]
+
+
 def test_server_reject_review_forwards_validation_amendment(monkeypatch):
     calls = []
 
