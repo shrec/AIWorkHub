@@ -81,6 +81,13 @@ def deterministic_process_launch_capacity(monkeypatch):
         )
 
 
+@pytest.fixture(autouse=True)
+def pinned_toolchain_authority_secret(monkeypatch):
+    """A contained validation lane cannot create the on-disk authority key, so pin it."""
+
+    monkeypatch.setenv("AIWORKHUB_TOOLCHAIN_AUTHORITY_HMAC_KEY", "hex:" + "11" * 32)
+
+
 def is_beneath(path: os.PathLike[str] | str, root: os.PathLike[str] | str) -> bool:
     try:
         Path(path).resolve().relative_to(Path(root).resolve())
