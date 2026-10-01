@@ -683,12 +683,12 @@ function renderSummary(snapshot) {
       elements.headerNeedfixDetail.textContent = needfix && needfix.error ? String(needfix.error) : "No evidence";
     } else {
       elements.headerNeedfixValue.textContent = `${formatCount(needfix.open)} open`;
-      elements.headerNeedfixDetail.textContent = `${formatCount(needfix.total)} stored${needfix.truncated ? " · partial" : ""}`;
+      elements.headerNeedfixDetail.textContent = `${formatCount(needfix.stored ?? needfix.total)} stored`;
     }
     setTileHealth(elements.headerNeedfix, !needfix ? "neutral" : needfix.available === false ? "error" : "ok");
     if (elements.headerNeedfix) {
       elements.headerNeedfix.title = needfix && needfix.available !== false
-        ? `${numberValue(needfix.open)} open NeedFix entries · ${numberValue(needfix.total)} visible`
+        ? `${numberValue(needfix.open)} open NeedFix entries · ${numberValue(needfix.stored ?? needfix.total)} stored`
         : `NeedFix unavailable: ${String((needfix && needfix.error) || "unknown")}`;
     }
   }

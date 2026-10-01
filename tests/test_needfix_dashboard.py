@@ -152,8 +152,9 @@ class TestBuildNeedfixSnapshot:
 
     def test_truncated_true_when_total_hits_limit(self, tmp_path: Path,
                                                    monkeypatch: pytest.MonkeyPatch):
-        """When the number of rows equals or exceeds NEEDFIX_SNAPSHOT_LIMIT,
-        truncated must be True."""
+        """Counts come from the store, not the bounded page: with more rows
+        than NEEDFIX_SNAPSHOT_LIMIT, total is the real stored count, items
+        hold the page, and truncated is True."""
         monkeypatch.setattr(dashboard, "NEEDFIX_SNAPSHOT_LIMIT", 3)
         needfix_store.initialize_repository(tmp_path)
         for i in range(4):
@@ -162,7 +163,9 @@ class TestBuildNeedfixSnapshot:
             )
 
         snapshot = dashboard._build_needfix_snapshot(tmp_path)
-        assert snapshot["total"] == 3
+        assert snapshot["total"] == 4
+        assert snapshot["open"] == 4
+        assert len(snapshot["items"]) == 3
         assert snapshot["truncated"] is True
         assert snapshot["limit"] == 3
 

@@ -4928,11 +4928,25 @@ def _build_needfix_snapshot(
         return result
 
     rows = report["items"]
-    total = len(rows)
-    truncated = total >= NEEDFIX_SNAPSHOT_LIMIT
-    open_count = sum(
-        1 for r in rows if r.get("status") not in _NEEDFIX_CLOSED_STATUSES
-    )
+    # Counts come from the store, never from the bounded page: ``rows`` holds at
+    # most NEEDFIX_SNAPSHOT_LIMIT records, so len(rows) caps the header at the
+    # page size on any repo with more active NeedFix than that.
+    if report.get("count") is not None:
+        # Derived: ``count`` is the full active total (open == total, since a
+        # terminal-status row is never derived active) and ``before`` the
+        # stored non-archived total feeding ``stored``, both computed by
+        # list_active independently of pagination -- no second derivation scan.
+        open_count = total = int(report["count"])
+        stored = int(report["before"])
+    else:
+        # Underived: plain SQL counts (archived excluded by default).
+        total = needfix_store.count_needfix(repo_root)
+        open_count = total - sum(
+            needfix_store.count_needfix(repo_root, status=status)
+            for status in sorted(_NEEDFIX_CLOSED_STATUSES - {"archived"})
+        )
+        stored = total
+    truncated = len(rows) < open_count
 
     return {
         "schema_id": "aiworkhub.needfix_snapshot.v1",
@@ -4942,6 +4956,7 @@ def _build_needfix_snapshot(
         "underived_reason": report.get("underived_reason"),
         "open": open_count,
         "total": total,
+        "stored": stored,
         "items": [
             {
                 "id": str(r.get("id") or ""),

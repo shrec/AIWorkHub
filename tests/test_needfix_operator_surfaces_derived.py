@@ -156,6 +156,30 @@ class TestOperatorSurfacesMarkUnderived:
         assert snapshot["total"] == 1
 
 
+class TestDashboardSnapshotCountsAboveCap:
+    """The header counts are the store's totals, not the bounded page length."""
+
+    def test_derived_snapshot_counts_above_cap(
+        self, repo: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.setattr(dashboard, "NEEDFIX_SNAPSHOT_LIMIT", 3)
+        task_store.initialize_repository(repo)
+        for i in range(5):
+            needfix_store.capture_proposal(
+                repo, title=f"active-{i}", description=f"open {i}"
+            )
+
+        snapshot = dashboard._build_needfix_snapshot(repo)
+
+        assert snapshot["available"] is True
+        assert snapshot["derived"] is True
+        assert snapshot["open"] == 5
+        assert snapshot["total"] == 5
+        assert snapshot["stored"] >= 5
+        assert len(snapshot["items"]) == 3
+        assert snapshot["truncated"] is True
+
+
 class TestNeedFixTerminalArtifactProjection:
     def test_list_and_count_exclude_exact_terminal_accepted_finished_superseded(
         self, repo: Path
