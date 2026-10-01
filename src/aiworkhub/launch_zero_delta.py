@@ -19,6 +19,29 @@ ZERO_DELTA_MAX_SECONDS = 600.0
 ZERO_DELTA_POLL_SECONDS = 15.0
 
 
+def split_lifecycle_tail(
+    events: Iterable[dict[str, Any]],
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Split an event list into its last lifecycle row and latest advisory row.
+
+    An advisory ``runtime_notice`` row (see ``RUNTIME_NOTICE_EVENT_KIND``) has
+    no ``state`` and carries ``pid`` without ``pid_start_ticks``. Every reader
+    that took lifecycle state from ``events[-1]`` must read the last LIFECYCLE
+    row instead, or a quiet worker's own notice stops reconciliation forever.
+    Returns ``({}, None)`` for an empty or notice-only list so every caller's
+    ``.get(...)`` stays safe without its own None-guard.
+    """
+
+    lifecycle: dict[str, Any] = {}
+    advisory: dict[str, Any] | None = None
+    for event in events:
+        if str(event.get("event_kind") or "") == RUNTIME_NOTICE_EVENT_KIND:
+            advisory = event
+        else:
+            lifecycle = event
+    return lifecycle, advisory
+
+
 def zero_delta_elapsed_share() -> float:
     raw = os.environ.get(ZERO_DELTA_ELAPSED_SHARE_ENV)
     if raw is None or not str(raw).strip():

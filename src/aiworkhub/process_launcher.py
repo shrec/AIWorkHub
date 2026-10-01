@@ -97,6 +97,7 @@ from .launch_zero_delta import (
     ZeroDeltaTripwire,
     changed_allowed_write_paths,
     evaluate_zero_delta_tripwire,
+    split_lifecycle_tail,
     zero_delta_elapsed_share,
     zero_delta_notice_after_seconds,
 )
@@ -7286,7 +7287,7 @@ class ProcessManager:
         events = self._request_events(target_request_id)
         if not events:
             return {"ok": False, "error": "quality_review_target_request_not_found"}
-        latest = events[-1]
+        latest = split_lifecycle_tail(events)[0]
         if str(latest.get("task_id") or "") != target_task_id:
             return {"ok": False, "error": "quality_review_target_identity_mismatch"}
         review_ready_event = next(
@@ -11168,7 +11169,7 @@ class ProcessManager:
             events = self._request_events(request_id)
             if not events:
                 return None
-            latest = events[-1]
+            latest = split_lifecycle_tail(events)[0]
             finalization_retry = bool(latest.get("finalization_retry"))
             if latest.get("state") in TERMINAL_PROCESS_STATES:
                 return latest
@@ -12577,7 +12578,7 @@ class ProcessManager:
         # stable request identity from the full request lineage while keeping
         # the final row authoritative for state/disposition.
         lineage = self._event_identity(events)
-        latest = {**lineage, **events[-1]}
+        latest = {**lineage, **split_lifecycle_tail(events)[0]}
         # Restore the lineage's error/retention_error over an overlay row.
         latest.update({key: lineage[key] for key in ("error", "retention_error") if key in lineage})
         if (
@@ -12613,7 +12614,7 @@ class ProcessManager:
                     latest["reconciliation_deferred"] = "request_lock_busy"
                 events = self._request_events(request_id)
                 lineage = self._event_identity(events)
-                latest = {**lineage, **events[-1], **{
+                latest = {**lineage, **split_lifecycle_tail(events)[0], **{
                     key: value
                     for key, value in latest.items()
                     if key == "reconciliation_deferred"
@@ -12669,6 +12670,7 @@ class ProcessManager:
             # a lossless string so a >2**53 counter is not silently rounded.
             "latest_event": {**latest, **pid_identity_surface(latest)},
             "liveness": self._liveness_snapshot(latest),
+            "runtime_notice": split_lifecycle_tail(events)[1],
         }
 
     def invoke_vscode_lm_worker_tool(
@@ -12724,13 +12726,13 @@ class ProcessManager:
         events = self._request_events(request_id)
         if not events:
             return {"ok": False, "reason": "worker_bridge_request_not_found"}
-        latest = events[-1]
+        latest = split_lifecycle_tail(events)[0]
         vscode_lm_adapters = {
             runtime_adapters.VSCODE_LM_ADAPTER,
             runtime_adapters.GLM_VSCODE_LM_ADAPTER,
             runtime_adapters.DEEPSEEK_VSCODE_LM_ADAPTER,
         }
-        if latest.get("adapter_id") not in vscode_lm_adapters:
+        if latest and latest.get("adapter_id") not in vscode_lm_adapters:
             return {"ok": False, "reason": "worker_bridge_adapter_mismatch"}
         if latest.get("state") not in WORKER_BRIDGE_AUTHORIZED_PROCESS_STATES:
             return {"ok": False, "reason": "worker_bridge_request_not_active"}
@@ -13229,7 +13231,7 @@ class ProcessManager:
         if not initial_events:
             return {"ok": False, "request_id": request_id, "state": "not_found"}
         initial_lineage = self._event_identity(initial_events)
-        initial_latest = {**initial_lineage, **initial_events[-1]}
+        initial_latest = {**initial_lineage, **split_lifecycle_tail(initial_events)[0]}
         status = {
             "ok": True,
             "request_id": request_id,
@@ -13301,7 +13303,7 @@ class ProcessManager:
         should_finalize = False
         with self._registry_lock():
             events = self._request_events(request_id)
-            latest = events[-1]
+            latest = split_lifecycle_tail(events)[0]
             if latest.get("state") in TERMINAL_PROCESS_STATES:
                 return {
                     "ok": True,
@@ -13402,7 +13404,7 @@ class ProcessManager:
                     "task_id": task_id,
                     "error": "request_not_found",
                 }
-            latest = events[-1]
+            latest = split_lifecycle_tail(events)[0]
             if str(latest.get("task_id") or "") != task_id:
                 return {
                     "ok": False,
