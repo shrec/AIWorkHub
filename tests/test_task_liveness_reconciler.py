@@ -144,6 +144,17 @@ def _require_named_pipes() -> None:
         pytest.skip(f"validation_unsupported_in_sandbox:named_pipe_denied:{exc}")
 
 
+def _read_status_tolerant(path: Path) -> dict:
+    """Reads status.json, tolerating a write in flight: the supervisor
+    replaces this file every heartbeat, so a decode failure or an OS-level
+    read failure (e.g. a Windows read racing the replace) means "no
+    snapshot this poll", not a test failure."""
+    try:
+        return json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
 # --- worker_supervisor.py heartbeat -----------------------------------------
 
 
@@ -194,10 +205,7 @@ def test_heartbeat_refreshes_during_silent_child_and_tracks_output_activity(tmp_
         deadline = time.monotonic() + 6.0
         while time.monotonic() < deadline and len(silent_snapshots) < 3:
             if status_path.is_file():
-                try:
-                    payload = json.loads(status_path.read_text())
-                except json.JSONDecodeError:
-                    payload = {}
+                payload = _read_status_tolerant(status_path)
                 if payload.get("state") == "running" and payload.get("heartbeat_seq"):
                     if (
                         not silent_snapshots
@@ -218,7 +226,7 @@ def test_heartbeat_refreshes_during_silent_child_and_tracks_output_activity(tmp_
         deadline = time.monotonic() + 6.0
         activity_seen = False
         while time.monotonic() < deadline:
-            payload = json.loads(status_path.read_text())
+            payload = _read_status_tolerant(status_path)
             if payload.get("stdout_bytes", 0) > 0:
                 activity_seen = True
                 assert payload["last_output_change_epoch"] > silent_snapshots[0]["last_output_change_epoch"]
@@ -227,7 +235,13 @@ def test_heartbeat_refreshes_during_silent_child_and_tracks_output_activity(tmp_
         assert activity_seen, "expected stdout activity to be observed after the marker was written"
 
         thread.join(timeout=10)
-        final = json.loads(status_path.read_text())
+        final: dict = {}
+        final_deadline = time.monotonic() + 5.0
+        while time.monotonic() < final_deadline:
+            final = _read_status_tolerant(status_path)
+            if final.get("state") == "exited":
+                break
+            time.sleep(0.05)
         assert final["state"] == "exited"
         assert final["exit_code"] == 0
         assert final["supervisor_pid_start_ticks"] is not None

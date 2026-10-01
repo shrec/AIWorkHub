@@ -515,6 +515,18 @@ class _MuxHarness:
             if time.monotonic() > deadline:
                 raise TimeoutError("mux never became ready after handshake")
             time.sleep(0.02)
+        # _seen_initialized_notification is set in _observe_extension_message
+        # BEFORE the pump's write of that notification to the child actually
+        # completes, so the flag alone does not prove the child has consumed
+        # it yet. The pump writes extension->child traffic to the child in
+        # the order it reads it from the extension, so round-tripping one
+        # more request over that same pipe can only come back once the
+        # notification's write has already finished -- which is what a
+        # sideband request racing in right after this method returns needs
+        # to be true.
+        self.send_as_extension({"id": "ext-handshake-drain", "method": "handshake/drain", "params": {}})
+        drain_resp = self.recv_as_extension()
+        assert drain_resp.get("id") == "ext-handshake-drain"
 
     def close(self) -> None:
         if self._closed:
@@ -703,6 +715,7 @@ def test_sideband_idle_turn_start_is_synchronous_ack_and_visible_to_extension():
             thread_id = f"thread-{uuid.uuid4()}"
             resumed = h.sideband_call("thread/resume", {"threadId": thread_id})
             assert resumed["ok"] is True
+            assert "result" in resumed["response"]
             result = h.sideband_call(
                 "turn/start",
                 {"threadId": thread_id, "input": [{"type": "text", "text": "callback prompt"}]},

@@ -44,6 +44,13 @@ from aiworkhub.source_graph_lsp import (
 
 FAKE_LSP_FLAG = "--fake-lsp"
 
+# A startup-tolerant deadline for happy-path cases that must observe a real
+# resolution (position_encoding negotiated, lsp.log written) from the fake
+# LSP subprocess: under host load, the handshake alone can take longer than
+# the short deadlines used by cases that deliberately assert timeout/
+# fail-closed-on-deadline behaviour, which keep their own short values.
+HAPPY_PATH_DEADLINE_S = 30.0
+
 
 def _hash(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
@@ -232,8 +239,8 @@ def test_fake_server_handshake_location_and_cleanup(tmp_path: Path) -> None:
         spec=_spec(scenario),
         queries=[DefinitionQuery("src/mod.py", hashes["src/mod.py"], 2, 11)],
         indexed_hashes=hashes,
-        request_timeout_s=2.0,
-        batch_timeout_s=4.0,
+        request_timeout_s=HAPPY_PATH_DEADLINE_S,
+        batch_timeout_s=HAPPY_PATH_DEADLINE_S,
         env=_env(scenario, log_path),
     )
     assert outcome.children_reaped
@@ -290,8 +297,8 @@ def test_non_ascii_byte_column_converted_per_negotiated_encoding(
         spec=_spec(scenario),
         queries=[DefinitionQuery("src/mod.py", hashes["src/mod.py"], 1, 10)],
         indexed_hashes=hashes,
-        request_timeout_s=2.0,
-        batch_timeout_s=4.0,
+        request_timeout_s=HAPPY_PATH_DEADLINE_S,
+        batch_timeout_s=HAPPY_PATH_DEADLINE_S,
         env=env,
     )
     assert outcome.position_encoding == encoding
@@ -322,7 +329,7 @@ def test_many_query_batch_survives_default_output_budget(tmp_path: Path) -> None
             for _ in range(count)
         ],
         indexed_hashes=hashes,
-        request_timeout_s=2.0,
+        request_timeout_s=HAPPY_PATH_DEADLINE_S,
         batch_timeout_s=60.0,
         env=_env(scenario),
     )
@@ -350,7 +357,7 @@ def test_non_positive_source_line_fails_closed(tmp_path: Path) -> None:
         spec=_spec(scenario),
         queries=[DefinitionQuery("src/mod.py", hashes["src/mod.py"], 0, 0)],
         indexed_hashes=hashes,
-        request_timeout_s=2.0,
+        request_timeout_s=HAPPY_PATH_DEADLINE_S,
         env=_env(scenario, log_path),
     )
     assert outcome.results[0].classification == UNRESOLVED
@@ -402,8 +409,8 @@ def test_location_link_and_interleaved_notifications(tmp_path: Path) -> None:
         spec=_spec(scenario),
         queries=[DefinitionQuery("src/mod.py", hashes["src/mod.py"], 2, 11)],
         indexed_hashes=hashes,
-        request_timeout_s=2.0,
-        batch_timeout_s=4.0,
+        request_timeout_s=HAPPY_PATH_DEADLINE_S,
+        batch_timeout_s=HAPPY_PATH_DEADLINE_S,
         env=_env(scenario),
     )
     assert outcome.results[0].classification == REPO_INTERNAL
@@ -465,7 +472,7 @@ def test_multiple_targets_are_ambiguous_not_internal(tmp_path: Path) -> None:
         spec=_spec(scenario),
         queries=[DefinitionQuery("src/mod.py", hashes["src/mod.py"], 2, 11)],
         indexed_hashes=hashes,
-        request_timeout_s=2.0,
+        request_timeout_s=HAPPY_PATH_DEADLINE_S,
         env=_env(scenario),
     )
     assert outcome.results[0].classification == AMBIGUOUS
@@ -858,7 +865,7 @@ def test_non_utf8_source_fails_closed_per_query(tmp_path: Path) -> None:
             DefinitionQuery("src/bad.py", hashes["src/bad.py"], 2, 11),
         ],
         indexed_hashes=hashes,
-        request_timeout_s=2.0,
+        request_timeout_s=HAPPY_PATH_DEADLINE_S,
         observed_cores=2,
         env=_env(scenario),
     )
