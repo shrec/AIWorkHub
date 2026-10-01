@@ -231,9 +231,11 @@ def reviewer_evidence(
     to this exact parent.  A live reviewer whose card carries no binding yet is
     listed from its topic ``quality_review`` ledger event alone (NF-2026-01058).
 
-    Total by construction: a ledger read failure leaves every reviewer with an
-    empty request id, ``usable`` False and ``state_unknown`` True -- never a
-    ``running`` False dressed up as knowledge -- which blocks acceptance.
+    Total by construction: any failure of the ledger read or of the liveness
+    rule leaves every reviewer with an empty request id, ``usable`` False and
+    ``state_unknown`` True, with the exception class name (never its text) in
+    ``state_unknown_cause`` -- never a ``running`` False dressed up as
+    knowledge -- which blocks acceptance (NF-2026-01164).
     """
     rows = bound_reviewer_rows(self.repo, parent_task_id, parent_request_id)
     live_lens_reviewers = getattr(self, "_live_lens_reviewers", None)
@@ -244,10 +246,12 @@ def reviewer_evidence(
             if live_lens_reviewers is not None
             else []
         )
-    except Exception:  # noqa: BLE001 -- unknown is neither running nor missing
+    except Exception as exc:  # noqa: BLE001 -- unknown is neither running nor missing
+        # The class name only: exception text can carry host paths.
         unknown = {
             "request_id": "", "state": "", "usable": False, "attempt_count": 0,
             "running": False, "running_request_id": "", "state_unknown": True,
+            "state_unknown_cause": type(exc).__name__[:80],
         }
         return [{**row, **unknown} for row in rows] or [{
             "task_id": "", "lens": "", "packet_sha256": "",
@@ -305,6 +309,7 @@ def reviewer_evidence(
                 "running": running is not None,
                 "running_request_id": running[0] if running else "",
                 "state_unknown": False,
+                "state_unknown_cause": "",
             }
         )
     return sorted(resolved, key=lambda entry: (entry["lens"], entry["task_id"]))
@@ -895,12 +900,23 @@ def fold_accept_blockers(
         row["lens"]: row for row in reviewers if row.get("running") and not row["usable"]
     }
     state_unknown = any(row.get("state_unknown") for row in reviewers)
+    state_unknown_cause = next(
+        (
+            str(row.get("state_unknown_cause"))[:80]
+            for row in reviewers
+            if row.get("state_unknown_cause")
+        ),
+        "",
+    )
     if lens_census_complete:
         for lens in required:
             if lens in usable_lenses:
                 continue
             if state_unknown:
-                blockers.append(_blocker("reviewer_state_unknown", lens, lens=lens))
+                cause = {"cause": state_unknown_cause} if state_unknown_cause else {}
+                blockers.append(
+                    _blocker("reviewer_state_unknown", lens, lens=lens, **cause)
+                )
                 continue
             live = running_rows.get(lens)
             blockers.append(

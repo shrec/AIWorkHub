@@ -645,6 +645,99 @@ def test_accept_preview_fails_closed_on_an_unreadable_ledger(tmp_path: Path):
     assert "reviewer_state_unknown" in process_launcher_accept_review.ACCEPT_BLOCKER_KINDS
 
 
+def _raising_reviewer_manager(repo: Path, exc: Exception) -> _ReviewerManager:
+    class _Raising(_ReviewerManager):
+        def _latest_by_request(self) -> dict[str, dict]:
+            raise exc
+
+    return _Raising(repo)
+
+
+def test_reviewer_evidence_state_unknown_cause_names_a_programming_error(
+    tmp_path: Path,
+):
+    """NF-2026-01164: a coding error took the same path as a ledger read
+    failure and left nothing but "reviewer state unknown" to go on."""
+    repo = _store_with_reviewers(
+        tmp_path,
+        [
+            _reviewer_card("QR-CORRECTNESS", "correctness"),
+            _reviewer_card("QR-SECURITY", "security"),
+        ],
+    )
+    manager = _raising_reviewer_manager(repo, AttributeError("boom /secret/path"))
+    rows = process_launcher_accept_review.reviewer_evidence(manager, "T-1", "R-1")
+
+    assert len(rows) == 2
+    for row in rows:
+        assert row["state_unknown"] is True
+        assert row["usable"] is False
+        assert row["running"] is False
+        assert row["state_unknown_cause"] == "AttributeError"
+        # The class name only: exception text can carry host paths.
+        assert all("/secret/path" not in str(value) for value in row.values())
+
+
+def test_reviewer_evidence_state_unknown_cause_names_a_ledger_read_error(
+    tmp_path: Path,
+):
+    repo = _store_with_reviewers(tmp_path, [])
+    manager = _raising_reviewer_manager(repo, OSError("ledger unreadable"))
+    rows = process_launcher_accept_review.reviewer_evidence(manager, "T-1", "R-1")
+
+    assert rows
+    assert all(row["state_unknown"] for row in rows)
+    assert [row["state_unknown_cause"] for row in rows] == ["OSError"] * len(rows)
+
+
+def test_reviewer_evidence_state_unknown_cause_is_empty_when_ledger_reads(
+    tmp_path: Path,
+):
+    repo = _store_with_reviewers(
+        tmp_path,
+        [
+            _reviewer_card("QR-CORRECTNESS", "correctness"),
+            _reviewer_card("QR-SECURITY", "security"),
+        ],
+    )
+    manager = _ReviewerManager(
+        repo,
+        {
+            "rq-correctness": {
+                "task_id": "QR-CORRECTNESS", "state": "review_ready",
+                "finished_at": "2026-09-08T02:00:00+00:00",
+            },
+        },
+    )
+    rows = process_launcher_accept_review.reviewer_evidence(manager, "T-1", "R-1")
+
+    assert len(rows) == 2
+    assert all(row["state_unknown"] is False for row in rows)
+    assert all(row["state_unknown_cause"] == "" for row in rows)
+
+
+def test_accept_preview_state_unknown_cause_reaches_the_blocker(tmp_path: Path):
+    repo = _store_with_reviewers(tmp_path, [])
+    manager = _raising_reviewer_manager(repo, AttributeError("boom /secret/path"))
+    card = {
+        "task_id": "T-1",
+        "risk_tier": "high",
+        "terminal_review": {
+            "substatus": "review_ready",
+            "evidence": {"changed_paths": ["src/aiworkhub/process_launcher.py"]},
+        },
+    }
+    manager._show_task = lambda task_id: {"returncode": 0, "stdout": json.dumps(card)}
+    preview = process_launcher_accept_review.accept_preview(manager, "R-1", "T-1")
+
+    required = set(_profile("high")["required_reviewer_lenses"])
+    lens_blockers = [row for row in preview["blockers"] if row.get("lens") in required]
+    assert {row["lens"] for row in lens_blockers} == required
+    assert {row["kind"] for row in lens_blockers} == {"reviewer_state_unknown"}
+    assert all(row["cause"] == "AttributeError" for row in lens_blockers)
+    assert "/secret/path" not in json.dumps(preview)
+
+
 def test_fold_never_invents_a_refusal_for_a_reviewer_it_cannot_see():
     """A manager-named id outside the bound-children scan is not evidence of
     absence: the authoritative loop resolves it by request id and verifies its
