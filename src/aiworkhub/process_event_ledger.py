@@ -269,7 +269,9 @@ def _canonical_terminal_reason(event: dict[str, Any], state: str) -> dict[str, A
 
     When no supported scalar cause exists the record is forced to the
     observability-missing-cause schema, regardless of any conflicting
-    caller-supplied ``code``/``taxonomy``.
+    caller-supplied ``code``/``taxonomy``. A typed ``terminal_failure``
+    category of ``credential`` classifies as retryable ``credential_expired``
+    whether or not a scalar cause also exists.
     """
 
     supplied = event.get("terminal_reason")
@@ -311,7 +313,15 @@ def _canonical_terminal_reason(event: dict[str, Any], state: str) -> dict[str, A
             elif reason.get("code") == "sandbox_spawn_failed":
                 code = "sandbox_spawn_failed"
                 taxonomy = "sandbox_spawn_failure"
-            return {
+            # NF-2026-01174: a typed credential category is the cause's class
+            # even when a scalar cause (e.g. the exit text) is also present.
+            elif (
+                isinstance(failure := event.get("terminal_failure"), dict)
+                and _bounded_cause(failure.get("category")) == "credential"
+            ):
+                code = "credential_expired"
+                taxonomy = "provider_credential"
+            scalar: dict[str, Any] = {
                 "code": code,
                 "taxonomy": taxonomy,
                 "source": source,
@@ -319,6 +329,9 @@ def _canonical_terminal_reason(event: dict[str, Any], state: str) -> dict[str, A
                 "missing_cause": False,
                 "alertable": alertable,
             }
+            if code == "credential_expired":
+                scalar["retryable"] = True
+            return scalar
     # NF-2026-01126: with no scalar cause, a typed terminal_failure category
     # (e.g. an expired OAuth credential) is still a known cause, not a missing one.
     failure = event.get("terminal_failure")
@@ -370,6 +383,9 @@ def append_event(
     same object. Handing the persisted row back keeps one event with one
     representation: a caller that finalizes and a caller that replays the
     ledger afterwards must not disagree about what happened.
+    The one exception is a causeless workspace-GC row (NF-2026-01174): it is
+    persisted without ``terminal_reason`` so the merge fold of
+    ``latest_events`` keeps the reason already recorded for the request.
     """
 
     if max_active_bytes < 1024:
@@ -386,9 +402,17 @@ def append_event(
             persisted_event["state"] = state
             had_supplied_reason = "terminal_reason" in persisted_event
             supplied_reason = persisted_event.get("terminal_reason")
-            persisted_event["terminal_reason"] = _canonical_terminal_reason(
-                persisted_event, state
+            canonical_reason = _canonical_terminal_reason(persisted_event, state)
+            # NF-2026-01174: a causeless workspace-GC row only restates the
+            # state; stamping it missing_cause would overlay the recorded
+            # terminal reason in the default merge fold of latest_events.
+            causeless_gc_row = (
+                persisted_event.get("workspace_gc") is True
+                and not had_supplied_reason
+                and canonical_reason["missing_cause"] is True
             )
+            if not causeless_gc_row:
+                persisted_event["terminal_reason"] = canonical_reason
             if had_supplied_reason:
                 # Never discard what the caller sent: the canonical fixed-key
                 # schema above is authoritative, but the raw caller value is

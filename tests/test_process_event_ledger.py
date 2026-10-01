@@ -396,7 +396,7 @@ def test_scalar_cause_precedes_terminal_failure_and_empty_category_is_missing(
             "request_id": "scalar",
             "state": "worker_failed",
             "error": "worker crashed",
-            "terminal_failure": {"category": "credential"},
+            "terminal_failure": {"category": "tool_unavailable"},
         },
     )
     assert scalar["source"] == "error"
@@ -1155,3 +1155,107 @@ def test_returned_nested_values_cannot_mutate_the_retained_projection(
     # Each read owns its own nested containers, so one caller's edit is not a
     # later caller's input.
     assert first["a"][0]["detail"] is not second["a"][0]["detail"]
+
+
+def _nf01174_gc_row(request_id: str, **extra: object) -> dict[str, object]:
+    # The shape process_launcher._gc_finalized_workspace appends: it restates the
+    # failure state but carries no cause of its own.
+    return {
+        "request_id": request_id,
+        "task_id": "task",
+        "runner": "claude",
+        "topic": "topic",
+        "adapter_id": "adapter",
+        "state": "worker_failed",
+        "workspace_gc": True,
+        "workspace_gc_at": "2026-10-01T00:00:00+00:00",
+        "workspace_gc_reason": "finalized",
+        "workspace_disposition": "removed",
+        "workspace_retained": False,
+        **extra,
+    }
+
+
+def test_nf01174_gc_row_keeps_recorded_terminal_reason(tmp_path: Path) -> None:
+    path = tmp_path / "process_events.jsonl"
+    process_event_ledger.append_event(
+        path, {"request_id": "R", "state": "worker_failed", "error": "boom"}
+    )
+    process_event_ledger.append_event(path, _nf01174_gc_row("R"))
+
+    folded = process_event_ledger.latest_events(path)["R"]
+
+    assert folded["workspace_gc"] is True
+    assert folded["terminal_reason"]["code"] == "worker_failed"
+    assert folded["terminal_reason"]["message"] == "boom"
+    assert folded["terminal_reason"]["missing_cause"] is False
+
+
+def test_nf01174_gc_row_is_persisted_without_a_missing_cause_stamp(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "process_events.jsonl"
+    persisted = process_event_ledger.append_event(path, _nf01174_gc_row("R"))
+
+    assert persisted["state"] == "worker_failed"
+    assert "terminal_reason" not in persisted
+    assert "terminal_reason_raw" not in persisted
+    assert list(process_event_ledger.iter_events(path)) == [persisted]
+
+
+def test_nf01174_causeless_non_gc_failure_row_still_reports_missing_cause(
+    tmp_path: Path,
+) -> None:
+    reason = _append_and_read_reason(
+        tmp_path, {"request_id": "R", "state": "worker_failed"}
+    )
+
+    assert reason["code"] == "terminal_reason_missing"
+    assert reason["missing_cause"] is True
+
+
+def test_nf01174_gc_row_with_a_cause_is_canonicalised(tmp_path: Path) -> None:
+    reason = _append_and_read_reason(tmp_path, _nf01174_gc_row("R", error="late"))
+
+    assert reason["code"] == "worker_failed"
+    assert reason["message"] == "late"
+    assert reason["missing_cause"] is False
+
+
+def test_nf01174_typed_credential_wins_classification_over_scalar(
+    tmp_path: Path,
+) -> None:
+    reason = _append_and_read_reason(
+        tmp_path,
+        {
+            "request_id": "R",
+            "state": "worker_failed",
+            "error": "exit 1",
+            "terminal_failure": {"category": "credential"},
+        },
+    )
+
+    assert reason["code"] == "credential_expired"
+    assert reason["taxonomy"] == "provider_credential"
+    assert reason["retryable"] is True
+    assert reason["source"] == "error"
+    assert reason["message"] == "exit 1"
+    assert reason["missing_cause"] is False
+
+
+def test_nf01174_non_credential_category_keeps_lifecycle_classification(
+    tmp_path: Path,
+) -> None:
+    reason = _append_and_read_reason(
+        tmp_path,
+        {
+            "request_id": "R",
+            "state": "worker_failed",
+            "error": "exit 1",
+            "terminal_failure": {"category": "provider_runtime"},
+        },
+    )
+
+    assert reason["code"] == "worker_failed"
+    assert reason["taxonomy"] == "lifecycle_terminal_failure"
+    assert "retryable" not in reason
