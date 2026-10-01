@@ -422,6 +422,7 @@ def test_terminal_retry_spark_card_requires_explicit_native_codex_reroute(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("AIWORKHUB_TOOLCHAIN_AUTHORITY_HMAC_KEY", "hex:" + "11" * 32)
     task_id = "NF398_SPARK_RETRY"
     topic = "nf460_reroute_mcp_wiring"
     scope = ["out/result.json"]
