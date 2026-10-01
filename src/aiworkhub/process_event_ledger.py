@@ -271,7 +271,9 @@ def _canonical_terminal_reason(event: dict[str, Any], state: str) -> dict[str, A
     observability-missing-cause schema, regardless of any conflicting
     caller-supplied ``code``/``taxonomy``. A typed ``terminal_failure``
     category of ``credential`` classifies as retryable ``credential_expired``
-    whether or not a scalar cause also exists.
+    whether or not a scalar cause also exists; beside a scalar cause the
+    validation-environment prefix and the ``sandbox_spawn_failed`` code hint
+    are checked first and outrank it.
     """
 
     supplied = event.get("terminal_reason")
