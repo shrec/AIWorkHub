@@ -693,6 +693,11 @@ def _run(
         "shell": False,
         "env": _git_environment(),
     }
+    if text:
+        # git writes paths as UTF-8 bytes; the locale codec in strict mode
+        # drops the whole stream on one unmapped byte (NF-2026-01178).
+        popen_kwargs["encoding"] = "utf-8"
+        popen_kwargs["errors"] = "replace"
     if input_text is not None:
         popen_kwargs["stdin"] = subprocess.PIPE
     if os.name == "nt":
