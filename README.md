@@ -62,6 +62,14 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
+## What's new in 0.12.14
+
+- A review now shows how many tests passed, failed and were skipped, and the first failure, instead of only an exit code.
+- Reworking a card whose files changed on main in the meantime launches again instead of stopping on a hash check.
+- Stopping a worker on Windows ends its whole process tree and never reports a still-running process as stopped.
+- Running the test suite no longer overwrites the built release package.
+- A Codex manager that switched to another repository can switch back instead of stopping on a route ownership conflict.
+
 ## What's new in 0.12.13
 
 - A manager can dismiss a low or medium reviewer finding with counter-evidence, on the record, instead of re-running the whole card.

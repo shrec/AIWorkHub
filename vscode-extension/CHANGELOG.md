@@ -1,5 +1,18 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.12.14 — 2026-10-01
+
+### Added
+
+- Validation evidence and the review packet carry pytest outcome counts and the first failure block for each pytest validation row, and the packet reports `validation_skipped_total`, so a reviewer sees what a command measured instead of only its exit code (NF-2026-01155).
+
+### Fixed
+
+- A rework launch whose predecessor paths were cleanly rebased onto a drifted main no longer fails with `rework_overlay_hash_mismatch`: the overlay seals the rebased bytes when they match the post-seed workspace baseline, and foreign bytes are still refused (NF-2026-01187).
+- Windows child termination is a bounded ladder that ends in the kill-on-close Job and never reports a live child as stopped (NF-2026-01166).
+- The VSIX packaging test fixture builds into the validation scratch root and leaves the release `dist` untouched (NF-2026-01183).
+- A Codex manager that switched to another repository can switch back: the shared-route identity takes the owner window from a coherent ownership-ledger projection, so the reverse transfer no longer fails with `route_ownership_epoch_conflict` (NF-2026-01188).
+
 ## 0.12.13 — 2026-10-01
 
 ### Added
