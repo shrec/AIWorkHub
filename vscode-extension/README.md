@@ -14,6 +14,11 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.12.12
+
+- The NeedFix header shows the real open and stored counts instead of a constant 200.
+- A launch that failed without changing anything can be recovered instead of blocking its card.
+
 ## What's new in 0.12.11
 
 - A rejected review can demand new evidence: `validation_amendment` appends the required commands to the card's validation, so the next attempt must run them.

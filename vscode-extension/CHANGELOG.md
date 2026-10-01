@@ -1,5 +1,12 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.12.12 — 2026-10-01
+
+### Fixed
+
+- The NeedFix header card reports the store's real active and stored counts instead of the length of the 200-row snapshot page; a new additive `stored` field feeds the "stored" label, and `truncated` means only that the items page is bounded (NF-2026-01171).
+- A terminal launch failure that changed nothing is recoverable on a clean root: `recover_blocked_rework` proves the request's own worktree untouched against its workspace baseline, refuses untracked files the baseline does not cover, and re-checks a stat fingerprint of the tree under the writer lease without spawning (NF-2026-01160).
+
 ## 0.12.11 — 2026-10-01
 
 ### Added
