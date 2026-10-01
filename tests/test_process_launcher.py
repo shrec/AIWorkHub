@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import errno
 import hashlib
 import json
@@ -1127,6 +1128,140 @@ def test_rework_overlay_materialization_uses_same_task_distinct_request(
     assert packet["successor_request_id"] == "5" * 32
     assert packet["predecessor_request_id"] == "6" * 32
     assert json.loads(path.read_text(encoding="utf-8")) == packet
+
+
+def test_rework_overlay_materialization_seals_rebased_baseline_bytes(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    worktree = tmp_path / "successor" / "worktree"
+    home = tmp_path / "successor" / "home"
+    repo.mkdir()
+    worktree.mkdir(parents=True)
+    home.mkdir(parents=True)
+    candidate = worktree / "src" / "service.py"
+    candidate.parent.mkdir(parents=True)
+    candidate.write_bytes(b"def repaired():\n    return True\n    # rebased\n")
+    rebased_digest = hashlib.sha256(candidate.read_bytes()).hexdigest()
+    predecessor_digest = hashlib.sha256(
+        b"def repaired():\n    return True\n"
+    ).hexdigest()
+    baseline_entry = worker_workspace._hash_path(candidate)
+    workspace = process_launcher.WorkerWorkspace(
+        request_id="5" * 32,
+        repo=repo,
+        path=worktree,
+        home=home,
+        allowed_writes=("src/service.py",),
+        parent_baseline={"src/service.py": None},
+        workspace_baseline={"src/service.py": baseline_entry},
+        inherited_rework_paths=("src/service.py",),
+    )
+
+    path, packet = process_launcher._materialize_worker_rework_overlay(
+        workspace,
+        task_id="TASK_REBASED",
+        card={
+            "rework_predecessor": {
+                "request_id": "6" * 32,
+                "changed_path_hashes": {"src/service.py": predecessor_digest},
+            }
+        },
+    )
+
+    assert path is not None and path.is_file()
+    assert packet is not None
+    entry = packet["files"][0]
+    assert entry["path"] == "src/service.py"
+    assert entry["sha256"] == rebased_digest
+    assert base64.b64decode(entry["content_base64"]) == candidate.read_bytes()
+    assert json.loads(path.read_text(encoding="utf-8")) == packet
+
+
+def test_rework_overlay_materialization_rejects_foreign_bytes(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    worktree = tmp_path / "successor" / "worktree"
+    home = tmp_path / "successor" / "home"
+    repo.mkdir()
+    worktree.mkdir(parents=True)
+    home.mkdir(parents=True)
+    candidate = worktree / "src" / "service.py"
+    candidate.parent.mkdir(parents=True)
+    candidate.write_bytes(b"def foreign():\n    return False\n")
+    predecessor_digest = hashlib.sha256(
+        b"def repaired():\n    return True\n"
+    ).hexdigest()
+    baseline_digest = "file:644:" + hashlib.sha256(b"some other bytes\n").hexdigest()
+    workspace = process_launcher.WorkerWorkspace(
+        request_id="5" * 32,
+        repo=repo,
+        path=worktree,
+        home=home,
+        allowed_writes=("src/service.py",),
+        parent_baseline={"src/service.py": None},
+        workspace_baseline={"src/service.py": baseline_digest},
+        inherited_rework_paths=("src/service.py",),
+    )
+
+    with pytest.raises(
+        process_launcher.WorkspaceError,
+        match=r"^rework_overlay_hash_mismatch:src/service\.py$",
+    ):
+        process_launcher._materialize_worker_rework_overlay(
+            workspace,
+            task_id="TASK_FOREIGN",
+            card={
+                "rework_predecessor": {
+                    "request_id": "6" * 32,
+                    "changed_path_hashes": {"src/service.py": predecessor_digest},
+                }
+            },
+        )
+
+
+def test_rework_overlay_materialization_rejects_bare_hex_baseline_format(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    worktree = tmp_path / "successor" / "worktree"
+    home = tmp_path / "successor" / "home"
+    repo.mkdir()
+    worktree.mkdir(parents=True)
+    home.mkdir(parents=True)
+    candidate = worktree / "src" / "service.py"
+    candidate.parent.mkdir(parents=True)
+    candidate.write_bytes(b"def repaired():\n    return True\n    # rebased\n")
+    actual_digest = hashlib.sha256(candidate.read_bytes()).hexdigest()
+    predecessor_digest = hashlib.sha256(
+        b"def repaired():\n    return True\n"
+    ).hexdigest()
+    workspace = process_launcher.WorkerWorkspace(
+        request_id="5" * 32,
+        repo=repo,
+        path=worktree,
+        home=home,
+        allowed_writes=("src/service.py",),
+        parent_baseline={"src/service.py": None},
+        workspace_baseline={"src/service.py": actual_digest},
+        inherited_rework_paths=("src/service.py",),
+    )
+
+    with pytest.raises(
+        process_launcher.WorkspaceError,
+        match=r"^rework_overlay_hash_mismatch:src/service\.py$",
+    ):
+        process_launcher._materialize_worker_rework_overlay(
+            workspace,
+            task_id="TASK_BARE_HEX",
+            card={
+                "rework_predecessor": {
+                    "request_id": "6" * 32,
+                    "changed_path_hashes": {"src/service.py": predecessor_digest},
+                }
+            },
+        )
 
 
 def test_crash_retry_packet_reuses_bounded_failure_evidence_without_stale_tree(

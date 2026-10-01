@@ -3633,9 +3633,12 @@ def _materialize_worker_rework_overlay(
         if candidate.is_symlink() or not candidate.is_file():
             raise WorkspaceError(f"rework_overlay_file_missing:{relative}")
         content = candidate.read_bytes()
-        if hashlib.sha256(content).hexdigest() != expected:
+        actual = hashlib.sha256(content).hexdigest()
+        # NF-2026-01113: rebase merges bytes; baseline pins "file:<mode>:<sha256>".
+        rebased = str((workspace.workspace_baseline or {}).get(relative) or "")
+        if actual != expected and not re.fullmatch(rf"file:[0-7]+:{actual}", rebased):
             raise WorkspaceError(f"rework_overlay_hash_mismatch:{relative}")
-        entries.append((relative, expected, content))
+        entries.append((relative, actual, content))
 
     try:
         packet_bytes = materialize_rework_overlay(
