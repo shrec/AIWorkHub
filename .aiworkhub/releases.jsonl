@@ -14,3 +14,5 @@
 {"kind": "installed", "version": "0.12.11", "installed_at": "2026-10-01T00:39:33Z", "server_version": "0.12.11"}
 {"kind": "built", "version": "0.12.12", "release_commit": "9c3f70a08674d42006251a9a09e49f83d61ba93b", "vsix_sha256": "ba1e91eda6c29aa55e1f2fc7cd2f22e9a0abbe724ef68b6554f0e38ce846c3a9", "built_at": "2026-10-01T00:43:18Z", "previous_vsix": {"path": "vscode-extension/dist/aiworkhub-0.12.11.vsix", "sha256": "1e5e4ed2639536353e445ffb9b00cdda80c8c934e912a321f998e8d2bbe2a4ec"}, "target": "vscode_local"}
 {"kind": "installed", "version": "0.12.12", "installed_at": "2026-10-01T00:52:55Z", "server_version": "0.12.12"}
+{"kind": "built", "version": "0.12.13", "release_commit": "6e9f8b6f796470f3e9d7210b2d3ce95542be3616", "vsix_sha256": "77da64b7d481e2ce77bc1d1089fbe0811d7de14400e6eda2304df7b6cd967dae", "built_at": "2026-10-01T08:36:36Z", "previous_vsix": {"path": "vscode-extension/dist/aiworkhub-0.12.12.vsix", "sha256": "28c666a4a150458a43d02f8306f4e3f4669b4f590ff4f38e9b68e88ebe56caeb"}, "target": "vscode_local"}
+{"kind": "installed", "version": "0.12.13", "installed_at": "2026-10-01T09:14:08Z", "server_version": "0.12.13"}
