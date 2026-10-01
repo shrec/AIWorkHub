@@ -4518,6 +4518,55 @@ def test_validation_batch_retains_each_failed_command_and_bounded_streams(
     assert delta["packet_bytes"] <= 6 * 1024
 
 
+def test_validation_batch_records_pytest_outcomes_and_first_failure_block(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, repo: Path
+) -> None:
+    workspace = _workspace(monkeypatch, tmp_path, repo, "validation-pytest-evidence")
+    scratch = tmp_path / "validation-pytest-scratch"
+    scratch.mkdir()
+    monkeypatch.setattr(worker_workspace, "select_sandbox_backend", lambda: "landlock")
+    monkeypatch.setattr(
+        worker_workspace, "provision_validation_exec_scratch", lambda _workspace: scratch
+    )
+    monkeypatch.setattr(worker_workspace, "cleanup_validation_exec_scratch", lambda _path: None)
+    monkeypatch.setattr(
+        worker_workspace,
+        "sandbox_argv",
+        lambda _workspace, _adapter, argv, **_kwargs: list(argv),
+    )
+    monkeypatch.setattr(worker_workspace, "sanitized_env", lambda *_args, **_kwargs: {})
+    stdout = (
+        "x" * 4200
+        + "\n"
+        + "=================================== FAILURES ===================================\n"
+        + "__________________________________ test_one ____________________________________\n"
+        + "\n"
+        + "    def test_one():\n"
+        + ">       assert False\n"
+        + "E       assert False\n"
+        + "=========================== short test summary info ============================\n"
+        + "y" * 4200
+        + "\n"
+        + "2 failed, 3 passed, 1 skipped in 1.23s\n"
+    )
+    monkeypatch.setattr(
+        worker_workspace.subprocess,
+        "run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess([], 1, stdout, ""),
+    )
+
+    with pytest.raises(worker_workspace.ValidationRunError) as caught:
+        worker_workspace.run_validations(workspace, ["python3 -c 'raise SystemExit(1)'"])
+
+    rows = caught.value.results
+    assert rows[0]["pytest_outcomes"] == {"failed": 2, "passed": 3, "skipped": 1}
+    first_failure = rows[0]["pytest_first_failure"]
+    assert "test_one" in first_failure
+    assert "E       assert False" in first_failure
+    assert "test_one" not in rows[0]["stdout_head"]
+    assert "test_one" not in rows[0]["stdout_tail"]
+
+
 @pytest.mark.parametrize(
     ("record", "expected"),
     [

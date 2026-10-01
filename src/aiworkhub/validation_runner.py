@@ -1143,6 +1143,128 @@ def temp_root_blocks_nested_lsp_helper(temp_root: str, username: str) -> bool:
     )
 
 
+# ---- pytest outcome surfacing (NF-2026-01155) --------------------------------
+# Worker validation records only a returncode and a 4096-char head/tail per
+# command, so a pytest run that skips most of its tests can read as a clean
+# pass and a failing run can lose its traceback to the tail cut. This section
+# is SURFACE ONLY: it never feeds ``classify_validation_results`` or
+# ``row_restriction`` and never changes a verdict -- it only extracts counts
+# and the first failure's text so a human reading the evidence can see them.
+_PYTEST_SUMMARY_DURATION_RE = re.compile(r"^[\d.]+s(?: \(\d+:\d{2}:\d{2}\))?$")
+_PYTEST_SUMMARY_COUNT_RE = re.compile(r"^(\d{1,9})\s+([A-Za-z]+)$")
+_PYTEST_SUMMARY_KEY_ALIASES = {
+    "passed": "passed",
+    "failed": "failed",
+    "skipped": "skipped",
+    "error": "errors",
+    "errors": "errors",
+    "xfailed": "xfailed",
+    "xpassed": "xpassed",
+    "deselected": "deselected",
+    "warning": "warnings",
+    "warnings": "warnings",
+}
+_PYTEST_SECTION_HEADER_RE = re.compile(r"^=+\s*(?:FAILURES|ERRORS)\s*=+$")
+_PYTEST_ANY_SECTION_LINE_RE = re.compile(r"^=+.*=+$")
+_PYTEST_TEST_HEADER_RE = re.compile(r"^_{3,}.+_{3,}$")
+_PYTEST_FIRST_FAILURE_MAX_CHARS = 4_000
+_PYTEST_FIRST_FAILURE_HEAD_CHARS = 1_000
+_PYTEST_FIRST_FAILURE_TAIL_CHARS = 3_000
+_PYTEST_FIRST_FAILURE_TRUNCATION_MARKER = "\n...[truncated]...\n"
+
+
+def _parse_pytest_summary_line(line: str) -> dict[str, int] | None:
+    """One pytest final-summary line's outcomes; ``None`` when not one."""
+    stripped = line.strip().strip("=").strip()
+    if not stripped or " in " not in stripped:
+        return None
+    body, _, duration = stripped.rpartition(" in ")
+    if not _PYTEST_SUMMARY_DURATION_RE.match(duration):
+        return None
+    body = body.strip()
+    if body == "no tests ran":
+        return {}
+    if not body:
+        return None
+    outcomes: dict[str, int] = {}
+    for part in body.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        match = _PYTEST_SUMMARY_COUNT_RE.match(part)
+        if match is None:
+            return None
+        key = _PYTEST_SUMMARY_KEY_ALIASES.get(match.group(2).lower())
+        if key is None:
+            continue
+        outcomes[key] = outcomes.get(key, 0) + int(match.group(1))
+    return outcomes
+
+
+def _pytest_outcomes_from_stdout(stdout: str) -> dict[str, int] | None:
+    """The LAST pytest final-summary line's outcomes; ``None`` when none parsed."""
+    outcomes: dict[str, int] | None = None
+    for line in stdout.splitlines():
+        parsed = _parse_pytest_summary_line(line)
+        if parsed is not None:
+            outcomes = parsed
+    return outcomes
+
+
+def _bounded_pytest_first_failure(block: str) -> str:
+    if len(block) <= _PYTEST_FIRST_FAILURE_MAX_CHARS:
+        return block
+    return (
+        block[:_PYTEST_FIRST_FAILURE_HEAD_CHARS]
+        + _PYTEST_FIRST_FAILURE_TRUNCATION_MARKER
+        + block[-_PYTEST_FIRST_FAILURE_TAIL_CHARS:]
+    )
+
+
+def _pytest_first_failure_block(stdout: str) -> str:
+    """First FAILURES/ERRORS block: header up to the next header/section line."""
+    lines = stdout.splitlines()
+    in_section = False
+    header_idx: int | None = None
+    end_idx = len(lines)
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        if not in_section:
+            if _PYTEST_SECTION_HEADER_RE.match(stripped):
+                in_section = True
+            continue
+        if header_idx is None:
+            if _PYTEST_TEST_HEADER_RE.match(stripped):
+                header_idx = idx
+            continue
+        if _PYTEST_TEST_HEADER_RE.match(stripped) or _PYTEST_ANY_SECTION_LINE_RE.match(stripped):
+            end_idx = idx
+            break
+    if header_idx is None:
+        return ""
+    return _bounded_pytest_first_failure("\n".join(lines[header_idx:end_idx]))
+
+
+def pytest_validation_evidence(stdout: str, returncode: int | None) -> dict[str, Any]:
+    """Pytest outcome counts and first-failure excerpt, parsed from ``stdout``.
+
+    SURFACE ONLY (NF-2026-01155): never consulted by
+    ``classify_validation_results``/``row_restriction`` and never changes a
+    verdict -- it only makes a skip-heavy "clean" pass and a truncated
+    traceback visible in the evidence/review packet. ``{}`` when ``stdout``
+    holds no pytest final-summary line.
+    """
+    outcomes = _pytest_outcomes_from_stdout(stdout)
+    if outcomes is None:
+        return {}
+    evidence: dict[str, Any] = {"pytest_outcomes": outcomes}
+    if isinstance(returncode, int) and returncode != 0:
+        first_failure = _pytest_first_failure_block(stdout)
+        if first_failure:
+            evidence["pytest_first_failure"] = first_failure
+    return evidence
+
+
 __all__ = [
     "CREATEPROCESS_CWD_MAX_CHARS",
     "LSP_PRIVATE_CWD_SUFFIX",
@@ -1173,6 +1295,7 @@ __all__ = [
     "preflight_semlock_capability",
     "probe_multiprocessing_semlock",
     "projected_nested_lsp_cwd_length",
+    "pytest_validation_evidence",
     "row_restriction",
     "sandbox_can_grant_semlock",
     "sandbox_unrunnable_reason",

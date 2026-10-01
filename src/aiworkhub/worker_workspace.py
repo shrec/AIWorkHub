@@ -13814,6 +13814,9 @@ def run_validations(
                 "stderr_tail": stderr[-4_096:],
                 "stderr_truncated": len(stderr) > 8_192,
             }
+            from . import validation_runner
+
+            record.update(validation_runner.pytest_validation_evidence(stdout, result.returncode))
             if broker_evidence:
                 record["metadata_broker_denials"] = broker_evidence
                 # This attribution is launcher-authored from the private pipe;

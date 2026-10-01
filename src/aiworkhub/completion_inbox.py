@@ -66,7 +66,7 @@ import re
 from datetime import datetime, timezone
 from typing import Any
 
-from aiworkhub import core, task_plan, task_store
+from aiworkhub import core, task_plan, task_store, validation_runner
 
 READONLY: bool = True
 LAUNCH_IMPLEMENTED: bool = False
@@ -854,25 +854,41 @@ def _packet_validation_rows(evidence: dict[str, Any]) -> list[dict[str, Any]]:
     rows = []
     for row in _packet_rows(evidence.get("validation")):
         returncode = row.get("returncode")
-        rows.append(
-            {
-                "declared_command": _packet_text(
-                    row.get("declared_command") or row.get("command")
-                ),
-                "executed_command": _packet_text(
-                    row.get("executed_command")
-                    or " ".join(str(v) for v in (row.get("executed_argv") or []))
-                ),
-                "returncode": returncode if isinstance(returncode, int) else None,
-                "behavioral_role": _packet_text(row.get("behavioral_role"), 80),
-                "duration_seconds": row.get("duration_seconds"),
-                "stdout_tail": _packet_text(row.get("stdout_tail"), _PACKET_TAIL_CHARS),
-                "stderr_tail": _packet_text(row.get("stderr_tail"), _PACKET_TAIL_CHARS),
-                "truncated": bool(
-                    row.get("stdout_truncated") or row.get("stderr_truncated")
-                ),
+        returncode = returncode if isinstance(returncode, int) else None
+        pytest_outcomes = row.get("pytest_outcomes")
+        if not isinstance(pytest_outcomes, dict):
+            pytest_outcomes = validation_runner.pytest_validation_evidence(
+                str(row.get("stdout_tail") or ""), returncode
+            ).get("pytest_outcomes")
+        packet_row = {
+            "declared_command": _packet_text(
+                row.get("declared_command") or row.get("command")
+            ),
+            "executed_command": _packet_text(
+                row.get("executed_command")
+                or " ".join(str(v) for v in (row.get("executed_argv") or []))
+            ),
+            "returncode": returncode,
+            "behavioral_role": _packet_text(row.get("behavioral_role"), 80),
+            "duration_seconds": row.get("duration_seconds"),
+            "stdout_tail": _packet_text(row.get("stdout_tail"), _PACKET_TAIL_CHARS),
+            "stderr_tail": _packet_text(row.get("stderr_tail"), _PACKET_TAIL_CHARS),
+            "truncated": bool(
+                row.get("stdout_truncated") or row.get("stderr_truncated")
+            ),
+        }
+        if isinstance(pytest_outcomes, dict):
+            packet_row["pytest_outcomes"] = {
+                str(key): value
+                for key, value in pytest_outcomes.items()
+                if isinstance(value, int) and not isinstance(value, bool)
             }
-        )
+        first_failure = row.get("pytest_first_failure")
+        if isinstance(first_failure, str) and first_failure:
+            packet_row["pytest_first_failure"] = _packet_text(
+                first_failure, _PACKET_TAIL_CHARS
+            )
+        rows.append(packet_row)
     return rows
 
 
@@ -996,11 +1012,12 @@ def _packet_drop(packet: dict[str, Any], section: str) -> bool:
         rows = packet.get("gates", {}).get("validation") or []
         dropped = False
         for row in rows:
-            if row.get("stdout_tail") or row.get("stderr_tail"):
+            if row.get("stdout_tail") or row.get("stderr_tail") or row.get("pytest_first_failure"):
                 dropped = True
             row["stdout_tail"] = ""
             row["stderr_tail"] = ""
             row["tails_dropped"] = True
+            row.pop("pytest_first_failure", None)
         return dropped
     if section == "gate_checks_passed":
         gates = packet.get("gates", {})
@@ -1119,6 +1136,12 @@ def review_packet(
         reviewer_reports = verdict.get("reviewer_reports")
     findings, observations, duplicate_count = _packet_reviewer_sections(reviewer_reports)
     preview = accept_preview if isinstance(accept_preview, dict) else {}
+    validation_rows = _packet_validation_rows(evidence)
+    validation_skipped_total = sum(
+        int(row["pytest_outcomes"].get("skipped", 0))
+        for row in validation_rows
+        if isinstance(row.get("pytest_outcomes"), dict)
+    )
     packet.update(
         {
             "task_id": str(task_id or identity.get("task_id") or card.get("task_id") or ""),
@@ -1158,7 +1181,7 @@ def review_packet(
                 ][:40],
                 "quality_gate_config_error": _packet_text(gate.get("config_error")),
                 "quality_gate_checks": _packet_gate_checks(gate),
-                "validation": _packet_validation_rows(evidence),
+                "validation": validation_rows,
                 "worker_mcp_gate": _packet_worker_mcp_gate(evidence),
                 "required_outputs": [
                     {
@@ -1182,6 +1205,7 @@ def review_packet(
                 ],
                 "behavioral_gate": gate.get("behavioral_gate"),
             },
+            "validation_skipped_total": validation_skipped_total,
             "review": {
                 "lenses": [
                     {
