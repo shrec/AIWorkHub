@@ -1071,6 +1071,37 @@ def write_with_fts_self_repair(
     return result
 
 
+@contextmanager
+def malformed_write_backstop(conn: sqlite3.Connection, *, operation_name: str):
+    """Never let a malformed image escape a write transaction as raw sqlite.
+
+    The backstop for write sites that cannot be retried as one bounded unit --
+    above all the merge transaction's outer COMMIT, where FTS5 flushes whatever
+    it still buffers (NF-2026-01172). Such a failure ends in the existing
+    corrupt-marker path, which routes the next build through the staged full
+    rebuild; a non-corruption error propagates untouched.
+    """
+
+    try:
+        yield
+    except sqlite3.DatabaseError as exc:
+        if not is_malformed_database_error(exc):
+            raise
+        findings = _safe_quick_check_findings(conn)
+        tables = fts5_tables_in_findings(findings)
+        raise _corrupt_index_error(
+            _integrity_target_path(conn),
+            operation=operation_name,
+            findings=findings,
+            fts_tables=tables or (),
+            repair_state=(
+                INTEGRITY_REPAIR_REFUSED_NON_FTS
+                if tables is None else INTEGRITY_REPAIR_NOT_ATTEMPTED
+            ),
+            cause=exc,
+        ) from exc
+
+
 # ---------------------------------------------------------------------------
 # File discovery -- generic, repo-agnostic (no project-specific hardcoding)
 # ---------------------------------------------------------------------------
@@ -4150,7 +4181,10 @@ def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, increme
             0.0, time.monotonic() - git_metrics_started
         )
         merge_started = time.monotonic()
-        with conn:
+        # The backstop sits OUTSIDE ``conn`` so a malformed image raised by the
+        # merge's own COMMIT -- not just by a statement -- is typed and marks
+        # the generation corrupt instead of escaping as raw sqlite text.
+        with malformed_write_backstop(conn, operation_name="build_merge"), conn:
             if pending_stat_updates:
                 conn.executemany(
                     "UPDATE files SET file_size=?, mtime_ns=? WHERE file_path=?",
@@ -4168,18 +4202,58 @@ def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, increme
                 # than leaving a half-deleted partial.
                 savepoint = f"sg_write_{write_index}"
                 file_dropped: list[dict[str, str]] = []
-                conn.execute(f"SAVEPOINT {savepoint}")
+
+                def _write_file_unit(
+                    extraction=extraction, file_size=file_size,
+                    mtime_ns=mtime_ns, savepoint=savepoint,
+                ):
+                    # The WHOLE savepoint unit is the repairable write: FTS5
+                    # flushes buffered writes at RELEASE, so a malformed image
+                    # surfaces at SAVEPOINT, inside the writes or at RELEASE
+                    # (NF-2026-01172). Any failure rolls the file back to its
+                    # own savepoint before propagating, so the single retry
+                    # after an FTS rebuild starts from the prior generation.
+                    conn.execute(f"SAVEPOINT {savepoint}")
+                    try:
+                        _invalidate_file(conn, extraction.file_path)
+                        written = _write_extraction(
+                            conn, extraction, file_size=file_size, mtime_ns=mtime_ns,
+                        )
+                        conn.execute(f"RELEASE {savepoint}")
+                    except Exception as exc:
+                        try:
+                            conn.execute(f"ROLLBACK TO {savepoint}")
+                            conn.execute(f"RELEASE {savepoint}")
+                        except sqlite3.DatabaseError as cleanup_exc:
+                            if is_malformed_database_error(exc):
+                                raise exc from cleanup_exc
+                            if is_malformed_database_error(cleanup_exc):
+                                raise
+                            # Savepoint state is unknown: never contain this
+                            # as a per-file skip over a half-written file.
+                            raise SourceGraphBuildFailedError(
+                                "source_graph_build_failed_savepoint_cleanup: "
+                                f"file={extraction.file_path} "
+                                f"{type(cleanup_exc).__name__}:{cleanup_exc}"
+                            ) from cleanup_exc
+                        raise
+                    return written
+
                 try:
-                    _invalidate_file(conn, extraction.file_path)
-                    inserted_entities, inserted_edges, file_dropped = _write_extraction(
-                        conn, extraction, file_size=file_size, mtime_ns=mtime_ns,
+                    inserted_entities, inserted_edges, file_dropped = (
+                        write_with_fts_self_repair(
+                            conn, _write_file_unit,
+                            operation_name="build_write_file",
+                        )
                     )
-                except SourceGraphCorruptIndexError:
+                except (SourceGraphCorruptIndexError, SourceGraphBuildFailedError):
                     # Index-wide corruption is not a per-file defect. Counting
                     # it as one skip per file would publish a corrupt image as
                     # a mostly-successful build, and the shared root has
                     # already marked this generation for the existing full
                     # rebuild -- so abort the candidate instead of containing.
+                    # A malformed image never reaches the arm below: the unit
+                    # above routes it through the FTS self-repair first.
                     raise
                 except Exception as exc:  # noqa: BLE001
                     # Containment is deliberately BROAD. The whole point of this
@@ -4193,15 +4267,12 @@ def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, increme
                     # (KeyboardInterrupt/SystemExit) still propagates, because a
                     # cancellation or interpreter shutdown genuinely must abort
                     # the whole build rather than be swallowed per file.
-                    conn.execute(f"ROLLBACK TO {savepoint}")
-                    conn.execute(f"RELEASE {savepoint}")
                     skipped += 1
                     errors.append({
                         "file": extraction.file_path, "status": "index_write_skipped",
                         "error": f"{type(exc).__name__}: {exc}",
                     })
                     continue
-                conn.execute(f"RELEASE {savepoint}")
                 changed += 1
                 entities_written += inserted_entities
                 edges_written += inserted_edges
