@@ -9,6 +9,8 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from pathlib import Path
 
+import pytest
+
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
@@ -692,6 +694,150 @@ def test_repository_switch_roundtrip_is_serialized_and_repo_local(tmp_path, monk
     assert lifecycle["dispatcher_stop"] == [root_a.resolve(), root_b.resolve()]
     assert lifecycle["daemon_stop"] == [root_a.resolve(), root_b.resolve()]
     assert lifecycle["daemon_start"] == [root_b.resolve(), root_a.resolve()]
+
+
+@pytest.fixture
+def distinct_window_manager_routes(tmp_path, monkeypatch):
+    roots = [tmp_path / name for name in ("repo_a", "repo_b", "repo_c")]
+    repo_ids = []
+    registry = tmp_path / "router" / "repos"
+    registry.mkdir(parents=True)
+    thread_id = "019f5097-6dbe-7172-870a-945afc5f3bfa"
+    for root, window in zip(roots, ("window_owner", "window_b", "window_c")):
+        root.mkdir()
+        assert task_store.initialize_repository(root)["ok"]
+        repo_id = task_store.storage_readiness(root).repo_id
+        repo_ids.append(repo_id)
+        (registry / f"{repo_id}.json").write_text(json.dumps({
+            "schema_id": shared_router.SCHEMA_ID,
+            "repo_id": repo_id,
+            "repo_root": str(root),
+            "window_id": window,
+            "extension_host_pid": core.os.getpid(),
+            "selected_provider": "codex",
+            "targets": {"codex": {
+                "capability_state": "ready",
+                "route": {
+                    "repo_id": repo_id,
+                    "window_id": window,
+                    "thread_id": thread_id if root == roots[0] else "",
+                },
+            }},
+        }), encoding="utf-8")
+    monkeypatch.setattr(shared_router, "registry_dir", lambda home=None: registry)
+    monkeypatch.delenv("AIWORKHUB_REPO_ROOT", raising=False)
+    monkeypatch.delenv("AIWORKHUB_WINDOW_ID", raising=False)
+    monkeypatch.setenv("AIWORKHUB_REPO", str(roots[0]))
+    monkeypatch.setattr(core, "_PROCESS_REPO_ROOT_OVERRIDE", None)
+    monkeypatch.setattr(core, "_implicit_codex_repository_root", lambda: None)
+    monkeypatch.setattr(core, "_claude_manager_identity", lambda: None)
+    # Keep identity recovery real; bypass only platform-specific identity inputs.
+    monkeypatch.setattr(
+        core, "_codex_manager_identity", core._codex_shared_repo_route_manager_identity,
+    )
+    lifecycle = {"dispatcher_stop": [], "daemon_stop": [], "daemon_start": [],
+                 "dispatcher_start": []}
+    monkeypatch.setattr(core, "_callback_bridge_module", lambda: SimpleNamespace(
+        stop_dispatcher=lambda root: lifecycle["dispatcher_stop"].append(root),
+    ))
+    monkeypatch.setattr(core, "_source_graph_daemon_module", lambda: SimpleNamespace(
+        stop_daemon=lambda root: lifecycle["daemon_stop"].append(root),
+        ensure_started=lambda root: lifecycle["daemon_start"].append(root) or {"ok": True},
+    ))
+    monkeypatch.setattr(core, "dispatcher_ensure_started", lambda:
+        lifecycle["dispatcher_start"].append(core.repo_root())
+        or {"ok": True, "status": "manager_inbox"})
+    return roots, repo_ids, thread_id, lifecycle
+
+
+@pytest.mark.parametrize("destinations, epochs", [((1, 0), (1, 2)), ((1, 2, 0), (1, 2, 3))])
+def test_repository_switch_distinct_windows_preserves_original_owner(
+    distinct_window_manager_routes, destinations, epochs,
+):
+    # Returning the destination window instead of the ledger owner breaks the
+    # second real transfer's CAS, even when its repository and epoch are right.
+    roots, repo_ids, thread_id, lifecycle = distinct_window_manager_routes
+    previous = 0
+    for destination, epoch in zip(destinations, epochs):
+        result = core.repository_switch(repo_ids[destination])
+        assert result["ok"] is True, result
+        assert result["repo_id"] == repo_ids[destination]
+        assert result["binding_source"] == "manager_switch"
+        assert core.repo_root() == roots[destination].resolve()
+        assert result["route_transfer"]["epoch"] == epoch
+        assert result["route_transfer"]["previous_repo_id"] == repo_ids[previous]
+        assert result["route_transfer"]["window_id"] == "window_owner"
+        assert result["route_transfer"]["thread_id"] == thread_id
+        identity = core._codex_shared_repo_route_manager_identity()
+        assert identity["window_id"] == "window_owner"
+        assert identity["thread_id"] == identity["session_id"] == thread_id
+        previous = destination
+    ownership = shared_router._read_ownership(shared_router._ownership_path())
+    owner = ownership["routes"][f"codex:{thread_id}"]
+    assert owner["window_id"] == "window_owner"
+    assert owner["thread_id"] == thread_id
+    assert owner["repo_id"] == repo_ids[0]
+    assert owner["epoch"] == epochs[-1]
+    assert ownership["revision"] == epochs[-1]
+    stopped = [roots[index].resolve() for index in (0, *destinations[:-1])]
+    started = [roots[index].resolve() for index in destinations]
+    assert lifecycle["dispatcher_stop"] == stopped
+    assert lifecycle["daemon_stop"] == stopped
+    assert lifecycle["daemon_start"] == started
+    assert lifecycle["dispatcher_start"] == started
+
+
+@pytest.mark.parametrize("incoherent", [
+    "missing_projection", "foreign_provider", "foreign_thread", "foreign_repo",
+    "foreign_window", "missing_owner", "stale_epoch", "boolean_epoch", "zero_epoch",
+    "route_repo_mismatch",
+])
+def test_shared_route_identity_requires_coherent_owner_projection(
+    distinct_window_manager_routes, monkeypatch, incoherent,
+):
+    # A bare owner hint, or a projection for another identity/epoch, must never
+    # replace the live repository record's window authority.
+    roots, repo_ids, thread_id, _ = distinct_window_manager_routes
+    transfer = shared_router.transfer_manager_route(
+        provider="codex", thread_id=thread_id, window_id="window_owner",
+        source_repo_id=repo_ids[0], target_repo_id=repo_ids[1],
+        repositories=shared_router.list_known_repositories()["repositories"],
+    )
+    assert transfer["ok"] is True
+    monkeypatch.setattr(core, "_PROCESS_REPO_ROOT_OVERRIDE", roots[1].resolve())
+    real_list = shared_router.list_known_repositories
+
+    def incoherent_registry(**kwargs):
+        result = real_list(**kwargs)
+        record = next(row for row in result["repositories"] if row["repo_id"] == repo_ids[1])
+        projection = record["manager_route_ownership"]
+        route = record["targets"]["codex"]["route"]
+        if incoherent == "missing_projection":
+            del record["manager_route_ownership"]
+        elif incoherent == "foreign_provider":
+            projection["provider"] = "claude"
+        elif incoherent == "foreign_thread":
+            projection["thread_id"] = "019f5097-6dbe-7172-870a-945afc5f3bfb"
+        elif incoherent == "foreign_repo":
+            projection["repo_id"] = repo_ids[2]
+        elif incoherent == "foreign_window":
+            projection["window_id"] = "window_foreign"
+        elif incoherent == "missing_owner":
+            del route["owner_window_id"]
+        elif incoherent == "stale_epoch":
+            route["ownership_epoch"] = 2
+        elif incoherent == "boolean_epoch":
+            projection["epoch"] = True
+        elif incoherent == "zero_epoch":
+            projection["epoch"] = route["ownership_epoch"] = 0
+        elif incoherent == "route_repo_mismatch":
+            route["repo_id"] = repo_ids[2]
+        return result
+
+    monkeypatch.setattr(shared_router, "list_known_repositories", incoherent_registry)
+    identity = core._codex_shared_repo_route_manager_identity()
+    assert identity["window_id"] == "window_b"
+    assert identity["thread_id"] == thread_id
 
 
 def test_repository_switch_failed_target_stops_target_and_restores_old_services(tmp_path, monkeypatch):

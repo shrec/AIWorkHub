@@ -411,11 +411,31 @@ def _codex_shared_repo_route_manager_identity() -> dict[str, str] | None:
         route = {}
     thread_id = str(route.get("thread_id") or "").strip()
     session_id = str(route.get("session_id") or record.get("window_id") or "").strip()
+    window_id = str(record.get("window_id") or "")
+    ownership = record.get("manager_route_ownership")
+    # A transfer projects the original verified owner onto a different window's
+    # repo record. Only its coherent ledger projection can carry that authority.
+    if (
+        isinstance(ownership, dict)
+        and str(ownership.get("provider") or "").strip().lower() == "codex"
+        and _UUID_RE.fullmatch(thread_id)
+        and str(ownership.get("thread_id") or "").strip().lower() == thread_id.lower()
+        and str(ownership.get("repo_id") or "") == str(readiness.repo_id)
+        and str(route.get("repo_id") or "") == str(readiness.repo_id)
+        and type(ownership.get("epoch")) is int
+        and ownership["epoch"] >= 1
+        and type(route.get("ownership_epoch")) is int
+        and route["ownership_epoch"] == ownership["epoch"]
+        and str(ownership.get("window_id") or "").strip()
+        and str(route.get("owner_window_id") or "").strip()
+        == str(ownership["window_id"]).strip()
+    ):
+        window_id = str(ownership["window_id"]).strip()
     return {
         "provider": "codex",
         "session_id": thread_id if _UUID_RE.fullmatch(thread_id) else session_id,
         "thread_id": thread_id if _UUID_RE.fullmatch(thread_id) else "",
-        "window_id": str(record.get("window_id") or ""),
+        "window_id": window_id,
         "callback_supported": "true" if _UUID_RE.fullmatch(thread_id) else "false",
         "route_state": str(codex_target.get("capability_state") or "route_pending"),
     }
