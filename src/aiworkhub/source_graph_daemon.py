@@ -612,6 +612,7 @@ class SourceGraphDaemon:
         self._status = STATUS_STOPPED
         self._last_report: dict[str, Any] | None = None
         self._last_error: str = ""
+        self._last_slot_contention_at: str = ""
         self._last_run_at: str = ""
         self._last_success_at: str = ""
         self._started_at: str = ""
@@ -1436,7 +1437,11 @@ class SourceGraphDaemon:
                 and _identity_matches(retained)
             ):
                 return {"kind": "standby"}
-            return {"kind": "error", "error": "index_subprocess:identity_slot_owned"}
+            return {
+                "kind": "error",
+                "error": "index_subprocess:identity_slot_owned",
+                "slot_contention": True,
+            }
         if gate_write is not None:
             try:
                 os.write(gate_write, b"1")
@@ -1586,6 +1591,14 @@ class SourceGraphDaemon:
                         self._last_error = ""
                         self._last_run_at = _utcnow()
                     return True
+                if kind != "success" and outcome.get("slot_contention") is True:
+                    # NF-2026-01175: a lost identity-slot race is contention, not a new index fault.
+                    with self._state_lock:
+                        self._last_slot_contention_at = _utcnow()
+                        if self._last_error and self._last_error != "build_start_fenced":
+                            self._status = STATUS_DEGRADED
+                            self._last_run_at = self._last_slot_contention_at
+                            return True
                 if kind != "success":
                     raise RuntimeError(str(outcome.get("error") or "index_build_failed"))
                 report = dict(outcome["report"])
@@ -2014,6 +2027,7 @@ class SourceGraphDaemon:
                 "stale_reason": "last_success_exceeded_threshold" if stale else "",
                 "last_report": self._last_report,
                 "last_error": self._last_error,
+                "last_slot_contention_at": self._last_slot_contention_at,
                 "writer_state": writer_state,
                 "refreshable": refreshable,
                 "language_capabilities": dict(source_graph.LANGUAGE_CAPABILITIES),
@@ -2142,6 +2156,7 @@ def daemon_health(repo_root: Path | str) -> dict[str, Any]:
             "stale_reason": "",
             "last_report": None,
             "last_error": "",
+            "last_slot_contention_at": "",
             "writer_state": "stopped",
             "refreshable": False,
             "language_capabilities": dict(source_graph.LANGUAGE_CAPABILITIES),
