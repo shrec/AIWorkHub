@@ -22,7 +22,7 @@ _GEORGIAN = "ქართული"
 
 _WRITE_BOTH_PIPES = (
     "import sys\n"
-    f"data = {_GEORGIAN!r}.encode('utf-8')\n"
+    f"data = {_GEORGIAN!a}.encode('utf-8')\n"
     "sys.stdout.buffer.write(data)\n"
     "sys.stdout.buffer.flush()\n"
     "sys.stderr.buffer.write(data)\n"
