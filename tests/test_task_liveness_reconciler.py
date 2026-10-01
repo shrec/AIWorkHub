@@ -242,7 +242,7 @@ def test_heartbeat_refreshes_during_silent_child_and_tracks_output_activity(tmp_
             if final.get("state") == "exited":
                 break
             time.sleep(0.05)
-        assert final["state"] == "exited"
+        assert final.get("state") == "exited", final
         assert final["exit_code"] == 0
         assert final["supervisor_pid_start_ticks"] is not None
     finally:
