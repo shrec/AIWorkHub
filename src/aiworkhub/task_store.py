@@ -4846,6 +4846,42 @@ def retry_finalize_failed(
         return True, "processing"
 
 
+# Closed vocabulary of the retained terminal candidate identity checks, in
+# evaluation order: recover_blocked_rework refuses with
+# "retained_terminal_candidate_identity_invalid:<name>" for the first failure.
+RETAINED_TERMINAL_IDENTITY_CHECKS = (
+    "evidence",
+    "no_candidate",
+    "request_identity",
+    "workspace",
+    "changed_paths",
+    "changed_path_hashes",
+    "changed_path_hashes_paths",
+    "allowed_writes",
+    "allowed_writes_empty",
+    "authority",
+    "authority_workspace",
+    "authority_schema",
+    "authority_hashes",
+    "evidence_request_id",
+    "terminal_request_id",
+    "launch_request_id",
+    "task_id",
+    "runner",
+    "terminal_runner",
+    "topic",
+    "repo",
+    "claim_epoch_type",
+    "claim_epoch",
+    "identity_allowed_writes",
+    "base_oid",
+    "parent_baseline",
+    "workspace_request_id",
+    "workspace_allowed_writes",
+    "request_id",
+)
+
+
 def _terminal_failure_supersedes_predecessor(
     terminal_failure: dict[str, object],
     retained_predecessor: dict[str, object],
@@ -6221,38 +6257,44 @@ def recover_blocked_rework(
                 else ""
             )
             allowed_writes = card.get("allowed_writes")
-            if (
-                not isinstance(evidence, dict)
-                or not isinstance(identity, dict)
-                or not isinstance(workspace, dict)
-                or not isinstance(changed_paths, list)
-                or not changed_paths
-                or not isinstance(changed_hashes, dict)
-                or set(changed_hashes) != set(changed_paths)
-                or not isinstance(allowed_writes, list)
-                or not allowed_writes
-                or not isinstance(authority, dict)
-                or authority != workspace_authority
-                or authority.get("schema_id") != "aiworkhub.python_candidate_authority.v1"
-                or authority_hashes != changed_hashes
-                or evidence.get("request_id") not in {None, "", request_id}
-                or terminal_review.get("request_id") != request_id
-                or card.get("launch_request_id") != request_id
-                or identity.get("task_id") != task_id
-                or identity.get("runner") != card.get("runner")
-                or str(terminal_row["runner"] or "") != card.get("runner")
-                or identity.get("topic") != card.get("topic")
-                or identity.get("repo") != workspace.get("repo")
-                or type(identity.get("claim_epoch")) is not int
-                or identity.get("claim_epoch") != terminal_claim_epoch
-                or identity.get("allowed_writes") != workspace.get("allowed_writes")
-                or identity.get("base_oid") != workspace.get("base_oid")
-                or identity.get("parent_baseline") != workspace.get("parent_baseline")
-                or workspace.get("request_id") != request_id
-                or set(workspace.get("allowed_writes") or ()) != set(allowed_writes)
-                or not request_id
+            # Lazy, in order: each check may dereference what an earlier one
+            # proved to be a dict, so a malformed card is refused, never raised.
+            identity_checks = (
+                lambda: not isinstance(evidence, dict),
+                lambda: not changed_paths,
+                lambda: not isinstance(identity, dict),
+                lambda: not isinstance(workspace, dict),
+                lambda: not isinstance(changed_paths, list),
+                lambda: not isinstance(changed_hashes, dict),
+                lambda: set(changed_hashes) != set(changed_paths),
+                lambda: not isinstance(allowed_writes, list),
+                lambda: not allowed_writes,
+                lambda: not isinstance(authority, dict),
+                lambda: authority != workspace_authority,
+                lambda: authority.get("schema_id") != "aiworkhub.python_candidate_authority.v1",
+                lambda: authority_hashes != changed_hashes,
+                lambda: evidence.get("request_id") not in {None, "", request_id},
+                lambda: terminal_review.get("request_id") != request_id,
+                lambda: card.get("launch_request_id") != request_id,
+                lambda: identity.get("task_id") != task_id,
+                lambda: identity.get("runner") != card.get("runner"),
+                lambda: str(terminal_row["runner"] or "") != card.get("runner"),
+                lambda: identity.get("topic") != card.get("topic"),
+                lambda: identity.get("repo") != workspace.get("repo"),
+                lambda: type(identity.get("claim_epoch")) is not int,
+                lambda: identity.get("claim_epoch") != terminal_claim_epoch,
+                lambda: identity.get("allowed_writes") != workspace.get("allowed_writes"),
+                lambda: identity.get("base_oid") != workspace.get("base_oid"),
+                lambda: identity.get("parent_baseline") != workspace.get("parent_baseline"),
+                lambda: workspace.get("request_id") != request_id,
+                lambda: set(workspace.get("allowed_writes") or ()) != set(allowed_writes),
+                lambda: not request_id,
+            )
+            for check_name, check_failed in zip(
+                RETAINED_TERMINAL_IDENTITY_CHECKS, identity_checks, strict=True
             ):
-                return False, "retained_terminal_candidate_identity_invalid"
+                if check_failed():
+                    return False, f"retained_terminal_candidate_identity_invalid:{check_name}"
             if any(
                 not isinstance(path, str)
                 or not path

@@ -240,8 +240,76 @@ def test_no_candidate_terminal_failure_requires_explicit_clean_root(
 
     assert (ok, state) == (
         False,
-        "retained_terminal_candidate_identity_invalid",
+        "retained_terminal_candidate_identity_invalid:no_candidate",
     )
+    assert _get_card(repo, task_id)["status"] == "blocked"
+
+
+_RETAINED_PATH = "src/aiworkhub/task_store.py"
+
+
+@pytest.mark.parametrize(
+    ("mutation", "check"),
+    [
+        ("no_candidate", "no_candidate"),
+        ("authority_missing", "authority"),
+        ("authority_hashes", "authority_hashes"),
+        ("terminal_request_id", "terminal_request_id"),
+        ("launch_request_id", "launch_request_id"),
+        ("task_id", "task_id"),
+        ("runner", "runner"),
+        ("topic", "topic"),
+        ("repo", "repo"),
+        ("claim_epoch", "claim_epoch"),
+        ("workspace_request_id", "workspace_request_id"),
+        ("malformed_identity", "request_identity"),
+        ("malformed_workspace", "workspace"),
+    ],
+)
+def test_identity_refusal_names_failing_check(
+    tmp_path: Path, mutation: str, check: str,
+) -> None:
+    """NF-2026-01181: the identity refusal names its first failing check only."""
+
+    if mutation == "no_candidate":
+        repo, task_id, _request_id = _no_candidate_terminal_failure_fixture(tmp_path)
+    else:
+        repo, _candidate, _hashes = _retained_terminal_failure_fixture(tmp_path)
+        task_id = "BLOCKED_RETAINED_EMPTY_OUTPUTS"
+
+    def mutate(card: dict, failure: dict) -> None:
+        evidence = failure["evidence"]
+        if mutation == "authority_missing":
+            del evidence["python_candidate_authority"]
+        elif mutation == "authority_hashes":
+            evidence["changed_path_hashes"][_RETAINED_PATH] = "f" * 64
+        elif mutation == "terminal_request_id":
+            failure["request_id"] = "b" * 32
+        elif mutation == "launch_request_id":
+            card["launch_request_id"] = "b" * 32
+        elif mutation in {"task_id", "runner", "topic"}:
+            evidence["request_identity"][mutation] = "OTHER"
+        elif mutation == "repo":
+            evidence["request_identity"]["repo"] = str(tmp_path)
+        elif mutation == "claim_epoch":
+            evidence["request_identity"]["claim_epoch"] = 2
+        elif mutation == "workspace_request_id":
+            evidence["workspace"]["request_id"] = "c" * 32
+        elif mutation == "malformed_identity":
+            evidence["request_identity"] = "not-a-dict"
+        elif mutation == "malformed_workspace":
+            evidence["workspace"] = ["not", "a", "dict"]
+
+    _rewrite_no_candidate_failure(repo, task_id, mutate)
+
+    ok, state = task_store.recover_blocked_rework(
+        repo, task_id, actor="coordinator", feedback_reason="Name the failing check",
+    )
+
+    assert (ok, state) == (
+        False, f"retained_terminal_candidate_identity_invalid:{check}",
+    )
+    assert check in task_store.RETAINED_TERMINAL_IDENTITY_CHECKS
     assert _get_card(repo, task_id)["status"] == "blocked"
 
 
@@ -252,7 +320,10 @@ def test_no_candidate_terminal_failure_requires_explicit_clean_root(
         ("launch_request_id", "clean_root_no_candidate_identity_invalid"),
         ("live_pid", "retained_terminal_candidate_process_live"),
         ("completed_output", "clean_root_no_candidate_identity_invalid"),
-        ("candidate_metadata", "retained_terminal_candidate_identity_invalid"),
+        (
+            "candidate_metadata",
+            "retained_terminal_candidate_identity_invalid:request_identity",
+        ),
         ("workspace_present", "clean_root_no_candidate_workspace_still_available"),
     ],
 )
@@ -340,7 +411,7 @@ def _exited_pid() -> int:
 @pytest.mark.parametrize(
     ("clean_root", "expected"),
     [
-        (False, (False, "retained_terminal_candidate_identity_invalid")),
+        (False, (False, "retained_terminal_candidate_identity_invalid:no_candidate")),
         (True, (True, "recovered")),
     ],
 )
@@ -492,11 +563,11 @@ def test_recover_blocked_terminal_failure_retained_delta_without_required_output
     ("event_mismatch", "retained_terminal_candidate_event_mismatch"),
     ("claim_epoch", "retained_terminal_candidate_claim_epoch_invalid"),
     ("boolean_claim_epoch", "retained_terminal_candidate_claim_epoch_invalid"),
-    ("identity_epoch", "retained_terminal_candidate_identity_invalid"),
-    ("request_id", "retained_terminal_candidate_identity_invalid"),
-    ("launch_request_id", "retained_terminal_candidate_identity_invalid"),
-    ("task_id", "retained_terminal_candidate_identity_invalid"),
-    ("repo", "retained_terminal_candidate_identity_invalid"),
+    ("identity_epoch", "retained_terminal_candidate_identity_invalid:claim_epoch_type"),
+    ("request_id", "retained_terminal_candidate_identity_invalid:terminal_request_id"),
+    ("launch_request_id", "retained_terminal_candidate_identity_invalid:launch_request_id"),
+    ("task_id", "retained_terminal_candidate_identity_invalid:task_id"),
+    ("repo", "retained_terminal_candidate_identity_invalid:repo"),
     ("baseline", "retained_terminal_candidate_baseline_mismatch"),
     ("live_pid", "retained_terminal_candidate_process_live"),
     ("symlink", "retained_terminal_candidate_bytes_invalid"),
