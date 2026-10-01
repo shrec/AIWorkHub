@@ -6,6 +6,29 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.13] - 2026-10-01
+
+### Added
+
+- A verified manager can record an audited disposition of one non-blocking reviewer finding: `aiworkhub_manager_review_finding_dispose` stores an append-only receipt bound to the candidate digest and the verified reviewer receipt; a dismissed LOW/MEDIUM finding with counter-evidence lifts only its own refinement blocker, and a high/critical finding cannot be disposed (NF-2026-01170).
+- The task store can resolve a `scope_rejected` card on the same task ID: `recover_blocked_rework(scope_rejection_resolved=True)` is always clean-root, requires feedback, verifies the rejected request identity and replays idempotently (NF-2026-01169).
+
+### Fixed
+
+- `review_finding_disposition_candidate_unavailable` carries a `detail` object naming the unresolved identity fields, the task status and the request ids, and terminal evidence that belongs to another request is never bound (NF-2026-01180).
+- `retained_terminal_candidate_identity_invalid` names the first failing check as a `:<check>` suffix from a closed vocabulary; `:no_candidate` is the case that needs `clean_root_if_predecessor_missing` (NF-2026-01181).
+- A role-bearing pytest validation that passed zero tests is unmeasured, not passed: the behavioral gate fails with `behavioral_evidence_unmeasured:<roles>` when such a row exits 0 with only skips (NF-2026-01165).
+- A malformed FTS5 index met at savepoint release or at commit is repaired or reported as a corrupt-index error instead of failing every Source Graph build (NF-2026-01172).
+- A lost Windows identity-slot race no longer overwrites a real Source Graph build error; daemon health keeps the earlier `last_error` and records the race in `last_slot_contention_at` (NF-2026-01175).
+- Git pipes in the worker workspace are decoded as UTF-8 with replacement instead of the locale codec, so one unmapped byte on a cp1251 host no longer returns an empty stream with rc=0 (NF-2026-01178).
+- A freshly provisioned worktree no longer shows seeded files as modified (NF-2026-01168).
+- A causeless workspace-GC row no longer overwrites the recorded terminal reason, and a typed credential category classifies as retryable `credential_expired` (NF-2026-01174).
+- `reviewer_state_unknown` carries `state_unknown_cause`, the exception class name behind it (NF-2026-01164).
+
+### Changed
+
+- The finding-disposition entry points moved into `process_launcher_accept_review.py`, so `process_launcher.py` is back under its size ratchet; the OS-dependency boundary and four stale test expectations hold again (NF-2026-01176, NF-2026-01179).
+
 ## [0.12.12] - 2026-10-01
 
 ### Fixed

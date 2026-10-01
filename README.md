@@ -62,6 +62,14 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
+## What's new in 0.12.13
+
+- A manager can dismiss a low or medium reviewer finding with counter-evidence, on the record, instead of re-running the whole card.
+- Two refusals now say why: a blocked recovery names the failing check, and a refused finding disposition names what is missing.
+- A test command that ran zero tests no longer counts as passing evidence.
+- Source Graph recovers from a damaged search index and keeps the real build error after a lost startup race.
+- Workers on non-UTF-8 Windows locales read git output correctly, and fresh worktrees no longer show seeded files as modified.
+
 ## What's new in 0.12.12
 
 - The NeedFix header shows the real open and stored counts instead of a constant 200.
