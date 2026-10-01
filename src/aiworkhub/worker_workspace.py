@@ -7274,7 +7274,22 @@ def promote(workspace: WorkerWorkspace, changed: Iterable[str]) -> list[str]:
     partially promoted before the workspace is ever deleted, rather than
     silently discarding evidence or half-applying a "fix" that could touch
     parent files a second time.
+
+    NF-2026-01198: every write below goes through ``promotion_write``, which
+    names any OSError as ``WorkspaceError("promotion_write_failed:<relative>:
+    <op>:errno=<n>:winerror=<n|none>")`` -- never a bare errno, never an
+    absolute path -- retries a transient sharing violation on replace/unlink
+    with a bounded backoff, and proactively clears a destination's read-only
+    attribute (Windows only) since it already passed the scope and hash
+    preflight above.
     """
+    from .promotion_write import (
+        PromotionWriteError,
+        make_temp_sibling,
+        run_destination_write_retrying,
+        run_promotion_write,
+    )
+
     paths = sorted(set(changed))
     desired: dict[str, str | None] = {}
     for relative in paths:
@@ -7306,23 +7321,25 @@ def promote(workspace: WorkerWorkspace, changed: Iterable[str]) -> list[str]:
                 raise WorkspaceError(f"parent_changed_during_promotion:{relative}")
             if not source.exists() and not source.is_symlink():
                 if parent.exists() or parent.is_symlink():
-                    parent.unlink()
+                    run_destination_write_retrying(relative, "unlink", parent, parent.unlink)
                 promoted.append(relative)
                 continue
             if source.is_symlink() or not source.is_file():
                 raise WorkspaceError(f"invalid_promotion_source:{relative}")
-            parent.parent.mkdir(parents=True, exist_ok=True)
-            fd, temp_name = tempfile.mkstemp(prefix=f".{parent.name}.", dir=parent.parent)
-            os.close(fd)
-            temp = Path(temp_name)
+            run_promotion_write(
+                relative, "mkdir", parent.parent.mkdir, parents=True, exist_ok=True
+            )
+            temp = run_promotion_write(relative, "mkstemp", make_temp_sibling, parent)
             try:
-                shutil.copyfile(source, temp)
+                run_promotion_write(relative, "copy", shutil.copyfile, source, temp)
                 mode = stat.S_IMODE(source.stat().st_mode) & 0o777
-                chmod_path(temp, mode or 0o644)
-                os.replace(temp, parent)
+                run_promotion_write(relative, "chmod", chmod_path, temp, mode or 0o644)
+                run_destination_write_retrying(relative, "replace", parent, os.replace, temp, parent)
             finally:
                 temp.unlink(missing_ok=True)
             promoted.append(relative)
+    except PromotionWriteError as exc:
+        raise WorkspaceError(str(exc)) from exc
     finally:
         _promotion_end(marker)
     return promoted
