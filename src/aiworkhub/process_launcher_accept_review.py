@@ -30,8 +30,10 @@ __all__ = [
     "bound_reviewer_rows",
     "bound_reviewer_task_ids",
     "create_supplemental_inspection_rounds",
+    "dispose_review_finding",
     "effective_requested_risk_tier",
     "fold_accept_blockers",
+    "review_finding_dispositions",
     "reviewer_evidence",
     "sealed_review_packet",
     "server_derived_risk_tier",
@@ -2740,3 +2742,95 @@ def accept_review(
             "finished_at": _utcnow(),
         }, disposition="removed")
         return accepted_reply
+
+
+def dispose_review_finding(
+    self: Any,
+    *,
+    task_id: str,
+    request_id: str,
+    reviewer_request_id: str,
+    finding_id: str,
+    disposition: str,
+    counter_evidence: str,
+    reason: str,
+) -> dict[str, Any]:
+    """Record one manager disposition of one non-blocking reviewer finding.
+
+    Same manager gate as :meth:`resolve_review_route_hold`. The binding --
+    the reviewer receipt and the candidate digest -- is derived here from
+    the server-sealed reviewer evidence and the target's terminal evidence,
+    never from the caller. It never accepts the target (NF-2026-01170).
+    """
+    # Re-bound from the ``process_launcher`` module object, as in
+    # :func:`accept_review`, so monkeypatches of that module still apply.
+    from . import process_launcher as _pl
+
+    Path = _pl.Path
+    _parse_card = _pl._parse_card
+    core = _pl.core
+    review_orchestrator = _pl.review_orchestrator
+
+    route = core.manager_bootstrap()
+    identity = route.get("manager_route") if isinstance(route, dict) else None
+    if not isinstance(identity, dict) or route.get("role") != "manager":  # route is a dict
+        return {"ok": False, "error": "verified_manager_identity_required"}
+    if not route.get("repo") or Path(str(route["repo"])).resolve() != self.repo:
+        return {"ok": False, "error": "manager_repository_mismatch"}
+    if not core.writes_allowed():
+        return {"ok": False, "error": "write_gate_closed"}
+    provider = str(identity.get("provider") or route.get("provider") or "").strip()
+    session_id = str(identity.get("thread_id") or identity.get("session_id") or "").strip()
+    if not provider or not session_id:
+        return {"ok": False, "error": "manager_session_identity_missing"}
+    review_db = review_orchestrator.canonical_review_db(self)
+    if review_db is None:
+        return {"ok": False, "error": "review_storage_unavailable"}
+    try:
+        card = _parse_card(self._show_task(task_id), task_id)
+    except Exception as exc:  # noqa: BLE001 -- an unreadable target binds nothing
+        return {"ok": False, "error": f"task_lookup_failed:{exc}"[:300]}
+    bound = next(
+        (
+            row
+            for row in reviewer_evidence(self, task_id, request_id)
+            if row.get("usable")
+            and str(row.get("request_id") or "") == str(reviewer_request_id)
+        ),
+        None,
+    )
+    return review_orchestrator.ReviewOrchestrator(
+        self, db_path=review_db
+    ).dispose_review_finding(
+        task_id=task_id,
+        request_id=request_id,
+        reviewer_request_id=reviewer_request_id,
+        finding_id=finding_id,
+        disposition=disposition,
+        counter_evidence=counter_evidence,
+        reason=reason,
+        actor=f"{provider}:{session_id}",
+        reviewer_receipt=(bound or {}).get("receipt"),
+        candidate_sha256=str(
+            review_orchestrator.target_identity_from_card(card).get(
+                "candidate_sha256"
+            )
+            or ""
+        ),
+    )
+
+
+def review_finding_dispositions(
+    self: Any, task_id: str, request_id: str
+) -> list[dict[str, Any]]:
+    """READ-ONLY: stored finding dispositions for one exact target request."""
+    from . import process_launcher as _pl
+
+    review_orchestrator = _pl.review_orchestrator
+
+    review_db = review_orchestrator.canonical_review_db(self)
+    if review_db is None:
+        return []
+    return review_orchestrator.ReviewOrchestrator(
+        self, db_path=review_db
+    ).review_finding_dispositions(task_id=task_id, request_id=request_id)
