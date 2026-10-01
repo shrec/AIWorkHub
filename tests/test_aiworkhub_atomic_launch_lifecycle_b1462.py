@@ -88,6 +88,8 @@ def test_auto_pickup_claim_can_atomically_attach_exact_launch(tmp_path, monkeypa
 
 
 def test_launcher_preflight_accepts_only_unattached_owned_claim(tmp_path, monkeypatch):
+    # The sandbox cannot create the on-disk authority key (NF-2026-01204).
+    monkeypatch.setenv("AIWORKHUB_TOOLCHAIN_AUTHORITY_HMAC_KEY", "hex:" + "11" * 32)
     repo = _repo(tmp_path, monkeypatch)
     _insert(
         repo,
