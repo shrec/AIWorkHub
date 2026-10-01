@@ -2816,6 +2816,50 @@ def _write_rework_path(destination: Path, relative: str, content: bytes | None) 
         destination.write_bytes(content)
 
 
+def _rework_hash_mismatch(
+    relative: str, source: str, expected: Any, content: bytes | None,
+) -> WorkspaceError:
+    """Name WHICH read disagreed, keeping the typed reason prefix intact.
+
+    NF-2026-01199: the retained worktree and the sealed artifact raised one
+    indistinguishable reason.  ``terminal_failure_classification`` types only
+    the ``rework_predecessor_hash_mismatch`` prefix, so the diagnosis rides
+    immediately after ``:<relative>`` -- ahead of the ``[:300]``/``[:500]``
+    bounds this reason passes through on its way to the card -- and a pure
+    CR/LF difference in retained worktree bytes is named as exactly that.
+
+    Field order keeps compact verdicts first and both 64-character digests
+    last, so a long ``relative`` cannot push ``observed_bytes``/
+    ``line_endings_only`` out of the ``[:300]`` card bound; ``expected`` is
+    last since the card already publishes it separately as
+    ``changed_path_hashes``.  It renders only when it is actually a
+    64-character hex digest, so a forged string cannot inject fake tail
+    fields into the reason.
+    """
+    observed = None if content is None else hashlib.sha256(content).hexdigest()
+    digest = (
+        isinstance(expected, str)
+        and re.fullmatch(r"[0-9a-f]{64}", expected) is not None
+    )
+    tail = f" source={source}"
+    if source == "worktree":
+        unix = b"" if content is None else content.replace(b"\r\n", b"\n")
+        only_endings = content is not None and digest and any(
+            hashlib.sha256(variant).hexdigest() == expected
+            for variant in (unix, unix.replace(b"\n", b"\r\n"))
+        )
+        tail += f" line_endings_only={'true' if only_endings else 'false'}"
+    tail += f" observed_bytes={0 if content is None else len(content)}"
+    tail += f" observed={observed or 'absent'}"
+    if digest:
+        tail += f" expected={expected}"
+    elif isinstance(expected, str):
+        tail += " expected=invalid"
+    else:
+        tail += " expected=absent"
+    return WorkspaceError(f"rework_predecessor_hash_mismatch:{relative}{tail}")
+
+
 def _materialize_rework_predecessor_from_worktree(
     worktree: Path,
     source_workspace: WorkerWorkspace,
@@ -2842,7 +2886,7 @@ def _materialize_rework_predecessor_from_worktree(
         content = source.read_bytes() if regular else None
         observed = None if content is None else hashlib.sha256(content).hexdigest()
         if observed != raw_expected:
-            raise WorkspaceError(f"rework_predecessor_hash_mismatch:{relative}")
+            raise _rework_hash_mismatch(relative, "worktree", raw_expected, content)
         planned.append((relative, content if rebase is not None or content is None else b""))
     merged = {} if rebase is None else rebase(planned)
     for relative, content in planned:
@@ -3183,7 +3227,7 @@ def verify_rework_delta_artifact(
         if hashlib.sha256(content).hexdigest() != file_sha:
             raise WorkspaceError(f"rework_delta_content_hash_mismatch:{relative}")
         if file_sha != raw_expected:
-            raise WorkspaceError(f"rework_predecessor_hash_mismatch:{relative}")
+            raise _rework_hash_mismatch(relative, "artifact", raw_expected, content)
         total_content_bytes += len(content)
         if total_content_bytes > MAX_REWORK_OVERLAY_CONTENT_BYTES:
             raise WorkspaceError("rework_delta_content_exceeds_limit")

@@ -8,7 +8,7 @@ import os
 import stat
 from contextlib import ExitStack, closing, contextmanager
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from . import attempt_artifacts, platform_io, runtime_temp, worker_workspace
 
@@ -156,6 +156,23 @@ def capture_candidate_paths(workspace: Path, paths) -> list[tuple[str, bytes | N
         remaining -= len(data) if data is not None else 0
         entries.append((relative, data))
     return entries
+
+
+def captured_path_hashes(
+    entries: Sequence[tuple[str, bytes | None]]
+) -> dict[str, str | None]:
+    """Hash exactly the captured bytes, with ``None`` for a deletion marker.
+
+    NF-2026-01199: the one operation that makes a published
+    ``changed_path_hashes`` and a sealed delta artifact agree is deriving both
+    from the SAME ``capture_candidate_paths`` result.  The success path and
+    both terminal failure paths share this helper rather than each re-reading
+    the worktree, which is what let a concurrent writer split the pair.
+    """
+    return {
+        relative: hashlib.sha256(data).hexdigest() if data is not None else None
+        for relative, data in entries
+    }
 
 
 def candidate_entries(workspace: Path, hashes: Mapping[str, Any]) -> list[tuple[str, bytes | None]]:
@@ -332,7 +349,7 @@ def successful_candidate_evidence(workspace, metadata, request_id, changed):
     predecessor_hashes = (metadata.get("rework_predecessor") or {}).get("changed_path_hashes") or {}
     paths = sorted(set(changed) | {path for path in predecessor_hashes if isinstance(path, str) and path})
     entries = capture_candidate_paths(workspace.path, paths)
-    hashes = {path: hashlib.sha256(data).hexdigest() if data is not None else None for path, data in entries}
+    hashes = captured_path_hashes(entries)
     descriptor = process_launcher._terminal_rework_delta_evidence(
         workspace, metadata, request_id, paths, captured_entries=entries
     )

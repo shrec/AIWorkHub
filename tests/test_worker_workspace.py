@@ -626,6 +626,8 @@ def _commit_validation_worker_package(repo: Path) -> None:
         "_version.py",
         "_platform_process.py",
         "platform_io.py",
+        # worker_workspace imports its promotion write helper relatively (NF-2026-01198).
+        "promotion_write.py",
         # NF-2026-00841: worker_workspace loads this sibling at runtime through
         # ``__import__``, so the seed closure must carry it and this fixture
         # repository must therefore track it too.
@@ -2771,7 +2773,7 @@ def test_rework_delta_artifact_verifies_without_touching_a_worktree(
     assert sorted(path.name for path in tmp_path.iterdir()) == ["artifacts", "repo"]
     with pytest.raises(
         worker_workspace.WorkspaceError, match="rework_predecessor_hash_mismatch"
-    ):
+    ) as caught:
         worker_workspace.verify_rework_delta_artifact(
             descriptor,
             repo,
@@ -2781,6 +2783,16 @@ def test_rework_delta_artifact_verifies_without_touching_a_worktree(
             {"out/result.txt": "0" * 64},
             ("out/result.txt",),
         )
+    # NF-2026-01199: the prefix is unchanged, and the tail names WHICH read
+    # disagreed so this refusal is no longer confusable with the retained
+    # worktree one raised by _materialize_rework_predecessor_from_worktree.
+    reason = str(caught.value)
+    assert reason.startswith("rework_predecessor_hash_mismatch:out/result.txt ")
+    assert " source=artifact" in reason
+    assert f" expected={'0' * 64}" in reason
+    assert f" observed={expected['out/result.txt']}" in reason
+    assert f" observed_bytes={len(content)}" in reason
+    assert "line_endings_only" not in reason
 
 
 def test_rework_delta_artifact_rejects_tampered_bytes(tmp_path: Path) -> None:

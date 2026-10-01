@@ -21,10 +21,16 @@ def retained_candidate_identity_evidence(
     request_id: str,
     changed: list[str],
     claim_state: str,
+    *,
+    path_hashes: Mapping[str, str | None] | None = None,
 ) -> dict[str, Any]:
     if not changed:
         return {}
-    path_hashes = changed_path_hashes(workspace, changed)
+    # NF-2026-01199: a caller that already captured these bytes passes the
+    # hashes it derived from them, so the published identity cannot disagree
+    # with the artifact sealed from the same capture.
+    if path_hashes is None:
+        path_hashes = changed_path_hashes(workspace, changed)
     if not path_hashes or set(path_hashes) != set(changed):
         return {}
     workspace_metadata = workspace.as_metadata()
@@ -61,6 +67,59 @@ def retained_candidate_identity_evidence(
     }
 
 
+def retained_candidate_seal_evidence(
+    workspace: WorkerWorkspace,
+    metadata: dict[str, Any],
+    request_id: str,
+    changed: list[str],
+    claim_state: str,
+) -> dict[str, Any]:
+    """Publish the retained hashes AND the sealed delta from ONE capture.
+
+    NF-2026-01199: both failure paths used to hash the retained worktree and
+    then re-read it to seal, so any writer between the two reads (a still
+    running validation child, an editor, a normalizer) published a
+    ``changed_path_hashes`` the sealed artifact disagreed with, and the
+    successor died in ``worker_workspace.verify_rework_delta_artifact``.  This
+    is the success path's invariant (``successful_candidate_evidence``): both
+    halves are derived from the same bytes.  When that single capture cannot
+    be made, the pair is NOT faked from a second read -- the hashes are
+    published alone and the seal is refused by name, which is what a failed
+    seal already does for a symlink, an unsafe path or an over-limit
+    candidate.
+    """
+    from . import process_launcher
+    from .successful_rework_recovery import (
+        capture_candidate_paths,
+        captured_path_hashes,
+    )
+
+    if not changed:
+        return {}
+    captured: list[tuple[str, bytes | None]] | None = None
+    refused: dict[str, Any] | None = None
+    try:
+        captured = capture_candidate_paths(workspace.path, changed)
+    except (OSError, ValueError, WorkspaceError) as exc:
+        refused = {
+            "schema_id": "aiworkhub.rework_delta_seal.v1",
+            "sealed": False,
+            "reason": f"rework_delta_capture_failed:{exc}"[:300],
+        }
+    evidence = retained_candidate_identity_evidence(
+        workspace, metadata, request_id, changed, claim_state,
+        path_hashes=None if captured is None else captured_path_hashes(captured),
+    )
+    if not evidence:
+        return {}
+    delta = refused or process_launcher._terminal_rework_delta_evidence(
+        workspace, metadata, request_id, changed, captured_entries=captured,
+    )
+    if delta is not None:
+        evidence["rework_delta"] = delta
+    return evidence
+
+
 def is_rework_attempt(metadata: Mapping[str, Any]) -> bool:
     predecessor = metadata.get("rework_predecessor")
     return isinstance(predecessor, dict) and bool(predecessor)
@@ -77,7 +136,7 @@ def retained_rework_candidate_evidence(
     if terminal_state not in DELTA_RETAINING_TERMINAL_STATES or not changed:
         return {}
     try:
-        return retained_candidate_identity_evidence(
+        return retained_candidate_seal_evidence(
             workspace, metadata, request_id, changed, claim_state
         )
     except WorkspaceError:

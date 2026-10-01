@@ -3,7 +3,11 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
+import pytest
+
 from aiworkhub import process_launcher
+from aiworkhub import successful_rework_recovery
+from aiworkhub import worker_workspace
 from aiworkhub.worker_workspace import WorkerWorkspace
 
 
@@ -83,3 +87,58 @@ def test_empty_failed_candidate_is_not_claimed_as_rework_authority(
         [],
         "processing",
     ) == {}
+
+
+def test_validation_failed_seal_pairs_the_published_hashes_with_the_artifact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """NF-2026-01199: this branch's ONE capture feeds both published halves.
+
+    The branch used to hash the worktree here and re-read it to seal, so a
+    writer between the two reads published a ``changed_path_hashes`` the
+    sealed artifact disagreed with and the successor was refused with
+    ``rework_predecessor_hash_mismatch``.
+    """
+    workspace = _workspace(tmp_path, "failed-request-3")
+    (workspace.path / "candidate.py").write_bytes(b"value = 3\n")
+    monkeypatch.setenv(worker_workspace.RUNTIME_ROOT_ENV, str(tmp_path / "runtime"))
+    captures: list[tuple[Path, list[str]]] = []
+
+    def capture(root, paths):
+        captures.append((Path(root), sorted(paths)))
+        return [
+            (relative, (Path(root) / relative).read_bytes())
+            for relative in sorted(paths)
+        ]
+
+    monkeypatch.setattr(successful_rework_recovery, "capture_candidate_paths", capture)
+
+    evidence = process_launcher._retained_candidate_seal_evidence(
+        workspace,
+        {
+            "task_id": "FAILED_TASK_3",
+            "runner": "deepseek_worker",
+            "topic": "implementation",
+            "claim_epoch": 4,
+        },
+        "failed-request-3",
+        ["candidate.py"],
+        "processing",
+    )
+
+    # Exactly one read of the candidate bytes backs both published halves.
+    assert captures == [(workspace.path, ["candidate.py"])]
+    assert evidence["changed_path_hashes"] == {
+        "candidate.py": hashlib.sha256(b"value = 3\n").hexdigest()
+    }
+    descriptor = evidence["rework_delta"]
+    assert descriptor["sealed"] is True
+    assert worker_workspace.verify_rework_delta_artifact(
+        {"path": descriptor["artifact_path"], "digest": descriptor["artifact_sha256"]},
+        workspace.repo,
+        "failed-request-3",
+        "FAILED_TASK_3",
+        4,
+        evidence["changed_path_hashes"],
+        workspace.allowed_writes,
+    ) == [("candidate.py", b"value = 3\n")]

@@ -106,6 +106,7 @@ from .process_launcher_evidence import (
     is_rework_attempt as _is_rework_attempt,
     path_manifest as _path_manifest,
     retained_candidate_identity_evidence as _retained_candidate_identity_evidence,
+    retained_candidate_seal_evidence as _retained_candidate_seal_evidence,
     retained_rework_candidate_evidence,
 )
 from . import process_launcher_validation as _launcher_validation
@@ -11717,16 +11718,12 @@ class ProcessManager:
                                 timeout_changed = []
                                 retained = {}
                             if retained:
+                                # NF-2026-01199: the hashes and the sealed
+                                # delta both come from the retention helper's
+                                # single capture -- no second read of these
+                                # bytes can split the published pair.
                                 failure_evidence.update(retained)
                                 failure_evidence["changed_paths"] = timeout_changed
-                                rework_delta = _terminal_rework_delta_evidence(
-                                    workspace,
-                                    metadata,
-                                    request_id,
-                                    timeout_changed,
-                                )
-                                if rework_delta is not None:
-                                    failure_evidence["rework_delta"] = rework_delta
                         release_result = self._terminal_failure_exact(
                             metadata,
                             terminal_state,
@@ -12128,7 +12125,7 @@ class ProcessManager:
                         "finalize_failed",
                     }:
                         try:
-                            retained_candidate = _retained_candidate_identity_evidence(
+                            retained_candidate = _retained_candidate_seal_evidence(
                                 workspace,
                                 metadata,
                                 request_id,
@@ -12157,19 +12154,6 @@ class ProcessManager:
                         },
                         **retained_candidate,
                     }
-                    if terminal_state in {
-                        "validation_failed",
-                        "worker_failed",
-                        "finalize_failed",
-                    }:
-                        rework_delta = _terminal_rework_delta_evidence(
-                            workspace,
-                            metadata,
-                            request_id,
-                            changed,
-                        )
-                        if rework_delta is not None:
-                            terminal_evidence["rework_delta"] = rework_delta
                     if terminal_state == "finalize_failed" or (
                         _is_operational_validation_failure(terminal_state, error)
                     ):

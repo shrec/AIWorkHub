@@ -516,3 +516,65 @@ def test_missing_candidate_still_returns_none_when_missing_ok(episode, monkeypat
     assert recovery._read_regular(episode.candidate, episode.workspace, 100, missing_ok=True) is None
     with pytest.raises(recovery.SuccessfulReworkRecoveryError, match="successful_rework_read_failed"):
         recovery._read_regular(episode.candidate, episode.workspace, 100)
+
+
+def test_success_path_derives_hashes_and_artifact_from_one_capture(
+    tmp_path, monkeypatch
+):
+    """NF-2026-01199: the invariant both failure paths now share with this one.
+
+    ``successful_candidate_evidence`` captures the candidate ONCE and derives
+    both the published ``changed_path_hashes`` and the sealed delta artifact
+    from those exact bytes.  The two terminal failure paths in
+    ``process_launcher`` used to read twice, so a writer between the reads
+    published a pair the successor refused with
+    ``rework_predecessor_hash_mismatch``.
+    """
+    repo = tmp_path / "repo-one-capture"
+    worktree = tmp_path / "worktree-one-capture"
+    home = tmp_path / "home-one-capture"
+    for directory in (repo, worktree, home):
+        directory.mkdir()
+    (worktree / "candidate.py").write_bytes(b"value = 9\n")
+    monkeypatch.setenv(
+        worker_workspace.RUNTIME_ROOT_ENV, str(tmp_path / "runtime-one-capture")
+    )
+    workspace = worker_workspace.WorkerWorkspace(
+        request_id="req-one-capture",
+        repo=repo,
+        path=worktree,
+        home=home,
+        allowed_writes=("candidate.py",),
+        parent_baseline={},
+        workspace_baseline={},
+    )
+    captures = []
+
+    def capture(root, paths):
+        captures.append(sorted(set(paths)))
+        return [
+            (relative, (Path(root) / relative).read_bytes())
+            for relative in sorted(set(paths))
+        ]
+
+    monkeypatch.setattr(recovery, "capture_candidate_paths", capture)
+
+    paths, hashes, descriptor = recovery.successful_candidate_evidence(
+        workspace,
+        {"task_id": "ONE_CAPTURE", "claim_epoch": 3},
+        "req-one-capture",
+        ["candidate.py"],
+    )
+
+    assert captures == [["candidate.py"]]
+    assert paths == ["candidate.py"]
+    assert hashes == {"candidate.py": hashlib.sha256(b"value = 9\n").hexdigest()}
+    assert worker_workspace.verify_rework_delta_artifact(
+        {"path": descriptor["artifact_path"], "digest": descriptor["artifact_sha256"]},
+        repo,
+        "req-one-capture",
+        "ONE_CAPTURE",
+        3,
+        hashes,
+        workspace.allowed_writes,
+    ) == [("candidate.py", b"value = 9\n")]

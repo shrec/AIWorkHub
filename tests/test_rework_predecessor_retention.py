@@ -81,6 +81,17 @@ def test_timed_out_delta_is_retained_as_rework_predecessor(tmp_path: Path) -> No
         },
     ]
     assert "timed_out" in pl.DELTA_RETAINING_TERMINAL_STATES
+    # NF-2026-01199: the retained evidence now carries the seal derived from
+    # the SAME capture as these hashes, so the coordinator can never read a
+    # changed_path_hashes/artifact pair that a second read of the worktree
+    # split.  This fake metadata carries no claim_epoch, so the seal is
+    # refused by name instead of published -- never an inconsistent pair.
+    delta = evidence["rework_delta"]
+    assert delta["sealed"] is False
+    assert delta["reason"].partition(":")[0] in {
+        "rework_delta_identity_invalid",
+        "rework_delta_capture_failed",
+    }
 
 
 def test_states_without_a_usable_delta_retain_nothing(tmp_path: Path) -> None:
