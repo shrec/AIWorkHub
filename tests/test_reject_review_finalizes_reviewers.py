@@ -287,6 +287,7 @@ def test_disposed_reviewer_process_cancellation_is_exact_and_stable(monkeypatch)
     assert result["cancelled"] == [{
         "task_id": "R_BOUND",
         "request_id": "REQ_RUNNING",
+        "match": "bound_child",
         "ok": True,
         "state": "cancelled",
         "blocked_reason": "",

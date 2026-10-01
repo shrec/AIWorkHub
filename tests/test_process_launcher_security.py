@@ -162,6 +162,7 @@ def test_quality_reviewer_reservation_is_exact_durable_and_replays_before_ack(
     pm = manager_cls.__new__(manager_cls)
     pm._lock = process_launcher.threading.RLock()
     pm._live = {}
+    pm.process_log_path = ledger
     pm._registry_lock = _NullRegistryLock
     pm._latest_by_request = _load_latest
     pm._latest_by_request_stable = _stable

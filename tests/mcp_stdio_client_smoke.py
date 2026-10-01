@@ -143,6 +143,11 @@ WRITE_GATED_TOOLS: tuple[str, ...] = (
 #    its EXACT frozen input schema, over a real stdio pipe. A tool that
 #    disappears, is renamed, or changes shape still fails this gate; a newly
 #    added tool does not.
+#
+# RE-FROZEN 2026-10-01, one tool: ``aiworkhub_task_reject_review`` gained the
+# optional ``validation_amendment`` parameter (156ec39) -- additive, default
+# None, every earlier call shape still valid. The pin sat red from that commit
+# until the 0.12.13 release pre-check, because no card's validation ran it.
 FROZEN_SCHEMA_FINGERPRINTS: dict[str, str] = {
     "aiworkhub_agent_cancel_task": "f1d9792f94307639105434caa381c54857d7c292dab122b4cd4e9333dd0552f3",
     "aiworkhub_agent_collect_result": "c291cac06bc81689a1b0df1357facb97c5806fefd0a447ef3245e38976077a3f",
@@ -171,7 +176,7 @@ FROZEN_SCHEMA_FINGERPRINTS: dict[str, str] = {
     "aiworkhub_task_mark_review": "1722a2665425d2ebd8573c3425ee2d04b8c71ae3db24ace3c97e5a82d7e92bd4",
     "aiworkhub_task_pending_for_runner": "864d85c9f3a5a7020e270ddd71f9aeea2ab65ca35932aaf869afaa837950b16d",
     "aiworkhub_task_queue_request": "2c43bb4347d3806b3f373390c95cfc7c4f398b4404860ff4a1722269edeb7fa5",
-    "aiworkhub_task_reject_review": "a9aef828a0380ce7d369273043522bd6f793db9d83955bda180583eb4868722c",
+    "aiworkhub_task_reject_review": "2003a750582164c37b3f9cf74be2a2259ac2bb3ba3c00ee57077c1abc791455a",
     "aiworkhub_task_review_queue": "b5728f6f46c22488977fe80e794f420203cf6725367eb9271cfdad1c6538b878",
     "aiworkhub_task_review_summarize": "e535208ce91e843357bb2efb237b656c50ad1a0b4e1be4111c9ae2356c647e01",
     "aiworkhub_task_show": "987a6779aea9974dc849205292e41e5fab2443e04e97f3c2528059a6b60c4ad3",

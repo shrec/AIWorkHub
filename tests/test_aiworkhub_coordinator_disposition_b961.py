@@ -205,6 +205,7 @@ def test_reject_to_pending_pins_exact_review_workspace(coord):
         coord,
         "T_PIN",
         card={
+            "allowed_writes": ["out/result.txt"],
             "terminal_review": {
                 "substatus": "review_ready",
                 "evidence": {
