@@ -5654,6 +5654,92 @@ def _verify_authority_receipt_executable(
     return fact
 
 
+def _restat_seeds_equal_to_index_blobs(worktree: Path, relatives: list[str]) -> None:
+    """Refresh the index stat of seeded copies whose content Git already holds.
+
+    NF-2026-01168: checkout under ``core.autocrlf`` records the size of the
+    converted bytes, while the live seed writes the canonical bytes.  Git
+    reports a stat-size change as modified without comparing content, so a
+    zero-change worktree read ``" M"`` for every such seeded path.  The seeded
+    worktree copies are hashed with Git's own normalisation for their path and
+    matched against their stage-0 regular-file index entry; only the matching
+    paths are passed to ``update-index``, which re-records the stat (the oid is
+    unchanged, nothing is staged).  A real uncommitted canonical edit is never
+    passed and stays visible as modified.  At most three Git processes run for
+    any number of paths.  Any probe or refresh failure keeps the old, harmless
+    phantom state rather than failing provisioning.
+    """
+    try:
+        candidates: list[str] = []
+        for relative in dict.fromkeys(relatives):
+            seeded = worktree / relative
+            # ponytail: non-ASCII seeded paths keep the old phantom state;
+            # byte-mode stdin for hash-object/update-index lifts this.
+            if (
+                any(character in relative for character in "\n\r\0")
+                or relative.startswith('"')
+                or not relative.isascii()
+                or seeded.is_symlink()
+                or not seeded.is_file()
+            ):
+                continue
+            candidates.append(relative)
+        if not candidates:
+            return
+        listed = _run(
+            ["git", "ls-files", "-s", "-z"],
+            cwd=worktree,
+            phase="workspace_provision",
+            text=False,
+        )
+        if listed.returncode != 0:
+            return
+        index_entries: dict[str, tuple[str, str]] = {}
+        for record in listed.stdout.decode("utf-8", "replace").split("\0"):
+            meta, separator, listed_path = record.partition("\t")
+            entry = meta.split()
+            if (
+                separator
+                and len(entry) == 3
+                and entry[0] in {"100644", "100755"}
+                and entry[2] == "0"
+            ):
+                index_entries[listed_path] = (entry[0], entry[1])
+        tracked = [relative for relative in candidates if relative in index_entries]
+        if not tracked:
+            return
+        hashed = _run(
+            ["git", "hash-object", "--stdin-paths"],
+            cwd=worktree,
+            phase="workspace_provision",
+            input_text="".join(f"{relative}\n" for relative in tracked),
+        )
+        oids = hashed.stdout.split()
+        if hashed.returncode != 0 or len(oids) != len(tracked):
+            return
+        # Git for Windows runs core.filemode=false, so update-index keeps the index mode there.
+        equal = [
+            relative
+            for relative, oid in zip(tracked, oids, strict=True)
+            if oid == index_entries[relative][1]
+            and (
+                os.name == "nt"
+                or (index_entries[relative][0] == "100755")
+                == bool((worktree / relative).stat().st_mode & 0o100)
+            )
+        ]
+        if not equal:
+            return
+        _run(
+            ["git", "update-index", "-z", "--stdin"],
+            cwd=worktree,
+            phase="workspace_provision",
+            input_text="".join(f"{relative}\0" for relative in equal),
+        )
+    except (GitCommandTimeout, OSError, ValueError):
+        return
+
+
 def create_workspace(
     repo: Path,
     request_id: str,
@@ -5790,11 +5876,13 @@ def create_workspace(
         # ``workspace_baseline`` below and they remain read-only, never enter
         # the candidate delta, and can never be promoted.
         if pinned_base_oid is None:
+            restat_candidates: list[str] = []
             for relative in live_seeded:
                 destination = path / relative
                 _require_beneath(path, destination)
                 _require_beneath(repo, repo / relative)
                 _copy_one(repo / relative, destination)
+                restat_candidates.append(relative)
             for relative in support_seeded:
                 source = repo / relative
                 support_path = path / relative
@@ -5809,6 +5897,8 @@ def create_workspace(
                     raise WorkspaceError(
                         f"validation_worker_support_missing:{relative}"
                     )
+                restat_candidates.append(relative)
+            _restat_seeds_equal_to_index_blobs(path, restat_candidates)
         # Re-run the same exact-input checks against the sparse worktree after
         # materialization.  This closes races in the canonical copy window and
         # preserves field/index/path evidence if an input was not actually

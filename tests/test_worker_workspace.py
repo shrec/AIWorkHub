@@ -2204,6 +2204,9 @@ def test_workspace_creation_uses_bounded_metadata_not_post_create_git_probes(
             "sparse-checkout",
             "sparse-checkout",
             "read-tree",
+            "ls-files",
+            "hash-object",
+            "update-index",
         ]
         assert "--no-checkout" in calls[0]
         assert not (workspace.path / "parent-secret.txt").exists()
