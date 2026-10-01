@@ -15,6 +15,8 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 _SRC = Path(__file__).resolve().parents[1] / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
@@ -648,3 +650,111 @@ def test_preview_keys_dispositions_on_the_untruncated_finding_id() -> None:
     # is truncated.
     assert "finding_dispositions" not in fold
     assert _preview_refinements(fold) == [finding_id[:300]]
+
+
+# --------------------------------------------------------------------------
+# NF-2026-01180: the candidate_unavailable refusal names its cause
+# --------------------------------------------------------------------------
+def _without_terminal_review() -> dict:
+    card = _target_card()
+    del card["terminal_review"]
+    return {**card, "status": "review", "substatus": "review_ready"}
+
+
+def _without_evidence_key(key: str) -> dict:
+    card = _target_card()
+    del card["terminal_review"]["evidence"][key]
+    return {**card, "status": "review", "terminal_substatus": "review_ready"}
+
+
+def _for_other_request() -> dict:
+    card = _target_card()
+    card["terminal_review"]["evidence"]["request_identity"]["request_id"] = "other-request"
+    return {**card, "status": "review"}
+
+
+@pytest.mark.parametrize(
+    ("card", "unresolved", "substatus", "terminal_request_id"),
+    [
+        (_without_terminal_review(), ["terminal_evidence"], "review_ready", ""),
+        (
+            _without_evidence_key("attempt_artifact_manifest"),
+            ["packet_sha256"],
+            "review_ready",
+            "target-request",
+        ),
+        (
+            _without_evidence_key("changed_path_hashes"),
+            ["candidate_sha256"],
+            "review_ready",
+            "target-request",
+        ),
+        (_for_other_request(), ["request_mismatch"], "", "other-request"),
+    ],
+    ids=["no_terminal_review", "no_manifest", "no_changed_path_hashes", "other_request"],
+)
+def test_candidate_unavailable_refusal_names_cause(
+    monkeypatch, tmp_path: Path, card, unresolved, substatus, terminal_request_id
+) -> None:
+    repo = tmp_path.resolve()
+    receipt = _receipt(_finding("finding-1"))
+    monkeypatch.setattr(
+        process_launcher.core,
+        "manager_bootstrap",
+        lambda: {
+            "role": "manager",
+            "repo": str(repo),
+            "manager_route": {"provider": "codex", "thread_id": "thread-exact"},
+        },
+    )
+    monkeypatch.setattr(process_launcher.core, "writes_allowed", lambda: True)
+    monkeypatch.setattr(
+        review_orchestrator, "canonical_review_db", lambda _m: repo / "review.sqlite3"
+    )
+    monkeypatch.setattr(process_launcher, "_parse_card", lambda _raw, _tid: card)
+    monkeypatch.setattr(
+        accept_review,
+        "reviewer_evidence",
+        lambda _self, _task, _request: [
+            {"request_id": "review-req-1", "usable": True, "receipt": receipt}
+        ],
+    )
+    manager = SimpleNamespace(repo=repo, _show_task=lambda _task_id: "{}")
+
+    result = process_launcher.ProcessManager.dispose_review_finding(
+        manager,
+        task_id="TARGET",
+        request_id="target-request",
+        reviewer_request_id="review-req-1",
+        finding_id=FINDING_1,
+        disposition="dismissed",
+        counter_evidence="measured: unreachable",
+        reason="false positive",
+    )
+
+    assert result == {
+        "ok": False,
+        "error": "review_finding_disposition_candidate_unavailable",
+        "detail": {
+            "unresolved": unresolved,
+            "task_status": "review",
+            "task_substatus": substatus,
+            "terminal_request_id": terminal_request_id,
+            "requested_request_id": "target-request",
+        },
+    }
+    assert review_orchestrator.ReviewOrchestrator(
+        SimpleNamespace(repo=repo), db_path=repo / "review.sqlite3"
+    ).review_finding_dispositions(task_id="TARGET", request_id="target-request") == []
+
+
+def test_target_identity_unresolved_shares_the_identity_derivation() -> None:
+    assert review_orchestrator.target_identity_unresolved(_target_card()) == []
+    assert review_orchestrator.target_identity_from_card(_target_card())[
+        "candidate_sha256"
+    ] == CANDIDATE
+    for unreadable in (None, {}, {"terminal_review": {"evidence": {}}}):
+        assert review_orchestrator.target_identity_unresolved(unreadable) == [
+            "terminal_evidence"
+        ]
+        assert review_orchestrator.target_identity_from_card(unreadable) == {}

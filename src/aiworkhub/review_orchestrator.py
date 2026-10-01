@@ -786,21 +786,47 @@ def target_identity_from_card(card: Any) -> dict[str, str]:
     Returns ``{}`` unless every field resolves; a partially readable candidate
     is not an identity and must never be treated as one.
     """
-    if not isinstance(card, Mapping):
+    identity = _target_identity_values(card)
+    if identity is None or not all(identity[field] for field in TARGET_IDENTITY_FIELDS):
         return {}
+    return identity
+
+
+def target_identity_unresolved(card: Any) -> list[str]:
+    """Name why :func:`target_identity_from_card` yields no identity.
+
+    ``["terminal_evidence"]`` when ``terminal_review``, its ``evidence`` or
+    its ``request_identity`` is not a mapping; otherwise the sorted names of
+    the ``TARGET_IDENTITY_FIELDS`` that did not resolve; ``[]`` when the
+    identity resolves. Names only -- never a value (NF-2026-01180).
+    """
+    identity = _target_identity_values(card)
+    if identity is None:
+        return ["terminal_evidence"]
+    return sorted(field for field in TARGET_IDENTITY_FIELDS if not identity[field])
+
+
+def _target_identity_values(card: Any) -> dict[str, str] | None:
+    """The one derivation shared by the two public readers above.
+
+    ``None`` when the terminal evidence is not readable at all; otherwise
+    every field, unresolved ones as ``""``.
+    """
+    if not isinstance(card, Mapping):
+        return None
     terminal = card.get("terminal_review")
     evidence = terminal.get("evidence") if isinstance(terminal, Mapping) else None
     if not isinstance(evidence, Mapping):
-        return {}
+        return None
     request_identity = evidence.get("request_identity")
     if not isinstance(request_identity, Mapping):
-        return {}
+        return None
     manifest = evidence.get("attempt_artifact_manifest")
     changed_path_hashes = evidence.get("changed_path_hashes")
     epoch = request_identity.get("claim_epoch")
     if epoch is None:
         epoch = card.get("claim_epoch")
-    identity = {
+    return {
         "target_task_id": str(request_identity.get("task_id") or ""),
         "target_request_id": str(request_identity.get("request_id") or ""),
         "claim_epoch": str(epoch if epoch is not None else ""),
@@ -813,9 +839,6 @@ def target_identity_from_card(card: Any) -> dict[str, str]:
             else ""
         ),
     }
-    if not all(identity[field] for field in TARGET_IDENTITY_FIELDS):
-        return {}
-    return identity
 
 
 def target_identity_from_registration(event: Any) -> dict[str, str]:

@@ -2799,7 +2799,13 @@ def dispose_review_finding(
         ),
         None,
     )
-    return review_orchestrator.ReviewOrchestrator(
+    target_identity = review_orchestrator.target_identity_from_card(card)
+    # Terminal evidence that resolves for another request belongs to that
+    # request: nothing may be recorded against it (NF-2026-01180).
+    request_mismatch = bool(target_identity) and target_identity.get(
+        "target_request_id"
+    ) != str(request_id)
+    result = review_orchestrator.ReviewOrchestrator(
         self, db_path=review_db
     ).dispose_review_finding(
         task_id=task_id,
@@ -2811,13 +2817,30 @@ def dispose_review_finding(
         reason=reason,
         actor=f"{provider}:{session_id}",
         reviewer_receipt=(bound or {}).get("receipt"),
-        candidate_sha256=str(
-            review_orchestrator.target_identity_from_card(card).get(
-                "candidate_sha256"
-            )
-            or ""
+        candidate_sha256=(
+            "" if request_mismatch else str(target_identity.get("candidate_sha256") or "")
         ),
     )
+    if result.get("error") != "review_finding_disposition_candidate_unavailable":
+        return result
+    # Names and ids only: never a hash, a path or evidence content.
+    named = review_orchestrator._target_identity_values(card) or {}
+    return {
+        **result,
+        "detail": {
+            "unresolved": (
+                ["request_mismatch"]
+                if request_mismatch
+                else review_orchestrator.target_identity_unresolved(card)
+            ),
+            "task_status": str(card.get("status") or ""),
+            "task_substatus": str(
+                card.get("substatus") or card.get("terminal_substatus") or ""
+            ),
+            "terminal_request_id": str(named.get("target_request_id") or ""),
+            "requested_request_id": str(request_id),
+        },
+    }
 
 
 def review_finding_dispositions(
