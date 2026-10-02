@@ -62,6 +62,16 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
+## What's new in 0.12.15
+
+- A card whose launch failed before the worker started can be retried on the same task instead of staying stuck.
+- A worker's state and liveness stay visible while it reports a runtime notice.
+- A validation replay that never ran a test is reported as a finalization failure, not as failed tests.
+- Recovering a blocked rework keeps the rejected candidate and can still be routed to another worker.
+- A failed promotion on Windows names the file, the operation and the cause, and a briefly locked file is retried.
+- A worker is never started on an empty prompt.
+- Groundwork for the admin-free Windows worker sandbox: repo-local slots and a restricted-token launch primitive. It is not active for workers yet.
+
 ## What's new in 0.12.14
 
 - A review now shows how many tests passed, failed and were skipped, and the first failure, instead of only an exit code.

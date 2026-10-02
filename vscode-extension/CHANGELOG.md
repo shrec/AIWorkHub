@@ -1,5 +1,24 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.12.15 — 2026-10-02
+
+### Added
+
+- PlatformIO owns a repo-local worker sandbox plan and a CPU-derived slot lease: worker HOME, TEMP, cache, state, config, workspace and log storage is planned under `<repo>/.aiworkhub/runtime/sandboxes/slots/<slot-id>`, with no admin, no drive letter and no path derived from the user profile or the system temp directory. Nothing calls it yet; the launcher wiring is a later change (01173 part A).
+- A Windows restricted-token launch primitive starts a child under a restricted primary token at Low integrity inside a kill-on-close Job and writes one DACL on the slot root, refusing a UNC, device, reparse-point or out-of-sandbox root before any descriptor write. It needs no elevation, touches no ancestor ACL and is not yet wired into the worker launch path (01173 part D).
+
+### Fixed
+
+- A launch that fails before a worker runs leaves the card recoverable on the same task ID: the exact claim persists the request linkage before the fallible preflight, the failure records its request id on the blocker, and terminal retry and dead-processing reconciliation accept an unattached card while still refusing a contradicting request id. A legacy blocked card without linkage is recovered through its task-event trail as `legacy_unlinked` (NF-2026-01192, NF-2026-01202).
+- An advisory runtime notice no longer masks a worker's lifecycle state and liveness: process readers take the last lifecycle row, and `status()` returns the latest advisory separately as `runtime_notice` (NF-2026-01194).
+- A validation-only replay that fails before any declared command runs terminalises `finalize_failed`, not `validation_failed`; a replay whose declared command ran and failed keeps `validation_failed` with its receipt (NF-2026-01195).
+- A blocked-rework recovery that keeps the rejected candidate seals a rebind the reroute can authenticate, so the sequence no longer fails with `reroute_manager_rejection_identity_mismatch` (NF-2026-01196).
+- A rejected learning commit requires a manager rejection that actually landed for that exact request (NF-2026-01197).
+- A failed promotion write reports `promotion_write_failed:<relative>:<op>:errno=<n>:winerror=<n|none>` instead of a bare errno, and a transient sharing violation on replace or unlink is retried with a bounded backoff (NF-2026-01198).
+- A retained rework predecessor's path hashes and sealed delta come from one capture, so a write between two reads can no longer publish a pair that fails authentication (NF-2026-01199).
+- A worker prompt lost before the supervisor reads it rejects the launch instead of starting the worker on empty stdin (NF-2026-01159).
+- Tests take the toolchain-authority test key from one conftest fixture, so a contained validation lane never needs the on-disk key (NF-2026-01204, NF-2026-01213), and three timing-dependent tests wait on the observed state instead of a fixed budget (NF-2026-01191).
+
 ## 0.12.14 — 2026-10-01
 
 ### Added
