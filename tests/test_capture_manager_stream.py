@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 _spec = importlib.util.spec_from_file_location("capture_manager_stream", ROOT / "scripts" / "capture_manager_stream.py")
@@ -113,3 +116,100 @@ def test_user_names_cover_the_account_and_the_home_basename(monkeypatch):
 def test_a_wrong_argument_count_prints_usage_and_returns_2(capsys):
     assert cms.main([]) == 2
     assert capsys.readouterr().err.startswith("Usage: ")
+
+
+def _delta(index, field, fragment, kind="input_json_delta"):
+    event = {"type": "content_block_delta", "index": index, "delta": {"type": kind, field: fragment}}
+    return json.dumps({"type": "stream_event", "event": event})
+
+
+def _redactor(spellings):
+    ids: dict[str, str] = {}
+    return lambda line: cms.redact_line(line, spellings, ids)
+
+
+def test_a_path_inside_a_nested_json_string_is_replaced():
+    line = json.dumps({"rawInput": json.dumps({"path": "D:\\Work\\Repo\\notes.txt"})})
+    redacted = cms.redact_line(line, cms.path_spellings((Path("D:/Work/Repo"), "<repo>")), {})
+    assert "Work" not in redacted
+    assert "Repo" not in redacted
+    assert json.loads(json.loads(redacted)["rawInput"])["path"].startswith("<repo>")
+
+
+def test_a_prefixed_uuid_is_replaced_with_the_same_placeholder():
+    uuid = "0f8fad5b-d9cb-469f-a165-70867728950e"
+    line = cms.redact_line(f"rs_{uuid} fc_{uuid}_0", [], {})
+    assert line == "rs_00000000-0000-4000-8000-000000000001 fc_00000000-0000-4000-8000-000000000001_0"
+
+
+def test_a_hyphen_adjacent_uuid_is_replaced():
+    first = "0f8fad5b-d9cb-469f-a165-70867728950e"
+    second = "7c9e6679-7425-40de-944b-e07fc1f90ae7"
+    line = cms.redact_line(f"call-{first}-1 x-{second} {first}-{second}", [], {})
+    assert line == (
+        "call-00000000-0000-4000-8000-000000000001-1 x-00000000-0000-4000-8000-000000000002"
+        " 00000000-0000-4000-8000-000000000001-00000000-0000-4000-8000-000000000002"
+    )
+
+
+def test_capture_redacts_a_path_split_across_delta_lines(tmp_path: Path):
+    workdir = tmp_path / "zqxcapturedir"
+    out = tmp_path / "out" / "claude_cli.jsonl"
+    partial = json.dumps({"file_path": str(workdir / "notes.txt")})
+    first = partial.index("zqxcapturedir") + 5
+    second = partial.index("notes.txt")
+    lines = [
+        json.dumps({"type": "system", "subtype": "init", "session_id": "0f8fad5b-d9cb-469f-a165-70867728950e", "cwd": str(workdir)}),
+        *(_delta(1, "partial_json", fragment) for fragment in (partial[:first], partial[first:second], partial[second:])),
+        json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "done"}]}}),
+        json.dumps({"type": "result", "session_id": "0f8fad5b-d9cb-469f-a165-70867728950e", "usage": {"input_tokens": 3, "output_tokens": 1}}),
+    ]
+    events = cms.capture(
+        "claude_cli", "fixture-model", out, workdir=workdir,
+        spawn=_replay_spawn(lines), plan_builder=_plan_builder,
+    )
+    text = out.read_text(encoding="utf-8")
+    written = text.splitlines()
+    assert len(written) == 6
+    assert str(workdir) not in text
+    assert "zqxcapturedir" not in text
+    joined = "".join(json.loads(line)["event"]["delta"]["partial_json"] for line in written[1:4])
+    assert json.loads(joined) == {"file_path": "<workdir>" + str(Path("a") / "b")[1] + "notes.txt"}
+    assert [event["type"] for event in events] == ["assistant_text", "turn_end"]
+
+
+def test_held_delta_lines_are_written_when_the_stream_ends_raises_or_closes():
+    raw = [
+        _delta(0, "text", "mail owner@exa", "text_delta") + "\n",
+        _delta(0, "text", "mple.org now", "text_delta") + "\n",
+    ]
+    sink = io.StringIO()
+    assert list(cms._Tee._lines(iter(raw), sink, _redactor([]))) == raw
+    written = sink.getvalue().splitlines()
+    assert len(written) == 2
+    assert "example.org" not in sink.getvalue()
+    assert "".join(json.loads(line)["event"]["delta"]["text"] for line in written) == "mail <email> now"
+
+    def failing():
+        yield from raw
+        raise OSError("pipe closed")
+
+    sink = io.StringIO()
+    with pytest.raises(OSError):
+        list(cms._Tee._lines(failing(), sink, _redactor([])))
+    assert len(sink.getvalue().splitlines()) == 2
+
+    sink = io.StringIO()
+    lines = cms._Tee._lines(iter(raw), sink, _redactor([]))
+    assert next(lines) == raw[0]
+    assert sink.getvalue() == ""
+    lines.close()
+    assert len(sink.getvalue().splitlines()) == 1
+
+
+def test_a_delta_run_without_secrets_is_written_byte_for_byte():
+    expected = [_delta(0, "text", "do", "text_delta"), _delta(0, "text", "ne", "text_delta"), '{"type":"result"}']
+    raw = [line + "\n" for line in expected]
+    sink = io.StringIO()
+    assert list(cms._Tee._lines(iter(raw), sink, _redactor([]))) == raw
+    assert sink.getvalue().splitlines() == expected

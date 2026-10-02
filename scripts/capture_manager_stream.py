@@ -6,7 +6,9 @@ Usage: python scripts/capture_manager_stream.py <backend_id> <model> <out.jsonl>
 The turn runs through ``CliManagerBackend`` exactly as Manager Chat runs it.
 The spawned process is only wrapped: every raw stdout line is written to the
 fixture, redacted, and flushed while the backend reads it, so a crashed or
-timed-out turn still leaves its lines. Fixed placeholders replace the
+timed-out turn still leaves its lines; a run of Claude ``content_block_delta``
+lines is written when the run ends, so a value split across deltas is still
+redacted. Fixed placeholders replace the
 redaction: repository, workdir and home paths, the user name, e-mail
 addresses, UUIDs and OpenCode ``ses_`` ids. Developer tool only; nothing
 under ``src/aiworkhub`` imports it.
@@ -15,6 +17,7 @@ under ``src/aiworkhub`` imports it.
 from __future__ import annotations
 
 import getpass
+import json
 import re
 import sys
 from collections.abc import Callable, Iterator
@@ -36,7 +39,9 @@ PROMPT = (
 )
 
 _EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
-_UUID = re.compile(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b")
+_UUID = re.compile(
+    r"(?<![0-9A-Fa-f])[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}(?![0-9A-Fa-f])"
+)
 _SES = re.compile(r"\bses_[A-Za-z0-9]+")
 _UUID_PREFIX = "00000000-0000-4000-8000-"
 _SES_PREFIX = "ses_fixture"
@@ -56,7 +61,9 @@ def path_spellings(*roots: tuple[Path, str]) -> list[tuple[str, str]]:
         if not posix:
             continue
         windows = posix.replace("/", "\\")
-        for spelling in (str(root), posix, windows, windows.replace("\\", "\\\\")):
+        doubled = windows.replace("\\", "\\\\")
+        quadrupled = windows.replace("\\", "\\\\\\\\")
+        for spelling in (str(root), posix, windows, doubled, quadrupled):
             if spelling:
                 pairs.setdefault(spelling, token)
     return sorted(pairs.items(), key=lambda pair: len(pair[0]), reverse=True)
@@ -72,6 +79,9 @@ def redact_line(line: str, spellings: list[tuple[str, str]], ids: dict[str, str]
         line = re.sub(pattern, lambda _m, t=token: t, line, flags=re.IGNORECASE)
 
     def placeholder(original: str, prefix: str, template: str) -> str:
+        # A re-redacted delta line already carries issued placeholders; keep them.
+        if original in ids.values():
+            return original
         if original not in ids:
             count = sum(1 for value in ids.values() if value.startswith(prefix))
             ids[original] = template.format(count + 1)
@@ -90,6 +100,53 @@ def _user_names(home: Path) -> list[str]:
     return [name for name in dict.fromkeys((home.name, account)) if len(name) >= 2]
 
 
+_DELTA_FIELDS = ("text", "thinking", "partial_json")
+
+
+def _delta_line(line: str) -> tuple[tuple[str, str], dict] | None:
+    """``((index, field), obj)`` for a Claude content_block_delta line carrying a string fragment."""
+    try:
+        obj = json.loads(line)
+    except ValueError:
+        return None
+    if not isinstance(obj, dict) or obj.get("type") != "stream_event":
+        return None
+    event = obj.get("event")
+    if not isinstance(event, dict) or event.get("type") != "content_block_delta":
+        return None
+    delta = event.get("delta")
+    if not isinstance(delta, dict):
+        return None
+    for field in _DELTA_FIELDS:
+        if isinstance(delta.get(field), str):
+            return (json.dumps(event.get("index")), field), obj
+    return None
+
+
+def _split(text: str, count: int) -> list[str]:
+    """``text`` cut into ``count`` contiguous near-equal fragments (empty fragments allowed)."""
+    bounds = [len(text) * i // count for i in range(count + 1)]
+    return [text[bounds[i]:bounds[i + 1]] for i in range(count)]
+
+
+def _redact_run(run: list[tuple[str, tuple[str, str], dict]], redact: Callable[[str], str]) -> list[str]:
+    """Redact a run of delta lines so a value split across one (index, field) group is still caught."""
+    out = [redact(line) for line, _, _ in run]
+    groups: dict[tuple[str, str], list[int]] = {}
+    for position, (_, key, _) in enumerate(run):
+        groups.setdefault(key, []).append(position)
+    for (_, field), members in groups.items():
+        joined = "".join(run[i][2]["event"]["delta"][field] for i in members)
+        redacted = redact(joined)
+        if redacted == joined:
+            continue
+        for i, piece in zip(members, _split(redacted, len(members))):
+            obj = run[i][2]
+            obj["event"]["delta"][field] = piece
+            out[i] = redact(json.dumps(obj, ensure_ascii=False, separators=(",", ":")))
+    return out
+
+
 class _Tee:
     """The spawned process, with every stdout line also written (redacted) to ``sink``."""
 
@@ -99,11 +156,31 @@ class _Tee:
 
     @staticmethod
     def _lines(stream: Any, sink: Any, redact: Callable[[str], str]) -> Iterator[str]:
-        for raw in stream or ():
-            if raw.strip():
-                sink.write(redact(raw.rstrip("\r\n")) + "\n")
+        held: list[tuple[str, tuple[str, str], dict]] = []
+
+        def write_held() -> None:
+            run = held[:]
+            held.clear()
+            if run:
+                for line in _redact_run(run, redact):
+                    sink.write(line + "\n")
                 sink.flush()
-            yield raw
+
+        # Measured on real Claude streams a block's deltas are contiguous, so any non-delta line ends the run.
+        try:
+            for raw in stream or ():
+                if raw.strip():
+                    line = raw.rstrip("\r\n")
+                    delta = _delta_line(line)
+                    if delta is not None:
+                        held.append((line, *delta))
+                    else:
+                        write_held()
+                        sink.write(redact(line) + "\n")
+                        sink.flush()
+                yield raw
+        finally:
+            write_held()
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._process, name)
