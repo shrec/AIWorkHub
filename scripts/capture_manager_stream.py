@@ -63,7 +63,9 @@ def path_spellings(*roots: tuple[Path, str]) -> list[tuple[str, str]]:
         windows = posix.replace("/", "\\")
         doubled = windows.replace("\\", "\\\\")
         quadrupled = windows.replace("\\", "\\\\\\\\")
-        for spelling in (str(root), posix, windows, doubled, quadrupled):
+        # Claude Code names its per-project directories after the cwd, every non-alphanumeric as "-".
+        slug = re.sub(r"[^A-Za-z0-9]", "-", windows)
+        for spelling in (str(root), posix, windows, doubled, quadrupled, slug if slug.strip("-") else ""):
             if spelling:
                 pairs.setdefault(spelling, token)
     return sorted(pairs.items(), key=lambda pair: len(pair[0]), reverse=True)

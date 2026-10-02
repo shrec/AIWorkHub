@@ -152,6 +152,14 @@ def test_a_hyphen_adjacent_uuid_is_replaced():
     )
 
 
+def test_a_claude_project_slug_of_a_root_is_replaced():
+    repo = Path("D:/Work/Repo")
+    spellings = cms.path_spellings((repo / ".sub" / "fixture_dir", "<workdir>"), (repo, "<repo>"))
+    line = cms.redact_line("projects/D--Work-Repo--sub-fixture-dir/memory other/d--work-repo/x", spellings, {})
+    assert line == "projects/<workdir>/memory other/<repo>/x"
+    assert all(spelling.strip("-") for spelling, _ in cms.path_spellings(("", "<x>")))
+
+
 def test_capture_redacts_a_path_split_across_delta_lines(tmp_path: Path):
     workdir = tmp_path / "zqxcapturedir"
     out = tmp_path / "out" / "claude_cli.jsonl"
