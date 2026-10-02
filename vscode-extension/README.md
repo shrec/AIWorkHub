@@ -14,6 +14,14 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.12.17
+
+- Source Graph retries a briefly contended index recovery instead of failing the refresh.
+- A review that became ready while the manager was busy is announced again instead of being lost.
+- Manager Chat keeps its own conversation when you switch the model, shows a provider's real failure text, keeps long replies whole, and re-delivers a wake callback whose turn failed.
+- An OpenCode manager seat starts in the manager repository.
+- The semantic-edit coverage figure no longer counts files a rework attempt only inherited.
+
 ## What's new in 0.12.16
 
 - Source Graph recovers an interrupted index without locking it: an open reader no longer makes recovery hang for half a minute with `database is locked`.

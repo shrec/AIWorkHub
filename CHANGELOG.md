@@ -6,6 +6,24 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.17] - 2026-10-03
+
+### Added
+
+- A developer tool, `scripts/capture_manager_stream.py`, records one real manager turn as a redacted provider-stream fixture: repository, working-directory and home paths in every spelling (including nested JSON and Claude's project-slug form), the user name, e-mail addresses, UUIDs and OpenCode session ids become fixed placeholders, also when a value is split across Claude deltas. Recorded Claude, Codex and OpenCode manager streams are committed as test fixtures (NF-2026-01235, NF-2026-01237).
+
+### Fixed
+
+- Transient Source Graph recovery contention is retried on a short bounded backoff with a per-job budget instead of failing the refresh job, `refresh_now()` passes the recovery gate, and a stale retryable recovery error is cleared (NF-2026-01218).
+- A deferred review wake is no longer pre-empted by the seeded `review_ready` row, and the manager-ready wake is always announced by re-arming an already delivered row of the same episode (NF-2026-01220).
+- Semantic-edit coverage excludes inherited-unchanged rework paths, derives new files from the empty placeholder baseline and labels no-change runs `no_changed_paths`, so a rework attempt is no longer reported as raw edits it never made (NF-2026-01222).
+- A Manager Chat model switch or backend re-bind restores the session's own conversation in the new backend's brief (NF-2026-01225).
+- A Claude failure result carries its own text as the Manager Chat provider error instead of the subtype `success` (NF-2026-01226).
+- A Manager Chat wake callback is acknowledged only after its turn finished and was delivered; a failed turn keeps it and is retried on a backoff (NF-2026-01227).
+- The Manager Chat event log appends one line per event and bounds payload fields on their own, so a long reply keeps its text (NF-2026-01228).
+- The Manager Chat seat check reads a 512 KiB tail of the event log, so a session whose newest event is a long reply still counts as active (NF-2026-01244).
+- A manager seat child's `PWD` names the directory it was started in, so an OpenCode seat works in the manager repository (NF-2026-01236).
+
 ## [0.12.16] - 2026-10-02
 
 ### Fixed
