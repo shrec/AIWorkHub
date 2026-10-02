@@ -314,6 +314,50 @@ def test_a_provider_error_line_becomes_one_error_event():
     assert mlb.translate("claude_cli", flagged)[0]["payload"]["error"] == "error_during_execution"
 
 
+def _claude_failure(**fields):
+    return mlb.translate("claude_cli", {"type": "result", "is_error": True, **fields})
+
+
+def _claude_detail(**fields):
+    (event,) = _claude_failure(**fields)
+    return event["payload"]["error"]
+
+
+def test_a_claude_failure_result_carries_its_text_rather_than_the_subtype_success():
+    reason = "OAuth session expired and could not be refreshed"
+    assert _claude_failure(subtype="success", result=reason) == [
+        {"type": "error", "payload": {"source": "provider", "error": reason}}
+    ]
+
+
+def test_a_textless_claude_failure_is_provider_error_and_never_success():
+    assert _claude_failure(subtype="success") == [
+        {"type": "error", "payload": {"source": "provider", "error": "provider_error"}}
+    ]
+    assert _claude_detail(subtype=" Success ", result="  ") == "provider_error"
+
+
+def test_a_string_error_wins_over_result_and_message_is_the_last_text_fallback():
+    assert _claude_detail(error="rate_limited", result="ignored") == "rate_limited"
+    assert _claude_failure(subtype="success", message="quota exhausted") == [
+        {"type": "error", "payload": {"source": "provider", "error": "quota exhausted"}}
+    ]
+    assert _claude_detail(error=429, result="too many requests") == "too many requests"
+
+
+def test_a_very_long_failure_result_is_clipped_by_the_existing_limit():
+    long_text = "x" * (mlb.MAX_ERROR_DETAIL_CHARS + 500)
+    assert _claude_detail(subtype="success", result=long_text) == long_text[
+        : mlb.MAX_ERROR_DETAIL_CHARS
+    ]
+
+
+def test_a_successful_result_event_is_never_a_provider_error():
+    succeeded = {"type": "result", "is_error": False, "subtype": "success", "result": "done"}
+    events = mlb.translate("claude_cli", succeeded)
+    assert events and all(event["type"] != "error" for event in events)
+
+
 def test_an_unknown_line_is_skipped_and_never_crashes_the_turn(tmp_path: Path):
     fake = FakeCli(
         tmp_path,

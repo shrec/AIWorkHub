@@ -242,7 +242,15 @@ def _provider_error(event: Mapping[str, Any]) -> dict[str, Any] | None:
     if isinstance(reported, Mapping):
         detail = reported.get("name") or reported.get("message") or "provider_error"
     else:
-        detail = reported or event.get("subtype") or "provider_error"
+        # A Claude ``result`` failure carries its text in ``result`` and the
+        # subtype ``success``; that word is never a failure detail.
+        texts = (event.get(key) for key in ("error", "result", "message"))
+        detail = next((t for t in texts if isinstance(t, str) and t.strip()), None)
+        subtype = event.get("subtype")
+        if detail is None and isinstance(subtype, str) and subtype.strip():
+            detail = subtype
+        if detail is None or detail.strip().lower() == "success":
+            detail = "provider_error"
     return _turn_error("provider", str(detail))
 
 
