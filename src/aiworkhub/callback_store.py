@@ -57,6 +57,10 @@ _MANAGER_CHAT_SESSION_RE = re.compile(r"^mls-[0-9a-f]{32}$", re.I)
 # caught up with it.
 MANAGER_CHAT_SEAT_LEASE = timedelta(hours=12)
 MANAGER_CHAT_SEAT_CLOCK_SKEW = timedelta(minutes=5)
+# How long seed_missing_review_callbacks holds back a review card whose manager
+# wake was deferred to the quality-review chain (NF-2026-01220). Past this the
+# seed wakes the manager anyway, so a dead or held chain cannot strand the card.
+DEFERRED_REVIEW_WAKE_GRACE = timedelta(minutes=30)
 _MANAGER_CHAT_ACTIVITY_FIELDS = ("last_turn_at", "updated_at", "created_at")
 # ``manager_loop.SessionStore.append_event`` logs each event as one ASCII-escaped JSON line:
 # an envelope of about 100 bytes around a payload of at most
@@ -1889,6 +1893,29 @@ def seed_missing_review_callbacks(
             # blocked) so a failure substatus can never be delivered as
             # review_ready anywhere (NF-2026-00340).
             transition = normalize_callback_transition(raw_terminal) or "review_ready"
+            # A review whose manager wake was deliberately deferred until the
+            # quality-review chain finishes must not be pre-empted by a seeded
+            # review_ready row (NF-2026-01220): publish_manager_ready announces
+            # it. Only a young deferral is held back; a missing/unparseable or
+            # old recorded_at falls through to the last-resort wake below.
+            # ponytail: a dead or held review chain surfaces only after
+            # DEFERRED_REVIEW_WAKE_GRACE; upgrade path is an explicit release at
+            # fail_action / route hold in review_orchestrator.
+            terminal_review = card.get("terminal_review")
+            terminal_evidence = (
+                terminal_review.get("evidence") if isinstance(terminal_review, dict) else None
+            )
+            if (
+                isinstance(terminal_evidence, dict)
+                and isinstance(terminal_evidence.get("manager_callback_deferred"), dict)
+                and not card.get("manager_ready_receipt")
+            ):
+                deferred_at = _parse_instant(terminal_review.get("recorded_at"))
+                if (
+                    deferred_at is not None
+                    and datetime.now(timezone.utc) - deferred_at < DEFERRED_REVIEW_WAKE_GRACE
+                ):
+                    continue
         callback_origin = route_origin or str(row["origin_thread_id"] or card.get("origin_thread_id") or "").strip()
         if not callback_origin:
             continue

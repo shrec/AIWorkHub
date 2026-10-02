@@ -3127,6 +3127,36 @@ def publish_manager_ready(
             request_id=request_id,
             now=now,
         )
+        if not callback_enqueued:
+            # A premature review_ready row of this episode (seeded before the
+            # deferral existed, or after its grace window) already delivered
+            # and blocks the insert above. Re-arm the delivered rows so the
+            # manager-ready wake is still announced (NF-2026-01220).
+            rearmed = conn.execute(
+                "UPDATE callback_outbox SET state='pending', batch_id='', lease_id='', "
+                "lease_expires_at='', attempts=0, last_error='', updated_at=? "
+                "WHERE task_id=? AND episode_id=? AND transition='review_ready' "
+                "AND state='delivered'",
+                (now, task_id, str(claim_epoch)),
+            ).rowcount
+            if rearmed:
+                conn.execute(
+                    "INSERT INTO task_events(task_id, event, runner, payload_json, created_at) "
+                    "VALUES (?, 'callback_rearmed', 'system', ?, ?)",
+                    (
+                        task_id,
+                        json.dumps(
+                            {
+                                "transition": "review_ready",
+                                "episode_id": str(claim_epoch),
+                                "rows": rearmed,
+                            },
+                            sort_keys=True,
+                        ),
+                        now,
+                    ),
+                )
+                callback_enqueued = True
         conn.commit()
         return True, "review", callback_enqueued
 

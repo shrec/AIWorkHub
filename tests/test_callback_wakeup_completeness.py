@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 _SRC = Path(__file__).resolve().parents[1] / "src"
@@ -312,3 +313,108 @@ def test_dispatcher_health_not_ok_while_delivery_thread_dead(tmp_path):
         assert "delivery_thread_not_running" in health["problems"]
     finally:
         dispatcher.stop()
+
+
+# --- NF-2026-01220: a young deferred review wake is not pre-empted ---------
+
+def _defer_review_wake(conn, task_id: str, recorded_at, *, receipt=None) -> None:
+    """Record the terminal_review that process_launcher writes when the manager
+    wake is deferred to the quality-review chain."""
+    row = conn.execute("SELECT card_json FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+    card = json.loads(row["card_json"])
+    terminal_review = {
+        "substatus": card["terminal_substatus"],
+        "evidence": {
+            "manager_callback_deferred": {"reason": "system_quality_review_pending"},
+        },
+    }
+    if recorded_at is not None:
+        terminal_review["recorded_at"] = recorded_at
+    card["terminal_review"] = terminal_review
+    if receipt is not None:
+        card["manager_ready_receipt"] = receipt
+    conn.execute(
+        "UPDATE tasks SET card_json=? WHERE task_id=?",
+        (json.dumps(card, ensure_ascii=False, sort_keys=True), task_id),
+    )
+    conn.commit()
+
+
+def _deferred_review_age(age: timedelta) -> str:
+    return (datetime.now(timezone.utc) - age).isoformat()
+
+
+def _deferred_review_rows(conn, task_id: str) -> list[tuple[str, str, str, str]]:
+    return [
+        (str(r["provider"]), str(r["origin_thread_id"]), str(r["transition"]), str(r["state"]))
+        for r in conn.execute(
+            "SELECT provider, origin_thread_id, transition, state FROM callback_outbox "
+            "WHERE task_id=? ORDER BY outbox_id",
+            (task_id,),
+        ).fetchall()
+    ]
+
+
+def _deferred_review_events(conn, task_id: str) -> list[str]:
+    return [
+        str(r["event"])
+        for r in conn.execute(
+            "SELECT event FROM task_events WHERE task_id=?", (task_id,)
+        ).fetchall()
+    ]
+
+
+def test_seed_skips_young_deferred_review_wake(tmp_path):
+    conn = _db(tmp_path)
+    _insert_task(conn, "TASK_YOUNG", "thread-young", claim_epoch=1)
+    _defer_review_wake(conn, "TASK_YOUNG", _deferred_review_age(timedelta(0)))
+
+    assert callback_store.seed_missing_review_callbacks(conn, provider="codex") == 0
+    assert _deferred_review_rows(conn, "TASK_YOUNG") == []
+    assert _deferred_review_events(conn, "TASK_YOUNG") == []
+
+
+def test_seed_wakes_old_or_undated_deferred_review(tmp_path):
+    conn = _db(tmp_path)
+    grace = callback_store.DEFERRED_REVIEW_WAKE_GRACE
+    cases = {
+        "TASK_OLD": _deferred_review_age(2 * grace),
+        "TASK_UNDATED": None,
+        "TASK_GARBLED": "not-a-timestamp",
+    }
+    for task_id, recorded_at in cases.items():
+        _insert_task(conn, task_id, f"thread-{task_id}", claim_epoch=1)
+        _defer_review_wake(conn, task_id, recorded_at)
+
+    assert callback_store.seed_missing_review_callbacks(conn, provider="codex") == 3
+    for task_id in cases:
+        assert _deferred_review_rows(conn, task_id) == [
+            ("codex", f"thread-{task_id}", "review_ready", "pending")
+        ]
+
+
+def test_seed_deferred_review_guard_leaves_other_rows_unchanged(tmp_path):
+    conn = _db(tmp_path)
+    young = _deferred_review_age(timedelta(0))
+    # Already manager-ready: the deferral is settled, so the seed behaves as today.
+    _insert_task(conn, "TASK_READY", "thread-ready", claim_epoch=1)
+    _defer_review_wake(conn, "TASK_READY", young, receipt={"manager_ready": {"chain_id": "c"}})
+    # A review card without the deferral key.
+    _insert_task(conn, "TASK_PLAIN", "thread-plain", claim_epoch=1)
+    # A blocked card is never held back, whatever its deferral and age.
+    _insert_task(
+        conn, "TASK_BLOCKED", "thread-blocked",
+        status="blocked", terminal_substatus="blocked", claim_epoch=1,
+    )
+    _defer_review_wake(conn, "TASK_BLOCKED", young)
+
+    assert callback_store.seed_missing_review_callbacks(conn, provider="codex") == 3
+    assert _deferred_review_rows(conn, "TASK_READY") == [
+        ("codex", "thread-ready", "review_ready", "pending")
+    ]
+    assert _deferred_review_rows(conn, "TASK_PLAIN") == [
+        ("codex", "thread-plain", "review_ready", "pending")
+    ]
+    assert _deferred_review_rows(conn, "TASK_BLOCKED") == [
+        ("codex", "thread-blocked", "blocked", "pending")
+    ]

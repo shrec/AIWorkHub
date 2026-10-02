@@ -15,6 +15,7 @@ _SRC = Path(__file__).resolve().parents[1] / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
+from aiworkhub import callback_store  # noqa: E402
 from aiworkhub import task_store  # noqa: E402
 from aiworkhub import review_lifecycle  # noqa: E402
 
@@ -1965,3 +1966,201 @@ def test_publish_manager_ready_rejects_unauthenticated_stale_receipt(
     assert (ok, status, enqueued) == (False, "manager_ready_receipt_conflict", False)
     stored = task_store.get_task(repo, "TASK")
     assert (stored or {}).get("manager_ready_receipt") == forged_stale
+
+
+# --- NF-2026-01220: the manager-ready wake is always announced -------------
+
+_REARM_ORIGIN = "thread-rearm"
+_REARM_MANAGER_CHAT_ORIGIN = "mls-" + "0" * 32
+
+
+def _manager_ready_rearm_episode(tmp_path: Path) -> tuple[Path, Path]:
+    """One authenticated review episode (claim 1) bound to a codex route."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    task_store.initialize_repository(repo)
+    _readiness, db_path = task_store._require_ready(repo)
+    _complete_authenticated_chain(
+        db_path,
+        target_task_id="TASK",
+        target_request_id="req-a",
+        claim_epoch="1",
+        packet_sha256="a" * 64,
+        candidate_sha256="b" * 64,
+    )
+    _seed_review_ready_episode(repo, "TASK", request_id="req-a", claim_epoch="1")
+    conn = sqlite3.connect(db_path)
+    try:
+        card = json.loads(
+            conn.execute("SELECT card_json FROM tasks WHERE task_id='TASK'").fetchone()[0]
+        )
+        card["coordinator_provider"] = "codex"
+        conn.execute(
+            "UPDATE tasks SET origin_thread_id=?, card_json=? WHERE task_id='TASK'",
+            (_REARM_ORIGIN, json.dumps(card)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return repo, db_path
+
+
+def _insert_manager_ready_rearm_outbox(
+    db_path: Path,
+    *,
+    state: str,
+    task_id: str = "TASK",
+    provider: str = "codex",
+    origin: str = _REARM_ORIGIN,
+    transition: str = "review_ready",
+    episode_id: str = "1",
+) -> None:
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO callback_outbox(task_id, provider, origin_thread_id, transition, "
+            "episode_id, state, batch_id, lease_id, lease_expires_at, attempts, last_error, "
+            "created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                task_id,
+                provider,
+                origin,
+                transition,
+                episode_id,
+                state,
+                "batch-old",
+                "lease-old",
+                "2026-07-22T00:05:00+00:00",
+                2,
+                "old-error",
+                "2026-07-22T00:00:00+00:00",
+                "2026-07-22T00:00:00+00:00",
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _manager_ready_rearm_rows(db_path: Path) -> list[dict[str, Any]]:
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        return [
+            dict(row)
+            for row in conn.execute("SELECT * FROM callback_outbox ORDER BY outbox_id")
+        ]
+    finally:
+        conn.close()
+
+
+def _manager_ready_rearm_events(db_path: Path) -> int:
+    conn = sqlite3.connect(db_path)
+    try:
+        return int(
+            conn.execute(
+                "SELECT COUNT(*) FROM task_events WHERE event='callback_rearmed'"
+            ).fetchone()[0]
+        )
+    finally:
+        conn.close()
+
+
+def test_publish_manager_ready_rearm_inserts_row_when_none_exists(tmp_path: Path) -> None:
+    repo, db_path = _manager_ready_rearm_episode(tmp_path)
+
+    result = task_store.publish_manager_ready(
+        repo, task_id="TASK", request_id="req-a", claim_epoch="1"
+    )
+
+    assert result == (True, "review", True)
+    rows = _manager_ready_rearm_rows(db_path)
+    assert [
+        (r["provider"], r["origin_thread_id"], r["transition"], r["episode_id"], r["state"])
+        for r in rows
+    ] == [("codex", _REARM_ORIGIN, "review_ready", "1", "pending")]
+    assert _manager_ready_rearm_events(db_path) == 0
+
+
+def test_publish_manager_ready_rearm_resets_delivered_same_episode_rows(
+    tmp_path: Path,
+) -> None:
+    repo, db_path = _manager_ready_rearm_episode(tmp_path)
+    # The premature seeded wake and its Manager Chat copy were already delivered.
+    _insert_manager_ready_rearm_outbox(db_path, state="delivered")
+    _insert_manager_ready_rearm_outbox(
+        db_path,
+        state="delivered",
+        provider="manager_chat",
+        origin=_REARM_MANAGER_CHAT_ORIGIN,
+    )
+
+    result = task_store.publish_manager_ready(
+        repo, task_id="TASK", request_id="req-a", claim_epoch="1"
+    )
+
+    assert result == (True, "review", True)
+    rows = _manager_ready_rearm_rows(db_path)
+    assert len(rows) == 2
+    assert [(r["provider"], r["origin_thread_id"]) for r in rows] == [
+        ("codex", _REARM_ORIGIN),
+        ("manager_chat", _REARM_MANAGER_CHAT_ORIGIN),
+    ]
+    for row in rows:
+        assert row["state"] == "pending"
+        assert (row["batch_id"], row["lease_id"], row["lease_expires_at"]) == ("", "", "")
+        assert row["attempts"] == 0
+    assert _manager_ready_rearm_events(db_path) == 1
+
+    conn = callback_store.open_db(db_path)
+    try:
+        batch = callback_store.claim_pending_callback_batch(
+            conn, lease_seconds=30, provider="codex", origin_thread_id=_REARM_ORIGIN
+        )
+    finally:
+        conn.close()
+    assert batch is not None
+    assert "TASK" in [member["task_id"] for member in batch["members"]]
+
+
+def test_publish_manager_ready_rearm_second_publish_is_noop(tmp_path: Path) -> None:
+    repo, db_path = _manager_ready_rearm_episode(tmp_path)
+    _insert_manager_ready_rearm_outbox(db_path, state="delivered")
+    first = task_store.publish_manager_ready(
+        repo, task_id="TASK", request_id="req-a", claim_epoch="1"
+    )
+    assert first == (True, "review", True)
+    # The re-armed wake is delivered again before the receipt is republished.
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("UPDATE callback_outbox SET state='delivered'")
+        conn.commit()
+    finally:
+        conn.close()
+    before = _manager_ready_rearm_rows(db_path)
+
+    second = task_store.publish_manager_ready(
+        repo, task_id="TASK", request_id="req-a", claim_epoch="1"
+    )
+
+    assert second == (True, "review", False)
+    assert _manager_ready_rearm_rows(db_path) == before
+    assert _manager_ready_rearm_events(db_path) == 1
+
+
+def test_publish_manager_ready_rearm_leaves_other_rows_untouched(tmp_path: Path) -> None:
+    repo, db_path = _manager_ready_rearm_episode(tmp_path)
+    for state in ("pending", "inflight", "superseded", "dead_letter"):
+        _insert_manager_ready_rearm_outbox(db_path, state=state)
+    _insert_manager_ready_rearm_outbox(db_path, state="delivered", episode_id="0")
+    _insert_manager_ready_rearm_outbox(db_path, state="delivered", transition="blocked")
+    _insert_manager_ready_rearm_outbox(db_path, state="delivered", task_id="OTHER")
+    before = _manager_ready_rearm_rows(db_path)
+
+    result = task_store.publish_manager_ready(
+        repo, task_id="TASK", request_id="req-a", claim_epoch="1"
+    )
+
+    assert result == (True, "review", False)
+    assert _manager_ready_rearm_rows(db_path) == before
+    assert _manager_ready_rearm_events(db_path) == 0
