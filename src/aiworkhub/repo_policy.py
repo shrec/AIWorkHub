@@ -877,7 +877,12 @@ def _provider_status(
             result["status"] = "consent_required"
         else:
             result["status"] = "access_unavailable"
-        result["reason"] = str(readiness.get("blocker_reason") or readiness.get("reason") or "")[:200]
+        result["reason"] = str(
+            readiness.get("blocker_reason")
+            or readiness.get("reason")
+            or result.get("reason")
+            or ""
+        )[:200]
         if result["status"] == READINESS_READY_UNVERIFIED:
             result["reason"] = f"quota_unobserved:{quota_state}"
         # Preserve only bounded, secret-free broker observability.  The UI can

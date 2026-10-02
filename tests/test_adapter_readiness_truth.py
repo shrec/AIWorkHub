@@ -39,6 +39,83 @@ def _ok_resolution() -> runtime_adapters.ExecutableResolution:
     )
 
 
+def _patch_provider_dependencies(monkeypatch, resolution, readiness) -> None:
+    monkeypatch.setattr(
+        runtime_adapters, "resolve_executable", lambda adapter_id: resolution
+    )
+    monkeypatch.setattr(
+        "aiworkhub.claude_auth.auth_status", lambda executable: dict(readiness)
+    )
+
+
+def test_provider_reason_keeps_executable_cause_when_readiness_reason_empty(monkeypatch):
+    resolution = runtime_adapters.ExecutableResolution(
+        adapter_id="claude_cli",
+        executable="/nonexistent/claude",
+        ok=False,
+        reason="executable_not_found",
+    )
+    _patch_provider_dependencies(
+        monkeypatch,
+        resolution,
+        {
+            "launchable": False,
+            "access_observed": True,
+            "blocker_reason": "",
+            "reason": "",
+            "quota_observed": False,
+            "quota_state": "probe_marker",
+        },
+    )
+    row = repo_policy._provider_status(
+        Path("."),
+        "claude_cli",
+        _POLICY,
+        _native_cli_sandbox_backend(),
+        "",
+        {"providers": {}, "adapters": {}, "models": {}},
+    )
+    assert row["access_observed"] is True
+    assert row["quota_state"] == "probe_marker"
+    assert row["installed"] is False
+    assert row["launchable"] is False
+    assert row["status"] == "access_unavailable"
+    assert row["reason"] == "executable_not_found"
+
+
+def test_provider_reason_prefers_nonempty_readiness_reason_and_stays_bounded(monkeypatch):
+    resolution = runtime_adapters.ExecutableResolution(
+        adapter_id="claude_cli",
+        executable="/usr/bin/claude",
+        ok=True,
+        reason="resolution_reason_must_not_win",
+    )
+    _patch_provider_dependencies(
+        monkeypatch,
+        resolution,
+        {
+            "launchable": False,
+            "access_observed": True,
+            "blocker_reason": "",
+            "reason": "r" * 250,
+            "quota_observed": False,
+            "quota_state": "probe_marker",
+        },
+    )
+    row = repo_policy._provider_status(
+        Path("."),
+        "claude_cli",
+        _POLICY,
+        _native_cli_sandbox_backend(),
+        "",
+        {"providers": {}, "adapters": {}, "models": {}},
+    )
+    assert row["quota_state"] == "probe_marker"
+    assert row["launchable"] is False
+    assert row["reason"] == "r" * 200
+    assert len(row["reason"]) == 200
+
+
 def _native_cli_sandbox_backend() -> str:
     """A sandbox_backend value that does NOT itself fail-close a native CLI.
 
