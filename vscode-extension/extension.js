@@ -3730,6 +3730,15 @@ function languageModelTextPart(value) {
   return typeof vscode.LanguageModelTextPart === "function" ? new vscode.LanguageModelTextPart(String(value)) : { value: String(value) };
 }
 
+function languageModelResponseText(part) {
+  if (typeof part === "string") return part;
+  if (!part || typeof part.value !== "string") return "";
+  const isText = typeof vscode.LanguageModelTextPart === "function"
+    ? part instanceof vscode.LanguageModelTextPart
+    : part.constructor === Object;
+  return isText ? part.value : "";
+}
+
 function languageModelToolResultPart(callId, value) {
   const content = [languageModelTextPart(JSON.stringify(value))];
   return new vscode.LanguageModelToolResultPart(callId, content);
@@ -4866,8 +4875,8 @@ async function collectVscodeLmResponseText(response, onProviderPart = null, canc
       if (typeof onProviderPart === "function") {
         try { onProviderPart(); } catch (_err) { /* liveness only */ }
       }
-      if (part && typeof part.value === "string") textParts.push(part.value);
-      else if (typeof part === "string") textParts.push(part);
+      const responseText = languageModelResponseText(part);
+      if (responseText) textParts.push(responseText);
       else if (observations[channel].length < 4) {
         const value = part && part.value;
         observations[channel].push({
@@ -6439,8 +6448,10 @@ async function runVscodeLmAgent(
       }
       assistantParts.push(part);
       if (isLanguageModelToolCallPart(part)) calls.push(part);
-      else if (part && typeof part.value === "string") textParts.push(part.value);
-      else if (typeof part === "string") textParts.push(part);
+      else {
+        const responseText = languageModelResponseText(part);
+        if (responseText) textParts.push(responseText);
+      }
     }
     if (startedWithSourceGraph) postSourceTurns += 1;
     if (forceStagedEdit && calls.some((call) => call.name !== VSCODE_LM_STAGE_EDIT_TOOL)) {

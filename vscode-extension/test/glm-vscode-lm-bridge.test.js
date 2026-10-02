@@ -6700,7 +6700,54 @@ async function nf1252FinalSchemaIsExplicitAndCorrectable() {
   }
 }
 
+async function nf1255TypedReasoningCannotBecomeProtocolText() {
+  class LanguageModelTextPart { constructor(value) { this.value = value; } }
+  class LanguageModelThinkingPart { constructor(value) { this.value = value; } }
+  class LanguageModelDataPart { constructor(value) { this.value = value; } }
+  const previous = fakeVscode.LanguageModelTextPart;
+  fakeVscode.LanguageModelTextPart = LanguageModelTextPart;
+  try {
+    const final = (summary) => ({
+      schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+      summary, edits: [], creates: [],
+    });
+    for (const native of [false, true]) {
+      let turns = 0;
+      let progress = 0;
+      const model = {
+        capabilities: { toolCalling: native },
+        sendRequest: async () => {
+          turns += 1;
+          return { stream: (async function* stream() {
+            yield new LanguageModelThinkingPart("Reasoning before the answer");
+            yield new LanguageModelTextPart(JSON.stringify(final("actual answer")));
+            yield new LanguageModelThinkingPart(JSON.stringify(final("reasoning example")));
+            yield new LanguageModelDataPart(JSON.stringify(final("data example")));
+          }()) };
+        },
+      };
+      const request = {
+        requestId: (native ? "a" : "b").repeat(32),
+        request_kind: "worker", prompt: "readonly bounded task",
+        allowedWrites: [], path_contracts: {},
+        initial_source_graph_request: { mode: "focus", query: "bounded readonly task" },
+        initial_source_graph_result: { ok: true, content: "indexed task contract" },
+      };
+      const run = native ? internals.runVscodeLmAgent : internals.runVscodeLmTextProtocol;
+      const result = await run(model, request, undefined,
+        async () => ({ ok: true, content: "graph" }), null, () => { progress += 1; });
+      assert.deepStrictEqual(JSON.parse(result), final("actual answer"));
+      assert.strictEqual(turns, 1);
+      assert.ok(progress >= 4, "typed non-text parts still count as provider progress");
+    }
+  } finally {
+    if (previous === undefined) delete fakeVscode.LanguageModelTextPart;
+    else fakeVscode.LanguageModelTextPart = previous;
+  }
+}
+
 async function main() {
+  await nf1255TypedReasoningCannotBecomeProtocolText();
   await nf1252FinalSchemaIsExplicitAndCorrectable();
   await nf998LiteralWhitespaceDoesNotCollide();
   await nf998BundleTypeChangesSourceGraphBoundary();
