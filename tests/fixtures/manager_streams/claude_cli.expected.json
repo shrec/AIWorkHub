@@ -1,0 +1,100 @@
+[
+ {
+  "payload": {
+   "call_id": "toolu_01WfLYjzgvJuyR56B2bo3ZhS",
+   "command": "git --version",
+   "cwd": "",
+   "exit_code": null,
+   "output_bytes": 0,
+   "output_tail": "",
+   "status": "running"
+  },
+  "type": "command"
+ },
+ {
+  "payload": {
+   "call_id": "toolu_01WfLYjzgvJuyR56B2bo3ZhS",
+   "command": "git --version",
+   "cwd": "",
+   "exit_code": null,
+   "output_bytes": 28,
+   "output_tail": "git version 2.45.2.windows.1",
+   "status": "completed"
+  },
+  "type": "command"
+ },
+ {
+  "payload": {
+   "added": 1,
+   "call_id": "toolu_01AqM8mk2mUeutWHV17HGM9n",
+   "diff": "--- a/<workdir>\\notes.txt\n+++ b/<workdir>\\notes.txt\n@@ -0,0 +1 @@\n+alpha",
+   "kind": "add",
+   "path": "<workdir>\\notes.txt",
+   "removed": 0
+  },
+  "type": "file_change"
+ },
+ {
+  "payload": {
+   "added": 1,
+   "call_id": "toolu_011FMZH9eVN1oBcu71SwQvXz",
+   "diff": "--- a/<workdir>\\notes.txt\n+++ b/<workdir>\\notes.txt\n@@ -1 +1 @@\n-alpha\n+beta",
+   "kind": "update",
+   "path": "<workdir>\\notes.txt",
+   "removed": 1
+  },
+  "type": "file_change"
+ },
+ {
+  "payload": {
+   "text": "done"
+  },
+  "type": "assistant_text"
+ },
+ {
+  "payload": {
+   "usage": {
+    "cache_read": 120535,
+    "cache_write": 40648,
+    "context_fill": 0.0406,
+    "context_window": 1000000,
+    "input": 8,
+    "output": 351,
+    "raw": {
+     "cache_creation": {
+      "ephemeral_1h_input_tokens": 40648,
+      "ephemeral_5m_input_tokens": 0
+     },
+     "cache_creation_input_tokens": 40648,
+     "cache_read_input_tokens": 120535,
+     "inference_geo": "not_available",
+     "input_tokens": 8,
+     "iterations": [
+      {
+       "cache_creation": {
+        "ephemeral_1h_input_tokens": 265,
+        "ephemeral_5m_input_tokens": 0
+       },
+       "cache_creation_input_tokens": 265,
+       "cache_read_input_tokens": 40383,
+       "input_tokens": 2,
+       "output_tokens": 3,
+       "type": "message"
+      }
+     ],
+     "output_tokens": 351,
+     "output_tokens_details": {
+      "thinking_tokens": 10
+     },
+     "server_tool_use": {
+      "web_fetch_requests": 0,
+      "web_search_requests": 0
+     },
+     "service_tier": "standard",
+     "speed": "standard"
+    }
+   }
+  },
+  "type": "turn_end"
+ }
+]

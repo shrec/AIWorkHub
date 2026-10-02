@@ -43,7 +43,10 @@ SCHEMA_ID = "aiworkhub.manager_loop.v2"
 LEGACY_SCHEMA_ID = "aiworkhub.manager_loop.v1"
 STATE_DIRNAME = "manager_loop"
 SESSION_STATUSES = frozenset({"active", "closed"})
-EVENT_TYPES = frozenset({"assistant_text", "reasoning", "tool_call", "tool_result", "turn_end", "error"})
+EVENT_TYPES = frozenset({
+    "assistant_text", "reasoning", "tool_call", "tool_result", "command", "file_change",
+    "turn_end", "error",
+})
 OPEN_CARD_STATUSES = ("pending", "processing", "review", "blocked")
 DEFAULT_BRIEF_BYTES = 12 * 1024
 MIN_BRIEF_BYTES = 256
@@ -1048,7 +1051,7 @@ class ManagerOrchestrator:
     def _record(
         self, session: ManagerSession, turn: int, kind: str, payload: Mapping[str, Any]
     ) -> dict[str, Any]:
-        event = {"at": self._clock(), "turn": turn, "type": kind, "payload": payload}
+        event = {"at": self._clock(), "turn": turn, "type": kind, "v": 3, "payload": payload}
         return self.store.append_event(session.session_id, event)
 
     @staticmethod

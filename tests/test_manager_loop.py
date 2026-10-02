@@ -196,6 +196,29 @@ def test_start_and_send_persist_every_event(make, tmp_path: Path) -> None:
     assert _IDEMPOTENCY_RE.fullmatch(turn_event["idempotency_key"])
     assert "hello" in turn_event["content"] and "ack: hello" in turn_event["content"]
 
+def test_event_types_gained_command_and_file_change() -> None:
+    assert {"command", "file_change"} <= ml.EVENT_TYPES
+
+
+def test_new_records_carry_v3_and_an_unversioned_record_still_reads(make, tmp_path: Path) -> None:
+    harness = make()
+    session = harness.orch.start("fake", "model-a")
+    harness.orch.send("hello")
+
+    events = harness.store.events(session.session_id)
+    assert events and all(event["v"] == 3 for event in events)
+
+    log = tmp_path / "manager_loop" / "events" / f"{session.session_id}.jsonl"
+    legacy = json.dumps({
+        "at": "2026-01-01T00:00:00+00:00", "turn": 0, "seq": 0,
+        "type": "assistant_text", "payload": {"text": "legacy"},
+    })
+    log.write_text(legacy + "\n" + log.read_text(encoding="utf-8"), encoding="utf-8")
+
+    reread = harness.store.events(session.session_id)
+    assert reread[0]["payload"] == {"text": "legacy"}
+    assert "v" not in reread[0]
+
 
 def test_one_active_session_per_repository_through_the_lock(make) -> None:
     ticker = Ticker()

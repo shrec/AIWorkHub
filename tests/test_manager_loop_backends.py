@@ -246,7 +246,7 @@ def test_every_provider_event_maps_to_its_loop_event(tmp_path: Path):
     claude = [
         {"type": "assistant", "message": {"content": [
             {"type": "text", "text": "thinking out loud"},
-            {"type": "tool_use", "name": "Read", "input": {"path": "a.py"}},
+            {"type": "tool_use", "id": "t1", "name": "Read", "input": {"path": "a.py"}},
         ]}},
         {"type": "user", "message": {"content": [
             {"type": "tool_result", "tool_use_id": "t1", "content": "ok"},
@@ -259,33 +259,108 @@ def test_every_provider_event_maps_to_its_loop_event(tmp_path: Path):
     events = drain(cli.send("go"))
     assert kinds(events) == ["assistant_text", "tool_call", "tool_result", "turn_end"]
     assert events[0]["payload"]["text"] == "thinking out loud"
-    assert events[1]["payload"] == {"name": "Read", "input": {"path": "a.py"}}
-    assert events[2]["payload"] == {"name": "t1", "output": "ok"}
-    assert events[3]["payload"]["usage"] == {"input_tokens": 11, "output_tokens": 2}
+    assert events[1]["payload"] == {"call_id": "t1", "name": "Read", "input": {"path": "a.py"}}
+    assert events[2]["payload"] == {"call_id": "t1", "name": "Read", "output": "ok", "is_error": False}
+    assert events[3]["payload"]["usage"] == {
+        "input": 11, "cache_read": 0, "cache_write": 0, "output": 2,
+        "context_window": None, "context_fill": None,
+        "raw": {"input_tokens": 11, "output_tokens": 2},
+    }
     cli.close()
 
 
 def test_codex_and_opencode_streams_map_to_the_same_loop_events():
     codex = [
         {"type": "item.completed", "item": {"type": "agent_message", "text": "codex reply"}},
-        {"type": "item.started", "item": {"type": "command_execution", "command": "ls"}},
-        {"type": "item.completed", "item": {"type": "command_execution", "output": "a\nb"}},
+        {"type": "item.started", "item": {"id": "c1", "type": "command_execution", "command": "ls"}},
+        {"type": "item.completed", "item": {
+            "id": "c1", "type": "command_execution", "command": "ls",
+            "aggregated_output": "a\nb", "exit_code": 0,
+        }},
         {"type": "turn.completed", "usage": {"input_tokens": 3}},
     ]
     translated = [event for raw in codex for event in mlb.translate("codex_cli", raw)]
-    assert kinds(translated) == ["assistant_text", "tool_call", "tool_result", "turn_end"]
-    assert translated[3]["payload"]["usage"] == {"input_tokens": 3}
+    assert kinds(translated) == ["assistant_text", "command", "command", "turn_end"]
+    assert translated[1]["payload"] == {
+        "call_id": "c1", "command": "ls", "cwd": "", "status": "running",
+        "exit_code": None, "output_tail": "", "output_bytes": 0,
+    }
+    assert translated[2]["payload"]["status"] == "completed"
+    assert translated[2]["payload"]["output_tail"] == "a\nb"
+    assert translated[3]["payload"]["usage"]["raw"] == {"input_tokens": 3}
+    assert translated[3]["payload"]["usage"]["context_window"] is None
 
     opencode = [
         {"type": "text", "sessionID": "ses_1", "part": {"text": "opencode reply"}},
-        {"type": "tool", "part": {"tool": "bash", "state": {"status": "running", "input": {}}}},
-        {"type": "tool", "part": {"tool": "bash", "state": {"status": "completed", "output": "hi"}}},
+        {"type": "tool", "part": {"id": "o1", "tool": "bash", "state": {"status": "running", "input": {}}}},
+        {"type": "tool", "part": {"id": "o1", "tool": "bash", "state": {"status": "completed", "output": "hi"}}},
         {"type": "step_finish", "tokens": {"input": 4, "output": 1}},
     ]
-    translated = [event for raw in opencode for event in mlb.translate("opencode_cli", raw)]
-    assert kinds(translated) == ["assistant_text", "tool_call", "tool_result", "turn_end"]
-    assert translated[3]["payload"]["usage"] == {"input": 4, "output": 1}
+    context = mlb.TurnContext()
+    translated = [event for raw in opencode for event in mlb.translate("opencode_cli", raw, context)]
+    assert kinds(translated) == ["assistant_text", "command", "command"]
+    translated.extend(mlb.flush("opencode_cli", context))
+    assert kinds(translated) == ["assistant_text", "command", "command", "turn_end"]
+    assert translated[3]["payload"]["usage"]["input"] == 4
+    assert translated[3]["payload"]["usage"]["output"] == 1
     assert mlb.conversation_id_of(opencode[0]) == "ses_1"
+
+
+def test_an_opencode_turn_through_the_backend_emits_exactly_one_summed_turn_end(tmp_path: Path):
+    opencode = [
+        {"type": "tool", "part": {
+            "id": "s1", "tool": "bash",
+            "state": {"status": "completed", "input": {"command": "git --version"}, "output": "git 2.40"},
+        }},
+        {"type": "step_finish", "part": {"tokens": {
+            "input": 10, "output": 2, "reasoning": 0, "cache": {"read": 1, "write": 0},
+        }}},
+        {"type": "tool", "part": {
+            "id": "s2", "tool": "write",
+            "state": {
+                "status": "completed", "input": {"path": "notes.txt", "content": "hi"},
+                "output": "Created notes.txt",
+            },
+        }},
+        {"type": "step_finish", "part": {"tokens": {
+            "input": 20, "output": 3, "reasoning": 0, "cache": {"read": 2, "write": 0},
+        }}},
+        {"type": "text", "part": {"text": "done"}},
+        {"type": "step_finish", "part": {"tokens": {
+            "input": 5, "output": 1, "reasoning": 0, "cache": {"read": 0, "write": 0},
+        }}},
+    ]
+    fake = FakeCli(tmp_path, [opencode])
+    cli = backend(fake, backend_id="opencode_cli")
+    cli.start("brief")
+    events = drain(cli.send("go"))
+
+    assert kinds(events) == ["command", "file_change", "assistant_text", "turn_end"]
+    usage = events[-1]["payload"]["usage"]
+    assert (usage["input"], usage["cache_read"], usage["output"]) == (35, 3, 6)
+    assert usage["raw"] == {
+        "steps": 3,
+        "last": {"input": 5, "output": 1, "reasoning": 0, "cache": {"read": 0, "write": 0}},
+    }
+    cli.close()
+
+
+_OPENCODE_STEP = {"type": "step_finish", "part": {"tokens": {"input": 10, "output": 2}}}
+
+
+def test_a_non_zero_exit_opencode_turn_gets_no_turn_end_from_flush(tmp_path: Path):
+    cli = backend(FakeCli(tmp_path, [[_OPENCODE_STEP]], exit_code=3), backend_id="opencode_cli")
+    cli.start("brief")
+    assert kinds(drain(cli.send("go"))) == ["error"]
+    cli.close()
+
+
+def test_an_opencode_turn_that_yielded_an_error_gets_no_turn_end_from_flush(tmp_path: Path):
+    failed = [_OPENCODE_STEP, {"type": "error", "error": {"message": "boom"}}]
+    cli = backend(FakeCli(tmp_path, [failed]), backend_id="opencode_cli")
+    cli.start("brief")
+    assert kinds(drain(cli.send("go"))) == ["error"]
+    cli.close()
 
 
 def test_model_reasoning_is_captured_not_dropped():
@@ -852,3 +927,18 @@ def test_seat_turn_passes_merged_env_to_spawn(tmp_path: Path) -> None:
     # The backend forwards seat bindings untouched; _spawn_cli merges them
     # over the inherited environment (SystemRoot/PATH) at spawn time.
     assert seen["env"] == {"SEAT_BINDING": "x"}
+
+
+def test_stream_tokens_keep_thinking_on_without_a_level_and_normalize_the_level() -> None:
+    assert mlb.manager_stream_tokens("opencode_cli") == ["--thinking"]
+    assert mlb.apply_manager_stream_tokens("opencode_cli", ["opencode", "run", "hi"]) == [
+        "opencode", "run", "--thinking", "hi",
+    ]
+    assert mlb.apply_manager_stream_tokens("claude_cli", ["claude", "-p"], " High ") == [
+        "claude", "-p", "--include-partial-messages", "--effort", "high",
+    ]
+    effort = ["-c", 'model_reasoning_effort="high"']
+    assert mlb.apply_manager_stream_tokens("codex_cli", ["codex", "--json"], "high") == [
+        "codex", "--json", *effort,
+    ]
+    assert mlb.apply_manager_stream_tokens("codex_cli", [], "high") == effort

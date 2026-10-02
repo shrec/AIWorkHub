@@ -1,0 +1,73 @@
+[
+ {
+  "payload": {
+   "text": "I'll run `git --version`, then create and edit `notes.txt`."
+  },
+  "type": "assistant_text"
+ },
+ {
+  "payload": {
+   "call_id": "call-00000000-0000-4000-8000-000000000002-0",
+   "command": "git --version",
+   "cwd": "",
+   "exit_code": 0,
+   "output_bytes": 29,
+   "output_tail": "git version 2.45.2.windows.1\n",
+   "status": "completed"
+  },
+  "type": "command"
+ },
+ {
+  "payload": {
+   "added": 1,
+   "call_id": "call-00000000-0000-4000-8000-000000000004-1",
+   "diff": "--- a/<workdir>\\notes.txt\n+++ b/<workdir>\\notes.txt\n@@ -0,0 +1 @@\n+alpha",
+   "kind": "add",
+   "path": "<workdir>\\notes.txt",
+   "removed": 0
+  },
+  "type": "file_change"
+ },
+ {
+  "payload": {
+   "added": 1,
+   "call_id": "call-00000000-0000-4000-8000-000000000006-2",
+   "diff": "--- a/<workdir>\\notes.txt\n+++ b/<workdir>\\notes.txt\n@@ -1 +1 @@\n-alpha\n+beta",
+   "kind": "update",
+   "path": "<workdir>\\notes.txt",
+   "removed": 1
+  },
+  "type": "file_change"
+ },
+ {
+  "payload": {
+   "text": "done"
+  },
+  "type": "assistant_text"
+ },
+ {
+  "payload": {
+   "usage": {
+    "cache_read": 16128,
+    "cache_write": 0,
+    "context_fill": null,
+    "context_window": null,
+    "input": 8176,
+    "output": 107,
+    "raw": {
+     "last": {
+      "cache": {
+       "read": 8064,
+       "write": 0
+      },
+      "input": 127,
+      "output": 43,
+      "reasoning": 10
+     },
+     "steps": 3
+    }
+   }
+  },
+  "type": "turn_end"
+ }
+]

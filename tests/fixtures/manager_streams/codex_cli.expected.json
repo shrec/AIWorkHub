@@ -1,0 +1,86 @@
+[
+ {
+  "payload": {
+   "call_id": "item_0",
+   "command": "\"C:\\\\Program Files\\\\PowerShell\\\\7\\\\pwsh.exe\" -Command 'git --version'",
+   "cwd": "",
+   "exit_code": null,
+   "output_bytes": 0,
+   "output_tail": "",
+   "status": "running"
+  },
+  "type": "command"
+ },
+ {
+  "payload": {
+   "call_id": "item_0",
+   "command": "\"C:\\\\Program Files\\\\PowerShell\\\\7\\\\pwsh.exe\" -Command 'git --version'",
+   "cwd": "",
+   "exit_code": 0,
+   "output_bytes": 29,
+   "output_tail": "git version 2.45.2.windows.1\n",
+   "status": "completed"
+  },
+  "type": "command"
+ },
+ {
+  "payload": {
+   "text": "I’m creating `notes.txt` with `alpha`, then I’ll immediately update it to `beta`."
+  },
+  "type": "assistant_text"
+ },
+ {
+  "payload": {
+   "added": 0,
+   "call_id": "item_2",
+   "diff": "",
+   "kind": "add",
+   "path": "<workdir>\\notes.txt",
+   "removed": 0
+  },
+  "type": "file_change"
+ },
+ {
+  "payload": {
+   "text": "`notes.txt` exists now; I’m making the requested one-line edit."
+  },
+  "type": "assistant_text"
+ },
+ {
+  "payload": {
+   "added": 0,
+   "call_id": "item_4",
+   "diff": "",
+   "kind": "update",
+   "path": "<workdir>\\notes.txt",
+   "removed": 0
+  },
+  "type": "file_change"
+ },
+ {
+  "payload": {
+   "text": "done"
+  },
+  "type": "assistant_text"
+ },
+ {
+  "payload": {
+   "usage": {
+    "cache_read": 42496,
+    "cache_write": 0,
+    "context_fill": null,
+    "context_window": null,
+    "input": 15626,
+    "output": 680,
+    "raw": {
+     "cache_write_input_tokens": 0,
+     "cached_input_tokens": 42496,
+     "input_tokens": 58122,
+     "output_tokens": 680,
+     "reasoning_output_tokens": 516
+    }
+   }
+  },
+  "type": "turn_end"
+ }
+]

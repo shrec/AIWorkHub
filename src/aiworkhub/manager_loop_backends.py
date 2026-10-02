@@ -46,6 +46,8 @@ a worker is confined, the owner's manager seat is not.
 
 from __future__ import annotations
 
+import dataclasses
+import difflib
 import json
 import os
 import shutil
@@ -95,10 +97,106 @@ def _turn_error(source: str, detail: str) -> dict[str, Any]:
     return {"type": "error", "payload": payload}
 
 
-def _turn_end(usage: Any) -> dict[str, Any]:
+OUTPUT_TAIL_BYTES = 8 * 1024
+_CLAUDE_COMMAND_TOOLS = frozenset({"Bash"})
+_CLAUDE_EDIT_TOOLS = frozenset({"Edit", "MultiEdit", "Write"})
+
+
+@dataclasses.dataclass
+class TurnContext:
+    """What one turn's translator remembers between lines.
+
+    ``calls`` pairs an open tool call with its result across lines. Claude's
+    ``context_fill`` reads the LAST assistant call's usage and model, not the
+    turn total, so both are kept here too, refreshed from every ``assistant`` line.
+    """
+
+    calls: dict[str, dict[str, Any]] = dataclasses.field(default_factory=dict)
+    last_usage: dict[str, Any] = dataclasses.field(default_factory=dict)
+    model: str = ""
+    steps: dict[str, Any] = dataclasses.field(default_factory=dict)
+
+
+def _count(value: Any) -> int:
+    return int(value) if isinstance(value, (int, float)) and value > 0 else 0
+
+
+def _usage(
+    input_: Any, cache_read: Any, cache_write: Any, output: Any, window: Any,
+    raw: Mapping[str, Any], *, fill: int | None = None,
+) -> dict[str, Any]:
+    """Provider usage in the one shape the console and rotation read (spec §4).
+
+    ``fill`` is the already-summed numerator for ``context_fill``; ``None``
+    means it cannot be computed (no window, or no per-call usage to read it
+    from), never that it is zero.
+    """
+    counts = {
+        "input": _count(input_), "cache_read": _count(cache_read),
+        "cache_write": _count(cache_write), "output": _count(output),
+    }
+    size = _count(window)
+    fill_ratio = round(fill / size, 4) if size and fill is not None else None
+    return {**counts, "context_window": size or None, "context_fill": fill_ratio, "raw": dict(raw)}
+
+
+def _tail(text: str, limit: int = OUTPUT_TAIL_BYTES) -> str:
+    data = text.encode("utf-8")
+    return text if len(data) <= limit else data[-limit:].decode("utf-8", "ignore")
+
+
+def _result_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            str(block.get("text") or "") for block in content
+            if isinstance(block, Mapping) and block.get("type") == "text"
+        )
+    return "" if content is None else json.dumps(content, default=str)
+
+
+def _command(
+    call_id: str, command: str, *, status: str, exit_code: Any = None, output: str = "", cwd: str = "",
+) -> dict[str, Any]:
+    return {"type": "command", "payload": {
+        "call_id": call_id, "command": command, "cwd": cwd, "status": status,
+        "exit_code": exit_code if isinstance(exit_code, int) else None,
+        "output_tail": _tail(output), "output_bytes": len(output.encode("utf-8")),
+    }}
+
+
+def _file_change(call_id: str, path: str, pairs: list[tuple[str, str]], kind: str) -> dict[str, Any]:
+    """One file change; each (before, after) pair becomes one hunk of a unified diff."""
+    lines: list[str] = []
+    added = removed = 0
+    for before, after in pairs:
+        hunk = list(difflib.unified_diff(
+            before.splitlines(), after.splitlines(), f"a/{path}", f"b/{path}", lineterm="",
+        ))
+        body = hunk[2:]  # past the ---/+++ header; a content line "+++x" still counts as one added line
+        added += sum(1 for line in body if line.startswith("+"))
+        removed += sum(1 for line in body if line.startswith("-"))
+        lines.extend(body if lines else hunk)
+    return {"type": "file_change", "payload": {
+        "call_id": call_id, "path": path, "kind": kind, "diff": "\n".join(lines),
+        "added": added, "removed": removed,
+    }}
+
+
+def _tool_call(call_id: str, name: str, request: Any) -> dict[str, Any]:
+    return {"type": "tool_call", "payload": {"call_id": call_id, "name": name, "input": request}}
+
+
+def _tool_result(call_id: str, name: str, output: Any, failed: bool) -> dict[str, Any]:
+    return {"type": "tool_result", "payload": {
+        "call_id": call_id, "name": name, "output": output, "is_error": failed,
+    }}
+
+
+def _turn_end(usage: Mapping[str, Any] | None) -> dict[str, Any]:
     """The turn's final event; ``usage`` appears only when the provider reported it."""
-    reported = dict(usage) if isinstance(usage, Mapping) and usage else None
-    return {"type": "turn_end", "payload": {"usage": reported} if reported else {}}
+    return {"type": "turn_end", "payload": {"usage": dict(usage)} if usage else {}}
 
 
 def _assistant_text(value: Any) -> list[dict[str, Any]]:
@@ -116,55 +214,194 @@ def _mapping(value: Any) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
 
 
-def _claude_events(event: Mapping[str, Any]) -> list[dict[str, Any]]:
+def _claude_usage(event: Mapping[str, Any], context: TurnContext) -> dict[str, Any] | None:
+    """Turn totals from ``result.usage``; ``context_fill`` from the last call instead (W1-P1b)."""
+    usage = _mapping(event.get("usage"))
+    if not usage:
+        return None
+    model_usage = _mapping(event.get("modelUsage"))
+    if context.model and context.model in model_usage:
+        window = _mapping(model_usage[context.model]).get("contextWindow")
+    else:
+        windows = [_count(_mapping(entry).get("contextWindow")) for entry in model_usage.values()]
+        window = max(windows, default=0)
+    last = context.last_usage
+    fill = None
+    if last:
+        fill = (
+            _count(last.get("input_tokens"))
+            + _count(last.get("cache_read_input_tokens"))
+            + _count(last.get("cache_creation_input_tokens"))
+        )
+    return _usage(
+        usage.get("input_tokens"), usage.get("cache_read_input_tokens"),
+        usage.get("cache_creation_input_tokens"), usage.get("output_tokens"), window, usage, fill=fill,
+    )
+
+
+def _claude_tool_use(block: Mapping[str, Any], context: TurnContext) -> list[dict[str, Any]]:
+    call_id, name = str(block.get("id") or ""), str(block.get("name") or "")
+    context.calls[call_id] = {"name": name, "input": block.get("input")}
+    if name in _CLAUDE_COMMAND_TOOLS:
+        return [_command(call_id, str(_mapping(block.get("input")).get("command") or ""), status="running")]
+    if name in _CLAUDE_EDIT_TOOLS:
+        return []  # shown once its result proves the write happened
+    return [_tool_call(call_id, name, block.get("input"))]
+
+
+def _claude_file_changes(
+    call_id: str, name: str, request: Mapping[str, Any], output: str,
+) -> list[dict[str, Any]]:
+    path = str(request.get("file_path") or "")
+    if name == "Write":
+        kind = "add" if output.startswith("File created") else "update"
+        return [_file_change(call_id, path, [("", str(request.get("content") or ""))], kind)]
+    edits = request.get("edits") if name == "MultiEdit" else [request]
+    pairs = [
+        (str(e.get("old_string") or ""), str(e.get("new_string") or ""))
+        for e in edits or [] if isinstance(e, Mapping)
+    ]
+    return [_file_change(call_id, path, pairs, "update")]
+
+
+def _claude_tool_result(block: Mapping[str, Any], context: TurnContext) -> list[dict[str, Any]]:
+    call_id = str(block.get("tool_use_id") or "")
+    call = context.calls.pop(call_id, {"name": "", "input": None})
+    name, request, failed = call["name"], _mapping(call["input"]), bool(block.get("is_error"))
+    output = _result_text(block.get("content"))
+    if name in _CLAUDE_COMMAND_TOOLS:
+        status = "failed" if failed else "completed"
+        return [_command(call_id, str(request.get("command") or ""), status=status, output=output)]
+    if name in _CLAUDE_EDIT_TOOLS and not failed:
+        return _claude_file_changes(call_id, name, request, output)
+    shown = [_tool_call(call_id, name, call["input"])] if name in _CLAUDE_EDIT_TOOLS else []
+    return [*shown, _tool_result(call_id, name, block.get("content"), failed)]
+
+
+def _claude_events(event: Mapping[str, Any], context: TurnContext) -> list[dict[str, Any]]:
     """Claude ``stream-json``: assistant/user content blocks, then the result event."""
-    if str(event.get("type") or "") == "result":
-        return [_turn_end(event.get("usage"))]
-    content = _mapping(event.get("message")).get("content")
+    kind = str(event.get("type") or "")
+    if kind == "result":
+        return [_turn_end(_claude_usage(event, context))]
+    message = _mapping(event.get("message"))
+    if kind == "assistant":
+        context.model = str(message.get("model") or context.model)
+        usage = _mapping(message.get("usage"))
+        if usage:
+            context.last_usage = dict(usage)
+    content = message.get("content")
     events = _assistant_text(context_capture._message_text(content))
     for block in content if isinstance(content, list) else []:
         if not isinstance(block, Mapping):
             continue
         if block.get("type") == "tool_use":
-            events.append({
-                "type": "tool_call",
-                "payload": {"name": str(block.get("name") or ""), "input": block.get("input")},
-            })
+            events.extend(_claude_tool_use(block, context))
         elif block.get("type") == "tool_result":
-            events.append({
-                "type": "tool_result",
-                "payload": {
-                    "name": str(block.get("tool_use_id") or ""),
-                    "output": block.get("content"),
-                },
-            })
+            events.extend(_claude_tool_result(block, context))
         elif block.get("type") == "thinking":
             events.extend(_reasoning(block.get("thinking")))
     return events
 
 
-def _codex_events(event: Mapping[str, Any]) -> list[dict[str, Any]]:
+def _codex_usage(usage: Any) -> dict[str, Any] | None:
+    usage = _mapping(usage)
+    if not usage:
+        return None
+    cached = _count(usage.get("cached_input_tokens"))
+    # Codex counts cached tokens inside input_tokens; the fixture confirms it when cached <= input.
+    return _usage(
+        max(_count(usage.get("input_tokens")) - cached, 0), cached,
+        usage.get("cache_write_input_tokens"), usage.get("output_tokens"), 0, usage,
+    )
+
+
+def _codex_events(event: Mapping[str, Any], context: TurnContext) -> list[dict[str, Any]]:
     """Codex ``exec --json``: item events, then the completed turn's usage."""
     kind = str(event.get("type") or "")
     if kind == "turn.completed":
-        return [_turn_end(event.get("usage"))]
+        return [_turn_end(_codex_usage(event.get("usage")))]
     item = _mapping(event.get("item"))
     item_type = str(item.get("type") or "")
     if not kind.startswith("item.") or not item_type:
         return []
     if item_type in ("agent_message", "agentMessage"):
         return _assistant_text(item.get("text"))
+    call_id, done = str(item.get("id") or ""), kind == "item.completed"
+    if item_type == "command_execution":
+        code = item.get("exit_code") if done else None
+        status = "running" if not done else ("completed" if code == 0 else "failed")
+        return [_command(
+            call_id, str(item.get("command") or ""), status=status, exit_code=code,
+            output=str(item.get("aggregated_output") or ""),
+        )]
+    if item_type == "file_change":
+        changes = item.get("changes") if done else None
+        return [
+            {"type": "file_change", "payload": {
+                "call_id": call_id, "path": str(change.get("path") or ""),
+                "kind": str(change.get("kind") or "update"), "diff": "", "added": 0, "removed": 0,
+            }}
+            for change in changes or [] if isinstance(change, Mapping)
+        ]
     if item_type not in _CODEX_TOOL_ITEMS:
         return []
-    if kind == "item.completed":
-        has_aggregate = "aggregated_output" in item
-        output = item.get("aggregated_output") if has_aggregate else item.get("output")
-        return [{"type": "tool_result", "payload": {"name": item_type, "output": output}}]
-    request = item.get("command") if "command" in item else item.get("arguments")
-    return [{"type": "tool_call", "payload": {"name": item_type, "input": request}}]
+    if done:
+        output = item.get("aggregated_output") or item.get("output") or item.get("result")
+        return [_tool_result(call_id, item_type, output, str(item.get("status") or "") == "failed")]
+    return [_tool_call(call_id, item_type, item.get("arguments"))]
 
 
-def _opencode_events(event: Mapping[str, Any]) -> list[dict[str, Any]]:
+def _opencode_call_id(part: Mapping[str, Any]) -> str:
+    return str(part.get("id") or part.get("callID") or part.get("partID") or "")
+
+
+def _opencode_command(
+    call_id: str, request: Mapping[str, Any], state: Mapping[str, Any], status: str,
+) -> dict[str, Any]:
+    metadata = _mapping(state.get("metadata"))
+    nested = _mapping(metadata.get("metadata"))
+    code = nested.get("exit") if "exit" in nested else metadata.get("exit")
+    code = code if isinstance(code, int) else None
+    if status == "error":
+        shown = "failed"
+    elif status != "completed":
+        shown = "running"
+    elif code is not None and code != 0:
+        shown = "failed"
+    else:
+        shown = "completed"
+    return _command(
+        call_id, str(request.get("command") or ""), status=shown, exit_code=code,
+        output=str(state.get("output") or ""),
+    )
+
+
+def _opencode_tool(part: Mapping[str, Any], context: TurnContext) -> list[dict[str, Any]]:
+    state = _mapping(part.get("state"))
+    name = str(part.get("tool") or part.get("name") or state.get("title") or "tool")
+    call_id = _opencode_call_id(part)
+    status = str(state.get("status") or "")
+    done, failed = status in ("completed", "error"), status == "error"
+    request = _mapping(state.get("input") or part.get("input"))
+    if name in ("shell", "bash"):
+        return [_opencode_command(call_id, request, state, status)]
+    if name in ("write", "edit") and status == "completed":
+        path = str(request.get("path") or request.get("filePath") or "")
+        if name == "write":
+            output = str(state.get("output") or "")
+            kind = "add" if output.startswith("Created") else "update"
+            return [_file_change(call_id, path, [("", str(request.get("content") or ""))], kind)]
+        pairs = [(str(request.get("oldString") or ""), str(request.get("newString") or ""))]
+        return [_file_change(call_id, path, pairs, "update")]
+    if not done:
+        context.calls[call_id] = {"name": name}
+        return [_tool_call(call_id, name, request or part.get("input"))]
+    seen_running = context.calls.pop(call_id, None) is not None
+    result = _tool_result(call_id, name, state.get("output"), failed)
+    return [result] if seen_running else [_tool_call(call_id, name, request or part.get("input")), result]
+
+
+def _opencode_events(event: Mapping[str, Any], context: TurnContext) -> list[dict[str, Any]]:
     """OpenCode ``run --format json`` and part updates: text, thinking, tools, then step finish."""
     kind = str(event.get("type") or "").strip().lower()
     part = _mapping(event.get("part"))
@@ -174,18 +411,24 @@ def _opencode_events(event: Mapping[str, Any]) -> list[dict[str, Any]]:
     elif part_type and kind not in ("text", "reasoning", "tool", "step_finish", "step_start"):
         kind = part_type
     if kind in ("step_finish", "stepfinish"):
-        return [_turn_end(part.get("tokens") or event.get("tokens"))]
+        tokens = _mapping(part.get("tokens") or event.get("tokens"))
+        if tokens:
+            steps = context.steps
+            if not steps:
+                steps.update(count=0, input=0, cache_read=0, cache_write=0, output=0)
+            cache = _mapping(tokens.get("cache"))
+            steps["count"] += 1
+            steps["input"] += _count(tokens.get("input"))
+            steps["cache_read"] += _count(cache.get("read"))
+            steps["cache_write"] += _count(cache.get("write"))
+            steps["output"] += _count(tokens.get("output"))
+            steps["last"] = dict(tokens)
+        return []
     if kind == "text":
         return _assistant_text(part.get("text") or event.get("text"))
     if kind in ("reasoning", "thinking"):
         return _reasoning(part.get("text") or part.get("thinking") or event.get("text"))
-    if kind != "tool":
-        return []
-    state = _mapping(part.get("state"))
-    name = str(part.get("tool") or part.get("name") or state.get("title") or "tool")
-    if str(state.get("status") or "") in ("completed", "error"):
-        return [{"type": "tool_result", "payload": {"name": name, "output": state.get("output")}}]
-    return [{"type": "tool_call", "payload": {"name": name, "input": state.get("input") or part.get("input")}}]
+    return _opencode_tool(part, context) if kind == "tool" else []
 
 
 REASONING_LEVELS = frozenset({"low", "medium", "high", "xhigh", "max"})
@@ -225,13 +468,32 @@ def apply_manager_stream_tokens(backend_id: str, argv: list[str], level: str = "
     return [*argv, *tokens]
 
 
-_TRANSLATORS: Mapping[str, Callable[[Mapping[str, Any]], list[dict[str, Any]]]] = MappingProxyType(
+_TRANSLATORS: Mapping[str, Callable[[Mapping[str, Any], TurnContext], list[dict[str, Any]]]] = MappingProxyType(
     {
         "claude_cli": _claude_events,
         "codex_cli": _codex_events,
         "opencode_cli": _opencode_events,
     }
 )
+
+
+def flush(backend_id: str, context: TurnContext) -> list[dict[str, Any]]:
+    """The turn's closing events a backend's own stream does not supply by itself.
+
+    Only OpenCode needs this: its ``step_finish`` lines no longer carry their own
+    ``turn_end`` (W1-P1b), so their usage is summed here into exactly one. Claude
+    and Codex end their own turn with their own final event, so they get ``[]``.
+    """
+    if backend_id != "opencode_cli":
+        return []
+    steps = context.steps
+    if not steps:
+        return [_turn_end(None)]
+    usage = _usage(
+        steps["input"], steps["cache_read"], steps["cache_write"], steps["output"], 0,
+        {"steps": steps["count"], "last": steps.get("last") or {}},
+    )
+    return [_turn_end(usage)]
 
 
 def _provider_error(event: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -254,15 +516,18 @@ def _provider_error(event: Mapping[str, Any]) -> dict[str, Any] | None:
     return _turn_error("provider", str(detail))
 
 
-def translate(backend_id: str, event: Any) -> list[dict[str, Any]]:
-    """One provider event as loop events; an unrecognized one yields nothing at all."""
+def translate(backend_id: str, event: Any, context: TurnContext | None = None) -> list[dict[str, Any]]:
+    """One provider event as loop events; an unrecognized one yields nothing at all.
+
+    ``context`` pairs a tool call with its result across lines; one turn shares one.
+    """
     if not isinstance(event, Mapping):
         return []
     failure = _provider_error(event)
     if failure is not None:
         return [failure]
     translator = _TRANSLATORS.get(backend_id)
-    return translator(event) if translator is not None else []
+    return translator(event, context if context is not None else TurnContext()) if translator is not None else []
 
 
 def conversation_id_of(event: Mapping[str, Any]) -> str:
@@ -551,6 +816,8 @@ class CliManagerBackend:
 
         watchdog = threading.Timer(self.timeout_seconds, cut_off)
         watchdog.start()
+        context = TurnContext()
+        saw_error = False
         try:
             for raw in process.stdout or ():
                 event = _decode(raw)
@@ -558,7 +825,9 @@ class CliManagerBackend:
                     continue
                 self._conversation_id = self._conversation_id or conversation_id_of(event)
                 _maybe_record_claude_resolution(self.backend_id, self.model, self.repo, event)
-                yield from translate(self.backend_id, event)
+                for translated in translate(self.backend_id, event, context):
+                    saw_error = saw_error or translated["type"] == "error"
+                    yield translated
         finally:
             watchdog.cancel()
             code = _reap(process)
@@ -574,6 +843,8 @@ class CliManagerBackend:
                 str(outcome.get("outcome") or "worker_failed"),
                 str(outcome.get("reason") or f"exit_code={code}"),
             )
+        elif not saw_error:
+            yield from flush(self.backend_id, context)
 
 
 def _opencode_discovered_models() -> list[str]:
