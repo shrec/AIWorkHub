@@ -18,6 +18,8 @@ import time
 from pathlib import Path
 from typing import Any, Callable, TypeVar
 
+from .platform_io import is_windows
+
 #: Win32 ERROR_SHARING_VIOLATION: Python surfaces it as OSError.winerror == 32
 #: when the destination is momentarily open elsewhere without FILE_SHARE_DELETE.
 SHARING_VIOLATION_WINERROR = 32
@@ -77,7 +79,7 @@ def clear_readonly_if_set(path: Path) -> int | None:
     it actually cleared the bit, so a failed write can restore it; returns
     None on every other exit.
     """
-    if os.name != "nt":
+    if not is_windows():
         return None
     try:
         mode = path.stat().st_mode

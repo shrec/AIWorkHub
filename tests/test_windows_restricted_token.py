@@ -1071,7 +1071,7 @@ def test_restricted_access_closes_every_handle_when_the_check_fails(tmp_path):
 
 
 def test_probe_reports_not_windows_off_windows(monkeypatch):
-    monkeypatch.setattr(os, "name", "posix")
+    monkeypatch.setattr(wrt, "is_windows", lambda: False)
     assert probe() == (False, "not_windows")
     assert probe() == RestrictedTokenProbe(False, "not_windows")
 
@@ -1099,7 +1099,7 @@ def test_probe_names_the_failing_call_and_its_last_error(failure):
 
 
 def test_the_boundary_refuses_to_load_off_windows(monkeypatch, tmp_path):
-    monkeypatch.setattr(os, "name", "posix")
+    monkeypatch.setattr(wrt, "is_windows", lambda: False)
     repo, _slots, root = _slot(tmp_path)
     target = tmp_path / "thing.txt"
     target.write_text("x", encoding="utf-8")

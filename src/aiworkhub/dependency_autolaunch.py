@@ -251,6 +251,11 @@ TRANSIENT_DENIAL_REASONS = frozenset(
         "windows_appcontainer_identity_invalid",
         "windows_appcontainer_repo_identity_unavailable",
         "worker_supervisor_script_missing",
+        # The launcher's prompt write to the live supervisor's stdin failed or
+        # outran its bound (launch_isolated's _feed_supervisor_stdin). Both
+        # operands are the spawned process and the host pipe, never a card
+        # field, so an identical relaunch may succeed.
+        "worker_prompt_not_delivered",
         # -- replay grants that read task EVENTS or worker MCP gate receipts
         # rather than card fields.  Deliberately split from the card-pure
         # launch_replay_guard family claimed above: a terminal event or a gate

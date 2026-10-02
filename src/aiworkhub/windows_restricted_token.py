@@ -54,9 +54,11 @@ from typing import Any, Callable, Mapping, NamedTuple, Protocol, Sequence
 try:
     from . import windows_appcontainer as _appcontainer
     from . import windows_job_structures as _job_structures
+    from .platform_io import is_windows
 except ImportError:  # direct-script entrypoint
     import windows_appcontainer as _appcontainer  # type: ignore[no-redef]
     import windows_job_structures as _job_structures  # type: ignore[no-redef]
+    from platform_io import is_windows  # type: ignore[no-redef]
 
 __all__ = [
     "RestrictedTokenProbe",
@@ -1055,7 +1057,7 @@ def probe(*, api: _Win32Api | None = None) -> RestrictedTokenProbe:
     """
 
     if api is None:
-        if os.name != "nt":
+        if not is_windows():
             return RestrictedTokenProbe(False, "not_windows")
         api = _load_win32()
 
@@ -1234,7 +1236,7 @@ def _load_win32() -> _Win32Api:
     through a fake seam.
     """
 
-    if os.name != "nt":
+    if not is_windows():
         raise RestrictedTokenUnsupported("not_windows", os.name)
     return _CtypesWin32Api()
 

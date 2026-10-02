@@ -651,6 +651,12 @@ def _run_claude_launch(
                 target()
             return None
 
+        def join(self, timeout: float | None = None) -> None:
+            return None
+
+        def is_alive(self) -> bool:
+            return False
+
     runtime_dir = home / "task_mcp_worker_runtime"
     runtime_dir.mkdir(parents=True, exist_ok=True)
     _audit_ledger_path = runtime_dir / "audit_ledger.jsonl"
@@ -677,6 +683,9 @@ def _run_claude_launch(
         def write(self, data: bytes) -> int:
             stdin_writes.append(data)
             return len(data)
+
+        def flush(self) -> None:
+            return None
 
         def close(self) -> None:
             return None
