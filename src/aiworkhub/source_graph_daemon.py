@@ -76,6 +76,26 @@ _RECOVERY_PHASE_OPEN = "writable_open_recover"
 _RECOVERY_PHASE_INTEGRITY = "integrity_check"
 _RECOVERY_PHASE_COMMIT = "commit"
 
+# Transient recovery contention (another writer holds the lease, a busy
+# publish, a racing snapshot, or a coalesced in-flight recovery) is retried on
+# a short bounded backoff instead of failing the refresh job (NF-2026-01218).
+_RECOVERY_RETRY_BASE_SECONDS = 2.0
+_RECOVERY_RETRY_MAX_SECONDS = 60.0
+_RECOVERY_RETRY_JOB_ATTEMPTS = 6
+
+
+def _is_transient_recovery(result: dict[str, Any]) -> bool:
+    return result.get("retryable") is True or result.get("recovered") is None
+
+
+def _recovery_retry_timeout(interval: float, attempt: int) -> float:
+    """Wait before the ``attempt``-th (from 1) consecutive transient retry."""
+    return min(
+        interval,
+        _RECOVERY_RETRY_MAX_SECONDS,
+        _RECOVERY_RETRY_BASE_SECONDS * 2 ** (attempt - 1),
+    )
+
 
 def _build_once_payload(repo_root: Path | str, *, incremental: bool) -> dict[str, Any]:
     """Run one index build and return a JSON-safe outcome.
@@ -747,6 +767,8 @@ class SourceGraphDaemon:
         self._recovery_phase: str = ""
         self._recovery_elapsed: float = 0.0
         self._recovery_error: str = ""
+        # True while _recovery_error came from a retryable (contention) result.
+        self._recovery_error_retryable: bool = False
         self._last_known_good_generation: dict[str, Any] = {}
         self._recovery_started_at: float = 0.0
         # One durable refresh job per coalesced request wave. The daemon thread
@@ -1163,6 +1185,7 @@ class SourceGraphDaemon:
                 self._recovery_error = (
                     f"resolve_path:{type(exc).__name__}:{exc}"[:300]
                 )
+                self._recovery_error_retryable = False
                 self._recovery_phase = _RECOVERY_PHASE_DETECT
             return {
                 "recovered": False,
@@ -1176,6 +1199,7 @@ class SourceGraphDaemon:
                 self._status = STATUS_STANDBY
                 self._recovery_phase = _RECOVERY_PHASE_DETECT
                 self._recovery_error = "writer_lease_held_by_other_process"
+                self._recovery_error_retryable = True
             return {
                 "recovered": False,
                 "phase": self._recovery_phase,
@@ -1189,6 +1213,7 @@ class SourceGraphDaemon:
                 self._recovery_phase = _RECOVERY_PHASE_DETECT
                 self._recovery_elapsed = 0.0
                 self._recovery_error = ""
+                self._recovery_error_retryable = False
                 # Snapshot the last-known-good canonical generation *before*
                 # recovery mutates the database, so failed recovery can
                 # preserve and re-expose this identity.
@@ -1258,6 +1283,7 @@ class SourceGraphDaemon:
         """Record a terminal recovery failure with a frozen elapsed time."""
         with self._state_lock:
             self._recovery_error = error[:300]
+            self._recovery_error_retryable = retryable
             self._recovery_phase = phase
             if status is not None:
                 self._status = status
@@ -1814,50 +1840,116 @@ class SourceGraphDaemon:
             # build_in_progress result and returning the previous generation.
             self._build_completed.set()
 
+    def _recovery_gate(self) -> dict[str, Any] | None:
+        """Recover a pending journal before any build.
+
+        Returns ``None`` when a build may proceed, else the non-recovered
+        ``_recover_database()`` result. With no pending journal a recovery
+        error left by a retryable result (another process recovered) is stale
+        and is cleared.
+        """
+        if not self._has_pending_journal():
+            with self._state_lock:
+                if self._recovery_error_retryable:
+                    self._recovery_error = ""
+                    self._recovery_phase = ""
+                    self._recovery_error_retryable = False
+            return None
+        result = self._recover_database()
+        if result.get("recovered") is True:
+            return None
+        return result
+
+    def _requeue_refresh_job(self, job: dict[str, Any]) -> None:
+        """Put a started refresh job back as the pending job (same job_id)."""
+        queued = {**job, "state": "queued", "started_at": ""}
+        with self._state_lock:
+            if (
+                self._active_refresh_job is not None
+                and self._active_refresh_job.get("job_id") == job.get("job_id")
+            ):
+                self._active_refresh_job = None
+            self._pending_refresh_job = queued
+            self._last_refresh_job = queued
+        ok, error = self._persist_refresh_job(queued)
+        if not ok:
+            with self._state_lock:
+                if self._pending_refresh_job is queued:
+                    self._pending_refresh_job = None
+            self._finish_refresh_job(queued, state="failed", error=error)
+
     def _loop(self) -> None:
         # Power-loss recovery: writable single-flight recovery must precede
         # any readonly probe when a non-empty journal/WAL exists.
-        if self._has_pending_journal():
-            result = self._recover_database()
-            if not result.get("recovered"):
-                # Recovery failed or is still in-progress under another
-                # owner.  Retain degraded diagnostics and last-known-good
-                # generation; retry recovery on the next cycle before any
-                # readonly probe.
-                if result.get("recovered") is not None:
-                    # Explicit failure (not coalesced): ensure degraded.
-                    with self._state_lock:
-                        if self._status == STATUS_RECOVERY:
-                            self._status = STATUS_DEGRADED
-                        if not self._recovery_error:
-                            self._recovery_error = (
-                                result.get("error") or "recovery_failed"
-                            )[:300]
-                    # Signal lifecycle completion so callers do not block
-                    # indefinitely.  Health remains degraded and build_count
-                    # stays at zero; callers MUST inspect health after the wait.
-                    self._build_completed.set()
+        wait_timeout = self.refresh_interval_seconds
+        transient_attempts = 0
+        result = self._recovery_gate()
+        if result is not None:
+            # Recovery failed or is still in-progress under another owner.
+            # Retain diagnostics and last-known-good generation; retry
+            # recovery on the next cycle before any readonly probe.
+            if _is_transient_recovery(result):
+                # Contention: retry on a short bounded backoff, not degraded.
+                transient_attempts = 1
+                wait_timeout = _recovery_retry_timeout(
+                    self.refresh_interval_seconds, transient_attempts
+                )
             else:
-                self._run_one_build()
+                # Explicit failure: ensure degraded.
+                with self._state_lock:
+                    if self._status == STATUS_RECOVERY:
+                        self._status = STATUS_DEGRADED
+                    if not self._recovery_error:
+                        self._recovery_error = (
+                            result.get("error") or "recovery_failed"
+                        )[:300]
+                        self._recovery_error_retryable = False
+            # Signal lifecycle completion so callers do not block
+            # indefinitely.  build_count stays at zero (health is degraded on
+            # explicit failure); callers MUST inspect health after the wait.
+            self._build_completed.set()
         else:
             self._run_one_build()
+        held_job: dict[str, Any] | None = None
+        job_attempts = 0
+        job_attempts_id = ""
         while not self._stop_event.is_set():
-            self._refresh_event.wait(self.refresh_interval_seconds)
+            self._refresh_event.wait(wait_timeout)
             self._refresh_event.clear()
             if self._stop_event.is_set():
                 break
-            refresh_job = self._begin_refresh_job()
+            # A job kept running across transient recovery ticks is reused.
+            refresh_job = held_job if held_job is not None else self._begin_refresh_job()
+            held_job = None
             # Retry recovery before any probe when journal/WAL persists.
-            if self._has_pending_journal():
-                result = self._recover_database()
-                if not result.get("recovered"):
+            result = self._recovery_gate()
+            if result is not None:
+                error = str(result.get("error") or "recovery_failed")
+                if _is_transient_recovery(result):
+                    transient_attempts += 1
+                    wait_timeout = _recovery_retry_timeout(
+                        self.refresh_interval_seconds, transient_attempts
+                    )
                     if refresh_job is not None:
-                        self._finish_refresh_job(
-                            refresh_job,
-                            state="failed",
-                            error=str(result.get("error") or "recovery_failed"),
-                        )
+                        # Job budget is per job_id; backoff stays per episode.
+                        if refresh_job.get("job_id") != job_attempts_id:
+                            job_attempts_id = str(refresh_job.get("job_id") or "")
+                            job_attempts = 0
+                        job_attempts += 1
+                        if job_attempts >= _RECOVERY_RETRY_JOB_ATTEMPTS:
+                            self._finish_refresh_job(
+                                refresh_job, state="failed", error=error
+                            )
+                        else:
+                            held_job = refresh_job
                     continue
+                transient_attempts = 0
+                wait_timeout = self.refresh_interval_seconds
+                if refresh_job is not None:
+                    self._finish_refresh_job(refresh_job, state="failed", error=error)
+                continue
+            transient_attempts = 0
+            wait_timeout = self.refresh_interval_seconds
             triggered = self._run_one_build()
             if refresh_job is None:
                 continue
@@ -1969,6 +2061,27 @@ class SourceGraphDaemon:
                     "reason": "refresh_job_persist_failed",
                 }
         active_job = self._begin_refresh_job()
+        # A pending journal must be recovered before any build (NF-2026-01218).
+        gate = self._recovery_gate()
+        if gate is not None:
+            transient = _is_transient_recovery(gate)
+            if active_job is not None:
+                if transient:
+                    self._requeue_refresh_job(active_job)
+                else:
+                    self._finish_refresh_job(
+                        active_job,
+                        state="failed",
+                        error=str(gate.get("error") or "recovery_failed"),
+                    )
+            if transient:
+                self._refresh_event.set()
+            return {
+                **self.health(),
+                "ok": False,
+                "triggered": False,
+                "reason": "recovery_pending",
+            }
         triggered = self._run_one_build()
         if not triggered:
             self._refresh_event.set()

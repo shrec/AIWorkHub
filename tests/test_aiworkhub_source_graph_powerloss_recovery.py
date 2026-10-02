@@ -1675,3 +1675,409 @@ def test_staged_recovery_publish_permission_error_is_contention_only_on_windows(
     monkeypatch.setattr(platform_io, "is_windows", lambda: True)
     assert source_graph_daemon._is_publish_contention(PermissionError(13, "denied")) is True
     assert source_graph_daemon._is_publish_contention(locked) is True
+
+
+# ---------------------------------------------------------------------------
+# 17. NF-2026-01218: transient recovery contention is retried on a short
+#     bounded backoff instead of failing the refresh job.
+# ---------------------------------------------------------------------------
+
+_RETRY_INTERVAL = 120.0
+_LEASE_HELD = {
+    "recovered": False,
+    "phase": source_graph_daemon._RECOVERY_PHASE_DETECT,
+    "error": "writer_lease_held_by_other_process",
+    "retryable": True,
+}
+_COALESCED = {
+    "recovered": None,
+    "phase": source_graph_daemon._RECOVERY_PHASE_OPEN,
+    "error": "",
+    "coalesced": True,
+}
+_INTEGRITY_FAILED = {
+    "recovered": False,
+    "phase": source_graph_daemon._RECOVERY_PHASE_INTEGRITY,
+    "error": "integrity_check:database disk image is malformed",
+}
+
+
+class _ScriptedRefreshEvent:
+    """Stand-in for ``_refresh_event``: records every wait timeout, never
+    sleeps, and stops the loop once ``ticks`` loop iterations have run."""
+
+    def __init__(self, daemon, ticks, on_wait=None):
+        self._daemon = daemon
+        self._ticks = ticks
+        self._on_wait = on_wait
+        self.timeouts: list[float] = []
+
+    def wait(self, timeout=None):
+        self.timeouts.append(timeout)
+        if self._on_wait is not None:
+            self._on_wait(len(self.timeouts))
+        if len(self.timeouts) > self._ticks:
+            self._daemon._stop_event.set()
+        return True
+
+    def clear(self):
+        pass
+
+    def set(self):
+        pass
+
+    def is_set(self):
+        return False
+
+
+@pytest.fixture
+def fast_recovery_retry(monkeypatch):
+    monkeypatch.setattr(source_graph_daemon, "_RECOVERY_RETRY_BASE_SECONDS", 0.01)
+    monkeypatch.setattr(source_graph_daemon, "_RECOVERY_RETRY_MAX_SECONDS", 0.04)
+
+
+def _scripted_daemon(tmp_path, monkeypatch, name, results, *, pending=None):
+    """Daemon whose recovery gate and builds are scripted on the instance."""
+    root = _init_repo(tmp_path, name)
+    daemon = source_graph_daemon.SourceGraphDaemon(
+        root, refresh_interval_seconds=_RETRY_INTERVAL
+    )
+    script = {"results": list(results), "recover_calls": 0, "builds": 0}
+    armed = pending if pending is not None else [True]
+
+    def has_pending_journal():
+        return bool(armed[0] and script["results"])
+
+    def recover_database():
+        script["recover_calls"] += 1
+        return dict(script["results"].pop(0))
+
+    def run_one_build():
+        script["builds"] += 1
+        with daemon._state_lock:
+            daemon._status = source_graph_daemon.STATUS_READY
+        daemon._build_completed.set()
+        return True
+
+    monkeypatch.setattr(daemon, "_has_pending_journal", has_pending_journal)
+    monkeypatch.setattr(daemon, "_recover_database", recover_database)
+    monkeypatch.setattr(daemon, "_run_one_build", run_one_build)
+    return daemon, script
+
+
+def test_recovery_retry_transient_tick_keeps_job_running_with_backoff(
+    tmp_path, monkeypatch, fast_recovery_retry
+):
+    armed = [False]
+    daemon, script = _scripted_daemon(
+        tmp_path, monkeypatch, "retry_transient_tick",
+        [_LEASE_HELD, _COALESCED, _LEASE_HELD], pending=armed,
+    )
+    try:
+        job, coalesced = daemon._reserve_refresh_job()
+        assert coalesced is False
+        snapshots: list[dict] = []
+
+        def on_wait(n):
+            armed[0] = True
+            snapshots.append(dict(daemon.health()["refresh_job"]))
+
+        event = _ScriptedRefreshEvent(daemon, ticks=4, on_wait=on_wait)
+        daemon._refresh_event = event
+        daemon._loop()
+
+        base = source_graph_daemon._RECOVERY_RETRY_BASE_SECONDS
+        cap = source_graph_daemon._RECOVERY_RETRY_MAX_SECONDS
+        expected = [
+            min(_RETRY_INTERVAL, cap, base * 2 ** (n - 1)) for n in (1, 2, 3)
+        ]
+        assert event.timeouts == [_RETRY_INTERVAL, *expected, _RETRY_INTERVAL]
+        assert script["recover_calls"] == 3
+        # Startup build plus exactly one build once the gate cleared.
+        assert script["builds"] == 2
+        # Waits 2..4 observe the SAME job still running, never failed.
+        for snapshot in snapshots[1:4]:
+            assert snapshot["job_id"] == job["job_id"]
+            assert snapshot["state"] == "running"
+        final = daemon.health()["refresh_job"]
+        assert final["job_id"] == job["job_id"]
+        assert final["state"] == "succeeded"
+        assert final["error"] == ""
+    finally:
+        daemon.stop()
+
+
+def test_recovery_retry_job_fails_after_attempt_budget_and_never_builds(
+    tmp_path, monkeypatch, fast_recovery_retry
+):
+    monkeypatch.setattr(source_graph_daemon, "_RECOVERY_RETRY_JOB_ATTEMPTS", 3)
+    armed = [False]
+    daemon, script = _scripted_daemon(
+        tmp_path, monkeypatch, "retry_budget", [_LEASE_HELD] * 5, pending=armed,
+    )
+    try:
+        job, _ = daemon._reserve_refresh_job()
+        states: list[tuple[str, str]] = []
+
+        def on_wait(n):
+            armed[0] = True
+            snap = daemon.health()["refresh_job"]
+            states.append((snap["job_id"], snap["state"]))
+
+        event = _ScriptedRefreshEvent(daemon, ticks=5, on_wait=on_wait)
+        daemon._refresh_event = event
+        daemon._loop()
+
+        cap = source_graph_daemon._RECOVERY_RETRY_MAX_SECONDS
+        assert event.timeouts == [_RETRY_INTERVAL, 0.01, 0.02, cap, cap, cap]
+        assert script["recover_calls"] == 5
+        # Only the startup build: never a build while the gate is closed.
+        assert script["builds"] == 1
+        assert states[1:3] == [(job["job_id"], "running")] * 2
+        final = daemon.health()["refresh_job"]
+        assert final["job_id"] == job["job_id"]
+        assert final["state"] == "failed"
+        assert final["error"] == "writer_lease_held_by_other_process"
+    finally:
+        daemon.stop()
+
+
+def test_recovery_retry_non_transient_failure_fails_job_with_full_interval(
+    tmp_path, monkeypatch, fast_recovery_retry
+):
+    armed = [False]
+    daemon, script = _scripted_daemon(
+        tmp_path, monkeypatch, "retry_non_transient",
+        [_LEASE_HELD, _INTEGRITY_FAILED], pending=armed,
+    )
+    try:
+        daemon._reserve_refresh_job()
+
+        def on_wait(n):
+            armed[0] = True
+
+        event = _ScriptedRefreshEvent(daemon, ticks=2, on_wait=on_wait)
+        daemon._refresh_event = event
+        daemon._loop()
+
+        # Transient first (short wait), then one non-transient call that
+        # fails the job and resets the wait to the full interval.
+        assert event.timeouts == [_RETRY_INTERVAL, 0.01, _RETRY_INTERVAL]
+        assert script["recover_calls"] == 2
+        assert script["builds"] == 1
+        final = daemon.health()["refresh_job"]
+        assert final["state"] == "failed"
+        assert final["error"] == _INTEGRITY_FAILED["error"]
+    finally:
+        daemon.stop()
+
+
+def test_recovery_retry_startup_transient_uses_short_backoff_not_degraded(
+    tmp_path, monkeypatch, fast_recovery_retry
+):
+    daemon, script = _scripted_daemon(
+        tmp_path, monkeypatch, "retry_startup_transient", [_LEASE_HELD]
+    )
+    try:
+        with daemon._state_lock:
+            daemon._status = source_graph_daemon.STATUS_RECOVERY
+        observed: list[tuple[bool, str]] = []
+
+        def on_wait(n):
+            if n == 1:
+                observed.append((daemon.wait_for_first_build(timeout=0), daemon._status))
+
+        event = _ScriptedRefreshEvent(daemon, ticks=1, on_wait=on_wait)
+        daemon._refresh_event = event
+        daemon._loop()
+
+        assert observed == [(True, source_graph_daemon.STATUS_RECOVERY)]
+        assert event.timeouts == [0.01, _RETRY_INTERVAL]
+        assert script["builds"] == 1
+    finally:
+        daemon.stop()
+
+    other, other_script = _scripted_daemon(
+        tmp_path, monkeypatch, "retry_startup_fatal", [_INTEGRITY_FAILED]
+    )
+    try:
+        with other._state_lock:
+            other._status = source_graph_daemon.STATUS_RECOVERY
+        event = _ScriptedRefreshEvent(other, ticks=0)
+        other._refresh_event = event
+        other._loop()
+
+        assert other.wait_for_first_build(timeout=0) is True
+        assert other._status == source_graph_daemon.STATUS_DEGRADED
+        assert other.health()["recovery"]["error"] == _INTEGRITY_FAILED["error"]
+        assert event.timeouts == [_RETRY_INTERVAL]
+        assert other_script["builds"] == 0
+    finally:
+        other.stop()
+
+
+def test_recovery_retry_refresh_now_runs_gate_before_build(
+    tmp_path, monkeypatch, fast_recovery_retry
+):
+    daemon, script = _scripted_daemon(
+        tmp_path, monkeypatch, "retry_refresh_now",
+        [_LEASE_HELD, _COALESCED, _INTEGRITY_FAILED],
+    )
+    try:
+        for transient in (_LEASE_HELD, _COALESCED):
+            daemon._refresh_event.clear()
+            result = daemon.refresh_now()
+            assert result["ok"] is False
+            assert result["triggered"] is False
+            assert result["reason"] == "recovery_pending"
+            assert script["builds"] == 0
+            job = daemon.health()["refresh_job"]
+            assert job["state"] == "queued"
+            assert daemon._pending_refresh_job["job_id"] == job["job_id"]
+            assert daemon._active_refresh_job is None
+            assert daemon._refresh_event.is_set()
+            if transient is _LEASE_HELD:
+                first_job_id = job["job_id"]
+            assert job["job_id"] == first_job_id
+
+        daemon._refresh_event.clear()
+        result = daemon.refresh_now()
+        assert result["reason"] == "recovery_pending"
+        assert result["ok"] is False and result["triggered"] is False
+        assert script["builds"] == 0
+        assert not daemon._refresh_event.is_set()
+        failed = daemon.health()["refresh_job"]
+        assert failed["job_id"] == first_job_id
+        assert failed["state"] == "failed"
+        assert failed["error"] == _INTEGRITY_FAILED["error"]
+
+        # No pending journal: unchanged behaviour, the build runs.
+        result = daemon.refresh_now()
+        assert result["triggered"] is True
+        assert script["builds"] == 1
+        assert daemon.health()["refresh_job"]["state"] == "succeeded"
+    finally:
+        daemon.stop()
+
+
+def test_recovery_retry_stale_retryable_error_cleared_without_journal(
+    tmp_path, monkeypatch
+):
+    import contextlib
+
+    @contextlib.contextmanager
+    def lease_held_elsewhere(_repo_root):
+        yield False
+
+    root = _init_repo(tmp_path, "retry_stale_error")
+    daemon = source_graph_daemon.SourceGraphDaemon(root)
+    try:
+        monkeypatch.setattr(source_graph, "index_write_lease", lease_held_elsewhere)
+        result = daemon._recover_database()
+        assert result["retryable"] is True
+        assert daemon.health()["recovery"]["error"] == "writer_lease_held_by_other_process"
+
+        pending = [True]
+        monkeypatch.setattr(daemon, "_has_pending_journal", lambda: pending[0])
+        # Journal still pending: the gate stays closed and the error is kept.
+        assert daemon._recovery_gate() == result
+        assert daemon.health()["recovery"]["error"] == "writer_lease_held_by_other_process"
+
+        # Another process recovered: no journal, the stale error is cleared.
+        pending[0] = False
+        assert daemon._recovery_gate() is None
+        health = daemon.health()
+        assert health["recovery"]["error"] == ""
+        assert health["recovery"]["phase"] == ""
+
+        # A non-retryable recovery error is retained.
+        daemon._recovery_failure(
+            _INTEGRITY_FAILED["error"], source_graph_daemon._RECOVERY_PHASE_INTEGRITY
+        )
+        assert daemon._recovery_gate() is None
+        health = daemon.health()
+        assert health["recovery"]["error"] == _INTEGRITY_FAILED["error"]
+        assert health["recovery"]["phase"] == source_graph_daemon._RECOVERY_PHASE_INTEGRITY
+    finally:
+        daemon.stop()
+
+
+def test_recovery_retry_second_job_gets_own_budget(
+    tmp_path, monkeypatch, fast_recovery_retry
+):
+    monkeypatch.setattr(source_graph_daemon, "_RECOVERY_RETRY_JOB_ATTEMPTS", 2)
+    armed = [False]
+    daemon, script = _scripted_daemon(
+        tmp_path, monkeypatch, "retry_second_job", [_LEASE_HELD] * 6, pending=armed,
+    )
+    try:
+        job_a, _ = daemon._reserve_refresh_job()
+        jobs = {"b": None}
+        states: list[tuple[str, str]] = []
+
+        def on_wait(n):
+            armed[0] = True
+            snap = daemon.health()["refresh_job"]
+            states.append((snap["job_id"], snap["state"]))
+            if n == 3:
+                # Job A is spent; a new job B arrives while contention lasts.
+                job_b, coalesced = daemon._reserve_refresh_job()
+                assert coalesced is False
+                jobs["b"] = job_b
+
+        event = _ScriptedRefreshEvent(daemon, ticks=4, on_wait=on_wait)
+        daemon._refresh_event = event
+        daemon._loop()
+
+        job_b = jobs["b"]
+        assert job_b is not None and job_b["job_id"] != job_a["job_id"]
+        assert states[1] == (job_a["job_id"], "running")
+        assert states[2] == (job_a["job_id"], "failed")
+        # B survives budget-1 transient ticks, fails only at its own budget.
+        assert states[3] == (job_b["job_id"], "running")
+        assert states[4] == (job_b["job_id"], "failed")
+        assert daemon.health()["refresh_job"]["error"] == "writer_lease_held_by_other_process"
+        # Backoff continues from the contention episode, not from BASE.
+        cap = source_graph_daemon._RECOVERY_RETRY_MAX_SECONDS
+        assert event.timeouts == [_RETRY_INTERVAL, 0.01, 0.02, cap, cap]
+        assert script["recover_calls"] == 4
+        assert script["builds"] == 1
+    finally:
+        daemon.stop()
+
+
+def test_recovery_retry_requeued_job_keeps_its_budget(
+    tmp_path, monkeypatch, fast_recovery_retry
+):
+    monkeypatch.setattr(source_graph_daemon, "_RECOVERY_RETRY_JOB_ATTEMPTS", 2)
+    armed = [False]
+    daemon, script = _scripted_daemon(
+        tmp_path, monkeypatch, "retry_requeued_job", [_LEASE_HELD] * 6, pending=armed,
+    )
+    try:
+        job, _ = daemon._reserve_refresh_job()
+        snapshots: list[tuple[str, str]] = []
+
+        def on_wait(n):
+            armed[0] = True
+            snap = daemon.health()["refresh_job"]
+            snapshots.append((snap["job_id"], snap["state"]))
+            if n == 3:
+                # The job spent its budget; re-queue the SAME job_id.
+                daemon._requeue_refresh_job(dict(job))
+
+        event = _ScriptedRefreshEvent(daemon, ticks=3, on_wait=on_wait)
+        daemon._refresh_event = event
+        daemon._loop()
+
+        assert snapshots[1] == (job["job_id"], "running")
+        assert snapshots[2] == (job["job_id"], "failed")
+        # Returned again by _begin_refresh_job, the job does not restart its
+        # count: it is failed on that tick instead of left running.
+        assert snapshots[3] == (job["job_id"], "failed")
+        assert daemon._active_refresh_job is None
+        assert daemon._pending_refresh_job is None
+        assert script["recover_calls"] == 3
+        assert script["builds"] == 1
+    finally:
+        daemon.stop()
