@@ -202,6 +202,8 @@ SEMANTIC_EDIT_POLICY_EXCEPTIONS = (
     "adapter_without_tools",
 )
 _COVERAGE_LIST_CAP = 200
+_SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+_EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
 
 
 def semantic_edit_path_identifier(relative: str) -> str:
@@ -259,6 +261,7 @@ def _semantic_edit_coverage(
         "paths_raw_only_count": 0,
         "paths_new_file": 0,
         "paths_deleted": 0,
+        "paths_inherited_unchanged": 0,
         "paths_baseline_unknown": 0,
         "bytes_basis": "changed_file_size_at_finalization",
         "bytes_changed": 0,
@@ -289,14 +292,16 @@ def _semantic_edit_coverage(
         worker_mcp_gate.get("verification")
         if isinstance(worker_mcp_gate, dict) else None
     )
+    if not changed:
+        # Nothing changed, so there is nothing to cover whatever the ledger
+        # state: the run is labelled by what it did, not by its audit trail.
+        record["unmeasured_reason"] = "no_changed_paths"
+        return record
     if not isinstance(verification, dict) or verification.get("ok") is not True:
         # The ledger is the only authenticated statement about tool use.  An
         # adapter that reported nothing, or a ledger that could not be
         # verified, is UNMEASURED -- it is not a worker that used nothing.
         record["unmeasured_reason"] = "ledger_unverified"
-        return record
-    if not changed:
-        record["unmeasured_reason"] = "no_changed_paths"
         return record
 
     receipts = verification.get("semantic_edit_apply_receipts")
@@ -337,17 +342,53 @@ def _semantic_edit_coverage(
     baselines: dict[str, str | None] = {}
     tree_baseline: dict[str, str | None] | None = None
     workspace_root: Path | None = None
+    inherited: set[str] = set()
     if workspace is not None:
         baselines = dict(getattr(workspace, "workspace_baseline", None) or {})
         raw_tree = getattr(workspace, "tree_baseline", None)
         tree_baseline = dict(raw_tree) if isinstance(raw_tree, dict) else None
         root = getattr(workspace, "path", None)
         workspace_root = Path(str(root)) if root else None
+        inherited = {
+            str(item).strip().replace("\\", "/")
+            for item in (getattr(workspace, "inherited_rework_paths", None) or ())
+            if str(item).strip()
+        }
+
+    def baseline_digest(relative: str) -> str:
+        """Content sha256 of a ``file:<mode>:<hex>`` or bare-hex baseline.
+
+        The mode part is ignored: only content decides "unchanged".
+        """
+        value = baselines.get(relative)
+        if not isinstance(value, str):
+            return ""
+        text = value.strip().lower()
+        if text.startswith("file:"):
+            text = text.rsplit(":", 1)[-1]
+        return text if _SHA256_HEX.fullmatch(text) else ""
+
+    def content_digest(relative: str) -> str:
+        if workspace_root is None:
+            return ""
+        hasher = hashlib.sha256()
+        try:
+            with (workspace_root / relative).open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1 << 20), b""):
+                    hasher.update(chunk)
+        except OSError:
+            return ""
+        return hasher.hexdigest()
 
     def baseline_state(relative: str) -> str:
         """``present`` / ``absent`` / ``unknown`` at workspace creation."""
         if relative in baselines:
-            return "present" if baselines[relative] is not None else "absent"
+            if baselines[relative] is None:
+                return "absent"
+            # The workspace pre-creates every exact allowed path as an EMPTY
+            # placeholder before hashing, so an empty-content baseline means
+            # nothing existed to range-edit: the path is a new file.
+            return "absent" if baseline_digest(relative) == _EMPTY_SHA256 else "present"
         if tree_baseline is not None:
             # The tree manifest covers EVERY file in the worktree, so absence
             # from it is decisive: the path did not exist before this attempt.
@@ -399,12 +440,24 @@ def _semantic_edit_coverage(
             # denominator rather than an uncovered edit.
             record["paths_deleted"] += 1
             continue
+        if relative in inherited:
+            expected = baseline_digest(relative)
+            if expected and content_digest(relative) == expected:
+                # Seeded from the predecessor attempt and byte-identical to its
+                # seeded state: this attempt never touched it, so it is neither
+                # an edit nor a raw write and stays outside the denominator.
+                record["paths_inherited_unchanged"] += 1
+                continue
         if state == "absent":
             new_files.append(relative)
             derived.append({
                 "path": relative,
                 "exception": "new_file",
-                "basis": "no_baseline_hash_at_workspace_creation",
+                "basis": (
+                    "empty_placeholder_at_workspace_creation"
+                    if baselines.get(relative) is not None
+                    else "no_baseline_hash_at_workspace_creation"
+                ),
                 "source": "runtime_derivation",
             })
             continue

@@ -28,17 +28,28 @@ def _digest(relative: str) -> str:
     return hashlib.sha256(relative.encode("utf-8")).hexdigest()
 
 
-def _workspace(tmp_path: Path, files: dict[str, bytes], baseline: dict[str, str | None]):
+def _workspace(
+    tmp_path: Path,
+    files: dict[str, bytes],
+    baseline: dict[str, str | None],
+    *,
+    inherited_rework_paths: tuple[str, ...] | None = None,
+):
     root = tmp_path / "worktree"
     for relative, payload in files.items():
         target = root / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(payload)
-    return SimpleNamespace(
+    workspace = SimpleNamespace(
         path=root,
         workspace_baseline=dict(baseline),
         tree_baseline=None,
     )
+    if inherited_rework_paths is not None:
+        # Only set when asked: the default object keeps lacking the attribute,
+        # exactly as before.
+        workspace.inherited_rework_paths = tuple(inherited_rework_paths)
+    return workspace
 
 
 def _gate(receipts, *, ok: bool = True, declarations=None):
@@ -539,6 +550,179 @@ def test_full_coverage_is_exactly_one(tmp_path: Path) -> None:
     assert record["coverage_ratio"] == 1.0
     assert record["paths_with_apply"] == 2
     assert record["bytes_changed"] == record["bytes_via_apply"] == 24
+
+
+# ---------------------------------------------------------------------------
+# NF-2026-01222: labels, inherited rework paths and placeholder new files.
+# ---------------------------------------------------------------------------
+
+def test_a_run_that_changed_nothing_is_no_changed_paths_whatever_its_ledger(
+    tmp_path: Path,
+) -> None:
+    for gate in (None, _gate([], ok=False), _gate([])):
+        record = process_launcher._semantic_edit_coverage(
+            [],
+            workspace=_workspace(tmp_path, {}, baseline={}),
+            worker_mcp_gate=gate,
+        )
+        assert record["measured"] is False
+        assert record["unmeasured_reason"] == "no_changed_paths"
+        assert record["coverage_ratio"] is None
+        assert record.get("paths_inherited_unchanged") == 0
+
+    # A run that DID change something still names the unverified ledger.
+    changed = process_launcher._semantic_edit_coverage(
+        ["src/a.py"],
+        workspace=_workspace(
+            tmp_path, {"src/a.py": b"a" * 20}, baseline={"src/a.py": "old-hash"},
+        ),
+        worker_mcp_gate=_gate([], ok=False),
+    )
+    assert changed["unmeasured_reason"] == "ledger_unverified"
+    assert changed.get("paths_inherited_unchanged") == 0
+
+
+def test_every_unmeasured_return_carries_a_zero_inherited_unchanged_count(
+    tmp_path: Path,
+) -> None:
+    seeded = b"s" * 30
+    workspace = _workspace(
+        tmp_path,
+        {"src/a.py": seeded},
+        baseline={"src/a.py": hashlib.sha256(seeded).hexdigest()},
+        inherited_rework_paths=("src/a.py",),
+    )
+    legacy = _receipt("src/a.py")
+    legacy.pop("path_sha256")
+
+    records = [
+        process_launcher._semantic_edit_coverage(
+            ["src/a.py"], workspace=workspace, worker_mcp_gate=None,
+        ),
+        process_launcher._semantic_edit_coverage(
+            ["src/a.py"], workspace=workspace, worker_mcp_gate=_gate([legacy]),
+        ),
+        process_launcher._semantic_edit_coverage(
+            ["src/a.py"],
+            workspace=workspace,
+            worker_mcp_gate=_gate([]),
+            runtime_evidence={"observed": True},
+        ),
+    ]
+
+    assert [row["unmeasured_reason"] for row in records] == [
+        "ledger_unverified",
+        "receipts_without_path_identifier",
+        "applies_observed_outside_the_authenticated_ledger",
+    ]
+    for row in records:
+        assert row["measured"] is False
+        assert row.get("paths_inherited_unchanged") == 0
+
+
+def test_inherited_rework_paths_unchanged_since_seeding_leave_the_denominator(
+    tmp_path: Path,
+) -> None:
+    seeded = b"s" * 300
+    seeded_digest = hashlib.sha256(seeded).hexdigest()
+    workspace = _workspace(
+        tmp_path,
+        {
+            "src/seeded_mode.py": seeded,
+            "src/seeded_bare.py": seeded,
+            "src/reworked_raw.py": b"r" * 40,
+            "src/reworked_applied.py": b"p" * 60,
+            "src/not_inherited.py": seeded,
+        },
+        baseline={
+            # Mode differs from the file on disk: only the content digest counts.
+            "src/seeded_mode.py": f"file:600:{seeded_digest}",
+            "src/seeded_bare.py": seeded_digest,
+            "src/reworked_raw.py": f"file:644:{seeded_digest}",
+            "src/reworked_applied.py": f"file:644:{seeded_digest}",
+            "src/not_inherited.py": f"file:644:{seeded_digest}",
+        },
+        inherited_rework_paths=(
+            "src/seeded_mode.py",
+            "src/seeded_bare.py",
+            "src/reworked_raw.py",
+            "src/reworked_applied.py",
+        ),
+    )
+
+    record = process_launcher._semantic_edit_coverage(
+        [
+            "src/seeded_mode.py",
+            "src/seeded_bare.py",
+            "src/reworked_raw.py",
+            "src/reworked_applied.py",
+            "src/not_inherited.py",
+        ],
+        workspace=workspace,
+        worker_mcp_gate=_gate([_receipt("src/reworked_applied.py")]),
+        granted_tool_names=("aiworkhub_worker_semantic_edit_apply",),
+    )
+
+    assert record["measured"] is True
+    assert record["paths_inherited_unchanged"] == 2
+    assert record["eligible_paths_count"] == 3
+    assert record["paths_with_apply"] == 1
+    # An inherited path that differs is ordinary; a non-inherited path equal to
+    # its baseline keeps today's accounting.
+    assert record["paths_raw_only"] == ["src/not_inherited.py", "src/reworked_raw.py"]
+    assert record["undeclared_raw_only"] == [
+        "src/not_inherited.py", "src/reworked_raw.py",
+    ]
+    assert record["declared_exceptions"] == []
+    assert record["paths_new_file"] == 0
+    assert record["bytes_changed"] == 400
+    assert record["bytes_via_apply"] == 60
+
+
+def test_new_file_is_derived_from_the_empty_placeholder_baseline(
+    tmp_path: Path,
+) -> None:
+    empty = hashlib.sha256(b"").hexdigest()
+    workspace = _workspace(
+        tmp_path,
+        {
+            "src/new.py": b"n" * 50,
+            "src/also_new.py": b"m" * 20,
+            "src/edited.py": b"e" * 10,
+        },
+        baseline={
+            "src/new.py": f"file:644:{empty}",
+            "src/also_new.py": None,
+            "src/edited.py": "old-hash",
+        },
+    )
+
+    record = process_launcher._semantic_edit_coverage(
+        ["src/new.py", "src/also_new.py", "src/edited.py"],
+        workspace=workspace,
+        worker_mcp_gate=_gate([_receipt("src/edited.py")]),
+        granted_tool_names=("aiworkhub_worker_semantic_edit_apply",),
+    )
+
+    assert record["paths_new_file"] == 2
+    assert record["eligible_paths_count"] == 1
+    assert record["derived_exceptions"] == [
+        {
+            "path": "src/also_new.py",
+            "exception": "new_file",
+            "basis": "no_baseline_hash_at_workspace_creation",
+            "source": "runtime_derivation",
+        },
+        {
+            "path": "src/new.py",
+            "exception": "new_file",
+            "basis": "empty_placeholder_at_workspace_creation",
+            "source": "runtime_derivation",
+        },
+    ]
+    assert record["undeclared_raw_only"] == []
+    assert record["bytes_changed"] == 10
+    assert record["coverage_ratio"] == 1.0
 
 
 # ---------------------------------------------------------------------------
