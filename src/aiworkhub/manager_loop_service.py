@@ -639,6 +639,29 @@ def wait_for_idle(repo: str | Path, timeout: float | None = None) -> bool:
     return not thread.is_alive()
 
 
+def _wake_on_own_route(
+    repo: str | Path, orchestrator: ManagerOrchestrator, member: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Run one callback's turn; a session loaded from disk gets its backend back first.
+
+    Restore and continue attach a conversation without a backend, and a wake has
+    no owner present to pick one. So it binds only the route the session itself
+    persisted, and only while this repository still authorizes that route. A
+    refusal raises: the turn fails undelivered, its callback stays un-acked and
+    the consumer backs off. A session that already has its backend is not asked.
+    """
+
+    session = orchestrator.session
+    if session is not None and not session.passive and not orchestrator.bound:
+        route = authorize_selected_route(repo, session.backend_id, session.model)
+        if route is None:
+            raise ManagerLoopError(
+                f"manager_backend_unavailable:{session.backend_id}:{session.model}"
+            )
+        orchestrator.continue_on_route(*route)
+    return orchestrator.wake(member)
+
+
 def _wake_dispatch(
     repo: str | Path, member: Mapping[str, Any], done: Callable[[bool], None]
 ) -> bool:
@@ -649,7 +672,7 @@ def _wake_dispatch(
 
     result = _dispatch_turn(
         repo,
-        lambda orchestrator: orchestrator.wake(member),
+        lambda orchestrator: _wake_on_own_route(repo, orchestrator, member),
         record_last_turn=True,
         on_finished=done,
     )

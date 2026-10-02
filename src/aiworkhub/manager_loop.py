@@ -710,6 +710,11 @@ class ManagerOrchestrator:
         """The active session, or ``None`` between sessions."""
         return self._session
 
+    @property
+    def bound(self) -> bool:
+        """Whether the active session has its backend; one loaded from disk has none yet."""
+        return self._session is not None and self._backend is not None
+
     def ensure(self) -> ManagerSession:
         """Attach to the repository's one active conversation, persisting a passive one if none.
 

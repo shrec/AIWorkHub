@@ -19,7 +19,7 @@ from aiworkhub import manager_loop_service  # noqa: E402
 from aiworkhub import manager_loop_wake  # noqa: E402
 from aiworkhub.manager_loop_wake import WakeConsumer  # noqa: E402
 
-from test_manager_loop_service import _install_fakes  # noqa: E402
+from test_manager_loop_service import _install_fakes, _seat_record  # noqa: E402
 
 
 class _FakeClock:
@@ -824,5 +824,103 @@ def test_a_turn_whose_only_errors_arose_after_delivery_acks_its_batch(
         status = manager_loop_service.status(tmp_path)
         assert status["wake"]["turns_this_hour"] == 1
         assert status["wake"]["failed_turns"] == 0
+    finally:
+        assert manager_loop_service.close(tmp_path)["ok"] is True
+
+
+class _RouteAuthority:
+    """Stands in for ``authorize_selected_route``: records each ask, answers ``allowed``."""
+
+    def __init__(self, allowed: bool) -> None:
+        self.allowed = allowed
+        self.asked: list[tuple[str, str]] = []
+        self.called = threading.Event()
+
+    def __call__(self, repo: Any, backend_id: str, model: str) -> tuple[str, str] | None:
+        self.asked.append((backend_id, model))
+        self.called.set()
+        return (backend_id, model) if self.allowed else None
+
+
+def _claim_one_callback(monkeypatch: Any, authority: _RouteAuthority) -> tuple[list[Any], list[tuple[str, str]]]:
+    backends = _install_fakes(monkeypatch)
+    monkeypatch.setattr(manager_loop_service, "WAKE_IDLE_POLL_SECONDS", 0.02)
+    monkeypatch.setattr(manager_loop_service, "WAKE_RETRY_POLL_SECONDS", 0.02)
+    monkeypatch.setattr(manager_loop_service, "authorize_selected_route", authority)
+    ack_calls: list[tuple[str, str]] = []
+
+    def ack(batch_id: str, lease_id: str) -> bool:
+        ack_calls.append((batch_id, lease_id))
+        return True
+
+    _install_fake_wake_source(monkeypatch, _one_batch_claim(["CARD_A"]), ack)
+    return backends, ack_calls
+
+
+def test_a_wake_rebinds_a_restored_session_onto_its_own_authorized_route(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    # A session loaded from disk (a server restart, a panel reload) holds the seat
+    # but has no backend yet. Its callback must still reach the model.
+    authority = _RouteAuthority(allowed=True)
+    backends, ack_calls = _claim_one_callback(monkeypatch, authority)
+    entry = manager_loop_service._entry_for(tmp_path)
+    restored = _seat_record(entry, "mls-" + "0d" * 16)
+
+    assert manager_loop_service.restore(tmp_path)["ok"] is True
+    try:
+        assert authority.called.wait(timeout=5)
+        assert manager_loop_service.wait_for_idle(tmp_path, timeout=5) is True
+        assert authority.asked == [("fake", "model-a")]
+        assert [(backend.backend_id, backend.model) for backend in backends] == [("fake", "model-a")]
+        assert backends[0].messages == ["callback: CARD_A -> s"]
+        assert ack_calls == [("b1", "l1")]
+        status = manager_loop_service.status(tmp_path)
+        assert status["last_turn"]["ok"] is True
+        assert status["session"]["session_id"] == restored.session_id
+        assert status["wake"]["failed_turns"] == 0
+    finally:
+        assert manager_loop_service.close(tmp_path)["ok"] is True
+
+
+def test_a_wake_never_rebinds_a_restored_session_onto_a_route_policy_no_longer_allows(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    authority = _RouteAuthority(allowed=False)
+    backends, ack_calls = _claim_one_callback(monkeypatch, authority)
+    entry = manager_loop_service._entry_for(tmp_path)
+    _seat_record(entry, "mls-" + "0e" * 16)
+
+    assert manager_loop_service.restore(tmp_path)["ok"] is True
+    try:
+        assert authority.called.wait(timeout=5)
+        assert manager_loop_service.wait_for_idle(tmp_path, timeout=5) is True
+        assert backends == []
+        assert ack_calls == []
+        status = manager_loop_service.status(tmp_path)
+        assert status["last_turn"]["ok"] is False
+        assert "manager_backend_unavailable:fake:model-a" in status["last_turn"]["errors"][0]
+        assert status["wake"]["failed_turns"] == 1
+        assert status["wake"]["queued"] == 1
+        assert authority.asked == [("fake", "model-a")]
+    finally:
+        assert manager_loop_service.close(tmp_path)["ok"] is True
+    assert ack_calls == []
+
+
+def test_a_wake_on_a_session_that_already_has_its_backend_asks_for_no_authorization(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    authority = _RouteAuthority(allowed=False)
+    backends, ack_calls = _claim_one_callback(monkeypatch, authority)
+
+    assert manager_loop_service.start(tmp_path, "fake", "model-a")["ok"] is True
+    try:
+        assert backends[0].entered.wait(timeout=5)
+        assert manager_loop_service.wait_for_idle(tmp_path, timeout=5) is True
+        assert authority.asked == []
+        assert len(backends) == 1
+        assert backends[0].messages == ["callback: CARD_A -> s"]
+        assert ack_calls == [("b1", "l1")]
     finally:
         assert manager_loop_service.close(tmp_path)["ok"] is True
