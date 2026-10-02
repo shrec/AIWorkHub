@@ -12109,7 +12109,8 @@ class ProcessManager:
                 # declared ``required_outputs`` -- never from the validator's
                 # observed filenames, which a glob lets a worker choose.
                 reason = terminal_failure_classification.workspace_error_reason(error, metadata.get("required_outputs"))
-                terminal_state = _terminal_state_for_workspace_error(exc)
+                terminal_state = _launcher_validation.replay_terminal_state(
+                    _terminal_state_for_workspace_error(exc), metadata, validations)
                 # Keep the isolated candidate intact for coordinator
                 # diagnosis/retry on every genuine failure, including a
                 # lost-claim race. B863: a claim_ownership_lost read can be a

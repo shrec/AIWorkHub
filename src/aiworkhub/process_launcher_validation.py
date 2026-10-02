@@ -511,3 +511,22 @@ def terminal_state_for_workspace_error(exc: WorkspaceError) -> str:
     ):
         return "validation_failed"
     return "finalize_failed"
+
+
+def replay_terminal_state(
+    terminal_state: str,
+    metadata: Mapping[str, Any],
+    validations: list[dict[str, Any]],
+) -> str:
+    """Reclassify an unrun validation-only replay from validation_failed."""
+    if terminal_state != "validation_failed":
+        return terminal_state
+    if metadata.get("execution_mode") != "validation_only_replay":
+        return terminal_state
+    try:
+        declared = declared_validation_commands(metadata)
+    except WorkspaceError:
+        return terminal_state
+    if not declared or list(validations):
+        return terminal_state
+    return "finalize_failed"
