@@ -1054,6 +1054,38 @@ def _resolve_codex_windows_stable_shim(
         ")",
         '"%CODEX_BIN%" %*',
     )
+    if commands == (
+        "@echo off",
+        'call "%APPDATA%\\npm\\codex.cmd" %*',
+        "exit /b %ERRORLEVEL%",
+    ):
+        app_data = os.environ.get("APPDATA", "")
+        architecture = os.environ.get("PROCESSOR_ARCHITECTURE", "").lower()
+        target = {
+            "amd64": ("x64", "x86_64-pc-windows-msvc"),
+            "arm64": ("arm64", "aarch64-pc-windows-msvc"),
+        }.get(architecture)
+        if not app_data or not Path(app_data).is_absolute() or target is None:
+            return True, None
+        package_root = Path(app_data) / "npm" / "node_modules" / "@openai" / "codex"
+        arch, triple = target
+        vendors = (
+            package_root / "node_modules" / "@openai" / f"codex-win32-{arch}" / "vendor",
+            package_root / "vendor",
+        )
+        try:
+            for vendor in vendors:
+                binary = vendor / triple / "bin" / "codex.exe"
+                if not binary.is_file():
+                    continue
+                selected = binary.resolve(strict=True)
+                selected.relative_to(package_root.resolve(strict=True))
+                if not os.access(selected, os.X_OK):
+                    return True, None
+                return True, selected
+        except (OSError, RuntimeError, ValueError):
+            return True, None
+        return True, None
     if commands != expected_commands:
         return False, None
 

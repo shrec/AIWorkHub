@@ -2224,7 +2224,6 @@ def test_create_request_publishes_normalized_required_outputs_identically(
         ("not-a-list", "non-list"),
         ({"src/app.py"}, "non-list-set"),
         ([1], "non-string"),
-        ([], "empty-list"),
         ([""], "empty-path"),
         (["   "], "empty-whitespace"),
         (["src/app.py", "src/app.py"], "duplicate"),
@@ -2241,7 +2240,6 @@ def test_create_request_publishes_normalized_required_outputs_identically(
         "non-list",
         "non-list-set",
         "non-string",
-        "empty-list",
         "empty-path",
         "empty-whitespace",
         "duplicate",
@@ -2308,25 +2306,29 @@ def test_read_only_review_allows_explicit_empty_required_outputs(
     assert published["required_outputs"] == []
 
 
-def test_writable_bridge_request_still_rejects_empty_required_outputs(
+def test_writable_bridge_request_allows_explicit_empty_required_outputs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     request_id = "8" * 32
     _root, repo, workspace, home = _required_output_request_env(
         tmp_path, monkeypatch, request_id=request_id
     )
-    with pytest.raises(vscode_lm_bridge.BridgeError, match="bridge_required_outputs_invalid"):
-        vscode_lm_bridge.create_request(
-            repo=repo,
-            request_id=request_id,
-            workspace_path=workspace,
-            workspace_home=home,
-            prompt="writable worker",
-            model="glm-5.2",
-            allowed_writes=["src/app.py"],
-            required_outputs=[],
-            timeout_seconds=30,
-        )
+    request = vscode_lm_bridge.create_request(
+        repo=repo,
+        request_id=request_id,
+        workspace_path=workspace,
+        workspace_home=home,
+        prompt="writable worker",
+        model="glm-5.2",
+        allowed_writes=["src/app.py"],
+        required_outputs=[],
+        timeout_seconds=30,
+    )
+    published = json.loads(request.request_path.read_text(encoding="utf-8"))
+    worker_spec = json.loads(request.worker_spec_path.read_text(encoding="utf-8"))
+    assert published["allowed_writes"] == ["src/app.py"]
+    assert published["required_outputs"] == []
+    assert worker_spec["required_outputs"] == []
 
 
 def test_bridge_validates_and_forwards_provider_identity(

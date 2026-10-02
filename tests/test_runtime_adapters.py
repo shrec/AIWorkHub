@@ -674,6 +674,43 @@ if not defined CODEX_BIN (
     )
 
 
+@pytest.mark.parametrize("case", ["x64", "arm64", "bundled", "missing", "no-appdata", "unknown-arch"])
+def test_codex_windows_npm_forwarder_resolves_native_or_fails_closed(monkeypatch, tmp_path, case):
+    local = tmp_path / "Local"
+    roaming = tmp_path / "Roaming"
+    shim = local / "OpenAI" / "Codex" / "shim" / "codex.cmd"
+    shim.parent.mkdir(parents=True)
+    shim.write_text(
+        '@echo off\nrem Official npm launcher.\ncall "%APPDATA%\\npm\\codex.cmd" %*\nexit /b %ERRORLEVEL%\n',
+        encoding="utf-8",
+    )
+    package = roaming / "npm" / "node_modules" / "@openai" / "codex"
+    arch, triple = ("arm64", "aarch64-pc-windows-msvc") if case == "arm64" else ("x64", "x86_64-pc-windows-msvc")
+    vendor = package / "vendor" if case == "bundled" else package / "node_modules" / "@openai" / f"codex-win32-{arch}" / "vendor"
+    bin_dir = vendor / triple / "bin"
+    bin_dir.mkdir(parents=True)
+    native = _executable(bin_dir, "codex.exe")
+    if case == "missing":
+        native.unlink()
+    monkeypatch.setenv("LOCALAPPDATA", str(local))
+    monkeypatch.setenv("APPDATA", str(roaming) if case != "no-appdata" else "")
+    monkeypatch.setenv("PROCESSOR_ARCHITECTURE", "ARM64" if case == "arm64" else "AMD64")
+    if case == "unknown-arch":
+        monkeypatch.setenv("PROCESSOR_ARCHITECTURE", "unknown")
+    monkeypatch.setattr(runtime_adapters, "_is_windows_host", lambda: True)
+    monkeypatch.setattr(runtime_adapters.shutil, "which", lambda _: str(shim))
+
+    resolution = runtime_adapters.resolve_executable("codex_cli")
+
+    if case in {"missing", "no-appdata", "unknown-arch"}:
+        assert not resolution.ok
+        assert resolution.executable is None
+        assert resolution.reason == "Codex stable launcher target not found"
+    else:
+        assert resolution.ok
+        assert resolution.executable == str(native.resolve())
+
+
 def test_codex_windows_arbitrary_cmd_discovery_is_preserved(monkeypatch, tmp_path):
     shim = _executable(tmp_path, "codex.cmd")
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "Local"))
