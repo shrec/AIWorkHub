@@ -33,13 +33,14 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
 import threading
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -518,6 +519,112 @@ def _is_stale_query_connection_error(exc: BaseException) -> bool:
         return True
     text = str(exc).casefold()
     return any(marker in text for marker in _STALE_QUERY_CONNECTION_MARKERS)
+
+
+# Primary result codes SQLITE_BUSY / SQLITE_LOCKED (literals: Python 3.10 has
+# no sqlite3 constants for them).
+_SQLITE_BUSY_PRIMARY_CODES = frozenset({5, 6})
+_SQLITE_BUSY_MARKERS = ("database is locked", "database table is locked", "database is busy")
+_RECOVERY_SIDECAR_SUFFIXES = ("-journal", "-wal", "-shm")
+
+
+def _is_sqlite_busy_error(exc: BaseException) -> bool:
+    """Whether ``exc`` (or the error it carries) is SQLite busy/locked contention."""
+    for candidate in (exc, exc.__cause__, exc.__context__):
+        if not isinstance(candidate, sqlite3.Error):
+            continue
+        code = getattr(candidate, "sqlite_errorcode", None)
+        if code is not None:
+            if (code & 0xFF) in _SQLITE_BUSY_PRIMARY_CODES:
+                return True
+            continue
+        text = str(candidate).casefold()
+        if any(marker in text for marker in _SQLITE_BUSY_MARKERS):
+            return True
+    return False
+
+
+def _is_publish_contention(exc: BaseException) -> bool:
+    if _is_sqlite_busy_error(exc):
+        return True
+    # Only Windows denies the atomic replace while a reader holds the file;
+    # elsewhere a PermissionError is a real failure, not contention.
+    if not platform_io.is_windows():
+        return False
+    return any(
+        isinstance(candidate, PermissionError)
+        for candidate in (exc, exc.__cause__, exc.__context__)
+    )
+
+
+def _recovery_snapshot(db_path: Path) -> tuple[tuple[int, int] | None, ...]:
+    """(st_size, st_mtime_ns) of canonical and each sidecar, None when missing."""
+    snapshot: list[tuple[int, int] | None] = []
+    for path in (db_path, *(Path(f"{db_path}{s}") for s in _RECOVERY_SIDECAR_SUFFIXES)):
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            snapshot.append(None)
+            continue
+        snapshot.append((stat.st_size, stat.st_mtime_ns))
+    return tuple(snapshot)
+
+
+def _recovery_error_text(label: str, exc: BaseException, *, limit: int = 300) -> str:
+    """Render ``exc`` for health, never leaking raw SQLite contention text."""
+    if _is_sqlite_busy_error(exc):
+        return f"{label or type(exc).__name__}:sqlite_busy"
+    text = f"{type(exc).__name__}:{exc}"
+    return (f"{label}:{text}" if label else text)[:limit]
+
+
+def _copy_recovery_sidecars(canonical: Path, staging: Path) -> None:
+    """Copy non-empty canonical sidecars beside ``staging`` under matching names."""
+    copied_wal = False
+    for suffix in _RECOVERY_SIDECAR_SUFFIXES:
+        if suffix == "-shm" and not copied_wal:
+            continue
+        source = Path(f"{canonical}{suffix}")
+        try:
+            if source.stat().st_size <= 0:
+                continue
+        except FileNotFoundError:
+            continue
+        shutil.copyfile(source, f"{staging}{suffix}")
+        copied_wal = copied_wal or suffix == "-wal"
+
+
+def _remove_recovery_sidecars(staging: Path) -> None:
+    for suffix in _RECOVERY_SIDECAR_SUFFIXES:
+        try:
+            Path(f"{staging}{suffix}").unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _recovered_generation(conn: sqlite3.Connection) -> tuple[str, str, int]:
+    """Validate and return the recovered ``meta.last_build`` identity."""
+    row = conn.execute("SELECT value FROM meta WHERE key='last_build'").fetchone()
+    if row is None:
+        # A recovered database must carry a generation identity; an absent
+        # row is not an acceptable recovered state.
+        raise KeyError("last_build")
+    payload = json.loads(str(row["value"]))
+    if not isinstance(payload, dict):
+        raise TypeError("last_build payload is not a JSON object")
+    build_revision = payload.get("build_revision")
+    finished_at = payload.get("finished_at")
+    files_seen = payload.get("files_seen")
+    if (
+        not isinstance(build_revision, str)
+        or not build_revision
+        or not isinstance(finished_at, str)
+        or not finished_at
+    ):
+        raise ValueError("missing or empty generation metadata")
+    if not isinstance(files_seen, int) or isinstance(files_seen, bool) or files_seen < 0:
+        raise ValueError("files_seen must be a nonnegative integer")
+    return build_revision, finished_at, files_seen
 
 
 def _live_index_holder_evidence(repo_root: Path | str) -> str:
@@ -1135,195 +1242,189 @@ class SourceGraphDaemon:
                     self._status = STATUS_STOPPED
                 return {"recovered": True, "phase": "", "error": ""}
 
-            # Phase: writable open -- SQLite auto-recovers the journal/WAL on
-            # first connect in read_write mode.  This is the canonical
-            # recovery step prescribed by SQLite's hot-journal protocol.
-            self._recovery_phase = _RECOVERY_PHASE_OPEN
-            self._recovery_elapsed = time.monotonic() - self._recovery_started_at
-            try:
-                conn = source_graph.connect(db_path, read_only=False)
-            except source_graph.SourceGraphBuildInProgressError:
-                # Another process holds WAL -- we cannot force recovery here.
-                with self._state_lock:
-                    self._recovery_error = "wal_held_by_other_process"
-                    self._recovery_phase = _RECOVERY_PHASE_OPEN
-                    self._recovery_elapsed = time.monotonic() - self._recovery_started_at
-                    self._recovery_started_at = 0.0
-                return {"recovered": False, "phase": self._recovery_phase, "error": self._recovery_error}
-            except (OSError, sqlite3.Error) as exc:
-                with self._state_lock:
-                    self._recovery_error = f"connect:{type(exc).__name__}:{exc}"[:300]
-                    self._recovery_phase = _RECOVERY_PHASE_OPEN
-                    self._recovery_elapsed = time.monotonic() - self._recovery_started_at
-                    self._recovery_started_at = 0.0
-                return {"recovered": False, "phase": self._recovery_phase, "error": self._recovery_error}
-
-            try:
-                # Phase: integrity check on the recovered database.
-                self._recovery_phase = _RECOVERY_PHASE_INTEGRITY
-                self._recovery_elapsed = time.monotonic() - self._recovery_started_at
-                try:
-                    integrity = conn.execute("PRAGMA integrity_check").fetchone()
-                    if integrity and str(integrity[0]).lower() != "ok":
-                        raise sqlite3.DatabaseError(f"integrity_check:{integrity[0]}"[:300])
-                except sqlite3.Error as exc:
-                    # Integrity failure -- do NOT delete the database.
-                    # Preserve the canonical index so a human or later retry
-                    # can salvage what remains.
-                    with self._state_lock:
-                        self._recovery_error = f"integrity:{type(exc).__name__}:{exc}"[:300]
-                        self._recovery_phase = _RECOVERY_PHASE_INTEGRITY
-                        self._status = STATUS_DEGRADED
-                        self._recovery_elapsed = time.monotonic() - self._recovery_started_at
-                        self._recovery_started_at = 0.0
-                    return {"recovered": False, "phase": self._recovery_phase, "error": self._recovery_error}
-
-                # Phase: commit recovery by forcing DELETE mode and
-                # persisting any recovered state. The pragma also checkpoints
-                # and removes recovery sidecars before strict readers resume.
-                self._recovery_phase = _RECOVERY_PHASE_COMMIT
-                self._recovery_elapsed = time.monotonic() - self._recovery_started_at
-                try:
-                    conn.execute("PRAGMA journal_mode=DELETE").fetchone()
-                    conn.commit()
-                except sqlite3.Error as exc:
-                    with self._state_lock:
-                        self._recovery_error = (
-                            f"commit:{type(exc).__name__}:{exc}"[:300]
-                        )
-                        self._recovery_phase = _RECOVERY_PHASE_COMMIT
-                        self._status = STATUS_DEGRADED
-                        self._recovery_elapsed = (
-                            time.monotonic() - self._recovery_started_at
-                        )
-                        self._recovery_started_at = 0.0
-                    return {
-                        "recovered": False,
-                        "phase": self._recovery_phase,
-                        "error": self._recovery_error,
-                        "retryable": True,
-                    }
-
-                # Re-read last_build from the recovered database to refresh
-                # the daemon's in-memory state so the health surface stays
-                try:
-                    row = conn.execute(
-                        "SELECT value FROM meta WHERE key='last_build'"
-                    ).fetchone()
-                    if row is None:
-                        # A recovered canonical database must carry a
-                        # generation identity.  An absent row is not an
-                        # acceptable recovered state; fail bounded at commit,
-                        # preserve LKG, and never auto-delete.
-                        raise KeyError("last_build")
-                    payload = json.loads(str(row["value"]))
-                    if not isinstance(payload, dict):
-                        raise TypeError("last_build payload is not a JSON object")
-                    build_revision_raw = payload.get("build_revision")
-                    finished_at_raw = payload.get("finished_at")
-                    files_seen_raw = payload.get("files_seen")
-                    if (
-                        not isinstance(build_revision_raw, str)
-                        or not build_revision_raw
-                        or not isinstance(finished_at_raw, str)
-                        or not finished_at_raw
-                    ):
-                        raise ValueError("missing or empty generation metadata")
-                    if (
-                        not isinstance(files_seen_raw, int)
-                        or isinstance(files_seen_raw, bool)
-                        or files_seen_raw < 0
-                    ):
-                        raise ValueError("files_seen must be a nonnegative integer")
-                    build_revision = build_revision_raw
-                    finished_at = finished_at_raw
-                    files_seen = files_seen_raw
-                    with self._state_lock:
-                        if not self._last_report:
-                            self._last_report = {}
-                        self._last_report["build_revision"] = build_revision
-                        self._last_report["finished_at"] = finished_at
-                        self._last_report["files_seen"] = files_seen
-                        self._last_success_at = finished_at
-                except (
-                    json.JSONDecodeError,
-                    TypeError,
-                    KeyError,
-                    ValueError,
-                    AttributeError,
-                ) as exc:
-                    # Missing or malformed generation metadata is an explicit
-                    # bounded degraded failure at commit phase.  Preserve LKG
-                    # and frozen elapsed; never auto-delete the canonical DB.
-                    with self._state_lock:
-                        self._recovery_error = (
-                            f"generation_meta:{type(exc).__name__}:{exc}"[:300]
-                        )
-                        self._recovery_phase = _RECOVERY_PHASE_COMMIT
-                        self._status = STATUS_DEGRADED
-                        self._recovery_elapsed = (
-                            time.monotonic() - self._recovery_started_at
-                        )
-                        self._recovery_started_at = 0.0
-                    return {
-                        "recovered": False,
-                        "phase": self._recovery_phase,
-                        "error": self._recovery_error,
-                    }
-                except sqlite3.Error as exc:
-                    # Meta query error after recovery; preserve LKG, flag
-                    # degraded, freeze elapsed, and return the diagnostic.
-                    with self._state_lock:
-                        self._recovery_error = (
-                            f"meta_query:{type(exc).__name__}:{exc}"[:300]
-                        )
-                        self._recovery_phase = _RECOVERY_PHASE_COMMIT
-                        self._status = STATUS_DEGRADED
-                        self._recovery_elapsed = (
-                            time.monotonic() - self._recovery_started_at
-                        )
-                        self._recovery_started_at = 0.0
-                    return {
-                        "recovered": False,
-                        "phase": self._recovery_phase,
-                        "error": self._recovery_error,
-                    }
-
-                # A stale rollback journal can remain even after SQLite finds
-                # no pages to roll back. Remove it only after the recovered
-                # connection is committed and closed, before readers resume.
-                conn.close()
-                try:
-                    Path(f"{db_path}-journal").unlink(missing_ok=True)
-                except OSError as exc:
-                    with self._state_lock:
-                        self._recovery_error = (
-                            f"journal_cleanup:{type(exc).__name__}:{exc}"[:300]
-                        )
-                        self._recovery_phase = _RECOVERY_PHASE_COMMIT
-                        self._status = STATUS_DEGRADED
-                        self._recovery_elapsed = (
-                            time.monotonic() - self._recovery_started_at
-                        )
-                        self._recovery_started_at = 0.0
-                    return {
-                        "recovered": False,
-                        "phase": self._recovery_phase,
-                        "error": self._recovery_error,
-                        "retryable": True,
-                    }
-                with self._state_lock:
-                    self._recovery_phase = ""
-                    self._recovery_elapsed = time.monotonic() - self._recovery_started_at
-                    self._recovery_started_at = 0.0
-                    self._recovery_error = ""
-                    self._status = STATUS_STOPPED
-                return {"recovered": True, "phase": _RECOVERY_PHASE_COMMIT, "error": ""}
-            finally:
-                conn.close()
+            return self._recover_staged(db_path)
         finally:
             writer_lease.__exit__(None, None, None)
             self._recovery_lock.release()
+
+    def _recovery_failure(
+        self,
+        error: str,
+        phase: str,
+        *,
+        status: str | None = None,
+        retryable: bool = False,
+    ) -> dict[str, Any]:
+        """Record a terminal recovery failure with a frozen elapsed time."""
+        with self._state_lock:
+            self._recovery_error = error[:300]
+            self._recovery_phase = phase
+            if status is not None:
+                self._status = status
+            self._recovery_elapsed = time.monotonic() - self._recovery_started_at
+            self._recovery_started_at = 0.0
+        result: dict[str, Any] = {
+            "recovered": False,
+            "phase": phase,
+            "error": self._recovery_error,
+        }
+        if retryable:
+            result["retryable"] = True
+        return result
+
+    def _recover_staged(self, db_path: Path) -> dict[str, Any]:
+        """Roll a hot journal / WAL back on a private copy, then publish it.
+
+        Rolling back in place needs an EXCLUSIVE lock on the canonical file,
+        which any reader holding SHARED denies (NF-2026-01186). The canonical
+        database is therefore never opened writable: its sidecars are copied
+        beside a staged copy, SQLite replays them there, and only a verified
+        candidate replaces canonical in one atomic rename. Every failure
+        leaves the canonical database and its sidecars byte-identical, with
+        one exception: ``source_graph_generation_publication_durability_uncertain:
+        published=true`` means canonical already is the recovered generation,
+        and its sidecars are deliberately kept so the next tick replays them
+        idempotently.
+        """
+        self._recovery_phase = _RECOVERY_PHASE_OPEN
+        self._recovery_elapsed = time.monotonic() - self._recovery_started_at
+        with ExitStack() as stack:
+            try:
+                before = _recovery_snapshot(db_path)
+                staging_path = stack.enter_context(
+                    source_graph._staged_generation(db_path, copy_existing=True)
+                )
+                stack.callback(_remove_recovery_sidecars, staging_path)
+                _copy_recovery_sidecars(db_path, staging_path)
+                changed = _recovery_snapshot(db_path) != before
+            except (OSError, source_graph.SourceGraphError) as exc:
+                return self._recovery_failure(
+                    _recovery_error_text("connect", exc), _RECOVERY_PHASE_OPEN
+                )
+            if changed:
+                # Another opener rolled canonical back between the database
+                # copy and the sidecar copy: the staged pair is inconsistent.
+                return self._recovery_failure(
+                    "connect:snapshot_changed",
+                    _RECOVERY_PHASE_OPEN,
+                    status=STATUS_STANDBY,
+                    retryable=True,
+                )
+            return self._recover_staging_copy(db_path, staging_path)
+
+    def _recover_staging_copy(self, db_path: Path, staging_path: Path) -> dict[str, Any]:
+        # Phase: writable open of the PRIVATE copy -- SQLite auto-recovers the
+        # copied journal/WAL on first connect, per its hot-journal protocol.
+        try:
+            conn = source_graph.connect(staging_path, read_only=False)
+        except source_graph.SourceGraphBuildInProgressError:
+            return self._recovery_failure("wal_held_by_other_process", _RECOVERY_PHASE_OPEN)
+        except (OSError, sqlite3.Error) as exc:
+            busy = _is_sqlite_busy_error(exc)
+            return self._recovery_failure(
+                _recovery_error_text("connect", exc),
+                _RECOVERY_PHASE_OPEN,
+                status=STATUS_STANDBY if busy else None,
+                retryable=busy,
+            )
+        try:
+            self._recovery_phase = _RECOVERY_PHASE_INTEGRITY
+            self._recovery_elapsed = time.monotonic() - self._recovery_started_at
+            try:
+                integrity = conn.execute("PRAGMA integrity_check").fetchone()
+                if integrity and str(integrity[0]).lower() != "ok":
+                    raise sqlite3.DatabaseError(f"integrity_check:{integrity[0]}"[:300])
+            except sqlite3.Error as exc:
+                # Integrity failure -- the staged copy is discarded and the
+                # canonical index is preserved untouched so a human or later
+                # retry can salvage what remains.
+                return self._recovery_failure(
+                    _recovery_error_text("integrity", exc),
+                    _RECOVERY_PHASE_INTEGRITY,
+                    status=STATUS_DEGRADED,
+                )
+
+            # Phase: commit recovery by forcing DELETE mode and persisting the
+            # recovered state. The pragma also checkpoints and removes the
+            # staged sidecars so the published file is self-contained.
+            self._recovery_phase = _RECOVERY_PHASE_COMMIT
+            self._recovery_elapsed = time.monotonic() - self._recovery_started_at
+            try:
+                conn.execute("PRAGMA journal_mode=DELETE").fetchone()
+                conn.commit()
+            except sqlite3.Error as exc:
+                return self._recovery_failure(
+                    _recovery_error_text("commit", exc),
+                    _RECOVERY_PHASE_COMMIT,
+                    status=STATUS_DEGRADED,
+                    retryable=True,
+                )
+
+            try:
+                build_revision, finished_at, files_seen = _recovered_generation(conn)
+            except (
+                json.JSONDecodeError,
+                TypeError,
+                KeyError,
+                ValueError,
+                AttributeError,
+            ) as exc:
+                # Missing or malformed generation metadata is an explicit
+                # bounded degraded failure at commit phase.  Preserve LKG
+                # and frozen elapsed; never auto-delete the canonical DB.
+                return self._recovery_failure(
+                    f"generation_meta:{type(exc).__name__}:{exc}",
+                    _RECOVERY_PHASE_COMMIT,
+                    status=STATUS_DEGRADED,
+                )
+            except sqlite3.Error as exc:
+                return self._recovery_failure(
+                    _recovery_error_text("meta_query", exc),
+                    _RECOVERY_PHASE_COMMIT,
+                    status=STATUS_DEGRADED,
+                )
+        finally:
+            conn.close()
+
+        try:
+            source_graph._publish_staged_generation(staging_path, db_path)
+        except (OSError, sqlite3.Error, source_graph.SourceGraphError) as exc:
+            # A canonical file held open by a reader (Windows denies the
+            # replace) is contention, not damage: stand by and retry.
+            busy = _is_publish_contention(exc)
+            return self._recovery_failure(
+                "publish:sqlite_busy" if busy else _recovery_error_text("publish", exc),
+                _RECOVERY_PHASE_COMMIT,
+                status=STATUS_STANDBY if busy else STATUS_DEGRADED,
+                retryable=True,
+            )
+        with self._state_lock:
+            if not self._last_report:
+                self._last_report = {}
+            self._last_report["build_revision"] = build_revision
+            self._last_report["finished_at"] = finished_at
+            self._last_report["files_seen"] = files_seen
+            self._last_success_at = finished_at
+
+        # The canonical sidecars describe the replaced generation. Remove them
+        # only after a successful publish, before readers resume.
+        for suffix in _RECOVERY_SIDECAR_SUFFIXES:
+            try:
+                Path(f"{db_path}{suffix}").unlink(missing_ok=True)
+            except OSError as exc:
+                return self._recovery_failure(
+                    f"journal_cleanup:{type(exc).__name__}:{exc}",
+                    _RECOVERY_PHASE_COMMIT,
+                    status=STATUS_DEGRADED,
+                    retryable=True,
+                )
+        with self._state_lock:
+            self._recovery_phase = ""
+            self._recovery_elapsed = time.monotonic() - self._recovery_started_at
+            self._recovery_started_at = 0.0
+            self._recovery_error = ""
+            self._status = STATUS_STOPPED
+        return {"recovered": True, "phase": _RECOVERY_PHASE_COMMIT, "error": ""}
 
     def _run_build_subprocess(self, *, incremental: bool) -> dict[str, Any]:
         command = self._build_subprocess_command(incremental=incremental)
@@ -1701,7 +1802,7 @@ class SourceGraphDaemon:
             except Exception as exc:  # noqa: BLE001 -- a failed index must never crash the MCP process
                 with self._state_lock:
                     self._status = STATUS_DEGRADED
-                    self._last_error = f"{type(exc).__name__}:{exc}"[:500]
+                    self._last_error = _recovery_error_text("", exc, limit=500)
                     self._last_run_at = _utcnow()
             return True
         finally:

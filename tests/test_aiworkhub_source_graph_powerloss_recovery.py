@@ -10,6 +10,7 @@ separate from local freshness.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import threading
@@ -1375,3 +1376,302 @@ def test_recovery_missing_required_generation_keys_is_degraded(
     assert health["recovery"]["error"] == result["error"]
     assert health["last_known_good_generation"]["files_seen"] == 4
     assert db_path.exists(), "failed recovery must preserve the canonical DB"
+
+
+# ---------------------------------------------------------------------------
+# 16. NF-2026-01186: recovery runs on a private staged copy; contention is a
+#     typed retryable reason, never raw "database is locked".
+# ---------------------------------------------------------------------------
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _staging_leftovers(db_path: Path) -> list[str]:
+    prefix = source_graph._staging_prefix(db_path)
+    return sorted(p.name for p in db_path.parent.iterdir() if p.name.startswith(prefix))
+
+
+def _built_repo_with_crash_journal(tmp_path: Path, cleanup_daemons, name: str):
+    root = _init_repo(tmp_path, name)
+    cleanup_daemons.append(root)
+    (root / "app.py").write_text("def f(): return 1\n", encoding="utf-8")
+    assert source_graph.build_index(root, incremental=False).files_seen > 0
+    db_path = source_graph.resolve_db_path(root)
+    journal_path = _create_crash_journal(db_path)
+    return root, db_path, journal_path
+
+
+def test_staged_recovery_never_opens_canonical_writable(tmp_path, monkeypatch, cleanup_daemons):
+    root, db_path, journal_path = _built_repo_with_crash_journal(
+        tmp_path, cleanup_daemons, "staged_recovery_a"
+    )
+    canonical_sha = _sha256(db_path)
+    writable_opens: list[tuple[str, str]] = []
+    original_connect = source_graph.connect
+
+    def spy_connect(db_p, *, read_only=False):
+        if not read_only:
+            writable_opens.append((str(Path(db_p).resolve()), _sha256(db_path)))
+        return original_connect(db_p, read_only=read_only)
+
+    monkeypatch.setattr(source_graph, "connect", spy_connect)
+
+    result = source_graph_daemon.SourceGraphDaemon(root)._recover_database()
+
+    assert result["recovered"] is True, result
+    assert writable_opens, "recovery never opened the staged copy writable"
+    for opened, sha_at_open in writable_opens:
+        assert opened != str(db_path.resolve()), "canonical DB opened read_only=False"
+        assert sha_at_open == canonical_sha, "canonical bytes changed before publish"
+    assert not journal_path.exists()
+    conn = sqlite3.connect(str(db_path))
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM _crash_test WHERE x=999").fetchone()[0] == 0
+    finally:
+        conn.close()
+    assert _staging_leftovers(db_path) == []
+
+
+def test_staged_recovery_with_concurrent_reader_holding_shared(tmp_path, cleanup_daemons):
+    root, db_path, journal_path = _built_repo_with_crash_journal(
+        tmp_path, cleanup_daemons, "staged_recovery_b"
+    )
+    journal_bytes = journal_path.read_bytes()
+    # A reader cannot start while the hot journal exists (it would roll it
+    # back itself), so take SHARED first and then restore the journal bytes.
+    journal_path.unlink()
+    reader = sqlite3.connect(str(db_path), timeout=0.1, isolation_level=None)
+    try:
+        reader.execute("BEGIN")
+        assert reader.execute("SELECT COUNT(*) FROM files").fetchone()[0] > 0
+        journal_path.write_bytes(journal_bytes)
+        canonical_sha = _sha256(db_path)
+
+        daemon = source_graph_daemon.SourceGraphDaemon(root)
+        result = daemon._recover_database()
+
+        if result["recovered"] is not True:
+            assert result["recovered"] is False, result
+            assert result.get("retryable") is True, result
+            assert daemon._status == source_graph_daemon.STATUS_STANDBY
+            assert "database is locked" not in result["error"]
+            assert _sha256(db_path) == canonical_sha
+            assert journal_path.read_bytes() == journal_bytes
+    finally:
+        reader.close()
+
+    assert daemon._recover_database()["recovered"] is True
+    assert not journal_path.exists()
+    assert _staging_leftovers(db_path) == []
+
+
+def test_staged_recovery_busy_open_is_typed_standby(tmp_path, monkeypatch, cleanup_daemons):
+    root, db_path, journal_path = _built_repo_with_crash_journal(
+        tmp_path, cleanup_daemons, "staged_recovery_c"
+    )
+    original_connect = source_graph.connect
+
+    def busy_connect(db_p, *, read_only=False):
+        if not read_only:
+            raise sqlite3.OperationalError("database is locked")
+        return original_connect(db_p, read_only=read_only)
+
+    monkeypatch.setattr(source_graph, "connect", busy_connect)
+
+    daemon = source_graph_daemon.SourceGraphDaemon(root)
+    result = daemon._recover_database()
+    health = daemon.health()
+
+    assert result["recovered"] is False
+    assert result["retryable"] is True
+    assert result["error"] == "connect:sqlite_busy"
+    assert daemon._status == source_graph_daemon.STATUS_STANDBY
+    assert "database is locked" not in health["recovery"]["error"]
+    assert "database is locked" not in health["last_error"]
+    assert journal_path.exists()
+    assert _staging_leftovers(db_path) == []
+
+
+def test_staged_recovery_integrity_failure_preserves_canonical(
+    tmp_path, monkeypatch, cleanup_daemons
+):
+    root, db_path, journal_path = _built_repo_with_crash_journal(
+        tmp_path, cleanup_daemons, "staged_recovery_d"
+    )
+    canonical_sha = _sha256(db_path)
+    journal_sha = _sha256(journal_path)
+    original_connect = source_graph.connect
+
+    class _CorruptIntegrity:
+        def __init__(self, real_conn):
+            self._real = real_conn
+
+        def execute(self, sql, *args, **kwargs):
+            if "integrity_check" in str(sql).lower():
+                raise sqlite3.DatabaseError("database disk image is malformed")
+            return self._real.execute(sql, *args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+    def corrupt_connect(db_p, *, read_only=False):
+        conn = original_connect(db_p, read_only=read_only)
+        return conn if read_only else _CorruptIntegrity(conn)
+
+    monkeypatch.setattr(source_graph, "connect", corrupt_connect)
+
+    result = source_graph_daemon.SourceGraphDaemon(root)._recover_database()
+
+    assert result["recovered"] is False
+    assert result["phase"] == source_graph_daemon._RECOVERY_PHASE_INTEGRITY
+    assert "malformed" in result["error"]
+    assert _sha256(db_path) == canonical_sha
+    assert _sha256(journal_path) == journal_sha
+    assert _staging_leftovers(db_path) == []
+
+
+_HOT_JOURNAL_MAGIC = bytes.fromhex("d9d505f920a163d7")
+
+
+def _hot_journal_image(db_path: Path, journal_path: Path) -> tuple[bytes, bytes]:
+    """Capture a REAL hot journal: dirty DB pages plus the journal that undoes them.
+
+    ``_create_crash_journal`` leaves a cold journal (zeroed header), which
+    SQLite ignores. A tiny page cache forces the open UPDATE to spill dirty
+    pages into the database file, so both files are read mid-transaction.
+    """
+    journal_path.unlink(missing_ok=True)
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.executemany("INSERT INTO _crash_test(x) VALUES (?)", [(1,)] * 50000)
+        conn.commit()
+    finally:
+        conn.close()
+    conn = sqlite3.connect(str(db_path), isolation_level=None)
+    try:
+        conn.execute("PRAGMA cache_size=2")
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("UPDATE _crash_test SET x=999")
+        dirty = db_path.read_bytes()
+        hot = journal_path.read_bytes()
+        conn.execute("ROLLBACK")
+    finally:
+        conn.close()
+    assert hot[:8] == _HOT_JOURNAL_MAGIC, "journal is not hot"
+    return dirty, hot
+
+
+def _count_999_and_integrity(db_path: Path) -> tuple[int, str]:
+    conn = sqlite3.connect(str(db_path))
+    try:
+        count = conn.execute("SELECT COUNT(*) FROM _crash_test WHERE x=999").fetchone()[0]
+        integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+    finally:
+        conn.close()
+    return count, str(integrity)
+
+
+def test_staged_recovery_rolls_back_real_hot_journal(tmp_path, cleanup_daemons):
+    root, db_path, journal_path = _built_repo_with_crash_journal(
+        tmp_path, cleanup_daemons, "staged_recovery_hot"
+    )
+    dirty, hot = _hot_journal_image(db_path, journal_path)
+    db_path.write_bytes(dirty)
+    journal_path.write_bytes(hot)
+
+    result = source_graph_daemon.SourceGraphDaemon(root)._recover_database()
+
+    assert result["recovered"] is True, result
+    assert not journal_path.exists()
+    assert _count_999_and_integrity(db_path) == (0, "ok")
+    assert _staging_leftovers(db_path) == []
+
+
+def test_staged_recovery_hot_journal_under_shared_reader_is_not_locked(
+    tmp_path, cleanup_daemons
+):
+    root, db_path, journal_path = _built_repo_with_crash_journal(
+        tmp_path, cleanup_daemons, "staged_recovery_shared"
+    )
+    dirty, hot = _hot_journal_image(db_path, journal_path)
+    # A reader cannot start while the hot journal exists (it would roll it
+    # back itself), so take SHARED on the clean DB, then install the image.
+    reader = sqlite3.connect(str(db_path), timeout=0.1, isolation_level=None)
+    try:
+        reader.execute("BEGIN")
+        assert reader.execute("SELECT COUNT(*) FROM files").fetchone()[0] > 0
+        with open(db_path, "r+b") as handle:
+            handle.write(dirty)
+            handle.truncate()
+        journal_path.write_bytes(hot)
+
+        daemon = source_graph_daemon.SourceGraphDaemon(root)
+        started = time.monotonic()
+        result = daemon._recover_database()
+        elapsed = time.monotonic() - started
+        health = daemon.health()
+
+        assert elapsed < 15.0, (elapsed, result)
+        assert "database is locked" not in result["error"]
+        assert "database is locked" not in str(health["recovery"]["error"])
+        assert "database is locked" not in str(health["last_error"])
+        if result["recovered"] is not True:
+            assert result["recovered"] is False, result
+            assert result.get("retryable") is True, result
+            assert daemon._status == source_graph_daemon.STATUS_STANDBY
+    finally:
+        reader.close()
+
+    assert daemon._recover_database()["recovered"] is True
+    assert _count_999_and_integrity(db_path) == (0, "ok")
+    assert _staging_leftovers(db_path) == []
+
+
+def test_staged_recovery_snapshot_change_between_copies_is_retryable(
+    tmp_path, monkeypatch, cleanup_daemons
+):
+    root, db_path, journal_path = _built_repo_with_crash_journal(
+        tmp_path, cleanup_daemons, "staged_recovery_snapshot"
+    )
+    dirty, hot = _hot_journal_image(db_path, journal_path)
+    db_path.write_bytes(dirty)
+    journal_path.write_bytes(hot)
+    original_copy = source_graph_daemon._copy_recovery_sidecars
+
+    def racing_copy(canonical, staging):
+        # Another opener rolls canonical back between the two copies.
+        other = sqlite3.connect(str(canonical))
+        try:
+            other.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()
+        finally:
+            other.close()
+        return original_copy(canonical, staging)
+
+    monkeypatch.setattr(source_graph_daemon, "_copy_recovery_sidecars", racing_copy)
+
+    daemon = source_graph_daemon.SourceGraphDaemon(root)
+    result = daemon._recover_database()
+
+    assert result["recovered"] is False, result
+    assert result["retryable"] is True
+    assert result["error"] == "connect:snapshot_changed"
+    assert daemon._status == source_graph_daemon.STATUS_STANDBY
+    assert _count_999_and_integrity(db_path) == (0, "ok")
+    assert _staging_leftovers(db_path) == []
+
+
+def test_staged_recovery_publish_permission_error_is_contention_only_on_windows(
+    monkeypatch,
+):
+    platform_io = source_graph_daemon.platform_io
+    locked = sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(platform_io, "is_windows", lambda: False)
+    assert source_graph_daemon._is_publish_contention(PermissionError(13, "denied")) is False
+    assert source_graph_daemon._is_publish_contention(locked) is True
+
+    monkeypatch.setattr(platform_io, "is_windows", lambda: True)
+    assert source_graph_daemon._is_publish_contention(PermissionError(13, "denied")) is True
+    assert source_graph_daemon._is_publish_contention(locked) is True
