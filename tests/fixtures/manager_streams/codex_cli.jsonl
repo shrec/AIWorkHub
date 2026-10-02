@@ -1,0 +1,12 @@
+{"type":"thread.started","thread_id":"00000000-0000-4000-8000-000000000001"}
+{"type":"turn.started"}
+{"type":"item.started","item":{"id":"item_0","type":"command_execution","command":"\"C:\\\\Program Files\\\\PowerShell\\\\7\\\\pwsh.exe\" -Command 'git --version'","aggregated_output":"","exit_code":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_0","type":"command_execution","command":"\"C:\\\\Program Files\\\\PowerShell\\\\7\\\\pwsh.exe\" -Command 'git --version'","aggregated_output":"git version 2.45.2.windows.1\n","exit_code":0,"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"I’m creating `notes.txt` with `alpha`, then I’ll immediately update it to `beta`."}}
+{"type":"item.started","item":{"id":"item_2","type":"file_change","changes":[{"path":"<workdir>\\notes.txt","kind":"add"}],"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_2","type":"file_change","changes":[{"path":"<workdir>\\notes.txt","kind":"add"}],"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_3","type":"agent_message","text":"`notes.txt` exists now; I’m making the requested one-line edit."}}
+{"type":"item.started","item":{"id":"item_4","type":"file_change","changes":[{"path":"<workdir>\\notes.txt","kind":"update"}],"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_4","type":"file_change","changes":[{"path":"<workdir>\\notes.txt","kind":"update"}],"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_5","type":"agent_message","text":"done"}}
+{"type":"turn.completed","usage":{"input_tokens":58122,"cached_input_tokens":42496,"cache_write_input_tokens":0,"output_tokens":680,"reasoning_output_tokens":516}}
