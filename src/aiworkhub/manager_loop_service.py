@@ -225,6 +225,25 @@ def _pin_first_route(
     return session, None
 
 
+def _turn_delivered(raw: Mapping[str, Any]) -> bool:
+    """Whether the model received the turn's message.
+
+    A turn is delivered when it is ok, or when every error it carries arose
+    after the model was reached (the Context Graph turn write, the event cap).
+    """
+    if raw.get("ok"):
+        return True
+    errors = raw.get("errors") or ()
+    return bool(errors) and all(
+        isinstance(error, Mapping)
+        and (
+            error.get("source") == "context_graph_event_write"
+            or (error.get("source"), error.get("error")) == ("loop", "turn_event_limit")
+        )
+        for error in errors
+    )
+
+
 def _dispatch_turn(
     repo: str | Path,
     action: Callable[[ManagerOrchestrator], dict[str, Any]],
@@ -232,6 +251,7 @@ def _dispatch_turn(
     record_last_turn: bool,
     pin_passive_route: bool = False,
     route: tuple[str, str] | None = None,
+    on_finished: Callable[[bool], None] | None = None,
 ) -> dict[str, Any]:
     entry, err = _entry_or_error(repo)
     if err is not None:
@@ -272,8 +292,10 @@ def _dispatch_turn(
     session_id = session.session_id
 
     def run() -> None:
+        delivered = False
         try:
             raw = action(entry.orchestrator)
+            delivered = _turn_delivered(raw)
             if record_last_turn:
                 entry.last_turn = {
                     "turn": raw.get("turn", turn),
@@ -282,11 +304,20 @@ def _dispatch_turn(
                     "reply": str(raw.get("reply", ""))[:500],
                 }
         except Exception as exc:  # noqa: BLE001 - a dead thread must still record the turn's outcome
+            delivered = False
             if record_last_turn:
                 detail = f"{type(exc).__name__}: {exc}"[:240]
                 entry.last_turn = {"turn": turn, "ok": False, "errors": [detail], "reply": ""}
         finally:
             entry.turn_lock.release()
+            # Report the started turn's outcome exactly once, after the lock is
+            # free (a wake consumer may start its next member from the callback).
+            # A failing callback must never skip the re-arm below.
+            if on_finished is not None:
+                try:
+                    on_finished(delivered)
+                except Exception:  # noqa: BLE001 - the outcome callback must never kill the turn thread
+                    pass
             # Re-read the seat now the turn is over. A session that idled past the
             # seat lease got no wake consumer when it was loaded, and whichever send
             # revived it just logged its activity: that arms the consumer, leaves a
@@ -606,11 +637,19 @@ def wait_for_idle(repo: str | Path, timeout: float | None = None) -> bool:
     return not thread.is_alive()
 
 
-def _wake_dispatch(repo: str | Path, member: Mapping[str, Any]) -> bool:
-    """Start one callback's turn through the SAME non-blocking lock ``send`` uses."""
+def _wake_dispatch(
+    repo: str | Path, member: Mapping[str, Any], done: Callable[[bool], None]
+) -> bool:
+    """Start one callback's turn through the SAME non-blocking lock ``send`` uses.
+
+    Returns whether the turn STARTED; ``done(delivered)`` follows once it finishes.
+    """
 
     result = _dispatch_turn(
-        repo, lambda orchestrator: orchestrator.wake(member), record_last_turn=True
+        repo,
+        lambda orchestrator: orchestrator.wake(member),
+        record_last_turn=True,
+        on_finished=done,
     )
     return bool(result.get("ok"))
 
@@ -667,7 +706,7 @@ def _ensure_wake_started(entry: _Entry, repo: str | Path) -> None:
                 entry.wake = manager_loop_wake.WakeConsumer(
                     claim=claim,
                     ack=ack,
-                    dispatch=lambda member: _wake_dispatch(repo, member),
+                    dispatch=lambda member, done: _wake_dispatch(repo, member, done),
                     cap_per_hour=entry.wake_cap_per_hour,
                     idle_poll_seconds=WAKE_IDLE_POLL_SECONDS,
                     retry_poll_seconds=WAKE_RETRY_POLL_SECONDS,
@@ -705,5 +744,8 @@ def _wake_status(entry: _Entry) -> dict[str, Any]:
             "queued": 0,
             "turns_this_hour": 0,
             "cap": entry.wake_cap_per_hour,
+            "in_flight": 0,
+            "failed_turns": 0,
+            "retry_in_seconds": 0.0,
         }
     return wake.status()

@@ -6,10 +6,13 @@ the existing lease API -- the same claim/ack primitives behind
 (``callback_store.claim_pending_callback_batch`` and
 ``callback_store.acknowledge_callback_batch``) -- and turns each member into
 a manager turn dispatched through the SAME non-blocking turn lock
-``manager_loop_service.send`` uses. A batch is acked only once every one of
-its members' turns has STARTED; a member that could not start (the lock was
-busy, or the hourly automatic-turn cap was reached) stays queued in memory
-and its batch stays un-acked, so a crash before ack re-delivers it.
+``manager_loop_service.send`` uses. At most one member's turn is in flight.
+A batch is acked only once every one of its members' turns has FINISHED and
+was delivered; only a delivered turn counts toward the hourly cap. A member
+that could not start (the lock was busy, or the hourly automatic-turn cap was
+reached) stays queued in memory; a member whose turn failed goes back to the
+front of the queue and is retried after a backoff. Either way its batch stays
+un-acked, so a crash before ack re-delivers it.
 
 No new callback system: :class:`WakeConsumer` never touches a database or an
 orchestrator directly -- ``claim``/``ack``/``dispatch`` are injected, which is
@@ -22,15 +25,17 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, Callable, Mapping, Optional
 
 ClaimFn = Callable[[], Optional[Mapping[str, Any]]]
 AckFn = Callable[[str, str], bool]
-DispatchFn = Callable[[Mapping[str, Any]], bool]
+DispatchFn = Callable[[Mapping[str, Any], Callable[[bool], None]], bool]
 
 DEFAULT_CAP_PER_HOUR = 12
 DEFAULT_IDLE_POLL_SECONDS = 1.0
 DEFAULT_RETRY_POLL_SECONDS = 0.2
+DEFAULT_FAILED_TURN_BACKOFF_SECONDS = 300.0
 _HOUR_SECONDS = 3600.0
 
 
@@ -46,14 +51,27 @@ class _BatchState:
     remaining: int
 
 
+@dataclass
+class _Turn:
+    queued: _QueuedMember
+    finished: bool = False
+    dequeued: bool = False
+
+
 class WakeConsumer:
     """One repository's automatic-wake background thread.
 
     ``claim`` and ``ack`` stand in for the callback lease API (a fake in
     tests, the real outbox in production -- see :func:`default_callback_source`).
-    ``dispatch`` attempts to start one member's turn through the caller's own
-    non-blocking turn lock and reports only whether the turn STARTED, never
-    whether it finished -- that is all acking needs to know.
+    ``dispatch(member, done)`` attempts to start one member's turn through the
+    caller's own non-blocking turn lock and returns whether the turn STARTED.
+    For a started turn the dispatcher calls ``done(delivered)`` once, when the
+    turn finishes; if dispatch returns False or raises, ``done`` is not
+    expected and the member stays queued. A delivered turn counts toward the
+    cap and settles its batch; a failed one is requeued at the front, un-acked
+    and uncounted, and the consumer pauses for ``failed_turn_backoff_seconds``
+    (on ``clock``) before retrying it. Retries are unbounded on purpose: a
+    callback is never dropped because the provider is down.
     """
 
     def __init__(
@@ -65,6 +83,7 @@ class WakeConsumer:
         cap_per_hour: int = DEFAULT_CAP_PER_HOUR,
         idle_poll_seconds: float = DEFAULT_IDLE_POLL_SECONDS,
         retry_poll_seconds: float = DEFAULT_RETRY_POLL_SECONDS,
+        failed_turn_backoff_seconds: float = DEFAULT_FAILED_TURN_BACKOFF_SECONDS,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._claim = claim
@@ -73,12 +92,16 @@ class WakeConsumer:
         self._cap_per_hour = max(0, int(cap_per_hour))
         self._idle_poll_seconds = max(0.0, float(idle_poll_seconds))
         self._retry_poll_seconds = max(0.0, float(retry_poll_seconds))
+        self._failed_turn_backoff_seconds = max(0.0, float(failed_turn_backoff_seconds))
         self._clock = clock
 
         self._state_lock = threading.Lock()
         self._queue: list[_QueuedMember] = []
         self._batches: dict[str, _BatchState] = {}
         self._turn_times: list[float] = []
+        self._in_flight: _Turn | None = None
+        self._failed_turns = 0
+        self._retry_at = float("-inf")
 
         self._run_lock = threading.Lock()
         self._stop = threading.Event()
@@ -97,7 +120,7 @@ class WakeConsumer:
             return True
 
     def stop(self, timeout: float | None = None) -> None:
-        """Stop the background thread. Any batch not yet fully started stays un-acked."""
+        """Stop the background thread. Any batch not yet fully delivered stays un-acked."""
 
         self._stop.set()
         with self._run_lock:
@@ -115,6 +138,9 @@ class WakeConsumer:
                 "queued": len(self._queue),
                 "turns_this_hour": len(self._turn_times),
                 "cap": self._cap_per_hour,
+                "in_flight": 0 if self._in_flight is None else 1,
+                "failed_turns": self._failed_turns,
+                "retry_in_seconds": max(0.0, float(self._retry_at - self._clock())),
             }
 
     def _prune_turn_times_locked(self) -> None:
@@ -136,12 +162,18 @@ class WakeConsumer:
                 self._enqueue_batch(batch)
                 self._drain_queue()
                 continue
-            wait_seconds = self._retry_poll_seconds if self._has_queued() else self._idle_poll_seconds
-            self._stop.wait(wait_seconds)
+            self._stop.wait(self._next_wait_seconds())
 
-    def _has_queued(self) -> bool:
+    def _next_wait_seconds(self) -> float:
+        # A paused consumer (a turn just failed) waits the idle poll, not the
+        # retry poll: nothing can start before the backoff elapses anyway.
         with self._state_lock:
-            return bool(self._queue)
+            if self._queue and not self._paused_locked():
+                return self._retry_poll_seconds
+            return self._idle_poll_seconds
+
+    def _paused_locked(self) -> bool:
+        return self._clock() < self._retry_at
 
     def _enqueue_batch(self, batch: Mapping[str, Any]) -> None:
         batch_id = str(batch.get("batch_id") or "")
@@ -164,26 +196,75 @@ class WakeConsumer:
             self._queue.extend(_QueuedMember(member=member, batch_id=batch_id) for member in members)
 
     def _drain_queue(self) -> bool:
-        """Try to start every queued member once, in order. Returns True if any started."""
+        """Start the next queued member, in order, while nothing is in flight.
+
+        Returns True if a turn started. The started member leaves the queue and
+        becomes the single in-flight member; nothing is counted or acked until
+        its ``done`` reports the outcome (see :meth:`_finish_turn`). A member
+        whose dispatch did not start stays at the front of the queue throughout.
+        """
 
         started_any = False
         while True:
             with self._state_lock:
-                if not self._queue or not self._under_cap_locked():
+                if (
+                    self._in_flight is not None
+                    or not self._queue
+                    or self._paused_locked()
+                    or not self._under_cap_locked()
+                ):
                     break
                 queued = self._queue[0]
+                turn = _Turn(queued=queued)
+                self._in_flight = turn
             try:
-                started = bool(self._dispatch(queued.member))
+                started = bool(self._dispatch(queued.member, partial(self._finish_turn, turn)))
             except Exception:  # noqa: BLE001 -- a dispatch failure must never kill the consumer
                 started = False
-            if not started:
-                break
             with self._state_lock:
-                self._queue.pop(0)
-                self._turn_times.append(self._clock())
+                if not started:
+                    # The turn never started: no done() is expected, so the
+                    # member simply stays queued.
+                    if not turn.finished:
+                        turn.finished = True
+                        if self._in_flight is turn:
+                            self._in_flight = None
+                    break
+                self._leave_queue_locked(turn)
             started_any = True
-            self._settle_batch(queued.batch_id)
         return started_any
+
+    def _leave_queue_locked(self, turn: _Turn) -> None:
+        if not turn.dequeued:
+            turn.dequeued = True
+            self._queue = [queued for queued in self._queue if queued is not turn.queued]
+
+    def _finish_turn(self, turn: _Turn, delivered: bool) -> None:
+        """``done`` for one started turn: thread-safe, idempotent, never raises.
+
+        A delivered turn counts toward the hourly cap and settles its batch. A
+        failed one goes back to the front of the queue, un-acked and uncounted,
+        and pauses the consumer for ``failed_turn_backoff_seconds``.
+        """
+
+        try:
+            with self._state_lock:
+                if turn.finished:
+                    return
+                turn.finished = True
+                if self._in_flight is turn:
+                    self._in_flight = None
+                self._leave_queue_locked(turn)
+                if not delivered:
+                    self._queue.insert(0, turn.queued)
+                    self._failed_turns += 1
+                    self._retry_at = self._clock() + self._failed_turn_backoff_seconds
+                    return
+                self._turn_times.append(self._clock())
+                self._failed_turns = 0
+            self._settle_batch(turn.queued.batch_id)
+        except Exception:  # noqa: BLE001 -- done runs on the turn thread and must never raise
+            pass
 
     def _settle_batch(self, batch_id: str) -> None:
         with self._state_lock:
