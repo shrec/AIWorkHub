@@ -2124,15 +2124,19 @@ def test_manager_chat_event_tail_holds_the_longest_line_the_writer_can_log(tmp_p
     store = manager_loop.SessionStore(tmp_path / "manager_loop", "repo_event_tail")
     log = store.root / "events" / f"{_SEAT_SESSION}.jsonl"
     cap = manager_loop.MAX_EVENT_PAYLOAD_BYTES
-    frame = len(json.dumps({"text": ""}, separators=(",", ":")))
-    # The longest payloads the writer accepts: text that fills the cap with the characters
-    # json.dumps escapes to the most bytes per byte of UTF-8 (a 2-byte one becomes 6, a
-    # 4-byte one 12), and text past the cap, which is logged as a preview with its quotes
-    # and backslashes doubled.
+    bound = manager_loop.FIELD_BOUNDS["text"]
+    assert bound == max(manager_loop.FIELD_BOUNDS.values())
+    # The longest lines the writer logs: the largest bounded field filled to its bound with
+    # the characters json.dumps escapes to the most bytes per byte of UTF-8 (a control
+    # character becomes 6, a 2-byte one 6, a 4-byte one 12), that field past its bound,
+    # which is cut and marked with its quotes doubled, and unbounded fields past the
+    # payload cap, which collapse to a preview.
     payloads = {
-        "two_byte": {"text": chr(0xE9) * ((cap - frame) // 2)},
-        "four_byte": {"text": "\U0001f600" * ((cap - frame) // 4)},
-        "preview": {"text": '"' * (4 * cap)},
+        "control": {"text": "\x01" * bound},
+        "two_byte": {"text": chr(0xE9) * (bound // 2)},
+        "four_byte": {"text": "\U0001f600" * (bound // 4)},
+        "cut": {"text": '"' * (4 * bound)},
+        "preview": {"note": '"' * (4 * cap)},
     }
 
     for name, payload in payloads.items():
@@ -2142,7 +2146,7 @@ def test_manager_chat_event_tail_holds_the_longest_line_the_writer_can_log(tmp_p
         )
         line = log.read_bytes().splitlines(keepends=True)[-1]
 
-        assert ("truncated" in event["payload"]) == (name == "preview"), name
+        assert ("truncated" in event["payload"]) == (name in ("cut", "preview")), name
         assert len(line) <= callback_store._MANAGER_CHAT_EVENT_TAIL_BYTES, name
         newest = callback_store._manager_chat_last_event_at(
             store.root, _SEAT_SESSION, not_after=now
