@@ -43,7 +43,7 @@ Measured (`claude_cli.jsonl`): `result.usage` is cumulative over the turn's four
 ## P1b-3. Codex
 
 As the plan, plus: `cache_write` reads `usage.cache_write_input_tokens` (the fixture carries it, 0).
-`input` = `input_tokens` - `cached_input_tokens` (58218 - 43520 = 14698). The stream reports no window
+`input` = `input_tokens` - `cached_input_tokens` (58122 - 42496 = 15626 in the committed fixture). The stream reports no window
 and no per-call usage, so `context_window` and `context_fill` are `None`. `command` keeps the
 provider's full command string (the fixture wraps it in a pwsh invocation); `exit_code` is `None` on
 `item.started`. `file_change` events are emitted on `item.completed` only, one per `changes[]` entry.
