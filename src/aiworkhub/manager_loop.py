@@ -835,6 +835,19 @@ class ManagerOrchestrator:
         try:
             previous = self.store.latest_closed()
             handoff = self.store.read_handoff(previous.session_id) if previous else ""
+            if any(
+                event.get("type") in ("user_message", "callback", "assistant_text")
+                for event in self.store.events(session.session_id)
+            ):
+                # The new route continues this conversation, so it gets this
+                # session's own turns first; the previous closed handoff yields.
+                own = _clip(self._mechanical_handoff(
+                    session, "route_bind", f"rebound onto {backend_id}/{model}",
+                ), MAX_HANDOFF_BYTES)
+                room = MAX_HANDOFF_BYTES - len(own.encode("utf-8")) - 2
+                if handoff.strip() and room > len(_CLIP_MARK):
+                    own = f"{own}\n\n{_clip(handoff, room)}"
+                handoff = own
             brief = self.brief_builder.build(handoff)
             backend = self._backend_factory(backend_id, model)
             provider_ref = backend.start(brief)

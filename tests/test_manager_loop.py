@@ -954,6 +954,110 @@ def test_the_first_message_on_a_route_opens_one_session_and_a_loaded_one_stays(m
     assert len(again.store.sessions()) == 1
 
 
+_ASKED = "ZEBRA-owner-question-7731"
+_ANSWERED = "OKAPI-manager-reply-4412"
+
+
+def _record_handoffs(monkeypatch) -> list[str]:
+    """Every handoff text handed to a BriefBuilder from now on."""
+    seen: list[str] = []
+    real = ml.BriefBuilder.build
+
+    def build(self: ml.BriefBuilder, handoff: str = "") -> str:
+        seen.append(handoff)
+        return real(self, handoff)
+
+    monkeypatch.setattr(ml.BriefBuilder, "build", build)
+    return seen
+
+
+def _one_turn(harness: Harness) -> ml.ManagerSession:
+    session = harness.orch.continue_on_route("fake", "model-a")
+    harness.backends[-1].script.append([
+        {"type": "assistant_text", "payload": {"text": _ANSWERED}},
+        {"type": "turn_end", "payload": {}},
+    ])
+    assert harness.orch.send(_ASKED)["reply"] == _ANSWERED
+    return session
+
+
+def _closed_with_handoff(store: ml.SessionStore, text: str) -> None:
+    stamp = "2026-09-21T00:00:00+00:00"
+    closed = ml.ManagerSession(
+        session_id="older-closed-0001", repo_id=REPO_ID, backend_id="fake", model="model-a",
+        status="closed", created_at=stamp, closed_at=stamp,
+    )
+    store.save(closed)
+    store.save_handoff(closed.session_id, text)
+
+
+def test_a_route_switch_gives_the_new_model_this_sessions_own_turns(make) -> None:
+    harness = make()
+    session = _one_turn(harness)
+
+    switched = harness.orch.continue_on_route("other", "model-b")
+
+    assert switched.session_id == session.session_id
+    assert harness.backends[-1].backend_id == "other"
+    (brief,) = harness.backends[-1].briefs
+    assert _ASKED in brief and _ANSWERED in brief
+    assert len(harness.store.sessions()) == 1
+
+
+def test_rebinding_the_same_route_after_a_restart_restores_the_turns(make) -> None:
+    harness = make()
+    session = _one_turn(harness)
+    harness.orch.close()
+    again = make(prefix="b")
+    loaded = again.orch.restore_latest()
+    assert loaded is not None and loaded.session_id == session.session_id
+
+    bound = again.orch.continue_on_route("fake", "model-a")
+
+    assert bound.session_id == session.session_id
+    (brief,) = again.started
+    assert _ASKED in brief and _ANSWERED in brief
+
+
+def test_a_bind_without_turns_keeps_the_previous_closed_handoff_only(make, monkeypatch) -> None:
+    harness = make()
+    session = harness.orch.continue_on_route("fake", "model-a")
+    _closed_with_handoff(harness.store, "PREVIOUS-closed-handoff")
+    seen = _record_handoffs(monkeypatch)
+
+    harness.orch.continue_on_route("other", "model-b")
+
+    assert seen == ["PREVIOUS-closed-handoff"]
+    assert f"Mechanical handoff for {session.session_id}" not in harness.started[-1]
+
+
+def test_own_turns_come_before_the_previous_closed_handoff(make, monkeypatch) -> None:
+    harness = make()
+    _one_turn(harness)
+    _closed_with_handoff(harness.store, "PREVIOUS-closed-handoff")
+    seen = _record_handoffs(monkeypatch)
+
+    harness.orch.continue_on_route("other", "model-b")
+
+    (handoff,) = seen
+    previous_at = handoff.index("PREVIOUS-closed-handoff")
+    assert handoff.index(_ASKED) < handoff.index(_ANSWERED) < previous_at
+
+
+def test_the_combined_bind_handoff_stays_within_the_handoff_bound(make, monkeypatch) -> None:
+    harness = make()
+    _one_turn(harness)
+    _closed_with_handoff(harness.store, "é" * (ml.MAX_HANDOFF_BYTES // 2))
+    seen = _record_handoffs(monkeypatch)
+
+    harness.orch.continue_on_route("other", "model-b")
+
+    (handoff,) = seen
+    assert len(handoff.encode("utf-8")) <= ml.MAX_HANDOFF_BYTES
+    assert _ASKED in handoff and _ANSWERED in handoff
+    assert "é" in handoff
+
+
 def test_a_picker_selection_follows_the_route_successor(make) -> None:
     ticker = Ticker()
     harness = make(ticker=ticker)
