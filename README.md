@@ -62,6 +62,12 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
+## What's new in 0.12.16
+
+- Source Graph recovers an interrupted index without locking it: an open reader no longer makes recovery hang for half a minute with `database is locked`.
+- A failed tool call from a VS Code language-model worker reports its real reason instead of "MCP unavailable".
+- A language-model worker is stopped for malformed replies only when they come one after another.
+
 ## What's new in 0.12.15
 
 - A card whose launch failed before the worker started can be retried on the same task instead of staying stuck.

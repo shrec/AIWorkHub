@@ -1,5 +1,13 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.12.16 — 2026-10-02
+
+### Fixed
+
+- Source Graph recovery rolls a hot journal back on a private staged copy and publishes it through the staged-generation path instead of opening the canonical index writable. A reader holding the index no longer turns recovery into a 33 s raw `database is locked` under the writer lease: contention is a typed, retryable standby (`publish:sqlite_busy`, or `connect:snapshot_changed` when another opener rolled the index back between the two copies) reported in about a second (NF-2026-01186).
+- A failed `vscode_lm` tool turn reports its real reason instead of `mcp_unavailable`, and the sanitized message still never carries raw child output, environment values or filesystem paths (NF-2026-01201).
+- Only consecutive malformed `vscode_lm` replies exhaust the invalid-JSON budget: the counter resets after every parsed envelope (NF-2026-01200).
+
 ## 0.12.15 — 2026-10-02
 
 ### Added
