@@ -50,6 +50,9 @@ MIN_BRIEF_BYTES = 256
 DEFAULT_CONTEXT_WINDOW_BYTES = 512 * 1024
 DEFAULT_ROTATE_FRACTION = 0.75
 MAX_EVENT_PAYLOAD_BYTES = 4 * 1024
+# Payload fields bounded on their own, so a long one is cut without losing the rest.
+FIELD_BOUNDS = {"output_tail": 8 * 1024, "output": 16 * 1024, "diff": 64 * 1024, "text": 64 * 1024}
+_TAIL_READ_BYTES = 256 * 1024
 MAX_TURN_EVENTS = 1000
 MAX_LOG_EVENTS = 500
 MAX_HANDOFF_BYTES = 8 * 1024
@@ -174,14 +177,84 @@ def _clip(text: str, limit: int) -> str:
     return data[:keep].decode("utf-8", "ignore") + _CLIP_MARK if keep > 0 else ""
 
 
+def _bounded_field(value: object, limit: int) -> tuple[object, int]:
+    """``value`` within ``limit`` UTF-8 bytes, and its original size when it was cut.
+
+    A non-string is serialized first, so a list, dict or None is bounded by its
+    JSON text; a value that already fits is kept as it was, with size 0.
+    """
+    text = value if isinstance(value, str) else _json(value)
+    size = len(text.encode("utf-8"))
+    if size <= limit:
+        return (value if isinstance(value, str) else json.loads(text)), 0
+    return _clip(text, limit), size
+
+
 def _bounded_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
-    """``payload`` as plain JSON, or a marked preview once it outgrows the bound."""
-    text = _json(payload)
+    """``payload`` as plain JSON with each :data:`FIELD_BOUNDS` field cut on its own.
+
+    A cut bounded field leaves every other field intact and marks the payload
+    ``truncated`` with the original bytes of what was cut. The remaining fields
+    still collapse to a marked preview once they outgrow the payload bound.
+    """
+    rest = {key: value for key, value in payload.items() if key not in FIELD_BOUNDS}
+    text = _json(rest)
     size = len(text.encode("utf-8"))
     if size <= MAX_EVENT_PAYLOAD_BYTES:
-        return dict(json.loads(text))
-    preview = _clip(text, MAX_EVENT_PAYLOAD_BYTES // 2)
-    return {"truncated": True, "original_bytes": size, "preview": preview}
+        bounded: dict[str, Any] = dict(json.loads(text))
+        cut = 0
+    else:
+        bounded = {"preview": _clip(text, MAX_EVENT_PAYLOAD_BYTES // 2)}
+        cut = size
+    for key, limit in FIELD_BOUNDS.items():
+        if key in payload:
+            bounded[key], original = _bounded_field(payload[key], limit)
+            cut += original
+    if cut:
+        bounded.update(truncated=True, original_bytes=cut)
+    return bounded
+
+
+def _parsed(lines: Iterable[str]) -> list[dict[str, Any]]:
+    """The event records among ``lines``; a torn or malformed line is skipped."""
+    records: list[dict[str, Any]] = []
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            item = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(item, dict) and type(item.get("seq")) is int:
+            records.append(item)
+    return records
+
+
+def _last_seq(path: Path) -> int:
+    """The highest ``seq`` in the log at ``path``, read from its tail; 0 when none."""
+    if not path.is_file():
+        return 0
+    with path.open("rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        size = handle.tell()
+        handle.seek(max(0, size - _TAIL_READ_BYTES))
+        tail = handle.read()
+    records = _parsed(tail.decode("utf-8", "ignore").splitlines())
+    if not records and size > _TAIL_READ_BYTES:
+        records = _parsed(path.read_text(encoding="utf-8", errors="ignore").splitlines())
+    return max((int(item["seq"]) for item in records), default=0)
+
+
+def _ends_with_newline(path: Path) -> bool:
+    """Whether the next line appended to ``path`` starts on its own line."""
+    if not path.is_file():
+        return True
+    with path.open("rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            return True
+        handle.seek(-1, os.SEEK_END)
+        return handle.read(1) == b"\n"
 
 
 def _normalize(raw: object) -> tuple[str, dict[str, Any]]:
@@ -218,11 +291,14 @@ class SessionStore:
     ``events/<id>.jsonl``, ``handoffs/<id>.md``, the ``active.lock`` an
     orchestrator holds for the life of a pinned session (and only while it
     persists a passive one), and the ``ensure.lock`` that queues concurrent
-    ``ensure`` calls. Every file is replaced whole through
-    :func:`platform_io.atomic_replace`, so a reader never sees a torn
-    record. A log only appends and keeps its newest ``max_events`` lines, and
-    ``seq`` keeps counting, so a first ``seq`` above 1 says how much was
-    dropped. Closed sessions beyond ``keep_closed`` are pruned oldest first.
+    ``ensure`` calls. Records, handoffs and selections are replaced whole
+    through :func:`platform_io.atomic_replace`. An event log only grows by
+    appending one line per event; every ``max_events``-th ``seq`` compacts it
+    to its newest ``max_events`` lines through the same atomic writer. A torn
+    last line left by a crash mid-append is skipped by every read and closed
+    by the next append. ``seq`` keeps counting, so a first ``seq`` above 1
+    says how much was dropped. Closed sessions beyond ``keep_closed`` are
+    pruned oldest first.
     """
 
     def __init__(
@@ -318,18 +394,32 @@ class SessionStore:
         return path.read_text(encoding="utf-8") if path.is_file() else ""
 
     def events(self, session_id: str) -> list[dict[str, Any]]:
+        """The newest ``max_events`` records; a torn or malformed line is skipped."""
         path = self._path("events", session_id)
         lines = path.read_text(encoding="utf-8").splitlines() if path.is_file() else []
-        return [json.loads(line) for line in lines if line.strip()]
+        return _parsed(lines)[-self.max_events:]
 
     def append_event(self, session_id: str, event: Mapping[str, Any]) -> dict[str, Any]:
-        """Append ``event`` with the next ``seq`` and a bounded payload; return it."""
+        """Append ``event`` with the next ``seq`` and a bounded payload; return it.
+
+        One line is appended; only when ``seq`` reaches a multiple of
+        ``max_events`` is the log compacted to its newest ``max_events`` records
+        and replaced whole through :func:`_publish`.
+        """
         path = self._path("events", session_id)
-        lines = path.read_text(encoding="utf-8").splitlines() if path.is_file() else []
-        seq = int(json.loads(lines[-1])["seq"]) + 1 if lines else 1
+        seq = _last_seq(path) + 1
         record = {**event, "seq": seq, "payload": _bounded_payload(event.get("payload") or {})}
-        lines.append(json.dumps(record, sort_keys=True))
-        _publish(path, "\n".join(lines[-self.max_events:]) + "\n")
+        line = json.dumps(record, sort_keys=True)
+        if seq % self.max_events == 0:
+            lines = path.read_text(encoding="utf-8").splitlines() if path.is_file() else []
+            prior = [json.dumps(item, sort_keys=True) for item in _parsed(lines)]
+            kept = prior[max(0, len(prior) - (self.max_events - 1)):] + [line]
+            _publish(path, "\n".join(kept) + "\n")
+            return record
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torn = not _ends_with_newline(path)
+        with path.open("a", encoding="utf-8", newline="\n") as handle:
+            handle.write(("\n" if torn else "") + line + "\n")
         return record
 
     def prune(self) -> list[str]:

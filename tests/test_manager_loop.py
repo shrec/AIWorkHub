@@ -533,6 +533,97 @@ def test_the_event_log_is_bounded_and_payloads_are_capped(tmp_path: Path) -> Non
         store.events("../escape")
 
 
+def test_bounded_fields_are_cut_per_field_not_per_payload(tmp_path: Path) -> None:
+    store = ml.SessionStore(tmp_path, REPO_ID)
+    payload = {"output_tail": "a" * 20_000, "output": "short", "diff": "d" * 100, "exit_code": 1}
+
+    record = store.append_event("session-0001", {"type": "tool_result", "payload": payload})
+
+    kept = record["payload"]
+    assert kept["output_tail"].startswith("a" * 100)
+    assert len(kept["output_tail"].encode("utf-8")) <= ml.FIELD_BOUNDS["output_tail"]
+    assert (kept["output"], kept["diff"], kept["exit_code"]) == ("short", "d" * 100, 1)
+    assert kept["truncated"] is True and kept["original_bytes"] == 20_000
+    assert "preview" not in kept
+    assert store.events("session-0001")[-1] == record
+
+
+def test_non_string_output_is_serialized_before_it_is_bounded(tmp_path: Path) -> None:
+    store = ml.SessionStore(tmp_path, REPO_ID)
+    lines = ["line"] * 10_000
+    for value in ("text", lines, {"key": "value"}, None):
+        store.append_event("session-0001", {"type": "tool_result", "payload": {"output": value}})
+
+    stored = [event["payload"] for event in store.events("session-0001")]
+
+    assert stored[0] == {"output": "text"}
+    assert isinstance(stored[1]["output"], str) and stored[1]["output"].startswith('["line","line"')
+    assert len(stored[1]["output"].encode("utf-8")) <= ml.FIELD_BOUNDS["output"]
+    assert stored[1]["truncated"] is True
+    assert stored[1]["original_bytes"] == len(json.dumps(lines, separators=(",", ":")))
+    assert stored[2] == {"output": {"key": "value"}}
+    assert stored[3] == {"output": None}
+
+
+def test_the_log_is_appended_between_compactions(tmp_path: Path, monkeypatch) -> None:
+    store = ml.SessionStore(tmp_path, REPO_ID, max_events=4)
+    published: list[Path] = []
+    real_publish = ml._publish
+    monkeypatch.setattr(ml, "_publish", lambda path, text: (published.append(path), real_publish(path, text)))
+    log = tmp_path / "events" / "session-0001.jsonl"
+
+    for index in range(3):
+        store.append_event("session-0001", {"type": "assistant_text", "payload": {"text": str(index)}})
+    assert published == [] and len(log.read_text(encoding="utf-8").splitlines()) == 3
+
+    store.append_event("session-0001", {"type": "assistant_text", "payload": {"text": "3"}})
+    assert published == [log] and len(log.read_text(encoding="utf-8").splitlines()) == 4
+
+    for index in range(4, 7):
+        store.append_event("session-0001", {"type": "assistant_text", "payload": {"text": str(index)}})
+    assert published == [log] and len(log.read_text(encoding="utf-8").splitlines()) == 7
+    assert [event["seq"] for event in store.events("session-0001")] == [4, 5, 6, 7]
+
+    store.append_event("session-0001", {"type": "assistant_text", "payload": {"text": "7"}})
+    assert published == [log, log]
+    assert [json.loads(line)["seq"] for line in log.read_text(encoding="utf-8").splitlines()] == [5, 6, 7, 8]
+
+
+def test_a_torn_tail_line_is_skipped_and_seq_keeps_increasing(tmp_path: Path) -> None:
+    store = ml.SessionStore(tmp_path, REPO_ID)
+    for index in range(2):
+        store.append_event("session-0001", {"type": "assistant_text", "payload": {"text": str(index)}})
+    log = tmp_path / "events" / "session-0001.jsonl"
+    with log.open("a", encoding="utf-8", newline="\n") as handle:
+        handle.write('{"payload": {"text": "half')
+
+    assert [event["seq"] for event in store.events("session-0001")] == [1, 2]
+
+    record = store.append_event("session-0001", {"type": "assistant_text", "payload": {"text": "next"}})
+
+    assert record["seq"] == 3
+    assert [event["seq"] for event in store.events("session-0001")] == [1, 2, 3]
+    lines = log.read_text(encoding="utf-8").splitlines()
+    assert lines[-2] == '{"payload": {"text": "half'
+    assert json.loads(lines[-1]) == record
+
+
+def test_a_long_text_keeps_its_text_field(tmp_path: Path) -> None:
+    store = ml.SessionStore(tmp_path, REPO_ID)
+    short = "s" * 20_000
+    long = "h" * 70_000
+
+    whole = store.append_event("session-0001", {"type": "assistant_text", "payload": {"text": short}})
+    cut = store.append_event("session-0001", {"type": "assistant_text", "payload": {"text": long}})
+
+    assert whole["payload"] == {"text": short}
+    text = cut["payload"]["text"]
+    assert text.startswith(long[:1024])
+    assert len(text.encode("utf-8")) <= ml.FIELD_BOUNDS["text"] + len(ml._CLIP_MARK)
+    assert cut["payload"]["truncated"] is True and cut["payload"]["original_bytes"] == 70_000
+    assert [event["payload"] for event in store.events("session-0001")] == [whole["payload"], cut["payload"]]
+
+
 def test_a_foreign_or_malformed_session_record_fails_closed(tmp_path: Path) -> None:
     store = ml.SessionStore(tmp_path, REPO_ID)
     foreign = ml.ManagerSession(
