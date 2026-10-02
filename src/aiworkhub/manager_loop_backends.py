@@ -333,6 +333,8 @@ def _spawn_cli(
     (measured: Bun/opencode dies on missing SystemRoot with no provider
     signal) -- the seat is the owner's own, so inheritance matches the
     claude seat; scoping lives in the MCP allowlists, not env scrubbing.
+    With ``cwd`` given, ``PWD`` is bound to ``str(cwd)`` after the merge, so
+    a child that resolves its directory from ``PWD`` works in ``cwd``.
     """
     grouping: dict[str, Any] = (
         {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
@@ -342,6 +344,9 @@ def _spawn_cli(
     # The argv list comes from build_runtime_command; shell=False is the default
     # and is never overridden, so no provider text is ever interpreted as a command.
     child_env = dict(os.environ, **dict(env)) if env is not None else None
+    if cwd is not None:
+        # Popen(cwd=) leaves the inherited PWD stale; OpenCode takes its directory from PWD.
+        child_env = {**(child_env if child_env is not None else os.environ), "PWD": str(cwd)}
     process = subprocess.Popen(
         list(argv),
         cwd=cwd,

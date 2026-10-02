@@ -789,6 +789,52 @@ def test_seat_env_merges_over_inherited_environment(tmp_path: Path, monkeypatch:
                 pass
 
 
+_PWD_PROBE = (
+    "import os,sys;sys.exit(0 if os.environ.get('PWD') == sys.argv[1]"
+    " and os.environ.get('SEAT_INHERIT_PROBE') == 'kept'"
+    " and (len(sys.argv) < 3 or os.environ.get('SEAT_X') == sys.argv[2]) else 3)"
+)
+
+
+def _wait_and_close(process: Any) -> int:
+    try:
+        return process.wait(timeout=30)
+    finally:
+        for stream in (process.stdout, process.stderr):
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+
+def test_spawn_cli_binds_pwd_to_cwd_without_seat_env(tmp_path: Path, monkeypatch: Any) -> None:
+    # NF-2026-01236: Popen(cwd=) leaves the parent's PWD; OpenCode (Bun) reads
+    # its project directory from PWD and would work in the parent's directory.
+    monkeypatch.setenv("PWD", "stale-parent-directory")
+    monkeypatch.setenv("SEAT_INHERIT_PROBE", "kept")
+    process = mlb._spawn_cli([sys.executable, "-c", _PWD_PROBE, str(tmp_path)], str(tmp_path))
+    assert _wait_and_close(process) == 0
+
+
+def test_spawn_cli_pwd_overrides_seat_supplied_pwd(tmp_path: Path, monkeypatch: Any) -> None:
+    monkeypatch.setenv("PWD", "stale-parent-directory")
+    monkeypatch.setenv("SEAT_INHERIT_PROBE", "kept")
+    process = mlb._spawn_cli(
+        [sys.executable, "-c", _PWD_PROBE, str(tmp_path), "1"],
+        str(tmp_path),
+        None,
+        {"SEAT_X": "1", "PWD": "seat-supplied"},
+    )
+    assert _wait_and_close(process) == 0
+
+
+def test_spawn_cli_without_cwd_inherits_pwd_unchanged(monkeypatch: Any) -> None:
+    monkeypatch.setenv("PWD", "stale-parent-directory")
+    monkeypatch.setenv("SEAT_INHERIT_PROBE", "kept")
+    process = mlb._spawn_cli([sys.executable, "-c", _PWD_PROBE, "stale-parent-directory"], None)
+    assert _wait_and_close(process) == 0
+
+
 def test_seat_turn_passes_merged_env_to_spawn(tmp_path: Path) -> None:
     seen: dict[str, Any] = {}
 
