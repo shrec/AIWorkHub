@@ -5778,6 +5778,8 @@ async function runVscodeLmTextProtocol(
       ));
       continue;
     }
+    // NF-2026-01200: only CONSECUTIVE malformed replies exhaust the budget.
+    invalidJsonCount.count = 0;
     if (envelope.schema_id === VSCODE_LM_EDIT_RESPONSE_SCHEMA || envelope.schema_id === VSCODE_LM_EDIT_RESPONSE_SCHEMA_V2 || envelope.schema_id === VSCODE_LM_EDIT_RESPONSE_SCHEMA_V1) {
       if (!sourceGraphAcknowledged) throw new Error("vscode_lm_source_graph_not_acknowledged");
       if (request.request_kind === "quality_review") {
@@ -9311,7 +9313,14 @@ function sanitizeErrorMessage(err) {
   // Every message reaching here is one of this module's own literal Error
   // strings (mcp_not_running / mcp_request_timeout / no_workspace_folder /
   // mcp_child_exited ...) -- never raw child stdout/stderr, never an
-  // environment value or filesystem path.
+  // environment value or filesystem path. A string argument is an already
+  // sanitized reason code and passes through unchanged; any other string
+  // could carry free text, so it collapses to one fixed literal.
+  if (typeof err === "string" && err) {
+    return /^[A-Za-z0-9_.:=-]+$/.test(err)
+      ? err.slice(0, 200)
+      : "mcp_error_reason_unsafe";
+  }
   return String((err && err.message) || "mcp_unavailable").slice(0, 200);
 }
 
