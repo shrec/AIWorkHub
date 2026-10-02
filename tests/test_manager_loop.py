@@ -1305,3 +1305,86 @@ def test_ensure_binds_the_verified_repository_identity(tmp_path: Path) -> None:
 
     assert session.repo_id == state.manifest.repo_id and session.passive
     assert built == []
+
+
+def test_deltas_fill_partial_and_never_reach_the_log(make) -> None:
+    harness = make()
+    session = harness.orch.start("fake", "model-a")
+    seen: list[Any] = []
+
+    def stream():
+        yield {"type": "delta", "payload": {"kind": "text", "text": "Hel"}}
+        yield {"type": "delta", "payload": {"kind": "text", "text": "lo"}}
+        seen.append(harness.orch.partial)
+        yield {"type": "assistant_text", "payload": {"text": "Hello"}}
+        seen.append(harness.orch.partial)
+        yield {"type": "turn_end", "payload": {}}
+
+    harness.backends[0].script.append(stream())
+    result = harness.orch.send("hi")
+
+    assert seen[0]["text"] == "Hello" and seen[0]["turn"] == result["turn"]
+    assert seen[0]["session_id"] == session.session_id
+    assert seen[1]["text"] == ""
+    assert harness.orch.partial is None
+    logged = harness.store.events(session.session_id)
+    assert "delta" not in {event["type"] for event in logged}
+    assert [event["type"] for event in logged][-2:] == ["assistant_text", "turn_end"]
+
+
+def test_a_partial_never_crosses_into_the_next_turn(make) -> None:
+    harness = make()
+    harness.orch.start("fake", "model-a")
+    seen: list[Any] = []
+
+    def first():
+        yield {"type": "delta", "payload": {"kind": "reasoning", "text": "old"}}
+        yield {"type": "turn_end", "payload": {}}
+
+    def second():
+        seen.append(harness.orch.partial)
+        yield {"type": "delta", "payload": {"kind": "text", "text": "new"}}
+        seen.append(harness.orch.partial)
+        yield {"type": "turn_end", "payload": {}}
+
+    harness.backends[0].script.extend([first(), second()])
+    harness.orch.send("one")
+    harness.orch.send("two")
+
+    assert seen[0] is None
+    assert seen[1]["reasoning"] == "" and seen[1]["text"] == "new"
+
+
+def test_deltas_do_not_count_toward_the_turn_event_limit_and_a_partial_keeps_its_tail(make, monkeypatch) -> None:
+    monkeypatch.setattr(ml, "MAX_TURN_EVENTS", 2)
+    monkeypatch.setattr(ml, "PARTIAL_FIELD_BYTES", 4)
+    harness = make()
+    session = harness.orch.start("fake", "model-a")
+    seen: list[Any] = []
+
+    def stream():
+        for piece in ("ab", "cd", "ef"):
+            yield {"type": "delta", "payload": {"kind": "text", "text": piece}}
+        seen.append(harness.orch.partial)
+        yield {"type": "assistant_text", "payload": {"text": "abcdef"}}
+        yield {"type": "turn_end", "payload": {}}
+
+    harness.backends[0].script.append(stream())
+    harness.orch.send("hi")
+
+    assert seen[0]["text"] == "cdef"
+    assert [event["type"] for event in harness.store.events(session.session_id)][-2:] == ["assistant_text", "turn_end"]
+
+
+def test_a_failed_turn_leaves_no_partial_behind(make) -> None:
+    harness = make()
+    harness.orch.start("fake", "model-a")
+
+    def stream():
+        yield {"type": "delta", "payload": {"kind": "text", "text": "half"}}
+        raise RuntimeError("backend died")
+
+    harness.backends[0].script.append(stream())
+    harness.orch.send("hi")
+
+    assert harness.orch.partial is None

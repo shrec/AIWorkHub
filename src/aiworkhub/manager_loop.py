@@ -60,6 +60,9 @@ MAX_TURN_EVENTS = 1000
 MAX_LOG_EVENTS = 500
 MAX_HANDOFF_BYTES = 8 * 1024
 MAX_TURN_EVENT_BYTES = 8 * 1024
+PARTIAL_FIELD_BYTES = 64 * 1024
+_PARTIAL_FIELDS = ("text", "reasoning", "command_output")
+_SETTLES = {"assistant_text": "text", "reasoning": "reasoning", "command": "command_output"}
 MAX_BRIEF_CARDS = 25
 KEEP_CLOSED_SESSIONS = 20
 SESSION_TOPIC = "management"
@@ -169,6 +172,12 @@ def _failure(exc: BaseException) -> str:
 
 def _json(value: object) -> str:
     return json.dumps(value, sort_keys=True, ensure_ascii=False, default=str, separators=(",", ":"))
+
+
+def keep_tail(text: str, limit: int) -> str:
+    """The last ``limit`` UTF-8 bytes of ``text``."""
+    data = text.encode("utf-8")
+    return text if len(data) <= limit else data[-limit:].decode("utf-8", "ignore")
 
 
 def _clip(text: str, limit: int) -> str:
@@ -654,6 +663,29 @@ class ManagerOrchestrator:
         self._lock_fd: int | None = None
         self._session: ManagerSession | None = None
         self._backend: ManagerBackend | None = None
+        self._partial: dict[str, Any] | None = None
+
+    @property
+    def partial(self) -> dict[str, Any] | None:
+        """The running turn's streamed, unfinished text; display only, never persisted."""
+        return self._partial
+
+    def _grow_partial(self, session: ManagerSession, turn: int, payload: Any) -> None:
+        payload = payload if isinstance(payload, Mapping) else {}
+        kind = str(payload.get("kind") or "")
+        if kind not in _PARTIAL_FIELDS:
+            return
+        current = self._partial
+        if current is None or current["turn"] != turn or current["session_id"] != session.session_id:
+            current = {"session_id": session.session_id, "turn": turn, **{field: "" for field in _PARTIAL_FIELDS}}
+        # ponytail: tail-only cap per field; the final event carries the full text.
+        grown = keep_tail(current[kind] + str(payload.get("text") or ""), PARTIAL_FIELD_BYTES)
+        self._partial = {**current, kind: grown}  # replaced, never mutated: the poll reads it unlocked
+
+    def _settle_partial(self, kind: str) -> None:
+        field = _SETTLES.get(kind)
+        if field and self._partial and self._partial[field]:
+            self._partial = {**self._partial, field: ""}
 
     @classmethod
     def for_repository(
@@ -1227,11 +1259,15 @@ class ManagerOrchestrator:
         grown = 0
         try:
             for raw in backend.send(message):
+                if isinstance(raw, Mapping) and raw.get("type") == "delta":
+                    self._grow_partial(session, turn, raw.get("payload"))
+                    continue
                 if len(events) >= MAX_TURN_EVENTS:
                     capped = {"source": "loop", "error": "turn_event_limit"}
                     events.append(self._record(session, turn, "error", capped))
                     break
                 kind, payload = _normalize(raw)
+                self._settle_partial(kind)
                 grown += len(_json(payload).encode("utf-8"))
                 if kind == "assistant_text":
                     texts.append(str(payload.get("text", "")))
@@ -1239,6 +1275,8 @@ class ManagerOrchestrator:
         except Exception as exc:  # noqa: BLE001 - a failed turn is an error event, not a dead session
             broke = {"source": "backend", "error": _failure(exc)}
             events.append(self._record(session, turn, "error", broke))
+        finally:
+            self._partial = None
         return events, grown, "".join(texts)
 
     def _rotate(self, reason: str, *, successor: bool) -> dict[str, Any]:

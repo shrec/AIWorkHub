@@ -52,3 +52,12 @@ def test_reasoning_depth_is_only_a_documented_flag() -> None:
     assert codex[-3] == "-c"
     assert codex[-2] == 'model_reasoning_effort="high"'
     assert codex[-1] == "-"
+
+
+def test_claude_stream_deltas_become_transient_delta_items() -> None:
+    text = {"type": "stream_event", "event": {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "Hel"}}}
+    think = {"type": "stream_event", "event": {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "hm"}}}
+    other = {"type": "stream_event", "event": {"type": "message_start"}}
+    assert translate("claude_cli", text) == [{"type": "delta", "payload": {"kind": "text", "text": "Hel"}}]
+    assert translate("claude_cli", think) == [{"type": "delta", "payload": {"kind": "reasoning", "text": "hm"}}]
+    assert translate("claude_cli", other) == []

@@ -58,7 +58,7 @@ from types import MappingProxyType
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
 from . import cli_model_discovery, context_capture, platform_io, runtime_adapters, workforce_catalog
-from .manager_loop import ManagerLoopError
+from .manager_loop import ManagerLoopError, keep_tail
 
 MANAGER_BACKEND_IDS: tuple[str, ...] = ("claude_cli", "codex_cli", "opencode_cli")
 # The worker lane's own launch ceiling, reused as the manager turn default: a
@@ -140,11 +140,6 @@ def _usage(
     return {**counts, "context_window": size or None, "context_fill": fill_ratio, "raw": dict(raw)}
 
 
-def _tail(text: str, limit: int = OUTPUT_TAIL_BYTES) -> str:
-    data = text.encode("utf-8")
-    return text if len(data) <= limit else data[-limit:].decode("utf-8", "ignore")
-
-
 def _result_text(content: Any) -> str:
     if isinstance(content, str):
         return content
@@ -162,7 +157,7 @@ def _command(
     return {"type": "command", "payload": {
         "call_id": call_id, "command": command, "cwd": cwd, "status": status,
         "exit_code": exit_code if isinstance(exit_code, int) else None,
-        "output_tail": _tail(output), "output_bytes": len(output.encode("utf-8")),
+        "output_tail": keep_tail(output, OUTPUT_TAIL_BYTES), "output_bytes": len(output.encode("utf-8")),
     }}
 
 
@@ -278,9 +273,29 @@ def _claude_tool_result(block: Mapping[str, Any], context: TurnContext) -> list[
     return [*shown, _tool_result(call_id, name, block.get("content"), failed)]
 
 
+def _delta(kind: str, text: Any) -> list[dict[str, Any]]:
+    """A streamed fragment for display only; the orchestrator never records it."""
+    text = str(text or "")
+    return [{"type": "delta", "payload": {"kind": kind, "text": text}}] if text else []
+
+
+def _claude_delta(event: Mapping[str, Any]) -> list[dict[str, Any]]:
+    inner = _mapping(event.get("event"))
+    if inner.get("type") != "content_block_delta":
+        return []
+    delta = _mapping(inner.get("delta"))
+    if delta.get("type") == "text_delta":
+        return _delta("text", delta.get("text"))
+    if delta.get("type") == "thinking_delta":
+        return _delta("reasoning", delta.get("thinking"))
+    return []
+
+
 def _claude_events(event: Mapping[str, Any], context: TurnContext) -> list[dict[str, Any]]:
     """Claude ``stream-json``: assistant/user content blocks, then the result event."""
     kind = str(event.get("type") or "")
+    if kind == "stream_event":
+        return _claude_delta(event)
     if kind == "result":
         return [_turn_end(_claude_usage(event, context))]
     message = _mapping(event.get("message"))

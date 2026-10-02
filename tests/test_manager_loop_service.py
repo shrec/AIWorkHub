@@ -1457,3 +1457,16 @@ def test_close_after_a_turn_retires_the_wake_consumer_the_turn_left_running(
 
     assert entry.wake is None
     assert consumer.status()["running"] is False
+
+
+def test_events_carry_a_null_partial_once_the_turn_is_over(monkeypatch: Any, tmp_path: Path) -> None:
+    _install_fakes(monkeypatch)
+    manager_loop_service.start(tmp_path, "fake", "model-a")
+    manager_loop_service.send(tmp_path, "one")
+    assert manager_loop_service.wait_for_idle(tmp_path, timeout=5) is True
+    session_id = manager_loop_service.status(tmp_path)["session"]["session_id"]
+
+    result = manager_loop_service.events(tmp_path, session_id)
+
+    assert "partial" in result
+    assert result["partial"] is None

@@ -594,7 +594,9 @@ def events(
     floor = int(after_seq)
     bound = max(0, int(limit))
     filtered = [event for event in all_events if int(event.get("seq", 0)) > floor][:bound]
-    return {"ok": True, "events": filtered}
+    partial = entry.orchestrator.partial
+    mine = partial if partial and partial.get("session_id") == session_id else None
+    return {"ok": True, "events": filtered, "partial": mine}
 
 
 def close(repo: str | Path) -> dict[str, Any]:
