@@ -1,7 +1,9 @@
 "use strict";
 
 const assert = require("assert");
+const fs = require("fs");
 const path = require("path");
+const vm = require("vm");
 
 class FakeElement {
   constructor(tagName) {
@@ -122,7 +124,12 @@ function loadFormatter() {
     postMessage: () => {},
   });
   global.Intl = Intl;
-  require(path.join(__dirname, "../media/app.js"));
+  // Two classic scripts in one global scope, in the order the webview loads them: app.js
+  // top-level bindings (state, elements, createElement) stay visible to manager_console.js.
+  for (const name of ["manager_console.js", "app.js"]) {
+    const file = path.join(__dirname, "../media", name);
+    vm.runInThisContext(fs.readFileSync(file, "utf8"), { filename: file });
+  }
   return {
     api: global.__AIWORKHUB_LIVE_OUTPUT_FORMATTING__,
     document,

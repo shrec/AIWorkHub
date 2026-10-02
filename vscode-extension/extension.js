@@ -11314,6 +11314,8 @@ function getHtmlForWebview(webview, extensionUri) {
   const mediaUri = vscode.Uri.joinPath(extensionUri, "media");
   const scriptUri = dashboardAssetUri(webview, mediaUri, "app.js");
   const styleUri = dashboardAssetUri(webview, mediaUri, "app.css");
+  const consoleScriptUri = dashboardAssetUri(webview, mediaUri, "manager_console.js");
+  const consoleStyleUri = dashboardAssetUri(webview, mediaUri, "manager_console.css");
   const logoUri = webview.asWebviewUri(vscode.Uri.joinPath(mediaUri, "aiworkhub-icon.png"));
   const nonceValue = nonce();
   const csp = [
@@ -11336,6 +11338,7 @@ function getHtmlForWebview(webview, extensionUri) {
 <meta http-equiv="Content-Security-Policy" content="${csp}">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="stylesheet" href="${styleUri}">
+<link rel="stylesheet" href="${consoleStyleUri}">
 <title>AIWorkHub</title>
 </head>
 <body>
@@ -11980,6 +11983,7 @@ function getHtmlForWebview(webview, extensionUri) {
 
   <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
   <script nonce="${nonceValue}">${codingFoundationDashboardSource()}</script>
+  <script nonce="${nonceValue}" src="${consoleScriptUri}"></script>
   <script nonce="${nonceValue}" src="${scriptUri}"></script>
 </body>
 </html>`;

@@ -96,7 +96,13 @@ global.document = document;
 global.window = { setTimeout: (fn, delay) => { timers.push({ fn, delay }); return timers.length; }, clearTimeout: () => {}, addEventListener: () => {} };
 global.acquireVsCodeApi = () => ({ getState: () => ({}), setState: () => {}, postMessage: (m) => { posted.push(m); } });
 global.Intl = Intl;
-require(APP_JS);
+// Two classic scripts in one global scope, in the order the webview loads them: app.js
+// top-level bindings (state, elements, createElement) stay visible to manager_console.js.
+const fs = require("fs"); const path = require("path"); const vm = require("vm");
+for (const name of ["manager_console.js", "app.js"]) {
+  const file = path.join(path.dirname(APP_JS), name);
+  vm.runInThisContext(fs.readFileSync(file, "utf8"), { filename: file });
+}
 const api = global.__AIWORKHUB_LIVE_OUTPUT_FORMATTING__;
 assert(api, "formatter/test hook exposed");
 const reqCount = () => posted.filter((m) => m && m.type === "requestLiveOutput").length;

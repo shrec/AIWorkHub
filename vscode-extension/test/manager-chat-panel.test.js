@@ -9,9 +9,11 @@ const path = require("node:path");
 const test = require("node:test");
 const vm = require("node:vm");
 
-const extensionSource = fs.readFileSync(path.join(__dirname, "..", "extension.js"), "utf8");
+const extensionSource = fs.readFileSync(path.join(__dirname, "..", "extension.js"), "utf8").replace(/\r\n/g, "\n");
 const appSource = fs.readFileSync(path.join(__dirname, "..", "media", "app.js"), "utf8");
 const cssSource = fs.readFileSync(path.join(__dirname, "..", "media", "app.css"), "utf8");
+const consoleSource = fs.readFileSync(path.join(__dirname, "..", "media", "manager_console.js"), "utf8");
+const consoleCss = fs.readFileSync(path.join(__dirname, "..", "media", "manager_console.css"), "utf8");
 
 // Extracts an exact shipped block (verbatim, not reimplemented) so assertions
 // exercise the real production code path, following the pattern already used
@@ -398,7 +400,7 @@ function loadWebviewSlice() {
   );
   const managerChat = extractSlice(
     appSource,
-    "function managerChatEventNode(event) {",
+    "function managerChatTaskStatus(task) {",
     "  showManagerChatNotice(null);\n}",
     "manager chat render/poll functions",
   );
@@ -479,7 +481,7 @@ function loadWebviewSlice() {
   };
   vm.createContext(context);
   vm.runInContext(
-    `"use strict";\n${utilities}\n${constants}\n${managerChat}\n${managerChatWiring}\n` +
+    `"use strict";\n${utilities}\n${constants}\n${consoleSource}\n${managerChat}\n${managerChatWiring}\n` +
       "this.api = { managerChatEventNode, renderManagerChatEvents, renderManagerChatEventsResponse, " +
       "renderManagerChatAction, renderManagerChatStatus, requestManagerChatEvents, scheduleManagerChatPoll, " +
       "applyManagerChatSessionUi, applyManagerChatComposerState, managerChatEnabledModels, managerChatSelectedRoute, populateManagerChatModelOptions, applyManagerChatCollapsed, toggleManagerChatSidebar, startManagerChatSidebar, renderManagerChatTaskBoard, driveManagerChatTask };",
@@ -1300,6 +1302,11 @@ test("the Manager panel is a persistent sidebar and reuses existing theme tokens
     /#[0-9a-fA-F]{3,8}\b/,
     "manager chat CSS must reuse existing theme tokens, never a new colour literal",
   );
+  assert.doesNotMatch(
+    consoleCss,
+    /#[0-9a-fA-F]{3,8}\b/,
+    "manager console CSS must reuse existing theme tokens, never a new colour literal",
+  );
 });
 
 test("manager chat model and tool text is not clipped by ellipsis or a fixed height", () => {
@@ -1310,9 +1317,24 @@ test("manager chat model and tool text is not clipped by ellipsis or a fixed hei
     "manager chat css block",
   );
   assert.match(managerCss, /#manager-chat-model \{[^}]*field-sizing:\s*content/);
-  assert.match(managerCss, /\.manager-chat-tool-row > summary \{[^}]*overflow-wrap:\s*anywhere/);
-  assert.match(managerCss, /\.manager-chat-tool-row-body \{[^}]*overflow:\s*visible/);
-  assert.match(managerCss, /\.manager-chat-tool-row-body \{[^}]*max-height:\s*none/);
-  assert.doesNotMatch(managerCss, /text-overflow:\s*ellipsis/);
-  assert.doesNotMatch(managerCss, /line-clamp/);
+  assert.match(consoleCss, /\.manager-chat-tool-row > summary \{[^}]*overflow-wrap:\s*anywhere/);
+  assert.match(consoleCss, /\.manager-chat-tool-row-body \{[^}]*overflow:\s*visible/);
+  assert.match(consoleCss, /\.manager-chat-tool-row-body \{[^}]*max-height:\s*none/);
+  for (const css of [managerCss, consoleCss]) {
+    assert.doesNotMatch(css, /text-overflow:\s*ellipsis/);
+    assert.doesNotMatch(css, /line-clamp/);
+  }
+});
+
+test("manager console assets load before app.js and ship in the VSIX", () => {
+  const html = extensionSource.slice(extensionSource.indexOf("function getHtmlForWebview("));
+  const consoleScript = html.indexOf('src="${consoleScriptUri}"');
+  const appScript = html.indexOf('src="${scriptUri}"');
+  assert.ok(consoleScript !== -1 && consoleScript < appScript, "console script must load before app.js");
+  assert.ok(html.indexOf('href="${styleUri}"') < html.indexOf('href="${consoleStyleUri}"'), "console css loads after app.css");
+  const packager = fs.readFileSync(path.join(__dirname, "package-vsix.js"), "utf8");
+  assert.match(packager, /"media\/manager_console\.js"/);
+  assert.match(packager, /"media\/manager_console\.css"/);
+  assert.doesNotMatch(appSource, /function managerChatEventNode\(/);
+  assert.doesNotMatch(cssSource, /\.manager-chat-bubble \{/);
 });

@@ -8,7 +8,7 @@ const { test } = require("node:test");
 
 const root = path.resolve(__dirname, "..");
 const extensionPath = path.join(root, "extension.js");
-const extension = fs.existsSync(extensionPath) ? fs.readFileSync(extensionPath, "utf8") : null;
+const extension = fs.existsSync(extensionPath) ? fs.readFileSync(extensionPath, "utf8").replace(/\r\n/g, "\n") : null;
 const app = fs.readFileSync(path.join(root, "media", "app.js"), "utf8");
 const css = fs.readFileSync(path.join(root, "media", "app.css"), "utf8");
 
@@ -467,6 +467,7 @@ function buildDomHarness() {
     setState: (s) => { sandbox.__state = s; },
   });
   const context = vm.createContext(sandbox);
+  vm.runInContext(fs.readFileSync(path.join(root, "media", "manager_console.js"), "utf8"), context, { filename: "manager_console.js" });
   vm.runInContext(app, context, { filename: "app.js" });
   const run = (code) => vm.runInContext(code, context);
   run(`(() => {

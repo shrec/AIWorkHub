@@ -511,6 +511,8 @@ for (const rel of [
   "runtime-retention.js",
   "media/app.js",
   "media/app.css",
+  "media/manager_console.js",
+  "media/manager_console.css",
   "media/aiworkhub-icon.png",
   "media/aiworkhub-marketplace-icon.svg",
   "media/aiworkhub-marketplace-icon.png",
