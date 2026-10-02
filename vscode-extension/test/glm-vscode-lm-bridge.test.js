@@ -6655,7 +6655,53 @@ async function nf998LiteralWhitespaceDoesNotCollide() {
     "internal bodygrep whitespace distinguishes literal searches");
 }
 
+async function nf1252FinalSchemaIsExplicitAndCorrectable() {
+  const file = "src/version.js";
+  const hash = "a".repeat(64);
+  const final = {
+    schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+    summary: "Rebased version", creates: [],
+    edits: [{ path: file, current_sha256: hash, ranges: [{ start_line: 14, end_line: 14, new: "version = 17;" }] }],
+  };
+  const flat = { ...final, edits: [{ action: "replace_range", file_path: file, start_line: 14, end_line: 14, new: "version = 17;" }] };
+  assert.match(internals.validateVscodeLmFinalEnvelope(flat, [file]), /final_edit_invalid.*path.*ranges/);
+  for (const native of [false, true]) {
+    let turns = 0;
+    const model = {
+      capabilities: { toolCalling: native },
+      sendRequest: async (messages) => {
+        turns += 1;
+        if (turns === 1) {
+          const prompt = String(messages[0].content);
+          const example = prompt.match(/Canonical final response: (\{[^\n]+\})/);
+          assert.ok(example, "both transports must document the executable final shape");
+          const shape = JSON.parse(example[1]);
+          assert.deepStrictEqual(Object.keys(shape.edits[0].ranges[0]).sort(),
+            ["end_line", "new", "preserve_trailing_newline", "start_line"]);
+          assert.ok(shape.edits[0].path && shape.creates[0].path && shape.creates[0].content);
+        } else {
+          assert.match(JSON.stringify(messages[messages.length - 1]), /path.*ranges/,
+            "a rejected flat final must name the corrective keys");
+        }
+        return { stream: (async function* stream() { yield { value: JSON.stringify(turns === 1 ? flat : final) }; }()) };
+      },
+    };
+    const request = {
+      requestId: (native ? "c" : "d").repeat(32), request_kind: "worker",
+      prompt: "Rebase one version line.", allowedWrites: [file],
+      path_contracts: { [file]: { action: "edit", current_sha256: hash, line_count: 14 } },
+      initial_source_graph_request: { mode: "body", query: "version", target: file },
+      initial_source_graph_result: { ok: true, content: "indexed version line" },
+    };
+    const run = native ? internals.runVscodeLmAgent : internals.runVscodeLmTextProtocol;
+    const result = JSON.parse(await run(model, request, undefined, async () => assert.fail("no additional discovery is required")));
+    assert.strictEqual(result.edits[0].ranges[0].start_line, 14);
+    assert.strictEqual(turns, 2, "one diagnostic must make the final shape correctable");
+  }
+}
+
 async function main() {
+  await nf1252FinalSchemaIsExplicitAndCorrectable();
   await nf998LiteralWhitespaceDoesNotCollide();
   await nf998BundleTypeChangesSourceGraphBoundary();
   await nf998TextSourceGraphDuplicateStopsLiveLoop();

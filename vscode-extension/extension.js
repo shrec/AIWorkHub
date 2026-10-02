@@ -3895,6 +3895,7 @@ function glmAgentProtocolPrompt(prompt, allowedWrites, pathContracts = {}) {
     `- Canonical offline replace-range stage request uses the exact Source Graph range. A one-line pin of line 1 is not a complete replacement: {"schema_id":"${VSCODE_LM_TOOL_REQUEST_SCHEMA}","name":"${VSCODE_LM_STAGE_EDIT_TOOL}","input":{"operation":"replace_range","file_path":"<allowed-path>","start_line":"<source-graph-start>","end_line":"<source-graph-end>","new":"<complete replacement for that range>"}}\n` +
     `- A worker edits an existing file with aiworkhub_worker_semantic_edit_prepare then aiworkhub_worker_semantic_edit_apply. Do not call manager semantic-edit tools.\n` +
     `- Canonical offline finalize request: {"schema_id":"${VSCODE_LM_TOOL_REQUEST_SCHEMA}","name":"${VSCODE_LM_FINALIZE_EDIT_TOOL}","input":{"summary":"<short applied summary>"}}\n` +
+    `- Canonical final response: {"schema_id":"${VSCODE_LM_EDIT_RESPONSE_SCHEMA}","summary":"<truthful summary>","edits":[{"path":"<allowed-path>","current_sha256":"<path-contract-sha256>","ranges":[{"start_line":"<source-graph-start>","end_line":"<source-graph-end>","new":"<complete replacement>","preserve_trailing_newline":true}]}],"creates":[{"path":"<new-allowed-path>","content":"<complete new file>"}]}. Use empty edits/creates arrays when that operation is not needed. Stage input operation/file_path fields are not final-response path/ranges fields.\n` +
     `- Semantic-edit prepare is an internal bridge primitive and is not provider-callable. Stage each replacement with file_path, start_line, end_line, and new; the bridge resolves and binds current_sha256 internally.\n` +
     `- Semantic edits must name an allowed path and use non-overlapping 1-based inclusive start_line/end_line values from Source Graph evidence.\n` +
     `- Each new value must contain the complete, substantive replacement for its declared range; it may be empty only for an intentional deletion. Do not echo old code. preserve_trailing_newline defaults true.\n` +
@@ -4122,7 +4123,7 @@ function validateVscodeLmFinalEnvelope(envelope, allowedWrites, pathContracts = 
   const requiredCreateError = vscodeLmRequiredCreateError(envelope.creates, contractByPath, "content", "v3_create");
   for (const edit of envelope.edits) {
     if (!edit || typeof edit.path !== "string" || !Array.isArray(edit.ranges)) {
-      return "final_edit_invalid";
+      return "final_edit_invalid:expected_edits_path_and_ranges";
     }
     const contract = contractByPath.get(vscodeLmNormalizedPath(edit.path));
     if (typeof edit.current_sha256 !== "string" || !/^[0-9a-f]{64}$/.test(edit.current_sha256)) {
