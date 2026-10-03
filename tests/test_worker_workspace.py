@@ -651,6 +651,7 @@ def _commit_validation_worker_package(repo: Path) -> None:
         # platform_io's relative import of windows_mxc is repository-local.
         # The seed closure fails closed when the sibling is absent.
         "windows_mxc.py",
+        "rework_overlay_packet.py",
         "worker_workspace.py",
         # worker_workspace imports its C/C++ include-seed helpers from here
         # (NF-2026-01156-RATCHET).

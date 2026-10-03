@@ -14096,74 +14096,15 @@ def materialize_rework_overlay(
     authority_repo: Path,
     file_entries: list[tuple[str, str | None, bytes | None]],
 ) -> bytes:
-    """Emit a bounded, canonical-digest-bound retained-rework overlay.
-
-    Each file entry is (repo_relative_path, sha256_or_None, content_bytes_or_None).
-    sha256=None means delete; content=None with sha256 indicates a hash-only reference.
-    Returns JSON bytes with a deterministic canonical_digest over the sorted files payload.
-    """
-    if not _REQUEST_ID_RE.fullmatch(successor_request_id):
-        raise ValueError(f"invalid successor_request_id: {successor_request_id!r}")
-    if not _REQUEST_ID_RE.fullmatch(predecessor_request_id):
-        raise ValueError(f"invalid predecessor_request_id: {predecessor_request_id!r}")
-    if successor_request_id == predecessor_request_id:
-        raise ValueError("successor and predecessor request_ids must be distinct")
-    # Rework intentionally reuses the canonical task ID.  The immutable claim
-    # attempt is identified by a new request ID, so requiring a distinct task
-    # ID made the packet impossible to wire into the real recovery path.
-    if not successor_task_id or not predecessor_task_id:
-        raise ValueError("successor and predecessor task_ids are required")
-    authority_repo = authority_repo.resolve()
-    if not authority_repo.is_dir():
-        raise FileNotFoundError(f"authority_repo not found: {authority_repo}")
-    if len(file_entries) > MAX_REWORK_OVERLAY_FILES:
-        raise ValueError("rework overlay file count exceeds limit")
-    normalized_files: list[dict[str, Any]] = []
-    seen_paths: set[str] = set()
-    total_content_bytes = 0
-    for rel_path, file_sha, content in file_entries:
-        normalized_path = PurePosixPath(str(rel_path)).as_posix()
-        if (
-            not rel_path
-            or "\\" in str(rel_path)
-            or PurePosixPath(str(rel_path)).is_absolute()
-            or any(part in {"", ".", ".."} for part in PurePosixPath(str(rel_path)).parts)
-        ):
-            raise ValueError(f"invalid repo-relative path: {rel_path!r}")
-        if normalized_path in seen_paths:
-            raise ValueError(f"duplicate rework overlay path: {normalized_path}")
-        seen_paths.add(normalized_path)
-        entry: dict[str, Any] = {"path": normalized_path}
-        if file_sha is None:
-            if content is not None:
-                raise ValueError(f"deleted overlay path carries content: {normalized_path}")
-            entry["deleted"] = True
-        else:
-            if not re.fullmatch(r"[0-9a-f]{64}", str(file_sha)):
-                raise ValueError(f"invalid rework overlay hash: {normalized_path}")
-            entry["sha256"] = file_sha
-        if content is not None:
-            if hashlib.sha256(content).hexdigest() != file_sha:
-                raise ValueError(f"rework overlay content hash mismatch: {normalized_path}")
-            total_content_bytes += len(content)
-            if total_content_bytes > MAX_REWORK_OVERLAY_CONTENT_BYTES:
-                raise ValueError("rework overlay content exceeds limit")
-            entry["content_base64"] = base64.b64encode(content).decode("ascii")
-        normalized_files.append(entry)
-    normalized_files.sort(key=lambda e: e["path"])
-    payload = {
-        "successor_request_id": successor_request_id,
-        "successor_task_id": successor_task_id,
-        "predecessor_request_id": predecessor_request_id,
-        "predecessor_task_id": predecessor_task_id,
-        "authority_repo": str(authority_repo),
-        "files": normalized_files,
-    }
-    payload_digest = hashlib.sha256(
-        json.dumps(payload, sort_keys=True, ensure_ascii=True).encode("utf-8")
-    ).hexdigest()
-    packet = {
-        **payload,
-        "canonical_digest": payload_digest,
-    }
-    return json.dumps(packet, indent=2, ensure_ascii=True).encode("utf-8")
+    """Emit the canonical retained-rework packet with this workspace's limits."""
+    if __package__:
+        from .rework_overlay_packet import materialize_rework_overlay as build_packet
+    else:  # direct-script Landlock entrypoint
+        from rework_overlay_packet import materialize_rework_overlay as build_packet
+    return build_packet(
+        successor_request_id, successor_task_id,
+        predecessor_request_id, predecessor_task_id, authority_repo, file_entries,
+        request_id_pattern=_REQUEST_ID_RE,
+        max_files=MAX_REWORK_OVERLAY_FILES,
+        max_content_bytes=MAX_REWORK_OVERLAY_CONTENT_BYTES,
+    )

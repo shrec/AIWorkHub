@@ -38,7 +38,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, cast
 
-from . import core
+from . import core, rework_overlay_packet as _rework_overlay_packet
 from . import agent_tool_instructions
 from . import attempt_artifacts
 from . import claude_auth
@@ -3593,70 +3593,12 @@ def _provision_worker_mcp_runtime_for_authority(
 
 
 def _materialize_worker_rework_overlay(
-    workspace: WorkerWorkspace,
-    *,
-    task_id: str,
-    card: Mapping[str, Any],
+    workspace: WorkerWorkspace, *, task_id: str, card: Mapping[str, Any],
 ) -> tuple[Path | None, dict[str, Any] | None]:
-    """Seal inherited predecessor bytes for this request's Source Graph.
-
-    ``create_workspace`` already performed the strong predecessor workspace,
-    repository and hash verification.  This helper serializes exactly those
-    verified paths into the request-private HOME before the provider starts;
-    it never scans beyond ``inherited_rework_paths``.
-    """
-
-    if not workspace.inherited_rework_paths:
-        return None, None
-    predecessor = card.get("rework_predecessor")
-    if not isinstance(predecessor, Mapping):
-        raise WorkspaceError("rework_overlay_predecessor_missing")
-    predecessor_request_id = str(predecessor.get("request_id") or "").strip()
-    predecessor_task_id = str(predecessor.get("task_id") or task_id).strip()
-    hashes = predecessor.get("changed_path_hashes")
-    if not predecessor_request_id or not predecessor_task_id or not isinstance(hashes, Mapping):
-        raise WorkspaceError("rework_overlay_predecessor_invalid")
-
-    entries: list[tuple[str, str | None, bytes | None]] = []
-    for relative in workspace.inherited_rework_paths:
-        if relative not in hashes:
-            raise WorkspaceError(f"rework_overlay_hash_missing:{relative}")
-        expected = hashes.get(relative)
-        candidate = workspace.path / relative
-        if expected is None:
-            if candidate.exists() or candidate.is_symlink():
-                raise WorkspaceError(
-                    f"rework_overlay_deleted_path_present:{relative}"
-                )
-            entries.append((relative, None, None))
-            continue
-        if not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{64}", expected):
-            raise WorkspaceError(f"rework_overlay_hash_invalid:{relative}")
-        if candidate.is_symlink() or not candidate.is_file():
-            raise WorkspaceError(f"rework_overlay_file_missing:{relative}")
-        content = candidate.read_bytes()
-        actual = hashlib.sha256(content).hexdigest()
-        # NF-2026-01113: rebase merges bytes; baseline pins "file:<mode>:<sha256>".
-        rebased = str((workspace.workspace_baseline or {}).get(relative) or "")
-        if actual != expected and not re.fullmatch(rf"file:[0-7]+:{actual}", rebased):
-            raise WorkspaceError(f"rework_overlay_hash_mismatch:{relative}")
-        entries.append((relative, actual, content))
-
-    try:
-        packet_bytes = materialize_rework_overlay(
-            workspace.request_id,
-            task_id,
-            predecessor_request_id,
-            predecessor_task_id,
-            workspace.repo,
-            entries,
-        )
-        packet = json.loads(packet_bytes.decode("utf-8"))
-    except (ValueError, OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise WorkspaceError(f"rework_overlay_materialization_failed:{exc}") from exc
-    path = workspace.home / "task_mcp_worker_runtime" / "rework_overlay.json"
-    write_json_0600(path, packet)
-    return path, packet
+    return _rework_overlay_packet.materialize_worker_rework_overlay(
+        workspace, task_id, card, materialize_rework_overlay,
+        write_json_0600, WorkspaceError,
+    )
 
 
 def _materialize_crash_retry_packet(
