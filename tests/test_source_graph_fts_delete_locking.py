@@ -13,8 +13,8 @@ Run: python3 -m pytest -q tests/test_source_graph_fts_delete_locking.py
 from __future__ import annotations
 
 import math
-import shutil
 import sqlite3
+import statistics
 import sys
 import threading
 import time
@@ -172,55 +172,91 @@ def test_invalidate_file_with_no_entities_executes_no_fts_delete(tmp_path):
 # 2. Statement-count and wall-time proof: no full scan per deleted entity
 # ---------------------------------------------------------------------------
 
-def test_chunked_delete_beats_legacy_per_entity_delete_on_statements_and_time(tmp_path):
+def test_chunked_delete_beats_legacy_per_entity_delete_on_statements_and_time(
+    tmp_path, monkeypatch
+):
     root = _new_repo(tmp_path, "perf_proof")
-    db_path = sg.resolve_db_path(root)
-    conn = sg.connect(db_path)
+    source_conn = sg.connect(sg.resolve_db_path(root))
     try:
-        entity_ids = _seed_synthetic_file(conn, "haystack.py", 3000)
-        conn.commit()
+        entity_ids = _seed_synthetic_file(source_conn, "haystack.py", 3000)
+        keep_ids = _seed_synthetic_file(source_conn, "keep.py", 5)
+        source_conn.commit()
 
-        legacy_db = tmp_path / "legacy_copy.sqlite"
-        shutil.copyfile(db_path, legacy_db)
-        legacy_conn = sqlite3.connect(str(legacy_db))
-        try:
-            legacy_statements: list[str] = []
-            legacy_conn.set_trace_callback(legacy_statements.append)
-            legacy_started = time.monotonic()
-            legacy_conn.executemany(
+        def legacy_delete(conn, ids):
+            conn.executemany(
                 "DELETE FROM entities_fts WHERE entity_id=?",
-                [(i,) for i in entity_ids],
+                [(entity_id,) for entity_id in ids],
             )
-            legacy_elapsed = time.monotonic() - legacy_started
-            legacy_conn.set_trace_callback(None)
-        finally:
-            legacy_conn.close()
-        legacy_fts_deletes = _fts_delete_statements(legacy_statements)
 
-        chunked_statements: list[str] = []
-        conn.set_trace_callback(chunked_statements.append)
-        chunked_started = time.monotonic()
-        sg._delete_entities_fts_rows(conn, entity_ids)
-        chunked_elapsed = time.monotonic() - chunked_started
-        conn.set_trace_callback(None)
-        chunked_fts_deletes = _fts_delete_statements(chunked_statements)
+        def run_case(method, label, *, trace=False):
+            # Every arm starts from the same committed SQLite backup and uses
+            # the same production connection settings and invalidation path.
+            case_conn = sg.connect(tmp_path / f"{method}_{label}.sqlite")
+            try:
+                source_conn.backup(case_conn)
+                statements: list[str] = []
+                if trace:
+                    case_conn.set_trace_callback(statements.append)
+                with monkeypatch.context() as patcher:
+                    if method == "legacy":
+                        patcher.setattr(sg, "_delete_entities_fts_rows", legacy_delete)
+                    if not trace:
+                        started = time.perf_counter()
+                    sg._invalidate_file(case_conn, "haystack.py")
+                    case_conn.commit()
+                    elapsed = None if trace else time.perf_counter() - started
+                case_conn.set_trace_callback(None)
 
-        # Before/after statement counts: one DELETE per entity vs. one per
-        # bounded chunk (see NF-2026-00635: 79.5s of per-entity full scans
-        # collapsing to 0.109s of chunked ones).
-        assert len(legacy_fts_deletes) == len(entity_ids) == 3000
-        assert len(chunked_fts_deletes) == math.ceil(
+                # Check both the deleted target and unrelated rows after commit;
+                # the MATCH query also verifies the surviving FTS index is usable.
+                state = (
+                    case_conn.execute("SELECT COUNT(*) FROM files").fetchone()[0],
+                    case_conn.execute("SELECT COUNT(*) FROM entities").fetchone()[0],
+                    case_conn.execute("SELECT COUNT(*) FROM entities_fts").fetchone()[0],
+                    case_conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0],
+                    case_conn.execute(
+                        "SELECT COUNT(*) FROM entities_fts WHERE file_path='haystack.py'"
+                    ).fetchone()[0],
+                    case_conn.execute(
+                        "SELECT COUNT(*) FROM entities_fts WHERE entities_fts MATCH 'sym_0'"
+                    ).fetchone()[0],
+                )
+                assert state == (1, len(keep_ids), len(keep_ids), 0, 0, 1)
+                assert case_conn.execute(
+                    "SELECT file_path FROM files"
+                ).fetchone()[0] == "keep.py"
+                return elapsed, _fts_delete_statements(statements)
+            finally:
+                case_conn.close()
+
+        # Trace callbacks distort timing, so count SQL on separate untimed clones.
+        _, legacy_deletes = run_case("legacy", "statements", trace=True)
+        _, chunked_deletes = run_case("chunked", "statements", trace=True)
+        assert len(legacy_deletes) == len(entity_ids) == 3000
+        assert len(chunked_deletes) == math.ceil(
             len(entity_ids) / sg._FTS_DELETE_CHUNK_SIZE
-        )
-        assert len(chunked_fts_deletes) < len(legacy_fts_deletes)
-        assert chunked_elapsed < legacy_elapsed, (
-            f"chunked delete ({chunked_elapsed:.4f}s, "
-            f"{len(chunked_fts_deletes)} statements) did not beat the legacy "
-            f"per-entity delete ({legacy_elapsed:.4f}s, "
-            f"{len(legacy_fts_deletes)} statements)"
+        ) == 6
+        assert len(chunked_deletes) < len(legacy_deletes)
+
+        elapsed_by_method = {"legacy": [], "chunked": []}
+        for trial in range(8):  # One warmup pair, then seven alternating pairs.
+            order = ("legacy", "chunked") if trial % 2 == 0 else ("chunked", "legacy")
+            for method in order:
+                elapsed, _ = run_case(method, f"timed_{trial}")
+                if trial:
+                    elapsed_by_method[method].append(elapsed)
+        paired_advantages = [
+            legacy - chunked
+            for legacy, chunked in zip(
+                elapsed_by_method["legacy"], elapsed_by_method["chunked"]
+            )
+        ]
+        assert statistics.median(paired_advantages) > 0, (
+            f"chunked delete did not beat per-entity delete across paired runs: "
+            f"{elapsed_by_method}"
         )
     finally:
-        conn.close()
+        source_conn.close()
 
 
 # ---------------------------------------------------------------------------
