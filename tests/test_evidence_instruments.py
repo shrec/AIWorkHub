@@ -790,22 +790,30 @@ def test_suite_profile_collects_per_test_metrics(tmp_path: Path) -> None:
     (tmp_path / "test_sample.py").write_text(
         "def test_sample():\n    assert 2 + 2 == 4\n", encoding="utf-8"
     )
+    # This one-item metric probe must own its configuration, not inherit the
+    # repository's xdist addopts. Parallel controller/worker profile writers
+    # share one output path and produced null CPU/disk metrics in this fixture.
+    config = tmp_path / "pytest.ini"
+    config.write_text("[pytest]\n", encoding="utf-8")
     report = evidence.suite_profile(
         tmp_path,
-        argv=[sys.executable, "-m", "pytest", "-q", "test_sample.py"],
+        argv=[sys.executable, "-m", "pytest", "-c", str(config), "-q", "test_sample.py"],
         repeats=2,
     )
     assert report["per_test_observed"] is True
-    # pytest reports nodeids relative to ITS rootdir, not to the cwd it was
-    # given.  Under a worker sandbox tmp_path lives inside the repository
-    # (.aiworkhub/temp/validation/...), so pytest finds the repo pyproject.toml
-    # as rootdir and prefixes the path -- and every card whose validation list
-    # included this file failed deterministically.  Assert the identity this
-    # test is actually about (the per-test row is keyed by the sample's nodeid)
-    # without depending on where tmp_path happens to be.
     assert report["tests"][0]["nodeid"].endswith("test_sample.py::test_sample")
     assert report["tests"][0]["run_count"] == 2
     assert report["tests"][0]["flake_observed"] is False
+    assert len(report["runs"]) == 2
+    assert [run["returncode"] for run in report["runs"]] == [0, 0]
+    assert [run["timed_out"] for run in report["runs"]] == [False, False]
+    metrics = report["tests"][0]
+    assert metrics["outcomes"] == {"passed": 2}
+    assert len(metrics["duration_seconds"]) == 2
+    assert len(metrics["cpu_seconds"]) == 2
+    assert all(value is not None for value in metrics["cpu_seconds"])
+    assert len(metrics["disk_free_delta_bytes"]) == 2
+    assert all(value is not None for value in metrics["disk_free_delta_bytes"])
 
 
 def test_quality_gate_ratchet_distinguishes_absent_unreadable_and_shape_invalid(
