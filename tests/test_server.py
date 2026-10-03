@@ -18,6 +18,42 @@ if str(_SRC) not in sys.path:
 from aiworkhub import server  # noqa: E402
 
 
+def test_needfix_schema_hints_stdlib_keeps_dependency_free_types() -> None:
+    env = dict(os.environ, AIWORKHUB_MCP_STDIO_BACKEND="stdlib", PYTHONPATH=str(_SRC))
+    script = """
+import importlib.util
+import inspect
+import json
+import typing
+from aiworkhub import server
+assert importlib.util.find_spec("mcp") is None
+assert importlib.util.find_spec("pydantic") is None
+assert not server._MCP_SDK_AVAILABLE
+schemas = {}
+for fn in (server.needfix_add, server.needfix_update):
+    hints = typing.get_type_hints(fn)
+    signature = inspect.signature(fn)
+    fields = ("kind", "severity", "status") if fn is server.needfix_add else ("kind", "severity")
+    for field in fields:
+        if fn is server.needfix_add:
+            assert hints[field] is str
+            assert signature.parameters[field].default == {"kind": "other", "severity": "medium", "status": "captured"}[field]
+        else:
+            assert set(typing.get_args(hints[field])) == {str, type(None)}
+            assert signature.parameters[field].default is None
+    schemas[fn.__name__] = server._stdio_schema_for(fn)
+print(json.dumps(schemas))
+"""
+    result = subprocess.run(
+        [sys.executable, "-S", "-c", script], env=env, capture_output=True,
+        text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    for name, schema in json.loads(result.stdout).items():
+        for field in (("kind", "severity", "status") if name == "needfix_add" else ("kind", "severity")):
+            assert schema["properties"][field] == {"type": "string"}
+
+
 def test_manager_review_hold_tool_forwards_the_exact_identity(monkeypatch) -> None:
     captured: dict = {}
 

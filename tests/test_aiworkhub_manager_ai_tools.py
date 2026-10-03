@@ -1182,6 +1182,62 @@ def test_task_create_normalizes_declared_difficulty_case_and_space(
     assert card["difficulty_origin"] == "declared"
 
 
+def test_needfix_schema_hints_publish_authoritative_choices_without_constraints():
+    import asyncio
+    from aiworkhub import needfix_store
+
+    tools = {item.name: item for item in asyncio.run(server.mcp.list_tools())}
+    for tool_name in ("needfix_add", "needfix_update"):
+        tool = tools[tool_name]
+        choices = {"kind": needfix_store.KINDS, "severity": needfix_store.SEVERITIES}
+        if tool_name == "needfix_add":
+            choices["status"] = needfix_store.STATUSES
+        for name, values in choices.items():
+            field = tool.inputSchema["properties"][name]
+            assert field["description"]
+            assert field["examples"]
+            for value in values:
+                assert value in field["description"]
+            assert '"enum"' not in json.dumps(field)
+            assert '"const"' not in json.dumps(field)
+            if tool_name == "needfix_update":
+                assert field["default"] is None
+                assert {"type": "null"} in field["anyOf"]
+            else:
+                assert field["type"] == "string"
+                assert field["default"] == {"kind": "other", "severity": "medium", "status": "captured"}[name]
+    assert "``status`` defaults to captured" in tools["needfix_add"].description
+    assert "field hint" in tools["needfix_add"].description
+
+
+def test_needfix_schema_hints_real_binding_preserves_normalization_and_refusals(tmp_path, monkeypatch):
+    import asyncio
+    from aiworkhub import needfix_store
+    from mcp.server.fastmcp.exceptions import ToolError
+
+    root = _difficulty_repo(tmp_path, monkeypatch)
+    add = server.mcp._tool_manager.get_tool("needfix_add")
+    update = server.mcp._tool_manager.get_tool("needfix_update")
+    created = asyncio.run(add.run({"title": "Bound hints", "description": "Real binding", "kind": " Defect "}))
+    identity = created["id"]
+    assert created["kind"] == "bug"
+    assert created["kind_normalized"] == {"from": "Defect", "to": "bug"}
+    changed = asyncio.run(update.run({"needfix_id": identity, "kind": " GAP "}))
+    assert changed["kind_normalized"] == {"from": "GAP", "to": "improvement"}
+    before = needfix_store.get_needfix(root, identity)
+    for name, value in (("kind", "observability"), ("severity", "urgent")):
+        with pytest.raises(ToolError, match=f"invalid {name}") as refused:
+            asyncio.run(update.run({"needfix_id": identity, name: value}))
+        assert isinstance(refused.value.__cause__, needfix_store.NeedFixValidationError)
+        assert needfix_store.get_needfix(root, identity) == before
+    for name, value in (("kind", "observability"), ("severity", "urgent"), ("status", "processing")):
+        with pytest.raises(ToolError, match=f"invalid {name}") as refused:
+            asyncio.run(add.run({"title": "Refused hints", "description": "Must not persist", name: value}))
+        assert isinstance(refused.value.__cause__, needfix_store.NeedFixValidationError)
+    assert needfix_store.get_needfix(root, identity) == before
+    assert core.needfix_count() == 1
+
+
 def test_task_create_schema_hints_publish_choices_without_constraints():
     import asyncio
     from aiworkhub import quality_evidence, task_templates

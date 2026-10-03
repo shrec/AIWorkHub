@@ -5330,9 +5330,20 @@ def needfix_add(
     scope: str | None = None,
     provenance: dict | None = None,
     evidence: dict | None = None,
-    status: str = "captured",
-    kind: str = "other",
-    severity: str = "medium",
+    status: typing.Annotated[str, _task_create_hint(
+        "Accepted status values: " + ", ".join(sorted(needfix_store.STATUSES))
+        + ". Defaults to captured; store lifecycle and authority gates still apply.",
+        ["captured", "triaged"],
+    )] = "captured",
+    kind: typing.Annotated[str, _task_create_hint(
+        "Accepted kind values: " + ", ".join(sorted(needfix_store.KINDS))
+        + ". Case, surrounding space and known synonyms are normalized server-side.",
+        ["bug", "improvement"],
+    )] = "other",
+    severity: typing.Annotated[str, _task_create_hint(
+        "Accepted severity values: " + ", ".join(sorted(needfix_store.SEVERITIES)) + ".",
+        ["medium", "high"],
+    )] = "medium",
     tags: list[str] | None = None,
     scope_files: list[str] | None = None,
     scope_symbols: list[str] | None = None,
@@ -5350,6 +5361,8 @@ def needfix_add(
     performance->optimization, design->refactor, dead_code->technical_debt,
     test_coverage->improvement.
     ``severity`` must be one of: critical, high, medium, low, info.
+    ``status`` defaults to captured; its authoritative choices are published
+    in the field hint. Store lifecycle and manager authority still govern it.
 
     Replies with a receipt (``aiworkhub.needfix_add_receipt.v1``): id,
     dedupe_key, status, kind, severity, created_at, provenance.origin,
@@ -5410,8 +5423,16 @@ def needfix_update(
     title: str | None = None,
     description: str | None = None,
     scope: str | None = None,
-    kind: str | None = None,
-    severity: str | None = None,
+    kind: typing.Annotated[str | None, _task_create_hint(
+        "Accepted kind values: " + ", ".join(sorted(needfix_store.KINDS))
+        + ". None keeps the field; case, space and known synonyms normalize server-side.",
+        ["bug", "improvement"],
+    )] = None,
+    severity: typing.Annotated[str | None, _task_create_hint(
+        "Accepted severity values: " + ", ".join(sorted(needfix_store.SEVERITIES))
+        + ". None keeps the field.",
+        ["medium", "high"],
+    )] = None,
     tags: list[str] | None = None,
     scope_files: list[str] | None = None,
     scope_symbols: list[str] | None = None,
