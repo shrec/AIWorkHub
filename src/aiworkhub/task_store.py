@@ -123,6 +123,27 @@ CARD_PERSISTENCE_ENVELOPE_FIELDS: frozenset[str] = frozenset({
 })
 
 
+def is_pristine_pending_card(card: Mapping[str, Any]) -> bool:
+    """A never-claimed card, not a recovered or retained execution episode."""
+    epoch = card.get("claim_epoch")
+    history = card.get("history", [])
+    return (
+        card.get("status") == "pending"
+        and card.get("worker_status") == "unclaimed"
+        and isinstance(history, list)
+        and all(isinstance(entry, dict) and entry.get("event") in {
+            "created", "task_created", "reroute_launch_identity",
+        } for entry in history)
+        and (epoch is None or (type(epoch) is int and epoch == 0))
+        and not any(card.get(key) for key in (
+            "claimed_by", "claimed_at", "started_at", "completed_at",
+            "launch_request_id", "request_id", "terminal_retry", "terminal_failure",
+            "terminal_substatus", "terminal_outcome", "rework_predecessor",
+            "review_feedback", "rejection_disposition",
+        ))
+    )
+
+
 def persistable_card_payload(card: Mapping[str, Any]) -> dict[str, Any]:
     """Return semantic card fields without the SQLite/read projection.
 

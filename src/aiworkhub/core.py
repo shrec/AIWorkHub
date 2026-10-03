@@ -9130,7 +9130,8 @@ def reroute_launch_identity(
     """Atomically reroute one pending/unclaimed card's invalid pinned runner
     to an enabled, available, risk-capable canonical workforce tuple.
 
-    Permitted for an exact operational ``terminal_retry`` receipt, an
+    Permitted for an explicitly authorized pristine never-claimed pending card,
+    an exact operational ``terminal_retry`` receipt, an
     authenticated manager review rejection bound to a verified sealed
     candidate, or — when the manager supplies ``from_runner``, ``to_runner``,
     ``to_adapter_id``, ``to_model`` and a reason — a pending card after a
@@ -9207,6 +9208,9 @@ def reroute_launch_identity(
             reason=bounded_reason,
         )
     )
+    pristine_authorization = bool(
+        bounded_reason and from_runner and task_store.is_pristine_pending_card(card)
+    )
     manager_rejection_receipt: dict[str, Any] = {}
     identical_outcome_receipt: dict[str, Any] = {}
     validation_replay_receipt: dict[str, Any] = {}
@@ -9229,7 +9233,8 @@ def reroute_launch_identity(
             )
         manager_rejection_receipt = manager_rejection
     elif (
-        not valid_terminal_retry
+        not pristine_authorization
+        and not valid_terminal_retry
         and not validation_replay_receipt
         and not operational_authorization
     ):
@@ -9341,6 +9346,26 @@ def reroute_launch_identity(
         except process_launcher.LaunchRejected as exc:
             return _lifecycle_error(f"reroute_target_rejected:{exc}")
 
+    if pristine_authorization:
+        from . import workforce_catalog
+
+        try:
+            catalog = workforce_catalog.build_catalog(repo_root())
+        except Exception as exc:  # noqa: BLE001 - unreadable authority fails closed
+            return _lifecycle_error(
+                f"reroute_target_rejected:workforce_catalog_unreadable:{type(exc).__name__}"
+            )
+        routes = [
+            route for route in catalog.get("workers", [])
+            if route.get("execution_runner") == to_runner
+            and route.get("effective_adapter_id") == to_adapter_id
+            and route.get("model") == canonical_model
+        ]
+        if len(routes) != 1 or routes[0].get("implementation_worker") is not True:
+            return _lifecycle_error("reroute_target_rejected:implementation_worker_role_required")
+        if not all(routes[0].get(key) for key in ("enabled", "available", "launch_eligible")):
+            return _lifecycle_error("reroute_target_rejected:workforce_route_unavailable")
+
     if to_runner == card_runner:
         return _lifecycle_error("reroute_target_identical_to_source")
 
@@ -9368,6 +9393,14 @@ def reroute_launch_identity(
         "rerouted_at": now,
         **retained_candidate_receipt,
     }
+    if pristine_authorization:
+        semantic_card["identity_reroute"]["pristine_pending_authorization"] = {
+            "schema_id": "aiworkhub.pristine_pending_reroute.v1",
+            "task_id": task_id,
+            "actor": _verified_manager_actor(),
+            "from_runner": card_runner,
+            "expected_updated_at": expected_updated_at,
+        }
     if identical_outcome_receipt:
         # What authorized this reroute, recorded where the next reader of the
         # card can see it: the task id, the retained candidate and the retry
@@ -9394,8 +9427,9 @@ def reroute_launch_identity(
     except task_store.TaskStoreError as exc:
         return _canonical_result(ok=False, returncode=1, stderr=str(exc), command=command)
     try:
+        conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
-            "SELECT status, worker_status, runner, card_json, updated_at FROM tasks WHERE task_id=?",
+            "SELECT * FROM tasks WHERE task_id=?",
             (task_id,),
         ).fetchone()
         if (
@@ -9404,6 +9438,10 @@ def reroute_launch_identity(
             or str(row["worker_status"] or "") != "unclaimed"
             or str(row["runner"] or "") != card_runner
             or str(row["updated_at"] or "") != expected_updated_at
+            or task_store._decode_task_card(row) != card
+            or (pristine_authorization and not task_store.is_pristine_pending_card(
+                {**json.loads(row["card_json"]), **dict(row)}
+            ))
         ):
             conn.rollback()
             return _canonical_result(
@@ -9415,8 +9453,8 @@ def reroute_launch_identity(
         cur = conn.execute(
             "UPDATE tasks SET runner=?, card_json=?, updated_at=? "
             "WHERE task_id=? AND status='pending' AND worker_status='unclaimed' "
-            "AND runner=? AND updated_at=?",
-            (to_runner, encoded_card, now, task_id, card_runner, expected_updated_at),
+            "AND runner=? AND updated_at=? AND card_json=?",
+            (to_runner, encoded_card, now, task_id, card_runner, expected_updated_at, row["card_json"]),
         )
         if cur.rowcount != 1:
             conn.rollback()
@@ -9444,6 +9482,9 @@ def reroute_launch_identity(
                         "identical_outcome_refusal": identical_outcome_receipt,
                         "manager_rejection_authorization": manager_rejection_receipt,
                         "operational_provider_authorization": operational_authorization or {},
+                        "pristine_pending_authorization": semantic_card["identity_reroute"].get(
+                            "pristine_pending_authorization", {}
+                        ),
                     },
                     ensure_ascii=False,
                     sort_keys=True,

@@ -220,6 +220,106 @@ def test_retry_terminal_rejects_semantic_or_review_outcomes(
     assert _row(coordinator_repo, task_id)["status"] == "blocked"
 
 
+@pytest.mark.parametrize("change", [
+    {}, {"claimed_by": "worker"}, {"claim_epoch": 1},
+    {"claim_epoch": True}, {"launch_request_id": "old"},
+    {"status": "processing"}, {"status": "review"},
+    {"worker_status": "claimed"},
+])
+def test_pristine_pending_reroute_contract(coordinator_repo, monkeypatch, change):
+    task_id = "PRISTINE_REROUTE"
+    _insert_pending_reroutable(
+        coordinator_repo, task_id=task_id, terminal_retry=None,
+        risk_tier="low", card_overrides={"history": [], **change},
+        status=change.get("status", "pending"),
+        worker_status=change.get("worker_status", "unclaimed"),
+        claimed_by=change.get("claimed_by"),
+    )
+    route = {
+        "execution_runner": "codex_gpt-5.5", "effective_adapter_id": "codex_cli",
+        "model": "gpt-5.5", "implementation_worker": True,
+        "enabled": True, "available": True, "launch_eligible": True,
+    }
+    monkeypatch.setattr(workforce_catalog, "build_catalog", lambda *_: {"workers": [route]})
+    before = _row(coordinator_repo, task_id)
+    result = core.reroute_launch_identity(
+        task_id, from_runner="claude_sonnet-4.6", to_runner="codex_gpt-5.5",
+        to_adapter_id="codex_cli", to_model="gpt-5.5", reason="owner quota reroute",
+    )
+    assert result["ok"] is (not change), result
+    after = _row(coordinator_repo, task_id)
+    if change:
+        assert dict(after) == dict(before)
+    else:
+        assert after["status"] == "pending" and after["worker_status"] == "unclaimed"
+        assert after["claimed_by"] is None
+        card = json.loads(after["card_json"])
+        receipt = card["identity_reroute"]["pristine_pending_authorization"]
+        assert receipt["task_id"] == task_id and receipt["actor"]
+        assert card["allowed_writes"] == json.loads(before["card_json"])["allowed_writes"]
+        conn = sqlite3.connect(task_store.storage_readiness(coordinator_repo).canonical_db)
+        try:
+            event = conn.execute(
+                "SELECT payload_json FROM task_events WHERE task_id=? AND event='reroute_launch_identity'",
+                (task_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        assert json.loads(event[0])["pristine_pending_authorization"] == receipt
+
+
+@pytest.mark.parametrize("reject", ["disabled", "role", "unknown_role", "from", "model", "adapter", "reason", "race", "write_gate", "catalog_unreadable", "history", "risk"])
+def test_pristine_pending_reroute_rejects_invalid_authority(coordinator_repo, monkeypatch, reject):
+    task_id = "PRISTINE_REJECT"
+    _insert_pending_reroutable(
+        coordinator_repo, task_id=task_id, terminal_retry=None,
+        risk_tier="invalid" if reject == "risk" else "low", card_overrides={"history": [{"event": "claimed"}] if reject == "history" else []},
+    )
+    route = {
+        "execution_runner": "codex_gpt-5.5", "effective_adapter_id": "codex_cli",
+        "model": "gpt-5.5", "implementation_worker": True,
+        "enabled": True, "available": True, "launch_eligible": True,
+    }
+    if reject == "disabled":
+        route["enabled"] = False
+    if reject == "role":
+        route["implementation_worker"] = False
+    if reject == "unknown_role":
+        route.pop("implementation_worker")
+    monkeypatch.setattr(workforce_catalog, "build_catalog", lambda *_: {"workers": [route]})
+    if reject == "write_gate":
+        monkeypatch.setenv("AIWORKHUB_ALLOW_WRITES", "0")
+    if reject == "catalog_unreadable":
+        def unreadable(*_):
+            raise workforce_catalog.WorkforceCatalogError("unreadable")
+        monkeypatch.setattr(workforce_catalog, "build_catalog", unreadable)
+    if reject == "race":
+        gate = core._canonical_write_gate
+        def concurrent_claim(*args, **kwargs):
+            result = gate(*args, **kwargs)
+            conn = sqlite3.connect(task_store.storage_readiness(coordinator_repo).canonical_db)
+            try:
+                conn.execute("UPDATE tasks SET claimed_by='concurrent' WHERE task_id=?", (task_id,))
+                conn.commit()
+            finally:
+                conn.close()
+            return result
+        monkeypatch.setattr(core, "_canonical_write_gate", concurrent_claim)
+    before = _row(coordinator_repo, task_id)
+    result = core.reroute_launch_identity(
+        task_id, from_runner="wrong" if reject == "from" else "claude_sonnet-4.6",
+        to_runner="codex_gpt-5.5",
+        to_adapter_id="wrong" if reject == "adapter" else "codex_cli",
+        to_model="wrong" if reject == "model" else "gpt-5.5",
+        reason="" if reject == "reason" else "owner quota reroute",
+    )
+    assert not result["ok"], result
+    after = _row(coordinator_repo, task_id)
+    assert after["runner"] == before["runner"] and after["card_json"] == before["card_json"]
+    if reject == "race":
+        assert after["claimed_by"] == "concurrent"
+
+
 def _insert_pending_reroutable(
     repo: Path,
     *,
