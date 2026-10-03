@@ -2821,7 +2821,7 @@ def _prepare_windows_lock_byte(fd: int) -> None:
 
     The CRT permits locking past EOF. Writing first is unsafe: two handles can
     observe an empty file, and the second write then hits the first handle's
-    newly acquired lock. Initialization requires a writable descriptor, and
+    newly acquired lock. Initialization requires a WRITABLE descriptor, and
     any failure must release the acquired lock before propagating to the caller.
     The public lock/unlock functions preserve the caller's offset.
     """

@@ -206,7 +206,7 @@ def _record(
 # it was actually asserting, so the span is now derived on both sides and
 # there is nothing left to drift.
 _EDITOR_BRIDGE_DISPATCH = (
-    "src/aiworkhub/process_launcher.py::invoke_vscode_lm_worker_tool"
+    "src/aiworkhub/process_launcher.py::_invoke_vscode_lm_worker_tool_bound"
 )
 
 _EDITOR_VSCODE_LM_CONTRACT = RouteContract(
