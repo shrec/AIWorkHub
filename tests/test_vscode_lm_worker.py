@@ -1689,3 +1689,96 @@ def test_model_text_carrying_the_sentence_is_never_a_provider_error(
 
     assert not isinstance(failure.value, vscode_lm_worker.VscodeLmProviderRefusal)
     assert str(failure.value) == "vscode_lm_edit_response_invalid_json"
+
+@pytest.mark.parametrize("error", ["", "fixture_failure"])
+def test_worker_drains_visible_activity_before_terminal_success_or_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], error: str,
+) -> None:
+    request_id = "a" * 32
+    spec_path, response_path, repo_id, token = _strict_terminal_fixture(tmp_path, request_id=request_id)
+    spec = json.loads(spec_path.read_text(encoding="utf-8"))
+    home = tmp_path / request_id / "home"
+    home.mkdir(parents=True, mode=0o700)
+    activity_path = home / ".aiworkhub_vscode_lm_activity.jsonl"
+    rows = [{
+        "schema_id": "aiworkhub.vscode_lm.activity.v1", "request_id": request_id,
+        "repo_id": repo_id, "sequence": index, "kind": "tool", "call_id": "call-1",
+        "tool_name": "read", "tool_state": "completed", "tool_transport": "native",
+        "input_preview": '{"password":"short-secret"}', "output_preview": "ქართული 😀 visible",
+    } for index in range(1, 31)]
+    activity_path.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows), encoding="utf-8")
+    activity_path.chmod(0o600)
+    workspace = home.parent / "worktree"
+    workspace.mkdir()
+    spec_path = home / ".aiworkhub_vscode_lm_worker.json"
+    response_path = home / ".aiworkhub_vscode_lm_response.json"
+    spec.update(workspace_home=str(home), workspace_path=str(workspace),
+                response_path=str(response_path), cancel_path=str(response_path),
+                activity_path=str(activity_path), activity_capture=True)
+    spec_path.write_text(json.dumps(spec), encoding="utf-8")
+    response = _strict_provider_response(request_id=request_id, repo_id=repo_id, token=token)
+    response["error"] = error
+    vscode_lm_bridge._atomic_json(response_path, response)  # noqa: SLF001
+    if error:
+        with pytest.raises(RuntimeError, match="fixture_failure"):
+            vscode_lm_worker.run(spec_path)
+    else:
+        assert vscode_lm_worker.run(spec_path)["is_error"] is False
+    raw = capsys.readouterr().out
+    events = [json.loads(line) for line in raw.splitlines() if line]
+    tool = [event for event in events if event.get("kind") == "tool"]
+    assert len(tool) == 30
+    assert [event["sequence"] for event in tool] == list(range(1, 31))
+    assert all(event["request_id"] == request_id and event["repo_id"] == repo_id for event in tool)
+    assert "short-secret" not in raw
+    assert tool[-1]["output_preview"] == "ქართული 😀 visible"
+
+
+@pytest.mark.parametrize("forged_token", [False, True])
+@pytest.mark.parametrize("malformed", [
+    {"request_id": "foreign"}, {"kind": []}, {"tool_state": {}},
+    {"input_preview": "\ud800"}, {"tool_transport": {"token": "short-secret"}},
+])
+def test_rejected_activity_is_advisory_but_terminal_auth_stays_strict(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], forged_token: bool, malformed: dict,
+) -> None:
+    request_id = "c" * 32
+    original_spec, _original_response, repo_id, token = _strict_terminal_fixture(
+        tmp_path, request_id=request_id,
+    )
+    spec = json.loads(original_spec.read_text(encoding="utf-8"))
+    home = tmp_path / request_id / "home"
+    workspace = home.parent / "worktree"
+    home.mkdir(parents=True, mode=0o700)
+    workspace.mkdir()
+    spec_path = home / ".aiworkhub_vscode_lm_worker.json"
+    response_path = home / ".aiworkhub_vscode_lm_response.json"
+    activity_path = home / ".aiworkhub_vscode_lm_activity.jsonl"
+    activity_path.write_text(json.dumps({
+        "schema_id": "aiworkhub.vscode_lm.activity.v1",
+        "request_id": request_id, "repo_id": repo_id, "sequence": 1, "kind": "tool",
+        "call_id": "call-1", "tool_name": "read", "tool_state": "completed",
+        "output_preview": "MUST_NOT_RELAY password=short-secret",
+        **malformed,
+    }, ensure_ascii=True) + "\n", encoding="utf-8")
+    activity_path.chmod(0o600)
+    spec.update(workspace_home=str(home), workspace_path=str(workspace),
+                response_path=str(response_path), cancel_path=str(response_path),
+                activity_path=str(activity_path), activity_capture=True)
+    vscode_lm_bridge._atomic_json(spec_path, spec)  # noqa: SLF001
+    response = _strict_provider_response(
+        request_id=request_id, repo_id=repo_id, token=("0" * 64 if forged_token else token),
+    )
+    vscode_lm_bridge._atomic_json(response_path, response)  # noqa: SLF001
+    if forged_token:
+        with pytest.raises(RuntimeError, match="terminal_decision_contract_mismatch"):
+            vscode_lm_worker.run(spec_path)
+    else:
+        result = vscode_lm_worker.run(spec_path)
+        assert result["is_error"] is False
+        assert result["visible_tool_activity_status"] == "unavailable"
+    raw = capsys.readouterr().out
+    assert "MUST_NOT_RELAY" not in raw and "short-secret" not in raw
+    statuses = [json.loads(line) for line in raw.splitlines() if line]
+    assert any(event.get("capture_status") == "unavailable"
+               and event.get("rejected_capture") is True for event in statuses)

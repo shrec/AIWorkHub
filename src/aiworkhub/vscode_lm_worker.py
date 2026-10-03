@@ -19,6 +19,7 @@ from typing import Any, cast
 
 from . import semantic_edit
 from .platform_io import current_user_uid
+from .vscode_lm_activity import ActivityCaptureError, ActivityReader
 from .runtime_adapters import EDITOR_REQUESTED_MODEL_RE
 from .semantic_edit import coerce_protocol_line
 from .vscode_lm_bridge import (
@@ -1397,7 +1398,55 @@ def run(spec_path: Path) -> dict[str, Any]:
     last_progress_signature: ProgressFileSignature | None = None
     response: dict[str, Any] | None = None
     decision_action = ""
+    activity_reader = None
+    capture_rejected = False
+    if spec.get("activity_capture") is True and spec.get("activity_path"):
+        try:
+            activity_home = Path(str(spec.get("workspace_home") or "")).absolute()
+            if (activity_home != spec_path.absolute().parent
+                    or activity_home != response_path.absolute().parent
+                    or activity_home.parent != workspace.parent):
+                raise ActivityCaptureError("vscode_lm_activity_attachment_mismatch")
+            activity_reader = ActivityReader(
+                Path(str(spec["activity_path"])), activity_home,
+                str(spec.get("request_id") or ""), str(spec.get("repo_id") or ""),
+            )
+        except ActivityCaptureError:
+            capture_rejected = True
+
+    def capture_status() -> str:
+        if capture_rejected or (response is not None
+                and response.get("activity_capture_status") == "unavailable"):
+            return "unavailable"
+        return activity_reader.availability if activity_reader else "unknown"
+
+    def drain_activity(*, final: bool = False) -> None:
+        nonlocal activity_reader, capture_rejected
+        rejected_now = False
+        if activity_reader is not None:
+            try:
+                activities = activity_reader.drain(final=final)
+            except ActivityCaptureError:
+                # Optional capture fails closed on payload, NOT on terminal authority.
+                activity_reader = None
+                capture_rejected = rejected_now = True
+            else:
+                for activity in activities:
+                    print(json.dumps(activity, ensure_ascii=True, sort_keys=True), flush=True)
+        if final or rejected_now:
+            print(json.dumps({
+                "type": "aiworkhub_tool_activity", "kind": "status",
+                "capture_status": capture_status(),
+                "request_id": str(spec.get("request_id") or ""),
+                "repo_id": str(spec.get("repo_id") or ""),
+                "final_drain": final,
+                "rejected_capture": capture_rejected,
+                "capture_end": activity_reader.capture_end if activity_reader else False,
+                "dropped_events": activity_reader.dropped_events if activity_reader else None,
+            }, ensure_ascii=True, sort_keys=True), flush=True)
+
     while time.monotonic() < deadline:
+        drain_activity()
         if terminal_decision_required:
             decision = read_terminal_decision(
                 response_path,
@@ -1451,8 +1500,10 @@ def run(spec_path: Path) -> dict[str, Any]:
                     last_progress_signature = validated_signature
         time.sleep(0.1)
     else:
+        drain_activity(final=True)
         raise RuntimeError("vscode_lm_response_timeout")
 
+    drain_activity(final=True)
     if response is None:
         raise RuntimeError("vscode_lm_terminal_decision_missing")
     if response.get("schema_id") != RESPONSE_SCHEMA_ID:
@@ -1576,6 +1627,7 @@ def run(spec_path: Path) -> dict[str, Any]:
         "semantic_edit_metrics": semantic_metrics,
         "project_context_receipt": str(spec.get("project_context_receipt") or ""),
         "reasoning_context_attempt": _reasoning_context_attempt_result(response, spec),
+        "visible_tool_activity_status": capture_status(),
     }
 
 

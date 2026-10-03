@@ -3241,6 +3241,149 @@ function atomicWriteOwnerJsonExclusive(filePath, payload) {
   }
 }
 
+const VSCODE_LM_ACTIVITY_MAX_BYTES = 1024 * 1024;
+const VSCODE_LM_ACTIVITY_PREVIEW_BYTES = 4096;
+
+// NF1275: recognized credential coverage, not a claim to detect arbitrary secrets.
+// This is request-owned activity, NEVER raw params in a global debug/lifecycle trace.
+function vscodeLmActivityRedactText(value) {
+  const text = String(value).replace(/\b(?:Bearer|Basic)\s+[^\s"']+/gi, "Bearer [redacted]")
+    .replace(/\bsk-[A-Za-z0-9_-]{8,}\b/g, "[redacted]")
+    .replace(/([A-Za-z][A-Za-z0-9+.-]*:\/\/)[^/\s@]+@/g, "$1[redacted]@")
+    .replace(/(--(?:authorization|api[_-]?key|token|secret|password|credential|cookie)(?:\s+|=))(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s]+)/gi, "$1[redacted]")
+    .replace(/((?:authorization|api[_-]?key|token|secret|password|credential|cookie|prompt|model_context)[\w-]*["']?\s*[:=]\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s&,}]+)/gi, "$1[redacted]");
+  return Buffer.from(text, "utf8").toString("utf8");
+}
+
+function vscodeLmActivityPreview(value) {
+  let truncated = false, visited = 0;
+  const seen = new Set();
+  const redact = (item, depth = 0) => {
+    if (++visited > 256 || depth > 8) { truncated = true; return "[truncated]"; }
+    if (typeof item === "string") {
+      if (/^\s*[\[{]/.test(item)) {
+        try { return redact(JSON.parse(item), depth + 1); } catch (_err) { /* non-JSON tool text */ }
+      }
+      return vscodeLmActivityRedactText(item);
+    }
+    if (!item || typeof item !== "object") return item;
+    if (seen.has(item)) { truncated = true; return "[circular]"; }
+    seen.add(item);
+    const entries = Array.isArray(item) ? item : Object.keys(item);
+    if (entries.length > 40) truncated = true;
+    const result = Array.isArray(item)
+      ? item.slice(0, 40).map(child => redact(child, depth + 1))
+      : Object.fromEntries(entries.slice(0, 40).map(key => [key,
+        TOOL_INPUT_SECRET_KEY_PATTERN.test(key) || /prompt|model_context/i.test(key)
+          ? "[redacted]" : redact(item[key], depth + 1)]));
+    seen.delete(item);
+    return result;
+  };
+  let text = typeof value === "string" ? redact(value) : JSON.stringify(redact(value));
+  if (typeof text !== "string") text = JSON.stringify(text) || "";
+  const bytes = Buffer.from(text, "utf8");
+  text = bytes.toString("utf8"); // Normalize short previews too, before JSON serialization.
+  if (bytes.length > VSCODE_LM_ACTIVITY_PREVIEW_BYTES) {
+    truncated = true;
+    // Decode only complete UTF-8 codepoints; never split a surrogate/codepoint.
+    let end = VSCODE_LM_ACTIVITY_PREVIEW_BYTES;
+    while (end && (bytes[end] & 0xc0) === 0x80) end -= 1;
+    text = bytes.subarray(0, end).toString("utf8");
+  }
+  return { text, truncated };
+}
+
+function createVscodeLmActivityJournal(request) {
+  const home = path.resolve(request.workspaceHome);
+  const file = path.join(home, ".aiworkhub_vscode_lm_activity.jsonl");
+  if (request.activity_path !== undefined && path.resolve(String(request.activity_path)) !== file) {
+    throw new Error("vscode_lm_activity_path_invalid");
+  }
+  if (path.basename(home) !== "home" || path.basename(path.dirname(home)) !== request.requestId ||
+      !VSCODE_LM_REQUEST_ID_RE.test(request.requestId)) throw new Error("vscode_lm_activity_path_identity_invalid");
+  if (request.activity_capture !== true) return { record() {}, finish() {}, status: () => "unknown" };
+  let sequence = 0, bytes = 0, dropped = 0, ended = false, failed = false, identity = null;
+  const status = () => failed ? "unavailable" : dropped ? "limited" : "available";
+  const samePath = (left, right) => process.platform === "win32"
+    ? path.resolve(left).toLowerCase() === path.resolve(right).toLowerCase() : path.resolve(left) === path.resolve(right);
+  const metadataSafe = metadata => metadata.isFile() && !metadata.isSymbolicLink() && metadata.nlink === 1 &&
+    (process.platform === "win32" || ((metadata.mode & 0o077) === 0 &&
+      (typeof process.getuid !== "function" || metadata.uid === process.getuid())));
+  // Windows named and opened snapshots expose different dev values (NF1270); inode is stable.
+  const key = metadata => (process.platform === "win32" ? "" : String(metadata.dev) + ":") + String(metadata.ino);
+  const append = fields => {
+    // No mkdir/chmod of host directories; only this already-owned request home.
+    for (let ancestor = home;; ancestor = path.dirname(ancestor)) {
+      const meta = fs.lstatSync(ancestor);
+      if (meta.isSymbolicLink() || !samePath(fs.realpathSync(ancestor), ancestor)) throw new Error("vscode_lm_activity_path_escape");
+      if (path.dirname(ancestor) === ancestor) break;
+    }
+    const parent = fs.lstatSync(home);
+    if (!parent.isDirectory() || (process.platform !== "win32" && ((parent.mode & 0o077) ||
+        (typeof process.getuid === "function" && parent.uid !== process.getuid())))) throw new Error("vscode_lm_activity_owner_invalid");
+    const row = Buffer.from(JSON.stringify({
+      schema_id:"aiworkhub.vscode_lm.activity.v1", request_id:request.requestId, repo_id:request.repo_id,
+      sequence:sequence + 1, updated_at:new Date().toISOString(), ...fields,
+    }) + "\n", "utf8");
+    if (bytes + row.length > VSCODE_LM_ACTIVITY_MAX_BYTES) throw new Error("vscode_lm_activity_journal_limit");
+    let flags = fs.constants.O_WRONLY | fs.constants.O_APPEND;
+    if (typeof fs.constants.O_NOFOLLOW === "number") flags |= fs.constants.O_NOFOLLOW;
+    if (identity === null) flags |= fs.constants.O_CREAT | fs.constants.O_EXCL;
+    else {
+      const named = fs.lstatSync(file);
+      if (!metadataSafe(named) || key(named) !== identity || named.size !== bytes) throw new Error("vscode_lm_activity_identity_changed");
+    }
+    const fd = fs.openSync(file, flags, 0o600);
+    try {
+      const opened = fs.fstatSync(fd), named = fs.lstatSync(file);
+      const parentNow = fs.lstatSync(home);
+      if (parentNow.isSymbolicLink() || key(parentNow) !== key(parent) ||
+          !samePath(fs.realpathSync(home), home) || !samePath(fs.realpathSync(file), file)) {
+        throw new Error("vscode_lm_activity_path_escape");
+      }
+      if (!metadataSafe(opened) || !metadataSafe(named) || key(opened) !== key(named) ||
+          (identity !== null && key(opened) !== identity) || opened.size !== bytes) throw new Error("vscode_lm_activity_identity_changed");
+      // Ordered, synchronous single-request append: no per-event thread/race or snapshot overwrite.
+      let written = 0;
+      while (written < row.length) {
+        const count = fs.writeSync(fd, row, written, row.length - written);
+        if (count <= 0) throw new Error("vscode_lm_activity_short_write");
+        written += count;
+      }
+      fs.fsyncSync(fd);
+      identity = key(opened); bytes += row.length; sequence += 1;
+    } finally { fs.closeSync(fd); }
+  };
+  const marker = end => ({kind:"status", capture_status:status(), dropped_events:dropped, capture_end:end,
+    redaction_coverage:"recognized credential keys/assignments, bearer/API tokens, URL credentials; arbitrary secrets unknown"});
+  try { append(marker(false)); } catch (_err) { failed = true; }
+  return {
+    status,
+    record(toolName, details = {}) {
+      if (ended || failed) return;
+      // Reserve the final loss/status row rather than silently dropping its evidence.
+      if (bytes > VSCODE_LM_ACTIVITY_MAX_BYTES - 16 * 1024) { dropped += 1; return; }
+      try {
+        const input = details.tool_input === undefined ? null : vscodeLmActivityPreview(details.tool_input);
+        const output = details.tool_result === undefined ? null : vscodeLmActivityPreview(details.tool_result);
+        append({kind:"tool", call_id:Buffer.from(vscodeLmActivityRedactText(details.call_id || "").slice(0,200), "utf8").toString("utf8"),
+          tool_name:Buffer.from(vscodeLmActivityRedactText(toolName || "").slice(0,200), "utf8").toString("utf8"),
+          tool_transport:["native","emulated"].includes(details.activity_transport) ? details.activity_transport : "unknown",
+          tool_state:["started","completed","failed"].includes(details.tool_state) ? details.tool_state : "started",
+          elapsed_ms:Math.max(0,Math.min(Math.floor(Number(details.elapsed_ms) || 0),86_400_000)),
+          error_code:vscodeLmActivityRedactText(details.error_code || "").slice(0,256),
+          ...(input ? {input_preview:input.text} : {}), ...(output ? {output_preview:output.text} : {}),
+          preview_truncated:Boolean(input && input.truncated || output && output.truncated)});
+      } catch (_err) { failed = true; }
+    },
+    finish() {
+      if (ended) return;
+      ended = true;
+      if (!failed) { try { append(marker(true)); } catch (_err) { failed = true; } }
+    },
+  };
+}
+
 function validateVscodeLmRequest(payload, repoInfo, expectedRequestPath = null) {
   if (!payload || typeof payload !== "object" || payload.schema_id !== VSCODE_LM_REQUEST_SCHEMA) {
     throw new Error("vscode_lm_request_schema_mismatch");
@@ -6145,7 +6288,8 @@ async function runVscodeLmTextProtocol(
     let toolFailureReported = false;
     const toolStartedAt = Date.now();
     if (!toolInputTooLarge && typeof onToolTurn === "function") {
-      try { onToolTurn(envelope.name, { tool_state: "started" }); } catch (_err) { /* liveness only */ }
+      try { onToolTurn(envelope.name, { tool_state: "started", tool_input: envelope.input,
+        call_id: String(turnProviderCallId || `emulated-${turn}`), activity_transport: "emulated" }); } catch (_err) { /* advisory activity */ }
     }
     try {
       assertRequestActive();
@@ -6197,6 +6341,7 @@ async function runVscodeLmTextProtocol(
       if (typeof onToolTurn === "function") {
         try {
           onToolTurn(envelope.name, {
+            call_id: String(turnProviderCallId || `emulated-${turn}`), activity_transport: "emulated", tool_result: result,
             tool_state: "failed",
             elapsed_ms: Math.max(0, Date.now() - toolStartedAt),
             error_code: sanitizeErrorMessage(result.error).slice(0, 256),
@@ -6216,6 +6361,7 @@ async function runVscodeLmTextProtocol(
     if (typeof onToolTurn === "function" && !toolFailureReported) {
       try {
         onToolTurn(envelope.name, {
+          call_id: String(turnProviderCallId || `emulated-${turn}`), activity_transport: "emulated", tool_result: result,
           tool_state: result && result.ok === false ? "failed" : "completed",
           elapsed_ms: Math.max(0, Date.now() - toolStartedAt),
           error_code: result && result.ok === false
@@ -6785,7 +6931,8 @@ async function runVscodeLmAgent(
       let toolFailureReported = false;
       const toolStartedAt = Date.now();
       if (typeof onToolTurn === "function") {
-        try { onToolTurn(call.name, { tool_state: "started" }); } catch (_err) { /* liveness only */ }
+        try { onToolTurn(call.name, { tool_state: "started", tool_input: call.input,
+          call_id: `${turnProviderCallId || `native-${turn}`}:${results.length}`, activity_transport: "native" }); } catch (_err) { /* advisory activity */ }
       }
       try {
         assertRequestActive();
@@ -6811,6 +6958,7 @@ async function runVscodeLmAgent(
         if (typeof onToolTurn === "function") {
           try {
             onToolTurn(call.name, {
+              call_id: `${turnProviderCallId || `native-${turn}`}:${results.length}`, activity_transport: "native", tool_result: result,
               tool_state: "failed",
               elapsed_ms: Math.max(0, Date.now() - toolStartedAt),
               error_code: sanitizeErrorMessage(result.error).slice(0, 256),
@@ -6831,6 +6979,7 @@ async function runVscodeLmAgent(
       if (typeof onToolTurn === "function" && !toolFailureReported) {
         try {
           onToolTurn(call.name, {
+            call_id: `${turnProviderCallId || `native-${turn}`}:${results.length}`, activity_transport: "native", tool_result: result,
             tool_state: result && result.ok === false ? "failed" : "completed",
             elapsed_ms: Math.max(0, Date.now() - toolStartedAt),
             error_code: result && result.ok === false
@@ -7212,17 +7361,22 @@ class VscodeLmBridgeHost {
         } catch (_err) { /* progress is advisory, never completion */ }
       };
       writeProgress("request_accepted");
-      const onToolTurn = (toolName, details = {}) => writeProgress("tool_turn", {
-        tool_name: String(toolName || "").slice(0, 200),
+      const activityJournal = createVscodeLmActivityJournal(request);
+      const onToolTurn = (toolName, details = {}) => {
+        activityJournal.record(toolName, details);
+        writeProgress("tool_turn", {
+          activity_capture_status: activityJournal.status(),
+        tool_name: Buffer.from(vscodeLmActivityRedactText(toolName || ""), "utf8").toString("utf8").slice(0, 200),
         tool_transport: vscodeLmProtocolToolTransport(toolName),
         tool_state: ["started", "completed", "failed"].includes(String(details.tool_state || ""))
           ? String(details.tool_state)
           : "started",
         elapsed_ms: Math.max(0, Math.min(Number(details.elapsed_ms || 0), 86_400_000)),
-        error_code: String(details.error_code || "").slice(0, 256),
+        error_code: vscodeLmActivityRedactText(details.error_code || "").slice(0, 256),
         timeout_phase: String(details.timeout_phase || "").slice(0, 80),
         timeout_ms: Math.max(0, Math.min(Number(details.timeout_ms || 0), 86_400_000)),
-      });
+        });
+      };
       const onProviderPart = () => writeProgress("provider_response", {}, 2000);
       const remainingMs = Math.max(1, Date.parse(String(request.deadline)) - Date.now());
       deadlineTimer = setTimeout(() => {
@@ -7275,6 +7429,7 @@ class VscodeLmBridgeHost {
         recordSystemLog(`[vscode lm bridge] ${error} trace=${JSON.stringify(diagnostics.turn_trace)}`);
       }
       finally {
+        activityJournal.finish();
         if (deadlineTimer) clearTimeout(deadlineTimer);
         deadlineTimer = null;
       }
@@ -7286,6 +7441,7 @@ class VscodeLmBridgeHost {
       // separate reservation to leak after a host crash and no overwrite
       // window in which a late provider response can replace cancellation.
       const responsePayload = {
+        activity_capture_status: activityJournal.status(),
         schema_id: VSCODE_LM_RESPONSE_SCHEMA,
         request_id: request.requestId,
         repo_id: repoInfo.repoId,
@@ -12643,6 +12799,9 @@ module.exports = {
   activate,
   deactivate,
   __testInternals: {
+    createVscodeLmActivityJournal,
+  vscodeLmActivityRedactText,
+    vscodeLmActivityPreview,
     CODING_FOUNDATION_CARD_KEYS,
     CODING_FOUNDATION_SCHEMAS,
     codingFoundationCardModel,

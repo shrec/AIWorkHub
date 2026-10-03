@@ -362,6 +362,12 @@ def test_create_request_targets_selected_fresh_window(
 
     payload = json.loads(request.request_path.read_text(encoding="utf-8"))
     assert payload["target_window_id"] == "window_test"
+    spec = json.loads(request.worker_spec_path.read_text(encoding="utf-8"))
+    expected_activity = str(home / ".aiworkhub_vscode_lm_activity.jsonl")
+    assert payload["activity_path"] == spec["activity_path"] == expected_activity
+    assert payload["activity_capture"] is spec["activity_capture"] is True
+    assert spec["workspace_home"] == str(home)
+    assert not Path(expected_activity).exists(), "coordinator must not pre-create/overwrite the host journal"
 
 
 def _bridge_request_for_cancel_test(
@@ -1930,7 +1936,19 @@ def test_worker_streams_monotonic_progress_before_response(
     result = vscode_lm_worker.run(request.worker_spec_path)
 
     output = capsys.readouterr().out
-    progress = json.loads(output.strip())
+    records = [json.loads(line) for line in output.splitlines() if line]
+    progress_records = [record for record in records if record.get("type") == "aiworkhub_progress"]
+    assert len(progress_records) == 1
+    progress = progress_records[0]
+    activity_status = [record for record in records
+                       if record.get("type") == "aiworkhub_tool_activity"]
+    assert activity_status == [{
+        "type": "aiworkhub_tool_activity", "kind": "status",
+        "capture_status": "unknown", "request_id": request_id, "repo_id": repo_id,
+        "final_drain": True, "capture_end": False, "dropped_events": None,
+        "rejected_capture": False,
+    }]
+    assert len(records) == 2
     assert progress == {
         "phase": "tool_turn",
         "sequence": 2,

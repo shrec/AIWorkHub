@@ -6746,7 +6746,93 @@ async function nf1255TypedReasoningCannotBecomeProtocolText() {
   }
 }
 
+async function nf1275VisibleActivityEndToEnd() {
+  const root = path.resolve(__dirname,"../..");
+  const base = fs.mkdtempSync(path.join(os.tmpdir(),"activity-e2e-"));
+  const originalTextPart = fakeVscode.LanguageModelTextPart;
+  class TextPart { constructor(value) { this.value=value; } }
+  fakeVscode.LanguageModelTextPart = TextPart;
+  try {
+    const fixture = require("./live-output-formatting.test.js");
+    for (const native of [false,true]) {
+      for (const toolError of [false,true]) {
+        const requestId = (native ? (toolError ? "c" : "b") : (toolError ? "e" : "d")).repeat(32);
+        const home=path.join(base,requestId,"home"), workspace=path.join(base,requestId,"worktree");
+        fs.mkdirSync(home,{recursive:true,mode:0o700}); fs.mkdirSync(workspace,{mode:0o700});
+        const request={requestId,repo_id:"repo_test",workspaceHome:home,activity_capture:true,
+          prompt:"Synthetic fixture only",request_kind:"worker",allowedWrites:[],path_contracts:{},
+          initial_source_graph_request:{mode:"focus",query:"seed"},initial_source_graph_result:{ok:true,content:"seed"}};
+        const final=JSON.stringify({schema_id:internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+          summary:"fixture final",edits:[],creates:[]});
+        const source=fs.readFileSync(extensionPath,"utf8");
+        const begin=source.indexOf("const activityJournal = createVscodeLmActivityJournal(request);");
+        const end=source.indexOf("const onProviderPart =",begin);
+        const wired=require("vm").runInNewContext(source.slice(begin,end)+"\n({onToolTurn,activityJournal});",{
+          request,createVscodeLmActivityJournal:internals.createVscodeLmActivityJournal,
+          Buffer, vscodeLmActivityRedactText:internals.vscodeLmActivityRedactText,
+          writeProgress(_phase,fields){ assert(!JSON.stringify(fields).includes("metadata-secret")); },
+          vscodeLmProtocolToolTransport:()=> "private_mcp",
+        });
+        let turn=0;
+        const input={mode:"focus",query:'{"password":"short-secret","visible":"input marker"}'};
+        const model={capabilities:{toolCalling:native},sendRequest:async()=>{
+          turn+=1;
+          const parts=turn===1 ? native
+            ? [{callId:"provider-call",name:"aiworkhub_worker_source_graph_query",input}]
+            : [new TextPart(JSON.stringify({schema_id:internals.constants.VSCODE_LM_TOOL_REQUEST_SCHEMA,
+              name:"aiworkhub_worker_source_graph_query",input}))]
+            : [new TextPart(final)];
+          return {stream:(async function*(){yield* parts;}())};
+        }};
+        await internals.runVscodeLmAgent(model,request,undefined,async()=>{
+          if(toolError) throw new Error("fixture tool failure password=short-secret");
+          return {ok:true,content:"ქართული 😀 visible <script>",nested:{api_key:"short-secret"}};
+        },wired.onToolTurn);
+        wired.activityJournal.finish();
+        const artifact=path.join(home,".aiworkhub_vscode_lm_activity.jsonl");
+        wired.onToolTurn("password=metadata-secret", {call_id:"Bearer metadata-secret",
+          activity_transport:"native", tool_input:"short\ud800"});
+        assert(!fs.readFileSync(artifact,"utf8").includes("short-secret"));
+        const response=path.join(home,".aiworkhub_vscode_lm_response.json"), spec=path.join(home,".aiworkhub_vscode_lm_worker.json");
+        fs.writeFileSync(response,JSON.stringify({schema_id:"aiworkhub.vscode_lm.response.v1",
+          request_id:requestId,text:final,error:""}),{mode:0o600});
+        fs.writeFileSync(spec,JSON.stringify({schema_id:"aiworkhub.vscode_lm.worker_spec.v1",
+          request_id:requestId,repo_id:"repo_test",workspace_path:workspace,workspace_home:home,
+          response_path:response,activity_path:artifact,activity_capture:true,allowed_writes:[]}),{mode:0o600});
+        const python=path.join(root,".venv",process.platform==="win32"?"Scripts/python.exe":"bin/python");
+        const child=require("child_process").spawnSync(python,["-m","aiworkhub.vscode_lm_worker","--spec",spec],{
+          cwd:root,encoding:"utf8",timeout:20000,
+          env:{...process.env,AIWORKHUB_ALLOW_WRITES:"1",PYTHONPATH:[path.join(root,"src"),root].join(path.delimiter)},
+        });
+        assert.strictEqual(child.status,0,child.stderr || child.stdout);
+        assert(!child.stdout.includes("short-secret"),"relay must re-redact");
+        const events=child.stdout.trim().split("\n").map(JSON.parse);
+        const activity=events.filter(item=>item.type==="aiworkhub_tool_activity"&&item.kind==="tool");
+        assert.strictEqual(activity.length,2);
+        assert.strictEqual(activity[0].tool_state,"started");
+        assert.strictEqual(activity[1].tool_state,toolError?"failed":"completed");
+        assert.strictEqual(activity[0].call_id,activity[1].call_id);
+        assert.strictEqual(activity[1].tool_transport,native?"native":"emulated");
+        assert(activity.every(item=>item.request_id===requestId&&item.repo_id==="repo_test"));
+        const timeline=fixture.api.timelineEventsFromText(child.stdout).filter(item=>item.title==="Tool activity");
+        assert(timeline.some(item=>item.activityInput.includes("input marker")));
+        fixture.api.renderFormattedLiveOutput(child.stdout);
+        const rendered=fixture.document.querySelector("#detail-live-output-container");
+        assert(rendered.textContent.includes(toolError?"fixture tool failure":"ქართული 😀 visible"));
+        assert(!rendered.innerHTML.includes("<script>"));
+        assert(!rendered.textContent.includes("short-secret"));
+      }
+    }
+  } finally {
+    if(originalTextPart===undefined) delete fakeVscode.LanguageModelTextPart;
+    else fakeVscode.LanguageModelTextPart=originalTextPart;
+    assert(path.resolve(base).startsWith(path.resolve(os.tmpdir())+path.sep));
+    fs.rmSync(base,{recursive:true,force:true});
+  }
+}
+
 async function main() {
+  await nf1275VisibleActivityEndToEnd();
   await nf1255TypedReasoningCannotBecomeProtocolText();
   await nf1252FinalSchemaIsExplicitAndCorrectable();
   await nf998LiteralWhitespaceDoesNotCollide();
@@ -7447,6 +7533,90 @@ async function progressReceiptChecks() {
   internals.resetVscodeLmWorkerSourceGraphReadinessForTest();
 }
 
+// NF1275: use production append/redaction, never global trace or owner HOME.
+{
+  assert.strictEqual(typeof internals.createVscodeLmActivityJournal, "function");
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "activity-"));
+  const requestId = "a".repeat(32);
+  const home = path.join(base, requestId, "home");
+  fs.mkdirSync(home, {recursive:true, mode:0o700});
+  const request = {requestId, repo_id:"repo_test", workspaceHome:home, activity_capture:true};
+  assert.strictEqual(internals.vscodeLmActivityPreview("short\ud800").text, "short\ufffd",
+    "short previews must normalize unpaired surrogates before JSON persistence");
+  const privateId = "8".repeat(32), privateHome = path.join(base, privateId, "home");
+  fs.mkdirSync(privateHome, {recursive:true, mode:0o700});
+  const privateJournal = internals.createVscodeLmActivityJournal({...request,requestId:privateId,workspaceHome:privateHome});
+  privateJournal.record("password=metadata-secret", {call_id:"Bearer metadata-secret",
+    activity_transport:{token:"metadata-secret"}, tool_input:"short\ud800"});
+  privateJournal.finish();
+  const privateRaw = fs.readFileSync(path.join(privateHome,".aiworkhub_vscode_lm_activity.jsonl"),"utf8");
+  assert(!privateRaw.includes("metadata-secret"), "string metadata redacted BEFORE append");
+  const privateRow = privateRaw.trim().split("\n").map(JSON.parse)[1];
+  assert.strictEqual(privateRow.tool_transport,"unknown");
+  assert.strictEqual(privateRow.input_preview,"short\ufffd");
+  const journal = internals.createVscodeLmActivityJournal(request);
+  for (let index=0; index<100; index++) {
+    journal.record("read", {tool_state:"started", call_id:`call-${index}`, tool_input:{
+      path:"src/a.txt", password:"short-secret", nested:{authorization:"Bearer short-secret"},
+      text:'{"api_key":"short-secret"}', url:"https://user:short-secret@example.com/?token=short-secret",
+    }});
+    journal.record("read", {tool_state:"completed", call_id:`call-${index}`, tool_result:"ქართული 😀 <script>"});
+  }
+  journal.finish();
+  const artifact = path.join(home, ".aiworkhub_vscode_lm_activity.jsonl");
+  const raw = fs.readFileSync(artifact,"utf8");
+  const rows = raw.trim().split("\n").map(JSON.parse);
+  assert.strictEqual(rows.length,202);
+  assert.deepStrictEqual(rows.map(item=>item.sequence),Array.from({length:202},(_,i)=>i+1));
+  assert(!raw.includes("short-secret"),"recognized credentials redacted BEFORE append");
+  for(const value of ["postgresql://name:short-secret@example.com/db","--password short-secret",
+      "Authorization: Basic short-secret", '{"nested":{"text":"{\\"token\\":\\"short-secret\\"}"}}']) {
+    assert(!internals.vscodeLmActivityPreview(value).text.includes("short-secret"));
+  }
+  assert(internals.vscodeLmActivityPreview(Array.from({length:40},()=>Array.from({length:40},()=>({visible:"x"})))).truncated);
+  assert(raw.includes("ქართული 😀"));
+  assert.strictEqual(rows[1].call_id,rows[2].call_id);
+  assert.strictEqual(rows.at(-1).capture_end,true);
+  assert.strictEqual(rows.at(-1).capture_status,"available");
+  const wrong = {...request, activity_path:path.join(base,"outside")};
+  assert.throws(()=>internals.createVscodeLmActivityJournal(wrong),/activity_path/);
+  const legacy = internals.createVscodeLmActivityJournal({...request,activity_capture:undefined});
+  assert.strictEqual(legacy.status(),"unknown");
+  const collision=internals.createVscodeLmActivityJournal(request);
+  assert.strictEqual(collision.status(),"unavailable");
+  collision.finish();
+  assert.strictEqual(fs.readFileSync(artifact,"utf8"),raw,"existing journal never overwritten/replayed");
+  const cappedId="f".repeat(32), cappedHome=path.join(base,cappedId,"home");
+  fs.mkdirSync(cappedHome,{recursive:true,mode:0o700});
+  const capped=internals.createVscodeLmActivityJournal({...request,requestId:cappedId,workspaceHome:cappedHome});
+  for(let index=0;index<800;index++) capped.record("read",{
+    tool_state:"completed",call_id:"cap-"+index,tool_result:"ქართული 😀 ".repeat(1000),
+  });
+  capped.finish();
+  const cappedRaw=fs.readFileSync(path.join(cappedHome,".aiworkhub_vscode_lm_activity.jsonl"),"utf8");
+  assert(Buffer.byteLength(cappedRaw,"utf8")<=1024*1024);
+  const cappedRows=cappedRaw.trim().split("\n").map(JSON.parse);
+  assert.strictEqual(cappedRows.at(-1).capture_status,"limited");
+  assert(cappedRows.at(-1).dropped_events>0);
+  assert(cappedRows.some(item=>item.preview_truncated===true));
+  assert(!cappedRaw.includes("\ufffd"),"byte caps cannot split Unicode");
+  assert(cappedRows.every(item=>!item.output_preview||Buffer.byteLength(item.output_preview,"utf8")<=4096));
+  const linkId="1".repeat(32), linkHome=path.join(base,linkId,"home");
+  fs.mkdirSync(linkHome,{recursive:true,mode:0o700});
+  const linkPath=path.join(linkHome,".aiworkhub_vscode_lm_activity.jsonl");
+  try {
+    fs.symlinkSync(artifact,linkPath,"file");
+    const linked=internals.createVscodeLmActivityJournal({...request,requestId:linkId,workspaceHome:linkHome});
+    assert.strictEqual(linked.status(),"unavailable");
+    linked.record("read",{tool_state:"completed",call_id:"unsafe",tool_result:"must not persist"});
+    assert.strictEqual(fs.readFileSync(artifact,"utf8"),raw);
+  } catch(error) {
+    if(!["EPERM","EACCES","ENOTSUP"].includes(error.code)) throw error;
+  }
+  // Exact owned scratch removal only, after verifying it remains inside the test temp root.
+  assert(path.resolve(base).startsWith(path.resolve(os.tmpdir())+path.sep));
+  fs.rmSync(base,{recursive:true,force:true});
+}
 main().then(() => {
   console.log("GLM VS Code LM bridge: ok");
 }).catch((err) => {

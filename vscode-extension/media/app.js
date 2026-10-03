@@ -4749,8 +4749,23 @@ function reasoningTimelineEvent(event, rawLine) {
     rawLine,
   );
 }
-
 function timelineEventFromObject(event, rawLine) {
+  if (event.type === "aiworkhub_tool_activity") {
+    const status = event.kind === "status";
+    const capture = ["available", "limited", "unavailable", "unknown"].includes(event.capture_status)
+      ? event.capture_status : "unknown";
+    return {
+      kind: event.tool_state === "failed" ? "error" : "event",
+      title: "Tool activity", label: status ? "Visible tool capture" : redactDisplayText(event.tool_name || "tool", 200),
+      state: status ? "advisory" : String(event.tool_state || "unknown"),
+      message: status
+        ? `Capture ${capture}; dropped ${Number.isSafeInteger(event.dropped_events) ? event.dropped_events : "unknown"} events${event.rejected_capture ? "; capture rejected" : ""}${event.final_drain && event.capture_end !== true ? "; journal end unknown" : ""}`
+        : `${event.tool_transport || "unknown"} · ${event.call_id || "unknown call"} · sequence ${event.sequence || "unknown"}${event.preview_truncated ? " · preview truncated" : ""}`,
+      metrics: [], raw: safeRawEvent(rawLine),
+      activityInput: redactDisplayText(event.input_preview || "", 8192),
+      activityOutput: redactDisplayText(event.output_preview || event.error_code || "", 8192),
+    };
+  }
   if (claudeStreamNoopEvent(event)) {
     return null;
   }
@@ -4917,6 +4932,8 @@ function renderFormattedLiveOutput(decoded) {
     if (event.metrics.length) {
       row.appendChild(createElement("div", "live-output-row-meta", event.metrics.join(" | ")));
     }
+    addLiveOutputSection(row, "Tool input (recognized credentials redacted)", event.activityInput);
+    addLiveOutputSection(row, "Tool result (recognized credentials redacted)", event.activityOutput);
     const raw = createElement("details", "live-output-row-raw");
     raw.append(createElement("summary", "", "Raw event"), createElement("pre", "", event.raw));
     row.appendChild(raw);

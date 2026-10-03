@@ -513,4 +513,23 @@ function lines(...events) {
   }
 }
 
+{
+  const visible = { type: "aiworkhub_tool_activity", request_id: "a".repeat(32), repo_id: "repo_test",
+    sequence: 1, kind: "tool", call_id: "call-1", tool_name: "read", tool_state: "completed",
+    input_preview: '{"path":"src/a.txt"}', output_preview: "ქართული 😀 <script>" + "visible line ".repeat(220) + "END",
+    preview_truncated: false };
+  const parsed = api.timelineEventsFromText(lines(visible));
+  assert.strictEqual(parsed[0].title, "Tool activity");
+  assert.strictEqual(parsed[0].activityInput, visible.input_preview);
+  assert.strictEqual(parsed[0].activityOutput, visible.output_preview);
+  api.renderFormattedLiveOutput(lines(visible));
+  const rendered = document.querySelector("#detail-live-output-container");
+  assert(rendered.textContent.includes("ქართული 😀 <script>"));
+  assert(rendered.textContent.includes("visible line ".repeat(220)), "bounded payload is fully viewable, not 180/2000-char raw truncation");
+  assert(!rendered.innerHTML.includes("<script>"), "tool previews use textContent, never HTML");
+  const status = api.timelineEventsFromText(lines({type:"aiworkhub_tool_activity", kind:"status", capture_status:"limited", dropped_events:3}));
+  assert(status[0].message.includes("limited"));
+  assert(status[0].message.includes("3"));
+}
+module.exports = { api, document };
 console.log("live-output-formatting.test.js: ok");
