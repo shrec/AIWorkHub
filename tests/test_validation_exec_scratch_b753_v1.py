@@ -623,11 +623,11 @@ def test_run_validations_pins_request_local_scratch_root(
         worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
 
 
-def test_windows_default_scratch_uses_short_request_local_leaf(
+def test_windows_default_repo_scratch_uses_short_full_request_leaf(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    request_id = "b753a1c9d2e3f405162738495a6b7c8d"
-    monkeypatch.setattr(worker_workspace.sys, "platform", "win32")
+    request_id = "union2_" + "b7" * 16 + "_" + "c8" * 8
+    monkeypatch.setattr(worker_workspace, "is_windows", lambda: True)
     monkeypatch.delenv(worker_workspace.VALIDATION_EXEC_SCRATCH_ROOT_ENV, raising=False)
     # Topology-only test: pin both capability probes to deterministic
     # success so the assertions measure the scratch path shape, not the
@@ -644,18 +644,24 @@ def test_windows_default_scratch_uses_short_request_local_leaf(
         monkeypatch.setenv("COMSPEC", str(fake_comspec))
     _repo, workspace = _manual_workspace(tmp_path, request_id)
     scratch = worker_workspace.provision_validation_exec_scratch(workspace)
-    boundary = workspace.home.parent.resolve()
-    assert scratch.parent == boundary
-    assert scratch.is_relative_to((tmp_path / "worktrees" / request_id).resolve())
+    boundary = _repo / ".aiworkhub" / "temp" / "validation"
+    assert scratch.parent == boundary.resolve()
+    assert not scratch.is_relative_to(workspace.home.parent.resolve())
     leaf = scratch.name
     assert leaf.startswith("vx_")
-    assert len(leaf) <= 16
+    assert len(leaf) <= 24
     assert request_id not in leaf
     assert worker_workspace._EXEC_SCRATCH_NAME_PREFIX not in leaf
     legacy = workspace.home.resolve() / (
         f"{worker_workspace._EXEC_SCRATCH_NAME_PREFIX}{request_id}"
     )
     assert len(str(scratch)) + 40 <= len(str(legacy))
+    manifest = worker_workspace.runtime_temp.read_owner_manifest(scratch)
+    assert manifest is not None
+    assert manifest["request_id"] == request_id
+    assert manifest["namespace"] == "validation"
+    worker_workspace.cleanup_validation_exec_scratch(scratch)
+    assert not scratch.exists()
 
 
 def test_windows_explicit_scratch_root_override_stays_authoritative(
@@ -693,11 +699,13 @@ def test_windows_preexisting_default_scratch_directory_fails_closed(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     request_id = "d070e9f3a1b2c3d4e5f60718293a4b5c1"
-    monkeypatch.setattr(worker_workspace.sys, "platform", "win32")
+    monkeypatch.setattr(worker_workspace, "is_windows", lambda: True)
     monkeypatch.delenv(worker_workspace.VALIDATION_EXEC_SCRATCH_ROOT_ENV, raising=False)
     _repo, workspace = _manual_workspace(tmp_path, request_id)
-    squatter = workspace.home.parent / f"vx_{request_id[-12:]}"
-    squatter.mkdir(mode=0o700)
+    squatter = (_repo / ".aiworkhub" / "temp" / "validation" / (
+        "vx_" + worker_workspace.hashlib.sha256(request_id.encode()).hexdigest()[:16]
+    ))
+    squatter.mkdir(parents=True, mode=0o700)
     with pytest.raises(worker_workspace.WorkspaceError) as excinfo:
         worker_workspace.provision_validation_exec_scratch(workspace)
     assert "validation_exec_scratch_already_exists" in str(excinfo.value)
@@ -708,12 +716,15 @@ def test_windows_symlink_at_default_scratch_path_fails_closed(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     request_id = "e181f0a4b2c3d4e5f60718293a4b5c6d2"
-    monkeypatch.setattr(worker_workspace.sys, "platform", "win32")
+    monkeypatch.setattr(worker_workspace, "is_windows", lambda: True)
     monkeypatch.delenv(worker_workspace.VALIDATION_EXEC_SCRATCH_ROOT_ENV, raising=False)
     _repo, workspace = _manual_workspace(tmp_path, request_id)
     outside = tmp_path / "outside_request_boundary"
     outside.mkdir(mode=0o700)
-    attacked = workspace.home.parent / f"vx_{request_id[-12:]}"
+    attacked = (_repo / ".aiworkhub" / "temp" / "validation" / (
+        "vx_" + worker_workspace.hashlib.sha256(request_id.encode()).hexdigest()[:16]
+    ))
+    attacked.parent.mkdir(parents=True)
     try:
         os.symlink(outside, attacked, target_is_directory=True)
     except OSError as exc:
@@ -725,3 +736,144 @@ def test_windows_symlink_at_default_scratch_path_fails_closed(
         assert attacked.is_symlink()
     finally:
         attacked.unlink(missing_ok=True)
+
+
+def test_windows_repo_scratch_distinguishes_requests_with_same_tail(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(worker_workspace, "is_windows", lambda: True)
+    monkeypatch.delenv(worker_workspace.VALIDATION_EXEC_SCRATCH_ROOT_ENV, raising=False)
+    monkeypatch.setattr(worker_workspace, "_probe_exec_capable_dir", lambda path: True)
+    monkeypatch.setattr(worker_workspace, "_probe_metadata_capable_dir", lambda path: True)
+    repo, first = _manual_workspace(tmp_path, "union2_first_" + "a" * 32)
+    _, second = _manual_workspace(tmp_path, "union2_second_" + "a" * 32)
+    roots = []
+    try:
+        roots.append(worker_workspace.provision_validation_exec_scratch(first))
+        roots.append(worker_workspace.provision_validation_exec_scratch(second))
+        assert roots[0] != roots[1]
+        assert roots[0].parent == roots[1].parent == (
+            repo / ".aiworkhub" / "temp" / "validation"
+        ).resolve()
+        for root, request in zip(roots, (first.request_id, second.request_id)):
+            manifest = worker_workspace.runtime_temp.read_owner_manifest(root)
+            assert manifest is not None and manifest["request_id"] == request
+        (roots[0] / "isolated").write_text("first", encoding="utf-8")
+        assert not (roots[1] / "isolated").exists()
+    finally:
+        for root in roots:
+            worker_workspace.cleanup_validation_exec_scratch(root)
+            assert not root.exists()
+
+
+@pytest.mark.parametrize("component", ["temp", "validation"])
+def test_windows_repo_scratch_rejects_redirected_namespace_before_writes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, make_symlink, component: str
+) -> None:
+    monkeypatch.setattr(worker_workspace, "is_windows", lambda: True)
+    monkeypatch.delenv(worker_workspace.VALIDATION_EXEC_SCRATCH_ROOT_ENV, raising=False)
+    monkeypatch.setattr(worker_workspace, "_probe_exec_capable_dir", lambda path: True)
+    monkeypatch.setattr(worker_workspace, "_probe_metadata_capable_dir", lambda path: True)
+    repo, workspace = _manual_workspace(tmp_path, "union2_symlink_" + "a" * 32)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    attacked = repo / ".aiworkhub" / "temp"
+    attacked.parent.mkdir()
+    if component == "validation":
+        attacked.mkdir()
+        attacked = attacked / "validation"
+    make_symlink(outside, attacked)
+    with pytest.raises(worker_workspace.WorkspaceError, match="symlink|escape"):
+        worker_workspace.provision_validation_exec_scratch(workspace)
+    assert list(outside.iterdir()) == []
+    assert attacked.is_symlink()
+
+
+def test_windows_repo_scratch_hash_collision_never_reuses_mutable_directory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(worker_workspace, "is_windows", lambda: True)
+    monkeypatch.delenv(worker_workspace.VALIDATION_EXEC_SCRATCH_ROOT_ENV, raising=False)
+    monkeypatch.setattr(worker_workspace, "_probe_exec_capable_dir", lambda path: True)
+    monkeypatch.setattr(worker_workspace, "_probe_metadata_capable_dir", lambda path: True)
+    repo, first = _manual_workspace(tmp_path, "union2_first_" + "a" * 32)
+    _, second = _manual_workspace(tmp_path, "union2_second_" + "a" * 32)
+
+    class CollisionDigest:
+        def hexdigest(self):
+            return "f" * 64
+
+    monkeypatch.setattr(worker_workspace.hashlib, "sha256", lambda data: CollisionDigest())
+    scratch = worker_workspace.provision_validation_exec_scratch(first)
+    marker = scratch / "unchanged"
+    marker.write_text("first", encoding="utf-8")
+    try:
+        for workspace in (second, first):
+            with pytest.raises(
+                worker_workspace.WorkspaceError, match="validation_exec_scratch_already_exists"
+            ):
+                worker_workspace.provision_validation_exec_scratch(workspace)
+        assert marker.read_text(encoding="utf-8") == "first"
+        manifest = worker_workspace.runtime_temp.read_owner_manifest(scratch)
+        assert manifest is not None and manifest["request_id"] == first.request_id
+    finally:
+        worker_workspace.cleanup_validation_exec_scratch(scratch)
+        assert not scratch.exists()
+
+
+def test_windows_repo_scratch_reparse_authority_is_not_capability_fallback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(worker_workspace, "is_windows", lambda: True)
+    monkeypatch.delenv(worker_workspace.VALIDATION_EXEC_SCRATCH_ROOT_ENV, raising=False)
+    repo, workspace = _manual_workspace(tmp_path, "union2_reparse_" + "a" * 32)
+
+    def refuse_paths(paths):
+        raise worker_workspace._platform_io.ReparsePointRefused(
+            40, "reparse symlink refused", str(paths[-1])
+        )
+
+    monkeypatch.setattr(worker_workspace._platform_io, "pinned_paths", refuse_paths)
+    with pytest.raises(worker_workspace.WorkspaceError, match="reparse symlink"):
+        worker_workspace.provision_validation_exec_scratch(workspace)
+    assert list(repo.iterdir()) == []
+    assert list(workspace.home.iterdir()) == [workspace.home / "tmp"]
+
+
+def test_windows_repo_scratch_cleanup_removes_readonly_git_object(tmp_path: Path) -> None:
+    scratch = tmp_path / "owned_scratch"
+    git_object = scratch / "repo" / ".git" / "objects" / "90" / "fixture_object"
+    git_object.parent.mkdir(parents=True)
+    git_object.write_bytes(b"owned Git object")
+    os.chmod(git_object, 0o444)
+    assert git_object.stat().st_nlink == 1
+    worker_workspace.cleanup_validation_exec_scratch(scratch)
+    assert not scratch.exists()
+
+
+def test_windows_repo_scratch_cleanup_does_not_follow_root_symlink(
+    tmp_path: Path, make_symlink
+) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    marker = outside / "keep"
+    marker.write_bytes(b"outside authority")
+    scratch = tmp_path / "owned_scratch"
+    make_symlink(outside, scratch)
+    worker_workspace.cleanup_validation_exec_scratch(scratch)
+    assert scratch.is_symlink()
+    assert marker.read_bytes() == b"outside authority"
+
+
+def test_windows_repo_scratch_cleanup_stays_best_effort(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    scratch = tmp_path / "owned_scratch"
+    scratch.mkdir()
+
+    def refuse_removal(root):
+        raise worker_workspace.WorkspaceError("measured cleanup failure")
+
+    monkeypatch.setattr(worker_workspace, "_rmtree_workspace_owned", refuse_removal)
+    worker_workspace.cleanup_validation_exec_scratch(scratch)
+    assert scratch.is_dir()

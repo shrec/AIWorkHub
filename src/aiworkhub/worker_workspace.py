@@ -7703,7 +7703,7 @@ def provision_validation_exec_scratch(workspace: WorkerWorkspace) -> Path:
     """
     name = f"{_EXEC_SCRATCH_NAME_PREFIX}{workspace.request_id}"
     windows_default_scratch = (
-        sys.platform == "win32"
+        is_windows()
         and not os.environ.get(VALIDATION_EXEC_SCRATCH_ROOT_ENV, "").strip()
     )
     windows_short_leaf = name
@@ -7748,12 +7748,37 @@ def provision_validation_exec_scratch(workspace: WorkerWorkspace) -> Path:
         try:
             repo_temp_root = configured_temp_root(Path(workspace_repo))
             repo_temp_validation = repo_temp_root / "validation"
-            repo_temp_validation.mkdir(parents=True, exist_ok=True, mode=0o700)
+            # Verify the lexical namespace before mkdir: resolving first would
+            # silently follow a planted validation symlink/junction.
+            authority = (
+                repo_temp_root
+                if os.environ.get(runtime_temp.TEMP_ROOT_ENV, "").strip()
+                else Path(workspace_repo).resolve()
+            )
+            _require_beneath(authority, repo_temp_validation)
+            namespace_paths = [authority]
+            cursor = authority
+            for part in repo_temp_validation.relative_to(authority).parts:
+                # Hold every existing ancestor while creating the next child.
+                # The platform facade refuses junctions before traversal too.
+                with _platform_io.pinned_paths(namespace_paths):
+                    cursor = cursor / part
+                    cursor.mkdir(exist_ok=True, mode=0o700)
+                    with _platform_io.pinned_paths([cursor]):
+                        pass
+                namespace_paths.append(cursor)
+            _require_beneath(authority, repo_temp_validation)
             try:
                 chmod_path(repo_temp_validation, 0o700)
             except OSError:
                 pass
             candidate_roots.insert(0, repo_temp_validation)
+        except (
+            WorkspaceError, runtime_temp.RuntimeTempError, _platform_io.ReparsePointRefused
+        ) as exc:
+            # A redirected authority is not an unavailable capability and may
+            # never silently fall back to a different root.
+            raise WorkspaceError(str(exc)) from exc
         except (OSError, RuntimeError):
             repo_temp_validation = None
     if windows_default_scratch:
@@ -7763,6 +7788,11 @@ def provision_validation_exec_scratch(workspace: WorkerWorkspace) -> Path:
         candidate_roots.insert(0, workspace.home)
         if request_boundary is not None:
             candidate_roots.insert(0, request_boundary)
+    if windows_default_scratch and repo_temp_validation is not None:
+        # Windows needs no system-temp executable mount. Prefer the existing
+        # repository authority over the much deeper union2 request boundary.
+        candidate_roots.remove(repo_temp_validation)
+        candidate_roots.insert(0, repo_temp_validation)
     for raw_root in candidate_roots:
         root = raw_root.expanduser()
         try:
@@ -7779,6 +7809,16 @@ def provision_validation_exec_scratch(workspace: WorkerWorkspace) -> Path:
             and resolved_root in windows_short_leaf_roots
             else name
         )
+        if (
+            windows_default_scratch
+            and repo_temp_validation is not None
+            and resolved_root == repo_temp_validation.resolve()
+        ):
+            # Hash the complete identity, not the shared tail. Exclusive mkdir
+            # below refuses a hash collision instead of sharing mutable state.
+            leaf = "vx_" + hashlib.sha256(
+                workspace.request_id.encode("utf-8")
+            ).hexdigest()[:16]
         scratch_dir = resolved_root / leaf
         if scratch_dir.is_symlink():
             raise WorkspaceError(f"validation_exec_scratch_symlink_forbidden:{scratch_dir}")
@@ -7832,8 +7872,8 @@ def cleanup_validation_exec_scratch(path: Path | None) -> None:
 
     Never follows a symlink and never raises -- called from the
     ``run_validations`` ``finally`` block on every outcome (success, a raised
-    ``WorkspaceError``, a timeout, or any other exception), so a scratch dir
-    is never left behind regardless of how the validation run ended.
+    ``WorkspaceError``, a timeout, or any other exception). Owned readonly
+    entries are repaired narrowly; other removal failures remain best effort.
     """
     if path is None:
         return
@@ -7841,8 +7881,8 @@ def cleanup_validation_exec_scratch(path: Path | None) -> None:
         if path.is_symlink():
             return
         if path.exists():
-            shutil.rmtree(path, ignore_errors=True)
-    except OSError:
+            _rmtree_workspace_owned(path)
+    except (WorkspaceError, OSError):
         return
 
 
