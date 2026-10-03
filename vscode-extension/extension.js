@@ -11,7 +11,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.12.23";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.12.24";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 // NF-2026-00643: this globalStorage trace directory was measured holding 1,102
 // files and 2,235,024,325 bytes (2.24 GB), largest single file 44,626,825 bytes
@@ -4563,6 +4563,16 @@ function createVscodeLmStagedEditCollector(request) {
       range.start_line === input.start_line && range.end_line === input.end_line);
     if (exact) {
       if (exact.new !== input.new || exact.preserve_trailing_newline !== (input.preserve_trailing_newline !== false)) {
+        // NF1322: an applied worker mistake needs fresh-pair recovery, not a blind overwrite.
+        if (!originalCoordinateBatch && request.request_kind === "worker" &&
+            exact.mcp_receipt && typeof authenticate === "function" &&
+            input.preserve_trailing_newline !== false) {
+          recoveryPath = filePath;
+          recoveryTarget = "";
+          recoveryEvidence = [];
+          return { ...reject(`coordinates_shifted_requires_fresh_worker_pair:${filePath}`),
+            corrective: true, instruction: "Read a fresh bounded Source Graph body for this path, then call worker semantic-edit prepare/apply using its current coordinates. Do not reuse launch coordinates." };
+        }
         return reject(`range_conflict:${filePath}:${input.start_line}:${input.end_line}`);
       }
       return boundedReceipt(operation, filePath, input.new, {

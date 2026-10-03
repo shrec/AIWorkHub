@@ -7152,6 +7152,60 @@ async function nf1291ShiftedStageRecovery() {
     };
     return { req, invoke, calls, lines: () => lines };
   };
+  // NF1322: a worker must be able to repair its already-applied same-line mistake.
+  const repaired = fixture();
+  const repairCollector = internals.createVscodeLmStagedEditCollector(repaired.req);
+  const repairInvoke = async call => {
+    const result = await repaired.invoke(call);
+    if (call.name === "aiworkhub_worker_source_graph_query") {
+      const payload = JSON.parse(result.content);
+      Object.assign(payload.matches[0], { line_start: 4, line_end: 4, source: repaired.lines()[3] });
+      return { ...result, content: JSON.stringify(payload) };
+    }
+    return result;
+  };
+  const bad = { operation: "replace_range", file_path: file, start_line: 4, end_line: 4, new: "WRONG" };
+  assert.equal((await repairCollector.stage(bad, repairInvoke)).ok, true);
+  const beforeRepair = repaired.calls.length;
+  const unsupported = await repairCollector.stage({ ...bad, new: "FOUR",
+    preserve_trailing_newline: false }, repairInvoke);
+  assert.match(unsupported.reason, /range_conflict/);
+  assert.deepEqual(repairCollector.recoveryToolNames(), []);
+  const overlap = await repairCollector.stage({ ...bad, start_line: 3, new: "three\nFOUR" }, repairInvoke);
+  assert.match(overlap.reason, /range_overlap/);
+  assert.deepEqual(repairCollector.recoveryToolNames(), []);
+  const conflictingBatch = await repairCollector.ingestFinalEnvelope({
+    schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA, summary: "conflicting batch",
+    edits: [{ path: file, ranges: [{ start_line: 4, end_line: 4, new: "FOUR" }] }], creates: [],
+  }, repairInvoke);
+  assert.match(conflictingBatch.reason, /range_conflict/);
+  assert.deepEqual(repairCollector.recoveryToolNames(), []);
+  assert.equal(repaired.calls.length, beforeRepair, "unsafe amendments never invoke authenticated tools");
+  const corrective = await repairCollector.stage({ ...bad, new: "FOUR" }, repairInvoke);
+  assert.equal(corrective.ok, false, "recovery is not a direct overwrite");
+  assert.equal(corrective.corrective, true, "same-range correction must open fresh-pair recovery");
+  assert.equal(repaired.calls.length, beforeRepair, "no prepare/apply until fresh source is delivered");
+  assert.deepEqual(repaired.lines(), ["one", "two", "three", "WRONG"]);
+  const repairPrepare = { name: "aiworkhub_worker_semantic_edit_prepare",
+    input: { file_path: file, start_line: 4, end_line: 4 } };
+  assert.equal(repairCollector.allowsRecoveryCall(repairPrepare), false);
+  const repairDispatch = call => internals.invokeVscodeLmProtocolTool(
+    call, repaired.req.requestId, repairInvoke, repairCollector);
+  await repairDispatch({ name: "aiworkhub_worker_source_graph_query",
+    input: { mode: "body", query: "app.four", target: file } });
+  assert.equal(repairCollector.allowsRecoveryCall(repairPrepare), true);
+  await repairDispatch(repairPrepare);
+  const repairApply = { name: "aiworkhub_worker_semantic_edit_apply",
+    input: { target_id: "shift-target-2", new: "FOUR", idempotency_key: "same-line-repair" } };
+  assert.equal(repairCollector.allowsRecoveryCall({ ...repairApply,
+    input: { ...repairApply.input, target_id: "unrelated-target" } }), false);
+  await repairDispatch(repairApply);
+  assert.deepEqual(repaired.lines(), ["one", "two", "three", "FOUR"]);
+  assert.deepEqual(repairCollector.recoveryToolNames(), []);
+  assert.equal(repairCollector.allowsRecoveryCall(repairApply), false);
+  assert.equal((await repairCollector.stage({ operation: "create", file_path: created,
+    content: "assert True\n" })).ok, true);
+  assert.equal(repairCollector.finalize("same-line repaired").ok, true);
   const grow = { operation: "replace_range", file_path: file, start_line: 1, end_line: 1, new: "inserted\none" };
   // Match the actual fresh body schema, never a source_hash-only mock.
   for (const [label, corrupt] of [
