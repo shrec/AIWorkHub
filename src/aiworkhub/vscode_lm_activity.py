@@ -13,7 +13,7 @@ import stat
 from pathlib import Path
 from typing import Any
 
-from .platform_io import current_user_uid
+from .platform_io import current_user_uid, is_windows
 
 ACTIVITY_SCHEMA = "aiworkhub.vscode_lm.activity.v1"
 ACTIVITY_FILENAME = ".aiworkhub_vscode_lm_activity.jsonl"
@@ -90,7 +90,7 @@ class ActivityReader:
     def _private(metadata: os.stat_result, *, directory: bool = False) -> None:
         uid = current_user_uid()
         regular = stat.S_ISDIR(metadata.st_mode) if directory else stat.S_ISREG(metadata.st_mode)
-        if not regular or stat.S_ISLNK(metadata.st_mode) or (not directory and metadata.st_nlink != 1) or (os.name != "nt" and (
+        if not regular or stat.S_ISLNK(metadata.st_mode) or (not directory and metadata.st_nlink != 1) or (not is_windows() and (
             metadata.st_mode & 0o077 or (uid is not None and metadata.st_uid != uid)
         )):
             raise ActivityCaptureError("vscode_lm_activity_owner_invalid")

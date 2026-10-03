@@ -28,6 +28,56 @@ def write(path: Path, rows: list[dict[str, object]]) -> None:
     path.chmod(0o600)
 
 
+@pytest.mark.parametrize("windows", [False, True])
+def test_private_checks_dispatch_through_platform_interface(monkeypatch, windows: bool) -> None:
+    import stat
+    from types import SimpleNamespace
+
+    from aiworkhub import platform_io, vscode_lm_activity as activity
+
+    class LocalOS:
+        def __getattr__(self, name):
+            assert name != "name", "activity must not decide platforms through raw os.name"
+            return getattr(os, name)
+
+    platform_calls: list[bool] = []
+
+    def is_windows() -> bool:
+        platform_calls.append(windows)
+        return windows
+
+    monkeypatch.setattr(activity, "os", LocalOS())
+    monkeypatch.setattr(activity, "is_windows", is_windows, raising=False)
+    monkeypatch.setattr(activity, "current_user_uid", lambda: None if windows else 1000)
+    assert platform_io.os is os  # The local facade never changes the central interface's OS.
+    metadata = SimpleNamespace(st_mode=stat.S_IFREG | 0o600, st_uid=1000, st_nlink=1)
+    ActivityReader._private(metadata)
+    assert platform_calls == [windows]
+    for mode, owner in ((0o600, 1001), (0o644, 1000)):
+        metadata.st_mode = stat.S_IFREG | mode
+        metadata.st_uid = owner
+        if windows:
+            ActivityReader._private(metadata)
+        else:
+            with pytest.raises(activity.ActivityCaptureError, match="activity_owner"):
+                ActivityReader._private(metadata)
+
+
+def test_uid_authority_failure_is_typed_advisory_capture_error(tmp_path: Path, monkeypatch) -> None:
+    from aiworkhub import vscode_lm_activity as activity
+
+    home, path = journal(tmp_path)
+    write(path, [row(1)])
+
+    def unavailable_uid():
+        raise OSError("current_user_uid_unavailable")
+
+    monkeypatch.setattr(activity, "current_user_uid", unavailable_uid)
+    with pytest.raises(activity.ActivityCaptureError) as rejected:
+        ActivityReader(path, home, "a" * 32, "repo_test").drain()
+    assert isinstance(rejected.value.__cause__, OSError)
+
+
 def test_reader_rapid_unicode_events_and_incremental_no_duplicates(tmp_path: Path) -> None:
     home, path = journal(tmp_path)
     write(path, [row(i, output_preview="ქართული 😀 <script>") for i in range(1, 101)])
