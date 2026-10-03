@@ -825,6 +825,16 @@ class TestRunSpecPathIntegration:
         )
         return spec_path, target
 
+    def test_run_rejects_unauthenticated_existing_range(self, tmp_path: Path) -> None:
+        spec_path, target = self._make_spec_and_response(
+            tmp_path, "before\n", "src/mod.py",
+            [{"ranges": [{"start_line": 1, "end_line": 1, "new": "after\n"}]}],
+            "nf1291-pending", ["src/*.py"],
+        )
+        with pytest.raises(RuntimeError, match="vscode_lm_existing_edit_requires_authenticated_apply"):
+            vscode_lm_worker.run(spec_path)
+        assert target.read_bytes() == b"before\n"
+
     def test_run_duplicate_same_path_disjoint_entries(
         self, tmp_path: Path,
     ) -> None:
@@ -848,20 +858,15 @@ class TestRunSpecPathIntegration:
             ["src/*.py"],
         )
 
-        result = vscode_lm_worker.run(spec_path)
-
-        assert result["is_error"] is False
-        assert result["changed_paths"] == ["src/mod.py"]
-        metric = result["semantic_edit_metrics"][0]
-        assert metric["apply_surface"] == (
-            "vscode_lm_worker_provider_side"
+        with pytest.raises(RuntimeError, match="existing_edit_requires_authenticated_apply"):
+            vscode_lm_worker.run(spec_path)
+        response = json.loads(Path(json.loads(spec_path.read_text())["response_path"]).read_text())
+        planned, metrics = vscode_lm_worker._v3_planned_outputs(
+            target.parent.parent, json.loads(response["text"]), ["src/*.py"],
         )
-        assert metric["mcp_receipt"] is None
-        assert metric["entry_count"] == 2
-        assert (
-            target.read_text(encoding="utf-8")
-            == "line1\nL2\nline3\nL4\nline5\n"
-        )
+        assert planned == [("src/mod.py", "line1\nL2\nline3\nL4\nline5\n")]
+        assert metrics[0]["entry_count"] == 2
+        assert target.read_bytes() == b"line1\nline2\nline3\nline4\nline5\n"
 
     def test_run_byte_identical_edit_is_truthful_no_op(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
@@ -882,12 +887,9 @@ class TestRunSpecPathIntegration:
             raise AssertionError("byte-identical edit must not rewrite the file")
 
         monkeypatch.setattr(vscode_lm_worker, "_write_atomic", _unexpected_write)
-        result = vscode_lm_worker.run(spec_path)
-
-        assert result["is_error"] is False
-        assert result["changed_paths"] == []
-        assert result["semantic_edit_metrics"][0]["no_op"] is True
-        assert target.read_text(encoding="utf-8") == "line1\nline2\nline3\n"
+        with pytest.raises(RuntimeError, match="existing_edit_requires_authenticated_apply"):
+            vscode_lm_worker.run(spec_path)
+        assert target.read_bytes() == b"line1\nline2\nline3\n"
 
     def test_run_consolidated_disjoint_ranges(
         self, tmp_path: Path,
@@ -906,19 +908,15 @@ class TestRunSpecPathIntegration:
             ["*.txt"],
         )
 
-        result = vscode_lm_worker.run(spec_path)
-
-        assert result["is_error"] is False
-        assert result["changed_paths"] == ["config.txt"]
-        metric = result["semantic_edit_metrics"][0]
-        assert metric["apply_surface"] == (
-            "vscode_lm_worker_provider_side"
+        with pytest.raises(RuntimeError, match="existing_edit_requires_authenticated_apply"):
+            vscode_lm_worker.run(spec_path)
+        response = json.loads(Path(json.loads(spec_path.read_text())["response_path"]).read_text())
+        planned, metrics = vscode_lm_worker._v3_planned_outputs(
+            target.parent, json.loads(response["text"]), ["*.txt"],
         )
-        assert metric["mcp_receipt"] is None
-        assert (
-            target.read_text(encoding="utf-8")
-            == "A\nB2\nC\nD2\nE\n"
-        )
+        assert planned == [("config.txt", "A\nB2\nC\nD2\nE\n")]
+        assert metrics[0]["range_count"] == 2
+        assert target.read_bytes() == b"A\nB\nC\nD\nE\n"
 
     def test_run_invalid_later_range_zero_mutation(
         self, tmp_path: Path,
@@ -1012,7 +1010,7 @@ class TestRunSpecPathIntegration:
             tmp_path,
             "line1\nline2\nline3\n",
             "src/mod.py",
-            [{"ranges": [{"start_line": 2, "end_line": 2, "new": "line2\n"}]}],
+            [],  # This fixture measures host receipts, not editing authority.
             self._ATTEMPT_REQUEST_ID,
             ["src/*.py"],
             spec_extra=(

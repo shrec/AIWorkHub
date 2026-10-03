@@ -1380,6 +1380,206 @@ def test_packaged_glm_worker_module_is_importable_from_isolated_cwd(tmp_path: Pa
     assert "--spec" in completed.stdout
 
 
+@pytest.fixture
+def nf1291_editor_bridge(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Real coordinator/editor/HMAC, using synthetic owned request metadata only."""
+    repo = _repo(tmp_path)
+    process_dir = repo / ".aiworkhub" / "runtime" / "processes"
+    process_dir.mkdir(parents=True)
+    manager = process_launcher.ProcessManager(
+        repo=repo, process_log_path=tmp_path / "events.jsonl",
+        process_dir=process_dir, isolation_enabled=False,
+    )
+    events = {}
+    monkeypatch.setattr(manager, "_request_events", lambda request_id: events.get(request_id, []))
+    monkeypatch.setenv(process_launcher.ALLOW_WRITES_ENV, "1")
+
+    def request(request_id: str):
+        workspace = tmp_path / request_id / "worktree"
+        home = tmp_path / request_id / "home"
+        workspace.mkdir(parents=True)
+        home.mkdir()
+        source = workspace / "src" / "app.py"
+        source.parent.mkdir()
+        source.write_bytes(b"before\nsecond\n")
+        ledger, key = home / "audit.jsonl", home / "audit.key"
+        ledger.write_text("", encoding="utf-8")
+        key.write_bytes(b"k" * 32)
+        metadata = {
+            "request_id": request_id, "task_id": "NF1291_TEST",
+            "runner": "editor_test", "topic": "semantic_restore", "adapter_id": "glm_vscode_lm",
+            "workspace": {"path": str(workspace), "home": str(home)},
+            "worker_mcp": {
+                "authority_repo": str(repo), "source_graph_targets": ["src"],
+                "allowed_writes": ["src/app.py"], "session_topic": "semantic_restore",
+                "audit_ledger_path": str(ledger), "audit_hmac_key_path": str(key),
+            },
+        }
+        metadata_path = process_dir / f"{request_id}.request.json"
+        metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+        event = {"request_id": request_id, "adapter_id": "glm_vscode_lm",
+                 "state": "running", "metadata_path": str(metadata_path)}
+        events[request_id] = [event]
+        return source, metadata_path, metadata, event, ledger, key
+
+    return manager, request
+
+
+def _nf1291_prepare(manager, request_id, **overrides):
+    return manager.invoke_vscode_lm_worker_tool(
+        request_id, "aiworkhub_worker_semantic_edit_prepare",
+        {"file_path": "src/app.py", "start_line": 1, "end_line": 1,
+         "provider_call_id": "nf1291.prepare", **overrides},
+    )
+
+
+def _nf1291_apply(manager, request_id, prepared, **overrides):
+    return manager.invoke_vscode_lm_worker_tool(
+        request_id, "aiworkhub_worker_semantic_edit_apply",
+        {"target_id": prepared["target_id"], "new": "after\n",
+         "idempotency_key": "nf1291.apply", "provider_call_id": "nf1291.apply", **overrides},
+    )
+
+
+@pytest.mark.parametrize("field", ["workspace", "scope", "ledger", "key", "runner", "authority"])
+def test_nf1291_cached_editor_rejects_identity_drift(nf1291_editor_bridge, field):
+    manager, request = nf1291_editor_bridge
+    request_id = "1" * 32
+    source, metadata_path, metadata, _event, _ledger, _key = request(request_id)
+    prepared = _nf1291_prepare(manager, request_id)
+    assert prepared["ok"] is True
+    if field == "workspace":
+        metadata["workspace"]["path"] += "-different"
+    elif field == "scope":
+        metadata["worker_mcp"]["allowed_writes"] = ["src/*.py"]
+    elif field == "ledger":
+        metadata["worker_mcp"]["audit_ledger_path"] += "-different"
+    elif field == "key":
+        metadata["worker_mcp"]["audit_hmac_key_path"] += "-different"
+    elif field == "runner":
+        metadata["runner"] = "different_actor"
+    else:
+        metadata["worker_mcp"]["authority_repo"] += "-different"
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+    applied = _nf1291_apply(manager, request_id, prepared)
+    assert applied == {"ok": False, "reason": "worker_bridge_semantic_identity_changed"}
+    assert source.read_bytes() == b"before\nsecond\n"
+    assert request_id not in manager._vscode_lm_semantic_sessions
+
+
+def test_nf1291_target_cannot_cross_requests(nf1291_editor_bridge):
+    manager, request = nf1291_editor_bridge
+    first, second = "1" * 32, "2" * 32
+    first_source, *_ = request(first)
+    second_source, *_ = request(second)
+    prepared = _nf1291_prepare(manager, first)
+    assert prepared["ok"] is True
+    applied = _nf1291_apply(manager, second, prepared)
+    assert applied["ok"] is False and "target_unknown" in applied["reason"]
+    assert first_source.read_bytes() == second_source.read_bytes() == b"before\nsecond\n"
+
+
+@pytest.mark.parametrize("state", ["exited", "timed_out", "cancelled", "worker_failed"])
+def test_nf1291_terminal_revokes_editor_handles(nf1291_editor_bridge, state):
+    manager, request = nf1291_editor_bridge
+    request_id = "1" * 32
+    source, _path, _meta, event, *_ = request(request_id)
+    prepared = _nf1291_prepare(manager, request_id)
+    event["state"] = state
+    applied = _nf1291_apply(manager, request_id, prepared)
+    assert applied == {"ok": False, "reason": "worker_bridge_request_not_active"}
+    assert request_id not in manager._vscode_lm_semantic_sessions
+    assert request_id not in manager._vscode_lm_tool_locks
+    event["state"] = "running"
+    fresh = _nf1291_apply(manager, request_id, prepared)
+    assert fresh["ok"] is False and "target_unknown" in fresh["reason"]
+    assert source.read_bytes() == b"before\nsecond\n"
+
+
+def test_nf1291_stale_preimage_is_not_applied(nf1291_editor_bridge):
+    manager, request = nf1291_editor_bridge
+    request_id = "1" * 32
+    source, *_ = request(request_id)
+    prepared = _nf1291_prepare(manager, request_id)
+    source.write_bytes(b"external change\n")
+    applied = _nf1291_apply(manager, request_id, prepared)
+    assert applied["ok"] is False and "stale" in applied["reason"]
+    assert source.read_bytes() == b"external change\n"
+
+
+def test_nf1291_idempotency_conflict_and_provenance(nf1291_editor_bridge):
+    manager, request = nf1291_editor_bridge
+    request_id = "1" * 32
+    source, _path, _meta, _event, ledger, key = request(request_id)
+    prepared = _nf1291_prepare(manager, request_id)
+    applied = _nf1291_apply(manager, request_id, prepared)
+    assert applied["ok"] is True and applied["preimage_verified"] is True
+    replay = _nf1291_apply(manager, request_id, prepared, provider_call_id="nf1291.replay")
+    assert replay["ok"] is True and replay["idempotent_replay"] is True
+    assert manager._vscode_lm_semantic_sessions[request_id][1].ctx.provider_call_id == "nf1291.replay"
+    conflict = _nf1291_apply(manager, request_id, prepared, new="different\n")
+    assert conflict["ok"] is False and "idempotency_key_conflict" in conflict["reason"]
+    rows = [json.loads(line) for line in ledger.read_text(encoding="utf-8").splitlines()]
+    applies = [row for row in rows if row["tool"] == "semantic_edit_apply" and row["ok"]]
+    assert len(applies) == 1 and applies[0]["provider_call_id"] == "nf1291.apply"
+    verified = worker_ai_tools_mcp.verify_audit_ledger(
+        ledger, key, task_id="NF1291_TEST", runner="editor_test",
+        topic="semantic_restore", request_id=request_id,
+    )
+    assert verified["ok"] is True and len(verified["semantic_edit_apply_receipts"]) == 1
+    assert source.read_bytes() == b"after\nsecond\n"
+
+
+def test_nf1291_write_gate_and_scope_reject_before_mutation(nf1291_editor_bridge, monkeypatch):
+    manager, request = nf1291_editor_bridge
+    request_id = "1" * 32
+    source, *_ = request(request_id)
+    outside = _nf1291_prepare(manager, request_id, file_path="outside.py")
+    assert outside["ok"] is False
+    prepared = _nf1291_prepare(manager, request_id)
+    monkeypatch.delenv(process_launcher.ALLOW_WRITES_ENV)
+    applied = _nf1291_apply(manager, request_id, prepared)
+    assert applied == {"ok": False, "reason": "worker_bridge_write_gate_closed"}
+    assert source.read_bytes() == b"before\nsecond\n"
+
+
+def test_nf1291_source_graph_delivery_is_not_reemitted(nf1291_editor_bridge, monkeypatch):
+    manager, request = nf1291_editor_bridge
+    request_id = "1" * 32
+    source, *_ = request(request_id)
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    graph = {"ok": True, "content": json.dumps({"matches": [{
+        "file_path": "src/app.py", "line_start": 1, "line_end": 1,
+        "source": "before", "freshness": {"state": "fresh", "disk_source_hash": digest},
+    }]})}
+    monkeypatch.setattr(worker_ai_tools_mcp, "source_graph_query", lambda *_args, **_kwargs: graph)
+    assert manager.invoke_vscode_lm_worker_tool(
+        request_id, "aiworkhub_manager_source_graph_query",
+        {"mode": "body", "query": "app", "target": "src/app.py",
+         "provider_call_id": "nf1291.source"},
+    )["ok"] is True
+    prepared = _nf1291_prepare(manager, request_id)
+    assert prepared["ok"] is True and "fragment" not in prepared
+    assert prepared["fragment_bytes_avoided"] > 0
+    assert _nf1291_apply(manager, request_id, prepared)["preimage_verified"] is True
+
+
+def test_nf1291_nondurable_apply_never_becomes_success(nf1291_editor_bridge, monkeypatch):
+    manager, request = nf1291_editor_bridge
+    request_id = "1" * 32
+    _source, _path, _meta, _event, ledger, key = request(request_id)
+    prepared = _nf1291_prepare(manager, request_id)
+    monkeypatch.setattr(worker_ai_tools_mcp, "_append_audit", lambda *_args, **_kwargs: False)
+    applied = _nf1291_apply(manager, request_id, prepared)
+    assert applied["ok"] is False and applied["reason"] == "semantic_edit_apply_not_durable"
+    assert manager._vscode_lm_semantic_sessions[request_id][1]._receipts == {}
+    verified = worker_ai_tools_mcp.verify_audit_ledger(
+        ledger, key, task_id="NF1291_TEST", runner="editor_test",
+        topic="semantic_restore", request_id=request_id,
+    )
+    assert verified["ok"] is True and verified["semantic_edit_apply_receipts"] == []
+
+
 def test_glm_bridge_tool_runs_with_exact_worker_audit_context(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1491,6 +1691,41 @@ def test_glm_bridge_tool_runs_with_exact_worker_audit_context(
     assert text_provider_alias["ok"] is True
     assert text_provider_alias["path"] == "src/app.py"
     assert text_provider_alias["fragment"] == prepared["fragment"]
+
+    # NF1291: use the advertised worker pair, not the legacy manager alias.
+    monkeypatch.setenv(process_launcher.ALLOW_WRITES_ENV, "1")
+    worker_prepared = manager.invoke_vscode_lm_worker_tool(
+        request_id,
+        "aiworkhub_worker_semantic_edit_prepare",
+        {"file_path": "src/app.py", "start_line": 2, "end_line": 3,
+         "provider_call_id": "nf1291.prepare"},
+    )
+    assert worker_prepared["ok"] is True, worker_prepared
+    replacement = "def target():\n    return 2\n"
+    apply_input = {
+        "target_id": worker_prepared["target_id"], "new": replacement,
+        "idempotency_key": "nf1291.apply", "provider_call_id": "nf1291.apply",
+    }
+    applied = manager.invoke_vscode_lm_worker_tool(
+        request_id, "aiworkhub_worker_semantic_edit_apply", dict(apply_input),
+    )
+    assert applied["ok"] is True, applied
+    assert source_file.read_bytes() == b"before\ndef target():\n    return 2\nafter\n"
+    assert applied["before_sha256"] == worker_prepared["current_sha256"]
+    assert applied["preimage_verified"] is True
+    replay = manager.invoke_vscode_lm_worker_tool(
+        request_id, "aiworkhub_worker_semantic_edit_apply", dict(apply_input),
+    )
+    assert replay["ok"] is True and replay["idempotent_replay"] is True
+    verification = worker_ai_tools_mcp.verify_audit_ledger(
+        ledger, key, task_id="GLM_BRIDGE_TEST", runner="glm52_bridge_test",
+        topic="bridge_test", request_id=request_id,
+    )
+    assert verification["ok"] is True
+    assert len(verification["semantic_edit_apply_receipts"]) == 1
+    audit_rows = [json.loads(line) for line in ledger.read_text(encoding="utf-8").splitlines()]
+    apply_rows = [row for row in audit_rows if row.get("tool") == "semantic_edit_apply"]
+    assert apply_rows and all(row["provider_call_id"] == "nf1291.apply" for row in apply_rows)
 
     def _session_intent(
         bound_ctx: worker_ai_tools_mcp.WorkerToolContext, **kwargs: object,

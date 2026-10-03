@@ -50,6 +50,7 @@ async function main() {
     },
   };
   let liveReads = 0;
+  const semanticCalls = []; // Mock transport evidence, not a native/HMAC acceptance claim.
   const result = JSON.parse(await bridge.runVscodeLmTextProtocol(model, {
     requestId: "8".repeat(32), request_kind: "worker", prompt: "Fix src/app.js.",
     allowedWrites: ["src/app.js"], required_outputs: [],
@@ -58,13 +59,29 @@ async function main() {
     },
     initial_source_graph_request: { mode: "focus", query: "src/app.js" },
     initial_source_graph_result: { ok: true, content: "prefetched graph" },
-  }, undefined, async () => {
+  }, undefined, async (call) => {
+    if (call.name === "aiworkhub_worker_semantic_edit_prepare") {
+      semanticCalls.push(call);
+      assert.deepEqual(call.input, { file_path: "src/app.js", start_line: 1, end_line: 1 });
+      return { ok: true, target_id: "discovery-fixture-target", path: "src/app.js",
+        start_line: 1, end_line: 1, current_sha256: "a".repeat(64), fragment_sha256: "f".repeat(64) };
+    }
+    if (call.name === "aiworkhub_worker_semantic_edit_apply") {
+      semanticCalls.push(call);
+      assert.equal(call.input.target_id, "discovery-fixture-target");
+      assert.equal(call.input.new, "const fixed = true;\n");
+      return { ok: true, schema_id: "aiworkhub.semantic_edit_apply_receipt.v1",
+        target_id: call.input.target_id, path: "src/app.js", before_sha256: "a".repeat(64),
+        after_sha256: require("node:crypto").createHash("sha256").update(call.input.new).digest("hex"),
+        idempotency_key: call.input.idempotency_key, preimage_verified: true };
+    }
+    assert.equal(call.name, "aiworkhub_worker_source_graph_query");
     liveReads++;
     return { ok: true, content: "bounded source" };
   }));
   assert.equal(liveReads, 12, "the existing discovery allowance stays available");
-  assert.equal(result.edits[0].path, "src/app.js");
-  assert.equal(result.edits[0].ranges[0].new, "const fixed = true;\n");
+  assert.equal(semanticCalls.length, 2, "one authenticated prepare/apply pair");
+  assert.deepEqual(result.edits, [], "already-applied edit is not emitted twice");
 
   const input = { operation: "create", file_path: "src/new.js", content: "const ready = true;\n" };
   const request = { allowedWrites: ["src/new.js"], required_outputs: [],

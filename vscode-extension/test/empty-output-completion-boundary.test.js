@@ -38,7 +38,38 @@ const request = (requiredOutputs = []) => ({
   },
 });
 const create = { operation: "create", file_path: "tests/new.py", content: "def test_wiring():\n    assert True\n" };
+
 const edit = { operation: "replace_range", file_path: "src/app.py", start_line: 2, end_line: 2, new: "run_feature()" };
+// Request-local transport fixture only: typed receipts exercise bridge wiring,
+// not a real worker actor or production HMAC acceptance.
+function authenticatedEditor(req, sourceGraph = async () => ({ ok: true })) {
+  const semanticCalls = [];
+  const handles = new Map();
+  const transport = async (call) => {
+    if (call.name === "aiworkhub_worker_source_graph_query") return sourceGraph(call);
+    semanticCalls.push(call);
+    const input = call.input;
+    if (call.name === "aiworkhub_worker_semantic_edit_prepare") {
+      const targetId = "fixture-target-" + semanticCalls.length;
+      handles.set(targetId, input);
+      return { ok: true, target_id: targetId, path: input.file_path,
+        start_line: input.start_line, end_line: input.end_line,
+        current_sha256: req.path_contracts[input.file_path].current_sha256,
+        fragment_sha256: "f".repeat(64) };
+    }
+    assert.equal(call.name, "aiworkhub_worker_semantic_edit_apply");
+    const prepared = handles.get(input.target_id);
+    assert.ok(prepared, "apply must use this request's prepared handle");
+    assert.equal(input.new, edit.new);
+    return { ok: true, schema_id: "aiworkhub.semantic_edit_apply_receipt.v1",
+      target_id: input.target_id, path: prepared.file_path,
+      before_sha256: req.path_contracts[prepared.file_path].current_sha256,
+      after_sha256: require("node:crypto").createHash("sha256").update(input.new).digest("hex"),
+      idempotency_key: input.idempotency_key, preimage_verified: true };
+  };
+  transport.semanticCalls = semanticCalls;
+  return transport;
+}
 
 function modelFor(toolCalling, calls) {
   let turns = 0;
@@ -67,12 +98,12 @@ for (const toolCalling of [false, true]) {
       calls.splice(lateFirstStage ? calls.length : 0, 0, { name: stageName, input: create });
       calls.push({ name: stageName, input: edit }, { name: finishName, input: { summary: "Complete wired feature" } });
       const model = modelFor(toolCalling, calls);
-      const result = JSON.parse(await run(model, request(), undefined, async () => ({ ok: true })));
+      const transport = authenticatedEditor(request());
+      const result = JSON.parse(await run(model, request(), undefined, transport));
       assert.equal(model.turns, calls.length, "worker must explicitly finish after production staging");
       assert.equal(result.summary, "Complete wired feature");
-      assert.equal(result.edits.length, 1);
-      assert.equal(result.edits[0].path, "src/app.py");
-      assert.equal(result.edits[0].ranges[0].new, "run_feature()");
+      assert.equal(transport.semanticCalls.length, 2);
+      assert.deepEqual(result.edits, [], "authenticated edit must not be applied twice");
       assert.equal(result.creates.length, 1);
     });
   }
@@ -111,17 +142,19 @@ for (const toolCalling of [false, true]) {
     const model = modelFor(toolCalling, calls);
     let reads = 0;
     const run = toolCalling ? bridge.runVscodeLmAgent : bridge.runVscodeLmTextProtocol;
-    const result = JSON.parse(await run(model, request(), undefined, async () => ({
+    const transport = authenticatedEditor(request(), async () => ({
       ok: true, tool: "source_graph", mode: "body", authority_source: "canonical",
       authority_repo: "D:/Dev/AIWorkHub", hit_count: 1,
       content: JSON.stringify({ matches: [{
         file_path: "src/app.py", source_hash: "a".repeat(64), line_start: ++reads,
         line_end: reads, source: `def f${reads}(): pass`, qualname: `app.f${reads}`,
       }] }),
-    })));
+    }));
+    const result = JSON.parse(await run(model, request(), undefined, transport));
     assert.equal(reads, 18);
     assert.equal(model.turns, 21);
-    assert.equal(result.edits[0].ranges[0].new, "run_feature()");
+    assert.equal(transport.semanticCalls.length, 2);
+    assert.deepEqual(result.edits, [], "authenticated edit must not be applied twice");
     assert.equal(result.summary, "Verified production edit");
   });
 }
@@ -156,7 +189,7 @@ for (const toolCalling of [false, true]) for (const withTarget of [true, false])
     let reads = 0;
     const model = modelFor(toolCalling, calls);
     const run = toolCalling ? bridge.runVscodeLmAgent : bridge.runVscodeLmTextProtocol;
-    const result = JSON.parse(await run(model, request(), undefined, async () => {
+    const transport = authenticatedEditor(request(), async () => {
       const page = reads++;
       const chunk = bytes.subarray(page * size, (page + 1) * size);
       return { ok: true, tool: "source_graph", mode: "body", authority_source: "canonical",
@@ -165,10 +198,12 @@ for (const toolCalling of [false, true]) for (const withTarget of [true, false])
         content_sha256: contentHash, page_sha256: hash(chunk), page_index: page,
         page_count: 18, bytes: chunk.length, full_bytes: bytes.length,
         continuation_cursor: page < 17 ? cursor(page + 1) : null };
-    }));
+    });
+    const result = JSON.parse(await run(model, request(), undefined, transport));
     assert.equal(reads, 18);
     assert.equal(model.turns, 21);
-    assert.equal(result.edits[0].ranges[0].new, "run_feature()");
+    assert.equal(transport.semanticCalls.length, 2);
+    assert.deepEqual(result.edits, [], "authenticated edit must not be applied twice");
     assert.equal(result.summary, "Paged body completed");
   });
 }

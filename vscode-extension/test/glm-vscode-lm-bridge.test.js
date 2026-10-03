@@ -184,11 +184,20 @@ assert.ok(internals.glmTextToolProtocolPrompt("bounded", ["src/app.py"]).include
 assert.ok(internals.glmTextToolProtocolPrompt("bounded", ["src/app.py"]).includes("Use mode=focus only for broad orientation"));
 assert.ok(internals.glmTextToolProtocolPrompt("bounded", ["src/app.py"]).includes("Never coerce or repeat mode=focus for an exact file/body lookup"));
 assert.ok(!internals.glmTextToolProtocolPrompt("bounded", ["src/app.py"]).includes("For every tool call output ONLY: {\"schema_id\":\"aiworkhub.vscode_lm.tool_request.v1\",\"name\":\"aiworkhub_worker_source_graph_query\",\"input\":{\"mode\":\"focus\""));
-assert.ok(internals.glmTextToolProtocolPrompt("bounded", ["src/app.py"]).includes("prepare is an internal bridge primitive"));
+for (const prompt of [
+  internals.glmTextToolProtocolPrompt("bounded", ["src/app.py"]),
+]) {
+  assert.ok(prompt.includes("Worker semantic-edit prepare/apply are provider-callable"));
+  assert.ok(!prompt.includes("not provider-callable"));
+  assert.ok(prompt.includes("does not expose aiworkhub_worker_validation_run"));
+  assert.ok(prompt.includes("aiworkhub_worker_exit_preflight"));
+  assert.ok(prompt.includes("never call them or fabricate their results"));
+  assert.ok(prompt.includes("supervisor performs the exact card validation and exit gates before review"));
+}
 assert.ok(!internals.glmTextToolProtocolPrompt("bounded", ["src/app.py"]).includes('"aiworkhub_manager_semantic_edit_prepare"'));
 assert.ok(internals.glmTextToolProtocolPrompt("bounded", ["src/app.py"]).includes("semantic_edit_stage"));
-assert.ok(internals.glmTextToolProtocolPrompt("bounded", ["src/app.py"]).includes("assembles the final envelope offline"));
-assert.ok(internals.glmTextToolProtocolPrompt("bounded", ["src/app.py"]).includes("file_path, start_line, end_line, and new"));
+assert.ok(internals.glmTextToolProtocolPrompt("bounded", ["src/app.py"]).includes("For an existing file the bridge executes authenticated worker prepare/apply"));
+assert.ok(internals.glmTextToolProtocolPrompt("bounded", ["src/app.py"]).includes('"operation":"replace_range","file_path":"<allowed-path>","start_line"'));
 assert.ok(internals.glmTextToolProtocolPrompt("bounded", ["src/app.py"]).includes("absence of native toolCalling does not mean tools are unavailable"));
 assert.ok(internals.glmTextToolProtocolPrompt("bounded", ["src/app.py"]).includes("never report that MCP/callable tools are missing"));
 const nf97Prompt = internals.glmTextToolProtocolPrompt("bounded", ["src/app.py"]);
@@ -493,7 +502,7 @@ async function textProtocolChecks() {
   const calls = [];
   const result = await internals.runVscodeLmTextProtocol(
     model,
-    { prompt: "bounded", allowedWrites: ["out/result.json"] },
+    { prompt: "bounded", allowedWrites: ["out/result.json"], path_contracts: { "out/result.json": { action: "create", parent_existed: true } } },
     undefined,
     async (call) => { calls.push(call); return { ok: true, content: "graph" }; },
   );
@@ -724,7 +733,7 @@ async function textProtocolChecks() {
   };
   const wrappedResult = await internals.runVscodeLmTextProtocol(
     wrappedModel,
-    { prompt: "bounded", allowedWrites: ["out/result.json"] },
+    { prompt: "bounded", allowedWrites: ["out/result.json"], path_contracts: { "out/result.json": { action: "create", parent_existed: true } } },
     undefined,
     async () => ({ ok: true, content: "graph" }),
   );
@@ -774,7 +783,7 @@ async function textProtocolChecks() {
       prompt: "bounded",
       allowedWrites: ["out/result.json"],
       allowed_writes: ["out/result.json"],
-      path_contracts: {},
+      path_contracts: { "out/result.json": { action: "create", parent_existed: true } },
       initial_source_graph_request: { mode: "focus", query: "model", budget: 48 },
       initial_source_graph_result: {
         ok: true,
@@ -833,7 +842,7 @@ async function textProtocolChecks() {
     correctingModel,
     {
       prompt: "bounded",
-      allowedWrites: ["out/result.json"],
+      allowedWrites: ["out/result.json"], path_contracts: { "out/result.json": { action: "create", parent_existed: true } },
       initial_source_graph_request: { mode: "focus", query: "model" },
     },
     undefined,
@@ -875,9 +884,9 @@ async function textProtocolChecks() {
       initial_source_graph_result: { ok: true, content: "prefetched graph" },
     },
     undefined,
-    async () => { throw new Error("prefetched_source_graph_must_not_requery"); },
+    nf1291MockEditor({ path_contracts: editContract }, async () => { throw new Error("prefetched_source_graph_must_not_requery"); }),
   );
-  assert.strictEqual(v3HashResult, freshV3);
+  assert.deepStrictEqual(JSON.parse(v3HashResult).edits, []);
   assert.strictEqual(v3HashMessages.length, 2);
   assert.ok(v3HashMessages[1].includes("final_hash_stale:src/app.py"));
 
@@ -934,23 +943,14 @@ async function textProtocolChecks() {
       initial_source_graph_result: { ok: true, content: "prefetched graph" },
     },
     undefined,
-    async (call) => {
+    nf1291MockEditor({ path_contracts: editContract }, async (call) => {
       stagedTextCalls.push(call);
-      throw new Error("staged edits must not require an MCP round-trip");
-    },
+      throw new Error("prefetched graph must not require another read");
+    }),
   ));
   assert.strictEqual(stagedTextCalls.length, 0);
   assert.strictEqual(stagedTextResult.summary, "Updated app and added its focused test.");
-  assert.deepStrictEqual(stagedTextResult.edits, [{
-    path: "src/app.py",
-    current_sha256: "a".repeat(64),
-    ranges: [{
-      start_line: 2,
-      end_line: 2,
-      new: "return 2",
-      preserve_trailing_newline: true,
-    }],
-  }]);
+  assert.deepStrictEqual(stagedTextResult.edits, []);
   assert.deepStrictEqual(stagedTextResult.creates, [{
     path: "tests/test_app.py",
     content: "def test_app():\n    assert True\n",
@@ -1227,9 +1227,9 @@ async function textProtocolChecks() {
       initial_source_graph_result: { ok: true, content: "prefetched graph" },
     },
     undefined,
-    async () => { throw new Error("prefetched_source_graph_must_not_requery"); },
+    nf1291MockEditor({ path_contracts: editContract }, async () => { throw new Error("prefetched_source_graph_must_not_requery"); }),
   );
-  assert.strictEqual(fidelityResult, substantiveV3);
+  assert.deepStrictEqual(JSON.parse(fidelityResult).edits, []);
   assert.strictEqual(fidelityMessages.length, 2);
   assert.ok(fidelityMessages[1].includes("final_edit_fidelity_rejected"));
 
@@ -1244,7 +1244,7 @@ async function textProtocolChecks() {
     recoveringTextModel,
     {
       prompt: "bounded",
-      allowedWrites: ["out/result.json"],
+      allowedWrites: ["out/result.json"], path_contracts: { "out/result.json": { action: "create", parent_existed: true } },
       initial_source_graph_request: { mode: "focus", query: "model" },
     },
     undefined,
@@ -1262,7 +1262,7 @@ async function textProtocolChecks() {
     textChannelModel,
     {
       prompt: "bounded",
-      allowedWrites: ["out/result.json"],
+      allowedWrites: ["out/result.json"], path_contracts: { "out/result.json": { action: "create", parent_existed: true } },
       initial_source_graph_request: { mode: "focus", query: "model" },
     },
     undefined,
@@ -1281,7 +1281,7 @@ async function textProtocolChecks() {
     emptyTextChannelModel,
     {
       prompt: "bounded",
-      allowedWrites: ["out/result.json"],
+      allowedWrites: ["out/result.json"], path_contracts: { "out/result.json": { action: "create", parent_existed: true } },
       initial_source_graph_request: { mode: "focus", query: "model", budget: 48 },
     },
     undefined,
@@ -1489,7 +1489,7 @@ async function nativeProtocolChecks() {
   const originalInvoke = internals.VSCODE_LM_PRIVATE_TOOLS;
   const result = await internals.runVscodeLmAgent(
     model,
-    { requestId: "a".repeat(32), prompt: "bounded", allowedWrites: ["out/result.json"] },
+    { requestId: "a".repeat(32), prompt: "bounded", allowedWrites: ["out/result.json"], path_contracts: { "out/result.json": { action: "create", parent_existed: true } } },
     undefined,
     async () => ({ ok: true, content: "graph" }),
   );
@@ -1540,14 +1540,14 @@ async function nativeProtocolChecks() {
       initial_source_graph_result: { ok: true, content: "prefetched graph" },
     },
     undefined,
-    async (call) => {
+    nf1291MockEditor({ path_contracts: { "src/app.py": { action: "edit", current_sha256: "a".repeat(64) } } }, async (call) => {
       stagedNativeCalls.push(call);
-      throw new Error("staged edits must not require an MCP round-trip");
-    },
+      throw new Error("prefetched graph must not require another read");
+    }),
   ));
   assert.strictEqual(stagedNativeCalls.length, 0);
   assert.strictEqual(stagedNativeResult.summary, "Applied one staged native edit.");
-  assert.strictEqual(stagedNativeResult.edits[0].ranges[0].new, "return 3");
+  assert.deepStrictEqual(stagedNativeResult.edits, []);
 
   const nativePrefetchCalls = [];
   const nativePrefetchMessages = [];
@@ -1565,7 +1565,7 @@ async function nativeProtocolChecks() {
     {
       requestId: "9".repeat(32),
       prompt: "bounded",
-      allowedWrites: ["out/result.json"],
+      allowedWrites: ["out/result.json"], path_contracts: { "out/result.json": { action: "create", parent_existed: true } },
       initial_source_graph_request: { mode: "focus", query: "model" },
       initial_source_graph_result: {
         ok: true,
@@ -2574,7 +2574,7 @@ async function nf169WorkerSourceGraphAck() {
   };
   const workerTextResult = await internals.runVscodeLmTextProtocol(
     workerTextModel,
-    { prompt: "bounded", request_kind: "worker", allowedWrites: ["out/result.json"] },
+    { prompt: "bounded", request_kind: "worker", allowedWrites: ["out/result.json"], path_contracts: { "out/result.json": { action: "create", parent_existed: true } } },
     undefined,
     async (call) => {
       workerTextCalls.push(call);
@@ -4097,9 +4097,8 @@ async function nf723StagedFinalizationCompletenessChecks() {
   assert.strictEqual(finalized.__finalEnvelope.edits[0].path, editPath);
   assert.strictEqual(finalized.__finalEnvelope.creates[0].path, createPath);
 
-  const invokeOk = async () => ({ ok: true, content: "graph" });
-  const runText = (model) => internals.runVscodeLmTextProtocol(model, request, undefined, invokeOk);
-  const runNative = (model) => internals.runVscodeLmAgent(model, request, undefined, invokeOk);
+  const runText = (model) => internals.runVscodeLmTextProtocol(model, request, undefined, nf1291MockEditor(request));
+  const runNative = (model) => internals.runVscodeLmAgent(model, request, undefined, nf1291MockEditor(request));
 
   const textTurns = [];
   let textEditStaged = false;
@@ -4135,7 +4134,7 @@ async function nf723StagedFinalizationCompletenessChecks() {
     },
   };
   const textResult = JSON.parse(await runText(textSuccess));
-  assert.strictEqual(textResult.edits[0].path, editPath);
+  assert.deepStrictEqual(textResult.edits, []);
   assert.strictEqual(textResult.creates[0].path, createPath);
   assert.ok(textEditStaged);
   const createInstructions = textTurns.filter((instruction) =>
@@ -4179,7 +4178,7 @@ async function nf723StagedFinalizationCompletenessChecks() {
     },
   };
   const forcedResult = JSON.parse(await runText(forcedTextModel));
-  assert.strictEqual(forcedResult.edits[0].path, editPath);
+  assert.deepStrictEqual(forcedResult.edits, []);
   assert.strictEqual(forcedResult.creates[0].path, createPath);
   const forcedReceipt = JSON.parse(forcedCreateInput);
   assert.strictEqual(forcedReceipt.schema_id, "aiworkhub.vscode_lm.tool_result.v1");
@@ -4274,7 +4273,7 @@ async function nf723StagedFinalizationCompletenessChecks() {
     },
   };
   const nativeResult = JSON.parse(await runNative(nativeSuccess));
-  assert.strictEqual(nativeResult.edits[0].path, editPath);
+  assert.deepStrictEqual(nativeResult.edits, []);
   assert.strictEqual(nativeResult.creates[0].path, createPath);
   const nativeAfterEdit = nativeTurns.find((turn) =>
     turn.hasTools
@@ -4365,7 +4364,7 @@ async function nf723StagedFinalizationCompletenessChecks() {
     },
   };
   const textEarlyResult = JSON.parse(await runText(textEarly));
-  assert.strictEqual(textEarlyResult.edits[0].path, editPath);
+  assert.deepStrictEqual(textEarlyResult.edits, []);
   assert.strictEqual(textEarlyResult.creates[0].path, createPath);
   assert.ok(textEarlyEdit);
   assert.strictEqual(textEarlyCount, 3);
@@ -4400,7 +4399,7 @@ async function nf723StagedFinalizationCompletenessChecks() {
     },
   };
   const nativeEarlyResult = JSON.parse(await runNative(nativeEarly));
-  assert.strictEqual(nativeEarlyResult.edits[0].path, editPath);
+  assert.deepStrictEqual(nativeEarlyResult.edits, []);
   assert.strictEqual(nativeEarlyResult.creates[0].path, createPath);
   assert.strictEqual(nativeEarlyCount, 2);
 
@@ -4444,7 +4443,7 @@ async function nf723StagedFinalizationCompletenessChecks() {
     },
   };
   const textProgressResult = JSON.parse(await runText(textProgress));
-  assert.strictEqual(textProgressResult.edits[0].path, editPath);
+  assert.deepStrictEqual(textProgressResult.edits, []);
   assert.strictEqual(textProgressResult.creates[0].path, createPath);
   assert.ok(textProgressEdit);
   assert.ok(textProgressRefusedCreate && textProgressCreate);
@@ -4538,7 +4537,7 @@ async function nf723StagedFinalizationCompletenessChecks() {
     },
   };
   const nativeProgressResult = JSON.parse(await runNative(nativeProgress));
-  assert.strictEqual(nativeProgressResult.edits[0].path, editPath);
+  assert.deepStrictEqual(nativeProgressResult.edits, []);
   assert.strictEqual(nativeProgressResult.creates[0].path, createPath);
   assert.ok(nativeProgressRefusedEdit && nativeProgressEdit);
   assert.ok(nativeProgressRefusedCreate && nativeProgressCreate);
@@ -4723,7 +4722,7 @@ async function nf723StagedFinalizationCompletenessChecks() {
     },
   };
   const textNonStageResult = JSON.parse(await runText(textNonStageAfterEdit));
-  assert.strictEqual(textNonStageResult.edits[0].path, editPath);
+  assert.deepStrictEqual(textNonStageResult.edits, []);
   assert.strictEqual(textNonStageResult.creates[0].path, createPath);
   assert.ok(
     textNonStageCorrection.includes(createPath),
@@ -4787,7 +4786,7 @@ async function nf723StagedFinalizationCompletenessChecks() {
     },
   };
   const nativeNonStageResult = JSON.parse(await runNative(nativeNonStageAfterEdit));
-  assert.strictEqual(nativeNonStageResult.edits[0].path, editPath);
+  assert.deepStrictEqual(nativeNonStageResult.edits, []);
   assert.strictEqual(nativeNonStageResult.creates[0].path, createPath);
   assert.ok(
     nativeNonStageCorrection.includes(createPath),
@@ -4877,7 +4876,6 @@ async function nf831DirectFinalSubsetChecks() {
     path: NF831_CREATE_PATH,
     content: "export const nf831 = true;\n",
   }]);
-  const invoke = async () => ({ ok: true });
 
   for (const [name, run, native] of [
     ["text", internals.runVscodeLmTextProtocol, false],
@@ -4885,10 +4883,10 @@ async function nf831DirectFinalSubsetChecks() {
   ]) {
     const partialThenCreate = nf831Model(native, [editOnly, createOnly]);
     const combined = JSON.parse(await run(
-      partialThenCreate.model, nf831Request(), undefined, invoke,
+      partialThenCreate.model, nf831Request(), undefined, nf1291MockEditor(nf831Request()),
     ));
     assert.strictEqual(partialThenCreate.state.turns, 2, `${name}: use one bounded correction turn`);
-    assert.deepStrictEqual(combined.edits[0].ranges, nf831Edit().ranges, `${name}: preserve prior edit`);
+    assert.deepStrictEqual(combined.edits, [], `${name}: prior authenticated edit is not emitted twice`);
     assert.strictEqual(combined.creates[0].path, NF831_CREATE_PATH, `${name}: add missing create`);
     const correction = nf831LastUserText(partialThenCreate.state.requests[1]);
     assert.ok(correction.includes(NF831_CREATE_PATH), `${name}: name exact missing path`);
@@ -4897,15 +4895,15 @@ async function nf831DirectFinalSubsetChecks() {
 
     const onePass = nf831Model(native, [complete]);
     const onePassResult = JSON.parse(await run(
-      onePass.model, nf831Request(), undefined, invoke,
+      onePass.model, nf831Request(), undefined, nf1291MockEditor(nf831Request()),
     ));
     assert.strictEqual(onePass.state.turns, 1, `${name}: complete envelope stays one-pass`);
-    assert.strictEqual(onePassResult.edits[0].path, NF831_EDIT_PATH);
+    assert.deepStrictEqual(onePassResult.edits, [], `${name}: applied edit is not emitted twice`);
     assert.strictEqual(onePassResult.creates[0].path, NF831_CREATE_PATH);
 
     const repeated = nf831Model(native, [editOnly]);
     await assert.rejects(
-      () => run(repeated.model, nf831Request(), undefined, invoke),
+      () => run(repeated.model, nf831Request(), undefined, nf1291MockEditor(nf831Request())),
       (error) => {
         assert.match(String(error && error.message || error), /vscode_lm_finalization_nonprogress/);
         assert.strictEqual(error.nonprogressReason, "repeated_missing_required_create");
@@ -5101,6 +5099,7 @@ async function nf897EffortContextChecks() {
     {
       prompt: "bounded",
       allowedWrites: ["out/result.json"],
+      path_contracts: { "out/result.json": { action: "create", parent_existed: true } },
       request_kind: "worker",
       reasoning_decision: highDecision,
       initial_source_graph_request: { mode: "focus", query: "nf897", workflow_stage: "orientation" },
@@ -5109,7 +5108,7 @@ async function nf897EffortContextChecks() {
     undefined,
     async () => ({ ok: true, content: "graph" }),
   );
-  assert.strictEqual(textResult, finalResponse);
+  assert.deepStrictEqual(JSON.parse(textResult), JSON.parse(finalResponse));
   assert.ok(captured.length >= 1);
   assert.deepStrictEqual(captured[0].modelOptions, { reasoningEffort: "high" });
   assert.ok(!Object.prototype.hasOwnProperty.call(captured[0], "tools"));
@@ -5166,6 +5165,7 @@ async function nf897EffortContextChecks() {
       requestId: "e".repeat(32),
       prompt: "bounded native",
       allowedWrites: ["out/result.json"],
+      path_contracts: { "out/result.json": { action: "create", parent_existed: true } },
       request_kind: "worker",
       reasoning_decision: highDecision,
       initial_source_graph_request: { mode: "focus", query: "nf897", workflow_stage: "orientation" },
@@ -5436,6 +5436,7 @@ async function nf925ReasoningContextAttemptChecks() {
   };
   const nativeParityRequest = {
     requestId: "c".repeat(32), prompt: "bounded", allowedWrites: ["out/result.json"], reasoning_decision: highDecision,
+    path_contracts: { "out/result.json": { action: "create", parent_existed: true } },
   };
   const nativeRecorder = newRecorder(
     nativeParityModel, nativeParityRequest, { ...boundaryIdentity, requestId: nativeParityRequest.requestId },
@@ -5444,7 +5445,7 @@ async function nf925ReasoningContextAttemptChecks() {
     nativeParityModel, nativeParityRequest, undefined, async () => ({ ok: true, content: "graph" }),
     null, null, null, nativeRecorder,
   );
-  assert.strictEqual(nativeParityResult, nativeFinal);
+  assert.deepStrictEqual(JSON.parse(nativeParityResult), JSON.parse(nativeFinal));
   assert.strictEqual(nativeSent.length, 3);
   assert.ok(nativeSent.every((options) => options.modelOptions.reasoningEffort === "high"));
   const nativeParityReceipt = nativeRecorder.snapshot();
@@ -5671,16 +5672,16 @@ async function nf988DiscoveryDoesNotImplicitlyEnterSemanticStage() {
     model,
     request,
     undefined,
-    async (call) => {
+    nf1291MockEditor(request, async (call) => {
       assert.strictEqual(call.name, "aiworkhub_worker_source_graph_query");
       sourceGraphCalls += 1;
       return { ok: true, content: "bounded graph" };
-    },
+    }),
   ));
 
   assert.strictEqual(sourceGraphCalls, 15,
     "valid discovery calls remain available until the first authenticated staged edit");
-  assert.deepStrictEqual(final.edits.map((edit) => edit.path), [file]);
+  assert.deepStrictEqual(final.edits, []);
   assert.strictEqual(modelTurns, 16);
 }
 
@@ -5734,12 +5735,12 @@ async function nf651StageContextReadForNextRequiredFile() {
     },
   };
   const final = JSON.parse(await internals.runVscodeLmTextProtocol(
-    model, request, undefined, async (call) => {
+    model, request, undefined, nf1291MockEditor(request, async (call) => {
       if (call.name === "aiworkhub_worker_source_graph_query" && call.input.target === second) exactReads += 1;
       return { ok: true, content: "bounded graph" };
-    },
+    }),
   ));
-  assert.deepStrictEqual(final.edits.map((edit) => edit.path), [first, second]);
+  assert.deepStrictEqual(final.edits, []);
   assert.strictEqual(exactReads, 1, "one exact next-output read must execute after a staged edit");
   assert.ok(modelTurns < 24);
   let repeatedTurns = 0;
@@ -5771,10 +5772,10 @@ async function nf651StageContextReadForNextRequiredFile() {
   };
   await assert.rejects(
     internals.runVscodeLmTextProtocol(repeatedModel, { ...request, requestId: "2".repeat(32) }, undefined,
-      async (call) => {
+      nf1291MockEditor(request, async (call) => {
         if (call.name === "aiworkhub_worker_source_graph_query" && call.input.target === second) repeatedExactReads += 1;
         return { ok: true, content: "bounded graph" };
-      }),
+      })),
     /vscode_lm_source_graph_no_progress/,
   );
   assert.strictEqual(repeatedExactReads, 1, "duplicate exact reads stop before a second live lookup");
@@ -5851,14 +5852,14 @@ async function nf202600023DeclaredDependencyReadDuringForcedStaging() {
     },
   };
   const final = JSON.parse(await internals.runVscodeLmTextProtocol(
-    model, request, undefined, async (call) => {
+    model, request, undefined, nf1291MockEditor(request, async (call) => {
       if (call.name === "aiworkhub_worker_source_graph_query" && call.input.mode === "file") {
         executed.push(call.input.target);
       }
       return { ok: true, content: "bounded graph" };
-    },
+    }),
   ));
-  assert.deepStrictEqual(final.edits.map((edit) => edit.path), [first, second]);
+  assert.deepStrictEqual(final.edits, []);
   assert.deepStrictEqual(executed, [dep],
     "the declared dependency must be read; the undeclared file must never execute");
   assert.ok(stageInstructions.length > 0);
@@ -5892,15 +5893,15 @@ async function nf202600023DeclaredDependencyReadDuringForcedStaging() {
     },
   };
   const cappedFinal = JSON.parse(await internals.runVscodeLmTextProtocol(
-    cappedModel, { ...request, requestId: "4".repeat(32) }, undefined, async (call) => {
+    cappedModel, { ...request, requestId: "4".repeat(32) }, undefined, nf1291MockEditor(request, async (call) => {
       if (call.name === "aiworkhub_worker_source_graph_query" &&
           (call.input.mode === "file" || call.input.mode === "body")) {
         cappedExecuted.push(call.input.target);
       }
       return { ok: true, content: "bounded graph" };
-    },
+    }),
   ));
-  assert.deepStrictEqual(cappedFinal.edits.map((edit) => edit.path), [first, second]);
+  assert.deepStrictEqual(cappedFinal.edits, []);
   assert.deepStrictEqual(cappedExecuted, [dep, dep, second, second],
     "the duplicate consumes no slot, but the fifth distinct forced-stage read is refused");
 }
@@ -5956,12 +5957,12 @@ async function nf988TwoBoundedCorrectionsDuringForcedStaging() {
     ]),
     request,
     undefined,
-    async (call) => {
+    nf1291MockEditor(request, async (call) => {
       invoked.push(call.name);
       return { ok: true, content: "bounded graph" };
-    },
+    }),
   ));
-  assert.deepStrictEqual(recovered.edits.map((edit) => edit.path), [first, second]);
+  assert.deepStrictEqual(recovered.edits, []);
   assert.deepStrictEqual(invoked, Array.from({ length: 12 }, () => "aiworkhub_worker_source_graph_query"),
     "the rejected non-stage request must not execute while two corrective turns remain bounded");
 
@@ -5976,12 +5977,12 @@ async function nf988TwoBoundedCorrectionsDuringForcedStaging() {
     ]),
     { ...request, requestId: "a".repeat(32) },
     undefined,
-    async (call) => {
+    nf1291MockEditor(request, async (call) => {
       assert.strictEqual(call.name, "aiworkhub_worker_source_graph_query",
         "a rejected non-stage request must never execute");
       failureInvocations += 1;
       return { ok: true, content: "bounded graph" };
-    },
+    }),
   ).then(() => assert.fail("a third forced-stage violation must fail"), (err) => err);
   assert.strictEqual(failureInvocations, 12);
   assert.match(String(failure.message), /vscode_lm_semantic_edit_stage_required/);
@@ -6039,12 +6040,12 @@ async function nf202600032UnknownToolOutsideForcedStaging() {
   const correctives = [];
   const final = JSON.parse(await internals.runVscodeLmTextProtocol(
     scripted([discover(), discover(), unknown, discover(), finalEdit], correctives),
-    request, undefined, async (call) => {
+    request, undefined, nf1291MockEditor(request, async (call) => {
       invoked.push(call.name);
       return { ok: true, content: "bounded graph" };
-    },
+    }),
   ));
-  assert.deepStrictEqual(final.edits.map((edit) => edit.path), ["src/app.py"]);
+  assert.deepStrictEqual(final.edits, []);
   assert.deepStrictEqual(invoked, [
     "aiworkhub_worker_source_graph_query",
     "aiworkhub_worker_source_graph_query",
@@ -6202,12 +6203,14 @@ async function nf998SourceGraphBoundaryAndStageReset() {
       "src/app.js": { action: "edit", current_sha256: "a".repeat(64), line_count: 1, parent_existed: true },
     },
     initial_source_graph_result: { ok: true, content: "prefetched graph" },
-  }, undefined, async (call) => {
+  }, undefined, nf1291MockEditor({ path_contracts: {
+    "src/app.js": { current_sha256: "a".repeat(64) },
+  } }, async (call) => {
     stageCalls.push(call.name);
     return { ok: true, content: "graph" };
-  }));
+  })));
   assert.deepStrictEqual(stageCalls, [graph, graph], "successful staging resets the duplicate guard");
-  assert.deepStrictEqual(stageResult.edits.map((edit) => edit.path), ["src/app.js"]);
+  assert.deepStrictEqual(stageResult.edits, []);
   assert.strictEqual(stageReceipts[1].result.duplicate, true);
   assert.strictEqual(stageReceipts[2].result.idempotent_replay, false);
 }
@@ -6300,10 +6303,12 @@ async function nf998ForcedStageDuplicateAfterReadCap() {
       [dependency]: { action: "edit", current_sha256: "c".repeat(64), line_count: 1, parent_existed: true },
     },
     initial_source_graph_result: { ok: true, content: "prefetched graph" },
-  }, undefined, async (call) => {
+  }, undefined, nf1291MockEditor({ path_contracts: {
+    [first]: { current_sha256: "a".repeat(64) }, [second]: { current_sha256: "b".repeat(64) },
+  } }, async (call) => {
     if (call.name === graph && call.input.target === dependency) liveDependencyReads.push(call.input.mode);
     return { ok: true, content: "bounded graph" };
-  }).then(() => assert.fail("a capped duplicate must stop before the general turn limit"), (error) => error);
+  })).then(() => assert.fail("a capped duplicate must stop before the general turn limit"), (error) => error);
   assert.deepStrictEqual(liveDependencyReads, ["file", "body"]);
   assert.strictEqual(receipts[15].result.error, "vscode_lm_semantic_edit_stage_required",
     "a new query remains subject to the two-read cap");
@@ -6452,10 +6457,12 @@ async function nf1179EarlyStagedPlainTextStaysBounded() {
       [second]: { action: "edit", current_sha256: "b".repeat(64), line_count: 1, parent_existed: true },
     },
     initial_source_graph_result: { ok: true, content: "prefetched graph" },
-  }, undefined, async () => {
+  }, undefined, nf1291MockEditor({ path_contracts: {
+    [first]: { current_sha256: "a".repeat(64) }, [second]: { current_sha256: "b".repeat(64) },
+  } }, async () => {
     sourceGraphCalls += 1;
     return { ok: true, content: "bounded graph" };
-  }).then(() => assert.fail("an early-staged prose run must never finalize"), (error) => error);
+  })).then(() => assert.fail("an early-staged prose run must never finalize"), (error) => error);
   // The bound this test exists for is unchanged: the run still stops on the
   // second prose reply, at turn 4, instead of drifting through the discovery
   // phase. Only the identity it reports changed. src/second.js was declared
@@ -6694,8 +6701,13 @@ async function nf1252FinalSchemaIsExplicitAndCorrectable() {
       initial_source_graph_result: { ok: true, content: "indexed version line" },
     };
     const run = native ? internals.runVscodeLmAgent : internals.runVscodeLmTextProtocol;
-    const result = JSON.parse(await run(model, request, undefined, async () => assert.fail("no additional discovery is required")));
-    assert.strictEqual(result.edits[0].ranges[0].start_line, 14);
+    const editor = nf1291MockEditor(request, async () => assert.fail("no additional discovery is required"));
+    const result = JSON.parse(await run(model, request, undefined, editor));
+    assert.deepStrictEqual(result.edits, []);
+    assert.deepStrictEqual(editor.editorCalls.map(call => call.name), [
+      "aiworkhub_worker_semantic_edit_prepare", "aiworkhub_worker_semantic_edit_apply",
+    ]);
+    assert.strictEqual(editor.editorCalls[0].input.start_line, 14);
     assert.strictEqual(turns, 2, "one diagnostic must make the final shape correctable");
   }
 }
@@ -6907,15 +6919,14 @@ async function nf1290ProgressingProviderLoopsContinue() {
       return { ok: true, tool: "semantic_edit_apply",
         schema_id: "aiworkhub.semantic_edit_apply_receipt.v1", target_id: "verified-target",
         path: file, before_sha256: "a".repeat(64), after_sha256: "b".repeat(64),
-        idempotency_key: "nf1290", idempotent_replay: false };
+        idempotency_key: "nf1290", idempotent_replay: false, preimage_verified: true };
     }));
-    assert.strictEqual(turns, reads + 3);
+    assert(turns >= reads + 2 && turns <= reads + 3, "complete after authenticated apply, without re-emission");
     assert.deepStrictEqual(invoked.slice(-2), [
       "aiworkhub_worker_semantic_edit_prepare", "aiworkhub_worker_semantic_edit_apply",
     ]);
-    assert.strictEqual(result.edits[0].path, file);
-    assert.strictEqual(result.edits[0].current_sha256, "a".repeat(64));
-    assert.strictEqual(result.edits[0].ranges[0].new, "return fixed");
+    assert.deepStrictEqual(result.edits, [], "the authenticated edit is already applied");
+    assert.strictEqual(invoked.filter(name => name === "aiworkhub_worker_semantic_edit_apply").length, 1);
     assert.deepStrictEqual(result.creates, []);
   }
 
@@ -6949,7 +6960,344 @@ async function nf1290ProgressingProviderLoopsContinue() {
   }
 }
 
+// Synthetic editor authority for protocol regression tests, never a native actor.
+function nf1291MockEditor(request, fallback = async () => ({ ok: true, content: "graph" })) {
+  const targets = new Map(), hashes = new Map();
+  const calls = [];
+  const invoke = async (call, requestId, providerCallId) => {
+    if (!call.name.startsWith("aiworkhub_worker_semantic_edit_")) return fallback(call, requestId, providerCallId);
+    calls.push(call);
+    if (call.name.endsWith("_prepare")) {
+      const input = call.input, file = input.file_path;
+      const current = hashes.get(file) || request.path_contracts[file].current_sha256;
+      const target = "mock-target-" + targets.size;
+      targets.set(target, { file, current });
+      return { ok: true, tool: "semantic_edit_prepare", target_id: target, path: file,
+        current_sha256: current, fragment_sha256: "c".repeat(64),
+        start_line: input.start_line, end_line: input.end_line };
+    }
+    assert.strictEqual(call.name, "aiworkhub_worker_semantic_edit_apply");
+    const input = call.input, target = targets.get(input.target_id);
+    assert(target, "apply must refer to a real mock prepare");
+    const after = require("crypto").createHash("sha256").update(input.new).digest("hex");
+    hashes.set(target.file, after);
+    return { ok: true, tool: "semantic_edit_apply", schema_id: "aiworkhub.semantic_edit_apply_receipt.v1",
+      target_id: input.target_id, path: target.file, before_sha256: target.current,
+      after_sha256: after, idempotency_key: input.idempotency_key, idempotent_replay: false,
+      preimage_verified: true };
+  };
+  invoke.editorCalls = calls;
+  return invoke;
+}
+async function nf1291AuthenticatedStageHandoff() {
+  const request = { requestId: "a".repeat(32), request_kind: "worker",
+    allowedWrites: ["src/app.py"], required_outputs: ["src/app.py"],
+    path_contracts: { "src/app.py": { action: "edit", current_sha256: "a".repeat(64),
+      line_count: 3, parent_existed: true } } };
+  const collector = internals.createVscodeLmStagedEditCollector(request);
+  const calls = [];
+  const applyReceipt = { ok: true, tool: "semantic_edit_apply",
+    schema_id: "aiworkhub.semantic_edit_apply_receipt.v1", target_id: "target",
+    path: "src/app.py", before_sha256: "a".repeat(64), after_sha256: "b".repeat(64),
+    idempotency_key: "stage-key", idempotent_replay: false, preimage_verified: true };
+  const invoke = async (call, requestId, providerCallId) => {
+    calls.push({ ...call, requestId, providerCallId });
+    if (call.name === "aiworkhub_worker_semantic_edit_prepare") return {
+      ok: true, tool: "semantic_edit_prepare", target_id: "target", path: "src/app.py",
+      current_sha256: "a".repeat(64), fragment_sha256: "c".repeat(64),
+      start_line: 2, end_line: 2 };
+    assert.strictEqual(call.name, "aiworkhub_worker_semantic_edit_apply");
+    assert.strictEqual(call.input.target_id, "target");
+    return { ...applyReceipt, idempotency_key: call.input.idempotency_key };
+  };
+  const staged = await internals.invokeVscodeLmProtocolTool({
+    name: "aiworkhub_manager_semantic_edit_stage",
+    input: { operation: "replace_range", file_path: "src/app.py",
+      start_line: 2, end_line: 2, new: "return fixed" },
+  }, request.requestId, invoke, collector, "nf1291.stage");
+  assert.strictEqual(staged.ok, true);
+  assert.deepStrictEqual(calls.map(call => call.name), [
+    "aiworkhub_worker_semantic_edit_prepare", "aiworkhub_worker_semantic_edit_apply",
+  ], "existing stage must execute the actual authenticated worker pair");
+  assert(calls.every(call => call.requestId === request.requestId && call.providerCallId));
+  assert.strictEqual(staged.mcp_receipt.after_sha256, "b".repeat(64));
+  const final = collector.finalize("already applied");
+  assert.strictEqual(final.ok, true);
+  assert.deepStrictEqual(final.__finalEnvelope.edits, [], "never reapply through offline Python V3");
+  assert.deepStrictEqual(final.completed_outputs, ["src/app.py"]);
+  const failedCollector = internals.createVscodeLmStagedEditCollector(request);
+  const failed = await internals.invokeVscodeLmProtocolTool({
+    name: "aiworkhub_manager_semantic_edit_stage",
+    input: { operation: "replace_range", file_path: "src/app.py",
+      start_line: 2, end_line: 2, new: "return fixed" },
+  }, request.requestId, async call => call.name.endsWith("_prepare")
+    ? { ok: true, target_id: "target", path: "src/app.py", current_sha256: "a".repeat(64),
+        start_line: 2, end_line: 2, fragment_sha256: "c".repeat(64) }
+    : { ok: false, reason: "semantic_edit_apply_not_durable" }, failedCollector, "nf1291.failure");
+  assert.strictEqual(failed.ok, false);
+  assert.deepStrictEqual(failed.completed_outputs, []);
+}
+async function nf1291ShiftedStageRecovery() {
+  const file = "src/app.py";
+  const created = "tests/new.py";
+  const digest = value => require("node:crypto").createHash("sha256").update(value).digest("hex");
+  const fixture = () => {
+    let lines = ["one", "two", "three", "four"];
+    let targetNumber = 0;
+    const targets = new Map();
+    const calls = [];
+    const req = { requestId: "d".repeat(32), request_kind: "worker", prompt: "Edit current source ranges.",
+      allowedWrites: [file, created], required_outputs: [],
+      path_contracts: {
+        [file]: { action: "edit", line_count: 4, current_sha256: digest(lines.join("\n") + "\n") },
+        [created]: { action: "create", parent_existed: false },
+      }, initial_source_graph_result: { ok: true, content: "injected" } };
+    const invoke = async call => {
+      calls.push(call);
+      const input = call.input;
+      if (call.name === "aiworkhub_worker_source_graph_query") {
+        return { ok: true, tool: "source_graph", mode: input.mode, authority_source: "canonical",
+          authority_repo: "D:/Dev/AIWorkHub", hit_count: 1,
+          content: JSON.stringify({ matches: [{ file_path: file,
+            freshness: { state: "fresh", disk_source_hash: digest(lines.join("\n") + "\n"),
+              indexed_source_hash: digest(lines.join("\n") + "\n") },
+            line_start: 5, line_end: 5, source: lines[4] || "four", qualname: "app.four" }] }) };
+      }
+      if (call.name === "aiworkhub_worker_semantic_edit_prepare") {
+        const targetId = "shift-target-" + (++targetNumber);
+        const before = digest(lines.join("\n") + "\n");
+        targets.set(targetId, { ...input, before });
+        return { ok: true, target_id: targetId, path: input.file_path, start_line: input.start_line,
+          end_line: input.end_line, current_sha256: before,
+          fragment_sha256: digest(lines.slice(input.start_line - 1, input.end_line).join("\n") + "\n") };
+      }
+      assert.equal(call.name, "aiworkhub_worker_semantic_edit_apply");
+      const target = targets.get(input.target_id);
+      assert.ok(target);
+      assert.equal(target.before, digest(lines.join("\n") + "\n"), "fresh preimage");
+      const replacement = input.new === "" ? [] : input.new.replace(/\n$/, "").split("\n");
+      lines.splice(target.start_line - 1, target.end_line - target.start_line + 1, ...replacement);
+      return { ok: true, schema_id: "aiworkhub.semantic_edit_apply_receipt.v1",
+        target_id: input.target_id, path: target.file_path, before_sha256: target.before,
+        after_sha256: digest(lines.join("\n") + "\n"), idempotency_key: input.idempotency_key,
+        preimage_verified: true };
+    };
+    return { req, invoke, calls, lines: () => lines };
+  };
+  const grow = { operation: "replace_range", file_path: file, start_line: 1, end_line: 1, new: "inserted\none" };
+  // Match the actual fresh body schema, never a source_hash-only mock.
+  for (const [label, corrupt] of [
+    ["missing freshness", row => { delete row.freshness; }],
+    ["stale freshness", row => { row.freshness.state = "stale"; }],
+    ["missing freshness state", row => { delete row.freshness.state; }],
+    ["missing file", row => { row.freshness.state = "missing"; }],
+    ["mismatched disk hash", row => { row.freshness.disk_source_hash = "0".repeat(64); }],
+    ["indexed hash only", row => { delete row.freshness.disk_source_hash; }],
+    ["source_hash only", row => { row.source_hash = row.freshness.disk_source_hash; delete row.freshness; }],
+    ["trimmed delivered span", row => { row.line_start = 4; }],
+  ]) {
+    const f = fixture();
+    const collector = internals.createVscodeLmStagedEditCollector(f.req);
+    assert.equal((await collector.stage(grow, f.invoke)).ok, true);
+    assert.equal((await collector.stage({ ...grow, start_line: 4, end_line: 4, new: "WRONG" }, f.invoke)).ok, false);
+    const source = { name: "aiworkhub_worker_source_graph_query",
+      input: { mode: "body", query: "app.four", target: file } };
+    const delivered = await f.invoke(source);
+    const payload = JSON.parse(delivered.content);
+    assert.equal(Object.hasOwn(payload.matches[0], "source_hash"), false);
+    corrupt(payload.matches[0]);
+    collector.noteRecoverySourceGraph(source, { ...delivered, content: JSON.stringify(payload) });
+    const beforeCalls = f.calls.length;
+    assert.equal(collector.allowsRecoveryCall({ name: "aiworkhub_worker_semantic_edit_prepare",
+      input: { file_path: file, start_line: 5, end_line: 5 } }), false, label);
+    assert.equal(f.calls.length, beforeCalls, "invalid delivery cannot invoke prepare/apply");
+    assert.deepEqual(f.lines(), ["inserted", "one", "two", "three", "four"]);
+  }
+  for (const staleCoordinate of [4, 5]) {
+    const f = fixture();
+    const collector = internals.createVscodeLmStagedEditCollector(f.req);
+    assert.equal((await collector.stage(grow, f.invoke)).ok, true);
+    const beforeCalls = f.calls.length;
+    const rejected = await collector.stage({ operation: "replace_range", file_path: file,
+      start_line: staleCoordinate, end_line: staleCoordinate, new: "FOUR" }, f.invoke);
+    assert.equal(rejected.ok, false, "later stage must never mix launch and current coordinates");
+    assert.match(rejected.reason, /coordinates_shifted_requires_fresh_worker_pair/);
+    assert.equal(f.calls.length, beforeCalls, "shifted stage is refused before prepare/mutation");
+    assert.deepEqual(f.lines(), ["inserted", "one", "two", "three", "four"]);
+  }
+  for (const directGrowth of [false, true]) {
+    const f = fixture();
+    const collector = internals.createVscodeLmStagedEditCollector(f.req);
+    const dispatch = call => internals.invokeVscodeLmProtocolTool(call, f.req.requestId, f.invoke, collector);
+    if (directGrowth) {
+      await dispatch({ name: "aiworkhub_worker_semantic_edit_prepare",
+        input: { file_path: file, start_line: 1, end_line: 1 } });
+      await dispatch({ name: "aiworkhub_worker_semantic_edit_apply",
+        input: { target_id: "shift-target-1", new: grow.new, idempotency_key: "direct-growth" } });
+    } else await collector.stage(grow, f.invoke);
+    assert.equal((await collector.stage({ ...grow, start_line: 4, end_line: 4, new: "WRONG" }, f.invoke)).ok, false);
+    const prepare = { name: "aiworkhub_worker_semantic_edit_prepare",
+      input: { file_path: file, start_line: 5, end_line: 5 } };
+    assert.equal(collector.allowsRecoveryCall(prepare), false, "no prepare before fresh current SG body");
+    assert.equal(collector.allowsRecoveryCall({ name: "aiworkhub_worker_source_graph_query",
+      input: { mode: "body", query: "outside", target: created } }), false);
+    const source = { name: "aiworkhub_worker_source_graph_query",
+      input: { mode: "body", query: "app.four", target: file } };
+    assert.equal(collector.allowsRecoveryCall(source), true);
+    await dispatch(source);
+    assert.equal(collector.allowsRecoveryCall({ ...prepare,
+      input: { ...prepare.input, file_path: created } }), false, "unrelated path is never recovery authority");
+    assert.equal(collector.allowsRecoveryCall({ ...prepare,
+      input: { ...prepare.input, start_line: 4, end_line: 4 } }), false, "old coordinate lacks fresh range evidence");
+    assert.equal(collector.allowsRecoveryCall(prepare), true);
+    await dispatch(prepare);
+    const apply = { name: "aiworkhub_worker_semantic_edit_apply",
+      input: { target_id: "shift-target-2", new: "FOUR", idempotency_key: "current-five" } };
+    assert.equal(collector.allowsRecoveryCall({ ...apply,
+      input: { ...apply.input, target_id: "unrelated-target" } }), false);
+    assert.equal(collector.allowsRecoveryCall(apply), true);
+    await dispatch(apply);
+    assert.deepEqual(f.lines(), ["inserted", "one", "two", "three", "FOUR"]);
+    assert.deepEqual(collector.recoveryToolNames(), [], "authentic apply revokes recovery mode");
+    assert.equal(collector.allowsRecoveryCall(apply), false);
+  }
+  for (const directGrowth of [false, true]) {
+    for (const withEarlierPath of [false, true]) {
+      const f = fixture();
+      const earlier = "src/aaa.py";
+      if (withEarlierPath) {
+        f.req.allowedWrites.push(earlier);
+        f.req.path_contracts[earlier] = { action: "edit", line_count: 4, current_sha256: f.req.path_contracts[file].current_sha256 };
+      }
+      const collector = internals.createVscodeLmStagedEditCollector(f.req);
+      const dispatch = call => internals.invokeVscodeLmProtocolTool(call, f.req.requestId, f.invoke, collector);
+      if (directGrowth) {
+        await dispatch({ name: "aiworkhub_worker_semantic_edit_prepare",
+          input: { file_path: file, start_line: 1, end_line: 1 } });
+        await dispatch({ name: "aiworkhub_worker_semantic_edit_apply",
+          input: { target_id: "shift-target-1", new: grow.new, idempotency_key: "before-final-growth" } });
+      } else assert.equal((await collector.stage(grow, f.invoke)).ok, true);
+      const beforeCalls = f.calls.length;
+      const ingested = await collector.ingestFinalEnvelope({
+        schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA, summary: "stale later batch",
+        edits: [
+          ...(withEarlierPath ? [{ path: earlier, ranges: [{ start_line: 2, end_line: 2, new: "EARLIER" }] }] : []),
+          { path: file, current_sha256: f.req.path_contracts[file].current_sha256,
+            ranges: [{ start_line: 4, end_line: 4, new: "FOUR" }] },
+        ], creates: [],
+      }, f.invoke);
+      assert.equal(ingested.ok, false, "preexisting growth must not receive the internal batch bypass");
+      assert.equal(ingested.corrective, true);
+      assert.match(ingested.reason, /coordinates_shifted_requires_fresh_worker_pair/);
+      assert.equal(f.calls.length, beforeCalls, "all paths are checked before ANY batch prepare/apply");
+      assert.deepEqual(f.lines(), ["inserted", "one", "two", "three", "four"]);
+    }
+  }
+  // Direct final ranges retain their launch-coordinate descending batch contract.
+  const batch = fixture();
+  const batchCollector = internals.createVscodeLmStagedEditCollector(batch.req);
+  assert.equal((await batchCollector.ingestFinalEnvelope({
+    schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA, summary: "batch",
+    edits: [{ path: file, ranges: [
+      { start_line: 1, end_line: 1, new: grow.new }, { start_line: 4, end_line: 4, new: "FOUR" },
+    ] }], creates: [],
+  }, batch.invoke)).ok, true);
+  assert.deepEqual(batch.lines(), ["inserted", "one", "two", "three", "FOUR"]);
+  const unchanged = fixture();
+  const sameCollector = internals.createVscodeLmStagedEditCollector(unchanged.req);
+  for (const [line, value] of [[1, "ONE"], [4, "FOUR"]]) {
+    assert.equal((await sameCollector.stage({ operation: "replace_range", file_path: file,
+      start_line: line, end_line: line, new: value }, unchanged.invoke)).ok, true);
+  }
+  assert.deepEqual(unchanged.lines(), ["ONE", "two", "three", "FOUR"]);
+  for (const native of [false, true]) {
+    const f = fixture();
+    f.req.required_outputs = [file, created];
+    const staleFinal = { schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+      summary: "later stale batch", edits: [{ path: file, current_sha256: f.req.path_contracts[file].current_sha256,
+        ranges: [{ start_line: 4, end_line: 4, new: "WRONG" }] }],
+      creates: [{ path: created, content: "assert True\n" }] };
+    const plan = [
+      { name: "aiworkhub_worker_source_graph_query", input: { mode: "focus", query: "composition-orientation" } },
+      { name: "aiworkhub_manager_semantic_edit_stage", input: grow },
+      staleFinal,
+      { name: "aiworkhub_worker_source_graph_query", input: { mode: "body", query: "app.four", target: file } },
+      { name: "aiworkhub_worker_semantic_edit_prepare", input: { file_path: file, start_line: 5, end_line: 5 } },
+      { name: "aiworkhub_worker_semantic_edit_apply", input: {
+        target_id: "shift-target-2", new: "FOUR", idempotency_key: "after-rejected-final" } },
+      { name: "aiworkhub_manager_semantic_edit_stage", input: {
+        operation: "create", file_path: created, content: "assert True\n" } },
+    ];
+    let turn = 0;
+    const model = { capabilities: { toolCalling: native },
+      sendRequest: async (messages, options) => {
+        const item = plan[turn++];
+        assert.ok(item, "direct-final correction must reach pair without a fatal or stage-only dead end");
+        if (turn === 4) {
+          assert.deepEqual(f.lines(), ["inserted", "one", "two", "three", "four"]);
+          assert.equal(f.calls.filter(call => call.name.endsWith("_apply")).length, 1,
+            "rejected final must not mutate any range");
+          assert.match(JSON.stringify(messages), /Read a fresh bounded Source Graph body/);
+        }
+        if (native && turn === 5) {
+          assert.ok(options.tools.some(tool => tool.name === "aiworkhub_worker_semantic_edit_prepare"));
+          assert.ok(options.tools.some(tool => tool.name === "aiworkhub_worker_semantic_edit_apply"));
+        }
+        const part = !item.name ? { value: JSON.stringify(item) }
+          : native ? { callId: "composition-call-" + turn, ...item }
+          : { value: JSON.stringify({ schema_id: internals.constants.VSCODE_LM_TOOL_REQUEST_SCHEMA, ...item }) };
+        return { stream: (async function* () { yield part; })() };
+      } };
+    const run = native ? internals.runVscodeLmAgent : internals.runVscodeLmTextProtocol;
+    const final = JSON.parse(await run(model, f.req, undefined, f.invoke));
+    assert.deepEqual(f.lines(), ["inserted", "one", "two", "three", "FOUR"]);
+    assert.equal(f.calls.filter(call => call.name.endsWith("_apply")).length, 2);
+    assert.equal(turn, plan.length);
+    assert.deepEqual(final.edits, []);
+    assert.equal(final.creates[0].path, created);
+  }
+  for (const native of [false, true]) {
+    const f = fixture();
+    f.req.required_outputs = [file, created]; // Keep forced staging genuinely active through recovery.
+    const plan = [
+      ...Array.from({ length: 12 }, (_, i) => ({ name: "aiworkhub_worker_source_graph_query",
+        input: { mode: "focus", query: "orientation-" + i } })),
+      { name: "aiworkhub_manager_semantic_edit_stage", input: grow },
+      { name: "aiworkhub_manager_semantic_edit_stage", input: { operation: "replace_range",
+        file_path: file, start_line: 4, end_line: 4, new: "WRONG" } },
+      { name: "aiworkhub_worker_source_graph_query", input: { mode: "body", query: "app.four", target: file } },
+      { name: "aiworkhub_worker_semantic_edit_prepare", input: { file_path: file, start_line: 5, end_line: 5 } },
+      { name: "aiworkhub_worker_semantic_edit_apply", input: {
+        target_id: "shift-target-2", new: "FOUR", idempotency_key: "fresh-pair" } },
+      { name: "aiworkhub_manager_semantic_edit_stage", input: {
+        operation: "create", file_path: created, content: "assert True\n" } },
+    ];
+    let turn = 0;
+    const model = { capabilities: { toolCalling: native },
+      sendRequest: async (_messages, options) => {
+        const call = plan[turn++];
+        assert.ok(call, "bounded corrective reaches actual pair instead of another stage-only dead end");
+        if (native && turn === 16) {
+          assert.ok(options.tools.some(tool => tool.name === "aiworkhub_worker_semantic_edit_prepare"));
+          assert.ok(options.tools.some(tool => tool.name === "aiworkhub_worker_semantic_edit_apply"));
+        }
+        const part = native ? { callId: "shift-call-" + turn, ...call }
+          : { value: JSON.stringify({ schema_id: internals.constants.VSCODE_LM_TOOL_REQUEST_SCHEMA, ...call }) };
+        return { stream: (async function* () { yield part; })() };
+      } };
+    const run = native ? internals.runVscodeLmAgent : internals.runVscodeLmTextProtocol;
+    const final = JSON.parse(await run(model, f.req, undefined, f.invoke));
+    assert.deepEqual(f.lines(), ["inserted", "one", "two", "three", "FOUR"]);
+    assert.equal(f.calls.filter(call => call.name.endsWith("_apply")).length, 2);
+    assert.equal(turn, plan.length);
+    assert.deepEqual(final.edits, []);
+    assert.equal(final.creates[0].path, created);
+  }
+}
+
 async function main() {
+  await nf1291ShiftedStageRecovery();
+  await nf1291AuthenticatedStageHandoff();
   await nf1290ProgressingProviderLoopsContinue();
   await nf1275VisibleActivityEndToEnd();
   await nf1255TypedReasoningCannotBecomeProtocolText();

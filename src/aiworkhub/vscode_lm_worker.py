@@ -1564,6 +1564,14 @@ def run(spec_path: Path) -> dict[str, Any]:
             planned, semantic_metrics = _v3_planned_outputs(
                 workspace, edit, allowed, create_paths
             )
+        # Existing files are edited through the coordinator's authenticated
+        # worker prepare/apply session before this final handoff. Python may
+        # materialize new-file exceptions only, never unaudited replacements.
+        for relative, _content in planned:
+            if relative not in create_paths and (workspace / relative).exists():
+                raise RuntimeError(
+                    f"vscode_lm_existing_edit_requires_authenticated_apply:{relative}"
+                )
     except RuntimeError as exc:
         response_bytes = raw_text.encode("utf-8")
         raise RuntimeError(

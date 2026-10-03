@@ -4708,6 +4708,10 @@ class ProcessManager:
         if self.process_log_path.is_file() and self.isolation_enabled:
             self._reconcile_persisted_requests()
         self._reconcile_pending_needfix_closures()
+        self._vscode_lm_tool_locks: dict[str, Any] = {}
+        self._vscode_lm_semantic_sessions: dict[
+            str, tuple[worker_ai_tools_mcp.WorkerToolContext, worker_ai_tools_mcp.WorkerSemanticEditSession]
+        ] = {}
 
     def _default_show_task(self, task_id: str) -> dict[str, Any]:
         """Read from this manager's canonical repository-bound task store."""
@@ -12664,6 +12668,31 @@ class ProcessManager:
         tool_name: str,
         tool_input: dict[str, Any],
     ) -> dict[str, Any]:
+        if not re.fullmatch(r"[a-f0-9]{32}", str(request_id or "")):
+            return {"ok": False, "reason": "worker_bridge_request_id_invalid"}
+        with self._lock:
+            request_lock = self._vscode_lm_tool_locks.setdefault(request_id, threading.RLock())
+        # Independent requests run independently. One request is sequential:
+        # prepared handles and per-call audit provenance form one state machine.
+        with request_lock:
+            try:
+                return self._invoke_vscode_lm_worker_tool_bound(
+                    request_id, tool_name, dict(tool_input) if isinstance(tool_input, dict) else tool_input,
+                )
+            finally:
+                events = self._request_events(request_id)
+                latest = split_lifecycle_tail(events)[0] if events else {}
+                if latest.get("state") not in WORKER_BRIDGE_AUTHORIZED_PROCESS_STATES:
+                    with self._lock:
+                        self._vscode_lm_semantic_sessions.pop(request_id, None)
+                        self._vscode_lm_tool_locks.pop(request_id, None)
+
+    def _invoke_vscode_lm_worker_tool_bound(
+        self,
+        request_id: str,
+        tool_name: str,
+        tool_input: dict[str, Any],
+    ) -> dict[str, Any]:
         """Run one GLM bridge tool through the exact task-scoped worker authority.
 
         The VS Code Language Model API can only call tools through the
@@ -12860,8 +12889,52 @@ class ProcessManager:
         except (KeyError, TypeError, ValueError):
             return {"ok": False, "reason": "worker_bridge_context_invalid"}
 
+        if tool_name in {
+            "aiworkhub_worker_semantic_edit_prepare",
+            "aiworkhub_worker_semantic_edit_apply",
+        }:
+            if tool_name.endswith("_apply") and os.environ.get(ALLOW_WRITES_ENV, "0") != "1":
+                return {"ok": False, "reason": "worker_bridge_write_gate_closed"}
+            identity = replace(ctx, provider_call_id="", provenance="")
+            cached = self._vscode_lm_semantic_sessions.get(request_id)
+            if cached is not None and cached[0] != identity:
+                self._vscode_lm_semantic_sessions.pop(request_id, None)
+                return {"ok": False, "reason": "worker_bridge_semantic_identity_changed"}
+            if cached is None:
+                session = worker_ai_tools_mcp.WorkerSemanticEditSession(ctx)
+                self._vscode_lm_semantic_sessions[request_id] = (identity, session)
+            else:
+                session = cached[1]
+                # The immutable request identity is unchanged; only this call's
+                # authenticated provider provenance changes under the request lock.
+                session.ctx = ctx
+            if tool_name.endswith("_prepare"):
+                return session.prepare(
+                    file_path=tool_input.get("file_path") or tool_input.get("path", ""),
+                    start_line=tool_input.get("start_line", 0),
+                    end_line=tool_input.get("end_line", 0),
+                    include_fragment=tool_input.get("include_fragment") is True,
+                )
+            return session.apply(
+                target_id=tool_input.get("target_id", ""),
+                new=tool_input.get("new"),
+                idempotency_key=tool_input.get("idempotency_key", ""),
+            )
         if tool_name == "aiworkhub_manager_source_graph_query":
-            return worker_ai_tools_mcp.source_graph_query(ctx, **tool_input)
+            identity = replace(ctx, provider_call_id="", provenance="")
+            cached = self._vscode_lm_semantic_sessions.get(request_id)
+            if cached is not None and cached[0] != identity:
+                self._vscode_lm_semantic_sessions.pop(request_id, None)
+                return {"ok": False, "reason": "worker_bridge_semantic_identity_changed"}
+            if cached is None:
+                editor = worker_ai_tools_mcp.WorkerSemanticEditSession(ctx)
+                self._vscode_lm_semantic_sessions[request_id] = (identity, editor)
+            else:
+                editor = cached[1]
+                editor.ctx = ctx
+            result = worker_ai_tools_mcp.source_graph_query(ctx, **tool_input)
+            editor.note_source_graph_delivery(result)
+            return result
         if tool_name == "aiworkhub_manager_semantic_edit_prepare":
             return worker_ai_tools_mcp.WorkerSemanticEditSession(ctx).prepare(
                 # Text-only VS Code LM providers occasionally mirror the final

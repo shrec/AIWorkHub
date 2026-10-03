@@ -3794,13 +3794,14 @@ function _vscodeLmToolScopedName(toolName, requestKind) {
   return toolName;
 }
 
-function vscodeLmToolsForRequest(request, sourceGraphAcknowledged, stageOnly = false) {
+function vscodeLmToolsForRequest(request, sourceGraphAcknowledged, stageOnly = false, recoveryTools = []) {
   const requestKind = request && request.request_kind ? String(request.request_kind) : "manager";
   const all = sourceGraphAcknowledged
     ? VSCODE_LM_PRIVATE_TOOLS
     : [VSCODE_LM_PRIVATE_TOOLS[0], VSCODE_LM_PRIVATE_TOOLS[1]];
   if (stageOnly) {
-    return all.filter((tool) => tool.name === VSCODE_LM_STAGE_EDIT_TOOL);
+    return all.filter(tool => tool.name === VSCODE_LM_STAGE_EDIT_TOOL ||
+      (requestKind === "worker" && recoveryTools.includes(tool.name)));
   }
   if (requestKind === "quality_review") {
     return all.filter((tool) => VSCODE_LM_QUALITY_REVIEW_TOOL_NAMES.has(tool.name));
@@ -4039,16 +4040,17 @@ function glmAgentProtocolPrompt(prompt, allowedWrites, pathContracts = {}) {
     `- Source Graph file lookup: mode=file with query and target both equal to one declared repo-relative path returns source_hash for that file.\n` +
     `- Source Graph body lookup: mode=body with query equal to the exact indexed symbol name and target equal to that file path returns bounded source.\n` +
     `- Use the supplied AIWorkHub Session Manager, AI Memory and KB tools when relevant.\n` +
+    `- Call only advertised tools. This editor adapter does not expose aiworkhub_worker_validation_run or aiworkhub_worker_exit_preflight; never call them or fabricate their results. After the final envelope, the supervisor performs the exact card validation and exit gates before review.\n` +
     `- Complete through ${VSCODE_LM_FINALIZE_EDIT_TOOL}; only the compatibility fallback emits a direct ${VSCODE_LM_EDIT_RESPONSE_SCHEMA} object.\n` +
     `- Never read or emit a complete existing file. Use Source Graph body mode for the smallest exact symbol, then return only its replacement in a line range.\n` +
-    `- Preferred delivery: after body discovery call ${VSCODE_LM_STAGE_EDIT_TOOL} once per smallest replacement or complete new file. The bridge performs hash-bound prepare internally and retains the fragment without writing it.\n` +
-    `- After every intended fragment is staged, call ${VSCODE_LM_FINALIZE_EDIT_TOOL} with only a short truthful summary. Do not resend staged code; the bridge assembles the final envelope offline.\n` +
+    `- Preferred delivery: after body discovery call ${VSCODE_LM_STAGE_EDIT_TOOL} once per smallest replacement or complete new file. For an existing file the bridge executes authenticated worker prepare/apply and retains the durable receipt.\n` +
+    `- After every intended fragment is staged, call ${VSCODE_LM_FINALIZE_EDIT_TOOL} with only a short truthful summary. Do not resend already-applied code; final edits are empty for authenticated applies, while new-file creates remain pending.\n` +
     `- Canonical offline create stage request: {"schema_id":"${VSCODE_LM_TOOL_REQUEST_SCHEMA}","name":"${VSCODE_LM_STAGE_EDIT_TOOL}","input":{"operation":"create","file_path":"<allowed-path>","content":"<full file content>"}}\n` +
-    `- Canonical offline replace-range stage request uses the exact Source Graph range. A one-line pin of line 1 is not a complete replacement: {"schema_id":"${VSCODE_LM_TOOL_REQUEST_SCHEMA}","name":"${VSCODE_LM_STAGE_EDIT_TOOL}","input":{"operation":"replace_range","file_path":"<allowed-path>","start_line":"<source-graph-start>","end_line":"<source-graph-end>","new":"<complete replacement for that range>"}}\n` +
+    `- Canonical authenticated replace-range stage request uses the exact Source Graph range. A one-line pin of line 1 is not a complete replacement: {"schema_id":"${VSCODE_LM_TOOL_REQUEST_SCHEMA}","name":"${VSCODE_LM_STAGE_EDIT_TOOL}","input":{"operation":"replace_range","file_path":"<allowed-path>","start_line":"<source-graph-start>","end_line":"<source-graph-end>","new":"<complete replacement for that range>"}}\n` +
     `- A worker edits an existing file with aiworkhub_worker_semantic_edit_prepare then aiworkhub_worker_semantic_edit_apply. Do not call manager semantic-edit tools.\n` +
     `- Canonical offline finalize request: {"schema_id":"${VSCODE_LM_TOOL_REQUEST_SCHEMA}","name":"${VSCODE_LM_FINALIZE_EDIT_TOOL}","input":{"summary":"<short applied summary>"}}\n` +
     `- Canonical final response: {"schema_id":"${VSCODE_LM_EDIT_RESPONSE_SCHEMA}","summary":"<truthful summary>","edits":[{"path":"<allowed-path>","current_sha256":"<path-contract-sha256>","ranges":[{"start_line":"<source-graph-start>","end_line":"<source-graph-end>","new":"<complete replacement>","preserve_trailing_newline":true}]}],"creates":[{"path":"<new-allowed-path>","content":"<complete new file>"}]}. Use empty edits/creates arrays when that operation is not needed. Stage input operation/file_path fields are not final-response path/ranges fields.\n` +
-    `- Semantic-edit prepare is an internal bridge primitive and is not provider-callable. Stage each replacement with file_path, start_line, end_line, and new; the bridge resolves and binds current_sha256 internally.\n` +
+    `- Worker semantic-edit prepare/apply are provider-callable. Either use their pair or stage a replacement through the bridge, which executes the same authenticated pair. Never submit an offline existing-file replacement.\n` +
     `- Semantic edits must name an allowed path and use non-overlapping 1-based inclusive start_line/end_line values from Source Graph evidence.\n` +
     `- Each new value must contain the complete, substantive replacement for its declared range; it may be empty only for an intentional deletion. Do not echo old code. preserve_trailing_newline defaults true.\n` +
     `- creates must name an allowed path and contain complete, nonempty UTF-8 content. Every path_contract whose action is create MUST appear exactly once in creates.\n` +
@@ -4333,6 +4335,62 @@ function createVscodeLmStagedEditCollector(request) {
   const contractByPath = vscodeLmContractMap(pathContracts);
   const edits = new Map();
   const creates = new Map();
+  const preparedTargets = new Map();
+  let recoveryPath = "";
+  let recoveryTarget = "";
+  let recoveryEvidence = [];
+  let recoveryReadsTotal = 0;
+  const recoveryReads = new Map();
+  const replacementLineCount = value => value === "" ? 0
+    : String(value).replace(/\r\n$|\r$|\n$/, "").split(/\r\n|\r|\n/).length;
+  const recoveryToolNames = () => recoveryPath && request.request_kind === "worker"
+    ? [VSCODE_LM_WORKER_SOURCE_GRAPH_TOOL, "aiworkhub_worker_semantic_edit_prepare", "aiworkhub_worker_semantic_edit_apply"]
+    : [];
+  const allowsRecoveryCall = call => {
+    if (!recoveryToolNames().length) return false;
+    const input = call.input || {};
+    if (call.name === VSCODE_LM_WORKER_SOURCE_GRAPH_TOOL) {
+      return input.mode === "body" && vscodeLmNormalizedPath(input.target) === recoveryPath &&
+        typeof input.query === "string" && input.query.trim() && input.query.length <= 512 &&
+        (input.budget === undefined || (Number.isInteger(input.budget) && input.budget > 0 && input.budget <= 160)) &&
+        (recoveryReads.get(recoveryPath) || 0) < 2 && recoveryReadsTotal < VSCODE_LM_MAX_FORCED_STAGE_READS;
+    }
+    if (call.name === "aiworkhub_worker_semantic_edit_prepare") {
+      const entry = edits.get(recoveryPath);
+      return vscodeLmNormalizedPath(input.file_path || input.path) === recoveryPath &&
+        recoveryEvidence.some(row => row.source_hash === entry.last_sha256 &&
+          row.line_start <= input.start_line && row.line_end >= input.end_line);
+    }
+    return call.name === "aiworkhub_worker_semantic_edit_apply" &&
+      Boolean(recoveryTarget) && input.target_id === recoveryTarget;
+  };
+  const noteRecoverySourceGraph = (call, result) => {
+    if (!recoveryPath || call.name !== VSCODE_LM_WORKER_SOURCE_GRAPH_TOOL ||
+        vscodeLmNormalizedPath(call.input?.target) !== recoveryPath || call.input.mode !== "body") return;
+    recoveryReadsTotal += 1;
+    recoveryReads.set(recoveryPath, (recoveryReads.get(recoveryPath) || 0) + 1);
+    recoveryEvidence = [];
+    if (!result || result.ok !== true || result.tool !== "source_graph" || result.mode !== "body" ||
+        !["canonical", "rework_overlay", "candidate_overlay"].includes(result.authority_source) ||
+        !result.authority_repo) return;
+    // A fresh bounded body is required. Partial pages never authorize a range.
+    let payload;
+    try {
+      if (result.content_encoding === "base64") {
+        const bytes = vscodeLmSourceGraphPageBytes(result);
+        if (!bytes || result.page_count !== 1) return;
+        payload = JSON.parse(bytes.toString("utf8"));
+      } else payload = JSON.parse(result.content);
+    } catch (_err) { return; }
+    recoveryEvidence = (Array.isArray(payload?.matches) ? payload.matches : []).filter(row =>
+      vscodeLmNormalizedPath(row.file_path) === recoveryPath && typeof row.source === "string" &&
+      row.source.length > 0 && row.freshness?.state === "fresh" &&
+      /^[a-f0-9]{64}$/i.test(String(row.freshness.disk_source_hash || "")) &&
+      Number.isInteger(row.line_start) && row.line_start > 0 &&
+      Number.isInteger(row.line_end) && row.line_end >= row.line_start &&
+      row.source.split("\n").length === row.line_end - row.line_start + 1
+    ).map(row => ({ ...row, source_hash: row.freshness.disk_source_hash }));
+  };
   const trackRequired = Array.isArray(request && request.required_outputs);
   const requiredOutputs = [];
   if (trackRequired) {
@@ -4415,7 +4473,7 @@ function createVscodeLmStagedEditCollector(request) {
     }
     return value;
   };
-  const stage = async (rawInput) => {
+  const stage = async (rawInput, authenticate, originalCoordinateBatch = false) => {
     if (!rawInput || typeof rawInput !== "object" || Array.isArray(rawInput)) return reject("input_invalid");
     const input = { ...rawInput };
     if (typeof input.action === "string" && input.action.trim()) {
@@ -4431,6 +4489,7 @@ function createVscodeLmStagedEditCollector(request) {
     if ("start_line" in input) input.start_line = decimalProtocolLine(input.start_line);
     if ("end_line" in input) input.end_line = decimalProtocolLine(input.end_line);
     const operation = String(input.operation || "");
+    if (operation !== "create" && operation !== "replace_range") return reject("operation_invalid");
     const filePath = vscodeLmNormalizedPath(input.file_path);
     if (!filePath || !allowedWrites.some((pattern) => vscodeLmPathMatchesPattern(filePath, pattern))) {
       return reject(`path_not_allowed:${filePath || "missing"}`);
@@ -4462,8 +4521,14 @@ function createVscodeLmStagedEditCollector(request) {
       creates.set(filePath, { path: filePath, content: input.content });
       return boundedReceipt(operation, filePath, input.content, { idempotent_replay: Boolean(existing) });
     }
-    if (operation !== "replace_range") return reject(`operation_invalid:${operation || "missing"}`);
     if (!contract || contract.action !== "edit") return reject(`action_mismatch:${filePath}:replace_range`);
+    if (edits.get(filePath)?.coordinatesShifted && !originalCoordinateBatch) {
+      recoveryPath = filePath;
+      recoveryTarget = "";
+      recoveryEvidence = [];
+      return { ...reject(`coordinates_shifted_requires_fresh_worker_pair:${filePath}`),
+        corrective: true, instruction: "Read a fresh bounded Source Graph body for this path, then call worker semantic-edit prepare/apply using its current coordinates. Do not reuse launch coordinates." };
+    }
     const unknown = unexpectedKeys("replace_range");
     if (unknown.length > 0) return reject(`stage_payload_extra_fields:${filePath}:${unknown.join(",")}`);
     if (!Number.isSafeInteger(input.start_line) || input.start_line < 1 ||
@@ -4478,48 +4543,66 @@ function createVscodeLmStagedEditCollector(request) {
     const fidelity = vscodeLmFidelityError(input.new, filePath, "staged_range");
     if (fidelity) return reject(fidelity);
     if (creates.has(filePath)) return reject(`path_conflict:${filePath}`);
-    // The immutable path contract was computed from this isolated workspace
-    // immediately before launch. No write occurs until the final envelope is
-    // accepted, so staging can bind directly to that canonical hash without a
-    // second MCP round-trip. This keeps the offline editor available even if
-    // the coordinator MCP transport restarts while a provider response is in
-    // flight; final application still revalidates the exact hash and range.
+    // This collector also serves pure validation tests. Production protocols
+    // always supply the request-bound authenticated bridge here; only durable
+    // worker apply receipts complete an existing-file output.
     const currentSha256 = String(contract.current_sha256 || "");
-    if (!/^[0-9a-f]{64}$/.test(currentSha256)) {
-      return reject(`contract_hash_invalid:${filePath}`);
-    }
+    if (!/^[0-9a-f]{64}$/.test(currentSha256)) return reject(`contract_hash_invalid:${filePath}`);
     const entry = edits.get(filePath) || { path: filePath, current_sha256: currentSha256, ranges: [] };
-    if (entry.current_sha256 !== currentSha256) return reject(`hash_conflict:${filePath}`);
-    const exact = entry.ranges.find((range) =>
-      range.start_line === input.start_line && range.end_line === input.end_line
-    );
+    const exact = entry.ranges.find(range =>
+      range.start_line === input.start_line && range.end_line === input.end_line);
     if (exact) {
       if (exact.new !== input.new || exact.preserve_trailing_newline !== (input.preserve_trailing_newline !== false)) {
         return reject(`range_conflict:${filePath}:${input.start_line}:${input.end_line}`);
       }
       return boundedReceipt(operation, filePath, input.new, {
-        current_sha256: currentSha256,
-        start_line: input.start_line,
-        end_line: input.end_line,
-        idempotent_replay: true,
+        current_sha256: currentSha256, start_line: input.start_line, end_line: input.end_line,
+        idempotent_replay: true, ...(exact.mcp_receipt ? { mcp_receipt: exact.mcp_receipt } : {}),
       });
     }
-    if (entry.ranges.some((range) => input.start_line <= range.end_line && input.end_line >= range.start_line)) {
+    if (entry.ranges.some(range => input.start_line <= range.end_line && input.end_line >= range.start_line)) {
       return reject(`range_overlap:${filePath}:${input.start_line}:${input.end_line}`);
     }
-    entry.ranges.push({
-      start_line: input.start_line,
-      end_line: input.end_line,
-      new: input.new,
-      preserve_trailing_newline: input.preserve_trailing_newline !== false,
-    });
+    let mcpReceipt;
+    if (typeof authenticate === "function") {
+      // The native worker editor has fixed trailing-newline semantics. Never
+      // silently reinterpret an explicit unsupported deletion of that newline.
+      if (input.preserve_trailing_newline === false) return reject("preserve_trailing_newline_unsupported");
+      const prepared = await authenticate({ name: "aiworkhub_worker_semantic_edit_prepare",
+        input: { file_path: filePath, start_line: input.start_line, end_line: input.end_line } });
+      const expectedHash = entry.last_sha256 || currentSha256;
+      if (!prepared || prepared.ok !== true) return reject(prepared?.reason || "prepare_failed");
+      if (prepared.path !== filePath || prepared.start_line !== input.start_line ||
+          prepared.end_line !== input.end_line || prepared.current_sha256 !== expectedHash ||
+          !/^[0-9a-f]{64}$/.test(String(prepared.fragment_sha256 || "")) || !prepared.target_id) {
+        return reject(`prepare_identity_mismatch:${filePath}`);
+      }
+      const key = crypto.createHash("sha256").update(JSON.stringify([
+        String(request.requestId || ""), filePath, prepared.target_id, input.new,
+      ])).digest("hex");
+      mcpReceipt = await authenticate({ name: "aiworkhub_worker_semantic_edit_apply",
+        input: { target_id: prepared.target_id, new: input.new, idempotency_key: key } });
+      if (!mcpReceipt || mcpReceipt.ok !== true) return reject(mcpReceipt?.reason || "apply_failed");
+      if (mcpReceipt.schema_id !== "aiworkhub.semantic_edit_apply_receipt.v1" ||
+          mcpReceipt.target_id !== prepared.target_id || mcpReceipt.path !== filePath ||
+          mcpReceipt.before_sha256 !== expectedHash || mcpReceipt.preimage_verified !== true ||
+          mcpReceipt.idempotency_key !== key ||
+          !/^[0-9a-f]{64}$/.test(String(mcpReceipt.after_sha256 || ""))) {
+        return reject(`apply_identity_mismatch:${filePath}`);
+      }
+      entry.applied = true;
+      entry.coordinatesShifted = Boolean(entry.coordinatesShifted) ||
+        replacementLineCount(input.new) !== input.end_line - input.start_line + 1;
+      entry.last_sha256 = mcpReceipt.after_sha256;
+    }
+    entry.ranges.push({ start_line: input.start_line, end_line: input.end_line,
+      new: input.new, preserve_trailing_newline: input.preserve_trailing_newline !== false,
+      ...(mcpReceipt ? { mcp_receipt: mcpReceipt } : {}) });
     entry.ranges.sort((left, right) => left.start_line - right.start_line || left.end_line - right.end_line);
     edits.set(filePath, entry);
     return boundedReceipt(operation, filePath, input.new, {
-      current_sha256: currentSha256,
-      start_line: input.start_line,
-      end_line: input.end_line,
-      idempotent_replay: false,
+      current_sha256: currentSha256, start_line: input.start_line, end_line: input.end_line,
+      idempotent_replay: false, ...(mcpReceipt ? { mcp_receipt: mcpReceipt } : {}),
     });
   };
 
@@ -4549,7 +4632,7 @@ function createVscodeLmStagedEditCollector(request) {
     const envelope = {
       schema_id: VSCODE_LM_EDIT_RESPONSE_SCHEMA,
       summary: String(summary || "").trim(),
-      edits: [...edits.values()],
+      edits: [...edits.values()].filter(edit => !edit.applied),
       creates: [...creates.values()],
     };
     const error = validateVscodeLmFinalEnvelope(envelope, allowedWrites, pathContracts);
@@ -4569,23 +4652,35 @@ function createVscodeLmStagedEditCollector(request) {
   // completed on this provider turn. Reuse the same stage validator so those
   // edits remain authoritative while the protocol asks only for the next
   // missing required path. No raw/direct payload bypasses the stage contract.
-  const ingestFinalEnvelope = async (envelope) => {
+  const ingestFinalEnvelope = async (envelope, authenticate) => {
     if (!envelope || envelope.schema_id !== VSCODE_LM_EDIT_RESPONSE_SCHEMA ||
         !Array.isArray(envelope.edits) || !Array.isArray(envelope.creates)) {
       return reject("final_envelope_invalid");
     }
+    // The descending bypass covers only growth inside this pristine batch.
+    // Inspect every path first so an earlier-sorted path cannot partially apply.
     for (const edit of envelope.edits) {
-      for (const range of edit.ranges) {
+      const filePath = vscodeLmNormalizedPath(edit.path);
+      if (!edits.get(filePath)?.coordinatesShifted) continue;
+      recoveryPath = filePath;
+      recoveryTarget = "";
+      recoveryEvidence = [];
+      return { ...reject(`coordinates_shifted_requires_fresh_worker_pair:${filePath}`),
+        corrective: true, instruction: "Read a fresh bounded Source Graph body for this path, then call worker semantic-edit prepare/apply using its current coordinates. Do not reuse launch coordinates." };
+    }
+    // Descending original coordinates keep earlier edits stable when line counts change.
+    const ranges = envelope.edits.flatMap(edit => edit.ranges.map(range => ({ path: edit.path, range })))
+      .sort((left, right) => left.path.localeCompare(right.path) || right.range.start_line - left.range.start_line);
+    for (const { path: editPath, range } of ranges) {
         const receipt = await stage({
           operation: "replace_range",
-          file_path: edit.path,
+          file_path: editPath,
           start_line: range.start_line,
           end_line: range.end_line,
           new: range.new,
           preserve_trailing_newline: range.preserve_trailing_newline,
-        });
+        }, authenticate, true);
         if (!receipt.ok) return receipt;
-      }
     }
     for (const create of envelope.creates) {
       const receipt = await stage({
@@ -4602,10 +4697,55 @@ function createVscodeLmStagedEditCollector(request) {
     };
   };
 
+  const observeSemanticEdit = (call, result) => {
+    if (!result || result.ok !== true) return false;
+    const input = call.input || {};
+    if (call.name === "aiworkhub_worker_semantic_edit_prepare") {
+      const filePath = vscodeLmNormalizedPath(input.file_path || input.path);
+      if (result.target_id && contractByPath.get(filePath)?.action === "edit") {
+        preparedTargets.set(result.target_id, { path: filePath,
+          start_line: input.start_line, end_line: input.end_line });
+        if (recoveryPath === filePath && result.path === filePath &&
+            result.current_sha256 === edits.get(filePath)?.last_sha256 &&
+            result.start_line === input.start_line && result.end_line === input.end_line &&
+            allowsRecoveryCall(call)) recoveryTarget = result.target_id;
+      }
+      return false;
+    }
+    if (call.name !== "aiworkhub_worker_semantic_edit_apply") return false;
+    const prepared = preparedTargets.get(input.target_id);
+    if (!prepared || result.schema_id !== "aiworkhub.semantic_edit_apply_receipt.v1" ||
+        result.target_id !== input.target_id || result.path !== prepared.path ||
+        result.preimage_verified !== true ||
+        !/^[0-9a-f]{64}$/.test(String(result.before_sha256 || "")) ||
+        !/^[0-9a-f]{64}$/.test(String(result.after_sha256 || ""))) return false;
+    const entry = edits.get(prepared.path) || { path: prepared.path,
+      current_sha256: result.before_sha256, ranges: [] };
+    const expected = entry.last_sha256 || contractByPath.get(prepared.path).current_sha256;
+    if (expected !== result.before_sha256 && !result.idempotent_replay) return false;
+    if (!entry.ranges.some(range => range.mcp_receipt?.target_id === input.target_id)) {
+      entry.ranges.push({ start_line: prepared.start_line, end_line: prepared.end_line,
+        new: input.new, preserve_trailing_newline: true, mcp_receipt: result });
+    }
+    entry.applied = true;
+    entry.coordinatesShifted = Boolean(entry.coordinatesShifted) ||
+      replacementLineCount(input.new) !== prepared.end_line - prepared.start_line + 1;
+    if (recoveryPath === prepared.path && recoveryTarget === input.target_id) {
+      recoveryPath = ""; recoveryTarget = ""; recoveryEvidence = [];
+    }
+    entry.last_sha256 = result.after_sha256;
+    edits.set(prepared.path, entry);
+    return true;
+  };
   return {
     stage,
     finalize,
     ingestFinalEnvelope,
+    observeSemanticEdit,
+    recoveryToolNames,
+    allowsRecoveryCall,
+    noteRecoverySourceGraph,
+    recoveryRequiredOutput: () => recoveryPath ? { path: recoveryPath, action: "replace_range" } : null,
     hasChanges: () => edits.size > 0 || creates.size > 0,
     nextMissingRequired,
   };
@@ -4960,7 +5100,8 @@ function createVscodeLmSourceGraphGuard() {
 async function invokeVscodeLmProtocolTool(call, requestId, invokeTool, stagedEdits, providerCallId = "", sourceGraphGuard = null) {
   const toolName = String(call && call.name || "").trim();
   if (toolName === VSCODE_LM_STAGE_EDIT_TOOL) {
-    const result = await stagedEdits.stage(call.input);
+    const result = await stagedEdits.stage(call.input,
+      (semanticCall) => invokeTool(semanticCall, requestId, providerCallId));
     if (sourceGraphGuard) sourceGraphGuard.staged(result, true);
     return result;
   }
@@ -4974,10 +5115,16 @@ async function invokeVscodeLmProtocolTool(call, requestId, invokeTool, stagedEdi
   if (toolName === VSCODE_LM_WORKER_SOURCE_GRAPH_TOOL) {
     await awaitVscodeLmWorkerSourceGraphReadinessOnce();
   }
+  if (toolName === "aiworkhub_worker_semantic_edit_apply") {
+    const fidelity = vscodeLmFidelityError(call.input && call.input.new, "", "worker_apply");
+    if (fidelity) return { ok: false, reason: fidelity };
+  }
   const result = await invokeTool({ ...call, name: toolName }, requestId, providerCallId);
+  stagedEdits.noteRecoverySourceGraph(call, result);
   if (sourceGraphGuard) sourceGraphGuard.observed(call, result);
-  if (sourceGraphGuard && toolName.startsWith("aiworkhub_worker_semantic_edit_")) {
-    sourceGraphGuard.staged(result);
+  if (toolName.startsWith("aiworkhub_worker_semantic_edit_")) {
+    stagedEdits.observeSemanticEdit(call, result);
+    if (sourceGraphGuard) sourceGraphGuard.staged(result);
   }
   return result;
 }
@@ -6027,12 +6174,19 @@ async function runVscodeLmTextProtocol(
         finalError, vscodeLmContractMap(request.path_contracts),
       );
       const stageRequiredDirectV3 = envelope.schema_id === VSCODE_LM_EDIT_RESPONSE_SCHEMA &&
-        Array.isArray(request.required_outputs) && request.required_outputs.length > 0 &&
-        (!finalError || Boolean(missingCreate));
+        (!finalError || (Boolean(missingCreate) && Array.isArray(request.required_outputs) && request.required_outputs.length > 0));
       if (stageRequiredDirectV3) {
-        const ingested = await stagedEdits.ingestFinalEnvelope(envelope);
+        const ingested = await stagedEdits.ingestFinalEnvelope(envelope,
+          call => invokeTool(call, request.requestId, turnProviderCallId));
         if (!ingested.ok) {
           protocolTrace.push({ turn, phase: "semantic_edit_stage", outcome: ingested.reason });
+          if (ingested.corrective === true &&
+              String(ingested.reason).startsWith("semantic_edit_stage_rejected:coordinates_shifted_requires_fresh_worker_pair:") &&
+              stagedEdits.recoveryToolNames().length > 0) {
+            messages.push(vscode.LanguageModelChatMessage.Assistant([languageModelTextPart(text)]));
+            messages.push(vscode.LanguageModelChatMessage.User(ingested.instruction));
+            continue;
+          }
           throw vscodeLmProtocolFailure(
             "vscode_lm_semantic_edit_stage_required", protocolTrace, lastProtocolPreview,
           );
@@ -6149,10 +6303,13 @@ async function runVscodeLmTextProtocol(
       throw new Error("vscode_lm_text_protocol_schema_mismatch");
     }
     const availableTools = vscodeLmToolsForRequest(
-      request, sourceGraphAcknowledged, forceStagedEdit,
+      request, sourceGraphAcknowledged, forceStagedEdit, stagedEdits.recoveryToolNames(),
     );
-    const permitted = availableTools.find((tool) => tool.name === envelope.name);
-    const nextRequired = forceStagedEdit ? vscodeLmNextMissingRequiredOutput(stagedEdits) : null;
+    const permitted = availableTools.find(tool => tool.name === envelope.name &&
+      (!forceStagedEdit || tool.name === VSCODE_LM_STAGE_EDIT_TOOL ||
+        (tool.name !== expectedSgTool && stagedEdits.allowsRecoveryCall(envelope))));
+    const nextRequired = forceStagedEdit
+      ? (vscodeLmNextMissingRequiredOutput(stagedEdits) || stagedEdits.recoveryRequiredOutput()) : null;
     const stageInput = envelope.input && typeof envelope.input === "object" &&
       !Array.isArray(envelope.input) ? envelope.input : null;
     // Forced staging still needs bounded context. NF-651 allowed exact reads of
@@ -6625,7 +6782,7 @@ async function runVscodeLmAgent(
     }
     const startedWithSourceGraph = sourceGraphAcknowledged;
     const availableTools = vscodeLmToolsForRequest(
-      request, sourceGraphAcknowledged, forceStagedEdit,
+      request, sourceGraphAcknowledged, forceStagedEdit, stagedEdits.recoveryToolNames(),
     );
     const options = vscodeLmLanguageModelRequestOptions(model, request);
     if (!forceFinal) {
@@ -6676,7 +6833,8 @@ async function runVscodeLmAgent(
       }
     }
     if (startedWithSourceGraph) postSourceTurns += 1;
-    if (forceStagedEdit && calls.some((call) => call.name !== VSCODE_LM_STAGE_EDIT_TOOL)) {
+    if (forceStagedEdit && calls.some(call => call.name !== VSCODE_LM_STAGE_EDIT_TOOL &&
+        !stagedEdits.allowsRecoveryCall(call))) {
       const nextMissing = vscodeLmNextMissingRequiredOutput(stagedEdits);
       protocolTrace.push({ turn, phase: "semantic_edit_stage", outcome: "non_stage_tool_rejected" });
       vscodeLmNoteForcedStageFailure(
@@ -6771,12 +6929,19 @@ async function runVscodeLmAgent(
         finalError, vscodeLmContractMap(request.path_contracts),
       );
       const stageRequiredDirectV3 = envelope.schema_id === VSCODE_LM_EDIT_RESPONSE_SCHEMA &&
-        Array.isArray(request.required_outputs) && request.required_outputs.length > 0 &&
-        (!finalError || Boolean(missingCreate));
+        (!finalError || (Boolean(missingCreate) && Array.isArray(request.required_outputs) && request.required_outputs.length > 0));
       if (stageRequiredDirectV3) {
-        const ingested = await stagedEdits.ingestFinalEnvelope(envelope);
+        const ingested = await stagedEdits.ingestFinalEnvelope(envelope,
+          call => invokeTool(call, request.requestId, turnProviderCallId));
         if (!ingested.ok) {
           protocolTrace.push({ turn, phase: "semantic_edit_stage", outcome: ingested.reason });
+          if (ingested.corrective === true &&
+              String(ingested.reason).startsWith("semantic_edit_stage_rejected:coordinates_shifted_requires_fresh_worker_pair:") &&
+              stagedEdits.recoveryToolNames().length > 0) {
+            messages.push(vscode.LanguageModelChatMessage.Assistant([languageModelTextPart(text)]));
+            messages.push(vscode.LanguageModelChatMessage.User(ingested.instruction));
+            continue;
+          }
           throw vscodeLmProtocolFailure(
             "vscode_lm_semantic_edit_stage_required", protocolTrace, lastProtocolPreview,
           );
