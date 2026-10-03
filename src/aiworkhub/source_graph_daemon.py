@@ -236,8 +236,8 @@ def _compare_and_write_build_identity(
 
 
 def _proc_identity(pid: int) -> dict[str, Any] | None:
-    """Return Linux kernel identity without using a liveness-only PID probe."""
-    return platform_io.linux_proc_identity(pid)
+    """Read platform identity without granting cross-instance signal authority."""
+    return platform_io.process_creation_identity(pid)
 
 
 def _cross_instance_identity_supported() -> bool:
@@ -1507,7 +1507,10 @@ class SourceGraphDaemon:
         # never target a recycled PID's unrelated process group.
         pgid = None if platform_io.is_windows() else process.pid
         kernel_identity = _proc_identity(process.pid)
-        identity_kind = "cross_instance" if kernel_identity is not None else "owner_handle"
+        identity_kind = (
+            ("windows_creation" if platform_io.is_windows() else "cross_instance")
+            if kernel_identity is not None else "owner_handle"
+        )
         retained = {
             "schema_id": "aiworkhub.source_graph.build_process.v1",
             "repo_root": str(self.repo_root),
@@ -1553,14 +1556,17 @@ class SourceGraphDaemon:
                     self._build_pgid = None
                 self._build_owner_token = None
             retained = _read_build_identity(self.repo_root)
-            # A verified POSIX owner is normal cross-instance contention.
-            # Windows PID liveness alone cannot authenticate identity, so an
-            # unproven owner remains a fail-closed error.
+            # A creation-stamped Windows writer may be observed as standby;
+            # termination still requires the owning Popen, never this evidence.
             if (
-                not platform_io.is_windows()
-                and retained is not None
+                retained is not None
                 and retained.get("repo_root") == _registry_key(self.repo_root)
                 and retained.get("state") == "running"
+                and (not platform_io.is_windows() or (
+                    retained.get("identity_kind") == "windows_creation"
+                    and isinstance(retained.get("owner_token"), str)
+                    and bool(retained["owner_token"])
+                ))
                 and _identity_matches(retained)
             ):
                 return {"kind": "standby"}

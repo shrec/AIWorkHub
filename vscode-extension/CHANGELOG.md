@@ -1,5 +1,17 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.12.23 — 2026-10-03
+
+### Fixed
+
+- Windows Source Graph writer contention uses a verified process-creation identity through the platform interface; PID-only or unknown identity stays fenced.
+- Foreign-process signalling, private ownership, atomic publication and existing safety gates are unchanged.
+- Canonical OpenCode executable binding and AST closure caching are included. Full sandboxed Muse/MCP startup and Manager Chat end-to-end qualification remain unclaimed.
+
+### Qualification
+
+- Independent component regressions pass; installation, activation and live qualification are separate evidence.
+
 ## 0.12.22 — 2026-10-03
 
 ### Fixed

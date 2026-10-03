@@ -14,6 +14,12 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.12.23
+
+- Windows Source Graph writer contention uses a verified process-creation identity through the platform interface; PID-only or unknown identity stays fenced.
+- Foreign-process signalling, private ownership, atomic publication and existing safety gates are unchanged.
+- Canonical OpenCode executable binding and AST closure caching are included. Full sandboxed Muse/MCP startup and Manager Chat end-to-end qualification remain unclaimed.
+
 ## What's new in 0.12.22
 
 - Explicitly allowed optional outputs can be staged alongside mandatory outputs; mandatory completion is not a second write scope.

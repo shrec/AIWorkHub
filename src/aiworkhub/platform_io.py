@@ -712,6 +712,20 @@ def windows_system_taskkill_path() -> str | None:
         return None
 
 
+def process_creation_identity(pid: int) -> dict[str, Any] | None:
+    """Read process identity; Windows evidence never authorizes signalling."""
+    if not is_windows():
+        return linux_proc_identity(pid)
+    from .runtime_temp import process_start_ticks
+
+    if pid <= 0:
+        return None
+    stamp = process_start_ticks(pid)
+    if stamp is None or stamp <= 0 or not windows_pid_is_alive(pid):
+        return None
+    return {"pid": pid, "pgid": 0, "session_id": 0, "start_ticks": stamp}
+
+
 def linux_proc_identity(pid: int) -> dict[str, Any] | None:
     """Return Linux procfs identity without using a liveness-only PID probe."""
 

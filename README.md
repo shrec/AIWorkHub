@@ -62,6 +62,12 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
+## What's new in 0.12.23
+
+- Windows Source Graph writer contention uses a verified process-creation identity through the platform interface; PID-only or unknown identity stays fenced.
+- Foreign-process signalling, private ownership, atomic publication and existing safety gates are unchanged.
+- Canonical OpenCode executable binding and AST closure caching are included. Full sandboxed Muse/MCP startup and Manager Chat end-to-end qualification remain unclaimed.
+
 ## What's new in 0.12.22
 
 Editor-worker staging now accepts explicitly allowed optional outputs without confusing mandatory completion with filesystem authorization. Exact scope, action contracts, semantic hashes/ranges, content fidelity and required-output completion remain enforced.
