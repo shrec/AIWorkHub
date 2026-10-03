@@ -227,7 +227,27 @@ def test_empty_purge_eligible_count_reflects_only_the_collector_reap(tmp_path, m
     )
     storage_observability._reset_cache_for_tests()
 
-    result = _wait_ready(repo)
+    # This asserts collector counts, not background scheduling latency. Wait for
+    # this repository's real refresh to publish instead of returning a pending
+    # shell when the shared polling helper's two-second deadline expires.
+    refresh_completed = threading.Event()
+    real_refresh = storage_observability._refresh
+
+    def complete_refresh(key, repo_root):
+        try:
+            return real_refresh(key, repo_root)
+        finally:
+            if repo_root == repo:
+                refresh_completed.set()
+
+    monkeypatch.setattr(storage_observability, "_refresh", complete_refresh)
+    storage_observability.snapshot(repo)
+    # This is a deadlock safety guard, not a scan performance deadline: a
+    # producer regression must fail this fixture instead of hanging the suite.
+    assert refresh_completed.wait(10.0), "owned refresh did not complete"
+    result = storage_observability.snapshot(repo)
+    assert result["scan_status"] == "ready", result
+    assert result["errors"] == [], result
     terminal_bounds = result["storage_bounds"]["terminal_log_quarantine"]
 
     # Both batches are purge_eligible, so the pre-fix count would have read 2.
