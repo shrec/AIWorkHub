@@ -6460,7 +6460,23 @@ async function runVscodeLmTextProtocol(
       throw invalidInputError;
     }
     const toolInputBytes = Buffer.byteLength(JSON.stringify(envelope.input), "utf8");
-    const toolInputTooLarge = toolInputBytes > VSCODE_LM_MAX_EMULATED_TOOL_INPUT_BYTES;
+    // Complete creates cannot be chunked. Reserve 1KiB of the existing transport
+    // ceiling for the request envelope; all other inputs retain the 16KiB cap.
+    const createPath = vscodeLmNormalizedPath(envelope.input.file_path || envelope.input.path);
+    const completeCreate = envelope.name === VSCODE_LM_STAGE_EDIT_TOOL &&
+      (envelope.input.operation || envelope.input.action) === "create" &&
+      (!envelope.input.action || envelope.input.action === "create") &&
+      (!envelope.input.path || !envelope.input.file_path || envelope.input.path === envelope.input.file_path) &&
+      Object.keys(envelope.input).every(key => ["operation", "action", "file_path", "path", "content"].includes(key)) &&
+      typeof envelope.input.content === "string" &&
+      vscodeLmContractMap(request.path_contracts).get(createPath)?.action === "create" &&
+      request.allowedWrites.some(pattern => vscodeLmPathMatchesPattern(createPath, pattern)) &&
+      (!Array.isArray(request.required_outputs) || request.required_outputs.length === 0 ||
+        request.required_outputs.some(item => vscodeLmNormalizedPath(item) === createPath)) &&
+      !vscodeLmFidelityError(envelope.input.content, createPath, "staged_create", { create: true });
+    const toolInputMaxBytes = completeCreate
+      ? VSCODE_LM_MAX_EMULATED_RESPONSE_BYTES - 1024 : VSCODE_LM_MAX_EMULATED_TOOL_INPUT_BYTES;
+    const toolInputTooLarge = toolInputBytes > toolInputMaxBytes;
     if (toolInputTooLarge) {
       protocolTrace.push({
         turn,
@@ -6468,7 +6484,7 @@ async function runVscodeLmTextProtocol(
         outcome: "vscode_lm_tool_input_too_large",
         tool_name: String(envelope.name || "unknown").slice(0, 120),
         actual_bytes: toolInputBytes,
-        max_bytes: VSCODE_LM_MAX_EMULATED_TOOL_INPUT_BYTES,
+        max_bytes: toolInputMaxBytes,
       });
     }
     let result;
@@ -6485,7 +6501,7 @@ async function runVscodeLmTextProtocol(
           ok: false,
           error: "vscode_lm_tool_input_too_large",
           actual_bytes: toolInputBytes,
-          max_bytes: VSCODE_LM_MAX_EMULATED_TOOL_INPUT_BYTES,
+          max_bytes: toolInputMaxBytes,
         };
       } else {
         if (envelope.name === VSCODE_LM_STAGE_EDIT_TOOL) {

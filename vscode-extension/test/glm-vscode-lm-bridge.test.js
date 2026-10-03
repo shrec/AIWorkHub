@@ -3828,6 +3828,72 @@ async function nf968InvalidJsonOneCorrectionChecks() {
 }
 
 async function nf179ForcedStageRecoveryChecks() {
+  // NF1303: exercise complete-create authorization through emulated dispatch.
+  const createTool = "aiworkhub_manager_semantic_edit_stage";
+  const createInput = { operation: "create", file_path: "out/large.json", content: "" };
+  const inputBytes = input => Buffer.byteLength(JSON.stringify(input), "utf8");
+  const createRequest = {
+    requestId: "1303".repeat(8), request_kind: "worker", prompt: "complete create",
+    allowedWrites: [createInput.file_path], required_outputs: [createInput.file_path],
+    path_contracts: { [createInput.file_path]: { action: "create", line_count: 0,
+      current_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      parent_existed: false } },
+    initial_source_graph_request: { mode: "focus", query: "complete create" },
+    initial_source_graph_result: { ok: true, content: "graph" },
+  };
+  const runCreate = async (input, override = {}) => {
+    let turns = 0;
+    const results = [];
+    const calls = [];
+    const model = { capabilities: { toolCalling: false }, sendRequest: async () => {
+      turns += 1;
+      const value = JSON.stringify({ schema_id: internals.constants.VSCODE_LM_TOOL_REQUEST_SCHEMA,
+        name: createTool, input });
+      return { stream: (async function* () { yield { value }; }()) };
+    } };
+    let value;
+    let error;
+    try {
+      value = await internals.runVscodeLmAgent(model, { ...createRequest, ...override }, undefined,
+        async call => { calls.push(call); throw new Error("unexpected external create"); },
+        (_name, event) => { if (event.tool_result) results.push(event.tool_result); });
+    } catch (cause) { error = cause; }
+    return { value, error, turns, results, calls };
+  };
+  for (const measured of [16988, 19503]) {
+    const input = { ...createInput, content: "x".repeat(measured - inputBytes(createInput)) };
+    assert.strictEqual(inputBytes(input), measured);
+    const run = await runCreate(input);
+    assert.ifError(run.error);
+    assert.strictEqual(JSON.parse(run.value).creates[0].content, input.content);
+    assert.strictEqual(run.calls.length, 0, "create remains pending canonical acceptance");
+  }
+  const bound = 256 * 1024 - 1024;
+  const unicode = { ...createInput, content: "é\n\"".repeat(5000) };
+  unicode.content += "x".repeat(bound - inputBytes(unicode));
+  assert.strictEqual(inputBytes(unicode), bound);
+  const boundary = await runCreate(unicode);
+  assert.ifError(boundary.error);
+  assert.strictEqual(JSON.parse(boundary.value).creates[0].content, unicode.content);
+  const tooLarge = await runCreate({ ...unicode, content: unicode.content + "é" });
+  assert.ok(tooLarge.error);
+  assert.strictEqual(tooLarge.turns, 2);
+  assert.strictEqual(tooLarge.calls.length, 0);
+  assert.ok(tooLarge.results.every(result => result.max_bytes === bound));
+  const large = { ...createInput, content: "x".repeat(19000) };
+  for (const input of [ { ...large, extra: true }, { ...large, operation: "unknown" },
+      { ...large, operation: "replace_range", new: large.content },
+      { ...large, file_path: "out/unallowed.json" } ]) {
+    const run = await runCreate(input);
+    assert.ok(run.error);
+    assert.strictEqual(run.calls.length, 0);
+    assert.ok(run.results.every(result => result.max_bytes === 16 * 1024));
+  }
+  const editContract = await runCreate(large, { path_contracts: {
+    [createInput.file_path]: { action: "edit", current_sha256: "a".repeat(64), line_count: 1 } } });
+  assert.ok(editContract.error);
+  assert.strictEqual(editContract.calls.length, 0);
+  assert.ok(editContract.results.every(result => result.max_bytes === 16 * 1024));
   const request = {
     requestId: "7".repeat(32),
     request_kind: "worker",
