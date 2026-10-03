@@ -1237,6 +1237,7 @@ def test_path_contract_line_count_matches_semantic_edit_lines(
     (workspace / "trailing.py").write_text("one\ntwo\n", encoding="utf-8")
     (workspace / "no_trailing.py").write_text("one\ntwo", encoding="utf-8")
     (workspace / "empty.py").write_bytes(b"")
+    (workspace / "crlf.py").write_bytes(b"one\r\ntwo\r\n")
 
     request = vscode_lm_bridge.create_request(
         repo=repo,
@@ -1245,13 +1246,14 @@ def test_path_contract_line_count_matches_semantic_edit_lines(
         workspace_home=home,
         prompt="bounded",
         model="glm-5.2",
-        allowed_writes=["trailing.py", "no_trailing.py", "empty.py"],
+        allowed_writes=["trailing.py", "no_trailing.py", "empty.py", "crlf.py"],
         timeout_seconds=30,
     )
     contracts = json.loads(request.request_path.read_text(encoding="utf-8"))["path_contracts"]
     assert contracts["trailing.py"]["line_count"] == 2
     assert contracts["no_trailing.py"]["line_count"] == 2
     assert contracts["empty.py"]["line_count"] == 0
+    assert contracts["crlf.py"]["line_count"] == 2
 
 
 def test_worker_rejects_whole_mixed_scope_response_before_writing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
