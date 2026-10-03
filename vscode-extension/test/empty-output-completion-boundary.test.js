@@ -100,3 +100,75 @@ for (const toolCalling of [false, true]) {
 test("the existing global provider-turn safety bound is unchanged", () => {
   assert.equal(bridge.constants.VSCODE_LM_MAX_AGENT_TURNS, 24);
 });
+
+for (const toolCalling of [false, true]) {
+  test(`${toolCalling ? "native" : "text"}: eighteen genuine body reads can stage and explicitly finish`, async () => {
+    const calls = Array.from({ length: 18 }, (_, n) => ({
+      name: "aiworkhub_worker_source_graph_query",
+      input: { mode: "body", query: `app.f${n}`, target: "src/app.py" },
+    }));
+    calls.push({ name: stageName, input: create }, { name: stageName, input: edit }, { name: finishName, input: { summary: "Verified production edit" } });
+    const model = modelFor(toolCalling, calls);
+    let reads = 0;
+    const run = toolCalling ? bridge.runVscodeLmAgent : bridge.runVscodeLmTextProtocol;
+    const result = JSON.parse(await run(model, request(), undefined, async () => ({
+      ok: true, tool: "source_graph", mode: "body", authority_source: "canonical",
+      authority_repo: "D:/Dev/AIWorkHub", hit_count: 1,
+      content: JSON.stringify({ matches: [{
+        file_path: "src/app.py", source_hash: "a".repeat(64), line_start: ++reads,
+        line_end: reads, source: `def f${reads}(): pass`, qualname: `app.f${reads}`,
+      }] }),
+    })));
+    assert.equal(reads, 18);
+    assert.equal(model.turns, 21);
+    assert.equal(result.edits[0].ranges[0].new, "run_feature()");
+    assert.equal(result.summary, "Verified production edit");
+  });
+}
+
+const crypto = require("node:crypto");
+const hash = (bytes) => crypto.createHash("sha256").update(bytes).digest("hex");
+for (const toolCalling of [false, true]) for (const withTarget of [true, false]) {
+  test(`${toolCalling ? "native" : "text"}: eighteen verified base64 body pages reach production staging${withTarget ? "" : " without target"}`, async () => {
+    const bytes = Buffer.from(JSON.stringify({ matches: [{
+      file_path: "src/app.py", line_start: 1, line_end: 2,
+      source_hash: "a".repeat(64), source: Array.from({ length: 100 }, (_, n) => `# ქართული ${n}\n`).join(""),
+    }] }));
+    const size = Math.ceil(bytes.length / 18);
+    const contentHash = hash(bytes);
+    // Test-only signer: production cursor authentication remains in the backend.
+    const cursor = (page) => {
+      const fields = { content_sha256: contentHash, page_index: page,
+        schema_id: "aiworkhub.task_mcp.source_graph_continuation.v1", store_id: "test-store" };
+      const hmac_sha256 = crypto.createHmac("sha256", "test-only-key")
+        .update(JSON.stringify(fields)).digest("hex");
+      const token = { ...fields, hmac_sha256 };
+      return Buffer.from(JSON.stringify(token, Object.keys(token).sort()))
+        .toString("base64").replace(/\+/g, "-").replace(/\//g, "_");
+    };
+    const calls = Array.from({ length: 18 }, (_, page) => ({
+      name: "aiworkhub_worker_source_graph_query",
+      input: { mode: "body", query: "src/aiworkhub/core.py.reroute_launch_identity", ...(withTarget ? { target: "src/app.py" } : {}),
+        ...(page ? { continuation_cursor: cursor(page) } : {}) },
+    }));
+    calls.push({ name: stageName, input: create }, { name: stageName, input: edit },
+      { name: finishName, input: { summary: "Paged body completed" } });
+    let reads = 0;
+    const model = modelFor(toolCalling, calls);
+    const run = toolCalling ? bridge.runVscodeLmAgent : bridge.runVscodeLmTextProtocol;
+    const result = JSON.parse(await run(model, request(), undefined, async () => {
+      const page = reads++;
+      const chunk = bytes.subarray(page * size, (page + 1) * size);
+      return { ok: true, tool: "source_graph", mode: "body", authority_source: "canonical",
+        authority_repo: "D:/Dev/AIWorkHub", hit_count: 1, target: withTarget ? "src/app.py" : null,
+        content_encoding: "base64", content: chunk.toString("base64"),
+        content_sha256: contentHash, page_sha256: hash(chunk), page_index: page,
+        page_count: 18, bytes: chunk.length, full_bytes: bytes.length,
+        continuation_cursor: page < 17 ? cursor(page + 1) : null };
+    }));
+    assert.equal(reads, 18);
+    assert.equal(model.turns, 21);
+    assert.equal(result.edits[0].ranges[0].new, "run_feature()");
+    assert.equal(result.summary, "Paged body completed");
+  });
+}

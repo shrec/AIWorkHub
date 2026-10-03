@@ -4670,41 +4670,37 @@ async function awaitVscodeLmWorkerSourceGraphReadinessOnce() {
   throw new Error("vscode_lm_mcp_unavailable");
 }
 
-// NF-2026-01179: this is a *without-edit* budget, not a discovery budget, so it
-// may never be smaller than the discovery the protocol itself authorises. The
-// protocol grants VSCODE_LM_MAX_POST_SOURCE_TURNS post-source turns before it
-// tries to force a phase change -- and NF-2026-00988 keeps valid discovery
-// available past that point while nothing is staged -- plus
-// VSCODE_LM_MAX_FORCED_STAGE_READS bounded declared-file reads once forced
-// staging begins. Their sum is therefore the largest number of Source Graph
-// calls a *progressing* request can legitimately make before its first staged
-// edit. At 6 the guard fired inside the 12-turn orientation phase and preempted
-// the typed forced-stage receipts (read cap -> stage_required ->
-// source_graph_duplicate -> no_progress) that the same guard exists to reach.
-// One call past the sum is provably a spin: it still fails closed as
-// vscode_lm_source_graph_no_progress at turn 17 of VSCODE_LM_MAX_AGENT_TURNS,
-// instead of the measured 23 discovery turns that ended in the untruthful
-// vscode_lm_agent_turn_limit.
+// Keep the NF-1179 discovery allowance: 12 orientation reads plus 4 forced
+// stage reads. It bounds requests without novel source evidence or a staged
+// edit, not successful discovery itself (NF-1260). The global 24-turn bound
+// still limits progressing requests; forced-stage limits are unchanged.
 const VSCODE_LM_MAX_SOURCE_GRAPH_WITHOUT_EDIT =
   VSCODE_LM_MAX_POST_SOURCE_TURNS + VSCODE_LM_MAX_FORCED_STAGE_READS;
 
-// Both halves count every request, with no "does it still owe a declared output"
-// exemption. The sum above is the most Source Graph calls *any* progressing
-// request can make before its first staged edit, so one call past it is a spin
-// in every shape -- and the shape with no declared required output is the one
-// that needs the guard most, not least: for a writable request the protocol
-// never forces a phase change while nothing is staged, so its only other bound
-// is VSCODE_LM_MAX_AGENT_TURNS, which reports the untruthful
-// vscode_lm_agent_turn_limit. Counting only while a required output is owed
-// silently switched the whole protection off for exactly that case. Nothing
-// legitimate is caught in exchange: valid discovery stays available up to the
-// sum (NF-2026-00988), a successful stage resets the counter below, and after
-// the discovery phase the protocol caps further reads at
-// VSCODE_LM_MAX_FORCED_STAGE_READS or drives the request into finalization.
+// Validate the backend's byte-page contract, not a partially decoded JSON page.
+function vscodeLmSourceGraphPageBytes(result) {
+  if (typeof result.content !== "string" ||
+      !/^[A-Za-z0-9+/]*={0,2}$/.test(result.content) ||
+      !/^[a-f0-9]{64}$/i.test(result.content_sha256 || "") ||
+      !/^[a-f0-9]{64}$/i.test(result.page_sha256 || "") ||
+      !Number.isInteger(result.page_index) || result.page_index < 0 ||
+      !Number.isInteger(result.page_count) || result.page_index >= result.page_count ||
+      !Number.isInteger(result.full_bytes) || result.full_bytes < result.bytes ||
+      !Number.isInteger(result.bytes) || result.bytes < 1) return null;
+  const bytes = Buffer.from(result.content, "base64");
+  if (bytes.length !== result.bytes || bytes.toString("base64") !== result.content ||
+      crypto.createHash("sha256").update(bytes).digest("hex") !== result.page_sha256) return null;
+  return bytes;
+}
+
+// Distinct requests alone are not progress. Novel backend source evidence
+// resets the bounded no-progress streak; duplicates and all protocol limits remain.
 function createVscodeLmSourceGraphGuard() {
   let lastIdentity = "";
   let duplicates = 0;
   let callsSinceEdit = 0;
+  const seenEvidence = new Set();
+  const pages = new Map();
   const raw = (value) => String(value == null ? "" : value);
   const normalize = (value) => raw(value).trim();
   const identityFor = (call) => {
@@ -4747,6 +4743,59 @@ function createVscodeLmSourceGraphGuard() {
         corrective: true,
       };
     },
+
+    observed(call, result) {
+      // Only backend replies reaching this shared dispatcher can earn progress;
+      // query/cursor/receipt churn and generic ok envelopes never do.
+      if (!identityFor(call) || !result || result.ok !== true ||
+          result.tool !== "source_graph" ||
+          !["canonical", "rework_overlay", "candidate_overlay"].includes(result.authority_source) ||
+          !normalize(result.authority_repo) ||
+          normalize(result.mode) !== normalize(call.input && call.input.mode)) return;
+      const keys = [];
+      if (result.content_encoding === "base64") {
+        const chunk = vscodeLmSourceGraphPageBytes(result);
+        const input = call.input || {};
+        const chainIdentity = JSON.stringify([call.name, input.mode, input.query, input.target,
+          result.authority_source, result.authority_repo, result.page_count, result.full_bytes]);
+        const prior = pages.get(result.content_sha256);
+        const cursor = normalize(input.continuation_cursor);
+        if (!chunk || !["body", "file", "function", "class"].includes(result.mode) ||
+            !(result.hit_count > 0) || !normalize(input.query) ||
+            (result.page_index === 0 ? Boolean(cursor) : (!cursor || !prior ||
+              prior.identity !== chainIdentity || prior.nextIndex !== result.page_index ||
+              prior.cursor !== cursor))) return;
+        pages.set(result.content_sha256, {
+          identity: chainIdentity, nextIndex: result.page_index + 1,
+          cursor: normalize(result.continuation_cursor),
+        });
+        // A chunk may split UTF-8 or JSON. Hash its verified raw bytes, never
+        // truncate/decode it into a guessed source record.
+        keys.push("page:" + result.page_sha256);
+      } else {
+        let payload;
+        try { payload = JSON.parse(result.content); } catch (_err) { return; }
+        if (!payload || !Array.isArray(payload.matches)) return;
+        for (const row of payload.matches) {
+          if (!row || !normalize(row.file_path) ||
+              !Number.isInteger(row.line_start) || row.line_start < 1 ||
+              !Number.isInteger(row.line_end) || row.line_end < row.line_start ||
+              row.freshness && ["stale", "missing"].includes(row.freshness.state)) continue;
+          const sourceHash = row.source_hash || row.freshness && row.freshness.disk_source_hash || "";
+          const source = normalize(row.source);
+          const indexed = normalize(row.qualname) && normalize(row.kind) &&
+            normalize(row.signature);
+          if (!(source && /^[a-f0-9]{64}$/i.test(sourceHash)) && !indexed) continue;
+          keys.push(JSON.stringify([row.file_path, sourceHash, row.line_start,
+            row.line_end, row.qualname || "", source || row.signature]));
+        }
+      }
+      let progressed = false;
+      for (const key of keys) {
+        if (!seenEvidence.has(key)) { seenEvidence.add(key); progressed = true; }
+      }
+      if (progressed) callsSinceEdit = 0;
+    },
     staged(result) {
       if (result && result.ok === true && result.idempotent_replay !== true) {
         lastIdentity = "";
@@ -4775,6 +4824,7 @@ async function invokeVscodeLmProtocolTool(call, requestId, invokeTool, stagedEdi
     await awaitVscodeLmWorkerSourceGraphReadinessOnce();
   }
   const result = await invokeTool({ ...call, name: toolName }, requestId, providerCallId);
+  if (sourceGraphGuard) sourceGraphGuard.observed(call, result);
   if (sourceGraphGuard && toolName.startsWith("aiworkhub_worker_semantic_edit_")) {
     sourceGraphGuard.staged(result);
   }
