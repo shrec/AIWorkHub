@@ -4717,6 +4717,7 @@ function createVscodeLmSourceGraphGuard() {
       name, mode, mode === "bodygrep" ? raw(input.query) : normalize(input.query),
       normalize(input.target).replace(/\\/g, "/"), normalize(input.workflow_stage).toLowerCase(),
       normalize(input.bundle_type).toLowerCase(),
+      normalize(input.cursor), normalize(input.continuation_cursor),
     ]);
   };
   return {
