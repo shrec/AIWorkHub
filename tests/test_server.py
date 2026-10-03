@@ -18,6 +18,85 @@ if str(_SRC) not in sys.path:
 from aiworkhub import server  # noqa: E402
 
 
+def test_needfix_closed_gate_refuses_before_normalization_or_storage(monkeypatch) -> None:
+    monkeypatch.setattr(server.core, "writes_allowed", lambda: False)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("closed gate touched normalization, repository or storage")
+
+    monkeypatch.setattr(server.needfix_store, "normalize_kind", forbidden)
+    monkeypatch.setattr(server.core, "repo_root", forbidden)
+    monkeypatch.setattr(server.core, "needfix_add", forbidden)
+    monkeypatch.setattr(server.needfix_store, "update_needfix", forbidden)
+    expected = {"ok": False, "error": "write_gate_closed"}
+    assert server.needfix_add("closed", "closed", kind="observability") == expected
+    assert server.needfix_update("missing", kind="observability") == expected
+
+
+def test_needfix_closed_startup_sdk_and_dependency_free_dispatch(tmp_path) -> None:
+    script = """
+import asyncio
+import importlib.util
+import json
+import os
+import sys
+from pathlib import Path
+from aiworkhub import needfix_store, task_store
+root = Path(sys.argv[1])
+root.mkdir()
+assert task_store.initialize_repository(root)["ok"]
+seed = needfix_store.add_needfix(root, title="Fixture seed", description="Existing row before closed startup")
+os.environ["AIWORKHUB_REPO"] = str(root)
+from aiworkhub import server
+assert not server.core.writes_allowed()
+# Same manager identity stub as _difficulty_repo; this is not live auth evidence.
+server.core._claude_manager_identity = lambda: None
+server.core._codex_manager_identity = lambda: {
+    "provider": "codex", "session_id": "019f5097-6dbe-7172-870a-945afc5f3bfa",
+    "thread_id": "019f5097-6dbe-7172-870a-945afc5f3bfa",
+}
+before_count = server.core.needfix_count()
+before_row = needfix_store.get_needfix(root, seed["id"])
+originals = (
+    (server.core, "repo_root", server.core.repo_root),
+    (server.core, "needfix_add", server.core.needfix_add),
+    (needfix_store, "normalize_kind", needfix_store.normalize_kind),
+    (needfix_store, "update_needfix", needfix_store.update_needfix),
+)
+def forbidden(*args, **kwargs):
+    raise AssertionError("closed dispatch accessed normalization, repository or storage")
+for module, name, original in originals:
+    setattr(module, name, forbidden)
+for name, arguments in (
+    ("needfix_add", {"title": "Closed startup", "description": "Must not persist"}),
+    ("needfix_update", {"needfix_id": seed["id"], "title": "Must not change"}),
+):
+    if server._MCP_SDK_AVAILABLE:
+        result = asyncio.run(server.mcp._tool_manager.get_tool(name).run(arguments))
+    else:
+        assert importlib.util.find_spec("mcp") is None
+        assert importlib.util.find_spec("pydantic") is None
+        envelope = server._stdio_tools_call(server.mcp._tools, {"name": name, "arguments": arguments})
+        result = json.loads(envelope["content"][0]["text"])
+    assert result == {"ok": False, "error": "write_gate_closed"}, result
+for module, name, original in originals:
+    setattr(module, name, original)
+assert server.core.needfix_count() == before_count == 1
+assert needfix_store.get_needfix(root, seed["id"]) == before_row
+print("closed startup unchanged")
+"""
+    for backend in ("sdk", "stdlib"):
+        env = dict(os.environ, AIWORKHUB_ALLOW_WRITES="0", PYTHONPATH=str(_SRC))
+        env["AIWORKHUB_MCP_STDIO_BACKEND"] = backend
+        argv = [sys.executable] + (["-S"] if backend == "stdlib" else [])
+        result = subprocess.run(
+            argv + ["-c", script, str(tmp_path / backend)], env=env,
+            capture_output=True, text=True, timeout=30,
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "closed startup unchanged"
+
+
 def test_needfix_schema_hints_stdlib_keeps_dependency_free_types() -> None:
     env = dict(os.environ, AIWORKHUB_MCP_STDIO_BACKEND="stdlib", PYTHONPATH=str(_SRC))
     script = """
@@ -451,6 +530,7 @@ def test_sdlc_metrics_tool_is_read_only_forwarder(monkeypatch, tmp_path: Path) -
 def test_needfix_caused_by_verifies_real_canonical_accepted_task(
     monkeypatch, tmp_path: Path
 ) -> None:
+    monkeypatch.setenv("AIWORKHUB_ALLOW_WRITES", "1")
     db_path = tmp_path / "task.sqlite"
     conn = sqlite3.connect(db_path)
     conn.executescript(server.task_store.SCHEMA)

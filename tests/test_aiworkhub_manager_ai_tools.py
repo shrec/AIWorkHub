@@ -1182,6 +1182,28 @@ def test_task_create_normalizes_declared_difficulty_case_and_space(
     assert card["difficulty_origin"] == "declared"
 
 
+def test_needfix_sdk_gate_rechecks_same_process_after_open_to_closed(tmp_path, monkeypatch):
+    import asyncio
+    from aiworkhub import needfix_store
+
+    root = _difficulty_repo(tmp_path, monkeypatch)
+    add = server.mcp._tool_manager.get_tool("needfix_add")
+    update = server.mcp._tool_manager.get_tool("needfix_update")
+    created = asyncio.run(add.run({"title": "Open fixture", "description": "Open gate", "kind": " Defect "}))
+    identity = created["id"]
+    assert created["kind"] == "bug"
+    before = needfix_store.get_needfix(root, identity)
+    assert core.needfix_count() == 1
+    monkeypatch.setenv("AIWORKHUB_ALLOW_WRITES", "0")
+    for tool, arguments in (
+        (add, {"title": "Closed fixture", "description": "Must not persist"}),
+        (update, {"needfix_id": identity, "kind": " GAP "}),
+    ):
+        assert asyncio.run(tool.run(arguments)) == {"ok": False, "error": "write_gate_closed"}
+    assert core.needfix_count() == 1
+    assert needfix_store.get_needfix(root, identity) == before
+
+
 def test_needfix_schema_hints_publish_authoritative_choices_without_constraints():
     import asyncio
     from aiworkhub import needfix_store

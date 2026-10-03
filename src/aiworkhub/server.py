@@ -5370,6 +5370,8 @@ def needfix_add(
     (the existing row is returned, nothing new is written), kind_normalized.
     The row itself is one ``needfix_show`` away.
     """
+    if not core.writes_allowed():
+        return {"ok": False, "error": "write_gate_closed"}
     canonical_kind, kind_normalized = needfix_store.normalize_kind(kind)
     before = _utc_now_iso()
     kwargs = {
@@ -5466,6 +5468,8 @@ def needfix_update(
     kind_normalized. The ``updated`` audit event records the same
     fields_changed plus the evidence sha256 before and after.
     """
+    if not core.writes_allowed():
+        return {"ok": False, "error": "write_gate_closed"}
     canonical_kind: str | None = None
     kind_normalized: dict[str, str] | None = None
     if kind is not None:
