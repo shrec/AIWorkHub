@@ -4967,13 +4967,13 @@ def test_windows_metadata_probe_uses_atomic_replace_not_posix_chmod(
     assert list(tmp_path.iterdir()) == []
 
 
-def test_windows_scratch_prefers_request_private_home(
+def test_windows_scratch_prefers_repo_local_temp(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     workspace = _bare_workspace(tmp_path, "windows-private-home")
     fallback = tmp_path / "global-temp"
     fallback.mkdir()
-    monkeypatch.setattr(worker_workspace.sys, "platform", "win32")
+    monkeypatch.setattr(worker_workspace, "is_windows", lambda: True)
     monkeypatch.delenv(
         worker_workspace.VALIDATION_EXEC_SCRATCH_ROOT_ENV, raising=False
     )
@@ -4989,7 +4989,9 @@ def test_windows_scratch_prefers_request_private_home(
 
     scratch = worker_workspace.provision_validation_exec_scratch(workspace)
     try:
-        assert scratch.parent == workspace.home.resolve()
+        assert scratch.parent == (
+            workspace.repo / ".aiworkhub" / "temp" / "validation"
+        ).resolve()
     finally:
         worker_workspace.cleanup_validation_exec_scratch(scratch)
 
@@ -5014,7 +5016,7 @@ def test_provision_validation_exec_scratch_skips_metadata_hostile_root(
 ) -> None:
     """A /dev/shm-like root that execs but rejects chmod must be skipped in
     favour of the next chmod-capable candidate, never handed back."""
-    monkeypatch.setattr(worker_workspace.sys, "platform", "linux")
+    monkeypatch.setattr(worker_workspace, "is_windows", lambda: False)
     hostile = tmp_path / "shm-like"
     portable = tmp_path / "tmp-like"
     hostile.mkdir()
