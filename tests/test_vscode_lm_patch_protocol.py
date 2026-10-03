@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from aiworkhub import vscode_lm_bridge, vscode_lm_worker
+from aiworkhub import process_launcher, task_store, vscode_lm_bridge, vscode_lm_worker, worker_ai_tools_mcp
 
 
 def _request(
@@ -78,7 +78,80 @@ def _v3(
     }
 
 
-def test_v3_applies_only_bounded_line_range_and_reports_accounting(tmp_path: Path) -> None:
+def _authenticated_handoff(
+    spec_path: Path, relative: str, start: int, end: int, new: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> dict[str, object]:
+    """Real coordinator/session/HMAC apply in synthetic, test-owned storage."""
+    spec = json.loads(spec_path.read_text(encoding="utf-8"))
+    workspace = Path(spec["workspace_path"])
+    home = spec_path.parent
+    request_id = spec["request_id"]
+    repo = workspace.parent / "authority"
+    repo.mkdir()
+    task_store.initialize_repository(repo)
+    process_dir = repo / ".aiworkhub" / "runtime" / "processes"
+    process_dir.mkdir(parents=True)
+    ledger, key = home / "audit.jsonl", home / "audit.key"
+    ledger.write_text("", encoding="utf-8")
+    key.write_bytes(b"synthetic-test-audit-key-32-bytes!")
+    metadata_path = process_dir / f"{request_id}.request.json"
+    metadata_path.write_text(json.dumps({
+        "request_id": request_id, "task_id": "NF1298_PATCH_TEST",
+        "runner": "editor_test", "topic": "patch_protocol", "adapter_id": "glm_vscode_lm",
+        "workspace": {"path": str(workspace), "home": str(home)},
+        "worker_mcp": {
+            "authority_repo": str(repo), "source_graph_targets": [relative],
+            "allowed_writes": spec["allowed_writes"], "session_topic": "patch_protocol",
+            "audit_ledger_path": str(ledger), "audit_hmac_key_path": str(key),
+        },
+    }), encoding="utf-8")
+    manager = process_launcher.ProcessManager(
+        repo=repo, process_log_path=repo / "events.jsonl",
+        process_dir=process_dir, isolation_enabled=False,
+    )
+    event = {"request_id": request_id, "adapter_id": "glm_vscode_lm",
+             "state": "running", "metadata_path": str(metadata_path)}
+    monkeypatch.setattr(manager, "_request_events", lambda rid: [event] if rid == request_id else [])
+    monkeypatch.setenv(process_launcher.ALLOW_WRITES_ENV, "1")
+    prepared = manager.invoke_vscode_lm_worker_tool(
+        request_id, "aiworkhub_worker_semantic_edit_prepare",
+        {"file_path": relative, "start_line": start, "end_line": end,
+         "provider_call_id": "nf1298.prepare"},
+    )
+    assert prepared["ok"] is True, prepared
+    applied = manager.invoke_vscode_lm_worker_tool(
+        request_id, "aiworkhub_worker_semantic_edit_apply",
+        {"target_id": prepared["target_id"], "new": new,
+         "idempotency_key": "nf1298.apply", "provider_call_id": "nf1298.apply"},
+    )
+    assert applied["ok"] is True, applied
+    assert applied["preimage_verified"] is True
+    assert applied["before_sha256"] == prepared["current_sha256"]
+    assert applied["after_sha256"] == hashlib.sha256((workspace / relative).read_bytes()).hexdigest()
+    verification = worker_ai_tools_mcp.verify_audit_ledger(
+        ledger, key, task_id="NF1298_PATCH_TEST", runner="editor_test",
+        topic="patch_protocol", request_id=request_id,
+    )
+    assert verification["ok"] is True, verification
+    receipts = verification["semantic_edit_apply_receipts"]
+    assert len(receipts) == 1
+    assert receipts[0]["path_sha256"] == hashlib.sha256(relative.encode("utf-8")).hexdigest()
+    for field in ("file_bytes", "range_count", "old_region_bytes", "replacement_bytes"):
+        assert receipts[0][field] == applied[field]
+    # Authenticated existing edits are already applied; only creates remain pending.
+    response_path = Path(spec["response_path"])
+    response = json.loads(response_path.read_text(encoding="utf-8"))
+    final = vscode_lm_worker._normalize_staged_final_envelope(json.loads(response["text"]))
+    final["edits"] = []
+    response["text"] = json.dumps(final)
+    response_path.write_text(json.dumps(response), encoding="utf-8")
+    return applied
+
+
+def test_v3_applies_only_bounded_line_range_and_reports_accounting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     current = "header\ndef old():\n    return 1\nfooter\n"
     spec, workspace = _request(
         tmp_path,
@@ -92,17 +165,23 @@ def test_v3_applies_only_bounded_line_range_and_reports_accounting(tmp_path: Pat
     target.parent.mkdir()
     target.write_bytes(current.encode("utf-8"))
 
+    with pytest.raises(RuntimeError, match="existing_edit_requires_authenticated_apply"):
+        vscode_lm_worker.run(spec)
+    assert target.read_text(encoding="utf-8") == current
+    metric = _authenticated_handoff(spec, "src/app.py", 2, 3, "def new():\n    return 2\n", monkeypatch)
     result = vscode_lm_worker.run(spec)
 
     assert target.read_text(encoding="utf-8") == "header\ndef new():\n    return 2\nfooter\n"
     assert result["edit_protocol"] == vscode_lm_bridge.EDIT_RESPONSE_SCHEMA_ID
-    metric = result["semantic_edit_metrics"][0]
+    assert result["semantic_edit_metrics"] == []
     assert metric["model_reemitted_old_bytes"] == 0
     assert metric["whole_file_output_required"] is False
     assert metric["token_savings_claimed"] is False
 
 
-def test_v3_can_fill_existing_empty_file_with_virtual_line(tmp_path: Path) -> None:
+def test_v3_can_fill_existing_empty_file_with_virtual_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     empty_sha256 = hashlib.sha256(b"").hexdigest()
     spec, workspace = _request(
         tmp_path,
@@ -116,10 +195,14 @@ def test_v3_can_fill_existing_empty_file_with_virtual_line(tmp_path: Path) -> No
     target.parent.mkdir()
     target.write_bytes(b"")
 
+    with pytest.raises(RuntimeError, match="existing_edit_requires_authenticated_apply"):
+        vscode_lm_worker.run(spec)
+    assert target.read_bytes() == b""
+    metric = _authenticated_handoff(spec, "out/result.txt", 1, 1, "created\n", monkeypatch)
     result = vscode_lm_worker.run(spec)
 
     assert target.read_text(encoding="utf-8") == "created\n"
-    metric = result["semantic_edit_metrics"][0]
+    assert result["semantic_edit_metrics"] == []
     assert metric["old_region_bytes"] == 0
     assert metric["replacement_bytes"] == len(b"created\n")
     assert metric["whole_file_output_required"] is False
@@ -448,7 +531,9 @@ def test_v2_validates_every_output_before_first_write(tmp_path: Path) -> None:
     assert existing.read_text(encoding="utf-8") == "keep\n"
 
 
-def test_v2_replaces_large_file_and_creates_root_file(tmp_path: Path) -> None:
+def test_v2_replaces_large_file_and_creates_root_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     content = ("prefix\n" * 2000) + "needle\n" + ("suffix\n" * 2000)
     spec, workspace = _request(
         tmp_path,
@@ -462,12 +547,18 @@ def test_v2_replaces_large_file_and_creates_root_file(tmp_path: Path) -> None:
     target.parent.mkdir()
     target.write_bytes(content.encode("utf-8"))
 
+    with pytest.raises(RuntimeError, match="existing_edit_requires_authenticated_apply"):
+        vscode_lm_worker.run(spec)
+    assert target.read_text(encoding="utf-8") == content
+    assert not (workspace / "root.txt").exists()
+    receipt = _authenticated_handoff(spec, "src/app.py", 2001, 2001, "replacement\n", monkeypatch)
     result = vscode_lm_worker.run(spec)
 
-    assert result["changed_paths"] == ["root.txt", "src/app.py"]
+    assert receipt["preimage_verified"] is True
+    assert receipt["path"] == "src/app.py"
+    assert result["changed_paths"] == ["root.txt"]
     updated = target.read_text(encoding="utf-8")
-    assert "needle" not in updated
-    assert "replacement\n" in updated
+    assert updated == content.replace("needle\n", "replacement\n", 1)
     assert (workspace / "root.txt").read_text(encoding="utf-8") == "created\n"
 
 
@@ -490,7 +581,7 @@ def test_v1_full_file_response_remains_accepted(tmp_path: Path) -> None:
     )
 
 
-def test_staged_action_and_string_lines_apply_when_hash_matches(tmp_path: Path) -> None:
+def test_staged_action_and_string_lines_plan_when_hash_matches(tmp_path: Path) -> None:
     current = "alpha\nbeta\ngamma\n"
     digest = hashlib.sha256(current.encode()).hexdigest()
     spec, workspace = _request(
@@ -512,11 +603,17 @@ def test_staged_action_and_string_lines_apply_when_hash_matches(tmp_path: Path) 
     target.parent.mkdir()
     target.write_bytes(current.encode("utf-8"))
 
-    result = vscode_lm_worker.run(spec)
-
-    assert target.read_text(encoding="utf-8") == "alpha\nBETA\ngamma\n"
-    assert result["edit_protocol"] == vscode_lm_bridge.EDIT_RESPONSE_SCHEMA_ID
-    assert "final_edit_invalid" not in json.dumps(result)
+    response = json.loads(spec.with_name("response.json").read_text(encoding="utf-8"))
+    normalized = vscode_lm_worker._normalize_staged_final_envelope(json.loads(response["text"]))
+    assert normalized["schema_id"] == vscode_lm_bridge.EDIT_RESPONSE_SCHEMA_ID
+    planned, _metrics = vscode_lm_worker._v3_planned_outputs(
+        workspace, normalized, ["src/*.py"], set(),
+    )
+    assert planned == [("src/app.py", "alpha\nBETA\ngamma\n")]
+    with pytest.raises(RuntimeError, match="existing_edit_requires_authenticated_apply") as raised:
+        vscode_lm_worker.run(spec)
+    assert "final_edit_invalid" not in str(raised.value)
+    assert target.read_text(encoding="utf-8") == current
 
 
 def test_flat_stage_inside_v3_edits_is_not_final_edit_invalid(tmp_path: Path) -> None:
@@ -542,10 +639,16 @@ def test_flat_stage_inside_v3_edits_is_not_final_edit_invalid(tmp_path: Path) ->
     target.parent.mkdir()
     target.write_bytes(current.encode("utf-8"))
 
-    result = vscode_lm_worker.run(spec)
-
-    assert target.read_text(encoding="utf-8") == "alpha\nBETA\ngamma\n"
-    assert "final_edit_invalid" not in json.dumps(result)
+    response = json.loads(spec.with_name("response.json").read_text(encoding="utf-8"))
+    normalized = vscode_lm_worker._normalize_staged_final_envelope(json.loads(response["text"]))
+    planned, _metrics = vscode_lm_worker._v3_planned_outputs(
+        workspace, normalized, ["src/*.py"], set(),
+    )
+    assert planned == [("src/app.py", "alpha\nBETA\ngamma\n")]
+    with pytest.raises(RuntimeError, match="existing_edit_requires_authenticated_apply") as raised:
+        vscode_lm_worker.run(spec)
+    assert "final_edit_invalid" not in str(raised.value)
+    assert target.read_text(encoding="utf-8") == current
 
 
 def test_string_line_stage_still_rejects_overlap_stale_hash_and_bounds(
