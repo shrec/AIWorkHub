@@ -1539,8 +1539,32 @@ def _resolve_local_python_imports(repo: Path, seeded: Iterable[str]) -> tuple[st
         getattr_ok = True
         stdlib_bindings: set[str] = set()
 
+        dispatcher_cache: dict[int, frozenset[str]] = {}
+
+        def build_dispatcher(node: ast.AST) -> frozenset[str]:
+            stored = frozenset(
+                item.id
+                for item in ast.walk(node)
+                if isinstance(item, ast.Name) and isinstance(item.ctx, (
+                    ast.Store, ast.Del
+                ))
+            )
+            return stored
+
         def stores_name(node: ast.AST, name: str) -> bool:
-            return any(isinstance(item, ast.Name) and item.id == name and isinstance(item.ctx, (ast.Store, ast.Del)) for item in ast.walk(node))
+            # Reuse one per-parsed-tree Store/Del descendant index instead of
+            # re-walking a statement for each of the six taint checks.  The
+            # dict is keyed by id(node) for each queried statement and lives
+            # only inside the dispatcher_cache created for one ast.parse call,
+            # so source changes, disjoint AST trees, and re-parses get a fresh
+            # record; nothing path-based or global is cached.  Bounded by the
+            # statement count of that single parsed tree and released with it.
+            key = id(node)
+            recorded = dispatcher_cache.get(key)
+            if recorded is None:
+                recorded = build_dispatcher(node)
+                dispatcher_cache[key] = recorded
+            return name in recorded
 
         def importlib_binding(statement: ast.stmt) -> bool | None:
             canonical = False
