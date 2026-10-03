@@ -9828,10 +9828,10 @@ async function pushManagerLoopEvents(view, sessionId, afterSeq) {
     view.bindClient(client);
     const payload = await client.callTool(MANAGER_LOOP_TOOLS.events, { session_id: sessionId, after_seq: afterSeq });
     if (view.stillBoundTo(client)) {
-      view.postMessage({ type: OUTBOUND_TYPES.managerLoopEvents, payload: sanitizeWebviewPayload(payload) });
+      view.postMessage({ type: OUTBOUND_TYPES.managerLoopEvents, payload: { ...sanitizeWebviewPayload(payload), session_id: sessionId } });
     }
   } catch (err) {
-    view.postMessage({ type: OUTBOUND_TYPES.managerLoopEvents, payload: { ok: false, error: sanitizeErrorMessage(err) } });
+    view.postMessage({ type: OUTBOUND_TYPES.managerLoopEvents, payload: { ok: false, error: sanitizeErrorMessage(err), session_id: sessionId } });
   }
 }
 
@@ -11857,9 +11857,11 @@ function getHtmlForWebview(webview, extensionUri) {
           <span id="manager-chat-session-backend" hidden></span>
         </div>
         <div class="mc-hairline" id="manager-chat-hairline" role="meter" aria-label="Manager context use" aria-valuemin="0" aria-valuemax="100" hidden><span></span></div>
-        <div class="manager-chat-transcript" id="manager-chat-transcript" aria-live="polite">
+        <div class="manager-chat-transcript" id="manager-chat-transcript">
           <div class="panel-list-empty compact" id="manager-chat-empty">Write on the selected model to open the first session</div>
         </div>
+        <button type="button" class="mc-latest" id="manager-chat-latest" hidden>↓ latest</button>
+        <div class="sr-only" id="manager-chat-announcer" aria-live="polite"></div>
         <div class="manager-chat-notice" id="manager-chat-notice" hidden></div>
         <form class="manager-chat-composer" id="manager-chat-composer">
           <textarea id="manager-chat-input" rows="2" placeholder="Message the manager" aria-label="Message the manager"></textarea>

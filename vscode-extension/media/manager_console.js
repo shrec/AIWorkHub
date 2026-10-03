@@ -14,7 +14,7 @@ function managerChatEventNode(event) {
   if (type === "assistant_text" || type === "user_message") {
     const bubble = createElement("div", `manager-chat-bubble role-${type === "user_message" ? "user" : "assistant"}`);
     bubble.appendChild(createElement("span", "manager-chat-bubble-label sr-only", type === "user_message" ? "You" : "Manager"));
-    bubble.appendChild(document.createTextNode(String(payload.text || "")));
+    bubble.appendChild(type === "assistant_text" ? managerConsoleMarkdown(payload.text) : document.createTextNode(String(payload.text || "")));
     return managerConsoleBlock(type, bubble);
   }
   if (type === "tool_call" || type === "tool_result") {
@@ -353,7 +353,10 @@ function managerConsoleApplyHairline() {
 function renderManagerChatEvents() {
   if (!elements.managerChatTranscript) return;
   managerConsoleApplyHairline();
-  const rows = [];
+  const box = elements.managerChatTranscript;
+  const scrollTop = box.scrollTop;
+  const atBottom = box.scrollHeight - scrollTop - (box.clientHeight || 0) < 24;
+  let rows = [];
   let lastTurnEndTurn = null;
   const pending = [];
   const flushPendingTurnEnd = () => {
@@ -379,20 +382,156 @@ function renderManagerChatEvents() {
     if (node) rows.push(node);
   }
   flushPendingTurnEnd();
-  if (state.managerChatRunning) {
+  const partialRows = managerConsolePartialNodes(state.managerChatPartial);
+  if (partialRows.length > 0) {
+    rows.push(...partialRows);
+  } else if (state.managerChatRunning) {
     if (!state.managerChatThinkingSince) state.managerChatThinkingSince = Date.now();
     rows.push(managerChatLiveThinkingNode());
   } else if (state.managerChatLastThoughtMs && !state.managerChatEvents.some((item) => item && item.type === "reasoning")) {
     rows.push(createElement("div", "manager-chat-thinking", "Thought for " + managerChatFormatDuration(state.managerChatLastThoughtMs)));
   }
+  const limit = state.managerChatRenderLimit || MANAGER_CONSOLE_BLOCK_LIMIT;
+  if (rows.length > limit) {
+    rows = rows.slice(-limit);
+    const earlier = createElement("button", "mc-show-all", "load earlier");
+    earlier.type = "button";
+    earlier.addEventListener("click", () => {
+      state.managerChatRenderLimit = limit + MANAGER_CONSOLE_BLOCK_LIMIT;
+      managerConsoleScheduleRender();
+    });
+    rows.unshift(earlier);
+  }
   if (rows.length === 0) {
     elements.managerChatTranscript.replaceChildren(
       createElement("div", "panel-list-empty compact", state.managerChatSession ? "No events yet" : "No open session"),
     );
+    if (elements.managerChatLatest) elements.managerChatLatest.hidden = true;
     return;
   }
   const fragment = document.createDocumentFragment();
   for (const row of rows) fragment.appendChild(row);
   elements.managerChatTranscript.replaceChildren(fragment);
-  elements.managerChatTranscript.scrollTop = elements.managerChatTranscript.scrollHeight;
+  box.scrollTop = atBottom ? box.scrollHeight : scrollTop;
+  if (elements.managerChatLatest) elements.managerChatLatest.hidden = atBottom;
+  managerConsoleAnnounce(state.managerChatEvents);
+}
+
+const MANAGER_CONSOLE_BLOCK_LIMIT = 400;
+const MANAGER_CONSOLE_INLINE = /(`[^`]+`|\*\*[^*]+\*\*|\*[^*]+\*|_[^_]+_|\[[^\]]+\]\([^)\s]+\))/;
+
+function managerConsoleInline(parent, text) {
+  for (const part of String(text).split(MANAGER_CONSOLE_INLINE)) {
+    if (!part) continue;
+    if (part.startsWith("`") && part.endsWith("`") && part.length > 1) parent.appendChild(createElement("code", "mc-mono", part.slice(1, -1)));
+    else if (part.startsWith("**") && part.endsWith("**") && part.length > 4) parent.appendChild(createElement("strong", "", part.slice(2, -2)));
+    else if (/^(\*[^*]+\*|_[^_]+_)$/.test(part)) parent.appendChild(createElement("em", "", part.slice(1, -1)));
+    else if (/^\[[^\]]+\]\([^)\s]+\)$/.test(part)) {
+      const cut = part.indexOf("](");
+      parent.appendChild(document.createTextNode(`${part.slice(1, cut)} (${part.slice(cut + 2, -1)})`));
+    } else parent.appendChild(document.createTextNode(part));
+  }
+}
+
+function managerConsoleMarkdown(text) {
+  const fragment = document.createDocumentFragment();
+  const lines = String(text || "").split("\n");
+  let index = 0;
+  while (index < lines.length) {
+    const line = lines[index];
+    if (line.startsWith("```")) {
+      const code = [];
+      index += 1;
+      while (index < lines.length && !lines[index].startsWith("```")) code.push(lines[index++]);
+      index += 1;
+      fragment.appendChild(createElement("pre", "mc-code", code.join("\n")));
+      continue;
+    }
+    const bullet = /^\s*([-*]|\d+\.)\s+/;
+    if (bullet.test(line)) {
+      const ordered = /^\s*\d+\./.test(line);
+      const list = createElement(ordered ? "ol" : "ul", "mc-list");
+      while (index < lines.length && bullet.test(lines[index])) {
+        const item = createElement("li", "");
+        managerConsoleInline(item, lines[index++].replace(bullet, ""));
+        list.appendChild(item);
+      }
+      fragment.appendChild(list);
+      continue;
+    }
+    if (!line.trim()) { index += 1; continue; }
+    const paragraph = createElement("p", "mc-p");
+    const words = [];
+    while (index < lines.length && lines[index].trim() && !lines[index].startsWith("```") && !bullet.test(lines[index])) words.push(lines[index++]);
+    managerConsoleInline(paragraph, words.join("\n"));
+    fragment.appendChild(paragraph);
+  }
+  return fragment;
+}
+
+function managerConsoleTurnFinished(turn) {
+  return (state.managerChatEvents || []).some((item) => item && item.turn === turn && ["turn_end", "assistant_text"].includes(item.type));
+}
+
+function managerConsolePartialIsCurrent(partial) {
+  if (!partial || !state.managerChatSession || !Number.isInteger(partial.turn) || managerConsoleTurnFinished(partial.turn)) return false;
+  if (partial.session_id && partial.session_id !== state.managerChatSession) return false;
+  const latestTurn = (state.managerChatEvents || []).reduce((latest, item) => item && Number.isInteger(item.turn) ? Math.max(latest, item.turn) : latest, 0);
+  return partial.turn >= latestTurn;
+}
+
+function managerConsolePartialNodes(partial) {
+  if (!managerConsolePartialIsCurrent(partial)) return [];
+  const nodes = [];
+  if (partial.reasoning) {
+    const details = createElement("details", "mc-thinking");
+    details.open = true;
+    details.appendChild(createElement("summary", "", "Thinking"));
+    details.appendChild(createElement("div", "mc-thinking-text", partial.reasoning));
+    nodes.push(managerConsoleBlock("reasoning", details));
+  }
+  if (partial.text) {
+    const body = createElement("div", "mc-body mc-streaming");
+    body.appendChild(managerConsoleMarkdown(partial.text));
+    const caret = createElement("span", "mc-caret");
+    caret.setAttribute("aria-hidden", "true");
+    body.appendChild(caret);
+    nodes.push(managerConsoleBlock("assistant_text", body));
+  }
+  return nodes;
+}
+
+let managerConsoleFramePending = false;
+
+function managerConsoleScheduleRender() {
+  if (managerConsoleFramePending) return;
+  managerConsoleFramePending = true;
+  window.requestAnimationFrame(() => {
+    managerConsoleFramePending = false;
+    renderManagerChatEvents();
+  });
+}
+
+function managerConsoleAnnounce(events) {
+  if (!elements.managerChatAnnouncer) return;
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    if (!event || event.type !== "assistant_text") continue;
+    if (event.seq > (state.managerChatAnnouncedSeq || 0)) {
+      state.managerChatAnnouncedSeq = event.seq;
+      elements.managerChatAnnouncer.textContent = String((event.payload && event.payload.text) || "");
+    }
+    return;
+  }
+}
+
+function managerConsoleReset() {
+  state.managerChatPartial = null;
+  state.managerChatRenderLimit = MANAGER_CONSOLE_BLOCK_LIMIT;
+  state.managerChatAnnouncedSeq = 0;
+  state.managerChatThinkingSince = 0;
+  state.managerChatLastThoughtMs = 0;
+  if (elements.managerChatAnnouncer) elements.managerChatAnnouncer.textContent = "";
+  if (elements.managerChatLatest) elements.managerChatLatest.hidden = true;
+  if (elements.managerChatTranscript) elements.managerChatTranscript.scrollTop = elements.managerChatTranscript.scrollHeight;
 }

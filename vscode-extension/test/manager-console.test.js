@@ -33,6 +33,9 @@ function load(events = []) {
   const elements = { managerChatTranscript: fakeElement("div"), managerChatHairline: fakeElement("div"), managerChatContext: fakeElement("span") };
   elements.managerChatHairline.children.push(fakeElement("span"));
   const opened = [];
+  const frames = [];
+  elements.managerChatAnnouncer = fakeElement("div");
+  elements.managerChatLatest = fakeElement("button");
   const context = {
     document: {
       createElement: (tag) => fakeElement(tag),
@@ -42,6 +45,7 @@ function load(events = []) {
     state: { managerChatEvents: events, managerChatSession: "mls-fixture", managerChatRunning: false },
     elements,
     requestTaskDetail: (id) => opened.push(id),
+    window: { requestAnimationFrame: (fn) => { frames.push(fn); return frames.length; } },
     Date,
   };
   vm.createContext(context);
@@ -53,8 +57,8 @@ function load(events = []) {
     slice(appSource, "function numberValue(value) {", "return Number.isFinite(parsed) ? parsed : 0;\n}"),
     slice(appSource, "function limitText(value, maxLength = 120) {", "return `${text.slice(0, Math.max(0, maxLength - 1)).trimEnd()}...`;\n}"),
   ].join("\n");
-  vm.runInContext(`${utilities}\n${consoleSource}\nthis.api = { managerChatEventNode, renderManagerChatEvents, managerConsoleMergeCommands, managerConsoleCompact, managerConsoleFooterText, managerConsoleTaskOf, managerConsoleApplyHairline };`, context);
-  return { api: context.api, elements, opened, state: context.state };
+  vm.runInContext(`${utilities}\n${consoleSource}\nthis.api = { managerChatEventNode, renderManagerChatEvents, managerConsoleMergeCommands, managerConsoleCompact, managerConsoleFooterText, managerConsoleTaskOf, managerConsoleApplyHairline, managerConsoleMarkdown, managerConsolePartialNodes, managerConsoleScheduleRender };`, context);
+  return { api: context.api, elements, opened, frames, state: context.state };
 }
 
 function flat(node, out = []) {
@@ -185,4 +189,85 @@ test("hostile payloads render as text in every block", () => {
     assert.ok(!flat(node).some((n) => n.tag === "img"), "no element from payload");
     assert.ok(text(node).includes(evil));
   }
+});
+
+test("markdown subset is built from nodes and never creates links or html", () => {
+  const { api } = load();
+  const fragment = api.managerConsoleMarkdown("Intro **bold** and `code`\n\n- one\n- two\n\n```\n<img src=x>\n```\n\nsee [docs](https://example.test)");
+  const all = flat(fragment);
+  assert.ok(all.some((n) => n.tag === "strong" && text(n) === "bold"));
+  assert.ok(all.some((n) => n.tag === "code" && text(n) === "code"));
+  assert.equal(all.filter((n) => n.tag === "li").length, 2);
+  assert.ok(all.some((n) => n.tag === "pre" && text(n).includes("<img src=x>")));
+  assert.ok(!all.some((n) => n.tag === "a" || n.tag === "img"));
+  assert.ok(text(fragment).includes("docs (https://example.test)"));
+});
+
+test("partial renders only for a turn that has not finished", () => {
+  const { api, state } = load([{ seq: 1, turn: 3, type: "user_message", payload: { text: "go" } }]);
+  const live = api.managerConsolePartialNodes({ turn: 3, text: "Hel", reasoning: "hm", command_output: "" });
+  assert.equal(live.length, 2);
+  assert.ok(flat(live[1]).some((n) => n.className === "mc-caret"));
+  state.managerChatEvents.push({ seq: 2, turn: 3, type: "turn_end", payload: {} });
+  assert.deepEqual(Array.from(api.managerConsolePartialNodes({ turn: 3, text: "Hel", reasoning: "", command_output: "" })), []);
+});
+
+test("renders coalesce to one DOM write per animation frame", () => {
+  const { api, frames, elements } = load([{ seq: 1, turn: 1, type: "assistant_text", payload: { text: "hi" } }]);
+  let writes = 0;
+  const original = elements.managerChatTranscript.replaceChildren;
+  elements.managerChatTranscript.replaceChildren = function (...nodes) { writes += 1; return original.apply(this, nodes); };
+  for (let i = 0; i < 5; i += 1) api.managerConsoleScheduleRender();
+  assert.equal(frames.length, 1);
+  frames[0]();
+  assert.equal(writes, 1);
+});
+
+test("the transcript keeps the newest 400 blocks behind load earlier", () => {
+  const events = Array.from({ length: 450 }, (_, i) => ({ seq: i + 1, turn: 1, type: "assistant_text", payload: { text: `m${i}` } }));
+  const { api, elements, state } = load(events);
+  api.renderManagerChatEvents();
+  const rows = elements.managerChatTranscript.children;
+  assert.equal(rows.length, 401);
+  assert.equal(rows[0].tag, "button");
+  rows[0].listeners.click[0]();
+  assert.equal(state.managerChatRenderLimit, 800);
+  api.renderManagerChatEvents();
+  assert.equal(elements.managerChatTranscript.children.length, 450);
+});
+
+test("only a new final message is announced", () => {
+  const { api, elements, state } = load([{ seq: 1, turn: 1, type: "assistant_text", payload: { text: "first" } }]);
+  api.renderManagerChatEvents();
+  assert.equal(elements.managerChatAnnouncer.textContent, "first");
+  elements.managerChatAnnouncer.textContent = "";
+  state.managerChatPartial = { turn: 2, text: "stream", reasoning: "", command_output: "" };
+  api.renderManagerChatEvents();
+  assert.equal(elements.managerChatAnnouncer.textContent, "");
+});
+
+test("scrolled-up rendering retains position and bottom rendering follows", () => {
+  const { api, elements, state } = load([{ seq: 1, turn: 1, type: "assistant_text", payload: { text: "first" } }]);
+  const box = elements.managerChatTranscript;
+  box.scrollHeight = 1000;
+  box.clientHeight = 100;
+  box.scrollTop = 120;
+  const original = box.replaceChildren;
+  box.replaceChildren = function (...nodes) { original.apply(this, nodes); this.scrollHeight += 100; this.scrollTop = 0; };
+  api.renderManagerChatEvents();
+  assert.equal(box.scrollTop, 120);
+  assert.equal(elements.managerChatLatest.hidden, false);
+  box.scrollTop = box.scrollHeight - box.clientHeight;
+  state.managerChatEvents.push({ seq: 2, turn: 2, type: "assistant_text", payload: { text: "next" } });
+  api.renderManagerChatEvents();
+  assert.equal(box.scrollTop, box.scrollHeight);
+  assert.equal(elements.managerChatLatest.hidden, true);
+});
+
+test("partial rejects a final assistant message and an older session or turn", () => {
+  const { api, state } = load([{ seq: 1, turn: 3, type: "user_message", payload: { text: "go" } }]);
+  assert.equal(api.managerConsolePartialNodes({ session_id: "mls-old", turn: 3, text: "old" }).length, 0);
+  assert.equal(api.managerConsolePartialNodes({ turn: 2, text: "old" }).length, 0);
+  state.managerChatEvents.push({ seq: 2, turn: 3, type: "assistant_text", payload: { text: "final" } });
+  assert.equal(api.managerConsolePartialNodes({ turn: 3, text: "stale" }).length, 0);
 });

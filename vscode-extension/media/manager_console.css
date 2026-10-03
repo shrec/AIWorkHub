@@ -167,3 +167,12 @@
 .mc-hairline.is-stale > span { background: var(--stale); }
 .mc-hairline.is-blocked > span { background: var(--blocked); }
 @media (prefers-reduced-motion: reduce) { .mc-hairline > span { transition: none; } }
+
+.mc-caret { display: inline-block; width: 0.5ch; height: 1em; margin-left: 1px; vertical-align: text-bottom; background: var(--ink-soft); animation: mc-caret-blink 1s steps(1) infinite; }
+@keyframes mc-caret-blink { 50% { opacity: 0; } }
+@media (prefers-reduced-motion: reduce) { .mc-caret { animation: none; } }
+.mc-p { margin: 0 0 6px; }
+.mc-list { margin: 0 0 6px; padding-left: 2ch; }
+.mc-code { padding: 6px 8px; background: var(--surface-subtle); border: 1px solid var(--line); }
+.mc-latest { position: sticky; bottom: 8px; margin-left: auto; font-size: var(--fs-2xs); }
+.mc-thinking { color: var(--ink-soft); }

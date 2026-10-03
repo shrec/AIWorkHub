@@ -86,6 +86,9 @@ const state = {
   managerChatModelByBackend: {},
   managerChatRunning: false,
   managerChatEvents: [],
+  managerChatPartial: null,
+  managerChatRenderLimit: MANAGER_CONSOLE_BLOCK_LIMIT,
+  managerChatAnnouncedSeq: 0,
   managerChatLastSeq: 0,
   managerChatPollTimer: null,
   managerChatCollapsed: Boolean(persisted.managerChatCollapsed),
@@ -349,6 +352,8 @@ const elements = {
   managerChatTasksList: document.querySelector("#manager-chat-tasks-list"),
   managerChatTaskFilter: document.querySelector("#manager-chat-task-filter"),
   managerChatTranscript: document.querySelector("#manager-chat-transcript"),
+  managerChatLatest: document.querySelector("#manager-chat-latest"),
+  managerChatAnnouncer: document.querySelector("#manager-chat-announcer"),
   managerChatNotice: document.querySelector("#manager-chat-notice"),
   managerChatComposer: document.querySelector("#manager-chat-composer"),
   managerChatInput: document.querySelector("#manager-chat-input"),
@@ -7400,12 +7405,14 @@ function renderManagerChatStatus(payload) {
   if (!state.managerChatSession) {
     stopManagerChatPolling();
     state.managerChatEvents = [];
+    managerConsoleReset();
     state.managerChatLastSeq = 0;
     renderManagerChatEvents();
     return;
   }
   if (sessionChanged) {
     state.managerChatEvents = [];
+    managerConsoleReset();
     state.managerChatLastSeq = 0;
     renderManagerChatEvents();
   }
@@ -7414,6 +7421,7 @@ function renderManagerChatStatus(payload) {
 }
 
 function renderManagerChatEventsResponse(payload) {
+  if (payload && payload.session_id && payload.session_id !== state.managerChatSession) return;
   if (!payload || payload.ok === false) {
     showManagerChatNotice(payload && payload.error ? `Manager error: ${payload.error}` : "Manager events unavailable");
   } else {
@@ -7423,7 +7431,6 @@ function renderManagerChatEventsResponse(payload) {
     if (events.length > 0) {
       state.managerChatEvents = state.managerChatEvents.concat(events);
       state.managerChatLastSeq = events.reduce((max, event) => Math.max(max, numberValue(event.seq)), state.managerChatLastSeq);
-      renderManagerChatEvents();
       if (state.managerChatRunning) applyManagerChatSessionUi();
       // A finished turn still needs one status pull: running and send_queue
       // are authoritative only on status, and nothing else refreshes them
@@ -7435,11 +7442,12 @@ function renderManagerChatEventsResponse(payload) {
           state.managerChatThinkingSince = 0;
         }
         state.managerChatRunning = false;
-        renderManagerChatEvents();
         applyManagerChatSessionUi();
         vscode.postMessage({ type: "managerLoopStatus" });
       }
     }
+    state.managerChatPartial = managerConsolePartialIsCurrent(payload.partial) ? payload.partial : null;
+    managerConsoleScheduleRender();
   }
   if (state.managerChatSession) {
     scheduleManagerChatPoll();
@@ -7461,7 +7469,9 @@ function renderManagerChatAction(_action, payload) {
     if (state.managerChatSession !== sessionId) {
       state.managerChatSession = sessionId;
       state.managerChatEvents = [];
+      managerConsoleReset();
       state.managerChatLastSeq = 0;
+      renderManagerChatEvents();
     }
     state.managerChatRunning = true;
     applyManagerChatSessionUi();
@@ -8031,12 +8041,21 @@ function startManagerChatSidebar() {
   // the selected model opens the first session.
   state.managerChatSession = null;
   state.managerChatEvents = [];
+  managerConsoleReset();
   state.managerChatLastSeq = 0;
   state.managerChatRunning = false;
   renderManagerChatEvents();
   applyManagerChatSessionUi();
   vscode.postMessage({ type: "managerLoopStatus" });
   renderManagerChatTaskBoard();
+}
+
+if (elements.managerChatLatest && typeof elements.managerChatLatest.addEventListener === "function") {
+  elements.managerChatLatest.addEventListener("click", () => {
+    const box = elements.managerChatTranscript;
+    if (box) box.scrollTop = box.scrollHeight;
+    elements.managerChatLatest.hidden = true;
+  });
 }
 
 if (elements.managerChatCollapse && typeof elements.managerChatCollapse.addEventListener === "function") {

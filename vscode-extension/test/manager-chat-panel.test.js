@@ -426,6 +426,8 @@ function loadWebviewSlice() {
     headerManagerChat: makeFakeElement("button"),
     managerChatDialog: Object.assign(makeFakeElement("dialog"), { open: true }),
     managerChatTranscript: makeFakeElement("div"),
+    managerChatLatest: makeFakeElement("button"),
+    managerChatAnnouncer: makeFakeElement("div"),
     managerChatNotice: makeFakeElement("div"),
     managerChatSummary: makeFakeElement("span"),
     managerChatBackendSelect: makeFakeElement("select"),
@@ -454,6 +456,7 @@ function loadWebviewSlice() {
   const timers = [];
   const vscode = { postMessage: (message) => posts.push(message) };
   const windowFake = {
+    requestAnimationFrame: (fn) => { fn(); return 1; },
     setTimeout: (fn) => {
       const id = timers.length + 1;
       timers.push({ id, fn });
@@ -487,7 +490,7 @@ function loadWebviewSlice() {
       "applyManagerChatSessionUi, applyManagerChatComposerState, managerChatEnabledModels, managerChatSelectedRoute, populateManagerChatModelOptions, applyManagerChatCollapsed, toggleManagerChatSidebar, startManagerChatSidebar, renderManagerChatTaskBoard, driveManagerChatTask };",
     context,
   );
-  return { api: context.api, state, elements, posts, timers };
+  return { api: context.api, state, elements, posts, timers, window: windowFake };
 }
 
 test("manager chat turn_end shows reported token counts", () => {
@@ -1337,4 +1340,118 @@ test("manager console assets load before app.js and ship in the VSIX", () => {
   assert.match(packager, /"media\/manager_console\.css"/);
   assert.doesNotMatch(appSource, /function managerChatEventNode\(/);
   assert.doesNotMatch(cssSource, /\.manager-chat-bubble \{/);
+});
+
+test("partial-only provider responses render without persisting or announcing deltas", () => {
+  const harness = loadWebviewSlice();
+  const session = "mls-" + "a".repeat(32);
+  harness.state.managerChatSession = session;
+  harness.state.managerChatEvents = [{ seq: 1, turn: 3, type: "user_message", payload: { text: "go" } }];
+  harness.state.managerChatLastSeq = 1;
+  const partial = { session_id: session, turn: 3, text: "Hel **world**", reasoning: "hm" };
+  harness.api.renderManagerChatEventsResponse({ ok: true, session_id: session, events: [], partial });
+  assert.equal(harness.state.managerChatPartial, partial);
+  assert.equal(harness.state.managerChatEvents.length, 1);
+  assert.equal(harness.state.managerChatLastSeq, 1);
+  assert.equal(harness.elements.managerChatAnnouncer.textContent, "");
+  const nodes = flattenNodes(harness.elements.managerChatTranscript, []);
+  assert.ok(nodes.some((node) => node.className === "mc-caret"));
+  assert.ok(nodes.some((node) => node.tag === "strong" && node.textContent === "world"));
+  harness.api.renderManagerChatEventsResponse({
+    ok: true, session_id: session, partial,
+    events: [{ seq: 2, turn: 3, type: "assistant_text", payload: { text: "final" } }],
+  });
+  assert.equal(harness.state.managerChatPartial, null);
+  assert.equal(harness.elements.managerChatAnnouncer.textContent, "final");
+  assert.ok(!flattenNodes(harness.elements.managerChatTranscript, []).some((node) => node.className === "mc-caret"));
+  harness.api.renderManagerChatEventsResponse({ ok: true, session_id: session, events: [], partial: null });
+  assert.equal(harness.state.managerChatPartial, null);
+});
+
+test("session resets clear partial, render limit and announcements through actual call sites", () => {
+  for (const reset of ["status-switch", "status-close", "action-switch", "sidebar"]) {
+    const harness = loadWebviewSlice();
+    harness.state.managerChatSession = "mls-" + "a".repeat(32);
+    harness.state.managerChatPartial = { session_id: harness.state.managerChatSession, turn: 9, text: "old" };
+    harness.state.managerChatEvents = [{ seq: 999, turn: 9, type: "assistant_text", payload: { text: "old" } }];
+    harness.state.managerChatRenderLimit = 800;
+    harness.state.managerChatAnnouncedSeq = 999;
+    harness.elements.managerChatAnnouncer.textContent = "old";
+    harness.api.renderManagerChatEvents();
+    if (reset === "sidebar") harness.api.startManagerChatSidebar();
+    else if (reset === "action-switch") harness.api.renderManagerChatAction("new", { ok: true, session_id: "mls-" + "b".repeat(32) });
+    else harness.api.renderManagerChatStatus({ ok: true, running: false, session: reset === "status-close" ? null : { session_id: "mls-" + "b".repeat(32) } });
+    assert.equal(harness.state.managerChatPartial, null, reset);
+    assert.equal(harness.state.managerChatEvents.length, 0, reset);
+    assert.equal(harness.state.managerChatRenderLimit, 400, reset);
+    assert.equal(harness.state.managerChatAnnouncedSeq, 0, reset);
+    assert.equal(harness.elements.managerChatAnnouncer.textContent, "", reset);
+    assert.equal(harness.elements.managerChatLatest.hidden, true, reset);
+    assert.ok(!flattenNodes(harness.elements.managerChatTranscript, []).some((node) => node.textContent === "old"), reset + " clears the old transcript immediately");
+  }
+});
+
+test("stale provider replies cannot replace the active session partial or events", () => {
+  const harness = loadWebviewSlice();
+  const session = "mls-" + "b".repeat(32);
+  harness.state.managerChatSession = session;
+  harness.state.managerChatEvents = [{ seq: 1, turn: 4, type: "user_message", payload: { text: "go" } }];
+  harness.state.managerChatLastSeq = 1;
+  harness.api.renderManagerChatEventsResponse({ ok: true, session_id: session, events: [], partial: { session_id: session, turn: 4, text: "current" } });
+  const current = harness.state.managerChatPartial;
+  harness.api.renderManagerChatEventsResponse({ ok: true, session_id: "mls-" + "a".repeat(32), events: [{ seq: 9, turn: 1, type: "assistant_text", payload: { text: "old" } }], partial: { turn: 1, text: "old" } });
+  assert.equal(harness.state.managerChatPartial, current);
+  assert.equal(harness.state.managerChatLastSeq, 1);
+  assert.equal(harness.state.managerChatEvents.length, 1);
+  harness.api.renderManagerChatEventsResponse({ ok: true, session_id: session, events: [], partial: { session_id: session, turn: 3, text: "older turn" } });
+  assert.equal(harness.state.managerChatPartial, null);
+});
+
+test("latest button resumes following and only the final announcer has aria-live", () => {
+  const harness = loadWebviewSlice();
+  const box = harness.elements.managerChatTranscript;
+  box.scrollHeight = 2000;
+  box.scrollTop = 100;
+  harness.elements.managerChatLatest.hidden = false;
+  harness.elements.managerChatLatest.listeners.click[0]();
+  assert.equal(box.scrollTop, 2000);
+  assert.equal(harness.elements.managerChatLatest.hidden, true);
+  const markup = extensionSource.slice(extensionSource.indexOf('id="manager-chat-transcript"') - 40, extensionSource.indexOf('id="manager-chat-notice"'));
+  assert.doesNotMatch(markup.split("</div>")[0], /aria-live/);
+  assert.match(markup, /id="manager-chat-announcer" aria-live="polite"/);
+  const persisted = appSource.slice(appSource.indexOf("function persistState()"), appSource.indexOf("function stopReadyRetry()"));
+  assert.doesNotMatch(persisted, /managerChatPartial/);
+});
+
+test("the host binds successful and failed event replies to their requested session", async () => {
+  const sessionId = "mls-" + "a".repeat(32);
+  for (const failed of [false, true]) {
+    const harness = loadHostSlice();
+    harness.setClient(makeClient(() => { if (failed) throw new Error("failed"); return { ok: true, events: [], partial: null }; }));
+    const view = makeView();
+    harness.api.handleInboundMessage(view, { type: "managerLoopEvents", sessionId, afterSeq: 0 });
+    await flush();
+    assert.equal(view.posts.length, 1);
+    assert.equal(view.posts[0].payload.session_id, sessionId);
+    assert.equal(view.posts[0].payload.ok, !failed);
+  }
+});
+
+test("five partial provider batches coalesce and render the latest text once", () => {
+  const harness = loadWebviewSlice();
+  const frames = [];
+  harness.window.requestAnimationFrame = (fn) => { frames.push(fn); return frames.length; };
+  harness.state.managerChatSession = "mls-" + "a".repeat(32);
+  let writes = 0;
+  const box = harness.elements.managerChatTranscript;
+  const original = box.replaceChildren;
+  box.replaceChildren = function (...nodes) { writes += 1; return original.apply(this, nodes); };
+  for (let i = 0; i < 5; i += 1) {
+    harness.api.renderManagerChatEventsResponse({ ok: true, session_id: harness.state.managerChatSession, events: [], partial: { session_id: harness.state.managerChatSession, turn: 1, text: "partial " + i } });
+  }
+  assert.equal(frames.length, 1);
+  assert.equal(writes, 0);
+  frames[0]();
+  assert.equal(writes, 1);
+  assert.ok(flattenNodes(box, []).some((node) => node.textContent === "partial 4"));
 });
