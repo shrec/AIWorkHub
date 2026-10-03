@@ -196,11 +196,8 @@ assert.ok(
   readRepositoryManifestInfoMatch[0].includes(".isDirectory()"),
   "manifest inspection may verify that the repository metadata root is a directory",
 );
-const extWithoutReadRepositoryManifestInfo = ext.replace(readRepositoryManifestInfoMatch[0], "");
-assert.ok(
-  !extWithoutReadRepositoryManifestInfo.includes(".isDirectory()"),
-  "storage readiness outside manifest inspection must never be derived from directory existence",
-);
+// Shared static guard also executes the existing readiness assertions and mutants.
+require("./explicit-init-no-fallback.test.js").assertNoDirectoryOnlyStorageReady(ext);
 assert.ok(ext.includes('const hubPath = path.join(root, ".aiworkhub")'));
 assert.ok(ext.includes('const manifestPath = path.join(hubPath, "project.json")'));
 assert.ok(ext.includes('INITIALIZE_TOOL = "aiworkhub_dashboard_initialize"'));

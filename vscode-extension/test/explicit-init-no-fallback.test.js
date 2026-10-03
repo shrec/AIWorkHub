@@ -47,12 +47,59 @@ assert.ok(
   readRepositoryManifestInfoMatch[0].includes(".isDirectory()"),
   "readRepositoryManifestInfo must validate the repository manifest path as a directory",
 );
-const extWithoutReadRepositoryManifestInfo = ext.replace(readRepositoryManifestInfoMatch[0], "");
-assertAbsent(
-  extWithoutReadRepositoryManifestInfo,
-  [".isDirectory()"],
-  "directory_only_storage_ready forbidden pattern present outside readRepositoryManifestInfo",
-);
+// NF1278: private request-home validation is not repository storage readiness.
+// Verify this exact security boundary before allowing its one directory check.
+function assertNoDirectoryOnlyStorageReady(source) {
+  const manifest = source.match(
+    /function readRepositoryManifestInfo\(root, label\) \{[\s\S]*?\r?\n\}\r?\n/,
+  );
+  assert.ok(manifest, "readRepositoryManifestInfo function body not found");
+  const journals = [...source.matchAll(
+    /^function createVscodeLmActivityJournal\(request\) \{[\s\S]*?\r?\n\}\r?\n/gm,
+  )];
+  assert.strictEqual(journals.length, 1, "exact journal function boundary required");
+  const journal = journals[0][0];
+  const privateHomeGuard = 'if (!parent.isDirectory() || (process.platform !== "win32" && ((parent.mode & 0o077) || ' +
+    '(typeof process.getuid === "function" && parent.uid !== process.getuid())))) ' +
+    'throw new Error("vscode_lm_activity_owner_invalid");';
+  assert.ok(journal.replace(/\s+/g, " ").includes(privateHomeGuard),
+    "journal exception requires rejecting non-directory, nonprivate or foreign-owned home");
+  assert.strictEqual((journal.match(/\.isDirectory\(\)/g) || []).length, 1,
+    "journal exception permits exactly one private-home directory check");
+  assertAbsent(journal, ["storage_ready", "bootstrapRepository", "initializeStorage"],
+    "journal exception must not initialize or determine repository readiness");
+  assertAbsent(
+    source.replace(manifest[0], "").replace(journal, ""),
+    [".isDirectory()"],
+    "directory_only_storage_ready forbidden pattern present outside validated manifest/journal",
+  );
+}
+assertNoDirectoryOnlyStorageReady(ext);
+
+// In-memory mutants: never write altered production files or touch storage.
+assert.throws(() => assertNoDirectoryOnlyStorageReady(
+  ext + "\nfunction fakeReadiness(p) { return fs.statSync(p).isDirectory(); }\n",
+), /directory_only_storage_ready/);
+assert.throws(() => assertNoDirectoryOnlyStorageReady(ext.replace(
+  "function getActiveRepositoryRoot(context) {",
+  "function getActiveRepositoryRoot(context) { fs.statSync(context).isDirectory();",
+)), /directory_only_storage_ready/);
+for (const [before, after] of [
+  ["!parent.isDirectory() || ", ""],
+  ["(parent.mode & 0o077)", "false"],
+  ["parent.uid !== process.getuid()", "false"],
+  ["function createVscodeLmActivityJournal(request)", "function renamedJournal(request)"],
+  ["const parent = fs.lstatSync(home);", "const parent = fs.lstatSync(home); parent.isDirectory();"],
+]) {
+  assert.ok(ext.includes(before), "mutation must modify the verified production boundary");
+  assert.throws(() => assertNoDirectoryOnlyStorageReady(ext.replace(before, after)),
+    /journal exception|exact journal function boundary/);
+}
+const journalForDuplicate = ext.match(
+  /^function createVscodeLmActivityJournal\(request\) \{[\s\S]*?\r?\n\}\r?\n/m,
+)[0];
+assert.throws(() => assertNoDirectoryOnlyStorageReady(ext + "\n" + journalForDuplicate),
+  /exact journal function boundary/);
 
 // getActiveRepositoryRoot must remain the single resolution path used by
 // activation, selectRepositoryCommand, and getMcpClient -- and it must never
@@ -331,3 +378,5 @@ assertPresent(
 );
 
 console.log("AIWorkHub explicit-init / no-legacy-fallback contract checks passed");
+
+module.exports = { assertNoDirectoryOnlyStorageReady };
