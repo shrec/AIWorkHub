@@ -78,6 +78,7 @@ def test_cleanup_is_digest_bound_write_gated_and_never_deletes_rogue_repo_dir(
     preview = hygiene.cleanup_preview(repo, scratch_root=scratch, now=10**12)
     assert preview["candidates"]
     assert preview["rogue_build_dirs"][0]["path"] == "build-debug"
+    monkeypatch.delenv("AIWORKHUB_ALLOW_WRITES", raising=False)
     with pytest.raises(hygiene.WorkspaceHygieneError, match="write_gate_closed"):
         hygiene.apply_cleanup(
             repo, preview_digest=preview["preview_digest"], confirm=True,
