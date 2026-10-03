@@ -5592,7 +5592,9 @@ async function runVscodeLmTextProtocol(
       reviewSubmitForced = true;
     }
     if (request.request_kind !== "quality_review" &&
-        sourceGraphAcknowledged && postSourceTurns >= VSCODE_LM_MAX_POST_SOURCE_TURNS) {
+        sourceGraphAcknowledged &&
+        (!writableTask || !Array.isArray(request.required_outputs) || request.required_outputs.length > 0) &&
+        postSourceTurns >= VSCODE_LM_MAX_POST_SOURCE_TURNS) {
       if (stagedEdits.hasChanges() && vscodeLmShouldKeepStagedEdit(writableTask, stagedEdits)) forceStagedEdit = true;
       else if (!writableTask || (stagedEdits && stagedEdits.hasChanges())) forceFinal = true;
     }
@@ -6333,6 +6335,7 @@ async function runVscodeLmAgent(
       reviewSubmitForced = true;
     }
     if (sourceGraphAcknowledged &&
+        (!writableTask || !Array.isArray(request.required_outputs) || request.required_outputs.length > 0) &&
         (toolTurns >= VSCODE_LM_MAX_TOOL_TURNS || postSourceTurns >= VSCODE_LM_MAX_POST_SOURCE_TURNS) &&
         !forceFinal) {
       if (vscodeLmShouldKeepStagedEdit(writableTask, stagedEdits)) {
