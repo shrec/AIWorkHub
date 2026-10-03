@@ -1182,6 +1182,137 @@ def test_task_create_normalizes_declared_difficulty_case_and_space(
     assert card["difficulty_origin"] == "declared"
 
 
+def test_task_create_schema_hints_publish_choices_without_constraints():
+    import asyncio
+    from aiworkhub import quality_evidence, task_templates
+
+    tool = next(
+        item for item in asyncio.run(server.mcp.list_tools())
+        if item.name == "aiworkhub_task_create"
+    )
+    fields = tool.inputSchema["properties"]
+    vocabularies = {
+        "difficulty": ("bounded", "standard", "complex"),
+        "work_kind": quality_evidence.WORK_KINDS,
+        "validation_roles": quality_evidence.VALIDATION_ROLES,
+        "custom_template_escape": (task_templates.AUDITED_CUSTOM_ESCAPE,),
+    }
+    for name, choices in vocabularies.items():
+        field = fields[name]
+        assert field["description"]
+        assert field["examples"]
+        for choice in choices:
+            assert choice in field["description"]
+            assert choice in tool.description
+        assert '"enum"' not in json.dumps(field)
+        assert '"const"' not in json.dumps(field)
+    assert fields["work_kind"]["type"] == "string"
+    assert fields["work_kind"]["default"] == "generic"
+    for name in ("difficulty", "validation_roles", "custom_template_escape", "validation"):
+        assert fields[name]["default"] is None
+        assert {"type": "null"} in fields[name]["anyOf"]
+    for name in ("validation", "validation_roles"):
+        branch = next(row for row in fields[name]["anyOf"] if row["type"] == "array")
+        assert branch["items"] == {"type": "string"}
+    assert "one" in fields["validation_roles"]["description"]
+    assert "shell-free" in fields["validation"]["description"]
+    assert "not" in fields["custom_template_escape"]["description"]
+
+
+def _task_create_bound_arguments(**overrides):
+    arguments = dict(
+        task_id="TASK_SCHEMA_HINT_BINDING", title="Schema binding",
+        runner="claude_difficulty", topic="task_mcp",
+        objective="Preserve task-create argument normalization.",
+        acceptance=["Existing task contract stays enforced."],
+        allowed_writes=["research/difficulty.json"],
+        required_outputs=["research/difficulty.json"],
+        validation=["python3 -m json.tool research/difficulty.json"],
+        custom_template_escape="audited_custom_unclassified", echo_card=True,
+    )
+    arguments.update(overrides)
+    return arguments
+
+
+def test_task_create_schema_hints_real_binding_keeps_normalization(tmp_path, monkeypatch):
+    import asyncio
+
+    _difficulty_repo(tmp_path, monkeypatch)
+    tool = server.mcp._tool_manager.get_tool("aiworkhub_task_create")
+    result = asyncio.run(tool.run(_task_create_bound_arguments(
+        difficulty=" Standard ", work_kind=" Generic ", validation_roles=[" Generic "],
+    )))
+    assert result["ok"] is True, result
+    card = json.loads(result["stdout"])
+    assert card["difficulty"] == "standard"
+    assert card["work_kind"] == "generic"
+    assert card["validation_roles"] == ["generic"]
+    assert card["status"] == "pending"
+
+
+@pytest.mark.parametrize(("overrides", "reason"), [
+    ({"difficulty": "medium"}, "invalid_difficulty"),
+    ({"work_kind": "implementation"}, "invalid_work_kind"),
+    ({"validation_roles": ["generic", "generic"]}, "validation_roles_length_mismatch"),
+    ({"validation_roles": ["unknown"]}, "invalid_validation_role"),
+    ({"validation": ["python3 -m json.tool research/difficulty.json && echo ok"]}, "shell"),
+    ({"custom_template_escape": None}, "unclassified"),
+    ({"custom_template_escape": "custom"}, "custom_escape_invalid"),
+])
+def test_task_create_schema_hints_real_binding_keeps_refusals(
+    tmp_path, monkeypatch, overrides, reason,
+):
+    import asyncio
+
+    root = _difficulty_repo(tmp_path, monkeypatch)
+    tool = server.mcp._tool_manager.get_tool("aiworkhub_task_create")
+    result = asyncio.run(tool.run(_task_create_bound_arguments(**overrides)))
+    assert result["ok"] is False, result
+    assert reason in json.dumps(result), result
+    assert not task_store.get_task(root, "TASK_SCHEMA_HINT_BINDING")
+
+
+def test_task_create_schema_hints_stdlib_keeps_dependency_free_schema():
+    import os
+    import subprocess
+
+    env = dict(os.environ, AIWORKHUB_MCP_STDIO_BACKEND="stdlib", PYTHONPATH=str(SRC))
+    script = """
+import inspect
+import importlib.util
+import json
+import typing
+from aiworkhub import server
+assert importlib.util.find_spec("mcp") is None
+assert importlib.util.find_spec("pydantic") is None
+assert not server._MCP_SDK_AVAILABLE
+signature = inspect.signature(server.aiworkhub_task_create)
+assert signature.parameters["work_kind"].default == "generic"
+for name in ("difficulty", "validation_roles", "custom_template_escape", "validation"):
+    assert signature.parameters[name].default is None
+    annotation = typing.get_type_hints(server.aiworkhub_task_create)[name]
+    assert type(None) in typing.get_args(annotation)
+for arguments, reason in (([], "arguments_must_be_object"), ({"unexpected": 1}, "unexpected_arguments")):
+    try:
+        server._stdio_tools_call(server.mcp._tools, {"name": "aiworkhub_task_create", "arguments": arguments})
+    except server._StdioProtocolError as error:
+        assert error.code == -32602 and reason in error.message
+    else:
+        raise AssertionError("fallback refusal disappeared")
+print(json.dumps(server._stdio_schema_for(server.aiworkhub_task_create)))
+"""
+    result = subprocess.run(
+        [sys.executable, "-S", "-c", script], env=env, capture_output=True,
+        text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    fields = json.loads(result.stdout)["properties"]
+    for name in ("difficulty", "work_kind", "custom_template_escape"):
+        assert fields[name] == {"type": "string"}
+    for name in ("validation", "validation_roles"):
+        assert fields[name] == {"type": "array", "items": {"type": "string"}}
+
+
 def test_task_create_rejects_invalid_difficulty(tmp_path, monkeypatch):
     root = _difficulty_repo(tmp_path, monkeypatch)
 

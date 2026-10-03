@@ -2159,6 +2159,15 @@ def aiworkhub_repo_switch(repo_id: str) -> dict[str, Any]:
     return core.repository_switch(repo_id)
 
 
+def _task_create_hint(description: str, examples: list[Any]) -> Any:
+    """Optional SDK metadata only; stdlib get_type_hints strips Annotated extras."""
+    if not _MCP_SDK_AVAILABLE:
+        return None
+    from pydantic import Field
+
+    return Field(description=description, examples=examples)
+
+
 @mcp.tool()
 @_serialize_task_lifecycle_write
 def aiworkhub_task_create(
@@ -2173,7 +2182,11 @@ def aiworkhub_task_create(
     required_outputs: list[str] | None = None,
     allow_empty_required_outputs: list[str] | None = None,
     allow_unchanged_required_outputs: list[str] | None = None,
-    validation: list[str] | None = None,
+    validation: typing.Annotated[list[str] | None, _task_create_hint(
+        "shell-free executable commands, one per entry; no environment assignments, "
+        "pipes, redirects, or command chaining. Set environment outside validation argv.",
+        [["python -m pytest -q tests/test_example.py"]],
+    )] = None,
     priority: str = "normal",
     task_type: str = "code",
     depends_on: list[str] | None = None,
@@ -2181,21 +2194,53 @@ def aiworkhub_task_create(
     immutable_inputs: list[str] | None = None,
     read_only: bool = False,
     max_live_tokens: int | None = None,
-    work_kind: str = "generic",
-    validation_roles: list[str] | None = None,
+    work_kind: typing.Annotated[str, _task_create_hint(
+        "Accepted work_kind values: " + ", ".join(quality_evidence.WORK_KINDS)
+        + ". Case and surrounding space are normalized by core; never infer from prose.",
+        ["generic", "bugfix"],
+    )] = "generic",
+    validation_roles: typing.Annotated[list[str] | None, _task_create_hint(
+        "Accepted validation_roles: " + ", ".join(quality_evidence.VALIDATION_ROLES)
+        + ". Supply one role per validation command. Required: bugfix=reproduction+regression; "
+        "refactor=parity; performance=baseline+delta; security=negative_fixture; "
+        "data_ml=schema+distribution. Case and surrounding space are normalized by core.",
+        [["reproduction", "regression"], ["generic"]],
+    )] = None,
     risk_tier: str | None = None,
-    difficulty: str | None = None,
+    difficulty: typing.Annotated[str | None, _task_create_hint(
+        "Accepted difficulty values: bounded, standard, complex. Optional; omitted remains "
+        "undeclared, never inferred. Case and surrounding space are normalized by core.",
+        ["standard", "bounded"],
+    )] = None,
     skill_task_family: str | None = None,
     skill_stage: str | None = None,
     skill_triggers: list[str] | None = None,
     skill_applicability: list[str] | None = None,
     skill_path_scope: str | None = None,
-    custom_template_escape: str | None = None,
+    custom_template_escape: typing.Annotated[str | None, _task_create_hint(
+        "Explicit audited escape token: " + task_templates.AUDITED_CUSTOM_ESCAPE
+        + ". Only for deliberately audited unclassified cards, not an automatic bypass. "
+        "Writable escaped cards require non-empty required_outputs covered by allowed_writes.",
+        [task_templates.AUDITED_CUSTOM_ESCAPE],
+    )] = None,
     apply_contract_patch: str | None = None,
     echo_card: bool = False,
     wave_goal_binding: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """MANAGER WRITE: create one new canonical repo-local task card.
+
+    Creation choices (also exposed as field hints):
+    difficulty: bounded, standard, complex (optional; never inferred).
+    work_kind: generic, bugfix, refactor, performance, security, data_ml.
+    validation_roles: generic, reproduction, regression, parity, baseline,
+    delta, negative_fixture, schema, distribution; one per validation command.
+    Required roles: bugfix=reproduction+regression; refactor=parity;
+    performance=baseline+delta; security=negative_fixture; data_ml=schema+distribution.
+    validation: shell-free executable commands; no environment assignments,
+    pipes, redirects or chaining. Set environment outside validation argv.
+    custom_template_escape: audited_custom_unclassified, explicitly audited
+    unclassified cards only, not an automatic bypass; writable escaped cards
+    require non-empty required_outputs covered by allowed_writes.
 
     Replies with a creation receipt (``aiworkhub.task_create_receipt.v1``):
     task_id, created/reconciled/receipt_state, scope_warnings, the
