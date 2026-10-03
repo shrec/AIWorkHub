@@ -149,6 +149,19 @@ def _bridge_chmod_sandbox_restriction(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(os, "fchmod", lambda *a, **k: None)
 
 
+@pytest.fixture(autouse=True)
+def _synthetic_dashboard_authority(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # FakeProvider still exercises genuine repository fallback readers. Bind
+    # their default authority, rather than stubbing telemetry under test.
+    root = _init_canonical_repo(tmp_path, "dashboard-default").resolve()
+    home = tmp_path / "dashboard-home"
+    home.mkdir()
+    for variable in ("AIWORKHUB_REPO_ROOT", "AIWORKHUB_REPO"):
+        monkeypatch.setenv(variable, str(root))
+    for variable in ("HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "TMP", "TEMP"):
+        monkeypatch.setenv(variable, str(home))
+
+
 class FakeProvider:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str | None]] = []
@@ -1708,6 +1721,29 @@ class _FoundationProvider(FakeProvider):
         if "tool_recipes" not in self._inputs:
             raise AttributeError("tool_recipes")
         return self._inputs["tool_recipes"]
+
+
+def test_fake_provider_snapshot_does_not_read_owner_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    expected_root = (tmp_path / "dashboard-default").resolve()
+    original_root_reader = core.repo_root
+    root_reads: list[Path] = []
+
+    def guarded_root_reader() -> Path:
+        # Refuse before resolving or reading an inherited owner authority.
+        for variable in ("AIWORKHUB_REPO_ROOT", "AIWORKHUB_REPO"):
+            assert os.environ.get(variable) == str(expected_root), variable
+        root = original_root_reader()
+        assert root == expected_root
+        root_reads.append(root)
+        return root
+
+    monkeypatch.setattr(core, "repo_root", guarded_root_reader)
+    snapshot = dashboard.build_snapshot(FakeProvider())
+    assert len(root_reads) >= 4
+    for key in ("development_rules", "skills", "tool_recipes"):
+        assert snapshot[key]["state"] == "not_wired"
 
 
 def test_coding_foundation_default_snapshot_is_not_wired() -> None:
