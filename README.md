@@ -62,6 +62,12 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
+## What's new in 0.12.22
+
+Editor-worker staging now accepts explicitly allowed optional outputs without confusing mandatory completion with filesystem authorization. Exact scope, action contracts, semantic hashes/ranges, content fidelity and required-output completion remain enforced.
+
+An old-source red regression and repaired production collector/text transport pass alongside independent bridge, console and Python checks. Installation and live worker replay remain separate evidence; full Manager Chat, sandboxed OpenCode/Muse, uniform context policy and Skills completion are not claimed.
+
 ## What's new in 0.12.21
 
 Authorized complete-create editor-worker stages now accept up to 255 KiB instead of the general 16 KiB limit. Exact card scope, payload fidelity and required-output checks remain enforced; reads, range edits and malformed or unauthorized requests keep the original bound. This restores a measured multi-file worker blocker without granting new filesystem authority.

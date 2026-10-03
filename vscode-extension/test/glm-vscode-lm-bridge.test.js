@@ -1154,7 +1154,7 @@ async function textProtocolChecks() {
     content: "def created():\n    return True\n",
   });
   assert.strictEqual(extraPathStage.ok, false);
-  assert.match(extraPathStage.reason, /path_not_required/);
+  assert.match(extraPathStage.reason, /action_mismatch/);
   assert.strictEqual(extraPathStage.required_output_count, 1);
   assert.deepStrictEqual(extraPathStage.completed_outputs, ["src/app.py"]);
   assert.deepStrictEqual(extraPathStage.missing_outputs, []);

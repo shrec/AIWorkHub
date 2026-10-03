@@ -14,6 +14,12 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.12.22
+
+- Explicitly allowed optional outputs can be staged alongside mandatory outputs; mandatory completion is not a second write scope.
+- Exact scope/action contracts, semantic hashes/ranges, substantive content and completion checks stay enforced.
+- Independent component regressions pass. Installation/live replay and full Manager Chat, sandboxed OpenCode/Muse, context policy and Skills completion are separate, unclaimed checks.
+
 ## What's new in 0.12.21
 
 - Authorized complete-create worker stages have a separate 255 KiB payload bound; general requests retain 16 KiB.

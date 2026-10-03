@@ -90,10 +90,15 @@ async function main() {
   for (const denied of [
     { ...request, allowedWrites: [] },
     { ...request, allowedWrites: ["src/other.js"] },
-    { ...request, required_outputs: ["src/other.js"] },
+    { ...request, path_contracts: {} },
   ]) {
     assert.equal((await bridge.createVscodeLmStagedEditCollector(denied).stage(input)).ok, false);
   }
+  const incomplete = bridge.createVscodeLmStagedEditCollector({ ...request, required_outputs: ["src/other.js"] });
+  assert.equal((await incomplete.stage(input)).ok, true, "an obligation does not remove the allowed write scope");
+  const missingRequired = incomplete.finalize("an optional create cannot replace a required output");
+  assert.equal(missingRequired.ok, false);
+  assert.deepEqual(missingRequired.missing_outputs, ["src/other.js"]);
 }
 
 main().then(() => console.log("VS Code LM first-stage discovery transition: ok"))

@@ -6,6 +6,18 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.22] - 2026-10-03
+
+### Fixed
+
+- Editor workers may stage an explicitly allowed output outside the mandatory-output set. Mandatory completion is not a second filesystem authorization scope.
+- Exact allowed-write/action contracts, semantic hashes and ranges, substantive-content checks and required-output completion remain enforced.
+
+### Qualification
+
+- An old-source red regression and repaired production collector/text transport pass; independent bridge, console and Python checks pass.
+- This is a Task MCP restoration, not completed Manager Chat, sandboxed OpenCode/Muse, context-policy or Skills integration. Installation and live worker replay require separate evidence.
+
 ## [0.12.21] - 2026-10-03
 
 ### Fixed

@@ -1,5 +1,16 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.12.22 — 2026-10-03
+
+### Fixed
+
+- Explicitly allowed optional outputs are accepted by editor-worker staging, with unchanged scope/action, semantic hash/range, content-fidelity and mandatory-completion checks.
+
+### Qualification
+
+- Old-source red/new-source green production collector/text-transport regression, independent bridge/console harnesses and Python checks pass.
+- Installation and live worker replay remain separate checks. Full Manager Chat, sandboxed OpenCode/Muse, context-policy and Skills completion are not claimed.
+
 ## 0.12.21 — 2026-10-03
 
 ### Fixed

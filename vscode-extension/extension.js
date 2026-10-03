@@ -11,7 +11,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.12.21";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.12.22";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 // NF-2026-00643: this globalStorage trace directory was measured holding 1,102
 // files and 2,235,024,325 bytes (2.24 GB), largest single file 44,626,825 bytes
@@ -4414,7 +4414,6 @@ function createVscodeLmStagedEditCollector(request) {
       requiredOutputs.push(filePath);
     }
   }
-  const requiredSet = new Set(requiredOutputs);
   let incompleteFinalizeCount = 0;
 
   const nextMissingRequired = () => {
@@ -4509,9 +4508,8 @@ function createVscodeLmStagedEditCollector(request) {
     if (trackRequired && incompleteFinalizeCount >= 2) {
       return reject("required_outputs_correction_exhausted");
     }
-    if (trackRequired && requiredSet.size > 0 && !requiredSet.has(filePath)) {
-      return reject(`path_not_required:${filePath}`);
-    }
+    // Required outputs are completion obligations, not a second write scope.
+    // Exact allowed-write and action contracts authorize optional outputs too.
     const contract = contractByPath.get(filePath);
     const unexpectedKeys = (candidate) => {
       const all = ["operation", "file_path"];
