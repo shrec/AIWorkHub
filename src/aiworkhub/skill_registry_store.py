@@ -1202,7 +1202,11 @@ def skill_coverage(
     by_lifecycle: dict[str, int] = {}
     injectable = 0
     active_unreachable = 0
+    accepted_evidence = 0
+    accepted_actors: set[str] = set()
     for record in records:
+        accepted_evidence += skill_registry.independent_accepted_evidence_count(record)
+        accepted_actors.update(skill_registry.independent_accepted_actor_ids(record))
         state = record.lifecycle_state.value
         by_lifecycle[state] = by_lifecycle.get(state, 0) + 1
         if record.lifecycle_state is not skill_registry.LifecycleState.ACTIVE:
@@ -1243,6 +1247,8 @@ def skill_coverage(
             ),
             "injectable": injectable,
             "active_unreachable_vocabulary": active_unreachable,
+            "accepted_evidence_count": "unknown" if records_truncated else accepted_evidence,
+            "distinct_actor_count": "unknown" if records_truncated else len(accepted_actors),
             # The population these totals were counted over, and whether the
             # registry held more than it. Without both, "total" reads as the
             # registry when it is only the first identity-ordered page of it.

@@ -1197,6 +1197,77 @@ def test_accepted_evidence_from_two_actors_carries_a_skill_into_selection(
     assert skill_registry_store.skill_coverage(repo)["skills"]["injectable"] == 1
 
 
+@pytest.mark.parametrize("record_limit", [None, 2])
+def test_dashboard_skill_totals_measure_store_population_not_rendered_rows(
+    tmp_path: Path, monkeypatch, record_limit
+) -> None:
+    from aiworkhub import dashboard
+
+    monkeypatch.setenv("AIWORKHUB_ALLOW_WRITES", "1")
+    for index in range(9):
+        proposal = skill_registry.validate_record(
+            skill_registry.replace(_reachable_proposal(), identity=f"a-proposed-{index}")
+        )
+        skill_registry_store.put_record(tmp_path, proposal)
+    # The only injectable/evidenced record sorts outside the eight displayed rows.
+    qualified = _vocabulary_record(identity="z-qualified")
+    skill_registry_store.put_record(tmp_path, qualified)
+    real_coverage = skill_registry_store.skill_coverage
+    coverage = real_coverage(tmp_path, record_limit=record_limit or 1000)
+    assert coverage["skills"]["truncated"] is (record_limit is not None)
+    if record_limit is not None:
+        assert coverage["skills"]["accepted_evidence_count"] == "unknown"
+        assert coverage["skills"]["distinct_actor_count"] == "unknown"
+        monkeypatch.setattr(
+            skill_registry_store,
+            "skill_coverage",
+            lambda repo: real_coverage(repo, record_limit=record_limit),
+        )
+    payload = dashboard.DashboardProvider(repo_root=tmp_path).get_skills_projection_input()
+    projected = dashboard._project_skills(
+        payload, ownership="full", input_state="present"
+    )
+    assert projected["count"] == 10
+    assert projected["returned_count"] == 8
+    assert projected["truncated"] is True
+    expected = ("unknown", "unknown", "unknown") if record_limit else (1, 2, 2)
+    assert (
+        projected["injectable_count"],
+        projected["accepted_evidence_count"],
+        projected["distinct_actor_count"],
+    ) == expected
+    assert projected["invocation"]["state"] == "no_sample"
+    assert projected["outcome"]["state"] == "no_sample"
+
+
+def test_dashboard_skill_coverage_failure_is_explicit_and_fail_soft(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from aiworkhub import dashboard
+
+    monkeypatch.setenv("AIWORKHUB_ALLOW_WRITES", "1")
+    for index in range(9):
+        skill_registry_store.put_record(
+            tmp_path, _vocabulary_record(identity=f"qualified-{index}")
+        )
+
+    def unavailable(repo):
+        raise OSError("coverage read unavailable")
+
+    monkeypatch.setattr(skill_registry_store, "skill_coverage", unavailable)
+    payload = dashboard.DashboardProvider(repo_root=tmp_path).get_skills_projection_input()
+    assert payload._dashboard_skill_coverage == {
+        "measured": False,
+        "unavailable_reason": "skill_coverage_failed:OSError",
+    }
+    projected = dashboard._project_skills(
+        payload, ownership="full", input_state="present"
+    )
+    assert projected["injectable_count"] == "unknown"
+    assert projected["accepted_evidence_count"] == "unknown"
+    assert projected["distinct_actor_count"] == "unknown"
+
+
 def test_one_accepted_actor_never_activates_however_many_entries_it_files(
     tmp_path: Path,
 ) -> None:

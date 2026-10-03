@@ -2301,6 +2301,17 @@ class DashboardProvider:
         except Exception:  # noqa: BLE001 - a bad store must never break the dashboard
             return api.SkillRegistry()
         payload: dict[str, Any] = {"registry": registry}
+        coverage = getattr(store, "skill_coverage", None)
+        if callable(coverage):
+            # The eight rendered rows are not the measured registry population.
+            try:
+                measured = coverage(self.repo_root)
+            except Exception as exc:  # noqa: BLE001 - unavailable is never measured zero
+                measured = {
+                    "measured": False,
+                    "unavailable_reason": f"skill_coverage_failed:{type(exc).__name__}",
+                }
+            object.__setattr__(registry, "_dashboard_skill_coverage", measured)
         # Preserve an absent database or selection-receipt table as unavailable
         # evidence. The store's bounded reader intentionally returns [] for both
         # absence and a measured empty table, so inspect only the durable store's
@@ -3461,6 +3472,19 @@ def _project_skills(
             api, records, truncated=truncated or total_count == "unknown"
         )
     )
+    registry = mapping.get("registry") if mapping is not None else payload
+    coverage = getattr(registry, "_dashboard_skill_coverage", None)
+    if isinstance(coverage, Mapping) and coverage.get("measured") is True:
+        totals = coverage.get("skills")
+        if isinstance(totals, Mapping) and totals.get("truncated") is False:
+            for field, source in (
+                ("injectable_count", "injectable"),
+                ("accepted_evidence_count", "accepted_evidence_count"),
+                ("distinct_actor_count", "distinct_actor_count"),
+            ):
+                value = totals.get(source)
+                if type(value) is int and value >= 0:
+                    projected[field] = value
     projected.update(evidence)
     if ownership == "summary":
         return _cheap_projection(projected)
