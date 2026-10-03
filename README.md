@@ -62,6 +62,14 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
+## What's new in 0.12.18
+
+- Manager Chat now has safe Markdown, live partial text, command/diff blocks, task links, a real usage footer, context hairline, transcript pagination and scroll control.
+- Worker completion and Source Graph progress guards no longer confuse valid work with premature completion or discovery stalls.
+- Pending model reroutes and skills evidence are wired to canonical authority; both dashboards expose separate unpriced main/subagent transcript usage.
+- Declared worker contexts carry task-scoped Development Rules; dashboard cost headers distinguish unknown cost, partially priced totals and observed zero.
+- Full Python and extension release gates passed; live activation and sandboxed OpenCode/Muse startup remain explicitly pending.
+
 ## What's new in 0.12.17
 
 - Source Graph retries a briefly contended index recovery instead of failing the refresh.

@@ -14,6 +14,14 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.12.18
+
+- Manager Chat now has safe Markdown, live partial text, command/diff blocks, task links, a real usage footer, context hairline, transcript pagination and scroll control.
+- Worker completion and Source Graph progress guards no longer confuse valid work with premature completion or discovery stalls.
+- Pending model reroutes and skills evidence are wired to canonical authority; both dashboards expose separate unpriced main/subagent transcript usage.
+- Declared worker contexts carry task-scoped Development Rules; dashboard cost headers distinguish unknown cost, partially priced totals and observed zero.
+- Full Python and extension release gates passed; live activation and sandboxed OpenCode/Muse startup remain explicitly pending.
+
 ## What's new in 0.12.17
 
 - Source Graph retries a briefly contended index recovery instead of failing the refresh.

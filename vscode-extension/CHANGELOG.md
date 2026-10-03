@@ -1,5 +1,28 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.12.18 — 2026-10-03
+
+### Added
+
+- Manager Chat renders glyph blocks, merged command output, expandable diffs, task links, a measured usage footer and context hairline.
+- Safe DOM Markdown, transient live partial text, frame-coalesced rendering, 400-block pagination, scroll control and final-only screen-reader announcements are wired through the actual chat panel.
+- Both dashboards display main and subagent Claude transcript usage separately as unpriced repository history, without adding it to canonical task costs.
+
+### Fixed
+
+- Empty-output workers await explicit completion instead of being finalized after their first test-only stage.
+- Source Graph progress is recognized from returned source evidence and verified chained pages; duplicate and no-progress protection remain enabled.
+- Pristine pending cards can be explicitly rerouted to an eligible implementation worker with audited provenance and atomic concurrent-claim protection.
+- Skills adoption totals use the measured registry rather than eight rendered rows; accepted learning decisions now feed the existing bootstrap evidence path with exact native acceptance and actor binding.
+- Declared worker contexts include digest-bound, task-scoped Development Rules with deduplicated path applicability; cards without that context contract retain their existing behavior.
+- Cost headers distinguish unavailable cost from observed zero and label partially priced totals with measured coverage.
+- Extension tests isolate child homes, configuration and temporary files inside the repository, protecting live manager routes.
+- Windows callback registry snapshots use shared, no-follow reads and pinned-parent publication so atomic updates do not transiently hide a live instance; default platform rename behavior is unchanged.
+
+### Qualification
+
+- Full canonical Python qualification passed (15,614 tests, 444 skips, two warnings and three subtests); all 64 extension test files passed. Live activation remains pending; sandboxed OpenCode/Muse startup is not claimed fixed.
+
 ## 0.12.17 — 2026-10-03
 
 ### Added
