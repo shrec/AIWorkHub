@@ -2370,7 +2370,8 @@ def test_a_filesystem_root_is_never_granted(tmp_path, access):
 def test_protected_trees_come_from_the_token_not_the_request_env(
     tmp_path, monkeypatch
 ):
-    real_profile_path = os.environ["USERPROFILE"]
+    real_profile_path = wac._token_profile_directory()
+    assert real_profile_path
     real_profile = os.path.normcase(real_profile_path)
     # A launcher points USERPROFILE/TEMP at the request's own directories,
     # and then the env-expanding known-folder lookups fail (measured).  Never
