@@ -87,7 +87,7 @@ function makeModel(responses) {
       sendRequest: async () => {
         const value = responses[Math.min(state.turns, responses.length - 1)];
         state.turns += 1;
-        return { stream: (async function* stream() { yield { value }; })() };
+        return { stream: (async function* stream() { yield new LanguageModelTextPart(value); })() };
       },
     },
   };
