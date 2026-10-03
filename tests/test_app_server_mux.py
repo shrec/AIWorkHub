@@ -677,6 +677,111 @@ def test_notifications_reach_extension_for_visible_ui_updates(harness):
     assert completed["params"]["threadId"] == thread_id
 
 
+
+def test_passive_manager_notifications_forward_and_publish_only_on_registry_tick(tmp_path, monkeypatch):
+    import io
+    from types import SimpleNamespace
+    from aiworkhub import app_server_mux, codex_manager_observation
+
+    mux = AppServerMux(["app-server"], real_executable="fixture-never-started",
+                       sideband_dir=tmp_path / "sideband", repo_id=_MUX_TEST_REPO_ID)
+    mux._registry_path.parent.mkdir(parents=True, mode=0o700)
+    mux._server_socket = object()
+    mux._ready_event.set()
+    thread_id = str(uuid.uuid4())
+    mux._observe_extension_message(json.dumps({
+        "id": 1, "method": "thread/resume", "params": {"threadId": thread_id}}).encode())
+    writes = []
+    writer = app_server_mux._write_registry_descriptor
+
+    def capture_write(path, descriptor):
+        writes.append(descriptor)
+        writer(path, descriptor)
+
+    monkeypatch.setattr(app_server_mux, "_write_registry_descriptor", capture_write)
+    counters = {key: 0 for key in codex_manager_observation.COUNTERS}
+    event = {"method": "thread/tokenUsage/updated", "params": {
+        "threadId": thread_id, "turnId": "fixture-turn",
+        "tokenUsage": {"last": counters, "total": counters, "modelContextWindow": None}}}
+    raw = (json.dumps(event) + "\n").encode()
+    forwarded = []
+    mux._child = SimpleNamespace(stdout=io.BytesIO(raw), poll=lambda: None)
+    monkeypatch.setattr(mux, "_write_to_extension", forwarded.append)
+    mux._pump_child_to_extension()
+    assert forwarded == [raw]
+    assert writes == []
+    observed_at = mux._manager_context["usage_observed_at"]
+    mux._stop_event.clear()
+    mux._write_registry()
+    mux._write_registry()
+    assert len(writes) == 2
+    assert all(row["manager_context"]["usage_observed_at"] == observed_at for row in writes)
+    assert mux._registry_path.stat().st_size < app_server_mux.SIDEBAND_REGISTRY_MAX_BYTES
+    instance = app_server_mux._read_instance_descriptor(mux._registry_path)
+    assert instance is not None
+    assert instance.manager_context["usage"]["last"]["totalTokens"] == 0
+    assert instance.manager_context["generation_id"] == instance.generation_id
+    # A replaced owner cannot relabel another generation's snapshot.
+    corrupted = dict(writes[-1], generation_id="replacement-generation")
+    writer(mux._registry_path, corrupted)
+    assert app_server_mux._read_instance_descriptor(mux._registry_path).manager_context == {}
+    monkeypatch.setattr(app_server_mux, "_pid_is_live", lambda *args: False)
+    assert app_server_mux._read_instance_descriptor(mux._registry_path) is None
+
+
+def test_passive_snapshot_resets_on_active_thread_switch_not_same_thread_resume(tmp_path):
+    from aiworkhub import app_server_mux
+
+    mux = AppServerMux(["app-server"], real_executable="fixture-never-started",
+                       sideband_dir=tmp_path / "sideband", repo_id=_MUX_TEST_REPO_ID)
+    mux._registry_path.parent.mkdir(parents=True, mode=0o700)
+    mux._server_socket = object()
+    mux._ready_event.set()
+    first, second = str(uuid.uuid4()), str(uuid.uuid4())
+    mux._record_owned_thread(first)
+    mux._observe_child_message(json.dumps({
+        "method": "thread/status/changed", "params": {
+            "threadId": first, "status": {"type": "idle"}}}).encode())
+    original = dict(mux._manager_context)
+    mux._record_owned_thread(first)
+    assert mux._manager_context == original
+    mux._record_owned_thread(second)
+    mux._record_owned_thread(first)
+    instance = app_server_mux._read_instance_descriptor(mux._registry_path)
+    assert instance is not None
+    assert "status" not in instance.manager_context
+    assert mux._manager_context == {}
+
+
+def test_oversized_passive_frame_skips_parser_preserves_capture_and_forwarding(tmp_path, monkeypatch):
+    import io
+    from types import SimpleNamespace
+    from aiworkhub import app_server_mux
+
+    mux = AppServerMux(["app-server"], real_executable="fixture-never-started",
+                       sideband_dir=tmp_path / "sideband", repo_id=_MUX_TEST_REPO_ID)
+    raw = b" " * (app_server_mux.SIDEBAND_REGISTRY_MAX_BYTES + 1) + b"\n"
+    parsed, forwarded = [], []
+    message = {"method": "fixture"}
+    monkeypatch.setattr(app_server_mux, "_try_parse_json_object",
+                        lambda line: parsed.append(line) or message)
+    monkeypatch.setattr(mux, "_write_to_extension", forwarded.append)
+    mux._transcript_capture = None
+    # Isolate passive parsing from the pre-existing response router's parser.
+    mux._observe_child_message(raw)
+    assert parsed == []
+    monkeypatch.setattr(mux, "_route_child_message", lambda line: False)
+    mux._child = SimpleNamespace(stdout=io.BytesIO(raw), poll=lambda: None)
+    mux._pump_child_to_extension()
+    assert forwarded == [raw]
+    assert parsed == []
+    offered = []
+    mux._transcript_capture = SimpleNamespace(offer=offered.append)
+    mux._observe_child_message(raw)
+    assert parsed == [raw]
+    assert offered == [message]
+
+
 def test_server_error_response_forwarded_transparently(harness):
     """An out-of-order request (unknown to the fake server) must still
     reach the extension as a real JSON-RPC error, never swallowed."""

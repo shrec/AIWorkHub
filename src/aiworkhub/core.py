@@ -11616,6 +11616,41 @@ def claude_callback_ack_by_reference(*, task_id: str = "", request_id: str = "")
         conn.close()
 
 
+def _passive_codex_manager_context(root: Path, target: dict[str, Any]) -> dict[str, Any]:
+    """Read existing validated owner metadata; never issue a child request."""
+    from . import app_server_mux, codex_manager_observation as observation
+
+    unknown = observation.project({}, time.time(), app_server_mux.SIDEBAND_OWNER_LEASE_SECONDS)
+    try:
+        route = target.get("targets", {}).get("codex", {}).get("route", {})
+        thread_id = route.get("thread_id")
+        repo_id = task_store.storage_readiness(root).repo_id
+        parent_pid = target.get("extension_host_pid")
+        window_id = target.get("window_id")
+        if (target.get("selected_provider") != "codex"
+                or not isinstance(thread_id, str) or not _UUID_RE.fullmatch(thread_id)
+                or type(parent_pid) is not int or parent_pid <= 1 or not window_id):
+            return {**unknown, "reason": "manager_route_unobserved"}
+        windows = [record for record in _read_live_window_route_records(root)
+                   if record.get("repo_id") == repo_id and record.get("window_id") == window_id
+                   and record.get("extension_host_pid") == parent_pid]
+        if len(windows) != 1:
+            return {**unknown, "reason": "window_owner_unavailable_or_ambiguous"}
+        owners = [instance for instance in app_server_mux.list_live_sideband_instances(
+                      app_server_mux.default_sideband_dir())
+                  if instance.repo_id == repo_id and instance.parent_pid == parent_pid
+                  and thread_id in instance.owned_thread_ids and instance.ready
+                  and instance.is_owner_fresh]
+        if len(owners) != 1:
+            return {**unknown, "reason": "thread_owner_unavailable_or_ambiguous"}
+        owner = owners[0]
+        data = observation.hydrate(owner.manager_context, thread_id, owner.generation_id)
+        return {**observation.project(data, time.time(), owner.owner_lease_seconds),
+                "owner_instance_id": owner.instance_id, "owner_generation_id": owner.generation_id}
+    except (OSError, RuntimeError, TypeError, ValueError, AttributeError, task_store.TaskStoreError):
+        return {**unknown, "reason": "manager_observation_unavailable"}
+
+
 def dispatcher_health() -> dict[str, Any]:
     """Read-only dispatcher health for the active repository.
 
@@ -11718,6 +11753,7 @@ def dispatcher_health() -> dict[str, Any]:
         "dispatch_expected": dispatch_expected,
         "recoverable": bool(problems),
         "problems": problems,
+        "manager_context": _passive_codex_manager_context(root, target),
         **backlog,
     }
 

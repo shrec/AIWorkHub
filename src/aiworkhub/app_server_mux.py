@@ -150,6 +150,11 @@ except ImportError:  # direct-script Codex mux entrypoint
         stat_owned_by_current_user,
     )
 
+try:
+    from . import codex_manager_observation as observation
+except ImportError:  # direct-script Codex mux entrypoint
+    import codex_manager_observation as observation
+
 if __package__:
     from . import shared_router
 else:  # direct-file CLI compatibility; package launcher uses the branch above
@@ -971,6 +976,7 @@ class SidebandInstance:
     heartbeat_at: float = 0.0
     owner_lease_seconds: float = SIDEBAND_OWNER_LEASE_SECONDS
     ready: bool = False
+    manager_context: dict[str, Any] = field(default_factory=dict)
 
     @property
     def age_seconds(self) -> float:
@@ -1083,6 +1089,7 @@ def _read_instance_descriptor(path: Path) -> SidebandInstance | None:
         heartbeat_at=float(heartbeat_at),
         owner_lease_seconds=float(owner_lease_seconds),
         ready=bool(ready),
+        manager_context=observation.hydrate(obj.get("manager_context"), active_thread_id, generation_id),
     )
 
 
@@ -1794,15 +1801,25 @@ class AppServerMux:
             self._owned_thread_ids.append(thread_id)
             if len(self._owned_thread_ids) > SIDEBAND_MAX_OWNED_THREAD_IDS:
                 self._owned_thread_ids.pop(0)
+            if self._active_thread_id != thread_id:
+                self._manager_context = {}
             self._active_thread_id = thread_id
             self._active_thread_observed_at = time.time()
         self._write_registry()
 
     def _observe_child_message(self, raw_line: bytes) -> None:
-        if self._transcript_capture is None:
+        if self._transcript_capture is None and len(raw_line) > SIDEBAND_REGISTRY_MAX_BYTES:
             return
         message = _try_parse_json_object(raw_line)
-        if message is not None:
+        if message is None:
+            return
+        with self._owned_thread_lock:
+            active = self._active_thread_id
+            if active in self._owned_thread_ids and len(raw_line) <= SIDEBAND_REGISTRY_MAX_BYTES:
+                self._manager_context = observation.observe(
+                    message, active, getattr(self, "_manager_context", {}), time.time(),
+                )
+        if self._transcript_capture is not None:
             self._transcript_capture.offer(message)
 
     def _write_registry(self) -> None:
@@ -1812,6 +1829,10 @@ class AppServerMux:
             owned = list(self._owned_thread_ids)
             active_thread_id = self._active_thread_id
             active_thread_observed_at = self._active_thread_observed_at
+            manager_context = observation.hydrate(
+                {**getattr(self, "_manager_context", {}), "generation_id": self._generation_id},
+                active_thread_id, self._generation_id,
+            )
         descriptor = {
             "instance_id": self._instance_id,
             "generation_id": self._generation_id,
@@ -1832,6 +1853,7 @@ class AppServerMux:
                 if self._transcript_capture is not None
                 else {"state": "unavailable"}
             ),
+            "manager_context": manager_context,
         }
         _write_registry_descriptor(self._registry_path, descriptor)
 

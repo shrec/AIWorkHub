@@ -275,3 +275,66 @@ def test_terminal_enqueue_is_durable_and_replays_after_recovery(tmp_path, monkey
     assert batch["origin_thread_id"] == thread
     assert [m["task_id"] for m in batch["members"]] == ["TASK_RECOVER"]
     conn.close()
+
+
+
+def test_public_dispatcher_health_passive_context_zero_parked_callbacks(tmp_path, monkeypatch):
+    import json
+    import pytest
+    from aiworkhub import app_server_mux, codex_manager_observation, server
+
+    repo_id = "repo_" + "1" * 32
+    thread = str(uuid.uuid4())
+    mux = app_server_mux.AppServerMux(
+        ["app-server"], real_executable="fixture-never-started",
+        sideband_dir=tmp_path / "sideband", repo_id=repo_id)
+    mux._registry_path.parent.mkdir(parents=True, mode=0o700)
+    mux._server_socket = object()
+    mux._ready_event.set()
+    mux._observe_extension_message(json.dumps({
+        "id": 1, "method": "thread/resume", "params": {"threadId": thread}}).encode())
+    counters = {key: 0 for key in codex_manager_observation.COUNTERS}
+    mux._observe_child_message(json.dumps({
+        "method": "thread/tokenUsage/updated", "params": {
+            "threadId": thread, "turnId": "fixture-turn",
+            "tokenUsage": {"last": counters, "total": counters, "modelContextWindow": None}}}).encode())
+    mux._observe_child_message(json.dumps({"method": "thread/status/changed", "params": {
+        "threadId": thread, "status": {"type": "idle"}}}).encode())
+    mux._write_registry()
+    _patch_core(monkeypatch, readiness=_readiness(repo_id=repo_id),
+                bridge_health={**_RUNNING, "repo_id": repo_id}, window_id="fixture-window")
+    target = {"selected_provider": "codex", "extension_host_pid": mux._parent_pid,
+              "window_id": "fixture-window", "targets": {"codex": {
+                  "route": {"thread_id": thread}, "wake": {"supported": True, "mode": "app_server_sideband"}}}}
+    monkeypatch.setattr(core, "read_selected_coordinator_target", lambda root=None: target)
+    monkeypatch.setattr(core, "_read_live_window_route_records", lambda root: [
+        {"repo_id": repo_id, "window_id": "fixture-window", "extension_host_pid": mux._parent_pid}])
+    monkeypatch.setattr(app_server_mux, "default_sideband_dir", lambda: mux._registry_path.parent.parent)
+    monkeypatch.setattr(mux, "_write_to_child", lambda *args: pytest.fail("no child RPC"))
+    result = server.aiworkhub_dispatcher_health()
+    assert result["ok"] is True
+    assert result["manager_context"]["usage_observed"] is True
+    assert result["manager_context"]["status"] == {"type": "idle"}
+    assert result["manager_context"]["usage"]["modelContextWindow"] is None
+    assert result["manager_context"]["usage"]["last"]["totalTokens"] == 0
+    assert target["targets"]["codex"]["route"]["thread_id"] == thread
+    actual_instances = app_server_mux.list_live_sideband_instances
+    instance = actual_instances(app_server_mux.default_sideband_dir())[0]
+    monkeypatch.setattr(app_server_mux, "list_live_sideband_instances", lambda path: [instance, instance])
+    assert server.aiworkhub_dispatcher_health()["manager_context"]["usage_observed"] is False
+    monkeypatch.setattr(app_server_mux, "list_live_sideband_instances", lambda path: [instance])
+    from dataclasses import replace
+    import time
+    original = instance
+    instance = replace(original, heartbeat_at=1)
+    assert server.aiworkhub_dispatcher_health()["manager_context"]["usage_observed"] is False
+    instance = replace(original, heartbeat_at=time.time(),
+                       manager_context={**original.manager_context, "usage_observed_at": 1})
+    stale = server.aiworkhub_dispatcher_health()["manager_context"]
+    assert stale["usage_reason"] == "stale_observation"
+    assert "usage" not in stale
+    instance = replace(original, parent_pid=original.parent_pid + 1)
+    assert server.aiworkhub_dispatcher_health()["manager_context"]["status_observed"] is False
+    instance = original
+    target["selected_provider"] = "claude"
+    assert server.aiworkhub_dispatcher_health()["manager_context"]["usage_observed"] is False
