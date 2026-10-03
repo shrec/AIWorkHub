@@ -1918,10 +1918,9 @@ class McpStdioClient {
     this.outputChannel = outputChannel;
     this.repositoryIdentity = repositoryIdentity;
     this.claimEpisode = claimEpisode;
-    // The manager loop's own child opts in here (see getManagerLoopMcpClient());
-    // every other McpStdioClient -- the dashboard's -- leaves this false and
-    // _start() keeps deleting both gates from the child's environment.
+    // Explicit private gates never change the dashboard's read-only default.
     this.grantManagerLoopGates = Boolean(options.grantManagerLoopGates);
+    this.grantWorkerBridgeWrites = Boolean(options.grantWorkerBridgeWrites);
     this.child = null;
     this.lifecycleChild = null;
     this.lifecyclePid = null;
@@ -2239,16 +2238,16 @@ class McpStdioClient {
     if (runtimeDir) {
       env.PYTHONPATH = [runtimeDir, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter);
     }
-    // Defense in depth: this extension never enables the write gate or the
-    // launch gate for the dashboard's own read-only child, regardless of the
-    // ambient extension-host environment. The one exception is the manager
-    // loop's own child (see getManagerLoopMcpClient()), which opts in via
-    // grantManagerLoopGates because the owner explicitly started it.
-    if (this.grantManagerLoopGates) {
+    // Ambient gates never authorize the dashboard. The private worker child
+    // explicitly enables writes only; Python still validates every task claim.
+    if (this.grantManagerLoopGates || this.grantWorkerBridgeWrites) {
       env.AIWORKHUB_ALLOW_WRITES = "1";
-      env.AIWORKHUB_ALLOW_LAUNCH = "1";
     } else {
       delete env.AIWORKHUB_ALLOW_WRITES;
+    }
+    if (this.grantManagerLoopGates) {
+      env.AIWORKHUB_ALLOW_LAUNCH = "1";
+    } else {
       delete env.AIWORKHUB_ALLOW_LAUNCH;
     }
     // Never inherit a stale coordinator secret from the extension host.
@@ -4008,9 +4007,22 @@ async function invokeVscodeLmPrivateTool(call, requestId = "", providerCallId = 
         : "vscode_lm_mcp_unavailable",
     );
   }
-  if (mcpClient.repositoryRoot !== activeRepoIdentity.root) throw new Error("vscode_lm_mcp_repo_mismatch");
+  if (mcpClient.repositoryRoot !== activeRepoIdentity.root
+      || !activeRepoIdentity.repoId
+      || !mcpClient.repositoryIdentity
+      || mcpClient.repositoryIdentity.repoId !== activeRepoIdentity.repoId) {
+    throw new Error("vscode_lm_mcp_repo_mismatch");
+  }
   if (!VSCODE_LM_REQUEST_ID_RE.test(String(requestId || ""))) {
     throw new Error("vscode_lm_worker_request_id_invalid");
+  }
+  // Keep all private worker tools on one explicitly gated server session.
+  // Do not refresh the dashboard route here or follow a repository switch.
+  const privateClient = getVscodeLmWorkerMcpClient(mcpClient);
+  if (privateClient.repositoryRoot !== activeRepoIdentity.root
+      || !privateClient.repositoryIdentity
+      || privateClient.repositoryIdentity.repoId !== activeRepoIdentity.repoId) {
+    throw new Error("vscode_lm_mcp_repo_mismatch");
   }
   // NF134 rewrites worker tool names onto the manager namespace. Semantic edit
   // is the exception: workers have their own prepare/apply and must not be
@@ -4026,7 +4038,7 @@ async function invokeVscodeLmPrivateTool(call, requestId = "", providerCallId = 
   // authenticated worker audit identity. It is consumed from the synthesized
   // single-flight entry, not left as an unused Promise property.
   if (providerCallId) toolInput.provider_call_id = providerCallId;
-  return mcpClient.callTool("aiworkhub_vscode_lm_worker_tool", {
+  return privateClient.callTool("aiworkhub_vscode_lm_worker_tool", {
     request_id: requestId,
     tool_name: normalizedName,
     tool_input: toolInput,
@@ -4906,6 +4918,9 @@ function bindVscodeLmProviderBridgeForTest(binding) {
   mcpClient = binding && Object.prototype.hasOwnProperty.call(binding, "mcpClient")
     ? binding.mcpClient
     : null;
+  vscodeLmWorkerMcpClient = binding && Object.prototype.hasOwnProperty.call(binding, "workerMcpClient")
+    ? binding.workerMcpClient
+    : null;
   activeRepoIdentity = binding && Object.prototype.hasOwnProperty.call(binding, "activeRepoIdentity")
     ? binding.activeRepoIdentity
     : null;
@@ -4919,6 +4934,8 @@ function resetVscodeLmWorkerSourceGraphReadinessForTest() {
   vscodeLmWorkerSourceGraphReadyTimeoutMs = VSCODE_LM_WORKER_SOURCE_GRAPH_READY_TIMEOUT_MS;
   vscodeLmWorkerSourceGraphReadyWaiters.splice(0, vscodeLmWorkerSourceGraphReadyWaiters.length);
   mcpClient = null;
+  vscodeLmWorkerMcpClient = null;
+  managerLoopMcpClient = null;
   activeRepoIdentity = null;
 }
 
@@ -9470,6 +9487,7 @@ function getMcpClient(context) {
   const identity = { ...repo, label: displayLabel };
   if (!mcpClient || mcpClient.repositoryRoot !== root || mcpClient.repositoryIdentity.repoId !== identity.repoId) {
     let startupBarrier = null;
+    disposeVscodeLmWorkerMcpClient();
     if (mcpClient) {
       // getMcpClient() remains synchronous, but the replacement client's first
       // start is gated by this bounded shutdown. This prevents two Windows
@@ -9505,8 +9523,31 @@ function getMcpClient(context) {
   return mcpClient;
 }
 
-let managerLoopMcpClient = null;
+let vscodeLmWorkerMcpClient = null;
 
+// Worker writes are explicit, but launch stays closed. Every private call still
+// requires the server's launched-task/active-claim/adapter/scope/HMAC checks.
+// Source Graph and prepare/apply must share this process-local target cache.
+// Dashboard/Manager dialog closure does not end a canonical worker's lifetime.
+function getVscodeLmWorkerMcpClient(dashboardClient) {
+  if (!vscodeLmWorkerMcpClient) {
+    vscodeLmWorkerMcpClient = new McpStdioClient(
+      dashboardClient.repositoryRoot, outputChannel,
+      dashboardClient.repositoryIdentity, dashboardClient.claimEpisode,
+      { grantWorkerBridgeWrites: true },
+    );
+  }
+  return vscodeLmWorkerMcpClient;
+}
+
+function disposeVscodeLmWorkerMcpClient() {
+  const client = vscodeLmWorkerMcpClient;
+  vscodeLmWorkerMcpClient = null;
+  // This child owns no dispatcher/daemon service; stop only its process.
+  if (client) client.stop({ restart: false });
+}
+
+let managerLoopMcpClient = null;
 // The manager loop is the one caller in this extension explicitly allowed to
 // write and launch: the owner opted in by clicking Start in the Manager
 // dialog. It gets its own child -- bound to the same repository identity the
@@ -12979,6 +13020,7 @@ async function deactivate() {
     await oldClient.stopDispatcherThenTerminate({ restart: false });
   }
   await disposeManagerLoopMcpClient();
+  disposeVscodeLmWorkerMcpClient();
   flushSystemLogs();
   // The trace writer buffers; a reload cycle must not lose the tail that
   // explains why this window was reloaded.
@@ -13128,6 +13170,8 @@ module.exports = {
     flushDebugTrace,
     pruneDebugTraces,
     debugTraceBufferedLineCount: () => debugTraceBuffer.length,
+    disposeManagerLoopMcpClient,
+    disposeVscodeLmWorkerMcpClient,
     bindDebugTraceFileForTest: (filePath) => {
       flushDebugTrace(false);
       extensionDebugTraceBase = filePath ? String(filePath).replace(/\.jsonl$/, "") : "";

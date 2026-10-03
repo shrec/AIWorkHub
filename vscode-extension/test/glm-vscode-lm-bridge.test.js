@@ -3518,15 +3518,17 @@ async function nf202600229QualityReviewSubmitBoundaryChecks() {
   );
 
   let forwardedSubmit = null;
+  const submitIdentity = { root: "/tmp/nf723-submit", repoId: "repo_" + "4".repeat(32) };
   internals.bindVscodeLmProviderBridgeForTest({
-    mcpClient: {
-      repositoryRoot: "/tmp/nf723-submit",
+    mcpClient: { repositoryRoot: submitIdentity.root, repositoryIdentity: submitIdentity },
+    workerMcpClient: {
+      repositoryRoot: submitIdentity.root, repositoryIdentity: submitIdentity,
       callTool: async (name, args) => {
         forwardedSubmit = { name, args };
         return { ok: true, durable: true, submission_id: "f".repeat(64) };
       },
     },
-    activeRepoIdentity: { root: "/tmp/nf723-submit" },
+    activeRepoIdentity: submitIdentity,
   });
   const authenticated = await internals.invokeVscodeLmPrivateTool(
     { name: "aiworkhub_worker_quality_review_submit", input: submitInput() },
@@ -7295,7 +7297,136 @@ async function nf1291ShiftedStageRecovery() {
   }
 }
 
+// NF1300: exercise the production connection factory without starting Python.
+// Server rejection propagation is checked here; canonical claim authorization
+// is covered by Python worker bridge tests, not duplicated in this mock.
+async function nf1300PrivateWorkerTransport() {
+  const identity = { root: "/tmp/nf1300", repoId: "repo_" + "1".repeat(32) };
+  const dashboard = new internals.McpStdioClient(identity.root, null, identity, "episode_nf1300");
+  const originalCall = internals.McpStdioClient.prototype.callTool;
+  const calls = [];
+  const requestId = "a".repeat(32);
+  let preparedOn;
+  internals.McpStdioClient.prototype.callTool = async function(name, args, timeout) {
+    calls.push({ client: this, name, args, timeout });
+    if (!this.grantWorkerBridgeWrites) throw new Error("worker_bridge_write_gate_closed");
+    assert.strictEqual(name, "aiworkhub_vscode_lm_worker_tool");
+    if (args.tool_name === "aiworkhub_worker_semantic_edit_prepare") {
+      preparedOn = this;
+      return { ok: true, target_id: "session_local_target" };
+    }
+    if (args.tool_name === "aiworkhub_worker_semantic_edit_apply") {
+      assert.strictEqual(this, preparedOn, "prepare/apply target cache must share one server session");
+    }
+    if (args.request_id !== requestId) return { ok: false, reason: "worker_bridge_request_not_active" };
+    return { ok: true };
+  };
+  try {
+    internals.bindVscodeLmProviderBridgeForTest({ mcpClient: dashboard, activeRepoIdentity: identity });
+    const invoke = (name, input = {}, id = requestId) =>
+      internals.invokeVscodeLmPrivateTool({ name, input }, id, "pci_nf1300");
+    await invoke("aiworkhub_worker_source_graph_query", { mode: "focus", query: "nf1300" });
+    const prepared = await invoke("aiworkhub_worker_semantic_edit_prepare",
+      { file_path: "src/app.py", start_line: 1, end_line: 1 });
+    const privateClient = calls[0].client;
+    // Closing any dashboard/Manager surface used to discard the shared target.
+    await internals.disposeManagerLoopMcpClient();
+    new internals.ViewState({ postMessage() {} }).dispose();
+    await invoke("aiworkhub_worker_semantic_edit_apply",
+      { target_id: prepared.target_id, new: "fixed", idempotency_key: "nf1300" });
+    assert.strictEqual(calls.length, 3);
+    assert.notStrictEqual(privateClient, dashboard);
+    assert.strictEqual(privateClient.grantWorkerBridgeWrites, true);
+    assert.strictEqual(privateClient.grantManagerLoopGates, false, "worker cannot launch");
+    assert.strictEqual(dashboard.grantWorkerBridgeWrites, false, "dashboard stays read-only");
+    assert.strictEqual(dashboard.grantManagerLoopGates, false);
+    assert(calls.every(call => call.client === privateClient));
+    assert.strictEqual(calls[0].args.tool_name, "aiworkhub_manager_source_graph_query");
+    assert(calls.every(call => call.args.tool_input.provider_call_id === "pci_nf1300"));
+    assert(calls.every(call => call.timeout === internals.constants.VSCODE_LM_WORKER_TOOL_TIMEOUT_MS));
+    assert.strictEqual(privateClient.repositoryIdentity.repoId, identity.repoId);
+    const count = calls.length;
+    await assert.rejects(invoke("aiworkhub_worker_semantic_edit_apply", {}, "invalid"),
+      /vscode_lm_worker_request_id_invalid/);
+    await assert.rejects(invoke("unregistered_write"), /vscode_lm_tool_not_allowed/);
+    assert.strictEqual(calls.length, count, "invalid requests never reach the transport");
+    assert.deepStrictEqual(await invoke("aiworkhub_worker_semantic_edit_apply", {}, "b".repeat(32)),
+      { ok: false, reason: "worker_bridge_request_not_active" }, "server denial propagates without retry");
+    privateClient.repositoryRoot = "/tmp/foreign";
+    await assert.rejects(invoke("aiworkhub_worker_source_graph_query"), /vscode_lm_mcp_repo_mismatch/);
+    privateClient.repositoryRoot = identity.root;
+    privateClient.repositoryIdentity = { ...identity, repoId: "repo_" + "2".repeat(32) };
+    await assert.rejects(invoke("aiworkhub_worker_semantic_edit_apply"), /vscode_lm_mcp_repo_mismatch/);
+    privateClient.repositoryIdentity = identity;
+    internals.bindVscodeLmProviderBridgeForTest({
+      mcpClient: dashboard, workerMcpClient: privateClient,
+      activeRepoIdentity: { ...identity, root: "/tmp/switched" },
+    });
+    await assert.rejects(invoke("aiworkhub_worker_semantic_edit_apply"), /vscode_lm_mcp_repo_mismatch/);
+    assert.strictEqual(calls.length, count + 1, "foreign/switch checks fail before forwarding");
+    const previousFolders = fakeVscode.workspace.workspaceFolders;
+    const scratchRoot = fs.mkdtempSync(path.join(os.tmpdir(), "nf1300-switch-"));
+    try {
+      fakeVscode.workspace.workspaceFolders = [{
+        name: "nf1300-uninitialized", uri: { fsPath: scratchRoot, toString: () => "nf1300://switched" },
+      }];
+      internals.getMcpClient({ workspaceState: { update() {} } });
+      assert.strictEqual(privateClient.intentionalStop, true, "repository switch disposes worker client");
+      internals.bindVscodeLmProviderBridgeForTest({ mcpClient: dashboard, activeRepoIdentity: identity });
+      await invoke("aiworkhub_worker_source_graph_query");
+      const replacement = calls.at(-1).client;
+      assert.notStrictEqual(replacement, privateClient, "switched cache is never reused");
+      await require(extensionPath).deactivate();
+      assert.strictEqual(replacement.intentionalStop, true, "extension shutdown disposes worker client");
+    } finally {
+      fakeVscode.workspace.workspaceFolders = previousFolders;
+      assert(path.resolve(scratchRoot).startsWith(path.resolve(os.tmpdir()) + path.sep));
+      fs.rmSync(scratchRoot, { recursive: true, force: true });
+    }
+  } finally {
+    internals.McpStdioClient.prototype.callTool = originalCall;
+    internals.resetVscodeLmWorkerSourceGraphReadinessForTest();
+  }
+}
+
+async function nf1300ChildEnvironments() {
+  // Evaluate the actual production method with host dependencies isolated.
+  // Capture the spawn boundary before starting any subprocess or touching HOME.
+  const vm = require("vm");
+  for (const [options, expectedWrites, expectedLaunch] of [
+    [{}, undefined, undefined],
+    [{ grantWorkerBridgeWrites: true }, "1", undefined],
+    [{ grantManagerLoopGates: true }, "1", "1"],
+  ]) {
+    let spawnedEnv;
+    const ambientEnv = { AIWORKHUB_ALLOW_WRITES: "1", AIWORKHUB_ALLOW_LAUNCH: "1" };
+    const start = vm.runInNewContext(
+      "({ " + internals.McpStdioClient.prototype._start.toString() + " })._start",
+      {
+        extensionContext: null, extensionRuntimeDir: "", mcpDebugTraceFile: "",
+        path, process: { env: ambientEnv }, WINDOW_SCOPE_ID: "window_nf1300",
+        findPythonCommandForLaunch: async () => ({ command: "python", argsPrefix: [] }),
+        resolveWorkerWorktreeRootEnv: () => "",
+        ensureRepositoryCoordinatorCapability: () => { throw new Error("test_no_capability"); },
+        debugTrace() {},
+        childProcess: { spawn(_command, _args, spawnOptions) {
+          spawnedEnv = spawnOptions.env;
+          throw new Error("nf1300_spawn_captured");
+        } },
+      },
+    );
+    const client = new internals.McpStdioClient("/tmp/nf1300", null,
+      { repoId: "repo_" + "1".repeat(32) }, "episode_nf1300", options);
+    await assert.rejects(start.call(client), /nf1300_spawn_captured/);
+    assert.strictEqual(spawnedEnv.AIWORKHUB_ALLOW_WRITES, expectedWrites);
+    assert.strictEqual(spawnedEnv.AIWORKHUB_ALLOW_LAUNCH, expectedLaunch);
+    assert.deepStrictEqual(ambientEnv, { AIWORKHUB_ALLOW_WRITES: "1", AIWORKHUB_ALLOW_LAUNCH: "1" });
+  }
+}
+
 async function main() {
+  await nf1300ChildEnvironments();
+  await nf1300PrivateWorkerTransport();
   await nf1291ShiftedStageRecovery();
   await nf1291AuthenticatedStageHandoff();
   await nf1290ProgressingProviderLoopsContinue();
@@ -7970,16 +8101,19 @@ async function progressReceiptChecks() {
   // unused Promise property.
   let forwardedToolInput = null;
   let forwardedToolName = null;
+  const forwardingIdentity = { root: "/tmp/nf389-forward", repoId: "repo_" + "3".repeat(32) };
+  // Forwarding authority belongs to the private child; dashboard stays read-only.
   internals.bindVscodeLmProviderBridgeForTest({
-    mcpClient: {
-      repositoryRoot: "/tmp/nf389-forward",
+    mcpClient: { repositoryRoot: forwardingIdentity.root, repositoryIdentity: forwardingIdentity },
+    workerMcpClient: {
+      repositoryRoot: forwardingIdentity.root, repositoryIdentity: forwardingIdentity,
       callTool: async (name, args) => {
         forwardedToolName = name;
         forwardedToolInput = args.tool_input;
         return { ok: true };
       },
     },
-    activeRepoIdentity: { root: "/tmp/nf389-forward" },
+    activeRepoIdentity: forwardingIdentity,
   });
   const privateResult = await internals.invokeVscodeLmPrivateTool(
     { name: "aiworkhub_worker_source_graph_query", input: { mode: "focus", query: "nf389" } },
