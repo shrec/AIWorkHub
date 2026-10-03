@@ -2,7 +2,7 @@
 
 const fs = require("fs");
 const path = require("path");
-const { spawnSync } = require("child_process");
+const { runIsolatedTest } = require("./isolated-test-env");
 
 const testRoot = __dirname;
 const tests = fs.readdirSync(testRoot, { withFileTypes: true })
@@ -20,12 +20,7 @@ if (!tests.includes("package-vsix-scratch.test.js")) {
 }
 for (const test of tests) {
   const absolute = path.join(testRoot, test);
-  const result = spawnSync(process.execPath, [absolute], {
-    cwd: path.resolve(testRoot, ".."),
-    env: process.env,
-    stdio: "inherit",
-    shell: false,
-  });
+  const result = runIsolatedTest([absolute]);
   if (result.error) {
     console.error(`Failed to start ${test}: ${result.error.message}`);
     process.exit(1);

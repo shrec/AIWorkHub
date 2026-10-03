@@ -1,3 +1,4 @@
+require("./isolated-test-env").enterIsolatedTest();
 const assert = require("assert");
 const childProcess = require("child_process");
 const fs = require("fs");
@@ -44,10 +45,7 @@ function loadExtensionHost(repoRoot) {
   }
 }
 
-// Unique, self-contained test repo ids (never shared with other test files'
-// "repo_aaaa..."/"repo_bbbb..." fixtures) so this test's assertions against
-// the machine-wide shared router manifest can never collide with, or be
-// polluted by, leftover state another test file wrote for the same id.
+// Route publication uses a private router under this test process's scratch HOME.
 const REPO_A_ID = `repo_${"b1008".repeat(7).slice(0, 32)}`;
 const REPO_FOREIGN_ID = `repo_${"c1008".repeat(7).slice(0, 32)}`;
 const VALID_UUID_1 = "11111111-1111-4111-8111-111111111111";
