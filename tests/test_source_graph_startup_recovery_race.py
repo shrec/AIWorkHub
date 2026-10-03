@@ -100,6 +100,7 @@ def test_daemon_cold_start_refresh_stop_restart_needs_no_later_refresh(
     writer_open = [threading.Event(), threading.Event()]
     release_writer = [threading.Event(), threading.Event()]
     completed = [threading.Event(), threading.Event()]
+    build_outcomes: list[dict[str, object]] = [{}, {}]
     staging_paths: list[Path | None] = [None, None]
     original_connect = source_graph.connect
     original_build = source_graph.build_index
@@ -135,7 +136,14 @@ def test_daemon_cold_start_refresh_stop_restart_needs_no_later_refresh(
         if index < 2:
             build_started[index].set()
         try:
-            return original_build(*args, **kwargs)
+            report = original_build(*args, **kwargs)
+            if index < 2:
+                build_outcomes[index] = {"ok": True, "report": report.to_json()}
+            return report
+        except Exception as exc:
+            if index < 2:
+                build_outcomes[index] = {"ok": False, "error": f"{type(exc).__name__}:{exc}"}
+            raise
         finally:
             del invocation.index
             if index < 2:
@@ -152,12 +160,17 @@ def test_daemon_cold_start_refresh_stop_restart_needs_no_later_refresh(
     assert not source_graph_daemon._repo_has_readable_generation(root)
     release_writer[0].set()
     assert completed[0].wait(10)
+    assert build_outcomes[0].get("ok") is True, build_outcomes[0]
+    # Wait for the cold build to release its lock so refresh scheduling is timing-independent.
+    assert daemon.wait_for_first_build(timeout=10)
     _assert_public_reads(root, "committed")
 
     (root / "app.py").write_text(
         "def refreshed():\n    return 'searchable marker'\n", encoding="utf-8"
     )
-    daemon.refresh_now()
+    queued = daemon.request_refresh()
+    assert queued["ok"] is True, queued
+    assert queued["queued"] is True, queued
     assert build_started[1].wait(10)
     assert writer_open[1].wait(10)
     assert staging_paths[1] is not None
@@ -166,6 +179,7 @@ def test_daemon_cold_start_refresh_stop_restart_needs_no_later_refresh(
     _assert_public_reads(root, "committed")
     release_writer[1].set()
     assert completed[1].wait(10)
+    assert build_outcomes[1].get("ok") is True, build_outcomes[1]
     _assert_public_reads(root, "refreshed")
 
     assert source_graph_daemon.stop_daemon(root)
