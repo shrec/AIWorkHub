@@ -960,6 +960,12 @@ def add_learning_commit_evidence(*, task_id: str, request_id: str = "") -> dict[
         return _unlinked(f"task_card_unreadable:{type(exc).__name__}")
     if not isinstance(card, dict):
         return _unlinked("task_card_not_in_canonical_store")
+    if decision == "accepted":
+        try:
+            learning_commit_store._canonical_acceptance_reference(card, resolved_request)
+        except learning_commit_store.LearningCommitStoreError as exc:
+            return {**_unlinked(f"canonical_acceptance_required:{exc}"), "ok": False}
+
 
     try:
         context = project_context._skill_selection_context(card)
@@ -971,7 +977,7 @@ def add_learning_commit_evidence(*, task_id: str, request_id: str = "") -> dict[
     try:
         _role, actor_id, anchor_task = _task_actor(root, task, require_finished=False)
     except sr.SkillRegistryError as exc:
-        return _unlinked(str(exc)[:240])
+        return {**_unlinked(str(exc)[:240]), "ok": False}
 
     anchor = f"{anchor_task}:{resolved_request}" if resolved_request else anchor_task
 
@@ -1035,6 +1041,7 @@ def add_learning_commit_evidence(*, task_id: str, request_id: str = "") -> dict[
         "evidence_outcome": evidence_outcome,
         "actor_id": actor_id,
         "actor_source": "task_card_runner",
+        "evidence_basis": "adjudicated_applicable_card",
         "matched_context": _context_payload(context),
         "recorded": recorded,
         "unlinked": unlinked,

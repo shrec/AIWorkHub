@@ -449,7 +449,7 @@ def learning_commit(
         "promotion_eligible_context_graph": bool(promote_context_graph),
         "promotion_eligible_kb": bool(promote_kb),
     }
-    return _write_invoke(
+    result = _write_invoke(
         lambda repo, actor: learning_commit_store.commit_learning(
             repo,
             actor=actor,
@@ -461,6 +461,33 @@ def learning_commit(
         topic="learning_commit",
         task_id=task_id,
     )
+    if result.get("commit_id") and result.get("outcome") == "accepted":
+        from . import manager_skill_tools
+
+        # Applicability evidence, never a claim that the procedure was invoked.
+        # Retry even an idempotent learning commit: the optional projection may
+        # have failed after its durable decision was committed.
+        try:
+            evidence = manager_skill_tools.add_learning_commit_evidence(
+                task_id=result["task_id"], request_id=result["request_id"]
+            )
+        except Exception as exc:  # noqa: BLE001 - durable learning survives projection failure
+            evidence = {"ok": False, "reason": f"skill_evidence_failed:{type(exc).__name__}",
+                        "recorded": []}
+        reason = evidence.get("reason")
+        failed = (
+            evidence.get("ok") is not True
+            or bool(evidence.get("unlinked"))
+            or bool(reason and reason != "card_declares_no_selection_vocabulary")
+        )
+        result["skill_evidence"] = {**evidence, "state": "failed" if failed else "completed"}
+        if failed:
+            result["ok"] = False
+            result["failures"] = {
+                **result.get("failures", {}),
+                "skill_evidence": evidence.get("reason") or "skill_evidence_unlinked",
+            }
+    return result
 
 
 def needfix_markdown_preview(

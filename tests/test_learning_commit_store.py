@@ -179,6 +179,137 @@ def test_manager_learning_commit_projects_all_authorities_idempotently(
         con.close()
 
 
+def _bootstrap_skill_case(tmp_path, monkeypatch):
+    from aiworkhub import manager_skill_tools, skill_registry_store
+
+    root, task_id, request_id = _setup(tmp_path, monkeypatch)
+    card = task_store.get_task(root, task_id)
+    card.update({
+        "runner": "codex_gpt_6",
+        "allowed_writes": ["src/aiworkhub/a.py", "src/aiworkhub/b.py"],
+        "skill_task_family": "bugfix",
+        "skill_stage": "implementation",
+        "skill_triggers": ["code_change"],
+        "skill_applicability": ["quality_gate"],
+        "risk_tier": "low",
+    })
+    con = sqlite3.connect(str(task_store.canonical_db_path(root)))
+    con.row_factory = sqlite3.Row
+    try:
+        upsert_card(con, card)
+    finally:
+        con.close()
+    proposal = manager_skill_tools.propose(
+        identity="bootstrap-bugfix", version="1.0.0", scope="repository",
+        task_family="bugfix", path_or_symbol="src/aiworkhub", risk="low",
+        stage="implementation", triggers=["code_change"], applicability=["quality_gate"],
+        procedure_steps=["Reproduce and inspect the shared production boundary."],
+        avoid_rules=["Never infer procedure use from an applicable card."],
+        preferred_tools=["source_graph"], confidence=0.9,
+    )
+    assert proposal["ok"] is True
+    return root, task_id, request_id, skill_registry_store
+
+
+def test_accepted_learning_commit_bootstraps_skill_evidence_idempotently(tmp_path, monkeypatch):
+    root, task_id, request_id, store = _bootstrap_skill_case(tmp_path, monkeypatch)
+    first = _commit(task_id, request_id)
+    second = _commit(task_id, request_id)
+    record = store.load_registry(root).get("bootstrap-bugfix", "1.0.0")
+    assert len(record.evidence) == 1
+    assert record.evidence[0].source == f"{task_id}:{request_id}"
+    assert record.evidence[0].actor_id == "worker.codex.gpt.6"
+    assert record.evidence[0].outcome.value == "accepted"
+    assert record.lifecycle_state.value == "proposed"
+    assert first["skill_evidence"]["recorded"][0]["idempotent"] is False
+    assert second["skill_evidence"]["recorded"][0]["idempotent"] is True
+    assert second["commit_id"] == first["commit_id"]
+    assert first["skill_evidence"]["evidence_basis"] == "adjudicated_applicable_card"
+
+
+@pytest.mark.parametrize("failure", ["exception", "refusal", "unlinked", "after_write", "unreadable"])
+def test_skill_bootstrap_projection_failure_retries_durable_learning(tmp_path, monkeypatch, failure):
+    from aiworkhub import manager_skill_tools
+
+    root, task_id, request_id, store = _bootstrap_skill_case(tmp_path, monkeypatch)
+    real_projection = manager_skill_tools.add_learning_commit_evidence
+
+    def fail_projection(**kwargs):
+        if failure == "after_write":
+            real_projection(**kwargs)
+        if failure in {"exception", "after_write"}:
+            raise OSError("optional skill projection unavailable")
+        return {
+            "ok": failure != "refusal",
+            "reason": "skill_store_unreadable:SkillStoreError" if failure == "unreadable" else "measured_projection_refusal",
+            "recorded": [], "unlinked": [{"reason": "cas_failed"}] if failure == "unlinked" else [],
+        }
+
+    monkeypatch.setattr(manager_skill_tools, "add_learning_commit_evidence", fail_projection)
+    first = _commit(task_id, request_id)
+    assert first["ok"] is False
+    assert first["skill_evidence"]["state"] == "failed"
+    assert first["skill_evidence"]["recorded"] == []
+    assert "skill_evidence" in first["failures"]
+    assert learning_commit_store.read_card_outcomes(root)[f"{task_id}:{request_id}"]["outcome"] == "accepted"
+    before = store.load_registry(root).get("bootstrap-bugfix", "1.0.0")
+    assert len(before.evidence) == (1 if failure == "after_write" else 0)
+    monkeypatch.setattr(manager_skill_tools, "add_learning_commit_evidence", real_projection)
+    second = _commit(task_id, request_id)
+    assert second["ok"] is True
+    assert second["idempotent"] is True
+    assert second["commit_id"] == first["commit_id"]
+    assert second["skill_evidence"]["state"] == "completed"
+    assert len(store.load_registry(root).get("bootstrap-bugfix", "1.0.0").evidence) == 1
+
+
+@pytest.mark.parametrize("fault", ["blocked", "review", "processing", "stale_request", "absent_acceptance"])
+def test_skill_bootstrap_producer_never_credits_unaccepted_card(tmp_path, monkeypatch, fault):
+    root, task_id, request_id, store = _bootstrap_skill_case(tmp_path, monkeypatch)
+    card = task_store.get_task(root, task_id)
+    if fault == "stale_request":
+        card["accepted_request_id"] = "another-request"
+    elif fault == "absent_acceptance":
+        card.pop("accept_evidence")
+    else:
+        card.update(status=fault, worker_status=fault)
+    con = sqlite3.connect(str(task_store.canonical_db_path(root)))
+    con.row_factory = sqlite3.Row
+    try:
+        upsert_card(con, card)
+    finally:
+        con.close()
+    result = _commit(task_id, request_id)
+    assert result["ok"] is False
+    assert "skill_evidence" not in result
+    assert store.load_registry(root).get("bootstrap-bugfix", "1.0.0").evidence == ()
+
+
+@pytest.mark.parametrize("outcome", ["rejected", "inconclusive"])
+def test_skill_bootstrap_producer_does_not_credit_other_learning_outcomes(tmp_path, monkeypatch, outcome):
+    from aiworkhub import manager_skill_tools
+
+    root, task_id, request_id, store = _bootstrap_skill_case(tmp_path, monkeypatch)
+    if outcome == "rejected":
+        _rework_rejected_card(root, task_id=task_id, request_id=request_id)
+    else:
+        _review_card(root, task_id=task_id, request_id=request_id, substatus="validation_failed")
+
+    def forbidden_projection(**kwargs):
+        pytest.fail("a nonaccepted learning commit must not bootstrap accepted evidence")
+
+    monkeypatch.setattr(manager_skill_tools, "add_learning_commit_evidence", forbidden_projection)
+    result = manager_ai_tools.learning_commit(
+        task_id=task_id, request_id=request_id, repo_area="src/aiworkhub",
+        outcome=outcome, evidence_ids=["file:tests/test_learning_commit_store.py"],
+        idempotency_key=f"learning-skill-{outcome}", provenance="native outcome regression",
+    )
+    assert result["ok"] is True
+    assert result["outcome"] == outcome
+    assert "skill_evidence" not in result
+    assert store.load_registry(root).get("bootstrap-bugfix", "1.0.0").evidence == ()
+
+
 def test_learning_commit_rejects_unaccepted_or_mismatched_request(tmp_path, monkeypatch):
     _root, task_id, request_id = _setup(tmp_path, monkeypatch)
 

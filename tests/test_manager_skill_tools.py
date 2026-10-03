@@ -944,6 +944,26 @@ def _seed_learning_commit(
     conn = sqlite3.connect(str(db))
     try:
         conn.executescript(learning_commit_store._SCHEMA)
+        if outcome == "accepted":
+            from _taskdb_compat import upsert_card
+            from aiworkhub import evidence_levels
+
+            card = task_store.get_task(root, task_id)
+            if card is not None:
+                card.update({
+                    "status": "finished", "worker_status": "done",
+                    "accepted_request_id": request_id,
+                    "accept_evidence": {
+                        "acceptance_evidence_record": evidence_levels.EvidenceRecord(
+                            evidence_level=evidence_levels.EvidenceLevel.FIXED_AND_VERIFIED,
+                            severity="NONE", confidence="HIGH",
+                            reference=f"file:test-acceptance/{request_id}",
+                            verified_by="codex", message="fixture manager acceptance",
+                        ).to_dict(),
+                    },
+                })
+                conn.row_factory = sqlite3.Row
+                upsert_card(conn, card)
         payload = {"failure_category": None, "edge_candidates": edges or []}
         projections = {
             "ai_memory": {"state": "applied" if ai_memory_applied else "not_requested"}
@@ -1002,6 +1022,38 @@ def test_add_learning_commit_evidence_is_idempotent(manager):
         LEARNING_BASE["identity"], LEARNING_BASE["version"]
     )
     assert len(record.evidence) == 1
+
+
+@pytest.mark.parametrize("fault", [
+    "blocked", "incomplete", "stale_request", "absent_acceptance", "invalid_level", "no_runner",
+])
+def test_skill_bootstrap_refuses_ledger_without_exact_native_acceptance(manager, fault):
+    from _taskdb_compat import upsert_card
+
+    mst.propose(**LEARNING_BASE)
+    _seed_skill_card(manager, "T_BOUND")
+    _seed_learning_commit(manager, "T_BOUND", "r-bound", outcome="accepted")
+    card = task_store.get_task(manager, "T_BOUND")
+    if fault == "stale_request":
+        card["accepted_request_id"] = "r-stale"
+    elif fault == "absent_acceptance":
+        card.pop("accept_evidence")
+    elif fault == "invalid_level":
+        card["accept_evidence"]["acceptance_evidence_record"]["evidence_level"] = "OBSERVED"
+    elif fault == "no_runner":
+        card.update(runner="worker", claimed_by="")
+    else:
+        card.update(status="blocked" if fault == "blocked" else "processing", worker_status="blocked")
+    conn = sqlite3.connect(str(task_store.canonical_db_path(manager)))
+    conn.row_factory = sqlite3.Row
+    try:
+        upsert_card(conn, card)
+    finally:
+        conn.close()
+    result = mst.add_learning_commit_evidence(task_id="T_BOUND", request_id="r-bound")
+    assert result["ok"] is False
+    assert result["recorded"] == []
+    assert store.load_registry(manager).get(LEARNING_BASE["identity"], LEARNING_BASE["version"]).evidence == ()
 
 
 def test_add_learning_commit_evidence_reports_no_commit_for_unknown_key(manager):
