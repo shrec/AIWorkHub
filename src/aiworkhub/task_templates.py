@@ -1473,6 +1473,11 @@ def validate_custom_validation_roles(
                 continue
             else:
                 payload = token
+                # A validation directory operand may have one terminal slash.
+                # Do not alter executable/include-root/node-id or card path rules,
+                # original length limits, or the argv spelling eventually executed.
+                if index > 1 and len(payload) <= MAX_PATH_LENGTH and "::" not in payload and payload.endswith("/"):
+                    payload = payload[:-1]
             try:
                 _validated_validation_token(payload)
             except TaskTemplateError as exc:

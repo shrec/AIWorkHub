@@ -1005,6 +1005,67 @@ def test_manager_create_rejects_validation_syntax_worker_cannot_execute(
     assert task_store.get_task(writable_repo, "TASK_INVALID_VALIDATION_SYNTAX") is None
 
 
+def test_trailing_directory_documented_full_qualification_argv(writable_repo, monkeypatch):
+    from aiworkhub.task_templates import split_command_argv, validate_custom_validation_roles
+
+    command = ".venv/Scripts/python.exe -m pytest -q tests/ --deselect tests/test_app_server_mux.py"
+    original = split_command_argv(command)
+    validate_custom_validation_roles([command], ["regression"])
+    assert split_command_argv(command) == original
+    monkeypatch.setattr(core, "_claude_manager_identity", lambda: {
+        "provider": "claude", "session_id": "5be44029-03da-4683-aae3-c68ecb07b1a4",
+        "window_id": "claude_vscode_123",
+    })
+    result = core.create_task(
+        task_id="TASK_TRAILING_DIRECTORY", title="Offline qualification",
+        runner="claude_worker", topic="coding", objective="Validate canonical source.",
+        acceptance=["Both full-suite passes succeed."], allowed_writes=["docs/result.md"],
+        required_outputs=["docs/result.md"], validation=[command], validation_roles=["regression"],
+        custom_template_escape="audited_custom_unclassified",
+    )
+    assert result["ok"] is True, result
+    stored = task_store.get_task(writable_repo, "TASK_TRAILING_DIRECTORY")
+    assert stored is not None and stored["validation"] == [command]
+
+
+@pytest.mark.parametrize("operand", ["tests/", "tests/unit/", "src/"])
+def test_trailing_directory_validation_accepts_bounded_operand(operand):
+    from aiworkhub.task_templates import validate_custom_validation_roles
+    validate_custom_validation_roles(["python -m pytest " + operand], ["regression"])
+
+
+@pytest.mark.parametrize("operand", [
+    "/", "//", "../", "tests/../", "tests/../../private/", "./", "tests/./",
+    "tests//", "tests///", "/tmp/", "C:/private/", "C:private/", "\\\\server\\share\\",
+    "tests\\", "tests\\/", "~/", "-tests/", "tests/;touch", "tests/|cmd", "tests/&cmd",
+    "tests/\x00", "tests/\n", "tests/\t", "tests/::test_case", "tests/test_a.py::test_case/",
+])
+def test_trailing_directory_validation_rejects_unsafe_operand(operand):
+    from aiworkhub.task_templates import TaskTemplateError, validate_custom_validation_roles
+    with pytest.raises(TaskTemplateError, match="invalid_validation_embedded_path"):
+        validate_custom_validation_roles(["python -m pytest " + operand], ["regression"])
+
+
+@pytest.mark.parametrize("command", ["g++ -I tests/ src/a.cpp", "g++ -Itests/ src/a.cpp", "tests/ -m pytest"])
+def test_trailing_directory_does_not_relax_include_root(command):
+    from aiworkhub.task_templates import TaskTemplateError, validate_custom_validation_roles
+    with pytest.raises(TaskTemplateError, match="invalid_validation_embedded_path"):
+        validate_custom_validation_roles([command], ["generic"])
+
+
+@pytest.mark.parametrize("field", ["allowed_writes", "read_first", "required_outputs"])
+def test_trailing_directory_ordinary_card_paths_stay_strict(field):
+    from aiworkhub.task_templates import TaskTemplateError, _validated_path
+    with pytest.raises(TaskTemplateError, match="path_not_normalized"):
+        _validated_path("tests/", field)
+
+
+def test_trailing_directory_original_length_limit_is_preserved():
+    from aiworkhub.task_templates import MAX_PATH_LENGTH, TaskTemplateError, validate_custom_validation_roles
+    with pytest.raises(TaskTemplateError, match="invalid_validation_embedded_path"):
+        validate_custom_validation_roles(["python -m pytest " + "a" * MAX_PATH_LENGTH + "/"], ["regression"])
+
+
 def test_manager_create_rejects_required_output_prose_before_provider_launch(
     writable_repo, monkeypatch
 ):
