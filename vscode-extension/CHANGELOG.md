@@ -1,5 +1,17 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.12.20 — 2026-10-03
+
+### Fixed
+
+- Editor workers use a dedicated write-only MCP child instead of the read-only dashboard child, with one Source Graph/prepare/apply session and unchanged server claim/scope/HMAC authorization.
+- Worker launch stays disabled; Manager/dashboard close no longer loses worker targets. Repository switch and deactivation dispose the worker connection.
+
+### Qualification
+
+- Independent full extension qualification passed across 64 test files, plus 16 Python worker authorization regressions. Packaging, installation and genuine live edit proof remain pending.
+- Full Manager Chat, sandboxed OpenCode/Muse and Skills coverage are not claimed.
+
 ## 0.12.19 — 2026-10-03
 
 ### Fixed

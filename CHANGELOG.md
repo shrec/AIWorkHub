@@ -6,6 +6,19 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.20] - 2026-10-03
+
+### Fixed
+
+- Editor language-model workers use a dedicated, explicitly write-gated MCP connection instead of the read-only dashboard connection. Source Graph, semantic prepare and apply share one authenticated worker session.
+- The worker connection cannot launch processes; dashboard gates remain closed and server task/claim/scope/HMAC checks remain authoritative.
+- Closing Manager Chat or the dashboard preserves worker edit targets; repository changes and extension deactivation dispose the worker connection.
+
+### Qualification
+
+- Independent full extension qualification passed across 64 test files; 16 Python worker authorization regressions passed. The Python runtime is unchanged from the separately qualified 0.12.19 source apart from the release version literal.
+- Packaging, installation and the genuine live existing-file edit canary remain to be verified. Manager Chat completion, sandboxed OpenCode/Muse startup and Skills invocation coverage are not claimed.
+
 ## [0.12.19] - 2026-10-03
 
 ### Fixed

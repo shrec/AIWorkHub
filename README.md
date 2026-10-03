@@ -62,6 +62,12 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
+## What's new in 0.12.20
+
+Editor language-model worker edits now use a dedicated write-only MCP connection rather than the read-only dashboard connection. Worker Source Graph and semantic edits share one session, while server task authorization and dashboard restrictions stay intact. Closing the Manager dialog no longer discards a worker's prepared edit targets.
+
+Independent extension and worker-authorization checks passed. Packaging, installation and live worker edit proof remain pending; this restoration does not establish full Manager Chat, OpenCode/Muse or Skills completion.
+
 ## What's new in 0.12.19
 
 - Restoration candidate: Windows worker validation uses repository-local temporary storage, and language-model workers recognize verified Source Graph progress while retaining stall safeguards.

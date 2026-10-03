@@ -14,6 +14,13 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.12.20
+
+- Editor workers use a dedicated write-only MCP connection, preserving Source Graph/prepare/apply session identity without granting worker launch or dashboard write permissions.
+- Manager/dashboard closure preserves worker targets; repository switch and extension shutdown dispose their connection.
+- Independent full extension and Python authorization checks passed; packaging, installation and a genuine live worker edit remain pending.
+- Full Manager Chat, sandboxed OpenCode/Muse and Skills coverage are not claimed.
+
 ## What's new in 0.12.19
 
 - Restoration candidate: Windows worker validation prefers repository-local temporary storage, and language-model workers continue on verified Source Graph progress without weakening stall safeguards.
