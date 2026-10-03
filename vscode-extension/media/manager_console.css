@@ -143,3 +143,27 @@
 @media (prefers-reduced-motion: reduce) {
   .manager-chat-thinking-dots span { animation: none; opacity: 0.8; }
 }
+
+.mc-block { display: grid; grid-template-columns: 2ch minmax(0, 1fr); column-gap: 6px; margin: 0 0 6px; }
+.mc-gutter { color: var(--ink-soft); font-family: var(--vscode-editor-font-family); text-align: center; user-select: none; }
+.mc-body { min-width: 0; }
+.mc-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px; }
+.mc-mono, .mc-block pre { font-family: var(--vscode-editor-font-family); font-size: var(--fs-2xs); }
+.mc-block pre { margin: 4px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.mc-chip { color: var(--ink-soft); font-size: var(--fs-2xs); }
+.mc-chip.is-ok { color: var(--review-ink); }
+.mc-chip.is-failed { color: var(--blocked-ink); }
+.mc-diff > span { display: block; }
+.mc-diff .mc-add { background: var(--review-soft); }
+.mc-diff .mc-del { background: var(--blocked-soft); }
+.mc-diff .mc-hunk { color: var(--ink-soft); }
+.mc-show-all { margin-top: 4px; font-size: var(--fs-2xs); }
+.mc-note, .mc-footer { color: var(--muted); font-size: var(--fs-2xs); }
+.mc-error .mc-gutter, .mc-error .mc-body { color: var(--blocked-ink); }
+.mc-task-link { background: none; border: 0; padding: 0; color: var(--ink); cursor: pointer; text-decoration: underline; }
+.mc-task-link:focus-visible, .mc-show-all:focus-visible { outline: 1px solid var(--accent); }
+.mc-hairline { height: 2px; background: var(--line); }
+.mc-hairline > span { display: block; height: 100%; width: 0; background: var(--ink-soft); transition: width 200ms ease; }
+.mc-hairline.is-stale > span { background: var(--stale); }
+.mc-hairline.is-blocked > span { background: var(--blocked); }
+@media (prefers-reduced-motion: reduce) { .mc-hairline > span { transition: none; } }

@@ -11849,12 +11849,14 @@ function getHtmlForWebview(webview, extensionUri) {
           <select id="manager-chat-session" class="compact-select" aria-label="Manager session">
             <option value="">Saved sessions</option>
           </select>
+          <span class="mc-mono" id="manager-chat-context" aria-label="Manager context percent"></span>
           <button type="button" id="manager-chat-rename-session">Rename</button>
           <button type="button" id="manager-chat-delete-session">Delete</button>
           <button type="button" id="manager-chat-new-session">New</button>
           <span id="manager-chat-session-id" hidden></span>
           <span id="manager-chat-session-backend" hidden></span>
         </div>
+        <div class="mc-hairline" id="manager-chat-hairline" role="meter" aria-label="Manager context use" aria-valuemin="0" aria-valuemax="100" hidden><span></span></div>
         <div class="manager-chat-transcript" id="manager-chat-transcript" aria-live="polite">
           <div class="panel-list-empty compact" id="manager-chat-empty">Write on the selected model to open the first session</div>
         </div>

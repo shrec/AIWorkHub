@@ -9,11 +9,13 @@
 function managerChatEventNode(event) {
   const type = String((event && event.type) || "");
   const payload = event && event.payload && typeof event.payload === "object" ? event.payload : {};
+  if (type === "command") return managerConsoleCommandNode(payload);
+  if (type === "file_change") return managerConsoleFileChangeNode(payload);
   if (type === "assistant_text" || type === "user_message") {
     const bubble = createElement("div", `manager-chat-bubble role-${type === "user_message" ? "user" : "assistant"}`);
-    bubble.appendChild(createElement("span", "manager-chat-bubble-label", type === "user_message" ? "You" : "Manager"));
+    bubble.appendChild(createElement("span", "manager-chat-bubble-label sr-only", type === "user_message" ? "You" : "Manager"));
     bubble.appendChild(document.createTextNode(String(payload.text || "")));
-    return bubble;
+    return managerConsoleBlock(type, bubble);
   }
   if (type === "tool_call" || type === "tool_result") {
     const name = String(payload.name || payload.tool || "tool");
@@ -28,22 +30,23 @@ function managerChatEventNode(event) {
     delete rest.tool;
     appendManagerChatToolFields(body, rest, 0);
     row.appendChild(body);
-    return row;
+    const task = type === "tool_result" ? managerConsoleTaskOf(payload) : null;
+    return task ? managerConsoleTaskNode(task, row) : managerConsoleBlock(type, row);
   }
   if (type === "callback") {
-    return createElement("div", "manager-chat-marker", `Automatic wake-up${payload.text ? `: ${limitText(payload.text, 120)}` : ""}`);
+    return managerConsoleBlock(type, createElement("div", "manager-chat-marker", `Automatic wake-up${payload.text ? `: ${limitText(payload.text, 120)}` : ""}`));
   }
   if (type === "error") {
-    return createElement("div", "manager-chat-error", String(payload.error || payload.message || "Manager error"));
+    return managerConsoleBlock(type, createElement("div", "manager-chat-error", String(payload.error || payload.message || "Manager error")));
   }
   if (type === "session_start") {
-    return createElement("div", "manager-chat-marker", "Session started");
+    return managerConsoleBlock(type, createElement("div", "manager-chat-marker", "Session started"));
   }
   if (type === "handoff_request") {
-    return createElement("div", "manager-chat-marker", `Handoff requested${payload.reason ? `: ${limitText(payload.reason, 120)}` : ""}`);
+    return managerConsoleBlock(type, createElement("div", "manager-chat-marker", `Handoff requested${payload.reason ? `: ${limitText(payload.reason, 120)}` : ""}`));
   }
   if (type === "session_close") {
-    return createElement("div", "manager-chat-marker", `Session closed${payload.reason ? `: ${limitText(payload.reason, 120)}` : ""}`);
+    return managerConsoleBlock(type, createElement("div", "manager-chat-marker", `Session closed${payload.reason ? `: ${limitText(payload.reason, 120)}` : ""}`));
   }
   if (type === "reasoning") {
     const row = createElement("details", "manager-chat-thinking-block");
@@ -52,10 +55,10 @@ function managerChatEventNode(event) {
     const body = createElement("div", "manager-chat-tool-row-body");
     body.appendChild(document.createTextNode(String(payload.text || "")));
     row.appendChild(body);
-    return row;
+    return managerConsoleBlock(type, row);
   }
   if (type === "turn_end") {
-    return managerChatTurnEndNode(payload, event);
+    return managerConsoleBlock("turn_end", createElement("div", "mc-footer", managerConsoleFooterText(event)));
   }
   return null;
 }
@@ -136,38 +139,220 @@ function managerChatLiveThinkingNode() {
   return row;
 }
 
-function managerChatTurnCallCount(turn) {
-  if (!Array.isArray(state.managerChatEvents)) return 0;
-  return state.managerChatEvents.filter((item) => item && item.type === "tool_call" && item.turn === turn).length;
+// Glyph per block kind; the gutter is fixed-width so blocks never shift.
+const MANAGER_CONSOLE_GLYPHS = Object.freeze({
+  user_message: "›", assistant_text: "●", reasoning: "∴", command: "$", file_change: "±",
+  tool_call: "⚙", tool_result: "⚙", task: "▣", callback: "↯", goal: "◎", error: "!",
+});
+const MANAGER_CONSOLE_COMMAND_LINES = 20;
+const MANAGER_CONSOLE_DIFF_LINES = 40;
+
+function managerConsoleBlock(kind, body) {
+  const block = createElement("div", "mc-block mc-" + kind.replace(/_/g, "-"));
+  const gutter = createElement("span", "mc-gutter", MANAGER_CONSOLE_GLYPHS[kind] || "");
+  gutter.setAttribute("aria-hidden", "true");
+  block.appendChild(gutter);
+  block.appendChild(body);
+  return block;
 }
 
-function managerChatTurnEndNode(payload, event) {
-  const usage = payload && payload.usage;
-  const counts = [];
-  if (usage && typeof usage === "object" && !Array.isArray(usage)) {
-    const fields = [
-      ["input_tokens", "in"],
-      ["output_tokens", "out"],
-      ["total_tokens", "total"],
-      ["cache_read_input_tokens", "cache read"],
-      ["cache_creation_input_tokens", "cache write"]
-    ];
-    for (const field of fields) {
-      const value = usage[field[0]];
-      if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
-        counts.push(`${field[1]} ${value.toLocaleString("en-US")}`);
-      }
-    }
+function managerConsoleShowAll(label, onClick) {
+  const button = createElement("button", "mc-show-all", label);
+  button.type = "button";
+  button.addEventListener("click", () => { onClick(); button.remove(); });
+  return button;
+}
+
+function managerConsoleMergeCommands(events) {
+  const latest = new Map();
+  for (const event of events) {
+    const id = event && event.type === "command" && event.payload && event.payload.call_id;
+    if (id) latest.set(id, event);
   }
-  const turn = event && Number.isFinite(event.turn) ? ` ${event.turn}` : "";
-  const calls = managerChatTurnCallCount(event && event.turn);
-  const head = `Turn${turn} completed · ${calls} tool call${calls === 1 ? "" : "s"}`;
-  const text = counts.length > 0 ? `${head} (Tokens: ${counts.join(", ")})` : head;
-  return createElement("div", "manager-chat-marker", text);
+  const shown = new Set();
+  const merged = [];
+  for (const event of events) {
+    const id = event && event.type === "command" && event.payload && event.payload.call_id;
+    if (!id) { merged.push(event); continue; }
+    if (shown.has(id)) continue;
+    shown.add(id);
+    merged.push(latest.get(id));
+  }
+  return merged;
+}
+
+function managerConsoleCommandChip(payload) {
+  if (payload.status === "running") return createElement("span", "mc-chip is-running", "running");
+  const code = Number.isInteger(payload.exit_code) ? payload.exit_code : null;
+  const failed = payload.status === "failed" || (code !== null && code !== 0);
+  const label = code !== null ? "exit " + code : failed ? "failed" : "done";
+  return createElement("span", failed ? "mc-chip is-failed" : "mc-chip is-ok", label);
+}
+
+function managerConsoleCommandNode(payload) {
+  const body = createElement("div", "mc-body");
+  const head = createElement("div", "mc-head");
+  head.appendChild(createElement("code", "mc-mono", String(payload.command || "")));
+  head.appendChild(managerConsoleCommandChip(payload));
+  body.appendChild(head);
+  const lines = String(payload.output_tail || "").split("\n");
+  if (payload.output_tail) {
+    const pre = createElement("pre", "mc-output", lines.slice(-MANAGER_CONSOLE_COMMAND_LINES).join("\n"));
+    if (lines.length > MANAGER_CONSOLE_COMMAND_LINES) {
+      body.appendChild(managerConsoleShowAll(`show all (${lines.length} lines)`, () => { pre.textContent = lines.join("\n"); }));
+    }
+    body.appendChild(pre);
+  }
+  if (payload.truncated) body.appendChild(createElement("div", "mc-note", `output cut, ${numberValue(payload.original_bytes)} bytes in total`));
+  return managerConsoleBlock("command", body);
+}
+
+function managerConsoleDiffNode(diff) {
+  const lines = String(diff || "").split("\n");
+  const pre = createElement("pre", "mc-diff");
+  const paint = (count) => {
+    const fragment = document.createDocumentFragment();
+    for (const line of lines.slice(0, count)) {
+      const kind = line.startsWith("@@") ? "mc-hunk"
+        : line.startsWith("+") && !line.startsWith("+++") ? "mc-add"
+        : line.startsWith("-") && !line.startsWith("---") ? "mc-del" : "mc-ctx";
+      fragment.appendChild(createElement("span", kind, line + "\n"));
+    }
+    pre.replaceChildren(fragment);
+  };
+  paint(MANAGER_CONSOLE_DIFF_LINES);
+  if (lines.length <= MANAGER_CONSOLE_DIFF_LINES) return pre;
+  const wrap = createElement("div", "mc-collapsible");
+  wrap.appendChild(managerConsoleShowAll(`show all (${lines.length} lines)`, () => paint(lines.length)));
+  wrap.appendChild(pre);
+  return wrap;
+}
+
+function managerConsoleFileChangeNode(payload) {
+  const body = createElement("div", "mc-body");
+  const head = createElement("div", "mc-head");
+  head.appendChild(createElement("code", "mc-mono", String(payload.path || "")));
+  head.appendChild(createElement("span", "mc-counts", ` (+${numberValue(payload.added)} −${numberValue(payload.removed)})`));
+  body.appendChild(head);
+  if (payload.diff) body.appendChild(managerConsoleDiffNode(payload.diff));
+  if (payload.truncated) body.appendChild(createElement("div", "mc-note", `diff cut, ${numberValue(payload.original_bytes)} bytes in total`));
+  return managerConsoleBlock("file_change", body);
+}
+
+function managerConsoleTaskFields(value) {
+  let data = value;
+  if (Array.isArray(data)) data = data.map((block) => (block && typeof block.text === "string" ? block.text : "")).join("");
+  if (typeof data === "string") {
+    if (data.length > 16384) return null;
+    try { data = JSON.parse(data); } catch (_error) { return null; }
+  }
+  if (!data || typeof data !== "object") return null;
+  const task = data.task && typeof data.task === "object" ? data.task : data;
+  const id = task.task_id;
+  if (typeof id !== "string" || !TASK_ID_RE.test(id)) return null;
+  return { id, status: typeof task.status === "string" ? task.status : "", title: typeof task.title === "string" ? task.title : "" };
+}
+
+function managerConsoleTaskOf(payload) {
+  if (!payload) return null;
+  return managerConsoleTaskFields(payload.output) || managerConsoleTaskFields(payload.input);
+}
+
+function managerConsoleTaskNode(task, detail) {
+  const body = createElement("div", "mc-body");
+  const open = createElement("button", "mc-task-link mc-mono", task.id);
+  open.type = "button";
+  open.addEventListener("click", () => requestTaskDetail(task.id));
+  body.appendChild(open);
+  if (task.status) body.appendChild(createElement("span", "status-badge " + task.status, task.status));
+  if (task.title) body.appendChild(createElement("span", "mc-task-title", task.title));
+  if (detail) body.appendChild(detail);
+  return managerConsoleBlock("task", body);
+}
+
+function managerConsoleCompact(value) {
+  const n = numberValue(value);
+  if (n < 1000) return String(n);
+  if (n < 1000000) return (n / 1000).toFixed(1).replace(/\.0$/, "") + "k";
+  return (n / 1000000).toFixed(1).replace(/\.0$/, "") + "M";
+}
+
+function managerConsoleCount(value) {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
+}
+
+// Normalized v3 usage, or the legacy provider keys; a hostile or empty usage gives no counts at all.
+function managerConsoleUsage(usage) {
+  if (!usage || typeof usage !== "object" || Array.isArray(usage)) return null;
+  const legacy = !("input" in usage || "output" in usage);
+  const pick = (key, legacyKey) => managerConsoleCount(legacy ? usage[legacyKey] : usage[key]);
+  const input = pick("input", "input_tokens");
+  const output = pick("output", "output_tokens");
+  if (input === null && output === null) return null;
+  const cache = (pick("cache_read", "cache_read_input_tokens") || 0) + (pick("cache_write", "cache_creation_input_tokens") || 0);
+  return { input: input || 0, cache, output: output || 0 };
+}
+
+function managerConsoleTurnTools(turn) {
+  if (!Number.isInteger(turn)) return 0;
+  const ids = new Set();
+  for (const item of state.managerChatEvents || []) {
+    if (!item || item.turn !== turn || !["tool_call", "command", "file_change"].includes(item.type)) continue;
+    ids.add((item.payload && item.payload.call_id) || "seq:" + item.seq);
+  }
+  return ids.size;
+}
+
+function managerConsoleFooterText(event) {
+  const turn = event && event.turn;
+  const tools = managerConsoleTurnTools(turn);
+  const parts = [Number.isInteger(turn) ? `turn ${turn}` : "turn", `${tools} tool${tools === 1 ? "" : "s"}`];
+  const usage = managerConsoleUsage(event && event.payload && event.payload.usage);
+  if (usage) parts.push(`in ${managerConsoleCompact(usage.input)}`, `cache ${managerConsoleCompact(usage.cache)}`, `out ${managerConsoleCompact(usage.output)}`);
+  const first = Number.isInteger(turn) ? (state.managerChatEvents || []).find((item) => item && item.turn === turn) : null;
+  // managerChatEventTime is 0 without an `at`; no duration is better than a made-up one.
+  const start = first ? managerChatEventTime(first) : 0;
+  const end = managerChatEventTime(event);
+  if (start > 0 && end > 0 && end >= start) parts.push(managerChatFormatDuration(end - start));
+  return parts.join(" · ");
+}
+
+function managerConsoleContextFill(events) {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    if (!event || event.type !== "turn_end") continue;
+    const usage = event.payload && event.payload.usage;
+    return usage && typeof usage.context_fill === "number" && Number.isFinite(usage.context_fill) ? usage.context_fill : null;
+  }
+  return null;
+}
+
+function managerConsoleApplyHairline() {
+  const line = elements.managerChatHairline;
+  if (!line) return;
+  const fill = managerConsoleContextFill(state.managerChatEvents || []);
+  line.hidden = fill === null;
+  if (elements.managerChatContext) elements.managerChatContext.textContent = fill === null ? "" : Math.round(fill * 100) + "%";
+  if (!(line.firstElementChild || line.children[0])) return;
+  if (fill === null) {
+    const bar = line.firstElementChild || line.children[0];
+    if (bar) bar.style.width = "0%";
+    line.setAttribute("aria-valuenow", "0");
+    line.classList.toggle("is-stale", false);
+    line.classList.toggle("is-blocked", false);
+    return;
+  }
+  const percent = Math.min(100, Math.round(fill * 100));
+  const bar = line.firstElementChild || line.children[0]; // the DOM has firstElementChild, the test fake has children
+  bar.style.width = percent + "%";
+  line.setAttribute("aria-valuenow", String(percent));
+  line.classList.toggle("is-stale", fill >= 0.6 && fill < 0.75);
+  line.classList.toggle("is-blocked", fill >= 0.75);
 }
 
 function renderManagerChatEvents() {
   if (!elements.managerChatTranscript) return;
+  managerConsoleApplyHairline();
   const rows = [];
   let lastTurnEndTurn = null;
   const pending = [];
@@ -179,7 +364,7 @@ function renderManagerChatEvents() {
     }
     lastTurnEndTurn = null;
   };
-  for (const event of state.managerChatEvents) {
+  for (const event of managerConsoleMergeCommands(state.managerChatEvents)) {
     // Opencode closes every agent step with step_finish, which the backend
     // records as turn_end: collapse consecutive same-turn markers so one
     // turn renders one completion row (the last, with final usage).

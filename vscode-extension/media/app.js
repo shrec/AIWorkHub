@@ -337,6 +337,8 @@ const elements = {
   managerChatStatus: document.querySelector("#manager-chat-status"),
   managerChatStatusLabel: document.querySelector("#manager-chat-status-label"),
   managerChatSessionLine: document.querySelector("#manager-chat-session-line"),
+  managerChatHairline: document.querySelector("#manager-chat-hairline"),
+  managerChatContext: document.querySelector("#manager-chat-context"),
   managerChatSessionSelect: document.querySelector("#manager-chat-session"),
   managerChatRenameSession: document.querySelector("#manager-chat-rename-session"),
   managerChatDeleteSession: document.querySelector("#manager-chat-delete-session"),

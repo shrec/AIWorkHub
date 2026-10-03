@@ -498,8 +498,8 @@ test("manager chat turn_end shows reported token counts", () => {
   });
   assert.ok(node, "turn_end should render a node");
   const text = flattenNodes(node, []).map((part) => String(part.textContent || "")).join("");
-  assert.match(text, /Turn completed/);
-  assert.match(text, /in 1,234/);
+  assert.match(text, /^turn · 0 tools/);
+  assert.match(text, /in 1\.2k/);
   assert.match(text, /out 567/);
 });
 
@@ -508,7 +508,7 @@ test("manager chat turn_end without usage renders the neutral marker", () => {
   const node = view.api.managerChatEventNode({ type: "turn_end", payload: {} });
   assert.ok(node, "turn_end without usage should still render");
   const text = flattenNodes(node, []).map((part) => String(part.textContent || "")).join("");
-  assert.equal(text, "Turn completed · 0 tool calls");
+  assert.equal(text, "turn · 0 tools");
 });
 
 test("manager chat turn_end names its turn and tool-call count", () => {
@@ -520,7 +520,7 @@ test("manager chat turn_end names its turn and tool-call count", () => {
   ];
   const node = harness.api.managerChatEventNode({ type: "turn_end", turn: 4, payload: {} });
   const text = flattenNodes(node, []).map((part) => String(part.textContent || "")).join("");
-  assert.equal(text, "Turn 4 completed · 2 tool calls");
+  assert.equal(text, "turn 4 · 2 tools");
 });
 
 test("manager chat reasoning renders as inert collapsible text", () => {
@@ -533,7 +533,7 @@ test("manager chat reasoning renders as inert collapsible text", () => {
   const text = allNodes.map((item) => String(item.textContent || "")).join("");
   assert.ok(text.includes("thinking:"), "reasoning text preserved");
   assert.ok(text.includes("<img"), "payload kept verbatim as inert text");
-  assert.equal(node.tag, "details", "reasoning collapses like tool rows");
+  assert.ok(allNodes.some((item) => item.tag === "details"), "reasoning collapses like tool rows");
 });
 
 test("manager chat turn_end hostile usage payload stays neutral", () => {
@@ -552,7 +552,7 @@ test("manager chat turn_end hostile usage payload stays neutral", () => {
   });
   assert.ok(node, "hostile usage should still render a node");
   const text = flattenNodes(node, []).map((part) => String(part.textContent || "")).join("");
-  assert.equal(text, "Turn completed · 0 tool calls");
+  assert.equal(text, "turn · 0 tools");
   assert.ok(!text.includes("<img"), "hostile markup must never reach text content");
   assert.ok(!text.includes("Tokens:"), "no synthetic counts may be reported");
 });
@@ -586,9 +586,9 @@ test("the transcript renders assistant text, tool rows and callback wake-ups, an
   assert.equal(harness.state.managerChatLastSeq, 4);
   const rendered = harness.elements.managerChatTranscript.children;
   assert.equal(rendered.length, 4);
-  assert.match(rendered[1].children.map((c) => c.textContent || "").join(""), /hi there/);
-  assert.match(rendered[2].children[0].textContent, /read_file/);
-  assert.match(rendered[3].textContent, /Automatic wake-up/);
+  assert.match(flattenNodes(rendered[1], []).map((c) => c.textContent || "").join(""), /hi there/);
+  assert.match(rendered[2].children[1].children[0].textContent, /read_file/);
+  assert.match(rendered[3].children[1].textContent, /Automatic wake-up/);
 });
 
 test("a terminal batch unlocks the composer immediately, status confirms after", () => {
@@ -684,7 +684,7 @@ test("consecutive same-turn turn_end markers collapse to one completion row", ()
   harness.api.renderManagerChatEvents();
 
   const markers = harness.elements.managerChatTranscript.children.filter(
-    (child) => String(child.textContent || "").includes("completed")
+    (child) => flattenNodes(child, []).some((node) => node.className === "mc-footer")
   );
   assert.equal(markers.length, 1);
 });
