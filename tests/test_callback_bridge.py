@@ -1668,6 +1668,169 @@ def test_sideband_client_empty_sideband_dir_raises_missing_owner_error():
 # rows never guessed, no request ever reaches the wrong fake App Server.
 # ---------------------------------------------------------------------------
 
+@pytest.mark.skipif(os.name != "nt", reason="native parent junction rejection")
+def test_registry_publication_refuses_parent_junction_before_staging(tmp_path, monkeypatch):
+    import errno
+    import subprocess
+    target = tmp_path / "target"
+    target.mkdir()
+    junction = tmp_path / "junction"
+    result = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(junction), str(target)],
+        capture_output=True, check=False,
+    )
+    if result.returncode:
+        pytest.skip("fixture junction creation unavailable")
+    created = []
+    original = app_server_mux.create_windows_relative_regular_file_descriptor
+    def create(*args):
+        created.append(args)
+        return original(*args)
+    monkeypatch.setattr(app_server_mux, "create_windows_relative_regular_file_descriptor", create)
+    try:
+        with pytest.raises(OSError) as error:
+            app_server_mux._write_registry_descriptor(junction / "registry.json", {"fixture": True})
+        assert error.value.errno == errno.ELOOP
+        assert created == []
+        assert list(target.iterdir()) == []
+    finally:
+        junction.rmdir()
+
+
+def test_registry_publication_pins_parent_and_closes_on_publish_failure(tmp_path, monkeypatch):
+    calls, fds = [], []
+    class Parent:
+        value = 123
+        def __enter__(self):
+            calls.append("parent_open")
+            return self
+        def __exit__(self, *_args):
+            calls.append("parent_close")
+    monkeypatch.setattr(app_server_mux, "is_windows", lambda: True)
+    monkeypatch.setattr(app_server_mux, "open_windows_root_directory_handle", lambda path: Parent())
+    def create(parent, name):
+        assert calls == ["parent_open"] and parent == 123
+        fd = os.open(str(tmp_path / name), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        fds.append(fd)
+        calls.append("staged")
+        return fd
+    def publish(source_parent, name, destination_parent, destination_name, **kwargs):
+        assert source_parent == destination_parent == 123
+        assert kwargs == {"replace_if_exists": True, "posix_semantics": True}
+        raise OSError("fixture publication failure")
+    def cleanup(parent, name):
+        assert parent == 123 and calls[-1] == "staged"
+        (tmp_path / name).unlink()
+        calls.append("relative_cleanup")
+    monkeypatch.setattr(app_server_mux, "create_windows_relative_regular_file_descriptor", create)
+    monkeypatch.setattr(app_server_mux, "rename_windows_relative_child", publish)
+    monkeypatch.setattr(app_server_mux, "delete_windows_relative_child", cleanup)
+    with pytest.raises(OSError, match="fixture publication failure"):
+        app_server_mux._write_registry_descriptor(tmp_path / "registry.json", {"fixture": True})
+    assert calls == ["parent_open", "staged", "relative_cleanup", "parent_close"]
+    assert list(tmp_path.iterdir()) == []
+    with pytest.raises(OSError):
+        os.fstat(fds[0])
+
+
+@pytest.mark.parametrize("failure", ["directory", "foreign_owner", "public_mode", "oversize", "growth", "read_error", "utf8", "json", "bad_repo", "dead_pid"])
+def test_registry_descriptor_snapshot_rejections_close_fd(tmp_path, monkeypatch, failure):
+    import stat
+    path = tmp_path / "registry.json"
+    descriptor = {
+        "instance_id": "fixture", "pid": os.getpid(), "socket_path": "fixture-socket",
+        "capability_path": "fixture-capability", "owned_thread_ids": [],
+        "repo_id": _SIDEBAND_TEST_REPO_ID, "generation_id": "fixture-generation",
+    }
+    app_server_mux._write_registry_descriptor(path, descriptor)
+    real_open = app_server_mux.open_readonly_shared
+    opened = []
+    def capture(*args, **kwargs):
+        fd = real_open(*args, **kwargs)
+        opened.append(fd)
+        return fd
+    monkeypatch.setattr(app_server_mux, "open_readonly_shared", capture)
+    if failure in {"directory", "oversize"}:
+        actual_stat = os.fstat
+        class StatProxy:
+            def __init__(self, original):
+                self.original = original
+                self.st_mode = stat.S_IFDIR if failure == "directory" else original.st_mode
+                self.st_size = app_server_mux.SIDEBAND_REGISTRY_MAX_BYTES + 1 if failure == "oversize" else original.st_size
+            def __getattr__(self, name):
+                return getattr(self.original, name)
+        monkeypatch.setattr(app_server_mux.os, "fstat", lambda fd: StatProxy(actual_stat(fd)))
+    if failure == "foreign_owner":
+        monkeypatch.setattr(app_server_mux, "_owned_by_current_user", lambda st: False)
+    if failure == "public_mode":
+        monkeypatch.setattr(app_server_mux, "_private_mode", lambda st, mode: False)
+    if failure == "growth":
+        monkeypatch.setattr(app_server_mux.os, "read", lambda fd, count: b"x" * count)
+    if failure == "read_error":
+        def fail_read(fd, count):
+            raise OSError("fixture read denied")
+        monkeypatch.setattr(app_server_mux.os, "read", fail_read)
+    if failure in {"utf8", "json", "bad_repo"}:
+        payload = bytes([0xff]) if failure == "utf8" else b"{" if failure == "json" else json.dumps({**descriptor, "repo_id": None}).encode()
+        if failure == "utf8":
+            with pytest.raises(UnicodeDecodeError):
+                payload.decode("utf-8")
+        chunks = iter([payload, b""])
+        monkeypatch.setattr(app_server_mux.os, "read", lambda fd, count: next(chunks))
+    if failure == "dead_pid":
+        monkeypatch.setattr(app_server_mux, "_pid_is_live", lambda pid, start: False)
+    assert app_server_mux._read_instance_descriptor(path) is None
+    assert len(opened) == 1
+    # Undo the injected fstat before independently checking that ownership closed.
+    monkeypatch.undo()
+    with pytest.raises(OSError):
+        os.fstat(opened[0])
+
+
+def test_registry_descriptor_short_reads_preserve_generation(tmp_path, monkeypatch):
+    path = tmp_path / "registry.json"
+    descriptor = {
+        "instance_id": "fixture", "pid": os.getpid(), "socket_path": "fixture-socket",
+        "capability_path": "fixture-capability", "owned_thread_ids": [],
+        "repo_id": _SIDEBAND_TEST_REPO_ID, "generation_id": "exact-generation",
+    }
+    app_server_mux._write_registry_descriptor(path, descriptor)
+    read = os.read
+    requests = []
+    def short_read(fd, count):
+        requests.append(count)
+        return read(fd, min(count, 7))
+    monkeypatch.setattr(app_server_mux.os, "read", short_read)
+    result = app_server_mux._read_instance_descriptor(path)
+    assert result is not None and result.generation_id == "exact-generation"
+    assert len(requests) > 2 and max(requests) == app_server_mux.SIDEBAND_REGISTRY_MAX_BYTES + 1
+
+
+def test_registry_descriptor_reads_one_shared_snapshot_across_publication(tmp_path, monkeypatch):
+    from aiworkhub import platform_io
+    path = tmp_path / "registry.json"
+    descriptor = {
+        "instance_id": "old", "pid": os.getpid(), "socket_path": "fixture-socket",
+        "capability_path": "fixture-capability", "owned_thread_ids": [],
+        "repo_id": _SIDEBAND_TEST_REPO_ID,
+    }
+    app_server_mux._write_registry_descriptor(path, descriptor)
+    opened = []
+    def snapshot_open(path, flags, *, nofollow):
+        assert nofollow is True
+        fd = platform_io.open_readonly_shared(path, flags, nofollow=nofollow)
+        opened.append(fd)
+        app_server_mux._write_registry_descriptor(path, {**descriptor, "instance_id": "new"})
+        return fd
+    monkeypatch.setattr(app_server_mux, "open_readonly_shared", snapshot_open, raising=False)
+    result = app_server_mux._read_instance_descriptor(path)
+    assert opened
+    assert result is not None and result.instance_id == "old"
+    for fd in opened:
+        with pytest.raises(OSError):
+            os.fstat(fd)
+
+
 def test_two_mux_instances_coexist_with_distinct_endpoints():
     shared_dir = Path(tempfile.mkdtemp(prefix="cb-sb2-"))
     h1 = _SidebandHarness(sideband_dir=shared_dir)

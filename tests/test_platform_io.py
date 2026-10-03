@@ -19,6 +19,94 @@ import pytest
 
 from aiworkhub import _platform_process, platform_io, windows_appcontainer, windows_mxc
 
+@pytest.mark.parametrize("attributes,tag,query_ok,convert_fails", [
+    (0x400, 0, True, False), (0, 1, True, False),
+    (0x10, 0, True, False), (0x40, 0, True, False),
+    (0, 0, False, False), (0, 0, True, True),
+])
+def test_readonly_shared_nofollow_windows_rejects_and_closes_handle(
+    monkeypatch, tmp_path, attributes, tag, query_ok, convert_fails,
+):
+    import ctypes
+    msvcrt = SimpleNamespace(open_osfhandle=lambda *_args: None)
+    monkeypatch.setitem(sys.modules, "msvcrt", msvcrt)
+    closed, creates, conversions = [], [], []
+    def create(*args):
+        creates.append(args)
+        return 123
+    def information(handle, kind, buffer, size):
+        value = ctypes.cast(buffer, ctypes.POINTER(platform_io._FileAttributeTagInfo)).contents
+        value.FileAttributes, value.ReparseTag = attributes, tag
+        return query_ok
+    def close(handle):
+        closed.append(handle.value)
+        return True
+    kernel = SimpleNamespace(CreateFileW=create, GetFileInformationByHandleEx=information, CloseHandle=close)
+    monkeypatch.setattr(platform_io, "is_windows", lambda: True)
+    monkeypatch.setattr(platform_io, "_windows_dll_loader", lambda: lambda *_args, **_kwargs: kernel)
+    monkeypatch.setattr(ctypes, "get_last_error", lambda: 5, raising=False)
+    def convert(*args):
+        conversions.append(args)
+        raise OSError("conversion failed")
+    monkeypatch.setattr(msvcrt, "open_osfhandle", convert)
+    with pytest.raises(OSError):
+        platform_io.open_readonly_shared(tmp_path / "file", os.O_RDONLY, nofollow=True)
+    assert creates[0][2] == 7
+    assert creates[0][5] == platform_io._FILE_FLAG_OPEN_REPARSE_POINT
+    assert closed == [123]
+    assert bool(conversions) is convert_fails
+
+
+@pytest.mark.parametrize("posix,unsupported", [(False, False), (True, False), (True, True), (False, True)])
+def test_relative_rename_posix_is_opt_in_and_required_ex_never_falls_back(monkeypatch, posix, unsupported):
+    import ctypes
+    calls = []
+    def set_information(handle, status, buffer, length, kind):
+        flags = ctypes.cast(buffer, ctypes.POINTER(platform_io._FileRenameOrLinkInfoHeader)).contents.Flags
+        calls.append((kind, flags))
+        return -1 if unsupported and len(calls) == 1 else 0
+    def to_error(status):
+        return 87
+    library = SimpleNamespace(NtSetInformationFile=set_information, RtlNtStatusToDosError=to_error)
+    monkeypatch.setattr(platform_io, "_windows_dll_loader", lambda: lambda *_args, **_kwargs: library)
+    kwargs = dict(ex_info_class=platform_io._FILE_RENAME_INFO_EX, legacy_info_class=platform_io._FILE_RENAME_INFO, replace_if_exists=True)
+    if posix:
+        kwargs["posix_semantics"] = True
+    if posix and unsupported:
+        with pytest.raises(OSError, match="required POSIX rename semantics unavailable"):
+            platform_io._set_file_relative_name_information(1, 2, "file", **kwargs)
+    else:
+        platform_io._set_file_relative_name_information(1, 2, "file", **kwargs)
+    assert calls[0] == (platform_io._FILE_RENAME_INFO_EX, 3 if posix else 1)
+    assert len(calls) == (2 if unsupported and not posix else 1)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native Windows share-delete contract")
+def test_readonly_shared_nofollow_snapshot_survives_atomic_replacement(tmp_path):
+    from aiworkhub import app_server_mux
+    path = tmp_path / "registry.json"
+    app_server_mux._write_registry_descriptor(path, {"snapshot": "old"})
+    fd = platform_io.open_readonly_shared(path, os.O_RDONLY, nofollow=True)
+    try:
+        app_server_mux._write_registry_descriptor(path, {"snapshot": "new"})
+        assert json.loads(os.read(fd, 1024)) == {"snapshot": "old"}
+        assert json.loads(path.read_text()) == {"snapshot": "new"}
+    finally:
+        os.close(fd)
+
+
+def test_readonly_shared_nofollow_posix_flag_and_unsupported(monkeypatch, tmp_path):
+    monkeypatch.setattr(platform_io, "is_windows", lambda: False)
+    calls = []
+    monkeypatch.setattr(platform_io.os, "open", lambda path, flags: calls.append(flags) or 123)
+    monkeypatch.setattr(platform_io.os, "O_NOFOLLOW", 0x20000, raising=False)
+    assert platform_io.open_readonly_shared(tmp_path / "file", os.O_RDONLY, nofollow=True) == 123
+    assert calls == [os.O_RDONLY | 0x20000]
+    monkeypatch.delattr(platform_io.os, "O_NOFOLLOW")
+    with pytest.raises(OSError, match="nofollow"):
+        platform_io.open_readonly_shared(tmp_path / "file", os.O_RDONLY, nofollow=True)
+
+
 
 def test_current_user_uid_never_probes_posix_uid_on_windows(monkeypatch):
     monkeypatch.setattr(

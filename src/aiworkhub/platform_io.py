@@ -1819,6 +1819,7 @@ def _set_file_relative_name_information(
     ex_info_class: int,
     legacy_info_class: int,
     replace_if_exists: bool,
+    posix_semantics: bool = False,
 ) -> None:
     """Point one already-open, authenticated HANDLE at a new name/parent.
 
@@ -1897,12 +1898,14 @@ def _set_file_relative_name_information(
             raise FileExistsError(errno.EEXIST, f"{new_name!r} already exists")
         raise OSError(winerror, f"NtSetInformationFile failed for {new_name!r}")
 
-    status = set_information(ex_info_class, build_buffer(0x1 if replace_if_exists else 0x0))
+    status = set_information(ex_info_class, build_buffer((0x1 if replace_if_exists else 0x0) | (0x2 if posix_semantics else 0x0)))
     if status >= 0:
         return
     winerror = int(rtl_status_to_dos_error(status))
     if winerror not in _WINDOWS_DISPOSITION_UNSUPPORTED_ERRNOS:
         raise_for_status(status)
+    if posix_semantics:
+        raise OSError(errno.ENOTSUP, "required POSIX rename semantics unavailable")
     status = set_information(legacy_info_class, build_buffer(1 if replace_if_exists else 0))
     if status < 0:
         raise_for_status(status)
@@ -1915,6 +1918,7 @@ def rename_windows_relative_child(
     new_name: str,
     *,
     replace_if_exists: bool = False,
+    posix_semantics: bool = False,
 ) -> None:
     """Rename one exact child from beneath one borrowed parent HANDLE to another.
 
@@ -1938,6 +1942,7 @@ def rename_windows_relative_child(
             ex_info_class=_FILE_RENAME_INFO_EX,
             legacy_info_class=_FILE_RENAME_INFO,
             replace_if_exists=replace_if_exists,
+            posix_semantics=posix_semantics,
         )
     finally:
         authority.close()
@@ -2742,7 +2747,7 @@ def _open_windows_lock_file(path: Path) -> int:
     return msvcrt.open_osfhandle(handle, os.O_RDWR | getattr(os, "O_BINARY", 0))
 
 
-def open_readonly_shared(path: Path, flags: int) -> int:
+def open_readonly_shared(path: Path, flags: int, *, nofollow: bool = False) -> int:
     """Open an existing file for reading without ever blocking its deletion.
 
     POSIX ``os.open`` never stands in the way of an ``unlink``, so ``flags``
@@ -2758,6 +2763,11 @@ def open_readonly_shared(path: Path, flags: int) -> int:
     """
 
     if not is_windows():
+        if nofollow:
+            nofollow_flag = getattr(os, "O_NOFOLLOW", 0)
+            if not nofollow_flag:
+                raise OSError(errno.ENOTSUP, "nofollow read unavailable")
+            flags |= nofollow_flag
         return os.open(str(path), flags)
     from ctypes import wintypes
 
@@ -2775,13 +2785,35 @@ def open_readonly_shared(path: Path, flags: int) -> int:
     )
     create_file.restype = wintypes.HANDLE
     handle = create_file(
-        str(path), GENERIC_READ, _FILE_SHARE_ALL, None, _OPEN_EXISTING, 0, None
+        str(path), GENERIC_READ, _FILE_SHARE_ALL, None, _OPEN_EXISTING,
+        _FILE_FLAG_OPEN_REPARSE_POINT if nofollow else 0, None
     )
     if handle in (None, 0, _INVALID_HANDLE_VALUE):
         raise _windows_error(ctypes.get_last_error())
-    import msvcrt
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (wintypes.HANDLE,)
+    close_handle.restype = wintypes.BOOL
+    owned = OwnedWindowsHandle(handle, close_handle, ctypes.get_last_error)
+    try:
+        if nofollow:
+            information = kernel32.GetFileInformationByHandleEx
+            information.argtypes = (wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD)
+            information.restype = wintypes.BOOL
+            attributes = _FileAttributeTagInfo()
+            if not information(handle, _FILE_ATTRIBUTE_TAG_INFO, ctypes.byref(attributes), ctypes.sizeof(attributes)):
+                raise _windows_error(ctypes.get_last_error())
+            if attributes.ReparseTag or attributes.FileAttributes & 0x400:
+                raise OSError(errno.ELOOP, "opened file is a reparse point")
+            if attributes.FileAttributes & (_FILE_ATTRIBUTE_DIRECTORY | _FILE_ATTRIBUTE_DEVICE):
+                raise OSError(errno.EISDIR, "opened file is not regular")
+        import msvcrt
 
-    return msvcrt.open_osfhandle(handle, os.O_RDONLY)
+        descriptor = msvcrt.open_osfhandle(handle, os.O_RDONLY | (getattr(os, "O_BINARY", 0) if nofollow else 0))
+        owned.detach()
+        return descriptor
+    except BaseException:
+        owned.close()
+        raise
 
 
 def _prepare_windows_lock_byte(fd: int) -> None:

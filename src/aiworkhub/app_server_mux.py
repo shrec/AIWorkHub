@@ -125,8 +125,14 @@ try:
     from .platform_io import (
         background_process_launch_kwargs,
         chmod_fd,
+        create_windows_relative_regular_file_descriptor,
+        delete_windows_relative_child,
+        open_windows_relative_regular_file_descriptor,
         current_user_uid,
         is_windows,
+        open_readonly_shared,
+        open_windows_root_directory_handle,
+        rename_windows_relative_child,
         stat_owned_by_current_user,
     )
 except ImportError:  # direct-script Codex mux entrypoint
@@ -134,6 +140,12 @@ except ImportError:  # direct-script Codex mux entrypoint
         background_process_launch_kwargs,
         chmod_fd,
         current_user_uid,
+        create_windows_relative_regular_file_descriptor,
+        delete_windows_relative_child,
+        open_windows_relative_regular_file_descriptor,
+        open_readonly_shared,
+        open_windows_root_directory_handle,
+        rename_windows_relative_child,
         is_windows,
         stat_owned_by_current_user,
     )
@@ -621,7 +633,7 @@ def ensure_private_dir(path: Path) -> None:
         raise PermissionError("sideband directory is not owner-controlled mode 0700")
 
 
-def _write_owner_only_file(path: Path, data: bytes, *, max_bytes: int) -> None:
+def _write_owner_only_file(path: Path, data: bytes, *, max_bytes: int, replace_open_snapshot: bool = False) -> None:
     """Atomic owner-only (0600) file write shared by the capability token
     and the per-instance registry descriptor.
 
@@ -638,39 +650,62 @@ def _write_owner_only_file(path: Path, data: bytes, *, max_bytes: int) -> None:
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
-    fd = os.open(str(tmp), flags, 0o600)
-    try:
+    with contextlib.ExitStack() as stack:
+        parent = None
+        if replace_open_snapshot and is_windows():
+            # Do not resolve a junction into trusted authority before opening.
+            parent = stack.enter_context(open_windows_root_directory_handle(path.parent.absolute()))
+        fd = (
+            create_windows_relative_regular_file_descriptor(parent.value, tmp.name)
+            if parent is not None else os.open(str(tmp), flags, 0o600)
+        )
         try:
+            try:
+                with contextlib.suppress(OSError):
+                    chmod_fd(fd, 0o600)
+                os.write(fd, data)
+                os.fsync(fd)
+                st = os.fstat(fd)
+                if (
+                    not stat.S_ISREG(st.st_mode)
+                    or not _owned_by_current_user(st)
+                    or not _private_mode(st, 0o600)
+                ):
+                    raise PermissionError(f"{path.name} is not owner-controlled mode 0600")
+            finally:
+                os.close(fd)
+            if parent is not None:
+                # FILE_RENAME_POSIX_SEMANTICS (0x2), never readonly/storage bypass:
+                # https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/ns-ntifs-_file_rename_information
+                rename_windows_relative_child(
+                    parent.value, tmp.name, parent.value, path.name,
+                    replace_if_exists=True, posix_semantics=True,
+                )
+            else:
+                os.replace(tmp, path)
+        except BaseException:
+            # Remove only the exclusively-created child under the same parent.
+            # No pathname reopen can retarget cleanup after a parent rename.
             with contextlib.suppress(OSError):
-                chmod_fd(fd, 0o600)
-            os.write(fd, data)
-            os.fsync(fd)
-            st = os.fstat(fd)
-            if (
-                not stat.S_ISREG(st.st_mode)
-                or not _owned_by_current_user(st)
-                or not _private_mode(st, 0o600)
-            ):
-                raise PermissionError(f"{path.name} is not owner-controlled mode 0600")
-        finally:
-            os.close(fd)
-        os.replace(tmp, path)
-    except BaseException:
-        # Any failure in the write/fsync/verify/replace steps must remove the
-        # exclusive-create temp file. Its name is fixed by pid+thread ident, so
-        # a leaked temp would make every subsequent O_EXCL open fail with
-        # FileExistsError forever -- freezing this instance's heartbeat (and,
-        # 90s later, its owner freshness) on a single transient ENOSPC/EIO.
-        with contextlib.suppress(OSError):
-            os.unlink(tmp)
-        raise
-    st = os.lstat(path)
-    if (
-        not stat.S_ISREG(st.st_mode)
-        or not _owned_by_current_user(st)
-        or not _private_mode(st, 0o600)
-    ):
-        raise PermissionError(f"installed {path.name} is not owner-controlled mode 0600")
+                if parent is not None:
+                    delete_windows_relative_child(parent.value, tmp.name)
+                else:
+                    os.unlink(tmp)
+            raise
+        if parent is not None:
+            installed_fd = open_windows_relative_regular_file_descriptor(parent.value, path.name)
+            try:
+                st = os.fstat(installed_fd)
+            finally:
+                os.close(installed_fd)
+        else:
+            st = os.lstat(path)
+        if (
+            not stat.S_ISREG(st.st_mode)
+            or not _owned_by_current_user(st)
+            or not _private_mode(st, 0o600)
+        ):
+            raise PermissionError(f"installed {path.name} is not owner-controlled mode 0600")
 
 
 def _write_owner_only_new_file(path: Path, data: bytes, *, max_bytes: int) -> None:
@@ -834,7 +869,7 @@ def _write_registry_descriptor(path: Path, descriptor: dict[str, Any]) -> None:
     (the capability TOKEN itself is never included, only its file path).
     """
     payload = json.dumps(descriptor, ensure_ascii=False, sort_keys=True).encode("utf-8")
-    _write_owner_only_file(path, payload, max_bytes=SIDEBAND_REGISTRY_MAX_BYTES)
+    _write_owner_only_file(path, payload, max_bytes=SIDEBAND_REGISTRY_MAX_BYTES, replace_open_snapshot=True)
 
 
 # --- PID-reuse-safe liveness (Linux /proc; best-effort elsewhere) -----------
@@ -957,18 +992,32 @@ def _read_instance_descriptor(path: Path) -> SidebandInstance | None:
     raises) for anything stale, corrupt, foreign-owned, or wrongly-permissioned
     -- callers must treat that identically to "no such instance", not an error."""
     try:
-        st = os.lstat(path)
-    except OSError:
-        return None
-    if (
-        not stat.S_ISREG(st.st_mode)
-        or not _owned_by_current_user(st)
-        or not _private_mode(st, 0o600)
-        or st.st_size > SIDEBAND_REGISTRY_MAX_BYTES
-    ):
-        return None
-    try:
-        obj = json.loads(path.read_text(encoding="utf-8"))
+        fd = open_readonly_shared(path, os.O_RDONLY, nofollow=True)
+        try:
+            # Validate the very same snapshot we read, not a pathname that
+            # atomic publication can replace between the check and open.
+            st = os.fstat(fd)
+            if (
+                not stat.S_ISREG(st.st_mode)
+                or not _owned_by_current_user(st)
+                or not _private_mode(st, 0o600)
+                or st.st_size > SIDEBAND_REGISTRY_MAX_BYTES
+            ):
+                return None
+            remaining = SIDEBAND_REGISTRY_MAX_BYTES + 1
+            chunks = []
+            while remaining:
+                chunk = os.read(fd, remaining)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            payload = b"".join(chunks)
+            if len(payload) > SIDEBAND_REGISTRY_MAX_BYTES:
+                return None
+            obj = json.loads(payload.decode("utf-8"))
+        finally:
+            os.close(fd)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return None
     if not isinstance(obj, dict):
