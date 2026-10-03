@@ -521,12 +521,41 @@ function renderUsage(snapshot) {
     ? aggregates.by_runner
     : {};
 
+  // Transcript counters are independent repository history, never task totals or prices.
+  const fragment = document.createDocumentFragment();
+  const transcript = ledger.claude_code_sessions;
+  if (transcript && transcript.status === "measured" && transcript.source === "claude_code_transcripts"
+      && transcript.totals && typeof transcript.totals === "object") {
+    const section = createElement("div", "usage-transcript");
+    section.appendChild(createElement("strong", "", "Claude Code transcript usage"));
+    section.appendChild(createElement("div", "", "Repository history — unpriced; not task-attributed; excluded from canonical totals"));
+    const validCount = (value) => typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+    for (const [label, bucket] of [["Main", transcript.totals.main], ["Subagents", transcript.totals.subagent]]) {
+      const keys = ["api_calls", "input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"];
+      const measured = bucket && keys.every((key) => validCount(bucket[key]));
+      section.appendChild(createElement("div", "", measured
+        ? `${label}: ${formatCount(bucket.api_calls)} calls | ${formatCount(bucket.input_tokens)} input | ${formatCount(bucket.output_tokens)} output | ${formatCount(bucket.cache_read_input_tokens)} cache-read | ${formatCount(bucket.cache_creation_input_tokens)} cache-creation tokens`
+        : `${label}: unavailable`));
+    }
+    const total = transcript.total_count;
+    const returned = transcript.returned_count;
+    const sessions = transcript.totals.sessions;
+    const subagents = transcript.totals.subagent_transcripts;
+    section.appendChild(createElement("div", "", validCount(sessions) && validCount(subagents)
+      ? `${formatCount(sessions)} sessions | ${formatCount(subagents)} subagent transcripts`
+      : "Session coverage unavailable"));
+    section.appendChild(createElement("div", "", validCount(total) && validCount(returned) && typeof transcript.truncated === "boolean"
+      ? `Session details: ${formatCount(Math.min(returned, total))} of ${formatCount(total)} — ${transcript.truncated ? "truncated" : "not truncated"}`
+      : "Session detail coverage unavailable"));
+    fragment.appendChild(section);
+  }
+
   if (!totals.available) {
-    elements.usageList.replaceChildren(createElement("div", "panel-list-empty", "Usage data unavailable"));
+    fragment.appendChild(createElement("div", "panel-list-empty", "Canonical usage data unavailable"));
+    elements.usageList.replaceChildren(fragment);
     return;
   }
 
-  const fragment = document.createDocumentFragment();
   const overview = createElement("div", "usage-overview");
   const usageObserved = numberValue(totals.usage_observed_records) > 0;
   const costObserved = numberValue(totals.cost_known_records) > 0;

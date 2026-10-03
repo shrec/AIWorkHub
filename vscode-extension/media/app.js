@@ -1493,18 +1493,49 @@ function renderUsage(snapshot) {
     ? aggregates.by_runner
     : {};
 
+  // Transcript counters are independent repository history, never task totals or prices.
+  const fragment = document.createDocumentFragment();
+  const transcript = ledger.claude_code_sessions;
+  if (transcript && transcript.status === "measured" && transcript.source === "claude_code_transcripts"
+      && transcript.totals && typeof transcript.totals === "object") {
+    const section = createElement("div", "usage-transcript");
+    section.appendChild(createElement("strong", "", "Claude Code transcript usage"));
+    section.appendChild(createElement("div", "", "Repository history — unpriced; not task-attributed; excluded from canonical totals"));
+    const validCount = (value) => typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+    for (const [label, bucket] of [["Main", transcript.totals.main], ["Subagents", transcript.totals.subagent]]) {
+      const keys = ["api_calls", "input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"];
+      const measured = bucket && keys.every((key) => validCount(bucket[key]));
+      section.appendChild(createElement("div", "", measured
+        ? `${label}: ${formatCount(bucket.api_calls)} calls | ${formatCount(bucket.input_tokens)} input | ${formatCount(bucket.output_tokens)} output | ${formatCount(bucket.cache_read_input_tokens)} cache-read | ${formatCount(bucket.cache_creation_input_tokens)} cache-creation tokens`
+        : `${label}: unavailable`));
+    }
+    const total = transcript.total_count;
+    const returned = transcript.returned_count;
+    const sessions = transcript.totals.sessions;
+    const subagents = transcript.totals.subagent_transcripts;
+    section.appendChild(createElement("div", "", validCount(sessions) && validCount(subagents)
+      ? `${formatCount(sessions)} sessions | ${formatCount(subagents)} subagent transcripts`
+      : "Session coverage unavailable"));
+    section.appendChild(createElement("div", "", validCount(total) && validCount(returned) && typeof transcript.truncated === "boolean"
+      ? `Session details: ${formatCount(Math.min(returned, total))} of ${formatCount(total)} — ${transcript.truncated ? "truncated" : "not truncated"}`
+      : "Session detail coverage unavailable"));
+    fragment.appendChild(section);
+  }
+
   if (!totals.available) {
-    elements.usageList.replaceChildren(createElement("div", "panel-list-empty", "Usage data unavailable"));
+    fragment.appendChild(createElement("div", "panel-list-empty", "Canonical usage data unavailable"));
+    elements.usageList.replaceChildren(fragment);
     return;
   }
 
-  const fragment = document.createDocumentFragment();
   const overview = createElement("div", "usage-overview");
+  const usageObserved = numberValue(totals.usage_observed_records) > 0;
+  const costObserved = numberValue(totals.cost_known_records) > 0;
   const overviewValues = [
     ["Records", formatCount(totals.records)],
-    ["Input", formatCount(totals.input_tokens)],
-    ["Output", formatCount(totals.output_tokens)],
-    ["Cost", formatMoney(totals.cost_usd)],
+    ["Input", usageObserved ? formatCount(totals.input_tokens) : "Unavailable"],
+    ["Output", usageObserved ? formatCount(totals.output_tokens) : "Unavailable"],
+    ["Cost", costObserved ? formatMoney(totals.cost_usd) : "Unavailable"],
   ];
   for (const [label, value] of overviewValues) {
     const metric = createElement("div", "usage-metric");
@@ -1527,7 +1558,10 @@ function renderUsage(snapshot) {
   const maximum = Math.max(...rows.map((row) => numberValue(row.total_tokens)), 1);
   for (const item of rows.slice(0, 40)) {
     const row = createElement("div", "stat-row usage-row");
-    row.title = `${numberValue(item.records)} records, ${numberValue(item.total_tokens)} total tokens, ${formatMoney(item.cost_usd)}`;
+    const itemUsageObserved = numberValue(item.usage_observed_records) > 0;
+    const itemCostObserved = numberValue(item.cost_known_records) > 0;
+    const itemCost = itemCostObserved ? formatMoney(item.cost_usd) : "cost unavailable";
+    row.title = `${numberValue(item.records)} records, ${itemUsageObserved ? formatCount(item.total_tokens) : "usage unavailable"}, ${itemCost}`;
     const main = createElement("div", "stat-main");
     const labels = createElement("div", "stat-labels");
     const name = createElement("span", "stat-name", item.name || "unknown");
@@ -1535,7 +1569,7 @@ function renderUsage(snapshot) {
     const breakdown = createElement(
       "span",
       "stat-breakdown",
-      `${formatCount(item.input_tokens)} in | ${formatCount(item.output_tokens)} out | ${formatMoney(item.cost_usd)}`,
+      itemUsageObserved ? `${formatCount(item.input_tokens)} in | ${formatCount(item.output_tokens)} out | ${itemCost}` : `usage unavailable | ${itemCost}`,
     );
     labels.append(name, breakdown);
     const track = createElement("div", "stat-track");
@@ -1543,7 +1577,7 @@ function renderUsage(snapshot) {
     fill.style.width = `${Math.max(3, Math.round((numberValue(item.total_tokens) / maximum) * 100))}%`;
     track.appendChild(fill);
     main.append(labels, track);
-    row.append(main, createElement("strong", "stat-total", formatCount(item.total_tokens)));
+    row.append(main, createElement("strong", "stat-total", itemUsageObserved ? formatCount(item.total_tokens) : "N/A"));
     fragment.appendChild(row);
   }
   elements.usageList.replaceChildren(fragment);
