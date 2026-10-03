@@ -22,7 +22,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
-from . import platform_io, reasoning_policy
+from . import platform_io, reasoning_policy, runtime_executable_registry
 
 
 SUPPORTED_ADAPTERS: tuple[str, ...] = (
@@ -2168,7 +2168,21 @@ def build_runtime_command(
             validation_reason="manual-only adapter; no local command is available",
         )
 
-    resolution = resolve_executable(adapter_id, executable_overrides)
+    registered_overrides, registration_error = (
+        runtime_executable_registry.select_executable_overrides(
+            adapter_id,
+            Path(cwd),
+            executable_overrides,
+        )
+    )
+    if registration_error is not None:
+        # A repo-owned registration selected for this adapter was malformed,
+        # unreadable, unsafe, platform-mismatched, SHA-tampered, or present
+        # as a non-regular manifest path: fail closed with the concrete
+        # registration reason and never fall back to PATH/default resolution.
+        return _invalid_plan(adapter_id, registration_error, cwd=cwd)
+
+    resolution = resolve_executable(adapter_id, registered_overrides)
     if not resolution.ok or resolution.executable is None:
         return _invalid_plan(adapter_id, resolution.reason, cwd=cwd)
 
