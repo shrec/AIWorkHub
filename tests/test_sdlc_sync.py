@@ -726,14 +726,32 @@ def test_a_transient_window_task_before_the_resume_point_is_retried_before_the_d
     repo, monkeypatch
 ):
     monkeypatch.setattr(sdlc_sync, "MAX_TASKS_PER_PASS", 1)
+    # A wall-clock "now + 5 seconds" build can precede A's acceptance under load.
+    # Fix the domain ordering, not how quickly the real acceptance/sync runs.
+    accepted_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    built_at = datetime(2026, 1, 2, tzinfo=timezone.utc)
+
+    class AcceptanceClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return accepted_at.astimezone(tz) if tz else accepted_at.replace(tzinfo=None)
+
+    def accept_before_build(task_id):
+        with monkeypatch.context() as clock:
+            clock.setattr(task_engine, "datetime", AcceptanceClock)
+            _seal_and_accept(repo.root, task_id)
+        card = task_store.get_task(repo.root, task_id)
+        assert card is not None
+        assert datetime.fromisoformat(card["accepted_at"]) < built_at
+
     for task_id in ("T-SYNC-B", "T-SYNC-C"):
         _create_task(repo.root, task_id)
-        _seal_and_accept(repo.root, task_id)
+        accept_before_build(task_id)
     _create_task(repo.root, "T-SYNC-A")
     for _ in range(10):
         if sdlc_sync.sync_once(repo.root, repo.repo_id)["parts"]["cases"]["scanned"] == 0:
             break
-    _publish(repo.root, "1.0.0")
+    _publish(repo.root, "1.0.0", built_at=built_at.isoformat())
     state_path = repo.root.joinpath(*sdlc_sync.STATE_DB_REL)
 
     first = sdlc_sync.sync_once(repo.root, repo.repo_id)
@@ -741,7 +759,7 @@ def test_a_transient_window_task_before_the_resume_point_is_retried_before_the_d
     assert sdlc_sync._read_release(state_path)[sdlc_sync.RELEASE_RESUME] == "T-SYNC-B"
 
     # T-SYNC-A sorts before the resume point and is refused transiently in the window.
-    _seal_and_accept(repo.root, "T-SYNC-A")
+    accept_before_build("T-SYNC-A")
     # T-SYNC-B's proof remembered the release blob; git can only fail on a fact not yet known.
     sdlc_deploy_proof._clear_git_facts()
     with monkeypatch.context() as patched:
