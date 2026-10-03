@@ -3289,6 +3289,10 @@ def needfix_capture_view(
     the dedupe key matched a live row, plus the compact item
     (``include_item=True`` adds description/scope/provenance/evidence).
     """
+    if not core.writes_allowed():
+        return _needfix_response(
+            {"ok": False, "error": "write_gate_closed"}, "aiworkhub_dashboard_needfix_capture", write=True,
+        )
     canonical_kind, kind_normalized = needfix_store.normalize_kind(str(kind or "other")[:60])
     before = datetime.now(timezone.utc).isoformat()
     try:
@@ -3341,6 +3345,10 @@ def needfix_update_view(
     evidence_keys_after, event_id, kind_normalized, plus the compact item
     (``include_item=True`` adds description/scope/provenance/evidence).
     """
+    if not core.writes_allowed():
+        return _needfix_response(
+            {"ok": False, "error": "write_gate_closed"}, "aiworkhub_dashboard_needfix_update", write=True,
+        )
     candidate = str(needfix_id or "")
     canonical_kind: str | None = None
     kind_normalized: dict[str, str] | None = None
