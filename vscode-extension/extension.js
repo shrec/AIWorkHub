@@ -4813,10 +4813,10 @@ async function awaitVscodeLmWorkerSourceGraphReadinessOnce() {
   throw new Error("vscode_lm_mcp_unavailable");
 }
 
-// Keep the NF-1179 discovery allowance: 12 orientation reads plus 4 forced
-// stage reads. It bounds requests without novel source evidence or a staged
-// edit, not successful discovery itself (NF-1260). The global 24-turn bound
-// still limits progressing requests; forced-stage limits are unchanged.
+// Keep the NF1179 12+4 allowance for requests without novel source evidence
+// or a staged edit (NF1260). NF1290 also applies verified progress to the
+// 24-uncredited-turn allowance; successful discovery can continue while
+// duplicate, no-progress and forced-stage limits remain unchanged.
 const VSCODE_LM_MAX_SOURCE_GRAPH_WITHOUT_EDIT =
   VSCODE_LM_MAX_POST_SOURCE_TURNS + VSCODE_LM_MAX_FORCED_STAGE_READS;
 
@@ -4842,6 +4842,8 @@ function createVscodeLmSourceGraphGuard() {
   let lastIdentity = "";
   let duplicates = 0;
   let callsSinceEdit = 0;
+  let progressRevision = 0;
+  const seenStages = new Set();
   const seenEvidence = new Set();
   const pages = new Map();
   const raw = (value) => String(value == null ? "" : value);
@@ -4937,15 +4939,21 @@ function createVscodeLmSourceGraphGuard() {
       for (const key of keys) {
         if (!seenEvidence.has(key)) { seenEvidence.add(key); progressed = true; }
       }
-      if (progressed) callsSinceEdit = 0;
+      if (progressed) { callsSinceEdit = 0; progressRevision += 1; }
     },
-    staged(result) {
+    staged(result, validatedStage = false) {
       if (result && result.ok === true && result.idempotent_replay !== true) {
         lastIdentity = "";
         duplicates = 0;
         callsSinceEdit = 0;
+        if (validatedStage && result.schema_id === "aiworkhub.vscode_lm.staged_edit_receipt.v1") {
+          const identity = JSON.stringify([result.operation, result.path, result.content_sha256]);
+          if (!seenStages.has(identity)) { seenStages.add(identity); progressRevision += 1; }
+        }
       }
     },
+    progressRevision() { return progressRevision; },
+    sourceEvidenceRevision() { return seenEvidence.size; },
   };
 }
 
@@ -4953,7 +4961,7 @@ async function invokeVscodeLmProtocolTool(call, requestId, invokeTool, stagedEdi
   const toolName = String(call && call.name || "").trim();
   if (toolName === VSCODE_LM_STAGE_EDIT_TOOL) {
     const result = await stagedEdits.stage(call.input);
-    if (sourceGraphGuard) sourceGraphGuard.staged(result);
+    if (sourceGraphGuard) sourceGraphGuard.staged(result, true);
     return result;
   }
   if (toolName === VSCODE_LM_FINALIZE_EDIT_TOOL) {
@@ -5778,7 +5786,12 @@ async function runVscodeLmTextProtocol(
   const sourceGraphGuard = createVscodeLmSourceGraphGuard();
   const writableTask = request.request_kind !== "quality_review" &&
     Array.isArray(request.allowedWrites) && request.allowedWrites.length > 0;
-  for (let turn = 0; turn < VSCODE_LM_MAX_AGENT_TURNS; turn += 1) {
+  let creditedTurns = 0;
+  // NF1290: 24 bounds uncredited turns; verified discovery/edit progress earns
+  // continuation, without weakening duplicate/no-progress/finalization gates.
+  for (let turn = 0; turn < VSCODE_LM_MAX_AGENT_TURNS + creditedTurns; turn += 1) {
+    const progressBeforeTurn = sourceGraphGuard.progressRevision();
+    const sourceBeforeTurn = sourceGraphGuard.sourceEvidenceRevision();
     assertRequestActive();
     if (request.request_kind === "quality_review" &&
         postSourceTurns >= VSCODE_LM_MAX_QUALITY_REVIEW_TURNS && !reviewSubmitForced) {
@@ -6437,6 +6450,12 @@ async function runVscodeLmTextProtocol(
       }
       oversizedStageFailure.count += 1;
     }
+    if (writableTask && sourceGraphGuard.progressRevision() !== progressBeforeTurn) {
+      creditedTurns += 1; // One credit per provider turn, never per returned row/page.
+    }
+    if (writableTask && sourceGraphGuard.sourceEvidenceRevision() !== sourceBeforeTurn) {
+      postSourceTurns = Math.max(0, postSourceTurns - 1);
+    }
     protocolTrace.push({ turn, phase: "work", outcome: `tool:${envelope.name}` });
     const historyText = toolInputTooLarge ? "[oversized tool request omitted]" : text;
     messages.push(vscode.LanguageModelChatMessage.Assistant([languageModelTextPart(historyText)]));
@@ -6525,7 +6544,10 @@ async function runVscodeLmAgent(
   const writableTask = !qualityReview && Array.isArray(request.allowedWrites) &&
     request.allowedWrites.length > 0;
   let wrongToolViolations = 0;
-  for (let turn = 0; turn < VSCODE_LM_MAX_AGENT_TURNS; turn += 1) {
+  let creditedTurns = 0;
+  for (let turn = 0; turn < VSCODE_LM_MAX_AGENT_TURNS + creditedTurns; turn += 1) {
+    const progressBeforeTurn = sourceGraphGuard.progressRevision();
+    const sourceBeforeTurn = sourceGraphGuard.sourceEvidenceRevision();
     assertRequestActive();
     if (qualityReview && postSourceTurns >= VSCODE_LM_MAX_QUALITY_REVIEW_TURNS && !reviewSubmitForced) {
       reviewSubmitForced = true;
@@ -7012,7 +7034,14 @@ async function runVscodeLmAgent(
       }
       results.push(languageModelToolResultPart(call.callId, result));
     }
-    toolTurns += 1;
+    if (writableTask && sourceGraphGuard.progressRevision() !== progressBeforeTurn) {
+      creditedTurns += 1; // A multi-tool batch earns at most one continuation turn.
+    }
+    if (writableTask && sourceGraphGuard.sourceEvidenceRevision() !== sourceBeforeTurn) {
+      postSourceTurns = Math.max(0, postSourceTurns - 1);
+    } else {
+      toolTurns += 1;
+    }
     protocolTrace.push({ turn, phase: "work", outcome: `tools:${calls.length}` });
     messages.push(vscode.LanguageModelChatMessage.User(results));
     if (submitIncompleteThisTurn) {

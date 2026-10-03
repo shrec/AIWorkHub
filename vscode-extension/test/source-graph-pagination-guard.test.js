@@ -187,3 +187,30 @@ test("empty body query cannot earn page progress even with a positive backend hi
   assert.throws(() => guard.before({ ...sgCall(0),
     input: { mode: "body", query: " ", cursor: "scan-last" } }), /source_graph_no_progress/);
 });
+
+test("NF1290 only verified novel source or locally validated new stages earn continuation", () => {
+  const guard = bridge.createVscodeLmSourceGraphGuard();
+  assert.equal(guard.progressRevision(), 0);
+  guard.staged({ ok: true }); // Generic tool ok / prepare does not earn a turn.
+  guard.staged({ ok: true, schema_id: "aiworkhub.semantic_edit_apply_receipt.v1" });
+  assert.equal(guard.progressRevision(), 0);
+  const call = sgCall(0);
+  guard.before(call);
+  guard.observed(call, trusted({ matches: [], nonce: "churn" }, { hit_count: 0 }));
+  assert.equal(guard.progressRevision(), 0);
+  const rows = [evidence(1).matches[0], evidence(2).matches[0]];
+  guard.observed(call, trusted({ matches: rows }));
+  assert.equal(guard.progressRevision(), 1, "multiple new source rows credit one observation");
+  guard.observed(call, trusted({ matches: rows }));
+  assert.equal(guard.progressRevision(), 1, "repeated rows never credit twice");
+  const stage = { ok: true, schema_id: "aiworkhub.vscode_lm.staged_edit_receipt.v1",
+    operation: "replace_range", path: "src/app.py", content_sha256: "c".repeat(64) };
+  guard.staged(stage);
+  assert.equal(guard.progressRevision(), 1, "a backend-shaped receipt is not a local validated stage");
+  guard.staged({ ...stage, idempotent_replay: true }, true);
+  assert.equal(guard.progressRevision(), 1);
+  guard.staged(stage, true);
+  assert.equal(guard.progressRevision(), 2);
+  guard.staged(stage, true);
+  assert.equal(guard.progressRevision(), 2, "same validated staged state earns no further credit");
+});

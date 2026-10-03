@@ -6831,7 +6831,126 @@ async function nf1275VisibleActivityEndToEnd() {
   }
 }
 
+async function nf1290ProgressingProviderLoopsContinue() {
+  const file = "src/app.py";
+  for (const [native, paged] of [[false, false], [true, false], [false, true], [true, true]]) {
+    const reads = internals.constants.VSCODE_LM_MAX_AGENT_TURNS + 2;
+    const hashBytes = (bytes) => require("node:crypto").createHash("sha256").update(bytes).digest("hex");
+    const bodyBytes = Buffer.from(JSON.stringify({ matches: Array.from({ length: reads }, (_, n) => ({
+      file_path: file, line_start: n + 1, line_end: n + 1, source: `return before_${n}`,
+      freshness: { state: "fresh", disk_source_hash: "a".repeat(64) },
+      kind: "function", qualname: `app.f${n}`,
+    })) }));
+    const chunkSize = Math.ceil(bodyBytes.length / reads);
+    let turns = 0;
+    const invoked = [];
+    const model = {
+      capabilities: { toolCalling: native },
+      sendRequest: async (_messages, options) => {
+        if (native) assert.ok(Array.isArray(options.tools), "exercise native tools, not text fallback");
+        const n = turns++;
+        let call;
+        if (n < reads) {
+          call = { name: "aiworkhub_worker_source_graph_query",
+            input: { mode: "body", query: paged ? "app.whole" : `app.f${n}`, target: file,
+              ...(paged && n ? { continuation_cursor: `next-${n}` } : {}) } };
+        } else if (n === reads) {
+          call = { name: "aiworkhub_worker_semantic_edit_prepare",
+            input: { file_path: file, start_line: 2, end_line: 2 } };
+        } else if (n === reads + 1) {
+          call = { name: "aiworkhub_worker_semantic_edit_apply",
+            input: { target_id: "verified-target", new: "return fixed", idempotency_key: "nf1290" } };
+        } else {
+          assert.strictEqual(n, reads + 2, "validated staging must complete the required output");
+          call = { name: "aiworkhub_manager_semantic_edit_stage",
+            input: { operation: "replace_range", file_path: file,
+              start_line: 2, end_line: 2, new: "return fixed" } };
+        }
+        const part = native ? { ...call, callId: `nf1290-${n}` } :
+          { value: JSON.stringify({ schema_id: internals.constants.VSCODE_LM_TOOL_REQUEST_SCHEMA, ...call }) };
+        return { stream: (async function* () { yield part; }()) };
+      },
+    };
+    const run = native ? internals.runVscodeLmAgent : internals.runVscodeLmTextProtocol;
+    const result = JSON.parse(await run(model, {
+      requestId: (native ? "7" : "6").repeat(32), request_kind: "worker",
+      prompt: "Read distinct verified source, then prepare/apply and stage the required edit.",
+      allowedWrites: [file], required_outputs: [file],
+      path_contracts: { [file]: { action: "edit", current_sha256: "a".repeat(64),
+        line_count: reads + 2, parent_existed: true } },
+    }, undefined, async (call) => {
+      invoked.push(call.name);
+      if (call.name === "aiworkhub_worker_source_graph_query") {
+        const n = paged ? (call.input.continuation_cursor ?
+          Number(call.input.continuation_cursor.slice(5)) : 0) : Number(call.input.query.slice(5));
+        if (paged) {
+          const chunk = bodyBytes.subarray(n * chunkSize, (n + 1) * chunkSize);
+          return { ok: true, tool: "source_graph", mode: "body",
+            authority_source: "canonical", authority_repo: "D:/Dev/AIWorkHub", hit_count: 1,
+            content: chunk.toString("base64"), content_encoding: "base64",
+            content_sha256: hashBytes(bodyBytes), page_sha256: hashBytes(chunk),
+            page_index: n, page_count: reads, bytes: chunk.length, full_bytes: bodyBytes.length,
+            continuation_cursor: n + 1 < reads ? `next-${n + 1}` : null };
+        }
+        return { ok: true, tool: "source_graph", mode: "body",
+          authority_source: "canonical", authority_repo: "D:/Dev/AIWorkHub", hit_count: 1,
+          content: JSON.stringify({ matches: [{ file_path: file, line_start: n + 1,
+            line_end: n + 1, source: `return before_${n}`,
+            freshness: { state: "fresh", disk_source_hash: "a".repeat(64) },
+            kind: "function", qualname: `app.f${n}` }] }) };
+      }
+      if (call.name === "aiworkhub_worker_semantic_edit_prepare") {
+        return { ok: true, tool: "semantic_edit_prepare", target_id: "verified-target" };
+      }
+      assert.strictEqual(call.name, "aiworkhub_worker_semantic_edit_apply");
+      assert.strictEqual(call.input.target_id, "verified-target");
+      return { ok: true, tool: "semantic_edit_apply",
+        schema_id: "aiworkhub.semantic_edit_apply_receipt.v1", target_id: "verified-target",
+        path: file, before_sha256: "a".repeat(64), after_sha256: "b".repeat(64),
+        idempotency_key: "nf1290", idempotent_replay: false };
+    }));
+    assert.strictEqual(turns, reads + 3);
+    assert.deepStrictEqual(invoked.slice(-2), [
+      "aiworkhub_worker_semantic_edit_prepare", "aiworkhub_worker_semantic_edit_apply",
+    ]);
+    assert.strictEqual(result.edits[0].path, file);
+    assert.strictEqual(result.edits[0].current_sha256, "a".repeat(64));
+    assert.strictEqual(result.edits[0].ranges[0].new, "return fixed");
+    assert.deepStrictEqual(result.creates, []);
+  }
+
+  for (const native of [false, true]) {
+    for (const kind of ["zero-hit", "untrusted", "duplicate"]) {
+      let turns = 0;
+      let calls = 0;
+      const model = { capabilities: { toolCalling: native }, sendRequest: async () => {
+        const n = turns++;
+        const call = { name: "aiworkhub_worker_source_graph_query",
+          input: { mode: "body", query: kind === "duplicate" ? "app.same" : `app.f${n}`, target: file } };
+        const part = native ? { ...call, callId: `counter-${n}` } :
+          { value: JSON.stringify({ schema_id: internals.constants.VSCODE_LM_TOOL_REQUEST_SCHEMA, ...call }) };
+        return { stream: (async function* () { yield part; }()) };
+      } };
+      const run = native ? internals.runVscodeLmAgent : internals.runVscodeLmTextProtocol;
+      await assert.rejects(run(model, {
+        requestId: (native ? "9" : "8").repeat(32), request_kind: "worker", prompt: "bounded countercase",
+        allowedWrites: [file], required_outputs: [],
+        path_contracts: { [file]: { action: "edit", current_sha256: "a".repeat(64), line_count: 100 } },
+      }, undefined, async () => {
+        calls++;
+        return { ok: true, tool: "source_graph", mode: "body", hit_count: 0,
+          authority_source: kind === "untrusted" ? "legacy" : "canonical",
+          authority_repo: "D:/Dev/AIWorkHub", content: JSON.stringify({ matches: [] }) };
+      }), /vscode_lm_source_graph_no_progress/);
+      assert.ok(turns < internals.constants.VSCODE_LM_MAX_AGENT_TURNS);
+      assert.strictEqual(calls, kind === "duplicate" ? 1 :
+        internals.constants.VSCODE_LM_MAX_SOURCE_GRAPH_WITHOUT_EDIT);
+    }
+  }
+}
+
 async function main() {
+  await nf1290ProgressingProviderLoopsContinue();
   await nf1275VisibleActivityEndToEnd();
   await nf1255TypedReasoningCannotBecomeProtocolText();
   await nf1252FinalSchemaIsExplicitAndCorrectable();
