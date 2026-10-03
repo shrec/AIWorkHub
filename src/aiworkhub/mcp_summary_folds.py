@@ -179,9 +179,27 @@ def fold_task_card_contract(card: Any) -> Any:
 
 
 def fold_task_card_for_process_status(card: Any) -> Any:
-    """Full task_card fold for ``aiworkhub_agent_task_status``'s summary."""
-
-    return fold_task_card_contract(fold_task_card_facts(card))
+    """Fold contract text and repeated retry/reroute prose, not lifecycle facts."""
+    result = fold_task_card_contract(fold_task_card_facts(card))
+    if not isinstance(result, dict):
+        return result
+    minimality = result.get("minimality_contract")
+    if minimality:
+        result["minimality_contract"] = _fold_to_identity(minimality)
+    for key in ("identity_reroute", "terminal_retry"):
+        value = result.get(key)
+        if not isinstance(value, dict):
+            continue
+        provenance = dict(value)
+        if provenance.get("reason"):
+            provenance["reason"] = _fold_to_identity(provenance["reason"])
+        authorization = provenance.get("operational_provider_authorization")
+        if isinstance(authorization, dict) and authorization.get("reason"):
+            authorization = dict(authorization)
+            authorization["reason"] = _fold_to_identity(authorization["reason"])
+            provenance["operational_provider_authorization"] = authorization
+        result[key] = provenance
+    return result
 
 
 def _compact_provider_status_map(items: Any, *, adapter_id: str | None) -> dict[str, Any]:
@@ -436,4 +454,27 @@ def fold_latest_event_for_process_status(event: Any) -> Any:
         value = result.get(key)
         if isinstance(value, (dict, list)) and value:
             result[key] = _fold_blob_generic(value)
+    # Core has already computed these summaries' identity. Drop only the redundant
+    # field-name inventory; retain its original digest, bytes and every fact.
+    for key in ("project_context", "worker_mcp_gate", "token_budget", "quality_gate"):
+        value = result.get(key)
+        if isinstance(value, dict) and value.get("summarized") is True and "keys" in value:
+            result[key] = {name: fact for name, fact in value.items() if name != "keys"}
+    # Named receipts contain repeatable manifests/registration, not live state.
+    # Keep explicit unknown/observed flags, errors and operational facts visible.
+    for key, facts in (
+        ("review_automation", ("state", "chain_identity_sha256")),
+        ("attempt_artifact_manifest", ("attempt_id", "artifact_count", "verified")),
+        ("project_context_delivery", ("injected", "section_count", "bundle_bytes")),
+    ):
+        value = result.get(key)
+        if not isinstance(value, dict) or not value or value.get("summarized") is True:
+            continue
+        receipt = _fold_to_identity(value)
+        for name, fact in value.items():
+            if (name in facts or isinstance(fact, bool) or fact is None
+                    or name in ("status", "verdict", "reason", "error", "unknown_reason",
+                                "telemetry_reason", "evidence_observed")):
+                receipt[name] = fact
+        result[key] = receipt
     return result

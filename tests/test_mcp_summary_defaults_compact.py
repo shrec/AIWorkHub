@@ -424,6 +424,147 @@ def test_agent_task_status_full_keeps_the_task_card_exact(monkeypatch) -> None:
     assert result == status_result
 
 
+
+def test_agent_task_status_terminal_metadata_compacts_without_losing_truth(monkeypatch) -> None:
+    """U2-shaped residual metadata: byte counts are not provider token savings."""
+    import copy
+
+    status = _agent_task_status_result()
+    status.update(state="blocked", process_alive=False, exit_code=1, pid=123,
+                  liveness={"observed": False, "reason": "unknown"})
+    card = status["task_card"]
+    card["minimality_contract"] = _filler(522)
+    authorization = {"authority": "provider_runtime_or_cancellation",
+                     "retry_request_id": "prior-request", "terminal_substatus": "worker_failed",
+                     "to_model": "gpt-6.1-sol", "reason": _filler(390)}
+    card["identity_reroute"] = {"from_runner": "old-runner", "to_runner": "new-runner",
+                               "to_adapter_id": "vscode_lm", "to_model": "gpt-6.1-sol",
+                               "reason": _filler(390),
+                               "operational_provider_authorization": authorization}
+    card["terminal_retry"] = {"claim_epoch": 4, "request_id": "prior-request",
+                             "runner": "old-runner", "terminal_substatus": "worker_failed",
+                             "reason": _filler(500)}
+    card["blocker_reason"] = "provider runtime unavailable"
+    event = status["latest_event"]
+    event.update(state="blocked", request_id="req-0001", task_id=card["task_id"],
+                 pid=123, exit_code=1, provider_launched=True,
+                 stall_detected=False, liveness_lost=False, error="provider failure",
+                 worker_terminal_state="worker_failed")
+    event["usage"].update(usage_observed=False, total_tokens_observed=False,
+                          cost_observed=False, cost_usd=None, telemetry_reason="unavailable")
+    for key in ("project_context", "worker_mcp_gate", "token_budget", "quality_gate"):
+        event[key] = {"summarized": True, "bytes": 9000, "sha256": "a" * 64,
+                      "status": "unknown", "observed": False,
+                      "keys": ["metadata_field_" + str(i) for i in range(20)]}
+    event["review_automation"] = {
+        "state": "seeded", "chain_identity_sha256": "b" * 64,
+        "registration": {"candidate_sha256": "c" * 64, "packet_sha256": "d" * 64,
+                         "target_request_id": "req-0001", "target_task_id": card["task_id"],
+                         "claim_epoch": "4", "effective_tier": "medium"}}
+    event["attempt_artifact_manifest"] = {
+        "attempt_id": "req-0001", "artifact_count": 5, "verified": False,
+        "manifest_path": _filler(165), "manifest_sha256": "e" * 64}
+    event["project_context_delivery"] = {
+        "injected": True, "section_count": 4, "bundle_sha256": "f" * 64,
+        "prompt_sha256": "g" * 64, "bundle_bytes": 16277}
+    # Unknown acknowledgement and numeric usage remain exact, not invented zero.
+    event["project_context_acknowledgement"] = {"acknowledged": False, "reason": "receipt_not_found"}
+    before = copy.deepcopy(status)
+
+    class FakeManager:
+        def status(self, request_id: str) -> dict:
+            assert request_id == "req-0001"
+            return status
+
+    pre_fold = {}
+    fold = mcp_summary_folds.fold_latest_event_for_process_status
+
+    def capture_fold(event):
+        pre_fold.update(copy.deepcopy(event))
+        return fold(event)
+
+    monkeypatch.setattr(mcp_summary_folds, "fold_latest_event_for_process_status", capture_fold)
+    monkeypatch.setattr(server.process_launcher, "default_manager", lambda: FakeManager())
+    result = server.aiworkhub_agent_task_status("req-0001")
+    summary = result["latest_event"]
+    assert "keys" not in summary["worker_mcp_gate"]
+    for key in ("project_context", "worker_mcp_gate", "token_budget", "quality_gate"):
+        assert summary[key] == {name: fact for name, fact in pre_fold[key].items() if name != "keys"}
+    direct = fold({"worker_mcp_gate": before["latest_event"]["worker_mcp_gate"]})
+    assert direct["worker_mcp_gate"]["observed"] is False
+    assert direct["worker_mcp_gate"]["status"] == "unknown"
+    assert direct["worker_mcp_gate"]["sha256"] == "a" * 64
+    assert summary["review_automation"]["state"] == "seeded"
+    assert summary["review_automation"]["summarized"] is True
+    assert summary["attempt_artifact_manifest"]["verified"] is False
+    assert summary["project_context_delivery"]["injected"] is True
+    assert summary["project_context_acknowledgement"] == before["latest_event"]["project_context_acknowledgement"]
+    for key in ("state", "request_id", "task_id", "pid", "exit_code", "provider_launched",
+                "stall_detected", "liveness_lost", "error", "worker_terminal_state"):
+        assert summary[key] == before["latest_event"][key]
+    for key in ("usage_observed", "total_tokens_observed", "cost_observed", "cost_usd",
+                "telemetry_reason", "total_tokens"):
+        assert summary["usage"][key] == before["latest_event"]["usage"][key]
+    route = result["task_card"]["identity_reroute"]
+    assert route["reason"]["summarized"] is True
+    assert route["from_runner"] == "old-runner"
+    assert route["operational_provider_authorization"]["authority"] == authorization["authority"]
+    assert result["task_card"]["terminal_retry"]["claim_epoch"] == 4
+    assert result["task_card"]["blocker_reason"] == card["blocker_reason"]
+    assert result["liveness"] == status["liveness"]
+    assert status == before
+    assert server.aiworkhub_agent_task_status("req-0001", detail="full") == before
+    evidence = server.aiworkhub_agent_task_status("req-0001", detail="evidence")
+    assert evidence["latest_event"] == before["latest_event"]
+    assert evidence["task_card"]["identity_reroute"] == before["task_card"]["identity_reroute"]
+    # Deterministic residual baseline using the existing old folds' shape.
+    baseline = copy.deepcopy(result)
+    for key in ("minimality_contract", "identity_reroute", "terminal_retry"):
+        baseline["task_card"][key] = before["task_card"][key]
+    for key in ("project_context", "worker_mcp_gate", "token_budget", "quality_gate",
+                "review_automation", "attempt_artifact_manifest", "project_context_delivery"):
+        baseline["latest_event"][key] = pre_fold[key]
+
+    def size(value):
+        return len(json.dumps(value, separators=(",", ":")).encode("utf-8"))
+
+    baseline_bytes, summary_bytes = size(baseline), size(result)
+    assert summary_bytes <= baseline_bytes - 1800, (baseline_bytes, summary_bytes)
+
+
+
+def test_terminal_metadata_identity_unknown_and_passthrough() -> None:
+    from aiworkhub import core
+
+    receipt = {"verified": False, "observed": None, "error": "manifest unavailable",
+               "unknown_reason": "unmeasured", "payload": "გ" * 300}
+    result = mcp_summary_folds.fold_latest_event_for_process_status({
+        "attempt_artifact_manifest": receipt, "unrelated": {"payload": "exact"}})
+    folded = result["attempt_artifact_manifest"]
+    size, digest = core._evidence_identity(receipt)
+    assert folded["bytes"] == size
+    assert folded["sha256"] == digest
+    for key in ("verified", "observed", "error", "unknown_reason"):
+        assert folded[key] == receipt[key]
+    assert result["unrelated"] == {"payload": "exact"}
+    assert "artifact_count" not in folded
+    assert "payload" not in folded
+    assert mcp_summary_folds.fold_latest_event_for_process_status(result) == result
+    for value in (None, "corrupt", [], {}):
+        event = {"review_automation": value}
+        assert mcp_summary_folds.fold_latest_event_for_process_status(event) == event
+    assert mcp_summary_folds.fold_latest_event_for_process_status(None) is None
+    assert mcp_summary_folds.fold_task_card_for_process_status(None) is None
+    card = {"identity_reroute": {"reason": "გ" * 300, "to_model": "exact-model"},
+            "terminal_retry": {"reason": "retry" * 100, "claim_epoch": 4}}
+    folded_card = mcp_summary_folds.fold_task_card_for_process_status(card)
+    for key in ("identity_reroute", "terminal_retry"):
+        size, digest = core._evidence_identity(card[key]["reason"])
+        assert folded_card[key]["reason"] == {"summarized": True, "bytes": size, "sha256": digest}
+    assert folded_card["identity_reroute"]["to_model"] == "exact-model"
+    assert folded_card["terminal_retry"]["claim_epoch"] == 4
+
+
 # ---------------------------------------------------------------------------
 # aiworkhub_environment_preflight
 # ---------------------------------------------------------------------------

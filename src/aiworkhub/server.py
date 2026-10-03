@@ -4243,7 +4243,11 @@ def aiworkhub_agent_task_status(
     {summarized, bytes, sha256} -- identity and lifecycle fields (task_id,
     title, status, substatus, runner, topic, request ids, allowed_writes
     count) stay exact. The latest event's validation/quality_gate/
-    worker_mcp_gate/token_budget/project_context fold the same way;
+    worker_mcp_gate/token_budget/project_context fold the same way, without
+    redundant field-name inventories. Repeated retry/reroute reasons and the
+    minimality contract fold to identity; named artifact/delivery/review receipts
+    retain status, errors and explicit observed/unknown flags alongside identity.
+    Failure/liveness fields and usage metrics stay exact.
     ``"evidence"`` keeps all of the above exact (baselines still folded);
     ``"full"`` returns the raw status payload.
     """
