@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import hashlib
+import inspect
 import json
 import os
 import subprocess
@@ -12,6 +13,8 @@ from collections.abc import Callable
 from pathlib import Path, PureWindowsPath
 
 import pytest
+
+from aiworkhub.platform_io import process_is_alive
 
 from aiworkhub.source_graph_lsp import (
     AMBIGUOUS,
@@ -64,7 +67,15 @@ def _write(repo: Path, relative: str, data: bytes) -> str:
 
 
 def _spec(*_args: object) -> LspServerSpec:
-    command = [sys.executable, str(Path(__file__).resolve()), FAKE_LSP_FLAG]
+    # Reuse the exact server without importing this pytest/AIWorkHub module
+    # in every child. Startup remains inside the unchanged transport budget.
+    program = (
+        "import json, os, sys, time\nfrom pathlib import Path\n"
+        f"DEFAULT_POSITION_ENCODING = {DEFAULT_POSITION_ENCODING!r}\n"
+        + inspect.getsource(_run_fake_lsp_server)
+        + "\nraise SystemExit(_run_fake_lsp_server())\n"
+    )
+    command = [sys.executable, "-I", "-S", "-c", program]
     return LspServerSpec(command=tuple(command), version="fake-1.0", language="python")
 
 
@@ -78,6 +89,37 @@ def _env(scenario_path: Path, log_path: Path | None = None) -> dict[str, str]:
     if log_path is not None:
         env["AIWORKHUB_FAKE_LSP_LOG"] = str(log_path)
     return env
+
+
+def test_fake_child_imports_only_stdlib_and_preserves_real_handshake(tmp_path: Path) -> None:
+    scenario = _write_scenario(tmp_path / "scenario.json", {})
+    log_path = tmp_path / "lsp.log"
+    frames = []
+    for ident, method in ((1, "initialize"), (2, "shutdown"), (None, "exit")):
+        message = {"jsonrpc": "2.0", "method": method, "params": {}}
+        if ident is not None:
+            message["id"] = ident
+        raw = json.dumps(message).encode("utf-8")
+        frames.append(f"Content-Length: {len(raw)}\r\n\r\n".encode("ascii") + raw)
+    command = _spec().command
+    child = subprocess.run(
+        [command[0], "-X", "importtime", *command[1:]],
+        input=b"".join(frames), capture_output=True,
+        env={**os.environ, **_env(scenario, log_path)}, cwd=tmp_path,
+        timeout=4.0, check=False,
+    )
+    assert child.returncode == 0, child.stderr.decode("utf-8", "replace")
+    assert child.stdout.count(b"Content-Length:") == 2
+    assert json.loads(log_path.read_text(encoding="utf-8")) == ["initialize", "shutdown", "exit"]
+    modules = {
+        line.rsplit("|", 1)[-1].strip()
+        for line in child.stderr.decode("utf-8", "replace").splitlines()
+        if line.startswith("import time:")
+    }
+    assert modules
+    assert not any(name == "pytest" or name.startswith("_pytest.") for name in modules)
+    assert not any(name == "aiworkhub" or name.startswith("aiworkhub.") for name in modules)
+    assert "site" not in modules
 
 def _write_scenario(path: Path, payload: dict[str, object]) -> Path:
     path.write_text(json.dumps(payload), encoding="utf-8")
@@ -673,8 +715,7 @@ def _stalled_large_didopen(tmp_path: Path) -> None:
     assert outcome.results[0].classification == UNRESOLVED
     assert outcome.children_reaped
     for pid in outcome.child_pids:
-        with pytest.raises(OSError):
-            os.kill(pid, 0)
+        assert not process_is_alive(pid)
     assert not any(
         thread.name == "lsp-stdio-w" and thread.is_alive()
         for thread in threading.enumerate()

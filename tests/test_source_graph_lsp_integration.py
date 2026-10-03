@@ -233,7 +233,7 @@ class _Lsp:
         self.scenario_path.write_text(json.dumps(self.scenario), encoding="utf-8")
 
     def serve(self, env_name: str = PYTHON_SERVER_ENV) -> None:
-        command = f"{shlex.quote(sys.executable)} {shlex.quote(str(self.script))}"
+        command = shlex.join((sys.executable, "-I", "-S", str(self.script)))
         self.monkeypatch.setenv(env_name, command)
 
     def unserve(self, env_name: str = PYTHON_SERVER_ENV) -> None:
@@ -336,6 +336,40 @@ def _python_pair(fixture: _Lsp) -> None:
     fixture.write("a.py", PY_CALLER)
     fixture.define(CALL_KEY, {"workspace_path": "b.py", "range": TARGET_SPAN})
     fixture.serve()
+
+
+def test_fake_child_imports_only_stdlib_and_preserves_real_handshake(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    import subprocess
+
+    fixture = _Lsp(tmp_path, monkeypatch, "stdlib_child")
+    fixture.serve()
+    command = tuple(shlex.split(os.environ[PYTHON_SERVER_ENV]))
+    assert sg._lsp_server_identity(command) == fixture.identity()
+    frames = []
+    for ident, method in ((1, "initialize"), (2, "shutdown"), (None, "exit")):
+        message = {"jsonrpc": "2.0", "method": method, "params": {}}
+        if ident is not None:
+            message["id"] = ident
+        raw = json.dumps(message).encode("utf-8")
+        frames.append(f"Content-Length: {len(raw)}\r\n\r\n".encode("ascii") + raw)
+    child = subprocess.run(
+        [command[0], "-X", "importtime", *command[1:]],
+        input=b"".join(frames), capture_output=True, cwd=fixture.root,
+        timeout=4.0, check=False,
+    )
+    assert child.returncode == 0, child.stderr.decode("utf-8", "replace")
+    assert child.stdout.count(b"Content-Length:") == 2
+    modules = {
+        line.rsplit("|", 1)[-1].strip()
+        for line in child.stderr.decode("utf-8", "replace").splitlines()
+        if line.startswith("import time:")
+    }
+    assert modules
+    assert not any(name == "pytest" or name.startswith("_pytest.") for name in modules)
+    assert not any(name == "aiworkhub" or name.startswith("aiworkhub.") for name in modules)
+    assert "site" not in modules
 
 
 def _assert_evidence_agrees(fixture: _Lsp, rel: str) -> None:
