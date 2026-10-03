@@ -1088,7 +1088,34 @@ _ZERO_DIFF_GITIGNORE = "__pycache__/\n.pytest_cache/\n.ruff_cache/\n.coverage\n"
 
 
 def _git(root: Path, *args: str) -> None:
-    subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-c", "core.longpaths=true", "-C", str(root), *args],
+        check=True,
+        capture_output=True,
+    )
+
+
+def test_git_fixture_enables_longpaths_without_persistent_config(
+    tmp_path, monkeypatch
+):
+    recorded: dict[str, object] = {}
+
+    def _fake_run(argv, *, check, capture_output):
+        recorded["argv"] = list(argv)
+        recorded["check"] = check
+        recorded["capture_output"] = capture_output
+        return subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+    _git(tmp_path, "add", ".")
+    argv = list(recorded["argv"])
+    assert argv[:3] == ["git", "-c", "core.longpaths=true"]
+    assert argv[3:5] == ["-C", str(tmp_path)]
+    assert argv[5:] == ["add", "."]
+    assert recorded["check"] is True
+    assert recorded["capture_output"] is True
+    assert "config" not in argv
+    assert not (tmp_path / ".git" / "config").exists()
 
 
 def _sealed_zero_diff_workspace(
