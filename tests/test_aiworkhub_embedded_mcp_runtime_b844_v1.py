@@ -31,6 +31,7 @@ import selectors
 import subprocess
 import sys
 import threading
+import time
 import zipfile
 from pathlib import Path
 
@@ -509,6 +510,41 @@ def test_stdlib_fallback_task_create_then_show_uses_binary_utf8_for_georgian(
 class _StdioSession:
     def __init__(self, proc: subprocess.Popen):
         self.proc = proc
+        self._stdout_pending = bytearray()
+        self._stderr_tail = ""
+        self._stderr_lock = threading.Lock()
+        self._stderr_done = threading.Event()
+        if proc.stderr is None:
+            self._stderr_done.set()
+        else:
+            # Drain concurrently: a chatty child must not block on a full pipe.
+            threading.Thread(target=self._collect_stderr, daemon=True).start()
+
+    def _collect_stderr(self) -> None:
+        assert self.proc.stderr is not None
+        try:
+            while chunk := self.proc.stderr.readline(2048):
+                with self._stderr_lock:
+                    self._stderr_tail = (self._stderr_tail + chunk)[-2000:]
+        except Exception as exc:
+            with self._stderr_lock:
+                self._stderr_tail = (
+                    self._stderr_tail + f"[stderr reader {type(exc).__name__}: {exc}]"
+                )[-2000:]
+        finally:
+            self._stderr_done.set()
+
+    def _diagnostics(self, started: float, first_byte_at: float | None) -> str:
+        first_byte = (
+            "None" if first_byte_at is None else f"{first_byte_at - started:.3f}s"
+        )
+        with self._stderr_lock:
+            stderr_tail = self._stderr_tail
+        return (
+            f"pid={self.proc.pid} returncode={self.proc.poll()} "
+            f"elapsed={time.monotonic() - started:.3f}s "
+            f"first_byte={first_byte} stderr_tail={stderr_tail!r}"
+        )
 
     def send(self, message: dict) -> None:
         assert self.proc.stdin is not None
@@ -517,34 +553,155 @@ class _StdioSession:
 
     def recv(self, timeout: float = 20.0) -> dict:
         assert self.proc.stdout is not None
+        started = time.monotonic()
+        first_byte_at: list[float | None] = [None]
         if os.name == "nt":
             # Windows ``select`` accepts sockets only, not subprocess pipes.
-            # A daemon reader preserves the same bounded protocol timeout.
-            received: queue.Queue[str] = queue.Queue(maxsize=1)
-            threading.Thread(
-                target=lambda: received.put(self.proc.stdout.readline()),
-                daemon=True,
-            ).start()
+            # The reader reports its exception instead of silently timing out.
+            received: queue.Queue[tuple[str | None, BaseException | None]] = queue.Queue(
+                maxsize=1
+            )
+
+            def read_line() -> None:
+                try:
+                    first = self.proc.stdout.read(1)
+                    if first:
+                        first_byte_at[0] = time.monotonic()
+                    received.put((first + self.proc.stdout.readline() if first else "", None))
+                except BaseException as exc:
+                    received.put((None, exc))
+
+            threading.Thread(target=read_line, daemon=True).start()
             try:
-                line = received.get(timeout=timeout)
+                line, read_error = received.get(timeout=timeout)
             except queue.Empty as exc:
                 raise TimeoutError(
-                    "bundled MCP fallback runtime did not respond in time"
+                    "bundled MCP fallback runtime did not respond in time: "
+                    + self._diagnostics(started, first_byte_at[0])
                 ) from exc
+            if read_error is not None:
+                raise read_error
         else:
-            # DefaultSelector uses poll/epoll/kqueue where available, so an
-            # xdist worker with a pipe fd above FD_SETSIZE remains valid.
+            # DefaultSelector handles pipe fds above FD_SETSIZE. Read bytes
+            # under one deadline: TextIOWrapper.readline() can block forever
+            # after select reports only the first byte of a partial line.
+            deadline = started + timeout
+            if self._stdout_pending:
+                first_byte_at[0] = started
             with selectors.DefaultSelector() as selector:
                 selector.register(self.proc.stdout, selectors.EVENT_READ)
-                if not selector.select(timeout):
-                    raise TimeoutError(
-                        "bundled MCP fallback runtime did not respond in time"
-                    )
-            line = self.proc.stdout.readline()
+                while b"\n" not in self._stdout_pending:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0 or not selector.select(remaining):
+                        raise TimeoutError(
+                            "bundled MCP fallback runtime did not respond in time: "
+                            + self._diagnostics(started, first_byte_at[0])
+                        )
+                    chunk = os.read(self.proc.stdout.fileno(), 4096)
+                    if not chunk:
+                        break
+                    if first_byte_at[0] is None:
+                        first_byte_at[0] = time.monotonic()
+                    self._stdout_pending.extend(chunk)
+            end = self._stdout_pending.find(b"\n")
+            if end < 0:
+                end = len(self._stdout_pending) - 1
+            raw_line = bytes(self._stdout_pending[:end + 1])
+            del self._stdout_pending[:end + 1]
+            line = raw_line.decode(
+                self.proc.stdout.encoding or "utf-8",
+                errors=self.proc.stdout.errors or "strict",
+            )
         if line == "":
-            stderr = self.proc.stderr.read() if self.proc.stderr else ""
-            raise EOFError(f"bundled MCP fallback runtime exited unexpectedly: {stderr[-2000:]}")
+            # The child may still own stderr; never wait unboundedly for it.
+            self._stderr_done.wait(timeout=0.05)
+            raise EOFError(
+                "bundled MCP fallback runtime exited unexpectedly: "
+                + self._diagnostics(started, first_byte_at[0])
+            )
         return json.loads(line)
+
+
+
+def _diagnostic_child(code: str) -> subprocess.Popen:
+    return subprocess.Popen(
+        [sys.executable, "-S", "-c", code],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+
+
+def test_stdio_session_eof_reports_child_state_and_bounded_stderr():
+    proc = _diagnostic_child(
+        "import sys; sys.stderr.write('x' * 4096 + 'stderr-marker\\n'); sys.exit(7)"
+    )
+    try:
+        session = _StdioSession(proc)
+        assert proc.wait(timeout=5) == 7
+        assert session._stderr_done.wait(timeout=2)
+        with pytest.raises(EOFError) as raised:
+            session.recv(timeout=1)
+        message = str(raised.value)
+        assert f"pid={proc.pid}" in message
+        assert "returncode=7" in message
+        assert "first_byte=None" in message
+        assert "stderr-marker" in message
+        assert len(message) < 3000
+    finally:
+        _terminate(proc)
+
+
+def test_stdio_session_timeout_reports_live_child_without_output():
+    proc = _diagnostic_child("import time; time.sleep(5)")
+    try:
+        session = _StdioSession(proc)
+        with pytest.raises(TimeoutError) as raised:
+            session.recv(timeout=0.05)
+        message = str(raised.value)
+        assert f"pid={proc.pid}" in message
+        assert "returncode=None" in message
+        assert "elapsed=" in message
+        assert "first_byte=None" in message
+    finally:
+        _terminate(proc)
+
+
+def test_stdio_session_timeout_reports_partial_first_byte():
+    proc = _diagnostic_child(
+        "import sys, time; sys.stderr.write('ready\\n'); sys.stderr.flush(); "
+        "sys.stdin.readline(); sys.stdout.write('{'); sys.stdout.flush(); time.sleep(5)"
+    )
+    try:
+        ready: queue.Queue[str] = queue.Queue(maxsize=1)
+        threading.Thread(
+            target=lambda: ready.put(proc.stderr.readline()), daemon=True
+        ).start()
+        assert ready.get(timeout=5) == "ready\n"
+        session = _StdioSession(proc)
+        proc.stdin.write("\n")
+        proc.stdin.flush()
+        with pytest.raises(TimeoutError) as raised:
+            session.recv(timeout=1)
+        message = str(raised.value)
+        assert f"pid={proc.pid}" in message
+        assert "first_byte=" in message
+        assert "first_byte=None" not in message
+    finally:
+        _terminate(proc)
+
+
+def test_stdio_session_propagates_reader_error():
+    proc = _diagnostic_child("import time; time.sleep(5)")
+    try:
+        session = _StdioSession(proc)
+        proc.stdout.close()
+        with pytest.raises(ValueError):
+            session.recv(timeout=1)
+    finally:
+        _terminate(proc)
 
 
 def _spawn_bundled_runtime(runtime_dir: Path, fresh_repo: Path) -> subprocess.Popen:
