@@ -4295,7 +4295,7 @@ function createVscodeLmStagedEditCollector(request) {
     if (trackRequired && incompleteFinalizeCount >= 2) {
       return reject("required_outputs_correction_exhausted");
     }
-    if (trackRequired && !requiredSet.has(filePath)) {
+    if (trackRequired && requiredSet.size > 0 && !requiredSet.has(filePath)) {
       return reject(`path_not_required:${filePath}`);
     }
     const contract = contractByPath.get(filePath);
