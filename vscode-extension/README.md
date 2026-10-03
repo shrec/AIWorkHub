@@ -14,6 +14,13 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.12.21
+
+- Authorized complete-create worker stages have a separate 255 KiB payload bound; general requests retain 16 KiB.
+- Card scope, payload fidelity, semantic edit authorization and mandatory-output gates remain enforced. Oversize diagnostics report the selected bound.
+- Independent bridge and Python regressions passed; installation and live activation remain separate checks.
+- Full Manager Chat, shared all-seat context policy, sandboxed OpenCode/Muse and Skills completion are not claimed.
+
 ## What's new in 0.12.20
 
 - Editor workers use a dedicated write-only MCP connection, preserving Source Graph/prepare/apply session identity without granting worker launch or dashboard write permissions.

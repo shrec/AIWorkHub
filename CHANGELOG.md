@@ -6,6 +6,19 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.21] - 2026-10-03
+
+### Fixed
+
+- Authorized complete-create editor-worker payloads use an independent 255 KiB bound, restoring measured 16,988- and 19,503-byte stages rejected by the general 16 KiB guard.
+- Reads, range edits, malformed operations and requests outside the card scope retain 16 KiB. Payload fidelity, semantic authorization and mandatory-output gates are unchanged.
+- Oversize results and traces report the actual selected bound.
+
+### Qualification
+
+- Discriminating old-source regressions, the full Node bridge suite and 100 Python bridge tests passed independently. Packaging, installation and live activation are separate checks.
+- Full Manager Chat, shared all-seat context policy, sandboxed OpenCode/Muse and Skills completion are not claimed.
+
 ## [0.12.20] - 2026-10-03
 
 ### Fixed

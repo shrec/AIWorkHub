@@ -62,6 +62,12 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
+## What's new in 0.12.21
+
+Authorized complete-create editor-worker stages now accept up to 255 KiB instead of the general 16 KiB limit. Exact card scope, payload fidelity and required-output checks remain enforced; reads, range edits and malformed or unauthorized requests keep the original bound. This restores a measured multi-file worker blocker without granting new filesystem authority.
+
+Independent bridge and Python regressions passed. Packaging and live activation remain separate checks. Full Manager Chat, shared all-seat context policy, sandboxed OpenCode/Muse and Skills completion are not claimed.
+
 ## What's new in 0.12.20
 
 Editor language-model worker edits now use a dedicated write-only MCP connection rather than the read-only dashboard connection. Worker Source Graph and semantic edits share one session, while server task authorization and dashboard restrictions stay intact. Closing the Manager dialog no longer discards a worker's prepared edit targets.

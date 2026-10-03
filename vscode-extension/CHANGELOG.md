@@ -1,5 +1,17 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.12.21 — 2026-10-03
+
+### Fixed
+
+- Authorized complete-create worker stages use a separate 255 KiB bound; general, range-edit, malformed and unauthorized requests keep 16 KiB.
+- Scope, payload fidelity and mandatory-output checks remain intact. Oversize diagnostics report the actual bound.
+
+### Qualification
+
+- Independent Node bridge and 100 Python regressions passed. Packaging and live activation remain separate checks.
+- Full Manager Chat, shared all-seat context policy, sandboxed OpenCode/Muse and Skills completion are not claimed.
+
 ## 0.12.20 — 2026-10-03
 
 ### Fixed

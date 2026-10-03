@@ -206,7 +206,8 @@ async function oversizedStrikeIsKeyedToTheMissingOutput() {
     input: { mode: "focus", query: "bounded orientation" },
   });
   const boundedAlpha = stageEnvelope({ operation: "create", file_path: alpha, content: "const alpha = 1;\n" });
-  const oversizedBravo = stageEnvelope({ operation: "create", file_path: bravo, content: "x".repeat(17000) });
+  // Authorized create stages have a 255 KiB bound; this fixture must exceed it.
+  const oversizedBravo = stageEnvelope({ operation: "create", file_path: bravo, content: "x".repeat(255 * 1024 + 1) });
   const boundedBravo = stageEnvelope({ operation: "create", file_path: bravo, content: "const bravo = 2;\n" });
   let turns = 0;
   let invoked = 0;
