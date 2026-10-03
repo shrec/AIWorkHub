@@ -192,6 +192,195 @@ def test_project_context_collects_source_modes_bounded_session_and_optional_kb(
     assert '"mode":"explore"' in seen["bundle"]
 
 
+def _development_rules_case(tmp_path, monkeypatch):
+    from aiworkhub import development_rules as dr
+
+    repo = _context_repo(tmp_path)
+    _stub_source_graph_direct(monkeypatch)
+    _stub_worker_tools_direct(monkeypatch)
+    manifest = {
+        "schema": dr.SCHEMA_ID, "schema_version": dr.SCHEMA_VERSION,
+        "languages": ["python", "rust"],
+        "rules": [
+            {"id": identity, "topic": topic, "kind": "coding_convention",
+             "applicability": applicability,
+             "forbid": ["unsafe_authority"] if identity == "baseline" else [],
+             "payload": {"guideline_ids": [identity], "severity": "error"}}
+            for identity, topic, applicability in [
+                ("baseline", "baseline", {}),
+                ("python_rule", "language", {"languages": ["python"]}),
+                ("rust_rule", "language", {"languages": ["rust"]}),
+                ("path_rule", "path", {"paths": ["src/a.py"]}),
+                ("release_rule", "release", {"tasks": ["release"]}),
+                ("high_rule", "risk", {"risk_levels": ["high"]}),
+                ("excluded_rule", "excluded", {"paths": ["other/*.py"]}),
+            ]
+        ],
+    }
+    path = repo / ".aiworkhub/config/development_rules.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+    card = _project_context_card()
+    card.update(allowed_writes=["src/a.py", "src/b.rs", "tests/test_a.py"],
+                task_category="bugfix", risk_tier="low")
+    return repo, card, manifest, path
+
+
+def test_development_rules_reach_actual_worker_prompt_deterministically(tmp_path, monkeypatch):
+    from aiworkhub import development_rules as dr
+
+    repo, card, manifest, _path = _development_rules_case(tmp_path, monkeypatch)
+    first = project_context.collect_project_context(repo, card)
+    second = project_context.collect_project_context(
+        repo, {**card, "allowed_writes": list(reversed(card["allowed_writes"]))}
+    )
+    payload = json.loads(first.prompt_bundle.split("PROJECT_CONTEXT_BUNDLE:\n", 1)[1])
+    rules = payload["evidence"]["development_rules"]
+    assert rules["manifest_digest"] == dr.canonical_digest(dr.parse_manifest(manifest))
+    definitions = {rule["id"]: rule for rule in rules["rules"]}
+    assert set(definitions) == {"baseline", "python_rule", "rust_rule", "path_rule"}
+    assert definitions["baseline"]["forbid"] == ["unsafe_authority"]
+    assert definitions["baseline"]["requirements"]["guideline_ids"] == ["baseline"]
+    mappings = {path: set(context["rule_ids"]) for context in rules["contexts"] for path in context["paths"]}
+    assert mappings["src/a.py"] == {"baseline", "python_rule", "path_rule"}
+    assert mappings["src/b.rs"] == {"baseline", "rust_rule"}
+    assert mappings["tests/test_a.py"] == {"baseline", "python_rule"}
+    assert rules["declared_rule_count"] == 7
+    assert rules["selected_rule_count"] == 4
+    assert first.prompt_bundle == second.prompt_bundle
+    prompt = process_launcher.build_worker_prompt(
+        task_id=card["task_id"], runner=card["runner"], topic=card["topic"],
+        card=card, project_context_bundle=first.prompt_bundle,
+    )
+    assert rules["manifest_digest"] in prompt
+    assert "unsafe_authority" in prompt
+    assert "excluded_rule" not in prompt
+    assert "release_rule" not in prompt
+    assert "high_rule" not in prompt
+
+
+@pytest.mark.parametrize("change", [
+    {"allowed_writes": ["../escape.py"]}, {"allowed_writes": ["/abs.py"]},
+    {"allowed_writes": ["src/*.py"]}, {"allowed_writes": [42]},
+    {"allowed_writes": "src/a.py"}, {"language": "unknown"},
+    {"task_category": "bad task"}, {"risk_tier": "unknown"},
+])
+def test_development_rules_refuse_unsafe_card_context(tmp_path, monkeypatch, change):
+    repo, card, _manifest, _path = _development_rules_case(tmp_path, monkeypatch)
+    card.update(change)
+    with pytest.raises(project_context.ProjectContextError, match="development_rules"):
+        project_context.collect_project_context(repo, card)
+
+
+@pytest.mark.parametrize("required", [True, False])
+def test_present_development_rules_never_silently_degrade(tmp_path, monkeypatch, required):
+    repo, card, _manifest, path = _development_rules_case(tmp_path, monkeypatch)
+    card["project_context"]["required"] = required
+    path.write_text("{", encoding="utf-8")
+    with pytest.raises(project_context.ProjectContextError, match="development_rules"):
+        project_context.collect_project_context(repo, card)
+
+
+def test_development_rules_require_complete_section_and_bundle(tmp_path, monkeypatch):
+    repo, card, _manifest, _path = _development_rules_case(tmp_path, monkeypatch)
+    card["project_context"]["required"] = False
+    monkeypatch.setitem(project_context.TOOL_CAPS, "development_rules", {"bytes": 100, "rows": 32})
+    with pytest.raises(project_context.ProjectContextError, match="development_rules"):
+        project_context.collect_project_context(repo, card)
+    monkeypatch.delitem(project_context.TOOL_CAPS, "development_rules")
+    monkeypatch.setattr(project_context, "MAX_BUNDLE_BYTES", 100)
+    with pytest.raises(project_context.ProjectContextError, match="budget_overflow"):
+        project_context.collect_project_context(repo, card)
+
+
+def test_real_manifest_multifile_rules_fit_deduplicated_section(tmp_path, monkeypatch):
+    repo, card, _manifest, path = _development_rules_case(tmp_path, monkeypatch)
+    canonical = Path(__file__).resolve().parents[1] / ".aiworkhub/config/development_rules.json"
+    path.write_bytes(canonical.read_bytes())
+    card["allowed_writes"] = [
+        "src/aiworkhub/manager_ai_tools.py", "src/aiworkhub/manager_skill_tools.py",
+        "src/aiworkhub/dashboard.py", "src/aiworkhub/skill_registry_store.py",
+        "tests/test_manager_skill_tools.py", "tests/test_learning_commit_store.py",
+        "tests/test_dashboard.py", "tests/test_skill_selection_vocabulary.py",
+    ]
+    result = project_context.collect_project_context(repo, card)
+    payload = json.loads(result.prompt_bundle.split("PROJECT_CONTEXT_BUNDLE:\n", 1)[1])
+    rules = payload["evidence"]["development_rules"]
+    assert sum(len(context["paths"]) for context in rules["contexts"]) == 8
+    assert len({rule["id"] for rule in rules["rules"]}) == len(rules["rules"])
+    assert len(json.dumps(rules, separators=(",", ":")).encode()) <= 8192
+    assert "truncated" not in rules
+
+
+@pytest.mark.parametrize("manifest_state", ["missing", "valid", "malformed"])
+def test_development_rules_preserve_legacy_missing_context_contract(tmp_path, monkeypatch, manifest_state):
+    # No invented default workflow: these cards still receive no context bundle.
+    repo, card, _manifest, path = _development_rules_case(tmp_path, monkeypatch)
+    card.pop("project_context")
+    if manifest_state == "missing":
+        path.unlink()
+    elif manifest_state == "malformed":
+        path.write_text("{", encoding="utf-8")
+    assert project_context.collect_project_context(repo, card) is None
+
+
+@pytest.mark.parametrize("broken", [False, True])
+def test_development_rules_manifest_symlink_cannot_escape_authority(tmp_path, monkeypatch, broken):
+    repo, card, manifest, path = _development_rules_case(tmp_path, monkeypatch)
+    target = (repo / "missing.json") if broken else (tmp_path / "outside.json")
+    if not broken:
+        target.write_text(json.dumps(manifest), encoding="utf-8")
+    path.unlink()
+    try:
+        path.symlink_to(target)
+    except OSError as exc:
+        pytest.skip(f"host cannot create symlink: {exc}")
+    with pytest.raises(project_context.ProjectContextError, match="manifest_(untrusted|broken)"):
+        project_context.collect_project_context(repo, card)
+
+
+@pytest.mark.parametrize("path_count", [13, 33, 40])
+def test_development_rules_cover_paths_without_unrelated_row_cutoff(tmp_path, monkeypatch, path_count):
+    repo, card, _manifest, _path = _development_rules_case(tmp_path, monkeypatch)
+    monkeypatch.setattr(project_context, "MAX_SECTION_ROWS", 32)
+    paths = [f"src/module_{index}.py" for index in range(path_count)]
+    card["allowed_writes"] = paths
+    result = project_context.collect_project_context(repo, card)
+    rules = json.loads(result.prompt_bundle.split("PROJECT_CONTEXT_BUNDLE:\n", 1)[1])["evidence"]["development_rules"]
+    assert [path for context in rules["contexts"] for path in context["paths"]] == sorted(paths)
+    assert len(rules["rules"]) == 2
+    assert all(context["rule_ids"] == ["baseline", "python_rule"] for context in rules["contexts"])
+
+
+def test_development_rules_keep_path_precedence_and_positive_task_risk_scopes(tmp_path, monkeypatch):
+    repo, card, manifest, path = _development_rules_case(tmp_path, monkeypatch)
+    manifest["rules"].append({
+        "id": "generic_path", "topic": "path", "kind": "coding_convention", "applicability": {},
+        "payload": {"guideline_ids": ["generic_path"], "severity": "error"},
+    })
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+    card.update(task_category="release", risk_tier="high")
+    result = project_context.collect_project_context(repo, card)
+    rules = json.loads(result.prompt_bundle.split("PROJECT_CONTEXT_BUNDLE:\n", 1)[1])["evidence"]["development_rules"]
+    mappings = {path: set(context["rule_ids"]) for context in rules["contexts"] for path in context["paths"]}
+    assert "path_rule" in mappings["src/a.py"] and "generic_path" not in mappings["src/a.py"]
+    assert "generic_path" in mappings["src/b.rs"] and "path_rule" not in mappings["src/b.rs"]
+    assert all({"release_rule", "high_rule"} <= identities for identities in mappings.values())
+
+
+def test_development_rules_refuse_manifest_and_path_population_over_budget(tmp_path, monkeypatch):
+    repo, card, _manifest, path = _development_rules_case(tmp_path, monkeypatch)
+    card["allowed_writes"] = [f"src/a_{index}.py" for index in range(1000)]
+    with pytest.raises(project_context.ProjectContextError, match="paths_budget_overflow"):
+        project_context.collect_project_context(repo, card)
+    card["allowed_writes"] = ["src/a.py"]
+    path.write_bytes(b" " * (2 * 1024 * 1024 + 1))
+    with pytest.raises(project_context.ProjectContextError, match="manifest_budget_overflow"):
+        project_context.collect_project_context(repo, card)
+
+
+
+
 def test_project_context_preserves_declared_mode_query_and_slice_target(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

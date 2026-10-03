@@ -1281,6 +1281,85 @@ def _skill_selection_metadata(section: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _development_rules_section(
+    repo: Path, card: dict[str, Any], *, workspace_root: Path,
+) -> dict[str, Any] | None:
+    """Deliver complete, scoped requirements; never claim detector enforcement."""
+    from . import development_rules as rules, source_graph_languages
+
+    path = repo / ".aiworkhub/config/development_rules.json"
+    try:
+        path.resolve().relative_to(repo.resolve())
+        with path.open("rb") as stream:
+            data = stream.read(2 * 1024 * 1024 + 1)
+    except FileNotFoundError:
+        if path.is_symlink():
+            raise ProjectContextError("development_rules_manifest_broken_symlink")
+        return None
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ProjectContextError("development_rules_manifest_untrusted_or_unreadable") from exc
+    try:
+        if len(data) > 2 * 1024 * 1024:
+            raise ProjectContextError("development_rules_manifest_budget_overflow")
+        manifest = rules.parse_manifest_bytes(data)
+        raw_paths = card.get("allowed_writes")
+        if raw_paths is None or raw_paths == []:
+            raw_paths = card.get("read_first", [])
+        if not isinstance(raw_paths, list):
+            raise ProjectContextError("development_rules_paths_must_be_list")
+        scope_bytes = len(json.dumps(raw_paths, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+        if scope_bytes > _tool_cap("development_rules", "bytes", 8192):
+            raise ProjectContextError("development_rules_paths_budget_overflow")
+        # Validate before sorting/rebasing: never normalize an unsafe card into authority.
+        for raw_path in raw_paths:
+            if not isinstance(raw_path, str) or not raw_path:
+                raise ProjectContextError("development_rules_path_must_be_nonempty_string")
+            rules.resolve(manifest, path=raw_path)
+        paths = _rebase_targets(workspace_root, repo, raw_paths)
+        explicit_language = card.get("language")
+        task = card.get("skill_task_family", _template_skill_task_family(card) or card.get("task_category"))
+        risk = card.get("risk_tier")
+        rules.resolve(manifest, language=explicit_language, task=task, risk=risk)
+        definitions: dict[str, Any] = {}
+        contexts: dict[tuple[Any, ...], dict[str, Any]] = {}
+        # Sequential: byte-bounded scopes over a tiny immutable manifest; no IO per path.
+        for target in sorted(set(paths)) or [None]:
+            inferred = source_graph_languages.language_for_path(Path(target)) if target else None
+            language = inferred if inferred in manifest.languages else None
+            if explicit_language is not None:
+                if language is not None and language != explicit_language:
+                    raise ProjectContextError("development_rules_language_conflicts_with_path")
+                language = explicit_language
+            resolved = rules.resolve(manifest, language=language, path=target, task=task, risk=risk)
+            key = (language, tuple(rule.id for rule in resolved.rules))
+            context = contexts.setdefault(key, {
+                "paths": [], "language": language, "rule_ids": list(key[1]),
+            })
+            context["paths"].append(target)
+            for rule in resolved.rules:
+                definitions[rule.id] = {
+                    "id": rule.id, "topic": rule.topic, "kind": rule.kind.value,
+                    "allow": rule.allow, "forbid": rule.forbid,
+                    "requirements": rules._to_canonical(rule.payload),
+                }
+        payload = {
+            "schema_id": "aiworkhub.development_rules_prompt.v1",
+            "source": ".aiworkhub/config/development_rules.json",
+            "manifest_digest": rules.canonical_digest(manifest),
+            "declared_rule_count": len(manifest.rules),
+            "selected_rule_count": len(definitions),
+            "task": task, "risk": risk,
+            "contexts": list(contexts.values()), "rules": [definitions[key] for key in sorted(definitions)],
+        }
+        content = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        if len(content.encode("utf-8")) > _tool_cap("development_rules", "bytes", 8192):
+            raise ProjectContextError("development_rules_section_budget_overflow")
+        return _section(name="development_rules", content=content, truncated=False,
+                        hit_count=len(definitions))
+    except (rules.ManifestValidationError, TypeError, ValueError) as exc:
+        raise ProjectContextError(f"development_rules_invalid:{exc}") from exc
+
+
 def _skills_section(repo: Path, card: dict[str, Any]) -> dict[str, Any] | None:
     """Return the bounded skill runtime packet section, or ``None``.
 
@@ -1424,7 +1503,8 @@ def collect_project_context(repo: Path, card: dict[str, Any]) -> ProjectContextR
     required = bool(contract["required"])
     ctx = _worker_tool_context(authority_repo, card, contract)
 
-    sections: list[dict[str, Any]] = []
+    rules_section = _development_rules_section(authority_repo, card, workspace_root=repo)
+    sections: list[dict[str, Any]] = [rules_section] if rules_section is not None else []
 
     try:
         source_text, source_truncated = _source_graph_direct(authority_repo, contract)
@@ -1634,7 +1714,7 @@ def collect_project_context(repo: Path, card: dict[str, Any]) -> ProjectContextR
     )
     encoded = bundle.encode("utf-8")
     if len(encoded) > MAX_BUNDLE_BYTES:
-        if required:
+        if required or rules_section is not None:
             raise ProjectContextError(f"project_context_bundle_budget_overflow:{len(encoded)}")
         bundle = encoded[:MAX_BUNDLE_BYTES].decode("utf-8", errors="replace")
     metadata = {
