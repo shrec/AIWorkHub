@@ -2817,16 +2817,13 @@ def open_readonly_shared(path: Path, flags: int, *, nofollow: bool = False) -> i
 
 
 def _prepare_windows_lock_byte(fd: int) -> None:
-    """Ensure byte zero exists and select it for ``msvcrt.locking``.
+    """Initialize byte zero only AFTER acquiring its Windows byte-range lock.
 
-    This REQUIRES A WRITABLE descriptor. ``msvcrt.locking`` locks a byte range
-    that has to exist, so an empty lock file gets one byte written into it.
-    POSIX ``flock`` needs neither a writable fd nor any file content, so a lock
-    file that both branches may open must always be opened for writing -- the
-    read-only descriptor POSIX accepts fails here with ``EBADF``.
-
-    Restoring the caller's file offset is not this helper's job; ``lock_fd`` and
-    ``unlock_fd`` save and restore it around the whole Windows operation.
+    The CRT permits locking past EOF. Writing first is unsafe: two handles can
+    observe an empty file, and the second write then hits the first handle's
+    newly acquired lock. Initialization requires a writable descriptor, and
+    any failure must release the acquired lock before propagating to the caller.
+    The public lock/unlock functions preserve the caller's offset.
     """
 
     if os.fstat(fd).st_size == 0:
@@ -2840,15 +2837,15 @@ def _lock_fd_windows(
 ) -> None:
     """Acquire the Windows byte-range lock; the caller restores the offset."""
 
-    _prepare_windows_lock_byte(fd)
-    if not blocking:
-        windows_locking.locking(fd, windows_locking.LK_NBLCK, 1)
-        return
-    # ``msvcrt.LK_LOCK`` is NOT the Windows equivalent of ``flock(LOCK_EX)``.
-    # It retries ten times at one-second intervals and then raises ``OSError``,
+    # _locking supports ranges past EOF: serialize initialization with the
+    # actual OS lock, never treat a permission-shaped initializer failure as
+    # ownership. https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/locking
+    os.lseek(fd, 0, os.SEEK_SET)
+    # msvcrt.LK_LOCK is NOT the Windows equivalent of flock(LOCK_EX).
+    # It retries ten times at one-second intervals and then raises OSError,
     # so a lock genuinely held by someone else fails on Windows where a POSIX
-    # caller would simply wait.  Poll the non-blocking primitive instead, but
-    # bound the wait: unlike ``flock``, a Windows byte-range lock can be blocked
+    # caller would simply wait. Poll the non-blocking primitive instead, but
+    # bound the wait: unlike flock, a Windows byte-range lock can be blocked
     # by this very process holding another handle, which no amount of waiting
     # can clear. Waiting forever there would hang the caller outright.
     deadline = time.monotonic() + ADVISORY_LOCK_MAX_WAIT_SECONDS
@@ -2859,9 +2856,9 @@ def _lock_fd_windows(
     while True:
         try:
             windows_locking.locking(fd, windows_locking.LK_NBLCK, 1)
-            return
+            break
         except OSError as exc:
-            if exc.errno not in _WINDOWS_LOCK_CONTENDED_ERRNOS:
+            if not blocking or exc.errno not in _WINDOWS_LOCK_CONTENDED_ERRNOS:
                 raise
             last_errno = exc.errno
             if time.monotonic() >= deadline:
@@ -2870,6 +2867,14 @@ def _lock_fd_windows(
             # locking() leaves the file pointer where it found it, but a failed
             # attempt must still start from the same lock byte.
             os.lseek(fd, 0, os.SEEK_SET)
+    try:
+        _prepare_windows_lock_byte(fd)
+    except BaseException:
+        # Initialization failed after acquisition. Roll back the exact range,
+        # then preserve the failure: no missing byte or denied write is success.
+        os.lseek(fd, 0, os.SEEK_SET)
+        windows_locking.locking(fd, windows_locking.LK_UNLCK, 1)
+        raise
 
 
 def lock_fd(fd: int, *, blocking: bool) -> None:

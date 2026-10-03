@@ -1329,6 +1329,93 @@ def test_windows_lock_backend_uses_one_byte_region(tmp_path, monkeypatch):
     assert [mode for _, mode, _ in calls] == [2, 3]
     assert all(count == 1 for _, _, count in calls)
 
+@pytest.mark.skipif(os.name != "nt", reason="native Windows byte-range interleaving")
+def test_windows_lock_byte_initialization_serializes_before_stale_zero_write(tmp_path, monkeypatch):
+    """Schedule a second handle at the losing initializer's zero-size read."""
+    path = tmp_path / "initializer-race.claim"
+    flags = platform_io.lock_file_open_flags()
+    contender = os.open(path, flags, 0o600)
+    winner = os.open(path, flags, 0o600)
+    original_fstat = os.fstat
+    scheduled = False
+    winner_owned = False
+    contender_owned = False
+
+    def interleaved_fstat(fd):
+        nonlocal scheduled, winner_owned
+        snapshot = original_fstat(fd)
+        if fd == contender and not scheduled:
+            scheduled = True
+            assert snapshot.st_size == 0
+            try:
+                platform_io.lock_fd(winner, blocking=False)
+            except OSError as exc:
+                assert exc.errno in (errno.EACCES, errno.EDEADLK)
+            else:
+                winner_owned = True
+        return snapshot
+
+    monkeypatch.setattr(platform_io.os, "fstat", interleaved_fstat)
+    try:
+        os.lseek(contender, 7, os.SEEK_SET)
+        platform_io.lock_fd(contender, blocking=False)
+        contender_owned = True
+        assert scheduled is True
+        assert winner_owned is False
+        assert os.lseek(contender, 0, os.SEEK_CUR) == 7
+        assert original_fstat(contender).st_size == 1
+        # A lost initializer must never become an unlocked ownership success.
+        with pytest.raises(OSError) as blocked:
+            platform_io.lock_fd(winner, blocking=False)
+        assert blocked.value.errno in (errno.EACCES, errno.EDEADLK)
+        platform_io.unlock_fd(contender)
+        contender_owned = False
+        platform_io.lock_fd(winner, blocking=False)
+        winner_owned = True
+    finally:
+        if contender_owned:
+            platform_io.unlock_fd(contender)
+        if winner_owned:
+            platform_io.unlock_fd(winner)
+        os.close(contender)
+        os.close(winner)
+
+
+@pytest.mark.parametrize("error_number", [errno.EACCES, errno.EBADF, errno.EIO])
+def test_windows_lock_byte_initialization_failure_releases_lock_and_fails_closed(
+    tmp_path, monkeypatch, error_number
+):
+    calls = []
+    fake_msvcrt = SimpleNamespace(
+        LK_NBLCK=2,
+        LK_UNLCK=3,
+        locking=lambda fd, mode, count: calls.append((fd, mode, count)),
+    )
+    monkeypatch.setitem(sys.modules, "msvcrt", fake_msvcrt)
+    monkeypatch.setattr(platform_io.os, "name", "nt")
+    path = tmp_path / "denied-initializer.claim"
+    fd = os.open(path, platform_io.lock_file_open_flags(), 0o600)
+    failure = OSError(error_number, "initializer write denied")
+    original_write = os.write
+
+    def denied_write(target, data):
+        if target == fd:
+            raise failure
+        return original_write(target, data)
+
+    monkeypatch.setattr(platform_io.os, "write", denied_write)
+    try:
+        os.lseek(fd, 9, os.SEEK_SET)
+        with pytest.raises(OSError) as denied:
+            platform_io.lock_fd(fd, blocking=False)
+        assert denied.value is failure
+        assert [mode for _, mode, _ in calls] == [2, 3]
+        assert os.fstat(fd).st_size == 0
+        assert os.lseek(fd, 0, os.SEEK_CUR) == 9
+    finally:
+        os.close(fd)
+
+
 
 def test_windows_blocking_lock_timeout_is_classified_as_contention(
     tmp_path, monkeypatch
