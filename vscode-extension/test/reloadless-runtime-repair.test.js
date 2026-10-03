@@ -921,6 +921,10 @@ function testWindowsWorkerRootIsolationPreservesExplicitOverride(tmp) {
 
 (async () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aiworkhub-reloadless-"));
+  // Native CLI fallback must never register fixture servers in the owner's Codex home.
+  const codexHome = path.join(tmp, "codex-home");
+  fs.mkdirSync(codexHome, { recursive: true });
+  process.env.CODEX_HOME = codexHome;
   await testSameVersionPackagedRuntimeDriftReplacesOwnedChild(tmp);
   await testCoexistingOwnedChildrenKeepOldGenerationLeased(tmp);
   await testSelfHealsAndReconnectsWithoutReload(tmp);

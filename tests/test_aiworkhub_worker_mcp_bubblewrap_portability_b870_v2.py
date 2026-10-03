@@ -78,10 +78,11 @@ _PACKAGE_FILES = (
     "windows_file_structures.py",
     "_platform_process.py",
     "sqlite_readonly.py",
-    # The codex config block quotes through runtime_adapters' single TOML
-    # owner (NF-2026-01022), which imports reasoning_policy.
+    # The runtime adapter owns TOML quoting (NF-2026-01022) and imports
+    # reasoning policy plus the qualified executable registry.
     "runtime_adapters.py",
     "reasoning_policy.py",
+    "runtime_executable_registry.py",
 )
 
 
