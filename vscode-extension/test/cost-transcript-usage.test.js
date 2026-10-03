@@ -79,3 +79,75 @@ for (const relative of ['media/app.js', '../src/aiworkhub/dashboard_static/dashb
   assert.doesNotMatch(text, /\$0\.00/);
   console.log(`${relative}: transcript usage DOM tests passed`);
 }
+
+for (const relative of ['media/app.js', '../src/aiworkhub/dashboard_static/dashboard.js']) {
+  const source = fs.readFileSync(path.join(__dirname, '..', relative), 'utf8');
+  const extract = name => {
+    const start = source.indexOf('function ' + name + '(');
+    assert.ok(start >= 0, name + ' production function missing');
+    const end = source.indexOf('\nfunction ', start + 1);
+    return source.slice(start, end < 0 ? source.length : end);
+  };
+  const nodes = new Map();
+  const context = {
+    Intl,
+    numberValue: value => Number(value) || 0,
+    formatCount: value => String(value || 0),
+    formatRelativeTime: () => '',
+    formatBytes: value => String(value || 0),
+    setTileHealth() {},
+    elements: { lastSync: {}, headerStorageManaged: {}, headerStorageFree: {} },
+    document: { querySelector(id) {
+      if (!nodes.has(id)) nodes.set(id, { textContent: '', title: '' });
+      return nodes.get(id);
+    } },
+  };
+  vm.createContext(context);
+  vm.runInContext(extract('formatMoney') + '\n' + extract('renderSummary'), context);
+  const complete = { available: true, records: 1, cost_known_records: 1, cost_unknown_records: 0, cost_complete: true, cost_usd: 0 };
+  const partial = { ...complete, records: 3, cost_unknown_records: 2, cost_complete: false, cost_usd: 6.5 };
+  const renderHeader = totals => {
+    const snapshot = totals === undefined ? {} : { cost_usage: { totals } };
+    const before = JSON.stringify(snapshot);
+    context.renderSummary(snapshot);
+    assert.equal(JSON.stringify(snapshot), before, 'header never changes canonical totals');
+    return nodes.get('#metric-cost');
+  };
+  let header = renderHeader(partial);
+  assert.equal(header.textContent, 'Known ' + context.formatMoney(6.5));
+  assert.match(header.title, /1 of 3 records/);
+  assert.match(header.title, /2 records unpriced/);
+  header = renderHeader(complete);
+  assert.equal(header.textContent, context.formatMoney(0), 'observed zero remains currency');
+  assert.match(header.title, /1 of 1 records/);
+  assert.doesNotMatch(header.title, /unpriced/);
+  for (const invalid of [
+    undefined, {}, { ...complete, available: false }, { ...complete, available: 'true' },
+    { ...complete, records: 0, cost_known_records: 0 },
+    { ...partial, cost_known_records: 0, records: 2 },
+    { ...complete, records: '1' }, { ...complete, cost_known_records: '1' },
+    { ...complete, cost_unknown_records: '0' }, { ...complete, records: -1 },
+    { ...complete, cost_known_records: -1 }, { ...complete, cost_unknown_records: -1 },
+    { ...complete, records: 1.5 }, { ...complete, cost_known_records: 0.5 },
+    { ...complete, cost_unknown_records: 0.5 },
+    { ...complete, records: Number.MAX_SAFE_INTEGER + 1 },
+    { ...complete, records: Number.MAX_SAFE_INTEGER, cost_known_records: Number.MAX_SAFE_INTEGER, cost_unknown_records: 1 },
+    { ...complete, cost_unknown_records: NaN }, { ...complete, cost_known_records: Infinity },
+    { ...complete, records: 2 }, { ...complete, cost_complete: false },
+    { ...partial, cost_complete: true }, { ...complete, cost_complete: undefined },
+    { ...complete, cost_usd: null }, { ...complete, cost_usd: '0' },
+    { ...complete, cost_usd: -1 }, { ...complete, cost_usd: NaN },
+    { ...complete, cost_usd: Infinity }, { ...complete, cost_usd: undefined },
+  ]) {
+    renderHeader(partial); // unavailable must reset an earlier amount and coverage
+    header = renderHeader(invalid);
+    assert.equal(header.textContent, 'Cost unavailable');
+    assert.equal(header.title, 'Cost unavailable');
+  }
+  assert.equal(renderHeader(partial).textContent, 'Known ' + context.formatMoney(6.5));
+  console.log(relative + ': header cost coverage DOM tests passed');
+}
+for (const relative of ['extension.js', '../src/aiworkhub/dashboard_static/index.html']) {
+  const source = fs.readFileSync(path.join(__dirname, '..', relative), 'utf8');
+  assert.match(source, /id="metric-cost">Cost unavailable<\/span>/);
+}

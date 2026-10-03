@@ -608,7 +608,22 @@ function renderSummary(snapshot) {
   elements.lastSync.textContent = `Synced ${formatRelativeTime(snapshot.generated_at)}`;
   document.querySelector("#metric-tokens").textContent = formatCount(totals.total_tokens);
   document.querySelector("#metric-tokens").title = `${numberValue(totals.total_tokens)} tokens`;
-  document.querySelector("#metric-cost").textContent = formatMoney(totals.cost_usd);
+  const costMetric = document.querySelector("#metric-cost");
+  const costKnown = totals.cost_known_records;
+  const costUnknown = totals.cost_unknown_records;
+  const costRecords = totals.records;
+  const costCountsValid = [costKnown, costUnknown, costRecords].every(
+    value => Number.isSafeInteger(value) && value >= 0,
+  ) && Number.isSafeInteger(costKnown + costUnknown) && costKnown + costUnknown === costRecords;
+  const costObserved = totals.available === true && costCountsValid && costKnown > 0
+    && totals.cost_complete === (costUnknown === 0)
+    && typeof totals.cost_usd === "number" && Number.isFinite(totals.cost_usd) && totals.cost_usd >= 0;
+  costMetric.textContent = costObserved
+    ? (costUnknown > 0 ? `Known ${formatMoney(totals.cost_usd)}` : formatMoney(totals.cost_usd))
+    : "Cost unavailable";
+  costMetric.title = costObserved
+    ? `Known cost for ${costKnown} of ${costRecords} records${costUnknown > 0 ? `; ${costUnknown} records unpriced` : ""}`
+    : "Cost unavailable";
   const storage = snapshot && snapshot.storage_usage && typeof snapshot.storage_usage === "object"
     ? snapshot.storage_usage
     : null;

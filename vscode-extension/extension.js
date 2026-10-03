@@ -11555,7 +11555,7 @@ function getHtmlForWebview(webview, extensionUri) {
       <div class="summary-item usage-total">
         <span class="summary-label">Usage</span>
         <strong id="metric-tokens">0</strong>
-        <span class="summary-note" id="metric-cost">$0.00</span>
+        <span class="summary-note" id="metric-cost">Cost unavailable</span>
       </div>
     </div>
     </div>
