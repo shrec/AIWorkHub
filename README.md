@@ -62,6 +62,13 @@ structured findings into NeedFix with provenance.
 > That incorrect wording lives in the separate **UltrafastSecp256k1** README and
 > cannot be fixed from this repository — it must be corrected in that repository.
 
+## What's new in 0.12.19
+
+- Restoration candidate: Windows worker validation uses repository-local temporary storage, and language-model workers recognize verified Source Graph progress while retaining stall safeguards.
+- Zero-diff disposition fixtures support Git long paths and owned cleanup of read-only Git objects.
+- Focused independent checks passed; full final Python qualification is pending after a previous run reported 35 failures. Installation and live activation are not yet verified.
+- Manager Chat completion, sandboxed OpenCode/Muse startup and Skills invocation coverage remain unclaimed.
+
 ## What's new in 0.12.18
 
 - Manager Chat now has safe Markdown, live partial text, command/diff blocks, task links, a real usage footer, context hairline, transcript pagination and scroll control.

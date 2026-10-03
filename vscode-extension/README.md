@@ -14,6 +14,13 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.12.19
+
+- Restoration candidate: Windows worker validation prefers repository-local temporary storage, and language-model workers continue on verified Source Graph progress without weakening stall safeguards.
+- Zero-diff disposition fixtures support Git long paths and owned cleanup of read-only Git objects.
+- Focused independent checks passed; full final Python qualification remains pending after a previous run reported 35 failures. Installation and live activation are not yet verified.
+- Manager Chat completion, sandboxed OpenCode/Muse startup and Skills invocation coverage are not claimed.
+
 ## What's new in 0.12.18
 
 - Manager Chat now has safe Markdown, live partial text, command/diff blocks, task links, a real usage footer, context hairline, transcript pagination and scroll control.

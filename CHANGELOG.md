@@ -6,6 +6,19 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.19] - 2026-10-03
+
+### Fixed
+
+- Windows worker validation prefers repository-local temporary storage over inherited host temporary paths.
+- VS Code language-model workers continue on verified Source Graph progress while retaining duplicate and no-progress safeguards.
+- Zero-diff disposition fixtures enable Git long paths and use owned cleanup for read-only Git objects.
+
+### Qualification
+
+- Restoration candidate only: focused independent checks passed; full final Python qualification is pending after a previous run reported 35 failures. Installation and live activation are not yet verified.
+- This release does not establish completion of Manager Chat, sandboxed OpenCode/Muse startup or Skills invocation coverage.
+
 ## [0.12.18] - 2026-10-03
 
 ### Added

@@ -1,5 +1,18 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.12.19 — 2026-10-03
+
+### Fixed
+
+- Windows worker validation prefers repository-local temporary storage over inherited host temporary paths.
+- Language-model workers continue on verified Source Graph progress without relaxing duplicate or no-progress safeguards.
+- Zero-diff disposition fixtures support Git long paths and owned cleanup of read-only Git objects.
+
+### Qualification
+
+- Restoration candidate only: focused independent checks passed; full final Python qualification remains pending after a previous run reported 35 failures. Installation and live activation are not yet verified.
+- Manager Chat completion, sandboxed OpenCode/Muse startup and Skills invocation coverage are not claimed.
+
 ## 0.12.18 — 2026-10-03
 
 ### Added
