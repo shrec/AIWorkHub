@@ -147,23 +147,149 @@ def test_send_runs_in_background_and_status_and_events_catch_up_once_finished(
     ]
 
 
-def test_send_while_a_turn_is_running_is_refused_and_nothing_is_queued(
+def test_send_while_a_turn_is_running_is_queued_and_runs_next_on_the_same_session(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    # The owner's second message used to be refused with manager_turn_in_progress
+    # and lost; callback turns run back to back, so the owner had no window at all.
+    backends = _install_fakes(monkeypatch)
+    manager_loop_service.start(tmp_path, "fake", "model-a")
+    backend = backends[0]
+    backend.gate = threading.Event()
+
+    first = manager_loop_service.send(tmp_path, "one")
+    assert backend.entered.wait(timeout=5)
+
+    queued = manager_loop_service.send(tmp_path, "two", reasoning="High")
+    assert queued == {"ok": True, "queued": True, "position": 1, "session_id": first["session_id"]}
+    assert manager_loop_service.status(tmp_path)["send_queue"] == [
+        {"text": "two", "backend_id": "", "model": ""}
+    ]
+    # Everything that is not an owner send still refuses while the turn runs.
+    assert manager_loop_service.rotate(tmp_path, "x") == {"ok": False, "error": "manager_turn_in_progress"}
+    assert manager_loop_service.close(tmp_path) == {"ok": False, "error": "manager_turn_in_progress"}
+
+    backend.gate.set()
+    assert manager_loop_service.wait_for_idle(tmp_path, timeout=5) is True
+    assert backend.messages == ["one", "two"]
+    assert backend.reasoning_level == "high"
+    settled = manager_loop_service.status(tmp_path)
+    assert settled["running"] is False and settled["send_queue"] == []
+    assert settled["last_turn"]["turn"] == 2 and settled["last_turn"]["ok"] is True
+    kinds = [
+        (event["turn"], event["type"])
+        for event in manager_loop_service.events(tmp_path, first["session_id"])["events"]
+    ]
+    assert kinds[1:] == [
+        (1, "user_message"), (1, "assistant_text"), (1, "turn_end"),
+        (2, "user_message"), (2, "assistant_text"), (2, "turn_end"),
+    ]
+
+
+def test_the_owner_send_queue_is_bounded(monkeypatch: Any, tmp_path: Path) -> None:
+    backends = _install_fakes(monkeypatch)
+    manager_loop_service.start(tmp_path, "fake", "model-a")
+    backend = backends[0]
+    backend.gate = threading.Event()
+    manager_loop_service.send(tmp_path, "running")
+    assert backend.entered.wait(timeout=5)
+
+    positions = [
+        manager_loop_service.send(tmp_path, f"q{n}")["position"]
+        for n in range(manager_loop_service.SEND_QUEUE_LIMIT)
+    ]
+    assert positions == list(range(1, manager_loop_service.SEND_QUEUE_LIMIT + 1))
+    assert manager_loop_service.send(tmp_path, "overflow") == {
+        "ok": False, "error": "manager_send_queue_full",
+    }
+
+    backend.gate.set()
+    assert manager_loop_service.wait_for_idle(tmp_path, timeout=10) is True
+    assert backend.messages == ["running", *[f"q{n}" for n in range(manager_loop_service.SEND_QUEUE_LIMIT)]]
+
+
+def test_an_unrunnable_route_is_refused_at_once_even_while_a_turn_runs(
     monkeypatch: Any, tmp_path: Path
 ) -> None:
     backends = _install_fakes(monkeypatch)
     manager_loop_service.start(tmp_path, "fake", "model-a")
     backend = backends[0]
     backend.gate = threading.Event()
+    manager_loop_service.send(tmp_path, "running")
+    assert backend.entered.wait(timeout=5)
+    monkeypatch.setattr(manager_loop_service, "authorize_selected_route", lambda *a: None)
 
+    assert manager_loop_service.send(tmp_path, "later", "fake", "nope") == {
+        "ok": False, "error": "manager_backend_unavailable:fake:nope",
+    }
+    assert manager_loop_service.status(tmp_path)["send_queue"] == []
+    backend.gate.set()
+    assert manager_loop_service.wait_for_idle(tmp_path, timeout=5) is True
+    assert backend.messages == ["running"]
+
+
+def test_a_queued_owner_message_runs_before_the_next_callback_wake(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    backends = _install_fakes(monkeypatch)
+    manager_loop_service.start(tmp_path, "fake", "model-a")
+    backend = backends[0]
+    backend.gate = threading.Event()
+    member = {"task_id": "T-1", "state": "review_ready"}
+    next_wake_started: list[bool] = []
+
+    def done(delivered: bool) -> None:
+        # The wake consumer starts its next member once a turn reports done;
+        # the queued owner message must already own the lock by then.
+        next_wake_started.append(
+            manager_loop_service._wake_dispatch(tmp_path, {"task_id": "T-2", "state": "done"}, lambda _d: None)
+        )
+
+    assert manager_loop_service._wake_dispatch(tmp_path, member, done) is True
+    assert backend.entered.wait(timeout=5)
+    queued = manager_loop_service.send(tmp_path, "owner says hi")
+    assert queued["queued"] is True and queued["position"] == 1
+
+    backend.gate.set()
+    assert manager_loop_service.wait_for_idle(tmp_path, timeout=5) is True
+    assert next_wake_started == [False]
+    assert backend.messages == ["callback: T-1 -> review_ready", "owner says hi"]
+
+
+def test_a_queued_message_that_cannot_bind_its_route_is_that_turns_error_event(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    backends = _install_fakes(monkeypatch)
+    monkeypatch.setattr(
+        manager_loop_service, "authorize_selected_route", lambda repo, backend_id, model: (backend_id, model)
+    )
+    session_id = manager_loop_service.start(tmp_path, "fake", "model-a")["session"]["session_id"]
+    backend = backends[0]
+    backend.gate = threading.Event()
     manager_loop_service.send(tmp_path, "one")
     assert backend.entered.wait(timeout=5)
+    orchestrator = manager_loop_service._entry_for(tmp_path).orchestrator
 
-    refused = manager_loop_service.send(tmp_path, "two")
-    assert refused == {"ok": False, "error": "manager_turn_in_progress"}
+    def unbindable(backend_id: str, model: str) -> Any:
+        raise ml.ManagerLoopError(f"manager_backend_unavailable:{backend_id}:{model}")
+
+    monkeypatch.setattr(orchestrator, "continue_on_route", unbindable)
+    assert manager_loop_service.send(tmp_path, "two", "fake", "model-b")["queued"] is True
 
     backend.gate.set()
     assert manager_loop_service.wait_for_idle(tmp_path, timeout=5) is True
     assert backend.messages == ["one"]
+    errors = [
+        event for event in manager_loop_service.events(tmp_path, session_id)["events"]
+        if event["type"] == "error"
+    ]
+    assert len(errors) == 1 and errors[0]["turn"] == 2
+    assert errors[0]["payload"]["source"] == "send_queue"
+    assert errors[0]["payload"]["text"] == "two"
+    assert "manager_backend_unavailable:fake:model-b" in errors[0]["payload"]["error"]
+    last = manager_loop_service.status(tmp_path)["last_turn"]
+    assert last["ok"] is False and "manager_backend_unavailable:fake:model-b" in last["errors"][0]
+    assert manager_loop_service.status(tmp_path)["running"] is False
 
 
 def test_events_after_seq_returns_only_newer_events_and_respects_limit(
@@ -652,7 +778,9 @@ def test_a_first_send_without_start_activates_the_persisted_passive_conversation
     monkeypatch: Any, tmp_path: Path
 ) -> None:
     # NF-2026-00989: the picker route binds the repository's conversation by its own id;
-    # it is not retired for a second session, and a second send meanwhile is refused.
+    # it is not retired for a second session. A second send meanwhile used to be refused
+    # with manager_turn_in_progress; the owner send queue now holds it and runs it on the
+    # same conversation, so it still opens no second session.
     backends = _install_fakes(monkeypatch)
     monkeypatch.setattr(
         manager_loop_service, "authorize_selected_route", lambda repo, backend_id, model: (backend_id, model)
@@ -673,11 +801,11 @@ def test_a_first_send_without_start_activates_the_persisted_passive_conversation
     (backend,) = backends
     assert backend.entered.wait(timeout=5)
     assert manager_loop_service.send(tmp_path, "again", "fake", "model-a") == {
-        "ok": False, "error": "manager_turn_in_progress",
+        "ok": True, "queued": True, "position": 1, "session_id": passive.session_id,
     }
     gate.set()
     assert manager_loop_service.wait_for_idle(tmp_path, timeout=5) is True
-    assert (backend.backend_id, backend.model, backend.messages) == ("fake", "model-a", ["hello"])
+    assert (backend.backend_id, backend.model, backend.messages) == ("fake", "model-a", ["hello", "again"])
     store = manager_loop_service._entry_for(tmp_path).orchestrator.store
     assert [(item.session_id, item.status) for item in store.sessions()] == [(passive.session_id, "active")]
     pinned = manager_loop_service.status(tmp_path)["session"]

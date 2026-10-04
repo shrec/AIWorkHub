@@ -824,13 +824,24 @@ class ManagerOrchestrator:
             return self._open(backend_id, model)
 
     def send(self, text: str, *, reasoning: str = "") -> dict[str, Any]:
-        """Run one turn; refused, not queued, while another turn is running."""
+        """Run one turn; refused while another runs (the service queues owner sends)."""
         if not text.strip():
             raise ValueError("the message is empty")
         if self._backend is not None:
             self._backend.reasoning_level = str(reasoning or "").strip().lower()
         with self._exclusive():
             return self._turn(text, "user_message", "")
+
+    def record_error(self, payload: Mapping[str, Any]) -> dict[str, Any] | None:
+        """Log one ``error`` event as the attached session's next turn; none attached logs nothing.
+
+        For a turn that failed before it reached :meth:`send` (a queued owner
+        message whose route no longer binds), so the transcript still shows it.
+        """
+        session = self._session
+        if session is None:
+            return None
+        return self._record(session, session.turn_count + 1, "error", payload)
 
     def wake(self, callback: Mapping[str, Any]) -> dict[str, Any]:
         """Run a task callback as a turn worded ``callback: <task_id> -> <state>``."""

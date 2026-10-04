@@ -1889,10 +1889,11 @@ def aiworkhub_manager_loop_send(
 ) -> dict[str, Any]:
     """MANAGER WRITE: run one manager turn in the background.
 
-    Returns at once with ``state: "running"``; a call while a turn is already
-    running is refused with ``manager_turn_in_progress`` and nothing is
-    queued. Poll ``aiworkhub_manager_loop_status`` or
-    ``aiworkhub_manager_loop_events`` for the outcome.
+    Returns at once with ``state: "running"``. A call while a turn is already
+    running is queued (``queued: true`` with its ``position``; at most 8, in
+    memory only) and runs before the next callback wake; an unrunnable route
+    is refused at once. Poll ``aiworkhub_manager_loop_status`` (its
+    ``send_queue``) or ``aiworkhub_manager_loop_events`` for the outcome.
 
     ``backend_id``/``model`` carry the panel picker selection: the turn binds
     to that exact route (same route is a no-op, a switch re-opens with a
@@ -1926,7 +1927,7 @@ def aiworkhub_manager_loop_rotate(reason: str) -> dict[str, Any]:
 
 @mcp.tool()
 def aiworkhub_manager_loop_status() -> dict[str, Any]:
-    """MANAGER READ: the active session, whether a turn is running, and the last turn's outcome."""
+    """MANAGER READ: the active session, whether a turn is running, queued owner sends, and the last turn's outcome."""
 
     root, refusal = _manager_loop_repo_root()
     if refusal is not None:

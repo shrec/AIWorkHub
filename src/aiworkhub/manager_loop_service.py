@@ -1,9 +1,12 @@
 """Process-wide manager loop registry: one :class:`ManagerOrchestrator` per repository.
 
 ``send`` and ``rotate`` run a manager turn on a background thread and return
-at once; a concurrent call is refused with ``manager_turn_in_progress`` and
-nothing is queued. ``status`` and ``events`` let a caller poll a running
-session incrementally. Every :class:`~aiworkhub.manager_loop.ManagerLoopError`
+at once. A ``send`` that arrives while a turn runs waits in the repository's
+bounded owner send queue (:data:`SEND_QUEUE_LIMIT`, in memory only: a process
+restart drops it) and runs on the same turn thread before the lock is freed, so
+a callback wake cannot start between two owner messages. Every other concurrent
+call is refused with ``manager_turn_in_progress``. ``status`` and ``events`` let
+a caller poll a running session incrementally. Every :class:`~aiworkhub.manager_loop.ManagerLoopError`
 becomes ``{"ok": False, "error": <reason code>}`` here -- nothing raises
 across this module's boundary.
 
@@ -21,6 +24,7 @@ caller's repository through the shared manager route gate and pass it in.
 
 from __future__ import annotations
 
+import collections
 import dataclasses
 import threading
 from pathlib import Path
@@ -37,11 +41,23 @@ WAKE_IDLE_POLL_SECONDS = manager_loop_wake.DEFAULT_IDLE_POLL_SECONDS
 WAKE_RETRY_POLL_SECONDS = manager_loop_wake.DEFAULT_RETRY_POLL_SECONDS
 default_callback_source = manager_loop_wake.default_callback_source
 
+SEND_QUEUE_LIMIT = 8
+SEND_QUEUE_PREVIEW_CHARS = 200
+
 NO_MANAGER_ROUTE_ERROR = "no_manager_route_available"
 NO_MANAGER_ROUTE_HINT = (
     "enable a manager-capable route in the repository model policy or workforce catalog, "
     "or start one explicitly"
 )
+
+
+@dataclasses.dataclass(frozen=True)
+class _QueuedSend:
+    """One owner message waiting for the running turn, with its own route and depth."""
+
+    text: str
+    level: str
+    route: tuple[str, str] | None
 
 
 @dataclasses.dataclass
@@ -53,10 +69,18 @@ class _Entry:
     before a background thread is ever started -- so a concurrent caller is
     refused synchronously instead of racing to discover the refusal from
     inside a thread it can no longer observe.
+
+    ``send_queue`` holds owner messages that arrived while a background turn
+    ran (``turn_running``); ``queue_lock`` orders enqueueing against the turn
+    thread's pop-or-release, so a message is either queued while the lock is
+    still held or finds the lock free.
     """
 
     orchestrator: ManagerOrchestrator
     turn_lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
+    queue_lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
+    send_queue: collections.deque["_QueuedSend"] = dataclasses.field(default_factory=collections.deque)
+    turn_running: bool = False
     thread: threading.Thread | None = None
     last_turn: dict[str, Any] | None = None
     wake: manager_loop_wake.WakeConsumer | None = None
@@ -244,20 +268,15 @@ def _turn_delivered(raw: Mapping[str, Any]) -> bool:
     )
 
 
-def _dispatch_turn(
+def _bind_turn_session(
+    entry: _Entry,
     repo: str | Path,
-    action: Callable[[ManagerOrchestrator], dict[str, Any]],
     *,
-    record_last_turn: bool,
-    pin_passive_route: bool = False,
-    route: tuple[str, str] | None = None,
-    on_finished: Callable[[bool], None] | None = None,
-) -> dict[str, Any]:
-    entry, err = _entry_or_error(repo)
-    if err is not None:
-        return err
-    if not entry.turn_lock.acquire(blocking=False):
-        return {"ok": False, "error": "manager_turn_in_progress"}
+    route: tuple[str, str] | None,
+    pin_passive_route: bool,
+) -> tuple[ManagerSession | None, dict[str, Any] | None]:
+    """The session a turn runs on; the caller holds ``turn_lock`` and frees it on a refusal."""
+
     session = entry.orchestrator.session
     if route is not None:
         # Selected model: no session yet opens the first one. A loaded
@@ -266,58 +285,157 @@ def _dispatch_turn(
             session = entry.orchestrator.continue_on_route(*route)
             _ensure_wake_started(entry, repo)
         except ManagerLoopError as exc:
-            entry.turn_lock.release()
-            return _error(exc)
+            return None, _error(exc)
         except Exception as exc:  # noqa: BLE001 - route binding must never cross the MCP boundary
-            entry.turn_lock.release()
-            return {"ok": False, "error": f"manager_loop_unavailable:{type(exc).__name__}"}
+            return None, {"ok": False, "error": f"manager_loop_unavailable:{type(exc).__name__}"}
     elif pin_passive_route and session is None:
         try:
             session = entry.orchestrator.ensure()
         except ManagerLoopError as exc:
-            entry.turn_lock.release()
-            return _error(exc)
+            return None, _error(exc)
         except Exception as exc:  # noqa: BLE001 - ensure must never cross the MCP boundary
-            entry.turn_lock.release()
-            return {"ok": False, "error": f"manager_loop_unavailable:{type(exc).__name__}"}
+            return None, {"ok": False, "error": f"manager_loop_unavailable:{type(exc).__name__}"}
     if route is None and pin_passive_route and session is not None and session.passive:
         session, err = _pin_first_route(entry, repo)
         if err is not None:
-            entry.turn_lock.release()
-            return err
+            return None, err
     if session is None:
+        return None, {"ok": False, "error": "no_active_manager_session"}
+    return session, None
+
+
+def _enqueue_send(entry: _Entry, queued: _QueuedSend | None) -> dict[str, Any]:
+    """Queue an owner message behind the running turn; the caller holds ``queue_lock``.
+
+    Only a send queues, and only behind a background turn: a synchronous holder
+    (start, rename, close...) or a turn still binding its session refuses as before.
+    """
+
+    if queued is None or not entry.turn_running:
+        return {"ok": False, "error": "manager_turn_in_progress"}
+    if len(entry.send_queue) >= SEND_QUEUE_LIMIT:
+        return {"ok": False, "error": "manager_send_queue_full"}
+    entry.send_queue.append(queued)
+    session = entry.orchestrator.session
+    return {
+        "ok": True,
+        "queued": True,
+        "position": len(entry.send_queue),
+        "session_id": session.session_id if session is not None else "",
+    }
+
+
+def _queued_send_action(
+    entry: _Entry, repo: str | Path, queued: _QueuedSend
+) -> Callable[[ManagerOrchestrator], dict[str, Any]]:
+    """A queued message's turn: it binds its own route first, exactly as a direct send does."""
+
+    def action(orchestrator: ManagerOrchestrator) -> dict[str, Any]:
+        _, refused = _bind_turn_session(
+            entry, repo, route=queued.route, pin_passive_route=bool(queued.text.strip())
+        )
+        if refused is not None:
+            raise ManagerLoopError(str(refused.get("error") or "manager_send_queue_bind_failed"))
+        return orchestrator.send(queued.text, reasoning=queued.level)
+
+    return action
+
+
+def _run_turn(
+    entry: _Entry,
+    action: Callable[[ManagerOrchestrator], dict[str, Any]],
+    *,
+    record_last_turn: bool,
+    queued_text: str | None,
+) -> bool:
+    """Run one turn on the turn thread and return whether it was delivered; never raises."""
+
+    session = entry.orchestrator.session
+    turn = session.turn_count + 1 if session is not None else 0
+    try:
+        raw = action(entry.orchestrator)
+    except Exception as exc:  # noqa: BLE001 - a dead thread must still record the turn's outcome
+        detail = f"{type(exc).__name__}: {exc}"[:240]
+        if record_last_turn:
+            entry.last_turn = {"turn": turn, "ok": False, "errors": [detail], "reply": ""}
+        if queued_text is not None:
+            # A queued message never reached the model: the transcript says so,
+            # with the owner's words, as that turn's error event.
+            try:
+                entry.orchestrator.record_error(
+                    {"source": "send_queue", "error": detail, "text": queued_text}
+                )
+            except Exception:  # noqa: BLE001 - a failing event log must not kill the turn thread
+                pass
+        return False
+    if record_last_turn:
+        entry.last_turn = {
+            "turn": raw.get("turn", turn),
+            "ok": bool(raw.get("ok")),
+            "errors": list(raw.get("errors") or []),
+            "reply": str(raw.get("reply", ""))[:500],
+        }
+    return _turn_delivered(raw)
+
+
+def _dispatch_turn(
+    repo: str | Path,
+    action: Callable[[ManagerOrchestrator], dict[str, Any]],
+    *,
+    record_last_turn: bool,
+    pin_passive_route: bool = False,
+    route: tuple[str, str] | None = None,
+    on_finished: Callable[[bool], None] | None = None,
+    queued: _QueuedSend | None = None,
+) -> dict[str, Any]:
+    entry, err = _entry_or_error(repo)
+    if err is not None:
+        return err
+    with entry.queue_lock:
+        if not entry.turn_lock.acquire(blocking=False):
+            return _enqueue_send(entry, queued)
+    session, err = _bind_turn_session(entry, repo, route=route, pin_passive_route=pin_passive_route)
+    if err is not None:
         entry.turn_lock.release()
-        return {"ok": False, "error": "no_active_manager_session"}
+        return err
     turn = session.turn_count + 1
     session_id = session.session_id
 
     def run() -> None:
-        delivered = False
+        step, finished, queued_text = action, on_finished, None
+        holding = True
         try:
-            raw = action(entry.orchestrator)
-            delivered = _turn_delivered(raw)
-            if record_last_turn:
-                entry.last_turn = {
-                    "turn": raw.get("turn", turn),
-                    "ok": bool(raw.get("ok")),
-                    "errors": list(raw.get("errors") or []),
-                    "reply": str(raw.get("reply", ""))[:500],
-                }
-        except Exception as exc:  # noqa: BLE001 - a dead thread must still record the turn's outcome
-            delivered = False
-            if record_last_turn:
-                detail = f"{type(exc).__name__}: {exc}"[:240]
-                entry.last_turn = {"turn": turn, "ok": False, "errors": [detail], "reply": ""}
+            while True:
+                delivered = _run_turn(
+                    entry, step, record_last_turn=record_last_turn, queued_text=queued_text
+                )
+                # A queued owner message runs next on this thread under the same
+                # lock, so no wake member slips in between; only an empty queue
+                # frees the lock.
+                with entry.queue_lock:
+                    following = entry.send_queue.popleft() if entry.send_queue else None
+                    if following is None:
+                        entry.turn_running = False
+                        entry.turn_lock.release()
+                        holding = False
+                # Report the started turn's outcome exactly once; with an empty
+                # queue the lock is already free (a wake consumer may start its
+                # next member from the callback). A failing callback must never
+                # skip the re-arm below.
+                if finished is not None:
+                    try:
+                        finished(delivered)
+                    except Exception:  # noqa: BLE001 - the outcome callback must never kill the turn thread
+                        pass
+                if following is None:
+                    return
+                step = _queued_send_action(entry, repo, following)
+                finished, queued_text = None, following.text
         finally:
-            entry.turn_lock.release()
-            # Report the started turn's outcome exactly once, after the lock is
-            # free (a wake consumer may start its next member from the callback).
-            # A failing callback must never skip the re-arm below.
-            if on_finished is not None:
-                try:
-                    on_finished(delivered)
-                except Exception:  # noqa: BLE001 - the outcome callback must never kill the turn thread
-                    pass
+            if holding:
+                with entry.queue_lock:
+                    entry.turn_running = False
+                    entry.turn_lock.release()
             # Re-read the seat now the turn is over. A session that idled past the
             # seat lease got no wake consumer when it was loaded, and whichever send
             # revived it just logged its activity: that arms the consumer, leaves a
@@ -330,6 +448,8 @@ def _dispatch_turn(
 
     thread = threading.Thread(target=run, daemon=True)
     entry.thread = thread
+    with entry.queue_lock:
+        entry.turn_running = True
     thread.start()
     return {"ok": True, "session_id": session_id, "turn": turn, "state": "running"}
 
@@ -449,13 +569,20 @@ def send(
 ) -> dict[str, Any]:
     """Run one manager turn on a background thread.
 
-    Refused with ``manager_turn_in_progress``, not queued, while one runs.
-    With an explicit picker route the turn binds to it (same route is a
-    no-op, any other state re-opens the selection with a mechanical
-    handoff); without one, the first send to a passive conversation pins
-    the one route :func:`resolve_manager_route` names. A named-but-unrunnable
-    route is refused before anything spawns. ``reasoning`` is the owner's
-    depth choice for this turn; blank keeps the provider default.
+    While a background turn runs (an owner turn or a callback wake), the
+    message is queued instead: ``{"ok": True, "queued": True, "position": n,
+    "session_id": ...}``. The queue is per repository, FIFO, in memory only
+    and bounded by :data:`SEND_QUEUE_LIMIT` (``manager_send_queue_full``
+    beyond it); the running turn's thread drains it before freeing the lock,
+    so the owner goes ahead of the next callback. A queued message keeps its
+    own route and depth and binds them when its turn starts; a failure there
+    is logged as that turn's ``error`` event. With an explicit picker route
+    the turn binds to it (same route is a no-op, any other state re-opens the
+    selection with a mechanical handoff); without one, the first send to a
+    passive conversation pins the one route :func:`resolve_manager_route`
+    names. A named-but-unrunnable route is refused at once, before anything
+    is queued or spawned. ``reasoning`` is the owner's depth choice for this
+    turn; blank keeps the provider default.
     """
 
     route: tuple[str, str] | None = None
@@ -475,6 +602,7 @@ def send(
         record_last_turn=True,
         pin_passive_route=bool(text.strip()),
         route=route,
+        queued=_QueuedSend(text=text, level=level, route=route),
     )
 
 
@@ -514,17 +642,27 @@ def _session_catalog(store: Any) -> list[dict[str, Any]]:
 
 
 def status(repo: str | Path) -> dict[str, Any]:
-    """The active session, whether a turn is running, and the last turn's outcome."""
+    """The active session, whether a turn is running, the owner's queued sends and the last turn's outcome."""
 
     entry, err = _entry_or_error(repo)
     if err is not None:
         return err
     session = entry.orchestrator.session
+    with entry.queue_lock:
+        pending = list(entry.send_queue)
     return {
         "ok": True,
         "session": session.to_json() if session is not None else None,
         "sessions": _session_catalog(entry.orchestrator.store),
         "running": entry.turn_lock.locked(),
+        "send_queue": [
+            {
+                "text": item.text[:SEND_QUEUE_PREVIEW_CHARS],
+                "backend_id": item.route[0] if item.route else "",
+                "model": item.route[1] if item.route else "",
+            }
+            for item in pending
+        ],
         "last_turn": entry.last_turn,
         "wake": _wake_status(entry),
     }
