@@ -8995,8 +8995,19 @@ def _is_review_rejection_reroute(card: Mapping[str, Any]) -> bool:
     disposition, or a ``candidate_code`` rejection, is that path even when the
     feedback is missing: the receipt then fails closed. A blocked
     infrastructure rejection (``to=blocked``, ``validation_environment``) is
-    not. Recovery writes ``recovery_feedback`` and never ``review_feedback``.
+    not. Recovery writes ``recovery_feedback`` and never ``review_feedback``,
+    so an earlier rejection's feedback outlives a later blocked rejection; once
+    the manager recovered that one, it is the latest episode.
     """
+    rejection = card.get("rejection_disposition")
+    if (
+        isinstance(rejection, dict)
+        and rejection.get("schema_id") == "aiworkhub.rejection_disposition.v1"
+        and rejection.get("to") == "blocked"
+        and rejection.get("failure_category") != "candidate_code"
+        and _manager_recovery_reroute_episode(card)
+    ):
+        return False
     feedback = card.get("review_feedback")
     predecessor = card.get("rework_predecessor")
     if (
@@ -9007,7 +9018,6 @@ def _is_review_rejection_reroute(card: Mapping[str, Any]) -> bool:
         and _has_retained_candidate_delta(card)
     ):
         return True
-    rejection = card.get("rejection_disposition")
     if (
         not isinstance(rejection, dict)
         or rejection.get("schema_id") != "aiworkhub.rejection_disposition.v1"

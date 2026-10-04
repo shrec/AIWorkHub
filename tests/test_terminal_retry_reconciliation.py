@@ -2974,3 +2974,56 @@ def test_reroute_operational_provider_move_stays_fail_closed(
     assert denied["ok"] is False
     assert "coordinator_capability_denied" in denied["stderr"]
     assert _row(coordinator_repo, gated)["runner"] == "claude_sonnet-4.6"
+
+
+def test_reroute_recovered_blocked_card_ignores_earlier_review_feedback(
+    coordinator_repo: Path,
+) -> None:
+    """A manager recovery of a later blocked rejection is the latest episode.
+
+    An earlier pending rejection's ``review_feedback`` stays on the card; it
+    must not demand that rejection's receipt for an infrastructure move.
+    """
+    stale_feedback = {
+        "schema_id": "aiworkhub.rework_feedback_delta.v1",
+        "instruction": "fix the candidate",
+        "predecessor_request_id": "d" * 32,
+        "predecessor_changed_paths": ["out/result.json"],
+        "residual_identities": [],
+    }
+    recovered = "REROUTE_RECOVERED_AFTER_REVIEW_FEEDBACK"
+    _insert_pending_reroutable(
+        coordinator_repo,
+        task_id=recovered,
+        terminal_retry=None,
+        rework_predecessor=_nf01013_unsealed_predecessor(),
+        card_overrides={
+            **_nf01013_recovery_fields(),
+            "rejection_disposition": _nf01013_blocked_rejection(),
+            "review_feedback": stale_feedback,
+        },
+    )
+
+    result = _nf01013_reroute(recovered, reason="validation lane cannot build")
+
+    assert result["ok"] is True, result
+    assert result["operational_provider_authorization"]["authority"] == (
+        "manager_recovery"
+    )
+    assert _row(coordinator_repo, recovered)["runner"] == "claude_sonnet-5"
+
+    unrecovered = "REROUTE_BLOCKED_REVIEW_FEEDBACK_UNRECOVERED"
+    _insert_pending_reroutable(
+        coordinator_repo,
+        task_id=unrecovered,
+        terminal_retry=None,
+        rework_predecessor=_nf01013_unsealed_predecessor(),
+        card_overrides={
+            "rejection_disposition": _nf01013_blocked_rejection(),
+            "review_feedback": stale_feedback,
+        },
+    )
+    refused = _nf01013_reroute(unrecovered, reason="no recovery yet")
+    assert refused["ok"] is False
+    assert "reroute_manager_rejection" in refused["stderr"]
+    assert _row(coordinator_repo, unrecovered)["runner"] == "claude_sonnet-4.6"
