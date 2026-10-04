@@ -6,6 +6,20 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.26] - 2026-10-04
+
+### Fixed
+
+- A manager-recovered blocked card is no longer rerouted as a review rejection because an earlier rejection's feedback outlived it (NF-2026-01344).
+- Shell residue (an empty `$null`/`nul` file, any `*.stackdump`) is neither scope-checked nor promoted, and `agent_retry_finalization` accepts `scope_rejected` without relaunching the provider (NF-2026-01345).
+- A validation-only replay of a card with dependencies carries a toolchain receipt bound to the identity the finalizer checks; receipt refusals are typed diagnostics instead of `unclassified` (NF-2026-01346).
+- The crash-retry packet stays within its cap: an oversized inherited path list becomes a count, digest and rework-overlay pointer, and a refusal names the measured size (NF-2026-01347).
+- Runtime JSON writes ride out transient Windows sharing denials with a bounded retry; exhaustion names the operation and path (NF-2026-01348).
+
+### Qualification
+
+- Each fix has regressions that fail before and pass after; the touched suites pass. Installation and live worker replay are separate checks.
+
 ## [0.12.25] - 2026-10-04
 
 ### Fixed

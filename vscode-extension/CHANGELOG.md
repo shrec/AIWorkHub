@@ -1,5 +1,17 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.12.26 — 2026-10-04
+
+### Fixed
+
+- Shell residue (`$null`, `nul`, `*.stackdump`) no longer causes `scope_rejected`, and `agent_retry_finalization` recovers that state (NF-2026-01345).
+- Dependent validation-only replays verify their toolchain receipt; receipt refusals are typed (NF-2026-01346).
+- Large-predecessor reworks relaunch within the crash-retry packet cap (NF-2026-01347); transient Windows sharing denials are retried (NF-2026-01348); manager-recovered blocked cards reroute correctly (NF-2026-01344).
+
+### Qualification
+
+- Independent component regressions pass; installation, activation and live qualification are separate evidence.
+
 ## 0.12.25 — 2026-10-04
 
 ### Fixed

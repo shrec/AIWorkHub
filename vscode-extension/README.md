@@ -14,6 +14,12 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.12.26
+
+- Unblocks work on other repositories: shell residue (`$null`, `nul`, `*.stackdump`) no longer causes `scope_rejected`, which `agent_retry_finalization` can now recover (NF-2026-01345); dependent validation-only replays verify their toolchain receipt (NF-2026-01346).
+- Large-predecessor reworks relaunch within the crash-retry packet cap (NF-2026-01347), transient Windows `[Errno 13]` sharing denials are retried (NF-2026-01348), and a manager-recovered blocked card reroutes correctly (NF-2026-01344).
+- Component regressions pass; installation and live worker replay are separate evidence.
+
 ## What's new in 0.12.25
 
 - Windows AppContainer validation commands get the request's own temp directory instead of the adapter-shared `AC\Temp`: the exec scratch lives under the request home and non-Python commands run under a trampoline that restores TEMP/TMP (NF-2026-01341).
