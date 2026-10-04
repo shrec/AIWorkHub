@@ -2893,6 +2893,9 @@ def aiworkhub_task_reject_review(
     review failure. It is accepted only with ``to=blocked`` and only from the
     closed infrastructure taxonomy, so it cannot relabel candidate code.
 
+    ``reason`` is capped at 8000 UTF-8 bytes after strip; over it the call is
+    refused with ``reject_reason_too_large:<bytes>><cap>`` and nothing changes.
+
     Replies with a receipt (``aiworkhub.reject_review_receipt.v1``): task_id,
     to, status, request_id, claim_epoch, prior_episode, failure_category,
     reason_identity (sha256 + bytes, never the text), predecessor changed-path
@@ -2953,6 +2956,8 @@ def aiworkhub_task_recover_blocked_rework(
 
     ``scope_rejection_resolved`` is the manager's explicit, audited clean-root
     resolution of a ``scope_rejected`` card; it requires ``feedback_reason``.
+    A ``feedback_reason`` over 8000 UTF-8 bytes is refused with
+    ``feedback_reason_too_large:<bytes>><cap>``; it is never truncated.
     """
 
     kwargs: dict[str, Any] = {

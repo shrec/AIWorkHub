@@ -148,20 +148,20 @@ def test_reject_to_pending_never_repersists_decoded_card_json_envelope(coord):
     assert len(json.dumps(persisted)) < 3_000
 
 
-def test_reject_to_pending_bounds_large_unicode_feedback(coord):
+def test_reject_to_pending_refuses_large_unicode_feedback(coord):
+    # NF-2026-01352: an over-cap reason is refused whole, never truncated.
     _insert(coord, "T_PEND_UNICODE")
     reason = "ქართული მიზეზი " * 1000
+    before = _row(coord, "T_PEND_UNICODE")
 
     res = core.reject_review("T_PEND_UNICODE", reason, to="pending")
 
-    assert res["ok"] is True, res
-    feedback = json.loads(_row(coord, "T_PEND_UNICODE")["card_json"])[
-        "review_feedback"
-    ]
-    assert len(feedback["instruction"].encode("utf-8")) <= 4 * 1024
-    assert feedback["reason_identity"]["bytes"] == len(reason.encode("utf-8"))
-    assert feedback["reason_identity"]["truncated"] is True
-    assert len(feedback["reason_identity"]["sha256"]) == 64
+    size = len(reason.strip().encode("utf-8"))
+    assert res["ok"] is False, res
+    assert res["stderr"] == (
+        f"reject_reason_too_large:{size}>{task_store.MAX_REWORK_FEEDBACK_BYTES}"
+    )
+    assert _row(coord, "T_PEND_UNICODE") == before
 
 
 def test_reject_transition_does_not_wait_for_workspace_gc(coord, monkeypatch):

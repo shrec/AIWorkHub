@@ -68,6 +68,14 @@ from .sqlite_readonly import connect_readonly
 
 SCHEMA_ID = "aiworkhub.task_store.v1"
 
+# NF-2026-01352: the one UTF-8 byte cap on rework feedback a manager hands a
+# worker (reject_review reason, recover_blocked_rework feedback_reason).  Over
+# it a caller is refused, never silently cut.  Every consumer keeps a capped
+# text whole: quality_reviewer.MAX_MANAGER_AMENDMENT_CHARS and the learning
+# correction excerpt are 8000 characters, and a character is at least a byte;
+# the crash retry packet carries only the overlay digest, never the text.
+MAX_REWORK_FEEDBACK_BYTES = 8_000
+
 CANONICAL_STATUSES: tuple[str, ...] = (
     "pending",
     "processing",
@@ -5215,6 +5223,9 @@ def recover_blocked_rework(
         an explicit ``scope_rejection_resolved`` lifts ``scope_rejected``
       - blocked tasks without retained terminal predecessor evidence
       - blocked tasks without residual feedback
+      - an explicit ``feedback_reason`` over ``MAX_REWORK_FEEDBACK_BYTES``
+        (``feedback_reason_too_large:<bytes>><cap>``); a stored reject_review
+        residual is bounded to the same cap instead
       - tasks with a live claim or in-process episode
       - non-blocked tasks
       - explicit validation_only_replay authorization lacking retained
@@ -5272,6 +5283,14 @@ def recover_blocked_rework(
     when the task is already recovered; an idempotent success never silently
     drops a caller's amendment.
     """
+    # NF-2026-01352: an explicit feedback over the cap is refused before any
+    # read or write; the stored recovery_feedback used to be cut at 2000 chars.
+    explicit_feedback_bytes = len(str(feedback_reason or "").strip().encode("utf-8"))
+    if explicit_feedback_bytes > MAX_REWORK_FEEDBACK_BYTES:
+        return False, (
+            f"feedback_reason_too_large:{explicit_feedback_bytes}>"
+            f"{MAX_REWORK_FEEDBACK_BYTES}"
+        )
     _readiness, db_path = _require_ready(root)
     from .successful_rework_recovery import prepare_blocked_recovery
 
@@ -6609,7 +6628,11 @@ def recover_blocked_rework(
         if not bounded_feedback:
             residual = card.get("reject_review")
             if isinstance(residual, dict):
-                bounded_feedback = str(residual.get("reason") or "").strip()
+                # NF-2026-01352: a stored residual is bounded, never refused.
+                bounded_feedback = (
+                    str(residual.get("reason") or "").strip().encode("utf-8")
+                    [:MAX_REWORK_FEEDBACK_BYTES].decode("utf-8", errors="ignore")
+                )
         if not bounded_feedback:
             return False, "no_residual_feedback"
 
@@ -6713,7 +6736,7 @@ def recover_blocked_rework(
         card["recovered_from_blocked_at"] = now
         card["recovered_by"] = actor
         card["recovery_predecessor"] = predecessor_evidence
-        card["recovery_feedback"] = bounded_feedback[:2000]
+        card["recovery_feedback"] = bounded_feedback
 
         if validation_only_replay:
             card["validation_only_replay_lineage"] = {
@@ -6796,7 +6819,7 @@ def recover_blocked_rework(
             "transition": "blocked->pending",
             "terminal_substatus": terminal_substatus,
             "predecessor": predecessor_evidence,
-            "feedback": bounded_feedback[:2000],
+            "feedback": bounded_feedback,
             "prior_episode": prior_episode_summary,
             "claim_epoch": claim_epoch,
             "recorded_at": now,

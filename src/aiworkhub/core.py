@@ -102,7 +102,8 @@ _TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$")
 _TASK_IDENTITY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 _REPO_ID_RE = re.compile(r"^repo_[a-f0-9]{32}$")
 _PROCESS_REPO_ROOT_OVERRIDE: Path | None = None
-_MAX_REWORK_FEEDBACK_BYTES = 4 * 1024
+# NF-2026-01352: one cap, owned by task_store, which also refuses over it.
+_MAX_REWORK_FEEDBACK_BYTES = task_store.MAX_REWORK_FEEDBACK_BYTES
 
 
 def _bounded_utf8_prefix(value: str, max_bytes: int) -> tuple[str, bool]:
@@ -6294,6 +6295,13 @@ def reject_review(
     disposition = str(to or "pending").strip().lower()
     if disposition not in ("pending", "blocked", "archived", "superseded"):
         return _lifecycle_error(f"invalid reject-review disposition: {disposition}")
+    # NF-2026-01352: an over-cap reason is refused before any state change; it
+    # used to be cut silently, so the worker lost the tail of the instruction.
+    stored_reason_bytes = len(str(reason or "").strip().encode("utf-8"))
+    if stored_reason_bytes > _MAX_REWORK_FEEDBACK_BYTES:
+        return _lifecycle_error(
+            f"reject_reason_too_large:{stored_reason_bytes}>{_MAX_REWORK_FEEDBACK_BYTES}"
+        )
     amendment_commands = list(validation_amendment) if validation_amendment else []
     if amendment_commands:
         amendment_error = _validate_validation_amendment_commands(amendment_commands)
@@ -7141,9 +7149,13 @@ def recover_blocked_rework(
             return amendment_error
     applied: list[str] = []
 
-    bounded_feedback, _truncated = _bounded_utf8_prefix(
-        str(feedback_reason or "").strip(), _MAX_REWORK_FEEDBACK_BYTES
-    )
+    # NF-2026-01352: refused whole, never truncated, before the write gate.
+    bounded_feedback = str(feedback_reason or "").strip()
+    feedback_bytes = len(bounded_feedback.encode("utf-8"))
+    if feedback_bytes > _MAX_REWORK_FEEDBACK_BYTES:
+        return _lifecycle_error(
+            f"feedback_reason_too_large:{feedback_bytes}>{_MAX_REWORK_FEEDBACK_BYTES}"
+        )
     actor = _verified_manager_actor()
     command = [
         "recover-blocked-rework",
