@@ -664,7 +664,9 @@ test("no status pull when idle or when the batch has no terminal event", () => {
     ok: true,
     events: [{ seq: 9, type: "turn_end", turn: 2, payload: {} }],
   });
-  assert.equal(statusPosts().length, 0, "idle panel never polls status");
+  // An idle turn_end alone does not pull status; the periodic refresh and a
+  // session_close do (see the two tests after the busy-reply test).
+  assert.equal(statusPosts().length, 0, "an idle turn_end batch does not pull status");
   harness.state.managerChatRunning = true;
   harness.api.renderManagerChatEventsResponse({
     ok: true,
@@ -715,6 +717,52 @@ test("a manager_turn_in_progress reply shows a notice and sends nothing else", (
   assert.equal(harness.elements.managerChatNotice.hidden, false);
   assert.match(harness.elements.managerChatNotice.textContent, /already running/i);
   assert.equal(harness.posts.length, 0, "the busy reply must never trigger a resend");
+});
+
+test("a session_close for the current session pulls status even when the panel is idle", () => {
+  // EntryLink 0.12.26: a callback turn crossed the context threshold while the
+  // panel was idle; the panel stayed on the closed session because only a
+  // running panel ever pulled status after a terminal batch.
+  const harness = loadWebviewSlice();
+  harness.state.managerChatSession = "mls-aaaa1111bbbb2222";
+  harness.state.managerChatRunning = false;
+
+  harness.api.renderManagerChatEventsResponse({
+    ok: true,
+    events: [
+      { seq: 9, type: "turn_end", turn: 2, payload: {} },
+      { seq: 10, type: "session_close", turn: 2, payload: { reason: "context_threshold" } },
+    ],
+  });
+
+  assert.deepEqual(plain(harness.posts.filter((post) => post.type === "managerLoopStatus")), [{ type: "managerLoopStatus" }]);
+});
+
+test("the poll loop refreshes status every few seconds so a server-side rotation is followed", () => {
+  const harness = loadWebviewSlice();
+  harness.state.managerChatSession = "mls-aaaa1111bbbb2222";
+  const statusPosts = () => harness.posts.filter((post) => post.type === "managerLoopStatus").length;
+  const tick = () => {
+    harness.timers.shift().fn();
+    harness.api.renderManagerChatEventsResponse({ ok: true, events: [] });
+  };
+
+  harness.api.scheduleManagerChatPoll();
+  for (let n = 0; n < 3; n += 1) tick();
+  assert.equal(statusPosts(), 0, "4.5s of idle polls is still events only");
+  tick();
+  assert.equal(statusPosts(), 1, "the 6s idle poll also pulls status");
+  assert.equal(harness.posts.at(-1).type, "managerLoopEvents", "events keep flowing even if the status reply is lost");
+
+  harness.api.renderManagerChatStatus({
+    ok: true,
+    running: false,
+    session: { session_id: "mls-cccc3333dddd4444", backend_id: "codex_cli", model: "gpt-x" },
+    send_queue: [],
+  });
+  assert.equal(harness.state.managerChatSession, "mls-cccc3333dddd4444", "the status reply follows the rotation");
+  for (let n = 0; n < 3; n += 1) tick();
+  assert.equal(statusPosts(), 1, "a status reply restarts the refresh clock");
 });
 
 test("the composer stays enabled with no session and while a turn is running", () => {

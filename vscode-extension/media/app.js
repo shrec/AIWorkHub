@@ -7348,6 +7348,14 @@ function scheduleManagerChatPoll() {
   state.managerChatPollTimer = window.setTimeout(() => {
     state.managerChatPollTimer = null;
     if (state.managerChatSession) {
+      // Callback turns start and rotate the session server-side with nothing
+      // posted to the panel, so every ~6s of polling also pulls status (one
+      // read). Events still go out: a lost status reply never stops the chain.
+      state.managerChatStatusAgeMs = (state.managerChatStatusAgeMs || 0) + delay;
+      if (state.managerChatStatusAgeMs >= 6000) {
+        state.managerChatStatusAgeMs = 0;
+        vscode.postMessage({ type: "managerLoopStatus" });
+      }
       requestManagerChatEvents();
     }
   }, delay);
@@ -7464,6 +7472,7 @@ function renderManagerChatStatus(payload) {
   state.managerChatModel = session ? String(session.model || "") : null;
   state.managerChatTitle = session ? String(session.title || "").trim() : "";
   state.managerChatRunning = Boolean(payload.running);
+  state.managerChatStatusAgeMs = 0;
   applyManagerChatSessionUi();
   renderManagerChatSessionPicker(payload);
   // Latest successful status is authoritative: an empty or missing send_queue drains the list.
@@ -7501,8 +7510,12 @@ function renderManagerChatEventsResponse(payload) {
       // A finished turn still needs one status pull: running and send_queue
       // are authoritative only on status, and nothing else refreshes them
       // after a background turn ends. The composer stays enabled either way.
-      // Failed turns carry `error` with no `turn_end`.
-      if (state.managerChatRunning && events.some((event) => event && (event.type === "turn_end" || event.type === "error"))) {
+      // Failed turns carry `error` with no `turn_end`. A closed session always
+      // pulls it: the server already runs (or will open) the successor, and
+      // only status names it.
+      const terminal = events.some((event) => event && (event.type === "turn_end" || event.type === "error"));
+      const closed = events.some((event) => event && event.type === "session_close");
+      if ((state.managerChatRunning && terminal) || closed) {
         if (state.managerChatThinkingSince) {
           state.managerChatLastThoughtMs = Date.now() - state.managerChatThinkingSince;
           state.managerChatThinkingSince = 0;
