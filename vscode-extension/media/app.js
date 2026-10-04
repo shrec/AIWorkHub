@@ -7473,6 +7473,8 @@ function renderManagerChatStatus(payload) {
   state.managerChatTitle = session ? String(session.title || "").trim() : "";
   state.managerChatRunning = Boolean(payload.running);
   state.managerChatStatusAgeMs = 0;
+  // An idle server owns no Thinking timer; a later turn starts a fresh one.
+  if (!state.managerChatRunning) state.managerChatThinkingSince = 0;
   applyManagerChatSessionUi();
   renderManagerChatSessionPicker(payload);
   // Latest successful status is authoritative: an empty or missing send_queue drains the list.
@@ -7507,19 +7509,21 @@ function renderManagerChatEventsResponse(payload) {
       state.managerChatEvents = state.managerChatEvents.concat(events);
       state.managerChatLastSeq = events.reduce((max, event) => Math.max(max, numberValue(event.seq)), state.managerChatLastSeq);
       if (state.managerChatRunning) applyManagerChatSessionUi();
+      // Failed turns carry `error` with no `turn_end`; a rotation ends the
+      // session with `session_close`. Any of them stops the Thinking timer,
+      // whether or not the panel knew a (callback) turn was running.
+      const terminal = events.some((event) => event && (event.type === "turn_end" || event.type === "error" || event.type === "session_close"));
+      if (terminal && state.managerChatThinkingSince) {
+        state.managerChatLastThoughtMs = Date.now() - state.managerChatThinkingSince;
+        state.managerChatThinkingSince = 0;
+      }
       // A finished turn still needs one status pull: running and send_queue
       // are authoritative only on status, and nothing else refreshes them
       // after a background turn ends. The composer stays enabled either way.
-      // Failed turns carry `error` with no `turn_end`. A closed session always
-      // pulls it: the server already runs (or will open) the successor, and
-      // only status names it.
-      const terminal = events.some((event) => event && (event.type === "turn_end" || event.type === "error"));
+      // A closed session always pulls it: the server already runs (or will
+      // open) the successor, and only status names it.
       const closed = events.some((event) => event && event.type === "session_close");
       if ((state.managerChatRunning && terminal) || closed) {
-        if (state.managerChatThinkingSince) {
-          state.managerChatLastThoughtMs = Date.now() - state.managerChatThinkingSince;
-          state.managerChatThinkingSince = 0;
-        }
         state.managerChatRunning = false;
         applyManagerChatSessionUi();
         vscode.postMessage({ type: "managerLoopStatus" });
@@ -7533,14 +7537,27 @@ function renderManagerChatEventsResponse(payload) {
   }
 }
 
-function renderManagerChatAction(_action, payload) {
+function renderManagerChatAction(action, payload) {
+  const pendingText = action === "send" ? state.managerChatPendingText : "";
+  if (action === "send") state.managerChatPendingText = "";
   if (payload && payload.ok === false) {
+    if (action === "send") {
+      // The submit set Running optimistically; a refusal ran nothing, so the
+      // phantom turn and its Thinking timer go (status follows and corrects
+      // it if another turn really runs), and the refused words come back.
+      state.managerChatRunning = false;
+      state.managerChatThinkingSince = 0;
+      if (pendingText && elements.managerChatInput && !elements.managerChatInput.value) {
+        elements.managerChatInput.value = pendingText;
+      }
+      applyManagerChatSessionUi();
+      managerConsoleScheduleRender();
+    }
     showManagerChatNotice(
       payload.error === "manager_turn_in_progress"
         ? "A manager turn is already running."
         : `Manager error: ${payload.error || "unknown"}`,
     );
-    return;
     return;
   }
   const sessionId = String(payload && payload.session_id || "");
@@ -8221,6 +8238,8 @@ elements.managerChatComposer.addEventListener("submit", (event) => {
     model,
     reasoning: String(elements.managerChatReasoningSelect && elements.managerChatReasoningSelect.value || ""),
   });
+  // Kept until the send's reply: a refusal puts it back in the composer.
+  state.managerChatPendingText = text;
   elements.managerChatInput.value = "";
   // Optimistic Running label only. The composer stays enabled so the next
   // send can be queued; status.send_queue is what renders that queue.

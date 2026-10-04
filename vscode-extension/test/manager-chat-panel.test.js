@@ -192,7 +192,13 @@ test("managerLoopSend with an unlisted backend is refused before any MCP call", 
   await flush();
 
   assert.equal(harness.managerLoopClientInstances.length, 0);
-  assert.deepEqual(plain(view.posts), [{ type: harness.api.OUTBOUND_TYPES.error, message: "invalid_backend_id" }]);
+  // A send refusal answers on the send action channel, so the panel reverts
+  // its optimistic running state and gives the owner's words back.
+  assert.deepEqual(plain(view.posts), [{
+    type: harness.api.OUTBOUND_TYPES.managerLoopAction,
+    action: "send",
+    payload: { ok: false, error: "invalid_backend_id" },
+  }]);
 });
 
 test("managerLoopEnsure reaches the gated client as aiworkhub_manager_loop_ensure with no args", async () => {
@@ -763,6 +769,72 @@ test("the poll loop refreshes status every few seconds so a server-side rotation
   assert.equal(harness.state.managerChatSession, "mls-cccc3333dddd4444", "the status reply follows the rotation");
   for (let n = 0; n < 3; n += 1) tick();
   assert.equal(statusPosts(), 1, "a status reply restarts the refresh clock");
+});
+
+test("a refused send reverts the optimistic running state and gives the text back", () => {
+  const harness = loadWebviewSlice();
+  harness.state.managerChatSession = "mls-aaaa1111bbbb2222";
+  harness.elements.managerChatBackendSelect.value = "codex_cli";
+  harness.elements.managerChatModelInput.value = "gpt-x";
+  harness.elements.managerChatInput.value = "hello";
+
+  trigger(harness.elements.managerChatComposer, "submit");
+  assert.equal(harness.state.managerChatRunning, true);
+  assert.equal(harness.elements.managerChatInput.value, "");
+  harness.api.renderManagerChatEvents();
+  assert.ok(harness.state.managerChatThinkingSince > 0);
+
+  harness.api.renderManagerChatAction("send", { ok: false, error: "manager_send_queue_full" });
+
+  assert.equal(harness.state.managerChatRunning, false, "a refusal must not leave a phantom running turn");
+  assert.equal(harness.state.managerChatThinkingSince, 0, "the Thinking timer stops with it");
+  assert.equal(harness.elements.managerChatInput.value, "hello", "the refused words come back to the composer");
+  assert.equal(harness.elements.managerChatNotice.hidden, false);
+  const text = flattenNodes(harness.elements.managerChatTranscript, []).map((part) => String(part.textContent || "")).join("");
+  assert.doesNotMatch(text, /Thinking/);
+});
+
+test("a refused send never overwrites what the owner typed since", () => {
+  const harness = loadWebviewSlice();
+  harness.elements.managerChatBackendSelect.value = "codex_cli";
+  harness.elements.managerChatModelInput.value = "gpt-x";
+  harness.elements.managerChatInput.value = "first";
+  trigger(harness.elements.managerChatComposer, "submit");
+  harness.elements.managerChatInput.value = "typing on";
+
+  harness.api.renderManagerChatAction("send", { ok: false, error: "invalid_backend_id" });
+
+  assert.equal(harness.elements.managerChatInput.value, "typing on");
+  assert.equal(harness.state.managerChatRunning, false);
+});
+
+test("the Thinking timer restarts for a new turn instead of carrying an old start", () => {
+  const harness = loadWebviewSlice();
+  harness.state.managerChatSession = "mls-aaaa1111bbbb2222";
+  harness.state.managerChatRunning = true;
+  harness.state.managerChatThinkingSince = 1; // a start from a turn long gone
+  harness.state.managerChatEvents = [
+    { seq: 1, turn: 1, type: "user_message", payload: { text: "hi" } },
+    { seq: 2, turn: 1, type: "turn_end", payload: {} },
+    { seq: 3, turn: 2, type: "user_message", payload: { text: "callback: T-1 -> review_ready" } },
+  ];
+
+  harness.api.renderManagerChatEvents();
+
+  assert.ok(Date.now() - harness.state.managerChatThinkingSince < 60000, "the timer belongs to turn 2");
+});
+
+test("turn_end, error and session_close stop the Thinking timer even on an idle panel", () => {
+  for (const type of ["turn_end", "error", "session_close"]) {
+    const harness = loadWebviewSlice();
+    harness.state.managerChatSession = "mls-aaaa1111bbbb2222";
+    harness.state.managerChatRunning = false;
+    harness.state.managerChatThinkingSince = 1;
+
+    harness.api.renderManagerChatEventsResponse({ ok: true, events: [{ seq: 4, type, turn: 2, payload: {} }] });
+
+    assert.equal(harness.state.managerChatThinkingSince, 0, type);
+  }
 });
 
 test("the composer stays enabled with no session and while a turn is running", () => {

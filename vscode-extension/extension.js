@@ -11345,12 +11345,14 @@ function handleInboundMessage(view, message) {
       const sendBackendId = String(message.backendId || "");
       const sendModel = String(message.model || "").trim();
       const sendReasoning = String(message.reasoning || "").trim().toLowerCase();
+      // Refusals answer on the send action channel: the panel set Running
+      // optimistically and only a send reply reverts it and restores the text.
       if (sendBackendId && !MANAGER_LOOP_BACKENDS.has(sendBackendId)) {
-        view.postMessage({ type: OUTBOUND_TYPES.error, message: "invalid_backend_id" });
+        view.postMessage({ type: OUTBOUND_TYPES.managerLoopAction, action: "send", payload: { ok: false, error: "invalid_backend_id" } });
         return;
       }
       if (sendReasoning && !["low", "medium", "high", "xhigh", "max"].includes(sendReasoning)) {
-        view.postMessage({ type: OUTBOUND_TYPES.error, message: "invalid_reasoning_level" });
+        view.postMessage({ type: OUTBOUND_TYPES.managerLoopAction, action: "send", payload: { ok: false, error: "invalid_reasoning_level" } });
         return;
       }
       runManagerLoopAction(view, "send", { text, backend_id: sendBackendId, model: sendModel, reasoning: sendReasoning });

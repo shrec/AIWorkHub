@@ -139,6 +139,22 @@ function managerChatLiveThinkingNode() {
   return row;
 }
 
+function managerChatThinkingKey() {
+  // session:turn the running panel waits on -- the latest turn, or the next
+  // one once the latest has ended (an optimistic send before its user_message).
+  let turn = 0;
+  let finished = false;
+  for (const item of state.managerChatEvents || []) {
+    if (!item || !Number.isInteger(item.turn) || item.turn < turn) continue;
+    if (item.turn > turn) {
+      turn = item.turn;
+      finished = false;
+    }
+    if (item.type === "turn_end" || item.type === "error" || item.type === "session_close") finished = true;
+  }
+  return String(state.managerChatSession || "") + ":" + (finished ? turn + 1 : turn);
+}
+
 // Glyph per block kind; the gutter is fixed-width so blocks never shift.
 const MANAGER_CONSOLE_GLYPHS = Object.freeze({
   user_message: "›", assistant_text: "●", reasoning: "∴", command: "$", file_change: "±",
@@ -386,7 +402,13 @@ function renderManagerChatEvents() {
   if (partialRows.length > 0) {
     rows.push(...partialRows);
   } else if (state.managerChatRunning) {
-    if (!state.managerChatThinkingSince) state.managerChatThinkingSince = Date.now();
+    // The timer belongs to one session and turn: a start left over from an
+    // earlier turn or session restarts instead of counting on (the 64m timer).
+    const key = managerChatThinkingKey();
+    if (!state.managerChatThinkingSince || state.managerChatThinkingKey !== key) {
+      state.managerChatThinkingSince = Date.now();
+      state.managerChatThinkingKey = key;
+    }
     rows.push(managerChatLiveThinkingNode());
   } else if (state.managerChatLastThoughtMs && !state.managerChatEvents.some((item) => item && item.type === "reasoning")) {
     rows.push(createElement("div", "manager-chat-thinking", "Thought for " + managerChatFormatDuration(state.managerChatLastThoughtMs)));
