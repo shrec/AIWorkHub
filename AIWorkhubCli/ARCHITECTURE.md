@@ -333,16 +333,27 @@ AIWorkhubCli/
 
 ## 10. Build and dependencies
 
-- C++23, CMake ≥ 3.28 presets (`windows-msvc`, `windows-clang`, `linux-gcc`,
-  `linux-clang`, `macos-clang`). The static MSVC runtime is used on Windows.
+- **Toolchain: LLVM on every OS.** C++23, CMake ≥ 3.28, Ninja. Presets
+  `windows-clang` (clang-cl, lld-link, llvm-rc, llvm-mt over the MSVC STL and
+  Windows SDK headers, static CRT), `linux-clang` and `macos-clang`, each with a
+  same-named build and test preset; validation uses only presets, so no
+  build-tree path is ever named. One compiler family gives one set of
+  diagnostics and one C++23 behaviour everywhere. Measured 2026-10-04 on this
+  host (LLVM 21.1.0): clang-cl builds C++23 `std::expected`/`std::format` with no
+  developer shell (INCLUDE/LIB unset), the static binary imports only
+  `KERNEL32.dll`, and Ninja writes `compile_commands.json`, which clangd needs
+  (phase 2b) and the Visual Studio generator does not produce. MSVC `cl` is not
+  a build target; a CI lane adds it only for a measured portability defect.
 - **Vendored dependencies** in `third_party/` (see its README for the pins and
   sha256). There is no package manager at build time, so builds are hermetic
   and work in the sandboxed, network-less validation lane, which also rejects
   absolute host paths such as a vcpkg root. Vendored: sqlite3 amalgamation
   (FTS5 enabled), CLI11, nlohmann_json, spdlog (`SPDLOG_USE_STD_FORMAT`, no fmt),
   Catch2 amalgamated, tree-sitter core. asio arrives in P6.
-- Warnings are errors (`/W4 /permissive-`, `-Wall -Wextra -Wpedantic`).
-  ASan/UBSan presets cover unit and integration tests on Linux and macOS.
+- Warnings are errors on our code only (`/W4 /permissive-` plus `-Wextra`
+  through clang-cl, `-Wall -Wextra -Wpedantic` elsewhere). The same toolchain
+  supplies ASan/UBSan, libFuzzer and source-based coverage (`llvm-cov`) on every
+  OS, Windows included; clang-tidy and clang-format are the lint gates.
 - Required at runtime: `git`. Optional per provider: `claude`, `codex`,
   `copilot`, `opencode`.
 
