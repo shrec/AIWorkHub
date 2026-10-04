@@ -1201,6 +1201,85 @@ def rebind_authority_receipt(
     )
 
 
+# NF-2026-01349: the failures a receipt can acquire honestly after launch --
+# the request identity it binds was widened (a pre-0.12.26 replay), or the host
+# PATH, registry, metadata or an executable moved under a restarted server.
+RECEIPT_DRIFT_CODES = frozenset({
+    "validation_toolchain_authority_receipt_card_identity_mismatch",
+    "validation_toolchain_authority_receipt_path_mismatch",
+    "validation_toolchain_authority_receipt_cache_identity_mismatch",
+    "validation_toolchain_authority_receipt_registry_fingerprint_mismatch",
+    "validation_toolchain_authority_receipt_repository_fingerprint_mismatch",
+    "validation_toolchain_authority_executable_identity_drift",
+})
+
+
+def _receipt_tamper_code(receipt: Mapping[str, Any], repo: Path, card: Mapping[str, Any]) -> str:
+    """The first identity/integrity failure, judged on the receipt's OWN fields.
+
+    ``_verified_receipt_snapshot`` checks the drift scalars before the MAC, so a
+    forged receipt that also drifted reports drift first. The MAC here is
+    recomputed over the stored ``card_identity``, which only the minting key
+    can have produced, so a forgery is refused whatever else drifted.
+    """
+    if receipt.get("schema_id") != RECEIPT_SCHEMA_ID:
+        return "validation_toolchain_authority_receipt_schema"
+    if str(receipt.get("repository") or "") != str(repo.resolve()):
+        return "validation_toolchain_authority_receipt_repository_mismatch"
+    request_id = str(
+        card.get("request_id") or card.get("claimed_request_id") or card.get("accepted_request_id") or ""
+    )
+    if str(receipt.get("request_id") or "") != request_id:
+        return "validation_toolchain_authority_receipt_request_id_mismatch"
+    secret = _authority_secret(repo.resolve(), create=False)
+    if not secret:
+        return "validation_toolchain_authority_secret_unavailable"
+    expected = _receipt_mac(secret, receipt, str(receipt.get("card_identity") or ""))
+    if not hmac.compare_digest(str(receipt.get(_RECEIPT_MAC_KEY) or ""), expected):
+        return "validation_toolchain_authority_receipt_mac_mismatch"
+    return ""
+
+
+def refresh_drifted_receipt(
+    receipt: object,
+    repo: Path,
+    card: Mapping[str, Any],
+    authority: ToolchainAuthority,
+) -> tuple[dict[str, object] | None, str]:
+    """Re-mint a launch receipt that fails ONLY with a drift code.
+
+    NF-2026-01349: only ``retry_finalization`` -- an explicit, audited manager
+    action -- may call this. The first finalization keeps the receipt as the
+    TOCTOU binding between launch preflight and validation. A missing or
+    cleanly verifying receipt returns ``(None, "")``; a drifted one is replaced
+    by the host preflight ``_preflight_card`` runs, returning the fresh receipt
+    and the drift code. Raises ``ValueError`` before anything is written:
+    ``finalization_retry_toolchain_receipt_invalid:<code>`` for a tamper or
+    corruption failure, ``finalization_retry_toolchain_unavailable:<missing>``
+    when the fresh preflight is not available.
+    """
+    if not isinstance(receipt, Mapping):
+        return None, ""
+    try:
+        _verified_receipt_snapshot(receipt, repo, card)
+        return None, ""
+    except ValueError as exc:
+        code = str(exc)
+    tamper = _receipt_tamper_code(receipt, repo, card)
+    if tamper or code not in RECEIPT_DRIFT_CODES:
+        raise ValueError(f"finalization_retry_toolchain_receipt_invalid:{tamper or code}")
+    snapshot = authority.evaluate(card)
+    authority.repair(snapshot)
+    if not snapshot.available:
+        detail = json.dumps(
+            [f"{fact.kind}:{fact.value}" for fact in snapshot.missing],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        raise ValueError(f"finalization_retry_toolchain_unavailable:{detail}")
+    return authority_receipt(snapshot, card), code
+
+
 def _verified_receipt_snapshot(
     receipt: Mapping[str, Any], repo: Path, card: Mapping[str, Any]
 ) -> AuthoritySnapshot:

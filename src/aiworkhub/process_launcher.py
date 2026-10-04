@@ -13350,6 +13350,16 @@ class ProcessManager:
                     "task_id": task_id,
                     "error": "finalization_retry_worker_not_successful",
                 }
+            # NF-2026-01349: a receipt that only drifted (widened request identity,
+            # moved PATH/registry/executable) is re-minted by the same host preflight
+            # launch ran; a tampered receipt is refused before any transition.
+            try:
+                refreshed_receipt, receipt_drift = _toolchain_authority.refresh_drifted_receipt(
+                    metadata.get(_toolchain_authority.RECEIPT_CARD_KEY),
+                    self.repo, metadata, self._toolchain_authority,
+                )
+            except ValueError as exc:
+                return {"ok": False, "request_id": request_id, "task_id": task_id, "error": str(exc)[:500]}
             if not retryable_release_pending:
                 transition = task_engine.retry_finalize_failed(
                     self.repo,
@@ -13372,6 +13382,9 @@ class ProcessManager:
                             )
                         )[:500],
                     }
+            if refreshed_receipt is not None:
+                metadata[_toolchain_authority.RECEIPT_CARD_KEY] = refreshed_receipt
+                write_json_0600(metadata_path, metadata)
             self._append_event({
                 **self._event_identity(events),
                 "request_id": request_id,
@@ -13388,6 +13401,7 @@ class ProcessManager:
                 "finalization_retry": True,
                 "finalization_retry_provider_launched": False,
                 "finalization_started_at": _utcnow(),
+                **({"toolchain_authority_receipt_refreshed": receipt_drift} if receipt_drift else {}),
             })
 
         event = self._finalize_isolated_request(request_id, 0)

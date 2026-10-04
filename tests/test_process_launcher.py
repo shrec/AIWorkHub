@@ -2012,6 +2012,147 @@ def test_retry_finalization_reuses_retained_workspace_without_provider(
         )
 
 
+_RECEIPT_DRIFT_PREFIX = "validation_toolchain_authority_receipt_"
+
+
+def _receipt_retry_manager(monkeypatch, tmp_path, *, minted_for=None, forge=False):
+    """NF-2026-01349: a finalize_failed request whose metadata carries a launch
+    receipt minted for ``minted_for(metadata)`` (default: the metadata itself)."""
+    _open_gates(monkeypatch)
+    manager = _manager(tmp_path, show_task=_show(lambda: _card(state="review")), argv=[sys.executable, "-c", "pass"])
+    manager._toolchain_authority = toolchain_authority.ToolchainAuthority(
+        manager.repo, capability_probe=lambda *_: ()
+    )
+    request_id = "e" * 32
+    worktree_root = tmp_path / "worktrees"
+    monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(worktree_root))
+    workspace_path = worktree_root / request_id / "worktree"
+    home_path = worktree_root / request_id / "home"
+    workspace_path.mkdir(parents=True)
+    home_path.mkdir()
+    workspace = worker_workspace.WorkerWorkspace(
+        request_id=request_id, repo=manager.repo, path=workspace_path, home=home_path,
+        allowed_writes=("out/result.json",), parent_baseline={}, workspace_baseline={},
+    )
+    status_path = manager.process_dir / f"{request_id}.supervisor.json"
+    metadata_path = manager.process_dir / f"{request_id}.request.json"
+    worker_workspace.write_json_0600(status_path, {"state": "exited", "exit_code": 0})
+    metadata = {
+        "request_id": request_id, "task_id": "TASK_B1", "runner": "claude_worker_b1",
+        "topic": "task_mcp", "adapter_id": "vscode_lm", "sandbox_backend": "vscode_lm_in_process",
+        "supervisor_status_path": str(status_path), "workspace": workspace.as_metadata(),
+        "validation": [f"{sys.executable} -m compileall -q src"],
+        "allowed_writes": ["out/result.json"],
+    }
+    card = minted_for(metadata) if minted_for else metadata
+    receipt = toolchain_authority.authority_receipt(manager._toolchain_authority.evaluate(card), card)
+    if forge:
+        receipt["receipt_mac"] = "0" * 64
+    metadata[toolchain_authority.RECEIPT_CARD_KEY] = receipt
+    worker_workspace.write_json_0600(metadata_path, metadata)
+    manager._append_event({
+        "request_id": request_id, "task_id": "TASK_B1", "runner": "claude_worker_b1",
+        "topic": "task_mcp", "adapter_id": "vscode_lm", "state": "finalize_failed",
+        "error": "finalize_failed:" + _RECEIPT_DRIFT_PREFIX + "card_identity_mismatch",
+        "metadata_path": str(metadata_path), "supervisor_status_path": str(status_path),
+        "workspace_retained": True,
+    })
+    transitions = []
+    monkeypatch.setattr(
+        process_launcher.task_engine, "retry_finalize_failed",
+        lambda *args, **kwargs: transitions.append(args) or {"ok": True, "stderr": ""},
+    )
+    finalized = []
+
+    def finalize(request_id_arg, supervisor_returncode=None):
+        on_disk = json.loads(metadata_path.read_text(encoding="utf-8"))
+        # The finalizer re-reads metadata and runs the full receipt check.
+        assert toolchain_authority.verify_authority_receipt(
+            on_disk[toolchain_authority.RECEIPT_CARD_KEY], manager.repo, on_disk
+        )
+        finalized.append(manager._request_events(request_id_arg)[-1])
+        return {"request_id": request_id_arg, "task_id": "TASK_B1", "state": "review_ready", "error": ""}
+
+    monkeypatch.setattr(manager, "_finalize_isolated_request", finalize)
+    return manager, request_id, metadata_path, transitions, finalized
+
+
+def test_retry_finalization_remints_receipt_after_card_identity_drift(monkeypatch, tmp_path):
+    manager, request_id, _metadata_path, transitions, finalized = _receipt_retry_manager(
+        monkeypatch, tmp_path, minted_for=lambda metadata: {**metadata, "required_outputs": ["out/old.json"]}
+    )
+
+    result = manager.retry_finalization(request_id, "TASK_B1")
+
+    assert result["ok"] is True, result
+    assert transitions
+    assert finalized and finalized[0]["state"] == "finalizing"
+    assert finalized[0]["toolchain_authority_receipt_refreshed"] == (
+        _RECEIPT_DRIFT_PREFIX + "card_identity_mismatch"
+    )
+
+
+def test_retry_finalization_remints_receipt_after_path_drift(monkeypatch, tmp_path):
+    manager, request_id, _metadata_path, transitions, finalized = _receipt_retry_manager(monkeypatch, tmp_path)
+    monkeypatch.setenv("PATH", os.environ.get("PATH", "") + os.pathsep + str(tmp_path / "moved-bin"))
+
+    result = manager.retry_finalization(request_id, "TASK_B1")
+
+    assert result["ok"] is True, result
+    assert transitions
+    assert finalized[0]["toolchain_authority_receipt_refreshed"] == _RECEIPT_DRIFT_PREFIX + "path_mismatch"
+
+
+def test_retry_finalization_leaves_a_clean_receipt_untouched(monkeypatch, tmp_path):
+    manager, request_id, metadata_path, _transitions, finalized = _receipt_retry_manager(monkeypatch, tmp_path)
+    before = metadata_path.read_bytes()
+
+    result = manager.retry_finalization(request_id, "TASK_B1")
+
+    assert result["ok"] is True, result
+    assert metadata_path.read_bytes() == before
+    assert "toolchain_authority_receipt_refreshed" not in finalized[0]
+
+
+@pytest.mark.parametrize("drifted", [False, True], ids=["mac-only", "mac-and-identity-drift"])
+def test_retry_finalization_refuses_forged_receipt_before_transition(monkeypatch, tmp_path, drifted):
+    # A forgery that also drifted reports the drift first from the full check; it
+    # must still be judged by its MAC and stay fail-closed.
+    manager, request_id, metadata_path, transitions, finalized = _receipt_retry_manager(
+        monkeypatch, tmp_path, forge=True,
+        minted_for=(lambda metadata: {**metadata, "required_outputs": ["out/old.json"]}) if drifted else None,
+    )
+    before = metadata_path.read_bytes()
+
+    result = manager.retry_finalization(request_id, "TASK_B1")
+
+    assert result == {
+        "ok": False, "request_id": request_id, "task_id": "TASK_B1",
+        "error": "finalization_retry_toolchain_receipt_invalid:" + _RECEIPT_DRIFT_PREFIX + "mac_mismatch",
+    }
+    assert transitions == [] and finalized == []
+    assert metadata_path.read_bytes() == before
+    assert manager._request_events(request_id)[-1]["state"] == "finalize_failed"
+
+
+def test_retry_finalization_refuses_refresh_when_toolchain_unavailable(monkeypatch, tmp_path):
+    manager, request_id, metadata_path, transitions, finalized = _receipt_retry_manager(
+        monkeypatch, tmp_path, minted_for=lambda metadata: {**metadata, "required_outputs": ["out/old.json"]},
+    )
+    manager._toolchain_authority = toolchain_authority.ToolchainAuthority(
+        manager.repo, capability_probe=lambda *_: ("executable:/missing/aiworkhub-nf01349-tool",)
+    )
+    before = metadata_path.read_bytes()
+
+    result = manager.retry_finalization(request_id, "TASK_B1")
+
+    assert result["ok"] is False
+    assert result["error"].startswith("finalization_retry_toolchain_unavailable:")
+    assert "executable:/missing/aiworkhub-nf01349-tool" in result["error"]
+    assert transitions == [] and finalized == []
+    assert metadata_path.read_bytes() == before
+
+
 def test_retry_finalization_rejects_product_validation_failure(monkeypatch, tmp_path):
     _open_gates(monkeypatch)
     manager = _manager(
