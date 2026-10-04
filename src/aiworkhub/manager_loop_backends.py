@@ -335,6 +335,9 @@ def _codex_events(event: Mapping[str, Any], context: TurnContext) -> list[dict[s
     kind = str(event.get("type") or "")
     if kind == "turn.completed":
         return [_turn_end(_codex_usage(event.get("usage")))]
+    if kind == "turn.failed":
+        # NF-2026-01232: the provider's own reason, e.g. its HTTP 400 message.
+        return [_turn_error("provider", str(_mapping(event.get("error")).get("message") or "turn_failed"))]
     item = _mapping(event.get("item"))
     item_type = str(item.get("type") or "")
     if not kind.startswith("item.") or not item_type:
@@ -517,7 +520,9 @@ def _provider_error(event: Mapping[str, Any]) -> dict[str, Any] | None:
         return None
     reported = event.get("error")
     if isinstance(reported, Mapping):
-        detail = reported.get("name") or reported.get("message") or "provider_error"
+        # NF-2026-01232: the provider's message, not only its error class name.
+        said = reported.get("message") or _mapping(reported.get("data")).get("message")
+        detail = ": ".join(str(part) for part in (reported.get("name"), said) if part) or "provider_error"
     else:
         # A Claude ``result`` failure carries its text in ``result`` and the
         # subtype ``success``; that word is never a failure detail.
@@ -841,7 +846,12 @@ class CliManagerBackend:
                 self._conversation_id = self._conversation_id or conversation_id_of(event)
                 _maybe_record_claude_resolution(self.backend_id, self.model, self.repo, event)
                 for translated in translate(self.backend_id, event, context):
-                    saw_error = saw_error or translated["type"] == "error"
+                    if translated["type"] == "error":
+                        # NF-2026-01232: one failed turn is one error event; the
+                        # provider's first report (Codex: error, then turn.failed) wins.
+                        if saw_error:
+                            continue
+                        saw_error = True
                     yield translated
         finally:
             watchdog.cancel()
@@ -850,15 +860,21 @@ class CliManagerBackend:
             with self._slot:
                 if self._process is process:
                     self._process = None
+        if saw_error:
+            return
         if expired.is_set():
             yield _turn_error("timeout", f"manager_turn_timeout_seconds={self.timeout_seconds:g}")
         elif code != 0:
             outcome = runtime_adapters.classify_provider_outcome(exit_code=code, stderr=stderr)
+            reason = str(outcome.get("reason") or f"exit_code={code}")
+            # NF-2026-01232: with no provider error line, its stderr is its own text.
+            said = str(outcome.get("provider_message") or "").strip()
+            room = MAX_ERROR_DETAIL_CHARS - len(reason) - 2
             yield _turn_error(
                 str(outcome.get("outcome") or "worker_failed"),
-                str(outcome.get("reason") or f"exit_code={code}"),
+                f"{reason}: {said[-room:]}" if said and room > 0 else reason,
             )
-        elif not saw_error:
+        else:
             yield from flush(self.backend_id, context)
 
 

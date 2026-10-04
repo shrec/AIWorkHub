@@ -60,6 +60,8 @@ _FAKE_CLI = textwrap.dedent(
                 time.sleep(0.01)
         elif step == "@hang":
             time.sleep(30)
+        elif isinstance(step, str) and step.startswith("@stderr:"):
+            print(step[len("@stderr:"):], file=sys.stderr, flush=True)
         elif isinstance(step, str):
             print(step, flush=True)
         else:
@@ -488,6 +490,51 @@ def test_a_non_zero_exit_is_exactly_one_error_event_and_the_backend_still_closes
     assert errors[0]["payload"]["error"]
     cli.close()
     assert not cli.is_running()
+
+
+_CODEX_400 = "The 'gpt-5.3-codex' model is not supported when using Codex with a ChatGPT account."
+
+
+def test_a_failed_codex_turn_is_one_error_carrying_the_providers_own_text(tmp_path: Path):
+    # NF-2026-01232: the measured stream; before, a second generic worker_failed error followed.
+    fake = FakeCli(tmp_path, [[
+        {"type": "thread.started", "thread_id": "t-1"},
+        {"type": "item.completed", "item": {"id": "w1", "type": "error", "message": "warning"}},
+        {"type": "turn.started"},
+        {"type": "error", "message": f"unexpected status 400 Bad Request: {_CODEX_400}"},
+        {"type": "turn.failed", "error": {"message": f"unexpected status 400 Bad Request: {_CODEX_400}"}},
+    ]], exit_code=1)
+    cli = backend(fake, backend_id="codex_cli")
+    cli.start("brief")
+
+    events = drain(cli.send("go"))
+
+    assert kinds(events) == ["error"]
+    assert events[0]["payload"]["source"] == "provider"
+    assert _CODEX_400 in events[0]["payload"]["error"]
+    cli.close()
+
+
+def test_a_codex_turn_failed_alone_and_an_error_object_carry_the_providers_message():
+    failed = {"type": "turn.failed", "error": {"message": _CODEX_400}}
+    assert mlb.translate("codex_cli", failed) == [
+        {"type": "error", "payload": {"source": "provider", "error": _CODEX_400}}
+    ]
+    reported = {"type": "error", "error": {"name": "APIError", "data": {"message": "model gone", "statusCode": 400}}}
+    assert mlb.translate("opencode_cli", reported)[0]["payload"]["error"] == "APIError: model gone"
+
+
+def test_a_non_zero_exit_without_a_provider_error_carries_the_stderr_text(tmp_path: Path):
+    fake = FakeCli(tmp_path, [["@stderr:Error: model not supported for this login"]], exit_code=2)
+    cli = backend(fake, backend_id="codex_cli")
+    cli.start("brief")
+
+    (error,) = drain(cli.send("go"))
+
+    assert error["payload"]["error"].endswith("Error: model not supported for this login")
+    assert error["payload"]["error"].startswith("worker_process_failure_no_provider_refusal_signal: ")
+    assert len(error["payload"]["error"]) <= mlb.MAX_ERROR_DETAIL_CHARS
+    cli.close()
 
 
 def test_a_turn_timeout_kills_the_process_and_reports_exactly_one_error(tmp_path: Path):
