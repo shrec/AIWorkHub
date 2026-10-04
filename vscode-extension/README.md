@@ -14,6 +14,12 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.12.27
+
+- Unblocks retained-candidate finalization on other repositories: `agent_retry_finalization` re-mints a toolchain receipt that only drifted (card identity, PATH, registry) and still refuses a forged one (NF-2026-01349); `scope_rejection_resolved` recovers a scope-rejected card that retention later blocked as `finalize_failed` (NF-2026-01350).
+- Transient Windows read denials of attempt artifacts are retried, and a bare `[Errno 13]` now names its raising site (NF-2026-01351); rework feedback up to 8000 bytes is kept whole and longer feedback is refused instead of cut mid-word (NF-2026-01352).
+- Component regressions pass; installation and live worker replay are separate evidence.
+
 ## What's new in 0.12.26
 
 - Unblocks work on other repositories: shell residue (`$null`, `nul`, `*.stackdump`) no longer causes `scope_rejected`, which `agent_retry_finalization` can now recover (NF-2026-01345); dependent validation-only replays verify their toolchain receipt (NF-2026-01346).

@@ -6,6 +6,19 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.27] - 2026-10-05
+
+### Fixed
+
+- `agent_retry_finalization` re-mints a toolchain authority receipt that fails only with a drift code (card/cache identity, PATH, registry, repository fingerprint, executable identity); tamper failures stay fail-closed before any transition (NF-2026-01349).
+- `recover_blocked_rework(scope_rejection_resolved=true)` admits a scope-rejected card that retention blocked as `finalize_failed` for the same launch request, so the two recovery gates no longer contradict each other (NF-2026-01350).
+- Attempt-artifact re-reads ride out transient Windows read denials, and a filename-less `[Errno 13]` in finalization names its raising frame (NF-2026-01351).
+- Rework feedback has one 8000-byte cap: `reject_review` and `recover_blocked_rework` store text within it whole and refuse longer text (`reject_reason_too_large` / `feedback_reason_too_large`) instead of truncating it (NF-2026-01352).
+
+### Qualification
+
+- Each fix has regressions that fail before and pass after; the touched suites pass. Installation and live worker replay are separate checks.
+
 ## [0.12.26] - 2026-10-04
 
 ### Fixed

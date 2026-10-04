@@ -1,5 +1,17 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.12.27 — 2026-10-05
+
+### Fixed
+
+- `agent_retry_finalization` re-mints a drifted toolchain receipt and still refuses a forged one (NF-2026-01349).
+- A scope-rejected card that retention blocked as `finalize_failed` recovers with `scope_rejection_resolved` (NF-2026-01350).
+- Transient Windows read denials of attempt artifacts are retried; a bare `[Errno 13]` names its site (NF-2026-01351); rework feedback up to 8000 bytes is kept whole, longer is refused (NF-2026-01352).
+
+### Qualification
+
+- Independent component regressions pass; installation, activation and live qualification are separate evidence.
+
 ## 0.12.26 — 2026-10-04
 
 ### Fixed
