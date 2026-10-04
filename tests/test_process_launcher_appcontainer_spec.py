@@ -19,6 +19,7 @@ import aiworkhub.repository_state as repository_state
 import aiworkhub.windows_appcontainer as windows_appcontainer
 import aiworkhub.worker_supervisor as worker_supervisor
 import aiworkhub.worker_workspace as worker_workspace
+import aiworkhub.worker_workspace_appcontainer_node as worker_workspace_appcontainer_node
 
 CANONICAL_REPO_ID = "repo_57de971f505d4a50a7729a99c32615de"
 
@@ -2684,7 +2685,9 @@ def test_node_version_probe_is_bounded_shell_free_and_cached(
     tmp_path: Path, monkeypatch
 ) -> None:
     """One host call per resolved node, no shell, and a real timeout."""
-    monkeypatch.setattr(worker_workspace, "_APPCONTAINER_NODE_VERSION_CACHE", {})
+    monkeypatch.setattr(
+        worker_workspace_appcontainer_node, "_APPCONTAINER_NODE_VERSION_CACHE", {}
+    )
     calls: list[dict] = []
 
     def _fake_run(argv, **kwargs):
@@ -2718,7 +2721,9 @@ def test_node_version_probe_reports_unknown_for_every_failure(
     tmp_path: Path, monkeypatch, outcome
 ) -> None:
     """Any failure is an unknown version, and unknown adds no isolation flag."""
-    monkeypatch.setattr(worker_workspace, "_APPCONTAINER_NODE_VERSION_CACHE", {})
+    monkeypatch.setattr(
+        worker_workspace_appcontainer_node, "_APPCONTAINER_NODE_VERSION_CACHE", {}
+    )
     calls: list[int] = []
 
     def _fake_run(argv, **_kwargs):
@@ -2750,7 +2755,9 @@ def test_node_version_probe_reports_unknown_for_every_failure(
 def test_node_version_probe_reports_unknown_for_an_unresolvable_executable(
     tmp_path: Path, monkeypatch
 ) -> None:
-    monkeypatch.setattr(worker_workspace, "_APPCONTAINER_NODE_VERSION_CACHE", {})
+    monkeypatch.setattr(
+        worker_workspace_appcontainer_node, "_APPCONTAINER_NODE_VERSION_CACHE", {}
+    )
 
     def _never(*_args, **_kwargs):
         raise AssertionError("an unresolvable node is never launched")

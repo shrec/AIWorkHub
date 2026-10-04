@@ -656,6 +656,8 @@ def _commit_validation_worker_package(repo: Path) -> None:
         # worker_workspace imports its C/C++ include-seed helpers from here
         # (NF-2026-01156-RATCHET).
         "worker_workspace_include_seed.py",
+        # ...and its AppContainer node argv rewrite (size ratchet).
+        "worker_workspace_appcontainer_node.py",
     ):
         shutil.copyfile(source_package / name, destination_package / name)
     # write_bytes, not write_text: several tests compare a raw on-disk byte
